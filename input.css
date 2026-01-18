@@ -1,0 +1,90 @@
+@import "tailwindcss";
+
+@theme {
+  --color-bg-main: #1e1e1e;
+  --color-panel: #252526;
+  --color-tab: #2d2d2d;
+  --color-tab-active: #1e1e1e;
+  --color-text-main: #cccccc;
+  --color-accent: #007acc;
+  --color-border-main: #3e3e42;
+  --color-notes: #252526;
+  
+  --spacing-title-bar: 28px;
+  --spacing-tab-height: 35px;
+  --spacing-sidebar-width: 300px;
+
+  --font-jetbrains: "JetBrainsMono Nerd Font", monospace;
+}
+
+@layer base {
+  body {
+    @apply m-0 p-0 bg-bg-main text-text-main font-sans h-screen flex flex-col overflow-hidden;
+  }
+
+  @font-face {
+    font-family: 'JetBrainsMono Nerd Font';
+    src: url('assets/fonts/JetBrainsMonoNerdFont-Regular.ttf') format('truetype');
+    font-weight: normal;
+    font-style: normal;
+  }
+
+  @keyframes slideIn {
+    from {
+      opacity: 0;
+      transform: translateY(-10px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+}
+
+@layer components {
+  /* Title Bar */
+  .title-bar {
+    @apply h-title-bar bg-[#323233] flex items-center select-none border-b border-[#111] gap-2;
+  }
+
+  .window-controls-placeholder {
+    @apply w-[70px] h-full;
+    -webkit-app-region: drag;
+  }
+
+  .title-drag-area {
+    @apply flex-grow h-full;
+    -webkit-app-region: drag;
+  }
+
+  #project-chips-container {
+    @apply flex gap-1.5 items-center px-2;
+    -webkit-app-region: no-drag;
+  }
+
+  /* Utility for no-drag */
+  .no-drag {
+    -webkit-app-region: no-drag;
+  }
+
+  .active {
+    @apply !flex;
+  }
+
+  .dash-nav-btn.active {
+    @apply !text-white transition-colors duration-200;
+  }
+
+  .note-tab.active {
+    @apply !text-white !border-b-2 !border-accent;
+  }
+
+  /* Active States for JS-toggled elements */
+  .project-card.active {
+    @apply !bg-accent !text-white;
+  }
+
+  .tab.active {
+    @apply !bg-tab-active !text-white !border-t-2 !border-accent;
+  }
+}
