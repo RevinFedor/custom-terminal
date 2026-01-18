@@ -1,0 +1,40 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+release/
+*.app
+*.dmg
+*.pkg
+
+# Logs
+*.log
+npm-debug.log*
+app.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment
+.env
+.env.local
+
+# Electron
+out/
+build/
+
+# Icon generation
+build-resources/icon.iconset/
+build-resources/.DS_Store
+
+# Native modules
+prebuilds/
