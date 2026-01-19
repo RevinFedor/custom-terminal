@@ -87,12 +87,30 @@ class DatabaseManager {
       )
     `);
 
+    // AI Sessions table (for session persistence)
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS ai_sessions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id TEXT NOT NULL,
+        tool_type TEXT NOT NULL CHECK(tool_type IN ('gemini', 'claude')),
+        session_key TEXT NOT NULL,
+        content_blob TEXT NOT NULL,
+        original_cwd TEXT NOT NULL,
+        original_hash TEXT DEFAULT NULL,
+        created_at INTEGER DEFAULT (strftime('%s', 'now')),
+        updated_at INTEGER DEFAULT (strftime('%s', 'now')),
+        FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+      )
+    `);
+
     // Create indexes for faster queries
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_quick_actions_project ON quick_actions(project_id);
       CREATE INDEX IF NOT EXISTS idx_tabs_project ON tabs(project_id);
       CREATE INDEX IF NOT EXISTS idx_gemini_history_project ON gemini_history(project_id);
       CREATE INDEX IF NOT EXISTS idx_gemini_history_timestamp ON gemini_history(timestamp DESC);
+      CREATE INDEX IF NOT EXISTS idx_ai_sessions_project ON ai_sessions(project_id);
+      CREATE INDEX IF NOT EXISTS idx_ai_sessions_tool_type ON ai_sessions(tool_type);
     `);
   }
 
@@ -398,6 +416,112 @@ class DatabaseManager {
     ];
 
     this.savePrompts(defaultPrompts);
+  }
+
+  // ========== AI SESSIONS ==========
+
+  saveAISession(projectPath, toolType, sessionKey, contentBlob, originalCwd, originalHash = null) {
+    const normalizedPath = path.resolve(projectPath);
+    const project = this.db.prepare('SELECT id FROM projects WHERE path = ?').get(normalizedPath);
+
+    if (!project) return null;
+
+    // Check if session already exists
+    const existing = this.db.prepare(`
+      SELECT id FROM ai_sessions
+      WHERE project_id = ? AND tool_type = ? AND session_key = ?
+    `).get(project.id, toolType, sessionKey);
+
+    if (existing) {
+      // Update existing session
+      this.db.prepare(`
+        UPDATE ai_sessions
+        SET content_blob = ?, original_cwd = ?, original_hash = ?, updated_at = strftime('%s', 'now')
+        WHERE id = ?
+      `).run(contentBlob, originalCwd, originalHash, existing.id);
+
+      return existing.id;
+    } else {
+      // Insert new session
+      const result = this.db.prepare(`
+        INSERT INTO ai_sessions (project_id, tool_type, session_key, content_blob, original_cwd, original_hash)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(project.id, toolType, sessionKey, contentBlob, originalCwd, originalHash);
+
+      return result.lastInsertRowid;
+    }
+  }
+
+  getAISessions(projectPath, toolType = null) {
+    const normalizedPath = path.resolve(projectPath);
+    const project = this.db.prepare('SELECT id FROM projects WHERE path = ?').get(normalizedPath);
+
+    if (!project) return [];
+
+    if (toolType) {
+      return this.db.prepare(`
+        SELECT * FROM ai_sessions
+        WHERE project_id = ? AND tool_type = ?
+        ORDER BY updated_at DESC
+      `).all(project.id, toolType);
+    } else {
+      return this.db.prepare(`
+        SELECT * FROM ai_sessions
+        WHERE project_id = ?
+        ORDER BY updated_at DESC
+      `).all(project.id);
+    }
+  }
+
+  getAISession(projectPath, toolType, sessionKey) {
+    const normalizedPath = path.resolve(projectPath);
+    const project = this.db.prepare('SELECT id FROM projects WHERE path = ?').get(normalizedPath);
+
+    if (!project) return null;
+
+    return this.db.prepare(`
+      SELECT * FROM ai_sessions
+      WHERE project_id = ? AND tool_type = ? AND session_key = ?
+    `).get(project.id, toolType, sessionKey);
+  }
+
+  deleteAISession(sessionId) {
+    this.db.prepare('DELETE FROM ai_sessions WHERE id = ?').run(sessionId);
+  }
+
+  // ========== VISUAL SNAPSHOTS ==========
+
+  saveTabVisualSnapshot(projectPath, tabIndex, snapshot) {
+    const normalizedPath = path.resolve(projectPath);
+    const project = this.db.prepare('SELECT id FROM projects WHERE path = ?').get(normalizedPath);
+
+    if (!project) return;
+
+    const tabs = this.db.prepare('SELECT * FROM tabs WHERE project_id = ? ORDER BY position').all(project.id);
+
+    if (tabIndex < 0 || tabIndex >= tabs.length) return;
+
+    const tab = tabs[tabIndex];
+
+    this.db.prepare(`
+      UPDATE tabs
+      SET visual_snapshot = ?
+      WHERE id = ?
+    `).run(snapshot, tab.id);
+  }
+
+  getTabVisualSnapshot(projectPath, tabIndex) {
+    const normalizedPath = path.resolve(projectPath);
+    const project = this.db.prepare('SELECT id FROM projects WHERE path = ?').get(normalizedPath);
+
+    if (!project) return null;
+
+    const tabs = this.db.prepare('SELECT * FROM tabs WHERE project_id = ? ORDER BY position').all(project.id);
+
+    if (tabIndex < 0 || tabIndex >= tabs.length) return null;
+
+    const tab = tabs[tabIndex];
+    return tab.visual_snapshot;
   }
 
   // ========== CLEANUP ==========
