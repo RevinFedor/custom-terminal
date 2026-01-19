@@ -71,6 +71,7 @@ const notesTabs = document.querySelectorAll('.note-tab');
 const notesContentSession = document.getElementById('notes-content-session');
 const notesContentGemini = document.getElementById('notes-content-gemini');
 const notesContentActions = document.getElementById('notes-content-actions');
+const notesContentSessions = document.getElementById('notes-content-sessions');
 const notesEditor = document.getElementById('notes-editor'); // Session notes
 const actionsList = document.getElementById('actions-list');
 const saveStatus = document.querySelector('.save-status');
@@ -87,8 +88,8 @@ async function init() {
   // Load Projects
   await loadProjects();
 
-  // Auto-open favorite projects
-  await autoOpenFavoriteProjects();
+  // Auto-open favorite projects (DISABLED - causes lag on startup)
+  // await autoOpenFavoriteProjects();
 
   // Start on Dashboard
   showDashboard();
@@ -873,40 +874,14 @@ function switchToProject(projectId) {
   console.timeEnd('[PERF] switchToProject total');
   console.log('[switchToProject] END (sync part)');
 
-  // Restore tabs from saved state or create default tab
+  // Always create a fresh tab on project open (no restoration)
   if (projectData.tabs.size === 0) {
-    const savedTabs = projectData.project.tabs || [];
-
-    if (savedTabs.length > 0) {
-      // Restore saved tabs sequentially
-      console.log('[switchToProject] Restoring', savedTabs.length, 'saved tabs');
-      const t6 = performance.now();
-      (async () => {
-        for (const savedTab of savedTabs) {
-          const tTab = performance.now();
-          console.log('[switchToProject] Creating tab for:', savedTab.name, savedTab.cwd);
-          await createTab(savedTab.cwd || projectData.project.path);
-          console.log(`[switchToProject] Tab created in ${(performance.now() - tTab).toFixed(2)}ms`);
-
-          // Rename last created tab to saved name
-          const lastTabId = `${projectId}-tab-${projectData.tabCounter}`;
-          const tab = projectData.tabs.get(lastTabId);
-          if (tab && savedTab.name) {
-            tab.name = savedTab.name;
-            tab.element.querySelector('.tab-name').textContent = savedTab.name;
-          }
-        }
-        console.log(`[switchToProject] All tabs restored in ${(performance.now() - t6).toFixed(2)}ms`);
-        // After all tabs restored, render them
-        renderTabsForProject(projectId);
-      })();
-    } else {
-      // Create default tab if no saved tabs
-      console.log('[switchToProject] Creating default tab');
-      createTab(projectData.project.path).then(() => {
-        renderTabsForProject(projectId);
-      });
-    }
+    console.log('[switchToProject] Creating fresh tab');
+    createTab(projectData.project.path).then(() => {
+      // Don't call renderTabsForProject here - createTab already calls switchTab
+      // which shows the terminal. renderTabsForProject would hide it again!
+      console.log('[switchToProject] Tab created and activated');
+    });
   } else {
     // Hide/show tabs based on current project
     renderTabsForProject(projectId);
@@ -941,7 +916,7 @@ function renderTabsForProject(projectId) {
     pd.tabs.forEach(tabData => {
       tabData.element.style.display = 'none';
       tabData.element.classList.remove('active');
-      tabData.wrapper.style.display = 'none';
+      tabData.wrapper.classList.add('hidden');
       tabData.wrapper.classList.remove('active');
     });
   });
@@ -1098,7 +1073,12 @@ function createTabElement(tabId, name) {
 
   // Click to switch (but not if we're renaming)
   el.addEventListener('click', (e) => {
-    if (isRenamingTab) return;
+    console.log('[TAB CLICK] Clicked on tab:', tabId);
+    if (isRenamingTab) {
+      console.log('[TAB CLICK] BLOCKED: Currently renaming');
+      return;
+    }
+    console.log('[TAB CLICK] Calling switchTab...');
     switchTab(tabId);
   });
   
@@ -1134,10 +1114,17 @@ function switchTab(tabId) {
     console.log('[switchTab] Same tab, checking visibility');
     // Even if it's the same tab, make sure it's visible
     const tab = projectData.tabs.get(tabId);
-    if (tab && tab.wrapper.style.display !== 'block') {
-      tab.wrapper.style.display = 'block';
-      tab.wrapper.classList.add('active');
-      tab.fitAddon.fit();
+    console.log('[switchTab] Tab data:', tab ? 'exists' : 'NOT FOUND');
+    if (tab) {
+      console.log('[switchTab] Wrapper classes BEFORE:', tab.wrapper.className);
+      console.log('[switchTab] Has hidden class?', tab.wrapper.classList.contains('hidden'));
+      if (tab.wrapper.classList.contains('hidden')) {
+        console.log('[switchTab] Removing hidden class...');
+        tab.wrapper.classList.remove('hidden');
+        tab.wrapper.classList.add('active');
+        console.log('[switchTab] Wrapper classes AFTER:', tab.wrapper.className);
+        tab.fitAddon.fit();
+      }
     }
     console.timeEnd('[PERF] switchTab total');
     return;
@@ -1151,7 +1138,7 @@ function switchTab(tabId) {
     const prevTab = projectData.tabs.get(projectData.activeTabId);
     if (prevTab) {
       prevTab.element.classList.remove('active');
-      prevTab.wrapper.style.display = 'none';
+      prevTab.wrapper.classList.add('hidden');
       prevTab.wrapper.classList.remove('active');
     }
   }
@@ -1164,7 +1151,7 @@ function switchTab(tabId) {
   const nextTab = projectData.tabs.get(tabId);
   if (nextTab) {
     nextTab.element.classList.add('active');
-    nextTab.wrapper.style.display = 'block';
+    nextTab.wrapper.classList.remove('hidden');
     nextTab.wrapper.classList.add('active');
 
     // Restore notes
@@ -1483,12 +1470,13 @@ function setupGlobalListeners() {
       notesTabs.forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
 
-      const target = btn.dataset.tab; // session, gemini, actions
+      const target = btn.dataset.tab; // session, gemini, actions, sessions
 
       // Hide all contents
       notesContentSession.classList.remove('active');
       notesContentGemini.classList.remove('active');
       notesContentActions.classList.remove('active');
+      notesContentSessions.classList.remove('active');
 
       // Show target
       if (target === 'session') notesContentSession.classList.add('active');
@@ -1502,6 +1490,11 @@ function setupGlobalListeners() {
         }
       }
       if (target === 'actions') notesContentActions.classList.add('active');
+      if (target === 'sessions') {
+        notesContentSessions.classList.add('active');
+        // Auto-refresh sessions list when tab is opened
+        refreshSessionsList();
+      }
     });
   });
 
@@ -1988,7 +1981,7 @@ async function openFilePreview(filePath) {
     const projectData = getCurrentProject();
     if (projectData) {
       projectData.tabs.forEach(tabData => {
-        tabData.wrapper.style.display = 'none';
+        tabData.wrapper.classList.add('hidden');
       });
     }
 
@@ -2108,7 +2101,7 @@ function closeFilePreview() {
   if (projectData && projectData.activeTabId) {
     const activeTab = projectData.tabs.get(projectData.activeTabId);
     if (activeTab) {
-      activeTab.wrapper.style.display = 'block';
+      activeTab.wrapper.classList.remove('hidden');
       activeTab.wrapper.classList.add('active');
       // Refit terminal
       requestAnimationFrame(() => {
@@ -2278,23 +2271,87 @@ ipcRenderer.on('terminal:data', (e, { pid, tabId, data }) => {
 // ========== SESSION PERSISTENCE ==========
 
 /**
+ * Show modal prompt (replacement for prompt())
+ */
+function showPromptModal(title, label, placeholder = '', hint = '') {
+  return new Promise((resolve) => {
+    const modal = document.getElementById('session-input-modal');
+    const titleEl = document.getElementById('session-modal-title');
+    const labelEl = document.getElementById('session-modal-label');
+    const inputEl = document.getElementById('session-input-field');
+    const hintEl = document.getElementById('session-modal-hint');
+    const confirmBtn = document.getElementById('confirm-session-btn');
+    const cancelBtn = document.getElementById('cancel-session-btn');
+    const closeBtn = document.getElementById('close-session-modal-btn');
+
+    // Set content
+    titleEl.textContent = title;
+    labelEl.textContent = label;
+    inputEl.placeholder = placeholder;
+    hintEl.textContent = hint;
+    inputEl.value = '';
+
+    // Show modal
+    modal.classList.remove('hidden');
+    inputEl.focus();
+
+    // Handle confirm
+    const handleConfirm = () => {
+      const value = inputEl.value.trim();
+      cleanup();
+      resolve(value || null);
+    };
+
+    // Handle cancel
+    const handleCancel = () => {
+      cleanup();
+      resolve(null);
+    };
+
+    // Handle Enter key
+    const handleKeyPress = (e) => {
+      if (e.key === 'Enter') {
+        handleConfirm();
+      } else if (e.key === 'Escape') {
+        handleCancel();
+      }
+    };
+
+    // Cleanup
+    const cleanup = () => {
+      modal.classList.add('hidden');
+      confirmBtn.removeEventListener('click', handleConfirm);
+      cancelBtn.removeEventListener('click', handleCancel);
+      closeBtn.removeEventListener('click', handleCancel);
+      inputEl.removeEventListener('keypress', handleKeyPress);
+    };
+
+    // Attach listeners
+    confirmBtn.addEventListener('click', handleConfirm);
+    cancelBtn.addEventListener('click', handleCancel);
+    closeBtn.addEventListener('click', handleCancel);
+    inputEl.addEventListener('keypress', handleKeyPress);
+  });
+}
+
+/**
  * Save visual snapshot of current tab
  */
 async function saveVisualSnapshot() {
   if (!activeProjectId) {
-    alert('No active project');
+    showToast('No active project', 'error');
     return;
   }
 
   const projectData = openProjects.get(activeProjectId);
   if (!projectData || !projectData.activeTabId) {
-    alert('No active tab');
+    showToast('No active tab', 'error');
     return;
   }
 
   const tab = projectData.tabs.get(projectData.activeTabId);
   if (!tab || !tab.serializeAddon) {
-    alert('Terminal not ready');
+    showToast('Terminal not ready', 'error');
     return;
   }
 
@@ -2313,8 +2370,10 @@ async function saveVisualSnapshot() {
   });
 
   if (result.success) {
+    showToast('Terminal buffer saved', 'success');
     console.log('[Session] Visual snapshot saved');
   } else {
+    showToast('Failed to save terminal buffer', 'error');
     console.error('[Session] Failed to save visual snapshot:', result.error);
   }
 }
@@ -2344,18 +2403,256 @@ async function restoreVisualSnapshot(tabId, tabIndex) {
 }
 
 /**
+ * Refresh sessions list UI
+ */
+async function refreshSessionsList() {
+  if (!activeProjectId) return;
+
+  const projectData = openProjects.get(activeProjectId);
+  if (!projectData) return;
+
+  console.log('[Sessions] Refreshing sessions list...');
+
+  const result = await ipcRenderer.invoke('session:list', {
+    dirPath: projectData.project.path,
+    toolType: null
+  });
+
+  if (!result.success) {
+    console.error('[Sessions] Failed to load sessions:', result.error);
+    return;
+  }
+
+  const sessions = result.data;
+  console.log('[Sessions] Loaded sessions:', sessions);
+
+  // Separate by type
+  const geminiSessions = sessions.filter(s => s.tool_type === 'gemini');
+  const claudeSessions = sessions.filter(s => s.tool_type === 'claude');
+
+  // Update counts
+  document.getElementById('gemini-session-count').textContent = geminiSessions.length;
+  document.getElementById('claude-session-count').textContent = claudeSessions.length;
+
+  // Render Gemini sessions
+  const geminiList = document.getElementById('gemini-sessions-list');
+  geminiList.innerHTML = '';
+
+  if (geminiSessions.length === 0) {
+    geminiList.innerHTML = '<div class="text-[10px] text-[#555] italic">No saved sessions</div>';
+  } else {
+    geminiSessions.forEach(session => {
+      const item = document.createElement('div');
+      item.className = 'session-item flex items-center gap-2 p-2 bg-[#2a2a2a] hover:bg-[#333] rounded cursor-pointer border border-transparent hover:border-accent transition-colors';
+      item.dataset.sessionKey = session.session_key;
+      item.dataset.sessionType = 'gemini';
+
+      const updatedDate = new Date(session.updated_at * 1000);
+      const timeAgo = getTimeAgo(updatedDate);
+
+      item.innerHTML = `
+        <div class="flex-1 min-w-0">
+          <div class="text-xs text-white truncate">${session.session_key}</div>
+          <div class="text-[10px] text-[#666]">${timeAgo}</div>
+        </div>
+        <button onclick="deleteSession(event, ${session.id})" class="text-[#888] hover:text-red-500 text-xs">🗑️</button>
+      `;
+
+      // Click to select for restore
+      item.addEventListener('click', (e) => {
+        if (e.target.tagName === 'BUTTON') return; // Ignore delete button
+        // Remove selection from all items
+        document.querySelectorAll('#gemini-sessions-list .session-item').forEach(el => {
+          el.classList.remove('border-accent');
+          el.classList.add('border-transparent');
+        });
+        // Add selection to clicked item
+        item.classList.remove('border-transparent');
+        item.classList.add('border-accent');
+      });
+
+      geminiList.appendChild(item);
+    });
+  }
+
+  // Render Claude sessions
+  const claudeList = document.getElementById('claude-sessions-list');
+  claudeList.innerHTML = '';
+
+  if (claudeSessions.length === 0) {
+    claudeList.innerHTML = '<div class="text-[10px] text-[#555] italic">No saved sessions</div>';
+  } else {
+    claudeSessions.forEach(session => {
+      const item = document.createElement('div');
+      item.className = 'session-item flex items-center gap-2 p-2 bg-[#2a2a2a] hover:bg-[#333] rounded cursor-pointer border border-transparent hover:border-accent transition-colors';
+      item.dataset.sessionKey = session.session_key;
+      item.dataset.sessionType = 'claude';
+
+      const updatedDate = new Date(session.updated_at * 1000);
+      const timeAgo = getTimeAgo(updatedDate);
+
+      item.innerHTML = `
+        <div class="flex-1 min-w-0">
+          <div class="text-xs text-white truncate">${session.session_key}</div>
+          <div class="text-[10px] text-[#666]">${timeAgo}</div>
+        </div>
+        <button onclick="deleteSession(event, ${session.id})" class="text-[#888] hover:text-red-500 text-xs">🗑️</button>
+      `;
+
+      item.addEventListener('click', (e) => {
+        if (e.target.tagName === 'BUTTON') return;
+        // Remove selection from all items
+        document.querySelectorAll('#claude-sessions-list .session-item').forEach(el => {
+          el.classList.remove('border-accent');
+          el.classList.add('border-transparent');
+        });
+        // Add selection to clicked item
+        item.classList.remove('border-transparent');
+        item.classList.add('border-accent');
+      });
+
+      claudeList.appendChild(item);
+    });
+  }
+}
+
+/**
+ * Get human-readable time ago
+ */
+function getTimeAgo(date) {
+  const seconds = Math.floor((new Date() - date) / 1000);
+
+  if (seconds < 60) return 'just now';
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
+  return `${Math.floor(seconds / 86400)}d ago`;
+}
+
+/**
+ * Delete session
+ */
+async function deleteSession(event, sessionId) {
+  event.stopPropagation();
+
+  const confirmed = confirm('Delete this session?');
+  if (!confirmed) return;
+
+  const result = await ipcRenderer.invoke('session:delete', sessionId);
+
+  if (result.success) {
+    showToast('Session deleted', 'success');
+    await refreshSessionsList();
+  } else {
+    showToast('Failed to delete session', 'error');
+  }
+}
+
+/**
+ * Wait for terminal output matching pattern
+ * @param {string} tabId - Tab ID to monitor
+ * @param {RegExp} pattern - Pattern to match
+ * @param {number} timeout - Timeout in ms
+ * @returns {Promise<boolean>} - True if pattern found, false if timeout
+ */
+function waitForTerminalOutput(tabId, pattern, timeout = 10000) {
+  return new Promise((resolve) => {
+    let found = false;
+    const startTime = Date.now();
+
+    const checkOutput = (event, data) => {
+      if (data.tabId !== tabId) return;
+
+      const text = data.data;
+      console.log('[Sessions] Terminal output chunk:', text.substring(0, 100));
+
+      if (pattern.test(text)) {
+        console.log('[Sessions] ✅ Pattern matched!');
+        found = true;
+        cleanup();
+        resolve(true);
+      }
+    };
+
+    const cleanup = () => {
+      ipcRenderer.removeListener('terminal:data', checkOutput);
+      clearTimeout(timeoutId);
+    };
+
+    const timeoutId = setTimeout(() => {
+      if (!found) {
+        console.log('[Sessions] ⏱️ Timeout waiting for pattern');
+        cleanup();
+        resolve(false);
+      }
+    }, timeout);
+
+    ipcRenderer.on('terminal:data', checkOutput);
+  });
+}
+
+/**
  * Export Gemini session
+ * Automatically runs /chat save in terminal, then exports to DB
  */
 async function exportGeminiSession() {
   if (!activeProjectId) {
-    alert('No active project');
+    showToast('No active project', 'error');
     return;
   }
 
   const projectData = openProjects.get(activeProjectId);
-  const sessionKey = prompt('Enter Gemini checkpoint name (e.g., "my-session"):');
+
+  if (!projectData.activeTabId) {
+    showToast('Please open a terminal tab first', 'error');
+    return;
+  }
+
+  const sessionKey = await showPromptModal(
+    'Export Gemini Session',
+    'Checkpoint Name',
+    'session-' + Date.now(),
+    'This will run "/chat save <name>" in your terminal'
+  );
 
   if (!sessionKey) return;
+
+  console.log('[Sessions] Starting Gemini export workflow...');
+  console.log('[Sessions] Active tab:', projectData.activeTabId);
+
+  // Step 1: Send /chat save command to terminal
+  showToast('Saving checkpoint in Gemini...', 'info');
+  const saveCommand = `/chat save ${sessionKey}`;
+  console.log('[Sessions] ===== SENDING COMMAND =====');
+  console.log('[Sessions] Command:', JSON.stringify(saveCommand));
+  console.log('[Sessions] Tab ID:', projectData.activeTabId);
+
+  // Start monitoring terminal output BEFORE sending command
+  const successPattern = /checkpoint saved with\s+tag:\s*(\S+)/i;
+  console.log('[Sessions] Starting output monitor with pattern:', successPattern);
+  const outputPromise = waitForTerminalOutput(projectData.activeTabId, successPattern, 8000);
+
+  // Send command
+  console.log('[Sessions] Calling ipcRenderer.send...');
+  ipcRenderer.send('terminal:executeCommand', projectData.activeTabId, saveCommand);
+  console.log('[Sessions] ✅ IPC send called');
+
+  // Step 2: Wait for confirmation from Gemini
+  console.log('[Sessions] Waiting for Gemini confirmation...');
+  const success = await outputPromise;
+
+  if (!success) {
+    showToast('Timeout: Gemini did not confirm save. Check terminal.', 'error');
+    console.error('[Sessions] ❌ Did not receive checkpoint confirmation');
+    return;
+  }
+
+  console.log('[Sessions] ✅ Gemini confirmed checkpoint save');
+
+  // Small additional delay to ensure file is written to disk
+  await new Promise(resolve => setTimeout(resolve, 500));
+
+  // Step 3: Export the checkpoint to database
+  showToast('Exporting to database...', 'info');
 
   const result = await ipcRenderer.invoke('session:export-gemini', {
     dirPath: projectData.project.path,
@@ -2363,30 +2660,41 @@ async function exportGeminiSession() {
   });
 
   if (result.success) {
-    alert(result.message);
+    showToast(result.message, 'success');
+    await refreshSessionsList(); // Refresh list after export
   } else {
-    alert('Export failed: ' + result.message);
+    showToast('Export failed: ' + result.message, 'error');
   }
 }
 
 /**
- * Import Gemini session
+ * Import Gemini session from selected item in list
  */
-async function importGeminiSession() {
+async function importGeminiSessionFromList() {
   if (!activeProjectId) {
-    alert('No active project');
+    showToast('No active project', 'error');
     return;
   }
 
   const projectData = openProjects.get(activeProjectId);
-  const sessionKey = prompt('Enter Gemini checkpoint name to restore:');
-
-  if (!sessionKey) return;
 
   if (!projectData.activeTabId) {
-    alert('Please create a tab first');
+    showToast('Please create a tab first', 'error');
     return;
   }
+
+  // Get selected session from list
+  const selectedItem = document.querySelector('#gemini-sessions-list .session-item.border-accent');
+
+  if (!selectedItem) {
+    showToast('Please select a session from the list', 'error');
+    return;
+  }
+
+  const sessionKey = selectedItem.dataset.sessionKey;
+  console.log('[Sessions] Restoring Gemini session:', sessionKey);
+
+  showToast('Restoring session...', 'info');
 
   const result = await ipcRenderer.invoke('session:import-gemini', {
     dirPath: projectData.project.path,
@@ -2395,17 +2703,227 @@ async function importGeminiSession() {
   });
 
   if (result.success) {
-    alert(result.message);
+    showToast(result.message, 'success');
 
-    // Auto-execute restore commands if provided
-    if (result.commands && result.commands.length > 0) {
-      for (const cmd of result.commands) {
-        await new Promise(resolve => setTimeout(resolve, 1000));
-        ipcRenderer.send('terminal:executeCommand', projectData.activeTabId, cmd);
+    // Smart auto-resume with state detection
+    await smartGeminiResume(projectData.activeTabId, sessionKey);
+  } else {
+    showToast('Import failed: ' + result.message, 'error');
+  }
+}
+
+/**
+ * Smart Gemini resume - detects if Gemini is running and waits for ready state
+ */
+async function smartGeminiResume(tabId, sessionKey) {
+  const tab = getTabById(tabId);
+  if (!tab) {
+    console.error('[SmartResume] Tab not found:', tabId);
+    return;
+  }
+
+  console.log('[SmartResume] Starting smart resume for session:', sessionKey);
+
+  // Step 1: Check if Gemini is already running
+  const isGeminiRunning = await detectGeminiRunning(tab);
+
+  if (isGeminiRunning) {
+    console.log('[SmartResume] ✅ Gemini already running, sending resume command directly');
+    showToast('Resuming session...', 'info');
+    ipcRenderer.send('terminal:executeCommand', tabId, `/chat resume ${sessionKey}`);
+    return;
+  }
+
+  // Step 2: Gemini not running, start it
+  console.log('[SmartResume] Gemini not running, starting...');
+  showToast('Starting Gemini CLI...', 'info');
+  ipcRenderer.send('terminal:executeCommand', tabId, 'gemini');
+
+  // Step 3: Wait for Gemini to be ready
+  console.log('[SmartResume] Waiting for Gemini to be ready...');
+  const ready = await waitForGeminiReady(tab, 15000); // 15 second timeout
+
+  if (!ready) {
+    console.error('[SmartResume] ❌ Timeout waiting for Gemini to start');
+    showToast('Timeout waiting for Gemini. Please run: /chat resume ' + sessionKey, 'warning');
+    return;
+  }
+
+  // Step 4: Gemini ready, send resume command
+  console.log('[SmartResume] ✅ Gemini ready, sending resume command');
+  showToast('Resuming session...', 'info');
+  await new Promise(resolve => setTimeout(resolve, 500)); // Small delay for stability
+  ipcRenderer.send('terminal:executeCommand', tabId, `/chat resume ${sessionKey}`);
+
+  showToast('Session resumed successfully!', 'success');
+}
+
+/**
+ * Detect if Gemini is currently running in the terminal
+ *
+ * ISSUE: Current buffer-based detection is unreliable because:
+ * 1. Old patterns remain in buffer from previous sessions
+ * 2. Can't distinguish "Gemini running now" vs "Gemini was running before"
+ *
+ * TODO: Better approach - check PTY child processes via main.js IPC
+ * ipcRenderer.invoke('terminal:getActiveProcess', tabId) -> 'gemini' | 'claude' | null
+ */
+async function detectGeminiRunning(tab) {
+  console.log('[DetectGemini] ========== START DETECTION ==========');
+
+  // Check terminal buffer for Gemini prompt patterns
+  if (!tab.serializeAddon) {
+    console.log('[DetectGemini] ❌ No serializeAddon available');
+    return false;
+  }
+
+  const buffer = tab.serializeAddon.serialize();
+  const bufferLength = buffer.length;
+
+  // Only check last 2000 chars (recent output)
+  const recentBuffer = buffer.slice(-2000);
+  const lastLines = recentBuffer.split('\n').slice(-20); // Last 20 lines
+
+  console.log('[DetectGemini] Buffer length:', bufferLength);
+  console.log('[DetectGemini] Last 20 lines:', lastLines);
+
+  // Gemini prompt patterns - only in RECENT output
+  const geminiPatterns = [
+    'Type your message or @path/to/file',
+    'YOLO mode',
+    // Removed />\s*$/m - too generic, matches bash prompt too
+  ];
+
+  for (const pattern of geminiPatterns) {
+    if (typeof pattern === 'string') {
+      // Check only in recent buffer
+      if (recentBuffer.includes(pattern)) {
+        console.log('[DetectGemini] ✅ Found pattern in recent output:', pattern);
+        return true;
       }
     }
+  }
+
+  console.log('[DetectGemini] ❌ No Gemini patterns found in recent output');
+  return false;
+}
+
+/**
+ * Wait for Gemini to be ready (detect ready pattern in terminal output)
+ *
+ * ISSUE: Same as detectGeminiRunning - buffer-based detection is unreliable
+ * TODO: Use PTY process monitoring instead
+ */
+function waitForGeminiReady(tab, timeoutMs = 15000) {
+  console.log('[WaitGeminiReady] ========== WAITING FOR GEMINI ==========');
+  console.log('[WaitGeminiReady] Timeout:', timeoutMs, 'ms');
+
+  return new Promise((resolve) => {
+    const startTime = Date.now();
+    let lastCheckTime = Date.now();
+    let checkCount = 0;
+    let lastBufferSnapshot = '';
+
+    const checkInterval = setInterval(() => {
+      // Timeout check
+      if (Date.now() - startTime > timeoutMs) {
+        clearInterval(checkInterval);
+        console.log('[WaitGeminiReady] ⏱️ Timeout after', checkCount, 'checks');
+        resolve(false);
+        return;
+      }
+
+      // Only check every 500ms to avoid spam
+      if (Date.now() - lastCheckTime < 500) return;
+      lastCheckTime = Date.now();
+      checkCount++;
+
+      // Check terminal buffer
+      if (!tab.serializeAddon) {
+        console.log('[WaitGeminiReady] ❌ No serializeAddon');
+        return;
+      }
+
+      const buffer = tab.serializeAddon.serialize();
+
+      // Log if buffer changed (new output)
+      const recentBuffer = buffer.slice(-1000);
+      if (recentBuffer !== lastBufferSnapshot) {
+        console.log('[WaitGeminiReady] Check #', checkCount, '- Buffer changed, last 200 chars:', recentBuffer.slice(-200));
+        lastBufferSnapshot = recentBuffer;
+      }
+
+      // Ready patterns (Gemini shows these when ready for input)
+      const readyPatterns = [
+        'Type your message or @path/to/file',
+        'YOLO mode',
+      ];
+
+      for (const pattern of readyPatterns) {
+        // Check only recent buffer
+        if (recentBuffer.includes(pattern)) {
+          clearInterval(checkInterval);
+          console.log('[WaitGeminiReady] ✅ Ready! Found pattern:', pattern, 'after', checkCount, 'checks');
+          resolve(true);
+          return;
+        }
+      }
+    }, 100); // Check every 100ms
+  });
+}
+
+/**
+ * Helper to get tab by ID across all projects
+ */
+function getTabById(tabId) {
+  for (const [projId, projectData] of openProjects) {
+    if (projectData.tabs.has(tabId)) {
+      return projectData.tabs.get(tabId);
+    }
+  }
+  return null;
+}
+
+/**
+ * Import Gemini session (manual prompt version)
+ */
+async function importGeminiSession() {
+  if (!activeProjectId) {
+    showToast('No active project', 'error');
+    return;
+  }
+
+  const projectData = openProjects.get(activeProjectId);
+
+  if (!projectData.activeTabId) {
+    showToast('Please create a tab first', 'error');
+    return;
+  }
+
+  const sessionKey = await showPromptModal(
+    'Restore Gemini Session',
+    'Checkpoint Name',
+    'test-001',
+    'Enter the checkpoint name to restore'
+  );
+
+  if (!sessionKey) return;
+
+  showToast('Restoring session...', 'info');
+
+  const result = await ipcRenderer.invoke('session:import-gemini', {
+    dirPath: projectData.project.path,
+    sessionKey,
+    tabId: projectData.activeTabId
+  });
+
+  if (result.success) {
+    showToast(result.message, 'success');
+
+    // Smart auto-resume with state detection
+    await smartGeminiResume(projectData.activeTabId, sessionKey);
   } else {
-    alert('Import failed: ' + result.message);
+    showToast('Import failed: ' + result.message, 'error');
   }
 }
 
@@ -2414,38 +2932,88 @@ async function importGeminiSession() {
  */
 async function exportClaudeSession() {
   if (!activeProjectId) {
-    alert('No active project');
+    showToast('No active project', 'error');
     return;
   }
 
   const projectData = openProjects.get(activeProjectId);
-  let sessionKey = prompt('Enter Claude session UUID (leave empty to auto-detect latest):');
+  const sessionKey = await showPromptModal(
+    'Export Claude Session',
+    'Session UUID (optional)',
+    '',
+    'Leave empty to auto-detect latest session'
+  );
 
-  sessionKey = sessionKey || '';
-
+  // Allow empty for auto-detect
   const result = await ipcRenderer.invoke('session:export-claude', {
+    dirPath: projectData.project.path,
+    sessionKey: sessionKey || ''
+  });
+
+  if (result.success) {
+    showToast(result.message, 'success');
+    await refreshSessionsList(); // Refresh list after export
+  } else {
+    showToast('Export failed: ' + result.message, 'error');
+  }
+}
+
+/**
+ * Import Claude session from selected item in list
+ */
+async function importClaudeSessionFromList() {
+  if (!activeProjectId) {
+    showToast('No active project', 'error');
+    return;
+  }
+
+  const projectData = openProjects.get(activeProjectId);
+
+  // Get selected session from list
+  const selectedItem = document.querySelector('#claude-sessions-list .session-item.border-accent');
+
+  if (!selectedItem) {
+    showToast('Please select a session from the list', 'error');
+    return;
+  }
+
+  const sessionKey = selectedItem.dataset.sessionKey;
+  console.log('[Sessions] Restoring Claude session:', sessionKey);
+
+  const result = await ipcRenderer.invoke('session:import-claude', {
     dirPath: projectData.project.path,
     sessionKey
   });
 
   if (result.success) {
-    alert(result.message);
+    showToast(result.message, 'success');
+
+    // Show command to user
+    if (result.commands && result.commands.length > 0) {
+      console.log('[Session] Run this command:', result.commands[0]);
+      showToast('Run: ' + result.commands[0], 'info');
+    }
   } else {
-    alert('Export failed: ' + result.message);
+    showToast('Import failed: ' + result.message, 'error');
   }
 }
 
 /**
- * Import Claude session
+ * Import Claude session (manual input - kept for backward compatibility)
  */
 async function importClaudeSession() {
   if (!activeProjectId) {
-    alert('No active project');
+    showToast('No active project', 'error');
     return;
   }
 
   const projectData = openProjects.get(activeProjectId);
-  const sessionKey = prompt('Enter Claude session UUID to restore:');
+  const sessionKey = await showPromptModal(
+    'Restore Claude Session',
+    'Session UUID',
+    '',
+    'Enter the session UUID to restore'
+  );
 
   if (!sessionKey) return;
 
@@ -2455,47 +3023,15 @@ async function importClaudeSession() {
   });
 
   if (result.success) {
-    alert(result.message);
+    showToast(result.message, 'success');
 
     // Show command to user
     if (result.commands && result.commands.length > 0) {
       console.log('[Session] Run this command:', result.commands[0]);
+      showToast('Run: ' + result.commands[0], 'info');
     }
   } else {
-    alert('Import failed: ' + result.message);
-  }
-}
-
-/**
- * List saved sessions
- */
-async function listSessions() {
-  if (!activeProjectId) {
-    alert('No active project');
-    return;
-  }
-
-  const projectData = openProjects.get(activeProjectId);
-
-  const result = await ipcRenderer.invoke('session:list', {
-    dirPath: projectData.project.path,
-    toolType: null // null = all types
-  });
-
-  if (result.success) {
-    console.log('[Session] Saved sessions:', result.data);
-
-    if (result.data.length === 0) {
-      alert('No saved sessions found');
-    } else {
-      const sessionList = result.data.map(s =>
-        `${s.tool_type}: ${s.session_key} (updated: ${new Date(s.updated_at * 1000).toLocaleString()})`
-      ).join('\n');
-
-      alert('Saved Sessions:\n\n' + sessionList);
-    }
-  } else {
-    alert('Failed to list sessions: ' + result.error);
+    showToast('Import failed: ' + result.message, 'error');
   }
 }
 
@@ -2503,9 +3039,12 @@ async function listSessions() {
 window.saveVisualSnapshot = saveVisualSnapshot;
 window.exportGeminiSession = exportGeminiSession;
 window.importGeminiSession = importGeminiSession;
+window.importGeminiSessionFromList = importGeminiSessionFromList;
 window.exportClaudeSession = exportClaudeSession;
 window.importClaudeSession = importClaudeSession;
-window.listSessions = listSessions;
+window.importClaudeSessionFromList = importClaudeSessionFromList;
+window.refreshSessionsList = refreshSessionsList;
+window.deleteSession = deleteSession;
 
 // Run Init
 init();

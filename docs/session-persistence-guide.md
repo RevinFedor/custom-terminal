@@ -84,19 +84,19 @@ Click the **"Sessions"** tab in the right panel (next to Notes, AI, Actions).
 
 ## How It Works
 
-### Gemini CLI ("Trojan Horse" Method)
+### Gemini CLI ("Direct Injection" Method)
 
-Since Gemini CLI doesn't expose a direct API for checkpoint management, we use a workaround:
+Gemini CLI scans the filesystem for checkpoints - there's no internal registry. This makes restoration simple:
 
 1. **Export:**
    - Reads checkpoint file from `~/.gemini/tmp/<hash>/checkpoint-<name>.json`
    - Stores in database with original path and hash
 
 2. **Import:**
-   - Creates a temporary "trojan" checkpoint in Gemini
-   - Replaces its content with the saved session
+   - Calculates new directory hash (SHA-256 of current working directory)
+   - Creates checkpoint file directly with original name
    - Patches all file paths and directory hashes to match new location
-   - Renames to original session name
+   - Gemini automatically discovers it when you run `/chat resume`
 
 ### Claude Code (Direct JSONL Manipulation)
 

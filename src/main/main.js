@@ -1,11 +1,8 @@
 const { app, BrowserWindow, ipcMain, Menu, dialog } = require('electron');
 const path = require('path');
 const pty = require('node-pty');
-
-// Resolve paths relative to project root (not dist/main/)
-const rootDir = path.join(__dirname, '..', '..');
-const projectManager = require(path.join(rootDir, 'project-manager'));
-const SessionManager = require(path.join(rootDir, 'session-manager'));
+const projectManager = require('./project-manager');
+const SessionManager = require('./session-manager');
 
 const isDev = process.env.NODE_ENV === 'development';
 
@@ -18,7 +15,12 @@ function createWindow() {
   const windowOptions = {
     width: 1200,
     height: 800,
-    titleBarStyle: 'hiddenInset',
+    titleBarStyle: 'hidden',
+    titleBarOverlay: {
+      color: 'rgba(0,0,0,0)',
+      height: 40,
+      symbolColor: '#ffffff'
+    },
     webPreferences: {
       nodeIntegration: true,
       contextIsolation: false,
@@ -35,15 +37,7 @@ function createWindow() {
     }
   }
 
-  // Load from Vite dev server in development, or from file in production
-  const VITE_DEV_SERVER_URL = process.env.VITE_DEV_SERVER_URL || (isDev ? 'http://localhost:5173' : null);
-
-  if (VITE_DEV_SERVER_URL) {
-    mainWindow.loadURL(VITE_DEV_SERVER_URL);
-    mainWindow.webContents.openDevTools();
-  } else {
-    mainWindow.loadFile(path.join(rootDir, 'dist/renderer/index.html'));
-  }
+  mainWindow.loadFile('index.html');
 }
 
 // Context Menu IPC
@@ -171,6 +165,44 @@ ipcMain.on('terminal:kill', (event, tabId) => {
     term.kill();
     terminals.delete(tabId);
   }
+});
+
+// Get current working directory of terminal process
+ipcMain.handle('terminal:getCwd', async (event, tabId) => {
+  const term = terminals.get(tabId);
+  if (!term) return null;
+
+  try {
+    const { execSync } = require('child_process');
+
+    // Get child process of shell (the actual foreground process)
+    // First try to get the shell's cwd directly
+    const pid = term.pid;
+
+    if (process.platform === 'darwin') {
+      // macOS: use lsof to get cwd
+      const result = execSync(`lsof -p ${pid} | grep cwd | awk '{print $9}'`, {
+        encoding: 'utf-8',
+        timeout: 1000
+      }).trim();
+
+      if (result) {
+        console.log('[main] Got cwd for', tabId, ':', result);
+        return result;
+      }
+    } else if (process.platform === 'linux') {
+      // Linux: read /proc/<pid>/cwd symlink
+      const fs = require('fs');
+      const cwd = fs.readlinkSync(`/proc/${pid}/cwd`);
+      console.log('[main] Got cwd for', tabId, ':', cwd);
+      return cwd;
+    }
+  } catch (e) {
+    console.error('[main] Failed to get cwd:', e.message);
+  }
+
+  // Fallback to stored cwd
+  return terminalProjects.get(tabId) || null;
 });
 
 // Notes management

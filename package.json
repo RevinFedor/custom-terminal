@@ -2,15 +2,22 @@
   "name": "noted-terminal",
   "version": "1.0.0",
   "description": "Terminal with tabs and notes",
-  "main": "main.js",
+  "main": "dist/main/main.js",
   "scripts": {
     "start": "electron .",
-    "dev": "NODE_ENV=development nodemon --exec electron . --watch main.js --watch project-manager.js --watch renderer.js --watch index.html --ignore output.css --delay 1000ms",
+    "dev": "NODE_ENV=development electron-vite dev",
+    "dev:legacy": "NODE_ENV=development electron .",
     "dev:css": "tailwindcss -i input.css -o output.css --watch",
+    "build": "electron-vite build && electron-builder",
     "build:css": "tailwindcss -i input.css -o output.css",
+    "build:vite": "electron-vite build",
+    "preview": "electron-vite preview",
     "rebuild": "electron-rebuild -f -w node-pty",
-    "build": "electron-builder",
-    "dist": "electron-builder --mac --dir"
+    "dist": "electron-builder --mac --dir",
+    "test:e2e": "cd runtime-tests && npx playwright test",
+    "test:e2e:headed": "cd runtime-tests && npx playwright test --headed",
+    "test:e2e:debug": "cd runtime-tests && npx playwright test --debug",
+    "test:report": "cd runtime-tests && npx playwright show-report results/playwright-report"
   },
   "build": {
     "appId": "com.noted.terminal",
@@ -26,6 +33,9 @@
     }
   },
   "dependencies": {
+    "@dnd-kit/core": "^6.3.1",
+    "@dnd-kit/sortable": "^10.0.0",
+    "@dnd-kit/utilities": "^3.2.2",
     "@xterm/addon-fit": "^0.10.0",
     "@xterm/addon-serialize": "^0.14.0",
     "@xterm/addon-web-links": "^0.11.0",
@@ -33,15 +43,22 @@
     "@xterm/xterm": "^5.5.0",
     "better-sqlite3": "^12.6.2",
     "highlight.js": "^11.11.1",
-    "node-pty": "^1.0.0"
+    "node-pty": "^1.0.0",
+    "react": "^19.2.3",
+    "react-dom": "^19.2.3",
+    "zustand": "^5.0.10"
   },
   "devDependencies": {
     "@electron/rebuild": "^4.0.2",
+    "@playwright/test": "^1.57.0",
     "@tailwindcss/cli": "^4.1.18",
+    "@vitejs/plugin-react": "^5.1.2",
     "electron": "^28.0.0",
     "electron-builder": "^25.1.8",
     "electron-rebuild": "^3.2.9",
-    "nodemon": "^3.1.11",
-    "tailwindcss": "^4.1.18"
+    "electron-vite": "^5.0.0",
+    "playwright": "^1.57.0",
+    "tailwindcss": "^4.1.18",
+    "vite": "^7.3.1"
   }
 }
