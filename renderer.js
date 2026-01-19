@@ -5,6 +5,7 @@ const { Terminal } = require('@xterm/xterm');
 const { FitAddon } = require('@xterm/addon-fit');
 const { WebLinksAddon } = require('@xterm/addon-web-links');
 const { WebglAddon } = require('@xterm/addon-webgl');
+const { SerializeAddon } = require('@xterm/addon-serialize');
 const hljs = require('highlight.js');
 
 // --- State ---
@@ -998,7 +999,9 @@ async function createTab(cwd) {
   });
 
   const fitAddon = new FitAddon();
+  const serializeAddon = new SerializeAddon();
   terminal.loadAddon(fitAddon);
+  terminal.loadAddon(serializeAddon);
   terminal.loadAddon(new WebLinksAddon());
 
   try {
@@ -1040,6 +1043,7 @@ async function createTab(cwd) {
   projectData.tabs.set(tabId, {
     terminal,
     fitAddon,
+    serializeAddon,
     element: tabEl,
     wrapper,
     name: `Tab ${projectData.tabCounter}`,
@@ -2270,6 +2274,238 @@ ipcRenderer.on('terminal:data', (e, { pid, tabId, data }) => {
     }, FLUSH_DELAY);
   }
 });
+
+// ========== SESSION PERSISTENCE ==========
+
+/**
+ * Save visual snapshot of current tab
+ */
+async function saveVisualSnapshot() {
+  if (!activeProjectId) {
+    alert('No active project');
+    return;
+  }
+
+  const projectData = openProjects.get(activeProjectId);
+  if (!projectData || !projectData.activeTabId) {
+    alert('No active tab');
+    return;
+  }
+
+  const tab = projectData.tabs.get(projectData.activeTabId);
+  if (!tab || !tab.serializeAddon) {
+    alert('Terminal not ready');
+    return;
+  }
+
+  // Get tab index
+  const tabs = Array.from(projectData.tabs.keys());
+  const tabIndex = tabs.indexOf(projectData.activeTabId);
+
+  // Serialize terminal buffer
+  const snapshot = tab.serializeAddon.serialize();
+
+  // Save to database
+  const result = await ipcRenderer.invoke('session:save-visual', {
+    dirPath: projectData.project.path,
+    tabIndex,
+    snapshot
+  });
+
+  if (result.success) {
+    console.log('[Session] Visual snapshot saved');
+  } else {
+    console.error('[Session] Failed to save visual snapshot:', result.error);
+  }
+}
+
+/**
+ * Restore visual snapshot for a tab (called during tab creation)
+ */
+async function restoreVisualSnapshot(tabId, tabIndex) {
+  if (!activeProjectId) return;
+
+  const projectData = openProjects.get(activeProjectId);
+  if (!projectData) return;
+
+  const tab = projectData.tabs.get(tabId);
+  if (!tab || !tab.terminal) return;
+
+  // Get visual snapshot from database
+  const result = await ipcRenderer.invoke('session:get-visual', {
+    dirPath: projectData.project.path,
+    tabIndex
+  });
+
+  if (result.success && result.data) {
+    console.log('[Session] Restoring visual snapshot');
+    tab.terminal.write(result.data);
+  }
+}
+
+/**
+ * Export Gemini session
+ */
+async function exportGeminiSession() {
+  if (!activeProjectId) {
+    alert('No active project');
+    return;
+  }
+
+  const projectData = openProjects.get(activeProjectId);
+  const sessionKey = prompt('Enter Gemini checkpoint name (e.g., "my-session"):');
+
+  if (!sessionKey) return;
+
+  const result = await ipcRenderer.invoke('session:export-gemini', {
+    dirPath: projectData.project.path,
+    sessionKey
+  });
+
+  if (result.success) {
+    alert(result.message);
+  } else {
+    alert('Export failed: ' + result.message);
+  }
+}
+
+/**
+ * Import Gemini session
+ */
+async function importGeminiSession() {
+  if (!activeProjectId) {
+    alert('No active project');
+    return;
+  }
+
+  const projectData = openProjects.get(activeProjectId);
+  const sessionKey = prompt('Enter Gemini checkpoint name to restore:');
+
+  if (!sessionKey) return;
+
+  if (!projectData.activeTabId) {
+    alert('Please create a tab first');
+    return;
+  }
+
+  const result = await ipcRenderer.invoke('session:import-gemini', {
+    dirPath: projectData.project.path,
+    sessionKey,
+    tabId: projectData.activeTabId
+  });
+
+  if (result.success) {
+    alert(result.message);
+
+    // Auto-execute restore commands if provided
+    if (result.commands && result.commands.length > 0) {
+      for (const cmd of result.commands) {
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        ipcRenderer.send('terminal:executeCommand', projectData.activeTabId, cmd);
+      }
+    }
+  } else {
+    alert('Import failed: ' + result.message);
+  }
+}
+
+/**
+ * Export Claude session
+ */
+async function exportClaudeSession() {
+  if (!activeProjectId) {
+    alert('No active project');
+    return;
+  }
+
+  const projectData = openProjects.get(activeProjectId);
+  let sessionKey = prompt('Enter Claude session UUID (leave empty to auto-detect latest):');
+
+  sessionKey = sessionKey || '';
+
+  const result = await ipcRenderer.invoke('session:export-claude', {
+    dirPath: projectData.project.path,
+    sessionKey
+  });
+
+  if (result.success) {
+    alert(result.message);
+  } else {
+    alert('Export failed: ' + result.message);
+  }
+}
+
+/**
+ * Import Claude session
+ */
+async function importClaudeSession() {
+  if (!activeProjectId) {
+    alert('No active project');
+    return;
+  }
+
+  const projectData = openProjects.get(activeProjectId);
+  const sessionKey = prompt('Enter Claude session UUID to restore:');
+
+  if (!sessionKey) return;
+
+  const result = await ipcRenderer.invoke('session:import-claude', {
+    dirPath: projectData.project.path,
+    sessionKey
+  });
+
+  if (result.success) {
+    alert(result.message);
+
+    // Show command to user
+    if (result.commands && result.commands.length > 0) {
+      console.log('[Session] Run this command:', result.commands[0]);
+    }
+  } else {
+    alert('Import failed: ' + result.message);
+  }
+}
+
+/**
+ * List saved sessions
+ */
+async function listSessions() {
+  if (!activeProjectId) {
+    alert('No active project');
+    return;
+  }
+
+  const projectData = openProjects.get(activeProjectId);
+
+  const result = await ipcRenderer.invoke('session:list', {
+    dirPath: projectData.project.path,
+    toolType: null // null = all types
+  });
+
+  if (result.success) {
+    console.log('[Session] Saved sessions:', result.data);
+
+    if (result.data.length === 0) {
+      alert('No saved sessions found');
+    } else {
+      const sessionList = result.data.map(s =>
+        `${s.tool_type}: ${s.session_key} (updated: ${new Date(s.updated_at * 1000).toLocaleString()})`
+      ).join('\n');
+
+      alert('Saved Sessions:\n\n' + sessionList);
+    }
+  } else {
+    alert('Failed to list sessions: ' + result.error);
+  }
+}
+
+// Expose functions globally for button access
+window.saveVisualSnapshot = saveVisualSnapshot;
+window.exportGeminiSession = exportGeminiSession;
+window.importGeminiSession = importGeminiSession;
+window.exportClaudeSession = exportClaudeSession;
+window.importClaudeSession = importClaudeSession;
+window.listSessions = listSessions;
 
 // Run Init
 init();

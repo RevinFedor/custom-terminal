@@ -2,12 +2,14 @@ const { app, BrowserWindow, ipcMain, Menu, dialog } = require('electron');
 const path = require('path');
 const pty = require('node-pty');
 const projectManager = require('./project-manager');
+const SessionManager = require('./session-manager');
 
 const isDev = process.env.NODE_ENV === 'development';
 
 let mainWindow;
 const terminals = new Map(); // tabId -> ptyProcess
 const terminalProjects = new Map(); // tabId -> cwd path
+let sessionManager; // Initialized after projectManager is ready
 
 function createWindow() {
   const windowOptions = {
@@ -82,7 +84,11 @@ ipcMain.on('show-terminal-context-menu', async (event, { hasSelection, prompts }
   menu.popup(BrowserWindow.fromWebContents(event.sender));
 });
 
-app.whenReady().then(createWindow);
+app.whenReady().then(() => {
+  // Initialize session manager with database from project manager
+  sessionManager = new SessionManager(projectManager.db);
+  createWindow();
+});
 
 app.on('window-all-closed', () => {
   // Kill all terminals
@@ -331,6 +337,104 @@ ipcMain.handle('prompts:save', async (event, prompts) => {
     return { success: true };
   } catch (error) {
     console.error('[main] Error saving prompts:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// ========== SESSION PERSISTENCE ==========
+
+// Export Gemini session
+ipcMain.handle('session:export-gemini', async (event, { dirPath, sessionKey }) => {
+  try {
+    const result = await sessionManager.exportGeminiSession(dirPath, sessionKey);
+    return result;
+  } catch (error) {
+    console.error('[main] Error exporting Gemini session:', error);
+    return { success: false, message: error.message };
+  }
+});
+
+// Import Gemini session
+ipcMain.handle('session:import-gemini', async (event, { dirPath, sessionKey, tabId }) => {
+  try {
+    // Helper function to send commands to PTY
+    const sendCommand = (tid, cmd) => {
+      const term = terminals.get(tid);
+      if (term) {
+        term.write(cmd + '\r');
+      }
+    };
+
+    const result = await sessionManager.importGeminiSession(dirPath, sessionKey, sendCommand, tabId);
+    return result;
+  } catch (error) {
+    console.error('[main] Error importing Gemini session:', error);
+    return { success: false, message: error.message };
+  }
+});
+
+// Export Claude session
+ipcMain.handle('session:export-claude', async (event, { dirPath, sessionKey }) => {
+  try {
+    const result = await sessionManager.exportClaudeSession(dirPath, sessionKey);
+    return result;
+  } catch (error) {
+    console.error('[main] Error exporting Claude session:', error);
+    return { success: false, message: error.message };
+  }
+});
+
+// Import Claude session
+ipcMain.handle('session:import-claude', async (event, { dirPath, sessionKey }) => {
+  try {
+    const result = await sessionManager.importClaudeSession(dirPath, sessionKey);
+    return result;
+  } catch (error) {
+    console.error('[main] Error importing Claude session:', error);
+    return { success: false, message: error.message };
+  }
+});
+
+// List all sessions for a project
+ipcMain.handle('session:list', async (event, { dirPath, toolType }) => {
+  try {
+    const sessions = sessionManager.listSessions(dirPath, toolType);
+    return { success: true, data: sessions };
+  } catch (error) {
+    console.error('[main] Error listing sessions:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// Delete session
+ipcMain.handle('session:delete', async (event, sessionId) => {
+  try {
+    sessionManager.deleteSession(sessionId);
+    return { success: true };
+  } catch (error) {
+    console.error('[main] Error deleting session:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// Save visual snapshot for a tab
+ipcMain.handle('session:save-visual', async (event, { dirPath, tabIndex, snapshot }) => {
+  try {
+    projectManager.db.saveTabVisualSnapshot(dirPath, tabIndex, snapshot);
+    return { success: true };
+  } catch (error) {
+    console.error('[main] Error saving visual snapshot:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// Get visual snapshot for a tab
+ipcMain.handle('session:get-visual', async (event, { dirPath, tabIndex }) => {
+  try {
+    const snapshot = projectManager.db.getTabVisualSnapshot(dirPath, tabIndex);
+    return { success: true, data: snapshot };
+  } catch (error) {
+    console.error('[main] Error getting visual snapshot:', error);
     return { success: false, error: error.message };
   }
 });

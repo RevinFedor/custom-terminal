@@ -103,6 +103,7 @@
           <button class="note-tab active flex-1 bg-transparent border-none text-[#888] py-2 text-xs cursor-pointer border-b-2 border-transparent hover:text-[#ccc]" data-tab="session">Notes</button>
           <button class="note-tab flex-1 bg-transparent border-none text-[#888] py-2 text-xs cursor-pointer border-b-2 border-transparent hover:text-[#ccc]" data-tab="gemini">AI</button>
           <button class="note-tab flex-1 bg-transparent border-none text-[#888] py-2 text-xs cursor-pointer border-b-2 border-transparent hover:text-[#ccc]" data-tab="actions">Actions</button>
+          <button class="note-tab flex-1 bg-transparent border-none text-[#888] py-2 text-xs cursor-pointer border-b-2 border-transparent hover:text-[#ccc]" data-tab="sessions">Sessions</button>
         </div>
 
         <!-- Session Notes -->
@@ -131,6 +132,38 @@
             <span>Quick Actions</span>
           </div>
           <div id="actions-list" class="p-2.5 flex flex-col gap-2"></div>
+        </div>
+
+        <!-- Session Persistence -->
+        <div id="notes-content-sessions" class="notes-content flex-1 flex-col hidden">
+          <div class="notes-header px-3 py-2 bg-[#333] text-[11px] uppercase text-[#aaa] flex justify-between items-center">
+            <span>Session Manager</span>
+          </div>
+          <div class="p-2.5 flex flex-col gap-2 overflow-y-auto">
+            <div class="text-[10px] text-[#666] mb-2">Gemini CLI</div>
+            <button onclick="exportGeminiSession()" class="w-full bg-[#2d2d2d] hover:bg-[#3d3d3d] border border-border-main rounded px-3 py-2 text-xs text-white cursor-pointer transition-colors">
+              Export Gemini Session
+            </button>
+            <button onclick="importGeminiSession()" class="w-full bg-[#2d2d2d] hover:bg-[#3d3d3d] border border-border-main rounded px-3 py-2 text-xs text-white cursor-pointer transition-colors">
+              Restore Gemini Session
+            </button>
+
+            <div class="text-[10px] text-[#666] mb-2 mt-4">Claude Code</div>
+            <button onclick="exportClaudeSession()" class="w-full bg-[#2d2d2d] hover:bg-[#3d3d3d] border border-border-main rounded px-3 py-2 text-xs text-white cursor-pointer transition-colors">
+              Export Claude Session
+            </button>
+            <button onclick="importClaudeSession()" class="w-full bg-[#2d2d2d] hover:bg-[#3d3d3d] border border-border-main rounded px-3 py-2 text-xs text-white cursor-pointer transition-colors">
+              Restore Claude Session
+            </button>
+
+            <div class="text-[10px] text-[#666] mb-2 mt-4">Utilities</div>
+            <button onclick="listSessions()" class="w-full bg-[#2d2d2d] hover:bg-[#3d3d3d] border border-border-main rounded px-3 py-2 text-xs text-white cursor-pointer transition-colors">
+              List All Sessions
+            </button>
+            <button onclick="saveVisualSnapshot()" class="w-full bg-[#2d2d2d] hover:bg-[#3d3d3d] border border-border-main rounded px-3 py-2 text-xs text-white cursor-pointer transition-colors">
+              Save Terminal Buffer
+            </button>
+          </div>
         </div>
       </div>
 
