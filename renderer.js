@@ -34,15 +34,15 @@ const newProjectChip = document.getElementById('new-project-chip');
 const projectChipsContainer = document.getElementById('project-chips-container');
 
 // Dashboard
-const projectsList = document.getElementById('projects-list');
-const commandsSettingsList = document.getElementById('commands-settings-list'); // New
-const projectDetailsPanel = document.getElementById('project-details-panel');
-const dashTitle = document.getElementById('dash-project-title');
-const dashPath = document.getElementById('dash-project-path');
-const dashNotes = document.getElementById('dash-project-notes');
-const btnOpenProject = document.getElementById('btn-open-project');
-const btnNewProject = document.getElementById('btn-new-project');
-const dashEmptyState = document.getElementById('dashboard-empty-state');
+const commandsSettingsList = document.getElementById('commands-settings-list');
+// Old elements removed in redesign:
+// const projectsList = document.getElementById('projects-list');
+// const projectDetailsPanel = document.getElementById('project-details-panel');
+// const dashTitle = document.getElementById('dash-project-title');
+// const dashPath = document.getElementById('dash-project-path');
+// const dashNotes = document.getElementById('dash-project-notes');
+// const btnOpenProject = document.getElementById('btn-open-project');
+// const dashEmptyState = document.getElementById('dashboard-empty-state');
 
 // Selected project on dashboard (not necessarily active in workspace)
 let dashboardSelectedProject = null;
@@ -68,11 +68,9 @@ const closePreviewBtn = document.getElementById('close-preview-btn');
 // Notes Panel
 const notesTabs = document.querySelectorAll('.note-tab');
 const notesContentSession = document.getElementById('notes-content-session');
-const notesContentProject = document.getElementById('notes-content-project');
-const notesContentGemini = document.getElementById('notes-content-gemini'); // New
+const notesContentGemini = document.getElementById('notes-content-gemini');
 const notesContentActions = document.getElementById('notes-content-actions');
 const notesEditor = document.getElementById('notes-editor'); // Session notes
-const notesViewerProject = document.getElementById('notes-viewer-project'); // Read-only project notes
 const actionsList = document.getElementById('actions-list');
 const saveStatus = document.querySelector('.save-status');
 
@@ -84,12 +82,51 @@ async function init() {
   // Setup Global Listeners
   setupGlobalListeners();
   setupDashboardTabs(); // New
-  
+
   // Load Projects
   await loadProjects();
-  
+
+  // Auto-open favorite projects
+  await autoOpenFavoriteProjects();
+
   // Start on Dashboard
   showDashboard();
+}
+
+// Auto-open specified projects on startup
+async function autoOpenFavoriteProjects() {
+  const favoriteProjects = [
+    { name: 'custom-terminal', path: '/Users/fedor/Desktop/custom-terminal' },
+    { name: 'cli-tools', path: '/Users/fedor/Desktop/cli-tools' }
+  ];
+
+  for (const favorite of favoriteProjects) {
+    // Try to find by name first
+    let project = Object.values(projects).find(p => p.name === favorite.name);
+
+    // If not found by name, try to load by path
+    if (!project) {
+      console.log('[autoOpenFavoriteProjects] Project not found by name, loading:', favorite.name);
+      try {
+        project = await ipcRenderer.invoke('project:get', favorite.path);
+        if (project) {
+          projects[project.path] = project;
+        }
+      } catch (err) {
+        console.error('[autoOpenFavoriteProjects] Failed to load project:', favorite.name, err);
+      }
+    }
+
+    if (project) {
+      console.log('[autoOpenFavoriteProjects] Opening:', favorite.name);
+      openWorkspace(project);
+    } else {
+      console.log('[autoOpenFavoriteProjects] Project not found:', favorite.name);
+    }
+  }
+
+  // Re-render project list after loading new projects
+  renderProjectList();
 }
 
 function setupDashboardTabs() {
@@ -144,6 +181,7 @@ function setupDashboardTabs() {
 
       if (target === 'settings') {
         renderCommandsSettings();
+        renderPromptsSettings();
       }
     });
   });
@@ -155,72 +193,226 @@ function setupDashboardTabs() {
   });
 }
 
-function renderCommandsSettings() {
-  if (!dashboardSelectedProject) {
-    commandsSettingsList.innerHTML = '<p class="placeholder-text">Выберите проект в списке слева, чтобы настроить его команды.</p>';
-    return;
-  }
+// populateSettingsProjectSelect removed - commands are now global
 
-  const proj = dashboardSelectedProject;
+let commandsSaveTimeout = null;
+
+async function renderCommandsSettings() {
   commandsSettingsList.innerHTML = '';
 
-  if (!proj.quickActions || proj.quickActions.length === 0) {
-    commandsSettingsList.innerHTML = '<p class="placeholder-text">У этого проекта нет доступных команд.</p>';
+  // Load global commands
+  const result = await ipcRenderer.invoke('commands:get-global');
+
+  if (!result.success) {
+    commandsSettingsList.innerHTML = '<p class="placeholder-text text-[#cc3333] text-center mt-5 text-xs">Error loading global commands.</p>';
     return;
   }
 
-  proj.quickActions.forEach((action, index) => {
+  const globalCommands = result.data;
+
+  if (!globalCommands || globalCommands.length === 0) {
+    commandsSettingsList.innerHTML = '<p class="text-[#666] text-sm">No commands yet. Click "Add Command" to create one.</p>';
+    return;
+  }
+
+  globalCommands.forEach((action, index) => {
     const item = document.createElement('div');
-    item.className = 'bg-[#2d2d2d] p-3 rounded-md border border-border-main';
-    
-    // We only want to edit the "prompt" part of the command if it exists
-    // For now, let's allow editing the full command string
+    item.className = 'group bg-[#2d2d2d] px-6 py-5 rounded-lg border-2 border-border-main hover:border-accent/50 transition-all relative';
+
     item.innerHTML = `
-      <label class="block text-[11px] text-accent mb-1 uppercase font-bold">Команда: ${action.name}</label>
-      <div class="font-bold mb-2 text-[#eee]">Исполняемая строка в терминале:</div>
-      <textarea class="bg-[#111] border border-[#444] text-[#ddd] p-2 font-jetbrains text-xs w-full box-border rounded resize-y min-h-[60px] focus:outline-none focus:border-accent" data-index="${index}">${action.command}</textarea>
+      <div class="flex items-start justify-between gap-3 mb-3">
+        <input type="text" class="command-name-input bg-transparent border-none text-white font-bold text-base flex-1 outline-none focus:text-accent transition-colors" value="${action.name}" placeholder="Command name..." />
+        <button class="delete-btn opacity-0 group-hover:opacity-100 text-[#888] hover:text-red-500 text-xl transition-all px-2" title="Delete command">×</button>
+      </div>
+      <textarea class="command-textarea bg-[#1a1a1a] border-2 border-[#444] text-[#ddd] p-4 font-jetbrains text-xs w-full box-border rounded-md resize-y min-h-[90px] focus:outline-none focus:border-accent transition-colors" placeholder="Enter terminal command...">${action.command}</textarea>
     `;
 
-    const textarea = item.querySelector('textarea');
-    textarea.addEventListener('input', () => {
-      // Update local state
-      proj.quickActions[index].command = textarea.value;
-      
-      // Save to backend
-      ipcRenderer.invoke('project:save-actions', {
-        dirPath: proj.path,
-        actions: proj.quickActions
-      });
-      
-      // Update sidebar if this project is currently active
-      const openProj = openProjects.get(proj.id);
-      if (openProj) {
-        openProj.project.quickActions = proj.quickActions;
-        renderActions(proj.quickActions);
+    const nameInput = item.querySelector('.command-name-input');
+    const textarea = item.querySelector('.command-textarea');
+    const deleteBtn = item.querySelector('.delete-btn');
+
+    const saveCommands = () => {
+      globalCommands[index].name = nameInput.value.trim() || `Command ${index + 1}`;
+      globalCommands[index].command = textarea.value;
+
+      // Debounce save
+      clearTimeout(commandsSaveTimeout);
+      commandsSaveTimeout = setTimeout(async () => {
+        await ipcRenderer.invoke('commands:save-global', globalCommands);
+        showToast('Commands saved');
+
+        // Update all open projects
+        openProjects.forEach(projectData => {
+          projectData.project.quickActions = globalCommands.map(gc => ({
+            name: gc.name,
+            command: gc.command
+          }));
+
+          if (projectData.project.id === activeProjectId) {
+            renderActions(projectData.project.quickActions);
+          }
+        });
+      }, 800);
+    };
+
+    deleteBtn.addEventListener('click', async () => {
+      if (confirm(`Delete command "${action.name}"?`)) {
+        globalCommands.splice(index, 1);
+        await ipcRenderer.invoke('commands:save-global', globalCommands);
+        showToast('Command deleted');
+        renderCommandsSettings();
+
+        // Update all open projects
+        openProjects.forEach(projectData => {
+          projectData.project.quickActions = globalCommands.map(gc => ({
+            name: gc.name,
+            command: gc.command
+          }));
+          if (projectData.project.id === activeProjectId) {
+            renderActions(projectData.project.quickActions);
+          }
+        });
       }
     });
+
+    nameInput.addEventListener('input', saveCommands);
+    textarea.addEventListener('input', saveCommands);
 
     commandsSettingsList.appendChild(item);
   });
 }
 
+let promptsSaveTimeout = null;
+
+async function renderPromptsSettings() {
+  const promptsList = document.getElementById('prompts-settings-list');
+  if (!promptsList) return;
+
+  promptsList.innerHTML = '';
+
+  const result = await ipcRenderer.invoke('prompts:get');
+
+  if (!result.success) {
+    promptsList.innerHTML = '<p class="text-[#cc3333] text-sm">Error loading prompts.</p>';
+    return;
+  }
+
+  const prompts = result.data;
+
+  if (!prompts || prompts.length === 0) {
+    promptsList.innerHTML = '<p class="text-[#666] text-sm">No prompts yet. Click "Add Prompt" to create one.</p>';
+    return;
+  }
+
+  prompts.forEach((prompt, index) => {
+    const item = document.createElement('div');
+    item.className = 'group bg-[#2d2d2d] px-6 py-5 rounded-lg border-2 border-border-main hover:border-accent/50 transition-all relative';
+
+    item.innerHTML = `
+      <div class="flex items-start justify-between gap-3 mb-3">
+        <input type="text" class="prompt-title-input bg-transparent border-none text-white font-bold text-base flex-1 outline-none focus:text-accent transition-colors" value="${prompt.title}" placeholder="Prompt title..." />
+        <button class="delete-btn opacity-0 group-hover:opacity-100 text-[#888] hover:text-red-500 text-xl transition-all px-2" title="Delete prompt">×</button>
+      </div>
+      <textarea class="prompt-content-textarea bg-[#1a1a1a] border-2 border-[#444] text-[#ddd] p-4 font-jetbrains text-xs w-full box-border rounded-md resize-y min-h-[120px] focus:outline-none focus:border-accent transition-colors" placeholder="Prompt content...">${prompt.content}</textarea>
+      <div class="text-[10px] text-[#666] mt-2 italic">This text will be inserted when selected from context menu</div>
+    `;
+
+    const titleInput = item.querySelector('.prompt-title-input');
+    const contentTextarea = item.querySelector('.prompt-content-textarea');
+    const deleteBtn = item.querySelector('.delete-btn');
+
+    const savePrompts = () => {
+      prompts[index].title = titleInput.value.trim() || `Prompt ${index + 1}`;
+      prompts[index].content = contentTextarea.value;
+
+      // Debounce save
+      clearTimeout(promptsSaveTimeout);
+      promptsSaveTimeout = setTimeout(async () => {
+        await ipcRenderer.invoke('prompts:save', prompts);
+        showToast('Prompts saved');
+      }, 800);
+    };
+
+    deleteBtn.addEventListener('click', async () => {
+      if (confirm(`Delete prompt "${prompt.title}"?`)) {
+        prompts.splice(index, 1);
+        await ipcRenderer.invoke('prompts:save', prompts);
+        showToast('Prompt deleted');
+        renderPromptsSettings();
+      }
+    });
+
+    titleInput.addEventListener('input', savePrompts);
+    contentTextarea.addEventListener('input', savePrompts);
+
+    promptsList.appendChild(item);
+  });
+}
+
+// --- Toast Notifications ---
+
+function showToast(message, type = 'success') {
+  const container = document.getElementById('toast-container');
+  if (!container) return;
+
+  const toast = document.createElement('div');
+  toast.className = `toast pointer-events-auto flex items-center gap-3 px-4 py-3 rounded-lg shadow-lg backdrop-blur-sm transform transition-all duration-300 ease-out opacity-0 translate-x-4 ${
+    type === 'success' ? 'bg-[#22c55e]/90 text-white' :
+    type === 'error' ? 'bg-[#ef4444]/90 text-white' :
+    'bg-[#3b82f6]/90 text-white'
+  }`;
+
+  const icon = type === 'success' ? '✓' : type === 'error' ? '✗' : 'ℹ';
+
+  toast.innerHTML = `
+    <span class="text-lg font-bold">${icon}</span>
+    <span class="text-sm font-medium">${message}</span>
+  `;
+
+  container.appendChild(toast);
+
+  // Animate in
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      toast.style.opacity = '1';
+      toast.style.transform = 'translateX(0)';
+    });
+  });
+
+  // Remove after 2.5 seconds
+  setTimeout(() => {
+    toast.style.opacity = '0';
+    toast.style.transform = 'translateX(4rem)';
+    setTimeout(() => toast.remove(), 300);
+  }, 2500);
+}
+
 // --- Dashboard Logic ---
 
 async function loadProjects() {
-  console.log('[loadProjects] START');
-
   try {
-    // Get CWD from main process (process.cwd() doesn't work in renderer!)
+    // Load all saved projects
+    const allProjects = await ipcRenderer.invoke('project:list');
+
+    // Build projects object
+    allProjects.forEach(project => {
+      projects[project.path] = project;
+    });
+
+    // Also ensure CWD is registered (if it's not a system directory)
     const cwd = await ipcRenderer.invoke('app:getCwd');
-    console.log('[loadProjects] CWD:', cwd);
 
-    // Fetch project data for CWD to register it
-    const project = await ipcRenderer.invoke('project:get', cwd);
-    console.log('[loadProjects] Project loaded:', project);
+    // Don't auto-load system directories as projects
+    const isSystemDir = cwd === '/' ||
+                       cwd === '/Users/fedor' ||
+                       cwd === '/Users' ||
+                       cwd === '/Users/fedor/Desktop';
 
-    if (project) {
-      projects[cwd] = project;
-      console.log('[loadProjects] Projects object:', projects);
+    if (!isSystemDir) {
+      const cwdProject = await ipcRenderer.invoke('project:get', cwd);
+      if (cwdProject) {
+        projects[cwd] = cwdProject;
+      }
     }
 
     renderProjectList();
@@ -246,80 +438,280 @@ async function handleAddNewProject() {
 
 function renderProjectList() {
   console.log('[renderProjectList] START');
-  
-  const listEl = document.getElementById('projects-list');
-  if (!listEl) {
-    console.warn('[renderProjectList] projects-list element not found in DOM yet.');
+
+  const gridEl = document.getElementById('projects-grid');
+  if (!gridEl) {
+    console.warn('[renderProjectList] projects-grid element not found in DOM yet.');
     return;
   }
 
-  // Clear list
-  listEl.innerHTML = '';
+  // Clear grid
+  gridEl.innerHTML = '';
 
-  // Create "New Project" button manually
-  const newBtn = document.createElement('div');
-  newBtn.className = 'project-card bg-transparent border border-dashed border-[#555] p-[10px_15px] mb-2 rounded cursor-pointer transition-colors opacity-70 hover:opacity-100 hover:border-accent text-center';
-  newBtn.innerHTML = '<span>+ New Project</span>';
-  newBtn.addEventListener('click', handleAddNewProject);
-
-  // Render project cards
-  const projectsArray = Object.values(projects);
-  projectsArray.forEach(proj => {
-    const card = document.createElement('div');
-    card.className = 'project-card bg-tab p-[10px_15px] mb-2 rounded cursor-pointer transition-colors hover:bg-[#3a3a3c]';
-    if (dashboardSelectedProject && dashboardSelectedProject.path === proj.path) {
-      card.classList.add('active');
+  // Filter projects
+  const excludedNames = ['Fedor', 'Desktop', 'Documents', 'Downloads', 'Applications'];
+  const projectsArray = Object.values(projects).filter(proj => {
+    // Filter out projects with empty names
+    if (!proj.name || proj.name.trim() === '') {
+      console.log('[renderProjectList] Filtering out: empty name, path:', proj.path);
+      return false;
     }
-    card.innerHTML = `
-      <div style="font-weight:bold">${proj.name}</div>
-    `;
-    // Single click - select project
-    card.onclick = () => selectProjectOnDashboard(proj);
-    // Double click - open workspace
-    card.ondblclick = () => openWorkspace(proj);
-    listEl.appendChild(card);
+
+    // Filter out excluded names
+    if (excludedNames.includes(proj.name)) {
+      console.log('[renderProjectList] Filtering out:', proj.name);
+      return false;
+    }
+
+    // Filter out root and system directories
+    const isSystemDir = proj.path === '/' ||
+                       proj.path === '/Users/fedor' ||
+                       proj.path === '/Users' ||
+                       proj.path === '/Users/fedor/Desktop';
+    if (isSystemDir) {
+      console.log('[renderProjectList] Filtering out system dir:', proj.path);
+      return false;
+    }
+
+    return true;
   });
 
-  listEl.appendChild(newBtn);
+  // Render project cards
+  projectsArray.forEach(proj => {
+    const card = createProjectCard(proj);
+    gridEl.appendChild(card);
+  });
+
+  // Add "New Project" card
+  const newCard = document.createElement('div');
+  newCard.className = 'bg-transparent border-2 border-dashed border-[#555] p-6 rounded-xl cursor-pointer transition-all opacity-70 hover:opacity-100 hover:border-accent flex items-center justify-center min-h-[200px]';
+  newCard.innerHTML = '<span class="text-xl">+ New Project</span>';
+  newCard.onclick = handleAddNewProject;
+  gridEl.appendChild(newCard);
+
+  // Adjust tooltip positions for rightmost cards
+  requestAnimationFrame(() => {
+    adjustTooltipPositions();
+  });
+
   console.log('[renderProjectList] DONE');
+}
+
+function adjustTooltipPositions() {
+  const cards = document.querySelectorAll('.project-card-item');
+  if (cards.length === 0) return;
+
+  // Get grid container width and card positions
+  cards.forEach((card, index) => {
+    const rect = card.getBoundingClientRect();
+    const viewportWidth = window.innerWidth;
+    const spaceOnRight = viewportWidth - rect.right;
+
+    // If less than 300px space on right, open tooltip to the left
+    const tooltipWrapper = card.querySelector('.info-icon-wrapper');
+    if (tooltipWrapper && spaceOnRight < 300) {
+      const tooltipContainer = tooltipWrapper.querySelector('.tooltip-container');
+      if (tooltipContainer) {
+        // Change position from left to right
+        tooltipContainer.classList.remove('left-0');
+        tooltipContainer.classList.add('right-0');
+
+        // Change origin from bottom-left to bottom-right
+        const tooltipInner = tooltipContainer.querySelector('div');
+        if (tooltipInner) {
+          tooltipInner.classList.remove('origin-bottom-left');
+          tooltipInner.classList.add('origin-bottom-right');
+        }
+      }
+    }
+
+    // Show tooltip container (was hidden initially)
+    const tooltipContainer = card.querySelector('.tooltip-container');
+    if (tooltipContainer) {
+      tooltipContainer.classList.remove('hidden');
+    }
+  });
+}
+
+function createProjectCard(proj) {
+  // Count active tabs for this project
+  const projectData = openProjects.get(proj.id);
+  const activeTabsCount = projectData ? projectData.tabs.size : 0;
+
+  const card = document.createElement('div');
+  card.className = 'group bg-tab border border-border-main rounded-xl p-6 cursor-pointer transition-all hover:border-accent hover:shadow-lg relative project-card-item';
+  card.dataset.projectId = proj.id;
+
+  card.innerHTML = `
+    <div class="flex justify-between items-start mb-3">
+      <div class="flex items-center gap-2 flex-1 mr-2 min-w-0">
+        <h3 class="text-lg font-bold text-white truncate">${proj.name}</h3>
+        ${proj.description ? `
+          <span class="relative group/desc inline-block info-icon-wrapper shrink-0">
+            <span class="text-xs text-[#aaa] cursor-help hover:text-white transition-colors">ℹ️</span>
+            <div class="tooltip-container absolute bottom-full left-0 mb-2 pointer-events-none z-50 hidden">
+              <div class="origin-bottom-left opacity-0 scale-x-0 scale-y-[0.85]
+                group-hover/desc:opacity-100 group-hover/desc:scale-x-100 group-hover/desc:scale-y-100
+                transition-all duration-200 ease-out
+                bg-gray-900/95 backdrop-blur-sm border border-gray-700
+                p-3 rounded-xl shadow-2xl w-64 whitespace-normal">
+                <p class="text-xs text-gray-300">${proj.description}</p>
+              </div>
+            </div>
+          </span>
+        ` : ''}
+      </div>
+      <div class="opacity-0 group-hover:opacity-100 transition-opacity relative shrink-0">
+        <button class="menu-btn text-[#999] hover:text-white text-xl leading-none w-8 h-8 flex items-center justify-center rounded hover:bg-white/10" data-project-id="${proj.id}">⋯</button>
+        <div class="menu-dropdown absolute right-0 top-full mt-1 bg-panel border border-border-main rounded-lg shadow-xl hidden min-w-[150px] z-10">
+          <button class="edit-btn w-full text-left px-4 py-2 text-sm text-[#ccc] hover:bg-white/5 rounded-t-lg" data-project-id="${proj.id}">✏️ Edit</button>
+          <button class="delete-btn w-full text-left px-4 py-2 text-sm text-[#cc3333] hover:bg-[#cc3333]/10 rounded-b-lg" data-project-id="${proj.id}">🗑️ Delete</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="flex items-center gap-2 mb-3">
+      <span class="text-xs font-jetbrains text-[#666] truncate flex-1">${proj.path}</span>
+    </div>
+
+    <div class="flex items-center justify-between text-xs text-[#888]">
+      <span>${activeTabsCount} active tab${activeTabsCount !== 1 ? 's' : ''}</span>
+      <span class="text-accent">Click to open →</span>
+    </div>
+  `;
+
+  // Click to open workspace (but not if clicking menu or info icon)
+  card.addEventListener('click', (e) => {
+    if (!e.target.closest('.menu-btn') &&
+        !e.target.closest('.menu-dropdown') &&
+        !e.target.closest('.info-icon-wrapper')) {
+      openWorkspace(proj);
+    }
+  });
+
+  // Setup menu toggle
+  const menuBtn = card.querySelector('.menu-btn');
+  const menuDropdown = card.querySelector('.menu-dropdown');
+
+  menuBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    // Close other menus
+    document.querySelectorAll('.menu-dropdown').forEach(m => {
+      if (m !== menuDropdown) m.classList.add('hidden');
+    });
+    menuDropdown.classList.toggle('hidden');
+  });
+
+  // Edit button
+  card.querySelector('.edit-btn').addEventListener('click', (e) => {
+    e.stopPropagation();
+    menuDropdown.classList.add('hidden');
+    openEditModal(proj);
+  });
+
+  // Delete button
+  card.querySelector('.delete-btn').addEventListener('click', (e) => {
+    e.stopPropagation();
+    menuDropdown.classList.add('hidden');
+    deleteProject(proj);
+  });
+
+  return card;
+}
+
+// Close menus when clicking outside
+document.addEventListener('click', () => {
+  document.querySelectorAll('.menu-dropdown').forEach(m => m.classList.add('hidden'));
+});
+
+// Modal management
+let currentEditingProject = null;
+
+function openEditModal(project) {
+  currentEditingProject = project;
+  const modal = document.getElementById('edit-project-modal');
+  const nameInput = document.getElementById('edit-project-name');
+  const descInput = document.getElementById('edit-project-description');
+
+  nameInput.value = project.name;
+  descInput.value = project.description || '';
+
+  modal.classList.remove('hidden');
+  modal.classList.add('flex');
+  nameInput.focus();
+}
+
+function closeEditModal() {
+  const modal = document.getElementById('edit-project-modal');
+  modal.classList.add('hidden');
+  modal.classList.remove('flex');
+  currentEditingProject = null;
+}
+
+async function saveProjectEdit() {
+  if (!currentEditingProject) return;
+
+  const nameInput = document.getElementById('edit-project-name');
+  const descInput = document.getElementById('edit-project-description');
+
+  const newName = nameInput.value.trim();
+  const newDesc = descInput.value.trim();
+
+  if (!newName) {
+    alert('Project name cannot be empty');
+    return;
+  }
+
+  // Save to backend
+  await ipcRenderer.invoke('project:save-metadata', {
+    dirPath: currentEditingProject.path,
+    metadata: {
+      name: newName,
+      description: newDesc
+    }
+  });
+
+  // Update local cache
+  currentEditingProject.name = newName;
+  currentEditingProject.description = newDesc;
+  projects[currentEditingProject.path] = currentEditingProject;
+
+  closeEditModal();
+  renderProjectList();
+  renderProjectChips();
+}
+
+async function deleteProject(project) {
+  const confirm = window.confirm(`Are you sure you want to delete "${project.name}"? This cannot be undone.`);
+  if (!confirm) return;
+
+  // Close project if it's open
+  if (openProjects.has(project.id)) {
+    // Close all tabs
+    const projectData = openProjects.get(project.id);
+    for (const tabId of projectData.tabs.keys()) {
+      await ipcRenderer.send('terminal:destroy', tabId);
+    }
+    openProjects.delete(project.id);
+  }
+
+  // Remove from projects list
+  delete projects[project.path];
+
+  // TODO: Add backend delete if needed
+  // For now just remove from local cache, backend still has it
+
+  renderProjectList();
+  renderProjectChips();
 }
 
 function selectProjectOnDashboard(project) {
   dashboardSelectedProject = project; // Store for settings tab
 
-  // Update UI cards active state
-  document.querySelectorAll('.project-card').forEach(card => {
-    card.classList.remove('active');
-    // Check if this card's text matches the project path
-    if (card.innerHTML.includes(project.path)) {
-      card.classList.add('active');
-    }
-  });
-
-  dashEmptyState.style.display = 'none';
-  projectDetailsPanel.style.display = 'flex';
-
-  dashTitle.textContent = project.name;
-  dashPath.textContent = project.path;
-  dashNotes.innerHTML = project.notes.global;
-
   // If we are already on Settings tab, re-render them
-  if (document.querySelector('.dash-nav-btn[data-dash-tab="settings"]').classList.contains('active')) {
+  if (document.querySelector('.dash-nav-btn[data-dash-tab="settings"]')?.classList.contains('active')) {
     renderCommandsSettings();
   }
-
-  // Setup 'Open' button
-  btnOpenProject.onclick = () => openWorkspace(project);
-  
-  // Auto-save dashboard notes changes
-  dashNotes.oninput = () => {
-    ipcRenderer.invoke('project:save-note', {
-      dirPath: project.path,
-      content: dashNotes.innerHTML
-    });
-    // Update local cache
-    project.notes.global = dashNotes.innerHTML;
-  };
 }
 
 function showDashboard() {
@@ -327,38 +719,56 @@ function showDashboard() {
   workspaceView.style.display = 'none';
   dashboardView.style.display = 'flex';
 
-  // Update chips: hide new project chip, deactivate all
+  // Update chips: hide new project chip, deactivate all project chips
   newProjectChip.style.display = 'none';
-  document.querySelectorAll('.project-chip').forEach(chip => {
-    chip.classList.remove('active');
+  document.querySelectorAll('.project-chip:not(#home-chip):not(#new-project-chip)').forEach(chip => {
+    chip.classList.remove('active', '!bg-accent', '!border-accent', '!text-white', 'shadow-lg', 'ring-2', 'ring-accent/50');
   });
+
+  // Activate home chip
+  homeChip.classList.add('active', '!bg-accent', '!border-accent', '!text-white');
 
   activeProjectId = null;
 }
 
 function renderProjectChips() {
-  console.log('[renderProjectChips] Open projects:', openProjects.size, 'Active:', activeProjectId);
-
   // Remove old project chips (keep home and new buttons)
   const existingChips = projectChipsContainer.querySelectorAll('.project-chip:not(#home-chip):not(#new-project-chip)');
   existingChips.forEach(chip => chip.remove());
 
   // Deactivate home chip
-  homeChip.classList.remove('active');
+  homeChip.classList.remove('active', '!bg-accent', '!border-accent', '!text-white');
 
   // Add chips for each open project
   openProjects.forEach((projectData, projectId) => {
     const chip = document.createElement('button');
-    chip.className = 'project-chip group flex items-center gap-1 px-3 py-0.5 rounded-xl text-xs bg-tab border border-border-main hover:bg-[#3a3a3c] hover:border-accent transition-all duration-150 no-drag h-[22px] text-text-main';
+    chip.className = 'project-chip group flex items-center gap-1 px-3 py-0.5 rounded-xl text-xs bg-tab border border-border-main hover:bg-[#3a3a3c] hover:border-accent transition-all duration-150 no-drag h-[22px] text-text-main cursor-pointer';
     chip.dataset.projectId = projectId;
 
     if (projectId === activeProjectId) {
       chip.classList.add('active');
-      chip.classList.add('!bg-accent', '!border-accent', '!text-white');
+      chip.classList.add('!bg-accent', '!border-accent', '!text-white', 'shadow-lg', 'ring-2', 'ring-accent/50');
     }
 
-    chip.innerHTML = `<span class="project-indicator w-2 h-2 rounded-full bg-[#4a9eff]"></span>${projectData.project.name}`;
-    chip.onclick = () => switchToProject(projectId);
+    const indicatorColor = projectId === activeProjectId ? 'bg-white' : 'bg-[#4a9eff]';
+    chip.innerHTML = `
+      <span class="project-indicator w-2 h-2 rounded-full ${indicatorColor}"></span>
+      <span class="chip-name">${projectData.project.name}</span>
+      <span class="chip-close opacity-0 group-hover:opacity-70 hover:!opacity-100 ml-1 text-[10px] w-3 h-3 flex items-center justify-center rounded-full hover:bg-[#cc3333]/20">×</span>
+    `;
+
+    // Click to switch project (but not if clicking close button)
+    chip.onclick = (e) => {
+      if (!e.target.closest('.chip-close')) {
+        switchToProject(projectId);
+      }
+    };
+
+    // Close button
+    chip.querySelector('.chip-close').onclick = (e) => {
+      e.stopPropagation();
+      closeProject(projectId);
+    };
 
     // Insert before the "+" button
     projectChipsContainer.insertBefore(chip, newProjectChip);
@@ -386,17 +796,13 @@ async function saveProjectTabs() {
     dirPath: projectData.project.path,
     tabs: tabsState
   });
-
-  console.log('[saveProjectTabs] Saved tabs:', tabsState);
 }
 
 function openWorkspace(project) {
-  console.log('[openWorkspace] Opening project:', project.name);
   const projectId = project.id;
 
   // Check if project is already open
   if (!openProjects.has(projectId)) {
-    console.log('[openWorkspace] Creating new project instance');
     // Initialize project state
     openProjects.set(projectId, {
       project,
@@ -412,37 +818,59 @@ function openWorkspace(project) {
 }
 
 function switchToProject(projectId) {
-  console.log('[switchToProject] Switching to:', projectId);
+  console.time('[PERF] switchToProject total');
+  console.log('[switchToProject] START, projectId:', projectId);
 
   if (activeProjectId === projectId && workspaceView.style.display === 'flex') {
+    console.log('[switchToProject] Already active, skipping');
+    console.timeEnd('[PERF] switchToProject total');
     return;
   }
 
+  const t0 = performance.now();
   const projectData = openProjects.get(projectId);
   if (!projectData) {
     console.error('[switchToProject] Project not found:', projectId);
+    console.timeEnd('[PERF] switchToProject total');
     return;
   }
+  console.log(`[switchToProject] Get project data took ${(performance.now() - t0).toFixed(2)}ms`);
 
   activeProjectId = projectId;
 
   // Show workspace
+  console.log('[switchToProject] Showing workspace');
+  const t1 = performance.now();
   dashboardView.style.display = 'none';
   workspaceView.style.display = 'flex';
+  console.log(`[switchToProject] Show workspace took ${(performance.now() - t1).toFixed(2)}ms`);
 
-  // Update Project Notes in Sidebar (Read-only view)
-  notesViewerProject.innerHTML = projectData.project.notes.global;
-
-  // Render Actions
+  // Render Actions (only if changed)
+  console.log('[switchToProject] Calling renderActions');
+  const t2 = performance.now();
   renderActions(projectData.project.quickActions || []);
+  console.log(`[switchToProject] renderActions took ${(performance.now() - t2).toFixed(2)}ms`);
 
   // Update chips
+  console.log('[switchToProject] Updating chips');
+  const t3 = performance.now();
   renderProjectChips();
+  console.log(`[switchToProject] renderProjectChips took ${(performance.now() - t3).toFixed(2)}ms`);
 
-  // Update File Explorer if visible
-  if (fileExplorer.style.display !== 'none') {
+  // Don't load Gemini history here - it blocks UI for 3-6 seconds!
+  // It will be loaded lazily when user opens AI tab
+  console.log('[switchToProject] Skipping Gemini history (lazy load when AI tab opened)');
+
+  // Update File Explorer only if visible
+  console.log('[switchToProject] Checking file explorer');
+  const t5 = performance.now();
+  if (fileExplorer.style.display !== 'none' && fileExplorer.style.display !== '') {
     renderFileTree(projectData.project.path, fileTreeContainer);
   }
+  console.log(`[switchToProject] File explorer check/render took ${(performance.now() - t5).toFixed(2)}ms`);
+
+  console.timeEnd('[PERF] switchToProject total');
+  console.log('[switchToProject] END (sync part)');
 
   // Restore tabs from saved state or create default tab
   if (projectData.tabs.size === 0) {
@@ -451,9 +879,14 @@ function switchToProject(projectId) {
     if (savedTabs.length > 0) {
       // Restore saved tabs sequentially
       console.log('[switchToProject] Restoring', savedTabs.length, 'saved tabs');
+      const t6 = performance.now();
       (async () => {
         for (const savedTab of savedTabs) {
+          const tTab = performance.now();
+          console.log('[switchToProject] Creating tab for:', savedTab.name, savedTab.cwd);
           await createTab(savedTab.cwd || projectData.project.path);
+          console.log(`[switchToProject] Tab created in ${(performance.now() - tTab).toFixed(2)}ms`);
+
           // Rename last created tab to saved name
           const lastTabId = `${projectId}-tab-${projectData.tabCounter}`;
           const tab = projectData.tabs.get(lastTabId);
@@ -462,11 +895,13 @@ function switchToProject(projectId) {
             tab.element.querySelector('.tab-name').textContent = savedTab.name;
           }
         }
+        console.log(`[switchToProject] All tabs restored in ${(performance.now() - t6).toFixed(2)}ms`);
         // After all tabs restored, render them
         renderTabsForProject(projectId);
       })();
     } else {
       // Create default tab if no saved tabs
+      console.log('[switchToProject] Creating default tab');
       createTab(projectData.project.path).then(() => {
         renderTabsForProject(projectId);
       });
@@ -487,35 +922,40 @@ function switchToProject(projectId) {
 }
 
 function renderTabsForProject(projectId) {
-  console.log('[renderTabsForProject] Called for:', projectId);
+  console.time('[PERF] renderTabsForProject');
+  console.log('[renderTabsForProject] START, projectId:', projectId);
+
+  const t0 = performance.now();
   const projectData = openProjects.get(projectId);
   if (!projectData) {
     console.error('[renderTabsForProject] No project data!');
     return;
   }
-
-  console.log('[renderTabsForProject] Current project has', projectData.tabs.size, 'tabs');
+  console.log(`[renderTabsForProject] Get project data took ${(performance.now() - t0).toFixed(2)}ms`);
 
   // Hide all tabs from all projects
-  let hiddenCount = 0;
+  console.log('[renderTabsForProject] Hiding all tabs from all projects');
+  const t1 = performance.now();
   openProjects.forEach((pd, pdId) => {
     pd.tabs.forEach(tabData => {
       tabData.element.style.display = 'none';
+      tabData.element.classList.remove('active');
       tabData.wrapper.style.display = 'none';
       tabData.wrapper.classList.remove('active');
-      hiddenCount++;
     });
   });
-  console.log('[renderTabsForProject] Hidden', hiddenCount, 'tabs total');
+  console.log(`[renderTabsForProject] Hide all tabs took ${(performance.now() - t1).toFixed(2)}ms`);
 
   // Show only tab buttons from current project
-  let shownCount = 0;
+  console.log('[renderTabsForProject] Showing tabs for current project');
+  const t2 = performance.now();
   projectData.tabs.forEach((tabData, tabId) => {
-    console.log('[renderTabsForProject] Showing tab:', tabId, tabData.name);
     tabData.element.style.display = 'flex';
-    shownCount++;
   });
-  console.log('[renderTabsForProject] Shown', shownCount, 'tabs for current project');
+  console.log(`[renderTabsForProject] Show current project tabs took ${(performance.now() - t2).toFixed(2)}ms`);
+
+  console.timeEnd('[PERF] renderTabsForProject');
+  console.log('[renderTabsForProject] END');
 }
 
 // --- Terminal & Tabs Logic ---
@@ -527,6 +967,10 @@ function getCurrentProject() {
 }
 
 async function createTab(cwd) {
+  console.time(`[PERF] createTab total`);
+  console.log('[createTab] START, cwd:', cwd);
+
+  const t0 = performance.now();
   const projectData = getCurrentProject();
   if (!projectData) {
     console.error('[createTab] No active project!');
@@ -535,9 +979,12 @@ async function createTab(cwd) {
 
   // Use project-specific tab IDs to avoid conflicts
   const tabId = `${activeProjectId}-tab-${++projectData.tabCounter}`;
-  console.log('[createTab] Creating tab:', tabId, 'for project:', projectData.project.name);
+  console.log('[createTab] Generated tabId:', tabId);
+  console.log(`[createTab] Get project data took ${(performance.now() - t0).toFixed(2)}ms`);
 
   // 1. Terminal Instance
+  console.log('[createTab] Creating Terminal instance');
+  const t1 = performance.now();
   const terminal = new Terminal({
     cursorBlink: true,
     fontSize: 14,
@@ -553,25 +1000,37 @@ async function createTab(cwd) {
   const fitAddon = new FitAddon();
   terminal.loadAddon(fitAddon);
   terminal.loadAddon(new WebLinksAddon());
-  
+
   try {
     const webgl = new WebglAddon();
     terminal.loadAddon(webgl);
   } catch (e) { console.warn('WebGL not available'); }
+  console.log(`[createTab] Terminal creation took ${(performance.now() - t1).toFixed(2)}ms`);
 
   // 2. DOM Elements
+  console.log('[createTab] Creating DOM elements');
+  const t2 = performance.now();
   const wrapper = document.createElement('div');
   wrapper.className = 'terminal-wrapper absolute inset-0 pl-1 pt-1 hidden';
   wrapper.id = `term-wrap-${tabId}`;
   terminalContainer.appendChild(wrapper);
-  
+  console.log(`[createTab] DOM creation took ${(performance.now() - t2).toFixed(2)}ms`);
+
+  console.log('[createTab] Calling terminal.open()');
+  const t3 = performance.now();
   terminal.open(wrapper);
+  console.log(`[createTab] terminal.open() took ${(performance.now() - t3).toFixed(2)}ms`);
 
   // Right click handler for context menu
-  wrapper.addEventListener('contextmenu', (e) => {
+  wrapper.addEventListener('contextmenu', async (e) => {
     e.preventDefault();
     const hasSelection = terminal.hasSelection();
-    ipcRenderer.send('show-terminal-context-menu', hasSelection);
+
+    // Get prompts for context menu
+    const promptsResult = await ipcRenderer.invoke('prompts:get');
+    const prompts = promptsResult.success ? promptsResult.data : [];
+
+    ipcRenderer.send('show-terminal-context-menu', { hasSelection, prompts });
   });
 
   const tabEl = createTabElement(tabId, `Tab ${projectData.tabCounter}`);
@@ -585,7 +1044,8 @@ async function createTab(cwd) {
     wrapper,
     name: `Tab ${projectData.tabCounter}`,
     writeBuffer: '',
-    pendingWrite: null
+    pendingWrite: null,
+    lastDataTime: null // Track last data time for active process detection
   });
 
   // 4. Initialize Session Notes
@@ -599,24 +1059,27 @@ async function createTab(cwd) {
     cols: terminal.cols,
     cwd: cwd || projectData.project.path
   });
-  console.log('[createTab] PTY created, result:', result);
 
   // 6. Hook Events
   terminal.onData(data => {
-    console.log('[terminal.onData] tabId:', tabId, 'data:', data.substring(0, 10));
     ipcRenderer.send('terminal:input', tabId, data);
   });
 
   terminal.onResize(size => {
-    console.log('[terminal.onResize] tabId:', tabId);
     ipcRenderer.send('terminal:resize', tabId, size.cols, size.rows);
   });
 
   // Switch to it
+  console.log('[createTab] Switching to new tab');
+  const t7 = performance.now();
   switchTab(tabId);
+  console.log(`[createTab] switchTab took ${(performance.now() - t7).toFixed(2)}ms`);
 
   // Save tabs state
   saveProjectTabs();
+
+  console.timeEnd(`[PERF] createTab total`);
+  console.log('[createTab] END');
 }
 
 function createTabElement(tabId, name) {
@@ -651,10 +1114,20 @@ function createTabElement(tabId, name) {
 }
 
 function switchTab(tabId) {
+  console.time('[PERF] switchTab total');
+  console.log('[switchTab] START, tabId:', tabId);
+
+  const t0 = performance.now();
   const projectData = getCurrentProject();
-  if (!projectData || isRenamingTab) return;
+  console.log(`[switchTab] getCurrentProject took ${(performance.now() - t0).toFixed(2)}ms`);
+
+  if (!projectData || isRenamingTab) {
+    console.log('[switchTab] ABORT: no project or renaming');
+    return;
+  }
 
   if (projectData.activeTabId === tabId) {
+    console.log('[switchTab] Same tab, checking visibility');
     // Even if it's the same tab, make sure it's visible
     const tab = projectData.tabs.get(tabId);
     if (tab && tab.wrapper.style.display !== 'block') {
@@ -662,10 +1135,13 @@ function switchTab(tabId) {
       tab.wrapper.classList.add('active');
       tab.fitAddon.fit();
     }
+    console.timeEnd('[PERF] switchTab total');
     return;
   }
 
   // 1. Save current notes
+  console.log('[switchTab] Saving current notes');
+  const t1 = performance.now();
   if (projectData.activeTabId) {
     projectData.sessionNotes[projectData.activeTabId] = notesEditor.innerText;
     const prevTab = projectData.tabs.get(projectData.activeTabId);
@@ -675,8 +1151,11 @@ function switchTab(tabId) {
       prevTab.wrapper.classList.remove('active');
     }
   }
+  console.log(`[switchTab] Save notes took ${(performance.now() - t1).toFixed(2)}ms`);
 
   // 2. Activate new
+  console.log('[switchTab] Activating new tab');
+  const t2 = performance.now();
   projectData.activeTabId = tabId;
   const nextTab = projectData.tabs.get(tabId);
   if (nextTab) {
@@ -697,14 +1176,23 @@ function switchTab(tabId) {
       }
     });
   }
+  console.log(`[switchTab] Activate took ${(performance.now() - t2).toFixed(2)}ms`);
+  console.timeEnd('[PERF] switchTab total');
+  console.log('[switchTab] END');
 }
 
-function closeTab(tabId) {
+function closeTab(tabId, skipConfirmation = false) {
   const projectData = getCurrentProject();
   if (!projectData) return;
 
   const tab = projectData.tabs.get(tabId);
   if (!tab) return;
+
+  // Check for active processes
+  if (!skipConfirmation && hasActiveProcess(tab)) {
+    const confirm = window.confirm('This tab has an active process running. Are you sure you want to close it?');
+    if (!confirm) return;
+  }
 
   // Cleanup DOM
   tab.element.remove();
@@ -726,6 +1214,90 @@ function closeTab(tabId) {
 
   // Save tabs state
   saveProjectTabs();
+}
+
+// Check if tab has active process (heuristic)
+function hasActiveProcess(tabData) {
+  // Simple heuristic: if terminal has received data in last 2 seconds
+  if (!tabData.lastDataTime) return false;
+  const timeSinceLastData = Date.now() - tabData.lastDataTime;
+  return timeSinceLastData < 2000;
+}
+
+// Helper: Check if we're in workspace view
+function isInWorkspace() {
+  return workspaceView.style.display !== 'none' && workspaceView.style.display !== '';
+}
+
+// Handle Cmd+W context-aware close
+function handleCloseShortcut() {
+  if (isInWorkspace()) {
+    // In workspace - close active tab
+    const projectData = getCurrentProject();
+    if (projectData && projectData.activeTabId) {
+      closeTab(projectData.activeTabId);
+    }
+  } else {
+    // On dashboard - close active project chip
+    if (activeProjectId) {
+      closeProject(activeProjectId);
+    }
+  }
+}
+
+// Close an entire project
+async function closeProject(projectId, skipConfirmation = false) {
+  const projectData = openProjects.get(projectId);
+  if (!projectData) return;
+
+  // Count active processes
+  let activeProcessCount = 0;
+  projectData.tabs.forEach(tabData => {
+    if (hasActiveProcess(tabData)) activeProcessCount++;
+  });
+
+  // Confirm if there are active processes
+  if (!skipConfirmation && activeProcessCount > 0) {
+    const plural = activeProcessCount > 1 ? 's' : '';
+    const confirm = window.confirm(
+      `Project "${projectData.project.name}" has ${activeProcessCount} active process${plural}. Close anyway?`
+    );
+    if (!confirm) return;
+  }
+
+  // Close all tabs and cleanup
+  const tabIds = Array.from(projectData.tabs.keys());
+  for (const tabId of tabIds) {
+    const tab = projectData.tabs.get(tabId);
+    if (tab) {
+      // Cleanup DOM
+      tab.element.remove();
+      tab.wrapper.remove();
+      tab.terminal.dispose();
+
+      // Kill PTY process
+      ipcRenderer.send('terminal:kill', tabId);
+    }
+  }
+
+  // Clear all tabs from project data
+  projectData.tabs.clear();
+
+  // Remove from open projects
+  openProjects.delete(projectId);
+
+  // Update UI
+  renderProjectChips();
+
+  // If this was active project, switch to another or go to dashboard
+  if (activeProjectId === projectId) {
+    const remaining = Array.from(openProjects.keys());
+    if (remaining.length > 0) {
+      switchToProject(remaining[0]);
+    } else {
+      showDashboard();
+    }
+  }
 }
 
 function startRenamingTab(tabId, nameSpan) {
@@ -789,9 +1361,64 @@ function setupGlobalListeners() {
 
   // New Project Chip - return to dashboard to select another project
   newProjectChip.addEventListener('click', handleAddNewProject);
-  
+
   // New Tab
   newTabBtn.addEventListener('click', () => createTab());
+
+  // Edit Modal handlers
+  document.getElementById('close-modal-btn')?.addEventListener('click', closeEditModal);
+  document.getElementById('cancel-edit-btn')?.addEventListener('click', closeEditModal);
+  document.getElementById('save-edit-btn')?.addEventListener('click', saveProjectEdit);
+
+  // Close modal on Escape
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      const modal = document.getElementById('edit-project-modal');
+      if (modal && !modal.classList.contains('hidden')) {
+        closeEditModal();
+      }
+    }
+  });
+
+  // Settings project select removed - commands are now global
+
+  // Add Command button
+  const addCommandBtn = document.getElementById('add-command-btn');
+  if (addCommandBtn) {
+    addCommandBtn.addEventListener('click', async () => {
+      const result = await ipcRenderer.invoke('commands:get-global');
+      if (!result.success) return;
+
+      const commands = result.data;
+      commands.push({
+        name: `New Command ${commands.length + 1}`,
+        command: ''
+      });
+
+      await ipcRenderer.invoke('commands:save-global', commands);
+      showToast('Command added');
+      renderCommandsSettings();
+    });
+  }
+
+  // Add Prompt button
+  const addPromptBtn = document.getElementById('add-prompt-btn');
+  if (addPromptBtn) {
+    addPromptBtn.addEventListener('click', async () => {
+      const result = await ipcRenderer.invoke('prompts:get');
+      if (!result.success) return;
+
+      const prompts = result.data;
+      prompts.push({
+        title: `New Prompt ${prompts.length + 1}`,
+        content: ''
+      });
+
+      await ipcRenderer.invoke('prompts:save', prompts);
+      showToast('Prompt added');
+      renderPromptsSettings();
+    });
+  }
 
   // Close File Explorer
   closeExplorerBtn.addEventListener('click', () => {
@@ -804,16 +1431,44 @@ function setupGlobalListeners() {
     closeFilePreview();
   });
 
-  // Cmd + \ Shortcut for File Explorer (works with any keyboard layout)
+  // Global keyboard shortcuts (work with any keyboard layout)
   window.addEventListener('keydown', (e) => {
+    // Cmd + \ - Toggle File Explorer
     if (e.metaKey && e.code === 'Backslash') {
       e.preventDefault();
       toggleFileExplorer();
+      return;
     }
-    // Escape to close file preview (works with any keyboard layout)
-    if (e.code === 'Escape' && filePreviewOverlay.style.display === 'flex') {
+
+    // Escape - Close file preview or Gemini modal
+    if (e.code === 'Escape') {
+      const geminiModal = document.getElementById('gemini-modal');
+      if (geminiModal) {
+        e.preventDefault();
+        geminiModal.remove();
+        return;
+      }
+      if (filePreviewOverlay.style.display === 'flex') {
+        e.preventDefault();
+        closeFilePreview();
+        return;
+      }
+    }
+
+    // Cmd + T - New Tab (only in workspace)
+    if (e.metaKey && e.code === 'KeyT') {
       e.preventDefault();
-      closeFilePreview();
+      if (isInWorkspace()) {
+        createTab();
+      }
+      return;
+    }
+
+    // Cmd + W - Close Tab/Project (context-aware)
+    if (e.metaKey && e.code === 'KeyW') {
+      e.preventDefault();
+      handleCloseShortcut();
+      return;
     }
   });
 
@@ -823,19 +1478,25 @@ function setupGlobalListeners() {
       // UI Toggle
       notesTabs.forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
-      
-      const target = btn.dataset.tab; // session, project, actions
-      
+
+      const target = btn.dataset.tab; // session, gemini, actions
+
       // Hide all contents
       notesContentSession.classList.remove('active');
-      notesContentProject.classList.remove('active');
-      notesContentGemini.classList.remove('active'); // Added
+      notesContentGemini.classList.remove('active');
       notesContentActions.classList.remove('active');
-      
+
       // Show target
       if (target === 'session') notesContentSession.classList.add('active');
-      if (target === 'project') notesContentProject.classList.add('active');
-      if (target === 'gemini') notesContentGemini.classList.add('active'); // Added
+      if (target === 'gemini') {
+        notesContentGemini.classList.add('active');
+        // Lazy load Gemini history only when AI tab is opened
+        const projectData = getCurrentProject();
+        if (projectData && projectData.project) {
+          console.log('[Sidebar] AI tab opened, loading Gemini history...');
+          loadGeminiHistory(projectData.project.path);
+        }
+      }
       if (target === 'actions') notesContentActions.classList.add('active');
     });
   });
@@ -908,6 +1569,103 @@ function handleResize() {
 const GEMINI_API_KEY = 'REDACTED_GEMINI_KEY';
 const geminiHistoryContainer = document.getElementById('gemini-history');
 
+async function loadGeminiHistory(projectPath) {
+  console.time('[PERF] loadGeminiHistory total');
+  console.log('[loadGeminiHistory] START, path:', projectPath);
+
+  try {
+    const t0 = performance.now();
+    const result = await ipcRenderer.invoke('gemini:get-history', { dirPath: projectPath, limit: 50 });
+    console.log(`[loadGeminiHistory] IPC invoke took ${(performance.now() - t0).toFixed(2)}ms`);
+
+    if (result.success && result.data) {
+      console.log(`[loadGeminiHistory] Got ${result.data.length} items`);
+
+      // Clear existing history
+      const t1 = performance.now();
+      geminiHistoryContainer.innerHTML = '';
+      console.log(`[loadGeminiHistory] Clear container took ${(performance.now() - t1).toFixed(2)}ms`);
+
+      if (result.data.length === 0) {
+        geminiHistoryContainer.innerHTML = '<p class="placeholder-text text-[#555] text-center mt-5 text-xs">No Gemini searches yet. Select text in terminal and right-click to search.</p>';
+        document.getElementById('gemini-count').textContent = '0';
+        console.timeEnd('[PERF] loadGeminiHistory total');
+        return;
+      }
+
+      // Render history items (newest first)
+      const t2 = performance.now();
+      result.data.forEach(item => {
+        const timestamp = new Date(item.timestamp * 1000).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+        const charCount = item.selected_text.length;
+
+        const historyItem = document.createElement('div');
+        historyItem.className = 'history-item group bg-[#2d2d2d] border-l-2 border-l-accent rounded p-2 transition-all hover:bg-[#333]';
+        historyItem.dataset.historyId = item.id;
+
+        historyItem.innerHTML = `
+          <div class="flex items-start justify-between gap-2 mb-1">
+            <div class="flex items-center gap-2 min-w-0 flex-1">
+              <span class="text-[9px] text-[#666] shrink-0">${timestamp}</span>
+              <span class="text-[10px] text-[#888] truncate" title="${item.selected_text}">${charCount} chars</span>
+            </div>
+            <div class="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+              <button class="copy-btn text-[#666] hover:text-accent text-xs px-1 rounded hover:bg-white/5 transition-colors" title="Copy response">📋</button>
+              <button class="expand-btn text-[#666] hover:text-white text-xs px-1 rounded hover:bg-white/5 transition-colors" title="Show full">⤢</button>
+              <button class="delete-btn text-[#666] hover:text-[#cc3333] text-xs px-1 rounded hover:bg-white/5 transition-colors" title="Delete">🗑️</button>
+            </div>
+          </div>
+          <div class="status-text text-[10px] text-accent">✓ Done</div>
+        `;
+
+        // Setup copy button
+        const copyBtn = historyItem.querySelector('.copy-btn');
+        copyBtn.addEventListener('click', async (e) => {
+          e.stopPropagation();
+          await navigator.clipboard.writeText(item.response);
+          copyBtn.textContent = '✓';
+          setTimeout(() => copyBtn.textContent = '📋', 1000);
+        });
+
+        // Setup expand button
+        const expandBtn = historyItem.querySelector('.expand-btn');
+        expandBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          showGeminiModal(item.selected_text, item.prompt, item.response, timestamp);
+        });
+
+        // Setup delete button
+        const deleteBtn = historyItem.querySelector('.delete-btn');
+        deleteBtn.addEventListener('click', async (e) => {
+          e.stopPropagation();
+          const confirm = window.confirm('Delete this search from history?');
+          if (confirm) {
+            await ipcRenderer.invoke('gemini:delete-history', item.id);
+            historyItem.remove();
+            updateGeminiCount();
+          }
+        });
+
+        geminiHistoryContainer.appendChild(historyItem);
+      });
+      console.log(`[loadGeminiHistory] Render items took ${(performance.now() - t2).toFixed(2)}ms`);
+
+      const t3 = performance.now();
+      updateGeminiCount();
+      console.log(`[loadGeminiHistory] Update count took ${(performance.now() - t3).toFixed(2)}ms`);
+    }
+  } catch (err) {
+    console.error('[loadGeminiHistory] Error:', err);
+  }
+  console.timeEnd('[PERF] loadGeminiHistory total');
+  console.log('[loadGeminiHistory] END');
+}
+
+function updateGeminiCount() {
+  const count = geminiHistoryContainer.querySelectorAll('.history-item').length;
+  document.getElementById('gemini-count').textContent = count;
+}
+
 async function researchWithGemini(forcedText = null) {
   const projectData = getCurrentProject();
   if (!projectData || !projectData.activeTabId) return;
@@ -924,19 +1682,43 @@ async function researchWithGemini(forcedText = null) {
   // Switch to Gemini Tab to show progress
   document.querySelector('[data-tab="gemini"]').click();
 
+  // Get or create Gemini prompt from project settings
+  const geminiPrompt = projectData.project.geminiPrompt ||
+    'вот моя проблема нужно чтобы ты понял что за проблема и на reddit поискал обсуждения. Не ограничивайся категориями. Проблема: ';
+
+  const timestamp = new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+  const charCount = selectedText.length;
+
   const historyItem = document.createElement('div');
-  historyItem.className = 'history-item bg-[#2d2d2d] border-l-[3px] border-l-[#eebb00] p-2.5 rounded opacity-70';
+  historyItem.className = 'history-item group bg-[#2d2d2d] border-l-2 border-l-[#eebb00] rounded p-2 transition-all hover:bg-[#333]';
+
+  const itemId = `gemini-${Date.now()}`;
+  let responseText = '';
+
   historyItem.innerHTML = `
-    <div class="history-query text-[11px] text-[#888] mb-1 font-jetbrains">🔍 ${selectedText.substring(0, 50)}${selectedText.length > 50 ? '...' : ''}</div>
-    <div class="history-response text-[13px] text-[#ddd] leading-[1.4] whitespace-pre-wrap">Gemini is thinking...</div>
+    <div class="flex items-start justify-between gap-2 mb-1">
+      <div class="flex items-center gap-2 min-w-0 flex-1">
+        <span class="text-[9px] text-[#666] shrink-0">${timestamp}</span>
+        <span class="text-[10px] text-[#888] truncate" title="${selectedText}">${charCount} chars</span>
+      </div>
+      <div class="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+        <button class="copy-btn text-[#666] hover:text-accent text-xs px-1 rounded hover:bg-white/5 transition-colors" data-id="${itemId}" title="Copy response">📋</button>
+        <button class="expand-btn text-[#666] hover:text-white text-xs px-1 rounded hover:bg-white/5 transition-colors" data-id="${itemId}" title="Show full">⤢</button>
+        <button class="delete-btn text-[#666] hover:text-[#cc3333] text-xs px-1 rounded hover:bg-white/5 transition-colors" data-id="${itemId}" title="Delete">🗑️</button>
+      </div>
+    </div>
+    <div class="status-text text-[10px] text-[#888] italic">Searching...</div>
   `;
-  
+
   if (geminiHistoryContainer.querySelector('.placeholder-text')) {
     geminiHistoryContainer.innerHTML = '';
   }
   geminiHistoryContainer.prepend(historyItem);
 
-  const prompt = `вот моя проблема нужно чтобы ты понял что за проблема и на reddit поискал обсуждения. Не ограничивайся категориями. Проблема: ${selectedText}`;
+  // Update counter
+  updateGeminiCount();
+
+  const prompt = geminiPrompt + selectedText;
 
   try {
     console.log('[Gemini API] Requesting with prompt:', prompt);
@@ -960,48 +1742,188 @@ async function researchWithGemini(forcedText = null) {
       throw new Error('API returned empty or blocked response (Check safety settings or quota)');
     }
 
-    const resultText = data.candidates[0].content.parts[0].text;
+    responseText = data.candidates[0].content.parts[0].text;
 
-    // Update UI
-    historyItem.classList.remove('opacity-70', 'border-l-[#eebb00]');
+    // Save to database
+    const saveResult = await ipcRenderer.invoke('gemini:save-history', {
+      dirPath: projectData.project.path,
+      selectedText: selectedText,
+      prompt: geminiPrompt,
+      response: responseText
+    });
+
+    if (saveResult.success) {
+      // Store history ID for delete functionality
+      historyItem.dataset.historyId = saveResult.data.id;
+    }
+
+    // Update UI - success
+    historyItem.classList.remove('border-l-[#eebb00]');
     historyItem.classList.add('border-l-accent');
-    historyItem.querySelector('.history-response').textContent = resultText;
+    historyItem.querySelector('.status-text').textContent = '✓ Done';
+    historyItem.querySelector('.status-text').classList.remove('italic');
+    historyItem.querySelector('.status-text').classList.add('text-accent');
 
-    // Copy to clipboard
-    await navigator.clipboard.writeText(resultText);
-    
-    saveStatus.classList.remove('saving');
-    saveStatus.classList.add('saved');
-    saveStatus.textContent = 'Copied to clipboard!';
-    setTimeout(() => saveStatus.classList.remove('saved'), 2000);
-    
+    // Store response in data attribute
+    historyItem.dataset.response = responseText;
+
+    // Setup copy button
+    const copyBtn = historyItem.querySelector('.copy-btn');
+    copyBtn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      await navigator.clipboard.writeText(responseText);
+      copyBtn.textContent = '✓';
+      setTimeout(() => copyBtn.textContent = '📋', 1000);
+    });
+
+    // Setup expand button
+    const expandBtn = historyItem.querySelector('.expand-btn');
+    expandBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      showGeminiModal(selectedText, geminiPrompt, responseText, timestamp);
+    });
+
+    // Setup delete button
+    const deleteBtn = historyItem.querySelector('.delete-btn');
+    deleteBtn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const confirm = window.confirm('Delete this search from history?');
+      if (confirm && historyItem.dataset.historyId) {
+        await ipcRenderer.invoke('gemini:delete-history', parseInt(historyItem.dataset.historyId));
+        historyItem.remove();
+        updateGeminiCount();
+      }
+    });
+
   } catch (err) {
     console.error('Gemini API Error:', err);
-    historyItem.classList.remove('opacity-70', 'border-l-[#eebb00]');
+    historyItem.classList.remove('border-l-[#eebb00]');
     historyItem.classList.add('border-l-[#cc3333]');
-    historyItem.querySelector('.history-response').textContent = `Error: ${err.message}`;
-    
-    saveStatus.textContent = 'Gemini Error';
-    saveStatus.classList.remove('saving');
+    historyItem.querySelector('.status-text').textContent = `✗ ${err.message}`;
+    historyItem.querySelector('.status-text').classList.remove('italic');
+    historyItem.querySelector('.status-text').classList.add('text-[#cc3333]');
   }
 }
 
+function showGeminiModal(selectedText, prompt, response, timestamp) {
+  // Create modal overlay inside terminal container
+  const modal = document.createElement('div');
+  modal.className = 'gemini-modal-overlay absolute inset-0 bg-bg-main z-[90] flex flex-col border border-border-main';
+  modal.id = 'gemini-modal';
+
+  modal.innerHTML = `
+    <div class="modal-header h-10 bg-tab border-b border-border-main flex items-center justify-between px-4 shrink-0">
+      <div class="flex items-center gap-3">
+        <h3 class="text-sm font-bold">AI Response</h3>
+        <span class="text-[10px] text-[#666]">${timestamp}</span>
+      </div>
+      <button class="close-modal text-[#999] hover:text-white text-2xl leading-none w-8 h-8 flex items-center justify-center rounded hover:bg-white/10">×</button>
+    </div>
+
+    <div class="modal-content flex-1 overflow-y-auto p-4 flex flex-col gap-3">
+      <!-- Selected Text (Collapsible) -->
+      <div class="section bg-[#2d2d2d] rounded border border-border-main">
+        <button class="section-toggle w-full px-3 py-2 flex items-center justify-between text-left hover:bg-[#333] transition-colors">
+          <div class="flex items-center gap-2">
+            <span class="toggle-icon text-xs transition-transform">▶</span>
+            <span class="text-xs font-bold text-accent uppercase">Selected Text</span>
+            <span class="text-[10px] text-[#666]">${selectedText.length} chars</span>
+          </div>
+        </button>
+        <div class="section-content hidden px-3 pb-3">
+          <div class="p-2 bg-[#1e1e1e] rounded font-jetbrains text-xs text-[#ccc] whitespace-pre-wrap max-h-[200px] overflow-y-auto">${selectedText}</div>
+        </div>
+      </div>
+
+      <!-- Prompt -->
+      <div class="section bg-[#2d2d2d] rounded border border-border-main p-3">
+        <p class="text-[10px] text-[#888] uppercase mb-2">Prompt Template:</p>
+        <div class="p-2 bg-[#1e1e1e] rounded font-jetbrains text-xs text-[#ddd] whitespace-pre-wrap">${prompt}</div>
+      </div>
+
+      <!-- Response -->
+      <div class="section bg-[#2d2d2d] rounded border border-accent p-3 flex-1">
+        <div class="flex items-center justify-between mb-2">
+          <p class="text-[10px] text-accent uppercase font-bold">AI Response:</p>
+          <button class="copy-response text-[10px] text-[#666] hover:text-accent px-2 py-1 rounded hover:bg-white/5 transition-colors">📋 Copy</button>
+        </div>
+        <div class="response-text p-2 bg-[#1e1e1e] rounded font-jetbrains text-sm text-[#eee] leading-relaxed whitespace-pre-wrap">${response}</div>
+      </div>
+    </div>
+
+    <div class="modal-footer p-3 border-t border-border-main flex gap-2 justify-end shrink-0 bg-panel">
+      <button class="close-modal px-4 py-2 bg-transparent border border-border-main rounded text-[#ccc] hover:bg-white/5 text-sm">Close</button>
+    </div>
+  `;
+
+  // Append to terminal container
+  terminalContainer.appendChild(modal);
+
+  // Toggle collapsible section
+  const toggleBtn = modal.querySelector('.section-toggle');
+  const toggleIcon = modal.querySelector('.toggle-icon');
+  const sectionContent = modal.querySelector('.section-content');
+
+  toggleBtn.addEventListener('click', () => {
+    const isHidden = sectionContent.classList.contains('hidden');
+    if (isHidden) {
+      sectionContent.classList.remove('hidden');
+      toggleIcon.style.transform = 'rotate(90deg)';
+    } else {
+      sectionContent.classList.add('hidden');
+      toggleIcon.style.transform = 'rotate(0deg)';
+    }
+  });
+
+  // Close handlers
+  modal.querySelectorAll('.close-modal').forEach(btn => {
+    btn.addEventListener('click', () => modal.remove());
+  });
+
+  // Copy handler
+  modal.querySelector('.copy-response').addEventListener('click', async () => {
+    await navigator.clipboard.writeText(response);
+    const btn = modal.querySelector('.copy-response');
+    const originalText = btn.textContent;
+    btn.textContent = '✓ Copied!';
+    setTimeout(() => btn.textContent = originalText, 1000);
+  });
+}
+
 // Handle Context Menu from Main Process
-ipcRenderer.on('context-menu-command', (e, cmd) => {
+ipcRenderer.on('context-menu-command', (e, cmd, data) => {
   if (cmd === 'gemini-research') {
     researchWithGemini();
+  } else if (cmd === 'insert-prompt') {
+    // Insert prompt text into active terminal
+    const projectData = getCurrentProject();
+    if (projectData && projectData.activeTabId) {
+      const tab = projectData.tabs.get(projectData.activeTabId);
+      if (tab && tab.terminal) {
+        tab.terminal.paste(data);
+        tab.terminal.focus();
+      }
+    }
   }
 });
 
 function renderActions(actions) {
-  console.log('[renderActions] START, actions:', actions);
+  console.time('[PERF] renderActions total');
+  console.log('[renderActions] START, actions count:', actions?.length || 0);
+  console.log('[renderActions] Full actions:', actions);
+
+  const t0 = performance.now();
   actionsList.innerHTML = '';
+  console.log(`[renderActions] Clear list took ${(performance.now() - t0).toFixed(2)}ms`);
 
   if (!actions || !actions.length) {
     actionsList.innerHTML = '<p class="placeholder-text">No actions defined.</p>';
+    console.timeEnd('[PERF] renderActions total');
+    console.log('[renderActions] END (no actions)');
     return;
   }
 
+  const t1 = performance.now();
   actions.forEach(act => {
     const btn = document.createElement('div');
     btn.className = 'action-btn bg-[#333] border border-[#444] text-[#ddd] p-2 text-left cursor-pointer rounded text-xs flex items-center hover:bg-[#444] hover:border-[#555]';
@@ -1009,6 +1931,10 @@ function renderActions(actions) {
     btn.onclick = () => runAction(act.command);
     actionsList.appendChild(btn);
   });
+  console.log(`[renderActions] Render buttons took ${(performance.now() - t1).toFixed(2)}ms`);
+
+  console.timeEnd('[PERF] renderActions total');
+  console.log('[renderActions] END');
 }
 
 function runAction(cmd) {
@@ -1317,8 +2243,6 @@ async function renderFileTree(dirPath, container, level = 0) {
 
 // Global Data Handler
 ipcRenderer.on('terminal:data', (e, { pid, tabId, data }) => {
-  console.log('[terminal:data] received for tabId:', tabId, 'length:', data.length);
-
   // Find which project owns this tab
   let tab = null;
   for (const [projId, projectData] of openProjects) {
@@ -1329,9 +2253,12 @@ ipcRenderer.on('terminal:data', (e, { pid, tabId, data }) => {
   }
 
   if (!tab) {
-    console.error('[terminal:data] Tab not found:', tabId);
+    // Silently ignore - tab might have been closed
     return;
   }
+
+  // Track last data time for active process detection
+  tab.lastDataTime = Date.now();
 
   // Buffered Write
   tab.writeBuffer += data;

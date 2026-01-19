@@ -1,102 +1,108 @@
-const fs = require('fs');
-const path = require('path');
-const { app } = require('electron');
+const DatabaseManager = require('./database');
+const { migrateFromJSON } = require('./migration');
 
 class ProjectManager {
   constructor() {
-    this.userDataPath = app.getPath('userData');
-    this.projectsFilePath = path.join(this.userDataPath, 'projects.json');
-    this.projects = {};
+    this.db = new DatabaseManager();
     this.init();
   }
 
   init() {
     try {
-      if (fs.existsSync(this.projectsFilePath)) {
-        const data = fs.readFileSync(this.projectsFilePath, 'utf-8');
-        this.projects = JSON.parse(data);
-      } else {
-        this.projects = {};
-        this.save();
+      // Check if this is first run and migrate from JSON if needed
+      const projectCount = this.db.db.prepare('SELECT COUNT(*) as count FROM projects').get().count;
+
+      if (projectCount === 0) {
+        console.log('[ProjectManager] No projects found in database. Attempting migration from JSON...');
+        try {
+          migrateFromJSON();
+        } catch (err) {
+          console.log('[ProjectManager] Migration skipped or failed:', err.message);
+        }
+      }
+
+      // Migrate quick_actions to global_commands
+      const migrationResult = this.db.migrateQuickActionsToGlobal();
+      if (migrationResult.migrated) {
+        console.log(`[ProjectManager] Migrated ${migrationResult.count} unique commands to global_commands`);
       }
     } catch (err) {
-      console.error('Failed to load projects:', err);
-      this.projects = {};
-    }
-  }
-
-  save() {
-    try {
-      fs.writeFileSync(this.projectsFilePath, JSON.stringify(this.projects, null, 2));
-    } catch (err) {
-      console.error('Failed to save projects:', err);
+      console.error('[ProjectManager] Init error:', err);
     }
   }
 
   getProject(dirPath) {
-    // Normalize path to avoid / vs \ issues and trailing slashes
-    const normalizedPath = path.resolve(dirPath);
+    let project = this.db.getProject(dirPath);
 
-    // Migration: Add tabs field to old projects
-    if (this.projects[normalizedPath] && !this.projects[normalizedPath].tabs) {
-      this.projects[normalizedPath].tabs = [];
-      this.save();
+    // If project doesn't exist, create it
+    if (!project) {
+      project = this.db.createProject(dirPath);
     }
 
-    if (!this.projects[normalizedPath]) {
-      // Initialize new project if it doesn't exist
-      const folderName = path.basename(normalizedPath);
-      this.projects[normalizedPath] = {
-        id: Buffer.from(normalizedPath).toString('base64'),
-        path: normalizedPath,
-        name: folderName,
-        notes: {
-          global: `<h1>${folderName}</h1><p>Project notes go here...</p>`,
-          sessions: [] // History of session summaries
-        },
-        quickActions: [
-          {
-            name: "gemini (прочитать docs)",
-            command: "gemini 'Прочитай всю документацию в папке docs и в корне проекта, чтобы понять архитектуру. Не отвечай пока я не спрошу.'"
-          },
-          {
-            name: "claude (прочитать docs)",
-            command: "claude 'Прочитай всю документацию в папке docs и в корне проекта, чтобы понять архитектуру. Не отвечай пока я не спрошу.'"
-          },
-          {
-            name: "📂 List Project Files",
-            command: "ls -lah"
-          }
-        ],
-        tabs: [] // Saved tabs state: [{ name: "Tab 1", cwd: "/path" }]
-      };
-      this.save();
-    }
-    return this.projects[normalizedPath];
+    return project;
   }
 
-  saveProjectNote(dirPath, noteContent) {
-    const normalizedPath = path.resolve(dirPath);
-    if (this.projects[normalizedPath]) {
-      this.projects[normalizedPath].notes.global = noteContent;
-      this.save();
-    }
+  get projects() {
+    // Return projects as an object with path as key (for compatibility)
+    const allProjects = this.db.getAllProjects();
+    const projectsObj = {};
+
+    allProjects.forEach(project => {
+      projectsObj[project.path] = project;
+    });
+
+    return projectsObj;
+  }
+
+  saveProjectNote(dirPath, content) {
+    this.db.updateProjectNotes(dirPath, content);
   }
 
   saveProjectActions(dirPath, actions) {
-    const normalizedPath = path.resolve(dirPath);
-    if (this.projects[normalizedPath]) {
-      this.projects[normalizedPath].quickActions = actions;
-      this.save();
-    }
+    this.db.saveQuickActions(dirPath, actions);
   }
 
   saveProjectTabs(dirPath, tabs) {
-    const normalizedPath = path.resolve(dirPath);
-    if (this.projects[normalizedPath]) {
-      this.projects[normalizedPath].tabs = tabs;
-      this.save();
-    }
+    this.db.saveTabs(dirPath, tabs);
+  }
+
+  saveProjectMetadata(dirPath, metadata) {
+    this.db.updateProjectMetadata(dirPath, metadata);
+  }
+
+  saveGeminiPrompt(dirPath, prompt) {
+    this.db.updateProjectMetadata(dirPath, { geminiPrompt: prompt });
+  }
+
+  // Gemini history methods
+  saveGeminiHistory(dirPath, selectedText, prompt, response) {
+    return this.db.saveGeminiHistory(dirPath, selectedText, prompt, response);
+  }
+
+  getGeminiHistory(dirPath, limit = 50) {
+    return this.db.getGeminiHistory(dirPath, limit);
+  }
+
+  deleteGeminiHistoryItem(historyId) {
+    this.db.deleteGeminiHistoryItem(historyId);
+  }
+
+  // Global commands methods
+  getGlobalCommands() {
+    return this.db.getGlobalCommands();
+  }
+
+  saveGlobalCommands(commands) {
+    this.db.saveGlobalCommands(commands);
+  }
+
+  // Prompts methods
+  getPrompts() {
+    return this.db.getPrompts();
+  }
+
+  savePrompts(prompts) {
+    this.db.savePrompts(prompts);
   }
 }
 

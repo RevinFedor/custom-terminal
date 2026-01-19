@@ -1,3 +1,132 @@
+# Developer Guide
+
+## Быстрый старт
+
+### 1. Установка
+```bash
+npm install
+```
+
+### 2. Запуск
+```bash
+npm start
+```
+
+### 3. Перестройка native модулей (если node-pty не работает)
+```bash
+npm run rebuild
+```
+
+## Команды NPM
+
+| Команда | Описание |
+|---------|----------|
+| `npm start` | Запуск приложения |
+| `npm run dev` | Запуск с hot-reload (nodemon) |
+| `npm run dev:css` | Watch режим для Tailwind CSS |
+| `npm run build:css` | Сборка Tailwind CSS (минифицированный) |
+| `npm run rebuild` | Пересборка node-pty для текущей версии Node |
+| `npm run build` | Сборка приложения (electron-builder) |
+| `npm run dist` | Сборка для macOS в папку |
+
+## Структура проекта
+
+```
+custom-terminal/
+├── main.js                  # Главный процесс Electron
+├── renderer.js              # Рендерер (UI, терминал, Gemini)
+├── project-manager.js       # Менеджер проектов (JSON storage)
+├── index.html               # HTML структура
+├── input.css                # Tailwind исходный файл
+├── output.css               # Tailwind скомпилированный
+├── package.json             # Dependencies & scripts
+├── assets/                  # Шрифты, иконки
+│   └── fonts/
+├── docs/                    # Документация (Gold Standard v3.4)
+└── build-resources/         # Ресурсы для сборки (иконки)
+```
+
+## Разработка
+
+### Hot Reload
+```bash
+npm run dev
+```
+Автоматически перезапускает Electron при изменении файлов (main.js, renderer.js, index.html).
+
+### Tailwind CSS
+**Watch mode (для разработки):**
+```bash
+npm run dev:css
+```
+
+**Build (для коммита):**
+```bash
+npm run build:css
+```
+
+### DevTools
+- `Cmd + Option + I` — открыть DevTools
+- `Cmd + R` — перезагрузить окно
+
+## Архитектура
+
+### IPC Communication
+- `terminal:create` — создать PTY процесс
+- `terminal:input` — отправить input в PTY
+- `terminal:data` — получить output из PTY
+- `terminal:resize` — изменить размер PTY
+- `terminal:kill` — убить PTY процесс
+- `project:get` — получить данные проекта
+- `project:save-*` — сохранить данные проекта
+
+### Data Storage
+```bash
+~/Library/Application Support/custom-terminal/projects.json
+```
+
+**Schema:**
+```json
+{
+  "/absolute/path/to/project": {
+    "id": "base64-encoded-path",
+    "name": "Project Name",
+    "description": "Optional description",
+    "geminiPrompt": "Custom AI prompt template",
+    "notes": { "global": "..." },
+    "quickActions": [...],
+    "tabs": [...]
+  }
+}
+```
+
+## Troubleshooting
+
+### node-pty не работает
+```bash
+npm run rebuild
+```
+
+### Tailwind изменения не применяются
+```bash
+npm run build:css
+```
+
+### Терминал не отображается
+1. Проверь DevTools Console на ошибки
+2. Проверь что шрифт загружен: `document.fonts.check("14px 'JetBrainsMono NF'")`
+3. См. `docs/troubleshooting/001-font-loading-race.md`
+
+### WebGL не работает
+```javascript
+// В DevTools Console:
+const term = Array.from(tabs.values())[0]?.terminal;
+const renderer = term._core._renderService._renderer._value;
+console.log(Object.keys(renderer)); // Должен содержать _gl
+```
+
+---
+
 # Debug Guide
 
 ## Debug Scripts Location
