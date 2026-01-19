@@ -11,9 +11,9 @@
   <div class="title-bar">
     <div class="window-controls-placeholder"></div>
     <div id="project-chips-container">
-      <button id="home-chip" class="project-chip group flex items-center gap-1 px-3 py-0.5 rounded-xl text-xs bg-tab border border-border-main hover:bg-[#3a3a3c] hover:border-accent transition-all duration-150 no-drag h-[22px] text-text-main" title="Dashboard">🏠</button>
+      <button id="home-chip" class="project-chip group flex items-center gap-1 px-3 py-0.5 rounded-xl text-xs bg-tab border border-border-main hover:bg-[#3a3a3c] hover:border-accent transition-all duration-150 no-drag h-[22px] text-text-main cursor-pointer" title="Dashboard">🏠</button>
       <!-- Active project chips will be added here -->
-      <button id="new-project-chip" class="project-chip new hidden group items-center gap-1 px-2.5 py-0.5 rounded-xl text-xs bg-transparent border border-dashed border-[#555] opacity-70 hover:opacity-100 hover:border-accent transition-all duration-150 no-drag h-[22px] text-text-main" title="Open new project">+</button>
+      <button id="new-project-chip" class="project-chip new hidden group items-center gap-1 px-2.5 py-0.5 rounded-xl text-xs bg-transparent border border-dashed border-[#555] opacity-70 hover:opacity-100 hover:border-accent transition-all duration-150 no-drag h-[22px] text-text-main cursor-pointer" title="Open new project">+</button>
     </div>
     <div class="title-drag-area"></div>
   </div>
@@ -31,47 +31,46 @@
       </div>
     </div>
 
-    <!-- View 1: Projects (The 2-column layout) -->
+    <!-- View 1: Projects (Card Grid) -->
     <div id="dash-global-projects" class="dash-global-content active hidden flex-1 overflow-hidden">
-      <div class="dashboard-container flex w-full h-full">
-        <div class="projects-sidebar w-sidebar-width bg-panel border-r border-border-main flex flex-col p-5">
-          <h2 class="text-lg font-bold mb-4">Your Projects</h2>
-          <div id="projects-list" class="flex-1 overflow-y-auto mt-[10px]">
+      <div class="dashboard-container w-full h-full p-10 overflow-y-auto">
+        <div class="max-w-[1400px] mx-auto">
+          <h2 class="text-2xl font-bold mb-8">Your Projects</h2>
+          <div id="projects-grid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
             <!-- Project cards will be injected here -->
           </div>
-        </div>
-
-        <div class="project-details flex-1 p-10 flex flex-col" id="project-details-panel" style="display: none;">
-          <h1 id="dash-project-title" class="mt-0 text-2xl font-bold">Project Name</h1>
-          <div class="dash-path font-jetbrains text-[#888] text-xs mb-5" id="dash-project-path">/path/to/project</div>
-          
-          <div class="dash-section flex-1 flex flex-col min-h-0 mb-5">
-            <h3 class="text-sm uppercase tracking-wider text-[#aaa] mb-2">Global Project Notes (AI Context)</h3>
-            <div id="dash-project-notes" class="notes-editor flex-1 bg-[#111] border border-border-main p-[15px] text-[#eee] font-jetbrains text-[13px] leading-relaxed outline-none rounded-md overflow-y-auto whitespace-pre-wrap" contenteditable="true" spellcheck="false"></div>
-          </div>
-
-          <div class="dash-actions flex gap-2.5">
-            <button id="btn-open-project" class="primary-btn bg-accent text-white border-none py-2.5 px-5 rounded cursor-pointer text-sm font-medium hover:brightness-110">🚀 Open Workspace</button>
-          </div>
-        </div>
-
-        <div class="empty-state flex-1 p-10 flex flex-col items-center justify-center opacity-50" id="dashboard-empty-state">
-          <div class="text-[48px] mb-5">📁</div>
-          <h2 class="text-xl font-semibold">Select a project to view details or create a new one.</h2>
         </div>
       </div>
     </div>
 
-    <!-- View 2: Settings (Full page layout) -->
-    <div id="dash-global-settings" class="dash-global-content hidden flex-1 overflow-hidden">
-      <div class="settings-container max-w-[800px] mx-auto p-10 w-full overflow-y-auto">
-        <div class="settings-header mb-[30px] border-b border-border-main pb-5">
-          <h2 class="m-0 text-2xl font-bold">Global Command Settings</h2>
-          <p class="text-[#888] mt-2.5 mb-0">Configure prompts and terminal commands for the selected project.</p>
+    <!-- View 2: Settings (Full Screen) -->
+    <div id="dash-global-settings" class="dash-global-content hidden flex-1 overflow-hidden flex">
+      <!-- Commands Settings -->
+      <div class="flex-1 overflow-y-auto p-10 border-r border-border-main">
+        <div class="settings-header mb-8 flex items-center justify-between">
+          <div>
+            <h2 class="m-0 text-2xl font-bold">Terminal Commands</h2>
+            <p class="text-[#888] mt-2 text-sm">Quick actions available in all projects</p>
+          </div>
+          <button id="add-command-btn" class="bg-accent hover:bg-accent/80 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors flex items-center gap-2">
+            <span>+</span> Add Command
+          </button>
         </div>
-        <div id="commands-settings-list" class="flex flex-col gap-[15px] overflow-y-auto">
-          <p class="placeholder-text text-[#555] text-center mt-5 text-xs">Select a project in the Projects tab first.</p>
+        <div id="commands-settings-list" class="flex flex-col gap-5"></div>
+      </div>
+
+      <!-- Prompts Settings -->
+      <div class="flex-1 overflow-y-auto p-10">
+        <div class="settings-header mb-8 flex items-center justify-between">
+          <div>
+            <h2 class="m-0 text-2xl font-bold">Insert Prompts</h2>
+            <p class="text-[#888] mt-2 text-sm">Right-click in terminal to insert these prompts</p>
+          </div>
+          <button id="add-prompt-btn" class="bg-accent hover:bg-accent/80 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors flex items-center gap-2">
+            <span>+</span> Add Prompt
+          </button>
         </div>
+        <div id="prompts-settings-list" class="flex flex-col gap-5"></div>
       </div>
     </div>
   </div>
@@ -101,37 +100,28 @@
 
       <div id="notes-panel" class="w-[300px] bg-notes border-l border-border-main flex flex-col min-w-[150px]">
         <div class="notes-tabs flex border-b border-border-main bg-[#2d2d2d]">
-          <button class="note-tab active flex-1 bg-transparent border-none text-[#888] py-2 text-xs cursor-pointer border-b-2 border-transparent hover:text-[#ccc]" data-tab="session">Session</button>
-          <button class="note-tab flex-1 bg-transparent border-none text-[#888] py-2 text-xs cursor-pointer border-b-2 border-transparent hover:text-[#ccc]" data-tab="project">Project</button>
-          <button class="note-tab flex-1 bg-transparent border-none text-[#888] py-2 text-xs cursor-pointer border-b-2 border-transparent hover:text-[#ccc]" data-tab="gemini">Gemini</button>
+          <button class="note-tab active flex-1 bg-transparent border-none text-[#888] py-2 text-xs cursor-pointer border-b-2 border-transparent hover:text-[#ccc]" data-tab="session">Notes</button>
+          <button class="note-tab flex-1 bg-transparent border-none text-[#888] py-2 text-xs cursor-pointer border-b-2 border-transparent hover:text-[#ccc]" data-tab="gemini">AI</button>
           <button class="note-tab flex-1 bg-transparent border-none text-[#888] py-2 text-xs cursor-pointer border-b-2 border-transparent hover:text-[#ccc]" data-tab="actions">Actions</button>
         </div>
 
         <!-- Session Notes -->
         <div id="notes-content-session" class="notes-content flex-1 flex-col hidden active">
           <div class="notes-header px-3 py-2 bg-[#333] text-[11px] uppercase text-[#aaa] flex justify-between items-center">
-            <span>Current Session</span>
+            <span>Session Notes</span>
             <span class="save-status text-[10px] text-[#666] transition-colors duration-300">Saved</span>
           </div>
           <div id="notes-editor" class="flex-1 p-3 outline-none overflow-y-auto font-jetbrains text-[13px] leading-relaxed text-[#ddd] whitespace-pre-wrap" contenteditable="true" spellcheck="false"></div>
         </div>
 
-        <!-- Project Notes -->
-        <div id="notes-content-project" class="notes-content flex-1 flex-col hidden">
-          <div class="notes-header px-3 py-2 bg-[#333] text-[11px] uppercase text-[#aaa] flex justify-between items-center">
-            <span>Global Context</span>
-            <button class="small-btn bg-[#444] border-none text-[#ccc] px-2 py-0.5 text-[10px] rounded cursor-pointer hover:bg-[#555]" onclick="showDashboard()">Edit</button>
-          </div>
-          <div id="notes-viewer-project" class="read-only-content flex-1 p-3 outline-none overflow-y-auto font-jetbrains text-[13px] leading-relaxed text-[#999] whitespace-pre-wrap bg-[#1e1e1e]"></div>
-        </div>
-
         <!-- Gemini History -->
         <div id="notes-content-gemini" class="notes-content flex-1 flex-col hidden">
           <div class="notes-header px-3 py-2 bg-[#333] text-[11px] uppercase text-[#aaa] flex justify-between items-center">
-            <span>Gemini AI History</span>
+            <span>AI Search</span>
+            <span class="text-[9px] text-[#666]" id="gemini-count">0</span>
           </div>
-          <div id="gemini-history" class="history-list flex-1 overflow-y-auto p-2.5 flex flex-col gap-[15px]">
-            <p class="placeholder-text text-[#555] text-center mt-5 text-xs">История поиска появится здесь...</p>
+          <div id="gemini-history" class="history-list flex-1 overflow-y-auto p-2 flex flex-col gap-2">
+            <p class="placeholder-text text-[#555] text-center mt-5 text-xs">Select text and right-click to search</p>
           </div>
         </div>
 
@@ -153,6 +143,35 @@
         <div id="file-preview-content" class="file-preview-content flex-1 overflow-auto font-jetbrains text-[13px] leading-[1.5] bg-bg-main text-text-main"></div>
       </div>
     </div>
+  </div>
+
+  <!-- Edit Project Modal -->
+  <div id="edit-project-modal" class="fixed inset-0 bg-black/50 backdrop-blur-sm z-[100] hidden flex items-center justify-center">
+    <div class="bg-panel border border-border-main rounded-xl w-[500px] max-w-[90vw] shadow-2xl">
+      <div class="p-5 border-b border-border-main flex justify-between items-center">
+        <h3 class="text-lg font-bold">Edit Project</h3>
+        <button id="close-modal-btn" class="text-[#999] hover:text-white text-2xl leading-none w-8 h-8 flex items-center justify-center rounded hover:bg-white/10">×</button>
+      </div>
+      <div class="p-5 flex flex-col gap-4">
+        <div>
+          <label class="block text-sm text-[#aaa] mb-2">Project Name</label>
+          <input id="edit-project-name" type="text" class="w-full bg-[#111] border border-border-main rounded px-3 py-2 text-white outline-none focus:border-accent">
+        </div>
+        <div>
+          <label class="block text-sm text-[#aaa] mb-2">Description</label>
+          <textarea id="edit-project-description" rows="4" class="w-full bg-[#111] border border-border-main rounded px-3 py-2 text-white outline-none focus:border-accent resize-none"></textarea>
+        </div>
+      </div>
+      <div class="p-5 border-t border-border-main flex gap-2 justify-end">
+        <button id="cancel-edit-btn" class="px-4 py-2 bg-transparent border border-border-main rounded text-[#ccc] hover:bg-white/5">Cancel</button>
+        <button id="save-edit-btn" class="px-4 py-2 bg-accent rounded text-white hover:brightness-110">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast Notifications -->
+  <div id="toast-container" class="fixed bottom-5 right-5 z-[1000] flex flex-col gap-2 pointer-events-none">
+    <!-- Toasts will be added here -->
   </div>
 
   <script src="renderer.js"></script>

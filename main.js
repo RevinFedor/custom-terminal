@@ -47,19 +47,37 @@ function createWindow() {
 }
 
 // Context Menu IPC
-ipcMain.on('show-terminal-context-menu', (event, hasSelection) => {
+ipcMain.on('show-terminal-context-menu', async (event, { hasSelection, prompts }) => {
   const template = [
     {
       label: 'Search Reddit with Gemini',
       enabled: hasSelection,
       click: () => { event.sender.send('context-menu-command', 'gemini-research'); }
     },
-    { type: 'separator' },
-    { role: 'copy' },
-    { role: 'paste' },
-    { type: 'separator' },
-    { role: 'selectAll' }
+    { type: 'separator' }
   ];
+
+  // Add Insert Prompt submenu
+  if (prompts && prompts.length > 0) {
+    const promptsSubmenu = prompts.map(prompt => ({
+      label: prompt.title,
+      click: () => {
+        event.sender.send('context-menu-command', 'insert-prompt', prompt.content);
+      }
+    }));
+
+    template.push({
+      label: 'Insert Prompt',
+      submenu: promptsSubmenu
+    });
+    template.push({ type: 'separator' });
+  }
+
+  template.push({ role: 'copy' });
+  template.push({ role: 'paste' });
+  template.push({ type: 'separator' });
+  template.push({ role: 'selectAll' });
+
   const menu = Menu.buildFromTemplate(template);
   menu.popup(BrowserWindow.fromWebContents(event.sender));
 });
@@ -198,6 +216,11 @@ ipcMain.handle('project:save-tabs', (event, { dirPath, tabs }) => {
   return { success: true };
 });
 
+ipcMain.handle('project:save-metadata', (event, { dirPath, metadata }) => {
+  projectManager.saveProjectMetadata(dirPath, metadata);
+  return { success: true };
+});
+
 ipcMain.handle('project:select-directory', async () => {
   const result = await dialog.showOpenDialog(mainWindow, {
     properties: ['openDirectory']
@@ -235,6 +258,79 @@ ipcMain.handle('file:read', async (event, filePath) => {
     return { success: true, content };
   } catch (error) {
     console.error('[main] Error reading file:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// Gemini history management
+ipcMain.handle('gemini:save-history', async (event, { dirPath, selectedText, prompt, response }) => {
+  try {
+    const result = projectManager.saveGeminiHistory(dirPath, selectedText, prompt, response);
+    return { success: true, data: result };
+  } catch (error) {
+    console.error('[main] Error saving Gemini history:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('gemini:get-history', async (event, { dirPath, limit }) => {
+  try {
+    const history = projectManager.getGeminiHistory(dirPath, limit);
+    return { success: true, data: history };
+  } catch (error) {
+    console.error('[main] Error getting Gemini history:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('gemini:delete-history', async (event, historyId) => {
+  try {
+    projectManager.deleteGeminiHistoryItem(historyId);
+    return { success: true };
+  } catch (error) {
+    console.error('[main] Error deleting Gemini history:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// Global commands management
+ipcMain.handle('commands:get-global', async () => {
+  try {
+    const commands = projectManager.getGlobalCommands();
+    return { success: true, data: commands };
+  } catch (error) {
+    console.error('[main] Error getting global commands:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('commands:save-global', async (event, commands) => {
+  try {
+    projectManager.saveGlobalCommands(commands);
+    return { success: true };
+  } catch (error) {
+    console.error('[main] Error saving global commands:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// Prompts management
+ipcMain.handle('prompts:get', async () => {
+  try {
+    const prompts = projectManager.getPrompts();
+    return { success: true, data: prompts };
+  } catch (error) {
+    console.error('[main] Error getting prompts:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('prompts:save', async (event, prompts) => {
+  try {
+    projectManager.savePrompts(prompts);
+    return { success: true };
+  } catch (error) {
+    console.error('[main] Error saving prompts:', error);
     return { success: false, error: error.message };
   }
 });
