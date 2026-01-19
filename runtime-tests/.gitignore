@@ -1,0 +1,20 @@
+# Test Results
+results/
+test-results/
+playwright-report/
+test-artifacts/
+*.png
+*.mp4
+*.webm
+*.zip
+
+# Logs
+test-logs.txt
+*.log
+
+# Node modules (if accidentally installed here)
+node_modules/
+
+# OS
+.DS_Store
+Thumbs.db

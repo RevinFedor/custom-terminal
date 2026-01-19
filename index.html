@@ -3,12 +3,26 @@
 <head>
   <meta charset="UTF-8">
   <title>Noted Terminal</title>
-  <link rel="stylesheet" href="node_modules/@xterm/xterm/css/xterm.css">
-  <link rel="stylesheet" href="node_modules/highlight.js/styles/vs2015.css">
-  <link rel="stylesheet" href="output.css">
+  <style>
+    body, html {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+    }
+    #react-root {
+      width: 100%;
+      height: 100%;
+    }
+  </style>
 </head>
 <body>
-  <div class="title-bar">
+  <!-- React App Container -->
+  <div id="react-root"></div>
+
+  <!-- Legacy UI hidden during migration -->
+  <div class="hidden title-bar">
     <div class="window-controls-placeholder"></div>
     <div id="project-chips-container">
       <button id="home-chip" class="project-chip group flex items-center gap-1 px-3 py-0.5 rounded-xl text-xs bg-tab border border-border-main hover:bg-[#3a3a3c] hover:border-accent transition-all duration-150 no-drag h-[22px] text-text-main cursor-pointer" title="Dashboard">🏠</button>
@@ -138,31 +152,65 @@
         <div id="notes-content-sessions" class="notes-content flex-1 flex-col hidden">
           <div class="notes-header px-3 py-2 bg-[#333] text-[11px] uppercase text-[#aaa] flex justify-between items-center">
             <span>Session Manager</span>
+            <button onclick="refreshSessionsList()" class="text-xs text-[#888] hover:text-white">🔄</button>
           </div>
-          <div class="p-2.5 flex flex-col gap-2 overflow-y-auto">
-            <div class="text-[10px] text-[#666] mb-2">Gemini CLI</div>
-            <button onclick="exportGeminiSession()" class="w-full bg-[#2d2d2d] hover:bg-[#3d3d3d] border border-border-main rounded px-3 py-2 text-xs text-white cursor-pointer transition-colors">
-              Export Gemini Session
-            </button>
-            <button onclick="importGeminiSession()" class="w-full bg-[#2d2d2d] hover:bg-[#3d3d3d] border border-border-main rounded px-3 py-2 text-xs text-white cursor-pointer transition-colors">
-              Restore Gemini Session
-            </button>
+          <div class="p-2.5 flex flex-col gap-3 overflow-y-auto">
 
-            <div class="text-[10px] text-[#666] mb-2 mt-4">Claude Code</div>
-            <button onclick="exportClaudeSession()" class="w-full bg-[#2d2d2d] hover:bg-[#3d3d3d] border border-border-main rounded px-3 py-2 text-xs text-white cursor-pointer transition-colors">
-              Export Claude Session
-            </button>
-            <button onclick="importClaudeSession()" class="w-full bg-[#2d2d2d] hover:bg-[#3d3d3d] border border-border-main rounded px-3 py-2 text-xs text-white cursor-pointer transition-colors">
-              Restore Claude Session
-            </button>
+            <!-- Gemini Sessions -->
+            <div class="session-section">
+              <div class="flex items-center justify-between mb-2">
+                <div class="text-[10px] text-[#666] uppercase">Gemini CLI</div>
+                <span id="gemini-session-count" class="text-[9px] text-[#666]">0</span>
+              </div>
 
-            <div class="text-[10px] text-[#666] mb-2 mt-4">Utilities</div>
-            <button onclick="listSessions()" class="w-full bg-[#2d2d2d] hover:bg-[#3d3d3d] border border-border-main rounded px-3 py-2 text-xs text-white cursor-pointer transition-colors">
-              List All Sessions
-            </button>
-            <button onclick="saveVisualSnapshot()" class="w-full bg-[#2d2d2d] hover:bg-[#3d3d3d] border border-border-main rounded px-3 py-2 text-xs text-white cursor-pointer transition-colors">
-              Save Terminal Buffer
-            </button>
+              <!-- Saved Gemini Sessions List -->
+              <div id="gemini-sessions-list" class="mb-2 flex flex-col gap-1">
+                <!-- Sessions will be rendered here -->
+              </div>
+
+              <div class="flex gap-1">
+                <button onclick="exportGeminiSession()" class="flex-1 bg-[#2d2d2d] hover:bg-[#3d3d3d] border border-border-main rounded px-2 py-1.5 text-xs text-white cursor-pointer transition-colors" title="Runs /chat save in terminal, then exports to DB">
+                  💾 Save & Export
+                </button>
+                <button onclick="importGeminiSessionFromList()" class="flex-1 bg-accent hover:brightness-110 rounded px-2 py-1.5 text-xs text-white cursor-pointer transition-colors">
+                  ↩️ Restore
+                </button>
+              </div>
+            </div>
+
+            <div class="border-t border-border-main"></div>
+
+            <!-- Claude Sessions -->
+            <div class="session-section">
+              <div class="flex items-center justify-between mb-2">
+                <div class="text-[10px] text-[#666] uppercase">Claude Code</div>
+                <span id="claude-session-count" class="text-[9px] text-[#666]">0</span>
+              </div>
+
+              <!-- Saved Claude Sessions List -->
+              <div id="claude-sessions-list" class="mb-2 flex flex-col gap-1">
+                <!-- Sessions will be rendered here -->
+              </div>
+
+              <div class="flex gap-1">
+                <button onclick="exportClaudeSession()" class="flex-1 bg-[#2d2d2d] hover:bg-[#3d3d3d] border border-border-main rounded px-2 py-1.5 text-xs text-white cursor-pointer transition-colors">
+                  💾 Export
+                </button>
+                <button onclick="importClaudeSessionFromList()" class="flex-1 bg-accent hover:brightness-110 rounded px-2 py-1.5 text-xs text-white cursor-pointer transition-colors">
+                  ↩️ Restore
+                </button>
+              </div>
+            </div>
+
+            <div class="border-t border-border-main"></div>
+
+            <!-- Utilities -->
+            <div class="session-section">
+              <div class="text-[10px] text-[#666] uppercase mb-2">Utilities</div>
+              <button onclick="saveVisualSnapshot()" class="w-full bg-[#2d2d2d] hover:bg-[#3d3d3d] border border-border-main rounded px-2 py-1.5 text-xs text-white cursor-pointer transition-colors">
+                📸 Save Terminal Buffer
+              </button>
+            </div>
           </div>
         </div>
       </div>
@@ -202,11 +250,28 @@
     </div>
   </div>
 
-  <!-- Toast Notifications -->
-  <div id="toast-container" class="fixed bottom-5 right-5 z-[1000] flex flex-col gap-2 pointer-events-none">
-    <!-- Toasts will be added here -->
+  <!-- Session Input Modal -->
+  <div id="session-input-modal" class="fixed inset-0 bg-black/50 backdrop-blur-sm z-[100] hidden flex items-center justify-center">
+    <div class="bg-panel border border-border-main rounded-xl w-[400px] max-w-[90vw] shadow-2xl">
+      <div class="p-5 border-b border-border-main flex justify-between items-center">
+        <h3 class="text-lg font-bold" id="session-modal-title">Enter Session Key</h3>
+        <button id="close-session-modal-btn" class="text-[#999] hover:text-white text-2xl leading-none w-8 h-8 flex items-center justify-center rounded hover:bg-white/10">×</button>
+      </div>
+      <div class="p-5 flex flex-col gap-4">
+        <div>
+          <label class="block text-sm text-[#aaa] mb-2" id="session-modal-label">Session Key</label>
+          <input id="session-input-field" type="text" class="w-full bg-[#111] border border-border-main rounded px-3 py-2 text-white outline-none focus:border-accent" placeholder="e.g., my-session-name">
+          <p class="text-xs text-[#666] mt-1" id="session-modal-hint">Enter the session identifier</p>
+        </div>
+      </div>
+      <div class="p-5 border-t border-border-main flex gap-2 justify-end">
+        <button id="cancel-session-btn" class="px-4 py-2 bg-transparent border border-border-main rounded text-[#ccc] hover:bg-white/5">Cancel</button>
+        <button id="confirm-session-btn" class="px-4 py-2 bg-accent rounded text-white hover:brightness-110">Confirm</button>
+      </div>
+    </div>
   </div>
 
-  <script src="renderer.js"></script>
+  <!-- React App (Vite dev server) -->
+  <script type="module" src="/src/renderer/main.tsx"></script>
 </body>
 </html>

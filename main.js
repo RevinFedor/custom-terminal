@@ -1,8 +1,11 @@
 const { app, BrowserWindow, ipcMain, Menu, dialog } = require('electron');
 const path = require('path');
 const pty = require('node-pty');
-const projectManager = require('./project-manager');
-const SessionManager = require('./session-manager');
+
+// Resolve paths relative to project root (not dist/main/)
+const rootDir = path.join(__dirname, '..', '..');
+const projectManager = require(path.join(rootDir, 'project-manager'));
+const SessionManager = require(path.join(rootDir, 'session-manager'));
 
 const isDev = process.env.NODE_ENV === 'development';
 
@@ -32,20 +35,15 @@ function createWindow() {
     }
   }
 
-  mainWindow.loadFile('index.html');
+  // Load from Vite dev server in development, or from file in production
+  const VITE_DEV_SERVER_URL = process.env.VITE_DEV_SERVER_URL || (isDev ? 'http://localhost:5173' : null);
 
-  // Simple Live Reload for Frontend
-  const fs = require('fs');
-  const frontendFiles = ['renderer.js', 'output.css', 'index.html'];
-  
-  frontendFiles.forEach(file => {
-    fs.watch(path.join(__dirname, file), () => {
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        console.log(`[LiveReload] ${file} changed, reloading window...`);
-        mainWindow.webContents.reload();
-      }
-    });
-  });
+  if (VITE_DEV_SERVER_URL) {
+    mainWindow.loadURL(VITE_DEV_SERVER_URL);
+    mainWindow.webContents.openDevTools();
+  } else {
+    mainWindow.loadFile(path.join(rootDir, 'dist/renderer/index.html'));
+  }
 }
 
 // Context Menu IPC
@@ -243,16 +241,25 @@ ipcMain.handle('project:select-directory', async () => {
 
 // Execute quick action command in terminal
 ipcMain.on('terminal:executeCommand', (event, tabId, command) => {
-  console.log('[main] terminal:executeCommand received, tabId:', tabId);
-  console.log('[main] Command:', command);
+  console.log('[main] ===== EXECUTE COMMAND =====');
+  console.log('[main] tabId:', tabId);
+  console.log('[main] command:', JSON.stringify(command));
+  console.log('[main] command length:', command.length);
+
   const term = terminals.get(tabId);
   if (term) {
-    console.log('[main] Writing command to PTY with Enter...');
-    // Send command + Enter
-    term.write(command + '\r');
-    console.log('[main] Command executed!');
+    // Try sending command in parts
+    console.log('[main] Step 1: Writing command text...');
+    term.write(command);
+
+    console.log('[main] Step 2: Sending Enter (\\r)...');
+    term.write('\r');
+
+    console.log('[main] ✅ Command + Enter sent to PTY');
+    console.log('[main] PTY process PID:', term.pid);
   } else {
-    console.error('[main] Terminal not found for tabId:', tabId);
+    console.error('[main] ❌ Terminal not found for tabId:', tabId);
+    console.log('[main] Available terminals:', Array.from(terminals.keys()));
   }
 });
 
@@ -342,6 +349,17 @@ ipcMain.handle('prompts:save', async (event, prompts) => {
 });
 
 // ========== SESSION PERSISTENCE ==========
+
+// List available Gemini checkpoints
+ipcMain.handle('session:list-gemini-checkpoints', async (event, { dirPath }) => {
+  try {
+    const checkpoints = await sessionManager.listAvailableGeminiCheckpoints(dirPath);
+    return { success: true, data: checkpoints };
+  } catch (error) {
+    console.error('[main] Error listing Gemini checkpoints:', error);
+    return { success: false, error: error.message };
+  }
+});
 
 // Export Gemini session
 ipcMain.handle('session:export-gemini', async (event, { dirPath, sessionKey }) => {

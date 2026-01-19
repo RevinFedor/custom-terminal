@@ -1,0 +1,126 @@
+import React, { useState } from 'react';
+import { useUIStore } from '../../store/useUIStore';
+import { useProjectsStore } from '../../store/useProjectsStore';
+import { useWorkspaceStore } from '../../store/useWorkspaceStore';
+
+const { ipcRenderer } = window.require('electron');
+
+interface Project {
+  id: string;
+  path: string;
+  name: string;
+  description?: string;
+}
+
+interface ProjectCardProps {
+  project: Project;
+  onOpen: () => void;
+  activeTabsCount?: number;
+}
+
+export default function ProjectCard({ project, onOpen, activeTabsCount = 0 }: ProjectCardProps) {
+  const [menuOpen, setMenuOpen] = useState(false);
+  const { openEditModal, showToast } = useUIStore();
+  const { loadProjects } = useProjectsStore();
+  const { openProjects, closeProject } = useWorkspaceStore();
+
+  const handleEdit = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    setMenuOpen(false);
+    openEditModal(project);
+  };
+
+  const handleDelete = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    setMenuOpen(false);
+
+    if (!confirm(`Are you sure you want to delete "${project.name}"?`)) return;
+
+    // Close project if open
+    if (openProjects.has(project.id)) {
+      closeProject(project.id);
+    }
+
+    // Delete from backend
+    await ipcRenderer.invoke('project:delete', project.path);
+    showToast('Project deleted', 'success');
+    loadProjects();
+  };
+
+  const handleMenuClick = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    setMenuOpen(!menuOpen);
+  };
+
+  return (
+    <div
+      className="group bg-tab border border-border-main rounded-xl p-6 cursor-pointer transition-all hover:border-accent hover:shadow-lg relative"
+      onClick={onOpen}
+    >
+      {/* Header */}
+      <div className="flex justify-between items-start mb-3">
+        <div className="flex items-center gap-2 flex-1 mr-2 min-w-0">
+          <h3 className="text-lg font-bold text-white truncate group-hover:text-accent transition-colors">
+            {project.name}
+          </h3>
+          {project.description && (
+            <span className="relative group/desc inline-block shrink-0">
+              <span className="text-xs text-[#aaa] cursor-help hover:text-white transition-colors">ℹ️</span>
+              <div className="absolute bottom-full left-0 mb-2 pointer-events-none z-50 opacity-0 group-hover/desc:opacity-100 transition-opacity">
+                <div className="bg-gray-900/95 backdrop-blur-sm border border-gray-700 p-3 rounded-xl shadow-2xl w-64 whitespace-normal">
+                  <p className="text-xs text-gray-300">{project.description}</p>
+                </div>
+              </div>
+            </span>
+          )}
+        </div>
+
+        {/* Menu Button */}
+        <div className="relative shrink-0">
+          <button
+            className="opacity-0 group-hover:opacity-100 text-[#999] hover:text-white text-xl leading-none w-8 h-8 flex items-center justify-center rounded hover:bg-white/10 transition-all"
+            onClick={handleMenuClick}
+          >
+            ⋯
+          </button>
+
+          {/* Dropdown Menu */}
+          {menuOpen && (
+            <>
+              {/* Click outside handler */}
+              <div
+                className="fixed inset-0 z-10"
+                onClick={(e) => { e.stopPropagation(); setMenuOpen(false); }}
+              />
+              <div className="absolute right-0 top-full mt-1 bg-panel border border-border-main rounded-lg shadow-xl min-w-[150px] z-20">
+                <button
+                  className="w-full text-left px-4 py-2 text-sm text-[#ccc] hover:bg-white/5 rounded-t-lg"
+                  onClick={handleEdit}
+                >
+                  ✏️ Edit
+                </button>
+                <button
+                  className="w-full text-left px-4 py-2 text-sm text-[#cc3333] hover:bg-[#cc3333]/10 rounded-b-lg"
+                  onClick={handleDelete}
+                >
+                  🗑️ Delete
+                </button>
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+
+      {/* Path */}
+      <div className="flex items-center gap-2 mb-3">
+        <span className="text-xs font-jetbrains text-[#666] truncate flex-1">{project.path}</span>
+      </div>
+
+      {/* Footer */}
+      <div className="flex items-center justify-between text-xs text-[#888]">
+        <span>{activeTabsCount} active tab{activeTabsCount !== 1 ? 's' : ''}</span>
+        <span className="text-accent">Click to open →</span>
+      </div>
+    </div>
+  );
+}
