@@ -10,7 +10,9 @@
 
 ## Стек (Tech Stack)
 - **Runtime:** Electron 28
-- **Terminal:** Vanilla JS + xterm.js (WebGL)
+- **Frontend:** React 19 + Vite + TypeScript
+- **State Management:** Zustand
+- **Terminal:** xterm.js (WebGL rendering)
 - **Styling:** Tailwind CSS v4 (JIT, @layer components)
 - **Backend:** Node.js + node-pty
 - **Storage:** JSON files (~/Library/Application Support)
@@ -18,20 +20,36 @@
 - **Syntax Highlighting:** Highlight.js (VS2015 theme)
 
 ## Навигация (Project Mapping)
+
+### Backend (Main Process)
 - `main.js` — Главный процесс Electron, управление PTY и IPC.
-- `renderer.js` — Рендерер, UI, терминал, Gemini интеграция.
 - `project-manager.js` — Менеджер проектов, сохранение в JSON.
-- `index.html` — HTML структура (Dashboard, Workspace, Modals).
-- `input.css` — Tailwind входной файл с кастомными стилями (@layer).
-- `output.css` — Скомпилированный Tailwind (генерируется автоматически).
+- `session-manager.js` — Управление сессиями AI (Gemini/Claude).
+- `database.js` — SQLite для сессий и проектов.
+
+### Frontend (Renderer Process - React)
+- `src/renderer/App.tsx` — Корневой компонент, роутинг.
+- `src/renderer/store/` — Zustand stores (useProjectsStore, useWorkspaceStore).
+- `src/renderer/components/Dashboard/` — Dashboard UI (проекты, настройки).
+- `src/renderer/components/Workspace/` — Workspace UI (табы, терминалы).
+- `src/renderer/components/Workspace/Terminal.tsx` — xterm.js wrapper.
+
+### Build & Config
+- `electron.vite.config.js` — Vite config для Electron.
+- `index.html` — HTML entry point.
+- `input.css` — Tailwind входной файл.
+- `output.css` — Скомпилированный Tailwind.
+
+### Docs
 - `docs/` — База знаний (Gold Standard v3.4).
+- `MIGRATION-COMPLETE.md` — Документация по миграции на React.
 
 ## Правила Кодирования
-- **Язык:** Vanilla JS, ES6+, без транспиляции.
-- **Стили:** Tailwind CSS v4, кастомные стили только через `input.css` (@layer base/components/utilities).
-- **Именование:** kebab-case для всех файлов и папок.
-- **CSS:** Tailwind классы в HTML, никаких inline стилей кроме динамических.
-- **Модули:** CommonJS (require/module.exports), не ESM.
+- **Язык:** TypeScript + React 19 (frontend), CommonJS (backend).
+- **Стили:** Tailwind CSS v4, кастомные стили через `input.css` (@layer).
+- **Именование:** PascalCase для компонентов, camelCase для функций/переменных.
+- **State:** Zustand stores (`useProjectsStore`, `useWorkspaceStore`).
+- **Модули:** ESM в React, CommonJS в main process.
 
 ## Структура Данных
 - **Проекты:** `~/Library/Application Support/custom-terminal/projects.json`
