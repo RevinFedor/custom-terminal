@@ -1,9 +1,14 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { Terminal as XTerminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebglAddon } from '@xterm/addon-webgl';
 import { WebLinksAddon } from '@xterm/addon-web-links';
 import { SerializeAddon } from '@xterm/addon-serialize';
+import { useUIStore } from '../../store/useUIStore';
+import { terminalRegistry } from '../../utils/terminalRegistry';
+
+// Get setTerminalSelection outside of component to avoid re-renders
+const getSetTerminalSelection = () => useUIStore.getState().setTerminalSelection;
 
 const { ipcRenderer } = window.require('electron');
 
@@ -25,6 +30,10 @@ export default function Terminal({ tabId, cwd, active }: TerminalProps) {
   const webglAddonRef = useRef<WebglAddon | null>(null);
   const isInitialized = useRef(false);
   const isMounted = useRef(true);
+  const isReadyRef = useRef(false); // Track if first fit completed
+  const [isVisible, setIsVisible] = useState(false); // Hide until ready
+
+  const terminalFontSize = useUIStore((state) => state.terminalFontSize);
 
   // Write buffer refs to batch PTY output and prevent jitter
   const writeBufferRef = useRef<string>('');
@@ -131,6 +140,9 @@ export default function Terminal({ tabId, cwd, active }: TerminalProps) {
 
       if (!isMounted.current || !containerRef) return;
 
+      // Get current fontSize from store
+      const currentFontSize = useUIStore.getState().terminalFontSize;
+
       const term = new XTerminal({
         theme: {
           background: '#1a1a1a',
@@ -156,7 +168,7 @@ export default function Terminal({ tabId, cwd, active }: TerminalProps) {
           brightWhite: '#e5e5e5'
         },
         fontFamily: "'JetBrains Mono', 'JetBrainsMono NF', Menlo, Monaco, monospace",
-        fontSize: 13,
+        fontSize: currentFontSize,
         cursorBlink: true,
         cursorStyle: 'block',
         allowTransparency: false,
@@ -184,9 +196,14 @@ export default function Terminal({ tabId, cwd, active }: TerminalProps) {
 
       xtermInstance.current = term;
 
-      // Fit after opening
+      // Register terminal in global registry for selection access
+      terminalRegistry.register(tabId, term);
+
+      // Fit after opening, then reveal terminal
       setTimeout(() => {
         safeFit();
+        isReadyRef.current = true;
+        setIsVisible(true); // Reveal after first fit to prevent jitter
         if (active) {
           term.focus();
         }
@@ -195,6 +212,14 @@ export default function Terminal({ tabId, cwd, active }: TerminalProps) {
       // IPC: Send input to PTY
       term.onData((data) => {
         ipcRenderer.send('terminal:input', tabId, data);
+      });
+
+      // Track selection changes and update global state
+      term.onSelectionChange(() => {
+        if (active) {
+          const selection = term.getSelection() || '';
+          getSetTerminalSelection()(selection);
+        }
       });
     };
 
@@ -206,6 +231,9 @@ export default function Terminal({ tabId, cwd, active }: TerminalProps) {
       resizeObserver.disconnect();
       ipcRenderer.removeListener('terminal:data', handleData);
       ipcRenderer.removeListener('terminal:exit', handleExit);
+
+      // Unregister from global registry
+      terminalRegistry.unregister(tabId);
 
       // Clear write buffer timeout
       if (pendingWriteRef.current) {
@@ -237,7 +265,13 @@ export default function Terminal({ tabId, cwd, active }: TerminalProps) {
 
   // Focus and fit when becoming active (with rAF to let browser paint first)
   useEffect(() => {
-    if (!active || !xtermInstance.current) {
+    if (!active) {
+      // Clear global selection when terminal becomes inactive
+      getSetTerminalSelection()('');
+      return;
+    }
+
+    if (!xtermInstance.current) {
       return;
     }
 
@@ -245,10 +279,27 @@ export default function Terminal({ tabId, cwd, active }: TerminalProps) {
     const frameId = requestAnimationFrame(() => {
       safeFit();
       xtermInstance.current?.focus();
+      // Update selection state when becoming active
+      const selection = xtermInstance.current?.getSelection() || '';
+      getSetTerminalSelection()(selection);
     });
 
     return () => cancelAnimationFrame(frameId);
   }, [active]);
+
+  // React to font size changes
+  useEffect(() => {
+    const term = xtermInstance.current;
+    if (!term) return;
+
+    // Update font size
+    term.options.fontSize = terminalFontSize;
+
+    // Refit terminal after font size change
+    requestAnimationFrame(() => {
+      safeFit();
+    });
+  }, [terminalFontSize]);
 
   // Handle click to focus
   const handleClick = () => {
@@ -261,6 +312,13 @@ export default function Terminal({ tabId, cwd, active }: TerminalProps) {
   const handleContextMenu = async (e: React.MouseEvent) => {
     e.preventDefault();
     const hasSelection = xtermInstance.current?.hasSelection() || false;
+    const selection = xtermInstance.current?.getSelection() || '';
+
+    // Update global selection state immediately
+    if (selection) {
+      getSetTerminalSelection()(selection);
+      console.log('[Terminal] Context menu - selection:', selection.slice(0, 50));
+    }
 
     // Get prompts for context menu
     const promptsResult = await ipcRenderer.invoke('prompts:get');
@@ -271,6 +329,7 @@ export default function Terminal({ tabId, cwd, active }: TerminalProps) {
 
   // CSS: visibility:hidden preserves geometry, prevents WebGL context loss
   // (unlike display:none which collapses to 0x0 and kills WebGL textures)
+  // opacity:0 initially to prevent jitter during first fit
   return (
     <div
       ref={terminalRef}
@@ -279,6 +338,8 @@ export default function Terminal({ tabId, cwd, active }: TerminalProps) {
         width: '100%',
         height: '100%',
         visibility: active ? 'visible' : 'hidden',
+        opacity: isVisible ? 1 : 0,
+        transition: 'opacity 0.05s ease-in',
         zIndex: active ? 1 : -1
       }}
       onClick={handleClick}

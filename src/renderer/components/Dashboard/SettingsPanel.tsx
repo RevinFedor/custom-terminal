@@ -3,6 +3,8 @@ import { useUIStore } from '../../store/useUIStore';
 
 const { ipcRenderer } = window.require('electron');
 
+const DEFAULT_RESEARCH_PROMPT = 'вот моя проблема нужно чтобы ты понял что за проблема и на reddit поискал обсуждения. Не ограничивайся категориями. Проблема: ';
+
 interface Command {
   name: string;
   command: string;
@@ -14,14 +16,28 @@ interface Prompt {
 }
 
 export default function PromptsPanel() {
-  const { showToast } = useUIStore();
+  const {
+    showToast,
+    researchPrompt,
+    setResearchPrompt,
+    docPrompt,
+    setDocPromptUseFile,
+    setDocPromptFilePath,
+    setDocPromptInlineContent
+  } = useUIStore();
 
   const [commands, setCommands] = useState<Command[]>([]);
   const [prompts, setPrompts] = useState<Prompt[]>([]);
   const [editingCommand, setEditingCommand] = useState<number | null>(null);
   const [editingPrompt, setEditingPrompt] = useState<number | null>(null);
+  const [editingResearch, setEditingResearch] = useState(false);
+  const [localResearchPrompt, setLocalResearchPrompt] = useState(researchPrompt);
+  const [editingDocPrompt, setEditingDocPrompt] = useState(false);
+  const [localDocFilePath, setLocalDocFilePath] = useState(docPrompt.filePath);
+  const [localDocInlineContent, setLocalDocInlineContent] = useState(docPrompt.inlineContent);
   const commandsSaveTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const promptsSaveTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const researchSaveTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   useEffect(() => {
     loadCommands();
@@ -98,6 +114,52 @@ export default function PromptsPanel() {
     await ipcRenderer.invoke('prompts:save', newPrompts);
     showToast('Deleted', 'success');
     setEditingPrompt(null);
+  };
+
+  const updateResearchPrompt = (value: string) => {
+    setLocalResearchPrompt(value);
+    if (researchSaveTimeoutRef.current) clearTimeout(researchSaveTimeoutRef.current);
+    researchSaveTimeoutRef.current = setTimeout(() => {
+      setResearchPrompt(value);
+      showToast('Saved', 'success');
+    }, 800);
+  };
+
+  const resetResearchPrompt = () => {
+    setLocalResearchPrompt(DEFAULT_RESEARCH_PROMPT);
+    setResearchPrompt(DEFAULT_RESEARCH_PROMPT);
+    showToast('Reset to default', 'success');
+  };
+
+  const docPromptSaveTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+
+  const updateDocFilePath = (value: string) => {
+    setLocalDocFilePath(value);
+    if (docPromptSaveTimeoutRef.current) clearTimeout(docPromptSaveTimeoutRef.current);
+    docPromptSaveTimeoutRef.current = setTimeout(() => {
+      setDocPromptFilePath(value);
+      showToast('Saved', 'success');
+    }, 800);
+  };
+
+  const updateDocInlineContent = (value: string) => {
+    setLocalDocInlineContent(value);
+    if (docPromptSaveTimeoutRef.current) clearTimeout(docPromptSaveTimeoutRef.current);
+    docPromptSaveTimeoutRef.current = setTimeout(() => {
+      setDocPromptInlineContent(value);
+      showToast('Saved', 'success');
+    }, 800);
+  };
+
+  const DEFAULT_DOC_FILE_PATH = '/Users/fedor/Global-Templates/🧩 Code-Patterns/документация/docs-rules.prompt.md';
+
+  const resetDocPrompt = () => {
+    setLocalDocFilePath(DEFAULT_DOC_FILE_PATH);
+    setDocPromptFilePath(DEFAULT_DOC_FILE_PATH);
+    setLocalDocInlineContent('');
+    setDocPromptInlineContent('');
+    setDocPromptUseFile(true);
+    showToast('Reset to default', 'success');
   };
 
   return (
@@ -267,6 +329,125 @@ export default function PromptsPanel() {
             >
               + Add
             </button>
+          </div>
+
+          {/* System: Research Prompt */}
+          <div style={{ marginBottom: '24px' }}>
+            <div style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: '8px',
+              marginBottom: '12px',
+              paddingBottom: '8px',
+              borderBottom: '1px solid #333'
+            }}>
+              <span style={{
+                fontSize: '10px',
+                fontWeight: '600',
+                color: '#0ea5e9',
+                textTransform: 'uppercase',
+                letterSpacing: '0.5px'
+              }}>
+                System
+              </span>
+              <span style={{ fontSize: '10px', color: '#555' }}>Research Selection</span>
+            </div>
+
+            <div
+              onClick={() => !editingResearch && setEditingResearch(true)}
+              style={{
+                padding: '16px',
+                backgroundColor: editingResearch ? '#252525' : '#222',
+                border: editingResearch ? '2px solid #0ea5e9' : '2px solid #0ea5e933',
+                borderRadius: '12px',
+                cursor: editingResearch ? 'default' : 'pointer',
+                transition: 'all 0.15s ease'
+              }}
+            >
+              {editingResearch ? (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                  <textarea
+                    value={localResearchPrompt}
+                    onChange={(e) => updateResearchPrompt(e.target.value)}
+                    placeholder="Research prompt (prepended to selected text)..."
+                    rows={4}
+                    autoFocus
+                    style={{
+                      width: '100%',
+                      padding: '10px 12px',
+                      backgroundColor: '#1a1a1a',
+                      border: '1px solid #444',
+                      borderRadius: '8px',
+                      color: '#aaa',
+                      fontSize: '12px',
+                      fontFamily: 'monospace',
+                      outline: 'none',
+                      resize: 'none',
+                      boxSizing: 'border-box'
+                    }}
+                  />
+                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                    <button
+                      onClick={(e) => { e.stopPropagation(); resetResearchPrompt(); }}
+                      style={{
+                        padding: '6px 12px',
+                        backgroundColor: 'transparent',
+                        color: '#888',
+                        border: 'none',
+                        fontSize: '12px',
+                        cursor: 'pointer'
+                      }}
+                    >
+                      Reset to Default
+                    </button>
+                    <button
+                      onClick={(e) => { e.stopPropagation(); setEditingResearch(false); }}
+                      style={{
+                        padding: '6px 16px',
+                        backgroundColor: '#0ea5e9',
+                        color: '#fff',
+                        border: 'none',
+                        borderRadius: '6px',
+                        fontSize: '12px',
+                        cursor: 'pointer'
+                      }}
+                    >
+                      Done
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <>
+                  <div style={{ fontSize: '14px', color: '#0ea5e9', fontWeight: '500', marginBottom: '4px' }}>
+                    Research Prompt
+                  </div>
+                  <div style={{ fontSize: '12px', color: '#666', overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' }}>
+                    {localResearchPrompt}
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+
+          {/* User Prompts */}
+          <div style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: '8px',
+            marginBottom: '12px',
+            paddingBottom: '8px',
+            borderBottom: '1px solid #333'
+          }}>
+            <span style={{
+              fontSize: '10px',
+              fontWeight: '600',
+              color: '#8b5cf6',
+              textTransform: 'uppercase',
+              letterSpacing: '0.5px'
+            }}>
+              User
+            </span>
+            <span style={{ fontSize: '10px', color: '#555' }}>Context Menu Prompts</span>
           </div>
 
           <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>

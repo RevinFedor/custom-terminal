@@ -8,6 +8,7 @@ import NotesPanel from './NotesPanel';
 import FileExplorer from './FileExplorer';
 import FilePreview from './FilePreview';
 import Resizer from './Resizer';
+import ResearchSheet from '../Research/ResearchSheet';
 
 export default function Workspace() {
   const { activeProjectId, getActiveProject } = useWorkspaceStore();
@@ -42,6 +43,9 @@ export default function Workspace() {
 
           {/* File Preview Overlay */}
           {filePreview && <FilePreview />}
+
+          {/* Research Sheet */}
+          <ResearchSheet projectId={activeProjectId} />
         </div>
 
         {/* Resizer */}
