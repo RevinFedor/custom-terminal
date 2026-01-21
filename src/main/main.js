@@ -944,8 +944,15 @@ ipcMain.on('claude:spawn-with-watcher', (event, { tabId, cwd }) => {
       // Already found a session - ignore all further events
       if (sessionFound) return;
 
-      // Only care about .jsonl files (UUID format)
+      // Only care about UUID format .jsonl files (ignore agent-* files)
       if (!filename || !filename.endsWith('.jsonl')) return;
+
+      // UUID format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx.jsonl
+      const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.jsonl$/i;
+      if (!uuidPattern.test(filename)) {
+        console.log('[Sniper] Ignoring non-UUID file:', filename);
+        return;
+      }
 
       const filePath = path.join(projectDir, filename);
 
@@ -989,6 +996,48 @@ ipcMain.on('claude:spawn-with-watcher', (event, { tabId, cwd }) => {
 });
 
 // Fork Claude session: copy .jsonl file with new UUID, signal renderer to create new tab (legacy)
+// Fork Claude session file: copy .jsonl with new UUID
+ipcMain.handle('claude:fork-session-file', async (event, { sourceSessionId, cwd }) => {
+  console.log('[Claude Fork] Copying session:', sourceSessionId);
+
+  try {
+    const projectSlug = cwd.replace(/\//g, '-');
+    const projectDir = path.join(os.homedir(), '.claude', 'projects', projectSlug);
+
+    // Generate new UUID
+    const newSessionId = crypto.randomUUID();
+    console.log('[Claude Fork] New session ID:', newSessionId);
+
+    const sourcePath = path.join(projectDir, `${sourceSessionId}.jsonl`);
+    const destPath = path.join(projectDir, `${newSessionId}.jsonl`);
+
+    if (!fs.existsSync(sourcePath)) {
+      console.error('[Claude Fork] Source file not found:', sourcePath);
+      return { success: false, error: 'Session file not found: ' + sourceSessionId };
+    }
+
+    // Check source file is not empty
+    const stats = fs.statSync(sourcePath);
+    if (stats.size === 0) {
+      console.error('[Claude Fork] Source file is empty:', sourcePath);
+      return { success: false, error: 'Source session is empty' };
+    }
+
+    // Copy the file
+    fs.copyFileSync(sourcePath, destPath);
+    console.log('[Claude Fork] Copied:', sourcePath, '->', destPath);
+
+    // Wait for Claude to index the new file
+    await new Promise(resolve => setTimeout(resolve, 500));
+
+    return { success: true, newSessionId };
+  } catch (error) {
+    console.error('[Claude Fork] Error:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// Legacy fork handler (for new tab creation)
 ipcMain.on('claude:fork-session', async (event, { tabId, existingSessionId, cwd }) => {
   console.log('[Claude Fork] Starting fork for tab:', tabId);
   console.log('[Claude Fork] Existing session:', existingSessionId);

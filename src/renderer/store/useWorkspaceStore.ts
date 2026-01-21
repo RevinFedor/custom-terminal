@@ -245,6 +245,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       // Restore saved tabs or create default one
       if (savedTabs.length > 0) {
         for (const savedTab of savedTabs) {
+          console.log('[Store] Restoring tab with claudeSessionId:', savedTab.claudeSessionId);
           await createTab(projectId, savedTab.name, savedTab.cwd, {
             color: savedTab.color,
             isUtility: savedTab.isUtility,
@@ -592,9 +593,11 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     for (const [projectId, workspace] of openProjects) {
       const tab = workspace.tabs.get(tabId);
       if (tab) {
+        console.log('[Store] getClaudeSessionId for tab', tabId, ':', tab.claudeSessionId);
         return tab.claudeSessionId || null;
       }
     }
+    console.log('[Store] getClaudeSessionId: tab not found', tabId);
     return null;
   },
 
