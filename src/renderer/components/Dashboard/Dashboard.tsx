@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import ProjectCard from './ProjectCard';
@@ -6,14 +6,46 @@ import PromptsPanel from './SettingsPanel';
 
 const { ipcRenderer } = window.require('electron');
 
+// Polling interval for process status
+const PROCESS_STATUS_POLL_INTERVAL = 2000;
+
 export default function Dashboard() {
   const [activeTab, setActiveTab] = useState<'projects' | 'prompts'>('projects');
+  const [processStatus, setProcessStatus] = useState<Map<string, boolean>>(new Map());
   const { projects, loadProjects } = useProjectsStore();
   const { openProject, openProjects } = useWorkspaceStore();
 
   useEffect(() => {
     loadProjects();
   }, []);
+
+  // Poll for running processes in all open project tabs
+  const checkProcessStatus = useCallback(async () => {
+    const newStatus = new Map<string, boolean>();
+
+    for (const [, workspace] of openProjects) {
+      const tabIds = Array.from(workspace.tabs.keys());
+      await Promise.all(
+        tabIds.map(async (tabId) => {
+          try {
+            const result = await ipcRenderer.invoke('terminal:hasRunningProcess', tabId);
+            newStatus.set(tabId, result.hasProcess);
+          } catch {
+            newStatus.set(tabId, false);
+          }
+        })
+      );
+    }
+
+    setProcessStatus(newStatus);
+  }, [openProjects]);
+
+  // Polling effect
+  useEffect(() => {
+    checkProcessStatus();
+    const interval = setInterval(checkProcessStatus, PROCESS_STATUS_POLL_INTERVAL);
+    return () => clearInterval(interval);
+  }, [checkProcessStatus]);
 
   const handleOpenProject = async () => {
     const result = await ipcRenderer.invoke('project:select-directory');
@@ -41,10 +73,21 @@ export default function Dashboard() {
     return true;
   });
 
-  // Get active tabs count for each project
-  const getActiveTabsCount = (projectId: string) => {
+  // Get tabs stats for each project: total tabs and active processes
+  const getTabsStats = (projectId: string) => {
     const projectData = openProjects.get(projectId);
-    return projectData ? projectData.tabs.size : 0;
+    if (!projectData) return { total: 0, active: 0 };
+
+    const total = projectData.tabs.size;
+    let active = 0;
+
+    for (const tabId of projectData.tabs.keys()) {
+      if (processStatus.get(tabId)) {
+        active++;
+      }
+    }
+
+    return { total, active };
   };
 
   return (
@@ -99,7 +142,7 @@ export default function Dashboard() {
                     key={project.id}
                     project={project}
                     onOpen={() => handleOpenProjectWorkspace(project.id)}
-                    activeTabsCount={getActiveTabsCount(project.id)}
+                    tabsStats={getTabsStats(project.id)}
                   />
                 ))}
 

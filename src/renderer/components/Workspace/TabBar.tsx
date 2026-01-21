@@ -711,6 +711,9 @@ export default function TabBar({ projectId }: TabBarProps) {
   // Check if active tab is in utility zone
   const activeTabInUtils = utilityTabs.some(t => t.id === workspace.activeTabId);
 
+  // Check if any utility tab has a running process
+  const hasProcessInUtils = utilityTabs.some(t => processStatus.get(t.id));
+
   return (
     <>
       {/* Single row TabBar like VSCode */}
@@ -763,6 +766,18 @@ export default function TabBar({ projectId }: TabBarProps) {
                 size={16}
                 className={`transition-transform duration-200 ${utilityExpanded ? 'rotate-180' : ''}`}
               />
+              {hasProcessInUtils && (
+                <span
+                  style={{
+                    width: '5px',
+                    height: '5px',
+                    borderRadius: '50%',
+                    backgroundColor: '#fff',
+                    opacity: 0.6,
+                    flexShrink: 0,
+                  }}
+                />
+              )}
               <span>Utils</span>
               {utilityTabs.length > 0 && (
                 <span className="bg-[#444] px-1.5 rounded text-[10px]">{utilityTabs.length}</span>

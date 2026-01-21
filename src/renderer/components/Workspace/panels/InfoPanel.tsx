@@ -1,5 +1,11 @@
 import React, { useState, useEffect } from 'react';
 import { useWorkspaceStore } from '../../../store/useWorkspaceStore';
+import { useUIStore } from '../../../store/useUIStore';
+
+const { ipcRenderer } = window.require('electron');
+
+// UUID v4 regex pattern
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 interface InfoPanelProps {
   activeTabId: string | null;
@@ -7,6 +13,7 @@ interface InfoPanelProps {
 
 export default function InfoPanel({ activeTabId }: InfoPanelProps) {
   const [sessionId, setSessionId] = useState<string | null>(null);
+  const { showToast } = useUIStore();
 
   // Poll for session ID changes (every 500ms)
   // This avoids store subscription that causes terminal re-render issues
@@ -70,7 +77,22 @@ export default function InfoPanel({ activeTabId }: InfoPanelProps) {
           <div className="bg-[#2d2d2d] rounded p-2">
             <div className="flex items-center justify-between">
               <code className="text-accent text-xs">claude</code>
-              <span className="text-green-400 text-[10px]">всегда</span>
+              <div className="flex items-center gap-2">
+                <button
+                  className="text-[10px] px-1.5 py-0.5 rounded transition-colors text-[#888] hover:text-white bg-[#333] hover:bg-[#444] cursor-pointer"
+                  onClick={() => {
+                    if (activeTabId) {
+                      ipcRenderer.send('claude:run-command', { tabId: activeTabId, command: 'claude' });
+                    } else {
+                      showToast('Нет активного таба', 'error');
+                    }
+                  }}
+                  title="Start new Claude session"
+                >
+                  ⑂
+                </button>
+                <span className="text-green-400 text-[10px]">всегда</span>
+              </div>
             </div>
             <p className="text-[10px] text-[#888] mt-1">Новая сессия</p>
           </div>
@@ -79,9 +101,27 @@ export default function InfoPanel({ activeTabId }: InfoPanelProps) {
           <div className={`rounded p-2 ${hasSession ? 'bg-[#2d2d2d]' : 'bg-[#252525] opacity-60'}`}>
             <div className="flex items-center justify-between">
               <code className={`text-xs ${hasSession ? 'text-accent' : 'text-[#666]'}`}>claude-c</code>
-              <span className={`text-[10px] ${hasSession ? 'text-green-400' : 'text-red-400'}`}>
-                {hasSession ? 'готово' : 'нет сессии'}
-              </span>
+              <div className="flex items-center gap-2">
+                <button
+                  className={`text-[10px] px-1.5 py-0.5 rounded transition-colors ${
+                    hasSession
+                      ? 'text-[#888] hover:text-white bg-[#333] hover:bg-[#444] cursor-pointer'
+                      : 'text-[#555] bg-[#2a2a2a] cursor-not-allowed'
+                  }`}
+                  disabled={!hasSession}
+                  onClick={() => {
+                    if (hasSession && activeTabId) {
+                      ipcRenderer.send('claude:run-command', { tabId: activeTabId, command: 'claude-c', sessionId });
+                    }
+                  }}
+                  title={hasSession ? 'Continue session' : 'No session'}
+                >
+                  ⑂
+                </button>
+                <span className={`text-[10px] ${hasSession ? 'text-green-400' : 'text-red-400'}`}>
+                  {hasSession ? 'готово' : 'нет сессии'}
+                </span>
+              </div>
             </div>
             <p className="text-[10px] text-[#888] mt-1">Продолжить активную сессию</p>
           </div>
@@ -90,7 +130,32 @@ export default function InfoPanel({ activeTabId }: InfoPanelProps) {
           <div className="bg-[#2d2d2d] rounded p-2">
             <div className="flex items-center justify-between">
               <code className="text-accent text-xs">claude-f &lt;ID&gt;</code>
-              <span className="text-green-400 text-[10px]">всегда</span>
+              <div className="flex items-center gap-2">
+                <button
+                  className="text-[10px] px-1.5 py-0.5 rounded transition-colors text-[#888] hover:text-white bg-[#333] hover:bg-[#444] cursor-pointer"
+                  onClick={async () => {
+                    if (!activeTabId) {
+                      showToast('Нет активного таба', 'error');
+                      return;
+                    }
+                    try {
+                      const clipboardText = await navigator.clipboard.readText();
+                      const trimmed = clipboardText.trim();
+                      if (UUID_REGEX.test(trimmed)) {
+                        ipcRenderer.send('claude:run-command', { tabId: activeTabId, command: 'claude-f', forkSessionId: trimmed });
+                      } else {
+                        showToast('В буфере нет UUID. Скопируйте ID сессии.', 'warning');
+                      }
+                    } catch (err) {
+                      showToast('Не удалось прочитать буфер обмена', 'error');
+                    }
+                  }}
+                  title="Fork session from clipboard UUID"
+                >
+                  ⑂
+                </button>
+                <span className="text-green-400 text-[10px]">всегда</span>
+              </div>
             </div>
             <p className="text-[10px] text-[#888] mt-1">Форк сессии по UUID</p>
           </div>

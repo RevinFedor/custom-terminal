@@ -14,10 +14,12 @@
     - `docs:save-selection`: Сохранение выделения терминала в файл (✂️).
     - `docs:save-prompt-temp`: Сохранение временного файла для Gemini.
     - `docs:cleanup-temp`: Удаление временных артефактов.
+    - `claude:spawn-with-watcher`: Запуск Claude с активацией Sniper Watcher.
+    - `claude:fork-session-file`: Копирование файла сессии для форка.
 
 ## 2. Data Layer
 - **SQLite (`noted-terminal.db`):** Хранит сессии AI (`ai_sessions`) и историю развертываний.
-- **JSON (`projects.json`):** Хранит метаданные проектов, заметки, табы (теперь с `color`), промпты и команды. Путь: `~/Library/Application Support/noted-terminal/`.
+- **JSON (`projects.json`):** Хранит метаданные проектов, заметки, табы (теперь с `color` и `claudeSessionId`), промпты и команды. Путь: `~/Library/Application Support/noted-terminal/`.
 - **Persistence Strategy:** Для минимизации нагрузки на диск и IPC используется **Debounce (300-500ms)** при сохранении табов и сессий. См. `knowledge/fix-data-persistence.md`.
 - **Visual State (In-Memory):**
     - `terminalBuffers`: (Zustand) Хранит сериализованные строки `xterm.js` при переключении между Workspace и Dashboard. Очищается после восстановления.
@@ -32,6 +34,7 @@
 
 ## 3. Terminal Integration
 - **Backend:** `node-pty` для создания псевдотерминалов.
+    - **Environment:** Принудительно устанавливается `COLORTERM: 'truecolor'` для поддержки 24-битной палитры в Ink-based CLI (Claude, Gemini).
 - **Frontend:** `xterm.js` с использованием **Canvas рендерера**. WebGL отключен для предотвращения лагов "прогрева" GPU и обхода лимитов контекстов (max 16). См. `knowledge/fix-ui-stability.md`.
 - **Terminal Registry:** Глобальный маппинг `tabId -> xterm instance` для доступа к данным терминала (выделение, ввод) из любой части приложения. См. `knowledge/fact-terminal-registry.md`.
 - **Lazy Hydration:** Инстанс `xterm.js` и его аддоны создаются только при первом физическом показе таба (активация таба или проекта). До этого данные от PTY буферизируются. Это обеспечивает мгновенный старт приложения (Cold Start) даже с десятками табов.

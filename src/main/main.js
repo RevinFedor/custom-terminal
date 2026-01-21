@@ -119,7 +119,10 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd }) => {
       cols: cols || 80,
       rows: rows || 24,
       cwd: workingDir,
-      env: process.env
+      env: {
+        ...process.env,
+        COLORTERM: 'truecolor'  // Enable 24-bit colors for Ink-based CLIs (gemini, claude)
+      }
     });
     console.timeEnd(`[PERF:main] pty.spawn ${tabId}`);
 
@@ -991,7 +994,7 @@ ipcMain.on('claude:spawn-with-watcher', (event, { tabId, cwd }) => {
   // Let the command through - don't intercept, just watch
   const term = terminals.get(tabId);
   if (term) {
-    term.write('claude\r');
+    term.write('claude --dangerously-skip-permissions\r');
   }
 });
 
@@ -1079,5 +1082,125 @@ ipcMain.on('claude:fork-session', async (event, { tabId, existingSessionId, cwd 
       success: false,
       error: error.message
     });
+  }
+});
+
+// ========== CLAUDE COMMAND RUNNER (from UI buttons) ==========
+// This handles claude commands triggered from InfoPanel buttons
+// bypassing the terminal input interception (which only works for keyboard Enter)
+ipcMain.on('claude:run-command', (event, { tabId, command, sessionId, forkSessionId }) => {
+  console.log('[Claude Runner] Command:', command, 'Tab:', tabId);
+
+  const term = terminals.get(tabId);
+  if (!term) {
+    console.error('[Claude Runner] Terminal not found for tab:', tabId);
+    return;
+  }
+
+  // Get cwd for this terminal
+  const cwd = terminalProjects.get(tabId);
+  if (!cwd) {
+    console.error('[Claude Runner] CWD not found for tab:', tabId);
+    return;
+  }
+
+  switch (command) {
+    case 'claude':
+      // New session - start watcher and run claude
+      console.log('[Claude Runner] Starting new session with watcher');
+
+      const projectSlug = cwd.replace(/\//g, '-');
+      const projectDir = path.join(os.homedir(), '.claude', 'projects', projectSlug);
+      const startTime = Date.now();
+      let watcher = null;
+      let sessionFound = false;
+
+      const closeWatcher = () => {
+        if (watcher) {
+          try { watcher.close(); } catch (e) {}
+          watcher = null;
+        }
+      };
+
+      try {
+        if (!fs.existsSync(projectDir)) {
+          fs.mkdirSync(projectDir, { recursive: true });
+        }
+
+        watcher = fs.watch(projectDir, (eventType, filename) => {
+          if (sessionFound) return;
+          if (!filename || !filename.endsWith('.jsonl')) return;
+
+          const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.jsonl$/i;
+          if (!uuidPattern.test(filename)) return;
+
+          const filePath = path.join(projectDir, filename);
+          fs.stat(filePath, (err, stats) => {
+            if (err || sessionFound) return;
+            const fileTime = stats.birthtimeMs || stats.mtimeMs;
+            if (fileTime >= startTime - 500) {
+              sessionFound = true;
+              const detectedSessionId = filename.replace('.jsonl', '');
+              console.log('[Claude Runner] ✅ Session detected:', detectedSessionId);
+              event.sender.send('claude:session-detected', { tabId, sessionId: detectedSessionId });
+              closeWatcher();
+            }
+          });
+        });
+
+        setTimeout(() => closeWatcher(), 5000);
+      } catch (e) {
+        console.error('[Claude Runner] Watcher error:', e.message);
+      }
+
+      term.write('claude --dangerously-skip-permissions\r');
+      break;
+
+    case 'claude-c':
+      // Continue session
+      if (sessionId) {
+        console.log('[Claude Runner] Continuing session:', sessionId);
+        term.write(`claude --dangerously-skip-permissions --resume ${sessionId}\r`);
+      } else {
+        console.error('[Claude Runner] No sessionId for claude-c');
+      }
+      break;
+
+    case 'claude-f':
+      // Fork session - copy file and signal renderer
+      if (forkSessionId) {
+        console.log('[Claude Runner] Forking session:', forkSessionId);
+
+        const forkProjectSlug = cwd.replace(/\//g, '-');
+        const forkProjectDir = path.join(os.homedir(), '.claude', 'projects', forkProjectSlug);
+        const newSessionId = crypto.randomUUID();
+
+        const sourcePath = path.join(forkProjectDir, `${forkSessionId}.jsonl`);
+        const destPath = path.join(forkProjectDir, `${newSessionId}.jsonl`);
+
+        if (fs.existsSync(sourcePath)) {
+          fs.copyFileSync(sourcePath, destPath);
+          console.log('[Claude Runner] Copied session file, new ID:', newSessionId);
+
+          // Signal renderer to create new tab
+          event.sender.send('claude:fork-complete', {
+            success: true,
+            newSessionId,
+            cwd
+          });
+        } else {
+          console.error('[Claude Runner] Source session not found:', sourcePath);
+          event.sender.send('claude:fork-complete', {
+            success: false,
+            error: 'Session file not found: ' + forkSessionId
+          });
+        }
+      } else {
+        console.error('[Claude Runner] No forkSessionId for claude-f');
+      }
+      break;
+
+    default:
+      console.error('[Claude Runner] Unknown command:', command);
   }
 });

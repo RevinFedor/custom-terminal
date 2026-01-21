@@ -6,6 +6,7 @@
 - **AI Промпты и Команды:** `features/prompts.md` — Быстрые команды терминала и шаблоны для AI.
 - **Глобальные Настройки:** `features/settings.md` — Шрифты, цвета и системные настройки.
 - **AI Сессии:** `features/ai-sessions.md` — Автоматизация, восстановление сессий, прямое внедрение чекпоинтов.
+- **Claude Сессии:** `features/claude-sessions.md` — Управление сессиями Claude CLI, перехват команд, форки.
 - **Update Docs:** `features/docs-update.md` — Синхронизация Claude и Gemini для документации.
 - **Workspace:** `features/workspace.md` — Проводник, превью файлов, Gemini Search, Empty States.
 

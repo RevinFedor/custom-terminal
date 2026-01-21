@@ -369,6 +369,15 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
         // --- CASE 1: claude (new session) - must end with exactly "claude" ---
         if (fullLine.endsWith(' claude') || fullLine === 'claude') {
           event.preventDefault();
+
+          // Check if session already exists - prevent accidental overwrite
+          const existingId = getClaudeSessionId(tabId);
+          if (existingId) {
+            console.log('[Claude Intercept] Session exists, blocking new:', existingId);
+            ipcRenderer.send('terminal:input', tabId, '\x15echo "❌ Уже есть сессия: ' + existingId + '. Используйте claude-c или claude-f <ID>"\r');
+            return false;
+          }
+
           // Clear line, start watcher, then launch claude
           ipcRenderer.send('terminal:input', tabId, '\x15');
           console.log('[Claude Intercept] Spawning with Sniper Watcher');
@@ -378,16 +387,17 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
         }
 
         // --- CASE 2: claude-c (continue session) ---
-                                      if (fullLine.endsWith(' claude-c') || fullLine === 'claude-c') {
-                                        const existingSessionId = getClaudeSessionId(tabId);
-                                        console.log('[Claude-c] tabId:', tabId);
-                                        console.log('[Claude-c] existingSessionId from store:', existingSessionId);
-                                        if (existingSessionId) {
-                                          event.preventDefault();
-                                          console.log('[Claude-c] Sending command: claude --resume', existingSessionId);
-                                          ipcRenderer.send('terminal:input', tabId, '\x15claude --resume ' + existingSessionId + '\r');
-                                          return false;
-                                        } else {            event.preventDefault();
+        if (fullLine.endsWith(' claude-c') || fullLine === 'claude-c') {
+          const existingSessionId = getClaudeSessionId(tabId);
+          console.log('[Claude-c] tabId:', tabId);
+          console.log('[Claude-c] existingSessionId from store:', existingSessionId);
+          if (existingSessionId) {
+            event.preventDefault();
+            console.log('[Claude-c] Sending command: claude --resume', existingSessionId);
+            ipcRenderer.send('terminal:input', tabId, '\x15claude --dangerously-skip-permissions --resume ' + existingSessionId + '\r');
+            return false;
+          } else {
+            event.preventDefault();
             console.log('[Claude Intercept] No session to continue, showing error');
             ipcRenderer.send('terminal:input', tabId, '\x15echo "❌ No Claude session saved for this tab"\r');
             return false;
@@ -402,6 +412,15 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
                             if (forkWithIdMatch) {
                               event.preventDefault();
                               const sourceSessionId = forkWithIdMatch[1];
+
+                              // Check if session already exists - prevent accidental overwrite
+                              const existingId = getClaudeSessionId(tabId);
+                              if (existingId) {
+                                console.log('[Claude Intercept] Session exists, blocking fork:', existingId);
+                                ipcRenderer.send('terminal:input', tabId, '\x15echo "❌ Уже есть сессия: ' + existingId + '. Откройте новый таб для claude-f"\r');
+                                return false;
+                              }
+
                               console.log('[Claude Intercept] Fork from session:', sourceSessionId);
 
                               // Clear line
@@ -414,7 +433,7 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
                                 if (result.success) {
                                   console.log('[Claude Intercept] Forked to new session:', result.newSessionId);
                                   getSetClaudeSessionId()(tabId, result.newSessionId);
-                                  ipcRenderer.send('terminal:input', tabId, 'claude --resume ' + result.newSessionId + '\r');
+                                  ipcRenderer.send('terminal:input', tabId, 'claude --dangerously-skip-permissions --resume ' + result.newSessionId + '\r');
                                 } else {
                                   console.error('[Claude Intercept] Fork failed:', result.error);
                                   ipcRenderer.send('terminal:input', tabId, 'echo "❌ Fork failed: ' + result.error + '"\r');
@@ -426,6 +445,23 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
         if (fullLine.endsWith(' claude-f') || fullLine === 'claude-f') {
           event.preventDefault();
           ipcRenderer.send('terminal:input', tabId, '\x15echo "❌ Укажите ID: claude-f <session-id>"\r');
+          return false;
+        }
+
+        // --- CASE 4: claude-d (alias for claude) ---
+        if (fullLine.endsWith(' claude-d') || fullLine === 'claude-d') {
+          event.preventDefault();
+
+          const existingId = getClaudeSessionId(tabId);
+          if (existingId) {
+            console.log('[Claude Intercept] Session exists, blocking new:', existingId);
+            ipcRenderer.send('terminal:input', tabId, '\x15echo "❌ Уже есть сессия: ' + existingId + '. Используйте claude-c или claude-f <ID>"\r');
+            return false;
+          }
+
+          ipcRenderer.send('terminal:input', tabId, '\x15');
+          console.log('[Claude Intercept] Spawning with Sniper Watcher');
+          ipcRenderer.send('claude:spawn-with-watcher', { tabId, cwd });
           return false;
         }
 
@@ -591,6 +627,15 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
 
           if (fullLine.endsWith(' claude') || fullLine === 'claude') {
             event.preventDefault();
+
+            // Check if session already exists
+            const existingId = getClaudeSessionId(tabId);
+            if (existingId) {
+              console.log('[Claude Intercept] Session exists, blocking new:', existingId);
+              ipcRenderer.send('terminal:input', tabId, '\x15echo "❌ Уже есть сессия: ' + existingId + '. Используйте claude-c или claude-f <ID>"\r');
+              return false;
+            }
+
             ipcRenderer.send('terminal:input', tabId, '\x15');
             console.log('[Claude Intercept] Spawning with Sniper Watcher');
             ipcRenderer.send('claude:spawn-with-watcher', { tabId, cwd });
@@ -604,7 +649,7 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
             if (existingSessionId) {
               event.preventDefault();
               console.log('[Claude-c] Sending command: claude --resume', existingSessionId);
-              ipcRenderer.send('terminal:input', tabId, '\x15claude --resume ' + existingSessionId + '\r');
+              ipcRenderer.send('terminal:input', tabId, '\x15claude --dangerously-skip-permissions --resume ' + existingSessionId + '\r');
               return false;
             } else {
               event.preventDefault();
@@ -621,6 +666,15 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
           if (forkWithIdMatch) {
             event.preventDefault();
             const sourceSessionId = forkWithIdMatch[1];
+
+            // Check if session already exists
+            const existingId = getClaudeSessionId(tabId);
+            if (existingId) {
+              console.log('[Claude Intercept] Session exists, blocking fork:', existingId);
+              ipcRenderer.send('terminal:input', tabId, '\x15echo "❌ Уже есть сессия: ' + existingId + '. Откройте новый таб для claude-f"\r');
+              return false;
+            }
+
             console.log('[Claude Intercept] Fork from session:', sourceSessionId);
 
             // Clear line
@@ -632,7 +686,7 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
               if (result.success) {
                 console.log('[Claude Intercept] Forked to new session:', result.newSessionId);
                 getSetClaudeSessionId()(tabId, result.newSessionId);
-                ipcRenderer.send('terminal:input', tabId, 'claude --resume ' + result.newSessionId + '\r');
+                ipcRenderer.send('terminal:input', tabId, 'claude --dangerously-skip-permissions --resume ' + result.newSessionId + '\r');
               } else {
                 console.error('[Claude Intercept] Fork failed:', result.error);
                 ipcRenderer.send('terminal:input', tabId, 'echo "❌ Fork failed: ' + result.error + '"\r');
@@ -645,6 +699,23 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
           if (fullLine.endsWith(' claude-f') || fullLine === 'claude-f') {
             event.preventDefault();
             ipcRenderer.send('terminal:input', tabId, '\x15echo "❌ Укажите ID: claude-f <session-id>"\r');
+            return false;
+          }
+
+          // --- CASE 4: claude-d (alias for claude) ---
+          if (fullLine.endsWith(' claude-d') || fullLine === 'claude-d') {
+            event.preventDefault();
+
+            const existingId = getClaudeSessionId(tabId);
+            if (existingId) {
+              console.log('[Claude Intercept] Session exists, blocking new:', existingId);
+              ipcRenderer.send('terminal:input', tabId, '\x15echo "❌ Уже есть сессия: ' + existingId + '. Используйте claude-c или claude-f <ID>"\r');
+              return false;
+            }
+
+            ipcRenderer.send('terminal:input', tabId, '\x15');
+            console.log('[Claude Intercept] Spawning with Sniper Watcher');
+            ipcRenderer.send('claude:spawn-with-watcher', { tabId, cwd });
             return false;
           }
 
