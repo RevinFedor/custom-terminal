@@ -33,10 +33,14 @@ function App() {
 
     // Global Hotkeys
     const handleKeyDown = (e: KeyboardEvent) => {
-      // Cmd+\ - Toggle file explorer
+      // Cmd+\ - Toggle file explorer (also close file preview if open)
       if (e.metaKey && e.code === 'Backslash') {
         e.preventDefault();
         if (view === 'workspace') {
+          // Close file preview if open
+          if (filePreview) {
+            closeFilePreview();
+          }
           toggleFileExplorer();
         }
         return;
@@ -129,7 +133,6 @@ function App() {
                 : 'bg-transparent border-border-main hover:bg-[#3a3a3c] hover:border-accent text-text-main'
             }`}
             onClick={() => {
-              console.log('[App] Home button clicked');
               showDashboard();
             }}
             title="Dashboard"

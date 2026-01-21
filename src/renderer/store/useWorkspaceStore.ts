@@ -2,11 +2,15 @@ import { create } from 'zustand';
 
 const { ipcRenderer } = window.require('electron');
 
+export type TabColor = 'default' | 'red' | 'yellow' | 'green' | 'blue' | 'purple';
+
 interface Tab {
   id: string;
   name: string;
   cwd: string;
   pid?: number;
+  color?: TabColor;
+  isUtility?: boolean;
 }
 
 interface ProjectWorkspace {
@@ -49,6 +53,14 @@ interface WorkspaceStore {
   // Reorder tabs
   reorderTabs: (projectId: string, oldIndex: number, newIndex: number) => void;
 
+  // Tab color and utility
+  setTabColor: (projectId: string, tabId: string, color: TabColor) => void;
+  toggleTabUtility: (projectId: string, tabId: string) => void;
+
+  // Advanced drag & drop
+  reorderInZone: (projectId: string, zone: 'main' | 'utility', orderedIds: string[]) => void;
+  moveTabToZone: (projectId: string, tabId: string, toUtility: boolean, atIndex: number) => void;
+
   // Update tab cwd
   updateTabCwd: (projectId: string, tabId: string, newCwd: string) => void;
   syncAllTabsCwd: (projectId: string) => Promise<void>;
@@ -66,7 +78,6 @@ const saveTabs = async (projectPath: string, tabs: Map<string, Tab>) => {
     name: tab.name,
     cwd: tab.cwd
   }));
-  console.log('[Workspace] Saving tabs to DB:', tabsArray);
   await ipcRenderer.invoke('project:save-tabs', { dirPath: projectPath, tabs: tabsArray });
 };
 
@@ -139,8 +150,6 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   },
 
   showDashboard: async () => {
-    console.log('[Workspace] showDashboard called');
-    console.log('[Workspace] Current state:', { view: get().view, activeProjectId: get().activeProjectId });
 
     // Sync cwd for active project before leaving
     const { activeProjectId, syncAllTabsCwd } = get();
@@ -149,7 +158,6 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     }
 
     set({ view: 'dashboard', activeProjectId: null });
-    console.log('[Workspace] New state:', { view: get().view, activeProjectId: get().activeProjectId });
     get().saveSession();
   },
 
@@ -163,14 +171,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
 
     if (!openProjects.has(projectId)) {
       // Load saved tabs from database
-      console.log('[Workspace] ========== OPENING PROJECT ==========');
-      console.log('[Workspace] Project:', projectId);
-      console.log('[Workspace] Path:', projectPath);
 
       const projectData = await ipcRenderer.invoke('project:get', projectPath);
       const savedTabs = projectData?.tabs || [];
 
-      console.log('[Workspace] Loaded from DB - savedTabs:', savedTabs);
 
       const newWorkspace: ProjectWorkspace = {
         projectId,
@@ -185,15 +189,12 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       // Restore saved tabs or create default one
       if (savedTabs.length > 0) {
         for (const savedTab of savedTabs) {
-          console.log('[Workspace] Restoring tab:', savedTab.name, 'with cwd:', savedTab.cwd);
           await createTab(projectId, savedTab.name, savedTab.cwd);
         }
       } else {
         // Create default tab
-        console.log('[Workspace] No saved tabs, creating default');
         await createTab(projectId, 'Terminal 1', projectPath);
       }
-      console.log('[Workspace] ========== PROJECT OPENED ==========');
 
       saveSession();
     } else {
@@ -330,6 +331,117 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     saveTabs(workspace.projectPath, workspace.tabs);
   },
 
+  setTabColor: (projectId, tabId, color) => {
+    const { openProjects } = get();
+    const workspace = openProjects.get(projectId);
+
+    if (workspace) {
+      const tab = workspace.tabs.get(tabId);
+      if (tab) {
+        tab.color = color;
+        set({ openProjects: new Map(openProjects) });
+        saveTabs(workspace.projectPath, workspace.tabs);
+      }
+    }
+  },
+
+  toggleTabUtility: (projectId, tabId) => {
+    const { openProjects } = get();
+    const workspace = openProjects.get(projectId);
+
+    if (workspace) {
+      const tab = workspace.tabs.get(tabId);
+      if (tab) {
+        tab.isUtility = !tab.isUtility;
+        set({ openProjects: new Map(openProjects) });
+        saveTabs(workspace.projectPath, workspace.tabs);
+      }
+    }
+  },
+
+  reorderInZone: (projectId, zone, orderedIds) => {
+    const { openProjects } = get();
+    const workspace = openProjects.get(projectId);
+
+    if (!workspace) return;
+
+    // Get all tabs
+    const allTabs = Array.from(workspace.tabs.entries());
+    const isUtilityZone = zone === 'utility';
+
+    // Separate tabs by zone
+    const zoneTabs = allTabs.filter(([_, tab]) => !!tab.isUtility === isUtilityZone);
+    const otherTabs = allTabs.filter(([_, tab]) => !!tab.isUtility !== isUtilityZone);
+
+    // Reorder zone tabs according to orderedIds
+    const reorderedZoneTabs = orderedIds
+      .map(id => zoneTabs.find(([tabId]) => tabId === id))
+      .filter(Boolean) as [string, any][];
+
+    // Rebuild Map: utility tabs first, then main tabs (or vice versa based on preference)
+    // We'll keep utility tabs at the end of the Map
+    const newTabs = new Map<string, any>();
+
+    if (isUtilityZone) {
+      // Main tabs first, then reordered utility
+      otherTabs.forEach(([id, tab]) => newTabs.set(id, tab));
+      reorderedZoneTabs.forEach(([id, tab]) => newTabs.set(id, tab));
+    } else {
+      // Reordered main tabs first, then utility
+      reorderedZoneTabs.forEach(([id, tab]) => newTabs.set(id, tab));
+      otherTabs.forEach(([id, tab]) => newTabs.set(id, tab));
+    }
+
+    workspace.tabs = newTabs;
+    set({ openProjects: new Map(openProjects) });
+    saveTabs(workspace.projectPath, workspace.tabs);
+  },
+
+  moveTabToZone: (projectId, tabId, toUtility, atIndex) => {
+    const { openProjects } = get();
+    const workspace = openProjects.get(projectId);
+
+    if (!workspace) return;
+
+    const tab = workspace.tabs.get(tabId);
+    if (!tab) return;
+
+    // Change utility flag
+    tab.isUtility = toUtility;
+
+    // Get tabs of target zone (after flag change)
+    const allTabs = Array.from(workspace.tabs.entries());
+    const targetZoneTabs = allTabs.filter(([_, t]) => !!t.isUtility === toUtility);
+    const otherZoneTabs = allTabs.filter(([_, t]) => !!t.isUtility !== toUtility);
+
+    // Remove tab from its current position in target zone list
+    const tabIndex = targetZoneTabs.findIndex(([id]) => id === tabId);
+    if (tabIndex !== -1) {
+      targetZoneTabs.splice(tabIndex, 1);
+    }
+
+    // Insert at new position
+    const insertIndex = Math.min(atIndex, targetZoneTabs.length);
+    targetZoneTabs.splice(insertIndex, 0, [tabId, tab]);
+
+    // Rebuild Map
+    const newTabs = new Map<string, any>();
+
+    if (toUtility) {
+      // Main tabs first, then utility (with moved tab)
+      otherZoneTabs.forEach(([id, t]) => newTabs.set(id, t));
+      targetZoneTabs.forEach(([id, t]) => newTabs.set(id, t));
+    } else {
+      // Main tabs (with moved tab) first, then utility
+      targetZoneTabs.forEach(([id, t]) => newTabs.set(id, t));
+      otherZoneTabs.forEach(([id, t]) => newTabs.set(id, t));
+    }
+
+    workspace.tabs = newTabs;
+    set({ openProjects: new Map(openProjects) });
+    saveTabs(workspace.projectPath, workspace.tabs);
+  },
+
   updateTabCwd: (projectId, tabId, newCwd) => {
     const { openProjects } = get();
     const workspace = openProjects.get(projectId);
@@ -337,7 +449,6 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     if (workspace) {
       const tab = workspace.tabs.get(tabId);
       if (tab && tab.cwd !== newCwd) {
-        console.log('[Workspace] Updating tab cwd:', tabId, newCwd);
         tab.cwd = newCwd;
         set({ openProjects: new Map(openProjects) });
         saveTabs(workspace.projectPath, workspace.tabs);
@@ -350,30 +461,21 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     const workspace = openProjects.get(projectId);
 
     if (!workspace) {
-      console.log('[Workspace] syncAllTabsCwd: workspace not found for', projectId);
       return;
     }
 
-    console.log('[Workspace] ========== SYNC CWD ==========');
-    console.log('[Workspace] Project:', projectId);
-    console.log('[Workspace] Tabs count:', workspace.tabs.size);
 
     for (const [tabId, tab] of workspace.tabs) {
-      console.log('[Workspace] Checking tab:', tabId, 'current cwd:', tab.cwd);
       try {
         const currentCwd = await ipcRenderer.invoke('terminal:getCwd', tabId);
-        console.log('[Workspace] Got cwd from PTY:', currentCwd);
         if (currentCwd && currentCwd !== tab.cwd) {
-          console.log('[Workspace] ✅ Updating cwd:', tab.cwd, '->', currentCwd);
           updateTabCwd(projectId, tabId, currentCwd);
         } else {
-          console.log('[Workspace] No change needed');
         }
       } catch (e) {
         console.error('[Workspace] ❌ Failed to get cwd for tab:', tabId, e);
       }
     }
-    console.log('[Workspace] ========== SYNC DONE ==========');
   },
 
   getActiveTab: (projectId) => {

@@ -13,16 +13,13 @@ function migrateFromJSON() {
 
   // Check if JSON file exists
   if (!fs.existsSync(jsonPath)) {
-    console.log('[Migration] No projects.json found. Starting with empty database.');
     return;
   }
 
   try {
-    console.log('[Migration] Reading projects.json...');
     const jsonData = fs.readFileSync(jsonPath, 'utf-8');
     const projects = JSON.parse(jsonData);
 
-    console.log(`[Migration] Found ${Object.keys(projects).length} projects to migrate.`);
 
     const db = new DatabaseManager();
 
@@ -32,7 +29,6 @@ function migrateFromJSON() {
     // Migrate each project
     for (const [projectPath, projectData] of Object.entries(projects)) {
       try {
-        console.log(`[Migration] Migrating project: ${projectData.name || projectPath}`);
 
         // Insert project
         const projectId = projectData.id || Buffer.from(projectPath).toString('base64');
@@ -60,7 +56,6 @@ function migrateFromJSON() {
             insertAction.run(projectId, action.name, action.command, index);
           });
 
-          console.log(`  - Migrated ${projectData.quickActions.length} quick actions`);
         }
 
         // Migrate tabs
@@ -79,11 +74,9 @@ function migrateFromJSON() {
             );
           });
 
-          console.log(`  - Migrated ${projectData.tabs.length} tabs`);
         }
 
         migratedCount++;
-        console.log(`  ✓ Project migrated successfully`);
       } catch (err) {
         errorCount++;
         console.error(`  ✗ Error migrating project ${projectPath}:`, err.message);
@@ -92,14 +85,10 @@ function migrateFromJSON() {
 
     db.close();
 
-    console.log('\n[Migration] Migration complete!');
-    console.log(`  - Successfully migrated: ${migratedCount} projects`);
-    console.log(`  - Errors: ${errorCount}`);
 
     // Backup the old JSON file
     const backupPath = path.join(userDataPath, `projects.json.backup-${Date.now()}`);
     fs.copyFileSync(jsonPath, backupPath);
-    console.log(`\n[Migration] Original JSON backed up to: ${backupPath}`);
 
   } catch (err) {
     console.error('[Migration] Fatal error during migration:', err);

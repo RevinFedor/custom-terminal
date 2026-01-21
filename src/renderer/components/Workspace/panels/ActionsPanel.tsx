@@ -37,7 +37,6 @@ export default function ActionsPanel({ activeTabId }: ActionsPanelProps) {
       return;
     }
 
-    console.log('[Actions] Running command:', command);
     ipcRenderer.send('terminal:executeCommand', activeTabId, command);
     showToast(`Running: ${command.substring(0, 30)}...`, 'info');
   };

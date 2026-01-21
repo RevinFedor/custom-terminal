@@ -5,7 +5,11 @@ const { app } = require('electron');
 class DatabaseManager {
   constructor() {
     const userDataPath = app.getPath('userData');
-    const dbPath = path.join(userDataPath, 'noted-terminal.db');
+    // Use different database for dev vs prod
+    const dbName = app.isPackaged ? 'noted-terminal.db' : 'noted-terminal-dev.db';
+    const dbPath = path.join(userDataPath, dbName);
+
+    console.log(`[Database] Mode: ${app.isPackaged ? 'PROD' : 'DEV'}, Path: ${dbPath}`);
 
     this.db = new Database(dbPath);
     this.db.pragma('journal_mode = WAL');
@@ -103,6 +107,19 @@ class DatabaseManager {
       )
     `);
 
+    // Session deployments - tracks where sessions have been imported to
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS session_deployments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id INTEGER NOT NULL,
+        deployed_cwd TEXT NOT NULL,
+        deployed_hash TEXT,
+        deployed_at INTEGER DEFAULT (strftime('%s', 'now')),
+        FOREIGN KEY (session_id) REFERENCES ai_sessions(id) ON DELETE CASCADE,
+        UNIQUE(session_id, deployed_cwd)
+      )
+    `);
+
     // Create indexes for faster queries
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_quick_actions_project ON quick_actions(project_id);
@@ -111,6 +128,7 @@ class DatabaseManager {
       CREATE INDEX IF NOT EXISTS idx_gemini_history_timestamp ON gemini_history(timestamp DESC);
       CREATE INDEX IF NOT EXISTS idx_ai_sessions_project ON ai_sessions(project_id);
       CREATE INDEX IF NOT EXISTS idx_ai_sessions_tool_type ON ai_sessions(tool_type);
+      CREATE INDEX IF NOT EXISTS idx_session_deployments_session ON session_deployments(session_id);
     `);
   }
 
@@ -422,9 +440,18 @@ class DatabaseManager {
 
   saveAISession(projectPath, toolType, sessionKey, contentBlob, originalCwd, originalHash = null) {
     const normalizedPath = path.resolve(projectPath);
-    const project = this.db.prepare('SELECT id FROM projects WHERE path = ?').get(normalizedPath);
+    let project = this.db.prepare('SELECT id FROM projects WHERE path = ?').get(normalizedPath);
 
-    if (!project) return null;
+    // Auto-create project if it doesn't exist
+    if (!project) {
+      console.log('[Database] Auto-creating project for:', normalizedPath);
+      this.createProject(normalizedPath);
+      project = this.db.prepare('SELECT id FROM projects WHERE path = ?').get(normalizedPath);
+      if (!project) {
+        console.error('[Database] Failed to create project for:', normalizedPath);
+        return null;
+      }
+    }
 
     // Check if session already exists
     const existing = this.db.prepare(`
@@ -450,6 +477,40 @@ class DatabaseManager {
 
       return result.lastInsertRowid;
     }
+  }
+
+  // Get ALL sessions across all projects (with deployments)
+  getAllAISessions(toolType = null) {
+    let sessions;
+    if (toolType) {
+      sessions = this.db.prepare(`
+        SELECT s.*, p.path as project_path
+        FROM ai_sessions s
+        JOIN projects p ON s.project_id = p.id
+        WHERE s.tool_type = ?
+        ORDER BY s.updated_at DESC
+      `).all(toolType);
+    } else {
+      sessions = this.db.prepare(`
+        SELECT s.*, p.path as project_path
+        FROM ai_sessions s
+        JOIN projects p ON s.project_id = p.id
+        ORDER BY s.updated_at DESC
+      `).all();
+    }
+
+    // Add deployments to each session
+    for (const session of sessions) {
+      const deployments = this.getSessionDeployments(session.id);
+      // Collect all locations: original_cwd + all deployed locations
+      const locations = new Set([session.original_cwd]);
+      for (const d of deployments) {
+        locations.add(d.deployed_cwd);
+      }
+      session.locations = Array.from(locations);
+    }
+
+    return sessions;
   }
 
   getAISessions(projectPath, toolType = null) {
@@ -487,6 +548,43 @@ class DatabaseManager {
 
   deleteAISession(sessionId) {
     this.db.prepare('DELETE FROM ai_sessions WHERE id = ?').run(sessionId);
+  }
+
+  // ========== SESSION DEPLOYMENTS ==========
+
+  addSessionDeployment(sessionId, deployedCwd, deployedHash = null) {
+    const normalizedCwd = path.resolve(deployedCwd);
+    try {
+      this.db.prepare(`
+        INSERT OR REPLACE INTO session_deployments (session_id, deployed_cwd, deployed_hash)
+        VALUES (?, ?, ?)
+      `).run(sessionId, normalizedCwd, deployedHash);
+      return true;
+    } catch (error) {
+      console.error('[Database] Error adding deployment:', error);
+      return false;
+    }
+  }
+
+  getSessionDeployments(sessionId) {
+    return this.db.prepare(`
+      SELECT * FROM session_deployments
+      WHERE session_id = ?
+      ORDER BY deployed_at DESC
+    `).all(sessionId);
+  }
+
+  removeSessionDeployment(sessionId, deployedCwd) {
+    const normalizedCwd = path.resolve(deployedCwd);
+    this.db.prepare(`
+      DELETE FROM session_deployments
+      WHERE session_id = ? AND deployed_cwd = ?
+    `).run(sessionId, normalizedCwd);
+  }
+
+  // Get session by ID (for cross-project import)
+  getAISessionById(sessionId) {
+    return this.db.prepare('SELECT * FROM ai_sessions WHERE id = ?').get(sessionId);
   }
 
   // ========== VISUAL SNAPSHOTS ==========

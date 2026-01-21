@@ -46,64 +46,55 @@ class SessionManager {
   }
 
   /**
-   * Export Gemini session using "Trojan Horse" method
-   * @param {string} projectPath - Current project path
+   * Export Gemini session
+   * @param {string} dirPath - Current tab working directory (where Gemini saved checkpoint)
    * @param {string} sessionKey - Tag name for the checkpoint
+   * @param {string} projectPath - Project root path (for DB organization, optional - defaults to dirPath)
    * @returns {Promise<{success: boolean, message: string}>}
    */
-  async exportGeminiSession(projectPath, sessionKey) {
-    console.log('\n[SessionManager] ===== EXPORT GEMINI SESSION =====');
-    console.log('[SessionManager] Project path:', projectPath);
-    console.log('[SessionManager] Session key:', sessionKey);
+  async exportGeminiSession(dirPath, sessionKey, projectPath = null) {
 
     try {
-      const normalizedPath = path.resolve(projectPath);
-      console.log('[SessionManager] Normalized path:', normalizedPath);
+      const normalizedCwd = path.resolve(dirPath);
+      const normalizedProject = projectPath ? path.resolve(projectPath) : normalizedCwd;
 
-      // Calculate directory hash (SHA-256 of absolute path)
-      const dirHash = this.calculateGeminiHash(normalizedPath);
-      console.log('[SessionManager] Directory hash:', dirHash);
+      // Calculate directory hash (SHA-256 of tab cwd - this is what Gemini uses)
+      const dirHash = this.calculateGeminiHash(normalizedCwd);
 
       // Find checkpoint file
       const geminiTmpDir = path.join(os.homedir(), '.gemini', 'tmp', dirHash);
-      console.log('[SessionManager] Gemini tmp dir:', geminiTmpDir);
 
       const checkpointPattern = `checkpoint-${sessionKey}.json`;
       const checkpointPath = path.join(geminiTmpDir, checkpointPattern);
+
       console.log('[SessionManager] Looking for checkpoint at:', checkpointPath);
 
-      // List all files in directory for debugging
-      if (fs.existsSync(geminiTmpDir)) {
-        const files = fs.readdirSync(geminiTmpDir);
-        console.log('[SessionManager] Files in gemini tmp dir:', files);
-      } else {
-        console.log('[SessionManager] ⚠️ Gemini tmp dir does not exist!');
-      }
-
       if (!fs.existsSync(checkpointPath)) {
-        console.log('[SessionManager] ❌ Checkpoint file not found');
+        // List available checkpoints for debugging
+        if (fs.existsSync(geminiTmpDir)) {
+          const files = fs.readdirSync(geminiTmpDir).filter(f => f.startsWith('checkpoint-'));
+          console.log('[SessionManager] Available checkpoints:', files);
+        }
         return {
           success: false,
           message: `Checkpoint "${sessionKey}" not found. Run "/chat save ${sessionKey}" first.`
         };
       }
 
-      console.log('[SessionManager] ✅ Checkpoint file found, reading...');
       // Read checkpoint content
       const checkpointContent = fs.readFileSync(checkpointPath, 'utf-8');
-      console.log('[SessionManager] Checkpoint size:', checkpointContent.length, 'bytes');
 
       // Save to database
-      console.log('[SessionManager] Saving to database...');
+      // - projectPath for organization (which project this belongs to)
+      // - original_cwd = dirPath (where checkpoint was created, for import patching)
       const sessionId = this.db.saveAISession(
-        normalizedPath,
+        normalizedProject,    // project for DB organization
         'gemini',
         sessionKey,
         checkpointContent,
-        normalizedPath,
+        normalizedCwd,        // original_cwd = tab cwd where checkpoint was created
         dirHash
       );
-      console.log('[SessionManager] ✅ Saved to database with ID:', sessionId);
 
       return {
         success: true,
@@ -119,91 +110,89 @@ class SessionManager {
   }
 
   /**
-   * Import Gemini session using "Direct Injection" method
-   * @param {string} projectPath - Current project path
+   * Import Gemini session using "Trojan Horse" method
+   *
+   * Flow:
+   * 1. Return commands to: start gemini, send message, /chat save <tag>
+   * 2. After Gemini creates the checkpoint file, we overwrite it with our content
+   * 3. Then /chat resume <tag> will load our patched session
+   *
+   * @param {string} targetCwd - Target directory where to restore (tab cwd)
    * @param {string} sessionKey - Tag name to restore
-   * @param {Function} sendCommand - Function to send commands to PTY (tabId, command) [UNUSED in new version]
-   * @param {number} tabId - Tab ID to send commands to [UNUSED in new version]
-   * @returns {Promise<{success: boolean, message: string, commands: string[]}>}
+   * @param {number} sessionId - Session ID (for cross-project import)
+   * @returns {Promise<{success: boolean, message: string, patchData: object}>}
    */
-  async importGeminiSession(projectPath, sessionKey, sendCommand, tabId) {
-    console.log('\n[SessionManager] ===== IMPORT GEMINI SESSION (Direct Injection) =====');
-    console.log('[SessionManager] Project path:', projectPath);
-    console.log('[SessionManager] Session key:', sessionKey);
+  async importGeminiSession(targetCwd, sessionKey, sendCommand, tabId, sessionId = null) {
 
     try {
-      const normalizedPath = path.resolve(projectPath);
-      console.log('[SessionManager] Normalized path:', normalizedPath);
+      const normalizedTarget = path.resolve(targetCwd);
 
-      // Get session from database
-      console.log('[SessionManager] Looking for session in database...');
-      const session = this.db.getAISession(normalizedPath, 'gemini', sessionKey);
+      // Get session from database - try by ID first (cross-project), then by key
+      let session;
+      if (sessionId) {
+        session = this.db.getAISessionById(sessionId);
+      }
+      if (!session) {
+        // Fallback: search globally by session_key
+        const allSessions = this.db.getAllAISessions('gemini');
+        session = allSessions.find(s => s.session_key === sessionKey);
+      }
 
       if (!session) {
-        console.log('[SessionManager] ❌ Session not found in database');
-        // List available sessions for debugging
-        const allSessions = this.db.getAISessions(normalizedPath, 'gemini');
-        console.log('[SessionManager] Available Gemini sessions:', allSessions.map(s => s.session_key));
         return {
           success: false,
-          message: `Session "${sessionKey}" not found in database. Available: ${allSessions.map(s => s.session_key).join(', ')}`
+          message: `Session "${sessionKey}" not found in database.`
         };
       }
 
-      console.log('[SessionManager] ✅ Session found in database');
-      console.log('[SessionManager] Session original_cwd:', session.original_cwd);
-      console.log('[SessionManager] Session original_hash:', session.original_hash);
+      console.log('[SessionManager] Preparing Trojan Horse import:', session.session_key);
+      console.log('[SessionManager] From:', session.original_cwd, 'To:', normalizedTarget);
 
       // Calculate new hash for target directory
-      const newHash = this.calculateGeminiHash(normalizedPath);
-      console.log('[SessionManager] New hash:', newHash);
-
-      // Target directory and file
-      const geminiTmpDir = path.join(os.homedir(), '.gemini', 'tmp', newHash);
-      const targetPath = path.join(geminiTmpDir, `checkpoint-${sessionKey}.json`);
-
-      // Create directory if it doesn't exist
-      if (!fs.existsSync(geminiTmpDir)) {
-        console.log('[SessionManager] Creating gemini tmp directory...');
-        fs.mkdirSync(geminiTmpDir, { recursive: true });
-      }
+      const newHash = this.calculateGeminiHash(normalizedTarget);
 
       // Patch the saved session content
-      console.log('[SessionManager] Patching session content...');
       let patchedContent = session.content_blob;
 
       // Replace old path with new path
-      if (session.original_cwd !== normalizedPath) {
-        console.log(`[SessionManager] Replacing paths: ${session.original_cwd} -> ${normalizedPath}`);
+      if (session.original_cwd !== normalizedTarget) {
         patchedContent = patchedContent.replace(
           new RegExp(session.original_cwd.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'),
-          normalizedPath
+          normalizedTarget
         );
       }
 
       // Replace old hash with new hash
       if (session.original_hash && session.original_hash !== newHash) {
-        console.log(`[SessionManager] Replacing hashes: ${session.original_hash} -> ${newHash}`);
         patchedContent = patchedContent.replace(
           new RegExp(session.original_hash, 'g'),
           newHash
         );
       }
 
-      // Write patched content directly to target file
-      console.log('[SessionManager] Writing checkpoint file directly...');
-      fs.writeFileSync(targetPath, patchedContent, 'utf-8');
-      console.log('[SessionManager] ✅ Checkpoint file created at:', targetPath);
+      // Record this deployment (if different from original)
+      if (session.original_cwd !== normalizedTarget) {
+        this.db.addSessionDeployment(session.id, normalizedTarget, newHash);
+        console.log('[SessionManager] Added deployment record for:', normalizedTarget);
+      }
 
-      console.log('[SessionManager] ✅ Direct injection complete');
-
+      // Return data for Trojan Horse method
+      // The renderer will:
+      // 1. Start Gemini
+      // 2. Send a dummy message
+      // 3. /chat save <tag> - creates shell checkpoint
+      // 4. Call session:patch-checkpoint to overwrite with our content
+      // 5. /chat resume <tag> - loads our patched session
       return {
         success: true,
-        message: `Session "${sessionKey}" restored. Click "🔄 Resume" or run: gemini → /chat resume ${sessionKey}`,
-        commands: [
-          'gemini',
-          `/chat resume ${sessionKey}`
-        ]
+        message: `Trojan Horse prepared for "${sessionKey}"`,
+        trojanHorse: true,
+        patchData: {
+          targetCwd: normalizedTarget,
+          targetHash: newHash,
+          sessionKey: sessionKey,
+          patchedContent: patchedContent
+        }
       };
     } catch (error) {
       console.error('[SessionManager] ❌ Import failed:', error);
@@ -211,6 +200,68 @@ class SessionManager {
         success: false,
         message: `Import failed: ${error.message}`
       };
+    }
+  }
+
+  /**
+   * Patch checkpoint file (Phase 2 of Trojan Horse)
+   * Called after Gemini CLI creates the checkpoint file
+   */
+  patchCheckpointFile(targetCwd, sessionKey, patchedContent) {
+    try {
+      const normalizedTarget = path.resolve(targetCwd);
+      const targetHash = this.calculateGeminiHash(normalizedTarget);
+      const geminiTmpDir = path.join(os.homedir(), '.gemini', 'tmp', targetHash);
+      const checkpointPath = path.join(geminiTmpDir, `checkpoint-${sessionKey}.json`);
+
+      console.log('[SessionManager] Patching checkpoint at:', checkpointPath);
+
+      if (!fs.existsSync(checkpointPath)) {
+        return { success: false, message: 'Checkpoint file not found. Gemini may not have created it yet.' };
+      }
+
+      // Overwrite with our patched content
+      fs.writeFileSync(checkpointPath, patchedContent, 'utf-8');
+      console.log('[SessionManager] ✅ Checkpoint patched successfully');
+
+      return { success: true };
+    } catch (error) {
+      console.error('[SessionManager] ❌ Patch failed:', error);
+      return { success: false, message: error.message };
+    }
+  }
+
+  /**
+   * Delete a deployment (checkpoint file) from a specific location
+   * @param {number} sessionId - Session ID in database
+   * @param {string} sessionKey - Tag name
+   * @param {string} deployedCwd - Directory where checkpoint was deployed
+   * @returns {{success: boolean, message?: string}}
+   */
+  deleteDeployment(sessionId, sessionKey, deployedCwd) {
+    try {
+      const normalizedCwd = path.resolve(deployedCwd);
+      const hash = this.calculateGeminiHash(normalizedCwd);
+      const checkpointPath = path.join(os.homedir(), '.gemini', 'tmp', hash, `checkpoint-${sessionKey}.json`);
+
+      console.log('[SessionManager] Deleting deployment:', checkpointPath);
+
+      // Delete the checkpoint file if it exists
+      if (fs.existsSync(checkpointPath)) {
+        fs.unlinkSync(checkpointPath);
+        console.log('[SessionManager] ✅ Checkpoint file deleted');
+      } else {
+        console.log('[SessionManager] ⚠️ Checkpoint file not found (already deleted?)');
+      }
+
+      // Remove from session_deployments table
+      // Note: If this is the original_cwd, we don't remove from ai_sessions - just the file
+      this.db.removeSessionDeployment(sessionId, normalizedCwd);
+
+      return { success: true };
+    } catch (error) {
+      console.error('[SessionManager] ❌ Delete deployment failed:', error);
+      return { success: false, message: error.message };
     }
   }
 

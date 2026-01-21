@@ -4,24 +4,25 @@ import { resolve } from 'path';
 
 export default defineConfig({
   main: {
-    // Main process build config (using legacy main.js for now)
     build: {
       outDir: 'dist/main',
       lib: {
-        entry: resolve(__dirname, 'main.js'),
+        entry: resolve(__dirname, 'src/main/main.js'),
         formats: ['cjs']
       },
       rollupOptions: {
         external: [
           'electron',
           'node-pty',
-          'better-sqlite3',
-          'fs',
-          'path',
-          'os',
-          'crypto',
-          'child_process'
+          'better-sqlite3'
         ]
+      }
+    },
+    resolve: {
+      alias: {
+        './project-manager': resolve(__dirname, 'src/main/project-manager.js'),
+        './session-manager': resolve(__dirname, 'src/main/session-manager.js'),
+        './database': resolve(__dirname, 'src/main/database.js')
       }
     }
   },

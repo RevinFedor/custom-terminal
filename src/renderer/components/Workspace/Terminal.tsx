@@ -7,6 +7,10 @@ import { SerializeAddon } from '@xterm/addon-serialize';
 
 const { ipcRenderer } = window.require('electron');
 
+// Write buffer constants to prevent Ink/TUI render tearing
+const FLUSH_DELAY = 10; // ms - aligns with 60fps
+const MAX_BUFFER_SIZE = 4096; // safety valve
+
 interface TerminalProps {
   tabId: string;
   cwd: string;
@@ -22,22 +26,33 @@ export default function Terminal({ tabId, cwd, active }: TerminalProps) {
   const isInitialized = useRef(false);
   const isMounted = useRef(true);
 
+  // Write buffer refs to batch PTY output and prevent jitter
+  const writeBufferRef = useRef<string>('');
+  const pendingWriteRef = useRef<NodeJS.Timeout | null>(null);
+
   const safeFit = () => {
+    console.log('[safeFit] called, isMounted:', isMounted.current);
     if (!isMounted.current) return;
     try {
       const term = xtermInstance.current;
       const fit = fitAddonRef.current;
+      console.log('[safeFit] term:', !!term, 'fit:', !!fit);
       if (!term || !fit) return;
-      // Safely check if disposed
+      console.log('[safeFit] _isDisposed:', (term as any)._isDisposed, 'element:', !!term.element);
       if ((term as any)._isDisposed) return;
-      if ((term as any).element === null) return;
+      if (!term.element) return;
+      console.log('[safeFit] cols:', term.cols, 'rows:', term.rows);
+      if (!term.options || term.cols === 0 || term.rows === 0) return;
+      console.log('[safeFit] calling fit.fit()');
       fit.fit();
+      console.log('[safeFit] calling proposeDimensions()');
       const dims = fit.proposeDimensions();
+      console.log('[safeFit] dims:', dims);
       if (dims) {
         ipcRenderer.send('terminal:resize', tabId, dims.cols, dims.rows);
       }
     } catch (e) {
-      // Terminal disposed or not ready - silently ignore
+      console.error('[safeFit] error:', e);
     }
   };
 
@@ -45,79 +60,36 @@ export default function Terminal({ tabId, cwd, active }: TerminalProps) {
     if (isInitialized.current || !terminalRef.current) return;
     isInitialized.current = true;
 
-    console.log('[Terminal] Initializing terminal for tabId:', tabId);
+    const containerRef = terminalRef.current;
 
-    const term = new XTerminal({
-      theme: {
-        background: '#1a1a1a',
-        foreground: '#d4d4d4',
-        cursor: '#ffffff',
-        cursorAccent: '#1a1a1a',
-        selectionBackground: '#264f78',
-        black: '#000000',
-        red: '#cd3131',
-        green: '#0dbc79',
-        yellow: '#e5e510',
-        blue: '#2472c8',
-        magenta: '#bc3fbc',
-        cyan: '#11a8cd',
-        white: '#e5e5e5',
-        brightBlack: '#666666',
-        brightRed: '#f14c4c',
-        brightGreen: '#23d18b',
-        brightYellow: '#f5f543',
-        brightBlue: '#3b8eea',
-        brightMagenta: '#d670d6',
-        brightCyan: '#29b8db',
-        brightWhite: '#e5e5e5'
-      },
-      fontFamily: "'JetBrains Mono', 'JetBrainsMono NF', Menlo, Monaco, monospace",
-      fontSize: 13,
-      cursorBlink: true,
-      cursorStyle: 'block',
-      allowTransparency: false,
-      scrollback: 10000
-    });
-
-    const fitAddon = new FitAddon();
-    const serializeAddon = new SerializeAddon();
-    fitAddonRef.current = fitAddon;
-    serializeAddonRef.current = serializeAddon;
-
-    term.loadAddon(fitAddon);
-    term.loadAddon(serializeAddon);
-    term.loadAddon(new WebLinksAddon());
-
-    term.open(terminalRef.current);
-
-    try {
-      const webgl = new WebglAddon();
-      term.loadAddon(webgl);
-      webglAddonRef.current = webgl;
-    } catch (e) {
-      console.warn('[Terminal] WebGL addon failed to load');
-    }
-
-    xtermInstance.current = term;
-
-    // Fit after opening
-    setTimeout(() => {
-      safeFit();
-      if (active) {
-        term.focus();
-      }
-    }, 100);
-
-    // IPC: Send input to PTY
-    term.onData((data) => {
-      console.log('[Terminal] onData sending to PTY, tabId:', tabId);
-      ipcRenderer.send('terminal:input', tabId, data);
-    });
-
-    // IPC: Receive data from PTY
+    // IPC: Receive data from PTY (with write buffer to prevent jitter)
     const handleData = (_: any, payload: { tabId: string; data: string }) => {
-      if (payload.tabId === tabId && xtermInstance.current) {
-        xtermInstance.current.write(payload.data);
+      if (payload.tabId !== tabId || !xtermInstance.current) return;
+
+      // Accumulate data in buffer
+      writeBufferRef.current += payload.data;
+
+      // Schedule flush if not already pending
+      if (!pendingWriteRef.current) {
+        pendingWriteRef.current = setTimeout(() => {
+          if (xtermInstance.current && writeBufferRef.current) {
+            xtermInstance.current.write(writeBufferRef.current);
+            writeBufferRef.current = '';
+          }
+          pendingWriteRef.current = null;
+        }, FLUSH_DELAY);
+      }
+
+      // Flush immediately if buffer too large (safety valve)
+      if (writeBufferRef.current.length > MAX_BUFFER_SIZE) {
+        if (pendingWriteRef.current) {
+          clearTimeout(pendingWriteRef.current);
+          pendingWriteRef.current = null;
+        }
+        if (xtermInstance.current) {
+          xtermInstance.current.write(writeBufferRef.current);
+          writeBufferRef.current = '';
+        }
       }
     };
 
@@ -127,6 +99,7 @@ export default function Terminal({ tabId, cwd, active }: TerminalProps) {
       }
     };
 
+    // Register IPC listeners synchronously
     ipcRenderer.on('terminal:data', handleData);
     ipcRenderer.on('terminal:exit', handleExit);
 
@@ -134,14 +107,113 @@ export default function Terminal({ tabId, cwd, active }: TerminalProps) {
     const resizeObserver = new ResizeObserver(() => {
       if (active) safeFit();
     });
-    resizeObserver.observe(terminalRef.current);
+    resizeObserver.observe(containerRef);
+
+    // Async terminal initialization (waits for fonts)
+    const initTerminal = async () => {
+      // Wait for fonts to load before creating terminal (prevents metric issues)
+      await document.fonts.ready;
+
+      // Double-check our specific font is loaded
+      const fontFamily = "'JetBrains Mono', 'JetBrainsMono NF'";
+      if (!document.fonts.check(`13px ${fontFamily}`)) {
+        try {
+          await document.fonts.load(`13px ${fontFamily}`);
+        } catch (e) {
+          // Font may not be available, proceed with fallback
+        }
+      }
+
+      if (!isMounted.current || !containerRef) return;
+
+      const term = new XTerminal({
+        theme: {
+          background: '#1a1a1a',
+          foreground: '#d4d4d4',
+          cursor: '#ffffff',
+          cursorAccent: '#1a1a1a',
+          selectionBackground: '#264f78',
+          black: '#000000',
+          red: '#cd3131',
+          green: '#0dbc79',
+          yellow: '#e5e510',
+          blue: '#2472c8',
+          magenta: '#bc3fbc',
+          cyan: '#11a8cd',
+          white: '#e5e5e5',
+          brightBlack: '#666666',
+          brightRed: '#f14c4c',
+          brightGreen: '#23d18b',
+          brightYellow: '#f5f543',
+          brightBlue: '#3b8eea',
+          brightMagenta: '#d670d6',
+          brightCyan: '#29b8db',
+          brightWhite: '#e5e5e5'
+        },
+        fontFamily: "'JetBrains Mono', 'JetBrainsMono NF', Menlo, Monaco, monospace",
+        fontSize: 13,
+        cursorBlink: true,
+        cursorStyle: 'block',
+        allowTransparency: false,
+        scrollback: 10000
+      });
+
+      const fitAddon = new FitAddon();
+      const serializeAddon = new SerializeAddon();
+      fitAddonRef.current = fitAddon;
+      serializeAddonRef.current = serializeAddon;
+
+      term.loadAddon(fitAddon);
+      term.loadAddon(serializeAddon);
+      term.loadAddon(new WebLinksAddon());
+
+      console.log('[initTerminal] opening terminal');
+      term.open(containerRef);
+      console.log('[initTerminal] terminal opened, cols:', term.cols, 'rows:', term.rows);
+
+      try {
+        console.log('[initTerminal] loading WebGL addon');
+        const webgl = new WebglAddon();
+        term.loadAddon(webgl);
+        webglAddonRef.current = webgl;
+        console.log('[initTerminal] WebGL addon loaded');
+      } catch (e) {
+        console.warn('[Terminal] WebGL addon failed to load:', e);
+      }
+
+      xtermInstance.current = term;
+      console.log('[initTerminal] xtermInstance.current set');
+
+      // Fit after opening
+      setTimeout(() => {
+        console.log('[initTerminal] setTimeout callback, calling safeFit');
+        safeFit();
+        if (active) {
+          term.focus();
+        }
+      }, 100);
+
+      // IPC: Send input to PTY
+      term.onData((data) => {
+        ipcRenderer.send('terminal:input', tabId, data);
+      });
+    };
+
+    // Start async initialization
+    initTerminal();
 
     return () => {
-      console.log('[Terminal] Disposing terminal for tabId:', tabId);
       isMounted.current = false;
       resizeObserver.disconnect();
       ipcRenderer.removeListener('terminal:data', handleData);
       ipcRenderer.removeListener('terminal:exit', handleExit);
+
+      // Clear write buffer timeout
+      if (pendingWriteRef.current) {
+        clearTimeout(pendingWriteRef.current);
+        pendingWriteRef.current = null;
+      }
+      writeBufferRef.current = '';
 
       // Dispose WebGL addon BEFORE terminal to avoid errors
       try {
@@ -150,13 +222,14 @@ export default function Terminal({ tabId, cwd, active }: TerminalProps) {
         // Ignore WebGL dispose errors
       }
 
+      const termToDispose = xtermInstance.current;
       xtermInstance.current = null;
       fitAddonRef.current = null;
       serializeAddonRef.current = null;
       webglAddonRef.current = null;
 
       try {
-        term.dispose();
+        termToDispose?.dispose();
       } catch (e) {
         // Ignore dispose errors
       }

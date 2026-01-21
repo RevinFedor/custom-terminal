@@ -1,10 +1,13 @@
 const { app, BrowserWindow, ipcMain, Menu, dialog } = require('electron');
 const path = require('path');
 const pty = require('node-pty');
-const projectManager = require('./project-manager');
-const SessionManager = require('./session-manager');
 
-const isDev = process.env.NODE_ENV === 'development';
+// Load modules from src/main (works for both dev and production)
+const srcMainDir = path.join(__dirname, '..', '..', 'src', 'main');
+const projectManager = require(path.join(srcMainDir, 'project-manager'));
+const SessionManager = require(path.join(srcMainDir, 'session-manager'));
+
+const isDev = !app.isPackaged;
 
 let mainWindow;
 const terminals = new Map(); // tabId -> ptyProcess
@@ -31,13 +34,19 @@ function createWindow() {
 
   // Set dev icon in Dock if in development mode (macOS specific)
   if (isDev && process.platform === 'darwin') {
-    const devIconPath = path.join(__dirname, 'build-resources', 'icon-dev.png');
+    const devIconPath = path.join(__dirname, '..', '..', 'build-resources', 'icon-dev.png');
     if (require('fs').existsSync(devIconPath)) {
       app.dock.setIcon(devIconPath);
     }
   }
 
-  mainWindow.loadFile('index.html');
+  // Load from Vite dev server in dev mode, or from built files in production
+  if (process.env.ELECTRON_RENDERER_URL) {
+    mainWindow.loadURL(process.env.ELECTRON_RENDERER_URL);
+    mainWindow.webContents.openDevTools();
+  } else {
+    mainWindow.loadFile(path.join(__dirname, '..', 'renderer', 'index.html'));
+  }
 }
 
 // Context Menu IPC
@@ -100,7 +109,6 @@ app.on('activate', () => {
 
 // Create new terminal for a tab
 ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd }) => {
-    console.log('[main] terminal:create called with tabId:', tabId, 'cwd:', cwd);
     const shell = process.env.SHELL || '/bin/bash';
     const workingDir = cwd || process.env.HOME;
 
@@ -112,21 +120,17 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd }) => {
       env: process.env
     });
 
-    console.log('[main] PTY spawned, PID:', ptyProcess.pid);
 
     terminals.set(tabId, ptyProcess);
     terminalProjects.set(tabId, workingDir);
-    console.log('[main] Stored terminal with tabId:', tabId);
 
     ptyProcess.onData((data) => {
       if (mainWindow && !mainWindow.isDestroyed()) {
-        console.log('[main] PTY data received for tabId:', tabId, 'length:', data.length);
         mainWindow.webContents.send('terminal:data', { pid: ptyProcess.pid, tabId, data });
       }
     });
 
     ptyProcess.onExit((exitCode) => {
-      console.log('[main] PTY exited, tabId:', tabId, 'exitCode:', exitCode);
       if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.webContents.send('terminal:exit', tabId, exitCode);
       }
@@ -139,14 +143,11 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd }) => {
 
 // Send input to terminal
 ipcMain.on('terminal:input', (event, tabId, data) => {
-  console.log('[main] terminal:input received, tabId:', tabId, 'data:', data.substring(0, 20));
   const term = terminals.get(tabId);
   if (term) {
-    console.log('[main] Writing to PTY...');
     term.write(data);
   } else {
     console.error('[main] Terminal not found for tabId:', tabId);
-    console.log('[main] Available terminals:', Array.from(terminals.keys()));
   }
 });
 
@@ -187,14 +188,12 @@ ipcMain.handle('terminal:getCwd', async (event, tabId) => {
       }).trim();
 
       if (result) {
-        console.log('[main] Got cwd for', tabId, ':', result);
         return result;
       }
     } else if (process.platform === 'linux') {
       // Linux: read /proc/<pid>/cwd symlink
       const fs = require('fs');
       const cwd = fs.readlinkSync(`/proc/${pid}/cwd`);
-      console.log('[main] Got cwd for', tabId, ':', cwd);
       return cwd;
     }
   } catch (e) {
@@ -203,6 +202,60 @@ ipcMain.handle('terminal:getCwd', async (event, tabId) => {
 
   // Fallback to stored cwd
   return terminalProjects.get(tabId) || null;
+});
+
+// Get active process running in terminal (child of shell)
+ipcMain.handle('terminal:getActiveProcess', async (event, tabId) => {
+  const term = terminals.get(tabId);
+  console.log('[main] terminal:getActiveProcess called, tabId:', tabId);
+
+  if (!term) {
+    console.log('[main] ❌ Terminal not found for tabId:', tabId);
+    return null;
+  }
+
+  const shellPid = term.pid;
+  console.log('[main] Shell PID:', shellPid);
+
+  try {
+    const { execSync } = require('child_process');
+
+    if (process.platform === 'darwin' || process.platform === 'linux') {
+      // Find child processes of the shell
+      const childPidsRaw = execSync(`pgrep -P ${shellPid}`, {
+        encoding: 'utf-8',
+        timeout: 1000
+      }).trim();
+
+      console.log('[main] Child PIDs raw:', childPidsRaw);
+
+      const childPids = childPidsRaw.split('\n').filter(p => p);
+
+      if (childPids.length === 0) {
+        console.log('[main] No child processes - shell is idle');
+        return null;
+      }
+
+      // Get the first child process name
+      const firstChildPid = childPids[0];
+      const processName = execSync(`ps -o comm= -p ${firstChildPid}`, {
+        encoding: 'utf-8',
+        timeout: 1000
+      }).trim();
+
+      console.log('[main] Active process:', processName, '(PID:', firstChildPid + ')');
+      return processName;
+    }
+  } catch (e) {
+    // pgrep returns exit code 1 if no processes found - this is normal
+    if (e.status === 1) {
+      console.log('[main] No child processes - shell is idle');
+      return null;
+    }
+    console.error('[main] Error getting active process:', e.message);
+  }
+
+  return null;
 });
 
 // Notes management
@@ -271,28 +324,59 @@ ipcMain.handle('project:select-directory', async () => {
   return projectManager.getProject(selectedPath);
 });
 
-// Execute quick action command in terminal
+// Execute quick action command in terminal (fire-and-forget version)
+// For backwards compatibility - use terminal:executeCommandAsync for sequential commands
 ipcMain.on('terminal:executeCommand', (event, tabId, command) => {
-  console.log('[main] ===== EXECUTE COMMAND =====');
+  console.log('[main] ========== EXECUTE COMMAND ==========');
   console.log('[main] tabId:', tabId);
-  console.log('[main] command:', JSON.stringify(command));
-  console.log('[main] command length:', command.length);
+  console.log('[main] command:', command);
 
   const term = terminals.get(tabId);
   if (term) {
-    // Try sending command in parts
-    console.log('[main] Step 1: Writing command text...');
+    console.log('[main] ✅ Terminal found, PID:', term.pid);
     term.write(command);
-
-    console.log('[main] Step 2: Sending Enter (\\r)...');
-    term.write('\r');
-
-    console.log('[main] ✅ Command + Enter sent to PTY');
-    console.log('[main] PTY process PID:', term.pid);
+    setTimeout(() => {
+      term.write('\r');
+      console.log('[main] ✅ Enter (\\r) sent!');
+    }, 150);
   } else {
-    console.error('[main] ❌ Terminal not found for tabId:', tabId);
-    console.log('[main] Available terminals:', Array.from(terminals.keys()));
+    console.error('[main] ❌ Terminal NOT FOUND for tabId:', tabId);
   }
+});
+
+// Execute command and wait for Enter to be sent (async version)
+// Use this when you need to wait before sending next command
+ipcMain.handle('terminal:executeCommandAsync', async (event, tabId, command) => {
+  const startTime = Date.now();
+  console.log('[main] ========== EXECUTE COMMAND ASYNC ==========');
+  console.log('[main] tabId:', tabId);
+  console.log('[main] command:', command);
+  console.log('[main] timestamp:', startTime);
+
+  const term = terminals.get(tabId);
+  if (!term) {
+    console.error('[main] ❌ Terminal NOT FOUND for tabId:', tabId);
+    return { success: false };
+  }
+
+  console.log('[main] ✅ Terminal found, PID:', term.pid);
+
+  // Write command text
+  console.log('[main] 📝 Writing command text...');
+  term.write(command);
+  console.log('[main] 📝 Command text written at', Date.now() - startTime, 'ms');
+
+  // Wait 150ms then send Enter
+  await new Promise(resolve => setTimeout(resolve, 150));
+  console.log('[main] ⏰ 150ms passed, sending Enter...');
+  term.write('\r');
+  console.log('[main] ✅ Enter (\\r) sent at', Date.now() - startTime, 'ms');
+
+  // Wait a bit more for command to start processing
+  await new Promise(resolve => setTimeout(resolve, 100));
+  console.log('[main] ⏰ 100ms after Enter, returning at', Date.now() - startTime, 'ms');
+
+  return { success: true };
 });
 
 // Read file for preview
@@ -394,9 +478,11 @@ ipcMain.handle('session:list-gemini-checkpoints', async (event, { dirPath }) => 
 });
 
 // Export Gemini session
-ipcMain.handle('session:export-gemini', async (event, { dirPath, sessionKey }) => {
+ipcMain.handle('session:export-gemini', async (event, { dirPath, projectPath, sessionKey }) => {
   try {
-    const result = await sessionManager.exportGeminiSession(dirPath, sessionKey);
+    // dirPath = where Gemini saved checkpoint (tab cwd)
+    // projectPath = for DB organization (project root)
+    const result = await sessionManager.exportGeminiSession(dirPath, sessionKey, projectPath);
     return result;
   } catch (error) {
     console.error('[main] Error exporting Gemini session:', error);
@@ -404,21 +490,27 @@ ipcMain.handle('session:export-gemini', async (event, { dirPath, sessionKey }) =
   }
 });
 
-// Import Gemini session
-ipcMain.handle('session:import-gemini', async (event, { dirPath, sessionKey, tabId }) => {
+// Import Gemini session (Trojan Horse - Phase 1: prepare patch data)
+ipcMain.handle('session:import-gemini', async (event, { dirPath, sessionKey, tabId, sessionId }) => {
   try {
-    // Helper function to send commands to PTY
-    const sendCommand = (tid, cmd) => {
-      const term = terminals.get(tid);
-      if (term) {
-        term.write(cmd + '\r');
-      }
-    };
-
-    const result = await sessionManager.importGeminiSession(dirPath, sessionKey, sendCommand, tabId);
+    const sendCommand = null; // unused
+    // dirPath = target cwd (where to deploy)
+    // sessionId = for cross-project import
+    const result = await sessionManager.importGeminiSession(dirPath, sessionKey, sendCommand, tabId, sessionId);
     return result;
   } catch (error) {
     console.error('[main] Error importing Gemini session:', error);
+    return { success: false, message: error.message };
+  }
+});
+
+// Patch checkpoint file (Trojan Horse - Phase 2: overwrite after Gemini creates shell)
+ipcMain.handle('session:patch-checkpoint', async (event, { targetCwd, sessionKey, patchedContent }) => {
+  try {
+    const result = sessionManager.patchCheckpointFile(targetCwd, sessionKey, patchedContent);
+    return result;
+  } catch (error) {
+    console.error('[main] Error patching checkpoint:', error);
     return { success: false, message: error.message };
   }
 });
@@ -445,14 +537,32 @@ ipcMain.handle('session:import-claude', async (event, { dirPath, sessionKey }) =
   }
 });
 
-// List all sessions for a project
-ipcMain.handle('session:list', async (event, { dirPath, toolType }) => {
+// List sessions (all or for specific project)
+ipcMain.handle('session:list', async (event, { dirPath, toolType, global }) => {
   try {
-    const sessions = sessionManager.listSessions(dirPath, toolType);
+    let sessions;
+    if (global) {
+      // Get ALL sessions across all projects
+      sessions = projectManager.db.getAllAISessions(toolType);
+    } else {
+      // Get sessions for specific project
+      sessions = sessionManager.listSessions(dirPath, toolType);
+    }
     return { success: true, data: sessions };
   } catch (error) {
     console.error('[main] Error listing sessions:', error);
     return { success: false, error: error.message };
+  }
+});
+
+// Delete deployment (checkpoint file from specific location)
+ipcMain.handle('session:delete-deployment', async (event, { sessionId, sessionKey, deployedCwd }) => {
+  try {
+    const result = sessionManager.deleteDeployment(sessionId, sessionKey, deployedCwd);
+    return result;
+  } catch (error) {
+    console.error('[main] Error deleting deployment:', error);
+    return { success: false, message: error.message };
   }
 });
 
