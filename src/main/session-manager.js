@@ -2,7 +2,6 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
-const { execSync } = require('child_process');
 
 /**
  * SessionManager - Unified session persistence for Gemini CLI and Claude Code
@@ -276,20 +275,32 @@ class SessionManager {
   // ========== CLAUDE CODE ==========
 
   /**
+   * Calculate Claude project slug from path
+   * Example: /Users/fedor/Desktop/custom-terminal -> -Users-fedor-Desktop-custom-terminal
+   */
+  calculateClaudeSlug(dirPath) {
+    const normalizedPath = path.resolve(dirPath);
+    return normalizedPath.replace(/\//g, '-');
+  }
+
+  /**
    * Export Claude session (JSONL extraction)
-   * @param {string} projectPath - Current project path
-   * @param {string} sessionKey - Session UUID or identifier
+   * Uses explicit sessionId detected from terminal output (Output Sniffing)
+   *
+   * @param {string} projectPath - Current project path (tab cwd)
+   * @param {string} sessionId - Claude session UUID (detected from "Starting/Resuming session <UUID>")
+   * @param {string} customName - Optional custom name for the session
    * @returns {Promise<{success: boolean, message: string}>}
    */
-  async exportClaudeSession(projectPath, sessionKey) {
+  async exportClaudeSession(projectPath, sessionId, customName = null) {
     try {
       const normalizedPath = path.resolve(projectPath);
-
-      // Convert path to Claude's project slug format
-      // Example: /Users/fedor/Desktop/custom-terminal -> -Users-fedor-Desktop-custom-terminal
-      const projectSlug = normalizedPath.replace(/\//g, '-');
-
+      const projectSlug = this.calculateClaudeSlug(normalizedPath);
       const claudeProjectDir = path.join(os.homedir(), '.claude', 'projects', projectSlug);
+
+      console.log('[SessionManager] Exporting Claude session:', sessionId);
+      console.log('[SessionManager] Project path:', normalizedPath);
+      console.log('[SessionManager] Looking in:', claudeProjectDir);
 
       if (!fs.existsSync(claudeProjectDir)) {
         return {
@@ -298,11 +309,12 @@ class SessionManager {
         };
       }
 
-      // Find session JSONL file
-      const sessionFile = path.join(claudeProjectDir, `${sessionKey}.jsonl`);
+      // If no sessionId provided, fallback to most recent file (legacy behavior)
+      let targetSessionId = sessionId;
+      let sessionFile;
 
-      if (!fs.existsSync(sessionFile)) {
-        // Try to find any recent JSONL file
+      if (!targetSessionId) {
+        console.log('[SessionManager] No sessionId provided, falling back to most recent file');
         const files = fs.readdirSync(claudeProjectDir)
           .filter(f => f.endsWith('.jsonl'))
           .map(f => ({
@@ -315,34 +327,35 @@ class SessionManager {
         if (files.length === 0) {
           return {
             success: false,
-            message: 'No Claude session files found'
+            message: 'No Claude session files found. Start a Claude session first.'
           };
         }
 
-        // Use the most recent file
-        const recentFile = files[0];
-        const content = fs.readFileSync(recentFile.path, 'utf-8');
+        targetSessionId = path.basename(files[0].name, '.jsonl');
+        sessionFile = files[0].path;
+        console.log('[SessionManager] Auto-detected session:', targetSessionId);
+      } else {
+        sessionFile = path.join(claudeProjectDir, `${targetSessionId}.jsonl`);
+      }
 
-        // Extract UUID from filename (remove .jsonl extension)
-        const extractedKey = path.basename(recentFile.name, '.jsonl');
-
-        this.db.saveAISession(
-          normalizedPath,
-          'claude',
-          extractedKey,
-          content,
-          normalizedPath,
-          null // Claude doesn't use hash
-        );
+      if (!fs.existsSync(sessionFile)) {
+        // List available sessions for debugging
+        const available = fs.readdirSync(claudeProjectDir)
+          .filter(f => f.endsWith('.jsonl'))
+          .map(f => path.basename(f, '.jsonl'));
+        console.log('[SessionManager] Available sessions:', available);
 
         return {
-          success: true,
-          message: `Claude session exported (auto-detected: ${extractedKey})`
+          success: false,
+          message: `Session file not found: ${targetSessionId}.jsonl`
         };
       }
 
       // Read session content
       const sessionContent = fs.readFileSync(sessionFile, 'utf-8');
+
+      // Use custom name or UUID as session key
+      const sessionKey = customName || targetSessionId;
 
       // Save to database
       this.db.saveAISession(
@@ -351,14 +364,18 @@ class SessionManager {
         sessionKey,
         sessionContent,
         normalizedPath,
-        null
+        targetSessionId // Store original UUID for resume
       );
+
+      console.log('[SessionManager] ✅ Claude session exported:', sessionKey);
 
       return {
         success: true,
-        message: `Claude session "${sessionKey}" exported successfully`
+        message: `Claude session "${sessionKey}" exported successfully`,
+        sessionId: targetSessionId
       };
     } catch (error) {
+      console.error('[SessionManager] ❌ Export failed:', error);
       return {
         success: false,
         message: `Export failed: ${error.message}`
@@ -368,16 +385,30 @@ class SessionManager {
 
   /**
    * Import Claude session (JSONL injection)
-   * @param {string} projectPath - Current project path
-   * @param {string} sessionKey - Session UUID to restore
-   * @returns {Promise<{success: boolean, message: string, commands: string[]}>}
+   * Patches paths and prepares for explicit --resume <UUID>
+   *
+   * @param {string} targetCwd - Target directory where to restore (tab cwd)
+   * @param {string} sessionKey - Session key in database
+   * @param {number} sessionId - Optional session ID for cross-project import
+   * @returns {Promise<{success: boolean, message: string, resumeCommand: string}>}
    */
-  async importClaudeSession(projectPath, sessionKey) {
+  async importClaudeSession(targetCwd, sessionKey, sessionId = null) {
     try {
-      const normalizedPath = path.resolve(projectPath);
+      const normalizedTarget = path.resolve(targetCwd);
 
-      // Get session from database
-      const session = this.db.getAISession(normalizedPath, 'claude', sessionKey);
+      console.log('[SessionManager] Importing Claude session:', sessionKey);
+      console.log('[SessionManager] Target path:', normalizedTarget);
+
+      // Get session from database - try by ID first (cross-project), then by key
+      let session;
+      if (sessionId) {
+        session = this.db.getAISessionById(sessionId);
+      }
+      if (!session) {
+        // Fallback: search globally by session_key
+        const allSessions = this.db.getAllAISessions('claude');
+        session = allSessions.find(s => s.session_key === sessionKey);
+      }
 
       if (!session) {
         return {
@@ -386,21 +417,32 @@ class SessionManager {
         };
       }
 
-      // Convert path to Claude's project slug format
-      const projectSlug = normalizedPath.replace(/\//g, '-');
+      // Get the original UUID (stored in original_hash field for Claude)
+      // This is the actual UUID needed for --resume
+      const originalUUID = session.original_hash || session.session_key;
 
-      const claudeProjectDir = path.join(os.homedir(), '.claude', 'projects', projectSlug);
+      console.log('[SessionManager] Original UUID:', originalUUID);
+      console.log('[SessionManager] Original path:', session.original_cwd);
+
+      // Calculate new slug for target directory
+      const newSlug = this.calculateClaudeSlug(normalizedTarget);
+      const claudeProjectDir = path.join(os.homedir(), '.claude', 'projects', newSlug);
+
+      console.log('[SessionManager] Target Claude dir:', claudeProjectDir);
 
       // Create project directory if it doesn't exist
       if (!fs.existsSync(claudeProjectDir)) {
         fs.mkdirSync(claudeProjectDir, { recursive: true });
+        console.log('[SessionManager] Created Claude project directory');
       }
 
       // Patch JSONL content (replace old paths with new paths)
       let patchedContent = session.content_blob;
 
-      if (session.original_cwd !== normalizedPath) {
-        // Parse JSONL line by line
+      if (session.original_cwd !== normalizedTarget) {
+        console.log('[SessionManager] Patching paths:', session.original_cwd, '->', normalizedTarget);
+
+        // Parse JSONL line by line for precise patching
         const lines = patchedContent.split('\n').filter(l => l.trim());
         const patchedLines = lines.map(line => {
           try {
@@ -408,53 +450,67 @@ class SessionManager {
 
             // Replace paths in common fields
             if (obj.cwd) {
-              obj.cwd = obj.cwd.replace(session.original_cwd, normalizedPath);
+              obj.cwd = obj.cwd.replace(session.original_cwd, normalizedTarget);
             }
             if (obj.project) {
-              obj.project = obj.project.replace(session.original_cwd, normalizedPath);
+              obj.project = obj.project.replace(session.original_cwd, normalizedTarget);
             }
 
-            // Handle tool results with file paths
+            // Handle tool results with file paths (global replace)
             if (obj.type === 'tool_result' && obj.result) {
               obj.result = obj.result.replace(
-                new RegExp(session.original_cwd.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'),
-                normalizedPath
+                new RegExp(this.escapeRegExp(session.original_cwd), 'g'),
+                normalizedTarget
               );
             }
 
             return JSON.stringify(obj);
           } catch (e) {
-            // If line is not valid JSON, return as-is
-            return line;
+            // If line is not valid JSON, do simple string replace
+            return line.replace(
+              new RegExp(this.escapeRegExp(session.original_cwd), 'g'),
+              normalizedTarget
+            );
           }
         });
 
         patchedContent = patchedLines.join('\n');
       }
 
-      // Write patched session file
-      const targetFile = path.join(claudeProjectDir, `${sessionKey}.jsonl`);
+      // Write patched session file with original UUID
+      const targetFile = path.join(claudeProjectDir, `${originalUUID}.jsonl`);
       fs.writeFileSync(targetFile, patchedContent, 'utf-8');
+      console.log('[SessionManager] ✅ Wrote session file:', targetFile);
 
-      // Create empty session-env folder (as observed in research)
-      const sessionEnvDir = path.join(os.homedir(), '.claude', 'session-env', sessionKey);
-      if (!fs.existsSync(sessionEnvDir)) {
-        fs.mkdirSync(sessionEnvDir, { recursive: true });
+      // Record this deployment (if different from original)
+      if (session.original_cwd !== normalizedTarget) {
+        this.db.addSessionDeployment(session.id, normalizedTarget, newSlug);
+        console.log('[SessionManager] Added deployment record');
       }
+
+      // Return explicit resume command
+      const resumeCommand = `claude --resume ${originalUUID}`;
 
       return {
         success: true,
-        message: `Session "${sessionKey}" restored. Run "claude --resume ${sessionKey}"`,
-        commands: [
-          `claude --resume ${sessionKey}`
-        ]
+        message: `Session "${sessionKey}" restored`,
+        resumeCommand: resumeCommand,
+        sessionUUID: originalUUID
       };
     } catch (error) {
+      console.error('[SessionManager] ❌ Import failed:', error);
       return {
         success: false,
         message: `Import failed: ${error.message}`
       };
     }
+  }
+
+  /**
+   * Escape special regex characters in string
+   */
+  escapeRegExp(string) {
+    return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   }
 
   // ========== UTILITIES ==========

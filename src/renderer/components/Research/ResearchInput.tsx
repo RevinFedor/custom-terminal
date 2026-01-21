@@ -9,8 +9,8 @@ interface ResearchInputProps {
 
 export default function ResearchInput({ projectId, inputRef }: ResearchInputProps) {
   const [value, setValue] = useState('');
-  const { addMessage, createConversation, getActiveConversation, isLoading, setLoading } = useResearchStore();
-  const { selectedModel, showToast } = useUIStore();
+  const { addMessage, createConversation, getActiveConversation, isLoading, setLoading, setAbortController, cancelRequest } = useResearchStore();
+  const { selectedModel, thinkingLevel, showToast } = useUIStore();
 
   const handleSubmit = useCallback(async () => {
     const trimmed = value.trim();
@@ -18,42 +18,68 @@ export default function ResearchInput({ projectId, inputRef }: ResearchInputProp
 
     console.log('[ResearchInput] Sending message...');
     console.log('[ResearchInput] Model:', selectedModel);
-    console.log('[ResearchInput] Message:', trimmed.slice(0, 50));
+    console.log('[ResearchInput] Thinking:', thinkingLevel);
 
     // Check if there's an active conversation
     const activeConv = getActiveConversation(projectId);
 
     if (activeConv) {
-      // Add to existing conversation
       addMessage(projectId, 'user', trimmed);
     } else {
-      // Create new conversation
       createConversation(projectId, trimmed);
     }
 
     setValue('');
     setLoading(true);
 
-    // Get API key
-    const apiKey = process.env.GEMINI_API_KEY || 'REDACTED_GEMINI_KEY';
+    // Create AbortController
+    const controller = new AbortController();
+    setAbortController(controller);
 
     try {
+      const apiKey = process.env.GEMINI_API_KEY || 'REDACTED_GEMINI_KEY';
+
+      // Build conversation history
+      const currentConv = getActiveConversation(projectId);
+      const contents = currentConv
+        ? currentConv.messages.map(msg => ({
+            role: msg.role === 'assistant' ? 'model' : 'user',
+            parts: [{ text: msg.content }]
+          }))
+        : [{ role: 'user', parts: [{ text: trimmed }] }];
+
+      console.log('[ResearchInput] Sending', contents.length, 'messages');
+
+      // Build request body with thinking config
+      const requestBody: any = {
+        contents,
+        systemInstruction: {
+          parts: [{ text: 'Отвечай максимально кратко и по делу.' }]
+        }
+      };
+
+      // Add thinking config for gemini-3
+      if (selectedModel.includes('gemini-3') && thinkingLevel !== 'NONE') {
+        requestBody.generationConfig = {
+          thinkingConfig: {
+            thinkingLevel: thinkingLevel
+          }
+        };
+      }
+
       const response = await fetch(
         `https://generativelanguage.googleapis.com/v1beta/models/${selectedModel}:generateContent?key=${apiKey}`,
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            contents: [{ parts: [{ text: trimmed }] }]
-          })
+          body: JSON.stringify(requestBody),
+          signal: controller.signal
         }
       );
 
-      console.log('[ResearchInput] Response status:', response.status);
       const data = await response.json();
 
       if (data.error) {
-        console.error('[ResearchInput] API Error:', data.error);
         throw new Error(data.error.message || 'API Error');
       }
 
@@ -65,27 +91,29 @@ export default function ResearchInput({ projectId, inputRef }: ResearchInputProp
       console.log('[ResearchInput] Response length:', responseText.length);
       addMessage(projectId, 'assistant', responseText);
     } catch (err: any) {
-      console.error('[ResearchInput] ERROR:', err.message);
-      showToast(err.message, 'error');
-      addMessage(projectId, 'assistant', `Ошибка: ${err.message}`);
+      if (err.name === 'AbortError') {
+        console.log('[ResearchInput] Request cancelled');
+        showToast('Запрос отменён', 'info');
+      } else {
+        console.error('[ResearchInput] ERROR:', err.message);
+        showToast(err.message, 'error');
+        addMessage(projectId, 'assistant', `Ошибка: ${err.message}`);
+      }
     } finally {
+      setAbortController(null);
       setLoading(false);
     }
-  }, [value, projectId, addMessage, createConversation, getActiveConversation, isLoading, setLoading, selectedModel, showToast]);
+  }, [value, projectId, addMessage, createConversation, getActiveConversation, isLoading, setLoading, setAbortController, selectedModel, thinkingLevel, showToast]);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
-    // Submit on Enter (without Shift)
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       handleSubmit();
     }
   };
 
-  // Auto-resize textarea
   const handleChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     setValue(e.target.value);
-
-    // Reset height to auto to get proper scrollHeight
     const textarea = e.target;
     textarea.style.height = 'auto';
     textarea.style.height = `${Math.min(textarea.scrollHeight, 200)}px`;
@@ -100,36 +128,35 @@ export default function ResearchInput({ projectId, inputRef }: ResearchInputProp
             value={value}
             onChange={handleChange}
             onKeyDown={handleKeyDown}
-            placeholder="Ask anything... (Enter to send, Shift+Enter for new line)"
+            placeholder="Введите запрос..."
             disabled={isLoading}
             rows={1}
-            className="w-full bg-[#333] border border-white/10 rounded-lg px-4 py-3 text-sm text-gray-200 placeholder-gray-500 resize-none focus:outline-none focus:border-white/20 disabled:opacity-50 disabled:cursor-not-allowed"
+            className="w-full bg-[#2a2a2a] border border-[#444] rounded-lg px-4 py-3 text-sm text-gray-200 placeholder-gray-600 resize-none focus:outline-none focus:border-[#555] disabled:opacity-50 disabled:cursor-not-allowed"
             style={{ minHeight: '44px', maxHeight: '200px' }}
           />
         </div>
 
-        <button
-          onClick={handleSubmit}
-          disabled={!value.trim() || isLoading}
-          className="h-11 px-4 bg-blue-600 hover:bg-blue-500 disabled:bg-gray-600 disabled:cursor-not-allowed rounded-lg text-sm font-medium text-white transition flex items-center gap-2 shrink-0"
-        >
-          {isLoading ? (
-            <svg className="w-4 h-4 animate-spin" viewBox="0 0 24 24" fill="none">
-              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+        {isLoading ? (
+          <button
+            onClick={cancelRequest}
+            className="h-11 px-4 bg-red-600 hover:bg-red-500 cursor-pointer rounded-lg text-sm font-medium text-white transition flex items-center gap-2 shrink-0"
+          >
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+              <rect x="3" y="3" width="10" height="10" rx="1" fill="currentColor" />
             </svg>
-          ) : (
+            Отмена
+          </button>
+        ) : (
+          <button
+            onClick={handleSubmit}
+            disabled={!value.trim()}
+            className="h-11 px-4 bg-blue-600 hover:bg-blue-500 disabled:bg-gray-600 cursor-pointer disabled:cursor-not-allowed rounded-lg text-sm font-medium text-white transition flex items-center gap-2 shrink-0"
+          >
             <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
               <path d="M14 2L7 9M14 2L9.5 14L7 9M14 2L2 6.5L7 9" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
             </svg>
-          )}
-          Send
-        </button>
-      </div>
-
-      <div className="mt-2 flex items-center justify-between text-xs text-gray-500">
-        <span>Model: {selectedModel}</span>
-        <span className="opacity-50">Cmd+Shift+R to toggle</span>
+          </button>
+        )}
       </div>
     </div>
   );

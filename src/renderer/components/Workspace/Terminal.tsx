@@ -1,14 +1,94 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState, memo } from 'react';
 import { Terminal as XTerminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebglAddon } from '@xterm/addon-webgl';
 import { WebLinksAddon } from '@xterm/addon-web-links';
 import { SerializeAddon } from '@xterm/addon-serialize';
 import { useUIStore } from '../../store/useUIStore';
+import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { terminalRegistry } from '../../utils/terminalRegistry';
+
+// Get buffer management functions outside of component to avoid re-renders
+const getBufferActions = () => ({
+  save: useWorkspaceStore.getState().saveTerminalBuffer,
+  get: useWorkspaceStore.getState().getTerminalBuffer,
+  clear: useWorkspaceStore.getState().clearTerminalBuffer
+});
 
 // Get setTerminalSelection outside of component to avoid re-renders
 const getSetTerminalSelection = () => useUIStore.getState().setTerminalSelection;
+
+// Get Claude session setter/getter outside of component
+const getSetClaudeSessionId = () => useWorkspaceStore.getState().setClaudeSessionId;
+const getClaudeSessionId = (tabId: string) => useWorkspaceStore.getState().getClaudeSessionId(tabId);
+
+// Get pending command for a tab (used for fork)
+const getTabPendingCommand = (tabId: string): string | undefined => {
+  const state = useWorkspaceStore.getState();
+  for (const [, workspace] of state.openProjects) {
+    const tab = workspace.tabs.get(tabId);
+    if (tab) return tab.pendingCommand;
+  }
+  return undefined;
+};
+
+// Clear pending command after execution
+const clearTabPendingCommand = (tabId: string) => {
+  const state = useWorkspaceStore.getState();
+  for (const [projectId, workspace] of state.openProjects) {
+    const tab = workspace.tabs.get(tabId);
+    if (tab && tab.pendingCommand) {
+      tab.pendingCommand = undefined;
+      state.openProjects.set(projectId, { ...workspace });
+      useWorkspaceStore.setState({ openProjects: new Map(state.openProjects) });
+      return;
+    }
+  }
+};
+
+// Regex to detect Claude session ID from terminal output
+// Claude uses TWO formats:
+// 1. Short: "agent-xxxxxxxx"
+// 2. Full UUID: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+// Matches: "Starting session <id>" or "Resuming session <id>"
+const CLAUDE_SESSION_REGEX = /(Starting|Resuming) session ([0-9a-f-]{8,36})/i;
+
+// Helper: Get current command from xterm buffer (handles wrapped lines)
+// When a long command wraps to multiple visual lines, we need to walk up
+// and concatenate all wrapped line segments
+// NOTE: When Enter is pressed, cursor already moved to next line, so we start from cursorY - 1
+function getCurrentCommand(term: XTerminal): string {
+  const buffer = term.buffer.active;
+  let cursorY = buffer.cursorY;
+
+  // When Enter is pressed, cursor is already on the NEW line (empty)
+  // We need to look at the previous line where the command was typed
+  if (cursorY > 0) {
+    const currentLine = buffer.getLine(cursorY);
+    if (currentLine && currentLine.translateToString(true).trim() === '') {
+      cursorY--; // Go back to the command line
+    }
+  }
+
+  let currentLineObj = buffer.getLine(cursorY);
+  if (!currentLineObj) return '';
+
+  // Collect line segments (walk up while lines are wrapped)
+  let logicalLine = currentLineObj.translateToString(true);
+
+  // While current line is marked as wrapped, the command starts above
+  while (currentLineObj.isWrapped && cursorY > 0) {
+    cursorY--;
+    currentLineObj = buffer.getLine(cursorY);
+    if (currentLineObj) {
+      // Prepend the upper part of the command
+      logicalLine = currentLineObj.translateToString(true) + logicalLine;
+    }
+  }
+
+  console.log('[getCurrentCommand] Result:', JSON.stringify(logicalLine));
+  return logicalLine;
+}
 
 const { ipcRenderer } = window.require('electron');
 
@@ -20,9 +100,10 @@ interface TerminalProps {
   tabId: string;
   cwd: string;
   active: boolean;
+  isActiveProject?: boolean; // For lazy init optimization
 }
 
-export default function Terminal({ tabId, cwd, active }: TerminalProps) {
+function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps) {
   const terminalRef = useRef<HTMLDivElement>(null);
   const xtermInstance = useRef<XTerminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
@@ -31,7 +112,10 @@ export default function Terminal({ tabId, cwd, active }: TerminalProps) {
   const isInitialized = useRef(false);
   const isMounted = useRef(true);
   const isReadyRef = useRef(false); // Track if first fit completed
+  const hasBeenActive = useRef(false); // Track if tab was ever active (for lazy init)
+  const pendingBuffer = useRef<string>(''); // Buffer PTY data before xterm init
   const [isVisible, setIsVisible] = useState(false); // Hide until ready
+  const claudeSessionDetected = useRef<string | null>(null); // Track detected Claude session UUID
 
   const terminalFontSize = useUIStore((state) => state.terminalFontSize);
 
@@ -50,6 +134,7 @@ export default function Terminal({ tabId, cwd, active }: TerminalProps) {
       if (!term.options || term.cols === 0 || term.rows === 0) return;
 
       fit.fit();
+
       const dims = fit.proposeDimensions();
       if (dims) {
         ipcRenderer.send('terminal:resize', tabId, dims.cols, dims.rows);
@@ -67,7 +152,34 @@ export default function Terminal({ tabId, cwd, active }: TerminalProps) {
 
     // IPC: Receive data from PTY (with write buffer to prevent jitter)
     const handleData = (_: any, payload: { tabId: string; data: string }) => {
-      if (payload.tabId !== tabId || !xtermInstance.current) return;
+      if (payload.tabId !== tabId) return;
+
+      // Claude Session Detection (Output Sniffing)
+      // Look for "Starting session <UUID>" or "Resuming session <UUID>"
+      // Always update - user may restart Claude with new session
+      const match = payload.data.match(CLAUDE_SESSION_REGEX);
+      if (match) {
+        const sessionId = match[2];
+        console.log('[Terminal] Claude session detected:', sessionId);
+        if (claudeSessionDetected.current !== sessionId) {
+          claudeSessionDetected.current = sessionId;
+          getSetClaudeSessionId()(tabId, sessionId);
+        }
+      }
+      // Debug: log if data contains "session" to see what format Claude uses
+      if (payload.data.toLowerCase().includes('session') && payload.data.length < 500) {
+        console.log('[Terminal] Data contains "session":', JSON.stringify(payload.data.substring(0, 200)));
+      }
+
+      // If xterm not yet created, buffer data for later replay
+      if (!xtermInstance.current) {
+        pendingBuffer.current += payload.data;
+        // Limit buffer size to prevent memory issues
+        if (pendingBuffer.current.length > 100000) {
+          pendingBuffer.current = pendingBuffer.current.slice(-50000);
+        }
+        return;
+      }
 
       // Accumulate data in buffer
       writeBufferRef.current += payload.data;
@@ -102,9 +214,17 @@ export default function Terminal({ tabId, cwd, active }: TerminalProps) {
       }
     };
 
+    // Sniper Watcher: receive session ID when Claude creates it
+    const handleSessionDetected = (_: any, data: { tabId: string; sessionId: string }) => {
+      if (data.tabId !== tabId) return;
+      console.log('[Terminal] Sniper caught session:', data.sessionId);
+      getSetClaudeSessionId()(tabId, data.sessionId);
+    };
+
     // Register IPC listeners synchronously
     ipcRenderer.on('terminal:data', handleData);
     ipcRenderer.on('terminal:exit', handleExit);
+    ipcRenderer.on('claude:session-detected', handleSessionDetected);
 
     // Resize observer with Guard Clause (prevents WebGL accordion effect)
     const resizeObserver = new ResizeObserver((entries) => {
@@ -125,11 +245,8 @@ export default function Terminal({ tabId, cwd, active }: TerminalProps) {
 
     // Async terminal initialization (waits for fonts)
     const initTerminal = async () => {
-      console.time(`[PERF] Terminal init ${tabId}`);
-      console.time(`[PERF] Terminal fonts ${tabId}`);
       // Wait for fonts to load before creating terminal (prevents metric issues)
       await document.fonts.ready;
-      console.timeEnd(`[PERF] Terminal fonts ${tabId}`);
 
       // Double-check our specific font is loaded
       const fontFamily = "'JetBrains Mono', 'JetBrainsMono NF'";
@@ -146,7 +263,6 @@ export default function Terminal({ tabId, cwd, active }: TerminalProps) {
       // Get current fontSize from store
       const currentFontSize = useUIStore.getState().terminalFontSize;
 
-      console.time(`[PERF] Terminal xterm create ${tabId}`);
       const term = new XTerminal({
         theme: {
           background: '#1a1a1a',
@@ -187,24 +303,26 @@ export default function Terminal({ tabId, cwd, active }: TerminalProps) {
       term.loadAddon(fitAddon);
       term.loadAddon(serializeAddon);
       term.loadAddon(new WebLinksAddon());
-      console.timeEnd(`[PERF] Terminal xterm create ${tabId}`);
 
-      console.time(`[PERF] Terminal open+webgl ${tabId}`);
       term.open(containerRef);
-
-      try {
-        const webgl = new WebglAddon();
-        term.loadAddon(webgl);
-        webglAddonRef.current = webgl;
-      } catch (e) {
-        // WebGL not available, fallback to canvas renderer
-      }
-      console.timeEnd(`[PERF] Terminal open+webgl ${tabId}`);
 
       xtermInstance.current = term;
 
       // Register terminal in global registry for selection access
       terminalRegistry.register(tabId, term);
+
+      // Restore previously serialized buffer (from before unmount)
+      const savedBuffer = getBufferActions().get(tabId);
+      if (savedBuffer) {
+        term.write(savedBuffer);
+        getBufferActions().clear(tabId); // Clear after restoration
+      }
+
+      // Replay buffered PTY data that arrived before xterm was ready
+      if (pendingBuffer.current) {
+        term.write(pendingBuffer.current);
+        pendingBuffer.current = '';
+      }
 
       // Fit after opening, then reveal terminal
       setTimeout(() => {
@@ -214,7 +332,17 @@ export default function Terminal({ tabId, cwd, active }: TerminalProps) {
         if (active) {
           term.focus();
         }
-        console.timeEnd(`[PERF] Terminal init ${tabId}`);
+
+        // Execute pending command if any (used for fork)
+        const pendingCommand = getTabPendingCommand(tabId);
+        if (pendingCommand) {
+          console.log('[Terminal] Executing pending command:', pendingCommand);
+          // Small delay to ensure PTY is fully ready
+          setTimeout(() => {
+            ipcRenderer.send('terminal:input', tabId, pendingCommand + '\r');
+            clearTabPendingCommand(tabId);
+          }, 200);
+        }
       }, 100);
 
       // IPC: Send input to PTY
@@ -229,16 +357,123 @@ export default function Terminal({ tabId, cwd, active }: TerminalProps) {
           getSetTerminalSelection()(selection);
         }
       });
+
+      // === INPUT INTERCEPTION for Claude Commands ===
+      // Intercept Enter key to replace claude/claude-c/claude-f with explicit --resume
+      // Commands: claude (new), claude-c (continue), claude-f (fork)
+      term.attachCustomKeyEventHandler((event) => {
+        // Only intercept Enter key on keydown
+        if (event.key !== 'Enter' || event.type !== 'keydown') {
+          return true; // Allow default handling
+        }
+
+        // Get full command (handles wrapped lines)
+        const fullLine = getCurrentCommand(term).trim();
+        console.log('[Claude Intercept] Full line:', JSON.stringify(fullLine));
+
+        // --- CASE 1: claude (new session) - must end with exactly "claude" ---
+        if (fullLine.endsWith(' claude') || fullLine === 'claude') {
+          event.preventDefault();
+          // Clear line, start watcher, then launch claude
+          ipcRenderer.send('terminal:input', tabId, '\x15');
+          console.log('[Claude Intercept] Spawning with Sniper Watcher');
+          // Main process will: 1) start fs.watch 2) write 'claude\r' to PTY
+          ipcRenderer.send('claude:spawn-with-watcher', { tabId, cwd });
+          return false;
+        }
+
+        // --- CASE 2: claude-c (continue session) ---
+        if (fullLine.endsWith(' claude-c') || fullLine === 'claude-c') {
+          const existingSessionId = getClaudeSessionId(tabId);
+          if (existingSessionId) {
+            event.preventDefault();
+            console.log('[Claude Intercept] Continue session:', existingSessionId);
+            ipcRenderer.send('terminal:input', tabId, '\x15claude --resume ' + existingSessionId + '\r');
+
+            // Double Tap: auto-confirm session picker after 1 second
+            setTimeout(() => {
+              console.log('[Claude Intercept] Auto-confirming session picker...');
+              ipcRenderer.send('terminal:input', tabId, '\r');
+            }, 1000);
+            return false;
+          } else {
+            event.preventDefault();
+            console.log('[Claude Intercept] No session to continue, showing error');
+            ipcRenderer.send('terminal:input', tabId, '\x15echo "❌ No Claude session saved for this tab"\r');
+            return false;
+          }
+        }
+
+        // --- CASE 3: claude-f <ID> (fork session by ID) ---
+        // Creates a COPY of the session file with new ID
+        console.log('[Claude Intercept] Checking for claude-f pattern in:', fullLine);
+        const forkWithIdMatch = fullLine.match(/claude-f\s+([a-f0-9-]{8,})$/i);
+        console.log('[Claude Intercept] Fork match result:', forkWithIdMatch);
+        if (forkWithIdMatch) {
+          event.preventDefault();
+          const sourceSessionId = forkWithIdMatch[1];
+          console.log('[Claude Intercept] Fork from session:', sourceSessionId);
+          ipcRenderer.send('terminal:input', tabId, '\x15');
+
+          // Ask main process to copy the file and return new ID
+          (async () => {
+            const result = await ipcRenderer.invoke('claude:fork-session-file', { sourceSessionId, cwd });
+            if (result.success) {
+              console.log('[Claude Intercept] Forked to new session:', result.newSessionId);
+              getSetClaudeSessionId()(tabId, result.newSessionId);
+              ipcRenderer.send('terminal:input', tabId, 'claude --resume ' + result.newSessionId + '\r');
+
+              // Double Tap: auto-confirm session picker after 1 second
+              setTimeout(() => {
+                console.log('[Claude Intercept] Auto-confirming session picker...');
+                ipcRenderer.send('terminal:input', tabId, '\r');
+              }, 1000);
+            } else {
+              console.error('[Claude Intercept] Fork failed:', result.error);
+              ipcRenderer.send('terminal:input', tabId, 'echo "❌ Fork failed: ' + result.error + '"\r');
+            }
+          })();
+          return false;
+        }
+
+        // claude-f without ID - show error
+        if (fullLine.endsWith(' claude-f') || fullLine === 'claude-f') {
+          event.preventDefault();
+          ipcRenderer.send('terminal:input', tabId, '\x15echo "❌ Укажите ID: claude-f <agent-xxx>"\r');
+          return false;
+        }
+
+        return true; // Allow default handling for other commands
+      });
     };
 
-    // Start async initialization
-    initTerminal();
+    // Lazy init: only create xterm when tab is active AND project is active
+    // This prevents creating xterm for background projects during restore
+    if (active && isActiveProject) {
+      hasBeenActive.current = true;
+      initTerminal();
+    }
 
     return () => {
       isMounted.current = false;
       resizeObserver.disconnect();
       ipcRenderer.removeListener('terminal:data', handleData);
       ipcRenderer.removeListener('terminal:exit', handleExit);
+      ipcRenderer.removeListener('claude:session-detected', handleSessionDetected);
+
+      // Serialize terminal buffer before unmount (for restoration after remount)
+      const term = xtermInstance.current;
+      const serializeAddon = serializeAddonRef.current;
+      if (term && serializeAddon) {
+        try {
+          const serialized = serializeAddon.serialize();
+          if (serialized) {
+            getBufferActions().save(tabId, serialized);
+          }
+        } catch (e) {
+          // Ignore serialization errors
+        }
+      }
 
       // Unregister from global registry
       terminalRegistry.unregister(tabId);
@@ -272,10 +507,185 @@ export default function Terminal({ tabId, cwd, active }: TerminalProps) {
   }, [tabId]);
 
   // Focus and fit when becoming active (with rAF to let browser paint first)
+  // Also handles lazy initialization on first activation
   useEffect(() => {
-    if (!active) {
+    if (!active || !isActiveProject) {
       // Clear global selection when terminal becomes inactive
-      getSetTerminalSelection()('');
+      if (!active) {
+        getSetTerminalSelection()('');
+      }
+      return;
+    }
+
+    // Lazy init: if this is first activation and xterm not created yet
+    if (!hasBeenActive.current && !xtermInstance.current && terminalRef.current) {
+      hasBeenActive.current = true;
+
+      // Need to initialize terminal now (reuse same logic as initTerminal)
+      const initLazy = async () => {
+        await document.fonts.ready;
+
+        if (!isMounted.current || !terminalRef.current) return;
+
+        const currentFontSize = useUIStore.getState().terminalFontSize;
+        const term = new XTerminal({
+          theme: {
+            background: '#1a1a1a',
+            foreground: '#d4d4d4',
+            cursor: '#ffffff',
+            cursorAccent: '#1a1a1a',
+            selectionBackground: '#264f78',
+            black: '#000000',
+            red: '#cd3131',
+            green: '#0dbc79',
+            yellow: '#e5e510',
+            blue: '#2472c8',
+            magenta: '#bc3fbc',
+            cyan: '#11a8cd',
+            white: '#e5e5e5'
+          },
+          fontFamily: "'JetBrains Mono', 'JetBrainsMono NF', Menlo, Monaco, monospace",
+          fontSize: currentFontSize,
+          cursorBlink: true,
+          cursorStyle: 'block',
+          allowTransparency: false,
+          scrollback: 10000
+        });
+
+        const fitAddon = new FitAddon();
+        const serializeAddon = new SerializeAddon();
+        fitAddonRef.current = fitAddon;
+        serializeAddonRef.current = serializeAddon;
+
+        term.loadAddon(fitAddon);
+        term.loadAddon(serializeAddon);
+        term.loadAddon(new WebLinksAddon());
+
+        term.open(terminalRef.current);
+
+        xtermInstance.current = term;
+        terminalRegistry.register(tabId, term);
+
+        // Restore previously serialized buffer (from before unmount)
+        const savedBuffer = getBufferActions().get(tabId);
+        if (savedBuffer) {
+          term.write(savedBuffer);
+          getBufferActions().clear(tabId); // Clear after restoration
+        }
+
+        // Replay buffered PTY data
+        if (pendingBuffer.current) {
+          term.write(pendingBuffer.current);
+          pendingBuffer.current = '';
+        }
+
+        // Setup handlers
+        term.onData((data) => {
+          ipcRenderer.send('terminal:input', tabId, data);
+        });
+        term.onSelectionChange(() => {
+          const selection = term.getSelection() || '';
+          getSetTerminalSelection()(selection);
+        });
+
+        // === INPUT INTERCEPTION for Claude Commands (same as initTerminal) ===
+        term.attachCustomKeyEventHandler((event) => {
+          if (event.key !== 'Enter' || event.type !== 'keydown') {
+            return true;
+          }
+
+          // Get full command (handles wrapped lines)
+          const fullLine = getCurrentCommand(term).trim();
+          console.log('[Claude Intercept] Full line:', JSON.stringify(fullLine));
+
+          if (fullLine.endsWith(' claude') || fullLine === 'claude') {
+            event.preventDefault();
+            ipcRenderer.send('terminal:input', tabId, '\x15');
+            console.log('[Claude Intercept] Spawning with Sniper Watcher');
+            ipcRenderer.send('claude:spawn-with-watcher', { tabId, cwd });
+            return false;
+          }
+
+          if (fullLine.endsWith(' claude-c') || fullLine === 'claude-c') {
+            const existingSessionId = getClaudeSessionId(tabId);
+            if (existingSessionId) {
+              event.preventDefault();
+              console.log('[Claude Intercept] Continue session:', existingSessionId);
+              ipcRenderer.send('terminal:input', tabId, '\x15claude --resume ' + existingSessionId + '\r');
+
+              // Double Tap: auto-confirm session picker after 1 second
+              setTimeout(() => {
+                console.log('[Claude Intercept] Auto-confirming session picker...');
+                ipcRenderer.send('terminal:input', tabId, '\r');
+              }, 1000);
+              return false;
+            } else {
+              event.preventDefault();
+              console.log('[Claude Intercept] No session to continue');
+              ipcRenderer.send('terminal:input', tabId, '\x15echo "❌ No Claude session saved for this tab"\r');
+              return false;
+            }
+          }
+
+          // --- CASE 3: claude-f <ID> (fork session by ID) ---
+          console.log('[Claude Intercept] Checking for claude-f pattern in:', fullLine);
+          const forkWithIdMatch = fullLine.match(/claude-f\s+([a-f0-9-]{8,})$/i);
+          console.log('[Claude Intercept] Fork match result:', forkWithIdMatch);
+          if (forkWithIdMatch) {
+            event.preventDefault();
+            const sourceSessionId = forkWithIdMatch[1];
+            console.log('[Claude Intercept] Fork from session:', sourceSessionId);
+            ipcRenderer.send('terminal:input', tabId, '\x15');
+
+            (async () => {
+              const result = await ipcRenderer.invoke('claude:fork-session-file', { sourceSessionId, cwd });
+              if (result.success) {
+                console.log('[Claude Intercept] Forked to new session:', result.newSessionId);
+                getSetClaudeSessionId()(tabId, result.newSessionId);
+                ipcRenderer.send('terminal:input', tabId, 'claude --resume ' + result.newSessionId + '\r');
+
+                // Double Tap: auto-confirm session picker after 1 second
+                setTimeout(() => {
+                  console.log('[Claude Intercept] Auto-confirming session picker...');
+                  ipcRenderer.send('terminal:input', tabId, '\r');
+                }, 1000);
+              } else {
+                console.error('[Claude Intercept] Fork failed:', result.error);
+                ipcRenderer.send('terminal:input', tabId, 'echo "❌ Fork failed: ' + result.error + '"\r');
+              }
+            })();
+            return false;
+          }
+
+          // claude-f without ID - show error
+          if (fullLine.endsWith(' claude-f') || fullLine === 'claude-f') {
+            event.preventDefault();
+            ipcRenderer.send('terminal:input', tabId, '\x15echo "❌ Укажите ID: claude-f <agent-xxx>"\r');
+            return false;
+          }
+
+          return true;
+        });
+
+        setTimeout(() => {
+          safeFit();
+          isReadyRef.current = true;
+          setIsVisible(true);
+          term.focus();
+
+          // Execute pending command if any (used for fork)
+          const pendingCommand = getTabPendingCommand(tabId);
+          if (pendingCommand) {
+            console.log('[Terminal] Executing pending command:', pendingCommand);
+            setTimeout(() => {
+              ipcRenderer.send('terminal:input', tabId, pendingCommand + '\r');
+              clearTabPendingCommand(tabId);
+            }, 200);
+          }
+        }, 100);
+      };
+
+      initLazy();
       return;
     }
 
@@ -285,15 +695,28 @@ export default function Terminal({ tabId, cwd, active }: TerminalProps) {
 
     // Give browser 1 frame to recalculate CSS before calling fit
     const frameId = requestAnimationFrame(() => {
+      const term = xtermInstance.current;
+      if (!term) return;
+
+      // Save scroll position before fit/focus
+      const scrollY = term.buffer.active.viewportY;
+
       safeFit();
-      xtermInstance.current?.focus();
+      term.focus();
+
+      // Restore scroll position after focus (which auto-scrolls to cursor)
+      if (scrollY !== undefined && scrollY !== term.buffer.active.baseY + term.rows - 1) {
+        // Only restore if user wasn't at the bottom (avoid fighting auto-scroll)
+        term.scrollToLine(scrollY);
+      }
+
       // Update selection state when becoming active
-      const selection = xtermInstance.current?.getSelection() || '';
+      const selection = term.getSelection() || '';
       getSetTerminalSelection()(selection);
     });
 
     return () => cancelAnimationFrame(frameId);
-  }, [active]);
+  }, [active, isActiveProject]);
 
   // React to font size changes
   useEffect(() => {
@@ -325,7 +748,6 @@ export default function Terminal({ tabId, cwd, active }: TerminalProps) {
     // Update global selection state immediately
     if (selection) {
       getSetTerminalSelection()(selection);
-      console.log('[Terminal] Context menu - selection:', selection.slice(0, 50));
     }
 
     // Get prompts for context menu
@@ -355,3 +777,6 @@ export default function Terminal({ tabId, cwd, active }: TerminalProps) {
     />
   );
 }
+
+// Wrap in memo to prevent re-renders when other terminals' state changes
+export default memo(Terminal);

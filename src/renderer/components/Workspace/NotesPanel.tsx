@@ -1,11 +1,10 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState } from 'react';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
+import InfoPanel from './panels/InfoPanel';
 import GeminiPanel from './panels/GeminiPanel';
 import ActionsPanel from './panels/ActionsPanel';
 import SessionsPanel from './panels/SessionsPanel';
-
-const { ipcRenderer } = window.require('electron');
 
 interface Project {
   id: string;
@@ -20,50 +19,19 @@ interface NotesPanelProps {
   project: Project;
 }
 
-type TabType = 'notes' | 'ai' | 'actions' | 'sessions';
+type TabType = 'info' | 'ai' | 'actions' | 'sessions';
 
 export default function NotesPanel({ projectId, project }: NotesPanelProps) {
   const { notesPanelWidth } = useUIStore();
-  const { getActiveProject, getActiveTab } = useWorkspaceStore();
+  const { getActiveProject } = useWorkspaceStore();
 
-  const [activeTab, setActiveTab] = useState<TabType>('notes');
-  const [notes, setNotes] = useState('');
-  const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'saved'>('idle');
-  const saveTimeoutRef = useRef<NodeJS.Timeout | null>(null);
-  const notesRef = useRef<{ [key: string]: string }>({});
+  const [activeTab, setActiveTab] = useState<TabType>('info');
 
   const activeProject = getActiveProject();
   const activeTabId = activeProject?.activeTabId || null;
 
-  // Load notes when tab changes
-  useEffect(() => {
-    if (activeTabId) {
-      setNotes(notesRef.current[activeTabId] || '');
-    }
-  }, [activeTabId]);
-
-  // Auto-save notes
-  const handleNotesChange = (value: string) => {
-    setNotes(value);
-
-    if (activeTabId) {
-      notesRef.current[activeTabId] = value;
-    }
-
-    setSaveStatus('saving');
-
-    if (saveTimeoutRef.current) {
-      clearTimeout(saveTimeoutRef.current);
-    }
-
-    saveTimeoutRef.current = setTimeout(() => {
-      setSaveStatus('saved');
-      setTimeout(() => setSaveStatus('idle'), 1000);
-    }, 500);
-  };
-
   const tabs: { id: TabType; label: string }[] = [
-    { id: 'notes', label: 'Notes' },
+    { id: 'info', label: 'Info' },
     { id: 'ai', label: 'AI' },
     { id: 'actions', label: 'Actions' },
     { id: 'sessions', label: 'Sessions' }
@@ -93,26 +61,8 @@ export default function NotesPanel({ projectId, project }: NotesPanelProps) {
 
       {/* Content */}
       <div className="flex-1 overflow-hidden">
-        {activeTab === 'notes' && (
-          <div className="h-full flex flex-col">
-            <div className="px-3 py-2 bg-[#333] text-[11px] uppercase text-[#aaa] flex justify-between items-center shrink-0">
-              <span>Session Notes</span>
-              <span className={`text-[10px] ${
-                saveStatus === 'saving' ? 'text-[#888]' :
-                saveStatus === 'saved' ? 'text-accent' : 'text-[#666]'
-              }`}>
-                {saveStatus === 'saving' ? 'Saving...' :
-                 saveStatus === 'saved' ? 'Saved' : 'Auto-saved'}
-              </span>
-            </div>
-            <textarea
-              className="flex-1 p-3 outline-none overflow-y-auto font-mono text-[13px] leading-relaxed text-[#ddd] bg-transparent resize-none"
-              value={notes}
-              onChange={(e) => handleNotesChange(e.target.value)}
-              spellCheck={false}
-              placeholder="Type your notes here..."
-            />
-          </div>
+        {activeTab === 'info' && (
+          <InfoPanel activeTabId={activeTabId} />
         )}
 
         {activeTab === 'ai' && (

@@ -49,6 +49,11 @@ interface ResearchStore {
   // Loading state
   isLoading: boolean;
   setLoading: (loading: boolean) => void;
+
+  // Abort controller for cancellation
+  abortController: AbortController | null;
+  setAbortController: (controller: AbortController | null) => void;
+  cancelRequest: () => void;
 }
 
 // Load from localStorage
@@ -218,5 +223,16 @@ export const useResearchStore = create<ResearchStore>((set, get) => ({
 
   // Loading state
   isLoading: false,
-  setLoading: (loading) => set({ isLoading: loading })
+  setLoading: (loading) => set({ isLoading: loading }),
+
+  // Abort controller
+  abortController: null,
+  setAbortController: (controller) => set({ abortController: controller }),
+  cancelRequest: () => {
+    const { abortController } = get();
+    if (abortController) {
+      abortController.abort();
+      set({ abortController: null, isLoading: false });
+    }
+  }
 }));

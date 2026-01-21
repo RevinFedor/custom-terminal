@@ -14,10 +14,11 @@ interface ActionsPanelProps {
 }
 
 export default function ActionsPanel({ activeTabId }: ActionsPanelProps) {
-  const { showToast, docPrompt } = useUIStore();
+  const { showToast, docPrompt, terminalSelection } = useUIStore();
   const { activeProjectId, createTab, getActiveProject, switchTab } = useWorkspaceStore();
   const [isUpdatingDocs, setIsUpdatingDocs] = useState(false);
   const [actions, setActions] = useState<Action[]>([]);
+  const [isScissorsHovered, setIsScissorsHovered] = useState(false);
 
   useEffect(() => {
     loadActions();
@@ -230,6 +231,126 @@ export default function ActionsPanel({ activeTabId }: ActionsPanelProps) {
     }
   };
 
+  // Update Docs with terminal selection (instead of Claude session export)
+  const handleUpdateDocsWithSelection = async (e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+
+    if (!activeTabId || !activeProjectId || !terminalSelection) {
+      showToast('No selection in terminal', 'error');
+      return;
+    }
+
+    const activeProject = getActiveProject();
+    if (!activeProject) {
+      showToast('No active project', 'error');
+      return;
+    }
+
+    setIsUpdatingDocs(true);
+    showToast('Using terminal selection...', 'info');
+
+    try {
+      // 1. Get actual cwd of current terminal
+      const tabCwd = await ipcRenderer.invoke('terminal:getCwd', activeTabId);
+      const workingDir = tabCwd || activeProject.projectPath;
+
+      // 2. Get documentation prompt
+      let promptContent: string;
+      if (docPrompt.useFile) {
+        const promptResult = await ipcRenderer.invoke('docs:read-prompt-file', {
+          filePath: docPrompt.filePath
+        });
+        if (!promptResult.success) {
+          throw new Error(promptResult.error || 'Failed to read prompt file');
+        }
+        promptContent = promptResult.content;
+      } else {
+        promptContent = docPrompt.inlineContent;
+      }
+
+      if (!promptContent) {
+        throw new Error('Documentation prompt is empty');
+      }
+
+      // 3. Generate tab name with index
+      const existingDocsTabs = Array.from(activeProject.tabs.values())
+        .filter(t => t.name.startsWith('docs-gemini-'))
+        .length;
+      const tabIndex = String(existingDocsTabs + 1).padStart(2, '0');
+      const tabName = `docs-gemini-${tabIndex}`;
+
+      // 4. Create new green tab for Gemini
+      const newTabId = await createTab(
+        activeProjectId,
+        tabName,
+        workingDir,
+        { color: 'green', isUtility: false }
+      );
+
+      if (!newTabId) {
+        throw new Error('Failed to create new tab');
+      }
+
+      // 5. Wait for terminal to initialize
+      await new Promise(resolve => setTimeout(resolve, 500));
+
+      // 6. Save selection to temp file (same pattern as Claude session export)
+      const selectionResult = await ipcRenderer.invoke('docs:save-selection', {
+        projectPath: workingDir,
+        selectionText: terminalSelection
+      });
+
+      if (!selectionResult.success) {
+        throw new Error(selectionResult.error || 'Failed to save selection file');
+      }
+
+      showToast('Selection saved, preparing Gemini...', 'info');
+
+      // 7. Save prompt with path to selection file (same as Claude export flow)
+      const promptResult = await ipcRenderer.invoke('docs:save-prompt-temp', {
+        projectPath: workingDir,
+        promptContent,
+        exportedFilePath: selectionResult.selectionPath
+      });
+
+      if (!promptResult.success) {
+        throw new Error(promptResult.error || 'Failed to save prompt file');
+      }
+
+      // 8. Start Gemini
+      await ipcRenderer.invoke('terminal:executeCommandAsync', newTabId, 'gemini');
+
+      // 9. Wait for Gemini to be ready
+      const geminiReady = await waitForGeminiReady(newTabId, 15000);
+      if (!geminiReady) {
+        throw new Error('Timeout waiting for Gemini to start');
+      }
+
+      await new Promise(resolve => setTimeout(resolve, 300));
+
+      // 10. Read prompt file and send to terminal
+      const promptFileContent = await ipcRenderer.invoke('file:read', promptResult.promptFile);
+      if (promptFileContent.success) {
+        ipcRenderer.send('terminal:input', newTabId, promptFileContent.content + '\r');
+      }
+
+      // 11. Cleanup temp prompt file (keep selection file - Gemini needs to read it!)
+      await ipcRenderer.invoke('docs:cleanup-temp', {
+        exportedPath: null,  // Don't delete selection file - Gemini reads it
+        promptPath: promptResult.promptFile
+      });
+
+      showToast('Gemini started with selection', 'success');
+
+    } catch (error: any) {
+      console.error('[UpdateDocsSelection] Error:', error);
+      showToast(error.message || 'Update docs failed', 'error');
+    } finally {
+      setIsUpdatingDocs(false);
+    }
+  };
+
   return (
     <div className="h-full flex flex-col">
       <div className="px-3 py-2 bg-[#333] text-[11px] uppercase text-[#aaa] shrink-0">
@@ -258,6 +379,28 @@ export default function ActionsPanel({ activeTabId }: ActionsPanelProps) {
                 {isUpdatingDocs ? 'Processing...' : 'Export session → Gemini analysis'}
               </div>
             </div>
+            {/* Selection button - appears when text is selected in terminal */}
+            {terminalSelection && !isUpdatingDocs && (
+              <div
+                className="relative z-10 text-white text-[9px] px-2 py-1.5 rounded flex items-center gap-1 cursor-pointer select-none"
+                style={{
+                  backgroundColor: isScissorsHovered ? '#3b82f6' : '#2563eb',
+                  transform: isScissorsHovered ? 'scale(1.02)' : 'scale(1)',
+                  boxShadow: isScissorsHovered ? '0 2px 6px rgba(59, 130, 246, 0.25)' : 'none',
+                  transition: 'all 0.15s ease'
+                }}
+                onClick={handleUpdateDocsWithSelection}
+                onMouseDown={(e) => e.stopPropagation()}
+                onMouseEnter={() => setIsScissorsHovered(true)}
+                onMouseLeave={() => setIsScissorsHovered(false)}
+                title={`Use selection (${terminalSelection.length} chars)`}
+                role="button"
+                tabIndex={0}
+              >
+                <span className="text-[10px]">✂️</span>
+                <span className="font-medium">{terminalSelection.length}</span>
+              </div>
+            )}
           </button>
         </div>
 

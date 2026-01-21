@@ -47,7 +47,22 @@ Gemini CLI doesn't have an internal registry; it just scans `~/.gemini/tmp/<SHA2
 
 ---
 
-## 4. Session Item Visual Selection
+## 4. Claude Code Export: Predetermined Path Pattern
+**Файл-источник:** Сессия 2026-01-21
+
+### Problem
+Парсинг вывода Claude Code для получения пути к экспортированной сессии ненадежен из-за ANSI-кодов, форматирования и асинхронности.
+
+### Solution
+Вместо парсинга ответа "Conversation exported to: ...", мы сами задаем путь в команде `/export path/to/file.md` и используем **FS Polling** для отслеживания момента появления файла.
+1. Генерируем уникальный путь в `docs/tmp/`.
+2. Отправляем команду в PTY.
+3. Опрашиваем ФС (fs.existsSync) до появления файла (или таймаута 15с).
+**Важно:** Claude всегда сохраняет файл с расширением `.txt`, даже если запрошен `.md`. Нужно учитывать это при ожидании.
+
+---
+
+## 5. Session Item Visual Selection
 **Файл-источник:** `fix-session-item-not-selecting.md`
 
 ### Problem

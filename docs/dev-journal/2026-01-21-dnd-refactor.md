@@ -49,7 +49,7 @@
   Стек
 
   - Electron 28 + React 19 + TypeScript + Vite
-  - xterm.js с WebGL рендерингом
+  - xterm.js с Canvas рендерингом
   - Zustand для state management
   - Tailwind CSS v4
   - node-pty для терминала

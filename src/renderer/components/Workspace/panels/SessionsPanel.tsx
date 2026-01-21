@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { useUIStore } from '../../../store/useUIStore';
+import { useWorkspaceStore } from '../../../store/useWorkspaceStore';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -23,6 +24,7 @@ export default function SessionsPanel({ projectPath, activeTabId }: SessionsPane
   const [claudeSessions, setClaudeSessions] = useState<Session[]>([]);
   const [selectedGemini, setSelectedGemini] = useState<Session | null>(null);
   const [selectedClaude, setSelectedClaude] = useState<Session | null>(null);
+  const getClaudeSessionId = useWorkspaceStore((state) => state.getClaudeSessionId);
   const [expandedSessionId, setExpandedSessionId] = useState<number | null>(null);
 
   useEffect(() => {
@@ -489,48 +491,118 @@ export default function SessionsPanel({ projectPath, activeTabId }: SessionsPane
     console.log('[SessionsPanel] ========== IMPORT GEMINI (TROJAN HORSE) END ==========');
   };
 
-  // Claude Export
+  // Claude Export - uses LSOF to find active session file
   const exportClaudeSession = async () => {
-    const sessionKey = await showSessionModal(
+    console.log('[SessionsPanel] ========== EXPORT CLAUDE START ==========');
+    console.log('[SessionsPanel] activeTabId:', activeTabId);
+    console.log('[SessionsPanel] projectPath:', projectPath);
+
+    if (!activeTabId) {
+      showToast('Please open a terminal tab first', 'error');
+      return;
+    }
+
+    // Get actual cwd of the tab
+    const tabCwd = await ipcRenderer.invoke('terminal:getCwd', activeTabId);
+    console.log('[SessionsPanel] Tab cwd:', tabCwd);
+
+    // Use LSOF method to find active Claude session
+    const lsofResult = await ipcRenderer.invoke('terminal:getClaudeSession', activeTabId);
+    console.log('[SessionsPanel] LSOF result:', lsofResult);
+
+    const detectedSessionId = lsofResult.success ? lsofResult.sessionId : null;
+    console.log('[SessionsPanel] Detected Claude session ID (LSOF):', detectedSessionId);
+
+    // Ask for custom name with default value (like Gemini)
+    const defaultName = `session-${Date.now()}`;
+    const customName = await showSessionModal(
       'Export Claude Session',
-      'Session UUID (optional)',
-      '',
-      'Leave empty to auto-detect latest session'
+      'Session Name',
+      defaultName,
+      detectedSessionId
+        ? `Detected session: ${detectedSessionId.substring(0, 8)}...`
+        : 'No active Claude session detected. Will use most recent file.'
     );
 
+    if (customName === null) {
+      console.log('[SessionsPanel] User cancelled');
+      return;
+    }
+
+    // Use default name if empty
+    const finalName = customName.trim() || defaultName;
+
     const result = await ipcRenderer.invoke('session:export-claude', {
-      dirPath: projectPath,
-      sessionKey: sessionKey || ''
+      dirPath: tabCwd || projectPath,
+      sessionId: detectedSessionId, // Explicit UUID from output sniffing
+      customName: finalName
     });
 
+    console.log('[SessionsPanel] Export result:', result);
+
     if (result.success) {
-      showToast(result.message, 'success');
+      // Show different message based on whether active session was detected
+      if (!detectedSessionId) {
+        showToast(`⚠️ Exported most recent file (no active Claude detected)`, 'warning');
+      } else {
+        showToast(result.message, 'success');
+      }
       loadSessions();
     } else {
       showToast('Export failed: ' + result.message, 'error');
     }
+
+    console.log('[SessionsPanel] ========== EXPORT CLAUDE END ==========');
   };
 
-  // Claude Import
+  // Claude Import - patches paths and runs explicit --resume <UUID>
   const importClaudeSession = async () => {
+    console.log('[SessionsPanel] ========== IMPORT CLAUDE START ==========');
+    console.log('[SessionsPanel] activeTabId:', activeTabId);
+    console.log('[SessionsPanel] selectedClaude:', selectedClaude);
+
+    if (!activeTabId) {
+      showToast('Please open a terminal tab first', 'error');
+      return;
+    }
+
     if (!selectedClaude) {
       showToast('Please select a session from the list', 'error');
       return;
     }
 
+    // Get actual cwd of the tab
+    const tabCwd = await ipcRenderer.invoke('terminal:getCwd', activeTabId);
+    console.log('[SessionsPanel] Tab cwd:', tabCwd);
+
+    showToast('Preparing session restore...', 'info');
+
     const result = await ipcRenderer.invoke('session:import-claude', {
-      dirPath: projectPath,
-      sessionKey: selectedClaude
+      dirPath: tabCwd || projectPath,
+      sessionKey: selectedClaude.session_key,
+      sessionId: selectedClaude.id
     });
 
-    if (result.success) {
-      showToast(result.message, 'success');
-      if (result.commands?.[0]) {
-        showToast(`Run: ${result.commands[0]}`, 'info');
-      }
-    } else {
+    console.log('[SessionsPanel] Import result:', result);
+
+    if (!result.success) {
       showToast('Import failed: ' + result.message, 'error');
+      return;
     }
+
+    // Execute the resume command in terminal
+    if (result.resumeCommand) {
+      console.log('[SessionsPanel] Executing resume command:', result.resumeCommand);
+      showToast('Starting Claude with restored session...', 'info');
+
+      // Send command to terminal
+      ipcRenderer.send('terminal:executeCommand', activeTabId, result.resumeCommand);
+
+      showToast(result.message, 'success');
+      loadSessions();
+    }
+
+    console.log('[SessionsPanel] ========== IMPORT CLAUDE END ==========');
   };
 
   return (
@@ -669,11 +741,11 @@ export default function SessionsPanel({ projectPath, activeTabId }: SessionsPane
                 <div
                   key={session.id}
                   className={`flex items-center gap-2 p-2 bg-[#2a2a2a] hover:bg-[#333] rounded cursor-pointer border transition-colors ${
-                    selectedClaude === session.session_key
+                    selectedClaude?.id === session.id
                       ? 'border-accent'
                       : 'border-transparent hover:border-[#444]'
                   }`}
-                  onClick={() => setSelectedClaude(session.session_key)}
+                  onClick={() => setSelectedClaude(session)}
                 >
                   <div className="flex-1 min-w-0">
                     <div className="text-xs text-white truncate">{session.session_key}</div>

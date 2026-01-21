@@ -1,6 +1,7 @@
 import React from 'react';
 import { Virtuoso } from 'react-virtuoso';
 import { useResearchStore, Message } from '../../store/useResearchStore';
+import MarkdownRenderer from './MarkdownRenderer';
 
 interface ChatAreaProps {
   projectId: string;
@@ -46,11 +47,14 @@ function MessageBubble({ message }: { message: Message }) {
           <div style={{
             fontSize: '13px',
             color: '#e5e5e5',
-            whiteSpace: 'pre-wrap',
             wordBreak: 'break-word',
             lineHeight: 1.5
           }}>
-            {message.content}
+            {isUser ? (
+              <div style={{ whiteSpace: 'pre-wrap' }}>{message.content}</div>
+            ) : (
+              <MarkdownRenderer content={message.content} />
+            )}
           </div>
         </div>
       </div>

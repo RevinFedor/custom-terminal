@@ -20,11 +20,10 @@ interface GeminiPanelProps {
 
 export default function GeminiPanel({ projectPath, geminiPrompt }: GeminiPanelProps) {
   const { showToast, researchPrompt, selectedModel, terminalSelection } = useUIStore();
-  const { createConversation, addMessage, openResearch, getProjectConversations, setActiveConversation, deleteConversation } = useResearchStore();
+  const { createConversation, addMessage, openResearch, getProjectConversations, setActiveConversation, deleteConversation, isLoading, setLoading, setAbortController } = useResearchStore();
   const { activeProjectId } = useWorkspaceStore();
   const conversations = activeProjectId ? getProjectConversations(activeProjectId) : [];
   const [history, setHistory] = useState<HistoryItem[]>([]);
-  const [loading, setLoading] = useState(false);
   const [expandedItem, setExpandedItem] = useState<HistoryItem | null>(null);
 
   // Ref to store handleResearch for event listener
@@ -67,12 +66,21 @@ export default function GeminiPanel({ projectPath, geminiPrompt }: GeminiPanelPr
 
     const selectedText = terminalSelection;
 
-    setLoading(true);
-
     // Use prompt from settings, fallback to project prompt, then system default
     const prompt = geminiPrompt || researchPrompt;
     console.log('[Research] Prompt:', `"${prompt.slice(0, 50)}..."`);
     console.log('[Research] Model:', selectedModel);
+
+    // IMMEDIATELY create conversation and open panel
+    // Put selectedText first so title shows content, not prompt
+    const userMessage = `${selectedText}\n\n---\n\n_Prompt: ${prompt}_`;
+    if (activeProjectId) {
+      createConversation(activeProjectId, userMessage);
+      openResearch();
+      console.log('[Research] Panel opened, loading...');
+    }
+
+    setLoading(true);
 
     // Get API key from environment
     const apiKey = process.env.GEMINI_API_KEY || 'REDACTED_GEMINI_KEY';
@@ -82,6 +90,10 @@ export default function GeminiPanel({ projectPath, geminiPrompt }: GeminiPanelPr
     console.log('[Research] Full prompt length:', fullPrompt.length);
     console.log('[Research] Sending request to Gemini API...');
 
+    // Create AbortController for cancellation
+    const controller = new AbortController();
+    setAbortController(controller);
+
     try {
       const response = await fetch(
         `https://generativelanguage.googleapis.com/v1beta/models/${selectedModel}:generateContent?key=${apiKey}`,
@@ -90,7 +102,8 @@ export default function GeminiPanel({ projectPath, geminiPrompt }: GeminiPanelPr
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             contents: [{ parts: [{ text: fullPrompt }] }]
-          })
+          }),
+          signal: controller.signal
         }
       );
 
@@ -120,25 +133,25 @@ export default function GeminiPanel({ projectPath, geminiPrompt }: GeminiPanelPr
         response: responseText
       });
 
-      // Create new conversation in Research panel
+      // Add assistant response to the conversation
       if (activeProjectId) {
-        // Create new conversation with user message
-        const userMessage = `${prompt}\n\n---\n${selectedText}`;
-        createConversation(activeProjectId, userMessage);
-        // Add assistant response to the new conversation
         addMessage(activeProjectId, 'assistant', responseText);
-        // Open Research panel to show result
-        openResearch();
-        console.log('[Research] Created new conversation');
+        console.log('[Research] Added assistant response');
       }
 
       console.log('[Research] Saved to history');
       showToast('Research completed!', 'success');
       loadHistory();
     } catch (err: any) {
-      console.error('[Research] ERROR:', err.message);
-      showToast(err.message, 'error');
+      if (err.name === 'AbortError') {
+        console.log('[Research] Request cancelled');
+        showToast('Запрос отменён', 'info');
+      } else {
+        console.error('[Research] ERROR:', err.message);
+        showToast(err.message, 'error');
+      }
     } finally {
+      setAbortController(null);
       setLoading(false);
       console.log('[Research] Done');
     }
@@ -246,17 +259,6 @@ export default function GeminiPanel({ projectPath, geminiPrompt }: GeminiPanelPr
             <span className="text-[9px] text-green-500">● {terminalSelection.length}</span>
           )}
         </div>
-        <button
-          className={`text-[10px] px-2 py-1 rounded ${
-            loading || !terminalSelection
-              ? 'bg-[#444] text-[#666] cursor-not-allowed'
-              : 'bg-accent text-white hover:bg-accent/80'
-          }`}
-          onClick={handleResearch}
-          disabled={loading || !terminalSelection}
-        >
-          {loading ? 'Поиск...' : 'Research'}
-        </button>
       </div>
 
       {/* Conversations List */}
