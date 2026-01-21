@@ -131,9 +131,9 @@ function App() {
         const terminalSelection = useUIStore.getState().terminalSelection;
         console.log('[ContextMenu] Selection:', terminalSelection ? terminalSelection.slice(0, 50) : 'EMPTY');
         if (terminalSelection) {
-          // Dispatch event that GeminiPanel listens to
-          window.dispatchEvent(new CustomEvent('trigger-research'));
-          console.log('[ContextMenu] Triggered research');
+          // Use store to trigger research (survives panel mount)
+          useResearchStore.getState().triggerResearch();
+          console.log('[ContextMenu] Triggered research via store');
         } else {
           showToast('Select text in terminal first', 'error');
         }

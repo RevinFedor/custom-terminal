@@ -3,6 +3,7 @@
 ## 1. Process Model (Electron IPC)
 - **Main Process:** Управляет `node-pty` (терминальными сессиями), SQLite базой данных и файловой системой. 
     - **КРИТИЧЕСКОЕ ПРАВИЛО:** Запрещено использование `execSync`. Все системные вызовы (pgrep, lsof, ps) должны быть асинхронными (через `execAsync`), чтобы не блокировать Event Loop главного процесса и IPC.
+    - **Stability:** Используется `disable-http-cache` для предотвращения загрузки устаревшего кода в продакшн-билдах.
 - **Renderer Process:** React UI. Общается с Main через типизированные IPC-вызовы (см. `src/preload/index.js`).
 - **Terminal Routing:** Данные от PTY содержат `tabId`. Renderer направляет их в соответствующий инстанс `xterm.js`.
 - **New IPC Channels:**
@@ -16,6 +17,9 @@
     - `docs:cleanup-temp`: Удаление временных артефактов.
     - `claude:spawn-with-watcher`: Запуск Claude с активацией Sniper Watcher.
     - `claude:fork-session-file`: Копирование файла сессии для форка.
+    - `claude:run-command`: Прямой запуск команд Claude из UI (Claude Runner).
+    - `claude:session-detected`: Событие при обнаружении нового ID сессии.
+    - `claude:fork-complete`: Сигнал об успешном создании форка.
 
 ## 2. Data Layer
 - **SQLite (`noted-terminal.db`):** Хранит сессии AI (`ai_sessions`) и историю развертываний.
@@ -33,9 +37,14 @@
 - **UI State (`useUIStore`):** Хранит настройки интерфейса, включая размеры шрифтов и текущее выделение терминала (`terminalSelection`).
 
 ## 3. Terminal Integration
+
 - **Backend:** `node-pty` для создания псевдотерминалов.
-    - **Environment:** Принудительно устанавливается `COLORTERM: 'truecolor'` для поддержки 24-битной палитры в Ink-based CLI (Claude, Gemini).
-- **Frontend:** `xterm.js` с использованием **Canvas рендерера**. WebGL отключен для предотвращения лагов "прогрева" GPU и обхода лимитов контекстов (max 16). См. `knowledge/fix-ui-stability.md`.
+
+    - **Environment:** Принудительно устанавливаются `COLORTERM: 'truecolor'`, `LANG` и `LC_ALL` (UTF-8). Это обеспечивает яркие 24-битные цвета в AI CLI и корректный ввод кириллицы. См. `knowledge/fix-terminal-colors.md`.
+
+- **Frontend:** `xterm.js` с использованием **Canvas рендерера**.
+
+ WebGL отключен для предотвращения лагов "прогрева" GPU и обхода лимитов контекстов (max 16). См. `knowledge/fix-ui-stability.md`.
 - **Terminal Registry:** Глобальный маппинг `tabId -> xterm instance` для доступа к данным терминала (выделение, ввод) из любой части приложения. См. `knowledge/fact-terminal-registry.md`.
 - **Lazy Hydration:** Инстанс `xterm.js` и его аддоны создаются только при первом физическом показе таба (активация таба или проекта). До этого данные от PTY буферизируются. Это обеспечивает мгновенный старт приложения (Cold Start) даже с десятками табов.
 - **Rendering Strategy:** Для предотвращения дёргания (jitter) при переключении проектов терминалы всех открытых проектов рендерятся одновременно и скрываются через `visibility: hidden`. См. `knowledge/fix-terminal-jitter.md`.

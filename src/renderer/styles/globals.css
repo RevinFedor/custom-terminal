@@ -34,6 +34,14 @@
   padding-top: 4px;
 }
 
+/* Terminal font smoothing - makes fonts thinner like in iTerm/VS Code */
+.terminal-instance,
+.terminal-instance .xterm-screen,
+.terminal-instance .xterm-screen canvas {
+  -webkit-font-smoothing: antialiased !important;
+  -moz-osx-font-smoothing: grayscale !important;
+}
+
 .terminal-wrapper.hidden {
   display: none;
 }

@@ -278,6 +278,9 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
         },
         fontFamily: "'JetBrains Mono', 'JetBrainsMono NF', Menlo, Monaco, monospace",
         fontSize: currentFontSize,
+        fontWeight: 'normal',
+        fontWeightBold: 'bold',
+        drawBoldTextInBrightColors: false, // Prevents bright colors from being bold
         cursorBlink: true,
         cursorStyle: 'block',
         allowTransparency: false,
@@ -568,6 +571,9 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
           },
           fontFamily: "'JetBrains Mono', 'JetBrainsMono NF', Menlo, Monaco, monospace",
           fontSize: currentFontSize,
+          fontWeight: 'normal',
+          fontWeightBold: 'bold',
+          drawBoldTextInBrightColors: false, // Prevents bright colors from being bold
           cursorBlink: true,
           cursorStyle: 'block',
           allowTransparency: false,

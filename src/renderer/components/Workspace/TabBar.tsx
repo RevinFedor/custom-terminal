@@ -74,6 +74,65 @@ const DropIndicatorLine = memo(({ edge }: IndicatorProps) => {
   );
 });
 
+// Process indicator dot with restart button on hover
+const ProcessDot = memo(({ hasColor, onRestart }: { hasColor: boolean; onRestart: () => void }) => {
+  const [isHovered, setIsHovered] = useState(false);
+
+  return (
+    <div
+      style={{ marginRight: '-4px', flexShrink: 0 }}
+      onMouseEnter={() => setIsHovered(true)}
+      onMouseLeave={() => setIsHovered(false)}
+    >
+      {isHovered ? (
+        <button
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            width: '14px',
+            height: '14px',
+            marginLeft: '-5px',
+            borderRadius: '3px',
+            backgroundColor: 'transparent',
+            color: '#888',
+            cursor: 'pointer',
+            border: 'none',
+            fontSize: '11px',
+            transition: 'all 0.1s',
+          }}
+          onMouseEnter={(e) => {
+            e.currentTarget.style.backgroundColor = '#444';
+            e.currentTarget.style.color = '#fff';
+          }}
+          onMouseLeave={(e) => {
+            e.currentTarget.style.backgroundColor = 'transparent';
+            e.currentTarget.style.color = '#888';
+          }}
+          onClick={(e) => {
+            e.stopPropagation();
+            onRestart();
+          }}
+          title="Restart (Ctrl+C → !! → Enter)"
+        >
+          ↻
+        </button>
+      ) : (
+        <span
+          style={{
+            display: 'block',
+            width: '5px',
+            height: '5px',
+            borderRadius: '50%',
+            backgroundColor: '#fff',
+            opacity: hasColor ? 0.9 : 0.6,
+          }}
+        />
+      )}
+    </div>
+  );
+});
+
 // Draggable Tab Item
 interface TabItemProps {
   tab: TabData;
@@ -93,6 +152,7 @@ interface TabItemProps {
   forceRightIndicator?: boolean; // Show right indicator when empty zone is hovered
   fontSize: number;
   hasProcess?: boolean; // Whether tab has a running process
+  onRestart?: (tabId: string) => void; // Restart process (Ctrl+C, Up, Enter)
 }
 
 const TabItem = memo(({
@@ -113,6 +173,7 @@ const TabItem = memo(({
   forceRightIndicator = false,
   fontSize,
   hasProcess = false,
+  onRestart,
 }: TabItemProps) => {
   const ref = useRef<HTMLDivElement>(null);
   const [closestEdge, setClosestEdge] = useState<Edge | null>(null);
@@ -226,19 +287,20 @@ const TabItem = memo(({
       onContextMenu={onContextMenu}
       onMouseEnter={() => setIsHovered(true)}
       onMouseLeave={() => setIsHovered(false)}
+      onAuxClick={(e) => {
+        // Middle mouse button (button === 1) closes tab
+        if (e.button === 1) {
+          e.preventDefault();
+          e.stopPropagation();
+          onClose(e as any);
+        }
+      }}
     >
-      {/* Process indicator dot */}
+      {/* Process indicator dot with restart on hover */}
       {hasProcess && (
-        <span
-          style={{
-            width: '5px',
-            height: '5px',
-            borderRadius: '50%',
-            backgroundColor: '#fff',
-            opacity: hasColor ? 0.9 : 0.6,
-            flexShrink: 0,
-            marginRight: '-4px', // Compensate gap to keep text position
-          }}
+        <ProcessDot
+          hasColor={hasColor}
+          onRestart={() => onRestart && onRestart(tab.id)}
         />
       )}
 
@@ -619,6 +681,16 @@ export default function TabBar({ projectId }: TabBarProps) {
     setContextMenu({ x: e.clientX, y: e.clientY, tabId });
   };
 
+  // Restart process: Ctrl+C → delay → !! (repeat last command)
+  const handleRestart = (tabId: string) => {
+    // Ctrl+C to stop current process
+    ipcRenderer.send('terminal:input', tabId, '\x03');
+    // Wait for process to stop, then use !! to repeat last command
+    setTimeout(() => {
+      ipcRenderer.send('terminal:input', tabId, '!!\r');
+    }, 300);
+  };
+
   const handleRenameSubmit = () => {
     if (editingTabId && editValue.trim()) {
       renameTab(projectId, editingTabId, editValue.trim());
@@ -823,6 +895,7 @@ export default function TabBar({ projectId }: TabBarProps) {
                           inputRef={inputRef as React.RefObject<HTMLInputElement>}
                           fontSize={tabsFontSize}
                           hasProcess={processStatus.get(tab.id) || false}
+                          onRestart={handleRestart}
                         />
                       ))}
                     </div>
@@ -864,6 +937,7 @@ export default function TabBar({ projectId }: TabBarProps) {
                     forceRightIndicator={emptyZoneHovered && index === mainTabs.length - 1}
                     fontSize={tabsFontSize}
                     hasProcess={processStatus.get(tab.id) || false}
+                    onRestart={handleRestart}
                   />
                 ))}
               </div>

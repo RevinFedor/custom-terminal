@@ -249,3 +249,40 @@ const execAsync = (cmd, timeout = 1000) => {
 - Отсутствие лимита на количество открытых терминалов
 - Стабильная отрисовка шрифтов
 - Упрощение кодовой базы (нет логики управления WebGL контекстами)
+
+---
+
+## 10. Font Rendering & Smoothing (iTerm Style)
+**Файл-источник:** Сессия 2026-01-22 (Visual Polish)
+
+### Проблема
+Шрифт в терминале выглядел слишком жирным, "рыхлым" или менее четким по сравнению с нативными терминалами (iTerm2) или VS Code, особенно при использовании ярких цветов.
+
+### Решение
+
+#### 1. CSS Antialiasing
+Для достижения "эффекта тонкого шрифта" в macOS необходимо принудительно включить сглаживание на уровне CSS для всех слоев терминала (включая Canvas):
+```css
+/* src/renderer/styles/globals.css */
+.terminal-instance,
+.terminal-instance .xterm-screen,
+.terminal-instance .xterm-screen canvas {
+  -webkit-font-smoothing: antialiased !important;
+  -moz-osx-font-smoothing: grayscale !important;
+}
+```
+
+#### 2. xterm.js Bold/Bright Logic
+По умолчанию xterm.js может отрисовывать "яркие" цвета (bright colors) жирным шрифтом, что создает визуальный шум. Для чистоты интерфейса это поведение отключено:
+```javascript
+// src/renderer/components/Workspace/Terminal.tsx
+const term = new XTerminal({
+  fontWeight: 'normal',
+  fontWeightBold: 'bold',
+  drawBoldTextInBrightColors: false, // Запрещает ярким цветам быть жирными по умолчанию
+  // ...
+});
+```
+
+### Результат
+Текст стал более четким, тонким и профессиональным, сохраняя читаемость даже при мелком кегле.

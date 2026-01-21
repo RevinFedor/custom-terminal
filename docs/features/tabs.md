@@ -17,6 +17,10 @@
     - Помечаются зеленым цветом автоматически.
     - Могут создаваться в Main зоне (для анализа) или Utils зоне (для фоновых задач).
 - **DND:** Перетаскивание таба между зонами.
+- **Quick Actions:**
+    - **Smart Restart (↻):** При наведении на индикатор активного процесса (белая точка), он заменяется на иконку ↻. Клик по ней выполняет цепочку: `SIGINT (Ctrl+C)` -> задержка 300мс -> `!! + Enter`. Это позволяет мгновенно перезапустить `npm run dev` или любую другую команду.
+    - **Middle Click Close:** Закрытие вкладки нажатием на колесико мыши (стандарт современных браузеров).
+- **Utils Zone Status:** На основной кнопке "Utils" (dropdown) появляется индикатор (белая точка), если хотя бы в одном скрытом системном табе запущен активный процесс.
 - **Persistence:** Цвет, статус `isUtility`, положение таба и ID сессии Claude (`claudeSessionId`) сохраняются в `projects.json`.
 - **Lazy Initialization (Performance):** 
     - При загрузке воркспейса UI терминала (`xterm.js`) создается только для активной вкладки.
@@ -26,7 +30,7 @@
 - **Сохранение истории (Serialization):** Визуальный буфер терминала сохраняется при переходе на Dashboard и восстанавливается при возврате в Workspace. Это предотвращает потерю вывода при размонтировании компонентов. См. `knowledge/fix-terminal-serialization.md`.
 
 ## Code Map
-- **UI:** `src/renderer/components/Workspace/TabBar.tsx` — рендеринг через inline-styles (см. `knowledge/fix-tailwind-dynamic-runtime.md`).
+- **UI:** `src/renderer/components/Workspace/TabBar.tsx` — рендеринг через inline-styles. Содержит компонент `ProcessDot` для обработки Smart Restart.
 - **Logic:** `src/renderer/components/Workspace/Terminal.tsx` — реализация Lazy Init и логика сериализации (`SerializeAddon`).
 - **Store:** `src/renderer/store/useWorkspaceStore.ts` — экшены `createTab`, `switchTab`, `closeTab` и хранилище `terminalBuffers`.
 - **Fixes:**
