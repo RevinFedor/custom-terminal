@@ -944,12 +944,8 @@ ipcMain.on('claude:spawn-with-watcher', (event, { tabId, cwd }) => {
       // Already found a session - ignore all further events
       if (sessionFound) return;
 
-      // Only care about .jsonl files with agent- prefix (real sessions)
+      // Only care about .jsonl files (UUID format)
       if (!filename || !filename.endsWith('.jsonl')) return;
-      if (!filename.startsWith('agent-')) {
-        console.log('[Sniper] Ignoring non-agent file:', filename);
-        return;
-      }
 
       const filePath = path.join(projectDir, filename);
 
@@ -989,41 +985,6 @@ ipcMain.on('claude:spawn-with-watcher', (event, { tabId, cwd }) => {
   const term = terminals.get(tabId);
   if (term) {
     term.write('claude\r');
-  }
-});
-
-// Fork Claude session file: copy .jsonl with new agent ID
-ipcMain.handle('claude:fork-session-file', async (event, { sourceSessionId, cwd }) => {
-  console.log('[Claude Fork] Copying session:', sourceSessionId);
-
-  try {
-    const projectSlug = cwd.replace(/\//g, '-');
-    const projectDir = path.join(os.homedir(), '.claude', 'projects', projectSlug);
-
-    // Generate new agent-style ID
-    const newSessionId = 'agent-' + crypto.randomUUID().slice(0, 8);
-    console.log('[Claude Fork] New session ID:', newSessionId);
-
-    const sourcePath = path.join(projectDir, `${sourceSessionId}.jsonl`);
-    const destPath = path.join(projectDir, `${newSessionId}.jsonl`);
-
-    if (!fs.existsSync(sourcePath)) {
-      console.error('[Claude Fork] Source file not found:', sourcePath);
-      return { success: false, error: 'Session file not found: ' + sourceSessionId };
-    }
-
-    // Copy the file
-    fs.copyFileSync(sourcePath, destPath);
-    console.log('[Claude Fork] Copied:', sourcePath, '->', destPath);
-
-    // IMPORTANT: Wait for Claude to index the new file
-    // Without this delay, Claude shows the picker menu
-    await new Promise(resolve => setTimeout(resolve, 500));
-
-    return { success: true, newSessionId };
-  } catch (error) {
-    console.error('[Claude Fork] Error:', error);
-    return { success: false, error: error.message };
   }
 });
 
