@@ -12,6 +12,8 @@ interface Tab {
   pid?: number;
   color?: TabColor;
   isUtility?: boolean;
+  claudeSessionId?: string; // Active Claude Code session UUID (detected from terminal output)
+  pendingCommand?: string; // Command to execute when terminal is ready (used for fork)
 }
 
 interface ProjectWorkspace {
@@ -33,6 +35,12 @@ interface WorkspaceStore {
   openProjects: Map<string, ProjectWorkspace>;
   isRestoring: boolean;
 
+  // Terminal buffer serialization (for preserving history on unmount/remount)
+  terminalBuffers: Map<string, string>;
+  saveTerminalBuffer: (tabId: string, buffer: string) => void;
+  getTerminalBuffer: (tabId: string) => string | null;
+  clearTerminalBuffer: (tabId: string) => void;
+
   // Session
   restoreSession: () => Promise<void>;
   saveSession: () => void;
@@ -46,7 +54,7 @@ interface WorkspaceStore {
   closeProject: (projectId: string) => Promise<void>;
 
   // Tab management
-  createTab: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean }) => Promise<string>;
+  createTab: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; pendingCommand?: string; claudeSessionId?: string }) => Promise<string>;
   closeTab: (projectId: string, tabId: string) => Promise<void>;
   switchTab: (projectId: string, tabId: string) => void;
   renameTab: (projectId: string, tabId: string, newName: string) => void;
@@ -65,6 +73,10 @@ interface WorkspaceStore {
   // Update tab cwd
   updateTabCwd: (projectId: string, tabId: string, newCwd: string) => void;
   syncAllTabsCwd: (projectId: string) => Promise<void>;
+
+  // Claude session tracking
+  setClaudeSessionId: (tabId: string, sessionId: string) => void;
+  getClaudeSessionId: (tabId: string) => string | null;
 
   // Helpers
   getActiveTab: (projectId: string) => Tab | null;
@@ -89,7 +101,8 @@ const saveTabs = (projectPath: string, tabs: Map<string, Tab>) => {
       name: tab.name,
       cwd: tab.cwd,
       color: tab.color,
-      isUtility: tab.isUtility
+      isUtility: tab.isUtility,
+      claudeSessionId: tab.claudeSessionId // Persist Claude session ID
     }));
     await ipcRenderer.invoke('project:save-tabs', { dirPath: projectPath, tabs: tabsArray });
     saveTabsTimers.delete(projectPath);
@@ -103,6 +116,21 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   activeProjectId: null,
   openProjects: new Map(),
   isRestoring: false,
+
+  // Terminal buffer serialization
+  terminalBuffers: new Map(),
+  saveTerminalBuffer: (tabId, buffer) => {
+    const { terminalBuffers } = get();
+    terminalBuffers.set(tabId, buffer);
+    // No need to trigger re-render - this is just storage
+  },
+  getTerminalBuffer: (tabId) => {
+    return get().terminalBuffers.get(tabId) || null;
+  },
+  clearTerminalBuffer: (tabId) => {
+    const { terminalBuffers } = get();
+    terminalBuffers.delete(tabId);
+  },
 
   saveSession: () => {
     const { openProjects, activeProjectId, isRestoring } = get();
@@ -133,10 +161,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   },
 
   restoreSession: async () => {
-    console.time('[PERF] restoreSession total');
     const stored = localStorage.getItem(SESSION_KEY);
     if (!stored) {
-      console.timeEnd('[PERF] restoreSession total');
       return;
     }
 
@@ -144,14 +170,11 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       const sessionState: SessionState = JSON.parse(stored);
       const { openProject } = get();
 
-      console.log('[PERF] restoreSession: restoring', sessionState.openProjects.length, 'projects');
       set({ isRestoring: true });
 
       // Restore all open projects
       for (const proj of sessionState.openProjects) {
-        console.time(`[PERF] openProject ${proj.projectId}`);
         await openProject(proj.projectId, proj.projectPath);
-        console.timeEnd(`[PERF] openProject ${proj.projectId}`);
 
         // Set active tab by index
         const workspace = get().openProjects.get(proj.projectId);
@@ -173,10 +196,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       } else {
         set({ isRestoring: false });
       }
-      console.timeEnd('[PERF] restoreSession total');
     } catch (e) {
       console.error('[Session] Failed to restore:', e);
-      console.timeEnd('[PERF] restoreSession total');
       set({ isRestoring: false });
     }
   },
@@ -194,13 +215,11 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   },
 
   showWorkspace: (projectId) => {
-    console.time(`[PERF] showWorkspace ${projectId}`);
     // Use startTransition for smooth project switching
     startTransition(() => {
       set({ view: 'workspace', activeProjectId: projectId });
     });
     get().saveSession();
-    console.timeEnd(`[PERF] showWorkspace ${projectId}`);
   },
 
   openProject: async (projectId, projectPath) => {
@@ -228,7 +247,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         for (const savedTab of savedTabs) {
           await createTab(projectId, savedTab.name, savedTab.cwd, {
             color: savedTab.color,
-            isUtility: savedTab.isUtility
+            isUtility: savedTab.isUtility,
+            claudeSessionId: savedTab.claudeSessionId // Restore Claude session ID
           });
         }
       } else {
@@ -271,12 +291,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   },
 
   createTab: async (projectId, name, cwd, options) => {
-    console.time(`[PERF] createTab ${name || 'unnamed'}`);
     const { openProjects } = get();
     const workspace = openProjects.get(projectId);
 
     if (!workspace) {
-      console.timeEnd(`[PERF] createTab ${name || 'unnamed'}`);
       return '';
     }
 
@@ -288,7 +306,9 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       name: name || `Tab ${workspace.tabCounter}`,
       cwd: cwd || workspace.projectPath || process.env.HOME || '~',
       color: options?.color,
-      isUtility: options?.isUtility
+      isUtility: options?.isUtility,
+      pendingCommand: options?.pendingCommand,
+      claudeSessionId: options?.claudeSessionId
     };
 
     // Create terminal
@@ -308,12 +328,11 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     // Save tabs
     saveTabs(workspace.projectPath, workspace.tabs);
 
-    console.timeEnd(`[PERF] createTab ${name || 'unnamed'}`);
     return tabId;
   },
 
   closeTab: async (projectId, tabId) => {
-    const { openProjects } = get();
+    const { openProjects, clearTerminalBuffer } = get();
     const workspace = openProjects.get(projectId);
 
     if (!workspace) return;
@@ -330,6 +349,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
 
     ipcRenderer.send('terminal:kill', tabId);
     workspace.tabs.delete(tabId);
+    clearTerminalBuffer(tabId); // Clean up serialized buffer
 
     if (workspace.activeTabId === tabId) {
       // Only switch to Main tabs (not utility) - get last Main tab
@@ -343,14 +363,16 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       }
     }
 
-    set({ openProjects: new Map(openProjects) });
+    // Use startTransition to prevent UI blocking
+    startTransition(() => {
+      set({ openProjects: new Map(openProjects) });
+    });
 
     // Save tabs
     saveTabs(workspace.projectPath, workspace.tabs);
   },
 
   switchTab: (projectId, tabId) => {
-    console.time(`[PERF] switchTab ${tabId}`);
     const { openProjects, saveSession } = get();
     const workspace = openProjects.get(projectId);
 
@@ -362,7 +384,6 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       });
       saveSession();
     }
-    console.timeEnd(`[PERF] switchTab ${tabId}`);
   },
 
   renameTab: (projectId, tabId, newName) => {
@@ -545,6 +566,36 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         console.error('[Workspace] ❌ Failed to get cwd for tab:', tabId, e);
       }
     }
+  },
+
+  // Claude session tracking (detected from terminal output)
+  setClaudeSessionId: (tabId, sessionId) => {
+    const { openProjects } = get();
+
+    // Find tab across all projects
+    for (const [projectId, workspace] of openProjects) {
+      const tab = workspace.tabs.get(tabId);
+      if (tab) {
+        tab.claudeSessionId = sessionId;
+        console.log(`[Workspace] Claude session set for tab ${tabId}: ${sessionId}`);
+        // Save to database so session persists across restarts
+        saveTabs(workspace.projectPath, workspace.tabs);
+        // NOTE: Not calling set() here to avoid re-render that breaks terminal
+        return;
+      }
+    }
+  },
+
+  getClaudeSessionId: (tabId) => {
+    const { openProjects } = get();
+
+    for (const [projectId, workspace] of openProjects) {
+      const tab = workspace.tabs.get(tabId);
+      if (tab) {
+        return tab.claudeSessionId || null;
+      }
+    }
+    return null;
   },
 
   getActiveTab: (projectId) => {

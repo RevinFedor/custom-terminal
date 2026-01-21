@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, memo } from 'react';
+import React, { useState, useRef, useEffect, memo, useCallback } from 'react';
 import { useWorkspaceStore, TabColor } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import { useUIStore } from '../../store/useUIStore';
@@ -7,6 +7,11 @@ import { draggable, dropTargetForElements, monitorForElements } from '@atlaskit/
 import { attachClosestEdge, extractClosestEdge, type Edge } from '@atlaskit/pragmatic-drag-and-drop-hitbox/closest-edge';
 import { combine } from '@atlaskit/pragmatic-drag-and-drop/combine';
 import { ChevronDown } from 'lucide-react';
+
+const { ipcRenderer } = window.require('electron');
+
+// Polling interval for process status check
+const PROCESS_STATUS_POLL_INTERVAL = 2000;
 
 interface TabBarProps {
   projectId: string;
@@ -87,6 +92,7 @@ interface TabItemProps {
   inputRef: React.RefObject<HTMLInputElement>;
   forceRightIndicator?: boolean; // Show right indicator when empty zone is hovered
   fontSize: number;
+  hasProcess?: boolean; // Whether tab has a running process
 }
 
 const TabItem = memo(({
@@ -106,6 +112,7 @@ const TabItem = memo(({
   inputRef,
   forceRightIndicator = false,
   fontSize,
+  hasProcess = false,
 }: TabItemProps) => {
   const ref = useRef<HTMLDivElement>(null);
   const [closestEdge, setClosestEdge] = useState<Edge | null>(null);
@@ -220,6 +227,21 @@ const TabItem = memo(({
       onMouseEnter={() => setIsHovered(true)}
       onMouseLeave={() => setIsHovered(false)}
     >
+      {/* Process indicator dot */}
+      {hasProcess && (
+        <span
+          style={{
+            width: '5px',
+            height: '5px',
+            borderRadius: '50%',
+            backgroundColor: '#fff',
+            opacity: hasColor ? 0.9 : 0.6,
+            flexShrink: 0,
+            marginRight: '-4px', // Compensate gap to keep text position
+          }}
+        />
+      )}
+
       {isEditing ? (
         <input
           ref={inputRef}
@@ -453,10 +475,40 @@ export default function TabBar({ projectId }: TabBarProps) {
   const [utilityExpanded, setUtilityExpanded] = useState(false);
   const [utilityOpenedManually, setUtilityOpenedManually] = useState(false); // Track if opened by click vs hover
   const [emptyZoneHovered, setEmptyZoneHovered] = useState(false);
+  const [processStatus, setProcessStatus] = useState<Map<string, boolean>>(new Map());
   const inputRef = useRef<HTMLInputElement>(null);
 
   const workspace = openProjects.get(projectId);
   const project = projects[projectId];
+
+  // Poll for running processes in all tabs
+  const checkProcessStatus = useCallback(async () => {
+    if (!workspace) return;
+
+    const tabIds = Array.from(workspace.tabs.keys());
+    const newStatus = new Map<string, boolean>();
+
+    await Promise.all(
+      tabIds.map(async (tabId) => {
+        try {
+          const result = await ipcRenderer.invoke('terminal:hasRunningProcess', tabId);
+          newStatus.set(tabId, result.hasProcess);
+        } catch {
+          newStatus.set(tabId, false);
+        }
+      })
+    );
+
+    setProcessStatus(newStatus);
+  }, [workspace]);
+
+  // Polling effect
+  useEffect(() => {
+    checkProcessStatus(); // Initial check
+
+    const interval = setInterval(checkProcessStatus, PROCESS_STATUS_POLL_INTERVAL);
+    return () => clearInterval(interval);
+  }, [checkProcessStatus]);
 
   // Monitor for all drag events
   useEffect(() => {
@@ -755,6 +807,7 @@ export default function TabBar({ projectId }: TabBarProps) {
                           onEditKeyDown={handleRenameKeyDown}
                           inputRef={inputRef as React.RefObject<HTMLInputElement>}
                           fontSize={tabsFontSize}
+                          hasProcess={processStatus.get(tab.id) || false}
                         />
                       ))}
                     </div>
@@ -795,6 +848,7 @@ export default function TabBar({ projectId }: TabBarProps) {
                     inputRef={inputRef as React.RefObject<HTMLInputElement>}
                     forceRightIndicator={emptyZoneHovered && index === mainTabs.length - 1}
                     fontSize={tabsFontSize}
+                    hasProcess={processStatus.get(tab.id) || false}
                   />
                 ))}
               </div>

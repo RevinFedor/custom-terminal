@@ -16,15 +16,24 @@ Commands sent via `terminal:executeCommand` (like `/chat save`) appeared in term
 
 ### Solution: Split writes with delay
 In `main.js`:
-```javascript
 term.write(command);
 await new Promise(r => setTimeout(r, 150)); // Allow CLI to process text
 term.write('\r'); // Now send Enter separately
-```
 
 ---
 
-## 2. Fix: prompt() and alert() Not Supported in Electron
+## 2. Fix: Large Text Input (Buffer Overflow)
+**Файл-источник:** `fix-pty-buffer-overflow.md`
+
+### Problem
+Вставка текста > 4KB (длинные промпты) обрывается из-за ограничений буфера TTY в ОС.
+
+### Solution
+Реализована функция `writeToPtySafe` с разбиением на чанки по 1KB и использованием **Bracketed Paste Mode**. Подробности в `knowledge/fix-pty-buffer-overflow.md`.
+
+---
+
+## 3. Fix: prompt() and alert() Not Supported in Electron
 **Файл-источник:** `fix-prompt-alert-fix.md`
 
 ### Problem
@@ -53,5 +62,28 @@ if (sessionKey) { ... }
 2.  **Context Menu:** Принудительно вызывает `getSelection()` перед открытием меню.
 3.  **UI:** Кнопки поиска используют `terminalSelection` для управления состоянием `disabled` и отображения счетчика символов.
 См. также: `knowledge/fact-terminal-registry.md`.
+
+---
+
+## 4. UI Responsiveness (React 19 startTransition)
+**Файл-источник:** Сессия 2026-01-21 (Performance Optimization)
+
+### Проблема
+При переключении между "тяжелыми" проектами или открытии новых вкладок интерфейс замирал, не реагируя на клики, пока новый терминал не отрисуется полностью.
+
+### Решение
+Использование API `startTransition` в React 19 для всех операций смены контекста (`switchTab`, `showWorkspace`).
+```javascript
+import { startTransition } from 'react';
+
+const switchTab = (tabId) => {
+  startTransition(() => {
+    set({ activeTabId: tabId });
+  });
+};
+```
+
+### Результат
+React помечает обновление как "низкоприоритетное". Это позволяет браузеру продолжать обработку анимаций и кликов (например, подсветку таба при наведении), пока тяжелая работа по рендерингу сетки терминала происходит в фоновом потоке.
 
 ```

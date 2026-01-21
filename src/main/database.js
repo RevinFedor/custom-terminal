@@ -87,6 +87,9 @@ class DatabaseManager {
     try {
       this.db.exec(`ALTER TABLE tabs ADD COLUMN is_utility INTEGER DEFAULT 0`);
     } catch (e) { /* column already exists */ }
+    try {
+      this.db.exec(`ALTER TABLE tabs ADD COLUMN claude_session_id TEXT DEFAULT NULL`);
+    } catch (e) { /* column already exists */ }
 
     // Gemini history table
     this.db.exec(`
@@ -176,7 +179,8 @@ class DatabaseManager {
         name: t.name,
         cwd: t.cwd,
         color: t.color || undefined,
-        isUtility: t.is_utility === 1
+        isUtility: t.is_utility === 1,
+        claudeSessionId: t.claude_session_id || undefined
       }))
     };
   }
@@ -288,14 +292,14 @@ class DatabaseManager {
     // Delete existing tabs
     this.db.prepare('DELETE FROM tabs WHERE project_id = ?').run(project.id);
 
-    // Insert new tabs with color and is_utility
+    // Insert new tabs with color, is_utility and claude_session_id
     const insert = this.db.prepare(`
-      INSERT INTO tabs (project_id, name, cwd, position, color, is_utility)
-      VALUES (?, ?, ?, ?, ?, ?)
+      INSERT INTO tabs (project_id, name, cwd, position, color, is_utility, claude_session_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
     `);
 
     tabs.forEach((tab, index) => {
-      insert.run(project.id, tab.name, tab.cwd, index, tab.color || null, tab.isUtility ? 1 : 0);
+      insert.run(project.id, tab.name, tab.cwd, index, tab.color || null, tab.isUtility ? 1 : 0, tab.claudeSessionId || null);
     });
 
     this.db.prepare(`

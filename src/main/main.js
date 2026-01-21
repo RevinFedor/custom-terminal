@@ -16,8 +16,8 @@ let sessionManager; // Initialized after projectManager is ready
 
 function createWindow() {
   const windowOptions = {
-    width: 1200,
-    height: 800,
+    width: 1900,
+    height: 1000,
     titleBarStyle: 'hidden',
     titleBarOverlay: {
       color: 'rgba(0,0,0,0)',
@@ -209,29 +209,119 @@ ipcMain.on('terminal:kill', (event, tabId) => {
   }
 });
 
+// Helper: async exec with timeout
+const execAsync = (cmd, timeout = 1000) => {
+  return new Promise((resolve, reject) => {
+    const { exec } = require('child_process');
+    const child = exec(cmd, { encoding: 'utf-8', timeout }, (err, stdout) => {
+      if (err) reject(err);
+      else resolve(stdout.trim());
+    });
+  });
+};
+
+// Get Claude session ID by finding recently modified .jsonl file for this process
+ipcMain.handle('terminal:getClaudeSession', async (event, tabId) => {
+  const term = terminals.get(tabId);
+  if (!term) return { success: false, error: 'Terminal not found' };
+
+  try {
+    const shellPid = term.pid;
+    console.log(`[Claude] Checking session for tab ${tabId}, shell PID: ${shellPid}`);
+
+    if (process.platform === 'darwin' || process.platform === 'linux') {
+      // Get child processes of the shell
+      const children = await execAsync(`pgrep -P ${shellPid}`);
+
+      if (!children) {
+        console.log('[Claude] No child processes found');
+        return { success: false, error: 'No child process running' };
+      }
+
+      const childPids = children.split('\n').filter(p => p.trim());
+
+      // Find claude process among children
+      for (const childPid of childPids) {
+        try {
+          const processName = await execAsync(`ps -p ${childPid} -o comm=`);
+          console.log(`[Claude] PID ${childPid} is: ${processName}`);
+
+          if (!processName.includes('claude')) continue;
+
+          // Get process start time (Unix timestamp)
+          const startTimeStr = await execAsync(`ps -p ${childPid} -o lstart=`);
+          const processStartTime = new Date(startTimeStr.trim()).getTime();
+          console.log(`[Claude] Process start time: ${startTimeStr.trim()} (${processStartTime})`);
+
+          // Get CWD of the claude process
+          const cwdResult = await execAsync(`lsof -p ${childPid} | grep cwd | awk '{print $9}'`);
+          const claudeCwd = cwdResult.trim();
+          console.log(`[Claude] Process CWD: ${claudeCwd}`);
+
+          if (!claudeCwd) continue;
+
+          // Calculate project slug
+          const projectSlug = claudeCwd.replace(/\//g, '-');
+          const projectDir = path.join(os.homedir(), '.claude', 'projects', projectSlug);
+          console.log(`[Claude] Project dir: ${projectDir}`);
+
+          if (!fs.existsSync(projectDir)) {
+            console.log('[Claude] Project dir does not exist');
+            continue;
+          }
+
+          // Find .jsonl files modified AFTER process start
+          const files = fs.readdirSync(projectDir)
+            .filter(f => f.endsWith('.jsonl'))
+            .map(f => {
+              const fullPath = path.join(projectDir, f);
+              const stat = fs.statSync(fullPath);
+              return {
+                name: f,
+                mtime: stat.mtime.getTime(),
+                sessionId: f.replace('.jsonl', '')
+              };
+            })
+            .filter(f => f.mtime >= processStartTime - 5000) // Allow 5s tolerance
+            .sort((a, b) => b.mtime - a.mtime);
+
+          console.log(`[Claude] Files modified after process start:`, files.map(f => `${f.sessionId} (${new Date(f.mtime).toISOString()})`));
+
+          if (files.length > 0) {
+            const sessionId = files[0].sessionId;
+            console.log(`[Claude] ✅ Found active session: ${sessionId}`);
+            return { success: true, sessionId, method: 'mtime-after-start' };
+          }
+        } catch (e) {
+          console.log(`[Claude] Error checking PID ${childPid}:`, e.message);
+        }
+      }
+    }
+
+    console.log('[Claude] No active session found');
+    return { success: false, error: 'No active Claude session found' };
+  } catch (e) {
+    console.log('[Claude] Error:', e.message);
+    return { success: false, error: e.message };
+  }
+});
+
 // Check if terminal has running child process (not just idle shell)
 ipcMain.handle('terminal:hasRunningProcess', async (event, tabId) => {
   const term = terminals.get(tabId);
   if (!term) return { hasProcess: false };
 
   try {
-    const { execSync } = require('child_process');
     const shellPid = term.pid;
 
     if (process.platform === 'darwin' || process.platform === 'linux') {
-      // Get child processes of the shell
-      const children = execSync(`pgrep -P ${shellPid}`, {
-        encoding: 'utf-8',
-        timeout: 1000
-      }).trim();
+      // Get child processes of the shell (async to not block main process)
+      const children = await execAsync(`pgrep -P ${shellPid}`);
 
       if (children) {
         // Get the name of the first child process
         const childPid = children.split('\n')[0];
-        const processName = execSync(`ps -p ${childPid} -o comm=`, {
-          encoding: 'utf-8',
-          timeout: 1000
-        }).trim();
+        const processName = await execAsync(`ps -p ${childPid} -o comm=`);
 
         return { hasProcess: true, processName };
       }
@@ -250,26 +340,21 @@ ipcMain.handle('terminal:getCwd', async (event, tabId) => {
   if (!term) return null;
 
   try {
-    const { execSync } = require('child_process');
-
     // Get child process of shell (the actual foreground process)
     // First try to get the shell's cwd directly
     const pid = term.pid;
 
     if (process.platform === 'darwin') {
-      // macOS: use lsof to get cwd
-      const result = execSync(`lsof -p ${pid} | grep cwd | awk '{print $9}'`, {
-        encoding: 'utf-8',
-        timeout: 1000
-      }).trim();
+      // macOS: use lsof to get cwd (async to not block main process)
+      const result = await execAsync(`lsof -p ${pid} | grep cwd | awk '{print $9}'`);
 
       if (result) {
         return result;
       }
     } else if (process.platform === 'linux') {
-      // Linux: read /proc/<pid>/cwd symlink
-      const fs = require('fs');
-      const cwd = fs.readlinkSync(`/proc/${pid}/cwd`);
+      // Linux: read /proc/<pid>/cwd symlink (fs.promises for async)
+      const fs = require('fs').promises;
+      const cwd = await fs.readlink(`/proc/${pid}/cwd`);
       return cwd;
     }
   } catch (e) {
@@ -294,14 +379,9 @@ ipcMain.handle('terminal:getActiveProcess', async (event, tabId) => {
   console.log('[main] Shell PID:', shellPid);
 
   try {
-    const { execSync } = require('child_process');
-
     if (process.platform === 'darwin' || process.platform === 'linux') {
-      // Find child processes of the shell
-      const childPidsRaw = execSync(`pgrep -P ${shellPid}`, {
-        encoding: 'utf-8',
-        timeout: 1000
-      }).trim();
+      // Find child processes of the shell (async to not block main process)
+      const childPidsRaw = await execAsync(`pgrep -P ${shellPid}`);
 
       console.log('[main] Child PIDs raw:', childPidsRaw);
 
@@ -314,17 +394,14 @@ ipcMain.handle('terminal:getActiveProcess', async (event, tabId) => {
 
       // Get the first child process name
       const firstChildPid = childPids[0];
-      const processName = execSync(`ps -o comm= -p ${firstChildPid}`, {
-        encoding: 'utf-8',
-        timeout: 1000
-      }).trim();
+      const processName = await execAsync(`ps -o comm= -p ${firstChildPid}`);
 
       console.log('[main] Active process:', processName, '(PID:', firstChildPid + ')');
       return processName;
     }
   } catch (e) {
     // pgrep returns exit code 1 if no processes found - this is normal
-    if (e.status === 1) {
+    if (e.code === 1 || (e.killed === false && e.signal === null)) {
       console.log('[main] No child processes - shell is idle');
       return null;
     }
@@ -648,6 +725,33 @@ ipcMain.handle('docs:save-prompt-temp', async (event, { projectPath, promptConte
   }
 });
 
+// Save terminal selection to temp file (similar to session export, but for copied text)
+ipcMain.handle('docs:save-selection', async (event, { projectPath, selectionText }) => {
+  const fs = require('fs');
+
+  try {
+    const tmpDir = path.join(projectPath, 'docs', 'tmp');
+    if (!fs.existsSync(tmpDir)) {
+      fs.mkdirSync(tmpDir, { recursive: true });
+    }
+
+    const timestamp = Date.now();
+    const selectionFile = path.join(tmpDir, `selection-${timestamp}.txt`);
+
+    // Add preamble explaining this is copied AI history
+    const preamble = '(Весь текст ниже является копипастом из истории Claude Code / нейросетки, а не содержимым файла)\n\n---\n\n';
+    const fullContent = preamble + selectionText;
+
+    fs.writeFileSync(selectionFile, fullContent, 'utf-8');
+    console.log('[docs:save-selection] Saved selection to:', selectionFile);
+
+    return { success: true, selectionPath: selectionFile };
+  } catch (error) {
+    console.error('[docs:save-selection] Error:', error);
+    return { success: false, error: error.message };
+  }
+});
+
 // Cleanup temp files after successful Gemini start
 ipcMain.handle('docs:cleanup-temp', async (event, { exportedPath, promptPath }) => {
   const fs = require('fs');
@@ -719,10 +823,10 @@ ipcMain.handle('session:patch-checkpoint', async (event, { targetCwd, sessionKey
   }
 });
 
-// Export Claude session
-ipcMain.handle('session:export-claude', async (event, { dirPath, sessionKey }) => {
+// Export Claude session (uses explicit sessionId from output sniffing)
+ipcMain.handle('session:export-claude', async (event, { dirPath, sessionId, customName }) => {
   try {
-    const result = await sessionManager.exportClaudeSession(dirPath, sessionKey);
+    const result = await sessionManager.exportClaudeSession(dirPath, sessionId, customName);
     return result;
   } catch (error) {
     console.error('[main] Error exporting Claude session:', error);
@@ -730,10 +834,10 @@ ipcMain.handle('session:export-claude', async (event, { dirPath, sessionKey }) =
   }
 });
 
-// Import Claude session
-ipcMain.handle('session:import-claude', async (event, { dirPath, sessionKey }) => {
+// Import Claude session (patches paths and returns explicit resume command)
+ipcMain.handle('session:import-claude', async (event, { dirPath, sessionKey, sessionId }) => {
   try {
-    const result = await sessionManager.importClaudeSession(dirPath, sessionKey);
+    const result = await sessionManager.importClaudeSession(dirPath, sessionKey, sessionId);
     return result;
   } catch (error) {
     console.error('[main] Error importing Claude session:', error);
@@ -800,5 +904,170 @@ ipcMain.handle('session:get-visual', async (event, { dirPath, tabIndex }) => {
   } catch (error) {
     console.error('[main] Error getting visual snapshot:', error);
     return { success: false, error: error.message };
+  }
+});
+
+// ========== CLAUDE INPUT INTERCEPTION ==========
+
+const os = require('os');
+const fs = require('fs');
+const crypto = require('crypto');
+
+// Sniper Watcher: watch for new .jsonl file creation when claude starts
+// This captures the session ID that Claude creates
+ipcMain.on('claude:spawn-with-watcher', (event, { tabId, cwd }) => {
+  const projectSlug = cwd.replace(/\//g, '-');
+  const projectDir = path.join(os.homedir(), '.claude', 'projects', projectSlug);
+
+  console.log('[Sniper] Starting watcher for tab:', tabId);
+  console.log('[Sniper] Watching directory:', projectDir);
+
+  const startTime = Date.now();
+  let watcher = null;
+  let sessionFound = false; // Flag to prevent multiple detections
+
+  const closeWatcher = () => {
+    if (watcher) {
+      try { watcher.close(); } catch (e) {}
+      watcher = null;
+      console.log('[Sniper] Watcher closed for tab:', tabId);
+    }
+  };
+
+  try {
+    // Ensure directory exists (Claude may create it)
+    if (!fs.existsSync(projectDir)) {
+      fs.mkdirSync(projectDir, { recursive: true });
+    }
+
+    watcher = fs.watch(projectDir, (eventType, filename) => {
+      // Already found a session - ignore all further events
+      if (sessionFound) return;
+
+      // Only care about .jsonl files with agent- prefix (real sessions)
+      if (!filename || !filename.endsWith('.jsonl')) return;
+      if (!filename.startsWith('agent-')) {
+        console.log('[Sniper] Ignoring non-agent file:', filename);
+        return;
+      }
+
+      const filePath = path.join(projectDir, filename);
+
+      // Check if file is fresh (created after our start time)
+      fs.stat(filePath, (err, stats) => {
+        if (err || sessionFound) return;
+
+        // Check birthtime with 500ms tolerance
+        const fileTime = stats.birthtimeMs || stats.mtimeMs;
+        if (fileTime >= startTime - 500) {
+          sessionFound = true; // Lock - no more detections
+          const sessionId = filename.replace('.jsonl', '');
+          console.log('[Sniper] ✅ Caught session:', sessionId);
+
+          // Send session ID back to renderer
+          event.sender.send('claude:session-detected', { tabId, sessionId });
+
+          // Mission complete, close watcher
+          closeWatcher();
+        }
+      });
+    });
+
+    // Safety timeout: close watcher after 5 seconds
+    setTimeout(() => {
+      if (!sessionFound) {
+        console.log('[Sniper] Timeout - no session detected for tab:', tabId);
+      }
+      closeWatcher();
+    }, 5000);
+
+  } catch (e) {
+    console.error('[Sniper] Error setting up watcher:', e.message);
+  }
+
+  // Let the command through - don't intercept, just watch
+  const term = terminals.get(tabId);
+  if (term) {
+    term.write('claude\r');
+  }
+});
+
+// Fork Claude session file: copy .jsonl with new agent ID
+ipcMain.handle('claude:fork-session-file', async (event, { sourceSessionId, cwd }) => {
+  console.log('[Claude Fork] Copying session:', sourceSessionId);
+
+  try {
+    const projectSlug = cwd.replace(/\//g, '-');
+    const projectDir = path.join(os.homedir(), '.claude', 'projects', projectSlug);
+
+    // Generate new agent-style ID
+    const newSessionId = 'agent-' + crypto.randomUUID().slice(0, 8);
+    console.log('[Claude Fork] New session ID:', newSessionId);
+
+    const sourcePath = path.join(projectDir, `${sourceSessionId}.jsonl`);
+    const destPath = path.join(projectDir, `${newSessionId}.jsonl`);
+
+    if (!fs.existsSync(sourcePath)) {
+      console.error('[Claude Fork] Source file not found:', sourcePath);
+      return { success: false, error: 'Session file not found: ' + sourceSessionId };
+    }
+
+    // Copy the file
+    fs.copyFileSync(sourcePath, destPath);
+    console.log('[Claude Fork] Copied:', sourcePath, '->', destPath);
+
+    // IMPORTANT: Wait for Claude to index the new file
+    // Without this delay, Claude shows the picker menu
+    await new Promise(resolve => setTimeout(resolve, 500));
+
+    return { success: true, newSessionId };
+  } catch (error) {
+    console.error('[Claude Fork] Error:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// Fork Claude session: copy .jsonl file with new UUID, signal renderer to create new tab (legacy)
+ipcMain.on('claude:fork-session', async (event, { tabId, existingSessionId, cwd }) => {
+  console.log('[Claude Fork] Starting fork for tab:', tabId);
+  console.log('[Claude Fork] Existing session:', existingSessionId);
+  console.log('[Claude Fork] CWD:', cwd);
+
+  try {
+    // Generate new session ID
+    const newSessionId = crypto.randomUUID();
+    console.log('[Claude Fork] New session ID:', newSessionId);
+
+    // Calculate project slug (Claude uses path with / replaced by -)
+    const projectSlug = cwd.replace(/\//g, '-');
+    const projectDir = path.join(os.homedir(), '.claude', 'projects', projectSlug);
+    console.log('[Claude Fork] Project dir:', projectDir);
+
+    // If we have an existing session, copy its file
+    if (existingSessionId) {
+      const oldPath = path.join(projectDir, `${existingSessionId}.jsonl`);
+      const newPath = path.join(projectDir, `${newSessionId}.jsonl`);
+
+      if (fs.existsSync(oldPath)) {
+        fs.copyFileSync(oldPath, newPath);
+        console.log('[Claude Fork] Copied session file:', oldPath, '->', newPath);
+      } else {
+        console.log('[Claude Fork] Source session file not found:', oldPath);
+      }
+    }
+
+    // Send event to renderer to create new tab and run claude
+    // Renderer will handle tab creation and command execution
+    event.sender.send('claude:fork-complete', {
+      success: true,
+      newSessionId,
+      cwd
+    });
+  } catch (error) {
+    console.error('[Claude Fork] Error:', error);
+    event.sender.send('claude:fork-complete', {
+      success: false,
+      error: error.message
+    });
   }
 });

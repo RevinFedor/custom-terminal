@@ -13,6 +13,7 @@ interface FilePreview {
 }
 
 export type AIModel = 'gemini-2.0-flash' | 'gemini-3-flash-preview' | 'gemini-3-pro-preview';
+export type ThinkingLevel = 'NONE' | 'LOW' | 'MEDIUM' | 'HIGH';
 
 interface DocPromptSettings {
   useFile: boolean; // true = read from file path, false = use inline content
@@ -34,6 +35,10 @@ interface UIStore {
   // AI Model Selection (global)
   selectedModel: AIModel;
   setSelectedModel: (model: AIModel) => void;
+
+  // Thinking Level for Gemini 3
+  thinkingLevel: ThinkingLevel;
+  setThinkingLevel: (level: ThinkingLevel) => void;
 
   // Research Prompt (system prompt for Research Selection)
   researchPrompt: string;
@@ -126,6 +131,27 @@ const saveSelectedModel = (model: AIModel) => {
   }
 };
 
+// Load/save thinking level
+const loadThinkingLevel = (): ThinkingLevel => {
+  try {
+    const saved = localStorage.getItem('noted-terminal-thinking-level');
+    if (saved && ['NONE', 'LOW', 'MEDIUM', 'HIGH'].includes(saved)) {
+      return saved as ThinkingLevel;
+    }
+  } catch (e) {
+    console.error('Failed to load thinking level:', e);
+  }
+  return 'HIGH'; // Default to HIGH
+};
+
+const saveThinkingLevel = (level: ThinkingLevel) => {
+  try {
+    localStorage.setItem('noted-terminal-thinking-level', level);
+  } catch (e) {
+    console.error('Failed to save thinking level:', e);
+  }
+};
+
 const DEFAULT_RESEARCH_PROMPT = 'вот моя проблема нужно чтобы ты понял что за проблема и на reddit поискал обсуждения. Не ограничивайся категориями. Проблема: ';
 
 const loadResearchPrompt = (): string => {
@@ -182,6 +208,7 @@ const saveFontSettings = (settings: { terminalFontSize: number; tabsFontSize: nu
 
 const initialFontSettings = loadFontSettings();
 const initialModel = loadSelectedModel();
+const initialThinkingLevel = loadThinkingLevel();
 const initialResearchPrompt = loadResearchPrompt();
 const initialDocPrompt = loadDocPrompt();
 
@@ -196,6 +223,13 @@ export const useUIStore = create<UIStore>((set, get) => ({
   setSelectedModel: (model) => {
     set({ selectedModel: model });
     saveSelectedModel(model);
+  },
+
+  // Thinking Level
+  thinkingLevel: initialThinkingLevel,
+  setThinkingLevel: (level) => {
+    set({ thinkingLevel: level });
+    saveThinkingLevel(level);
   },
 
   // Research Prompt
