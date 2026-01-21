@@ -31,28 +31,22 @@ export default function Terminal({ tabId, cwd, active }: TerminalProps) {
   const pendingWriteRef = useRef<NodeJS.Timeout | null>(null);
 
   const safeFit = () => {
-    console.log('[safeFit] called, isMounted:', isMounted.current);
     if (!isMounted.current) return;
     try {
       const term = xtermInstance.current;
       const fit = fitAddonRef.current;
-      console.log('[safeFit] term:', !!term, 'fit:', !!fit);
       if (!term || !fit) return;
-      console.log('[safeFit] _isDisposed:', (term as any)._isDisposed, 'element:', !!term.element);
       if ((term as any)._isDisposed) return;
       if (!term.element) return;
-      console.log('[safeFit] cols:', term.cols, 'rows:', term.rows);
       if (!term.options || term.cols === 0 || term.rows === 0) return;
-      console.log('[safeFit] calling fit.fit()');
+
       fit.fit();
-      console.log('[safeFit] calling proposeDimensions()');
       const dims = fit.proposeDimensions();
-      console.log('[safeFit] dims:', dims);
       if (dims) {
         ipcRenderer.send('terminal:resize', tabId, dims.cols, dims.rows);
       }
     } catch (e) {
-      console.error('[safeFit] error:', e);
+      // Silently ignore fit errors
     }
   };
 
@@ -103,9 +97,20 @@ export default function Terminal({ tabId, cwd, active }: TerminalProps) {
     ipcRenderer.on('terminal:data', handleData);
     ipcRenderer.on('terminal:exit', handleExit);
 
-    // Resize observer
-    const resizeObserver = new ResizeObserver(() => {
-      if (active) safeFit();
+    // Resize observer with Guard Clause (prevents WebGL accordion effect)
+    const resizeObserver = new ResizeObserver((entries) => {
+      // Guard: If container is hidden (0x0), DON'T let xterm reset to 12x6
+      const rect = entries[0]?.contentRect;
+      if (!rect || rect.width === 0 || rect.height === 0) {
+        return;
+      }
+
+      // Only fit if active, wrapped in rAF to prevent layout thrashing
+      if (active) {
+        window.requestAnimationFrame(() => {
+          safeFit();
+        });
+      }
     });
     resizeObserver.observe(containerRef);
 
@@ -167,26 +172,20 @@ export default function Terminal({ tabId, cwd, active }: TerminalProps) {
       term.loadAddon(serializeAddon);
       term.loadAddon(new WebLinksAddon());
 
-      console.log('[initTerminal] opening terminal');
       term.open(containerRef);
-      console.log('[initTerminal] terminal opened, cols:', term.cols, 'rows:', term.rows);
 
       try {
-        console.log('[initTerminal] loading WebGL addon');
         const webgl = new WebglAddon();
         term.loadAddon(webgl);
         webglAddonRef.current = webgl;
-        console.log('[initTerminal] WebGL addon loaded');
       } catch (e) {
-        console.warn('[Terminal] WebGL addon failed to load:', e);
+        // WebGL not available, fallback to canvas renderer
       }
 
       xtermInstance.current = term;
-      console.log('[initTerminal] xtermInstance.current set');
 
       // Fit after opening
       setTimeout(() => {
-        console.log('[initTerminal] setTimeout callback, calling safeFit');
         safeFit();
         if (active) {
           term.focus();
@@ -236,14 +235,19 @@ export default function Terminal({ tabId, cwd, active }: TerminalProps) {
     };
   }, [tabId]);
 
-  // Focus and fit when becoming active
+  // Focus and fit when becoming active (with rAF to let browser paint first)
   useEffect(() => {
-    if (active && xtermInstance.current) {
-      setTimeout(() => {
-        safeFit();
-        xtermInstance.current?.focus();
-      }, 50);
+    if (!active || !xtermInstance.current) {
+      return;
     }
+
+    // Give browser 1 frame to recalculate CSS before calling fit
+    const frameId = requestAnimationFrame(() => {
+      safeFit();
+      xtermInstance.current?.focus();
+    });
+
+    return () => cancelAnimationFrame(frameId);
   }, [active]);
 
   // Handle click to focus
@@ -265,11 +269,18 @@ export default function Terminal({ tabId, cwd, active }: TerminalProps) {
     ipcRenderer.send('show-terminal-context-menu', { hasSelection, prompts });
   };
 
+  // CSS: visibility:hidden preserves geometry, prevents WebGL context loss
+  // (unlike display:none which collapses to 0x0 and kills WebGL textures)
   return (
     <div
       ref={terminalRef}
-      className={`terminal-instance absolute inset-0 ${active ? 'block' : 'hidden'}`}
-      style={{ width: '100%', height: '100%' }}
+      className="terminal-instance absolute inset-0"
+      style={{
+        width: '100%',
+        height: '100%',
+        visibility: active ? 'visible' : 'hidden',
+        zIndex: active ? 1 : -1
+      }}
       onClick={handleClick}
       onContextMenu={handleContextMenu}
     />

@@ -45,8 +45,8 @@ interface WorkspaceStore {
   closeProject: (projectId: string) => Promise<void>;
 
   // Tab management
-  createTab: (projectId: string, name?: string, cwd?: string) => Promise<string>;
-  closeTab: (projectId: string, tabId: string) => void;
+  createTab: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean }) => Promise<string>;
+  closeTab: (projectId: string, tabId: string) => Promise<void>;
   switchTab: (projectId: string, tabId: string) => void;
   renameTab: (projectId: string, tabId: string, newName: string) => void;
 
@@ -76,7 +76,9 @@ const SESSION_KEY = 'terminal-session-state';
 const saveTabs = async (projectPath: string, tabs: Map<string, Tab>) => {
   const tabsArray = Array.from(tabs.values()).map((tab) => ({
     name: tab.name,
-    cwd: tab.cwd
+    cwd: tab.cwd,
+    color: tab.color,
+    isUtility: tab.isUtility
   }));
   await ipcRenderer.invoke('project:save-tabs', { dirPath: projectPath, tabs: tabsArray });
 };
@@ -189,7 +191,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       // Restore saved tabs or create default one
       if (savedTabs.length > 0) {
         for (const savedTab of savedTabs) {
-          await createTab(projectId, savedTab.name, savedTab.cwd);
+          await createTab(projectId, savedTab.name, savedTab.cwd, {
+            color: savedTab.color,
+            isUtility: savedTab.isUtility
+          });
         }
       } else {
         // Create default tab
@@ -230,7 +235,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     }
   },
 
-  createTab: async (projectId, name, cwd) => {
+  createTab: async (projectId, name, cwd, options) => {
     const { openProjects } = get();
     const workspace = openProjects.get(projectId);
 
@@ -242,7 +247,9 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     const newTab: Tab = {
       id: tabId,
       name: name || `Tab ${workspace.tabCounter}`,
-      cwd: cwd || workspace.projectPath || process.env.HOME || '~'
+      cwd: cwd || workspace.projectPath || process.env.HOME || '~',
+      color: options?.color,
+      isUtility: options?.isUtility
     };
 
     // Create terminal
@@ -265,11 +272,21 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     return tabId;
   },
 
-  closeTab: (projectId, tabId) => {
+  closeTab: async (projectId, tabId) => {
     const { openProjects } = get();
     const workspace = openProjects.get(projectId);
 
     if (!workspace) return;
+
+    // Check if terminal has running process
+    const { hasProcess, processName } = await ipcRenderer.invoke('terminal:hasRunningProcess', tabId);
+
+    if (hasProcess) {
+      const confirmed = window.confirm(
+        `Terminal has a running process: "${processName}"\n\nAre you sure you want to close this tab?`
+      );
+      if (!confirmed) return;
+    }
 
     ipcRenderer.send('terminal:kill', tabId);
     workspace.tabs.delete(tabId);

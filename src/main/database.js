@@ -74,9 +74,19 @@ class DatabaseManager {
         cwd TEXT NOT NULL,
         position INTEGER DEFAULT 0,
         visual_snapshot TEXT DEFAULT NULL,
+        color TEXT DEFAULT NULL,
+        is_utility INTEGER DEFAULT 0,
         FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
       )
     `);
+
+    // Migration: add color and is_utility columns if they don't exist
+    try {
+      this.db.exec(`ALTER TABLE tabs ADD COLUMN color TEXT DEFAULT NULL`);
+    } catch (e) { /* column already exists */ }
+    try {
+      this.db.exec(`ALTER TABLE tabs ADD COLUMN is_utility INTEGER DEFAULT 0`);
+    } catch (e) { /* column already exists */ }
 
     // Gemini history table
     this.db.exec(`
@@ -164,7 +174,9 @@ class DatabaseManager {
       })),
       tabs: tabs.map(t => ({
         name: t.name,
-        cwd: t.cwd
+        cwd: t.cwd,
+        color: t.color || undefined,
+        isUtility: t.is_utility === 1
       }))
     };
   }
@@ -276,14 +288,14 @@ class DatabaseManager {
     // Delete existing tabs
     this.db.prepare('DELETE FROM tabs WHERE project_id = ?').run(project.id);
 
-    // Insert new tabs
+    // Insert new tabs with color and is_utility
     const insert = this.db.prepare(`
-      INSERT INTO tabs (project_id, name, cwd, position)
-      VALUES (?, ?, ?, ?)
+      INSERT INTO tabs (project_id, name, cwd, position, color, is_utility)
+      VALUES (?, ?, ?, ?, ?, ?)
     `);
 
     tabs.forEach((tab, index) => {
-      insert.run(project.id, tab.name, tab.cwd, index);
+      insert.run(project.id, tab.name, tab.cwd, index, tab.color || null, tab.isUtility ? 1 : 0);
     });
 
     this.db.prepare(`
