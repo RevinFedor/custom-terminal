@@ -109,9 +109,11 @@ app.on('activate', () => {
 
 // Create new terminal for a tab
 ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd }) => {
+    console.time(`[PERF:main] terminal:create ${tabId}`);
     const shell = process.env.SHELL || '/bin/bash';
     const workingDir = cwd || process.env.HOME;
 
+    console.time(`[PERF:main] pty.spawn ${tabId}`);
     const ptyProcess = pty.spawn(shell, [], {
       name: 'xterm-256color',
       cols: cols || 80,
@@ -119,7 +121,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd }) => {
       cwd: workingDir,
       env: process.env
     });
-
+    console.timeEnd(`[PERF:main] pty.spawn ${tabId}`);
 
     terminals.set(tabId, ptyProcess);
     terminalProjects.set(tabId, workingDir);
@@ -138,16 +140,55 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd }) => {
       terminalProjects.delete(tabId);
     });
 
+    console.timeEnd(`[PERF:main] terminal:create ${tabId}`);
     return { pid: ptyProcess.pid, cwd: workingDir };
   });
 
+// Safe PTY write with chunking (prevents TTY buffer overflow)
+async function writeToPtySafe(term, data) {
+  const CHUNK_SIZE = 1024; // 1KB - safe for TTY buffer (OS limit ~4KB)
+  const DELAY_MS = 10;     // 10ms - enough for buffer to flush
+
+  for (let i = 0; i < data.length; i += CHUNK_SIZE) {
+    const chunk = data.substring(i, i + CHUNK_SIZE);
+    term.write(chunk);
+
+    // Wait for Event Loop and TTY to process
+    if (i + CHUNK_SIZE < data.length) {
+      await new Promise(resolve => setTimeout(resolve, DELAY_MS));
+    }
+  }
+}
+
+// Bracketed Paste Mode escape sequences
+const PASTE_START = '\x1b[200~';
+const PASTE_END = '\x1b[201~';
+
 // Send input to terminal
-ipcMain.on('terminal:input', (event, tabId, data) => {
+ipcMain.on('terminal:input', async (event, tabId, data) => {
   const term = terminals.get(tabId);
-  if (term) {
-    term.write(data);
-  } else {
+  if (!term) {
     console.error('[main] Terminal not found for tabId:', tabId);
+    return;
+  }
+
+  // For large data: use chunked write with bracketed paste
+  if (data.length > 1024) {
+    console.log(`[main] Large input (${data.length} bytes), using chunked write`);
+
+    // Check if data ends with \r (Enter) - need to send it AFTER paste ends
+    const endsWithEnter = data.endsWith('\r');
+    const contentToSend = endsWithEnter ? data.slice(0, -1) : data;
+
+    await writeToPtySafe(term, PASTE_START + contentToSend + PASTE_END);
+
+    // Send Enter separately, outside of bracketed paste
+    if (endsWithEnter) {
+      await new Promise(resolve => setTimeout(resolve, 50));
+      term.write('\r');
+    }
+  } else {
+    term.write(data);
   }
 });
 
@@ -495,6 +536,134 @@ ipcMain.handle('prompts:save', async (event, prompts) => {
     return { success: true };
   } catch (error) {
     console.error('[main] Error saving prompts:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// ========== DOCS UPDATE FEATURE ==========
+
+// Export Claude session for documentation update (with file watcher approach)
+ipcMain.handle('docs:export-session', async (event, { tabId, projectPath }) => {
+  const fs = require('fs');
+  const term = terminals.get(tabId);
+
+  if (!term) {
+    return { success: false, error: 'Terminal not found' };
+  }
+
+  try {
+    // 1. Generate unique filename (Claude Code always saves as .txt regardless of input extension)
+    const timestamp = Date.now();
+    const baseFilename = `session-export-${timestamp}`;
+    const expectedFilename = `${baseFilename}.txt`; // Claude always outputs .txt
+    const tmpDir = path.join(projectPath, 'docs', 'tmp');
+
+    // Ensure tmp directory exists
+    if (!fs.existsSync(tmpDir)) {
+      fs.mkdirSync(tmpDir, { recursive: true });
+    }
+
+    const absolutePath = path.join(tmpDir, expectedFilename);
+
+    // Use relative path from projectPath (Claude Code treats path as relative to cwd)
+    // We send .md but Claude will create .txt
+    const relativePath = `docs/tmp/${baseFilename}.md`;
+    console.log('[docs:export] Starting export, expecting:', absolutePath);
+
+    // 2. Send /export command to Claude Code (same pattern as terminal:executeCommand)
+    term.write(`/export ${relativePath}`);
+    await new Promise(resolve => setTimeout(resolve, 150));
+    term.write('\r');
+
+    // 3. Wait for file to appear (polling approach)
+    const timeout = 15000; // 15 seconds max
+    const intervalTime = 200;
+    let elapsed = 0;
+
+    return new Promise((resolve) => {
+      const checkFile = setInterval(() => {
+        elapsed += intervalTime;
+
+        if (fs.existsSync(absolutePath)) {
+          const stats = fs.statSync(absolutePath);
+          if (stats.size > 0) {
+            clearInterval(checkFile);
+            console.log('[docs:export] File detected:', absolutePath);
+            resolve({ success: true, exportedPath: absolutePath });
+          }
+        }
+
+        if (elapsed >= timeout) {
+          clearInterval(checkFile);
+          console.error('[docs:export] Timeout waiting for file');
+          resolve({ success: false, error: 'Timeout: Claude did not create export file within 15s' });
+        }
+      }, intervalTime);
+    });
+  } catch (error) {
+    console.error('[docs:export] Error:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// Read documentation prompt from file
+ipcMain.handle('docs:read-prompt-file', async (event, { filePath }) => {
+  const fs = require('fs');
+
+  try {
+    if (!fs.existsSync(filePath)) {
+      return { success: false, error: 'Prompt file not found: ' + filePath };
+    }
+
+    const content = fs.readFileSync(filePath, 'utf-8');
+    console.log('[docs:read-prompt] Read prompt file:', filePath, '- Length:', content.length);
+    return { success: true, content };
+  } catch (error) {
+    console.error('[docs:read-prompt] Error reading prompt file:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// Save combined prompt to temp file for Gemini (avoids shell escaping issues)
+ipcMain.handle('docs:save-prompt-temp', async (event, { projectPath, promptContent, exportedFilePath }) => {
+  const fs = require('fs');
+
+  try {
+    const tmpDir = path.join(projectPath, 'docs', 'tmp');
+    if (!fs.existsSync(tmpDir)) {
+      fs.mkdirSync(tmpDir, { recursive: true });
+    }
+
+    const timestamp = Date.now();
+    const promptFile = path.join(tmpDir, `gemini-prompt-${timestamp}.txt`);
+    const fullPrompt = `${promptContent}\n\n${exportedFilePath}`;
+
+    fs.writeFileSync(promptFile, fullPrompt, 'utf-8');
+    console.log('[docs:save-prompt] Saved prompt to:', promptFile);
+
+    return { success: true, promptFile };
+  } catch (error) {
+    console.error('[docs:save-prompt] Error:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// Cleanup temp files after successful Gemini start
+ipcMain.handle('docs:cleanup-temp', async (event, { exportedPath, promptPath }) => {
+  const fs = require('fs');
+
+  try {
+    if (exportedPath && fs.existsSync(exportedPath)) {
+      fs.unlinkSync(exportedPath);
+      console.log('[docs:cleanup] Deleted:', exportedPath);
+    }
+    if (promptPath && fs.existsSync(promptPath)) {
+      fs.unlinkSync(promptPath);
+      console.log('[docs:cleanup] Deleted:', promptPath);
+    }
+    return { success: true };
+  } catch (error) {
+    console.error('[docs:cleanup] Error:', error);
     return { success: false, error: error.message };
   }
 });

@@ -125,8 +125,11 @@ export default function Terminal({ tabId, cwd, active }: TerminalProps) {
 
     // Async terminal initialization (waits for fonts)
     const initTerminal = async () => {
+      console.time(`[PERF] Terminal init ${tabId}`);
+      console.time(`[PERF] Terminal fonts ${tabId}`);
       // Wait for fonts to load before creating terminal (prevents metric issues)
       await document.fonts.ready;
+      console.timeEnd(`[PERF] Terminal fonts ${tabId}`);
 
       // Double-check our specific font is loaded
       const fontFamily = "'JetBrains Mono', 'JetBrainsMono NF'";
@@ -143,6 +146,7 @@ export default function Terminal({ tabId, cwd, active }: TerminalProps) {
       // Get current fontSize from store
       const currentFontSize = useUIStore.getState().terminalFontSize;
 
+      console.time(`[PERF] Terminal xterm create ${tabId}`);
       const term = new XTerminal({
         theme: {
           background: '#1a1a1a',
@@ -183,7 +187,9 @@ export default function Terminal({ tabId, cwd, active }: TerminalProps) {
       term.loadAddon(fitAddon);
       term.loadAddon(serializeAddon);
       term.loadAddon(new WebLinksAddon());
+      console.timeEnd(`[PERF] Terminal xterm create ${tabId}`);
 
+      console.time(`[PERF] Terminal open+webgl ${tabId}`);
       term.open(containerRef);
 
       try {
@@ -193,6 +199,7 @@ export default function Terminal({ tabId, cwd, active }: TerminalProps) {
       } catch (e) {
         // WebGL not available, fallback to canvas renderer
       }
+      console.timeEnd(`[PERF] Terminal open+webgl ${tabId}`);
 
       xtermInstance.current = term;
 
@@ -207,6 +214,7 @@ export default function Terminal({ tabId, cwd, active }: TerminalProps) {
         if (active) {
           term.focus();
         }
+        console.timeEnd(`[PERF] Terminal init ${tabId}`);
       }, 100);
 
       // IPC: Send input to PTY
