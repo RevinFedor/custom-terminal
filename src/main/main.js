@@ -2,6 +2,9 @@ const { app, BrowserWindow, ipcMain, Menu, dialog } = require('electron');
 const path = require('path');
 const pty = require('node-pty');
 
+// Disable HTTP cache to ensure fresh code after updates
+app.commandLine.appendSwitch('disable-http-cache');
+
 // Load modules from src/main (works for both dev and production)
 const srcMainDir = path.join(__dirname, '..', '..', 'src', 'main');
 const projectManager = require(path.join(srcMainDir, 'project-manager'));
@@ -121,7 +124,9 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd }) => {
       cwd: workingDir,
       env: {
         ...process.env,
-        COLORTERM: 'truecolor'  // Enable 24-bit colors for Ink-based CLIs (gemini, claude)
+        COLORTERM: 'truecolor',  // Enable 24-bit colors for Ink-based CLIs (gemini, claude)
+        LANG: process.env.LANG || 'en_US.UTF-8',
+        LC_ALL: process.env.LC_ALL || 'en_US.UTF-8'
       }
     });
     console.timeEnd(`[PERF:main] pty.spawn ${tabId}`);
@@ -181,14 +186,22 @@ ipcMain.on('terminal:input', async (event, tabId, data) => {
 
     // Check if data ends with \r (Enter) - need to send it AFTER paste ends
     const endsWithEnter = data.endsWith('\r');
+    console.log(`[main] endsWithEnter: ${endsWithEnter}, last chars: ${JSON.stringify(data.slice(-5))}`);
     const contentToSend = endsWithEnter ? data.slice(0, -1) : data;
 
+    console.log('[main] Starting writeToPtySafe...');
     await writeToPtySafe(term, PASTE_START + contentToSend + PASTE_END);
+    console.log('[main] writeToPtySafe completed');
 
     // Send Enter separately, outside of bracketed paste
     if (endsWithEnter) {
+      console.log('[main] Waiting 50ms before Enter...');
       await new Promise(resolve => setTimeout(resolve, 50));
+      console.log('[main] Sending Enter now!');
       term.write('\r');
+      console.log('[main] Enter sent!');
+    } else {
+      console.log('[main] ⚠️ NO ENTER TO SEND - data did not end with \\r');
     }
   } else {
     term.write(data);

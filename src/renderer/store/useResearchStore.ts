@@ -22,6 +22,11 @@ interface ResearchStore {
   closeResearch: () => void;
   toggleResearch: () => void;
 
+  // Trigger research from context menu (survives panel mount/unmount)
+  pendingResearch: boolean;
+  triggerResearch: () => void;
+  clearPendingResearch: () => void;
+
   // Conversations per project: projectId -> conversationId -> Conversation
   conversations: Record<string, Record<string, Conversation>>;
 
@@ -86,6 +91,11 @@ export const useResearchStore = create<ResearchStore>((set, get) => ({
   openResearch: () => set({ isOpen: true }),
   closeResearch: () => set({ isOpen: false }),
   toggleResearch: () => set((state) => ({ isOpen: !state.isOpen })),
+
+  // Pending research trigger (survives panel mount)
+  pendingResearch: false,
+  triggerResearch: () => set({ pendingResearch: true, isOpen: true }),
+  clearPendingResearch: () => set({ pendingResearch: false }),
 
   // Data
   conversations: initialData.conversations || {},

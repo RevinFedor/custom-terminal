@@ -20,7 +20,7 @@ interface GeminiPanelProps {
 
 export default function GeminiPanel({ projectPath, geminiPrompt }: GeminiPanelProps) {
   const { showToast, researchPrompt, selectedModel, terminalSelection } = useUIStore();
-  const { createConversation, addMessage, openResearch, getProjectConversations, setActiveConversation, deleteConversation, isLoading, setLoading, setAbortController } = useResearchStore();
+  const { createConversation, addMessage, openResearch, getProjectConversations, setActiveConversation, deleteConversation, isLoading, setLoading, setAbortController, pendingResearch, clearPendingResearch } = useResearchStore();
   const { activeProjectId } = useWorkspaceStore();
   const conversations = activeProjectId ? getProjectConversations(activeProjectId) : [];
   const [history, setHistory] = useState<HistoryItem[]>([]);
@@ -33,15 +33,14 @@ export default function GeminiPanel({ projectPath, geminiPrompt }: GeminiPanelPr
     loadHistory();
   }, [projectPath]);
 
-  // Listen for trigger-research event from context menu
+  // Check for pending research from store (survives panel mount/unmount)
   useEffect(() => {
-    const handleTriggerResearch = () => {
-      console.log('[GeminiPanel] Received trigger-research event');
+    if (pendingResearch) {
+      console.log('[GeminiPanel] Found pending research, executing...');
+      clearPendingResearch();
       handleResearchRef.current();
-    };
-    window.addEventListener('trigger-research', handleTriggerResearch);
-    return () => window.removeEventListener('trigger-research', handleTriggerResearch);
-  }, []);
+    }
+  }, [pendingResearch, clearPendingResearch]);
 
   const loadHistory = async () => {
     try {
@@ -101,7 +100,13 @@ export default function GeminiPanel({ projectPath, geminiPrompt }: GeminiPanelPr
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            contents: [{ parts: [{ text: fullPrompt }] }]
+            contents: [{ parts: [{ text: fullPrompt }] }],
+            // Tools (search) only supported on gemini-3-pro models
+            ...(selectedModel.includes('gemini-3') || selectedModel.includes('gemini-2.5') ? {
+              tools: [
+                { googleSearch: {} }
+              ]
+            } : {})
           }),
           signal: controller.signal
         }
