@@ -62,12 +62,6 @@ export default function NotesPanel({ projectId, project }: NotesPanelProps) {
     }, 500);
   };
 
-  // Get terminal selection for Gemini
-  const getSelectedText = (): string => {
-    // This will be implemented via terminal ref
-    return '';
-  };
-
   const tabs: { id: TabType; label: string }[] = [
     { id: 'notes', label: 'Notes' },
     { id: 'ai', label: 'AI' },
@@ -125,7 +119,6 @@ export default function NotesPanel({ projectId, project }: NotesPanelProps) {
           <GeminiPanel
             projectPath={project.path}
             geminiPrompt={project.geminiPrompt}
-            getSelectedText={getSelectedText}
           />
         )}
 

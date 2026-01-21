@@ -1,11 +1,120 @@
-import React, { useEffect } from 'react';
+import React, { useEffect, useState } from 'react';
+import { useUIStore } from '../../store/useUIStore';
 
 interface SettingsModalProps {
   isOpen: boolean;
   onClose: () => void;
 }
 
+type SettingsTab = 'fonts' | 'colors';
+
+// Font size slider component
+function FontSizeSlider({
+  label,
+  description,
+  value,
+  onChange,
+  min,
+  max
+}: {
+  label: string;
+  description: string;
+  value: number;
+  onChange: (v: number) => void;
+  min: number;
+  max: number;
+}) {
+  return (
+    <div style={{
+      padding: '14px',
+      backgroundColor: '#222',
+      border: '1px solid #333',
+      borderRadius: '10px',
+      marginBottom: '12px'
+    }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
+        <div>
+          <div style={{ fontSize: '14px', color: '#fff', fontWeight: '500' }}>{label}</div>
+          <div style={{ fontSize: '12px', color: '#666' }}>{description}</div>
+        </div>
+        <div style={{
+          fontSize: '14px',
+          color: '#fff',
+          backgroundColor: '#333',
+          padding: '4px 12px',
+          borderRadius: '6px',
+          minWidth: '50px',
+          textAlign: 'center'
+        }}>
+          {value}px
+        </div>
+      </div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+        <button
+          onClick={() => onChange(Math.max(min, value - 1))}
+          style={{
+            width: '28px',
+            height: '28px',
+            borderRadius: '6px',
+            border: '1px solid #444',
+            backgroundColor: '#333',
+            color: '#fff',
+            cursor: 'pointer',
+            fontSize: '16px',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center'
+          }}
+        >
+          -
+        </button>
+        <input
+          type="range"
+          min={min}
+          max={max}
+          value={value}
+          onChange={(e) => onChange(Number(e.target.value))}
+          style={{
+            flex: 1,
+            height: '4px',
+            borderRadius: '2px',
+            appearance: 'none',
+            background: `linear-gradient(to right, #666 0%, #666 ${((value - min) / (max - min)) * 100}%, #333 ${((value - min) / (max - min)) * 100}%, #333 100%)`,
+            cursor: 'pointer'
+          }}
+        />
+        <button
+          onClick={() => onChange(Math.min(max, value + 1))}
+          style={{
+            width: '28px',
+            height: '28px',
+            borderRadius: '6px',
+            border: '1px solid #444',
+            backgroundColor: '#333',
+            color: '#fff',
+            cursor: 'pointer',
+            fontSize: '16px',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center'
+          }}
+        >
+          +
+        </button>
+      </div>
+    </div>
+  );
+}
+
 export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
+  const [activeTab, setActiveTab] = useState<SettingsTab>('fonts');
+  const terminalFontSize = useUIStore((s) => s.terminalFontSize);
+  const tabsFontSize = useUIStore((s) => s.tabsFontSize);
+  const projectTabsFontSize = useUIStore((s) => s.projectTabsFontSize);
+  const setTerminalFontSize = useUIStore((s) => s.setTerminalFontSize);
+  const setTabsFontSize = useUIStore((s) => s.setTabsFontSize);
+  const setProjectTabsFontSize = useUIStore((s) => s.setProjectTabsFontSize);
+
   // Close on Escape
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -68,66 +177,132 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
           </button>
         </div>
 
+        {/* Tabs */}
+        <div style={{
+          display: 'flex',
+          borderBottom: '1px solid #333',
+          padding: '0 24px'
+        }}>
+          <button
+            onClick={() => setActiveTab('fonts')}
+            style={{
+              padding: '12px 16px',
+              fontSize: '14px',
+              color: activeTab === 'fonts' ? '#fff' : '#666',
+              backgroundColor: 'transparent',
+              border: 'none',
+              borderBottom: activeTab === 'fonts' ? '2px solid #fff' : '2px solid transparent',
+              cursor: 'pointer',
+              marginBottom: '-1px'
+            }}
+          >
+            Fonts
+          </button>
+          <button
+            onClick={() => setActiveTab('colors')}
+            style={{
+              padding: '12px 16px',
+              fontSize: '14px',
+              color: activeTab === 'colors' ? '#fff' : '#666',
+              backgroundColor: 'transparent',
+              border: 'none',
+              borderBottom: activeTab === 'colors' ? '2px solid #fff' : '2px solid transparent',
+              cursor: 'pointer',
+              marginBottom: '-1px'
+            }}
+          >
+            Colors
+          </button>
+        </div>
+
         {/* Content */}
-        <div style={{ padding: '24px' }}>
-          {/* Tab Colors Reference */}
-          <h3 style={{ fontSize: '14px', fontWeight: '600', color: '#fff', margin: '0 0 16px 0' }}>
-            Tab Colors
-          </h3>
+        <div style={{ padding: '24px', minHeight: '280px' }}>
+          {activeTab === 'fonts' && (
+            <>
+              <FontSizeSlider
+                label="Terminal"
+                description="Font size inside terminal (Cmd+/- to adjust)"
+                value={terminalFontSize}
+                onChange={setTerminalFontSize}
+                min={8}
+                max={24}
+              />
+              <FontSizeSlider
+                label="Tabs"
+                description="Workspace tabs (Main + Utils)"
+                value={tabsFontSize}
+                onChange={setTabsFontSize}
+                min={10}
+                max={20}
+              />
+              <FontSizeSlider
+                label="Projects"
+                description="Project chips in title bar"
+                value={projectTabsFontSize}
+                onChange={setProjectTabsFontSize}
+                min={10}
+                max={16}
+              />
+            </>
+          )}
 
-          {/* System Colors */}
-          <div style={{
-            padding: '14px',
-            backgroundColor: '#222',
-            border: '1px solid #333',
-            borderRadius: '10px',
-            marginBottom: '12px'
-          }}>
-            <div style={{ fontSize: '11px', fontWeight: '600', color: '#666', marginBottom: '12px', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
-              System (Auto-assigned)
-            </div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-              <div style={{ width: '24px', height: '24px', borderRadius: '50%', backgroundColor: 'rgba(34, 197, 94, 0.2)', border: '2px solid rgb(34, 197, 94)' }} />
-              <div>
-                <div style={{ fontSize: '14px', color: '#fff', fontWeight: '500' }}>Green — System Tool</div>
-                <div style={{ fontSize: '12px', color: '#666' }}>AI agents (Gemini CLI, Claude Code)</div>
+          {activeTab === 'colors' && (
+            <>
+              {/* System Colors */}
+              <div style={{
+                padding: '14px',
+                backgroundColor: '#222',
+                border: '1px solid #333',
+                borderRadius: '10px',
+                marginBottom: '12px'
+              }}>
+                <div style={{ fontSize: '11px', fontWeight: '600', color: '#666', marginBottom: '12px', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+                  System (Auto-assigned)
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                  <div style={{ width: '24px', height: '24px', borderRadius: '50%', backgroundColor: 'rgba(34, 197, 94, 0.2)', border: '2px solid rgb(34, 197, 94)' }} />
+                  <div>
+                    <div style={{ fontSize: '14px', color: '#fff', fontWeight: '500' }}>Green — System Tool</div>
+                    <div style={{ fontSize: '12px', color: '#666' }}>AI agents (Gemini CLI, Claude Code)</div>
+                  </div>
+                </div>
               </div>
-            </div>
-          </div>
 
-          {/* User Colors */}
-          <div style={{
-            padding: '14px',
-            backgroundColor: '#222',
-            border: '1px solid #333',
-            borderRadius: '10px'
-          }}>
-            <div style={{ fontSize: '11px', fontWeight: '600', color: '#666', marginBottom: '12px', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
-              User (Manual via Right-Click)
-            </div>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-                <div style={{ width: '20px', height: '20px', borderRadius: '50%', backgroundColor: 'transparent', border: '2px solid #666' }} />
-                <span style={{ fontSize: '13px', color: '#888' }}>Default — no special meaning</span>
+              {/* User Colors */}
+              <div style={{
+                padding: '14px',
+                backgroundColor: '#222',
+                border: '1px solid #333',
+                borderRadius: '10px'
+              }}>
+                <div style={{ fontSize: '11px', fontWeight: '600', color: '#666', marginBottom: '12px', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+                  User (Manual via Right-Click)
+                </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                    <div style={{ width: '20px', height: '20px', borderRadius: '50%', backgroundColor: 'transparent', border: '2px solid #666' }} />
+                    <span style={{ fontSize: '13px', color: '#888' }}>Default — no special meaning</span>
+                  </div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                    <div style={{ width: '20px', height: '20px', borderRadius: '50%', backgroundColor: 'rgba(239, 68, 68, 0.2)', border: '2px solid rgb(239, 68, 68)' }} />
+                    <span style={{ fontSize: '13px', color: '#888' }}>Red — for your labels</span>
+                  </div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                    <div style={{ width: '20px', height: '20px', borderRadius: '50%', backgroundColor: 'rgba(234, 179, 8, 0.2)', border: '2px solid rgb(234, 179, 8)' }} />
+                    <span style={{ fontSize: '13px', color: '#888' }}>Yellow — for your labels</span>
+                  </div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                    <div style={{ width: '20px', height: '20px', borderRadius: '50%', backgroundColor: 'rgba(59, 130, 246, 0.2)', border: '2px solid rgb(59, 130, 246)' }} />
+                    <span style={{ fontSize: '13px', color: '#888' }}>Blue — for your labels</span>
+                  </div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                    <div style={{ width: '20px', height: '20px', borderRadius: '50%', backgroundColor: 'rgba(168, 85, 247, 0.2)', border: '2px solid rgb(168, 85, 247)' }} />
+                    <span style={{ fontSize: '13px', color: '#888' }}>Purple — for your labels</span>
+                  </div>
+                </div>
               </div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-                <div style={{ width: '20px', height: '20px', borderRadius: '50%', backgroundColor: 'rgba(239, 68, 68, 0.2)', border: '2px solid rgb(239, 68, 68)' }} />
-                <span style={{ fontSize: '13px', color: '#888' }}>Red — for your labels</span>
-              </div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-                <div style={{ width: '20px', height: '20px', borderRadius: '50%', backgroundColor: 'rgba(234, 179, 8, 0.2)', border: '2px solid rgb(234, 179, 8)' }} />
-                <span style={{ fontSize: '13px', color: '#888' }}>Yellow — for your labels</span>
-              </div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-                <div style={{ width: '20px', height: '20px', borderRadius: '50%', backgroundColor: 'rgba(59, 130, 246, 0.2)', border: '2px solid rgb(59, 130, 246)' }} />
-                <span style={{ fontSize: '13px', color: '#888' }}>Blue — for your labels</span>
-              </div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-                <div style={{ width: '20px', height: '20px', borderRadius: '50%', backgroundColor: 'rgba(168, 85, 247, 0.2)', border: '2px solid rgb(168, 85, 247)' }} />
-                <span style={{ fontSize: '13px', color: '#888' }}>Purple — for your labels</span>
-              </div>
-            </div>
-          </div>
+            </>
+          )}
         </div>
 
         {/* Footer */}

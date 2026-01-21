@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { useWorkspaceStore } from './store/useWorkspaceStore';
 import { useProjectsStore } from './store/useProjectsStore';
 import { useUIStore } from './store/useUIStore';
+import { useResearchStore } from './store/useResearchStore';
 import Dashboard from './components/Dashboard/Dashboard';
 import Workspace from './components/Workspace/Workspace';
 import ToastContainer from './components/UI/Toast';
@@ -14,7 +15,9 @@ const { ipcRenderer } = window.require('electron');
 function App() {
   const { view, showDashboard, openProject, openProjects, activeProjectId, closeProject, createTab, closeTab, getActiveProject, restoreSession } = useWorkspaceStore();
   const { projects, loadProjects } = useProjectsStore();
-  const { toggleFileExplorer, closeFilePreview, filePreview, showToast } = useUIStore();
+  const { toggleFileExplorer, closeFilePreview, filePreview, showToast, incrementTerminalFontSize, decrementTerminalFontSize } = useUIStore();
+  const { toggleResearch } = useResearchStore();
+  const projectTabsFontSize = useUIStore((s) => s.projectTabsFontSize);
   const [settingsOpen, setSettingsOpen] = useState(false);
 
   // Load projects and restore session ONCE on mount
@@ -93,15 +96,47 @@ function App() {
         setSettingsOpen(true);
         return;
       }
+
+      // Cmd+= (plus) - Increase terminal font size
+      if (e.metaKey && (e.code === 'Equal' || e.code === 'NumpadAdd')) {
+        e.preventDefault();
+        incrementTerminalFontSize();
+        return;
+      }
+
+      // Cmd+- (minus) - Decrease terminal font size
+      if (e.metaKey && (e.code === 'Minus' || e.code === 'NumpadSubtract')) {
+        e.preventDefault();
+        decrementTerminalFontSize();
+        return;
+      }
+
+      // Cmd+Shift+R - Toggle Research panel
+      if (e.metaKey && e.shiftKey && e.code === 'KeyR') {
+        e.preventDefault();
+        if (view === 'workspace') {
+          toggleResearch();
+        }
+        return;
+      }
     };
 
     window.addEventListener('keydown', handleKeyDown);
 
     // Handle Context Menu commands from main process
     const handleContextMenuCommand = (_: any, cmd: string, data?: any) => {
+      console.log('[ContextMenu] Command received:', cmd);
       if (cmd === 'gemini-research') {
-        // Trigger Gemini research - switch to AI tab
-        showToast('Select text and use AI tab', 'info');
+        // Trigger Research - same as clicking "Research Selection" button
+        const terminalSelection = useUIStore.getState().terminalSelection;
+        console.log('[ContextMenu] Selection:', terminalSelection ? terminalSelection.slice(0, 50) : 'EMPTY');
+        if (terminalSelection) {
+          // Dispatch event that GeminiPanel listens to
+          window.dispatchEvent(new CustomEvent('trigger-research'));
+          console.log('[ContextMenu] Triggered research');
+        } else {
+          showToast('Select text in terminal first', 'error');
+        }
       } else if (cmd === 'insert-prompt') {
         // Insert prompt text into active terminal
         const activeProject = getActiveProject();
@@ -118,7 +153,7 @@ function App() {
       window.removeEventListener('keydown', handleKeyDown);
       ipcRenderer.removeListener('context-menu-command', handleContextMenuCommand);
     };
-  }, [view, activeProjectId, filePreview]);
+  }, [view, activeProjectId, filePreview, incrementTerminalFontSize, decrementTerminalFontSize, toggleResearch]);
 
   const openProjectsList = Array.from(openProjects.entries());
 
@@ -136,11 +171,12 @@ function App() {
         <div className="flex items-center gap-2 px-2" style={{ WebkitAppRegion: 'no-drag' } as any}>
           {/* Home */}
           <button
-            className={`project-chip flex items-center gap-1 px-3 py-0.5 rounded-xl text-xs border transition-all duration-150 h-[22px] cursor-pointer ${
+            className={`project-chip flex items-center gap-1 px-3 py-0.5 rounded-xl border transition-all duration-150 h-[22px] cursor-pointer ${
               view === 'dashboard'
                 ? 'bg-accent border-accent text-white'
                 : 'bg-transparent border-border-main hover:bg-[#3a3a3c] hover:border-accent text-text-main'
             }`}
+            style={{ fontSize: `${projectTabsFontSize}px` }}
             onClick={() => {
               showDashboard();
             }}
@@ -157,11 +193,12 @@ function App() {
             return (
               <div
                 key={projectId}
-                className={`project-chip group flex items-center gap-1 px-3 py-0.5 rounded-xl text-xs border transition-all duration-150 h-[22px] cursor-pointer ${
+                className={`project-chip group flex items-center gap-1 px-3 py-0.5 rounded-xl border transition-all duration-150 h-[22px] cursor-pointer ${
                   activeProjectId === projectId
                     ? 'bg-accent border-accent text-white'
                     : 'bg-transparent border-border-main hover:bg-[#3a3a3c] hover:border-accent text-text-main'
                 }`}
+                style={{ fontSize: `${projectTabsFontSize}px` }}
                 onClick={() => openProject(projectId, project.path)}
               >
                 <span className="max-w-[100px] truncate">{project.name}</span>

@@ -292,8 +292,15 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     workspace.tabs.delete(tabId);
 
     if (workspace.activeTabId === tabId) {
-      const remainingTabs = Array.from(workspace.tabs.keys());
-      workspace.activeTabId = remainingTabs.length > 0 ? remainingTabs[0] : null;
+      // Only switch to Main tabs (not utility) - get last Main tab
+      const mainTabs = Array.from(workspace.tabs.values()).filter(t => !t.isUtility);
+      if (mainTabs.length > 0) {
+        // Switch to last Main tab
+        workspace.activeTabId = mainTabs[mainTabs.length - 1].id;
+      } else {
+        // No Main tabs left - set to null (show placeholder, don't auto-switch to Utils)
+        workspace.activeTabId = null;
+      }
     }
 
     set({ openProjects: new Map(openProjects) });

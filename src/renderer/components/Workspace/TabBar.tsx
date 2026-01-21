@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect, memo } from 'react';
 import { useWorkspaceStore, TabColor } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
+import { useUIStore } from '../../store/useUIStore';
 import { motion, AnimatePresence } from 'framer-motion';
 import { draggable, dropTargetForElements, monitorForElements } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
 import { attachClosestEdge, extractClosestEdge, type Edge } from '@atlaskit/pragmatic-drag-and-drop-hitbox/closest-edge';
@@ -85,6 +86,7 @@ interface TabItemProps {
   onEditKeyDown: (e: React.KeyboardEvent) => void;
   inputRef: React.RefObject<HTMLInputElement>;
   forceRightIndicator?: boolean; // Show right indicator when empty zone is hovered
+  fontSize: number;
 }
 
 const TabItem = memo(({
@@ -103,6 +105,7 @@ const TabItem = memo(({
   onEditKeyDown,
   inputRef,
   forceRightIndicator = false,
+  fontSize,
 }: TabItemProps) => {
   const ref = useRef<HTMLDivElement>(null);
   const [closestEdge, setClosestEdge] = useState<Edge | null>(null);
@@ -194,7 +197,7 @@ const TabItem = memo(({
     cursor: 'pointer',
     overflow: 'visible',
     padding: isHorizontal ? '0 16px' : '0 12px',
-    fontSize: '14px',
+    fontSize: `${fontSize}px`,
     height: isHorizontal ? 'auto' : '36px', // Fixed height for utility tabs
     minWidth: isHorizontal ? 'auto' : '160px',
     color: (isActive || isHovered) ? '#fff' : '#888',
@@ -442,6 +445,7 @@ export default function TabBar({ projectId }: TabBarProps) {
     moveTabToZone
   } = useWorkspaceStore();
   const { projects } = useProjectsStore();
+  const tabsFontSize = useUIStore((state) => state.tabsFontSize);
 
   const [editingTabId, setEditingTabId] = useState<string | null>(null);
   const [editValue, setEditValue] = useState('');
@@ -683,7 +687,7 @@ export default function TabBar({ projectId }: TabBarProps) {
                 gap: '6px',
                 padding: '0 12px',
                 height: '100%',
-                fontSize: '14px',
+                fontSize: `${tabsFontSize}px`,
                 color: activeTabInUtils ? '#fff' : '#888',
                 backgroundColor: activeTabInUtils ? 'rgba(255,255,255,0.05)' : 'transparent',
                 borderTop: activeTabInUtils ? '2px solid rgba(255,255,255,0.7)' : '2px solid transparent',
@@ -750,6 +754,7 @@ export default function TabBar({ projectId }: TabBarProps) {
                           onEditSubmit={handleRenameSubmit}
                           onEditKeyDown={handleRenameKeyDown}
                           inputRef={inputRef as React.RefObject<HTMLInputElement>}
+                          fontSize={tabsFontSize}
                         />
                       ))}
                     </div>
@@ -789,6 +794,7 @@ export default function TabBar({ projectId }: TabBarProps) {
                     onEditKeyDown={handleRenameKeyDown}
                     inputRef={inputRef as React.RefObject<HTMLInputElement>}
                     forceRightIndicator={emptyZoneHovered && index === mainTabs.length - 1}
+                    fontSize={tabsFontSize}
                   />
                 ))}
               </div>

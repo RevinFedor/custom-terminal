@@ -5,7 +5,19 @@ export default function ToastContainer() {
   const { toasts, removeToast } = useUIStore();
 
   return (
-    <div className="fixed top-16 right-4 z-[100] pointer-events-none flex flex-col gap-2 max-w-[300px]">
+    <div
+      style={{
+        position: 'fixed',
+        top: '52px',
+        right: '16px',
+        zIndex: 9999,
+        pointerEvents: 'none',
+        display: 'flex',
+        flexDirection: 'column',
+        gap: '8px',
+        maxWidth: '300px'
+      }}
+    >
       {toasts.map((toast) => (
         <div
           key={toast.id}
