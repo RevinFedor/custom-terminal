@@ -61,7 +61,7 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
       }
 
       // Create new tab with pending command
-      const pendingCommand = `claude --resume ${data.newSessionId}`;
+      const pendingCommand = `claude --dangerously-skip-permissions --resume ${data.newSessionId}`;
       console.log('[TerminalArea] Creating new tab with command:', pendingCommand);
 
       // Find project that contains this cwd

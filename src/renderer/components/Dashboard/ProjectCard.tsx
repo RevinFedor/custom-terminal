@@ -12,13 +12,18 @@ interface Project {
   description?: string;
 }
 
+interface TabsStats {
+  total: number;
+  active: number;
+}
+
 interface ProjectCardProps {
   project: Project;
   onOpen: () => void;
-  activeTabsCount?: number;
+  tabsStats?: TabsStats;
 }
 
-export default function ProjectCard({ project, onOpen, activeTabsCount = 0 }: ProjectCardProps) {
+export default function ProjectCard({ project, onOpen, tabsStats = { total: 0, active: 0 } }: ProjectCardProps) {
   const [menuOpen, setMenuOpen] = useState(false);
   const { openEditModal, showToast } = useUIStore();
   const { loadProjects } = useProjectsStore();
@@ -118,7 +123,16 @@ export default function ProjectCard({ project, onOpen, activeTabsCount = 0 }: Pr
 
       {/* Footer */}
       <div className="flex items-center justify-between text-xs text-[#888]">
-        <span>{activeTabsCount} active tab{activeTabsCount !== 1 ? 's' : ''}</span>
+        {tabsStats.total > 0 ? (
+          <span>
+            {tabsStats.total} tab{tabsStats.total !== 1 ? 's' : ''}
+            {tabsStats.active > 0 && (
+              <span className="text-green-400 ml-1">• {tabsStats.active} active</span>
+            )}
+          </span>
+        ) : (
+          <span>No open tabs</span>
+        )}
         <span className="text-accent">Click to open →</span>
       </div>
     </div>
