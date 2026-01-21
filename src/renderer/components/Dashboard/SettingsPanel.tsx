@@ -13,7 +13,7 @@ interface Prompt {
   content: string;
 }
 
-export default function SettingsPanel() {
+export default function PromptsPanel() {
   const { showToast } = useUIStore();
 
   const [commands, setCommands] = useState<Command[]>([]);
@@ -115,8 +115,8 @@ export default function SettingsPanel() {
         {/* Commands Column */}
         <div style={{ flex: '1 1 50%', minWidth: 0 }}>
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '16px' }}>
-            <h2 style={{ fontSize: '16px', fontWeight: '600', color: '#fff', margin: 0, display: 'flex', alignItems: 'center', gap: '8px' }}>
-              <span style={{ fontSize: '18px' }}>⚡</span> Quick Commands
+            <h2 style={{ fontSize: '16px', fontWeight: '600', color: '#fff', margin: 0 }}>
+              Quick Commands
             </h2>
             <button
               onClick={addCommand}
@@ -249,8 +249,8 @@ export default function SettingsPanel() {
         {/* Prompts Column */}
         <div style={{ flex: '1 1 50%', minWidth: 0 }}>
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '16px' }}>
-            <h2 style={{ fontSize: '16px', fontWeight: '600', color: '#fff', margin: 0, display: 'flex', alignItems: 'center', gap: '8px' }}>
-              <span style={{ fontSize: '18px' }}>💬</span> AI Prompts
+            <h2 style={{ fontSize: '16px', fontWeight: '600', color: '#fff', margin: 0 }}>
+              AI Prompts
             </h2>
             <button
               onClick={addPrompt}

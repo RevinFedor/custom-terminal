@@ -25,13 +25,13 @@ type DragData = {
   index: number;
 };
 
-const TAB_COLORS: { color: TabColor; bg: string; border: string; label: string }[] = [
-  { color: 'default', bg: 'bg-transparent', border: 'border-accent', label: '⚪ Default' },
-  { color: 'red', bg: 'bg-red-500/20', border: 'border-red-500', label: '🔴 Red' },
-  { color: 'yellow', bg: 'bg-yellow-500/20', border: 'border-yellow-500', label: '🟡 Yellow' },
-  { color: 'green', bg: 'bg-green-500/20', border: 'border-green-500', label: '🟢 Green' },
-  { color: 'blue', bg: 'bg-blue-500/20', border: 'border-blue-500', label: '🔵 Blue' },
-  { color: 'purple', bg: 'bg-purple-500/20', border: 'border-purple-500', label: '🟣 Purple' },
+const TAB_COLORS: { color: TabColor; bgColor: string; borderColor: string; label: string }[] = [
+  { color: 'default', bgColor: 'transparent', borderColor: '#666', label: '⚪ Default' },
+  { color: 'red', bgColor: 'rgba(239, 68, 68, 0.2)', borderColor: 'rgb(239, 68, 68)', label: '🔴 Red' },
+  { color: 'yellow', bgColor: 'rgba(234, 179, 8, 0.2)', borderColor: 'rgb(234, 179, 8)', label: '🟡 Yellow' },
+  { color: 'green', bgColor: 'rgba(34, 197, 94, 0.2)', borderColor: 'rgb(34, 197, 94)', label: '🟢 Green' },
+  { color: 'blue', bgColor: 'rgba(59, 130, 246, 0.2)', borderColor: 'rgb(59, 130, 246)', label: '🔵 Blue' },
+  { color: 'purple', bgColor: 'rgba(168, 85, 247, 0.2)', borderColor: 'rgb(168, 85, 247)', label: '🟣 Purple' },
 ];
 
 
@@ -150,22 +150,72 @@ const TabItem = memo(({
   }, [tab.id, zone, index]);
 
   const isHorizontal = zone === 'main';
+  const [isHovered, setIsHovered] = useState(false);
 
-  // Unified tab styles for both main and utility zones
+  // Get color config
   const colorConfig = TAB_COLORS.find(c => c.color === tab.color) || TAB_COLORS[0];
-  const baseClasses = `relative group flex items-center justify-center gap-2 cursor-pointer transition-colors overflow-visible px-4 text-[14px]`;
-  const activeClasses = isActive
-    ? `text-white ${colorConfig.bg !== 'bg-transparent' ? colorConfig.bg : 'bg-white/5'}`
-    : 'text-[#888] hover:text-white hover:bg-white/5';
-  const borderClass = isHorizontal && isActive ? `border-t-2 ${colorConfig.border}` : '';
+
+
+  // Determine background color
+  const hasColor = tab.color && tab.color !== 'default';
+
+  const getBgColor = () => {
+    // Colored tabs always show their background
+    if (hasColor) {
+      return colorConfig.bgColor;
+    }
+    // Default tabs: background only when active or hovered
+    if (isActive) {
+      return 'rgba(255,255,255,0.05)';
+    }
+    if (isHovered) {
+      return 'rgba(255,255,255,0.05)';
+    }
+    return 'transparent';
+  };
+
+  // Border for ACTIVE tabs (always reserve 2px space to avoid jump)
+  const getActiveBorder = () => {
+    if (!isActive) {
+      return '2px solid transparent';
+    }
+    // Active default tab = brighter white line
+    const borderColor = !hasColor ? 'rgba(255,255,255,0.7)' : colorConfig.borderColor;
+    return `2px solid ${borderColor}`;
+  };
+
+  // Build inline styles - full control to avoid Tailwind conflicts
+  const tabStyle: React.CSSProperties = {
+    position: 'relative',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: isHorizontal ? 'center' : 'space-between', // Space-between for utility (close btn right)
+    gap: '8px',
+    cursor: 'pointer',
+    overflow: 'visible',
+    padding: isHorizontal ? '0 16px' : '0 12px',
+    fontSize: '14px',
+    height: isHorizontal ? 'auto' : '36px', // Fixed height for utility tabs
+    minWidth: isHorizontal ? 'auto' : '160px',
+    color: (isActive || isHovered) ? '#fff' : '#888',
+    backgroundColor: getBgColor(),
+    // Horizontal tabs: border on top. Vertical tabs: border on left
+    borderTop: isHorizontal ? getActiveBorder() : 'none',
+    borderLeft: !isHorizontal ? getActiveBorder() : 'none',
+    opacity: isDragging ? 0.5 : 1,
+    transition: 'color 0.15s ease, background-color 0.15s ease'
+  };
 
   return (
     <div
       ref={ref}
-      className={`${baseClasses} ${activeClasses} ${borderClass} ${isDragging ? 'opacity-50' : ''}`}
+      className="group"
+      style={tabStyle}
       onClick={onSwitch}
       onDoubleClick={onDoubleClick}
       onContextMenu={onContextMenu}
+      onMouseEnter={() => setIsHovered(true)}
+      onMouseLeave={() => setIsHovered(false)}
     >
       {isEditing ? (
         <input
@@ -179,13 +229,13 @@ const TabItem = memo(({
           onClick={(e) => e.stopPropagation()}
         />
       ) : (
-        <span className="select-none whitespace-nowrap">
+        <span className="select-none whitespace-nowrap overflow-hidden text-ellipsis" style={{ flex: isHorizontal ? 'none' : 1 }}>
           {tab.name}
         </span>
       )}
 
       <button
-        className="text-[#666] hover:text-white text-lg leading-none opacity-0 group-hover:opacity-100 transition-opacity cursor-pointer"
+        className="text-[#666] hover:text-white text-lg leading-none opacity-0 group-hover:opacity-100 transition-opacity cursor-pointer flex-shrink-0"
         onClick={(e) => {
           e.stopPropagation();
           onClose(e);
@@ -546,7 +596,9 @@ export default function TabBar({ projectId }: TabBarProps) {
   };
 
   const handleSetColor = (color: TabColor) => {
-    if (contextMenu) setTabColor(projectId, contextMenu.tabId, color);
+    if (contextMenu) {
+      setTabColor(projectId, contextMenu.tabId, color);
+    }
     setContextMenu(null);
   };
 
@@ -600,6 +652,9 @@ export default function TabBar({ projectId }: TabBarProps) {
     };
   }, [utilityExpanded, isDraggingTab]);
 
+  // Check if active tab is in utility zone
+  const activeTabInUtils = utilityTabs.some(t => t.id === workspace.activeTabId);
+
   return (
     <>
       {/* Single row TabBar like VSCode */}
@@ -622,7 +677,31 @@ export default function TabBar({ projectId }: TabBarProps) {
                 setUtilityExpanded(!utilityExpanded);
                 setUtilityOpenedManually(!utilityExpanded); // Track manual toggle
               }}
-              className="flex items-center gap-1.5 px-3 h-full text-[14px] text-[#888] hover:text-white hover:bg-white/5 transition-colors cursor-pointer"
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: '6px',
+                padding: '0 12px',
+                height: '100%',
+                fontSize: '14px',
+                color: activeTabInUtils ? '#fff' : '#888',
+                backgroundColor: activeTabInUtils ? 'rgba(255,255,255,0.05)' : 'transparent',
+                borderTop: activeTabInUtils ? '2px solid rgba(255,255,255,0.7)' : '2px solid transparent',
+                cursor: 'pointer',
+                transition: 'all 0.15s ease'
+              }}
+              onMouseEnter={(e) => {
+                if (!activeTabInUtils) {
+                  e.currentTarget.style.color = '#fff';
+                  e.currentTarget.style.backgroundColor = 'rgba(255,255,255,0.05)';
+                }
+              }}
+              onMouseLeave={(e) => {
+                if (!activeTabInUtils) {
+                  e.currentTarget.style.color = '#888';
+                  e.currentTarget.style.backgroundColor = 'transparent';
+                }
+              }}
             >
               <ChevronDown
                 size={16}
@@ -642,7 +721,7 @@ export default function TabBar({ projectId }: TabBarProps) {
                 initial={{ opacity: 0, y: -10 }}
                 animate={{ opacity: 1, y: 0 }}
                 exit={{ opacity: 0, y: -10 }}
-                className="absolute top-full left-0 bg-panel border border-border-main rounded-lg shadow-xl min-w-[150px] z-50 overflow-hidden"
+                className="absolute top-full left-0 bg-panel border border-border-main shadow-xl min-w-[160px] z-50 overflow-hidden"
               >
                 <ZoneDropTarget zone="utility" isEmpty={utilityTabs.length === 0}>
                   {utilityTabs.length === 0 ? (
@@ -650,7 +729,7 @@ export default function TabBar({ projectId }: TabBarProps) {
                       Drag tabs here
                     </div>
                   ) : (
-                    <div className="py-1 flex flex-col">
+                    <div className="flex flex-col">
                       {utilityTabs.map((tab, index) => (
                         <TabItem
                           key={tab.id}
@@ -660,8 +739,11 @@ export default function TabBar({ projectId }: TabBarProps) {
                           isActive={workspace.activeTabId === tab.id}
                           isEditing={editingTabId === tab.id}
                           editValue={editValue}
-                          onSwitch={() => switchTab(projectId, tab.id)}
-                          onClose={() => toggleTabUtility(projectId, tab.id)}
+                          onSwitch={() => {
+                            switchTab(projectId, tab.id);
+                            setUtilityExpanded(false); // Close dropdown on tab click
+                          }}
+                          onClose={() => closeTab(projectId, tab.id)} // Close tab, not move to main
                           onDoubleClick={() => handleDoubleClick(tab.id, tab.name)}
                           onContextMenu={(e) => handleContextMenu(e, tab.id)}
                           onEditChange={setEditValue}
@@ -748,19 +830,35 @@ export default function TabBar({ projectId }: TabBarProps) {
           onClick={(e) => e.stopPropagation()}
           onMouseDown={(e) => e.stopPropagation()}
         >
-          <div className="px-2 py-1 text-[10px] text-[#666] uppercase">Color</div>
-          <div className="flex gap-1 px-3 py-1">
-            {TAB_COLORS.map((c) => (
-              <button
-                key={c.color}
-                className={`w-5 h-5 rounded-full border-2 ${c.border} ${c.bg} hover:scale-110 transition-transform cursor-pointer`}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  handleSetColor(c.color);
-                }}
-                title={c.label}
-              />
-            ))}
+          <div className="px-3 py-1.5 text-[10px] text-[#666] uppercase">Color</div>
+          <div className="flex gap-3 px-3 py-2">
+            {TAB_COLORS.map((c) => {
+              const isSelected = workspace.tabs.get(contextMenu.tabId)?.color === c.color ||
+                (!workspace.tabs.get(contextMenu.tabId)?.color && c.color === 'default');
+              return (
+                <button
+                  key={c.color}
+                  style={{
+                    width: '28px',
+                    height: '28px',
+                    borderRadius: '50%',
+                    border: `2px solid ${c.borderColor}`,
+                    backgroundColor: c.bgColor,
+                    cursor: 'pointer',
+                    transition: 'transform 0.1s',
+                    outline: isSelected ? '2px solid white' : 'none',
+                    outlineOffset: '2px'
+                  }}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    handleSetColor(c.color);
+                  }}
+                  onMouseEnter={(e) => (e.currentTarget.style.transform = 'scale(1.15)')}
+                  onMouseLeave={(e) => (e.currentTarget.style.transform = 'scale(1)')}
+                  title={c.label}
+                />
+              );
+            })}
           </div>
 
           <div className="border-t border-border-main my-1" />

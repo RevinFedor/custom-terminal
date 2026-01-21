@@ -2,12 +2,12 @@ import React, { useState, useEffect } from 'react';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import ProjectCard from './ProjectCard';
-import SettingsPanel from './SettingsPanel';
+import PromptsPanel from './SettingsPanel';
 
 const { ipcRenderer } = window.require('electron');
 
 export default function Dashboard() {
-  const [activeTab, setActiveTab] = useState<'projects' | 'settings'>('projects');
+  const [activeTab, setActiveTab] = useState<'projects' | 'prompts'>('projects');
   const { projects, loadProjects } = useProjectsStore();
   const { openProject, openProjects } = useWorkspaceStore();
 
@@ -70,11 +70,11 @@ export default function Dashboard() {
           </button>
           <button
             className={`flex-1 relative z-10 bg-transparent border-none py-1 px-4 text-[13px] cursor-pointer rounded-full font-medium ${
-              activeTab === 'settings' ? 'text-white' : 'text-[#888] hover:text-[#ccc]'
+              activeTab === 'prompts' ? 'text-white' : 'text-[#888] hover:text-[#ccc]'
             }`}
-            onClick={() => setActiveTab('settings')}
+            onClick={() => setActiveTab('prompts')}
           >
-            Settings
+            Prompts
           </button>
         </div>
       </div>
@@ -116,7 +116,7 @@ export default function Dashboard() {
         </div>
       )}
 
-      {activeTab === 'settings' && <SettingsPanel />}
+      {activeTab === 'prompts' && <PromptsPanel />}
     </div>
   );
 }

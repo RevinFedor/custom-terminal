@@ -168,6 +168,41 @@ ipcMain.on('terminal:kill', (event, tabId) => {
   }
 });
 
+// Check if terminal has running child process (not just idle shell)
+ipcMain.handle('terminal:hasRunningProcess', async (event, tabId) => {
+  const term = terminals.get(tabId);
+  if (!term) return { hasProcess: false };
+
+  try {
+    const { execSync } = require('child_process');
+    const shellPid = term.pid;
+
+    if (process.platform === 'darwin' || process.platform === 'linux') {
+      // Get child processes of the shell
+      const children = execSync(`pgrep -P ${shellPid}`, {
+        encoding: 'utf-8',
+        timeout: 1000
+      }).trim();
+
+      if (children) {
+        // Get the name of the first child process
+        const childPid = children.split('\n')[0];
+        const processName = execSync(`ps -p ${childPid} -o comm=`, {
+          encoding: 'utf-8',
+          timeout: 1000
+        }).trim();
+
+        return { hasProcess: true, processName };
+      }
+    }
+
+    return { hasProcess: false };
+  } catch (e) {
+    // pgrep returns non-zero if no children - this is normal for idle shell
+    return { hasProcess: false };
+  }
+});
+
 // Get current working directory of terminal process
 ipcMain.handle('terminal:getCwd', async (event, tabId) => {
   const term = terminals.get(tabId);

@@ -1,4 +1,4 @@
-import React, { useEffect } from 'react';
+import React, { useEffect, useState } from 'react';
 import { useWorkspaceStore } from './store/useWorkspaceStore';
 import { useProjectsStore } from './store/useProjectsStore';
 import { useUIStore } from './store/useUIStore';
@@ -7,6 +7,7 @@ import Workspace from './components/Workspace/Workspace';
 import ToastContainer from './components/UI/Toast';
 import EditProjectModal from './components/UI/EditProjectModal';
 import SessionInputModal from './components/UI/SessionInputModal';
+import SettingsModal from './components/UI/SettingsModal';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -14,6 +15,7 @@ function App() {
   const { view, showDashboard, openProject, openProjects, activeProjectId, closeProject, createTab, closeTab, getActiveProject, restoreSession } = useWorkspaceStore();
   const { projects, loadProjects } = useProjectsStore();
   const { toggleFileExplorer, closeFilePreview, filePreview, showToast } = useUIStore();
+  const [settingsOpen, setSettingsOpen] = useState(false);
 
   // Load projects and restore session ONCE on mount
   useEffect(() => {
@@ -82,6 +84,13 @@ function App() {
             closeProject(activeProjectId);
           }
         }
+        return;
+      }
+
+      // Cmd+, - Open Settings Modal
+      if (e.metaKey && e.code === 'Comma') {
+        e.preventDefault();
+        setSettingsOpen(true);
         return;
       }
     };
@@ -181,6 +190,7 @@ function App() {
       <ToastContainer />
       <EditProjectModal />
       <SessionInputModal />
+      <SettingsModal isOpen={settingsOpen} onClose={() => setSettingsOpen(false)} />
     </div>
   );
 }
