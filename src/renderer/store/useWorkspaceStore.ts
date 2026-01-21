@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { startTransition } from 'react';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -72,15 +73,29 @@ interface WorkspaceStore {
 
 const SESSION_KEY = 'terminal-session-state';
 
-// Helper to save tabs to database
-const saveTabs = async (projectPath: string, tabs: Map<string, Tab>) => {
-  const tabsArray = Array.from(tabs.values()).map((tab) => ({
-    name: tab.name,
-    cwd: tab.cwd,
-    color: tab.color,
-    isUtility: tab.isUtility
-  }));
-  await ipcRenderer.invoke('project:save-tabs', { dirPath: projectPath, tabs: tabsArray });
+// Debounce timers (outside store to persist across calls)
+let saveSessionTimer: NodeJS.Timeout | null = null;
+let saveTabsTimers: Map<string, NodeJS.Timeout> = new Map();
+
+// Helper to save tabs to database (debounced)
+const saveTabs = (projectPath: string, tabs: Map<string, Tab>) => {
+  // Clear existing timer for this project
+  const existingTimer = saveTabsTimers.get(projectPath);
+  if (existingTimer) clearTimeout(existingTimer);
+
+  // Debounce: save after 500ms of inactivity
+  const timer = setTimeout(async () => {
+    const tabsArray = Array.from(tabs.values()).map((tab) => ({
+      name: tab.name,
+      cwd: tab.cwd,
+      color: tab.color,
+      isUtility: tab.isUtility
+    }));
+    await ipcRenderer.invoke('project:save-tabs', { dirPath: projectPath, tabs: tabsArray });
+    saveTabsTimers.delete(projectPath);
+  }, 500);
+
+  saveTabsTimers.set(projectPath, timer);
 };
 
 export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
@@ -93,37 +108,50 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     const { openProjects, activeProjectId, isRestoring } = get();
     if (isRestoring) return; // Don't save while restoring
 
-    const sessionState: SessionState = {
-      openProjects: Array.from(openProjects.values()).map((workspace) => {
-        const tabsArray = Array.from(workspace.tabs.keys());
-        const activeTabIndex = workspace.activeTabId
-          ? tabsArray.indexOf(workspace.activeTabId)
-          : 0;
-        return {
-          projectId: workspace.projectId,
-          projectPath: workspace.projectPath,
-          activeTabIndex: Math.max(0, activeTabIndex)
-        };
-      }),
-      activeProjectId
-    };
+    // Debounce: save after 300ms of inactivity
+    if (saveSessionTimer) clearTimeout(saveSessionTimer);
 
-    localStorage.setItem(SESSION_KEY, JSON.stringify(sessionState));
+    saveSessionTimer = setTimeout(() => {
+      const sessionState: SessionState = {
+        openProjects: Array.from(openProjects.values()).map((workspace) => {
+          const tabsArray = Array.from(workspace.tabs.keys());
+          const activeTabIndex = workspace.activeTabId
+            ? tabsArray.indexOf(workspace.activeTabId)
+            : 0;
+          return {
+            projectId: workspace.projectId,
+            projectPath: workspace.projectPath,
+            activeTabIndex: Math.max(0, activeTabIndex)
+          };
+        }),
+        activeProjectId
+      };
+
+      localStorage.setItem(SESSION_KEY, JSON.stringify(sessionState));
+      saveSessionTimer = null;
+    }, 300);
   },
 
   restoreSession: async () => {
+    console.time('[PERF] restoreSession total');
     const stored = localStorage.getItem(SESSION_KEY);
-    if (!stored) return;
+    if (!stored) {
+      console.timeEnd('[PERF] restoreSession total');
+      return;
+    }
 
     try {
       const sessionState: SessionState = JSON.parse(stored);
       const { openProject } = get();
 
+      console.log('[PERF] restoreSession: restoring', sessionState.openProjects.length, 'projects');
       set({ isRestoring: true });
 
       // Restore all open projects
       for (const proj of sessionState.openProjects) {
+        console.time(`[PERF] openProject ${proj.projectId}`);
         await openProject(proj.projectId, proj.projectPath);
+        console.timeEnd(`[PERF] openProject ${proj.projectId}`);
 
         // Set active tab by index
         const workspace = get().openProjects.get(proj.projectId);
@@ -145,8 +173,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       } else {
         set({ isRestoring: false });
       }
+      console.timeEnd('[PERF] restoreSession total');
     } catch (e) {
       console.error('[Session] Failed to restore:', e);
+      console.timeEnd('[PERF] restoreSession total');
       set({ isRestoring: false });
     }
   },
@@ -164,8 +194,13 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   },
 
   showWorkspace: (projectId) => {
-    set({ view: 'workspace', activeProjectId: projectId });
+    console.time(`[PERF] showWorkspace ${projectId}`);
+    // Use startTransition for smooth project switching
+    startTransition(() => {
+      set({ view: 'workspace', activeProjectId: projectId });
+    });
     get().saveSession();
+    console.timeEnd(`[PERF] showWorkspace ${projectId}`);
   },
 
   openProject: async (projectId, projectPath) => {
@@ -236,10 +271,14 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   },
 
   createTab: async (projectId, name, cwd, options) => {
+    console.time(`[PERF] createTab ${name || 'unnamed'}`);
     const { openProjects } = get();
     const workspace = openProjects.get(projectId);
 
-    if (!workspace) return '';
+    if (!workspace) {
+      console.timeEnd(`[PERF] createTab ${name || 'unnamed'}`);
+      return '';
+    }
 
     const tabId = `${projectId}-tab-${workspace.tabCounter}`;
     workspace.tabCounter++;
@@ -269,6 +308,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     // Save tabs
     saveTabs(workspace.projectPath, workspace.tabs);
 
+    console.timeEnd(`[PERF] createTab ${name || 'unnamed'}`);
     return tabId;
   },
 
@@ -310,14 +350,19 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   },
 
   switchTab: (projectId, tabId) => {
+    console.time(`[PERF] switchTab ${tabId}`);
     const { openProjects, saveSession } = get();
     const workspace = openProjects.get(projectId);
 
     if (workspace && workspace.tabs.has(tabId)) {
       workspace.activeTabId = tabId;
-      set({ openProjects: new Map(openProjects) });
+      // Use startTransition to prevent UI blocking during re-render
+      startTransition(() => {
+        set({ openProjects: new Map(openProjects) });
+      });
       saveSession();
     }
+    console.timeEnd(`[PERF] switchTab ${tabId}`);
   },
 
   renameTab: (projectId, tabId, newName) => {

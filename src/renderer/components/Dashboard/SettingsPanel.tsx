@@ -429,6 +429,171 @@ export default function PromptsPanel() {
             </div>
           </div>
 
+          {/* System: Documentation Prompt */}
+          <div style={{ marginBottom: '24px' }}>
+            <div style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: '8px',
+              marginBottom: '12px',
+              paddingBottom: '8px',
+              borderBottom: '1px solid #333'
+            }}>
+              <span style={{
+                fontSize: '10px',
+                fontWeight: '600',
+                color: '#22c55e',
+                textTransform: 'uppercase',
+                letterSpacing: '0.5px'
+              }}>
+                System
+              </span>
+              <span style={{ fontSize: '10px', color: '#555' }}>Documentation Update</span>
+            </div>
+
+            <div
+              onClick={() => !editingDocPrompt && setEditingDocPrompt(true)}
+              style={{
+                padding: '16px',
+                backgroundColor: editingDocPrompt ? '#252525' : '#222',
+                border: editingDocPrompt ? '2px solid #22c55e' : '2px solid #22c55e33',
+                borderRadius: '12px',
+                cursor: editingDocPrompt ? 'default' : 'pointer',
+                transition: 'all 0.15s ease'
+              }}
+            >
+              {editingDocPrompt ? (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                  {/* Toggle: File / Inline */}
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                    <span style={{ fontSize: '12px', color: '#888' }}>Source:</span>
+                    <button
+                      onClick={(e) => { e.stopPropagation(); setDocPromptUseFile(true); }}
+                      style={{
+                        padding: '4px 12px',
+                        backgroundColor: docPrompt.useFile ? '#22c55e' : '#333',
+                        color: docPrompt.useFile ? '#fff' : '#888',
+                        border: 'none',
+                        borderRadius: '4px',
+                        fontSize: '11px',
+                        cursor: 'pointer'
+                      }}
+                    >
+                      File Path
+                    </button>
+                    <button
+                      onClick={(e) => { e.stopPropagation(); setDocPromptUseFile(false); }}
+                      style={{
+                        padding: '4px 12px',
+                        backgroundColor: !docPrompt.useFile ? '#22c55e' : '#333',
+                        color: !docPrompt.useFile ? '#fff' : '#888',
+                        border: 'none',
+                        borderRadius: '4px',
+                        fontSize: '11px',
+                        cursor: 'pointer'
+                      }}
+                    >
+                      Inline
+                    </button>
+                  </div>
+
+                  {docPrompt.useFile ? (
+                    <input
+                      type="text"
+                      value={localDocFilePath}
+                      onChange={(e) => updateDocFilePath(e.target.value)}
+                      placeholder="Path to prompt file..."
+                      autoFocus
+                      style={{
+                        width: '100%',
+                        padding: '10px 12px',
+                        backgroundColor: '#1a1a1a',
+                        border: '1px solid #444',
+                        borderRadius: '8px',
+                        color: '#aaa',
+                        fontSize: '12px',
+                        fontFamily: 'monospace',
+                        outline: 'none',
+                        boxSizing: 'border-box'
+                      }}
+                    />
+                  ) : (
+                    <textarea
+                      value={localDocInlineContent}
+                      onChange={(e) => updateDocInlineContent(e.target.value)}
+                      placeholder="Documentation prompt content..."
+                      rows={6}
+                      autoFocus
+                      style={{
+                        width: '100%',
+                        padding: '10px 12px',
+                        backgroundColor: '#1a1a1a',
+                        border: '1px solid #444',
+                        borderRadius: '8px',
+                        color: '#aaa',
+                        fontSize: '12px',
+                        fontFamily: 'monospace',
+                        outline: 'none',
+                        resize: 'none',
+                        boxSizing: 'border-box'
+                      }}
+                    />
+                  )}
+
+                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                    <button
+                      onClick={(e) => { e.stopPropagation(); resetDocPrompt(); }}
+                      style={{
+                        padding: '6px 12px',
+                        backgroundColor: 'transparent',
+                        color: '#888',
+                        border: 'none',
+                        fontSize: '12px',
+                        cursor: 'pointer'
+                      }}
+                    >
+                      Reset to Default
+                    </button>
+                    <button
+                      onClick={(e) => { e.stopPropagation(); setEditingDocPrompt(false); }}
+                      style={{
+                        padding: '6px 16px',
+                        backgroundColor: '#22c55e',
+                        color: '#fff',
+                        border: 'none',
+                        borderRadius: '6px',
+                        fontSize: '12px',
+                        cursor: 'pointer'
+                      }}
+                    >
+                      Done
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px' }}>
+                    <div style={{ fontSize: '14px', color: '#22c55e', fontWeight: '500' }}>
+                      Documentation Prompt
+                    </div>
+                    <span style={{
+                      fontSize: '9px',
+                      padding: '2px 6px',
+                      backgroundColor: docPrompt.useFile ? '#22c55e22' : '#8b5cf622',
+                      color: docPrompt.useFile ? '#22c55e' : '#8b5cf6',
+                      borderRadius: '4px'
+                    }}>
+                      {docPrompt.useFile ? 'FILE' : 'INLINE'}
+                    </span>
+                  </div>
+                  <div style={{ fontSize: '12px', color: '#666', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {docPrompt.useFile ? localDocFilePath : (localDocInlineContent || 'No content')}
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+
           {/* User Prompts */}
           <div style={{
             display: 'flex',
