@@ -24,5 +24,6 @@
 - **Rendering:** `src/renderer/components/Research/MarkdownRenderer.tsx` — компонент для отрисовки ответов с подсветкой.
 - **Chat:** `src/renderer/components/Research/ChatArea.tsx` — виртуализированный список.
 - **Input:** `src/renderer/components/Research/ResearchInput.tsx` — управление AbortController, авто-высота инпута и логика отмены.
-- **SDK:** Используется `@google/genai` для поддержки расширенных конфигураций (Thinking, Tools).
+- **Activation Logic:** `src/renderer/store/useResearchStore.ts` — флаги `pendingResearch` и метод `triggerResearch()` для синхронизации Context Menu и UI Panel.
+- **SDK:** Используется прямой Fetch к REST API (v1beta) для гибкого управления `tools` в зависимости от модели.
 - **Persistence:** Данные сохраняются в `localStorage` под ключом `noted-terminal-research-v2`.

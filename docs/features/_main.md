@@ -13,6 +13,7 @@
 ## База Знаний (Knowledge)
 - **Стабильность UI:** `knowledge/fix-ui-stability.md` — Jitter, Flickering, Fonts, Zoom.
 - **Цвета и Ввод:** `knowledge/fix-terminal-colors.md` — Truecolor, UTF-8 и кэширование.
+- **AI Поиск:** `knowledge/fix-gemini-search.md` — Google Search, Tools и активация панели.
 - **Рендеринг:** `knowledge/fix-markdown-hydration.md` — Решение проблем с Markdown и блочными элементами.
 - **AI Автоматизация:** `knowledge/fix-ai-sessions.md` — State Detection, Cursor detection, Trojan Horse.
 - **UX и Ввод:** `knowledge/fix-input-ux.md` — Enter key, Modal dialogs.
