@@ -25,31 +25,32 @@ When clicking "💾 Save & Export", the command `/chat save sessions-1` was type
 
 ## Root Cause
 
-**Original code in main.js:**
-```javascript
-term.write(command + '\r');
-```
+**1. Raw Mode Conflict**
+Gemini CLI (и другие Node.js CLI) переключают терминал в **Raw Mode**. Если отправить текст слишком быстро (текст + `\r` одним куском), парсер `readline` считает это "вставкой" (paste) и может игнорировать символы перевода строки внутри нее для безопасности.
 
-**Problem:** Sending `command + '\r'` as one string didn't work reliably with PTY.
+**2. Bracketed Paste Mode**
+Некоторые терминалы и CLI используют коды `\x1b[?2004h` (enable) и `\x1b[?2004l` (disable). Если режим включен, любой вставленный текст оборачивается в "скобки" `\x1b[200~` и `\x1b[201~`. Gemini CLI при виде такой вставки может блокировать выполнение команды до ручного подтверждения.
 
 ---
 
 ## Solution
 
-**Split into two separate writes:**
+**1. Split writes with delay (Main Process)**
+В `main.js` (IPC handler `terminal:executeCommandAsync`) мы разделили ввод и нажатие Enter:
 ```javascript
-// Step 1: Write command text
 term.write(command);
-
-// Step 2: Send Enter separately
+await new Promise(r => setTimeout(r, 150)); // Ждем, чтобы CLI не считал это paste
 term.write('\r');
 ```
 
-**Why this works:**
-- PTY processes each write() call separately
-- First write types the text
-- Second write sends carriage return
-- Gemini CLI interprets it correctly
+**2. Disable Bracketed Paste (Optional)**
+Если CLI все равно капризничает, можно принудительно выключить режим вставки перед командой:
+```javascript
+term.write('\x1b[?2004l'); // Disable bracketed paste
+term.write(command);
+// ... Enter ...
+```
+*Примечание: В финальной версии мы отказались от этого в пользу задержек, так как задержки оказались надежнее.*
 
 ---
 

@@ -16,7 +16,6 @@ const mainLogs: string[] = [];
 const rendererLogs: string[] = [];
 
 test.beforeAll(async () => {
-  console.log('🚀 [TEST] Launching Electron app...');
 
   // Launch Electron app (point to project root)
   electronApp = await electron.launch({
@@ -31,7 +30,6 @@ test.beforeAll(async () => {
   electronApp.process().stdout?.on('data', (data) => {
     const log = data.toString().trim();
     mainLogs.push(log);
-    console.log(`[MAIN] ${log}`);
   });
 
   electronApp.process().stderr?.on('data', (data) => {
@@ -47,10 +45,8 @@ test.beforeAll(async () => {
   mainWindow.on('console', (msg) => {
     const log = `[${msg.type()}] ${msg.text()}`;
     rendererLogs.push(log);
-    console.log(`[RENDERER] ${log}`);
   });
 
-  console.log('✅ [TEST] App launched successfully');
 
   // Wait for app to fully load
   await mainWindow.waitForLoadState('domcontentloaded');
@@ -58,7 +54,6 @@ test.beforeAll(async () => {
 });
 
 test.afterAll(async () => {
-  console.log('📊 [TEST] Saving logs to file...');
 
   // Save logs to file
   const fs = require('fs');
@@ -73,16 +68,13 @@ test.afterAll(async () => {
   ].join('\n');
 
   fs.writeFileSync(logsPath, allLogs);
-  console.log(`✅ [TEST] Logs saved to: ${logsPath}`);
 
   // Close app
   await electronApp.close();
-  console.log('👋 [TEST] App closed');
 });
 
 test.describe('Session Persistence Tests', () => {
   test('should display Sessions tab', async () => {
-    console.log('\n🧪 [TEST 1] Checking Sessions tab...');
 
     // Take screenshot of initial state
     await mainWindow.screenshot({
@@ -95,11 +87,9 @@ test.describe('Session Persistence Tests', () => {
     // Wait for it to be visible
     await expect(sessionsTab).toBeVisible({ timeout: 10000 });
 
-    console.log('✅ [TEST 1] Sessions tab is visible');
   });
 
   test('should open Sessions panel', async () => {
-    console.log('\n🧪 [TEST 2] Opening Sessions panel...');
 
     // Click Sessions tab
     const sessionsTab = mainWindow.locator('button.note-tab[data-tab="sessions"]');
@@ -114,11 +104,9 @@ test.describe('Session Persistence Tests', () => {
       path: path.join(__dirname, '../results/02-sessions-panel-open.png')
     });
 
-    console.log('✅ [TEST 2] Sessions panel opened');
   });
 
   test('should display session management buttons', async () => {
-    console.log('\n🧪 [TEST 3] Checking session buttons...');
 
     // Check for Gemini buttons
     const exportGeminiBtn = mainWindow.locator('button:has-text("Export Gemini Session")');
@@ -141,11 +129,9 @@ test.describe('Session Persistence Tests', () => {
     await expect(listSessionsBtn).toBeVisible();
     await expect(saveBufferBtn).toBeVisible();
 
-    console.log('✅ [TEST 3] All buttons are visible');
   });
 
   test('should open modal when Export Gemini clicked', async () => {
-    console.log('\n🧪 [TEST 4] Testing Export Gemini modal...');
 
     // Click Export Gemini button
     const exportBtn = mainWindow.locator('button:has-text("Export Gemini Session")');
@@ -167,17 +153,14 @@ test.describe('Session Persistence Tests', () => {
       path: path.join(__dirname, '../results/03-export-modal-open.png')
     });
 
-    console.log('✅ [TEST 4] Modal opened successfully');
 
     // Close modal (press Escape)
     await mainWindow.keyboard.press('Escape');
     await expect(modal).toHaveClass(/hidden/, { timeout: 2000 });
 
-    console.log('✅ [TEST 4] Modal closed with Escape');
   });
 
   test('should show error if session not found', async () => {
-    console.log('\n🧪 [TEST 5] Testing non-existent session export...');
 
     // Click Export button
     const exportBtn = mainWindow.locator('button:has-text("Export Gemini Session")');
@@ -214,14 +197,11 @@ test.describe('Session Persistence Tests', () => {
 
     if (toastVisible) {
       const toastText = await errorToast.textContent();
-      console.log('📋 [TEST 5] Toast message:', toastText);
     }
 
-    console.log('✅ [TEST 5] Export attempted, check logs for details');
   });
 
   test('should list saved sessions', async () => {
-    console.log('\n🧪 [TEST 6] Testing List Sessions...');
 
     // Click List Sessions button
     const listBtn = mainWindow.locator('button:has-text("List All Sessions")');
@@ -241,16 +221,13 @@ test.describe('Session Persistence Tests', () => {
 
     if (toastVisible) {
       const toastText = await toast.textContent();
-      console.log('📋 [TEST 6] Toast message:', toastText);
     }
 
-    console.log('✅ [TEST 6] List sessions executed');
   });
 });
 
 test.describe('Log Analysis', () => {
   test('should not have critical errors in logs', async () => {
-    console.log('\n🧪 [TEST 7] Analyzing logs for errors...');
 
     // Check for critical errors in main process
     const criticalErrors = mainLogs.filter(log =>
@@ -263,7 +240,6 @@ test.describe('Log Analysis', () => {
       console.error('❌ Critical errors found in main process:');
       criticalErrors.forEach(err => console.error('  -', err));
     } else {
-      console.log('✅ No critical errors in main process');
     }
 
     // Check renderer logs
@@ -276,7 +252,6 @@ test.describe('Log Analysis', () => {
       console.error('❌ Errors found in renderer process:');
       rendererErrors.forEach(err => console.error('  -', err));
     } else {
-      console.log('✅ No errors in renderer process');
     }
 
     // Fail test if critical errors found
@@ -284,19 +259,14 @@ test.describe('Log Analysis', () => {
   });
 
   test('should log SessionManager operations', async () => {
-    console.log('\n🧪 [TEST 8] Checking SessionManager logs...');
 
     const sessionLogs = [
       ...mainLogs.filter(log => log.includes('SessionManager')),
       ...rendererLogs.filter(log => log.includes('SessionManager') || log.includes('[Session]'))
     ];
 
-    console.log(`📋 Found ${sessionLogs.length} SessionManager log entries:`);
-    sessionLogs.forEach(log => console.log('  -', log));
-
     // Should have at least some session-related logs from our tests
     expect(sessionLogs.length).toBeGreaterThan(0);
 
-    console.log('✅ [TEST 8] SessionManager logs captured');
   });
 });

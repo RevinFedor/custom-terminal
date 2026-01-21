@@ -13,18 +13,15 @@ class ProjectManager {
       const projectCount = this.db.db.prepare('SELECT COUNT(*) as count FROM projects').get().count;
 
       if (projectCount === 0) {
-        console.log('[ProjectManager] No projects found in database. Attempting migration from JSON...');
         try {
           migrateFromJSON();
         } catch (err) {
-          console.log('[ProjectManager] Migration skipped or failed:', err.message);
         }
       }
 
       // Migrate quick_actions to global_commands
       const migrationResult = this.db.migrateQuickActionsToGlobal();
       if (migrationResult.migrated) {
-        console.log(`[ProjectManager] Migrated ${migrationResult.count} unique commands to global_commands`);
       }
     } catch (err) {
       console.error('[ProjectManager] Init error:', err);

@@ -22,43 +22,19 @@
 ## Навигация (Project Mapping)
 
 ### Backend (Main Process)
-- `main.js` — Главный процесс Electron, управление PTY и IPC.
-- `project-manager.js` — Менеджер проектов, сохранение в JSON.
-- `session-manager.js` — Управление сессиями AI (Gemini/Claude).
-- `database.js` — SQLite для сессий и проектов.
+- `src/main/main.js` — Главный процесс Electron, управление PTY и IPC. Содержит `terminal:executeCommandAsync` с защитой от Paste-режима.
+- `src/main/project-manager.js` — Менеджер проектов, сохранение в JSON.
+- `src/main/session-manager.js` — Логика Export/Import сессий (Trojan Horse метод).
+- `src/main/database.js` — SQLite для сессий (ai_sessions) и проектов.
 
 ### Frontend (Renderer Process - React)
-- `src/renderer/App.tsx` — Корневой компонент, роутинг.
-- `src/renderer/store/` — Zustand stores (useProjectsStore, useWorkspaceStore).
-- `src/renderer/components/Dashboard/` — Dashboard UI (проекты, настройки).
-- `src/renderer/components/Workspace/` — Workspace UI (табы, терминалы).
-- `src/renderer/components/Workspace/Terminal.tsx` — xterm.js wrapper.
+- `src/renderer/App.tsx` — Корневой компонент.
+- `src/renderer/components/Workspace/panels/SessionsPanel.tsx` — UI и логика автоматизации импорта/экспорта. Использует `waitForSilence` и `waitForHideCursor`.
 
-### Build & Config
-- `electron.vite.config.js` — Vite config для Electron.
-- `index.html` — HTML entry point.
-- `input.css` — Tailwind входной файл.
-- `output.css` — Скомпилированный Tailwind.
+## Правила Автоматизации CLI (Gemini)
+1. **Не доверяй промпту `>`**: Он появляется до того, как CLI готов принимать команды.
+2. **Детекция готовности (Основной метод)**: Используй ожидание ANSI-кода `HIDE CURSOR` (`\x1b[?25l`). Это самый быстрый и точный сигнал готовности Gemini CLI.
+3. **Детекция готовности (Запасной метод)**: "Окно тишины" (Silence Detection) в 1500мс. Используется, если ANSI-коды не сработали.
+4. **Нажатие Enter**: Всегда разделяй ввод текста и `\r` задержкой в 150мс, чтобы обойти защиту от Paste в Raw Mode.
 
-### Docs
-- `docs/` — База знаний (Gold Standard v3.4).
-- `MIGRATION-COMPLETE.md` — Документация по миграции на React.
-
-## Правила Кодирования
-- **Язык:** TypeScript + React 19 (frontend), CommonJS (backend).
-- **Стили:** Tailwind CSS v4, кастомные стили через `input.css` (@layer).
-- **Именование:** PascalCase для компонентов, camelCase для функций/переменных.
-- **State:** Zustand stores (`useProjectsStore`, `useWorkspaceStore`).
-- **Модули:** ESM в React, CommonJS в main process.
-
-## Структура Данных
-- **Проекты:** `~/Library/Application Support/custom-terminal/projects.json`
-- **Schema:** Ключ = абсолютный путь к проекту
-- **Поля проекта:** id, path, name, description, geminiPrompt, notes, quickActions, tabs
-
-## Ключевые Концепции
-- **Project-Based Design:** Каждый проект = отдельный workspace с табами.
-- **Level 1 Tabs:** Project chips в title bar (проекты).
-- **Level 2 Tabs:** Terminal tabs внутри проекта.
-- **Context-Aware Hotkeys:** Cmd+T/W работают по-разному в workspace и на dashboard.
-- **Gemini Integration:** Выделение текста → контекстное меню → AI search с кастомным промптом.
+## Стек (Tech Stack)
