@@ -47,11 +47,11 @@ const clearTabPendingCommand = (tabId: string) => {
 };
 
 // Regex to detect Claude session ID from terminal output
-// Claude uses TWO formats:
-// 1. Short: "agent-xxxxxxxx"
-// 2. Full UUID: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-// Matches: "Starting session <id>", "Resuming session <id>", "Forked session <id>", "Session ID: <id>"
-const CLAUDE_SESSION_REGEX = /(Starting|Resuming|Forked|Session ID:)\s+([0-9a-f-]{8,36}|agent-[0-9a-f]{8})/i;
+// Matches only "Session ID: <uuid>" - the most reliable and final pattern
+const CLAUDE_SESSION_REGEX = /Session ID:\s+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i;
+
+// Debounce for session detection (saves only the last detected ID after 300ms)
+let sessionDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 
 // Helper: Get current command from xterm buffer (handles wrapped lines)
 // When a long command wraps to multiple visual lines, we need to walk up
@@ -154,15 +154,11 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
     const handleData = (_: any, payload: { tabId: string; data: string }) => {
       if (payload.tabId !== tabId) return;
 
-      // Claude Session Detection (Output Sniffing)
-      const match = payload.data.match(CLAUDE_SESSION_REGEX);
-      if (match) {
-        const sessionId = match[2];
-        if (claudeSessionDetected.current !== sessionId) {
-          claudeSessionDetected.current = sessionId;
-          getSetClaudeSessionId()(tabId, sessionId);
-        }
-      }
+      // NOTE: Session ID detection via regex is DISABLED
+      // It catches the wrong ID (parent session) from Claude's UI output
+      // Instead we use:
+      // - Sniper Watcher for 'claude' command (catches new file creation)
+      // - Explicit ID setting for 'claude-c' and 'claude-f' commands
 
       // If xterm not yet created, buffer data for later replay
       if (!xtermInstance.current) {
@@ -384,9 +380,11 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
         // --- CASE 2: claude-c (continue session) ---
                                       if (fullLine.endsWith(' claude-c') || fullLine === 'claude-c') {
                                         const existingSessionId = getClaudeSessionId(tabId);
+                                        console.log('[Claude-c] tabId:', tabId);
+                                        console.log('[Claude-c] existingSessionId from store:', existingSessionId);
                                         if (existingSessionId) {
                                           event.preventDefault();
-                                          console.log('[Claude Intercept] Continue session:', existingSessionId);
+                                          console.log('[Claude-c] Sending command: claude --resume', existingSessionId);
                                           ipcRenderer.send('terminal:input', tabId, '\x15claude --resume ' + existingSessionId + '\r');
                                           return false;
                                         } else {            event.preventDefault();
@@ -404,22 +402,30 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
                             if (forkWithIdMatch) {
                               event.preventDefault();
                               const sourceSessionId = forkWithIdMatch[1];
-                              console.log('[Claude Intercept] Fork from session (native):', sourceSessionId);
-                              
+                              console.log('[Claude Intercept] Fork from session:', sourceSessionId);
+
                               // Clear line
                               ipcRenderer.send('terminal:input', tabId, '\x15');
-                  
-                              // Use native Claude CLI fork feature
-                              // This avoids manual file copying and the "interactive picker" issue
-                              // The regex CLAUDE_SESSION_REGEX will catch the NEW session ID from stdout automatically
-                              const cmd = `claude --resume ${sourceSessionId} --fork-session\r`;
-                              ipcRenderer.send('terminal:input', tabId, cmd);
-                              
+
+                              // Copy file manually and resume with new ID
+                              // This avoids regex catching wrong ID from Claude output
+                              (async () => {
+                                const result = await ipcRenderer.invoke('claude:fork-session-file', { sourceSessionId, cwd });
+                                if (result.success) {
+                                  console.log('[Claude Intercept] Forked to new session:', result.newSessionId);
+                                  getSetClaudeSessionId()(tabId, result.newSessionId);
+                                  ipcRenderer.send('terminal:input', tabId, 'claude --resume ' + result.newSessionId + '\r');
+                                } else {
+                                  console.error('[Claude Intercept] Fork failed:', result.error);
+                                  ipcRenderer.send('terminal:input', tabId, 'echo "❌ Fork failed: ' + result.error + '"\r');
+                                }
+                              })();
+
                               return false;
                             }        // claude-f without ID - show error
         if (fullLine.endsWith(' claude-f') || fullLine === 'claude-f') {
           event.preventDefault();
-          ipcRenderer.send('terminal:input', tabId, '\x15echo "❌ Укажите ID: claude-f <agent-xxx>"\r');
+          ipcRenderer.send('terminal:input', tabId, '\x15echo "❌ Укажите ID: claude-f <session-id>"\r');
           return false;
         }
 
@@ -593,9 +599,11 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
 
           if (fullLine.endsWith(' claude-c') || fullLine === 'claude-c') {
             const existingSessionId = getClaudeSessionId(tabId);
+            console.log('[Claude-c] tabId:', tabId);
+            console.log('[Claude-c] existingSessionId from store:', existingSessionId);
             if (existingSessionId) {
               event.preventDefault();
-              console.log('[Claude Intercept] Continue session:', existingSessionId);
+              console.log('[Claude-c] Sending command: claude --resume', existingSessionId);
               ipcRenderer.send('terminal:input', tabId, '\x15claude --resume ' + existingSessionId + '\r');
               return false;
             } else {
@@ -613,23 +621,30 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
           if (forkWithIdMatch) {
             event.preventDefault();
             const sourceSessionId = forkWithIdMatch[1];
-            console.log('[Claude Intercept] Fork from session (native):', sourceSessionId);
-            
+            console.log('[Claude Intercept] Fork from session:', sourceSessionId);
+
             // Clear line
             ipcRenderer.send('terminal:input', tabId, '\x15');
-            
-            // Use native Claude CLI fork feature
-            // This avoids manual file copying and the "interactive picker" issue
-            // The regex CLAUDE_SESSION_REGEX will catch the NEW session ID from stdout automatically
-            const cmd = `claude --resume ${sourceSessionId} --fork-session\r`;
-            ipcRenderer.send('terminal:input', tabId, cmd);
-            
+
+            // Copy file manually and resume with new ID
+            (async () => {
+              const result = await ipcRenderer.invoke('claude:fork-session-file', { sourceSessionId, cwd });
+              if (result.success) {
+                console.log('[Claude Intercept] Forked to new session:', result.newSessionId);
+                getSetClaudeSessionId()(tabId, result.newSessionId);
+                ipcRenderer.send('terminal:input', tabId, 'claude --resume ' + result.newSessionId + '\r');
+              } else {
+                console.error('[Claude Intercept] Fork failed:', result.error);
+                ipcRenderer.send('terminal:input', tabId, 'echo "❌ Fork failed: ' + result.error + '"\r');
+              }
+            })();
+
             return false;
           }
           // claude-f without ID - show error
           if (fullLine.endsWith(' claude-f') || fullLine === 'claude-f') {
             event.preventDefault();
-            ipcRenderer.send('terminal:input', tabId, '\x15echo "❌ Укажите ID: claude-f <agent-xxx>"\r');
+            ipcRenderer.send('terminal:input', tabId, '\x15echo "❌ Укажите ID: claude-f <session-id>"\r');
             return false;
           }
 

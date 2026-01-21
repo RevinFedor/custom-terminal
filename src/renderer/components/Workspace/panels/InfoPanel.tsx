@@ -92,7 +92,7 @@ export default function InfoPanel({ activeTabId }: InfoPanelProps) {
               <code className="text-accent text-xs">claude-f &lt;ID&gt;</code>
               <span className="text-green-400 text-[10px]">всегда</span>
             </div>
-            <p className="text-[10px] text-[#888] mt-1">Подключиться к сессии по ID</p>
+            <p className="text-[10px] text-[#888] mt-1">Форк сессии по UUID</p>
           </div>
         </div>
       </div>
