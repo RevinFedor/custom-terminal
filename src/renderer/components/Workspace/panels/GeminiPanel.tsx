@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useUIStore } from '../../../store/useUIStore';
-import { useResearchStore } from '../../../store/useResearchStore';
+import { useResearchStore, ChatType } from '../../../store/useResearchStore';
 import { useWorkspaceStore } from '../../../store/useWorkspaceStore';
 
 const { ipcRenderer } = window.require('electron');
@@ -19,15 +19,15 @@ interface GeminiPanelProps {
 }
 
 export default function GeminiPanel({ projectPath, geminiPrompt }: GeminiPanelProps) {
-  const { showToast, researchPrompt, selectedModel, terminalSelection } = useUIStore();
-  const { createConversation, addMessage, openResearch, getProjectConversations, setActiveConversation, deleteConversation, isLoading, setLoading, setAbortController, pendingResearch, clearPendingResearch } = useResearchStore();
+  const { showToast, chatSettings, terminalSelection } = useUIStore();
+  const { createConversation, addMessage, openResearch, getProjectConversations, setActiveConversation, deleteConversation, isLoading, setLoading, setAbortController, pendingResearch, pendingChatType, clearPendingResearch } = useResearchStore();
   const { activeProjectId } = useWorkspaceStore();
   const conversations = activeProjectId ? getProjectConversations(activeProjectId) : [];
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [expandedItem, setExpandedItem] = useState<HistoryItem | null>(null);
 
-  // Ref to store handleResearch for event listener
-  const handleResearchRef = useRef<() => void>(() => {});
+  // Ref to store handleResearch for event listener (with chatType parameter)
+  const handleResearchRef = useRef<(chatType: ChatType) => void>(() => {});
 
   useEffect(() => {
     loadHistory();
@@ -36,11 +36,11 @@ export default function GeminiPanel({ projectPath, geminiPrompt }: GeminiPanelPr
   // Check for pending research from store (survives panel mount/unmount)
   useEffect(() => {
     if (pendingResearch) {
-      console.log('[GeminiPanel] Found pending research, executing...');
+      console.log('[GeminiPanel] Found pending research, type:', pendingChatType);
       clearPendingResearch();
-      handleResearchRef.current();
+      handleResearchRef.current(pendingChatType);
     }
-  }, [pendingResearch, clearPendingResearch]);
+  }, [pendingResearch, pendingChatType, clearPendingResearch]);
 
   const loadHistory = async () => {
     try {
@@ -53,8 +53,8 @@ export default function GeminiPanel({ projectPath, geminiPrompt }: GeminiPanelPr
     }
   };
 
-  const handleResearch = async () => {
-    console.log('[Research] Starting research...');
+  const handleResearch = async (chatType: ChatType = 'research') => {
+    console.log('[Research] Starting, type:', chatType);
     console.log('[Research] Selection:', terminalSelection ? `"${terminalSelection.slice(0, 50)}..."` : 'EMPTY');
 
     if (!terminalSelection) {
@@ -65,16 +65,20 @@ export default function GeminiPanel({ projectPath, geminiPrompt }: GeminiPanelPr
 
     const selectedText = terminalSelection;
 
-    // Use prompt from settings, fallback to project prompt, then system default
-    const prompt = geminiPrompt || researchPrompt;
+    // Get settings for the chat type
+    const settings = chatSettings[chatType];
+    const { model: selectedModel, thinkingLevel, prompt: systemPrompt } = settings;
+
+    // Use project prompt for research if available, otherwise use type's system prompt
+    const prompt = (chatType === 'research' && geminiPrompt) ? geminiPrompt : systemPrompt;
+    console.log('[Research] Type:', chatType, 'Model:', selectedModel, 'Thinking:', thinkingLevel);
     console.log('[Research] Prompt:', `"${prompt.slice(0, 50)}..."`);
-    console.log('[Research] Model:', selectedModel);
 
     // IMMEDIATELY create conversation and open panel
     // Put selectedText first so title shows content, not prompt
     const userMessage = `${selectedText}\n\n---\n\n_Prompt: ${prompt}_`;
     if (activeProjectId) {
-      createConversation(activeProjectId, userMessage);
+      createConversation(activeProjectId, userMessage, chatType);
       openResearch();
       console.log('[Research] Panel opened, loading...');
     }
@@ -94,20 +98,32 @@ export default function GeminiPanel({ projectPath, geminiPrompt }: GeminiPanelPr
     setAbortController(controller);
 
     try {
+      // Build request body
+      const requestBody: any = {
+        contents: [{ parts: [{ text: fullPrompt }] }],
+        // Tools (search) only supported on gemini-3/2.5 models
+        ...(selectedModel.includes('gemini-3') || selectedModel.includes('gemini-2.5') ? {
+          tools: [
+            { googleSearch: {} }
+          ]
+        } : {})
+      };
+
+      // Add thinking config for gemini-3 models
+      if (selectedModel.includes('gemini-3') && thinkingLevel !== 'NONE') {
+        requestBody.generationConfig = {
+          thinkingConfig: {
+            thinkingLevel: thinkingLevel
+          }
+        };
+      }
+
       const response = await fetch(
         `https://generativelanguage.googleapis.com/v1beta/models/${selectedModel}:generateContent?key=${apiKey}`,
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            contents: [{ parts: [{ text: fullPrompt }] }],
-            // Tools (search) only supported on gemini-3-pro models
-            ...(selectedModel.includes('gemini-3') || selectedModel.includes('gemini-2.5') ? {
-              tools: [
-                { googleSearch: {} }
-              ]
-            } : {})
-          }),
+          body: JSON.stringify(requestBody),
           signal: controller.signal
         }
       );
@@ -145,7 +161,7 @@ export default function GeminiPanel({ projectPath, geminiPrompt }: GeminiPanelPr
       }
 
       console.log('[Research] Saved to history');
-      showToast('Research completed!', 'success');
+      showToast(chatType === 'compact' ? 'Compact completed!' : 'Research completed!', 'success');
       loadHistory();
     } catch (err: any) {
       if (err.name === 'AbortError') {
@@ -280,17 +296,32 @@ export default function GeminiPanel({ projectPath, geminiPrompt }: GeminiPanelPr
           </div>
         ) : (
           <div className="flex flex-col gap-2">
-            {conversations.map((conv) => (
+            {conversations.map((conv) => {
+              // Default to 'research' for backward compatibility
+              const convType = conv.type || 'research';
+              return (
               <div
                 key={conv.id}
-                className="group bg-[#2d2d2d] border-l-2 border-l-accent rounded p-2 transition-all hover:bg-[#333] cursor-pointer"
+                className={`group bg-[#2d2d2d] border-l-2 rounded p-2 transition-all hover:bg-[#333] cursor-pointer ${
+                  convType === 'compact' ? 'border-l-purple-500' : 'border-l-accent'
+                }`}
                 onClick={() => openConversation(conv.id)}
               >
                 <div className="flex items-start justify-between gap-2 mb-1">
-                  <div className="text-[10px] text-[#ccc] truncate flex-1">
-                    {conv.title}
+                  <div className="flex items-center gap-1.5 flex-1 min-w-0">
+                    {/* Type badge */}
+                    <span className={`text-[8px] px-1 py-0.5 rounded shrink-0 ${
+                      convType === 'compact'
+                        ? 'bg-purple-500/20 text-purple-400'
+                        : 'bg-accent/20 text-accent'
+                    }`}>
+                      {convType === 'compact' ? 'C' : 'R'}
+                    </span>
+                    <div className="text-[10px] text-[#ccc] truncate">
+                      {conv.title}
+                    </div>
                   </div>
-                  <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                  <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity shrink-0">
                     <button
                       className="text-[#666] hover:text-accent text-xs px-1"
                       onClick={(e) => { e.stopPropagation(); copyLastResponse(conv); }}
@@ -313,7 +344,8 @@ export default function GeminiPanel({ projectPath, geminiPrompt }: GeminiPanelPr
                   <span className="text-[#555]">{getConversationChars(conv)} симв.</span>
                 </div>
               </div>
-            ))}
+              );
+            })}
           </div>
         )}
       </div>

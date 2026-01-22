@@ -67,6 +67,10 @@ class ProjectManager {
     this.db.updateProjectMetadata(dirPath, metadata);
   }
 
+  deleteProject(dirPath) {
+    return this.db.deleteProject(dirPath);
+  }
+
   saveGeminiPrompt(dirPath, prompt) {
     this.db.updateProjectMetadata(dirPath, { geminiPrompt: prompt });
   }

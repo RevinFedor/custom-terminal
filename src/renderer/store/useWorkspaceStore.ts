@@ -28,6 +28,7 @@ interface ProjectWorkspace {
 interface SessionState {
   openProjects: { projectId: string; projectPath: string; activeTabIndex: number }[];
   activeProjectId: string | null;
+  view: 'dashboard' | 'workspace';
 }
 
 interface WorkspaceStore {
@@ -149,7 +150,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   },
 
   saveSession: () => {
-    const { openProjects, activeProjectId, isRestoring } = get();
+    const { openProjects, activeProjectId, view, isRestoring } = get();
     if (isRestoring) return; // Don't save while restoring
 
     // Debounce: save after 300ms of inactivity
@@ -168,7 +169,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
             activeTabIndex: Math.max(0, activeTabIndex)
           };
         }),
-        activeProjectId
+        activeProjectId,
+        view
       };
 
       // Save to database
@@ -203,15 +205,21 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         }
       }
 
-      // Set active project
-      if (sessionState.activeProjectId && get().openProjects.has(sessionState.activeProjectId)) {
+      // Set active project and view
+      const savedView = sessionState.view || 'dashboard';
+      if (savedView === 'workspace' && sessionState.activeProjectId && get().openProjects.has(sessionState.activeProjectId)) {
         set({
           activeProjectId: sessionState.activeProjectId,
           view: 'workspace',
           isRestoring: false
         });
       } else {
-        set({ isRestoring: false });
+        // Stay on dashboard or fallback
+        set({
+          view: 'dashboard',
+          activeProjectId: null,
+          isRestoring: false
+        });
       }
     } catch (e) {
       console.error('[Session] Failed to restore:', e);
@@ -310,14 +318,17 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   },
 
   createTab: async (projectId, name, cwd, options) => {
+    console.log('[Store] createTab called:', { projectId, name, cwd, options });
     const { openProjects } = get();
     const workspace = openProjects.get(projectId);
 
     if (!workspace) {
+      console.log('[Store] createTab: No workspace for projectId:', projectId);
       return '';
     }
 
     const tabId = `${projectId}-tab-${workspace.tabCounter}`;
+    console.log('[Store] createTab: Generated tabId:', tabId, 'counter:', workspace.tabCounter);
     workspace.tabCounter++;
 
     const newTab: Tab = {
@@ -331,6 +342,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       wasInterrupted: options?.wasInterrupted
     };
 
+    console.log('[Store] createTab: Creating PTY terminal for:', tabId, 'cwd:', newTab.cwd);
     // Create terminal
     const { pid } = await ipcRenderer.invoke('terminal:create', {
       tabId,
@@ -339,15 +351,18 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       cols: 80
     });
 
+    console.log('[Store] createTab: PTY created with pid:', pid);
     newTab.pid = pid;
     workspace.tabs.set(tabId, newTab);
     workspace.activeTabId = tabId;
 
+    console.log('[Store] createTab: Setting state, tabs count:', workspace.tabs.size);
     set({ openProjects: new Map(openProjects) });
 
     // Save tabs
     saveTabs(workspace.projectPath, workspace.tabs);
 
+    console.log('[Store] createTab: Done, returning tabId:', tabId);
     return tabId;
   },
 
@@ -760,7 +775,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   // Save session immediately without debounce (for shutdown)
   // Note: This uses synchronous XHR workaround for beforeunload
   saveSessionImmediate: () => {
-    const { openProjects, activeProjectId } = get();
+    const { openProjects, activeProjectId, view } = get();
 
     const sessionState: SessionState = {
       openProjects: Array.from(openProjects.values()).map((workspace) => {
@@ -774,7 +789,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           activeTabIndex: Math.max(0, activeTabIndex)
         };
       }),
-      activeProjectId
+      activeProjectId,
+      view
     };
 
     // Use sendSync for immediate save during shutdown

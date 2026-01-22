@@ -1,13 +1,19 @@
-import React, { useRef, useEffect, useState } from 'react';
+import React, { useRef, useEffect, useState, useMemo } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
-import { useResearchStore } from '../../store/useResearchStore';
-import { useUIStore, ThinkingLevel } from '../../store/useUIStore';
+import { useResearchStore, ChatType } from '../../store/useResearchStore';
+import { useUIStore, ThinkingLevel, AIModel } from '../../store/useUIStore';
 import ChatArea from './ChatArea';
 import ResearchInput from './ResearchInput';
 
 interface ResearchSheetProps {
   projectId: string;
 }
+
+// Chat type display names
+const CHAT_TYPE_LABELS: Record<ChatType, string> = {
+  research: 'Research',
+  compact: 'Compact'
+};
 
 const AI_MODELS = [
   { value: 'gemini-2.0-flash', label: 'Gemini 2.0 Flash' },
@@ -23,13 +29,45 @@ const THINKING_LEVELS = [
 ] as const;
 
 export default function ResearchSheet({ projectId }: ResearchSheetProps) {
-  const { isOpen, closeResearch, getActiveConversation, deleteConversation } = useResearchStore();
-  const { selectedModel, setSelectedModel, thinkingLevel, setThinkingLevel } = useUIStore();
+  const { isOpen, closeResearch, getActiveConversation, deleteConversation, pendingChatType } = useResearchStore();
+  const { chatSettings, setChatSettings, showToast } = useUIStore();
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const [showSettings, setShowSettings] = useState(false);
 
   const conversation = getActiveConversation(projectId);
   const messages = conversation?.messages || [];
+
+  // Determine current chat type: from active conversation or from pending trigger
+  const currentChatType: ChatType = conversation?.type || pendingChatType || 'research';
+  const currentSettings = chatSettings[currentChatType];
+
+  // Model and thinking level from per-type settings
+  const selectedModel = currentSettings.model;
+  const thinkingLevel = currentSettings.thinkingLevel;
+
+  const setSelectedModel = (model: AIModel) => {
+    setChatSettings(currentChatType, { model });
+  };
+
+  // Get last assistant response for copy button
+  const lastAssistantResponse = useMemo(() => {
+    const assistantMessages = messages.filter(m => m.role === 'assistant');
+    return assistantMessages.length > 0 ? assistantMessages[assistantMessages.length - 1].content : '';
+  }, [messages]);
+
+  // Copy last response to clipboard
+  const copyLastResponse = async () => {
+    if (!lastAssistantResponse) {
+      showToast('Нет ответа для копирования', 'warning');
+      return;
+    }
+    await navigator.clipboard.writeText(lastAssistantResponse);
+    showToast('Ответ скопирован', 'success');
+  };
+
+  const setThinkingLevel = (level: ThinkingLevel) => {
+    setChatSettings(currentChatType, { thinkingLevel: level });
+  };
 
   // Focus input when opened
   useEffect(() => {
@@ -101,7 +139,7 @@ export default function ResearchSheet({ projectId }: ResearchSheetProps) {
               flexShrink: 0
             }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-                <span style={{ fontSize: '14px', fontWeight: 500, color: '#fff' }}>Research</span>
+                <span style={{ fontSize: '14px', fontWeight: 500, color: '#fff' }}>{CHAT_TYPE_LABELS[currentChatType]}</span>
 
                 {/* Model select */}
                 <select
@@ -187,6 +225,40 @@ export default function ResearchSheet({ projectId }: ResearchSheetProps) {
               </div>
 
               <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                {/* Copy last response button */}
+                {lastAssistantResponse && (
+                  <button
+                    onClick={copyLastResponse}
+                    style={{
+                      fontSize: '11px',
+                      color: '#4ade80',
+                      background: 'rgba(34,197,94,0.1)',
+                      border: '1px solid rgba(34,197,94,0.3)',
+                      borderRadius: '6px',
+                      padding: '4px 10px',
+                      cursor: 'pointer',
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '4px',
+                      transition: 'all 0.15s ease'
+                    }}
+                    onMouseEnter={(e) => {
+                      e.currentTarget.style.background = 'rgba(34,197,94,0.2)';
+                      e.currentTarget.style.borderColor = 'rgba(34,197,94,0.5)';
+                    }}
+                    onMouseLeave={(e) => {
+                      e.currentTarget.style.background = 'rgba(34,197,94,0.1)';
+                      e.currentTarget.style.borderColor = 'rgba(34,197,94,0.3)';
+                    }}
+                    title="Скопировать последний ответ"
+                  >
+                    <svg width="12" height="12" viewBox="0 0 16 16" fill="none">
+                      <rect x="5" y="5" width="9" height="9" rx="1" stroke="currentColor" strokeWidth="1.5"/>
+                      <path d="M11 5V3C11 2.44772 10.5523 2 10 2H3C2.44772 2 2 2.44772 2 3V10C2 10.5523 2.44772 11 3 11H5" stroke="currentColor" strokeWidth="1.5"/>
+                    </svg>
+                    Copy
+                  </button>
+                )}
                 {conversation && (
                   <button
                     onClick={() => deleteConversation(projectId, conversation.id)}
@@ -231,7 +303,7 @@ export default function ResearchSheet({ projectId }: ResearchSheetProps) {
 
             {/* Input Area */}
             <div style={{ borderTop: '1px solid #333', backgroundColor: '#222', flexShrink: 0 }}>
-              <ResearchInput projectId={projectId} inputRef={inputRef} />
+              <ResearchInput projectId={projectId} inputRef={inputRef} chatType={currentChatType} />
             </div>
           </motion.div>
         </>

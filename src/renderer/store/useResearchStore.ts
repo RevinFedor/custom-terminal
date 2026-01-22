@@ -7,10 +7,13 @@ export interface Message {
   timestamp: number;
 }
 
+export type ChatType = 'research' | 'compact';
+
 export interface Conversation {
   id: string;
   title: string; // First user message preview
   messages: Message[];
+  type: ChatType; // Type of chat (research, compact, etc.)
   createdAt: number;
   updatedAt: number;
 }
@@ -24,7 +27,8 @@ interface ResearchStore {
 
   // Trigger research from context menu (survives panel mount/unmount)
   pendingResearch: boolean;
-  triggerResearch: () => void;
+  pendingChatType: ChatType;
+  triggerResearch: (type?: ChatType) => void;
   clearPendingResearch: () => void;
 
   // Conversations per project: projectId -> conversationId -> Conversation
@@ -34,7 +38,7 @@ interface ResearchStore {
   activeConversationId: Record<string, string | null>;
 
   // Create new conversation and return its id
-  createConversation: (projectId: string, firstUserMessage: string) => string;
+  createConversation: (projectId: string, firstUserMessage: string, type?: ChatType) => string;
 
   // Add message to active conversation
   addMessage: (projectId: string, role: 'user' | 'assistant', content: string) => void;
@@ -94,14 +98,15 @@ export const useResearchStore = create<ResearchStore>((set, get) => ({
 
   // Pending research trigger (survives panel mount)
   pendingResearch: false,
-  triggerResearch: () => set({ pendingResearch: true, isOpen: true }),
+  pendingChatType: 'research' as ChatType,
+  triggerResearch: (type: ChatType = 'research') => set({ pendingResearch: true, pendingChatType: type, isOpen: true }),
   clearPendingResearch: () => set({ pendingResearch: false }),
 
   // Data
   conversations: initialData.conversations || {},
   activeConversationId: initialData.activeConversationId || {},
 
-  createConversation: (projectId, firstUserMessage) => {
+  createConversation: (projectId, firstUserMessage, type = 'research') => {
     const convId = `conv-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
     const now = Date.now();
 
@@ -114,6 +119,7 @@ export const useResearchStore = create<ResearchStore>((set, get) => ({
         content: firstUserMessage,
         timestamp: now
       }],
+      type,
       createdAt: now,
       updatedAt: now
     };

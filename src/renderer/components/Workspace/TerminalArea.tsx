@@ -1,4 +1,4 @@
-import React, { memo, useMemo, useEffect } from 'react';
+import React, { memo, useMemo, useEffect, useState } from 'react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import Terminal from './Terminal';
@@ -14,22 +14,26 @@ const InterruptedSessionOverlay = memo(({ tabId, sessionId, onContinue, onDismis
   onContinue: () => void;
   onDismiss: () => void;
 }) => {
+  const [isLoading, setIsLoading] = useState(false);
+
   // Handle backdrop click
   const handleBackdropClick = (e: React.MouseEvent) => {
     e.stopPropagation();
-    onDismiss();
+    if (!isLoading) onDismiss();
   };
 
-  // Handle continue click
+  // Handle continue click - disable after first click
   const handleContinueClick = (e: React.MouseEvent) => {
     e.stopPropagation();
+    if (isLoading) return; // Prevent double click
+    setIsLoading(true);
     onContinue();
   };
 
   // Handle close button click
   const handleCloseClick = (e: React.MouseEvent) => {
     e.stopPropagation();
-    onDismiss();
+    if (!isLoading) onDismiss();
   };
 
   return (
@@ -54,8 +58,9 @@ const InterruptedSessionOverlay = memo(({ tabId, sessionId, onContinue, onDismis
       >
         {/* Close button */}
         <button
-          className="absolute top-3 right-3 text-[#666] hover:text-white text-xl leading-none w-6 h-6 flex items-center justify-center rounded hover:bg-white/10"
+          className="absolute top-3 right-3 text-[#666] hover:text-white text-xl leading-none w-6 h-6 flex items-center justify-center rounded hover:bg-white/10 disabled:opacity-50"
           onClick={handleCloseClick}
+          disabled={isLoading}
         >
           ×
         </button>
@@ -82,10 +87,11 @@ const InterruptedSessionOverlay = memo(({ tabId, sessionId, onContinue, onDismis
 
         {/* Continue button */}
         <button
-          className="w-full bg-accent hover:bg-accent/80 text-white py-2.5 px-4 rounded-lg font-medium text-sm transition-colors"
+          className="w-full bg-accent hover:bg-accent/80 disabled:bg-accent/50 disabled:cursor-not-allowed text-white py-2.5 px-4 rounded-lg font-medium text-sm transition-colors"
           onClick={handleContinueClick}
+          disabled={isLoading}
         >
-          ⏵ Продолжить сессию
+          {isLoading ? '⏳ Загрузка...' : '⏵ Продолжить сессию'}
         </button>
 
         {/* Hint */}
@@ -121,8 +127,12 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
   const hasActiveMainTab = currentWorkspace?.activeTabId != null;
 
   const handleCreateTab = () => {
+    console.log('[TerminalArea] handleCreateTab called, currentProject:', currentProject?.name);
     if (currentProject) {
+      console.log('[TerminalArea] Creating tab for project:', projectId, 'path:', currentProject.path);
       createTab(projectId, undefined, currentProject.path);
+    } else {
+      console.log('[TerminalArea] No currentProject, cannot create tab');
     }
   };
 
@@ -147,22 +157,28 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
   const terminals = useMemo(() => {
     const result: React.ReactNode[] = [];
 
+    console.log('[TerminalArea] Building terminal list, openProjects:', openProjects.size, 'current projectId:', projectId);
+
     openProjects.forEach((workspace, projId) => {
       const isActiveProject = projId === projectId;
+      console.log('[TerminalArea] Project:', projId, 'isActive:', isActiveProject, 'tabs:', workspace.tabs.size, 'activeTabId:', workspace.activeTabId);
 
       workspace.tabs.forEach((tab) => {
+        const isActive = isActiveProject && workspace.activeTabId === tab.id;
+        console.log('[TerminalArea] Adding Terminal:', tab.id, 'active:', isActive, 'cwd:', tab.cwd);
         result.push(
           <Terminal
             key={tab.id}
             tabId={tab.id}
             cwd={tab.cwd}
-            active={isActiveProject && workspace.activeTabId === tab.id}
+            active={isActive}
             isActiveProject={isActiveProject}
           />
         );
       });
     });
 
+    console.log('[TerminalArea] Total terminals:', result.length);
     return result;
   }, [openProjects, projectId]);
 

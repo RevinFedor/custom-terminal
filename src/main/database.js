@@ -308,6 +308,17 @@ class DatabaseManager {
     `).run(notes, normalizedPath);
   }
 
+  deleteProject(projectPath) {
+    const normalizedPath = path.resolve(projectPath);
+    const project = this.db.prepare('SELECT id FROM projects WHERE path = ?').get(normalizedPath);
+
+    if (!project) return false;
+
+    // CASCADE will delete tabs, quick_actions, gemini_history, ai_sessions
+    this.db.prepare('DELETE FROM projects WHERE id = ?').run(project.id);
+    return true;
+  }
+
   // ========== QUICK ACTIONS (now redirects to global commands) ==========
 
   saveQuickActions(projectPath, actions) {

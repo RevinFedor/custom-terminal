@@ -14,6 +14,15 @@ interface FilePreview {
 
 export type AIModel = 'gemini-2.0-flash' | 'gemini-3-flash-preview' | 'gemini-3-pro-preview';
 export type ThinkingLevel = 'NONE' | 'LOW' | 'MEDIUM' | 'HIGH';
+export type ChatType = 'research' | 'compact';
+
+export interface ChatTypeSettings {
+  model: AIModel;
+  thinkingLevel: ThinkingLevel;
+  prompt: string;
+}
+
+export type ChatSettingsMap = Record<ChatType, ChatTypeSettings>;
 
 interface DocPromptSettings {
   useFile: boolean; // true = read from file path, false = use inline content
@@ -49,6 +58,11 @@ interface UIStore {
   setDocPromptUseFile: (useFile: boolean) => void;
   setDocPromptFilePath: (path: string) => void;
   setDocPromptInlineContent: (content: string) => void;
+
+  // Per-chat-type settings (research, compact, etc.)
+  chatSettings: ChatSettingsMap;
+  getChatSettings: (type: ChatType) => ChatTypeSettings;
+  setChatSettings: (type: ChatType, settings: Partial<ChatTypeSettings>) => void;
 
   // Terminal Selection (global state for selected text)
   terminalSelection: string;
@@ -154,6 +168,46 @@ const saveThinkingLevel = (level: ThinkingLevel) => {
 
 const DEFAULT_RESEARCH_PROMPT = 'вот моя проблема нужно чтобы ты понял что за проблема и на reddit поискал обсуждения. Не ограничивайся категориями. Проблема: ';
 
+const DEFAULT_COMPACT_PROMPT = 'Проанализируй всю нашу текущую сессию и составь структурированное резюме для переноса контекста в новый чат, включив в него: изначальную цель; список всех созданных файлов с пояснением, почему мы выбрали именно такую структуру и эти файлы; краткий отчет о том, что работает; детальный разбор того, что НЕ получилось, с указанием конкретных причин ошибок (почему выбранные решения не сработали); текущее состояние кода и пошаговый план дальнейших действий — оформи это всё одним компактным сообщением, которое я смогу скопировать и отправить тебе в новом чате для полного восстановления контекста.\n\nВот текст сессии:\n';
+
+const DEFAULT_CHAT_SETTINGS: ChatSettingsMap = {
+  research: {
+    model: 'gemini-2.0-flash',
+    thinkingLevel: 'NONE',
+    prompt: DEFAULT_RESEARCH_PROMPT
+  },
+  compact: {
+    model: 'gemini-3-flash-preview',
+    thinkingLevel: 'HIGH',
+    prompt: DEFAULT_COMPACT_PROMPT
+  }
+};
+
+const loadChatSettings = (): ChatSettingsMap => {
+  try {
+    const saved = localStorage.getItem('noted-terminal-chat-settings');
+    if (saved) {
+      const parsed = JSON.parse(saved);
+      // Merge with defaults to ensure all types have settings
+      return {
+        research: { ...DEFAULT_CHAT_SETTINGS.research, ...parsed.research },
+        compact: { ...DEFAULT_CHAT_SETTINGS.compact, ...parsed.compact }
+      };
+    }
+  } catch (e) {
+    console.error('Failed to load chat settings:', e);
+  }
+  return DEFAULT_CHAT_SETTINGS;
+};
+
+const saveChatSettings = (settings: ChatSettingsMap) => {
+  try {
+    localStorage.setItem('noted-terminal-chat-settings', JSON.stringify(settings));
+  } catch (e) {
+    console.error('Failed to save chat settings:', e);
+  }
+};
+
 const loadResearchPrompt = (): string => {
   try {
     const saved = localStorage.getItem('noted-terminal-research-prompt');
@@ -211,6 +265,7 @@ const initialModel = loadSelectedModel();
 const initialThinkingLevel = loadThinkingLevel();
 const initialResearchPrompt = loadResearchPrompt();
 const initialDocPrompt = loadDocPrompt();
+const initialChatSettings = loadChatSettings();
 
 export const useUIStore = create<UIStore>((set, get) => ({
   // Font Settings
@@ -258,6 +313,21 @@ export const useUIStore = create<UIStore>((set, get) => ({
     const updated = { ...current, inlineContent };
     set({ docPrompt: updated });
     saveDocPrompt(updated);
+  },
+
+  // Per-chat-type settings
+  chatSettings: initialChatSettings,
+  getChatSettings: (type) => {
+    return get().chatSettings[type];
+  },
+  setChatSettings: (type, settings) => {
+    const current = get().chatSettings;
+    const updated = {
+      ...current,
+      [type]: { ...current[type], ...settings }
+    };
+    set({ chatSettings: updated });
+    saveChatSettings(updated);
   },
 
   // Terminal Selection
@@ -334,8 +404,14 @@ export const useUIStore = create<UIStore>((set, get) => ({
 
   // Edit Project Modal
   editingProject: null,
-  openEditModal: (project) => set({ editingProject: project }),
-  closeEditModal: () => set({ editingProject: null }),
+  openEditModal: (project) => {
+    console.log('[UIStore] openEditModal called with:', project?.name);
+    set({ editingProject: project });
+  },
+  closeEditModal: () => {
+    console.log('[UIStore] closeEditModal called');
+    set({ editingProject: null });
+  },
 
   // Session Input Modal
   sessionModal: {

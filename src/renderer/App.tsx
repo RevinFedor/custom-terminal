@@ -164,8 +164,18 @@ function App() {
         console.log('[ContextMenu] Selection:', terminalSelection ? terminalSelection.slice(0, 50) : 'EMPTY');
         if (terminalSelection) {
           // Use store to trigger research (survives panel mount)
-          useResearchStore.getState().triggerResearch();
+          useResearchStore.getState().triggerResearch('research');
           console.log('[ContextMenu] Triggered research via store');
+        } else {
+          showToast('Select text in terminal first', 'error');
+        }
+      } else if (cmd === 'gemini-compact') {
+        // Trigger Compact - summarize session
+        const terminalSelection = useUIStore.getState().terminalSelection;
+        console.log('[ContextMenu] Compact selection:', terminalSelection ? terminalSelection.slice(0, 50) : 'EMPTY');
+        if (terminalSelection) {
+          useResearchStore.getState().triggerResearch('compact');
+          console.log('[ContextMenu] Triggered compact via store');
         } else {
           showToast('Select text in terminal first', 'error');
         }

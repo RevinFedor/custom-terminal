@@ -30,28 +30,48 @@ export default function ProjectCard({ project, onOpen, tabsStats = { total: 0, a
   const { openProjects, closeProject } = useWorkspaceStore();
 
   const handleEdit = (e: React.MouseEvent) => {
+    console.log('[ProjectCard] handleEdit called');
     e.stopPropagation();
+    e.preventDefault();
     setMenuOpen(false);
+    console.log('[ProjectCard] Opening edit modal for:', project.name);
     // Small delay to ensure menu closes before modal opens
     setTimeout(() => {
+      console.log('[ProjectCard] Calling openEditModal');
       openEditModal(project);
-    }, 10);
+    }, 50);
   };
 
   const handleDelete = async (e: React.MouseEvent) => {
+    console.log('[ProjectCard] handleDelete called');
     e.stopPropagation();
+    e.preventDefault();
     setMenuOpen(false);
 
-    if (!confirm(`Are you sure you want to delete "${project.name}"?`)) return;
+    console.log('[ProjectCard] Showing confirm dialog');
+    if (!confirm(`Are you sure you want to delete "${project.name}"?`)) {
+      console.log('[ProjectCard] Delete cancelled');
+      return;
+    }
+
+    console.log('[ProjectCard] Delete confirmed, proceeding...');
 
     // Close project if open
     if (openProjects.has(project.id)) {
-      closeProject(project.id);
+      console.log('[ProjectCard] Closing open project');
+      await closeProject(project.id);
     }
 
     // Delete from backend
-    await ipcRenderer.invoke('project:delete', project.path);
-    showToast('Project deleted', 'success');
+    console.log('[ProjectCard] Calling project:delete IPC');
+    const result = await ipcRenderer.invoke('project:delete', project.path);
+    console.log('[ProjectCard] Delete result:', result);
+
+    if (result.success) {
+      showToast('Project deleted', 'success');
+    } else {
+      showToast('Failed to delete project', 'error');
+    }
     loadProjects();
   };
 
@@ -95,20 +115,24 @@ export default function ProjectCard({ project, onOpen, tabsStats = { total: 0, a
           {/* Dropdown Menu */}
           {menuOpen && (
             <>
-              {/* Click outside handler */}
+              {/* Click outside handler - use pointer-events to not block dropdown */}
               <div
-                className="fixed inset-0 z-10"
+                className="fixed inset-0"
+                style={{ zIndex: 50 }}
                 onClick={(e) => { e.stopPropagation(); setMenuOpen(false); }}
               />
-              <div className="absolute right-0 top-full mt-1 bg-panel border border-border-main rounded-lg shadow-xl min-w-[150px] z-20">
+              <div
+                className="absolute right-0 top-full mt-1 bg-panel border border-border-main rounded-lg shadow-xl min-w-[150px]"
+                style={{ zIndex: 51 }}
+              >
                 <button
-                  className="w-full text-left px-4 py-2 text-sm text-[#ccc] hover:bg-white/5 rounded-t-lg"
+                  className="w-full text-left px-4 py-2 text-sm text-[#ccc] hover:bg-white/10 hover:text-white rounded-t-lg cursor-pointer transition-colors"
                   onClick={handleEdit}
                 >
                   ✏️ Edit
                 </button>
                 <button
-                  className="w-full text-left px-4 py-2 text-sm text-[#cc3333] hover:bg-[#cc3333]/10 rounded-b-lg"
+                  className="w-full text-left px-4 py-2 text-sm text-[#cc3333] hover:bg-[#cc3333]/20 hover:text-[#ff4444] rounded-b-lg cursor-pointer transition-colors"
                   onClick={handleDelete}
                 >
                   🗑️ Delete

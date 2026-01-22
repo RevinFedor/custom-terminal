@@ -31,34 +31,20 @@ const extractNotes = (notes: any): string => {
 export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [notes, setNotes] = useState(extractNotes(project?.notes));
-  const [isEditingNotes, setIsEditingNotes] = useState(false);
   const { showToast } = useUIStore();
-  const notesTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const notesTextareaRef = useRef<HTMLTextAreaElement>(null);
 
   // Sync notes with project
   useEffect(() => {
     setNotes(extractNotes(project?.notes));
   }, [project?.notes]);
 
-  // Save notes with debounce
-  const saveNotes = (newNotes: string) => {
-    setNotes(newNotes);
-    if (notesTimeoutRef.current) {
-      clearTimeout(notesTimeoutRef.current);
+  // Save notes on blur
+  const saveNotesImmediately = async () => {
+    if (project?.path && notes !== extractNotes(project?.notes)) {
+      await ipcRenderer.invoke('project:save-note', { dirPath: project.path, content: notes });
     }
-    notesTimeoutRef.current = setTimeout(async () => {
-      if (project?.path) {
-        await ipcRenderer.invoke('project:save-note', { dirPath: project.path, content: newNotes });
-      }
-    }, 500);
   };
-
-  // Cleanup timeout on unmount
-  useEffect(() => {
-    return () => {
-      if (notesTimeoutRef.current) clearTimeout(notesTimeoutRef.current);
-    };
-  }, []);
 
   // Poll for session ID changes (every 500ms)
   // This avoids store subscription that causes terminal re-render issues
@@ -244,51 +230,25 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
         </div>
       </div>
 
-      {/* Quick Tips */}
-      <div className="mb-4">
-        <div className="text-[11px] uppercase text-[#888] mb-2">Подсказки</div>
-        <ul className="text-[10px] text-[#777] space-y-1 list-disc list-inside">
-          <li>Сессия сохраняется после перезапуска</li>
-          <li>Форк создаёт копию в новой вкладке</li>
-          <li>У каждой вкладки своя сессия</li>
-        </ul>
-      </div>
-
-      {/* Project Notes */}
+      {/* Project Notes - always editable */}
       <div className="flex-1 flex flex-col min-h-0 border-t border-border-main pt-3">
-        <div className="flex items-center justify-between mb-2">
-          <div className="text-[11px] uppercase text-[#888]">Заметки проекта</div>
-          <button
-            className="text-[10px] text-[#666] hover:text-white transition-colors"
-            onClick={() => setIsEditingNotes(!isEditingNotes)}
-          >
-            {isEditingNotes ? 'Done' : 'Edit'}
-          </button>
-        </div>
-        {isEditingNotes ? (
-          <textarea
-            className="flex-1 min-h-[80px] bg-[#2a2a2a] border border-[#444] rounded p-2 text-[11px] text-[#ccc] resize-none focus:outline-none focus:border-accent"
-            value={notes}
-            onChange={(e) => saveNotes(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter' && e.metaKey) {
-                e.preventDefault();
-                setIsEditingNotes(false);
-                showToast('Заметки сохранены', 'success');
-              }
-            }}
-            placeholder="Добавьте заметки по проекту..."
-            autoFocus
-          />
-        ) : (
-          <div className="flex-1 min-h-[60px] overflow-y-auto">
-            {notes ? (
-              <p className="text-[11px] text-[#aaa] whitespace-pre-wrap">{notes}</p>
-            ) : (
-              <p className="text-[11px] text-[#555] italic">Нет заметок. Нажмите Edit чтобы добавить.</p>
-            )}
-          </div>
-        )}
+        <div className="text-[11px] uppercase text-[#888] mb-2">Заметки проекта</div>
+        <textarea
+          ref={notesTextareaRef}
+          className="flex-1 min-h-[80px] bg-transparent border border-transparent rounded p-2 text-[11px] text-[#aaa] resize-none focus:outline-none focus:border-accent focus:bg-[#2a2a2a] transition-all duration-200 placeholder:text-[#555] placeholder:italic"
+          value={notes}
+          onChange={(e) => setNotes(e.target.value)}
+          onBlur={() => {
+            saveNotesImmediately();
+          }}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' && e.metaKey) {
+              e.preventDefault();
+              notesTextareaRef.current?.blur();
+            }
+          }}
+          placeholder="Добавьте заметки по проекту..."
+        />
       </div>
     </div>
   );
