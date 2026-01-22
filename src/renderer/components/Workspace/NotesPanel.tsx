@@ -1,6 +1,7 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
+import { useResearchStore } from '../../store/useResearchStore';
 import InfoPanel from './panels/InfoPanel';
 import GeminiPanel from './panels/GeminiPanel';
 import ActionsPanel from './panels/ActionsPanel';
@@ -24,11 +25,19 @@ type TabType = 'info' | 'ai' | 'actions' | 'sessions';
 export default function NotesPanel({ projectId, project }: NotesPanelProps) {
   const { notesPanelWidth } = useUIStore();
   const { getActiveProject } = useWorkspaceStore();
+  const { pendingResearch } = useResearchStore();
 
   const [activeTab, setActiveTab] = useState<TabType>('info');
 
   const activeProject = getActiveProject();
   const activeTabId = activeProject?.activeTabId || null;
+
+  // Auto-switch to AI tab when research is triggered
+  useEffect(() => {
+    if (pendingResearch) {
+      setActiveTab('ai');
+    }
+  }, [pendingResearch]);
 
   const tabs: { id: TabType; label: string }[] = [
     { id: 'info', label: 'Info' },

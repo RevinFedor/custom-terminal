@@ -1,9 +1,10 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { useUIStore } from '../../store/useUIStore';
+import { useUIStore, ChatType } from '../../store/useUIStore';
 
 const { ipcRenderer } = window.require('electron');
 
 const DEFAULT_RESEARCH_PROMPT = 'вот моя проблема нужно чтобы ты понял что за проблема и на reddit поискал обсуждения. Не ограничивайся категориями. Проблема: ';
+const DEFAULT_COMPACT_PROMPT = 'Проанализируй всю нашу текущую сессию и составь структурированное резюме для переноса контекста в новый чат, включив в него: изначальную цель; список всех созданных файлов с пояснением, почему мы выбрали именно такую структуру и эти файлы; краткий отчет о том, что работает; детальный разбор того, что НЕ получилось, с указанием конкретных причин ошибок (почему выбранные решения не сработали); текущее состояние кода и пошаговый план дальнейших действий — оформи это всё одним компактным сообщением, которое я смогу скопировать и отправить тебе в новом чате для полного восстановления контекста.\n\nВот текст сессии:\n';
 
 interface Command {
   name: string;
@@ -18,8 +19,8 @@ interface Prompt {
 export default function PromptsPanel() {
   const {
     showToast,
-    researchPrompt,
-    setResearchPrompt,
+    chatSettings,
+    setChatSettings,
     docPrompt,
     setDocPromptUseFile,
     setDocPromptFilePath,
@@ -31,13 +32,16 @@ export default function PromptsPanel() {
   const [editingCommand, setEditingCommand] = useState<number | null>(null);
   const [editingPrompt, setEditingPrompt] = useState<number | null>(null);
   const [editingResearch, setEditingResearch] = useState(false);
-  const [localResearchPrompt, setLocalResearchPrompt] = useState(researchPrompt);
+  const [editingCompact, setEditingCompact] = useState(false);
+  const [localResearchPrompt, setLocalResearchPrompt] = useState(chatSettings.research.prompt);
+  const [localCompactPrompt, setLocalCompactPrompt] = useState(chatSettings.compact.prompt);
   const [editingDocPrompt, setEditingDocPrompt] = useState(false);
   const [localDocFilePath, setLocalDocFilePath] = useState(docPrompt.filePath);
   const [localDocInlineContent, setLocalDocInlineContent] = useState(docPrompt.inlineContent);
   const commandsSaveTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const promptsSaveTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const researchSaveTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const compactSaveTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   useEffect(() => {
     loadCommands();
@@ -120,14 +124,29 @@ export default function PromptsPanel() {
     setLocalResearchPrompt(value);
     if (researchSaveTimeoutRef.current) clearTimeout(researchSaveTimeoutRef.current);
     researchSaveTimeoutRef.current = setTimeout(() => {
-      setResearchPrompt(value);
+      setChatSettings('research', { prompt: value });
       showToast('Saved', 'success');
     }, 800);
   };
 
   const resetResearchPrompt = () => {
     setLocalResearchPrompt(DEFAULT_RESEARCH_PROMPT);
-    setResearchPrompt(DEFAULT_RESEARCH_PROMPT);
+    setChatSettings('research', { prompt: DEFAULT_RESEARCH_PROMPT });
+    showToast('Reset to default', 'success');
+  };
+
+  const updateCompactPrompt = (value: string) => {
+    setLocalCompactPrompt(value);
+    if (compactSaveTimeoutRef.current) clearTimeout(compactSaveTimeoutRef.current);
+    compactSaveTimeoutRef.current = setTimeout(() => {
+      setChatSettings('compact', { prompt: value });
+      showToast('Saved', 'success');
+    }, 800);
+  };
+
+  const resetCompactPrompt = () => {
+    setLocalCompactPrompt(DEFAULT_COMPACT_PROMPT);
+    setChatSettings('compact', { prompt: DEFAULT_COMPACT_PROMPT });
     showToast('Reset to default', 'success');
   };
 
@@ -423,6 +442,104 @@ export default function PromptsPanel() {
                   </div>
                   <div style={{ fontSize: '12px', color: '#666', overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' }}>
                     {localResearchPrompt}
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+
+          {/* System: Compact Prompt */}
+          <div style={{ marginBottom: '24px' }}>
+            <div style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: '8px',
+              marginBottom: '12px',
+              paddingBottom: '8px',
+              borderBottom: '1px solid #333'
+            }}>
+              <span style={{
+                fontSize: '10px',
+                fontWeight: '600',
+                color: '#a855f7',
+                textTransform: 'uppercase',
+                letterSpacing: '0.5px'
+              }}>
+                System
+              </span>
+              <span style={{ fontSize: '10px', color: '#555' }}>Compact (Резюме)</span>
+            </div>
+
+            <div
+              onClick={() => !editingCompact && setEditingCompact(true)}
+              style={{
+                padding: '16px',
+                backgroundColor: editingCompact ? '#252525' : '#222',
+                border: editingCompact ? '2px solid #a855f7' : '2px solid #a855f733',
+                borderRadius: '12px',
+                cursor: editingCompact ? 'default' : 'pointer',
+                transition: 'all 0.15s ease'
+              }}
+            >
+              {editingCompact ? (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                  <textarea
+                    value={localCompactPrompt}
+                    onChange={(e) => updateCompactPrompt(e.target.value)}
+                    placeholder="Compact prompt (prepended to selected text)..."
+                    rows={6}
+                    autoFocus
+                    style={{
+                      width: '100%',
+                      padding: '10px 12px',
+                      backgroundColor: '#1a1a1a',
+                      border: '1px solid #444',
+                      borderRadius: '8px',
+                      color: '#aaa',
+                      fontSize: '12px',
+                      fontFamily: 'monospace',
+                      outline: 'none',
+                      resize: 'none',
+                      boxSizing: 'border-box'
+                    }}
+                  />
+                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                    <button
+                      onClick={(e) => { e.stopPropagation(); resetCompactPrompt(); }}
+                      style={{
+                        padding: '6px 12px',
+                        backgroundColor: 'transparent',
+                        color: '#888',
+                        border: 'none',
+                        fontSize: '12px',
+                        cursor: 'pointer'
+                      }}
+                    >
+                      Reset to Default
+                    </button>
+                    <button
+                      onClick={(e) => { e.stopPropagation(); setEditingCompact(false); }}
+                      style={{
+                        padding: '6px 16px',
+                        backgroundColor: '#a855f7',
+                        color: '#fff',
+                        border: 'none',
+                        borderRadius: '6px',
+                        fontSize: '12px',
+                        cursor: 'pointer'
+                      }}
+                    >
+                      Done
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <>
+                  <div style={{ fontSize: '14px', color: '#a855f7', fontWeight: '500', marginBottom: '4px' }}>
+                    Compact Prompt
+                  </div>
+                  <div style={{ fontSize: '12px', color: '#666', overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' }}>
+                    {localCompactPrompt}
                   </div>
                 </>
               )}

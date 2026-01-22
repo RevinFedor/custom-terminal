@@ -29,6 +29,12 @@ export default function Workspace() {
     return <div className="flex-1 bg-bg-main" />;
   }
 
+  // Get current tab's cwd for FileExplorer (fallback to project path)
+  const activeTab = activeProject.activeTabId
+    ? activeProject.tabs.get(activeProject.activeTabId)
+    : null;
+  const explorerPath = activeTab?.cwd || currentProject.path;
+
   return (
     <div className="flex-1 flex flex-col h-full overflow-hidden">
       <TabBar projectId={activeProjectId} />
@@ -54,8 +60,8 @@ export default function Workspace() {
         )}
       </div>
 
-      {/* File Explorer - fixed overlay on left side */}
-      <FileExplorer projectPath={currentProject.path} />
+      {/* File Explorer - opens in current terminal's directory */}
+      <FileExplorer projectPath={explorerPath} />
     </div>
   );
 }

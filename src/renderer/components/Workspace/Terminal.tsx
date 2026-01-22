@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState, memo } from 'react';
+import React, { useEffect, useRef, useState, memo, useCallback } from 'react';
 import { Terminal as XTerminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebglAddon } from '@xterm/addon-webgl';
@@ -154,6 +154,8 @@ interface TerminalProps {
 }
 
 function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps) {
+  console.log('[Terminal] Render:', { tabId, cwd, active, isActiveProject });
+
   const terminalRef = useRef<HTMLDivElement>(null);
   const xtermInstance = useRef<XTerminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
@@ -163,11 +165,46 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
   const isMounted = useRef(true);
   const isReadyRef = useRef(false); // Track if first fit completed
   const hasBeenActive = useRef(false); // Track if tab was ever active (for lazy init)
+  const isCreatingRef = useRef(false); // Lock to prevent double initialization
   const pendingBuffer = useRef<string>(''); // Buffer PTY data before xterm init
   const [isVisible, setIsVisible] = useState(false); // Hide until ready
+  const [showScrollButton, setShowScrollButton] = useState(false); // Show "scroll to bottom" button
   const claudeSessionDetected = useRef<string | null>(null); // Track detected Claude session UUID
 
   const terminalFontSize = useUIStore((state) => state.terminalFontSize);
+
+  // Check if terminal is scrolled up (not at bottom)
+  const checkScrollPosition = useCallback(() => {
+    const term = xtermInstance.current;
+    if (!term) return;
+
+    const buffer = term.buffer.active;
+    const isAtBottom = buffer.viewportY >= buffer.baseY;
+    setShowScrollButton(!isAtBottom);
+  }, []);
+
+  // Scroll to bottom
+  const scrollToBottom = useCallback(() => {
+    const term = xtermInstance.current;
+    if (!term) return;
+    term.scrollToBottom();
+    setShowScrollButton(false);
+  }, []);
+
+  // Attach scroll listeners - called AFTER term.open() when DOM is guaranteed to exist
+  const attachScrollListeners = useCallback((term: XTerminal, container: HTMLDivElement) => {
+    // 1. Native scroll (mouse wheel, trackpad, scrollbar drag)
+    const viewport = container.querySelector('.xterm-viewport');
+    if (viewport) {
+      viewport.addEventListener('scroll', checkScrollPosition);
+    }
+
+    // 2. Xterm scroll (programmatic scroll, buffer changes)
+    term.onScroll(checkScrollPosition);
+
+    // 3. When data is written (terminal auto-scrolls down on output)
+    term.onWriteParsed(checkScrollPosition);
+  }, [checkScrollPosition]);
 
   // Write buffer refs to batch PTY output and prevent jitter
   const writeBufferRef = useRef<string>('');
@@ -195,8 +232,13 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
   };
 
   useEffect(() => {
-    if (isInitialized.current || !terminalRef.current) return;
+    console.log('[Terminal] Main useEffect:', { tabId, isInitialized: isInitialized.current, hasRef: !!terminalRef.current });
+    if (isInitialized.current || !terminalRef.current) {
+      console.log('[Terminal] Skipping init:', { isInitialized: isInitialized.current, hasRef: !!terminalRef.current });
+      return;
+    }
     isInitialized.current = true;
+    console.log('[Terminal] Starting initialization for:', tabId);
 
     const containerRef = terminalRef.current;
 
@@ -349,6 +391,11 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
       term.open(containerRef);
 
       xtermInstance.current = term;
+      hasBeenActive.current = true; // Mark as active AFTER xterm is created to prevent race condition
+      console.log('[Terminal] initTerminal: xterm created, hasBeenActive set to true for:', tabId);
+
+      // Attach scroll listeners (native + xterm events)
+      attachScrollListeners(term, containerRef);
 
       // Register terminal in global registry for selection access
       terminalRegistry.register(tabId, term);
@@ -524,9 +571,18 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
 
     // Lazy init: only create xterm when tab is active AND project is active
     // This prevents creating xterm for background projects during restore
+    console.log('[Terminal] Lazy init check:', { tabId, active, isActiveProject, hasBeenActive: hasBeenActive.current, isCreating: isCreatingRef.current });
     if (active && isActiveProject) {
-      hasBeenActive.current = true;
+      // Lock: prevent double initialization
+      if (isCreatingRef.current) {
+        console.log('[Terminal] Skipping initTerminal - already creating');
+        return;
+      }
+      console.log('[Terminal] Calling initTerminal for:', tabId);
+      isCreatingRef.current = true; // Set lock
       initTerminal();
+    } else {
+      console.log('[Terminal] Skipping initTerminal - not active or not active project');
     }
 
     return () => {
@@ -584,7 +640,9 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
   // Focus and fit when becoming active (with rAF to let browser paint first)
   // Also handles lazy initialization on first activation
   useEffect(() => {
+    console.log('[Terminal] Active useEffect:', { tabId, active, isActiveProject, hasBeenActive: hasBeenActive.current, hasXterm: !!xtermInstance.current });
     if (!active || !isActiveProject) {
+      console.log('[Terminal] Not active or not active project, returning');
       // Clear global selection when terminal becomes inactive
       if (!active) {
         getSetTerminalSelection()('');
@@ -594,10 +652,17 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
 
     // Lazy init: if this is first activation and xterm not created yet
     if (!hasBeenActive.current && !xtermInstance.current && terminalRef.current) {
-      hasBeenActive.current = true;
+      // Lock: prevent double initialization
+      if (isCreatingRef.current) {
+        console.log('[Terminal] Lazy init skipped - already creating for:', tabId);
+        return;
+      }
+      console.log('[Terminal] Lazy init triggered for:', tabId);
+      isCreatingRef.current = true; // Set lock
 
       // Need to initialize terminal now (reuse same logic as initTerminal)
       const initLazy = async () => {
+        console.log('[Terminal] initLazy starting for:', tabId);
         await document.fonts.ready;
 
         if (!isMounted.current || !terminalRef.current) return;
@@ -642,6 +707,12 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
         term.open(terminalRef.current);
 
         xtermInstance.current = term;
+        hasBeenActive.current = true; // Mark as active AFTER xterm is created
+        console.log('[Terminal] initLazy: xterm created, hasBeenActive set to true for:', tabId);
+
+        // Attach scroll listeners (native + xterm events)
+        attachScrollListeners(term, terminalRef.current);
+
         terminalRegistry.register(tabId, term);
 
         // Restore previously serialized buffer (from before unmount)
@@ -871,21 +942,60 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
   // CSS: visibility:hidden preserves geometry, prevents WebGL context loss
   // (unlike display:none which collapses to 0x0 and kills WebGL textures)
   // opacity:0 initially to prevent jitter during first fit
+
   return (
-    <div
-      ref={terminalRef}
-      className="terminal-instance absolute inset-0"
-      style={{
-        width: '100%',
-        height: '100%',
-        visibility: active ? 'visible' : 'hidden',
-        opacity: isVisible ? 1 : 0,
-        transition: 'opacity 0.05s ease-in',
-        zIndex: active ? 1 : -1
-      }}
-      onClick={handleClick}
-      onContextMenu={handleContextMenu}
-    />
+    <div className="relative w-full h-full" style={{ zIndex: active ? 1 : -1, isolation: 'isolate' }}>
+
+      {/* Layer 1: Terminal (Lower) */}
+      <div
+        ref={terminalRef}
+        className="terminal-instance absolute inset-0"
+        style={{
+          visibility: active ? 'visible' : 'hidden',
+          opacity: isVisible ? 1 : 0,
+          transition: 'opacity 0.05s ease-in'
+        }}
+        onClick={handleClick}
+        onContextMenu={handleContextMenu}
+      />
+
+      {/* Layer 2: UI Overlay - Scroll to bottom button */}
+      {active && showScrollButton && (
+        <button
+          onClick={scrollToBottom}
+          className="pointer-events-auto flex items-center justify-center cursor-pointer transition-all duration-200 ease-out hover:scale-105"
+          title="Scroll to bottom"
+          style={{
+            position: 'absolute',
+            bottom: '16px',
+            right: '16px',
+            width: '36px',
+            height: '36px',
+            borderRadius: '8px',
+            backgroundColor: 'rgba(60, 60, 60, 0.85)',
+            backdropFilter: 'blur(8px)',
+            border: '1px solid rgba(255, 255, 255, 0.1)',
+            color: 'rgba(255, 255, 255, 0.8)',
+            fontSize: '18px',
+            boxShadow: '0 4px 12px rgba(0, 0, 0, 0.3)',
+            zIndex: 100
+          }}
+          onMouseEnter={(e) => {
+            e.currentTarget.style.backgroundColor = 'rgba(80, 80, 80, 0.95)';
+            e.currentTarget.style.color = 'rgba(255, 255, 255, 1)';
+            e.currentTarget.style.borderColor = 'rgba(255, 255, 255, 0.2)';
+          }}
+          onMouseLeave={(e) => {
+            e.currentTarget.style.backgroundColor = 'rgba(60, 60, 60, 0.85)';
+            e.currentTarget.style.color = 'rgba(255, 255, 255, 0.8)';
+            e.currentTarget.style.borderColor = 'rgba(255, 255, 255, 0.1)';
+          }}
+        >
+          ↓
+        </button>
+      )}
+
+    </div>
   );
 }
 

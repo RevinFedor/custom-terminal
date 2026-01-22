@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
+import { motion } from 'framer-motion';
 import { useUIStore } from '../../store/useUIStore';
 import hljs from 'highlight.js';
 import 'highlight.js/styles/vs2015.css';
@@ -89,7 +90,10 @@ export default function FilePreview() {
   if (!filePreview) return null;
 
   return createPortal(
-    <div
+    <motion.div
+      initial={{ opacity: 0, scale: 0.98 }}
+      animate={{ opacity: 1, scale: 1 }}
+      transition={{ duration: 0.1, ease: 'easeOut' }}
       style={{
         position: 'fixed',
         top: 36,
@@ -134,7 +138,7 @@ export default function FilePreview() {
         ref={contentRef}
         className="flex-1 overflow-auto p-4 font-jetbrains text-sm text-[#ddd] leading-relaxed bg-[#1e1e1e]"
       />
-    </div>,
+    </motion.div>,
     document.body
   );
 }

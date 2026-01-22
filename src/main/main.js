@@ -56,9 +56,14 @@ function createWindow() {
 ipcMain.on('show-terminal-context-menu', async (event, { hasSelection, prompts }) => {
   const template = [
     {
-      label: 'Search Reddit with Gemini',
+      label: '🔍 Research (Reddit)',
       enabled: hasSelection,
       click: () => { event.sender.send('context-menu-command', 'gemini-research'); }
+    },
+    {
+      label: '📋 Compact (Резюме)',
+      enabled: hasSelection,
+      click: () => { event.sender.send('context-menu-command', 'gemini-compact'); }
     },
     { type: 'separator' }
   ];
@@ -493,6 +498,11 @@ ipcMain.handle('project:save-tabs', (event, { dirPath, tabs }) => {
 ipcMain.handle('project:save-metadata', (event, { dirPath, metadata }) => {
   projectManager.saveProjectMetadata(dirPath, metadata);
   return { success: true };
+});
+
+ipcMain.handle('project:delete', (event, dirPath) => {
+  const result = projectManager.deleteProject(dirPath);
+  return { success: result };
 });
 
 ipcMain.handle('project:select-directory', async () => {

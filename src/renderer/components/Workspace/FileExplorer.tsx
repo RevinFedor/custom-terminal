@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { createPortal } from 'react-dom';
+import { motion, AnimatePresence } from 'framer-motion';
 import { useUIStore } from '../../store/useUIStore';
 
 const { ipcRenderer } = window.require('electron');
@@ -189,45 +190,51 @@ export default function FileExplorer({ projectPath }: FileExplorerProps) {
     }
   };
 
-  if (!fileExplorerOpen) return null;
-
   return createPortal(
-    <div
-      style={{
-        position: 'fixed',
-        left: 0,
-        top: 36,
-        bottom: 0,
-        width: 250,
-        backgroundColor: '#1e1e1e',
-        borderRight: '1px solid #333',
-        display: 'flex',
-        flexDirection: 'column',
-        zIndex: 99999,
-        boxShadow: '4px 0 20px rgba(0,0,0,0.5)'
-      }}
-    >
-      <div style={{ padding: '8px 12px', borderBottom: '1px solid #333', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-        <span style={{ fontSize: 11, color: '#888', fontWeight: 'bold', textTransform: 'uppercase' }}>Explorer</span>
-        <button
-          style={{ color: '#888', fontSize: 18, background: 'none', border: 'none', cursor: 'pointer' }}
-          onClick={() => setFileExplorerOpen(false)}
+    <AnimatePresence>
+      {fileExplorerOpen && (
+        <motion.div
+          initial={{ x: -250 }}
+          animate={{ x: 0 }}
+          exit={{ x: -250 }}
+          transition={{ duration: 0.15, ease: 'easeOut' }}
+          style={{
+            position: 'fixed',
+            left: 0,
+            top: 36,
+            bottom: 0,
+            width: 250,
+            backgroundColor: '#1e1e1e',
+            borderRight: '1px solid #333',
+            display: 'flex',
+            flexDirection: 'column',
+            zIndex: 99999,
+            boxShadow: '4px 0 20px rgba(0,0,0,0.5)'
+          }}
         >
-          ×
-        </button>
-      </div>
+          <div style={{ padding: '8px 12px', borderBottom: '1px solid #333', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <span style={{ fontSize: 11, color: '#888', fontWeight: 'bold', textTransform: 'uppercase' }}>Explorer</span>
+            <button
+              style={{ color: '#888', fontSize: 18, background: 'none', border: 'none', cursor: 'pointer' }}
+              onClick={() => setFileExplorerOpen(false)}
+            >
+              ×
+            </button>
+          </div>
 
-      <div style={{ flex: 1, overflowY: 'auto', overflowX: 'hidden' }}>
-        {rootItems.map((item) => (
-          <FileTreeItem
-            key={item.path}
-            item={item}
-            level={0}
-            onFileClick={handleFileClick}
-          />
-        ))}
-      </div>
-    </div>,
+          <div style={{ flex: 1, overflowY: 'auto', overflowX: 'hidden' }}>
+            {rootItems.map((item) => (
+              <FileTreeItem
+                key={item.path}
+                item={item}
+                level={0}
+                onFileClick={handleFileClick}
+              />
+            ))}
+          </div>
+        </motion.div>
+      )}
+    </AnimatePresence>,
     document.body
   );
 }

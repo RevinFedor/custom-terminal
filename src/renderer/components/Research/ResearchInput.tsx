@@ -1,16 +1,22 @@
 import React, { useState, RefObject, useCallback } from 'react';
-import { useResearchStore } from '../../store/useResearchStore';
+import { useResearchStore, ChatType } from '../../store/useResearchStore';
 import { useUIStore } from '../../store/useUIStore';
 
 interface ResearchInputProps {
   projectId: string;
   inputRef: RefObject<HTMLTextAreaElement>;
+  chatType: ChatType;
 }
 
-export default function ResearchInput({ projectId, inputRef }: ResearchInputProps) {
+export default function ResearchInput({ projectId, inputRef, chatType }: ResearchInputProps) {
   const [value, setValue] = useState('');
   const { addMessage, createConversation, getActiveConversation, isLoading, setLoading, setAbortController, cancelRequest } = useResearchStore();
-  const { selectedModel, thinkingLevel, showToast } = useUIStore();
+  const { chatSettings, showToast } = useUIStore();
+
+  // Get settings for current chat type
+  const currentSettings = chatSettings[chatType];
+  const selectedModel = currentSettings.model;
+  const thinkingLevel = currentSettings.thinkingLevel;
 
   const handleSubmit = useCallback(async () => {
     const trimmed = value.trim();
@@ -26,7 +32,8 @@ export default function ResearchInput({ projectId, inputRef }: ResearchInputProp
     if (activeConv) {
       addMessage(projectId, 'user', trimmed);
     } else {
-      createConversation(projectId, trimmed);
+      // Create new conversation with the current chat type
+      createConversation(projectId, trimmed, chatType);
     }
 
     setValue('');
@@ -103,7 +110,7 @@ export default function ResearchInput({ projectId, inputRef }: ResearchInputProp
       setAbortController(null);
       setLoading(false);
     }
-  }, [value, projectId, addMessage, createConversation, getActiveConversation, isLoading, setLoading, setAbortController, selectedModel, thinkingLevel, showToast]);
+  }, [value, projectId, addMessage, createConversation, getActiveConversation, isLoading, setLoading, setAbortController, selectedModel, thinkingLevel, showToast, chatType]);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {

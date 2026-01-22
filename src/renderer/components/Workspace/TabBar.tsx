@@ -74,61 +74,68 @@ const DropIndicatorLine = memo(({ edge }: IndicatorProps) => {
   );
 });
 
-// Process indicator dot with restart button on hover
-const ProcessDot = memo(({ hasColor, onRestart }: { hasColor: boolean; onRestart: () => void }) => {
+// Restart zone - left part of tab, shows restart button on hover when process is running
+const RestartZone = memo(({ hasProcess, hasColor, onRestart }: { hasProcess: boolean; hasColor: boolean; onRestart: () => void }) => {
   const [isHovered, setIsHovered] = useState(false);
 
   return (
     <div
-      style={{ marginRight: '-4px', flexShrink: 0 }}
+      style={{
+        position: 'absolute',
+        left: 0,
+        top: 0,
+        bottom: 0,
+        width: '32px',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        zIndex: 10,
+      }}
       onMouseEnter={() => setIsHovered(true)}
       onMouseLeave={() => setIsHovered(false)}
+      onClick={(e) => {
+        if (hasProcess) {
+          e.stopPropagation();
+          onRestart();
+        }
+      }}
     >
-      {isHovered ? (
-        <button
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            width: '14px',
-            height: '14px',
-            marginLeft: '-5px',
-            borderRadius: '3px',
-            backgroundColor: 'transparent',
-            color: '#888',
-            cursor: 'pointer',
-            border: 'none',
-            fontSize: '11px',
-            transition: 'all 0.1s',
-          }}
-          onMouseEnter={(e) => {
-            e.currentTarget.style.backgroundColor = '#444';
-            e.currentTarget.style.color = '#fff';
-          }}
-          onMouseLeave={(e) => {
-            e.currentTarget.style.backgroundColor = 'transparent';
-            e.currentTarget.style.color = '#888';
-          }}
-          onClick={(e) => {
-            e.stopPropagation();
-            onRestart();
-          }}
-          title="Restart (Ctrl+C → !! → Enter)"
-        >
-          ↻
-        </button>
-      ) : (
-        <span
-          style={{
-            display: 'block',
-            width: '5px',
-            height: '5px',
-            borderRadius: '50%',
-            backgroundColor: '#fff',
-            opacity: hasColor ? 0.9 : 0.6,
-          }}
-        />
-      )}
+      {hasProcess ? (
+        isHovered ? (
+          // Restart button when hovered
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              width: '24px',
+              height: '24px',
+              borderRadius: '4px',
+              backgroundColor: 'rgba(255,255,255,0.1)',
+              color: '#fff',
+              cursor: 'pointer',
+              fontSize: '14px',
+              transition: 'all 0.15s',
+            }}
+            title="Restart (Ctrl+C → !! → Enter)"
+          >
+            ↻
+          </div>
+        ) : (
+          // Green dot when not hovered (process running)
+          <span
+            style={{
+              display: 'block',
+              width: '6px',
+              height: '6px',
+              borderRadius: '50%',
+              backgroundColor: '#4ade80',
+              opacity: hasColor ? 0.9 : 0.8,
+              boxShadow: '0 0 4px rgba(74, 222, 128, 0.5)',
+            }}
+          />
+        )
+      ) : null}
     </div>
   );
 });
@@ -264,7 +271,7 @@ const TabItem = memo(({
     gap: '8px',
     cursor: 'pointer',
     overflow: 'visible',
-    padding: isHorizontal ? '0 16px' : '0 12px',
+    padding: isHorizontal ? '0 16px 0 32px' : '0 12px 0 32px', // Left padding for restart zone
     fontSize: `${fontSize}px`,
     height: isHorizontal ? 'auto' : '36px', // Fixed height for utility tabs
     minWidth: isHorizontal ? 'auto' : '160px',
@@ -296,13 +303,12 @@ const TabItem = memo(({
         }
       }}
     >
-      {/* Process indicator dot with restart on hover */}
-      {hasProcess && (
-        <ProcessDot
-          hasColor={hasColor}
-          onRestart={() => onRestart && onRestart(tab.id)}
-        />
-      )}
+      {/* Restart zone - left part of tab */}
+      <RestartZone
+        hasProcess={hasProcess}
+        hasColor={!!hasColor}
+        onRestart={() => onRestart && onRestart(tab.id)}
+      />
 
       {isEditing ? (
         <input
