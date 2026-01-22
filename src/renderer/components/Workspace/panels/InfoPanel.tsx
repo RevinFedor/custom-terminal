@@ -74,24 +74,35 @@ export default function InfoPanel({ activeTabId }: InfoPanelProps) {
         <div className="text-[11px] uppercase text-[#888] mb-2">Команды</div>
         <div className="space-y-2">
           {/* claude */}
-          <div className="bg-[#2d2d2d] rounded p-2">
+          <div className={`rounded p-2 ${hasSession ? 'bg-[#252525] opacity-60' : 'bg-[#2d2d2d]'}`}>
             <div className="flex items-center justify-between">
-              <code className="text-accent text-xs">claude</code>
+              <code className={`text-xs ${hasSession ? 'text-[#666]' : 'text-accent'}`}>claude</code>
               <div className="flex items-center gap-2">
                 <button
-                  className="text-[10px] px-1.5 py-0.5 rounded transition-colors text-[#888] hover:text-white bg-[#333] hover:bg-[#444] cursor-pointer"
+                  className={`text-[10px] px-1.5 py-0.5 rounded transition-colors ${
+                    hasSession
+                      ? 'text-[#555] bg-[#2a2a2a] cursor-not-allowed'
+                      : 'text-[#888] hover:text-white bg-[#333] hover:bg-[#444] cursor-pointer'
+                  }`}
+                  disabled={hasSession}
                   onClick={() => {
-                    if (activeTabId) {
-                      ipcRenderer.send('claude:run-command', { tabId: activeTabId, command: 'claude' });
-                    } else {
+                    if (!activeTabId) {
                       showToast('Нет активного таба', 'error');
+                      return;
                     }
+                    if (hasSession) {
+                      showToast('Сессия уже есть. Используйте claude-c', 'warning');
+                      return;
+                    }
+                    ipcRenderer.send('claude:run-command', { tabId: activeTabId, command: 'claude' });
                   }}
-                  title="Start new Claude session"
+                  title={hasSession ? 'Сессия уже есть' : 'Start new Claude session'}
                 >
                   ⑂
                 </button>
-                <span className="text-green-400 text-[10px]">всегда</span>
+                <span className={`text-[10px] ${hasSession ? 'text-red-400' : 'text-green-400'}`}>
+                  {hasSession ? 'есть сессия' : 'нет сессии'}
+                </span>
               </div>
             </div>
             <p className="text-[10px] text-[#888] mt-1">Новая сессия</p>
