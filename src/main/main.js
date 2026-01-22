@@ -459,6 +459,22 @@ ipcMain.handle('project:list', () => {
   return Object.values(projectManager.projects);
 });
 
+// App state (session, settings)
+ipcMain.handle('app:getState', (event, key) => {
+  return projectManager.db.getAppState(key);
+});
+
+ipcMain.handle('app:setState', (event, { key, value }) => {
+  projectManager.db.setAppState(key, value);
+  return { success: true };
+});
+
+// Synchronous version for beforeunload
+ipcMain.on('app:setStateSync', (event, { key, value }) => {
+  projectManager.db.setAppState(key, value);
+  event.returnValue = { success: true };
+});
+
 ipcMain.handle('project:save-note', (event, { dirPath, content }) => {
   projectManager.saveProjectNote(dirPath, content);
   return { success: true };
@@ -1013,18 +1029,55 @@ ipcMain.on('claude:spawn-with-watcher', (event, { tabId, cwd }) => {
 
 // Fork Claude session: copy .jsonl file with new UUID, signal renderer to create new tab (legacy)
 // Fork Claude session file: copy .jsonl with new UUID
+// Searches ALL project directories under ~/.claude/projects/ to find the session file
 ipcMain.handle('claude:fork-session-file', async (event, { sourceSessionId, cwd }) => {
   console.log('[Claude Fork] Copying session:', sourceSessionId);
 
   try {
+    const claudeProjectsDir = path.join(os.homedir(), '.claude', 'projects');
+
+    // Find session file across ALL project directories
+    let sourcePath = null;
+    let projectDir = null;
+
+    // First, try the cwd-based path (most likely)
     const projectSlug = cwd.replace(/\//g, '-');
-    const projectDir = path.join(os.homedir(), '.claude', 'projects', projectSlug);
+    const primaryDir = path.join(claudeProjectsDir, projectSlug);
+    const primaryPath = path.join(primaryDir, `${sourceSessionId}.jsonl`);
+
+    if (fs.existsSync(primaryPath)) {
+      sourcePath = primaryPath;
+      projectDir = primaryDir;
+      console.log('[Claude Fork] Found in primary location:', sourcePath);
+    } else {
+      // Search all project directories
+      console.log('[Claude Fork] Not in primary location, searching all projects...');
+      if (fs.existsSync(claudeProjectsDir)) {
+        const projectDirs = fs.readdirSync(claudeProjectsDir, { withFileTypes: true })
+          .filter(dirent => dirent.isDirectory())
+          .map(dirent => dirent.name);
+
+        for (const dir of projectDirs) {
+          const checkPath = path.join(claudeProjectsDir, dir, `${sourceSessionId}.jsonl`);
+          if (fs.existsSync(checkPath)) {
+            sourcePath = checkPath;
+            projectDir = path.join(claudeProjectsDir, dir);
+            console.log('[Claude Fork] Found in:', sourcePath);
+            break;
+          }
+        }
+      }
+    }
+
+    if (!sourcePath) {
+      console.error('[Claude Fork] Source file not found in any project directory');
+      return { success: false, error: 'Session file not found: ' + sourceSessionId };
+    }
 
     // Generate new UUID
     const newSessionId = crypto.randomUUID();
     console.log('[Claude Fork] New session ID:', newSessionId);
 
-    const sourcePath = path.join(projectDir, `${sourceSessionId}.jsonl`);
     const destPath = path.join(projectDir, `${newSessionId}.jsonl`);
 
     if (!fs.existsSync(sourcePath)) {

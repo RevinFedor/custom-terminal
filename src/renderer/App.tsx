@@ -13,7 +13,7 @@ import SettingsModal from './components/UI/SettingsModal';
 const { ipcRenderer } = window.require('electron');
 
 function App() {
-  const { view, showDashboard, openProject, openProjects, activeProjectId, closeProject, createTab, closeTab, getActiveProject, restoreSession } = useWorkspaceStore();
+  const { view, showDashboard, openProject, openProjects, activeProjectId, closeProject, createTab, createTabAfterCurrent, closeTab, getActiveProject, restoreSession } = useWorkspaceStore();
   const { projects, loadProjects } = useProjectsStore();
   const { toggleFileExplorer, closeFilePreview, filePreview, showToast, incrementTerminalFontSize, decrementTerminalFontSize } = useUIStore();
   const { toggleResearch } = useResearchStore();
@@ -25,6 +25,20 @@ function App() {
     loadProjects();
     restoreSession();
   }, []); // Empty deps = only on mount
+
+  // Save session and mark Claude sessions as interrupted when app closes
+  useEffect(() => {
+    const handleBeforeUnload = () => {
+      const state = useWorkspaceStore.getState();
+      // Save session immediately (without debounce)
+      state.saveSessionImmediate();
+      // Mark active Claude sessions as interrupted
+      state.markAllSessionsInterrupted();
+    };
+
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
+  }, []);
 
   useEffect(() => {
 
@@ -38,15 +52,27 @@ function App() {
 
     // Global Hotkeys
     const handleKeyDown = (e: KeyboardEvent) => {
-      // Cmd+\ - Toggle file explorer (also close file preview if open)
-      if (e.metaKey && e.code === 'Backslash') {
+      // Debug: log all Cmd+key combinations
+      if (e.metaKey) {
+        console.log('[Hotkey] Cmd +', e.code, e.key, 'view:', view);
+      }
+
+      // Cmd+\ or Cmd+B - Toggle file explorer (also close file preview if open)
+      // Check both code and key for compatibility with different keyboards
+      const isBackslash = e.code === 'Backslash' || e.key === '\\' || e.code === 'IntlBackslash';
+      const isCmdB = e.code === 'KeyB';
+      if (e.metaKey && (isBackslash || isCmdB)) {
+        console.log('[Hotkey] FileExplorer toggle triggered, view:', view);
         e.preventDefault();
         if (view === 'workspace') {
           // Close file preview if open
           if (filePreview) {
             closeFilePreview();
           }
+          console.log('[Hotkey] Calling toggleFileExplorer');
           toggleFileExplorer();
+        } else {
+          console.log('[Hotkey] Not in workspace view, skipping');
         }
         return;
       }
@@ -60,12 +86,18 @@ function App() {
         }
       }
 
-      // Cmd+T - New Tab (only in workspace)
+      // Cmd+T - New Tab after current (only in workspace)
       if (e.metaKey && e.code === 'KeyT') {
         e.preventDefault();
         if (view === 'workspace' && activeProjectId) {
+          const activeProject = getActiveProject();
           const currentProject = projects[activeProjectId];
-          if (currentProject) {
+          if (currentProject && activeProject?.activeTabId) {
+            // Get current tab's cwd
+            const currentTab = activeProject.tabs.get(activeProject.activeTabId);
+            const cwd = currentTab?.cwd || currentProject.path;
+            createTabAfterCurrent(activeProjectId, undefined, cwd);
+          } else if (currentProject) {
             createTab(activeProjectId, undefined, currentProject.path);
           }
         }

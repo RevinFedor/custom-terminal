@@ -62,7 +62,7 @@ export default function NotesPanel({ projectId, project }: NotesPanelProps) {
       {/* Content */}
       <div className="flex-1 overflow-hidden">
         {activeTab === 'info' && (
-          <InfoPanel activeTabId={activeTabId} />
+          <InfoPanel activeTabId={activeTabId} project={project} />
         )}
 
         {activeTab === 'ai' && (

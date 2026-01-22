@@ -13,15 +13,15 @@ function MarkdownRenderer({ content }: MarkdownRendererProps) {
     <ReactMarkdown
       remarkPlugins={[remarkGfm]}
       components={{
-        // Code blocks with syntax highlighting
+        // Code blocks with syntax highlighting (gt-editor style: gray background)
         code({ node, inline, className, children, ...props }: any) {
           const match = /language-(\w+)/.exec(className || '');
           const language = match ? match[1] : '';
 
           if (!inline && language) {
             return (
-              <div className="my-2 rounded-lg overflow-hidden">
-                <div className="flex items-center justify-between px-3 py-1.5 bg-[#1e1e1e] text-[10px] text-gray-500">
+              <div className="my-2 rounded-lg overflow-hidden" style={{ background: 'rgba(80, 80, 80, 0.25)' }}>
+                <div className="flex items-center justify-between px-3 py-1.5 text-[10px] text-gray-500" style={{ background: 'rgba(60, 60, 60, 0.4)' }}>
                   <span>{language}</span>
                   <button
                     className="hover:text-gray-300 transition-colors cursor-pointer"
@@ -39,7 +39,7 @@ function MarkdownRenderer({ content }: MarkdownRendererProps) {
                     padding: '12px',
                     fontSize: '12px',
                     lineHeight: 1.5,
-                    background: '#282c34'
+                    background: 'rgba(80, 80, 80, 0.25)'
                   }}
                   {...props}
                 >
@@ -49,10 +49,10 @@ function MarkdownRenderer({ content }: MarkdownRendererProps) {
             );
           }
 
-          // Inline code or code without language
+          // Inline code or code without language (also gray bg)
           if (!inline) {
             return (
-              <pre className="my-2 p-3 bg-[#1e1e1e] rounded-lg overflow-x-auto text-xs">
+              <pre className="my-2 p-3 rounded-lg overflow-x-auto text-xs" style={{ background: 'rgba(80, 80, 80, 0.25)' }}>
                 <code className="text-gray-300" {...props}>
                   {children}
                 </code>
@@ -62,7 +62,7 @@ function MarkdownRenderer({ content }: MarkdownRendererProps) {
 
           // Inline code
           return (
-            <code className="px-1.5 py-0.5 bg-[#333] rounded text-[12px] text-pink-400" {...props}>
+            <code className="px-1.5 py-0.5 bg-[#444] rounded text-[12px] text-[#e0e0e0]" {...props}>
               {children}
             </code>
           );

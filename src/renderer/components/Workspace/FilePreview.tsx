@@ -1,10 +1,11 @@
 import React, { useEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { useUIStore } from '../../store/useUIStore';
 import hljs from 'highlight.js';
 import 'highlight.js/styles/vs2015.css';
 
 export default function FilePreview() {
-  const { filePreview, closeFilePreview, showToast } = useUIStore();
+  const { filePreview, closeFilePreview, showToast, fileExplorerOpen } = useUIStore();
   const contentRef = useRef<HTMLDivElement>(null);
   const [copied, setCopied] = useState(false);
 
@@ -87,8 +88,21 @@ export default function FilePreview() {
 
   if (!filePreview) return null;
 
-  return (
-    <div className="absolute inset-0 bg-bg-main z-[90] flex flex-col border border-border-main">
+  return createPortal(
+    <div
+      style={{
+        position: 'fixed',
+        top: 36,
+        left: fileExplorerOpen ? 250 : 0,
+        right: 0,
+        bottom: 0,
+        zIndex: 100000,
+        display: 'flex',
+        flexDirection: 'column',
+        backgroundColor: '#1a1a1a',
+        border: '1px solid #333'
+      }}
+    >
       {/* Header */}
       <div className="h-10 bg-tab border-b border-border-main flex items-center justify-between px-4 shrink-0">
         <div className="flex items-center gap-3 min-w-0 flex-1">
@@ -120,6 +134,7 @@ export default function FilePreview() {
         ref={contentRef}
         className="flex-1 overflow-auto p-4 font-jetbrains text-sm text-[#ddd] leading-relaxed bg-[#1e1e1e]"
       />
-    </div>
+    </div>,
+    document.body
   );
 }

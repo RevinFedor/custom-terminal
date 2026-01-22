@@ -3,6 +3,56 @@ import { Terminal as XTerminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebglAddon } from '@xterm/addon-webgl';
 import { WebLinksAddon } from '@xterm/addon-web-links';
+
+const { shell } = window.require('electron');
+
+// Helper: open URL in browser or file in preview
+const handleLinkActivation = (event: MouseEvent, uri: string) => {
+  // Only activate on Cmd+click (metaKey on macOS)
+  if (!event.metaKey) {
+    return;
+  }
+
+  console.log('[Link] Cmd+click on:', uri);
+
+  // Check if it's a localhost URL - open in browser
+  if (uri.match(/^https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0)/i)) {
+    console.log('[Link] Opening localhost URL in browser:', uri);
+    shell.openExternal(uri);
+    return;
+  }
+
+  // Check if it's any other URL - open in browser
+  if (uri.match(/^https?:\/\//i)) {
+    console.log('[Link] Opening URL in browser:', uri);
+    shell.openExternal(uri);
+    return;
+  }
+
+  // If it looks like a file path, try to open in preview
+  // This handles paths like /Users/fedor/file.ts or ./src/file.ts
+  if (uri.startsWith('/') || uri.startsWith('./') || uri.startsWith('../')) {
+    console.log('[Link] Opening file in preview:', uri);
+    // Use ipcRenderer to open file preview
+    ipcRenderer.invoke('file:read', uri).then((result: any) => {
+      if (result.success) {
+        const ext = uri.split('.').pop()?.toLowerCase() || '';
+        const languageMap: Record<string, string> = {
+          'js': 'javascript', 'jsx': 'javascript', 'ts': 'typescript', 'tsx': 'typescript',
+          'json': 'json', 'md': 'markdown', 'css': 'css', 'html': 'html',
+          'py': 'python', 'go': 'go', 'rs': 'rust', 'sh': 'bash', 'yaml': 'yaml', 'yml': 'yaml'
+        };
+        useUIStore.getState().openFilePreview({
+          path: uri,
+          content: result.content,
+          language: languageMap[ext] || null
+        });
+      }
+    }).catch((err: any) => {
+      console.error('[Link] Failed to read file:', err);
+    });
+  }
+};
 import { SerializeAddon } from '@xterm/addon-serialize';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
@@ -294,7 +344,7 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
 
       term.loadAddon(fitAddon);
       term.loadAddon(serializeAddon);
-      term.loadAddon(new WebLinksAddon());
+      term.loadAddon(new WebLinksAddon(handleLinkActivation));
 
       term.open(containerRef);
 
@@ -587,7 +637,7 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
 
         term.loadAddon(fitAddon);
         term.loadAddon(serializeAddon);
-        term.loadAddon(new WebLinksAddon());
+        term.loadAddon(new WebLinksAddon(handleLinkActivation));
 
         term.open(terminalRef.current);
 

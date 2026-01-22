@@ -3,8 +3,99 @@ import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import Terminal from './Terminal';
 import EmptyTerminalPlaceholder from './EmptyTerminalPlaceholder';
+import { motion, AnimatePresence } from 'framer-motion';
 
 const { ipcRenderer } = window.require('electron');
+
+// Overlay for interrupted Claude sessions
+const InterruptedSessionOverlay = memo(({ tabId, sessionId, onContinue, onDismiss }: {
+  tabId: string;
+  sessionId: string;
+  onContinue: () => void;
+  onDismiss: () => void;
+}) => {
+  // Handle backdrop click
+  const handleBackdropClick = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    onDismiss();
+  };
+
+  // Handle continue click
+  const handleContinueClick = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    onContinue();
+  };
+
+  // Handle close button click
+  const handleCloseClick = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    onDismiss();
+  };
+
+  return (
+    <motion.div
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      exit={{ opacity: 0 }}
+      className="absolute inset-0 z-50 flex items-center justify-center"
+      onClick={handleBackdropClick}
+      onDoubleClick={(e) => e.stopPropagation()}
+    >
+      {/* Semi-transparent backdrop */}
+      <div className="absolute inset-0 bg-black/40 backdrop-blur-sm pointer-events-none" />
+
+      {/* Modal */}
+      <motion.div
+        initial={{ scale: 0.95, opacity: 0 }}
+        animate={{ scale: 1, opacity: 1 }}
+        exit={{ scale: 0.95, opacity: 0 }}
+        className="relative bg-panel border border-border-main rounded-xl shadow-2xl p-6 max-w-sm mx-4 z-10"
+        onClick={(e) => e.stopPropagation()}
+      >
+        {/* Close button */}
+        <button
+          className="absolute top-3 right-3 text-[#666] hover:text-white text-xl leading-none w-6 h-6 flex items-center justify-center rounded hover:bg-white/10"
+          onClick={handleCloseClick}
+        >
+          ×
+        </button>
+
+        {/* Icon */}
+        <div className="w-12 h-12 rounded-full bg-yellow-500/20 flex items-center justify-center mb-4 mx-auto">
+          <span className="text-2xl">⚠️</span>
+        </div>
+
+        {/* Title */}
+        <h3 className="text-white text-center font-medium mb-2">
+          Сессия была прервана
+        </h3>
+
+        {/* Description */}
+        <p className="text-[#888] text-sm text-center mb-4">
+          Приложение было закрыто во время активной Claude сессии
+        </p>
+
+        {/* Session ID */}
+        <div className="bg-[#1a1a1a] rounded-lg p-2 mb-4">
+          <code className="text-[10px] text-[#666] break-all">{sessionId}</code>
+        </div>
+
+        {/* Continue button */}
+        <button
+          className="w-full bg-accent hover:bg-accent/80 text-white py-2.5 px-4 rounded-lg font-medium text-sm transition-colors"
+          onClick={handleContinueClick}
+        >
+          ⏵ Продолжить сессию
+        </button>
+
+        {/* Hint */}
+        <p className="text-[#555] text-[10px] text-center mt-3">
+          Или нажмите на фон чтобы закрыть
+        </p>
+      </motion.div>
+    </motion.div>
+  );
+});
 
 interface TerminalAreaProps {
   projectId: string;
@@ -14,10 +105,17 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
   // Use selectors to minimize re-renders
   const openProjects = useWorkspaceStore((state) => state.openProjects);
   const createTab = useWorkspaceStore((state) => state.createTab);
+  const clearInterruptedState = useWorkspaceStore((state) => state.clearInterruptedState);
   const projects = useProjectsStore((state) => state.projects);
 
   const currentWorkspace = openProjects.get(projectId);
   const currentProject = projects[projectId];
+
+  // Get active tab info for interrupted session overlay
+  const activeTab = currentWorkspace?.activeTabId
+    ? currentWorkspace.tabs.get(currentWorkspace.activeTabId)
+    : null;
+  const showInterruptedOverlay = activeTab?.wasInterrupted && activeTab?.claudeSessionId;
 
   // Check if active project has no active Main tab
   const hasActiveMainTab = currentWorkspace?.activeTabId != null;
@@ -25,6 +123,23 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
   const handleCreateTab = () => {
     if (currentProject) {
       createTab(projectId, undefined, currentProject.path);
+    }
+  };
+
+  // Handle continuing interrupted Claude session
+  const handleContinueSession = () => {
+    if (activeTab?.id && activeTab?.claudeSessionId) {
+      // Clear the interrupted state
+      clearInterruptedState(activeTab.id);
+      // Send command to terminal
+      ipcRenderer.send('terminal:input', activeTab.id, `claude --dangerously-skip-permissions --resume ${activeTab.claudeSessionId}\r`);
+    }
+  };
+
+  // Handle dismissing the interrupted overlay
+  const handleDismissOverlay = () => {
+    if (activeTab?.id) {
+      clearInterruptedState(activeTab.id);
     }
   };
 
@@ -121,6 +236,18 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
 
       {/* Render all terminals from all projects */}
       {terminals}
+
+      {/* Interrupted session overlay */}
+      <AnimatePresence>
+        {showInterruptedOverlay && activeTab && (
+          <InterruptedSessionOverlay
+            tabId={activeTab.id}
+            sessionId={activeTab.claudeSessionId!}
+            onContinue={handleContinueSession}
+            onDismiss={handleDismissOverlay}
+          />
+        )}
+      </AnimatePresence>
     </div>
   );
 }
