@@ -299,7 +299,11 @@ export const useUIStore = create<UIStore>((set, get) => ({
 
   // File Explorer
   fileExplorerOpen: false,
-  toggleFileExplorer: () => set((state) => ({ fileExplorerOpen: !state.fileExplorerOpen })),
+  toggleFileExplorer: () => {
+    const current = useUIStore.getState().fileExplorerOpen;
+    console.log('[UIStore] toggleFileExplorer, current:', current, '-> new:', !current);
+    set({ fileExplorerOpen: !current });
+  },
   setFileExplorerOpen: (open) => set({ fileExplorerOpen: open }),
 
   // File Preview

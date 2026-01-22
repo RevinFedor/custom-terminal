@@ -32,7 +32,10 @@ export default function ProjectCard({ project, onOpen, tabsStats = { total: 0, a
   const handleEdit = (e: React.MouseEvent) => {
     e.stopPropagation();
     setMenuOpen(false);
-    openEditModal(project);
+    // Small delay to ensure menu closes before modal opens
+    setTimeout(() => {
+      openEditModal(project);
+    }, 10);
   };
 
   const handleDelete = async (e: React.MouseEvent) => {

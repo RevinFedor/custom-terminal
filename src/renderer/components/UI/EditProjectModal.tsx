@@ -54,6 +54,7 @@ export default function EditProjectModal() {
       className="fixed inset-0 bg-black/50 flex items-center justify-center z-[100]"
       onClick={closeEditModal}
       onKeyDown={handleKeyDown}
+      tabIndex={-1}
     >
       <div
         className="bg-panel border border-border-main rounded-xl p-6 w-[400px] shadow-2xl"

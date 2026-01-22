@@ -90,6 +90,9 @@ class DatabaseManager {
     try {
       this.db.exec(`ALTER TABLE tabs ADD COLUMN claude_session_id TEXT DEFAULT NULL`);
     } catch (e) { /* column already exists */ }
+    try {
+      this.db.exec(`ALTER TABLE tabs ADD COLUMN was_interrupted INTEGER DEFAULT 0`);
+    } catch (e) { /* column already exists */ }
 
     // Gemini history table
     this.db.exec(`
@@ -143,6 +146,36 @@ class DatabaseManager {
       CREATE INDEX IF NOT EXISTS idx_ai_sessions_tool_type ON ai_sessions(tool_type);
       CREATE INDEX IF NOT EXISTS idx_session_deployments_session ON session_deployments(session_id);
     `);
+
+    // App state table (for storing session, settings, etc.)
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS app_state (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at INTEGER DEFAULT (strftime('%s', 'now'))
+      )
+    `);
+  }
+
+  // ========== APP STATE ==========
+
+  getAppState(key) {
+    const row = this.db.prepare('SELECT value FROM app_state WHERE key = ?').get(key);
+    if (!row) return null;
+    try {
+      return JSON.parse(row.value);
+    } catch {
+      return row.value;
+    }
+  }
+
+  setAppState(key, value) {
+    const jsonValue = typeof value === 'string' ? value : JSON.stringify(value);
+    this.db.prepare(`
+      INSERT INTO app_state (key, value, updated_at)
+      VALUES (?, ?, strftime('%s', 'now'))
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+    `).run(key, jsonValue);
   }
 
   // ========== PROJECTS ==========
@@ -180,7 +213,8 @@ class DatabaseManager {
         cwd: t.cwd,
         color: t.color || undefined,
         isUtility: t.is_utility === 1,
-        claudeSessionId: t.claude_session_id || undefined
+        claudeSessionId: t.claude_session_id || undefined,
+        wasInterrupted: t.was_interrupted === 1
       }))
     };
   }
@@ -292,14 +326,14 @@ class DatabaseManager {
     // Delete existing tabs
     this.db.prepare('DELETE FROM tabs WHERE project_id = ?').run(project.id);
 
-    // Insert new tabs with color, is_utility and claude_session_id
+    // Insert new tabs with color, is_utility, claude_session_id and was_interrupted
     const insert = this.db.prepare(`
-      INSERT INTO tabs (project_id, name, cwd, position, color, is_utility, claude_session_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO tabs (project_id, name, cwd, position, color, is_utility, claude_session_id, was_interrupted)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     tabs.forEach((tab, index) => {
-      insert.run(project.id, tab.name, tab.cwd, index, tab.color || null, tab.isUtility ? 1 : 0, tab.claudeSessionId || null);
+      insert.run(project.id, tab.name, tab.cwd, index, tab.color || null, tab.isUtility ? 1 : 0, tab.claudeSessionId || null, tab.wasInterrupted ? 1 : 0);
     });
 
     this.db.prepare(`

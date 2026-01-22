@@ -376,10 +376,11 @@ const ZoneDropTarget = memo(({
 });
 
 // Empty area drop zone - for dropping at the end of tabs (works for both reorder and move from utility)
-const EmptyDropZone = memo(({ onDropMain, onDropFromUtility, onHoverChange }: {
+const EmptyDropZone = memo(({ onDropMain, onDropFromUtility, onHoverChange, onDoubleClick }: {
   onDropMain: (tabId: string) => void;
   onDropFromUtility: (tabId: string) => void;
   onHoverChange: (isOver: boolean) => void;
+  onDoubleClick?: () => void;
 }) => {
   const ref = useRef<HTMLDivElement>(null);
   const [isOver, setIsOver] = useState(false);
@@ -417,6 +418,7 @@ const EmptyDropZone = memo(({ onDropMain, onDropFromUtility, onHoverChange }: {
     <div
       ref={ref}
       className={`flex-1 h-full min-w-[40px] transition-colors ${isOver ? 'bg-white/5' : ''}`}
+      onDoubleClick={onDoubleClick}
     />
   );
 });
@@ -520,6 +522,7 @@ export default function TabBar({ projectId }: TabBarProps) {
   const {
     openProjects,
     createTab,
+    createTabAfterCurrent,
     closeTab,
     switchTab,
     renameTab,
@@ -536,6 +539,8 @@ export default function TabBar({ projectId }: TabBarProps) {
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; tabId: string } | null>(null);
   const [utilityExpanded, setUtilityExpanded] = useState(false);
   const [utilityOpenedManually, setUtilityOpenedManually] = useState(false); // Track if opened by click vs hover
+  const utilityHoverTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const utilityCloseTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const [emptyZoneHovered, setEmptyZoneHovered] = useState(false);
   const [processStatus, setProcessStatus] = useState<Map<string, boolean>>(new Map());
   const inputRef = useRef<HTMLInputElement>(null);
@@ -662,7 +667,10 @@ export default function TabBar({ projectId }: TabBarProps) {
   const utilityTabs = allTabs.filter(t => t.isUtility);
 
   const handleNewTab = () => {
-    createTab(projectId, `Tab ${workspace.tabCounter + 1}`, project.path);
+    // Get current tab's cwd
+    const activeTab = workspace.activeTabId ? workspace.tabs.get(workspace.activeTabId) : null;
+    const cwd = activeTab?.cwd || project.path;
+    createTabAfterCurrent(projectId, `Tab ${workspace.tabCounter + 1}`, cwd);
   };
 
   const handleCloseTab = (e: React.MouseEvent, tabId: string) => {
@@ -786,12 +794,72 @@ export default function TabBar({ projectId }: TabBarProps) {
   // Check if any utility tab has a running process
   const hasProcessInUtils = utilityTabs.some(t => processStatus.get(t.id));
 
+  // Utils hover handlers
+  const handleUtilsMouseEnter = useCallback(() => {
+    // Clear any pending close timeout
+    if (utilityCloseTimeoutRef.current) {
+      clearTimeout(utilityCloseTimeoutRef.current);
+      utilityCloseTimeoutRef.current = null;
+    }
+    // Open with small delay (prevents accidental opens)
+    utilityHoverTimeoutRef.current = setTimeout(() => {
+      if (!utilityExpanded) {
+        setUtilityExpanded(true);
+        setUtilityOpenedManually(false);
+      }
+    }, 150);
+  }, [utilityExpanded]);
+
+  const handleUtilsMouseLeave = useCallback(() => {
+    // Clear any pending open timeout
+    if (utilityHoverTimeoutRef.current) {
+      clearTimeout(utilityHoverTimeoutRef.current);
+      utilityHoverTimeoutRef.current = null;
+    }
+    // Close with delay (allows moving to dropdown)
+    if (!utilityOpenedManually && utilityExpanded) {
+      utilityCloseTimeoutRef.current = setTimeout(() => {
+        setUtilityExpanded(false);
+      }, 200);
+    }
+  }, [utilityOpenedManually, utilityExpanded]);
+
+  const handleDropdownMouseEnter = useCallback(() => {
+    // Clear close timeout when entering dropdown
+    if (utilityCloseTimeoutRef.current) {
+      clearTimeout(utilityCloseTimeoutRef.current);
+      utilityCloseTimeoutRef.current = null;
+    }
+  }, []);
+
+  const handleDropdownMouseLeave = useCallback(() => {
+    // Close when leaving dropdown (if not opened manually)
+    if (!utilityOpenedManually) {
+      utilityCloseTimeoutRef.current = setTimeout(() => {
+        setUtilityExpanded(false);
+      }, 200);
+    }
+  }, [utilityOpenedManually]);
+
+  // Cleanup timeouts on unmount
+  useEffect(() => {
+    return () => {
+      if (utilityHoverTimeoutRef.current) clearTimeout(utilityHoverTimeoutRef.current);
+      if (utilityCloseTimeoutRef.current) clearTimeout(utilityCloseTimeoutRef.current);
+    };
+  }, []);
+
   return (
     <>
       {/* Single row TabBar like VSCode */}
       <div className="h-[44px] bg-panel flex items-stretch">
         {/* Utility Zone - Left side */}
-        <div className="relative flex items-center h-full" data-utils-button>
+        <div
+          className="relative flex items-center h-full"
+          data-utils-button
+          onMouseEnter={handleUtilsMouseEnter}
+          onMouseLeave={handleUtilsMouseLeave}
+        >
           <UtilsButtonDropTarget
             onDropToUtils={(tabId) => toggleTabUtility(projectId, tabId)}
             onHoverDrag={(isOver) => {
@@ -864,7 +932,10 @@ export default function TabBar({ projectId }: TabBarProps) {
                 initial={{ opacity: 0, y: -10 }}
                 animate={{ opacity: 1, y: 0 }}
                 exit={{ opacity: 0, y: -10 }}
+                transition={{ duration: 0.15 }}
                 className="absolute top-full left-0 bg-panel border border-border-main shadow-xl min-w-[160px] z-50 overflow-hidden"
+                onMouseEnter={handleDropdownMouseEnter}
+                onMouseLeave={handleDropdownMouseLeave}
               >
                 <ZoneDropTarget zone="utility" isEmpty={utilityTabs.length === 0}>
                   {utilityTabs.length === 0 ? (
@@ -957,6 +1028,7 @@ export default function TabBar({ projectId }: TabBarProps) {
               moveTabToZone(projectId, tabId, false, mainTabs.length);
             }}
             onHoverChange={setEmptyZoneHovered}
+            onDoubleClick={handleNewTab}
           />
             </>
           )}

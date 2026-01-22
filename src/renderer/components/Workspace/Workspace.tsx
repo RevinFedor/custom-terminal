@@ -34,9 +34,6 @@ export default function Workspace() {
       <TabBar projectId={activeProjectId} />
 
       <div className="flex-1 flex overflow-hidden min-h-0">
-        {/* File Explorer */}
-        <FileExplorer projectPath={currentProject.path} />
-
         {/* Main Terminal Area with FilePreview overlay */}
         <div className="flex-1 relative min-w-0">
           <TerminalArea projectId={activeProjectId} />
@@ -56,6 +53,9 @@ export default function Workspace() {
           <NotesPanel projectId={activeProjectId} project={currentProject} />
         )}
       </div>
+
+      {/* File Explorer - fixed overlay on left side */}
+      <FileExplorer projectPath={currentProject.path} />
     </div>
   );
 }

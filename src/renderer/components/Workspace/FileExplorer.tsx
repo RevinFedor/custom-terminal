@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { createPortal } from 'react-dom';
 import { useUIStore } from '../../store/useUIStore';
 
 const { ipcRenderer } = window.require('electron');
@@ -190,19 +191,33 @@ export default function FileExplorer({ projectPath }: FileExplorerProps) {
 
   if (!fileExplorerOpen) return null;
 
-  return (
-    <div className="w-[250px] bg-panel border-r border-border-main flex flex-col shrink-0">
-      <div className="px-3 py-2 border-b border-border-main flex items-center justify-between">
-        <span className="text-[11px] uppercase text-[#888] font-bold">Explorer</span>
+  return createPortal(
+    <div
+      style={{
+        position: 'fixed',
+        left: 0,
+        top: 36,
+        bottom: 0,
+        width: 250,
+        backgroundColor: '#1e1e1e',
+        borderRight: '1px solid #333',
+        display: 'flex',
+        flexDirection: 'column',
+        zIndex: 99999,
+        boxShadow: '4px 0 20px rgba(0,0,0,0.5)'
+      }}
+    >
+      <div style={{ padding: '8px 12px', borderBottom: '1px solid #333', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        <span style={{ fontSize: 11, color: '#888', fontWeight: 'bold', textTransform: 'uppercase' }}>Explorer</span>
         <button
-          className="text-[#888] hover:text-white text-lg leading-none"
+          style={{ color: '#888', fontSize: 18, background: 'none', border: 'none', cursor: 'pointer' }}
           onClick={() => setFileExplorerOpen(false)}
         >
           ×
         </button>
       </div>
 
-      <div className="flex-1 overflow-y-auto overflow-x-hidden">
+      <div style={{ flex: 1, overflowY: 'auto', overflowX: 'hidden' }}>
         {rootItems.map((item) => (
           <FileTreeItem
             key={item.path}
@@ -212,7 +227,8 @@ export default function FileExplorer({ projectPath }: FileExplorerProps) {
           />
         ))}
       </div>
-    </div>
+    </div>,
+    document.body
   );
 }
 

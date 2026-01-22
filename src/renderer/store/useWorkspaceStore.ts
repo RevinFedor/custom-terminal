@@ -14,6 +14,7 @@ interface Tab {
   isUtility?: boolean;
   claudeSessionId?: string; // Active Claude Code session UUID (detected from terminal output)
   pendingCommand?: string; // Command to execute when terminal is ready (used for fork)
+  wasInterrupted?: boolean; // True if tab was closed with active Claude session (show resume overlay)
 }
 
 interface ProjectWorkspace {
@@ -54,7 +55,8 @@ interface WorkspaceStore {
   closeProject: (projectId: string) => Promise<void>;
 
   // Tab management
-  createTab: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; pendingCommand?: string; claudeSessionId?: string }) => Promise<string>;
+  createTab: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; pendingCommand?: string; claudeSessionId?: string; wasInterrupted?: boolean }) => Promise<string>;
+  createTabAfterCurrent: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; pendingCommand?: string; claudeSessionId?: string; wasInterrupted?: boolean }) => Promise<string>;
   closeTab: (projectId: string, tabId: string) => Promise<void>;
   switchTab: (projectId: string, tabId: string) => void;
   renameTab: (projectId: string, tabId: string, newName: string) => void;
@@ -78,37 +80,51 @@ interface WorkspaceStore {
   setClaudeSessionId: (tabId: string, sessionId: string) => void;
   getClaudeSessionId: (tabId: string) => string | null;
 
+  // Interrupted session handling
+  clearInterruptedState: (tabId: string) => void;
+  markAllSessionsInterrupted: () => void;
+
+  // Immediate save (for shutdown)
+  saveSessionImmediate: () => void;
+
   // Helpers
   getActiveTab: (projectId: string) => Tab | null;
   getActiveProject: () => ProjectWorkspace | null;
 }
 
-const SESSION_KEY = 'terminal-session-state';
+const SESSION_KEY = 'workspace-session';
 
 // Debounce timers (outside store to persist across calls)
 let saveSessionTimer: NodeJS.Timeout | null = null;
 let saveTabsTimers: Map<string, NodeJS.Timeout> = new Map();
 
 // Helper to save tabs to database (debounced)
-const saveTabs = (projectPath: string, tabs: Map<string, Tab>) => {
+const saveTabs = (projectPath: string, tabs: Map<string, Tab>, immediate = false) => {
   // Clear existing timer for this project
   const existingTimer = saveTabsTimers.get(projectPath);
   if (existingTimer) clearTimeout(existingTimer);
 
-  // Debounce: save after 500ms of inactivity
-  const timer = setTimeout(async () => {
+  const doSave = async () => {
     const tabsArray = Array.from(tabs.values()).map((tab) => ({
       name: tab.name,
       cwd: tab.cwd,
       color: tab.color,
       isUtility: tab.isUtility,
-      claudeSessionId: tab.claudeSessionId // Persist Claude session ID
+      claudeSessionId: tab.claudeSessionId, // Persist Claude session ID
+      wasInterrupted: tab.wasInterrupted // Persist interrupted state
     }));
     await ipcRenderer.invoke('project:save-tabs', { dirPath: projectPath, tabs: tabsArray });
     saveTabsTimers.delete(projectPath);
-  }, 500);
+  };
 
-  saveTabsTimers.set(projectPath, timer);
+  if (immediate) {
+    // Save immediately (for shutdown scenarios)
+    doSave();
+  } else {
+    // Debounce: save after 500ms of inactivity
+    const timer = setTimeout(doSave, 500);
+    saveTabsTimers.set(projectPath, timer);
+  }
 };
 
 export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
@@ -139,7 +155,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     // Debounce: save after 300ms of inactivity
     if (saveSessionTimer) clearTimeout(saveSessionTimer);
 
-    saveSessionTimer = setTimeout(() => {
+    saveSessionTimer = setTimeout(async () => {
       const sessionState: SessionState = {
         openProjects: Array.from(openProjects.values()).map((workspace) => {
           const tabsArray = Array.from(workspace.tabs.keys());
@@ -155,19 +171,20 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         activeProjectId
       };
 
-      localStorage.setItem(SESSION_KEY, JSON.stringify(sessionState));
+      // Save to database
+      await ipcRenderer.invoke('app:setState', { key: SESSION_KEY, value: sessionState });
       saveSessionTimer = null;
     }, 300);
   },
 
   restoreSession: async () => {
-    const stored = localStorage.getItem(SESSION_KEY);
-    if (!stored) {
+    // Load from database
+    const sessionState = await ipcRenderer.invoke('app:getState', SESSION_KEY) as SessionState | null;
+    if (!sessionState) {
       return;
     }
 
     try {
-      const sessionState: SessionState = JSON.parse(stored);
       const { openProject } = get();
 
       set({ isRestoring: true });
@@ -245,11 +262,12 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       // Restore saved tabs or create default one
       if (savedTabs.length > 0) {
         for (const savedTab of savedTabs) {
-          console.log('[Store] Restoring tab with claudeSessionId:', savedTab.claudeSessionId);
+          console.log('[Store] Restoring tab with claudeSessionId:', savedTab.claudeSessionId, 'wasInterrupted:', savedTab.wasInterrupted);
           await createTab(projectId, savedTab.name, savedTab.cwd, {
             color: savedTab.color,
             isUtility: savedTab.isUtility,
-            claudeSessionId: savedTab.claudeSessionId // Restore Claude session ID
+            claudeSessionId: savedTab.claudeSessionId, // Restore Claude session ID
+            wasInterrupted: savedTab.wasInterrupted // Restore interrupted state
           });
         }
       } else {
@@ -272,8 +290,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       // Sync cwd for all tabs before closing
       await syncAllTabsCwd(projectId);
 
-      // Save tabs before closing
-      saveTabs(workspace.projectPath, workspace.tabs);
+      // Save tabs before closing (manual close = NOT interrupted)
+      saveTabs(workspace.projectPath, workspace.tabs, true);
 
       // Kill all terminals
       workspace.tabs.forEach((tab) => {
@@ -309,7 +327,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       color: options?.color,
       isUtility: options?.isUtility,
       pendingCommand: options?.pendingCommand,
-      claudeSessionId: options?.claudeSessionId
+      claudeSessionId: options?.claudeSessionId,
+      wasInterrupted: options?.wasInterrupted
     };
 
     // Create terminal
@@ -332,11 +351,89 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     return tabId;
   },
 
+  createTabAfterCurrent: async (projectId, name, cwd, options) => {
+    const { openProjects } = get();
+    const workspace = openProjects.get(projectId);
+
+    if (!workspace) {
+      return '';
+    }
+
+    const tabId = `${projectId}-tab-${workspace.tabCounter}`;
+    workspace.tabCounter++;
+
+    const newTab: Tab = {
+      id: tabId,
+      name: name || `Tab ${workspace.tabCounter}`,
+      cwd: cwd || workspace.projectPath || process.env.HOME || '~',
+      color: options?.color,
+      isUtility: options?.isUtility,
+      pendingCommand: options?.pendingCommand,
+      claudeSessionId: options?.claudeSessionId,
+      wasInterrupted: options?.wasInterrupted
+    };
+
+    // Create terminal
+    const { pid } = await ipcRenderer.invoke('terminal:create', {
+      tabId,
+      cwd: newTab.cwd,
+      rows: 24,
+      cols: 80
+    });
+
+    newTab.pid = pid;
+
+    // Insert after current tab (or at end if no active tab)
+    const currentActiveTabId = workspace.activeTabId;
+    const tabsArray = Array.from(workspace.tabs.entries());
+    const isUtility = options?.isUtility || false;
+
+    // Find position: after current tab in same zone, or at end of zone
+    let insertIndex = tabsArray.length;
+
+    if (currentActiveTabId && !isUtility) {
+      // Find current active tab index
+      const currentIndex = tabsArray.findIndex(([id]) => id === currentActiveTabId);
+      if (currentIndex !== -1) {
+        // Find the first utility tab to know where main zone ends
+        const firstUtilityIndex = tabsArray.findIndex(([_, tab]) => tab.isUtility);
+        if (firstUtilityIndex === -1) {
+          // No utility tabs, insert right after current
+          insertIndex = currentIndex + 1;
+        } else if (currentIndex < firstUtilityIndex) {
+          // Current is in main zone, insert after it but before utility zone
+          insertIndex = Math.min(currentIndex + 1, firstUtilityIndex);
+        }
+      }
+    } else if (currentActiveTabId && isUtility) {
+      // Insert after current utility tab
+      const currentIndex = tabsArray.findIndex(([id]) => id === currentActiveTabId);
+      if (currentIndex !== -1 && tabsArray[currentIndex]?.[1]?.isUtility) {
+        insertIndex = currentIndex + 1;
+      }
+    }
+
+    // Insert tab at calculated position
+    tabsArray.splice(insertIndex, 0, [tabId, newTab]);
+    workspace.tabs = new Map(tabsArray);
+
+    workspace.activeTabId = tabId;
+
+    set({ openProjects: new Map(openProjects) });
+
+    // Save tabs
+    saveTabs(workspace.projectPath, workspace.tabs);
+
+    return tabId;
+  },
+
   closeTab: async (projectId, tabId) => {
     const { openProjects, clearTerminalBuffer } = get();
     const workspace = openProjects.get(projectId);
 
     if (!workspace) return;
+
+    const tab = workspace.tabs.get(tabId);
 
     // Check if terminal has running process
     const { hasProcess, processName } = await ipcRenderer.invoke('terminal:hasRunningProcess', tabId);
@@ -344,6 +441,14 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     if (hasProcess) {
       const confirmed = window.confirm(
         `Terminal has a running process: "${processName}"\n\nAre you sure you want to close this tab?`
+      );
+      if (!confirmed) return;
+    }
+
+    // Check if tab has saved Claude session
+    if (tab?.claudeSessionId && !hasProcess) {
+      const confirmed = window.confirm(
+        `Эта вкладка содержит Claude сессию:\n${tab.claudeSessionId}\n\nПри закрытии вы потеряете привязку к этой сессии. Продолжить?`
       );
       if (!confirmed) return;
     }
@@ -612,5 +717,68 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     const { openProjects, activeProjectId } = get();
     if (!activeProjectId) return null;
     return openProjects.get(activeProjectId) || null;
+  },
+
+  // Clear interrupted state for a tab (when user dismisses overlay or continues session)
+  clearInterruptedState: (tabId) => {
+    const { openProjects } = get();
+
+    for (const [projectId, workspace] of openProjects) {
+      const tab = workspace.tabs.get(tabId);
+      if (tab && tab.wasInterrupted) {
+        tab.wasInterrupted = false;
+        console.log('[Store] Cleared interrupted state for tab:', tabId);
+        // Save to persist the change
+        saveTabs(workspace.projectPath, workspace.tabs);
+        // Trigger re-render so overlay disappears
+        set({ openProjects: new Map(openProjects) });
+        return;
+      }
+    }
+  },
+
+  // Mark all tabs with active Claude sessions as interrupted (called on shutdown)
+  markAllSessionsInterrupted: () => {
+    const { openProjects } = get();
+
+    for (const [projectId, workspace] of openProjects) {
+      let changed = false;
+      for (const [tabId, tab] of workspace.tabs) {
+        if (tab.claudeSessionId && !tab.wasInterrupted) {
+          tab.wasInterrupted = true;
+          changed = true;
+          console.log('[Store] Marking tab as interrupted:', tabId, tab.claudeSessionId);
+        }
+      }
+      if (changed) {
+        // Save immediately (shutdown scenario)
+        saveTabs(workspace.projectPath, workspace.tabs, true);
+      }
+    }
+  },
+
+  // Save session immediately without debounce (for shutdown)
+  // Note: This uses synchronous XHR workaround for beforeunload
+  saveSessionImmediate: () => {
+    const { openProjects, activeProjectId } = get();
+
+    const sessionState: SessionState = {
+      openProjects: Array.from(openProjects.values()).map((workspace) => {
+        const tabsArray = Array.from(workspace.tabs.keys());
+        const activeTabIndex = workspace.activeTabId
+          ? tabsArray.indexOf(workspace.activeTabId)
+          : 0;
+        return {
+          projectId: workspace.projectId,
+          projectPath: workspace.projectPath,
+          activeTabIndex: Math.max(0, activeTabIndex)
+        };
+      }),
+      activeProjectId
+    };
+
+    // Use sendSync for immediate save during shutdown
+    ipcRenderer.sendSync('app:setStateSync', { key: SESSION_KEY, value: sessionState });
+    console.log('[Store] Session saved immediately:', sessionState);
   }
 }));
