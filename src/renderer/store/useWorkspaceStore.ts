@@ -1,9 +1,12 @@
 import { create } from 'zustand';
 import { startTransition } from 'react';
+import { log } from '../utils/logger';
 
 const { ipcRenderer } = window.require('electron');
 
-export type TabColor = 'default' | 'red' | 'yellow' | 'green' | 'blue' | 'purple';
+export type TabColor = 'default' | 'red' | 'yellow' | 'green' | 'blue' | 'purple' | 'claude' | 'gemini';
+
+export type CommandType = 'generic' | 'devServer' | 'claude' | 'gemini';
 
 interface Tab {
   id: string;
@@ -11,6 +14,8 @@ interface Tab {
   cwd: string;
   pid?: number;
   color?: TabColor;
+  colorSetManually?: boolean; // True if user changed color manually - prevents auto-color override
+  commandType?: CommandType; // Type of running command (for restart button visibility)
   isUtility?: boolean;
   claudeSessionId?: string; // Active Claude Code session UUID (detected from terminal output)
   pendingCommand?: string; // Command to execute when terminal is ready (used for fork)
@@ -66,7 +71,8 @@ interface WorkspaceStore {
   reorderTabs: (projectId: string, oldIndex: number, newIndex: number) => void;
 
   // Tab color and utility
-  setTabColor: (projectId: string, tabId: string, color: TabColor) => void;
+  setTabColor: (projectId: string, tabId: string, color: TabColor, manual?: boolean) => void;
+  setTabCommandType: (tabId: string, commandType: CommandType) => void; // Also sets auto-color on first run
   toggleTabUtility: (projectId: string, tabId: string) => void;
 
   // Advanced drag & drop
@@ -96,6 +102,34 @@ interface WorkspaceStore {
 }
 
 const SESSION_KEY = 'workspace-session';
+
+/**
+ * Find the next available name for a tab based on existing tabs.
+ * - First of type: "tab-1", "run-dev", "claude", "gemini"
+ * - Subsequent: "tab-2", "run-dev-02", "claude-02", etc. (finds first free number)
+ */
+const getNextAvailableName = (baseName: string, existingNames: string[]): string => {
+  // For generic tabs: tab-1, tab-2, etc.
+  if (baseName === 'tab') {
+    let num = 1;
+    while (existingNames.includes(`tab-${num}`)) {
+      num++;
+    }
+    return `tab-${num}`;
+  }
+
+  // For commands (run-dev, claude, gemini): first without number, then -02, -03, etc.
+  if (!existingNames.includes(baseName)) {
+    return baseName;
+  }
+
+  // Find first available number starting from 02
+  let num = 2;
+  while (existingNames.includes(`${baseName}-${num.toString().padStart(2, '0')}`)) {
+    num++;
+  }
+  return `${baseName}-${num.toString().padStart(2, '0')}`;
+};
 
 // Debounce timers (outside store to persist across calls)
 let saveSessionTimer: NodeJS.Timeout | null = null;
@@ -320,22 +354,27 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   },
 
   createTab: async (projectId, name, cwd, options) => {
-    console.log('[Store] createTab called:', { projectId, name, cwd, options });
+    log.tabs('createTab called:', { projectId, name, cwd, options });
     const { openProjects } = get();
     const workspace = openProjects.get(projectId);
 
     if (!workspace) {
-      console.log('[Store] createTab: No workspace for projectId:', projectId);
+      log.tabs('createTab: No workspace for projectId:', projectId);
       return '';
     }
 
     const tabId = `${projectId}-tab-${workspace.tabCounter}`;
-    console.log('[Store] createTab: Generated tabId:', tabId, 'counter:', workspace.tabCounter);
+    log.tabs('createTab: Generated tabId:', tabId, 'counter:', workspace.tabCounter);
     workspace.tabCounter++;
+
+    // Smart naming: find next available name if not provided
+    const existingNames = Array.from(workspace.tabs.values()).map(t => t.name);
+    const tabName = name || getNextAvailableName('tab', existingNames);
+    log.tabs('createTab: Using name:', tabName);
 
     const newTab: Tab = {
       id: tabId,
-      name: name || `Tab ${workspace.tabCounter}`,
+      name: tabName,
       cwd: cwd || workspace.projectPath || process.env.HOME || '~',
       color: options?.color,
       isUtility: options?.isUtility,
@@ -380,9 +419,13 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     const tabId = `${projectId}-tab-${workspace.tabCounter}`;
     workspace.tabCounter++;
 
+    // Smart naming: find next available name if not provided
+    const existingNames = Array.from(workspace.tabs.values()).map(t => t.name);
+    const tabName = name || getNextAvailableName('tab', existingNames);
+
     const newTab: Tab = {
       id: tabId,
-      name: name || `Tab ${workspace.tabCounter}`,
+      name: tabName,
       cwd: cwd || workspace.projectPath || process.env.HOME || '~',
       color: options?.color,
       isUtility: options?.isUtility,
@@ -546,7 +589,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     saveTabs(workspace.projectPath, workspace.tabs);
   },
 
-  setTabColor: (projectId, tabId, color) => {
+  setTabColor: (projectId, tabId, color, manual = true) => {
     const { openProjects } = get();
     const workspace = openProjects.get(projectId);
 
@@ -554,8 +597,71 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       const tab = workspace.tabs.get(tabId);
       if (tab) {
         tab.color = color;
+        if (manual) {
+          tab.colorSetManually = true; // User changed color - prevent auto-override
+        }
         set({ openProjects: new Map(openProjects) });
         saveTabs(workspace.projectPath, workspace.tabs);
+      }
+    }
+  },
+
+  setTabCommandType: (tabId, commandType) => {
+    const { openProjects } = get();
+    log.tabs('setTabCommandType called: tabId=%s, commandType=%s', tabId, commandType);
+
+    // Find tab across all projects
+    for (const [projectId, workspace] of openProjects) {
+      const tab = workspace.tabs.get(tabId);
+      if (tab) {
+        log.tabs('Found tab, current state: name=%s, color=%s, colorSetManually=%s', tab.name, tab.color, tab.colorSetManually);
+
+        // Only set commandType and rename if not already set (first run only)
+        const isFirstRun = !tab.commandType;
+        tab.commandType = commandType;
+
+        // Auto-rename on first run
+        if (isFirstRun) {
+          const existingNames = Array.from(workspace.tabs.values()).map(t => t.name);
+          let baseName = '';
+
+          if (commandType === 'claude') {
+            baseName = 'claude';
+          } else if (commandType === 'gemini') {
+            baseName = 'gemini';
+          } else if (commandType === 'devServer') {
+            baseName = 'run-dev';
+          }
+
+          if (baseName) {
+            const newName = getNextAvailableName(baseName, existingNames);
+            log.tabs('Auto-renaming tab from %s to %s', tab.name, newName);
+            tab.name = newName;
+          }
+        }
+
+        // Auto-color on first run (if not manually set)
+        const shouldAutoColor = !tab.colorSetManually && (tab.color === 'default' || !tab.color);
+        log.tabs('shouldAutoColor: %s', shouldAutoColor);
+
+        if (shouldAutoColor) {
+          if (commandType === 'claude') {
+            log.tabs('Setting color to claude');
+            tab.color = 'claude';
+          } else if (commandType === 'gemini') {
+            log.tabs('Setting color to gemini');
+            tab.color = 'gemini';
+          } else if (commandType === 'devServer') {
+            log.tabs('Setting color to green');
+            tab.color = 'green';
+          }
+        } else {
+          log.tabs('Skipping auto-color (manually set or already colored)');
+        }
+
+        set({ openProjects: new Map(openProjects) });
+        saveTabs(workspace.projectPath, workspace.tabs);
+        break;
       }
     }
   },

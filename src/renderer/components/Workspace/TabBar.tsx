@@ -2,7 +2,7 @@ import React, { useState, useRef, useEffect, memo, useCallback } from 'react';
 import { useWorkspaceStore, TabColor } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import { useUIStore } from '../../store/useUIStore';
-import { motion, AnimatePresence } from 'framer-motion';
+// Removed: framer-motion import - was causing lag on project switch
 import { draggable, dropTargetForElements, monitorForElements } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
 import { attachClosestEdge, extractClosestEdge, type Edge } from '@atlaskit/pragmatic-drag-and-drop-hitbox/closest-edge';
 import { combine } from '@atlaskit/pragmatic-drag-and-drop/combine';
@@ -22,6 +22,7 @@ interface TabData {
   name: string;
   color?: TabColor;
   isUtility?: boolean;
+  commandType?: string;
 }
 
 type DragData = {
@@ -38,6 +39,8 @@ const TAB_COLORS: { color: TabColor; bgColor: string; borderColor: string; label
   { color: 'green', bgColor: 'rgba(34, 197, 94, 0.2)', borderColor: 'rgb(34, 197, 94)', label: '🟢 Green' },
   { color: 'blue', bgColor: 'rgba(59, 130, 246, 0.2)', borderColor: 'rgb(59, 130, 246)', label: '🔵 Blue' },
   { color: 'purple', bgColor: 'rgba(168, 85, 247, 0.2)', borderColor: 'rgb(168, 85, 247)', label: '🟣 Purple' },
+  { color: 'claude', bgColor: 'rgba(218, 119, 86, 0.2)', borderColor: '#DA7756', label: '🟠 Claude' },
+  { color: 'gemini', bgColor: 'rgba(78, 134, 248, 0.2)', borderColor: '#4E86F8', label: '💎 Gemini' },
 ];
 
 
@@ -75,8 +78,17 @@ const DropIndicatorLine = memo(({ edge }: IndicatorProps) => {
 });
 
 // Restart zone - left part of tab, shows restart button on hover when process is running
-const RestartZone = memo(({ hasProcess, hasColor, onRestart }: { hasProcess: boolean; hasColor: boolean; onRestart: () => void }) => {
+// Only shows restart for devServer commands (npm/yarn/etc), not for claude/gemini
+const RestartZone = memo(({ hasProcess, hasColor, commandType, onRestart }: {
+  hasProcess: boolean;
+  hasColor: boolean;
+  commandType?: string;
+  onRestart: () => void;
+}) => {
   const [isHovered, setIsHovered] = useState(false);
+
+  // Only show restart button for devServer commands
+  const showRestart = hasProcess && commandType === 'devServer';
 
   return (
     <div
@@ -94,15 +106,15 @@ const RestartZone = memo(({ hasProcess, hasColor, onRestart }: { hasProcess: boo
       onMouseEnter={() => setIsHovered(true)}
       onMouseLeave={() => setIsHovered(false)}
       onClick={(e) => {
-        if (hasProcess) {
+        if (showRestart) {
           e.stopPropagation();
           onRestart();
         }
       }}
     >
       {hasProcess ? (
-        isHovered ? (
-          // Restart button when hovered
+        isHovered && showRestart ? (
+          // Restart button when hovered (only for devServer)
           <div
             style={{
               display: 'flex',
@@ -159,6 +171,7 @@ interface TabItemProps {
   forceRightIndicator?: boolean; // Show right indicator when empty zone is hovered
   fontSize: number;
   hasProcess?: boolean; // Whether tab has a running process
+  commandType?: string; // Type of command running (devServer, claude, gemini, generic)
   onRestart?: (tabId: string) => void; // Restart process (Ctrl+C, Up, Enter)
 }
 
@@ -180,6 +193,7 @@ const TabItem = memo(({
   forceRightIndicator = false,
   fontSize,
   hasProcess = false,
+  commandType,
   onRestart,
 }: TabItemProps) => {
   const ref = useRef<HTMLDivElement>(null);
@@ -273,7 +287,7 @@ const TabItem = memo(({
     overflow: 'visible',
     padding: isHorizontal ? '0 16px 0 32px' : '0 12px 0 32px', // Left padding for restart zone
     fontSize: `${fontSize}px`,
-    height: isHorizontal ? 'auto' : '36px', // Fixed height for utility tabs
+    height: '30px', // Same height for all tabs
     minWidth: isHorizontal ? 'auto' : '160px',
     color: (isActive || isHovered) ? '#fff' : '#888',
     backgroundColor: getBgColor(),
@@ -307,6 +321,7 @@ const TabItem = memo(({
       <RestartZone
         hasProcess={hasProcess}
         hasColor={!!hasColor}
+        commandType={commandType}
         onRestart={() => onRestart && onRestart(tab.id)}
       />
 
@@ -326,16 +341,6 @@ const TabItem = memo(({
           {tab.name}
         </span>
       )}
-
-      <button
-        className="text-[#666] hover:text-white text-lg leading-none opacity-0 group-hover:opacity-100 transition-opacity cursor-pointer flex-shrink-0"
-        onClick={(e) => {
-          e.stopPropagation();
-          onClose(e);
-        }}
-      >
-        ×
-      </button>
 
       {/* Absolute overlay indicator - doesn't affect layout */}
       {closestEdge && <DropIndicatorLine edge={closestEdge} />}
@@ -686,7 +691,8 @@ export default function TabBar({ projectId }: TabBarProps) {
     // Get current tab's cwd
     const activeTab = workspace.activeTabId ? workspace.tabs.get(workspace.activeTabId) : null;
     const cwd = activeTab?.cwd || project.path;
-    createTabAfterCurrent(projectId, `Tab ${workspace.tabCounter + 1}`, cwd);
+    // Pass undefined for name to use smart naming (tab-1, tab-2, etc.)
+    createTabAfterCurrent(projectId, undefined, cwd);
   };
 
   const handleCloseTab = (e: React.MouseEvent, tabId: string) => {
@@ -810,33 +816,28 @@ export default function TabBar({ projectId }: TabBarProps) {
   // Check if any utility tab has a running process
   const hasProcessInUtils = utilityTabs.some(t => processStatus.get(t.id));
 
-  // Utils hover handlers
+  // Utils hover handlers - instant open/close
   const handleUtilsMouseEnter = useCallback(() => {
-    // Clear any pending close timeout
     if (utilityCloseTimeoutRef.current) {
       clearTimeout(utilityCloseTimeoutRef.current);
       utilityCloseTimeoutRef.current = null;
     }
-    // Open with small delay (prevents accidental opens)
-    utilityHoverTimeoutRef.current = setTimeout(() => {
-      if (!utilityExpanded) {
-        setUtilityExpanded(true);
-        setUtilityOpenedManually(false);
-      }
-    }, 150);
+    if (!utilityExpanded) {
+      setUtilityExpanded(true);
+      setUtilityOpenedManually(false);
+    }
   }, [utilityExpanded]);
 
   const handleUtilsMouseLeave = useCallback(() => {
-    // Clear any pending open timeout
     if (utilityHoverTimeoutRef.current) {
       clearTimeout(utilityHoverTimeoutRef.current);
       utilityHoverTimeoutRef.current = null;
     }
-    // Close with delay (allows moving to dropdown)
+    // Small delay to allow moving to dropdown
     if (!utilityOpenedManually && utilityExpanded) {
       utilityCloseTimeoutRef.current = setTimeout(() => {
         setUtilityExpanded(false);
-      }, 200);
+      }, 100);
     }
   }, [utilityOpenedManually, utilityExpanded]);
 
@@ -867,8 +868,8 @@ export default function TabBar({ projectId }: TabBarProps) {
 
   return (
     <>
-      {/* Single row TabBar like VSCode */}
-      <div className="h-[44px] bg-panel flex items-stretch">
+      {/* Single row TabBar */}
+      <div className="h-[30px] bg-panel flex items-stretch">
         {/* Utility Zone - Left side */}
         <div
           className="relative flex items-center h-full"
@@ -941,56 +942,51 @@ export default function TabBar({ projectId }: TabBarProps) {
             </button>
           </UtilsButtonDropTarget>
 
-          <AnimatePresence>
-            {utilityExpanded && (
-              <motion.div
-                data-utils-dropdown
-                initial={{ opacity: 0, y: -10 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -10 }}
-                transition={{ duration: 0.15 }}
-                className="absolute top-full left-0 bg-panel border border-border-main shadow-xl min-w-[160px] z-50 overflow-hidden"
-                onMouseEnter={handleDropdownMouseEnter}
-                onMouseLeave={handleDropdownMouseLeave}
-              >
-                <ZoneDropTarget zone="utility" isEmpty={utilityTabs.length === 0}>
-                  {utilityTabs.length === 0 ? (
-                    <div className="p-3 text-[11px] text-[#666] italic">
-                      Drag tabs here
-                    </div>
-                  ) : (
-                    <div className="flex flex-col">
-                      {utilityTabs.map((tab, index) => (
-                        <TabItem
-                          key={tab.id}
-                          tab={tab}
-                          index={index}
-                          zone="utility"
-                          isActive={workspace.activeTabId === tab.id}
-                          isEditing={editingTabId === tab.id}
-                          editValue={editValue}
-                          onSwitch={() => {
-                            switchTab(projectId, tab.id);
-                            setUtilityExpanded(false); // Close dropdown on tab click
-                          }}
-                          onClose={() => closeTab(projectId, tab.id)} // Close tab, not move to main
-                          onDoubleClick={() => handleDoubleClick(tab.id, tab.name)}
-                          onContextMenu={(e) => handleContextMenu(e, tab.id)}
-                          onEditChange={setEditValue}
-                          onEditSubmit={handleRenameSubmit}
-                          onEditKeyDown={handleRenameKeyDown}
-                          inputRef={inputRef as React.RefObject<HTMLInputElement>}
-                          fontSize={tabsFontSize}
-                          hasProcess={processStatus.get(tab.id) || false}
-                          onRestart={handleRestart}
-                        />
-                      ))}
-                    </div>
-                  )}
-                </ZoneDropTarget>
-              </motion.div>
-            )}
-          </AnimatePresence>
+          {utilityExpanded && (
+            <div
+              data-utils-dropdown
+              className="absolute top-full left-0 bg-panel border border-border-main shadow-xl min-w-[160px] z-50 overflow-hidden"
+              onMouseEnter={handleDropdownMouseEnter}
+              onMouseLeave={handleDropdownMouseLeave}
+            >
+              <ZoneDropTarget zone="utility" isEmpty={utilityTabs.length === 0}>
+                {utilityTabs.length === 0 ? (
+                  <div className="p-3 text-[11px] text-[#666] italic">
+                    Drag tabs here
+                  </div>
+                ) : (
+                  <div className="flex flex-col">
+                    {utilityTabs.map((tab, index) => (
+                      <TabItem
+                        key={tab.id}
+                        tab={tab}
+                        index={index}
+                        zone="utility"
+                        isActive={workspace.activeTabId === tab.id}
+                        isEditing={editingTabId === tab.id}
+                        editValue={editValue}
+                        onSwitch={() => {
+                          switchTab(projectId, tab.id);
+                          setUtilityExpanded(false); // Close dropdown on tab click
+                        }}
+                        onClose={() => closeTab(projectId, tab.id)} // Close tab, not move to main
+                        onDoubleClick={() => handleDoubleClick(tab.id, tab.name)}
+                        onContextMenu={(e) => handleContextMenu(e, tab.id)}
+                        onEditChange={setEditValue}
+                        onEditSubmit={handleRenameSubmit}
+                        onEditKeyDown={handleRenameKeyDown}
+                        inputRef={inputRef as React.RefObject<HTMLInputElement>}
+                        fontSize={tabsFontSize}
+                        hasProcess={processStatus.get(tab.id) || false}
+                        commandType={tab.commandType}
+                        onRestart={handleRestart}
+                      />
+                    ))}
+                  </div>
+                )}
+              </ZoneDropTarget>
+            </div>
+          )}
         </div>
 
         {/* Main Tabs Zone - fills remaining width */}
@@ -1024,6 +1020,7 @@ export default function TabBar({ projectId }: TabBarProps) {
                     forceRightIndicator={emptyZoneHovered && index === mainTabs.length - 1}
                     fontSize={tabsFontSize}
                     hasProcess={processStatus.get(tab.id) || false}
+                    commandType={tab.commandType}
                     onRestart={handleRestart}
                   />
                 ))}
@@ -1049,75 +1046,73 @@ export default function TabBar({ projectId }: TabBarProps) {
             </>
           )}
 
-          {/* New tab button */}
-          <button
-            className="px-3 h-full text-[#666] text-lg hover:text-white hover:bg-white/5 transition-colors cursor-pointer flex items-center"
-            onClick={handleNewTab}
-          >
-            +
-          </button>
         </div>
       </div>
 
-      {/* Context Menu */}
+      {/* Context Menu - styled like terminal context menu */}
       {contextMenu && (
         <div
-          className="fixed bg-panel border border-border-main rounded-lg shadow-xl py-1 min-w-[150px] z-[100]"
+          className="fixed bg-[#2a2a2a] border border-[#444] rounded-xl shadow-2xl py-2 min-w-[180px] z-[100]"
           style={{ left: contextMenu.x, top: contextMenu.y }}
           onClick={(e) => e.stopPropagation()}
           onMouseDown={(e) => e.stopPropagation()}
         >
-          <div className="px-3 py-1.5 text-[10px] text-[#666] uppercase">Color</div>
-          <div className="flex gap-3 px-3 py-2">
-            {TAB_COLORS.map((c) => {
-              const isSelected = workspace.tabs.get(contextMenu.tabId)?.color === c.color ||
-                (!workspace.tabs.get(contextMenu.tabId)?.color && c.color === 'default');
-              return (
-                <button
-                  key={c.color}
-                  style={{
-                    width: '28px',
-                    height: '28px',
-                    borderRadius: '50%',
-                    border: `2px solid ${c.borderColor}`,
-                    backgroundColor: c.bgColor,
-                    cursor: 'pointer',
-                    transition: 'transform 0.1s',
-                    outline: isSelected ? '2px solid white' : 'none',
-                    outlineOffset: '2px'
-                  }}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    handleSetColor(c.color);
-                  }}
-                  onMouseEnter={(e) => (e.currentTarget.style.transform = 'scale(1.15)')}
-                  onMouseLeave={(e) => (e.currentTarget.style.transform = 'scale(1)')}
-                  title={c.label}
-                />
-              );
-            })}
-          </div>
-
-          <div className="border-t border-border-main my-1" />
-
+          {/* Close Tab */}
           <button
-            className="w-full text-left px-4 py-2 text-sm text-[#ccc] hover:bg-white/10 cursor-pointer"
-            onClick={handleContextRename}
-          >
-            Rename
-          </button>
-          <button
-            className="w-full text-left px-4 py-2 text-sm text-[#ccc] hover:bg-white/10 cursor-pointer"
-            onClick={handleMoveToUtility}
-          >
-            {workspace.tabs.get(contextMenu.tabId)?.isUtility ? '↑ Move to Main' : '↓ Move to Utils'}
-          </button>
-          <button
-            className="w-full text-left px-4 py-2 text-sm text-[#cc3333] hover:bg-white/10 cursor-pointer"
+            className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2"
             onClick={handleContextClose}
           >
             Close Tab
           </button>
+
+          {/* Rename */}
+          <button
+            className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2"
+            onClick={handleContextRename}
+          >
+            Rename
+          </button>
+
+          {/* Color - submenu */}
+          <div className="relative group/color">
+            <button
+              className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center justify-between"
+            >
+              <span>Color</span>
+              <span className="text-[#666]">›</span>
+            </button>
+            {/* Color submenu */}
+            <div className="absolute left-full top-0 ml-1 hidden group-hover/color:block">
+              <div className="bg-[#2a2a2a] border border-[#444] rounded-xl shadow-2xl py-2 min-w-[140px]">
+                {TAB_COLORS.map((c) => {
+                  const isSelected = workspace.tabs.get(contextMenu.tabId)?.color === c.color ||
+                    (!workspace.tabs.get(contextMenu.tabId)?.color && c.color === 'default');
+                  return (
+                    <button
+                      key={c.color}
+                      className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-3"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleSetColor(c.color);
+                      }}
+                    >
+                      <span
+                        style={{
+                          width: '12px',
+                          height: '12px',
+                          borderRadius: '50%',
+                          border: `2px solid ${c.borderColor}`,
+                          backgroundColor: c.bgColor,
+                        }}
+                      />
+                      <span>{c.label.replace(/^. /, '')}</span>
+                      {isSelected && <span className="ml-auto text-white">✓</span>}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
         </div>
       )}
     </>

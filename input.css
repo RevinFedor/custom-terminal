@@ -1,5 +1,7 @@
 @import "tailwindcss";
 
+@source "./src/renderer/**/*.{js,ts,jsx,tsx}";
+
 @theme {
   --color-bg-main: #1e1e1e;
   --color-panel: #252526;

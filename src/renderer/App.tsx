@@ -10,6 +10,9 @@ import EditProjectModal from './components/UI/EditProjectModal';
 import SessionInputModal from './components/UI/SessionInputModal';
 import SettingsModal from './components/UI/SettingsModal';
 
+// Initialize debug logger (exposes `debug` helper in console)
+import './utils/logger';
+
 const { ipcRenderer } = window.require('electron');
 
 function App() {
@@ -19,6 +22,7 @@ function App() {
   const { toggleResearch } = useResearchStore();
   const projectTabsFontSize = useUIStore((s) => s.projectTabsFontSize);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [projectContextMenu, setProjectContextMenu] = useState<{ projectId: string; x: number; y: number } | null>(null);
 
   // Load projects and restore session ONCE on mount
   useEffect(() => {
@@ -209,51 +213,74 @@ function App() {
           paddingLeft: 'env(titlebar-area-x, 85px)'
         } as any}
       >
-        {/* Project Chips */}
-        <div className="flex items-center gap-2 px-2" style={{ WebkitAppRegion: 'no-drag' } as any}>
+        {/* Project Tabs - portfolio style */}
+        <div className="flex items-center gap-1 px-2" style={{ WebkitAppRegion: 'no-drag' } as any}>
           {/* Home */}
           <button
-            className={`project-chip flex items-center gap-1 px-3 py-0.5 rounded-xl border transition-all duration-150 h-[22px] cursor-pointer ${
+            className={`relative px-3 py-1.5 text-sm font-medium cursor-pointer transition-colors ${
               view === 'dashboard'
-                ? 'bg-accent border-accent text-white'
-                : 'bg-transparent border-border-main hover:bg-[#3a3a3c] hover:border-accent text-text-main'
+                ? 'text-black'
+                : 'text-gray-400 hover:text-white'
             }`}
             style={{ fontSize: `${projectTabsFontSize}px` }}
-            onClick={() => {
-              showDashboard();
-            }}
+            onClick={() => showDashboard()}
             title="Dashboard"
           >
-            🏠
+            {view === 'dashboard' && (
+              <div className="absolute inset-0 bg-white rounded" />
+            )}
+            <span className="relative z-10">🏠</span>
           </button>
+
+          {/* Separator */}
+          {openProjectsList.length > 0 && (
+            <div className="h-5 w-px bg-[#444] mx-1" />
+          )}
 
           {/* Open Projects */}
           {openProjectsList.map(([projectId, workspace]) => {
             const project = projects[projectId];
             if (!project) return null;
+            const isActive = activeProjectId === projectId;
 
             return (
-              <div
+              <button
                 key={projectId}
-                className={`project-chip group flex items-center gap-1 px-3 py-0.5 rounded-xl border transition-all duration-150 h-[22px] cursor-pointer ${
-                  activeProjectId === projectId
-                    ? 'bg-accent border-accent text-white'
-                    : 'bg-transparent border-border-main hover:bg-[#3a3a3c] hover:border-accent text-text-main'
+                className={`relative px-3 py-1.5 text-sm font-medium cursor-pointer transition-colors ${
+                  isActive ? 'text-black' : 'text-gray-400 hover:text-white'
                 }`}
                 style={{ fontSize: `${projectTabsFontSize}px` }}
-                onClick={() => openProject(projectId, project.path)}
+                onClick={() => {
+                  console.log('[ProjectTab] Click START:', projectId);
+                  console.time('[ProjectTab] openProject');
+                  openProject(projectId, project.path);
+                  console.timeEnd('[ProjectTab] openProject');
+                  console.log('[ProjectTab] Click END');
+                }}
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  setProjectContextMenu({ projectId, x: e.clientX, y: e.clientY });
+                }}
+                onAuxClick={(e) => {
+                  // Middle mouse button (wheel click)
+                  if (e.button === 1) {
+                    e.preventDefault();
+                    const tabCount = workspace.tabs.size;
+                    if (tabCount > 0) {
+                      if (confirm(`Close "${project.name}"?\n${tabCount} terminal(s) will be closed.`)) {
+                        closeProject(projectId);
+                      }
+                    } else {
+                      closeProject(projectId);
+                    }
+                  }
+                }}
               >
-                <span className="max-w-[100px] truncate">{project.name}</span>
-                <button
-                  className="text-[10px] opacity-0 group-hover:opacity-100 hover:text-red-400 ml-1"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    closeProject(projectId);
-                  }}
-                >
-                  ×
-                </button>
-              </div>
+                {isActive && (
+                  <div className="absolute inset-0 bg-white rounded" />
+                )}
+                <span className="relative z-10 max-w-[120px] truncate block">{project.name}</span>
+              </button>
             );
           })}
         </div>
@@ -270,6 +297,41 @@ function App() {
       <EditProjectModal />
       <SessionInputModal />
       <SettingsModal isOpen={settingsOpen} onClose={() => setSettingsOpen(false)} />
+
+      {/* Project Context Menu */}
+      {projectContextMenu && (
+        <>
+          {/* Backdrop */}
+          <div
+            className="fixed inset-0 z-[99]"
+            onClick={() => setProjectContextMenu(null)}
+          />
+          {/* Menu */}
+          <div
+            className="fixed bg-[#252526] border border-[#444] rounded-lg shadow-xl py-1 min-w-[140px] z-[100]"
+            style={{ left: projectContextMenu.x, top: projectContextMenu.y }}
+          >
+            <button
+              className="w-full text-left px-4 py-2 text-sm text-red-400 hover:bg-white/10 cursor-pointer"
+              onClick={() => {
+                const workspace = openProjects.get(projectContextMenu.projectId);
+                const project = projects[projectContextMenu.projectId];
+                const tabCount = workspace?.tabs.size || 0;
+                if (tabCount > 0) {
+                  if (confirm(`Close "${project?.name}"?\n${tabCount} terminal(s) will be closed.`)) {
+                    closeProject(projectContextMenu.projectId);
+                  }
+                } else {
+                  closeProject(projectContextMenu.projectId);
+                }
+                setProjectContextMenu(null);
+              }}
+            >
+              Close Project
+            </button>
+          </div>
+        </>
+      )}
     </div>
   );
 }

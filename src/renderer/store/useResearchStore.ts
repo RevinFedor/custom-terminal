@@ -58,6 +58,12 @@ interface ResearchStore {
   // Edit message (truncates history after this message)
   editMessage: (projectId: string, projectPath: string, messageId: string, newContent: string) => void;
 
+  // Delete single message (and its pair if user message)
+  deleteMessage: (projectId: string, projectPath: string, messageId: string) => void;
+
+  // Truncate history after message (for retry) - removes this message and all after it
+  truncateFromMessage: (projectId: string, projectPath: string, messageId: string) => void;
+
   // Loading state
   isLoading: boolean;
   setLoading: (loading: boolean) => void;
@@ -364,6 +370,98 @@ export const useResearchStore = create<ResearchStore>((set, get) => ({
       // Save to DB
       saveToDB(projectPath, updatedConv);
       
+      return { conversations: newConversations };
+    });
+  },
+
+  deleteMessage: (projectId, projectPath, messageId) => {
+    set((state) => {
+      const activeId = state.activeConversationId[projectId];
+      if (!activeId) return state;
+
+      const conv = state.conversations[projectId]?.[activeId];
+      if (!conv) return state;
+
+      const msgIndex = conv.messages.findIndex(m => m.id === messageId);
+      if (msgIndex === -1) return state;
+
+      const targetMsg = conv.messages[msgIndex];
+      let updatedMessages: Message[];
+
+      if (targetMsg.role === 'user') {
+        // Delete user message AND the following assistant response (if exists)
+        const nextMsg = conv.messages[msgIndex + 1];
+        if (nextMsg && nextMsg.role === 'assistant') {
+          updatedMessages = [
+            ...conv.messages.slice(0, msgIndex),
+            ...conv.messages.slice(msgIndex + 2)
+          ];
+        } else {
+          updatedMessages = [
+            ...conv.messages.slice(0, msgIndex),
+            ...conv.messages.slice(msgIndex + 1)
+          ];
+        }
+      } else {
+        // Delete only the assistant message
+        updatedMessages = [
+          ...conv.messages.slice(0, msgIndex),
+          ...conv.messages.slice(msgIndex + 1)
+        ];
+      }
+
+      const updatedConv: Conversation = {
+        ...conv,
+        messages: updatedMessages,
+        updatedAt: Date.now()
+      };
+
+      const newConversations = {
+        ...state.conversations,
+        [projectId]: {
+          ...state.conversations[projectId],
+          [activeId]: updatedConv
+        }
+      };
+
+      saveData(newConversations, state.activeConversationId);
+      saveToDB(projectPath, updatedConv);
+
+      return { conversations: newConversations };
+    });
+  },
+
+  truncateFromMessage: (projectId, projectPath, messageId) => {
+    set((state) => {
+      const activeId = state.activeConversationId[projectId];
+      if (!activeId) return state;
+
+      const conv = state.conversations[projectId]?.[activeId];
+      if (!conv) return state;
+
+      const msgIndex = conv.messages.findIndex(m => m.id === messageId);
+      if (msgIndex === -1) return state;
+
+      // Remove this message and everything after it
+      const updatedMessages = conv.messages.slice(0, msgIndex);
+
+      const updatedConv: Conversation = {
+        ...conv,
+        messages: updatedMessages,
+        updatedAt: Date.now()
+      };
+
+      const newConversations = {
+        ...state.conversations,
+        [projectId]: {
+          ...state.conversations[projectId],
+          [activeId]: updatedConv
+        }
+      };
+
+      saveData(newConversations, state.activeConversationId);
+      saveToDB(projectPath, updatedConv);
+
       return { conversations: newConversations };
     });
   },

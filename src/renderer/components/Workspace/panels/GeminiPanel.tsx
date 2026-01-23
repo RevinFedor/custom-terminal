@@ -21,9 +21,10 @@ interface GeminiPanelProps {
 
 export default function GeminiPanel({ projectPath, geminiPrompt }: GeminiPanelProps) {
   const { showToast, chatSettings, terminalSelection } = useUIStore();
-  const { createConversation, addMessage, openResearch, getProjectConversations, setActiveConversation, deleteConversation, isLoading, setLoading, setAbortController, pendingResearch, pendingChatType, clearPendingResearch, loadFromDB } = useResearchStore();
+  const { createConversation, addMessage, openResearch, getProjectConversations, setActiveConversation, deleteConversation, isLoading, setLoading, setAbortController, pendingResearch, pendingChatType, clearPendingResearch, loadFromDB, activeConversationId } = useResearchStore();
   const { activeProjectId } = useWorkspaceStore();
   const conversations = activeProjectId ? getProjectConversations(activeProjectId) : [];
+  const currentActiveConvId = activeProjectId ? activeConversationId[activeProjectId] : null;
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [expandedItem, setExpandedItem] = useState<HistoryItem | null>(null);
 
@@ -304,37 +305,46 @@ export default function GeminiPanel({ projectPath, geminiPrompt }: GeminiPanelPr
             {conversations.map((conv) => {
               // Default to 'research' for backward compatibility
               const convType = conv.type || 'research';
+              const isActive = conv.id === currentActiveConvId;
+              const isLoadingThis = isActive && isLoading;
+
               return (
               <div
                 key={conv.id}
-                className={`group bg-[#2d2d2d] border-l-2 rounded p-2 transition-all hover:bg-[#333] cursor-pointer ${
-                  convType === 'compact' ? 'border-l-purple-500' : 'border-l-accent'
+                className={`group rounded p-2 transition-all cursor-pointer border-l-2 ${
+                  isActive
+                    ? 'bg-[#3a3a3a] border-l-white'
+                    : 'bg-[#2d2d2d] hover:bg-[#333]'
+                } ${
+                  convType === 'compact' && !isActive ? 'border-l-purple-500' : ''
+                } ${
+                  convType === 'research' && !isActive ? 'border-l-accent' : ''
                 }`}
                 onClick={() => openConversation(conv.id)}
               >
                 <div className="flex items-start justify-between gap-2 mb-1">
                   <div className="flex items-center gap-1.5 flex-1 min-w-0">
-                    {/* Type badge */}
-                    <span className={`text-[8px] px-1 py-0.5 rounded shrink-0 ${
-                      convType === 'compact'
-                        ? 'bg-purple-500/20 text-purple-400'
-                        : 'bg-accent/20 text-accent'
-                    }`}>
-                      {convType === 'compact' ? 'C' : 'R'}
-                    </span>
-                    <div className="text-[10px] text-[#ccc] truncate">
+                    {/* Type badge or loader */}
+                    {isLoadingThis ? (
+                      <span className="w-4 h-4 shrink-0 flex items-center justify-center">
+                        <span className="w-3 h-3 border-2 border-accent border-t-transparent rounded-full animate-spin" />
+                      </span>
+                    ) : (
+                      <span className={`text-[8px] px-1 py-0.5 rounded shrink-0 ${
+                        convType === 'compact'
+                          ? 'bg-purple-500/20 text-purple-400'
+                          : 'bg-accent/20 text-accent'
+                      }`}>
+                        {convType === 'compact' ? 'C' : 'R'}
+                      </span>
+                    )}
+                    <div className={`text-[10px] truncate ${isActive ? 'text-white font-medium' : 'text-[#ccc]'}`}>
                       {conv.title}
                     </div>
                   </div>
                   <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity shrink-0">
                     <button
-                      className="text-[#666] hover:text-accent text-xs px-1"
-                      onClick={(e) => { e.stopPropagation(); copyLastResponse(conv); }}
-                    >
-                      Copy
-                    </button>
-                    <button
-                      className="text-[#666] hover:text-[#cc3333] text-xs px-1"
+                      className="text-[#666] hover:text-[#cc3333] text-xs px-1 cursor-pointer"
                       onClick={(e) => {
                         e.stopPropagation();
                         if (activeProjectId) deleteConversation(activeProjectId, projectPath, conv.id);

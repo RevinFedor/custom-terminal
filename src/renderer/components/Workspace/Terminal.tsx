@@ -57,6 +57,7 @@ import { SerializeAddon } from '@xterm/addon-serialize';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { terminalRegistry } from '../../utils/terminalRegistry';
+import { log } from '../../utils/logger';
 
 // Get buffer management functions outside of component to avoid re-renders
 const getBufferActions = () => ({
@@ -71,6 +72,9 @@ const getSetTerminalSelection = () => useUIStore.getState().setTerminalSelection
 // Get Claude session setter/getter outside of component
 const getSetClaudeSessionId = () => useWorkspaceStore.getState().setClaudeSessionId;
 const getClaudeSessionId = (tabId: string) => useWorkspaceStore.getState().getClaudeSessionId(tabId);
+
+// Get setTabCommandType for auto-color and restart button visibility
+const getSetTabCommandType = () => useWorkspaceStore.getState().setTabCommandType;
 
 // Get updateTabCwd for OSC 7 handler (shell reports cwd changes)
 const getUpdateTabCwd = () => {
@@ -149,7 +153,6 @@ function getCurrentCommand(term: XTerminal): string {
     }
   }
 
-  console.log('[getCurrentCommand] Result:', JSON.stringify(logicalLine));
   return logicalLine;
 }
 
@@ -167,7 +170,7 @@ interface TerminalProps {
 }
 
 function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps) {
-  console.log('[Terminal] Render:', { tabId, cwd, active, isActiveProject });
+  // Removed: excessive render log
 
   const terminalRef = useRef<HTMLDivElement>(null);
   const xtermInstance = useRef<XTerminal | null>(null);
@@ -247,13 +250,10 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
   };
 
   useEffect(() => {
-    console.log('[Terminal] Main useEffect:', { tabId, isInitialized: isInitialized.current, hasRef: !!terminalRef.current });
     if (isInitialized.current || !terminalRef.current) {
-      console.log('[Terminal] Skipping init:', { isInitialized: isInitialized.current, hasRef: !!terminalRef.current });
       return;
     }
     isInitialized.current = true;
-    console.log('[Terminal] Starting initialization for:', tabId);
 
     const containerRef = terminalRef.current;
 
@@ -431,7 +431,6 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
 
       xtermInstance.current = term;
       hasBeenActive.current = true; // Mark as active AFTER xterm is created to prevent race condition
-      console.log('[Terminal] initTerminal: xterm created, hasBeenActive set to true for:', tabId);
 
       // Attach scroll listeners (native + xterm events)
       attachScrollListeners(term, containerRef);
@@ -495,10 +494,28 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
 
         // Get full command (handles wrapped lines)
         const fullLine = getCurrentCommand(term).trim();
-        console.log('[Claude Intercept] Full line:', JSON.stringify(fullLine));
+        log.commands('Enter pressed, command: %s', fullLine);
+
+        // --- Detect command type for auto-color and restart button ---
+        // npm/npx/yarn/pnpm/bun → devServer (green, show restart)
+        // gemini → gemini (blue, hide restart)
+        // claude → handled below with explicit interception
+        // Note: fullLine includes shell prompt, so don't use ^ anchor
+        const devServerMatch = fullLine.match(/\b(npm|npx|yarn|pnpm|bun)\s+(run\s+)?(dev|start|serve|watch)\b/i);
+        const geminiMatch = fullLine.match(/\bgemini(\s|$)/i);
+
+        if (devServerMatch) {
+          log.commands('Detected devServer command, setting commandType');
+          getSetTabCommandType()(tabId, 'devServer');
+        } else if (geminiMatch) {
+          log.commands('Detected gemini command, setting commandType');
+          getSetTabCommandType()(tabId, 'gemini');
+        }
 
         // --- CASE 1: claude (new session) - must end with exactly "claude" ---
         if (fullLine.endsWith(' claude') || fullLine === 'claude') {
+          log.commands('Detected claude command, setting commandType');
+          getSetTabCommandType()(tabId, 'claude');
           event.preventDefault();
 
           // Check if session already exists - prevent accidental overwrite
@@ -519,6 +536,7 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
 
         // --- CASE 2: claude-c (continue session) ---
         if (fullLine.endsWith(' claude-c') || fullLine === 'claude-c') {
+          getSetTabCommandType()(tabId, 'claude');
           const existingSessionId = getClaudeSessionId(tabId);
           console.log('[Claude-c] tabId:', tabId);
           console.log('[Claude-c] existingSessionId from store:', existingSessionId);
@@ -581,6 +599,7 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
 
         // --- CASE 4: claude-d (alias for claude) ---
         if (fullLine.endsWith(' claude-d') || fullLine === 'claude-d') {
+          getSetTabCommandType()(tabId, 'claude');
           event.preventDefault();
 
           const existingId = getClaudeSessionId(tabId);
@@ -602,18 +621,13 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
 
     // Lazy init: only create xterm when tab is active AND project is active
     // This prevents creating xterm for background projects during restore
-    console.log('[Terminal] Lazy init check:', { tabId, active, isActiveProject, hasBeenActive: hasBeenActive.current, isCreating: isCreatingRef.current });
     if (active && isActiveProject) {
       // Lock: prevent double initialization
       if (isCreatingRef.current) {
-        console.log('[Terminal] Skipping initTerminal - already creating');
         return;
       }
-      console.log('[Terminal] Calling initTerminal for:', tabId);
       isCreatingRef.current = true; // Set lock
       initTerminal();
-    } else {
-      console.log('[Terminal] Skipping initTerminal - not active or not active project');
     }
 
     return () => {
@@ -671,9 +685,7 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
   // Focus and fit when becoming active (with rAF to let browser paint first)
   // Also handles lazy initialization on first activation
   useEffect(() => {
-    console.log('[Terminal] Active useEffect:', { tabId, active, isActiveProject, hasBeenActive: hasBeenActive.current, hasXterm: !!xtermInstance.current });
     if (!active || !isActiveProject) {
-      console.log('[Terminal] Not active or not active project, returning');
       // Clear global selection when terminal becomes inactive
       if (!active) {
         getSetTerminalSelection()('');
@@ -685,15 +697,12 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
     if (!hasBeenActive.current && !xtermInstance.current && terminalRef.current) {
       // Lock: prevent double initialization
       if (isCreatingRef.current) {
-        console.log('[Terminal] Lazy init skipped - already creating for:', tabId);
         return;
       }
-      console.log('[Terminal] Lazy init triggered for:', tabId);
       isCreatingRef.current = true; // Set lock
 
       // Need to initialize terminal now (reuse same logic as initTerminal)
       const initLazy = async () => {
-        console.log('[Terminal] initLazy starting for:', tabId);
         await document.fonts.ready;
 
         if (!isMounted.current || !terminalRef.current) return;
@@ -759,7 +768,6 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
 
         xtermInstance.current = term;
         hasBeenActive.current = true; // Mark as active AFTER xterm is created
-        console.log('[Terminal] initLazy: xterm created, hasBeenActive set to true for:', tabId);
 
         // Attach scroll listeners (native + xterm events)
         attachScrollListeners(term, terminalRef.current);
@@ -801,9 +809,22 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
 
           // Get full command (handles wrapped lines)
           const fullLine = getCurrentCommand(term).trim();
-          console.log('[Claude Intercept] Full line:', JSON.stringify(fullLine));
+
+          // --- Detect command type for auto-color and restart button ---
+          // Note: fullLine includes shell prompt, so don't use ^ anchor
+          const devServerMatch = fullLine.match(/\b(npm|npx|yarn|pnpm|bun)\s+(run\s+)?(dev|start|serve|watch)\b/i);
+          const geminiMatch = fullLine.match(/\bgemini(\s|$)/i);
+
+          if (devServerMatch) {
+            log.commands('Detected devServer command, setting commandType');
+            getSetTabCommandType()(tabId, 'devServer');
+          } else if (geminiMatch) {
+            log.commands('Detected gemini command, setting commandType');
+            getSetTabCommandType()(tabId, 'gemini');
+          }
 
           if (fullLine.endsWith(' claude') || fullLine === 'claude') {
+            getSetTabCommandType()(tabId, 'claude');
             event.preventDefault();
 
             // Check if session already exists
@@ -821,6 +842,7 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
           }
 
           if (fullLine.endsWith(' claude-c') || fullLine === 'claude-c') {
+            getSetTabCommandType()(tabId, 'claude');
             const existingSessionId = getClaudeSessionId(tabId);
             console.log('[Claude-c] tabId:', tabId);
             console.log('[Claude-c] existingSessionId from store:', existingSessionId);
@@ -882,6 +904,7 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
 
           // --- CASE 4: claude-d (alias for claude) ---
           if (fullLine.endsWith(' claude-d') || fullLine === 'claude-d') {
+            getSetTabCommandType()(tabId, 'claude');
             event.preventDefault();
 
             const existingId = getClaudeSessionId(tabId);
@@ -920,15 +943,22 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
     }
 
     // Give browser 1 frame to recalculate CSS before calling fit
+    console.log('[Terminal] Focus useEffect: scheduling rAF for', tabId);
     const frameId = requestAnimationFrame(() => {
+      console.time('[Terminal] rAF callback ' + tabId);
       const term = xtermInstance.current;
       if (!term) return;
 
       // Save scroll position before fit/focus
       const scrollY = term.buffer.active.viewportY;
 
+      console.time('[Terminal] safeFit');
       safeFit();
+      console.timeEnd('[Terminal] safeFit');
+
+      console.time('[Terminal] focus');
       term.focus();
+      console.timeEnd('[Terminal] focus');
 
       // Restore scroll position after focus (which auto-scrolls to cursor)
       if (scrollY !== undefined && scrollY !== term.buffer.active.baseY + term.rows - 1) {
@@ -939,6 +969,7 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
       // Update selection state when becoming active
       const selection = term.getSelection() || '';
       getSetTerminalSelection()(selection);
+      console.timeEnd('[Terminal] rAF callback ' + tabId);
     });
 
     return () => cancelAnimationFrame(frameId);

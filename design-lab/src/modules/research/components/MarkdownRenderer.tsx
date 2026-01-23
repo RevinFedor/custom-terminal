@@ -1,4 +1,4 @@
-import React, { memo } from 'react';
+import { memo } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import CodeBlock from './CodeBlock';
@@ -14,39 +14,46 @@ function MarkdownRenderer({ content, className = '' }: MarkdownRendererProps) {
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         components={{
-          // Pre element wraps code blocks - handle all block code here
-          pre({ children, ...props }: any) {
-            // Extract code element from pre children
-            const codeElement = React.Children.toArray(children)[0] as React.ReactElement;
+          // Code blocks
+          code({ node, inline, className, children, ...props }: any) {
+            const match = /language-(\w+)/.exec(className || '');
+            const language = match ? match[1] : '';
+            const value = String(children).replace(/\n$/, '');
 
-            if (React.isValidElement(codeElement) && codeElement.type === 'code') {
-              const { className, children: codeChildren } = codeElement.props;
-              const match = /language-(\w+)/.exec(className || '');
-              const language = match ? match[1] : '';
-              const value = String(codeChildren).replace(/\n$/, '');
+            if (!inline && language) {
+              return <CodeBlock language={language} value={value} />;
+            }
 
-              // Code block with language - use syntax highlighter
-              if (language) {
-                return <CodeBlock language={language} value={value} />;
+            // Block code without language
+            if (!inline) {
+              const isMultiLine = value.includes('\n');
+
+              if (!isMultiLine) {
+                return (
+                  <div className="my-2">
+                    <code
+                      className="px-2 py-1 bg-[#1e1f20] rounded text-[12px] text-[#a8c7fa] font-mono border border-[#333] inline-block"
+                      {...props}
+                    >
+                      {children}
+                    </code>
+                  </div>
+                );
               }
 
-              // Code block without language
               return (
                 <pre className="my-3 p-3 rounded-lg bg-[#1a1a1a] border border-[#333] overflow-x-auto text-xs text-gray-300">
-                  <code>{codeChildren}</code>
+                  <code {...props}>{children}</code>
                 </pre>
               );
             }
 
-            // Fallback
-            return <pre {...props}>{children}</pre>;
-          },
-
-          // Code element - now only called for INLINE code (not inside pre)
-          code({ className, children, ...props }: any) {
-            // Inline code - simple styling
+            // Inline code
             return (
-              <code className="px-1.5 py-0.5 bg-[#333] rounded text-[12px] text-[#a8c7fa] font-mono" {...props}>
+              <code
+                className="px-1.5 py-0.5 bg-[#333] rounded text-[12px] text-[#a8c7fa] font-mono"
+                {...props}
+              >
                 {children}
               </code>
             );
@@ -59,24 +66,40 @@ function MarkdownRenderer({ content, className = '' }: MarkdownRendererProps) {
 
           // Headers
           h1({ children }) {
-            return <h1 className="text-xl font-bold mb-4 mt-6 first:mt-0 text-white pb-2 border-b border-[#333]">{children}</h1>;
+            return (
+              <h1 className="text-xl font-bold mb-4 mt-6 first:mt-0 text-white pb-2 border-b border-[#333]">
+                {children}
+              </h1>
+            );
           },
           h2({ children }) {
             return <h2 className="text-lg font-bold mb-3 mt-5 first:mt-0 text-white">{children}</h2>;
           },
           h3({ children }) {
-            return <h3 className="text-base font-semibold mb-2 mt-4 first:mt-0 text-white">{children}</h3>;
+            return (
+              <h3 className="text-base font-semibold mb-2 mt-4 first:mt-0 text-white">{children}</h3>
+            );
           },
           h4({ children }) {
-            return <h4 className="text-sm font-semibold mb-2 mt-4 first:mt-0 text-white">{children}</h4>;
+            return (
+              <h4 className="text-sm font-semibold mb-2 mt-4 first:mt-0 text-white">{children}</h4>
+            );
           },
 
           // Lists
           ul({ children }) {
-            return <ul className="list-disc list-outside ml-4 mb-4 space-y-1 marker:text-[#666]">{children}</ul>;
+            return (
+              <ul className="list-disc list-outside ml-4 mb-4 space-y-1 marker:text-[#666]">
+                {children}
+              </ul>
+            );
           },
           ol({ children }) {
-            return <ol className="list-decimal list-outside ml-4 mb-4 space-y-1 marker:text-[#666]">{children}</ol>;
+            return (
+              <ol className="list-decimal list-outside ml-4 mb-4 space-y-1 marker:text-[#666]">
+                {children}
+              </ol>
+            );
           },
           li({ children }) {
             return <li className="pl-1">{children}</li>;
@@ -142,7 +165,7 @@ function MarkdownRenderer({ content, className = '' }: MarkdownRendererProps) {
           // Emphasis/Italic
           em({ children }) {
             return <em className="italic text-gray-300">{children}</em>;
-          }
+          },
         }}
       >
         {content}
