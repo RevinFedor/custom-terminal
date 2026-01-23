@@ -57,3 +57,44 @@
     - `Cmd + B`: Toggle Sidebar.
     - `Cmd + Plus / Minus`: Изменение размера шрифта активного терминала (вместо системного зума). См. `knowledge/fix-zoom-override.md`.
     - `Cmd + T`: Создание нового таба в активном проекте.
+
+## 6. Debug Logger
+- **Библиотека:** `debug` npm package.
+- **Файл:** `src/renderer/utils/logger.ts`.
+- **Категории:**
+    - `app:claude` — Claude session handling
+    - `app:tabs` — Tab operations (colors, creation)
+    - `app:perf` — Performance timing
+    - `app:terminal` — Terminal operations
+    - `app:store` — Store actions
+    - `app:ui` — UI interactions
+    - `app:research` — Research panel
+    - `app:commands` — Command detection (npm, claude, gemini)
+- **Включение в DevTools консоли:**
+    ```javascript
+    localStorage.debug = 'app:*'           // все логи
+    localStorage.debug = 'app:tabs'        // только tabs
+    localStorage.debug = 'app:tabs,app:commands'  // несколько
+    // Затем F5 (перезагрузка страницы)
+    ```
+- **Хелперы в консоли:**
+    ```javascript
+    debug.enable('app:*')   // включить
+    debug.disable()         // выключить
+    debug.status()          // показать текущие настройки
+    debug.help()            // справка
+    ```
+
+## 7. Tab Colors & Command Types
+- **Цвета табов** определены в `TabBar.tsx` (`TAB_COLORS`).
+- **Специальные цвета:**
+    - `claude` — #DA7756 (терракотовый)
+    - `gemini` — #4E86F8 (синий)
+- **Auto-color:** При первом запуске команды таб автоматически окрашивается:
+    - `npm run dev` / `yarn start` / `pnpm serve` / `bun dev` → зелёный
+    - `claude` / `claude-c` / `claude-d` → claude (оранжевый)
+    - `gemini` → gemini (синий)
+- **Флаг `colorSetManually`:** Если пользователь вручную изменил цвет через контекстное меню, авто-окрашивание отключается для этого таба.
+- **CommandType на табе:** Определяет тип запущенной команды (`devServer`, `claude`, `gemini`, `generic`). Используется для:
+    - Показа/скрытия кнопки Restart (только для `devServer`)
+    - Авто-окрашивания

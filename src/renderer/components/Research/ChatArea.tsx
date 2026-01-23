@@ -2,7 +2,7 @@ import React, { useState, useRef } from 'react';
 import { Virtuoso, VirtuosoHandle } from 'react-virtuoso';
 import { useResearchStore, Message } from '../../store/useResearchStore';
 import MarkdownRenderer from './MarkdownRenderer';
-import { Bot, User, Sparkles, Pencil, Copy, Check, ArrowDown, RotateCcw, RefreshCw } from 'lucide-react';
+import { User, Sparkles, Pencil, Copy, Check, ArrowDown, RotateCcw, RefreshCw, Trash2 } from 'lucide-react';
 import { useUIStore } from '../../store/useUIStore';
 
 // Google AI Studio Inspired Colors
@@ -17,25 +17,20 @@ const COLORS = {
   botBg: 'rgba(255, 255, 255, 0.02)'
 };
 
-interface ChatAreaProps {
-  projectId: string;
-  projectPath: string;
-}
-
-function MessageBubble({ 
-  message, 
-  projectId, 
-  projectPath, 
-  onEdit, 
-  onRegenerate,
-  isLast 
-}: { 
-  message: Message, 
-  projectId: string, 
-  projectPath: string, 
+function MessageBubble({
+  message,
+  projectId,
+  projectPath,
+  onEdit,
+  onRetry,
+  onDelete
+}: {
+  message: Message,
+  projectId: string,
+  projectPath: string,
   onEdit: (msg: Message, newContent: string) => void,
-  onRegenerate?: () => void,
-  isLast: boolean
+  onRetry: (messageId: string) => void,
+  onDelete: (messageId: string) => void
 }) {
   const isUser = message.role === 'user';
   const [copied, setCopied] = useState(false);
@@ -121,33 +116,39 @@ function MessageBubble({
               </div>
             </div>
           ) : (
-            <div className="relative group/content">
-              <MarkdownRenderer content={message.content} />
-              
-              {/* Footer Actions (Bot Only) */}
-              {!isUser && (
-                <div className="flex items-center gap-2 mt-3 opacity-0 group-hover:opacity-100 transition-opacity">
-                  <button 
-                    onClick={handleCopy}
-                    className="flex items-center gap-1.5 px-2 py-1 text-gray-500 hover:text-white hover:bg-[#333] rounded text-[11px] transition-colors"
-                    title="Copy response"
+            <div className="relative">
+              {/* Sticky Actions - правый верхний угол */}
+              <div className="sticky top-4 float-right ml-4 z-10 flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity bg-[#1a1a1a] border border-[#333] rounded-lg p-1">
+                <button
+                  onClick={handleCopy}
+                  className="p-1.5 text-gray-500 hover:text-white hover:bg-[#333] rounded transition-colors cursor-pointer"
+                  title="Copy"
+                >
+                  {copied ? <Check size={14} className="text-green-400" /> : <Copy size={14} />}
+                </button>
+
+                {/* Retry - только для assistant */}
+                {!isUser && (
+                  <button
+                    onClick={() => onRetry(message.id)}
+                    className="p-1.5 text-gray-500 hover:text-[#a8c7fa] hover:bg-[#333] rounded transition-colors cursor-pointer"
+                    title="Retry (regenerate from this point)"
                   >
-                    {copied ? <Check size={14} className="text-green-400" /> : <Copy size={14} />}
-                    <span>{copied ? 'Copied' : 'Copy'}</span>
+                    <RefreshCw size={14} />
                   </button>
-                  
-                  {isLast && onRegenerate && (
-                    <button 
-                      onClick={onRegenerate}
-                      className="flex items-center gap-1.5 px-2 py-1 text-gray-500 hover:text-[#a8c7fa] hover:bg-[#333] rounded text-[11px] transition-colors"
-                      title="Regenerate response"
-                    >
-                      <RefreshCw size={14} />
-                      <span>Retry</span>
-                    </button>
-                  )}
-                </div>
-              )}
+                )}
+
+                {/* Delete */}
+                <button
+                  onClick={() => onDelete(message.id)}
+                  className="p-1.5 text-gray-500 hover:text-red-400 hover:bg-[#333] rounded transition-colors cursor-pointer"
+                  title="Delete message"
+                >
+                  <Trash2 size={14} />
+                </button>
+              </div>
+
+              <MarkdownRenderer content={message.content} />
             </div>
           )}
         </div>
@@ -202,8 +203,14 @@ function LoadingIndicator() {
   );
 }
 
-export default function ChatArea({ projectId, projectPath }: ChatAreaProps) {
-  const { getActiveConversation, isLoading, editMessage, triggerResearch } = useResearchStore();
+interface ChatAreaProps {
+  projectId: string;
+  projectPath: string;
+  onRetry?: (messageId: string) => void;
+}
+
+export default function ChatArea({ projectId, projectPath, onRetry }: ChatAreaProps) {
+  const { getActiveConversation, isLoading, editMessage, deleteMessage, truncateFromMessage } = useResearchStore();
   const conversation = getActiveConversation(projectId);
   const messages = conversation?.messages || [];
   const virtuosoRef = useRef<VirtuosoHandle>(null);
@@ -211,17 +218,30 @@ export default function ChatArea({ projectId, projectPath }: ChatAreaProps) {
 
   const handleEdit = (message: Message, newContent: string) => {
     editMessage(projectId, projectPath, message.id, newContent);
-    triggerResearch(conversation?.type || 'research');
+    // After edit, parent should handle the API call via onRetry
+    if (onRetry) {
+      // Find the message that was just edited (it's the last one now after truncation)
+      setTimeout(() => {
+        const updatedConv = getActiveConversation(projectId);
+        const lastMsg = updatedConv?.messages[updatedConv.messages.length - 1];
+        if (lastMsg && lastMsg.role === 'user') {
+          onRetry(lastMsg.id);
+        }
+      }, 50);
+    }
   };
 
-  const handleRegenerate = () => {
-    // To regenerate, we want to re-run the LAST user message.
-    // In our truncated flow (editMessage), the last message IS the user message we want to run.
-    // If we call triggerResearch, GeminiPanel will grab the selection, which might be wrong.
-    
-    // Better: We assume the user edited the LAST message and now wants to run it.
-    // For now, triggerResearch will work if they haven't changed terminal selection.
-    triggerResearch(conversation?.type || 'research');
+  const handleRetry = (messageId: string) => {
+    // Truncate from this assistant message (removes it and everything after)
+    truncateFromMessage(projectId, projectPath, messageId);
+    // Then call parent's retry handler
+    if (onRetry) {
+      onRetry(messageId);
+    }
+  };
+
+  const handleDelete = (messageId: string) => {
+    deleteMessage(projectId, projectPath, messageId);
   };
 
   if (messages.length === 0 && !isLoading) {
@@ -238,13 +258,13 @@ export default function ChatArea({ projectId, projectPath }: ChatAreaProps) {
         followOutput="auto"
         atBottomStateChange={(atBottom) => setShowScrollButton(!atBottom)}
         itemContent={(index, message) => (
-          <MessageBubble 
-            message={message} 
-            projectId={projectId} 
+          <MessageBubble
+            message={message}
+            projectId={projectId}
             projectPath={projectPath}
             onEdit={handleEdit}
-            onRegenerate={handleRegenerate}
-            isLast={index === messages.length - 1 && message.role === 'assistant'}
+            onRetry={handleRetry}
+            onDelete={handleDelete}
           />
         )}
         components={{

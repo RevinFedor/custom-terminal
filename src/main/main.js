@@ -11,6 +11,7 @@ app.commandLine.appendSwitch('disable-http-cache');
 const srcMainDir = path.join(__dirname, '..', '..', 'src', 'main');
 const projectManager = require(path.join(srcMainDir, 'project-manager'));
 const SessionManager = require(path.join(srcMainDir, 'session-manager'));
+const ClaudeManager = require(path.join(srcMainDir, 'claude-manager'));
 
 const isDev = !app.isPackaged;
 
@@ -18,6 +19,7 @@ let mainWindow;
 const terminals = new Map(); // tabId -> ptyProcess
 const terminalProjects = new Map(); // tabId -> cwd path
 let sessionManager; // Initialized after projectManager is ready
+let claudeManager; // Initialized with terminals map
 
 // Shell integration directory (for OSC 7 cwd reporting)
 const shellIntegrationDir = path.join(app.getPath('userData'), 'shell-integration');
@@ -40,7 +42,7 @@ fi
 
 # OSC 7 - Report current directory to terminal
 __ct_osc7() {
-  printf '\\e]7;file://%s%s\\e\\\\' "$HOST" "$PWD"
+  printf '\e]7;file://%s%s\e\\' "$HOST" "$PWD"
 }
 
 # Hook into directory changes
@@ -63,11 +65,12 @@ fi
 
 # OSC 7 - Report current directory to terminal
 __ct_osc7() {
-  printf '\\e]7;file://%s%s\\e\\\\' "$HOSTNAME" "$PWD"
+  printf '\e]7;file://%s%s\e\\' "$HOSTNAME" "$PWD"
 }
 
 # Add to PROMPT_COMMAND
-PROMPT_COMMAND="__ct_osc7\${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
+PROMPT_COMMAND="__ct_osc7
+\${PROMPT_COMMAND:+;\$PROMPT_COMMAND}"
 
 # Send initial cwd
 __ct_osc7
@@ -162,6 +165,10 @@ app.whenReady().then(() => {
 
   // Initialize session manager with database from project manager
   sessionManager = new SessionManager(projectManager.db);
+  
+  // Initialize Claude Manager
+  claudeManager = new ClaudeManager(terminals, terminalProjects);
+  
   createWindow();
 });
 
@@ -300,7 +307,7 @@ ipcMain.on('terminal:input', async (event, tabId, data) => {
       term.write('\r');
       console.log('[main] Enter sent!');
     } else {
-      console.log('[main] ⚠️ NO ENTER TO SEND - data did not end with \\r');
+      console.log('[main] ⚠️ NO ENTER TO SEND - data did not end with \r');
     }
   } else {
     term.write(data);
@@ -335,120 +342,6 @@ const execAsync = (cmd, timeout = 1000) => {
   });
 };
 
-// Get Claude session ID by finding recently modified .jsonl file for this process
-ipcMain.handle('terminal:getClaudeSession', async (event, tabId) => {
-  const term = terminals.get(tabId);
-  if (!term) return { success: false, error: 'Terminal not found' };
-
-  try {
-    const shellPid = term.pid;
-    console.log(`[Claude] Checking session for tab ${tabId}, shell PID: ${shellPid}`);
-
-    if (process.platform === 'darwin' || process.platform === 'linux') {
-      // Get child processes of the shell
-      const children = await execAsync(`pgrep -P ${shellPid}`);
-
-      if (!children) {
-        console.log('[Claude] No child processes found');
-        return { success: false, error: 'No child process running' };
-      }
-
-      const childPids = children.split('\n').filter(p => p.trim());
-
-      // Find claude process among children
-      for (const childPid of childPids) {
-        try {
-          const processName = await execAsync(`ps -p ${childPid} -o comm=`);
-          console.log(`[Claude] PID ${childPid} is: ${processName}`);
-
-          if (!processName.includes('claude')) continue;
-
-          // Get process start time (Unix timestamp)
-          const startTimeStr = await execAsync(`ps -p ${childPid} -o lstart=`);
-          const processStartTime = new Date(startTimeStr.trim()).getTime();
-          console.log(`[Claude] Process start time: ${startTimeStr.trim()} (${processStartTime})`);
-
-          // Get CWD of the claude process
-          const cwdResult = await execAsync(`lsof -p ${childPid} | grep cwd | awk '{print $9}'`);
-          const claudeCwd = cwdResult.trim();
-          console.log(`[Claude] Process CWD: ${claudeCwd}`);
-
-          if (!claudeCwd) continue;
-
-          // Calculate project slug
-          const projectSlug = claudeCwd.replace(/\//g, '-');
-          const projectDir = path.join(os.homedir(), '.claude', 'projects', projectSlug);
-          console.log(`[Claude] Project dir: ${projectDir}`);
-
-          if (!fs.existsSync(projectDir)) {
-            console.log('[Claude] Project dir does not exist');
-            continue;
-          }
-
-          // Find .jsonl files modified AFTER process start
-          const files = fs.readdirSync(projectDir)
-            .filter(f => f.endsWith('.jsonl'))
-            .map(f => {
-              const fullPath = path.join(projectDir, f);
-              const stat = fs.statSync(fullPath);
-              return {
-                name: f,
-                mtime: stat.mtime.getTime(),
-                sessionId: f.replace('.jsonl', '')
-              };
-            })
-            .filter(f => f.mtime >= processStartTime - 5000) // Allow 5s tolerance
-            .sort((a, b) => b.mtime - a.mtime);
-
-          console.log(`[Claude] Files modified after process start:`, files.map(f => `${f.sessionId} (${new Date(f.mtime).toISOString()})`));
-
-          if (files.length > 0) {
-            const sessionId = files[0].sessionId;
-            console.log(`[Claude] ✅ Found active session: ${sessionId}`);
-            return { success: true, sessionId, method: 'mtime-after-start' };
-          }
-        } catch (e) {
-          console.log(`[Claude] Error checking PID ${childPid}:`, e.message);
-        }
-      }
-    }
-
-    console.log('[Claude] No active session found');
-    return { success: false, error: 'No active Claude session found' };
-  } catch (e) {
-    console.log('[Claude] Error:', e.message);
-    return { success: false, error: e.message };
-  }
-});
-
-// Check if terminal has running child process (not just idle shell)
-ipcMain.handle('terminal:hasRunningProcess', async (event, tabId) => {
-  const term = terminals.get(tabId);
-  if (!term) return { hasProcess: false };
-
-  try {
-    const shellPid = term.pid;
-
-    if (process.platform === 'darwin' || process.platform === 'linux') {
-      // Get child processes of the shell (async to not block main process)
-      const children = await execAsync(`pgrep -P ${shellPid}`);
-
-      if (children) {
-        // Get the name of the first child process
-        const childPid = children.split('\n')[0];
-        const processName = await execAsync(`ps -p ${childPid} -o comm=`);
-
-        return { hasProcess: true, processName };
-      }
-    }
-
-    return { hasProcess: false };
-  } catch (e) {
-    // pgrep returns non-zero if no children - this is normal for idle shell
-    return { hasProcess: false };
-  }
-});
-
 // Get current working directory of terminal process
 ipcMain.handle('terminal:getCwd', async (event, tabId) => {
   const term = terminals.get(tabId);
@@ -478,52 +371,6 @@ ipcMain.handle('terminal:getCwd', async (event, tabId) => {
 
   // Fallback to stored cwd
   return terminalProjects.get(tabId) || null;
-});
-
-// Get active process running in terminal (child of shell)
-ipcMain.handle('terminal:getActiveProcess', async (event, tabId) => {
-  const term = terminals.get(tabId);
-  console.log('[main] terminal:getActiveProcess called, tabId:', tabId);
-
-  if (!term) {
-    console.log('[main] ❌ Terminal not found for tabId:', tabId);
-    return null;
-  }
-
-  const shellPid = term.pid;
-  console.log('[main] Shell PID:', shellPid);
-
-  try {
-    if (process.platform === 'darwin' || process.platform === 'linux') {
-      // Find child processes of the shell (async to not block main process)
-      const childPidsRaw = await execAsync(`pgrep -P ${shellPid}`);
-
-      console.log('[main] Child PIDs raw:', childPidsRaw);
-
-      const childPids = childPidsRaw.split('\n').filter(p => p);
-
-      if (childPids.length === 0) {
-        console.log('[main] No child processes - shell is idle');
-        return null;
-      }
-
-      // Get the first child process name
-      const firstChildPid = childPids[0];
-      const processName = await execAsync(`ps -o comm= -p ${firstChildPid}`);
-
-      console.log('[main] Active process:', processName, '(PID:', firstChildPid + ')');
-      return processName;
-    }
-  } catch (e) {
-    // pgrep returns exit code 1 if no processes found - this is normal
-    if (e.code === 1 || (e.killed === false && e.signal === null)) {
-      console.log('[main] No child processes - shell is idle');
-      return null;
-    }
-    console.error('[main] Error getting active process:', e.message);
-  }
-
-  return null;
 });
 
 // Notes management
@@ -626,7 +473,7 @@ ipcMain.on('terminal:executeCommand', (event, tabId, command) => {
     term.write(command);
     setTimeout(() => {
       term.write('\r');
-      console.log('[main] ✅ Enter (\\r) sent!');
+      console.log('[main] ✅ Enter (\r) sent!');
     }, 150);
   } else {
     console.error('[main] ❌ Terminal NOT FOUND for tabId:', tabId);
@@ -659,7 +506,7 @@ ipcMain.handle('terminal:executeCommandAsync', async (event, tabId, command) => 
   await new Promise(resolve => setTimeout(resolve, 150));
   console.log('[main] ⏰ 150ms passed, sending Enter...');
   term.write('\r');
-  console.log('[main] ✅ Enter (\\r) sent at', Date.now() - startTime, 'ms');
+  console.log('[main] ✅ Enter (\r) sent at', Date.now() - startTime, 'ms');
 
   // Wait a bit more for command to start processing
   await new Promise(resolve => setTimeout(resolve, 100));
@@ -784,7 +631,7 @@ ipcMain.handle('prompts:save', async (event, prompts) => {
   }
 });
 
-// ========== DOCS UPDATE FEATURE ==========
+// ========== DOCS UPDATE FEATURE ========== 
 
 // Export Claude session for documentation update (with file watcher approach)
 ipcMain.handle('docs:export-session', async (event, { tabId, projectPath }) => {
@@ -939,7 +786,7 @@ ipcMain.handle('docs:cleanup-temp', async (event, { exportedPath, promptPath }) 
   }
 });
 
-// ========== SESSION PERSISTENCE ==========
+// ========== SESSION PERSISTENCE ========== 
 
 // List available Gemini checkpoints
 ipcMain.handle('session:list-gemini-checkpoints', async (event, { dirPath }) => {
@@ -1074,7 +921,7 @@ ipcMain.handle('session:get-visual', async (event, { dirPath, tabIndex }) => {
   }
 });
 
-// ========== CLAUDE INPUT INTERCEPTION ==========
+// ========== CLAUDE INPUT INTERCEPTION ========== 
 
 const crypto = require('crypto');
 
@@ -1297,7 +1144,7 @@ ipcMain.on('claude:fork-session', async (event, { tabId, existingSessionId, cwd 
   }
 });
 
-// ========== CLAUDE COMMAND RUNNER (from UI buttons) ==========
+// ========== CLAUDE COMMAND RUNNER (from UI buttons) ========== 
 // This handles claude commands triggered from InfoPanel buttons
 // bypassing the terminal input interception (which only works for keyboard Enter)
 ipcMain.on('claude:run-command', (event, { tabId, command, sessionId, forkSessionId }) => {

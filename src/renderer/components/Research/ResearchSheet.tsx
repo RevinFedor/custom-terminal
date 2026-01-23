@@ -1,4 +1,4 @@
-import React, { useRef, useEffect, useState, useMemo } from 'react';
+import React, { useRef, useEffect, useState, useMemo, useCallback } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
 import { useResearchStore, ChatType } from '../../store/useResearchStore';
 import { useUIStore, ThinkingLevel, AIModel } from '../../store/useUIStore';
@@ -29,7 +29,7 @@ const THINKING_LEVELS = [
 ] as const;
 
 export default function ResearchSheet({ projectId, projectPath }: ResearchSheetProps) {
-  const { isOpen, closeResearch, getActiveConversation, deleteConversation, pendingChatType } = useResearchStore();
+  const { isOpen, closeResearch, getActiveConversation, deleteConversation, pendingChatType, addMessage, setLoading, setAbortController, isLoading } = useResearchStore();
   const { chatSettings, setChatSettings, showToast } = useUIStore();
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const [showSettings, setShowSettings] = useState(false);
@@ -86,6 +86,91 @@ export default function ResearchSheet({ projectId, projectPath }: ResearchSheetP
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [isOpen, closeResearch]);
+
+  // Retry handler - resends the conversation to API
+  const handleRetry = useCallback(async (messageId: string) => {
+    // Get updated conversation (after truncation)
+    const conv = getActiveConversation(projectId);
+    if (!conv || conv.messages.length === 0) {
+      showToast('No messages to retry', 'warning');
+      return;
+    }
+
+    // The last message should be a user message (after truncation removed the assistant)
+    const lastUserMsg = conv.messages[conv.messages.length - 1];
+    if (lastUserMsg.role !== 'user') {
+      showToast('Cannot retry: last message is not from user', 'warning');
+      return;
+    }
+
+    setLoading(true);
+
+    // Create AbortController
+    const controller = new AbortController();
+    setAbortController(controller);
+
+    try {
+      const apiKey = process.env.GEMINI_API_KEY || 'REDACTED_GEMINI_KEY';
+
+      // Build conversation history
+      const contents = conv.messages.map(msg => ({
+        role: msg.role === 'assistant' ? 'model' : 'user',
+        parts: [{ text: msg.content }]
+      }));
+
+      // Build request body
+      const requestBody: any = {
+        contents,
+        systemInstruction: {
+          parts: [{ text: 'Отвечай максимально кратко и по делу.' }]
+        }
+      };
+
+      // Add thinking config for gemini-3
+      if (selectedModel.includes('gemini-3') && thinkingLevel !== 'NONE') {
+        requestBody.generationConfig = {
+          thinkingConfig: {
+            thinkingLevel: thinkingLevel
+          }
+        };
+      }
+
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${selectedModel}:generateContent?key=${apiKey}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(requestBody),
+          signal: controller.signal
+        }
+      );
+
+      const data = await response.json();
+
+      if (data.error) {
+        throw new Error(data.error.message || 'API Error');
+      }
+
+      if (!data.candidates?.[0]?.content?.parts?.[0]?.text) {
+        throw new Error('Empty or blocked response');
+      }
+
+      const responseText = data.candidates[0].content.parts[0].text;
+      addMessage(projectId, projectPath, 'assistant', responseText);
+      showToast('Response regenerated', 'success');
+    } catch (err: any) {
+      if (err.name === 'AbortError') {
+        showToast('Request cancelled', 'info');
+      } else {
+        console.error('[Retry] ERROR:', err.message);
+        showToast(err.message, 'error');
+        addMessage(projectId, projectPath, 'assistant', `Error: ${err.message}`);
+      }
+    } finally {
+      setAbortController(null);
+      setLoading(false);
+    }
+  }, [projectId, projectPath, getActiveConversation, addMessage, setLoading, setAbortController, selectedModel, thinkingLevel, showToast]);
 
   return (
     <AnimatePresence>
@@ -298,7 +383,7 @@ export default function ResearchSheet({ projectId, projectPath }: ResearchSheetP
 
             {/* Chat Area */}
             <div style={{ flex: 1, overflow: 'hidden', minHeight: 0 }}>
-              <ChatArea projectId={projectId} projectPath={projectPath} />
+              <ChatArea projectId={projectId} projectPath={projectPath} onRetry={handleRetry} />
             </div>
 
             {/* Input Area */}

@@ -182,17 +182,14 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
 
   // Memoize terminal list to prevent unnecessary re-renders
   const terminals = useMemo(() => {
+    console.time('[TerminalArea] Build terminals');
     const result: React.ReactNode[] = [];
-
-    console.log('[TerminalArea] Building terminal list, openProjects:', openProjects.size, 'current projectId:', projectId);
 
     openProjects.forEach((workspace, projId) => {
       const isActiveProject = projId === projectId;
-      console.log('[TerminalArea] Project:', projId, 'isActive:', isActiveProject, 'tabs:', workspace.tabs.size, 'activeTabId:', workspace.activeTabId);
 
       workspace.tabs.forEach((tab) => {
         const isActive = isActiveProject && workspace.activeTabId === tab.id;
-        console.log('[TerminalArea] Adding Terminal:', tab.id, 'active:', isActive, 'cwd:', tab.cwd);
         result.push(
           <Terminal
             key={tab.id}
@@ -205,7 +202,7 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
       });
     });
 
-    console.log('[TerminalArea] Total terminals:', result.length);
+    console.timeEnd('[TerminalArea] Build terminals');
     return result;
   }, [openProjects, projectId]);
 

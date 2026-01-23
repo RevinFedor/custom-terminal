@@ -11,10 +11,7 @@ export default function EditProjectModal() {
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
 
-  console.log('[EditProjectModal] Render, editingProject:', editingProject?.name || null);
-
   useEffect(() => {
-    console.log('[EditProjectModal] editingProject changed:', editingProject);
     if (editingProject) {
       setName(editingProject.name || '');
       setDescription(editingProject.description || '');

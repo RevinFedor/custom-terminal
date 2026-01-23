@@ -14,41 +14,39 @@ function MarkdownRenderer({ content, className = '' }: MarkdownRendererProps) {
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         components={{
-          // Code blocks
-          code({ node, inline, className, children, ...props }: any) {
-            const match = /language-(\w+)/.exec(className || '');
-            const language = match ? match[1] : '';
-            const value = String(children).replace(/\n$/, '');
+          // Pre element wraps code blocks - handle all block code here
+          pre({ children, ...props }: any) {
+            // Extract code element from pre children
+            const codeElement = React.Children.toArray(children)[0] as React.ReactElement;
 
-            if (!inline && language) {
-              return <CodeBlock language={language} value={value} />;
+            if (React.isValidElement(codeElement) && codeElement.type === 'code') {
+              const { className, children: codeChildren } = codeElement.props;
+              const match = /language-(\w+)/.exec(className || '');
+              const language = match ? match[1] : '';
+              const value = String(codeChildren).replace(/\n$/, '');
+
+              // Code block with language - use syntax highlighter
+              if (language) {
+                return <CodeBlock language={language} value={value} />;
+              }
+
+              // Code block without language
+              return (
+                <pre className="my-3 p-3 rounded-lg bg-[#1a1a1a] border border-[#333] overflow-x-auto text-xs text-gray-300">
+                  <code>{codeChildren}</code>
+                </pre>
+              );
             }
 
-            // Block code without language
-            if (!inline) {
-               const isMultiLine = value.includes('\n');
-               
-               if (!isMultiLine) {
-                 // Lightweight render for single-line blocks (often used for filenames/commands)
-                 return (
-                   <div className="my-2">
-                     <code className="px-2 py-1 bg-[#1e1f20] rounded text-[12px] text-[#a8c7fa] font-mono border border-[#333] inline-block" {...props}>
-                       {children}
-                     </code>
-                   </div>
-                 );
-               }
+            // Fallback
+            return <pre {...props}>{children}</pre>;
+          },
 
-               return (
-                 <pre className="my-3 p-3 rounded-lg bg-[#1a1a1a] border border-[#333] overflow-x-auto text-xs text-gray-300">
-                   <code {...props}>{children}</code>
-                 </pre>
-               );
-            }
-
-            // Inline code
+          // Code element - now only called for INLINE code (not inside pre)
+          code({ className, children, ...props }: any) {
+            // Inline code - simple styling
             return (
-              <code className="px-1.5 py-0.5 bg-[#333] rounded text-[12px] text-accent font-mono" {...props}>
+              <code className="px-1.5 py-0.5 bg-[#333] rounded text-[12px] text-[#a8c7fa] font-mono" {...props}>
                 {children}
               </code>
             );
