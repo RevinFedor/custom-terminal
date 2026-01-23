@@ -1,28 +1,27 @@
-# Feature: Workspace & Tools
+# Feature: Workspace & Project Tools
 
 ## Intro
-Инструменты для работы с кодом внутри терминала: навигация по файлам, быстрый просмотр и поиск через AI.
+Инструменты управления проектами, навигации по файлам и работы с заметками.
+
+## User Flow: Работа с проектами
+1. **Переключение:** Пользователь видит список открытых проектов в самом верху окна (Project Tabs).
+   - Активный проект имеет белый фон (стиль "portfolio").
+   - При клике на проект воркспейс мгновенно переключает все терминалы и Explorer.
+2. **Управление:** 
+   - Пользователь хочет закрыть проект. Кнопок "x" нет для чистоты дизайна.
+   - **ПКМ на вкладку проекта** -> "Close Project". Появляется подтверждение (confirm), если в проекте есть открытые терминалы.
+   - **Клик колесиком** на вкладку проекта также вызывает закрытие с подтверждением.
+3. **Файлы:** Пользователь открывает File Explorer (`Cmd+B`). 
+   - Проводник открывается поверх терминала через [React Portal](knowledge/fix-layering-pattern.md).
+   - Пользователь делает `Cmd+Click` по пути файла в терминале -> файл открывается в **File Preview**.
+4. **Заметки:** Пользователь записывает мысли в InfoPanel. Сохранение происходит по `Cmd+Enter` или при потере фокуса.
 
 ## Behavior Specs
-- **File Explorer (Overlay):**
-    - Сайдбар больше не сдвигает терминал. Он открывается поверх через **React Portal**.
-    - Анимация появления стала быстрее (150ms) и плавнее через `framer-motion`.
-    - При открытии Explorer, FilePreview (если активен) автоматически смещается вправо на 250px.
-- **Smart Opening (CWD Aware):** Explorer открывается в директории текущей активной вкладки. Если вкладок нет — в корне проекта.
-- **Cmd + Click (Terminal Links):**
-    - `Cmd+Click` по URL типа `localhost` или `http://` открывает их во внешнем браузере.
-    - `Cmd+Click` по путям файлов (`/Users/...`, `./src/...`) открывает их в **File Preview**.
-- **Project Notes (InfoPanel):**
-    - Блок заметок в правой панели.
-    - Дизайн: прозрачная textarea, которая становится активной при фокусе.
-    - **Сохранение:** По `blur` (уход фокуса) или по `Cmd+Enter`.
-    - Заметки привязаны к проекту и сохраняются в `projects.json` через IPC.
-- **Empty Terminal State:** 
-    - Если в проекте нет вкладок, отображается "Empty State" с быстрыми кнопками (New Tab, Claude, Gemini).
-- **Gemini Search:** Поиск по файлам проекта через встроенную панель.
+- **Project Tabs UI:** Высота 40px, шрифт регулируется в настройках. Убраны лишние отступы и скругления для строгого вида.
+- **Explorer:** Анимация 150мс. Автоматически открывается в CWD активного терминала. См. `knowledge/fact-osc7-cwd.md`.
+- **Empty State:** Если в проекте нет вкладок, отображаются быстрые кнопки (Claude, Gemini, New Tab).
 
 ## Code Map
-- **Explorer:** `src/renderer/components/Workspace/FileExplorer.tsx` — рендеринг через Portal.
-- **Notes:** `src/renderer/components/Workspace/panels/InfoPanel.tsx` — логика `saveNotes` и обработка `Cmd+Enter`.
-- **Links:** `src/renderer/components/Workspace/Terminal.tsx` — хендлер `handleLinkActivation` для `WebLinksAddon`.
-- **Search:** `src/renderer/components/Workspace/panels/GeminiPanel.tsx`.
+- **UI:** `src/renderer/App.tsx` — рендеринг Project Tabs и контекстного меню проектов.
+- **Explorer:** `src/renderer/components/Workspace/FileExplorer.tsx`.
+- **Logic:** `src/main/main.js` — IPC для сохранения заметок в `projects.json`.

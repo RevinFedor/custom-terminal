@@ -1082,7 +1082,7 @@ export default function TabBar({ projectId }: TabBarProps) {
               <span className="text-[#666]">›</span>
             </button>
             {/* Color submenu */}
-            <div className="absolute left-full top-0 ml-1 hidden group-hover/color:block">
+            <div className="absolute left-full top-0 -ml-2 pl-2 hidden group-hover/color:block">
               <div className="bg-[#2a2a2a] border border-[#444] rounded-xl shadow-2xl py-2 min-w-[140px]">
                 {TAB_COLORS.map((c) => {
                   const isSelected = workspace.tabs.get(contextMenu.tabId)?.color === c.color ||
