@@ -79,6 +79,7 @@ interface WorkspaceStore {
 
   // Claude session tracking
   setClaudeSessionId: (tabId: string, sessionId: string) => void;
+  clearClaudeSession: (tabId: string) => void; // Clear both claudeSessionId and wasInterrupted
   getClaudeSessionId: (tabId: string) => string | null;
 
   // Interrupted session handling
@@ -702,6 +703,24 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         // Save to database so session persists across restarts
         saveTabs(workspace.projectPath, workspace.tabs);
         // NOTE: Not calling set() here to avoid re-render that breaks terminal
+        return;
+      }
+    }
+  },
+
+  // Clear Claude session completely (when process exits normally)
+  clearClaudeSession: (tabId) => {
+    const { openProjects } = get();
+
+    for (const [projectId, workspace] of openProjects) {
+      const tab = workspace.tabs.get(tabId);
+      if (tab && (tab.claudeSessionId || tab.wasInterrupted)) {
+        console.log(`[Workspace] Clearing Claude session for tab ${tabId}`);
+        tab.claudeSessionId = undefined;
+        tab.wasInterrupted = false;
+        // Save to database
+        saveTabs(workspace.projectPath, workspace.tabs);
+        // Don't trigger re-render to avoid terminal issues
         return;
       }
     }

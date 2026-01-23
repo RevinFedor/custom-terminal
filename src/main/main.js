@@ -1,6 +1,8 @@
 const { app, BrowserWindow, ipcMain, Menu, dialog } = require('electron');
 const path = require('path');
 const pty = require('node-pty');
+const fs = require('fs');
+const os = require('os');
 
 // Disable HTTP cache to ensure fresh code after updates
 app.commandLine.appendSwitch('disable-http-cache');
@@ -16,6 +18,67 @@ let mainWindow;
 const terminals = new Map(); // tabId -> ptyProcess
 const terminalProjects = new Map(); // tabId -> cwd path
 let sessionManager; // Initialized after projectManager is ready
+
+// Shell integration directory (for OSC 7 cwd reporting)
+const shellIntegrationDir = path.join(app.getPath('userData'), 'shell-integration');
+
+// Create shell integration files on startup
+function setupShellIntegration() {
+  // Create directory
+  if (!fs.existsSync(shellIntegrationDir)) {
+    fs.mkdirSync(shellIntegrationDir, { recursive: true });
+  }
+
+  // Zsh integration - .zshrc that loads user's config and adds OSC 7
+  const zshIntegration = `# CustomTerminal Shell Integration
+# This file is auto-generated - do not edit
+
+# Load user's original .zshrc
+if [[ -f "$HOME/.zshrc" ]]; then
+  ZDOTDIR="$HOME" source "$HOME/.zshrc"
+fi
+
+# OSC 7 - Report current directory to terminal
+__ct_osc7() {
+  printf '\\e]7;file://%s%s\\e\\\\' "$HOST" "$PWD"
+}
+
+# Hook into directory changes
+autoload -Uz add-zsh-hook 2>/dev/null
+add-zsh-hook chpwd __ct_osc7
+add-zsh-hook precmd __ct_osc7
+
+# Send initial cwd
+__ct_osc7
+`;
+
+  // Bash integration
+  const bashIntegration = `# CustomTerminal Shell Integration
+# This file is auto-generated - do not edit
+
+# Load user's original .bashrc
+if [[ -f "$HOME/.bashrc" ]]; then
+  source "$HOME/.bashrc"
+fi
+
+# OSC 7 - Report current directory to terminal
+__ct_osc7() {
+  printf '\\e]7;file://%s%s\\e\\\\' "$HOSTNAME" "$PWD"
+}
+
+# Add to PROMPT_COMMAND
+PROMPT_COMMAND="__ct_osc7\${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
+
+# Send initial cwd
+__ct_osc7
+`;
+
+  // Write integration files
+  fs.writeFileSync(path.join(shellIntegrationDir, '.zshrc'), zshIntegration);
+  fs.writeFileSync(path.join(shellIntegrationDir, '.bashrc'), bashIntegration);
+
+  console.log('[Shell Integration] Created at:', shellIntegrationDir);
+}
 
 function createWindow() {
   const windowOptions = {
@@ -94,6 +157,9 @@ ipcMain.on('show-terminal-context-menu', async (event, { hasSelection, prompts }
 });
 
 app.whenReady().then(() => {
+  // Setup shell integration (OSC 7 for cwd reporting)
+  setupShellIntegration();
+
   // Initialize session manager with database from project manager
   sessionManager = new SessionManager(projectManager.db);
   createWindow();
@@ -119,7 +185,28 @@ app.on('activate', () => {
 ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd }) => {
     console.time(`[PERF:main] terminal:create ${tabId}`);
     const shell = process.env.SHELL || '/bin/bash';
+    const shellName = path.basename(shell);
     const workingDir = cwd || process.env.HOME;
+
+    // Build env with shell integration
+    const shellEnv = {
+      ...process.env,
+      COLORTERM: 'truecolor',  // Enable 24-bit colors for Ink-based CLIs (gemini, claude)
+      LANG: process.env.LANG || 'en_US.UTF-8',
+      LC_ALL: process.env.LC_ALL || 'en_US.UTF-8',
+      TERM_PROGRAM: 'CustomTerminal',
+      TERM_PROGRAM_VERSION: '1.0.0'
+    };
+
+    // Zsh: use ZDOTDIR to load our integration
+    if (shellName === 'zsh') {
+      shellEnv.ZDOTDIR = shellIntegrationDir;
+    }
+
+    // Bash: use BASH_ENV to source our integration
+    if (shellName === 'bash') {
+      shellEnv.BASH_ENV = path.join(shellIntegrationDir, '.bashrc');
+    }
 
     console.time(`[PERF:main] pty.spawn ${tabId}`);
     const ptyProcess = pty.spawn(shell, [], {
@@ -127,12 +214,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd }) => {
       cols: cols || 80,
       rows: rows || 24,
       cwd: workingDir,
-      env: {
-        ...process.env,
-        COLORTERM: 'truecolor',  // Enable 24-bit colors for Ink-based CLIs (gemini, claude)
-        LANG: process.env.LANG || 'en_US.UTF-8',
-        LC_ALL: process.env.LC_ALL || 'en_US.UTF-8'
-      }
+      env: shellEnv
     });
     console.timeEnd(`[PERF:main] pty.spawn ${tabId}`);
 
@@ -951,8 +1033,6 @@ ipcMain.handle('session:get-visual', async (event, { dirPath, tabIndex }) => {
 
 // ========== CLAUDE INPUT INTERCEPTION ==========
 
-const os = require('os');
-const fs = require('fs');
 const crypto = require('crypto');
 
 // Sniper Watcher: watch for new .jsonl file creation when claude starts
@@ -1041,10 +1121,13 @@ ipcMain.on('claude:spawn-with-watcher', (event, { tabId, cwd }) => {
 // Fork Claude session file: copy .jsonl with new UUID
 // Searches ALL project directories under ~/.claude/projects/ to find the session file
 ipcMain.handle('claude:fork-session-file', async (event, { sourceSessionId, cwd }) => {
+  console.log('[Claude Fork] ========================================');
   console.log('[Claude Fork] Copying session:', sourceSessionId);
+  console.log('[Claude Fork] Current cwd:', cwd);
 
   try {
     const claudeProjectsDir = path.join(os.homedir(), '.claude', 'projects');
+    console.log('[Claude Fork] Claude projects dir:', claudeProjectsDir);
 
     // Find session file across ALL project directories
     let sourcePath = null;
@@ -1055,32 +1138,42 @@ ipcMain.handle('claude:fork-session-file', async (event, { sourceSessionId, cwd 
     const primaryDir = path.join(claudeProjectsDir, projectSlug);
     const primaryPath = path.join(primaryDir, `${sourceSessionId}.jsonl`);
 
+    console.log('[Claude Fork] Primary slug:', projectSlug);
+    console.log('[Claude Fork] Primary path:', primaryPath);
+    console.log('[Claude Fork] Primary exists:', fs.existsSync(primaryPath));
+
     if (fs.existsSync(primaryPath)) {
       sourcePath = primaryPath;
       projectDir = primaryDir;
       console.log('[Claude Fork] Found in primary location:', sourcePath);
     } else {
       // Search all project directories
-      console.log('[Claude Fork] Not in primary location, searching all projects...');
+      console.log('[Claude Fork] Not in primary location, searching ALL projects...');
       if (fs.existsSync(claudeProjectsDir)) {
         const projectDirs = fs.readdirSync(claudeProjectsDir, { withFileTypes: true })
           .filter(dirent => dirent.isDirectory())
           .map(dirent => dirent.name);
 
+        console.log('[Claude Fork] Found', projectDirs.length, 'project directories to search');
+
         for (const dir of projectDirs) {
           const checkPath = path.join(claudeProjectsDir, dir, `${sourceSessionId}.jsonl`);
-          if (fs.existsSync(checkPath)) {
+          const exists = fs.existsSync(checkPath);
+          if (exists) {
             sourcePath = checkPath;
             projectDir = path.join(claudeProjectsDir, dir);
-            console.log('[Claude Fork] Found in:', sourcePath);
+            console.log('[Claude Fork] ✓ FOUND in:', sourcePath);
             break;
           }
         }
+      } else {
+        console.log('[Claude Fork] ERROR: Claude projects dir does not exist!');
       }
     }
 
     if (!sourcePath) {
-      console.error('[Claude Fork] Source file not found in any project directory');
+      console.error('[Claude Fork] ✗ Source file not found in ANY project directory');
+      console.error('[Claude Fork] Searched for:', sourceSessionId + '.jsonl');
       return { success: false, error: 'Session file not found: ' + sourceSessionId };
     }
 
@@ -1244,32 +1337,65 @@ ipcMain.on('claude:run-command', (event, { tabId, command, sessionId, forkSessio
 
     case 'claude-f':
       // Fork session - copy file and signal renderer
+      // IMPORTANT: Search ALL project directories because session might be from different project
       if (forkSessionId) {
         console.log('[Claude Runner] Forking session:', forkSessionId);
 
+        const claudeProjectsDir = path.join(os.homedir(), '.claude', 'projects');
         const forkProjectSlug = cwd.replace(/\//g, '-');
-        const forkProjectDir = path.join(os.homedir(), '.claude', 'projects', forkProjectSlug);
-        const newSessionId = crypto.randomUUID();
+        const primaryDir = path.join(claudeProjectsDir, forkProjectSlug);
+        const primaryPath = path.join(primaryDir, `${forkSessionId}.jsonl`);
 
-        const sourcePath = path.join(forkProjectDir, `${forkSessionId}.jsonl`);
-        const destPath = path.join(forkProjectDir, `${newSessionId}.jsonl`);
+        let sourcePath = null;
+        let sourceDir = null;
 
-        if (fs.existsSync(sourcePath)) {
+        // First try primary location (cwd-based)
+        if (fs.existsSync(primaryPath)) {
+          sourcePath = primaryPath;
+          sourceDir = primaryDir;
+          console.log('[Claude Runner] Found in primary location:', sourcePath);
+        } else {
+          // Search ALL project directories
+          console.log('[Claude Runner] Not in primary, searching all projects...');
+          if (fs.existsSync(claudeProjectsDir)) {
+            const projectDirs = fs.readdirSync(claudeProjectsDir, { withFileTypes: true })
+              .filter(dirent => dirent.isDirectory())
+              .map(dirent => dirent.name);
+
+            for (const dir of projectDirs) {
+              const checkPath = path.join(claudeProjectsDir, dir, `${forkSessionId}.jsonl`);
+              if (fs.existsSync(checkPath)) {
+                sourcePath = checkPath;
+                sourceDir = path.join(claudeProjectsDir, dir);
+                console.log('[Claude Runner] ✓ Found in:', sourcePath);
+                break;
+              }
+            }
+          }
+        }
+
+        if (sourcePath && sourceDir) {
+          const newSessionId = crypto.randomUUID();
+          // Copy to the SAME directory where source was found
+          const destPath = path.join(sourceDir, `${newSessionId}.jsonl`);
+
           fs.copyFileSync(sourcePath, destPath);
           console.log('[Claude Runner] Copied session file, new ID:', newSessionId);
+          console.log('[Claude Runner] From:', sourcePath);
+          console.log('[Claude Runner] To:', destPath);
 
-          // Signal renderer to create new tab
-          event.sender.send('claude:fork-complete', {
-            success: true,
-            newSessionId,
-            cwd
-          });
+          // Run claude --resume in CURRENT terminal (not new tab!)
+          // This is for claude-f <uuid> - resuming external session
+          term.write(`claude --dangerously-skip-permissions --resume ${newSessionId}\r`);
+
+          // Notify renderer about new session ID
+          event.sender.send('claude:session-detected', { tabId, sessionId: newSessionId });
+          console.log('[Claude Runner] Started claude --resume in current terminal');
         } else {
-          console.error('[Claude Runner] Source session not found:', sourcePath);
-          event.sender.send('claude:fork-complete', {
-            success: false,
-            error: 'Session file not found: ' + forkSessionId
-          });
+          console.error('[Claude Runner] Source session not found in ANY project');
+          console.error('[Claude Runner] Searched for:', forkSessionId);
+          // Just echo error to terminal
+          term.write(`echo "❌ Session not found: ${forkSessionId}"\r`);
         }
       } else {
         console.error('[Claude Runner] No forkSessionId for claude-f');

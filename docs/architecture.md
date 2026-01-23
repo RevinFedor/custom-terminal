@@ -15,41 +15,31 @@
     - `docs:save-selection`: Сохранение выделения терминала в файл (✂️).
     - `docs:save-prompt-temp`: Сохранение временного файла для Gemini.
     - `docs:cleanup-temp`: Удаление временных артефактов.
+    - `app:getState` / `app:setState`: Глобальное хранилище состояния (view, session) в SQLite.
+    - `project:save-note`: Сохранение заметок проекта в JSON.
     - `claude:spawn-with-watcher`: Запуск Claude с активацией Sniper Watcher.
-    - `claude:fork-session-file`: Копирование файла сессии для форка.
+    - `claude:fork-session-file`: Копирование файла сессии (поиск по всем проектам).
     - `claude:run-command`: Прямой запуск команд Claude из UI (Claude Runner).
-    - `claude:session-detected`: Событие при обнаружении нового ID сессии.
-    - `claude:fork-complete`: Сигнал об успешном создании форка.
 
 ## 2. Data Layer
-- **SQLite (`noted-terminal.db`):** Хранит сессии AI (`ai_sessions`) и историю развертываний.
-- **JSON (`projects.json`):** Хранит метаданные проектов, заметки, табы (теперь с `color` и `claudeSessionId`), промпты и команды. Путь: `~/Library/Application Support/noted-terminal/`.
-- **Persistence Strategy:** Для минимизации нагрузки на диск и IPC используется **Debounce (300-500ms)** при сохранении табов и сессий. См. `knowledge/fix-data-persistence.md`.
-- **Visual State (In-Memory):**
-    - `terminalBuffers`: (Zustand) Хранит сериализованные строки `xterm.js` при переключении между Workspace и Dashboard. Очищается после восстановления.
-- **LocalStorage:**
-    - `noted-terminal-font-settings`: Настройки шрифтов.
-    - `noted-terminal-research-v2`: История чатов Research (Conversations).
-    - `noted-terminal-ai-model`: Выбранная глобальная модель Gemini.
-    - `noted-terminal-thinking-level`: Настройка глубины рассуждений Gemini 3.
-    - `noted-terminal-research-prompt`: Системный промпт для ресерча.
-    - `noted-terminal-doc-prompt`: Настройки промпта для обновления документации (Update Docs).
-- **UI State (`useUIStore`):** Хранит настройки интерфейса, включая размеры шрифтов и текущее выделение терминала (`terminalSelection`).
+- **SQLite (`noted-terminal.db`):** 
+    - Хранит сессии AI (`ai_sessions`).
+    - Хранит глобальное состояние приложения (`app_state`): текущий `view` (Dashboard/Workspace), данные последней сессии.
+    - **Миграция:** Таблица `tabs` теперь содержит колонку `was_interrupted`.
+- **JSON (`projects.json`):** Хранит метаданные проектов, заметки, табы (с `color`, `isUtility`, `claudeSessionId` и `wasInterrupted`).
+- **Persistence Strategy:** 
+    - Для вкладок используется Debounce (500ms).
+    - Для заметок проекта сохранение происходит при `blur` (потере фокуса) или по `Cmd+Enter`.
+    - Состояние приложения (`app:setState`) сохраняется асинхронно с дебаунсом, но при закрытии приложения (`beforeunload`) используется синхронный вызов для гарантии записи.
 
 ## 3. Terminal Integration
 
-- **Backend:** `node-pty` для создания псевдотерминалов.
-
-    - **Environment:** Принудительно устанавливаются `COLORTERM: 'truecolor'`, `LANG` и `LC_ALL` (UTF-8). Это обеспечивает яркие 24-битные цвета в AI CLI и корректный ввод кириллицы. См. `knowledge/fix-terminal-colors.md`.
+- **Backend:** `node-pty` + **Shell Integration (OSC 7)**.
+    - **CWD Tracking:** Вместо поллинга через `lsof` используется реактивный подход. Shell (Zsh/Bash) отправляет последовательность OSC 7 при каждой смене директории. Это позволяет приложению мгновенно узнавать `cwd` и сохранять его. См. `knowledge/fact-osc7-cwd.md`.
 
 - **Frontend:** `xterm.js` с использованием **Canvas рендерера**.
-
- WebGL отключен для предотвращения лагов "прогрева" GPU и обхода лимитов контекстов (max 16). См. `knowledge/fix-ui-stability.md`.
-- **Terminal Registry:** Глобальный маппинг `tabId -> xterm instance` для доступа к данным терминала (выделение, ввод) из любой части приложения. См. `knowledge/fact-terminal-registry.md`.
-- **Lazy Hydration:** Инстанс `xterm.js` и его аддоны создаются только при первом физическом показе таба (активация таба или проекта). До этого данные от PTY буферизируются. Это обеспечивает мгновенный старт приложения (Cold Start) даже с десятками табов.
-- **Rendering Strategy:** Для предотвращения дёргания (jitter) при переключении проектов терминалы всех открытых проектов рендерятся одновременно и скрываются через `visibility: hidden`. См. `knowledge/fix-terminal-jitter.md`.
-- **Buffer Optimization:** `FLUSH_DELAY = 10ms` для предотвращения дрожания UI при интенсивном выводе.
-- **Visual Persistence (Serialization):** При размонтировании (unmount) воркспейса, содержимое терминалов сериализуется через `SerializeAddon` и сохраняется в `useWorkspaceStore`. При возврате данные восстанавливаются через `term.write()`. См. `knowledge/fix-terminal-serialization.md`.
+    - **Layering Pattern:** Использование слоев и Portals для отрисовки UI (кнопки скролла, Explorer) поверх Canvas без конфликтов Stacking Context. См. `knowledge/fix-layering-pattern.md`.
+    - **Lazy Hydration:** Инстанс `xterm.js` создается только при первом физическом показе. Добавлен `isCreatingRef` для предотвращения двойной инициализации.
 
 ## 4. Styling System
 - Tailwind CSS v4 с JIT-компиляцией.

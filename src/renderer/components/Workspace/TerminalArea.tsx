@@ -146,10 +146,13 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
     }
   };
 
-  // Handle dismissing the interrupted overlay
+  // Handle dismissing the interrupted overlay (clear session completely)
   const handleDismissOverlay = () => {
     if (activeTab?.id) {
-      clearInterruptedState(activeTab.id);
+      // Clear both wasInterrupted AND claudeSessionId
+      // This prevents the overlay from appearing again on next restart
+      const clearClaudeSession = useWorkspaceStore.getState().clearClaudeSession;
+      clearClaudeSession(activeTab.id);
     }
   };
 

@@ -4,25 +4,25 @@
 Инструменты для работы с кодом внутри терминала: навигация по файлам, быстрый просмотр и поиск через AI.
 
 ## Behavior Specs
-- **File Explorer:** Вызывается по `Cmd + \` . Показывает структуру проекта.
-- **File Preview:** Быстрый просмотр контента файла с подсветкой синтаксиса (Highlight.js). Закрывается по `Esc` или повторному `Cmd + \` .
-- **Right Panel (Info):** Содержит вкладки для работы с активным табом.
-    - **Info:** (Заменила Notes) Отображает статус и ID сессии Claude Code, а также справочник доступных команд.
-    - **AI:** Панель Gemini для работы с контекстом.
-    - **Actions:** Системные действия (экспорт сессий, Update Docs).
-    - **Sessions:** Управление сохраненными AI-чекпоинтами.
-- **Notes (Temporary):** Панель заметок временно скрыта из правой части и подготавливается к переносу в нижнюю панель воркспейса.
-- **Empty State:** Если в проекте не открыто ни одного терминала в Main зоне, отображается информационный экран:
-    - Название текущего проекта.
-    - Кнопка быстрого создания терминала.
-    - Подсказка по горячим клавишам (`Cmd + T`).
-- **Gemini Search:** Позволяет искать выделенный в терминале текст через API Gemini. Вызывается через контекстное меню (ПКМ) в терминале → "Искать в AI". Результаты открываются в Research Panel.
+- **File Explorer (Overlay):**
+    - Сайдбар больше не сдвигает терминал. Он открывается поверх через **React Portal**.
+    - Анимация появления стала быстрее (150ms) и плавнее через `framer-motion`.
+    - При открытии Explorer, FilePreview (если активен) автоматически смещается вправо на 250px.
+- **Smart Opening (CWD Aware):** Explorer открывается в директории текущей активной вкладки. Если вкладок нет — в корне проекта.
+- **Cmd + Click (Terminal Links):**
+    - `Cmd+Click` по URL типа `localhost` или `http://` открывает их во внешнем браузере.
+    - `Cmd+Click` по путям файлов (`/Users/...`, `./src/...`) открывает их в **File Preview**.
+- **Project Notes (InfoPanel):**
+    - Блок заметок в правой панели.
+    - Дизайн: прозрачная textarea, которая становится активной при фокусе.
+    - **Сохранение:** По `blur` (уход фокуса) или по `Cmd+Enter`.
+    - Заметки привязаны к проекту и сохраняются в `projects.json` через IPC.
+- **Empty Terminal State:** 
+    - Если в проекте нет вкладок, отображается "Empty State" с быстрыми кнопками (New Tab, Claude, Gemini).
+- **Gemini Search:** Поиск по файлам проекта через встроенную панель.
 
 ## Code Map
-- **Preview:** `src/renderer/components/Workspace/FilePreview.tsx`.
-- **Explorer:** `src/renderer/components/Workspace/FileExplorer.tsx`.
-- **Right Panel:** `src/renderer/components/Workspace/NotesPanel.tsx` (контейнер для вкладок Info, AI и др.).
-- **Info Panel:** `src/renderer/components/Workspace/panels/InfoPanel.tsx`.
-- **Placeholder:** `src/renderer/components/Workspace/EmptyTerminalPlaceholder.tsx`.
-- **Research Overlay:** `src/renderer/components/Research/ResearchSheet.tsx` — открывается внутри области терминала.
-- **Logic:** `src/renderer/components/Workspace/TerminalArea.tsx` управляет переключением между терминалами и заглушкой.
+- **Explorer:** `src/renderer/components/Workspace/FileExplorer.tsx` — рендеринг через Portal.
+- **Notes:** `src/renderer/components/Workspace/panels/InfoPanel.tsx` — логика `saveNotes` и обработка `Cmd+Enter`.
+- **Links:** `src/renderer/components/Workspace/Terminal.tsx` — хендлер `handleLinkActivation` для `WebLinksAddon`.
+- **Search:** `src/renderer/components/Workspace/panels/GeminiPanel.tsx`.

@@ -72,6 +72,19 @@ const getSetTerminalSelection = () => useUIStore.getState().setTerminalSelection
 const getSetClaudeSessionId = () => useWorkspaceStore.getState().setClaudeSessionId;
 const getClaudeSessionId = (tabId: string) => useWorkspaceStore.getState().getClaudeSessionId(tabId);
 
+// Get updateTabCwd for OSC 7 handler (shell reports cwd changes)
+const getUpdateTabCwd = () => {
+  return (tabId: string, newCwd: string) => {
+    const state = useWorkspaceStore.getState();
+    for (const [projectId, workspace] of state.openProjects) {
+      if (workspace.tabs.has(tabId)) {
+        state.updateTabCwd(projectId, tabId, newCwd);
+        return;
+      }
+    }
+  };
+};
+
 // Get pending command for a tab (used for fork)
 const getTabPendingCommand = (tabId: string): string | undefined => {
   const state = useWorkspaceStore.getState();
@@ -390,6 +403,27 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
 
       term.open(containerRef);
 
+      // OSC 7 handler - shell reports current working directory
+      // Format: file://hostname/path or just /path
+      term.parser.registerOscHandler(7, (data: string) => {
+        try {
+          let newCwd: string;
+          if (data.startsWith('file://')) {
+            const url = new URL(data);
+            newCwd = decodeURIComponent(url.pathname);
+          } else {
+            newCwd = data;
+          }
+          if (newCwd && newCwd.startsWith('/')) {
+            console.log('[Terminal] OSC 7 cwd update:', newCwd);
+            getUpdateTabCwd()(tabId, newCwd);
+          }
+        } catch (e) {
+          console.error('[Terminal] OSC 7 parse error:', e);
+        }
+        return true;
+      });
+
       xtermInstance.current = term;
       hasBeenActive.current = true; // Mark as active AFTER xterm is created to prevent race condition
       console.log('[Terminal] initTerminal: xterm created, hasBeenActive set to true for:', tabId);
@@ -706,6 +740,26 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
 
         term.open(terminalRef.current);
 
+        // OSC 7 handler - shell reports current working directory
+        term.parser.registerOscHandler(7, (data: string) => {
+          try {
+            let newCwd: string;
+            if (data.startsWith('file://')) {
+              const url = new URL(data);
+              newCwd = decodeURIComponent(url.pathname);
+            } else {
+              newCwd = data;
+            }
+            if (newCwd && newCwd.startsWith('/')) {
+              console.log('[Terminal] OSC 7 cwd update:', newCwd);
+              getUpdateTabCwd()(tabId, newCwd);
+            }
+          } catch (e) {
+            console.error('[Terminal] OSC 7 parse error:', e);
+          }
+          return true;
+        });
+
         xtermInstance.current = term;
         hasBeenActive.current = true; // Mark as active AFTER xterm is created
         console.log('[Terminal] initLazy: xterm created, hasBeenActive set to true for:', tabId);
@@ -944,12 +998,12 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
   // opacity:0 initially to prevent jitter during first fit
 
   return (
-    <div className="relative w-full h-full" style={{ zIndex: active ? 1 : -1, isolation: 'isolate' }}>
+    <div className="absolute inset-0" style={{ zIndex: active ? 1 : -1, isolation: 'isolate' }}>
 
       {/* Layer 1: Terminal (Lower) */}
       <div
         ref={terminalRef}
-        className="terminal-instance absolute inset-0"
+        className="terminal-instance w-full h-full"
         style={{
           visibility: active ? 'visible' : 'hidden',
           opacity: isVisible ? 1 : 0,
