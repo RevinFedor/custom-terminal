@@ -133,15 +133,23 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
           {/* claude */}
           <div className={`rounded p-2 ${hasSession ? 'bg-[#252525] opacity-60' : 'bg-[#2d2d2d]'}`}>
             <div className="flex items-center justify-between">
-              <code className={`text-xs ${hasSession ? 'text-[#666]' : 'text-accent'}`}>claude</code>
               <div className="flex items-center gap-2">
                 <button
-                  className={`text-[10px] px-1.5 py-0.5 rounded transition-colors ${
+                  className="text-[9px] px-1 py-0.5 rounded text-[#666] hover:text-white bg-[#333] hover:bg-[#444] cursor-pointer transition-colors"
+                  onClick={() => {
+                    navigator.clipboard.writeText('claude');
+                    showToast('Скопировано: claude', 'success');
+                  }}
+                  title="Копировать команду"
+                >
+                  Copy
+                </button>
+                <code
+                  className={`text-xs cursor-pointer transition-colors ${
                     hasSession
-                      ? 'text-[#555] bg-[#2a2a2a] cursor-not-allowed'
-                      : 'text-[#888] hover:text-white bg-[#333] hover:bg-[#444] cursor-pointer'
+                      ? 'text-[#666] cursor-not-allowed'
+                      : 'text-accent hover:text-white hover:underline'
                   }`}
-                  disabled={hasSession}
                   onClick={() => {
                     if (!activeTabId) {
                       showToast('Нет активного таба', 'error');
@@ -153,14 +161,14 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                     }
                     ipcRenderer.send('claude:run-command', { tabId: activeTabId, command: 'claude' });
                   }}
-                  title={hasSession ? 'Сессия уже есть' : 'Start new Claude session'}
+                  title={hasSession ? 'Сессия уже есть' : 'Запустить новую сессию'}
                 >
-                  ⑂
-                </button>
-                <span className={`text-[10px] ${hasSession ? 'text-red-400' : 'text-green-400'}`}>
-                  {hasSession ? 'есть сессия' : 'нет сессии'}
-                </span>
+                  claude
+                </code>
               </div>
+              <span className={`text-[10px] ${hasSession ? 'text-red-400' : 'text-green-400'}`}>
+                {hasSession ? 'есть сессия' : 'нет сессии'}
+              </span>
             </div>
             <p className="text-[10px] text-[#888] mt-1">Новая сессия</p>
           </div>
@@ -168,28 +176,40 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
           {/* claude-c */}
           <div className={`rounded p-2 ${hasSession ? 'bg-[#2d2d2d]' : 'bg-[#252525] opacity-60'}`}>
             <div className="flex items-center justify-between">
-              <code className={`text-xs ${hasSession ? 'text-accent' : 'text-[#666]'}`}>claude-c</code>
               <div className="flex items-center gap-2">
                 <button
-                  className={`text-[10px] px-1.5 py-0.5 rounded transition-colors ${
-                    hasSession
-                      ? 'text-[#888] hover:text-white bg-[#333] hover:bg-[#444] cursor-pointer'
-                      : 'text-[#555] bg-[#2a2a2a] cursor-not-allowed'
-                  }`}
-                  disabled={!hasSession}
+                  className="text-[9px] px-1 py-0.5 rounded text-[#666] hover:text-white bg-[#333] hover:bg-[#444] cursor-pointer transition-colors"
                   onClick={() => {
+                    navigator.clipboard.writeText('claude -c');
+                    showToast('Скопировано: claude -c', 'success');
+                  }}
+                  title="Копировать команду"
+                >
+                  Copy
+                </button>
+                <code
+                  className={`text-xs cursor-pointer transition-colors ${
+                    hasSession
+                      ? 'text-accent hover:text-white hover:underline'
+                      : 'text-[#666] cursor-not-allowed'
+                  }`}
+                  onClick={() => {
+                    if (!hasSession) {
+                      showToast('Нет активной сессии', 'warning');
+                      return;
+                    }
                     if (hasSession && activeTabId) {
                       ipcRenderer.send('claude:run-command', { tabId: activeTabId, command: 'claude-c', sessionId });
                     }
                   }}
-                  title={hasSession ? 'Continue session' : 'No session'}
+                  title={hasSession ? 'Продолжить сессию' : 'Нет сессии'}
                 >
-                  ⑂
-                </button>
-                <span className={`text-[10px] ${hasSession ? 'text-green-400' : 'text-red-400'}`}>
-                  {hasSession ? 'готово' : 'нет сессии'}
-                </span>
+                  claude-c
+                </code>
               </div>
+              <span className={`text-[10px] ${hasSession ? 'text-green-400' : 'text-red-400'}`}>
+                {hasSession ? 'готово' : 'нет сессии'}
+              </span>
             </div>
             <p className="text-[10px] text-[#888] mt-1">Продолжить активную сессию</p>
           </div>
@@ -197,10 +217,19 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
           {/* claude-f <ID> */}
           <div className="bg-[#2d2d2d] rounded p-2">
             <div className="flex items-center justify-between">
-              <code className="text-accent text-xs">claude-f &lt;ID&gt;</code>
               <div className="flex items-center gap-2">
                 <button
-                  className="text-[10px] px-1.5 py-0.5 rounded transition-colors text-[#888] hover:text-white bg-[#333] hover:bg-[#444] cursor-pointer"
+                  className="text-[9px] px-1 py-0.5 rounded text-[#666] hover:text-white bg-[#333] hover:bg-[#444] cursor-pointer transition-colors"
+                  onClick={() => {
+                    navigator.clipboard.writeText('claude -r');
+                    showToast('Скопировано: claude -r', 'success');
+                  }}
+                  title="Копировать команду"
+                >
+                  Copy
+                </button>
+                <code
+                  className="text-accent text-xs cursor-pointer hover:text-white hover:underline transition-colors"
                   onClick={async () => {
                     if (!activeTabId) {
                       showToast('Нет активного таба', 'error');
@@ -218,14 +247,14 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                       showToast('Не удалось прочитать буфер обмена', 'error');
                     }
                   }}
-                  title="Fork session from clipboard UUID"
+                  title="Форк сессии из буфера обмена"
                 >
-                  ⑂
-                </button>
-                <span className="text-green-400 text-[10px]">всегда</span>
+                  claude-f
+                </code>
               </div>
+              <span className="text-green-400 text-[10px]">всегда</span>
             </div>
-            <p className="text-[10px] text-[#888] mt-1">Форк сессии по UUID</p>
+            <p className="text-[10px] text-[#888] mt-1">Форк сессии по UUID из буфера</p>
           </div>
         </div>
       </div>

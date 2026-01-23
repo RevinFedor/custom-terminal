@@ -18,22 +18,35 @@ const InterruptedSessionOverlay = memo(({ tabId, sessionId, onContinue, onDismis
 
   // Handle backdrop click
   const handleBackdropClick = (e: React.MouseEvent) => {
+    console.log('[InterruptedOverlay] Backdrop click, isLoading:', isLoading, 'tabId:', tabId);
     e.stopPropagation();
-    if (!isLoading) onDismiss();
+    if (!isLoading) {
+      console.log('[InterruptedOverlay] Calling onDismiss');
+      onDismiss();
+    }
   };
 
   // Handle continue click - disable after first click
   const handleContinueClick = (e: React.MouseEvent) => {
+    console.log('[InterruptedOverlay] Continue click, isLoading:', isLoading, 'tabId:', tabId, 'sessionId:', sessionId);
     e.stopPropagation();
-    if (isLoading) return; // Prevent double click
+    if (isLoading) {
+      console.log('[InterruptedOverlay] Already loading, ignoring');
+      return;
+    }
+    console.log('[InterruptedOverlay] Setting isLoading=true, calling onContinue');
     setIsLoading(true);
     onContinue();
   };
 
   // Handle close button click
   const handleCloseClick = (e: React.MouseEvent) => {
+    console.log('[InterruptedOverlay] Close button click, isLoading:', isLoading, 'tabId:', tabId);
     e.stopPropagation();
-    if (!isLoading) onDismiss();
+    if (!isLoading) {
+      console.log('[InterruptedOverlay] Calling onDismiss');
+      onDismiss();
+    }
   };
 
   return (
@@ -137,22 +150,33 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
   };
 
   // Handle continuing interrupted Claude session
-  const handleContinueSession = () => {
-    if (activeTab?.id && activeTab?.claudeSessionId) {
+  const handleContinueSession = (sessionId?: string) => {
+    const targetSessionId = sessionId || activeTab?.claudeSessionId;
+    console.log('[TerminalArea] handleContinueSession called, activeTab:', activeTab?.id, 'sessionId:', targetSessionId);
+    
+    if (activeTab?.id && targetSessionId) {
+      console.log('[TerminalArea] Clearing interrupted state and sending command');
       // Clear the interrupted state
       clearInterruptedState(activeTab.id);
       // Send command to terminal
-      ipcRenderer.send('terminal:input', activeTab.id, `claude --dangerously-skip-permissions --resume ${activeTab.claudeSessionId}\r`);
+      const cmd = `claude --dangerously-skip-permissions --resume ${targetSessionId}\r`;
+      console.log('[TerminalArea] Sending terminal:input:', cmd);
+      ipcRenderer.send('terminal:input', activeTab.id, cmd);
+    } else {
+      console.log('[TerminalArea] handleContinueSession: Missing activeTab or sessionId!');
     }
   };
 
   // Handle dismissing the interrupted overlay (clear session completely)
   const handleDismissOverlay = () => {
+    console.log('[TerminalArea] handleDismissOverlay called, activeTab:', activeTab?.id);
     if (activeTab?.id) {
-      // Clear both wasInterrupted AND claudeSessionId
-      // This prevents the overlay from appearing again on next restart
-      const clearClaudeSession = useWorkspaceStore.getState().clearClaudeSession;
-      clearClaudeSession(activeTab.id);
+      console.log('[TerminalArea] Clearing Claude session completely');
+      // Clear both wasInterrupted AND claudeSessionId using dismiss action that triggers re-render
+      const dismissInterruptedSession = useWorkspaceStore.getState().dismissInterruptedSession;
+      dismissInterruptedSession(activeTab.id);
+    } else {
+      console.log('[TerminalArea] handleDismissOverlay: No activeTab!');
     }
   };
 
@@ -262,7 +286,7 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
           <InterruptedSessionOverlay
             tabId={activeTab.id}
             sessionId={activeTab.claudeSessionId!}
-            onContinue={handleContinueSession}
+            onContinue={() => handleContinueSession(activeTab.claudeSessionId!)}
             onDismiss={handleDismissOverlay}
           />
         )}

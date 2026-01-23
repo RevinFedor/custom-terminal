@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { createPortal } from 'react-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useUIStore } from '../../store/useUIStore';
+import FileIcon from '../UI/FileIcon';
 
 const { ipcRenderer } = window.require('electron');
 const fs = window.require('fs').promises;
@@ -17,9 +18,10 @@ interface FileTreeItemProps {
   item: FileItem;
   level: number;
   onFileClick: (path: string) => void;
+  fontSize: number;
 }
 
-function FileTreeItem({ item, level, onFileClick }: FileTreeItemProps) {
+function FileTreeItem({ item, level, onFileClick, fontSize }: FileTreeItemProps) {
   const [expanded, setExpanded] = useState(false);
   const [children, setChildren] = useState<FileItem[]>([]);
   const [loading, setLoading] = useState(false);
@@ -82,15 +84,15 @@ function FileTreeItem({ item, level, onFileClick }: FileTreeItemProps) {
   return (
     <>
       <div
-        className="flex items-center py-1 cursor-pointer text-[#ccc] gap-1 whitespace-nowrap font-jetbrains text-xs hover:bg-white/5 group"
-        style={{ paddingLeft: `${level * 16 + 8}px` }}
+        className="flex items-center py-1 cursor-pointer text-[#ccc] gap-1 whitespace-nowrap font-jetbrains hover:bg-white/5 group"
+        style={{ paddingLeft: `${level * 16 + 8}px`, fontSize: `${fontSize}px` }}
         onClick={handleClick}
       >
-        <span className="shrink-0 w-3 text-center text-[10px] transition-transform">
+        <span className="shrink-0 w-3 text-center text-[10px] transition-transform text-[#6c7086]">
           {item.isDirectory ? (expanded ? '▼' : '▶') : '\u00A0'}
         </span>
-        <span className="shrink-0 w-4 text-center text-sm">
-          {item.isDirectory ? (expanded ? '📂' : '📁') : '📄'}
+        <span className="shrink-0 flex items-center justify-center" style={{ width: 16 }}>
+          <FileIcon name={item.name} isDirectory={item.isDirectory} isOpen={expanded} size={14} />
         </span>
         <span className="flex-1 overflow-hidden text-ellipsis ml-1">
           {item.name}
@@ -114,6 +116,7 @@ function FileTreeItem({ item, level, onFileClick }: FileTreeItemProps) {
                 item={child}
                 level={level + 1}
                 onFileClick={onFileClick}
+                fontSize={fontSize}
               />
             ))
           )}
@@ -128,7 +131,7 @@ interface FileExplorerProps {
 }
 
 export default function FileExplorer({ projectPath }: FileExplorerProps) {
-  const { fileExplorerOpen, setFileExplorerOpen, openFilePreview, showToast } = useUIStore();
+  const { fileExplorerOpen, setFileExplorerOpen, openFilePreview, showToast, sidebarFontSize } = useUIStore();
   const [rootItems, setRootItems] = useState<FileItem[]>([]);
 
   useEffect(() => {
@@ -229,6 +232,7 @@ export default function FileExplorer({ projectPath }: FileExplorerProps) {
                 item={item}
                 level={0}
                 onFileClick={handleFileClick}
+                fontSize={sidebarFontSize}
               />
             ))}
           </div>

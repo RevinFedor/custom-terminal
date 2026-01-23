@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useUIStore } from '../../../store/useUIStore';
+import MarkdownRenderer from '../../Research/MarkdownRenderer';
 import { useResearchStore, ChatType } from '../../../store/useResearchStore';
 import { useWorkspaceStore } from '../../../store/useWorkspaceStore';
 
@@ -20,7 +21,7 @@ interface GeminiPanelProps {
 
 export default function GeminiPanel({ projectPath, geminiPrompt }: GeminiPanelProps) {
   const { showToast, chatSettings, terminalSelection } = useUIStore();
-  const { createConversation, addMessage, openResearch, getProjectConversations, setActiveConversation, deleteConversation, isLoading, setLoading, setAbortController, pendingResearch, pendingChatType, clearPendingResearch } = useResearchStore();
+  const { createConversation, addMessage, openResearch, getProjectConversations, setActiveConversation, deleteConversation, isLoading, setLoading, setAbortController, pendingResearch, pendingChatType, clearPendingResearch, loadFromDB } = useResearchStore();
   const { activeProjectId } = useWorkspaceStore();
   const conversations = activeProjectId ? getProjectConversations(activeProjectId) : [];
   const [history, setHistory] = useState<HistoryItem[]>([]);
@@ -31,7 +32,11 @@ export default function GeminiPanel({ projectPath, geminiPrompt }: GeminiPanelPr
 
   useEffect(() => {
     loadHistory();
-  }, [projectPath]);
+    // Load full conversations from DB for this project
+    if (activeProjectId && projectPath) {
+      loadFromDB(activeProjectId, projectPath);
+    }
+  }, [projectPath, activeProjectId]);
 
   // Check for pending research from store (survives panel mount/unmount)
   useEffect(() => {
@@ -75,10 +80,10 @@ export default function GeminiPanel({ projectPath, geminiPrompt }: GeminiPanelPr
     console.log('[Research] Prompt:', `"${prompt.slice(0, 50)}..."`);
 
     // IMMEDIATELY create conversation and open panel
-    // Put selectedText first so title shows content, not prompt
-    const userMessage = `${selectedText}\n\n---\n\n_Prompt: ${prompt}_`;
+    // Put prompt first as requested
+    const userMessage = `_Prompt: ${prompt}_\n\n---\n\n${selectedText}`;
     if (activeProjectId) {
-      createConversation(activeProjectId, userMessage, chatType);
+      createConversation(activeProjectId, projectPath, userMessage, chatType);
       openResearch();
       console.log('[Research] Panel opened, loading...');
     }
@@ -156,7 +161,7 @@ export default function GeminiPanel({ projectPath, geminiPrompt }: GeminiPanelPr
 
       // Add assistant response to the conversation
       if (activeProjectId) {
-        addMessage(activeProjectId, 'assistant', responseText);
+        addMessage(activeProjectId, projectPath, 'assistant', responseText);
         console.log('[Research] Added assistant response');
       }
 
@@ -232,9 +237,9 @@ export default function GeminiPanel({ projectPath, geminiPrompt }: GeminiPanelPr
                 Copy
               </button>
             </div>
-            <p className="text-sm text-[#eee] whitespace-pre-wrap leading-relaxed">
-              {expandedItem.response}
-            </p>
+            <div className="text-sm text-[#eee] leading-relaxed">
+              <MarkdownRenderer content={expandedItem.response} />
+            </div>
           </div>
         </div>
       </div>
@@ -332,7 +337,7 @@ export default function GeminiPanel({ projectPath, geminiPrompt }: GeminiPanelPr
                       className="text-[#666] hover:text-[#cc3333] text-xs px-1"
                       onClick={(e) => {
                         e.stopPropagation();
-                        if (activeProjectId) deleteConversation(activeProjectId, conv.id);
+                        if (activeProjectId) deleteConversation(activeProjectId, projectPath, conv.id);
                       }}
                     >
                       ×

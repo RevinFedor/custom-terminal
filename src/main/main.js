@@ -182,7 +182,7 @@ app.on('activate', () => {
 });
 
 // Create new terminal for a tab
-ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd }) => {
+ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initialCommand }) => {
     console.time(`[PERF:main] terminal:create ${tabId}`);
     const shell = process.env.SHELL || '/bin/bash';
     const shellName = path.basename(shell);
@@ -209,7 +209,19 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd }) => {
     }
 
     console.time(`[PERF:main] pty.spawn ${tabId}`);
-    const ptyProcess = pty.spawn(shell, [], {
+
+    // Build shell arguments
+    // If initialCommand provided, run shell with -c to execute command after loading configs
+    let shellArgs = [];
+    if (initialCommand) {
+      // For zsh/bash: -l (login shell) -c "command; exec shell"
+      // This ensures .zshrc/.bashrc loads before command runs, then keeps shell open
+      const escapedCmd = initialCommand.replace(/"/g, '\\"');
+      shellArgs = ['-l', '-c', `${escapedCmd}; exec ${shell}`];
+      console.log(`[terminal:create] Running with initial command: ${initialCommand}`);
+    }
+
+    const ptyProcess = pty.spawn(shell, shellArgs, {
       name: 'xterm-256color',
       cols: cols || 80,
       rows: rows || 24,
@@ -695,6 +707,37 @@ ipcMain.handle('gemini:delete-history', async (event, historyId) => {
     return { success: true };
   } catch (error) {
     console.error('[main] Error deleting Gemini history:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// Research Conversations (Full Chat History)
+ipcMain.handle('research:save-conversation', async (event, { dirPath, conversation }) => {
+  try {
+    projectManager.db.saveResearchConversation(dirPath, conversation);
+    return { success: true };
+  } catch (error) {
+    console.error('[main] Error saving research conversation:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('research:get-conversations', async (event, dirPath) => {
+  try {
+    const conversations = projectManager.db.getResearchConversations(dirPath);
+    return { success: true, data: conversations };
+  } catch (error) {
+    console.error('[main] Error getting research conversations:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('research:delete-conversation', async (event, { dirPath, conversationId }) => {
+  try {
+    projectManager.db.deleteResearchConversation(dirPath, conversationId);
+    return { success: true };
+  } catch (error) {
+    console.error('[main] Error deleting research conversation:', error);
     return { success: false, error: error.message };
   }
 });

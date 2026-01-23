@@ -570,16 +570,12 @@ export default function TabBar({ projectId }: TabBarProps) {
           const hasProcess = result.hasProcess;
           newStatus.set(tabId, hasProcess);
 
-          // If process just ended and tab had a Claude session - clear it
-          // This prevents wasInterrupted from being set again on next shutdown
-          // BUT: Don't clear if wasInterrupted is true (let user decide via overlay)
-          if (hadProcess && !hasProcess) {
-            const tab = workspace.tabs.get(tabId);
-            if (tab?.claudeSessionId && !tab?.wasInterrupted) {
-              console.log('[TabBar] Process ended, clearing Claude session for tab:', tabId);
-              clearClaudeSession(tabId);
-            }
-          }
+          // NOTE: Don't clear Claude session when process ends!
+          // Claude sessions persist on the server and can be continued with `claude -c`
+          // Session should only be cleared when:
+          // - User explicitly starts a NEW session (without -c)
+          // - User closes the tab
+          // Previously this was clearing session on Ctrl+C which was wrong
         } catch {
           newStatus.set(tabId, false);
         }

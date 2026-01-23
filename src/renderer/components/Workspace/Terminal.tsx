@@ -183,6 +183,8 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
   const [isVisible, setIsVisible] = useState(false); // Hide until ready
   const [showScrollButton, setShowScrollButton] = useState(false); // Show "scroll to bottom" button
   const claudeSessionDetected = useRef<string | null>(null); // Track detected Claude session UUID
+  // NOTE: pendingCommand execution moved to main process (pty.spawn with initialCommand)
+  // Shell now starts with command baked in, no need for client-side detection
 
   const terminalFontSize = useUIStore((state) => state.terminalFontSize);
 
@@ -264,6 +266,9 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
       // Instead we use:
       // - Sniper Watcher for 'claude' command (catches new file creation)
       // - Explicit ID setting for 'claude-c' and 'claude-f' commands
+
+      // NOTE: Initial command execution moved to main process (pty.spawn with -c flag)
+      // No need for client-side detection - shell starts with command baked in
 
       // If xterm not yet created, buffer data for later replay
       if (!xtermInstance.current) {
@@ -456,16 +461,8 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
           term.focus();
         }
 
-        // Execute pending command if any (used for fork)
-        const pendingCommand = getTabPendingCommand(tabId);
-        if (pendingCommand) {
-          console.log('[Terminal] Executing pending command:', pendingCommand);
-          // Small delay to ensure PTY is fully ready
-          setTimeout(() => {
-            ipcRenderer.send('terminal:input', tabId, pendingCommand + '\r');
-            clearTabPendingCommand(tabId);
-          }, 200);
-        }
+        // NOTE: Pending command execution moved to handleData
+        // It now waits for first PTY output (= shell ready) instead of arbitrary timeout
       }, 100);
 
       // IPC: Send input to PTY
@@ -909,15 +906,8 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
           setIsVisible(true);
           term.focus();
 
-          // Execute pending command if any (used for fork)
-          const pendingCommand = getTabPendingCommand(tabId);
-          if (pendingCommand) {
-            console.log('[Terminal] Executing pending command:', pendingCommand);
-            setTimeout(() => {
-              ipcRenderer.send('terminal:input', tabId, pendingCommand + '\r');
-              clearTabPendingCommand(tabId);
-            }, 200);
-          }
+          // NOTE: Pending command execution moved to handleData
+          // It now waits for first PTY output (= shell ready) instead of arbitrary timeout
         }, 100);
       };
 

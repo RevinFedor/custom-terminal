@@ -48,7 +48,7 @@ export default function Workspace() {
           {filePreview && <FilePreview />}
 
           {/* Research Sheet */}
-          <ResearchSheet projectId={activeProjectId} />
+          <ResearchSheet projectId={activeProjectId} projectPath={currentProject.path} />
         </div>
 
         {/* Resizer */}

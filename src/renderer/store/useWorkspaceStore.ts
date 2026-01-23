@@ -84,6 +84,7 @@ interface WorkspaceStore {
 
   // Interrupted session handling
   clearInterruptedState: (tabId: string) => void;
+  dismissInterruptedSession: (tabId: string) => void;
   markAllSessionsInterrupted: () => void;
 
   // Immediate save (for shutdown)
@@ -344,12 +345,13 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     };
 
     console.log('[Store] createTab: Creating PTY terminal for:', tabId, 'cwd:', newTab.cwd);
-    // Create terminal
+    // Create terminal (pass initialCommand if provided for immediate execution)
     const { pid } = await ipcRenderer.invoke('terminal:create', {
       tabId,
       cwd: newTab.cwd,
       rows: 24,
-      cols: 80
+      cols: 80,
+      initialCommand: options?.pendingCommand
     });
 
     console.log('[Store] createTab: PTY created with pid:', pid);
@@ -389,12 +391,13 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       wasInterrupted: options?.wasInterrupted
     };
 
-    // Create terminal
+    // Create terminal (pass initialCommand if provided for immediate execution)
     const { pid } = await ipcRenderer.invoke('terminal:create', {
       tabId,
       cwd: newTab.cwd,
       rows: 24,
-      cols: 80
+      cols: 80,
+      initialCommand: options?.pendingCommand
     });
 
     newTab.pid = pid;
@@ -765,6 +768,25 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         // Save to persist the change
         saveTabs(workspace.projectPath, workspace.tabs);
         // Trigger re-render so overlay disappears
+        set({ openProjects: new Map(openProjects) });
+        return;
+      }
+    }
+  },
+
+  // Dismiss interrupted session (Clear interrupted state but KEEP session ID so it appears in lists)
+  dismissInterruptedSession: (tabId) => {
+    const { openProjects } = get();
+
+    for (const [projectId, workspace] of openProjects) {
+      const tab = workspace.tabs.get(tabId);
+      if (tab) {
+        console.log('[Store] Dismissing interrupted overlay for tab (keeping session):', tabId);
+        // Only clear the interruption flag, keep the session ID so it's not "lost"
+        tab.wasInterrupted = false;
+        // Save to database
+        saveTabs(workspace.projectPath, workspace.tabs);
+        // Trigger re-render
         set({ openProjects: new Map(openProjects) });
         return;
       }

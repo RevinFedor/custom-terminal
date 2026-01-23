@@ -1,170 +1,155 @@
 import React, { memo } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
-import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
+import CodeBlock from './CodeBlock';
 
 interface MarkdownRendererProps {
   content: string;
+  className?: string;
 }
 
-function MarkdownRenderer({ content }: MarkdownRendererProps) {
+function MarkdownRenderer({ content, className = '' }: MarkdownRendererProps) {
   return (
-    <ReactMarkdown
-      remarkPlugins={[remarkGfm]}
-      components={{
-        // Code blocks with syntax highlighting (gt-editor style: gray background)
-        code({ node, inline, className, children, ...props }: any) {
-          const match = /language-(\w+)/.exec(className || '');
-          const language = match ? match[1] : '';
+    <div className={`text-[13px] leading-relaxed text-gray-200 ${className}`}>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          // Code blocks
+          code({ node, inline, className, children, ...props }: any) {
+            const match = /language-(\w+)/.exec(className || '');
+            const language = match ? match[1] : '';
+            const value = String(children).replace(/\n$/, '');
 
-          if (!inline && language) {
+            if (!inline && language) {
+              return <CodeBlock language={language} value={value} />;
+            }
+
+            // Block code without language
+            if (!inline) {
+               const isMultiLine = value.includes('\n');
+               
+               if (!isMultiLine) {
+                 // Lightweight render for single-line blocks (often used for filenames/commands)
+                 return (
+                   <div className="my-2">
+                     <code className="px-2 py-1 bg-[#1e1f20] rounded text-[12px] text-[#a8c7fa] font-mono border border-[#333] inline-block" {...props}>
+                       {children}
+                     </code>
+                   </div>
+                 );
+               }
+
+               return (
+                 <pre className="my-3 p-3 rounded-lg bg-[#1a1a1a] border border-[#333] overflow-x-auto text-xs text-gray-300">
+                   <code {...props}>{children}</code>
+                 </pre>
+               );
+            }
+
+            // Inline code
             return (
-              <div className="my-2 rounded-lg overflow-hidden" style={{ background: 'rgba(80, 80, 80, 0.25)' }}>
-                <div className="flex items-center justify-between px-3 py-1.5 text-[10px] text-gray-500" style={{ background: 'rgba(60, 60, 60, 0.4)' }}>
-                  <span>{language}</span>
-                  <button
-                    className="hover:text-gray-300 transition-colors cursor-pointer"
-                    onClick={() => navigator.clipboard.writeText(String(children).replace(/\n$/, ''))}
-                  >
-                    Copy
-                  </button>
-                </div>
-                <SyntaxHighlighter
-                  style={oneDark}
-                  language={language}
-                  PreTag="div"
-                  customStyle={{
-                    margin: 0,
-                    padding: '12px',
-                    fontSize: '12px',
-                    lineHeight: 1.5,
-                    background: 'rgba(80, 80, 80, 0.25)'
-                  }}
-                  {...props}
-                >
-                  {String(children).replace(/\n$/, '')}
-                </SyntaxHighlighter>
+              <code className="px-1.5 py-0.5 bg-[#333] rounded text-[12px] text-accent font-mono" {...props}>
+                {children}
+              </code>
+            );
+          },
+
+          // Paragraphs
+          p({ children }) {
+            return <div className="mb-4 last:mb-0 text-gray-300">{children}</div>;
+          },
+
+          // Headers
+          h1({ children }) {
+            return <h1 className="text-xl font-bold mb-4 mt-6 first:mt-0 text-white pb-2 border-b border-[#333]">{children}</h1>;
+          },
+          h2({ children }) {
+            return <h2 className="text-lg font-bold mb-3 mt-5 first:mt-0 text-white">{children}</h2>;
+          },
+          h3({ children }) {
+            return <h3 className="text-base font-semibold mb-2 mt-4 first:mt-0 text-white">{children}</h3>;
+          },
+          h4({ children }) {
+            return <h4 className="text-sm font-semibold mb-2 mt-4 first:mt-0 text-white">{children}</h4>;
+          },
+
+          // Lists
+          ul({ children }) {
+            return <ul className="list-disc list-outside ml-4 mb-4 space-y-1 marker:text-[#666]">{children}</ul>;
+          },
+          ol({ children }) {
+            return <ol className="list-decimal list-outside ml-4 mb-4 space-y-1 marker:text-[#666]">{children}</ol>;
+          },
+          li({ children }) {
+            return <li className="pl-1">{children}</li>;
+          },
+
+          // Links
+          a({ href, children }) {
+            return (
+              <a
+                href={href}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-blue-400 hover:text-blue-300 underline underline-offset-2 transition-colors"
+              >
+                {children}
+              </a>
+            );
+          },
+
+          // Blockquotes
+          blockquote({ children }) {
+            return (
+              <blockquote className="border-l-4 border-[#444] pl-4 py-1 my-4 bg-[#252525]/50 rounded-r text-gray-400 italic">
+                {children}
+              </blockquote>
+            );
+          },
+
+          // Tables
+          table({ children }) {
+            return (
+              <div className="overflow-x-auto my-4 border border-[#333] rounded-lg">
+                <table className="min-w-full text-left text-xs">{children}</table>
               </div>
             );
+          },
+          thead({ children }) {
+            return <thead className="bg-[#252525] text-gray-300 font-medium">{children}</thead>;
+          },
+          tbody({ children }) {
+            return <tbody className="divide-y divide-[#333]">{children}</tbody>;
+          },
+          tr({ children }) {
+            return <tr className="hover:bg-[#2a2a2a] transition-colors">{children}</tr>;
+          },
+          th({ children }) {
+            return <th className="px-4 py-3 font-semibold">{children}</th>;
+          },
+          td({ children }) {
+            return <td className="px-4 py-2.5 text-gray-400">{children}</td>;
+          },
+
+          // Horizontal rule
+          hr() {
+            return <hr className="my-6 border-[#333]" />;
+          },
+
+          // Strong/Bold
+          strong({ children }) {
+            return <strong className="font-semibold text-white">{children}</strong>;
+          },
+
+          // Emphasis/Italic
+          em({ children }) {
+            return <em className="italic text-gray-300">{children}</em>;
           }
-
-          // Inline code or code without language (also gray bg)
-          if (!inline) {
-            return (
-              <pre className="my-2 p-3 rounded-lg overflow-x-auto text-xs" style={{ background: 'rgba(80, 80, 80, 0.25)' }}>
-                <code className="text-gray-300" {...props}>
-                  {children}
-                </code>
-              </pre>
-            );
-          }
-
-          // Inline code
-          return (
-            <code className="px-1.5 py-0.5 bg-[#444] rounded text-[12px] text-[#e0e0e0]" {...props}>
-              {children}
-            </code>
-          );
-        },
-
-        // Paragraphs - avoid nesting block elements
-        p({ children, node }) {
-          // Check if children contain block-level elements (pre, div, etc.)
-          const hasBlockChild = node?.children?.some((child: any) =>
-            child.tagName === 'pre' || child.tagName === 'div'
-          );
-          // If has block children, render as div instead of p
-          if (hasBlockChild) {
-            return <div className="mb-3 last:mb-0">{children}</div>;
-          }
-          return <p className="mb-3 last:mb-0">{children}</p>;
-        },
-
-        // Headers
-        h1({ children }) {
-          return <h1 className="text-lg font-bold mb-3 mt-4 first:mt-0">{children}</h1>;
-        },
-        h2({ children }) {
-          return <h2 className="text-base font-bold mb-2 mt-3 first:mt-0">{children}</h2>;
-        },
-        h3({ children }) {
-          return <h3 className="text-sm font-bold mb-2 mt-3 first:mt-0">{children}</h3>;
-        },
-
-        // Lists
-        ul({ children }) {
-          return <ul className="list-disc list-inside mb-3 space-y-1">{children}</ul>;
-        },
-        ol({ children }) {
-          return <ol className="list-decimal list-inside mb-3 space-y-1">{children}</ol>;
-        },
-        li({ children }) {
-          return <li className="text-gray-200">{children}</li>;
-        },
-
-        // Links
-        a({ href, children }) {
-          return (
-            <a
-              href={href}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-blue-400 hover:text-blue-300 underline"
-            >
-              {children}
-            </a>
-          );
-        },
-
-        // Blockquotes
-        blockquote({ children }) {
-          return (
-            <blockquote className="border-l-2 border-gray-500 pl-3 my-2 text-gray-400 italic">
-              {children}
-            </blockquote>
-          );
-        },
-
-        // Tables
-        table({ children }) {
-          return (
-            <div className="overflow-x-auto my-3">
-              <table className="min-w-full border-collapse text-xs">{children}</table>
-            </div>
-          );
-        },
-        th({ children }) {
-          return (
-            <th className="border border-[#444] bg-[#333] px-3 py-1.5 text-left font-medium">
-              {children}
-            </th>
-          );
-        },
-        td({ children }) {
-          return (
-            <td className="border border-[#444] px-3 py-1.5">{children}</td>
-          );
-        },
-
-        // Horizontal rule
-        hr() {
-          return <hr className="my-4 border-[#444]" />;
-        },
-
-        // Strong/Bold
-        strong({ children }) {
-          return <strong className="font-semibold text-white">{children}</strong>;
-        },
-
-        // Emphasis/Italic
-        em({ children }) {
-          return <em className="italic text-gray-300">{children}</em>;
-        }
-      }}
-    >
-      {content}
-    </ReactMarkdown>
+        }}
+      >
+        {content}
+      </ReactMarkdown>
+    </div>
   );
 }
 
