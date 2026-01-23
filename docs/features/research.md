@@ -4,26 +4,21 @@
 Встроенный AI-ассистент, работающий непосредственно в контексте терминала. Позволяет исследовать ошибки, искать решения на Reddit и вести диалог с современными моделями Gemini без переключения окон.
 
 ## Behavior Specs
-- **Вызов:** `Cmd + Shift + R` открывает панель. Основной способ активации — правый клик в терминале → **"Искать в AI"**.
-    - **Надежный запуск:** Используется система `pendingResearch` (флаг в Store), что гарантирует старт поиска даже если панель была закрыта в момент вызова. См. `knowledge/fix-gemini-search.md`.
-- **Контекстное управление:**
-    - Панель открывается **мгновенно** сразу после инициации запроса.
-- **Инструменты (Tools):**
-    - **Google Search:** Доступен для моделей серии `gemini-3-*` и `gemini-2.5-*`. Позволяет модели искать актуальную информацию в интернете.
-- **Thinking Level (Gemini 3):**
-- **Markdown и код:**
-    - Полная поддержка Markdown через `react-markdown`.
-    - Подсветка синтаксиса кода с темой `oneDark`.
-    - Решен конфликт гидратации (вложенность `<pre>` в `<p>`). См. `knowledge/fix-markdown-hydration.md`.
+- **Вызов:** `Cmd + Shift + R` открывает панель. 
+- **Режимы (Modes):**
+    - **🔍 Research:** Использует `gemini-2.0-flash`. Оптимизирован для быстрого поиска ответов и анализа кода.
+    - **📋 Compact:** Использует `gemini-3-flash` с настройкой `Thinking: HIGH`. Предназначен для глубокого анализа сложных проблем. Вызывается через контекстное меню терминала.
+- **Инструменты (Tools):** Google Search доступен для моделей серии `3` и `2.5`.
+- **Markdown и код (gt-editor style):**
+    - Блоки кода теперь имеют серый полупрозрачный фон `rgba(80, 80, 80, 0.25)`.
+    - Поддержка `remark-gfm` и `syntax-highlighter` с темой `oneDark`.
+    - Кнопка **Copy** в хедере чата позволяет мгновенно скопировать последний ответ ассистента.
+- **Авто-переключение:** При активации поиска через контекстное меню терминала, правая панель автоматически переключается на вкладку **AI**.
 - **Система чатов (Conversations):**
-    - Каждый запуск создает новую сессию. Заголовок чата формируется из выделенного текста (промпт уходит в конец сообщения).
-    - Чаты отображаются в правой панели (вкладка AI) для быстрого переключения.
+    - Данные сохраняются в `localStorage`. Каждому чату присваивается тип (`research` или `compact`).
 
 ## Code Map
-- **UI:** `src/renderer/components/Research/ResearchSheet.tsx` — хедер с выбором модели, Thinking Level и настройками.
-- **Rendering:** `src/renderer/components/Research/MarkdownRenderer.tsx` — компонент для отрисовки ответов с подсветкой.
-- **Chat:** `src/renderer/components/Research/ChatArea.tsx` — виртуализированный список.
-- **Input:** `src/renderer/components/Research/ResearchInput.tsx` — управление AbortController, авто-высота инпута и логика отмены.
-- **Activation Logic:** `src/renderer/store/useResearchStore.ts` — флаги `pendingResearch` и метод `triggerResearch()` для синхронизации Context Menu и UI Panel.
-- **SDK:** Используется прямой Fetch к REST API (v1beta) для гибкого управления `tools` в зависимости от модели.
-- **Persistence:** Данные сохраняются в `localStorage` под ключом `noted-terminal-research-v2`.
+- **UI:** `src/renderer/components/Research/ResearchSheet.tsx` — логика переключения вкладок и кнопка копирования.
+- **Logic:** `src/renderer/components/Workspace/panels/NotesPanel.tsx` — слушает `pendingResearch` для авто-переключения вкладок.
+- **Rendering:** `src/renderer/components/Research/MarkdownRenderer.tsx` — обновленные стили для `code` и `pre`.
+- **Store:** `src/renderer/store/useResearchStore.ts` — хранение типа чата.

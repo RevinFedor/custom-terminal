@@ -535,7 +535,8 @@ export default function TabBar({ projectId }: TabBarProps) {
     setTabColor,
     toggleTabUtility,
     reorderInZone,
-    moveTabToZone
+    moveTabToZone,
+    clearClaudeSession
   } = useWorkspaceStore();
   const { projects } = useProjectsStore();
   const tabsFontSize = useUIStore((state) => state.tabsFontSize);
@@ -565,7 +566,20 @@ export default function TabBar({ projectId }: TabBarProps) {
       tabIds.map(async (tabId) => {
         try {
           const result = await ipcRenderer.invoke('terminal:hasRunningProcess', tabId);
-          newStatus.set(tabId, result.hasProcess);
+          const hadProcess = processStatus.get(tabId);
+          const hasProcess = result.hasProcess;
+          newStatus.set(tabId, hasProcess);
+
+          // If process just ended and tab had a Claude session - clear it
+          // This prevents wasInterrupted from being set again on next shutdown
+          // BUT: Don't clear if wasInterrupted is true (let user decide via overlay)
+          if (hadProcess && !hasProcess) {
+            const tab = workspace.tabs.get(tabId);
+            if (tab?.claudeSessionId && !tab?.wasInterrupted) {
+              console.log('[TabBar] Process ended, clearing Claude session for tab:', tabId);
+              clearClaudeSession(tabId);
+            }
+          }
         } catch {
           newStatus.set(tabId, false);
         }
@@ -573,7 +587,7 @@ export default function TabBar({ projectId }: TabBarProps) {
     );
 
     setProcessStatus(newStatus);
-  }, [workspace]);
+  }, [workspace, processStatus, clearClaudeSession]);
 
   // Polling effect
   useEffect(() => {

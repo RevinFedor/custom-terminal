@@ -7,18 +7,25 @@
 Управление осуществляется через **InfoPanel** (правая панель) и автоматический перехват ввода.
 
 ### Команды и UI-кнопки (⑂):
-- `claude`: Запуск новой сессии. Включает [Sniper Watcher](../../knowledge/fix-claude-id-capture.md). Кнопка в InfoPanel всегда активна.
-- `claude-c`: Продолжить сессию. Кнопка активна только при наличии захваченного UUID.
-- `claude-f <UUID>`: (Smart Fork) Создает полную копию сессии. Кнопка **⑂ Fork** в InfoPanel берет UUID из буфера обмена, валидирует его (Regex) и автоматически инициирует форк.
+- `claude`: Запуск новой сессии. Включает [Sniper Watcher](../../knowledge/fix-claude-id-capture.md). 
+- `claude-c`: Продолжить сессию. 
+- `⑂ Fork в новую вкладку`: (Smart Fork) Создает копию текущей сессии Claude. Создает новую вкладку справа в том же CWD и автоматически выполняет `claude-f <UUID>`.
+- `claude-f <UUID>`: (Команда) Находит сессию по указанному UUID во ВСЕХ директориях `~/.claude/projects/` и запускает форк в текущем терминале.
+
+### Interrupted Sessions (⚠️)
+Система отслеживает статус завершения работы Claude CLI.
+- **Детекция:** Если приложение закрывается (или крэшится) при активном процессе Claude, вкладке присваивается статус `wasInterrupted = true`.
+- **Overlay:** При следующем открытии такой вкладки поверх терминала отображается полупрозрачный блюр-оверлей с модальным окном "Сессия была прервана".
+- **Действия:**
+    - Кнопка **"Продолжить сессию"** запускает `claude --resume <sessionId>` и снимает оверлей.
+    - Клик на фон просто снимает оверлей, позволяя работать в терминале.
+- **Очистка:** Если процесс завершился нормально (через Ctrl+C или `exit`), статус `wasInterrupted` и `claudeSessionId` автоматически очищаются через поллинг статуса процесса.
 
 ### Claude Runner (Main Process):
-Команды, запущенные через кнопки UI, проходят через выделенный IPC-канал `claude:run-command`. Это гарантирует корректное выполнение (исключает `command not found`) и позволяет Main-процессу предварительно подготовить окружение (например, скопировать файлы для форка).
-
-### Session Watcher:
-Main-процесс активно следит за директорией `~/.claude/projects/` на предмет появления новых файлов `.jsonl`. При обнаружении — автоматически отправляет событие `claude:session-detected` в Renderer для обновления UI.
+Команды проходят через IPC-канал `claude:run-command`. Main-процесс при форке теперь сканирует все подпапки в `~/.claude/projects/`, что позволяет форкать сессии, созданные в других проектах или через внешние терминалы.
 
 ## Code Map
-- **Renderer (UI):** `src/renderer/components/Workspace/panels/InfoPanel.tsx` — интерактивные кнопки управления сессиями.
-- **Renderer (Logic):** `src/renderer/components/Workspace/TerminalArea.tsx` — обработка события `claude:fork-complete` и создание новых табов.
-- **Main (Runner):** `src/main/main.js` — IPC-хендлер `claude:run-command`, логика файлового копирования и вочер сессий.
-- **State:** `useWorkspaceStore.ts` — хранение и персистентность `claudeSessionId`.
+- **Renderer (UI):** `src/renderer/components/Workspace/TerminalArea.tsx` — рендеринг `InterruptedOverlay` через `Layering Pattern`.
+- **Logic:** `src/renderer/components/Workspace/TabBar.tsx` — метод `checkProcessStatus` очищает сессию при нормальном выходе.
+- **Main (Runner):** `src/main/main.js` — IPC-хендлер `claude:fork-session-file` с логикой глобального поиска файлов `.jsonl`.
+- **State:** `useWorkspaceStore.ts` — хранение `wasInterrupted` в SQLite.
