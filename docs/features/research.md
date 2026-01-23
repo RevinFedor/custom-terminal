@@ -1,24 +1,29 @@
 # Feature: Research Panel (AI Assistant)
 
 ## Intro
-Встроенный AI-ассистент, работающий непосредственно в контексте терминала. Позволяет исследовать ошибки, искать решения на Reddit и вести диалог с современными моделями Gemini без переключения окон.
+Встроенный AI-ассистент, работающий в контексте терминала. Оптимизирован для быстрого поиска решений и глубокого анализа кода.
+
+## User Flow: Исследование проблемы
+1. **Триггер:** Пользователь видит ошибку в терминале, выделяет её мышью.
+2. **Активация:** Правый клик -> "Research Selection". 
+   - Правая панель (InfoPanel) автоматически переключается на вкладку **AI**.
+   - Используется [State-driven триггер](knowledge/fix-gemini-search.md), чтобы панель открылась и сразу начала поиск.
+3. **Ожидание:** В списке чатов слева и в самом чате отображаются анимированные лоадеры вместо статических иконок.
+4. **Анализ:** Ответ рендерится с поддержкой Markdown. 
+   - Inline-код отображается корректно. См. `knowledge/fix-markdown-inline-code.md`.
+   - Блоки кода имеют кнопку Copy.
+5. **Итерация:** 
+   - Если ответ не помог, пользователь нажимает **Retry** (липкая кнопка в конце сообщения). Хвост истории удаляется, и запрос отправляется снова.
+   - Ненужные сообщения можно удалить кнопкой **Delete**.
 
 ## Behavior Specs
-- **Вызов:** `Cmd + Shift + R` открывает панель. 
 - **Режимы (Modes):**
-    - **🔍 Research:** Использует `gemini-2.0-flash`. Оптимизирован для быстрого поиска ответов и анализа кода.
-    - **📋 Compact:** Использует `gemini-3-flash` с настройкой `Thinking: HIGH`. Предназначен для глубокого анализа сложных проблем. Вызывается через контекстное меню терминала.
-- **Инструменты (Tools):** Google Search доступен для моделей серии `3` и `2.5`.
-- **Markdown и код (gt-editor style):**
-    - Блоки кода теперь имеют серый полупрозрачный фон `rgba(80, 80, 80, 0.25)`.
-    - Поддержка `remark-gfm` и `syntax-highlighter` с темой `oneDark`.
-    - Кнопка **Copy** в хедере чата позволяет мгновенно скопировать последний ответ ассистента.
-- **Авто-переключение:** При активации поиска через контекстное меню терминала, правая панель автоматически переключается на вкладку **AI**.
-- **Система чатов (Conversations):**
-    - Данные сохраняются в `localStorage`. Каждому чату присваивается тип (`research` или `compact`).
+    - **🔍 Research:** `gemini-2.0-flash`.
+    - **📋 Compact:** `gemini-3-flash` (Thinking: HIGH).
+- **Tools:** Автоматическая активация Google Search для моделей серии 3. См. `knowledge/fix-gemini-search.md`.
+- **UI Stability:** Ответы рендерятся через `react-virtuoso` для плавной прокрутки. См. `knowledge/fix-markdown-hydration.md`.
 
 ## Code Map
-- **UI:** `src/renderer/components/Research/ResearchSheet.tsx` — логика переключения вкладок и кнопка копирования.
-- **Logic:** `src/renderer/components/Workspace/panels/NotesPanel.tsx` — слушает `pendingResearch` для авто-переключения вкладок.
-- **Rendering:** `src/renderer/components/Research/MarkdownRenderer.tsx` — обновленные стили для `code` и `pre`.
-- **Store:** `src/renderer/store/useResearchStore.ts` — хранение типа чата.
+- **UI:** `src/renderer/components/Research/ChatArea.tsx` — кнопки Retry/Delete.
+- **Rendering:** `src/renderer/components/Research/MarkdownRenderer.tsx` — фикс inline-кода.
+- **Store:** `src/renderer/store/useResearchStore.ts` — флаг `pendingResearch`.
