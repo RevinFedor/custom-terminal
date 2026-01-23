@@ -7,6 +7,7 @@ import ResearchInput from './ResearchInput';
 
 interface ResearchSheetProps {
   projectId: string;
+  projectPath: string;
 }
 
 // Chat type display names
@@ -16,7 +17,6 @@ const CHAT_TYPE_LABELS: Record<ChatType, string> = {
 };
 
 const AI_MODELS = [
-  { value: 'gemini-2.0-flash', label: 'Gemini 2.0 Flash' },
   { value: 'gemini-3-flash-preview', label: 'Gemini 3 Flash' },
   { value: 'gemini-3-pro-preview', label: 'Gemini 3 Pro' }
 ] as const;
@@ -28,7 +28,7 @@ const THINKING_LEVELS = [
   { value: 'HIGH', label: 'High' }
 ] as const;
 
-export default function ResearchSheet({ projectId }: ResearchSheetProps) {
+export default function ResearchSheet({ projectId, projectPath }: ResearchSheetProps) {
   const { isOpen, closeResearch, getActiveConversation, deleteConversation, pendingChatType } = useResearchStore();
   const { chatSettings, setChatSettings, showToast } = useUIStore();
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -261,7 +261,7 @@ export default function ResearchSheet({ projectId }: ResearchSheetProps) {
                 )}
                 {conversation && (
                   <button
-                    onClick={() => deleteConversation(projectId, conversation.id)}
+                    onClick={() => deleteConversation(projectId, projectPath, conversation.id)}
                     style={{
                       fontSize: '11px',
                       color: '#666',
@@ -298,7 +298,7 @@ export default function ResearchSheet({ projectId }: ResearchSheetProps) {
 
             {/* Chat Area */}
             <div style={{ flex: 1, overflow: 'hidden', minHeight: 0 }}>
-              <ChatArea projectId={projectId} />
+              <ChatArea projectId={projectId} projectPath={projectPath} />
             </div>
 
             {/* Input Area */}

@@ -26,16 +26,7 @@ export default defineConfig({
       }
     }
   },
-  preload: {
-    build: {
-      outDir: 'dist/preload',
-      lib: {
-        entry: resolve(__dirname, 'src/preload/index.js'),
-        formats: ['cjs']
-      }
-    }
-  },
-  renderer: {
+renderer: {
     // Renderer process (React app)
     root: '.',
     build: {

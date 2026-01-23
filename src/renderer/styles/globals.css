@@ -4,6 +4,109 @@
 /* Import Tailwind */
 @import '../../../output.css';
 
+/* ============================================
+   Catppuccin Mocha Theme Variables
+   Copied from gt-editor
+   ============================================ */
+:root {
+  --bg-base: #1e1e2e;
+  --bg-surface: #181825;
+  --bg-overlay: #313244;
+  --text: #cdd6f4;
+  --text-muted: #6c7086;
+  --accent: #89b4fa;
+  --border: #45475a;
+
+  /* Extended palette */
+  --red: #f38ba8;
+  --green: #a6e3a1;
+  --yellow: #f9e2af;
+  --purple: #cba6f7;
+  --pink: #f5c2e7;
+  --teal: #94e2d5;
+}
+
+/* ============================================
+   Markdown Styles (from gt-editor)
+   ============================================ */
+
+/* Inline formatting */
+.md-bold {
+  color: #ffa348;
+  font-weight: bold;
+}
+
+.md-italic {
+  color: #69dbdb;
+  font-style: italic;
+}
+
+.md-strike {
+  color: #868e96;
+  text-decoration: line-through;
+}
+
+.md-code {
+  color: #50fa7b;
+  background-color: rgba(80, 80, 80, 0.4);
+  border-radius: 3px;
+  padding: 1px 4px;
+  font-family: "SF Mono", "Fira Code", monospace;
+}
+
+/* Headings */
+.md-h1 { color: #c678dd; font-size: 1.5em; font-weight: bold; }
+.md-h2 { color: #b197fc; font-size: 1.3em; font-weight: bold; }
+.md-h3 { color: #a78bfa; font-size: 1.15em; font-weight: bold; }
+.md-h4 { color: #9775fa; font-size: 1.1em; font-weight: bold; }
+.md-h5 { color: #8b5cf6; font-weight: bold; }
+.md-h6 { color: #7c3aed; font-weight: bold; }
+
+/* Code blocks */
+.md-code-block {
+  background: rgba(80, 80, 80, 0.25);
+  border-radius: 6px;
+  padding: 12px;
+  overflow-x: auto;
+}
+
+/* Horizontal rule */
+.md-hr {
+  height: 1px;
+  background: rgba(255, 255, 255, 0.3);
+  margin: 8px 0;
+  border: none;
+}
+
+/* Hidden markup (for concealed markdown symbols) */
+.cm-hidden-markup {
+  display: none !important;
+}
+
+/* Horizontal rule widget */
+.cm-horizontal-rule {
+  display: block;
+  height: 1px;
+  background: rgba(255, 255, 255, 0.3);
+  margin: 8px 0;
+  width: 100%;
+}
+
+/* Code block lines */
+.cm-code-block-line {
+  background: rgba(80, 80, 80, 0.25) !important;
+}
+
+.cm-code-block-start {
+  border-top-left-radius: 6px;
+  border-top-right-radius: 6px;
+}
+
+.cm-code-block-end {
+  border-bottom-left-radius: 6px;
+  border-bottom-right-radius: 6px;
+}
+
 /* React-specific styles */
 #react-root {
   width: 100%;

@@ -15,7 +15,7 @@ const { ipcRenderer } = window.require('electron');
 function App() {
   const { view, showDashboard, openProject, openProjects, activeProjectId, closeProject, createTab, createTabAfterCurrent, closeTab, getActiveProject, restoreSession } = useWorkspaceStore();
   const { projects, loadProjects } = useProjectsStore();
-  const { toggleFileExplorer, closeFilePreview, filePreview, showToast, incrementTerminalFontSize, decrementTerminalFontSize } = useUIStore();
+  const { toggleFileExplorer, closeFilePreview, filePreview, showToast, incrementAllFontSizes, decrementAllFontSizes } = useUIStore();
   const { toggleResearch } = useResearchStore();
   const projectTabsFontSize = useUIStore((s) => s.projectTabsFontSize);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -129,17 +129,17 @@ function App() {
         return;
       }
 
-      // Cmd+= (plus) - Increase terminal font size
+      // Cmd+= (plus) - Increase ALL font sizes (gt-editor style)
       if (e.metaKey && (e.code === 'Equal' || e.code === 'NumpadAdd')) {
         e.preventDefault();
-        incrementTerminalFontSize();
+        incrementAllFontSizes();
         return;
       }
 
-      // Cmd+- (minus) - Decrease terminal font size
+      // Cmd+- (minus) - Decrease ALL font sizes (gt-editor style)
       if (e.metaKey && (e.code === 'Minus' || e.code === 'NumpadSubtract')) {
         e.preventDefault();
-        decrementTerminalFontSize();
+        decrementAllFontSizes();
         return;
       }
 
@@ -195,7 +195,7 @@ function App() {
       window.removeEventListener('keydown', handleKeyDown);
       ipcRenderer.removeListener('context-menu-command', handleContextMenuCommand);
     };
-  }, [view, activeProjectId, filePreview, incrementTerminalFontSize, decrementTerminalFontSize, toggleResearch]);
+  }, [view, activeProjectId, filePreview, incrementAllFontSizes, decrementAllFontSizes, toggleResearch]);
 
   const openProjectsList = Array.from(openProjects.entries());
 

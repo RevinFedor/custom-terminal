@@ -147,6 +147,22 @@ class DatabaseManager {
       CREATE INDEX IF NOT EXISTS idx_session_deployments_session ON session_deployments(session_id);
     `);
 
+    // Research Conversations table (JSON storage for full chat history)
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS research_conversations (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        title TEXT,
+        type TEXT DEFAULT 'research',
+        messages_json TEXT NOT NULL,
+        created_at INTEGER DEFAULT (strftime('%s', 'now')),
+        updated_at INTEGER DEFAULT (strftime('%s', 'now')),
+        FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+      )
+    `);
+    
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_research_conversations_project ON research_conversations(project_id);`);
+
     // App state table (for storing session, settings, etc.)
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS app_state (
@@ -681,6 +697,61 @@ class DatabaseManager {
 
     const tab = tabs[tabIndex];
     return tab.visual_snapshot;
+  }
+
+  // ========== RESEARCH CONVERSATIONS ==========
+
+  saveResearchConversation(projectPath, conversation) {
+    const normalizedPath = path.resolve(projectPath);
+    const project = this.db.prepare('SELECT id FROM projects WHERE path = ?').get(normalizedPath);
+    if (!project) return;
+
+    this.db.prepare(`
+      INSERT INTO research_conversations (id, project_id, title, type, messages_json, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        title = excluded.title,
+        messages_json = excluded.messages_json,
+        updated_at = excluded.updated_at
+    `).run(
+      conversation.id,
+      project.id,
+      conversation.title,
+      conversation.type,
+      JSON.stringify(conversation.messages),
+      Math.floor(conversation.createdAt / 1000), // Store as seconds for consistency
+      Math.floor(conversation.updatedAt / 1000)
+    );
+  }
+
+  getResearchConversations(projectPath) {
+    const normalizedPath = path.resolve(projectPath);
+    const project = this.db.prepare('SELECT id FROM projects WHERE path = ?').get(normalizedPath);
+    if (!project) return [];
+
+    const rows = this.db.prepare(`
+      SELECT * FROM research_conversations
+      WHERE project_id = ?
+      ORDER BY updated_at DESC
+    `).all(project.id);
+
+    return rows.map(row => ({
+      id: row.id,
+      title: row.title,
+      type: row.type,
+      messages: JSON.parse(row.messages_json),
+      createdAt: row.created_at * 1000, // Convert back to ms
+      updatedAt: row.updated_at * 1000
+    }));
+  }
+
+  deleteResearchConversation(projectPath, conversationId) {
+    const normalizedPath = path.resolve(projectPath);
+    const project = this.db.prepare('SELECT id FROM projects WHERE path = ?').get(normalizedPath);
+    if (!project) return;
+
+    this.db.prepare('DELETE FROM research_conversations WHERE id = ? AND project_id = ?')
+      .run(conversationId, project.id);
   }
 
   // ========== CLEANUP ==========

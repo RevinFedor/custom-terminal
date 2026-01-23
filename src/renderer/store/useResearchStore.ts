@@ -38,10 +38,10 @@ interface ResearchStore {
   activeConversationId: Record<string, string | null>;
 
   // Create new conversation and return its id
-  createConversation: (projectId: string, firstUserMessage: string, type?: ChatType) => string;
+  createConversation: (projectId: string, projectPath: string, firstUserMessage: string, type?: ChatType) => string;
 
   // Add message to active conversation
-  addMessage: (projectId: string, role: 'user' | 'assistant', content: string) => void;
+  addMessage: (projectId: string, projectPath: string, role: 'user' | 'assistant', content: string) => void;
 
   // Get all conversations for project
   getProjectConversations: (projectId: string) => Conversation[];
@@ -53,7 +53,10 @@ interface ResearchStore {
   setActiveConversation: (projectId: string, conversationId: string | null) => void;
 
   // Delete conversation
-  deleteConversation: (projectId: string, conversationId: string) => void;
+  deleteConversation: (projectId: string, projectPath: string, conversationId: string) => void;
+
+  // Edit message (truncates history after this message)
+  editMessage: (projectId: string, projectPath: string, messageId: string, newContent: string) => void;
 
   // Loading state
   isLoading: boolean;
@@ -63,9 +66,12 @@ interface ResearchStore {
   abortController: AbortController | null;
   setAbortController: (controller: AbortController | null) => void;
   cancelRequest: () => void;
+
+  // Sync with DB
+  loadFromDB: (projectId: string, projectPath: string) => Promise<void>;
 }
 
-// Load from localStorage
+// Load from localStorage (Legacy fallback / Cache)
 const loadData = () => {
   try {
     const saved = localStorage.getItem('noted-terminal-research-v2');
@@ -84,6 +90,26 @@ const saveData = (conversations: Record<string, Record<string, Conversation>>, a
     localStorage.setItem('noted-terminal-research-v2', JSON.stringify({ conversations, activeConversationId }));
   } catch (e) {
     console.error('Failed to save research data:', e);
+  }
+};
+
+// Helper to save specific conversation to DB
+const saveToDB = async (projectPath: string, conversation: Conversation) => {
+  try {
+    const { ipcRenderer } = window.require('electron');
+    await ipcRenderer.invoke('research:save-conversation', { dirPath: projectPath, conversation });
+  } catch (e) {
+    console.error('Failed to save conversation to DB:', e);
+  }
+};
+
+// Helper to delete from DB
+const deleteFromDB = async (projectPath: string, conversationId: string) => {
+  try {
+    const { ipcRenderer } = window.require('electron');
+    await ipcRenderer.invoke('research:delete-conversation', { dirPath: projectPath, conversationId });
+  } catch (e) {
+    console.error('Failed to delete conversation from DB:', e);
   }
 };
 
@@ -106,7 +132,55 @@ export const useResearchStore = create<ResearchStore>((set, get) => ({
   conversations: initialData.conversations || {},
   activeConversationId: initialData.activeConversationId || {},
 
-  createConversation: (projectId, firstUserMessage, type = 'research') => {
+  loadFromDB: async (projectId, projectPath) => {
+    try {
+      const { ipcRenderer } = window.require('electron');
+      const result = await ipcRenderer.invoke('research:get-conversations', projectPath);
+      
+      if (result.success && Array.isArray(result.data)) {
+        const dbConversations = result.data;
+        
+        // Convert array to record
+        const convRecord: Record<string, Conversation> = {};
+        dbConversations.forEach((conv: Conversation) => {
+          convRecord[conv.id] = conv;
+        });
+
+        set((state) => {
+          const existingProjectConvs = state.conversations[projectId] || {};
+          
+          // Merge DB conversations into existing ones (DB takes precedence if ID exists)
+          const mergedProjectConvs = {
+             ...existingProjectConvs,
+             ...convRecord
+          };
+
+          const newConversations = {
+            ...state.conversations,
+            [projectId]: mergedProjectConvs
+          };
+          
+          // Determine active ID if not set
+          let newActiveId = state.activeConversationId[projectId];
+          if (!newActiveId && dbConversations.length > 0) {
+             newActiveId = dbConversations[0].id; // Most recent due to SQL sorting
+          }
+
+          const newActiveIds = {
+            ...state.activeConversationId,
+            [projectId]: newActiveId
+          };
+
+          saveData(newConversations, newActiveIds);
+          return { conversations: newConversations, activeConversationId: newActiveIds };
+        });
+      }
+    } catch (e) {
+      console.error('Error loading conversations from DB:', e);
+    }
+  },
+
+  createConversation: (projectId, projectPath, firstUserMessage, type = 'research') => {
     const convId = `conv-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
     const now = Date.now();
 
@@ -138,6 +212,10 @@ export const useResearchStore = create<ResearchStore>((set, get) => ({
         [projectId]: convId
       };
       saveData(newConversations, newActiveIds);
+      
+      // Save to DB
+      saveToDB(projectPath, conversation);
+
       return {
         conversations: newConversations,
         activeConversationId: newActiveIds
@@ -147,7 +225,7 @@ export const useResearchStore = create<ResearchStore>((set, get) => ({
     return convId;
   },
 
-  addMessage: (projectId, role, content) => {
+  addMessage: (projectId, projectPath, role, content) => {
     const state = get();
     const activeId = state.activeConversationId[projectId];
     if (!activeId) {
@@ -180,6 +258,10 @@ export const useResearchStore = create<ResearchStore>((set, get) => ({
         }
       };
       saveData(newConversations, state.activeConversationId);
+      
+      // Save to DB
+      saveToDB(projectPath, updatedConv);
+
       return { conversations: newConversations };
     });
   },
@@ -207,7 +289,7 @@ export const useResearchStore = create<ResearchStore>((set, get) => ({
     });
   },
 
-  deleteConversation: (projectId, conversationId) => {
+  deleteConversation: (projectId, projectPath, conversationId) => {
     set((state) => {
       const projectConvs = { ...state.conversations[projectId] };
       delete projectConvs[conversationId];
@@ -230,10 +312,59 @@ export const useResearchStore = create<ResearchStore>((set, get) => ({
       };
 
       saveData(newConversations, newActiveIds);
+      
+      // Delete from DB
+      deleteFromDB(projectPath, conversationId);
+      
       return {
         conversations: newConversations,
         activeConversationId: newActiveIds
       };
+    });
+  },
+
+  editMessage: (projectId, projectPath, messageId, newContent) => {
+    set((state) => {
+      const activeId = state.activeConversationId[projectId];
+      if (!activeId) return state;
+
+      const conv = state.conversations[projectId]?.[activeId];
+      if (!conv) return state;
+
+      const msgIndex = conv.messages.findIndex(m => m.id === messageId);
+      if (msgIndex === -1) return state;
+
+      // Keep messages up to the edited one (inclusive)
+      // Actually, we replace the content of the target message, and remove everything AFTER it.
+      // Because we will probably trigger a re-fetch immediately after this in the UI.
+      
+      const updatedMessages = conv.messages.slice(0, msgIndex + 1);
+      updatedMessages[msgIndex] = {
+        ...updatedMessages[msgIndex],
+        content: newContent,
+        timestamp: Date.now()
+      };
+
+      const updatedConv: Conversation = {
+        ...conv,
+        messages: updatedMessages,
+        updatedAt: Date.now()
+      };
+
+      const newConversations = {
+        ...state.conversations,
+        [projectId]: {
+          ...state.conversations[projectId],
+          [activeId]: updatedConv
+        }
+      };
+
+      saveData(newConversations, state.activeConversationId);
+      
+      // Save to DB
+      saveToDB(projectPath, updatedConv);
+      
+      return { conversations: newConversations };
     });
   },
 
