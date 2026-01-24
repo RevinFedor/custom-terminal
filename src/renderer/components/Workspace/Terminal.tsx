@@ -124,6 +124,8 @@ const executePendingAction = (tabId: string, pendingAction: PendingAction) => {
   switch (pendingAction.type) {
     case 'claude-fork':
       if (pendingAction.sessionId) {
+        // Set tab color/type before executing
+        getSetTabCommandType()(tabId, 'claude');
         ipcRenderer.send('claude:run-command', {
           tabId,
           command: 'claude-f',
@@ -134,6 +136,8 @@ const executePendingAction = (tabId: string, pendingAction: PendingAction) => {
 
     case 'claude-continue':
       if (pendingAction.sessionId) {
+        // Set tab color/type before executing
+        getSetTabCommandType()(tabId, 'claude');
         ipcRenderer.send('claude:run-command', {
           tabId,
           command: 'claude-c',

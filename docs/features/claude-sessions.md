@@ -7,9 +7,9 @@
 Управление осуществляется через **InfoPanel** (правая панель) и автоматический перехват ввода.
 
 ### Команды и UI-кнопки (⑂):
-- `claude`: Запуск новой сессии. Включает [Sniper Watcher](../../knowledge/fix-claude-id-capture.md). 
-- `claude-c`: Продолжить сессию. 
-- `⑂ Fork в новую вкладку`: (Smart Fork) Создает копию текущей сессии Claude. Создает новую вкладку справа в том же CWD и автоматически выполняет `claude-f <UUID>`.
+- `claude`: Запуск новой сессии. Включает [Sniper Watcher](../../knowledge/fix-claude-id-capture.md).
+- `claude-c`: Продолжить сессию.
+- `⑂ Fork в новую вкладку`: (Smart Fork) Создает копию текущей сессии Claude. Использует [PendingAction Pattern](../architecture.md#3-pendingaction-pattern) — создаёт новую вкладку с `pendingAction: { type: 'claude-fork', sessionId }`, которое выполняется автоматически после готовности shell.
 - `claude-f <UUID>`: (Команда) Находит сессию по указанному UUID во ВСЕХ директориях `~/.claude/projects/` и запускает форк в текущем терминале.
 
 ### Interrupted Sessions (⚠️)
@@ -26,6 +26,7 @@
 
 ## Code Map
 - **Renderer (UI):** `src/renderer/components/Workspace/TerminalArea.tsx` — рендеринг `InterruptedOverlay` через `Layering Pattern`.
+- **PendingAction:** `src/renderer/components/Workspace/Terminal.tsx` — обработка `pendingAction` при первом PTY output (`executePendingAction`).
 - **Logic:** `src/renderer/components/Workspace/TabBar.tsx` — метод `checkProcessStatus` очищает сессию при нормальном выходе.
-- **Main (Runner):** `src/main/main.js` — IPC-хендлер `claude:fork-session-file` с логикой глобального поиска файлов `.jsonl`.
-- **State:** `useWorkspaceStore.ts` — хранение `wasInterrupted` в SQLite.
+- **Main (Runner):** `src/main/main.js` — IPC-хендлер `claude:run-command` с логикой глобального поиска файлов `.jsonl`.
+- **State:** `useWorkspaceStore.ts` — хранение `pendingAction`, `wasInterrupted` и `claudeSessionId`.

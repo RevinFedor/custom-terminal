@@ -23,15 +23,17 @@
 - **Smart Naming:** 
     - Первый: `run-dev`, `claude`, `tab-1`.
     - Повторные: `run-dev-02`, `claude-03`.
-- **Auto-color:** 
+- **Auto-color:**
     - `devServer` -> Green.
     - `claude` -> #DA7756.
     - `gemini` -> #4E86F8.
     - Флаг `colorSetManually` предотвращает автоматическую смену цвета, если пользователь сам выбрал цвет.
+    - **ВАЖНО:** Вызывается через `setTabCommandType()` как при ручном вводе (перехват в Terminal.tsx), так и при запуске через UI-кнопки (InfoPanel.tsx).
 - **Restart Zone:** Левая часть таба (32px). Клик выполняет `SIGINT` -> `!! + Enter`. Доступно только для `devServer`.
 - **Utils Zone:** Всплывающее меню слева. Открывается мгновенно при наведении, закрывается с задержкой 100мс. См. `knowledge/fix-ui-stability.md` (раздел 2).
 
 ## Code Map
 - **UI:** `src/renderer/components/Workspace/TabBar.tsx` — логика меню и `RestartZone`.
 - **Logic:** `src/renderer/store/useWorkspaceStore.ts` — функции `getNextAvailableName` и `setTabCommandType`.
-- **Terminal:** `src/renderer/components/Workspace/Terminal.tsx` — перехват команд для детекции типа процесса.
+- **Terminal:** `src/renderer/components/Workspace/Terminal.tsx` — перехват ввода для детекции типа процесса.
+- **InfoPanel:** `src/renderer/components/Workspace/panels/InfoPanel.tsx` — кнопки claude/claude-c/claude-f также вызывают `setTabCommandType`.

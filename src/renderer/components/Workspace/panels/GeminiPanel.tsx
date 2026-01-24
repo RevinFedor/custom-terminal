@@ -248,14 +248,16 @@ export default function GeminiPanel({ projectPath, geminiPrompt }: GeminiPanelPr
   }
 
   // Get total chars in conversation
-  const getConversationChars = (conv: { messages: { content: string }[] }) => {
-    return conv.messages.reduce((sum, m) => sum + m.content.length, 0);
+  const getConversationChars = (conv: { messages?: { content?: string }[] }) => {
+    if (!conv.messages) return 0;
+    return conv.messages.reduce((sum, m) => sum + (m.content?.length || 0), 0);
   };
 
   // Get last assistant response
-  const getLastResponse = (conv: { messages: { role: string; content: string }[] }) => {
+  const getLastResponse = (conv: { messages?: { role: string; content?: string }[] }) => {
+    if (!conv.messages) return '';
     const assistantMsgs = conv.messages.filter(m => m.role === 'assistant');
-    return assistantMsgs.length > 0 ? assistantMsgs[assistantMsgs.length - 1].content : '';
+    return assistantMsgs.length > 0 ? assistantMsgs[assistantMsgs.length - 1].content || '' : '';
   };
 
   // Copy last response

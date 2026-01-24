@@ -388,7 +388,7 @@ export default function ResearchSheet({ projectId, projectPath }: ResearchSheetP
 
             {/* Input Area */}
             <div style={{ borderTop: '1px solid #333', backgroundColor: '#222', flexShrink: 0 }}>
-              <ResearchInput projectId={projectId} inputRef={inputRef} chatType={currentChatType} />
+              <ResearchInput projectId={projectId} projectPath={projectPath} inputRef={inputRef} chatType={currentChatType} />
             </div>
           </motion.div>
         </>
