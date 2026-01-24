@@ -218,6 +218,11 @@ interface UIStore {
 
   closeSessionModal: (value: string | null) => void;
 
+  // Notes Editor Modal
+  notesEditorOpen: boolean;
+  notesEditorProjectId: string | null;
+  openNotesEditor: (projectId: string) => void;
+  closeNotesEditor: () => void;
 }
 
 
@@ -750,5 +755,11 @@ export const useUIStore = create<UIStore>((set, get) => ({
         resolve: null
       }
     });
-  }
+  },
+
+  // Notes Editor Modal
+  notesEditorOpen: false,
+  notesEditorProjectId: null,
+  openNotesEditor: (projectId) => set({ notesEditorOpen: true, notesEditorProjectId: projectId }),
+  closeNotesEditor: () => set({ notesEditorOpen: false, notesEditorProjectId: null })
 }));

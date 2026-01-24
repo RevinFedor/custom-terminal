@@ -1,4 +1,4 @@
-import React, { useCallback } from 'react';
+import React, { useCallback, useEffect } from 'react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import { useUIStore } from '../../store/useUIStore';
@@ -9,11 +9,12 @@ import FileExplorer from './FileExplorer';
 import FilePreview from './FilePreview';
 import Resizer from './Resizer';
 import ResearchSheet from '../Research/ResearchSheet';
+import NotesEditorModal from './NotesEditorModal';
 
 export default function Workspace() {
   const { activeProjectId, getActiveProject } = useWorkspaceStore();
   const { projects } = useProjectsStore();
-  const { filePreview, closeFilePreview } = useUIStore();
+  const { filePreview, openNotesEditor, notesEditorOpen } = useUIStore();
 
   const activeProject = getActiveProject();
   const currentProject = activeProjectId ? projects[activeProjectId] : null;
@@ -22,6 +23,19 @@ export default function Workspace() {
   const handleResize = useCallback(() => {
     // Terminal will auto-refit via ResizeObserver
   }, []);
+
+  // CMD+E hotkey to open notes editor
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.metaKey && e.key === 'e' && !notesEditorOpen && activeProjectId) {
+        e.preventDefault();
+        openNotesEditor(activeProjectId);
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [activeProjectId, notesEditorOpen, openNotesEditor]);
 
   // Tab creation is now handled in useWorkspaceStore.openProject()
 
@@ -62,6 +76,9 @@ export default function Workspace() {
 
       {/* File Explorer - opens in current terminal's directory */}
       <FileExplorer projectPath={explorerPath} />
+
+      {/* Notes Editor Modal */}
+      <NotesEditorModal />
     </div>
   );
 }

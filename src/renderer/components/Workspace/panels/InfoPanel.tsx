@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useWorkspaceStore } from '../../../store/useWorkspaceStore';
 import { useUIStore } from '../../../store/useUIStore';
+import { Maximize2 } from 'lucide-react';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -31,7 +32,7 @@ const extractNotes = (notes: any): string => {
 export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [notes, setNotes] = useState(extractNotes(project?.notes));
-  const { showToast } = useUIStore();
+  const { showToast, openNotesEditor } = useUIStore();
   const notesTextareaRef = useRef<HTMLTextAreaElement>(null);
 
   // Sync notes with project
@@ -261,7 +262,16 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
 
       {/* Project Notes - always editable */}
       <div className="flex-1 flex flex-col min-h-0 border-t border-border-main pt-3">
-        <div className="text-[11px] uppercase text-[#888] mb-2">Заметки проекта</div>
+        <div className="flex items-center justify-between mb-2">
+          <div className="text-[11px] uppercase text-[#888]">Заметки проекта</div>
+          <button
+            onClick={() => project?.id && openNotesEditor(project.id)}
+            className="p-1 rounded text-[#666] hover:text-white hover:bg-white/10 transition-colors"
+            title="Развернуть редактор (⌘E)"
+          >
+            <Maximize2 size={12} />
+          </button>
+        </div>
         <textarea
           ref={notesTextareaRef}
           className="flex-1 min-h-[80px] bg-transparent border border-transparent rounded p-2 text-[11px] text-[#aaa] resize-none focus:outline-none focus:border-accent focus:bg-[#2a2a2a] transition-all duration-200 placeholder:text-[#555] placeholder:italic"
