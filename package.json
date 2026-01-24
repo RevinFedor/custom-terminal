@@ -25,6 +25,7 @@
     }
   },
   "dependencies": {
+    "@anthropic/markdown-editor": "file:../gt-editor/packages/markdown-editor",
     "@atlaskit/pragmatic-drag-and-drop": "^1.7.7",
     "@atlaskit/pragmatic-drag-and-drop-hitbox": "^1.1.0",
     "@google/genai": "^1.38.0",
