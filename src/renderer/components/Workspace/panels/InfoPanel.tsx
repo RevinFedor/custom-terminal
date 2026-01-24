@@ -33,6 +33,7 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [notes, setNotes] = useState(extractNotes(project?.notes));
   const { showToast, openNotesEditor } = useUIStore();
+  const { setTabCommandType } = useWorkspaceStore();
   const notesTextareaRef = useRef<HTMLTextAreaElement>(null);
 
   // Sync notes with project
@@ -170,6 +171,7 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                       showToast('Сессия уже есть. Используйте claude-c', 'warning');
                       return;
                     }
+                    setTabCommandType(activeTabId, 'claude');
                     ipcRenderer.send('claude:run-command', { tabId: activeTabId, command: 'claude' });
                   }}
                   title={hasSession ? 'Сессия уже есть' : 'Запустить новую сессию'}
@@ -210,6 +212,7 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                       return;
                     }
                     if (hasSession && activeTabId) {
+                      setTabCommandType(activeTabId, 'claude');
                       ipcRenderer.send('claude:run-command', { tabId: activeTabId, command: 'claude-c', sessionId });
                     }
                   }}
@@ -250,6 +253,7 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                       const clipboardText = await navigator.clipboard.readText();
                       const trimmed = clipboardText.trim();
                       if (UUID_REGEX.test(trimmed)) {
+                        setTabCommandType(activeTabId, 'claude');
                         ipcRenderer.send('claude:run-command', { tabId: activeTabId, command: 'claude-f', forkSessionId: trimmed });
                       } else {
                         showToast('В буфере нет UUID. Скопируйте ID сессии.', 'warning');

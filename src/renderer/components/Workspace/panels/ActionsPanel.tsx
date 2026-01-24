@@ -46,7 +46,7 @@ export default function ActionsPanel({ activeTabId }: ActionsPanelProps) {
   };
 
   // Wait for Gemini to be ready (detects "type your message" in terminal output)
-  const waitForGeminiReady = (tabId: string, timeoutMs: number = 15000): Promise<boolean> => {
+  const waitForGeminiReady = (tabId: string, timeoutMs: number = 40000): Promise<boolean> => {
     const pattern = 'type your message';
 
     return new Promise((resolve) => {

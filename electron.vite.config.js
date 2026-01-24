@@ -33,13 +33,27 @@ renderer: {
       outDir: 'dist/renderer',
       rollupOptions: {
         input: resolve(__dirname, 'index.html')
+      },
+      commonjsOptions: {
+        // Ensure single React instance in bundle
+        include: [/node_modules/],
+        requireReturnsDefault: 'auto'
       }
     },
     plugins: [react()],
     resolve: {
       alias: {
-        '@': resolve(__dirname, 'src/renderer')
-      }
+        '@': resolve(__dirname, 'src/renderer'),
+        // Dev: use source directly, no need to rebuild gt-editor
+        '@anthropic/markdown-editor': resolve(__dirname, '../gt-editor/packages/markdown-editor/src/index.ts'),
+        // Force single React instance for all packages
+        'react': resolve(__dirname, 'node_modules/react'),
+        'react-dom': resolve(__dirname, 'node_modules/react-dom')
+      },
+      dedupe: ['react', 'react-dom']
+    },
+    optimizeDeps: {
+      include: ['react', 'react-dom']
     }
   }
 });

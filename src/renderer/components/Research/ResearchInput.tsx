@@ -4,11 +4,12 @@ import { useUIStore } from '../../store/useUIStore';
 
 interface ResearchInputProps {
   projectId: string;
+  projectPath: string;
   inputRef: RefObject<HTMLTextAreaElement>;
   chatType: ChatType;
 }
 
-export default function ResearchInput({ projectId, inputRef, chatType }: ResearchInputProps) {
+export default function ResearchInput({ projectId, projectPath, inputRef, chatType }: ResearchInputProps) {
   const [value, setValue] = useState('');
   const { addMessage, createConversation, getActiveConversation, isLoading, setLoading, setAbortController, cancelRequest } = useResearchStore();
   const { chatSettings, showToast } = useUIStore();
@@ -30,10 +31,10 @@ export default function ResearchInput({ projectId, inputRef, chatType }: Researc
     const activeConv = getActiveConversation(projectId);
 
     if (activeConv) {
-      addMessage(projectId, 'user', trimmed);
+      addMessage(projectId, projectPath, 'user', trimmed);
     } else {
       // Create new conversation with the current chat type
-      createConversation(projectId, trimmed, chatType);
+      createConversation(projectId, projectPath, trimmed, chatType);
     }
 
     setValue('');
@@ -96,7 +97,7 @@ export default function ResearchInput({ projectId, inputRef, chatType }: Researc
 
       const responseText = data.candidates[0].content.parts[0].text;
       console.log('[ResearchInput] Response length:', responseText.length);
-      addMessage(projectId, 'assistant', responseText);
+      addMessage(projectId, projectPath, 'assistant', responseText);
     } catch (err: any) {
       if (err.name === 'AbortError') {
         console.log('[ResearchInput] Request cancelled');
@@ -104,13 +105,13 @@ export default function ResearchInput({ projectId, inputRef, chatType }: Researc
       } else {
         console.error('[ResearchInput] ERROR:', err.message);
         showToast(err.message, 'error');
-        addMessage(projectId, 'assistant', `Ошибка: ${err.message}`);
+        addMessage(projectId, projectPath, 'assistant', `Ошибка: ${err.message}`);
       }
     } finally {
       setAbortController(null);
       setLoading(false);
     }
-  }, [value, projectId, addMessage, createConversation, getActiveConversation, isLoading, setLoading, setAbortController, selectedModel, thinkingLevel, showToast, chatType]);
+  }, [value, projectId, projectPath, addMessage, createConversation, getActiveConversation, isLoading, setLoading, setAbortController, selectedModel, thinkingLevel, showToast, chatType]);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
