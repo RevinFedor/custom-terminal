@@ -55,7 +55,7 @@ const handleLinkActivation = (event: MouseEvent, uri: string) => {
 };
 import { SerializeAddon } from '@xterm/addon-serialize';
 import { useUIStore } from '../../store/useUIStore';
-import { useWorkspaceStore } from '../../store/useWorkspaceStore';
+import { useWorkspaceStore, type PendingAction } from '../../store/useWorkspaceStore';
 import { terminalRegistry } from '../../utils/terminalRegistry';
 import { log } from '../../utils/logger';
 
@@ -89,28 +89,66 @@ const getUpdateTabCwd = () => {
   };
 };
 
-// Get pending command for a tab (used for fork)
-const getTabPendingCommand = (tabId: string): string | undefined => {
+// Get pending action for a tab (used for fork, continue, etc.)
+const getTabPendingAction = (tabId: string): PendingAction | undefined => {
   const state = useWorkspaceStore.getState();
   for (const [, workspace] of state.openProjects) {
     const tab = workspace.tabs.get(tabId);
-    if (tab) return tab.pendingCommand;
+    if (tab) {
+      console.log('[Terminal:getTabPendingAction]', { tabId, pendingAction: tab.pendingAction });
+      return tab.pendingAction;
+    }
   }
   return undefined;
 };
 
-// Clear pending command after execution
-const clearTabPendingCommand = (tabId: string) => {
+// Clear pending action after execution
+const clearTabPendingAction = (tabId: string) => {
   const state = useWorkspaceStore.getState();
   for (const [projectId, workspace] of state.openProjects) {
     const tab = workspace.tabs.get(tabId);
-    if (tab && tab.pendingCommand) {
-      tab.pendingCommand = undefined;
+    if (tab && tab.pendingAction) {
+      console.log('[Terminal:clearTabPendingAction] Clearing:', { tabId, pendingAction: tab.pendingAction });
+      tab.pendingAction = undefined;
       state.openProjects.set(projectId, { ...workspace });
       useWorkspaceStore.setState({ openProjects: new Map(state.openProjects) });
       return;
     }
   }
+};
+
+// Execute pending action after terminal is ready
+const executePendingAction = (tabId: string, pendingAction: PendingAction) => {
+  console.log('[Terminal:executePendingAction] Executing:', { tabId, pendingAction });
+
+  switch (pendingAction.type) {
+    case 'claude-fork':
+      if (pendingAction.sessionId) {
+        ipcRenderer.send('claude:run-command', {
+          tabId,
+          command: 'claude-f',
+          forkSessionId: pendingAction.sessionId
+        });
+      }
+      break;
+
+    case 'claude-continue':
+      if (pendingAction.sessionId) {
+        ipcRenderer.send('claude:run-command', {
+          tabId,
+          command: 'claude-c',
+          sessionId: pendingAction.sessionId
+        });
+      }
+      break;
+
+    case 'shell-command':
+      // Shell commands are handled via initialCommand in pty.spawn
+      // Nothing to do here
+      break;
+  }
+
+  clearTabPendingAction(tabId);
 };
 
 // Regex to detect Claude session ID from terminal output
@@ -186,8 +224,7 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
   const [isVisible, setIsVisible] = useState(false); // Hide until ready
   const [showScrollButton, setShowScrollButton] = useState(false); // Show "scroll to bottom" button
   const claudeSessionDetected = useRef<string | null>(null); // Track detected Claude session UUID
-  // NOTE: pendingCommand execution moved to main process (pty.spawn with initialCommand)
-  // Shell now starts with command baked in, no need for client-side detection
+  const pendingActionExecuted = useRef(false); // Track if pendingAction was executed
 
   const terminalFontSize = useUIStore((state) => state.terminalFontSize);
 
@@ -261,14 +298,15 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
     const handleData = (_: any, payload: { tabId: string; data: string }) => {
       if (payload.tabId !== tabId) return;
 
-      // NOTE: Session ID detection via regex is DISABLED
-      // It catches the wrong ID (parent session) from Claude's UI output
-      // Instead we use:
-      // - Sniper Watcher for 'claude' command (catches new file creation)
-      // - Explicit ID setting for 'claude-c' and 'claude-f' commands
-
-      // NOTE: Initial command execution moved to main process (pty.spawn with -c flag)
-      // No need for client-side detection - shell starts with command baked in
+      // Execute pendingAction on first PTY output (= shell is ready)
+      if (!pendingActionExecuted.current) {
+        pendingActionExecuted.current = true;
+        const pendingAction = getTabPendingAction(tabId);
+        if (pendingAction) {
+          console.log('[Terminal:handleData] First PTY output, executing pendingAction');
+          executePendingAction(tabId, pendingAction);
+        }
+      }
 
       // If xterm not yet created, buffer data for later replay
       if (!xtermInstance.current) {

@@ -100,10 +100,20 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                   const tab = workspace.tabs.get(activeTabId);
                   if (tab) {
                     currentCwd = tab.cwd || currentCwd;
-                    // Create new tab after current with fork command
-                    await state.createTabAfterCurrent(projectId, undefined, currentCwd, {
-                      pendingCommand: `claude-f ${sessionId}`
+                    // Create new tab with pendingAction for fork
+                    console.log('[Fork Button] Creating new tab with pendingAction:', {
+                      projectId,
+                      sessionId,
+                      currentCwd
                     });
+
+                    await state.createTabAfterCurrent(projectId, undefined, currentCwd, {
+                      pendingAction: {
+                        type: 'claude-fork',
+                        sessionId: sessionId
+                      }
+                    });
+
                     showToast('Создана вкладка с fork сессии', 'success');
                     break;
                   }

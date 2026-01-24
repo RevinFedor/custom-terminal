@@ -50,7 +50,7 @@ export default function Workspace() {
   const explorerPath = activeTab?.cwd || currentProject.path;
 
   return (
-    <div className="flex-1 flex flex-col h-full overflow-hidden">
+    <div className="flex-1 flex flex-col h-full overflow-hidden relative">
       <TabBar projectId={activeProjectId} />
 
       <div className="flex-1 flex overflow-hidden min-h-0">
