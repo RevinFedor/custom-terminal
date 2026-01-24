@@ -225,7 +225,14 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
       // This ensures .zshrc/.bashrc loads before command runs, then keeps shell open
       const escapedCmd = initialCommand.replace(/"/g, '\\"');
       shellArgs = ['-l', '-c', `${escapedCmd}; exec ${shell}`];
-      console.log(`[terminal:create] Running with initial command: ${initialCommand}`);
+      console.log(`[terminal:create] ========== FORK DEBUG ==========`);
+      console.log(`[terminal:create] tabId: ${tabId}`);
+      console.log(`[terminal:create] initialCommand (raw): ${initialCommand}`);
+      console.log(`[terminal:create] escapedCmd: ${escapedCmd}`);
+      console.log(`[terminal:create] shell: ${shell}`);
+      console.log(`[terminal:create] shellArgs:`, shellArgs);
+      console.log(`[terminal:create] Full command: ${shell} ${shellArgs.join(' ')}`);
+      console.log(`[terminal:create] ================================`);
     }
 
     const ptyProcess = pty.spawn(shell, shellArgs, {

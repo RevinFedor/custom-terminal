@@ -1,5 +1,4 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { createPortal } from 'react-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import { MarkdownEditor } from '@anthropic/markdown-editor';
 import '@anthropic/markdown-editor/styles.css';
@@ -13,7 +12,7 @@ const { ipcRenderer } = window.require('electron');
 export default function NotesEditorModal() {
   const { notesEditorOpen, notesEditorProjectId, closeNotesEditor, showToast, wordWrap } = useUIStore();
   const { openProjects } = useWorkspaceStore();
-  const { projects } = useProjectsStore();
+  const { projects, updateProject } = useProjectsStore();
 
   const [content, setContent] = useState('');
   const [projectPath, setProjectPath] = useState<string | null>(null);
@@ -46,17 +45,29 @@ export default function NotesEditorModal() {
 
   // Save notes
   const saveNotes = useCallback(async () => {
-    if (!projectPath) return;
+    if (!projectPath || !notesEditorProjectId) {
+      console.warn('[NotesEditor] Cannot save: No project path or ID');
+      return;
+    }
+
+    console.log('[NotesEditor] Saving notes for path:', projectPath, 'Content length:', content.length);
+    console.log('[NotesEditor] Content preview:', content.slice(0, 50));
 
     try {
-      await ipcRenderer.invoke('project:save-note', { dirPath: projectPath, content });
+      const result = await ipcRenderer.invoke('project:save-note', { dirPath: projectPath, content });
+      console.log('[NotesEditor] Save result:', result);
+      
+      // Update local store to reflect changes immediately
+      await updateProject(notesEditorProjectId, { notes: content });
+      console.log('[NotesEditor] Local store updated');
+
       setHasChanges(false);
-      showToast('Заметки сохранены', 'success');
+      // Toast removed as requested
     } catch (error) {
-      console.error('Failed to save notes:', error);
+      console.error('[NotesEditor] Failed to save notes:', error);
       showToast('Ошибка сохранения', 'error');
     }
-  }, [projectPath, content, showToast]);
+  }, [projectPath, notesEditorProjectId, content, showToast, updateProject]);
 
   // Handle content change
   const handleChange = useCallback((newContent: string) => {
@@ -82,8 +93,8 @@ export default function NotesEditorModal() {
         e.preventDefault();
         saveNotes();
       }
-      // Escape to close
-      if (e.key === 'Escape') {
+      // Escape or CMD+E to close (and save)
+      if (e.key === 'Escape' || (e.metaKey && e.key === 'e')) {
         e.preventDefault();
         handleClose();
       }
@@ -93,82 +104,94 @@ export default function NotesEditorModal() {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [notesEditorOpen, saveNotes, handleClose]);
 
-  if (!notesEditorOpen) return null;
-
-  return createPortal(
+  return (
     <AnimatePresence>
-      <motion.div
-        initial={{ opacity: 0 }}
-        animate={{ opacity: 1 }}
-        exit={{ opacity: 0 }}
-        transition={{ duration: 0.15 }}
-        className="fixed inset-0 z-[100000] flex flex-col"
-        style={{ top: 36 }} // Below title bar
-      >
-        {/* Backdrop */}
-        <div
-          className="absolute inset-0 bg-black/60 backdrop-blur-sm"
-          onClick={handleClose}
-        />
+      {notesEditorOpen && (
+        <>
+          {/* Backdrop */}
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: 0.12 }}
+            onClick={handleClose}
+            style={{
+              position: 'absolute',
+              inset: 0,
+              zIndex: 40,
+              backgroundColor: 'rgba(0,0,0,0.75)'
+            }}
+          />
 
-        {/* Modal Content */}
-        <motion.div
-          initial={{ opacity: 0, scale: 0.98, y: 10 }}
-          animate={{ opacity: 1, scale: 1, y: 0 }}
-          exit={{ opacity: 0, scale: 0.98, y: 10 }}
-          transition={{ duration: 0.15, ease: 'easeOut' }}
-          className="relative flex-1 flex flex-col m-4 bg-[#1e1e2e] rounded-xl border border-[#333] shadow-2xl overflow-hidden"
-        >
-          {/* Header */}
-          <div className="flex items-center justify-between px-4 py-3 border-b border-[#333] bg-[#252536]">
-            <div className="flex items-center gap-3">
-              <h2 className="text-sm font-semibold text-white">
-                Заметки проекта
-              </h2>
-              <span className="text-xs text-[#888] font-mono">
-                {projectName}
-              </span>
-              {hasChanges && (
-                <span className="text-[10px] px-1.5 py-0.5 rounded bg-yellow-500/20 text-yellow-400">
-                  Не сохранено
+          {/* Panel */}
+          <motion.div
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: 20 }}
+            transition={{ duration: 0.15, ease: 'easeOut' }}
+            style={{
+              position: 'absolute',
+              top: '16px',
+              left: '16px',
+              right: '16px',
+              bottom: '16px',
+              zIndex: 50,
+              display: 'flex',
+              flexDirection: 'column',
+              backgroundColor: '#1a1a1a',
+              borderRadius: '12px',
+              border: '1px solid #333',
+              overflow: 'hidden',
+              boxShadow: '0 25px 50px -12px rgba(0,0,0,0.5)'
+            }}
+          >
+            {/* Header */}
+            <div style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              padding: '12px 16px',
+              borderBottom: '1px solid #333',
+              backgroundColor: '#222',
+              flexShrink: 0
+            }}>
+              <div className="flex items-center gap-3">
+                <h2 className="text-sm font-medium text-white">
+                  Notes Editor
+                </h2>
+                <span className="text-xs text-[#888]">
+                  {projectName}
                 </span>
-              )}
+                {hasChanges && (
+                  <span className="text-[10px] px-1.5 py-0.5 rounded bg-yellow-500/20 text-yellow-400">
+                    Unsaved
+                  </span>
+                )}
+              </div>
+              
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={handleClose}
+                  className="p-1.5 rounded-md text-[#888] hover:text-white hover:bg-white/10 transition-colors"
+                >
+                  <X size={18} />
+                </button>
+              </div>
             </div>
-            <div className="flex items-center gap-2">
-              <button
-                onClick={saveNotes}
-                className="text-xs px-3 py-1.5 rounded-lg bg-[#89b4fa]/20 text-[#89b4fa] hover:bg-[#89b4fa]/30 transition-colors"
-              >
-                Сохранить (⌘S)
-              </button>
-              <button
-                onClick={handleClose}
-                className="p-1.5 rounded-lg text-[#888] hover:text-white hover:bg-white/10 transition-colors"
-              >
-                <X size={18} />
-              </button>
+
+            {/* Editor Container - ensure it takes full height */}
+            <div className="flex-1 overflow-hidden relative bg-[#1e1e2e]">
+              <MarkdownEditor
+                content={content}
+                onChange={handleChange}
+                fontSize={14}
+                wordWrap={wordWrap}
+                foldStateKey={`notes:${notesEditorProjectId}`}
+              />
             </div>
-          </div>
-
-          {/* Editor */}
-          <div className="flex-1 overflow-hidden">
-            <MarkdownEditor
-              content={content}
-              onChange={handleChange}
-              fontSize={14}
-              wordWrap={wordWrap}
-              foldStateKey={`notes:${notesEditorProjectId}`}
-            />
-          </div>
-
-          {/* Footer */}
-          <div className="flex items-center justify-between px-4 py-2 border-t border-[#333] bg-[#252536] text-[10px] text-[#666]">
-            <span>ESC — закрыть | ⌘S — сохранить</span>
-            <span>Markdown поддерживается</span>
-          </div>
-        </motion.div>
-      </motion.div>
-    </AnimatePresence>,
-    document.body
+          </motion.div>
+        </>
+      )}
+    </AnimatePresence>
   );
 }

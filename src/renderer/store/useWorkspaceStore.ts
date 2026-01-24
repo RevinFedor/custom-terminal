@@ -8,6 +8,13 @@ export type TabColor = 'default' | 'red' | 'yellow' | 'green' | 'blue' | 'purple
 
 export type CommandType = 'generic' | 'devServer' | 'claude' | 'gemini';
 
+// Typed pending action - executed after terminal is ready
+export interface PendingAction {
+  type: 'claude-fork' | 'claude-continue' | 'shell-command';
+  sessionId?: string;    // For claude-fork, claude-continue
+  command?: string;      // For shell-command
+}
+
 interface Tab {
   id: string;
   name: string;
@@ -18,7 +25,7 @@ interface Tab {
   commandType?: CommandType; // Type of running command (for restart button visibility)
   isUtility?: boolean;
   claudeSessionId?: string; // Active Claude Code session UUID (detected from terminal output)
-  pendingCommand?: string; // Command to execute when terminal is ready (used for fork)
+  pendingAction?: PendingAction; // Action to execute when terminal is ready
   wasInterrupted?: boolean; // True if tab was closed with active Claude session (show resume overlay)
 }
 
@@ -61,8 +68,8 @@ interface WorkspaceStore {
   closeProject: (projectId: string) => Promise<void>;
 
   // Tab management
-  createTab: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; pendingCommand?: string; claudeSessionId?: string; wasInterrupted?: boolean }) => Promise<string>;
-  createTabAfterCurrent: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; pendingCommand?: string; claudeSessionId?: string; wasInterrupted?: boolean }) => Promise<string>;
+  createTab: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; pendingAction?: PendingAction; claudeSessionId?: string; wasInterrupted?: boolean }) => Promise<string>;
+  createTabAfterCurrent: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; pendingAction?: PendingAction; claudeSessionId?: string; wasInterrupted?: boolean }) => Promise<string>;
   closeTab: (projectId: string, tabId: string) => Promise<void>;
   switchTab: (projectId: string, tabId: string) => void;
   renameTab: (projectId: string, tabId: string, newName: string) => void;
@@ -378,19 +385,23 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       cwd: cwd || workspace.projectPath || process.env.HOME || '~',
       color: options?.color,
       isUtility: options?.isUtility,
-      pendingCommand: options?.pendingCommand,
+      pendingAction: options?.pendingAction,
       claudeSessionId: options?.claudeSessionId,
       wasInterrupted: options?.wasInterrupted
     };
 
     console.log('[Store] createTab: Creating PTY terminal for:', tabId, 'cwd:', newTab.cwd);
-    // Create terminal (pass initialCommand if provided for immediate execution)
+    // Only pass initialCommand for shell-command type, not for internal commands
+    const initialCommand = options?.pendingAction?.type === 'shell-command'
+      ? options.pendingAction.command
+      : undefined;
+
     const { pid } = await ipcRenderer.invoke('terminal:create', {
       tabId,
       cwd: newTab.cwd,
       rows: 24,
       cols: 80,
-      initialCommand: options?.pendingCommand
+      initialCommand
     });
 
     console.log('[Store] createTab: PTY created with pid:', pid);
@@ -429,20 +440,32 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       cwd: cwd || workspace.projectPath || process.env.HOME || '~',
       color: options?.color,
       isUtility: options?.isUtility,
-      pendingCommand: options?.pendingCommand,
+      pendingAction: options?.pendingAction,
       claudeSessionId: options?.claudeSessionId,
       wasInterrupted: options?.wasInterrupted
     };
 
-    // Create terminal (pass initialCommand if provided for immediate execution)
+    // Only pass initialCommand for shell-command type, not for internal commands
+    const initialCommand = options?.pendingAction?.type === 'shell-command'
+      ? options.pendingAction.command
+      : undefined;
+
+    console.log('[Store:createTabAfterCurrent] Creating terminal with:', {
+      tabId,
+      cwd: newTab.cwd,
+      pendingAction: options?.pendingAction,
+      initialCommand
+    });
+
     const { pid } = await ipcRenderer.invoke('terminal:create', {
       tabId,
       cwd: newTab.cwd,
       rows: 24,
       cols: 80,
-      initialCommand: options?.pendingCommand
+      initialCommand
     });
 
+    console.log('[Store:createTabAfterCurrent] Terminal created with pid:', pid);
     newTab.pid = pid;
 
     // Insert after current tab (or at end if no active tab)
