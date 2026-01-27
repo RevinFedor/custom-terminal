@@ -93,6 +93,12 @@ class DatabaseManager {
     try {
       this.db.exec(`ALTER TABLE tabs ADD COLUMN was_interrupted INTEGER DEFAULT 0`);
     } catch (e) { /* column already exists */ }
+    try {
+      this.db.exec(`ALTER TABLE tabs ADD COLUMN gemini_session_id TEXT DEFAULT NULL`);
+    } catch (e) { /* column already exists */ }
+    try {
+      this.db.exec(`ALTER TABLE tabs ADD COLUMN overlay_dismissed INTEGER DEFAULT 0`);
+    } catch (e) { /* column already exists */ }
 
     // Gemini history table
     this.db.exec(`
@@ -230,7 +236,9 @@ class DatabaseManager {
         color: t.color || undefined,
         isUtility: t.is_utility === 1,
         claudeSessionId: t.claude_session_id || undefined,
-        wasInterrupted: t.was_interrupted === 1
+        geminiSessionId: t.gemini_session_id || undefined,
+        wasInterrupted: t.was_interrupted === 1,
+        overlayDismissed: t.overlay_dismissed === 1
       }))
     };
   }
@@ -353,14 +361,14 @@ class DatabaseManager {
     // Delete existing tabs
     this.db.prepare('DELETE FROM tabs WHERE project_id = ?').run(project.id);
 
-    // Insert new tabs with color, is_utility, claude_session_id and was_interrupted
+    // Insert new tabs with color, is_utility, claude_session_id, gemini_session_id, was_interrupted and overlay_dismissed
     const insert = this.db.prepare(`
-      INSERT INTO tabs (project_id, name, cwd, position, color, is_utility, claude_session_id, was_interrupted)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO tabs (project_id, name, cwd, position, color, is_utility, claude_session_id, gemini_session_id, was_interrupted, overlay_dismissed)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     tabs.forEach((tab, index) => {
-      insert.run(project.id, tab.name, tab.cwd, index, tab.color || null, tab.isUtility ? 1 : 0, tab.claudeSessionId || null, tab.wasInterrupted ? 1 : 0);
+      insert.run(project.id, tab.name, tab.cwd, index, tab.color || null, tab.isUtility ? 1 : 0, tab.claudeSessionId || null, tab.geminiSessionId || null, tab.wasInterrupted ? 1 : 0, tab.overlayDismissed ? 1 : 0);
     });
 
     this.db.prepare(`

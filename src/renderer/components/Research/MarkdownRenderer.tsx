@@ -1,46 +1,78 @@
-import React, { memo } from 'react';
+import React, { memo, useMemo } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import CodeBlock from './CodeBlock';
+import CollapsiblePastedBlock from './CollapsiblePastedBlock';
 
 interface MarkdownRendererProps {
   content: string;
   className?: string;
 }
 
+// Segment type for pre-processing pasted blocks
+type Segment = { type: 'markdown' | 'pasted'; content: string };
+
 function MarkdownRenderer({ content, className = '' }: MarkdownRendererProps) {
-  return (
-    <div className={`text-[13px] leading-relaxed text-gray-200 ${className}`}>
-      <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
-        components={{
-          // Pre element wraps code blocks - handle all block code here
-          pre({ children, ...props }: any) {
-            // Extract code element from pre children
-            const codeElement = React.Children.toArray(children)[0] as React.ReactElement;
+  // Pre-process content: extract :::pasted blocks BEFORE markdown parsing
+  // This avoids conflicts with ``` inside pasted content
+  const segments = useMemo<Segment[]>(() => {
+    const pastedRegex = /:::pasted\n([\s\S]*?)\n:::/g;
+    const result: Segment[] = [];
+    let lastIndex = 0;
+    let match;
 
-            if (React.isValidElement(codeElement) && codeElement.type === 'code') {
-              const { className, children: codeChildren } = codeElement.props;
-              const match = /language-(\w+)/.exec(className || '');
-              const language = match ? match[1] : '';
-              const value = String(codeChildren).replace(/\n$/, '');
+    while ((match = pastedRegex.exec(content)) !== null) {
+      // Add markdown text before this match
+      if (match.index > lastIndex) {
+        result.push({ type: 'markdown', content: content.slice(lastIndex, match.index) });
+      }
+      // Add pasted block
+      result.push({ type: 'pasted', content: match[1] });
+      lastIndex = match.index + match[0].length;
+    }
 
-              // Code block with language - use syntax highlighter
-              if (language) {
-                return <CodeBlock language={language} value={value} />;
-              }
+    // Add remaining markdown text
+    if (lastIndex < content.length) {
+      result.push({ type: 'markdown', content: content.slice(lastIndex) });
+    }
 
-              // Code block without language
-              return (
-                <pre className="my-3 p-3 rounded-lg bg-[#1a1a1a] border border-[#333] overflow-x-auto text-xs text-gray-300">
-                  <code>{codeChildren}</code>
-                </pre>
-              );
-            }
+    // If no pasted blocks found, return single markdown segment
+    if (result.length === 0) {
+      return [{ type: 'markdown', content }];
+    }
 
-            // Fallback
-            return <pre {...props}>{children}</pre>;
-          },
+    return result;
+  }, [content]);
+
+  // Markdown components configuration
+  const markdownComponents = {
+    // Pre element wraps code blocks - handle all block code here
+    pre({ children, ...props }: any) {
+      // Extract code element from pre children
+      const codeElement = React.Children.toArray(children)[0] as React.ReactElement;
+
+      if (React.isValidElement(codeElement) && codeElement.type === 'code') {
+        const { className, children: codeChildren } = codeElement.props;
+        const match = /language-(\w+)/.exec(className || '');
+        const language = match ? match[1] : '';
+        const value = String(codeChildren).replace(/\n$/, '');
+
+        // Code block with language - use syntax highlighter
+        if (language) {
+          return <CodeBlock language={language} value={value} />;
+        }
+
+        // Code block without language
+        return (
+          <pre className="my-3 p-3 rounded-lg bg-[#1a1a1a] border border-[#333] overflow-x-auto text-xs text-gray-300">
+            <code>{codeChildren}</code>
+          </pre>
+        );
+      }
+
+      // Fallback
+      return <pre {...props}>{children}</pre>;
+    },
 
           // Code element - now only called for INLINE code (not inside pre)
           code({ className, children, ...props }: any) {
@@ -139,14 +171,28 @@ function MarkdownRenderer({ content, className = '' }: MarkdownRendererProps) {
             return <strong className="font-semibold text-white">{children}</strong>;
           },
 
-          // Emphasis/Italic
-          em({ children }) {
-            return <em className="italic text-gray-300">{children}</em>;
-          }
-        }}
-      >
-        {content}
-      </ReactMarkdown>
+    // Emphasis/Italic
+    em({ children }) {
+      return <em className="italic text-gray-300">{children}</em>;
+    }
+  };
+
+  return (
+    <div className={`text-[13px] leading-relaxed text-gray-200 ${className}`}>
+      {segments.map((segment, index) => {
+        if (segment.type === 'pasted') {
+          return <CollapsiblePastedBlock key={index} content={segment.content} />;
+        }
+        return (
+          <ReactMarkdown
+            key={index}
+            remarkPlugins={[remarkGfm]}
+            components={markdownComponents}
+          >
+            {segment.content}
+          </ReactMarkdown>
+        );
+      })}
     </div>
   );
 }

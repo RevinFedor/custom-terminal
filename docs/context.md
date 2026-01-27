@@ -1,13 +1,22 @@
 # Context: Noted Terminal
 
-> **ИНСТРУКЦИЯ (System Prompt):**
-> 1. В начале сессии ОБЯЗАТЕЛЬНО прочитай три базовых файла:
->    - `context.md` — точка входа (этот файл)
->    - `architecture.md` — технический фундамент
->    - `main-feature.md` — пользовательские сценарии
-> 2. **ПЕРЕД ИЗМЕНЕНИЕМ КОДА** — найди нужную фичу в `main-feature.md`, перейди в `features/` и прочитай связанные `knowledge/`.
-> 3. Если есть ссылка на `knowledge/` — ЧИТАЙ ОБЯЗАТЕЛЬНО (там причины критических решений).
-> 4. Игнорируй папки с пометкой ⚪ (tmp, journal) без команды.
+<instructions>
+  <step index="1">
+    CRITICAL: Before generating ANY solution, you MUST issue read_file commands for:
+    - docs/architecture.md
+    - docs/main-feature.md
+  </step>
+  <step index="2">
+    Analyze the user request against `main-feature.md`.
+    Find ALL relevant feature files (may be multiple — read each).
+    For each feature file — follow links to `knowledge/` and READ them.
+  </step>
+  <step index="3">
+    ONLY after steps 1-2, propose a solution.
+    Start your response with: "Я проверил файлы: [list of files you read]"
+    If you skip this — your answer is considered a hallucination.
+  </step>
+</instructions>
 
 ## 1. Обзор Проекта
 Noted Terminal — это кастомный эмулятор терминала на базе Electron, ориентированный на глубокую интеграцию с AI-агентами (Gemini CLI, Claude Code) и бесшовное управление проектами.

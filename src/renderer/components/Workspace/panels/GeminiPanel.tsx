@@ -3,6 +3,7 @@ import { useUIStore } from '../../../store/useUIStore';
 import MarkdownRenderer from '../../Research/MarkdownRenderer';
 import { useResearchStore, ChatType } from '../../../store/useResearchStore';
 import { useWorkspaceStore } from '../../../store/useWorkspaceStore';
+import { ChevronDown, ClipboardPaste, Search, FileText } from 'lucide-react';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -187,6 +188,121 @@ export default function GeminiPanel({ projectPath, geminiPrompt }: GeminiPanelPr
   // Keep ref updated for event listener
   handleResearchRef.current = handleResearch;
 
+  // Handle research from clipboard (for "Apply from Clipboard" dropdown)
+  const handleClipboardResearch = async (chatType: ChatType) => {
+    try {
+      const clipboardText = await navigator.clipboard.readText();
+      if (!clipboardText.trim()) {
+        showToast('Буфер обмена пуст', 'warning');
+        return;
+      }
+
+      console.log('[ClipboardResearch] Starting, type:', chatType);
+      console.log('[ClipboardResearch] Clipboard:', `"${clipboardText.slice(0, 50)}..."`);
+
+      // Get settings for the chat type
+      const settings = chatSettings[chatType];
+      const { model: selectedModel, thinkingLevel, prompt: systemPrompt } = settings;
+
+      // Use project prompt for research if available
+      const prompt = (chatType === 'research' && geminiPrompt) ? geminiPrompt : systemPrompt;
+
+      // Wrap clipboard content in special pasted block (using ::: syntax to avoid markdown conflicts)
+      const wrappedContent = `:::pasted\n${clipboardText}\n:::`;
+
+      // User message: prompt first, then wrapped content
+      const userMessage = `_Prompt: ${prompt}_\n\n---\n\n${wrappedContent}`;
+
+      if (activeProjectId) {
+        createConversation(activeProjectId, projectPath, userMessage, chatType);
+        openResearch();
+      }
+
+      setLoading(true);
+
+      const apiKey = process.env.GEMINI_API_KEY || 'REDACTED_GEMINI_KEY';
+      const fullPrompt = prompt + clipboardText;
+
+      const controller = new AbortController();
+      setAbortController(controller);
+
+      const requestBody: any = {
+        contents: [{ parts: [{ text: fullPrompt }] }],
+        ...(selectedModel.includes('gemini-3') || selectedModel.includes('gemini-2.5') ? {
+          tools: [{ googleSearch: {} }]
+        } : {})
+      };
+
+      if (selectedModel.includes('gemini-3') && thinkingLevel !== 'NONE') {
+        requestBody.generationConfig = {
+          thinkingConfig: { thinkingLevel }
+        };
+      }
+
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${selectedModel}:generateContent?key=${apiKey}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(requestBody),
+          signal: controller.signal
+        }
+      );
+
+      const data = await response.json();
+
+      if (data.error) {
+        throw new Error(data.error.message || 'Unknown API Error');
+      }
+
+      if (!data.candidates || !data.candidates[0]?.content?.parts?.[0]?.text) {
+        throw new Error('API returned empty response');
+      }
+
+      const responseText = data.candidates[0].content.parts[0].text;
+
+      await ipcRenderer.invoke('gemini:save-history', {
+        dirPath: projectPath,
+        selectedText: clipboardText,
+        prompt,
+        response: responseText
+      });
+
+      if (activeProjectId) {
+        addMessage(activeProjectId, projectPath, 'assistant', responseText);
+      }
+
+      showToast(chatType === 'compact' ? 'Compact готов!' : 'Research готов!', 'success');
+      loadHistory();
+    } catch (err: any) {
+      if (err.name === 'AbortError') {
+        showToast('Запрос отменён', 'info');
+      } else {
+        showToast(err.message, 'error');
+      }
+    } finally {
+      setAbortController(null);
+      setLoading(false);
+    }
+  };
+
+  // Dropdown state for clipboard actions
+  const [clipboardDropdownOpen, setClipboardDropdownOpen] = useState(false);
+  const dropdownRef = useRef<HTMLDivElement>(null);
+
+  // Close dropdown on outside click
+  useEffect(() => {
+    const handleClickOutside = (e: MouseEvent) => {
+      if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node)) {
+        setClipboardDropdownOpen(false);
+      }
+    };
+    if (clipboardDropdownOpen) {
+      document.addEventListener('mousedown', handleClickOutside);
+    }
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, [clipboardDropdownOpen]);
+
   const handleDelete = async (id: number) => {
     if (!confirm('Delete this search from history?')) return;
 
@@ -281,7 +397,52 @@ export default function GeminiPanel({ projectPath, geminiPrompt }: GeminiPanelPr
     <div className="h-full flex flex-col">
       {/* Header */}
       <div className="px-3 py-2 bg-[#333] flex items-center justify-between shrink-0">
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-3">
+          {/* Clipboard Actions Dropdown */}
+          <div className="relative" ref={dropdownRef}>
+            <button
+              onClick={() => setClipboardDropdownOpen(!clipboardDropdownOpen)}
+              className={`flex items-center gap-1 px-2 py-1 rounded text-[10px] transition-colors ${
+                clipboardDropdownOpen
+                  ? 'bg-accent/20 text-accent'
+                  : 'text-[#888] hover:text-white hover:bg-[#444]'
+              }`}
+              title="Применить из буфера"
+            >
+              <ClipboardPaste size={12} />
+              <span>Буфер</span>
+              <ChevronDown size={10} className={`transition-transform ${clipboardDropdownOpen ? 'rotate-180' : ''}`} />
+            </button>
+
+            {clipboardDropdownOpen && (
+              <div className="absolute top-full left-0 mt-1 z-50 bg-[#252525] border border-[#444] rounded-lg shadow-xl min-w-[140px] py-1">
+                <button
+                  onClick={() => {
+                    handleClipboardResearch('research');
+                    setClipboardDropdownOpen(false);
+                  }}
+                  className="w-full flex items-center gap-2 px-3 py-2 text-[11px] text-[#ccc] hover:bg-accent/20 hover:text-accent transition-colors"
+                >
+                  <Search size={12} />
+                  <span>Research</span>
+                </button>
+                <button
+                  onClick={() => {
+                    handleClipboardResearch('compact');
+                    setClipboardDropdownOpen(false);
+                  }}
+                  className="w-full flex items-center gap-2 px-3 py-2 text-[11px] text-[#ccc] hover:bg-purple-500/20 hover:text-purple-400 transition-colors"
+                >
+                  <FileText size={12} />
+                  <span>Compact</span>
+                </button>
+              </div>
+            )}
+          </div>
+
+          {/* Divider */}
+          <div className="w-px h-4 bg-[#444]" />
+
           <span className="text-[11px] uppercase text-[#aaa]">Чаты</span>
           <span className="text-[10px] text-accent">{conversations.length}</span>
           {terminalSelection && (

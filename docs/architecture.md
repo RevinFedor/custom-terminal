@@ -10,50 +10,37 @@
 ## 2. Data & Metadata Layer
 - **SQLite (`noted-terminal.db`):** Хранит сессии AI (`ai_sessions`) и глобальное состояние приложения (`app_state`).
 - **JSON (`projects.json`):** Хранит метаданные проектов, заметки и расширенные данные табов.
-- **Tab Metadata:**
-    - `commandType`: Тип процесса (`devServer`, `claude`, `gemini`, `generic`). Влияет на видимость кнопки Restart.
-    - `colorSetManually`: Флаг, блокирующий автоматическую смену цвета таба при запуске команд.
-    - `claudeSessionId`: UUID активной сессии Claude Code. См. `knowledge/fix-claude-id-capture.md`.
-    - `wasInterrupted`: Статус некорректного завершения сессии.
-- **Persistence Strategy:**
-    - Дебаунс сохранение (300-500мс) для предотвращения фризов интерфейса. См. `knowledge/fix-data-persistence.md`.
-    - При закрытии приложения (`beforeunload`) используется синхронный вызов для гарантии записи.
+- **Minayu History Layer (`~/.minayu/history/`):** Система снепшотов для Gemini Time Machine. Хранит полные копии JSON-сессий для каждого "хода" (turn) пользователя. См. `features/time-machine.md`.
+- **Tab Metadata: ... (прежние поля)**
+    - `geminiSessionId`: UUID активной сессии Gemini CLI.
+- **Persistence Strategy: ...**
 
 ## 3. PendingAction Pattern
-Механизм отложенного выполнения команд после создания нового терминала. Решает проблему: как выполнить internal-команду (например, `claude-f`) в новой вкладке, когда shell ещё не готов?
+Механизм отложенного выполнения команд после создания нового терминала.
 
 ### Типы действий:
 ```ts
 interface PendingAction {
-  type: 'claude-fork' | 'claude-continue' | 'shell-command';
-  sessionId?: string;  // Для claude-fork, claude-continue
+  type: 'claude-fork' | 'claude-continue' | 'gemini-fork' | 'gemini-continue' | 'shell-command';
+  sessionId?: string;  // Для всех AI экшенов
   command?: string;    // Для shell-command
 }
 ```
 
 ### Архитектура:
 1. **Store (`useWorkspaceStore`):** Tab содержит поле `pendingAction?: PendingAction`.
-2. **createTab / createTabAfterCurrent:** Принимает `options.pendingAction`. Для `shell-command` передаёт команду в PTY через `initialCommand`. Для internal-команд (`claude-fork`, etc.) — не передаёт.
-3. **Terminal.tsx (`handleData`):** При первом выводе PTY (= shell готов) проверяет `pendingAction` и вызывает `executePendingAction()`.
-4. **executePendingAction:** Отправляет IPC `claude:run-command` с нужными параметрами, затем очищает `pendingAction`.
-
-### Почему не setTimeout:
-- **Ненадёжно:** Произвольная задержка может не совпадать с реальной готовностью shell.
-- **Event-driven:** Первый вывод от PTY — надёжный сигнал готовности. Shell уже прочитал `.zshrc` и готов к вводу.
-
-### Пример использования (Fork в новую вкладку):
-```ts
-await createTabAfterCurrent(projectId, undefined, cwd, {
-  pendingAction: { type: 'claude-fork', sessionId: '...' }
-});
-// Terminal.tsx при первом PTY output вызовет:
-// ipcRenderer.send('claude:run-command', { command: 'claude-f', forkSessionId: '...' })
-```
+2. **createTab / createTabAfterCurrent:** Принимает `options.pendingAction`. 
+    - **UX Fix:** Для Gemini сессий ID передаётся сразу в `options.geminiSessionId`, чтобы избежать мерцания "No Session" в UI. См. `knowledge/fix-ai-ui-flicker.md`.
+3. **Terminal.tsx (`handleData`):** При первом выводе PTY вызывает `executePendingAction()`.
+4. **executePendingAction:** Отправляет IPC `claude:run-command` или `gemini:run-command` с нужными параметрами, затем очищает `pendingAction`.
 
 ## 4. Terminal Integration
-- **Backend:** `node-pty` + **Shell Integration (OSC 7)**. См. `knowledge/fact-osc7-cwd.md`.
-- **Truecolor (24-bit):** Принудительная установка `COLORTERM`. См. `knowledge/fix-terminal-colors.md`.
-- **Frontend:** `xterm.js` с **Canvas рендерером**. См. `knowledge/fix-ui-stability.md` (почему не WebGL).
+- **Backend:** `node-pty` + **Shell Integration (OSC 7)**.
+- **AI Integrations:**
+    - **Claude Sniper:** Захват UUID через `fs.watch` на `.jsonl` файлы.
+    - **Gemini Sniper:** Захват UUID через `fs.watch` на `session-*.json`. Особенность: файл создаётся только после первого сообщения. См. `knowledge/fix-gemini-id-capture.md`.
+    - **Gemini True Fork:** Клонирование сессии через физическое копирование и патчинг JSON (подмена `sessionId`). См. `knowledge/fix-gemini-true-fork.md`.
+- **Truecolor (24-bit): ...**
 - **Layering Pattern:** Использование слоев и Portals для отрисовки UI поверх Canvas. См. `knowledge/fix-layering-pattern.md`.
 - **Large Input:** Разбиение на чанки (Chunking) для вставки промптов > 4KB. См. `knowledge/fix-pty-buffer-overflow.md`.
 
