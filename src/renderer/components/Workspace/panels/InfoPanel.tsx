@@ -13,8 +13,8 @@ interface HistoryTurn {
   file: string;
 }
 
-// UUID v4 regex pattern
-const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// UUID v4 regex pattern (without anchors to extract from text)
+const UUID_EXTRACT_REGEX = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
 
 interface Project {
   id: string;
@@ -456,10 +456,11 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                       }
                       try {
                         const clipboardText = await navigator.clipboard.readText();
-                        const trimmed = clipboardText.trim();
-                        if (UUID_REGEX.test(trimmed)) {
+                        const match = clipboardText.match(UUID_EXTRACT_REGEX);
+                        if (match) {
+                          const extractedUuid = match[0];
                           setTabCommandType(activeTabId, 'claude');
-                          ipcRenderer.send('claude:run-command', { tabId: activeTabId, command: 'claude-f', forkSessionId: trimmed });
+                          ipcRenderer.send('claude:run-command', { tabId: activeTabId, command: 'claude-f', forkSessionId: extractedUuid });
                         } else {
                           showToast('В буфере нет UUID', 'warning');
                         }

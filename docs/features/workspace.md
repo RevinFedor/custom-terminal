@@ -21,7 +21,22 @@
 - **Explorer:** Анимация 150мс. Автоматически открывается в CWD активного терминала. См. `knowledge/fact-osc7-cwd.md`.
 - **Empty State:** Если в проекте нет вкладок, отображаются быстрые кнопки (Claude, Gemini, New Tab).
 
+## User Flow: Dashboard
+
+Dashboard является стартовым экраном приложения, ориентированным на быстрый доступ к проектам.
+
+- **Project Selection:** Клик по карточке проекта загружает его контекст (терминалы, вкладки).
+
+- **Cleanup:** Из Dashboard удалены все вкладки (Prompts, Quick Commands), так как управление ими перенесено в настройки приложения. Теперь интерфейс Dashboard максимально сфокусирован на списке проектов.
+
+
+
 ## Code Map
-- **UI:** `src/renderer/App.tsx` — рендеринг Project Tabs и контекстного меню проектов.
+
+- **UI (Project Tabs):** `src/renderer/App.tsx` — рендеринг и Drag-and-Drop проектов.
+
+- **UI (Dashboard):** `src/renderer/components/Dashboard/Dashboard.tsx`.
+
 - **Explorer:** `src/renderer/components/Workspace/FileExplorer.tsx`.
-- **Logic:** `src/main/main.js` — IPC для сохранения заметок в `projects.json`.
+
+- **Logic:** `src/main/main.js` — IPC для сохранения заметок и состояния.
