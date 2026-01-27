@@ -10,39 +10,31 @@
 ## 2. Data & Metadata Layer
 - **SQLite (`noted-terminal.db`):** Хранит сессии AI (`ai_sessions`) и глобальное состояние приложения (`app_state`).
 - **JSON (`projects.json`):** Хранит метаданные проектов, заметки и расширенные данные табов.
-- **Minayu History Layer (`~/.minayu/history/`):** Система снепшотов для Gemini Time Machine. Хранит полные копии JSON-сессий для каждого "хода" (turn) пользователя. См. `features/time-machine.md`.
-- **Tab Metadata: ... (прежние поля)**
+- **Minayu History Layer (`~/.minayu/history/`):** Система снепшотов для Gemini Time Machine. См. `features/time-machine.md`.
+- **Tab Metadata:**
     - `geminiSessionId`: UUID активной сессии Gemini CLI.
-- **Persistence Strategy: ...**
+    - `wasInterrupted`: Флаг прерванной сессии для показа Overlay.
+    - `overlayDismissed`: Флаг осознанного закрытия оверлея пользователем (сохраняется в БД, колонка `overlay_dismissed`). См. `knowledge/fix-interrupted-overlay-persistence.md`.
+- **Persistence Strategy:** Состояние табов сохраняется в SQLite. Важное ограничение: данные PTY, приходящие во время размонтирования таба, временно теряются. См. `knowledge/fix-terminal-serialization-loss.md`.
 
-## 3. PendingAction Pattern
-Механизм отложенного выполнения команд после создания нового терминала.
-
-### Типы действий:
-```ts
-interface PendingAction {
-  type: 'claude-fork' | 'claude-continue' | 'gemini-fork' | 'gemini-continue' | 'shell-command';
-  sessionId?: string;  // Для всех AI экшенов
-  command?: string;    // Для shell-command
-}
-```
-
-### Архитектура:
-1. **Store (`useWorkspaceStore`):** Tab содержит поле `pendingAction?: PendingAction`.
-2. **createTab / createTabAfterCurrent:** Принимает `options.pendingAction`. 
-    - **UX Fix:** Для Gemini сессий ID передаётся сразу в `options.geminiSessionId`, чтобы избежать мерцания "No Session" в UI. См. `knowledge/fix-ai-ui-flicker.md`.
-3. **Terminal.tsx (`handleData`):** При первом выводе PTY вызывает `executePendingAction()`.
-4. **executePendingAction:** Отправляет IPC `claude:run-command` или `gemini:run-command` с нужными параметрами, затем очищает `pendingAction`.
+## 3. Startup & Recovery Flow
+Система гарантирует плавное восстановление состояния без визуального шума.
+- **RestoreLoader:** При запуске приложения или переключении проекта включается полноэкранный лоадер (флаг `isRestoring` в store).
+- **Batch Restoration:** Во время восстановления `createTab` не переключает `activeTabId`, предотвращая "дёрганье" UI. Финальный таб устанавливается один раз в конце процесса.
+- **Persistence:** Каждое изменение таба (CWD, цвет, ID сессии) немедленно синхронизируется с SQLite.
 
 ## 4. Terminal Integration
-- **Backend:** `node-pty` + **Shell Integration (OSC 7)**.
+- **Backend:** `node-pty`.
+- **Shell Integration (OSC 7 & 133):**
+    - **OSC 7:** Передача текущего рабочего каталога (CWD). См. `knowledge/fact-osc7-cwd.md`.
+    - **OSC 133 (Event-Driven):** Использование невидимых сигналов от шелла для отслеживания жизненного цикла команд. Позволяет мгновенно узнавать о старте и завершении процесса без polling. См. `knowledge/fact-shell-integration.md`.
+- **Search Engine:** Интеграция `@xterm/addon-search` для полнотекстового поиска по буферу.
+    - **Proposed API:** Для работы поиска в `xterm.js` включена опция `allowProposedApi: true`.
 - **AI Integrations:**
     - **Claude Sniper:** Захват UUID через `fs.watch` на `.jsonl` файлы.
-    - **Gemini Sniper:** Захват UUID через `fs.watch` на `session-*.json`. Особенность: файл создаётся только после первого сообщения. См. `knowledge/fix-gemini-id-capture.md`.
-    - **Gemini True Fork:** Клонирование сессии через физическое копирование и патчинг JSON (подмена `sessionId`). См. `knowledge/fix-gemini-true-fork.md`.
-- **Truecolor (24-bit): ...**
-- **Layering Pattern:** Использование слоев и Portals для отрисовки UI поверх Canvas. См. `knowledge/fix-layering-pattern.md`.
-- **Large Input:** Разбиение на чанки (Chunking) для вставки промптов > 4KB. См. `knowledge/fix-pty-buffer-overflow.md`.
+    - **Gemini Sniper:** Захват UUID через `fs.watch` на `session-*.json`. См. `knowledge/fix-gemini-id-capture.md`.
+    - **Timeline Engine:** Асинхронный парсинг JSONL файлов с использованием алгоритма **Backtrace** для фильтрации отменённых (Undo) веток диалога. См. `knowledge/fix-jsonl-backtrace.md`.
+- **Large Input:** Safe Write (chunked write) для вставки промптов > 4KB. См. `knowledge/fix-pty-buffer-overflow.md`.
 
 ## 5. Debug Logger
 Централизованная система логирования на базе библиотеки `debug`.
