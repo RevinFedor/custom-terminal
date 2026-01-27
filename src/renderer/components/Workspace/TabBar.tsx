@@ -1052,7 +1052,7 @@ export default function TabBar({ projectId }: TabBarProps) {
       {/* Context Menu - styled like terminal context menu */}
       {contextMenu && (
         <div
-          className="fixed bg-[#2a2a2a] border border-[#444] rounded-xl shadow-2xl py-2 min-w-[180px] z-[100]"
+          className="fixed bg-[#2a2a2a] border border-[#444] shadow-2xl min-w-[180px] z-[100]"
           style={{ left: contextMenu.x, top: contextMenu.y }}
           onClick={(e) => e.stopPropagation()}
           onMouseDown={(e) => e.stopPropagation()}
@@ -1113,6 +1113,26 @@ export default function TabBar({ projectId }: TabBarProps) {
               </div>
             </div>
           </div>
+
+          {/* Separator */}
+          <div className="my-1 border-t border-[#444]" />
+
+          {/* Copy ID/Path */}
+          <button
+            className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2"
+            onClick={() => {
+              const tab = workspace.tabs.get(contextMenu.tabId);
+              if (tab) {
+                const sessionId = tab.claudeSessionId || tab.geminiSessionId || 'no-session';
+                const path = tab.cwd || project.path || '/';
+                const text = `${sessionId}\n${path}`;
+                navigator.clipboard.writeText(text);
+              }
+              setContextMenu(null);
+            }}
+          >
+            Copy ID/Path
+          </button>
         </div>
       )}
     </>

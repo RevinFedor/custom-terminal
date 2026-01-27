@@ -42,14 +42,14 @@ renderer: {
     },
     plugins: [react()],
     resolve: {
-      alias: {
-        '@': resolve(__dirname, 'src/renderer'),
-        // Dev: use source directly, no need to rebuild gt-editor
-        '@anthropic/markdown-editor': resolve(__dirname, '../gt-editor/packages/markdown-editor/src/index.ts'),
-        // Force single React instance for all packages
-        'react': resolve(__dirname, 'node_modules/react'),
-        'react-dom': resolve(__dirname, 'node_modules/react-dom')
-      },
+      alias: [
+        // CSS must come BEFORE the main package alias
+        { find: '@anthropic/markdown-editor/styles.css', replacement: resolve(__dirname, '../gt-editor/packages/markdown-editor/src/styles/editor.css') },
+        { find: '@anthropic/markdown-editor', replacement: resolve(__dirname, '../gt-editor/packages/markdown-editor/src/index.ts') },
+        { find: '@', replacement: resolve(__dirname, 'src/renderer') },
+        { find: 'react', replacement: resolve(__dirname, 'node_modules/react') },
+        { find: 'react-dom', replacement: resolve(__dirname, 'node_modules/react-dom') }
+      ],
       dedupe: ['react', 'react-dom']
     },
     optimizeDeps: {

@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { MarkdownEditor } from '@anthropic/markdown-editor';
 import '@anthropic/markdown-editor/styles.css';
@@ -9,6 +9,11 @@ import { X } from 'lucide-react';
 
 const { ipcRenderer } = window.require('electron');
 
+// EditorView type from CodeMirror (available via MarkdownEditor's onEditorView callback)
+interface EditorViewLike {
+  focus: () => void;
+}
+
 export default function NotesEditorModal() {
   const { notesEditorOpen, notesEditorProjectId, closeNotesEditor, showToast, wordWrap } = useUIStore();
   const { openProjects } = useWorkspaceStore();
@@ -18,6 +23,9 @@ export default function NotesEditorModal() {
   const [projectPath, setProjectPath] = useState<string | null>(null);
   const [projectName, setProjectName] = useState('');
   const [hasChanges, setHasChanges] = useState(false);
+
+  // EditorView ref for focus management
+  const editorViewRef = useRef<EditorViewLike | null>(null);
 
   // Load notes when modal opens
   useEffect(() => {
@@ -34,6 +42,27 @@ export default function NotesEditorModal() {
       }
     }
   }, [notesEditorOpen, notesEditorProjectId, openProjects, projects]);
+
+  // Auto-focus editor when modal opens
+  useEffect(() => {
+    if (notesEditorOpen && editorViewRef.current) {
+      // Small delay to ensure animation is complete and editor is ready
+      const timer = setTimeout(() => {
+        editorViewRef.current?.focus();
+      }, 100);
+      return () => clearTimeout(timer);
+    }
+  }, [notesEditorOpen]);
+
+  // Handle EditorView instance from MarkdownEditor
+  // Using 'any' for compatibility with MarkdownEditor's EditorView type
+  const handleEditorView = useCallback((view: any) => {
+    editorViewRef.current = view;
+    // Focus immediately if modal is already open
+    if (view && notesEditorOpen) {
+      setTimeout(() => view.focus(), 50);
+    }
+  }, [notesEditorOpen]);
 
   // Helper to extract notes string from potentially nested object
   const extractNotes = (notes: any): string => {
@@ -187,6 +216,7 @@ export default function NotesEditorModal() {
                 fontSize={14}
                 wordWrap={wordWrap}
                 foldStateKey={`notes:${notesEditorProjectId}`}
+                onEditorView={handleEditorView}
               />
             </div>
           </motion.div>

@@ -18,10 +18,11 @@ const isDev = !app.isPackaged;
 let mainWindow;
 const terminals = new Map(); // tabId -> ptyProcess
 const terminalProjects = new Map(); // tabId -> cwd path
+const terminalCommandState = new Map(); // tabId -> { isRunning: boolean, lastExitCode: number }
 let sessionManager; // Initialized after projectManager is ready
 let claudeManager; // Initialized with terminals map
 
-// Shell integration directory (for OSC 7 cwd reporting)
+// Shell integration directory (for OSC 7 cwd reporting + OSC 133 command lifecycle)
 const shellIntegrationDir = path.join(app.getPath('userData'), 'shell-integration');
 
 // Create shell integration files on startup
@@ -31,8 +32,9 @@ function setupShellIntegration() {
     fs.mkdirSync(shellIntegrationDir, { recursive: true });
   }
 
-  // Zsh integration - .zshrc that loads user's config and adds OSC 7
-  const zshIntegration = `# CustomTerminal Shell Integration
+  // Zsh integration - .zshrc that loads user's config and adds OSC 7 + OSC 133
+  // IMPORTANT: Use \033 (octal) for ESC and \007 for BEL - \e doesn't work reliably
+  const zshIntegration = `# Noted Terminal Shell Integration
 # This file is auto-generated - do not edit
 
 # Load user's original .zshrc
@@ -42,20 +44,43 @@ fi
 
 # OSC 7 - Report current directory to terminal
 __ct_osc7() {
-  printf '\e]7;file://%s%s\e\\' "$HOST" "$PWD"
+  printf "\\033]7;file://%s%s\\033\\\\" "$HOST" "$PWD"
 }
 
-# Hook into directory changes
-autoload -Uz add-zsh-hook 2>/dev/null
-add-zsh-hook chpwd __ct_osc7
-add-zsh-hook precmd __ct_osc7
+# ============ OSC 133 - Command Lifecycle (VS Code protocol) ============
+# A - Prompt started
+# B - Command started (after user presses Enter)
+# C - Command executing
+# D;exit_code - Command finished with exit code
 
-# Send initial cwd
-__ct_osc7
+__ct_precmd() {
+  local ret=$?
+  # Command finished (D)
+  printf "\\033]133;D;%s\\007" "$ret"
+  # Report cwd
+  printf "\\033]7;file://%s%s\\033\\\\" "$HOST" "$PWD"
+  # Prompt starting (A)
+  printf "\\033]133;A\\007"
+}
+
+__ct_preexec() {
+  # Command started (B)
+  printf "\\033]133;B\\007"
+  # Command executing (C)
+  printf "\\033]133;C\\007"
+}
+
+# Install hooks
+autoload -Uz add-zsh-hook 2>/dev/null
+add-zsh-hook precmd __ct_precmd
+add-zsh-hook preexec __ct_preexec
+
+# Send initial prompt
+printf "\\033]133;A\\007"
 `;
 
-  // Bash integration
-  const bashIntegration = `# CustomTerminal Shell Integration
+  // Bash integration - use \033 (octal) for ESC
+  const bashIntegration = `# Noted Terminal Shell Integration
 # This file is auto-generated - do not edit
 
 # Load user's original .bashrc
@@ -63,17 +88,35 @@ if [[ -f "$HOME/.bashrc" ]]; then
   source "$HOME/.bashrc"
 fi
 
-# OSC 7 - Report current directory to terminal
-__ct_osc7() {
-  printf '\e]7;file://%s%s\e\\' "$HOSTNAME" "$PWD"
+__ct_in_command=0
+
+__ct_prompt_command() {
+  local ret=$?
+  if [[ "$__ct_in_command" == "1" ]]; then
+    # Command finished (D)
+    printf "\\033]133;D;%s\\007" "$ret"
+    __ct_in_command=0
+  fi
+  # Report cwd (OSC 7)
+  printf "\\033]7;file://%s%s\\033\\\\" "$HOSTNAME" "$PWD"
+  # Prompt starting (A)
+  printf "\\033]133;A\\007"
 }
 
-# Add to PROMPT_COMMAND
-PROMPT_COMMAND="__ct_osc7
-\${PROMPT_COMMAND:+;\$PROMPT_COMMAND}"
+__ct_preexec() {
+  if [[ "$BASH_COMMAND" != "__ct_prompt_command" && "$__ct_in_command" == "0" ]]; then
+    # Command started (B) + executing (C)
+    printf "\\033]133;B\\007"
+    printf "\\033]133;C\\007"
+    __ct_in_command=1
+  fi
+}
 
-# Send initial cwd
-__ct_osc7
+PROMPT_COMMAND="__ct_prompt_command"
+trap '__ct_preexec' DEBUG
+
+# Initial prompt
+printf "\\033]133;A\\007"
 `;
 
   // Write integration files
@@ -83,10 +126,66 @@ __ct_osc7
   console.log('[Shell Integration] Created at:', shellIntegrationDir);
 }
 
+// Parse OSC 133 sequences and emit events
+// OSC 133 format: \x1b]133;X\x07 or \x1b]133;X;param\x07
+// X can be: A (prompt start), B (command start), C (executing), D;exitcode (finished)
+function parseOSC133AndEmit(tabId, data) {
+  // Regex to match OSC 133 sequences
+  // \x1b] = ESC ]
+  // 133; = OSC 133
+  // ([A-D]) = command type
+  // (;[^]*?)? = optional params (like exit code for D)
+  // [\x07\x1b\\] = terminator (BEL or ST)
+  const osc133Regex = /\x1b\]133;([A-D])(;[^\x07\x1b]*)?(?:\x07|\x1b\\)/g;
+
+  let match;
+  while ((match = osc133Regex.exec(data)) !== null) {
+    const type = match[1];
+    const param = match[2] ? match[2].slice(1) : null; // Remove leading ';'
+
+    const state = terminalCommandState.get(tabId) || { isRunning: false, lastExitCode: 0 };
+
+    switch (type) {
+      case 'A': // Prompt start - shell is waiting for input
+        console.log(`[OSC 133] Tab ${tabId}: Prompt ready (A)`);
+        break;
+
+      case 'B': // Command start - user pressed Enter
+        console.log(`[OSC 133] Tab ${tabId}: Command STARTED (B)`);
+        state.isRunning = true;
+        terminalCommandState.set(tabId, state);
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('terminal:command-started', { tabId });
+        }
+        break;
+
+      case 'C': // Command executing
+        console.log(`[OSC 133] Tab ${tabId}: Executing (C)`);
+        // Already handled by B
+        break;
+
+      case 'D': // Command finished
+        state.isRunning = false;
+        state.lastExitCode = param ? parseInt(param, 10) : 0;
+        console.log(`[OSC 133] Tab ${tabId}: Command FINISHED (D) exitCode=${state.lastExitCode}`);
+        terminalCommandState.set(tabId, state);
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('terminal:command-finished', {
+            tabId,
+            exitCode: state.lastExitCode
+          });
+        }
+        break;
+    }
+  }
+}
+
 function createWindow() {
   const windowOptions = {
     width: 1900,
     height: 1000,
+    show: false, // Don't show until ready
+    backgroundColor: '#1a1a1a', // Dark background instead of white flash
     titleBarStyle: 'hidden',
     titleBarOverlay: {
       color: 'rgba(0,0,0,0)',
@@ -100,6 +199,12 @@ function createWindow() {
   };
 
   mainWindow = new BrowserWindow(windowOptions);
+
+  // Show window when ready (prevents white flash)
+  mainWindow.once('ready-to-show', () => {
+    mainWindow.show();
+    mainWindow.focus();
+  });
 
   // Set dev icon in Dock if in development mode (macOS specific)
   if (isDev && process.platform === 'darwin') {
@@ -185,6 +290,10 @@ app.on('window-all-closed', () => {
 app.on('activate', () => {
   if (BrowserWindow.getAllWindows().length === 0) {
     createWindow();
+  } else if (mainWindow) {
+    // Show and focus existing window when clicking dock icon
+    mainWindow.show();
+    mainWindow.focus();
   }
 });
 
@@ -246,8 +355,13 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
 
     terminals.set(tabId, ptyProcess);
     terminalProjects.set(tabId, workingDir);
+    terminalCommandState.set(tabId, { isRunning: false, lastExitCode: 0 });
 
     ptyProcess.onData((data) => {
+      // Parse OSC 133 for command lifecycle events (just spy, don't modify)
+      parseOSC133AndEmit(tabId, data);
+
+      // Send raw data to renderer - xterm.js handles OSC sequences itself
       if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.webContents.send('terminal:data', { pid: ptyProcess.pid, tabId, data });
       }
@@ -259,6 +373,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
       }
       terminals.delete(tabId);
       terminalProjects.delete(tabId);
+      terminalCommandState.delete(tabId);
     });
 
     console.timeEnd(`[PERF:main] terminal:create ${tabId}`);
@@ -378,6 +493,12 @@ ipcMain.handle('terminal:getCwd', async (event, tabId) => {
 
   // Fallback to stored cwd
   return terminalProjects.get(tabId) || null;
+});
+
+// Get command state (is command running?) - uses OSC 133 tracking
+ipcMain.handle('terminal:getCommandState', async (event, tabId) => {
+  const state = terminalCommandState.get(tabId);
+  return state || { isRunning: false, lastExitCode: 0 };
 });
 
 // Notes management
@@ -1014,6 +1135,546 @@ ipcMain.on('claude:spawn-with-watcher', (event, { tabId, cwd }) => {
   }
 });
 
+// ========== GEMINI INPUT INTERCEPTION ==========
+
+// Store active Gemini watchers by tabId (so we can close them when tab closes)
+const geminiWatchers = new Map();
+
+// Gemini Sniper Watcher: watch for new session file creation when gemini starts
+// IMPORTANT: Gemini creates session file only AFTER first user message, not at startup!
+// Session files are stored in ~/.gemini/tmp/<SHA256_HASH>/chats/session-<datetime>-<id>.json
+ipcMain.on('gemini:spawn-with-watcher', (event, { tabId, cwd }) => {
+  console.log('[Gemini Sniper] ========================================');
+  console.log('[Gemini Sniper] IPC received: gemini:spawn-with-watcher');
+  console.log('[Gemini Sniper] TabId:', tabId);
+  console.log('[Gemini Sniper] CWD from renderer:', cwd);
+
+  // Close any existing watcher for this tab
+  if (geminiWatchers.has(tabId)) {
+    console.log('[Gemini Sniper] Closing existing watcher for tab');
+    const oldWatcher = geminiWatchers.get(tabId);
+    try { oldWatcher.close(); } catch (e) {}
+    geminiWatchers.delete(tabId);
+  }
+
+  // Calculate SHA256 hash of the cwd (this is how Gemini organizes projects)
+  const normalizedCwd = path.resolve(cwd || os.homedir());
+  const dirHash = crypto.createHash('sha256').update(normalizedCwd).digest('hex');
+  const chatsDir = path.join(os.homedir(), '.gemini', 'tmp', dirHash, 'chats');
+
+  console.log('[Gemini Sniper] Normalized CWD:', normalizedCwd);
+  console.log('[Gemini Sniper] Dir hash:', dirHash);
+  console.log('[Gemini Sniper] Watching directory:', chatsDir);
+
+  // List existing files in chats dir for debugging
+  let existingFileCount = 0;
+  try {
+    if (fs.existsSync(chatsDir)) {
+      const existingFiles = fs.readdirSync(chatsDir);
+      existingFileCount = existingFiles.length;
+      console.log('[Gemini Sniper] Existing files:', existingFileCount);
+    } else {
+      console.log('[Gemini Sniper] Chats dir does not exist yet');
+    }
+  } catch (e) {
+    console.log('[Gemini Sniper] Could not list chats dir:', e.message);
+  }
+
+  const startTime = Date.now();
+  let watcher = null;
+  let sessionFound = false;
+
+  const closeWatcher = () => {
+    if (watcher) {
+      try { watcher.close(); } catch (e) {}
+      watcher = null;
+      geminiWatchers.delete(tabId);
+      console.log('[Gemini Sniper] Watcher closed for tab:', tabId);
+    }
+  };
+
+  try {
+    // Ensure directory exists (Gemini may create it)
+    if (!fs.existsSync(chatsDir)) {
+      console.log('[Gemini Sniper] Creating chats directory');
+      fs.mkdirSync(chatsDir, { recursive: true });
+    }
+
+    console.log('[Gemini Sniper] Setting up fs.watch (no timeout - waits for first message)...');
+    watcher = fs.watch(chatsDir, (eventType, filename) => {
+      if (sessionFound) return;
+
+      // Gemini session files: session-2026-01-22T22-19-788e351c.json
+      if (!filename || !filename.startsWith('session-') || !filename.endsWith('.json')) return;
+
+      console.log('[Gemini Sniper] Session file event:', eventType, filename);
+      const filePath = path.join(chatsDir, filename);
+
+      // Check if file is fresh (created after our start time)
+      fs.stat(filePath, (err, stats) => {
+        if (err || sessionFound) return;
+
+        const fileTime = stats.birthtimeMs || stats.mtimeMs;
+        if (fileTime >= startTime - 500) {
+          sessionFound = true;
+          console.log('[Gemini Sniper] Fresh session file detected!');
+
+          // Read the file to get the full sessionId
+          try {
+            const content = fs.readFileSync(filePath, 'utf-8');
+            const data = JSON.parse(content);
+            const sessionId = data.sessionId;
+
+            console.log('[Gemini Sniper] ✅ SUCCESS! Session:', sessionId);
+            event.sender.send('gemini:session-detected', { tabId, sessionId });
+          } catch (parseErr) {
+            // Fallback: extract short ID from filename
+            const match = filename.match(/session-.*-([a-f0-9]{8})\.json$/i);
+            if (match) {
+              console.log('[Gemini Sniper] ✅ Using short ID:', match[1]);
+              event.sender.send('gemini:session-detected', { tabId, sessionId: match[1] });
+            }
+          }
+          closeWatcher();
+        }
+      });
+    });
+
+    // Store watcher in map so it can be closed when tab closes
+    geminiWatchers.set(tabId, watcher);
+    console.log('[Gemini Sniper] fs.watch active (will wait for first Gemini message)');
+
+    // Safety timeout: 5 minutes (user might take a while to send first message)
+    setTimeout(() => {
+      if (!sessionFound && geminiWatchers.has(tabId)) {
+        console.log('[Gemini Sniper] ⏱️ 5 min timeout - closing watcher');
+        closeWatcher();
+      }
+    }, 5 * 60 * 1000);
+
+  } catch (e) {
+    console.error('[Gemini Sniper] ❌ Error setting up watcher:', e.message);
+  }
+
+  // Let the command through - write 'gemini' to PTY
+  const term = terminals.get(tabId);
+  if (term) {
+    console.log('[Gemini Sniper] Writing "gemini" to terminal');
+    term.write('gemini\r');
+  } else {
+    console.log('[Gemini Sniper] ❌ Terminal not found for tabId:', tabId);
+  }
+});
+
+// Close Gemini watcher when tab closes
+ipcMain.on('gemini:close-watcher', (event, { tabId }) => {
+  if (geminiWatchers.has(tabId)) {
+    console.log('[Gemini Sniper] Closing watcher for closed tab:', tabId);
+    const watcher = geminiWatchers.get(tabId);
+    try { watcher.close(); } catch (e) {}
+    geminiWatchers.delete(tabId);
+  }
+});
+
+// Gemini run command: execute gemini commands (gemini-c, gemini-f)
+ipcMain.on('gemini:run-command', (event, { tabId, command, sessionId, cwd }) => {
+  const term = terminals.get(tabId);
+  if (!term) {
+    console.error('[Gemini] Terminal not found:', tabId);
+    return;
+  }
+
+  // Get cwd from terminalProjects if not provided
+  const termCwd = cwd || terminalProjects.get(tabId);
+  console.log('[Gemini] Running command:', command, 'sessionId:', sessionId, 'cwd:', termCwd);
+
+  switch (command) {
+    case 'gemini':
+      // New session - handled by spawn-with-watcher
+      break;
+
+    case 'gemini-c':
+      // Continue session (same session)
+      if (sessionId) {
+        term.write(`gemini -r ${sessionId}\r`);
+      } else {
+        console.error('[Gemini] No sessionId for gemini-c');
+      }
+      break;
+
+    case 'gemini-f':
+      // TRUE FORK: copy session file with new UUID
+      if (!sessionId) {
+        console.error('[Gemini] No sessionId for gemini-f');
+        return;
+      }
+
+      console.log('[Gemini Fork] ========================================');
+      console.log('[Gemini Fork] Source sessionId:', sessionId);
+
+      try {
+        // Calculate hash for chats directory
+        const normalizedCwd = path.resolve(termCwd || os.homedir());
+        const dirHash = crypto.createHash('sha256').update(normalizedCwd).digest('hex');
+        const chatsDir = path.join(os.homedir(), '.gemini', 'tmp', dirHash, 'chats');
+
+        console.log('[Gemini Fork] CWD:', normalizedCwd);
+        console.log('[Gemini Fork] Chats dir:', chatsDir);
+
+        if (!fs.existsSync(chatsDir)) {
+          console.error('[Gemini Fork] Chats directory not found');
+          term.write(`echo "❌ Gemini chats directory not found"\r`);
+          return;
+        }
+
+        // Find source session file by reading each JSON and matching sessionId
+        const files = fs.readdirSync(chatsDir).filter(f => f.startsWith('session-') && f.endsWith('.json'));
+        console.log('[Gemini Fork] Found', files.length, 'session files');
+
+        let sourceFile = null;
+        let sourceData = null;
+
+        for (const file of files) {
+          try {
+            const filePath = path.join(chatsDir, file);
+            const content = fs.readFileSync(filePath, 'utf-8');
+            const data = JSON.parse(content);
+            if (data.sessionId === sessionId) {
+              sourceFile = filePath;
+              sourceData = data;
+              console.log('[Gemini Fork] ✓ Found source file:', file);
+              break;
+            }
+          } catch (e) {
+            // Ignore parse errors, continue searching
+          }
+        }
+
+        if (!sourceFile || !sourceData) {
+          console.error('[Gemini Fork] Source session not found:', sessionId);
+          term.write(`echo "❌ Session not found: ${sessionId}"\r`);
+          return;
+        }
+
+        // Generate new UUID and timestamp
+        const newUUID = crypto.randomUUID();
+        const now = new Date();
+        const newTimestamp = now.toISOString().replace(/[:.]/g, '-').slice(0, -5); // 2026-01-24T12-30-45
+        const shortId = newUUID.slice(-8);
+
+        console.log('[Gemini Fork] New UUID:', newUUID);
+        console.log('[Gemini Fork] New timestamp:', newTimestamp);
+
+        // Patch the data
+        const newData = {
+          ...sourceData,
+          sessionId: newUUID,
+          startTime: now.toISOString(),
+          lastUpdateTime: now.toISOString()
+          // projectHash stays the same (same directory)
+        };
+
+        // Save with new filename
+        const newFilename = `session-${newTimestamp}-${shortId}.json`;
+        const newFilePath = path.join(chatsDir, newFilename);
+
+        fs.writeFileSync(newFilePath, JSON.stringify(newData, null, 2), 'utf-8');
+        console.log('[Gemini Fork] ✅ Created fork:', newFilename);
+
+        // Run gemini -r with the NEW session ID
+        term.write(`gemini -r ${newUUID}\r`);
+
+        // Notify renderer about new session ID
+        event.sender.send('gemini:session-detected', { tabId, sessionId: newUUID });
+        console.log('[Gemini Fork] Sent session-detected event with new UUID');
+
+      } catch (error) {
+        console.error('[Gemini Fork] Error:', error);
+        term.write(`echo "❌ Fork error: ${error.message}"\r`);
+      }
+      break;
+
+    default:
+      console.error('[Gemini] Unknown command:', command);
+  }
+});
+
+// ========== GEMINI TIME MACHINE ==========
+// Auto-backup session on every change, allow rollback to any turn
+
+const MINAYU_HISTORY_DIR = path.join(os.homedir(), '.minayu', 'history');
+const geminiHistoryWatchers = new Map(); // sessionId -> { watcher, filePath, lastTurnCount }
+
+// Ensure history directory exists
+if (!fs.existsSync(MINAYU_HISTORY_DIR)) {
+  fs.mkdirSync(MINAYU_HISTORY_DIR, { recursive: true });
+}
+
+// Count user messages (turns) in a session
+function countGeminiTurns(sessionData) {
+  if (!sessionData.messages) return 0;
+  return sessionData.messages.filter(m => m.type === 'user').length;
+}
+
+// Get turn info (user message previews)
+function getGeminiTurnInfo(sessionData) {
+  if (!sessionData.messages) return [];
+
+  const turns = [];
+  let turnIndex = 0;
+
+  for (let i = 0; i < sessionData.messages.length; i++) {
+    const msg = sessionData.messages[i];
+    if (msg.type === 'user') {
+      turnIndex++;
+      turns.push({
+        turnNumber: turnIndex,
+        messageIndex: i,
+        preview: msg.content.slice(0, 100).replace(/\n/g, ' '),
+        timestamp: msg.timestamp
+      });
+    }
+  }
+
+  return turns;
+}
+
+// Save a history snapshot for a specific turn
+function saveGeminiHistorySnapshot(sessionId, sessionData, turnNumber) {
+  const historyDir = path.join(MINAYU_HISTORY_DIR, sessionId);
+  if (!fs.existsSync(historyDir)) {
+    fs.mkdirSync(historyDir, { recursive: true });
+  }
+
+  const snapshotFile = path.join(historyDir, `turn-${String(turnNumber).padStart(3, '0')}.json`);
+
+  // Don't overwrite existing snapshots
+  if (fs.existsSync(snapshotFile)) {
+    return false;
+  }
+
+  fs.writeFileSync(snapshotFile, JSON.stringify(sessionData, null, 2), 'utf-8');
+  console.log('[Gemini TimeMachine] Saved snapshot:', snapshotFile);
+  return true;
+}
+
+// Start watching a session file for changes
+ipcMain.on('gemini:start-history-watcher', (event, { sessionId, cwd }) => {
+  console.log('[Gemini TimeMachine] Starting history watcher for:', sessionId);
+
+  // Close existing watcher for this session
+  if (geminiHistoryWatchers.has(sessionId)) {
+    const old = geminiHistoryWatchers.get(sessionId);
+    try { old.watcher.close(); } catch (e) {}
+    geminiHistoryWatchers.delete(sessionId);
+  }
+
+  // Find the session file
+  const normalizedCwd = path.resolve(cwd || os.homedir());
+  const dirHash = crypto.createHash('sha256').update(normalizedCwd).digest('hex');
+  const chatsDir = path.join(os.homedir(), '.gemini', 'tmp', dirHash, 'chats');
+
+  // Find file by sessionId
+  let sessionFilePath = null;
+  try {
+    const files = fs.readdirSync(chatsDir).filter(f => f.startsWith('session-') && f.endsWith('.json'));
+    for (const file of files) {
+      const filePath = path.join(chatsDir, file);
+      const content = fs.readFileSync(filePath, 'utf-8');
+      const data = JSON.parse(content);
+      if (data.sessionId === sessionId) {
+        sessionFilePath = filePath;
+        break;
+      }
+    }
+  } catch (e) {
+    console.error('[Gemini TimeMachine] Error finding session file:', e.message);
+    return;
+  }
+
+  if (!sessionFilePath) {
+    console.error('[Gemini TimeMachine] Session file not found:', sessionId);
+    return;
+  }
+
+  console.log('[Gemini TimeMachine] Watching file:', sessionFilePath);
+
+  // Read initial state
+  let lastTurnCount = 0;
+  try {
+    const data = JSON.parse(fs.readFileSync(sessionFilePath, 'utf-8'));
+    lastTurnCount = countGeminiTurns(data);
+    // Save initial snapshot
+    if (lastTurnCount > 0) {
+      saveGeminiHistorySnapshot(sessionId, data, lastTurnCount);
+    }
+  } catch (e) {
+    console.error('[Gemini TimeMachine] Error reading initial state:', e.message);
+  }
+
+  // Watch for changes
+  const watcher = fs.watch(sessionFilePath, { persistent: false }, (eventType) => {
+    if (eventType !== 'change') return;
+
+    // Debounce: wait a bit for file to be fully written
+    setTimeout(() => {
+      try {
+        const content = fs.readFileSync(sessionFilePath, 'utf-8');
+        const data = JSON.parse(content);
+        const currentTurnCount = countGeminiTurns(data);
+
+        // New turn detected - save snapshot
+        if (currentTurnCount > lastTurnCount) {
+          console.log('[Gemini TimeMachine] New turn detected:', lastTurnCount, '->', currentTurnCount);
+          saveGeminiHistorySnapshot(sessionId, data, currentTurnCount);
+          lastTurnCount = currentTurnCount;
+
+          // Notify renderer about new turn
+          event.sender.send('gemini:history-updated', { sessionId, turnCount: currentTurnCount });
+        }
+      } catch (e) {
+        // File might be in the middle of being written
+      }
+    }, 500);
+  });
+
+  geminiHistoryWatchers.set(sessionId, { watcher, filePath: sessionFilePath, lastTurnCount });
+});
+
+// Stop watching a session
+ipcMain.on('gemini:stop-history-watcher', (event, { sessionId }) => {
+  if (geminiHistoryWatchers.has(sessionId)) {
+    const { watcher } = geminiHistoryWatchers.get(sessionId);
+    try { watcher.close(); } catch (e) {}
+    geminiHistoryWatchers.delete(sessionId);
+    console.log('[Gemini TimeMachine] Stopped watching:', sessionId);
+  }
+});
+
+// Get history (list of available turns)
+ipcMain.handle('gemini:get-timemachine', async (event, { sessionId, cwd }) => {
+  console.log('[Gemini TimeMachine] Getting history for:', sessionId);
+
+  const historyDir = path.join(MINAYU_HISTORY_DIR, sessionId);
+  const turns = [];
+
+  // Read from saved snapshots
+  if (fs.existsSync(historyDir)) {
+    const files = fs.readdirSync(historyDir)
+      .filter(f => f.startsWith('turn-') && f.endsWith('.json'))
+      .sort();
+
+    for (const file of files) {
+      try {
+        const filePath = path.join(historyDir, file);
+        const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+        const turnInfo = getGeminiTurnInfo(data);
+        const lastTurn = turnInfo[turnInfo.length - 1];
+
+        if (lastTurn) {
+          turns.push({
+            turnNumber: lastTurn.turnNumber,
+            preview: lastTurn.preview,
+            timestamp: lastTurn.timestamp,
+            file: file
+          });
+        }
+      } catch (e) {
+        console.error('[Gemini TimeMachine] Error reading snapshot:', file, e.message);
+      }
+    }
+  }
+
+  return { success: true, turns };
+});
+
+// Rollback to a specific turn
+ipcMain.handle('gemini:rollback', async (event, { sessionId, turnNumber, cwd, tabId }) => {
+  console.log('[Gemini TimeMachine] Rolling back to turn:', turnNumber);
+
+  const historyDir = path.join(MINAYU_HISTORY_DIR, sessionId);
+  const snapshotFile = path.join(historyDir, `turn-${String(turnNumber).padStart(3, '0')}.json`);
+
+  if (!fs.existsSync(snapshotFile)) {
+    return { success: false, error: 'Snapshot not found' };
+  }
+
+  // Find the original session file
+  const normalizedCwd = path.resolve(cwd || os.homedir());
+  const dirHash = crypto.createHash('sha256').update(normalizedCwd).digest('hex');
+  const chatsDir = path.join(os.homedir(), '.gemini', 'tmp', dirHash, 'chats');
+
+  let originalFilePath = null;
+  try {
+    const files = fs.readdirSync(chatsDir).filter(f => f.startsWith('session-') && f.endsWith('.json'));
+    for (const file of files) {
+      const filePath = path.join(chatsDir, file);
+      const content = fs.readFileSync(filePath, 'utf-8');
+      const data = JSON.parse(content);
+      if (data.sessionId === sessionId) {
+        originalFilePath = filePath;
+        break;
+      }
+    }
+  } catch (e) {
+    return { success: false, error: 'Could not find original session file' };
+  }
+
+  if (!originalFilePath) {
+    return { success: false, error: 'Original session file not found' };
+  }
+
+  // Stop the history watcher temporarily
+  if (geminiHistoryWatchers.has(sessionId)) {
+    const { watcher } = geminiHistoryWatchers.get(sessionId);
+    try { watcher.close(); } catch (e) {}
+    geminiHistoryWatchers.delete(sessionId);
+  }
+
+  // DELETE ALL FUTURE SNAPSHOTS (turns > turnNumber)
+  // This is crucial for correct history after rollback
+  try {
+    const snapshotFiles = fs.readdirSync(historyDir)
+      .filter(f => f.startsWith('turn-') && f.endsWith('.json'));
+
+    for (const file of snapshotFiles) {
+      const match = file.match(/^turn-(\d+)\.json$/);
+      if (match) {
+        const fileTurnNumber = parseInt(match[1], 10);
+        if (fileTurnNumber > turnNumber) {
+          const fileToDelete = path.join(historyDir, file);
+          fs.unlinkSync(fileToDelete);
+          console.log('[Gemini TimeMachine] Deleted future snapshot:', file);
+        }
+      }
+    }
+  } catch (e) {
+    console.error('[Gemini TimeMachine] Error cleaning up future snapshots:', e.message);
+  }
+
+  // Kill the terminal process
+  const term = terminals.get(tabId);
+  if (term) {
+    console.log('[Gemini TimeMachine] Killing terminal:', tabId);
+    term.kill();
+    terminals.delete(tabId);
+    terminalProjects.delete(tabId);
+  }
+
+  // Wait for process to die
+  await new Promise(resolve => setTimeout(resolve, 500));
+
+  // Copy snapshot to original location
+  try {
+    fs.copyFileSync(snapshotFile, originalFilePath);
+    console.log('[Gemini TimeMachine] Restored:', snapshotFile, '->', originalFilePath);
+  } catch (e) {
+    return { success: false, error: 'Failed to restore snapshot: ' + e.message };
+  }
+
+  return { success: true, sessionId, cwd };
+});
+
 // Fork Claude session: copy .jsonl file with new UUID, signal renderer to create new tab (legacy)
 // Fork Claude session file: copy .jsonl with new UUID
 // Searches ALL project directories under ~/.claude/projects/ to find the session file
@@ -1106,6 +1767,369 @@ ipcMain.handle('claude:fork-session-file', async (event, { sourceSessionId, cwd 
   }
 });
 
+// Get Claude session timeline for navigation
+// Reads JSONL file and returns filtered entries for Timeline component
+// Uses BACKTRACE algorithm to handle Escape/Undo branches correctly
+ipcMain.handle('claude:get-timeline', async (event, { sessionId, cwd }) => {
+  console.log('[Claude Timeline] Getting timeline for session:', sessionId);
+
+  if (!sessionId) {
+    return { success: false, error: 'No session ID provided' };
+  }
+
+  try {
+    const claudeProjectsDir = path.join(os.homedir(), '.claude', 'projects');
+
+    // Find session file (same logic as fork)
+    let sourcePath = null;
+
+    // Try cwd-based path first
+    if (cwd) {
+      const projectSlug = cwd.replace(/\//g, '-');
+      const primaryPath = path.join(claudeProjectsDir, projectSlug, `${sessionId}.jsonl`);
+      if (fs.existsSync(primaryPath)) {
+        sourcePath = primaryPath;
+      }
+    }
+
+    // Search all directories if not found
+    if (!sourcePath && fs.existsSync(claudeProjectsDir)) {
+      const projectDirs = fs.readdirSync(claudeProjectsDir, { withFileTypes: true })
+        .filter(dirent => dirent.isDirectory())
+        .map(dirent => dirent.name);
+
+      for (const dir of projectDirs) {
+        const checkPath = path.join(claudeProjectsDir, dir, `${sessionId}.jsonl`);
+        if (fs.existsSync(checkPath)) {
+          sourcePath = checkPath;
+          break;
+        }
+      }
+    }
+
+    if (!sourcePath) {
+      return { success: false, error: 'Session file not found' };
+    }
+
+    // Read and parse ALL JSONL records into a Map
+    const content = fs.readFileSync(sourcePath, 'utf-8');
+    const lines = content.trim().split('\n').filter(line => line.trim());
+
+    const recordMap = new Map(); // UUID -> record
+    let lastRecord = null;
+
+    for (const line of lines) {
+      try {
+        const entry = JSON.parse(line);
+        recordMap.set(entry.uuid, entry);
+        lastRecord = entry; // Track the last record in file
+      } catch (parseErr) {
+        // Skip malformed lines
+      }
+    }
+
+    if (!lastRecord) {
+      return { success: true, entries: [] };
+    }
+
+    // BACKTRACE: Walk backwards from the last record following parentUuid
+    // This gives us the ACTIVE branch, ignoring dead branches from Escape/Undo
+    const activeBranch = [];
+    let currentUuid = lastRecord.uuid;
+
+    while (currentUuid) {
+      const record = recordMap.get(currentUuid);
+      if (!record) break;
+
+      activeBranch.unshift(record); // Add to beginning (we're going backwards)
+
+      // Move to parent (use logicalParentUuid for compact boundaries, else parentUuid)
+      currentUuid = record.logicalParentUuid || record.parentUuid;
+    }
+
+    // Now filter the active branch for Timeline display
+    const entries = [];
+    for (const entry of activeBranch) {
+      // Skip sidechain entries (internal Claude operations)
+      if (entry.isSidechain) continue;
+
+      // Skip summary type (internal)
+      if (entry.type === 'summary') continue;
+
+      // Include: user messages, compact boundaries
+      if (entry.type === 'user') {
+        // Normalize content - can be string or array of objects
+        let rawContent = entry.message?.content;
+
+        // Skip tool_result entries - these are automatic, not user input
+        if (Array.isArray(rawContent)) {
+          const hasToolResult = rawContent.some(item => item.type === 'tool_result');
+          if (hasToolResult) {
+            continue;
+          }
+          // Find first text block for other array types
+          const textBlock = rawContent.find(item => item.type === 'text' && item.text);
+          rawContent = textBlock?.text || null;
+        }
+
+        // Skip if no valid content
+        if (!rawContent || typeof rawContent !== 'string') {
+          continue;
+        }
+
+        // Skip system messages that look like user messages
+        if (rawContent === '[Request interrupted by user]' ||
+            rawContent.startsWith('[Request interrupted') ||
+            rawContent === '[User cancelled]') {
+          continue;
+        }
+
+        // Clean up bracketed paste escape sequences [200~ and ~]
+        let cleanContent = rawContent
+          .replace(/\[200~/g, '')
+          .replace(/~\]/g, '')
+          .trim();
+
+        // Skip if content became empty after cleanup
+        if (!cleanContent) {
+          continue;
+        }
+
+        entries.push({
+          uuid: entry.uuid,
+          type: 'user',
+          timestamp: entry.timestamp,
+          content: cleanContent,
+          isCompactSummary: entry.isCompactSummary || false
+        });
+      } else if (entry.type === 'system' && entry.subtype === 'compact_boundary') {
+        entries.push({
+          uuid: entry.uuid,
+          type: 'compact',
+          timestamp: entry.timestamp,
+          content: 'Conversation compacted',
+          preTokens: entry.compactMetadata?.preTokens
+        });
+      }
+    }
+
+    console.log('[Claude Timeline] Found', entries.length, 'entries (from active branch)');
+    return { success: true, entries };
+
+  } catch (error) {
+    console.error('[Claude Timeline] Error:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// Export Claude session as clean text (without code content)
+ipcMain.handle('claude:export-clean-session', async (event, { sessionId, cwd }) => {
+  console.log('[Claude Export] Exporting session:', sessionId);
+
+  if (!sessionId) {
+    return { success: false, error: 'No session ID provided' };
+  }
+
+  try {
+    const claudeProjectsDir = path.join(os.homedir(), '.claude', 'projects');
+
+    // Find session file
+    let sourcePath = null;
+
+    // Try cwd-based path first
+    if (cwd) {
+      const projectSlug = cwd.replace(/\//g, '-');
+      const primaryPath = path.join(claudeProjectsDir, projectSlug, `${sessionId}.jsonl`);
+      if (fs.existsSync(primaryPath)) {
+        sourcePath = primaryPath;
+      }
+    }
+
+    // Search all directories if not found
+    if (!sourcePath && fs.existsSync(claudeProjectsDir)) {
+      const projectDirs = fs.readdirSync(claudeProjectsDir, { withFileTypes: true })
+        .filter(dirent => dirent.isDirectory())
+        .map(dirent => dirent.name);
+
+      for (const dir of projectDirs) {
+        const checkPath = path.join(claudeProjectsDir, dir, `${sessionId}.jsonl`);
+        if (fs.existsSync(checkPath)) {
+          sourcePath = checkPath;
+          break;
+        }
+      }
+    }
+
+    if (!sourcePath) {
+      return { success: false, error: 'Session file not found' };
+    }
+
+    // Read and parse JSONL
+    const content = fs.readFileSync(sourcePath, 'utf-8');
+    const lines = content.trim().split('\n').filter(line => line.trim());
+
+    const outputParts = [];
+    outputParts.push(`# Claude Session Export`);
+    outputParts.push(`Session: ${sessionId}`);
+    outputParts.push(`CWD: ${cwd || 'unknown'}`);
+    outputParts.push(`Exported: ${new Date().toISOString()}`);
+    outputParts.push('');
+
+    // Helper: format tool_use as short action
+    const formatToolAction = (toolName, input) => {
+      switch (toolName) {
+        case 'Read':
+          return `📄 Чтение (${input.file_path || '?'})`;
+        case 'Edit':
+          return `✏️ Редактирование (${input.file_path || '?'})`;
+        case 'Write':
+          return `📝 Создание (${input.file_path || '?'})`;
+        case 'Bash':
+          const cmd = (input.command || '').substring(0, 50);
+          return `🖥 Команда ("${cmd}${input.command?.length > 50 ? '...' : ''}")`;
+        case 'Glob':
+          return `🔍 Поиск файлов (${input.pattern || '?'})`;
+        case 'Grep':
+          return `🔍 Поиск в коде (${input.pattern || '?'})`;
+        case 'Task':
+          return `🤖 Подзадача (${input.description || '?'})`;
+        case 'WebFetch':
+          return `🌐 Веб-запрос`;
+        case 'WebSearch':
+          return `🔎 Веб-поиск (${input.query || '?'})`;
+        case 'TodoWrite':
+          return null; // Skip
+        default:
+          return `⚙️ ${toolName}`;
+      }
+    };
+
+    for (const line of lines) {
+      try {
+        const entry = JSON.parse(line);
+
+        // Skip sidechain entries (internal Claude operations)
+        if (entry.isSidechain) continue;
+
+        // Skip summary type (internal)
+        if (entry.type === 'summary') continue;
+
+        // Handle user messages
+        if (entry.type === 'user') {
+          let rawContent = entry.message?.content;
+
+          // Skip tool_result entries - these are automatic, not user input
+          if (Array.isArray(rawContent)) {
+            const hasToolResult = rawContent.some(item => item.type === 'tool_result');
+            if (hasToolResult) continue;
+
+            const textBlock = rawContent.find(item => item.type === 'text' && item.text);
+            rawContent = textBlock?.text || null;
+          }
+
+          if (!rawContent || typeof rawContent !== 'string') continue;
+
+          // Skip system messages
+          if (rawContent === '[Request interrupted by user]' ||
+              rawContent.startsWith('[Request interrupted') ||
+              rawContent === '[User cancelled]') continue;
+
+          // Clean up bracketed paste escape sequences
+          let cleanContent = rawContent
+            .replace(/\[200~/g, '')
+            .replace(/~\]/g, '')
+            .trim();
+
+          if (!cleanContent) continue;
+
+          outputParts.push('---');
+          outputParts.push('');
+          outputParts.push('👤 USER:');
+          outputParts.push(cleanContent);
+          outputParts.push('');
+        }
+
+        // Handle assistant messages
+        else if (entry.type === 'assistant') {
+          const msgContent = entry.message?.content;
+          if (!msgContent) continue;
+
+          let textContent = '';
+          const toolActions = [];
+
+          if (typeof msgContent === 'string') {
+            textContent = msgContent;
+          } else if (Array.isArray(msgContent)) {
+            const textParts = [];
+
+            for (const block of msgContent) {
+              // Include thinking blocks (shortened)
+              if (block.type === 'thinking' && block.thinking) {
+                // Truncate very long thinking
+                const thinking = block.thinking.length > 500
+                  ? block.thinking.substring(0, 500) + '...[truncated]'
+                  : block.thinking;
+                textParts.push(`<thinking>\n${thinking}\n</thinking>`);
+              }
+
+              // Include text blocks
+              if (block.type === 'text' && block.text) {
+                textParts.push(block.text);
+              }
+
+              // Collect tool actions
+              if (block.type === 'tool_use') {
+                const action = formatToolAction(block.name, block.input || {});
+                if (action) toolActions.push(action);
+              }
+            }
+
+            textContent = textParts.join('\n\n');
+          }
+
+          // Only output if there's content
+          if (textContent.trim() || toolActions.length > 0) {
+            outputParts.push('🤖 CLAUDE:');
+
+            if (textContent.trim()) {
+              outputParts.push(textContent);
+            }
+
+            // Add actions summary on one line
+            if (toolActions.length > 0) {
+              outputParts.push(`   [Действия: ${toolActions.join(', ')}]`);
+            }
+
+            outputParts.push('');
+          }
+        }
+
+        // Handle compact boundaries
+        else if (entry.type === 'system' && entry.subtype === 'compact_boundary') {
+          outputParts.push('');
+          outputParts.push('═══ COMPACTED ═══');
+          if (entry.compactMetadata?.preTokens) {
+            outputParts.push(`(${entry.compactMetadata.preTokens} tokens compacted)`);
+          }
+          outputParts.push('');
+        }
+
+      } catch (parseErr) {
+        console.warn('[Claude Export] Skipping malformed line');
+      }
+    }
+
+    const exportedText = outputParts.join('\n');
+    console.log('[Claude Export] Exported', exportedText.length, 'characters');
+
+    return { success: true, content: exportedText };
+
+  } catch (error) {
+    console.error('[Claude Export] Error:', error);
+    return { success: false, error: error.message };
+  }
+});
+
 // Legacy fork handler (for new tab creation)
 ipcMain.on('claude:fork-session', async (event, { tabId, existingSessionId, cwd }) => {
   console.log('[Claude Fork] Starting fork for tab:', tabId);
@@ -1154,8 +2178,8 @@ ipcMain.on('claude:fork-session', async (event, { tabId, existingSessionId, cwd 
 // ========== CLAUDE COMMAND RUNNER (from UI buttons) ========== 
 // This handles claude commands triggered from InfoPanel buttons
 // bypassing the terminal input interception (which only works for keyboard Enter)
-ipcMain.on('claude:run-command', (event, { tabId, command, sessionId, forkSessionId }) => {
-  console.log('[Claude Runner] Command:', command, 'Tab:', tabId);
+ipcMain.on('claude:run-command', (event, { tabId, command, sessionId, forkSessionId, prompt }) => {
+  console.log('[Claude Runner] Command:', command, 'Tab:', tabId, 'Prompt:', prompt ? `${prompt.slice(0, 50)}...` : 'none');
 
   const term = terminals.get(tabId);
   if (!term) {
@@ -1219,7 +2243,35 @@ ipcMain.on('claude:run-command', (event, { tabId, command, sessionId, forkSessio
         console.error('[Claude Runner] Watcher error:', e.message);
       }
 
-      term.write('claude --dangerously-skip-permissions\r');
+      // Build command with optional prompt
+      if (prompt && prompt.trim()) {
+        // For prompts, we use chunked write with bracketed paste to avoid shell escaping issues
+        // This sends the prompt as if user pasted it, bypassing shell interpretation
+        const baseCmd = 'claude --dangerously-skip-permissions ';
+
+        // Escape the prompt for shell: use double quotes and escape special chars
+        const escapedPrompt = prompt
+          .replace(/\\/g, '\\\\')   // Escape backslashes
+          .replace(/"/g, '\\"')     // Escape double quotes
+          .replace(/\$/g, '\\$')    // Escape dollar signs (prevent variable expansion)
+          .replace(/`/g, '\\`')     // Escape backticks
+          .replace(/!/g, '\\!');    // Escape exclamation marks (history expansion)
+
+        const fullCmd = `${baseCmd}"${escapedPrompt}"`;
+        console.log('[Claude Runner] Full command length:', fullCmd.length);
+
+        // For very long prompts, use chunked write
+        if (fullCmd.length > 1024) {
+          writeToPtySafe(term, fullCmd).then(() => {
+            term.write('\r');
+          });
+        } else {
+          term.write(fullCmd + '\r');
+        }
+        console.log('[Claude Runner] Started with prompt');
+      } else {
+        term.write('claude --dangerously-skip-permissions\r');
+      }
       break;
 
     case 'claude-c':

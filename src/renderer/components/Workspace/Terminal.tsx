@@ -54,6 +54,7 @@ const handleLinkActivation = (event: MouseEvent, uri: string) => {
   }
 };
 import { SerializeAddon } from '@xterm/addon-serialize';
+import { SearchAddon } from '@xterm/addon-search';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore, type PendingAction } from '../../store/useWorkspaceStore';
 import { terminalRegistry } from '../../utils/terminalRegistry';
@@ -72,6 +73,10 @@ const getSetTerminalSelection = () => useUIStore.getState().setTerminalSelection
 // Get Claude session setter/getter outside of component
 const getSetClaudeSessionId = () => useWorkspaceStore.getState().setClaudeSessionId;
 const getClaudeSessionId = (tabId: string) => useWorkspaceStore.getState().getClaudeSessionId(tabId);
+
+// Get Gemini session setter/getter outside of component
+const getSetGeminiSessionId = () => useWorkspaceStore.getState().setGeminiSessionId;
+const getGeminiSessionId = (tabId: string) => useWorkspaceStore.getState().getGeminiSessionId(tabId);
 
 // Get setTabCommandType for auto-color and restart button visibility
 const getSetTabCommandType = () => useWorkspaceStore.getState().setTabCommandType;
@@ -117,6 +122,18 @@ const clearTabPendingAction = (tabId: string) => {
   }
 };
 
+// Get tab cwd for fork commands
+const getTabCwd = (tabId: string): string | undefined => {
+  const state = useWorkspaceStore.getState();
+  for (const [, workspace] of state.openProjects) {
+    const tab = workspace.tabs.get(tabId);
+    if (tab) {
+      return tab.cwd;
+    }
+  }
+  return undefined;
+};
+
 // Execute pending action after terminal is ready
 const executePendingAction = (tabId: string, pendingAction: PendingAction) => {
   console.log('[Terminal:executePendingAction] Executing:', { tabId, pendingAction });
@@ -141,6 +158,36 @@ const executePendingAction = (tabId: string, pendingAction: PendingAction) => {
         ipcRenderer.send('claude:run-command', {
           tabId,
           command: 'claude-c',
+          sessionId: pendingAction.sessionId
+        });
+      }
+      break;
+
+    case 'gemini-fork':
+      if (pendingAction.sessionId) {
+        // Set tab color/type before executing
+        getSetTabCommandType()(tabId, 'gemini');
+        // Note: for fork, we DON'T set sessionId here because main.js will
+        // create a NEW sessionId and send it back via gemini:session-detected
+        const cwd = getTabCwd(tabId);
+        ipcRenderer.send('gemini:run-command', {
+          tabId,
+          command: 'gemini-f',
+          sessionId: pendingAction.sessionId,
+          cwd
+        });
+      }
+      break;
+
+    case 'gemini-continue':
+      if (pendingAction.sessionId) {
+        // Set tab color/type before executing
+        getSetTabCommandType()(tabId, 'gemini');
+        // Set the session ID on this tab (important for rollback!)
+        getSetGeminiSessionId()(tabId, pendingAction.sessionId);
+        ipcRenderer.send('gemini:run-command', {
+          tabId,
+          command: 'gemini-c',
           sessionId: pendingAction.sessionId
         });
       }
@@ -218,6 +265,7 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
   const xtermInstance = useRef<XTerminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
   const serializeAddonRef = useRef<SerializeAddon | null>(null);
+  const searchAddonRef = useRef<SearchAddon | null>(null);
   const webglAddonRef = useRef<WebglAddon | null>(null);
   const isInitialized = useRef(false);
   const isMounted = useRef(true);
@@ -358,14 +406,22 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
     // Sniper Watcher: receive session ID when Claude creates it
     const handleSessionDetected = (_: any, data: { tabId: string; sessionId: string }) => {
       if (data.tabId !== tabId) return;
-      console.log('[Terminal] Sniper caught session:', data.sessionId);
+      console.log('[Terminal] Sniper caught Claude session:', data.sessionId);
       getSetClaudeSessionId()(tabId, data.sessionId);
+    };
+
+    // Gemini Sniper Watcher: receive session ID when Gemini creates it
+    const handleGeminiSessionDetected = (_: any, data: { tabId: string; sessionId: string }) => {
+      if (data.tabId !== tabId) return;
+      console.log('[Terminal] Sniper caught Gemini session:', data.sessionId);
+      getSetGeminiSessionId()(tabId, data.sessionId);
     };
 
     // Register IPC listeners synchronously
     ipcRenderer.on('terminal:data', handleData);
     ipcRenderer.on('terminal:exit', handleExit);
     ipcRenderer.on('claude:session-detected', handleSessionDetected);
+    ipcRenderer.on('gemini:session-detected', handleGeminiSessionDetected);
 
     // Resize observer with Guard Clause (prevents WebGL accordion effect)
     const resizeObserver = new ResizeObserver((entries) => {
@@ -436,16 +492,20 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
         cursorBlink: true,
         cursorStyle: 'block',
         allowTransparency: false,
+        allowProposedApi: true, // Required for SearchAddon
         scrollback: 10000
       });
 
       const fitAddon = new FitAddon();
       const serializeAddon = new SerializeAddon();
+      const searchAddon = new SearchAddon();
       fitAddonRef.current = fitAddon;
       serializeAddonRef.current = serializeAddon;
+      searchAddonRef.current = searchAddon;
 
       term.loadAddon(fitAddon);
       term.loadAddon(serializeAddon);
+      term.loadAddon(searchAddon);
       term.loadAddon(new WebLinksAddon(handleLinkActivation));
 
       term.open(containerRef);
@@ -477,8 +537,8 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
       // Attach scroll listeners (native + xterm events)
       attachScrollListeners(term, containerRef);
 
-      // Register terminal in global registry for selection access
-      terminalRegistry.register(tabId, term);
+      // Register terminal in global registry for selection access and search
+      terminalRegistry.register(tabId, term, searchAddon);
 
       // Restore previously serialized buffer (from before unmount)
       const savedBuffer = getBufferActions().get(tabId);
@@ -556,21 +616,28 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
 
         // --- CASE 1: claude (new session) - must end with exactly "claude" ---
         if (fullLine.endsWith(' claude') || fullLine === 'claude') {
-          log.commands('Detected claude command, setting commandType');
+          log.claude('Detected claude command in terminal');
           getSetTabCommandType()(tabId, 'claude');
           event.preventDefault();
 
-          // Check if session already exists - prevent accidental overwrite
-          const existingId = getClaudeSessionId(tabId);
-          if (existingId) {
-            console.log('[Claude Intercept] Session exists, blocking new:', existingId);
-            ipcRenderer.send('terminal:input', tabId, '\x15echo "❌ Уже есть сессия: ' + existingId + '. Используйте claude-c или claude-f <ID>"\r');
+          // Check if ANY session already exists (Claude OR Gemini) - one session per tab
+          const existingClaudeId = getClaudeSessionId(tabId);
+          const existingGeminiId = getGeminiSessionId(tabId);
+
+          if (existingClaudeId) {
+            log.claude('Blocking: Claude session already exists: %s', existingClaudeId);
+            ipcRenderer.send('terminal:input', tabId, '\x15echo "❌ Уже есть Claude сессия: ' + existingClaudeId + '. Используйте claude-c"\r');
+            return false;
+          }
+          if (existingGeminiId) {
+            log.claude('Blocking: Gemini session exists, cannot start Claude: %s', existingGeminiId);
+            ipcRenderer.send('terminal:input', tabId, '\x15echo "❌ Уже есть Gemini сессия. Откройте новую вкладку для Claude."\r');
             return false;
           }
 
           // Clear line, start watcher, then launch claude
           ipcRenderer.send('terminal:input', tabId, '\x15');
-          console.log('[Claude Intercept] Spawning with Sniper Watcher');
+          log.claude('Sending claude:spawn-with-watcher IPC');
           // Main process will: 1) start fs.watch 2) write 'claude\r' to PTY
           ipcRenderer.send('claude:spawn-with-watcher', { tabId, cwd });
           return false;
@@ -657,6 +724,56 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
           return false;
         }
 
+        // ========== GEMINI INPUT INTERCEPTION ==========
+
+        // --- CASE: gemini (new session) - must end with exactly "gemini" ---
+        if (fullLine.endsWith(' gemini') || fullLine === 'gemini') {
+          log.gemini('Detected gemini command in terminal');
+          log.gemini('TabId: %s, CWD: %s', tabId, cwd);
+          getSetTabCommandType()(tabId, 'gemini');
+          event.preventDefault();
+
+          // Check if ANY session already exists (Claude OR Gemini) - one session per tab
+          const existingGeminiId = getGeminiSessionId(tabId);
+          const existingClaudeId = getClaudeSessionId(tabId);
+
+          if (existingGeminiId) {
+            log.gemini('Blocking: Gemini session already exists: %s', existingGeminiId);
+            ipcRenderer.send('terminal:input', tabId, '\x15echo "❌ Уже есть Gemini сессия: ' + existingGeminiId + '. Используйте gemini-c"\r');
+            return false;
+          }
+          if (existingClaudeId) {
+            log.gemini('Blocking: Claude session exists, cannot start Gemini: %s', existingClaudeId);
+            ipcRenderer.send('terminal:input', tabId, '\x15echo "❌ Уже есть Claude сессия. Откройте новую вкладку для Gemini."\r');
+            return false;
+          }
+
+          // Clear line, start watcher, then launch gemini
+          ipcRenderer.send('terminal:input', tabId, '\x15');
+          log.gemini('Sending gemini:spawn-with-watcher IPC to main process');
+          // Main process will: 1) start fs.watch 2) write 'gemini\r' to PTY
+          ipcRenderer.send('gemini:spawn-with-watcher', { tabId, cwd });
+          return false;
+        }
+
+        // --- CASE: gemini-c (continue session) ---
+        if (fullLine.endsWith(' gemini-c') || fullLine === 'gemini-c') {
+          getSetTabCommandType()(tabId, 'gemini');
+          const existingSessionId = getGeminiSessionId(tabId);
+          log.gemini('gemini-c command, tabId: %s, sessionId: %s', tabId, existingSessionId);
+          if (existingSessionId) {
+            event.preventDefault();
+            log.gemini('Sending: gemini -r %s', existingSessionId);
+            ipcRenderer.send('terminal:input', tabId, '\x15gemini -r ' + existingSessionId + '\r');
+            return false;
+          } else {
+            event.preventDefault();
+            log.gemini('No Gemini session to continue');
+            ipcRenderer.send('terminal:input', tabId, '\x15echo "❌ No Gemini session saved for this tab"\r');
+            return false;
+          }
+        }
+
         return true; // Allow default handling for other commands
       });
     };
@@ -678,6 +795,10 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
       ipcRenderer.removeListener('terminal:data', handleData);
       ipcRenderer.removeListener('terminal:exit', handleExit);
       ipcRenderer.removeListener('claude:session-detected', handleSessionDetected);
+      ipcRenderer.removeListener('gemini:session-detected', handleGeminiSessionDetected);
+
+      // Close Gemini watcher if active for this tab
+      ipcRenderer.send('gemini:close-watcher', { tabId });
 
       // Serialize terminal buffer before unmount (for restoration after remount)
       const term = xtermInstance.current;
@@ -774,16 +895,20 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
           cursorBlink: true,
           cursorStyle: 'block',
           allowTransparency: false,
+          allowProposedApi: true, // Required for SearchAddon
           scrollback: 10000
         });
 
         const fitAddon = new FitAddon();
         const serializeAddon = new SerializeAddon();
+        const searchAddon = new SearchAddon();
         fitAddonRef.current = fitAddon;
         serializeAddonRef.current = serializeAddon;
+        searchAddonRef.current = searchAddon;
 
         term.loadAddon(fitAddon);
         term.loadAddon(serializeAddon);
+        term.loadAddon(searchAddon);
         term.loadAddon(new WebLinksAddon(handleLinkActivation));
 
         term.open(terminalRef.current);
@@ -814,7 +939,7 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
         // Attach scroll listeners (native + xterm events)
         attachScrollListeners(term, terminalRef.current);
 
-        terminalRegistry.register(tabId, term);
+        terminalRegistry.register(tabId, term, searchAddon);
 
         // Restore previously serialized buffer (from before unmount)
         const savedBuffer = getBufferActions().get(tabId);

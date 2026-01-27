@@ -23,13 +23,16 @@ import createDebug from 'debug';
 // Enable specific categories by default for development
 // Change this line to enable/disable debug categories
 if (typeof window !== 'undefined' && !localStorage.debug) {
-  localStorage.debug = 'app:tabs,app:commands';
+  localStorage.debug = 'app:gemini'; // Temporary: debug Gemini session capture
 }
 
 // Define all log categories
 export const log = {
   // Claude session handling
   claude: createDebug('app:claude'),
+
+  // Gemini session handling
+  gemini: createDebug('app:gemini'),
 
   // Tab operations (colors, creation, switching)
   tabs: createDebug('app:tabs'),
@@ -78,6 +81,7 @@ Debug Logger Help:
 
 Available categories:
   app:claude   - Claude session handling
+  app:gemini   - Gemini session handling
   app:tabs     - Tab operations (colors, creation)
   app:perf     - Performance timing
   app:terminal - Terminal operations
