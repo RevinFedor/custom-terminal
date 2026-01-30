@@ -42,9 +42,10 @@ export default function ProjectCard({
 
   const hasActiveProcesses = tabsStats.active > 0;
 
-  const getFolderName = (path: string) => {
-    const parts = path.split('/');
-    return parts[parts.length - 1] || path;
+  const getShortPath = (fullPath: string) => {
+    const parts = fullPath.split('/').filter(Boolean);
+    if (parts.length <= 2) return fullPath;
+    return `${parts[parts.length - 2]}/${parts[parts.length - 1]}`;
   };
 
   const handleEdit = (e: React.MouseEvent) => {
@@ -80,6 +81,8 @@ export default function ProjectCard({
     }
   };
 
+  const [pathHovered, setPathHovered] = useState(false);
+
   return (
     <div
       className={`
@@ -90,7 +93,10 @@ export default function ProjectCard({
         }
       `}
       onClick={onOpen}
-      onMouseLeave={() => setMenuOpen(false)}
+      onMouseLeave={() => {
+        setMenuOpen(false);
+        setPathHovered(false);
+      }}
     >
       {/* Project Name */}
       <div className="flex items-center gap-2 px-2.5 pt-3 pb-0.5">
@@ -105,11 +111,21 @@ export default function ProjectCard({
         </span>
       </div>
 
-      {/* Path */}
+      {/* Path with Instant Tooltip */}
       <div 
-        className="px-2.5 text-[10px] text-[#555] truncate group-hover:text-[#888] transition-colors"
+        className="px-2.5 text-[10px] text-[#555] truncate group-hover:text-[#888] transition-colors relative"
+        onMouseEnter={() => setPathHovered(true)}
+        onMouseLeave={() => setPathHovered(false)}
       >
-        {project.path}
+        {getShortPath(project.path)}
+
+        {pathHovered && (
+          <div 
+            className="absolute left-0 bottom-full mb-1 z-[100] bg-[#333] text-white text-[9px] px-2 py-1 rounded shadow-xl border border-white/10 whitespace-nowrap pointer-events-none"
+          >
+            {project.path}
+          </div>
+        )}
       </div>
 
       {/* Stats */}

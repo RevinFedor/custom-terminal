@@ -7,23 +7,17 @@
     - **Stability:** Используется `disable-http-cache` для предотвращения загрузки устаревшего кода в продакшн-билдах. См. `knowledge/fix-terminal-colors.md`.
 - **Renderer Process:** React 19 UI. Общается с Main через типизированные IPC-вызовы (см. `src/preload/index.js`).
 
-## 2. Data & Metadata Layer
-- **SQLite (`noted-terminal.db`):** Хранит сессии AI (`ai_sessions`), глобальное состояние приложения (`app_state`), проекты (`projects`) и закладки (`bookmarks`).
-- **Project IDs (UUID):** Проекты больше не привязаны к `base64(path)`. Теперь используется уникальный ID (UUID/Timestamp), что позволяет создавать несколько независимых инстансов (копий) одного и того же пути. См. `knowledge/fix-project-instances.md`.
-- **Bookmarks Table:** Новая сущность для хранения «Зарезервированных директорий». Содержит `path`, `name` и `description`. См. `features/bookmarks.md`.
-- **JSON (`projects.json`):** Хранит метаданные проектов, заметки и расширенные данные табов. (Постепенно переносится в SQLite).
-- **Minayu History Layer (`~/.minayu/history/`):** Система снепшотов для Gemini Time Machine. См. `features/time-machine.md`.
-- **Tab Metadata:**
-    - `geminiSessionId`: UUID активной сессии Gemini CLI.
-    - `wasInterrupted`: Флаг прерванной сессии для показа Overlay.
-    - `overlayDismissed`: Флаг осознанного закрытия оверлея пользователем (сохраняется в БД, колонка `overlay_dismissed`). См. `knowledge/fix-interrupted-overlay-persistence.md`.
-- **Persistence Strategy:** Состояние табов сохраняется в SQLite. Важное ограничение: данные PTY, приходящие во время размонтирования таба, временно теряются. См. `knowledge/fix-terminal-serialization-loss.md`.
+## 2. Project Instance Model (Philosophy)
+Проект в системе перестал быть «путем на диске» и стал самостоятельной **Сущностью (Entity)**.
+- **Entity vs Path:** Раньше один путь `~/app` соответствовал одному проекту. Теперь проект — это уникальный ID в БД. Путь (`path`) — лишь один из атрибутов.
+- **Multiple Instances:** Архитектура позволяет создавать неограниченное количество инстансов для одной и той же директории. Каждый инстанс имеет свой набор вкладок, заметок и историю AI.
+- **ID Generation:** Используется композитный ID: `base64(path)` + `timestamp` + `random`. См. `knowledge/fix-project-instances.md`.
 
 ## 3. Startup & Recovery Flow
 Система гарантирует плавное восстановление состояния без визуального шума.
-- **RestoreLoader:** При запуске приложения или переключении проекта включается полноэкранный лоадер (флаг `isRestoring` в store).
-- **Batch Restoration:** Во время восстановления `createTab` не переключает `activeTabId`, предотвращая "дёрганье" UI. Финальный таб устанавливается один раз в конце процесса.
-- **Persistence:** Каждое изменение таба (CWD, цвет, ID сессии) немедленно синхронизируется с SQLite.
+- **Prepare-before-show:** При переключении проекта или запуске система сначала инициализирует PTY-процессы и готовит терминалы в фоне. UI переключается только после готовности ядра.
+- **RestoreLoader:** Глобальный лоадер (флаг `isRestoring`) скрывает процесс инициализации, делая переходы бесшовными.
+- **Dashboard Retention:** При удалении проекта из Dashboard пользователь остается на главном экране, предотвращая переход в пустое рабочее пространство.
 
 ## 4. Terminal Integration
 - **Backend:** `node-pty`.

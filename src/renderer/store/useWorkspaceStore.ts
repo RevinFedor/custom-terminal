@@ -332,6 +332,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       openProjects.set(projectId, newWorkspace);
       
       console.log('[Store] Preparing project tabs before switching view...');
+      set({ isRestoring: true });
 
       // Restore saved tabs or create default one
       if (savedTabs.length > 0) {
@@ -356,7 +357,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       set({ 
         openProjects: new Map(openProjects), 
         activeProjectId: projectId, 
-        view: 'workspace' 
+        view: 'workspace',
+        isRestoring: false
       });
 
       saveSession();
@@ -367,7 +369,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   },
 
   closeProject: async (projectId) => {
-    const { openProjects, activeProjectId, saveSession, syncAllTabsCwd } = get();
+    const { openProjects, activeProjectId, view, saveSession, syncAllTabsCwd } = get();
     const workspace = openProjects.get(projectId);
 
     if (workspace) {
@@ -383,10 +385,14 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       });
 
       openProjects.delete(projectId);
+      
+      const isClosingActive = activeProjectId === projectId;
+      
       set({
         openProjects: new Map(openProjects),
-        activeProjectId: activeProjectId === projectId ? null : activeProjectId,
-        view: activeProjectId === projectId ? 'dashboard' : 'workspace'
+        activeProjectId: isClosingActive ? null : activeProjectId,
+        // Only switch to dashboard if we closed the active project AND we were in workspace view
+        view: (isClosingActive && view === 'workspace') ? 'dashboard' : view
       });
 
       saveSession();
