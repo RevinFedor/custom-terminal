@@ -1,0 +1,65 @@
+(Весь текст ниже является копипастом из истории Claude Code / нейросетки, а не содержимым файла)
+
+---
+
+ Нет, у нас проблема базовая в том, что при наведении на значок вопроса и при наведении на карточку у 
+нас есть hover-эффект, который меняет фон. Так вот проблема в том, что у этого hover-эффекта высота не 
+карточки, а высота вот этого блока, который значок вопрос и который три точка. 
+
+⏺ Понял! Проблема в том, что hover-фон кнопок не на всю высоту карточки. Нужно чтобы кнопки
+  растягивались на всю высоту карточки, а hover покрывал её полностью.
+
+⏺ Read(src/renderer/components/Dashboard/BookmarkCard.tsx)
+  ⎿  Read 45 lines
+
+⏺ Исправлю - нужно items-stretch на контейнере и self-stretch + flex items-center на кнопках без py:
+
+⏺ Update(src/renderer/components/Dashboard/BookmarkCard.tsx)
+  ⎿  Updated src/renderer/components/Dashboard/BookmarkCard.tsx with 6 additions and 6 removals
+        83              </div>
+        84            )}
+        85    
+        86 -          {/* Right side buttons - stretch full height, no gaps */}
+        86 +          {/* Right side buttons - stretch full height */}
+        87            <div
+        88 -            className="flex items-center self-stretch rounded-r-lg"
+        88 +            className="flex items-stretch self-stretch"
+        89              onMouseEnter={() => setIsButtonsHovered(true)}
+        90              onMouseLeave={() => setIsButtonsHovered(false)}
+        91              onClick={(e) => e.stopPropagation()}
+        92            >
+        93              {/* Info button - only render if description exists */}
+        94              {bookmark.description && (
+        95 -              <span className="relative group/info flex items-center">
+        95 +              <span className="relative group/info flex items-stretch">
+        96                  <button
+        97 -                  className="px-2 py-3
+           -   text-[#666] hover:text-white hover:bg-white/10 transition-colors cursor-pointer"
+        97 +                  className="px-2 flex items-center
+           +   text-[#666] hover:text-white hover:bg-white/10 transition-colors cursor-pointer"
+        98                  >
+        99                    <HelpCircle size={14} />
+       100                  </button>
+     ...
+       116              )}
+       117    
+       118              {/* Menu button */}
+       119 -            <div className="relative flex items-center">
+       119 +            <div className="relative flex items-stretch">
+       120                <button
+       121 -                className="px-2 py-3
+           -   text-[#666] hover:text-white hover:bg-white/10 rounded-r-lg transition-colors 
+           -  cursor-pointer"
+       121 +                className="px-2 flex items-center
+           +   text-[#666] hover:text-white hover:bg-white/10 rounded-r-lg transition-colors 
+           +  cursor-pointer"
+       122                  onClick={(e) => {
+       123                    e.stopPropagation();
+       124                    setShowMenu(!showMenu);
+
+⏺ Изменения:
+  1. Контейнер: items-center → items-stretch (дети растягиваются на всю высоту)
+  2. Кнопки: убрал py-3, добавил flex items-center для центрирования иконки
+  3. Обёртки: items-stretch для растягивания
+
+  Теперь hover-фон должен быть на всю высоту карточки. Проверь.

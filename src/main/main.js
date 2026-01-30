@@ -677,9 +677,25 @@ ipcMain.handle('project:list', () => {
   return Object.values(projectManager.projects);
 });
 
+// Get project by ID (not path)
+ipcMain.handle('project:getById', (event, projectId) => {
+  console.log('[Main] project:getById called with:', projectId);
+  const result = projectManager.db.getProjectById(projectId);
+  console.log('[Main] project:getById result:', result);
+  return result;
+});
+
 // Create new project instance (allows multiple projects with same path)
 ipcMain.handle('project:create-instance', (event, { path: projectPath, name }) => {
-  return projectManager.db.createProjectInstance(projectPath, name);
+  console.log('[Main] project:create-instance called with:', { projectPath, name });
+  try {
+    const result = projectManager.db.createProjectInstance(projectPath, name);
+    console.log('[Main] project:create-instance result:', result);
+    return result;
+  } catch (err) {
+    console.error('[Main] project:create-instance error:', err);
+    throw err;
+  }
 });
 
 // App state (session, settings)
@@ -698,28 +714,28 @@ ipcMain.on('app:setStateSync', (event, { key, value }) => {
   event.returnValue = { success: true };
 });
 
-ipcMain.handle('project:save-note', (event, { dirPath, content }) => {
-  projectManager.saveProjectNote(dirPath, content);
+ipcMain.handle('project:save-note', (event, { projectId, content }) => {
+  projectManager.saveProjectNote(projectId, content);
   return { success: true };
 });
 
-ipcMain.handle('project:save-actions', (event, { dirPath, actions }) => {
-  projectManager.saveProjectActions(dirPath, actions);
+ipcMain.handle('project:save-actions', (event, { projectId, actions }) => {
+  projectManager.saveProjectActions(projectId, actions);
   return { success: true };
 });
 
-ipcMain.handle('project:save-tabs', (event, { dirPath, tabs }) => {
-  projectManager.saveProjectTabs(dirPath, tabs);
+ipcMain.handle('project:save-tabs', (event, { projectId, tabs }) => {
+  projectManager.saveProjectTabs(projectId, tabs);
   return { success: true };
 });
 
-ipcMain.handle('project:save-metadata', (event, { dirPath, metadata }) => {
-  projectManager.saveProjectMetadata(dirPath, metadata);
+ipcMain.handle('project:save-metadata', (event, { projectId, metadata }) => {
+  projectManager.saveProjectMetadata(projectId, metadata);
   return { success: true };
 });
 
-ipcMain.handle('project:delete', (event, dirPath) => {
-  const result = projectManager.deleteProject(dirPath);
+ipcMain.handle('project:delete', (event, projectId) => {
+  const result = projectManager.deleteProject(projectId);
   return { success: result };
 });
 

@@ -1,5 +1,6 @@
 import { defineConfig } from 'electron-vite';
 import react from '@vitejs/plugin-react';
+import tailwindcss from '@tailwindcss/vite';
 import { resolve } from 'path';
 
 export default defineConfig({
@@ -40,7 +41,7 @@ renderer: {
         requireReturnsDefault: 'auto'
       }
     },
-    plugins: [react()],
+    plugins: [react(), tailwindcss()],
     resolve: {
       alias: [
         // CSS must come BEFORE the main package alias

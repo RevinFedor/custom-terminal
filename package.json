@@ -59,6 +59,7 @@
     "@electron/rebuild": "^4.0.2",
     "@playwright/test": "^1.57.0",
     "@tailwindcss/cli": "^4.1.18",
+    "@tailwindcss/vite": "^4.1.18",
     "@types/debug": "^4.1.12",
     "@vitejs/plugin-react": "^5.1.2",
     "electron": "^28.0.0",

@@ -157,9 +157,9 @@ let saveSessionTimer: NodeJS.Timeout | null = null;
 let saveTabsTimers: Map<string, NodeJS.Timeout> = new Map();
 
 // Helper to save tabs to database (debounced)
-const saveTabs = (projectPath: string, tabs: Map<string, Tab>, immediate = false) => {
+const saveTabs = (projectId: string, tabs: Map<string, Tab>, immediate = false) => {
   // Clear existing timer for this project
-  const existingTimer = saveTabsTimers.get(projectPath);
+  const existingTimer = saveTabsTimers.get(projectId);
   if (existingTimer) clearTimeout(existingTimer);
 
   const doSave = async () => {
@@ -168,23 +168,21 @@ const saveTabs = (projectPath: string, tabs: Map<string, Tab>, immediate = false
       cwd: tab.cwd,
       color: tab.color,
       isUtility: tab.isUtility,
-      claudeSessionId: tab.claudeSessionId, // Persist Claude session ID
-      geminiSessionId: tab.geminiSessionId, // Persist Gemini session ID
-      wasInterrupted: tab.wasInterrupted, // Persist interrupted state
-      overlayDismissed: tab.overlayDismissed, // Persist overlay dismissed state
-      notes: tab.notes // Persist tab notes
+      claudeSessionId: tab.claudeSessionId,
+      geminiSessionId: tab.geminiSessionId,
+      wasInterrupted: tab.wasInterrupted,
+      overlayDismissed: tab.overlayDismissed,
+      notes: tab.notes
     }));
-    await ipcRenderer.invoke('project:save-tabs', { dirPath: projectPath, tabs: tabsArray });
-    saveTabsTimers.delete(projectPath);
+    await ipcRenderer.invoke('project:save-tabs', { projectId, tabs: tabsArray });
+    saveTabsTimers.delete(projectId);
   };
 
   if (immediate) {
-    // Save immediately (for shutdown scenarios)
     doSave();
   } else {
-    // Debounce: save after 500ms of inactivity
     const timer = setTimeout(doSave, 500);
-    saveTabsTimers.set(projectPath, timer);
+    saveTabsTimers.set(projectId, timer);
   }
 };
 
@@ -312,43 +310,54 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   },
 
   openProject: async (projectId, projectPath) => {
+    console.log('[Store] openProject called:', { projectId, projectPath });
     const { openProjects, createTab, saveSession } = get();
 
     if (!openProjects.has(projectId)) {
-      // Load saved tabs from database
+      console.log('[Store] Project not in openProjects, loading from DB...');
+      // Load saved tabs from database - use getById to get correct project (not just any with same path)
 
-      const projectData = await ipcRenderer.invoke('project:get', projectPath);
+      const projectData = await ipcRenderer.invoke('project:getById', projectId);
+      console.log('[Store] project:getById returned:', projectData);
       const savedTabs = projectData?.tabs || [];
-
+      console.log('[Store] savedTabs:', savedTabs);
 
       const newWorkspace: ProjectWorkspace = {
         projectId,
         projectPath,
         tabs: new Map(),
         activeTabId: null,
-        tabCounter: savedTabs.length
+        tabCounter: 0 // Start from 0 for new projects
       };
       openProjects.set(projectId, newWorkspace);
-      set({ openProjects: new Map(openProjects), activeProjectId: projectId, view: 'workspace' });
+      
+      console.log('[Store] Preparing project tabs before switching view...');
 
       // Restore saved tabs or create default one
       if (savedTabs.length > 0) {
+        newWorkspace.tabCounter = savedTabs.length;
         for (const savedTab of savedTabs) {
-          console.log('[Store] Restoring tab with claudeSessionId:', savedTab.claudeSessionId, 'geminiSessionId:', savedTab.geminiSessionId, 'wasInterrupted:', savedTab.wasInterrupted, 'overlayDismissed:', savedTab.overlayDismissed);
           await createTab(projectId, savedTab.name, savedTab.cwd, {
             color: savedTab.color,
             isUtility: savedTab.isUtility,
-            claudeSessionId: savedTab.claudeSessionId, // Restore Claude session ID
-            geminiSessionId: savedTab.geminiSessionId, // Restore Gemini session ID
-            wasInterrupted: savedTab.wasInterrupted, // Restore interrupted state
-            overlayDismissed: savedTab.overlayDismissed, // Restore overlay dismissed state
-            notes: savedTab.notes // Restore tab notes
+            claudeSessionId: savedTab.claudeSessionId,
+            geminiSessionId: savedTab.geminiSessionId,
+            wasInterrupted: savedTab.wasInterrupted,
+            overlayDismissed: savedTab.overlayDismissed,
+            notes: savedTab.notes
           });
         }
       } else {
         // Create default tab
         await createTab(projectId, 'Terminal 1', projectPath);
       }
+
+      console.log('[Store] Tabs prepared, switching to workspace view');
+      set({ 
+        openProjects: new Map(openProjects), 
+        activeProjectId: projectId, 
+        view: 'workspace' 
+      });
 
       saveSession();
     } else {
@@ -366,7 +375,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       await syncAllTabsCwd(projectId);
 
       // Save tabs before closing (manual close = NOT interrupted)
-      saveTabs(workspace.projectPath, workspace.tabs, true);
+      saveTabs(workspace.projectId, workspace.tabs, true);
 
       // Kill all terminals
       workspace.tabs.forEach((tab) => {
@@ -445,7 +454,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     set({ openProjects: new Map(openProjects) });
 
     // Save tabs
-    saveTabs(workspace.projectPath, workspace.tabs);
+    saveTabs(workspace.projectId, workspace.tabs);
 
     console.log('[Store] createTab: Done, returning tabId:', tabId);
     return tabId;
@@ -542,7 +551,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     set({ openProjects: new Map(openProjects) });
 
     // Save tabs
-    saveTabs(workspace.projectPath, workspace.tabs);
+    saveTabs(workspace.projectId, workspace.tabs);
 
     return tabId;
   },
@@ -597,7 +606,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     });
 
     // Save tabs
-    saveTabs(workspace.projectPath, workspace.tabs);
+    saveTabs(workspace.projectId, workspace.tabs);
   },
 
   switchTab: (projectId, tabId) => {
@@ -625,7 +634,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         set({ openProjects: new Map(openProjects) });
 
         // Save tabs
-        saveTabs(workspace.projectPath, workspace.tabs);
+        saveTabs(workspace.projectId, workspace.tabs);
       }
     }
   },
@@ -646,7 +655,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     set({ openProjects: new Map(openProjects) });
 
     // Save tabs
-    saveTabs(workspace.projectPath, workspace.tabs);
+    saveTabs(workspace.projectId, workspace.tabs);
   },
 
   setTabColor: (projectId, tabId, color, manual = true) => {
@@ -661,7 +670,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           tab.colorSetManually = true; // User changed color - prevent auto-override
         }
         set({ openProjects: new Map(openProjects) });
-        saveTabs(workspace.projectPath, workspace.tabs);
+        saveTabs(workspace.projectId, workspace.tabs);
       }
     }
   },
@@ -720,7 +729,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         }
 
         set({ openProjects: new Map(openProjects) });
-        saveTabs(workspace.projectPath, workspace.tabs);
+        saveTabs(workspace.projectId, workspace.tabs);
         break;
       }
     }
@@ -735,7 +744,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       if (tab) {
         tab.isUtility = !tab.isUtility;
         set({ openProjects: new Map(openProjects) });
-        saveTabs(workspace.projectPath, workspace.tabs);
+        saveTabs(workspace.projectId, workspace.tabs);
       }
     }
   },
@@ -775,7 +784,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
 
     workspace.tabs = newTabs;
     set({ openProjects: new Map(openProjects) });
-    saveTabs(workspace.projectPath, workspace.tabs);
+    saveTabs(workspace.projectId, workspace.tabs);
   },
 
   moveTabToZone: (projectId, tabId, toUtility, atIndex) => {
@@ -820,7 +829,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
 
     workspace.tabs = newTabs;
     set({ openProjects: new Map(openProjects) });
-    saveTabs(workspace.projectPath, workspace.tabs);
+    saveTabs(workspace.projectId, workspace.tabs);
   },
 
   moveTabToProject: (sourceProjectId, tabId, targetProjectId) => {
@@ -855,8 +864,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     set({ openProjects: new Map(openProjects) });
 
     // Save both projects
-    saveTabs(sourceWorkspace.projectPath, sourceWorkspace.tabs);
-    saveTabs(targetWorkspace.projectPath, targetWorkspace.tabs);
+    saveTabs(sourceWorkspace.projectId, sourceWorkspace.tabs);
+    saveTabs(targetWorkspace.projectId, targetWorkspace.tabs);
 
     log.tabs(`[moveTabToProject] Moved tab ${tabId} from ${sourceProjectId} to ${targetProjectId}`);
   },
@@ -870,7 +879,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       if (tab && tab.cwd !== newCwd) {
         tab.cwd = newCwd;
         set({ openProjects: new Map(openProjects) });
-        saveTabs(workspace.projectPath, workspace.tabs);
+        saveTabs(workspace.projectId, workspace.tabs);
       }
     }
   },
@@ -911,7 +920,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         tab.overlayDismissed = false;
         console.log(`[Workspace] Claude session set for tab ${tabId}: ${sessionId} (reset overlay flags)`);
         // Save to database so session persists across restarts
-        saveTabs(workspace.projectPath, workspace.tabs);
+        saveTabs(workspace.projectId, workspace.tabs);
         // NOTE: Not calling set() here to avoid re-render that breaks terminal
         return;
       }
@@ -945,7 +954,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         tab.wasInterrupted = false;
         tab.overlayDismissed = false;
         console.log(`[Workspace] Gemini session set for tab ${tabId}: ${sessionId} (reset overlay flags)`);
-        saveTabs(workspace.projectPath, workspace.tabs);
+        saveTabs(workspace.projectId, workspace.tabs);
         return;
       }
     }
@@ -971,7 +980,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       const tab = workspace.tabs.get(tabId);
       if (tab) {
         tab.notes = notes;
-        saveTabs(workspace.projectPath, workspace.tabs);
+        saveTabs(workspace.projectId, workspace.tabs);
         return;
       }
     }
@@ -1031,7 +1040,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         tab.overlayDismissed = false;
         console.log('[Store] Cleared interrupted state for tab:', tabId);
         // Save to persist the change
-        saveTabs(workspace.projectPath, workspace.tabs);
+        saveTabs(workspace.projectId, workspace.tabs);
         // Trigger re-render so overlay disappears
         set({ openProjects: new Map(openProjects) });
         return;
@@ -1052,7 +1061,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         // Mark as dismissed so it won't be re-marked on shutdown
         tab.overlayDismissed = true;
         // Save to database
-        saveTabs(workspace.projectPath, workspace.tabs);
+        saveTabs(workspace.projectId, workspace.tabs);
         // Trigger re-render
         set({ openProjects: new Map(openProjects) });
         return;
@@ -1077,7 +1086,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       }
       if (changed) {
         // Save immediately (shutdown scenario)
-        saveTabs(workspace.projectPath, workspace.tabs, true);
+        saveTabs(workspace.projectId, workspace.tabs, true);
       }
     }
   },

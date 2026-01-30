@@ -8,8 +8,10 @@
 - **Renderer Process:** React 19 UI. Общается с Main через типизированные IPC-вызовы (см. `src/preload/index.js`).
 
 ## 2. Data & Metadata Layer
-- **SQLite (`noted-terminal.db`):** Хранит сессии AI (`ai_sessions`) и глобальное состояние приложения (`app_state`).
-- **JSON (`projects.json`):** Хранит метаданные проектов, заметки и расширенные данные табов.
+- **SQLite (`noted-terminal.db`):** Хранит сессии AI (`ai_sessions`), глобальное состояние приложения (`app_state`), проекты (`projects`) и закладки (`bookmarks`).
+- **Project IDs (UUID):** Проекты больше не привязаны к `base64(path)`. Теперь используется уникальный ID (UUID/Timestamp), что позволяет создавать несколько независимых инстансов (копий) одного и того же пути. См. `knowledge/fix-project-instances.md`.
+- **Bookmarks Table:** Новая сущность для хранения «Зарезервированных директорий». Содержит `path`, `name` и `description`. См. `features/bookmarks.md`.
+- **JSON (`projects.json`):** Хранит метаданные проектов, заметки и расширенные данные табов. (Постепенно переносится в SQLite).
 - **Minayu History Layer (`~/.minayu/history/`):** Система снепшотов для Gemini Time Machine. См. `features/time-machine.md`.
 - **Tab Metadata:**
     - `geminiSessionId`: UUID активной сессии Gemini CLI.
@@ -71,8 +73,8 @@ Continue → claude --resume ID | Dismiss → overlayDismissed = true
 - **Хелперы:** Доступны через глобальный объект `window.debug`.
 
 ## 7. Styling & Rendering
-- **Tailwind v4:** Использует JIT-компиляцию и директиву `@source` для сканирования `.tsx` файлов. См. `knowledge/fix-tailwind-v4-source.md`.
-- **Dynamic Styles:** Для рантайм-цветов используются Inline Styles. См. `knowledge/fix-data-persistence.md`.
+- **Tailwind v4 + Vite:** Используется официальный плагин `@tailwindcss/vite`, обеспечивающий мгновенный HMR и автоматическое сканирование зависимостей. См. `knowledge/fix-tailwind-v4-source.md`.
+- **Dynamic Styles:** Для рантайм-цветов используются Inline Styles (Tailwind не поддерживает динамическую генерацию классов типа `bg-${color}`). См. `knowledge/fix-tailwind-dynamic-runtime.md`.
 - **Markdown:** Специальный рендерер для исправления гидратации и inline-кода. См. `knowledge/fix-markdown-hydration.md` и `knowledge/fix-markdown-inline-code.md`.
 - **Hotkeys:** Перехват `Cmd+Plus/Minus` для изменения шрифта терминала вместо системного зума. См. `knowledge/fix-ui-stability.md` (раздел 6).
 
