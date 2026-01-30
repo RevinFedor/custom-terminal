@@ -42,9 +42,11 @@ interface ProjectTabItemProps {
   isActive: boolean;
   fontSize: number;
   forceRightIndicator?: boolean;
+  activeProcessCount?: number; // Count of running processes in project
   onClick: () => void;
   onContextMenu: (e: React.MouseEvent) => void;
   onMiddleClick: () => void;
+  onTabDrop?: (tabId: string, sourceProjectId: string) => void; // For dropping terminal tabs
 }
 
 const ProjectTabItem = memo(({
@@ -54,13 +56,16 @@ const ProjectTabItem = memo(({
   isActive,
   fontSize,
   forceRightIndicator = false,
+  activeProcessCount = 0,
   onClick,
   onContextMenu,
-  onMiddleClick
+  onMiddleClick,
+  onTabDrop
 }: ProjectTabItemProps) => {
   const ref = useRef<HTMLButtonElement>(null);
   const [closestEdge, setClosestEdge] = useState<Edge | null>(null);
   const [isDragging, setIsDragging] = useState(false);
+  const [isTabDropTarget, setIsTabDropTarget] = useState(false); // Highlight when terminal tab is over
 
   useEffect(() => {
     const element = ref.current;
@@ -81,33 +86,65 @@ const ProjectTabItem = memo(({
             { element, input, allowedEdges: ['left', 'right'] }
           );
         },
-        canDrop: ({ source }) => source.data.type === 'PROJECT_TAB',
+        canDrop: ({ source }) => {
+          // Accept both PROJECT_TAB (for reordering) and TAB (terminal tabs)
+          return source.data.type === 'PROJECT_TAB' || source.data.type === 'TAB';
+        },
         onDragEnter: ({ source, self }) => {
+          if (source.data.type === 'TAB') {
+            setIsTabDropTarget(true);
+            return;
+          }
           if (source.data.id === projectId) return;
           setClosestEdge(extractClosestEdge(self.data) as Edge | null);
         },
         onDrag: ({ source, self }) => {
+          if (source.data.type === 'TAB') {
+            setIsTabDropTarget(true);
+            return;
+          }
           if (source.data.id === projectId) {
             setClosestEdge(null);
             return;
           }
           setClosestEdge(extractClosestEdge(self.data) as Edge | null);
         },
-        onDragLeave: () => setClosestEdge(null),
-        onDrop: () => setClosestEdge(null),
+        onDragLeave: () => {
+          setClosestEdge(null);
+          setIsTabDropTarget(false);
+        },
+        onDrop: ({ source }) => {
+          setClosestEdge(null);
+          setIsTabDropTarget(false);
+          // Handle terminal tab drop
+          if (source.data.type === 'TAB' && onTabDrop) {
+            const tabData = source.data as { id: string; projectId?: string };
+            if (tabData.projectId && tabData.projectId !== projectId) {
+              onTabDrop(tabData.id, tabData.projectId);
+            }
+          }
+        },
       })
     );
-  }, [projectId, index]);
+  }, [projectId, index, onTabDrop]);
+
+  // Text color: active (selected) = black, has processes = white, idle = gray
+  const textColor = isActive
+    ? 'text-black'
+    : activeProcessCount > 0
+      ? 'text-white'
+      : 'text-gray-400 hover:text-white';
 
   return (
     <button
       ref={ref}
-      className={`relative px-3 py-1.5 text-sm font-medium cursor-pointer transition-colors ${
-        isActive ? 'text-black' : 'text-gray-400 hover:text-white'
-      }`}
+      className={`relative px-3 py-1.5 text-sm font-medium cursor-pointer transition-colors ${textColor}`}
       style={{
         fontSize: `${fontSize}px`,
-        opacity: isDragging ? 0.5 : 1
+        opacity: isDragging ? 0.5 : 1,
+        outline: isTabDropTarget ? '2px solid #4ade80' : 'none',
+        outlineOffset: '-2px',
+        borderRadius: isTabDropTarget ? '4px' : undefined,
       }}
       onClick={onClick}
       onContextMenu={onContextMenu}
@@ -121,7 +158,23 @@ const ProjectTabItem = memo(({
       {isActive && (
         <div className="absolute inset-0 bg-white rounded" />
       )}
-      <span className="relative z-10 max-w-[120px] truncate block">{projectName}</span>
+      <span className="relative z-10 flex items-center gap-1.5">
+        <span className="max-w-[120px] truncate">{projectName}</span>
+        {activeProcessCount > 0 && (
+          <span
+            className="flex items-center justify-center text-[10px] font-medium rounded-full"
+            style={{
+              minWidth: '16px',
+              height: '16px',
+              padding: '0 4px',
+              backgroundColor: isActive ? 'rgba(74, 222, 128, 0.3)' : 'rgba(74, 222, 128, 0.2)',
+              color: isActive ? '#166534' : '#4ade80',
+            }}
+          >
+            {activeProcessCount}
+          </span>
+        )}
+      </span>
       {closestEdge && <ProjectDropIndicator edge={closestEdge as 'left' | 'right'} />}
       {forceRightIndicator && !closestEdge && <ProjectDropIndicator edge="right" />}
     </button>
@@ -185,7 +238,7 @@ const RestoreLoader = memo(() => (
 ));
 
 function App() {
-  const { view, showDashboard, openProject, openProjects, activeProjectId, closeProject, createTab, createTabAfterCurrent, closeTab, getActiveProject, restoreSession, reorderProjects, isRestoring } = useWorkspaceStore();
+  const { view, showDashboard, openProject, openProjects, activeProjectId, closeProject, createTab, createTabAfterCurrent, closeTab, getActiveProject, restoreSession, reorderProjects, moveTabToProject, isRestoring } = useWorkspaceStore();
   const { projects, loadProjects } = useProjectsStore();
   const { toggleFileExplorer, closeFilePreview, filePreview, showToast, incrementAllFontSizes, decrementAllFontSizes } = useUIStore();
   const { toggleResearch } = useResearchStore();
@@ -193,12 +246,65 @@ function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [projectContextMenu, setProjectContextMenu] = useState<{ projectId: string; x: number; y: number } | null>(null);
   const [projectEmptyZoneHovered, setProjectEmptyZoneHovered] = useState(false);
+  const [processStatus, setProcessStatus] = useState<Map<string, boolean>>(new Map()); // tabId -> isRunning
 
   // Load projects and restore session ONCE on mount
   useEffect(() => {
     loadProjects();
     restoreSession();
   }, []); // Empty deps = only on mount
+
+  // Track process status via OSC 133 events
+  useEffect(() => {
+    // Initial load: get state for all tabs
+    const initProcessStatus = async () => {
+      const allTabIds: string[] = [];
+      openProjects.forEach((workspace) => {
+        workspace.tabs.forEach((_, tabId) => {
+          allTabIds.push(tabId);
+        });
+      });
+
+      const newStatus = new Map<string, boolean>();
+      await Promise.all(
+        allTabIds.map(async (tabId) => {
+          try {
+            const state = await ipcRenderer.invoke('terminal:getCommandState', tabId);
+            newStatus.set(tabId, state?.isRunning || false);
+          } catch {
+            newStatus.set(tabId, false);
+          }
+        })
+      );
+      setProcessStatus(newStatus);
+    };
+    initProcessStatus();
+
+    // Listen for command start/finish
+    const handleCommandStarted = (_: any, { tabId }: { tabId: string }) => {
+      setProcessStatus(prev => {
+        const next = new Map(prev);
+        next.set(tabId, true);
+        return next;
+      });
+    };
+
+    const handleCommandFinished = (_: any, { tabId }: { tabId: string }) => {
+      setProcessStatus(prev => {
+        const next = new Map(prev);
+        next.set(tabId, false);
+        return next;
+      });
+    };
+
+    ipcRenderer.on('terminal:command-started', handleCommandStarted);
+    ipcRenderer.on('terminal:command-finished', handleCommandFinished);
+
+    return () => {
+      ipcRenderer.removeListener('terminal:command-started', handleCommandStarted);
+      ipcRenderer.removeListener('terminal:command-finished', handleCommandFinished);
+    };
+  }, [openProjects.size]); // Re-init when projects change
 
   // Save session and mark Claude sessions as interrupted when app closes
   useEffect(() => {
@@ -481,6 +587,12 @@ function App() {
             const isActive = activeProjectId === projectId;
             const isLast = index === openProjectsList.length - 1;
 
+            // Count active processes in this project
+            let activeCount = 0;
+            workspace.tabs.forEach((_, tabId) => {
+              if (processStatus.get(tabId)) activeCount++;
+            });
+
             return (
               <ProjectTabItem
                 key={projectId}
@@ -490,6 +602,7 @@ function App() {
                 isActive={isActive}
                 fontSize={projectTabsFontSize}
                 forceRightIndicator={isLast && projectEmptyZoneHovered}
+                activeProcessCount={activeCount}
                 onClick={() => {
                   openProject(projectId, project.path);
                 }}
@@ -506,6 +619,11 @@ function App() {
                   } else {
                     closeProject(projectId);
                   }
+                }}
+                onTabDrop={(tabId, sourceProjectId) => {
+                  moveTabToProject(sourceProjectId, tabId, projectId);
+                  // Switch to target project
+                  openProject(projectId, project.path);
                 }}
               />
             );

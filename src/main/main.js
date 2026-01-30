@@ -19,6 +19,11 @@ let mainWindow;
 const terminals = new Map(); // tabId -> ptyProcess
 const terminalProjects = new Map(); // tabId -> cwd path
 const terminalCommandState = new Map(); // tabId -> { isRunning: boolean, lastExitCode: number }
+// Claude Thinking Mode State Machine (Tab Handshake with debounce)
+// States: 'WAITING_PROMPT' -> 'DEBOUNCE_PROMPT' -> 'TAB_SENT' -> 'DEBOUNCE_TAB' -> 'READY'
+const claudeState = new Map(); // tabId -> state string | null
+const claudePendingPrompt = new Map(); // tabId -> prompt string
+const claudeDebounceTimers = new Map(); // tabId -> debounce timer ID
 let sessionManager; // Initialized after projectManager is ready
 let claudeManager; // Initialized with terminals map
 
@@ -204,6 +209,12 @@ function createWindow() {
   mainWindow.once('ready-to-show', () => {
     mainWindow.show();
     mainWindow.focus();
+
+    // In dev mode, force window to front (macOS needs extra push)
+    if (isDev && process.platform === 'darwin') {
+      app.dock.show();
+      app.focus({ steal: true });
+    }
   });
 
   // Set dev icon in Dock if in development mode (macOS specific)
@@ -272,7 +283,7 @@ app.whenReady().then(() => {
   sessionManager = new SessionManager(projectManager.db);
   
   // Initialize Claude Manager
-  claudeManager = new ClaudeManager(terminals, terminalProjects);
+  claudeManager = new ClaudeManager(terminals, terminalProjects, claudeState);
   
   createWindow();
 });
@@ -361,6 +372,127 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
       // Parse OSC 133 for command lifecycle events (just spy, don't modify)
       parseOSC133AndEmit(tabId, data);
 
+      // ========== CLAUDE THINKING MODE STATE MACHINE (Debounce Handshake) ==========
+      // Wait for UI to "settle" (no data for 300ms) before sending Tab/prompt
+      const DEBOUNCE_MS = 300;
+      const currentState = claudeState.get(tabId);
+
+      if (currentState) {
+        const stripped = data.replace(/\x1b\[[0-9;]*m/g, '');
+        const term = terminals.get(tabId);
+
+        console.log(`[Claude Handshake] State: ${currentState}, bytes: ${data.length}`);
+
+        // STEP 1: WAITING_PROMPT -> See ">" -> Start debounce for Tab
+        if (currentState === 'WAITING_PROMPT' && stripped.includes('>')) {
+          console.log(`[Claude Handshake] Tab ${tabId}: Prompt ">" detected. Starting debounce...`);
+          claudeState.set(tabId, 'DEBOUNCE_PROMPT');
+
+          // Start debounce timer
+          const timerId = setTimeout(() => {
+            console.log(`[Claude Handshake] Tab ${tabId}: UI settled (${DEBOUNCE_MS}ms silence). Sending TAB...`);
+            term.write('\t');
+            claudeState.set(tabId, 'TAB_SENT');
+            claudeDebounceTimers.delete(tabId);
+          }, DEBOUNCE_MS);
+          claudeDebounceTimers.set(tabId, timerId);
+        }
+
+        // STEP 2: DEBOUNCE_PROMPT -> More data = Reset debounce
+        else if (currentState === 'DEBOUNCE_PROMPT') {
+          console.log(`[Claude Handshake] Tab ${tabId}: More data during debounce, resetting timer...`);
+          clearTimeout(claudeDebounceTimers.get(tabId));
+
+          const timerId = setTimeout(() => {
+            console.log(`[Claude Handshake] Tab ${tabId}: UI settled. Sending TAB...`);
+            term.write('\t');
+            claudeState.set(tabId, 'TAB_SENT');
+            claudeDebounceTimers.delete(tabId);
+          }, DEBOUNCE_MS);
+          claudeDebounceTimers.set(tabId, timerId);
+        }
+
+        // STEP 3: TAB_SENT -> Data received -> Start debounce for prompt
+        else if (currentState === 'TAB_SENT') {
+          console.log(`[Claude Handshake] Tab ${tabId}: UI reacted to Tab. Starting prompt debounce...`);
+          claudeState.set(tabId, 'DEBOUNCE_TAB');
+
+          const timerId = setTimeout(async () => {
+            console.log(`[Claude Handshake] Tab ${tabId}: UI settled after Tab. Sending prompt via Bracketed Paste...`);
+
+            if (claudePendingPrompt.has(tabId)) {
+              const pendingPrompt = claudePendingPrompt.get(tabId);
+              claudePendingPrompt.delete(tabId);
+
+              // Bracketed Paste Mode: tell terminal "this is a paste, not typing"
+              const PASTE_START = '\x1b[200~';
+              const PASTE_END = '\x1b[201~';
+
+              // Step 1: Send text wrapped in paste brackets (NO \r inside!)
+              console.log(`[Claude Handshake] Tab ${tabId}: Sending PASTE_START + prompt (${pendingPrompt.length} chars) + PASTE_END...`);
+              if (pendingPrompt.length > 1024) {
+                // AWAIT for chunked write to complete!
+                await writeToPtySafe(term, PASTE_START + pendingPrompt + PASTE_END);
+                console.log(`[Claude Handshake] Tab ${tabId}: Chunked write complete.`);
+              } else {
+                term.write(PASTE_START + pendingPrompt + PASTE_END);
+              }
+
+              // Step 2: Wait for Ink to exit paste mode, then send Enter
+              setTimeout(() => {
+                console.log(`[Claude Handshake] Tab ${tabId}: Sending SUBMIT (\\r)...`);
+                term.write('\r');
+                console.log(`[Claude Handshake] Tab ${tabId}: ✅ Prompt sent!`);
+              }, 100);
+            }
+
+            claudeState.delete(tabId);
+            claudeDebounceTimers.delete(tabId);
+          }, DEBOUNCE_MS);
+          claudeDebounceTimers.set(tabId, timerId);
+        }
+
+        // STEP 4: DEBOUNCE_TAB -> More data = Reset debounce
+        else if (currentState === 'DEBOUNCE_TAB') {
+          console.log(`[Claude Handshake] Tab ${tabId}: More data after Tab, resetting prompt debounce...`);
+          clearTimeout(claudeDebounceTimers.get(tabId));
+
+          const timerId = setTimeout(async () => {
+            console.log(`[Claude Handshake] Tab ${tabId}: UI settled. Sending prompt via Bracketed Paste...`);
+
+            if (claudePendingPrompt.has(tabId)) {
+              const pendingPrompt = claudePendingPrompt.get(tabId);
+              claudePendingPrompt.delete(tabId);
+
+              // Bracketed Paste Mode
+              const PASTE_START = '\x1b[200~';
+              const PASTE_END = '\x1b[201~';
+
+              console.log(`[Claude Handshake] Tab ${tabId}: Sending PASTE_START + prompt (${pendingPrompt.length} chars) + PASTE_END...`);
+              if (pendingPrompt.length > 1024) {
+                // AWAIT for chunked write to complete!
+                await writeToPtySafe(term, PASTE_START + pendingPrompt + PASTE_END);
+                console.log(`[Claude Handshake] Tab ${tabId}: Chunked write complete.`);
+              } else {
+                term.write(PASTE_START + pendingPrompt + PASTE_END);
+              }
+
+              // Wait for Ink to exit paste mode, then send Enter
+              setTimeout(() => {
+                console.log(`[Claude Handshake] Tab ${tabId}: Sending SUBMIT (\\r)...`);
+                term.write('\r');
+                console.log(`[Claude Handshake] Tab ${tabId}: ✅ Prompt sent!`);
+              }, 100);
+            }
+
+            claudeState.delete(tabId);
+            claudeDebounceTimers.delete(tabId);
+          }, DEBOUNCE_MS);
+          claudeDebounceTimers.set(tabId, timerId);
+        }
+      }
+      // ========== END STATE MACHINE ==========
+
       // Send raw data to renderer - xterm.js handles OSC sequences itself
       if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.webContents.send('terminal:data', { pid: ptyProcess.pid, tabId, data });
@@ -385,15 +517,27 @@ async function writeToPtySafe(term, data) {
   const CHUNK_SIZE = 1024; // 1KB - safe for TTY buffer (OS limit ~4KB)
   const DELAY_MS = 10;     // 10ms - enough for buffer to flush
 
+  console.log('[writeToPtySafe] Starting write, total length:', data.length);
+  console.log('[writeToPtySafe] Data ends with \\r:', data.endsWith('\r'));
+  console.log('[writeToPtySafe] Data ends with \\n:', data.endsWith('\n'));
+  console.log('[writeToPtySafe] Last 10 chars (escaped):', JSON.stringify(data.slice(-10)));
+
+  const totalChunks = Math.ceil(data.length / CHUNK_SIZE);
+  console.log('[writeToPtySafe] Will write in', totalChunks, 'chunk(s)');
+
   for (let i = 0; i < data.length; i += CHUNK_SIZE) {
     const chunk = data.substring(i, i + CHUNK_SIZE);
+    const chunkNum = Math.floor(i / CHUNK_SIZE) + 1;
+    console.log(`[writeToPtySafe] Writing chunk ${chunkNum}/${totalChunks}, size: ${chunk.length}`);
     term.write(chunk);
 
     // Wait for Event Loop and TTY to process
     if (i + CHUNK_SIZE < data.length) {
+      console.log('[writeToPtySafe] Waiting', DELAY_MS, 'ms before next chunk...');
       await new Promise(resolve => setTimeout(resolve, DELAY_MS));
     }
   }
+  console.log('[writeToPtySafe] ✅ All chunks written');
 }
 
 // Bracketed Paste Mode escape sequences
@@ -533,6 +677,11 @@ ipcMain.handle('project:list', () => {
   return Object.values(projectManager.projects);
 });
 
+// Create new project instance (allows multiple projects with same path)
+ipcMain.handle('project:create-instance', (event, { path: projectPath, name }) => {
+  return projectManager.db.createProjectInstance(projectPath, name);
+});
+
 // App state (session, settings)
 ipcMain.handle('app:getState', (event, key) => {
   return projectManager.db.getAppState(key);
@@ -586,6 +735,39 @@ ipcMain.handle('project:select-directory', async () => {
   const selectedPath = result.filePaths[0];
   // getProject will create the project in JSON if it doesn't exist
   return projectManager.getProject(selectedPath);
+});
+
+// ========== BOOKMARKS IPC ==========
+
+ipcMain.handle('bookmark:list', () => {
+  return projectManager.db.getAllBookmarks();
+});
+
+ipcMain.handle('bookmark:create', (event, { path: dirPath, name, description }) => {
+  return projectManager.db.createBookmark(dirPath, name, description || '');
+});
+
+ipcMain.handle('bookmark:update', (event, { id, updates }) => {
+  return projectManager.db.updateBookmark(id, updates);
+});
+
+ipcMain.handle('bookmark:delete', (event, id) => {
+  projectManager.db.deleteBookmark(id);
+  return { success: true };
+});
+
+ipcMain.handle('bookmark:select-directory', async () => {
+  const result = await dialog.showOpenDialog(mainWindow, {
+    properties: ['openDirectory']
+  });
+
+  if (result.canceled || result.filePaths.length === 0) {
+    return null;
+  }
+
+  const selectedPath = result.filePaths[0];
+  const name = require('path').basename(selectedPath);
+  return projectManager.db.createBookmark(selectedPath, name, '');
 });
 
 // Execute quick action command in terminal (fire-and-forget version)
@@ -1131,6 +1313,8 @@ ipcMain.on('claude:spawn-with-watcher', (event, { tabId, cwd }) => {
   // Let the command through - don't intercept, just watch
   const term = terminals.get(tabId);
   if (term) {
+    // Enable thinking mode detection (will send Tab when '>' prompt appears)
+    claudeState.set(tabId, 'WAITING_PROMPT');
     term.write('claude --dangerously-skip-permissions\r');
   }
 });
@@ -2243,41 +2427,25 @@ ipcMain.on('claude:run-command', (event, { tabId, command, sessionId, forkSessio
         console.error('[Claude Runner] Watcher error:', e.message);
       }
 
-      // Build command with optional prompt
+      // Enable thinking mode detection (will send Tab when '>' prompt appears)
+      claudeState.set(tabId, 'WAITING_PROMPT');
+
+      // If prompt provided, save it to send AFTER thinking mode is enabled
       if (prompt && prompt.trim()) {
-        // For prompts, we use chunked write with bracketed paste to avoid shell escaping issues
-        // This sends the prompt as if user pasted it, bypassing shell interpretation
-        const baseCmd = 'claude --dangerously-skip-permissions ';
-
-        // Escape the prompt for shell: use double quotes and escape special chars
-        const escapedPrompt = prompt
-          .replace(/\\/g, '\\\\')   // Escape backslashes
-          .replace(/"/g, '\\"')     // Escape double quotes
-          .replace(/\$/g, '\\$')    // Escape dollar signs (prevent variable expansion)
-          .replace(/`/g, '\\`')     // Escape backticks
-          .replace(/!/g, '\\!');    // Escape exclamation marks (history expansion)
-
-        const fullCmd = `${baseCmd}"${escapedPrompt}"`;
-        console.log('[Claude Runner] Full command length:', fullCmd.length);
-
-        // For very long prompts, use chunked write
-        if (fullCmd.length > 1024) {
-          writeToPtySafe(term, fullCmd).then(() => {
-            term.write('\r');
-          });
-        } else {
-          term.write(fullCmd + '\r');
-        }
-        console.log('[Claude Runner] Started with prompt');
-      } else {
-        term.write('claude --dangerously-skip-permissions\r');
+        claudePendingPrompt.set(tabId, prompt.trim());
+        console.log('[Claude Runner] Prompt saved, will send after thinking mode enabled');
       }
+
+      // Always launch claude without prompt (prompt will be sent after Tab)
+      term.write('claude --dangerously-skip-permissions\r');
       break;
 
     case 'claude-c':
       // Continue session
       if (sessionId) {
         console.log('[Claude Runner] Continuing session:', sessionId);
+        // Enable thinking mode detection (will send Tab when '>' prompt appears)
+        claudeState.set(tabId, 'WAITING_PROMPT');
         term.write(`claude --dangerously-skip-permissions --resume ${sessionId}\r`);
       } else {
         console.error('[Claude Runner] No sessionId for claude-c');
@@ -2335,6 +2503,8 @@ ipcMain.on('claude:run-command', (event, { tabId, command, sessionId, forkSessio
 
           // Run claude --resume in CURRENT terminal (not new tab!)
           // This is for claude-f <uuid> - resuming external session
+          // Enable thinking mode detection (will send Tab when '>' prompt appears)
+          claudeState.set(tabId, 'WAITING_PROMPT');
           term.write(`claude --dangerously-skip-permissions --resume ${newSessionId}\r`);
 
           // Notify renderer about new session ID

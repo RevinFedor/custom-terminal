@@ -2,7 +2,6 @@ import React, { memo, useMemo, useEffect, useState } from 'react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import Terminal from './Terminal';
-import EmptyTerminalPlaceholder from './EmptyTerminalPlaceholder';
 import { motion, AnimatePresence } from 'framer-motion';
 
 const { ipcRenderer } = window.require('electron');
@@ -136,19 +135,7 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
     : null;
   const showInterruptedOverlay = activeTab?.wasInterrupted && activeTab?.claudeSessionId;
 
-  // Check if active project has no active Main tab
-  const hasActiveMainTab = currentWorkspace?.activeTabId != null;
-
-  const handleCreateTab = () => {
-    console.log('[TerminalArea] handleCreateTab called, currentProject:', currentProject?.name);
-    if (currentProject) {
-      console.log('[TerminalArea] Creating tab for project:', projectId, 'path:', currentProject.path);
-      createTab(projectId, undefined, currentProject.path);
-    } else {
-      console.log('[TerminalArea] No currentProject, cannot create tab');
-    }
-  };
-
+  
   // Handle continuing interrupted Claude session
   const handleContinueSession = (sessionId?: string) => {
     const targetSessionId = sessionId || activeTab?.claudeSessionId;
@@ -180,9 +167,19 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
     }
   };
 
-  // Memoize terminal list to prevent unnecessary re-renders
+  // Memoize terminal list - use stable key for comparison
+  // Only rebuild when tabs actually change (add/remove), not on every state update
+  const terminalKeys = useMemo(() => {
+    const keys: string[] = [];
+    openProjects.forEach((workspace) => {
+      workspace.tabs.forEach((tab) => {
+        keys.push(tab.id);
+      });
+    });
+    return keys.join(',');
+  }, [openProjects]);
+
   const terminals = useMemo(() => {
-    console.time('[TerminalArea] Build terminals');
     const result: React.ReactNode[] = [];
 
     openProjects.forEach((workspace, projId) => {
@@ -202,9 +199,8 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
       });
     });
 
-    console.timeEnd('[TerminalArea] Build terminals');
     return result;
-  }, [openProjects, projectId]);
+  }, [terminalKeys, projectId, openProjects]);
 
   // Listen for Claude fork completion to create new tab with command
   useEffect(() => {
@@ -247,15 +243,9 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
 
   // Handle double-click on empty space to create new tab
   const handleDoubleClick = (e: React.MouseEvent) => {
-    console.log('[TerminalArea] Double click detected');
-    console.log('[TerminalArea] target:', e.target);
-    console.log('[TerminalArea] currentTarget:', e.currentTarget);
-    console.log('[TerminalArea] target === currentTarget:', e.target === e.currentTarget);
-
     // Only trigger if clicking directly on the container (not on terminal)
-    if (e.target === e.currentTarget) {
-      console.log('[TerminalArea] Creating new tab...');
-      handleCreateTab();
+    if (e.target === e.currentTarget && currentProject) {
+      createTab(projectId, undefined, currentProject.path);
     }
   };
 
@@ -266,14 +256,6 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
       className="absolute inset-0 bg-bg-main"
       onDoubleClick={handleDoubleClick}
     >
-      {/* Show placeholder when no active tab */}
-      {!hasActiveMainTab && currentProject && (
-        <EmptyTerminalPlaceholder
-          projectName={currentProject.name}
-          onCreateTab={handleCreateTab}
-        />
-      )}
-
       {/* Render all terminals from all projects */}
       {terminals}
 

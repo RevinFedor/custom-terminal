@@ -29,6 +29,7 @@ interface Tab {
   pendingAction?: PendingAction; // Action to execute when terminal is ready
   wasInterrupted?: boolean; // True if tab was closed with active AI session (show resume overlay)
   overlayDismissed?: boolean; // True if user dismissed the interrupted overlay (don't show again)
+  notes?: string; // Tab-specific notes
 }
 
 interface ProjectWorkspace {
@@ -70,8 +71,8 @@ interface WorkspaceStore {
   closeProject: (projectId: string) => Promise<void>;
 
   // Tab management
-  createTab: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; wasInterrupted?: boolean; overlayDismissed?: boolean }) => Promise<string>;
-  createTabAfterCurrent: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; wasInterrupted?: boolean; overlayDismissed?: boolean }) => Promise<string>;
+  createTab: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string }) => Promise<string>;
+  createTabAfterCurrent: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string }) => Promise<string>;
   closeTab: (projectId: string, tabId: string) => Promise<void>;
   switchTab: (projectId: string, tabId: string) => void;
   renameTab: (projectId: string, tabId: string, newName: string) => void;
@@ -87,6 +88,7 @@ interface WorkspaceStore {
   // Advanced drag & drop
   reorderInZone: (projectId: string, zone: 'main' | 'utility', orderedIds: string[]) => void;
   moveTabToZone: (projectId: string, tabId: string, toUtility: boolean, atIndex: number) => void;
+  moveTabToProject: (sourceProjectId: string, tabId: string, targetProjectId: string) => void;
 
   // Update tab cwd
   updateTabCwd: (projectId: string, tabId: string, newCwd: string) => void;
@@ -94,13 +96,15 @@ interface WorkspaceStore {
 
   // Claude session tracking
   setClaudeSessionId: (tabId: string, sessionId: string) => void;
-  clearClaudeSession: (tabId: string) => void; // Clear both claudeSessionId and wasInterrupted
   getClaudeSessionId: (tabId: string) => string | null;
 
   // Gemini session tracking
   setGeminiSessionId: (tabId: string, sessionId: string) => void;
-  clearGeminiSession: (tabId: string) => void;
   getGeminiSessionId: (tabId: string) => string | null;
+
+  // Tab notes
+  setTabNotes: (tabId: string, notes: string) => void;
+  getTabNotes: (tabId: string) => string;
 
   // Interrupted session handling
   clearInterruptedState: (tabId: string) => void;
@@ -167,7 +171,8 @@ const saveTabs = (projectPath: string, tabs: Map<string, Tab>, immediate = false
       claudeSessionId: tab.claudeSessionId, // Persist Claude session ID
       geminiSessionId: tab.geminiSessionId, // Persist Gemini session ID
       wasInterrupted: tab.wasInterrupted, // Persist interrupted state
-      overlayDismissed: tab.overlayDismissed // Persist overlay dismissed state
+      overlayDismissed: tab.overlayDismissed, // Persist overlay dismissed state
+      notes: tab.notes // Persist tab notes
     }));
     await ipcRenderer.invoke('project:save-tabs', { dirPath: projectPath, tabs: tabsArray });
     saveTabsTimers.delete(projectPath);
@@ -336,7 +341,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
             claudeSessionId: savedTab.claudeSessionId, // Restore Claude session ID
             geminiSessionId: savedTab.geminiSessionId, // Restore Gemini session ID
             wasInterrupted: savedTab.wasInterrupted, // Restore interrupted state
-            overlayDismissed: savedTab.overlayDismissed // Restore overlay dismissed state
+            overlayDismissed: savedTab.overlayDismissed, // Restore overlay dismissed state
+            notes: savedTab.notes // Restore tab notes
           });
         }
       } else {
@@ -407,7 +413,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       claudeSessionId: options?.claudeSessionId,
       geminiSessionId: options?.geminiSessionId,
       wasInterrupted: options?.wasInterrupted,
-      overlayDismissed: options?.overlayDismissed
+      overlayDismissed: options?.overlayDismissed,
+      notes: options?.notes
     };
 
     console.log('[Store] createTab: Creating PTY terminal for:', tabId, 'cwd:', newTab.cwd);
@@ -469,7 +476,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       claudeSessionId: options?.claudeSessionId,
       geminiSessionId: options?.geminiSessionId,
       wasInterrupted: options?.wasInterrupted,
-      overlayDismissed: options?.overlayDismissed
+      overlayDismissed: options?.overlayDismissed,
+      notes: options?.notes
     };
 
     // Only pass initialCommand for shell-command type, not for internal commands
@@ -547,18 +555,20 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
 
     const tab = workspace.tabs.get(tabId);
 
-    // Check if terminal has running process
-    const { hasProcess, processName } = await ipcRenderer.invoke('terminal:hasRunningProcess', tabId);
+    // Check if terminal has running process via OSC 133 state (fast, no syscalls)
+    const commandState = await ipcRenderer.invoke('terminal:getCommandState', tabId);
 
-    if (hasProcess) {
+    if (commandState.isRunning) {
+      // Only call hasRunningProcess to get process name (single syscall, not polling)
+      const { processName } = await ipcRenderer.invoke('terminal:hasRunningProcess', tabId);
       const confirmed = window.confirm(
-        `Terminal has a running process: "${processName}"\n\nAre you sure you want to close this tab?`
+        `Terminal has a running process: "${processName || 'unknown'}"\n\nAre you sure you want to close this tab?`
       );
       if (!confirmed) return;
     }
 
     // Check if tab has saved Claude session
-    if (tab?.claudeSessionId && !hasProcess) {
+    if (tab?.claudeSessionId && !commandState.isRunning) {
       const confirmed = window.confirm(
         `Эта вкладка содержит Claude сессию:\n${tab.claudeSessionId}\n\nПри закрытии вы потеряете привязку к этой сессии. Продолжить?`
       );
@@ -813,6 +823,44 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     saveTabs(workspace.projectPath, workspace.tabs);
   },
 
+  moveTabToProject: (sourceProjectId, tabId, targetProjectId) => {
+    if (sourceProjectId === targetProjectId) return;
+
+    const { openProjects } = get();
+    const sourceWorkspace = openProjects.get(sourceProjectId);
+    const targetWorkspace = openProjects.get(targetProjectId);
+
+    if (!sourceWorkspace || !targetWorkspace) return;
+
+    const tab = sourceWorkspace.tabs.get(tabId);
+    if (!tab) return;
+
+    // Remove from source project
+    sourceWorkspace.tabs.delete(tabId);
+
+    // If this was the active tab in source, switch to another
+    if (sourceWorkspace.activeTabId === tabId) {
+      const remainingTabs = Array.from(sourceWorkspace.tabs.keys());
+      sourceWorkspace.activeTabId = remainingTabs.length > 0 ? remainingTabs[0] : null;
+    }
+
+    // Add to target project (as main tab, not utility)
+    tab.isUtility = false;
+    targetWorkspace.tabs.set(tabId, tab);
+
+    // Make it active in target project
+    targetWorkspace.activeTabId = tabId;
+
+    // Update state
+    set({ openProjects: new Map(openProjects) });
+
+    // Save both projects
+    saveTabs(sourceWorkspace.projectPath, sourceWorkspace.tabs);
+    saveTabs(targetWorkspace.projectPath, targetWorkspace.tabs);
+
+    log.tabs(`[moveTabToProject] Moved tab ${tabId} from ${sourceProjectId} to ${targetProjectId}`);
+  },
+
   updateTabCwd: (projectId, tabId, newCwd) => {
     const { openProjects } = get();
     const workspace = openProjects.get(projectId);
@@ -858,7 +906,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       const tab = workspace.tabs.get(tabId);
       if (tab) {
         tab.claudeSessionId = sessionId;
-        console.log(`[Workspace] Claude session set for tab ${tabId}: ${sessionId}`);
+        // Reset overlay flags when new session starts (so overlay shows again if interrupted)
+        tab.wasInterrupted = false;
+        tab.overlayDismissed = false;
+        console.log(`[Workspace] Claude session set for tab ${tabId}: ${sessionId} (reset overlay flags)`);
         // Save to database so session persists across restarts
         saveTabs(workspace.projectPath, workspace.tabs);
         // NOTE: Not calling set() here to avoid re-render that breaks terminal
@@ -868,23 +919,6 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   },
 
   // Clear Claude session completely (when process exits normally)
-  clearClaudeSession: (tabId) => {
-    const { openProjects } = get();
-
-    for (const [projectId, workspace] of openProjects) {
-      const tab = workspace.tabs.get(tabId);
-      if (tab && (tab.claudeSessionId || tab.wasInterrupted)) {
-        console.log(`[Workspace] Clearing Claude session for tab ${tabId}`);
-        tab.claudeSessionId = undefined;
-        tab.wasInterrupted = false;
-        // Save to database
-        saveTabs(workspace.projectPath, workspace.tabs);
-        // Don't trigger re-render to avoid terminal issues
-        return;
-      }
-    }
-  },
-
   getClaudeSessionId: (tabId) => {
     const { openProjects } = get();
 
@@ -907,21 +941,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       const tab = workspace.tabs.get(tabId);
       if (tab) {
         tab.geminiSessionId = sessionId;
-        console.log(`[Workspace] Gemini session set for tab ${tabId}: ${sessionId}`);
-        saveTabs(workspace.projectPath, workspace.tabs);
-        return;
-      }
-    }
-  },
-
-  clearGeminiSession: (tabId) => {
-    const { openProjects } = get();
-
-    for (const [projectId, workspace] of openProjects) {
-      const tab = workspace.tabs.get(tabId);
-      if (tab && tab.geminiSessionId) {
-        console.log(`[Workspace] Clearing Gemini session for tab ${tabId}`);
-        tab.geminiSessionId = undefined;
+        // Reset overlay flags when new session starts (so overlay shows again if interrupted)
+        tab.wasInterrupted = false;
+        tab.overlayDismissed = false;
+        console.log(`[Workspace] Gemini session set for tab ${tabId}: ${sessionId} (reset overlay flags)`);
         saveTabs(workspace.projectPath, workspace.tabs);
         return;
       }
@@ -938,6 +961,32 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       }
     }
     return null;
+  },
+
+  // Tab notes
+  setTabNotes: (tabId, notes) => {
+    const { openProjects } = get();
+
+    for (const [, workspace] of openProjects) {
+      const tab = workspace.tabs.get(tabId);
+      if (tab) {
+        tab.notes = notes;
+        saveTabs(workspace.projectPath, workspace.tabs);
+        return;
+      }
+    }
+  },
+
+  getTabNotes: (tabId) => {
+    const { openProjects } = get();
+
+    for (const [, workspace] of openProjects) {
+      const tab = workspace.tabs.get(tabId);
+      if (tab) {
+        return tab.notes || '';
+      }
+    }
+    return '';
   },
 
   // Reorder projects (drag-and-drop)

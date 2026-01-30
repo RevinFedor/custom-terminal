@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useWorkspaceStore } from '../../../store/useWorkspaceStore';
 import { useUIStore } from '../../../store/useUIStore';
-import { Maximize2, RotateCcw, Clock, ChevronDown, ChevronRight } from 'lucide-react';
+import { RotateCcw, Clock, ChevronDown, ChevronRight } from 'lucide-react';
 import { log } from '../../../utils/logger';
 
 const { ipcRenderer } = window.require('electron');
@@ -30,19 +30,10 @@ interface InfoPanelProps {
 
 type AIMode = 'claude' | 'gemini';
 
-// Helper to extract notes string from potentially nested object
-const extractNotes = (notes: any): string => {
-  if (!notes) return '';
-  if (typeof notes === 'string') return notes;
-  if (typeof notes === 'object' && notes.global) return notes.global;
-  return '';
-};
-
 export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
   const [claudeSessionId, setClaudeSessionId] = useState<string | null>(null);
   const [geminiSessionId, setGeminiSessionId] = useState<string | null>(null);
   const [aiMode, setAiMode] = useState<AIMode>('claude');
-  const [notes, setNotes] = useState(extractNotes(project?.notes));
   const [showTooltip, setShowTooltip] = useState(false);
   const [historyTurns, setHistoryTurns] = useState<HistoryTurn[]>([]);
   const [historyExpanded, setHistoryExpanded] = useState(false);
@@ -55,16 +46,22 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
   const [actionsExpanded, setActionsExpanded] = useState(false);
   const [exportSessionInput, setExportSessionInput] = useState('');
   const [isExporting, setIsExporting] = useState(false);
-  const { showToast, openNotesEditor } = useUIStore();
-  const { setTabCommandType, closeTab } = useWorkspaceStore();
+  // Tab notes state
+  const [tabNotes, setTabNotes] = useState('');
+  const { showToast } = useUIStore();
+  const { setTabCommandType, closeTab, setTabNotes: setTabNotesStore, getTabNotes } = useWorkspaceStore();
   const notesTextareaRef = useRef<HTMLTextAreaElement>(null);
   const claudeTextareaRef = useRef<HTMLTextAreaElement>(null);
   const exportTextareaRef = useRef<HTMLTextAreaElement>(null);
 
-  // Sync notes with project
+  // Sync tab notes with activeTabId
   useEffect(() => {
-    setNotes(extractNotes(project?.notes));
-  }, [project?.notes]);
+    if (activeTabId) {
+      setTabNotes(getTabNotes(activeTabId));
+    } else {
+      setTabNotes('');
+    }
+  }, [activeTabId, getTabNotes]);
 
   // Load Claude default prompt from settings
   useEffect(() => {
@@ -72,13 +69,6 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
       setClaudeDefaultPrompt(value || '');
     });
   }, []);
-
-  // Save notes on blur
-  const saveNotesImmediately = async () => {
-    if (project?.path && notes !== extractNotes(project?.notes)) {
-      await ipcRenderer.invoke('project:save-note', { dirPath: project.path, content: notes });
-    }
-  };
 
   // Poll for session ID changes (every 500ms)
   useEffect(() => {
@@ -742,25 +732,18 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
         </div>
       )}
 
-      {/* Project Notes */}
+      {/* Tab Notes */}
       <div className="flex-1 flex flex-col min-h-0 border-t border-border-main pt-3">
-        <div className="flex items-center justify-between mb-2">
-          <div className="text-[11px] uppercase text-[#888]">Заметки проекта</div>
-          <button
-            onClick={() => project?.id && openNotesEditor(project.id)}
-            className="p-1 rounded text-[#666] hover:text-white hover:bg-white/10 transition-colors"
-            title="Развернуть редактор (⌘E)"
-          >
-            <Maximize2 size={12} />
-          </button>
-        </div>
+        <div className="text-[11px] uppercase text-[#888] mb-2">Заметки вкладки</div>
         <textarea
           ref={notesTextareaRef}
           className="flex-1 min-h-[80px] bg-transparent border border-transparent rounded p-2 text-[11px] text-[#aaa] resize-none focus:outline-none focus:border-accent focus:bg-[#2a2a2a] transition-all duration-200 placeholder:text-[#555] placeholder:italic"
-          value={notes}
-          onChange={(e) => setNotes(e.target.value)}
+          value={tabNotes}
+          onChange={(e) => setTabNotes(e.target.value)}
           onBlur={() => {
-            saveNotesImmediately();
+            if (activeTabId) {
+              setTabNotesStore(activeTabId, tabNotes);
+            }
           }}
           onKeyDown={(e) => {
             if (e.key === 'Enter' && e.metaKey) {
@@ -768,7 +751,8 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
               notesTextareaRef.current?.blur();
             }
           }}
-          placeholder="Добавьте заметки по проекту..."
+          placeholder={activeTabId ? "Заметки для этой вкладки..." : "Выберите вкладку..."}
+          disabled={!activeTabId}
         />
       </div>
     </div>

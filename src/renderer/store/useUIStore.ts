@@ -18,6 +18,8 @@ export type ThinkingLevel = 'NONE' | 'LOW' | 'MEDIUM' | 'HIGH';
 
 export type ChatType = 'research' | 'compact';
 
+export type WorkspaceView = 'terminal' | 'home';
+
 
 
 export interface ChatTypeSettings {
@@ -223,6 +225,10 @@ interface UIStore {
   notesEditorProjectId: string | null;
   openNotesEditor: (projectId: string) => void;
   closeNotesEditor: () => void;
+
+  // Workspace View (terminal or project home)
+  currentView: WorkspaceView;
+  setCurrentView: (view: WorkspaceView) => void;
 }
 
 
@@ -761,5 +767,9 @@ export const useUIStore = create<UIStore>((set, get) => ({
   notesEditorOpen: false,
   notesEditorProjectId: null,
   openNotesEditor: (projectId) => set({ notesEditorOpen: true, notesEditorProjectId: projectId }),
-  closeNotesEditor: () => set({ notesEditorOpen: false, notesEditorProjectId: null })
+  closeNotesEditor: () => set({ notesEditorOpen: false, notesEditorProjectId: null }),
+
+  // Workspace View
+  currentView: 'terminal',
+  setCurrentView: (view) => set({ currentView: view })
 }));
