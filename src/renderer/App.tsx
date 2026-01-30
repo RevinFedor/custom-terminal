@@ -675,9 +675,9 @@ function App() {
                   setProjectContextMenu({ projectId, x: e.clientX, y: e.clientY });
                 }}
                 onMiddleClick={() => {
-                  const tabCount = workspace.tabs.size;
-                  if (tabCount > 0) {
-                    if (confirm(`Close "${project.name}"?\n${tabCount} terminal(s) will be closed.`)) {
+                  // Only warn if there are running processes (not just open terminals)
+                  if (activeCount > 0) {
+                    if (confirm(`Close "${project.name}"?\n\n${activeCount} running process(es) will be terminated.`)) {
                       closeProject(projectId);
                     }
                   } else {
@@ -735,9 +735,14 @@ function App() {
               onClick={() => {
                 const workspace = openProjects.get(projectContextMenu.projectId);
                 const project = projects[projectContextMenu.projectId];
-                const tabCount = workspace?.tabs.size || 0;
-                if (tabCount > 0) {
-                  if (confirm(`Close "${project?.name}"?\n${tabCount} terminal(s) will be closed.`)) {
+                // Count running processes in this project
+                let runningCount = 0;
+                workspace?.tabs.forEach((_, tabId) => {
+                  if (processStatus.get(tabId)) runningCount++;
+                });
+                // Only warn if there are running processes
+                if (runningCount > 0) {
+                  if (confirm(`Close "${project?.name}"?\n\n${runningCount} running process(es) will be terminated.`)) {
                     closeProject(projectContextMenu.projectId);
                   }
                 } else {
