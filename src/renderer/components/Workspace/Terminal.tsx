@@ -275,6 +275,8 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
   const pendingBuffer = useRef<string>(''); // Buffer PTY data before xterm init
   const [isVisible, setIsVisible] = useState(false); // Hide until ready
   const [showScrollButton, setShowScrollButton] = useState(false); // Show "scroll to bottom" button
+  const savedScrollPosition = useRef<number | null>(null); // Save scroll position when tab becomes inactive
+  const wasAtBottom = useRef<boolean>(true); // Track if terminal was at bottom when deactivated
   const claudeSessionDetected = useRef<string | null>(null); // Track detected Claude session UUID
   const pendingActionExecuted = useRef(false); // Track if pendingAction was executed
 
@@ -848,11 +850,15 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
   // Focus and fit when becoming active (with rAF to let browser paint first)
   // Also handles lazy initialization on first activation
   useEffect(() => {
+    console.log('[Scroll:EFFECT] tabId=%s | active=%s isActiveProject=%s hasXterm=%s',
+      tabId, active, isActiveProject, !!xtermInstance.current);
+
     if (!active || !isActiveProject) {
       // Clear global selection when terminal becomes inactive
       if (!active) {
         getSetTerminalSelection()('');
       }
+      console.log('[Scroll:EFFECT] Skipping (not active or not active project)');
       return;
     }
 
@@ -1110,37 +1116,73 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
     }
 
     // Give browser 1 frame to recalculate CSS before calling fit
-    console.log('[Terminal] Focus useEffect: scheduling rAF for', tabId);
     const frameId = requestAnimationFrame(() => {
-      console.time('[Terminal] rAF callback ' + tabId);
       const term = xtermInstance.current;
       if (!term) return;
 
-      // Save scroll position before fit/focus
-      const scrollY = term.buffer.active.viewportY;
-
-      console.time('[Terminal] safeFit');
       safeFit();
-      console.timeEnd('[Terminal] safeFit');
-
-      console.time('[Terminal] focus');
       term.focus();
-      console.timeEnd('[Terminal] focus');
 
-      // Restore scroll position after focus (which auto-scrolls to cursor)
-      if (scrollY !== undefined && scrollY !== term.buffer.active.baseY + term.rows - 1) {
-        // Only restore if user wasn't at the bottom (avoid fighting auto-scroll)
-        term.scrollToLine(scrollY);
-      }
+      // Restore saved scroll position (from when tab was deactivated)
+      // Use requestAnimationFrame to ensure fit() completed
+      const savedWasAtBottom = wasAtBottom.current;
+      const savedPos = savedScrollPosition.current;
+      const buffer = term.buffer.active;
+
+      console.log('[Scroll:RESTORE] tabId=%s | saved: wasAtBottom=%s pos=%s | current: viewportY=%s baseY=%s',
+        tabId, savedWasAtBottom, savedPos, buffer.viewportY, buffer.baseY);
+
+      requestAnimationFrame(() => {
+        const bufferAfterRAF = term.buffer.active;
+        // CRITICAL FIX: If terminal was at bottom when deactivated, scroll to bottom
+        // This handles the case where data arrived while terminal was hidden
+        // (xterm.js bug: viewportY resets to 0 when writing to hidden terminal)
+        // See: docs/knowledge/fix-scroll-position-hidden-terminal.md
+        if (savedWasAtBottom) {
+          console.log('[Scroll:ACTION] scrollToBottom (wasAtBottom=true) | before: viewportY=%s baseY=%s',
+            bufferAfterRAF.viewportY, bufferAfterRAF.baseY);
+          term.scrollToBottom();
+        } else if (savedPos !== null) {
+          // Terminal was scrolled up - restore exact position
+          console.log('[Scroll:ACTION] scrollToLine(%s) (user was scrolled up)', savedPos);
+          term.scrollToLine(savedPos);
+        } else {
+          // Fallback: no saved position, scroll to bottom
+          console.log('[Scroll:ACTION] scrollToBottom (fallback, no saved position)');
+          term.scrollToBottom();
+        }
+
+        // Log final position after scroll
+        setTimeout(() => {
+          const finalBuffer = term.buffer.active;
+          console.log('[Scroll:FINAL] viewportY=%s baseY=%s isAtBottom=%s',
+            finalBuffer.viewportY, finalBuffer.baseY, finalBuffer.viewportY >= finalBuffer.baseY);
+        }, 50);
+
+        // Reset saved state
+        savedScrollPosition.current = null;
+        wasAtBottom.current = true;
+      });
 
       // Update selection state when becoming active
       const selection = term.getSelection() || '';
       getSetTerminalSelection()(selection);
-      console.timeEnd('[Terminal] rAF callback ' + tabId);
     });
 
-    return () => cancelAnimationFrame(frameId);
-  }, [active, isActiveProject]);
+    // Cleanup: save scroll position when tab becomes inactive
+    return () => {
+      cancelAnimationFrame(frameId);
+      const term = xtermInstance.current;
+      if (term && active) {
+        // Tab is being deactivated - save current scroll position AND wasAtBottom flag
+        const buffer = term.buffer.active;
+        savedScrollPosition.current = buffer.viewportY;
+        wasAtBottom.current = buffer.viewportY >= buffer.baseY;
+        console.log('[Scroll:SAVE] tabId=%s | viewportY=%s baseY=%s wasAtBottom=%s',
+          tabId, buffer.viewportY, buffer.baseY, wasAtBottom.current);
+      }
+    };
+  }, [active, isActiveProject, tabId]);
 
   // React to font size changes
   useEffect(() => {

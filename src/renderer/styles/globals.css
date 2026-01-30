@@ -145,6 +145,21 @@
   -moz-osx-font-smoothing: grayscale !important;
 }
 
+/* Remove/dim focus outline on terminal */
+.terminal-instance:focus,
+.terminal-instance:focus-visible,
+.terminal-instance .xterm:focus,
+.terminal-instance .xterm:focus-visible,
+.terminal-instance .xterm-viewport:focus,
+.terminal-instance .xterm-viewport:focus-visible {
+  outline: none !important;
+}
+
+/* Subtle focus indicator if needed - very dim */
+.terminal-instance .xterm.focus {
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.05) !important;
+}
+
 .terminal-wrapper.hidden {
   display: none;
 }
@@ -185,4 +200,14 @@
 /* JetBrains Mono font class */
 .font-jetbrains {
   font-family: 'JetBrains Mono', 'JetBrainsMono NF', monospace;
+}
+
+/* Hidden scrollbar utility */
+.scrollbar-hide {
+  -ms-overflow-style: none;  /* IE and Edge */
+  scrollbar-width: none;     /* Firefox */
+}
+
+.scrollbar-hide::-webkit-scrollbar {
+  display: none;             /* Chrome, Safari and Opera */
 }

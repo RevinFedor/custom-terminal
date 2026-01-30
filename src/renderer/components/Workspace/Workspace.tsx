@@ -4,6 +4,8 @@ import { useProjectsStore } from '../../store/useProjectsStore';
 import { useUIStore } from '../../store/useUIStore';
 import { terminalRegistry } from '../../utils/terminalRegistry';
 import TabBar from './TabBar';
+import ProjectToolbar from './ProjectToolbar';
+import ProjectHome from './ProjectHome';
 import TerminalArea from './TerminalArea';
 import Timeline from './Timeline';
 import NotesPanel from './NotesPanel';
@@ -18,7 +20,7 @@ const { ipcRenderer } = window.require('electron');
 export default function Workspace() {
   const { activeProjectId, getActiveProject } = useWorkspaceStore();
   const { projects } = useProjectsStore();
-  const { filePreview, openNotesEditor, notesEditorOpen } = useUIStore();
+  const { filePreview, openNotesEditor, notesEditorOpen, currentView, setCurrentView, notesPanelWidth } = useUIStore();
   const [showSearch, setShowSearch] = useState(false);
   const [searchText, setSearchText] = useState('');
   const [searchResults, setSearchResults] = useState({ resultIndex: 0, resultCount: 0 });
@@ -32,6 +34,13 @@ export default function Workspace() {
   const activeTab = activeProject?.activeTabId
     ? activeProject.tabs.get(activeProject.activeTabId)
     : null;
+
+  // Auto-switch to Home when all tabs are closed
+  useEffect(() => {
+    if (activeProject && activeProject.tabs.size === 0 && currentView === 'terminal') {
+      setCurrentView('home');
+    }
+  }, [activeProject?.tabs.size, currentView, setCurrentView]);
 
   // Listen for OSC 133 command lifecycle events (Shell Integration)
   useEffect(() => {
@@ -188,15 +197,32 @@ export default function Workspace() {
 
   return (
     <div className="flex-1 flex flex-col h-full overflow-hidden relative">
-      <TabBar projectId={activeProjectId} />
+      {/* Header Row: TabBar + ProjectToolbar */}
+      <div className="flex h-[30px]">
+        {/* TabBar - fills left side (over terminal area) */}
+        <div className="flex-1 min-w-0">
+          <TabBar projectId={activeProjectId} />
+        </div>
+
+        {/* ProjectToolbar - right side (over NotesPanel) */}
+        <ProjectToolbar width={notesPanelWidth} />
+      </div>
 
       <div className="flex-1 flex overflow-hidden min-h-0">
-        {/* Main Terminal Area with FilePreview overlay */}
+        {/* Main Content Area */}
         <div className="flex-1 relative min-w-0">
+          {/* TerminalArea always renders - same as project switching */}
           <TerminalArea projectId={activeProjectId} />
 
-          {/* Search Bar (Cmd+F) */}
-          {showSearch && (
+          {/* Project Home - overlay on top when active */}
+          {currentView === 'home' && (
+            <div className="absolute inset-0 z-10">
+              <ProjectHome projectId={activeProjectId} />
+            </div>
+          )}
+
+          {/* Search Bar (Cmd+F) - only in terminal view */}
+          {currentView === 'terminal' && showSearch && (
             <div
               style={{
                 position: 'absolute',
@@ -311,7 +337,7 @@ export default function Workspace() {
         </div>
 
         {/* Timeline for Claude session navigation - only when Claude is running */}
-        {showTimeline && (
+        {currentView === 'terminal' && showTimeline && (
           <Timeline
             tabId={activeTab.id}
             sessionId={claudeSessionId}

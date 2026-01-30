@@ -6,12 +6,12 @@ import { useUIStore } from '../../store/useUIStore';
 import { draggable, dropTargetForElements, monitorForElements } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
 import { attachClosestEdge, extractClosestEdge, type Edge } from '@atlaskit/pragmatic-drag-and-drop-hitbox/closest-edge';
 import { combine } from '@atlaskit/pragmatic-drag-and-drop/combine';
+import { autoScrollForElements } from '@atlaskit/pragmatic-drag-and-drop-auto-scroll/element';
 import { ChevronDown } from 'lucide-react';
 
 const { ipcRenderer } = window.require('electron');
 
-// Polling interval for process status check
-const PROCESS_STATUS_POLL_INTERVAL = 2000;
+// OSC 133 event-driven process status (no more polling!)
 
 interface TabBarProps {
   projectId: string;
@@ -30,6 +30,7 @@ type DragData = {
   id: string;
   zone: 'main' | 'utility';
   index: number;
+  projectId?: string; // For cross-project drag
 };
 
 const TAB_COLORS: { color: TabColor; bgColor: string; borderColor: string; label: string }[] = [
@@ -157,6 +158,7 @@ interface TabItemProps {
   tab: TabData;
   index: number;
   zone: 'main' | 'utility';
+  projectId: string; // For cross-project drag
   isActive: boolean;
   isEditing: boolean;
   editValue: string;
@@ -179,6 +181,7 @@ const TabItem = memo(({
   tab,
   index,
   zone,
+  projectId,
   isActive,
   isEditing,
   editValue,
@@ -209,7 +212,7 @@ const TabItem = memo(({
     return combine(
       draggable({
         element,
-        getInitialData: (): DragData => ({ type: 'TAB', id: tab.id, zone, index }),
+        getInitialData: (): DragData => ({ type: 'TAB', id: tab.id, zone, index, projectId }),
         onDragStart: () => setIsDragging(true),
         onDrop: () => setIsDragging(false),
       }),
@@ -239,7 +242,7 @@ const TabItem = memo(({
         onDrop: () => setClosestEdge(null),
       })
     );
-  }, [tab.id, zone, index]);
+  }, [tab.id, zone, index, projectId]);
 
   const isHorizontal = zone === 'main';
   const [isHovered, setIsHovered] = useState(false);
@@ -428,7 +431,7 @@ const EmptyDropZone = memo(({ onDropMain, onDropFromUtility, onHoverChange, onDo
   return (
     <div
       ref={ref}
-      className={`flex-1 h-full min-w-[40px] transition-colors ${isOver ? 'bg-white/5' : ''}`}
+      className={`h-full w-1 flex-shrink-0 transition-colors ${isOver ? 'bg-white/10' : ''}`}
       onDoubleClick={onDoubleClick}
     />
   );
@@ -529,22 +532,22 @@ const UtilsButtonDropTarget = memo(({
   );
 });
 
-export default function TabBar({ projectId }: TabBarProps) {
-  const {
-    openProjects,
-    createTab,
-    createTabAfterCurrent,
-    closeTab,
-    switchTab,
-    renameTab,
-    setTabColor,
-    toggleTabUtility,
-    reorderInZone,
-    moveTabToZone,
-    clearClaudeSession
-  } = useWorkspaceStore();
+function TabBar({ projectId }: TabBarProps) {
+  // Use individual selectors to minimize re-renders
+  const openProjects = useWorkspaceStore((state) => state.openProjects);
+  const createTab = useWorkspaceStore((state) => state.createTab);
+  const createTabAfterCurrent = useWorkspaceStore((state) => state.createTabAfterCurrent);
+  const closeTab = useWorkspaceStore((state) => state.closeTab);
+  const switchTab = useWorkspaceStore((state) => state.switchTab);
+  const renameTab = useWorkspaceStore((state) => state.renameTab);
+  const setTabColor = useWorkspaceStore((state) => state.setTabColor);
+  const toggleTabUtility = useWorkspaceStore((state) => state.toggleTabUtility);
+  const reorderInZone = useWorkspaceStore((state) => state.reorderInZone);
+  const moveTabToZone = useWorkspaceStore((state) => state.moveTabToZone);
   const { projects } = useProjectsStore();
   const tabsFontSize = useUIStore((state) => state.tabsFontSize);
+  const currentView = useUIStore((state) => state.currentView);
+  const setCurrentView = useUIStore((state) => state.setCurrentView);
 
   const [editingTabId, setEditingTabId] = useState<string | null>(null);
   const [editValue, setEditValue] = useState('');
@@ -556,47 +559,60 @@ export default function TabBar({ projectId }: TabBarProps) {
   const [emptyZoneHovered, setEmptyZoneHovered] = useState(false);
   const [processStatus, setProcessStatus] = useState<Map<string, boolean>>(new Map());
   const inputRef = useRef<HTMLInputElement>(null);
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
 
   const workspace = openProjects.get(projectId);
   const project = projects[projectId];
 
-  // Poll for running processes in all tabs
-  const checkProcessStatus = useCallback(async () => {
+  // OSC 133 Event-driven process status (replaces polling)
+  // Initial load + listen for command start/finish events
+  useEffect(() => {
     if (!workspace) return;
 
     const tabIds = Array.from(workspace.tabs.keys());
-    const newStatus = new Map<string, boolean>();
 
-    await Promise.all(
-      tabIds.map(async (tabId) => {
-        try {
-          const result = await ipcRenderer.invoke('terminal:hasRunningProcess', tabId);
-          const hadProcess = processStatus.get(tabId);
-          const hasProcess = result.hasProcess;
-          newStatus.set(tabId, hasProcess);
+    // Initial load: get current state from memory (no syscalls)
+    const initStatus = async () => {
+      const newStatus = new Map<string, boolean>();
+      await Promise.all(
+        tabIds.map(async (tabId) => {
+          try {
+            const state = await ipcRenderer.invoke('terminal:getCommandState', tabId);
+            newStatus.set(tabId, state.isRunning);
+          } catch {
+            newStatus.set(tabId, false);
+          }
+        })
+      );
+      setProcessStatus(newStatus);
+    };
+    initStatus();
 
-          // NOTE: Don't clear Claude session when process ends!
-          // Claude sessions persist on the server and can be continued with `claude -c`
-          // Session should only be cleared when:
-          // - User explicitly starts a NEW session (without -c)
-          // - User closes the tab
-          // Previously this was clearing session on Ctrl+C which was wrong
-        } catch {
-          newStatus.set(tabId, false);
-        }
-      })
-    );
+    // Listen for OSC 133 events (instant, no polling)
+    const handleCommandStarted = (_: any, { tabId }: { tabId: string }) => {
+      setProcessStatus(prev => {
+        const next = new Map(prev);
+        next.set(tabId, true);
+        return next;
+      });
+    };
 
-    setProcessStatus(newStatus);
-  }, [workspace, processStatus, clearClaudeSession]);
+    const handleCommandFinished = (_: any, { tabId }: { tabId: string }) => {
+      setProcessStatus(prev => {
+        const next = new Map(prev);
+        next.set(tabId, false);
+        return next;
+      });
+    };
 
-  // Polling effect
-  useEffect(() => {
-    checkProcessStatus(); // Initial check
+    ipcRenderer.on('terminal:command-started', handleCommandStarted);
+    ipcRenderer.on('terminal:command-finished', handleCommandFinished);
 
-    const interval = setInterval(checkProcessStatus, PROCESS_STATUS_POLL_INTERVAL);
-    return () => clearInterval(interval);
-  }, [checkProcessStatus]);
+    return () => {
+      ipcRenderer.removeListener('terminal:command-started', handleCommandStarted);
+      ipcRenderer.removeListener('terminal:command-finished', handleCommandFinished);
+    };
+  }, [workspace?.tabs.size]); // Re-init when tabs change
 
   // Monitor for all drag events
   useEffect(() => {
@@ -693,6 +709,15 @@ export default function TabBar({ projectId }: TabBarProps) {
     const cwd = activeTab?.cwd || project.path;
     // Pass undefined for name to use smart naming (tab-1, tab-2, etc.)
     createTabAfterCurrent(projectId, undefined, cwd);
+    setCurrentView('terminal');
+  };
+
+  // Create new tab at the end of tabs list (for double-click on empty space)
+  const handleNewTabAtEnd = () => {
+    const activeTab = workspace.activeTabId ? workspace.tabs.get(workspace.activeTabId) : null;
+    const cwd = activeTab?.cwd || project.path;
+    createTab(projectId, undefined, cwd);
+    setCurrentView('terminal');
   };
 
   const handleCloseTab = (e: React.MouseEvent, tabId: string) => {
@@ -811,7 +836,7 @@ export default function TabBar({ projectId }: TabBarProps) {
   }, [utilityExpanded, isDraggingTab]);
 
   // Check if active tab is in utility zone
-  const activeTabInUtils = utilityTabs.some(t => t.id === workspace.activeTabId);
+  const activeTabInUtils = currentView === 'terminal' && utilityTabs.some(t => t.id === workspace.activeTabId);
 
   // Check if any utility tab has a running process
   const hasProcessInUtils = utilityTabs.some(t => processStatus.get(t.id));
@@ -864,6 +889,20 @@ export default function TabBar({ projectId }: TabBarProps) {
       if (utilityHoverTimeoutRef.current) clearTimeout(utilityHoverTimeoutRef.current);
       if (utilityCloseTimeoutRef.current) clearTimeout(utilityCloseTimeoutRef.current);
     };
+  }, []);
+
+  // Auto-scroll when dragging near edges
+  useEffect(() => {
+    const scrollContainer = scrollContainerRef.current;
+    if (!scrollContainer) return;
+
+    return autoScrollForElements({
+      element: scrollContainer,
+      canScroll: ({ source }) => source.data.type === 'TAB',
+      getConfiguration: () => ({
+        maxScrollSpeed: 'fast',
+      }),
+    });
   }, []);
 
   return (
@@ -962,12 +1001,14 @@ export default function TabBar({ projectId }: TabBarProps) {
                         tab={tab}
                         index={index}
                         zone="utility"
-                        isActive={workspace.activeTabId === tab.id}
+                        projectId={projectId}
+                        isActive={currentView === 'terminal' && workspace.activeTabId === tab.id}
                         isEditing={editingTabId === tab.id}
                         editValue={editValue}
                         onSwitch={() => {
                           switchTab(projectId, tab.id);
                           setUtilityExpanded(false); // Close dropdown on tab click
+                          setCurrentView('terminal');
                         }}
                         onClose={() => closeTab(projectId, tab.id)} // Close tab, not move to main
                         onDoubleClick={() => handleDoubleClick(tab.id, tab.name)}
@@ -989,8 +1030,22 @@ export default function TabBar({ projectId }: TabBarProps) {
           )}
         </div>
 
-        {/* Main Tabs Zone - fills remaining width */}
-        <div className="flex-1 flex items-stretch h-full min-w-0">
+        {/* Main Tabs Zone - fills remaining width with hidden scrollbar */}
+        <div
+          ref={scrollContainerRef}
+          className="flex-1 flex items-stretch h-full min-w-0 scrollbar-hide"
+          style={{
+            overflowX: 'auto',
+            overflowY: 'hidden',
+          }}
+          onWheel={(e) => {
+            // Convert vertical scroll to horizontal (works with and without Shift)
+            if (scrollContainerRef.current && e.deltaY !== 0) {
+              e.preventDefault();
+              scrollContainerRef.current.scrollLeft += e.deltaY;
+            }
+          }}
+        >
           {mainTabs.length === 0 ? (
             /* Empty main zone - show drop target */
             <EmptyMainZone
@@ -999,17 +1054,21 @@ export default function TabBar({ projectId }: TabBarProps) {
           ) : (
             <>
               {/* Tabs */}
-              <div className="flex items-stretch h-full">
+              <div className="flex items-stretch h-full flex-shrink-0">
                 {mainTabs.map((tab, index) => (
                   <TabItem
                     key={tab.id}
                     tab={tab}
                     index={index}
                     zone="main"
-                    isActive={workspace.activeTabId === tab.id}
+                    projectId={projectId}
+                    isActive={currentView === 'terminal' && workspace.activeTabId === tab.id}
                     isEditing={editingTabId === tab.id}
                     editValue={editValue}
-                    onSwitch={() => switchTab(projectId, tab.id)}
+                    onSwitch={() => {
+                      switchTab(projectId, tab.id);
+                      setCurrentView('terminal');
+                    }}
                     onClose={(e) => handleCloseTab(e, tab.id)}
                     onDoubleClick={() => handleDoubleClick(tab.id, tab.name)}
                     onContextMenu={(e) => handleContextMenu(e, tab.id)}
@@ -1041,7 +1100,7 @@ export default function TabBar({ projectId }: TabBarProps) {
               moveTabToZone(projectId, tabId, false, mainTabs.length);
             }}
             onHoverChange={setEmptyZoneHovered}
-            onDoubleClick={handleNewTab}
+            onDoubleClick={handleNewTabAtEnd}
           />
             </>
           )}
@@ -1138,3 +1197,5 @@ export default function TabBar({ projectId }: TabBarProps) {
     </>
   );
 }
+
+export default memo(TabBar);

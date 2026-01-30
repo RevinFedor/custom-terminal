@@ -16,9 +16,10 @@ const execAsync = (cmd, timeout = 1000) => {
 };
 
 class ClaudeManager {
-  constructor(terminals, terminalProjects) {
+  constructor(terminals, terminalProjects, claudeState) {
     this.terminals = terminals;
     this.terminalProjects = terminalProjects;
+    this.claudeState = claudeState; // State machine for thinking mode handshake
     this.registerHandlers();
   }
 
@@ -260,6 +261,8 @@ class ClaudeManager {
       // Let the command through - don't intercept, just watch
       const term = this.terminals.get(tabId);
       if (term) {
+        // Enable thinking mode detection (will send Tab when '>' prompt appears)
+        this.claudeState.set(tabId, 'WAITING_PROMPT');
         term.write('claude --dangerously-skip-permissions\r');
       }
     });
@@ -440,12 +443,16 @@ class ClaudeManager {
             console.error('[Claude Runner] Watcher error:', e.message);
           }
 
+          // Enable thinking mode detection (will send Tab when '>' prompt appears)
+          this.claudeState.set(tabId, 'WAITING_PROMPT');
           term.write('claude --dangerously-skip-permissions\r');
           break;
 
         case 'claude-c':
           if (sessionId) {
             console.log('[Claude Runner] Continuing session:', sessionId);
+            // Enable thinking mode detection (will send Tab when '>' prompt appears)
+            this.claudeState.set(tabId, 'WAITING_PROMPT');
             term.write(`claude --dangerously-skip-permissions --resume ${sessionId}\r`);
           }
           break;
@@ -489,7 +496,9 @@ class ClaudeManager {
               const newSessionId = crypto.randomUUID();
               const destPath = path.join(sourceDir, `${newSessionId}.jsonl`);
               fs.copyFileSync(sourcePath, destPath);
-              
+
+              // Enable thinking mode detection (will send Tab when '>' prompt appears)
+              this.claudeState.set(tabId, 'WAITING_PROMPT');
               term.write(`claude --dangerously-skip-permissions --resume ${newSessionId}\r`);
               event.sender.send('claude:session-detected', { tabId, sessionId: newSessionId });
             } else {

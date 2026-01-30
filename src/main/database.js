@@ -153,6 +153,9 @@ class DatabaseManager {
       CREATE INDEX IF NOT EXISTS idx_session_deployments_session ON session_deployments(session_id);
     `);
 
+    // Migration: Remove UNIQUE constraint from projects.path to allow multiple project instances
+    this.migrateProjectsTableRemoveUniquePathConstraint();
+
     // Research Conversations table (JSON storage for full chat history)
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS research_conversations (
@@ -177,6 +180,73 @@ class DatabaseManager {
         updated_at INTEGER DEFAULT (strftime('%s', 'now'))
       )
     `);
+
+    // Bookmarks table (reserved directories for quick project creation)
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS bookmarks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        path TEXT UNIQUE NOT NULL,
+        name TEXT NOT NULL,
+        description TEXT DEFAULT '',
+        position INTEGER DEFAULT 0,
+        created_at INTEGER DEFAULT (strftime('%s', 'now'))
+      )
+    `);
+  }
+
+  // Migration: Remove UNIQUE constraint from projects.path
+  migrateProjectsTableRemoveUniquePathConstraint() {
+    // Check if migration is needed by trying to find the unique index
+    const indexes = this.db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='projects'").all();
+    const hasUniquePathIndex = indexes.some(idx => idx.name === 'sqlite_autoindex_projects_2');
+
+    // Also check if path column has UNIQUE by looking at table info
+    const tableInfo = this.db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='projects'").get();
+    if (!tableInfo || !tableInfo.sql.includes('path TEXT UNIQUE')) {
+      console.log('[Database] projects.path UNIQUE constraint already removed or never existed');
+      return;
+    }
+
+    console.log('[Database] Migrating projects table: removing UNIQUE constraint from path');
+
+    this.db.exec('BEGIN TRANSACTION');
+    try {
+      // 1. Create new table without UNIQUE on path
+      this.db.exec(`
+        CREATE TABLE projects_new (
+          id TEXT PRIMARY KEY,
+          path TEXT NOT NULL,
+          name TEXT NOT NULL,
+          description TEXT DEFAULT '',
+          gemini_prompt TEXT DEFAULT 'вот моя проблема нужно чтобы ты понял что за проблема и на reddit поискал обсуждения. Не ограничивайся категориями. Проблема: ',
+          notes_global TEXT DEFAULT '',
+          created_at INTEGER DEFAULT (strftime('%s', 'now')),
+          updated_at INTEGER DEFAULT (strftime('%s', 'now'))
+        )
+      `);
+
+      // 2. Copy data
+      this.db.exec(`
+        INSERT INTO projects_new (id, path, name, description, gemini_prompt, notes_global, created_at, updated_at)
+        SELECT id, path, name, description, gemini_prompt, notes_global, created_at, updated_at FROM projects
+      `);
+
+      // 3. Drop old table
+      this.db.exec('DROP TABLE projects');
+
+      // 4. Rename new table
+      this.db.exec('ALTER TABLE projects_new RENAME TO projects');
+
+      // 5. Recreate index on path (non-unique)
+      this.db.exec('CREATE INDEX IF NOT EXISTS idx_projects_path ON projects(path)');
+
+      this.db.exec('COMMIT');
+      console.log('[Database] Migration completed: projects.path is no longer UNIQUE');
+    } catch (err) {
+      this.db.exec('ROLLBACK');
+      console.error('[Database] Migration failed:', err);
+      throw err;
+    }
   }
 
   // ========== APP STATE ==========
@@ -285,6 +355,79 @@ class DatabaseManager {
     }
 
     return this.getProject(normalizedPath);
+  }
+
+  // Create a new project instance (allows multiple projects with same path)
+  createProjectInstance(projectPath, customName = null) {
+    const normalizedPath = path.resolve(projectPath);
+    const folderName = path.basename(normalizedPath);
+
+    // Generate unique ID using timestamp + random
+    const timestamp = Date.now();
+    const random = Math.random().toString(36).substring(2, 8);
+    const projectId = `${Buffer.from(normalizedPath).toString('base64').substring(0, 20)}_${timestamp}_${random}`;
+
+    // Determine name: use customName or generate suffix
+    let projectName = customName;
+    if (!projectName) {
+      // Count existing projects with this path to generate suffix
+      const existingCount = this.db.prepare('SELECT COUNT(*) as count FROM projects WHERE path = ?').get(normalizedPath).count;
+      projectName = existingCount > 0 ? `${folderName}-${existingCount + 1}` : folderName;
+    }
+
+    const insert = this.db.prepare(`
+      INSERT INTO projects (id, path, name, description, gemini_prompt, notes_global)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `);
+
+    insert.run(
+      projectId,
+      normalizedPath,
+      projectName,
+      '',
+      'вот моя проблема нужно чтобы ты понял что за проблема и на reddit поискал обсуждения. Не ограничивайся категориями. Проблема: ',
+      `<h1>${projectName}</h1><p>Project notes go here...</p>`
+    );
+
+    return this.getProjectById(projectId);
+  }
+
+  // Get project by ID (not by path)
+  getProjectById(projectId) {
+    const project = this.db.prepare('SELECT * FROM projects WHERE id = ?').get(projectId);
+
+    if (!project) {
+      return null;
+    }
+
+    // Load related data
+    const tabs = this.db.prepare('SELECT * FROM tabs WHERE project_id = ? ORDER BY position').all(project.id);
+    const globalCommands = this.getGlobalCommands();
+
+    return {
+      id: project.id,
+      path: project.path,
+      name: project.name,
+      description: project.description || '',
+      geminiPrompt: project.gemini_prompt,
+      notesGlobal: project.notes_global || '',
+      createdAt: project.created_at,
+      updatedAt: project.updated_at,
+      quickActions: globalCommands.map(gc => ({
+        name: gc.name,
+        command: gc.command
+      })),
+      tabs: tabs.map(t => ({
+        name: t.name,
+        cwd: t.cwd,
+        color: t.color || undefined,
+        isUtility: t.is_utility === 1,
+        claudeSessionId: t.claude_session_id || undefined,
+        geminiSessionId: t.gemini_session_id || undefined,
+        wasInterrupted: t.was_interrupted === 1,
+        overlayDismissed: t.overlay_dismissed === 1
+      }))
+    };
   }
 
   getAllProjects() {
@@ -763,6 +906,57 @@ class DatabaseManager {
   }
 
   // ========== CLEANUP ==========
+
+  // ========== BOOKMARKS ==========
+
+  getAllBookmarks() {
+    return this.db.prepare('SELECT * FROM bookmarks ORDER BY position').all();
+  }
+
+  getBookmark(id) {
+    return this.db.prepare('SELECT * FROM bookmarks WHERE id = ?').get(id);
+  }
+
+  createBookmark(dirPath, name, description = '') {
+    const normalizedPath = path.resolve(dirPath);
+
+    // Check if bookmark already exists
+    const existing = this.db.prepare('SELECT * FROM bookmarks WHERE path = ?').get(normalizedPath);
+    if (existing) {
+      return existing;
+    }
+
+    // Get max position
+    const maxPos = this.db.prepare('SELECT MAX(position) as max FROM bookmarks').get();
+    const position = (maxPos.max || 0) + 1;
+
+    const result = this.db.prepare(`
+      INSERT INTO bookmarks (path, name, description, position)
+      VALUES (?, ?, ?, ?)
+    `).run(normalizedPath, name, description, position);
+
+    return this.getBookmark(result.lastInsertRowid);
+  }
+
+  updateBookmark(id, updates) {
+    const { name, description, position } = updates;
+
+    if (name !== undefined) {
+      this.db.prepare('UPDATE bookmarks SET name = ? WHERE id = ?').run(name, id);
+    }
+    if (description !== undefined) {
+      this.db.prepare('UPDATE bookmarks SET description = ? WHERE id = ?').run(description, id);
+    }
+    if (position !== undefined) {
+      this.db.prepare('UPDATE bookmarks SET position = ? WHERE id = ?').run(position, id);
+    }
+
+    return this.getBookmark(id);
+  }
+
+  deleteBookmark(id) {
+    this.db.prepare('DELETE FROM bookmarks WHERE id = ?').run(id);
+  }
 
   close() {
     this.db.close();
