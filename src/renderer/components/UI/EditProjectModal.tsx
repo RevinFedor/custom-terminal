@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useUIStore } from '../../store/useUIStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
+import { Folder, CheckCircle2, AlertCircle } from 'lucide-react';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -10,13 +11,38 @@ export default function EditProjectModal() {
 
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
+  const [path, setPath] = useState('');
+  const [isPathValid, setIsPathValid] = useState<boolean | null>(null);
+  const [isValidating, setIsValidating] = useState(false);
 
   useEffect(() => {
     if (editingProject) {
       setName(editingProject.name || '');
       setDescription(editingProject.description || '');
+      setPath(editingProject.path || '');
+      setIsPathValid(null);
     }
   }, [editingProject]);
+
+  const validatePath = async (p: string) => {
+    if (!p.trim()) {
+      setIsPathValid(false);
+      return false;
+    }
+    setIsValidating(true);
+    const exists = await ipcRenderer.invoke('app:check-path-exists', p.trim());
+    setIsPathValid(exists);
+    setIsValidating(false);
+    return exists;
+  };
+
+  const handleSelectDirectory = async () => {
+    const selected = await ipcRenderer.invoke('app:select-directory');
+    if (selected) {
+      setPath(selected);
+      validatePath(selected);
+    }
+  };
 
   const handleSave = async () => {
     if (!editingProject) return;
@@ -26,11 +52,19 @@ export default function EditProjectModal() {
       return;
     }
 
+    const isCurrentPathValid = await validatePath(path);
+    if (!isCurrentPathValid) {
+      if (!confirm('The specified path does not exist or is not a directory. Save anyway?')) {
+        return;
+      }
+    }
+
     await ipcRenderer.invoke('project:save-metadata', {
-      dirPath: editingProject.path,
+      projectId: editingProject.id,
       metadata: {
         name: name.trim(),
-        description: description.trim()
+        description: description.trim(),
+        path: path.trim()
       }
     });
 
@@ -57,7 +91,7 @@ export default function EditProjectModal() {
       tabIndex={-1}
     >
       <div
-        className="bg-panel border border-border-main rounded-xl p-6 w-[400px] shadow-2xl"
+        className="bg-panel border border-border-main rounded-xl p-6 w-[450px] shadow-2xl"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
@@ -77,7 +111,7 @@ export default function EditProjectModal() {
             <label className="block text-xs text-[#888] uppercase mb-1">Name</label>
             <input
               type="text"
-              className="w-full bg-[#2d2d2d] border border-[#444] rounded px-3 py-2 text-white text-sm focus:outline-none focus:border-accent"
+              className="w-full bg-[#2d2d2d] border border-[#444] rounded px-3 py-2 text-white text-sm focus:outline-none focus:border-accent transition-colors"
               value={name}
               onChange={(e) => setName(e.target.value)}
               autoFocus
@@ -85,33 +119,60 @@ export default function EditProjectModal() {
           </div>
 
           <div>
-            <label className="block text-xs text-[#888] uppercase mb-1">Description</label>
+            <label className="block text-xs text-[#888] uppercase mb-1 font-medium flex items-center gap-2">
+              Directory Path
+              {isPathValid === true && <CheckCircle2 size={12} className="text-green-500" />}
+              {isPathValid === false && <AlertCircle size={12} className="text-red-500" />}
+            </label>
+            <div className="flex gap-2">
+              <div className="relative flex-1">
+                <input
+                  type="text"
+                  className={`w-full bg-[#2d2d2d] border ${isPathValid === false ? 'border-red-500/50' : 'border-[#444]'} rounded px-3 py-2 text-white text-xs focus:outline-none focus:border-accent transition-colors`}
+                  value={path}
+                  onChange={(e) => {
+                    setPath(e.target.value);
+                    setIsPathValid(null);
+                  }}
+                  onBlur={(e) => validatePath(e.target.value)}
+                  placeholder="/path/to/project"
+                />
+              </div>
+              <button
+                className="px-3 bg-[#333] hover:bg-[#444] text-[#aaa] hover:text-white rounded border border-[#444] transition-all flex items-center gap-2 text-xs cursor-pointer"
+                onClick={handleSelectDirectory}
+                title="Select folder"
+              >
+                <Folder size={14} />
+              </button>
+            </div>
+          </div>
+
+          <div>
+            <label className="block text-xs text-[#888] uppercase mb-1 font-medium">Description</label>
             <textarea
               className="w-full bg-[#2d2d2d] border border-[#444] rounded px-3 py-2 text-white text-sm focus:outline-none focus:border-accent resize-none h-24"
               value={description}
               onChange={(e) => setDescription(e.target.value)}
-              placeholder="Optional description..."
+              placeholder="What is this project about?"
             />
-          </div>
-
-          <div className="text-[10px] text-[#666]">
-            Path: {editingProject.path}
           </div>
         </div>
 
         {/* Footer */}
-        <div className="flex justify-end gap-2 mt-6">
+        <div className="flex justify-end gap-2 mt-6 pt-4 border-t border-white/5">
           <button
-            className="px-4 py-2 text-sm text-[#ccc] hover:text-white transition-colors"
+            className="px-4 py-2 text-sm text-[#ccc] hover:text-white transition-colors cursor-pointer"
             onClick={closeEditModal}
           >
             Cancel
           </button>
           <button
-            className="px-4 py-2 text-sm bg-accent text-white rounded hover:bg-accent/80 transition-colors"
+            className={`px-4 py-2 text-sm bg-accent text-white rounded hover:bg-accent/80 transition-colors cursor-pointer ${isValidating ? 'opacity-50' : ''}`}
             onClick={handleSave}
+            disabled={isValidating}
           >
-            Save
+            Save Changes
           </button>
         </div>
       </div>

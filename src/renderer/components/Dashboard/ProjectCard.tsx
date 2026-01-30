@@ -63,7 +63,7 @@ export default function ProjectCard({
       await closeProject(project.id);
     }
 
-    const result = await ipcRenderer.invoke('project:delete', project.path);
+    const result = await ipcRenderer.invoke('project:delete', project.id);
     if (result.success) {
       showToast('Project deleted', 'success');
       loadProjects();
@@ -100,15 +100,16 @@ export default function ProjectCard({
         />
         <span
           className="text-sm text-white font-medium truncate group-hover:text-accent transition-colors"
-          title={project.name}
         >
           {project.name}
         </span>
       </div>
 
       {/* Path */}
-      <div className="px-2.5 text-[10px] text-[#555] truncate" title={project.path}>
-        {getFolderName(project.path)}
+      <div 
+        className="px-2.5 text-[10px] text-[#555] truncate group-hover:text-[#888] transition-colors"
+      >
+        {project.path}
       </div>
 
       {/* Stats */}
