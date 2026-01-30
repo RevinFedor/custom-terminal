@@ -1,19 +1,40 @@
 import React, { useState, useEffect } from 'react';
 import { useUIStore } from '../../store/useUIStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
-import { Folder, CheckCircle2, AlertCircle } from 'lucide-react';
+import { Folder, CheckCircle2, AlertCircle, Trash2 } from 'lucide-react';
+import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 
 const { ipcRenderer } = window.require('electron');
 
 export default function EditProjectModal() {
   const { editingProject, closeEditModal, showToast } = useUIStore();
   const { loadProjects } = useProjectsStore();
+  const { openProjects, closeProject } = useWorkspaceStore();
 
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
   const [path, setPath] = useState('');
   const [isPathValid, setIsPathValid] = useState<boolean | null>(null);
   const [isValidating, setIsValidating] = useState(false);
+
+  const handleDelete = async () => {
+    if (!editingProject) return;
+
+    if (!confirm(`Delete "${editingProject.name}"?`)) return;
+
+    if (openProjects.has(editingProject.id)) {
+      await closeProject(editingProject.id);
+    }
+
+    const result = await ipcRenderer.invoke('project:delete', editingProject.id);
+    if (result.success) {
+      showToast('Project deleted', 'success');
+      loadProjects();
+      closeEditModal();
+    } else {
+      showToast('Failed to delete', 'error');
+    }
+  };
 
   useEffect(() => {
     if (editingProject) {
@@ -96,7 +117,16 @@ export default function EditProjectModal() {
       >
         {/* Header */}
         <div className="flex items-center justify-between mb-4">
-          <h2 className="text-lg font-bold text-white">Edit Project</h2>
+          <div className="flex items-center gap-3">
+            <h2 className="text-lg font-bold text-white">Edit Project</h2>
+            <button
+              className="p-1.5 text-[#555] hover:text-red-400 hover:bg-red-500/10 rounded-lg transition-all cursor-pointer"
+              onClick={handleDelete}
+              title="Delete Project"
+            >
+              <Trash2 size={16} />
+            </button>
+          </div>
           <button
             className="text-[#888] hover:text-white text-2xl leading-none"
             onClick={closeEditModal}

@@ -22,11 +22,24 @@ const TAB_COLORS: Record<TabColor, { bgColor: string; borderColor: string }> = {
 
 export default function ProjectHome({ projectId }: ProjectHomeProps) {
   const { openProjects, switchTab, createTab } = useWorkspaceStore();
-  const { projects } = useProjectsStore();
+  const { projects, updateProject } = useProjectsStore();
   const { setCurrentView } = useUIStore();
+  const [syncName, setSyncName] = React.useState<string | null>(null);
+
+  React.useEffect(() => {
+    const handleSync = (e: any) => {
+      if (e.detail.projectId === projectId) {
+        setSyncName(e.detail.name);
+      }
+    };
+    window.addEventListener('project:name-sync', handleSync);
+    return () => window.removeEventListener('project:name-sync', handleSync);
+  }, [projectId]);
 
   const workspace = openProjects.get(projectId);
   const project = projects[projectId];
+
+  const displayName = syncName || project?.name || '';
 
   const handleCreateTab = async () => {
     if (project) {
@@ -60,7 +73,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
     <div className="flex-1 bg-bg-main p-6 overflow-y-auto">
       {/* Project Header */}
       <div className="mb-6">
-        <h1 className="text-xl text-white font-medium mb-1">{project.name}</h1>
+        <h1 className="text-xl text-white font-medium mb-1">{displayName}</h1>
         <div className="flex items-center gap-2 text-[#666] text-sm">
           <FolderOpen size={14} />
           <span>{project.path}</span>

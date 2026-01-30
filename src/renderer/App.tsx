@@ -53,6 +53,7 @@ interface ProjectTabItemProps {
   onMiddleClick: () => void;
   onDoubleClick: () => void;
   onTabDrop?: (tabId: string, sourceProjectId: string) => void; // For dropping terminal tabs
+  isAreaActive?: boolean;
 }
 
 const ProjectTabItem = memo(({
@@ -72,7 +73,8 @@ const ProjectTabItem = memo(({
   onContextMenu,
   onMiddleClick,
   onDoubleClick,
-  onTabDrop
+  onTabDrop,
+  isAreaActive
 }: ProjectTabItemProps) => {
   const ref = useRef<HTMLButtonElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -159,7 +161,9 @@ const ProjectTabItem = memo(({
   return (
     <button
       ref={ref}
-      className={`relative px-3 py-1.5 text-sm font-medium cursor-pointer transition-colors ${textColor}`}
+      className={`relative px-3 py-1.5 text-sm font-medium cursor-pointer transition-all rounded ${
+        isActive && isAreaActive ? 'ring-1 ring-white/50 shadow-[0_0_10px_rgba(255,255,255,0.1)]' : ''
+      } ${textColor}`}
       style={{
         fontSize: `${fontSize}px`,
         opacity: isDragging ? 0.5 : 1,
@@ -186,7 +190,16 @@ const ProjectTabItem = memo(({
             ref={inputRef}
             className="bg-[#333] border border-accent rounded px-1.5 py-0 text-white outline-none w-[100px] text-xs font-normal"
             value={editValue}
-            onChange={(e) => onEditChange(e.target.value)}
+            onChange={(e) => {
+              const val = e.target.value;
+              onEditChange(val);
+              // Real-time sync with ProjectHome
+              if (val.trim()) {
+                window.dispatchEvent(new CustomEvent('project:name-sync', { 
+                  detail: { projectId, name: val.trim() } 
+                }));
+              }
+            }}
             onBlur={onEditSubmit}
             onKeyDown={(e) => {
               if (e.key === 'Enter') onEditSubmit();
@@ -220,9 +233,10 @@ const ProjectTabItem = memo(({
 
 // Empty area drop zone for projects - for dropping at the end
 // This area allows window dragging when not in a drag-drop operation
-const ProjectEmptyDropZone = memo(({ onDrop, onHoverChange }: {
+const ProjectEmptyDropZone = memo(({ onDrop, onHoverChange, onDoubleClick }: {
   onDrop: (projectId: string) => void;
   onHoverChange: (isOver: boolean) => void;
+  onDoubleClick: () => void;
 }) => {
   const ref = useRef<HTMLDivElement>(null);
   const [isDragActive, setIsDragActive] = useState(false);
@@ -255,10 +269,18 @@ const ProjectEmptyDropZone = memo(({ onDrop, onHoverChange }: {
   return (
     <div
       ref={ref}
-      className="flex-1 h-full min-w-[40px]"
+      className="flex-1 h-full min-w-[60px] transition-colors"
+      onDoubleClick={(e) => {
+        e.stopPropagation();
+        onDoubleClick();
+      }}
+      onClick={(e) => {
+        e.stopPropagation();
+        // Just focus the area
+      }}
       style={{
-        // Allow window dragging when not in drag-drop operation
-        WebkitAppRegion: isDragActive ? 'no-drag' : 'drag'
+        // Crucial: no-drag allows JS to catch events, but we keep it transparent
+        WebkitAppRegion: 'no-drag'
       } as any}
     />
   );
@@ -277,7 +299,7 @@ const RestoreLoader = memo(() => (
 function App() {
   const { view, showDashboard, openProject, openProjects, activeProjectId, closeProject, createTab, createTabAfterCurrent, closeTab, getActiveProject, restoreSession, reorderProjects, moveTabToProject, isRestoring } = useWorkspaceStore();
   const { projects, loadProjects, updateProject } = useProjectsStore();
-  const { toggleFileExplorer, closeFilePreview, filePreview, showToast, incrementAllFontSizes, decrementAllFontSizes } = useUIStore();
+  const { toggleFileExplorer, closeFilePreview, filePreview, showToast, incrementAllFontSizes, decrementAllFontSizes, activeArea, setActiveArea, currentView } = useUIStore();
   const { toggleResearch } = useResearchStore();
   const projectTabsFontSize = useUIStore((s) => s.projectTabsFontSize);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -288,6 +310,7 @@ function App() {
   // Renaming projects in tabs
   const [editingProjectId, setEditingProjectId] = useState<string | null>(null);
   const [projectEditValue, setProjectEditValue] = useState('');
+  const [lastCreatedProjectId, setLastCreatedProjectId] = useState<string | null>(null);
 
   const handleStartEditingProject = (projectId: string, currentName: string) => {
     setEditingProjectId(projectId);
@@ -298,12 +321,43 @@ function App() {
     if (editingProjectId && projectEditValue.trim()) {
       await updateProject(editingProjectId, { name: projectEditValue.trim() });
       showToast('Project renamed', 'success');
+      setEditingProjectId(null);
+      setLastCreatedProjectId(null); // No longer "new" once renamed/submitted
+    } else if (editingProjectId) {
+      handleCancelProjectRename();
     }
-    setEditingProjectId(null);
   };
 
   const handleCancelProjectRename = () => {
+    if (editingProjectId === lastCreatedProjectId) {
+      // VSCode behavior: if we cancel creating a new project, delete it
+      closeProject(editingProjectId!);
+      showToast('Project creation cancelled', 'info');
+    }
     setEditingProjectId(null);
+    setLastCreatedProjectId(null);
+  };
+
+  const handleCreateNewProject = async () => {
+    try {
+      const newProject = await ipcRenderer.invoke('project:create-empty', { name: 'Новый проект' });
+      if (newProject) {
+        // 1. Reload projects in store to include the new one
+        await loadProjects();
+        // 2. Open it in workspace
+        openProject(newProject.id, newProject.path);
+        // 3. Set area focus
+        setActiveArea('projects');
+        // 4. Enter edit mode immediately
+        setLastCreatedProjectId(newProject.id);
+        setEditingProjectId(newProject.id);
+        setProjectEditValue(newProject.name);
+        showToast('New project created', 'success');
+      }
+    } catch (err) {
+      console.error('Failed to create project:', err);
+      showToast('Failed to create project', 'error');
+    }
   };
 
   // Load projects and restore session ONCE on mount
@@ -458,18 +512,27 @@ function App() {
         return;
       }
 
-      // Escape - Close file preview
+      // Escape - Close file preview or clear area focus
       if (e.code === 'Escape') {
         if (filePreview) {
           e.preventDefault();
           closeFilePreview();
           return;
         }
+        if (activeArea === 'projects') {
+          setActiveArea('workspace');
+          return;
+        }
       }
 
-      // Cmd+T - New Tab after current (only in workspace)
+      // Cmd+T - New Tab or New Project
       if (e.metaKey && e.code === 'KeyT') {
         e.preventDefault();
+        if (activeArea === 'projects') {
+          handleCreateNewProject();
+          return;
+        }
+
         if (view === 'workspace' && activeProjectId) {
           const activeProject = getActiveProject();
           const currentProject = projects[activeProjectId];
@@ -483,6 +546,30 @@ function App() {
           }
         }
         return;
+      }
+
+      // Arrow keys for project navigation (only when projects area is focused)
+      if (activeArea === 'projects') {
+        if (e.code === 'ArrowRight' || e.code === 'ArrowLeft') {
+          e.preventDefault();
+          const projectIds = Array.from(openProjects.keys());
+          if (projectIds.length === 0) return;
+
+          const currentIndex = activeProjectId ? projectIds.indexOf(activeProjectId) : -1;
+          let nextIndex = 0;
+
+          if (e.code === 'ArrowRight') {
+            nextIndex = (currentIndex + 1) % projectIds.length;
+          } else {
+            nextIndex = (currentIndex - 1 + projectIds.length) % projectIds.length;
+          }
+
+          const nextProjectId = projectIds[nextIndex];
+          const nextProject = openProjects.get(nextProjectId);
+          if (nextProject) {
+            openProject(nextProjectId, nextProject.projectPath);
+          }
+        }
       }
 
       // Cmd+W - Close Tab/Project (context-aware)
@@ -576,7 +663,7 @@ function App() {
       window.removeEventListener('keydown', handleKeyDown);
       ipcRenderer.removeListener('context-menu-command', handleContextMenuCommand);
     };
-  }, [view, activeProjectId, filePreview, incrementAllFontSizes, decrementAllFontSizes, toggleResearch]);
+  }, [view, activeProjectId, filePreview, incrementAllFontSizes, decrementAllFontSizes, toggleResearch, activeArea, openProjects, setActiveArea]);
 
   const openProjectsList = Array.from(openProjects.entries());
 
@@ -589,14 +676,32 @@ function App() {
     <div className="h-screen w-screen flex flex-col overflow-hidden bg-bg-main text-white">
       {/* Title Bar */}
       <div
-        className="title-bar h-[40px] bg-tab border-b border-border-main flex items-center select-none"
+        className={`title-bar h-[40px] transition-all duration-300 flex items-center select-none border-b ${
+          activeArea === 'projects' 
+            ? 'bg-white/[0.05] border-white/20 ring-1 ring-white/10 shadow-[inset_0_0_20px_rgba(255,255,255,0.02)]' 
+            : 'bg-tab border-border-main'
+        }`}
         style={{
-          WebkitAppRegion: 'drag',
+          WebkitAppRegion: 'drag', // Window can be dragged by clicking any empty space
           paddingLeft: 'env(titlebar-area-x, 85px)'
         } as any}
       >
         {/* Project Tabs - portfolio style */}
-        <div className="flex items-center gap-1 px-2" style={{ WebkitAppRegion: 'no-drag' } as any}>
+        <div 
+          className="flex items-center gap-1 px-2 h-full" 
+          style={{ WebkitAppRegion: 'no-drag' } as any}
+          onMouseDown={() => setActiveArea('projects')} // Focus projects when clicking this container
+          onDoubleClick={(e) => {
+            if (e.target === e.currentTarget) {
+              handleCreateNewProject();
+            }
+          }}
+          onClick={(e) => {
+            if (e.target === e.currentTarget) {
+              setActiveArea('projects');
+            }
+          }}
+        >
           {/* Home / DEV indicator */}
           {window.location.hostname === 'localhost' ? (
             <button
@@ -666,6 +771,7 @@ function App() {
                 onEditChange={setProjectEditValue}
                 onEditSubmit={handleSubmitProjectRename}
                 onEditCancel={handleCancelProjectRename}
+                isAreaActive={activeArea === 'projects'}
                 onClick={() => {
                   openProject(projectId, project.path);
                 }}
@@ -695,21 +801,33 @@ function App() {
         </div>
 
         {/* Drag area + Empty drop zone for reordering */}
-        <ProjectEmptyDropZone
-          onDrop={(projectId) => {
-            // Move to end
-            const currentOrder = Array.from(openProjects.keys());
-            if (!currentOrder.includes(projectId)) return;
-            const newOrder = currentOrder.filter(id => id !== projectId);
-            newOrder.push(projectId);
-            reorderProjects(newOrder);
-          }}
-          onHoverChange={setProjectEmptyZoneHovered}
-        />
+          <ProjectEmptyDropZone
+            onDrop={(id) => {
+              const currentOrder = openProjectsList.map(([id]) => id);
+              const sourceIndex = currentOrder.indexOf(id);
+              if (sourceIndex !== -1) {
+                const newOrder = [...currentOrder];
+                newOrder.splice(sourceIndex, 1);
+                newOrder.push(id);
+                reorderProjects(newOrder);
+              }
+            }}
+            onHoverChange={setProjectEmptyZoneHovered}
+            onDoubleClick={handleCreateNewProject}
+          />
       </div>
 
-      {/* Content */}
-      {view === 'dashboard' ? <Dashboard /> : <Workspace />}
+      {/* Content Area */}
+      <div 
+        className="flex-1 relative overflow-hidden flex flex-col"
+        onClick={() => setActiveArea('workspace')}
+      >
+        {view === 'dashboard' ? (
+          <Dashboard />
+        ) : (
+          <Workspace />
+        )}
+      </div>
 
       {/* Global UI Components */}
       <ToastContainer />
