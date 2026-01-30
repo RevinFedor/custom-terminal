@@ -76,9 +76,12 @@ export default function Dashboard() {
 
   // Create project from bookmark - always creates a NEW project instance
   const handleCreateProjectFromBookmark = async (bookmark: Bookmark) => {
+    console.log('[Dashboard] handleCreateProjectFromBookmark called with bookmark:', bookmark);
+
     // Generate unique name with suffix if needed
     let projectName = bookmark.name;
     const existingNames = Object.values(projects).map(p => p.name);
+    console.log('[Dashboard] Existing project names:', existingNames);
 
     if (existingNames.includes(projectName)) {
       let suffix = 1;
@@ -87,16 +90,27 @@ export default function Dashboard() {
       }
       projectName = `${bookmark.name}-${suffix}`;
     }
+    console.log('[Dashboard] Final project name:', projectName);
 
     // Always create new project instance
-    const newProject = await ipcRenderer.invoke('project:create-instance', {
-      path: bookmark.path,
-      name: projectName
-    });
+    console.log('[Dashboard] Calling project:create-instance...');
+    try {
+      const newProject = await ipcRenderer.invoke('project:create-instance', {
+        path: bookmark.path,
+        name: projectName
+      });
+      console.log('[Dashboard] project:create-instance returned:', newProject);
 
-    if (newProject) {
-      await loadProjects();
-      openProject(newProject.id, newProject.path);
+      if (newProject) {
+        console.log('[Dashboard] Loading projects...');
+        await loadProjects();
+        console.log('[Dashboard] Opening project:', newProject.id, newProject.path);
+        openProject(newProject.id, newProject.path);
+      } else {
+        console.error('[Dashboard] project:create-instance returned null/undefined!');
+      }
+    } catch (err) {
+      console.error('[Dashboard] Error in handleCreateProjectFromBookmark:', err);
     }
   };
 
@@ -195,8 +209,7 @@ export default function Dashboard() {
 
             {/* Add Directory Card - same style as BookmarkCard */}
             <div
-              className="flex items-center justify-center gap-2 px-3 py-2 rounded-lg border border-dashed border-[#444] bg-transparent cursor-pointer transition-all duration-150 hover:border-[#666] hover:bg-[#1a1a1a]"
-              style={{ minWidth: '200px', maxWidth: '350px', height: '44px' }}
+              className="flex items-center justify-center gap-2 px-3 py-3 rounded-lg border border-dashed border-[#444] bg-transparent cursor-pointer transition-all duration-150 hover:border-[#666] hover:bg-[#1a1a1a]"
               onClick={addBookmarkFromDialog}
             >
               <Plus size={14} className="text-[#666]" />

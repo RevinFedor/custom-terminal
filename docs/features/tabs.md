@@ -26,6 +26,11 @@
 - **ContextMenu:** Правый клик по вкладке позволяет не только закрыть проект, но и выполнить **"Copy ID/Path"** — копирование UUID сессии и полного пути в буфер обмена.
 
 ## Behavior Specs
+- **Horizontal Scroll:** Таб-бар поддерживает прокрутку колесиком мыши без зажатого Shift (реализовано через `onWheel` и трансформацию `deltaY` в `scrollLeft`).
+- **Auto-Scroll:** При перетаскивании таба к левому или правому краю, область вкладок автоматически скроллится. Используется `@atlaskit/pragmatic-drag-and-drop-auto-scroll`.
+- **Cross-Project Move:** Таб можно перетащить на любую вкладку проекта в Title Bar. 
+    - Логика: `moveTabToProject` в `useWorkspaceStore`.
+    - PTY процесс сохраняется, меняется только привязка к проекту в БД.
 - **Sync:** Порядок проектов сохраняется в `Map` внутри `useWorkspaceStore`.
 - **Title Bar Integration:** Пустая зона для дропа (`ProjectEmptyDropZone`) поддерживает `WebkitAppRegion: drag`, когда не активен процесс перетаскивания, позволяя двигать окно приложения за шапку.
 

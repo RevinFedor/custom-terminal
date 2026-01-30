@@ -40,48 +40,48 @@ class ProjectManager {
   }
 
   get projects() {
-    // Return projects as an object with path as key (for compatibility)
+    // Return projects as an object with ID as key
     const allProjects = this.db.getAllProjects();
     const projectsObj = {};
 
     allProjects.forEach(project => {
-      projectsObj[project.path] = project;
+      projectsObj[project.id] = project;
     });
 
     return projectsObj;
   }
 
-  saveProjectNote(dirPath, content) {
-    this.db.updateProjectNotes(dirPath, content);
+  saveProjectNote(projectId, content) {
+    this.db.updateProjectNotes(projectId, content);
   }
 
-  saveProjectActions(dirPath, actions) {
-    this.db.saveQuickActions(dirPath, actions);
+  saveProjectActions(projectId, actions) {
+    this.db.saveQuickActions(projectId, actions);
   }
 
-  saveProjectTabs(dirPath, tabs) {
-    this.db.saveTabs(dirPath, tabs);
+  saveProjectTabs(projectId, tabs) {
+    this.db.saveTabs(projectId, tabs);
   }
 
-  saveProjectMetadata(dirPath, metadata) {
-    this.db.updateProjectMetadata(dirPath, metadata);
+  saveProjectMetadata(projectId, metadata) {
+    this.db.updateProjectMetadata(projectId, metadata);
   }
 
-  deleteProject(dirPath) {
-    return this.db.deleteProject(dirPath);
+  deleteProject(projectId) {
+    return this.db.deleteProject(projectId);
   }
 
-  saveGeminiPrompt(dirPath, prompt) {
-    this.db.updateProjectMetadata(dirPath, { geminiPrompt: prompt });
+  saveGeminiPrompt(projectId, prompt) {
+    this.db.updateProjectMetadata(projectId, { geminiPrompt: prompt });
   }
 
   // Gemini history methods
-  saveGeminiHistory(dirPath, selectedText, prompt, response) {
-    return this.db.saveGeminiHistory(dirPath, selectedText, prompt, response);
+  saveGeminiHistory(projectId, selectedText, prompt, response) {
+    return this.db.saveGeminiHistory(projectId, selectedText, prompt, response);
   }
 
-  getGeminiHistory(dirPath, limit = 50) {
-    return this.db.getGeminiHistory(dirPath, limit);
+  getGeminiHistory(projectId, limit = 50) {
+    return this.db.getGeminiHistory(projectId, limit);
   }
 
   deleteGeminiHistoryItem(historyId) {

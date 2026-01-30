@@ -60,14 +60,14 @@ export default function BookmarkCard({
       {/* Main Card */}
       <div
         ref={cardRef}
-        className="relative flex items-center rounded-lg border border-[#333] bg-[#1a1a1a] cursor-pointer transition-all duration-150 hover:border-[#555]"
-        style={{ minWidth: '200px', maxWidth: '350px', height: '44px' }}
+        className="relative flex items-stretch rounded-lg border border-[#333] bg-[#1a1a1a] cursor-pointer transition-all duration-150 hover:border-[#555]"
         onClick={() => onCreateProject(bookmark)}
       >
         {/* Content */}
         <div
-          className="flex-1 min-w-0 px-3 py-2 transition-opacity duration-150"
+          className="flex-1 min-w-0 px-2.5 py-1.5 transition-opacity duration-150"
           style={{ opacity: showAddOverlay ? 0 : 1 }}
+          title={bookmark.path}
         >
           <div className="text-sm text-white truncate">{bookmark.name}</div>
           <div className="text-[10px] text-[#666] truncate">{shortPath}</div>
@@ -84,18 +84,18 @@ export default function BookmarkCard({
           </div>
         )}
 
-        {/* Right side buttons - stretch full height, no gaps */}
+        {/* Right side buttons - stretch full height */}
         <div
-          className="flex items-center self-stretch rounded-r-lg"
+          className="flex items-stretch self-stretch"
           onMouseEnter={() => setIsButtonsHovered(true)}
           onMouseLeave={() => setIsButtonsHovered(false)}
           onClick={(e) => e.stopPropagation()}
         >
           {/* Info button - only render if description exists */}
           {bookmark.description && (
-            <span className="relative group/info flex items-center self-stretch">
+            <span className="relative group/info flex items-stretch">
               <button
-                className="px-1.5 self-stretch text-[#666] hover:text-white hover:bg-white/10 transition-colors cursor-pointer"
+                className="px-2 flex items-center text-[#666] hover:text-white hover:bg-white/10 transition-colors cursor-pointer"
               >
                 <HelpCircle size={14} />
               </button>
@@ -116,11 +116,10 @@ export default function BookmarkCard({
             </span>
           )}
 
-          {/* Menu button - stretch full height, rounded only on right side */}
-          <div className="relative flex items-center self-stretch">
+          {/* Menu button */}
+          <div className="relative flex items-stretch">
             <button
-              className="px-1.5 self-stretch text-[#666] hover:text-white hover:bg-white/10 transition-colors cursor-pointer"
-              style={{ borderTopRightRadius: '7px', borderBottomRightRadius: '7px' }}
+              className="px-2 flex items-center text-[#666] hover:text-white hover:bg-white/10 rounded-r-lg transition-colors cursor-pointer"
               onClick={(e) => {
                 e.stopPropagation();
                 setShowMenu(!showMenu);

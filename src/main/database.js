@@ -359,13 +359,17 @@ class DatabaseManager {
 
   // Create a new project instance (allows multiple projects with same path)
   createProjectInstance(projectPath, customName = null) {
+    console.log('[DB] createProjectInstance called:', { projectPath, customName });
+
     const normalizedPath = path.resolve(projectPath);
     const folderName = path.basename(normalizedPath);
+    console.log('[DB] Normalized path:', normalizedPath, 'folderName:', folderName);
 
     // Generate unique ID using timestamp + random
     const timestamp = Date.now();
     const random = Math.random().toString(36).substring(2, 8);
     const projectId = `${Buffer.from(normalizedPath).toString('base64').substring(0, 20)}_${timestamp}_${random}`;
+    console.log('[DB] Generated projectId:', projectId);
 
     // Determine name: use customName or generate suffix
     let projectName = customName;
@@ -374,12 +378,14 @@ class DatabaseManager {
       const existingCount = this.db.prepare('SELECT COUNT(*) as count FROM projects WHERE path = ?').get(normalizedPath).count;
       projectName = existingCount > 0 ? `${folderName}-${existingCount + 1}` : folderName;
     }
+    console.log('[DB] Final projectName:', projectName);
 
     const insert = this.db.prepare(`
       INSERT INTO projects (id, path, name, description, gemini_prompt, notes_global)
       VALUES (?, ?, ?, ?, ?, ?)
     `);
 
+    console.log('[DB] Inserting project...');
     insert.run(
       projectId,
       normalizedPath,
@@ -388,8 +394,11 @@ class DatabaseManager {
       'вот моя проблема нужно чтобы ты понял что за проблема и на reddit поискал обсуждения. Не ограничивайся категориями. Проблема: ',
       `<h1>${projectName}</h1><p>Project notes go here...</p>`
     );
+    console.log('[DB] Insert done, fetching project by ID...');
 
-    return this.getProjectById(projectId);
+    const result = this.getProjectById(projectId);
+    console.log('[DB] getProjectById returned:', result);
+    return result;
   }
 
   // Get project by ID (not by path)
@@ -466,43 +475,35 @@ class DatabaseManager {
     }
   }
 
-  updateProjectNotes(projectPath, notes) {
-    const normalizedPath = path.resolve(projectPath);
+  updateProjectNotes(projectId, notes) {
     this.db.prepare(`
       UPDATE projects
       SET notes_global = ?, updated_at = strftime('%s', 'now')
-      WHERE path = ?
-    `).run(notes, normalizedPath);
+      WHERE id = ?
+    `).run(notes, projectId);
   }
 
-  deleteProject(projectPath) {
-    const normalizedPath = path.resolve(projectPath);
-    const project = this.db.prepare('SELECT id FROM projects WHERE path = ?').get(normalizedPath);
-
-    if (!project) return false;
-
+  deleteProject(projectId) {
+    console.log('[DB] deleteProject called for ID:', projectId);
     // CASCADE will delete tabs, quick_actions, gemini_history, ai_sessions
-    this.db.prepare('DELETE FROM projects WHERE id = ?').run(project.id);
-    return true;
+    const result = this.db.prepare('DELETE FROM projects WHERE id = ?').run(projectId);
+    return result.changes > 0;
   }
 
   // ========== QUICK ACTIONS (now redirects to global commands) ==========
 
-  saveQuickActions(projectPath, actions) {
+  saveQuickActions(projectId, actions) {
     // Now we save to global commands instead of project-specific
     this.saveGlobalCommands(actions);
   }
 
   // ========== TABS ==========
 
-  saveTabs(projectPath, tabs) {
-    const normalizedPath = path.resolve(projectPath);
-    const project = this.db.prepare('SELECT id FROM projects WHERE path = ?').get(normalizedPath);
-
-    if (!project) return;
+  saveTabs(projectId, tabs) {
+    console.log('[DB] saveTabs called for projectId:', projectId);
 
     // Delete existing tabs
-    this.db.prepare('DELETE FROM tabs WHERE project_id = ?').run(project.id);
+    this.db.prepare('DELETE FROM tabs WHERE project_id = ?').run(projectId);
 
     // Insert new tabs with color, is_utility, claude_session_id, gemini_session_id, was_interrupted and overlay_dismissed
     const insert = this.db.prepare(`
@@ -511,32 +512,27 @@ class DatabaseManager {
     `);
 
     tabs.forEach((tab, index) => {
-      insert.run(project.id, tab.name, tab.cwd, index, tab.color || null, tab.isUtility ? 1 : 0, tab.claudeSessionId || null, tab.geminiSessionId || null, tab.wasInterrupted ? 1 : 0, tab.overlayDismissed ? 1 : 0);
+      insert.run(projectId, tab.name, tab.cwd, index, tab.color || null, tab.isUtility ? 1 : 0, tab.claudeSessionId || null, tab.geminiSessionId || null, tab.wasInterrupted ? 1 : 0, tab.overlayDismissed ? 1 : 0);
     });
 
     this.db.prepare(`
       UPDATE projects SET updated_at = strftime('%s', 'now') WHERE id = ?
-    `).run(project.id);
+    `).run(projectId);
   }
 
   // ========== GEMINI HISTORY ==========
 
-  saveGeminiHistory(projectPath, selectedText, prompt, response) {
-    const normalizedPath = path.resolve(projectPath);
-    const project = this.db.prepare('SELECT id FROM projects WHERE path = ?').get(normalizedPath);
-
-    if (!project) return null;
-
+  saveGeminiHistory(projectId, selectedText, prompt, response) {
     const insert = this.db.prepare(`
       INSERT INTO gemini_history (project_id, selected_text, prompt, response)
       VALUES (?, ?, ?, ?)
     `);
 
-    const result = insert.run(project.id, selectedText, prompt, response);
+    const result = insert.run(projectId, selectedText, prompt, response);
 
     return {
       id: result.lastInsertRowid,
-      project_id: project.id,
+      project_id: projectId,
       selected_text: selectedText,
       prompt: prompt,
       response: response,
@@ -544,18 +540,13 @@ class DatabaseManager {
     };
   }
 
-  getGeminiHistory(projectPath, limit = 50) {
-    const normalizedPath = path.resolve(projectPath);
-    const project = this.db.prepare('SELECT id FROM projects WHERE path = ?').get(normalizedPath);
-
-    if (!project) return [];
-
+  getGeminiHistory(projectId, limit = 50) {
     return this.db.prepare(`
       SELECT * FROM gemini_history
       WHERE project_id = ?
       ORDER BY timestamp DESC
       LIMIT ?
-    `).all(project.id, limit);
+    `).all(projectId, limit);
   }
 
   deleteGeminiHistoryItem(historyId) {
