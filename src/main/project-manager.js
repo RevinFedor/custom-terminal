@@ -28,15 +28,12 @@ class ProjectManager {
     }
   }
 
-  getProject(dirPath) {
-    let project = this.db.getProject(dirPath);
+  createProjectInstance(projectPath, customName = null) {
+    return this.db.createProjectInstance(projectPath, customName);
+  }
 
-    // If project doesn't exist, create it
-    if (!project) {
-      project = this.db.createProject(dirPath);
-    }
-
-    return project;
+  createEmptyProject(name) {
+    return this.db.createEmptyProject(name);
   }
 
   get projects() {

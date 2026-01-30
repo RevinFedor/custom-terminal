@@ -716,6 +716,19 @@ ipcMain.handle('project:create-instance', (event, { path: projectPath, name }) =
   }
 });
 
+// Create new empty project (path can be set later)
+ipcMain.handle('project:create-empty', (event, { name }) => {
+  console.log('[Main] project:create-empty called with:', { name });
+  try {
+    const result = projectManager.db.createEmptyProject(name);
+    console.log('[Main] project:create-empty result:', result);
+    return result;
+  } catch (err) {
+    console.error('[Main] project:create-empty error:', err);
+    throw err;
+  }
+});
+
 // App state (session, settings)
 ipcMain.handle('app:getState', (event, key) => {
   return projectManager.db.getAppState(key);

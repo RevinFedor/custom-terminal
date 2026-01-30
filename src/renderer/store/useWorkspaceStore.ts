@@ -152,38 +152,23 @@ const getNextAvailableName = (baseName: string, existingNames: string[]): string
   return `${baseName}-${num.toString().padStart(2, '0')}`;
 };
 
-// Debounce timers (outside store to persist across calls)
+// Debounce timer for session saving
 let saveSessionTimer: NodeJS.Timeout | null = null;
-let saveTabsTimers: Map<string, NodeJS.Timeout> = new Map();
 
-// Helper to save tabs to database (debounced)
-const saveTabs = (projectId: string, tabs: Map<string, Tab>, immediate = false) => {
-  // Clear existing timer for this project
-  const existingTimer = saveTabsTimers.get(projectId);
-  if (existingTimer) clearTimeout(existingTimer);
-
-  const doSave = async () => {
-    const tabsArray = Array.from(tabs.values()).map((tab) => ({
-      name: tab.name,
-      cwd: tab.cwd,
-      color: tab.color,
-      isUtility: tab.isUtility,
-      claudeSessionId: tab.claudeSessionId,
-      geminiSessionId: tab.geminiSessionId,
-      wasInterrupted: tab.wasInterrupted,
-      overlayDismissed: tab.overlayDismissed,
-      notes: tab.notes
-    }));
-    await ipcRenderer.invoke('project:save-tabs', { projectId, tabs: tabsArray });
-    saveTabsTimers.delete(projectId);
-  };
-
-  if (immediate) {
-    doSave();
-  } else {
-    const timer = setTimeout(doSave, 500);
-    saveTabsTimers.set(projectId, timer);
-  }
+// Helper to save tabs to database (immediate, no debounce)
+const saveTabs = (projectId: string, tabs: Map<string, Tab>) => {
+  const tabsArray = Array.from(tabs.values()).map((tab) => ({
+    name: tab.name,
+    cwd: tab.cwd,
+    color: tab.color,
+    isUtility: tab.isUtility,
+    claudeSessionId: tab.claudeSessionId,
+    geminiSessionId: tab.geminiSessionId,
+    wasInterrupted: tab.wasInterrupted,
+    overlayDismissed: tab.overlayDismissed,
+    notes: tab.notes
+  }));
+  ipcRenderer.invoke('project:save-tabs', { projectId, tabs: tabsArray });
 };
 
 export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
@@ -377,7 +362,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       await syncAllTabsCwd(projectId);
 
       // Save tabs before closing (manual close = NOT interrupted)
-      saveTabs(workspace.projectId, workspace.tabs, true);
+      saveTabs(workspace.projectId, workspace.tabs);
 
       // Kill all terminals
       workspace.tabs.forEach((tab) => {
@@ -1092,7 +1077,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       }
       if (changed) {
         // Save immediately (shutdown scenario)
-        saveTabs(workspace.projectId, workspace.tabs, true);
+        saveTabs(workspace.projectId, workspace.tabs);
       }
     }
   },

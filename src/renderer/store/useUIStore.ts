@@ -771,5 +771,9 @@ export const useUIStore = create<UIStore>((set, get) => ({
 
   // Workspace View
   currentView: 'terminal',
-  setCurrentView: (view) => set({ currentView: view })
+  setCurrentView: (view) => set({ currentView: view }),
+
+  // Focus Area
+  activeArea: 'workspace',
+  setActiveArea: (area) => set({ activeArea: area })
 }));

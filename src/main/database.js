@@ -257,6 +257,18 @@ class DatabaseManager {
     return this.getProjectById(projectId);
   }
 
+  createEmptyProject(name = 'Новый проект') {
+    const projectId = `new_project_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+    const emptyPath = ''; // Path can be set later via Edit Modal
+
+    this.db.prepare(`
+      INSERT INTO projects (id, path, name, description, gemini_prompt, notes_global)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(projectId, emptyPath, name, '', 'вот моя проблема нужно чтобы ты понял что за проблема и на reddit поискал обсуждения. Не ограничивайся категориями. Проблема: ', `<h1>${name}</h1>`);
+
+    return this.getProjectById(projectId);
+  }
+
   getAllProjects() {
     const projects = this.db.prepare('SELECT * FROM projects ORDER BY updated_at DESC').all();
     return projects.map(p => this.getProjectById(p.id));
