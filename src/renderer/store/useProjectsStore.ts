@@ -59,7 +59,7 @@ export const useProjectsStore = create<ProjectsStore>((set, get) => ({
       // Persist to backend
       if (updates.name || updates.description) {
         await ipcRenderer.invoke('project:save-metadata', {
-          dirPath: project.path,
+          projectId: project.id,
           metadata: { name: updates.name, description: updates.description }
         });
       }

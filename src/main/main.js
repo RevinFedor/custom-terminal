@@ -668,6 +668,24 @@ ipcMain.handle('project:get', (event, identifier) => {
 });
 
 // Get current working directory
+ipcMain.handle('app:select-directory', async () => {
+  const { dialog } = require('electron');
+  const result = await dialog.showOpenDialog({
+    properties: ['openDirectory']
+  });
+  if (result.canceled) return null;
+  return result.filePaths[0];
+});
+
+ipcMain.handle('app:check-path-exists', (event, targetPath) => {
+  const fs = require('fs');
+  try {
+    return fs.existsSync(targetPath) && fs.lstatSync(targetPath).isDirectory();
+  } catch (err) {
+    return false;
+  }
+});
+
 ipcMain.handle('app:getCwd', () => {
   return process.cwd();
 });

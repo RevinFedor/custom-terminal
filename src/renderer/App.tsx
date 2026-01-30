@@ -43,9 +43,15 @@ interface ProjectTabItemProps {
   fontSize: number;
   forceRightIndicator?: boolean;
   activeProcessCount?: number; // Count of running processes in project
+  isEditing: boolean;
+  editValue: string;
+  onEditChange: (val: string) => void;
+  onEditSubmit: () => void;
+  onEditCancel: () => void;
   onClick: () => void;
   onContextMenu: (e: React.MouseEvent) => void;
   onMiddleClick: () => void;
+  onDoubleClick: () => void;
   onTabDrop?: (tabId: string, sourceProjectId: string) => void; // For dropping terminal tabs
 }
 
@@ -57,19 +63,33 @@ const ProjectTabItem = memo(({
   fontSize,
   forceRightIndicator = false,
   activeProcessCount = 0,
+  isEditing,
+  editValue,
+  onEditChange,
+  onEditSubmit,
+  onEditCancel,
   onClick,
   onContextMenu,
   onMiddleClick,
+  onDoubleClick,
   onTabDrop
 }: ProjectTabItemProps) => {
   const ref = useRef<HTMLButtonElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
   const [closestEdge, setClosestEdge] = useState<Edge | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [isTabDropTarget, setIsTabDropTarget] = useState(false); // Highlight when terminal tab is over
 
   useEffect(() => {
+    if (isEditing && inputRef.current) {
+      inputRef.current.focus();
+      inputRef.current.select();
+    }
+  }, [isEditing]);
+
+  useEffect(() => {
     const element = ref.current;
-    if (!element) return;
+    if (!element || isEditing) return;
 
     return combine(
       draggable({
@@ -78,6 +98,7 @@ const ProjectTabItem = memo(({
         onDragStart: () => setIsDragging(true),
         onDrop: () => setIsDragging(false),
       }),
+// ... existing dropTargetForElements code ...
       dropTargetForElements({
         element,
         getData: ({ input, element }) => {
@@ -126,7 +147,7 @@ const ProjectTabItem = memo(({
         },
       })
     );
-  }, [projectId, index, onTabDrop]);
+  }, [projectId, index, onTabDrop, isEditing]);
 
   // Text color: active (selected) = black, has processes = white, idle = gray
   const textColor = isActive
@@ -147,6 +168,7 @@ const ProjectTabItem = memo(({
         borderRadius: isTabDropTarget ? '4px' : undefined,
       }}
       onClick={onClick}
+      onDoubleClick={onDoubleClick}
       onContextMenu={onContextMenu}
       onAuxClick={(e) => {
         if (e.button === 1) {
@@ -159,8 +181,23 @@ const ProjectTabItem = memo(({
         <div className="absolute inset-0 bg-white rounded" />
       )}
       <span className="relative z-10 flex items-center gap-1.5">
-        <span className="max-w-[120px] truncate">{projectName}</span>
-        {activeProcessCount > 0 && (
+        {isEditing ? (
+          <input
+            ref={inputRef}
+            className="bg-[#333] border border-accent rounded px-1.5 py-0 text-white outline-none w-[100px] text-xs font-normal"
+            value={editValue}
+            onChange={(e) => onEditChange(e.target.value)}
+            onBlur={onEditSubmit}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') onEditSubmit();
+              if (e.key === 'Escape') onEditCancel();
+            }}
+            onClick={(e) => e.stopPropagation()}
+          />
+        ) : (
+          <span className="max-w-[120px] truncate">{projectName}</span>
+        )}
+        {activeProcessCount > 0 && !isEditing && (
           <span
             className="flex items-center justify-center text-[10px] font-medium rounded-full"
             style={{
@@ -239,7 +276,7 @@ const RestoreLoader = memo(() => (
 
 function App() {
   const { view, showDashboard, openProject, openProjects, activeProjectId, closeProject, createTab, createTabAfterCurrent, closeTab, getActiveProject, restoreSession, reorderProjects, moveTabToProject, isRestoring } = useWorkspaceStore();
-  const { projects, loadProjects } = useProjectsStore();
+  const { projects, loadProjects, updateProject } = useProjectsStore();
   const { toggleFileExplorer, closeFilePreview, filePreview, showToast, incrementAllFontSizes, decrementAllFontSizes } = useUIStore();
   const { toggleResearch } = useResearchStore();
   const projectTabsFontSize = useUIStore((s) => s.projectTabsFontSize);
@@ -247,6 +284,27 @@ function App() {
   const [projectContextMenu, setProjectContextMenu] = useState<{ projectId: string; x: number; y: number } | null>(null);
   const [projectEmptyZoneHovered, setProjectEmptyZoneHovered] = useState(false);
   const [processStatus, setProcessStatus] = useState<Map<string, boolean>>(new Map()); // tabId -> isRunning
+
+  // Renaming projects in tabs
+  const [editingProjectId, setEditingProjectId] = useState<string | null>(null);
+  const [projectEditValue, setProjectEditValue] = useState('');
+
+  const handleStartEditingProject = (projectId: string, currentName: string) => {
+    setEditingProjectId(projectId);
+    setProjectEditValue(currentName);
+  };
+
+  const handleSubmitProjectRename = async () => {
+    if (editingProjectId && projectEditValue.trim()) {
+      await updateProject(editingProjectId, { name: projectEditValue.trim() });
+      showToast('Project renamed', 'success');
+    }
+    setEditingProjectId(null);
+  };
+
+  const handleCancelProjectRename = () => {
+    setEditingProjectId(null);
+  };
 
   // Load projects and restore session ONCE on mount
   useEffect(() => {
@@ -603,9 +661,15 @@ function App() {
                 fontSize={projectTabsFontSize}
                 forceRightIndicator={isLast && projectEmptyZoneHovered}
                 activeProcessCount={activeCount}
+                isEditing={editingProjectId === projectId}
+                editValue={projectEditValue}
+                onEditChange={setProjectEditValue}
+                onEditSubmit={handleSubmitProjectRename}
+                onEditCancel={handleCancelProjectRename}
                 onClick={() => {
                   openProject(projectId, project.path);
                 }}
+                onDoubleClick={() => handleStartEditingProject(projectId, project.name)}
                 onContextMenu={(e) => {
                   e.preventDefault();
                   setProjectContextMenu({ projectId, x: e.clientX, y: e.clientY });
