@@ -6,9 +6,12 @@
     - **Vite & Escaping:** При написании Bash-команд в `main.js` необходимо экранировать `$`, чтобы избежать ошибок трансформации Vite. См. `knowledge/fix-main-process-escaping.md`.
     - **Stability:** Используется `disable-http-cache` для предотвращения загрузки устаревшего кода в продакшн-билдах. См. `knowledge/fix-terminal-colors.md`.
 - **Renderer Process:** React 19 UI. Общается с Main через типизированные IPC-вызовы (см. `src/preload/index.js`).
+- **Focus Model:** Введено понятие `activeArea` ('projects' | 'workspace'). Это позволяет контекстно интерпретировать горячие клавиши (например, `Cmd+T`).
+- **Navigation History (LRU):** Система хранит стек последних 20 активных проектов (`projectHistory`). Это позволяет реализовать навигацию «Назад» при закрытии вкладок или отмене действий.
 
 ## 2. Project Instance Model (Philosophy)
 Проект в системе перестал быть «путем на диске» и стал самостоятельной **Сущностью (Entity)**.
+- **Empty Projects:** Поддержка создания проектов без начального пути (`project:create-empty`). Путь назначается позже через Edit Modal.
 - **Entity vs Path:** Раньше один путь `~/app` соответствовал одному проекту. Теперь проект — это уникальный ID в БД. Путь (`path`) — лишь один из атрибутов.
 - **Multiple Instances:** Архитектура позволяет создавать неограниченное количество инстансов для одной и той же директории. Каждый инстанс имеет свой набор вкладок, заметок и историю AI.
 - **ID Generation:** Используется композитный ID: `base64(path)` + `timestamp` + `random`. См. `knowledge/fix-project-instances.md`.

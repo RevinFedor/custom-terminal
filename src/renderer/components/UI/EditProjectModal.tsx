@@ -1,14 +1,17 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useUIStore } from '../../store/useUIStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
-import { Folder, CheckCircle2, AlertCircle, Trash2 } from 'lucide-react';
+import { useBookmarksStore } from '../../store/useBookmarksStore';
+import { Folder, CheckCircle2, AlertCircle, Trash2, HelpCircle } from 'lucide-react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
+import SmartPopover from './SmartPopover';
 
 const { ipcRenderer } = window.require('electron');
 
 export default function EditProjectModal() {
   const { editingProject, closeEditModal, showToast } = useUIStore();
-  const { loadProjects } = useProjectsStore();
+  const { loadProjects, updateProject } = useProjectsStore();
+  const { bookmarks, updateBookmark, deleteBookmark, loadBookmarks } = useBookmarksStore();
   const { openProjects, closeProject } = useWorkspaceStore();
 
   const [name, setName] = useState('');
@@ -16,25 +19,10 @@ export default function EditProjectModal() {
   const [path, setPath] = useState('');
   const [isPathValid, setIsPathValid] = useState<boolean | null>(null);
   const [isValidating, setIsValidating] = useState(false);
+  const [isHoveringName, setIsHoveringName] = useState(false);
 
-  const handleDelete = async () => {
-    if (!editingProject) return;
-
-    if (!confirm(`Delete "${editingProject.name}"?`)) return;
-
-    if (openProjects.has(editingProject.id)) {
-      await closeProject(editingProject.id);
-    }
-
-    const result = await ipcRenderer.invoke('project:delete', editingProject.id);
-    if (result.success) {
-      showToast('Project deleted', 'success');
-      loadProjects();
-      closeEditModal();
-    } else {
-      showToast('Failed to delete', 'error');
-    }
-  };
+  // Robust check if we are editing a Bookmark or a Project
+  const isActuallyBookmark = editingProject && bookmarks.some(b => String(b.id) === String(editingProject.id));
 
   useEffect(() => {
     if (editingProject) {
@@ -45,8 +33,17 @@ export default function EditProjectModal() {
     }
   }, [editingProject]);
 
+  // Save everything when modal closes (onUnmount)
+  useEffect(() => {
+    return () => {
+      if (editingProject) {
+        handleSave(true); // Silent save on close
+      }
+    };
+  }, [editingProject, name, description, path]);
+
   const validatePath = async (p: string) => {
-    if (!p.trim()) {
+    if (!p || !p.trim()) {
       setIsPathValid(false);
       return false;
     }
@@ -62,42 +59,59 @@ export default function EditProjectModal() {
     if (selected) {
       setPath(selected);
       validatePath(selected);
+      handleSave();
     }
   };
 
-  const handleSave = async () => {
+  const handleSave = async (silent = false) => {
     if (!editingProject) return;
+    if (!name.trim()) return;
 
-    if (!name.trim()) {
-      showToast('Project name cannot be empty', 'error');
-      return;
-    }
-
-    const isCurrentPathValid = await validatePath(path);
-    if (!isCurrentPathValid) {
-      if (!confirm('The specified path does not exist or is not a directory. Save anyway?')) {
-        return;
-      }
-    }
-
-    await ipcRenderer.invoke('project:save-metadata', {
-      projectId: editingProject.id,
-      metadata: {
+    if (isActuallyBookmark) {
+      await updateBookmark(editingProject.id, {
+        name: name.trim(),
+        description: description.trim()
+      });
+    } else {
+      // For projects, path validation is more critical
+      await updateProject(editingProject.id, {
         name: name.trim(),
         description: description.trim(),
         path: path.trim()
-      }
-    });
+      });
+    }
 
-    showToast('Project saved', 'success');
-    loadProjects();
+    if (!silent) {
+      // Notify other components (like ProjectHome) about name change
+      window.dispatchEvent(new CustomEvent('project:name-sync', { 
+        detail: { projectId: editingProject.id, name: name.trim() } 
+      }));
+    }
+  };
+
+  const handleDelete = async () => {
+    if (!editingProject) return;
+
+    if (!confirm(`Delete ${isActuallyBookmark ? 'bookmark' : 'project'} "${editingProject.name}"?`)) return;
+
+    if (isActuallyBookmark) {
+      await deleteBookmark(editingProject.id);
+      showToast('Bookmark deleted', 'success');
+    } else {
+      if (openProjects.has(editingProject.id)) {
+        await closeProject(editingProject.id);
+      }
+      const result = await ipcRenderer.invoke('project:delete', editingProject.id);
+      if (result.success) {
+        showToast('Project deleted', 'success');
+        loadProjects();
+      }
+    }
     closeEditModal();
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter' && e.metaKey) {
-      handleSave();
-    } else if (e.key === 'Escape') {
+    if (e.key === 'Escape') {
       closeEditModal();
     }
   };
@@ -106,104 +120,115 @@ export default function EditProjectModal() {
 
   return (
     <div
-      className="fixed inset-0 bg-black/50 flex items-center justify-center z-[100]"
+      className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-[100]"
       onClick={closeEditModal}
       onKeyDown={handleKeyDown}
       tabIndex={-1}
     >
       <div
-        className="bg-panel border border-border-main rounded-xl p-6 w-[450px] shadow-2xl"
+        className="bg-[#1a1a1a] border border-white/10 rounded-2xl p-6 w-[400px] shadow-2xl relative"
         onClick={(e) => e.stopPropagation()}
       >
-        {/* Header */}
-        <div className="flex items-center justify-between mb-4">
-          <div className="flex items-center gap-3">
-            <h2 className="text-lg font-bold text-white">Edit Project</h2>
-            <button
-              className="p-1.5 text-[#555] hover:text-red-400 hover:bg-red-500/10 rounded-lg transition-all cursor-pointer"
-              onClick={handleDelete}
-              title="Delete Project"
-            >
-              <Trash2 size={16} />
-            </button>
-          </div>
+        {/* Top Right Controls */}
+        <div className="absolute top-4 right-4 flex items-center gap-2">
           <button
-            className="text-[#888] hover:text-white text-2xl leading-none"
+            className="p-1.5 text-gray-500 hover:text-red-400 hover:bg-red-500/10 rounded-full transition-all cursor-pointer"
+            onClick={handleDelete}
+            title="Delete"
+          >
+            <Trash2 size={16} />
+          </button>
+          <button
+            className="w-8 h-8 flex items-center justify-center text-gray-500 hover:text-white rounded-full hover:bg-white/5 transition-all text-xl"
             onClick={closeEditModal}
           >
             ×
           </button>
         </div>
 
+        {/* Header with SmartPopover on Name */}
+        <div className="mb-6">
+          <SmartPopover content={description} isOpen={isHoveringName}>
+            <h2 
+              className="text-lg font-bold text-white cursor-help inline-block border-b border-transparent hover:border-white/20 transition-all"
+              onMouseEnter={() => setIsHoveringName(true)}
+              onMouseLeave={() => setIsHoveringName(false)}
+            >
+              {name || (isActuallyBookmark ? 'Edit Bookmark' : 'Edit Project')}
+            </h2>
+          </SmartPopover>
+          <p className="text-[10px] text-gray-500 uppercase tracking-widest mt-1">
+            {isActuallyBookmark ? 'Reserved Directory' : 'Project Instance'}
+          </p>
+        </div>
+
         {/* Form */}
-        <div className="space-y-4">
+        <div className="space-y-5">
           <div>
-            <label className="block text-xs text-[#888] uppercase mb-1">Name</label>
+            <label className="block text-[10px] text-gray-500 uppercase font-bold mb-1.5 ml-1">Name</label>
             <input
               type="text"
-              className="w-full bg-[#2d2d2d] border border-[#444] rounded px-3 py-2 text-white text-sm focus:outline-none focus:border-accent transition-colors"
+              className="w-full bg-[#222] border border-white/5 rounded-xl px-4 py-2.5 text-white text-sm focus:outline-none focus:border-accent focus:bg-[#252525] transition-all"
               value={name}
               onChange={(e) => setName(e.target.value)}
+              onBlur={() => handleSave()}
+              placeholder="Enter name..."
               autoFocus
             />
           </div>
 
-          <div>
-            <label className="block text-xs text-[#888] uppercase mb-1 font-medium flex items-center gap-2">
-              Directory Path
-              {isPathValid === true && <CheckCircle2 size={12} className="text-green-500" />}
-              {isPathValid === false && <AlertCircle size={12} className="text-red-500" />}
-            </label>
-            <div className="flex gap-2">
-              <div className="relative flex-1">
-                <input
-                  type="text"
-                  className={`w-full bg-[#2d2d2d] border ${isPathValid === false ? 'border-red-500/50' : 'border-[#444]'} rounded px-3 py-2 text-white text-xs focus:outline-none focus:border-accent transition-colors`}
-                  value={path}
-                  onChange={(e) => {
-                    setPath(e.target.value);
-                    setIsPathValid(null);
-                  }}
-                  onBlur={(e) => validatePath(e.target.value)}
-                  placeholder="/path/to/project"
-                />
+          {!isActuallyBookmark && (
+            <div>
+              <label className="block text-[10px] text-gray-500 uppercase font-bold mb-1.5 ml-1 flex items-center gap-2">
+                System Path
+                {isPathValid === true && <CheckCircle2 size={12} className="text-green-500" />}
+                {isPathValid === false && <AlertCircle size={12} className="text-red-500" />}
+              </label>
+              <div className="flex gap-2">
+                <div className="relative flex-1">
+                  <input
+                    type="text"
+                    className={`w-full bg-[#222] border ${isPathValid === false ? 'border-red-500/30' : 'border-white/5'} rounded-xl px-4 py-2 text-white text-[11px] focus:outline-none focus:border-accent transition-all font-mono`}
+                    value={path}
+                    onChange={(e) => {
+                      setPath(e.target.value);
+                      setIsPathValid(null);
+                    }}
+                    onBlur={(e) => {
+                      validatePath(e.target.value);
+                      handleSave();
+                    }}
+                    placeholder="/path/to/project"
+                  />
+                </div>
+                <button
+                  className="w-10 h-10 flex items-center justify-center bg-[#222] hover:bg-[#2a2a2a] text-gray-400 hover:text-white rounded-xl border border-white/5 transition-all cursor-pointer flex-shrink-0"
+                  onClick={handleSelectDirectory}
+                >
+                  <Folder size={18} />
+                </button>
               </div>
-              <button
-                className="px-3 bg-[#333] hover:bg-[#444] text-[#aaa] hover:text-white rounded border border-[#444] transition-all flex items-center gap-2 text-xs cursor-pointer"
-                onClick={handleSelectDirectory}
-                title="Select folder"
-              >
-                <Folder size={14} />
-              </button>
             </div>
-          </div>
+          )}
 
           <div>
-            <label className="block text-xs text-[#888] uppercase mb-1 font-medium">Description</label>
+            <label className="block text-[10px] text-gray-500 uppercase font-bold mb-1.5 ml-1">Description</label>
             <textarea
-              className="w-full bg-[#2d2d2d] border border-[#444] rounded px-3 py-2 text-white text-sm focus:outline-none focus:border-accent resize-none h-24"
+              className="w-full bg-[#222] border border-white/5 rounded-xl px-4 py-3 text-white text-sm focus:outline-none focus:border-accent focus:bg-[#252525] transition-all resize-none h-28"
               value={description}
               onChange={(e) => setDescription(e.target.value)}
-              placeholder="What is this project about?"
+              onBlur={() => handleSave()}
+              placeholder="What is this project about? Hover the name above to see this description."
             />
           </div>
         </div>
 
-        {/* Footer */}
-        <div className="flex justify-end gap-2 mt-6 pt-4 border-t border-white/5">
-          <button
-            className="px-4 py-2 text-sm text-[#ccc] hover:text-white transition-colors cursor-pointer"
-            onClick={closeEditModal}
-          >
-            Cancel
-          </button>
-          <button
-            className={`px-4 py-2 text-sm bg-accent text-white rounded hover:bg-accent/80 transition-colors cursor-pointer ${isValidating ? 'opacity-50' : ''}`}
-            onClick={handleSave}
-            disabled={isValidating}
-          >
-            Save Changes
-          </button>
+        <div className="mt-8 pt-4 border-t border-white/5 flex items-center justify-between">
+          <div className="flex items-center gap-2 text-gray-600">
+            <div className="w-1.5 h-1.5 bg-green-500/50 rounded-full animate-pulse" />
+            <span className="text-[10px] uppercase font-bold tracking-tighter">Auto-saving enabled</span>
+          </div>
+          <span className="text-[10px] text-gray-700 font-mono italic">ESC to close</span>
         </div>
       </div>
     </div>

@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
+import { useUIStore } from '../../store/useUIStore';
 import { useBookmarksStore, Bookmark } from '../../store/useBookmarksStore';
 import ProjectCard from './ProjectCard';
 import BookmarkCard from './BookmarkCard';
@@ -13,11 +14,12 @@ export default function Dashboard() {
   const { projects, loadProjects } = useProjectsStore();
   const { openProject, openProjects } = useWorkspaceStore();
   const { bookmarks, loadBookmarks, addBookmarkFromDialog, updateBookmark, deleteBookmark } = useBookmarksStore();
+  const { openEditModal } = useUIStore();
 
-  // Edit bookmark modal state
-  const [editingBookmark, setEditingBookmark] = useState<Bookmark | null>(null);
-  const [editName, setEditName] = useState('');
-  const [editDescription, setEditDescription] = useState('');
+  // Remove local modal states
+  // const [editingBookmark, setEditingBookmark] = useState<Bookmark | null>(null);
+  // const [editName, setEditName] = useState('');
+  // const [editDescription, setEditDescription] = useState('');
 
   useEffect(() => {
     loadProjects();
@@ -143,19 +145,7 @@ export default function Dashboard() {
 
   // Handle edit bookmark
   const handleEditBookmark = (bookmark: Bookmark) => {
-    setEditingBookmark(bookmark);
-    setEditName(bookmark.name);
-    setEditDescription(bookmark.description);
-  };
-
-  const handleSaveEdit = async () => {
-    if (editingBookmark) {
-      await updateBookmark(editingBookmark.id, {
-        name: editName,
-        description: editDescription
-      });
-      setEditingBookmark(null);
-    }
+    openEditModal(bookmark);
   };
 
   // Handle delete bookmark
@@ -218,57 +208,6 @@ export default function Dashboard() {
           </div>
         </div>
       </div>
-
-      {/* Edit Bookmark Modal */}
-      {editingBookmark && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-          <div className="bg-[#252525] border border-[#444] rounded-lg p-4 w-[400px] shadow-2xl">
-            <h3 className="text-sm font-medium text-white mb-4">Edit Bookmark</h3>
-
-            <div className="space-y-3">
-              <div>
-                <label className="text-xs text-[#888] block mb-1">Name</label>
-                <input
-                  type="text"
-                  value={editName}
-                  onChange={(e) => setEditName(e.target.value)}
-                  className="w-full bg-[#1a1a1a] border border-[#444] rounded px-3 py-2 text-sm text-white focus:border-accent outline-none"
-                />
-              </div>
-
-              <div>
-                <label className="text-xs text-[#888] block mb-1">Description</label>
-                <textarea
-                  value={editDescription}
-                  onChange={(e) => setEditDescription(e.target.value)}
-                  rows={3}
-                  className="w-full bg-[#1a1a1a] border border-[#444] rounded px-3 py-2 text-sm text-white focus:border-accent outline-none resize-none"
-                  placeholder="What is this project about?"
-                />
-              </div>
-
-              <div className="text-xs text-[#666] truncate">
-                {editingBookmark.path}
-              </div>
-            </div>
-
-            <div className="flex justify-end gap-2 mt-4">
-              <button
-                onClick={() => setEditingBookmark(null)}
-                className="px-3 py-1.5 text-xs text-[#888] hover:text-white transition-colors"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={handleSaveEdit}
-                className="px-3 py-1.5 text-xs bg-accent/20 text-accent hover:bg-accent/30 rounded transition-colors"
-              >
-                Save
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }

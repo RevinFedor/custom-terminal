@@ -196,30 +196,24 @@ export default function Workspace() {
   const showTimeline = !filePreview && claudeSessionId && activeTab?.commandType === 'claude' && isCommandRunning;
 
   return (
-    <div className="flex-1 flex flex-col h-full overflow-hidden relative">
-      {/* Header Row: TabBar + ProjectToolbar */}
-      <div className="flex h-[30px]">
-        {/* TabBar - fills left side (over terminal area) */}
-        <div className="flex-1 min-w-0">
+    <div className="flex-1 flex h-full overflow-hidden relative">
+      {/* LEFT COLUMN: Tabs + Terminal/Home Area */}
+      <div className="flex-1 flex flex-col min-w-0 relative">
+        {/* Project Home - Overlay that covers only the left column (tabs + terminal) */}
+        {currentView === 'home' && (
+          <div className="absolute inset-0 z-50 bg-bg-main border-r border-border-main">
+            <ProjectHome projectId={activeProjectId} />
+          </div>
+        )}
+
+        {/* TabBar Row */}
+        <div className="h-[30px] border-b border-border-main">
           <TabBar projectId={activeProjectId} />
         </div>
 
-        {/* ProjectToolbar - right side (over NotesPanel) */}
-        <ProjectToolbar width={notesPanelWidth} />
-      </div>
-
-      <div className="flex-1 flex overflow-hidden min-h-0">
-        {/* Main Content Area */}
+        {/* Terminal Area */}
         <div className="flex-1 relative min-w-0">
-          {/* TerminalArea always renders - same as project switching */}
           <TerminalArea projectId={activeProjectId} />
-
-          {/* Project Home - overlay on top when active */}
-          {currentView === 'home' && (
-            <div className="absolute inset-0 z-10">
-              <ProjectHome projectId={activeProjectId} />
-            </div>
-          )}
 
           {/* Search Bar (Cmd+F) - only in terminal view */}
           {currentView === 'terminal' && showSearch && (
@@ -240,6 +234,7 @@ export default function Workspace() {
                 boxShadow: '0 4px 12px rgba(0, 0, 0, 0.3)'
               }}
             >
+              {/* ... search input content ... */}
               <input
                 ref={searchInputRef}
                 type="text"
@@ -256,8 +251,6 @@ export default function Workspace() {
                   width: '160px'
                 }}
               />
-
-              {/* Results count */}
               {searchText && (
                 <span style={{
                   fontSize: '11px',
@@ -270,40 +263,16 @@ export default function Workspace() {
                     : 'No results'}
                 </span>
               )}
-
-              {/* Navigation arrows */}
               <button
                 onClick={handleFindPrevious}
                 disabled={searchResults.resultCount === 0}
-                title="Previous (Shift+Enter)"
-                style={{
-                  background: 'none',
-                  border: 'none',
-                  color: searchResults.resultCount > 0 ? 'rgba(255, 255, 255, 0.7)' : 'rgba(255, 255, 255, 0.3)',
-                  cursor: searchResults.resultCount > 0 ? 'pointer' : 'default',
-                  fontSize: '12px',
-                  padding: '2px 4px'
-                }}
-              >
-                ▲
-              </button>
+                style={{ background: 'none', border: 'none', color: searchResults.resultCount > 0 ? 'rgba(255, 255, 255, 0.7)' : 'rgba(255, 255, 255, 0.3)', cursor: searchResults.resultCount > 0 ? 'pointer' : 'default', fontSize: '12px', padding: '2px 4px' }}
+              >▲</button>
               <button
                 onClick={handleFindNext}
                 disabled={searchResults.resultCount === 0}
-                title="Next (Enter)"
-                style={{
-                  background: 'none',
-                  border: 'none',
-                  color: searchResults.resultCount > 0 ? 'rgba(255, 255, 255, 0.7)' : 'rgba(255, 255, 255, 0.3)',
-                  cursor: searchResults.resultCount > 0 ? 'pointer' : 'default',
-                  fontSize: '12px',
-                  padding: '2px 4px'
-                }}
-              >
-                ▼
-              </button>
-
-              {/* Close button */}
+                style={{ background: 'none', border: 'none', color: searchResults.resultCount > 0 ? 'rgba(255, 255, 255, 0.7)' : 'rgba(255, 255, 255, 0.3)', cursor: searchResults.resultCount > 0 ? 'pointer' : 'default', fontSize: '12px', padding: '2px 4px' }}
+              >▼</button>
               <button
                 onClick={() => {
                   setShowSearch(false);
@@ -313,19 +282,8 @@ export default function Workspace() {
                     terminalRegistry.clearSearch(activeTab.id);
                   }
                 }}
-                title="Close (Escape)"
-                style={{
-                  background: 'none',
-                  border: 'none',
-                  color: 'rgba(255, 255, 255, 0.5)',
-                  cursor: 'pointer',
-                  fontSize: '14px',
-                  padding: '2px 4px',
-                  marginLeft: '4px'
-                }}
-              >
-                ✕
-              </button>
+                style={{ background: 'none', border: 'none', color: 'rgba(255, 255, 255, 0.5)', cursor: 'pointer', fontSize: '14px', padding: '2px 4px', marginLeft: '4px' }}
+              >✕</button>
             </div>
           )}
 
@@ -335,24 +293,36 @@ export default function Workspace() {
           {/* Research Sheet */}
           <ResearchSheet projectId={activeProjectId} projectPath={currentProject.path} />
         </div>
-
-        {/* Timeline for Claude session navigation - only when Claude is running */}
-        {currentView === 'terminal' && showTimeline && (
-          <Timeline
-            tabId={activeTab.id}
-            sessionId={claudeSessionId}
-            cwd={activeTab.cwd}
-          />
-        )}
-
-        {/* Resizer */}
-        {!filePreview && <Resizer onResize={handleResize} />}
-
-        {/* Notes Panel */}
-        {!filePreview && (
-          <NotesPanel projectId={activeProjectId} project={currentProject} />
-        )}
       </div>
+
+      {/* RIGHT COLUMN: Toolbar + Notes + Resizer */}
+      <div className="flex shrink-0 overflow-hidden relative" style={{ width: notesPanelWidth }}>
+        <Resizer onResize={handleResize} />
+        
+        <div className="flex-1 flex flex-col min-w-0 border-l border-border-main">
+          {/* ProjectToolbar Row */}
+          <div className="h-[30px] border-b border-border-main">
+            <ProjectToolbar width={notesPanelWidth} />
+          </div>
+
+          {/* Notes Panel Content */}
+          <div className="flex-1 overflow-hidden relative">
+            {!filePreview && (
+              <NotesPanel projectId={activeProjectId} project={currentProject} />
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Global Overlays */}
+      {/* Timeline for Claude session navigation - only when Claude is running */}
+      {currentView === 'terminal' && showTimeline && (
+        <Timeline
+          tabId={activeTab.id}
+          sessionId={claudeSessionId}
+          cwd={activeTab.cwd}
+        />
+      )}
 
       {/* File Explorer - opens in current terminal's directory */}
       <FileExplorer projectPath={explorerPath} />
