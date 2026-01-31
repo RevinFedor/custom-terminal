@@ -3,6 +3,7 @@ import { useUIStore } from '../../store/useUIStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { FolderOpen, Settings } from 'lucide-react';
+import SmartPopover from '../UI/SmartPopover';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -32,6 +33,7 @@ export default function ProjectCard({
   tabsStats = { total: 0, active: 0 }
 }: ProjectCardProps) {
   const [pathHovered, setPathHovered] = useState(false);
+  const [isHoveringName, setIsHoveringName] = useState(false);
 
   const { openEditModal } = useUIStore();
   const { openProjects } = useWorkspaceStore();
@@ -67,11 +69,15 @@ export default function ProjectCard({
           size={13}
           className={`flex-shrink-0 ${hasActiveProcesses ? 'text-green-400' : 'text-[#888]'}`}
         />
-        <span
-          className="text-[13px] text-white font-medium truncate group-hover:text-accent transition-colors"
-        >
-          {project.name}
-        </span>
+        <SmartPopover content={project.description || ''} isOpen={isHoveringName}>
+          <span
+            className="text-[13px] text-white font-medium truncate group-hover:text-accent transition-colors cursor-help"
+            onMouseEnter={() => setIsHoveringName(true)}
+            onMouseLeave={() => setIsHoveringName(false)}
+          >
+            {project.name}
+          </span>
+        </SmartPopover>
       </div>
 
       {/* Path with Custom Tooltip */}

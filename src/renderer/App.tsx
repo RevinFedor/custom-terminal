@@ -161,7 +161,7 @@ const ProjectTabItem = memo(({
   return (
     <button
       ref={ref}
-      className={`relative px-3 py-1.5 text-sm font-medium cursor-pointer transition-all rounded ${
+      className={`relative px-3 py-1.5 text-sm font-medium cursor-pointer transition-all rounded-sm ${
         isActive && isAreaActive ? 'ring-1 ring-white/50 shadow-[0_0_10px_rgba(255,255,255,0.1)]' : ''
       } ${textColor}`}
       style={{
@@ -169,7 +169,7 @@ const ProjectTabItem = memo(({
         opacity: isDragging ? 0.5 : 1,
         outline: isTabDropTarget ? '2px solid #4ade80' : 'none',
         outlineOffset: '-2px',
-        borderRadius: isTabDropTarget ? '4px' : undefined,
+        borderRadius: isTabDropTarget ? '4px' : '2px', // Consistency with rounded-sm
       }}
       onClick={onClick}
       onDoubleClick={onDoubleClick}
@@ -182,7 +182,7 @@ const ProjectTabItem = memo(({
       }}
     >
       {isActive && (
-        <div className="absolute inset-0 bg-white rounded" />
+        <div className="absolute inset-0 bg-white rounded-sm" />
       )}
       <span className="relative z-10 flex items-center gap-1.5">
         {isEditing ? (
@@ -233,10 +233,11 @@ const ProjectTabItem = memo(({
 
 // Empty area drop zone for projects - for dropping at the end
 // This area allows window dragging when not in a drag-drop operation
-const ProjectEmptyDropZone = memo(({ onDrop, onHoverChange, onDoubleClick }: {
+const ProjectEmptyDropZone = memo(({ onDrop, onHoverChange, onDoubleClick, onMouseDown }: {
   onDrop: (projectId: string) => void;
   onHoverChange: (isOver: boolean) => void;
   onDoubleClick: () => void;
+  onMouseDown: () => void;
 }) => {
   const ref = useRef<HTMLDivElement>(null);
   const [isDragActive, setIsDragActive] = useState(false);
@@ -269,14 +270,14 @@ const ProjectEmptyDropZone = memo(({ onDrop, onHoverChange, onDoubleClick }: {
   return (
     <div
       ref={ref}
-      className="flex-1 h-full min-w-[60px] transition-colors"
+      className="flex-1 h-full min-w-[30px] transition-colors"
       onDoubleClick={(e) => {
         e.stopPropagation();
         onDoubleClick();
       }}
-      onClick={(e) => {
+      onMouseDown={(e) => {
         e.stopPropagation();
-        // Just focus the area
+        onMouseDown();
       }}
       style={{
         // Crucial: no-drag allows JS to catch events, but we keep it transparent
@@ -311,6 +312,7 @@ function App() {
   const [editingProjectId, setEditingProjectId] = useState<string | null>(null);
   const [projectEditValue, setProjectEditValue] = useState('');
   const [lastCreatedProjectId, setLastCreatedProjectId] = useState<string | null>(null);
+  const [previousProjectId, setPreviousProjectId] = useState<string | null>(null);
 
   const handleStartEditingProject = (projectId: string, currentName: string) => {
     setEditingProjectId(projectId);
@@ -318,37 +320,80 @@ function App() {
   };
 
   const handleSubmitProjectRename = async () => {
-    if (editingProjectId && projectEditValue.trim()) {
+    const isNewAndUnchanged = editingProjectId === lastCreatedProjectId && projectEditValue.trim() === 'Новый проект';
+
+    if (editingProjectId && projectEditValue.trim() && !isNewAndUnchanged) {
       await updateProject(editingProjectId, { name: projectEditValue.trim() });
       showToast('Project renamed', 'success');
       setEditingProjectId(null);
       setLastCreatedProjectId(null); // No longer "new" once renamed/submitted
+      setPreviousProjectId(null);
     } else if (editingProjectId) {
       handleCancelProjectRename();
     }
   };
 
-  const handleCancelProjectRename = () => {
+  const handleCancelProjectRename = async () => {
     if (editingProjectId === lastCreatedProjectId) {
+      const idToDelete = editingProjectId;
+      const idToRestore = previousProjectId;
+
       // VSCode behavior: if we cancel creating a new project, delete it
-      closeProject(editingProjectId!);
+      setEditingProjectId(null);
+      setLastCreatedProjectId(null);
+      setPreviousProjectId(null);
+      
+      await closeProject(idToDelete!);
+      await ipcRenderer.invoke('project:delete', idToDelete);
+      await loadProjects(); // Refresh global projects list
+      
+      // Return to previous project if it exists
+      if (idToRestore && openProjects.has(idToRestore)) {
+        const prevProj = openProjects.get(idToRestore);
+        if (prevProj) {
+          openProject(idToRestore, prevProj.projectPath);
+        }
+      }
+      
       showToast('Project creation cancelled', 'info');
+    } else {
+      setEditingProjectId(null);
+      setLastCreatedProjectId(null);
+      setPreviousProjectId(null);
     }
-    setEditingProjectId(null);
-    setLastCreatedProjectId(null);
   };
 
   const handleCreateNewProject = async () => {
     try {
+      // Remember where we are before switching
+      setPreviousProjectId(activeProjectId);
+
       const newProject = await ipcRenderer.invoke('project:create-empty', { name: 'Новый проект' });
       if (newProject) {
         // 1. Reload projects in store to include the new one
         await loadProjects();
-        // 2. Open it in workspace
+        
+        // 2. Calculate new order: insert after current or at start
+        const currentOrder = Array.from(openProjects.keys());
+        let insertIndex = 0;
+        
+        if (view === 'workspace' && activeProjectId) {
+          const currentIndex = currentOrder.indexOf(activeProjectId);
+          if (currentIndex !== -1) {
+            insertIndex = currentIndex + 1;
+          }
+        }
+        
+        const newOrder = [...currentOrder];
+        newOrder.splice(insertIndex, 0, newProject.id);
+        
+        // 3. Apply new order and open
+        reorderProjects(newOrder);
         openProject(newProject.id, newProject.path);
-        // 3. Set area focus
+        
+        // 4. Set area focus
         setActiveArea('projects');
-        // 4. Enter edit mode immediately
+        // 5. Enter edit mode immediately
         setLastCreatedProjectId(newProject.id);
         setEditingProjectId(newProject.id);
         setProjectEditValue(newProject.name);
@@ -801,7 +846,9 @@ function App() {
         </div>
 
         {/* Drag area + Empty drop zone for reordering */}
+        <div className="flex flex-1 h-full items-center">
           <ProjectEmptyDropZone
+            onMouseDown={() => setActiveArea('projects')}
             onDrop={(id) => {
               const currentOrder = openProjectsList.map(([id]) => id);
               const sourceIndex = currentOrder.indexOf(id);
@@ -815,6 +862,18 @@ function App() {
             onHoverChange={setProjectEmptyZoneHovered}
             onDoubleClick={handleCreateNewProject}
           />
+          
+          {/* Vertical separator */}
+          <div className="w-[1px] h-4 bg-white/10 flex-shrink-0" />
+
+          {/* Dedicated Window Drag Area - Fixed 300px */}
+          <div 
+            className="w-[300px] h-full flex-shrink-0 cursor-default bg-white/[0.01] hover:bg-white/[0.03] transition-colors border-l border-white/5"
+            style={{ WebkitAppRegion: 'drag' } as any}
+            onMouseDown={() => setActiveArea('projects')}
+            title="Drag window"
+          />
+        </div>
       </div>
 
       {/* Content Area */}

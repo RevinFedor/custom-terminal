@@ -50,6 +50,7 @@ interface WorkspaceStore {
   view: 'dashboard' | 'workspace';
   activeProjectId: string | null;
   openProjects: Map<string, ProjectWorkspace>;
+  projectHistory: string[]; // Stack of project IDs in order of activation
   isRestoring: boolean;
 
   // Terminal buffer serialization (for preserving history on unmount/remount)
@@ -175,6 +176,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   view: 'dashboard',
   activeProjectId: null,
   openProjects: new Map(),
+  projectHistory: [],
   isRestoring: false,
 
   // Terminal buffer serialization
@@ -193,14 +195,14 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   },
 
   saveSession: () => {
-    const { openProjects, activeProjectId, view, isRestoring } = get();
+    const { openProjects, activeProjectId, view, isRestoring, projectHistory } = get();
     if (isRestoring) return; // Don't save while restoring
 
     // Debounce: save after 300ms of inactivity
     if (saveSessionTimer) clearTimeout(saveSessionTimer);
 
     saveSessionTimer = setTimeout(async () => {
-      const sessionState: SessionState = {
+      const sessionState: SessionState & { projectHistory?: string[] } = {
         openProjects: Array.from(openProjects.values()).map((workspace) => {
           const tabsArray = Array.from(workspace.tabs.keys());
           const activeTabIndex = workspace.activeTabId
@@ -213,7 +215,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           };
         }),
         activeProjectId,
-        view
+        view,
+        projectHistory
       };
 
       // Save to database
@@ -224,7 +227,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
 
   restoreSession: async () => {
     // Load from database
-    const sessionState = await ipcRenderer.invoke('app:getState', SESSION_KEY) as SessionState | null;
+    const sessionState = await ipcRenderer.invoke('app:getState', SESSION_KEY) as (SessionState & { projectHistory?: string[] }) | null;
     if (!sessionState) {
       return;
     }
@@ -251,13 +254,15 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       // Set active project and view (also trigger re-render with updated openProjects to reflect activeTabId changes)
       const savedView = sessionState.view || 'dashboard';
       const currentOpenProjects = get().openProjects;
+      const restoredHistory = sessionState.projectHistory || [];
 
       if (savedView === 'workspace' && sessionState.activeProjectId && currentOpenProjects.has(sessionState.activeProjectId)) {
         set({
           activeProjectId: sessionState.activeProjectId,
           view: 'workspace',
           isRestoring: false,
-          openProjects: new Map(currentOpenProjects) // Trigger re-render with correct activeTabId
+          openProjects: new Map(currentOpenProjects),
+          projectHistory: restoredHistory
         });
       } else {
         // Stay on dashboard or fallback
@@ -265,7 +270,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           view: 'dashboard',
           activeProjectId: null,
           isRestoring: false,
-          openProjects: new Map(currentOpenProjects) // Trigger re-render with correct activeTabId
+          openProjects: new Map(currentOpenProjects),
+          projectHistory: restoredHistory
         });
       }
     } catch (e) {
@@ -287,16 +293,27 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   },
 
   showWorkspace: (projectId) => {
+    const { projectHistory } = get();
+    // Move to end of history (max 20)
+    const newHistory = [...projectHistory.filter(id => id !== projectId), projectId].slice(-20);
+
     // Use startTransition for smooth project switching
     startTransition(() => {
-      set({ view: 'workspace', activeProjectId: projectId });
+      set({ 
+        view: 'workspace', 
+        activeProjectId: projectId,
+        projectHistory: newHistory 
+      });
     });
     get().saveSession();
   },
 
   openProject: async (projectId, projectPath) => {
     console.log('[Store] openProject called:', { projectId, projectPath });
-    const { openProjects, createTab, saveSession } = get();
+    const { openProjects, createTab, saveSession, projectHistory } = get();
+
+    // Update history
+    const newHistory = [...projectHistory.filter(id => id !== projectId), projectId].slice(-20);
 
     if (!openProjects.has(projectId)) {
       console.log('[Store] Project not in openProjects, loading from DB...');
@@ -343,18 +360,23 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         openProjects: new Map(openProjects), 
         activeProjectId: projectId, 
         view: 'workspace',
-        isRestoring: false
+        isRestoring: false,
+        projectHistory: newHistory
       });
 
       saveSession();
     } else {
-      set({ activeProjectId: projectId, view: 'workspace' });
+      set({ 
+        activeProjectId: projectId, 
+        view: 'workspace',
+        projectHistory: newHistory 
+      });
       saveSession();
     }
   },
 
   closeProject: async (projectId) => {
-    const { openProjects, activeProjectId, view, saveSession, syncAllTabsCwd } = get();
+    const { openProjects, activeProjectId, view, saveSession, syncAllTabsCwd, projectHistory } = get();
     const workspace = openProjects.get(projectId);
 
     if (workspace) {
@@ -371,13 +393,29 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
 
       openProjects.delete(projectId);
       
+      // Update history: remove closed project
+      const newHistory = projectHistory.filter(id => id !== projectId);
+      
       const isClosingActive = activeProjectId === projectId;
+      let nextActiveId = activeProjectId;
+
+      if (isClosingActive) {
+        // Find next best project from history that is still open
+        nextActiveId = null;
+        for (let i = newHistory.length - 1; i >= 0; i--) {
+          if (openProjects.has(newHistory[i])) {
+            nextActiveId = newHistory[i];
+            break;
+          }
+        }
+      }
       
       set({
         openProjects: new Map(openProjects),
-        activeProjectId: isClosingActive ? null : activeProjectId,
-        // Only switch to dashboard if we closed the active project AND we were in workspace view
-        view: (isClosingActive && view === 'workspace') ? 'dashboard' : view
+        activeProjectId: nextActiveId,
+        projectHistory: newHistory,
+        // If we closed the active project and no projects are left in history -> dashboard
+        view: (isClosingActive && !nextActiveId && view === 'workspace') ? 'dashboard' : view
       });
 
       saveSession();
