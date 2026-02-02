@@ -81,9 +81,12 @@ export default function GeminiPanel({ projectPath, geminiPrompt }: GeminiPanelPr
     console.log('[Research] Type:', chatType, 'Model:', selectedModel, 'Thinking:', thinkingLevel);
     console.log('[Research] Prompt:', `"${prompt.slice(0, 50)}..."`);
 
+    // Wrap in pasted block (same as handleClipboardResearch)
+    const displayText = `:::pasted\n${selectedText}\n:::`;
+
     // IMMEDIATELY create conversation and open panel
     // Put prompt first as requested
-    const userMessage = `_Prompt: ${prompt}_\n\n---\n\n${selectedText}`;
+    const userMessage = `_Prompt: ${prompt}_\n\n---\n\n${displayText}`;
     if (activeProjectId) {
       createConversation(activeProjectId, projectPath, userMessage, chatType);
       openResearch();

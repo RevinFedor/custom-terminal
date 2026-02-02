@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { createPortal } from 'react-dom';
-import { Maximize2, Copy, X } from 'lucide-react';
+import { Maximize2, Copy, Minimize2 } from 'lucide-react';
 import { terminalRegistry } from '../../utils/terminalRegistry';
 
 const { ipcRenderer } = window.require('electron');
@@ -44,15 +44,15 @@ function Timeline({ tabId, sessionId, cwd }: TimelineProps) {
   const [entries, setEntries] = useState<TimelineEntry[]>([]);
   const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
   const [activeTooltipIndex, setActiveTooltipIndex] = useState<number | null>(null);
+  const [isExpanded, setIsExpanded] = useState(false);
   const [selectionStartId, setSelectionStartId] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [contextMenu, setContextMenu] = useState<{ x: number, y: number, entry: TimelineEntry } | null>(null);
-  const [fullMessage, setFullMessage] = useState<string | null>(null);
   const [viewport, setViewport] = useState({ top: 0, bottom: 0, total: 1 });
   
+  const notesPanelWidth = useUIStore(state => state.notesPanelWidth);
   const containerRef = useRef<HTMLDivElement>(null);
   const segmentRefs = useRef<(HTMLDivElement | null)[]>([]);
-  const closeTimerRef = useRef<NodeJS.Timeout | null>(null);
 
   // Adjust segmentRefs length
   useEffect(() => {
@@ -65,6 +65,11 @@ function Timeline({ tabId, sessionId, cwd }: TimelineProps) {
     const rect = el.getBoundingClientRect();
     return rect.top + rect.height / 2;
   };
+
+  // Reset expansion when tooltip target changes
+  useEffect(() => {
+    setIsExpanded(false);
+  }, [activeTooltipIndex]);
 
   // Load timeline when sessionId changes
   const loadTimeline = useCallback(async () => {
@@ -105,32 +110,25 @@ function Timeline({ tabId, sessionId, cwd }: TimelineProps) {
     return () => clearInterval(interval);
   }, [sessionId, loadTimeline]);
 
-  // Sticky hover logic
+  // Hover logic: Instant set, bridge handles the move
   const handleMouseEnterSegment = (index: number) => {
-    if (closeTimerRef.current) {
-      clearTimeout(closeTimerRef.current);
-      closeTimerRef.current = null;
-    }
     setHoveredIndex(index);
     setActiveTooltipIndex(index);
   };
 
   const handleMouseLeaveSegment = () => {
     setHoveredIndex(null);
-    closeTimerRef.current = setTimeout(() => {
-      setActiveTooltipIndex(null);
-    }, 300); // 300ms window to move cursor to the tooltip
+    // If we don't have a bridge, this would close it. 
+    // With bridge, we only close if we really exit the area.
+    if (!isExpanded) setActiveTooltipIndex(null);
   };
 
   const handleMouseEnterTooltip = () => {
-    if (closeTimerRef.current) {
-      clearTimeout(closeTimerRef.current);
-      closeTimerRef.current = null;
-    }
+    // Keep it open
   };
 
   const handleMouseLeaveTooltip = () => {
-    setActiveTooltipIndex(null);
+    if (!isExpanded) setActiveTooltipIndex(null);
   };
 
   const handleEntryClick = useCallback((entry: TimelineEntry) => {
@@ -187,10 +185,17 @@ function Timeline({ tabId, sessionId, cwd }: TimelineProps) {
   };
 
   useEffect(() => {
-    const handleClickOutside = () => setContextMenu(null);
+    const handleClickOutside = () => {
+      setContextMenu(null);
+      // Close expanded tooltip on outside click
+      if (isExpanded) {
+        setIsExpanded(false);
+        setActiveTooltipIndex(null);
+      }
+    };
     window.addEventListener('click', handleClickOutside);
     return () => window.removeEventListener('click', handleClickOutside);
-  }, []);
+  }, [isExpanded]);
 
   if (!sessionId) return null;
 
@@ -273,58 +278,74 @@ function Timeline({ tabId, sessionId, cwd }: TimelineProps) {
         {/* Tooltip Portal */}
         {activeTooltipIndex !== null && currentActiveEntry && (
           <TooltipPortal>
+            {/* Bridge Container: invisible area between timeline and tooltip */}
             <div
               onMouseEnter={handleMouseEnterTooltip}
               onMouseLeave={handleMouseLeaveTooltip}
               style={{
                 position: 'fixed',
-                right: '30px', // Positioned very close to the terminal border
+                right: `${notesPanelWidth + 4}px`, // Place right at the sidebar edge
                 top: `${getElementCenterY(activeTooltipIndex)}px`,
                 transform: 'translateY(-50%)',
-                backgroundColor: 'rgba(25, 25, 25, 0.98)',
-                backdropFilter: 'blur(12px)',
-                border: '1px solid rgba(255, 255, 255, 0.1)',
-                borderRadius: '6px',
-                padding: '10px 14px',
-                fontSize: '12px',
-                color: 'white',
-                minWidth: '240px',
-                maxWidth: '320px',
+                paddingRight: '30px', // The invisible bridge
+                marginRight: '-20px', // Pull content back to actual desired position
                 zIndex: 10000,
-                boxShadow: '0 15px 35px rgba(0,0,0,0.6)',
                 display: 'flex',
-                flexDirection: 'column',
-                gap: '8px'
+                alignItems: 'center'
               }}
             >
-              {currentActiveEntry.type === 'compact' ? (
-                <span className="text-amber-400 font-medium">History Compacted ({currentActiveEntry.preTokens ? `${Math.round(currentActiveEntry.preTokens/1000)}k` : '?'} tokens)</span>
-              ) : (
-                <>
-                  <div className="flex justify-between items-start gap-4">
-                    <span className="text-white/90 leading-snug flex-1">
-                      {truncateText(currentActiveEntry.content)}
-                    </span>
-                    <button 
-                      onClick={(e) => { e.stopPropagation(); setFullMessage(currentActiveEntry.content); }}
-                      className="p-1.5 rounded hover:bg-white/10 text-white/40 hover:text-white transition-colors"
-                      title="Развернуть полностью"
-                    >
-                      <Maximize2 size={14} />
-                    </button>
-                  </div>
-                  <div className="flex justify-between items-center mt-1">
-                    <span className="text-[10px] text-white/30">{new Date(currentActiveEntry.timestamp).toLocaleTimeString()}</span>
-                    <button 
-                      onClick={(e) => { e.stopPropagation(); navigator.clipboard.writeText(currentActiveEntry.content); }}
-                      className="flex items-center gap-1.5 px-2 py-1 rounded bg-white/5 hover:bg-white/10 text-[10px] text-white/60 hover:text-white transition-colors"
-                    >
-                      <Copy size={12} />
-                      Копировать
-                    </button>
-                  </div>
-                </>
-              )}
+              <div
+                style={{
+                  backgroundColor: 'rgba(25, 25, 25, 0.98)',
+                  backdropFilter: 'blur(12px)',
+                  border: '1px solid rgba(255, 255, 255, 0.1)',
+                  borderRadius: '6px',
+                  padding: '10px 14px',
+                  fontSize: '12px',
+                  color: 'white',
+                  minWidth: '240px',
+                  maxWidth: '320px',
+                  maxHeight: isExpanded ? '60vh' : '200px',
+                  boxShadow: '0 15px 35px rgba(0,0,0,0.6)',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: '8px',
+                  transition: 'max-height 0.2s ease-in-out',
+                  overflow: 'hidden'
+                }}
+              >
+                {currentActiveEntry.type === 'compact' ? (
+                  <span className="text-amber-400 font-medium">History Compacted ({currentActiveEntry.preTokens ? `${Math.round(currentActiveEntry.preTokens/1000)}k` : '?'} tokens)</span>
+                ) : (
+                  <>
+                    <div className="flex justify-between items-start gap-4">
+                      <div
+                        className={`text-white/90 leading-snug flex-1 font-mono ${isExpanded ? 'overflow-y-auto' : 'line-clamp-6'}`}
+                        style={{ whiteSpace: 'pre-wrap' }}
+                      >
+                        {isExpanded ? currentActiveEntry.content : truncateText(currentActiveEntry.content, 200)}
+                      </div>
+                      <button
+                        onClick={(e) => { e.stopPropagation(); setIsExpanded(!isExpanded); }}
+                        className="p-1.5 rounded hover:bg-white/10 text-white/40 hover:text-white transition-colors cursor-pointer shrink-0"
+                        title={isExpanded ? "Свернуть" : "Развернуть полностью"}
+                      >
+                        {isExpanded ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
+                      </button>
+                    </div>
+                    <div className="flex justify-between items-center mt-1 pt-2 border-t border-white/5">
+                      <span className="text-[10px] text-white/30">{new Date(currentActiveEntry.timestamp).toLocaleTimeString()}</span>
+                      <button
+                        onClick={(e) => { e.stopPropagation(); navigator.clipboard.writeText(currentActiveEntry.content); }}
+                        className="flex items-center gap-1.5 px-2 py-1 rounded bg-white/5 hover:bg-white/10 text-[10px] text-white/60 hover:text-white transition-colors cursor-pointer"
+                      >
+                        <Copy size={12} />
+                        Копировать
+                      </button>
+                    </div>
+                  </>
+                )}
+              </div>
             </div>
           </TooltipPortal>
         )}
@@ -348,21 +369,21 @@ function Timeline({ tabId, sessionId, cwd }: TimelineProps) {
             >
               {!selectionStartId ? (
                 <button
-                  className="w-full text-left px-3 py-2 text-xs text-white hover:bg-blue-600 rounded transition-colors"
+                  className="w-full text-left px-3 py-2 text-xs text-white hover:bg-blue-600 rounded transition-colors cursor-pointer"
                   onClick={() => startRangeSelection(contextMenu.entry)}
                 >
                   Начать копирование
                 </button>
               ) : (
                 <button
-                  className="w-full text-left px-3 py-2 text-xs text-white hover:bg-green-600 rounded transition-colors"
+                  className="w-full text-left px-3 py-2 text-xs text-white hover:bg-green-600 rounded transition-colors cursor-pointer"
                   onClick={() => finishRangeSelection(contextMenu.entry)}
                 >
                   Копировать до этой точки
                 </button>
               )}
               <button
-                className="w-full text-left px-3 py-2 text-xs text-white/60 hover:bg-white/5 rounded transition-colors"
+                className="w-full text-left px-3 py-2 text-xs text-white/60 hover:bg-white/5 rounded transition-colors cursor-pointer"
                 onClick={() => {
                   navigator.clipboard.writeText(contextMenu.entry.content);
                   setContextMenu(null);
@@ -381,45 +402,6 @@ function Timeline({ tabId, sessionId, cwd }: TimelineProps) {
           </div>
         )}
       </div>
-
-      {/* Full Message Modal */}
-      {fullMessage && (
-        <TooltipPortal>
-          <div 
-            className="fixed inset-0 z-[20000] flex items-center justify-center bg-black/60 backdrop-blur-sm p-10"
-            onClick={() => setFullMessage(null)}
-          >
-            <div 
-              className="bg-[#1a1a1a] border border-white/10 rounded-xl shadow-2xl w-full max-w-2xl max-h-[80vh] flex flex-col overflow-hidden"
-              onClick={e => e.stopPropagation()}
-            >
-              <div className="flex items-center justify-between px-6 py-4 border-b border-white/5">
-                <span className="text-sm font-medium text-white/80 uppercase tracking-wider">Полное сообщение</span>
-                <button 
-                  onClick={() => setFullMessage(null)}
-                  className="p-2 rounded-lg hover:bg-white/5 text-white/40 hover:text-white transition-colors"
-                >
-                  <X size={18} />
-                </button>
-              </div>
-              <div className="flex-1 overflow-y-auto p-6 scrollbar-thin">
-                <pre className="text-sm text-white/90 whitespace-pre-wrap font-mono leading-relaxed selection:bg-blue-500/30">
-                  {fullMessage}
-                </pre>
-              </div>
-              <div className="px-6 py-4 border-t border-white/5 flex justify-end">
-                <button 
-                  onClick={() => { navigator.clipboard.writeText(fullMessage); setFullMessage(null); }}
-                  className="flex items-center gap-2 px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-sm text-white font-medium transition-colors"
-                >
-                  <Copy size={16} />
-                  Копировать и закрыть
-                </button>
-              </div>
-            </div>
-          </div>
-        </TooltipPortal>
-      )}
     </>
   );
 }
