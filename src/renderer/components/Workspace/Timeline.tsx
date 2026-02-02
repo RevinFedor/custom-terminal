@@ -111,51 +111,38 @@ function Timeline({ tabId, sessionId, cwd }: TimelineProps) {
     return () => clearInterval(interval);
   }, [sessionId, loadTimeline]);
 
-  // Hover logic using relatedTarget to check where mouse went
+  // Hover logic using global mousemove (relatedTarget unreliable with portals)
   const tooltipRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLDivElement>(null); // Container for all segments
 
   const handleMouseEnterSegment = (index: number) => {
     setHoveredIndex(index);
     setActiveTooltipIndex(index);
   };
 
-  const handleMouseLeaveSegment = (e: React.MouseEvent) => {
-    setHoveredIndex(null);
+  // Global mousemove listener - checks if mouse is over segment or tooltip
+  useEffect(() => {
+    if (activeTooltipIndex === null || isExpanded) return;
 
-    // Check if mouse went to tooltip
-    const relatedTarget = e.relatedTarget as HTMLElement;
-    if (tooltipRef.current && tooltipRef.current.contains(relatedTarget)) {
-      // Mouse went to tooltip - keep it open
-      return;
-    }
+    const checkHover = (e: MouseEvent) => {
+      const target = e.target as HTMLElement;
+      const isOverSegment = target?.closest?.('[data-segment]');
+      const isOverTooltip = tooltipRef.current?.contains(target);
 
-    // Mouse went elsewhere - close
-    if (!isExpanded) {
-      setActiveTooltipIndex(null);
-    }
-  };
+      if (!isOverSegment && !isOverTooltip) {
+        setHoveredIndex(null);
+        setActiveTooltipIndex(null);
+      }
+    };
+
+    document.addEventListener('mousemove', checkHover);
+    return () => document.removeEventListener('mousemove', checkHover);
+  }, [activeTooltipIndex, isExpanded]);
 
   const handleMouseEnterTooltip = () => {
-    // Keep open - reactivate hover state
+    // Keep hover state active
     if (activeTooltipIndex !== null) {
       setHoveredIndex(activeTooltipIndex);
-    }
-  };
-
-  const handleMouseLeaveTooltip = (e: React.MouseEvent) => {
-    // Check if mouse went back to a segment
-    const relatedTarget = e.relatedTarget as HTMLElement;
-    const isGoingToSegment = relatedTarget?.closest?.('[data-segment]');
-
-    if (isGoingToSegment) {
-      // Mouse going back to timeline - segment will handle it
-      return;
-    }
-
-    // Mouse went elsewhere - close
-    if (!isExpanded) {
-      setHoveredIndex(null);
-      setActiveTooltipIndex(null);
     }
   };
 
@@ -272,7 +259,6 @@ function Timeline({ tabId, sessionId, cwd }: TimelineProps) {
                   backgroundColor: active ? 'rgba(59, 130, 246, 0.15)' : 'transparent',
                 }}
                 onMouseEnter={() => handleMouseEnterSegment(index)}
-                onMouseLeave={(e) => handleMouseLeaveSegment(e)}
                 onClick={() => handleEntryClick(entry)}
                 onContextMenu={(e) => handleRightClick(e, entry)}
               >
@@ -309,13 +295,14 @@ function Timeline({ tabId, sessionId, cwd }: TimelineProps) {
           <TooltipPortal>
             <div
               ref={tooltipRef}
+              tabIndex={-1}
               onMouseEnter={handleMouseEnterTooltip}
-              onMouseLeave={(e) => handleMouseLeaveTooltip(e)}
               style={{
                 position: 'fixed',
                 right: `${notesPanelWidth + 32}px`,
-                top: `${getElementCenterY(activeTooltipIndex)}px`,
+                top: `clamp(50px, ${getElementCenterY(activeTooltipIndex)}px, calc(100vh - 150px))`,
                 transform: 'translateY(-50%)',
+                outline: 'none',
                 zIndex: 10000,
                 backgroundColor: 'rgba(25, 25, 25, 0.98)',
                 backdropFilter: 'blur(12px)',
