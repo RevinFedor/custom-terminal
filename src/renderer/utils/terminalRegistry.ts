@@ -13,9 +13,20 @@ interface SearchState {
 }
 const searchStates = new Map<string, SearchState>();
 
-// Callbacks for search results changes
+// Viewport state for scroll sync
+interface ViewportState {
+  top: number;
+  bottom: number;
+  total: number;
+}
+const viewportStates = new Map<string, ViewportState>();
+
+// Callbacks
 type SearchResultsCallback = (results: { resultIndex: number; resultCount: number }) => void;
 const searchCallbacks = new Map<string, SearchResultsCallback>();
+
+type ViewportCallback = (viewport: ViewportState) => void;
+const viewportCallbacks = new Map<string, ViewportCallback>();
 
 const defaultSearchOptions: ISearchOptions = {
   caseSensitive: false,
@@ -56,10 +67,31 @@ export const terminalRegistry = {
     searchAddons.delete(tabId);
     searchStates.delete(tabId);
     searchCallbacks.delete(tabId);
+    viewportStates.delete(tabId);
+    viewportCallbacks.delete(tabId);
   },
 
   get(tabId: string): XTerminal | undefined {
     return terminals.get(tabId);
+  },
+
+  updateViewport(tabId: string, top: number, bottom: number, total: number) {
+    const state = { top, bottom, total };
+    viewportStates.set(tabId, state);
+    const callback = viewportCallbacks.get(tabId);
+    if (callback) callback(state);
+  },
+
+  onViewportChange(tabId: string, callback: ViewportCallback) {
+    viewportCallbacks.set(tabId, callback);
+  },
+
+  offViewportChange(tabId: string) {
+    viewportCallbacks.delete(tabId);
+  },
+
+  getViewportState(tabId: string) {
+    return viewportStates.get(tabId);
   },
 
   getSelection(tabId: string): string {

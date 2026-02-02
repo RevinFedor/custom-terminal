@@ -290,7 +290,15 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
     const buffer = term.buffer.active;
     const isAtBottom = buffer.viewportY >= buffer.baseY;
     setShowScrollButton(!isAtBottom);
-  }, []);
+
+    // Sync viewport position with registry for Timeline
+    terminalRegistry.updateViewport(
+      tabId,
+      buffer.viewportY,
+      buffer.viewportY + term.rows,
+      buffer.baseY + term.rows
+    );
+  }, [tabId]);
 
   // Scroll to bottom
   const scrollToBottom = useCallback(() => {
