@@ -436,7 +436,19 @@ ipcMain.handle('claude:copy-range', async (event, { sessionId, cwd, startUuid, e
     }
 
     const minIdx = Math.min(startIndex, endIndex);
-    const maxIdx = Math.max(startIndex, endIndex);
+    let maxIdx = Math.max(startIndex, endIndex);
+
+    // EXPAND RANGE: Include all assistant responses and system messages 
+    // that follow the last selected message, until the next user message/compact starts.
+    for (let i = maxIdx + 1; i < activeHistory.length; i++) {
+      const entry = activeHistory[i];
+      // Stop if we hit a new "point" (user message or compact boundary)
+      if (entry.type === 'user' || (entry.type === 'system' && entry.subtype === 'compact_boundary')) {
+        break;
+      }
+      maxIdx = i; // Include this assistant/system record
+    }
+
     const range = activeHistory.slice(minIdx, maxIdx + 1);
 
     // Format the range

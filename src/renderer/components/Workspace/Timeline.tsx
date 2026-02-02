@@ -1,5 +1,6 @@
 import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { createPortal } from 'react-dom';
+import { Maximize2, Copy, X } from 'lucide-react';
 import { terminalRegistry } from '../../utils/terminalRegistry';
 
 const { ipcRenderer } = window.require('electron');
@@ -25,7 +26,7 @@ interface TimelineProps {
 }
 
 // Truncate text for tooltip display
-const truncateText = (text: string | unknown, maxLength: number = 80): string => {
+const truncateText = (text: string | unknown, maxLength: number = 120): string => {
   if (typeof text !== 'string') {
     if (Array.isArray(text)) {
       const firstText = text.find((item: any) => item.type === 'text' && item.text);
@@ -42,13 +43,16 @@ const truncateText = (text: string | unknown, maxLength: number = 80): string =>
 function Timeline({ tabId, sessionId, cwd }: TimelineProps) {
   const [entries, setEntries] = useState<TimelineEntry[]>([]);
   const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
+  const [activeTooltipIndex, setActiveTooltipIndex] = useState<number | null>(null);
   const [selectionStartId, setSelectionStartId] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [contextMenu, setContextMenu] = useState<{ x: number, y: number, entry: TimelineEntry } | null>(null);
+  const [fullMessage, setFullMessage] = useState<string | null>(null);
   const [viewport, setViewport] = useState({ top: 0, bottom: 0, total: 1 });
   
   const containerRef = useRef<HTMLDivElement>(null);
   const segmentRefs = useRef<(HTMLDivElement | null)[]>([]);
+  const closeTimerRef = useRef<NodeJS.Timeout | null>(null);
 
   // Adjust segmentRefs length
   useEffect(() => {
@@ -101,6 +105,34 @@ function Timeline({ tabId, sessionId, cwd }: TimelineProps) {
     return () => clearInterval(interval);
   }, [sessionId, loadTimeline]);
 
+  // Sticky hover logic
+  const handleMouseEnterSegment = (index: number) => {
+    if (closeTimerRef.current) {
+      clearTimeout(closeTimerRef.current);
+      closeTimerRef.current = null;
+    }
+    setHoveredIndex(index);
+    setActiveTooltipIndex(index);
+  };
+
+  const handleMouseLeaveSegment = () => {
+    setHoveredIndex(null);
+    closeTimerRef.current = setTimeout(() => {
+      setActiveTooltipIndex(null);
+    }, 300); // 300ms window to move cursor to the tooltip
+  };
+
+  const handleMouseEnterTooltip = () => {
+    if (closeTimerRef.current) {
+      clearTimeout(closeTimerRef.current);
+      closeTimerRef.current = null;
+    }
+  };
+
+  const handleMouseLeaveTooltip = () => {
+    setActiveTooltipIndex(null);
+  };
+
   const handleEntryClick = useCallback((entry: TimelineEntry) => {
     if (entry.type === 'compact') return;
     const searchText = entry.content.split('\n')[0].slice(0, 40).trim();
@@ -132,7 +164,6 @@ function Timeline({ tabId, sessionId, cwd }: TimelineProps) {
       
       if (result.success) {
         await navigator.clipboard.writeText(result.content);
-        // Show success visual feedback? 
         console.log('[Timeline] Range copied to clipboard');
       }
     } catch (error) {
@@ -143,16 +174,14 @@ function Timeline({ tabId, sessionId, cwd }: TimelineProps) {
     }
   };
 
-  // Check if an index is within the current selection range
   const isSelected = (entry: TimelineEntry, index: number) => {
     if (!selectionStartId) return false;
     const startIndex = entries.findIndex(e => e.uuid === selectionStartId);
     if (startIndex === -1) return false;
     
-    const min = Math.min(startIndex, hoveredIndex ?? startIndex);
-    const max = Math.max(startIndex, hoveredIndex ?? startIndex);
+    const min = Math.min(startIndex, hoveredIndex ?? activeTooltipIndex ?? startIndex);
+    const max = Math.max(startIndex, hoveredIndex ?? activeTooltipIndex ?? startIndex);
     
-    // During hover, we highlight the potential range
     const currentIndex = entries.findIndex(e => e.uuid === entry.uuid);
     return currentIndex >= min && currentIndex <= max;
   };
@@ -165,165 +194,233 @@ function Timeline({ tabId, sessionId, cwd }: TimelineProps) {
 
   if (!sessionId) return null;
 
+  const currentActiveEntry = activeTooltipIndex !== null ? entries[activeTooltipIndex] : null;
+
   return (
-    <div
-      ref={containerRef}
-      className="relative flex flex-col group transition-all duration-300"
-      style={{
-        width: '24px',
-        backgroundColor: 'rgba(0, 0, 0, 0.2)',
-        backdropFilter: 'blur(4px)',
-        borderLeft: '1px solid rgba(255, 255, 255, 0.05)',
-        height: '100%',
-        zIndex: 40,
-      }}
-    >
-      {/* Central Axis Line */}
-      <div className="absolute left-1/2 top-0 bottom-0 w-[1px] bg-white/10 -translate-x-1/2 pointer-events-none" />
-
-      {/* Viewport Indicator (Floating window showing terminal scroll) */}
-      <div 
-        className="absolute left-0 right-0 bg-blue-500/10 border-y border-blue-500/40 pointer-events-none z-0 transition-all duration-75"
+    <>
+      <div
+        ref={containerRef}
+        className="relative flex flex-col group transition-all duration-300"
         style={{
-          top: `${(viewport.top / viewport.total) * 100}%`,
-          height: `${((viewport.bottom - viewport.top) / viewport.total) * 100}%`,
-          minHeight: '2px'
+          width: '24px',
+          backgroundColor: 'rgba(0, 0, 0, 0.2)',
+          backdropFilter: 'blur(4px)',
+          borderLeft: '1px solid rgba(255, 255, 255, 0.05)',
+          height: '100%',
+          zIndex: 40,
         }}
-      />
+      >
+        {/* Central Axis Line */}
+        <div className="absolute left-1/2 top-0 bottom-0 w-[1px] bg-white/10 -translate-x-1/2 pointer-events-none" />
 
-      {/* Segmented Hit-boxes */}
-      <div className="flex flex-col h-full w-full">
-        {entries.map((entry, index) => {
-          const active = isSelected(entry, index);
-          const isCompacted = entry.type === 'compact';
-          
-          return (
-            <div
-              key={entry.uuid}
-              ref={el => segmentRefs.current[index] = el}
-              className="relative flex-1 min-h-[4px] w-full flex items-center justify-center cursor-pointer transition-colors"
-              style={{
-                backgroundColor: active ? 'rgba(59, 130, 246, 0.15)' : 'transparent',
-              }}
-              onMouseEnter={() => setHoveredIndex(index)}
-              onMouseLeave={() => setHoveredIndex(null)}
-              onClick={() => handleEntryClick(entry)}
-              onContextMenu={(e) => handleRightClick(e, entry)}
-            >
-              {/* Visual Indicator (Dot or Line) */}
-              <div
-                className="transition-all duration-200"
-                style={{
-                  width: isCompacted ? '12px' : (hoveredIndex === index ? '8px' : '4px'),
-                  height: isCompacted ? '2px' : (hoveredIndex === index ? '8px' : '4px'),
-                  borderRadius: isCompacted ? '1px' : '50%',
-                  backgroundColor: isCompacted 
-                    ? '#f59e0b' 
-                    : (active ? '#3b82f6' : (hoveredIndex === index ? 'white' : 'rgba(255,255,255,0.3)')),
-                  boxShadow: hoveredIndex === index ? '0 0 8px rgba(255,255,255,0.4)' : 'none',
-                }}
-              />
-
-              {/* Tooltip */}
-              {hoveredIndex === index && (
-                <TooltipPortal>
-                  <div
-                    style={{
-                      position: 'fixed',
-                      right: '340px',
-                      top: `${getElementCenterY(index)}px`,
-                      transform: 'translateY(-50%)',
-                      backgroundColor: 'rgba(20, 20, 20, 0.95)',
-                      border: '1px solid rgba(255, 255, 255, 0.1)',
-                      borderRadius: '4px',
-                      padding: '8px 12px',
-                      fontSize: '12px',
-                      color: 'white',
-                      maxWidth: '300px',
-                      zIndex: 10000,
-                      boxShadow: '0 10px 25px rgba(0,0,0,0.5)',
-                      pointerEvents: 'none'
-                    }}
-                  >
-                    {isCompacted ? (
-                      <span className="text-amber-400 font-medium">History Compacted ({entry.preTokens ? `${Math.round(entry.preTokens/1000)}k` : '?'} tokens)</span>
-                    ) : (
-                      <div className="flex flex-col gap-1">
-                        <span className="text-white/90 leading-snug">{truncateText(entry.content)}</span>
-                        <span className="text-[10px] text-white/40">{new Date(entry.timestamp).toLocaleTimeString()}</span>
-                      </div>
-                    )}
-                  </div>
-                </TooltipPortal>
-              )}
-            </div>
-          );
-        })}
-      </div>
-
-      {/* Selection Range Indicator (Floating Overlay) */}
-      {selectionStartId && hoveredIndex !== null && (
-        <div className="absolute left-0 right-0 pointer-events-none bg-blue-500/10 border-y border-blue-500/30"
+        {/* Viewport Indicator */}
+        <div 
+          className="absolute left-0 right-0 bg-blue-500/10 border-y border-blue-500/40 pointer-events-none z-0 transition-all duration-75"
           style={{
-            top: `${Math.min(entries.findIndex(e => e.uuid === selectionStartId), hoveredIndex) / entries.length * 100}%`,
-            height: `${Math.abs(entries.findIndex(e => e.uuid === selectionStartId) - hoveredIndex + 1) / entries.length * 100}%`,
+            top: `${(viewport.top / viewport.total) * 100}%`,
+            height: `${((viewport.bottom - viewport.top) / viewport.total) * 100}%`,
+            minHeight: '2px'
           }}
         />
-      )}
 
-      {/* Context Menu */}
-      {contextMenu && (
-        <TooltipPortal>
-          <div
+        {/* Segmented Hit-boxes */}
+        <div className="flex flex-col h-full w-full">
+          {entries.map((entry, index) => {
+            const active = isSelected(entry, index);
+            const isCompacted = entry.type === 'compact';
+            
+            return (
+              <div
+                key={entry.uuid}
+                ref={el => segmentRefs.current[index] = el}
+                className="relative flex-1 min-h-[4px] w-full flex items-center justify-center cursor-pointer transition-colors"
+                style={{
+                  backgroundColor: active ? 'rgba(59, 130, 246, 0.15)' : 'transparent',
+                }}
+                onMouseEnter={() => handleMouseEnterSegment(index)}
+                onMouseLeave={handleMouseLeaveSegment}
+                onClick={() => handleEntryClick(entry)}
+                onContextMenu={(e) => handleRightClick(e, entry)}
+              >
+                {/* Visual Indicator (Dot or Line) */}
+                <div
+                  className="transition-all duration-200"
+                  style={{
+                    width: isCompacted ? '12px' : (hoveredIndex === index || activeTooltipIndex === index ? '8px' : '4px'),
+                    height: isCompacted ? '2px' : (hoveredIndex === index || activeTooltipIndex === index ? '8px' : '4px'),
+                    borderRadius: isCompacted ? '1px' : '50%',
+                    backgroundColor: isCompacted 
+                      ? '#f59e0b' 
+                      : (active ? '#3b82f6' : (hoveredIndex === index || activeTooltipIndex === index ? 'white' : 'rgba(255,255,255,0.3)')),
+                    boxShadow: (hoveredIndex === index || activeTooltipIndex === index) ? '0 0 8px rgba(255,255,255,0.4)' : 'none',
+                  }}
+                />
+              </div>
+            );
+          })}
+        </div>
+
+        {/* Selection Range Indicator */}
+        {selectionStartId && hoveredIndex !== null && (
+          <div className="absolute left-0 right-0 pointer-events-none bg-blue-500/10 border-y border-blue-500/30"
             style={{
-              position: 'fixed',
-              left: contextMenu.x,
-              top: contextMenu.y,
-              backgroundColor: '#1a1a1a',
-              border: '1px solid #333',
-              borderRadius: '4px',
-              padding: '4px',
-              zIndex: 10001,
-              minWidth: '160px',
-              boxShadow: '0 4px 12px rgba(0,0,0,0.5)'
+              top: `${Math.min(entries.findIndex(e => e.uuid === selectionStartId), hoveredIndex) / entries.length * 100}%`,
+              height: `${Math.abs(entries.findIndex(e => e.uuid === selectionStartId) - hoveredIndex + 1) / entries.length * 100}%`,
             }}
-          >
-            {!selectionStartId ? (
-              <button
-                className="w-full text-left px-3 py-2 text-xs text-white hover:bg-blue-600 rounded transition-colors"
-                onClick={() => startRangeSelection(contextMenu.entry)}
-              >
-                Начать копирование
-              </button>
-            ) : (
-              <button
-                className="w-full text-left px-3 py-2 text-xs text-white hover:bg-green-600 rounded transition-colors"
-                onClick={() => finishRangeSelection(contextMenu.entry)}
-              >
-                Копировать до этой точки
-              </button>
-            )}
-            <button
-              className="w-full text-left px-3 py-2 text-xs text-white/60 hover:bg-white/5 rounded transition-colors"
-              onClick={() => {
-                const searchText = contextMenu.entry.content.split('\n')[0].slice(0, 40).trim();
-                if (searchText) navigator.clipboard.writeText(contextMenu.entry.content);
-                setContextMenu(null);
+          />
+        )}
+
+        {/* Tooltip Portal */}
+        {activeTooltipIndex !== null && currentActiveEntry && (
+          <TooltipPortal>
+            <div
+              onMouseEnter={handleMouseEnterTooltip}
+              onMouseLeave={handleMouseLeaveTooltip}
+              style={{
+                position: 'fixed',
+                right: '30px', // Positioned very close to the terminal border
+                top: `${getElementCenterY(activeTooltipIndex)}px`,
+                transform: 'translateY(-50%)',
+                backgroundColor: 'rgba(25, 25, 25, 0.98)',
+                backdropFilter: 'blur(12px)',
+                border: '1px solid rgba(255, 255, 255, 0.1)',
+                borderRadius: '6px',
+                padding: '10px 14px',
+                fontSize: '12px',
+                color: 'white',
+                minWidth: '240px',
+                maxWidth: '320px',
+                zIndex: 10000,
+                boxShadow: '0 15px 35px rgba(0,0,0,0.6)',
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '8px'
               }}
             >
-              Копировать текст сообщения
-            </button>
+              {currentActiveEntry.type === 'compact' ? (
+                <span className="text-amber-400 font-medium">History Compacted ({currentActiveEntry.preTokens ? `${Math.round(currentActiveEntry.preTokens/1000)}k` : '?'} tokens)</span>
+              ) : (
+                <>
+                  <div className="flex justify-between items-start gap-4">
+                    <span className="text-white/90 leading-snug flex-1">
+                      {truncateText(currentActiveEntry.content)}
+                    </span>
+                    <button 
+                      onClick={(e) => { e.stopPropagation(); setFullMessage(currentActiveEntry.content); }}
+                      className="p-1.5 rounded hover:bg-white/10 text-white/40 hover:text-white transition-colors"
+                      title="Развернуть полностью"
+                    >
+                      <Maximize2 size={14} />
+                    </button>
+                  </div>
+                  <div className="flex justify-between items-center mt-1">
+                    <span className="text-[10px] text-white/30">{new Date(currentActiveEntry.timestamp).toLocaleTimeString()}</span>
+                    <button 
+                      onClick={(e) => { e.stopPropagation(); navigator.clipboard.writeText(currentActiveEntry.content); }}
+                      className="flex items-center gap-1.5 px-2 py-1 rounded bg-white/5 hover:bg-white/10 text-[10px] text-white/60 hover:text-white transition-colors"
+                    >
+                      <Copy size={12} />
+                      Копировать
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
+          </TooltipPortal>
+        )}
+
+        {/* Context Menu */}
+        {contextMenu && (
+          <TooltipPortal>
+            <div
+              style={{
+                position: 'fixed',
+                left: contextMenu.x,
+                top: contextMenu.y,
+                backgroundColor: '#1a1a1a',
+                border: '1px solid #333',
+                borderRadius: '4px',
+                padding: '4px',
+                zIndex: 10001,
+                minWidth: '160px',
+                boxShadow: '0 4px 12px rgba(0,0,0,0.5)'
+              }}
+            >
+              {!selectionStartId ? (
+                <button
+                  className="w-full text-left px-3 py-2 text-xs text-white hover:bg-blue-600 rounded transition-colors"
+                  onClick={() => startRangeSelection(contextMenu.entry)}
+                >
+                  Начать копирование
+                </button>
+              ) : (
+                <button
+                  className="w-full text-left px-3 py-2 text-xs text-white hover:bg-green-600 rounded transition-colors"
+                  onClick={() => finishRangeSelection(contextMenu.entry)}
+                >
+                  Копировать до этой точки
+                </button>
+              )}
+              <button
+                className="w-full text-left px-3 py-2 text-xs text-white/60 hover:bg-white/5 rounded transition-colors"
+                onClick={() => {
+                  navigator.clipboard.writeText(contextMenu.entry.content);
+                  setContextMenu(null);
+                }}
+              >
+                Копировать текст сообщения
+              </button>
+            </div>
+          </TooltipPortal>
+        )}
+
+        {/* Loading */}
+        {isLoading && entries.length === 0 && (
+          <div className="absolute inset-0 flex items-center justify-center bg-black/20">
+            <div className="w-1 h-1 bg-white animate-ping rounded-full" />
+          </div>
+        )}
+      </div>
+
+      {/* Full Message Modal */}
+      {fullMessage && (
+        <TooltipPortal>
+          <div 
+            className="fixed inset-0 z-[20000] flex items-center justify-center bg-black/60 backdrop-blur-sm p-10"
+            onClick={() => setFullMessage(null)}
+          >
+            <div 
+              className="bg-[#1a1a1a] border border-white/10 rounded-xl shadow-2xl w-full max-w-2xl max-h-[80vh] flex flex-col overflow-hidden"
+              onClick={e => e.stopPropagation()}
+            >
+              <div className="flex items-center justify-between px-6 py-4 border-b border-white/5">
+                <span className="text-sm font-medium text-white/80 uppercase tracking-wider">Полное сообщение</span>
+                <button 
+                  onClick={() => setFullMessage(null)}
+                  className="p-2 rounded-lg hover:bg-white/5 text-white/40 hover:text-white transition-colors"
+                >
+                  <X size={18} />
+                </button>
+              </div>
+              <div className="flex-1 overflow-y-auto p-6 scrollbar-thin">
+                <pre className="text-sm text-white/90 whitespace-pre-wrap font-mono leading-relaxed selection:bg-blue-500/30">
+                  {fullMessage}
+                </pre>
+              </div>
+              <div className="px-6 py-4 border-t border-white/5 flex justify-end">
+                <button 
+                  onClick={() => { navigator.clipboard.writeText(fullMessage); setFullMessage(null); }}
+                  className="flex items-center gap-2 px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-sm text-white font-medium transition-colors"
+                >
+                  <Copy size={16} />
+                  Копировать и закрыть
+                </button>
+              </div>
+            </div>
           </div>
         </TooltipPortal>
       )}
-
-      {/* Loading */}
-      {isLoading && entries.length === 0 && (
-        <div className="absolute inset-0 flex items-center justify-center bg-black/20">
-          <div className="w-1 h-1 bg-white animate-ping rounded-full" />
-        </div>
-      )}
-    </div>
+    </>
   );
 }
 
