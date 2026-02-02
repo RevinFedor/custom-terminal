@@ -372,6 +372,124 @@ app.on('activate', () => {
   }
 });
 
+// Export a range of messages from Claude session
+ipcMain.handle('claude:copy-range', async (event, { sessionId, cwd, startUuid, endUuid }) => {
+  console.log('[Claude Export] Exporting range from', startUuid, 'to', endUuid);
+
+  if (!sessionId) return { success: false, error: 'No session ID' };
+
+  try {
+    const claudeProjectsDir = path.join(os.homedir(), '.claude', 'projects');
+    let sourcePath = null;
+
+    if (cwd) {
+      const projectSlug = cwd.replace(/\//g, '-');
+      const primaryPath = path.join(claudeProjectsDir, projectSlug, `${sessionId}.jsonl`);
+      if (fs.existsSync(primaryPath)) sourcePath = primaryPath;
+    }
+
+    if (!sourcePath && fs.existsSync(claudeProjectsDir)) {
+      const projectDirs = fs.readdirSync(claudeProjectsDir).filter(d => fs.statSync(path.join(claudeProjectsDir, d)).isDirectory());
+      for (const dir of projectDirs) {
+        const checkPath = path.join(claudeProjectsDir, dir, `${sessionId}.jsonl`);
+        if (fs.existsSync(checkPath)) {
+          sourcePath = checkPath;
+          break;
+        }
+      }
+    }
+
+    if (!sourcePath) return { success: false, error: 'File not found' };
+
+    const content = fs.readFileSync(sourcePath, 'utf-8');
+    const lines = content.trim().split('\n').filter(l => l.trim());
+    
+    // First, build the full message map
+    const recordMap = new Map();
+    let lastEntryWithUuid = null;
+    for (const line of lines) {
+      try {
+        const entry = JSON.parse(line);
+        if (entry.uuid) {
+          recordMap.set(entry.uuid, entry);
+          lastEntryWithUuid = entry;
+        }
+      } catch (e) {}
+    }
+
+    // Use backtrace to get the linear active history
+    const activeHistory = [];
+    let current = lastEntryWithUuid?.uuid;
+    while (current) {
+      const record = recordMap.get(current);
+      if (!record) break;
+      activeHistory.unshift(record);
+      current = record.logicalParentUuid || record.parentUuid;
+    }
+
+    // Find the range in the active history
+    const startIndex = activeHistory.findIndex(e => e.uuid === startUuid);
+    const endIndex = activeHistory.findIndex(e => e.uuid === endUuid);
+
+    if (startIndex === -1 || endIndex === -1) {
+      return { success: false, error: 'Selected range not found in active history' };
+    }
+
+    const minIdx = Math.min(startIndex, endIndex);
+    const maxIdx = Math.max(startIndex, endIndex);
+    const range = activeHistory.slice(minIdx, maxIdx + 1);
+
+    // Format the range
+    let output = `# Claude Session Export (Range)\nSession: ${sessionId}\n\n---\n\n`;
+
+    for (const entry of range) {
+      if (entry.isSidechain || entry.type === 'summary') continue;
+
+      if (entry.type === 'user') {
+        let rawContent = entry.message?.content;
+        if (Array.isArray(rawContent)) {
+          if (rawContent.some(i => i.type === 'tool_result')) continue;
+          const textBlock = rawContent.find(i => i.type === 'text');
+          rawContent = textBlock?.text || '';
+        }
+        if (!rawContent || typeof rawContent !== 'string') continue;
+        if (rawContent.includes('[Request interrupted')) continue;
+
+        output += `## User\n${rawContent.replace(/\[200~/g, '').replace(/~\]/g, '').trim()}\n\n`;
+      } 
+      else if (entry.type === 'assistant') {
+        output += `## Claude\n`;
+        const content = entry.message?.content;
+        if (Array.isArray(content)) {
+          for (const block of content) {
+            if (block.type === 'text') output += `${block.text}\n`;
+            if (block.type === 'thinking') output += `> Thinking: ${block.thinking.slice(0, 200)}...\n`;
+            if (block.type === 'tool_use') {
+              const name = block.name;
+              const fPath = block.input?.file_path || block.input?.path;
+              if (name === 'Read') output += `→ Read(${fPath})\n`;
+              else if (name === 'Edit') output += `→ Updated ${fPath}\n`;
+              else if (name === 'Write') output += `→ Created ${fPath}\n`;
+              else output += `→ Tool: ${name}\n`;
+            }
+          }
+        } else if (typeof content === 'string') {
+          output += `${content}\n`;
+        }
+        output += `\n`;
+      }
+      else if (entry.type === 'system' && entry.subtype === 'compact_boundary') {
+        output += `\n═══ HISTORY COMPACTED ═══\n\n`;
+      }
+    }
+
+    return { success: true, content: output };
+  } catch (error) {
+    console.error('[Claude Export] Error:', error);
+    return { success: false, error: error.message };
+  }
+});
+
 // Create new terminal for a tab
 ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initialCommand }) => {
     console.time(`[PERF:main] terminal:create ${tabId}`);

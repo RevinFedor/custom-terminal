@@ -358,6 +358,15 @@ export default function Workspace() {
 
       {/* RIGHT COLUMN: Toolbar + Notes + Resizer */}
       <div className="flex shrink-0 overflow-hidden relative" style={{ width: notesPanelWidth }}>
+        {/* Timeline for Claude session navigation - correctly positioned LEFT of Resizer */}
+        {currentView === 'terminal' && showTimeline && (
+          <Timeline
+            tabId={activeTab.id}
+            sessionId={claudeSessionId}
+            cwd={activeTab.cwd || currentProject.path}
+          />
+        )}
+
         <Resizer onResize={handleResize} />
         
         <div className="flex-1 flex flex-col min-w-0 border-l border-border-main">
@@ -376,15 +385,6 @@ export default function Workspace() {
       </div>
 
       {/* Global Overlays */}
-      {/* Timeline for Claude session navigation - only when Claude is running */}
-      {currentView === 'terminal' && showTimeline && (
-        <Timeline
-          tabId={activeTab.id}
-          sessionId={claudeSessionId}
-          cwd={activeTab.cwd}
-        />
-      )}
-
       {/* File Explorer - opens in current terminal's directory */}
       <FileExplorer projectPath={explorerPath} projectId={activeProjectId} />
 
