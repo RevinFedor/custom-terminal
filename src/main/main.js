@@ -466,9 +466,16 @@ ipcMain.handle('claude:copy-range', async (event, { sessionId, cwd, startUuid, e
         }
         if (!rawContent || typeof rawContent !== 'string') continue;
         if (rawContent.includes('[Request interrupted')) continue;
+        // Skip system artifacts
+        if (rawContent.includes('<command-name>') ||
+            rawContent.includes('<command-message>') ||
+            rawContent.includes('<local-command-stdout>') ||
+            rawContent.includes('<system-reminder>') ||
+            rawContent.includes('<bash-notification>') ||
+            rawContent.startsWith('Caveat: The messages below')) continue;
 
         output += `## User\n${rawContent.replace(/\[200~/g, '').replace(/~\]/g, '').trim()}\n\n`;
-      } 
+      }
       else if (entry.type === 'assistant') {
         output += `## Claude\n`;
         const content = entry.message?.content;
@@ -2351,9 +2358,16 @@ ipcMain.handle('claude:get-timeline', async (event, { sessionId, cwd }) => {
         }
 
         // Skip local command artifacts - these appear after /compact and other slash commands
+        // Also skip system notifications and reminders injected by Claude Code
         if (rawContent.includes('<command-name>') ||
+            rawContent.includes('<command-message>') ||
+            rawContent.includes('<command-args>') ||
             rawContent.includes('<local-command-stdout>') ||
             rawContent.includes('<local-command-stderr>') ||
+            rawContent.includes('<system-reminder>') ||
+            rawContent.includes('<bash-notification>') ||
+            rawContent.includes('<shell-id>') ||
+            rawContent.includes('<user-prompt-submit-hook>') ||
             rawContent.startsWith('Caveat: The messages below')) {
           skippedSystem++;
           continue;
@@ -2517,6 +2531,14 @@ ipcMain.handle('claude:export-clean-session', async (event, { sessionId, cwd }) 
           if (rawContent === '[Request interrupted by user]' ||
               rawContent.startsWith('[Request interrupted') ||
               rawContent === '[User cancelled]') continue;
+
+          // Skip system artifacts
+          if (rawContent.includes('<command-name>') ||
+              rawContent.includes('<command-message>') ||
+              rawContent.includes('<local-command-stdout>') ||
+              rawContent.includes('<system-reminder>') ||
+              rawContent.includes('<bash-notification>') ||
+              rawContent.startsWith('Caveat: The messages below')) continue;
 
           // Clean up bracketed paste escape sequences
           let cleanContent = rawContent
