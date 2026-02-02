@@ -431,7 +431,7 @@ const EmptyDropZone = memo(({ onDropMain, onDropFromUtility, onHoverChange, onDo
   return (
     <div
       ref={ref}
-      className={`h-full w-1 flex-shrink-0 transition-colors ${isOver ? 'bg-white/10' : ''}`}
+      className={`h-full flex-1 min-w-[30px] transition-colors ${isOver ? 'bg-white/10' : ''}`}
       onDoubleClick={onDoubleClick}
     />
   );
@@ -1030,30 +1030,33 @@ function TabBar({ projectId }: TabBarProps) {
           )}
         </div>
 
-        {/* Main Tabs Zone - fills remaining width with hidden scrollbar */}
-        <div
-          ref={scrollContainerRef}
-          className="flex-1 flex items-stretch h-full min-w-0 scrollbar-hide"
-          style={{
-            overflowX: 'auto',
-            overflowY: 'hidden',
-          }}
-          onWheel={(e) => {
-            // Convert vertical scroll to horizontal (works with and without Shift)
-            if (scrollContainerRef.current && e.deltaY !== 0) {
-              e.preventDefault();
-              scrollContainerRef.current.scrollLeft += e.deltaY;
-            }
-          }}
-        >
-          {mainTabs.length === 0 ? (
-            /* Empty main zone - show drop target */
-            <EmptyMainZone
-              onDrop={(tabId) => moveTabToZone(projectId, tabId, false, 0)}
-            />
-          ) : (
-            <>
-              {/* Tabs */}
+        {/* Main Tabs Zone - wrapper for scroll + empty zone */}
+        <div className="flex-1 flex items-stretch h-full min-w-0">
+          {/* Scrollable tabs container */}
+          <div
+            ref={scrollContainerRef}
+            className="flex items-stretch h-full scrollbar-hide"
+            style={{
+              overflowX: 'auto',
+              overflowY: 'hidden',
+              minWidth: 0,
+              flexShrink: 1,
+            }}
+            onWheel={(e) => {
+              // Convert vertical scroll to horizontal (works with and without Shift)
+              if (scrollContainerRef.current && e.deltaY !== 0) {
+                e.preventDefault();
+                scrollContainerRef.current.scrollLeft += e.deltaY;
+              }
+            }}
+          >
+            {mainTabs.length === 0 ? (
+              /* Empty main zone - show drop target */
+              <EmptyMainZone
+                onDrop={(tabId) => moveTabToZone(projectId, tabId, false, 0)}
+              />
+            ) : (
+              /* Tabs */
               <div className="flex items-stretch h-full flex-shrink-0">
                 {mainTabs.map((tab, index) => (
                   <TabItem
@@ -1084,27 +1087,28 @@ function TabBar({ projectId }: TabBarProps) {
                   />
                 ))}
               </div>
+            )}
+          </div>
 
-              {/* Empty drop zone - captures drops after last tab */}
-              <EmptyDropZone
-            onDropMain={(tabId) => {
-              // Reorder within main - move to end
-              const currentTabs = mainTabs.map(t => t.id);
-              if (!currentTabs.includes(tabId)) return;
-              const newOrder = currentTabs.filter(id => id !== tabId);
-              newOrder.push(tabId);
-              reorderInZone(projectId, 'main', newOrder);
-            }}
-            onDropFromUtility={(tabId) => {
-              // Move from utility to main (at end)
-              moveTabToZone(projectId, tabId, false, mainTabs.length);
-            }}
-            onHoverChange={setEmptyZoneHovered}
-            onDoubleClick={handleNewTabAtEnd}
-          />
-            </>
+          {/* Empty drop zone - OUTSIDE scroll container, captures drops after last tab */}
+          {mainTabs.length > 0 && (
+            <EmptyDropZone
+              onDropMain={(tabId) => {
+                // Reorder within main - move to end
+                const currentTabs = mainTabs.map(t => t.id);
+                if (!currentTabs.includes(tabId)) return;
+                const newOrder = currentTabs.filter(id => id !== tabId);
+                newOrder.push(tabId);
+                reorderInZone(projectId, 'main', newOrder);
+              }}
+              onDropFromUtility={(tabId) => {
+                // Move from utility to main (at end)
+                moveTabToZone(projectId, tabId, false, mainTabs.length);
+              }}
+              onHoverChange={setEmptyZoneHovered}
+              onDoubleClick={handleNewTabAtEnd}
+            />
           )}
-
         </div>
       </div>
 
