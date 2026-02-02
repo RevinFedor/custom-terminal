@@ -93,6 +93,14 @@ class DatabaseManager {
       this.db.exec(`ALTER TABLE tabs ADD COLUMN notes TEXT DEFAULT NULL`);
     } catch (e) { /* column already exists */ }
 
+    // Project sidebar state
+    try {
+      this.db.exec(`ALTER TABLE projects ADD COLUMN sidebar_open INTEGER DEFAULT 0`);
+    } catch (e) { /* column already exists */ }
+    try {
+      this.db.exec(`ALTER TABLE projects ADD COLUMN open_file_path TEXT DEFAULT NULL`);
+    } catch (e) { /* column already exists */ }
+
     // Gemini history table
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS gemini_history (
@@ -208,6 +216,8 @@ class DatabaseManager {
       description: project.description || '',
       geminiPrompt: project.gemini_prompt,
       notesGlobal: project.notes_global || '',
+      sidebarOpen: project.sidebar_open === 1,
+      openFilePath: project.open_file_path || null,
       createdAt: project.created_at,
       updatedAt: project.updated_at,
       quickActions: globalCommands.map(gc => ({ name: gc.name, command: gc.command })),
@@ -293,6 +303,10 @@ class DatabaseManager {
 
   updateProjectNotes(projectId, notes) {
     this.db.prepare('UPDATE projects SET notes_global = ?, updated_at = strftime(\'%s\', \'now\') WHERE id = ?').run(notes, projectId);
+  }
+
+  updateProjectSidebarState(projectId, sidebarOpen, openFilePath) {
+    this.db.prepare('UPDATE projects SET sidebar_open = ?, open_file_path = ? WHERE id = ?').run(sidebarOpen ? 1 : 0, openFilePath || null, projectId);
   }
 
   deleteProject(projectId) {

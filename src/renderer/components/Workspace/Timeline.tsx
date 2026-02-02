@@ -111,13 +111,17 @@ function Timeline({ tabId, sessionId, cwd }: TimelineProps) {
 
   // Don't render if no session
   if (!sessionId) {
+    console.log('[Timeline] NOT rendering - no sessionId');
     return null;
   }
+
+  console.log('[Timeline] RENDERING with sessionId:', sessionId, 'entries:', entries.length);
 
   return (
     <div
       ref={containerRef}
       className="relative flex flex-col items-center"
+      data-testid="timeline-container"
       style={{
         width: '16px',
         backgroundColor: 'rgba(255, 255, 255, 0.03)',

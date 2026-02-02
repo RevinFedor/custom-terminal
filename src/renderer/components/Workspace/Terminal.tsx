@@ -692,6 +692,7 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
                                 const result = await ipcRenderer.invoke('claude:fork-session-file', { sourceSessionId, cwd });
                                 if (result.success) {
                                   console.log('[Claude Intercept] Forked to new session:', result.newSessionId);
+                                  getSetTabCommandType()(tabId, 'claude'); // Set commandType for Timeline visibility
                                   getSetClaudeSessionId()(tabId, result.newSessionId);
                                   ipcRenderer.send('terminal:input', tabId, 'claude --dangerously-skip-permissions --resume ' + result.newSessionId + '\r');
                                 } else {
@@ -1058,6 +1059,7 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
               const result = await ipcRenderer.invoke('claude:fork-session-file', { sourceSessionId, cwd });
               if (result.success) {
                 console.log('[Claude Intercept] Forked to new session:', result.newSessionId);
+                getSetTabCommandType()(tabId, 'claude'); // Set commandType for Timeline visibility
                 getSetClaudeSessionId()(tabId, result.newSessionId);
                 ipcRenderer.send('terminal:input', tabId, 'claude --dangerously-skip-permissions --resume ' + result.newSessionId + '\r');
               } else {

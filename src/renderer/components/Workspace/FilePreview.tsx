@@ -2,12 +2,15 @@ import React, { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { motion } from 'framer-motion';
 import { useUIStore } from '../../store/useUIStore';
+import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import hljs from 'highlight.js';
 import 'highlight.js/styles/vs2015.css';
 import MarkdownPreview from './MarkdownPreview';
 
 export default function FilePreview() {
-  const { filePreview, closeFilePreview, showToast, fileExplorerOpen } = useUIStore();
+  const { filePreview, closeFilePreview, showToast } = useUIStore();
+  const { activeProjectId, getSidebarState, setOpenFilePath } = useWorkspaceStore();
+  const { sidebarOpen } = activeProjectId ? getSidebarState(activeProjectId) : { sidebarOpen: false };
   const contentRef = useRef<HTMLDivElement>(null);
   const [copied, setCopied] = useState(false);
 
@@ -82,6 +85,13 @@ export default function FilePreview() {
     }
   };
 
+  const handleClose = () => {
+    closeFilePreview();
+    if (activeProjectId) {
+      setOpenFilePath(activeProjectId, null);
+    }
+  };
+
   // Get filename from path
   const fileName = filePreview?.path.split('/').pop() || '';
 
@@ -95,7 +105,7 @@ export default function FilePreview() {
       style={{
         position: 'fixed',
         top: 36,
-        left: fileExplorerOpen ? 250 : 0,
+        left: sidebarOpen ? 250 : 0,
         right: 0,
         bottom: 0,
         zIndex: 100000,
@@ -129,7 +139,7 @@ export default function FilePreview() {
           </button>
           <button
             className="text-[#999] hover:text-white text-2xl leading-none w-8 h-8 flex items-center justify-center rounded hover:bg-white/10"
-            onClick={closeFilePreview}
+            onClick={handleClose}
           >
             ×
           </button>

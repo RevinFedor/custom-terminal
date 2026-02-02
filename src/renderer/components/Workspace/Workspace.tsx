@@ -17,10 +17,27 @@ import NotesEditorModal from './NotesEditorModal';
 
 const { ipcRenderer } = window.require('electron');
 
+// Helper to detect language from file extension
+const detectLanguage = (ext: string): string | null => {
+  const langMap: Record<string, string> = {
+    '.js': 'javascript', '.jsx': 'javascript', '.ts': 'typescript', '.tsx': 'typescript',
+    '.py': 'python', '.rb': 'ruby', '.java': 'java', '.go': 'go', '.rs': 'rust',
+    '.c': 'c', '.cpp': 'cpp', '.h': 'c', '.hpp': 'cpp', '.cs': 'csharp',
+    '.php': 'php', '.swift': 'swift', '.kt': 'kotlin', '.scala': 'scala',
+    '.html': 'html', '.css': 'css', '.scss': 'scss', '.less': 'less',
+    '.json': 'json', '.xml': 'xml', '.yaml': 'yaml', '.yml': 'yaml',
+    '.md': 'markdown', '.mdx': 'markdown', '.sh': 'bash', '.bash': 'bash',
+    '.sql': 'sql', '.graphql': 'graphql', '.vue': 'vue', '.svelte': 'svelte'
+  };
+  return langMap[ext.toLowerCase()] || null;
+};
+
+const path = window.require('path');
+
 export default function Workspace() {
-  const { activeProjectId, getActiveProject } = useWorkspaceStore();
+  const { activeProjectId, getActiveProject, getSidebarState } = useWorkspaceStore();
   const { projects } = useProjectsStore();
-  const { filePreview, openNotesEditor, notesEditorOpen, currentView, setCurrentView, notesPanelWidth } = useUIStore();
+  const { filePreview, openFilePreview, closeFilePreview, openNotesEditor, notesEditorOpen, currentView, setCurrentView, notesPanelWidth } = useUIStore();
   const [showSearch, setShowSearch] = useState(false);
   const [searchText, setSearchText] = useState('');
   const [searchResults, setSearchResults] = useState({ resultIndex: 0, resultCount: 0 });
@@ -41,6 +58,38 @@ export default function Workspace() {
       setCurrentView('home');
     }
   }, [activeProject?.tabs.size, currentView, setCurrentView]);
+
+  // Restore file preview when switching projects
+  useEffect(() => {
+    if (!activeProjectId) return;
+
+    const { openFilePath } = getSidebarState(activeProjectId);
+
+    // Close current file preview when switching projects
+    if (filePreview && filePreview.path !== openFilePath) {
+      closeFilePreview();
+    }
+
+    // If project has saved open file, restore it
+    if (openFilePath && (!filePreview || filePreview.path !== openFilePath)) {
+      (async () => {
+        try {
+          const result = await ipcRenderer.invoke('file:read', openFilePath);
+          if (result.success) {
+            const ext = path.extname(openFilePath).toLowerCase();
+            const language = detectLanguage(ext);
+            openFilePreview({
+              path: openFilePath,
+              content: result.content,
+              language
+            });
+          }
+        } catch (e) {
+          console.error('[Workspace] Failed to restore file preview:', e);
+        }
+      })();
+    }
+  }, [activeProjectId]);
 
   // Listen for OSC 133 command lifecycle events (Shell Integration)
   useEffect(() => {
@@ -195,6 +244,18 @@ export default function Workspace() {
   // 2. A command is currently running (detected via OSC 133 Shell Integration)
   const showTimeline = !filePreview && claudeSessionId && activeTab?.commandType === 'claude' && isCommandRunning;
 
+  // DEBUG: Log all Timeline visibility conditions
+  console.log('[Timeline Debug] ==================');
+  console.log('[Timeline Debug] activeTabId:', activeTab?.id);
+  console.log('[Timeline Debug] currentView:', currentView, '-> === terminal:', currentView === 'terminal');
+  console.log('[Timeline Debug] filePreview:', filePreview, '-> !filePreview:', !filePreview);
+  console.log('[Timeline Debug] claudeSessionId:', claudeSessionId);
+  console.log('[Timeline Debug] commandType:', activeTab?.commandType, '-> === claude:', activeTab?.commandType === 'claude');
+  console.log('[Timeline Debug] isCommandRunning:', isCommandRunning);
+  console.log('[Timeline Debug] RESULT showTimeline:', showTimeline);
+  console.log('[Timeline Debug] FINAL RENDER:', currentView === 'terminal' && showTimeline);
+  console.log('[Timeline Debug] ==================');
+
   return (
     <div className="flex-1 flex h-full overflow-hidden relative">
       {/* LEFT COLUMN: Tabs + Terminal/Home Area */}
@@ -325,7 +386,7 @@ export default function Workspace() {
       )}
 
       {/* File Explorer - opens in current terminal's directory */}
-      <FileExplorer projectPath={explorerPath} />
+      <FileExplorer projectPath={explorerPath} projectId={activeProjectId} />
 
       {/* Notes Editor Modal */}
       <NotesEditorModal />

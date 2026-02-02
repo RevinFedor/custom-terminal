@@ -298,9 +298,9 @@ const RestoreLoader = memo(() => (
 ));
 
 function App() {
-  const { view, showDashboard, openProject, openProjects, activeProjectId, closeProject, createTab, createTabAfterCurrent, closeTab, getActiveProject, restoreSession, reorderProjects, moveTabToProject, isRestoring } = useWorkspaceStore();
+  const { view, showDashboard, openProject, openProjects, activeProjectId, closeProject, createTab, createTabAfterCurrent, closeTab, getActiveProject, restoreSession, reorderProjects, moveTabToProject, isRestoring, getSidebarState, setSidebarOpen, setOpenFilePath } = useWorkspaceStore();
   const { projects, loadProjects, updateProject } = useProjectsStore();
-  const { toggleFileExplorer, closeFilePreview, filePreview, showToast, incrementAllFontSizes, decrementAllFontSizes, activeArea, setActiveArea, currentView } = useUIStore();
+  const { closeFilePreview, filePreview, showToast, incrementAllFontSizes, decrementAllFontSizes, activeArea, setActiveArea, currentView } = useUIStore();
   const { toggleResearch } = useResearchStore();
   const projectTabsFontSize = useUIStore((s) => s.projectTabsFontSize);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -544,15 +544,18 @@ function App() {
       if (e.metaKey && (isBackslash || isCmdB)) {
         console.log('[Hotkey] FileExplorer toggle triggered, view:', view);
         e.preventDefault();
-        if (view === 'workspace') {
+        if (view === 'workspace' && activeProjectId) {
           // Close file preview if open
           if (filePreview) {
             closeFilePreview();
+            setOpenFilePath(activeProjectId, null);
           }
-          console.log('[Hotkey] Calling toggleFileExplorer');
-          toggleFileExplorer();
+          // Toggle per-project sidebar state
+          const { sidebarOpen } = getSidebarState(activeProjectId);
+          console.log('[Hotkey] Toggling sidebar for project:', activeProjectId, 'current:', sidebarOpen);
+          setSidebarOpen(activeProjectId, !sidebarOpen);
         } else {
-          console.log('[Hotkey] Not in workspace view, skipping');
+          console.log('[Hotkey] Not in workspace view or no active project, skipping');
         }
         return;
       }

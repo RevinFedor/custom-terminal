@@ -30,6 +30,9 @@ export default defineConfig({
 renderer: {
     // Renderer process (React app)
     root: '.',
+    server: {
+      port: 5182
+    },
     build: {
       outDir: 'dist/renderer',
       rollupOptions: {

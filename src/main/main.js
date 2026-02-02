@@ -15,6 +15,13 @@ const ClaudeManager = require(path.join(srcMainDir, 'claude-manager'));
 
 const isDev = !app.isPackaged;
 
+// ⚡ КРИТИЧЕСКИ ВАЖНО: Устанавливаем activation policy ДО app.whenReady()
+// Это обходит защиту macOS Sequoia/Tahoe от "focus stealing" для дочерних процессов
+if (process.platform === 'darwin') {
+  console.log('[Startup] Setting activation policy to "regular"...');
+  app.setActivationPolicy('regular');
+}
+
 let mainWindow;
 const terminals = new Map(); // tabId -> ptyProcess
 const terminalProjects = new Map(); // tabId -> cwd path
@@ -186,10 +193,12 @@ function parseOSC133AndEmit(tabId, data) {
 }
 
 function createWindow() {
+  console.log('[Window] Creating main window...');
+
   const windowOptions = {
     width: 1900,
     height: 1000,
-    show: false, // Don't show until ready
+    show: false, // Don't show until ready-to-show
     backgroundColor: '#1a1a1a', // Dark background instead of white flash
     titleBarStyle: 'hidden',
     titleBarOverlay: {
@@ -204,16 +213,21 @@ function createWindow() {
   };
 
   mainWindow = new BrowserWindow(windowOptions);
+  console.log('[Window] BrowserWindow created');
 
-  // Show window when ready (prevents white flash)
+  // Show window when ready and force focus on macOS (Sequoia/Tahoe workaround)
   mainWindow.once('ready-to-show', () => {
+    console.log('[Window] ready-to-show fired, showing window...');
     mainWindow.show();
-    mainWindow.focus();
 
-    // In dev mode, force window to front (macOS needs extra push)
-    if (isDev && process.platform === 'darwin') {
-      app.dock.show();
-      app.focus({ steal: true });
+    // macOS Sequoia/Tahoe: Triple activation для обхода focus stealing protection
+    if (process.platform === 'darwin') {
+      setTimeout(() => {
+        console.log('[Window] Forcing focus (moveTop + focus + steal)...');
+        mainWindow.moveTop();
+        app.focus({ steal: true });
+        mainWindow.focus();
+      }, 50);
     }
   });
 
@@ -227,11 +241,31 @@ function createWindow() {
 
   // Load from Vite dev server in dev mode, or from built files in production
   if (process.env.ELECTRON_RENDERER_URL) {
+    console.log('[Window] Loading URL:', process.env.ELECTRON_RENDERER_URL);
     mainWindow.loadURL(process.env.ELECTRON_RENDERER_URL);
     mainWindow.webContents.openDevTools();
+  } else if (isDev) {
+    console.log('[Window] Loading fallback URL: http://localhost:5182');
+    mainWindow.loadURL('http://localhost:5182');
+    mainWindow.webContents.openDevTools();
   } else {
-    mainWindow.loadFile(path.join(__dirname, '..', 'renderer', 'index.html'));
+    const filePath = path.join(__dirname, '..', 'renderer', 'index.html');
+    console.log('[Window] Loading file:', filePath);
+    mainWindow.loadFile(filePath);
   }
+
+  // Логи для отладки загрузки
+  mainWindow.webContents.on('did-start-loading', () => {
+    console.log('[Window] did-start-loading');
+  });
+
+  mainWindow.webContents.on('did-finish-load', () => {
+    console.log('[Window] did-finish-load');
+  });
+
+  mainWindow.webContents.on('did-fail-load', (event, errorCode, errorDescription) => {
+    console.error('[Window] did-fail-load:', errorCode, errorDescription);
+  });
 }
 
 // Context Menu IPC
@@ -276,16 +310,42 @@ ipcMain.on('show-terminal-context-menu', async (event, { hasSelection, prompts }
 });
 
 app.whenReady().then(() => {
+  // Диагностика для отладки проблемы с окном
+  console.log('[Startup] ═══════════════════════════════════════');
+  console.log('[Startup] Platform:', process.platform);
+  console.log('[Startup] Is packaged:', app.isPackaged);
+  console.log('[Startup] isDev:', isDev);
+  console.log('[Startup] Process type:', process.type);
+  console.log('[Startup] Parent PID:', process.ppid);
+  console.log('[Startup] ELECTRON_RENDERER_URL:', process.env.ELECTRON_RENDERER_URL || '(not set)');
+  console.log('[Startup] ═══════════════════════════════════════');
+
   // Setup shell integration (OSC 7 for cwd reporting)
+  console.log('[Startup] Setting up shell integration...');
   setupShellIntegration();
 
   // Initialize session manager with database from project manager
-  sessionManager = new SessionManager(projectManager.db);
-  
+  console.log('[Startup] Initializing SessionManager...');
+  try {
+    sessionManager = new SessionManager(projectManager.db);
+    console.log('[Startup] SessionManager OK');
+  } catch (e) {
+    console.error('[Startup] SessionManager ERROR:', e.message);
+  }
+
   // Initialize Claude Manager
-  claudeManager = new ClaudeManager(terminals, terminalProjects, claudeState);
-  
+  console.log('[Startup] Initializing ClaudeManager...');
+  try {
+    claudeManager = new ClaudeManager(terminals, terminalProjects, claudeState);
+    console.log('[Startup] ClaudeManager OK');
+  } catch (e) {
+    console.error('[Startup] ClaudeManager ERROR:', e.message);
+    // Продолжаем без ClaudeManager — окно всё равно должно открыться
+  }
+
+  console.log('[Startup] Calling createWindow()...');
   createWindow();
+  console.log('[Startup] createWindow() returned');
 });
 
 app.on('window-all-closed', () => {
@@ -299,12 +359,16 @@ app.on('window-all-closed', () => {
 });
 
 app.on('activate', () => {
+  console.log('[Activate] Dock icon clicked');
   if (BrowserWindow.getAllWindows().length === 0) {
     createWindow();
   } else if (mainWindow) {
     // Show and focus existing window when clicking dock icon
     mainWindow.show();
-    mainWindow.focus();
+    if (process.platform === 'darwin') {
+      mainWindow.moveTop();
+      app.focus({ steal: true });
+    }
   }
 });
 
@@ -762,6 +826,11 @@ ipcMain.handle('project:save-tabs', (event, { projectId, tabs }) => {
 
 ipcMain.handle('project:save-metadata', (event, { projectId, metadata }) => {
   projectManager.saveProjectMetadata(projectId, metadata);
+  return { success: true };
+});
+
+ipcMain.handle('project:save-sidebar-state', (event, { projectId, sidebarOpen, openFilePath }) => {
+  projectManager.db.updateProjectSidebarState(projectId, sidebarOpen, openFilePath);
   return { success: true };
 });
 
@@ -2046,20 +2115,32 @@ ipcMain.handle('claude:get-timeline', async (event, { sessionId, cwd }) => {
     const content = fs.readFileSync(sourcePath, 'utf-8');
     const lines = content.trim().split('\n').filter(line => line.trim());
 
+    console.log('[Claude Timeline] File:', sourcePath);
+    console.log('[Claude Timeline] Total lines in file:', lines.length);
+
     const recordMap = new Map(); // UUID -> record
     let lastRecord = null;
+    let parseErrors = 0;
 
     for (const line of lines) {
       try {
         const entry = JSON.parse(line);
         recordMap.set(entry.uuid, entry);
-        lastRecord = entry; // Track the last record in file
+        // Track last record with valid UUID (skip summary records which have null uuid)
+        if (entry.uuid) {
+          lastRecord = entry;
+        }
       } catch (parseErr) {
-        // Skip malformed lines
+        parseErrors++;
       }
     }
 
+    console.log('[Claude Timeline] Parsed records:', recordMap.size);
+    console.log('[Claude Timeline] Parse errors:', parseErrors);
+    console.log('[Claude Timeline] Last record type:', lastRecord?.type);
+
     if (!lastRecord) {
+      console.log('[Claude Timeline] No lastRecord - returning empty');
       return { success: true, entries: [] };
     }
 
@@ -2078,14 +2159,18 @@ ipcMain.handle('claude:get-timeline', async (event, { sessionId, cwd }) => {
       currentUuid = record.logicalParentUuid || record.parentUuid;
     }
 
+    console.log('[Claude Timeline] Active branch size:', activeBranch.length);
+    console.log('[Claude Timeline] Active branch types:', activeBranch.map(r => r.type).join(', '));
+
     // Now filter the active branch for Timeline display
     const entries = [];
+    let skippedSidechain = 0, skippedSummary = 0, skippedToolResult = 0, skippedNoContent = 0, skippedSystem = 0;
     for (const entry of activeBranch) {
       // Skip sidechain entries (internal Claude operations)
-      if (entry.isSidechain) continue;
+      if (entry.isSidechain) { skippedSidechain++; continue; }
 
       // Skip summary type (internal)
-      if (entry.type === 'summary') continue;
+      if (entry.type === 'summary') { skippedSummary++; continue; }
 
       // Include: user messages, compact boundaries
       if (entry.type === 'user') {
@@ -2096,6 +2181,7 @@ ipcMain.handle('claude:get-timeline', async (event, { sessionId, cwd }) => {
         if (Array.isArray(rawContent)) {
           const hasToolResult = rawContent.some(item => item.type === 'tool_result');
           if (hasToolResult) {
+            skippedToolResult++;
             continue;
           }
           // Find first text block for other array types
@@ -2105,6 +2191,7 @@ ipcMain.handle('claude:get-timeline', async (event, { sessionId, cwd }) => {
 
         // Skip if no valid content
         if (!rawContent || typeof rawContent !== 'string') {
+          skippedNoContent++;
           continue;
         }
 
@@ -2112,6 +2199,7 @@ ipcMain.handle('claude:get-timeline', async (event, { sessionId, cwd }) => {
         if (rawContent === '[Request interrupted by user]' ||
             rawContent.startsWith('[Request interrupted') ||
             rawContent === '[User cancelled]') {
+          skippedSystem++;
           continue;
         }
 
@@ -2144,7 +2232,16 @@ ipcMain.handle('claude:get-timeline', async (event, { sessionId, cwd }) => {
       }
     }
 
-    console.log('[Claude Timeline] Found', entries.length, 'entries (from active branch)');
+    console.log('[Claude Timeline] === FILTER RESULTS ===');
+    console.log('[Claude Timeline] Skipped sidechain:', skippedSidechain);
+    console.log('[Claude Timeline] Skipped summary:', skippedSummary);
+    console.log('[Claude Timeline] Skipped tool_result:', skippedToolResult);
+    console.log('[Claude Timeline] Skipped no content:', skippedNoContent);
+    console.log('[Claude Timeline] Skipped system msg:', skippedSystem);
+    console.log('[Claude Timeline] FINAL entries:', entries.length);
+    if (entries.length > 0) {
+      console.log('[Claude Timeline] First entry:', entries[0].content?.slice(0, 50));
+    }
     return { success: true, entries };
 
   } catch (error) {

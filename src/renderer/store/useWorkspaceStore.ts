@@ -38,6 +38,8 @@ interface ProjectWorkspace {
   tabs: Map<string, Tab>;
   activeTabId: string | null;
   tabCounter: number;
+  sidebarOpen: boolean;
+  openFilePath: string | null;
 }
 
 interface SessionState {
@@ -121,6 +123,11 @@ interface WorkspaceStore {
   // Helpers
   getActiveTab: (projectId: string) => Tab | null;
   getActiveProject: () => ProjectWorkspace | null;
+
+  // Sidebar state (per-project)
+  setSidebarOpen: (projectId: string, open: boolean) => void;
+  setOpenFilePath: (projectId: string, filePath: string | null) => void;
+  getSidebarState: (projectId: string) => { sidebarOpen: boolean; openFilePath: string | null };
 }
 
 const SESSION_KEY = 'workspace-session';
@@ -329,7 +336,9 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         projectPath,
         tabs: new Map(),
         activeTabId: null,
-        tabCounter: 0 // Start from 0 for new projects
+        tabCounter: 0, // Start from 0 for new projects
+        sidebarOpen: projectData?.sidebarOpen || false,
+        openFilePath: projectData?.openFilePath || null
       };
       openProjects.set(projectId, newWorkspace);
       
@@ -1144,5 +1153,48 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     // Use sendSync for immediate save during shutdown
     ipcRenderer.sendSync('app:setStateSync', { key: SESSION_KEY, value: sessionState });
     console.log('[Store] Session saved immediately:', sessionState);
+  },
+
+  // Sidebar state (per-project)
+  setSidebarOpen: (projectId, open) => {
+    const { openProjects } = get();
+    const workspace = openProjects.get(projectId);
+    if (workspace) {
+      workspace.sidebarOpen = open;
+      set({ openProjects: new Map(openProjects) });
+      // Save to database
+      ipcRenderer.invoke('project:save-sidebar-state', {
+        projectId,
+        sidebarOpen: open,
+        openFilePath: workspace.openFilePath
+      });
+    }
+  },
+
+  setOpenFilePath: (projectId, filePath) => {
+    const { openProjects } = get();
+    const workspace = openProjects.get(projectId);
+    if (workspace) {
+      workspace.openFilePath = filePath;
+      set({ openProjects: new Map(openProjects) });
+      // Save to database
+      ipcRenderer.invoke('project:save-sidebar-state', {
+        projectId,
+        sidebarOpen: workspace.sidebarOpen,
+        openFilePath: filePath
+      });
+    }
+  },
+
+  getSidebarState: (projectId) => {
+    const { openProjects } = get();
+    const workspace = openProjects.get(projectId);
+    if (workspace) {
+      return {
+        sidebarOpen: workspace.sidebarOpen,
+        openFilePath: workspace.openFilePath
+      };
+    }
+    return { sidebarOpen: false, openFilePath: null };
   }
 }));
