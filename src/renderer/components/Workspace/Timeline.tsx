@@ -2,6 +2,7 @@ import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { Maximize2, Copy, Minimize2 } from 'lucide-react';
 import { terminalRegistry } from '../../utils/terminalRegistry';
+import { useUIStore } from '../../store/useUIStore';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -110,25 +111,52 @@ function Timeline({ tabId, sessionId, cwd }: TimelineProps) {
     return () => clearInterval(interval);
   }, [sessionId, loadTimeline]);
 
-  // Hover logic: Instant set, bridge handles the move
+  // Hover logic using relatedTarget to check where mouse went
+  const tooltipRef = useRef<HTMLDivElement>(null);
+
   const handleMouseEnterSegment = (index: number) => {
     setHoveredIndex(index);
     setActiveTooltipIndex(index);
   };
 
-  const handleMouseLeaveSegment = () => {
+  const handleMouseLeaveSegment = (e: React.MouseEvent) => {
     setHoveredIndex(null);
-    // If we don't have a bridge, this would close it. 
-    // With bridge, we only close if we really exit the area.
-    if (!isExpanded) setActiveTooltipIndex(null);
+
+    // Check if mouse went to tooltip
+    const relatedTarget = e.relatedTarget as HTMLElement;
+    if (tooltipRef.current && tooltipRef.current.contains(relatedTarget)) {
+      // Mouse went to tooltip - keep it open
+      return;
+    }
+
+    // Mouse went elsewhere - close
+    if (!isExpanded) {
+      setActiveTooltipIndex(null);
+    }
   };
 
   const handleMouseEnterTooltip = () => {
-    // Keep it open
+    // Keep open - reactivate hover state
+    if (activeTooltipIndex !== null) {
+      setHoveredIndex(activeTooltipIndex);
+    }
   };
 
-  const handleMouseLeaveTooltip = () => {
-    if (!isExpanded) setActiveTooltipIndex(null);
+  const handleMouseLeaveTooltip = (e: React.MouseEvent) => {
+    // Check if mouse went back to a segment
+    const relatedTarget = e.relatedTarget as HTMLElement;
+    const isGoingToSegment = relatedTarget?.closest?.('[data-segment]');
+
+    if (isGoingToSegment) {
+      // Mouse going back to timeline - segment will handle it
+      return;
+    }
+
+    // Mouse went elsewhere - close
+    if (!isExpanded) {
+      setHoveredIndex(null);
+      setActiveTooltipIndex(null);
+    }
   };
 
   const handleEntryClick = useCallback((entry: TimelineEntry) => {
@@ -238,12 +266,13 @@ function Timeline({ tabId, sessionId, cwd }: TimelineProps) {
               <div
                 key={entry.uuid}
                 ref={el => segmentRefs.current[index] = el}
+                data-segment
                 className="relative flex-1 min-h-[4px] w-full flex items-center justify-center cursor-pointer transition-colors"
                 style={{
                   backgroundColor: active ? 'rgba(59, 130, 246, 0.15)' : 'transparent',
                 }}
                 onMouseEnter={() => handleMouseEnterSegment(index)}
-                onMouseLeave={handleMouseLeaveSegment}
+                onMouseLeave={(e) => handleMouseLeaveSegment(e)}
                 onClick={() => handleEntryClick(entry)}
                 onContextMenu={(e) => handleRightClick(e, entry)}
               >
@@ -278,42 +307,34 @@ function Timeline({ tabId, sessionId, cwd }: TimelineProps) {
         {/* Tooltip Portal */}
         {activeTooltipIndex !== null && currentActiveEntry && (
           <TooltipPortal>
-            {/* Bridge Container: invisible area between timeline and tooltip */}
             <div
+              ref={tooltipRef}
               onMouseEnter={handleMouseEnterTooltip}
-              onMouseLeave={handleMouseLeaveTooltip}
+              onMouseLeave={(e) => handleMouseLeaveTooltip(e)}
               style={{
                 position: 'fixed',
-                right: `${notesPanelWidth + 4}px`, // Place right at the sidebar edge
+                right: `${notesPanelWidth + 32}px`,
                 top: `${getElementCenterY(activeTooltipIndex)}px`,
                 transform: 'translateY(-50%)',
-                paddingRight: '30px', // The invisible bridge
-                marginRight: '-20px', // Pull content back to actual desired position
                 zIndex: 10000,
+                backgroundColor: 'rgba(25, 25, 25, 0.98)',
+                backdropFilter: 'blur(12px)',
+                border: '1px solid rgba(255, 255, 255, 0.1)',
+                borderRadius: '6px',
+                padding: '10px 14px',
+                fontSize: '12px',
+                color: 'white',
+                minWidth: '240px',
+                maxWidth: '320px',
+                maxHeight: isExpanded ? '60vh' : '200px',
+                boxShadow: '0 15px 35px rgba(0,0,0,0.6)',
                 display: 'flex',
-                alignItems: 'center'
+                flexDirection: 'column',
+                gap: '8px',
+                transition: 'max-height 0.2s ease-in-out',
+                overflow: 'hidden'
               }}
             >
-              <div
-                style={{
-                  backgroundColor: 'rgba(25, 25, 25, 0.98)',
-                  backdropFilter: 'blur(12px)',
-                  border: '1px solid rgba(255, 255, 255, 0.1)',
-                  borderRadius: '6px',
-                  padding: '10px 14px',
-                  fontSize: '12px',
-                  color: 'white',
-                  minWidth: '240px',
-                  maxWidth: '320px',
-                  maxHeight: isExpanded ? '60vh' : '200px',
-                  boxShadow: '0 15px 35px rgba(0,0,0,0.6)',
-                  display: 'flex',
-                  flexDirection: 'column',
-                  gap: '8px',
-                  transition: 'max-height 0.2s ease-in-out',
-                  overflow: 'hidden'
-                }}
-              >
                 {currentActiveEntry.type === 'compact' ? (
                   <span className="text-amber-400 font-medium">History Compacted ({currentActiveEntry.preTokens ? `${Math.round(currentActiveEntry.preTokens/1000)}k` : '?'} tokens)</span>
                 ) : (
@@ -345,7 +366,6 @@ function Timeline({ tabId, sessionId, cwd }: TimelineProps) {
                     </div>
                   </>
                 )}
-              </div>
             </div>
           </TooltipPortal>
         )}
