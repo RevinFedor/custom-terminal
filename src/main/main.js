@@ -609,6 +609,17 @@ const PASTE_START = '\x1b[200~';
 const PASTE_END = '\x1b[201~';
 
 // Send input to terminal
+// Force command-started signal (for Claude commands that bypass OSC 133 detection)
+ipcMain.on('terminal:force-command-started', (event, tabId) => {
+  console.log('[Force Command Started] Tab:', tabId);
+  const state = terminalCommandState.get(tabId) || { isRunning: false, lastCommand: null };
+  state.isRunning = true;
+  terminalCommandState.set(tabId, state);
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('terminal:command-started', { tabId });
+  }
+});
+
 ipcMain.on('terminal:input', async (event, tabId, data) => {
   const term = terminals.get(tabId);
   if (!term) {
@@ -2203,6 +2214,21 @@ ipcMain.handle('claude:get-timeline', async (event, { sessionId, cwd }) => {
           continue;
         }
 
+        // Skip meta messages (isMeta: true) - these are Claude internal markers
+        if (entry.isMeta) {
+          skippedSystem++;
+          continue;
+        }
+
+        // Skip local command artifacts - these appear after /compact and other slash commands
+        if (rawContent.includes('<command-name>') ||
+            rawContent.includes('<local-command-stdout>') ||
+            rawContent.includes('<local-command-stderr>') ||
+            rawContent.startsWith('Caveat: The messages below')) {
+          skippedSystem++;
+          continue;
+        }
+
         // Clean up bracketed paste escape sequences [200~ and ~]
         let cleanContent = rawContent
           .replace(/\[200~/g, '')
@@ -2591,6 +2617,11 @@ ipcMain.on('claude:run-command', (event, { tabId, command, sessionId, forkSessio
         // Enable thinking mode detection (will send Tab when '>' prompt appears)
         claudeState.set(tabId, 'WAITING_PROMPT');
         term.write(`claude --dangerously-skip-permissions --resume ${sessionId}\r`);
+
+        // Signal that command started (for Timeline visibility)
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('terminal:command-started', { tabId });
+        }
       } else {
         console.error('[Claude Runner] No sessionId for claude-c');
       }

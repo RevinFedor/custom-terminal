@@ -140,15 +140,23 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
   const handleContinueSession = (sessionId?: string) => {
     const targetSessionId = sessionId || activeTab?.claudeSessionId;
     console.log('[TerminalArea] handleContinueSession called, activeTab:', activeTab?.id, 'sessionId:', targetSessionId);
-    
+
     if (activeTab?.id && targetSessionId) {
       console.log('[TerminalArea] Clearing interrupted state and sending command');
       // Clear the interrupted state
       clearInterruptedState(activeTab.id);
+
+      // Set command type to 'claude' for Timeline visibility
+      const setTabCommandType = useWorkspaceStore.getState().setTabCommandType;
+      setTabCommandType(activeTab.id, 'claude');
+
       // Send command to terminal
       const cmd = `claude --dangerously-skip-permissions --resume ${targetSessionId}\r`;
       console.log('[TerminalArea] Sending terminal:input:', cmd);
       ipcRenderer.send('terminal:input', activeTab.id, cmd);
+
+      // Signal command started immediately for Timeline visibility
+      ipcRenderer.send('terminal:force-command-started', activeTab.id);
     } else {
       console.log('[TerminalArea] handleContinueSession: Missing activeTab or sessionId!');
     }
