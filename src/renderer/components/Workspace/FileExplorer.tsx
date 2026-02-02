@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { createPortal } from 'react-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useUIStore } from '../../store/useUIStore';
+import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import FileIcon from '../UI/FileIcon';
 
 const { ipcRenderer } = window.require('electron');
@@ -128,17 +129,20 @@ function FileTreeItem({ item, level, onFileClick, fontSize }: FileTreeItemProps)
 
 interface FileExplorerProps {
   projectPath: string;
+  projectId: string;
 }
 
-export default function FileExplorer({ projectPath }: FileExplorerProps) {
-  const { fileExplorerOpen, setFileExplorerOpen, openFilePreview, showToast, sidebarFontSize } = useUIStore();
+export default function FileExplorer({ projectPath, projectId }: FileExplorerProps) {
+  const { showToast, sidebarFontSize } = useUIStore();
+  const { getSidebarState, setSidebarOpen, setOpenFilePath } = useWorkspaceStore();
+  const { sidebarOpen } = getSidebarState(projectId);
   const [rootItems, setRootItems] = useState<FileItem[]>([]);
 
   useEffect(() => {
-    if (fileExplorerOpen && projectPath) {
+    if (sidebarOpen && projectPath) {
       loadRootDirectory();
     }
-  }, [fileExplorerOpen, projectPath]);
+  }, [sidebarOpen, projectPath]);
 
   const loadRootDirectory = async () => {
     try {
@@ -180,7 +184,10 @@ export default function FileExplorer({ projectPath }: FileExplorerProps) {
         const ext = path.extname(filePath).toLowerCase();
         const language = detectLanguage(ext);
 
-        openFilePreview({
+        // Store file path in per-project state (for persistence)
+        setOpenFilePath(projectId, filePath);
+        // Also update UI store for FilePreview component
+        useUIStore.getState().openFilePreview({
           path: filePath,
           content: result.content,
           language
@@ -195,7 +202,7 @@ export default function FileExplorer({ projectPath }: FileExplorerProps) {
 
   return createPortal(
     <AnimatePresence>
-      {fileExplorerOpen && (
+      {sidebarOpen && (
         <motion.div
           initial={{ x: -250 }}
           animate={{ x: 0 }}
@@ -219,7 +226,7 @@ export default function FileExplorer({ projectPath }: FileExplorerProps) {
             <span style={{ fontSize: 11, color: '#888', fontWeight: 'bold', textTransform: 'uppercase' }}>Explorer</span>
             <button
               style={{ color: '#888', fontSize: 18, background: 'none', border: 'none', cursor: 'pointer' }}
-              onClick={() => setFileExplorerOpen(false)}
+              onClick={() => setSidebarOpen(projectId, false)}
             >
               ×
             </button>
