@@ -8,6 +8,11 @@ export type TabColor = 'default' | 'red' | 'yellow' | 'green' | 'blue' | 'purple
 
 export type CommandType = 'generic' | 'devServer' | 'claude' | 'gemini';
 
+// Helper: Check if tab has an interrupted AI session that can be resumed
+export const isTabInterrupted = (tab: { wasInterrupted?: boolean; claudeSessionId?: string; geminiSessionId?: string }): boolean => {
+  return !!(tab.wasInterrupted && (tab.claudeSessionId || tab.geminiSessionId));
+};
+
 // Typed pending action - executed after terminal is ready
 export interface PendingAction {
   type: 'claude-fork' | 'claude-continue' | 'gemini-fork' | 'gemini-continue' | 'shell-command';
@@ -785,17 +790,13 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
 
   setTabCommandType: (tabId, commandType) => {
     const { openProjects } = get();
-    console.log('[setTabCommandType] called: tabId=', tabId, 'commandType=', commandType);
 
     // Find tab across all projects
     for (const [projectId, workspace] of openProjects) {
       const tab = workspace.tabs.get(tabId);
       if (tab) {
-        console.log('[setTabCommandType] Found tab:', tab.name, 'current commandType:', tab.commandType);
-
         // Only set commandType and rename if not already set (first run only)
         const isFirstRun = !tab.commandType;
-        console.log('[setTabCommandType] isFirstRun=', isFirstRun);
         tab.commandType = commandType;
 
         // Auto-rename on first run
@@ -813,11 +814,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
 
           if (baseName) {
             const newName = getNextAvailableName(baseName, existingNames);
-            console.log('[setTabCommandType] AUTO-RENAME:', tab.name, '->', newName);
             tab.name = newName;
           }
-        } else {
-          console.log('[setTabCommandType] Skipping rename (not first run)');
         }
 
         // Auto-color on first run (if not manually set)

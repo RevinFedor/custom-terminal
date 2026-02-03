@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, memo, useCallback } from 'react';
-import { useWorkspaceStore, TabColor } from '../../store/useWorkspaceStore';
+import { useWorkspaceStore, TabColor, isTabInterrupted } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import { useUIStore } from '../../store/useUIStore';
 // Removed: framer-motion import - was causing lag on project switch
@@ -347,9 +347,6 @@ const TabItem = memo(({
     // Horizontal tabs: border on top. Vertical tabs: border on left
     borderTop: isHorizontal ? getTopBorder() : 'none',
     borderLeft: !isHorizontal ? getLeftBorder() : 'none',
-    // Gap between tabs to separate borders visually (especially for dashed lines)
-    marginRight: isHorizontal ? '1px' : '0',
-    marginBottom: !isHorizontal ? '1px' : '0',
     opacity: isDragging ? 0.5 : 1,
     transition: 'color 0.15s ease, background-color 0.15s ease',
   };
@@ -1082,7 +1079,7 @@ function TabBar({ projectId }: TabBarProps) {
                     Drag tabs here
                   </div>
                 ) : (
-                  <div className="flex flex-col">
+                  <div className="flex flex-col gap-[1px]">
                     {utilityTabs.map((tab, index) => (
                       <TabItem
                         key={tab.id}
@@ -1116,7 +1113,7 @@ function TabBar({ projectId }: TabBarProps) {
                         hasProcess={processStatus.get(tab.id) || false}
                         commandType={tab.commandType}
                         onRestart={handleRestart}
-                        isInterrupted={tab.wasInterrupted && !!(tab.claudeSessionId || tab.geminiSessionId)}
+                        isInterrupted={isTabInterrupted(tab)}
                       />
                     ))}
                   </div>
@@ -1146,7 +1143,7 @@ function TabBar({ projectId }: TabBarProps) {
               />
             ) : (
               /* Tabs */
-              <div className="flex items-stretch h-full flex-shrink-0">
+              <div className="flex items-stretch h-full flex-shrink-0 gap-[1px]">
                 {mainTabs.map((tab, index) => (
                   <TabItem
                     key={tab.id}
@@ -1178,7 +1175,7 @@ function TabBar({ projectId }: TabBarProps) {
                     hasProcess={processStatus.get(tab.id) || false}
                     commandType={tab.commandType}
                     onRestart={handleRestart}
-                    isInterrupted={tab.wasInterrupted && !!(tab.claudeSessionId || tab.geminiSessionId)}
+                    isInterrupted={isTabInterrupted(tab)}
                   />
                 ))}
               </div>

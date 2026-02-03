@@ -22,8 +22,8 @@ import createDebug from 'debug';
 
 // Enable specific categories by default for development
 // Change this line to enable/disable debug categories
-if (typeof window !== 'undefined') {
-  localStorage.debug = 'app:tabs'; // Debug tab rename issue
+if (typeof window !== 'undefined' && !localStorage.debug) {
+  localStorage.debug = ''; // No debug by default
 }
 
 // Define all log categories
