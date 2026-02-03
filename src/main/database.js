@@ -173,6 +173,18 @@ class DatabaseManager {
         created_at INTEGER DEFAULT (strftime('%s', 'now'))
       )
     `);
+
+    // Fork markers table - tracks where sessions were forked for Timeline visualization
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS fork_markers (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        source_session_id TEXT NOT NULL,
+        message_uuid TEXT NOT NULL,
+        forked_to_session_id TEXT NOT NULL,
+        created_at INTEGER DEFAULT (strftime('%s', 'now')),
+        UNIQUE(source_session_id, message_uuid, forked_to_session_id)
+      )
+    `);
   }
 
   // ========== APP STATE ========== 
@@ -404,6 +416,54 @@ transaction(tabs);
     return this.db.prepare('SELECT * FROM bookmarks WHERE id = ?').get(id);
   }
   deleteBookmark(id) { this.db.prepare('DELETE FROM bookmarks WHERE id = ?').run(id); }
+
+  // ========== FORK MARKERS ==========
+
+  /**
+   * Save a fork marker when a session is forked
+   * @param {string} sourceSessionId - Original session UUID
+   * @param {string} messageUuid - UUID of the message where fork happened
+   * @param {string} forkedToSessionId - New session UUID
+   */
+  saveForkMarker(sourceSessionId, messageUuid, forkedToSessionId) {
+    try {
+      this.db.prepare(`
+        INSERT OR IGNORE INTO fork_markers (source_session_id, message_uuid, forked_to_session_id)
+        VALUES (?, ?, ?)
+      `).run(sourceSessionId, messageUuid, forkedToSessionId);
+      console.log('[DB] Fork marker saved:', { sourceSessionId, messageUuid, forkedToSessionId });
+    } catch (e) {
+      console.error('[DB] Failed to save fork marker:', e);
+    }
+  }
+
+  /**
+   * Get fork origin for a session (to show blue line on Timeline where it was forked from)
+   * @param {string} sessionId - Session UUID (the forked/child session)
+   * @returns {Array<{message_uuid: string, source_session_id: string}>}
+   */
+  getForkMarkers(sessionId) {
+    // Search by forked_to_session_id - we want to show the fork point on the CHILD session
+    return this.db.prepare(`
+      SELECT message_uuid, source_session_id, created_at
+      FROM fork_markers
+      WHERE forked_to_session_id = ?
+      ORDER BY created_at
+    `).all(sessionId);
+  }
+
+  /**
+   * Get parent session (where this session was forked from)
+   * @param {string} sessionId - Session UUID
+   * @returns {{source_session_id: string, message_uuid: string} | null}
+   */
+  getParentSession(sessionId) {
+    return this.db.prepare(`
+      SELECT source_session_id, message_uuid
+      FROM fork_markers
+      WHERE forked_to_session_id = ?
+    `).get(sessionId) || null;
+  }
 
   close() { this.db.close(); }
 }

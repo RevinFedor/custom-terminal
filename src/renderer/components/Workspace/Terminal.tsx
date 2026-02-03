@@ -1120,6 +1120,18 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
             return false;
           }
 
+          // --- CASE 5: claude --resume <ID> (direct resume command) ---
+          console.log('[Claude Intercept 2] Checking for --resume pattern in:', fullLine);
+          const resumeMatch = fullLine.match(/claude\s+.*--resume\s+([a-f0-9-]{8,})/i);
+          console.log('[Claude Intercept 2] Resume match result:', resumeMatch);
+          if (resumeMatch) {
+            const sessionId = resumeMatch[1];
+            console.log('[Claude Intercept 2] Direct --resume detected, sessionId:', sessionId);
+            getSetTabCommandType()(tabId, 'claude');
+            getSetClaudeSessionId()(tabId, sessionId);
+            // Let the command pass through, but set commandType for Timeline
+          }
+
           return true;
         });
 

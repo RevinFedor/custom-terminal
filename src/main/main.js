@@ -2201,17 +2201,70 @@ ipcMain.handle('claude:fork-session-file', async (event, { sourceSessionId, cwd 
       return { success: false, error: 'Source session is empty' };
     }
 
+    // Read source file to get last USER message UUID for fork marker
+    // Important: must be a 'user' type message because Timeline only shows user messages
+    let lastUserMessageUuid = null;
+    try {
+      const content = fs.readFileSync(sourcePath, 'utf-8');
+      const lines = content.trim().split('\n').filter(l => l.trim());
+      // Find last USER record (Timeline only shows user messages, so fork point must be on a user entry)
+      for (let i = lines.length - 1; i >= 0; i--) {
+        try {
+          const record = JSON.parse(lines[i]);
+          if (record.type === 'user' && record.uuid && !record.isSidechain && !record.isMeta) {
+            // Also check it's not a tool_result
+            const content = record.message?.content;
+            const isToolResult = Array.isArray(content) && content.some(item => item.type === 'tool_result');
+            if (!isToolResult) {
+              lastUserMessageUuid = record.uuid;
+              break;
+            }
+          }
+        } catch {}
+      }
+      console.log('[Claude Fork] Last USER message UUID:', lastUserMessageUuid);
+    } catch (e) {
+      console.warn('[Claude Fork] Could not read last message UUID:', e.message);
+    }
+
     // Copy the file
     fs.copyFileSync(sourcePath, destPath);
     console.log('[Claude Fork] Copied:', sourcePath, '->', destPath);
 
+    // Save fork marker in database
+    if (lastUserMessageUuid) {
+      try {
+        projectManager.db.saveForkMarker(sourceSessionId, lastUserMessageUuid, newSessionId);
+        console.log('[Claude Fork] Fork marker saved');
+      } catch (e) {
+        console.warn('[Claude Fork] Could not save fork marker:', e.message);
+      }
+    }
+
     // Wait for Claude to index the new file
     await new Promise(resolve => setTimeout(resolve, 500));
 
-    return { success: true, newSessionId };
+    return { success: true, newSessionId, forkPointUuid: lastUserMessageUuid };
   } catch (error) {
     console.error('[Claude Fork] Error:', error);
     return { success: false, error: error.message };
+  }
+});
+
+// Get fork markers for a session (for Timeline blue lines)
+ipcMain.handle('claude:get-fork-markers', async (event, { sessionId }) => {
+  console.log('[Fork Markers] Getting markers for session:', sessionId);
+  if (!sessionId) return { success: false, error: 'No session ID', markers: [] };
+  try {
+    const markers = projectManager.db.getForkMarkers(sessionId);
+    console.log('[Fork Markers] Found:', markers.length, 'markers');
+    if (markers.length > 0) {
+      console.log('[Fork Markers] Markers:', JSON.stringify(markers));
+    }
+    return { success: true, markers };
+  } catch (error) {
+    console.error('[Fork Markers] Error:', error);
+    return { success: false, error: error.message, markers: [] };
   }
 });
 
@@ -2823,10 +2876,43 @@ ipcMain.on('claude:run-command', (event, { tabId, command, sessionId, forkSessio
           // Copy to the SAME directory where source was found
           const destPath = path.join(sourceDir, `${newSessionId}.jsonl`);
 
+          // Read source file to find last USER message UUID for fork marker
+          let lastUserMessageUuid = null;
+          try {
+            const content = fs.readFileSync(sourcePath, 'utf-8');
+            const lines = content.trim().split('\n').filter(l => l.trim());
+            for (let i = lines.length - 1; i >= 0; i--) {
+              try {
+                const record = JSON.parse(lines[i]);
+                if (record.type === 'user' && record.uuid && !record.isSidechain && !record.isMeta) {
+                  const msgContent = record.message?.content;
+                  const isToolResult = Array.isArray(msgContent) && msgContent.some(item => item.type === 'tool_result');
+                  if (!isToolResult) {
+                    lastUserMessageUuid = record.uuid;
+                    break;
+                  }
+                }
+              } catch {}
+            }
+            console.log('[Claude Runner] Last USER message UUID:', lastUserMessageUuid);
+          } catch (e) {
+            console.warn('[Claude Runner] Could not read last message UUID:', e.message);
+          }
+
           fs.copyFileSync(sourcePath, destPath);
           console.log('[Claude Runner] Copied session file, new ID:', newSessionId);
           console.log('[Claude Runner] From:', sourcePath);
           console.log('[Claude Runner] To:', destPath);
+
+          // Save fork marker in database
+          if (lastUserMessageUuid) {
+            try {
+              projectManager.db.saveForkMarker(forkSessionId, lastUserMessageUuid, newSessionId);
+              console.log('[Claude Runner] Fork marker saved');
+            } catch (e) {
+              console.warn('[Claude Runner] Could not save fork marker:', e.message);
+            }
+          }
 
           // Run claude --resume in CURRENT terminal (not new tab!)
           // This is for claude-f <uuid> - resuming external session
