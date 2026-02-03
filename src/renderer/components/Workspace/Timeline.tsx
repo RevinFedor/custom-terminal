@@ -94,16 +94,11 @@ function Timeline({ tabId, sessionId, cwd }: TimelineProps) {
         ipcRenderer.invoke('claude:get-fork-markers', { sessionId })
       ]);
 
-      console.log('[Timeline] Loaded entries:', timelineResult.entries?.length);
-      console.log('[Timeline] Fork markers result:', markersResult);
 
       if (timelineResult.success) {
         setEntries(timelineResult.entries);
       }
       if (markersResult.success && markersResult.markers?.length > 0) {
-        console.log('[Timeline] Setting fork markers:', markersResult.markers);
-        console.log('[Timeline] Fork marker UUIDs count:', markersResult.markers.map((m: ForkMarker) => m.entry_uuids?.length));
-        console.log('[Timeline] Current entries count:', timelineResult.entries?.length);
         setForkMarkers(markersResult.markers);
       }
     } catch (error) {
@@ -196,7 +191,6 @@ function Timeline({ tabId, sessionId, cwd }: TimelineProps) {
       
       if (result.success) {
         await navigator.clipboard.writeText(result.content);
-        console.log('[Timeline] Range copied to clipboard');
       }
     } catch (error) {
       console.error('[Timeline] Range copy failed:', error);

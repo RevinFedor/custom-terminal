@@ -272,6 +272,7 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
   const isReadyRef = useRef(false); // Track if first fit completed
   const hasBeenActive = useRef(false); // Track if tab was ever active (for lazy init)
   const isCreatingRef = useRef(false); // Lock to prevent double initialization
+  const activeRef = useRef(active); // Track current active state for ResizeObserver closure
   const pendingBuffer = useRef<string>(''); // Buffer PTY data before xterm init
   const [isVisible, setIsVisible] = useState(false); // Hide until ready
   const [showScrollButton, setShowScrollButton] = useState(false); // Show "scroll to bottom" button
@@ -281,6 +282,11 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
   const pendingActionExecuted = useRef(false); // Track if pendingAction was executed
 
   const terminalFontSize = useUIStore((state) => state.terminalFontSize);
+
+  // Keep activeRef in sync with active prop for ResizeObserver closure
+  useEffect(() => {
+    activeRef.current = active;
+  }, [active]);
 
   // Check if terminal is scrolled up (not at bottom)
   const checkScrollPosition = useCallback(() => {
@@ -441,8 +447,8 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
         return;
       }
 
-      // Only fit if active, wrapped in rAF to prevent layout thrashing
-      if (active) {
+      // Only fit if active (use ref to get current value, not stale closure)
+      if (activeRef.current) {
         window.requestAnimationFrame(() => {
           safeFit();
         });
@@ -874,15 +880,11 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
   // Focus and fit when becoming active (with rAF to let browser paint first)
   // Also handles lazy initialization on first activation
   useEffect(() => {
-    console.log('[Scroll:EFFECT] tabId=%s | active=%s isActiveProject=%s hasXterm=%s',
-      tabId, active, isActiveProject, !!xtermInstance.current);
-
     if (!active || !isActiveProject) {
       // Clear global selection when terminal becomes inactive
       if (!active) {
         getSetTerminalSelection()('');
       }
-      console.log('[Scroll:EFFECT] Skipping (not active or not active project)');
       return;
     }
 
@@ -1168,35 +1170,20 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
       const savedPos = savedScrollPosition.current;
       const buffer = term.buffer.active;
 
-      console.log('[Scroll:RESTORE] tabId=%s | saved: wasAtBottom=%s pos=%s | current: viewportY=%s baseY=%s',
-        tabId, savedWasAtBottom, savedPos, buffer.viewportY, buffer.baseY);
-
       requestAnimationFrame(() => {
-        const bufferAfterRAF = term.buffer.active;
         // CRITICAL FIX: If terminal was at bottom when deactivated, scroll to bottom
         // This handles the case where data arrived while terminal was hidden
         // (xterm.js bug: viewportY resets to 0 when writing to hidden terminal)
         // See: docs/knowledge/fix-scroll-position-hidden-terminal.md
         if (savedWasAtBottom) {
-          console.log('[Scroll:ACTION] scrollToBottom (wasAtBottom=true) | before: viewportY=%s baseY=%s',
-            bufferAfterRAF.viewportY, bufferAfterRAF.baseY);
           term.scrollToBottom();
         } else if (savedPos !== null) {
           // Terminal was scrolled up - restore exact position
-          console.log('[Scroll:ACTION] scrollToLine(%s) (user was scrolled up)', savedPos);
           term.scrollToLine(savedPos);
         } else {
           // Fallback: no saved position, scroll to bottom
-          console.log('[Scroll:ACTION] scrollToBottom (fallback, no saved position)');
           term.scrollToBottom();
         }
-
-        // Log final position after scroll
-        setTimeout(() => {
-          const finalBuffer = term.buffer.active;
-          console.log('[Scroll:FINAL] viewportY=%s baseY=%s isAtBottom=%s',
-            finalBuffer.viewportY, finalBuffer.baseY, finalBuffer.viewportY >= finalBuffer.baseY);
-        }, 50);
 
         // Reset saved state
         savedScrollPosition.current = null;
@@ -1217,8 +1204,6 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
         const buffer = term.buffer.active;
         savedScrollPosition.current = buffer.viewportY;
         wasAtBottom.current = buffer.viewportY >= buffer.baseY;
-        console.log('[Scroll:SAVE] tabId=%s | viewportY=%s baseY=%s wasAtBottom=%s',
-          tabId, buffer.viewportY, buffer.baseY, wasAtBottom.current);
       }
     };
   }, [active, isActiveProject, tabId]);

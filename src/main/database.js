@@ -92,6 +92,9 @@ class DatabaseManager {
     try {
       this.db.exec(`ALTER TABLE tabs ADD COLUMN notes TEXT DEFAULT NULL`);
     } catch (e) { /* column already exists */ }
+    try {
+      this.db.exec(`ALTER TABLE tabs ADD COLUMN command_type TEXT DEFAULT NULL`);
+    } catch (e) { /* column already exists */ }
 
     // Project sidebar state
     try {
@@ -241,6 +244,7 @@ class DatabaseManager {
         cwd: t.cwd,
         color: t.color || undefined,
         isUtility: t.is_utility === 1,
+        commandType: t.command_type || undefined,
         claudeSessionId: t.claude_session_id || undefined,
         geminiSessionId: t.gemini_session_id || undefined,
         wasInterrupted: t.was_interrupted === 1,
@@ -334,13 +338,13 @@ class DatabaseManager {
   saveTabs(projectId, tabs) {
     this.db.prepare('DELETE FROM tabs WHERE project_id = ?').run(projectId);
     const insert = this.db.prepare(`
-      INSERT INTO tabs (project_id, name, cwd, position, color, is_utility, claude_session_id, gemini_session_id, was_interrupted, overlay_dismissed, notes)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO tabs (project_id, name, cwd, position, color, is_utility, command_type, claude_session_id, gemini_session_id, was_interrupted, overlay_dismissed, notes)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     const transaction = this.db.transaction((tabList) => {
       tabList.forEach((tab, index) => {
-        insert.run(projectId, tab.name, tab.cwd, index, tab.color || null, tab.isUtility ? 1 : 0, tab.claudeSessionId || null, tab.geminiSessionId || null, tab.wasInterrupted ? 1 : 0, tab.overlayDismissed ? 1 : 0, tab.notes || '');
+        insert.run(projectId, tab.name, tab.cwd, index, tab.color || null, tab.isUtility ? 1 : 0, tab.commandType || null, tab.claudeSessionId || null, tab.geminiSessionId || null, tab.wasInterrupted ? 1 : 0, tab.overlayDismissed ? 1 : 0, tab.notes || '');
       });
     });
 transaction(tabs);
