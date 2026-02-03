@@ -22,8 +22,8 @@ import createDebug from 'debug';
 
 // Enable specific categories by default for development
 // Change this line to enable/disable debug categories
-if (typeof window !== 'undefined' && !localStorage.debug) {
-  localStorage.debug = 'app:gemini'; // Temporary: debug Gemini session capture
+if (typeof window !== 'undefined') {
+  localStorage.debug = 'app:tabs'; // Debug tab rename issue
 }
 
 // Define all log categories

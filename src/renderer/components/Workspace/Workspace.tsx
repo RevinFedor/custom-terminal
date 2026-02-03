@@ -256,17 +256,8 @@ export default function Workspace() {
   // 2. A command is currently running (detected via OSC 133 Shell Integration)
   const showTimeline = !filePreview && claudeSessionId && activeTab?.commandType === 'claude' && isCommandRunning;
 
-  // DEBUG: Log all Timeline visibility conditions
-  console.log('[Timeline Debug] ==================');
-  console.log('[Timeline Debug] activeTabId:', activeTab?.id);
-  console.log('[Timeline Debug] currentView:', currentView, '-> === terminal:', currentView === 'terminal');
-  console.log('[Timeline Debug] filePreview:', filePreview, '-> !filePreview:', !filePreview);
-  console.log('[Timeline Debug] claudeSessionId:', claudeSessionId);
-  console.log('[Timeline Debug] commandType:', activeTab?.commandType, '-> === claude:', activeTab?.commandType === 'claude');
-  console.log('[Timeline Debug] isCommandRunning:', isCommandRunning);
-  console.log('[Timeline Debug] RESULT showTimeline:', showTimeline);
-  console.log('[Timeline Debug] FINAL RENDER:', currentView === 'terminal' && showTimeline);
-  console.log('[Timeline Debug] ==================');
+  // DEBUG: Uncomment to debug Timeline visibility
+  // console.log('[Timeline Debug] showTimeline:', showTimeline, 'claudeSessionId:', claudeSessionId, 'commandType:', activeTab?.commandType, 'isRunning:', isCommandRunning);
 
   return (
     <div className="flex-1 flex h-full overflow-hidden relative">
@@ -384,7 +375,7 @@ export default function Workspace() {
         <div className="flex-1 flex flex-col min-w-0 border-l border-border-main">
           {/* ProjectToolbar Row */}
           <div className="h-[30px] border-b border-border-main">
-            <ProjectToolbar width={notesPanelWidth} />
+            <ProjectToolbar />
           </div>
 
           {/* Notes Panel Content */}

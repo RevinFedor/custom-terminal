@@ -347,6 +347,9 @@ const TabItem = memo(({
     // Horizontal tabs: border on top. Vertical tabs: border on left
     borderTop: isHorizontal ? getTopBorder() : 'none',
     borderLeft: !isHorizontal ? getLeftBorder() : 'none',
+    // Gap between tabs to separate borders visually (especially for dashed lines)
+    marginRight: isHorizontal ? '1px' : '0',
+    marginBottom: !isHorizontal ? '1px' : '0',
     opacity: isDragging ? 0.5 : 1,
     transition: 'color 0.15s ease, background-color 0.15s ease',
   };
@@ -974,6 +977,22 @@ function TabBar({ projectId }: TabBarProps) {
     });
   }, []);
 
+  // Convert vertical scroll to horizontal (non-passive to allow preventDefault)
+  useEffect(() => {
+    const scrollContainer = scrollContainerRef.current;
+    if (!scrollContainer) return;
+
+    const handleWheel = (e: WheelEvent) => {
+      if (e.deltaY !== 0) {
+        e.preventDefault();
+        scrollContainer.scrollLeft += e.deltaY;
+      }
+    };
+
+    scrollContainer.addEventListener('wheel', handleWheel, { passive: false });
+    return () => scrollContainer.removeEventListener('wheel', handleWheel);
+  }, []);
+
   return (
     <>
       {/* Single row TabBar */}
@@ -1118,13 +1137,6 @@ function TabBar({ projectId }: TabBarProps) {
               overflowY: 'hidden',
               minWidth: 0,
               flexShrink: 1,
-            }}
-            onWheel={(e) => {
-              // Convert vertical scroll to horizontal (works with and without Shift)
-              if (scrollContainerRef.current && e.deltaY !== 0) {
-                e.preventDefault();
-                scrollContainerRef.current.scrollLeft += e.deltaY;
-              }
             }}
           >
             {mainTabs.length === 0 ? (

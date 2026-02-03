@@ -1,18 +1,14 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { Home, Minimize2, Play, ChevronDown } from 'lucide-react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
+import { Home, Minimize2, Play, ChevronDown, RotateCcw } from 'lucide-react';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { compressLogs } from '../../utils/compressLogs';
 
 const { ipcRenderer } = window.require('electron');
 
-interface ProjectToolbarProps {
-  width: number;
-}
-
-export default function ProjectToolbar({ width }: ProjectToolbarProps) {
+export default function ProjectToolbar() {
   const { currentView, setCurrentView, showToast } = useUIStore();
-  const { activeProjectId, getActiveTab, openProjects } = useWorkspaceStore();
+  const { activeProjectId, getActiveTab, openProjects, clearInterruptedState, setTabCommandType } = useWorkspaceStore();
 
   // Get active tab ID to trigger updates when switching tabs
   const activeTabId = activeProjectId
@@ -24,6 +20,57 @@ export default function ProjectToolbar({ width }: ProjectToolbarProps) {
   const dropdownRef = useRef<HTMLDivElement>(null);
 
   const isHomeActive = currentView === 'home';
+
+  // Get interrupted tabs for CURRENT project only
+  const interruptedTabs = useMemo(() => {
+    if (!activeProjectId) return [];
+
+    const workspace = openProjects.get(activeProjectId);
+    if (!workspace) return [];
+
+    const tabs: Array<{
+      id: string;
+      claudeSessionId?: string;
+      geminiSessionId?: string;
+    }> = [];
+
+    workspace.tabs.forEach((tab) => {
+      if (tab.wasInterrupted && (tab.claudeSessionId || tab.geminiSessionId)) {
+        tabs.push({
+          id: tab.id,
+          claudeSessionId: tab.claudeSessionId,
+          geminiSessionId: tab.geminiSessionId,
+        });
+      }
+    });
+
+    return tabs;
+  }, [openProjects, activeProjectId]);
+
+  // Resume all interrupted sessions
+  const handleResumeAll = () => {
+    if (interruptedTabs.length === 0) return;
+
+    interruptedTabs.forEach((tab) => {
+      // Clear interrupted state
+      clearInterruptedState(tab.id);
+
+      // Send resume command based on session type
+      if (tab.claudeSessionId) {
+        setTabCommandType(tab.id, 'claude');
+        const cmd = `claude --dangerously-skip-permissions --resume ${tab.claudeSessionId}\r`;
+        ipcRenderer.send('terminal:input', tab.id, cmd);
+        ipcRenderer.send('terminal:force-command-started', tab.id);
+      } else if (tab.geminiSessionId) {
+        setTabCommandType(tab.id, 'gemini');
+        const cmd = `gemini -s ${tab.geminiSessionId}\r`;
+        ipcRenderer.send('terminal:input', tab.id, cmd);
+        ipcRenderer.send('terminal:force-command-started', tab.id);
+      }
+    });
+
+    showToast(`Resumed ${interruptedTabs.length} session(s)`, 'success');
+  };
 
   // Track current terminal directory for scripts
   const [terminalCwd, setTerminalCwd] = useState<string | null>(null);
@@ -207,8 +254,7 @@ export default function ProjectToolbar({ width }: ProjectToolbarProps) {
 
   return (
     <div
-      className="h-[30px] bg-panel flex items-stretch border-l border-border-main"
-      style={{ width }}
+      className="h-[30px] w-full bg-panel flex items-stretch"
     >
       {/* Home Button */}
       <button
@@ -270,6 +316,52 @@ export default function ProjectToolbar({ width }: ProjectToolbarProps) {
         <Minimize2 size={14} className={isCompressing ? 'animate-pulse' : ''} />
         <span>Logs</span>
       </button>
+
+      {/* Resume All Interrupted Sessions Button - only shows when there are interrupted tabs */}
+      {interruptedTabs.length > 0 && (
+        <button
+          onClick={handleResumeAll}
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            gap: '6px',
+            padding: '0 12px',
+            height: '100%',
+            fontSize: '13px',
+            color: '#fff',
+            backgroundColor: 'rgba(59, 130, 246, 0.3)',
+            borderTop: '2px solid #3b82f6',
+            borderBottom: 'none',
+            borderLeft: 'none',
+            borderRight: 'none',
+            cursor: 'pointer',
+            transition: 'all 0.15s ease',
+            outline: 'none',
+          }}
+          onMouseEnter={(e) => {
+            e.currentTarget.style.backgroundColor = 'rgba(59, 130, 246, 0.5)';
+          }}
+          onMouseLeave={(e) => {
+            e.currentTarget.style.backgroundColor = 'rgba(59, 130, 246, 0.3)';
+          }}
+          title={`Resume all ${interruptedTabs.length} interrupted session(s)`}
+        >
+          <RotateCcw size={14} />
+          <span>all</span>
+          <span
+            style={{
+              backgroundColor: 'rgba(59, 130, 246, 0.4)',
+              padding: '0 6px',
+              borderRadius: '4px',
+              fontSize: '10px',
+              fontWeight: 500,
+            }}
+          >
+            {interruptedTabs.length}
+          </span>
+        </button>
+      )}
     </div>
   );
 }

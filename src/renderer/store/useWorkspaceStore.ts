@@ -75,8 +75,8 @@ interface WorkspaceStore {
   closeProject: (projectId: string) => Promise<void>;
 
   // Tab management
-  createTab: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string }) => Promise<string>;
-  createTabAfterCurrent: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string }) => Promise<string>;
+  createTab: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string }) => Promise<string>;
+  createTabAfterCurrent: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string }) => Promise<string>;
   closeTab: (projectId: string, tabId: string) => Promise<void>;
   switchTab: (projectId: string, tabId: string) => void;
   renameTab: (projectId: string, tabId: string, newName: string) => void;
@@ -177,6 +177,7 @@ const saveTabs = (projectId: string, tabs: Map<string, Tab>) => {
     cwd: tab.cwd,
     color: tab.color,
     isUtility: tab.isUtility,
+    commandType: tab.commandType, // Preserve to prevent auto-rename on resume
     claudeSessionId: tab.claudeSessionId,
     geminiSessionId: tab.geminiSessionId,
     wasInterrupted: tab.wasInterrupted,
@@ -417,6 +418,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           await createTab(projectId, savedTab.name, savedTab.cwd, {
             color: savedTab.color,
             isUtility: savedTab.isUtility,
+            commandType: savedTab.commandType,
             claudeSessionId: savedTab.claudeSessionId,
             geminiSessionId: savedTab.geminiSessionId,
             wasInterrupted: savedTab.wasInterrupted,
@@ -521,6 +523,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       cwd: cwd || workspace.projectPath || process.env.HOME || '~',
       color: options?.color,
       isUtility: options?.isUtility,
+      commandType: options?.commandType,
       pendingAction: options?.pendingAction,
       claudeSessionId: options?.claudeSessionId,
       geminiSessionId: options?.geminiSessionId,
@@ -584,6 +587,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       cwd: cwd || workspace.projectPath || process.env.HOME || '~',
       color: options?.color,
       isUtility: options?.isUtility,
+      commandType: options?.commandType,
       pendingAction: options?.pendingAction,
       claudeSessionId: options?.claudeSessionId,
       geminiSessionId: options?.geminiSessionId,
@@ -781,16 +785,17 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
 
   setTabCommandType: (tabId, commandType) => {
     const { openProjects } = get();
-    log.tabs('setTabCommandType called: tabId=%s, commandType=%s', tabId, commandType);
+    console.log('[setTabCommandType] called: tabId=', tabId, 'commandType=', commandType);
 
     // Find tab across all projects
     for (const [projectId, workspace] of openProjects) {
       const tab = workspace.tabs.get(tabId);
       if (tab) {
-        log.tabs('Found tab, current state: name=%s, color=%s, colorSetManually=%s', tab.name, tab.color, tab.colorSetManually);
+        console.log('[setTabCommandType] Found tab:', tab.name, 'current commandType:', tab.commandType);
 
         // Only set commandType and rename if not already set (first run only)
         const isFirstRun = !tab.commandType;
+        console.log('[setTabCommandType] isFirstRun=', isFirstRun);
         tab.commandType = commandType;
 
         // Auto-rename on first run
@@ -808,9 +813,11 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
 
           if (baseName) {
             const newName = getNextAvailableName(baseName, existingNames);
-            log.tabs('Auto-renaming tab from %s to %s', tab.name, newName);
+            console.log('[setTabCommandType] AUTO-RENAME:', tab.name, '->', newName);
             tab.name = newName;
           }
+        } else {
+          console.log('[setTabCommandType] Skipping rename (not first run)');
         }
 
         // Auto-color on first run (if not manually set)
