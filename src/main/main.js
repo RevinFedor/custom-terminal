@@ -2514,9 +2514,11 @@ ipcMain.handle('claude:get-timeline', async (event, { sessionId, cwd }) => {
   }
 });
 
-// Export Claude session as clean text (without code content)
-ipcMain.handle('claude:export-clean-session', async (event, { sessionId, cwd }) => {
+// Export Claude session as clean text (with options and backtrace)
+ipcMain.handle('claude:export-clean-session', async (event, { sessionId, cwd, includeCode = false, fromStart = true }) => {
+  console.log('[Claude Export] ========================================');
   console.log('[Claude Export] Exporting session:', sessionId);
+  console.log('[Claude Export] Options:', { includeCode, fromStart, cwd });
 
   if (!sessionId) {
     return { success: false, error: 'No session ID provided' };
@@ -2528,7 +2530,6 @@ ipcMain.handle('claude:export-clean-session', async (event, { sessionId, cwd }) 
     // Find session file
     let sourcePath = null;
 
-    // Try cwd-based path first
     if (cwd) {
       const projectSlug = cwd.replace(/\//g, '-');
       const primaryPath = path.join(claudeProjectsDir, projectSlug, `${sessionId}.jsonl`);
@@ -2537,7 +2538,6 @@ ipcMain.handle('claude:export-clean-session', async (event, { sessionId, cwd }) 
       }
     }
 
-    // Search all directories if not found
     if (!sourcePath && fs.existsSync(claudeProjectsDir)) {
       const projectDirs = fs.readdirSync(claudeProjectsDir, { withFileTypes: true })
         .filter(dirent => dirent.isDirectory())
@@ -2557,175 +2557,217 @@ ipcMain.handle('claude:export-clean-session', async (event, { sessionId, cwd }) 
     }
 
     // Read and parse JSONL
-    const content = fs.readFileSync(sourcePath, 'utf-8');
-    const lines = content.trim().split('\n').filter(line => line.trim());
+    const fileContent = fs.readFileSync(sourcePath, 'utf-8');
+    const allRecords = fileContent.trim().split('\n')
+      .filter(line => line.trim())
+      .map(line => {
+        try { return JSON.parse(line); }
+        catch (e) { return null; }
+      })
+      .filter(Boolean);
+
+    // 1. Build UUID -> Record Map
+    const recordMap = new Map();
+    allRecords.forEach(r => recordMap.set(r.uuid, r));
+    console.log('[Claude Export] Total records in file:', allRecords.length);
+    console.log('[Claude Export] UUID map size:', recordMap.size);
+
+    // 2. BACKTRACE: Find the active branch starting from the last message
+    // Filter for user or assistant messages only for finding the "head"
+    const contentRecords = allRecords.filter(r => r.type === 'user' || r.type === 'assistant');
+    console.log('[Claude Export] Content records (user/assistant):', contentRecords.length);
+
+    if (contentRecords.length === 0) {
+      console.log('[Claude Export] Empty session - no content records');
+      return { success: true, content: '# Empty session' };
+    }
+
+    let currentUuid = contentRecords[contentRecords.length - 1].uuid;
+    console.log('[Claude Export] Starting backtrace from UUID:', currentUuid);
+
+    const activeBranch = [];
+    let backtraceSteps = 0;
+
+    while (currentUuid) {
+      const record = recordMap.get(currentUuid);
+      if (!record) {
+        console.log('[Claude Export] Backtrace ended - UUID not found:', currentUuid);
+        break;
+      }
+
+      activeBranch.unshift(record);
+      backtraceSteps++;
+
+      // Stop if we hit a fork point AND fromStart is false
+      // A fork point is typically where parentUuid is null but logicalParentUuid exists (compact)
+      // or if it's just a resume point.
+      if (!fromStart && (record.type === 'system' && record.subtype === 'compact_boundary')) {
+        console.log('[Claude Export] Stopping at compact_boundary (fromStart=false)');
+        break;
+      }
+
+      currentUuid = record.parentUuid || record.logicalParentUuid;
+    }
+
+    console.log('[Claude Export] Backtrace complete:', {
+      steps: backtraceSteps,
+      activeBranchSize: activeBranch.length
+    });
 
     const outputParts = [];
     outputParts.push(`# Claude Session Export`);
     outputParts.push(`Session: ${sessionId}`);
     outputParts.push(`CWD: ${cwd || 'unknown'}`);
     outputParts.push(`Exported: ${new Date().toISOString()}`);
+    outputParts.push(`Options: includeCode=${includeCode}, fromStart=${fromStart}`);
     outputParts.push('');
 
-    // Helper: format tool_use as short action
-    const formatToolAction = (toolName, input) => {
+    // Helper: format tool_use
+    const formatToolAction = (toolName, input, toolResult = null) => {
+      let label = '';
       switch (toolName) {
-        case 'Read':
-          return `📄 Чтение (${input.file_path || '?'})`;
-        case 'Edit':
-          return `✏️ Редактирование (${input.file_path || '?'})`;
-        case 'Write':
-          return `📝 Создание (${input.file_path || '?'})`;
-        case 'Bash':
+        case 'Read': label = `📄 Чтение (${input.file_path || '?'})`; break;
+        case 'Edit': label = `✏️ Редактирование (${input.file_path || '?'})`; break;
+        case 'Write': label = `📝 Создание (${input.file_path || '?'})`; break;
+        case 'Bash': 
           const cmd = (input.command || '').substring(0, 50);
-          return `🖥 Команда ("${cmd}${input.command?.length > 50 ? '...' : ''}")`;
-        case 'Glob':
-          return `🔍 Поиск файлов (${input.pattern || '?'})`;
-        case 'Grep':
-          return `🔍 Поиск в коде (${input.pattern || '?'})`;
-        case 'Task':
-          return `🤖 Подзадача (${input.description || '?'})`;
-        case 'WebFetch':
-          return `🌐 Веб-запрос`;
-        case 'WebSearch':
-          return `🔎 Веб-поиск (${input.query || '?'})`;
-        case 'TodoWrite':
-          return null; // Skip
-        default:
-          return `⚙️ ${toolName}`;
+          label = `🖥 Команда ("${cmd}${input.command?.length > 50 ? '...' : ''}")`; 
+          break;
+        case 'Glob': label = `🔍 Поиск файлов (${input.pattern || '?'})`; break;
+        case 'Grep': label = `🔍 Поиск в коде (${input.pattern || '?'})`; break;
+        default: label = `⚙️ ${toolName}`;
       }
+
+      if (!includeCode) return label;
+
+      // If including code, add the content if available
+      let detail = '';
+      if (toolName === 'Read' && toolResult?.content) {
+        detail = `\n\`\`\`\n${toolResult.content}\n\`\`\``;
+      } else if ((toolName === 'Edit' || toolName === 'Write') && input.content) {
+        detail = `\n\`\`\`\n${input.content}\n\`\`\``;
+      } else if (toolName === 'Bash' && toolResult?.content) {
+        detail = `\n\`\`\`\n${toolResult.content}\n\`\`\``;
+      }
+
+      return `${label}${detail}`;
     };
 
-    for (const line of lines) {
-      try {
-        const entry = JSON.parse(line);
+    // Process the active branch
+    for (let i = 0; i < activeBranch.length; i++) {
+      const entry = activeBranch[i];
 
-        // Skip sidechain entries (internal Claude operations)
-        if (entry.isSidechain) continue;
+      if (entry.isSidechain || entry.type === 'summary') continue;
 
-        // Skip summary type (internal)
-        if (entry.type === 'summary') continue;
+      if (entry.type === 'user') {
+        let rawContent = entry.message?.content;
 
-        // Handle user messages
-        if (entry.type === 'user') {
-          let rawContent = entry.message?.content;
-
-          // Skip tool_result entries - these are automatic, not user input
-          if (Array.isArray(rawContent)) {
-            const hasToolResult = rawContent.some(item => item.type === 'tool_result');
-            if (hasToolResult) continue;
-
-            const textBlock = rawContent.find(item => item.type === 'text' && item.text);
-            rawContent = textBlock?.text || null;
-          }
-
-          if (!rawContent || typeof rawContent !== 'string') continue;
-
-          // Skip system messages
-          if (rawContent === '[Request interrupted by user]' ||
-              rawContent.startsWith('[Request interrupted') ||
-              rawContent === '[User cancelled]') continue;
-
-          // Skip system artifacts
-          if (rawContent.includes('<command-name>') ||
-              rawContent.includes('<command-message>') ||
-              rawContent.includes('<local-command-stdout>') ||
-              rawContent.includes('<system-reminder>') ||
-              rawContent.includes('<bash-notification>') ||
-              rawContent.startsWith('Caveat: The messages below')) continue;
-
-          // Clean up bracketed paste escape sequences
-          let cleanContent = rawContent
-            .replace(/\[200~/g, '')
-            .replace(/~\]/g, '')
-            .trim();
-
-          if (!cleanContent) continue;
-
-          outputParts.push('---');
-          outputParts.push('');
-          outputParts.push('👤 USER:');
-          outputParts.push(cleanContent);
-          outputParts.push('');
+        // tool_result entries are stored as user messages in JSONL
+        if (Array.isArray(rawContent) && rawContent.some(item => item.type === 'tool_result')) {
+          // If we are including code, these are handled by matching them to tool_use in formatToolAction
+          // or we can list them here. But cleaner to ignore them if they are just results of previous assistant tools.
+          continue;
         }
 
-        // Handle assistant messages
-        else if (entry.type === 'assistant') {
-          const msgContent = entry.message?.content;
-          if (!msgContent) continue;
-
-          let textContent = '';
-          const toolActions = [];
-
-          if (typeof msgContent === 'string') {
-            textContent = msgContent;
-          } else if (Array.isArray(msgContent)) {
-            const textParts = [];
-
-            for (const block of msgContent) {
-              // Include thinking blocks (shortened)
-              if (block.type === 'thinking' && block.thinking) {
-                // Truncate very long thinking
-                const thinking = block.thinking.length > 500
-                  ? block.thinking.substring(0, 500) + '...[truncated]'
-                  : block.thinking;
-                textParts.push(`<thinking>\n${thinking}\n</thinking>`);
-              }
-
-              // Include text blocks
-              if (block.type === 'text' && block.text) {
-                textParts.push(block.text);
-              }
-
-              // Collect tool actions
-              if (block.type === 'tool_use') {
-                const action = formatToolAction(block.name, block.input || {});
-                if (action) toolActions.push(action);
-              }
-            }
-
-            textContent = textParts.join('\n\n');
+        if (typeof rawContent !== 'string') {
+          if (Array.isArray(rawContent)) {
+            rawContent = rawContent.find(item => item.type === 'text')?.text || null;
+          } else {
+            rawContent = null;
           }
+        }
 
-          // Only output if there's content
-          if (textContent.trim() || toolActions.length > 0) {
-            outputParts.push('🤖 CLAUDE:');
+        if (!rawContent) continue;
 
-            if (textContent.trim()) {
-              outputParts.push(textContent);
+        // Skip system-like messages
+        if (rawContent.startsWith('[Request interrupted') || rawContent === '[User cancelled]') continue;
+        if (rawContent.includes('<command-name>') || rawContent.includes('<local-command-stdout>')) continue;
+
+        let cleanContent = rawContent.replace(/\[200~/g, '').replace(/~\]/g, '').trim();
+        if (!cleanContent) continue;
+
+        outputParts.push('---');
+        outputParts.push('');
+        outputParts.push('👤 USER:');
+        outputParts.push(cleanContent);
+        outputParts.push('');
+      }
+
+      else if (entry.type === 'assistant') {
+        const msgContent = entry.message?.content;
+        if (!msgContent) continue;
+
+        let textContent = '';
+        const toolActions = [];
+
+        if (typeof msgContent === 'string') {
+          textContent = msgContent;
+        } else if (Array.isArray(msgContent)) {
+          const textParts = [];
+          for (const block of msgContent) {
+            if (block.type === 'thinking' && block.thinking) {
+              const thinking = block.thinking.length > 500 ? block.thinking.substring(0, 500) + '...[truncated]' : block.thinking;
+              textParts.push(`<thinking>\n${thinking}\n</thinking>`);
             }
+            if (block.type === 'text' && block.text) {
+              textParts.push(block.text);
+            }
+            if (block.type === 'tool_use') {
+              // Find matching tool_result in subsequent records
+              let toolResult = null;
+              if (includeCode) {
+                for (let j = i + 1; j < activeBranch.length; j++) {
+                  const nextEntry = activeBranch[j];
+                  if (nextEntry.type === 'user' && Array.isArray(nextEntry.message?.content)) {
+                    const res = nextEntry.message.content.find(c => c.type === 'tool_result' && c.tool_use_id === block.id);
+                    if (res) {
+                      toolResult = res;
+                      break;
+                    }
+                  }
+                }
+              }
+              const action = formatToolAction(block.name, block.input || {}, toolResult);
+              if (action) toolActions.push(action);
+            }
+          }
+          textContent = textParts.join('\n\n');
+        }
 
-            // Add actions summary on one line
-            if (toolActions.length > 0) {
+        if (textContent.trim() || toolActions.length > 0) {
+          outputParts.push('🤖 CLAUDE:');
+          if (textContent.trim()) outputParts.push(textContent);
+          if (toolActions.length > 0) {
+            if (includeCode) {
+              outputParts.push('\n**Actions:**\n' + toolActions.join('\n\n'));
+            } else {
               outputParts.push(`   [Действия: ${toolActions.join(', ')}]`);
             }
-
-            outputParts.push('');
-          }
-        }
-
-        // Handle compact boundaries
-        else if (entry.type === 'system' && entry.subtype === 'compact_boundary') {
-          outputParts.push('');
-          outputParts.push('═══ COMPACTED ═══');
-          if (entry.compactMetadata?.preTokens) {
-            outputParts.push(`(${entry.compactMetadata.preTokens} tokens compacted)`);
           }
           outputParts.push('');
         }
+      }
 
-      } catch (parseErr) {
-        console.warn('[Claude Export] Skipping malformed line');
+      else if (entry.type === 'system' && entry.subtype === 'compact_boundary') {
+        outputParts.push('');
+        outputParts.push('═══ COMPACTED ═══');
+        outputParts.push('');
       }
     }
 
-    const exportedText = outputParts.join('\n');
-    console.log('[Claude Export] Exported', exportedText.length, 'characters');
+    const finalContent = outputParts.join('\n');
+    console.log('[Claude Export] Export complete:', {
+      outputLines: outputParts.length,
+      totalLength: finalContent.length,
+      preview: finalContent.substring(0, 200) + '...'
+    });
+    console.log('[Claude Export] ========================================');
 
-    return { success: true, content: exportedText };
+    return { success: true, content: finalContent };
 
   } catch (error) {
     console.error('[Claude Export] Error:', error);
+    console.error('[Claude Export] Stack:', error.stack);
     return { success: false, error: error.message };
   }
 });
