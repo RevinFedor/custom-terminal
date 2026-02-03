@@ -43,6 +43,7 @@ interface ProjectTabItemProps {
   fontSize: number;
   forceRightIndicator?: boolean;
   activeProcessCount?: number; // Count of running processes in project
+  interruptedCount?: number; // Count of interrupted (paused) sessions in project
   isEditing: boolean;
   editValue: string;
   onEditChange: (val: string) => void;
@@ -64,6 +65,7 @@ const ProjectTabItem = memo(({
   fontSize,
   forceRightIndicator = false,
   activeProcessCount = 0,
+  interruptedCount = 0,
   isEditing,
   editValue,
   onEditChange,
@@ -222,6 +224,21 @@ const ProjectTabItem = memo(({
             }}
           >
             {activeProcessCount}
+          </span>
+        )}
+        {interruptedCount > 0 && !isEditing && (
+          <span
+            className="flex items-center justify-center text-[10px] font-medium rounded-full"
+            style={{
+              minWidth: '16px',
+              height: '16px',
+              padding: '0 4px',
+              backgroundColor: isActive ? 'rgba(59, 130, 246, 0.3)' : 'rgba(59, 130, 246, 0.2)',
+              color: isActive ? '#1e40af' : '#3b82f6',
+            }}
+            title="Interrupted sessions - click tab to resume"
+          >
+            {interruptedCount}
           </span>
         )}
       </span>
@@ -804,6 +821,14 @@ function App() {
               if (processStatus.get(tabId)) activeCount++;
             });
 
+            // Count interrupted (paused) sessions
+            let interruptedCount = 0;
+            workspace.tabs.forEach((tab) => {
+              if (tab.wasInterrupted && (tab.claudeSessionId || tab.geminiSessionId)) {
+                interruptedCount++;
+              }
+            });
+
             return (
               <ProjectTabItem
                 key={projectId}
@@ -814,6 +839,7 @@ function App() {
                 fontSize={projectTabsFontSize}
                 forceRightIndicator={isLast && projectEmptyZoneHovered}
                 activeProcessCount={activeCount}
+                interruptedCount={interruptedCount}
                 isEditing={editingProjectId === projectId}
                 editValue={projectEditValue}
                 onEditChange={setProjectEditValue}
