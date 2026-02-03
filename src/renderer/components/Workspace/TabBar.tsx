@@ -160,9 +160,10 @@ interface TabItemProps {
   zone: 'main' | 'utility';
   projectId: string; // For cross-project drag
   isActive: boolean;
+  isSelected: boolean; // Added for multi-select
   isEditing: boolean;
   editValue: string;
-  onSwitch: () => void;
+  onSwitch: (e: React.MouseEvent) => void; // Pass event for modifier checks
   onClose: (e: React.MouseEvent) => void;
   onDoubleClick: () => void;
   onContextMenu: (e: React.MouseEvent) => void;
@@ -183,6 +184,7 @@ const TabItem = memo(({
   zone,
   projectId,
   isActive,
+  isSelected,
   isEditing,
   editValue,
   onSwitch,
@@ -255,28 +257,53 @@ const TabItem = memo(({
   const hasColor = tab.color && tab.color !== 'default';
 
   const getBgColor = () => {
-    // Colored tabs always show their background
+    // Active tab always gets its proper background
+    if (isActive) {
+      if (hasColor) {
+        return colorConfig.bgColor;
+      }
+      return 'rgba(255,255,255,0.08)';
+    }
+    // Selected but NOT active tabs
+    if (isSelected) {
+      if (hasColor) {
+        // Slightly brighter version of the tab color
+        const match = colorConfig.bgColor.match(/rgba?\((\d+),\s*(\d+),\s*(\d+),?\s*([\d.]+)?\)/);
+        if (match) {
+          const [, r, g, b, a = '0.2'] = match;
+          const newAlpha = Math.min(parseFloat(a) + 0.1, 0.4);
+          return `rgba(${r}, ${g}, ${b}, ${newAlpha})`;
+        }
+        return colorConfig.bgColor;
+      }
+      return 'rgba(255,255,255,0.06)';
+    }
+    // Hovered tabs
+    if (isHovered) {
+      if (hasColor) {
+        return colorConfig.bgColor;
+      }
+      return 'rgba(255,255,255,0.05)';
+    }
+    // Colored tabs always show subtle background
     if (hasColor) {
       return colorConfig.bgColor;
-    }
-    // Default tabs: background only when active or hovered
-    if (isActive) {
-      return 'rgba(255,255,255,0.05)';
-    }
-    if (isHovered) {
-      return 'rgba(255,255,255,0.05)';
     }
     return 'transparent';
   };
 
-  // Border for ACTIVE tabs (always reserve 2px space to avoid jump)
+  // Border/indicator ONLY for ACTIVE tab (not selected)
   const getActiveBorder = () => {
-    if (!isActive) {
-      return '2px solid transparent';
+    if (isActive) {
+      // Only active tab gets the colored line indicator
+      const borderColor = !hasColor ? 'rgba(255,255,255,0.7)' : colorConfig.borderColor;
+      return `2px solid ${borderColor}`;
     }
-    // Active default tab = brighter white line
-    const borderColor = !hasColor ? 'rgba(255,255,255,0.7)' : colorConfig.borderColor;
-    return `2px solid ${borderColor}`;
+    // Selected but not active - subtle dashed outline to show selection
+    if (isSelected) {
+      return '2px dashed rgba(255,255,255,0.3)';
+    }
+    return '2px solid transparent';
   };
 
   // Build inline styles - full control to avoid Tailwind conflicts
@@ -292,7 +319,7 @@ const TabItem = memo(({
     fontSize: `${fontSize}px`,
     height: '30px', // Same height for all tabs
     minWidth: isHorizontal ? 'auto' : '160px',
-    color: (isActive || isHovered) ? '#fff' : '#888',
+    color: (isActive || isHovered || isSelected) ? '#fff' : '#888',
     backgroundColor: getBgColor(),
     // Horizontal tabs: border on top. Vertical tabs: border on left
     borderTop: isHorizontal ? getActiveBorder() : 'none',
@@ -306,7 +333,7 @@ const TabItem = memo(({
       ref={ref}
       className="group"
       style={tabStyle}
-      onClick={onSwitch}
+      onClick={(e) => onSwitch(e)}
       onDoubleClick={onDoubleClick}
       onContextMenu={onContextMenu}
       onMouseEnter={() => setIsHovered(true)}
@@ -544,10 +571,15 @@ function TabBar({ projectId }: TabBarProps) {
   const toggleTabUtility = useWorkspaceStore((state) => state.toggleTabUtility);
   const reorderInZone = useWorkspaceStore((state) => state.reorderInZone);
   const moveTabToZone = useWorkspaceStore((state) => state.moveTabToZone);
+  const toggleTabSelection = useWorkspaceStore((state) => state.toggleTabSelection);
+  const selectTabRange = useWorkspaceStore((state) => state.selectTabRange);
+  const clearSelection = useWorkspaceStore((state) => state.clearSelection);
+  
   const { projects } = useProjectsStore();
   const tabsFontSize = useUIStore((state) => state.tabsFontSize);
   const currentView = useUIStore((state) => state.currentView);
   const setCurrentView = useUIStore((state) => state.setCurrentView);
+  const showToast = useUIStore((state) => state.showToast);
 
   const [editingTabId, setEditingTabId] = useState<string | null>(null);
   const [editValue, setEditValue] = useState('');
@@ -563,6 +595,20 @@ function TabBar({ projectId }: TabBarProps) {
 
   const workspace = openProjects.get(projectId);
   const project = projects[projectId];
+
+  // Selection state
+  const selectedTabIds = workspace?.selectedTabIds || [];
+  const isMultiSelect = selectedTabIds.length > 1;
+
+  const handleTabClick = (e: React.MouseEvent, tabId: string) => {
+    if (e.shiftKey) {
+      selectTabRange(projectId, tabId);
+    } else if (e.metaKey || e.ctrlKey) {
+      toggleTabSelection(projectId, tabId, true);
+    } else {
+      switchTab(projectId, tabId);
+    }
+  };
 
   // OSC 133 Event-driven process status (replaces polling)
   // Initial load + listen for command start/finish events
@@ -1003,15 +1049,22 @@ function TabBar({ projectId }: TabBarProps) {
                         zone="utility"
                         projectId={projectId}
                         isActive={currentView === 'terminal' && workspace.activeTabId === tab.id}
+                        isSelected={selectedTabIds.includes(tab.id)}
                         isEditing={editingTabId === tab.id}
                         editValue={editValue}
-                        onSwitch={() => {
-                          switchTab(projectId, tab.id);
-                          setUtilityExpanded(false); // Close dropdown on tab click
+                        onSwitch={(e) => {
+                          handleTabClick(e, tab.id);
+                          if (!e.shiftKey && !e.metaKey && !e.ctrlKey) {
+                            setUtilityExpanded(false); // Close dropdown only on direct switch
+                          }
                           setCurrentView('terminal');
                         }}
                         onClose={() => closeTab(projectId, tab.id)} // Close tab, not move to main
-                        onDoubleClick={() => handleDoubleClick(tab.id, tab.name)}
+                        onDoubleClick={() => {
+                      if (!isMultiSelect) {
+                        handleDoubleClick(tab.id, tab.name);
+                      }
+                    }}
                         onContextMenu={(e) => handleContextMenu(e, tab.id)}
                         onEditChange={setEditValue}
                         onEditSubmit={handleRenameSubmit}
@@ -1066,14 +1119,19 @@ function TabBar({ projectId }: TabBarProps) {
                     zone="main"
                     projectId={projectId}
                     isActive={currentView === 'terminal' && workspace.activeTabId === tab.id}
+                    isSelected={selectedTabIds.includes(tab.id)}
                     isEditing={editingTabId === tab.id}
                     editValue={editValue}
-                    onSwitch={() => {
-                      switchTab(projectId, tab.id);
+                    onSwitch={(e) => {
+                      handleTabClick(e, tab.id);
                       setCurrentView('terminal');
                     }}
                     onClose={(e) => handleCloseTab(e, tab.id)}
-                    onDoubleClick={() => handleDoubleClick(tab.id, tab.name)}
+                    onDoubleClick={() => {
+                      if (!isMultiSelect) {
+                        handleDoubleClick(tab.id, tab.name);
+                      }
+                    }}
                     onContextMenu={(e) => handleContextMenu(e, tab.id)}
                     onEditChange={setEditValue}
                     onEditSubmit={handleRenameSubmit}
@@ -1120,81 +1178,111 @@ function TabBar({ projectId }: TabBarProps) {
           onClick={(e) => e.stopPropagation()}
           onMouseDown={(e) => e.stopPropagation()}
         >
-          {/* Close Tab */}
-          <button
-            className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2"
-            onClick={handleContextClose}
-          >
-            Close Tab
-          </button>
-
-          {/* Rename */}
-          <button
-            className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2"
-            onClick={handleContextRename}
-          >
-            Rename
-          </button>
-
-          {/* Color - submenu */}
-          <div className="relative group/color">
-            <button
-              className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center justify-between"
-            >
-              <span>Color</span>
-              <span className="text-[#666]">›</span>
-            </button>
-            {/* Color submenu */}
-            <div className="absolute left-full top-0 -ml-2 pl-2 hidden group-hover/color:block">
-              <div className="bg-[#2a2a2a] border border-[#444] rounded-xl shadow-2xl py-2 min-w-[140px]">
-                {TAB_COLORS.map((c) => {
-                  const isSelected = workspace.tabs.get(contextMenu.tabId)?.color === c.color ||
-                    (!workspace.tabs.get(contextMenu.tabId)?.color && c.color === 'default');
-                  return (
-                    <button
-                      key={c.color}
-                      className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-3"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        handleSetColor(c.color);
-                      }}
-                    >
-                      <span
-                        style={{
-                          width: '12px',
-                          height: '12px',
-                          borderRadius: '50%',
-                          border: `2px solid ${c.borderColor}`,
-                          backgroundColor: c.bgColor,
-                        }}
-                      />
-                      <span>{c.label.replace(/^. /, '')}</span>
-                      {isSelected && <span className="ml-auto text-white">✓</span>}
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-          </div>
-
-          {/* Separator */}
-          <div className="my-1 border-t border-[#444]" />
-
-          {/* Copy ID/Path */}
+          {/* Close Tab(s) */}
           <button
             className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2"
             onClick={() => {
-              const tab = workspace.tabs.get(contextMenu.tabId);
-              if (tab) {
-                const sessionId = tab.claudeSessionId || tab.geminiSessionId || 'no-session';
-                const path = tab.cwd || project.path || '/';
-                const text = `${sessionId}\n${path}`;
-                navigator.clipboard.writeText(text);
+              if (isMultiSelect) {
+                // Confirm closing multiple tabs
+                if (window.confirm(`Close ${selectedTabIds.length} tabs?`)) {
+                  selectedTabIds.forEach(id => closeTab(projectId, id));
+                }
+              } else {
+                handleContextClose();
               }
               setContextMenu(null);
             }}
           >
-            Copy ID/Path
+            {isMultiSelect ? `Close ${selectedTabIds.length} Tabs` : 'Close Tab'}
+          </button>
+
+          {!isMultiSelect && (
+            <>
+              {/* Rename */}
+              <button
+                className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2"
+                onClick={handleContextRename}
+              >
+                Rename
+              </button>
+
+              {/* Color - submenu */}
+              <div className="relative group/color">
+                <button
+                  className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center justify-between"
+                >
+                  <span>Color</span>
+                  <span className="text-[#666]">›</span>
+                </button>
+                {/* Color submenu */}
+                <div className="absolute left-full top-0 -ml-2 pl-2 hidden group-hover/color:block">
+                  <div className="bg-[#2a2a2a] border border-[#444] rounded-xl shadow-2xl py-2 min-w-[140px]">
+                    {TAB_COLORS.map((c) => {
+                      const isSelected = workspace.tabs.get(contextMenu.tabId)?.color === c.color ||
+                        (!workspace.tabs.get(contextMenu.tabId)?.color && c.color === 'default');
+                      return (
+                        <button
+                          key={c.color}
+                          className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-3"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleSetColor(c.color);
+                          }}
+                        >
+                          <span
+                            style={{
+                              width: '12px',
+                              height: '12px',
+                              borderRadius: '50%',
+                              border: `2px solid ${c.borderColor}`,
+                              backgroundColor: c.bgColor,
+                            }}
+                          />
+                          <span>{c.label.replace(/^. /, '')}</span>
+                          {isSelected && <span className="ml-auto text-white">✓</span>}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              </div>
+            </>
+          )}
+
+          {/* Separator */}
+          <div className="my-1 border-t border-[#444]" />
+
+          {/* Copy Session(s) */}
+          <button
+            className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2"
+            onClick={() => {
+              if (isMultiSelect) {
+                // Copy all selected tabs' session IDs + cwds
+                const lines: string[] = [];
+                selectedTabIds.forEach(tabId => {
+                  const tab = workspace.tabs.get(tabId);
+                  if (tab) {
+                    const sessionId = tab.claudeSessionId || tab.geminiSessionId || 'no-session';
+                    const path = tab.cwd || project?.path || '/';
+                    lines.push(`${sessionId}\ncwd: ${path}`);
+                  }
+                });
+                navigator.clipboard.writeText(lines.join('\n\n'));
+                showToast(`Copied ${selectedTabIds.length} sessions`, 'success');
+              } else {
+                const tab = workspace.tabs.get(contextMenu.tabId);
+                if (tab) {
+                  const sessionId = tab.claudeSessionId || tab.geminiSessionId || 'no-session';
+                  const path = tab.cwd || project?.path || '/';
+                  const text = `${sessionId}\ncwd: ${path}`;
+                  navigator.clipboard.writeText(text);
+                  showToast('Session ID copied', 'success');
+                }
+              }
+              setContextMenu(null);
+            }}
+          >
+            {isMultiSelect ? `Copy ${selectedTabIds.length} Sessions` : 'Copy ID/Path'}
           </button>
         </div>
       )}

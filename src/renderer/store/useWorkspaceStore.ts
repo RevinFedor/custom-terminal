@@ -37,6 +37,7 @@ interface ProjectWorkspace {
   projectPath: string;
   tabs: Map<string, Tab>;
   activeTabId: string | null;
+  selectedTabIds: string[]; // List of selected tab IDs for multi-action
   tabCounter: number;
   sidebarOpen: boolean;
   openFilePath: string | null;
@@ -79,6 +80,12 @@ interface WorkspaceStore {
   closeTab: (projectId: string, tabId: string) => Promise<void>;
   switchTab: (projectId: string, tabId: string) => void;
   renameTab: (projectId: string, tabId: string, newName: string) => void;
+
+  // Selection
+  toggleTabSelection: (projectId: string, tabId: string, multi?: boolean) => void;
+  selectTabRange: (projectId: string, tabId: string) => void;
+  clearSelection: (projectId: string) => void;
+  getSelectedTabs: (projectId: string) => Tab[];
 
   // Reorder tabs
   reorderTabs: (projectId: string, oldIndex: number, newIndex: number) => void;
@@ -299,6 +306,63 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     get().saveSession();
   },
 
+  toggleTabSelection: (projectId, tabId, multi = false) => {
+    const { openProjects } = get();
+    const workspace = openProjects.get(projectId);
+    if (!workspace) return;
+
+    let newSelected: string[];
+    if (multi) {
+      // Toggle individual tab in selection
+      if (workspace.selectedTabIds.includes(tabId)) {
+        newSelected = workspace.selectedTabIds.filter(id => id !== tabId);
+      } else {
+        newSelected = [...workspace.selectedTabIds, tabId];
+      }
+    } else {
+      // Single selection: clear others and set this one
+      newSelected = [tabId];
+    }
+
+    workspace.selectedTabIds = newSelected;
+    set({ openProjects: new Map(openProjects) });
+  },
+
+  selectTabRange: (projectId, tabId) => {
+    const { openProjects } = get();
+    const workspace = openProjects.get(projectId);
+    if (!workspace || !workspace.activeTabId) return;
+
+    const allTabIds = Array.from(workspace.tabs.keys());
+    const startIndex = allTabIds.indexOf(workspace.activeTabId);
+    const endIndex = allTabIds.indexOf(tabId);
+
+    if (startIndex === -1 || endIndex === -1) return;
+
+    const [start, end] = startIndex < endIndex ? [startIndex, endIndex] : [endIndex, startIndex];
+    const rangeIds = allTabIds.slice(start, end + 1);
+
+    workspace.selectedTabIds = Array.from(new Set([...workspace.selectedTabIds, ...rangeIds]));
+    set({ openProjects: new Map(openProjects) });
+  },
+
+  clearSelection: (projectId) => {
+    const { openProjects } = get();
+    const workspace = openProjects.get(projectId);
+    if (workspace) {
+      workspace.selectedTabIds = [];
+      set({ openProjects: new Map(openProjects) });
+    }
+  },
+
+  getSelectedTabs: (projectId) => {
+    const workspace = get().openProjects.get(projectId);
+    if (!workspace) return [];
+    return workspace.selectedTabIds
+      .map(id => workspace.tabs.get(id))
+      .filter(Boolean) as Tab[];
+  },
+
   showWorkspace: (projectId) => {
     const { projectHistory } = get();
     // Move to end of history (max 20)
@@ -336,6 +400,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         projectPath,
         tabs: new Map(),
         activeTabId: null,
+        selectedTabIds: [],
         tabCounter: 0, // Start from 0 for new projects
         sidebarOpen: projectData?.sidebarOpen || false,
         openFilePath: projectData?.openFilePath || null
@@ -653,6 +718,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
 
     if (workspace && workspace.tabs.has(tabId)) {
       workspace.activeTabId = tabId;
+      workspace.selectedTabIds = [tabId]; // Update selection on direct switch
       // Use startTransition to prevent UI blocking during re-render
       startTransition(() => {
         set({ openProjects: new Map(openProjects) });

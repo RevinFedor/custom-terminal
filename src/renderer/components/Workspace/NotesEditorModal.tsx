@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useRef, memo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { MarkdownEditor } from '@anthropic/markdown-editor';
 import '@anthropic/markdown-editor/styles.css';
@@ -14,10 +14,15 @@ interface EditorViewLike {
   focus: () => void;
 }
 
-export default function NotesEditorModal() {
-  const { notesEditorOpen, notesEditorProjectId, closeNotesEditor, showToast, wordWrap } = useUIStore();
-  const { openProjects } = useWorkspaceStore();
-  const { projects, updateProject } = useProjectsStore();
+function NotesEditorModal() {
+  // Only subscribe to what we need - avoid unnecessary rerenders from store changes
+  const notesEditorOpen = useUIStore((s) => s.notesEditorOpen);
+  const notesEditorProjectId = useUIStore((s) => s.notesEditorProjectId);
+  const closeNotesEditor = useUIStore((s) => s.closeNotesEditor);
+  const showToast = useUIStore((s) => s.showToast);
+  const wordWrap = useUIStore((s) => s.wordWrap);
+  const activeProjectId = useWorkspaceStore((s) => s.activeProjectId);
+  const updateProject = useProjectsStore((s) => s.updateProject);
 
   const [content, setContent] = useState('');
   const [projectPath, setProjectPath] = useState<string | null>(null);
@@ -27,21 +32,72 @@ export default function NotesEditorModal() {
   // EditorView ref for focus management
   const editorViewRef = useRef<EditorViewLike | null>(null);
 
-  // Load notes when modal opens
+  // Refs for sync effect (to access current values without re-triggering)
+  const hasChangesRef = useRef(hasChanges);
+  const contentRef = useRef(content);
+  hasChangesRef.current = hasChanges;
+  contentRef.current = content;
+
+  // DEBUG: Log renders
+  const renderCountRef = useRef(0);
+  renderCountRef.current++;
+  console.log('[NotesEditor] RENDER #', renderCountRef.current, {
+    notesEditorOpen,
+    notesEditorProjectId,
+    activeProjectId,
+    hasChanges,
+    contentLength: content.length
+  });
+
+  // Load notes when modal opens or project changes
+  // NOTE: Only depend on notesEditorOpen and notesEditorProjectId to avoid infinite loops
+  // when updateProject is called (which changes projects object)
   useEffect(() => {
+    console.log('[NotesEditor] useEffect:LOAD triggered', { notesEditorOpen, notesEditorProjectId });
     if (notesEditorOpen && notesEditorProjectId) {
-      const workspace = openProjects.get(notesEditorProjectId);
-      const project = projects[notesEditorProjectId];
+      // Get fresh data from stores (not from dependencies to avoid loops)
+      const currentProjects = useProjectsStore.getState().projects;
+      const currentOpenProjects = useWorkspaceStore.getState().openProjects;
+
+      const workspace = currentOpenProjects.get(notesEditorProjectId);
+      const project = currentProjects[notesEditorProjectId];
 
       if (workspace && project) {
         const notes = extractNotes(project.notes);
+        console.log('[NotesEditor] Loading notes, length:', notes.length);
         setContent(notes);
         setProjectPath(project.path || workspace.projectPath || null);
         setProjectName(project.name || 'Project');
         setHasChanges(false);
       }
     }
-  }, [notesEditorOpen, notesEditorProjectId, openProjects, projects]);
+  }, [notesEditorOpen, notesEditorProjectId]);
+
+  // Sync editor when switching projects - switch to new project's notes
+  // NOTE: Don't include updateProject/openNotesEditor in deps - use from store directly to avoid loops
+  useEffect(() => {
+    console.log('[NotesEditor] useEffect:SYNC triggered', {
+      notesEditorOpen,
+      activeProjectId,
+      notesEditorProjectId,
+      willSwitch: notesEditorOpen && activeProjectId && notesEditorProjectId && activeProjectId !== notesEditorProjectId
+    });
+
+    if (notesEditorOpen && activeProjectId && notesEditorProjectId && activeProjectId !== notesEditorProjectId) {
+      console.log('[NotesEditor] Project switched while editor open, syncing to new project:', activeProjectId);
+
+      // Save current changes before switching (use refs and direct store access)
+      if (hasChangesRef.current && notesEditorProjectId) {
+        console.log('[NotesEditor] Saving changes before switching');
+        ipcRenderer.invoke('project:save-note', { projectId: notesEditorProjectId, content: contentRef.current });
+        // Use direct store access to avoid dependency
+        useProjectsStore.getState().updateProject(notesEditorProjectId, { notes: contentRef.current });
+      }
+
+      // Switch to new project (use direct store access)
+      useUIStore.getState().openNotesEditor(activeProjectId);
+    }
+  }, [activeProjectId, notesEditorOpen, notesEditorProjectId]);
 
   // Auto-focus editor when modal opens
   useEffect(() => {
@@ -74,16 +130,16 @@ export default function NotesEditorModal() {
 
   // Save notes
   const saveNotes = useCallback(async () => {
-    if (!projectPath || !notesEditorProjectId) {
-      console.warn('[NotesEditor] Cannot save: No project path or ID');
+    if (!notesEditorProjectId) {
+      console.warn('[NotesEditor] Cannot save: No project ID');
       return;
     }
 
-    console.log('[NotesEditor] Saving notes for path:', projectPath, 'Content length:', content.length);
+    console.log('[NotesEditor] Saving notes for projectId:', notesEditorProjectId, 'Content length:', content.length);
     console.log('[NotesEditor] Content preview:', content.slice(0, 50));
 
     try {
-      const result = await ipcRenderer.invoke('project:save-note', { dirPath: projectPath, content });
+      const result = await ipcRenderer.invoke('project:save-note', { projectId: notesEditorProjectId, content });
       console.log('[NotesEditor] Save result:', result);
       
       // Update local store to reflect changes immediately
@@ -96,10 +152,11 @@ export default function NotesEditorModal() {
       console.error('[NotesEditor] Failed to save notes:', error);
       showToast('Ошибка сохранения', 'error');
     }
-  }, [projectPath, notesEditorProjectId, content, showToast, updateProject]);
+  }, [notesEditorProjectId, content, showToast, updateProject]);
 
   // Handle content change
   const handleChange = useCallback((newContent: string) => {
+    console.log('[NotesEditor] handleChange called, newContent length:', newContent.length, 'hasNewline:', newContent.includes('\n'));
     setContent(newContent);
     setHasChanges(true);
   }, []);
@@ -208,8 +265,16 @@ export default function NotesEditorModal() {
               </div>
             </div>
 
-            {/* Editor Container - ensure it takes full height */}
-            <div className="flex-1 overflow-hidden relative bg-[#1e1e2e]">
+            {/* Editor Container - CodeMirror handles its own scroll via .cm-scroller */}
+            <div
+              style={{
+                flex: 1,
+                minHeight: 0,
+                display: 'flex',
+                flexDirection: 'column',
+                backgroundColor: '#1e1e2e'
+              }}
+            >
               <MarkdownEditor
                 content={content}
                 onChange={handleChange}
@@ -225,3 +290,5 @@ export default function NotesEditorModal() {
     </AnimatePresence>
   );
 }
+
+export default memo(NotesEditorModal);

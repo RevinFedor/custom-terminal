@@ -35,9 +35,21 @@ const detectLanguage = (ext: string): string | null => {
 const path = window.require('path');
 
 export default function Workspace() {
-  const { activeProjectId, getActiveProject, getSidebarState } = useWorkspaceStore();
-  const { projects } = useProjectsStore();
-  const { filePreview, openFilePreview, closeFilePreview, openNotesEditor, notesEditorOpen, currentView, setCurrentView, notesPanelWidth } = useUIStore();
+  // Use selectors to avoid rerenders on unrelated store changes
+  const activeProjectId = useWorkspaceStore((s) => s.activeProjectId);
+  const getActiveProject = useWorkspaceStore((s) => s.getActiveProject);
+  const getSidebarState = useWorkspaceStore((s) => s.getSidebarState);
+  const projects = useProjectsStore((s) => s.projects);
+
+  // Use selectors to avoid rerenders on unrelated UIStore changes
+  const filePreview = useUIStore((s) => s.filePreview);
+  const openFilePreview = useUIStore((s) => s.openFilePreview);
+  const closeFilePreview = useUIStore((s) => s.closeFilePreview);
+  const openNotesEditor = useUIStore((s) => s.openNotesEditor);
+  const notesEditorOpen = useUIStore((s) => s.notesEditorOpen);
+  const currentView = useUIStore((s) => s.currentView);
+  const setCurrentView = useUIStore((s) => s.setCurrentView);
+  const notesPanelWidth = useUIStore((s) => s.notesPanelWidth);
   const [showSearch, setShowSearch] = useState(false);
   const [searchText, setSearchText] = useState('');
   const [searchResults, setSearchResults] = useState({ resultIndex: 0, resultCount: 0 });

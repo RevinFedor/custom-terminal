@@ -1,8 +1,14 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { createPortal } from 'react-dom';
 import { useUIStore } from '../../../store/useUIStore';
 import { useWorkspaceStore } from '../../../store/useWorkspaceStore';
 
 const { ipcRenderer } = window.require('electron');
+
+// Portal for settings menu to escape overflow and z-index issues
+const SettingsPortal: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+  return createPortal(children, document.body);
+};
 
 interface Action {
   name: string;
@@ -15,14 +21,49 @@ interface ActionsPanelProps {
 
 export default function ActionsPanel({ activeTabId }: ActionsPanelProps) {
   const { showToast, docPrompt, terminalSelection } = useUIStore();
-  const { activeProjectId, createTab, getActiveProject, switchTab } = useWorkspaceStore();
+  const { activeProjectId, createTab, getActiveProject, switchTab, getSelectedTabs, clearSelection } = useWorkspaceStore();
   const [isUpdatingDocs, setIsUpdatingDocs] = useState(false);
   const [actions, setActions] = useState<Action[]>([]);
   const [isScissorsHovered, setIsScissorsHovered] = useState(false);
+  
   // Copy Session state
   const [copySessionExpanded, setCopySessionExpanded] = useState(false);
   const [copySessionInput, setCopySessionInput] = useState('');
   const [isCopying, setIsCopying] = useState(false);
+  
+  // New toggles
+  const [includeCode, setIncludeCode] = useState(false);
+  const [fromStart, setFromStart] = useState(true);
+  const [showCopySettings, setShowCopySettings] = useState(false);
+  const copyIconRef = useRef<HTMLSpanElement>(null);
+
+  const selectedTabs = activeProjectId ? getSelectedTabs(activeProjectId) : [];
+
+  // Get icon position for portal positioning
+  const getIconPosition = useCallback(() => {
+    if (!copyIconRef.current) return { x: 0, y: 0 };
+    const rect = copyIconRef.current.getBoundingClientRect();
+    return { x: rect.left, y: rect.top + rect.height / 2 };
+  }, []);
+
+  // Direction-based close (exactly like Timeline)
+  const handleMouseLeaveIcon = useCallback((e: React.MouseEvent) => {
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    const mouseX = e.clientX;
+
+    // If mouse went LEFT (towards settings menu) - keep open
+    // If mouse went RIGHT or other direction - close
+    const wentLeft = mouseX < rect.left;
+
+    if (!wentLeft) {
+      setShowCopySettings(false);
+    }
+  }, []);
+
+  const handleMouseLeaveSettingsArea = useCallback(() => {
+    setShowCopySettings(false);
+  }, []);
+  const isMultiSelect = selectedTabs.length > 1;
 
   useEffect(() => {
     loadActions();
@@ -489,72 +530,113 @@ export default function ActionsPanel({ activeTabId }: ActionsPanelProps) {
     }
   };
 
-  // Copy Claude session to clipboard (without code content)
+  // Copy Claude session to clipboard (with options and multi-tab support)
   const handleCopySession = async (sessionIdOverride?: string) => {
+    console.log('[CopySession] Starting copy session...', {
+      sessionIdOverride,
+      isMultiSelect,
+      selectedTabsCount: selectedTabs.length,
+      activeTabId,
+      includeCode,
+      fromStart
+    });
+
     const activeProject = getActiveProject();
     if (!activeProject) {
+      console.warn('[CopySession] No active project');
       showToast('No active project', 'error');
       return;
     }
 
-    // Parse input text - extract UUID and cwd
-    const inputText = sessionIdOverride || copySessionInput.trim();
+    // Determine tabs to copy
+    const tabsToCopy = isMultiSelect ? selectedTabs : (activeTabId ? [activeProject.tabs.get(activeTabId)] : []);
+    console.log('[CopySession] Tabs to copy:', tabsToCopy.map(t => t && { id: t.id, name: t.name, claudeSessionId: t.claudeSessionId }));
 
-    // UUID pattern
-    const uuidPattern = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
-    // CWD pattern (path starting with /)
-    const cwdPattern = /cwd:\s*(\/[^\s\n]+)/i;
+    const validTabsToCopy = tabsToCopy.filter(t => t && (t.claudeSessionId || sessionIdOverride || copySessionInput.trim()));
+    console.log('[CopySession] Valid tabs to copy:', validTabsToCopy.length);
 
-    let targetSessionId = '';
-    let parsedCwd = '';
-
-    // Try to extract UUID from input
-    const uuidMatch = inputText.match(uuidPattern);
-    if (uuidMatch) {
-      targetSessionId = uuidMatch[0];
-    }
-
-    // Try to extract cwd from input
-    const cwdMatch = inputText.match(cwdPattern);
-    if (cwdMatch) {
-      parsedCwd = cwdMatch[1];
-    }
-
-    // If no UUID found in input, try current tab
-    if (!targetSessionId && activeTabId) {
-      const tab = activeProject.tabs.get(activeTabId);
-      targetSessionId = tab?.claudeSessionId || '';
-    }
-
-    if (!targetSessionId) {
-      showToast('Введите Session ID', 'warning');
+    if (validTabsToCopy.length === 0) {
+      console.warn('[CopySession] No valid sessions to copy');
+      showToast('Нет сессий для копирования', 'warning');
       return;
     }
 
-    console.log('[CopySession] Parsed sessionId:', targetSessionId);
-    console.log('[CopySession] Parsed cwd:', parsedCwd);
-
     setIsCopying(true);
     try {
-      // Use parsed cwd first, then tab cwd, then project path
-      const tabCwd = activeTabId ? await ipcRenderer.invoke('terminal:getCwd', activeTabId) : null;
-      const cwd = parsedCwd || tabCwd || activeProject.projectPath;
+      const allResults: string[] = [];
 
-      console.log('[CopySession] Final cwd:', cwd);
+      for (const tab of validTabsToCopy) {
+        if (!tab) continue;
 
-      const result = await ipcRenderer.invoke('claude:export-clean-session', {
-        sessionId: targetSessionId,
-        cwd
-      });
+        let targetSessionId = '';
+        let parsedCwd = '';
 
-      if (result.success) {
-        await navigator.clipboard.writeText(result.content);
-        const sizeKB = Math.round(result.content.length / 1024);
-        showToast(`Скопировано ${sizeKB}KB`, 'success');
+        if (sessionIdOverride || copySessionInput.trim()) {
+          const inputText = sessionIdOverride || copySessionInput.trim();
+          const uuidPattern = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+          const cwdPattern = /cwd:\s*(\/[^\s\n]+)/i;
+
+          const uuidMatch = inputText.match(uuidPattern);
+          if (uuidMatch) targetSessionId = uuidMatch[0];
+
+          const cwdMatch = inputText.match(cwdPattern);
+          if (cwdMatch) parsedCwd = cwdMatch[1];
+        }
+
+        if (!targetSessionId) {
+          targetSessionId = tab.claudeSessionId || '';
+        }
+
+        if (!targetSessionId) {
+          console.log('[CopySession] Skipping tab without session ID:', tab.name);
+          continue;
+        }
+
+        const tabCwd = await ipcRenderer.invoke('terminal:getCwd', tab.id).catch(() => null);
+        const cwd = parsedCwd || tabCwd || tab.cwd || activeProject.projectPath;
+
+        console.log('[CopySession] Exporting session:', {
+          tabName: tab.name,
+          sessionId: targetSessionId,
+          cwd,
+          includeCode,
+          fromStart
+        });
+
+        const result = await ipcRenderer.invoke('claude:export-clean-session', {
+          sessionId: targetSessionId,
+          cwd,
+          includeCode,
+          fromStart
+        });
+
+        if (result.success) {
+          console.log('[CopySession] Success for tab:', tab.name, 'Content length:', result.content?.length);
+          allResults.push(result.content);
+        } else {
+          console.warn(`[CopySession] Failed for tab ${tab.name}:`, result.error);
+        }
+      }
+
+      if (allResults.length > 0) {
+        const finalContent = allResults.join('\n\n' + '='.repeat(40) + '\n\n');
+        await navigator.clipboard.writeText(finalContent);
+        const sizeKB = Math.round(finalContent.length / 1024);
+        console.log('[CopySession] Copied to clipboard:', {
+          sessionsCount: validTabsToCopy.length,
+          totalSize: finalContent.length,
+          sizeKB
+        });
+        showToast(`Скопировано ${validTabsToCopy.length} сессий (${sizeKB}KB)`, 'success');
+
+        // Clear selection after successful multi-copy
+        if (isMultiSelect) clearSelection(activeProject.projectId);
       } else {
-        showToast(`Ошибка: ${result.error}`, 'error');
+        console.warn('[CopySession] No results to copy');
+        showToast('Не удалось скопировать ни одной сессии', 'error');
       }
     } catch (e: any) {
+      console.error('[CopySession] Error:', e);
       showToast(`Ошибка: ${e.message}`, 'error');
     } finally {
       setIsCopying(false);
@@ -568,71 +650,91 @@ export default function ActionsPanel({ activeTabId }: ActionsPanelProps) {
       </div>
 
       <div className="flex-1 overflow-y-auto p-2">
+        {/* Multi-Select Info */}
+        {isMultiSelect && (
+          <div className="mb-4 bg-accent/10 border border-accent/20 rounded-lg p-3 text-xs text-accent flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <span className="text-base">📑</span>
+              <div className="font-medium">Выбрано {selectedTabs.length} вкладок</div>
+            </div>
+            <button 
+              onClick={() => activeProjectId && clearSelection(activeProjectId)}
+              className="px-2 py-1 hover:bg-accent/20 rounded transition-colors"
+            >
+              Сбросить
+            </button>
+          </div>
+        )}
+
         {/* System Tools Section */}
         <div className="mb-4">
-          <div className="flex items-center gap-2 mb-2 px-1">
-            <span className="text-[9px] uppercase font-semibold text-green-500">System</span>
-            <div className="flex-1 h-px bg-[#333]" />
-          </div>
-
-          <button
-            className={`w-full bg-green-900/30 border border-green-700/30 text-green-400 p-3 text-left cursor-pointer rounded-lg text-xs flex items-center gap-2 hover:bg-green-900/50 hover:border-green-600/40 transition-colors focus:outline-none ${
-              isUpdatingDocs ? 'opacity-50 cursor-not-allowed' : ''
-            }`}
-            onClick={handleUpdateDocs}
-            disabled={isUpdatingDocs}
-          >
-            <span className="text-base">📚</span>
-            <div className="flex-1">
-              <div className="font-medium">Update Docs</div>
-              <div className="text-[10px] text-green-600 mt-0.5">
-                {isUpdatingDocs ? 'Processing...' : 'Export session → Gemini analysis'}
-              </div>
+          {!isMultiSelect && (
+            <div className="flex items-center gap-2 mb-2 px-1">
+              <span className="text-[9px] uppercase font-semibold text-green-500">System</span>
+              <div className="flex-1 h-px bg-[#333]" />
             </div>
-            {/* Selection button - appears when text is selected in terminal */}
-            {terminalSelection && !isUpdatingDocs && (
-              <div
-                className="relative z-10 text-white text-[9px] px-2 py-1.5 rounded flex items-center gap-1 cursor-pointer select-none"
-                style={{
-                  backgroundColor: isScissorsHovered ? '#3b82f6' : '#2563eb',
-                  transform: isScissorsHovered ? 'scale(1.02)' : 'scale(1)',
-                  boxShadow: isScissorsHovered ? '0 2px 6px rgba(59, 130, 246, 0.25)' : 'none',
-                  transition: 'all 0.15s ease'
-                }}
-                onClick={handleUpdateDocsWithSelection}
-                onMouseDown={(e) => e.stopPropagation()}
-                onMouseEnter={() => setIsScissorsHovered(true)}
-                onMouseLeave={() => setIsScissorsHovered(false)}
-                title={`Use selection (${terminalSelection.length} chars)`}
-                role="button"
-                tabIndex={0}
-              >
-                <span className="text-[10px]">✂️</span>
-                <span className="font-medium">{terminalSelection.length}</span>
-              </div>
-            )}
-            {/* Clipboard button - use content from clipboard */}
-            {!isUpdatingDocs && (
-              <div
-                className="relative z-10 text-white text-[9px] px-2 py-1.5 rounded flex items-center gap-1 cursor-pointer select-none transition-all"
-                style={{
-                  backgroundColor: '#7c3aed',
-                }}
-                onMouseEnter={(e) => e.currentTarget.style.backgroundColor = '#8b5cf6'}
-                onMouseLeave={(e) => e.currentTarget.style.backgroundColor = '#7c3aed'}
-                onClick={handleUpdateDocsWithClipboard}
-                onMouseDown={(e) => e.stopPropagation()}
-                title="Use clipboard content"
-                role="button"
-                tabIndex={0}
-              >
-                <span className="text-[10px]">📋</span>
-              </div>
-            )}
-          </button>
+          )}
 
-          {/* Copy Session - export Claude session without code */}
-          <div className="mt-2">
+          {!isMultiSelect && (
+            <button
+              className={`w-full bg-green-900/30 border border-green-700/30 text-green-400 p-3 text-left cursor-pointer rounded-lg text-xs flex items-center gap-2 hover:bg-green-900/50 hover:border-green-600/40 transition-colors focus:outline-none ${
+                isUpdatingDocs ? 'opacity-50 cursor-not-allowed' : ''
+              }`}
+              onClick={handleUpdateDocs}
+              disabled={isUpdatingDocs}
+            >
+              <span className="text-base">📚</span>
+              <div className="flex-1">
+                <div className="font-medium">Update Docs</div>
+                <div className="text-[10px] text-green-600 mt-0.5">
+                  {isUpdatingDocs ? 'Processing...' : 'Export session → Gemini analysis'}
+                </div>
+              </div>
+              {/* Selection button - appears when text is selected in terminal */}
+              {terminalSelection && !isUpdatingDocs && (
+                <div
+                  className="relative z-10 text-white text-[9px] px-2 py-1.5 rounded flex items-center gap-1 cursor-pointer select-none"
+                  style={{
+                    backgroundColor: isScissorsHovered ? '#3b82f6' : '#2563eb',
+                    transform: isScissorsHovered ? 'scale(1.02)' : 'scale(1)',
+                    boxShadow: isScissorsHovered ? '0 2px 6px rgba(59, 130, 246, 0.25)' : 'none',
+                    transition: 'all 0.15s ease'
+                  }}
+                  onClick={handleUpdateDocsWithSelection}
+                  onMouseDown={(e) => e.stopPropagation()}
+                  onMouseEnter={() => setIsScissorsHovered(true)}
+                  onMouseLeave={() => setIsScissorsHovered(false)}
+                  title={`Use selection (${terminalSelection.length} chars)`}
+                  role="button"
+                  tabIndex={0}
+                >
+                  <span className="text-[10px]">✂️</span>
+                  <span className="font-medium">{terminalSelection.length}</span>
+                </div>
+              )}
+              {/* Clipboard button - use content from clipboard */}
+              {!isUpdatingDocs && (
+                <div
+                  className="relative z-10 text-white text-[9px] px-2 py-1.5 rounded flex items-center gap-1 cursor-pointer select-none transition-all"
+                  style={{
+                    backgroundColor: '#7c3aed',
+                  }}
+                  onMouseEnter={(e) => e.currentTarget.style.backgroundColor = '#8b5cf6'}
+                  onMouseLeave={(e) => e.currentTarget.style.backgroundColor = '#7c3aed'}
+                  onClick={handleUpdateDocsWithClipboard}
+                  onMouseDown={(e) => e.stopPropagation()}
+                  title="Use clipboard content"
+                  role="button"
+                  tabIndex={0}
+                >
+                  <span className="text-[10px]">📋</span>
+                </div>
+              )}
+            </button>
+          )}
+
+          {/* Copy Session - export Claude session */}
+          <div className={`${isMultiSelect ? '' : 'mt-2'}`}>
             <div
               className={`w-full text-[#DA7756] p-3 text-left rounded-lg text-xs flex items-center gap-2 transition-colors ${
                 isCopying ? 'opacity-50' : ''
@@ -650,36 +752,106 @@ export default function ActionsPanel({ activeTabId }: ActionsPanelProps) {
                 e.currentTarget.style.borderColor = 'rgba(218, 119, 86, 0.15)';
               }}
             >
-              <span className="text-base">📋</span>
+              {/* Icon with simple hover (no scale - like Timeline) */}
+              <div
+                ref={copyIconRef}
+                className={`relative w-6 h-6 flex items-center justify-center cursor-pointer rounded transition-colors ${showCopySettings ? 'bg-white/15' : 'hover:bg-white/10'}`}
+                onMouseEnter={() => setShowCopySettings(true)}
+                onMouseLeave={handleMouseLeaveIcon}
+              >
+                <span className="text-base">📋</span>
+                {/* Indicators */}
+                <div className="absolute -bottom-1 -right-1 flex gap-0.5 pointer-events-none">
+                  {includeCode && <div className="w-1.5 h-1.5 rounded-full bg-green-500 border border-[#1a1a1a]" title="С кодом" />}
+                  {!fromStart && <div className="w-1.5 h-1.5 rounded-full bg-blue-500 border border-[#1a1a1a]" title="С последнего форка" />}
+                </div>
+              </div>
+
+              {/* Settings Menu Portal (like Timeline tooltip) */}
+              {showCopySettings && (
+                <SettingsPortal>
+                  <div
+                    onMouseLeave={handleMouseLeaveSettingsArea}
+                    style={{
+                      position: 'fixed',
+                      left: getIconPosition().x - 190, // Menu width (150) + bridge (40)
+                      top: getIconPosition().y - 60,   // Center vertically
+                      zIndex: 10000,
+                      display: 'flex',
+                      flexDirection: 'row',
+                      alignItems: 'center',
+                    }}
+                  >
+                    {/* Settings Menu Content */}
+                    <div
+                      className="bg-[#1a1a1a] border border-[#444] rounded-lg shadow-2xl p-2 min-w-[150px] flex flex-col gap-2"
+                      style={{
+                        backdropFilter: 'blur(12px)',
+                        boxShadow: '0 15px 35px rgba(0,0,0,0.6)',
+                      }}
+                    >
+                      <div className="px-1 py-0.5 text-[9px] uppercase font-bold text-[#666] border-b border-[#333] mb-1">Настройки</div>
+
+                      <label className="flex items-center justify-between gap-3 cursor-pointer group/label px-1">
+                        <span className="text-[10px] text-[#aaa] group-hover/label:text-white transition-colors">С кодом</span>
+                        <div
+                          className={`w-7 h-4 rounded-full relative transition-colors cursor-pointer ${includeCode ? 'bg-[#DA7756]' : 'bg-[#444]'}`}
+                          onClick={(e) => { e.stopPropagation(); setIncludeCode(!includeCode); }}
+                        >
+                          <div className={`absolute top-0.5 w-3 h-3 bg-white rounded-full transition-all ${includeCode ? 'left-[14px]' : 'left-0.5'}`} />
+                        </div>
+                      </label>
+
+                      <label className="flex items-center justify-between gap-3 cursor-pointer group/label px-1">
+                        <span className="text-[10px] text-[#aaa] group-hover/label:text-white transition-colors">С начала</span>
+                        <div
+                          className={`w-7 h-4 rounded-full relative transition-colors cursor-pointer ${fromStart ? 'bg-[#DA7756]' : 'bg-[#444]'}`}
+                          onClick={(e) => { e.stopPropagation(); setFromStart(!fromStart); }}
+                        >
+                          <div className={`absolute top-0.5 w-3 h-3 bg-white rounded-full transition-all ${fromStart ? 'left-[14px]' : 'left-0.5'}`} />
+                        </div>
+                      </label>
+                    </div>
+
+                    {/* CSS Bridge - invisible area connecting menu to icon */}
+                    <div style={{ width: '40px', height: '80px' }} />
+                  </div>
+                </SettingsPortal>
+              )}
+
               <div className="flex-1">
-                {/* Clickable title - copies current session */}
+                {/* Clickable title - copies current session(s) */}
                 <div
                   className="font-medium cursor-pointer hover:text-white hover:underline transition-colors inline-block"
                   onClick={(e) => {
                     e.stopPropagation();
                     if (!isCopying) handleCopySession();
                   }}
-                  title="Копировать текущую сессию"
+                  title={isMultiSelect ? `Копировать ${selectedTabs.length} сессий` : "Копировать текущую сессию"}
                 >
-                  Copy Session
+                  {isMultiSelect ? `Copy ${selectedTabs.length} Sessions` : 'Copy Session'}
                 </div>
                 <div
                   className="text-[10px] text-[#DA7756]/70 mt-0.5 cursor-pointer"
                   onClick={() => !isCopying && setCopySessionExpanded(!copySessionExpanded)}
                 >
-                  {isCopying ? 'Копирование...' : 'Claude JSONL → clipboard (без кода)'}
+                  {isCopying ? 'Копирование...' : 
+                    isMultiSelect ? `Экспорт ${selectedTabs.length} сессий в буфер` : 'Claude JSONL → clipboard'}
                 </div>
               </div>
-              <span
-                className="text-[10px] text-[#DA7756]/50 cursor-pointer hover:text-[#DA7756] transition-colors px-1"
-                onClick={() => !isCopying && setCopySessionExpanded(!copySessionExpanded)}
-              >
-                {copySessionExpanded ? '▼' : '▶'}
-              </span>
+              {/* Hide expand button when multi-select - no need for manual ID input */}
+              {!isMultiSelect && (
+                <span
+                  className="text-[10px] text-[#DA7756]/50 cursor-pointer hover:text-[#DA7756] transition-colors px-1"
+                  onClick={() => !isCopying && setCopySessionExpanded(!copySessionExpanded)}
+                >
+                  {copySessionExpanded ? '▼' : '▶'}
+                </span>
+              )}
             </div>
 
-            {/* Expanded area with textarea */}
-            {copySessionExpanded && (
+            {/* Expanded area with textarea (only show for single select) */}
+            {copySessionExpanded && !isMultiSelect && (
               <div className="mt-2 p-2 bg-[#1a1a1a] border border-[#DA7756]/30 rounded-lg">
                 <textarea
                   value={copySessionInput}
@@ -697,7 +869,7 @@ export default function ActionsPanel({ activeTabId }: ActionsPanelProps) {
                   <span className="text-[9px] text-[#555]">⌘+Enter для копирования</span>
                   <button
                     onClick={() => handleCopySession()}
-                    disabled={isCopying || !copySessionInput.trim()}
+                    disabled={isCopying || (!copySessionInput.trim() && !activeTabId)}
                     className="text-[10px] px-3 py-1.5 rounded transition-colors bg-[#DA7756] text-white hover:bg-[#DA7756]/80 disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
                   >
                     {isCopying ? 'Копирование...' : 'Copy'}
@@ -709,7 +881,7 @@ export default function ActionsPanel({ activeTabId }: ActionsPanelProps) {
         </div>
 
         {/* User Actions Section */}
-        {actions.length > 0 && (
+        {!isMultiSelect && actions.length > 0 && (
           <div>
             <div className="flex items-center gap-2 mb-2 px-1">
               <span className="text-[9px] uppercase font-semibold text-[#888]">User</span>
