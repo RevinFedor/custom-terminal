@@ -38,22 +38,10 @@ function NotesEditorModal() {
   hasChangesRef.current = hasChanges;
   contentRef.current = content;
 
-  // DEBUG: Log renders
-  const renderCountRef = useRef(0);
-  renderCountRef.current++;
-  console.log('[NotesEditor] RENDER #', renderCountRef.current, {
-    notesEditorOpen,
-    notesEditorProjectId,
-    activeProjectId,
-    hasChanges,
-    contentLength: content.length
-  });
-
   // Load notes when modal opens or project changes
   // NOTE: Only depend on notesEditorOpen and notesEditorProjectId to avoid infinite loops
   // when updateProject is called (which changes projects object)
   useEffect(() => {
-    console.log('[NotesEditor] useEffect:LOAD triggered', { notesEditorOpen, notesEditorProjectId });
     if (notesEditorOpen && notesEditorProjectId) {
       // Get fresh data from stores (not from dependencies to avoid loops)
       const currentProjects = useProjectsStore.getState().projects;
@@ -64,7 +52,6 @@ function NotesEditorModal() {
 
       if (workspace && project) {
         const notes = extractNotes(project.notes);
-        console.log('[NotesEditor] Loading notes, length:', notes.length);
         setContent(notes);
         setProjectPath(project.path || workspace.projectPath || null);
         setProjectName(project.name || 'Project');
@@ -156,7 +143,6 @@ function NotesEditorModal() {
 
   // Handle content change
   const handleChange = useCallback((newContent: string) => {
-    console.log('[NotesEditor] handleChange called, newContent length:', newContent.length, 'hasNewline:', newContent.includes('\n'));
     setContent(newContent);
     setHasChanges(true);
   }, []);
