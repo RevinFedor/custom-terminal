@@ -23,6 +23,9 @@ interface TabData {
   color?: TabColor;
   isUtility?: boolean;
   commandType?: string;
+  wasInterrupted?: boolean;
+  claudeSessionId?: string;
+  geminiSessionId?: string;
 }
 
 type DragData = {
@@ -176,6 +179,7 @@ interface TabItemProps {
   hasProcess?: boolean; // Whether tab has a running process
   commandType?: string; // Type of command running (devServer, claude, gemini, generic)
   onRestart?: (tabId: string) => void; // Restart process (Ctrl+C, Up, Enter)
+  isInterrupted?: boolean; // Tab has an interrupted AI session
 }
 
 const TabItem = memo(({
@@ -200,6 +204,7 @@ const TabItem = memo(({
   hasProcess = false,
   commandType,
   onRestart,
+  isInterrupted = false,
 }: TabItemProps) => {
   const ref = useRef<HTMLDivElement>(null);
   const [closestEdge, setClosestEdge] = useState<Edge | null>(null);
@@ -292,14 +297,32 @@ const TabItem = memo(({
     return 'transparent';
   };
 
-  // Border/indicator ONLY for ACTIVE tab (not selected)
-  const getActiveBorder = () => {
+  // Border/indicator for active, selected, or interrupted tabs
+  const getTopBorder = () => {
     if (isActive) {
-      // Only active tab gets the colored line indicator
+      // Active tab gets solid colored line
       const borderColor = !hasColor ? 'rgba(255,255,255,0.7)' : colorConfig.borderColor;
       return `2px solid ${borderColor}`;
     }
-    // Selected but not active - subtle dashed outline to show selection
+    if (isInterrupted) {
+      // Interrupted tab gets dashed blue line
+      return '2px dashed #3b82f6';
+    }
+    if (isSelected) {
+      // Selected but not active - subtle dashed outline
+      return '2px dashed rgba(255,255,255,0.3)';
+    }
+    return '2px solid transparent';
+  };
+
+  const getLeftBorder = () => {
+    if (isActive) {
+      const borderColor = !hasColor ? 'rgba(255,255,255,0.7)' : colorConfig.borderColor;
+      return `2px solid ${borderColor}`;
+    }
+    if (isInterrupted) {
+      return '2px dashed #3b82f6';
+    }
     if (isSelected) {
       return '2px dashed rgba(255,255,255,0.3)';
     }
@@ -322,10 +345,10 @@ const TabItem = memo(({
     color: (isActive || isHovered || isSelected) ? '#fff' : '#888',
     backgroundColor: getBgColor(),
     // Horizontal tabs: border on top. Vertical tabs: border on left
-    borderTop: isHorizontal ? getActiveBorder() : 'none',
-    borderLeft: !isHorizontal ? getActiveBorder() : 'none',
+    borderTop: isHorizontal ? getTopBorder() : 'none',
+    borderLeft: !isHorizontal ? getLeftBorder() : 'none',
     opacity: isDragging ? 0.5 : 1,
-    transition: 'color 0.15s ease, background-color 0.15s ease'
+    transition: 'color 0.15s ease, background-color 0.15s ease',
   };
 
   return (
@@ -1074,6 +1097,7 @@ function TabBar({ projectId }: TabBarProps) {
                         hasProcess={processStatus.get(tab.id) || false}
                         commandType={tab.commandType}
                         onRestart={handleRestart}
+                        isInterrupted={tab.wasInterrupted && !!(tab.claudeSessionId || tab.geminiSessionId)}
                       />
                     ))}
                   </div>
@@ -1142,6 +1166,7 @@ function TabBar({ projectId }: TabBarProps) {
                     hasProcess={processStatus.get(tab.id) || false}
                     commandType={tab.commandType}
                     onRestart={handleRestart}
+                    isInterrupted={tab.wasInterrupted && !!(tab.claudeSessionId || tab.geminiSessionId)}
                   />
                 ))}
               </div>
