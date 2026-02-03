@@ -42,8 +42,8 @@ const truncateText = (text: string | unknown, maxLength: number = 120): string =
 };
 
 interface ForkMarker {
-  message_uuid: string;
-  forked_to_session_id: string;
+  source_session_id: string;
+  entry_uuids: string[];  // Snapshot of all entry UUIDs at fork time
 }
 
 function Timeline({ tabId, sessionId, cwd }: TimelineProps) {
@@ -102,6 +102,8 @@ function Timeline({ tabId, sessionId, cwd }: TimelineProps) {
       }
       if (markersResult.success && markersResult.markers?.length > 0) {
         console.log('[Timeline] Setting fork markers:', markersResult.markers);
+        console.log('[Timeline] Fork marker UUIDs count:', markersResult.markers.map((m: ForkMarker) => m.entry_uuids?.length));
+        console.log('[Timeline] Current entries count:', timelineResult.entries?.length);
         setForkMarkers(markersResult.markers);
       }
     } catch (error) {
@@ -123,10 +125,11 @@ function Timeline({ tabId, sessionId, cwd }: TimelineProps) {
     return () => terminalRegistry.offViewportChange(tabId);
   }, [tabId]);
 
-  // Refresh timeline periodically
+  // Refresh timeline periodically (faster when command is running for Escape detection)
   useEffect(() => {
     if (!sessionId) return;
-    const interval = setInterval(loadTimeline, 5000);
+    // Refresh every 2 seconds to catch Escape/Undo changes quickly
+    const interval = setInterval(loadTimeline, 2000);
     return () => clearInterval(interval);
   }, [sessionId, loadTimeline]);
 
@@ -265,46 +268,70 @@ function Timeline({ tabId, sessionId, cwd }: TimelineProps) {
           {entries.map((entry, index) => {
             const active = isSelected(entry, index);
             const isCompacted = entry.type === 'compact';
-            // Fork point: if this session was forked, mark the LAST entry as fork point
-            // This shows where the session was forked from (the point at which fork happened)
             const isLastEntry = index === entries.length - 1;
-            const isForkPoint = forkMarkers.length > 0 && isLastEntry;
+
+            // Check if fork marker should appear AFTER this entry
+            // Fork marker shows after the LAST entry that exists in the fork snapshot
+            // This handles Escape/Undo correctly - marker stays with inherited entries
+            const forkMarker = forkMarkers.find(m => {
+              if (!m.entry_uuids || m.entry_uuids.length === 0) return false;
+              const snapshotUuids = new Set(m.entry_uuids);
+
+              // This entry must be in snapshot (inherited)
+              if (!snapshotUuids.has(entry.uuid)) return false;
+
+              // Check if NEXT entry is NOT in snapshot (new) or this is last entry
+              if (isLastEntry) return true;
+              const nextEntry = entries[index + 1];
+              return nextEntry && !snapshotUuids.has(nextEntry.uuid);
+            });
 
             return (
-              <div
-                key={entry.uuid}
-                ref={el => segmentRefs.current[index] = el}
-                data-segment
-                className="relative flex-1 min-h-[4px] w-full flex items-center justify-center cursor-pointer transition-colors"
-                style={{
-                  backgroundColor: active ? 'rgba(59, 130, 246, 0.15)' : 'transparent',
-                }}
-                onMouseEnter={() => handleMouseEnterSegment(index)}
-                onMouseLeave={(e) => handleMouseLeaveSegment(e)}
-                onClick={() => handleEntryClick(entry)}
-                onContextMenu={(e) => handleRightClick(e, entry)}
-              >
-                {/* Fork indicator - blue line on right side */}
-                {isForkPoint && (
-                  <div
-                    className="absolute right-0 top-0 bottom-0 w-[3px] bg-blue-500"
-                    title="Session was forked from here"
-                  />
-                )}
-                {/* Visual Indicator (Dot or Line) */}
+              <React.Fragment key={entry.uuid}>
                 <div
-                  className="transition-all duration-200"
+                  ref={el => segmentRefs.current[index] = el}
+                  data-segment
+                  className="relative flex-1 min-h-[4px] w-full flex items-center justify-center cursor-pointer transition-colors"
                   style={{
-                    width: isCompacted ? '12px' : (hoveredIndex === index || activeTooltipIndex === index ? '8px' : '4px'),
-                    height: isCompacted ? '2px' : (hoveredIndex === index || activeTooltipIndex === index ? '8px' : '4px'),
-                    borderRadius: isCompacted ? '1px' : '50%',
-                    backgroundColor: isCompacted
-                      ? '#f59e0b'
-                      : (isForkPoint ? '#3b82f6' : (active ? '#3b82f6' : (hoveredIndex === index || activeTooltipIndex === index ? 'white' : 'rgba(255,255,255,0.3)'))),
-                    boxShadow: (hoveredIndex === index || activeTooltipIndex === index) ? '0 0 8px rgba(255,255,255,0.4)' : 'none',
+                    backgroundColor: active ? 'rgba(59, 130, 246, 0.15)' : 'transparent',
                   }}
-                />
-              </div>
+                  onMouseEnter={() => handleMouseEnterSegment(index)}
+                  onMouseLeave={(e) => handleMouseLeaveSegment(e)}
+                  onClick={() => handleEntryClick(entry)}
+                  onContextMenu={(e) => handleRightClick(e, entry)}
+                >
+                  {/* Visual Indicator: Dot (normal) or Line (compact) */}
+                  <div
+                    className="transition-all duration-200"
+                    style={{
+                      width: isCompacted ? '12px' : (hoveredIndex === index || activeTooltipIndex === index ? '8px' : '4px'),
+                      height: isCompacted ? '2px' : (hoveredIndex === index || activeTooltipIndex === index ? '8px' : '4px'),
+                      borderRadius: isCompacted ? '1px' : '50%',
+                      backgroundColor: isCompacted
+                        ? '#f59e0b'  // Orange for compact
+                        : (active ? '#3b82f6' : (hoveredIndex === index || activeTooltipIndex === index ? 'white' : 'rgba(255,255,255,0.3)')),
+                      boxShadow: (hoveredIndex === index || activeTooltipIndex === index) ? '0 0 8px rgba(255,255,255,0.4)' : 'none',
+                    }}
+                  />
+                </div>
+                {/* Fork marker - appears AFTER the entry at position (entry_count - 1) */}
+                {forkMarker && (
+                  <div
+                    className="flex-shrink-0 w-full flex items-center justify-center"
+                    style={{ height: '8px' }}
+                    title="Fork point - this session was forked from here"
+                  >
+                    <div
+                      style={{
+                        width: '12px',
+                        height: '2px',
+                        borderRadius: '1px',
+                        backgroundColor: '#3b82f6',  // Blue for fork
+                      }}
+                    />
+                  </div>
+                )}
+              </React.Fragment>
             );
           })}
         </div>
