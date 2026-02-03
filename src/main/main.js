@@ -2123,6 +2123,69 @@ ipcMain.handle('gemini:rollback', async (event, { sessionId, turnNumber, cwd, ta
   return { success: true, sessionId, cwd };
 });
 
+// ========== TIMELINE PARSER FUNCTION ==========
+// Shared function to parse Timeline entries from JSONL file using Backtrace algorithm
+// Returns array of entry UUIDs in display order (for fork marker snapshot)
+function parseTimelineUuids(sourcePath) {
+  try {
+    const content = fs.readFileSync(sourcePath, 'utf-8');
+    const lines = content.trim().split('\n').filter(line => line.trim());
+
+    const recordMap = new Map();
+    let lastRecord = null;
+
+    for (const line of lines) {
+      try {
+        const entry = JSON.parse(line);
+        recordMap.set(entry.uuid, entry);
+        if (entry.uuid) lastRecord = entry;
+      } catch {}
+    }
+
+    if (!lastRecord) return [];
+
+    // BACKTRACE: Walk backwards from last record following parentUuid
+    const activeBranch = [];
+    let currentUuid = lastRecord.uuid;
+
+    while (currentUuid) {
+      const record = recordMap.get(currentUuid);
+      if (!record) break;
+      activeBranch.unshift(record);
+      currentUuid = record.logicalParentUuid || record.parentUuid;
+    }
+
+    // Filter for Timeline display (same logic as get-timeline handler)
+    const uuids = [];
+    for (const entry of activeBranch) {
+      if (entry.isSidechain || entry.type === 'summary') continue;
+
+      if (entry.type === 'user') {
+        let rawContent = entry.message?.content;
+        if (Array.isArray(rawContent)) {
+          if (rawContent.some(item => item.type === 'tool_result')) continue;
+          const textBlock = rawContent.find(item => item.type === 'text' && item.text);
+          rawContent = textBlock?.text || null;
+        }
+        if (!rawContent || typeof rawContent !== 'string') continue;
+        if (entry.isMeta) continue;
+        if (rawContent.includes('<command-name>') ||
+            rawContent.includes('<system-reminder>') ||
+            rawContent.startsWith('[Request interrupted')) continue;
+
+        uuids.push(entry.uuid);
+      } else if (entry.type === 'system' && entry.subtype === 'compact_boundary') {
+        uuids.push(entry.uuid);
+      }
+    }
+
+    return uuids;
+  } catch (e) {
+    console.error('[parseTimelineUuids] Error:', e.message);
+    return [];
+  }
+}
+
 // Fork Claude session: copy .jsonl file with new UUID, signal renderer to create new tab (legacy)
 // Fork Claude session file: copy .jsonl with new UUID
 // Searches ALL project directories under ~/.claude/projects/ to find the session file
@@ -2201,41 +2264,19 @@ ipcMain.handle('claude:fork-session-file', async (event, { sourceSessionId, cwd 
       return { success: false, error: 'Source session is empty' };
     }
 
-    // Read source file to get last USER message UUID for fork marker
-    // Important: must be a 'user' type message because Timeline only shows user messages
-    let lastUserMessageUuid = null;
-    try {
-      const content = fs.readFileSync(sourcePath, 'utf-8');
-      const lines = content.trim().split('\n').filter(l => l.trim());
-      // Find last USER record (Timeline only shows user messages, so fork point must be on a user entry)
-      for (let i = lines.length - 1; i >= 0; i--) {
-        try {
-          const record = JSON.parse(lines[i]);
-          if (record.type === 'user' && record.uuid && !record.isSidechain && !record.isMeta) {
-            // Also check it's not a tool_result
-            const content = record.message?.content;
-            const isToolResult = Array.isArray(content) && content.some(item => item.type === 'tool_result');
-            if (!isToolResult) {
-              lastUserMessageUuid = record.uuid;
-              break;
-            }
-          }
-        } catch {}
-      }
-      console.log('[Claude Fork] Last USER message UUID:', lastUserMessageUuid);
-    } catch (e) {
-      console.warn('[Claude Fork] Could not read last message UUID:', e.message);
-    }
+    // Get Timeline UUIDs snapshot using Backtrace algorithm (same as Timeline UI)
+    const entryUuids = parseTimelineUuids(sourcePath);
+    console.log('[Claude Fork] Timeline entries:', entryUuids.length);
 
     // Copy the file
     fs.copyFileSync(sourcePath, destPath);
     console.log('[Claude Fork] Copied:', sourcePath, '->', destPath);
 
-    // Save fork marker in database
-    if (lastUserMessageUuid) {
+    // Save fork marker with UUIDs snapshot
+    if (entryUuids.length > 0) {
       try {
-        projectManager.db.saveForkMarker(sourceSessionId, lastUserMessageUuid, newSessionId);
-        console.log('[Claude Fork] Fork marker saved');
+        projectManager.db.saveForkMarker(sourceSessionId, newSessionId, entryUuids);
+        console.log('[Claude Fork] Fork marker saved with', entryUuids.length, 'UUIDs');
       } catch (e) {
         console.warn('[Claude Fork] Could not save fork marker:', e.message);
       }
@@ -2244,7 +2285,7 @@ ipcMain.handle('claude:fork-session-file', async (event, { sourceSessionId, cwd 
     // Wait for Claude to index the new file
     await new Promise(resolve => setTimeout(resolve, 500));
 
-    return { success: true, newSessionId, forkPointUuid: lastUserMessageUuid };
+    return { success: true, newSessionId, forkEntryCount: entryUuids.length };
   } catch (error) {
     console.error('[Claude Fork] Error:', error);
     return { success: false, error: error.message };
@@ -2876,39 +2917,20 @@ ipcMain.on('claude:run-command', (event, { tabId, command, sessionId, forkSessio
           // Copy to the SAME directory where source was found
           const destPath = path.join(sourceDir, `${newSessionId}.jsonl`);
 
-          // Read source file to find last USER message UUID for fork marker
-          let lastUserMessageUuid = null;
-          try {
-            const content = fs.readFileSync(sourcePath, 'utf-8');
-            const lines = content.trim().split('\n').filter(l => l.trim());
-            for (let i = lines.length - 1; i >= 0; i--) {
-              try {
-                const record = JSON.parse(lines[i]);
-                if (record.type === 'user' && record.uuid && !record.isSidechain && !record.isMeta) {
-                  const msgContent = record.message?.content;
-                  const isToolResult = Array.isArray(msgContent) && msgContent.some(item => item.type === 'tool_result');
-                  if (!isToolResult) {
-                    lastUserMessageUuid = record.uuid;
-                    break;
-                  }
-                }
-              } catch {}
-            }
-            console.log('[Claude Runner] Last USER message UUID:', lastUserMessageUuid);
-          } catch (e) {
-            console.warn('[Claude Runner] Could not read last message UUID:', e.message);
-          }
+          // Get Timeline UUIDs snapshot using Backtrace algorithm
+          const entryUuids = parseTimelineUuids(sourcePath);
+          console.log('[Claude Runner] Timeline entries:', entryUuids.length);
 
           fs.copyFileSync(sourcePath, destPath);
           console.log('[Claude Runner] Copied session file, new ID:', newSessionId);
           console.log('[Claude Runner] From:', sourcePath);
           console.log('[Claude Runner] To:', destPath);
 
-          // Save fork marker in database
-          if (lastUserMessageUuid) {
+          // Save fork marker with UUIDs snapshot
+          if (entryUuids.length > 0) {
             try {
-              projectManager.db.saveForkMarker(forkSessionId, lastUserMessageUuid, newSessionId);
-              console.log('[Claude Runner] Fork marker saved');
+              projectManager.db.saveForkMarker(forkSessionId, newSessionId, entryUuids);
+              console.log('[Claude Runner] Fork marker saved with', entryUuids.length, 'UUIDs');
             } catch (e) {
               console.warn('[Claude Runner] Could not save fork marker:', e.message);
             }

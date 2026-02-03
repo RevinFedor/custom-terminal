@@ -175,16 +175,19 @@ class DatabaseManager {
     `);
 
     // Fork markers table - tracks where sessions were forked for Timeline visualization
+    // entry_uuids_json stores JSON array of all entry UUIDs at fork time for robust positioning
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS fork_markers (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         source_session_id TEXT NOT NULL,
-        message_uuid TEXT NOT NULL,
         forked_to_session_id TEXT NOT NULL,
+        entry_uuids_json TEXT NOT NULL DEFAULT '[]',
         created_at INTEGER DEFAULT (strftime('%s', 'now')),
-        UNIQUE(source_session_id, message_uuid, forked_to_session_id)
+        UNIQUE(source_session_id, forked_to_session_id)
       )
     `);
+    // Migration: add entry_uuids_json column if not exists
+    try { this.db.exec(`ALTER TABLE fork_markers ADD COLUMN entry_uuids_json TEXT NOT NULL DEFAULT '[]'`); } catch (e) {}
   }
 
   // ========== APP STATE ========== 
@@ -421,17 +424,31 @@ transaction(tabs);
 
   /**
    * Save a fork marker when a session is forked
+   * Also copies inherited markers from parent session (for cascading forks)
    * @param {string} sourceSessionId - Original session UUID
-   * @param {string} messageUuid - UUID of the message where fork happened
    * @param {string} forkedToSessionId - New session UUID
+   * @param {string[]} entryUuids - Array of all entry UUIDs at fork time (snapshot)
    */
-  saveForkMarker(sourceSessionId, messageUuid, forkedToSessionId) {
+  saveForkMarker(sourceSessionId, forkedToSessionId, entryUuids) {
     try {
+      // First, copy all inherited markers from parent session
+      const parentMarkers = this.getForkMarkers(sourceSessionId);
+      for (const marker of parentMarkers) {
+        const inheritedJson = JSON.stringify(marker.entry_uuids || []);
+        this.db.prepare(`
+          INSERT OR IGNORE INTO fork_markers (source_session_id, forked_to_session_id, entry_uuids_json)
+          VALUES (?, ?, ?)
+        `).run(marker.source_session_id, forkedToSessionId, inheritedJson);
+        console.log('[DB] Inherited fork marker copied:', marker.source_session_id, '->', forkedToSessionId);
+      }
+
+      // Then add the new fork marker
+      const entryUuidsJson = JSON.stringify(entryUuids || []);
       this.db.prepare(`
-        INSERT OR IGNORE INTO fork_markers (source_session_id, message_uuid, forked_to_session_id)
+        INSERT OR REPLACE INTO fork_markers (source_session_id, forked_to_session_id, entry_uuids_json)
         VALUES (?, ?, ?)
-      `).run(sourceSessionId, messageUuid, forkedToSessionId);
-      console.log('[DB] Fork marker saved:', { sourceSessionId, messageUuid, forkedToSessionId });
+      `).run(sourceSessionId, forkedToSessionId, entryUuidsJson);
+      console.log('[DB] Fork marker saved:', { sourceSessionId, forkedToSessionId, entryCount: entryUuids?.length || 0 });
     } catch (e) {
       console.error('[DB] Failed to save fork marker:', e);
     }
@@ -440,16 +457,22 @@ transaction(tabs);
   /**
    * Get fork origin for a session (to show blue line on Timeline where it was forked from)
    * @param {string} sessionId - Session UUID (the forked/child session)
-   * @returns {Array<{message_uuid: string, source_session_id: string}>}
+   * @returns {Array<{source_session_id: string, entry_uuids: string[]}>}
    */
   getForkMarkers(sessionId) {
     // Search by forked_to_session_id - we want to show the fork point on the CHILD session
-    return this.db.prepare(`
-      SELECT message_uuid, source_session_id, created_at
+    const rows = this.db.prepare(`
+      SELECT source_session_id, entry_uuids_json, created_at
       FROM fork_markers
       WHERE forked_to_session_id = ?
       ORDER BY created_at
     `).all(sessionId);
+
+    return rows.map(row => ({
+      source_session_id: row.source_session_id,
+      entry_uuids: JSON.parse(row.entry_uuids_json || '[]'),
+      created_at: row.created_at
+    }));
   }
 
   /**
