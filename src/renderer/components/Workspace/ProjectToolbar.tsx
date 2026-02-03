@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { Home, Minimize2, Play, ChevronDown, RotateCcw } from 'lucide-react';
 import { useUIStore } from '../../store/useUIStore';
-import { useWorkspaceStore } from '../../store/useWorkspaceStore';
+import { useWorkspaceStore, isTabInterrupted } from '../../store/useWorkspaceStore';
 import { compressLogs } from '../../utils/compressLogs';
 
 const { ipcRenderer } = window.require('electron');
@@ -35,7 +35,7 @@ export default function ProjectToolbar() {
     }> = [];
 
     workspace.tabs.forEach((tab) => {
-      if (tab.wasInterrupted && (tab.claudeSessionId || tab.geminiSessionId)) {
+      if (isTabInterrupted(tab)) {
         tabs.push({
           id: tab.id,
           claudeSessionId: tab.claudeSessionId,

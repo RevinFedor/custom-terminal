@@ -1,5 +1,5 @@
 import React, { useEffect, useState, useRef, memo } from 'react';
-import { useWorkspaceStore } from './store/useWorkspaceStore';
+import { useWorkspaceStore, isTabInterrupted } from './store/useWorkspaceStore';
 import { useProjectsStore } from './store/useProjectsStore';
 import { useUIStore } from './store/useUIStore';
 import { useResearchStore } from './store/useResearchStore';
@@ -822,11 +822,10 @@ function App() {
             });
 
             // Count interrupted (paused) sessions
+            // Count interrupted (paused) sessions using helper
             let interruptedCount = 0;
             workspace.tabs.forEach((tab) => {
-              if (tab.wasInterrupted && (tab.claudeSessionId || tab.geminiSessionId)) {
-                interruptedCount++;
-              }
+              if (isTabInterrupted(tab)) interruptedCount++;
             });
 
             return (

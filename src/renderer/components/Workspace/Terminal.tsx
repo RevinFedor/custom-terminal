@@ -623,10 +623,8 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
         const geminiMatch = fullLine.match(/\bgemini(\s|$)/i);
 
         if (devServerMatch) {
-          log.commands('Detected devServer command, setting commandType');
           getSetTabCommandType()(tabId, 'devServer');
         } else if (geminiMatch) {
-          log.commands('Detected gemini command, setting commandType');
           getSetTabCommandType()(tabId, 'gemini');
         }
 
