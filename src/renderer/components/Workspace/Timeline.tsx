@@ -41,8 +41,14 @@ const truncateText = (text: string | unknown, maxLength: number = 120): string =
   return clean.slice(0, maxLength) + '…';
 };
 
+interface ForkMarker {
+  message_uuid: string;
+  forked_to_session_id: string;
+}
+
 function Timeline({ tabId, sessionId, cwd }: TimelineProps) {
   const [entries, setEntries] = useState<TimelineEntry[]>([]);
+  const [forkMarkers, setForkMarkers] = useState<ForkMarker[]>([]);
   const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
   const [activeTooltipIndex, setActiveTooltipIndex] = useState<number | null>(null);
   const [isExpanded, setIsExpanded] = useState(false);
@@ -72,18 +78,31 @@ function Timeline({ tabId, sessionId, cwd }: TimelineProps) {
     setIsExpanded(false);
   }, [activeTooltipIndex]);
 
-  // Load timeline when sessionId changes
+  // Load timeline and fork markers when sessionId changes
   const loadTimeline = useCallback(async () => {
     if (!sessionId) {
       setEntries([]);
+      setForkMarkers([]);
       return;
     }
 
     setIsLoading(true);
     try {
-      const result = await ipcRenderer.invoke('claude:get-timeline', { sessionId, cwd });
-      if (result.success) {
-        setEntries(result.entries);
+      // Load timeline entries and fork markers in parallel
+      const [timelineResult, markersResult] = await Promise.all([
+        ipcRenderer.invoke('claude:get-timeline', { sessionId, cwd }),
+        ipcRenderer.invoke('claude:get-fork-markers', { sessionId })
+      ]);
+
+      console.log('[Timeline] Loaded entries:', timelineResult.entries?.length);
+      console.log('[Timeline] Fork markers result:', markersResult);
+
+      if (timelineResult.success) {
+        setEntries(timelineResult.entries);
+      }
+      if (markersResult.success && markersResult.markers?.length > 0) {
+        console.log('[Timeline] Setting fork markers:', markersResult.markers);
+        setForkMarkers(markersResult.markers);
       }
     } catch (error) {
       console.error('[Timeline] Error loading timeline:', error);
@@ -111,38 +130,35 @@ function Timeline({ tabId, sessionId, cwd }: TimelineProps) {
     return () => clearInterval(interval);
   }, [sessionId, loadTimeline]);
 
-  // Hover logic using global mousemove (relatedTarget unreliable with portals)
+  // Refs
   const tooltipRef = useRef<HTMLDivElement>(null);
-  const triggerRef = useRef<HTMLDivElement>(null); // Container for all segments
 
   const handleMouseEnterSegment = (index: number) => {
     setHoveredIndex(index);
     setActiveTooltipIndex(index);
   };
 
-  // Global mousemove listener - checks if mouse is over segment or tooltip
-  useEffect(() => {
-    if (activeTooltipIndex === null || isExpanded) return;
+  const handleMouseLeaveSegment = (e: React.MouseEvent) => {
+    setHoveredIndex(null);
 
-    const checkHover = (e: MouseEvent) => {
-      const target = e.target as HTMLElement;
-      const isOverSegment = target?.closest?.('[data-segment]');
-      const isOverTooltip = tooltipRef.current?.contains(target);
+    // Get segment bounds to determine direction
+    const segmentRect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    const mouseX = e.clientX;
 
-      if (!isOverSegment && !isOverTooltip) {
-        setHoveredIndex(null);
-        setActiveTooltipIndex(null);
-      }
-    };
+    // If mouse went LEFT (towards tooltip) - keep open
+    // If mouse went RIGHT (towards sidebar) - close
+    const wentLeft = mouseX < segmentRect.left;
 
-    document.addEventListener('mousemove', checkHover);
-    return () => document.removeEventListener('mousemove', checkHover);
-  }, [activeTooltipIndex, isExpanded]);
+    if (!wentLeft && !isExpanded) {
+      setActiveTooltipIndex(null);
+    }
+  };
 
-  const handleMouseEnterTooltip = () => {
-    // Keep hover state active
-    if (activeTooltipIndex !== null) {
-      setHoveredIndex(activeTooltipIndex);
+  // Simple hover close - CSS bridge handles the gap, no complex JS needed
+  const handleMouseLeaveTooltipArea = () => {
+    if (!isExpanded) {
+      setHoveredIndex(null);
+      setActiveTooltipIndex(null);
     }
   };
 
@@ -220,6 +236,7 @@ function Timeline({ tabId, sessionId, cwd }: TimelineProps) {
     <>
       <div
         ref={containerRef}
+        data-timeline
         className="relative flex flex-col group transition-all duration-300"
         style={{
           width: '24px',
@@ -248,7 +265,11 @@ function Timeline({ tabId, sessionId, cwd }: TimelineProps) {
           {entries.map((entry, index) => {
             const active = isSelected(entry, index);
             const isCompacted = entry.type === 'compact';
-            
+            // Fork point: if this session was forked, mark the LAST entry as fork point
+            // This shows where the session was forked from (the point at which fork happened)
+            const isLastEntry = index === entries.length - 1;
+            const isForkPoint = forkMarkers.length > 0 && isLastEntry;
+
             return (
               <div
                 key={entry.uuid}
@@ -259,9 +280,17 @@ function Timeline({ tabId, sessionId, cwd }: TimelineProps) {
                   backgroundColor: active ? 'rgba(59, 130, 246, 0.15)' : 'transparent',
                 }}
                 onMouseEnter={() => handleMouseEnterSegment(index)}
+                onMouseLeave={(e) => handleMouseLeaveSegment(e)}
                 onClick={() => handleEntryClick(entry)}
                 onContextMenu={(e) => handleRightClick(e, entry)}
               >
+                {/* Fork indicator - blue line on right side */}
+                {isForkPoint && (
+                  <div
+                    className="absolute right-0 top-0 bottom-0 w-[3px] bg-blue-500"
+                    title="Session was forked from here"
+                  />
+                )}
                 {/* Visual Indicator (Dot or Line) */}
                 <div
                   className="transition-all duration-200"
@@ -269,9 +298,9 @@ function Timeline({ tabId, sessionId, cwd }: TimelineProps) {
                     width: isCompacted ? '12px' : (hoveredIndex === index || activeTooltipIndex === index ? '8px' : '4px'),
                     height: isCompacted ? '2px' : (hoveredIndex === index || activeTooltipIndex === index ? '8px' : '4px'),
                     borderRadius: isCompacted ? '1px' : '50%',
-                    backgroundColor: isCompacted 
-                      ? '#f59e0b' 
-                      : (active ? '#3b82f6' : (hoveredIndex === index || activeTooltipIndex === index ? 'white' : 'rgba(255,255,255,0.3)')),
+                    backgroundColor: isCompacted
+                      ? '#f59e0b'
+                      : (isForkPoint ? '#3b82f6' : (active ? '#3b82f6' : (hoveredIndex === index || activeTooltipIndex === index ? 'white' : 'rgba(255,255,255,0.3)'))),
                     boxShadow: (hoveredIndex === index || activeTooltipIndex === index) ? '0 0 8px rgba(255,255,255,0.4)' : 'none',
                   }}
                 />
@@ -290,38 +319,48 @@ function Timeline({ tabId, sessionId, cwd }: TimelineProps) {
           />
         )}
 
-        {/* Tooltip Portal */}
+        {/* Tooltip Portal with CSS Bridge */}
         {activeTooltipIndex !== null && currentActiveEntry && (
           <TooltipPortal>
+            {/* Outer wrapper - handles mouse leave for entire area including bridge */}
             <div
               ref={tooltipRef}
-              tabIndex={-1}
-              onMouseEnter={handleMouseEnterTooltip}
+              onMouseLeave={handleMouseLeaveTooltipArea}
               style={{
                 position: 'fixed',
-                right: `${notesPanelWidth + 32}px`,
-                top: `clamp(50px, ${getElementCenterY(activeTooltipIndex)}px, calc(100vh - 150px))`,
-                transform: 'translateY(-50%)',
-                outline: 'none',
+                right: `${notesPanelWidth + 24}px`,
+                // Calculate top: center on element, but clamp to viewport
+                // Tooltip height ~200px, so offset by half (100px) for centering
+                top: Math.max(40, Math.min(getElementCenterY(activeTooltipIndex) - 100, window.innerHeight - 180)),
                 zIndex: 10000,
-                backgroundColor: 'rgba(25, 25, 25, 0.98)',
-                backdropFilter: 'blur(12px)',
-                border: '1px solid rgba(255, 255, 255, 0.1)',
-                borderRadius: '6px',
-                padding: '10px 14px',
-                fontSize: '12px',
-                color: 'white',
-                minWidth: '240px',
-                maxWidth: '320px',
-                maxHeight: isExpanded ? '60vh' : '200px',
-                boxShadow: '0 15px 35px rgba(0,0,0,0.6)',
                 display: 'flex',
-                flexDirection: 'column',
-                gap: '8px',
-                transition: 'max-height 0.2s ease-in-out',
-                overflow: 'hidden'
+                flexDirection: 'row',
+                alignItems: 'center',
               }}
             >
+              {/* Visible tooltip content */}
+              <div
+                tabIndex={-1}
+                style={{
+                  outline: 'none',
+                  backgroundColor: 'rgba(25, 25, 25, 0.98)',
+                  backdropFilter: 'blur(12px)',
+                  border: '1px solid rgba(255, 255, 255, 0.1)',
+                  borderRadius: '6px',
+                  padding: '10px 14px',
+                  fontSize: '12px',
+                  color: 'white',
+                  minWidth: '240px',
+                  maxWidth: '320px',
+                  maxHeight: isExpanded ? '60vh' : '200px',
+                  boxShadow: '0 15px 35px rgba(0,0,0,0.6)',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: '8px',
+                  transition: 'max-height 0.2s ease-in-out',
+                  overflow: 'hidden'
+                }}
+              >
                 {currentActiveEntry.type === 'compact' ? (
                   <span className="text-amber-400 font-medium">History Compacted ({currentActiveEntry.preTokens ? `${Math.round(currentActiveEntry.preTokens/1000)}k` : '?'} tokens)</span>
                 ) : (
@@ -333,13 +372,16 @@ function Timeline({ tabId, sessionId, cwd }: TimelineProps) {
                       >
                         {isExpanded ? currentActiveEntry.content : truncateText(currentActiveEntry.content, 200)}
                       </div>
-                      <button
-                        onClick={(e) => { e.stopPropagation(); setIsExpanded(!isExpanded); }}
-                        className="p-1.5 rounded hover:bg-white/10 text-white/40 hover:text-white transition-colors cursor-pointer shrink-0"
-                        title={isExpanded ? "Свернуть" : "Развернуть полностью"}
-                      >
-                        {isExpanded ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
-                      </button>
+                      {/* Show expand button only if content is truncated */}
+                      {(currentActiveEntry.content.length > 200 || isExpanded) && (
+                        <button
+                          onClick={(e) => { e.stopPropagation(); setIsExpanded(!isExpanded); }}
+                          className="p-1.5 rounded hover:bg-white/10 text-white/40 hover:text-white transition-colors cursor-pointer shrink-0"
+                          title={isExpanded ? "Свернуть" : "Развернуть полностью"}
+                        >
+                          {isExpanded ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
+                        </button>
+                      )}
                     </div>
                     <div className="flex justify-between items-center mt-1 pt-2 border-t border-white/5">
                       <span className="text-[10px] text-white/30">{new Date(currentActiveEntry.timestamp).toLocaleTimeString()}</span>
@@ -353,6 +395,15 @@ function Timeline({ tabId, sessionId, cwd }: TimelineProps) {
                     </div>
                   </>
                 )}
+              </div>
+              {/* CSS Bridge - invisible area connecting tooltip to timeline */}
+              <div
+                style={{
+                  width: '50px',
+                  height: '80px',
+                  // background: 'rgba(255,0,0,0.1)', // Uncomment for debug
+                }}
+              />
             </div>
           </TooltipPortal>
         )}

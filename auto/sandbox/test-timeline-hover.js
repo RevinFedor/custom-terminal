@@ -120,17 +120,46 @@ async function main() {
     log.fail('Tooltip закрылся при переходе к нему')
   }
 
-  // Теперь двигаем мышь далеко влево (должен закрыться)
+  // Теперь двигаем мышь далеко влево (плавно, должен закрыться)
   log.step('Движение мыши далеко влево (tooltip должен закрыться)...')
-  await page.mouse.move(100, startY)
-  await page.waitForTimeout(500)
+  for (let i = 0; i < 10; i++) {
+    await page.mouse.move(tooltipBefore.x - (i * 80), startY)
+    await page.waitForTimeout(30)
+  }
+  await page.waitForTimeout(300)
 
-  const tooltipGone = await page.locator('[tabindex="-1"]').first().boundingBox()
+  const tooltipGone = await page.locator('[tabindex="-1"]').first().boundingBox({ timeout: 1000 }).catch(() => null)
 
   if (!tooltipGone) {
-    log.pass('Tooltip закрылся при уходе мыши')
+    log.pass('Tooltip закрылся при уходе мыши влево')
   } else {
-    log.fail('Tooltip НЕ закрылся при уходе мыши')
+    log.fail('Tooltip НЕ закрылся при уходе мыши влево')
+  }
+
+  // Тест закрытия при уходе ВПРАВО
+  log.step('Тест закрытия при уходе ВПРАВО на сайдбар...')
+  await page.mouse.move(segmentBox.x + segmentBox.width / 2, segmentBox.y + segmentBox.height / 2)
+  await page.waitForTimeout(500)
+
+  const tooltip2 = await page.locator('[tabindex="-1"]').first().boundingBox({ timeout: 2000 }).catch(() => null)
+  if (tooltip2) {
+    log.pass('Tooltip появился снова')
+
+    // Двигаем ВПРАВО
+    for (let i = 0; i < 5; i++) {
+      await page.mouse.move(segmentBox.x + segmentBox.width + (i * 30), segmentBox.y + segmentBox.height / 2)
+      await page.waitForTimeout(30)
+    }
+    await page.waitForTimeout(200)
+
+    const tooltipAfterRight = await page.locator('[tabindex="-1"]').first().boundingBox({ timeout: 500 }).catch(() => null)
+    if (!tooltipAfterRight) {
+      log.pass('Tooltip закрылся при уходе ВПРАВО')
+    } else {
+      log.fail('Tooltip НЕ закрылся при уходе вправо')
+    }
+  } else {
+    log.info('Tooltip не появился при повторном наведении (возможно требуется клик)')
   }
 
   // Вывод логов
