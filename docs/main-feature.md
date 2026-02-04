@@ -9,14 +9,17 @@
 - **Cmd+T (в фокусе):** Создает новый проект и сразу включает режим переименования.
 - **Стрелки (в фокусе):** Переключение между открытыми проектами.
 - **Esc:** Возврат фокуса в терминал.
+- **Multi-Select (Tabs):** Поддержка выбора нескольких вкладок терминала через `Shift+Click` или `Cmd+Click` для массового закрытия или экспорта. См. [`knowledge/fact-selection-model.md`](knowledge/fact-selection-model.md).
 - **Bookmarks:** Резервирование папок в секции "Reserved Directories" для быстрого создания новых сред. См. [`features/bookmarks.md`](features/bookmarks.md).
 - **Home View:** Специальный экран проекта со списком всех его терминалов. См. [`features/project-home.md`](features/project-home.md).
 - **Особенности:** Поддержка нескольких инстансов одного пути. См. [`knowledge/fix-project-instances.md`](knowledge/fix-project-instances.md).
 
 ## 2. Flow: Умное управление терминалом
 - **Скролл:** Скрытый горизонтальный скролл в `TabBar` (прокрутка колесиком без Shift).
+- **Scripts:** Запуск npm-скриптов из `package.json` текущей директории через выпадающий список. См. [`features/scripts.md`](features/scripts.md).
+- **RestartZone:** Кнопка быстрого перезапуска для dev-серверов (появляется при наведении на зелёный маркер активного процесса).
 - **Cross-Project Drag:** Перетаскивание таба терминала на заголовок другого проекта в Title Bar перемещает таб в этот проект.
-- **Timeline:** Навигация по истории Claude через вертикальную полосу справа.
+- **Timeline:** Навигация по истории Claude через вертикальную полосу справа. См. [`features/timeline.md`](features/timeline.md).
 - **Подробнее:** [`features/tabs.md`](features/tabs.md), [`features/timeline.md`](features/timeline.md)
 
 ## 3. Flow: AI Исследование (Research)
@@ -28,7 +31,11 @@
 
 ## 4. Flow: Синхронизация и Экспорт
 - **Update Docs:** Отправляет `/export` в Клода и скармливает результат Gemini.
-- **Copy Session:** Мгновенный экспорт диалога Claude в буфер обмена с автоматической очисткой кода. См. `knowledge/fix-claude-clean-export.md`.
+- **Copy Session:** Экспорт диалога Claude в буфер обмена. Поддерживает:
+    - Выбор нескольких вкладок (массовый экспорт).
+    - Флаг `includeCode`: включение/исключение содержимого файлов.
+    - Флаг `fromStart`: экспорт всей истории или только с последнего форка.
+    - См. [`knowledge/fix-claude-clean-export.md`](knowledge/fix-claude-clean-export.md).
 - **Подробнее:** [`features/docs-update.md`](features/docs-update.md)
 
 ## 5. Flow: Безопасное восстановление (Persistence)
