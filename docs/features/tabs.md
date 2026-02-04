@@ -30,6 +30,8 @@
 - **Horizontal Scroll:** Таб-бар поддерживает прокрутку колесиком мыши без зажатого Shift. Используется `onWheel` с `{ passive: false }` для корректного предотвращения нативного скролла.
 - **Gap Separation:** Между вкладками используется физический разрыв `gap-[1px]`, что предотвращает слипание индикаторов активности и рамок при наведении.
 - **Auto-Scroll:** При перетаскивании таба к левому или правому краю, область вкладок автоматически скроллится. Используется `@atlaskit/pragmatic-drag-and-drop-auto-scroll`.
+- **Stable Resizing:** Размер терминала подстраивается под контейнер через `ResizeObserver`. Реализована защита от stale closure. См. [`knowledge/fix-terminal-resizing.md`](../knowledge/fix-terminal-resizing.md).
+- **Persistent Naming:** Тип команды сохраняется в БД, что предотвращает сброс кастомных имен при перезапуске. См. [`knowledge/fix-tab-rename-on-restart.md`](../knowledge/fix-tab-rename-on-restart.md).
 - **Cross-Project Move:** Таб можно перетащить на любую вкладку проекта в Title Bar. 
     - Логика: `moveTabToProject` в `useWorkspaceStore`.
     - PTY процесс сохраняется, меняется только привязка к проекту в БД.
