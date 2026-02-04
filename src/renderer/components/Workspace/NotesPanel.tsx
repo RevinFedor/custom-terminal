@@ -1,5 +1,4 @@
 import React, { useState, useEffect } from 'react';
-import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useResearchStore } from '../../store/useResearchStore';
 import InfoPanel from './panels/InfoPanel';
@@ -23,7 +22,6 @@ interface NotesPanelProps {
 type TabType = 'info' | 'ai' | 'actions' | 'sessions';
 
 export default function NotesPanel({ projectId, project }: NotesPanelProps) {
-  const { notesPanelWidth } = useUIStore();
   const { getActiveProject } = useWorkspaceStore();
   const { pendingResearch } = useResearchStore();
 
@@ -48,8 +46,7 @@ export default function NotesPanel({ projectId, project }: NotesPanelProps) {
 
   return (
     <div
-      className="bg-notes border-l border-border-main flex flex-col min-w-[150px]"
-      style={{ width: notesPanelWidth }}
+      className="bg-notes border-l border-border-main flex flex-col min-w-[150px] w-full h-full"
     >
       {/* Tabs */}
       <div className="flex border-b border-border-main bg-[#2d2d2d]">

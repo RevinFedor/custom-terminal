@@ -26,6 +26,7 @@
 - **Backend:** `node-pty`.
 - **Shell Integration (OSC 7 & 133):**
     - **OSC 7:** Передача текущего рабочего каталога (CWD). См. `knowledge/fact-osc7-cwd.md`.
+    - **CWD Capture:** Для фичи Scripts (см. `features/scripts.md`) используется IPC `terminal:getCwd`, который запрашивает путь напрямую у инстанса xterm.js, гарантируя актуальность после команд `cd`.
     - **OSC 133 (Event-Driven):** Использование невидимых сигналов от шелла для отслеживания жизненного цикла команд. Позволяет мгновенно узнавать о старте и завершении процесса без polling. См. `knowledge/fix-process-polling-to-osc133.md`.
     - **КРИТИЧЕСКОЕ ПРАВИЛО:** Запрещён polling через `pgrep`/`ps` для определения статуса процесса. Использовать только `terminal:getCommandState` (память) и IPC-события `terminal:command-started`/`terminal:command-finished`.
 - **Search Engine:** Интеграция `@xterm/addon-search` для полнотекстового поиска по буферу.
@@ -34,13 +35,15 @@
     - **Claude Sniper:** Захват UUID через `fs.watch` на `.jsonl` файлы.
     - **Gemini Sniper:** Захват UUID через `fs.watch` на `session-*.json`. См. `knowledge/fix-gemini-id-capture.md`.
     - **Timeline Engine:** Асинхронный парсинг JSONL файлов с использованием алгоритма **Backtrace** для фильтрации отменённых (Undo) веток диалога. См. `knowledge/fix-jsonl-backtrace.md`.
+    - **Fork Markers (Snapshot UUIDs):** Для визуализации форков в Timeline используется метод снимков. В БД сохраняется массив всех UUID сообщений на момент форка. Это позволяет метке оставаться на правильном месте даже при откатах истории (Escape/Undo). См. `features/timeline.md`.
 - **Large Input:** Safe Write (chunked write) для вставки промптов > 4KB. См. `knowledge/fix-pty-buffer-overflow.md`.
 
 ## 5. AI Session Recovery
 Система восстановления прерванных AI сессий (Claude/Gemini) при перезагрузке или крэше приложения.
 
 ### Компоненты:
-- **Tab Metadata:** `claudeSessionId`, `geminiSessionId`, `wasInterrupted`, `overlayDismissed` — сохраняются в SQLite.
+- **Tab Metadata:** `claudeSessionId`, `geminiSessionId`, `commandType`, `wasInterrupted`, `overlayDismissed` — сохраняются в SQLite.
+- **commandType Persistence:** Поле `commandType` сохраняется в БД, чтобы после перезапуска отличить AI-сессию от обычного терминала и избежать автоматического переименования вкладки.
 - **Sniper Watcher:** `fs.watch` на файлы сессий для захвата UUID при запуске AI.
 - **Interrupted Overlay:** UI компонент для предложения восстановления (`TerminalArea.tsx`).
 
@@ -67,16 +70,17 @@ Continue → claude --resume ID | Dismiss → overlayDismissed = true
 - **Файл:** `src/renderer/utils/logger.ts`.
 - **Категории:** `app:claude`, `app:tabs`, `app:commands`, `app:perf`, `app:terminal`, `app:store`, `app:ui`.
 - **Управление:** Включается через консоль DevTools: `localStorage.debug = 'app:*'`.
-- **Хелперы:** Доступны через глобальный объект `window.debug`.
+- **Принудительный режим:** В режиме разработки логгер принудительно включает `app:tabs` для отслеживания жизненного цикла сессий. См. `knowledge/fix-ui-stability.md`.
 
 ## 7. Styling & Rendering
 - **Tailwind v4 + Vite:** Используется официальный плагин `@tailwindcss/vite`, обеспечивающий мгновенный HMR и автоматическое сканирование зависимостей. См. `knowledge/fix-tailwind-v4-source.md`.
 - **Dynamic Styles:** Для рантайм-цветов используются Inline Styles (Tailwind не поддерживает динамическую генерацию классов типа `bg-${color}`). См. `knowledge/fix-tailwind-dynamic-runtime.md`.
-- **Markdown:** Специальный рендерер для исправления гидратации и inline-кода. См. `knowledge/fix-markdown-hydration.md` и `knowledge/fix-markdown-inline-code.md`.
+- **Markdown:** Специальный рендерер для исправления гидратации и inline-кода. См. `knowledge/fix-markdown-hydration.md`, `knowledge/fix-markdown-inline-code.md` и `knowledge/fix-markdown-editor-recreation.md`.
 - **Hotkeys:** Перехват `Cmd+Plus/Minus` для изменения шрифта терминала вместо системного зума. См. `knowledge/fix-ui-stability.md` (раздел 6).
 
 ## 8. UI Patterns & Modals
 - **Title Bar (Layered Drag):** Для совмещения перетаскивания окна и интерактивных элементов используется стратегия "Слоёного пирога": родитель имеет `drag`, дочерние интерактивные элементы — `no-drag`. См. `knowledge/fix-titlebar-layered-drag.md`.
+- **Interactive Hover Zones:** Для плавного перехода курсора от триггера к всплывающему окну (порталу) используется стратегия "Невидимого мостика". См. `knowledge/fix-interactive-hover-zones.md`.
 - **Context Modals (Notes, Research):** Должны рендериться внутри контейнера `Workspace` с использованием `absolute positioning` (inset-0) и `z-index: 50`. Контейнер Workspace должен иметь `relative`.
     - **Why:** Это обеспечивает правильное наложение поверх терминала, но сохранение контекста рабочей области, а также позволяет использовать "floating sheet" дизайн с отступами.
     - **Avoid:** Не использовать `createPortal(..., document.body)` для контекстных инструментов, так как это нарушает иерархию стилей и усложняет позиционирование относительно UI терминала.
