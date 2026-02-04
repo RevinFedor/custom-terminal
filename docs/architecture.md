@@ -31,6 +31,7 @@
     - **КРИТИЧЕСКОЕ ПРАВИЛО:** Запрещён polling через `pgrep`/`ps` для определения статуса процесса. Использовать только `terminal:getCommandState` (память) и IPC-события `terminal:command-started`/`terminal:command-finished`.
 - **Search Engine:** Интеграция `@xterm/addon-search` для полнотекстового поиска по буферу.
     - **Proposed API:** Для работы поиска в `xterm.js` включена опция `allowProposedApi: true`.
+- **Resizing:** Управление размером терминала через `ResizeObserver`. Для стабильности используется `activeRef` во избежание проблем с замыканиями. См. `knowledge/fix-terminal-resizing.md`.
 - **AI Integrations:**
     - **Claude Sniper:** Захват UUID через `fs.watch` на `.jsonl` файлы.
     - **Gemini Sniper:** Захват UUID через `fs.watch` на `session-*.json`. См. `knowledge/fix-gemini-id-capture.md`.
@@ -43,7 +44,7 @@
 
 ### Компоненты:
 - **Tab Metadata:** `claudeSessionId`, `geminiSessionId`, `commandType`, `wasInterrupted`, `overlayDismissed` — сохраняются в SQLite.
-- **commandType Persistence:** Поле `commandType` сохраняется в БД, чтобы после перезапуска отличить AI-сессию от обычного терминала и избежать автоматического переименования вкладки.
+- **commandType Persistence:** Поле `commandType` сохраняется в БД, чтобы после перезапуска отличить AI-сессию от обычного терминала и избежать автоматического переименования вкладки. См. `knowledge/fix-tab-rename-on-restart.md`.
 - **Sniper Watcher:** `fs.watch` на файлы сессий для захвата UUID при запуске AI.
 - **Interrupted Overlay:** UI компонент для предложения восстановления (`TerminalArea.tsx`).
 
@@ -81,6 +82,7 @@ Continue → claude --resume ID | Dismiss → overlayDismissed = true
 ## 8. UI Patterns & Modals
 - **Title Bar (Layered Drag):** Для совмещения перетаскивания окна и интерактивных элементов используется стратегия "Слоёного пирога": родитель имеет `drag`, дочерние интерактивные элементы — `no-drag`. См. `knowledge/fix-titlebar-layered-drag.md`.
 - **Interactive Hover Zones:** Для плавного перехода курсора от триггера к всплывающему окну (порталу) используется стратегия "Невидимого мостика". См. `knowledge/fix-interactive-hover-zones.md`.
+- **Layout Robustness:** Избегайте дублирования фиксированной ширины (`notesPanelWidth`) во вложенных компонентах. Используйте `w-full` или `flex-1`, чтобы верстка не ломалась при динамическом появлении элементов (например, Timeline). См. `knowledge/fix-layout-clipping.md`.
 - **Context Modals (Notes, Research):** Должны рендериться внутри контейнера `Workspace` с использованием `absolute positioning` (inset-0) и `z-index: 50`. Контейнер Workspace должен иметь `relative`.
     - **Why:** Это обеспечивает правильное наложение поверх терминала, но сохранение контекста рабочей области, а также позволяет использовать "floating sheet" дизайн с отступами.
     - **Avoid:** Не использовать `createPortal(..., document.body)` для контекстных инструментов, так как это нарушает иерархию стилей и усложняет позиционирование относительно UI терминала.
