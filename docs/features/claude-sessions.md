@@ -10,7 +10,7 @@
 - **Copy Session:** Кнопка в секции Actions позволяет скопировать весь текущий диалог в буфер обмена с автоматической очисткой кода для переноса в другие AI.
 
 ## Sniper Watcher (Session ID Capture)
-Механизм захвата UUID сессии при запуске Claude. Реализован как функция `startSessionSniper()` в `main.js`. См. `knowledge/fix-sniper-dual-method.md`.
+Механизм захвата UUID сессии при запуске Claude. Реализован как функция `startSessionSniper()` в `main.js`. См. `knowledge/ai-automation.md`.
 
 ### Алгоритм
 1. **Snapshot:** Перед запуском Claude фиксируется список существующих `.jsonl` файлов в директории `~/.claude/projects/<slug>/`. Это позволяет отличить новый файл от старого.
@@ -27,7 +27,7 @@
 - **Fork:** ID новой сессии будет пойман Sniper'ом, но ID родительской передаётся напрямую.
 
 ### Ограничение Claude CLI
-Claude CLI создаёт `.jsonl` файл **только после первого обмена сообщениями**. При запуске без Default Prompt Sniper не срабатывает до тех пор, пока пользователь не введёт первый промпт. В этот период InfoPanel показывает "Ожидание сессии..." (см. `knowledge/fix-session-waiting-state.md`).
+Claude CLI создаёт `.jsonl` файл **только после первого обмена сообщениями**. При запуске без Default Prompt Sniper не срабатывает до тех пор, пока пользователь не введёт первый промпт. В этот период InfoPanel показывает "Ожидание сессии..." (см. `knowledge/ai-automation.md`).
 
 ## Handshake (Thinking Mode + Prompt Injection)
 Стейт-машина для автоматического включения thinking mode и отправки промпта:
@@ -40,17 +40,17 @@ WAITING_PROMPT → DEBOUNCE_PROMPT → TAB_SENT → READY
 1. **WAITING_PROMPT:** Ждёт появления prompt-символа (`⏵` для Claude v2.1.32+ или `>` для старых версий). Используется `stripVTControlCharacters()` для очистки ANSI.
 2. **DEBOUNCE_PROMPT:** Задержка 200мс после обнаружения промпта (Claude может вывести несколько строк).
 3. **TAB_SENT:** Отправляет `\t` (Tab) для включения thinking mode. Ждёт второго появления промпта.
-4. **READY:** Если есть `pendingPrompt`, отправляет его через Safe Write (chunked bracketed paste). См. `knowledge/fix-pty-buffer-overflow.md`.
+4. **READY:** Если есть `pendingPrompt`, отправляет его через Safe Write (chunked bracketed paste). См. `knowledge/terminal-core.md`.
 
 ## Behavior Specs
 - **Claude Process Monitor:** Виджет на Dashboard для отслеживания всех запущенных в системе процессов Claude CLI.
     - **In-App:** Процессы, запущенные из терминалов приложения. Отображаются с указанием "Имя Проекта / Имя Таба".
     - **External:** Процессы, запущенные во внешних терминалах (iTerm, Terminal.app).
     - **Manual Stop:** Каждая карточка процесса имеет кнопку "Stop" (Square icon), которая отправляет сигнал `kill` процессу.
-- **Clean Export:** При копировании сессии блоки кода заменяются на компактные метки. См. `knowledge/fix-claude-clean-export.md`.
+- **Clean Export:** При копировании сессии блоки кода заменяются на компактные метки. См. `knowledge/ai-automation.md`.
 - **Backtrace Timeline:** История сессии отображается на вертикальном таймлайне с фильтрацией Undo-веток. См. `features/timeline.md`.
-- **Interrupted Recovery:** При аварийном закрытии показывается оверлей. Выбор пользователя сохраняется в БД. См. `knowledge/fix-interrupted-overlay-persistence.md`.
-- **Session Waiting State:** Промежуточное состояние "Ожидание сессии..." с пульсирующим жёлтым индикатором. См. `knowledge/fix-session-waiting-state.md`.
+- **Interrupted Recovery:** При аварийном закрытии показывается оверлей. Выбор пользователя сохраняется в БД. См. `knowledge/ui-ux-stability.md`.
+- **Session Waiting State:** Промежуточное состояние "Ожидание сессии..." с пульсирующим жёлтым индикатором. См. `knowledge/ai-automation.md`.
 - **History Restore:** При восстановлении из History `claudeSessionId` передаётся напрямую в `createTab()` (Immediate Injection). См. `features/project-home.md`.
 
 ## Code Map

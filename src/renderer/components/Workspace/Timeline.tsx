@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 import { Maximize2, Copy, Minimize2 } from 'lucide-react';
 import { terminalRegistry } from '../../utils/terminalRegistry';
 import { useUIStore } from '../../store/useUIStore';
+import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -57,7 +58,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true }: TimelineProps) {
   const [isLoading, setIsLoading] = useState(false);
   const [contextMenu, setContextMenu] = useState<{ x: number, y: number, entry: TimelineEntry } | null>(null);
   const [viewport, setViewport] = useState({ top: 0, bottom: 0, total: 1 });
-  
+  const [unreachableUuids, setUnreachableUuids] = useState<Set<string>>(new Set());
+
   const notesPanelWidth = useUIStore(state => state.notesPanelWidth);
   const containerRef = useRef<HTMLDivElement>(null);
   const segmentRefs = useRef<(HTMLDivElement | null)[]>([]);
@@ -98,6 +100,22 @@ function Timeline({ tabId, sessionId, cwd, isActive = true }: TimelineProps) {
 
       if (timelineResult.success) {
         setEntries(timelineResult.entries);
+
+        // Detect session ID change (e.g., after "Clear Context" in plan mode)
+        // If the timeline resolved a newer session, update our store
+        if (timelineResult.latestSessionId && timelineResult.latestSessionId !== sessionId) {
+          console.log('[Timeline] Session chain detected! Updating sessionId:', sessionId, '→', timelineResult.latestSessionId);
+          useWorkspaceStore.getState().setClaudeSessionId(tabId, timelineResult.latestSessionId);
+        }
+
+        // Bind markers retroactively for each entry (one-time per entry)
+        for (const entry of timelineResult.entries) {
+          if (entry.type === 'compact') continue;
+          const searchText = entry.content.split('\n')[0].slice(0, 40).trim();
+          if (searchText) {
+            terminalRegistry.bindEntryBySearch(tabId, entry.uuid, searchText);
+          }
+        }
       }
       if (markersResult.success) {
         const markers = markersResult.markers || [];
@@ -109,7 +127,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true }: TimelineProps) {
     } finally {
       setIsLoading(false);
     }
-  }, [sessionId, cwd]);
+  }, [sessionId, cwd, tabId]);
 
   useEffect(() => {
     loadTimeline();
@@ -130,6 +148,30 @@ function Timeline({ tabId, sessionId, cwd, isActive = true }: TimelineProps) {
     const interval = setInterval(loadTimeline, 2000);
     return () => clearInterval(interval);
   }, [sessionId, loadTimeline]);
+
+  // Check reachability of entries periodically (markers may get disposed by scrollback trim)
+  useEffect(() => {
+    if (entries.length === 0) return;
+    const checkReachability = () => {
+      const newUnreachable = new Set<string>();
+      for (const entry of entries) {
+        if (entry.type === 'compact') continue;
+        if (!terminalRegistry.isEntryReachable(tabId, entry.uuid)) {
+          newUnreachable.add(entry.uuid);
+        }
+      }
+      setUnreachableUuids(prev => {
+        // Only update if changed
+        if (prev.size !== newUnreachable.size || [...newUnreachable].some(id => !prev.has(id))) {
+          return newUnreachable;
+        }
+        return prev;
+      });
+    };
+    checkReachability();
+    const interval = setInterval(checkReachability, 3000);
+    return () => clearInterval(interval);
+  }, [entries, tabId]);
 
   // Refs
   const tooltipRef = useRef<HTMLDivElement>(null);
@@ -181,10 +223,39 @@ function Timeline({ tabId, sessionId, cwd, isActive = true }: TimelineProps) {
   };
 
   const handleEntryClick = useCallback((entry: TimelineEntry) => {
-    if (entry.type === 'compact') return;
+    if (entry.type === 'compact') {
+      console.log('[Timeline.handleEntryClick] Skipping compact entry:', entry.uuid);
+      return;
+    }
     const searchText = entry.content.split('\n')[0].slice(0, 40).trim();
+    console.log('[Timeline.handleEntryClick] entry:', {
+      uuid: entry.uuid,
+      type: entry.type,
+      contentPreview: entry.content.slice(0, 60),
+      searchText,
+    });
+
     if (searchText) {
-      terminalRegistry.searchAndScroll(tabId, searchText);
+      // Try marker-based navigation first
+      const markerLine = terminalRegistry.getEntryMarkerLine(tabId, entry.uuid);
+      if (markerLine !== null) {
+        console.log('[Timeline.handleEntryClick] Using marker navigation, line:', markerLine);
+        const scrolled = terminalRegistry.scrollToEntry(tabId, entry.uuid);
+        if (scrolled) {
+          console.log('[Timeline.handleEntryClick] Marker scroll SUCCESS');
+          return;
+        }
+        console.log('[Timeline.handleEntryClick] Marker scroll failed, falling back to search');
+      }
+
+      const found = terminalRegistry.searchAndScroll(tabId, searchText);
+      console.log('[Timeline.handleEntryClick] searchAndScroll result:', found);
+
+      // Log viewport state after scroll
+      const vp = terminalRegistry.getViewportState(tabId);
+      if (vp) {
+        console.log('[Timeline.handleEntryClick] viewport after scroll:', vp);
+      }
     }
   }, [tabId]);
 
@@ -249,6 +320,10 @@ function Timeline({ tabId, sessionId, cwd, isActive = true }: TimelineProps) {
 
   const currentActiveEntry = activeTooltipIndex !== null ? entries[activeTooltipIndex] : null;
 
+  // Compute first reachable entry index for dead zone overlay
+  const firstReachableIndex = entries.findIndex(e => e.type !== 'compact' && !unreachableUuids.has(e.uuid));
+  const hasDeadZone = firstReachableIndex > 0 && unreachableUuids.size > 0;
+
   // Compute tooltip wrapper position — uses measured height for precision
   const tooltipPos = activeTooltipIndex !== null ? (() => {
     const eCenterY = getElementCenterY(activeTooltipIndex);
@@ -303,15 +378,43 @@ function Timeline({ tabId, sessionId, cwd, isActive = true }: TimelineProps) {
         {/* Central Axis Line */}
         <div className="absolute left-1/2 top-0 bottom-0 w-[1px] bg-white/10 -translate-x-1/2 pointer-events-none" />
 
+        {/* Dead Zone Overlay — covers entries that have been trimmed from scrollback */}
+        {hasDeadZone && (
+          <div
+            className="absolute left-0 right-0 top-0 pointer-events-none z-[1]"
+            style={{
+              height: `${(firstReachableIndex / entries.length) * 100}%`,
+              background: 'rgba(0, 0, 0, 0.3)',
+              borderBottom: '1px solid rgba(255, 255, 255, 0.08)',
+            }}
+          />
+        )}
+
         {/* Viewport Indicator */}
-        <div 
-          className="absolute left-0 right-0 bg-blue-500/10 border-y border-blue-500/40 pointer-events-none z-0 transition-all duration-75"
-          style={{
-            top: `${(viewport.top / viewport.total) * 100}%`,
-            height: `${((viewport.bottom - viewport.top) / viewport.total) * 100}%`,
-            minHeight: '2px'
-          }}
-        />
+        {(() => {
+          // If we have a dead zone, constrain viewport indicator to reachable zone only
+          const deadZonePct = hasDeadZone ? (firstReachableIndex / entries.length) * 100 : 0;
+          const liveZonePct = 100 - deadZonePct;
+
+          // Map viewport position into the live zone
+          const vpTopPct = (viewport.top / viewport.total) * 100;
+          const vpHeightPct = ((viewport.bottom - viewport.top) / viewport.total) * 100;
+
+          // Remap into live zone area
+          const adjustedTop = deadZonePct + vpTopPct * (liveZonePct / 100);
+          const adjustedHeight = vpHeightPct * (liveZonePct / 100);
+
+          return (
+            <div
+              className="absolute left-0 right-0 bg-blue-500/10 border-y border-blue-500/40 pointer-events-none z-0 transition-all duration-75"
+              style={{
+                top: `${adjustedTop}%`,
+                height: `${adjustedHeight}%`,
+                minHeight: '2px'
+              }}
+            />
+          );
+        })()}
 
         {/* Segmented Hit-boxes */}
         <div className="flex flex-col h-full w-full">
@@ -336,6 +439,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true }: TimelineProps) {
             const active = isSelected(entry, index);
             const isCompacted = entry.type === 'compact';
             const isLastEntry = index === entries.length - 1;
+            const isUnreachable = unreachableUuids.has(entry.uuid);
 
             // Check if fork marker should appear AFTER this entry
             // Fork marker shows after the LAST entry that exists in the fork snapshot
@@ -358,14 +462,16 @@ function Timeline({ tabId, sessionId, cwd, isActive = true }: TimelineProps) {
                 <div
                   ref={el => segmentRefs.current[index] = el}
                   data-segment
-                  className="relative flex-1 min-h-[4px] w-full flex items-center justify-center cursor-pointer transition-colors"
+                  className="relative flex-1 min-h-[4px] w-full flex items-center justify-center transition-colors"
                   style={{
-                    backgroundColor: active ? 'rgba(59, 130, 246, 0.15)' : 'transparent',
+                    backgroundColor: isUnreachable ? 'rgba(0, 0, 0, 0.15)' : (active ? 'rgba(59, 130, 246, 0.15)' : 'transparent'),
+                    opacity: isUnreachable ? 0.3 : 1,
+                    cursor: isUnreachable ? 'not-allowed' : 'pointer',
                   }}
-                  onMouseEnter={() => handleMouseEnterSegment(index)}
-                  onMouseLeave={(e) => handleMouseLeaveSegment(e)}
-                  onClick={() => handleEntryClick(entry)}
-                  onContextMenu={(e) => handleRightClick(e, entry)}
+                  onMouseEnter={() => !isUnreachable && handleMouseEnterSegment(index)}
+                  onMouseLeave={(e) => !isUnreachable && handleMouseLeaveSegment(e)}
+                  onClick={() => !isUnreachable && handleEntryClick(entry)}
+                  onContextMenu={(e) => !isUnreachable && handleRightClick(e, entry)}
                 >
                   {/* Visual Indicator: Dot (normal) or Line (compact) */}
                   <div

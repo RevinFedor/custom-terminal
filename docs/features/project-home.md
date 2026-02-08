@@ -15,7 +15,7 @@
 ### User Flow
 1. **Закрытие вкладки:** При закрытии таб архивируется в SQLite через IPC `project:archive-tab`. Сохраняются все метаданные: `name`, `cwd`, `color`, `commandType`, `claudeSessionId`, `geminiSessionId`, `notes`.
 2. **Просмотр:** В Home View записи появляются в секции History с группировкой по дате `closed_at`.
-3. **Hover Popover:** При наведении на запись появляется попап с деталями (notes, даты, path, type). Используется паттерн "Невидимого мостика" (см. `knowledge/fix-interactive-hover-zones.md`).
+3. **Hover Popover:** При наведении на запись появляется попап с деталями (notes, даты, path, type). Используется паттерн "Невидимого мостика" (см. `knowledge/ui-ux-stability.md`).
 4. **Restore:** Клик по записи восстанавливает вкладку:
    - Создаётся новый таб через `createTab()` с **полными** метаданными из БД.
    - Для AI-вкладок формируется `pendingAction`:
@@ -26,7 +26,7 @@
 5. **Clear:** Кнопка «Clear» очищает всю историю проекта (`project:clear-tab-history`).
 
 ### Критическое правило: Immediate Injection при Restore
-При восстановлении AI-вкладки `claudeSessionId` / `geminiSessionId` передаются в `createTab()` через `options`. Это гарантирует, что InfoPanel **мгновенно** видит ID сессии, без ожидания PTY или Sniper Watcher. См. `knowledge/fix-ai-ui-flicker.md`.
+При восстановлении AI-вкладки `claudeSessionId` / `geminiSessionId` передаются в `createTab()` через `options`. Это гарантирует, что InfoPanel **мгновенно** видит ID сессии, без ожидания PTY или Sniper Watcher. См. `knowledge/ui-ux-stability.md`.
 
 ### Данные History Entry (SQLite)
 ```

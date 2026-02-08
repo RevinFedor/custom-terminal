@@ -27,5 +27,5 @@
 - **Logic (Main):** `src/main/main.js` -> хендлеры `docs:export-session`, `docs:save-selection`, `docs:save-prompt-temp`.
 - **State:** `src/renderer/store/useUIStore.ts` -> `docPrompt` settings.
 - **Fixes:**
-    - `knowledge/fix-pty-buffer-overflow.md` — как вставляем большие промпты.
-    - `knowledge/fix-ai-sessions.md` — паттерн ожидания файла.
+    - `knowledge/terminal-core.md` — как вставляем большие промпты.
+    - `knowledge/ai-automation.md` — паттерн ожидания файла.
