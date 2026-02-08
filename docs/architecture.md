@@ -33,7 +33,8 @@
     - **Proposed API:** Для работы поиска в `xterm.js` включена опция `allowProposedApi: true`.
 - **Resizing:** Управление размером терминала через `ResizeObserver`. Для стабильности используется `activeRef` во избежание проблем с замыканиями. См. `knowledge/fix-terminal-resizing.md`.
 - **AI Integrations:**
-    - **Claude Sniper:** Захват UUID через `fs.watch` на `.jsonl` файлы.
+    - **Claude Sniper:** Захват UUID через dual-method: `fs.watch` + polling (1с fallback). Реализован как функция `startSessionSniper()` с snapshot существующих файлов и 30с таймаутом. См. `features/claude-sessions.md`.
+    - **Claude Handshake:** Стейт-машина (WAITING_PROMPT → DEBOUNCE_PROMPT → TAB_SENT → READY) для автоматического включения thinking mode (`\t`) и отправки промпта. Поддерживает `⏵` (Claude v2.1.32+) и `>`. Используется `stripVTControlCharacters()`.
     - **Gemini Sniper:** Захват UUID через `fs.watch` на `session-*.json`. См. `knowledge/fix-gemini-id-capture.md`.
     - **Timeline Engine:** Асинхронный парсинг JSONL файлов с использованием алгоритма **Backtrace** для фильтрации отменённых (Undo) веток диалога. См. `knowledge/fix-jsonl-backtrace.md`.
     - **Fork Markers (Snapshot UUIDs):** Для визуализации форков в Timeline используется метод снимков. В БД сохраняется массив всех UUID сообщений на момент форка. Это позволяет метке оставаться на правильном месте даже при откатах истории (Escape/Undo). См. `features/timeline.md`.

@@ -1055,6 +1055,61 @@ ipcMain.handle('bookmark:select-directory', async () => {
   return projectManager.db.createBookmark(selectedPath, name, '');
 });
 
+// ========== SYSTEM: CLAUDE PROCESSES ==========
+ipcMain.handle('system:get-claude-processes', async () => {
+  try {
+    // Find all claude CLI processes (not our Electron app)
+    const psOutput = await execAsync(
+      'ps -eo pid,lstart,command | grep -i "claude" | grep -v grep | grep -v electron',
+      3000
+    );
+
+    if (!psOutput) return [];
+
+    const lines = psOutput.split('\n').filter(Boolean);
+    const processes = [];
+
+    for (const line of lines) {
+      try {
+        // Parse ps output: PID + lstart (Day Mon DD HH:MM:SS YYYY) + command
+        const match = line.trim().match(/^\s*(\d+)\s+\w+\s+\w+\s+\d+\s+(\d+:\d+:\d+)\s+\d+\s+(.+)/);
+        if (!match) continue;
+
+        const pid = match[1];
+        const startTime = match[2]; // HH:MM:SS
+        const command = match[3].trim();
+
+        // Skip non-CLI claude processes
+        if (!command.includes('claude') || command.includes('Electron')) continue;
+
+        // Get CWD via lsof
+        let cwd = '';
+        try {
+          cwd = await execAsync('lsof -p ' + pid + ' | grep cwd | awk \'{print ' + '\$' + '9}\'', 2000);
+        } catch {
+          // Process may have exited
+          continue;
+        }
+
+        if (!cwd) continue;
+
+        processes.push({
+          pid: Number(pid),
+          cwd,
+          startTime: startTime.substring(0, 5), // HH:MM
+          command,
+        });
+      } catch {
+        // Skip unparseable lines
+      }
+    }
+
+    return processes;
+  } catch {
+    return [];
+  }
+});
+
 // Execute quick action command in terminal (fire-and-forget version)
 // For backwards compatibility - use terminal:executeCommandAsync for sequential commands
 ipcMain.on('terminal:executeCommand', (event, tabId, command) => {
