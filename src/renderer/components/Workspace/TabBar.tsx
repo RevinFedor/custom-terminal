@@ -451,19 +451,23 @@ const TabItem = memo(({
         <span className="select-none whitespace-nowrap overflow-hidden text-ellipsis flex items-center gap-1" style={{ flex: isHorizontal ? 'none' : 1 }}>
           {tab.tabType === 'browser' && <Globe size={12} className="flex-shrink-0 opacity-60" />}
           {tab.name}
-          {showNotesIndicator && (
-            <span
-              style={{
-                width: '5px',
-                height: '5px',
-                borderRadius: '50%',
-                backgroundColor: '#DA7756',
-                flexShrink: 0,
-                opacity: 0.9,
-              }}
-            />
-          )}
         </span>
+      )}
+
+      {/* Notes indicator dot — absolute, doesn't affect layout */}
+      {showNotesIndicator && (
+        <span
+          style={{
+            position: 'absolute',
+            top: '4px',
+            right: '4px',
+            width: '5px',
+            height: '5px',
+            borderRadius: '50%',
+            backgroundColor: '#DA7756',
+            pointerEvents: 'none',
+          }}
+        />
       )}
 
       {/* Absolute overlay indicator - doesn't affect layout */}
@@ -693,6 +697,7 @@ function TabBar({ projectId }: TabBarProps) {
   const [isCmdPressed, setIsCmdPressed] = useState(false);
   const [notesPreview, setNotesPreview] = useState<{ tabId: string; rect: DOMRect } | null>(null);
   const isCmdPressedRef = useRef(false); // Ref to avoid stale closures
+  const notesCloseTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const [isMouseInTabBar, setIsMouseInTabBar] = useState(false);
 
   const workspace = openProjects.get(projectId);
@@ -742,12 +747,21 @@ function TabBar({ projectId }: TabBarProps) {
     };
   }, []);
 
-  // CMD+hover: callback for tab hover changes
+  // CMD+hover: callback for tab hover changes (with bridge timeout)
   const handleTabHoverChange = useCallback((tabId: string, hovering: boolean, rect?: DOMRect) => {
     if (hovering && rect) {
+      // Cancel any pending close when entering a tab
+      if (notesCloseTimeoutRef.current) {
+        clearTimeout(notesCloseTimeoutRef.current);
+        notesCloseTimeoutRef.current = null;
+      }
       setNotesPreview({ tabId, rect });
     } else {
-      setNotesPreview(prev => prev?.tabId === tabId ? null : prev);
+      // Delay close to allow cursor to reach popover (bridge pattern)
+      notesCloseTimeoutRef.current = setTimeout(() => {
+        setNotesPreview(prev => prev?.tabId === tabId ? null : prev);
+        notesCloseTimeoutRef.current = null;
+      }, 150);
     }
   }, []);
 
@@ -1105,6 +1119,7 @@ function TabBar({ projectId }: TabBarProps) {
     return () => {
       if (utilityHoverTimeoutRef.current) clearTimeout(utilityHoverTimeoutRef.current);
       if (utilityCloseTimeoutRef.current) clearTimeout(utilityCloseTimeoutRef.current);
+      if (notesCloseTimeoutRef.current) clearTimeout(notesCloseTimeoutRef.current);
     };
   }, []);
 
@@ -1513,11 +1528,18 @@ function TabBar({ projectId }: TabBarProps) {
               paddingTop: '4px', // Invisible bridge gap
             }}
             onMouseEnter={() => {
-              // Keep popover alive when cursor enters it
-              setNotesPreview(prev => prev ? { ...prev } : null);
+              // Cancel close timeout — cursor reached the popover
+              if (notesCloseTimeoutRef.current) {
+                clearTimeout(notesCloseTimeoutRef.current);
+                notesCloseTimeoutRef.current = null;
+              }
             }}
             onMouseLeave={() => {
               setNotesPreview(null);
+              if (notesCloseTimeoutRef.current) {
+                clearTimeout(notesCloseTimeoutRef.current);
+                notesCloseTimeoutRef.current = null;
+              }
             }}
           >
             <div
