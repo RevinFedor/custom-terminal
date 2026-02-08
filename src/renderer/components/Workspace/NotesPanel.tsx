@@ -3,7 +3,6 @@ import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useResearchStore } from '../../store/useResearchStore';
 import InfoPanel from './panels/InfoPanel';
 import GeminiPanel from './panels/GeminiPanel';
-import ActionsPanel from './panels/ActionsPanel';
 import SessionsPanel from './panels/SessionsPanel';
 
 interface Project {
@@ -19,7 +18,7 @@ interface NotesPanelProps {
   project: Project;
 }
 
-type TabType = 'info' | 'ai' | 'actions' | 'sessions';
+type TabType = 'info' | 'ai' | 'sessions';
 
 export default function NotesPanel({ projectId, project }: NotesPanelProps) {
   const { getActiveProject } = useWorkspaceStore();
@@ -29,6 +28,10 @@ export default function NotesPanel({ projectId, project }: NotesPanelProps) {
 
   const activeProject = getActiveProject();
   const activeTabId = activeProject?.activeTabId || null;
+
+  // Check if active tab has an active AI session
+  const activeTabData = activeTabId && activeProject ? activeProject.tabs.get(activeTabId) : null;
+  const hasActiveSession = !!(activeTabData?.claudeSessionId || activeTabData?.geminiSessionId);
 
   // Auto-switch to AI tab when research is triggered
   useEffect(() => {
@@ -40,7 +43,6 @@ export default function NotesPanel({ projectId, project }: NotesPanelProps) {
   const tabs: { id: TabType; label: string }[] = [
     { id: 'info', label: 'Info' },
     { id: 'ai', label: 'AI' },
-    { id: 'actions', label: 'Actions' },
     { id: 'sessions', label: 'Sessions' }
   ];
 
@@ -53,7 +55,7 @@ export default function NotesPanel({ projectId, project }: NotesPanelProps) {
         {tabs.map((tab) => (
           <button
             key={tab.id}
-            className={`flex-1 bg-transparent border-none py-2 text-xs cursor-pointer border-b-2 transition-colors ${
+            className={`flex-1 bg-transparent border-none py-2 text-xs cursor-pointer border-b-2 transition-colors flex items-center justify-center gap-1 ${
               activeTab === tab.id
                 ? 'text-white border-accent'
                 : 'text-[#888] border-transparent hover:text-[#ccc]'
@@ -61,6 +63,9 @@ export default function NotesPanel({ projectId, project }: NotesPanelProps) {
             onClick={() => setActiveTab(tab.id)}
           >
             {tab.label}
+            {tab.id === 'info' && hasActiveSession && (
+              <span style={{ width: 5, height: 5, borderRadius: '50%', backgroundColor: '#4ade80', flexShrink: 0 }} />
+            )}
           </button>
         ))}
       </div>
@@ -76,10 +81,6 @@ export default function NotesPanel({ projectId, project }: NotesPanelProps) {
             projectPath={project.path}
             geminiPrompt={project.geminiPrompt}
           />
-        )}
-
-        {activeTab === 'actions' && (
-          <ActionsPanel activeTabId={activeTabId} />
         )}
 
         {activeTab === 'sessions' && (

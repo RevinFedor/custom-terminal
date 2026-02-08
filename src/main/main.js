@@ -990,6 +990,33 @@ ipcMain.handle('project:delete', (event, projectId) => {
 // ========== TAB HISTORY ==========
 
 ipcMain.handle('project:archive-tab', (event, { projectId, tab }) => {
+  // Count user messages from JSONL at archive time (write-once)
+  if (tab.claudeSessionId && tab.cwd) {
+    try {
+      const claudeProjectsDir = path.join(os.homedir(), '.claude', 'projects');
+      const projectSlug = tab.cwd.replace(/\//g, '-');
+      const sessionPath = path.join(claudeProjectsDir, projectSlug, `${tab.claudeSessionId}.jsonl`);
+      if (fs.existsSync(sessionPath)) {
+        const uuids = parseTimelineUuids(sessionPath);
+        // parseTimelineUuids returns user entries + compact boundaries, count only user entries
+        // by re-parsing and checking types (compact boundaries are few, this is fast)
+        const content = fs.readFileSync(sessionPath, 'utf-8');
+        const recordMap = new Map();
+        for (const line of content.trim().split('\n')) {
+          try { const r = JSON.parse(line); recordMap.set(r.uuid, r); } catch {}
+        }
+        let count = 0;
+        for (const uuid of uuids) {
+          const r = recordMap.get(uuid);
+          if (r && r.type === 'user') count++;
+        }
+        tab.messageCount = count;
+        console.log('[Archive] Message count for', tab.claudeSessionId?.slice(0, 8), ':', count);
+      }
+    } catch (e) {
+      console.warn('[Archive] Could not count messages:', e.message);
+    }
+  }
   projectManager.db.archiveTab(projectId, tab);
   return { success: true };
 });
@@ -2792,17 +2819,20 @@ ipcMain.handle('claude:export-clean-session', async (event, { sessionId, cwd, in
     console.log('[Claude Export] Total records in file:', allRecords.length);
     console.log('[Claude Export] UUID map size:', recordMap.size);
 
-    // 2. BACKTRACE: Find the active branch starting from the last message
-    // Filter for user or assistant messages only for finding the "head"
-    const contentRecords = allRecords.filter(r => r.type === 'user' || r.type === 'assistant');
-    console.log('[Claude Export] Content records (user/assistant):', contentRecords.length);
+    // 2. BACKTRACE: Find the active branch starting from the last record (any type)
+    // Must use the very last record with a valid UUID (same as timeline)
+    let lastRecord = null;
+    for (const r of allRecords) {
+      if (r.uuid) lastRecord = r;
+    }
+    console.log('[Claude Export] Last record type:', lastRecord?.type);
 
-    if (contentRecords.length === 0) {
-      console.log('[Claude Export] Empty session - no content records');
+    if (!lastRecord) {
+      console.log('[Claude Export] Empty session - no records with UUID');
       return { success: true, content: '# Empty session' };
     }
 
-    let currentUuid = contentRecords[contentRecords.length - 1].uuid;
+    let currentUuid = lastRecord.uuid;
     console.log('[Claude Export] Starting backtrace from UUID:', currentUuid);
 
     const activeBranch = [];
@@ -2826,7 +2856,7 @@ ipcMain.handle('claude:export-clean-session', async (event, { sessionId, cwd, in
         break;
       }
 
-      currentUuid = record.parentUuid || record.logicalParentUuid;
+      currentUuid = record.logicalParentUuid || record.parentUuid;
     }
 
     console.log('[Claude Export] Backtrace complete:', {
@@ -2834,12 +2864,42 @@ ipcMain.handle('claude:export-clean-session', async (event, { sessionId, cwd, in
       activeBranchSize: activeBranch.length
     });
 
+    // 3. FORK MARKERS: Precompute which UUIDs are fork boundaries
+    const forkBoundaryUuids = new Set();
+    try {
+      const forkMarkers = projectManager.db.getForkMarkers(sessionId);
+      console.log('[Claude Export] Fork markers found:', forkMarkers.length);
+      for (const marker of forkMarkers) {
+        const snapshotSet = new Set(marker.entry_uuids || []);
+        if (snapshotSet.size === 0) continue;
+        for (let idx = 0; idx < activeBranch.length; idx++) {
+          const rec = activeBranch[idx];
+          if (!snapshotSet.has(rec.uuid)) continue;
+          // Fork boundary = this UUID is in snapshot, but next one is NOT (or this is last)
+          if (idx === activeBranch.length - 1) {
+            forkBoundaryUuids.add(rec.uuid);
+          } else {
+            const nextRec = activeBranch[idx + 1];
+            if (!snapshotSet.has(nextRec.uuid)) {
+              forkBoundaryUuids.add(rec.uuid);
+            }
+          }
+        }
+      }
+      console.log('[Claude Export] Fork boundary UUIDs:', forkBoundaryUuids.size);
+    } catch (e) {
+      console.warn('[Claude Export] Could not load fork markers:', e.message);
+    }
+
     const outputParts = [];
     outputParts.push(`# Claude Session Export`);
     outputParts.push(`Session: ${sessionId}`);
     outputParts.push(`CWD: ${cwd || 'unknown'}`);
     outputParts.push(`Exported: ${new Date().toISOString()}`);
-    outputParts.push(`Options: includeCode=${includeCode}, fromStart=${fromStart}`);
+    outputParts.push('');
+    outputParts.push(`Markers:`);
+    outputParts.push(`  🔵 FORK  — session branched (search "FORK")`);
+    outputParts.push(`  ═══ COMPACTED ═══ — context window compacted (search "COMPACTED")`);
     outputParts.push('');
 
     // Helper: format tool_use
@@ -2971,6 +3031,13 @@ ipcMain.handle('claude:export-clean-session', async (event, { sessionId, cwd, in
       else if (entry.type === 'system' && entry.subtype === 'compact_boundary') {
         outputParts.push('');
         outputParts.push('═══ COMPACTED ═══');
+        outputParts.push('');
+      }
+
+      // Insert fork separator after boundary entries
+      if (forkBoundaryUuids.has(entry.uuid)) {
+        outputParts.push('');
+        outputParts.push('🔵═══════════════════════════════ FORK ═══════════════════════════════🔵');
         outputParts.push('');
       }
     }

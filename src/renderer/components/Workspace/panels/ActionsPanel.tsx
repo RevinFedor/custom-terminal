@@ -17,15 +17,16 @@ interface Action {
 
 interface ActionsPanelProps {
   activeTabId: string | null;
+  embedded?: boolean; // When true, renders without header/wrapper (for embedding in InfoPanel)
 }
 
-export default function ActionsPanel({ activeTabId }: ActionsPanelProps) {
+export default function ActionsPanel({ activeTabId, embedded = false }: ActionsPanelProps) {
   const { showToast, docPrompt, terminalSelection } = useUIStore();
   const { activeProjectId, createTab, closeTab, getActiveProject, switchTab, getSelectedTabs, clearSelection } = useWorkspaceStore();
   const [isUpdatingDocs, setIsUpdatingDocs] = useState(false);
   const cancelledRef = useRef(false);
   const docsGeminiTabIdRef = useRef<string | null>(null);
-  const [actions, setActions] = useState<Action[]>([]);
+  const [actions, setActions] = useState<Action[]>([]); // Kept for potential future use, loaded from global_commands DB table
   const [isScissorsHovered, setIsScissorsHovered] = useState(false);
   
   // Copy Session state
@@ -609,13 +610,8 @@ export default function ActionsPanel({ activeTabId }: ActionsPanelProps) {
     }
   };
 
-  return (
-    <div className="h-full flex flex-col">
-      <div className="px-3 py-2 bg-[#333] text-[11px] uppercase text-[#aaa] shrink-0">
-        Quick Actions
-      </div>
-
-      <div className="flex-1 overflow-y-auto p-2">
+  const content = (
+      <>
         {/* Multi-Select Info */}
         {isMultiSelect && (
           <div className="mb-4 bg-accent/10 border border-accent/20 rounded-lg p-3 text-xs text-accent flex items-center justify-between">
@@ -856,29 +852,20 @@ export default function ActionsPanel({ activeTabId }: ActionsPanelProps) {
             )}
           </div>
         </div>
+      </>
+  );
 
-        {/* User Actions Section */}
-        {!isMultiSelect && actions.length > 0 && (
-          <div>
-            <div className="flex items-center gap-2 mb-2 px-1">
-              <span className="text-[9px] uppercase font-semibold text-[#888]">User</span>
-              <div className="flex-1 h-px bg-[#333]" />
-            </div>
+  if (embedded) {
+    return content;
+  }
 
-            <div className="flex flex-col gap-2">
-              {actions.map((action, index) => (
-                <button
-                  key={index}
-                  className="bg-[#333] border border-[#444] text-[#ddd] p-2 text-left cursor-pointer rounded text-xs flex items-center hover:bg-[#444] hover:border-[#555] transition-colors"
-                  onClick={() => runAction(action.command)}
-                >
-                  <span className="mr-2 text-sm">⚡</span>
-                  {action.name}
-                </button>
-              ))}
-            </div>
-          </div>
-        )}
+  return (
+    <div className="h-full flex flex-col">
+      <div className="px-3 py-2 bg-[#333] text-[11px] uppercase text-[#aaa] shrink-0">
+        Quick Actions
+      </div>
+      <div className="flex-1 overflow-y-auto p-2">
+        {content}
       </div>
     </div>
   );

@@ -5,6 +5,7 @@ import { useWorkspaceStore } from '../../../store/useWorkspaceStore';
 import { useUIStore } from '../../../store/useUIStore';
 import { RotateCcw, Clock, ChevronDown, ChevronRight } from 'lucide-react';
 import { log } from '../../../utils/logger';
+import ActionsPanel from './ActionsPanel';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -45,19 +46,16 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
   const [claudeExpanded, setClaudeExpanded] = useState(false);
   const [claudeExtraPrompt, setClaudeExtraPrompt] = useState('');
   const [claudeDefaultPrompt, setClaudeDefaultPrompt] = useState('');
-  // Actions export state
-  const [actionsExpanded, setActionsExpanded] = useState(false);
-  const [exportSessionInput, setExportSessionInput] = useState('');
-  const [isExporting, setIsExporting] = useState(false);
   // Tab notes state
   const [tabNotes, setTabNotes] = useState('');
   const [sessionCopied, setSessionCopied] = useState(false);
   const { showToast, claudeDefaultPromptEnabled } = useUIStore();
   const wordWrap = useUIStore((s) => s.wordWrap);
   const tabNotesFontSize = useUIStore((s) => s.tabNotesFontSize);
+  const tabNotesPaddingX = useUIStore((s) => s.tabNotesPaddingX);
+  const tabNotesPaddingY = useUIStore((s) => s.tabNotesPaddingY);
   const { setTabCommandType, closeTab, setTabNotes: setTabNotesStore, getTabNotes } = useWorkspaceStore();
   const claudeTextareaRef = useRef<HTMLTextAreaElement>(null);
-  const exportTextareaRef = useRef<HTMLTextAreaElement>(null);
 
   // Sync tab notes with activeTabId
   useEffect(() => {
@@ -216,7 +214,6 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
         {hasAnySession ? (
           <div className={`rounded p-2 ${currentSessionType === 'claude' ? 'bg-[#2a3a2a] border border-[#3a5a3a]' : 'bg-[#1a2a3a] border border-[#2a4a6a]'}`}>
             <div className="flex items-center gap-2 mb-1">
-              <span className="w-2 h-2 rounded-full bg-green-500 flex-shrink-0"></span>
               <span className={`text-xs font-medium ${currentSessionType === 'claude' ? 'text-[#DA7756]' : 'text-[#4E86F8]'}`}>
                 {currentSessionType === 'claude' ? 'Claude' : 'Gemini'}
               </span>
@@ -265,9 +262,23 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
           </div>
         ) : (activeCommandType === 'claude' || activeCommandType === 'gemini') ? (
           <div className="bg-[#2a2a2a] border border-[#3a3a3a] rounded p-2">
-            <div className="flex items-center gap-2">
-              <span className="w-2 h-2 rounded-full bg-yellow-500 animate-pulse"></span>
-              <span className="text-yellow-500/80 text-xs">Ожидание сессии...</span>
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <span className="w-2 h-2 rounded-full bg-yellow-500 animate-pulse"></span>
+                <span className="text-yellow-500/80 text-xs">Ожидание сессии...</span>
+              </div>
+              <button
+                className="text-[10px] text-[#666] hover:text-[#aaa] cursor-pointer transition-colors"
+                onClick={() => {
+                  if (activeTabId) {
+                    setTabCommandType(activeTabId, 'generic');
+                    setActiveCommandType(null);
+                  }
+                }}
+                title="Отменить ожидание"
+              >
+                ✕
+              </button>
             </div>
           </div>
         ) : (
@@ -441,34 +452,31 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
               </div>
               )}
 
-              {/* claude-c - continue */}
-              <div className={`rounded p-2 ${hasClaudeSession ? 'bg-[#2d2d2d]' : 'bg-[#252525] opacity-60'}`}>
+              {/* claude-c - continue (only when session exists) */}
+              {hasClaudeSession && (
+              <div className="rounded p-2 bg-[#2d2d2d]">
                 <div className="flex items-center justify-between">
                   <code
-                    className={`text-xs transition-colors hover:underline ${hasClaudeSession ? 'cursor-pointer' : 'cursor-not-allowed'}`}
-                    style={{ color: hasClaudeSession ? '#DA7756' : '#666' }}
+                    className="text-xs transition-colors hover:underline cursor-pointer"
+                    style={{ color: '#DA7756' }}
                     onClick={() => {
-                      if (!hasClaudeSession) {
-                        showToast('Нет Claude сессии', 'warning');
-                        return;
-                      }
                       if (activeTabId) {
                         setTabCommandType(activeTabId, 'claude');
                         ipcRenderer.send('claude:run-command', { tabId: activeTabId, command: 'claude-c', sessionId: claudeSessionId });
                       }
                     }}
-                    title={hasClaudeSession ? 'Продолжить' : 'Нет сессии'}
+                    title="Продолжить"
                   >
                     claude-c
                   </code>
-                  <span className={`text-[10px] ${hasClaudeSession ? 'text-green-400' : 'text-[#666]'}`}>
-                    {hasClaudeSession ? 'готово' : '—'}
-                  </span>
+                  <span className="text-[10px] text-green-400">готово</span>
                 </div>
                 <p className="text-[10px] text-[#666] mt-1">Продолжить</p>
               </div>
+              )}
 
-              {/* claude-f - fork from clipboard */}
+              {/* claude-f - fork from clipboard (only when NO active session) */}
+              {!hasAnySession && (
               <div className="bg-[#2d2d2d] rounded p-2">
                 <div className="flex items-center justify-between">
                   <code
@@ -477,10 +485,6 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                     onClick={async () => {
                       if (!activeTabId) {
                         showToast('Нет активного таба', 'error');
-                        return;
-                      }
-                      if (hasAnySession) {
-                        showToast(`Уже есть ${currentSessionType} сессия. Откройте новый таб.`, 'warning');
                         return;
                       }
                       try {
@@ -505,6 +509,7 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                 </div>
                 <p className="text-[10px] text-[#666] mt-1">Fork из буфера</p>
               </div>
+              )}
             </>
           ) : (
             <>
@@ -677,95 +682,10 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
         </div>
       )}
 
-      {/* Actions - Claude Export */}
-      {hasClaudeSession && (
-        <div className="mb-4">
-          <div
-            className="flex items-center justify-between mb-2 cursor-pointer"
-            onClick={() => {
-              setActionsExpanded(!actionsExpanded);
-              if (!actionsExpanded) {
-                // Pre-fill with current session ID
-                setExportSessionInput(claudeSessionId || '');
-                setTimeout(() => exportTextareaRef.current?.focus(), 50);
-              }
-            }}
-          >
-            <div className="flex items-center gap-1">
-              <span className="text-[11px] uppercase text-[#888]">Actions</span>
-            </div>
-            <span className="text-[10px] text-[#666]">{actionsExpanded ? '▼' : '▶'}</span>
-          </div>
-
-          {actionsExpanded && (
-            <div className="space-y-2">
-              {/* Copy Session button */}
-              <div className="bg-[#2d2d2d] rounded p-2">
-                <div className="flex items-center justify-between mb-2">
-                  <span className="text-[10px] text-[#aaa]">Copy Session (без кода)</span>
-                  <button
-                    onClick={async () => {
-                      const targetSessionId = exportSessionInput.trim() || claudeSessionId;
-                      if (!targetSessionId) {
-                        showToast('Нет session ID', 'warning');
-                        return;
-                      }
-
-                      setIsExporting(true);
-                      try {
-                        const cwd = getCurrentCwd();
-                        const result = await ipcRenderer.invoke('claude:export-clean-session', {
-                          sessionId: targetSessionId,
-                          cwd
-                        });
-
-                        if (result.success) {
-                          await navigator.clipboard.writeText(result.content);
-                          showToast(`Скопировано ${Math.round(result.content.length / 1024)}KB`, 'success');
-                        } else {
-                          showToast(`Ошибка: ${result.error}`, 'error');
-                        }
-                      } catch (e: any) {
-                        showToast(`Ошибка: ${e.message}`, 'error');
-                      } finally {
-                        setIsExporting(false);
-                      }
-                    }}
-                    disabled={isExporting}
-                    className="text-[10px] px-2 py-1 rounded transition-colors bg-[#DA7756]/20 text-[#DA7756] hover:bg-[#DA7756]/30 disabled:opacity-50 cursor-pointer"
-                  >
-                    {isExporting ? 'Экспорт...' : 'Copy'}
-                  </button>
-                </div>
-                <textarea
-                  ref={exportTextareaRef}
-                  value={exportSessionInput}
-                  onChange={(e) => setExportSessionInput(e.target.value)}
-                  placeholder={claudeSessionId || 'Session ID...'}
-                  className="w-full min-h-[32px] p-2 bg-[#1a1a1a] border border-[#333] rounded text-[10px] text-[#888] font-mono resize-none focus:outline-none focus:border-[#DA7756] placeholder:text-[#555]"
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter' && e.metaKey) {
-                      e.preventDefault();
-                      // Trigger export
-                      const btn = e.currentTarget.parentElement?.querySelector('button');
-                      btn?.click();
-                    }
-                  }}
-                />
-                <p className="text-[9px] text-[#555] mt-1">
-                  Оставьте пустым для текущей сессии
-                </p>
-              </div>
-            </div>
-          )}
-
-          {!actionsExpanded && (
-            <p className="text-[10px] text-[#555] italic">
-              Кликните чтобы показать
-            </p>
-          )}
-        </div>
-      )}
+      {/* Quick Actions (embedded from ActionsPanel) */}
+      <div className="mb-3">
+        <ActionsPanel activeTabId={activeTabId} embedded />
+      </div>
 
       {/* Tab Notes — MarkdownEditor */}
       <div className="flex-1 flex flex-col min-h-0 border-t border-border-main pt-3">
@@ -781,6 +701,8 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                 }
               }}
               fontSize={tabNotesFontSize}
+              contentPaddingX={tabNotesPaddingX}
+              contentPaddingY={tabNotesPaddingY}
               wordWrap={wordWrap}
               showLineNumbers={false}
               compact

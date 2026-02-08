@@ -145,6 +145,10 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
   const setProjectTabsFontSize = useUIStore((s) => s.setProjectTabsFontSize);
   const tabNotesFontSize = useUIStore((s) => s.tabNotesFontSize);
   const setTabNotesFontSize = useUIStore((s) => s.setTabNotesFontSize);
+  const tabNotesPaddingX = useUIStore((s) => s.tabNotesPaddingX);
+  const setTabNotesPaddingX = useUIStore((s) => s.setTabNotesPaddingX);
+  const tabNotesPaddingY = useUIStore((s) => s.tabNotesPaddingY);
+  const setTabNotesPaddingY = useUIStore((s) => s.setTabNotesPaddingY);
   const { showToast, chatSettings, setChatSettings, docPrompt, setDocPromptUseFile, setDocPromptFilePath, setDocPromptInlineContent, claudeDefaultPromptEnabled, setClaudeDefaultPromptEnabled } = useUIStore();
 
   // Claude Default Prompt
@@ -519,6 +523,22 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                   onChange={setTabNotesFontSize}
                   min={10}
                   max={20}
+                />
+                <FontSizeSlider
+                  label="Padding X"
+                  description="Горизонтальный отступ"
+                  value={tabNotesPaddingX}
+                  onChange={setTabNotesPaddingX}
+                  min={0}
+                  max={32}
+                />
+                <FontSizeSlider
+                  label="Padding Y"
+                  description="Вертикальный отступ"
+                  value={tabNotesPaddingY}
+                  onChange={setTabNotesPaddingY}
+                  min={0}
+                  max={32}
                 />
               </div>
             </>

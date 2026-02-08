@@ -234,9 +234,13 @@ interface UIStore {
   openNotesEditor: (projectId: string) => void;
   closeNotesEditor: () => void;
 
-  // Tab Notes Font Size
+  // Tab Notes Font Size & Padding
   tabNotesFontSize: number;
   setTabNotesFontSize: (size: number) => void;
+  tabNotesPaddingX: number;
+  setTabNotesPaddingX: (px: number) => void;
+  tabNotesPaddingY: number;
+  setTabNotesPaddingY: (px: number) => void;
 
   // Workspace View (terminal or project home)
   currentView: WorkspaceView;
@@ -834,7 +838,7 @@ export const useUIStore = create<UIStore>((set, get) => ({
   openNotesEditor: (projectId) => set({ notesEditorOpen: true, notesEditorProjectId: projectId }),
   closeNotesEditor: () => set({ notesEditorOpen: false, notesEditorProjectId: null }),
 
-  // Tab Notes Font Size
+  // Tab Notes Font Size & Padding
   tabNotesFontSize: (() => {
     try {
       const saved = localStorage.getItem('noted-terminal-tab-notes-font-size');
@@ -845,6 +849,28 @@ export const useUIStore = create<UIStore>((set, get) => ({
     const clamped = Math.max(10, Math.min(24, size));
     set({ tabNotesFontSize: clamped });
     localStorage.setItem('noted-terminal-tab-notes-font-size', String(clamped));
+  },
+  tabNotesPaddingX: (() => {
+    try {
+      const saved = localStorage.getItem('noted-terminal-tab-notes-padding-x');
+      return saved ? parseInt(saved, 10) : 8;
+    } catch { return 8; }
+  })(),
+  setTabNotesPaddingX: (px) => {
+    const clamped = Math.max(0, Math.min(32, px));
+    set({ tabNotesPaddingX: clamped });
+    localStorage.setItem('noted-terminal-tab-notes-padding-x', String(clamped));
+  },
+  tabNotesPaddingY: (() => {
+    try {
+      const saved = localStorage.getItem('noted-terminal-tab-notes-padding-y');
+      return saved ? parseInt(saved, 10) : 8;
+    } catch { return 8; }
+  })(),
+  setTabNotesPaddingY: (px) => {
+    const clamped = Math.max(0, Math.min(32, px));
+    set({ tabNotesPaddingY: clamped });
+    localStorage.setItem('noted-terminal-tab-notes-padding-y', String(clamped));
   },
 
   // Workspace View

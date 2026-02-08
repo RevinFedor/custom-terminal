@@ -4,6 +4,7 @@ import { useProjectsStore } from '../../store/useProjectsStore';
 import { useUIStore } from '../../store/useUIStore';
 import { Terminal, FolderOpen, Plus, Clock, Trash2 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
+import { MarkdownEditor } from '@anthropic/markdown-editor';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -25,6 +26,7 @@ interface TabHistoryEntry {
   closed_at: number;
   claude_session_id: string | null;
   gemini_session_id: string | null;
+  message_count: number | null;
 }
 
 type TimeGroup = 'Today' | 'Yesterday' | 'This Week' | 'This Month' | 'Older';
@@ -91,9 +93,14 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
   const { openProjects, switchTab, createTab } = useWorkspaceStore();
   const { projects, updateProject } = useProjectsStore();
   const { setCurrentView } = useUIStore();
+  const tabNotesFontSize = useUIStore((s) => s.tabNotesFontSize);
+  const tabNotesPaddingX = useUIStore((s) => s.tabNotesPaddingX);
+  const tabNotesPaddingY = useUIStore((s) => s.tabNotesPaddingY);
   const [syncName, setSyncName] = useState<string | null>(null);
   const [history, setHistory] = useState<TabHistoryEntry[]>([]);
-  const [hoveredHistoryId, setHoveredHistoryId] = useState<number | null>(null);
+  const [hoveredHistory, setHoveredHistory] = useState<{ id: number; rect: DOMRect } | null>(null);
+  const [isPopoverPinned, setIsPopoverPinned] = useState(false);
+  const historyCloseTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const [hoveredActiveTabId, setHoveredActiveTabId] = useState<string | null>(null);
   const [isCmdPressed, setIsCmdPressed] = useState(false);
 
@@ -405,8 +412,21 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
                     <div
                       key={entry.id}
                       className="relative"
-                      onMouseEnter={() => setHoveredHistoryId(entry.id)}
-                      onMouseLeave={() => setHoveredHistoryId(null)}
+                      onMouseEnter={(e) => {
+                        if (historyCloseTimeoutRef.current) {
+                          clearTimeout(historyCloseTimeoutRef.current);
+                          historyCloseTimeoutRef.current = null;
+                        }
+                        const rect = e.currentTarget.getBoundingClientRect();
+                        setHoveredHistory({ id: entry.id, rect });
+                      }}
+                      onMouseLeave={() => {
+                        historyCloseTimeoutRef.current = setTimeout(() => {
+                          setHoveredHistory(prev => prev?.id === entry.id ? null : prev);
+                          setIsPopoverPinned(false);
+                          historyCloseTimeoutRef.current = null;
+                        }, 150);
+                      }}
                     >
                       <div
                         className="transition-all duration-150 cursor-pointer hover:opacity-70"
@@ -451,60 +471,6 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
                           }}
                         />
                       )}
-
-                      {/* CMD+Hover Popover with invisible bridge */}
-                      <AnimatePresence>
-                        {isCmdPressed && hoveredHistoryId === entry.id && (
-                          <motion.div
-                            initial={{ opacity: 0, y: 4 }}
-                            animate={{ opacity: 1, y: 0 }}
-                            exit={{ opacity: 0, y: 4 }}
-                            transition={{ duration: 0.15 }}
-                            className="absolute z-50"
-                            style={{
-                              bottom: '100%',
-                              left: 0,
-                              paddingBottom: '8px', // Invisible bridge gap
-                            }}
-                          >
-                            <div
-                              style={{
-                                minWidth: '200px',
-                                padding: '8px 10px',
-                                backgroundColor: '#1e1e1e',
-                                border: '1px solid #333',
-                                borderRadius: '6px',
-                              }}
-                            >
-                              {entry.notes && (
-                                <div className="text-[11px] text-[#ccc] mb-2">
-                                  <span className="text-[#888]">Notes: </span>
-                                  {entry.notes}
-                                </div>
-                              )}
-                              <div className="text-[10px] text-[#888] space-y-0.5">
-                                <div>Created: {formatTimestamp(entry.created_at)}</div>
-                                <div>Closed: {formatTimestamp(entry.closed_at)}</div>
-                                <div className="truncate" title={entry.cwd}>Path: {entry.cwd}</div>
-                                {entry.command_type && (
-                                  <div>Type: {entry.command_type}</div>
-                                )}
-                              </div>
-                              {/* Restore button */}
-                              <div
-                                className="mt-2 pt-2 border-t border-[#333] text-[10px] text-[#DA7756] cursor-pointer hover:text-[#e89070]"
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  setHoveredHistoryId(null);
-                                  restoreTab(entry);
-                                }}
-                              >
-                                Восстановить вкладку
-                              </div>
-                            </div>
-                          </motion.div>
-                        )}
-                      </AnimatePresence>
                     </div>
                   );
                 })}
@@ -513,6 +479,101 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
           ))}
         </div>
       )}
+
+      {/* CMD+Hover History Popover — fixed position with pinning & smart placement */}
+      {(isCmdPressed || isPopoverPinned) && hoveredHistory && (() => {
+        const entry = history.find(h => h.id === hoveredHistory.id);
+        if (!entry) return null;
+        const rect = hoveredHistory.rect;
+        // Smart positioning: check space above, show below if not enough
+        const spaceAbove = rect.top;
+        const maxH = Math.min(spaceAbove - 16, 350); // 16px margin from top edge
+        const showBelow = spaceAbove < 160; // not enough room above
+        return (
+          <div
+            className="fixed z-[100]"
+            style={{
+              left: rect.left,
+              ...(showBelow
+                ? { top: rect.bottom, paddingTop: '4px' }
+                : { top: rect.top, paddingBottom: '4px', transform: 'translateY(-100%)' }
+              ),
+            }}
+            onMouseEnter={() => {
+              if (historyCloseTimeoutRef.current) {
+                clearTimeout(historyCloseTimeoutRef.current);
+                historyCloseTimeoutRef.current = null;
+              }
+              setIsPopoverPinned(true);
+            }}
+            onMouseLeave={() => {
+              setHoveredHistory(null);
+              setIsPopoverPinned(false);
+              if (historyCloseTimeoutRef.current) {
+                clearTimeout(historyCloseTimeoutRef.current);
+                historyCloseTimeoutRef.current = null;
+              }
+            }}
+          >
+            <div
+              style={{
+                width: '340px',
+                maxHeight: showBelow ? '300px' : `${maxH}px`,
+                backgroundColor: '#1e1e1e',
+                border: '1px solid #333',
+                borderRadius: '6px',
+                boxShadow: '0 4px 12px rgba(0,0,0,0.4)',
+                overflow: 'hidden',
+                display: 'flex',
+                flexDirection: 'column',
+              }}
+            >
+              {/* Notes via MarkdownEditor */}
+              {entry.notes && (
+                <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', borderBottom: '1px solid #333' }}>
+                  <MarkdownEditor
+                    content={entry.notes}
+                    onChange={() => {}}
+                    readOnly
+                    compact
+                    showLineNumbers={false}
+                    fontSize={tabNotesFontSize}
+                    contentPaddingX={tabNotesPaddingX}
+                    contentPaddingY={tabNotesPaddingY}
+                    wordWrap
+                  />
+                </div>
+              )}
+              {/* Metadata */}
+              <div style={{ padding: '6px 10px', flexShrink: 0 }}>
+                <div className="text-[10px] text-[#888] space-y-0.5">
+                  <div>Created: {formatTimestamp(entry.created_at)}</div>
+                  <div>Closed: {formatTimestamp(entry.closed_at)}</div>
+                  <div className="truncate" title={entry.cwd}>Path: {entry.cwd}</div>
+                  {entry.command_type && (
+                    <div>Type: {entry.command_type}</div>
+                  )}
+                  {entry.message_count != null && (
+                    <div className="text-[#ccc]">Messages: {entry.message_count}</div>
+                  )}
+                </div>
+                {/* Restore button */}
+                <div
+                  className="mt-2 pt-2 border-t border-[#333] text-[10px] text-[#DA7756] cursor-pointer hover:text-[#e89070]"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setHoveredHistory(null);
+                    setIsPopoverPinned(false);
+                    restoreTab(entry);
+                  }}
+                >
+                  Восстановить вкладку
+                </div>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
     </div>
   );
 }
