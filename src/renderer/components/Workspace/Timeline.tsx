@@ -313,6 +313,23 @@ function Timeline({ tabId, sessionId, cwd }: TimelineProps) {
 
         {/* Segmented Hit-boxes */}
         <div className="flex flex-col h-full w-full">
+          {/* Fork marker at the very beginning (empty snapshot = fork before any entries) */}
+          {forkMarkers.some(m => !m.entry_uuids || m.entry_uuids.length === 0) && entries.length > 0 && (
+            <div
+              className="flex-shrink-0 w-full flex items-center justify-center"
+              style={{ height: '8px' }}
+              title="Fork point - this session was forked from here"
+            >
+              <div
+                style={{
+                  width: '12px',
+                  height: '2px',
+                  borderRadius: '1px',
+                  backgroundColor: '#3b82f6',
+                }}
+              />
+            </div>
+          )}
           {entries.map((entry, index) => {
             const active = isSelected(entry, index);
             const isCompacted = entry.type === 'compact';

@@ -612,33 +612,14 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
 
   const content = (
       <>
-        {/* Multi-Select Info */}
-        {isMultiSelect && (
-          <div className="mb-4 bg-accent/10 border border-accent/20 rounded-lg p-3 text-xs text-accent flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <span className="text-base">📑</span>
-              <div className="font-medium">Выбрано {selectedTabs.length} вкладок</div>
-            </div>
-            <button 
-              onClick={() => activeProjectId && clearSelection(activeProjectId)}
-              className="px-2 py-1 hover:bg-accent/20 rounded transition-colors"
-            >
-              Сбросить
-            </button>
-          </div>
-        )}
-
         {/* System Tools Section */}
         <div className="mb-4">
-          {!isMultiSelect && (
-            <div className="flex items-center gap-2 mb-2 px-1">
-              <span className="text-[9px] uppercase font-semibold text-blue-500">System</span>
-              <div className="flex-1 h-px bg-[#333]" />
-            </div>
-          )}
+          <div className="flex items-center gap-2 mb-2 px-1">
+            <span className="text-[9px] uppercase font-semibold text-blue-500">System</span>
+            <div className="flex-1 h-px bg-[#333]" />
+          </div>
 
-          {!isMultiSelect && (
-            <div className="flex flex-col gap-1">
+          <div className="flex flex-col gap-1">
               <button
                 className={`w-full bg-blue-900/30 border border-blue-700/30 text-blue-400 p-3 text-left cursor-pointer rounded-lg text-xs flex items-center gap-2 hover:bg-blue-900/50 hover:border-blue-600/40 transition-colors focus:outline-none ${
                   isUpdatingDocs ? 'opacity-50 cursor-not-allowed' : ''
@@ -704,10 +685,10 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
                 </button>
               )}
             </div>
-          )}
+          </div>
 
           {/* Copy Session - export Claude session */}
-          <div className={`${isMultiSelect ? '' : 'mt-2'}`}>
+          <div className="mt-2">
             <div
               className={`w-full text-[#DA7756] p-3 text-left rounded-lg text-xs flex items-center gap-2 transition-colors ${
                 isCopying ? 'opacity-50' : ''
@@ -851,7 +832,6 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
               </div>
             )}
           </div>
-        </div>
       </>
   );
 

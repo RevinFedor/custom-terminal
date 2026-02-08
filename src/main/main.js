@@ -2519,14 +2519,12 @@ ipcMain.handle('claude:fork-session-file', async (event, { sourceSessionId, cwd 
     fs.copyFileSync(sourcePath, destPath);
     console.log('[Claude Fork] Copied:', sourcePath, '->', destPath);
 
-    // Save fork marker with UUIDs snapshot
-    if (entryUuids.length > 0) {
-      try {
-        projectManager.db.saveForkMarker(sourceSessionId, newSessionId, entryUuids);
-        console.log('[Claude Fork] Fork marker saved with', entryUuids.length, 'UUIDs');
-      } catch (e) {
-        console.warn('[Claude Fork] Could not save fork marker:', e.message);
-      }
+    // Save fork marker with UUIDs snapshot (always save, even if empty — marks fork at beginning)
+    try {
+      projectManager.db.saveForkMarker(sourceSessionId, newSessionId, entryUuids);
+      console.log('[Claude Fork] Fork marker saved with', entryUuids.length, 'UUIDs');
+    } catch (e) {
+      console.warn('[Claude Fork] Could not save fork marker:', e.message);
     }
 
     // Wait for Claude to index the new file
@@ -2865,30 +2863,70 @@ ipcMain.handle('claude:export-clean-session', async (event, { sessionId, cwd, in
     });
 
     // 3. FORK MARKERS: Precompute which UUIDs are fork boundaries
+    // Helper: check if a record is a Timeline-eligible entry (user message or compact boundary)
+    const isTimelineEntry = (rec) => {
+      if (rec.type === 'system' && rec.subtype === 'compact_boundary') return true;
+      if (rec.type !== 'user') return false;
+      if (rec.isSidechain || rec.isMeta) return false;
+      const content = rec.message?.content;
+      if (Array.isArray(content) && content.some(item => item.type === 'tool_result')) return false;
+      return true;
+    };
+
     const forkBoundaryUuids = new Set();
+    let hasForkAtBeginning = false; // Fork with empty snapshot = fork before any entries
     try {
       const forkMarkers = projectManager.db.getForkMarkers(sessionId);
       console.log('[Claude Export] Fork markers found:', forkMarkers.length);
       for (const marker of forkMarkers) {
         const snapshotSet = new Set(marker.entry_uuids || []);
-        if (snapshotSet.size === 0) continue;
+        if (snapshotSet.size === 0) {
+          // Empty snapshot = fork at the very beginning (before any entries)
+          hasForkAtBeginning = true;
+          continue;
+        }
+        // Find boundary: last Timeline-eligible entry in snapshot where next Timeline-eligible entry is NOT in snapshot
         for (let idx = 0; idx < activeBranch.length; idx++) {
           const rec = activeBranch[idx];
           if (!snapshotSet.has(rec.uuid)) continue;
-          // Fork boundary = this UUID is in snapshot, but next one is NOT (or this is last)
-          if (idx === activeBranch.length - 1) {
-            forkBoundaryUuids.add(rec.uuid);
-          } else {
-            const nextRec = activeBranch[idx + 1];
-            if (!snapshotSet.has(nextRec.uuid)) {
-              forkBoundaryUuids.add(rec.uuid);
+          // Find the NEXT Timeline-eligible entry (skip assistant/tool entries)
+          let nextTimelineEntry = null;
+          for (let j = idx + 1; j < activeBranch.length; j++) {
+            if (isTimelineEntry(activeBranch[j])) {
+              nextTimelineEntry = activeBranch[j];
+              break;
             }
+          }
+          if (!nextTimelineEntry) {
+            // No more Timeline entries after this — boundary at the end
+            forkBoundaryUuids.add(rec.uuid);
+          } else if (!snapshotSet.has(nextTimelineEntry.uuid)) {
+            // Next Timeline entry is NOT in snapshot — this is the fork boundary
+            forkBoundaryUuids.add(rec.uuid);
           }
         }
       }
-      console.log('[Claude Export] Fork boundary UUIDs:', forkBoundaryUuids.size);
+      console.log('[Claude Export] Fork boundary UUIDs:', forkBoundaryUuids.size, 'hasForkAtBeginning:', hasForkAtBeginning);
     } catch (e) {
       console.warn('[Claude Export] Could not load fork markers:', e.message);
+    }
+
+    // 4. fromStart=false: trim activeBranch to start from the last fork boundary
+    if (!fromStart && forkBoundaryUuids.size > 0) {
+      let lastForkIdx = -1;
+      for (let i = activeBranch.length - 1; i >= 0; i--) {
+        if (forkBoundaryUuids.has(activeBranch[i].uuid)) {
+          lastForkIdx = i;
+          break;
+        }
+      }
+      if (lastForkIdx >= 0) {
+        const trimmedUuid = activeBranch[lastForkIdx].uuid;
+        activeBranch.splice(0, lastForkIdx + 1);
+        forkBoundaryUuids.delete(trimmedUuid);
+        hasForkAtBeginning = true; // Show FORK separator at the beginning of trimmed output
+        console.log('[Claude Export] Trimmed to fork boundary, remaining entries:', activeBranch.length);
+      }
     }
 
     const outputParts = [];
@@ -2901,6 +2939,13 @@ ipcMain.handle('claude:export-clean-session', async (event, { sessionId, cwd, in
     outputParts.push(`  🔵 FORK  — session branched (search "FORK")`);
     outputParts.push(`  ═══ COMPACTED ═══ — context window compacted (search "COMPACTED")`);
     outputParts.push('');
+
+    // Insert FORK separator at the beginning if fork was before any entries or trimmed
+    if (hasForkAtBeginning) {
+      outputParts.push('');
+      outputParts.push('🔵═══════════════════════════════ FORK ═══════════════════════════════🔵');
+      outputParts.push('');
+    }
 
     // Helper: format tool_use
     const formatToolAction = (toolName, input, toolResult = null) => {
@@ -3220,14 +3265,12 @@ ipcMain.on('claude:run-command', (event, { tabId, command, sessionId, forkSessio
           console.log('[Claude Runner] From:', sourcePath);
           console.log('[Claude Runner] To:', destPath);
 
-          // Save fork marker with UUIDs snapshot
-          if (entryUuids.length > 0) {
-            try {
-              projectManager.db.saveForkMarker(forkSessionId, newSessionId, entryUuids);
-              console.log('[Claude Runner] Fork marker saved with', entryUuids.length, 'UUIDs');
-            } catch (e) {
-              console.warn('[Claude Runner] Could not save fork marker:', e.message);
-            }
+          // Save fork marker with UUIDs snapshot (always save, even if empty — marks fork at beginning)
+          try {
+            projectManager.db.saveForkMarker(forkSessionId, newSessionId, entryUuids);
+            console.log('[Claude Runner] Fork marker saved with', entryUuids.length, 'UUIDs');
+          } catch (e) {
+            console.warn('[Claude Runner] Could not save fork marker:', e.message);
           }
 
           // Run claude --resume in CURRENT terminal (not new tab!)
