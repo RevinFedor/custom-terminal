@@ -278,7 +278,6 @@ export default function ProjectToolbar() {
           title="npm run scripts"
         >
           <Play size={14} />
-          <span>Scripts</span>
           <ChevronDown size={10} className={`ml-[-2px] transition-transform duration-200 ${showScriptsDropdown ? 'rotate-180' : ''}`} />
         </button>
 
@@ -314,7 +313,6 @@ export default function ProjectToolbar() {
         disabled={isCompressing}
       >
         <Minimize2 size={14} className={isCompressing ? 'animate-pulse' : ''} />
-        <span>Logs</span>
       </button>
 
       {/* Browser Tab Button */}
@@ -331,7 +329,6 @@ export default function ProjectToolbar() {
         title="Open browser tab"
       >
         <Globe size={14} />
-        <span>Browser</span>
       </button>
 
       {/* Resume All Interrupted Sessions Button - only shows when there are interrupted tabs */}
@@ -365,7 +362,6 @@ export default function ProjectToolbar() {
           title={`Resume all ${interruptedTabs.length} interrupted session(s)`}
         >
           <RotateCcw size={14} />
-          <span>all</span>
           <span
             style={{
               backgroundColor: 'rgba(59, 130, 246, 0.4)',

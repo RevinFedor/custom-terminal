@@ -16,7 +16,7 @@ export type AIModel = 'gemini-3-flash-preview' | 'gemini-3-pro-preview';
 
 export type ThinkingLevel = 'NONE' | 'LOW' | 'MEDIUM' | 'HIGH';
 
-export type ChatType = 'research' | 'compact';
+export type ChatType = 'research' | 'compact' | 'description';
 
 export type WorkspaceView = 'terminal' | 'home';
 
@@ -433,6 +433,8 @@ const DEFAULT_COMPACT_PROMPT = 'Проанализируй всю нашу те�
 
 
 
+const DEFAULT_DESCRIPTION_PROMPT = '1-2 предложения: что сделано. Без маркдауна, без вступлений.\n\n';
+
 const DEFAULT_CHAT_SETTINGS: ChatSettingsMap = {
 
   research: {
@@ -453,6 +455,16 @@ const DEFAULT_CHAT_SETTINGS: ChatSettingsMap = {
 
     prompt: DEFAULT_COMPACT_PROMPT
 
+  },
+
+  description: {
+
+    model: 'gemini-3-flash-preview',
+
+    thinkingLevel: 'NONE',
+
+    prompt: DEFAULT_DESCRIPTION_PROMPT
+
   }
 
 };
@@ -465,7 +477,8 @@ const loadChatSettings = (): ChatSettingsMap => {
       // Merge with defaults to ensure all types have settings
       return {
         research: { ...DEFAULT_CHAT_SETTINGS.research, ...parsed.research },
-        compact: { ...DEFAULT_CHAT_SETTINGS.compact, ...parsed.compact }
+        compact: { ...DEFAULT_CHAT_SETTINGS.compact, ...parsed.compact },
+        description: { ...DEFAULT_CHAT_SETTINGS.description, ...parsed.description }
       };
     }
   } catch (e) {

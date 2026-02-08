@@ -7,7 +7,7 @@ export interface Message {
   timestamp: number;
 }
 
-export type ChatType = 'research' | 'compact';
+export type ChatType = 'research' | 'compact' | 'description';
 
 export interface Conversation {
   id: string;
