@@ -1,7 +1,7 @@
 # Architecture: Foundation
 
 ## 1. Process Model (Electron IPC)
-- **Main Process:** Управляет `node-pty` (терминальными сессиями), SQLite базой данных и файловой системой.
+- **Main Process:** Управляет `node-pty` (терминальными сессиями), SQLite базой данных, файловой системой и жизненным циклом внешних процессов (`system:kill-process`).
     - **КРИТИЧЕСКОЕ ПРАВИЛО:** Запрещено использование `execSync`. Все системные вызовы (pgrep, lsof, ps) должны быть асинхронными (через `execAsync`), чтобы не блокировать Event Loop главного процесса и IPC. См. `knowledge/fix-ui-stability.md` (раздел 8).
     - **Vite & Escaping:** При написании Bash-команд в `main.js` необходимо экранировать `$`, чтобы избежать ошибок трансформации Vite. См. `knowledge/fix-main-process-escaping.md`.
     - **Stability:** Используется `disable-http-cache` для предотвращения загрузки устаревшего кода в продакшн-билдах. См. `knowledge/fix-terminal-colors.md`.
@@ -24,6 +24,10 @@
 
 ## 4. Terminal Integration
 - **Backend:** `node-pty`.
+- **Process Ownership Tracking:** Система определяет принадлежность процессов Claude CLI к конкретным вкладкам приложения.
+    - **PPID Mapping:** Используется `ps -eo pid,ppid` для получения Parent Process ID. Если PPID процесса совпадает с PID шелла в одной из вкладок, процесс помечается как **In-App**.
+    - **External Detection:** Процессы, чьи PPID не найдены в активных терминалах, классифицируются как **External** (запущенные вне приложения).
+    - **CWD via lsof:** Для получения рабочего каталога процесса без взаимодействия с шеллом используется `lsof -p <PID>`.
 - **Shell Integration (OSC 7 & 133):**
     - **OSC 7:** Передача текущего рабочего каталога (CWD). См. `knowledge/fact-osc7-cwd.md`.
     - **CWD Capture:** Для фичи Scripts (см. `features/scripts.md`) используется IPC `terminal:getCwd`, который запрашивает путь напрямую у инстанса xterm.js, гарантируя актуальность после команд `cd`.

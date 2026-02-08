@@ -98,8 +98,10 @@ function Timeline({ tabId, sessionId, cwd }: TimelineProps) {
       if (timelineResult.success) {
         setEntries(timelineResult.entries);
       }
-      if (markersResult.success && markersResult.markers?.length > 0) {
-        setForkMarkers(markersResult.markers);
+      if (markersResult.success) {
+        const markers = markersResult.markers || [];
+        console.log('[Timeline] Fork markers for session', sessionId, ':', markers.length, markers.length > 0 ? JSON.stringify(markers.map((m: ForkMarker) => m.source_session_id)) : '(empty)');
+        setForkMarkers(markers);
       }
     } catch (error) {
       console.error('[Timeline] Error loading timeline:', error);
