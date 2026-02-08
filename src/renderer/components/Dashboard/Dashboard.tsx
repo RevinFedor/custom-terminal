@@ -5,7 +5,7 @@ import { useUIStore } from '../../store/useUIStore';
 import { useBookmarksStore, Bookmark } from '../../store/useBookmarksStore';
 import ProjectCard from './ProjectCard';
 import BookmarkCard from './BookmarkCard';
-import { Plus } from 'lucide-react';
+import { Plus, Square } from 'lucide-react';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -14,6 +14,7 @@ interface ClaudeProcess {
   cwd: string;
   startTime: string;
   command: string;
+  tabId: string | null;
 }
 
 export default function Dashboard() {
@@ -233,30 +234,87 @@ export default function Dashboard() {
         </div>
 
         {/* Active Claude Processes */}
-        {claudeProcesses.length > 0 && (
-          <div className="mt-8">
-            <h2 className="text-sm font-medium text-[#888] mb-3">Active Claude Processes</h2>
-            <div className="flex flex-wrap gap-2">
-              {claudeProcesses.map((proc) => {
-                const folderName = proc.cwd.split('/').filter(Boolean).pop() || proc.cwd;
-                return (
+        {claudeProcesses.length > 0 && (() => {
+          const inApp = claudeProcesses.filter(p => p.tabId);
+          const external = claudeProcesses.filter(p => !p.tabId);
+
+          // Helper: resolve project name + tab name for in-app processes
+          const getTabLabel = (proc: ClaudeProcess) => {
+            if (!proc.tabId) return '';
+            for (const [projId, workspace] of openProjects) {
+              const tab = workspace.tabs.get(proc.tabId);
+              if (tab) {
+                const projName = projects[projId]?.name || projId;
+                return `${projName} / ${tab.name}`;
+              }
+            }
+            return proc.cwd.split('/').filter(Boolean).pop() || proc.cwd;
+          };
+
+          const handleKill = async (pid: number) => {
+            await ipcRenderer.invoke('system:kill-process', pid);
+            // Refetch after short delay
+            setTimeout(async () => {
+              try {
+                const procs = await ipcRenderer.invoke('system:get-claude-processes');
+                setClaudeProcesses(procs || []);
+              } catch { /* ignore */ }
+            }, 500);
+          };
+
+          return (
+            <div className="mt-8">
+              <h2 className="text-sm font-medium text-[#888] mb-3">Active Claude Processes</h2>
+              <div className="flex flex-wrap gap-2">
+                {inApp.map((proc) => (
                   <div
                     key={proc.pid}
-                    className="flex items-center gap-2 px-3 py-2.5 rounded-lg border border-[#333] bg-[#1a1a1a] transition-colors hover:border-[#444]"
+                    className="group flex items-center gap-2 px-3 py-2.5 rounded-lg border border-[#333] bg-[#1a1a1a] transition-colors hover:border-[#444]"
                     title={`PID: ${proc.pid}\nCWD: ${proc.cwd}\nCommand: ${proc.command}`}
                   >
                     <span
                       className="w-2 h-2 rounded-full flex-shrink-0"
                       style={{ backgroundColor: '#0dbc79' }}
                     />
-                    <span className="text-sm text-[#ccc]">{folderName}</span>
+                    <span className="text-sm text-[#ccc]">{getTabLabel(proc)}</span>
                     <span className="text-xs text-[#666]">{proc.startTime}</span>
+                    <button
+                      className="ml-1 p-0.5 rounded text-[#666] opacity-0 group-hover:opacity-100 hover:text-red-400 hover:bg-white/5 transition-all cursor-pointer"
+                      onClick={() => handleKill(proc.pid)}
+                      title="Stop process"
+                    >
+                      <Square size={10} fill="currentColor" />
+                    </button>
                   </div>
-                );
-              })}
+                ))}
+                {external.map((proc) => {
+                  const folderName = proc.cwd.split('/').filter(Boolean).pop() || proc.cwd;
+                  return (
+                    <div
+                      key={proc.pid}
+                      className="group flex items-center gap-2 px-3 py-2.5 rounded-lg border border-dashed border-[#333] bg-transparent transition-colors hover:border-[#444]"
+                      title={`External\nPID: ${proc.pid}\nCWD: ${proc.cwd}\nCommand: ${proc.command}`}
+                    >
+                      <span
+                        className="w-2 h-2 rounded-full flex-shrink-0"
+                        style={{ backgroundColor: '#888' }}
+                      />
+                      <span className="text-sm text-[#888]">{folderName}</span>
+                      <span className="text-xs text-[#555]">{proc.startTime}</span>
+                      <button
+                        className="ml-1 p-0.5 rounded text-[#666] opacity-0 group-hover:opacity-100 hover:text-red-400 hover:bg-white/5 transition-all cursor-pointer"
+                        onClick={() => handleKill(proc.pid)}
+                        title="Stop process"
+                      >
+                        <Square size={10} fill="currentColor" />
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
             </div>
-          </div>
-        )}
+          );
+        })()}
       </div>
     </div>
   );

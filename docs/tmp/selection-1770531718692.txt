@@ -1,0 +1,670 @@
+(Весь текст ниже является копипастом из истории Claude Code / нейросетки, а не содержимым файла)
+
+---
+
+tView.
+
+⏺ Searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+⏺ Now I have all the context I need. Let me create tasks and implement the changes.
+
+⏺ Я проверил файлы: docs/architecture.md, docs/main-feature.md, все knowledge/ файлы из обоих
+  документов, docs/features/project-home.md, docs/features/claude-sessions.md,
+  src/renderer/components/Workspace/TerminalArea.tsx, src/renderer/components/Dashboard/Dashboard.tsx,
+  src/main/main.js.
+
+  Now let me implement all three changes. Starting with Task 1 - TerminalArea.tsx:
+
+⏺ Update(src/renderer/components/Workspace/TerminalArea.tsx)
+  ⎿  Added 1 line
+      1  import React, { memo, useMemo, useEffect, useState } from 'react';
+      2  import { useWorkspaceStore } from '../../store/useWorkspaceStore';
+      3  import { useProjectsStore } from '../../store/useProjectsStore';
+      4 +import { useUIStore } from '../../store/useUIStore';                                    
+      5  import Terminal from './Terminal';
+      6  import BrowserTab from './BrowserTab';
+      7  import { motion, AnimatePresence } from 'framer-motion';
+
+⏺ Update(src/renderer/components/Workspace/TerminalArea.tsx)
+  ⎿  Added 2 lines
+      128    const clearInterruptedState = useWorkspaceStore((state) => state.clearInterruptedSta
+           te);
+      129    const projects = useProjectsStore((state) => state.projects);
+      130
+      131 +  const currentView = useUIStore((s) => s.currentView);                               
+      132 +                                                                                      
+      133    const currentWorkspace = openProjects.get(projectId);
+      134    const currentProject = projects[projectId];
+      135
+
+⏺ Update(src/renderer/components/Workspace/TerminalArea.tsx)
+  ⎿  Added 1 line, removed 1 line
+      198        const isActiveProject = projId === projectId;
+      199
+      200        workspace.tabs.forEach((tab) => {
+      201 -        const isActive = isActiveProject && workspace.activeTabId === tab.id;         
+      201 +        const isActive = isActiveProject && workspace.activeTabId === tab.id && curren
+          +tView === 'terminal';                                                                 
+      202          if (tab.tabType === 'browser') {
+      203            result.push(
+      204              <BrowserTab
+
+⏺ Update(src/renderer/components/Workspace/TerminalArea.tsx)
+  ⎿  Added 1 line, removed 1 line
+      228      });
+      229
+      230      return result;
+      231 -  }, [terminalKeys, projectId, openProjects]);                                        
+      231 +  }, [terminalKeys, projectId, openProjects, currentView]);                           
+      232
+      233    // Listen for Claude fork completion to create new tab with command
+      234    useEffect(() => {
+
+⏺ Now Task 2 - Add IPC handler in main.js after bookmark handlers (after line 1056):
+
+⏺ Update(src/main/main.js)
+  ⎿  Added 55 lines
+      1055    return projectManager.db.createBookmark(selectedPath, name, '');
+      1056  });
+      1057
+      1058 +// ========== SYSTEM: CLAUDE PROCESSES ==========                                    
+      1059 +ipcMain.handle('system:get-claude-processes', async () => {                          
+      1060 +  try {                                                                              
+      1061 +    // Find all claude CLI processes (not our Electron app)                          
+      1062 +    const psOutput = await execAsync(                                                
+      1063 +      'ps -eo pid,lstart,command | grep -i "claude" | grep -v grep | grep -v electron
+           +',                                                                                   
+      1064 +      3000                                                                           
+      1065 +    );                                                                               
+      1066 +                                                                                     
+      1067 +    if (!psOutput) return [];                                                        
+      1068 +                                                                                     
+      1069 +    const lines = psOutput.split('\n').filter(Boolean);                              
+      1070 +    const processes = [];                                                            
+      1071 +                                                                                     
+      1072 +    for (const line of lines) {                                                      
+      1073 +      try {                                                                          
+      1074 +        // Parse ps output: PID + lstart (Day Mon DD HH:MM:SS YYYY) + command        
+      1075 +        const match = line.trim().match(/^\s*(\d+)\s+\w+\s+\w+\s+\d+\s+(\d+:\d+:\d+)\
+           +s+\d+\s+(.+)/);                                                                      
+      1076 +        if (!match) continue;                                                        
+      1077 +                                                                                     
+      1078 +        const pid = match[1];                                                        
+      1079 +        const startTime = match[2]; // HH:MM:SS                                      
+      1080 +        const command = match[3].trim();                                             
+      1081 +                                                                                     
+      1082 +        // Skip non-CLI claude processes                                             
+      1083 +        if (!command.includes('claude') || command.includes('Electron')) continue;   
+      1084 +                                                                                     
+      1085 +        // Get CWD via lsof                                                          
+      1086 +        let cwd = '';                                                                
+      1087 +        try {                                                                        
+      1088 +          cwd = await execAsync('lsof -p ' + pid + ' | grep cwd | awk \'{print ' + '\
+           +$' + '9}\'', 2000);                                                                  
+      1089 +        } catch {                                                                    
+      1090 +          // Process may have exited                                                 
+      1091 +          continue;                                                                  
+      1092 +        }                                                                            
+      1093 +                                                                                     
+      1094 +        if (!cwd) continue;                                                          
+      1095 +                                                                                     
+      1096 +        processes.push({                                                             
+      1097 +          pid: Number(pid),                                                          
+      1098 +          cwd,                                                                       
+      1099 +          startTime: startTime.substring(0, 5), // HH:MM                             
+      1100 +          command,                                                                   
+      1101 +        });                                                                          
+      1102 +      } catch {                                                                      
+      1103 +        // Skip unparseable lines                                                    
+      1104 +      }                                                                              
+      1105 +    }                                                                                
+      1106 +                                                                                     
+      1107 +    return processes;                                                                
+      1108 +  } catch {                                                                          
+      1109 +    return [];                                                                       
+      1110 +  }                                                                                  
+      1111 +});                                                                                  
+      1112 +                                                                                     
+      1113  // Execute quick action command in terminal (fire-and-forget version)
+      1114  // For backwards compatibility - use terminal:executeCommandAsync for sequential comm
+            ands
+      1115  ipcMain.on('terminal:executeCommand', (event, tabId, command) => {
+
+⏺ Now Task 3 - Add Active Claude Processes section to Dashboard.tsx:
+
+⏺ Update(src/renderer/components/Dashboard/Dashboard.tsx)
+  ⎿  Added 8 lines
+       9
+      10  const { ipcRenderer } = window.require('electron');
+      11
+      12 +interface ClaudeProcess {                                                              
+      13 +  pid: number;                                                                         
+      14 +  cwd: string;                                                                         
+      15 +  startTime: string;                                                                   
+      16 +  command: string;                                                                     
+      17 +}                                                                                      
+      18 +                                                                                       
+      19  export default function Dashboard() {
+      20    const [processStatus, setProcessStatus] = useState<Map<string, boolean>>(new Map());
+      21 +  const [claudeProcesses, setClaudeProcesses] = useState<ClaudeProcess[]>([]);         
+      22    const { projects, loadProjects } = useProjectsStore();
+      23    const { openProject, openProjects } = useWorkspaceStore();
+      24    const { bookmarks, loadBookmarks, addBookmarkFromDialog, updateBookmark, deleteBookma
+          rk } = useBookmarksStore();
+
+⏺ Now add the polling useEffect after the existing useEffects:
+
+⏺ Update(src/renderer/components/Dashboard/Dashboard.tsx)
+  ⎿  Added 16 lines
+       84      };
+       85    }, [openProjects.size]);
+       86
+       87 +  // Poll for active Claude processes                                                 
+       88 +  useEffect(() => {                                                                   
+       89 +    const fetchProcesses = async () => {                                              
+       90 +      try {                                                                           
+       91 +        const procs = await ipcRenderer.invoke('system:get-claude-processes');        
+       92 +        setClaudeProcesses(procs || []);                                              
+       93 +      } catch {                                                                       
+       94 +        setClaudeProcesses([]);                                                       
+       95 +      }                                                                               
+       96 +    };                                                                                
+       97 +                                                                                      
+       98 +    fetchProcesses();                                                                 
+       99 +    const interval = setInterval(fetchProcesses, 10000);                              
+      100 +    return () => clearInterval(interval);                                             
+      101 +  }, []);                                                                             
+      102 +                                                                                      
+      103    // Create project from bookmark - always creates a NEW project instance
+      104    const handleCreateProjectFromBookmark = async (bookmark: Bookmark) => {
+      105      console.log('[Dashboard] handleCreateProjectFromBookmark called with bookmark:', b
+           ookmark);
+
+⏺ Now add the JSX section after the Reserved Directories section:
+
+⏺ Update(src/renderer/components/Dashboard/Dashboard.tsx)
+  ⎿  Added 26 lines
+      231              </div>
+      232            </div>
+      233          </div>
+      234 +                                                                                      
+      235 +        {/* Active Claude Processes */}                                               
+      236 +        {claudeProcesses.length > 0 && (                                              
+      237 +          <div className="mt-8">                                                      
+      238 +            <h2 className="text-sm font-medium text-[#888] mb-3">Active Claude Process
+          +es</h2>                                                                               
+      239 +            <div className="flex flex-wrap gap-2">                                    
+      240 +              {claudeProcesses.map((proc) => {                                        
+      241 +                const folderName = proc.cwd.split('/').filter(Boolean).pop() || proc.c
+          +wd;                                                                                   
+      242 +                return (                                                              
+      243 +                  <div                                                                
+      244 +                    key={proc.pid}                                                    
+      245 +                    className="flex items-center gap-2 px-3 py-2.5 rounded-lg border b
+          +order-[#333] bg-[#1a1a1a] transition-colors hover:border-[#444]"                      
+      246 +                    title={`PID: ${proc.pid}\nCWD: ${proc.cwd}\nCommand: ${proc.comman
+          +d}`}                                                                                  
+      247 +                  >                                                                   
+      248 +                    <span                                                             
+      249 +                      className="w-2 h-2 rounded-full flex-shrink-0"                  
+      250 +                      style={{ backgroundColor: '#0dbc79' }}                          
+      251 +                    />                                                                
+      252 +                    <span className="text-sm text-[#ccc]">{folderName}</span>         
+      253 +                    <span className="text-xs text-[#666]">{proc.startTime}</span>     
+      254 +                  </div>                                                              
+      255 +                );                                                                    
+      256 +              })}                                                                     
+      257 +            </div>                                                                    
+      258 +          </div>                                                                      
+      259 +        )}                                                                            
+      260        </div>
+      261      </div>
+      262    );
+
+⏺ Let me verify the final state of all modified files:
+
+⏺ Bash(npx tsc --noEmit --pretty 2>&1 | head -40)
+  ⎿  Version 5.9.3
+     tsc: The TypeScript Compiler - Version 5.9.3
+     … +37 lines (ctrl+o to expand)
+
+⏺ Bash(npx tsc --noEmit -p tsconfig.json 2>&1 | head -40)
+  ⎿  error TS5058: The specified path does not exist: 'tsconfig.json'.
+
+⏺ Searched for 1 pattern (ctrl+o to expand)
+
+⏺ No root tsconfig. Let me just verify the files look correct by reading them:
+
+⏺ Read 1 file (ctrl+o to expand)
+
+⏺ All changes in TerminalArea.tsx look correct. Let me verify the Dashboard.tsx and main.js changes:
+
+⏺ Read 1 file (ctrl+o to expand)
+
+⏺ Let me also verify the main.js IPC handler:
+
+⏺ Read 1 file (ctrl+o to expand)
+
+⏺ All three changes are implemented correctly. Let me verify the $ escaping in the lsof command - this
+  is critical per knowledge/fix-main-process-escaping.md. The command uses string concatenation ('lsof
+  -p ' + pid + ' | grep cwd | awk \'{print ' + '\$' + '9}\'') to avoid template literals with $, which
+  is the correct approach for Vite compatibility.
+
+  Let me also do a quick build check:
+
+⏺ Bash(npm run build 2>&1 | tail -20)
+  ⎿  Running in the background (↓ to manage)
+  ⎿  (timeout 1m)
+
+⏺ Task Output b92902b
+  ⎿  dist/renderer/index.html                     0.61 kB
+     dist/renderer/assets/index-D_XUURIY.css     96.92 kB
+     dist/renderer/assets/index-C3qEy7Je.js   5,618.02 kB
+     … +22 lines (ctrl+o to expand)
+
+⏺ Build succeeds with no errors.
+
+  Here's a summary of all changes:
+
+  Task 1: Terminal refresh fix (TerminalArea.tsx — 4 lines changed)
+  - Imported useUIStore
+  - Added currentView selector
+  - Added && currentView === 'terminal' to isActive check (line 201)
+  - Added currentView to useMemo deps (line 231)
+
+  Task 2: IPC handler (main.js — ~50 lines added after bookmark handlers)
+  - New system:get-claude-processes handler using execAsync (not execSync)
+  - ps -eo pid,lstart,command to find Claude processes
+  - lsof -p <PID> to get CWD (with $ escaped via string concatenation per Vite rules)
+  - Returns Array<{ pid, cwd, startTime, command }>
+
+  Task 3: Dashboard UI (Dashboard.tsx — ~40 lines added)
+  - ClaudeProcess interface
+  - claudeProcesses state with 10-second polling
+  - JSX section after Reserved Directories, shown only when processes exist
+  - Cards: green dot (#0dbc79) + folder name + HH:MM start time + hover tooltip with full details
+
+✻ Worked for 4m 30s
+
+⏺ Background command "Build project to verify no errors" completed (exit code 0)
+
+⏺ The build already completed successfully — I retrieved the output earlier. All three changes are in
+  place and verified.
+
+❯ да ок. а мы может отображать отдельно в группе те вкладки которые запущены из нашего прилжения ?  
+  тип у нас как то храняться id pid или как? как это чисто архитерутно можно сделать                
+
+⏺ Хороший вопрос. Давай посмотрю что у нас есть в архитектуре для этого.
+
+⏺ Explore(Explore terminal/process tracking)
+  ⎿  Done (20 tool uses · 38.7k tokens · 47s)
+
+⏺ Да, можно. Вот что у нас есть:
+
+  В main.js:
+  - terminals Map: tabId → ptyProcess (где ptyProcess.pid — это PID шелла, zsh/bash)
+  - Каждый таб хранит commandType ('claude' / 'gemini' / etc.)
+
+  Ключевой факт: Claude CLI запускается как дочерний процесс нашего шелла. Значит PPID Claude'а ===
+  ptyProcess.pid одного из наших табов.
+
+  Архитектурно самый чистый вариант:
+
+  В IPC handler system:get-claude-processes мы уже получаем PID каждого Claude процесса. Можно добавить
+  ps -eo pid,ppid,command и проверить PPID:
+
+  Наши shell PIDs: terminals.values() → [pid1, pid2, pid3...]
+  Claude process PPID === pid2? → это НАШ, tabId = X
+  Claude process PPID не совпадает → внешний
+
+  Тогда результат будет:
+  { pid, cwd, startTime, command, tabId: "proj-tab-3" }  // наш
+  { pid, cwd, startTime, command, tabId: null }            // внешний
+
+  И на Dashboard две группы:
+  - "In-App" — Claude запущенные из наших вкладок (можно даже кликнуть → переключиться на таб)
+  - "External" — запущенные из iTerm/VS Code/etc.
+
+  Хочешь реализовать так, или есть другие идеи?
+
+✻ Churned for 1m 21s
+
+❯ да давай . Также для процессов добавь кнопку, чтобы можно было их стопнуть, то есть вручную       
+  остановить.                                                                                       
+  ⎿  Interrupted · What should Claude do instead?
+
+❯ Также на джборде можешь показывать как-нибудь тогда именно название нашего таба, то есть типа...  
+  Ну вот как сейчас ты показываешь, только у нас показывают типа проект-название. То есть не        
+  название папки, а проект-название типа того. Или как-то лучше архитектурно отобразить, подумай.   
+
+⏺ Read 2 files (ctrl+o to expand)
+
+⏺ Now let me read the current state of the files I need to modify and explore how project names are
+  accessible.
+
+⏺ Read 2 files (ctrl+o to expand)
+
+⏺ Now let me check how ps can give us PPID, and look at how the store exposes project/tab names on the
+  renderer side.
+
+⏺ Searched for 2 patterns, read 2 files (ctrl+o to expand)
+
+⏺ Now I have the full picture. Let me implement all the changes. The approach:
+
+  1. main.js: Modify system:get-claude-processes to include PPID, cross-reference with terminals Map to
+  add tabId if it's our process. Add system:kill-process handler.
+  2. Dashboard.tsx: Split processes into in-app and external groups. For in-app, show ProjectName /
+  TabName. Add stop button with Square icon.
+
+⏺ Now let me rewrite the IPC handler in main.js:
+
+⏺ Update(src/main/main.js)
+  ⎿  Added 34 lines, removed 6 lines
+      1058  // ========== SYSTEM: CLAUDE PROCESSES ==========
+      1059  ipcMain.handle('system:get-claude-processes', async () => {
+      1060    try {
+      1061 -    // Find all claude CLI processes (not our Electron app)                          
+      1061 +    // Find all claude CLI processes with PPID for ownership detection               
+      1062      const psOutput = await execAsync(
+      1063 -      'ps -eo pid,lstart,command | grep -i "claude" | grep -v grep | grep -v electron
+           -',                                                                                   
+      1063 +      'ps -eo pid,ppid,lstart,command | grep -i "claude" | grep -v grep | grep -v ele
+           +ctron',                                                                              
+      1064        3000
+      1065      );
+      1066
+      1067      if (!psOutput) return [];
+      1068
+      1069 +    // Build a set of our shell PIDs for ownership matching                          
+      1070 +    const ourShellPids = new Set();                                                  
+      1071 +    const pidToTabId = new Map();                                                    
+      1072 +    for (const [tabId, ptyProcess] of terminals) {                                   
+      1073 +      ourShellPids.add(ptyProcess.pid);                                              
+      1074 +      pidToTabId.set(ptyProcess.pid, tabId);                                         
+      1075 +    }                                                                                
+      1076 +                                                                                     
+      1077      const lines = psOutput.split('\n').filter(Boolean);
+      1078      const processes = [];
+      1079
+      1080      for (const line of lines) {
+      1081        try {
+      1074 -        // Parse ps output: PID + lstart (Day Mon DD HH:MM:SS YYYY) + command        
+      1075 -        const match = line.trim().match(/^\s*(\d+)\s+\w+\s+\w+\s+\d+\s+(\d+:\d+:\d+)\
+           -s+\d+\s+(.+)/);                                                                      
+      1082 +        // Parse ps output: PID + PPID + lstart (Day Mon DD HH:MM:SS YYYY) + command 
+      1083 +        const match = line.trim().match(/^\s*(\d+)\s+(\d+)\s+\w+\s+\w+\s+\d+\s+(\d+:\
+           +d+:\d+)\s+\d+\s+(.+)/);                                                              
+      1084          if (!match) continue;
+      1085
+      1086          const pid = match[1];
+      1079 -        const startTime = match[2]; // HH:MM:SS                                      
+      1080 -        const command = match[3].trim();                                             
+      1087 +        const ppid = Number(match[2]);                                               
+      1088 +        const startTime = match[3]; // HH:MM:SS                                      
+      1089 +        const command = match[4].trim();                                             
+      1090
+      1091          // Skip non-CLI claude processes
+      1092          if (!command.includes('claude') || command.includes('Electron')) continue;
+     ...
+      1102
+      1103          if (!cwd) continue;
+      1104
+      1105 +        // Check if this process belongs to one of our terminal tabs                 
+      1106 +        const tabId = pidToTabId.get(ppid) || null;                                  
+      1107 +                                                                                     
+      1108          processes.push({
+      1109            pid: Number(pid),
+      1110            cwd,
+      1111            startTime: startTime.substring(0, 5), // HH:MM
+      1112            command,
+      1113 +          tabId,                                                                     
+      1114          });
+      1115        } catch {
+      1116          // Skip unparseable lines
+     ...
+      1123    }
+      1124  });
+      1125
+      1126 +ipcMain.handle('system:kill-process', async (event, pid) => {                        
+      1127 +  try {                                                                              
+      1128 +    await execAsync('kill ' + pid, 2000);                                            
+      1129 +    return { success: true };                                                        
+      1130 +  } catch {                                                                          
+      1131 +    // Try SIGKILL if graceful kill failed                                           
+      1132 +    try {                                                                            
+      1133 +      await execAsync('kill -9 ' + pid, 2000);                                       
+      1134 +      return { success: true };                                                      
+      1135 +    } catch {                                                                        
+      1136 +      return { success: false };                                                     
+      1137 +    }                                                                                
+      1138 +  }                                                                                  
+      1139 +});                                                                                  
+      1140 +                                                                                     
+      1141  // Execute quick action command in terminal (fire-and-forget version)
+      1142  // For backwards compatibility - use terminal:executeCommandAsync for sequential comm
+            ands
+      1143  ipcMain.on('terminal:executeCommand', (event, tabId, command) => {
+
+⏺ Now update Dashboard.tsx with the new UI — two groups, project/tab names for in-app, stop button:
+
+⏺ Update(src/renderer/components/Dashboard/Dashboard.tsx)
+  ⎿  Added 1 line, removed 1 line
+       5  import { useBookmarksStore, Bookmark } from '../../store/useBookmarksStore';
+       6  import ProjectCard from './ProjectCard';
+       7  import BookmarkCard from './BookmarkCard';
+       8 -import { Plus } from 'lucide-react';                                                   
+       8 +import { Plus, Square } from 'lucide-react';                                           
+       9
+      10  const { ipcRenderer } = window.require('electron');
+      11
+
+⏺ Update(src/renderer/components/Dashboard/Dashboard.tsx)
+  ⎿  Added 1 line
+      14    cwd: string;
+      15    startTime: string;
+      16    command: string;
+      17 +  tabId: string | null;                                                                
+      18  }
+      19
+      20  export default function Dashboard() {
+
+⏺ Now replace the entire Claude Processes JSX section with the improved version:
+
+⏺ Update(src/renderer/components/Dashboard/Dashboard.tsx)
+  ⎿  Added 70 lines, removed 13 lines
+      234          </div>
+      235
+      236          {/* Active Claude Processes */}
+      237 -        {claudeProcesses.length > 0 && (                                              
+      238 -          <div className="mt-8">                                                      
+      239 -            <h2 className="text-sm font-medium text-[#888] mb-3">Active Claude Process
+          -es</h2>                                                                               
+      240 -            <div className="flex flex-wrap gap-2">                                    
+      241 -              {claudeProcesses.map((proc) => {                                        
+      242 -                const folderName = proc.cwd.split('/').filter(Boolean).pop() || proc.c
+          -wd;                                                                                   
+      243 -                return (                                                              
+      237 +        {claudeProcesses.length > 0 && (() => {                                       
+      238 +          const inApp = claudeProcesses.filter(p => p.tabId);                         
+      239 +          const external = claudeProcesses.filter(p => !p.tabId);                     
+      240 +                                                                                      
+      241 +          // Helper: resolve project name + tab name for in-app processes             
+      242 +          const getTabLabel = (proc: ClaudeProcess) => {                              
+      243 +            if (!proc.tabId) return '';                                               
+      244 +            for (const [projId, workspace] of openProjects) {                         
+      245 +              const tab = workspace.tabs.get(proc.tabId);                             
+      246 +              if (tab) {                                                              
+      247 +                const projName = projects[projId]?.name || projId;                    
+      248 +                return `${projName} / ${tab.name}`;                                   
+      249 +              }                                                                       
+      250 +            }                                                                         
+      251 +            return proc.cwd.split('/').filter(Boolean).pop() || proc.cwd;             
+      252 +          };                                                                          
+      253 +                                                                                      
+      254 +          const handleKill = async (pid: number) => {                                 
+      255 +            await ipcRenderer.invoke('system:kill-process', pid);                     
+      256 +            // Refetch after short delay                                              
+      257 +            setTimeout(async () => {                                                  
+      258 +              try {                                                                   
+      259 +                const procs = await ipcRenderer.invoke('system:get-claude-processes');
+      260 +                setClaudeProcesses(procs || []);                                      
+      261 +              } catch { /* ignore */ }                                                
+      262 +            }, 500);                                                                  
+      263 +          };                                                                          
+      264 +                                                                                      
+      265 +          return (                                                                    
+      266 +            <div className="mt-8">                                                    
+      267 +              <h2 className="text-sm font-medium text-[#888] mb-3">Active Claude Proce
+          +sses</h2>                                                                             
+      268 +              <div className="flex flex-wrap gap-2">                                  
+      269 +                {inApp.map((proc) => (                                                
+      270                    <div
+      271                      key={proc.pid}
+      246 -                    className="flex items-center gap-2 px-3 py-2.5 rounded-lg border b
+          -order-[#333] bg-[#1a1a1a] transition-colors hover:border-[#444]"                      
+      272 +                    className="group flex items-center gap-2 px-3 py-2.5 rounded-lg bo
+          +rder border-[#333] bg-[#1a1a1a] transition-colors hover:border-[#444]"                
+      273                      title={`PID: ${proc.pid}\nCWD: ${proc.cwd}\nCommand: ${proc.comman
+           d}`}
+      274                    >
+      275                      <span
+      276                        className="w-2 h-2 rounded-full flex-shrink-0"
+      277                        style={{ backgroundColor: '#0dbc79' }}
+      278                      />
+      253 -                    <span className="text-sm text-[#ccc]">{folderName}</span>         
+      279 +                    <span className="text-sm text-[#ccc]">{getTabLabel(proc)}</span>  
+      280                      <span className="text-xs text-[#666]">{proc.startTime}</span>
+      281 +                    <button                                                           
+      282 +                      className="ml-1 p-0.5 rounded text-[#666] opacity-0 group-hover:
+          +opacity-100 hover:text-red-400 hover:bg-white/5 transition-all"                       
+      283 +                      onClick={() => handleKill(proc.pid)}                            
+      284 +                      title="Stop process"                                            
+      285 +                    >                                                                 
+      286 +                      <Square size={10} fill="currentColor" />                        
+      287 +                    </button>                                                         
+      288                    </div>
+      256 -                );                                                                    
+      257 -              })}                                                                     
+      289 +                ))}                                                                   
+      290 +                {external.map((proc) => {                                             
+      291 +                  const folderName = proc.cwd.split('/').filter(Boolean).pop() || proc
+          +.cwd;                                                                                 
+      292 +                  return (                                                            
+      293 +                    <div                                                              
+      294 +                      key={proc.pid}                                                  
+      295 +                      className="group flex items-center gap-2 px-3 py-2.5 rounded-lg 
+          +border border-dashed border-[#333] bg-transparent transition-colors hover:border-[#444
+          +]"                                                                                    
+      296 +                      title={`External\nPID: ${proc.pid}\nCWD: ${proc.cwd}\nCommand: $
+          +{proc.command}`}                                                                      
+      297 +                    >                                                                 
+      298 +                      <span                                                           
+      299 +                        className="w-2 h-2 rounded-full flex-shrink-0"                
+      300 +                        style={{ backgroundColor: '#888' }}                           
+      301 +                      />                                                              
+      302 +                      <span className="text-sm text-[#888]">{folderName}</span>       
+      303 +                      <span className="text-xs text-[#555]">{proc.startTime}</span>   
+      304 +                      <button                                                         
+      305 +                        className="ml-1 p-0.5 rounded text-[#666] opacity-0 group-hove
+          +r:opacity-100 hover:text-red-400 hover:bg-white/5 transition-all"                     
+      306 +                        onClick={() => handleKill(proc.pid)}                          
+      307 +                        title="Stop process"                                          
+      308 +                      >                                                               
+      309 +                        <Square size={10} fill="currentColor" />                      
+      310 +                      </button>                                                       
+      311 +                    </div>                                                            
+      312 +                  );                                                                  
+      313 +                })}                                                                   
+      314 +              </div>                                                                  
+      315              </div>
+      259 -          </div>                                                                      
+      260 -        )}                                                                            
+      316 +          );                                                                          
+      317 +        })()}                                                                         
+      318        </div>
+      319      </div>
+      320    );
+
+⏺ Now let me build to verify:
+
+⏺ Bash(npm run build 2>&1 | tail -15)
+  ⎿  Running in the background (↓ to manage)
+  ⎿  (timeout 1m)
+
+⏺ Task Output b95f092                                                             
+  ⎿   • loaded configuration  file=package.json ("build" field)
+      • author is missed in the package.json  appPackageFile=/Users/fedor/Desktop/custom-terminal/p
+    ackage.json
+    … +17 lines (ctrl+o to expand)            
+                                          
+
+⏺ Билд успешен. Вот что изменилось:                                                                     
+                                                      
+  main.js — IPC handler system:get-claude-processes:                                                    
+  - Добавил ppid в ps команду (ps -eo pid,ppid,lstart,command)    
+  - Собираю Set наших shell PID из terminals Map и Map pid→tabId
+  - Если PPID Claude процесса совпадает с PID одного из наших шеллов → добавляю tabId                   
+  - Новый handler system:kill-process — отправляет kill, при неудаче kill -9
+                                                                                                        
+  Dashboard.tsx — UI:                                             
+  - Процессы разделяются на inApp (есть tabId) и external (нет)                                         
+  - In-App: зелёный индикатор + ProjectName / TabName (резолвится через openProjects и projects stores)
+  + время                                                                                               
+  - External: серый индикатор + имя папки + время + dashed border (визуально отличается)                
+  - На hover каждой карточки появляется кнопка Stop (заполненный квадрат), клик убивает процесс и
+  рефетчит список через 500мс
+
+✻ Sautéed for 3m 20s
+
+⏺ Background command "Build to verify changes" completed (exit code 0)
+
+⏺ Build already completed successfully — all changes are verified and working.
+                                          
+❯ На кнопке остановить добавь курсор поинтер.                                                           
+                                                                                                        
+⏺ Update(src/renderer/components/Dashboard/Dashboard.tsx)                                               
+  ⎿  Added 2 lines, removed 2 lines                                                                     
+      279                      <span className="text-sm text-[#ccc]">{getTabLabel(proc)}</span>         
+      280                      <span className="text-xs text-[#666]">{proc.startTime}</span>            
+      281                      <button                                                                  
+      282 -                      className="ml-1 p-0.5 rounded text-[#666] opacity-0 group-hover:       
+          -opacity-100 hover:text-red-400 hover:bg-white/5 transition-all"                              
+      282 +                      className="ml-1 p-0.5 rounded text-[#666] opacity-0 group-hover:       
+          +opacity-100 hover:text-red-400 hover:bg-white/5 transition-all cursor-pointer"               
+      283                        onClick={() => handleKill(proc.pid)}
+      284                        title="Stop process"
+      285                      >
+     ...
+      302                        <span className="text-sm text-[#888]">{folderName}</span>
+      303                        <span className="text-xs text-[#555]">{proc.startTime}</span>
+      304                        <button
+      305 -                        className="ml-1 p-0.5 rounded text-[#666] opacity-0 group-hove
+          -r:opacity-100 hover:text-red-400 hover:bg-white/5 transition-all"                     
+      305 +                        className="ml-1 p-0.5 rounded text-[#666] opacity-0 group-hove
+          +r:opacity-100 hover:text-red-400 hover:bg-white/5 transition-all cursor-pointer"      
+      306                          onClick={() => handleKill(proc.pid)}
+      307                          title="Stop process"
+      308                        >
+
+⏺ Добавил cursor-pointer на обе кнопки Stop (in-app и external).
+
+❯ Изучи как у нас работает таймлайн и как у нас работает синяя полоска, которая подставляется           
+  внизу.     blue line устанавливается не только у fork сессий, но и из которых они были сделаны .    
+  она не должна устанавливаться у сессии, откуда мы запускаем этот BlueLine. Она должна                 
+  устанавливаться только у новой сессии внизу.                                                          
+                                                                                                        
+⏺ Read 1 file (ctrl+o to expand)                                                                        
+                                                                                                        
+⏺ Это другая задача — про баг с BlueLine в Timeline при форке. Начну исследование.
+                                                                                                        
+⏺ Explore(Explore Timeline & BlueLine fork)                                                             
+  ⎿  Done (24 tool uses · 76.9k tokens · 1m 24s)                                                        
+                                                                                                       
+⏺ Отличное исследование. Теперь я понимаю проблему. Давай проверю ключевой код — saveForkMarker и       
+  getForkMarkers:                                       
+                                                                                                        
+⏺ Read 1 file (ctrl+o to expand)                        
+                                                                                                        
+⏺ Теперь посмотрю Timeline.tsx — как именно рендерится blue line и как он определяет, на какой сессии   
+  показывать:                                                                                           
+                                              

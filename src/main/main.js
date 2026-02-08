@@ -1058,26 +1058,35 @@ ipcMain.handle('bookmark:select-directory', async () => {
 // ========== SYSTEM: CLAUDE PROCESSES ==========
 ipcMain.handle('system:get-claude-processes', async () => {
   try {
-    // Find all claude CLI processes (not our Electron app)
+    // Find all claude CLI processes with PPID for ownership detection
     const psOutput = await execAsync(
-      'ps -eo pid,lstart,command | grep -i "claude" | grep -v grep | grep -v electron',
+      'ps -eo pid,ppid,lstart,command | grep -i "claude" | grep -v grep | grep -v electron',
       3000
     );
 
     if (!psOutput) return [];
+
+    // Build a set of our shell PIDs for ownership matching
+    const ourShellPids = new Set();
+    const pidToTabId = new Map();
+    for (const [tabId, ptyProcess] of terminals) {
+      ourShellPids.add(ptyProcess.pid);
+      pidToTabId.set(ptyProcess.pid, tabId);
+    }
 
     const lines = psOutput.split('\n').filter(Boolean);
     const processes = [];
 
     for (const line of lines) {
       try {
-        // Parse ps output: PID + lstart (Day Mon DD HH:MM:SS YYYY) + command
-        const match = line.trim().match(/^\s*(\d+)\s+\w+\s+\w+\s+\d+\s+(\d+:\d+:\d+)\s+\d+\s+(.+)/);
+        // Parse ps output: PID + PPID + lstart (Day Mon DD HH:MM:SS YYYY) + command
+        const match = line.trim().match(/^\s*(\d+)\s+(\d+)\s+\w+\s+\w+\s+\d+\s+(\d+:\d+:\d+)\s+\d+\s+(.+)/);
         if (!match) continue;
 
         const pid = match[1];
-        const startTime = match[2]; // HH:MM:SS
-        const command = match[3].trim();
+        const ppid = Number(match[2]);
+        const startTime = match[3]; // HH:MM:SS
+        const command = match[4].trim();
 
         // Skip non-CLI claude processes
         if (!command.includes('claude') || command.includes('Electron')) continue;
@@ -1093,11 +1102,15 @@ ipcMain.handle('system:get-claude-processes', async () => {
 
         if (!cwd) continue;
 
+        // Check if this process belongs to one of our terminal tabs
+        const tabId = pidToTabId.get(ppid) || null;
+
         processes.push({
           pid: Number(pid),
           cwd,
           startTime: startTime.substring(0, 5), // HH:MM
           command,
+          tabId,
         });
       } catch {
         // Skip unparseable lines
@@ -1107,6 +1120,21 @@ ipcMain.handle('system:get-claude-processes', async () => {
     return processes;
   } catch {
     return [];
+  }
+});
+
+ipcMain.handle('system:kill-process', async (event, pid) => {
+  try {
+    await execAsync('kill ' + pid, 2000);
+    return { success: true };
+  } catch {
+    // Try SIGKILL if graceful kill failed
+    try {
+      await execAsync('kill -9 ' + pid, 2000);
+      return { success: true };
+    } catch {
+      return { success: false };
+    }
   }
 });
 
