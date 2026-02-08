@@ -286,3 +286,25 @@ const term = new XTerminal({
 
 ### Результат
 Текст стал более четким, тонким и профессиональным, сохраняя читаемость даже при мелком кегле.
+
+---
+
+## 11. Background Terminal Throttling (currentView)
+**Файл-источник:** Сессия 2026-02-08
+
+### Проблема
+Терминалы в фоновых вкладках или при переключении на Dashboard/Notes продолжали считаться "активными" в логике `TerminalArea.tsx`, что могло приводить к лишним перерисовкам или конфликтам фокуса.
+
+### Решение
+Введена зависимость состояния `isActive` таба от глобального состояния `currentView` (из `useUIStore`).
+
+```javascript
+// src/renderer/components/Workspace/TerminalArea.tsx
+const currentView = useUIStore((s) => s.currentView);
+
+// ... внутри useMemo ...
+const isActive = isActiveProject && workspace.activeTabId === tab.id && currentView === 'terminal';
+```
+
+### Результат
+Терминал полностью игнорирует события и не претендует на активность, если пользователь находится в другом разделе приложения (Dashboard, Notes). Это повышает общую отзывчивость интерфейса при работе с тяжелыми AI-сессиями.
