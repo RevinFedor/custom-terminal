@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useRef, memo } from 'react';
+import React, { useEffect, useState, useRef, useCallback, memo } from 'react';
 import { useWorkspaceStore, isTabInterrupted } from './store/useWorkspaceStore';
 import { useProjectsStore } from './store/useProjectsStore';
 import { useUIStore } from './store/useUIStore';
@@ -317,13 +317,40 @@ const RestoreLoader = memo(() => (
 function App() {
   const { view, showDashboard, openProject, openProjects, activeProjectId, closeProject, createTab, createTabAfterCurrent, closeTab, getActiveProject, restoreSession, reorderProjects, moveTabToProject, isRestoring, getSidebarState, setSidebarOpen, setOpenFilePath } = useWorkspaceStore();
   const { projects, loadProjects, updateProject } = useProjectsStore();
-  const { closeFilePreview, filePreview, showToast, incrementAllFontSizes, decrementAllFontSizes, activeArea, setActiveArea, currentView } = useUIStore();
+  const { closeFilePreview, filePreview, showToast, incrementAllFontSizes, decrementAllFontSizes, activeArea, setActiveArea, currentView, dragAreaWidth, setDragAreaWidth } = useUIStore();
   const { toggleResearch } = useResearchStore();
   const projectTabsFontSize = useUIStore((s) => s.projectTabsFontSize);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [projectContextMenu, setProjectContextMenu] = useState<{ projectId: string; x: number; y: number } | null>(null);
   const [projectEmptyZoneHovered, setProjectEmptyZoneHovered] = useState(false);
   const [processStatus, setProcessStatus] = useState<Map<string, boolean>>(new Map()); // tabId -> isRunning
+
+  // Drag area resize
+  const isResizingDragArea = useRef(false);
+
+  const handleDragAreaResizeStart = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    isResizingDragArea.current = true;
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+
+    const handleMouseMove = (ev: MouseEvent) => {
+      if (!isResizingDragArea.current) return;
+      const newWidth = window.innerWidth - ev.clientX;
+      setDragAreaWidth(newWidth);
+    };
+
+    const handleMouseUp = () => {
+      isResizingDragArea.current = false;
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+      window.removeEventListener('mousemove', handleMouseMove);
+      window.removeEventListener('mouseup', handleMouseUp);
+    };
+
+    window.addEventListener('mousemove', handleMouseMove);
+    window.addEventListener('mouseup', handleMouseUp);
+  }, [setDragAreaWidth]);
 
   // Renaming projects in tabs
   const [editingProjectId, setEditingProjectId] = useState<string | null>(null);
@@ -891,16 +918,22 @@ function App() {
             onDoubleClick={handleCreateNewProject}
           />
           
-          {/* Vertical separator */}
-          <div className="w-[1px] h-4 bg-white/10 flex-shrink-0" />
-
-          {/* Dedicated Window Drag Area - Fixed 300px */}
-          <div 
-            className="w-[300px] h-full flex-shrink-0 cursor-default bg-white/[0.01] hover:bg-white/[0.03] transition-colors border-l border-white/5"
-            style={{ WebkitAppRegion: 'drag' } as any}
-            onMouseDown={() => setActiveArea('projects')}
-            title="Drag window"
-          />
+          {/* Resizable Window Drag Area */}
+          <div className="relative h-full flex-shrink-0 flex" style={{ width: dragAreaWidth }}>
+            {/* Resize handle */}
+            <div
+              className="w-[4px] h-full cursor-col-resize hover:bg-white/20 transition-colors flex-shrink-0"
+              style={{ WebkitAppRegion: 'no-drag' } as any}
+              onMouseDown={handleDragAreaResizeStart}
+            />
+            {/* Drag area */}
+            <div
+              className="flex-1 h-full cursor-default bg-white/[0.01] hover:bg-white/[0.03] transition-colors border-l border-white/5"
+              style={{ WebkitAppRegion: 'drag' } as any}
+              onMouseDown={() => setActiveArea('projects')}
+              title="Drag window"
+            />
+          </div>
         </div>
       </div>
 

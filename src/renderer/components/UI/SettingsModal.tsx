@@ -143,7 +143,7 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
   const setTerminalFontSize = useUIStore((s) => s.setTerminalFontSize);
   const setTabsFontSize = useUIStore((s) => s.setTabsFontSize);
   const setProjectTabsFontSize = useUIStore((s) => s.setProjectTabsFontSize);
-  const { showToast, chatSettings, setChatSettings, docPrompt, setDocPromptUseFile, setDocPromptFilePath, setDocPromptInlineContent } = useUIStore();
+  const { showToast, chatSettings, setChatSettings, docPrompt, setDocPromptUseFile, setDocPromptFilePath, setDocPromptInlineContent, claudeDefaultPromptEnabled, setClaudeDefaultPromptEnabled } = useUIStore();
 
   // Claude Default Prompt
   const [claudeDefaultPrompt, setClaudeDefaultPrompt] = useState('');
@@ -556,10 +556,11 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                   style={{
                     padding: '12px',
                     backgroundColor: editingClaude ? '#252525' : '#222',
-                    border: editingClaude ? '2px solid #DA7756' : '2px solid #DA775633',
+                    border: editingClaude ? '2px solid #DA7756' : `2px solid ${claudeDefaultPromptEnabled ? '#DA775633' : '#DA775615'}`,
                     borderRadius: '10px',
                     cursor: editingClaude ? 'default' : 'pointer',
-                    marginBottom: '10px'
+                    marginBottom: '10px',
+                    opacity: editingClaude || claudeDefaultPromptEnabled ? 1 : 0.6
                   }}
                 >
                   {editingClaude ? (
@@ -586,8 +587,37 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                     />
                   ) : (
                     <>
-                      <div style={{ fontSize: '13px', color: '#DA7756', fontWeight: '500', marginBottom: '4px' }}>Claude Default</div>
-                      <div style={{ fontSize: '11px', color: '#666', overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '4px' }}>
+                        <div style={{ fontSize: '13px', color: '#DA7756', fontWeight: '500' }}>Claude Default</div>
+                        <div
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setClaudeDefaultPromptEnabled(!claudeDefaultPromptEnabled);
+                          }}
+                          style={{
+                            width: '32px',
+                            height: '18px',
+                            borderRadius: '9px',
+                            backgroundColor: claudeDefaultPromptEnabled ? '#DA7756' : '#444',
+                            position: 'relative',
+                            cursor: 'pointer',
+                            transition: 'background-color 0.2s',
+                            flexShrink: 0
+                          }}
+                        >
+                          <div style={{
+                            width: '14px',
+                            height: '14px',
+                            borderRadius: '50%',
+                            backgroundColor: '#fff',
+                            position: 'absolute',
+                            top: '2px',
+                            left: claudeDefaultPromptEnabled ? '16px' : '2px',
+                            transition: 'left 0.2s'
+                          }} />
+                        </div>
+                      </div>
+                      <div style={{ fontSize: '11px', color: claudeDefaultPromptEnabled ? '#666' : '#555', overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', opacity: claudeDefaultPromptEnabled ? 1 : 0.5 }}>
                         {claudeDefaultPrompt || 'Не задан'}
                       </div>
                     </>

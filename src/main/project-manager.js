@@ -102,6 +102,19 @@ class ProjectManager {
   savePrompts(prompts) {
     this.db.savePrompts(prompts);
   }
+
+  // Tab history methods
+  archiveTab(projectId, tab) {
+    this.db.archiveTab(projectId, tab);
+  }
+
+  getTabHistory(projectId, limit) {
+    return this.db.getTabHistory(projectId, limit);
+  }
+
+  clearTabHistory(projectId) {
+    this.db.clearTabHistory(projectId);
+  }
 }
 
 module.exports = new ProjectManager();

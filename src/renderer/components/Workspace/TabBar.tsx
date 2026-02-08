@@ -7,7 +7,7 @@ import { draggable, dropTargetForElements, monitorForElements } from '@atlaskit/
 import { attachClosestEdge, extractClosestEdge, type Edge } from '@atlaskit/pragmatic-drag-and-drop-hitbox/closest-edge';
 import { combine } from '@atlaskit/pragmatic-drag-and-drop/combine';
 import { autoScrollForElements } from '@atlaskit/pragmatic-drag-and-drop-auto-scroll/element';
-import { ChevronDown } from 'lucide-react';
+import { ChevronDown, Globe } from 'lucide-react';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -26,6 +26,7 @@ interface TabData {
   wasInterrupted?: boolean;
   claudeSessionId?: string;
   geminiSessionId?: string;
+  tabType?: string;
 }
 
 type DragData = {
@@ -338,7 +339,9 @@ const TabItem = memo(({
     gap: '8px',
     cursor: 'pointer',
     overflow: 'visible',
-    padding: isHorizontal ? '0 16px 0 32px' : '0 12px 0 32px', // Left padding for restart zone
+    padding: tab.tabType === 'browser'
+      ? (isHorizontal ? '0 16px' : '0 12px') // No left padding for browser tabs
+      : (isHorizontal ? '0 16px 0 32px' : '0 12px 0 32px'), // Left padding for restart zone
     fontSize: `${fontSize}px`,
     height: '30px', // Same height for all tabs
     minWidth: isHorizontal ? 'auto' : '160px',
@@ -370,13 +373,15 @@ const TabItem = memo(({
         }
       }}
     >
-      {/* Restart zone - left part of tab */}
-      <RestartZone
-        hasProcess={hasProcess}
-        hasColor={!!hasColor}
-        commandType={commandType}
-        onRestart={() => onRestart && onRestart(tab.id)}
-      />
+      {/* Restart zone - left part of tab (not for browser tabs) */}
+      {tab.tabType !== 'browser' && (
+        <RestartZone
+          hasProcess={hasProcess}
+          hasColor={!!hasColor}
+          commandType={commandType}
+          onRestart={() => onRestart && onRestart(tab.id)}
+        />
+      )}
 
       {isEditing ? (
         <input
@@ -390,7 +395,8 @@ const TabItem = memo(({
           onClick={(e) => e.stopPropagation()}
         />
       ) : (
-        <span className="select-none whitespace-nowrap overflow-hidden text-ellipsis" style={{ flex: isHorizontal ? 'none' : 1 }}>
+        <span className="select-none whitespace-nowrap overflow-hidden text-ellipsis flex items-center gap-1" style={{ flex: isHorizontal ? 'none' : 1 }}>
+          {tab.tabType === 'browser' && <Globe size={12} className="flex-shrink-0 opacity-60" />}
           {tab.name}
         </span>
       )}

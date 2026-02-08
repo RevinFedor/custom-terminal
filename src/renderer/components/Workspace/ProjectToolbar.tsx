@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { Home, Minimize2, Play, ChevronDown, RotateCcw } from 'lucide-react';
+import { Home, Minimize2, Play, ChevronDown, RotateCcw, Globe } from 'lucide-react';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore, isTabInterrupted } from '../../store/useWorkspaceStore';
 import { compressLogs } from '../../utils/compressLogs';
@@ -8,7 +8,7 @@ const { ipcRenderer } = window.require('electron');
 
 export default function ProjectToolbar() {
   const { currentView, setCurrentView, showToast } = useUIStore();
-  const { activeProjectId, getActiveTab, openProjects, clearInterruptedState, setTabCommandType } = useWorkspaceStore();
+  const { activeProjectId, getActiveTab, openProjects, clearInterruptedState, setTabCommandType, createBrowserTab } = useWorkspaceStore();
 
   // Get active tab ID to trigger updates when switching tabs
   const activeTabId = activeProjectId
@@ -315,6 +315,23 @@ export default function ProjectToolbar() {
       >
         <Minimize2 size={14} className={isCompressing ? 'animate-pulse' : ''} />
         <span>Logs</span>
+      </button>
+
+      {/* Browser Tab Button */}
+      <button
+        onClick={() => {
+          if (activeProjectId) {
+            createBrowserTab(activeProjectId);
+            setCurrentView('terminal');
+          }
+        }}
+        style={buttonStyle(false)}
+        onMouseEnter={(e) => handleMouseEnter(e, false)}
+        onMouseLeave={(e) => handleMouseLeave(e, false)}
+        title="Open browser tab"
+      >
+        <Globe size={14} />
+        <span>Browser</span>
       </button>
 
       {/* Resume All Interrupted Sessions Button - only shows when there are interrupted tabs */}

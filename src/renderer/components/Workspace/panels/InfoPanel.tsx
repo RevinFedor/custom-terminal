@@ -48,7 +48,7 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
   const [isExporting, setIsExporting] = useState(false);
   // Tab notes state
   const [tabNotes, setTabNotes] = useState('');
-  const { showToast } = useUIStore();
+  const { showToast, claudeDefaultPromptEnabled } = useUIStore();
   const { setTabCommandType, closeTab, setTabNotes: setTabNotesStore, getTabNotes } = useWorkspaceStore();
   const notesTextareaRef = useRef<HTMLTextAreaElement>(null);
   const claudeTextareaRef = useRef<HTMLTextAreaElement>(null);
@@ -343,7 +343,8 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                           showToast(`Уже есть ${currentSessionType} сессия`, 'warning');
                           return;
                         }
-                        const finalPrompt = [claudeDefaultPrompt, claudeExtraPrompt].filter(Boolean).join('\n\n');
+                        const effectiveDefault = claudeDefaultPromptEnabled ? claudeDefaultPrompt : '';
+                        const finalPrompt = [effectiveDefault, claudeExtraPrompt].filter(Boolean).join('\n\n');
                         setTabCommandType(activeTabId, 'claude');
                         ipcRenderer.send('claude:run-command', { tabId: activeTabId, command: 'claude', prompt: finalPrompt || undefined });
                         setClaudeExpanded(false);
@@ -355,7 +356,7 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                   </div>
                   <div className="flex items-center gap-2">
                     {/* Default prompt badge with hover tooltip */}
-                    {claudeDefaultPrompt && !hasAnySession && (
+                    {claudeDefaultPrompt && claudeDefaultPromptEnabled && !hasAnySession && (
                       <div className="relative group">
                         <span className="text-[9px] px-1.5 py-0.5 bg-[#DA7756]/20 text-[#DA7756] rounded cursor-default">
                           Default
@@ -374,7 +375,7 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                   </div>
                 </div>
                 <p className="text-[10px] text-[#666] mt-1">
-                  {claudeDefaultPrompt ? 'С промптом' : 'Новая сессия'}
+                  {claudeDefaultPrompt && claudeDefaultPromptEnabled ? 'С промптом' : 'Новая сессия'}
                 </p>
 
                 {/* Expanded area with textarea */}
@@ -390,7 +391,8 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                         if (e.key === 'Enter' && e.metaKey) {
                           e.preventDefault();
                           if (!activeTabId) return;
-                          const finalPrompt = [claudeDefaultPrompt, claudeExtraPrompt].filter(Boolean).join('\n\n');
+                          const effectiveDefault = claudeDefaultPromptEnabled ? claudeDefaultPrompt : '';
+                          const finalPrompt = [effectiveDefault, claudeExtraPrompt].filter(Boolean).join('\n\n');
                           setTabCommandType(activeTabId, 'claude');
                           ipcRenderer.send('claude:run-command', { tabId: activeTabId, command: 'claude', prompt: finalPrompt || undefined });
                           setClaudeExpanded(false);

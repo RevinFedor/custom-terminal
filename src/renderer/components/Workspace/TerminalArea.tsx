@@ -2,6 +2,7 @@ import React, { memo, useMemo, useEffect, useState } from 'react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import Terminal from './Terminal';
+import BrowserTab from './BrowserTab';
 import { motion, AnimatePresence } from 'framer-motion';
 
 const { ipcRenderer } = window.require('electron');
@@ -195,15 +196,31 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
 
       workspace.tabs.forEach((tab) => {
         const isActive = isActiveProject && workspace.activeTabId === tab.id;
-        result.push(
-          <Terminal
-            key={tab.id}
-            tabId={tab.id}
-            cwd={tab.cwd}
-            active={isActive}
-            isActiveProject={isActiveProject}
-          />
-        );
+        if (tab.tabType === 'browser') {
+          result.push(
+            <BrowserTab
+              key={tab.id}
+              tabId={tab.id}
+              url={tab.url || 'http://localhost:3000'}
+              active={isActive}
+              isActiveProject={isActiveProject}
+              terminalId={tab.terminalId}
+              terminalName={tab.terminalName}
+              activeView={tab.activeView || 'terminal'}
+              cwd={tab.cwd}
+            />
+          );
+        } else {
+          result.push(
+            <Terminal
+              key={tab.id}
+              tabId={tab.id}
+              cwd={tab.cwd}
+              active={isActive}
+              isActiveProject={isActiveProject}
+            />
+          );
+        }
       });
     });
 

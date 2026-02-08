@@ -120,6 +120,10 @@ interface UIStore {
 
 
 
+  // Claude Default Prompt toggle
+  claudeDefaultPromptEnabled: boolean;
+  setClaudeDefaultPromptEnabled: (enabled: boolean) => void;
+
   // Documentation Prompt (for Update Docs feature)
 
   docPrompt: DocPromptSettings;
@@ -185,6 +189,10 @@ interface UIStore {
   notesPanelWidth: number;
 
   setNotesPanelWidth: (width: number) => void;
+
+  // Drag Area Width (title bar window drag handle)
+  dragAreaWidth: number;
+  setDragAreaWidth: (width: number) => void;
 
 
 
@@ -526,6 +534,40 @@ const initialResearchPrompt = loadResearchPrompt();
 const initialDocPrompt = loadDocPrompt();
 const initialChatSettings = loadChatSettings();
 
+const loadClaudeDefaultPromptEnabled = (): boolean => {
+  try {
+    const saved = localStorage.getItem('noted-terminal-claude-default-prompt-enabled');
+    if (saved !== null) return saved === 'true';
+  } catch (e) {
+    console.error('Failed to load claude default prompt enabled:', e);
+  }
+  return true; // Enabled by default
+};
+
+const saveClaudeDefaultPromptEnabled = (enabled: boolean) => {
+  try {
+    localStorage.setItem('noted-terminal-claude-default-prompt-enabled', String(enabled));
+  } catch (e) {
+    console.error('Failed to save claude default prompt enabled:', e);
+  }
+};
+
+const initialClaudeDefaultPromptEnabled = loadClaudeDefaultPromptEnabled();
+
+const loadDragAreaWidth = (): number => {
+  try {
+    const saved = localStorage.getItem('noted-terminal-drag-area-width');
+    if (saved) {
+      const parsed = Number(saved);
+      if (!isNaN(parsed)) return Math.max(80, Math.min(600, parsed));
+    }
+  } catch (e) {
+    console.error('Failed to load drag area width:', e);
+  }
+  return 300;
+};
+const initialDragAreaWidth = loadDragAreaWidth();
+
 export const useUIStore = create<UIStore>((set, get) => ({
   // Font Settings
   terminalFontSize: initialFontSettings.terminalFontSize,
@@ -573,6 +615,13 @@ export const useUIStore = create<UIStore>((set, get) => ({
   setResearchPrompt: (prompt) => {
     set({ researchPrompt: prompt });
     saveResearchPrompt(prompt);
+  },
+
+  // Claude Default Prompt toggle
+  claudeDefaultPromptEnabled: initialClaudeDefaultPromptEnabled,
+  setClaudeDefaultPromptEnabled: (enabled) => {
+    set({ claudeDefaultPromptEnabled: enabled });
+    saveClaudeDefaultPromptEnabled(enabled);
   },
 
   // Documentation Prompt
@@ -711,6 +760,18 @@ export const useUIStore = create<UIStore>((set, get) => ({
   // Notes Panel Width
   notesPanelWidth: 300,
   setNotesPanelWidth: (width) => set({ notesPanelWidth: Math.max(150, Math.min(600, width)) }),
+
+  // Drag Area Width
+  dragAreaWidth: initialDragAreaWidth,
+  setDragAreaWidth: (width) => {
+    const clamped = Math.max(80, Math.min(600, width));
+    set({ dragAreaWidth: clamped });
+    try {
+      localStorage.setItem('noted-terminal-drag-area-width', String(clamped));
+    } catch (e) {
+      console.error('Failed to save drag area width:', e);
+    }
+  },
 
   // Edit Project Modal
   editingProject: null,
