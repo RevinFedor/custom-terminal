@@ -9,6 +9,9 @@ import ActionsPanel from './ActionsPanel';
 
 const { ipcRenderer } = window.require('electron');
 
+// Marker prefix for auto-generated descriptions (first line of tab notes)
+const DESC_MARKER = '\u2726 '; // ✦ character
+
 interface HistoryTurn {
   turnNumber: number;
   preview: string;
@@ -49,7 +52,8 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
   // Tab notes state
   const [tabNotes, setTabNotes] = useState('');
   const [sessionCopied, setSessionCopied] = useState(false);
-  const { showToast, claudeDefaultPromptEnabled } = useUIStore();
+  const [isGeneratingDesc, setIsGeneratingDesc] = useState(false);
+  const { showToast, claudeDefaultPromptEnabled, chatSettings } = useUIStore();
   const wordWrap = useUIStore((s) => s.wordWrap);
   const tabNotesFontSize = useUIStore((s) => s.tabNotesFontSize);
   const tabNotesPaddingX = useUIStore((s) => s.tabNotesPaddingX);
@@ -204,6 +208,104 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
       if (tab) return tab.cwd || project?.path || '';
     }
     return project?.path || '';
+  };
+
+  // Generate AI description for tab notes
+  const handleGenerateDescription = async () => {
+    if (!activeTabId || isGeneratingDesc) return;
+
+    // Get session ID from current tab
+    const state = useWorkspaceStore.getState();
+    let targetSessionId = '';
+    let tabCwd = '';
+    for (const [, workspace] of state.openProjects) {
+      const tab = workspace.tabs.get(activeTabId);
+      if (tab) {
+        targetSessionId = tab.claudeSessionId || '';
+        tabCwd = tab.cwd || project?.path || '';
+        break;
+      }
+    }
+
+    if (!targetSessionId) {
+      showToast('No Claude session to describe', 'warning');
+      return;
+    }
+
+    setIsGeneratingDesc(true);
+
+    try {
+      // 1. Export session (without code)
+      const exportResult = await ipcRenderer.invoke('claude:export-clean-session', {
+        sessionId: targetSessionId,
+        cwd: tabCwd,
+        includeCode: false,
+        fromStart: true
+      });
+
+      if (!exportResult.success) {
+        throw new Error(exportResult.error || 'Export failed');
+      }
+
+      // 2. Get description settings
+      const descSettings = chatSettings.description;
+      const systemPrompt = descSettings.prompt || 'Describe this session in 1-2 sentences.';
+      const fullPrompt = systemPrompt + exportResult.content;
+
+      // 3. Call Gemini API
+      const apiKey = process.env.GEMINI_API_KEY || 'REDACTED_GEMINI_KEY';
+      const requestBody: any = {
+        contents: [{ role: 'user', parts: [{ text: fullPrompt }] }],
+        systemInstruction: {
+          parts: [{ text: '1-2 предложения. Без маркдауна.' }]
+        }
+      };
+
+      if (descSettings.model.includes('gemini-3') && descSettings.thinkingLevel !== 'NONE') {
+        requestBody.generationConfig = {
+          thinkingConfig: { thinkingLevel: descSettings.thinkingLevel }
+        };
+      }
+
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${descSettings.model}:generateContent?key=${apiKey}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(requestBody)
+        }
+      );
+
+      const data = await response.json();
+      if (data.error) throw new Error(data.error.message || 'API Error');
+      if (!data.candidates?.[0]?.content?.parts?.[0]?.text) throw new Error('Empty response');
+
+      // 4. Get description text (single line, trim)
+      const descriptionText = data.candidates[0].content.parts[0].text.replace(/\n/g, ' ').trim();
+
+      // 5. Insert/replace first line of tab notes
+      const lines = tabNotes.split('\n');
+      const markedLine = DESC_MARKER + descriptionText;
+
+      if (lines.length > 0 && lines[0].startsWith(DESC_MARKER)) {
+        // Replace existing description line
+        lines[0] = markedLine;
+      } else {
+        // Prepend new description line
+        lines.unshift(markedLine);
+      }
+
+      const newNotes = lines.join('\n');
+      setTabNotes(newNotes);
+      setTabNotesStore(activeTabId, newNotes);
+
+      showToast('Description generated', 'success');
+    } catch (e: any) {
+      console.error('[GenerateDescription] Error:', e);
+      showToast(e.message || 'Failed to generate description', 'error');
+    } finally {
+      setIsGeneratingDesc(false);
+    }
   };
 
   return (
@@ -689,7 +791,23 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
 
       {/* Tab Notes — MarkdownEditor */}
       <div className="flex-1 flex flex-col min-h-0 border-t border-border-main pt-3">
-        <div className="text-[11px] uppercase text-[#888] mb-2">Заметки вкладки</div>
+        <div className="flex items-center gap-2 mb-2">
+          <span className="text-[11px] uppercase text-[#888]">Заметки вкладки</span>
+          {activeTabId && (
+            <button
+              className={`text-[10px] px-1.5 py-0.5 rounded transition-colors cursor-pointer ${
+                isGeneratingDesc
+                  ? 'text-[#f59e0b] bg-[#f59e0b]/10 animate-pulse'
+                  : 'text-[#666] hover:text-[#f59e0b] hover:bg-[#f59e0b]/10'
+              }`}
+              onClick={handleGenerateDescription}
+              disabled={isGeneratingDesc}
+              title="Generate AI description"
+            >
+              {isGeneratingDesc ? '...' : '\u2726'}
+            </button>
+          )}
+        </div>
         {activeTabId ? (
           <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
             <MarkdownEditor

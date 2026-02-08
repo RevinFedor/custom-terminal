@@ -395,6 +395,13 @@ class DatabaseManager {
   // ========== TABS ========== 
 
   saveTabs(projectId, tabs) {
+    // Check if project exists to avoid FOREIGN KEY constraint error
+    const projectExists = this.db.prepare('SELECT 1 FROM projects WHERE id = ?').get(projectId);
+    if (!projectExists) {
+      console.warn('[DB] saveTabs: project not found, skipping:', projectId);
+      return;
+    }
+
     this.db.prepare('DELETE FROM tabs WHERE project_id = ?').run(projectId);
     const insert = this.db.prepare(`
       INSERT INTO tabs (project_id, name, cwd, position, color, is_utility, command_type, claude_session_id, gemini_session_id, was_interrupted, overlay_dismissed, notes, tab_type, url, terminal_id, terminal_name, active_view, created_at, is_collapsed)

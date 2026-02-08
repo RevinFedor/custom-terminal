@@ -193,6 +193,7 @@ interface TabItemProps {
   onHoverChange?: (hovering: boolean, rect?: DOMRect) => void; // CMD+hover notes preview
   showNotesIndicator?: boolean; // CMD held + cursor in TabBar = highlight tabs with notes
   isCollapsed?: boolean; // Collapsed tab — icon-only
+  hasSession?: boolean; // Whether tab has an active AI session
 }
 
 const TabItem = memo(({
@@ -222,6 +223,7 @@ const TabItem = memo(({
   onHoverChange,
   showNotesIndicator = false,
   isCollapsed = false,
+  hasSession = false,
 }: TabItemProps) => {
   const ref = useRef<HTMLDivElement>(null);
   const [closestEdge, setClosestEdge] = useState<Edge | null>(null);
@@ -456,7 +458,7 @@ const TabItem = memo(({
               hasProcess={hasProcess}
               hasColor={!!hasColor}
               commandType={commandType}
-              hasSession={sessionStatus.get(tab.id) || !!tab.claudeSessionId}
+              hasSession={hasSession}
               onRestart={() => onRestart && onRestart(tab.id)}
             />
           )}
@@ -1346,6 +1348,7 @@ function TabBar({ projectId }: TabBarProps) {
                         fontSize={tabsFontSize}
                         hasProcess={processStatus.get(tab.id) || false}
                         commandType={tab.commandType}
+                        hasSession={sessionStatus.get(tab.id) || !!tab.claudeSessionId}
                         onRestart={handleRestart}
                         isInterrupted={isTabInterrupted(tab)}
                         draggingGroupIds={draggingGroupIds}
@@ -1412,6 +1415,7 @@ function TabBar({ projectId }: TabBarProps) {
                     fontSize={tabsFontSize}
                     hasProcess={processStatus.get(tab.id) || false}
                     commandType={tab.commandType}
+                    hasSession={sessionStatus.get(tab.id) || !!tab.claudeSessionId}
                     onRestart={handleRestart}
                     isInterrupted={isTabInterrupted(tab)}
                     draggingGroupIds={draggingGroupIds}

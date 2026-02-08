@@ -17,6 +17,7 @@ type SettingsTab = 'shortcuts' | 'fonts' | 'colors' | 'ai';
 
 const DEFAULT_RESEARCH_PROMPT = 'вот моя проблема нужно чтобы ты понял что за проблема и на reddit поискал обсуждения. Не ограничивайся категориями. Проблема: ';
 const DEFAULT_COMPACT_PROMPT = 'Проанализируй всю нашу текущую сессию и составь структурированное резюме для переноса контекста в новый чат, включив в него: изначальную цель; список всех созданных файлов с пояснением, почему мы выбрали именно такую структуру и эти файлы; краткий отчет о том, что работает; детальный разбор того, что НЕ получилось, с указанием конкретных причин ошибок (почему выбранные решения не сработали); текущее состояние кода и пошаговый план дальнейших действий — оформи это всё одним компактным сообщением, которое я смогу скопировать и отправить тебе в новом чате для полного восстановления контекста.\n\nВот текст сессии:\n';
+const DEFAULT_DESCRIPTION_PROMPT_SETTINGS = '1-2 предложения: что сделано. Без маркдауна, без вступлений.\n\n';
 const DEFAULT_DOC_FILE_PATH = '/Users/fedor/Global-Templates/🧩 Code-Patterns/документация/docs-rules.prompt.md';
 
 // Track if settings was opened at least once (for default tab)
@@ -157,6 +158,7 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
   // System prompts
   const [localResearchPrompt, setLocalResearchPrompt] = useState('');
   const [localCompactPrompt, setLocalCompactPrompt] = useState('');
+  const [localDescriptionPrompt, setLocalDescriptionPrompt] = useState('');
   const [localDocFilePath, setLocalDocFilePath] = useState('');
   const [localDocInlineContent, setLocalDocInlineContent] = useState('');
 
@@ -167,6 +169,7 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
   const [editingClaude, setEditingClaude] = useState(false);
   const [editingResearch, setEditingResearch] = useState(false);
   const [editingCompact, setEditingCompact] = useState(false);
+  const [editingDescription, setEditingDescription] = useState(false);
   const [editingDocPrompt, setEditingDocPrompt] = useState(false);
   const [editingPrompt, setEditingPrompt] = useState<number | null>(null);
 
@@ -174,6 +177,7 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
   const claudeEditRef = useRef<HTMLDivElement>(null);
   const researchEditRef = useRef<HTMLDivElement>(null);
   const compactEditRef = useRef<HTMLDivElement>(null);
+  const descriptionEditRef = useRef<HTMLDivElement>(null);
   const docEditRef = useRef<HTMLDivElement>(null);
   const promptEditRefs = useRef<Map<number, HTMLDivElement>>(new Map());
 
@@ -196,6 +200,7 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
       // Load system prompts from store
       setLocalResearchPrompt(chatSettings.research.prompt);
       setLocalCompactPrompt(chatSettings.compact.prompt);
+      setLocalDescriptionPrompt(chatSettings.description.prompt);
       setLocalDocFilePath(docPrompt.filePath);
       setLocalDocInlineContent(docPrompt.inlineContent);
 
@@ -210,6 +215,7 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
       setEditingClaude(false);
       setEditingResearch(false);
       setEditingCompact(false);
+      setEditingDescription(false);
       setEditingDocPrompt(false);
       setEditingPrompt(null);
     }
@@ -233,6 +239,10 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
 
   const saveCompactPromptImmediate = useCallback((value: string) => {
     setChatSettings('compact', { prompt: value });
+  }, [setChatSettings]);
+
+  const saveDescriptionPromptImmediate = useCallback((value: string) => {
+    setChatSettings('description', { prompt: value });
   }, [setChatSettings]);
 
   const saveDocFilePathImmediate = useCallback((value: string) => {
@@ -264,6 +274,12 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
     if (isBlurInsideContainer(e, compactEditRef)) return;
     saveCompactPromptImmediate(localCompactPrompt);
     setEditingCompact(false);
+  };
+
+  const handleDescriptionBlur = (e: React.FocusEvent) => {
+    if (isBlurInsideContainer(e, descriptionEditRef)) return;
+    saveDescriptionPromptImmediate(localDescriptionPrompt);
+    setEditingDescription(false);
   };
 
   const handleDocBlur = (e: React.FocusEvent) => {
@@ -317,6 +333,11 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
   const resetCompact = () => {
     setLocalCompactPrompt(DEFAULT_COMPACT_PROMPT);
     saveCompactPromptImmediate(DEFAULT_COMPACT_PROMPT);
+  };
+
+  const resetDescription = () => {
+    setLocalDescriptionPrompt(DEFAULT_DESCRIPTION_PROMPT_SETTINGS);
+    saveDescriptionPromptImmediate(DEFAULT_DESCRIPTION_PROMPT_SETTINGS);
   };
 
   const resetDoc = () => {
@@ -696,6 +717,29 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                           boxSizing: 'border-box'
                         }}
                       />
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                        <span style={{ fontSize: '10px', color: '#888' }}>Модель:</span>
+                        {([
+                          { value: 'gemini-3-flash-preview', label: 'Flash' },
+                          { value: 'gemini-3-pro-preview', label: 'Pro' }
+                        ] as const).map((m) => (
+                          <button
+                            key={m.value}
+                            onClick={(e) => { e.stopPropagation(); setChatSettings('research', { model: m.value }); }}
+                            style={{
+                              padding: '2px 8px',
+                              backgroundColor: chatSettings.research.model === m.value ? '#0ea5e9' : '#333',
+                              color: chatSettings.research.model === m.value ? '#fff' : '#888',
+                              border: 'none',
+                              borderRadius: '4px',
+                              fontSize: '10px',
+                              cursor: 'pointer'
+                            }}
+                          >
+                            {m.label}
+                          </button>
+                        ))}
+                      </div>
                       <button
                         onClick={(e) => { e.stopPropagation(); resetResearch(); }}
                         style={{ alignSelf: 'flex-start', padding: '4px 8px', backgroundColor: 'transparent', color: '#666', border: 'none', fontSize: '10px', cursor: 'pointer' }}
@@ -705,7 +749,12 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                     </div>
                   ) : (
                     <>
-                      <div style={{ fontSize: '13px', color: '#0ea5e9', fontWeight: '500', marginBottom: '4px' }}>Research</div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '4px' }}>
+                        <span style={{ fontSize: '13px', color: '#0ea5e9', fontWeight: '500' }}>Research</span>
+                        <span style={{ fontSize: '9px', padding: '1px 4px', backgroundColor: '#0ea5e922', color: '#0ea5e9', borderRadius: '3px' }}>
+                          {chatSettings.research.model.includes('pro') ? 'PRO' : 'FLASH'}
+                        </span>
+                      </div>
                       <div style={{ fontSize: '11px', color: '#666', overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' }}>
                         {localResearchPrompt}
                       </div>
@@ -748,6 +797,29 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                           boxSizing: 'border-box'
                         }}
                       />
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                        <span style={{ fontSize: '10px', color: '#888' }}>Модель:</span>
+                        {([
+                          { value: 'gemini-3-flash-preview', label: 'Flash' },
+                          { value: 'gemini-3-pro-preview', label: 'Pro' }
+                        ] as const).map((m) => (
+                          <button
+                            key={m.value}
+                            onClick={(e) => { e.stopPropagation(); setChatSettings('compact', { model: m.value }); }}
+                            style={{
+                              padding: '2px 8px',
+                              backgroundColor: chatSettings.compact.model === m.value ? '#a855f7' : '#333',
+                              color: chatSettings.compact.model === m.value ? '#fff' : '#888',
+                              border: 'none',
+                              borderRadius: '4px',
+                              fontSize: '10px',
+                              cursor: 'pointer'
+                            }}
+                          >
+                            {m.label}
+                          </button>
+                        ))}
+                      </div>
                       <button
                         onClick={(e) => { e.stopPropagation(); resetCompact(); }}
                         style={{ alignSelf: 'flex-start', padding: '4px 8px', backgroundColor: 'transparent', color: '#666', border: 'none', fontSize: '10px', cursor: 'pointer' }}
@@ -757,9 +829,95 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                     </div>
                   ) : (
                     <>
-                      <div style={{ fontSize: '13px', color: '#a855f7', fontWeight: '500', marginBottom: '4px' }}>Compact (Резюме)</div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '4px' }}>
+                        <span style={{ fontSize: '13px', color: '#a855f7', fontWeight: '500' }}>Compact (Резюме)</span>
+                        <span style={{ fontSize: '9px', padding: '1px 4px', backgroundColor: '#a855f722', color: '#a855f7', borderRadius: '3px' }}>
+                          {chatSettings.compact.model.includes('pro') ? 'PRO' : 'FLASH'}
+                        </span>
+                      </div>
                       <div style={{ fontSize: '11px', color: '#666', overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' }}>
                         {localCompactPrompt}
+                      </div>
+                    </>
+                  )}
+                </div>
+
+                {/* Description Prompt */}
+                <div
+                  ref={descriptionEditRef}
+                  onClick={() => !editingDescription && setEditingDescription(true)}
+                  style={{
+                    padding: '12px',
+                    backgroundColor: editingDescription ? '#252525' : '#222',
+                    border: editingDescription ? '2px solid #f59e0b' : '2px solid #f59e0b33',
+                    borderRadius: '10px',
+                    cursor: editingDescription ? 'default' : 'pointer',
+                    marginBottom: '10px'
+                  }}
+                >
+                  {editingDescription ? (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                      <textarea
+                        value={localDescriptionPrompt}
+                        onChange={(e) => setLocalDescriptionPrompt(e.target.value)}
+                        onBlur={handleDescriptionBlur}
+                        rows={3}
+                        autoFocus
+                        style={{
+                          width: '100%',
+                          padding: '8px',
+                          backgroundColor: '#1a1a1a',
+                          border: '1px solid #444',
+                          borderRadius: '6px',
+                          color: '#aaa',
+                          fontSize: '11px',
+                          fontFamily: 'monospace',
+                          outline: 'none',
+                          resize: 'none',
+                          boxSizing: 'border-box'
+                        }}
+                      />
+                      {/* Model selector */}
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                        <span style={{ fontSize: '10px', color: '#888' }}>Модель:</span>
+                        {([
+                          { value: 'gemini-3-flash-preview', label: 'Flash' },
+                          { value: 'gemini-3-pro-preview', label: 'Pro' }
+                        ] as const).map((m) => (
+                          <button
+                            key={m.value}
+                            onClick={(e) => { e.stopPropagation(); setChatSettings('description', { model: m.value }); }}
+                            style={{
+                              padding: '2px 8px',
+                              backgroundColor: chatSettings.description.model === m.value ? '#f59e0b' : '#333',
+                              color: chatSettings.description.model === m.value ? '#fff' : '#888',
+                              border: 'none',
+                              borderRadius: '4px',
+                              fontSize: '10px',
+                              cursor: 'pointer'
+                            }}
+                          >
+                            {m.label}
+                          </button>
+                        ))}
+                      </div>
+                      <button
+                        onClick={(e) => { e.stopPropagation(); resetDescription(); }}
+                        style={{ alignSelf: 'flex-start', padding: '4px 8px', backgroundColor: 'transparent', color: '#666', border: 'none', fontSize: '10px', cursor: 'pointer' }}
+                      >
+                        Сбросить
+                      </button>
+                    </div>
+                  ) : (
+                    <>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '4px' }}>
+                        <span style={{ fontSize: '13px', color: '#f59e0b', fontWeight: '500' }}>Description</span>
+                        <span style={{ fontSize: '9px', padding: '1px 4px', backgroundColor: '#f59e0b22', color: '#f59e0b', borderRadius: '3px' }}>
+                          {chatSettings.description.model.includes('pro') ? 'PRO' : 'FLASH'}
+                        </span>
+                      </div>
+                      <div style={{ fontSize: '11px', color: '#666', overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' }}>
+                        {localDescriptionPrompt}
                       </div>
                     </>
                   )}
