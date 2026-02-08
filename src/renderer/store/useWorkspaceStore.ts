@@ -43,6 +43,7 @@ interface Tab {
   wasInterrupted?: boolean; // True if tab was closed with active AI session (show resume overlay)
   overlayDismissed?: boolean; // True if user dismissed the interrupted overlay (don't show again)
   notes?: string; // Tab-specific notes
+  isCollapsed?: boolean; // Collapsed tab — icon-only, for archiving completed sessions
 }
 
 interface ProjectWorkspace {
@@ -107,6 +108,7 @@ interface WorkspaceStore {
   setTabColor: (projectId: string, tabId: string, color: TabColor, manual?: boolean) => void;
   setTabCommandType: (tabId: string, commandType: CommandType) => void; // Also sets auto-color on first run
   toggleTabUtility: (projectId: string, tabId: string) => void;
+  toggleTabCollapsed: (projectId: string, tabId: string) => void;
 
   // Advanced drag & drop
   reorderInZone: (projectId: string, zone: 'main' | 'utility', orderedIds: string[]) => void;
@@ -202,7 +204,8 @@ const saveTabs = (projectId: string, tabs: Map<string, Tab>) => {
     terminalId: tab.terminalId,
     terminalName: tab.terminalName,
     activeView: tab.activeView,
-    createdAt: tab.createdAt
+    createdAt: tab.createdAt,
+    isCollapsed: tab.isCollapsed
   }));
   ipcRenderer.invoke('project:save-tabs', { projectId, tabs: tabsArray });
 };
@@ -450,7 +453,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
             notes: savedTab.notes,
             tabType: savedTab.tabType,
             url: savedTab.url,
-            createdAt: savedTab.createdAt
+            createdAt: savedTab.createdAt,
+            isCollapsed: savedTab.isCollapsed
           } as any);
         }
       } else {
@@ -559,7 +563,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       notes: options?.notes,
       tabType: options?.tabType || 'terminal',
       url: options?.url,
-      createdAt: (options as any)?.createdAt || Math.floor(Date.now() / 1000)
+      createdAt: (options as any)?.createdAt || Math.floor(Date.now() / 1000),
+      isCollapsed: (options as any)?.isCollapsed
     };
 
     console.log('[Store] createTab: Creating PTY terminal for:', tabId, 'cwd:', newTab.cwd);
@@ -900,6 +905,20 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       const tab = workspace.tabs.get(tabId);
       if (tab) {
         tab.isUtility = !tab.isUtility;
+        set({ openProjects: new Map(openProjects) });
+        saveTabs(workspace.projectId, workspace.tabs);
+      }
+    }
+  },
+
+  toggleTabCollapsed: (projectId, tabId) => {
+    const { openProjects } = get();
+    const workspace = openProjects.get(projectId);
+
+    if (workspace) {
+      const tab = workspace.tabs.get(tabId);
+      if (tab) {
+        tab.isCollapsed = !tab.isCollapsed;
         set({ openProjects: new Map(openProjects) });
         saveTabs(workspace.projectId, workspace.tabs);
       }

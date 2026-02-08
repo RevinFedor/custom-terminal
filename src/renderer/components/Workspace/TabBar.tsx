@@ -10,7 +10,7 @@ import { attachClosestEdge, extractClosestEdge, type Edge } from '@atlaskit/prag
 import { combine } from '@atlaskit/pragmatic-drag-and-drop/combine';
 import { autoScrollForElements } from '@atlaskit/pragmatic-drag-and-drop-auto-scroll/element';
 import { setCustomNativeDragPreview } from '@atlaskit/pragmatic-drag-and-drop/element/set-custom-native-drag-preview';
-import { ChevronDown, Globe } from 'lucide-react';
+import { ChevronDown, Globe, Bot } from 'lucide-react';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -30,6 +30,7 @@ interface TabData {
   claudeSessionId?: string;
   geminiSessionId?: string;
   tabType?: string;
+  isCollapsed?: boolean;
 }
 
 type DragData = {
@@ -88,10 +89,11 @@ const DropIndicatorLine = memo(({ edge }: IndicatorProps) => {
 
 // Restart zone - left part of tab, shows restart button on hover when process is running
 // Only shows restart for devServer commands (npm/yarn/etc), not for claude/gemini
-const RestartZone = memo(({ hasProcess, hasColor, commandType, onRestart }: {
+const RestartZone = memo(({ hasProcess, hasColor, commandType, hasSession, onRestart }: {
   hasProcess: boolean;
   hasColor: boolean;
   commandType?: string;
+  hasSession?: boolean;
   onRestart: () => void;
 }) => {
   const [isHovered, setIsHovered] = useState(false);
@@ -143,16 +145,18 @@ const RestartZone = memo(({ hasProcess, hasColor, commandType, onRestart }: {
             ↻
           </div>
         ) : (
-          // Green dot when not hovered (process running)
+          // Green dot (process running) or red dot (claude without saved session)
           <span
             style={{
               display: 'block',
               width: '6px',
               height: '6px',
               borderRadius: '50%',
-              backgroundColor: '#4ade80',
+              backgroundColor: (commandType === 'claude' && !hasSession) ? '#f87171' : '#4ade80',
               opacity: hasColor ? 0.9 : 0.8,
-              boxShadow: '0 0 4px rgba(74, 222, 128, 0.5)',
+              boxShadow: (commandType === 'claude' && !hasSession)
+                ? '0 0 4px rgba(248, 113, 113, 0.5)'
+                : '0 0 4px rgba(74, 222, 128, 0.5)',
             }}
           />
         )
@@ -188,6 +192,7 @@ interface TabItemProps {
   draggingGroupIds?: string[]; // IDs of tabs being dragged as a group
   onHoverChange?: (hovering: boolean, rect?: DOMRect) => void; // CMD+hover notes preview
   showNotesIndicator?: boolean; // CMD held + cursor in TabBar = highlight tabs with notes
+  isCollapsed?: boolean; // Collapsed tab — icon-only
 }
 
 const TabItem = memo(({
@@ -216,6 +221,7 @@ const TabItem = memo(({
   draggingGroupIds = [],
   onHoverChange,
   showNotesIndicator = false,
+  isCollapsed = false,
 }: TabItemProps) => {
   const ref = useRef<HTMLDivElement>(null);
   const [closestEdge, setClosestEdge] = useState<Edge | null>(null);
@@ -376,27 +382,38 @@ const TabItem = memo(({
     return '2px solid transparent';
   };
 
+  // Collapsed tab icon color based on tab brand
+  const getCollapsedIconColor = () => {
+    if (tab.color === 'claude') return '#DA7756';
+    if (tab.color === 'gemini') return '#4E86F8';
+    if (hasColor) return colorConfig.borderColor;
+    return '#888';
+  };
+
   // Build inline styles - full control to avoid Tailwind conflicts
   const tabStyle: React.CSSProperties = {
     position: 'relative',
     display: 'flex',
     alignItems: 'center',
-    justifyContent: isHorizontal ? 'center' : 'space-between', // Space-between for utility (close btn right)
-    gap: '8px',
+    justifyContent: 'center',
+    gap: isCollapsed ? '0' : '8px',
     cursor: 'pointer',
     overflow: 'visible',
-    padding: tab.tabType === 'browser'
-      ? (isHorizontal ? '0 16px' : '0 12px') // No left padding for browser tabs
-      : (isHorizontal ? '0 16px 0 32px' : '0 12px 0 32px'), // Left padding for restart zone
+    padding: isCollapsed
+      ? '0'
+      : (tab.tabType === 'browser'
+        ? (isHorizontal ? '0 16px' : '0 12px')
+        : (isHorizontal ? '0 16px 0 32px' : '0 12px 0 32px')),
     fontSize: `${fontSize}px`,
-    height: '30px', // Same height for all tabs
-    minWidth: isHorizontal ? 'auto' : '160px',
+    height: '30px',
+    width: isCollapsed ? '28px' : undefined,
+    minWidth: isCollapsed ? '28px' : (isHorizontal ? 'auto' : '160px'),
+    maxWidth: isCollapsed ? '28px' : undefined,
     color: (isActive || isHovered || isSelected) ? '#fff' : '#888',
     backgroundColor: getBgColor(),
-    // Horizontal tabs: border on top. Vertical tabs: border on left
     borderTop: isHorizontal ? getTopBorder() : 'none',
     borderLeft: !isHorizontal ? getLeftBorder() : 'none',
-    opacity: isDragging ? 0.5 : (draggingGroupIds.includes(tab.id) && !isDragging ? 0.5 : 1),
+    opacity: isDragging ? 0.5 : (draggingGroupIds.includes(tab.id) && !isDragging ? 0.5 : (isCollapsed && !isActive ? 0.6 : 1)),
     transition: 'color 0.15s ease, background-color 0.15s ease',
   };
 
@@ -428,48 +445,56 @@ const TabItem = memo(({
         }
       }}
     >
-      {/* Restart zone - left part of tab (not for browser tabs) */}
-      {tab.tabType !== 'browser' && (
-        <RestartZone
-          hasProcess={hasProcess}
-          hasColor={!!hasColor}
-          commandType={commandType}
-          onRestart={() => onRestart && onRestart(tab.id)}
-        />
-      )}
-
-      {isEditing ? (
-        <input
-          ref={inputRef}
-          type="text"
-          className="bg-[#333] border border-accent rounded px-2 py-0.5 text-[13px] text-white outline-none w-[100px]"
-          value={editValue}
-          onChange={(e) => onEditChange(e.target.value)}
-          onBlur={onEditSubmit}
-          onKeyDown={onEditKeyDown}
-          onClick={(e) => e.stopPropagation()}
-        />
+      {/* Collapsed: Bot icon only */}
+      {isCollapsed ? (
+        <Bot size={14} style={{ color: getCollapsedIconColor(), flexShrink: 0 }} />
       ) : (
-        <span className="select-none whitespace-nowrap overflow-hidden text-ellipsis flex items-center gap-1" style={{ flex: isHorizontal ? 'none' : 1 }}>
-          {tab.tabType === 'browser' && <Globe size={12} className="flex-shrink-0 opacity-60" />}
-          {tab.name}
-        </span>
-      )}
+        <>
+          {/* Restart zone - left part of tab (not for browser tabs) */}
+          {tab.tabType !== 'browser' && (
+            <RestartZone
+              hasProcess={hasProcess}
+              hasColor={!!hasColor}
+              commandType={commandType}
+              hasSession={!!tab.claudeSessionId}
+              onRestart={() => onRestart && onRestart(tab.id)}
+            />
+          )}
 
-      {/* Notes indicator dot — absolute, doesn't affect layout */}
-      {showNotesIndicator && (
-        <span
-          style={{
-            position: 'absolute',
-            top: '4px',
-            right: '4px',
-            width: '5px',
-            height: '5px',
-            borderRadius: '50%',
-            backgroundColor: '#DA7756',
-            pointerEvents: 'none',
-          }}
-        />
+          {isEditing ? (
+            <input
+              ref={inputRef}
+              type="text"
+              className="bg-[#333] border border-accent rounded px-2 py-0.5 text-[13px] text-white outline-none w-[100px]"
+              value={editValue}
+              onChange={(e) => onEditChange(e.target.value)}
+              onBlur={onEditSubmit}
+              onKeyDown={onEditKeyDown}
+              onClick={(e) => e.stopPropagation()}
+            />
+          ) : (
+            <span className="select-none whitespace-nowrap overflow-hidden text-ellipsis flex items-center gap-1" style={{ flex: isHorizontal ? 'none' : 1 }}>
+              {tab.tabType === 'browser' && <Globe size={12} className="flex-shrink-0 opacity-60" />}
+              {tab.name}
+            </span>
+          )}
+
+          {/* Notes indicator dot — absolute, doesn't affect layout */}
+          {showNotesIndicator && (
+            <span
+              style={{
+                position: 'absolute',
+                top: '4px',
+                right: '4px',
+                width: '5px',
+                height: '5px',
+                borderRadius: '50%',
+                backgroundColor: '#DA7756',
+                pointerEvents: 'none',
+              }}
+            />
+          )}
+        </>
       )}
 
       {/* Absolute overlay indicator - doesn't affect layout */}
@@ -669,6 +694,7 @@ function TabBar({ projectId }: TabBarProps) {
   const renameTab = useWorkspaceStore((state) => state.renameTab);
   const setTabColor = useWorkspaceStore((state) => state.setTabColor);
   const toggleTabUtility = useWorkspaceStore((state) => state.toggleTabUtility);
+  const toggleTabCollapsed = useWorkspaceStore((state) => state.toggleTabCollapsed);
   const reorderInZone = useWorkspaceStore((state) => state.reorderInZone);
   const moveTabToZone = useWorkspaceStore((state) => state.moveTabToZone);
   const toggleTabSelection = useWorkspaceStore((state) => state.toggleTabSelection);
@@ -681,6 +707,8 @@ function TabBar({ projectId }: TabBarProps) {
   const setCurrentView = useUIStore((state) => state.setCurrentView);
   const showToast = useUIStore((state) => state.showToast);
   const tabNotesFontSize = useUIStore((state) => state.tabNotesFontSize);
+  const tabNotesPaddingX = useUIStore((state) => state.tabNotesPaddingX);
+  const tabNotesPaddingY = useUIStore((state) => state.tabNotesPaddingY);
 
   const [editingTabId, setEditingTabId] = useState<string | null>(null);
   const [editValue, setEditValue] = useState('');
@@ -1306,6 +1334,7 @@ function TabBar({ projectId }: TabBarProps) {
                         draggingGroupIds={draggingGroupIds}
                         onHoverChange={(hovering, rect) => handleTabHoverChange(tab.id, hovering, rect)}
                         showNotesIndicator={isCmdPressed && isMouseInTabBar && !!workspace.tabs.get(tab.id)?.notes}
+                        isCollapsed={!!tab.isCollapsed}
                       />
                     ))}
                   </div>
@@ -1371,6 +1400,7 @@ function TabBar({ projectId }: TabBarProps) {
                     draggingGroupIds={draggingGroupIds}
                     onHoverChange={(hovering, rect) => handleTabHoverChange(tab.id, hovering, rect)}
                     showNotesIndicator={isCmdPressed && isMouseInTabBar && !!workspace.tabs.get(tab.id)?.notes}
+                    isCollapsed={!!tab.isCollapsed}
                   />
                 ))}
               </div>
@@ -1478,6 +1508,21 @@ function TabBar({ projectId }: TabBarProps) {
             </>
           )}
 
+          {/* Collapse / Expand */}
+          {!isMultiSelect && (
+            <button
+              className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2"
+              onClick={() => {
+                if (contextMenu) {
+                  toggleTabCollapsed(projectId, contextMenu.tabId);
+                }
+                setContextMenu(null);
+              }}
+            >
+              {workspace.tabs.get(contextMenu!.tabId)?.isCollapsed ? 'Expand' : 'Collapse'}
+            </button>
+          )}
+
           {/* Separator */}
           <div className="my-1 border-t border-[#444]" />
 
@@ -1520,7 +1565,9 @@ function TabBar({ projectId }: TabBarProps) {
       {(isCmdPressed || isPopoverPinned) && notesPreview && (() => {
         const tab = workspace.tabs.get(notesPreview.tabId);
         const notes = tab?.notes;
-        if (!notes) return null;
+        const isTabCollapsed = tab?.isCollapsed;
+        // Show popover if tab has notes OR if tab is collapsed (show name)
+        if (!notes && !isTabCollapsed) return null;
         return (
           <div
             className="fixed z-[100]"
@@ -1560,17 +1607,36 @@ function TabBar({ projectId }: TabBarProps) {
                 flexDirection: 'column',
               }}
             >
-              <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
-                <MarkdownEditor
-                  content={notes}
-                  onChange={() => {}}
-                  readOnly
-                  compact
-                  showLineNumbers={false}
-                  fontSize={tabNotesFontSize}
-                  wordWrap
-                />
-              </div>
+              {/* Tab name header for collapsed tabs */}
+              {isTabCollapsed && (
+                <div style={{
+                  padding: '6px 10px',
+                  fontSize: '12px',
+                  fontWeight: 600,
+                  color: '#fff',
+                  borderBottom: notes ? '1px solid #333' : 'none',
+                  whiteSpace: 'nowrap',
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                }}>
+                  {tab?.name}
+                </div>
+              )}
+              {notes && (
+                <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+                  <MarkdownEditor
+                    content={notes}
+                    onChange={() => {}}
+                    readOnly
+                    compact
+                    showLineNumbers={false}
+                    fontSize={tabNotesFontSize}
+                    contentPaddingX={tabNotesPaddingX}
+                    contentPaddingY={tabNotesPaddingY}
+                    wordWrap
+                  />
+                </div>
+              )}
             </div>
           </div>
         );
