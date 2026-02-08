@@ -100,10 +100,11 @@ const getTabPendingAction = (tabId: string): PendingAction | undefined => {
   for (const [, workspace] of state.openProjects) {
     const tab = workspace.tabs.get(tabId);
     if (tab) {
-      console.log('[Terminal:getTabPendingAction]', { tabId, pendingAction: tab.pendingAction });
+      console.log('[RESTORE] 10. getTabPendingAction:', { tabId, pendingAction: tab.pendingAction });
       return tab.pendingAction;
     }
   }
+  console.log('[RESTORE] 10. getTabPendingAction: TAB NOT FOUND in any workspace, tabId:', tabId);
   return undefined;
 };
 
@@ -113,7 +114,7 @@ const clearTabPendingAction = (tabId: string) => {
   for (const [projectId, workspace] of state.openProjects) {
     const tab = workspace.tabs.get(tabId);
     if (tab && tab.pendingAction) {
-      console.log('[Terminal:clearTabPendingAction] Clearing:', { tabId, pendingAction: tab.pendingAction });
+      console.log('[RESTORE] 13. clearTabPendingAction:', { tabId, pendingAction: tab.pendingAction });
       tab.pendingAction = undefined;
       state.openProjects.set(projectId, { ...workspace });
       useWorkspaceStore.setState({ openProjects: new Map(state.openProjects) });
@@ -136,13 +137,13 @@ const getTabCwd = (tabId: string): string | undefined => {
 
 // Execute pending action after terminal is ready
 const executePendingAction = (tabId: string, pendingAction: PendingAction) => {
-  console.log('[Terminal:executePendingAction] Executing:', { tabId, pendingAction });
+  console.log('[RESTORE] 11. executePendingAction:', { tabId, type: pendingAction.type, sessionId: (pendingAction as any).sessionId });
 
   switch (pendingAction.type) {
     case 'claude-fork':
       if (pendingAction.sessionId) {
-        // Set tab color/type before executing
         getSetTabCommandType()(tabId, 'claude');
+        console.log('[RESTORE] 12. Sending IPC claude:run-command { command: "claude-f", forkSessionId:', pendingAction.sessionId, '}');
         ipcRenderer.send('claude:run-command', {
           tabId,
           command: 'claude-f',
@@ -153,8 +154,8 @@ const executePendingAction = (tabId: string, pendingAction: PendingAction) => {
 
     case 'claude-continue':
       if (pendingAction.sessionId) {
-        // Set tab color/type before executing
         getSetTabCommandType()(tabId, 'claude');
+        console.log('[RESTORE] 12. Sending IPC claude:run-command { command: "claude-c", sessionId:', pendingAction.sessionId, '}');
         ipcRenderer.send('claude:run-command', {
           tabId,
           command: 'claude-c',
@@ -163,13 +164,18 @@ const executePendingAction = (tabId: string, pendingAction: PendingAction) => {
       }
       break;
 
+    case 'claude-new': {
+      getSetTabCommandType()(tabId, 'claude');
+      console.log('[RESTORE] 12. Sending IPC claude:run-command { command: "claude", tabId:', tabId, '}');
+      ipcRenderer.send('claude:run-command', { tabId, command: 'claude' });
+      break;
+    }
+
     case 'gemini-fork':
       if (pendingAction.sessionId) {
-        // Set tab color/type before executing
         getSetTabCommandType()(tabId, 'gemini');
-        // Note: for fork, we DON'T set sessionId here because main.js will
-        // create a NEW sessionId and send it back via gemini:session-detected
         const cwd = getTabCwd(tabId);
+        console.log('[RESTORE] 12. Sending IPC gemini:run-command { command: "gemini-f" }');
         ipcRenderer.send('gemini:run-command', {
           tabId,
           command: 'gemini-f',
@@ -181,10 +187,9 @@ const executePendingAction = (tabId: string, pendingAction: PendingAction) => {
 
     case 'gemini-continue':
       if (pendingAction.sessionId) {
-        // Set tab color/type before executing
         getSetTabCommandType()(tabId, 'gemini');
-        // Set the session ID on this tab (important for rollback!)
         getSetGeminiSessionId()(tabId, pendingAction.sessionId);
+        console.log('[RESTORE] 12. Sending IPC gemini:run-command { command: "gemini-c" }');
         ipcRenderer.send('gemini:run-command', {
           tabId,
           command: 'gemini-c',
@@ -193,9 +198,16 @@ const executePendingAction = (tabId: string, pendingAction: PendingAction) => {
       }
       break;
 
+    case 'gemini-new': {
+      getSetTabCommandType()(tabId, 'gemini');
+      const geminiCwd = getTabCwd(tabId);
+      console.log('[RESTORE] 12. Sending IPC gemini:spawn-with-watcher { cwd:', geminiCwd, '}');
+      ipcRenderer.send('gemini:spawn-with-watcher', { tabId, cwd: geminiCwd });
+      break;
+    }
+
     case 'shell-command':
-      // Shell commands are handled via initialCommand in pty.spawn
-      // Nothing to do here
+      console.log('[RESTORE] 12. shell-command — handled via initialCommand, nothing to do');
       break;
   }
 
