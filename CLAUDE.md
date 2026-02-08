@@ -27,8 +27,8 @@ Noted Terminal — это кастомный эмулятор терминала
 - **Runtime:** Electron 28
 - **Frontend:** React 19 + Vite + TypeScript
 - **State:** Zustand
-- **Terminal:** xterm.js (Canvas renderer) — см. `docs/knowledge/fix-ui-stability.md`
-- **Styling:** Tailwind CSS v4 — см. `docs/knowledge/fix-tailwind-v4-source.md`
+- **Terminal:** xterm.js (Canvas renderer) — см. `docs/knowledge/ui-ux-stability.md`
+- **Styling:** Tailwind CSS v4 — см. `docs/knowledge/rendering-styles.md`
 - **AI Rendering:** react-markdown + remark-gfm + syntax-highlighter
 - **DB:** SQLite (Sessions & Projects)
 

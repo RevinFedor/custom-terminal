@@ -1,4 +1,4 @@
-import { Terminal as XTerminal } from '@xterm/xterm';
+import { Terminal as XTerminal, IMarker } from '@xterm/xterm';
 import { SearchAddon, ISearchOptions } from '@xterm/addon-search';
 
 // Global registry to access terminal instances from anywhere
@@ -20,6 +20,15 @@ interface ViewportState {
   total: number;
 }
 const viewportStates = new Map<string, ViewportState>();
+
+// Marker tracking for timeline entry navigation
+interface TrackedEntry {
+  uuid: string;
+  marker: IMarker | null;
+  isReachable: boolean;
+}
+// Map<tabId, Map<uuid, TrackedEntry>>
+const entryMarkers = new Map<string, Map<string, TrackedEntry>>();
 
 // Callbacks
 type SearchResultsCallback = (results: { resultIndex: number; resultCount: number }) => void;
@@ -69,6 +78,7 @@ export const terminalRegistry = {
     searchCallbacks.delete(tabId);
     viewportStates.delete(tabId);
     viewportCallbacks.delete(tabId);
+    entryMarkers.delete(tabId);
   },
 
   get(tabId: string): XTerminal | undefined {
@@ -125,10 +135,13 @@ export const terminalRegistry = {
   // Returns true if found, false otherwise
   searchAndScroll(tabId: string, searchText: string): boolean {
     const searchAddon = searchAddons.get(tabId);
+    const terminal = terminals.get(tabId);
     if (!searchAddon) {
-      console.warn('[terminalRegistry] No SearchAddon for tab:', tabId);
+      console.warn('[terminalRegistry.searchAndScroll] No SearchAddon for tab:', tabId);
       return false;
     }
+
+    console.log('[terminalRegistry.searchAndScroll] searchText:', JSON.stringify(searchText), 'len:', searchText.length);
 
     // Update search state
     const state = searchStates.get(tabId) || { term: '', resultIndex: 0, resultCount: 0 };
@@ -137,6 +150,14 @@ export const terminalRegistry = {
 
     // Search with highlighting
     const found = searchAddon.findNext(searchText, defaultSearchOptions);
+
+    if (terminal) {
+      const buf = terminal.buffer.active;
+      console.log('[terminalRegistry.searchAndScroll] found:', found, '| viewportY:', buf.viewportY, '| baseY:', buf.baseY, '| length:', buf.length);
+    } else {
+      console.log('[terminalRegistry.searchAndScroll] found:', found, '(no terminal ref)');
+    }
+
     return found;
   },
 
@@ -167,5 +188,142 @@ export const terminalRegistry = {
     if (callback) {
       callback({ resultIndex: 0, resultCount: 0 });
     }
+  },
+
+  // === Marker Tracking API ===
+
+  // Register a marker at the current cursor line for a given entry UUID
+  registerEntryMarker(tabId: string, uuid: string): boolean {
+    const terminal = terminals.get(tabId);
+    if (!terminal) return false;
+
+    let tabMarkers = entryMarkers.get(tabId);
+    if (!tabMarkers) {
+      tabMarkers = new Map();
+      entryMarkers.set(tabId, tabMarkers);
+    }
+
+    // Don't re-register if already tracked with a live marker
+    const existing = tabMarkers.get(uuid);
+    if (existing?.marker && !existing.marker.isDisposed) {
+      return true;
+    }
+
+    const marker = terminal.registerMarker(0);
+    if (!marker) {
+      console.warn('[terminalRegistry.registerEntryMarker] Failed to create marker for', uuid);
+      tabMarkers.set(uuid, { uuid, marker: null, isReachable: false });
+      return false;
+    }
+
+    const tracked: TrackedEntry = { uuid, marker, isReachable: true };
+    marker.onDispose(() => {
+      tracked.isReachable = false;
+      tracked.marker = null;
+    });
+    tabMarkers.set(uuid, tracked);
+    console.log('[terminalRegistry.registerEntryMarker] Registered marker for', uuid, 'at line', marker.line);
+    return true;
+  },
+
+  // Scroll to an entry using its marker. Returns true if successful.
+  scrollToEntry(tabId: string, uuid: string): boolean {
+    const terminal = terminals.get(tabId);
+    const tabMarkers = entryMarkers.get(tabId);
+    if (!terminal || !tabMarkers) return false;
+
+    const tracked = tabMarkers.get(uuid);
+    if (!tracked?.marker || tracked.marker.isDisposed) {
+      console.log('[terminalRegistry.scrollToEntry] Marker not available for', uuid);
+      return false;
+    }
+
+    const line = tracked.marker.line;
+    console.log('[terminalRegistry.scrollToEntry] Scrolling to line', line, 'for', uuid);
+    terminal.scrollToLine(line);
+    return true;
+  },
+
+  // Check if an entry's marker is still reachable (not disposed by scrollback trim)
+  isEntryReachable(tabId: string, uuid: string): boolean {
+    const tabMarkers = entryMarkers.get(tabId);
+    if (!tabMarkers) return true; // No markers tracked yet — assume reachable
+    const tracked = tabMarkers.get(uuid);
+    if (!tracked) return true; // Not tracked yet — assume reachable
+    return tracked.isReachable;
+  },
+
+  // Get the buffer line number for a tracked entry, or null
+  getEntryMarkerLine(tabId: string, uuid: string): number | null {
+    const tabMarkers = entryMarkers.get(tabId);
+    if (!tabMarkers) return null;
+    const tracked = tabMarkers.get(uuid);
+    if (!tracked?.marker || tracked.marker.isDisposed) return null;
+    return tracked.marker.line;
+  },
+
+  // Retrospective binding: search for text, find its position, register marker there
+  bindEntryBySearch(tabId: string, uuid: string, searchText: string): boolean {
+    const terminal = terminals.get(tabId);
+    const searchAddon = searchAddons.get(tabId);
+    if (!terminal || !searchAddon) return false;
+
+    // Skip if already bound with a live marker
+    const tabMarkers = entryMarkers.get(tabId);
+    if (tabMarkers) {
+      const existing = tabMarkers.get(uuid);
+      if (existing?.marker && !existing.marker.isDisposed) {
+        return true; // Already bound
+      }
+    }
+
+    // Find the text in the buffer
+    const found = searchAddon.findNext(searchText, { ...defaultSearchOptions, decorations: undefined });
+    if (!found) {
+      console.log('[terminalRegistry.bindEntryBySearch] Text not found for', uuid, ':', searchText.slice(0, 30));
+      return false;
+    }
+
+    // Get selection position (the found match)
+    const selection = terminal.getSelectionPosition();
+    if (!selection) {
+      searchAddon.clearDecorations();
+      terminal.clearSelection();
+      return false;
+    }
+
+    // Register marker at the found line
+    // We need to compute the offset from current cursor to the found line
+    const buf = terminal.buffer.active;
+    const foundAbsoluteLine = selection.start.y + buf.viewportY;
+    const cursorAbsoluteLine = buf.cursorY + buf.baseY;
+    const offset = foundAbsoluteLine - cursorAbsoluteLine;
+
+    let markers = entryMarkers.get(tabId);
+    if (!markers) {
+      markers = new Map();
+      entryMarkers.set(tabId, markers);
+    }
+
+    const marker = terminal.registerMarker(offset);
+    if (marker) {
+      const tracked: TrackedEntry = { uuid, marker, isReachable: true };
+      marker.onDispose(() => {
+        tracked.isReachable = false;
+        tracked.marker = null;
+      });
+      markers.set(uuid, tracked);
+      console.log('[terminalRegistry.bindEntryBySearch] Bound', uuid, 'at line', marker.line);
+    }
+
+    // Clean up search state
+    searchAddon.clearDecorations();
+    terminal.clearSelection();
+    return !!marker;
+  },
+
+  // Get all entry markers for a tab (used by Timeline for reachability checks)
+  getEntryMarkers(tabId: string): Map<string, TrackedEntry> | undefined {
+    return entryMarkers.get(tabId);
   }
 };

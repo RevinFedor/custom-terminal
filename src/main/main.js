@@ -2370,6 +2370,169 @@ ipcMain.handle('gemini:rollback', async (event, { sessionId, turnNumber, cwd, ta
   return { success: true, sessionId, cwd };
 });
 
+// ========== SESSION CHAIN HELPERS ==========
+
+// Find a JSONL session file by ID, searching cwd-based path first, then all project dirs
+function findSessionFile(sessionId, cwd) {
+  const claudeProjectsDir = path.join(os.homedir(), '.claude', 'projects');
+
+  if (cwd) {
+    const projectSlug = cwd.replace(/\//g, '-');
+    const primaryPath = path.join(claudeProjectsDir, projectSlug, `${sessionId}.jsonl`);
+    if (fs.existsSync(primaryPath)) {
+      return { filePath: primaryPath, projectDir: path.join(claudeProjectsDir, projectSlug) };
+    }
+  }
+
+  if (fs.existsSync(claudeProjectsDir)) {
+    const projectDirs = fs.readdirSync(claudeProjectsDir, { withFileTypes: true })
+      .filter(dirent => dirent.isDirectory())
+      .map(dirent => dirent.name);
+    for (const dir of projectDirs) {
+      const checkPath = path.join(claudeProjectsDir, dir, `${sessionId}.jsonl`);
+      if (fs.existsSync(checkPath)) {
+        return { filePath: checkPath, projectDir: path.join(claudeProjectsDir, dir) };
+      }
+    }
+  }
+  return null;
+}
+
+// Load all records from a JSONL file into a Map (uuid → record)
+// Returns { recordMap, lastRecord, bridgeSessionId }
+// bridgeSessionId is set if the first entry references a different session (clear-context bridge)
+function loadJsonlRecords(filePath) {
+  const content = fs.readFileSync(filePath, 'utf-8');
+  const lines = content.trim().split('\n').filter(line => line.trim());
+  const sessionId = path.basename(filePath, '.jsonl');
+
+  const recordMap = new Map();
+  let lastRecord = null;
+  let bridgeSessionId = null;
+
+  for (const line of lines) {
+    try {
+      const entry = JSON.parse(line);
+      if (entry.uuid) {
+        recordMap.set(entry.uuid, entry);
+        lastRecord = entry;
+        // Detect bridge: first entry with uuid that has a different sessionId
+        if (bridgeSessionId === null && entry.sessionId && entry.sessionId !== sessionId) {
+          bridgeSessionId = entry.sessionId;
+        } else if (bridgeSessionId === null && entry.sessionId === sessionId) {
+          bridgeSessionId = undefined; // No bridge
+        }
+      }
+    } catch {}
+  }
+
+  return { recordMap, lastRecord, bridgeSessionId: bridgeSessionId || null };
+}
+
+// Resolve the full chain of JSONL files by following bridge entries backwards.
+// Returns a merged recordMap with all records from all files in the chain,
+// plus metadata about session boundaries.
+// sessionBoundaries: array of { childSessionId, parentSessionId, bridgeUuid }
+function resolveSessionChain(sessionId, cwd, maxDepth = 10) {
+  const mergedMap = new Map();
+  const sessionBoundaries = [];
+  let currentSessionId = sessionId;
+  let lastRecord = null;
+  let depth = 0;
+
+  while (currentSessionId && depth < maxDepth) {
+    const found = findSessionFile(currentSessionId, cwd);
+    if (!found) {
+      console.log('[SessionChain] File not found for:', currentSessionId);
+      break;
+    }
+
+    const { recordMap, lastRecord: fileLastRecord, bridgeSessionId } = loadJsonlRecords(found.filePath);
+
+    // On the first file (newest), capture the lastRecord for backtrace start
+    if (depth === 0) {
+      lastRecord = fileLastRecord;
+    }
+
+    // Merge records (don't overwrite newer records from child files)
+    for (const [uuid, record] of recordMap) {
+      if (!mergedMap.has(uuid)) {
+        mergedMap.set(uuid, record);
+      }
+    }
+
+    console.log('[SessionChain] Loaded', currentSessionId.slice(0, 12) + '...', ':', recordMap.size, 'records, bridge:', bridgeSessionId ? bridgeSessionId.slice(0, 12) + '...' : 'none');
+
+    if (bridgeSessionId) {
+      sessionBoundaries.push({
+        childSessionId: currentSessionId,
+        parentSessionId: bridgeSessionId,
+      });
+      currentSessionId = bridgeSessionId;
+    } else {
+      break;
+    }
+
+    depth++;
+  }
+
+  return { mergedMap, lastRecord, sessionBoundaries };
+}
+
+// Find the latest (tip) session in a chain starting from a given session.
+// Walks FORWARD: looks for any JSONL file whose first entry bridges FROM this session.
+function resolveLatestSessionInChain(sessionId, cwd) {
+  const claudeProjectsDir = path.join(os.homedir(), '.claude', 'projects');
+  let currentId = sessionId;
+  const visited = new Set();
+
+  while (!visited.has(currentId)) {
+    visited.add(currentId);
+
+    // Look for a child file that bridges from currentId
+    const found = findSessionFile(currentId, cwd);
+    if (!found) break;
+
+    // Scan project dir for files that reference currentId as bridge
+    let childId = null;
+    try {
+      const files = fs.readdirSync(found.projectDir);
+      const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.jsonl$/i;
+      for (const f of files) {
+        if (!uuidPattern.test(f)) continue;
+        const fId = f.replace('.jsonl', '');
+        if (fId === currentId || visited.has(fId)) continue;
+
+        // Read just the first line to check for bridge
+        const fPath = path.join(found.projectDir, f);
+        const fd = fs.openSync(fPath, 'r');
+        const buf = Buffer.alloc(2048);
+        const bytesRead = fs.readSync(fd, buf, 0, 2048, 0);
+        fs.closeSync(fd);
+
+        const firstLine = buf.toString('utf-8', 0, bytesRead).split('\n')[0];
+        try {
+          const entry = JSON.parse(firstLine);
+          if (entry.sessionId === currentId && entry.uuid) {
+            // This file bridges from currentId
+            childId = fId;
+            break;
+          }
+        } catch {}
+      }
+    } catch {}
+
+    if (childId) {
+      console.log('[SessionChain] Found child:', childId.slice(0, 12), '... for parent:', currentId.slice(0, 12) + '...');
+      currentId = childId;
+    } else {
+      break; // No child found, currentId is the tip
+    }
+  }
+
+  return currentId;
+}
+
 // ========== TIMELINE PARSER FUNCTION ==========
 // Shared function to parse Timeline entries from JSONL file using Backtrace algorithm
 // Returns array of entry UUIDs in display order (for fork marker snapshot)
@@ -2438,71 +2601,26 @@ function parseTimelineUuids(sourcePath) {
 // Searches ALL project directories under ~/.claude/projects/ to find the session file
 ipcMain.handle('claude:fork-session-file', async (event, { sourceSessionId, cwd }) => {
   console.log('[Claude Fork] ========================================');
-  console.log('[Claude Fork] Copying session:', sourceSessionId);
+  console.log('[Claude Fork] Requested source session:', sourceSessionId);
   console.log('[Claude Fork] Current cwd:', cwd);
 
   try {
-    const claudeProjectsDir = path.join(os.homedir(), '.claude', 'projects');
-    console.log('[Claude Fork] Claude projects dir:', claudeProjectsDir);
-
-    // Find session file across ALL project directories
-    let sourcePath = null;
-    let projectDir = null;
-
-    // First, try the cwd-based path (most likely)
-    const projectSlug = cwd.replace(/\//g, '-');
-    const primaryDir = path.join(claudeProjectsDir, projectSlug);
-    const primaryPath = path.join(primaryDir, `${sourceSessionId}.jsonl`);
-
-    console.log('[Claude Fork] Primary slug:', projectSlug);
-    console.log('[Claude Fork] Primary path:', primaryPath);
-    console.log('[Claude Fork] Primary exists:', fs.existsSync(primaryPath));
-
-    if (fs.existsSync(primaryPath)) {
-      sourcePath = primaryPath;
-      projectDir = primaryDir;
-      console.log('[Claude Fork] Found in primary location:', sourcePath);
-    } else {
-      // Search all project directories
-      console.log('[Claude Fork] Not in primary location, searching ALL projects...');
-      if (fs.existsSync(claudeProjectsDir)) {
-        const projectDirs = fs.readdirSync(claudeProjectsDir, { withFileTypes: true })
-          .filter(dirent => dirent.isDirectory())
-          .map(dirent => dirent.name);
-
-        console.log('[Claude Fork] Found', projectDirs.length, 'project directories to search');
-
-        for (const dir of projectDirs) {
-          const checkPath = path.join(claudeProjectsDir, dir, `${sourceSessionId}.jsonl`);
-          const exists = fs.existsSync(checkPath);
-          if (exists) {
-            sourcePath = checkPath;
-            projectDir = path.join(claudeProjectsDir, dir);
-            console.log('[Claude Fork] ✓ FOUND in:', sourcePath);
-            break;
-          }
-        }
-      } else {
-        console.log('[Claude Fork] ERROR: Claude projects dir does not exist!');
-      }
+    // Resolve the LATEST session in the chain (in case "Clear Context" created child sessions)
+    const resolvedSourceId = resolveLatestSessionInChain(sourceSessionId, cwd);
+    if (resolvedSourceId !== sourceSessionId) {
+      console.log('[Claude Fork] Chain resolved: ', sourceSessionId, '→', resolvedSourceId);
     }
 
-    if (!sourcePath) {
-      console.error('[Claude Fork] ✗ Source file not found in ANY project directory');
-      console.error('[Claude Fork] Searched for:', sourceSessionId + '.jsonl');
-      return { success: false, error: 'Session file not found: ' + sourceSessionId };
+    // Find the resolved source file
+    const found = findSessionFile(resolvedSourceId, cwd);
+    if (!found) {
+      console.error('[Claude Fork] ✗ Source file not found for:', resolvedSourceId);
+      return { success: false, error: 'Session file not found: ' + resolvedSourceId };
     }
 
-    // Generate new UUID
-    const newSessionId = crypto.randomUUID();
-    console.log('[Claude Fork] New session ID:', newSessionId);
-
-    const destPath = path.join(projectDir, `${newSessionId}.jsonl`);
-
-    if (!fs.existsSync(sourcePath)) {
-      console.error('[Claude Fork] Source file not found:', sourcePath);
-      return { success: false, error: 'Session file not found: ' + sourceSessionId };
-    }
+    const sourcePath = found.filePath;
+    const projectDir = found.projectDir;
+    console.log('[Claude Fork] Source file:', sourcePath);
 
     // Check source file is not empty
     const stats = fs.statSync(sourcePath);
@@ -2510,6 +2628,12 @@ ipcMain.handle('claude:fork-session-file', async (event, { sourceSessionId, cwd 
       console.error('[Claude Fork] Source file is empty:', sourcePath);
       return { success: false, error: 'Source session is empty' };
     }
+
+    // Generate new UUID
+    const newSessionId = crypto.randomUUID();
+    console.log('[Claude Fork] New session ID:', newSessionId);
+
+    const destPath = path.join(projectDir, `${newSessionId}.jsonl`);
 
     // Get Timeline UUIDs snapshot using Backtrace algorithm (same as Timeline UI)
     const entryUuids = parseTimelineUuids(sourcePath);
@@ -2521,7 +2645,7 @@ ipcMain.handle('claude:fork-session-file', async (event, { sourceSessionId, cwd 
 
     // Save fork marker with UUIDs snapshot (always save, even if empty — marks fork at beginning)
     try {
-      projectManager.db.saveForkMarker(sourceSessionId, newSessionId, entryUuids);
+      projectManager.db.saveForkMarker(resolvedSourceId, newSessionId, entryUuids);
       console.log('[Claude Fork] Fork marker saved with', entryUuids.length, 'UUIDs');
     } catch (e) {
       console.warn('[Claude Fork] Could not save fork marker:', e.message);
@@ -2565,65 +2689,10 @@ ipcMain.handle('claude:get-timeline', async (event, { sessionId, cwd }) => {
   }
 
   try {
-    const claudeProjectsDir = path.join(os.homedir(), '.claude', 'projects');
+    // Resolve the full session chain (follows bridge entries across "Clear Context" boundaries)
+    const { mergedMap: recordMap, lastRecord, sessionBoundaries } = resolveSessionChain(sessionId, cwd);
 
-    // Find session file (same logic as fork)
-    let sourcePath = null;
-
-    // Try cwd-based path first
-    if (cwd) {
-      const projectSlug = cwd.replace(/\//g, '-');
-      const primaryPath = path.join(claudeProjectsDir, projectSlug, `${sessionId}.jsonl`);
-      if (fs.existsSync(primaryPath)) {
-        sourcePath = primaryPath;
-      }
-    }
-
-    // Search all directories if not found
-    if (!sourcePath && fs.existsSync(claudeProjectsDir)) {
-      const projectDirs = fs.readdirSync(claudeProjectsDir, { withFileTypes: true })
-        .filter(dirent => dirent.isDirectory())
-        .map(dirent => dirent.name);
-
-      for (const dir of projectDirs) {
-        const checkPath = path.join(claudeProjectsDir, dir, `${sessionId}.jsonl`);
-        if (fs.existsSync(checkPath)) {
-          sourcePath = checkPath;
-          break;
-        }
-      }
-    }
-
-    if (!sourcePath) {
-      return { success: false, error: 'Session file not found' };
-    }
-
-    // Read and parse ALL JSONL records into a Map
-    const content = fs.readFileSync(sourcePath, 'utf-8');
-    const lines = content.trim().split('\n').filter(line => line.trim());
-
-    console.log('[Claude Timeline] File:', sourcePath);
-    console.log('[Claude Timeline] Total lines in file:', lines.length);
-
-    const recordMap = new Map(); // UUID -> record
-    let lastRecord = null;
-    let parseErrors = 0;
-
-    for (const line of lines) {
-      try {
-        const entry = JSON.parse(line);
-        recordMap.set(entry.uuid, entry);
-        // Track last record with valid UUID (skip summary records which have null uuid)
-        if (entry.uuid) {
-          lastRecord = entry;
-        }
-      } catch (parseErr) {
-        parseErrors++;
-      }
-    }
-
-    console.log('[Claude Timeline] Parsed records:', recordMap.size);
-    console.log('[Claude Timeline] Parse errors:', parseErrors);
+    console.log('[Claude Timeline] Merged records:', recordMap.size, '| Chain depth:', sessionBoundaries.length + 1);
     console.log('[Claude Timeline] Last record type:', lastRecord?.type);
 
     if (!lastRecord) {
@@ -2632,22 +2701,42 @@ ipcMain.handle('claude:get-timeline', async (event, { sessionId, cwd }) => {
     }
 
     // BACKTRACE: Walk backwards from the last record following parentUuid
-    // This gives us the ACTIVE branch, ignoring dead branches from Escape/Undo
+    // Now works across file boundaries thanks to merged recordMap
     const activeBranch = [];
     let currentUuid = lastRecord.uuid;
+    const seen = new Set();
 
-    while (currentUuid) {
+    while (currentUuid && !seen.has(currentUuid)) {
+      seen.add(currentUuid);
       const record = recordMap.get(currentUuid);
       if (!record) break;
 
-      activeBranch.unshift(record); // Add to beginning (we're going backwards)
+      activeBranch.unshift(record);
 
       // Move to parent (use logicalParentUuid for compact boundaries, else parentUuid)
-      currentUuid = record.logicalParentUuid || record.parentUuid;
+      let nextUuid = record.logicalParentUuid || record.parentUuid;
+
+      // If we hit the root (parentUuid=null), check for bridge entry to parent session.
+      // Bridge entry has a DIFFERENT sessionId and its parentUuid points into the parent file.
+      // We need to follow the bridge to continue backtrace into the parent chain.
+      if (!nextUuid && sessionBoundaries.length > 0) {
+        // Find bridge entry: an entry in mergedMap with a different sessionId whose parentUuid
+        // points to a record in the parent file
+        for (const [uuid, entry] of recordMap) {
+          if (seen.has(uuid)) continue;
+          // Bridge entry: sessionId differs from the file it lives in AND has a parentUuid
+          if (entry.parentUuid && entry.sessionId !== record.sessionId) {
+            console.log('[Claude Timeline] Following bridge:', uuid.slice(0, 12), '→ parent:', entry.parentUuid?.slice(0, 12));
+            nextUuid = entry.parentUuid;
+            break;
+          }
+        }
+      }
+
+      currentUuid = nextUuid;
     }
 
     console.log('[Claude Timeline] Active branch size:', activeBranch.length);
-    console.log('[Claude Timeline] Active branch types:', activeBranch.map(r => r.type).join(', '));
 
     // Now filter the active branch for Timeline display
     const entries = [];
@@ -2697,13 +2786,11 @@ ipcMain.handle('claude:get-timeline', async (event, { sessionId, cwd }) => {
         }
 
         // Skip local command artifacts - these appear after /compact and other slash commands
-        // Also skip system notifications and reminders injected by Claude Code
         if (rawContent.includes('<command-name>') ||
             rawContent.includes('<command-message>') ||
             rawContent.includes('<command-args>') ||
             rawContent.includes('<local-command-stdout>') ||
             rawContent.includes('<local-command-stderr>') ||
-            rawContent.includes('<system-reminder>') ||
             rawContent.includes('<bash-notification>') ||
             rawContent.includes('<shell-id>') ||
             rawContent.includes('<user-prompt-submit-hook>') ||
@@ -2712,8 +2799,11 @@ ipcMain.handle('claude:get-timeline', async (event, { sessionId, cwd }) => {
           continue;
         }
 
-        // Clean up bracketed paste escape sequences [200~ and ~]
+        // Strip <system-reminder>...</system-reminder> blocks injected by Claude Code
+        // These appear in user messages but don't represent actual user input
+        // Strip them first, then check if real content remains
         let cleanContent = rawContent
+          .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '')
           .replace(/\[200~/g, '')
           .replace(/~\]/g, '')
           .trim();
@@ -2751,7 +2841,12 @@ ipcMain.handle('claude:get-timeline', async (event, { sessionId, cwd }) => {
     if (entries.length > 0) {
       console.log('[Claude Timeline] First entry:', entries[0].content?.slice(0, 50));
     }
-    return { success: true, entries };
+
+    // Resolve the latest session ID in the chain (tip)
+    // This helps the renderer detect if claudeSessionId needs updating
+    const latestSessionId = resolveLatestSessionInChain(sessionId, cwd);
+
+    return { success: true, entries, latestSessionId, sessionBoundaries };
 
   } catch (error) {
     console.error('[Claude Timeline] Error:', error);
@@ -2874,6 +2969,7 @@ ipcMain.handle('claude:export-clean-session', async (event, { sessionId, cwd, in
     };
 
     const forkBoundaryUuids = new Set();
+    const markerBoundaryPairs = []; // { lastBoundaryIdx, sourceSessionId } for tree building
     let hasForkAtBeginning = false; // Fork with empty snapshot = fork before any entries
     try {
       const forkMarkers = projectManager.db.getForkMarkers(sessionId);
@@ -2885,6 +2981,7 @@ ipcMain.handle('claude:export-clean-session', async (event, { sessionId, cwd, in
           hasForkAtBeginning = true;
           continue;
         }
+        let lastBIdx = -1; // Track last boundary index for this marker (for tree)
         // Find boundary: last Timeline-eligible entry in snapshot where next Timeline-eligible entry is NOT in snapshot
         for (let idx = 0; idx < activeBranch.length; idx++) {
           const rec = activeBranch[idx];
@@ -2900,13 +2997,19 @@ ipcMain.handle('claude:export-clean-session', async (event, { sessionId, cwd, in
           if (!nextTimelineEntry) {
             // No more Timeline entries after this — boundary at the end
             forkBoundaryUuids.add(rec.uuid);
+            lastBIdx = idx;
           } else if (!snapshotSet.has(nextTimelineEntry.uuid)) {
             // Next Timeline entry is NOT in snapshot — this is the fork boundary
             forkBoundaryUuids.add(rec.uuid);
+            lastBIdx = idx;
           }
+        }
+        if (lastBIdx >= 0) {
+          markerBoundaryPairs.push({ lastBoundaryIdx: lastBIdx, sourceSessionId: marker.source_session_id });
         }
       }
       console.log('[Claude Export] Fork boundary UUIDs:', forkBoundaryUuids.size, 'hasForkAtBeginning:', hasForkAtBeginning);
+      console.log('[Claude Export] Marker boundary pairs:', markerBoundaryPairs.length);
     } catch (e) {
       console.warn('[Claude Export] Could not load fork markers:', e.message);
     }
@@ -2929,15 +3032,97 @@ ipcMain.handle('claude:export-clean-session', async (event, { sessionId, cwd, in
       }
     }
 
+    // Build session tree segments from fork marker boundaries
+    markerBoundaryPairs.sort((a, b) => a.lastBoundaryIdx - b.lastBoundaryIdx);
+
+    const treeSegments = [];
+    let segStart = 0;
+
+    for (const mb of markerBoundaryPairs) {
+      treeSegments.push({
+        startIdx: segStart,
+        endIdx: mb.lastBoundaryIdx,
+        sessionLabel: mb.sourceSessionId.slice(0, 8),
+        type: treeSegments.length === 0 && !hasForkAtBeginning ? 'root' : 'fork'
+      });
+      segStart = mb.lastBoundaryIdx + 1;
+    }
+
+    // Current session (final segment)
+    treeSegments.push({
+      startIdx: segStart,
+      endIdx: activeBranch.length - 1,
+      sessionLabel: sessionId.slice(0, 8),
+      type: treeSegments.length === 0 && !hasForkAtBeginning ? 'root' : 'fork',
+      isCurrent: true
+    });
+
+    // Compute per-segment stats
+    for (const seg of treeSegments) {
+      let prompts = 0, tools = 0, compacts = 0;
+      for (let i = seg.startIdx; i <= seg.endIdx && i < activeBranch.length; i++) {
+        const entry = activeBranch[i];
+        if (entry.isSidechain) continue;
+        if (entry.type === 'user') {
+          const c = entry.message?.content;
+          if (Array.isArray(c) && c.some(item => item.type === 'tool_result')) continue;
+          if (typeof c === 'string' && (c.startsWith('[Request interrupted') || c.includes('<command-name>'))) continue;
+          prompts++;
+        } else if (entry.type === 'assistant') {
+          const mc = entry.message?.content;
+          if (Array.isArray(mc)) { for (const b of mc) { if (b.type === 'tool_use') tools++; } }
+        } else if (entry.type === 'system' && entry.subtype === 'compact_boundary') {
+          compacts++;
+        }
+      }
+      seg.prompts = prompts;
+      seg.tools = tools;
+      seg.compacts = compacts;
+    }
+
+    // Detect clear-context boundaries (bridge entries with different sessionId)
+    const sessionIds = new Set();
+    for (const entry of activeBranch) {
+      if (entry.sessionId) sessionIds.add(entry.sessionId);
+    }
+    const clearContextCount = Math.max(0, sessionIds.size - 1);
+
+    console.log('[Claude Export] Tree segments:', treeSegments.length, 'clearContexts:', clearContextCount);
+
     const outputParts = [];
     outputParts.push(`# Claude Session Export`);
     outputParts.push(`Session: ${sessionId}`);
     outputParts.push(`CWD: ${cwd || 'unknown'}`);
-    outputParts.push(`Exported: ${new Date().toISOString()}`);
+    outputParts.push('');
+
+    // Render hierarchical session tree
+    outputParts.push('Session Tree:');
+    for (let i = 0; i < treeSegments.length; i++) {
+      const seg = treeSegments[i];
+      const depth = i;
+      const indent = depth > 0 ? '    '.repeat(depth - 1) + '└── ' : '';
+
+      let tag = '';
+      if (seg.type === 'root') tag = ' (root)';
+      else if (seg.isCurrent && treeSegments.length > 1) tag = ' (current)';
+      else if (!seg.isCurrent) tag = ' (fork)';
+
+      const stats = [];
+      if (seg.prompts > 0) stats.push(`${seg.prompts} prompt${seg.prompts !== 1 ? 's' : ''}`);
+      if (seg.tools > 0) stats.push(`${seg.tools} tool${seg.tools !== 1 ? 's' : ''}`);
+      if (seg.compacts > 0) stats.push(`\u267B\uFE0F \u00D7${seg.compacts}`);
+
+      const statsStr = stats.length > 0 ? ` \u2014 ${stats.join(', ')}` : '';
+      outputParts.push(`${indent}${seg.sessionLabel}${tag}${statsStr}`);
+    }
+    if (clearContextCount > 0) {
+      const lastIndent = '    '.repeat(Math.max(0, treeSegments.length - 1));
+      outputParts.push(`${lastIndent}(+ ${clearContextCount} clear context${clearContextCount > 1 ? 's' : ''})`);
+    }
     outputParts.push('');
     outputParts.push(`Markers:`);
-    outputParts.push(`  🔵 FORK  — session branched (search "FORK")`);
-    outputParts.push(`  ═══ COMPACTED ═══ — context window compacted (search "COMPACTED")`);
+    outputParts.push(`  \uD83D\uDD35 FORK  \u2014 session branched (search "FORK")`);
+    outputParts.push(`  \u2550\u2550\u2550 COMPACTED \u2550\u2550\u2550 \u2014 context window compacted (search "COMPACTED")`);
     outputParts.push('');
 
     // Insert FORK separator at the beginning if fork was before any entries or trimmed

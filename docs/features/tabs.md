@@ -6,7 +6,8 @@
 ## User Flow: Жизненный цикл таба
 1. **Создание:** Пользователь нажимает `Cmd+T` или делает двойной клик на пустом месте TabBar.
    - Система ищет первое свободное число для имени (`tab-1`, `tab-2`).
-   - Новый таб наследует `cwd` текущего активного таба. См. `knowledge/fact-osc7-cwd.md`.
+   - Новый таб наследует `cwd` текущего активного таба. См. `knowledge/terminal-core.md`.
+   - **Сброс выделения:** При создании нового таба через `Cmd+T` или интерфейс, текущее множественное выделение вкладок автоматически сбрасывается.
 2. **Запуск процесса:** Пользователь вводит `npm run dev`.
    - Таб мгновенно переименовывается в `run-dev`.
    - Цвет таба меняется на зеленый (если не был задан вручную).
@@ -16,7 +17,9 @@
    - Кнопка Restart скрывается, так как для AI она не актуальна.
 4. **Управление:** 
    - Пользователь делает правый клик (ПКМ). Открывается меню: **Close Tab** -> **Rename** -> **Color** (подменю).
-   - **Multi-Select:** Поддержка выбора нескольких вкладок через `Shift+Click` (диапазон) или `Cmd+Click` (по одной). При этом контекстное меню адаптируется, скрывая инструменты переименования. См. [`knowledge/fact-selection-model.md`](knowledge/fact-selection-model.md).
+   - **Multi-Select:** Поддержка выбора нескольких вкладок через `Shift+Click` (диапазон) или `Cmd+Click` (по одной). При этом контекстное меню адаптируется, скрывая инструменты переименования. См. [`knowledge/data-persistence.md`](knowledge/data-persistence.md).
+   - **Multi-Tab DnD:** Выделенные вкладки можно перетаскивать группой. При перетаскивании на другой проект в Title Bar появляется кастомный превью-индикатор с бейджем `+N`, показывающим количество переносимых вкладок.
+   - **Сброс выделения:** Клик вне области `TabBar` (например, по терминалу или боковой панели) автоматически снимает множественное выделение.
    - Пользователь может закрыть таб колесиком мыши.
 
 ## User Flow: Управление проектами
@@ -28,20 +31,22 @@
 
 ## Behavior Specs
 - **Horizontal Scroll:** Таб-бар поддерживает прокрутку колесиком мыши без зажатого Shift. Используется `onWheel` с `{ passive: false }` для корректного предотвращения нативного скролла.
+- **Auto-Scroll:** При переключении или создании вкладок система автоматически прокручивает `TabBar` так, чтобы активная вкладка всегда была видна. При перетаскивании таба к левому или правому краю также срабатывает автоматический скролл. Используется `@atlaskit/pragmatic-drag-and-drop-auto-scroll`.
 - **Gap Separation:** Между вкладками используется физический разрыв `gap-[1px]`, что предотвращает слипание индикаторов активности и рамок при наведении.
-- **Auto-Scroll:** При перетаскивании таба к левому или правому краю, область вкладок автоматически скроллится. Используется `@atlaskit/pragmatic-drag-and-drop-auto-scroll`.
-- **Stable Resizing:** Размер терминала подстраивается под контейнер через `ResizeObserver`. Реализована защита от stale closure. См. [`knowledge/fix-terminal-resizing.md`](../knowledge/fix-terminal-resizing.md).
-- **Persistent Naming:** Тип команды сохраняется в БД, что предотвращает сброс кастомных имен при перезапуске. См. [`knowledge/fix-tab-rename-on-restart.md`](../knowledge/fix-tab-rename-on-restart.md).
+- **Stable Resizing:** Размер терминала подстраивается под контейнер через `ResizeObserver`. Реализована защита от stale closure. См. [`knowledge/terminal-core.md`](../knowledge/terminal-core.md).
+- **Persistent Naming:** Тип команды сохраняется в БД, что предотвращает сброс кастомных имен при перезапуске. См. [`knowledge/data-persistence.md`](../knowledge/data-persistence.md).
 - **Activity Throttling:** Терминал считается активным только в том случае, если текущий вид (`currentView`) установлен в `'terminal'`. Это предотвращает лишнюю нагрузку и конфликты, когда пользователь находится в Dashboard или полноэкранном редакторе заметок.
-- **Cross-Project Move:** Таб можно перетащить на любую вкладку проекта в Title Bar. 
-    - Логика: `moveTabToProject` в `useWorkspaceStore`.
-    - PTY процесс сохраняется, меняется только привязка к проекту в БД.
+- **Cross-Project Move (Multi-Tab):** Вкладки (одна или несколько) могут быть перетащены на любую вкладку проекта в Title Bar. 
+    - Логика: `moveTabsToProject` в `useWorkspaceStore`.
+    - PTY процессы сохраняются, меняется только привязка к проекту в БД.
+    - Визуальное затемнение: При перетаскивании все вкладки, входящие в группу переноса, получают `opacity: 0.5`.
 - **Sync:** Порядок проектов сохраняется в `Map` внутри `useWorkspaceStore`.
 - **Title Bar Integration:** Пустая зона для дропа (`ProjectEmptyDropZone`) поддерживает `WebkitAppRegion: drag`, когда не активен процесс перетаскивания, позволяя двигать окно приложения за шапку.
 
 
 ## Code Map
-- **UI:** `src/renderer/components/Workspace/TabBar.tsx` — логика меню и `RestartZone`.
-- **Logic:** `src/renderer/store/useWorkspaceStore.ts` — функции `getNextAvailableName`, `setTabCommandType`, `setGeminiSessionId`.
+- **UI:** `src/renderer/components/Workspace/TabBar.tsx` — логика меню, `RestartZone`, `onGenerateDragPreview` для multi-drag и `useEffect` для авто-скролла.
+- **Logic:** `src/renderer/store/useWorkspaceStore.ts` — функции `getNextAvailableName`, `setTabCommandType`, `moveTabsToProject` (batch move).
 - **Terminal:** `src/renderer/components/Workspace/Terminal.tsx` — перехват ввода для детекции типа процесса и блокировки дублирующих AI сессий.
 - **InfoPanel:** `src/renderer/components/Workspace/panels/InfoPanel.tsx` — кнопки claude/claude-c/claude-f также вызывают `setTabCommandType`.
+- **Knowledge:** [`knowledge/data-persistence.md`](../knowledge/data-persistence.md) — детали реализации массового переноса.

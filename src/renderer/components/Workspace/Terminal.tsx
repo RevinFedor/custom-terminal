@@ -559,6 +559,17 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
         return true;
       });
 
+      // OSC 7777 handler - entry marker registration (future: main process sends before user prompt)
+      // Format: entry:<uuid>
+      term.parser.registerOscHandler(7777, (data: string) => {
+        if (data.startsWith('entry:')) {
+          const uuid = data.slice(6);
+          console.log('[Terminal] OSC 7777 entry marker:', uuid);
+          terminalRegistry.registerEntryMarker(tabId, uuid);
+        }
+        return true;
+      });
+
       xtermInstance.current = term;
       hasBeenActive.current = true; // Mark as active AFTER xterm is created to prevent race condition
 
@@ -938,7 +949,7 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
           cursorStyle: 'block',
           allowTransparency: false,
           allowProposedApi: true, // Required for SearchAddon
-          scrollback: 10000
+          scrollback: 50000
         });
 
         const fitAddon = new FitAddon();
@@ -971,6 +982,16 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
             }
           } catch (e) {
             console.error('[Terminal] OSC 7 parse error:', e);
+          }
+          return true;
+        });
+
+        // OSC 7777 handler - entry marker registration (future: main process sends before user prompt)
+        term.parser.registerOscHandler(7777, (data: string) => {
+          if (data.startsWith('entry:')) {
+            const uuid = data.slice(6);
+            console.log('[Terminal] OSC 7777 entry marker:', uuid);
+            terminalRegistry.registerEntryMarker(tabId, uuid);
           }
           return true;
         });

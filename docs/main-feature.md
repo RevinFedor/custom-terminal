@@ -9,10 +9,10 @@
 - **Cmd+T (в фокусе):** Создает новый проект и сразу включает режим переименования.
 - **Стрелки (в фокусе):** Переключение между открытыми проектами.
 - **Esc:** Возврат фокуса в терминал.
-- **Multi-Select (Tabs):** Поддержка выбора нескольких вкладок терминала через `Shift+Click` или `Cmd+Click` для массового закрытия или экспорта. См. [`knowledge/fact-selection-model.md`](knowledge/fact-selection-model.md).
+- **Multi-Select (Tabs):** Поддержка выбора нескольких вкладок терминала через `Shift+Click` или `Cmd+Click` для массового закрытия или экспорта. См. [`knowledge/data-persistence.md`](knowledge/data-persistence.md).
 - **Bookmarks:** Резервирование папок в секции "Reserved Directories" для быстрого создания новых сред. См. [`features/bookmarks.md`](features/bookmarks.md).
 - **Home View:** Специальный экран проекта со списком всех его терминалов. См. [`features/project-home.md`](features/project-home.md).
-- **Особенности:** Поддержка нескольких инстансов одного пути. См. [`knowledge/fix-project-instances.md`](knowledge/fix-project-instances.md).
+- **Особенности:** Поддержка нескольких инстансов одного пути. См. [`knowledge/data-persistence.md`](knowledge/data-persistence.md).
 
 ## 2. Flow: Умное управление терминалом
 - **Скролл:** Скрытый горизонтальный скролл в `TabBar` (прокрутка колесиком без Shift).
@@ -35,7 +35,7 @@
     - Выбор нескольких вкладок (массовый экспорт).
     - Флаг `includeCode`: включение/исключение содержимого файлов.
     - Флаг `fromStart`: экспорт всей истории или только с последнего форка.
-    - См. [`knowledge/fix-claude-clean-export.md`](knowledge/fix-claude-clean-export.md).
+    - См. [`knowledge/ai-automation.md`](knowledge/ai-automation.md).
 - **Подробнее:** [`features/docs-update.md`](features/docs-update.md)
 
 ## 5. Flow: Безопасное восстановление (Persistence)
@@ -43,7 +43,7 @@
 - **Действие:** Пользователь закрывает приложение. Все табы, их цвета, CWD и ID сессий сохраняются в SQLite.
 - **Сценарий Сбоя:** Если сессия была прервана, при следующем открытии появится [Interrupted Overlay](features/claude-sessions.md), предлагающий восстановить контекст одной кнопкой.
 - **Мониторинг процессов:** На Dashboard отображается список активных процессов Claude, разделенный на те, что запущены внутри приложения (In-App), и внешние (External). Это позволяет визуально контролировать "зависшие" сессии и останавливать их вручную.
-- **Подробнее:** [`features/ai-sessions.md`](features/ai-sessions.md), [`knowledge/fix-data-persistence.md`](knowledge/fix-data-persistence.md)
+- **Подробнее:** [`features/ai-sessions.md`](features/ai-sessions.md), [`knowledge/data-persistence.md`](knowledge/data-persistence.md)
 
 ## 6. Flow: Управление заметками (Notes)
 Пользователь ведет проектную документацию и личные заметки, привязанные к контексту проекта.
@@ -61,9 +61,9 @@
 
 ## Технические "фундаменты" (Knowledge Base)
 Все флоу опираются на критические решения:
-- **Форк:** [True Fork для Gemini](knowledge/fix-gemini-true-fork.md) — почему просто resume не работает.
-- **Стабильность:** [Устранение мерцания AI UI](knowledge/fix-ai-ui-flicker.md) через прямую инъекцию ID.
-- **Отрисовка:** [Canvas вместо WebGL](knowledge/fix-ui-stability.md) для стабильности.
-- **Пути:** [Реактивный OSC 7](knowledge/fact-osc7-cwd.md) для мгновенного отслеживания CWD.
-- **Слои:** [Layering Pattern](knowledge/fix-layering-pattern.md) для отрисовки UI поверх терминала.
-- **Ввод:** [Safe Write](knowledge/fix-pty-buffer-overflow.md) для вставки огромных промптов без обрывов.
+- **Форк:** [True Fork для Gemini](knowledge/ai-automation.md) — почему просто resume не работает.
+- **Стабильность:** [Устранение мерцания AI UI](knowledge/ui-ux-stability.md) через прямую инъекцию ID.
+- **Отрисовка:** [Canvas вместо WebGL](knowledge/ui-ux-stability.md) для стабильности.
+- **Пути:** [Реактивный OSC 7](knowledge/terminal-core.md) для мгновенного отслеживания CWD.
+- **Слои:** [Layering Pattern](knowledge/ui-ux-stability.md) для отрисовки UI поверх терминала.
+- **Ввод:** [Safe Write](knowledge/terminal-core.md) для вставки огромных промптов без обрывов.

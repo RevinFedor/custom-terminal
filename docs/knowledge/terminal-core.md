@@ -1,0 +1,291 @@
+# Terminal Core & Shell Integration\n
+\n---\n## File: terminal-core.md\n
+# Fact: Reactive CWD Tracking (OSC 7)
+
+## Problem
+Отслеживание текущей рабочей директории (CWD) в терминале через системные вызовы (`lsof`, `pgrep`, `ps`) является тяжелой и ненадежной операцией. Она вызывает задержки (Event Loop lag) и может возвращать неактуальные данные из-за асинхронности процессов.
+
+## Решение: Shell Integration (OSC 7)
+Вместо того чтобы "спрашивать" ОС о пути, терминал настраивается так, чтобы оболочка (Shell) сама сообщала о смене директории через специальные escape-последовательности (OSC 7).
+
+### 1. Механизм внедрения
+При старте приложения в директории `~/Library/Application Support/custom-terminal/` создается папка `shell-integration/`, содержащая файлы `.zshrc` и `.bashrc`.
+
+### 2. Zsh (ZDOTDIR)
+Для Zsh используется переменная окружения `ZDOTDIR`. 
+1. Наш `.zshrc` загружает оригинальный конфиг пользователя (`source ~/.zshrc`).
+2. Добавляет функцию в `chpwd_functions`, которая отправляет OSC 7 при каждом `cd`.
+3. Код последовательности: `\e]7;file://localhost$PWD\a`.
+
+### 3. Bash (BASH_ENV)
+Для Bash используется `BASH_ENV`, который подгружает наш скрипт инициализации с аналогичным хуком на `PROMPT_COMMAND`.
+
+### 4. Обработка в xterm.js
+Терминал слушает последовательности OSC 7:
+```typescript
+term.onLineFeed(() => {
+  // xterm.js автоматически парсит OSC 7 и обновляет внутреннее свойство, 
+  // если подключен соответствующий парсер или аддон.
+});
+```
+В нашем случае, `ipcRenderer` в Main-процессе перехватывает данные, либо Renderer парсит их и обновляет `tab.cwd` в `useWorkspaceStore`.
+
+## Преимущества
+- **Мгновенность:** Путь обновляется ровно в момент выполнения команды `cd`.
+- **Производительность:** Ноль системных вызовов к дереву процессов ОС.
+- **Надежность:** Работает даже если процесс Shell "завис" или занят (сообщение приходит от самой оболочки).
+- **Persistence:** Актуальный `cwd` всегда готов к сохранению в SQLite при закрытии приложения.
+\n---\n## File: terminal-core.md\n
+# ФАКТ: Shell Integration (OSC 133)
+
+## Суть
+Протокол OSC 133 — это стандарт (популяризированный VS Code), позволяющий терминалу "общаться" с эмулятором через невидимые управляющие последовательности. Это позволяет эмулятору точно знать, когда команда началась, когда она выполняется и с каким кодом завершилась.
+
+## Спецификация последовательностей
+Используются коды `\x1b]133;[Type][;Params]\x07` (или `\033` вместо `\x1b` и `\007` вместо `\x07` в octal представлении).
+
+| Код | Значение | Когда отправляется |
+|-----|----------|-------------------|
+| `A` | Prompt Start | Когда шелл готов к вводу и отрисовал промпт. |
+| `B` | Command Start | Сразу после нажатия Enter, перед началом выполнения. |
+| `C` | Command Executed | Когда команда начала выдавать результат. |
+| `D;[ExitCode]` | Command Finished | Когда процесс завершился (содержит код возврата). |
+
+## Реализация в проекте
+При создании PTY в шелл (zsh/bash) "впрыскивается" скрипт инициализации, который вешает хуки на `preexec` и `precmd`.
+
+### Zsh пример:
+```bash
+__custom_preexec() {
+  printf "\033]133;B\007"
+}
+__custom_precmd() {
+  printf "\033]133;D;%s\007" "$?"
+  printf "\033]133;A\007"
+}
+add-zsh-hook preexec __custom_preexec
+add-zsh-hook precmd __custom_precmd
+```
+
+## Почему это важно
+Это избавляет от необходимости использовать **Polling (pgrep)**. Мы получаем события мгновенно, что критично для плавного переключения UI элементов (например, Timeline истории Claude).
+\n---\n## File: terminal-core.md\n
+# Fact: Terminal Registry & Selection Sync
+
+Глобальный механизм синхронизации состояния терминалов `xterm.js` с UI-компонентами React.
+
+## 1. Реестр инстансов (terminalRegistry)
+Поскольку инстансы `xterm.js` создаются внутри хуков и не хранятся в React-стейтах (для производительности), создан прямой реестр.
+- **Файл:** `src/renderer/utils/terminalRegistry.ts`
+- **Функция:** Позволяет любому компоненту (например, NotesPanel или App) получить доступ к объекту терминала по его `tabId`.
+- **Методы:** `register`, `unregister`, `getSelection(tabId)`.
+
+## 2. Синхронизация выделения (terminalSelection)
+Для того чтобы кнопки "Research Selection" могли мгновенно реагировать на наличие выделенного текста (становиться активными), используется гибридный подход:
+1.  **Событие `onSelectionChange`:** Терминал слушает изменения выделения.
+2.  **Global State:** При изменении терминал записывает текст в `useUIStore.terminalSelection`.
+3.  **Context Menu:** При правом клике терминал принудительно обновляет глобальный стейт, чтобы контекстное меню гарантированно видело актуальный текст.
+
+## 3. Очистка состояния
+При деактивации терминала (переключение вкладок или проектов) глобальный стейт `terminalSelection` принудительно очищается, чтобы избежать "фантомных" поисков по тексту из другого окна.
+\n---\n## File: terminal-core.md\n
+# Опыт: Переполнение буфера ввода TTY (PTY Buffer Overflow)
+
+## Проблема
+При попытке вставить большой объем текста (например, промпт на 7KB или 200+ строк) напрямую в PTY через `term.write()`, текст обрывается. Gemini или другие CLI получают только часть данных (обычно первые ~4KB).
+
+## Причина
+В UNIX-системах (macOS/Linux) стандартный буфер ввода терминала (TTY Kernel Buffer) ограничен. При моментальной записи большого объема данных происходит переполнение, и остаток отбрасывается ОС.
+
+## Решение: Chunked Write & Bracketed Paste
+
+### 1. Разбиение на чанки (Chunking)
+Данные разбиваются на куски по 1KB с микро-задержкой (10ms) между ними. Это дает время ОС и процессу CLI обработать входящий поток.
+
+```javascript
+async function writeToPtySafe(term, data) {
+  const CHUNK_SIZE = 1024;
+  const DELAY_MS = 10;
+  for (let i = 0; i < data.length; i += CHUNK_SIZE) {
+    term.write(data.substring(i, i + CHUNK_SIZE));
+    await new Promise(r => setTimeout(r, DELAY_MS));
+  }
+}
+```
+
+### 2. Bracketed Paste Mode
+Чтобы CLI не пытался интерпретировать переносы строк внутри промпта как команду "Выполнить" (Enter), данные оборачиваются в специальные escape-последовательности:
+- Начало: `\x1b[200~`
+- Конец: `\x1b[201~`
+
+**Важно:** Символ переноса строки (`\r`) для запуска команды должен отправляться **после** закрывающего тега вставки, иначе он будет воспринят как часть текста.
+
+## Код
+Реализовано в `src/main/main.js` внутри IPC-хендлера `terminal:input`. Автоматически применяется для любых данных длиннее 1024 байт.
+
+```
+\n---\n## File: terminal-core.md\n
+# Fix: Terminal Colors and Input (Truecolor & UTF-8)
+
+## 🛠 ОПЫТ: "Почему в AI CLI тусклые цвета и странный ввод?"
+
+### Проблема
+При использовании Ink-based CLI (Gemini CLI, Claude Code) в кастомном терминале наблюдались две проблемы:
+1. **Цвета:** Текст выглядел тусклым и ненасыщенным (fallback на 256 цветов вместо 24-bit Truecolor).
+2. **Ввод (UTF-8):** При вводе кириллицы или использовании некоторых escape-последовательностей в терминале появлялись "битые" символы (Unicode-артефакты).
+
+### Причина
+Источник истины находился во **внешних ограничениях окружения PTY**. По умолчанию `node-pty` не передает полную конфигурацию переменных окружения, необходимую современным CLI для активации расширенных режимов.
+
+1. **COLORTERM:** CLI проверяют эту переменную. Если она не равна `truecolor`, они переходят в режим совместимости.
+2. **LANG/LC_ALL:** Без явного указания UTF-8 локали, терминал может некорректно интерпретировать многобайтовые символы (кириллицу).
+
+### Решение
+В файле `src/main/main.js` при создании PTY-процесса были принудительно установлены переменные окружения:
+
+```javascript
+const ptyProcess = pty.spawn(shell, [], {
+  // ...
+  env: {
+    ...process.env,
+    COLORTERM: 'truecolor',        // Включает яркие 24-bit цвета
+    LANG: process.env.LANG || 'en_US.UTF-8',
+    LC_ALL: process.env.LC_ALL || 'en_US.UTF-8' // Обеспечивает корректный ввод UTF-8
+  }
+});
+```
+
+### Дополнительно: Кэширование (Production)
+Для стабильности отображения изменений после сборки (Production build) в главный процесс добавлен флаг:
+`app.commandLine.appendSwitch('disable-http-cache');`
+Это гарантирует, что Electron не будет использовать устаревшие ресурсы из внутреннего кэша.
+\n---\n## File: terminal-core.md\n
+# Experience: Terminal Resizing (Stale Closure Fix)
+
+## Проблема
+Терминал переставал реагировать на изменение размеров окна или перемещение разделителя (Resizer). В консоли логи показывали, что `ResizeObserver` срабатывал, но свойство `active` всегда было `false`, из-за чего функция подстройки под размер (`safeFit()`) игнорировалась.
+
+## Причина
+Колбэк `ResizeObserver` инициализировался внутри `useEffect` один раз при монтировании. Он захватывал начальное значение переменной `active` (обычно `false`) в своё замыкание (closure). При изменении состояния компонента колбэк продолжал использовать старое значение, не зная, что вкладка стала активной.
+
+## Решение
+Использование `useRef` для хранения актуального состояния активности:
+1. Создан `activeRef = useRef(active)`.
+2. Добавлен `useEffect`, который синхронизирует `activeRef.current = active` при каждом рендере.
+3. Внутри колбэка `ResizeObserver` проверка выполняется через `activeRef.current`.
+
+```typescript
+const activeRef = useRef(active);
+useEffect(() => { activeRef.current = active; }, [active]);
+
+// Внутри ResizeObserver
+if (activeRef.current) {
+  safeFit();
+}
+```
+
+## Урок для проекта
+При использовании сторонних API с колбэками (ResizeObserver, IntersectionObserver, события на `window`) всегда проверяйте состояние через `Refs`, чтобы избежать проблем с "протухшими" данными в замыканиях.
+\n---\n## File: terminal-core.md\n
+# Fix: Process Status Polling → OSC 133 Event-Driven
+
+## Problem
+Noted Terminal was causing extreme CPU load on `sysmond` (334% CPU) due to constant polling for process status.
+
+### Диагностика (как обнаружили)
+При работе с несколькими терминалами Activity Monitor показывал `sysmond` на 334% CPU. Диагностика через `sample`:
+
+```bash
+sudo sample sysmond 10 -file /tmp/sysmond_dump.txt
+```
+
+Анализ показал главные "горячие" функции:
+```
+4486 samples: _xpc_connection_call_event_handler (XPC запросы)
+2053 samples: sysctl (информация о процессах)
+211 samples: responsibility_get_uniqueid_responsible_for_pid
+204 samples: proc_pidinfo
+```
+
+Это означало что кто-то постоянно бомбит sysmond запросами "дай статус процессов".
+
+### Root Cause
+Three components were polling `terminal:hasRunningProcess` every 2 seconds:
+- `TabBar.tsx` - to show green dot indicator on tabs
+- `Dashboard.tsx` - to show process status on project cards
+- Each call executed `pgrep -P ${pid}` + `ps -p ${childPid}` via shell
+
+With 6 terminals open:
+- 12+ system calls per second
+- Each syscall → sysmond XPC request → sysctl
+- Result: sysmond overloaded
+
+## Solution
+Replace polling with **OSC 133 Shell Integration** (already implemented in main.js).
+
+### How OSC 133 Works
+Shell sends escape codes when commands start/finish:
+```
+\x1b]133;B\x07  → Command started (user pressed Enter)
+\x1b]133;D;0\x07 → Command finished with exit code 0
+```
+
+Main process parses these and:
+1. Stores state in `terminalCommandState` Map (memory)
+2. Emits IPC events: `terminal:command-started`, `terminal:command-finished`
+
+### Changes Made
+
+#### TabBar.tsx
+```javascript
+// BEFORE: Polling every 2 seconds
+const interval = setInterval(async () => {
+  const result = await ipcRenderer.invoke('terminal:hasRunningProcess', tabId);
+}, 2000);
+
+// AFTER: Event-driven
+useEffect(() => {
+  // Initial load from memory (no syscalls)
+  const state = await ipcRenderer.invoke('terminal:getCommandState', tabId);
+
+  // Listen for events (instant, no polling)
+  ipcRenderer.on('terminal:command-started', handleStart);
+  ipcRenderer.on('terminal:command-finished', handleFinish);
+}, []);
+```
+
+#### Dashboard.tsx
+Same pattern as TabBar.tsx.
+
+#### useWorkspaceStore.ts (closeTab)
+```javascript
+// BEFORE: Always called pgrep/ps
+const { hasProcess } = await ipcRenderer.invoke('terminal:hasRunningProcess', tabId);
+
+// AFTER: First check memory, then syscall only if needed
+const state = await ipcRenderer.invoke('terminal:getCommandState', tabId);
+if (state.isRunning) {
+  // Only now call hasRunningProcess to get process name
+  const { processName } = await ipcRenderer.invoke('terminal:hasRunningProcess', tabId);
+}
+```
+
+## Result
+- **0 syscalls** for process status monitoring
+- Instant UI updates (no 2-second delay)
+- sysmond CPU: 0% (was 334%)
+
+## Files Modified
+- `src/renderer/components/Workspace/TabBar.tsx`
+- `src/renderer/components/Dashboard/Dashboard.tsx`
+- `src/renderer/store/useWorkspaceStore.ts`
+
+## Related
+- `terminal-core.md` - OSC 133 protocol specification
+- `terminal-core.md` - Similar event-driven pattern for CWD tracking
+- `ui-ux-stability.md` (section 8) - execSync → execAsync migration
+
+## Критическое правило (см. architecture.md)
+**ЗАПРЕЩЁН polling через `pgrep`/`ps`** для определения статуса процесса. Использовать только:
+- `terminal:getCommandState` (читает из памяти, 0 syscalls)
+- IPC-события `terminal:command-started` / `terminal:command-finished`
