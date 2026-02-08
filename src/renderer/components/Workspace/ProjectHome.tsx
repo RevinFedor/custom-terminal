@@ -148,6 +148,8 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
       tabType: (entry.tab_type || 'terminal') as TabType,
       url: entry.url || undefined,
       pendingAction,
+      claudeSessionId: entry.claude_session_id || undefined,
+      geminiSessionId: entry.gemini_session_id || undefined,
     });
     console.log('[RESTORE] 4. createTab returned tabId:', tabId);
 

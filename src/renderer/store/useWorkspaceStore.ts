@@ -1312,3 +1312,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     return { sidebarOpen: false, openFilePath: null };
   }
 }));
+
+if (typeof window !== 'undefined') {
+  (window as any).useWorkspaceStore = useWorkspaceStore;
+}
