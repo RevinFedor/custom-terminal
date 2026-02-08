@@ -53,7 +53,7 @@ interface ProjectTabItemProps {
   onContextMenu: (e: React.MouseEvent) => void;
   onMiddleClick: () => void;
   onDoubleClick: () => void;
-  onTabDrop?: (tabId: string, sourceProjectId: string) => void; // For dropping terminal tabs
+  onTabDrop?: (tabId: string, sourceProjectId: string, selectedTabIds?: string[]) => void; // For dropping terminal tabs
   isAreaActive?: boolean;
 }
 
@@ -143,9 +143,9 @@ const ProjectTabItem = memo(({
           setIsTabDropTarget(false);
           // Handle terminal tab drop
           if (source.data.type === 'TAB' && onTabDrop) {
-            const tabData = source.data as { id: string; projectId?: string };
+            const tabData = source.data as { id: string; projectId?: string; selectedTabIds?: string[] };
             if (tabData.projectId && tabData.projectId !== projectId) {
-              onTabDrop(tabData.id, tabData.projectId);
+              onTabDrop(tabData.id, tabData.projectId, tabData.selectedTabIds);
             }
           }
         },
@@ -315,7 +315,7 @@ const RestoreLoader = memo(() => (
 ));
 
 function App() {
-  const { view, showDashboard, openProject, openProjects, activeProjectId, closeProject, createTab, createTabAfterCurrent, closeTab, getActiveProject, restoreSession, reorderProjects, moveTabToProject, isRestoring, getSidebarState, setSidebarOpen, setOpenFilePath } = useWorkspaceStore();
+  const { view, showDashboard, openProject, openProjects, activeProjectId, closeProject, createTab, createTabAfterCurrent, closeTab, getActiveProject, restoreSession, reorderProjects, moveTabToProject, moveTabsToProject, isRestoring, getSidebarState, setSidebarOpen, setOpenFilePath } = useWorkspaceStore();
   const { projects, loadProjects, updateProject } = useProjectsStore();
   const { closeFilePreview, filePreview, showToast, incrementAllFontSizes, decrementAllFontSizes, activeArea, setActiveArea, currentView, dragAreaWidth, setDragAreaWidth } = useUIStore();
   const { toggleResearch } = useResearchStore();
@@ -626,6 +626,7 @@ function App() {
         }
 
         if (view === 'workspace' && activeProjectId) {
+          useWorkspaceStore.getState().clearSelection(activeProjectId);
           const activeProject = getActiveProject();
           const currentProject = projects[activeProjectId];
           if (currentProject && activeProject?.activeTabId) {
@@ -890,9 +891,9 @@ function App() {
                     closeProject(projectId);
                   }
                 }}
-                onTabDrop={(tabId, sourceProjectId) => {
-                  moveTabToProject(sourceProjectId, tabId, projectId);
-                  // Switch to target project
+                onTabDrop={(tabId, sourceProjectId, selectedTabIds) => {
+                  const ids = selectedTabIds && selectedTabIds.length > 1 ? selectedTabIds : [tabId];
+                  moveTabsToProject(sourceProjectId, ids, projectId);
                   openProject(projectId, project.path);
                 }}
               />
@@ -940,7 +941,7 @@ function App() {
       {/* Content Area */}
       <div 
         className="flex-1 relative overflow-hidden flex flex-col"
-        onClick={() => setActiveArea('workspace')}
+        onMouseDown={() => setActiveArea('workspace')}
       >
         {view === 'dashboard' ? (
           <Dashboard />

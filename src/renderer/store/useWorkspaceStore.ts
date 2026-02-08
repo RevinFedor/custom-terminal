@@ -112,6 +112,7 @@ interface WorkspaceStore {
   reorderInZone: (projectId: string, zone: 'main' | 'utility', orderedIds: string[]) => void;
   moveTabToZone: (projectId: string, tabId: string, toUtility: boolean, atIndex: number) => void;
   moveTabToProject: (sourceProjectId: string, tabId: string, targetProjectId: string) => void;
+  moveTabsToProject: (sourceProjectId: string, tabIds: string[], targetProjectId: string) => void;
 
   // Update tab cwd
   updateTabCwd: (projectId: string, tabId: string, newCwd: string) => void;
@@ -1020,6 +1021,41 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     saveTabs(targetWorkspace.projectId, targetWorkspace.tabs);
 
     log.tabs(`[moveTabToProject] Moved tab ${tabId} from ${sourceProjectId} to ${targetProjectId}`);
+  },
+
+  moveTabsToProject: (sourceProjectId, tabIds, targetProjectId) => {
+    if (sourceProjectId === targetProjectId || tabIds.length === 0) return;
+
+    const { openProjects } = get();
+    const src = openProjects.get(sourceProjectId);
+    const tgt = openProjects.get(targetProjectId);
+    if (!src || !tgt) return;
+
+    let lastId: string | null = null;
+    for (const tabId of tabIds) {
+      const tab = src.tabs.get(tabId);
+      if (!tab) continue;
+      src.tabs.delete(tabId);
+      tab.isUtility = false;
+      tgt.tabs.set(tabId, tab);
+      lastId = tabId;
+    }
+
+    // Fix active tab in source
+    if (src.activeTabId && !src.tabs.has(src.activeTabId)) {
+      const remaining = Array.from(src.tabs.keys());
+      src.activeTabId = remaining[0] || null;
+    }
+    // Clear selection in source
+    src.selectedTabIds = src.selectedTabIds.filter(id => src.tabs.has(id));
+    // Active in target
+    if (lastId) tgt.activeTabId = lastId;
+
+    set({ openProjects: new Map(openProjects) });
+    saveTabs(src.projectId, src.tabs);
+    saveTabs(tgt.projectId, tgt.tabs);
+
+    log.tabs(`[moveTabsToProject] Moved ${tabIds.length} tabs from ${sourceProjectId} to ${targetProjectId}`);
   },
 
   updateTabCwd: (projectId, tabId, newCwd) => {
