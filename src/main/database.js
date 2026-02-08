@@ -542,6 +542,10 @@ transaction(tabs);
         VALUES (?, ?, ?)
       `).run(sourceSessionId, forkedToSessionId, entryUuidsJson);
       console.log('[DB] Fork marker saved:', { sourceSessionId, forkedToSessionId, entryCount: entryUuids?.length || 0 });
+
+      // Debug: dump all fork_markers in DB
+      const allMarkers = this.db.prepare('SELECT source_session_id, forked_to_session_id FROM fork_markers').all();
+      console.log('[DB] ALL fork_markers after save:', JSON.stringify(allMarkers));
     } catch (e) {
       console.error('[DB] Failed to save fork marker:', e);
     }
@@ -560,6 +564,8 @@ transaction(tabs);
       WHERE forked_to_session_id = ?
       ORDER BY created_at
     `).all(sessionId);
+
+    console.log('[DB] getForkMarkers(' + sessionId?.slice(0, 8) + '...):', rows.length, 'rows');
 
     return rows.map(row => ({
       source_session_id: row.source_session_id,

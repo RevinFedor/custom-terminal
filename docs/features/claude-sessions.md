@@ -43,6 +43,10 @@ WAITING_PROMPT → DEBOUNCE_PROMPT → TAB_SENT → READY
 4. **READY:** Если есть `pendingPrompt`, отправляет его через Safe Write (chunked bracketed paste). См. `knowledge/fix-pty-buffer-overflow.md`.
 
 ## Behavior Specs
+- **Claude Process Monitor:** Виджет на Dashboard для отслеживания всех запущенных в системе процессов Claude CLI.
+    - **In-App:** Процессы, запущенные из терминалов приложения. Отображаются с указанием "Имя Проекта / Имя Таба".
+    - **External:** Процессы, запущенные во внешних терминалах (iTerm, Terminal.app).
+    - **Manual Stop:** Каждая карточка процесса имеет кнопку "Stop" (Square icon), которая отправляет сигнал `kill` процессу.
 - **Clean Export:** При копировании сессии блоки кода заменяются на компактные метки. См. `knowledge/fix-claude-clean-export.md`.
 - **Backtrace Timeline:** История сессии отображается на вертикальном таймлайне с фильтрацией Undo-веток. См. `features/timeline.md`.
 - **Interrupted Recovery:** При аварийном закрытии показывается оверлей. Выбор пользователя сохраняется в БД. См. `knowledge/fix-interrupted-overlay-persistence.md`.

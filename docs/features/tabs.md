@@ -32,6 +32,7 @@
 - **Auto-Scroll:** При перетаскивании таба к левому или правому краю, область вкладок автоматически скроллится. Используется `@atlaskit/pragmatic-drag-and-drop-auto-scroll`.
 - **Stable Resizing:** Размер терминала подстраивается под контейнер через `ResizeObserver`. Реализована защита от stale closure. См. [`knowledge/fix-terminal-resizing.md`](../knowledge/fix-terminal-resizing.md).
 - **Persistent Naming:** Тип команды сохраняется в БД, что предотвращает сброс кастомных имен при перезапуске. См. [`knowledge/fix-tab-rename-on-restart.md`](../knowledge/fix-tab-rename-on-restart.md).
+- **Activity Throttling:** Терминал считается активным только в том случае, если текущий вид (`currentView`) установлен в `'terminal'`. Это предотвращает лишнюю нагрузку и конфликты, когда пользователь находится в Dashboard или полноэкранном редакторе заметок.
 - **Cross-Project Move:** Таб можно перетащить на любую вкладку проекта в Title Bar. 
     - Логика: `moveTabToProject` в `useWorkspaceStore`.
     - PTY процесс сохраняется, меняется только привязка к проекту в БД.
