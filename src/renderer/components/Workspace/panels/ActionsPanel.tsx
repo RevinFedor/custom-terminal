@@ -21,8 +21,10 @@ interface ActionsPanelProps {
 
 export default function ActionsPanel({ activeTabId }: ActionsPanelProps) {
   const { showToast, docPrompt, terminalSelection } = useUIStore();
-  const { activeProjectId, createTab, getActiveProject, switchTab, getSelectedTabs, clearSelection } = useWorkspaceStore();
+  const { activeProjectId, createTab, closeTab, getActiveProject, switchTab, getSelectedTabs, clearSelection } = useWorkspaceStore();
   const [isUpdatingDocs, setIsUpdatingDocs] = useState(false);
+  const cancelledRef = useRef(false);
+  const docsGeminiTabIdRef = useRef<string | null>(null);
   const [actions, setActions] = useState<Action[]>([]);
   const [isScissorsHovered, setIsScissorsHovered] = useState(false);
   
@@ -154,7 +156,18 @@ export default function ActionsPanel({ activeTabId }: ActionsPanelProps) {
     });
   };
 
-  // Update Docs feature - exports Claude session and opens Gemini in new green tab
+  // Cancel Update Docs — close created Gemini tab if any
+  const handleCancelUpdateDocs = useCallback(() => {
+    cancelledRef.current = true;
+    if (docsGeminiTabIdRef.current && activeProjectId) {
+      closeTab(activeProjectId, docsGeminiTabIdRef.current);
+      docsGeminiTabIdRef.current = null;
+    }
+    setIsUpdatingDocs(false);
+    showToast('Отменено', 'info');
+  }, [activeProjectId, closeTab, showToast]);
+
+  // Update Docs feature - exports Claude session and opens Gemini in new blue tab
   const handleUpdateDocs = async () => {
     if (!activeTabId || !activeProjectId) {
       showToast('No active terminal tab', 'error');
@@ -167,6 +180,8 @@ export default function ActionsPanel({ activeTabId }: ActionsPanelProps) {
       return;
     }
 
+    cancelledRef.current = false;
+    docsGeminiTabIdRef.current = null;
     setIsUpdatingDocs(true);
     showToast('Exporting Claude session...', 'info');
 
@@ -181,6 +196,7 @@ export default function ActionsPanel({ activeTabId }: ActionsPanelProps) {
         projectPath: workingDir
       });
 
+      if (cancelledRef.current) return;
       if (!exportResult.success) {
         throw new Error(exportResult.error || 'Export failed');
       }
@@ -205,6 +221,8 @@ export default function ActionsPanel({ activeTabId }: ActionsPanelProps) {
         throw new Error('Documentation prompt is empty');
       }
 
+      if (cancelledRef.current) return;
+
       // 4. Generate tab name with index (docs-gemini-01, docs-gemini-02, etc.)
       const existingDocsTabs = Array.from(activeProject.tabs.values())
         .filter(t => t.name.startsWith('docs-gemini-'))
@@ -212,23 +230,28 @@ export default function ActionsPanel({ activeTabId }: ActionsPanelProps) {
       const tabIndex = String(existingDocsTabs + 1).padStart(2, '0');
       const tabName = `docs-gemini-${tabIndex}`;
 
-      // 5. Create new green tab for Gemini (in main zone, not utility)
+      // 5. Create new blue (gemini) tab (in main zone, not utility)
       const newTabId = await createTab(
         activeProjectId,
         tabName,
         workingDir, // Use same cwd as source terminal
-        { color: 'green', isUtility: false }
+        { color: 'gemini', isUtility: false }
       );
 
       if (!newTabId) {
         throw new Error('Failed to create new tab');
       }
 
+      docsGeminiTabIdRef.current = newTabId;
+
+      if (cancelledRef.current) return;
+
       // 6. Don't switch tab - let user continue working in current terminal
-      // New tab runs in background
 
       // 7. Wait for terminal to initialize
       await new Promise(resolve => setTimeout(resolve, 500));
+
+      if (cancelledRef.current) return;
 
       // 8. Save prompt to temp file (avoids shell escaping issues with special chars)
       const promptResult = await ipcRenderer.invoke('docs:save-prompt-temp', {
@@ -241,17 +264,24 @@ export default function ActionsPanel({ activeTabId }: ActionsPanelProps) {
         throw new Error(promptResult.error || 'Failed to save prompt file');
       }
 
+      if (cancelledRef.current) return;
+
       // 9. Start Gemini
       await ipcRenderer.invoke('terminal:executeCommandAsync', newTabId, 'gemini');
 
       // 10. Wait for Gemini to be ready (detect "type your message" in output)
       const geminiReady = await waitForGeminiReady(newTabId, 30000);
+
+      if (cancelledRef.current) return;
+
       if (!geminiReady) {
         throw new Error('Timeout waiting for Gemini to start');
       }
 
       // Small delay after ready signal
       await new Promise(resolve => setTimeout(resolve, 300));
+
+      if (cancelledRef.current) return;
 
       // 11. Read prompt file and send directly to terminal (bypasses shell escaping)
       const promptFileContent = await ipcRenderer.invoke('file:read', promptResult.promptFile);
@@ -260,19 +290,21 @@ export default function ActionsPanel({ activeTabId }: ActionsPanelProps) {
         ipcRenderer.send('terminal:input', newTabId, promptFileContent.content + '\r');
       }
 
-      // 14. Cleanup temp prompt file (keep exported session - Gemini needs to read it!)
+      // 12. Cleanup temp prompt file (keep exported session - Gemini needs to read it!)
       await ipcRenderer.invoke('docs:cleanup-temp', {
         exportedPath: null,  // Don't delete - Gemini reads this file
         promptPath: promptResult.promptFile
       });
 
+      docsGeminiTabIdRef.current = null;
       showToast('Gemini started with documentation prompt', 'success');
 
     } catch (error: any) {
+      if (cancelledRef.current) return;
       console.error('[UpdateDocs] Error:', error);
       showToast(error.message || 'Update docs failed', 'error');
     } finally {
-      setIsUpdatingDocs(false);
+      if (!cancelledRef.current) setIsUpdatingDocs(false);
     }
   };
 
@@ -292,107 +324,74 @@ export default function ActionsPanel({ activeTabId }: ActionsPanelProps) {
       return;
     }
 
+    cancelledRef.current = false;
+    docsGeminiTabIdRef.current = null;
     setIsUpdatingDocs(true);
     showToast('Using terminal selection...', 'info');
 
     try {
-      // 1. Get actual cwd of current terminal
       const tabCwd = await ipcRenderer.invoke('terminal:getCwd', activeTabId);
       const workingDir = tabCwd || activeProject.projectPath;
 
-      // 2. Get documentation prompt
       let promptContent: string;
       if (docPrompt.useFile) {
-        const promptResult = await ipcRenderer.invoke('docs:read-prompt-file', {
-          filePath: docPrompt.filePath
-        });
-        if (!promptResult.success) {
-          throw new Error(promptResult.error || 'Failed to read prompt file');
-        }
+        const promptResult = await ipcRenderer.invoke('docs:read-prompt-file', { filePath: docPrompt.filePath });
+        if (!promptResult.success) throw new Error(promptResult.error || 'Failed to read prompt file');
         promptContent = promptResult.content;
       } else {
         promptContent = docPrompt.inlineContent;
       }
+      if (!promptContent) throw new Error('Documentation prompt is empty');
 
-      if (!promptContent) {
-        throw new Error('Documentation prompt is empty');
-      }
+      if (cancelledRef.current) return;
 
-      // 3. Generate tab name with index
       const existingDocsTabs = Array.from(activeProject.tabs.values())
-        .filter(t => t.name.startsWith('docs-gemini-'))
-        .length;
-      const tabIndex = String(existingDocsTabs + 1).padStart(2, '0');
-      const tabName = `docs-gemini-${tabIndex}`;
+        .filter(t => t.name.startsWith('docs-gemini-')).length;
+      const tabName = `docs-gemini-${String(existingDocsTabs + 1).padStart(2, '0')}`;
 
-      // 4. Create new green tab for Gemini
-      const newTabId = await createTab(
-        activeProjectId,
-        tabName,
-        workingDir,
-        { color: 'green', isUtility: false }
-      );
+      const newTabId = await createTab(activeProjectId, tabName, workingDir, { color: 'gemini', isUtility: false });
+      if (!newTabId) throw new Error('Failed to create new tab');
+      docsGeminiTabIdRef.current = newTabId;
 
-      if (!newTabId) {
-        throw new Error('Failed to create new tab');
-      }
+      if (cancelledRef.current) return;
 
-      // 5. Wait for terminal to initialize
       await new Promise(resolve => setTimeout(resolve, 500));
 
-      // 6. Save selection to temp file (same pattern as Claude session export)
-      const selectionResult = await ipcRenderer.invoke('docs:save-selection', {
-        projectPath: workingDir,
-        selectionText: terminalSelection
-      });
-
-      if (!selectionResult.success) {
-        throw new Error(selectionResult.error || 'Failed to save selection file');
-      }
+      const selectionResult = await ipcRenderer.invoke('docs:save-selection', { projectPath: workingDir, selectionText: terminalSelection });
+      if (!selectionResult.success) throw new Error(selectionResult.error || 'Failed to save selection file');
 
       showToast('Selection saved, preparing Gemini...', 'info');
 
-      // 7. Save prompt with path to selection file (same as Claude export flow)
-      const promptResult = await ipcRenderer.invoke('docs:save-prompt-temp', {
-        projectPath: workingDir,
-        promptContent,
-        exportedFilePath: selectionResult.selectionPath
-      });
+      if (cancelledRef.current) return;
 
-      if (!promptResult.success) {
-        throw new Error(promptResult.error || 'Failed to save prompt file');
-      }
+      const promptResult = await ipcRenderer.invoke('docs:save-prompt-temp', { projectPath: workingDir, promptContent, exportedFilePath: selectionResult.selectionPath });
+      if (!promptResult.success) throw new Error(promptResult.error || 'Failed to save prompt file');
 
-      // 8. Start Gemini
       await ipcRenderer.invoke('terminal:executeCommandAsync', newTabId, 'gemini');
 
-      // 9. Wait for Gemini to be ready
       const geminiReady = await waitForGeminiReady(newTabId, 30000);
-      if (!geminiReady) {
-        throw new Error('Timeout waiting for Gemini to start');
-      }
+      if (cancelledRef.current) return;
+      if (!geminiReady) throw new Error('Timeout waiting for Gemini to start');
 
       await new Promise(resolve => setTimeout(resolve, 300));
+      if (cancelledRef.current) return;
 
-      // 10. Read prompt file and send to terminal
       const promptFileContent = await ipcRenderer.invoke('file:read', promptResult.promptFile);
       if (promptFileContent.success) {
         ipcRenderer.send('terminal:input', newTabId, promptFileContent.content + '\r');
       }
 
-      // 11. Cleanup temp prompt file (keep selection file - Gemini needs to read it!)
-      await ipcRenderer.invoke('docs:cleanup-temp', {
-        exportedPath: null,  // Don't delete selection file - Gemini reads it
-        promptPath: promptResult.promptFile
-      });
+      await ipcRenderer.invoke('docs:cleanup-temp', { exportedPath: null, promptPath: promptResult.promptFile });
 
+      docsGeminiTabIdRef.current = null;
       showToast('Gemini started with selection', 'success');
 
     } catch (error: any) {
+      if (cancelledRef.current) return;
       console.error('[UpdateDocsSelection] Error:', error);
       showToast(error.message || 'Update docs failed', 'error');
     } finally {
-      setIsUpdatingDocs(false);
+      if (!cancelledRef.current) setIsUpdatingDocs(false);
     }
   };
 
@@ -425,108 +424,75 @@ export default function ActionsPanel({ activeTabId }: ActionsPanelProps) {
       return;
     }
 
+    cancelledRef.current = false;
+    docsGeminiTabIdRef.current = null;
     setIsUpdatingDocs(true);
     showToast('Using clipboard content...', 'info');
 
     try {
-      // 1. Get actual cwd of current terminal
       const tabCwd = await ipcRenderer.invoke('terminal:getCwd', activeTabId);
       const workingDir = tabCwd || activeProject.projectPath;
 
-      // 2. Get documentation prompt
       let promptContent: string;
       if (docPrompt.useFile) {
-        const promptResult = await ipcRenderer.invoke('docs:read-prompt-file', {
-          filePath: docPrompt.filePath
-        });
-        if (!promptResult.success) {
-          throw new Error(promptResult.error || 'Failed to read prompt file');
-        }
+        const promptResult = await ipcRenderer.invoke('docs:read-prompt-file', { filePath: docPrompt.filePath });
+        if (!promptResult.success) throw new Error(promptResult.error || 'Failed to read prompt file');
         promptContent = promptResult.content;
       } else {
         promptContent = docPrompt.inlineContent;
       }
+      if (!promptContent) throw new Error('Documentation prompt is empty');
 
-      if (!promptContent) {
-        throw new Error('Documentation prompt is empty');
-      }
+      if (cancelledRef.current) return;
 
-      // 3. Generate tab name with index
       const existingDocsTabs = Array.from(activeProject.tabs.values())
-        .filter(t => t.name.startsWith('docs-gemini-'))
-        .length;
-      const tabIndex = String(existingDocsTabs + 1).padStart(2, '0');
-      const tabName = `docs-gemini-${tabIndex}`;
+        .filter(t => t.name.startsWith('docs-gemini-')).length;
+      const tabName = `docs-gemini-${String(existingDocsTabs + 1).padStart(2, '0')}`;
 
-      // 4. Create new green tab for Gemini
-      const newTabId = await createTab(
-        activeProjectId,
-        tabName,
-        workingDir,
-        { color: 'green', isUtility: false }
-      );
+      const newTabId = await createTab(activeProjectId, tabName, workingDir, { color: 'gemini', isUtility: false });
+      if (!newTabId) throw new Error('Failed to create new tab');
+      docsGeminiTabIdRef.current = newTabId;
 
-      if (!newTabId) {
-        throw new Error('Failed to create new tab');
-      }
+      if (cancelledRef.current) return;
 
-      // 5. Wait for terminal to initialize
       await new Promise(resolve => setTimeout(resolve, 500));
 
-      // 6. Save clipboard content to temp file
-      const selectionResult = await ipcRenderer.invoke('docs:save-selection', {
-        projectPath: workingDir,
-        selectionText: clipboardText
-      });
-
-      if (!selectionResult.success) {
-        throw new Error(selectionResult.error || 'Failed to save clipboard file');
-      }
+      const selectionResult = await ipcRenderer.invoke('docs:save-selection', { projectPath: workingDir, selectionText: clipboardText });
+      if (!selectionResult.success) throw new Error(selectionResult.error || 'Failed to save clipboard file');
 
       showToast('Clipboard saved, preparing Gemini...', 'info');
 
-      // 7. Save prompt with path to clipboard file
-      const promptResult = await ipcRenderer.invoke('docs:save-prompt-temp', {
-        projectPath: workingDir,
-        promptContent,
-        exportedFilePath: selectionResult.selectionPath
-      });
+      if (cancelledRef.current) return;
 
-      if (!promptResult.success) {
-        throw new Error(promptResult.error || 'Failed to save prompt file');
-      }
+      const promptResult = await ipcRenderer.invoke('docs:save-prompt-temp', { projectPath: workingDir, promptContent, exportedFilePath: selectionResult.selectionPath });
+      if (!promptResult.success) throw new Error(promptResult.error || 'Failed to save prompt file');
 
-      // 8. Start Gemini
       await ipcRenderer.invoke('terminal:executeCommandAsync', newTabId, 'gemini');
 
-      // 9. Wait for Gemini to be ready
       const geminiReady = await waitForGeminiReady(newTabId, 30000);
-      if (!geminiReady) {
-        throw new Error('Timeout waiting for Gemini to start');
-      }
+      if (cancelledRef.current) return;
+      if (!geminiReady) throw new Error('Timeout waiting for Gemini to start');
 
       await new Promise(resolve => setTimeout(resolve, 300));
+      if (cancelledRef.current) return;
 
-      // 10. Read prompt file and send to terminal
       const promptFileContent = await ipcRenderer.invoke('file:read', promptResult.promptFile);
       if (promptFileContent.success) {
         ipcRenderer.send('terminal:input', newTabId, promptFileContent.content + '\r');
       }
 
-      // 11. Cleanup temp prompt file
-      await ipcRenderer.invoke('docs:cleanup-temp', {
-        exportedPath: null,
-        promptPath: promptResult.promptFile
-      });
+      await ipcRenderer.invoke('docs:cleanup-temp', { exportedPath: null, promptPath: promptResult.promptFile });
 
+      docsGeminiTabIdRef.current = null;
       const sizeKB = Math.round(clipboardText.length / 1024);
       showToast(`Gemini started with clipboard (${sizeKB}KB)`, 'success');
 
     } catch (error: any) {
+      if (cancelledRef.current) return;
       console.error('[UpdateDocsClipboard] Error:', error);
       showToast(error.message || 'Update docs failed', 'error');
     } finally {
-      setIsUpdatingDocs(false);
+      if (!cancelledRef.current) setIsUpdatingDocs(false);
     }
   };
 
@@ -670,67 +636,78 @@ export default function ActionsPanel({ activeTabId }: ActionsPanelProps) {
         <div className="mb-4">
           {!isMultiSelect && (
             <div className="flex items-center gap-2 mb-2 px-1">
-              <span className="text-[9px] uppercase font-semibold text-green-500">System</span>
+              <span className="text-[9px] uppercase font-semibold text-blue-500">System</span>
               <div className="flex-1 h-px bg-[#333]" />
             </div>
           )}
 
           {!isMultiSelect && (
-            <button
-              className={`w-full bg-green-900/30 border border-green-700/30 text-green-400 p-3 text-left cursor-pointer rounded-lg text-xs flex items-center gap-2 hover:bg-green-900/50 hover:border-green-600/40 transition-colors focus:outline-none ${
-                isUpdatingDocs ? 'opacity-50 cursor-not-allowed' : ''
-              }`}
-              onClick={handleUpdateDocs}
-              disabled={isUpdatingDocs}
-            >
-              <span className="text-base">📚</span>
-              <div className="flex-1">
-                <div className="font-medium">Update Docs</div>
-                <div className="text-[10px] text-green-600 mt-0.5">
-                  {isUpdatingDocs ? 'Processing...' : 'Export session → Gemini analysis'}
+            <div className="flex flex-col gap-1">
+              <button
+                className={`w-full bg-blue-900/30 border border-blue-700/30 text-blue-400 p-3 text-left cursor-pointer rounded-lg text-xs flex items-center gap-2 hover:bg-blue-900/50 hover:border-blue-600/40 transition-colors focus:outline-none ${
+                  isUpdatingDocs ? 'opacity-50 cursor-not-allowed' : ''
+                }`}
+                onClick={handleUpdateDocs}
+                disabled={isUpdatingDocs}
+              >
+                <span className="text-base">📚</span>
+                <div className="flex-1">
+                  <div className="font-medium">Update Docs</div>
+                  <div className="text-[10px] text-blue-600 mt-0.5">
+                    {isUpdatingDocs ? 'Processing...' : 'Export session → Gemini analysis'}
+                  </div>
                 </div>
-              </div>
-              {/* Selection button - appears when text is selected in terminal */}
-              {terminalSelection && !isUpdatingDocs && (
-                <div
-                  className="relative z-10 text-white text-[9px] px-2 py-1.5 rounded flex items-center gap-1 cursor-pointer select-none"
-                  style={{
-                    backgroundColor: isScissorsHovered ? '#3b82f6' : '#2563eb',
-                    transform: isScissorsHovered ? 'scale(1.02)' : 'scale(1)',
-                    boxShadow: isScissorsHovered ? '0 2px 6px rgba(59, 130, 246, 0.25)' : 'none',
-                    transition: 'all 0.15s ease'
-                  }}
-                  onClick={handleUpdateDocsWithSelection}
-                  onMouseDown={(e) => e.stopPropagation()}
-                  onMouseEnter={() => setIsScissorsHovered(true)}
-                  onMouseLeave={() => setIsScissorsHovered(false)}
-                  title={`Use selection (${terminalSelection.length} chars)`}
-                  role="button"
-                  tabIndex={0}
+                {/* Selection button - appears when text is selected in terminal */}
+                {terminalSelection && !isUpdatingDocs && (
+                  <div
+                    className="relative z-10 text-white text-[9px] px-2 py-1.5 rounded flex items-center gap-1 cursor-pointer select-none"
+                    style={{
+                      backgroundColor: isScissorsHovered ? '#3b82f6' : '#2563eb',
+                      transform: isScissorsHovered ? 'scale(1.02)' : 'scale(1)',
+                      boxShadow: isScissorsHovered ? '0 2px 6px rgba(59, 130, 246, 0.25)' : 'none',
+                      transition: 'all 0.15s ease'
+                    }}
+                    onClick={handleUpdateDocsWithSelection}
+                    onMouseDown={(e) => e.stopPropagation()}
+                    onMouseEnter={() => setIsScissorsHovered(true)}
+                    onMouseLeave={() => setIsScissorsHovered(false)}
+                    title={`Use selection (${terminalSelection.length} chars)`}
+                    role="button"
+                    tabIndex={0}
+                  >
+                    <span className="text-[10px]">✂️</span>
+                    <span className="font-medium">{terminalSelection.length}</span>
+                  </div>
+                )}
+                {/* Clipboard button - use content from clipboard */}
+                {!isUpdatingDocs && (
+                  <div
+                    className="relative z-10 text-white text-[9px] px-2 py-1.5 rounded flex items-center gap-1 cursor-pointer select-none transition-all"
+                    style={{
+                      backgroundColor: '#7c3aed',
+                    }}
+                    onMouseEnter={(e) => e.currentTarget.style.backgroundColor = '#8b5cf6'}
+                    onMouseLeave={(e) => e.currentTarget.style.backgroundColor = '#7c3aed'}
+                    onClick={handleUpdateDocsWithClipboard}
+                    onMouseDown={(e) => e.stopPropagation()}
+                    title="Use clipboard content"
+                    role="button"
+                    tabIndex={0}
+                  >
+                    <span className="text-[10px]">📋</span>
+                  </div>
+                )}
+              </button>
+              {/* Cancel button — only visible during processing */}
+              {isUpdatingDocs && (
+                <button
+                  className="w-full bg-red-900/20 border border-red-700/20 text-red-400 p-2 text-center cursor-pointer rounded-lg text-[11px] hover:bg-red-900/40 hover:border-red-600/30 transition-colors focus:outline-none"
+                  onClick={handleCancelUpdateDocs}
                 >
-                  <span className="text-[10px]">✂️</span>
-                  <span className="font-medium">{terminalSelection.length}</span>
-                </div>
+                  Отменить
+                </button>
               )}
-              {/* Clipboard button - use content from clipboard */}
-              {!isUpdatingDocs && (
-                <div
-                  className="relative z-10 text-white text-[9px] px-2 py-1.5 rounded flex items-center gap-1 cursor-pointer select-none transition-all"
-                  style={{
-                    backgroundColor: '#7c3aed',
-                  }}
-                  onMouseEnter={(e) => e.currentTarget.style.backgroundColor = '#8b5cf6'}
-                  onMouseLeave={(e) => e.currentTarget.style.backgroundColor = '#7c3aed'}
-                  onClick={handleUpdateDocsWithClipboard}
-                  onMouseDown={(e) => e.stopPropagation()}
-                  title="Use clipboard content"
-                  role="button"
-                  tabIndex={0}
-                >
-                  <span className="text-[10px]">📋</span>
-                </div>
-              )}
-            </button>
+            </div>
           )}
 
           {/* Copy Session - export Claude session */}
