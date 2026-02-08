@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useWorkspaceStore, TabColor, TabType, PendingAction } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import { useUIStore } from '../../store/useUIStore';
@@ -94,6 +94,27 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
   const [syncName, setSyncName] = useState<string | null>(null);
   const [history, setHistory] = useState<TabHistoryEntry[]>([]);
   const [hoveredHistoryId, setHoveredHistoryId] = useState<number | null>(null);
+  const [isCmdPressed, setIsCmdPressed] = useState(false);
+
+  // CMD key tracking for hover previews
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Meta') setIsCmdPressed(true);
+    };
+    const handleKeyUp = (e: KeyboardEvent) => {
+      if (e.key === 'Meta') setIsCmdPressed(false);
+    };
+    const handleBlur = () => setIsCmdPressed(false);
+
+    window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('keyup', handleKeyUp);
+    window.addEventListener('blur', handleBlur);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('keyup', handleKeyUp);
+      window.removeEventListener('blur', handleBlur);
+    };
+  }, []);
 
   useEffect(() => {
     const handleSync = (e: any) => {
@@ -202,7 +223,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
   const groupedHistory = groupByTime(history);
 
   return (
-    <div className="flex-1 bg-bg-main p-6 overflow-y-auto">
+    <div className="flex-1 bg-bg-main p-6 overflow-y-auto overflow-x-hidden">
       {/* Project Header */}
       <div className="mb-6">
         <h1 className="text-xl text-white font-medium mb-1">{displayName}</h1>
@@ -352,9 +373,9 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
                         </span>
                       </div>
 
-                      {/* Hover Popover with invisible bridge */}
+                      {/* CMD+Hover Popover with invisible bridge */}
                       <AnimatePresence>
-                        {hoveredHistoryId === entry.id && (
+                        {isCmdPressed && hoveredHistoryId === entry.id && (
                           <motion.div
                             initial={{ opacity: 0, y: 4 }}
                             animate={{ opacity: 1, y: 0 }}

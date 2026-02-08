@@ -7,6 +7,7 @@ import { draggable, dropTargetForElements, monitorForElements } from '@atlaskit/
 import { attachClosestEdge, extractClosestEdge, type Edge } from '@atlaskit/pragmatic-drag-and-drop-hitbox/closest-edge';
 import { combine } from '@atlaskit/pragmatic-drag-and-drop/combine';
 import { autoScrollForElements } from '@atlaskit/pragmatic-drag-and-drop-auto-scroll/element';
+import { setCustomNativeDragPreview } from '@atlaskit/pragmatic-drag-and-drop/element/set-custom-native-drag-preview';
 import { ChevronDown, Globe } from 'lucide-react';
 
 const { ipcRenderer } = window.require('electron');
@@ -35,6 +36,7 @@ type DragData = {
   zone: 'main' | 'utility';
   index: number;
   projectId?: string; // For cross-project drag
+  selectedTabIds?: string[]; // For multi-tab drag
 };
 
 const TAB_COLORS: { color: TabColor; bgColor: string; borderColor: string; label: string }[] = [
@@ -181,6 +183,9 @@ interface TabItemProps {
   commandType?: string; // Type of command running (devServer, claude, gemini, generic)
   onRestart?: (tabId: string) => void; // Restart process (Ctrl+C, Up, Enter)
   isInterrupted?: boolean; // Tab has an interrupted AI session
+  draggingGroupIds?: string[]; // IDs of tabs being dragged as a group
+  onHoverChange?: (hovering: boolean, rect?: DOMRect) => void; // CMD+hover notes preview
+  showNotesIndicator?: boolean; // CMD held + cursor in TabBar = highlight tabs with notes
 }
 
 const TabItem = memo(({
@@ -206,6 +211,9 @@ const TabItem = memo(({
   commandType,
   onRestart,
   isInterrupted = false,
+  draggingGroupIds = [],
+  onHoverChange,
+  showNotesIndicator = false,
 }: TabItemProps) => {
   const ref = useRef<HTMLDivElement>(null);
   const [closestEdge, setClosestEdge] = useState<Edge | null>(null);
@@ -220,7 +228,43 @@ const TabItem = memo(({
     return combine(
       draggable({
         element,
-        getInitialData: (): DragData => ({ type: 'TAB', id: tab.id, zone, index, projectId }),
+        getInitialData: (): DragData => {
+          const ws = useWorkspaceStore.getState().openProjects.get(projectId);
+          const sel = ws?.selectedTabIds || [];
+          const tabIds = sel.includes(tab.id) ? sel : [tab.id];
+          return { type: 'TAB', id: tab.id, zone, index, projectId, selectedTabIds: tabIds };
+        },
+        onGenerateDragPreview: ({ nativeSetDragImage }) => {
+          const ws = useWorkspaceStore.getState().openProjects.get(projectId);
+          const sel = ws?.selectedTabIds || [];
+          const count = sel.includes(tab.id) ? sel.length : 1;
+          if (count <= 1) return;
+
+          setCustomNativeDragPreview({
+            nativeSetDragImage,
+            render({ container }) {
+              Object.assign(container.style, {
+                display: 'flex', alignItems: 'center', gap: '6px',
+                padding: '6px 12px', backgroundColor: '#1e1e1e',
+                border: '1px solid #555', borderRadius: '6px',
+                color: '#fff', fontSize: '13px', fontFamily: 'system-ui',
+                whiteSpace: 'nowrap', boxShadow: '0 4px 12px rgba(0,0,0,0.4)',
+              });
+              const name = document.createElement('span');
+              name.textContent = tab.name;
+              container.appendChild(name);
+              const badge = document.createElement('span');
+              badge.textContent = '+' + (count - 1);
+              Object.assign(badge.style, {
+                display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+                minWidth: '20px', height: '20px', padding: '0 6px',
+                borderRadius: '10px', backgroundColor: '#3b82f6',
+                color: '#fff', fontSize: '11px', fontWeight: '600',
+              });
+              container.appendChild(badge);
+            },
+          });
+        },
         onDragStart: () => setIsDragging(true),
         onDrop: () => setIsDragging(false),
       }),
@@ -350,7 +394,7 @@ const TabItem = memo(({
     // Horizontal tabs: border on top. Vertical tabs: border on left
     borderTop: isHorizontal ? getTopBorder() : 'none',
     borderLeft: !isHorizontal ? getLeftBorder() : 'none',
-    opacity: isDragging ? 0.5 : 1,
+    opacity: isDragging ? 0.5 : (draggingGroupIds.includes(tab.id) && !isDragging ? 0.5 : 1),
     transition: 'color 0.15s ease, background-color 0.15s ease',
   };
 
@@ -358,12 +402,21 @@ const TabItem = memo(({
     <div
       ref={ref}
       className="group"
+      data-tab-item
       style={tabStyle}
       onClick={(e) => onSwitch(e)}
       onDoubleClick={onDoubleClick}
       onContextMenu={onContextMenu}
-      onMouseEnter={() => setIsHovered(true)}
-      onMouseLeave={() => setIsHovered(false)}
+      onMouseEnter={() => {
+        setIsHovered(true);
+        if (onHoverChange && ref.current) {
+          onHoverChange(true, ref.current.getBoundingClientRect());
+        }
+      }}
+      onMouseLeave={() => {
+        setIsHovered(false);
+        onHoverChange?.(false);
+      }}
       onAuxClick={(e) => {
         // Middle mouse button (button === 1) closes tab
         if (e.button === 1) {
@@ -398,6 +451,18 @@ const TabItem = memo(({
         <span className="select-none whitespace-nowrap overflow-hidden text-ellipsis flex items-center gap-1" style={{ flex: isHorizontal ? 'none' : 1 }}>
           {tab.tabType === 'browser' && <Globe size={12} className="flex-shrink-0 opacity-60" />}
           {tab.name}
+          {showNotesIndicator && (
+            <span
+              style={{
+                width: '5px',
+                height: '5px',
+                borderRadius: '50%',
+                backgroundColor: '#DA7756',
+                flexShrink: 0,
+                opacity: 0.9,
+              }}
+            />
+          )}
         </span>
       )}
 
@@ -622,6 +687,12 @@ function TabBar({ projectId }: TabBarProps) {
   const inputRef = useRef<HTMLInputElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
 
+  // CMD+hover notes preview
+  const [isCmdPressed, setIsCmdPressed] = useState(false);
+  const [notesPreview, setNotesPreview] = useState<{ tabId: string; rect: DOMRect } | null>(null);
+  const isCmdPressedRef = useRef(false); // Ref to avoid stale closures
+  const [isMouseInTabBar, setIsMouseInTabBar] = useState(false);
+
   const workspace = openProjects.get(projectId);
   const project = projects[projectId];
 
@@ -638,6 +709,45 @@ function TabBar({ projectId }: TabBarProps) {
       switchTab(projectId, tabId);
     }
   };
+
+  // CMD+hover: track Meta key globally
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Meta') {
+        setIsCmdPressed(true);
+        isCmdPressedRef.current = true;
+      }
+    };
+    const handleKeyUp = (e: KeyboardEvent) => {
+      if (e.key === 'Meta') {
+        setIsCmdPressed(false);
+        isCmdPressedRef.current = false;
+      }
+    };
+    // Reset on window blur (user CMD+Tab'd away, keyup never fires)
+    const handleBlur = () => {
+      setIsCmdPressed(false);
+      isCmdPressedRef.current = false;
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('keyup', handleKeyUp);
+    window.addEventListener('blur', handleBlur);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('keyup', handleKeyUp);
+      window.removeEventListener('blur', handleBlur);
+    };
+  }, []);
+
+  // CMD+hover: callback for tab hover changes
+  const handleTabHoverChange = useCallback((tabId: string, hovering: boolean, rect?: DOMRect) => {
+    if (hovering && rect) {
+      setNotesPreview({ tabId, rect });
+    } else {
+      setNotesPreview(prev => prev?.tabId === tabId ? null : prev);
+    }
+  }, []);
 
   // OSC 133 Event-driven process status (replaces polling)
   // Initial load + listen for command start/finish events
@@ -867,14 +977,25 @@ function TabBar({ projectId }: TabBarProps) {
 
   // Track if dragging is in progress
   const [isDraggingTab, setIsDraggingTab] = useState(false);
+  const [draggingGroupIds, setDraggingGroupIds] = useState<string[]>([]);
+  const dropCooldownRef = useRef(false);
 
   // Monitor drag start/end for utils dropdown behavior
   useEffect(() => {
     return monitorForElements({
       canMonitor: ({ source }) => source.data.type === 'TAB',
-      onDragStart: () => setIsDraggingTab(true),
+      onDragStart: ({ source }) => {
+        setIsDraggingTab(true);
+        const data = source.data as DragData;
+        if (data.selectedTabIds && data.selectedTabIds.length > 1) {
+          setDraggingGroupIds(data.selectedTabIds);
+        }
+      },
       onDrop: () => {
         setIsDraggingTab(false);
+        setDraggingGroupIds([]);
+        dropCooldownRef.current = true;
+        setTimeout(() => { dropCooldownRef.current = false; }, 100);
         // Close Utils if it was opened by hover (not manually)
         if (utilityExpanded && !utilityOpenedManually) {
           setUtilityExpanded(false);
@@ -909,6 +1030,25 @@ function TabBar({ projectId }: TabBarProps) {
       document.removeEventListener('click', handleClickOutside);
     };
   }, [utilityExpanded, isDraggingTab]);
+
+  // Clear tab selection on click outside TabBar
+  useEffect(() => {
+    if (selectedTabIds.length <= 1) return;
+
+    const handleMouseDown = (e: MouseEvent) => {
+      if (isDraggingTab) return;
+      if (dropCooldownRef.current) return;
+      const tabBarEl = scrollContainerRef.current?.parentElement;
+      if (tabBarEl && tabBarEl.contains(e.target as Node)) return;
+      if ((e.target as HTMLElement).closest('[data-tab-context-menu]')) return;
+      if ((e.target as HTMLElement).closest('[data-utils-dropdown]')) return;
+      if ((e.target as HTMLElement).closest('[data-utils-button]')) return;
+      clearSelection(projectId);
+    };
+
+    document.addEventListener('mousedown', handleMouseDown);
+    return () => document.removeEventListener('mousedown', handleMouseDown);
+  }, [selectedTabIds.length, isDraggingTab, projectId, clearSelection]);
 
   // Check if active tab is in utility zone
   const activeTabInUtils = currentView === 'terminal' && utilityTabs.some(t => t.id === workspace.activeTabId);
@@ -980,6 +1120,26 @@ function TabBar({ projectId }: TabBarProps) {
     });
   }, []);
 
+  // Auto-scroll to active tab when it changes (e.g. new tab created off-screen)
+  useEffect(() => {
+    const scrollContainer = scrollContainerRef.current;
+    if (!scrollContainer || !workspace.activeTabId) return;
+
+    // Small delay to let DOM update with the new tab
+    const timer = setTimeout(() => {
+      const activeIndex = mainTabs.findIndex(t => t.id === workspace.activeTabId);
+      if (activeIndex === -1) return;
+
+      const tabElements = scrollContainer.querySelectorAll('[data-tab-item]');
+      const activeEl = tabElements[activeIndex] as HTMLElement | undefined;
+      if (activeEl) {
+        activeEl.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'nearest' });
+      }
+    }, 50);
+
+    return () => clearTimeout(timer);
+  }, [workspace.activeTabId, mainTabs.length]);
+
   // Convert vertical scroll to horizontal (non-passive to allow preventDefault)
   useEffect(() => {
     const scrollContainer = scrollContainerRef.current;
@@ -999,7 +1159,11 @@ function TabBar({ projectId }: TabBarProps) {
   return (
     <>
       {/* Single row TabBar */}
-      <div className="h-[30px] bg-panel flex items-stretch">
+      <div
+        className="h-[30px] bg-panel flex items-stretch"
+        onMouseEnter={() => setIsMouseInTabBar(true)}
+        onMouseLeave={() => setIsMouseInTabBar(false)}
+      >
         {/* Utility Zone - Left side */}
         <div
           className="relative flex items-center h-full"
@@ -1120,6 +1284,9 @@ function TabBar({ projectId }: TabBarProps) {
                         commandType={tab.commandType}
                         onRestart={handleRestart}
                         isInterrupted={isTabInterrupted(tab)}
+                        draggingGroupIds={draggingGroupIds}
+                        onHoverChange={(hovering, rect) => handleTabHoverChange(tab.id, hovering, rect)}
+                        showNotesIndicator={isCmdPressed && isMouseInTabBar && !!workspace.tabs.get(tab.id)?.notes}
                       />
                     ))}
                   </div>
@@ -1182,6 +1349,9 @@ function TabBar({ projectId }: TabBarProps) {
                     commandType={tab.commandType}
                     onRestart={handleRestart}
                     isInterrupted={isTabInterrupted(tab)}
+                    draggingGroupIds={draggingGroupIds}
+                    onHoverChange={(hovering, rect) => handleTabHoverChange(tab.id, hovering, rect)}
+                    showNotesIndicator={isCmdPressed && isMouseInTabBar && !!workspace.tabs.get(tab.id)?.notes}
                   />
                 ))}
               </div>
@@ -1326,6 +1496,55 @@ function TabBar({ projectId }: TabBarProps) {
           </button>
         </div>
       )}
+
+      {/* CMD+Hover Notes Preview — interactive with invisible bridge */}
+      {isCmdPressed && notesPreview && (() => {
+        const tab = workspace.tabs.get(notesPreview.tabId);
+        const notes = tab?.notes;
+        if (!notes) return null;
+        return (
+          <div
+            className="fixed z-[100]"
+            style={{
+              left: notesPreview.rect.left,
+              top: notesPreview.rect.bottom,
+              paddingTop: '4px', // Invisible bridge gap
+            }}
+            onMouseEnter={() => {
+              // Keep popover alive when cursor enters it
+              setNotesPreview(prev => prev ? { ...prev } : null);
+            }}
+            onMouseLeave={() => {
+              setNotesPreview(null);
+            }}
+          >
+            <div
+              style={{
+                maxWidth: '300px',
+                minWidth: '160px',
+                padding: '8px 10px',
+                backgroundColor: '#1e1e1e',
+                border: '1px solid #333',
+                borderRadius: '6px',
+                boxShadow: '0 4px 12px rgba(0,0,0,0.4)',
+              }}
+            >
+              <div
+                className="text-[11px] text-[#ccc] whitespace-pre-wrap break-words select-text cursor-text"
+                style={{
+                  maxHeight: '120px',
+                  overflow: 'hidden',
+                  display: '-webkit-box',
+                  WebkitLineClamp: 6,
+                  WebkitBoxOrient: 'vertical',
+                }}
+              >
+                {notes}
+              </div>
+            </div>
+          </div>
+        );
+      })()}
     </>
   );
 }

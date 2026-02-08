@@ -1059,8 +1059,9 @@ ipcMain.handle('bookmark:select-directory', async () => {
 ipcMain.handle('system:get-claude-processes', async () => {
   try {
     // Find all claude CLI processes with PPID for ownership detection
+    // Added %cpu,%mem to ps format
     const psOutput = await execAsync(
-      'ps -eo pid,ppid,lstart,command | grep -i "claude" | grep -v grep | grep -v electron',
+      'ps -eo pid,ppid,pcpu,pmem,lstart,command | grep -i "claude" | grep -v grep | grep -v electron',
       3000
     );
 
@@ -1079,14 +1080,16 @@ ipcMain.handle('system:get-claude-processes', async () => {
 
     for (const line of lines) {
       try {
-        // Parse ps output: PID + PPID + lstart (Day Mon DD HH:MM:SS YYYY) + command
-        const match = line.trim().match(/^\s*(\d+)\s+(\d+)\s+\w+\s+\w+\s+\d+\s+(\d+:\d+:\d+)\s+\d+\s+(.+)/);
+        // Parse ps output: PID PPID %CPU %MEM lstart(Day Mon DD HH:MM:SS YYYY) command
+        const match = line.trim().match(/^\s*(\d+)\s+(\d+)\s+([\d.]+)\s+([\d.]+)\s+\w+\s+\w+\s+\d+\s+(\d+:\d+:\d+)\s+\d+\s+(.+)/);
         if (!match) continue;
 
         const pid = match[1];
         const ppid = Number(match[2]);
-        const startTime = match[3]; // HH:MM:SS
-        const command = match[4].trim();
+        const cpu = match[3];
+        const mem = match[4];
+        const startTime = match[5]; // HH:MM:SS
+        const command = match[6].trim();
 
         // Skip non-CLI claude processes
         if (!command.includes('claude') || command.includes('Electron')) continue;
@@ -1111,6 +1114,85 @@ ipcMain.handle('system:get-claude-processes', async () => {
           startTime: startTime.substring(0, 5), // HH:MM
           command,
           tabId,
+          cpu,
+          mem,
+        });
+      } catch {
+        // Skip unparseable lines
+      }
+    }
+
+    return processes;
+  } catch {
+    return [];
+  }
+});
+
+ipcMain.handle('system:get-gemini-processes', async () => {
+  try {
+    // Find gemini processes with no controlling terminal (?? = detached)
+    const psOutput = await execAsync(
+      'ps aux | grep gemini | grep "\\?\\?" | grep -v grep',
+      3000
+    );
+
+    if (!psOutput) return [];
+
+    // Build ownership map from our terminal shells
+    const ourShellPids = new Set();
+    const pidToTabId = new Map();
+    for (const [tabId, ptyProcess] of terminals) {
+      ourShellPids.add(ptyProcess.pid);
+      pidToTabId.set(ptyProcess.pid, tabId);
+    }
+
+    const lines = psOutput.split('\n').filter(Boolean);
+    const processes = [];
+
+    for (const line of lines) {
+      try {
+        // ps aux columns: USER PID %CPU %MEM VSZ RSS TT STAT STARTED TIME COMMAND
+        const parts = line.trim().split(/\s+/);
+        if (parts.length < 11) continue;
+
+        const pid = parts[1];
+        const cpu = parts[2]; // %CPU
+        const mem = parts[3]; // %MEM
+        const startTime = parts[8]; // STARTED column
+        const command = parts.slice(10).join(' ');
+
+        // Skip non-CLI gemini processes
+        if (!command.includes('gemini')) continue;
+
+        // Get PPID for ownership detection
+        let ppid = 0;
+        try {
+          const ppidStr = await execAsync('ps -o ppid= -p ' + pid, 2000);
+          ppid = Number(ppidStr.trim());
+        } catch {
+          // Process may have exited
+        }
+
+        // Get CWD via lsof
+        let cwd = '';
+        try {
+          cwd = await execAsync('lsof -p ' + pid + ' | grep cwd | awk \'{print ' + '\$' + '9}\'', 2000);
+        } catch {
+          continue;
+        }
+
+        if (!cwd) continue;
+
+        const tabId = pidToTabId.get(ppid) || null;
+
+        processes.push({
+          pid: Number(pid),
+          cwd,
+          startTime: startTime || '',
+          command,
+          tabId,
+          cpu,
+          mem,
         });
       } catch {
         // Skip unparseable lines

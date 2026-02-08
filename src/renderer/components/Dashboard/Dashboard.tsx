@@ -9,17 +9,21 @@ import { Plus, Square } from 'lucide-react';
 
 const { ipcRenderer } = window.require('electron');
 
-interface ClaudeProcess {
+interface AIProcess {
   pid: number;
   cwd: string;
   startTime: string;
   command: string;
   tabId: string | null;
+  cpu: string;
+  mem: string;
 }
 
 export default function Dashboard() {
   const [processStatus, setProcessStatus] = useState<Map<string, boolean>>(new Map());
-  const [claudeProcesses, setClaudeProcesses] = useState<ClaudeProcess[]>([]);
+  const [claudeProcesses, setClaudeProcesses] = useState<AIProcess[]>([]);
+  const [geminiProcesses, setGeminiProcesses] = useState<AIProcess[]>([]);
+  const [hoveredPid, setHoveredPid] = useState<number | null>(null);
   const { projects, loadProjects } = useProjectsStore();
   const { openProject, openProjects } = useWorkspaceStore();
   const { bookmarks, loadBookmarks, addBookmarkFromDialog, updateBookmark, deleteBookmark } = useBookmarksStore();
@@ -85,14 +89,19 @@ export default function Dashboard() {
     };
   }, [openProjects.size]);
 
-  // Poll for active Claude processes
+  // Poll for active AI processes (Claude + Gemini)
   useEffect(() => {
     const fetchProcesses = async () => {
       try {
-        const procs = await ipcRenderer.invoke('system:get-claude-processes');
-        setClaudeProcesses(procs || []);
+        const [claude, gemini] = await Promise.all([
+          ipcRenderer.invoke('system:get-claude-processes'),
+          ipcRenderer.invoke('system:get-gemini-processes'),
+        ]);
+        setClaudeProcesses(claude || []);
+        setGeminiProcesses(gemini || []);
       } catch {
         setClaudeProcesses([]);
+        setGeminiProcesses([]);
       }
     };
 
@@ -233,13 +242,9 @@ export default function Dashboard() {
           </div>
         </div>
 
-        {/* Active Claude Processes */}
-        {claudeProcesses.length > 0 && (() => {
-          const inApp = claudeProcesses.filter(p => p.tabId);
-          const external = claudeProcesses.filter(p => !p.tabId);
-
-          // Helper: resolve project name + tab name for in-app processes
-          const getTabLabel = (proc: ClaudeProcess) => {
+        {/* Active AI Processes — two columns */}
+        {(claudeProcesses.length > 0 || geminiProcesses.length > 0) && (() => {
+          const getTabLabel = (proc: AIProcess) => {
             if (!proc.tabId) return '';
             for (const [projId, workspace] of openProjects) {
               const tab = workspace.tabs.get(proc.tabId);
@@ -253,64 +258,123 @@ export default function Dashboard() {
 
           const handleKill = async (pid: number) => {
             await ipcRenderer.invoke('system:kill-process', pid);
-            // Refetch after short delay
             setTimeout(async () => {
               try {
-                const procs = await ipcRenderer.invoke('system:get-claude-processes');
-                setClaudeProcesses(procs || []);
+                const [claude, gemini] = await Promise.all([
+                  ipcRenderer.invoke('system:get-claude-processes'),
+                  ipcRenderer.invoke('system:get-gemini-processes'),
+                ]);
+                setClaudeProcesses(claude || []);
+                setGeminiProcesses(gemini || []);
               } catch { /* ignore */ }
             }, 500);
           };
 
+          const renderProcessCard = (proc: AIProcess, accentColor: string) => {
+            const isInApp = !!proc.tabId;
+            const label = isInApp
+              ? getTabLabel(proc)
+              : proc.cwd.split('/').filter(Boolean).pop() || proc.cwd;
+
+            return (
+              <div
+                key={proc.pid}
+                className={`relative group flex items-center gap-2 px-3 py-2.5 rounded-lg border transition-colors hover:border-[#444] ${
+                  isInApp ? 'border-[#333] bg-[#1a1a1a]' : 'border-dashed border-[#333] bg-transparent'
+                }`}
+                onMouseEnter={() => setHoveredPid(proc.pid)}
+                onMouseLeave={() => setHoveredPid(null)}
+              >
+                {/* Circle → Square on card hover */}
+                <button
+                  className="flex-shrink-0 flex items-center justify-center w-4 h-4"
+                  onClick={() => handleKill(proc.pid)}
+                >
+                  <span
+                    className="w-2 h-2 rounded-full group-hover:hidden"
+                    style={{ backgroundColor: isInApp ? accentColor : '#888' }}
+                  />
+                  <Square
+                    size={11}
+                    fill="currentColor"
+                    stroke="none"
+                    className="hidden group-hover:block text-red-500/50 hover:text-red-400 cursor-pointer"
+                  />
+                </button>
+                <span className={`text-sm ${isInApp ? 'text-[#ccc]' : 'text-[#888]'}`}>{label}</span>
+                <span className={`text-xs ${isInApp ? 'text-[#666]' : 'text-[#555]'}`}>{proc.startTime}</span>
+
+                {/* Hover popover */}
+                {hoveredPid === proc.pid && (
+                  <div
+                    className="absolute z-50"
+                    style={{
+                      bottom: '100%',
+                      left: 0,
+                      paddingBottom: '4px',
+                    }}
+                  >
+                    <div
+                      style={{
+                        minWidth: '180px',
+                        padding: '8px 10px',
+                        backgroundColor: '#1e1e1e',
+                        border: '1px solid #333',
+                        borderRadius: '6px',
+                      }}
+                    >
+                      <div className="text-[10px] text-[#888] space-y-0.5">
+                        <div>PID: <span className="text-[#ccc]">{proc.pid}</span></div>
+                        <div>CPU: <span className="text-[#ccc]">{proc.cpu}%</span>  MEM: <span className="text-[#ccc]">{proc.mem}%</span></div>
+                        <div className="truncate" title={proc.cwd}>CWD: <span className="text-[#ccc]">{proc.cwd}</span></div>
+                        <div>{isInApp ? 'In-App' : 'External'}</div>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+            );
+          };
+
           return (
             <div className="mt-8">
-              <h2 className="text-sm font-medium text-[#888] mb-3">Active Claude Processes</h2>
-              <div className="flex flex-wrap gap-2">
-                {inApp.map((proc) => (
-                  <div
-                    key={proc.pid}
-                    className="group flex items-center gap-2 px-3 py-2.5 rounded-lg border border-[#333] bg-[#1a1a1a] transition-colors hover:border-[#444]"
-                    title={`PID: ${proc.pid}\nCWD: ${proc.cwd}\nCommand: ${proc.command}`}
-                  >
-                    <span
-                      className="w-2 h-2 rounded-full flex-shrink-0"
-                      style={{ backgroundColor: '#0dbc79' }}
-                    />
-                    <span className="text-sm text-[#ccc]">{getTabLabel(proc)}</span>
-                    <span className="text-xs text-[#666]">{proc.startTime}</span>
-                    <button
-                      className="ml-1 p-0.5 rounded text-[#666] opacity-0 group-hover:opacity-100 hover:text-red-400 hover:bg-white/5 transition-all cursor-pointer"
-                      onClick={() => handleKill(proc.pid)}
-                      title="Stop process"
-                    >
-                      <Square size={10} fill="currentColor" />
-                    </button>
+              <div className="flex gap-6">
+                {/* Claude column */}
+                <div className="flex-1">
+                  <h2 className="text-sm font-medium text-[#888] mb-3">
+                    <span style={{ color: '#e8913e' }}>Claude</span>
+                    {claudeProcesses.length > 0 && (
+                      <span className="ml-2 text-xs text-[#555]">{claudeProcesses.length}</span>
+                    )}
+                  </h2>
+                  <div className="flex flex-wrap gap-2">
+                    {claudeProcesses.length > 0 ? (
+                      claudeProcesses.map(p => renderProcessCard(p, '#e8913e'))
+                    ) : (
+                      <span className="text-xs text-[#555]">No active processes</span>
+                    )}
                   </div>
-                ))}
-                {external.map((proc) => {
-                  const folderName = proc.cwd.split('/').filter(Boolean).pop() || proc.cwd;
-                  return (
-                    <div
-                      key={proc.pid}
-                      className="group flex items-center gap-2 px-3 py-2.5 rounded-lg border border-dashed border-[#333] bg-transparent transition-colors hover:border-[#444]"
-                      title={`External\nPID: ${proc.pid}\nCWD: ${proc.cwd}\nCommand: ${proc.command}`}
-                    >
-                      <span
-                        className="w-2 h-2 rounded-full flex-shrink-0"
-                        style={{ backgroundColor: '#888' }}
-                      />
-                      <span className="text-sm text-[#888]">{folderName}</span>
-                      <span className="text-xs text-[#555]">{proc.startTime}</span>
-                      <button
-                        className="ml-1 p-0.5 rounded text-[#666] opacity-0 group-hover:opacity-100 hover:text-red-400 hover:bg-white/5 transition-all cursor-pointer"
-                        onClick={() => handleKill(proc.pid)}
-                        title="Stop process"
-                      >
-                        <Square size={10} fill="currentColor" />
-                      </button>
-                    </div>
-                  );
-                })}
+                </div>
+
+                {/* Vertical divider */}
+                <div className="w-px self-stretch" style={{ backgroundColor: '#2a2a2a' }} />
+
+                {/* Gemini column */}
+                <div className="flex-1">
+                  <h2 className="text-sm font-medium text-[#888] mb-3">
+                    <span style={{ color: '#4285f4' }}>Gemini</span>
+                    {geminiProcesses.length > 0 && (
+                      <span className="ml-2 text-xs text-[#555]">{geminiProcesses.length}</span>
+                    )}
+                  </h2>
+                  <div className="flex flex-wrap gap-2">
+                    {geminiProcesses.length > 0 ? (
+                      geminiProcesses.map(p => renderProcessCard(p, '#4285f4'))
+                    ) : (
+                      <span className="text-xs text-[#555]">No active sessions</span>
+                    )}
+                  </div>
+                </div>
               </div>
             </div>
           );
