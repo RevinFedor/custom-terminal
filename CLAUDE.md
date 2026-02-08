@@ -7,9 +7,11 @@
     - docs/main-feature.md
   </step>
   <step index="2">
-    Analyze the user request against `main-feature.md`.
-    Find ALL relevant feature files (may be multiple — read each).
-    CRITICAL: When reading `architecture.md` or any feature file — you MUST read ALL `knowledge/` files mentioned in it. No exceptions.
+    After reading `architecture.md`, scan it for EVERY reference to `knowledge/` files.
+    Issue read_file for EACH one. Do NOT skip any — even if they seem irrelevant to the question.
+
+    Then: find the relevant feature file(s) for the user's request from `main-feature.md`.
+    Read each feature file. For each — extract ALL `knowledge/` paths and read them too.
   </step>
   <step index="3">
     ONLY after steps 1-2, propose a solution.

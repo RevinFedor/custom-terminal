@@ -987,6 +987,27 @@ ipcMain.handle('project:delete', (event, projectId) => {
   return { success: result };
 });
 
+// ========== TAB HISTORY ==========
+
+ipcMain.handle('project:archive-tab', (event, { projectId, tab }) => {
+  projectManager.db.archiveTab(projectId, tab);
+  return { success: true };
+});
+
+ipcMain.handle('project:get-tab-history', (event, { projectId }) => {
+  return projectManager.db.getTabHistory(projectId);
+});
+
+ipcMain.handle('project:clear-tab-history', (event, { projectId }) => {
+  projectManager.db.clearTabHistory(projectId);
+  return { success: true };
+});
+
+ipcMain.handle('project:delete-tab-history-entry', (event, { id }) => {
+  projectManager.db.deleteTabHistoryEntry(id);
+  return { success: true };
+});
+
 ipcMain.handle('project:select-directory', async () => {
   const result = await dialog.showOpenDialog(mainWindow, {
     properties: ['openDirectory']
