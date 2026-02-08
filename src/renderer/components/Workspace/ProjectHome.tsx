@@ -3,7 +3,6 @@ import { useWorkspaceStore, TabColor, TabType, PendingAction } from '../../store
 import { useProjectsStore } from '../../store/useProjectsStore';
 import { useUIStore } from '../../store/useUIStore';
 import { Terminal, FolderOpen, Plus, Clock, Trash2 } from 'lucide-react';
-import { motion, AnimatePresence } from 'framer-motion';
 import { MarkdownEditor } from '@anthropic/markdown-editor';
 
 const { ipcRenderer } = window.require('electron');
@@ -101,7 +100,9 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
   const [hoveredHistory, setHoveredHistory] = useState<{ id: number; rect: DOMRect } | null>(null);
   const [isPopoverPinned, setIsPopoverPinned] = useState(false);
   const historyCloseTimeoutRef = useRef<NodeJS.Timeout | null>(null);
-  const [hoveredActiveTabId, setHoveredActiveTabId] = useState<string | null>(null);
+  const [hoveredActiveTab, setHoveredActiveTab] = useState<{ id: string; rect: DOMRect } | null>(null);
+  const [isActivePopoverPinned, setIsActivePopoverPinned] = useState(false);
+  const activeCloseTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const [isCmdPressed, setIsCmdPressed] = useState(false);
 
   // CMD key tracking for hover previews
@@ -242,7 +243,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
       </div>
 
       {/* Active Tabs Grid */}
-      <div className="mb-4 overflow-hidden">
+      <div className="mb-4">
         <h2 className="text-sm text-[#888] mb-3">Active Tabs ({tabs.length})</h2>
         <div className="flex flex-wrap gap-3 w-full">
           {tabs.map((tab) => {
@@ -252,9 +253,21 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
             return (
               <div
                 key={tab.id}
-                className="relative"
-                onMouseEnter={() => setHoveredActiveTabId(tab.id)}
-                onMouseLeave={() => setHoveredActiveTabId(null)}
+                onMouseEnter={(e) => {
+                  if (activeCloseTimeoutRef.current) {
+                    clearTimeout(activeCloseTimeoutRef.current);
+                    activeCloseTimeoutRef.current = null;
+                  }
+                  const rect = e.currentTarget.getBoundingClientRect();
+                  setHoveredActiveTab({ id: tab.id, rect });
+                }}
+                onMouseLeave={() => {
+                  activeCloseTimeoutRef.current = setTimeout(() => {
+                    setHoveredActiveTab(prev => prev?.id === tab.id ? null : prev);
+                    setIsActivePopoverPinned(false);
+                    activeCloseTimeoutRef.current = null;
+                  }, 150);
+                }}
               >
                 <button
                   onClick={() => handleTabClick(tab.id)}
@@ -301,59 +314,16 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
                     <span
                       className="text-sm text-white truncate"
                       style={{ maxWidth: '110px' }}
-                      title={tab.name}
                     >
                       {tab.name}
                     </span>
                   </div>
                   <span
                     className="text-[10px] text-[#666] truncate w-full"
-                    title={tab.cwd}
                   >
                     {getFolderName(tab.cwd)}
                   </span>
                 </button>
-
-                {/* CMD+Hover Popover for active tab */}
-                <AnimatePresence>
-                  {isCmdPressed && hoveredActiveTabId === tab.id && (
-                    <motion.div
-                      initial={{ opacity: 0, y: 4 }}
-                      animate={{ opacity: 1, y: 0 }}
-                      exit={{ opacity: 0, y: 4 }}
-                      transition={{ duration: 0.15 }}
-                      className="absolute z-50"
-                      style={{
-                        bottom: '100%',
-                        left: 0,
-                        paddingBottom: '8px',
-                      }}
-                    >
-                      <div
-                        style={{
-                          minWidth: '200px',
-                          padding: '8px 10px',
-                          backgroundColor: '#1e1e1e',
-                          border: '1px solid #333',
-                          borderRadius: '6px',
-                        }}
-                      >
-                        {tab.notes && (
-                          <div className="text-[11px] text-[#ccc] mb-2">
-                            <span className="text-[#888]">Notes: </span>
-                            {tab.notes}
-                          </div>
-                        )}
-                        <div className="text-[10px] text-[#888] space-y-0.5">
-                          <div className="truncate" title={tab.cwd}>Path: {tab.cwd}</div>
-                          {tab.commandType && (
-                            <div>Type: {tab.commandType}</div>
-                          )}
-                        </div>
-                      </div>
-                    </motion.div>
-                  )}
-                </AnimatePresence>
               </div>
             );
           })}
@@ -447,11 +417,10 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
                         <span
                           className="text-[12px] text-white truncate"
                           style={{ maxWidth: '120px' }}
-                          title={entry.name}
                         >
                           {entry.name}
                         </span>
-                        <span className="text-[9px] text-[#666] truncate" title={entry.cwd}>
+                        <span className="text-[9px] text-[#666] truncate">
                           {getFolderName(entry.cwd)}
                         </span>
                       </div>
@@ -480,23 +449,96 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
         </div>
       )}
 
-      {/* CMD+Hover History Popover — fixed position with pinning & smart placement */}
-      {(isCmdPressed || isPopoverPinned) && hoveredHistory && (() => {
-        const entry = history.find(h => h.id === hoveredHistory.id);
-        if (!entry) return null;
-        const rect = hoveredHistory.rect;
-        // Smart positioning: check space above, show below if not enough
-        const spaceAbove = rect.top;
-        const maxH = Math.min(spaceAbove - 16, 350); // 16px margin from top edge
-        const showBelow = spaceAbove < 160; // not enough room above
+      {/* CMD+Hover Active Tab Popover — fixed position with pinning */}
+      {(isCmdPressed || isActivePopoverPinned) && hoveredActiveTab && (() => {
+        const tab = tabs.find(t => t.id === hoveredActiveTab.id);
+        if (!tab) return null;
+        const rect = hoveredActiveTab.rect;
+        const spaceBelow = window.innerHeight - rect.bottom;
+        const showAbove = spaceBelow < 160;
+        const maxH = showAbove ? Math.min(rect.top - 16, 350) : Math.min(spaceBelow - 16, 350);
         return (
           <div
             className="fixed z-[100]"
             style={{
               left: rect.left,
-              ...(showBelow
-                ? { top: rect.bottom, paddingTop: '4px' }
-                : { top: rect.top, paddingBottom: '4px', transform: 'translateY(-100%)' }
+              ...(showAbove
+                ? { top: rect.top, paddingBottom: '4px', transform: 'translateY(-100%)' }
+                : { top: rect.bottom, paddingTop: '4px' }
+              ),
+            }}
+            onMouseEnter={() => {
+              if (activeCloseTimeoutRef.current) {
+                clearTimeout(activeCloseTimeoutRef.current);
+                activeCloseTimeoutRef.current = null;
+              }
+              setIsActivePopoverPinned(true);
+            }}
+            onMouseLeave={() => {
+              setHoveredActiveTab(null);
+              setIsActivePopoverPinned(false);
+              if (activeCloseTimeoutRef.current) {
+                clearTimeout(activeCloseTimeoutRef.current);
+                activeCloseTimeoutRef.current = null;
+              }
+            }}
+          >
+            <div
+              style={{
+                width: '340px',
+                maxHeight: `${maxH}px`,
+                backgroundColor: '#1e1e1e',
+                border: '1px solid #333',
+                borderRadius: '6px',
+                boxShadow: '0 4px 12px rgba(0,0,0,0.4)',
+                overflow: 'hidden',
+                display: 'flex',
+                flexDirection: 'column',
+              }}
+            >
+              {tab.notes && (
+                <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', borderBottom: '1px solid #333' }}>
+                  <MarkdownEditor
+                    content={tab.notes}
+                    onChange={() => {}}
+                    readOnly
+                    compact
+                    showLineNumbers={false}
+                    fontSize={tabNotesFontSize}
+                    contentPaddingX={tabNotesPaddingX}
+                    contentPaddingY={tabNotesPaddingY}
+                    wordWrap
+                  />
+                </div>
+              )}
+              <div style={{ padding: '6px 10px', flexShrink: 0 }}>
+                <div className="text-[10px] text-[#888] space-y-0.5">
+                  <div className="truncate">Path: {tab.cwd}</div>
+                  {tab.commandType && <div>Type: {tab.commandType}</div>}
+                </div>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* CMD+Hover History Popover — fixed position with pinning & smart placement */}
+      {(isCmdPressed || isPopoverPinned) && hoveredHistory && (() => {
+        const entry = history.find(h => h.id === hoveredHistory.id);
+        if (!entry) return null;
+        const rect = hoveredHistory.rect;
+        // Smart positioning: default below, show above only if not enough room below
+        const spaceBelow = window.innerHeight - rect.bottom;
+        const showAbove = spaceBelow < 160;
+        const maxH = showAbove ? Math.min(rect.top - 16, 350) : Math.min(spaceBelow - 16, 350);
+        return (
+          <div
+            className="fixed z-[100]"
+            style={{
+              left: rect.left,
+              ...(showAbove
+                ? { top: rect.top, paddingBottom: '4px', transform: 'translateY(-100%)' }
+                : { top: rect.bottom, paddingTop: '4px' }
               ),
             }}
             onMouseEnter={() => {
@@ -518,7 +560,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
             <div
               style={{
                 width: '340px',
-                maxHeight: showBelow ? '300px' : `${maxH}px`,
+                maxHeight: `${maxH}px`,
                 backgroundColor: '#1e1e1e',
                 border: '1px solid #333',
                 borderRadius: '6px',

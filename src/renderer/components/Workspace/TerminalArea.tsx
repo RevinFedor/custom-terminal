@@ -137,7 +137,7 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
   const activeTab = currentWorkspace?.activeTabId
     ? currentWorkspace.tabs.get(currentWorkspace.activeTabId)
     : null;
-  const showInterruptedOverlay = activeTab?.wasInterrupted && activeTab?.claudeSessionId;
+  const showInterruptedOverlay = activeTab?.wasInterrupted && activeTab?.claudeSessionId && currentView === 'terminal';
 
   
   // Handle continuing interrupted Claude session

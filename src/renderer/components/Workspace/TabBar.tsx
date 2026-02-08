@@ -10,7 +10,7 @@ import { attachClosestEdge, extractClosestEdge, type Edge } from '@atlaskit/prag
 import { combine } from '@atlaskit/pragmatic-drag-and-drop/combine';
 import { autoScrollForElements } from '@atlaskit/pragmatic-drag-and-drop-auto-scroll/element';
 import { setCustomNativeDragPreview } from '@atlaskit/pragmatic-drag-and-drop/element/set-custom-native-drag-preview';
-import { ChevronDown, Globe, Bot } from 'lucide-react';
+import { ChevronDown, Globe, Bot, Play, Minimize2, Maximize2 } from 'lucide-react';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -715,6 +715,7 @@ function TabBar({ projectId }: TabBarProps) {
   const [editingTabId, setEditingTabId] = useState<string | null>(null);
   const [editValue, setEditValue] = useState('');
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; tabId: string } | null>(null);
+  const [contextScripts, setContextScripts] = useState<string[]>([]);
   const [utilityExpanded, setUtilityExpanded] = useState(false);
   const [utilityOpenedManually, setUtilityOpenedManually] = useState(false); // Track if opened by click vs hover
   const utilityHoverTimeoutRef = useRef<NodeJS.Timeout | null>(null);
@@ -940,11 +941,11 @@ function TabBar({ projectId }: TabBarProps) {
   }, [editingTabId]);
 
   useEffect(() => {
-    const handleClick = () => setContextMenu(null);
-    if (contextMenu) {
-      document.addEventListener('click', handleClick);
-      return () => document.removeEventListener('click', handleClick);
-    }
+    if (!contextMenu) return;
+    const handleClose = () => setContextMenu(null);
+    // Use mousedown instead of click — xterm.js canvas swallows click events
+    document.addEventListener('mousedown', handleClose);
+    return () => document.removeEventListener('mousedown', handleClose);
   }, [contextMenu]);
 
   if (!workspace || !project) return null;
@@ -984,6 +985,26 @@ function TabBar({ projectId }: TabBarProps) {
     e.preventDefault();
     e.stopPropagation();
     setContextMenu({ x: e.clientX, y: e.clientY, tabId });
+
+    // Load scripts for this tab's CWD
+    (async () => {
+      try {
+        const cwd = await ipcRenderer.invoke('terminal:getCwd', tabId);
+        const tabCwd = cwd || workspace.tabs.get(tabId)?.cwd || '';
+        if (!tabCwd) { setContextScripts([]); return; }
+        const result = await ipcRenderer.invoke('file:read', `${tabCwd}/package.json`);
+        if (result?.success && result.content) {
+          const pkg = JSON.parse(result.content);
+          if (pkg.scripts) {
+            setContextScripts(Object.keys(pkg.scripts).filter(name => !name.startsWith('_')));
+            return;
+          }
+        }
+        setContextScripts([]);
+      } catch {
+        setContextScripts([]);
+      }
+    })();
   };
 
   // Restart process: Ctrl+C → delay → !! (repeat last command)
@@ -1540,8 +1561,49 @@ function TabBar({ projectId }: TabBarProps) {
                 setContextMenu(null);
               }}
             >
-              {workspace.tabs.get(contextMenu!.tabId)?.isCollapsed ? 'Expand' : 'Collapse'}
+              {workspace.tabs.get(contextMenu!.tabId)?.isCollapsed
+                ? <><Maximize2 size={12} className="text-[#666]" /> Expand</>
+                : <><Minimize2 size={12} className="text-[#666]" /> Collapse</>
+              }
             </button>
+          )}
+
+          {/* Scripts - submenu */}
+          {!isMultiSelect && contextScripts.length > 0 && (
+            <div className="relative group/scripts">
+              <button
+                className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center justify-between"
+              >
+                <span className="flex items-center gap-2">
+                  <Play size={12} className="text-[#666]" />
+                  Scripts
+                  <span className="text-[10px] text-[#555]">{contextScripts.length}</span>
+                </span>
+                <span className="text-[#666]">{'\u203A'}</span>
+              </button>
+              <div className="absolute left-full top-0 -ml-2 pl-2 hidden group-hover/scripts:block">
+                <div className="bg-[#2a2a2a] border border-[#444] rounded-xl shadow-2xl py-1 min-w-[160px] max-h-[300px] overflow-y-auto">
+                  {contextScripts.map((script) => (
+                    <button
+                      key={script}
+                      className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if (contextMenu) {
+                          ipcRenderer.send('terminal:input', contextMenu.tabId, `npm run ${script}\r`);
+                          setCurrentView('terminal');
+                          switchTab(projectId, contextMenu.tabId);
+                        }
+                        setContextMenu(null);
+                      }}
+                    >
+                      <div className="w-1 h-1 rounded-full bg-[#555]" />
+                      <span className="truncate">{script}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
           )}
 
           {/* Separator */}
