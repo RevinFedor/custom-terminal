@@ -195,7 +195,13 @@ const saveTabs = (projectId: string, tabs: Map<string, Tab>) => {
     geminiSessionId: tab.geminiSessionId,
     wasInterrupted: tab.wasInterrupted,
     overlayDismissed: tab.overlayDismissed,
-    notes: tab.notes
+    notes: tab.notes,
+    tabType: tab.tabType,
+    url: tab.url,
+    terminalId: tab.terminalId,
+    terminalName: tab.terminalName,
+    activeView: tab.activeView,
+    createdAt: tab.createdAt
   }));
   ipcRenderer.invoke('project:save-tabs', { projectId, tabs: tabsArray });
 };
@@ -436,8 +442,11 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
             geminiSessionId: savedTab.geminiSessionId,
             wasInterrupted: savedTab.wasInterrupted,
             overlayDismissed: savedTab.overlayDismissed,
-            notes: savedTab.notes
-          });
+            notes: savedTab.notes,
+            tabType: savedTab.tabType,
+            url: savedTab.url,
+            createdAt: savedTab.createdAt
+          } as any);
         }
       } else {
         // Create default tab
@@ -542,7 +551,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       geminiSessionId: options?.geminiSessionId,
       wasInterrupted: options?.wasInterrupted,
       overlayDismissed: options?.overlayDismissed,
-      notes: options?.notes
+      notes: options?.notes,
+      tabType: options?.tabType || 'terminal',
+      url: options?.url,
+      createdAt: (options as any)?.createdAt || Math.floor(Date.now() / 1000)
     };
 
     console.log('[Store] createTab: Creating PTY terminal for:', tabId, 'cwd:', newTab.cwd);
@@ -606,7 +618,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       geminiSessionId: options?.geminiSessionId,
       wasInterrupted: options?.wasInterrupted,
       overlayDismissed: options?.overlayDismissed,
-      notes: options?.notes
+      notes: options?.notes,
+      tabType: options?.tabType || 'terminal',
+      url: options?.url,
+      createdAt: (options as any)?.createdAt || Math.floor(Date.now() / 1000)
     };
 
     // Only pass initialCommand for shell-command type, not for internal commands
@@ -705,8 +720,28 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     }
 
     ipcRenderer.send('terminal:kill', tabId);
-    workspace.tabs.delete(tabId);
     clearTerminalBuffer(tabId); // Clean up serialized buffer
+
+    // Archive tab to history (fire-and-forget)
+    if (tab) {
+      ipcRenderer.invoke('project:archive-tab', {
+        projectId,
+        tab: {
+          name: tab.name,
+          cwd: tab.cwd,
+          color: tab.color,
+          notes: tab.notes,
+          commandType: tab.commandType,
+          tabType: tab.tabType,
+          url: tab.url,
+          createdAt: tab.createdAt,
+          claudeSessionId: tab.claudeSessionId,
+          geminiSessionId: tab.geminiSessionId
+        }
+      }).catch(() => {});
+    }
+
+    workspace.tabs.delete(tabId);
 
     if (workspace.activeTabId === tabId) {
       // Only switch to Main tabs (not utility) - get last Main tab
