@@ -674,6 +674,8 @@ function TabBar({ projectId }: TabBarProps) {
   const currentView = useUIStore((state) => state.currentView);
   const setCurrentView = useUIStore((state) => state.setCurrentView);
   const showToast = useUIStore((state) => state.showToast);
+  const openTabNotesEditor = useUIStore((state) => state.openTabNotesEditor);
+  const tabNotesFontSize = useUIStore((state) => state.tabNotesFontSize);
 
   const [editingTabId, setEditingTabId] = useState<string | null>(null);
   const [editValue, setEditValue] = useState('');
@@ -1534,12 +1536,23 @@ function TabBar({ projectId }: TabBarProps) {
                 style={{
                   maxHeight: '120px',
                   overflow: 'hidden',
+                  fontSize: `${tabNotesFontSize}px`,
                   display: '-webkit-box',
                   WebkitLineClamp: 6,
                   WebkitBoxOrient: 'vertical',
                 }}
               >
                 {notes}
+              </div>
+              {/* Open full editor */}
+              <div
+                className="mt-2 pt-2 border-t border-[#333] text-[10px] text-[#DA7756] cursor-pointer hover:text-[#e89070] transition-colors"
+                onClick={() => {
+                  openTabNotesEditor(notesPreview.tabId);
+                  setNotesPreview(null);
+                }}
+              >
+                Open in Editor
               </div>
             </div>
           </div>

@@ -234,6 +234,16 @@ interface UIStore {
   openNotesEditor: (projectId: string) => void;
   closeNotesEditor: () => void;
 
+  // Tab Notes Editor Modal
+  tabNotesEditorOpen: boolean;
+  tabNotesEditorTabId: string | null;
+  openTabNotesEditor: (tabId: string) => void;
+  closeTabNotesEditor: () => void;
+
+  // Tab Notes Font Size
+  tabNotesFontSize: number;
+  setTabNotesFontSize: (size: number) => void;
+
   // Workspace View (terminal or project home)
   currentView: WorkspaceView;
   setCurrentView: (view: WorkspaceView) => void;
@@ -829,6 +839,25 @@ export const useUIStore = create<UIStore>((set, get) => ({
   notesEditorProjectId: null,
   openNotesEditor: (projectId) => set({ notesEditorOpen: true, notesEditorProjectId: projectId }),
   closeNotesEditor: () => set({ notesEditorOpen: false, notesEditorProjectId: null }),
+
+  // Tab Notes Editor Modal
+  tabNotesEditorOpen: false,
+  tabNotesEditorTabId: null,
+  openTabNotesEditor: (tabId) => set({ tabNotesEditorOpen: true, tabNotesEditorTabId: tabId }),
+  closeTabNotesEditor: () => set({ tabNotesEditorOpen: false, tabNotesEditorTabId: null }),
+
+  // Tab Notes Font Size
+  tabNotesFontSize: (() => {
+    try {
+      const saved = localStorage.getItem('noted-terminal-tab-notes-font-size');
+      return saved ? parseInt(saved, 10) : 13;
+    } catch { return 13; }
+  })(),
+  setTabNotesFontSize: (size) => {
+    const clamped = Math.max(10, Math.min(24, size));
+    set({ tabNotesFontSize: clamped });
+    localStorage.setItem('noted-terminal-tab-notes-font-size', String(clamped));
+  },
 
   // Workspace View
   currentView: 'terminal',

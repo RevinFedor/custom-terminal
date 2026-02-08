@@ -143,6 +143,8 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
   const setTerminalFontSize = useUIStore((s) => s.setTerminalFontSize);
   const setTabsFontSize = useUIStore((s) => s.setTabsFontSize);
   const setProjectTabsFontSize = useUIStore((s) => s.setProjectTabsFontSize);
+  const tabNotesFontSize = useUIStore((s) => s.tabNotesFontSize);
+  const setTabNotesFontSize = useUIStore((s) => s.setTabNotesFontSize);
   const { showToast, chatSettings, setChatSettings, docPrompt, setDocPromptUseFile, setDocPromptFilePath, setDocPromptInlineContent, claudeDefaultPromptEnabled, setClaudeDefaultPromptEnabled } = useUIStore();
 
   // Claude Default Prompt
@@ -504,6 +506,21 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                 min={10}
                 max={16}
               />
+
+              {/* Tab Notes section */}
+              <div style={{ marginTop: '16px', paddingTop: '16px', borderTop: '1px solid #333' }}>
+                <div style={{ fontSize: '11px', fontWeight: '600', color: '#666', marginBottom: '12px', textTransform: 'uppercase' }}>
+                  Описание вкладки
+                </div>
+                <FontSizeSlider
+                  label="Заметки вкладки"
+                  description="Превью и редактор описания"
+                  value={tabNotesFontSize}
+                  onChange={setTabNotesFontSize}
+                  min={10}
+                  max={20}
+                />
+              </div>
             </>
           )}
 
