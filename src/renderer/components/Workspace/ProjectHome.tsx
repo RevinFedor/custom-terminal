@@ -94,6 +94,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
   const [syncName, setSyncName] = useState<string | null>(null);
   const [history, setHistory] = useState<TabHistoryEntry[]>([]);
   const [hoveredHistoryId, setHoveredHistoryId] = useState<number | null>(null);
+  const [hoveredActiveTabId, setHoveredActiveTabId] = useState<string | null>(null);
   const [isCmdPressed, setIsCmdPressed] = useState(false);
 
   // CMD key tracking for hover previews
@@ -242,49 +243,111 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
             const isActive = workspace.activeTabId === tab.id;
 
             return (
-              <button
+              <div
                 key={tab.id}
-                onClick={() => handleTabClick(tab.id)}
-                className="group cursor-pointer transition-all duration-150"
-                style={{
-                  maxWidth: '150px',
-                  maxHeight: '50px',
-                  minWidth: '100px',
-                  padding: '8px 12px',
-                  backgroundColor: colorConfig.bgColor,
-                  border: `1px solid ${isActive ? colorConfig.borderColor : 'transparent'}`,
-                  borderRadius: '6px',
-                  display: 'flex',
-                  flexDirection: 'column',
-                  alignItems: 'flex-start',
-                  gap: '2px',
-                }}
-                onMouseEnter={(e) => {
-                  e.currentTarget.style.borderColor = colorConfig.borderColor;
-                }}
-                onMouseLeave={(e) => {
-                  if (!isActive) {
-                    e.currentTarget.style.borderColor = 'transparent';
-                  }
-                }}
+                className="relative"
+                onMouseEnter={() => setHoveredActiveTabId(tab.id)}
+                onMouseLeave={() => setHoveredActiveTabId(null)}
               >
-                <div className="flex items-center gap-2 w-full">
-                  <Terminal size={12} className="text-[#888] flex-shrink-0" />
-                  <span
-                    className="text-sm text-white truncate"
-                    style={{ maxWidth: '110px' }}
-                    title={tab.name}
-                  >
-                    {tab.name}
-                  </span>
-                </div>
-                <span
-                  className="text-[10px] text-[#666] truncate w-full"
-                  title={tab.cwd}
+                <button
+                  onClick={() => handleTabClick(tab.id)}
+                  className="group cursor-pointer transition-all duration-150"
+                  style={{
+                    position: 'relative',
+                    maxWidth: '150px',
+                    maxHeight: '50px',
+                    minWidth: '100px',
+                    padding: '8px 12px',
+                    backgroundColor: colorConfig.bgColor,
+                    border: `1px solid ${isActive ? colorConfig.borderColor : 'transparent'}`,
+                    borderRadius: '6px',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    alignItems: 'flex-start',
+                    gap: '2px',
+                  }}
+                  onMouseEnter={(e) => {
+                    e.currentTarget.style.borderColor = colorConfig.borderColor;
+                  }}
+                  onMouseLeave={(e) => {
+                    if (!isActive) {
+                      e.currentTarget.style.borderColor = 'transparent';
+                    }
+                  }}
                 >
-                  {getFolderName(tab.cwd)}
-                </span>
-              </button>
+                  {isCmdPressed && tab.notes && (
+                    <span
+                      style={{
+                        position: 'absolute',
+                        top: '4px',
+                        right: '4px',
+                        width: '5px',
+                        height: '5px',
+                        borderRadius: '50%',
+                        backgroundColor: '#DA7756',
+                        zIndex: 10,
+                      }}
+                    />
+                  )}
+                  <div className="flex items-center gap-2 w-full">
+                    <Terminal size={12} className="text-[#888] flex-shrink-0" />
+                    <span
+                      className="text-sm text-white truncate"
+                      style={{ maxWidth: '110px' }}
+                      title={tab.name}
+                    >
+                      {tab.name}
+                    </span>
+                  </div>
+                  <span
+                    className="text-[10px] text-[#666] truncate w-full"
+                    title={tab.cwd}
+                  >
+                    {getFolderName(tab.cwd)}
+                  </span>
+                </button>
+
+                {/* CMD+Hover Popover for active tab */}
+                <AnimatePresence>
+                  {isCmdPressed && hoveredActiveTabId === tab.id && (
+                    <motion.div
+                      initial={{ opacity: 0, y: 4 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      exit={{ opacity: 0, y: 4 }}
+                      transition={{ duration: 0.15 }}
+                      className="absolute z-50"
+                      style={{
+                        bottom: '100%',
+                        left: 0,
+                        paddingBottom: '8px',
+                      }}
+                    >
+                      <div
+                        style={{
+                          minWidth: '200px',
+                          padding: '8px 10px',
+                          backgroundColor: '#1e1e1e',
+                          border: '1px solid #333',
+                          borderRadius: '6px',
+                        }}
+                      >
+                        {tab.notes && (
+                          <div className="text-[11px] text-[#ccc] mb-2">
+                            <span className="text-[#888]">Notes: </span>
+                            {tab.notes}
+                          </div>
+                        )}
+                        <div className="text-[10px] text-[#888] space-y-0.5">
+                          <div className="truncate" title={tab.cwd}>Path: {tab.cwd}</div>
+                          {tab.commandType && (
+                            <div>Type: {tab.commandType}</div>
+                          )}
+                        </div>
+                      </div>
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+              </div>
             );
           })}
 
@@ -372,6 +435,22 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
                           {getFolderName(entry.cwd)}
                         </span>
                       </div>
+
+                      {/* CMD indicator: notes exist */}
+                      {isCmdPressed && entry.notes && (
+                        <span
+                          style={{
+                            position: 'absolute',
+                            top: '6px',
+                            right: '6px',
+                            width: '5px',
+                            height: '5px',
+                            borderRadius: '50%',
+                            backgroundColor: '#DA7756',
+                            zIndex: 10,
+                          }}
+                        />
+                      )}
 
                       {/* CMD+Hover Popover with invisible bridge */}
                       <AnimatePresence>
