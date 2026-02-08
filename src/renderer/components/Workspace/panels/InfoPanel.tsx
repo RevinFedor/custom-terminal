@@ -33,6 +33,7 @@ type AIMode = 'claude' | 'gemini';
 export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
   const [claudeSessionId, setClaudeSessionId] = useState<string | null>(null);
   const [geminiSessionId, setGeminiSessionId] = useState<string | null>(null);
+  const [activeCommandType, setActiveCommandType] = useState<string | null>(null);
   const [aiMode, setAiMode] = useState<AIMode>('claude');
   const [showTooltip, setShowTooltip] = useState(false);
   const [historyTurns, setHistoryTurns] = useState<HistoryTurn[]>([]);
@@ -76,6 +77,7 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
       if (!activeTabId) {
         setClaudeSessionId(null);
         setGeminiSessionId(null);
+        setActiveCommandType(null);
         return;
       }
 
@@ -87,11 +89,13 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
           const newGeminiId = tab.geminiSessionId || null;
           setClaudeSessionId(prev => prev !== newClaudeId ? newClaudeId : prev);
           setGeminiSessionId(prev => prev !== newGeminiId ? newGeminiId : prev);
+          setActiveCommandType(tab.commandType || null);
           return;
         }
       }
       setClaudeSessionId(null);
       setGeminiSessionId(null);
+      setActiveCommandType(null);
     };
 
     checkSession();
@@ -240,6 +244,13 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
             >
               ⑂ Fork в новую вкладку
             </button>
+          </div>
+        ) : (activeCommandType === 'claude' || activeCommandType === 'gemini') ? (
+          <div className="bg-[#2a2a2a] border border-[#3a3a3a] rounded p-2">
+            <div className="flex items-center gap-2">
+              <span className="w-2 h-2 rounded-full bg-yellow-500 animate-pulse"></span>
+              <span className="text-yellow-500/80 text-xs">Ожидание сессии...</span>
+            </div>
           </div>
         ) : (
           <div className="bg-[#2a2a2a] border border-[#3a3a3a] rounded p-2">

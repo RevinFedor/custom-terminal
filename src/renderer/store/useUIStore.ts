@@ -838,3 +838,7 @@ export const useUIStore = create<UIStore>((set, get) => ({
   activeArea: 'workspace',
   setActiveArea: (area) => set({ activeArea: area })
 }));
+
+if (typeof window !== 'undefined') {
+  (window as any).useUIStore = useUIStore;
+}
