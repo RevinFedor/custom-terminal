@@ -2,6 +2,8 @@ import React, { useState, useRef, useEffect, memo, useCallback } from 'react';
 import { useWorkspaceStore, TabColor, isTabInterrupted } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import { useUIStore } from '../../store/useUIStore';
+import { MarkdownEditor } from '@anthropic/markdown-editor';
+import '@anthropic/markdown-editor/styles.css';
 // Removed: framer-motion import - was causing lag on project switch
 import { draggable, dropTargetForElements, monitorForElements } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
 import { attachClosestEdge, extractClosestEdge, type Edge } from '@atlaskit/pragmatic-drag-and-drop-hitbox/closest-edge';
@@ -678,7 +680,6 @@ function TabBar({ projectId }: TabBarProps) {
   const currentView = useUIStore((state) => state.currentView);
   const setCurrentView = useUIStore((state) => state.setCurrentView);
   const showToast = useUIStore((state) => state.showToast);
-  const openTabNotesEditor = useUIStore((state) => state.openTabNotesEditor);
   const tabNotesFontSize = useUIStore((state) => state.tabNotesFontSize);
 
   const [editingTabId, setEditingTabId] = useState<string | null>(null);
@@ -699,6 +700,7 @@ function TabBar({ projectId }: TabBarProps) {
   const isCmdPressedRef = useRef(false); // Ref to avoid stale closures
   const notesCloseTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const [isMouseInTabBar, setIsMouseInTabBar] = useState(false);
+  const [isPopoverPinned, setIsPopoverPinned] = useState(false); // Popover stays after CMD release
 
   const workspace = openProjects.get(projectId);
   const project = projects[projectId];
@@ -1514,8 +1516,8 @@ function TabBar({ projectId }: TabBarProps) {
         </div>
       )}
 
-      {/* CMD+Hover Notes Preview — interactive with invisible bridge */}
-      {isCmdPressed && notesPreview && (() => {
+      {/* CMD+Hover Notes Preview — MarkdownEditor readOnly with pinning */}
+      {(isCmdPressed || isPopoverPinned) && notesPreview && (() => {
         const tab = workspace.tabs.get(notesPreview.tabId);
         const notes = tab?.notes;
         if (!notes) return null;
@@ -1533,9 +1535,12 @@ function TabBar({ projectId }: TabBarProps) {
                 clearTimeout(notesCloseTimeoutRef.current);
                 notesCloseTimeoutRef.current = null;
               }
+              // Pin popover — CMD release won't close it
+              setIsPopoverPinned(true);
             }}
             onMouseLeave={() => {
               setNotesPreview(null);
+              setIsPopoverPinned(false);
               if (notesCloseTimeoutRef.current) {
                 clearTimeout(notesCloseTimeoutRef.current);
                 notesCloseTimeoutRef.current = null;
@@ -1544,37 +1549,27 @@ function TabBar({ projectId }: TabBarProps) {
           >
             <div
               style={{
-                maxWidth: '300px',
-                minWidth: '160px',
-                padding: '8px 10px',
+                width: '380px',
+                maxHeight: '300px',
                 backgroundColor: '#1e1e1e',
                 border: '1px solid #333',
                 borderRadius: '6px',
                 boxShadow: '0 4px 12px rgba(0,0,0,0.4)',
+                overflow: 'hidden',
+                display: 'flex',
+                flexDirection: 'column',
               }}
             >
-              <div
-                className="text-[11px] text-[#ccc] whitespace-pre-wrap break-words select-text cursor-text"
-                style={{
-                  maxHeight: '120px',
-                  overflow: 'hidden',
-                  fontSize: `${tabNotesFontSize}px`,
-                  display: '-webkit-box',
-                  WebkitLineClamp: 6,
-                  WebkitBoxOrient: 'vertical',
-                }}
-              >
-                {notes}
-              </div>
-              {/* Open full editor */}
-              <div
-                className="mt-2 pt-2 border-t border-[#333] text-[10px] text-[#DA7756] cursor-pointer hover:text-[#e89070] transition-colors"
-                onClick={() => {
-                  openTabNotesEditor(notesPreview.tabId);
-                  setNotesPreview(null);
-                }}
-              >
-                Open in Editor
+              <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+                <MarkdownEditor
+                  content={notes}
+                  onChange={() => {}}
+                  readOnly
+                  compact
+                  showLineNumbers={false}
+                  fontSize={tabNotesFontSize}
+                  wordWrap
+                />
               </div>
             </div>
           </div>

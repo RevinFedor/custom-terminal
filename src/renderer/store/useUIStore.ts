@@ -234,12 +234,6 @@ interface UIStore {
   openNotesEditor: (projectId: string) => void;
   closeNotesEditor: () => void;
 
-  // Tab Notes Editor Modal
-  tabNotesEditorOpen: boolean;
-  tabNotesEditorTabId: string | null;
-  openTabNotesEditor: (tabId: string) => void;
-  closeTabNotesEditor: () => void;
-
   // Tab Notes Font Size
   tabNotesFontSize: number;
   setTabNotesFontSize: (size: number) => void;
@@ -839,12 +833,6 @@ export const useUIStore = create<UIStore>((set, get) => ({
   notesEditorProjectId: null,
   openNotesEditor: (projectId) => set({ notesEditorOpen: true, notesEditorProjectId: projectId }),
   closeNotesEditor: () => set({ notesEditorOpen: false, notesEditorProjectId: null }),
-
-  // Tab Notes Editor Modal
-  tabNotesEditorOpen: false,
-  tabNotesEditorTabId: null,
-  openTabNotesEditor: (tabId) => set({ tabNotesEditorOpen: true, tabNotesEditorTabId: tabId }),
-  closeTabNotesEditor: () => set({ tabNotesEditorOpen: false, tabNotesEditorTabId: null }),
 
   // Tab Notes Font Size
   tabNotesFontSize: (() => {

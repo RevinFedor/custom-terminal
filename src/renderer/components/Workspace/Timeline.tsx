@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback, useRef } from 'react';
+import React, { useEffect, useLayoutEffect, useState, useCallback, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { Maximize2, Copy, Minimize2 } from 'lucide-react';
 import { terminalRegistry } from '../../utils/terminalRegistry';
@@ -132,6 +132,23 @@ function Timeline({ tabId, sessionId, cwd }: TimelineProps) {
 
   // Refs
   const tooltipRef = useRef<HTMLDivElement>(null);
+  const tooltipContentRef = useRef<HTMLDivElement>(null);
+  const tooltipMeasuredRef = useRef(0);
+  const [tooltipMeasuredH, setTooltipMeasuredH] = useState(0);
+
+  // Measure actual tooltip height (before paint) to size wrapper precisely
+  useLayoutEffect(() => {
+    if (tooltipContentRef.current && activeTooltipIndex !== null) {
+      const h = tooltipContentRef.current.getBoundingClientRect().height;
+      if (Math.abs(h - tooltipMeasuredRef.current) > 1) {
+        tooltipMeasuredRef.current = h;
+        setTooltipMeasuredH(h);
+      }
+    } else if (activeTooltipIndex === null && tooltipMeasuredRef.current !== 0) {
+      tooltipMeasuredRef.current = 0;
+      setTooltipMeasuredH(0);
+    }
+  }, [activeTooltipIndex, isExpanded]);
 
   const handleMouseEnterSegment = (index: number) => {
     setHoveredIndex(index);
@@ -230,6 +247,41 @@ function Timeline({ tabId, sessionId, cwd }: TimelineProps) {
   if (!sessionId) return null;
 
   const currentActiveEntry = activeTooltipIndex !== null ? entries[activeTooltipIndex] : null;
+
+  // Compute tooltip wrapper position — uses measured height for precision
+  const tooltipPos = activeTooltipIndex !== null ? (() => {
+    const eCenterY = getElementCenterY(activeTooltipIndex);
+    const approxH = isExpanded ? 400 : 200;
+    // Use measured height when available, fallback to estimate
+    const h = tooltipMeasuredH > 0 ? tooltipMeasuredH : approxH;
+
+    // Determine alignment based on estimate (stable — doesn't flicker with measurement)
+    const idealTop = eCenterY - approxH / 2;
+    let vAlign: 'flex-start' | 'center' | 'flex-end' = 'center';
+    if (idealTop < 40) {
+      vAlign = 'flex-start';
+    } else if (idealTop + approxH > window.innerHeight - 10) {
+      vAlign = 'flex-end';
+    }
+
+    // Calculate position based on actual measured height
+    let clampedTop: number;
+    if (vAlign === 'flex-start') {
+      clampedTop = 40;
+    } else if (vAlign === 'flex-end') {
+      clampedTop = Math.max(40, window.innerHeight - h - 10);
+    } else {
+      clampedTop = eCenterY - h / 2;
+    }
+
+    // Wrapper spans from tooltip to entry (bridge fills the gap)
+    const wTop = Math.min(clampedTop, eCenterY - 20);
+    const wBottom = Math.min(
+      Math.max(clampedTop + h, eCenterY + 20),
+      window.innerHeight // never extend below viewport
+    );
+    return { clampedTop, wTop, wH: wBottom - wTop, offset: clampedTop - wTop, vAlign };
+  })() : null;
 
   return (
     <>
@@ -343,28 +395,29 @@ function Timeline({ tabId, sessionId, cwd }: TimelineProps) {
         )}
 
         {/* Tooltip Portal with CSS Bridge */}
-        {activeTooltipIndex !== null && currentActiveEntry && (
+        {activeTooltipIndex !== null && currentActiveEntry && tooltipPos && (
           <TooltipPortal>
-            {/* Outer wrapper - handles mouse leave for entire area including bridge */}
+            {/* Outer wrapper — explicit height ensures bridge connects tooltip to entry */}
             <div
               ref={tooltipRef}
               onMouseLeave={handleMouseLeaveTooltipArea}
               style={{
                 position: 'fixed',
                 right: `${notesPanelWidth + 24}px`,
-                // Calculate top: center on element, but clamp to viewport
-                // Tooltip height ~200px, so offset by half (100px) for centering
-                top: Math.max(40, Math.min(getElementCenterY(activeTooltipIndex) - 100, window.innerHeight - 180)),
+                top: `${tooltipPos.wTop}px`,
+                height: `${tooltipPos.wH}px`,
                 zIndex: 10000,
                 display: 'flex',
                 flexDirection: 'row',
-                alignItems: 'center',
+                alignItems: tooltipPos.vAlign,
               }}
             >
               {/* Visible tooltip content */}
               <div
+                ref={tooltipContentRef}
                 tabIndex={-1}
                 style={{
+                  marginTop: tooltipPos.vAlign === 'flex-start' ? `${tooltipPos.offset}px` : undefined,
                   outline: 'none',
                   backgroundColor: 'rgba(25, 25, 25, 0.98)',
                   backdropFilter: 'blur(12px)',
@@ -419,12 +472,12 @@ function Timeline({ tabId, sessionId, cwd }: TimelineProps) {
                   </>
                 )}
               </div>
-              {/* CSS Bridge - invisible area connecting tooltip to timeline */}
+              {/* CSS Bridge — stretches full wrapper height, connects tooltip to entry */}
               <div
                 style={{
                   width: '50px',
-                  height: '80px',
-                  // background: 'rgba(255,0,0,0.1)', // Uncomment for debug
+                  alignSelf: 'stretch',
+                  // background: 'rgba(255,0,0,0.15)', // Uncomment for debug
                 }}
               />
             </div>

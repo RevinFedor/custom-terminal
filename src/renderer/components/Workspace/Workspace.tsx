@@ -14,7 +14,6 @@ import FilePreview from './FilePreview';
 import Resizer from './Resizer';
 import ResearchSheet from '../Research/ResearchSheet';
 import NotesEditorModal from './NotesEditorModal';
-import TabNotesEditorModal from './TabNotesEditorModal';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -395,8 +394,6 @@ export default function Workspace() {
       {/* Notes Editor Modal */}
       <NotesEditorModal />
 
-      {/* Tab Notes Editor Modal */}
-      <TabNotesEditorModal />
     </div>
   );
 }

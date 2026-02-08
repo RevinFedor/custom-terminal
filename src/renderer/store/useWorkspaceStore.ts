@@ -316,15 +316,19 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   },
 
   showDashboard: async () => {
-
-    // Sync cwd for active project before leaving
     const { activeProjectId, syncAllTabsCwd } = get();
-    if (activeProjectId) {
-      await syncAllTabsCwd(activeProjectId);
-    }
 
+    // Switch view IMMEDIATELY — don't block on sync
     set({ view: 'dashboard', activeProjectId: null });
-    get().saveSession();
+
+    // Sync cwd in background (lsof is slow when Claude is active)
+    if (activeProjectId) {
+      syncAllTabsCwd(activeProjectId).then(() => {
+        get().saveSession();
+      });
+    } else {
+      get().saveSession();
+    }
   },
 
   toggleTabSelection: (projectId, tabId, multi = false) => {
