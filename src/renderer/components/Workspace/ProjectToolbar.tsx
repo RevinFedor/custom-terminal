@@ -335,30 +335,9 @@ export default function ProjectToolbar() {
       {interruptedTabs.length > 0 && (
         <button
           onClick={handleResumeAll}
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            gap: '6px',
-            padding: '0 12px',
-            height: '100%',
-            fontSize: '13px',
-            color: '#fff',
-            backgroundColor: 'rgba(59, 130, 246, 0.3)',
-            borderTop: '2px solid #3b82f6',
-            borderBottom: 'none',
-            borderLeft: 'none',
-            borderRight: 'none',
-            cursor: 'pointer',
-            transition: 'all 0.15s ease',
-            outline: 'none',
-          }}
-          onMouseEnter={(e) => {
-            e.currentTarget.style.backgroundColor = 'rgba(59, 130, 246, 0.5)';
-          }}
-          onMouseLeave={(e) => {
-            e.currentTarget.style.backgroundColor = 'rgba(59, 130, 246, 0.3)';
-          }}
+          style={buttonStyle(false)}
+          onMouseEnter={(e) => handleMouseEnter(e, false)}
+          onMouseLeave={(e) => handleMouseLeave(e, false)}
           title={`Resume all ${interruptedTabs.length} interrupted session(s)`}
         >
           <RotateCcw size={14} />

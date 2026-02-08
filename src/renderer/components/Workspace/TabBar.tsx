@@ -2,6 +2,7 @@ import React, { useState, useRef, useEffect, memo, useCallback } from 'react';
 import { useWorkspaceStore, TabColor, isTabInterrupted } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import { useUIStore } from '../../store/useUIStore';
+import { useCmdKey, useCmdHoverPopover, CmdHoverPopover } from '../../hooks/useCmdHoverPopover';
 import { MarkdownEditor } from '@anthropic/markdown-editor';
 import '@anthropic/markdown-editor/styles.css';
 // Removed: framer-motion import - was causing lag on project switch
@@ -726,13 +727,10 @@ function TabBar({ projectId }: TabBarProps) {
   const inputRef = useRef<HTMLInputElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
 
-  // CMD+hover notes preview
-  const [isCmdPressed, setIsCmdPressed] = useState(false);
-  const [notesPreview, setNotesPreview] = useState<{ tabId: string; rect: DOMRect } | null>(null);
-  const isCmdPressedRef = useRef(false); // Ref to avoid stale closures
-  const notesCloseTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  // CMD+hover notes preview (unified hook)
+  const isCmdPressed = useCmdKey();
+  const notesPopover = useCmdHoverPopover<string>(isCmdPressed);
   const [isMouseInTabBar, setIsMouseInTabBar] = useState(false);
-  const [isPopoverPinned, setIsPopoverPinned] = useState(false); // Popover stays after CMD release
 
   const workspace = openProjects.get(projectId);
   const project = projects[projectId];
@@ -751,53 +749,15 @@ function TabBar({ projectId }: TabBarProps) {
     }
   };
 
-  // CMD+hover: track Meta key globally
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Meta') {
-        setIsCmdPressed(true);
-        isCmdPressedRef.current = true;
-      }
-    };
-    const handleKeyUp = (e: KeyboardEvent) => {
-      if (e.key === 'Meta') {
-        setIsCmdPressed(false);
-        isCmdPressedRef.current = false;
-      }
-    };
-    // Reset on window blur (user CMD+Tab'd away, keyup never fires)
-    const handleBlur = () => {
-      setIsCmdPressed(false);
-      isCmdPressedRef.current = false;
-    };
 
-    window.addEventListener('keydown', handleKeyDown);
-    window.addEventListener('keyup', handleKeyUp);
-    window.addEventListener('blur', handleBlur);
-    return () => {
-      window.removeEventListener('keydown', handleKeyDown);
-      window.removeEventListener('keyup', handleKeyUp);
-      window.removeEventListener('blur', handleBlur);
-    };
-  }, []);
-
-  // CMD+hover: callback for tab hover changes (with bridge timeout)
+  // CMD+hover: callback for tab hover changes (bridge via hook)
   const handleTabHoverChange = useCallback((tabId: string, hovering: boolean, rect?: DOMRect) => {
     if (hovering && rect) {
-      // Cancel any pending close when entering a tab
-      if (notesCloseTimeoutRef.current) {
-        clearTimeout(notesCloseTimeoutRef.current);
-        notesCloseTimeoutRef.current = null;
-      }
-      setNotesPreview({ tabId, rect });
+      notesPopover.setHovered(tabId, rect);
     } else {
-      // Delay close to allow cursor to reach popover (bridge pattern)
-      notesCloseTimeoutRef.current = setTimeout(() => {
-        setNotesPreview(prev => prev?.tabId === tabId ? null : prev);
-        notesCloseTimeoutRef.current = null;
-      }, 150);
+      notesPopover.clearHovered(tabId);
     }
-  }, []);
+  }, [notesPopover.setHovered, notesPopover.clearHovered]);
 
   // OSC 133 Event-driven process status (replaces polling)
   // Initial load + listen for command start/finish events
@@ -942,7 +902,11 @@ function TabBar({ projectId }: TabBarProps) {
 
   useEffect(() => {
     if (!contextMenu) return;
-    const handleClose = () => setContextMenu(null);
+    const handleClose = (e: MouseEvent) => {
+      // Don't close if clicking inside the context menu itself
+      if ((e.target as HTMLElement).closest('[data-tab-context-menu]')) return;
+      setContextMenu(null);
+    };
     // Use mousedown instead of click — xterm.js canvas swallows click events
     document.addEventListener('mousedown', handleClose);
     return () => document.removeEventListener('mousedown', handleClose);
@@ -1129,6 +1093,11 @@ function TabBar({ projectId }: TabBarProps) {
       if ((e.target as HTMLElement).closest('[data-tab-context-menu]')) return;
       if ((e.target as HTMLElement).closest('[data-utils-dropdown]')) return;
       if ((e.target as HTMLElement).closest('[data-utils-button]')) return;
+      console.log('[TabBar] clearSelection triggered by mousedown outside TabBar', {
+        target: (e.target as HTMLElement).tagName,
+        className: (e.target as HTMLElement).className?.slice(0, 80),
+        selectedCount: selectedTabIds.length
+      });
       clearSelection(projectId);
     };
 
@@ -1189,7 +1158,6 @@ function TabBar({ projectId }: TabBarProps) {
     return () => {
       if (utilityHoverTimeoutRef.current) clearTimeout(utilityHoverTimeoutRef.current);
       if (utilityCloseTimeoutRef.current) clearTimeout(utilityCloseTimeoutRef.current);
-      if (notesCloseTimeoutRef.current) clearTimeout(notesCloseTimeoutRef.current);
     };
   }, []);
 
@@ -1474,6 +1442,7 @@ function TabBar({ projectId }: TabBarProps) {
       {/* Context Menu - styled like terminal context menu */}
       {contextMenu && (
         <div
+          data-tab-context-menu
           className="fixed bg-[#2a2a2a] border border-[#444] shadow-2xl min-w-[180px] z-[100]"
           style={{ left: contextMenu.x, top: contextMenu.y }}
           onClick={(e) => e.stopPropagation()}
@@ -1591,8 +1560,6 @@ function TabBar({ projectId }: TabBarProps) {
                         e.stopPropagation();
                         if (contextMenu) {
                           ipcRenderer.send('terminal:input', contextMenu.tabId, `npm run ${script}\r`);
-                          setCurrentView('terminal');
-                          switchTab(projectId, contextMenu.tabId);
                         }
                         setContextMenu(null);
                       }}
@@ -1644,84 +1611,49 @@ function TabBar({ projectId }: TabBarProps) {
         </div>
       )}
 
-      {/* CMD+Hover Notes Preview — MarkdownEditor readOnly with pinning */}
-      {(isCmdPressed || isPopoverPinned) && notesPreview && (() => {
-        const tab = workspace.tabs.get(notesPreview.tabId);
+      {/* CMD+Hover Notes Preview — unified hook + CmdHoverPopover */}
+      {notesPopover.isVisible && notesPopover.hoveredItem && (() => {
+        const tab = workspace.tabs.get(notesPopover.hoveredItem.id);
         const notes = tab?.notes;
         const isTabCollapsed = tab?.isCollapsed;
-        // Show popover if tab has notes OR if tab is collapsed (show name)
         if (!notes && !isTabCollapsed) return null;
         return (
-          <div
-            className="fixed z-[100]"
-            style={{
-              left: notesPreview.rect.left,
-              top: notesPreview.rect.bottom,
-              paddingTop: '4px', // Invisible bridge gap
-            }}
-            onMouseEnter={() => {
-              // Cancel close timeout — cursor reached the popover
-              if (notesCloseTimeoutRef.current) {
-                clearTimeout(notesCloseTimeoutRef.current);
-                notesCloseTimeoutRef.current = null;
-              }
-              // Pin popover — CMD release won't close it
-              setIsPopoverPinned(true);
-            }}
-            onMouseLeave={() => {
-              setNotesPreview(null);
-              setIsPopoverPinned(false);
-              if (notesCloseTimeoutRef.current) {
-                clearTimeout(notesCloseTimeoutRef.current);
-                notesCloseTimeoutRef.current = null;
-              }
-            }}
+          <CmdHoverPopover
+            rect={notesPopover.hoveredItem.rect}
+            popoverProps={notesPopover.popoverProps}
+            width={380}
+            maxHeight={300}
           >
-            <div
-              style={{
-                width: '380px',
-                maxHeight: '300px',
-                backgroundColor: '#1e1e1e',
-                border: '1px solid #333',
-                borderRadius: '6px',
-                boxShadow: '0 4px 12px rgba(0,0,0,0.4)',
+            {isTabCollapsed && (
+              <div style={{
+                padding: '6px 10px',
+                fontSize: '12px',
+                fontWeight: 600,
+                color: '#fff',
+                borderBottom: notes ? '1px solid #333' : 'none',
+                whiteSpace: 'nowrap',
                 overflow: 'hidden',
-                display: 'flex',
-                flexDirection: 'column',
-              }}
-            >
-              {/* Tab name header for collapsed tabs */}
-              {isTabCollapsed && (
-                <div style={{
-                  padding: '6px 10px',
-                  fontSize: '12px',
-                  fontWeight: 600,
-                  color: '#fff',
-                  borderBottom: notes ? '1px solid #333' : 'none',
-                  whiteSpace: 'nowrap',
-                  overflow: 'hidden',
-                  textOverflow: 'ellipsis',
-                }}>
-                  {tab?.name}
-                </div>
-              )}
-              {notes && (
-                <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
-                  <MarkdownEditor
-                    content={notes}
-                    onChange={() => {}}
-                    readOnly
-                    compact
-                    showLineNumbers={false}
-                    fontSize={tabNotesFontSize}
-                    contentPaddingX={tabNotesPaddingX}
-                    contentPaddingY={tabNotesPaddingY}
-                    wordWrap
-                  />
-                </div>
-              )}
-            </div>
-          </div>
+                textOverflow: 'ellipsis',
+              }}>
+                {tab?.name}
+              </div>
+            )}
+            {notes && (
+              <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+                <MarkdownEditor
+                  content={notes}
+                  onChange={() => {}}
+                  readOnly
+                  compact
+                  showLineNumbers={false}
+                  fontSize={tabNotesFontSize}
+                  contentPaddingX={tabNotesPaddingX}
+                  contentPaddingY={tabNotesPaddingY}
+                  wordWrap
+                />
+              </div>
+            )}
+          </CmdHoverPopover>
         );
       })()}
     </>

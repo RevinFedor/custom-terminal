@@ -1,8 +1,9 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useUIStore } from '../../store/useUIStore';
 import { useBookmarksStore, Bookmark } from '../../store/useBookmarksStore';
+import { useCmdKey, useCmdHoverPopover } from '../../hooks/useCmdHoverPopover';
 import ProjectCard from './ProjectCard';
 import BookmarkCard from './BookmarkCard';
 import { Plus, Square, X } from 'lucide-react';
@@ -27,12 +28,9 @@ export default function Dashboard() {
 
   const [killTooltip, setKillTooltip] = useState<'claude' | 'gemini' | null>(null);
 
-  // CMD+hover popover state (same pattern as TabBar)
-  const [isCmdPressed, setIsCmdPressed] = useState(false);
-  const isCmdPressedRef = useRef(false);
-  const [hoveredPid, setHoveredPid] = useState<number | null>(null);
-  const [isPopoverPinned, setIsPopoverPinned] = useState(false);
-  const popoverCloseTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  // CMD+hover popover (unified hook)
+  const isCmdPressed = useCmdKey();
+  const processPopover = useCmdHoverPopover<number>(isCmdPressed);
 
   const { projects, loadProjects } = useProjectsStore();
   const { openProject, openProjects } = useWorkspaceStore();
@@ -125,51 +123,6 @@ export default function Dashboard() {
     return () => clearInterval(interval);
   }, []);
 
-  // CMD key tracking for hover popover
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Meta') {
-        setIsCmdPressed(true);
-        isCmdPressedRef.current = true;
-      }
-    };
-    const handleKeyUp = (e: KeyboardEvent) => {
-      if (e.key === 'Meta') {
-        setIsCmdPressed(false);
-        isCmdPressedRef.current = false;
-      }
-    };
-    const handleBlur = () => {
-      setIsCmdPressed(false);
-      isCmdPressedRef.current = false;
-    };
-
-    window.addEventListener('keydown', handleKeyDown);
-    window.addEventListener('keyup', handleKeyUp);
-    window.addEventListener('blur', handleBlur);
-    return () => {
-      window.removeEventListener('keydown', handleKeyDown);
-      window.removeEventListener('keyup', handleKeyUp);
-      window.removeEventListener('blur', handleBlur);
-    };
-  }, []);
-
-  // Card hover handler with bridge timeout
-  const handleCardHover = useCallback((pid: number, hovering: boolean) => {
-    if (hovering) {
-      if (popoverCloseTimeoutRef.current) {
-        clearTimeout(popoverCloseTimeoutRef.current);
-        popoverCloseTimeoutRef.current = null;
-      }
-      setHoveredPid(pid);
-    } else {
-      // Delay close to allow cursor to reach popover (bridge)
-      popoverCloseTimeoutRef.current = setTimeout(() => {
-        setHoveredPid(prev => prev === pid ? null : prev);
-        popoverCloseTimeoutRef.current = null;
-      }, 150);
-    }
-  }, []);
 
   // Create project from bookmark - always creates a NEW project instance
   const handleCreateProjectFromBookmark = async (bookmark: Bookmark) => {
@@ -336,7 +289,7 @@ export default function Dashboard() {
             const label = isInApp
               ? getTabLabel(proc)
               : proc.cwd.split('/').filter(Boolean).pop() || proc.cwd;
-            const showPopover = (isCmdPressed || isPopoverPinned) && hoveredPid === proc.pid;
+            const showPopover = processPopover.isVisible && processPopover.hoveredItem?.id === proc.pid;
 
             return (
               <div
@@ -344,8 +297,7 @@ export default function Dashboard() {
                 className={`relative group flex items-center gap-2 px-3 py-2.5 rounded-lg border transition-colors hover:border-[#444] ${
                   isInApp ? 'border-[#333] bg-[#1a1a1a]' : 'border-dashed border-[#333] bg-transparent'
                 }`}
-                onMouseEnter={() => handleCardHover(proc.pid, true)}
-                onMouseLeave={() => handleCardHover(proc.pid, false)}
+                {...processPopover.triggerProps(proc.pid)}
               >
                 {/* Circle → Square on card hover */}
                 <button
@@ -366,30 +318,16 @@ export default function Dashboard() {
                 <span className={`text-sm ${isInApp ? 'text-[#ccc]' : 'text-[#888]'}`}>{label}</span>
                 <span className={`text-xs ${isInApp ? 'text-[#666]' : 'text-[#555]'}`}>{proc.startTime}</span>
 
-                {/* CMD+Hover popover with bridge + pinning */}
+                {/* CMD+Hover popover (bridge + pinning via hook) */}
                 {showPopover && (
                   <div
                     className="absolute z-50"
                     style={{
                       bottom: '100%',
                       left: 0,
-                      paddingBottom: '4px', // Invisible bridge gap
+                      paddingBottom: '4px',
                     }}
-                    onMouseEnter={() => {
-                      if (popoverCloseTimeoutRef.current) {
-                        clearTimeout(popoverCloseTimeoutRef.current);
-                        popoverCloseTimeoutRef.current = null;
-                      }
-                      setIsPopoverPinned(true);
-                    }}
-                    onMouseLeave={() => {
-                      setIsPopoverPinned(false);
-                      setHoveredPid(null);
-                      if (popoverCloseTimeoutRef.current) {
-                        clearTimeout(popoverCloseTimeoutRef.current);
-                        popoverCloseTimeoutRef.current = null;
-                      }
-                    }}
+                    {...processPopover.popoverProps}
                   >
                     <div
                       style={{

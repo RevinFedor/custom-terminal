@@ -1,7 +1,8 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useWorkspaceStore, TabColor, TabType, PendingAction } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import { useUIStore } from '../../store/useUIStore';
+import { useCmdKey, useCmdHoverPopover, CmdHoverPopover } from '../../hooks/useCmdHoverPopover';
 import { Terminal, FolderOpen, Plus, Clock, Trash2 } from 'lucide-react';
 import { MarkdownEditor } from '@anthropic/markdown-editor';
 
@@ -97,33 +98,11 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
   const tabNotesPaddingY = useUIStore((s) => s.tabNotesPaddingY);
   const [syncName, setSyncName] = useState<string | null>(null);
   const [history, setHistory] = useState<TabHistoryEntry[]>([]);
-  const [hoveredHistory, setHoveredHistory] = useState<{ id: number; rect: DOMRect } | null>(null);
-  const [isPopoverPinned, setIsPopoverPinned] = useState(false);
-  const historyCloseTimeoutRef = useRef<NodeJS.Timeout | null>(null);
-  const [hoveredActiveTab, setHoveredActiveTab] = useState<{ id: string; rect: DOMRect } | null>(null);
-  const [isActivePopoverPinned, setIsActivePopoverPinned] = useState(false);
-  const activeCloseTimeoutRef = useRef<NodeJS.Timeout | null>(null);
-  const [isCmdPressed, setIsCmdPressed] = useState(false);
 
-  // CMD key tracking for hover previews
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Meta') setIsCmdPressed(true);
-    };
-    const handleKeyUp = (e: KeyboardEvent) => {
-      if (e.key === 'Meta') setIsCmdPressed(false);
-    };
-    const handleBlur = () => setIsCmdPressed(false);
-
-    window.addEventListener('keydown', handleKeyDown);
-    window.addEventListener('keyup', handleKeyUp);
-    window.addEventListener('blur', handleBlur);
-    return () => {
-      window.removeEventListener('keydown', handleKeyDown);
-      window.removeEventListener('keyup', handleKeyUp);
-      window.removeEventListener('blur', handleBlur);
-    };
-  }, []);
+  // CMD+hover popovers (unified hooks)
+  const isCmdPressed = useCmdKey();
+  const activePopover = useCmdHoverPopover<string>(isCmdPressed);
+  const historyPopover = useCmdHoverPopover<number>(isCmdPressed);
 
   useEffect(() => {
     const handleSync = (e: any) => {
@@ -253,21 +232,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
             return (
               <div
                 key={tab.id}
-                onMouseEnter={(e) => {
-                  if (activeCloseTimeoutRef.current) {
-                    clearTimeout(activeCloseTimeoutRef.current);
-                    activeCloseTimeoutRef.current = null;
-                  }
-                  const rect = e.currentTarget.getBoundingClientRect();
-                  setHoveredActiveTab({ id: tab.id, rect });
-                }}
-                onMouseLeave={() => {
-                  activeCloseTimeoutRef.current = setTimeout(() => {
-                    setHoveredActiveTab(prev => prev?.id === tab.id ? null : prev);
-                    setIsActivePopoverPinned(false);
-                    activeCloseTimeoutRef.current = null;
-                  }, 150);
-                }}
+                {...activePopover.triggerProps(tab.id)}
               >
                 <button
                   onClick={() => handleTabClick(tab.id)}
@@ -382,21 +347,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
                     <div
                       key={entry.id}
                       className="relative"
-                      onMouseEnter={(e) => {
-                        if (historyCloseTimeoutRef.current) {
-                          clearTimeout(historyCloseTimeoutRef.current);
-                          historyCloseTimeoutRef.current = null;
-                        }
-                        const rect = e.currentTarget.getBoundingClientRect();
-                        setHoveredHistory({ id: entry.id, rect });
-                      }}
-                      onMouseLeave={() => {
-                        historyCloseTimeoutRef.current = setTimeout(() => {
-                          setHoveredHistory(prev => prev?.id === entry.id ? null : prev);
-                          setIsPopoverPinned(false);
-                          historyCloseTimeoutRef.current = null;
-                        }, 150);
-                      }}
+                      {...historyPopover.triggerProps(entry.id)}
                     >
                       <div
                         className="transition-all duration-150 cursor-pointer hover:opacity-70"
@@ -449,171 +400,93 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
         </div>
       )}
 
-      {/* CMD+Hover Active Tab Popover — fixed position with pinning */}
-      {(isCmdPressed || isActivePopoverPinned) && hoveredActiveTab && (() => {
-        const tab = tabs.find(t => t.id === hoveredActiveTab.id);
+      {/* CMD+Hover Active Tab Popover — unified hook + CmdHoverPopover */}
+      {activePopover.isVisible && activePopover.hoveredItem && (() => {
+        const tab = tabs.find(t => t.id === activePopover.hoveredItem!.id);
         if (!tab) return null;
-        const rect = hoveredActiveTab.rect;
-        const spaceBelow = window.innerHeight - rect.bottom;
-        const showAbove = spaceBelow < 160;
-        const maxH = showAbove ? Math.min(rect.top - 16, 350) : Math.min(spaceBelow - 16, 350);
+        const pos = getPopoverPosition(activePopover.hoveredItem!.rect);
         return (
-          <div
-            className="fixed z-[100]"
-            style={{
-              left: rect.left,
-              ...(showAbove
-                ? { top: rect.top, paddingBottom: '4px', transform: 'translateY(-100%)' }
-                : { top: rect.bottom, paddingTop: '4px' }
-              ),
-            }}
-            onMouseEnter={() => {
-              if (activeCloseTimeoutRef.current) {
-                clearTimeout(activeCloseTimeoutRef.current);
-                activeCloseTimeoutRef.current = null;
-              }
-              setIsActivePopoverPinned(true);
-            }}
-            onMouseLeave={() => {
-              setHoveredActiveTab(null);
-              setIsActivePopoverPinned(false);
-              if (activeCloseTimeoutRef.current) {
-                clearTimeout(activeCloseTimeoutRef.current);
-                activeCloseTimeoutRef.current = null;
-              }
-            }}
+          <CmdHoverPopover
+            rect={activePopover.hoveredItem!.rect}
+            popoverProps={activePopover.popoverProps}
+            smartPosition
+            maxHeight={350}
           >
-            <div
-              style={{
-                width: '340px',
-                maxHeight: `${maxH}px`,
-                backgroundColor: '#1e1e1e',
-                border: '1px solid #333',
-                borderRadius: '6px',
-                boxShadow: '0 4px 12px rgba(0,0,0,0.4)',
-                overflow: 'hidden',
-                display: 'flex',
-                flexDirection: 'column',
-              }}
-            >
-              {tab.notes && (
-                <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', borderBottom: '1px solid #333' }}>
-                  <MarkdownEditor
-                    content={tab.notes}
-                    onChange={() => {}}
-                    readOnly
-                    compact
-                    showLineNumbers={false}
-                    fontSize={tabNotesFontSize}
-                    contentPaddingX={tabNotesPaddingX}
-                    contentPaddingY={tabNotesPaddingY}
-                    wordWrap
-                  />
-                </div>
-              )}
-              <div style={{ padding: '6px 10px', flexShrink: 0 }}>
-                <div className="text-[10px] text-[#888] space-y-0.5">
-                  <div className="truncate">Path: {tab.cwd}</div>
-                  {tab.commandType && <div>Type: {tab.commandType}</div>}
-                </div>
+            {tab.notes && (
+              <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', borderBottom: '1px solid #333' }}>
+                <MarkdownEditor
+                  content={tab.notes}
+                  onChange={() => {}}
+                  readOnly
+                  compact
+                  showLineNumbers={false}
+                  fontSize={tabNotesFontSize}
+                  contentPaddingX={tabNotesPaddingX}
+                  contentPaddingY={tabNotesPaddingY}
+                  wordWrap
+                />
+              </div>
+            )}
+            <div style={{ padding: '6px 10px', flexShrink: 0 }}>
+              <div className="text-[10px] text-[#888] space-y-0.5">
+                <div className="truncate">Path: {tab.cwd}</div>
+                {tab.commandType && <div>Type: {tab.commandType}</div>}
               </div>
             </div>
-          </div>
+          </CmdHoverPopover>
         );
       })()}
 
-      {/* CMD+Hover History Popover — fixed position with pinning & smart placement */}
-      {(isCmdPressed || isPopoverPinned) && hoveredHistory && (() => {
-        const entry = history.find(h => h.id === hoveredHistory.id);
+      {/* CMD+Hover History Popover — unified hook + CmdHoverPopover */}
+      {historyPopover.isVisible && historyPopover.hoveredItem && (() => {
+        const entry = history.find(h => h.id === historyPopover.hoveredItem!.id);
         if (!entry) return null;
-        const rect = hoveredHistory.rect;
-        // Smart positioning: default below, show above only if not enough room below
-        const spaceBelow = window.innerHeight - rect.bottom;
-        const showAbove = spaceBelow < 160;
-        const maxH = showAbove ? Math.min(rect.top - 16, 350) : Math.min(spaceBelow - 16, 350);
         return (
-          <div
-            className="fixed z-[100]"
-            style={{
-              left: rect.left,
-              ...(showAbove
-                ? { top: rect.top, paddingBottom: '4px', transform: 'translateY(-100%)' }
-                : { top: rect.bottom, paddingTop: '4px' }
-              ),
-            }}
-            onMouseEnter={() => {
-              if (historyCloseTimeoutRef.current) {
-                clearTimeout(historyCloseTimeoutRef.current);
-                historyCloseTimeoutRef.current = null;
-              }
-              setIsPopoverPinned(true);
-            }}
-            onMouseLeave={() => {
-              setHoveredHistory(null);
-              setIsPopoverPinned(false);
-              if (historyCloseTimeoutRef.current) {
-                clearTimeout(historyCloseTimeoutRef.current);
-                historyCloseTimeoutRef.current = null;
-              }
-            }}
+          <CmdHoverPopover
+            rect={historyPopover.hoveredItem!.rect}
+            popoverProps={historyPopover.popoverProps}
+            smartPosition
+            maxHeight={350}
           >
-            <div
-              style={{
-                width: '340px',
-                maxHeight: `${maxH}px`,
-                backgroundColor: '#1e1e1e',
-                border: '1px solid #333',
-                borderRadius: '6px',
-                boxShadow: '0 4px 12px rgba(0,0,0,0.4)',
-                overflow: 'hidden',
-                display: 'flex',
-                flexDirection: 'column',
-              }}
-            >
-              {/* Notes via MarkdownEditor */}
-              {entry.notes && (
-                <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', borderBottom: '1px solid #333' }}>
-                  <MarkdownEditor
-                    content={entry.notes}
-                    onChange={() => {}}
-                    readOnly
-                    compact
-                    showLineNumbers={false}
-                    fontSize={tabNotesFontSize}
-                    contentPaddingX={tabNotesPaddingX}
-                    contentPaddingY={tabNotesPaddingY}
-                    wordWrap
-                  />
-                </div>
-              )}
-              {/* Metadata */}
-              <div style={{ padding: '6px 10px', flexShrink: 0 }}>
-                <div className="text-[10px] text-[#888] space-y-0.5">
-                  <div>Created: {formatTimestamp(entry.created_at)}</div>
-                  <div>Closed: {formatTimestamp(entry.closed_at)}</div>
-                  <div className="truncate" title={entry.cwd}>Path: {entry.cwd}</div>
-                  {entry.command_type && (
-                    <div>Type: {entry.command_type}</div>
-                  )}
-                  {entry.message_count != null && (
-                    <div className="text-[#ccc]">Messages: {entry.message_count}</div>
-                  )}
-                </div>
-                {/* Restore button */}
-                <div
-                  className="mt-2 pt-2 border-t border-[#333] text-[10px] text-[#DA7756] cursor-pointer hover:text-[#e89070]"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    setHoveredHistory(null);
-                    setIsPopoverPinned(false);
-                    restoreTab(entry);
-                  }}
-                >
-                  Восстановить вкладку
-                </div>
+            {entry.notes && (
+              <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', borderBottom: '1px solid #333' }}>
+                <MarkdownEditor
+                  content={entry.notes}
+                  onChange={() => {}}
+                  readOnly
+                  compact
+                  showLineNumbers={false}
+                  fontSize={tabNotesFontSize}
+                  contentPaddingX={tabNotesPaddingX}
+                  contentPaddingY={tabNotesPaddingY}
+                  wordWrap
+                />
+              </div>
+            )}
+            <div style={{ padding: '6px 10px', flexShrink: 0 }}>
+              <div className="text-[10px] text-[#888] space-y-0.5">
+                <div>Created: {formatTimestamp(entry.created_at)}</div>
+                <div>Closed: {formatTimestamp(entry.closed_at)}</div>
+                <div className="truncate" title={entry.cwd}>Path: {entry.cwd}</div>
+                {entry.command_type && (
+                  <div>Type: {entry.command_type}</div>
+                )}
+                {entry.message_count != null && (
+                  <div className="text-[#ccc]">Messages: {entry.message_count}</div>
+                )}
+              </div>
+              <div
+                className="mt-2 pt-2 border-t border-[#333] text-[10px] text-[#DA7756] cursor-pointer hover:text-[#e89070]"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  historyPopover.close();
+                  restoreTab(entry);
+                }}
+              >
+                Восстановить вкладку
               </div>
             </div>
-          </div>
+          </CmdHoverPopover>
         );
       })()}
     </div>
