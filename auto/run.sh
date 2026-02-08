@@ -54,11 +54,9 @@ case "$1" in
         ;;
 
     --kill)
-        echo -e "${CYAN}Killing Electron processes...${NC}"
-        pkill -f "Electron" 2>/dev/null || true
-        pkill -f "noted-terminal" 2>/dev/null || true
-        echo -e "${GREEN}Done!${NC}"
-        exit 0
+        echo -e "${RED}DISABLED: --kill removes ALL Electron processes including your running app${NC}"
+        echo -e "If you need to kill zombie test processes, use: ${CYAN}pkill -f 'playwright'${NC}"
+        exit 1
         ;;
 
     "")

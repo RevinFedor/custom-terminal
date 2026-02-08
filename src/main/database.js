@@ -95,6 +95,21 @@ class DatabaseManager {
     try {
       this.db.exec(`ALTER TABLE tabs ADD COLUMN command_type TEXT DEFAULT NULL`);
     } catch (e) { /* column already exists */ }
+    try {
+      this.db.exec(`ALTER TABLE tabs ADD COLUMN tab_type TEXT DEFAULT 'terminal'`);
+    } catch (e) { /* column already exists */ }
+    try {
+      this.db.exec(`ALTER TABLE tabs ADD COLUMN url TEXT DEFAULT NULL`);
+    } catch (e) { /* column already exists */ }
+    try {
+      this.db.exec(`ALTER TABLE tabs ADD COLUMN terminal_id TEXT DEFAULT NULL`);
+    } catch (e) { /* column already exists */ }
+    try {
+      this.db.exec(`ALTER TABLE tabs ADD COLUMN terminal_name TEXT DEFAULT NULL`);
+    } catch (e) { /* column already exists */ }
+    try {
+      this.db.exec(`ALTER TABLE tabs ADD COLUMN active_view TEXT DEFAULT NULL`);
+    } catch (e) { /* column already exists */ }
 
     // Project sidebar state
     try {
@@ -191,6 +206,37 @@ class DatabaseManager {
     `);
     // Migration: add entry_uuids_json column if not exists
     try { this.db.exec(`ALTER TABLE fork_markers ADD COLUMN entry_uuids_json TEXT NOT NULL DEFAULT '[]'`); } catch (e) {}
+
+    // Tab history table - closed tabs archive
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS tab_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        cwd TEXT NOT NULL,
+        color TEXT DEFAULT NULL,
+        notes TEXT DEFAULT NULL,
+        command_type TEXT DEFAULT NULL,
+        tab_type TEXT DEFAULT 'terminal',
+        url TEXT DEFAULT NULL,
+        created_at INTEGER DEFAULT (strftime('%s', 'now')),
+        closed_at INTEGER DEFAULT (strftime('%s', 'now')),
+        FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+      )
+    `);
+
+    // Tab history indexes (must be after table creation)
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_tab_history_project ON tab_history(project_id);
+      CREATE INDEX IF NOT EXISTS idx_tab_history_closed ON tab_history(closed_at DESC);
+    `);
+
+    // Migration: add created_at to tabs
+    try { this.db.exec(`ALTER TABLE tabs ADD COLUMN created_at INTEGER DEFAULT NULL`); } catch (e) {}
+
+    // Migration: add session IDs to tab_history (for resume on restore)
+    try { this.db.exec(`ALTER TABLE tab_history ADD COLUMN claude_session_id TEXT DEFAULT NULL`); } catch (e) {}
+    try { this.db.exec(`ALTER TABLE tab_history ADD COLUMN gemini_session_id TEXT DEFAULT NULL`); } catch (e) {}
   }
 
   // ========== APP STATE ========== 
@@ -249,7 +295,13 @@ class DatabaseManager {
         geminiSessionId: t.gemini_session_id || undefined,
         wasInterrupted: t.was_interrupted === 1,
         overlayDismissed: t.overlay_dismissed === 1,
-        notes: t.notes || ''
+        notes: t.notes || '',
+        tabType: t.tab_type || 'terminal',
+        url: t.url || undefined,
+        terminalId: t.terminal_id || undefined,
+        terminalName: t.terminal_name || undefined,
+        activeView: t.active_view || undefined,
+        createdAt: t.created_at || undefined
       }))
     };
   }
@@ -338,17 +390,54 @@ class DatabaseManager {
   saveTabs(projectId, tabs) {
     this.db.prepare('DELETE FROM tabs WHERE project_id = ?').run(projectId);
     const insert = this.db.prepare(`
-      INSERT INTO tabs (project_id, name, cwd, position, color, is_utility, command_type, claude_session_id, gemini_session_id, was_interrupted, overlay_dismissed, notes)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO tabs (project_id, name, cwd, position, color, is_utility, command_type, claude_session_id, gemini_session_id, was_interrupted, overlay_dismissed, notes, tab_type, url, terminal_id, terminal_name, active_view, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     const transaction = this.db.transaction((tabList) => {
       tabList.forEach((tab, index) => {
-        insert.run(projectId, tab.name, tab.cwd, index, tab.color || null, tab.isUtility ? 1 : 0, tab.commandType || null, tab.claudeSessionId || null, tab.geminiSessionId || null, tab.wasInterrupted ? 1 : 0, tab.overlayDismissed ? 1 : 0, tab.notes || '');
+        insert.run(projectId, tab.name, tab.cwd, index, tab.color || null, tab.isUtility ? 1 : 0, tab.commandType || null, tab.claudeSessionId || null, tab.geminiSessionId || null, tab.wasInterrupted ? 1 : 0, tab.overlayDismissed ? 1 : 0, tab.notes || '', tab.tabType || 'terminal', tab.url || null, tab.terminalId || null, tab.terminalName || null, tab.activeView || null, tab.createdAt || null);
       });
     });
 transaction(tabs);
     this.db.prepare('UPDATE projects SET updated_at = strftime(\'%s\', \'now\') WHERE id = ?').run(projectId);
+  }
+
+  // ========== TAB HISTORY (CLOSED TABS ARCHIVE) ==========
+
+  archiveTab(projectId, tab) {
+    const now = Math.floor(Date.now() / 1000);
+    this.db.prepare(`
+      INSERT INTO tab_history (project_id, name, cwd, color, notes, command_type, tab_type, url, created_at, closed_at, claude_session_id, gemini_session_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      projectId,
+      tab.name,
+      tab.cwd,
+      tab.color || null,
+      tab.notes || null,
+      tab.commandType || null,
+      tab.tabType || 'terminal',
+      tab.url || null,
+      tab.createdAt || now,
+      now,
+      tab.claudeSessionId || null,
+      tab.geminiSessionId || null
+    );
+  }
+
+  getTabHistory(projectId, limit = 200) {
+    return this.db.prepare(
+      'SELECT * FROM tab_history WHERE project_id = ? ORDER BY closed_at DESC LIMIT ?'
+    ).all(projectId, limit);
+  }
+
+  clearTabHistory(projectId) {
+    this.db.prepare('DELETE FROM tab_history WHERE project_id = ?').run(projectId);
+  }
+
+  deleteTabHistoryEntry(id) {
+    this.db.prepare('DELETE FROM tab_history WHERE id = ?').run(id);
   }
 
   // ========== GEMINI HISTORY ========== 
