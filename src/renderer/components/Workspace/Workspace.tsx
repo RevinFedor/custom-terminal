@@ -251,10 +251,9 @@ export default function Workspace() {
   // Get Claude session ID for Timeline
   const claudeSessionId = activeTab?.claudeSessionId || null;
 
-  // Show Timeline when:
-  // 1. Tab has Claude session (commandType='claude' and sessionId exists)
-  // 2. A command is currently running (detected via OSC 133 Shell Integration)
-  const showTimeline = !filePreview && claudeSessionId && activeTab?.commandType === 'claude' && isCommandRunning;
+  // Show Timeline when tab has Claude session (commandType='claude' and sessionId exists)
+  // Timeline stays visible even when Claude is not running (dimmed background)
+  const showTimeline = !filePreview && claudeSessionId && activeTab?.commandType === 'claude';
 
   // DEBUG: Uncomment to debug Timeline visibility
   // console.log('[Timeline Debug] showTimeline:', showTimeline, 'claudeSessionId:', claudeSessionId, 'commandType:', activeTab?.commandType, 'isRunning:', isCommandRunning);
@@ -367,6 +366,7 @@ export default function Workspace() {
             tabId={activeTab.id}
             sessionId={claudeSessionId}
             cwd={activeTab.cwd || currentProject.path}
+            isActive={isCommandRunning}
           />
         )}
 

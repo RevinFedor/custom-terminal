@@ -39,8 +39,27 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
   const [fromStart, setFromStart] = useState(true);
   const [showCopySettings, setShowCopySettings] = useState(false);
   const copyIconRef = useRef<HTMLSpanElement>(null);
+  const copyContainerRef = useRef<HTMLDivElement>(null);
 
   const selectedTabs = activeProjectId ? getSelectedTabs(activeProjectId) : [];
+
+  // DEBUG: native event listener to bypass React delegation
+  useEffect(() => {
+    const el = copyContainerRef.current;
+    if (!el) return;
+    const onDown = (e: MouseEvent) => {
+      console.log('[CopySession] NATIVE mousedown!', (e.target as HTMLElement).textContent?.slice(0, 30));
+    };
+    const onUp = (e: MouseEvent) => {
+      console.log('[CopySession] NATIVE click!', (e.target as HTMLElement).textContent?.slice(0, 30));
+    };
+    el.addEventListener('mousedown', onDown, true); // capture phase
+    el.addEventListener('click', onUp, true);
+    return () => {
+      el.removeEventListener('mousedown', onDown, true);
+      el.removeEventListener('click', onUp, true);
+    };
+  }, []);
 
   // Get icon position for portal positioning
   const getIconPosition = useCallback(() => {
@@ -610,6 +629,8 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
     }
   };
 
+  console.log('[ActionsPanel] RENDER', { embedded, activeTabId, isCopying });
+
   const content = (
       <>
         {/* System Tools Section */}
@@ -690,12 +711,20 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
           {/* Copy Session - export Claude session */}
           <div className="mt-2">
             <div
+              ref={copyContainerRef}
+              data-copy-session
               className={`w-full text-[#DA7756] p-3 text-left rounded-lg text-xs flex items-center gap-2 transition-colors ${
                 isCopying ? 'opacity-50' : ''
               }`}
               style={{
                 backgroundColor: 'rgba(218, 119, 86, 0.1)',
                 border: '1px solid rgba(218, 119, 86, 0.15)'
+              }}
+              onMouseDown={(e) => {
+                console.log('[CopySession] CONTAINER mousedown', { target: (e.target as HTMLElement).tagName, className: (e.target as HTMLElement).className?.slice(0, 60) });
+              }}
+              onClick={(e) => {
+                console.log('[CopySession] CONTAINER click', { target: (e.target as HTMLElement).tagName, className: (e.target as HTMLElement).className?.slice(0, 60) });
               }}
               onMouseEnter={(e) => {
                 e.currentTarget.style.backgroundColor = 'rgba(218, 119, 86, 0.18)';
@@ -777,7 +806,12 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
                 {/* Clickable title - copies current session(s) */}
                 <div
                   className="font-medium cursor-pointer hover:text-white hover:underline transition-colors inline-block"
+                  onMouseDown={(e) => {
+                    console.log('[CopySession] TITLE mousedown', { isCopying, isMultiSelect, selectedCount: selectedTabs?.length });
+                    e.stopPropagation();
+                  }}
                   onClick={(e) => {
+                    console.log('[CopySession] TITLE click fired!', { isCopying, isMultiSelect });
                     e.stopPropagation();
                     if (!isCopying) handleCopySession();
                   }}

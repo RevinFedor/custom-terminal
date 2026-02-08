@@ -24,6 +24,7 @@ interface TimelineProps {
   tabId: string;
   sessionId: string | null;
   cwd: string;
+  isActive?: boolean; // Claude is currently running
 }
 
 // Truncate text for tooltip display
@@ -46,7 +47,7 @@ interface ForkMarker {
   entry_uuids: string[];  // Snapshot of all entry UUIDs at fork time
 }
 
-function Timeline({ tabId, sessionId, cwd }: TimelineProps) {
+function Timeline({ tabId, sessionId, cwd, isActive = true }: TimelineProps) {
   const [entries, setEntries] = useState<TimelineEntry[]>([]);
   const [forkMarkers, setForkMarkers] = useState<ForkMarker[]>([]);
   const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
@@ -291,11 +292,12 @@ function Timeline({ tabId, sessionId, cwd }: TimelineProps) {
         className="relative flex flex-col group transition-all duration-300"
         style={{
           width: '24px',
-          backgroundColor: 'rgba(0, 0, 0, 0.2)',
+          backgroundColor: isActive ? 'rgba(0, 0, 0, 0.2)' : 'rgba(40, 40, 40, 0.4)',
           backdropFilter: 'blur(4px)',
-          borderLeft: '1px solid rgba(255, 255, 255, 0.05)',
+          borderLeft: `1px solid rgba(255, 255, 255, ${isActive ? 0.05 : 0.03})`,
           height: '100%',
           zIndex: 40,
+          opacity: isActive ? 1 : 0.6,
         }}
       >
         {/* Central Axis Line */}
