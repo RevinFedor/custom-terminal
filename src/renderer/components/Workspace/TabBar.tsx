@@ -456,7 +456,7 @@ const TabItem = memo(({
               hasProcess={hasProcess}
               hasColor={!!hasColor}
               commandType={commandType}
-              hasSession={!!tab.claudeSessionId}
+              hasSession={sessionStatus.get(tab.id) || !!tab.claudeSessionId}
               onRestart={() => onRestart && onRestart(tab.id)}
             />
           )}
@@ -719,6 +719,7 @@ function TabBar({ projectId }: TabBarProps) {
   const utilityCloseTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const [emptyZoneHovered, setEmptyZoneHovered] = useState(false);
   const [processStatus, setProcessStatus] = useState<Map<string, boolean>>(new Map());
+  const [sessionStatus, setSessionStatus] = useState<Map<string, boolean>>(new Map());
   const inputRef = useRef<HTMLInputElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
 
@@ -804,18 +805,23 @@ function TabBar({ projectId }: TabBarProps) {
 
     // Initial load: get current state from memory (no syscalls)
     const initStatus = async () => {
-      const newStatus = new Map<string, boolean>();
+      const newProcessStatus = new Map<string, boolean>();
+      const newSessionStatus = new Map<string, boolean>();
       await Promise.all(
         tabIds.map(async (tabId) => {
           try {
             const state = await ipcRenderer.invoke('terminal:getCommandState', tabId);
-            newStatus.set(tabId, state.isRunning);
+            newProcessStatus.set(tabId, state.isRunning);
           } catch {
-            newStatus.set(tabId, false);
+            newProcessStatus.set(tabId, false);
           }
+          // Check if tab already has a session ID
+          const tab = workspace?.tabs.get(tabId);
+          newSessionStatus.set(tabId, !!tab?.claudeSessionId);
         })
       );
-      setProcessStatus(newStatus);
+      setProcessStatus(newProcessStatus);
+      setSessionStatus(newSessionStatus);
     };
     initStatus();
 
@@ -836,12 +842,23 @@ function TabBar({ projectId }: TabBarProps) {
       });
     };
 
+    // Session detected: track which tabs have a saved session (for red/green dot)
+    const handleSessionDetected = (_: any, data: { tabId: string; sessionId: string }) => {
+      setSessionStatus(prev => {
+        const next = new Map(prev);
+        next.set(data.tabId, true);
+        return next;
+      });
+    };
+
     ipcRenderer.on('terminal:command-started', handleCommandStarted);
     ipcRenderer.on('terminal:command-finished', handleCommandFinished);
+    ipcRenderer.on('claude:session-detected', handleSessionDetected);
 
     return () => {
       ipcRenderer.removeListener('terminal:command-started', handleCommandStarted);
       ipcRenderer.removeListener('terminal:command-finished', handleCommandFinished);
+      ipcRenderer.removeListener('claude:session-detected', handleSessionDetected);
     };
   }, [workspace?.tabs.size]); // Re-init when tabs change
 
