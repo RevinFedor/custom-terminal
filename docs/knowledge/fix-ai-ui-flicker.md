@@ -15,9 +15,13 @@
 5. Только тогда вызывается `setGeminiSessionId()`, и InfoPanel "просыпается".
 
 ## Solution: Immediate Injection
-Изменен метод создания вкладок для AI-команд. Теперь `geminiSessionId` передается в `options` метода `createTab` или `createTabAfterCurrent`.
+Изменен метод создания вкладок для AI-команд. Теперь `geminiSessionId` / `claudeSessionId` передается в `options` метода `createTab` или `createTabAfterCurrent`.
 - Таб создается **уже** с ID сессии.
 - InfoPanel видит ID мгновенно, не дожидаясь готовности PTY.
 
+### Применение паттерна
+1. **Fork/Rollback:** При создании форка или отката ID сессии передаётся в `createTab()` напрямую.
+2. **History Restore:** При восстановлении вкладки из History (ProjectHome) `claudeSessionId` / `geminiSessionId` берутся из SQLite и передаются в `createTab()`. Sniper Watcher **не нужен** — ID уже известен. См. `features/project-home.md`.
+
 ## Результат
-Бесшовный переход между вкладками и мгновенное отображение статуса сессии после отката.
+Бесшовный переход между вкладками и мгновенное отображение статуса сессии после отката или восстановления из истории.

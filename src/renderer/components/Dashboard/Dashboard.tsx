@@ -9,8 +9,16 @@ import { Plus } from 'lucide-react';
 
 const { ipcRenderer } = window.require('electron');
 
+interface ClaudeProcess {
+  pid: number;
+  cwd: string;
+  startTime: string;
+  command: string;
+}
+
 export default function Dashboard() {
   const [processStatus, setProcessStatus] = useState<Map<string, boolean>>(new Map());
+  const [claudeProcesses, setClaudeProcesses] = useState<ClaudeProcess[]>([]);
   const { projects, loadProjects } = useProjectsStore();
   const { openProject, openProjects } = useWorkspaceStore();
   const { bookmarks, loadBookmarks, addBookmarkFromDialog, updateBookmark, deleteBookmark } = useBookmarksStore();
@@ -75,6 +83,22 @@ export default function Dashboard() {
       ipcRenderer.removeListener('terminal:command-finished', handleCommandFinished);
     };
   }, [openProjects.size]);
+
+  // Poll for active Claude processes
+  useEffect(() => {
+    const fetchProcesses = async () => {
+      try {
+        const procs = await ipcRenderer.invoke('system:get-claude-processes');
+        setClaudeProcesses(procs || []);
+      } catch {
+        setClaudeProcesses([]);
+      }
+    };
+
+    fetchProcesses();
+    const interval = setInterval(fetchProcesses, 10000);
+    return () => clearInterval(interval);
+  }, []);
 
   // Create project from bookmark - always creates a NEW project instance
   const handleCreateProjectFromBookmark = async (bookmark: Bookmark) => {
@@ -207,6 +231,32 @@ export default function Dashboard() {
             </div>
           </div>
         </div>
+
+        {/* Active Claude Processes */}
+        {claudeProcesses.length > 0 && (
+          <div className="mt-8">
+            <h2 className="text-sm font-medium text-[#888] mb-3">Active Claude Processes</h2>
+            <div className="flex flex-wrap gap-2">
+              {claudeProcesses.map((proc) => {
+                const folderName = proc.cwd.split('/').filter(Boolean).pop() || proc.cwd;
+                return (
+                  <div
+                    key={proc.pid}
+                    className="flex items-center gap-2 px-3 py-2.5 rounded-lg border border-[#333] bg-[#1a1a1a] transition-colors hover:border-[#444]"
+                    title={`PID: ${proc.pid}\nCWD: ${proc.cwd}\nCommand: ${proc.command}`}
+                  >
+                    <span
+                      className="w-2 h-2 rounded-full flex-shrink-0"
+                      style={{ backgroundColor: '#0dbc79' }}
+                    />
+                    <span className="text-sm text-[#ccc]">{folderName}</span>
+                    <span className="text-xs text-[#666]">{proc.startTime}</span>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

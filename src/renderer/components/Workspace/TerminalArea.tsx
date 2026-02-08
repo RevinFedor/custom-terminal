@@ -1,6 +1,7 @@
 import React, { memo, useMemo, useEffect, useState } from 'react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
+import { useUIStore } from '../../store/useUIStore';
 import Terminal from './Terminal';
 import BrowserTab from './BrowserTab';
 import { motion, AnimatePresence } from 'framer-motion';
@@ -127,6 +128,8 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
   const clearInterruptedState = useWorkspaceStore((state) => state.clearInterruptedState);
   const projects = useProjectsStore((state) => state.projects);
 
+  const currentView = useUIStore((s) => s.currentView);
+
   const currentWorkspace = openProjects.get(projectId);
   const currentProject = projects[projectId];
 
@@ -195,7 +198,7 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
       const isActiveProject = projId === projectId;
 
       workspace.tabs.forEach((tab) => {
-        const isActive = isActiveProject && workspace.activeTabId === tab.id;
+        const isActive = isActiveProject && workspace.activeTabId === tab.id && currentView === 'terminal';
         if (tab.tabType === 'browser') {
           result.push(
             <BrowserTab
@@ -225,7 +228,7 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
     });
 
     return result;
-  }, [terminalKeys, projectId, openProjects]);
+  }, [terminalKeys, projectId, openProjects, currentView]);
 
   // Listen for Claude fork completion to create new tab with command
   useEffect(() => {
