@@ -10,7 +10,7 @@
    - Система читает буфер обмена.
    - Очищает логи (Grafana/Console) от мусора.
    - Записывает результат обратно в буфер.
-   - Показывает Toast с информацией о проценте сжатия. См. `knowledge/fact-logs-compression.md`.
+   - Показывает Toast с информацией о проценте сжатия. См. `knowledge/environment-fixes.md`.
 
 ## Behavior Specs
 - **:::pasted Syntax:** Для вставки в чат используется кастомный разделитель `:::pasted`.
