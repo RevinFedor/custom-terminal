@@ -3,6 +3,7 @@ const path = require('path');
 const pty = require('node-pty');
 const fs = require('fs');
 const os = require('os');
+const { stripVTControlCharacters } = require('node:util');
 
 // Disable HTTP cache to ensure fresh code after updates
 app.commandLine.appendSwitch('disable-http-cache');
@@ -579,14 +580,13 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
       const currentState = claudeState.get(tabId);
 
       if (currentState) {
-        const stripped = data.replace(/\x1b\[[0-9;]*m/g, '');
+        const stripped = stripVTControlCharacters(data);
         const term = terminals.get(tabId);
 
-        console.log(`[Claude Handshake] State: ${currentState}, bytes: ${data.length}`);
-
-        // STEP 1: WAITING_PROMPT -> See ">" -> Start debounce for Tab
-        if (currentState === 'WAITING_PROMPT' && stripped.includes('>')) {
-          console.log(`[Claude Handshake] Tab ${tabId}: Prompt ">" detected. Starting debounce...`);
+        // STEP 1: WAITING_PROMPT -> See prompt char -> Start debounce for Tab
+        // Claude v2.1.32+ uses ⏵ (U+23F5) instead of >
+        if (currentState === 'WAITING_PROMPT' && (stripped.includes('⏵') || stripped.includes('>'))) {
+          console.log(`[Claude Handshake] Tab ${tabId}: Prompt detected. Starting debounce...`);
           claudeState.set(tabId, 'DEBOUNCE_PROMPT');
 
           // Start debounce timer
@@ -1499,80 +1499,114 @@ ipcMain.handle('session:get-visual', async (event, { dirPath, tabIndex }) => {
 
 const crypto = require('crypto');
 
-// Sniper Watcher: watch for new .jsonl file creation when claude starts
-// This captures the session ID that Claude creates
-ipcMain.on('claude:spawn-with-watcher', (event, { tabId, cwd }) => {
-  const projectSlug = cwd.replace(/\//g, '-');
-  const projectDir = path.join(os.homedir(), '.claude', 'projects', projectSlug);
-
-  console.log('[Sniper] Starting watcher for tab:', tabId);
-  console.log('[Sniper] Watching directory:', projectDir);
-
-  const startTime = Date.now();
+// Sniper Watcher: detect new .jsonl session files via fs.watch + polling fallback
+// fs.watch alone is unreliable on macOS (FSEvents init delay), so we also poll
+function startSessionSniper(projectDir, startTime, onFound) {
+  let sessionFound = false;
   let watcher = null;
-  let sessionFound = false; // Flag to prevent multiple detections
+  let pollInterval = null;
+  let timeoutTimer = null;
 
-  const closeWatcher = () => {
-    if (watcher) {
-      try { watcher.close(); } catch (e) {}
-      watcher = null;
-      console.log('[Sniper] Watcher closed for tab:', tabId);
+  const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.jsonl$/i;
+
+  // Snapshot existing files before Claude starts
+  const existingFiles = new Set();
+  try {
+    const files = fs.readdirSync(projectDir);
+    for (const f of files) {
+      if (uuidPattern.test(f)) existingFiles.add(f);
+    }
+  } catch (e) {}
+  console.log('[Sniper] Snapshot:', existingFiles.size, 'existing files in', projectDir);
+
+  const cleanup = () => {
+    if (watcher) { try { watcher.close(); } catch(e) {} watcher = null; }
+    if (pollInterval) { clearInterval(pollInterval); pollInterval = null; }
+    if (timeoutTimer) { clearTimeout(timeoutTimer); timeoutTimer = null; }
+  };
+
+  const checkFile = (filename) => {
+    if (sessionFound) return;
+    if (!uuidPattern.test(filename)) return;
+    if (existingFiles.has(filename)) return; // old file, skip
+
+    const filePath = path.join(projectDir, filename);
+    try {
+      const stats = fs.statSync(filePath);
+      const fileTime = stats.birthtimeMs || stats.mtimeMs;
+      console.log('[Sniper] New file:', filename, 'time:', fileTime, 'startTime:', startTime, 'diff:', fileTime - startTime);
+      if (fileTime >= startTime - 1000) {
+        sessionFound = true;
+        const sessionId = filename.replace('.jsonl', '');
+        console.log('[Sniper] ✅ Session detected:', sessionId);
+        cleanup();
+        onFound(sessionId);
+      } else {
+        console.log('[Sniper] File too old, skipping');
+      }
+    } catch (e) {
+      console.log('[Sniper] stat error:', e.message);
     }
   };
 
+  // Ensure directory exists
   try {
-    // Ensure directory exists (Claude may create it)
     if (!fs.existsSync(projectDir)) {
       fs.mkdirSync(projectDir, { recursive: true });
+      console.log('[Sniper] Created directory:', projectDir);
     }
+  } catch (e) {}
 
+  // Method 1: fs.watch (may or may not fire on macOS)
+  try {
     watcher = fs.watch(projectDir, (eventType, filename) => {
-      // Already found a session - ignore all further events
-      if (sessionFound) return;
-
-      // Only care about UUID format .jsonl files (ignore agent-* files)
-      if (!filename || !filename.endsWith('.jsonl')) return;
-
-      // UUID format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx.jsonl
-      const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.jsonl$/i;
-      if (!uuidPattern.test(filename)) {
-        console.log('[Sniper] Ignoring non-UUID file:', filename);
-        return;
-      }
-
-      const filePath = path.join(projectDir, filename);
-
-      // Check if file is fresh (created after our start time)
-      fs.stat(filePath, (err, stats) => {
-        if (err || sessionFound) return;
-
-        // Check birthtime with 500ms tolerance
-        const fileTime = stats.birthtimeMs || stats.mtimeMs;
-        if (fileTime >= startTime - 500) {
-          sessionFound = true; // Lock - no more detections
-          const sessionId = filename.replace('.jsonl', '');
-          console.log('[Sniper] ✅ Caught session:', sessionId);
-
-          // Send session ID back to renderer
-          event.sender.send('claude:session-detected', { tabId, sessionId });
-
-          // Mission complete, close watcher
-          closeWatcher();
-        }
-      });
+      console.log('[Sniper] fs.watch event:', eventType, filename);
+      if (filename) checkFile(filename);
     });
-
-    // Safety timeout: close watcher after 5 seconds
-    setTimeout(() => {
-      if (!sessionFound) {
-        console.log('[Sniper] Timeout - no session detected for tab:', tabId);
-      }
-      closeWatcher();
-    }, 5000);
-
+    console.log('[Sniper] fs.watch active');
   } catch (e) {
-    console.error('[Sniper] Error setting up watcher:', e.message);
+    console.log('[Sniper] fs.watch failed:', e.message);
   }
+
+  // Method 2: Directory polling every 1s (reliable fallback)
+  let pollCount = 0;
+  pollInterval = setInterval(() => {
+    pollCount++;
+    try {
+      const files = fs.readdirSync(projectDir);
+      const newFiles = files.filter(f => uuidPattern.test(f) && !existingFiles.has(f));
+      if (newFiles.length > 0) {
+        console.log('[Sniper] Poll #' + pollCount + ': found', newFiles.length, 'new file(s):', newFiles[0]);
+      }
+      for (const f of newFiles) {
+        checkFile(f);
+        if (sessionFound) break;
+      }
+    } catch (e) {}
+  }, 1000);
+
+  // Safety timeout: 30s
+  timeoutTimer = setTimeout(() => {
+    if (!sessionFound) {
+      console.log('[Sniper] Timeout (30s) — no session detected after', pollCount, 'polls');
+    }
+    cleanup();
+  }, 30000);
+
+  return cleanup;
+}
+
+// Sniper Watcher handler: watch for new .jsonl file creation when claude starts
+ipcMain.on('claude:spawn-with-watcher', (event, { tabId, cwd }) => {
+  const projectSlug = cwd.replace(/\//g, '-');
+  const projectDir = path.join(os.homedir(), '.claude', 'projects', projectSlug);
+  const startTime = Date.now();
+
+  console.log('[Sniper] Starting for tab:', tabId, 'dir:', projectDir);
+
+  startSessionSniper(projectDir, startTime, (sessionId) => {
+    event.sender.send('claude:session-detected', { tabId, sessionId });
+  });
 
   // Let the command through - don't intercept, just watch
   const term = terminals.get(tabId);
@@ -2837,55 +2871,19 @@ ipcMain.on('claude:run-command', (event, { tabId, command, sessionId, forkSessio
   }
 
   switch (command) {
-    case 'claude':
-      // New session - start watcher and run claude
-      console.log('[Claude Runner] Starting new session with watcher');
-
+    case 'claude': {
+      // New session - start sniper and run claude
       const projectSlug = cwd.replace(/\//g, '-');
       const projectDir = path.join(os.homedir(), '.claude', 'projects', projectSlug);
-      const startTime = Date.now();
-      let watcher = null;
-      let sessionFound = false;
 
-      const closeWatcher = () => {
-        if (watcher) {
-          try { watcher.close(); } catch (e) {}
-          watcher = null;
-        }
-      };
+      console.log('[Claude Runner] Starting new session, sniper dir:', projectDir);
 
-      try {
-        if (!fs.existsSync(projectDir)) {
-          fs.mkdirSync(projectDir, { recursive: true });
-        }
+      startSessionSniper(projectDir, Date.now(), (sessionId) => {
+        console.log('[Claude Runner] Sniper detected session:', sessionId);
+        event.sender.send('claude:session-detected', { tabId, sessionId });
+      });
 
-        watcher = fs.watch(projectDir, (eventType, filename) => {
-          if (sessionFound) return;
-          if (!filename || !filename.endsWith('.jsonl')) return;
-
-          const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.jsonl$/i;
-          if (!uuidPattern.test(filename)) return;
-
-          const filePath = path.join(projectDir, filename);
-          fs.stat(filePath, (err, stats) => {
-            if (err || sessionFound) return;
-            const fileTime = stats.birthtimeMs || stats.mtimeMs;
-            if (fileTime >= startTime - 500) {
-              sessionFound = true;
-              const detectedSessionId = filename.replace('.jsonl', '');
-              console.log('[Claude Runner] ✅ Session detected:', detectedSessionId);
-              event.sender.send('claude:session-detected', { tabId, sessionId: detectedSessionId });
-              closeWatcher();
-            }
-          });
-        });
-
-        setTimeout(() => closeWatcher(), 5000);
-      } catch (e) {
-        console.error('[Claude Runner] Watcher error:', e.message);
-      }
-
-      // Enable thinking mode detection (will send Tab when '>' prompt appears)
+      // Enable thinking mode detection (will send Tab when prompt appears)
       claudeState.set(tabId, 'WAITING_PROMPT');
 
       // If prompt provided, save it to send AFTER thinking mode is enabled
@@ -2897,6 +2895,7 @@ ipcMain.on('claude:run-command', (event, { tabId, command, sessionId, forkSessio
       // Always launch claude without prompt (prompt will be sent after Tab)
       term.write('claude --dangerously-skip-permissions\r');
       break;
+    }
 
     case 'claude-c':
       // Continue session

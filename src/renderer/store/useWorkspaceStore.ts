@@ -8,6 +8,8 @@ export type TabColor = 'default' | 'red' | 'yellow' | 'green' | 'blue' | 'purple
 
 export type CommandType = 'generic' | 'devServer' | 'claude' | 'gemini';
 
+export type TabType = 'terminal' | 'browser';
+
 // Helper: Check if tab has an interrupted AI session that can be resumed
 export const isTabInterrupted = (tab: { wasInterrupted?: boolean; claudeSessionId?: string; geminiSessionId?: string }): boolean => {
   return !!(tab.wasInterrupted && (tab.claudeSessionId || tab.geminiSessionId));
@@ -15,7 +17,7 @@ export const isTabInterrupted = (tab: { wasInterrupted?: boolean; claudeSessionI
 
 // Typed pending action - executed after terminal is ready
 export interface PendingAction {
-  type: 'claude-fork' | 'claude-continue' | 'gemini-fork' | 'gemini-continue' | 'shell-command';
+  type: 'claude-fork' | 'claude-continue' | 'claude-new' | 'gemini-fork' | 'gemini-continue' | 'gemini-new' | 'shell-command';
   sessionId?: string;    // For claude-fork, claude-continue, gemini-fork, gemini-continue
   command?: string;      // For shell-command
 }
@@ -29,6 +31,12 @@ interface Tab {
   colorSetManually?: boolean; // True if user changed color manually - prevents auto-color override
   commandType?: CommandType; // Type of running command (for restart button visibility)
   isUtility?: boolean;
+  tabType?: TabType; // Terminal or browser tab
+  url?: string; // URL for browser tabs
+  terminalId?: string; // Terminal ID for browser tabs (linked terminal)
+  terminalName?: string; // Terminal name for browser tabs
+  activeView?: 'browser' | 'terminal'; // Which view is active in the tab
+  createdAt?: number; // Timestamp when tab was created
   claudeSessionId?: string; // Active Claude Code session UUID (detected from terminal output)
   geminiSessionId?: string; // Active Gemini CLI session ID (detected via Sniper Watcher)
   pendingAction?: PendingAction; // Action to execute when terminal is ready
@@ -80,8 +88,8 @@ interface WorkspaceStore {
   closeProject: (projectId: string) => Promise<void>;
 
   // Tab management
-  createTab: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string }) => Promise<string>;
-  createTabAfterCurrent: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string }) => Promise<string>;
+  createTab: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; tabType?: TabType; url?: string }) => Promise<string>;
+  createTabAfterCurrent: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; tabType?: TabType; url?: string }) => Promise<string>;
   closeTab: (projectId: string, tabId: string) => Promise<void>;
   switchTab: (projectId: string, tabId: string) => void;
   renameTab: (projectId: string, tabId: string, newName: string) => void;

@@ -1,11 +1,78 @@
-import React from 'react';
-import { useWorkspaceStore, TabColor } from '../../store/useWorkspaceStore';
+import React, { useState, useEffect } from 'react';
+import { useWorkspaceStore, TabColor, TabType, PendingAction } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import { useUIStore } from '../../store/useUIStore';
-import { Terminal, FolderOpen, Plus } from 'lucide-react';
+import { Terminal, FolderOpen, Plus, Clock, Trash2 } from 'lucide-react';
+import { motion, AnimatePresence } from 'framer-motion';
+
+const { ipcRenderer } = window.require('electron');
 
 interface ProjectHomeProps {
   projectId: string;
+}
+
+interface TabHistoryEntry {
+  id: number;
+  project_id: string;
+  name: string;
+  cwd: string;
+  color: string | null;
+  notes: string | null;
+  command_type: string | null;
+  tab_type: string;
+  url: string | null;
+  created_at: number;
+  closed_at: number;
+  claude_session_id: string | null;
+  gemini_session_id: string | null;
+}
+
+type TimeGroup = 'Today' | 'Yesterday' | 'This Week' | 'This Month' | 'Older';
+
+const TIME_GROUP_ORDER: TimeGroup[] = ['Today', 'Yesterday', 'This Week', 'This Month', 'Older'];
+
+function getTimeGroup(timestamp: number): TimeGroup {
+  const now = new Date();
+  const date = new Date(timestamp * 1000);
+
+  const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const yesterdayStart = new Date(todayStart.getTime() - 86400000);
+  const weekStart = new Date(todayStart.getTime() - todayStart.getDay() * 86400000);
+  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+
+  if (date >= todayStart) return 'Today';
+  if (date >= yesterdayStart) return 'Yesterday';
+  if (date >= weekStart) return 'This Week';
+  if (date >= monthStart) return 'This Month';
+  return 'Older';
+}
+
+function groupByTime(entries: TabHistoryEntry[]): Map<TimeGroup, TabHistoryEntry[]> {
+  const groups = new Map<TimeGroup, TabHistoryEntry[]>();
+  for (const entry of entries) {
+    const group = getTimeGroup(entry.closed_at);
+    if (!groups.has(group)) groups.set(group, []);
+    groups.get(group)!.push(entry);
+  }
+  // Return in order, skipping empty groups
+  const ordered = new Map<TimeGroup, TabHistoryEntry[]>();
+  for (const key of TIME_GROUP_ORDER) {
+    if (groups.has(key)) ordered.set(key, groups.get(key)!);
+  }
+  return ordered;
+}
+
+function formatTimestamp(unix: number): string {
+  const date = new Date(unix * 1000);
+  return date.toLocaleDateString('en-US', {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+  }) + ', ' + date.toLocaleTimeString('en-US', {
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  });
 }
 
 // Color configs matching TabBar
@@ -24,9 +91,11 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
   const { openProjects, switchTab, createTab } = useWorkspaceStore();
   const { projects, updateProject } = useProjectsStore();
   const { setCurrentView } = useUIStore();
-  const [syncName, setSyncName] = React.useState<string | null>(null);
+  const [syncName, setSyncName] = useState<string | null>(null);
+  const [history, setHistory] = useState<TabHistoryEntry[]>([]);
+  const [hoveredHistoryId, setHoveredHistoryId] = useState<number | null>(null);
 
-  React.useEffect(() => {
+  useEffect(() => {
     const handleSync = (e: any) => {
       if (e.detail.projectId === projectId) {
         setSyncName(e.detail.name);
@@ -38,6 +107,63 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
 
   const workspace = openProjects.get(projectId);
   const project = projects[projectId];
+  const tabs = workspace ? Array.from(workspace.tabs.values()) : [];
+
+  // Restore a closed tab from history
+  const restoreTab = async (entry: TabHistoryEntry) => {
+    console.log('[RESTORE] 1. restoreTab clicked:', {
+      name: entry.name,
+      cwd: entry.cwd,
+      command_type: entry.command_type,
+      color: entry.color,
+      tab_type: entry.tab_type,
+      claude_session_id: entry.claude_session_id,
+      gemini_session_id: entry.gemini_session_id,
+    });
+
+    // Build pendingAction: resume old session if ID exists, otherwise start new
+    let pendingAction: PendingAction | undefined;
+    if (entry.command_type === 'claude') {
+      if (entry.claude_session_id) {
+        pendingAction = { type: 'claude-continue', sessionId: entry.claude_session_id };
+      } else {
+        pendingAction = { type: 'claude-new' };
+      }
+    } else if (entry.command_type === 'gemini') {
+      if (entry.gemini_session_id) {
+        pendingAction = { type: 'gemini-continue', sessionId: entry.gemini_session_id };
+      } else {
+        pendingAction = { type: 'gemini-new' };
+      }
+    }
+
+    console.log('[RESTORE] 2. pendingAction built:', pendingAction);
+
+    setCurrentView('terminal');
+    console.log('[RESTORE] 3. setCurrentView("terminal") done, calling createTab...');
+    const tabId = await createTab(projectId, entry.name, entry.cwd, {
+      color: (entry.color || undefined) as TabColor | undefined,
+      notes: entry.notes || undefined,
+      commandType: entry.command_type as any || undefined,
+      tabType: (entry.tab_type || 'terminal') as TabType,
+      url: entry.url || undefined,
+      pendingAction,
+    });
+    console.log('[RESTORE] 4. createTab returned tabId:', tabId);
+
+    // Remove from history after successful restore
+    await ipcRenderer.invoke('project:delete-tab-history-entry', { id: entry.id });
+    setHistory(prev => prev.filter(h => h.id !== entry.id));
+    console.log('[RESTORE] 4a. History entry deleted, id:', entry.id);
+  };
+
+  // Fetch history when projectId changes or tabs count changes (tab closed -> refetch)
+  useEffect(() => {
+    if (!projectId) return;
+    ipcRenderer.invoke('project:get-tab-history', { projectId }).then((data: TabHistoryEntry[]) => {
+      setHistory(data || []);
+    });
+  }, [projectId, tabs.length]);
 
   const displayName = syncName || project?.name || '';
 
@@ -48,6 +174,11 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
     }
   };
 
+  const handleClearHistory = async () => {
+    await ipcRenderer.invoke('project:clear-tab-history', { projectId });
+    setHistory([]);
+  };
+
   if (!workspace || !project) {
     return (
       <div className="flex-1 flex items-center justify-center text-[#666]">
@@ -56,18 +187,17 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
     );
   }
 
-  const tabs = Array.from(workspace.tabs.values());
-
   const handleTabClick = (tabId: string) => {
     switchTab(projectId, tabId);
     setCurrentView('terminal');
   };
 
-  // Get folder name from path
   const getFolderName = (path: string) => {
     const parts = path.split('/');
     return parts[parts.length - 1] || path;
   };
+
+  const groupedHistory = groupByTime(history);
 
   return (
     <div className="flex-1 bg-bg-main p-6 overflow-y-auto">
@@ -80,7 +210,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
         </div>
       </div>
 
-      {/* Tabs Grid */}
+      {/* Active Tabs Grid */}
       <div className="mb-4 overflow-hidden">
         <h2 className="text-sm text-[#888] mb-3">Active Tabs ({tabs.length})</h2>
         <div className="flex flex-wrap gap-3 w-full">
@@ -115,7 +245,6 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
                   }
                 }}
               >
-                {/* Tab Name */}
                 <div className="flex items-center gap-2 w-full">
                   <Terminal size={12} className="text-[#888] flex-shrink-0" />
                   <span
@@ -126,8 +255,6 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
                     {tab.name}
                   </span>
                 </div>
-
-                {/* CWD */}
                 <span
                   className="text-[10px] text-[#666] truncate w-full"
                   title={tab.cwd}
@@ -162,6 +289,128 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
           </button>
         </div>
       </div>
+
+      {/* History Section */}
+      {history.length > 0 && (
+        <div className="mt-6">
+          <div className="flex items-center justify-between mb-3">
+            <div className="flex items-center gap-2">
+              <Clock size={14} className="text-[#888]" />
+              <h2 className="text-sm text-[#888]">History ({history.length})</h2>
+            </div>
+            <button
+              onClick={handleClearHistory}
+              className="flex items-center gap-1 text-[11px] text-[#666] hover:text-[#999] cursor-pointer transition-colors"
+            >
+              <Trash2 size={12} />
+              Clear
+            </button>
+          </div>
+
+          {Array.from(groupedHistory.entries()).map(([group, entries]) => (
+            <div key={group} className="mb-4">
+              <div className="text-[10px] text-[#555] uppercase tracking-wider mb-2">{group}</div>
+              <div className="flex flex-wrap gap-2">
+                {entries.map((entry) => {
+                  const color = (entry.color || 'default') as TabColor;
+                  const colorConfig = TAB_COLORS[color];
+
+                  return (
+                    <div
+                      key={entry.id}
+                      className="relative"
+                      onMouseEnter={() => setHoveredHistoryId(entry.id)}
+                      onMouseLeave={() => setHoveredHistoryId(null)}
+                    >
+                      <div
+                        className="transition-all duration-150 cursor-pointer hover:opacity-70"
+                        onClick={() => restoreTab(entry)}
+                        style={{
+                          maxWidth: '140px',
+                          minWidth: '90px',
+                          padding: '6px 10px',
+                          backgroundColor: colorConfig.bgColor,
+                          borderRadius: '5px',
+                          borderLeft: `2px solid ${colorConfig.borderColor}`,
+                          opacity: 0.5,
+                          display: 'flex',
+                          flexDirection: 'column',
+                          gap: '1px',
+                        }}
+                      >
+                        <span
+                          className="text-[12px] text-white truncate"
+                          style={{ maxWidth: '120px' }}
+                          title={entry.name}
+                        >
+                          {entry.name}
+                        </span>
+                        <span className="text-[9px] text-[#666] truncate" title={entry.cwd}>
+                          {getFolderName(entry.cwd)}
+                        </span>
+                      </div>
+
+                      {/* Hover Popover with invisible bridge */}
+                      <AnimatePresence>
+                        {hoveredHistoryId === entry.id && (
+                          <motion.div
+                            initial={{ opacity: 0, y: 4 }}
+                            animate={{ opacity: 1, y: 0 }}
+                            exit={{ opacity: 0, y: 4 }}
+                            transition={{ duration: 0.15 }}
+                            className="absolute z-50"
+                            style={{
+                              bottom: '100%',
+                              left: 0,
+                              paddingBottom: '8px', // Invisible bridge gap
+                            }}
+                          >
+                            <div
+                              style={{
+                                minWidth: '200px',
+                                padding: '8px 10px',
+                                backgroundColor: '#1e1e1e',
+                                border: '1px solid #333',
+                                borderRadius: '6px',
+                              }}
+                            >
+                              {entry.notes && (
+                                <div className="text-[11px] text-[#ccc] mb-2">
+                                  <span className="text-[#888]">Notes: </span>
+                                  {entry.notes}
+                                </div>
+                              )}
+                              <div className="text-[10px] text-[#888] space-y-0.5">
+                                <div>Created: {formatTimestamp(entry.created_at)}</div>
+                                <div>Closed: {formatTimestamp(entry.closed_at)}</div>
+                                <div className="truncate" title={entry.cwd}>Path: {entry.cwd}</div>
+                                {entry.command_type && (
+                                  <div>Type: {entry.command_type}</div>
+                                )}
+                              </div>
+                              {/* Restore button */}
+                              <div
+                                className="mt-2 pt-2 border-t border-[#333] text-[10px] text-[#DA7756] cursor-pointer hover:text-[#e89070]"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setHoveredHistoryId(null);
+                                  restoreTab(entry);
+                                }}
+                              >
+                                Восстановить вкладку
+                              </div>
+                            </div>
+                          </motion.div>
+                        )}
+                      </AnimatePresence>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
