@@ -462,7 +462,7 @@ export default function GeminiPanel({ projectPath, geminiPrompt }: GeminiPanelPr
               Нет чатов. Выдели текст и нажми Research.
             </p>
             <div className="text-[10px] text-[#444] bg-[#252525] rounded-lg p-3">
-              <kbd className="bg-[#333] px-1.5 py-0.5 rounded text-[#888]">Cmd+Shift+R</kbd>
+              <kbd className="bg-[#333] px-1.5 py-0.5 rounded text-[#888]">Cmd+Shift+E</kbd>
               <span className="text-[#666] ml-2">Research Panel</span>
             </div>
           </div>

@@ -30,18 +30,25 @@
 ### 4. Legacy: Sniper Watcher
 Старый метод отслеживания файлов через `fs.watch` признан устаревшим и перенесен в базу знаний: `docs/knowledge/fact-legacy-sniper-watcher.md`.
 
-## Handshake (Thinking Mode + Prompt Injection)
-Стейт-машина для автоматического включения thinking mode и отправки промпта:
+## Handshake (Prompt Injection при запуске)
+Упрощённая стейт-машина для автоматической отправки промпта:
 
 ```
-WAITING_PROMPT → DEBOUNCE_PROMPT → TAB_SENT → READY
+WAITING_PROMPT → DEBOUNCE_PROMPT → send prompt → done
 ```
 
 ### Шаги
 1. **WAITING_PROMPT:** Ждёт появления prompt-символа (`⏵` для Claude v2.1.32+ или `>` для старых версий). Используется `stripVTControlCharacters()` для очистки ANSI.
-2. **DEBOUNCE_PROMPT:** Задержка 200мс после обнаружения промпта (Claude может вывести несколько строк).
-3. **TAB_SENT:** Отправляет `\t` (Tab) для включения thinking mode. Ждёт второго появления промпта.
-4. **READY:** Если есть `pendingPrompt`, отправляет его через Safe Write (chunked bracketed paste). См. `knowledge/terminal-core.md`.
+2. **DEBOUNCE_PROMPT:** Задержка 300мс после обнаружения промпта (Claude может вывести несколько строк).
+3. **Send prompt:** Отправляет `pendingPrompt` через Bracketed Paste + delayed `\r`. См. `knowledge/terminal-core.md`.
+
+Thinking mode при запуске обеспечивается `alwaysThinkingEnabled: true` в `~/.claude/settings.json`, Tab (`\t`) больше не отправляется.
+
+## TUI Control (Model + Think)
+Программное управление Claude TUI из интерфейса. См. `knowledge/fact-claude-tui-control.md`.
+
+- **Model:** Кнопки sonnet/opus/haiku в InfoPanel → `/model <alias>` через bracketed paste. Текущая модель из bridge-данных.
+- **Think:** Реактивный toggle через `meta+t` → парсинг TUI-пикера → auto-navigate → confirm. Обрабатывает второй диалог "Do you want to proceed?" автоматически.
 
 ## Behavior Specs
 - **Claude Process Monitor:** Виджет на Dashboard для отслеживания всех запущенных в системе процессов Claude CLI.

@@ -53,6 +53,13 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
   const [tabNotes, setTabNotes] = useState('');
   const [sessionCopied, setSessionCopied] = useState(false);
   const [isGeneratingDesc, setIsGeneratingDesc] = useState(false);
+  // Think mode toggle flash
+  const [thinkFlash, setThinkFlash] = useState<string | null>(null);
+  // Bridge metadata (model + context %) — cached per tab
+  const bridgeCacheRef = useRef<Map<string, { model: string; contextPct: number }>>(new Map());
+  const cached = activeTabId ? bridgeCacheRef.current.get(activeTabId) : undefined;
+  const [claudeModel, setClaudeModel] = useState<string | null>(cached?.model ?? null);
+  const [contextPct, setContextPct] = useState(cached?.contextPct ?? 0);
   // Manual session ID replace
   const [showSessionInput, setShowSessionInput] = useState(false);
   const [manualSessionId, setManualSessionId] = useState('');
@@ -81,10 +88,26 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
     });
   }, []);
 
-  // Reset manual input on tab switch
+  // Reset manual input on tab switch; restore cached bridge data
   useEffect(() => {
     setShowSessionInput(false);
     setManualSessionId('');
+    const c = activeTabId ? bridgeCacheRef.current.get(activeTabId) : undefined;
+    setClaudeModel(c?.model ?? null);
+    setContextPct(c?.contextPct ?? 0);
+  }, [activeTabId]);
+
+  // Listen for bridge metadata (model, context %) — cache per tab
+  useEffect(() => {
+    const handler = (_: any, data: { tabId: string; model: string; contextPct: number }) => {
+      bridgeCacheRef.current.set(data.tabId, { model: data.model, contextPct: data.contextPct });
+      if (data.tabId === activeTabId) {
+        setClaudeModel(data.model);
+        setContextPct(data.contextPct);
+      }
+    };
+    ipcRenderer.on('claude:bridge-update', handler);
+    return () => { ipcRenderer.removeListener('claude:bridge-update', handler); };
   }, [activeTabId]);
 
   // Poll for session ID changes (every 500ms)
@@ -538,6 +561,79 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
           </div>
         )}
       </div>
+
+      {/* Claude Controls: Model + Think (only when Claude session active) */}
+      {hasClaudeSession && activeTabId && (
+        <div className="mb-4">
+          <div className="text-[11px] uppercase text-[#888] mb-2">Контроль</div>
+          <div className="space-y-2">
+            {/* Model switcher */}
+            <div className="flex items-center gap-1">
+              <span className="text-[10px] text-[#666] w-12 flex-shrink-0">Model</span>
+              <div className="flex gap-1 flex-1">
+                {(['sonnet', 'opus', 'haiku'] as const).map((model) => {
+                  const isActive = claudeModel?.toLowerCase().includes(model);
+                  return (
+                    <button
+                      key={model}
+                      className={`flex-1 text-[10px] px-1.5 py-1 rounded transition-all cursor-pointer ${
+                        isActive
+                          ? 'bg-[#DA7756] text-white font-medium'
+                          : 'bg-[#2d2d2d] text-[#888] hover:text-white hover:bg-[#3d3d3d]'
+                      }`}
+                      onClick={() => {
+                        ipcRenderer.send('claude:send-command', activeTabId, '/model ' + model);
+                      }}
+                      title={'Switch to ' + model}
+                    >
+                      {model}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+            {/* Think mode toggle */}
+            <div className="flex items-center gap-1">
+              <span className="text-[10px] text-[#666] w-12 flex-shrink-0">Think</span>
+              <button
+                className={`flex-1 text-[10px] px-1.5 py-1 rounded transition-all cursor-pointer bg-[#2d2d2d] ${
+                  thinkFlash
+                    ? 'text-[#b4b9f9]'
+                    : 'text-[#888] hover:text-white hover:bg-[#3d3d3d]'
+                }`}
+                onClick={async () => {
+                  const result = await ipcRenderer.invoke('claude:toggle-thinking', activeTabId);
+                  if (result.success) {
+                    setThinkFlash(result.thinking ? 'think on' : 'think off');
+                    setTimeout(() => setThinkFlash(null), 3000);
+                  }
+                }}
+                title="Toggle thinking mode (meta+t)"
+              >
+                {thinkFlash || 'toggle'}
+              </button>
+            </div>
+            {/* Context % indicator */}
+            {contextPct > 0 && (
+              <div className="flex items-center gap-1">
+                <span className="text-[10px] text-[#666] w-12 flex-shrink-0">Ctx</span>
+                <div className="flex-1 h-1.5 bg-[#2d2d2d] rounded overflow-hidden">
+                  <div
+                    className="h-full rounded transition-all"
+                    style={{
+                      width: contextPct + '%',
+                      backgroundColor: contextPct > 80 ? '#ef4444' : contextPct > 50 ? '#f59e0b' : '#4ade80'
+                    }}
+                  />
+                </div>
+                <span className={`text-[10px] ${contextPct > 80 ? 'text-red-400' : contextPct > 50 ? 'text-yellow-400' : 'text-[#666]'}`}>
+                  {contextPct}%
+                </span>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* Commands with Toggle */}
       <div className="mb-4">

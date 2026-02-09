@@ -42,7 +42,8 @@
         - **Flow:** Claude → `statusline-bridge.sh` → запись JSON (`session_id`, `ppid`) в `~/.claude/bridge/` → `fs.watch` в Main процессе.
         - **Stability:** Это обеспечивает 100% точность привязки сессии к конкретному табу через сопоставление PID (ppid из файла → родительский shell PID → наш PTY).
         - **Legacy:** Ранняя реализация через Sniper Watcher (отслеживание создания файлов) сохранена в `docs/knowledge/fact-legacy-sniper-watcher.md`.
-    - **Claude Handshake:** Стейт-машина (WAITING_PROMPT → DEBOUNCE_PROMPT → TAB_SENT → READY) для автоматического включения thinking mode (`\t`) и отправки промпта. Поддерживает `⏵` (Claude v2.1.32+) и `>`. Используется `stripVTControlCharacters()`.
+    - **Claude Handshake:** Упрощённая стейт-машина (WAITING_PROMPT → DEBOUNCE_PROMPT → send prompt) для автоматической отправки промпта при запуске. Thinking mode обеспечивается `alwaysThinkingEnabled` в settings.json. Поддерживает `⏵` (Claude v2.1.32+) и `>`. Используется `stripVTControlCharacters()`.
+    - **Claude TUI Control:** Программное управление Ink TUI через PTY. Модель (`/model <alias>`) переключается через bracketed paste + delayed Enter. Think mode — через реактивный парсинг TUI-пикера (`meta+t`). См. `knowledge/fact-claude-tui-control.md`.
     - **Gemini Sniper:** Захват UUID через `fs.watch` на `session-*.json`. См. `knowledge/ai-automation.md`.
     - **Timeline & Export Engine:** Асинхронный парсинг JSONL файлов с использованием алгоритма **Backtrace** для фильтрации отменённых (Undo) веток диалога. 
      

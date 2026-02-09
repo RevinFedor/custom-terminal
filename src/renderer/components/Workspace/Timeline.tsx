@@ -5,7 +5,7 @@ import { terminalRegistry } from '../../utils/terminalRegistry';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 
-const { ipcRenderer } = window.require('electron');
+const { ipcRenderer, clipboard } = window.require('electron');
 
 // Portal for tooltip to escape overflow:hidden
 const TooltipPortal: React.FC<{ children: React.ReactNode }> = ({ children }) => {
@@ -61,9 +61,12 @@ function Timeline({ tabId, sessionId, cwd, isActive = true }: TimelineProps) {
   const [activeTooltipIndex, setActiveTooltipIndex] = useState<number | null>(null);
   const [isExpanded, setIsExpanded] = useState(false);
   const [selectionStartId, setSelectionStartId] = useState<string | null>(null);
+  const selectionStartIdRef = useRef<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [contextMenu, setContextMenu] = useState<{ x: number, y: number, entry: TimelineEntry } | null>(null);
   const [sessionBoundaries, setSessionBoundaries] = useState<SessionBoundary[]>([]);
+  const [copyingRange, setCopyingRange] = useState<{ startIndex: number, endIndex: number } | null>(null);
+  const [copiedRange, setCopiedRange] = useState<{ startIndex: number, endIndex: number } | null>(null);
 
   const notesPanelWidth = useUIStore(state => state.notesPanelWidth);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -187,53 +190,122 @@ function Timeline({ tabId, sessionId, cwd, isActive = true }: TimelineProps) {
     }
   };
 
-  const handleEntryClick = useCallback((entry: TimelineEntry) => {
-    if (entry.type === 'compact') {
-      console.log('[Timeline.handleEntryClick] Skipping compact entry:', entry.uuid);
+  const clickTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const handleEntryClick = (entry: TimelineEntry) => {
+    // Если режим копирования активен — реагируем сразу (без задержки)
+    if (selectionStartIdRef.current) {
+      if (selectionStartIdRef.current === entry.uuid) {
+        // Клик по той же точке → отменить выделение
+        selectionStartIdRef.current = null;
+        setSelectionStartId(null);
+      } else {
+        // Клик по другой точке → копировать
+        finishRangeSelection(entry);
+      }
       return;
     }
-    const searchText = entry.content.split('\n')[0].slice(0, 40).trim();
-    console.log('[Timeline.handleEntryClick] entry:', {
-      uuid: entry.uuid,
-      type: entry.type,
-      contentPreview: entry.content.slice(0, 60),
-      searchText,
-    });
 
-    if (searchText) {
-      terminalRegistry.searchAndScroll(tabId, searchText);
+    // Обычный клик — ждём чтобы отличить от двойного
+    if (clickTimerRef.current) {
+      clearTimeout(clickTimerRef.current);
+      clickTimerRef.current = null;
+      return;
     }
-  }, [tabId]);
+    clickTimerRef.current = setTimeout(() => {
+      clickTimerRef.current = null;
+      if (entry.type === 'compact') return;
+      const searchText = entry.content.split('\n')[0].slice(0, 40).trim();
+      if (searchText) {
+        terminalRegistry.searchAndScroll(tabId, searchText);
+      }
+    }, 250);
+  };
+
+  const handleEntryDoubleClick = (entry: TimelineEntry) => {
+    if (clickTimerRef.current) {
+      clearTimeout(clickTimerRef.current);
+      clickTimerRef.current = null;
+    }
+    selectionStartIdRef.current = entry.uuid;
+    setSelectionStartId(entry.uuid);
+  };
 
   const handleRightClick = (e: React.MouseEvent, entry: TimelineEntry) => {
     e.preventDefault();
-    setContextMenu({ x: e.pageX, y: e.pageY, entry });
+
+    // Context menu dimensions (approximate)
+    const menuWidth = 160;
+    const menuHeight = 100; // Approximate height for 2-3 items
+
+    // Calculate position with bounds checking
+    let x = e.pageX;
+    let y = e.pageY;
+
+    // Check right boundary
+    if (x + menuWidth > window.innerWidth) {
+      x = window.innerWidth - menuWidth - 10;
+    }
+
+    // Check bottom boundary (most important for the reported issue)
+    if (y + menuHeight > window.innerHeight) {
+      y = window.innerHeight - menuHeight - 10;
+    }
+
+    // Check top boundary
+    if (y < 10) {
+      y = 10;
+    }
+
+    setContextMenu({ x, y, entry });
   };
 
   const startRangeSelection = (entry: TimelineEntry) => {
+    selectionStartIdRef.current = entry.uuid;
     setSelectionStartId(entry.uuid);
     setContextMenu(null);
   };
 
   const finishRangeSelection = async (endEntry: TimelineEntry) => {
-    if (!selectionStartId || !sessionId) return;
-    
+    const startId = selectionStartIdRef.current;
+    if (!startId || !sessionId) return;
+
+    const startIndex = entries.findIndex(e => e.uuid === startId);
+    const endIndex = entries.findIndex(e => e.uuid === endEntry.uuid);
+    const range = {
+      startIndex: Math.min(startIndex, endIndex),
+      endIndex: Math.max(startIndex, endIndex),
+    };
+
+    // Clear selection, show blinking blue (loading state)
+    selectionStartIdRef.current = null;
+    setSelectionStartId(null);
+    setContextMenu(null);
+    setCopyingRange(range);
+
     try {
       const result = await ipcRenderer.invoke('claude:copy-range', {
         sessionId,
         cwd,
-        startUuid: selectionStartId,
+        startUuid: startId,
         endUuid: endEntry.uuid
       });
-      
+
+      // Loading done — hide blinking blue
+      setCopyingRange(null);
+
       if (result.success) {
-        await navigator.clipboard.writeText(result.content);
+        clipboard.writeText(result.content);
+
+        // Show green success flash
+        setCopiedRange(range);
+        setTimeout(() => {
+          setCopiedRange(null);
+        }, 800);
       }
     } catch (error) {
       console.error('[Timeline] Range copy failed:', error);
-    } finally {
-      setSelectionStartId(null);
-      setContextMenu(null);
+      setCopyingRange(null);
     }
   };
 
@@ -250,12 +322,17 @@ function Timeline({ tabId, sessionId, cwd, isActive = true }: TimelineProps) {
   };
 
   useEffect(() => {
-    const handleClickOutside = () => {
+    const handleClickOutside = (e: MouseEvent) => {
       setContextMenu(null);
       // Close expanded tooltip on outside click
       if (isExpanded) {
         setIsExpanded(false);
         setActiveTooltipIndex(null);
+      }
+      // Cancel range selection if clicking outside timeline
+      if (selectionStartIdRef.current && containerRef.current && !containerRef.current.contains(e.target as Node)) {
+        selectionStartIdRef.current = null;
+        setSelectionStartId(null);
       }
     };
     window.addEventListener('click', handleClickOutside);
@@ -400,6 +477,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true }: TimelineProps) {
                   onMouseEnter={() => handleMouseEnterSegment(index)}
                   onMouseLeave={(e) => handleMouseLeaveSegment(e)}
                   onClick={() => handleEntryClick(entry)}
+                  onDoubleClick={() => handleEntryDoubleClick(entry)}
                   onContextMenu={(e) => handleRightClick(e, entry)}
                 >
                   {/* Visual Indicator: Dot (normal) or Line (compact) */}
@@ -455,12 +533,46 @@ function Timeline({ tabId, sessionId, cwd, isActive = true }: TimelineProps) {
           })}
         </div>
 
-        {/* Selection Range Indicator */}
+        {/* Selection Range Indicator (active selection) */}
         {selectionStartId && hoveredIndex !== null && (
-          <div className="absolute left-0 right-0 pointer-events-none bg-blue-500/10 border-y border-blue-500/30"
+          <div
+            className="absolute left-0 right-0 pointer-events-none"
             style={{
               top: `${Math.min(entries.findIndex(e => e.uuid === selectionStartId), hoveredIndex) / entries.length * 100}%`,
               height: `${Math.abs(entries.findIndex(e => e.uuid === selectionStartId) - hoveredIndex + 1) / entries.length * 100}%`,
+              backgroundColor: 'rgba(59, 130, 246, 0.1)',
+              borderTop: '1px solid rgba(59, 130, 246, 0.3)',
+              borderBottom: '1px solid rgba(59, 130, 246, 0.3)',
+            }}
+          />
+        )}
+
+        {/* Loading Range Indicator (blinking blue while IPC runs) */}
+        {copyingRange && (
+          <div
+            className="absolute left-0 right-0 pointer-events-none animate-pulse"
+            style={{
+              top: `${copyingRange.startIndex / entries.length * 100}%`,
+              height: `${(copyingRange.endIndex - copyingRange.startIndex + 1) / entries.length * 100}%`,
+              backgroundColor: 'rgba(59, 130, 246, 0.15)',
+              borderTop: '1px solid rgba(59, 130, 246, 0.5)',
+              borderBottom: '1px solid rgba(59, 130, 246, 0.5)',
+              boxShadow: '0 0 12px rgba(59, 130, 246, 0.3)',
+            }}
+          />
+        )}
+
+        {/* Copied Range Animation (green success flash) */}
+        {copiedRange && (
+          <div
+            className="absolute left-0 right-0 pointer-events-none"
+            style={{
+              top: `${copiedRange.startIndex / entries.length * 100}%`,
+              height: `${(copiedRange.endIndex - copiedRange.startIndex + 1) / entries.length * 100}%`,
+              backgroundColor: 'rgba(34, 197, 94, 0.25)',
+              borderTop: '1px solid rgba(34, 197, 94, 0.6)',
+              borderBottom: '1px solid rgba(34, 197, 94, 0.6)',
+              boxShadow: '0 0 20px rgba(34, 197, 94, 0.4)',
             }}
           />
         )}
@@ -533,7 +645,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true }: TimelineProps) {
                     <div className="flex justify-between items-center mt-1 pt-2 border-t border-white/5">
                       <span className="text-[10px] text-white/30">{new Date(currentActiveEntry.timestamp).toLocaleTimeString()}</span>
                       <button
-                        onClick={(e) => { e.stopPropagation(); navigator.clipboard.writeText(currentActiveEntry.content); }}
+                        onClick={(e) => { e.stopPropagation(); clipboard.writeText(currentActiveEntry.content); }}
                         className="flex items-center gap-1.5 px-2 py-1 rounded bg-white/5 hover:bg-white/10 text-[10px] text-white/60 hover:text-white transition-colors cursor-pointer"
                       >
                         <Copy size={12} />
@@ -573,29 +685,37 @@ function Timeline({ tabId, sessionId, cwd, isActive = true }: TimelineProps) {
               }}
             >
               {!selectionStartId ? (
-                <button
-                  className="w-full text-left px-3 py-2 text-xs text-white hover:bg-blue-600 rounded transition-colors cursor-pointer"
-                  onClick={() => startRangeSelection(contextMenu.entry)}
-                >
-                  Начать копирование
-                </button>
+                <>
+                  <button
+                    className="w-full text-left px-3 py-2 text-xs text-white hover:bg-blue-600 rounded transition-colors cursor-pointer"
+                    onClick={(e) => { e.stopPropagation(); startRangeSelection(contextMenu.entry); }}
+                  >
+                    Начать копирование
+                  </button>
+                  <button
+                    className="w-full text-left px-3 py-2 text-xs text-white/60 hover:bg-white/5 rounded transition-colors cursor-pointer"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      clipboard.writeText(contextMenu.entry.content);
+                      setContextMenu(null);
+                    }}
+                  >
+                    Копировать текст сообщения
+                  </button>
+                </>
               ) : (
                 <button
-                  className="w-full text-left px-3 py-2 text-xs text-white hover:bg-green-600 rounded transition-colors cursor-pointer"
-                  onClick={() => finishRangeSelection(contextMenu.entry)}
+                  className="w-full text-left px-3 py-2 text-xs text-amber-400 hover:bg-red-600/20 rounded transition-colors cursor-pointer"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    selectionStartIdRef.current = null;
+                    setSelectionStartId(null);
+                    setContextMenu(null);
+                  }}
                 >
-                  Копировать до этой точки
+                  Отменить копирование
                 </button>
               )}
-              <button
-                className="w-full text-left px-3 py-2 text-xs text-white/60 hover:bg-white/5 rounded transition-colors cursor-pointer"
-                onClick={() => {
-                  navigator.clipboard.writeText(contextMenu.entry.content);
-                  setContextMenu(null);
-                }}
-              >
-                Копировать текст сообщения
-              </button>
             </div>
           </TooltipPortal>
         )}
