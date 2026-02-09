@@ -815,16 +815,16 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
                     e.stopPropagation();
                     if (!isCopying) handleCopySession();
                   }}
-                  title={isMultiSelect ? `Копировать ${selectedTabs.length} сессий` : "Копировать текущую сессию"}
+                  title={isMultiSelect ? `Копировать ${selectedTabs.length} сессий` : copySessionInput.trim() ? `Копировать: ${copySessionInput.trim().slice(0, 40)}...` : "Копировать текущую сессию"}
                 >
-                  {isMultiSelect ? `Copy ${selectedTabs.length} Sessions` : 'Copy Session'}
+                  {isMultiSelect ? `Copy ${selectedTabs.length} Sessions` : copySessionInput.trim() ? 'Copy Custom Session' : 'Copy Session'}
                 </div>
                 <div
                   className="text-[10px] text-[#DA7756]/70 mt-0.5 cursor-pointer"
                   onClick={() => !isCopying && setCopySessionExpanded(!copySessionExpanded)}
                 >
-                  {isCopying ? 'Копирование...' : 
-                    isMultiSelect ? `Экспорт ${selectedTabs.length} сессий в буфер` : 'Claude JSONL → clipboard'}
+                  {isCopying ? 'Копирование...' :
+                    isMultiSelect ? `Экспорт ${selectedTabs.length} сессий в буфер` : copySessionInput.trim() ? `ID: ${copySessionInput.trim().slice(0, 30)}` : 'Claude JSONL → clipboard'}
                 </div>
               </div>
               {/* Hide expand button when multi-select - no need for manual ID input */}

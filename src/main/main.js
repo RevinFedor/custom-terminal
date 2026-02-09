@@ -27,8 +27,8 @@ let mainWindow;
 const terminals = new Map(); // tabId -> ptyProcess
 const terminalProjects = new Map(); // tabId -> cwd path
 const terminalCommandState = new Map(); // tabId -> { isRunning: boolean, lastExitCode: number }
-// Claude Thinking Mode State Machine (Tab Handshake with debounce)
-// States: 'WAITING_PROMPT' -> 'DEBOUNCE_PROMPT' -> 'TAB_SENT' -> 'DEBOUNCE_TAB' -> 'READY'
+// Claude Handshake: prompt injection with debounce (thinking handled by alwaysThinkingEnabled)
+// States: 'WAITING_PROMPT' -> 'DEBOUNCE_PROMPT' -> send prompt -> done
 const claudeState = new Map(); // tabId -> state string | null
 const claudePendingPrompt = new Map(); // tabId -> prompt string
 const claudeDebounceTimers = new Map(); // tabId -> debounce timer ID
@@ -77,11 +77,21 @@ function startSessionBridge() {
 
       if (!tabId) return; // Not our process
 
+      // Always send bridge metadata (model, context) on every update
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('claude:bridge-update', {
+          tabId,
+          sessionId: data.session_id,
+          model: data.model || 'unknown',
+          contextPct: data.context_pct || 0
+        });
+      }
+
       // Check for session change
       if (bridgeKnownSessions.get(tabId) === data.session_id) return;
 
       bridgeKnownSessions.set(tabId, data.session_id);
-      console.log('[Bridge] ✅ Tab', tabId, '→ session:', data.session_id.substring(0, 8) + '...', '(model:', data.model + ', ctx:', data.context_pct + '%)');
+      console.log('[Bridge] Tab', tabId, '-> session:', data.session_id.substring(0, 8) + '...', '(model:', data.model + ', ctx:', data.context_pct + '%)');
 
       if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.webContents.send('claude:session-detected', { tabId, sessionId: data.session_id });
@@ -482,52 +492,66 @@ ipcMain.handle('claude:copy-range', async (event, { sessionId, cwd, startUuid, e
   if (!sessionId) return { success: false, error: 'No session ID' };
 
   try {
-    const claudeProjectsDir = path.join(os.homedir(), '.claude', 'projects');
-    let sourcePath = null;
+    // Use the same chain resolution as claude:get-timeline
+    // This ensures we can find UUIDs across plan mode boundaries
+    const { mergedMap: recordMap, lastRecord, sessionBoundaries } = resolveSessionChain(sessionId, cwd);
 
-    if (cwd) {
-      const projectSlug = cwd.replace(/\//g, '-');
-      const primaryPath = path.join(claudeProjectsDir, projectSlug, `${sessionId}.jsonl`);
-      if (fs.existsSync(primaryPath)) sourcePath = primaryPath;
-    }
+    if (!lastRecord) return { success: false, error: 'No records found' };
 
-    if (!sourcePath && fs.existsSync(claudeProjectsDir)) {
-      const projectDirs = fs.readdirSync(claudeProjectsDir).filter(d => fs.statSync(path.join(claudeProjectsDir, d)).isDirectory());
-      for (const dir of projectDirs) {
-        const checkPath = path.join(claudeProjectsDir, dir, `${sessionId}.jsonl`);
-        if (fs.existsSync(checkPath)) {
-          sourcePath = checkPath;
-          break;
+    // BACKTRACE: identical to claude:get-timeline
+    const activeHistory = [];
+    let current = lastRecord.uuid;
+    const seen = new Set();
+
+    while (current && !seen.has(current)) {
+      seen.add(current);
+      const record = recordMap.get(current);
+      if (!record) {
+        let recovered = false;
+        if (activeHistory.length > 0) {
+          const lastAdded = activeHistory[0];
+          if (lastAdded.type === 'system' && lastAdded.subtype === 'compact_boundary' &&
+              lastAdded.logicalParentUuid === current) {
+            if (lastAdded.parentUuid && recordMap.has(lastAdded.parentUuid) && !seen.has(lastAdded.parentUuid)) {
+              current = lastAdded.parentUuid;
+              recovered = true;
+            } else {
+              let bestPred = null;
+              for (const [uuid, entry] of recordMap) {
+                if (seen.has(uuid)) continue;
+                if (entry._fromFile === lastAdded._fromFile &&
+                    entry._fileIndex < lastAdded._fileIndex) {
+                  if (!bestPred || entry._fileIndex > bestPred._fileIndex) {
+                    bestPred = entry;
+                  }
+                }
+              }
+              if (bestPred) {
+                current = bestPred.uuid;
+                recovered = true;
+              }
+            }
+          }
+        }
+        if (recovered) continue;
+        break;
+      }
+
+      activeHistory.unshift(record);
+
+      let nextUuid = record.logicalParentUuid || record.parentUuid;
+      if (!nextUuid && sessionBoundaries.length > 0) {
+        for (const [uuid, entry] of recordMap) {
+          if (seen.has(uuid)) continue;
+          if (entry._isBridge && entry.parentUuid && entry.sessionId !== record.sessionId &&
+              !seen.has(entry.parentUuid)) {
+            nextUuid = entry.parentUuid;
+            break;
+          }
         }
       }
-    }
 
-    if (!sourcePath) return { success: false, error: 'File not found' };
-
-    const content = fs.readFileSync(sourcePath, 'utf-8');
-    const lines = content.trim().split('\n').filter(l => l.trim());
-    
-    // First, build the full message map
-    const recordMap = new Map();
-    let lastEntryWithUuid = null;
-    for (const line of lines) {
-      try {
-        const entry = JSON.parse(line);
-        if (entry.uuid) {
-          recordMap.set(entry.uuid, entry);
-          lastEntryWithUuid = entry;
-        }
-      } catch (e) {}
-    }
-
-    // Use backtrace to get the linear active history
-    const activeHistory = [];
-    let current = lastEntryWithUuid?.uuid;
-    while (current) {
-      const record = recordMap.get(current);
-      if (!record) break;
-      activeHistory.unshift(record);
-      current = record.logicalParentUuid || record.parentUuid;
+      current = nextUuid;
     }
 
     // Find the range in the active history
@@ -676,8 +700,10 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
       // Parse OSC 133 for command lifecycle events (just spy, don't modify)
       parseOSC133AndEmit(tabId, data);
 
-      // ========== CLAUDE THINKING MODE STATE MACHINE (Debounce Handshake) ==========
-      // Wait for UI to "settle" (no data for 300ms) before sending Tab/prompt
+      // ========== CLAUDE HANDSHAKE (Prompt Injection) ==========
+      // Wait for prompt to appear, debounce UI settling, then send pending prompt.
+      // Note: Tab (\t) for thinking mode is NOT sent here — alwaysThinkingEnabled in
+      // ~/.claude/settings.json handles it globally. Toggle is available via UI buttons.
       const DEBOUNCE_MS = 300;
       const currentState = claudeState.get(tabId);
 
@@ -685,67 +711,32 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
         const stripped = stripVTControlCharacters(data);
         const term = terminals.get(tabId);
 
-        // STEP 1: WAITING_PROMPT -> See prompt char -> Start debounce for Tab
+        // STEP 1: WAITING_PROMPT -> See prompt char -> Start debounce
         // Claude v2.1.32+ uses ⏵ (U+23F5) instead of >
         if (currentState === 'WAITING_PROMPT' && (stripped.includes('⏵') || stripped.includes('>'))) {
-          console.log(`[Claude Handshake] Tab ${tabId}: Prompt detected. Starting debounce...`);
+          console.log('[Claude Handshake] Tab ' + tabId + ': Prompt detected. Starting debounce...');
           claudeState.set(tabId, 'DEBOUNCE_PROMPT');
 
-          // Start debounce timer
-          const timerId = setTimeout(() => {
-            console.log(`[Claude Handshake] Tab ${tabId}: UI settled (${DEBOUNCE_MS}ms silence). Sending TAB...`);
-            term.write('\t');
-            claudeState.set(tabId, 'TAB_SENT');
-            claudeDebounceTimers.delete(tabId);
-          }, DEBOUNCE_MS);
-          claudeDebounceTimers.set(tabId, timerId);
-        }
-
-        // STEP 2: DEBOUNCE_PROMPT -> More data = Reset debounce
-        else if (currentState === 'DEBOUNCE_PROMPT') {
-          console.log(`[Claude Handshake] Tab ${tabId}: More data during debounce, resetting timer...`);
-          clearTimeout(claudeDebounceTimers.get(tabId));
-
-          const timerId = setTimeout(() => {
-            console.log(`[Claude Handshake] Tab ${tabId}: UI settled. Sending TAB...`);
-            term.write('\t');
-            claudeState.set(tabId, 'TAB_SENT');
-            claudeDebounceTimers.delete(tabId);
-          }, DEBOUNCE_MS);
-          claudeDebounceTimers.set(tabId, timerId);
-        }
-
-        // STEP 3: TAB_SENT -> Data received -> Start debounce for prompt
-        else if (currentState === 'TAB_SENT') {
-          console.log(`[Claude Handshake] Tab ${tabId}: UI reacted to Tab. Starting prompt debounce...`);
-          claudeState.set(tabId, 'DEBOUNCE_TAB');
-
           const timerId = setTimeout(async () => {
-            console.log(`[Claude Handshake] Tab ${tabId}: UI settled after Tab. Sending prompt via Bracketed Paste...`);
+            console.log('[Claude Handshake] Tab ' + tabId + ': UI settled (' + DEBOUNCE_MS + 'ms silence). Sending prompt...');
 
             if (claudePendingPrompt.has(tabId)) {
               const pendingPrompt = claudePendingPrompt.get(tabId);
               claudePendingPrompt.delete(tabId);
 
-              // Bracketed Paste Mode: tell terminal "this is a paste, not typing"
               const PASTE_START = '\x1b[200~';
               const PASTE_END = '\x1b[201~';
 
-              // Step 1: Send text wrapped in paste brackets (NO \r inside!)
-              console.log(`[Claude Handshake] Tab ${tabId}: Sending PASTE_START + prompt (${pendingPrompt.length} chars) + PASTE_END...`);
+              console.log('[Claude Handshake] Tab ' + tabId + ': Sending prompt (' + pendingPrompt.length + ' chars) via Bracketed Paste...');
               if (pendingPrompt.length > 1024) {
-                // AWAIT for chunked write to complete!
                 await writeToPtySafe(term, PASTE_START + pendingPrompt + PASTE_END);
-                console.log(`[Claude Handshake] Tab ${tabId}: Chunked write complete.`);
               } else {
                 term.write(PASTE_START + pendingPrompt + PASTE_END);
               }
 
-              // Step 2: Wait for Ink to exit paste mode, then send Enter
               setTimeout(() => {
-                console.log(`[Claude Handshake] Tab ${tabId}: Sending SUBMIT (\\r)...`);
                 term.write('\r');
-                console.log(`[Claude Handshake] Tab ${tabId}: ✅ Prompt sent!`);
+                console.log('[Claude Handshake] Tab ' + tabId + ': Prompt sent!');
               }, 100);
             }
 
@@ -755,36 +746,29 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
           claudeDebounceTimers.set(tabId, timerId);
         }
 
-        // STEP 4: DEBOUNCE_TAB -> More data = Reset debounce
-        else if (currentState === 'DEBOUNCE_TAB') {
-          console.log(`[Claude Handshake] Tab ${tabId}: More data after Tab, resetting prompt debounce...`);
+        // STEP 2: DEBOUNCE_PROMPT -> More data = Reset debounce
+        else if (currentState === 'DEBOUNCE_PROMPT') {
           clearTimeout(claudeDebounceTimers.get(tabId));
 
           const timerId = setTimeout(async () => {
-            console.log(`[Claude Handshake] Tab ${tabId}: UI settled. Sending prompt via Bracketed Paste...`);
+            console.log('[Claude Handshake] Tab ' + tabId + ': UI settled. Sending prompt...');
 
             if (claudePendingPrompt.has(tabId)) {
               const pendingPrompt = claudePendingPrompt.get(tabId);
               claudePendingPrompt.delete(tabId);
 
-              // Bracketed Paste Mode
               const PASTE_START = '\x1b[200~';
               const PASTE_END = '\x1b[201~';
 
-              console.log(`[Claude Handshake] Tab ${tabId}: Sending PASTE_START + prompt (${pendingPrompt.length} chars) + PASTE_END...`);
               if (pendingPrompt.length > 1024) {
-                // AWAIT for chunked write to complete!
                 await writeToPtySafe(term, PASTE_START + pendingPrompt + PASTE_END);
-                console.log(`[Claude Handshake] Tab ${tabId}: Chunked write complete.`);
               } else {
                 term.write(PASTE_START + pendingPrompt + PASTE_END);
               }
 
-              // Wait for Ink to exit paste mode, then send Enter
               setTimeout(() => {
-                console.log(`[Claude Handshake] Tab ${tabId}: Sending SUBMIT (\\r)...`);
                 term.write('\r');
-                console.log(`[Claude Handshake] Tab ${tabId}: ✅ Prompt sent!`);
+                console.log('[Claude Handshake] Tab ' + tabId + ': Prompt sent!');
               }, 100);
             }
 
@@ -794,7 +778,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
           claudeDebounceTimers.set(tabId, timerId);
         }
       }
-      // ========== END STATE MACHINE ==========
+      // ========== END HANDSHAKE ==========
 
       // Detect Session ID from /status TUI output → show toast in renderer
       {
@@ -901,6 +885,120 @@ ipcMain.on('terminal:input', async (event, tabId, data) => {
   } else {
     term.write(data);
   }
+});
+
+// Send a slash command to Claude's Ink TUI (paste brackets + delayed Enter)
+// Ink in raw mode ignores bare \r/\n — need paste wrapper then separate \r
+ipcMain.on('claude:send-command', (event, tabId, command) => {
+  const term = terminals.get(tabId);
+  if (!term) return;
+  // Ctrl+C clears entire input (even multiline), single press doesn't exit
+  term.write('\x03');
+  setTimeout(() => {
+    const PASTE_START = '\x1b[200~';
+    const PASTE_END = '\x1b[201~';
+    term.write(PASTE_START + command + PASTE_END);
+    setTimeout(() => {
+      term.write('\r');
+    }, 100);
+  }, 50);
+});
+
+// Toggle thinking mode reactively: open picker → detect state → navigate → confirm
+ipcMain.handle('claude:toggle-thinking', async (event, tabId) => {
+  const term = terminals.get(tabId);
+  if (!term) return { success: false, error: 'no terminal' };
+
+  const stripped = require('node:util').stripVTControlCharacters;
+
+  return new Promise((resolve) => {
+    let buffer = '';
+
+    const sub = term.onData((data) => {
+      buffer += data;
+
+      // Picker ready when synchronized output ends
+      if (!buffer.includes('\x1b[?2026l')) return;
+      sub.dispose();
+
+      const clean = stripped(buffer);
+      const enabledIdx = clean.indexOf('Enabled');
+      const disabledIdx = clean.indexOf('Disabled');
+      const checkIdx = clean.indexOf('\u2714'); // ✓
+
+      let wasEnabled = true;
+      if (checkIdx >= 0 && enabledIdx >= 0 && disabledIdx >= 0) {
+        wasEnabled = Math.abs(checkIdx - enabledIdx) < Math.abs(checkIdx - disabledIdx);
+      }
+
+      const newState = !wasEnabled;
+      console.log('[Think] clean text:', JSON.stringify(clean).substring(0, 400));
+      console.log('[Think] enabledIdx:', enabledIdx, 'disabledIdx:', disabledIdx, 'checkIdx:', checkIdx);
+      console.log('[Think] Was:', wasEnabled ? 'Enabled' : 'Disabled', '-> Toggling to:', newState ? 'Enabled' : 'Disabled');
+
+      // Navigate to the other option
+      const arrow = wasEnabled ? '\x1b[B' : '\x1b[A';
+      console.log('[Think] Sending arrow:', wasEnabled ? 'DOWN' : 'UP');
+      term.write(arrow);
+
+      // Confirm with Enter after Ink processes the arrow
+      let confirmResolved = false;
+      const confirmSub = term.onData((confirmData) => {
+        if (confirmResolved) return;
+        console.log('[Think] Arrow response RAW (' + confirmData.length + ' bytes):', JSON.stringify(confirmData).substring(0, 300));
+        confirmSub.dispose();
+        confirmResolved = true;
+        console.log('[Think] Sending Enter to confirm selection');
+        term.write('\r');
+
+        // Claude may show "Do you want to proceed?" confirmation dialog
+        // Listen for it and auto-confirm
+        let proceedResolved = false;
+        let proceedBuffer = '';
+        const proceedSub = term.onData((proceedData) => {
+          proceedBuffer += proceedData;
+          console.log('[Think] Post-confirm RAW (' + proceedData.length + ' bytes):', JSON.stringify(proceedData).substring(0, 300));
+
+          if (proceedBuffer.includes('proceed') || proceedBuffer.includes('Proceed')) {
+            if (proceedResolved) return;
+            proceedResolved = true;
+            proceedSub.dispose();
+            console.log('[Think] Detected "proceed" confirmation, sending Enter');
+            term.write('\r');
+            resolve({ success: true, thinking: newState });
+          }
+        });
+
+        // Safety: resolve even if no confirmation dialog appears
+        setTimeout(() => {
+          proceedSub.dispose();
+          if (!proceedResolved) {
+            console.log('[Think] No proceed dialog, resolving');
+            resolve({ success: true, thinking: newState });
+          }
+        }, 2000);
+      });
+
+      // Safety: if no data after arrow, confirm anyway
+      setTimeout(() => {
+        if (confirmResolved) return;
+        confirmSub.dispose();
+        confirmResolved = true;
+        console.log('[Think] No arrow response, sending Enter anyway');
+        term.write('\r');
+        resolve({ success: true, thinking: newState });
+      }, 300);
+    });
+
+    // Safety timeout
+    setTimeout(() => {
+      sub.dispose();
+      resolve({ success: false, error: 'timeout' });
+    }, 5000);
+
+    // Open the picker
+    term.write('\x1bt');
+  });
 });
 
 // Resize terminal

@@ -704,8 +704,8 @@ function App() {
         return;
       }
 
-      // Cmd+Shift+R - Toggle Research panel
-      if (e.metaKey && e.shiftKey && e.code === 'KeyR') {
+      // Cmd+Shift+E - Toggle Research panel
+      if (e.metaKey && e.shiftKey && e.code === 'KeyE') {
         e.preventDefault();
         if (view === 'workspace') {
           toggleResearch();

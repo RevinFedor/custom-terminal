@@ -172,7 +172,7 @@ function EmptyState() {
       <div className="flex gap-4">
         <div className="flex flex-col items-center gap-2">
           <div className="px-4 py-2 bg-[#1e1f20] border border-[#333] rounded-xl text-[11px] text-[#a8c7fa] font-bold shadow-sm">
-            CMD + SHIFT + R
+            CMD + SHIFT + E
           </div>
           <span className="text-[10px] text-gray-600 uppercase font-bold tracking-widest font-mono">Open Panel</span>
         </div>
