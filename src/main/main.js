@@ -2409,11 +2409,14 @@ function loadJsonlRecords(filePath) {
   const recordMap = new Map();
   let lastRecord = null;
   let bridgeSessionId = null;
+  let fileIndex = 0;
 
   for (const line of lines) {
     try {
       const entry = JSON.parse(line);
       if (entry.uuid) {
+        entry._fileIndex = fileIndex++;
+        entry._fromFile = sessionId;
         recordMap.set(entry.uuid, entry);
         lastRecord = entry;
         // Detect bridge: first entry with uuid that has a different sessionId
@@ -2544,12 +2547,16 @@ function parseTimelineUuids(sourcePath) {
 
     const recordMap = new Map();
     let lastRecord = null;
+    let fileIndex = 0;
 
     for (const line of lines) {
       try {
         const entry = JSON.parse(line);
-        recordMap.set(entry.uuid, entry);
-        if (entry.uuid) lastRecord = entry;
+        if (entry.uuid) {
+          entry._fileIndex = fileIndex++;
+          recordMap.set(entry.uuid, entry);
+          lastRecord = entry;
+        }
       } catch {}
     }
 
@@ -2558,10 +2565,41 @@ function parseTimelineUuids(sourcePath) {
     // BACKTRACE: Walk backwards from last record following parentUuid
     const activeBranch = [];
     let currentUuid = lastRecord.uuid;
+    const seen = new Set();
 
-    while (currentUuid) {
+    while (currentUuid && !seen.has(currentUuid)) {
+      seen.add(currentUuid);
       const record = recordMap.get(currentUuid);
-      if (!record) break;
+      if (!record) {
+        // Recovery: dangling logicalParentUuid from compact_boundary
+        let recovered = false;
+        if (activeBranch.length > 0) {
+          const lastAdded = activeBranch[0];
+          if (lastAdded.type === 'system' && lastAdded.subtype === 'compact_boundary' &&
+              lastAdded.logicalParentUuid === currentUuid) {
+            if (lastAdded.parentUuid && recordMap.has(lastAdded.parentUuid) && !seen.has(lastAdded.parentUuid)) {
+              currentUuid = lastAdded.parentUuid;
+              recovered = true;
+            } else {
+              let bestPred = null;
+              for (const [uuid, entry] of recordMap) {
+                if (seen.has(uuid)) continue;
+                if (entry._fileIndex < lastAdded._fileIndex) {
+                  if (!bestPred || entry._fileIndex > bestPred._fileIndex) {
+                    bestPred = entry;
+                  }
+                }
+              }
+              if (bestPred) {
+                currentUuid = bestPred.uuid;
+                recovered = true;
+              }
+            }
+          }
+        }
+        if (recovered) continue;
+        break;
+      }
       activeBranch.unshift(record);
       currentUuid = record.logicalParentUuid || record.parentUuid;
     }
@@ -2700,7 +2738,40 @@ ipcMain.handle('claude:get-timeline', async (event, { sessionId, cwd }) => {
     while (currentUuid && !seen.has(currentUuid)) {
       seen.add(currentUuid);
       const record = recordMap.get(currentUuid);
-      if (!record) break;
+      if (!record) {
+        // Recovery: dangling logicalParentUuid from compact_boundary
+        // The compact removed the referenced entry but pre-compact entries still exist in the file
+        let recovered = false;
+        if (activeBranch.length > 0) {
+          const lastAdded = activeBranch[0];
+          if (lastAdded.type === 'system' && lastAdded.subtype === 'compact_boundary' &&
+              lastAdded.logicalParentUuid === currentUuid) {
+            // Option 1: try parentUuid of the compact_boundary
+            if (lastAdded.parentUuid && recordMap.has(lastAdded.parentUuid) && !seen.has(lastAdded.parentUuid)) {
+              currentUuid = lastAdded.parentUuid;
+              recovered = true;
+            } else {
+              // Option 2: find physical predecessor in the same JSONL file
+              let bestPred = null;
+              for (const [uuid, entry] of recordMap) {
+                if (seen.has(uuid)) continue;
+                if (entry._fromFile === lastAdded._fromFile &&
+                    entry._fileIndex < lastAdded._fileIndex) {
+                  if (!bestPred || entry._fileIndex > bestPred._fileIndex) {
+                    bestPred = entry;
+                  }
+                }
+              }
+              if (bestPred) {
+                currentUuid = bestPred.uuid;
+                recovered = true;
+              }
+            }
+          }
+        }
+        if (recovered) continue;
+        break;
+      }
 
       activeBranch.unshift(record);
 
@@ -2864,6 +2935,37 @@ ipcMain.handle('claude:export-clean-session', async (event, { sessionId, cwd, in
       seen.add(currentUuid);
       const record = recordMap.get(currentUuid);
       if (!record) {
+        // Recovery: dangling logicalParentUuid from compact_boundary
+        let recovered = false;
+        if (activeBranch.length > 0) {
+          const lastAdded = activeBranch[0];
+          if (lastAdded.type === 'system' && lastAdded.subtype === 'compact_boundary' &&
+              lastAdded.logicalParentUuid === currentUuid) {
+            console.log('[Claude Export] Dangling logicalParentUuid:', currentUuid.slice(0, 12), '- recovering');
+            if (lastAdded.parentUuid && recordMap.has(lastAdded.parentUuid) && !seen.has(lastAdded.parentUuid)) {
+              currentUuid = lastAdded.parentUuid;
+              recovered = true;
+              console.log('[Claude Export] Recovered via parentUuid:', currentUuid.slice(0, 12));
+            } else {
+              let bestPred = null;
+              for (const [uuid, entry] of recordMap) {
+                if (seen.has(uuid)) continue;
+                if (entry._fromFile === lastAdded._fromFile &&
+                    entry._fileIndex < lastAdded._fileIndex) {
+                  if (!bestPred || entry._fileIndex > bestPred._fileIndex) {
+                    bestPred = entry;
+                  }
+                }
+              }
+              if (bestPred) {
+                currentUuid = bestPred.uuid;
+                recovered = true;
+                console.log('[Claude Export] Recovered via physical predecessor:', currentUuid.slice(0, 12));
+              }
+            }
+          }
+        }
+        if (recovered) continue;
         console.log('[Claude Export] Backtrace ended - UUID not found:', currentUuid);
         break;
       }
