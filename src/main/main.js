@@ -35,6 +35,99 @@ const claudeDebounceTimers = new Map(); // tabId -> debounce timer ID
 let sessionManager; // Initialized after projectManager is ready
 let claudeManager; // Initialized with terminals map
 
+// ========== SESSION BRIDGE (StatusLine-based session detection) ==========
+// Claude's statusLine feature calls ~/.claude/statusline-bridge.sh after every response,
+// writing {session_id, ppid, cwd, ...} to ~/.claude/bridge/{session_id}.json.
+// We watch that directory and match bridge files to tabs via PID tree:
+// bridge.ppid (Claude PID) → parent PID (shell) → ptyProcess.pid (our tab)
+const bridgeDir = path.join(os.homedir(), '.claude', 'bridge');
+const bridgeKnownSessions = new Map(); // tabId → sessionId
+const bridgePidCache = new Map(); // claudePid → tabId
+const bridgeFileMtimes = new Map(); // filename → mtimeMs
+let bridgeWatcher = null;
+let bridgePollInterval = null;
+
+function startSessionBridge() {
+  try { fs.mkdirSync(bridgeDir, { recursive: true }); } catch {}
+
+  const processFile = async (filename) => {
+    const filePath = path.join(bridgeDir, filename);
+    try {
+      const stat = fs.statSync(filePath);
+      if (bridgeFileMtimes.get(filename) === stat.mtimeMs) return;
+      bridgeFileMtimes.set(filename, stat.mtimeMs);
+
+      const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+      if (!data.session_id || !data.ppid) return;
+
+      // Check PID cache first
+      let tabId = bridgePidCache.get(data.ppid);
+
+      if (!tabId) {
+        // Resolve Claude PID → parent (shell PID) → match to our PTY
+        try {
+          const ppidStr = await execAsync('ps -p ' + data.ppid + ' -o ppid=');
+          const shellPid = parseInt(ppidStr.trim());
+          for (const [tid, pty] of terminals) {
+            if (pty.pid === shellPid) { tabId = tid; break; }
+          }
+          if (tabId) bridgePidCache.set(data.ppid, tabId);
+        } catch {}
+      }
+
+      if (!tabId) return; // Not our process
+
+      // Check for session change
+      if (bridgeKnownSessions.get(tabId) === data.session_id) return;
+
+      bridgeKnownSessions.set(tabId, data.session_id);
+      console.log('[Bridge] ✅ Tab', tabId, '→ session:', data.session_id.substring(0, 8) + '...', '(model:', data.model + ', ctx:', data.context_pct + '%)');
+
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('claude:session-detected', { tabId, sessionId: data.session_id });
+      }
+    } catch {}
+  };
+
+  const scan = async () => {
+    try {
+      const files = fs.readdirSync(bridgeDir).filter(f => f.endsWith('.json') && !f.startsWith('_'));
+      for (const f of files) await processFile(f);
+    } catch {}
+  };
+
+  // Method 1: fs.watch for instant detection
+  try {
+    bridgeWatcher = fs.watch(bridgeDir, (eventType, filename) => {
+      if (filename?.endsWith('.json') && !filename.startsWith('_')) {
+        processFile(filename);
+      }
+    });
+    console.log('[Bridge] fs.watch active on', bridgeDir);
+  } catch (e) {
+    console.log('[Bridge] fs.watch failed:', e.message);
+  }
+
+  // Method 2: polling every 2s (reliable fallback)
+  bridgePollInterval = setInterval(scan, 2000);
+  console.log('[Bridge] Polling active (2s interval)');
+
+  // Initial scan
+  scan();
+}
+
+function stopSessionBridge() {
+  if (bridgeWatcher) { try { bridgeWatcher.close(); } catch {} bridgeWatcher = null; }
+  if (bridgePollInterval) { clearInterval(bridgePollInterval); bridgePollInterval = null; }
+}
+
+function clearBridgeTab(tabId) {
+  bridgeKnownSessions.delete(tabId);
+  for (const [pid, tid] of bridgePidCache) {
+    if (tid === tabId) bridgePidCache.delete(pid);
+  }
+}
+
 // Shell integration directory (for OSC 7 cwd reporting + OSC 133 command lifecycle)
 const shellIntegrationDir = path.join(app.getPath('userData'), 'shell-integration');
 
@@ -342,6 +435,15 @@ app.whenReady().then(() => {
   } catch (e) {
     console.error('[Startup] ClaudeManager ERROR:', e.message);
     // Продолжаем без ClaudeManager — окно всё равно должно открыться
+  }
+
+  // Initialize Session Bridge (StatusLine-based Claude session detection)
+  console.log('[Startup] Starting SessionBridge...');
+  try {
+    startSessionBridge();
+    console.log('[Startup] SessionBridge OK');
+  } catch (e) {
+    console.error('[Startup] SessionBridge ERROR:', e.message);
   }
 
   console.log('[Startup] Calling createWindow()...');
@@ -693,23 +795,6 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
         }
       }
       // ========== END STATE MACHINE ==========
-
-      // ========== SESSION ID INTERCEPTOR (/status PTY output) ==========
-      {
-        const sc = stripVTControlCharacters(data);
-        if (sc.includes('ession')) {
-          console.log('[SessIntercept] 🔍 "ession" in chunk. raw:', data.length, 'stripped:', sc.length);
-          console.log('[SessIntercept] text:', JSON.stringify(sc.substring(0, 500)));
-        }
-        const m = sc.match(/Session\s*ID[:\s]*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
-        if (m) {
-          console.log('[SessIntercept] ✅ MATCH:', m[1], 'tab:', tabId);
-          if (mainWindow && !mainWindow.isDestroyed()) {
-            mainWindow.webContents.send('claude:status-session-detected', { tabId, sessionId: m[1] });
-          }
-        }
-      }
-      // ========== END SESSION ID INTERCEPTOR ==========
 
       // Send raw data to renderer - xterm.js handles OSC sequences itself
       if (mainWindow && !mainWindow.isDestroyed()) {
@@ -1729,143 +1814,17 @@ ipcMain.handle('session:get-visual', async (event, { dirPath, tabIndex }) => {
 
 const crypto = require('crypto');
 
-// Sniper Watcher: detect new .jsonl session files via fs.watch + polling fallback
-// fs.watch alone is unreliable on macOS (FSEvents init delay), so we also poll
-function startSessionSniper(projectDir, startTime, onFound) {
-  let sessionFound = false;
-  let watcher = null;
-  let pollInterval = null;
-  let timeoutTimer = null;
-
-  const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.jsonl$/i;
-
-  // Snapshot existing files before Claude starts
-  const existingFiles = new Set();
-  try {
-    const files = fs.readdirSync(projectDir);
-    for (const f of files) {
-      if (uuidPattern.test(f)) existingFiles.add(f);
-    }
-  } catch (e) {}
-  console.log('[Sniper] Snapshot:', existingFiles.size, 'existing files in', projectDir);
-
-  const cleanup = () => {
-    if (watcher) { try { watcher.close(); } catch(e) {} watcher = null; }
-    if (pollInterval) { clearInterval(pollInterval); pollInterval = null; }
-    if (timeoutTimer) { clearTimeout(timeoutTimer); timeoutTimer = null; }
-  };
-
-  const checkFile = (filename) => {
-    if (sessionFound) return;
-    if (!uuidPattern.test(filename)) return;
-    if (existingFiles.has(filename)) return; // old file, skip
-
-    const filePath = path.join(projectDir, filename);
-    try {
-      const stats = fs.statSync(filePath);
-      const fileTime = stats.birthtimeMs || stats.mtimeMs;
-      console.log('[Sniper] New file:', filename, 'time:', fileTime, 'startTime:', startTime, 'diff:', fileTime - startTime);
-      if (fileTime >= startTime - 1000) {
-        // Bridge filter: reject files from other sessions (Clear Context / Plan Mode)
-        const fileSessionId = filename.replace('.jsonl', '');
-        try {
-          const fd = fs.openSync(filePath, 'r');
-          const buf = Buffer.alloc(2048);
-          const bytesRead = fs.readSync(fd, buf, 0, 2048, 0);
-          fs.closeSync(fd);
-          if (bytesRead === 0) {
-            console.log('[Sniper] File empty, waiting for content...');
-            return; // File just created, no content yet — wait for next poll
-          }
-          const firstLine = buf.toString('utf-8', 0, bytesRead).split('\n')[0];
-          const entry = JSON.parse(firstLine);
-          if (entry.sessionId && entry.sessionId !== fileSessionId) {
-            console.log('[Sniper] ⛔ Bridge file detected (parent:', entry.sessionId.substring(0, 8) + '...), skipping');
-            return; // This file belongs to another session's Clear Context chain
-          }
-        } catch (parseErr) {
-          console.log('[Sniper] Could not parse first line, waiting...', parseErr.message);
-          return; // Can't verify yet — wait for next poll
-        }
-
-        sessionFound = true;
-        console.log('[Sniper] ✅ Session detected:', fileSessionId);
-        cleanup();
-        onFound(fileSessionId);
-      } else {
-        console.log('[Sniper] File too old, skipping');
-      }
-    } catch (e) {
-      console.log('[Sniper] stat error:', e.message);
-    }
-  };
-
-  // Ensure directory exists
-  try {
-    if (!fs.existsSync(projectDir)) {
-      fs.mkdirSync(projectDir, { recursive: true });
-      console.log('[Sniper] Created directory:', projectDir);
-    }
-  } catch (e) {}
-
-  // Method 1: fs.watch (may or may not fire on macOS)
-  try {
-    watcher = fs.watch(projectDir, (eventType, filename) => {
-      console.log('[Sniper] fs.watch event:', eventType, filename);
-      if (filename) checkFile(filename);
-    });
-    console.log('[Sniper] fs.watch active');
-  } catch (e) {
-    console.log('[Sniper] fs.watch failed:', e.message);
-  }
-
-  // Method 2: Directory polling every 1s (reliable fallback)
-  let pollCount = 0;
-  pollInterval = setInterval(() => {
-    pollCount++;
-    try {
-      const files = fs.readdirSync(projectDir);
-      const newFiles = files.filter(f => uuidPattern.test(f) && !existingFiles.has(f));
-      if (newFiles.length > 0) {
-        console.log('[Sniper] Poll #' + pollCount + ': found', newFiles.length, 'new file(s):', newFiles[0]);
-      }
-      for (const f of newFiles) {
-        checkFile(f);
-        if (sessionFound) break;
-      }
-    } catch (e) {}
-  }, 1000);
-
-  // Safety timeout: 30s
-  timeoutTimer = setTimeout(() => {
-    if (!sessionFound) {
-      console.log('[Sniper] Timeout (30s) — no session detected after', pollCount, 'polls');
-    }
-    cleanup();
-  }, 30000);
-
-  return cleanup;
-}
-
-// Sniper Watcher handler: watch for new .jsonl file creation when claude starts
+// Claude launcher: start claude with handshake (session detected via Bridge watcher)
 ipcMain.on('claude:spawn-with-watcher', (event, { tabId, cwd }) => {
-  const projectSlug = cwd.replace(/\//g, '-');
-  const projectDir = path.join(os.homedir(), '.claude', 'projects', projectSlug);
-  const startTime = Date.now();
+  console.log('[Claude Launch] Starting Claude for tab:', tabId);
 
-  console.log('[Sniper] Starting for tab:', tabId, 'dir:', projectDir);
-
-  startSessionSniper(projectDir, startTime, (sessionId) => {
-    event.sender.send('claude:session-detected', { tabId, sessionId });
-  });
-
-  // Let the command through - don't intercept, just watch
   const term = terminals.get(tabId);
   if (term) {
     // Enable thinking mode detection (will send Tab when '>' prompt appears)
     claudeState.set(tabId, 'WAITING_PROMPT');
     term.write('claude --dangerously-skip-permissions\r');
   }
+  // Session ID will be detected by SessionBridge (via StatusLine)
 });
 
 // ========== GEMINI INPUT INTERCEPTION ==========
@@ -3461,16 +3420,8 @@ ipcMain.on('claude:run-command', (event, { tabId, command, sessionId, forkSessio
 
   switch (command) {
     case 'claude': {
-      // New session - start sniper and run claude
-      const projectSlug = cwd.replace(/\//g, '-');
-      const projectDir = path.join(os.homedir(), '.claude', 'projects', projectSlug);
-
-      console.log('[Claude Runner] Starting new session, sniper dir:', projectDir);
-
-      startSessionSniper(projectDir, Date.now(), (sessionId) => {
-        console.log('[Claude Runner] Sniper detected session:', sessionId);
-        event.sender.send('claude:session-detected', { tabId, sessionId });
-      });
+      // New session — session ID will be detected by SessionBridge (via StatusLine)
+      console.log('[Claude Runner] Starting new session for tab:', tabId);
 
       // Enable thinking mode detection (will send Tab when prompt appears)
       claudeState.set(tabId, 'WAITING_PROMPT');
