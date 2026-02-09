@@ -352,6 +352,13 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
                       <div
                         className="transition-all duration-150 cursor-pointer hover:opacity-70"
                         onClick={() => restoreTab(entry)}
+                        onAuxClick={(e) => {
+                          if (e.button === 1) {
+                            e.preventDefault();
+                            ipcRenderer.invoke('project:delete-tab-history-entry', { id: entry.id });
+                            setHistory(prev => prev.filter(h => h.id !== entry.id));
+                          }
+                        }}
                         style={{
                           maxWidth: '140px',
                           minWidth: '90px',
@@ -404,7 +411,6 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
       {activePopover.isVisible && activePopover.hoveredItem && (() => {
         const tab = tabs.find(t => t.id === activePopover.hoveredItem!.id);
         if (!tab) return null;
-        const pos = getPopoverPosition(activePopover.hoveredItem!.rect);
         return (
           <CmdHoverPopover
             rect={activePopover.hoveredItem!.rect}

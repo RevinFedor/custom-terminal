@@ -53,6 +53,10 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
   const [tabNotes, setTabNotes] = useState('');
   const [sessionCopied, setSessionCopied] = useState(false);
   const [isGeneratingDesc, setIsGeneratingDesc] = useState(false);
+  // Manual session ID replace
+  const [showSessionInput, setShowSessionInput] = useState(false);
+  const [manualSessionId, setManualSessionId] = useState('');
+  const sessionInputRef = useRef<HTMLInputElement>(null);
   const { showToast, claudeDefaultPromptEnabled, chatSettings } = useUIStore();
   const wordWrap = useUIStore((s) => s.wordWrap);
   const tabNotesFontSize = useUIStore((s) => s.tabNotesFontSize);
@@ -76,6 +80,12 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
       setClaudeDefaultPrompt(value || '');
     });
   }, []);
+
+  // Reset manual input on tab switch
+  useEffect(() => {
+    setShowSessionInput(false);
+    setManualSessionId('');
+  }, [activeTabId]);
 
   // Poll for session ID changes (every 500ms)
   useEffect(() => {
@@ -308,6 +318,29 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
     }
   };
 
+  // Apply manually entered session ID
+  const handleApplyManualSession = () => {
+    if (!activeTabId || !manualSessionId.trim()) return;
+    const trimmed = manualSessionId.trim();
+    // Extract UUID from pasted text (could be full path, url, or just uuid)
+    const uuidMatch = trimmed.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
+    if (!uuidMatch) {
+      showToast('Invalid UUID format', 'warning');
+      return;
+    }
+    const newId = uuidMatch[0];
+    if (newId === sessionId) {
+      showToast('Already current session', 'warning');
+      setShowSessionInput(false);
+      setManualSessionId('');
+      return;
+    }
+    useWorkspaceStore.getState().setClaudeSessionId(activeTabId, newId);
+    showToast('Session set: ' + newId.substring(0, 8) + '...', 'success');
+    setShowSessionInput(false);
+    setManualSessionId('');
+  };
+
   return (
     <div className="h-full flex flex-col p-3 overflow-y-auto">
       {/* Session Status - shows active session regardless of toggle */}
@@ -333,8 +366,72 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
               >
                 {sessionCopied ? '✓' : '⎘'}
               </span>
+              {/* Spacer pushes edit button to the right */}
+              <div className="flex-1" />
+              {/* Edit session button — toggle input */}
+              {activeTabId && (
+                <button
+                  className={`text-[10px] px-1.5 py-0.5 rounded transition-all cursor-pointer ${
+                    showSessionInput
+                      ? 'text-[#aaa] bg-[#ffffff10]'
+                      : 'text-[#555] hover:text-[#aaa] hover:bg-[#ffffff08]'
+                  }`}
+                  onClick={() => {
+                    setShowSessionInput(!showSessionInput);
+                    setManualSessionId('');
+                    if (!showSessionInput) {
+                      setTimeout(() => sessionInputRef.current?.focus(), 50);
+                    }
+                  }}
+                  title="Replace session ID"
+                >
+                  ✎
+                </button>
+              )}
             </div>
             <code className="text-[10px] text-[#aaa] break-all block">{sessionId}</code>
+
+            {/* Manual session ID input */}
+            {showSessionInput && (
+              <div className="mt-2" style={{ animation: 'fadeIn 0.15s ease-out' }}>
+                <input
+                  ref={sessionInputRef}
+                  type="text"
+                  value={manualSessionId}
+                  onChange={(e) => setManualSessionId(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault();
+                      handleApplyManualSession();
+                    } else if (e.key === 'Escape') {
+                      setShowSessionInput(false);
+                      setManualSessionId('');
+                    }
+                  }}
+                  placeholder="Paste session UUID..."
+                  className="w-full px-2 py-1 bg-[#1a1a1a] border border-[#444] rounded text-[10px] text-[#aaa] font-mono focus:outline-none focus:border-[#DA7756] placeholder:text-[#555]"
+                />
+                <div className="flex gap-2 mt-1.5">
+                  <button
+                    className="flex-1 text-[10px] px-2 py-1 rounded bg-[#DA7756]/20 text-[#DA7756] hover:bg-[#DA7756]/30 transition-colors cursor-pointer disabled:opacity-40"
+                    onClick={handleApplyManualSession}
+                    disabled={!manualSessionId.trim()}
+                  >
+                    Replace
+                  </button>
+                  <button
+                    className="flex-1 text-[10px] px-2 py-1 rounded bg-[#333] text-[#888] hover:bg-[#444] transition-colors cursor-pointer"
+                    onClick={() => {
+                      setShowSessionInput(false);
+                      setManualSessionId('');
+                    }}
+                  >
+                    Отмена
+                  </button>
+                </div>
+              </div>
+            )}
+
             {/* Fork session to new tab button */}
             <button
               className="mt-2 w-full text-[10px] px-2 py-1 rounded transition-colors text-[#888] hover:text-white bg-[#333] hover:bg-[#444] cursor-pointer"
@@ -392,21 +489,52 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
               </div>
               {activeTabId && (
                 <button
-                  className="text-[10px] text-[#555] hover:text-[#aaa] transition-colors cursor-pointer"
-                  onClick={async () => {
-                    const result = await ipcRenderer.invoke('terminal:getClaudeSession', activeTabId);
-                    if (result.success && result.sessionId) {
-                      useWorkspaceStore.getState().setClaudeSessionId(activeTabId, result.sessionId);
-                      showToast('Session detected: ' + result.sessionId.substring(0, 8) + '...', 'success');
-                    } else {
-                      showToast('No active Claude process found', 'warning');
+                  className={`text-[10px] transition-colors cursor-pointer ${
+                    showSessionInput
+                      ? 'text-[#aaa]'
+                      : 'text-[#555] hover:text-[#aaa]'
+                  }`}
+                  onClick={() => {
+                    setShowSessionInput(!showSessionInput);
+                    setManualSessionId('');
+                    if (!showSessionInput) {
+                      setTimeout(() => sessionInputRef.current?.focus(), 50);
                     }
                   }}
                 >
-                  Detect
+                  Set ID
                 </button>
               )}
             </div>
+            {/* Manual session ID input — no active session */}
+            {showSessionInput && activeTabId && (
+              <div className="mt-2" style={{ animation: 'fadeIn 0.15s ease-out' }}>
+                <input
+                  ref={sessionInputRef}
+                  type="text"
+                  value={manualSessionId}
+                  onChange={(e) => setManualSessionId(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault();
+                      handleApplyManualSession();
+                    } else if (e.key === 'Escape') {
+                      setShowSessionInput(false);
+                      setManualSessionId('');
+                    }
+                  }}
+                  placeholder="Paste session UUID..."
+                  className="w-full px-2 py-1 bg-[#1a1a1a] border border-[#444] rounded text-[10px] text-[#aaa] font-mono focus:outline-none focus:border-[#DA7756] placeholder:text-[#555]"
+                />
+                <button
+                  className="mt-1.5 w-full text-[10px] px-2 py-1 rounded bg-[#DA7756]/20 text-[#DA7756] hover:bg-[#DA7756]/30 transition-colors cursor-pointer disabled:opacity-40"
+                  onClick={handleApplyManualSession}
+                  disabled={!manualSessionId.trim()}
+                >
+                  Set session
+                </button>
+              </div>
+            )}
           </div>
         )}
       </div>

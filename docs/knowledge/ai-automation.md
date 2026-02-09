@@ -317,6 +317,25 @@ Claude только добавляет запись типа `compact_boundary`,
 
 ---
 
+## 3.1. Fork Copies Bridges (Ловушка при форке)
+
+### Проблема
+При форке сессии приложение **копирует JSONL-файл** целиком. Внутри копии сохраняются все bridge-записи (`_isBridge`) от оригинальной цепи. Когда `resolveSessionChain` обрабатывает форкнутый файл, он следует по этим скопированным мостам и попадает в оригинальную цепь, **пропуская промежуточные сессии**.
+
+### Пример
+Оригинальная цепь: `A → B(plan mode) → C(plan mode)`.
+Форк из `C` → создаёт `D.jsonl` (копия `C.jsonl`).
+В `D.jsonl` есть bridge к `B` (из оригинала).
+`resolveSessionChain(D)` строит цепь: `D → B → A`. Сессия `C` пропущена.
+
+### Следствие для UI
+`sessionBoundaries` из `resolveSessionChain` НЕ содержит всех plan mode переходов. Записи внутри `entries` при этом СОДЕРЖАТ правильные `sessionId` (из оригинальных данных).
+
+### Решение (Timeline)
+Plan mode маркеры в Timeline детектируются **не через `sessionBoundaries`**, а через прямое сравнение `entry.sessionId` между соседними записями. Если `sessionId` меняется и в этой позиции нет fork-маркера → это plan mode граница. См. `features/timeline.md`.
+
+---
+
 ## 4. Hierarchical Session Tree Logic
 
 ### Принцип построения

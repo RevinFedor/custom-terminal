@@ -44,6 +44,7 @@
         - **Unified Pipeline:** Оба механизма используют идентичный пайплайн обработки: `resolveSessionChain` (загрузка файлов цепи) → генерация единой `merged recordMap` → алгоритм **Backtrace** с применением `compact recovery` и защитой от циклов в мостах. Это гарантирует 100% идентичность данных в UI таймлайна и в итоговом текстовом экспорте.
         - **Gap Recovery:** Для восстановления связности после операций `/compact`, создающих "битые" ссылки `logicalParentUuid`, используется метод физического поиска: к каждой записи при загрузке добавляются поля `_fileIndex` и `_fromFile`. Если логическая связь разорвана, алгоритм находит физического предшественника в JSONL. См. `knowledge/ai-automation.md`.
     - **Fork Markers (Snapshot UUIDs):** Для визуализации форков в Timeline используется метод снимков. В БД сохраняется массив всех UUID сообщений на момент форка. Это позволяет метке оставаться на правильном месте даже при откатах истории (Escape/Undo). Форк-маркеры корректно работают с самого начала сессии (даже при пустых снапшотах). См. `features/timeline.md`.
+    - **Plan Mode Markers:** Визуализация границ "Clear Context" / Plan Mode. Детектируется через смену `sessionId` между соседними timeline-записями (без fork-маркера в той же позиции). Не использует `sessionBoundaries` из-за "Fork Copies Bridges" ловушки (см. `knowledge/ai-automation.md`). См. `features/timeline.md`.
 - **Large Input:** Safe Write (chunked write) для вставки промптов > 4KB. См. `knowledge/terminal-core.md`.
 
 ## 5. AI Session Recovery
