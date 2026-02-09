@@ -178,7 +178,7 @@ interface UIStore {
 
   toasts: Toast[];
 
-  showToast: (message: string, type?: 'success' | 'error' | 'info' | 'warning') => void;
+  showToast: (message: string, type?: 'success' | 'error' | 'info' | 'warning', duration?: number) => void;
 
   removeToast: (id: string) => void;
 
@@ -763,16 +763,15 @@ export const useUIStore = create<UIStore>((set, get) => ({
 
   // Toast Notifications
   toasts: [],
-  showToast: (message, type = 'success') => {
+  showToast: (message, type = 'success', duration = 2500) => {
     const id = `toast-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
     set((state) => ({
       toasts: [...state.toasts, { id, message, type }]
     }));
 
-    // Auto remove after 2.5 seconds
     setTimeout(() => {
       get().removeToast(id);
-    }, 2500);
+    }, duration);
   },
   removeToast: (id) => set((state) => ({
     toasts: state.toasts.filter((t) => t.id !== id)

@@ -493,18 +493,18 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
       getSetGeminiSessionId()(tabId, data.sessionId);
     };
 
-    // PTY interceptor: main process detected Session ID in raw PTY data
+    // PTY interceptor: show brief toast when /status reveals Session ID
     const handleStatusSessionDetected = (_: any, data: { tabId: string; sessionId: string }) => {
       if (data.tabId !== tabId) return;
       const currentId = getClaudeSessionId(tabId);
-      console.log('[PTY-Intercept] Detected:', data.sessionId, '| Stored:', currentId || 'NONE');
+      const short = data.sessionId.substring(0, 8);
       if (!currentId) {
-        console.log('[PTY-Intercept] 📝 Auto-setting session from /status');
         getSetClaudeSessionId()(tabId, data.sessionId);
+        useUIStore.getState().showToast(`Session: ${short}...`, 'success', 1000);
       } else if (currentId !== data.sessionId) {
-        console.log('[PTY-Intercept] ⚠️ MISMATCH:', currentId.substring(0, 8), '→', data.sessionId.substring(0, 8));
+        useUIStore.getState().showToast(`/status: ${short}... ≠ stored: ${currentId.substring(0, 8)}...`, 'warning', 2000);
       } else {
-        console.log('[PTY-Intercept] ✅ Matches');
+        useUIStore.getState().showToast(`Session: ${short}...`, 'success', 1000);
       }
     };
 
