@@ -40,7 +40,9 @@
     - **Claude Sniper:** Захват UUID через dual-method: `fs.watch` + polling (1с fallback). Реализован как функция `startSessionSniper()` с snapshot существующих файлов и 30с таймаутом. См. `features/claude-sessions.md`.
     - **Claude Handshake:** Стейт-машина (WAITING_PROMPT → DEBOUNCE_PROMPT → TAB_SENT → READY) для автоматического включения thinking mode (`\t`) и отправки промпта. Поддерживает `⏵` (Claude v2.1.32+) и `>`. Используется `stripVTControlCharacters()`.
     - **Gemini Sniper:** Захват UUID через `fs.watch` на `session-*.json`. См. `knowledge/ai-automation.md`.
-    - **Timeline Engine:** Асинхронный парсинг JSONL файлов с использованием алгоритма **Backtrace** для фильтрации отменённых (Undo) веток диалога. См. `knowledge/ai-automation.md`.
+    - **Timeline & Export Engine:** Асинхронный парсинг JSONL файлов с использованием алгоритма **Backtrace** для фильтрации отменённых (Undo) веток диалога. 
+        - **Unified Pipeline:** Оба механизма используют идентичный пайплайн обработки: `resolveSessionChain` (загрузка файлов цепи) → генерация единой `merged recordMap` → алгоритм **Backtrace** с применением `compact recovery` и защитой от циклов в мостах. Это гарантирует 100% идентичность данных в UI таймлайна и в итоговом текстовом экспорте.
+        - **Gap Recovery:** Для восстановления связности после операций `/compact`, создающих "битые" ссылки `logicalParentUuid`, используется метод физического поиска: к каждой записи при загрузке добавляются поля `_fileIndex` и `_fromFile`. Если логическая связь разорвана, алгоритм находит физического предшественника в JSONL. См. `knowledge/ai-automation.md`.
     - **Fork Markers (Snapshot UUIDs):** Для визуализации форков в Timeline используется метод снимков. В БД сохраняется массив всех UUID сообщений на момент форка. Это позволяет метке оставаться на правильном месте даже при откатах истории (Escape/Undo). Форк-маркеры корректно работают с самого начала сессии (даже при пустых снапшотах). См. `features/timeline.md`.
 - **Large Input:** Safe Write (chunked write) для вставки промптов > 4KB. См. `knowledge/terminal-core.md`.
 
