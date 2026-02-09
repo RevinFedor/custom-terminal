@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, memo, useCallback } from 'react';
+import React, { useState, useRef, useEffect, useLayoutEffect, memo, useCallback } from 'react';
 import { useWorkspaceStore, TabColor, isTabInterrupted } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import { useUIStore } from '../../store/useUIStore';
@@ -726,6 +726,8 @@ function TabBar({ projectId }: TabBarProps) {
   const [sessionStatus, setSessionStatus] = useState<Map<string, boolean>>(new Map());
   const inputRef = useRef<HTMLInputElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
+  const contextMenuRef = useRef<HTMLDivElement>(null);
+  const [contextMenuPos, setContextMenuPos] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
 
   // CMD+hover notes preview (unified hook)
   const isCmdPressed = useCmdKey();
@@ -760,35 +762,8 @@ function TabBar({ projectId }: TabBarProps) {
   }, [notesPopover.setHovered, notesPopover.clearHovered]);
 
   // OSC 133 Event-driven process status (replaces polling)
-  // Initial load + listen for command start/finish events
+  // Stable listeners — subscribe once, never re-create
   useEffect(() => {
-    if (!workspace) return;
-
-    const tabIds = Array.from(workspace.tabs.keys());
-
-    // Initial load: get current state from memory (no syscalls)
-    const initStatus = async () => {
-      const newProcessStatus = new Map<string, boolean>();
-      const newSessionStatus = new Map<string, boolean>();
-      await Promise.all(
-        tabIds.map(async (tabId) => {
-          try {
-            const state = await ipcRenderer.invoke('terminal:getCommandState', tabId);
-            newProcessStatus.set(tabId, state.isRunning);
-          } catch {
-            newProcessStatus.set(tabId, false);
-          }
-          // Check if tab already has a session ID
-          const tab = workspace?.tabs.get(tabId);
-          newSessionStatus.set(tabId, !!tab?.claudeSessionId);
-        })
-      );
-      setProcessStatus(newProcessStatus);
-      setSessionStatus(newSessionStatus);
-    };
-    initStatus();
-
-    // Listen for OSC 133 events (instant, no polling)
     const handleCommandStarted = (_: any, { tabId }: { tabId: string }) => {
       setProcessStatus(prev => {
         const next = new Map(prev);
@@ -805,7 +780,6 @@ function TabBar({ projectId }: TabBarProps) {
       });
     };
 
-    // Session detected: track which tabs have a saved session (for red/green dot)
     const handleSessionDetected = (_: any, data: { tabId: string; sessionId: string }) => {
       setSessionStatus(prev => {
         const next = new Map(prev);
@@ -823,7 +797,48 @@ function TabBar({ projectId }: TabBarProps) {
       ipcRenderer.removeListener('terminal:command-finished', handleCommandFinished);
       ipcRenderer.removeListener('claude:session-detected', handleSessionDetected);
     };
-  }, [workspace?.tabs.size]); // Re-init when tabs change
+  }, []); // Stable — no re-subscriptions
+
+  // Initial load + sync when tabs are added/removed
+  // Merges into existing Map instead of replacing it
+  useEffect(() => {
+    if (!workspace) return;
+
+    const tabIds = Array.from(workspace.tabs.keys());
+
+    const syncStatus = async () => {
+      await Promise.all(
+        tabIds.map(async (tabId) => {
+          try {
+            const state = await ipcRenderer.invoke('terminal:getCommandState', tabId);
+            setProcessStatus(prev => {
+              if (prev.get(tabId) === state.isRunning) return prev;
+              const next = new Map(prev);
+              next.set(tabId, state.isRunning);
+              return next;
+            });
+          } catch {
+            // Only set false if not already tracked
+            setProcessStatus(prev => {
+              if (prev.has(tabId)) return prev;
+              const next = new Map(prev);
+              next.set(tabId, false);
+              return next;
+            });
+          }
+          const tab = workspace?.tabs.get(tabId);
+          setSessionStatus(prev => {
+            const val = !!tab?.claudeSessionId;
+            if (prev.get(tabId) === val) return prev;
+            const next = new Map(prev);
+            next.set(tabId, val);
+            return next;
+          });
+        })
+      );
+    };
+    syncStatus();
+  }, [workspace?.tabs.size]); // Sync new tabs, but never clobber existing state
 
   // Monitor for all drag events
   useEffect(() => {
@@ -912,6 +927,33 @@ function TabBar({ projectId }: TabBarProps) {
     return () => document.removeEventListener('mousedown', handleClose);
   }, [contextMenu]);
 
+  // Clamp context menu position to viewport (same pattern as Timeline tooltip)
+  useLayoutEffect(() => {
+    if (!contextMenu || !contextMenuRef.current) return;
+    const el = contextMenuRef.current;
+    const rect = el.getBoundingClientRect();
+    const pad = 8;
+    let x = contextMenu.x;
+    let y = contextMenu.y;
+
+    // Clamp bottom
+    if (y + rect.height > window.innerHeight - pad) {
+      y = window.innerHeight - rect.height - pad;
+    }
+    // Clamp top
+    if (y < pad) y = pad;
+    // Clamp right
+    if (x + rect.width > window.innerWidth - pad) {
+      x = window.innerWidth - rect.width - pad;
+    }
+    // Clamp left
+    if (x < pad) x = pad;
+
+    if (x !== contextMenuPos.x || y !== contextMenuPos.y) {
+      setContextMenuPos({ x, y });
+    }
+  }, [contextMenu, contextScripts.length]);
+
   if (!workspace || !project) return null;
 
   const allTabs = Array.from(workspace.tabs.values());
@@ -948,6 +990,7 @@ function TabBar({ projectId }: TabBarProps) {
   const handleContextMenu = (e: React.MouseEvent, tabId: string) => {
     e.preventDefault();
     e.stopPropagation();
+    setContextMenuPos({ x: e.clientX, y: e.clientY });
     setContextMenu({ x: e.clientX, y: e.clientY, tabId });
 
     // Load scripts for this tab's CWD
@@ -1442,9 +1485,10 @@ function TabBar({ projectId }: TabBarProps) {
       {/* Context Menu - styled like terminal context menu */}
       {contextMenu && (
         <div
+          ref={contextMenuRef}
           data-tab-context-menu
           className="fixed bg-[#2a2a2a] border border-[#444] shadow-2xl min-w-[180px] z-[100]"
-          style={{ left: contextMenu.x, top: contextMenu.y }}
+          style={{ left: contextMenuPos.x, top: contextMenuPos.y }}
           onClick={(e) => e.stopPropagation()}
           onMouseDown={(e) => e.stopPropagation()}
         >

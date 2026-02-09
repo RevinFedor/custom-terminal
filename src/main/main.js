@@ -694,6 +694,23 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
       }
       // ========== END STATE MACHINE ==========
 
+      // ========== SESSION ID INTERCEPTOR (/status PTY output) ==========
+      {
+        const sc = stripVTControlCharacters(data);
+        if (sc.includes('ession')) {
+          console.log('[SessIntercept] 🔍 "ession" in chunk. raw:', data.length, 'stripped:', sc.length);
+          console.log('[SessIntercept] text:', JSON.stringify(sc.substring(0, 500)));
+        }
+        const m = sc.match(/Session\s*ID[:\s]*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
+        if (m) {
+          console.log('[SessIntercept] ✅ MATCH:', m[1], 'tab:', tabId);
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send('claude:status-session-detected', { tabId, sessionId: m[1] });
+          }
+        }
+      }
+      // ========== END SESSION ID INTERCEPTOR ==========
+
       // Send raw data to renderer - xterm.js handles OSC sequences itself
       if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.webContents.send('terminal:data', { pid: ptyProcess.pid, tabId, data });
