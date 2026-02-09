@@ -13,6 +13,7 @@
 - **DB:** `~/Library/Application Support/noted-terminal/noted-terminal.db`
 - **Config:** `~/Library/Application Support/noted-terminal/projects.json`
 - **AI History:** `~/.minayu/history/` — снепшоты Gemini Time Machine.
+- **Claude Bridge:** `~/.claude/bridge/` — временные JSON-файлы для идентификации активных сессий Клода.
 
 ## 4. Отладка (Debug)
 Скрипты отладки находятся в корне проекта:

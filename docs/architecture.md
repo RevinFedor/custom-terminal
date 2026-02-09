@@ -37,11 +37,15 @@
     - **Proposed API:** Для работы поиска в `xterm.js` включена опция `allowProposedApi: true`.
 - **Resizing:** Управление размером терминала через `ResizeObserver`. Для стабильности используется `activeRef` во избежание проблем с замыканиями. См. `knowledge/terminal-core.md`.
 - **AI Integrations:**
-    - **Claude Sniper:** Захват UUID через dual-method: `fs.watch` + polling (1с fallback). Реализован как функция `startSessionSniper()` с snapshot существующих файлов, bridge-фильтрацией и 30с таймаутом. См. `features/claude-sessions.md`, `knowledge/claude-session-detection.md`.
-    - **Claude Code Internals:** Документация внутренней архитектуры CLI (entry types, session chain механизм, скрытые поля). См. `knowledge/claude-code-internals.md`.
+    - **Claude StatusLine Bridge:** Основной механизм захвата и мониторинга Session ID. 
+        - **Принцип:** Приложение прописывает скрипт-мост в `~/.claude/settings.json` (секция `statusLine`). Claude автоматически вызывает этот скрипт после каждого ответа.
+        - **Flow:** Claude → `statusline-bridge.sh` → запись JSON (`session_id`, `ppid`) в `~/.claude/bridge/` → `fs.watch` в Main процессе.
+        - **Stability:** Это обеспечивает 100% точность привязки сессии к конкретному табу через сопоставление PID (ppid из файла → родительский shell PID → наш PTY).
+        - **Legacy:** Ранняя реализация через Sniper Watcher (отслеживание создания файлов) сохранена в `docs/knowledge/fact-legacy-sniper-watcher.md`.
     - **Claude Handshake:** Стейт-машина (WAITING_PROMPT → DEBOUNCE_PROMPT → TAB_SENT → READY) для автоматического включения thinking mode (`\t`) и отправки промпта. Поддерживает `⏵` (Claude v2.1.32+) и `>`. Используется `stripVTControlCharacters()`.
     - **Gemini Sniper:** Захват UUID через `fs.watch` на `session-*.json`. См. `knowledge/ai-automation.md`.
     - **Timeline & Export Engine:** Асинхронный парсинг JSONL файлов с использованием алгоритма **Backtrace** для фильтрации отменённых (Undo) веток диалога. 
+     
         - **Unified Pipeline:** Оба механизма используют идентичный пайплайн обработки: `resolveSessionChain` (загрузка файлов цепи) → генерация единой `merged recordMap` → алгоритм **Backtrace** с применением `compact recovery` и защитой от циклов в мостах. Это гарантирует 100% идентичность данных в UI таймлайна и в итоговом текстовом экспорте.
         - **Gap Recovery:** Для восстановления связности после операций `/compact`, создающих "битые" ссылки `logicalParentUuid`, используется метод физического поиска: к каждой записи при загрузке добавляются поля `_fileIndex` и `_fromFile`. Если логическая связь разорвана, алгоритм находит физического предшественника в JSONL. См. `knowledge/ai-automation.md`.
     - **Fork Markers (Snapshot UUIDs):** Для визуализации форков в Timeline используется метод снимков. В БД сохраняется массив всех UUID сообщений на момент форка. Это позволяет метке оставаться на правильном месте даже при откатах истории (Escape/Undo). Форк-маркеры корректно работают с самого начала сессии (даже при пустых снапшотах). См. `features/timeline.md`.
