@@ -441,6 +441,21 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
       getSetClaudeSessionId()(tabId, data.sessionId);
     };
 
+    // Toast when /status reveals Session ID (visual confirmation)
+    const handleStatusSessionDetected = (_: any, data: { tabId: string; sessionId: string }) => {
+      if (data.tabId !== tabId) return;
+      const currentId = getClaudeSessionId(tabId);
+      const short = data.sessionId.substring(0, 8);
+      if (!currentId) {
+        getSetClaudeSessionId()(tabId, data.sessionId);
+        useUIStore.getState().showToast('Session: ' + short + '...', 'success', 1000);
+      } else if (currentId !== data.sessionId) {
+        useUIStore.getState().showToast('/status: ' + short + '... \u2260 stored: ' + currentId.substring(0, 8) + '...', 'warning', 2000);
+      } else {
+        useUIStore.getState().showToast('Session: ' + short + '...', 'success', 1000);
+      }
+    };
+
     // Gemini Sniper Watcher: receive session ID when Gemini creates it
     const handleGeminiSessionDetected = (_: any, data: { tabId: string; sessionId: string }) => {
       if (data.tabId !== tabId) return;
@@ -452,6 +467,7 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
     ipcRenderer.on('terminal:data', handleData);
     ipcRenderer.on('terminal:exit', handleExit);
     ipcRenderer.on('claude:session-detected', handleSessionDetected);
+    ipcRenderer.on('claude:status-session-detected', handleStatusSessionDetected);
     ipcRenderer.on('gemini:session-detected', handleGeminiSessionDetected);
 
     // Resize observer with Guard Clause (prevents WebGL accordion effect)
@@ -851,6 +867,7 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
       ipcRenderer.removeListener('terminal:data', handleData);
       ipcRenderer.removeListener('terminal:exit', handleExit);
       ipcRenderer.removeListener('claude:session-detected', handleSessionDetected);
+      ipcRenderer.removeListener('claude:status-session-detected', handleStatusSessionDetected);
       ipcRenderer.removeListener('gemini:session-detected', handleGeminiSessionDetected);
       // Close Gemini watcher if active for this tab
       ipcRenderer.send('gemini:close-watcher', { tabId });
