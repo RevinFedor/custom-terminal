@@ -643,3 +643,78 @@ if (isOutside) {
 
 ## Результат
 Интерфейс ведет себя предсказуемо: если пользователь закрыл меню, кликнув в пустую область экрана, карточка мгновенно теряет фокус. Если кликнул внутри границ — фокус сохраняется.
+\n---\n## File: ui-ux-stability.md\n
+# ЛОВУШКА: Portal + handleClickOutside = мгновенный сброс стейта
+
+## Проблема
+Кнопки внутри `TooltipPortal` (React Portal в `document.body`) при клике немедленно сбрасывают стейт, который они только что установили.
+
+## Механизм бага
+1. Компонент имеет `window.addEventListener('click', handleClickOutside)`.
+2. `handleClickOutside` проверяет `containerRef.current.contains(e.target)`.
+3. Кнопка "Начать копирование" рендерится через Portal → живёт в `document.body`, **вне** `containerRef`.
+4. Клик по кнопке:
+   - `onClick` → `setSelectionStartId("uuid-123")` ✅
+   - Event bubbles to `window` → `handleClickOutside` → `contains()` = `false` → `setSelectionStartId(null)` ❌
+5. Итог: стейт устанавливается и **мгновенно сбрасывается** в одном цикле.
+
+## Решение
+`e.stopPropagation()` на всех `onClick` кнопок внутри Portal:
+```tsx
+<button onClick={(e) => { e.stopPropagation(); startRangeSelection(entry); }}>
+```
+
+## Правило
+Любая кнопка внутри Portal, которая меняет стейт родительского компонента, **обязана** вызывать `e.stopPropagation()`. Иначе `handleClickOutside` на `window` убьёт изменение.
+\n---\n## File: ui-ux-stability.md\n
+# ЛОВУШКА: useCallback + Auto-Refresh = Stale Closure
+
+## Проблема
+В компоненте Timeline `entries` обновляется каждые 2 секунды (auto-refresh). Функция `handleEntryClick`, обёрнутая в `useCallback([tabId])`, захватывает `finishRangeSelection` из рендера, когда `tabId` последний раз менялся. `finishRangeSelection` в свою очередь захватывает `entries` из того же рендера.
+
+Результат: при вызове `finishRangeSelection` через 10+ секунд после создания `handleEntryClick`, `entries` содержит устаревший массив (часто пустой `[]`). UUID не находятся → `findIndex` = `-1`.
+
+## Симптомы
+- `entries.findIndex(e => e.uuid === startId)` возвращает `-1`
+- IPC вызов `claude:copy-range` возвращает `{ success: false }`
+- Баг воспроизводится нестабильно (зависит от тайминга refresh)
+
+## Решение
+1. **Не оборачивать в `useCallback`** функции, которые читают часто меняющийся стейт (`entries`, `sessionId`). Для `<div>` элементов (не мемоизированных компонентов) пересоздание функции на каждый рендер не влияет на производительность.
+2. **Использовать ref** для значений, которые нужны в обработчиках И в async-функциях: `selectionStartIdRef.current` вместо замыкания над `selectionStartId`.
+
+## Pattern: State + Ref
+```tsx
+const [selectionStartId, setSelectionStartId] = useState<string | null>(null);
+const selectionStartIdRef = useRef<string | null>(null);
+
+// При установке — обновляем ОБА:
+selectionStartIdRef.current = entry.uuid;
+setSelectionStartId(entry.uuid);
+
+// В обработчиках — читаем из ref (всегда актуальный):
+if (selectionStartIdRef.current) { ... }
+```
+\n---\n## File: ui-ux-stability.md\n
+# ФАКТ: navigator.clipboard ненадёжен в Electron
+
+## Проблема
+`navigator.clipboard.writeText()` в Electron renderer-процессе работает нестабильно:
+- Требует фокус окна (если окно потеряло фокус во время async/await — промис "теряется")
+- Возвращает Promise, который может отклониться без видимой причины
+- Баг проявляется intermittently (то работает, то нет)
+
+## Решение
+Использовать синхронный `clipboard` из Electron:
+```typescript
+const { ipcRenderer, clipboard } = window.require('electron');
+
+// ❌ Ненадёжно
+await navigator.clipboard.writeText(text);
+
+// ✅ Надёжно
+clipboard.writeText(text);
+```
+
+## Где применено
+- `Timeline.tsx`: копирование range, копирование текста сообщения, кнопка "Копировать" в тултипе.
