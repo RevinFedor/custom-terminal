@@ -796,6 +796,15 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
       }
       // ========== END STATE MACHINE ==========
 
+      // Detect Session ID from /status TUI output → show toast in renderer
+      {
+        const sc = stripVTControlCharacters(data);
+        const m = sc.match(/Session\s*ID[:\s]*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
+        if (m && mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('claude:status-session-detected', { tabId, sessionId: m[1] });
+        }
+      }
+
       // Send raw data to renderer - xterm.js handles OSC sequences itself
       if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.webContents.send('terminal:data', { pid: ptyProcess.pid, tabId, data });
