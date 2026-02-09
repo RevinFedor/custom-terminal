@@ -1560,6 +1560,11 @@ function TabBar({ projectId }: TabBarProps) {
                         e.stopPropagation();
                         if (contextMenu) {
                           ipcRenderer.send('terminal:input', contextMenu.tabId, `npm run ${script}\r`);
+                          // Detect dev-like scripts for auto-rename and green color
+                          const isDevScript = /^(dev|start|serve|watch)/i.test(script);
+                          if (isDevScript) {
+                            useWorkspaceStore.getState().setTabCommandType(contextMenu.tabId, 'devServer');
+                          }
                         }
                         setContextMenu(null);
                       }}

@@ -277,6 +277,9 @@ export const terminalRegistry = {
       }
     }
 
+    // Skip if user has active text selection — findNext would destroy it
+    if (terminal.hasSelection()) return false;
+
     // Find the text in the buffer
     const found = searchAddon.findNext(searchText, { ...defaultSearchOptions, decorations: undefined });
     if (!found) {

@@ -254,6 +254,7 @@ class ClaudeManager {
         }
 
         console.log('[ClaudeDetect] ❌ All methods exhausted — no session found');
+        console.log('[ClaudeDetect] See docs/knowledge/claude-session-detection.md for research on this limitation');
         return { success: false, error: 'Session file not found (all 3 methods failed)' };
       } catch (e) {
         console.log('[ClaudeDetect] ❌ Fatal error:', e.message);

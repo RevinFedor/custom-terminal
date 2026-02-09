@@ -1749,11 +1749,32 @@ function startSessionSniper(projectDir, startTime, onFound) {
       const fileTime = stats.birthtimeMs || stats.mtimeMs;
       console.log('[Sniper] New file:', filename, 'time:', fileTime, 'startTime:', startTime, 'diff:', fileTime - startTime);
       if (fileTime >= startTime - 1000) {
+        // Bridge filter: reject files from other sessions (Clear Context / Plan Mode)
+        const fileSessionId = filename.replace('.jsonl', '');
+        try {
+          const fd = fs.openSync(filePath, 'r');
+          const buf = Buffer.alloc(2048);
+          const bytesRead = fs.readSync(fd, buf, 0, 2048, 0);
+          fs.closeSync(fd);
+          if (bytesRead === 0) {
+            console.log('[Sniper] File empty, waiting for content...');
+            return; // File just created, no content yet — wait for next poll
+          }
+          const firstLine = buf.toString('utf-8', 0, bytesRead).split('\n')[0];
+          const entry = JSON.parse(firstLine);
+          if (entry.sessionId && entry.sessionId !== fileSessionId) {
+            console.log('[Sniper] ⛔ Bridge file detected (parent:', entry.sessionId.substring(0, 8) + '...), skipping');
+            return; // This file belongs to another session's Clear Context chain
+          }
+        } catch (parseErr) {
+          console.log('[Sniper] Could not parse first line, waiting...', parseErr.message);
+          return; // Can't verify yet — wait for next poll
+        }
+
         sessionFound = true;
-        const sessionId = filename.replace('.jsonl', '');
-        console.log('[Sniper] ✅ Session detected:', sessionId);
+        console.log('[Sniper] ✅ Session detected:', fileSessionId);
         cleanup();
-        onFound(sessionId);
+        onFound(fileSessionId);
       } else {
         console.log('[Sniper] File too old, skipping');
       }
@@ -2877,7 +2898,8 @@ ipcMain.handle('claude:get-timeline', async (event, { sessionId, cwd }) => {
           type: 'user',
           timestamp: entry.timestamp,
           content: cleanContent,
-          isCompactSummary: entry.isCompactSummary || false
+          isCompactSummary: entry.isCompactSummary || false,
+          sessionId: entry.sessionId || entry._fromFile
         });
       } else if (entry.type === 'system' && entry.subtype === 'compact_boundary') {
         entries.push({
@@ -2885,7 +2907,8 @@ ipcMain.handle('claude:get-timeline', async (event, { sessionId, cwd }) => {
           type: 'compact',
           timestamp: entry.timestamp,
           content: 'Conversation compacted',
-          preTokens: entry.compactMetadata?.preTokens
+          preTokens: entry.compactMetadata?.preTokens,
+          sessionId: entry.sessionId || entry._fromFile
         });
       }
     }
