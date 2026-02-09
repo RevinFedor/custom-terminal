@@ -2783,11 +2783,11 @@ ipcMain.handle('claude:get-timeline', async (event, { sessionId, cwd }) => {
       // We need to follow the bridge to continue backtrace into the parent chain.
       if (!nextUuid && sessionBoundaries.length > 0) {
         // Find bridge entry: an entry in mergedMap with a different sessionId whose parentUuid
-        // points to a record in the parent file
+        // points to a record in the parent file AND has not been visited yet
         for (const [uuid, entry] of recordMap) {
           if (seen.has(uuid)) continue;
-          // Bridge entry: marked _isBridge by loadJsonlRecords, sessionId differs, has parentUuid
-          if (entry._isBridge && entry.parentUuid && entry.sessionId !== record.sessionId) {
+          if (entry._isBridge && entry.parentUuid && entry.sessionId !== record.sessionId &&
+              !seen.has(entry.parentUuid)) {
             nextUuid = entry.parentUuid;
             break;
           }
@@ -2981,10 +2981,12 @@ ipcMain.handle('claude:export-clean-session', async (event, { sessionId, cwd, in
       let nextUuid = record.logicalParentUuid || record.parentUuid;
 
       // If we hit the root (parentUuid=null), check for bridge entry to parent session
+      // Only follow bridges whose target has not been visited yet (prevents cycling)
       if (!nextUuid && sessionBoundaries.length > 0) {
         for (const [uuid, entry] of recordMap) {
           if (seen.has(uuid)) continue;
-          if (entry._isBridge && entry.parentUuid && entry.sessionId !== record.sessionId) {
+          if (entry._isBridge && entry.parentUuid && entry.sessionId !== record.sessionId &&
+              !seen.has(entry.parentUuid)) {
             console.log('[Claude Export] Following bridge:', uuid.slice(0, 12), '\u2192 parent:', entry.parentUuid?.slice(0, 12));
             nextUuid = entry.parentUuid;
             break;
@@ -3127,7 +3129,7 @@ ipcMain.handle('claude:export-clean-session', async (event, { sessionId, cwd, in
         sessionLabel: sessionId.slice(0, 8),
         fullSessionId: sessionId,
         type: isForkFromLast ? 'fork' : 'clear-context',
-        prompts: 0, tools: 0, compacts: 0,
+        messages: 0, compacts: 0,
       });
     }
 
@@ -3138,7 +3140,7 @@ ipcMain.handle('claude:export-clean-session', async (event, { sessionId, cwd, in
 
     // Compute per-segment stats
     for (const seg of treeSegments) {
-      let prompts = 0, tools = 0, compacts = 0;
+      let messages = 0, compacts = 0;
       for (let i = seg.startIdx; i <= seg.endIdx && i < activeBranch.length; i++) {
         const entry = activeBranch[i];
         if (entry.isSidechain) continue;
@@ -3146,16 +3148,12 @@ ipcMain.handle('claude:export-clean-session', async (event, { sessionId, cwd, in
           const c = entry.message?.content;
           if (Array.isArray(c) && c.some(item => item.type === 'tool_result')) continue;
           if (typeof c === 'string' && (c.startsWith('[Request interrupted') || c.includes('<command-name>'))) continue;
-          prompts++;
-        } else if (entry.type === 'assistant') {
-          const mc = entry.message?.content;
-          if (Array.isArray(mc)) { for (const b of mc) { if (b.type === 'tool_use') tools++; } }
+          messages++;
         } else if (entry.type === 'system' && entry.subtype === 'compact_boundary') {
           compacts++;
         }
       }
-      seg.prompts = prompts;
-      seg.tools = tools;
+      seg.messages = messages;
       seg.compacts = compacts;
     }
 
@@ -3181,9 +3179,8 @@ ipcMain.handle('claude:export-clean-session', async (event, { sessionId, cwd, in
       if (seg.isCurrent && treeSegments.length > 1) tag += ' *';
 
       const stats = [];
-      if (seg.prompts > 0) stats.push(`${seg.prompts} prompt${seg.prompts !== 1 ? 's' : ''}`);
-      if (seg.tools > 0) stats.push(`${seg.tools} tool${seg.tools !== 1 ? 's' : ''}`);
       if (seg.compacts > 0) stats.push(`\u267B\uFE0F \u00D7${seg.compacts}`);
+      if (seg.messages > 0) stats.push(`${seg.messages} message${seg.messages !== 1 ? 's' : ''}`);
 
       const statsStr = stats.length > 0 ? ` \u2014 ${stats.join(', ')}` : '';
       outputParts.push(`${indent}${seg.sessionLabel}${tag}${statsStr}`);
