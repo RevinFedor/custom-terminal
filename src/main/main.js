@@ -2419,6 +2419,7 @@ function loadJsonlRecords(filePath) {
         // Detect bridge: first entry with uuid that has a different sessionId
         if (bridgeSessionId === null && entry.sessionId && entry.sessionId !== sessionId) {
           bridgeSessionId = entry.sessionId;
+          entry._isBridge = true; // Mark for backtrace bridge following
         } else if (bridgeSessionId === null && entry.sessionId === sessionId) {
           bridgeSessionId = undefined; // No bridge
         }
@@ -2461,7 +2462,7 @@ function resolveSessionChain(sessionId, cwd, maxDepth = 10) {
       }
     }
 
-    console.log('[SessionChain] Loaded', currentSessionId.slice(0, 12) + '...', ':', recordMap.size, 'records, bridge:', bridgeSessionId ? bridgeSessionId.slice(0, 12) + '...' : 'none');
+    // SessionChain load logged silently (use [Claude Export] logs for debug)
 
     if (bridgeSessionId) {
       sessionBoundaries.push({
@@ -2523,7 +2524,7 @@ function resolveLatestSessionInChain(sessionId, cwd) {
     } catch {}
 
     if (childId) {
-      console.log('[SessionChain] Found child:', childId.slice(0, 12), '... for parent:', currentId.slice(0, 12) + '...');
+      // SessionChain child found silently
       currentId = childId;
     } else {
       break; // No child found, currentId is the tip
@@ -2663,14 +2664,9 @@ ipcMain.handle('claude:fork-session-file', async (event, { sourceSessionId, cwd 
 
 // Get fork markers for a session (for Timeline blue lines)
 ipcMain.handle('claude:get-fork-markers', async (event, { sessionId }) => {
-  console.log('[Fork Markers] Getting markers for session:', sessionId);
   if (!sessionId) return { success: false, error: 'No session ID', markers: [] };
   try {
     const markers = projectManager.db.getForkMarkers(sessionId);
-    console.log('[Fork Markers] Found:', markers.length, 'markers');
-    if (markers.length > 0) {
-      console.log('[Fork Markers] Markers:', JSON.stringify(markers));
-    }
     return { success: true, markers };
   } catch (error) {
     console.error('[Fork Markers] Error:', error);
@@ -2682,7 +2678,6 @@ ipcMain.handle('claude:get-fork-markers', async (event, { sessionId }) => {
 // Reads JSONL file and returns filtered entries for Timeline component
 // Uses BACKTRACE algorithm to handle Escape/Undo branches correctly
 ipcMain.handle('claude:get-timeline', async (event, { sessionId, cwd }) => {
-  console.log('[Claude Timeline] Getting timeline for session:', sessionId);
 
   if (!sessionId) {
     return { success: false, error: 'No session ID provided' };
@@ -2692,11 +2687,7 @@ ipcMain.handle('claude:get-timeline', async (event, { sessionId, cwd }) => {
     // Resolve the full session chain (follows bridge entries across "Clear Context" boundaries)
     const { mergedMap: recordMap, lastRecord, sessionBoundaries } = resolveSessionChain(sessionId, cwd);
 
-    console.log('[Claude Timeline] Merged records:', recordMap.size, '| Chain depth:', sessionBoundaries.length + 1);
-    console.log('[Claude Timeline] Last record type:', lastRecord?.type);
-
     if (!lastRecord) {
-      console.log('[Claude Timeline] No lastRecord - returning empty');
       return { success: true, entries: [] };
     }
 
@@ -2724,9 +2715,8 @@ ipcMain.handle('claude:get-timeline', async (event, { sessionId, cwd }) => {
         // points to a record in the parent file
         for (const [uuid, entry] of recordMap) {
           if (seen.has(uuid)) continue;
-          // Bridge entry: sessionId differs from the file it lives in AND has a parentUuid
-          if (entry.parentUuid && entry.sessionId !== record.sessionId) {
-            console.log('[Claude Timeline] Following bridge:', uuid.slice(0, 12), '→ parent:', entry.parentUuid?.slice(0, 12));
+          // Bridge entry: marked _isBridge by loadJsonlRecords, sessionId differs, has parentUuid
+          if (entry._isBridge && entry.parentUuid && entry.sessionId !== record.sessionId) {
             nextUuid = entry.parentUuid;
             break;
           }
@@ -2735,8 +2725,6 @@ ipcMain.handle('claude:get-timeline', async (event, { sessionId, cwd }) => {
 
       currentUuid = nextUuid;
     }
-
-    console.log('[Claude Timeline] Active branch size:', activeBranch.length);
 
     // Now filter the active branch for Timeline display
     const entries = [];
@@ -2831,17 +2819,6 @@ ipcMain.handle('claude:get-timeline', async (event, { sessionId, cwd }) => {
       }
     }
 
-    console.log('[Claude Timeline] === FILTER RESULTS ===');
-    console.log('[Claude Timeline] Skipped sidechain:', skippedSidechain);
-    console.log('[Claude Timeline] Skipped summary:', skippedSummary);
-    console.log('[Claude Timeline] Skipped tool_result:', skippedToolResult);
-    console.log('[Claude Timeline] Skipped no content:', skippedNoContent);
-    console.log('[Claude Timeline] Skipped system msg:', skippedSystem);
-    console.log('[Claude Timeline] FINAL entries:', entries.length);
-    if (entries.length > 0) {
-      console.log('[Claude Timeline] First entry:', entries[0].content?.slice(0, 50));
-    }
-
     // Resolve the latest session ID in the chain (tip)
     // This helps the renderer detect if claudeSessionId needs updating
     const latestSessionId = resolveLatestSessionInChain(sessionId, cwd);
@@ -2865,59 +2842,11 @@ ipcMain.handle('claude:export-clean-session', async (event, { sessionId, cwd, in
   }
 
   try {
-    const claudeProjectsDir = path.join(os.homedir(), '.claude', 'projects');
+    // Resolve the full session chain (follows bridge entries across "Clear Context" boundaries)
+    // Same as Timeline — loads all JSONL files in the chain and merges records
+    const { mergedMap: recordMap, lastRecord, sessionBoundaries } = resolveSessionChain(sessionId, cwd);
 
-    // Find session file
-    let sourcePath = null;
-
-    if (cwd) {
-      const projectSlug = cwd.replace(/\//g, '-');
-      const primaryPath = path.join(claudeProjectsDir, projectSlug, `${sessionId}.jsonl`);
-      if (fs.existsSync(primaryPath)) {
-        sourcePath = primaryPath;
-      }
-    }
-
-    if (!sourcePath && fs.existsSync(claudeProjectsDir)) {
-      const projectDirs = fs.readdirSync(claudeProjectsDir, { withFileTypes: true })
-        .filter(dirent => dirent.isDirectory())
-        .map(dirent => dirent.name);
-
-      for (const dir of projectDirs) {
-        const checkPath = path.join(claudeProjectsDir, dir, `${sessionId}.jsonl`);
-        if (fs.existsSync(checkPath)) {
-          sourcePath = checkPath;
-          break;
-        }
-      }
-    }
-
-    if (!sourcePath) {
-      return { success: false, error: 'Session file not found' };
-    }
-
-    // Read and parse JSONL
-    const fileContent = fs.readFileSync(sourcePath, 'utf-8');
-    const allRecords = fileContent.trim().split('\n')
-      .filter(line => line.trim())
-      .map(line => {
-        try { return JSON.parse(line); }
-        catch (e) { return null; }
-      })
-      .filter(Boolean);
-
-    // 1. Build UUID -> Record Map
-    const recordMap = new Map();
-    allRecords.forEach(r => recordMap.set(r.uuid, r));
-    console.log('[Claude Export] Total records in file:', allRecords.length);
-    console.log('[Claude Export] UUID map size:', recordMap.size);
-
-    // 2. BACKTRACE: Find the active branch starting from the last record (any type)
-    // Must use the very last record with a valid UUID (same as timeline)
-    let lastRecord = null;
-    for (const r of allRecords) {
-      if (r.uuid) lastRecord = r;
-    }
+    console.log('[Claude Export] Merged records:', recordMap.size, '| Chain depth:', sessionBoundaries.length + 1);
     console.log('[Claude Export] Last record type:', lastRecord?.type);
 
     if (!lastRecord) {
@@ -2925,13 +2854,14 @@ ipcMain.handle('claude:export-clean-session', async (event, { sessionId, cwd, in
       return { success: true, content: '# Empty session' };
     }
 
-    let currentUuid = lastRecord.uuid;
-    console.log('[Claude Export] Starting backtrace from UUID:', currentUuid);
-
+    // BACKTRACE: Walk backwards from the last record following parentUuid
+    // Same logic as Timeline — follows bridge entries across file boundaries
     const activeBranch = [];
-    let backtraceSteps = 0;
+    let currentUuid = lastRecord.uuid;
+    const seen = new Set();
 
-    while (currentUuid) {
+    while (currentUuid && !seen.has(currentUuid)) {
+      seen.add(currentUuid);
       const record = recordMap.get(currentUuid);
       if (!record) {
         console.log('[Claude Export] Backtrace ended - UUID not found:', currentUuid);
@@ -2939,23 +2869,39 @@ ipcMain.handle('claude:export-clean-session', async (event, { sessionId, cwd, in
       }
 
       activeBranch.unshift(record);
-      backtraceSteps++;
 
-      // Stop if we hit a fork point AND fromStart is false
-      // A fork point is typically where parentUuid is null but logicalParentUuid exists (compact)
-      // or if it's just a resume point.
+      // Stop at compact boundary if fromStart=false
       if (!fromStart && (record.type === 'system' && record.subtype === 'compact_boundary')) {
         console.log('[Claude Export] Stopping at compact_boundary (fromStart=false)');
         break;
       }
 
-      currentUuid = record.logicalParentUuid || record.parentUuid;
+      let nextUuid = record.logicalParentUuid || record.parentUuid;
+
+      // If we hit the root (parentUuid=null), check for bridge entry to parent session
+      if (!nextUuid && sessionBoundaries.length > 0) {
+        for (const [uuid, entry] of recordMap) {
+          if (seen.has(uuid)) continue;
+          if (entry._isBridge && entry.parentUuid && entry.sessionId !== record.sessionId) {
+            console.log('[Claude Export] Following bridge:', uuid.slice(0, 12), '\u2192 parent:', entry.parentUuid?.slice(0, 12));
+            nextUuid = entry.parentUuid;
+            break;
+          }
+        }
+      }
+
+      currentUuid = nextUuid;
     }
 
-    console.log('[Claude Export] Backtrace complete:', {
-      steps: backtraceSteps,
-      activeBranchSize: activeBranch.length
-    });
+    console.log('[Claude Export] Backtrace complete, active branch size:', activeBranch.length);
+
+    // Debug: log sessionId distribution in activeBranch
+    const sidCounts = {};
+    for (const entry of activeBranch) {
+      const sid = (entry.sessionId || 'NO-SID').slice(0, 8);
+      sidCounts[sid] = (sidCounts[sid] || 0) + 1;
+    }
+    console.log('[Claude Export] SessionId distribution:', JSON.stringify(sidCounts));
 
     // 3. FORK MARKERS: Precompute which UUIDs are fork boundaries
     // Helper: check if a record is a Timeline-eligible entry (user message or compact boundary)
@@ -2969,24 +2915,21 @@ ipcMain.handle('claude:export-clean-session', async (event, { sessionId, cwd, in
     };
 
     const forkBoundaryUuids = new Set();
-    const markerBoundaryPairs = []; // { lastBoundaryIdx, sourceSessionId } for tree building
     let hasForkAtBeginning = false; // Fork with empty snapshot = fork before any entries
+    let forkMarkers = [];
     try {
-      const forkMarkers = projectManager.db.getForkMarkers(sessionId);
+      forkMarkers = projectManager.db.getForkMarkers(sessionId);
       console.log('[Claude Export] Fork markers found:', forkMarkers.length);
       for (const marker of forkMarkers) {
         const snapshotSet = new Set(marker.entry_uuids || []);
         if (snapshotSet.size === 0) {
-          // Empty snapshot = fork at the very beginning (before any entries)
           hasForkAtBeginning = true;
           continue;
         }
-        let lastBIdx = -1; // Track last boundary index for this marker (for tree)
         // Find boundary: last Timeline-eligible entry in snapshot where next Timeline-eligible entry is NOT in snapshot
         for (let idx = 0; idx < activeBranch.length; idx++) {
           const rec = activeBranch[idx];
           if (!snapshotSet.has(rec.uuid)) continue;
-          // Find the NEXT Timeline-eligible entry (skip assistant/tool entries)
           let nextTimelineEntry = null;
           for (let j = idx + 1; j < activeBranch.length; j++) {
             if (isTimelineEntry(activeBranch[j])) {
@@ -2995,21 +2938,13 @@ ipcMain.handle('claude:export-clean-session', async (event, { sessionId, cwd, in
             }
           }
           if (!nextTimelineEntry) {
-            // No more Timeline entries after this — boundary at the end
             forkBoundaryUuids.add(rec.uuid);
-            lastBIdx = idx;
           } else if (!snapshotSet.has(nextTimelineEntry.uuid)) {
-            // Next Timeline entry is NOT in snapshot — this is the fork boundary
             forkBoundaryUuids.add(rec.uuid);
-            lastBIdx = idx;
           }
-        }
-        if (lastBIdx >= 0) {
-          markerBoundaryPairs.push({ lastBoundaryIdx: lastBIdx, sourceSessionId: marker.source_session_id });
         }
       }
       console.log('[Claude Export] Fork boundary UUIDs:', forkBoundaryUuids.size, 'hasForkAtBeginning:', hasForkAtBeginning);
-      console.log('[Claude Export] Marker boundary pairs:', markerBoundaryPairs.length);
     } catch (e) {
       console.warn('[Claude Export] Could not load fork markers:', e.message);
     }
@@ -3032,30 +2967,72 @@ ipcMain.handle('claude:export-clean-session', async (event, { sessionId, cwd, in
       }
     }
 
-    // Build session tree segments from fork marker boundaries
-    markerBoundaryPairs.sort((a, b) => a.lastBoundaryIdx - b.lastBoundaryIdx);
-
+    // Build session tree segments from sessionId boundaries in activeBranch
+    // This captures BOTH fork transitions and clear-context transitions
     const treeSegments = [];
-    let segStart = 0;
+    let currentTreeSid = null;
 
-    for (const mb of markerBoundaryPairs) {
-      treeSegments.push({
-        startIdx: segStart,
-        endIdx: mb.lastBoundaryIdx,
-        sessionLabel: mb.sourceSessionId.slice(0, 8),
-        type: treeSegments.length === 0 && !hasForkAtBeginning ? 'root' : 'fork'
-      });
-      segStart = mb.lastBoundaryIdx + 1;
+    for (let i = 0; i < activeBranch.length; i++) {
+      const entry = activeBranch[i];
+      const entrySid = entry.sessionId || 'unknown';
+
+      if (entrySid !== currentTreeSid) {
+        currentTreeSid = entrySid;
+        treeSegments.push({
+          startIdx: i,
+          endIdx: i,
+          sessionLabel: entrySid.slice(0, 8),
+          fullSessionId: entrySid,
+        });
+      }
+      // Update endIdx of current segment
+      if (treeSegments.length > 0) {
+        treeSegments[treeSegments.length - 1].endIdx = i;
+      }
     }
 
-    // Current session (final segment)
-    treeSegments.push({
-      startIdx: segStart,
-      endIdx: activeBranch.length - 1,
-      sessionLabel: sessionId.slice(0, 8),
-      type: treeSegments.length === 0 && !hasForkAtBeginning ? 'root' : 'fork',
-      isCurrent: true
-    });
+    // Determine segment types using bridge entries from recordMap
+    // Bridge entry (_isBridge=true) with sessionId matching PREVIOUS segment = clear-context/plan mode
+    // No matching bridge = fork (entries were copied, not bridged)
+    for (let i = 0; i < treeSegments.length; i++) {
+      const seg = treeSegments[i];
+
+      if (i === 0) {
+        seg.type = 'root';
+      } else {
+        // Check if a bridge entry exists with sessionId matching the previous segment
+        // This means the transition was a clear-context (plan mode)
+        let hasBridge = false;
+        for (const [, entry] of recordMap) {
+          if (entry._isBridge && entry.sessionId === treeSegments[i - 1].fullSessionId) {
+            hasBridge = true;
+            break;
+          }
+        }
+        seg.type = hasBridge ? 'clear-context' : 'fork';
+      }
+    }
+
+    // If the current export session has no entries in activeBranch, add it as final segment
+    // This happens when a fork was just created and Claude hasn't written new entries yet
+    const lastSeg = treeSegments[treeSegments.length - 1];
+    if (lastSeg.fullSessionId !== sessionId) {
+      // Determine type: check fork markers (source = last segment = fork) or session boundary
+      const isForkFromLast = forkMarkers.some(m => m.source_session_id === lastSeg.fullSessionId);
+      treeSegments.push({
+        startIdx: activeBranch.length,
+        endIdx: activeBranch.length - 1,
+        sessionLabel: sessionId.slice(0, 8),
+        fullSessionId: sessionId,
+        type: isForkFromLast ? 'fork' : 'clear-context',
+        prompts: 0, tools: 0, compacts: 0,
+      });
+    }
+
+    // Mark current session
+    for (let i = 0; i < treeSegments.length; i++) {
+      treeSegments[i].isCurrent = i === treeSegments.length - 1;
+    }
 
     // Compute per-segment stats
     for (const seg of treeSegments) {
@@ -3080,14 +3057,7 @@ ipcMain.handle('claude:export-clean-session', async (event, { sessionId, cwd, in
       seg.compacts = compacts;
     }
 
-    // Detect clear-context boundaries (bridge entries with different sessionId)
-    const sessionIds = new Set();
-    for (const entry of activeBranch) {
-      if (entry.sessionId) sessionIds.add(entry.sessionId);
-    }
-    const clearContextCount = Math.max(0, sessionIds.size - 1);
-
-    console.log('[Claude Export] Tree segments:', treeSegments.length, 'clearContexts:', clearContextCount);
+    console.log('[Claude Export] Tree segments:', treeSegments.length, treeSegments.map(s => `${s.sessionLabel}(${s.type})`).join(' → '));
 
     const outputParts = [];
     outputParts.push(`# Claude Session Export`);
@@ -3100,12 +3070,13 @@ ipcMain.handle('claude:export-clean-session', async (event, { sessionId, cwd, in
     for (let i = 0; i < treeSegments.length; i++) {
       const seg = treeSegments[i];
       const depth = i;
-      const indent = depth > 0 ? '    '.repeat(depth - 1) + '└── ' : '';
+      const indent = depth > 0 ? '    '.repeat(depth - 1) + '\u2514\u2500\u2500 ' : '';
 
       let tag = '';
-      if (seg.type === 'root') tag = ' (root)';
-      else if (seg.isCurrent && treeSegments.length > 1) tag = ' (current)';
-      else if (!seg.isCurrent) tag = ' (fork)';
+      if (seg.type === 'root' && treeSegments.length > 1) tag = ' (root)';
+      else if (seg.type === 'clear-context') tag = ' (plan mode)';
+      else if (seg.type === 'fork') tag = ' (fork)';
+      if (seg.isCurrent && treeSegments.length > 1) tag += ' *';
 
       const stats = [];
       if (seg.prompts > 0) stats.push(`${seg.prompts} prompt${seg.prompts !== 1 ? 's' : ''}`);
@@ -3114,10 +3085,6 @@ ipcMain.handle('claude:export-clean-session', async (event, { sessionId, cwd, in
 
       const statsStr = stats.length > 0 ? ` \u2014 ${stats.join(', ')}` : '';
       outputParts.push(`${indent}${seg.sessionLabel}${tag}${statsStr}`);
-    }
-    if (clearContextCount > 0) {
-      const lastIndent = '    '.repeat(Math.max(0, treeSegments.length - 1));
-      outputParts.push(`${lastIndent}(+ ${clearContextCount} clear context${clearContextCount > 1 ? 's' : ''})`);
     }
     outputParts.push('');
     outputParts.push(`Markers:`);
