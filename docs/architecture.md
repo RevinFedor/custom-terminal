@@ -30,14 +30,15 @@
     - **CWD via lsof:** Для получения рабочего каталога процесса без взаимодействия с шеллом используется `lsof -p <PID>`.
 - **Shell Integration (OSC 7 & 133):**
     - **OSC 7:** Передача текущего рабочего каталога (CWD). См. `knowledge/terminal-core.md`.
-    - **CWD Capture:** Для фичи Scripts (см. `features/scripts.md`) используется IPC `terminal:getCwd`, который запрашивает путь напрямую у инстанса xterm.js, гарантируя актуальность после команд `cd`.
+    - **CWD Capture:** Для фичи Scripts (см. `features/scripts.md`) и контекстного меню табов используется IPC `terminal:getCwd`, который запрашивает путь напрямую у инстанса xterm.js, гарантируя актуальность после команд `cd`.
     - **OSC 133 (Event-Driven):** Использование невидимых сигналов от шелла для отслеживания жизненного цикла команд. Позволяет мгновенно узнавать о старте и завершении процесса без polling. См. `knowledge/terminal-core.md`.
     - **КРИТИЧЕСКОЕ ПРАВИЛО:** Запрещён polling через `pgrep`/`ps` для определения статуса процесса. Использовать только `terminal:getCommandState` (память) и IPC-события `terminal:command-started`/`terminal:command-finished`.
 - **Search Engine:** Интеграция `@xterm/addon-search` для полнотекстового поиска по буферу.
     - **Proposed API:** Для работы поиска в `xterm.js` включена опция `allowProposedApi: true`.
 - **Resizing:** Управление размером терминала через `ResizeObserver`. Для стабильности используется `activeRef` во избежание проблем с замыканиями. См. `knowledge/terminal-core.md`.
 - **AI Integrations:**
-    - **Claude Sniper:** Захват UUID через dual-method: `fs.watch` + polling (1с fallback). Реализован как функция `startSessionSniper()` с snapshot существующих файлов и 30с таймаутом. См. `features/claude-sessions.md`.
+    - **Claude Sniper:** Захват UUID через dual-method: `fs.watch` + polling (1с fallback). Реализован как функция `startSessionSniper()` с snapshot существующих файлов, bridge-фильтрацией и 30с таймаутом. См. `features/claude-sessions.md`, `knowledge/claude-session-detection.md`.
+    - **Claude Code Internals:** Документация внутренней архитектуры CLI (entry types, session chain механизм, скрытые поля). См. `knowledge/claude-code-internals.md`.
     - **Claude Handshake:** Стейт-машина (WAITING_PROMPT → DEBOUNCE_PROMPT → TAB_SENT → READY) для автоматического включения thinking mode (`\t`) и отправки промпта. Поддерживает `⏵` (Claude v2.1.32+) и `>`. Используется `stripVTControlCharacters()`.
     - **Gemini Sniper:** Захват UUID через `fs.watch` на `session-*.json`. См. `knowledge/ai-automation.md`.
     - **Timeline & Export Engine:** Асинхронный парсинг JSONL файлов с использованием алгоритма **Backtrace** для фильтрации отменённых (Undo) веток диалога. 

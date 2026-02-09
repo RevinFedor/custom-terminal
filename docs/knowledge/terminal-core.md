@@ -289,3 +289,16 @@ if (state.isRunning) {
 **ЗАПРЕЩЁН polling через `pgrep`/`ps`** для определения статуса процесса. Использовать только:
 - `terminal:getCommandState` (читает из памяти, 0 syscalls)
 - IPC-события `terminal:command-started` / `terminal:command-finished`
+
+## TRAP: IPC Listeners + useEffect Dependencies
+
+**Ловушка:** Если `ipcRenderer.on(...)` подписки находятся в `useEffect` с нестабильной зависимостью (например `[workspace?.tabs.size]`), то при каждом изменении зависимости:
+1. Cleanup снимает старые listeners
+2. Между cleanup и новой подпиской — окно, когда OSC 133 events **теряются**
+3. `initStatus()` внутри создаёт **новый Map** и перезаписывает `setProcessStatus(newMap)` — убивая актуальное состояние `isRunning: true` для долгоживущих процессов (dev-серверы)
+
+**Решение (TabBar.tsx):** Два раздельных `useEffect`:
+1. **Listeners** (`[]`) — подписка один раз, стабильная, никогда не переподписывается
+2. **Sync** (`[workspace?.tabs.size]`) — только для новых табов, **дополняет** Map через `prev =>` вместо полной перезаписи. Если таб уже отслеживается — его значение не перетирается
+
+**Почему нейронка не догадается:** Код с единым `useEffect([tabs.size])` выглядит корректно — listeners подписываются, cleanup их убирает. Баг проявляется только при специфическом сценарии: dev-сервер запущен → создание нового таба → `tabs.size` изменился → effect re-runs → `initStatus()` async-ответ может прийти с `isRunning: false` (race) → кнопка RestartZone пропадает.
