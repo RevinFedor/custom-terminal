@@ -431,59 +431,14 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
       }
     };
 
-    // Sniper Watcher: receive session ID when Claude creates it
+    // Session Bridge: receive session ID from StatusLine bridge watcher
     const handleSessionDetected = (_: any, data: { tabId: string; sessionId: string }) => {
       if (data.tabId !== tabId) return;
-      console.log('[Terminal] Sniper caught Claude session:', data.sessionId);
+      const currentId = getClaudeSessionId(tabId);
+      if (currentId !== data.sessionId) {
+        console.log('[Terminal] Bridge session:', data.sessionId.substring(0, 8) + '...', currentId ? '(was: ' + currentId.substring(0, 8) + '...)' : '(new)');
+      }
       getSetClaudeSessionId()(tabId, data.sessionId);
-    };
-
-    // Session ID interceptor: scan xterm.js buffer for "Session ID:" from /status TUI
-    // Ink renders via cursor positioning → PTY data is fragmented → must read rendered buffer
-    const scanBufferForSessionId = () => {
-      const term = xtermInstance.current;
-      if (!term) return;
-      const buffer = term.buffer.active;
-      const uuidRegex = /Session\s*ID:\s*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i;
-      for (let i = 0; i < buffer.length; i++) {
-        const line = buffer.getLine(i);
-        if (!line) continue;
-        const text = line.translateToString(true);
-        const match = text.match(uuidRegex);
-        if (match) {
-          const detectedId = match[1];
-          const currentId = getClaudeSessionId(tabId);
-          console.log('[SessionInterceptor] Buffer scan found Session ID:', detectedId);
-          console.log('[SessionInterceptor] Current stored ID:', currentId || 'NONE');
-          console.log('[SessionInterceptor] Buffer line', i, ':', text.trim());
-          if (currentId && currentId === detectedId) {
-            console.log('[SessionInterceptor] ✅ Session matches');
-          } else if (currentId && currentId !== detectedId) {
-            console.log('[SessionInterceptor] ⚠️ MISMATCH! Stored:', currentId.substring(0, 8), '→ Detected:', detectedId.substring(0, 8));
-          } else {
-            console.log('[SessionInterceptor] 📝 No stored session — auto-setting');
-            getSetClaudeSessionId()(tabId, detectedId);
-          }
-          return;
-        }
-      }
-      console.log('[SessionInterceptor] No Session ID found in buffer (scanned', buffer.length, 'lines)');
-    };
-
-    // Detect alternate screen buffer (Ink TUI) and scan after render settles
-    let altBufferScanTimer: ReturnType<typeof setTimeout> | null = null;
-    const handleBufferChange = () => {
-      const term = xtermInstance.current;
-      if (!term) return;
-      // Only scan when alternate buffer is active (Ink TUI like /status)
-      if (term.buffer.active.type === 'alternate') {
-        // Debounce: wait for Ink to finish rendering
-        if (altBufferScanTimer) clearTimeout(altBufferScanTimer);
-        altBufferScanTimer = setTimeout(() => {
-          console.log('[SessionInterceptor] Alternate buffer detected, scanning...');
-          scanBufferForSessionId();
-        }, 500);
-      }
     };
 
     // Gemini Sniper Watcher: receive session ID when Gemini creates it
@@ -493,26 +448,10 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
       getSetGeminiSessionId()(tabId, data.sessionId);
     };
 
-    // PTY interceptor: show brief toast when /status reveals Session ID
-    const handleStatusSessionDetected = (_: any, data: { tabId: string; sessionId: string }) => {
-      if (data.tabId !== tabId) return;
-      const currentId = getClaudeSessionId(tabId);
-      const short = data.sessionId.substring(0, 8);
-      if (!currentId) {
-        getSetClaudeSessionId()(tabId, data.sessionId);
-        useUIStore.getState().showToast(`Session: ${short}...`, 'success', 1000);
-      } else if (currentId !== data.sessionId) {
-        useUIStore.getState().showToast(`/status: ${short}... ≠ stored: ${currentId.substring(0, 8)}...`, 'warning', 2000);
-      } else {
-        useUIStore.getState().showToast(`Session: ${short}...`, 'success', 1000);
-      }
-    };
-
     // Register IPC listeners synchronously
     ipcRenderer.on('terminal:data', handleData);
     ipcRenderer.on('terminal:exit', handleExit);
     ipcRenderer.on('claude:session-detected', handleSessionDetected);
-    ipcRenderer.on('claude:status-session-detected', handleStatusSessionDetected);
     ipcRenderer.on('gemini:session-detected', handleGeminiSessionDetected);
 
     // Resize observer with Guard Clause (prevents WebGL accordion effect)
@@ -674,13 +613,6 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
         ipcRenderer.send('terminal:input', tabId, data);
       });
 
-      // Session ID interceptor: scan buffer when Ink TUI renders
-      term.onWriteParsed(() => {
-        if (term.buffer.active.type === 'alternate') {
-          handleBufferChange();
-        }
-      });
-
       // Track selection changes and update global state
       term.onSelectionChange(() => {
         if (active) {
@@ -745,7 +677,7 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
 
           // Clear line, start watcher, then launch claude
           ipcRenderer.send('terminal:input', tabId, '\x15');
-          log.claude('Sending claude:spawn-with-watcher IPC');
+          log.claude('Sending claude:spawn-with-watcher IPC (Bridge handles session detection)');
           // Main process will: 1) start fs.watch 2) write 'claude\r' to PTY
           ipcRenderer.send('claude:spawn-with-watcher', { tabId, cwd });
           return false;
@@ -830,7 +762,7 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
           }
 
           ipcRenderer.send('terminal:input', tabId, '\x15');
-          console.log('[Claude Intercept] Spawning with Sniper Watcher');
+          console.log('[Claude Intercept] Launching Claude');
           ipcRenderer.send('claude:spawn-with-watcher', { tabId, cwd });
           return false;
         }
@@ -919,10 +851,7 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
       ipcRenderer.removeListener('terminal:data', handleData);
       ipcRenderer.removeListener('terminal:exit', handleExit);
       ipcRenderer.removeListener('claude:session-detected', handleSessionDetected);
-      ipcRenderer.removeListener('claude:status-session-detected', handleStatusSessionDetected);
       ipcRenderer.removeListener('gemini:session-detected', handleGeminiSessionDetected);
-      if (altBufferScanTimer) clearTimeout(altBufferScanTimer);
-
       // Close Gemini watcher if active for this tab
       ipcRenderer.send('gemini:close-watcher', { tabId });
 
@@ -1139,7 +1068,7 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
             }
 
             ipcRenderer.send('terminal:input', tabId, '\x15');
-            console.log('[Claude Intercept] Spawning with Sniper Watcher');
+            console.log('[Claude Intercept] Launching Claude');
             ipcRenderer.send('claude:spawn-with-watcher', { tabId, cwd });
             return false;
           }
@@ -1221,7 +1150,7 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
             }
 
             ipcRenderer.send('terminal:input', tabId, '\x15');
-            console.log('[Claude Intercept] Spawning with Sniper Watcher');
+            console.log('[Claude Intercept] Launching Claude');
             ipcRenderer.send('claude:spawn-with-watcher', { tabId, cwd });
             return false;
           }
