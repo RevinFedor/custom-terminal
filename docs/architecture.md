@@ -89,9 +89,11 @@ Continue → claude --resume ID | Dismiss → overlayDismissed = true
 - **ЛОВУШКА: console.log перехвачен.** В `main.tsx` установлен глобальный фильтр — `console.log()` пропускает только логи с префиксом `[RESTORE]`. Для отладки использовать `console.warn()`. См. `knowledge/fact-console-interceptor.md`.
 
 ## 7. Styling & Rendering
-- **Tailwind v4 + Vite:** Используется официальный плагин `@tailwindcss/vite`, обеспечивающий мгновенный HMR и автоматическое сканирование зависимостей. См. `knowledge/rendering-styles.md`.
+- **Tailwind v4 + Vite:** Используется официальный плагin `@tailwindcss/vite`, обеспечивающий мгновенный HMR и автоматическое сканирование зависимостей. См. `knowledge/rendering-styles.md`.
 - **Dynamic Styles:** Для рантайм-цветов используются Inline Styles (Tailwind не поддерживает динамическую генерацию классов типа `bg-${color}`). См. `knowledge/fix-tailwind-dynamic-runtime.md`.
-- **Markdown:** Специальный рендерер для исправления гидратации и inline-кода. См. `knowledge/rendering-styles.md`, `knowledge/rendering-styles.md` и `knowledge/rendering-styles.md`.
+- **Markdown Rendering:**
+  - **File Preview:** Унифицированный просмотр всех файлов через `@anthropic/markdown-editor` (readOnly mode). Заменил `react-markdown` + `highlight.js`. См. `knowledge/file-preview-markdown.md`.
+  - **Notes & Research:** Разные рендереры для разных целей (CodeMirror для редактирования, react-markdown для AI-ответов). См. `knowledge/rendering-styles.md`.
 - **Hotkeys:** Перехват `Cmd+Plus/Minus` для изменения шрифта терминала вместо системного зума. См. `knowledge/ui-ux-stability.md` (раздел 6).
 
 ## 8. UI Patterns & Modals

@@ -16,6 +16,7 @@
 
 ## 2. Flow: Умное управление терминалом
 - **Скролл:** Скрытый горизонтальный скролл в `TabBar` (прокрутка колесиком без Shift).
+- **File Explorer (`Cmd+\`):** Боковое дерево файлов проекта. Клик по файлу → полноэкранный просмотр с подсветкой синтаксиса и collapsible headers. См. [`knowledge/file-preview-markdown.md`](knowledge/file-preview-markdown.md).
 - **Scripts:** Запуск npm-скриптов из `package.json` через контекстное меню таба (ПКМ → Scripts). См. [`features/scripts.md`](features/scripts.md).
 - **RestartZone:** Кнопка быстрого перезапуска для dev-серверов (появляется при наведении на зелёный маркер активного процесса).
 - **Cross-Project Drag:** Перетаскивание таба терминала на заголовок другого проекта в Title Bar перемещает таб в этот проект.

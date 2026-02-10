@@ -60,6 +60,8 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
   const cached = activeTabId ? bridgeCacheRef.current.get(activeTabId) : undefined;
   const [claudeModel, setClaudeModel] = useState<string | null>(cached?.model ?? null);
   const [contextPct, setContextPct] = useState(cached?.contextPct ?? 0);
+  // Command running state (OSC 133)
+  const [isCommandRunning, setIsCommandRunning] = useState(false);
   // Manual session ID replace
   const [showSessionInput, setShowSessionInput] = useState(false);
   const [manualSessionId, setManualSessionId] = useState('');
@@ -95,6 +97,29 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
     const c = activeTabId ? bridgeCacheRef.current.get(activeTabId) : undefined;
     setClaudeModel(c?.model ?? null);
     setContextPct(c?.contextPct ?? 0);
+  }, [activeTabId]);
+
+  // Track command running state via OSC 133 events (same pattern as Workspace.tsx)
+  useEffect(() => {
+    if (!activeTabId) {
+      setIsCommandRunning(false);
+      return;
+    }
+    const handleStarted = (_: any, data: { tabId: string }) => {
+      if (data.tabId === activeTabId) setIsCommandRunning(true);
+    };
+    const handleFinished = (_: any, data: { tabId: string }) => {
+      if (data.tabId === activeTabId) setIsCommandRunning(false);
+    };
+    ipcRenderer.on('terminal:command-started', handleStarted);
+    ipcRenderer.on('terminal:command-finished', handleFinished);
+    ipcRenderer.invoke('terminal:getCommandState', activeTabId).then((state: any) => {
+      setIsCommandRunning(state?.isRunning || false);
+    });
+    return () => {
+      ipcRenderer.removeListener('terminal:command-started', handleStarted);
+      ipcRenderer.removeListener('terminal:command-finished', handleFinished);
+    };
   }, [activeTabId]);
 
   // Listen for bridge metadata (model, context %) — cache per tab
@@ -372,9 +397,6 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
         {hasAnySession ? (
           <div className={`rounded p-2 ${currentSessionType === 'claude' ? 'bg-[#2a3a2a] border border-[#3a5a3a]' : 'bg-[#1a2a3a] border border-[#2a4a6a]'}`}>
             <div className="flex items-center gap-2 mb-1">
-              <span className={`text-xs font-medium ${currentSessionType === 'claude' ? 'text-[#DA7756]' : 'text-[#4E86F8]'}`}>
-                {currentSessionType === 'claude' ? 'Claude' : 'Gemini'}
-              </span>
               <span
                 className="cursor-pointer flex-shrink-0 transition-colors leading-none"
                 style={{ color: sessionCopied ? '#4ade80' : '#888', fontSize: '14px' }}
@@ -389,6 +411,24 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
               >
                 {sessionCopied ? '✓' : '⎘'}
               </span>
+              <span className={`text-xs font-medium ${currentSessionType === 'claude' ? 'text-[#DA7756]' : 'text-[#4E86F8]'}`}>
+                {currentSessionType === 'claude' ? 'Claude' : 'Gemini'}
+              </span>
+              {/* Continue button — only when Claude session exists but process is NOT running */}
+              {hasClaudeSession && activeTabId && !isCommandRunning && (
+                <button
+                  className="text-[10px] px-2 py-0.5 rounded transition-all cursor-pointer bg-[#DA7756]/15 text-[#DA7756] hover:bg-[#DA7756]/25"
+                  onClick={() => {
+                    if (activeTabId) {
+                      setTabCommandType(activeTabId, 'claude');
+                      ipcRenderer.send('claude:run-command', { tabId: activeTabId, command: 'claude-c', sessionId: claudeSessionId });
+                    }
+                  }}
+                  title="Продолжить сессию (claude --resume)"
+                >
+                  Продолжить
+                </button>
+              )}
               {/* Spacer pushes edit button to the right */}
               <div className="flex-1" />
               {/* Edit session button — toggle input */}
@@ -397,7 +437,7 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                   className={`text-[10px] px-1.5 py-0.5 rounded transition-all cursor-pointer ${
                     showSessionInput
                       ? 'text-[#aaa] bg-[#ffffff10]'
-                      : 'text-[#555] hover:text-[#aaa] hover:bg-[#ffffff08]'
+                      : 'text-[#444] hover:text-[#aaa] hover:bg-[#ffffff08]'
                   }`}
                   onClick={() => {
                     setShowSessionInput(!showSessionInput);
@@ -778,28 +818,7 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
               </div>
               )}
 
-              {/* claude-c - continue (only when session exists) */}
-              {hasClaudeSession && (
-              <div className="rounded p-2 bg-[#2d2d2d]">
-                <div className="flex items-center justify-between">
-                  <code
-                    className="text-xs transition-colors hover:underline cursor-pointer"
-                    style={{ color: '#DA7756' }}
-                    onClick={() => {
-                      if (activeTabId) {
-                        setTabCommandType(activeTabId, 'claude');
-                        ipcRenderer.send('claude:run-command', { tabId: activeTabId, command: 'claude-c', sessionId: claudeSessionId });
-                      }
-                    }}
-                    title="Продолжить"
-                  >
-                    claude-c
-                  </code>
-                  <span className="text-[10px] text-green-400">готово</span>
-                </div>
-                <p className="text-[10px] text-[#666] mt-1">Продолжить</p>
-              </div>
-              )}
+              {/* claude-c moved to session header */}
 
               {/* claude-f - fork from clipboard (only when NO active session) */}
               {!hasAnySession && (
