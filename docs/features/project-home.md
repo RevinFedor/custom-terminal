@@ -5,25 +5,40 @@
 
 ## User Flow
 1. **Активация:** Пользователь нажимает кнопку «Home» в правой верхней части (`ProjectToolbar`) или закрывает все вкладки терминала.
-2. **Обзор:** Открывается сетка карточек всех вкладок проекта.
-3. **Навигация:** Клик по карточке переключает интерфейс в режим терминала (`currentView: 'terminal'`) и делает выбранную вкладку активной.
-4. **Управление:** В конце списка всегда отображается кнопка «New Tab» для быстрого создания нового терминала.
+2. **Обзор:** Открывается сетка карточек, разделенная на три секции:
+   - **Active Tabs:** Текущие открытые вкладки.
+   - **Favorites:** Закрепленные конфигурации табов.
+   - **History:** Список недавно закрытых вкладок (по умолчанию свернут).
+3. **Навигация:** Клик по карточке переключает интерфейс в режим терминала (`currentView: 'terminal'`) и делает выбранную вкладку активной (для Active) или создает новую (для Favorites/History).
+4. **Управление:** В конце списка Active всегда отображается кнопка «New Tab».
+
+## Favorites (Закрепленные табы)
+Секция между Active и History, содержащая карточки с полной непрозрачностью и цветной левой границей.
+- **Действие:** Клик по карточке создает новую вкладку на базе сохраненных метаданных (CWD, Session ID и т.д.). Исходный фаворит при этом не удаляется.
+- **ContextMenu:** Правый клик позволяет открыть таб или удалить его из избранного.
+- **Middle-click:** Быстрое удаление из списка избранного.
 
 ## History (Closed Tabs)
-Под секцией Active Tabs отображается история закрытых вкладок, сгруппированная по времени (Today, Yesterday, This Week, This Month, Older).
+Секция истории закрытых вкладок. Для экономии места она **свернута по умолчанию**.
 
 ### User Flow
-1. **Закрытие вкладки:** При закрытии таб архивируется в SQLite через IPC `project:archive-tab`. Сохраняются все метаданные: `name`, `cwd`, `color`, `commandType`, `claudeSessionId`, `geminiSessionId`, `notes`.
-2. **Просмотр:** В Home View записи появляются в секции History с группировкой по дате `closed_at`.
-3. **Hover Popover:** При наведении на запись появляется попап с деталями (notes, даты, path, type). Используется паттерн "Невидимого мостика" (см. `knowledge/ui-ux-stability.md`).
-4. **Restore:** Клик по записи восстанавливает вкладку:
-   - Создаётся новый таб через `createTab()` с **полными** метаданными из БД.
-   - Для AI-вкладок формируется `pendingAction`:
-     - С `sessionId` → `claude-continue` / `gemini-continue` (resume старой сессии).
-     - Без `sessionId` → `claude-new` / `gemini-new` (новый запуск).
-   - Запись удаляется из History через `project:delete-tab-history-entry`.
-   - View переключается на `terminal`.
-5. **Clear:** Кнопка «Clear» очищает всю историю проекта (`project:clear-tab-history`).
+1. **Закрытие вкладки:** При закрытии таб архивируется в SQLite через IPC `project:archive-tab`. Сохраняются все метаданные.
+2. **Индикация:** Справа отображается вертикальный стикер-бейдж "History (N)", позволяющий быстро понять размер архива без его раскрытия.
+3. **Раскрытие:** Клик по стикеру или заголовку "History" раскрывает список с анимацией (`max-height` transition).
+4. **Hover Popover:** При наведении на запись появляется попап с деталями.
+5. **Restore:** Клик по записи восстанавливает вкладку и удаляет её из истории.
+6. **Clear:** Кнопка «Clear» видна в заголовке истории всегда (даже если она свернута). При наведении на неё появляется **«Keep with notes»**, позволяющая сохранить только важные записи.
+
+## Context Menu (ProjectHome)
+Все элементы на Home View (Active, Favorite, History) поддерживают контекстное меню по правому клику:
+- **Active:** Switch to Tab, Add to Favorites, Close Tab.
+- **Favorite:** Open, Remove from Favorites.
+- **History:** Restore, Add to Favorites, Delete.
+
+### Directory Management
+Рядом с отображением текущего пути проекта в Home View находится иконка редактирования (карандаш/папка).
+- Клик открывает системный диалог выбора папки.
+- Обновление пути через `updateProject` мгновенно меняет корень для всех новых терминалов и файлового менеджера.
 
 ### Критическое правило: Immediate Injection при Restore
 При восстановлении AI-вкладки `claudeSessionId` / `geminiSessionId` передаются в `createTab()` через `options`. Это гарантирует, что InfoPanel **мгновенно** видит ID сессии, без ожидания PTY или Sniper Watcher. См. `knowledge/ui-ux-stability.md`.
@@ -44,7 +59,7 @@ claude_session_id, gemini_session_id
 - **History Refetch:** История автоматически обновляется при изменении `tabs.length` (закрытие таба → refetch).
 
 ## Code Map
-- `ProjectHome.tsx`: Рендеринг сетки карточек, History секции и логика `restoreTab()`.
+- `ProjectHome.tsx`: Рендеринг сетки карточек (Active, Favorites, History), логика сворачивания истории, анимации и контекстных меню.
 - `Workspace.tsx`: Управление состоянием `currentView` и автоматический редирект через `useEffect`.
 - `useUIStore.ts`: Хранение текущего вида (`currentView`).
-- `main.js`: IPC-хендлеры `project:archive-tab`, `project:get-tab-history`, `project:delete-tab-history-entry`, `project:clear-tab-history`.
+- `main.js`: IPC-хендлеры `project:add-favorite`, `project:get-favorites`, `project:delete-favorite`, а также хендлеры архивации истории.

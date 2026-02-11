@@ -243,6 +243,27 @@ class DatabaseManager {
 
     // Migration: add message_count to tab_history
     try { this.db.exec(`ALTER TABLE tab_history ADD COLUMN message_count INTEGER DEFAULT NULL`); } catch (e) {}
+
+    // Favorites table
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS favorites (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id TEXT NOT NULL,
+        name TEXT,
+        cwd TEXT,
+        color TEXT,
+        notes TEXT,
+        command_type TEXT,
+        tab_type TEXT DEFAULT 'terminal',
+        url TEXT,
+        claude_session_id TEXT,
+        gemini_session_id TEXT,
+        created_at INTEGER DEFAULT (strftime('%s', 'now')),
+        FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+      )
+    `);
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_favorites_project ON favorites(project_id)`);
+
   }
 
   // ========== APP STATE ========== 
@@ -347,7 +368,9 @@ class DatabaseManager {
 
   createEmptyProject(name = 'Новый проект') {
     const projectId = `new_project_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
-    const emptyPath = ''; // Path can be set later via Edit Modal
+    // Unique placeholder path — legacy prod DBs have UNIQUE constraint on projects.path,
+    // so empty string '' would collide on second empty project creation
+    const emptyPath = `__unset__${projectId}`;
 
     this.db.prepare(`
       INSERT INTO projects (id, path, name, description, gemini_prompt, notes_global)
@@ -451,11 +474,45 @@ transaction(tabs);
     this.db.prepare('DELETE FROM tab_history WHERE project_id = ?').run(projectId);
   }
 
+  clearTabHistoryExceptNotes(projectId) {
+    this.db.prepare("DELETE FROM tab_history WHERE project_id = ? AND (notes IS NULL OR notes = '')").run(projectId);
+  }
+
   deleteTabHistoryEntry(id) {
     this.db.prepare('DELETE FROM tab_history WHERE id = ?').run(id);
   }
 
-  // ========== GEMINI HISTORY ========== 
+  // ========== FAVORITES ==========
+
+  addFavorite(projectId, tab) {
+    this.db.prepare(`
+      INSERT INTO favorites (project_id, name, cwd, color, notes, command_type, tab_type, url, claude_session_id, gemini_session_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      projectId,
+      tab.name || null,
+      tab.cwd || null,
+      tab.color || null,
+      tab.notes || null,
+      tab.commandType || null,
+      tab.tabType || 'terminal',
+      tab.url || null,
+      tab.claudeSessionId || null,
+      tab.geminiSessionId || null
+    );
+  }
+
+  getFavorites(projectId) {
+    return this.db.prepare(
+      'SELECT * FROM favorites WHERE project_id = ? ORDER BY created_at DESC'
+    ).all(projectId);
+  }
+
+  deleteFavorite(id) {
+    this.db.prepare('DELETE FROM favorites WHERE id = ?').run(id);
+  }
+
+  // ========== GEMINI HISTORY ==========
 
   saveGeminiHistory(projectId, selectedText, prompt, response) {
     const result = this.db.prepare(`

@@ -210,8 +210,45 @@ type DragData = {
 ### 4. Визуальный фидбек
 Во время перетаскивания всем вкладкам из группы `selectedTabIds` устанавливается `opacity: 0.5`. Это дает пользователю четкое понимание того, какие именно элементы покинут текущий проект при отпускании кнопки мыши.
 
-## Результат
-Бесшовное перемещение сложных рабочих сред между проектами. Пользователь может выделить 5 терминалов с активными сессиями и одной операцией перекинуть их в другой контекст.
+## 4. Placeholder Paths for Empty Projects
+В старых версиях базы данных (Production) колонка `path` в таблице `projects` имеет ограничение `UNIQUE`. При создании "пустого" проекта без выбранной папки возникал конфликт при попытке вставить вторую пустую строку.
+
+**Решение:**
+- Пустые проекты создаются с путем `__unset__new_project_{projectId}`.
+- **UI Filter:** В `ProjectCard` и `Workspace` пути, начинающиеся с `__unset__`, отображаются как "No path".
+- **CWD Fallback:** В `useWorkspaceStore` логика создания таба проверяет путь. Если он является плейсхолдером, `cwd` терминала сбрасывается на `process.env.HOME`.
+
+## 5. Tab Navigation History (LRU Persistence)
+Для обеспечения удобной навигации в `useWorkspaceStore` внедрен стек `tabHistory`.
+- **Логика:** При каждом `switchTab` ID таба перемещается в конец массива (стека).
+- **Navigation:** При закрытии текущего таба система ищет в стеке ближайший доступный (не удаленный) таб. Это позволяет пользователю возвращаться "назад" по истории своих переключений, а не просто к соседнему табу.
+- **Limit:** Стек ограничен 20 последними записями для экономии памяти.
+
+---
+
+## 6. Favorites Persistence
+**Файл-источник:** Сессия 2026-02-11
+
+### Суть
+Введена таблица `favorites` для сохранения конфигураций вкладок, которые пользователь хочет закрепить для быстрого доступа.
+
+### Схема таблицы
+```sql
+CREATE TABLE favorites (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id TEXT NOT NULL,
+  name TEXT, cwd TEXT, color TEXT, notes TEXT,
+  command_type TEXT, tab_type TEXT DEFAULT 'terminal',
+  url TEXT, claude_session_id TEXT, gemini_session_id TEXT,
+  created_at INTEGER DEFAULT (strftime('%s', 'now')),
+  FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+)
+```
+
+### Особенности
+- **Project Specific:** Избранные табы привязаны к `projectId` через внешний ключ.
+- **AI Integration:** Сохраняются ID сессий Claude и Gemini, что позволяет восстанавливать чаты одним кликом из Home View.
+- **Independence:** При восстановлении из избранного создается **новый** таб. Исходная запись в `favorites` остается неизменной.
 \n---\n## File: data-persistence.md\n
 # ОПЫТ: Сброс scroll position в скрытом терминале
 

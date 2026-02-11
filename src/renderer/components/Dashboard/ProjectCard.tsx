@@ -41,6 +41,7 @@ export default function ProjectCard({
   const hasActiveProcesses = tabsStats.active > 0;
 
   const getShortPath = (fullPath: string) => {
+    if (!fullPath || fullPath.startsWith('__unset__')) return 'No path';
     const parts = fullPath.split('/').filter(Boolean);
     if (parts.length <= 2) return fullPath;
     return `${parts[parts.length - 2]}/${parts[parts.length - 1]}`;
@@ -91,7 +92,7 @@ export default function ProjectCard({
             {getShortPath(project.path)}
           </div>
 
-          {pathHovered && (
+          {pathHovered && !project.path.startsWith('__unset__') && (
             <div className="absolute bottom-full left-0 mb-1 z-[100] pointer-events-none">
               <div className="bg-[#1a1a1a] border border-[#333] px-1.5 py-0.5 rounded shadow-2xl whitespace-nowrap">
                 <span className="text-[10px] text-[#ccc]">{project.path}</span>

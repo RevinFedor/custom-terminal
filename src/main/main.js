@@ -373,7 +373,7 @@ function createWindow() {
 }
 
 // Context Menu IPC
-ipcMain.on('show-terminal-context-menu', async (event, { hasSelection, prompts }) => {
+ipcMain.on('show-terminal-context-menu', async (event, { hasSelection, prompts, tabId, projectId }) => {
   const template = [
     {
       label: '🔍 Research (Reddit)',
@@ -384,6 +384,12 @@ ipcMain.on('show-terminal-context-menu', async (event, { hasSelection, prompts }
       label: '📋 Compact (Резюме)',
       enabled: hasSelection,
       click: () => { event.sender.send('context-menu-command', 'gemini-compact'); }
+    },
+    { type: 'separator' },
+    {
+      label: '⭐ Add to Favorites',
+      enabled: !!(tabId && projectId),
+      click: () => { event.sender.send('context-menu-command', 'add-to-favorites-from-terminal', { tabId, projectId }); }
     },
     { type: 'separator' }
   ];
@@ -1239,8 +1245,29 @@ ipcMain.handle('project:clear-tab-history', (event, { projectId }) => {
   return { success: true };
 });
 
+ipcMain.handle('project:clear-tab-history-except-notes', (event, { projectId }) => {
+  projectManager.db.clearTabHistoryExceptNotes(projectId);
+  return { success: true };
+});
+
 ipcMain.handle('project:delete-tab-history-entry', (event, { id }) => {
   projectManager.db.deleteTabHistoryEntry(id);
+  return { success: true };
+});
+
+// ========== FAVORITES ==========
+
+ipcMain.handle('project:add-favorite', (event, { projectId, tab }) => {
+  projectManager.db.addFavorite(projectId, tab);
+  return { success: true };
+});
+
+ipcMain.handle('project:get-favorites', (event, { projectId }) => {
+  return projectManager.db.getFavorites(projectId);
+});
+
+ipcMain.handle('project:delete-favorite', (event, { id }) => {
+  projectManager.db.deleteFavorite(id);
   return { success: true };
 });
 

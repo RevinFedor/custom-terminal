@@ -310,6 +310,36 @@ const isActive = isActiveProject && workspace.activeTabId === tab.id && currentV
 
 ---
 
+## 11.1. Stale Canvas After View Switch (fit.fit() No-Op Trap)
+
+### Ловушка xterm.js
+`FitAddon.fit()` внутри проверяет `if (this.cols === newCols && this.rows === newRows) return` — если размеры контейнера не менялись, метод **ничего не делает**: ни `_renderService.clear()`, ни repaint. Это не баг xterm.js, а оптимизация, но она ломает рендеринг после `visibility:hidden`.
+
+### Почему ломается
+Пока терминал скрыт (Home view), данные из PTY продолжают писаться в буфер xterm.js. Canvas renderer накапливает stale state. При возврате `safeFit()` вызывает `fit.fit()`, но размеры те же → no-op → canvas не обновляется → Ink CLI (Gemini/Claude) рисует мусор (прогресс-бары переносятся, строки дублируются).
+
+### Решение
+В `Terminal.tsx`, useEffect активации (`[active, isActiveProject, tabId]`), после `safeFit()`:
+```javascript
+// Форсированная очистка и перерисовка
+if (xtermInstance.current) {
+  const term = xtermInstance.current;
+  const core = (term as any)._core;
+  if (core?._renderService) {
+    core._renderService.clear(); // Помечает все строки dirty, следующий цикл рендеринга перерисует их
+  }
+  term.refresh(0, term.rows - 1);
+}
+```
+
+### ⚠️ ОПАСНО: Resize Cycle (Trap)
+Попытка форсировать пересчет через `term.resize(cols-1)` -> `term.resize(cols)` является **ловушкой**.
+- **Эффект:** Это заставляет xterm.js пересчитать буфер, но так как это происходит внутри приложения, PTY не получает `SIGWINCH` (или получает их слишком быстро).
+- **Результат:** В Ink-based CLI (Gemini) это намертво ломает позицию курсора. Курсор остается на строке ввода, но Ink продолжает считать, что он в другом месте, что приводит к "фантомным" строкам при каждом обновлении TUI.
+- **Вывод:** Используйте только `_renderService.clear()` и `refresh()`. Это не трогает логические размеры терминала и курсор, но принудительно обновляет визуальный слой Canvas.
+
+---
+
 ## 12. Фокусировка активной области (onMouseDown)
 
 ### Проблема

@@ -52,6 +52,7 @@ interface ProjectWorkspace {
   tabs: Map<string, Tab>;
   activeTabId: string | null;
   selectedTabIds: string[]; // List of selected tab IDs for multi-action
+  tabHistory: string[]; // LRU stack of tab IDs (max 20) for navigation on close
   tabCounter: number;
   sidebarOpen: boolean;
   openFilePath: string | null;
@@ -91,7 +92,7 @@ interface WorkspaceStore {
   // Tab management
   createTab: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; tabType?: TabType; url?: string }) => Promise<string>;
   createTabAfterCurrent: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; tabType?: TabType; url?: string }) => Promise<string>;
-  closeTab: (projectId: string, tabId: string) => Promise<void>;
+  closeTab: (projectId: string, tabId: string, options?: { skipProcessCheck?: boolean }) => Promise<void>;
   switchTab: (projectId: string, tabId: string) => void;
   renameTab: (projectId: string, tabId: string, newName: string) => void;
 
@@ -142,6 +143,11 @@ interface WorkspaceStore {
 
   // Reorder projects (for drag-and-drop)
   reorderProjects: (orderedProjectIds: string[]) => void;
+
+  // Browser tabs
+  createBrowserTab: (projectId: string) => Promise<string>;
+  updateTabUrl: (tabId: string, url: string) => void;
+  setBrowserActiveView: (tabId: string, view: 'browser' | 'terminal') => void;
 
   // Helpers
   getActiveTab: (projectId: string) => Tab | null;
@@ -294,19 +300,24 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       const currentOpenProjects = get().openProjects;
       const restoredHistory = sessionState.projectHistory || [];
 
-      if (savedView === 'workspace' && sessionState.activeProjectId && currentOpenProjects.has(sessionState.activeProjectId)) {
+      // Restore activeProjectId if the project is still open (works for both workspace and dashboard views)
+      const restoredActiveId = sessionState.activeProjectId && currentOpenProjects.has(sessionState.activeProjectId)
+        ? sessionState.activeProjectId
+        : null;
+
+      if (savedView === 'workspace' && restoredActiveId) {
         set({
-          activeProjectId: sessionState.activeProjectId,
+          activeProjectId: restoredActiveId,
           view: 'workspace',
           isRestoring: false,
           openProjects: new Map(currentOpenProjects),
           projectHistory: restoredHistory
         });
       } else {
-        // Stay on dashboard or fallback
+        // Stay on dashboard — keep activeProjectId so Workspace stays ready (terminals preserved)
         set({
           view: 'dashboard',
-          activeProjectId: null,
+          activeProjectId: restoredActiveId,
           isRestoring: false,
           openProjects: new Map(currentOpenProjects),
           projectHistory: restoredHistory
@@ -322,7 +333,9 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     const { activeProjectId, syncAllTabsCwd } = get();
 
     // Switch view IMMEDIATELY — don't block on sync
-    set({ view: 'dashboard', activeProjectId: null });
+    // NOTE: Keep activeProjectId! Nulling it causes Workspace early return → TerminalArea unmount → all terminals destroyed
+    // Workspace stays mounted but hidden (CSS) to preserve terminal instances
+    set({ view: 'dashboard' });
 
     // Sync cwd in background (lsof is slow when Claude is active)
     if (activeProjectId) {
@@ -429,6 +442,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         tabs: new Map(),
         activeTabId: null,
         selectedTabIds: [],
+        tabHistory: [],
         tabCounter: 0, // Start from 0 for new projects
         sidebarOpen: projectData?.sidebarOpen || false,
         openFilePath: projectData?.openFilePath || null
@@ -551,7 +565,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     const newTab: Tab = {
       id: tabId,
       name: tabName,
-      cwd: cwd || workspace.projectPath || process.env.HOME || '~',
+      cwd: cwd || (workspace.projectPath?.startsWith('__unset__') ? '' : workspace.projectPath) || process.env.HOME || '~',
       color: options?.color,
       isUtility: options?.isUtility,
       commandType: options?.commandType,
@@ -589,6 +603,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     const { isRestoring } = get();
     if (!isRestoring) {
       workspace.activeTabId = tabId;
+      // Push to tab history (LRU, max 20)
+      workspace.tabHistory = [...workspace.tabHistory.filter(id => id !== tabId), tabId].slice(-20);
     }
 
     console.log('[Store] createTab: Setting state, tabs count:', workspace.tabs.size, 'isRestoring:', isRestoring);
@@ -619,7 +635,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     const newTab: Tab = {
       id: tabId,
       name: tabName,
-      cwd: cwd || workspace.projectPath || process.env.HOME || '~',
+      cwd: cwd || (workspace.projectPath?.startsWith('__unset__') ? '' : workspace.projectPath) || process.env.HOME || '~',
       color: options?.color,
       isUtility: options?.isUtility,
       commandType: options?.commandType,
@@ -692,6 +708,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     workspace.tabs = new Map(tabsArray);
 
     workspace.activeTabId = tabId;
+    // Push to tab history (LRU, max 20)
+    workspace.tabHistory = [...workspace.tabHistory.filter(id => id !== tabId), tabId].slice(-20);
 
     set({ openProjects: new Map(openProjects) });
 
@@ -701,32 +719,35 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     return tabId;
   },
 
-  closeTab: async (projectId, tabId) => {
+  closeTab: async (projectId, tabId, options) => {
     const { openProjects, clearTerminalBuffer } = get();
     const workspace = openProjects.get(projectId);
 
     if (!workspace) return;
 
     const tab = workspace.tabs.get(tabId);
+    const skipProcessCheck = options?.skipProcessCheck || false;
 
-    // Check if terminal has running process via OSC 133 state (fast, no syscalls)
-    const commandState = await ipcRenderer.invoke('terminal:getCommandState', tabId);
+    if (!skipProcessCheck) {
+      // Check if terminal has running process via OSC 133 state (fast, no syscalls)
+      const commandState = await ipcRenderer.invoke('terminal:getCommandState', tabId);
 
-    if (commandState.isRunning) {
-      // Only call hasRunningProcess to get process name (single syscall, not polling)
-      const { processName } = await ipcRenderer.invoke('terminal:hasRunningProcess', tabId);
-      const confirmed = window.confirm(
-        `Terminal has a running process: "${processName || 'unknown'}"\n\nAre you sure you want to close this tab?`
-      );
-      if (!confirmed) return;
-    }
+      if (commandState.isRunning) {
+        // Only call hasRunningProcess to get process name (single syscall, not polling)
+        const { processName } = await ipcRenderer.invoke('terminal:hasRunningProcess', tabId);
+        const confirmed = window.confirm(
+          `Terminal has a running process: "${processName || 'unknown'}"\n\nAre you sure you want to close this tab?`
+        );
+        if (!confirmed) return;
+      }
 
-    // Check if tab has saved Claude session
-    if (tab?.claudeSessionId && !commandState.isRunning) {
-      const confirmed = window.confirm(
-        `Эта вкладка содержит Claude сессию:\n${tab.claudeSessionId}\n\nПри закрытии вы потеряете привязку к этой сессии. Продолжить?`
-      );
-      if (!confirmed) return;
+      // Check if tab has saved Claude session
+      if (tab?.claudeSessionId && !commandState.isRunning) {
+        const confirmed = window.confirm(
+          `Эта вкладка содержит Claude сессию:\n${tab.claudeSessionId}\n\nПри закрытии вы потеряете привязку к этой сессии. Продолжить?`
+        );
+        if (!confirmed) return;
+      }
     }
 
     ipcRenderer.send('terminal:kill', tabId);
@@ -752,17 +773,28 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     }
 
     workspace.tabs.delete(tabId);
+    // Remove closed tab from history
+    workspace.tabHistory = workspace.tabHistory.filter(id => id !== tabId);
 
     if (workspace.activeTabId === tabId) {
-      // Only switch to Main tabs (not utility) - get last Main tab
-      const mainTabs = Array.from(workspace.tabs.values()).filter(t => !t.isUtility);
-      if (mainTabs.length > 0) {
-        // Switch to last Main tab
-        workspace.activeTabId = mainTabs[mainTabs.length - 1].id;
-      } else {
-        // No Main tabs left - set to null (show placeholder, don't auto-switch to Utils)
-        workspace.activeTabId = null;
+      // Find next tab from history (LRU: last visited that still exists and is not utility)
+      let nextTabId: string | null = null;
+      for (let i = workspace.tabHistory.length - 1; i >= 0; i--) {
+        const candidateId = workspace.tabHistory[i];
+        const candidate = workspace.tabs.get(candidateId);
+        if (candidate && !candidate.isUtility) {
+          nextTabId = candidateId;
+          break;
+        }
       }
+      // Fallback: last Main tab if history didn't help
+      if (!nextTabId) {
+        const mainTabs = Array.from(workspace.tabs.values()).filter(t => !t.isUtility);
+        if (mainTabs.length > 0) {
+          nextTabId = mainTabs[mainTabs.length - 1].id;
+        }
+      }
+      workspace.activeTabId = nextTabId;
     }
 
     // Use startTransition to prevent UI blocking
@@ -781,6 +813,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     if (workspace && workspace.tabs.has(tabId)) {
       workspace.activeTabId = tabId;
       workspace.selectedTabIds = [tabId]; // Update selection on direct switch
+      // Push to tab history (LRU, max 20)
+      workspace.tabHistory = [...workspace.tabHistory.filter(id => id !== tabId), tabId].slice(-20);
       // Use startTransition to prevent UI blocking during re-render
       startTransition(() => {
         set({ openProjects: new Map(openProjects) });
@@ -1224,6 +1258,39 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
 
     set({ openProjects: newOpenProjects });
     saveSession();
+  },
+
+  // Browser tabs
+  createBrowserTab: async (projectId) => {
+    const { openProjects, createTab } = get();
+    const workspace = openProjects.get(projectId);
+    const cwd = workspace?.projectPath || process.env.HOME || '~';
+    return createTab(projectId, 'Browser', cwd, { tabType: 'browser', url: 'http://localhost:3000' });
+  },
+
+  updateTabUrl: (tabId, url) => {
+    const { openProjects } = get();
+    for (const [, workspace] of openProjects) {
+      const tab = workspace.tabs.get(tabId);
+      if (tab) {
+        tab.url = url;
+        saveTabs(workspace.projectId, workspace.tabs);
+        return;
+      }
+    }
+  },
+
+  setBrowserActiveView: (tabId, view) => {
+    const { openProjects } = get();
+    for (const [, workspace] of openProjects) {
+      const tab = workspace.tabs.get(tabId);
+      if (tab) {
+        tab.activeView = view;
+        set({ openProjects: new Map(openProjects) });
+        saveTabs(workspace.projectId, workspace.tabs);
+        return;
+      }
+    }
   },
 
   getActiveTab: (projectId) => {

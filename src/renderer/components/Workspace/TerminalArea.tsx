@@ -1,4 +1,4 @@
-import React, { memo, useMemo, useEffect, useState } from 'react';
+import React, { memo, useMemo, useEffect, useState, useRef } from 'react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import { useUIStore } from '../../store/useUIStore';
@@ -122,6 +122,14 @@ interface TerminalAreaProps {
 }
 
 function TerminalArea({ projectId }: TerminalAreaProps) {
+  // DEBUG: Track TerminalArea mount/unmount lifecycle
+  useEffect(() => {
+    console.warn('[TerminalArea:MOUNT] projectId=', projectId);
+    return () => {
+      console.warn('[TerminalArea:UNMOUNT] projectId=', projectId);
+    };
+  }, []);
+
   // Use selectors to minimize re-renders
   const openProjects = useWorkspaceStore((state) => state.openProjects);
   const createTab = useWorkspaceStore((state) => state.createTab);
@@ -129,6 +137,11 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
   const projects = useProjectsStore((state) => state.projects);
 
   const currentView = useUIStore((s) => s.currentView);
+
+  // DEBUG: Track render reason
+  const renderCountRef = useRef(0);
+  renderCountRef.current++;
+  console.warn(`[TerminalArea:RENDER #${renderCountRef.current}] projectId=${projectId} currentView=${currentView} openProjects.size=${openProjects.size}`);
 
   const currentWorkspace = openProjects.get(projectId);
   const currentProject = projects[projectId];
@@ -192,13 +205,15 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
   }, [openProjects]);
 
   const terminals = useMemo(() => {
+    console.warn('[TerminalArea:useMemo] RECALCULATING terminals. terminalKeys:', terminalKeys, 'projectId:', projectId);
     const result: React.ReactNode[] = [];
 
     openProjects.forEach((workspace, projId) => {
       const isActiveProject = projId === projectId;
 
       workspace.tabs.forEach((tab) => {
-        const isActive = isActiveProject && workspace.activeTabId === tab.id && currentView === 'terminal';
+        // NOTE: currentView check moved INTO Terminal component to avoid useMemo recalculation on view switch
+        const isActive = isActiveProject && workspace.activeTabId === tab.id;
         if (tab.tabType === 'browser') {
           result.push(
             <BrowserTab
@@ -228,7 +243,7 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
     });
 
     return result;
-  }, [terminalKeys, projectId, openProjects, currentView]);
+  }, [terminalKeys, projectId, openProjects]);
 
   // Listen for Claude fork completion to create new tab with command
   useEffect(() => {
