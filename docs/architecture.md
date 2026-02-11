@@ -1,7 +1,7 @@
 # Architecture: Foundation
 
 ## 1. Process Model (Electron IPC)
-- **Main Process:** Управляет `node-pty` (терминальными сессиями), SQLite базой данных, файловой системой и жизненным циклом внешних процессов (`system:kill-process`).
+- **Main Process:** Управляет `node-pty` (терминальными сессиями), SQLite базой данных (таблицы `projects`, `tabs`, `tab_history`, `favorites`), файловой системой и жизненным циклом внешних процессов (`system:kill-process`).
     - **КРИТИЧЕСКОЕ ПРАВИЛО:** Запрещено использование `execSync`. Все системные вызовы (pgrep, lsof, ps) должны быть асинхронными (через `execAsync`), чтобы не блокировать Event Loop главного процесса и IPC. См. `knowledge/ui-ux-stability.md` (раздел 8).
     - **Vite & Escaping:** При написании Bash-команд в `main.js` необходимо экранировать `$`, чтобы избежать ошибок трансформации Vite. См. `knowledge/environment-fixes.md`.
     - **Stability:** Используется `disable-http-cache` для предотвращения загрузки устаревшего кода в продакшн-билдах. См. `knowledge/terminal-core.md`.
@@ -11,9 +11,11 @@
 
 ## 2. Project Instance Model (Philosophy)
 Проект в системе перестал быть «путем на диске» и стал самостоятельной **Сущностью (Entity)**.
-- **Empty Projects:** Поддержка создания проектов без начального пути (`project:create-empty`). Путь назначается позже через Edit Modal.
+- **Empty Projects:** Поддержка создания проектов без начального пути (`project:create-empty`).
+    - **Placeholder Paths:** Для обхода `UNIQUE` ограничения на колонку `path` в старых версиях БД (Production), пустые проекты создаются с временным путем `__unset__new_project_{id}`. UI фильтрует этот путь, а терминал использует fallback к `HOME`. См. `knowledge/data-persistence.md`.
 - **Entity vs Path:** Раньше один путь `~/app` соответствовал одному проекту. Теперь проект — это уникальный ID в БД. Путь (`path`) — лишь один из атрибутов.
-- **Multiple Instances:** Архитектура позволяет создавать неограниченное количество инстансов для одной и той же директории. Каждый инстанс имеет свой набор вкладок, заметок и историю AI.
+- **Navigation History (LRU):** Система хранит стек истории посещения табов (`tabHistory`) для каждого проекта. При закрытии активного таба система переключает пользователя на предыдущий активный из стека, а не просто на последний в списке.
+- **Multiple Instances:** Архитектура позволяет создавать неограниченное количество инстансов для одной и той же директории.
 - **ID Generation:** Используется композитный ID: `base64(path)` + `timestamp` + `random`. См. `knowledge/data-persistence.md`.
 
 ## 3. Startup & Recovery Flow
@@ -26,6 +28,7 @@
 - **Backend:** `node-pty`.
 - **Process Ownership Tracking:** Система определяет принадлежность процессов Claude CLI и Gemini к конкретным вкладкам приложения.
     - **PPID Mapping:** Используется `ps -eo pid,ppid` для получения Parent Process ID. Если PPID процесса совпадает с PID шелла в одной из вкладок, процесс помечается как **In-App**.
+    - **Context Menu Mapping:** Для поддержки функций вроде "Add to Favorites" из терминала, Renderer передает `tabId` и `projectId` в Main-процесс при вызове `show-terminal-context-menu`.
     - **External Detection:** Процессы, чьи PPID не найдены в активных терминалах, классифицируются как **External** (запущенные вне приложения). Для Gemini мониторинг осуществляется через поиск detached-процессов (`ps aux | grep "?"`).
     - **CWD via lsof:** Для получения рабочего каталога процесса без взаимодействия с шеллом используется `lsof -p <PID>`.
 - **Shell Integration (OSC 7 & 133):**

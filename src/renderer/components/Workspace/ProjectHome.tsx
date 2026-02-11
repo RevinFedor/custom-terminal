@@ -1,9 +1,9 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useWorkspaceStore, TabColor, TabType, PendingAction } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import { useUIStore } from '../../store/useUIStore';
 import { useCmdKey, useCmdHoverPopover, CmdHoverPopover } from '../../hooks/useCmdHoverPopover';
-import { Terminal, FolderOpen, Plus, Clock, Trash2 } from 'lucide-react';
+import { Terminal, FolderOpen, Plus, Clock, Trash2, Pencil, Star, ChevronDown, ChevronRight } from 'lucide-react';
 import { MarkdownEditor } from '@anthropic/markdown-editor';
 
 const { ipcRenderer } = window.require('electron');
@@ -28,6 +28,28 @@ interface TabHistoryEntry {
   gemini_session_id: string | null;
   message_count: number | null;
 }
+
+interface FavoriteEntry {
+  id: number;
+  project_id: string;
+  name: string | null;
+  cwd: string | null;
+  color: string | null;
+  notes: string | null;
+  command_type: string | null;
+  tab_type: string;
+  url: string | null;
+  claude_session_id: string | null;
+  gemini_session_id: string | null;
+  created_at: number;
+}
+
+type ContextMenuState = {
+  x: number;
+  y: number;
+  type: 'active-tab' | 'favorite' | 'history';
+  itemId: string | number;
+} | null;
 
 type TimeGroup = 'Today' | 'Yesterday' | 'This Week' | 'This Month' | 'Older';
 
@@ -56,7 +78,6 @@ function groupByTime(entries: TabHistoryEntry[]): Map<TimeGroup, TabHistoryEntry
     if (!groups.has(group)) groups.set(group, []);
     groups.get(group)!.push(entry);
   }
-  // Return in order, skipping empty groups
   const ordered = new Map<TimeGroup, TabHistoryEntry[]>();
   for (const key of TIME_GROUP_ORDER) {
     if (groups.has(key)) ordered.set(key, groups.get(key)!);
@@ -90,19 +111,35 @@ const TAB_COLORS: Record<TabColor, { bgColor: string; borderColor: string }> = {
 };
 
 export default function ProjectHome({ projectId }: ProjectHomeProps) {
-  const { openProjects, switchTab, createTab } = useWorkspaceStore();
+  const { openProjects, switchTab, createTab, closeTab } = useWorkspaceStore();
   const { projects, updateProject } = useProjectsStore();
-  const { setCurrentView } = useUIStore();
+  const { setCurrentView, showToast } = useUIStore();
   const tabNotesFontSize = useUIStore((s) => s.tabNotesFontSize);
   const tabNotesPaddingX = useUIStore((s) => s.tabNotesPaddingX);
   const tabNotesPaddingY = useUIStore((s) => s.tabNotesPaddingY);
   const [syncName, setSyncName] = useState<string | null>(null);
   const [history, setHistory] = useState<TabHistoryEntry[]>([]);
+  const [favorites, setFavorites] = useState<FavoriteEntry[]>([]);
+  const [historyExpanded, setHistoryExpanded] = useState(false);
+  const [homeContextMenu, setHomeContextMenu] = useState<ContextMenuState>(null);
 
   // CMD+hover popovers (unified hooks)
   const isCmdPressed = useCmdKey();
   const activePopover = useCmdHoverPopover<string>(isCmdPressed);
   const historyPopover = useCmdHoverPopover<number>(isCmdPressed);
+
+  // Close context menu on mousedown outside
+  const contextMenuRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!homeContextMenu) return;
+    const handleMouseDown = (e: MouseEvent) => {
+      if (contextMenuRef.current && !contextMenuRef.current.contains(e.target as Node)) {
+        setHomeContextMenu(null);
+      }
+    };
+    document.addEventListener('mousedown', handleMouseDown);
+    return () => document.removeEventListener('mousedown', handleMouseDown);
+  }, [homeContextMenu]);
 
   useEffect(() => {
     const handleSync = (e: any) => {
@@ -120,17 +157,6 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
 
   // Restore a closed tab from history
   const restoreTab = async (entry: TabHistoryEntry) => {
-    console.log('[RESTORE] 1. restoreTab clicked:', {
-      name: entry.name,
-      cwd: entry.cwd,
-      command_type: entry.command_type,
-      color: entry.color,
-      tab_type: entry.tab_type,
-      claude_session_id: entry.claude_session_id,
-      gemini_session_id: entry.gemini_session_id,
-    });
-
-    // Build pendingAction: resume old session if ID exists, otherwise start new
     let pendingAction: PendingAction | undefined;
     if (entry.command_type === 'claude') {
       if (entry.claude_session_id) {
@@ -146,11 +172,8 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
       }
     }
 
-    console.log('[RESTORE] 2. pendingAction built:', pendingAction);
-
     setCurrentView('terminal');
-    console.log('[RESTORE] 3. setCurrentView("terminal") done, calling createTab...');
-    const tabId = await createTab(projectId, entry.name, entry.cwd, {
+    await createTab(projectId, entry.name, entry.cwd, {
       color: (entry.color || undefined) as TabColor | undefined,
       notes: entry.notes || undefined,
       commandType: entry.command_type as any || undefined,
@@ -160,19 +183,49 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
       claudeSessionId: entry.claude_session_id || undefined,
       geminiSessionId: entry.gemini_session_id || undefined,
     });
-    console.log('[RESTORE] 4. createTab returned tabId:', tabId);
 
-    // Remove from history after successful restore
     await ipcRenderer.invoke('project:delete-tab-history-entry', { id: entry.id });
     setHistory(prev => prev.filter(h => h.id !== entry.id));
-    console.log('[RESTORE] 4a. History entry deleted, id:', entry.id);
   };
 
-  // Fetch history when projectId changes or tabs count changes (tab closed -> refetch)
+  // Restore from favorite (creates new tab, does NOT delete favorite)
+  const restoreFromFavorite = async (entry: FavoriteEntry) => {
+    let pendingAction: PendingAction | undefined;
+    if (entry.command_type === 'claude') {
+      if (entry.claude_session_id) {
+        pendingAction = { type: 'claude-continue', sessionId: entry.claude_session_id };
+      } else {
+        pendingAction = { type: 'claude-new' };
+      }
+    } else if (entry.command_type === 'gemini') {
+      if (entry.gemini_session_id) {
+        pendingAction = { type: 'gemini-continue', sessionId: entry.gemini_session_id };
+      } else {
+        pendingAction = { type: 'gemini-new' };
+      }
+    }
+
+    setCurrentView('terminal');
+    await createTab(projectId, entry.name || 'tab', entry.cwd || project?.path || '/', {
+      color: (entry.color || undefined) as TabColor | undefined,
+      notes: entry.notes || undefined,
+      commandType: entry.command_type as any || undefined,
+      tabType: (entry.tab_type || 'terminal') as TabType,
+      url: entry.url || undefined,
+      pendingAction,
+      claudeSessionId: entry.claude_session_id || undefined,
+      geminiSessionId: entry.gemini_session_id || undefined,
+    });
+  };
+
+  // Fetch history + favorites
   useEffect(() => {
     if (!projectId) return;
     ipcRenderer.invoke('project:get-tab-history', { projectId }).then((data: TabHistoryEntry[]) => {
       setHistory(data || []);
+    });
+    ipcRenderer.invoke('project:get-favorites', { projectId }).then((data: FavoriteEntry[]) => {
+      setFavorites(data || []);
     });
   }, [projectId, tabs.length]);
 
@@ -185,9 +238,81 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
     }
   };
 
+  const [showKeepNotes, setShowKeepNotes] = useState(false);
+
   const handleClearHistory = async () => {
     await ipcRenderer.invoke('project:clear-tab-history', { projectId });
     setHistory([]);
+  };
+
+  const handleClearExceptNotes = async () => {
+    await ipcRenderer.invoke('project:clear-tab-history-except-notes', { projectId });
+    const data = await ipcRenderer.invoke('project:get-tab-history', { projectId });
+    setHistory(data || []);
+  };
+
+  const handleChangeDirectory = async () => {
+    const selected = await ipcRenderer.invoke('app:select-directory');
+    if (selected) {
+      await updateProject(projectId, { path: selected });
+    }
+  };
+
+  // Add active tab to favorites
+  const addActiveTabToFavorites = async (tabId: string) => {
+    const tab = workspace?.tabs.get(tabId);
+    if (!tab) return;
+    await ipcRenderer.invoke('project:add-favorite', {
+      projectId,
+      tab: {
+        name: tab.name,
+        cwd: tab.cwd,
+        color: tab.color || null,
+        notes: tab.notes || null,
+        commandType: tab.commandType || null,
+        tabType: tab.tabType || 'terminal',
+        url: tab.url || null,
+        claudeSessionId: tab.claudeSessionId || null,
+        geminiSessionId: tab.geminiSessionId || null,
+      }
+    });
+    showToast(`"${tab.name}" added to favorites`, 'success');
+    // Refetch favorites
+    const data = await ipcRenderer.invoke('project:get-favorites', { projectId });
+    setFavorites(data || []);
+  };
+
+  // Add history entry to favorites
+  const addHistoryToFavorites = async (entry: TabHistoryEntry) => {
+    await ipcRenderer.invoke('project:add-favorite', {
+      projectId,
+      tab: {
+        name: entry.name,
+        cwd: entry.cwd,
+        color: entry.color || null,
+        notes: entry.notes || null,
+        commandType: entry.command_type || null,
+        tabType: entry.tab_type || 'terminal',
+        url: entry.url || null,
+        claudeSessionId: entry.claude_session_id || null,
+        geminiSessionId: entry.gemini_session_id || null,
+      }
+    });
+    showToast(`"${entry.name}" added to favorites`, 'success');
+    const data = await ipcRenderer.invoke('project:get-favorites', { projectId });
+    setFavorites(data || []);
+  };
+
+  // Delete favorite
+  const deleteFavorite = async (id: number) => {
+    await ipcRenderer.invoke('project:delete-favorite', { id });
+    setFavorites(prev => prev.filter(f => f.id !== id));
+  };
+
+  // Delete history entry
+  const deleteHistoryEntry = async (id: number) => {
+    await ipcRenderer.invoke('project:delete-tab-history-entry', { id });
+    setHistory(prev => prev.filter(h => h.id !== id));
   };
 
   if (!workspace || !project) {
@@ -203,21 +328,35 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
     setCurrentView('terminal');
   };
 
-  const getFolderName = (path: string) => {
-    const parts = path.split('/');
-    return parts[parts.length - 1] || path;
+  const getFolderName = (pathStr: string) => {
+    const parts = pathStr.split('/');
+    return parts[parts.length - 1] || pathStr;
   };
 
   const groupedHistory = groupByTime(history);
 
+  // Context menu handler for cards
+  const handleCardContextMenu = (e: React.MouseEvent, type: ContextMenuState['type'], itemId: string | number) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setHomeContextMenu({ x: e.clientX, y: e.clientY, type: type!, itemId });
+  };
+
   return (
-    <div className="flex-1 bg-bg-main p-6 overflow-y-auto overflow-x-hidden">
+    <div className="flex-1 bg-bg-main p-6 overflow-y-auto overflow-x-hidden" style={{ position: 'relative' }}>
       {/* Project Header */}
       <div className="mb-6">
         <h1 className="text-xl text-white font-medium mb-1">{displayName}</h1>
         <div className="flex items-center gap-2 text-[#666] text-sm">
           <FolderOpen size={14} />
           <span>{project.path}</span>
+          <button
+            onClick={handleChangeDirectory}
+            className="text-[#666] hover:text-[#999] cursor-pointer transition-colors p-0.5"
+            title="Change project directory"
+          >
+            <Pencil size={12} />
+          </button>
         </div>
       </div>
 
@@ -233,6 +372,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
               <div
                 key={tab.id}
                 {...activePopover.triggerProps(tab.id)}
+                onContextMenu={(e) => handleCardContextMenu(e, 'active-tab', tab.id)}
               >
                 <button
                   onClick={() => handleTabClick(tab.id)}
@@ -318,92 +458,333 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
         </div>
       </div>
 
-      {/* History Section */}
+      {/* Favorites Section */}
+      {favorites.length > 0 && (
+        <div className="mb-4 mt-4">
+          <div className="flex items-center gap-2 mb-3">
+            <Star size={14} className="text-[#b8860b]" />
+            <h2 className="text-sm text-[#888]">Favorites ({favorites.length})</h2>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {favorites.map((entry) => {
+              const color = (entry.color || 'default') as TabColor;
+              const colorConfig = TAB_COLORS[color];
+
+              return (
+                <div
+                  key={entry.id}
+                  className="transition-all duration-150 cursor-pointer"
+                  onClick={() => restoreFromFavorite(entry)}
+                  onAuxClick={(e) => {
+                    if (e.button === 1) {
+                      e.preventDefault();
+                      deleteFavorite(entry.id);
+                    }
+                  }}
+                  onContextMenu={(e) => handleCardContextMenu(e, 'favorite', entry.id)}
+                  style={{
+                    maxWidth: '140px',
+                    minWidth: '90px',
+                    padding: '6px 10px',
+                    backgroundColor: colorConfig.bgColor,
+                    borderRadius: '5px',
+                    borderLeft: `2px solid ${colorConfig.borderColor}`,
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: '1px',
+                  }}
+                  onMouseEnter={(e) => {
+                    (e.currentTarget as HTMLDivElement).style.opacity = '0.7';
+                  }}
+                  onMouseLeave={(e) => {
+                    (e.currentTarget as HTMLDivElement).style.opacity = '1';
+                  }}
+                >
+                  <span
+                    className="text-[12px] text-white truncate"
+                    style={{ maxWidth: '120px' }}
+                  >
+                    {entry.name || 'tab'}
+                  </span>
+                  <span className="text-[9px] text-[#666] truncate">
+                    {entry.cwd ? getFolderName(entry.cwd) : ''}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* History Section — collapsed by default */}
       {history.length > 0 && (
-        <div className="mt-6">
+        <div className="mt-6" style={{ position: 'relative' }}>
+          {/* History Header — always visible */}
           <div className="flex items-center justify-between mb-3">
-            <div className="flex items-center gap-2">
+            {/* Left: toggle (inline, only text clickable) */}
+            <div
+              className="flex items-center gap-2 cursor-pointer"
+              style={{ display: 'inline-flex' }}
+              onClick={() => {
+                console.warn('[ProjectHome] toggle history, was:', historyExpanded);
+                setHistoryExpanded(prev => !prev);
+              }}
+            >
+              {historyExpanded ? (
+                <ChevronDown size={14} className="text-[#888]" />
+              ) : (
+                <ChevronRight size={14} className="text-[#888]" />
+              )}
               <Clock size={14} className="text-[#888]" />
               <h2 className="text-sm text-[#888]">History ({history.length})</h2>
             </div>
-            <button
-              onClick={handleClearHistory}
-              className="flex items-center gap-1 text-[11px] text-[#666] hover:text-[#999] cursor-pointer transition-colors"
+            {/* Right: Clear + Keep with notes */}
+            <div
+              className="flex items-center gap-2"
+              onMouseEnter={() => {
+                console.warn('[ProjectHome] Clear hover enter, hasNotes:', history.some(h => h.notes));
+                setShowKeepNotes(true);
+              }}
+              onMouseLeave={() => {
+                console.warn('[ProjectHome] Clear hover leave');
+                setShowKeepNotes(false);
+              }}
             >
-              <Trash2 size={12} />
-              Clear
-            </button>
+              {showKeepNotes && history.some(h => h.notes) && (
+                <button
+                  onClick={handleClearExceptNotes}
+                  className="flex items-center gap-1 text-[11px] text-[#DA7756] hover:text-[#e89070] cursor-pointer transition-all"
+                >
+                  Keep with notes
+                </button>
+              )}
+              <button
+                onClick={(e) => {
+                  console.warn('[ProjectHome] Clear clicked');
+                  handleClearHistory();
+                }}
+                className="flex items-center gap-1 text-[11px] text-[#666] hover:text-[#999] cursor-pointer transition-colors"
+              >
+                <Trash2 size={12} />
+                Clear
+              </button>
+            </div>
           </div>
 
-          {Array.from(groupedHistory.entries()).map(([group, entries]) => (
-            <div key={group} className="mb-4">
-              <div className="text-[10px] text-[#555] uppercase tracking-wider mb-2">{group}</div>
-              <div className="flex flex-wrap gap-2">
-                {entries.map((entry) => {
-                  const color = (entry.color || 'default') as TabColor;
-                  const colorConfig = TAB_COLORS[color];
+          {/* History Content — animated expand/collapse */}
+          <div
+            style={{
+              maxHeight: historyExpanded ? '2000px' : '0',
+              opacity: historyExpanded ? 1 : 0,
+              overflow: 'hidden',
+              transition: 'max-height 0.3s ease, opacity 0.2s ease',
+            }}
+          >
+            {Array.from(groupedHistory.entries()).map(([group, entries]) => (
+              <div key={group} className="mb-4">
+                <div className="text-[10px] text-[#555] uppercase tracking-wider mb-2">{group}</div>
+                <div className="flex flex-wrap gap-2">
+                  {entries.map((entry) => {
+                    const color = (entry.color || 'default') as TabColor;
+                    const colorConfig = TAB_COLORS[color];
 
-                  return (
-                    <div
-                      key={entry.id}
-                      className="relative"
-                      {...historyPopover.triggerProps(entry.id)}
-                    >
+                    return (
                       <div
-                        className="transition-all duration-150 cursor-pointer hover:opacity-70"
-                        onClick={() => restoreTab(entry)}
-                        onAuxClick={(e) => {
-                          if (e.button === 1) {
-                            e.preventDefault();
-                            ipcRenderer.invoke('project:delete-tab-history-entry', { id: entry.id });
-                            setHistory(prev => prev.filter(h => h.id !== entry.id));
-                          }
-                        }}
-                        style={{
-                          maxWidth: '140px',
-                          minWidth: '90px',
-                          padding: '6px 10px',
-                          backgroundColor: colorConfig.bgColor,
-                          borderRadius: '5px',
-                          borderLeft: `2px solid ${colorConfig.borderColor}`,
-                          opacity: 0.5,
-                          display: 'flex',
-                          flexDirection: 'column',
-                          gap: '1px',
-                        }}
+                        key={entry.id}
+                        className="relative"
+                        {...historyPopover.triggerProps(entry.id)}
+                        onContextMenu={(e) => handleCardContextMenu(e, 'history', entry.id)}
                       >
-                        <span
-                          className="text-[12px] text-white truncate"
-                          style={{ maxWidth: '120px' }}
-                        >
-                          {entry.name}
-                        </span>
-                        <span className="text-[9px] text-[#666] truncate">
-                          {getFolderName(entry.cwd)}
-                        </span>
-                      </div>
-
-                      {/* CMD indicator: notes exist */}
-                      {isCmdPressed && entry.notes && (
-                        <span
-                          style={{
-                            position: 'absolute',
-                            top: '6px',
-                            right: '6px',
-                            width: '5px',
-                            height: '5px',
-                            borderRadius: '50%',
-                            backgroundColor: '#DA7756',
-                            zIndex: 10,
+                        <div
+                          className="transition-all duration-150 cursor-pointer hover:opacity-70"
+                          onClick={() => restoreTab(entry)}
+                          onAuxClick={(e) => {
+                            if (e.button === 1) {
+                              e.preventDefault();
+                              deleteHistoryEntry(entry.id);
+                            }
                           }}
-                        />
-                      )}
-                    </div>
-                  );
-                })}
+                          style={{
+                            maxWidth: '140px',
+                            minWidth: '90px',
+                            padding: '6px 10px',
+                            backgroundColor: colorConfig.bgColor,
+                            borderRadius: '5px',
+                            borderLeft: `2px solid ${colorConfig.borderColor}`,
+                            opacity: 0.5,
+                            display: 'flex',
+                            flexDirection: 'column',
+                            gap: '1px',
+                          }}
+                        >
+                          <span
+                            className="text-[12px] text-white truncate"
+                            style={{ maxWidth: '120px' }}
+                          >
+                            {entry.name}
+                          </span>
+                          <span className="text-[9px] text-[#666] truncate">
+                            {getFolderName(entry.cwd)}
+                          </span>
+                        </div>
+
+                        {/* CMD indicator: notes exist */}
+                        {isCmdPressed && entry.notes && (
+                          <span
+                            style={{
+                              position: 'absolute',
+                              top: '6px',
+                              right: '6px',
+                              width: '5px',
+                              height: '5px',
+                              borderRadius: '50%',
+                              backgroundColor: '#DA7756',
+                              zIndex: 10,
+                            }}
+                          />
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
               </div>
-            </div>
-          ))}
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Context Menu (fixed, pattern from TabBar) */}
+      {homeContextMenu && (
+        <div
+          ref={contextMenuRef}
+          onClick={(e) => e.stopPropagation()}
+          style={{
+            position: 'fixed',
+            left: homeContextMenu.x,
+            top: homeContextMenu.y,
+            zIndex: 9999,
+          }}
+        >
+          <div
+            className="bg-[#2a2a2a] border border-[#444] rounded-xl shadow-2xl py-1 min-w-[160px]"
+            style={{ transform: 'translateY(-4px)' }}
+          >
+            {/* Active Tab Context Menu */}
+            {homeContextMenu.type === 'active-tab' && (() => {
+              const tabId = homeContextMenu.itemId as string;
+              const tab = workspace.tabs.get(tabId);
+              if (!tab) return null;
+              return (
+                <>
+                  <button
+                    className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      handleTabClick(tabId);
+                      setHomeContextMenu(null);
+                    }}
+                  >
+                    Switch to Tab
+                  </button>
+                  <button
+                    className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      addActiveTabToFavorites(tabId);
+                      setHomeContextMenu(null);
+                    }}
+                  >
+                    Add to Favorites
+                  </button>
+                  <div className="my-1 border-t border-[#444]" />
+                  <button
+                    className="w-full text-left px-4 py-1.5 text-[13px] text-[#f87171] hover:bg-white/10 cursor-pointer"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      closeTab(projectId, tabId);
+                      setHomeContextMenu(null);
+                    }}
+                  >
+                    Close Tab
+                  </button>
+                </>
+              );
+            })()}
+
+            {/* Favorite Context Menu */}
+            {homeContextMenu.type === 'favorite' && (() => {
+              const favId = homeContextMenu.itemId as number;
+              const entry = favorites.find(f => f.id === favId);
+              if (!entry) return null;
+              return (
+                <>
+                  <button
+                    className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      restoreFromFavorite(entry);
+                      setHomeContextMenu(null);
+                    }}
+                  >
+                    Open
+                  </button>
+                  <div className="my-1 border-t border-[#444]" />
+                  <button
+                    className="w-full text-left px-4 py-1.5 text-[13px] text-[#f87171] hover:bg-white/10 cursor-pointer"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      deleteFavorite(favId);
+                      setHomeContextMenu(null);
+                    }}
+                  >
+                    Remove from Favorites
+                  </button>
+                </>
+              );
+            })()}
+
+            {/* History Context Menu */}
+            {homeContextMenu.type === 'history' && (() => {
+              const histId = homeContextMenu.itemId as number;
+              const entry = history.find(h => h.id === histId);
+              if (!entry) return null;
+              return (
+                <>
+                  <button
+                    className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      restoreTab(entry);
+                      setHomeContextMenu(null);
+                    }}
+                  >
+                    Restore
+                  </button>
+                  <button
+                    className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      addHistoryToFavorites(entry);
+                      setHomeContextMenu(null);
+                    }}
+                  >
+                    Add to Favorites
+                  </button>
+                  <div className="my-1 border-t border-[#444]" />
+                  <button
+                    className="w-full text-left px-4 py-1.5 text-[13px] text-[#f87171] hover:bg-white/10 cursor-pointer"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      deleteHistoryEntry(histId);
+                      setHomeContextMenu(null);
+                    }}
+                  >
+                    Delete
+                  </button>
+                </>
+              );
+            })()}
+          </div>
         </div>
       )}
 

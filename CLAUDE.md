@@ -2,21 +2,36 @@
 
 <instructions>
   <step index="1">
-    CRITICAL: Before generating ANY solution, you MUST issue read_file commands for:
-    - docs/architecture.md
-    - docs/main-feature.md
+    CRITICAL: Before generating ANY solution, you MUST:
+    1. Read `docs/main-feature.md` to understand the User Flow.
+    2. Read `docs/architecture.md` to understand system constraints and Anti-Patterns.
   </step>
   <step index="2">
-    After reading `architecture.md`, scan it for EVERY reference to `knowledge/` files.
-    Issue read_file for EACH one. Do NOT skip any — even if they seem irrelevant to the question.
-
-    Then: find the relevant feature file(s) for the user's request from `main-feature.md`.
-    Read each feature file. For each — extract ALL `knowledge/` paths and read them too.
+    IDENTIFY RELEVANCE:
+    Based on the task, find the corresponding file in `docs/features/`.
+    Read it and extract ONLY those `knowledge/` links that are relevant to the current problem.
+    (e.g., if fixing terminal rendering → extract `knowledge/ui-ux-stability.md`, `knowledge/rendering-styles.md`).
+    Read the selected knowledge files.
   </step>
   <step index="3">
-    ONLY after steps 1-2, propose a solution.
-    Start your response with: "Я проверил файлы: [list of files you read]"
-    If you skip this — your answer is considered a hallucination.
+    RED TEAM your own plan BEFORE writing code.
+    List at least 3 constraints. For each — name the EXACT function/variable in the target code that will break.
+    If you can't name a specific function — you haven't read deep enough, go back to step 2.
+
+    BAD (generic, useless):
+    "⚠️ terminal-core.md — use OSC 7 for CWD"
+    "⚠️ ui-ux-stability.md — avoid flickering"
+
+    GOOD (code-specific, actionable):
+    "⚠️ terminal-core.md — CWD отслеживается через OSC 7 escape-последовательности от shell, а не через lsof/pgrep; shell-integration файлы инжектятся через ZDOTDIR при старте в ~/Library/Application Support/custom-terminal/shell-integration/"
+    "⚠️ ui-ux-stability.md — Ink/TUI рендеринг (Claude CLI, Gemini CLI) вызывает jitter input bar; решение через конкретный механизм в xterm.js Canvas renderer"
+  </step>
+  <step index="4">
+    ONLY after steps 1-3, propose a solution.
+    Start your response with:
+    1. "Я проверил файлы: [list]"
+    2. "⚠️ Constraints:" followed by the list from step 3
+    3. Then your implementation plan that respects EVERY listed constraint.
   </step>
 </instructions>
 

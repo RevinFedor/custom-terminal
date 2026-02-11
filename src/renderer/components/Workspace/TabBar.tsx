@@ -748,6 +748,9 @@ function TabBar({ projectId }: TabBarProps) {
       toggleTabSelection(projectId, tabId, true);
     } else {
       switchTab(projectId, tabId);
+      // Always switch to terminal view when clicking a tab
+      // (fixes: clicking tab from Home view didn't switch currentView from 'home' to 'terminal')
+      setCurrentView('terminal');
     }
   };
 
@@ -1495,11 +1498,31 @@ function TabBar({ projectId }: TabBarProps) {
           {/* Close Tab(s) */}
           <button
             className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2"
-            onClick={() => {
+            onClick={async () => {
               if (isMultiSelect) {
-                // Confirm closing multiple tabs
-                if (window.confirm(`Close ${selectedTabIds.length} tabs?`)) {
-                  selectedTabIds.forEach(id => closeTab(projectId, id));
+                // Collect running processes for batch confirmation
+                const running: { id: string; name: string }[] = [];
+                for (const id of selectedTabIds) {
+                  const state = await ipcRenderer.invoke('terminal:getCommandState', id);
+                  if (state.isRunning) {
+                    const { processName } = await ipcRenderer.invoke('terminal:hasRunningProcess', id);
+                    running.push({ id, name: processName || 'unknown' });
+                  }
+                }
+
+                let confirmed = true;
+                if (running.length > 0) {
+                  confirmed = window.confirm(
+                    `${running.length} tab(s) have running processes:\n${running.map(r => `\u2022 ${r.name}`).join('\n')}\n\nClose all ${selectedTabIds.length} tabs?`
+                  );
+                } else {
+                  confirmed = window.confirm(`Close ${selectedTabIds.length} tabs?`);
+                }
+
+                if (confirmed) {
+                  for (const id of selectedTabIds) {
+                    await closeTab(projectId, id, { skipProcessCheck: true });
+                  }
                 }
               } else {
                 handleContextClose();
@@ -1657,6 +1680,39 @@ function TabBar({ projectId }: TabBarProps) {
           >
             {isMultiSelect ? `Copy ${selectedTabIds.length} Sessions` : 'Copy ID/Path'}
           </button>
+
+          {/* Add to Favorites */}
+          {!isMultiSelect && (
+            <button
+              className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2"
+              onClick={(e) => {
+                e.stopPropagation();
+                if (contextMenu) {
+                  const tab = workspace.tabs.get(contextMenu.tabId);
+                  if (tab) {
+                    ipcRenderer.invoke('project:add-favorite', {
+                      projectId,
+                      tab: {
+                        name: tab.name,
+                        cwd: tab.cwd,
+                        color: tab.color || null,
+                        notes: tab.notes || null,
+                        commandType: tab.commandType || null,
+                        tabType: tab.tabType || 'terminal',
+                        url: tab.url || null,
+                        claudeSessionId: tab.claudeSessionId || null,
+                        geminiSessionId: tab.geminiSessionId || null,
+                      }
+                    });
+                    showToast(`"${tab.name}" added to favorites`, 'success');
+                  }
+                }
+                setContextMenu(null);
+              }}
+            >
+              Add to Favorites
+            </button>
+          )}
         </div>
       )}
 

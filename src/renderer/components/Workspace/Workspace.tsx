@@ -35,10 +35,19 @@ const detectLanguage = (ext: string): string | null => {
 const path = window.require('path');
 
 export default function Workspace() {
+  // DEBUG: Track Workspace mount/unmount
+  useEffect(() => {
+    console.warn('[Workspace:MOUNT]');
+    return () => {
+      console.warn('[Workspace:UNMOUNT]');
+    };
+  }, []);
+
   // Use selectors to avoid rerenders on unrelated store changes
   const activeProjectId = useWorkspaceStore((s) => s.activeProjectId);
   const getActiveProject = useWorkspaceStore((s) => s.getActiveProject);
   const getSidebarState = useWorkspaceStore((s) => s.getSidebarState);
+  const workspaceView = useWorkspaceStore((s) => s.view);
   const projects = useProjectsStore((s) => s.projects);
 
   // Use selectors to avoid rerenders on unrelated UIStore changes
@@ -141,6 +150,8 @@ export default function Workspace() {
   // CMD+E hotkey to open notes editor
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      // Guard: don't fire when Workspace is hidden behind Dashboard
+      if (workspaceView !== 'workspace') return;
       if (e.metaKey && e.key === 'e' && !notesEditorOpen && activeProjectId) {
         e.preventDefault();
         openNotesEditor(activeProjectId);
@@ -149,11 +160,13 @@ export default function Workspace() {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [activeProjectId, notesEditorOpen, openNotesEditor]);
+  }, [activeProjectId, notesEditorOpen, openNotesEditor, workspaceView]);
 
   // CMD+F hotkey for terminal search
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      // Guard: don't fire when Workspace is hidden behind Dashboard
+      if (workspaceView !== 'workspace') return;
       if (e.metaKey && e.key === 'f') {
         e.preventDefault();
         setShowSearch(true);
@@ -174,7 +187,7 @@ export default function Workspace() {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [showSearch, activeTab?.id]);
+  }, [showSearch, activeTab?.id, workspaceView]);
 
   // Handle search
   const handleSearch = useCallback((text: string) => {
@@ -242,11 +255,12 @@ export default function Workspace() {
   // Tab creation is now handled in useWorkspaceStore.openProject()
 
   if (!activeProject || !activeProjectId || !currentProject) {
+    console.warn('[Workspace:EARLY_RETURN] Empty workspace!', { activeProject: !!activeProject, activeProjectId, currentProject: !!currentProject });
     return <div className="flex-1 bg-bg-main" />;
   }
 
   // Get current tab's cwd for FileExplorer (fallback to project path)
-  const explorerPath = activeTab?.cwd || currentProject.path;
+  const explorerPath = activeTab?.cwd || (currentProject.path?.startsWith('__unset__') ? '' : currentProject.path);
 
   // Get Claude session ID for Timeline
   const claudeSessionId = activeTab?.claudeSessionId || null;
@@ -262,13 +276,6 @@ export default function Workspace() {
     <div className="flex-1 flex h-full overflow-hidden relative">
       {/* LEFT COLUMN: Tabs + Terminal/Home Area */}
       <div className="flex-1 flex flex-col min-w-0 relative">
-        {/* Project Home - Overlay that covers only the left column (tabs + terminal) */}
-        {currentView === 'home' && (
-          <div className="absolute inset-0 z-50 bg-bg-main border-r border-border-main">
-            <ProjectHome projectId={activeProjectId} />
-          </div>
-        )}
-
         {/* TabBar Row */}
         <div className="h-[30px] border-b border-border-main">
           <TabBar projectId={activeProjectId} />
@@ -356,12 +363,21 @@ export default function Workspace() {
           {/* Research Sheet */}
           <ResearchSheet projectId={activeProjectId} projectPath={currentProject.path} />
         </div>
+
+        {/* Project Home - Overlay AFTER TabBar+TerminalArea to keep children indices stable */}
+        {/* Uses absolute positioning so visual order is unaffected */}
+        {currentView === 'home' && (
+          <div className="absolute inset-0 z-50 bg-bg-main border-r border-border-main">
+            <ProjectHome projectId={activeProjectId} />
+          </div>
+        )}
       </div>
 
       {/* RIGHT COLUMN: Toolbar + Notes + Resizer */}
       <div className="flex shrink-0 overflow-hidden relative" style={{ width: notesPanelWidth }}>
         {/* Timeline for Claude session navigation - correctly positioned LEFT of Resizer */}
-        {currentView === 'terminal' && showTimeline && (
+        {/* NOTE: No currentView check — Timeline stays visible on Home to prevent layout shift in right sidebar */}
+        {showTimeline && (
           <Timeline
             tabId={activeTab.id}
             sessionId={claudeSessionId}

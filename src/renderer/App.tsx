@@ -320,6 +320,16 @@ function App() {
   const { closeFilePreview, filePreview, showToast, incrementAllFontSizes, decrementAllFontSizes, activeArea, setActiveArea, currentView, dragAreaWidth, setDragAreaWidth } = useUIStore();
   const { toggleResearch } = useResearchStore();
   const projectTabsFontSize = useUIStore((s) => s.projectTabsFontSize);
+
+  // DEBUG: Track view changes that cause Workspace unmount/mount
+  const prevViewRef = useRef(view);
+  useEffect(() => {
+    if (prevViewRef.current !== view) {
+      console.warn(`[App:VIEW_CHANGED] ${prevViewRef.current} → ${view}`);
+      prevViewRef.current = view;
+    }
+  }, [view]);
+
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [projectContextMenu, setProjectContextMenu] = useState<{ projectId: string; x: number; y: number } | null>(null);
   const [projectEmptyZoneHovered, setProjectEmptyZoneHovered] = useState(false);
@@ -637,6 +647,10 @@ function App() {
           } else if (currentProject) {
             createTab(activeProjectId, undefined, currentProject.path);
           }
+          // Switch to terminal view if on Home
+          if (currentView !== 'terminal') {
+            useUIStore.getState().setCurrentView('terminal');
+          }
         }
         return;
       }
@@ -745,6 +759,29 @@ function App() {
         const activeProject = getActiveProject();
         if (activeProject?.activeTabId) {
           ipcRenderer.send('terminal:input', activeProject.activeTabId, data);
+        }
+      } else if (cmd === 'add-to-favorites-from-terminal') {
+        const { tabId: favTabId, projectId: favProjectId } = data || {};
+        if (favTabId && favProjectId) {
+          const ws = useWorkspaceStore.getState().openProjects.get(favProjectId);
+          const tab = ws?.tabs.get(favTabId);
+          if (tab) {
+            ipcRenderer.invoke('project:add-favorite', {
+              projectId: favProjectId,
+              tab: {
+                name: tab.name,
+                cwd: tab.cwd,
+                color: tab.color || null,
+                notes: tab.notes || null,
+                commandType: tab.commandType || null,
+                tabType: tab.tabType || 'terminal',
+                url: tab.url || null,
+                claudeSessionId: tab.claudeSessionId || null,
+                geminiSessionId: tab.geminiSessionId || null,
+              }
+            });
+            showToast(`"${tab.name}" added to favorites`, 'success');
+          }
         }
       }
     };
@@ -938,16 +975,26 @@ function App() {
         </div>
       </div>
 
-      {/* Content Area */}
-      <div 
+      {/* Content Area — Both rendered, CSS toggle preserves terminal instances */}
+      <div
         className="flex-1 relative overflow-hidden flex flex-col"
-        onMouseDown={() => setActiveArea('workspace')}
+        onMouseDown={() => setActiveArea(view === 'dashboard' ? 'projects' : 'workspace')}
       >
-        {view === 'dashboard' ? (
-          <Dashboard />
-        ) : (
+        {/* Dashboard — conditional render (no heavy state to preserve) */}
+        {view === 'dashboard' && <Dashboard />}
+
+        {/* Workspace — ALWAYS mounted, hidden via CSS to preserve xterm.js instances */}
+        {/* visibility:hidden keeps container dimensions (prevents xterm 0x0 collapse) */}
+        <div
+          className="flex-1 flex flex-col"
+          style={{
+            visibility: view === 'workspace' ? 'visible' : 'hidden',
+            position: view === 'workspace' ? 'relative' : 'absolute',
+            ...(view !== 'workspace' ? { inset: 0, pointerEvents: 'none' as const } : {}),
+          }}
+        >
           <Workspace />
-        )}
+        </div>
       </div>
 
       {/* Global UI Components */}

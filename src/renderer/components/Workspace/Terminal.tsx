@@ -294,11 +294,17 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
   const pendingActionExecuted = useRef(false); // Track if pendingAction was executed
 
   const terminalFontSize = useUIStore((state) => state.terminalFontSize);
+  const currentView = useUIStore((state) => state.currentView);
+  const workspaceView = useWorkspaceStore((state) => state.view);
 
-  // Keep activeRef in sync with active prop for ResizeObserver closure
+  // Effective active = tab is active AND we're in terminal view AND workspace is visible (not Dashboard)
+  // This prevents focus/fit/repaint when terminals are hidden behind Dashboard or ProjectHome
+  const effectiveActive = active && currentView === 'terminal' && workspaceView === 'workspace';
+
+  // Keep activeRef in sync for ResizeObserver closure
   useEffect(() => {
-    activeRef.current = active;
-  }, [active]);
+    activeRef.current = effectiveActive;
+  }, [effectiveActive]);
 
   // Check if terminal is scrolled up (not at bottom)
   const checkScrollPosition = useCallback(() => {
@@ -355,14 +361,23 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
       if (!term.element) return;
       if (!term.options || term.cols === 0 || term.rows === 0) return;
 
+      const colsBefore = term.cols;
+      const rowsBefore = term.rows;
+
       fit.fit();
 
       const dims = fit.proposeDimensions();
       if (dims) {
         ipcRenderer.send('terminal:resize', tabId, dims.cols, dims.rows);
       }
+
+      const colsAfter = term.cols;
+      const rowsAfter = term.rows;
+      if (colsBefore !== colsAfter || rowsBefore !== rowsAfter) {
+        console.warn(`[safeFit] tabId=${tabId} RESIZED ${colsBefore}x${rowsBefore} → ${colsAfter}x${rowsAfter}, sent to PTY: ${dims?.cols}x${dims?.rows}`);
+      }
     } catch (e) {
-      // Silently ignore fit errors
+      console.warn('[safeFit] ERROR:', e);
     }
   };
 
@@ -371,6 +386,7 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
       return;
     }
     isInitialized.current = true;
+    console.warn(`[Terminal:MOUNT] tabId=${tabId} active=${active} isActiveProject=${isActiveProject}`);
 
     const containerRef = terminalRef.current;
 
@@ -909,6 +925,8 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
       serializeAddonRef.current = null;
       webglAddonRef.current = null;
 
+      console.warn(`[Terminal:DISPOSE] tabId=${tabId} — terminal disposed (useEffect[tabId] cleanup)`);
+
       try {
         termToDispose?.dispose();
       } catch (e) {
@@ -919,10 +937,17 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
 
   // Focus and fit when becoming active (with rAF to let browser paint first)
   // Also handles lazy initialization on first activation
+  // Uses effectiveActive (active && currentView==='terminal') to prevent unmount/remount on view switch
   useEffect(() => {
-    if (!active || !isActiveProject) {
+    if (!effectiveActive || !isActiveProject) {
       // Clear global selection when terminal becomes inactive
-      if (!active) {
+      if (!effectiveActive) {
+        console.warn(`[Terminal:deactivate] tabId=${tabId}`, {
+          active,
+          effectiveActive,
+          currentView,
+          isActiveProject,
+        });
         getSetTerminalSelection()('');
       }
       return;
@@ -930,8 +955,10 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
 
     // Lazy init: if this is first activation and xterm not created yet
     if (!hasBeenActive.current && !xtermInstance.current && terminalRef.current) {
+      console.warn(`[Terminal:LAZY_INIT] tabId=${tabId} — terminal not created yet, initializing from scratch`);
       // Lock: prevent double initialization
       if (isCreatingRef.current) {
+        console.warn(`[Terminal:LAZY_INIT] tabId=${tabId} — SKIPPED (isCreatingRef lock)`);
         return;
       }
       isCreatingRef.current = true; // Set lock
@@ -1211,36 +1238,81 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
       const term = xtermInstance.current;
       if (!term) return;
 
+      const fit = fitAddonRef.current;
+      const colsBefore = term.cols;
+      const rowsBefore = term.rows;
+      const dimsBefore = fit?.proposeDimensions();
+      const container = terminalRef.current;
+      const containerRect = container?.getBoundingClientRect();
+
+      console.warn(`[Terminal:activate] tabId=${tabId} BEFORE safeFit:`, {
+        'term.cols': colsBefore,
+        'term.rows': rowsBefore,
+        'proposed': dimsBefore ? `${dimsBefore.cols}x${dimsBefore.rows}` : 'null',
+        'container': containerRect ? `${Math.round(containerRect.width)}x${Math.round(containerRect.height)}` : 'null',
+        'visibility': container?.style.visibility,
+        'cursorHidden': (term as any)._core?.buffer?.isCursorHidden,
+        'cursorX': term.buffer.active.cursorX,
+        'cursorY': term.buffer.active.cursorY,
+      });
+
       safeFit();
+
+      const colsAfter = term.cols;
+      const rowsAfter = term.rows;
+      console.warn(`[Terminal:activate] AFTER safeFit:`, {
+        'term.cols': colsAfter,
+        'term.rows': rowsAfter,
+        'changed': colsBefore !== colsAfter || rowsBefore !== rowsAfter,
+        'cursorX': term.buffer.active.cursorX,
+        'cursorY': term.buffer.active.cursorY,
+      });
+
+      // FIX: Force Canvas renderer to repaint after returning from visibility:hidden.
+      // fit.fit() is a no-op if dimensions haven't changed, leaving canvas stale.
+      try {
+        const core = (term as any)._core;
+        if (core?._renderService) {
+          core._renderService.clear();
+          console.warn('[Terminal:activate] _renderService.clear() called');
+          // Force canvas repaint — clear() only marks lines dirty, refresh() triggers actual paint
+          term.refresh(0, term.rows - 1);
+        }
+      } catch (e) {
+        console.warn('[Terminal:activate] _renderService.clear() ERROR:', e);
+      }
+
       term.focus();
 
       // Restore saved scroll position (from when tab was deactivated)
-      // Use requestAnimationFrame to ensure fit() completed
       const savedWasAtBottom = wasAtBottom.current;
       const savedPos = savedScrollPosition.current;
       const buffer = term.buffer.active;
 
+      console.warn('[Terminal:activate] scroll restore:', {
+        savedWasAtBottom,
+        savedPos,
+        'buffer.baseY': buffer.baseY,
+        'buffer.viewportY': buffer.viewportY,
+      });
+
       requestAnimationFrame(() => {
-        // CRITICAL FIX: If terminal was at bottom when deactivated, scroll to bottom
-        // This handles the case where data arrived while terminal was hidden
-        // (xterm.js bug: viewportY resets to 0 when writing to hidden terminal)
-        // See: docs/knowledge/fix-scroll-position-hidden-terminal.md
         if (savedWasAtBottom) {
           term.scrollToBottom();
         } else if (savedPos !== null) {
-          // Terminal was scrolled up - restore exact position
           term.scrollToLine(savedPos);
         } else {
-          // Fallback: no saved position, scroll to bottom
           term.scrollToBottom();
         }
-
-        // Reset saved state
         savedScrollPosition.current = null;
         wasAtBottom.current = true;
+
+        console.warn('[Terminal:activate] scroll restored, final:', {
+          'buffer.viewportY': term.buffer.active.viewportY,
+          'buffer.baseY': term.buffer.active.baseY,
+        });
       });
 
-      // Update selection state when becoming active
       const selection = term.getSelection() || '';
       getSetTerminalSelection()(selection);
     });
@@ -1256,7 +1328,7 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
         wasAtBottom.current = buffer.viewportY >= buffer.baseY;
       }
     };
-  }, [active, isActiveProject, tabId]);
+  }, [effectiveActive, isActiveProject, tabId]);
 
   // React to font size changes
   useEffect(() => {
@@ -1294,7 +1366,14 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
     const promptsResult = await ipcRenderer.invoke('prompts:get');
     const prompts = promptsResult.success ? promptsResult.data : [];
 
-    ipcRenderer.send('show-terminal-context-menu', { hasSelection, prompts });
+    // Find projectId for this tab
+    let currentProjectId: string | undefined;
+    const state = useWorkspaceStore.getState();
+    for (const [projId, workspace] of state.openProjects) {
+      if (workspace.tabs.has(tabId)) { currentProjectId = projId; break; }
+    }
+
+    ipcRenderer.send('show-terminal-context-menu', { hasSelection, prompts, tabId, projectId: currentProjectId });
   };
 
   // CSS: visibility:hidden preserves geometry, prevents WebGL context loss
@@ -1302,14 +1381,14 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
   // opacity:0 initially to prevent jitter during first fit
 
   return (
-    <div className="absolute inset-0" style={{ zIndex: active ? 1 : -1, isolation: 'isolate' }}>
+    <div className="absolute inset-0" style={{ zIndex: effectiveActive ? 1 : -1, isolation: 'isolate' }}>
 
       {/* Layer 1: Terminal (Lower) */}
       <div
         ref={terminalRef}
         className="terminal-instance w-full h-full"
         style={{
-          visibility: active ? 'visible' : 'hidden',
+          visibility: effectiveActive ? 'visible' : 'hidden',
           opacity: isVisible ? 1 : 0,
           transition: 'opacity 0.05s ease-in'
         }}
