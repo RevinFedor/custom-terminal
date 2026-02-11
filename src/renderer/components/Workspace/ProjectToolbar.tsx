@@ -102,7 +102,6 @@ export default function ProjectToolbar() {
     borderLeft: 'none',
     borderRight: 'none',
     cursor: 'pointer',
-    transition: 'all 0.15s ease',
     outline: 'none',
   });
 

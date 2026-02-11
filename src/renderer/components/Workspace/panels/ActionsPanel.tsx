@@ -629,8 +629,6 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
     }
   };
 
-  console.log('[ActionsPanel] RENDER', { embedded, activeTabId, isCopying });
-
   const content = (
       <>
         {/* System Tools Section */}
@@ -642,7 +640,7 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
 
           <div className="flex flex-col gap-1">
               <button
-                className={`w-full bg-blue-900/30 border border-blue-700/30 text-blue-400 p-3 text-left cursor-pointer rounded-lg text-xs flex items-center gap-2 hover:bg-blue-900/50 hover:border-blue-600/40 transition-colors focus:outline-none ${
+                className={`w-full bg-blue-900/30 border border-blue-700/30 text-blue-400 p-3 text-left cursor-pointer rounded-lg text-xs flex items-center gap-2 hover:bg-blue-900/50 hover:border-blue-600/40 focus:outline-none ${
                   isUpdatingDocs ? 'opacity-50 cursor-not-allowed' : ''
                 }`}
                 onClick={handleUpdateDocs}
@@ -663,9 +661,12 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
                       backgroundColor: isScissorsHovered ? '#3b82f6' : '#2563eb',
                       transform: isScissorsHovered ? 'scale(1.02)' : 'scale(1)',
                       boxShadow: isScissorsHovered ? '0 2px 6px rgba(59, 130, 246, 0.25)' : 'none',
-                      transition: 'all 0.15s ease'
                     }}
-                    onClick={handleUpdateDocsWithSelection}
+                    onClick={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      handleUpdateDocsWithSelection(e);
+                    }}
                     onMouseDown={(e) => e.stopPropagation()}
                     onMouseEnter={() => setIsScissorsHovered(true)}
                     onMouseLeave={() => setIsScissorsHovered(false)}
@@ -680,13 +681,17 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
                 {/* Clipboard button - use content from clipboard */}
                 {!isUpdatingDocs && (
                   <div
-                    className="relative z-10 text-white text-[9px] px-2 py-1.5 rounded flex items-center gap-1 cursor-pointer select-none transition-all"
+                    className="relative z-10 text-white text-[9px] px-2 py-1.5 rounded flex items-center gap-1 cursor-pointer select-none"
                     style={{
                       backgroundColor: '#7c3aed',
                     }}
                     onMouseEnter={(e) => e.currentTarget.style.backgroundColor = '#8b5cf6'}
                     onMouseLeave={(e) => e.currentTarget.style.backgroundColor = '#7c3aed'}
-                    onClick={handleUpdateDocsWithClipboard}
+                    onClick={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      handleUpdateDocsWithClipboard(e);
+                    }}
                     onMouseDown={(e) => e.stopPropagation()}
                     title="Use clipboard content"
                     role="button"
@@ -699,7 +704,7 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
               {/* Cancel button — only visible during processing */}
               {isUpdatingDocs && (
                 <button
-                  className="w-full bg-red-900/20 border border-red-700/20 text-red-400 p-2 text-center cursor-pointer rounded-lg text-[11px] hover:bg-red-900/40 hover:border-red-600/30 transition-colors focus:outline-none"
+                  className="w-full bg-red-900/20 border border-red-700/20 text-red-400 p-2 text-center cursor-pointer rounded-lg text-[11px] hover:bg-red-900/40 hover:border-red-600/30 focus:outline-none"
                   onClick={handleCancelUpdateDocs}
                 >
                   Отменить
@@ -713,18 +718,12 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
             <div
               ref={copyContainerRef}
               data-copy-session
-              className={`w-full text-[#DA7756] p-3 text-left rounded-lg text-xs flex items-center gap-2 transition-colors ${
+              className={`w-full text-[#DA7756] p-3 text-left rounded-lg text-xs flex items-center gap-2 ${
                 isCopying ? 'opacity-50' : ''
               }`}
               style={{
                 backgroundColor: 'rgba(218, 119, 86, 0.1)',
                 border: '1px solid rgba(218, 119, 86, 0.15)'
-              }}
-              onMouseDown={(e) => {
-                console.log('[CopySession] CONTAINER mousedown', { target: (e.target as HTMLElement).tagName, className: (e.target as HTMLElement).className?.slice(0, 60) });
-              }}
-              onClick={(e) => {
-                console.log('[CopySession] CONTAINER click', { target: (e.target as HTMLElement).tagName, className: (e.target as HTMLElement).className?.slice(0, 60) });
               }}
               onMouseEnter={(e) => {
                 e.currentTarget.style.backgroundColor = 'rgba(218, 119, 86, 0.18)';
@@ -738,7 +737,7 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
               {/* Icon with simple hover (no scale - like Timeline) */}
               <div
                 ref={copyIconRef}
-                className={`relative w-6 h-6 flex items-center justify-center cursor-pointer rounded transition-colors ${showCopySettings ? 'bg-white/15' : 'hover:bg-white/10'}`}
+                className={`relative w-6 h-6 flex items-center justify-center cursor-pointer rounded ${showCopySettings ? 'bg-white/15' : 'hover:bg-white/10'}`}
                 onMouseEnter={() => setShowCopySettings(true)}
                 onMouseLeave={handleMouseLeaveIcon}
               >
@@ -776,22 +775,22 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
                       <div className="px-1 py-0.5 text-[9px] uppercase font-bold text-[#666] border-b border-[#333] mb-1">Настройки</div>
 
                       <label className="flex items-center justify-between gap-3 cursor-pointer group/label px-1">
-                        <span className="text-[10px] text-[#aaa] group-hover/label:text-white transition-colors">С кодом</span>
+                        <span className="text-[10px] text-[#aaa] group-hover/label:text-white">С кодом</span>
                         <div
-                          className={`w-7 h-4 rounded-full relative transition-colors cursor-pointer ${includeCode ? 'bg-[#DA7756]' : 'bg-[#444]'}`}
+                          className={`w-7 h-4 rounded-full relative cursor-pointer ${includeCode ? 'bg-[#DA7756]' : 'bg-[#444]'}`}
                           onClick={(e) => { e.stopPropagation(); setIncludeCode(!includeCode); }}
                         >
-                          <div className={`absolute top-0.5 w-3 h-3 bg-white rounded-full transition-all ${includeCode ? 'left-[14px]' : 'left-0.5'}`} />
+                          <div className={`absolute top-0.5 w-3 h-3 bg-white rounded-full ${includeCode ? 'left-[14px]' : 'left-0.5'}`} />
                         </div>
                       </label>
 
                       <label className="flex items-center justify-between gap-3 cursor-pointer group/label px-1">
-                        <span className="text-[10px] text-[#aaa] group-hover/label:text-white transition-colors">С начала</span>
+                        <span className="text-[10px] text-[#aaa] group-hover/label:text-white">С начала</span>
                         <div
-                          className={`w-7 h-4 rounded-full relative transition-colors cursor-pointer ${fromStart ? 'bg-[#DA7756]' : 'bg-[#444]'}`}
+                          className={`w-7 h-4 rounded-full relative cursor-pointer ${fromStart ? 'bg-[#DA7756]' : 'bg-[#444]'}`}
                           onClick={(e) => { e.stopPropagation(); setFromStart(!fromStart); }}
                         >
-                          <div className={`absolute top-0.5 w-3 h-3 bg-white rounded-full transition-all ${fromStart ? 'left-[14px]' : 'left-0.5'}`} />
+                          <div className={`absolute top-0.5 w-3 h-3 bg-white rounded-full ${fromStart ? 'left-[14px]' : 'left-0.5'}`} />
                         </div>
                       </label>
                     </div>
@@ -805,13 +804,11 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
               <div className="flex-1">
                 {/* Clickable title - copies current session(s) */}
                 <div
-                  className="font-medium cursor-pointer hover:text-white hover:underline transition-colors inline-block"
+                  className="font-medium cursor-pointer hover:text-white hover:underline inline-block"
                   onMouseDown={(e) => {
-                    console.log('[CopySession] TITLE mousedown', { isCopying, isMultiSelect, selectedCount: selectedTabs?.length });
                     e.stopPropagation();
                   }}
                   onClick={(e) => {
-                    console.log('[CopySession] TITLE click fired!', { isCopying, isMultiSelect });
                     e.stopPropagation();
                     if (!isCopying) handleCopySession();
                   }}
@@ -830,7 +827,7 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
               {/* Hide expand button when multi-select - no need for manual ID input */}
               {!isMultiSelect && (
                 <span
-                  className="text-[10px] text-[#DA7756]/50 cursor-pointer hover:text-[#DA7756] transition-colors px-1"
+                  className="text-[10px] text-[#DA7756]/50 cursor-pointer hover:text-[#DA7756] px-1"
                   onClick={() => !isCopying && setCopySessionExpanded(!copySessionExpanded)}
                 >
                   {copySessionExpanded ? '▼' : '▶'}
@@ -858,7 +855,7 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
                   <button
                     onClick={() => handleCopySession()}
                     disabled={isCopying || (!copySessionInput.trim() && !activeTabId)}
-                    className="text-[10px] px-3 py-1.5 rounded transition-colors bg-[#DA7756] text-white hover:bg-[#DA7756]/80 disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+                    className="text-[10px] px-3 py-1.5 rounded bg-[#DA7756] text-white hover:bg-[#DA7756]/80 disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
                   >
                     {isCopying ? 'Копирование...' : 'Copy'}
                   </button>

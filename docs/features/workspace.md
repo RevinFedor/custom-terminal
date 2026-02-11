@@ -21,6 +21,8 @@
 
 ## Behavior Specs
 - **Two-Column Layout:** Рабочая область разделена на две независимые колонки. Левая — для терминалов и Home, правая — для инструментов проекта (Toolbar, Notes).
+- **Sidebar Stability:** Правая колонка (Toolbar, Notes) остается стабильной при переключении между Терминалом и Home. Компоненты (например, Timeline) не удаляются из DOM, а скрываются через `visibility`, что предотвращает Layout Shifts и сохраняет фиксированную ширину сайдбара.
+- **Persistent Mounting:** Workspace остается смонтированным всегда после первого открытия. Переход Dashboard ↔ Workspace осуществляется через CSS-скрытие. См. `knowledge/ui-ux-stability.md` (раздел 2).
 - **Navigation History:** При закрытии активного проекта система не выбрасывает пользователя на Dashboard, а переключает на предыдущий проект из истории (Stack-based navigation).
 - **Project Focus:** При активации области проектов (`activeArea`), панель получает подсветку `bg-white/[0.05]`, а активный проект — скругленную рамку `ring-1 ring-white/50`.
 - **VSCode-style Creation:**
