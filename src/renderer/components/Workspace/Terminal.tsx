@@ -294,12 +294,21 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
   const pendingActionExecuted = useRef(false); // Track if pendingAction was executed
 
   const terminalFontSize = useUIStore((state) => state.terminalFontSize);
-  const currentView = useUIStore((state) => state.currentView);
   const workspaceView = useWorkspaceStore((state) => state.view);
+
+  // Per-project currentView: find which project owns this tab and read its currentView
+  const projectCurrentView = useWorkspaceStore((state) => {
+    for (const [, workspace] of state.openProjects) {
+      if (workspace.tabs.has(tabId)) {
+        return workspace.currentView || 'terminal';
+      }
+    }
+    return 'terminal';
+  });
 
   // Effective active = tab is active AND we're in terminal view AND workspace is visible (not Dashboard)
   // This prevents focus/fit/repaint when terminals are hidden behind Dashboard or ProjectHome
-  const effectiveActive = active && currentView === 'terminal' && workspaceView === 'workspace';
+  const effectiveActive = active && projectCurrentView === 'terminal' && workspaceView === 'workspace';
 
   // Keep activeRef in sync for ResizeObserver closure
   useEffect(() => {
@@ -945,7 +954,7 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
         console.warn(`[Terminal:deactivate] tabId=${tabId}`, {
           active,
           effectiveActive,
-          currentView,
+          projectCurrentView,
           isActiveProject,
         });
         getSetTerminalSelection()('');

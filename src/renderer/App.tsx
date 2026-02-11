@@ -317,7 +317,7 @@ const RestoreLoader = memo(() => (
 function App() {
   const { view, showDashboard, openProject, openProjects, activeProjectId, closeProject, createTab, createTabAfterCurrent, closeTab, getActiveProject, restoreSession, reorderProjects, moveTabToProject, moveTabsToProject, isRestoring, getSidebarState, setSidebarOpen, setOpenFilePath } = useWorkspaceStore();
   const { projects, loadProjects, updateProject } = useProjectsStore();
-  const { closeFilePreview, filePreview, showToast, incrementAllFontSizes, decrementAllFontSizes, activeArea, setActiveArea, currentView, dragAreaWidth, setDragAreaWidth } = useUIStore();
+  const { closeFilePreview, filePreview, showToast, incrementAllFontSizes, decrementAllFontSizes, activeArea, setActiveArea, dragAreaWidth, setDragAreaWidth } = useUIStore();
   const { toggleResearch } = useResearchStore();
   const projectTabsFontSize = useUIStore((s) => s.projectTabsFontSize);
 
@@ -647,9 +647,10 @@ function App() {
           } else if (currentProject) {
             createTab(activeProjectId, undefined, currentProject.path);
           }
-          // Switch to terminal view if on Home
-          if (currentView !== 'terminal') {
-            useUIStore.getState().setCurrentView('terminal');
+          // Switch to terminal view if on Home (per-project)
+          const ws = useWorkspaceStore.getState().openProjects.get(activeProjectId);
+          if (ws && ws.currentView !== 'terminal') {
+            useWorkspaceStore.getState().setProjectView(activeProjectId, 'terminal');
           }
         }
         return;

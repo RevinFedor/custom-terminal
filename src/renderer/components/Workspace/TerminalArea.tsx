@@ -1,7 +1,6 @@
 import React, { memo, useMemo, useEffect, useState, useRef } from 'react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
-import { useUIStore } from '../../store/useUIStore';
 import Terminal from './Terminal';
 import BrowserTab from './BrowserTab';
 import { motion, AnimatePresence } from 'framer-motion';
@@ -136,14 +135,15 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
   const clearInterruptedState = useWorkspaceStore((state) => state.clearInterruptedState);
   const projects = useProjectsStore((state) => state.projects);
 
-  const currentView = useUIStore((s) => s.currentView);
-
   // DEBUG: Track render reason
   const renderCountRef = useRef(0);
   renderCountRef.current++;
-  console.warn(`[TerminalArea:RENDER #${renderCountRef.current}] projectId=${projectId} currentView=${currentView} openProjects.size=${openProjects.size}`);
 
   const currentWorkspace = openProjects.get(projectId);
+  const currentView = currentWorkspace?.currentView || 'terminal';
+
+  console.warn(`[TerminalArea:RENDER #${renderCountRef.current}] projectId=${projectId} currentView=${currentView} openProjects.size=${openProjects.size}`);
+
   const currentProject = projects[projectId];
 
   // Get active tab info for interrupted session overlay

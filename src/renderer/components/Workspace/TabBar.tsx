@@ -705,9 +705,8 @@ function TabBar({ projectId }: TabBarProps) {
   const clearSelection = useWorkspaceStore((state) => state.clearSelection);
   
   const { projects } = useProjectsStore();
+  const setProjectView = useWorkspaceStore((state) => state.setProjectView);
   const tabsFontSize = useUIStore((state) => state.tabsFontSize);
-  const currentView = useUIStore((state) => state.currentView);
-  const setCurrentView = useUIStore((state) => state.setCurrentView);
   const showToast = useUIStore((state) => state.showToast);
   const tabNotesFontSize = useUIStore((state) => state.tabNotesFontSize);
   const tabNotesPaddingX = useUIStore((state) => state.tabNotesPaddingX);
@@ -736,6 +735,7 @@ function TabBar({ projectId }: TabBarProps) {
 
   const workspace = openProjects.get(projectId);
   const project = projects[projectId];
+  const currentView = workspace?.currentView || 'terminal';
 
   // Selection state
   const selectedTabIds = workspace?.selectedTabIds || [];
@@ -750,7 +750,7 @@ function TabBar({ projectId }: TabBarProps) {
       switchTab(projectId, tabId);
       // Always switch to terminal view when clicking a tab
       // (fixes: clicking tab from Home view didn't switch currentView from 'home' to 'terminal')
-      setCurrentView('terminal');
+      setProjectView(projectId, 'terminal');
     }
   };
 
@@ -969,7 +969,7 @@ function TabBar({ projectId }: TabBarProps) {
     const cwd = activeTab?.cwd || project.path;
     // Pass undefined for name to use smart naming (tab-1, tab-2, etc.)
     createTabAfterCurrent(projectId, undefined, cwd);
-    setCurrentView('terminal');
+    setProjectView(projectId, 'terminal');
   };
 
   // Create new tab at the end of tabs list (for double-click on empty space)
@@ -977,7 +977,7 @@ function TabBar({ projectId }: TabBarProps) {
     const activeTab = workspace.activeTabId ? workspace.tabs.get(workspace.activeTabId) : null;
     const cwd = activeTab?.cwd || project.path;
     createTab(projectId, undefined, cwd);
-    setCurrentView('terminal');
+    setProjectView(projectId, 'terminal');
   };
 
   const handleCloseTab = (e: React.MouseEvent, tabId: string) => {
@@ -1367,7 +1367,7 @@ function TabBar({ projectId }: TabBarProps) {
                           if (!e.shiftKey && !e.metaKey && !e.ctrlKey) {
                             setUtilityExpanded(false); // Close dropdown only on direct switch
                           }
-                          setCurrentView('terminal');
+                          setProjectView(projectId, 'terminal');
                         }}
                         onClose={() => closeTab(projectId, tab.id)} // Close tab, not move to main
                         onDoubleClick={() => {
@@ -1433,7 +1433,7 @@ function TabBar({ projectId }: TabBarProps) {
                     editValue={editValue}
                     onSwitch={(e) => {
                       handleTabClick(e, tab.id);
-                      setCurrentView('terminal');
+                      setProjectView(projectId, 'terminal');
                     }}
                     onClose={(e) => handleCloseTab(e, tab.id)}
                     onDoubleClick={() => {
