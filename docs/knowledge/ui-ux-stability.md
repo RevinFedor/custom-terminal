@@ -84,11 +84,12 @@ ipcRenderer.on('terminal:data', (event, tabId, data) => {
 -   `opacity: isVisible ? 1 : 0` с коротким `transition`.
 Терминал становится видимым только ПОСЛЕ того, как выполнится первый `safeFit()`. Это делает появление терминала плавным.
 
-#### 2. Сохранение инстансов (Persistent Terminals)
-В `TerminalArea.tsx` логика изменена с фильтрации на скрытие:
--   Рендерим терминалы **всех** открытых проектов одновременно.
--   Используем `visibility: active ? 'visible' : 'hidden'` вместо условного рендеринга.
--   **Важно:** Используем именно `visibility: hidden`, а не `display: none`, так как `display: none` схлопывает контейнер в 0x0, что приводит к потере контекста WebGL и текстур в `xterm.js`.
+#### 2. Персистентные слои (Persistent Layers)
+В приложении используется стратегия «Смонтирован навсегда» для всех тяжелых компонентов:
+-   **Terminal:** Рендерим терминалы **всех** открытых проектов одновременно. Используем `visibility: active ? 'inherit' : 'hidden'`.
+-   **Workspace:** Компонент `Workspace` в `App.tsx` остается смонтированным при переходе на Dashboard. Скрытие управляется через `visibility`.
+-   **Почему:** Любой unmount `xterm.js` приводит к потере WebGL-контекста и визуального буфера. Пересоздание занимает 1-3с, что неприемлемо для быстрого переключения.
+-   **Важно:** Используем именно `visibility: hidden`, а не `display: none`, так как `display: none` схлопывает контейнер в 0x0, что приводит к потере текстур в `xterm.js`. См. также раздел 11.1 про ловушку `visible`.
 
 ---
 
@@ -319,18 +320,23 @@ const isActive = isActiveProject && workspace.activeTabId === tab.id && currentV
 Пока терминал скрыт (Home view), данные из PTY продолжают писаться в буфер xterm.js. Canvas renderer накапливает stale state. При возврате `safeFit()` вызывает `fit.fit()`, но размеры те же → no-op → canvas не обновляется → Ink CLI (Gemini/Claude) рисует мусор (прогресс-бары переносятся, строки дублируются).
 
 ### Решение
-В `Terminal.tsx`, useEffect активации (`[active, isActiveProject, tabId]`), после `safeFit()`:
+В `Terminal.tsx`, useEffect активации (`[effectiveActive, isActiveProject, tabId]`), после `safeFit()`:
 ```javascript
 // Форсированная очистка и перерисовка
 if (xtermInstance.current) {
   const term = xtermInstance.current;
   const core = (term as any)._core;
   if (core?._renderService) {
-    core._renderService.clear(); // Помечает все строки dirty, следующий цикл рендеринга перерисует их
+    core._renderService.clear(); // Помечает все строки dirty
   }
-  term.refresh(0, term.rows - 1);
+  term.refresh(0, term.rows - 1); // Форсирует repaint canvas
 }
 ```
+
+### ⚠️ ЛОВУШКА: Visibility Visible Override
+Если дочерний элемент имеет стиль `visibility: visible`, он **перекрывает** `visibility: hidden` родителя.
+- **Проблема:** При переходе на Dashboard весь Workspace скрывался через `hidden`, но терминалы (имея `visible`) продолжали «просвечивать» поверх главного экрана.
+- **Решение:** Использовать `visibility: inherit` (или `visibility: visible` только при условии видимости родителя). Это заставляет детей подчиняться состоянию верхнего слоя.
 
 ### ⚠️ ОПАСНО: Resize Cycle (Trap)
 Попытка форсировать пересчет через `term.resize(cols-1)` -> `term.resize(cols)` является **ловушкой**.
@@ -355,6 +361,46 @@ if (xtermInstance.current) {
 
 ### Результат
 Мгновенное и надежное переключение контекста горячих клавиш при клике в любую точку рабочей области.
+
+---
+
+## 13. React Reconciliation Trap (Index Shift)
+
+### Проблема
+При переключении между Terminal и Home видом в проекте все терминалы внезапно уничтожались (`DISPOSE`) и создавались заново, хотя они находятся в разных ветках DOM.
+
+### Причина
+React выполняет реконсиляцию (сравнение) детей по их индексу, если не заданы ключи. 
+**В `Workspace.tsx` была структура:**
+```tsx
+<div className="flex flex-col">
+  {currentView === 'home' && <ProjectHome />} // Элемент [0]
+  <TabBar />      // Элемент [1] или [0]
+  <TerminalArea /> // Элемент [2] или [1]
+</div>
+```
+Когда `ProjectHome` (индекс [0]) появлялся или исчезал, у `TabBar` и `TerminalArea` **смещались индексы**. React видел, что на месте [0] теперь другой компонент, и уничтожал всё дерево ниже по каскаду.
+
+### Решение
+1.  **Stable Indexing:** Условные оверлеи должны рендериться **последними** в списке детей.
+2.  **Absolute Positioning:** Использование `absolute inset-0` позволяет оверлею физически находиться в конце списка детей (не влияя на индексы соседей), но визуально перекрывать их.
+
+---
+
+## 14. Sequential UI Disappearance (The Laggy Sidebar)
+
+### Проблема
+При переключении на Home сайдбар исчезал не мгновенно, а «поэтапно» (сначала таймлайн, потом кнопки).
+
+### Причины
+1.  **Layout Shift:** `Timeline` (шириной 24px) полностью удалялся из DOM. Это вызывало пересчет ширины всей правой колонки.
+2.  **CSS Transitions:** Наличие `transition: all 0.3s` на кнопках и контейнерах заставляло элементы плавно менять прозрачность/цвет, что при массовом скрытии выглядело как задержка.
+
+### Решение
+1.  **Stay Mounted:** `Timeline` остается смонтированным всегда (сохраняя свои 24px), но скрывает содержимое через проп `isVisible`. Это убирает скачки верстки.
+2.  **Zero-Delay Policy:** Удаление `transition` у функциональных элементов (кнопки Claude/Gemini, Resizer), которые должны реагировать на смену глобального состояния мгновенно.
+3.  **Instant Portals:** Скрытие порталов (подсказок) должно быть принудительным и мгновенным при потере видимости родителя. Используйте `visibility: inherit`, чтобы дочерние элементы с явным `visible` не «пробивали» скрытого родителя.
+
 \n---\n## File: ui-ux-stability.md\n
 # Fact: UI/UX Polishing Details
 

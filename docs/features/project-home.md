@@ -61,5 +61,5 @@ claude_session_id, gemini_session_id
 ## Code Map
 - `ProjectHome.tsx`: Рендеринг сетки карточек (Active, Favorites, History), логика сворачивания истории, анимации и контекстных меню.
 - `Workspace.tsx`: Управление состоянием `currentView` и автоматический редирект через `useEffect`.
-- `useUIStore.ts`: Хранение текущего вида (`currentView`).
+- `useWorkspaceStore.ts`: Хранение текущего вида (`currentView`) для каждого проекта.
 - `main.js`: IPC-хендлеры `project:add-favorite`, `project:get-favorites`, `project:delete-favorite`, а также хендлеры архивации истории.

@@ -46,7 +46,7 @@ export default function Resizer({ onResize }: ResizerProps) {
 
   return (
     <div
-      className="relative w-1 h-full bg-border-main cursor-col-resize z-50 transition-colors duration-200 hover:bg-accent shrink-0"
+      className="relative w-1 h-full bg-border-main cursor-col-resize z-50 hover:bg-accent shrink-0"
       onMouseDown={handleMouseDown}
     />
   );

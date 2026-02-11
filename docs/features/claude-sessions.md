@@ -61,7 +61,7 @@ Thinking mode при запуске обеспечивается `alwaysThinking
     - **Индикаторы:** `*` помечает активную ветку, `♻️ ×N` показывает количество сжатий контекста в сегменте.
     - **Stats:** Напротив каждой сессии отображается количество сообщений (`messages`).
 - **Backtrace Timeline:** История сессии отображается на вертикальном таймлайне с фильтрацией Undo-веток. См. `features/timeline.md`.
-- **Interrupted Recovery:** При аварийном закрытии показывается оверлей. Выбор пользователя сохраняется в БД. См. `knowledge/ui-ux-stability.md`.
+- **Interrupted Recovery:** При аварийном закрытии показывается оверлей. Покажется только если `currentView === 'terminal'`, чтобы не перекрывать вкладку Home. Выбор пользователя сохраняется в БД. См. `knowledge/ui-ux-stability.md`.
 - **Session Waiting State:** Промежуточное состояние "Ожидание сессии..." с пульсирующим жёлтым индикатором. См. `knowledge/ai-automation.md`.
 - **History Restore:** При восстановлении из History `claudeSessionId` передаётся напрямую в `createTab()` (Immediate Injection). См. `features/project-home.md`.
 

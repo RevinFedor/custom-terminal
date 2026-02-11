@@ -32,6 +32,7 @@ interface TimelineProps {
   sessionId: string | null;
   cwd: string;
   isActive?: boolean; // Claude is currently running
+  isVisible?: boolean; // New prop to control visibility from parent
 }
 
 // Truncate text for tooltip display
@@ -54,7 +55,7 @@ interface ForkMarker {
   entry_uuids: string[];  // Snapshot of all entry UUIDs at fork time
 }
 
-function Timeline({ tabId, sessionId, cwd, isActive = true }: TimelineProps) {
+function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: TimelineProps) {
   const [entries, setEntries] = useState<TimelineEntry[]>([]);
   const [forkMarkers, setForkMarkers] = useState<ForkMarker[]>([]);
   const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
@@ -383,7 +384,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true }: TimelineProps) {
       <div
         ref={containerRef}
         data-timeline
-        className="relative flex flex-col group transition-all duration-300"
+        className="relative flex flex-col group"
         style={{
           width: '24px',
           backgroundColor: isActive ? 'rgba(0, 0, 0, 0.2)' : 'rgba(40, 40, 40, 0.4)',
@@ -392,13 +393,14 @@ function Timeline({ tabId, sessionId, cwd, isActive = true }: TimelineProps) {
           height: '100%',
           zIndex: 40,
           opacity: isActive ? 1 : 0.6,
+          visibility: isVisible ? 'inherit' : 'hidden',
         }}
       >
         {/* Central Axis Line */}
         <div className="absolute left-1/2 top-0 bottom-0 w-[1px] bg-white/10 -translate-x-1/2 pointer-events-none" />
 
         {/* Segmented Hit-boxes */}
-        <div className="flex flex-col h-full w-full">
+        <div className="flex flex-col h-full w-full" style={{ opacity: isVisible ? 1 : 0 }}>
           {/* Plan mode marker at the very beginning (first entry is from a child session — chain started before visible entries) */}
           {entries.length > 0 && entries[0].sessionId && sessionBoundaries.length > 0 &&
             sessionBoundaries.some(b => b.childSessionId === entries[0].sessionId) &&
@@ -534,7 +536,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true }: TimelineProps) {
         </div>
 
         {/* Selection Range Indicator (active selection) */}
-        {selectionStartId && hoveredIndex !== null && (
+        {isVisible && selectionStartId && hoveredIndex !== null && (
           <div
             className="absolute left-0 right-0 pointer-events-none"
             style={{
@@ -548,7 +550,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true }: TimelineProps) {
         )}
 
         {/* Loading Range Indicator (blinking blue while IPC runs) */}
-        {copyingRange && (
+        {isVisible && copyingRange && (
           <div
             className="absolute left-0 right-0 pointer-events-none animate-pulse"
             style={{
@@ -563,7 +565,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true }: TimelineProps) {
         )}
 
         {/* Copied Range Animation (green success flash) */}
-        {copiedRange && (
+        {isVisible && copiedRange && (
           <div
             className="absolute left-0 right-0 pointer-events-none"
             style={{
@@ -578,7 +580,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true }: TimelineProps) {
         )}
 
         {/* Tooltip Portal with CSS Bridge */}
-        {activeTooltipIndex !== null && currentActiveEntry && tooltipPos && (
+        {isVisible && activeTooltipIndex !== null && currentActiveEntry && tooltipPos && (
           <TooltipPortal>
             {/* Outer wrapper — explicit height ensures bridge connects tooltip to entry */}
             <div
@@ -668,7 +670,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true }: TimelineProps) {
         )}
 
         {/* Context Menu */}
-        {contextMenu && (
+        {isVisible && contextMenu && (
           <TooltipPortal>
             <div
               style={{
@@ -721,7 +723,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true }: TimelineProps) {
         )}
 
         {/* Loading */}
-        {isLoading && entries.length === 0 && (
+        {isVisible && isLoading && entries.length === 0 && (
           <div className="absolute inset-0 flex items-center justify-center bg-black/20">
             <div className="w-1 h-1 bg-white animate-ping rounded-full" />
           </div>

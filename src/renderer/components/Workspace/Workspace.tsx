@@ -274,6 +274,9 @@ export default function Workspace() {
   // DEBUG: Uncomment to debug Timeline visibility
   // console.log('[Timeline Debug] showTimeline:', showTimeline, 'claudeSessionId:', claudeSessionId, 'commandType:', activeTab?.commandType, 'isRunning:', isCommandRunning);
 
+  // DEBUG: Track state changes
+  console.warn(`[Workspace:RENDER] currentView=${currentView} showTimeline=${showTimeline} activeTabId=${activeTab?.id} isCommandRunning=${isCommandRunning}`);
+
   return (
     <div className="flex-1 flex h-full overflow-hidden relative">
       {/* LEFT COLUMN: Tabs + Terminal/Home Area */}
@@ -378,13 +381,14 @@ export default function Workspace() {
       {/* RIGHT COLUMN: Toolbar + Notes + Resizer */}
       <div className="flex shrink-0 overflow-hidden relative" style={{ width: notesPanelWidth }}>
         {/* Timeline for Claude session navigation - correctly positioned LEFT of Resizer */}
-        {/* NOTE: No currentView check — Timeline stays visible on Home to prevent layout shift in right sidebar */}
+        {/* Timeline stays mounted to prevent layout shift, visibility controlled via prop */}
         {showTimeline && (
           <Timeline
             tabId={activeTab.id}
             sessionId={claudeSessionId}
             cwd={activeTab.cwd || currentProject.path}
             isActive={isCommandRunning}
+            isVisible={workspaceView === 'workspace' && currentView === 'terminal'}
           />
         )}
 

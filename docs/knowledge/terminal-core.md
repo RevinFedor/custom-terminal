@@ -1,6 +1,8 @@
-# Terminal Core & Shell Integration\n
-\n---\n## File: terminal-core.md\n
-# Fact: Reactive CWD Tracking (OSC 7)
+# Terminal Core & Shell Integration
+
+---
+
+## Fact: Reactive CWD Tracking (OSC 7)
 
 ## Problem
 Отслеживание текущей рабочей директории (CWD) в терминале через системные вызовы (`lsof`, `pgrep`, `ps`) является тяжелой и ненадежной операцией. Она вызывает задержки (Event Loop lag) и может возвращать неактуальные данные из-за асинхронности процессов.
@@ -35,8 +37,10 @@ term.onLineFeed(() => {
 - **Производительность:** Ноль системных вызовов к дереву процессов ОС.
 - **Надежность:** Работает даже если процесс Shell "завис" или занят (сообщение приходит от самой оболочки).
 - **Persistence:** Актуальный `cwd` всегда готов к сохранению в SQLite при закрытии приложения.
-\n---\n## File: terminal-core.md\n
-# ФАКТ: Shell Integration (OSC 133)
+
+---
+
+## ФАКТ: Shell Integration (OSC 133)
 
 ## Суть
 Протокол OSC 133 — это стандарт (популяризированный VS Code), позволяющий терминалу "общаться" с эмулятором через невидимые управляющие последовательности. Это позволяет эмулятору точно знать, когда команда началась, когда она выполняется и с каким кодом завершилась.
@@ -69,8 +73,10 @@ add-zsh-hook precmd __custom_precmd
 
 ## Почему это важно
 Это избавляет от необходимости использовать **Polling (pgrep)**. Мы получаем события мгновенно, что критично для плавного переключения UI элементов (например, Timeline истории Claude).
-\n---\n## File: terminal-core.md\n
-# Fact: Terminal Registry & Selection Sync
+
+---
+
+## Fact: Terminal Registry & Selection Sync
 
 Глобальный механизм синхронизации состояния терминалов `xterm.js` с UI-компонентами React.
 
@@ -88,8 +94,10 @@ add-zsh-hook precmd __custom_precmd
 
 ## 3. Очистка состояния
 При деактивации терминала (переключение вкладок или проектов) глобальный стейт `terminalSelection` принудительно очищается, чтобы избежать "фантомных" поисков по тексту из другого окна.
-\n---\n## File: terminal-core.md\n
-# Опыт: Переполнение буфера ввода TTY (PTY Buffer Overflow)
+
+---
+
+## Опыт: Переполнение буфера ввода TTY (PTY Buffer Overflow)
 
 ## Проблема
 При попытке вставить большой объем текста (например, промпт на 7KB или 200+ строк) напрямую в PTY через `term.write()`, текст обрывается. Gemini или другие CLI получают только часть данных (обычно первые ~4KB).
@@ -123,9 +131,9 @@ async function writeToPtySafe(term, data) {
 ## Код
 Реализовано в `src/main/main.js` внутри IPC-хендлера `terminal:input`. Автоматически применяется для любых данных длиннее 1024 байт.
 
-```
-\n---\n## File: terminal-core.md\n
-# Fix: Terminal Colors and Input (Truecolor & UTF-8)
+---
+
+## Fix: Terminal Colors and Input (Truecolor & UTF-8)
 
 ## 🛠 ОПЫТ: "Почему в AI CLI тусклые цвета и странный ввод?"
 
@@ -159,24 +167,19 @@ const ptyProcess = pty.spawn(shell, [], {
 Для стабильности отображения изменений после сборки (Production build) в главный процесс добавлен флаг:
 `app.commandLine.appendSwitch('disable-http-cache');`
 Это гарантирует, что Electron не будет использовать устаревшие ресурсы из внутреннего кэша.
-\n---\n## File: terminal-core.md\n
-# Experience: Terminal Resizing (Stale Closure Fix)
 
-## Проблема
-Терминал переставал реагировать на изменение размеров окна или перемещение разделителя (Resizer). В консоли логи показывали, что `ResizeObserver` срабатывал, но свойство `active` всегда было `false`, из-за чего функция подстройки под размер (`safeFit()`) игнорировалась.
+---
 
-## Причина
-Колбэк `ResizeObserver` инициализировался внутри `useEffect` один раз при монтировании. Он захватывал начальное значение переменной `active` (обычно `false`) в своё замыкание (closure). При изменении состояния компонента колбэк продолжал использовать старое значение, не зная, что вкладка стала активной.
+## Resizing: Управление размером и активностью
+Управление размером терминала осуществляется через `ResizeObserver`. Для стабильности и предотвращения лишних вычислений используются следующие механизмы:
 
-## Решение
-Использование `useRef` для хранения актуального состояния активности:
-1. Создан `activeRef = useRef(active)`.
-2. Добавлен `useEffect`, который синхронизирует `activeRef.current = active` при каждом рендере.
-3. Внутри колбэка `ResizeObserver` проверка выполняется через `activeRef.current`.
+1.  **Ref-защита от Stale Closure:** Колбэк `ResizeObserver` использует `activeRef.current`, который синхронизируется с состоянием активности терминала.
+2.  **effectiveActive Logic:** Терминал реагирует на ресайз и вызывает `safeFit()` только когда он действительно виден пользователю (`effectiveActive`). Это исключает «прыжки» и ошибки FitAddon, когда контейнер имеет нулевой размер или скрыт за Dashboard/Home.
+3.  **Delayed Fit:** При активации терминала (`visibility: hidden` -> `inherit`), вызов `safeFit` оборачивается в `requestAnimationFrame`. Это дает браузеру время отрисовать контейнер и гарантирует, что `getBoundingClientRect()` вернет актуальные размеры для xterm.js.
 
 ```typescript
-const activeRef = useRef(active);
-useEffect(() => { activeRef.current = active; }, [active]);
+const activeRef = useRef(effectiveActive);
+useEffect(() => { activeRef.current = effectiveActive; }, [effectiveActive]);
 
 // Внутри ResizeObserver
 if (activeRef.current) {
@@ -185,9 +188,11 @@ if (activeRef.current) {
 ```
 
 ## Урок для проекта
-При использовании сторонних API с колбэками (ResizeObserver, IntersectionObserver, события на `window`) всегда проверяйте состояние через `Refs`, чтобы избежать проблем с "протухшими" данными в замыканиях.
-\n---\n## File: terminal-core.md\n
-# Fix: Process Status Polling → OSC 133 Event-Driven
+Никогда не вызывайте методы подстройки размера (`fit()`) или фокуса (`focus()`) у терминала, если его контейнер скрыт или имеет `visibility: hidden`. Это может привести к некорректным расчетам ширины символов в xterm.js.
+
+---
+
+## Fix: Process Status Polling → OSC 133 Event-Driven
 
 ## Problem
 Noted Terminal was causing extreme CPU load on `sysmond` (334% CPU) due to constant polling for process status.

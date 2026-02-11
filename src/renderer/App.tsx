@@ -321,15 +321,6 @@ function App() {
   const { toggleResearch } = useResearchStore();
   const projectTabsFontSize = useUIStore((s) => s.projectTabsFontSize);
 
-  // DEBUG: Track view changes that cause Workspace unmount/mount
-  const prevViewRef = useRef(view);
-  useEffect(() => {
-    if (prevViewRef.current !== view) {
-      console.warn(`[App:VIEW_CHANGED] ${prevViewRef.current} → ${view}`);
-      prevViewRef.current = view;
-    }
-  }, [view]);
-
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [projectContextMenu, setProjectContextMenu] = useState<{ projectId: string; x: number; y: number } | null>(null);
   const [projectEmptyZoneHovered, setProjectEmptyZoneHovered] = useState(false);
@@ -878,7 +869,12 @@ function App() {
           {openProjectsList.map(([projectId, workspace], index) => {
             const project = projects[projectId];
             if (!project) return null;
-            const isActive = activeProjectId === projectId;
+            
+            // Project is active only if:
+            // 1. We are in workspace view (not dashboard)
+            // 2. It matches activeProjectId
+            // 3. We are in terminal view (not project home)
+            const isActive = view === 'workspace' && activeProjectId === projectId && workspace.currentView === 'terminal';
             const isLast = index === openProjectsList.length - 1;
 
             // Count active processes in this project
