@@ -7,11 +7,12 @@ import { compressLogs } from '../../utils/compressLogs';
 const { ipcRenderer } = window.require('electron');
 
 export default function ProjectToolbar() {
-  const { currentView, setCurrentView, showToast } = useUIStore();
-  const { activeProjectId, openProjects, clearInterruptedState, setTabCommandType, createBrowserTab } = useWorkspaceStore();
+  const { showToast } = useUIStore();
+  const { activeProjectId, openProjects, clearInterruptedState, setTabCommandType, createBrowserTab, setProjectView } = useWorkspaceStore();
 
   const [isCompressing, setIsCompressing] = useState(false);
 
+  const currentView = activeProjectId ? openProjects.get(activeProjectId)?.currentView || 'terminal' : 'terminal';
   const isHomeActive = currentView === 'home';
 
   // Get interrupted tabs for CURRENT project only
@@ -125,7 +126,7 @@ export default function ProjectToolbar() {
     >
       {/* Home Button */}
       <button
-        onClick={() => setCurrentView(isHomeActive ? 'terminal' : 'home')}
+        onClick={() => activeProjectId && setProjectView(activeProjectId, isHomeActive ? 'terminal' : 'home')}
         style={buttonStyle(isHomeActive)}
         onMouseEnter={(e) => handleMouseEnter(e, isHomeActive)}
         onMouseLeave={(e) => handleMouseLeave(e, isHomeActive)}
@@ -152,7 +153,7 @@ export default function ProjectToolbar() {
         onClick={() => {
           if (activeProjectId) {
             createBrowserTab(activeProjectId);
-            setCurrentView('terminal');
+            setProjectView(activeProjectId, 'terminal');
           }
         }}
         style={buttonStyle(false)}

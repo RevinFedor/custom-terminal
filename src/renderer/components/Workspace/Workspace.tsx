@@ -56,9 +56,8 @@ export default function Workspace() {
   const closeFilePreview = useUIStore((s) => s.closeFilePreview);
   const openNotesEditor = useUIStore((s) => s.openNotesEditor);
   const notesEditorOpen = useUIStore((s) => s.notesEditorOpen);
-  const currentView = useUIStore((s) => s.currentView);
-  const setCurrentView = useUIStore((s) => s.setCurrentView);
   const notesPanelWidth = useUIStore((s) => s.notesPanelWidth);
+  const setProjectView = useWorkspaceStore((s) => s.setProjectView);
   const [showSearch, setShowSearch] = useState(false);
   const [searchText, setSearchText] = useState('');
   const [searchResults, setSearchResults] = useState({ resultIndex: 0, resultCount: 0 });
@@ -68,6 +67,9 @@ export default function Workspace() {
   const activeProject = getActiveProject();
   const currentProject = activeProjectId ? projects[activeProjectId] : null;
 
+  // Per-project currentView
+  const currentView = activeProject?.currentView || 'terminal';
+
   // Get active tab early for process checking
   const activeTab = activeProject?.activeTabId
     ? activeProject.tabs.get(activeProject.activeTabId)
@@ -75,10 +77,10 @@ export default function Workspace() {
 
   // Auto-switch to Home when all tabs are closed
   useEffect(() => {
-    if (activeProject && activeProject.tabs.size === 0 && currentView === 'terminal') {
-      setCurrentView('home');
+    if (activeProject && activeProjectId && activeProject.tabs.size === 0 && currentView === 'terminal') {
+      setProjectView(activeProjectId, 'home');
     }
-  }, [activeProject?.tabs.size, currentView, setCurrentView]);
+  }, [activeProject?.tabs.size, currentView, activeProjectId, setProjectView]);
 
   // Restore file preview when switching projects
   useEffect(() => {

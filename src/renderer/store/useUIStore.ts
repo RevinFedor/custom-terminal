@@ -18,8 +18,6 @@ export type ThinkingLevel = 'NONE' | 'LOW' | 'MEDIUM' | 'HIGH';
 
 export type ChatType = 'research' | 'compact' | 'description';
 
-export type WorkspaceView = 'terminal' | 'home';
-
 
 
 export interface ChatTypeSettings {
@@ -242,9 +240,6 @@ interface UIStore {
   tabNotesPaddingY: number;
   setTabNotesPaddingY: (px: number) => void;
 
-  // Workspace View (terminal or project home)
-  currentView: WorkspaceView;
-  setCurrentView: (view: WorkspaceView) => void;
 }
 
 
@@ -884,10 +879,6 @@ export const useUIStore = create<UIStore>((set, get) => ({
     set({ tabNotesPaddingY: clamped });
     localStorage.setItem('noted-terminal-tab-notes-padding-y', String(clamped));
   },
-
-  // Workspace View
-  currentView: 'terminal',
-  setCurrentView: (view) => set({ currentView: view }),
 
   // Focus Area
   activeArea: 'workspace',

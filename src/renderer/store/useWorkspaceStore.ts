@@ -56,6 +56,7 @@ interface ProjectWorkspace {
   tabCounter: number;
   sidebarOpen: boolean;
   openFilePath: string | null;
+  currentView: 'terminal' | 'home'; // Per-project view state (Home vs Terminal)
 }
 
 interface SessionState {
@@ -152,6 +153,9 @@ interface WorkspaceStore {
   // Helpers
   getActiveTab: (projectId: string) => Tab | null;
   getActiveProject: () => ProjectWorkspace | null;
+
+  // Per-project view (Home vs Terminal)
+  setProjectView: (projectId: string, view: 'terminal' | 'home') => void;
 
   // Sidebar state (per-project)
   setSidebarOpen: (projectId: string, open: boolean) => void;
@@ -445,7 +449,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         tabHistory: [],
         tabCounter: 0, // Start from 0 for new projects
         sidebarOpen: projectData?.sidebarOpen || false,
-        openFilePath: projectData?.openFilePath || null
+        openFilePath: projectData?.openFilePath || null,
+        currentView: 'terminal'
       };
       openProjects.set(projectId, newWorkspace);
       
@@ -1393,6 +1398,16 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     // Use sendSync for immediate save during shutdown
     ipcRenderer.sendSync('app:setStateSync', { key: SESSION_KEY, value: sessionState });
     console.log('[Store] Session saved immediately:', sessionState);
+  },
+
+  // Per-project view (Home vs Terminal)
+  setProjectView: (projectId, view) => {
+    const { openProjects } = get();
+    const workspace = openProjects.get(projectId);
+    if (workspace) {
+      workspace.currentView = view;
+      set({ openProjects: new Map(openProjects) });
+    }
   },
 
   // Sidebar state (per-project)

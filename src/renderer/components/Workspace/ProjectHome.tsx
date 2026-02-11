@@ -111,9 +111,9 @@ const TAB_COLORS: Record<TabColor, { bgColor: string; borderColor: string }> = {
 };
 
 export default function ProjectHome({ projectId }: ProjectHomeProps) {
-  const { openProjects, switchTab, createTab, closeTab } = useWorkspaceStore();
+  const { openProjects, switchTab, createTab, closeTab, setProjectView } = useWorkspaceStore();
   const { projects, updateProject } = useProjectsStore();
-  const { setCurrentView, showToast } = useUIStore();
+  const { showToast } = useUIStore();
   const tabNotesFontSize = useUIStore((s) => s.tabNotesFontSize);
   const tabNotesPaddingX = useUIStore((s) => s.tabNotesPaddingX);
   const tabNotesPaddingY = useUIStore((s) => s.tabNotesPaddingY);
@@ -172,7 +172,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
       }
     }
 
-    setCurrentView('terminal');
+    setProjectView(projectId, 'terminal');
     await createTab(projectId, entry.name, entry.cwd, {
       color: (entry.color || undefined) as TabColor | undefined,
       notes: entry.notes || undefined,
@@ -205,7 +205,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
       }
     }
 
-    setCurrentView('terminal');
+    setProjectView(projectId, 'terminal');
     await createTab(projectId, entry.name || 'tab', entry.cwd || project?.path || '/', {
       color: (entry.color || undefined) as TabColor | undefined,
       notes: entry.notes || undefined,
@@ -234,7 +234,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
   const handleCreateTab = async () => {
     if (project) {
       await createTab(projectId, undefined, project.path);
-      setCurrentView('terminal');
+      setProjectView(projectId, 'terminal');
     }
   };
 
@@ -325,7 +325,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
 
   const handleTabClick = (tabId: string) => {
     switchTab(projectId, tabId);
-    setCurrentView('terminal');
+    setProjectView(projectId, 'terminal');
   };
 
   const getFolderName = (pathStr: string) => {
