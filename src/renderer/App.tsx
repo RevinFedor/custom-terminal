@@ -3,6 +3,7 @@ import { useWorkspaceStore, isTabInterrupted } from './store/useWorkspaceStore';
 import { useProjectsStore } from './store/useProjectsStore';
 import { useUIStore } from './store/useUIStore';
 import { useResearchStore } from './store/useResearchStore';
+import { usePromptsStore } from './store/usePromptsStore';
 import Dashboard from './components/Dashboard/Dashboard';
 import Workspace from './components/Workspace/Workspace';
 import ToastContainer from './components/UI/Toast';
@@ -470,10 +471,11 @@ function App() {
     }
   };
 
-  // Load projects and restore session ONCE on mount
+  // Load projects, AI prompts, and restore session ONCE on mount
   useEffect(() => {
     loadProjects();
     restoreSession();
+    usePromptsStore.getState().loadPrompts();
   }, []); // Empty deps = only on mount
 
   // Listen for draft project events from ProjectHome
@@ -785,10 +787,10 @@ function App() {
         return;
       }
 
-      // Cmd+, - Open Settings Modal
+      // Cmd+, - Toggle Settings Modal
       if (e.metaKey && e.code === 'Comma') {
         e.preventDefault();
-        setSettingsOpen(true);
+        setSettingsOpen(prev => !prev);
         return;
       }
 
@@ -821,24 +823,30 @@ function App() {
     // Handle Context Menu commands from main process
     const handleContextMenuCommand = (_: any, cmd: string, data?: any) => {
       console.log('[ContextMenu] Command received:', cmd);
-      if (cmd === 'gemini-research') {
-        // Trigger Research - same as clicking "Research Selection" button
+      if (cmd === 'ai-prompt') {
+        // Dynamic AI prompt — data is the promptId
+        const promptId = data as string;
         const terminalSelection = useUIStore.getState().terminalSelection;
-        console.log('[ContextMenu] Selection:', terminalSelection ? terminalSelection.slice(0, 50) : 'EMPTY');
+        console.log('[ContextMenu] AI prompt:', promptId, 'Selection:', terminalSelection ? terminalSelection.slice(0, 50) : 'EMPTY');
         if (terminalSelection) {
-          // Use store to trigger research (survives panel mount)
+          useResearchStore.getState().triggerResearch(promptId);
+          console.log('[ContextMenu] Triggered', promptId, 'via store');
+        } else {
+          showToast('Select text in terminal first', 'error');
+        }
+      } else if (cmd === 'gemini-research') {
+        // Legacy fallback
+        const terminalSelection = useUIStore.getState().terminalSelection;
+        if (terminalSelection) {
           useResearchStore.getState().triggerResearch('research');
-          console.log('[ContextMenu] Triggered research via store');
         } else {
           showToast('Select text in terminal first', 'error');
         }
       } else if (cmd === 'gemini-compact') {
-        // Trigger Compact - summarize session
+        // Legacy fallback
         const terminalSelection = useUIStore.getState().terminalSelection;
-        console.log('[ContextMenu] Compact selection:', terminalSelection ? terminalSelection.slice(0, 50) : 'EMPTY');
         if (terminalSelection) {
           useResearchStore.getState().triggerResearch('compact');
-          console.log('[ContextMenu] Triggered compact via store');
         } else {
           showToast('Select text in terminal first', 'error');
         }

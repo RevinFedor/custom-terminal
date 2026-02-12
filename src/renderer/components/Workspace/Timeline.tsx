@@ -4,6 +4,7 @@ import { Maximize2, Copy, Minimize2 } from 'lucide-react';
 import { terminalRegistry } from '../../utils/terminalRegistry';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
+import { usePromptsStore } from '../../store/usePromptsStore';
 
 const { ipcRenderer, clipboard } = window.require('electron');
 
@@ -71,6 +72,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
   const [visibleEntryIndices, setVisibleEntryIndices] = useState<Set<number>>(new Set());
   const [unreachableIndices, setUnreachableIndices] = useState<Set<number>>(new Set());
   const [clickedState, setClickedState] = useState<{ index: number; status: 'loading' | 'failed' } | null>(null);
+  const [rewindState, setRewindState] = useState<{ index: number; phase: 'compacting' | 'rewinding' | 'pasting' | 'done' } | null>(null);
 
   const notesPanelWidth = useUIStore(state => state.notesPanelWidth);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -456,17 +458,110 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
     return () => window.removeEventListener('click', handleClickOutside);
   }, [isExpanded]);
 
-  const handleOpenHistoryMenu = async (entry: TimelineEntry) => {
+  const handleRewind = async (entry: TimelineEntry) => {
     setContextMenu(null);
-    console.warn('[Restore:History] Sending open-history-menu for tab:', tabId, 'entry:', entry.uuid);
+    if (!sessionId) return;
+
+    const entryIndex = entries.findIndex(e => e.uuid === entry.uuid);
+    if (entryIndex === -1) return;
+
+    // Calculate targetIndex: position in user-only list for TUI menu navigation
+    const userEntries = entries.filter(e => e.type === 'user');
+    const targetIndex = userEntries.findIndex(e => e.uuid === entry.uuid);
+    if (targetIndex === -1) return;
+
+    console.warn('[Restore:Rewind] Starting rewind to entry', targetIndex, '/', userEntries.length, '- uuid:', entry.uuid);
+
+    // Phase 1: Compact entries being lost (from next entry to end)
+    let compactText = '';
+    // Always compact from clicked entry to end — copy-range expands to include
+    // Claude's response after each user message. Even for the last entry,
+    // Claude's response is included and will be compacted.
+    setRewindState({ index: entryIndex, phase: 'compacting' });
+
     try {
-      const result = await ipcRenderer.invoke('claude:open-history-menu', tabId);
-      console.warn('[Restore:History] Result:', result.success ? 'OK' : 'FAIL', 'rawLength:', result.rawLength || 0);
-      if (result.cleanText) {
-        console.warn('[Restore:History] Clean text:', result.cleanText.substring(0, 300));
+      const rangeResult = await ipcRenderer.invoke('claude:copy-range', {
+        sessionId,
+        cwd,
+        startUuid: entry.uuid,
+        endUuid: entries[entries.length - 1].uuid
+      });
+
+      if (rangeResult.success && rangeResult.content) {
+        console.warn('[Restore:Rewind] Range copied, length:', rangeResult.content.length);
+
+        // Compact via Gemini using rewind prompt
+        const { getPromptById, rewindPromptId } = usePromptsStore.getState();
+        const promptConfig = getPromptById(rewindPromptId);
+
+        if (promptConfig) {
+          const apiKey = (typeof process !== 'undefined' && process.env?.GEMINI_API_KEY) || 'REDACTED_GEMINI_KEY';
+          const model = promptConfig.model;
+          const fullPrompt = promptConfig.content + rangeResult.content;
+
+          const requestBody: any = {
+            contents: [{ parts: [{ text: fullPrompt }] }],
+            ...(model.includes('gemini-3') || model.includes('gemini-2.5') ? {
+              tools: [{ googleSearch: {} }]
+            } : {})
+          };
+
+          if (model.includes('gemini-3') && promptConfig.thinkingLevel !== 'NONE') {
+            requestBody.generationConfig = {
+              thinkingConfig: { thinkingLevel: promptConfig.thinkingLevel }
+            };
+          }
+
+          try {
+            console.warn('[Restore:Rewind] Sending to Gemini for compact, model:', model);
+            const response = await fetch(
+              `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
+              {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(requestBody)
+              }
+            );
+
+            const data = await response.json();
+            if (data.candidates?.[0]?.content?.parts?.[0]?.text) {
+              compactText = data.candidates[0].content.parts[0].text;
+              console.warn('[Restore:Rewind] Compact ready, length:', compactText.length);
+            } else {
+              console.error('[Restore:Rewind] Gemini returned empty/blocked response');
+            }
+          } catch (geminiErr) {
+            console.error('[Restore:Rewind] Gemini compact failed:', geminiErr);
+          }
+        } else {
+          console.warn('[Restore:Rewind] No rewind prompt configured, skipping compact');
+        }
       }
-    } catch (err) {
-      console.error('[Restore:History] IPC error:', err);
+    } catch (rangeErr) {
+      console.error('[Restore:Rewind] Copy range failed:', rangeErr);
+    }
+
+    // Phase 2: Execute rewind in TUI + paste compact (all in main process via writeToPtySafe + \r)
+    setRewindState({ index: entryIndex, phase: 'rewinding' });
+
+    try {
+      const rewindResult = await ipcRenderer.invoke('claude:open-history-menu', {
+        tabId,
+        targetIndex,
+        targetText: entry.content.substring(0, 40),
+        pasteAfter: compactText || undefined
+      });
+      console.warn('[Restore:Rewind] Rewind result:', rewindResult.success ? 'OK' : 'FAIL',
+        'cursor:', rewindResult.cursorIndex, 'target:', rewindResult.targetIndex,
+        'compactPasted:', !!compactText);
+
+      // Success flash
+      setRewindState({ index: entryIndex, phase: 'done' });
+      setTimeout(() => setRewindState(null), 1200);
+
+    } catch (rewindErr) {
+      console.error('[Restore:Rewind] Rewind IPC failed:', rewindErr);
+      setRewindState(null);
     }
   };
 
@@ -742,6 +837,27 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
           />
         )}
 
+        {/* Rewind Progress Indicator */}
+        {isVisible && rewindState && entries.length > 0 && (
+          <div
+            className="absolute left-0 right-0 pointer-events-none animate-pulse"
+            style={{
+              top: `${rewindState.index / entries.length * 100}%`,
+              height: rewindState.phase === 'compacting'
+                ? `${(entries.length - rewindState.index) / entries.length * 100}%`
+                : `${Math.max(1, 100 / entries.length)}%`,
+              backgroundColor: rewindState.phase === 'done'
+                ? 'rgba(34, 197, 94, 0.25)'
+                : rewindState.phase === 'compacting'
+                  ? 'rgba(245, 158, 11, 0.15)'
+                  : 'rgba(168, 85, 247, 0.15)',
+              borderTop: `1px solid ${rewindState.phase === 'done' ? 'rgba(34, 197, 94, 0.6)' : rewindState.phase === 'compacting' ? 'rgba(245, 158, 11, 0.5)' : 'rgba(168, 85, 247, 0.5)'}`,
+              borderBottom: `1px solid ${rewindState.phase === 'done' ? 'rgba(34, 197, 94, 0.6)' : rewindState.phase === 'compacting' ? 'rgba(245, 158, 11, 0.5)' : 'rgba(168, 85, 247, 0.5)'}`,
+              boxShadow: `0 0 12px ${rewindState.phase === 'done' ? 'rgba(34, 197, 94, 0.4)' : rewindState.phase === 'compacting' ? 'rgba(245, 158, 11, 0.3)' : 'rgba(168, 85, 247, 0.3)'}`,
+            }}
+          />
+        )}
+
         {/* Tooltip Portal with CSS Bridge */}
         {isVisible && activeTooltipIndex !== null && currentActiveEntry && tooltipPos && (
           <TooltipPortal>
@@ -889,14 +1005,14 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
                   </button>
                   <div className="border-t border-white/10 my-1" />
                   <button
-                    className={`w-full text-left px-3 py-2 text-xs rounded transition-colors ${isActive ? 'text-amber-400 hover:bg-amber-600/20 cursor-pointer' : 'text-white/20 cursor-not-allowed'}`}
-                    disabled={!isActive}
+                    className={`w-full text-left px-3 py-2 text-xs rounded transition-colors ${isActive && !rewindState ? 'text-amber-400 hover:bg-amber-600/20 cursor-pointer' : 'text-white/20 cursor-not-allowed'}`}
+                    disabled={!isActive || !!rewindState}
                     onClick={(e) => {
                       e.stopPropagation();
-                      if (isActive) handleOpenHistoryMenu(contextMenu.entry);
+                      if (isActive && !rewindState) handleRewind(contextMenu.entry);
                     }}
                   >
-                    Откатиться
+                    {rewindState ? (rewindState.phase === 'compacting' ? 'Компакт...' : rewindState.phase === 'rewinding' ? 'Откат...' : 'Вставка...') : 'Откатиться'}
                   </button>
                 </>
               ) : (

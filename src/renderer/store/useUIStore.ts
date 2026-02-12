@@ -16,25 +16,6 @@ export type AIModel = 'gemini-3-flash-preview' | 'gemini-3-pro-preview';
 
 export type ThinkingLevel = 'NONE' | 'LOW' | 'MEDIUM' | 'HIGH';
 
-export type ChatType = 'research' | 'compact' | 'description';
-
-
-
-export interface ChatTypeSettings {
-
-  model: AIModel;
-
-  thinkingLevel: ThinkingLevel;
-
-  prompt: string;
-
-}
-
-
-
-export type ChatSettingsMap = Record<ChatType, ChatTypeSettings>;
-
-
 
 interface DocPromptSettings {
 
@@ -110,13 +91,6 @@ interface UIStore {
 
 
 
-  // Research Prompt (system prompt for Research Selection)
-
-  researchPrompt: string;
-
-  setResearchPrompt: (prompt: string) => void;
-
-
 
   // Claude Default Prompt toggle
   claudeDefaultPromptEnabled: boolean;
@@ -132,15 +106,6 @@ interface UIStore {
 
   setDocPromptInlineContent: (content: string) => void;
 
-
-
-  // Per-chat-type settings (research, compact, etc.)
-
-  chatSettings: ChatSettingsMap;
-
-  getChatSettings: (type: ChatType) => ChatTypeSettings;
-
-  setChatSettings: (type: ChatType, settings: Partial<ChatTypeSettings>) => void;
 
 
 
@@ -420,93 +385,6 @@ const saveThinkingLevel = (level: ThinkingLevel) => {
 
 
 
-const DEFAULT_RESEARCH_PROMPT = 'вот моя проблема нужно чтобы ты понял что за проблема и на reddit поискал обсуждения. Не ограничивайся категориями. Проблема: ';
-
-
-
-const DEFAULT_COMPACT_PROMPT = 'Проанализируй всю нашу текущую сессию и составь структурированное резюме для переноса контекста в новый чат, включив в него: изначальную цель; список всех созданных файлов с пояснением, почему мы выбрали именно такую структуру и эти файлы; краткий отчет о том, что работает; детальный разбор того, что НЕ получилось, с указанием конкретных причин ошибок (почему выбранные решения не сработали); текущее состояние кода и пошаговый план дальнейших действий — оформи это всё одним компактным сообщением, которое я смогу скопировать и отправить тебе в новом чате для полного восстановления контекста.\n\nВот текст сессии:\n';
-
-
-
-const DEFAULT_DESCRIPTION_PROMPT = '1-2 предложения: что сделано. Без маркдауна, без вступлений.\n\n';
-
-const DEFAULT_CHAT_SETTINGS: ChatSettingsMap = {
-
-  research: {
-
-    model: 'gemini-3-flash-preview',
-
-    thinkingLevel: 'HIGH',
-
-    prompt: DEFAULT_RESEARCH_PROMPT
-
-  },
-
-  compact: {
-
-    model: 'gemini-3-flash-preview',
-
-    thinkingLevel: 'HIGH',
-
-    prompt: DEFAULT_COMPACT_PROMPT
-
-  },
-
-  description: {
-
-    model: 'gemini-3-flash-preview',
-
-    thinkingLevel: 'NONE',
-
-    prompt: DEFAULT_DESCRIPTION_PROMPT
-
-  }
-
-};
-
-const loadChatSettings = (): ChatSettingsMap => {
-  try {
-    const saved = localStorage.getItem('noted-terminal-chat-settings');
-    if (saved) {
-      const parsed = JSON.parse(saved);
-      // Merge with defaults to ensure all types have settings
-      return {
-        research: { ...DEFAULT_CHAT_SETTINGS.research, ...parsed.research },
-        compact: { ...DEFAULT_CHAT_SETTINGS.compact, ...parsed.compact },
-        description: { ...DEFAULT_CHAT_SETTINGS.description, ...parsed.description }
-      };
-    }
-  } catch (e) {
-    console.error('Failed to load chat settings:', e);
-  }
-  return DEFAULT_CHAT_SETTINGS;
-};
-
-const saveChatSettings = (settings: ChatSettingsMap) => {
-  try {
-    localStorage.setItem('noted-terminal-chat-settings', JSON.stringify(settings));
-  } catch (e) {
-    console.error('Failed to save chat settings:', e);
-  }
-};
-
-const loadResearchPrompt = (): string => {
-  try {
-    const saved = localStorage.getItem('noted-terminal-research-prompt');
-    if (saved) return saved;
-  } catch (e) {
-    console.error('Failed to load research prompt:', e);
-  }
-  return DEFAULT_RESEARCH_PROMPT;
-};
-
-const saveResearchPrompt = (prompt: string) => {
-  try {
-    localStorage.setItem('noted-terminal-research-prompt', prompt);
-  } catch (e) {
-    console.error('Failed to save research prompt:', e);
-  }
-};
 
 const DEFAULT_DOC_PROMPT_PATH = '/Users/fedor/Global-Templates/🧩 Code-Patterns/документация/docs-rules.prompt.md';
 
@@ -546,9 +424,7 @@ const initialFontSettings = loadFontSettings();
 const initialEditorSettings = loadEditorSettings();
 const initialModel = loadSelectedModel();
 const initialThinkingLevel = loadThinkingLevel();
-const initialResearchPrompt = loadResearchPrompt();
 const initialDocPrompt = loadDocPrompt();
-const initialChatSettings = loadChatSettings();
 
 const loadClaudeDefaultPromptEnabled = (): boolean => {
   try {
@@ -626,13 +502,6 @@ export const useUIStore = create<UIStore>((set, get) => ({
     saveThinkingLevel(level);
   },
 
-  // Research Prompt
-  researchPrompt: initialResearchPrompt,
-  setResearchPrompt: (prompt) => {
-    set({ researchPrompt: prompt });
-    saveResearchPrompt(prompt);
-  },
-
   // Claude Default Prompt toggle
   claudeDefaultPromptEnabled: initialClaudeDefaultPromptEnabled,
   setClaudeDefaultPromptEnabled: (enabled) => {
@@ -659,21 +528,6 @@ export const useUIStore = create<UIStore>((set, get) => ({
     const updated = { ...current, inlineContent };
     set({ docPrompt: updated });
     saveDocPrompt(updated);
-  },
-
-  // Per-chat-type settings
-  chatSettings: initialChatSettings,
-  getChatSettings: (type) => {
-    return get().chatSettings[type];
-  },
-  setChatSettings: (type, settings) => {
-    const current = get().chatSettings;
-    const updated = {
-      ...current,
-      [type]: { ...current[type], ...settings }
-    };
-    set({ chatSettings: updated });
-    saveChatSettings(updated);
   },
 
   // Terminal Selection
@@ -887,4 +741,7 @@ export const useUIStore = create<UIStore>((set, get) => ({
 
 if (typeof window !== 'undefined') {
   (window as any).useUIStore = useUIStore;
+  // Cleanup: legacy localStorage keys migrated to SQLite ai_prompts table
+  localStorage.removeItem('noted-terminal-chat-settings');
+  localStorage.removeItem('noted-terminal-research-prompt');
 }

@@ -7,13 +7,14 @@ export interface Message {
   timestamp: number;
 }
 
-export type ChatType = 'research' | 'compact' | 'description';
+// ChatType is now a string to support dynamic AI prompts (was: 'research' | 'compact' | 'description')
+export type ChatType = string;
 
 export interface Conversation {
   id: string;
   title: string; // First user message preview
   messages: Message[];
-  type: ChatType; // Type of chat (research, compact, etc.)
+  type: ChatType; // Type of chat — matches AIPrompt.id
   createdAt: number;
   updatedAt: number;
 }

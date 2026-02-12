@@ -256,19 +256,20 @@ function NotesEditorModal() {
               style={{
                 flex: 1,
                 minHeight: 0,
-                display: 'flex',
-                flexDirection: 'column',
+                position: 'relative',
                 backgroundColor: '#1e1e2e'
               }}
             >
-              <MarkdownEditor
-                content={content}
-                onChange={handleChange}
-                fontSize={14}
-                wordWrap={wordWrap}
-                foldStateKey={`notes:${notesEditorProjectId}`}
-                onEditorView={handleEditorView}
-              />
+              <div style={{ position: 'absolute', inset: 0 }}>
+                <MarkdownEditor
+                  content={content}
+                  onChange={handleChange}
+                  fontSize={14}
+                  wordWrap={wordWrap}
+                  foldStateKey={`notes:${notesEditorProjectId}`}
+                  onEditorView={handleEditorView}
+                />
+              </div>
             </div>
           </motion.div>
         </>

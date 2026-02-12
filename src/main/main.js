@@ -374,25 +374,46 @@ function createWindow() {
 
 // Context Menu IPC
 ipcMain.on('show-terminal-context-menu', async (event, { hasSelection, prompts, tabId, projectId }) => {
-  const template = [
-    {
-      label: '🔍 Research (Reddit)',
+  // Load dynamic AI prompts from DB
+  let aiPrompts = [];
+  try {
+    aiPrompts = projectManager.getAIPrompts().filter(p => p.showInContextMenu);
+  } catch (e) {
+    console.error('[ContextMenu] Failed to load AI prompts:', e);
+  }
+
+  const template = [];
+
+  // Dynamic AI prompt items
+  for (const aiPrompt of aiPrompts) {
+    template.push({
+      label: `${aiPrompt.name}`,
       enabled: hasSelection,
-      click: () => { event.sender.send('context-menu-command', 'gemini-research'); }
-    },
-    {
-      label: '📋 Compact (Резюме)',
+      click: () => { event.sender.send('context-menu-command', 'ai-prompt', aiPrompt.id); }
+    });
+  }
+
+  // Fallback if no AI prompts loaded
+  if (aiPrompts.length === 0) {
+    template.push({
+      label: '🔍 Research',
       enabled: hasSelection,
-      click: () => { event.sender.send('context-menu-command', 'gemini-compact'); }
-    },
-    { type: 'separator' },
-    {
-      label: '⭐ Add to Favorites',
-      enabled: !!(tabId && projectId),
-      click: () => { event.sender.send('context-menu-command', 'add-to-favorites-from-terminal', { tabId, projectId }); }
-    },
-    { type: 'separator' }
-  ];
+      click: () => { event.sender.send('context-menu-command', 'ai-prompt', 'research'); }
+    });
+    template.push({
+      label: '📋 Compact',
+      enabled: hasSelection,
+      click: () => { event.sender.send('context-menu-command', 'ai-prompt', 'compact'); }
+    });
+  }
+
+  template.push({ type: 'separator' });
+  template.push({
+    label: '⭐ Add to Favorites',
+    enabled: !!(tabId && projectId),
+    click: () => { event.sender.send('context-menu-command', 'add-to-favorites-from-terminal', { tabId, projectId }); }
+  });
+  template.push({ type: 'separator' });
 
   // Add Insert Prompt submenu
   if (prompts && prompts.length > 0) {
@@ -1007,61 +1028,258 @@ ipcMain.handle('claude:toggle-thinking', async (event, tabId) => {
   });
 });
 
-// Debug: Open history menu via Ctrl+C + Escape sequence, capture PTY output
-ipcMain.handle('claude:open-history-menu', async (event, tabId) => {
+// Open Rewind menu, navigate to target entry with arrow keys
+// Each arrow key confirmed via synchronized output (\x1b[?2026l) — no timers
+ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, targetText, pasteAfter }) => {
   const term = terminals.get(tabId);
   if (!term) return { success: false, error: 'no terminal' };
 
   const stripped = require('node:util').stripVTControlCharacters;
 
-  return new Promise((resolve) => {
-    let resolved = false;
+  // Helper: clean raw PTY buffer → readable text
+  function cleanBuffer(raw) {
+    const spaced = raw.replace(/\x1b\[(\d*)C/g, (_, n) => ' '.repeat(parseInt(n) || 1));
+    const normalized = spaced
+      .replace(/\x1b\[\d*[ABD]/g, '')
+      .replace(/\x1b\[\d+;\d+H/g, '\n');
+    return stripped(normalized);
+  }
 
-    // Step 1: Send Ctrl+C to cancel any current input
-    term.write('\x03');
+  // Helper: parse full Rewind menu (initial render) → { entries[], cursorIndex }
+  function parseMenu(cleanText) {
+    const allLines = cleanText.split(/[\r\n]+/).map(l => l.trim()).filter(Boolean);
+    let cursorIndex = -1;
+    const entries = [];
+    for (const line of allLines) {
+      if (/^[─]+$/.test(line)) continue;
+      if (line === 'Rewind') continue;
+      if (line.startsWith('Restore and fork')) continue;
+      if (line.startsWith('Enter to continue')) continue;
+      if (line.startsWith('❯')) {
+        const text = line.replace(/^❯\s*/, '').replace(/^\(current\)\s*/, '').trim();
+        cursorIndex = entries.length;
+        if (text) entries.push(text);
+        continue;
+      }
+      if (line.length > 2) entries.push(line);
+    }
+    return { entries, cursorIndex };
+  }
 
-    setTimeout(() => {
-      let buffer = '';
+  // Helper: find cursor position in partial re-render (arrow response)
+  // Arrow responses are diffs — only changed lines, not full menu
+  // Match ❯ text against known entries list
+  function findCursorInDiff(cleanText, knownEntries) {
+    const lines = cleanText.split(/[\r\n]+/).map(l => l.trim()).filter(Boolean);
+    for (const line of lines) {
+      if (!line.startsWith('❯')) continue;
+      const text = line.replace(/^❯\s*/, '').trim();
+      if (text === '(current)' || !text) return knownEntries.length; // at (current)
+      // Match against known entries by prefix (entries are truncated with …)
+      for (let i = 0; i < knownEntries.length; i++) {
+        const prefix = knownEntries[i].substring(0, 30);
+        if (text.startsWith(prefix) || knownEntries[i].startsWith(text.substring(0, 30))) return i;
+      }
+    }
+    return -1;
+  }
 
-      // Step 2: Subscribe to PTY output to capture response
+  // Helper: send key → wait for \x1b[?2026l → return cleaned text
+  function sendAndCapture(key, timeout = 3000) {
+    return new Promise((resolve, reject) => {
+      let buf = '';
       const sub = term.onData((data) => {
-        buffer += data;
+        buf += data;
+        if (buf.includes('\x1b[?2026l')) {
+          sub.dispose();
+          resolve(cleanBuffer(buf));
+        }
+      });
+      term.write(key);
+      setTimeout(() => { sub.dispose(); reject(new Error('sync timeout')); }, timeout);
+    });
+  }
+
+  try {
+    // Step 1: Ctrl+C to cancel current input
+    term.write('\x03');
+    await new Promise(r => setTimeout(r, 50));
+
+    // Step 2: First Escape (prep)
+    term.write('\x1b');
+    await new Promise(r => setTimeout(r, 100));
+
+    // Step 3: Second Escape → Rewind menu opens (sync output = full render)
+    const menuText = await sendAndCapture('\x1b');
+    const initialState = parseMenu(menuText);
+    const knownEntries = initialState.entries;
+    let cursorPos = initialState.cursorIndex;
+
+    console.log('[Restore:History] Menu opened: ' + knownEntries.length + ' entries, cursor=' + cursorPos);
+    knownEntries.forEach((entry, i) => {
+      const marker = i === cursorPos ? ' ❯' : '';
+      console.log('  [' + i + ']' + marker + ' ' + entry.substring(0, 200));
+    });
+
+    // Step 4: Navigate to target entry
+    // Cursor starts at (current) = after last entry (cursorPos = entries.length)
+    // Primary: match by targetText (robust — timeline and menu may have different entry counts)
+    // Fallback: numeric targetIndex (clamped to valid range)
+    let target;
+    if (targetText && typeof targetText === 'string') {
+      const prefix = targetText.substring(0, 30);
+      target = knownEntries.findIndex(e =>
+        e.substring(0, 30) === prefix || e.startsWith(prefix) || prefix.startsWith(e.substring(0, 30))
+      );
+      if (target >= 0) {
+        console.log('[Restore:History] Text match found at index ' + target + ': "' + knownEntries[target].substring(0, 50) + '"');
+      } else {
+        console.log('[Restore:History] Text match failed for: "' + prefix + '", falling back to index');
+        target = Math.min(typeof targetIndex === 'number' ? targetIndex : 0, knownEntries.length - 1);
+      }
+    } else {
+      target = Math.min(typeof targetIndex === 'number' ? targetIndex : 0, knownEntries.length - 1);
+    }
+    const stepsNeeded = cursorPos - target;
+    console.log('[Restore:History] Target=' + target + ', need ' + stepsNeeded + ' arrow-up presses');
+
+    for (let i = 0; i < stepsNeeded; i++) {
+      try {
+        const diffText = await sendAndCapture('\x1b[A', 1500); // Arrow Up, 1.5s timeout
+        const newPos = findCursorInDiff(diffText, knownEntries);
+        console.log('[Restore:History] Arrow UP #' + (i + 1) + ' → cursor=' + newPos +
+          (newPos >= 0 && newPos < knownEntries.length ? ' (' + knownEntries[newPos].substring(0, 50) + ')' : ''));
+
+        if (newPos >= 0) cursorPos = newPos;
+        if (cursorPos === target) {
+          console.log('[Restore:History] Reached target!');
+          break;
+        }
+      } catch (e) {
+        // Timeout = no re-render = cursor at boundary, stop
+        console.log('[Restore:History] Arrow #' + (i + 1) + ' no response (boundary), stopping');
+        break;
+      }
+    }
+
+    console.log('[Restore:History] Final cursor=' + cursorPos +
+      (cursorPos >= 0 && cursorPos < knownEntries.length ? ' (' + knownEntries[cursorPos].substring(0, 80) + ')' : ' (current)'));
+
+    // Step 5: Confirm selection with Enter → triggers actual rewind
+    console.log('[Restore:History] Confirming selection with Enter...');
+    const confirmText = await sendAndCapture('\r', 5000);
+    console.log('[Restore:History] Confirm response (first sync):', confirmText.substring(0, 200));
+
+    // Step 6: Paste compact text if provided
+    if (pasteAfter && typeof pasteAfter === 'string' && pasteAfter.length > 0) {
+      // Wait for Claude's prompt to FULLY render — the first sync marker (Step 5) is just the banner.
+      // We need to wait for subsequent render cycles until the prompt box (╭...╰ or ⏵ or >) appears.
+      // Claude TUI uses Ink which renders in frames, each ending with \x1b[?2026l.
+      console.log('[Restore:History] Waiting for prompt to fully render...');
+
+      let promptReady = false;
+      let renderCount = 0;
+      let lastRenderText = '';
+
+      await new Promise((resolve) => {
+        let buf = '';
+        const sub = term.onData((data) => {
+          buf += data;
+
+          // Count sync markers = render frames
+          while (buf.includes('\x1b[?2026l')) {
+            renderCount++;
+            const clean = cleanBuffer(buf.split('\x1b[?2026l')[0]);
+            lastRenderText = clean;
+            console.log('[Restore:History] Render frame #' + renderCount + ':', clean.substring(0, 150));
+
+            // Prompt is ready when we see the prompt box bottom (╰) or prompt symbols (⏵ or >)
+            if (buf.includes('\u2335') || buf.includes('\u23F5') || buf.includes('╰') || renderCount >= 5) {
+              promptReady = true;
+              sub.dispose();
+              resolve();
+              return;
+            }
+
+            // Remove processed part, keep remainder after the sync marker
+            buf = buf.split('\x1b[?2026l').slice(1).join('\x1b[?2026l');
+          }
+        });
+
+        // Safety: 15s timeout (large sessions can take longer to rebuild context)
+        setTimeout(() => {
+          sub.dispose();
+          console.log('[Restore:History] Prompt render timeout after ' + renderCount + ' frames');
+          resolve();
+        }, 15000);
       });
 
-      // Step 3: Send first Escape
-      term.write('\x1b');
+      console.log('[Restore:History] Prompt ready=' + promptReady + ' after ' + renderCount + ' render frames');
 
-      setTimeout(() => {
-        // Step 4: Send second Escape
-        term.write('\x1b');
+      // Extra settle time after last render
+      await new Promise(r => setTimeout(r, 500));
 
-        // Step 5: Collect data for 3 seconds
+      // CRITICAL: Write paste as SINGLE atomic term.write() — no chunking.
+      // Ink TUI exits bracketed paste mode after each read(). If the paste is chunked
+      // into multiple writes, Ink processes chunk 1 as paste, re-renders, then treats
+      // chunks 2+ as raw keystrokes → text gets wiped.
+      // claude:send-command works because it writes everything in one term.write().
+      const pastePayload = PASTE_START + pasteAfter + PASTE_END;
+      console.log('[Restore:History] Pasting compact text: ' + pasteAfter.length + ' chars, payload: ' + pastePayload.length + ' bytes (single write)');
+
+      // Ctrl+C to clear pre-filled input (Claude restores the old message after rewind)
+      // Then wait for Ink re-render to complete before pasting
+      term.write('\x03');
+      console.log('[Restore:History] Ctrl+C sent, waiting for input clear render...');
+      await new Promise((resolve) => {
+        let buf = '';
+        const sub = term.onData((data) => {
+          buf += data;
+          if (buf.includes('\x1b[?2026l')) {
+            sub.dispose();
+            resolve();
+          }
+        });
+        setTimeout(() => { sub.dispose(); resolve(); }, 2000);
+      });
+
+      // Now paste into clean input (single atomic write)
+      term.write(pastePayload);
+
+      // Wait for Ink to process the paste and re-render (sync marker = frame complete)
+      console.log('[Restore:History] Waiting for Ink to process paste...');
+      await new Promise((resolve) => {
+        let buf = '';
+        const sub = term.onData((data) => {
+          buf += data;
+          if (buf.includes('\x1b[?2026l')) {
+            sub.dispose();
+            const clean = cleanBuffer(buf);
+            console.log('[Restore:History] Paste render confirmed:', clean.substring(0, 200));
+            resolve();
+          }
+        });
         setTimeout(() => {
-          if (resolved) return;
-          resolved = true;
           sub.dispose();
+          console.log('[Restore:History] Paste render timeout (5s), submitting anyway');
+          resolve();
+        }, 5000);
+      });
 
-          const cleanText = stripped(buffer);
-          console.log('[Restore:History] Raw buffer length:', buffer.length);
-          console.log('[Restore:History] Raw (first 500):', JSON.stringify(buffer).substring(0, 500));
-          console.log('[Restore:History] Clean text:', JSON.stringify(cleanText).substring(0, 500));
+      // Small settle after render
+      await new Promise(r => setTimeout(r, 50));
 
-          // Step 6: Send third Escape to close any opened menu
-          term.write('\x1b');
+      // Submit with \r — triggers JSONL rewrite
+      term.write('\r');
+      console.log('[Restore:History] Submitted with \\r');
+    }
 
-          resolve({ success: true, cleanText, rawBuffer: buffer, rawLength: buffer.length });
-        }, 3000);
-      }, 100);
-    }, 50);
-
-    // Safety timeout — 5 seconds total
-    setTimeout(() => {
-      if (resolved) return;
-      resolved = true;
-      console.log('[Restore:History] Safety timeout reached');
-      resolve({ success: false, error: 'timeout' });
-    }, 5000);
-  });
+    return { success: true, entries: knownEntries, cursorIndex: cursorPos, targetIndex: target };
+  } catch (err) {
+    console.log('[Restore:History] Error:', err.message);
+    term.write('\x1b'); // try to close menu on error
+    return { success: false, error: err.message };
+  }
 });
 
 // Resize terminal
@@ -1711,7 +1929,39 @@ ipcMain.handle('prompts:save', async (event, prompts) => {
   }
 });
 
-// ========== DOCS UPDATE FEATURE ========== 
+// ========== AI PROMPTS (Dynamic System Prompts) ==========
+
+ipcMain.handle('ai-prompts:get', async () => {
+  try {
+    const prompts = projectManager.getAIPrompts();
+    return { success: true, data: prompts };
+  } catch (error) {
+    console.error('[main] Error getting AI prompts:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('ai-prompts:save', async (event, prompt) => {
+  try {
+    projectManager.saveAIPrompt(prompt);
+    return { success: true };
+  } catch (error) {
+    console.error('[main] Error saving AI prompt:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('ai-prompts:delete', async (event, id) => {
+  try {
+    projectManager.deleteAIPrompt(id);
+    return { success: true };
+  } catch (error) {
+    console.error('[main] Error deleting AI prompt:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// ========== DOCS UPDATE FEATURE ==========
 
 // Export Claude session for documentation update (with file watcher approach)
 // Read documentation prompt from file

@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useUIStore } from '../../../store/useUIStore';
+import { usePromptsStore } from '../../../store/usePromptsStore';
 import MarkdownRenderer from '../../Research/MarkdownRenderer';
 import { useResearchStore, ChatType } from '../../../store/useResearchStore';
 import { useWorkspaceStore } from '../../../store/useWorkspaceStore';
@@ -21,7 +22,8 @@ interface GeminiPanelProps {
 }
 
 export default function GeminiPanel({ projectPath, geminiPrompt }: GeminiPanelProps) {
-  const { showToast, chatSettings, terminalSelection } = useUIStore();
+  const { showToast, terminalSelection } = useUIStore();
+  const { getPromptById, prompts: aiPrompts } = usePromptsStore();
   const { createConversation, addMessage, openResearch, getProjectConversations, setActiveConversation, deleteConversation, isLoading, setLoading, setAbortController, pendingResearch, pendingChatType, clearPendingResearch, loadFromDB, activeConversationId } = useResearchStore();
   const { activeProjectId } = useWorkspaceStore();
   const conversations = activeProjectId ? getProjectConversations(activeProjectId) : [];
@@ -72,9 +74,11 @@ export default function GeminiPanel({ projectPath, geminiPrompt }: GeminiPanelPr
 
     const selectedText = terminalSelection;
 
-    // Get settings for the chat type
-    const settings = chatSettings[chatType];
-    const { model: selectedModel, thinkingLevel, prompt: systemPrompt } = settings;
+    // Get settings from dynamic AI prompt
+    const promptConfig = getPromptById(chatType);
+    const selectedModel = promptConfig?.model || 'gemini-3-flash-preview';
+    const thinkingLevel = promptConfig?.thinkingLevel || 'HIGH';
+    const systemPrompt = promptConfig?.content || '';
 
     // Use project prompt for research if available, otherwise use type's system prompt
     const prompt = (chatType === 'research' && geminiPrompt) ? geminiPrompt : systemPrompt;
@@ -203,9 +207,11 @@ export default function GeminiPanel({ projectPath, geminiPrompt }: GeminiPanelPr
       console.log('[ClipboardResearch] Starting, type:', chatType);
       console.log('[ClipboardResearch] Clipboard:', `"${clipboardText.slice(0, 50)}..."`);
 
-      // Get settings for the chat type
-      const settings = chatSettings[chatType];
-      const { model: selectedModel, thinkingLevel, prompt: systemPrompt } = settings;
+      // Get settings from dynamic AI prompt
+      const promptConfig = getPromptById(chatType);
+      const selectedModel = promptConfig?.model || 'gemini-3-flash-preview';
+      const thinkingLevel = promptConfig?.thinkingLevel || 'HIGH';
+      const systemPrompt = promptConfig?.content || '';
 
       // Use project prompt for research if available
       const prompt = (chatType === 'research' && geminiPrompt) ? geminiPrompt : systemPrompt;
@@ -471,21 +477,19 @@ export default function GeminiPanel({ projectPath, geminiPrompt }: GeminiPanelPr
             {conversations.map((conv) => {
               // Default to 'research' for backward compatibility
               const convType = conv.type || 'research';
+              const convPrompt = getPromptById(convType);
+              const borderColor = convPrompt?.color || '#0ea5e9';
               const isActive = conv.id === currentActiveConvId;
               const isLoadingThis = isActive && isLoading;
 
               return (
               <div
                 key={conv.id}
-                className={`group rounded p-2 transition-all cursor-pointer border-l-2 ${
-                  isActive
-                    ? 'bg-[#3a3a3a] border-l-white'
-                    : 'bg-[#2d2d2d] hover:bg-[#333]'
-                } ${
-                  convType === 'compact' && !isActive ? 'border-l-purple-500' : ''
-                } ${
-                  convType === 'research' && !isActive ? 'border-l-accent' : ''
-                }`}
+                className={`group rounded p-2 transition-all cursor-pointer`}
+                style={{
+                  backgroundColor: isActive ? '#3a3a3a' : '#2d2d2d',
+                  borderLeft: `2px solid ${isActive ? '#fff' : borderColor}`
+                }}
                 onClick={() => openConversation(conv.id)}
               >
                 <div className="flex items-start justify-between gap-2 mb-1">
@@ -496,12 +500,11 @@ export default function GeminiPanel({ projectPath, geminiPrompt }: GeminiPanelPr
                         <span className="w-3 h-3 border-2 border-accent border-t-transparent rounded-full animate-spin" />
                       </span>
                     ) : (
-                      <span className={`text-[8px] px-1 py-0.5 rounded shrink-0 ${
-                        convType === 'compact'
-                          ? 'bg-purple-500/20 text-purple-400'
-                          : 'bg-accent/20 text-accent'
-                      }`}>
-                        {convType === 'compact' ? 'C' : 'R'}
+                      <span
+                        className="text-[8px] px-1 py-0.5 rounded shrink-0"
+                        style={{ backgroundColor: `${borderColor}33`, color: borderColor }}
+                      >
+                        {(convPrompt?.name || convType).charAt(0).toUpperCase()}
                       </span>
                     )}
                     <div className={`text-[10px] truncate ${isActive ? 'text-white font-medium' : 'text-[#ccc]'}`}>
