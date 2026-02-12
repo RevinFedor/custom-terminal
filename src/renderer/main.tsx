@@ -3,23 +3,66 @@ import ReactDOM from 'react-dom/client';
 import App from './App';
 import './styles/globals.css';
 
-// === GLOBAL CONSOLE FILTER ===
-// Only show [RESTORE] prefixed logs to reduce noise during debugging
+// === TAG-BASED CONSOLE FILTER ===
 const _origLog = console.log.bind(console);
 const _origWarn = console.warn.bind(console);
 const _origError = console.error.bind(console);
 
-const RESTORE_DEBUG = true; // Set to false to disable filter
+const LOG_DISABLED_TAGS = new Set([
+  'Workspace', 'TerminalArea', 'Terminal', 'safeFit', 'ProjectHome',
+  'Store', 'Link', 'Settings', 'SessionsPanel', 'CURSOR', 'SILENCE',
+  'DIAG', 'UIStore', 'Dashboard', 'NotesEditor', 'ResearchInput',
+  'Research', 'Timeline', 'Think',
+]);
 
-if (RESTORE_DEBUG) {
-  console.log = (...args: any[]) => {
-    const first = args[0];
-    if (typeof first === 'string' && first.startsWith('[RESTORE]')) {
-      _origLog(...args);
-    }
-  };
-  // Keep warn/error unfiltered
+const LOG_ALWAYS_TAGS = new Set(['RESTORE', 'Restore', 'ErrorBoundary']);
+
+function _extractTag(args: any[]): string | null {
+  const first = args[0];
+  if (typeof first !== 'string') return null;
+  const m = first.match(/^\[([^\]:\s]+)/);
+  return m ? m[1] : null;
 }
+
+function _shouldLog(args: any[]): boolean {
+  const tag = _extractTag(args);
+  if (!tag) return true; // no tag → pass through
+  if (LOG_ALWAYS_TAGS.has(tag)) return true;
+  if (LOG_DISABLED_TAGS.has(tag)) return false;
+  return true;
+}
+
+console.log = (...args: any[]) => { if (_shouldLog(args)) _origLog(...args); };
+console.warn = (...args: any[]) => { if (_shouldLog(args)) _origWarn(...args); };
+// console.error is NEVER filtered
+
+(window as any).logs = {
+  on(tag: string) { LOG_DISABLED_TAGS.delete(tag); _origLog(`[logs] enabled: ${tag}`); },
+  off(tag: string) { LOG_DISABLED_TAGS.add(tag); _origLog(`[logs] disabled: ${tag}`); },
+  only(...tags: string[]) {
+    LOG_DISABLED_TAGS.clear();
+    // Disable everything except specified tags
+    const allKnown = ['Workspace', 'TerminalArea', 'Terminal', 'safeFit', 'ProjectHome',
+      'Store', 'Link', 'Settings', 'SessionsPanel', 'CURSOR', 'SILENCE', 'DIAG',
+      'UIStore', 'Dashboard', 'NotesEditor', 'ResearchInput', 'Research', 'Timeline', 'Think'];
+    const keep = new Set(tags);
+    allKnown.forEach(t => { if (!keep.has(t)) LOG_DISABLED_TAGS.add(t); });
+    _origLog(`[logs] only: ${tags.join(', ')}`);
+  },
+  all() { LOG_DISABLED_TAGS.clear(); _origLog('[logs] all tags enabled'); },
+  reset() {
+    LOG_DISABLED_TAGS.clear();
+    ['Workspace', 'TerminalArea', 'Terminal', 'safeFit', 'ProjectHome',
+      'Store', 'Link', 'Settings', 'SessionsPanel', 'CURSOR', 'SILENCE',
+      'DIAG', 'UIStore', 'Dashboard', 'NotesEditor', 'ResearchInput',
+      'Research', 'Timeline', 'Think'].forEach(t => LOG_DISABLED_TAGS.add(t));
+    _origLog('[logs] reset to defaults');
+  },
+  status() {
+    _origLog('[logs] disabled:', [...LOG_DISABLED_TAGS].sort().join(', '));
+    _origLog('[logs] always:', [...LOG_ALWAYS_TAGS].join(', '));
+  },
+};
 
 // === GLOBAL ERROR BOUNDARY ===
 class ErrorBoundary extends React.Component<

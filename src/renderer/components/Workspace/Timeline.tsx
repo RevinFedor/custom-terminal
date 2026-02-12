@@ -353,7 +353,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
 
     // Context menu dimensions (approximate)
     const menuWidth = 160;
-    const menuHeight = selectionStartIdRef.current ? 40 : 72;
+    const menuHeight = selectionStartIdRef.current ? 40 : 112;
 
     // Position: right-center of cursor
     let x = e.pageX + 4;
@@ -455,6 +455,20 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
     window.addEventListener('click', handleClickOutside);
     return () => window.removeEventListener('click', handleClickOutside);
   }, [isExpanded]);
+
+  const handleOpenHistoryMenu = async (entry: TimelineEntry) => {
+    setContextMenu(null);
+    console.warn('[Restore:History] Sending open-history-menu for tab:', tabId, 'entry:', entry.uuid);
+    try {
+      const result = await ipcRenderer.invoke('claude:open-history-menu', tabId);
+      console.warn('[Restore:History] Result:', result.success ? 'OK' : 'FAIL', 'rawLength:', result.rawLength || 0);
+      if (result.cleanText) {
+        console.warn('[Restore:History] Clean text:', result.cleanText.substring(0, 300));
+      }
+    } catch (err) {
+      console.error('[Restore:History] IPC error:', err);
+    }
+  };
 
   if (!sessionId) return null;
 
@@ -872,6 +886,17 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
                     }}
                   >
                     Копировать текст сообщения
+                  </button>
+                  <div className="border-t border-white/10 my-1" />
+                  <button
+                    className={`w-full text-left px-3 py-2 text-xs rounded transition-colors ${isActive ? 'text-amber-400 hover:bg-amber-600/20 cursor-pointer' : 'text-white/20 cursor-not-allowed'}`}
+                    disabled={!isActive}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      if (isActive) handleOpenHistoryMenu(contextMenu.entry);
+                    }}
+                  >
+                    Откатиться
                   </button>
                 </>
               ) : (
