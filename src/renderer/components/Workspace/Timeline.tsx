@@ -555,6 +555,34 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
         'cursor:', rewindResult.cursorIndex, 'target:', rewindResult.targetIndex,
         'compactPasted:', !!compactText);
 
+      // Auto-scroll to bottom after rewind (Claude TUI re-renders cause scroll jumps)
+      const term = terminalRegistry.get(tabId);
+      if (term) {
+        let scrollDebounce: ReturnType<typeof setTimeout> | null = null;
+        let cleaned = false;
+
+        const doCleanup = () => {
+          if (cleaned) return;
+          cleaned = true;
+          scrollSub.dispose();
+          if (scrollDebounce) clearTimeout(scrollDebounce);
+          term.scrollToBottom();
+        };
+
+        // Listen for scroll events — each resets the debounce
+        const scrollSub = term.onScroll(() => {
+          if (cleaned) return;
+          if (scrollDebounce) clearTimeout(scrollDebounce);
+          scrollDebounce = setTimeout(doCleanup, 200);
+        });
+
+        // Safety: cleanup after 5s even if no scroll events
+        setTimeout(doCleanup, 5000);
+
+        // Immediate scroll
+        term.scrollToBottom();
+      }
+
       // Success flash
       setRewindState({ index: entryIndex, phase: 'done' });
       setTimeout(() => setRewindState(null), 1200);
