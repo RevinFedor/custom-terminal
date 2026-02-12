@@ -23,6 +23,7 @@ interface ProjectCardProps {
   project: Project;
   isOpen?: boolean;
   onOpen: () => void;
+  onMiddleClick?: () => void;
   tabsStats?: TabsStats;
 }
 
@@ -30,6 +31,7 @@ export default function ProjectCard({
   project,
   isOpen = false,
   onOpen,
+  onMiddleClick,
   tabsStats = { total: 0, active: 0 }
 }: ProjectCardProps) {
   const [pathHovered, setPathHovered] = useState(false);
@@ -62,6 +64,12 @@ export default function ProjectCard({
         }
       `}
       onClick={onOpen}
+      onMouseDown={(e) => {
+        if (e.button === 1 && onMiddleClick) {
+          e.preventDefault();
+          onMiddleClick();
+        }
+      }}
       onMouseLeave={() => setPathHovered(false)}
     >
       {/* Project Name */}

@@ -1657,69 +1657,6 @@ ipcMain.handle('prompts:save', async (event, prompts) => {
 // ========== DOCS UPDATE FEATURE ========== 
 
 // Export Claude session for documentation update (with file watcher approach)
-ipcMain.handle('docs:export-session', async (event, { tabId, projectPath }) => {
-  const fs = require('fs');
-  const term = terminals.get(tabId);
-
-  if (!term) {
-    return { success: false, error: 'Terminal not found' };
-  }
-
-  try {
-    // 1. Generate unique filename (Claude Code always saves as .txt regardless of input extension)
-    const timestamp = Date.now();
-    const baseFilename = `session-export-${timestamp}`;
-    const expectedFilename = `${baseFilename}.txt`; // Claude always outputs .txt
-    const tmpDir = path.join(projectPath, 'docs', 'tmp');
-
-    // Ensure tmp directory exists
-    if (!fs.existsSync(tmpDir)) {
-      fs.mkdirSync(tmpDir, { recursive: true });
-    }
-
-    const absolutePath = path.join(tmpDir, expectedFilename);
-
-    // Use relative path from projectPath (Claude Code treats path as relative to cwd)
-    // We send .md but Claude will create .txt
-    const relativePath = `docs/tmp/${baseFilename}.md`;
-    console.log('[docs:export] Starting export, expecting:', absolutePath);
-
-    // 2. Send /export command to Claude Code (same pattern as terminal:executeCommand)
-    term.write(`/export ${relativePath}`);
-    await new Promise(resolve => setTimeout(resolve, 150));
-    term.write('\r');
-
-    // 3. Wait for file to appear (polling approach)
-    const timeout = 15000; // 15 seconds max
-    const intervalTime = 200;
-    let elapsed = 0;
-
-    return new Promise((resolve) => {
-      const checkFile = setInterval(() => {
-        elapsed += intervalTime;
-
-        if (fs.existsSync(absolutePath)) {
-          const stats = fs.statSync(absolutePath);
-          if (stats.size > 0) {
-            clearInterval(checkFile);
-            console.log('[docs:export] File detected:', absolutePath);
-            resolve({ success: true, exportedPath: absolutePath });
-          }
-        }
-
-        if (elapsed >= timeout) {
-          clearInterval(checkFile);
-          console.error('[docs:export] Timeout waiting for file');
-          resolve({ success: false, error: 'Timeout: Claude did not create export file within 15s' });
-        }
-      }, intervalTime);
-    });
-  } catch (error) {
-    console.error('[docs:export] Error:', error);
-    return { success: false, error: error.message };
-  }
-});
-
 // Read documentation prompt from file
 ipcMain.handle('docs:read-prompt-file', async (event, { filePath }) => {
   const fs = require('fs');
@@ -1739,7 +1676,7 @@ ipcMain.handle('docs:read-prompt-file', async (event, { filePath }) => {
 });
 
 // Save combined prompt to temp file for Gemini (avoids shell escaping issues)
-ipcMain.handle('docs:save-prompt-temp', async (event, { projectPath, promptContent, exportedFilePath }) => {
+ipcMain.handle('docs:save-prompt-temp', async (event, { projectPath, promptContent, exportedFilePath, additionalPrompt }) => {
   const fs = require('fs');
 
   try {
@@ -1750,7 +1687,10 @@ ipcMain.handle('docs:save-prompt-temp', async (event, { projectPath, promptConte
 
     const timestamp = Date.now();
     const promptFile = path.join(tmpDir, `gemini-prompt-${timestamp}.txt`);
-    const fullPrompt = `${promptContent}\n\n${exportedFilePath}`;
+    let fullPrompt = `${promptContent}\n\n${exportedFilePath}`;
+    if (additionalPrompt) {
+      fullPrompt += `\n\n${additionalPrompt}`;
+    }
 
     fs.writeFileSync(promptFile, fullPrompt, 'utf-8');
     console.log('[docs:save-prompt] Saved prompt to:', promptFile);
@@ -2751,6 +2691,7 @@ function parseTimelineUuids(sourcePath) {
         if (entry.isMeta) continue;
         if (rawContent.includes('<command-name>') ||
             rawContent.includes('<system-reminder>') ||
+            rawContent.includes('<task-notification>') ||
             rawContent.startsWith('[Request interrupted')) continue;
 
         uuids.push(entry.uuid);
@@ -2984,6 +2925,7 @@ ipcMain.handle('claude:get-timeline', async (event, { sessionId, cwd }) => {
             rawContent.includes('<bash-notification>') ||
             rawContent.includes('<shell-id>') ||
             rawContent.includes('<user-prompt-submit-hook>') ||
+            rawContent.includes('<task-notification>') ||
             rawContent.startsWith('Caveat: The messages below')) {
           skippedSystem++;
           continue;
@@ -3003,9 +2945,12 @@ ipcMain.handle('claude:get-timeline', async (event, { sessionId, cwd }) => {
           continue;
         }
 
+        // Detect "continued session" summary (context overflow recovery)
+        const isContinued = cleanContent.startsWith('This session is being continued from a previous conversation');
+
         entries.push({
           uuid: entry.uuid,
-          type: 'user',
+          type: isContinued ? 'continued' : 'user',
           timestamp: entry.timestamp,
           content: cleanContent,
           isCompactSummary: entry.isCompactSummary || false,

@@ -328,5 +328,33 @@ export const terminalRegistry = {
   // Get all entry markers for a tab (used by Timeline for reachability checks)
   getEntryMarkers(tabId: string): Map<string, TrackedEntry> | undefined {
     return entryMarkers.get(tabId);
+  },
+
+  // Get visible text in the current terminal viewport (for Timeline visibility check)
+  getVisibleText(tabId: string): string {
+    const terminal = terminals.get(tabId);
+    if (!terminal) return '';
+    const buf = terminal.buffer.active;
+    const startLine = buf.viewportY;
+    const endLine = Math.min(startLine + terminal.rows, buf.length);
+    const lines: string[] = [];
+    for (let i = startLine; i < endLine; i++) {
+      const line = buf.getLine(i);
+      if (line) lines.push(line.translateToString(true));
+    }
+    return lines.join('\n');
+  },
+
+  // Get full buffer text (viewport + scrollback) for reachability checks
+  getFullBufferText(tabId: string): string {
+    const terminal = terminals.get(tabId);
+    if (!terminal) return '';
+    const buf = terminal.buffer.active;
+    const lines: string[] = [];
+    for (let i = 0; i < buf.length; i++) {
+      const line = buf.getLine(i);
+      if (line) lines.push(line.translateToString(true));
+    }
+    return lines.join('\n');
   }
 };

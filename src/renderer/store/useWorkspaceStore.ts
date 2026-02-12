@@ -87,7 +87,7 @@ interface WorkspaceStore {
   showWorkspace: (projectId: string) => void;
 
   // Project management
-  openProject: (projectId: string, projectPath: string) => void;
+  openProject: (projectId: string, projectPath: string, options?: { background?: boolean; draft?: boolean }) => void;
   closeProject: (projectId: string) => Promise<void>;
 
   // Tab management
@@ -424,8 +424,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     get().saveSession();
   },
 
-  openProject: async (projectId, projectPath) => {
-    console.log('[Store] openProject called:', { projectId, projectPath });
+  openProject: async (projectId, projectPath, options) => {
+    const background = options?.background ?? false;
+    const draft = options?.draft ?? false;
+    console.log('[Store] openProject called:', { projectId, projectPath, background, draft });
     const { openProjects, createTab, saveSession, projectHistory } = get();
 
     // Update history
@@ -450,52 +452,65 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         tabCounter: 0, // Start from 0 for new projects
         sidebarOpen: projectData?.sidebarOpen || false,
         openFilePath: projectData?.openFilePath || null,
-        currentView: 'terminal'
+        currentView: draft ? 'home' : 'terminal'
       };
       openProjects.set(projectId, newWorkspace);
-      
-      console.log('[Store] Preparing project tabs before switching view...');
-      set({ isRestoring: true });
 
-      // Restore saved tabs or create default one
-      if (savedTabs.length > 0) {
-        newWorkspace.tabCounter = savedTabs.length;
-        for (const savedTab of savedTabs) {
-          await createTab(projectId, savedTab.name, savedTab.cwd, {
-            color: savedTab.color,
-            isUtility: savedTab.isUtility,
-            commandType: savedTab.commandType,
-            claudeSessionId: savedTab.claudeSessionId,
-            geminiSessionId: savedTab.geminiSessionId,
-            wasInterrupted: savedTab.wasInterrupted,
-            overlayDismissed: savedTab.overlayDismissed,
-            notes: savedTab.notes,
-            tabType: savedTab.tabType,
-            url: savedTab.url,
-            createdAt: savedTab.createdAt,
-            isCollapsed: savedTab.isCollapsed
-          } as any);
-        }
-      } else {
-        // Create default tab
-        await createTab(projectId, 'Terminal 1', projectPath);
+      if (!background && !draft) {
+        console.log('[Store] Preparing project tabs before switching view...');
+        set({ isRestoring: true });
       }
 
-      console.log('[Store] Tabs prepared, switching to workspace view');
-      set({ 
-        openProjects: new Map(openProjects), 
-        activeProjectId: projectId, 
-        view: 'workspace',
-        isRestoring: false,
-        projectHistory: newHistory
-      });
+      // In draft mode, skip tab creation — user hasn't confirmed project yet
+      if (!draft) {
+        // Restore saved tabs or create default one
+        if (savedTabs.length > 0) {
+          newWorkspace.tabCounter = savedTabs.length;
+          for (const savedTab of savedTabs) {
+            await createTab(projectId, savedTab.name, savedTab.cwd, {
+              color: savedTab.color,
+              isUtility: savedTab.isUtility,
+              commandType: savedTab.commandType,
+              claudeSessionId: savedTab.claudeSessionId,
+              geminiSessionId: savedTab.geminiSessionId,
+              wasInterrupted: savedTab.wasInterrupted,
+              overlayDismissed: savedTab.overlayDismissed,
+              notes: savedTab.notes,
+              tabType: savedTab.tabType,
+              url: savedTab.url,
+              createdAt: savedTab.createdAt,
+              isCollapsed: savedTab.isCollapsed
+            } as any);
+          }
+        } else {
+          // Create default tab
+          await createTab(projectId, 'Terminal 1', projectPath);
+        }
+      }
+
+      if (background) {
+        console.log('[Store] Tabs prepared (background mode, staying on dashboard)');
+        set({
+          openProjects: new Map(openProjects),
+          projectHistory: newHistory
+        });
+      } else {
+        console.log('[Store] Tabs prepared, switching to workspace view');
+        set({
+          openProjects: new Map(openProjects),
+          activeProjectId: projectId,
+          view: 'workspace',
+          isRestoring: false,
+          projectHistory: newHistory
+        });
+      }
 
       saveSession();
-    } else {
-      set({ 
-        activeProjectId: projectId, 
+    } else if (!background) {
+      set({
+        activeProjectId: projectId,
         view: 'workspace',
-        projectHistory: newHistory 
+        projectHistory: newHistory
       });
       saveSession();
     }

@@ -274,7 +274,9 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
   };
 
   return (
-    <div className="h-full flex flex-col p-3 overflow-y-auto">
+    <div className="h-full flex flex-col p-3">
+      {/* Upper sections — scrollable independently */}
+      <div className="overflow-y-auto min-h-0 shrink">
       <div className="mb-4">
         <div className="text-[11px] uppercase text-[#888] mb-2">AI Session</div>
         {hasAnySession ? (
@@ -602,6 +604,7 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
       )}
 
       <div className="mb-3"><ActionsPanel activeTabId={activeTabId} embedded /></div>
+      </div>
 
       <div className="flex-1 flex flex-col min-h-0 border-t border-border-main pt-3">
         <div className="flex items-center gap-2 mb-2">
@@ -611,7 +614,7 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
           )}
         </div>
         {activeTabId ? (
-          <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+          <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
             <MarkdownEditor content={tabNotes} onChange={(newContent: string) => { setTabNotes(newContent); if (activeTabId) setTabNotesStore(activeTabId, newContent); }} fontSize={tabNotesFontSize} contentPaddingX={tabNotesPaddingX} contentPaddingY={tabNotesPaddingY} wordWrap={wordWrap} showLineNumbers={false} compact foldStateKey={`tab-notes:${activeTabId}`} />
           </div>
         ) : (

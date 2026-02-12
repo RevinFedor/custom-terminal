@@ -223,6 +223,7 @@ export default function Dashboard() {
                   project={project}
                   isOpen={isProjectOpen(project.id)}
                   onOpen={() => handleOpenProjectWorkspace(project.id)}
+                  onMiddleClick={() => openProject(project.id, project.path, { background: true })}
                   tabsStats={getTabsStats(project.id)}
                 />
               ))}
