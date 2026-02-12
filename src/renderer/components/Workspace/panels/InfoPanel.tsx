@@ -3,6 +3,7 @@ import { MarkdownEditor } from '@anthropic/markdown-editor';
 import '@anthropic/markdown-editor/styles.css';
 import { useWorkspaceStore } from '../../../store/useWorkspaceStore';
 import { useUIStore } from '../../../store/useUIStore';
+import { usePromptsStore } from '../../../store/usePromptsStore';
 import { RotateCcw, Clock, ChevronDown, ChevronRight } from 'lucide-react';
 import ActionsPanel from './ActionsPanel';
 
@@ -59,7 +60,8 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
   const [showSessionInput, setShowSessionInput] = useState(false);
   const [manualSessionId, setManualSessionId] = useState('');
   const sessionInputRef = useRef<HTMLInputElement>(null);
-  const { showToast, claudeDefaultPromptEnabled, chatSettings } = useUIStore();
+  const { showToast, claudeDefaultPromptEnabled } = useUIStore();
+  const { getPromptById } = usePromptsStore();
   const wordWrap = useUIStore((s) => s.wordWrap);
   const tabNotesFontSize = useUIStore((s) => s.tabNotesFontSize);
   const tabNotesPaddingX = useUIStore((s) => s.tabNotesPaddingX);
@@ -228,17 +230,20 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
         sessionId: targetSessionId, cwd: tabCwd, includeCode: false, fromStart: true
       });
       if (!exportResult.success) throw new Error(exportResult.error || 'Export failed');
-      const descSettings = chatSettings.description;
-      const fullPrompt = (descSettings.prompt || 'Describe this session in 1-2 sentences.') + exportResult.content;
+      const descPrompt = getPromptById('description');
+      const descContent = descPrompt?.content || 'Describe this session in 1-2 sentences.';
+      const descModel = descPrompt?.model || 'gemini-3-flash-preview';
+      const descThinking = descPrompt?.thinkingLevel || 'NONE';
+      const fullPrompt = descContent + exportResult.content;
       const apiKey = process.env.GEMINI_API_KEY || 'REDACTED_GEMINI_KEY';
       const requestBody: any = {
         contents: [{ role: 'user', parts: [{ text: fullPrompt }] }],
         systemInstruction: { parts: [{ text: '1-2 предложения. Без маркдауна.' }] }
       };
-      if (descSettings.model.includes('gemini-3') && descSettings.thinkingLevel !== 'NONE') {
-        requestBody.generationConfig = { thinkingConfig: { thinkingLevel: descSettings.thinkingLevel } };
+      if (descModel.includes('gemini-3') && descThinking !== 'NONE') {
+        requestBody.generationConfig = { thinkingConfig: { thinkingLevel: descThinking } };
       }
-      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${descSettings.model}:generateContent?key=${apiKey}`, {
+      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${descModel}:generateContent?key=${apiKey}`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(requestBody)
       });
       const data = await response.json();
@@ -614,8 +619,10 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
           )}
         </div>
         {activeTabId ? (
-          <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-            <MarkdownEditor content={tabNotes} onChange={(newContent: string) => { setTabNotes(newContent); if (activeTabId) setTabNotesStore(activeTabId, newContent); }} fontSize={tabNotesFontSize} contentPaddingX={tabNotesPaddingX} contentPaddingY={tabNotesPaddingY} wordWrap={wordWrap} showLineNumbers={false} compact foldStateKey={`tab-notes:${activeTabId}`} />
+          <div style={{ flex: 1, minHeight: 0, position: 'relative' }}>
+            <div style={{ position: 'absolute', inset: 0 }}>
+              <MarkdownEditor content={tabNotes} onChange={(newContent: string) => { setTabNotes(newContent); if (activeTabId) setTabNotesStore(activeTabId, newContent); }} fontSize={tabNotesFontSize} contentPaddingX={tabNotesPaddingX} contentPaddingY={tabNotesPaddingY} wordWrap={wordWrap} showLineNumbers={false} compact foldStateKey={`tab-notes:${activeTabId}`} />
+            </div>
           </div>
         ) : (
           <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#555', fontSize: '11px', fontStyle: 'italic' }}>Выберите вкладку...</div>

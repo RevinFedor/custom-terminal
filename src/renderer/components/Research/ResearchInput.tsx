@@ -1,6 +1,7 @@
 import React, { useState, RefObject, useCallback } from 'react';
 import { useResearchStore, ChatType } from '../../store/useResearchStore';
 import { useUIStore } from '../../store/useUIStore';
+import { usePromptsStore } from '../../store/usePromptsStore';
 
 interface ResearchInputProps {
   projectId: string;
@@ -12,12 +13,13 @@ interface ResearchInputProps {
 export default function ResearchInput({ projectId, projectPath, inputRef, chatType }: ResearchInputProps) {
   const [value, setValue] = useState('');
   const { addMessage, createConversation, getActiveConversation, isLoading, setLoading, setAbortController, cancelRequest } = useResearchStore();
-  const { chatSettings, showToast } = useUIStore();
+  const { showToast } = useUIStore();
+  const { getPromptById } = usePromptsStore();
 
-  // Get settings for current chat type
-  const currentSettings = chatSettings[chatType];
-  const selectedModel = currentSettings.model;
-  const thinkingLevel = currentSettings.thinkingLevel;
+  // Get settings from dynamic AI prompt
+  const currentPrompt = getPromptById(chatType);
+  const selectedModel = currentPrompt?.model || 'gemini-3-flash-preview';
+  const thinkingLevel = currentPrompt?.thinkingLevel || 'HIGH';
 
   const handleSubmit = useCallback(async () => {
     const trimmed = value.trim();

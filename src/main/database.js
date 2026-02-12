@@ -15,6 +15,8 @@ class DatabaseManager {
     this.db.pragma('journal_mode = WAL');
     this.initTables();
     this.createDefaultPrompts();
+    this.seedDefaultAIPrompts();
+    this.ensureRewindPrompt();
   }
 
   initTables() {
@@ -243,6 +245,21 @@ class DatabaseManager {
 
     // Migration: add message_count to tab_history
     try { this.db.exec(`ALTER TABLE tab_history ADD COLUMN message_count INTEGER DEFAULT NULL`); } catch (e) {}
+
+    // AI Prompts table (dynamic AI prompts for Research/Compact/Description/Custom)
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS ai_prompts (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        content TEXT NOT NULL,
+        model TEXT NOT NULL DEFAULT 'gemini-3-flash-preview',
+        thinking_level TEXT NOT NULL DEFAULT 'HIGH',
+        color TEXT NOT NULL DEFAULT '#0ea5e9',
+        is_built_in INTEGER NOT NULL DEFAULT 0,
+        show_in_context_menu INTEGER NOT NULL DEFAULT 1,
+        position INTEGER NOT NULL DEFAULT 0
+      )
+    `);
 
     // Favorites table
     this.db.exec(`
@@ -546,6 +563,134 @@ transaction(tabs);
   createDefaultPrompts() {
     if (this.db.prepare('SELECT COUNT(*) as count FROM prompts').get().count > 0) return;
     this.savePrompts([{ title: 'Fix Error', content: 'Analyze this error:' }, { title: 'Explain', content: 'Explain this:' }, { title: 'Optimize', content: 'Optimize this:' }]);
+  }
+
+  // ========== AI PROMPTS (Dynamic System Prompts) ==========
+
+  getAIPrompts() {
+    return this.db.prepare('SELECT * FROM ai_prompts ORDER BY position').all().map(row => ({
+      id: row.id,
+      name: row.name,
+      content: row.content,
+      model: row.model,
+      thinkingLevel: row.thinking_level,
+      color: row.color,
+      isBuiltIn: row.is_built_in === 1,
+      showInContextMenu: row.show_in_context_menu === 1,
+      position: row.position
+    }));
+  }
+
+  saveAIPrompt(prompt) {
+    this.db.prepare(`
+      INSERT INTO ai_prompts (id, name, content, model, thinking_level, color, is_built_in, show_in_context_menu, position)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        name = excluded.name,
+        content = excluded.content,
+        model = excluded.model,
+        thinking_level = excluded.thinking_level,
+        color = excluded.color,
+        show_in_context_menu = excluded.show_in_context_menu,
+        position = excluded.position
+    `).run(
+      prompt.id,
+      prompt.name,
+      prompt.content,
+      prompt.model || 'gemini-3-flash-preview',
+      prompt.thinkingLevel || 'HIGH',
+      prompt.color || '#0ea5e9',
+      prompt.isBuiltIn ? 1 : 0,
+      prompt.showInContextMenu !== false ? 1 : 0,
+      prompt.position ?? 0
+    );
+  }
+
+  deleteAIPrompt(id) {
+    // Only delete non-built-in prompts
+    this.db.prepare('DELETE FROM ai_prompts WHERE id = ? AND is_built_in = 0').run(id);
+  }
+
+  seedDefaultAIPrompts() {
+    if (this.db.prepare('SELECT COUNT(*) as count FROM ai_prompts').get().count > 0) return;
+
+    const defaults = [
+      {
+        id: 'research',
+        name: 'Research',
+        content: 'вот моя проблема нужно чтобы ты понял что за проблема и на reddit поискал обсуждения. Не ограничивайся категориями. Проблема: ',
+        model: 'gemini-3-flash-preview',
+        thinking_level: 'HIGH',
+        color: '#0ea5e9',
+        is_built_in: 1,
+        show_in_context_menu: 1,
+        position: 0
+      },
+      {
+        id: 'compact',
+        name: 'Compact (Резюме)',
+        content: 'Проанализируй всю нашу текущую сессию и составь структурированное резюме для переноса контекста в новый чат, включив в него: изначальную цель; список всех созданных файлов с пояснением, почему мы выбрали именно такую структуру и эти файлы; краткий отчет о том, что работает; детальный разбор того, что НЕ получилось, с указанием конкретных причин ошибок (почему выбранные решения не сработали); текущее состояние кода и пошаговый план дальнейших действий — оформи это всё одним компактным сообщением, которое я смогу скопировать и отправить тебе в новом чате для полного восстановления контекста.\n\nВот текст сессии:\n',
+        model: 'gemini-3-flash-preview',
+        thinking_level: 'HIGH',
+        color: '#a855f7',
+        is_built_in: 1,
+        show_in_context_menu: 1,
+        position: 1
+      },
+      {
+        id: 'rewind',
+        name: 'Rewind (Откат)',
+        content: 'Ниже представлена сессия из нейронки (Claude Code). Составь краткую сводку:\n\n1. **Изначальная цель** — что делали\n2. **Изменённые файлы** — путь, какие функции/компоненты затронуты, зачем\n3. **Что работает** — кратко\n4. **Что НЕ работает и ПОЧЕМУ** — конкретные причины ошибок, какие решения пробовали и почему они не сработали\n5. **Текущее состояние** — на чём остановились\n\nВажно: только факты и анализ. Никакого плана, никаких рекомендаций, никаких \"следующих шагов\". Не добавляй своё мнение. Начни сразу со сводки.\n\nСессия:\n',
+        model: 'gemini-3-flash-preview',
+        thinking_level: 'HIGH',
+        color: '#ec4899',
+        is_built_in: 1,
+        show_in_context_menu: 0,
+        position: 3
+      },
+      {
+        id: 'description',
+        name: 'Description',
+        content: '1-2 предложения: что сделано. Без маркдауна, без вступлений.\n\n',
+        model: 'gemini-3-flash-preview',
+        thinking_level: 'NONE',
+        color: '#f59e0b',
+        is_built_in: 1,
+        show_in_context_menu: 0,
+        position: 2
+      }
+    ];
+
+    const insert = this.db.prepare(`
+      INSERT INTO ai_prompts (id, name, content, model, thinking_level, color, is_built_in, show_in_context_menu, position)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    for (const d of defaults) {
+      insert.run(d.id, d.name, d.content, d.model, d.thinking_level, d.color, d.is_built_in, d.show_in_context_menu, d.position);
+    }
+  }
+
+  // Ensure built-in 'rewind' prompt exists (migration for existing DBs)
+  ensureRewindPrompt() {
+    const exists = this.db.prepare('SELECT id FROM ai_prompts WHERE id = ?').get('rewind');
+    if (!exists) {
+      this.db.prepare(`
+        INSERT INTO ai_prompts (id, name, content, model, thinking_level, color, is_built_in, show_in_context_menu, position)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        'rewind',
+        'Rewind (Откат)',
+        'Ниже представлена сессия из нейронки (Claude Code). Составь краткую сводку:\n\n1. **Изначальная цель** — что делали\n2. **Изменённые файлы** — путь, какие функции/компоненты затронуты, зачем\n3. **Что работает** — кратко\n4. **Что НЕ работает и ПОЧЕМУ** — конкретные причины ошибок, какие решения пробовали и почему они не сработали\n5. **Текущее состояние** — на чём остановились\n\nВажно: только факты и анализ. Никакого плана, никаких рекомендаций, никаких \"следующих шагов\". Не добавляй своё мнение. Начни сразу со сводки.\n\nСессия:\n',
+        'gemini-3-flash-preview',
+        'HIGH',
+        '#ec4899',
+        1,
+        0,
+        3
+      );
+      console.log('[DB] Migrated: added rewind prompt');
+    }
   }
 
   // ========== AI SESSIONS ========== 

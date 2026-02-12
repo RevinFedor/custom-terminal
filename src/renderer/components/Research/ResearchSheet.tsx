@@ -2,6 +2,7 @@ import React, { useRef, useEffect, useState, useMemo, useCallback } from 'react'
 import { AnimatePresence, motion } from 'framer-motion';
 import { useResearchStore, ChatType } from '../../store/useResearchStore';
 import { useUIStore, ThinkingLevel, AIModel } from '../../store/useUIStore';
+import { usePromptsStore } from '../../store/usePromptsStore';
 import ChatArea from './ChatArea';
 import ResearchInput from './ResearchInput';
 
@@ -9,12 +10,6 @@ interface ResearchSheetProps {
   projectId: string;
   projectPath: string;
 }
-
-// Chat type display names
-const CHAT_TYPE_LABELS: Record<ChatType, string> = {
-  research: 'Research',
-  compact: 'Compact'
-};
 
 const AI_MODELS = [
   { value: 'gemini-3-flash-preview', label: 'Gemini 3 Flash' },
@@ -30,7 +25,8 @@ const THINKING_LEVELS = [
 
 export default function ResearchSheet({ projectId, projectPath }: ResearchSheetProps) {
   const { isOpen, closeResearch, getActiveConversation, deleteConversation, pendingChatType, addMessage, setLoading, setAbortController, isLoading } = useResearchStore();
-  const { chatSettings, setChatSettings, showToast } = useUIStore();
+  const { showToast } = useUIStore();
+  const { getPromptById, savePrompt } = usePromptsStore();
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const [showSettings, setShowSettings] = useState(false);
 
@@ -39,14 +35,16 @@ export default function ResearchSheet({ projectId, projectPath }: ResearchSheetP
 
   // Determine current chat type: from active conversation or from pending trigger
   const currentChatType: ChatType = conversation?.type || pendingChatType || 'research';
-  const currentSettings = chatSettings[currentChatType];
+  const currentPrompt = getPromptById(currentChatType);
 
-  // Model and thinking level from per-type settings
-  const selectedModel = currentSettings.model;
-  const thinkingLevel = currentSettings.thinkingLevel;
+  // Model and thinking level from prompt settings
+  const selectedModel = currentPrompt?.model || 'gemini-3-flash-preview';
+  const thinkingLevel = currentPrompt?.thinkingLevel || 'HIGH';
 
   const setSelectedModel = (model: AIModel) => {
-    setChatSettings(currentChatType, { model });
+    if (currentPrompt) {
+      savePrompt({ ...currentPrompt, model });
+    }
   };
 
   // Get last assistant response for copy button
@@ -66,7 +64,9 @@ export default function ResearchSheet({ projectId, projectPath }: ResearchSheetP
   };
 
   const setThinkingLevel = (level: ThinkingLevel) => {
-    setChatSettings(currentChatType, { thinkingLevel: level });
+    if (currentPrompt) {
+      savePrompt({ ...currentPrompt, thinkingLevel: level });
+    }
   };
 
   // Focus input when opened
@@ -224,7 +224,7 @@ export default function ResearchSheet({ projectId, projectPath }: ResearchSheetP
               flexShrink: 0
             }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-                <span style={{ fontSize: '14px', fontWeight: 500, color: '#fff' }}>{CHAT_TYPE_LABELS[currentChatType]}</span>
+                <span style={{ fontSize: '14px', fontWeight: 500, color: currentPrompt?.color || '#fff' }}>{currentPrompt?.name || currentChatType}</span>
 
                 {/* Model select */}
                 <select

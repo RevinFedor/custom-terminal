@@ -1,5 +1,6 @@
 import React, { useEffect, useState, useRef, useCallback } from 'react';
 import { useUIStore } from '../../store/useUIStore';
+import { usePromptsStore, AIPrompt, AIModel, ThinkingLevel } from '../../store/usePromptsStore';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -15,9 +16,6 @@ interface Prompt {
 
 type SettingsTab = 'shortcuts' | 'fonts' | 'colors' | 'ai';
 
-const DEFAULT_RESEARCH_PROMPT = 'вот моя проблема нужно чтобы ты понял что за проблема и на reddit поискал обсуждения. Не ограничивайся категориями. Проблема: ';
-const DEFAULT_COMPACT_PROMPT = 'Проанализируй всю нашу текущую сессию и составь структурированное резюме для переноса контекста в новый чат, включив в него: изначальную цель; список всех созданных файлов с пояснением, почему мы выбрали именно такую структуру и эти файлы; краткий отчет о том, что работает; детальный разбор того, что НЕ получилось, с указанием конкретных причин ошибок (почему выбранные решения не сработали); текущее состояние кода и пошаговый план дальнейших действий — оформи это всё одним компактным сообщением, которое я смогу скопировать и отправить тебе в новом чате для полного восстановления контекста.\n\nВот текст сессии:\n';
-const DEFAULT_DESCRIPTION_PROMPT_SETTINGS = '1-2 предложения: что сделано. Без маркдауна, без вступлений.\n\n';
 const DEFAULT_DOC_FILE_PATH = '/Users/fedor/Global-Templates/🧩 Code-Patterns/документация/docs-rules.prompt.md';
 
 // Track if settings was opened at least once (for default tab)
@@ -150,34 +148,34 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
   const setTabNotesPaddingX = useUIStore((s) => s.setTabNotesPaddingX);
   const tabNotesPaddingY = useUIStore((s) => s.tabNotesPaddingY);
   const setTabNotesPaddingY = useUIStore((s) => s.setTabNotesPaddingY);
-  const { showToast, chatSettings, setChatSettings, docPrompt, setDocPromptUseFile, setDocPromptFilePath, setDocPromptInlineContent, claudeDefaultPromptEnabled, setClaudeDefaultPromptEnabled } = useUIStore();
+  const { showToast, docPrompt, setDocPromptUseFile, setDocPromptFilePath, setDocPromptInlineContent, claudeDefaultPromptEnabled, setClaudeDefaultPromptEnabled } = useUIStore();
+  const { prompts: aiPrompts, loadPrompts: loadAIPrompts, savePrompt: saveAIPrompt, deletePrompt: deleteAIPrompt, rewindPromptId, setRewindPromptId } = usePromptsStore();
 
   // Claude Default Prompt
   const [claudeDefaultPrompt, setClaudeDefaultPrompt] = useState('');
 
-  // System prompts
-  const [localResearchPrompt, setLocalResearchPrompt] = useState('');
-  const [localCompactPrompt, setLocalCompactPrompt] = useState('');
-  const [localDescriptionPrompt, setLocalDescriptionPrompt] = useState('');
+  // Doc prompt local state
   const [localDocFilePath, setLocalDocFilePath] = useState('');
   const [localDocInlineContent, setLocalDocInlineContent] = useState('');
 
-  // User prompts
+  // User prompts (text insertion snippets, not AI prompts)
   const [prompts, setPrompts] = useState<Prompt[]>([]);
 
   // Editing states
   const [editingClaude, setEditingClaude] = useState(false);
-  const [editingResearch, setEditingResearch] = useState(false);
-  const [editingCompact, setEditingCompact] = useState(false);
-  const [editingDescription, setEditingDescription] = useState(false);
+  const [editingPromptId, setEditingPromptId] = useState<string | null>(null); // AI prompt being edited
   const [editingDocPrompt, setEditingDocPrompt] = useState(false);
-  const [editingPrompt, setEditingPrompt] = useState<number | null>(null);
+  const [editingPrompt, setEditingPrompt] = useState<number | null>(null); // text insertion prompt being edited
+
+  // Local copies of AI prompt fields for editing
+  const [localPromptContent, setLocalPromptContent] = useState('');
+  const [localPromptName, setLocalPromptName] = useState('');
+  const [localPromptColor, setLocalPromptColor] = useState('');
+  const [localPromptShowInMenu, setLocalPromptShowInMenu] = useState(true);
 
   // Refs for editing containers (to check if blur target is inside)
   const claudeEditRef = useRef<HTMLDivElement>(null);
-  const researchEditRef = useRef<HTMLDivElement>(null);
-  const compactEditRef = useRef<HTMLDivElement>(null);
-  const descriptionEditRef = useRef<HTMLDivElement>(null);
+  const aiPromptEditRef = useRef<HTMLDivElement>(null);
   const docEditRef = useRef<HTMLDivElement>(null);
   const promptEditRefs = useRef<Map<number, HTMLDivElement>>(new Map());
 
@@ -197,14 +195,14 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
         setClaudeDefaultPrompt(value || '');
       });
 
-      // Load system prompts from store
-      setLocalResearchPrompt(chatSettings.research.prompt);
-      setLocalCompactPrompt(chatSettings.compact.prompt);
-      setLocalDescriptionPrompt(chatSettings.description.prompt);
+      // Load AI prompts from DB
+      loadAIPrompts();
+
+      // Load doc prompt local state
       setLocalDocFilePath(docPrompt.filePath);
       setLocalDocInlineContent(docPrompt.inlineContent);
 
-      // Load user prompts
+      // Load user prompts (text insertion snippets)
       ipcRenderer.invoke('prompts:get').then((result: { success: boolean; data?: Prompt[] }) => {
         if (result.success && result.data) {
           setPrompts(result.data);
@@ -213,13 +211,11 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
     } else {
       // Reset editing states when modal closes
       setEditingClaude(false);
-      setEditingResearch(false);
-      setEditingCompact(false);
-      setEditingDescription(false);
+      setEditingPromptId(null);
       setEditingDocPrompt(false);
       setEditingPrompt(null);
     }
-  }, [isOpen, chatSettings, docPrompt]);
+  }, [isOpen, docPrompt]);
 
   // Helper: check if blur target is inside container
   const isBlurInsideContainer = (e: React.FocusEvent, containerRef: React.RefObject<HTMLDivElement | null>) => {
@@ -232,18 +228,6 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
   const saveClaudePromptImmediate = useCallback((value: string) => {
     ipcRenderer.invoke('app:setState', { key: 'claudeDefaultPrompt', value });
   }, []);
-
-  const saveResearchPromptImmediate = useCallback((value: string) => {
-    setChatSettings('research', { prompt: value });
-  }, [setChatSettings]);
-
-  const saveCompactPromptImmediate = useCallback((value: string) => {
-    setChatSettings('compact', { prompt: value });
-  }, [setChatSettings]);
-
-  const saveDescriptionPromptImmediate = useCallback((value: string) => {
-    setChatSettings('description', { prompt: value });
-  }, [setChatSettings]);
 
   const saveDocFilePathImmediate = useCallback((value: string) => {
     setDocPromptFilePath(value);
@@ -264,22 +248,22 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
     setEditingClaude(false);
   };
 
-  const handleResearchBlur = (e: React.FocusEvent) => {
-    if (isBlurInsideContainer(e, researchEditRef)) return;
-    saveResearchPromptImmediate(localResearchPrompt);
-    setEditingResearch(false);
-  };
-
-  const handleCompactBlur = (e: React.FocusEvent) => {
-    if (isBlurInsideContainer(e, compactEditRef)) return;
-    saveCompactPromptImmediate(localCompactPrompt);
-    setEditingCompact(false);
-  };
-
-  const handleDescriptionBlur = (e: React.FocusEvent) => {
-    if (isBlurInsideContainer(e, descriptionEditRef)) return;
-    saveDescriptionPromptImmediate(localDescriptionPrompt);
-    setEditingDescription(false);
+  const handleAIPromptBlur = (e: React.FocusEvent) => {
+    if (isBlurInsideContainer(e, aiPromptEditRef)) return;
+    // Save the currently editing AI prompt
+    if (editingPromptId) {
+      const prompt = aiPrompts.find(p => p.id === editingPromptId);
+      if (prompt) {
+        saveAIPrompt({
+          ...prompt,
+          content: localPromptContent,
+          name: localPromptName,
+          color: localPromptColor,
+          showInContextMenu: localPromptShowInMenu
+        });
+      }
+    }
+    setEditingPromptId(null);
   };
 
   const handleDocBlur = (e: React.FocusEvent) => {
@@ -302,7 +286,35 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
     setEditingPrompt(null);
   };
 
-  // User prompts management
+  // Start editing an AI prompt
+  const startEditingAIPrompt = (prompt: AIPrompt) => {
+    setEditingPromptId(prompt.id);
+    setLocalPromptContent(prompt.content);
+    setLocalPromptName(prompt.name);
+    setLocalPromptColor(prompt.color);
+    setLocalPromptShowInMenu(prompt.showInContextMenu);
+  };
+
+  // Add new custom AI prompt
+  const addAIPrompt = () => {
+    const newId = `prompt-${Date.now()}`;
+    const maxPos = aiPrompts.reduce((max, p) => Math.max(max, p.position), 0);
+    const newPrompt: AIPrompt = {
+      id: newId,
+      name: `Prompt ${aiPrompts.length + 1}`,
+      content: '',
+      model: 'gemini-3-flash-preview',
+      thinkingLevel: 'HIGH',
+      color: '#6366f1',
+      isBuiltIn: false,
+      showInContextMenu: true,
+      position: maxPos + 1
+    };
+    saveAIPrompt(newPrompt);
+    startEditingAIPrompt(newPrompt);
+  };
+
+  // User prompts management (text insertion snippets)
   const addPrompt = () => {
     const newPrompts = [...prompts, { title: `Prompt ${prompts.length + 1}`, content: '' }];
     setPrompts(newPrompts);
@@ -324,32 +336,18 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
     setEditingPrompt(null);
   };
 
-  // Reset functions
-  const resetResearch = () => {
-    setLocalResearchPrompt(DEFAULT_RESEARCH_PROMPT);
-    saveResearchPromptImmediate(DEFAULT_RESEARCH_PROMPT);
-  };
-
-  const resetCompact = () => {
-    setLocalCompactPrompt(DEFAULT_COMPACT_PROMPT);
-    saveCompactPromptImmediate(DEFAULT_COMPACT_PROMPT);
-  };
-
-  const resetDescription = () => {
-    setLocalDescriptionPrompt(DEFAULT_DESCRIPTION_PROMPT_SETTINGS);
-    saveDescriptionPromptImmediate(DEFAULT_DESCRIPTION_PROMPT_SETTINGS);
-  };
-
   const resetDoc = () => {
     setLocalDocFilePath(DEFAULT_DOC_FILE_PATH);
     setDocPromptFilePath(DEFAULT_DOC_FILE_PATH);
     setDocPromptUseFile(true);
   };
 
-  // Close on Escape
+  // Close on Escape or Cmd+,
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && isOpen) {
+      if (!isOpen) return;
+      if (e.key === 'Escape' || (e.metaKey && e.code === 'Comma')) {
+        e.preventDefault();
         onClose();
       }
     };
@@ -601,13 +599,170 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
 
           {activeTab === 'ai' && (
             <div style={{ display: 'flex', gap: '24px' }}>
-              {/* Left Column - System Prompts */}
+              {/* Left Column - AI Prompts (dynamic) */}
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div style={{ fontSize: '11px', fontWeight: '600', color: '#666', marginBottom: '12px', textTransform: 'uppercase' }}>
-                  Системные промпты
+                  AI промпты (Gemini)
                 </div>
 
-                {/* Claude Default Prompt */}
+                {/* Dynamic AI Prompts */}
+                {aiPrompts.map((aiPrompt) => {
+                  const isEditing = editingPromptId === aiPrompt.id;
+                  return (
+                    <div
+                      key={aiPrompt.id}
+                      ref={isEditing ? aiPromptEditRef : undefined}
+                      onClick={() => !isEditing && startEditingAIPrompt(aiPrompt)}
+                      style={{
+                        padding: '12px',
+                        backgroundColor: isEditing ? '#252525' : '#222',
+                        border: isEditing ? `2px solid ${aiPrompt.color}` : `2px solid ${aiPrompt.color}33`,
+                        borderRadius: '10px',
+                        cursor: isEditing ? 'default' : 'pointer',
+                        marginBottom: '10px'
+                      }}
+                    >
+                      {isEditing ? (
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                          <input
+                            type="text"
+                            value={localPromptName}
+                            onChange={(e) => setLocalPromptName(e.target.value)}
+                            onBlur={handleAIPromptBlur}
+                            placeholder="Название..."
+                            autoFocus
+                            style={{ width: '100%', padding: '8px', backgroundColor: '#1a1a1a', border: '1px solid #444', borderRadius: '6px', color: '#fff', fontSize: '12px', outline: 'none', boxSizing: 'border-box' as const }}
+                          />
+                          <textarea
+                            value={localPromptContent}
+                            onChange={(e) => setLocalPromptContent(e.target.value)}
+                            onBlur={handleAIPromptBlur}
+                            rows={3}
+                            style={{ width: '100%', padding: '8px', backgroundColor: '#1a1a1a', border: '1px solid #444', borderRadius: '6px', color: '#aaa', fontSize: '11px', fontFamily: 'monospace', outline: 'none', resize: 'none', boxSizing: 'border-box' as const }}
+                          />
+                          {/* Model selector */}
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                            <span style={{ fontSize: '10px', color: '#888' }}>Модель:</span>
+                            {([
+                              { value: 'gemini-3-flash-preview' as AIModel, label: 'Flash' },
+                              { value: 'gemini-3-pro-preview' as AIModel, label: 'Pro' }
+                            ]).map((m) => (
+                              <button
+                                key={m.value}
+                                onClick={(e) => { e.stopPropagation(); saveAIPrompt({ ...aiPrompt, model: m.value }); }}
+                                style={{
+                                  padding: '2px 8px',
+                                  backgroundColor: aiPrompt.model === m.value ? aiPrompt.color : '#333',
+                                  color: aiPrompt.model === m.value ? '#fff' : '#888',
+                                  border: 'none', borderRadius: '4px', fontSize: '10px', cursor: 'pointer'
+                                }}
+                              >
+                                {m.label}
+                              </button>
+                            ))}
+                          </div>
+                          {/* Show in context menu toggle */}
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                            <span style={{ fontSize: '10px', color: '#888' }}>В контекстном меню:</span>
+                            <div
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                const newVal = !localPromptShowInMenu;
+                                setLocalPromptShowInMenu(newVal);
+                                saveAIPrompt({ ...aiPrompt, showInContextMenu: newVal });
+                              }}
+                              style={{ width: '28px', height: '16px', borderRadius: '8px', backgroundColor: localPromptShowInMenu ? aiPrompt.color : '#444', position: 'relative' as const, cursor: 'pointer', transition: 'background-color 0.2s', flexShrink: 0 }}
+                            >
+                              <div style={{ width: '12px', height: '12px', borderRadius: '50%', backgroundColor: '#fff', position: 'absolute' as const, top: '2px', left: localPromptShowInMenu ? '14px' : '2px', transition: 'left 0.2s' }} />
+                            </div>
+                          </div>
+                          {/* Color picker (simple presets) */}
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                            <span style={{ fontSize: '10px', color: '#888' }}>Цвет:</span>
+                            {['#0ea5e9', '#a855f7', '#f59e0b', '#22c55e', '#ef4444', '#6366f1', '#ec4899'].map((c) => (
+                              <div
+                                key={c}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setLocalPromptColor(c);
+                                  saveAIPrompt({ ...aiPrompt, color: c });
+                                }}
+                                style={{
+                                  width: '14px', height: '14px', borderRadius: '50%', backgroundColor: c, cursor: 'pointer',
+                                  border: aiPrompt.color === c ? '2px solid #fff' : '2px solid transparent'
+                                }}
+                              />
+                            ))}
+                          </div>
+                          <div style={{ display: 'flex', gap: '6px' }}>
+                            {aiPrompt.isBuiltIn && (
+                              <button
+                                onClick={(e) => { e.stopPropagation(); /* Reset: reload from DB default would need original, just keep as-is */ }}
+                                style={{ padding: '4px 8px', backgroundColor: 'transparent', color: '#666', border: 'none', fontSize: '10px', cursor: 'pointer' }}
+                              >
+                                Сбросить
+                              </button>
+                            )}
+                            {!aiPrompt.isBuiltIn && (
+                              <button
+                                onClick={(e) => { e.stopPropagation(); deleteAIPrompt(aiPrompt.id); setEditingPromptId(null); showToast('Deleted', 'success'); }}
+                                style={{ padding: '4px 8px', backgroundColor: 'transparent', color: '#ef4444', border: 'none', fontSize: '10px', cursor: 'pointer' }}
+                              >
+                                Удалить
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      ) : (
+                        <>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '4px' }}>
+                            <span style={{ fontSize: '13px', color: aiPrompt.color, fontWeight: '500' }}>{aiPrompt.name}</span>
+                            <span style={{ fontSize: '9px', padding: '1px 4px', backgroundColor: `${aiPrompt.color}22`, color: aiPrompt.color, borderRadius: '3px' }}>
+                              {aiPrompt.model.includes('pro') ? 'PRO' : 'FLASH'}
+                            </span>
+                            {aiPrompt.showInContextMenu && (
+                              <span style={{ fontSize: '9px', padding: '1px 4px', backgroundColor: '#ffffff11', color: '#666', borderRadius: '3px' }}>ПКМ</span>
+                            )}
+                          </div>
+                          <div style={{ fontSize: '11px', color: '#666', overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' as const }}>
+                            {aiPrompt.content}
+                          </div>
+                        </>
+                      )}
+                    </div>
+                  );
+                })}
+
+                {/* Add new AI prompt button */}
+                <button
+                  onClick={addAIPrompt}
+                  style={{ width: '100%', padding: '10px', backgroundColor: '#222', border: '2px dashed #444', borderRadius: '10px', color: '#666', fontSize: '12px', cursor: 'pointer', marginBottom: '10px' }}
+                >
+                  + Добавить промпт
+                </button>
+
+                {/* Rewind Assignment */}
+                <div style={{ padding: '12px', backgroundColor: '#222', border: '1px solid #333', borderRadius: '10px', marginBottom: '10px' }}>
+                  <div style={{ fontSize: '11px', color: '#888', marginBottom: '6px' }}>Промпт для "Откатиться":</div>
+                  <select
+                    value={rewindPromptId}
+                    onChange={(e) => setRewindPromptId(e.target.value)}
+                    style={{ width: '100%', padding: '6px 8px', backgroundColor: '#1a1a1a', border: '1px solid #444', borderRadius: '6px', color: '#ccc', fontSize: '11px', outline: 'none', cursor: 'pointer' }}
+                  >
+                    {aiPrompts.map((p) => (
+                      <option key={p.id} value={p.id}>{p.name}</option>
+                    ))}
+                  </select>
+                </div>
+
+                {/* Separator */}
+                <div style={{ borderTop: '1px solid #333', margin: '16px 0 12px', position: 'relative' as const }}>
+                  <span style={{ position: 'absolute' as const, top: '-8px', left: '12px', backgroundColor: '#1a1a1a', padding: '0 8px', fontSize: '10px', color: '#555', textTransform: 'uppercase' }}>
+                    Системные промпты
+                  </span>
+                </div>
+
+                {/* Claude Default Prompt — separate (toggle logic) */}
                 <div
                   ref={claudeEditRef}
                   onClick={() => !editingClaude && setEditingClaude(true)}
@@ -629,301 +784,27 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                       placeholder="Стартовый промпт Claude..."
                       rows={3}
                       autoFocus
-                      style={{
-                        width: '100%',
-                        padding: '8px',
-                        backgroundColor: '#1a1a1a',
-                        border: '1px solid #444',
-                        borderRadius: '6px',
-                        color: '#aaa',
-                        fontSize: '11px',
-                        fontFamily: 'monospace',
-                        outline: 'none',
-                        resize: 'none',
-                        boxSizing: 'border-box'
-                      }}
+                      style={{ width: '100%', padding: '8px', backgroundColor: '#1a1a1a', border: '1px solid #444', borderRadius: '6px', color: '#aaa', fontSize: '11px', fontFamily: 'monospace', outline: 'none', resize: 'none', boxSizing: 'border-box' as const }}
                     />
                   ) : (
                     <>
                       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '4px' }}>
                         <div style={{ fontSize: '13px', color: '#DA7756', fontWeight: '500' }}>Claude Default</div>
                         <div
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            setClaudeDefaultPromptEnabled(!claudeDefaultPromptEnabled);
-                          }}
-                          style={{
-                            width: '32px',
-                            height: '18px',
-                            borderRadius: '9px',
-                            backgroundColor: claudeDefaultPromptEnabled ? '#DA7756' : '#444',
-                            position: 'relative',
-                            cursor: 'pointer',
-                            transition: 'background-color 0.2s',
-                            flexShrink: 0
-                          }}
+                          onClick={(e) => { e.stopPropagation(); setClaudeDefaultPromptEnabled(!claudeDefaultPromptEnabled); }}
+                          style={{ width: '32px', height: '18px', borderRadius: '9px', backgroundColor: claudeDefaultPromptEnabled ? '#DA7756' : '#444', position: 'relative' as const, cursor: 'pointer', transition: 'background-color 0.2s', flexShrink: 0 }}
                         >
-                          <div style={{
-                            width: '14px',
-                            height: '14px',
-                            borderRadius: '50%',
-                            backgroundColor: '#fff',
-                            position: 'absolute',
-                            top: '2px',
-                            left: claudeDefaultPromptEnabled ? '16px' : '2px',
-                            transition: 'left 0.2s'
-                          }} />
+                          <div style={{ width: '14px', height: '14px', borderRadius: '50%', backgroundColor: '#fff', position: 'absolute' as const, top: '2px', left: claudeDefaultPromptEnabled ? '16px' : '2px', transition: 'left 0.2s' }} />
                         </div>
                       </div>
-                      <div style={{ fontSize: '11px', color: claudeDefaultPromptEnabled ? '#666' : '#555', overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', opacity: claudeDefaultPromptEnabled ? 1 : 0.5 }}>
+                      <div style={{ fontSize: '11px', color: claudeDefaultPromptEnabled ? '#666' : '#555', overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' as const, opacity: claudeDefaultPromptEnabled ? 1 : 0.5 }}>
                         {claudeDefaultPrompt || 'Не задан'}
                       </div>
                     </>
                   )}
                 </div>
 
-                {/* Research Prompt */}
-                <div
-                  ref={researchEditRef}
-                  onClick={() => !editingResearch && setEditingResearch(true)}
-                  style={{
-                    padding: '12px',
-                    backgroundColor: editingResearch ? '#252525' : '#222',
-                    border: editingResearch ? '2px solid #0ea5e9' : '2px solid #0ea5e933',
-                    borderRadius: '10px',
-                    cursor: editingResearch ? 'default' : 'pointer',
-                    marginBottom: '10px'
-                  }}
-                >
-                  {editingResearch ? (
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                      <textarea
-                        value={localResearchPrompt}
-                        onChange={(e) => setLocalResearchPrompt(e.target.value)}
-                        onBlur={handleResearchBlur}
-                        rows={3}
-                        autoFocus
-                        style={{
-                          width: '100%',
-                          padding: '8px',
-                          backgroundColor: '#1a1a1a',
-                          border: '1px solid #444',
-                          borderRadius: '6px',
-                          color: '#aaa',
-                          fontSize: '11px',
-                          fontFamily: 'monospace',
-                          outline: 'none',
-                          resize: 'none',
-                          boxSizing: 'border-box'
-                        }}
-                      />
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                        <span style={{ fontSize: '10px', color: '#888' }}>Модель:</span>
-                        {([
-                          { value: 'gemini-3-flash-preview', label: 'Flash' },
-                          { value: 'gemini-3-pro-preview', label: 'Pro' }
-                        ] as const).map((m) => (
-                          <button
-                            key={m.value}
-                            onClick={(e) => { e.stopPropagation(); setChatSettings('research', { model: m.value }); }}
-                            style={{
-                              padding: '2px 8px',
-                              backgroundColor: chatSettings.research.model === m.value ? '#0ea5e9' : '#333',
-                              color: chatSettings.research.model === m.value ? '#fff' : '#888',
-                              border: 'none',
-                              borderRadius: '4px',
-                              fontSize: '10px',
-                              cursor: 'pointer'
-                            }}
-                          >
-                            {m.label}
-                          </button>
-                        ))}
-                      </div>
-                      <button
-                        onClick={(e) => { e.stopPropagation(); resetResearch(); }}
-                        style={{ alignSelf: 'flex-start', padding: '4px 8px', backgroundColor: 'transparent', color: '#666', border: 'none', fontSize: '10px', cursor: 'pointer' }}
-                      >
-                        Сбросить
-                      </button>
-                    </div>
-                  ) : (
-                    <>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '4px' }}>
-                        <span style={{ fontSize: '13px', color: '#0ea5e9', fontWeight: '500' }}>Research</span>
-                        <span style={{ fontSize: '9px', padding: '1px 4px', backgroundColor: '#0ea5e922', color: '#0ea5e9', borderRadius: '3px' }}>
-                          {chatSettings.research.model.includes('pro') ? 'PRO' : 'FLASH'}
-                        </span>
-                      </div>
-                      <div style={{ fontSize: '11px', color: '#666', overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' }}>
-                        {localResearchPrompt}
-                      </div>
-                    </>
-                  )}
-                </div>
-
-                {/* Compact Prompt */}
-                <div
-                  ref={compactEditRef}
-                  onClick={() => !editingCompact && setEditingCompact(true)}
-                  style={{
-                    padding: '12px',
-                    backgroundColor: editingCompact ? '#252525' : '#222',
-                    border: editingCompact ? '2px solid #a855f7' : '2px solid #a855f733',
-                    borderRadius: '10px',
-                    cursor: editingCompact ? 'default' : 'pointer',
-                    marginBottom: '10px'
-                  }}
-                >
-                  {editingCompact ? (
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                      <textarea
-                        value={localCompactPrompt}
-                        onChange={(e) => setLocalCompactPrompt(e.target.value)}
-                        onBlur={handleCompactBlur}
-                        rows={4}
-                        autoFocus
-                        style={{
-                          width: '100%',
-                          padding: '8px',
-                          backgroundColor: '#1a1a1a',
-                          border: '1px solid #444',
-                          borderRadius: '6px',
-                          color: '#aaa',
-                          fontSize: '11px',
-                          fontFamily: 'monospace',
-                          outline: 'none',
-                          resize: 'none',
-                          boxSizing: 'border-box'
-                        }}
-                      />
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                        <span style={{ fontSize: '10px', color: '#888' }}>Модель:</span>
-                        {([
-                          { value: 'gemini-3-flash-preview', label: 'Flash' },
-                          { value: 'gemini-3-pro-preview', label: 'Pro' }
-                        ] as const).map((m) => (
-                          <button
-                            key={m.value}
-                            onClick={(e) => { e.stopPropagation(); setChatSettings('compact', { model: m.value }); }}
-                            style={{
-                              padding: '2px 8px',
-                              backgroundColor: chatSettings.compact.model === m.value ? '#a855f7' : '#333',
-                              color: chatSettings.compact.model === m.value ? '#fff' : '#888',
-                              border: 'none',
-                              borderRadius: '4px',
-                              fontSize: '10px',
-                              cursor: 'pointer'
-                            }}
-                          >
-                            {m.label}
-                          </button>
-                        ))}
-                      </div>
-                      <button
-                        onClick={(e) => { e.stopPropagation(); resetCompact(); }}
-                        style={{ alignSelf: 'flex-start', padding: '4px 8px', backgroundColor: 'transparent', color: '#666', border: 'none', fontSize: '10px', cursor: 'pointer' }}
-                      >
-                        Сбросить
-                      </button>
-                    </div>
-                  ) : (
-                    <>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '4px' }}>
-                        <span style={{ fontSize: '13px', color: '#a855f7', fontWeight: '500' }}>Compact (Резюме)</span>
-                        <span style={{ fontSize: '9px', padding: '1px 4px', backgroundColor: '#a855f722', color: '#a855f7', borderRadius: '3px' }}>
-                          {chatSettings.compact.model.includes('pro') ? 'PRO' : 'FLASH'}
-                        </span>
-                      </div>
-                      <div style={{ fontSize: '11px', color: '#666', overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' }}>
-                        {localCompactPrompt}
-                      </div>
-                    </>
-                  )}
-                </div>
-
-                {/* Description Prompt */}
-                <div
-                  ref={descriptionEditRef}
-                  onClick={() => !editingDescription && setEditingDescription(true)}
-                  style={{
-                    padding: '12px',
-                    backgroundColor: editingDescription ? '#252525' : '#222',
-                    border: editingDescription ? '2px solid #f59e0b' : '2px solid #f59e0b33',
-                    borderRadius: '10px',
-                    cursor: editingDescription ? 'default' : 'pointer',
-                    marginBottom: '10px'
-                  }}
-                >
-                  {editingDescription ? (
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                      <textarea
-                        value={localDescriptionPrompt}
-                        onChange={(e) => setLocalDescriptionPrompt(e.target.value)}
-                        onBlur={handleDescriptionBlur}
-                        rows={3}
-                        autoFocus
-                        style={{
-                          width: '100%',
-                          padding: '8px',
-                          backgroundColor: '#1a1a1a',
-                          border: '1px solid #444',
-                          borderRadius: '6px',
-                          color: '#aaa',
-                          fontSize: '11px',
-                          fontFamily: 'monospace',
-                          outline: 'none',
-                          resize: 'none',
-                          boxSizing: 'border-box'
-                        }}
-                      />
-                      {/* Model selector */}
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                        <span style={{ fontSize: '10px', color: '#888' }}>Модель:</span>
-                        {([
-                          { value: 'gemini-3-flash-preview', label: 'Flash' },
-                          { value: 'gemini-3-pro-preview', label: 'Pro' }
-                        ] as const).map((m) => (
-                          <button
-                            key={m.value}
-                            onClick={(e) => { e.stopPropagation(); setChatSettings('description', { model: m.value }); }}
-                            style={{
-                              padding: '2px 8px',
-                              backgroundColor: chatSettings.description.model === m.value ? '#f59e0b' : '#333',
-                              color: chatSettings.description.model === m.value ? '#fff' : '#888',
-                              border: 'none',
-                              borderRadius: '4px',
-                              fontSize: '10px',
-                              cursor: 'pointer'
-                            }}
-                          >
-                            {m.label}
-                          </button>
-                        ))}
-                      </div>
-                      <button
-                        onClick={(e) => { e.stopPropagation(); resetDescription(); }}
-                        style={{ alignSelf: 'flex-start', padding: '4px 8px', backgroundColor: 'transparent', color: '#666', border: 'none', fontSize: '10px', cursor: 'pointer' }}
-                      >
-                        Сбросить
-                      </button>
-                    </div>
-                  ) : (
-                    <>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '4px' }}>
-                        <span style={{ fontSize: '13px', color: '#f59e0b', fontWeight: '500' }}>Description</span>
-                        <span style={{ fontSize: '9px', padding: '1px 4px', backgroundColor: '#f59e0b22', color: '#f59e0b', borderRadius: '3px' }}>
-                          {chatSettings.description.model.includes('pro') ? 'PRO' : 'FLASH'}
-                        </span>
-                      </div>
-                      <div style={{ fontSize: '11px', color: '#666', overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' }}>
-                        {localDescriptionPrompt}
-                      </div>
-                    </>
-                  )}
-                </div>
-
-                {/* Documentation Prompt */}
+                {/* Documentation Prompt — separate (file/inline logic) */}
                 <div
                   ref={docEditRef}
                   onClick={() => !editingDocPrompt && setEditingDocPrompt(true)}
@@ -939,94 +820,21 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                     <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
                       <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                         <span style={{ fontSize: '11px', color: '#888' }}>Источник:</span>
-                        <button
-                          onClick={(e) => { e.stopPropagation(); setDocPromptUseFile(true); }}
-                          style={{
-                            padding: '3px 8px',
-                            backgroundColor: docPrompt.useFile ? '#22c55e' : '#333',
-                            color: docPrompt.useFile ? '#fff' : '#888',
-                            border: 'none',
-                            borderRadius: '4px',
-                            fontSize: '10px',
-                            cursor: 'pointer'
-                          }}
-                        >
-                          Файл
-                        </button>
-                        <button
-                          onClick={(e) => { e.stopPropagation(); setDocPromptUseFile(false); }}
-                          style={{
-                            padding: '3px 8px',
-                            backgroundColor: !docPrompt.useFile ? '#22c55e' : '#333',
-                            color: !docPrompt.useFile ? '#fff' : '#888',
-                            border: 'none',
-                            borderRadius: '4px',
-                            fontSize: '10px',
-                            cursor: 'pointer'
-                          }}
-                        >
-                          Inline
-                        </button>
+                        <button onClick={(e) => { e.stopPropagation(); setDocPromptUseFile(true); }} style={{ padding: '3px 8px', backgroundColor: docPrompt.useFile ? '#22c55e' : '#333', color: docPrompt.useFile ? '#fff' : '#888', border: 'none', borderRadius: '4px', fontSize: '10px', cursor: 'pointer' }}>Файл</button>
+                        <button onClick={(e) => { e.stopPropagation(); setDocPromptUseFile(false); }} style={{ padding: '3px 8px', backgroundColor: !docPrompt.useFile ? '#22c55e' : '#333', color: !docPrompt.useFile ? '#fff' : '#888', border: 'none', borderRadius: '4px', fontSize: '10px', cursor: 'pointer' }}>Inline</button>
                       </div>
-
                       {docPrompt.useFile ? (
-                        <input
-                          type="text"
-                          value={localDocFilePath}
-                          onChange={(e) => setLocalDocFilePath(e.target.value)}
-                          onBlur={handleDocBlur}
-                          placeholder="Путь к файлу..."
-                          autoFocus
-                          style={{
-                            width: '100%',
-                            padding: '8px',
-                            backgroundColor: '#1a1a1a',
-                            border: '1px solid #444',
-                            borderRadius: '6px',
-                            color: '#aaa',
-                            fontSize: '11px',
-                            fontFamily: 'monospace',
-                            outline: 'none',
-                            boxSizing: 'border-box'
-                          }}
-                        />
+                        <input type="text" value={localDocFilePath} onChange={(e) => setLocalDocFilePath(e.target.value)} onBlur={handleDocBlur} placeholder="Путь к файлу..." autoFocus style={{ width: '100%', padding: '8px', backgroundColor: '#1a1a1a', border: '1px solid #444', borderRadius: '6px', color: '#aaa', fontSize: '11px', fontFamily: 'monospace', outline: 'none', boxSizing: 'border-box' as const }} />
                       ) : (
-                        <textarea
-                          value={localDocInlineContent}
-                          onChange={(e) => setLocalDocInlineContent(e.target.value)}
-                          onBlur={handleDocBlur}
-                          rows={3}
-                          autoFocus
-                          style={{
-                            width: '100%',
-                            padding: '8px',
-                            backgroundColor: '#1a1a1a',
-                            border: '1px solid #444',
-                            borderRadius: '6px',
-                            color: '#aaa',
-                            fontSize: '11px',
-                            fontFamily: 'monospace',
-                            outline: 'none',
-                            resize: 'none',
-                            boxSizing: 'border-box'
-                          }}
-                        />
+                        <textarea value={localDocInlineContent} onChange={(e) => setLocalDocInlineContent(e.target.value)} onBlur={handleDocBlur} rows={3} autoFocus style={{ width: '100%', padding: '8px', backgroundColor: '#1a1a1a', border: '1px solid #444', borderRadius: '6px', color: '#aaa', fontSize: '11px', fontFamily: 'monospace', outline: 'none', resize: 'none', boxSizing: 'border-box' as const }} />
                       )}
-
-                      <button
-                        onClick={(e) => { e.stopPropagation(); resetDoc(); }}
-                        style={{ alignSelf: 'flex-start', padding: '4px 8px', backgroundColor: 'transparent', color: '#666', border: 'none', fontSize: '10px', cursor: 'pointer' }}
-                      >
-                        Сбросить
-                      </button>
+                      <button onClick={(e) => { e.stopPropagation(); resetDoc(); }} style={{ alignSelf: 'flex-start', padding: '4px 8px', backgroundColor: 'transparent', color: '#666', border: 'none', fontSize: '10px', cursor: 'pointer' }}>Сбросить</button>
                     </div>
                   ) : (
                     <>
                       <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '4px' }}>
                         <span style={{ fontSize: '13px', color: '#22c55e', fontWeight: '500' }}>Documentation</span>
-                        <span style={{ fontSize: '9px', padding: '1px 4px', backgroundColor: docPrompt.useFile ? '#22c55e22' : '#8b5cf622', color: docPrompt.useFile ? '#22c55e' : '#8b5cf6', borderRadius: '3px' }}>
-                          {docPrompt.useFile ? 'ФАЙЛ' : 'INLINE'}
-                        </span>
+                        <span style={{ fontSize: '9px', padding: '1px 4px', backgroundColor: docPrompt.useFile ? '#22c55e22' : '#8b5cf622', color: docPrompt.useFile ? '#22c55e' : '#8b5cf6', borderRadius: '3px' }}>{docPrompt.useFile ? 'ФАЙЛ' : 'INLINE'}</span>
                       </div>
                       <div style={{ fontSize: '11px', color: '#666', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                         {docPrompt.useFile ? localDocFilePath : (localDocInlineContent || 'Не задан')}
@@ -1036,109 +844,37 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                 </div>
               </div>
 
-              {/* Right Column - User Prompts */}
+              {/* Right Column - Text Insertion Prompts (context menu snippets) */}
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '12px' }}>
                   <div style={{ fontSize: '11px', fontWeight: '600', color: '#666', textTransform: 'uppercase' }}>
-                    Контекстное меню
+                    Текстовые вставки
                   </div>
-                  <button
-                    onClick={addPrompt}
-                    style={{
-                      padding: '4px 10px',
-                      backgroundColor: '#8b5cf6',
-                      color: '#fff',
-                      border: 'none',
-                      borderRadius: '4px',
-                      fontSize: '10px',
-                      cursor: 'pointer'
-                    }}
-                  >
-                    + Добавить
-                  </button>
+                  <button onClick={addPrompt} style={{ padding: '4px 10px', backgroundColor: '#8b5cf6', color: '#fff', border: 'none', borderRadius: '4px', fontSize: '10px', cursor: 'pointer' }}>+ Добавить</button>
                 </div>
 
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
                   {prompts.length === 0 ? (
-                    <div style={{
-                      padding: '24px',
-                      textAlign: 'center',
-                      color: '#555',
-                      fontSize: '12px',
-                      border: '2px dashed #333',
-                      borderRadius: '10px'
-                    }}>
-                      Пока нет промптов
-                    </div>
+                    <div style={{ padding: '24px', textAlign: 'center', color: '#555', fontSize: '12px', border: '2px dashed #333', borderRadius: '10px' }}>Пока нет промптов</div>
                   ) : (
                     prompts.map((prompt, index) => (
                       <div
                         key={index}
                         ref={(el) => { if (el) promptEditRefs.current.set(index, el); }}
                         onClick={() => editingPrompt !== index && setEditingPrompt(index)}
-                        style={{
-                          padding: '12px',
-                          backgroundColor: editingPrompt === index ? '#252525' : '#222',
-                          border: editingPrompt === index ? '2px solid #8b5cf6' : '2px solid #333',
-                          borderRadius: '10px',
-                          cursor: editingPrompt === index ? 'default' : 'pointer'
-                        }}
+                        style={{ padding: '12px', backgroundColor: editingPrompt === index ? '#252525' : '#222', border: editingPrompt === index ? '2px solid #8b5cf6' : '2px solid #333', borderRadius: '10px', cursor: editingPrompt === index ? 'default' : 'pointer' }}
                       >
                         {editingPrompt === index ? (
                           <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                            <input
-                              type="text"
-                              value={prompt.title}
-                              onChange={(e) => updatePrompt(index, 'title', e.target.value)}
-                              onBlur={(e) => handlePromptBlur(e, index)}
-                              placeholder="Название"
-                              autoFocus
-                              style={{
-                                width: '100%',
-                                padding: '8px',
-                                backgroundColor: '#1a1a1a',
-                                border: '1px solid #444',
-                                borderRadius: '6px',
-                                color: '#fff',
-                                fontSize: '12px',
-                                outline: 'none',
-                                boxSizing: 'border-box'
-                              }}
-                            />
-                            <textarea
-                              value={prompt.content}
-                              onChange={(e) => updatePrompt(index, 'content', e.target.value)}
-                              onBlur={(e) => handlePromptBlur(e, index)}
-                              placeholder="Содержимое..."
-                              rows={2}
-                              style={{
-                                width: '100%',
-                                padding: '8px',
-                                backgroundColor: '#1a1a1a',
-                                border: '1px solid #444',
-                                borderRadius: '6px',
-                                color: '#aaa',
-                                fontSize: '11px',
-                                fontFamily: 'monospace',
-                                outline: 'none',
-                                resize: 'none',
-                                boxSizing: 'border-box'
-                              }}
-                            />
-                            <button
-                              onClick={(e) => { e.stopPropagation(); deletePrompt(index); }}
-                              style={{ alignSelf: 'flex-start', padding: '4px 8px', backgroundColor: 'transparent', color: '#ef4444', border: 'none', fontSize: '10px', cursor: 'pointer' }}
-                            >
-                              Удалить
-                            </button>
+                            <input type="text" value={prompt.title} onChange={(e) => updatePrompt(index, 'title', e.target.value)} onBlur={(e) => handlePromptBlur(e, index)} placeholder="Название" autoFocus style={{ width: '100%', padding: '8px', backgroundColor: '#1a1a1a', border: '1px solid #444', borderRadius: '6px', color: '#fff', fontSize: '12px', outline: 'none', boxSizing: 'border-box' as const }} />
+                            <textarea value={prompt.content} onChange={(e) => updatePrompt(index, 'content', e.target.value)} onBlur={(e) => handlePromptBlur(e, index)} placeholder="Содержимое..." rows={2} style={{ width: '100%', padding: '8px', backgroundColor: '#1a1a1a', border: '1px solid #444', borderRadius: '6px', color: '#aaa', fontSize: '11px', fontFamily: 'monospace', outline: 'none', resize: 'none', boxSizing: 'border-box' as const }} />
+                            <button onClick={(e) => { e.stopPropagation(); deletePrompt(index); }} style={{ alignSelf: 'flex-start', padding: '4px 8px', backgroundColor: 'transparent', color: '#ef4444', border: 'none', fontSize: '10px', cursor: 'pointer' }}>Удалить</button>
                           </div>
                         ) : (
                           <>
                             <div style={{ fontSize: '13px', color: '#fff', fontWeight: '500', marginBottom: '2px' }}>{prompt.title}</div>
                             {prompt.content && (
-                              <div style={{ fontSize: '11px', color: '#666', overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' }}>
-                                {prompt.content}
-                              </div>
+                              <div style={{ fontSize: '11px', color: '#666', overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' as const }}>{prompt.content}</div>
                             )}
                           </>
                         )}
