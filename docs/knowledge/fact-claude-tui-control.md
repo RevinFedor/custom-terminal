@@ -52,7 +52,7 @@ ipcRenderer.send('claude:send-command', tabId, '/model sonnet');
 3. **safePasteAndSubmit:** Вставить сжатое резюме чанками по 900 байт, дожидаясь подтверждения отрисовки каждого чанка через sync marker.
 4. **Submit:** Отправить `\r`.
 
-## Решение: safePasteAndSubmit (Chunked Paste)
+## Решение: safePasteAndSubmit (Programmatic Chunked Paste)
 
 **⚠️ КРИТИЧЕСКОЕ ПРАВИЛО: macOS TTYHOG = 1024 bytes.**
 Ядро macOS режет любой `term.write()` > 1024 байт. Это создает три уровня проблем:
@@ -60,11 +60,35 @@ ipcRenderer.send('claude:send-command', tabId, '/model sonnet');
 2. **Ink Parsing:** Ink не имеет полноценного стейт-машины для bracketed paste. Он парсит байты через `parseKeypress()` и при разрыве последовательности может проигнорировать её или интерпретировать как обычный текст.
 3. **React Batching Race:** Даже если paste дошел целиком, React батчит обновления стейта. Если `\r` (Enter) приходит слишком быстро после paste (в том же микротаске), обработчик `onSubmit` увидит **старый (пустой) стейт**, так как ре-рендер еще не произошел.
 
+### ⚠️ ВАЖНО: safePasteAndSubmit ≠ user paste (Ctrl+V)
+
+`safePasteAndSubmit` — это функция **только для программных операций**, где наш код отправляет текст напрямую в PTY (минуя xterm.js) и сразу шлёт Enter. Она **НЕ используется** в обработчике `terminal:input` (user paste).
+
+**Два разных пути:**
+
+| | User Paste (Ctrl+V) | Programmatic Paste |
+|---|---|---|
+| **Путь** | xterm.js (добавляет brackets) → `terminal:input` → simple chunking | Наш код → `safePasteAndSubmit` → `term.write()` напрямую |
+| **xterm.js** | В цепи (сам добавляет brackets) | Не участвует |
+| **Enter** | Человек жмёт (секунды спустя) | Код шлёт (миллисекунды) |
+| **Sync markers** | Не нужны | Обязательны |
+
+**Почему в `terminal:input` нельзя было использовать `safePasteAndSubmit`:**
+1. Обычные терминалы (bash/zsh) не шлют sync markers → 5-сек таймаут на каждый чанк.
+2. xterm.js уже добавил brackets → `safePasteAndSubmit` создавала второй слой → двойное обрамление.
+
+Подробнее: `knowledge/terminal-core.md` (секция "Двухуровневая система вставки").
+
 ### Алгоритм `safePasteAndSubmit`:
 1. **Chunking:** Контент делится на чанки по ~900 байт.
 2. **Bracketed Wrap:** Каждый чанк оборачивается в ПОЛНЫЙ `\x1b[200~` + chunk + `\x1b[201~`. Итоговый размер каждого `term.write()` < 1024 байт, что гарантирует атомарную доставку в PTY.
 3. **Sync Marker Verification:** После каждого чанка система слушает PTY и ждёт `\x1b[?2026l` (sync marker). Это подтверждает, что Ink обработал вставку, React выполнил стейт-апдейт и отрендерил кадр.
 4. **Submit:** `\r` отправляется только после подтверждения последнего чанка. Это гарантирует, что `onSubmit` прочитает уже зафиксированный в стейте текст.
+
+### Где используется
+- **Handshake:** Автоотправка default prompt при запуске Claude.
+- **send-command:** `/model sonnet`, `/compact` и др. из UI.
+- **Rewind:** Вставка compact-резюме после отката.
 
 **Почему не Text Echo:** Ink коллапсирует большие вставки в строку вида `[Pasted text #N +M lines]`, поэтому проверять наличие самого текста в выводе невозможно. Только sync markers гарантируют успех.
 
