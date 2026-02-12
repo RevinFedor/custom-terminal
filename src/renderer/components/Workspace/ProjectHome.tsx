@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useWorkspaceStore, TabColor, TabType, PendingAction } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import { useUIStore } from '../../store/useUIStore';
@@ -123,6 +123,121 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
   const [historyExpanded, setHistoryExpanded] = useState(false);
   const [homeContextMenu, setHomeContextMenu] = useState<ContextMenuState>(null);
 
+  // Draft mode detection — check if this project was just created
+  const [isDraft, setIsDraft] = useState(false);
+  const [draftName, setDraftName] = useState('Новый проект');
+  const draftInputRef = useRef<HTMLInputElement>(null);
+  const isPickingDirectoryRef = useRef(false);
+  const draftConfirmedRef = useRef(false);
+  const [isEditingName, setIsEditingName] = useState(false);
+  const nameInputRef = useRef<HTMLInputElement>(null);
+
+  // Listen for draft init from App.tsx — only activates once per creation
+  useEffect(() => {
+    const handleDraftInit = (e: any) => {
+      if (e.detail.projectId === projectId) {
+        draftConfirmedRef.current = false;
+        setIsDraft(true);
+        setDraftName(e.detail.name || 'Новый проект');
+      }
+    };
+    window.addEventListener('project:draft-init', handleDraftInit);
+    return () => window.removeEventListener('project:draft-init', handleDraftInit);
+  }, [projectId]);
+
+  // Auto-focus draft input
+  useEffect(() => {
+    if (isDraft && draftInputRef.current) {
+      draftInputRef.current.focus();
+      draftInputRef.current.select();
+    }
+  }, [isDraft]);
+
+  // Auto-focus name edit input
+  useEffect(() => {
+    if (isEditingName && nameInputRef.current) {
+      nameInputRef.current.focus();
+      nameInputRef.current.select();
+    }
+  }, [isEditingName]);
+
+  const handleDraftSubmit = useCallback((name?: string, path?: string) => {
+    const finalName = name || draftName.trim();
+    if (!finalName || (finalName === 'Новый проект' && !path)) {
+      handleDraftCancel();
+      return;
+    }
+    draftConfirmedRef.current = true;
+    setIsDraft(false);
+    window.dispatchEvent(new CustomEvent('project:draft-submit', {
+      detail: { projectId, name: finalName, path }
+    }));
+  }, [draftName, projectId]);
+
+  const handleDraftCancel = useCallback(() => {
+    setIsDraft(false);
+    window.dispatchEvent(new CustomEvent('project:draft-cancel', {
+      detail: { projectId }
+    }));
+  }, [projectId]);
+
+  const handleDraftBlur = useCallback(() => {
+    // Delay to let onMouseDown on directory button set the flag first
+    setTimeout(() => {
+      if (isPickingDirectoryRef.current) return; // Don't cancel — user is picking directory
+      if (draftConfirmedRef.current) return; // Already submitted via Enter/directory
+      if (isDraft) {
+        const trimmed = draftName.trim();
+        if (!trimmed || trimmed === 'Новый проект') {
+          handleDraftCancel();
+        } else {
+          handleDraftSubmit(trimmed);
+        }
+      }
+    }, 100);
+  }, [isDraft, draftName, handleDraftSubmit, handleDraftCancel]);
+
+  const handleDraftKeyDown = useCallback((e: React.KeyboardEvent) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      const trimmed = draftName.trim();
+      if (!trimmed || trimmed === 'Новый проект') {
+        handleDraftCancel();
+      } else {
+        handleDraftSubmit(trimmed);
+      }
+    }
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      handleDraftCancel();
+    }
+  }, [draftName, handleDraftSubmit, handleDraftCancel]);
+
+  const handleDraftDirectoryClick = useCallback(async () => {
+    isPickingDirectoryRef.current = true;
+    try {
+      const selected = await ipcRenderer.invoke('app:select-directory');
+      if (selected) {
+        // Auto-name from directory
+        const dirName = selected.split('/').filter(Boolean).pop() || selected;
+        setDraftName(dirName);
+        await updateProject(projectId, { path: selected });
+        // Sync name with title bar
+        window.dispatchEvent(new CustomEvent('project:name-sync', {
+          detail: { projectId, name: dirName, source: 'home' }
+        }));
+        handleDraftSubmit(dirName, selected);
+      } else {
+        // User cancelled dialog — return to draft, re-focus input
+        if (draftInputRef.current) {
+          draftInputRef.current.focus();
+        }
+      }
+    } finally {
+      isPickingDirectoryRef.current = false;
+    }
+  }, [projectId, updateProject, handleDraftSubmit]);
+
   // CMD+hover popovers (unified hooks)
   const isCmdPressed = useCmdKey();
   const activePopover = useCmdHoverPopover<string>(isCmdPressed);
@@ -143,13 +258,14 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
 
   useEffect(() => {
     const handleSync = (e: any) => {
-      if (e.detail.projectId === projectId) {
+      if (e.detail.projectId === projectId && e.detail.source !== 'home') {
         setSyncName(e.detail.name);
+        if (isDraft) setDraftName(e.detail.name);
       }
     };
     window.addEventListener('project:name-sync', handleSync);
     return () => window.removeEventListener('project:name-sync', handleSync);
-  }, [projectId]);
+  }, [projectId, isDraft]);
 
   const workspace = openProjects.get(projectId);
   const project = projects[projectId];
@@ -346,18 +462,124 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
     <div className="flex-1 bg-bg-main p-6 overflow-y-auto overflow-x-hidden" style={{ position: 'relative' }}>
       {/* Project Header */}
       <div className="mb-6">
-        <h1 className="text-xl text-white font-medium mb-1">{displayName}</h1>
-        <div className="flex items-center gap-2 text-[#666] text-sm">
-          <FolderOpen size={14} />
-          <span>{project.path}</span>
-          <button
-            onClick={handleChangeDirectory}
-            className="text-[#666] hover:text-[#999] cursor-pointer transition-colors p-0.5"
-            title="Change project directory"
-          >
-            <Pencil size={12} />
-          </button>
-        </div>
+        {isDraft ? (
+          /* Draft mode: inline input for naming */
+          <>
+            <input
+              ref={draftInputRef}
+              className="text-xl text-white font-medium mb-1 bg-transparent border-b border-accent outline-none"
+              style={{ width: '400px', maxWidth: '100%' }}
+              value={draftName}
+              onChange={(e) => {
+                setDraftName(e.target.value);
+                window.dispatchEvent(new CustomEvent('project:name-sync', {
+                  detail: { projectId, name: e.target.value, source: 'home' }
+                }));
+              }}
+              onBlur={handleDraftBlur}
+              onKeyDown={handleDraftKeyDown}
+              placeholder="Project name..."
+            />
+            <div className="flex items-center gap-2 text-[#666] text-sm mt-1">
+              <FolderOpen size={14} />
+              <span className="text-[#555] italic">No directory selected</span>
+              <button
+                onMouseDown={(e) => {
+                  e.preventDefault(); // Prevent blur on input
+                  isPickingDirectoryRef.current = true;
+                }}
+                onClick={handleDraftDirectoryClick}
+                className="text-accent hover:text-white cursor-pointer transition-colors p-1 rounded hover:bg-accent/10"
+                title="Select project directory"
+              >
+                <FolderOpen size={14} />
+              </button>
+            </div>
+          </>
+        ) : isEditingName ? (
+          /* Normal editing mode: inline rename */
+          <>
+            <input
+              ref={nameInputRef}
+              className="text-xl text-white font-medium mb-1 bg-transparent border-b border-white/20 outline-none focus:border-accent"
+              style={{ width: '400px', maxWidth: '100%' }}
+              value={draftName}
+              onChange={(e) => {
+                setDraftName(e.target.value);
+                window.dispatchEvent(new CustomEvent('project:name-sync', {
+                  detail: { projectId, name: e.target.value, source: 'home' }
+                }));
+              }}
+              onBlur={async () => {
+                setIsEditingName(false);
+                window.dispatchEvent(new CustomEvent('project:edit-end', { detail: { projectId } }));
+                const trimmed = draftName.trim();
+                if (trimmed && trimmed !== project.name) {
+                  await updateProject(projectId, { name: trimmed });
+                }
+              }}
+              onKeyDown={async (e) => {
+                if (e.key === 'Enter') {
+                  setIsEditingName(false);
+                  window.dispatchEvent(new CustomEvent('project:edit-end', { detail: { projectId } }));
+                  const trimmed = draftName.trim();
+                  if (trimmed && trimmed !== project.name) {
+                    await updateProject(projectId, { name: trimmed });
+                  }
+                }
+                if (e.key === 'Escape') {
+                  setIsEditingName(false);
+                  setDraftName(project.name);
+                  window.dispatchEvent(new CustomEvent('project:edit-end', { detail: { projectId } }));
+                }
+              }}
+              placeholder="Project name..."
+            />
+            <div className="flex items-center gap-2 text-[#666] text-sm mt-1">
+              <FolderOpen size={14} />
+              <span>{project.path.startsWith('__unset__') ? 'No path' : project.path}</span>
+              <button
+                onClick={handleChangeDirectory}
+                className="text-[#666] hover:text-[#999] cursor-pointer transition-colors p-0.5"
+                title="Change project directory"
+              >
+                <Pencil size={12} />
+              </button>
+            </div>
+          </>
+        ) : (
+          /* Normal display mode */
+          <>
+            <div className="flex items-center gap-2 mb-1">
+              <h1 className="text-xl text-white font-medium">{displayName}</h1>
+              <button
+                onClick={() => {
+                  setDraftName(project.name);
+                  setIsEditingName(true);
+                  // Start editing in title bar too for sync
+                  window.dispatchEvent(new CustomEvent('project:edit-start', {
+                    detail: { projectId, name: project.name }
+                  }));
+                }}
+                className="text-[#555] hover:text-[#999] cursor-pointer transition-colors p-0.5"
+                title="Rename project"
+              >
+                <Pencil size={12} />
+              </button>
+            </div>
+            <div className="flex items-center gap-2 text-[#666] text-sm">
+              <FolderOpen size={14} />
+              <span>{project.path.startsWith('__unset__') ? 'No path' : project.path}</span>
+              <button
+                onClick={handleChangeDirectory}
+                className="text-[#666] hover:text-[#999] cursor-pointer transition-colors p-0.5"
+                title="Change project directory"
+              >
+                <Pencil size={12} />
+              </button>
+            </div>
+          </>
+        )}
       </div>
 
       {/* Active Tabs Grid */}

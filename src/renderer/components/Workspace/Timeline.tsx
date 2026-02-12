@@ -14,7 +14,7 @@ const TooltipPortal: React.FC<{ children: React.ReactNode }> = ({ children }) =>
 
 interface TimelineEntry {
   uuid: string;
-  type: 'user' | 'compact';
+  type: 'user' | 'compact' | 'continued';
   timestamp: string;
   content: string;
   isCompactSummary?: boolean;
@@ -68,6 +68,9 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
   const [sessionBoundaries, setSessionBoundaries] = useState<SessionBoundary[]>([]);
   const [copyingRange, setCopyingRange] = useState<{ startIndex: number, endIndex: number } | null>(null);
   const [copiedRange, setCopiedRange] = useState<{ startIndex: number, endIndex: number } | null>(null);
+  const [visibleEntryIndices, setVisibleEntryIndices] = useState<Set<number>>(new Set());
+  const [unreachableIndices, setUnreachableIndices] = useState<Set<number>>(new Set());
+  const [clickedState, setClickedState] = useState<{ index: number; status: 'loading' | 'failed' } | null>(null);
 
   const notesPanelWidth = useUIStore(state => state.notesPanelWidth);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -142,6 +145,89 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
     return () => clearInterval(interval);
   }, [sessionId, loadTimeline]);
 
+  // Viewport visibility + buffer reachability tracking
+  useEffect(() => {
+    if (!isVisible || entries.length === 0) {
+      setVisibleEntryIndices(prev => prev.size === 0 ? prev : new Set());
+      setUnreachableIndices(prev => prev.size === 0 ? prev : new Set());
+      return;
+    }
+
+    // Helper: extract search key from entry
+    const getSearchKey = (entry: TimelineEntry): string | null => {
+      if (entry.type === 'compact') return null;
+      const text = entry.content.split('\n')[0].slice(0, 40).trim();
+      return text || null;
+    };
+
+    // Viewport visibility — which entries are currently on screen
+    const checkVisibility = () => {
+      const visibleText = terminalRegistry.getVisibleText(tabId);
+      if (!visibleText) {
+        setVisibleEntryIndices(prev => prev.size === 0 ? prev : new Set());
+        return;
+      }
+
+      const newVisible = new Set<number>();
+      entries.forEach((entry, index) => {
+        const key = getSearchKey(entry);
+        if (key && visibleText.includes(key)) {
+          newVisible.add(index);
+        }
+      });
+
+      setVisibleEntryIndices(prev => {
+        if (prev.size === newVisible.size && [...prev].every(i => newVisible.has(i))) return prev;
+        return newVisible;
+      });
+    };
+
+    // Buffer reachability — which entries exist anywhere in the scrollback
+    const checkReachability = () => {
+      const fullText = terminalRegistry.getFullBufferText(tabId);
+      if (!fullText) {
+        setUnreachableIndices(prev => prev.size === 0 ? prev : new Set());
+        return;
+      }
+
+      const newUnreachable = new Set<number>();
+      entries.forEach((entry, index) => {
+        if (entry.type === 'compact' || entry.type === 'continued') return; // system entries have their own visual
+        const key = getSearchKey(entry);
+        if (key && !fullText.includes(key)) {
+          newUnreachable.add(index);
+        }
+      });
+
+      setUnreachableIndices(prev => {
+        if (prev.size === newUnreachable.size && [...prev].every(i => newUnreachable.has(i))) return prev;
+        return newUnreachable;
+      });
+    };
+
+    // Run both on mount / entries change
+    checkVisibility();
+    checkReachability();
+
+    // On viewport change (scroll + buffer writes via onWriteParsed):
+    // - checkVisibility: 100ms debounce (lightweight, viewport text only)
+    // - checkReachability: 500ms debounce (heavier, full buffer scan)
+    let visTimer: ReturnType<typeof setTimeout> | null = null;
+    let reachTimer: ReturnType<typeof setTimeout> | null = null;
+    terminalRegistry.onViewportChange(tabId, () => {
+      if (visTimer) clearTimeout(visTimer);
+      visTimer = setTimeout(checkVisibility, 100);
+      if (reachTimer) clearTimeout(reachTimer);
+      reachTimer = setTimeout(checkReachability, 500);
+    });
+
+    return () => {
+      if (visTimer) clearTimeout(visTimer);
+      if (reachTimer) clearTimeout(reachTimer);
+      terminalRegistry.offViewportChange(tabId);
+    };
+  }, [tabId, entries, isVisible]);
+
   // Refs
   const tooltipRef = useRef<HTMLDivElement>(null);
   const tooltipContentRef = useRef<HTMLDivElement>(null);
@@ -168,17 +254,31 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
   };
 
   const handleMouseLeaveSegment = (e: React.MouseEvent) => {
-    setHoveredIndex(null);
+    // Don't clear hoveredIndex during selection — keeps the range indicator visible
+    if (!selectionStartIdRef.current) {
+      setHoveredIndex(null);
+    }
 
     // Get segment bounds to determine direction
     const segmentRect = (e.currentTarget as HTMLElement).getBoundingClientRect();
     const mouseX = e.clientX;
+    const mouseY = e.clientY;
 
-    // If mouse went LEFT (towards tooltip) - keep open
+    // If mouse went LEFT (towards tooltip) - keep open only if within tooltip wrapper bounds
     // If mouse went RIGHT (towards sidebar) - close
     const wentLeft = mouseX < segmentRect.left;
 
-    if (!wentLeft && !isExpanded) {
+    if (wentLeft && !isExpanded) {
+      // Check if mouse Y is within tooltip wrapper bounds — if not, cursor is in empty space
+      // and will never reach the tooltip, so close immediately
+      if (tooltipRef.current) {
+        const wrapperRect = tooltipRef.current.getBoundingClientRect();
+        if (mouseY < wrapperRect.top || mouseY > wrapperRect.bottom) {
+          setActiveTooltipIndex(null);
+        }
+        // else: mouse is at tooltip height — keep open so user can reach it
+      }
+    } else if (!wentLeft && !isExpanded) {
       setActiveTooltipIndex(null);
     }
   };
@@ -207,18 +307,33 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
       return;
     }
 
-    // Обычный клик — ждём чтобы отличить от двойного
+    // Второй клик double-click — отменяем таймер и loader
     if (clickTimerRef.current) {
       clearTimeout(clickTimerRef.current);
       clickTimerRef.current = null;
+      setClickedState(null);
       return;
     }
+
+    if (entry.type === 'compact' || entry.type === 'continued') return;
+
+    // Instant visual feedback — loader appears immediately
+    const index = entries.findIndex(e => e.uuid === entry.uuid);
+    setClickedState({ index, status: 'loading' });
+
     clickTimerRef.current = setTimeout(() => {
       clickTimerRef.current = null;
-      if (entry.type === 'compact') return;
       const searchText = entry.content.split('\n')[0].slice(0, 40).trim();
       if (searchText) {
-        terminalRegistry.searchAndScroll(tabId, searchText);
+        const found = terminalRegistry.searchAndScroll(tabId, searchText);
+        if (found) {
+          setTimeout(() => setClickedState(null), 300);
+        } else {
+          setClickedState({ index, status: 'failed' });
+          setTimeout(() => setClickedState(null), 1200);
+        }
+      } else {
+        setClickedState(null);
       }
     }, 250);
   };
@@ -228,6 +343,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
       clearTimeout(clickTimerRef.current);
       clickTimerRef.current = null;
     }
+    setClickedState(null);
     selectionStartIdRef.current = entry.uuid;
     setSelectionStartId(entry.uuid);
   };
@@ -237,18 +353,18 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
 
     // Context menu dimensions (approximate)
     const menuWidth = 160;
-    const menuHeight = 100; // Approximate height for 2-3 items
+    const menuHeight = selectionStartIdRef.current ? 40 : 72;
 
-    // Calculate position with bounds checking
-    let x = e.pageX;
-    let y = e.pageY;
+    // Position: right-center of cursor
+    let x = e.pageX + 4;
+    let y = e.pageY - menuHeight / 2;
 
     // Check right boundary
     if (x + menuWidth > window.innerWidth) {
-      x = window.innerWidth - menuWidth - 10;
+      x = e.pageX - menuWidth - 8;
     }
 
-    // Check bottom boundary (most important for the reported issue)
+    // Check bottom boundary
     if (y + menuHeight > window.innerHeight) {
       y = window.innerHeight - menuHeight - 10;
     }
@@ -387,12 +503,11 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
         className="relative flex flex-col group"
         style={{
           width: '24px',
-          backgroundColor: isActive ? 'rgba(0, 0, 0, 0.2)' : 'rgba(40, 40, 40, 0.4)',
+          backgroundColor: 'rgba(0, 0, 0, 0.2)',
           backdropFilter: 'blur(4px)',
-          borderLeft: `1px solid rgba(255, 255, 255, ${isActive ? 0.05 : 0.03})`,
+          borderLeft: '1px solid rgba(255, 255, 255, 0.05)',
           height: '100%',
           zIndex: 40,
-          opacity: isActive ? 1 : 0.6,
           visibility: isVisible ? 'inherit' : 'hidden',
         }}
       >
@@ -466,6 +581,11 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
               return entry.sessionId !== nextEntry.sessionId;
             })();
 
+            const isInViewport = visibleEntryIndices.has(index);
+            const isUnreachable = unreachableIndices.has(index);
+            const isContinued = entry.type === 'continued';
+            const dotClickState = clickedState?.index === index ? clickedState.status : null;
+
             return (
               <React.Fragment key={entry.uuid}>
                 <div
@@ -473,8 +593,10 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
                   data-segment
                   className="relative flex-1 min-h-[4px] w-full flex items-center justify-center transition-colors"
                   style={{
-                    backgroundColor: active ? 'rgba(59, 130, 246, 0.15)' : 'transparent',
-                    cursor: 'pointer',
+                    backgroundColor: active
+                      ? 'rgba(59, 130, 246, 0.15)'
+                      : (isUnreachable ? 'rgba(239, 68, 68, 0.06)' : 'transparent'),
+                    cursor: isContinued ? 'default' : 'pointer',
                   }}
                   onMouseEnter={() => handleMouseEnterSegment(index)}
                   onMouseLeave={(e) => handleMouseLeaveSegment(e)}
@@ -482,19 +604,46 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
                   onDoubleClick={() => handleEntryDoubleClick(entry)}
                   onContextMenu={(e) => handleRightClick(e, entry)}
                 >
-                  {/* Visual Indicator: Dot (normal) or Line (compact) */}
+                  {/* Visual Indicator: Dot (normal), Line (compact), or Dot (continued=orange) */}
                   <div
                     className="transition-all duration-200"
                     style={{
-                      width: isCompacted ? '12px' : (hoveredIndex === index || activeTooltipIndex === index ? '8px' : '4px'),
-                      height: isCompacted ? '2px' : (hoveredIndex === index || activeTooltipIndex === index ? '8px' : '4px'),
-                      borderRadius: isCompacted ? '1px' : '50%',
-                      backgroundColor: isCompacted
-                        ? '#f59e0b'  // Orange for compact
-                        : (active ? '#3b82f6' : (hoveredIndex === index || activeTooltipIndex === index ? 'white' : 'rgba(255,255,255,0.3)')),
-                      boxShadow: (hoveredIndex === index || activeTooltipIndex === index) ? '0 0 8px rgba(255,255,255,0.4)' : 'none',
+                      width: isCompacted ? '12px' : (hoveredIndex === index || activeTooltipIndex === index ? '8px' : (isInViewport ? '10px' : '4px')),
+                      height: isCompacted ? '2px' : (hoveredIndex === index || activeTooltipIndex === index ? '8px' : (isInViewport ? '3px' : '4px')),
+                      borderRadius: (isCompacted || (isInViewport && hoveredIndex !== index && activeTooltipIndex !== index)) ? '1px' : '50%',
+                      backgroundColor: isCompacted || isContinued
+                        ? '#f59e0b'
+                        : (active ? '#3b82f6' : (hoveredIndex === index || activeTooltipIndex === index ? 'white' : (isInViewport ? 'rgba(255,255,255,0.75)' : 'rgba(255,255,255,0.3)'))),
+                      boxShadow: (hoveredIndex === index || activeTooltipIndex === index)
+                        ? (isContinued ? '0 0 8px rgba(245, 158, 11, 0.4)' : '0 0 8px rgba(255,255,255,0.4)')
+                        : (isInViewport ? '0 0 6px rgba(255,255,255,0.25)' : 'none'),
                     }}
                   />
+                  {/* Loading spinner — instant feedback on click */}
+                  {dotClickState === 'loading' && (
+                    <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                      <div
+                        className="animate-spin"
+                        style={{
+                          width: '14px',
+                          height: '14px',
+                          borderRadius: '50%',
+                          border: '1.5px solid transparent',
+                          borderTopColor: 'rgba(255, 255, 255, 0.6)',
+                          borderRightColor: 'rgba(255, 255, 255, 0.2)',
+                        }}
+                      />
+                    </div>
+                  )}
+                  {/* Failed X — search text not found in terminal buffer */}
+                  {dotClickState === 'failed' && (
+                    <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                      <svg width="10" height="10" viewBox="0 0 10 10" style={{ opacity: 0.7 }}>
+                        <line x1="2" y1="2" x2="8" y2="8" stroke="#ef4444" strokeWidth="1.5" strokeLinecap="round" />
+                        <line x1="8" y1="2" x2="2" y2="8" stroke="#ef4444" strokeWidth="1.5" strokeLinecap="round" />
+                      </svg>
+                    </div>
+                  )}
                 </div>
                 {/* Fork marker - appears AFTER the entry at position (entry_count - 1) */}
                 {forkMarker && (
@@ -588,7 +737,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
               onMouseLeave={handleMouseLeaveTooltipArea}
               style={{
                 position: 'fixed',
-                right: `${notesPanelWidth + 24}px`,
+                right: `${notesPanelWidth + 8}px`,
                 top: `${tooltipPos.wTop}px`,
                 height: `${tooltipPos.wH}px`,
                 zIndex: 10000,
@@ -614,7 +763,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
                   minWidth: '240px',
                   maxWidth: '320px',
                   maxHeight: isExpanded ? '60vh' : '200px',
-                  boxShadow: '0 15px 35px rgba(0,0,0,0.6)',
+                  boxShadow: '0 8px 30px rgba(255,255,255,0.08), 0 2px 8px rgba(255,255,255,0.05)',
                   display: 'flex',
                   flexDirection: 'column',
                   gap: '8px',
@@ -624,6 +773,25 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
               >
                 {currentActiveEntry.type === 'compact' ? (
                   <span className="text-amber-400 font-medium">History Compacted ({currentActiveEntry.preTokens ? `${Math.round(currentActiveEntry.preTokens/1000)}k` : '?'} tokens)</span>
+                ) : currentActiveEntry.type === 'continued' ? (
+                  <>
+                    <span className="text-amber-400 font-medium">Context Overflow Recovery</span>
+                    <div
+                      className={`text-white/70 leading-snug font-mono text-[11px] ${isExpanded ? 'overflow-y-auto' : 'line-clamp-4'}`}
+                      style={{ whiteSpace: 'pre-wrap' }}
+                    >
+                      {isExpanded ? currentActiveEntry.content : truncateText(currentActiveEntry.content, 200)}
+                    </div>
+                    {(currentActiveEntry.content.length > 200 || isExpanded) && (
+                      <button
+                        onClick={(e) => { e.stopPropagation(); setIsExpanded(!isExpanded); }}
+                        className="p-1.5 rounded hover:bg-white/10 text-white/40 hover:text-white transition-colors cursor-pointer shrink-0 self-end"
+                        title={isExpanded ? "Свернуть" : "Развернуть полностью"}
+                      >
+                        {isExpanded ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
+                      </button>
+                    )}
+                  </>
                 ) : (
                   <>
                     <div className="flex justify-between items-start gap-4">
@@ -660,7 +828,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
               {/* CSS Bridge — stretches full wrapper height, connects tooltip to entry */}
               <div
                 style={{
-                  width: '50px',
+                  width: '8px',
                   alignSelf: 'stretch',
                   // background: 'rgba(255,0,0,0.15)', // Uncomment for debug
                 }}
@@ -673,6 +841,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
         {isVisible && contextMenu && (
           <TooltipPortal>
             <div
+              onMouseLeave={() => setContextMenu(null)}
               style={{
                 position: 'fixed',
                 left: contextMenu.x,

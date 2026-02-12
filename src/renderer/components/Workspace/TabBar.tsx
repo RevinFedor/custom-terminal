@@ -1139,6 +1139,7 @@ function TabBar({ projectId }: TabBarProps) {
       if ((e.target as HTMLElement).closest('[data-tab-context-menu]')) return;
       if ((e.target as HTMLElement).closest('[data-utils-dropdown]')) return;
       if ((e.target as HTMLElement).closest('[data-utils-button]')) return;
+      if ((e.target as HTMLElement).closest('[data-keep-selection]')) return;
       console.log('[TabBar] clearSelection triggered by mousedown outside TabBar', {
         target: (e.target as HTMLElement).tagName,
         className: (e.target as HTMLElement).className?.slice(0, 80),

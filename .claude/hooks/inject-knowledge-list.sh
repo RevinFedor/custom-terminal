@@ -2,11 +2,11 @@
 # Hook: UserPromptSubmit
 # Извлекает ВСЕ ссылки на knowledge/ из CLAUDE.md и docs/architecture.md
 # и вклеивает их как обязательный список для чтения
-# Пропускает инъекцию если промпт начинается с "q " (quick mode)
+# По умолчанию НЕ инжектит. Инжектит только если промпт начинается с "q " (quality mode)
 
 INPUT=$(cat)
 PROMPT=$(echo "$INPUT" | jq -r '.prompt // empty' 2>/dev/null)
-if [ -n "$PROMPT" ] && echo "$PROMPT" | grep -qi '^q '; then
+if [ -z "$PROMPT" ] || ! echo "$PROMPT" | grep -qi '^q '; then
   exit 0
 fi
 

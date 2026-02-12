@@ -197,8 +197,8 @@ const ProjectTabItem = memo(({
               onEditChange(val);
               // Real-time sync with ProjectHome
               if (val.trim()) {
-                window.dispatchEvent(new CustomEvent('project:name-sync', { 
-                  detail: { projectId, name: val.trim() } 
+                window.dispatchEvent(new CustomEvent('project:name-sync', {
+                  detail: { projectId, name: val.trim(), source: 'titlebar' }
                 }));
               }
             }}
@@ -366,32 +366,46 @@ function App() {
 
   const handleSubmitProjectRename = async () => {
     const isNewAndUnchanged = editingProjectId === lastCreatedProjectId && projectEditValue.trim() === 'Новый проект';
+    const isDraft = editingProjectId === lastCreatedProjectId;
 
     if (editingProjectId && projectEditValue.trim() && !isNewAndUnchanged) {
       await updateProject(editingProjectId, { name: projectEditValue.trim() });
-      showToast('Project renamed', 'success');
+
+      if (isDraft) {
+        // Draft mode: also create Terminal 1 now that project is confirmed
+        const { openProjects: op, createTab: ct, setProjectView: spv } = useWorkspaceStore.getState();
+        const ws = op.get(editingProjectId);
+        if (ws && ws.tabs.size === 0) {
+          const cwd = ws.projectPath?.startsWith('__unset__') ? undefined : ws.projectPath;
+          await ct(editingProjectId, 'Terminal 1', cwd);
+          spv(editingProjectId, 'terminal');
+        }
+      }
+
       setEditingProjectId(null);
-      setLastCreatedProjectId(null); // No longer "new" once renamed/submitted
+      setLastCreatedProjectId(null);
       setPreviousProjectId(null);
     } else if (editingProjectId) {
       handleCancelProjectRename();
     }
   };
 
-  const handleCancelProjectRename = async () => {
-    if (editingProjectId === lastCreatedProjectId) {
-      const idToDelete = editingProjectId;
+  const handleCancelProjectRename = async (draftProjectId?: string) => {
+    const idToCancel = draftProjectId || editingProjectId;
+    const isDraftCancel = idToCancel === lastCreatedProjectId;
+
+    if (isDraftCancel && idToCancel) {
       const idToRestore = previousProjectId;
 
       // VSCode behavior: if we cancel creating a new project, delete it
       setEditingProjectId(null);
       setLastCreatedProjectId(null);
       setPreviousProjectId(null);
-      
-      await closeProject(idToDelete!);
-      await ipcRenderer.invoke('project:delete', idToDelete);
+
+      await closeProject(idToCancel);
+      await ipcRenderer.invoke('project:delete', idToCancel);
       await loadProjects(); // Refresh global projects list
-      
+
       // Return to previous project if it exists
       if (idToRestore && openProjects.has(idToRestore)) {
         const prevProj = openProjects.get(idToRestore);
@@ -399,7 +413,7 @@ function App() {
           openProject(idToRestore, prevProj.projectPath);
         }
       }
-      
+
       showToast('Project creation cancelled', 'info');
     } else {
       setEditingProjectId(null);
@@ -417,32 +431,38 @@ function App() {
       if (newProject) {
         // 1. Reload projects in store to include the new one
         await loadProjects();
-        
+
         // 2. Calculate new order: insert after current or at start
         const currentOrder = Array.from(openProjects.keys());
         let insertIndex = 0;
-        
+
         if (view === 'workspace' && activeProjectId) {
           const currentIndex = currentOrder.indexOf(activeProjectId);
           if (currentIndex !== -1) {
             insertIndex = currentIndex + 1;
           }
         }
-        
+
         const newOrder = [...currentOrder];
         newOrder.splice(insertIndex, 0, newProject.id);
-        
-        // 3. Apply new order and open
+
+        // 3. Apply new order and open in draft mode (Home view, no terminal)
         reorderProjects(newOrder);
-        openProject(newProject.id, newProject.path);
-        
+        openProject(newProject.id, newProject.path, { draft: true });
+
         // 4. Set area focus
         setActiveArea('projects');
-        // 5. Enter edit mode immediately
+        // 5. Mark as draft — ProjectHome owns the input, title bar shows synced text
         setLastCreatedProjectId(newProject.id);
-        setEditingProjectId(newProject.id);
+        setEditingProjectId(null);
         setProjectEditValue(newProject.name);
-        showToast('New project created', 'success');
+
+        // 6. Signal ProjectHome to enter draft mode (deferred so component is mounted)
+        setTimeout(() => {
+          window.dispatchEvent(new CustomEvent('project:draft-init', {
+            detail: { projectId: newProject.id, name: newProject.name }
+          }));
+        }, 50);
       }
     } catch (err) {
       console.error('Failed to create project:', err);
@@ -455,6 +475,82 @@ function App() {
     loadProjects();
     restoreSession();
   }, []); // Empty deps = only on mount
+
+  // Listen for draft project events from ProjectHome
+  useEffect(() => {
+    const handleDraftSubmit = async (e: any) => {
+      const { projectId, name, path } = e.detail;
+      if (projectId !== lastCreatedProjectId) return;
+
+      // Update project in DB
+      const updates: any = {};
+      if (name) updates.name = name;
+      if (path) updates.path = path;
+      await updateProject(projectId, updates);
+
+      setLastCreatedProjectId(null);
+      setPreviousProjectId(null);
+      setEditingProjectId(null);
+
+      // Create Terminal 1 now that project is confirmed
+      const { openProjects: op, createTab: ct, setProjectView: spv } = useWorkspaceStore.getState();
+      const ws = op.get(projectId);
+      if (ws && ws.tabs.size === 0) {
+        // Don't pass __unset__ paths — createTab will fallback to HOME
+        const cwd = path || (ws.projectPath?.startsWith('__unset__') ? undefined : ws.projectPath);
+        await ct(projectId, 'Terminal 1', cwd);
+        spv(projectId, 'terminal');
+      }
+    };
+
+    const handleDraftCancel = (e: any) => {
+      const { projectId } = e.detail;
+      if (projectId !== lastCreatedProjectId) return;
+      handleCancelProjectRename(projectId);
+    };
+
+    // Bidirectional name sync: when ProjectHome changes name, update title bar display/edit value
+    const handleNameSync = (e: any) => {
+      const id = e.detail.projectId;
+      if (e.detail.source === 'titlebar') return;
+      // Update title bar edit value if editing this project
+      if (id === editingProjectId) {
+        setProjectEditValue(e.detail.name);
+      }
+      // Update title bar display name if this is a draft project
+      if (id === lastCreatedProjectId) {
+        setProjectEditValue(e.detail.name);
+      }
+    };
+
+    // Start editing from ProjectHome pencil → also enable title bar input
+    const handleEditStart = (e: any) => {
+      const { projectId, name } = e.detail;
+      setEditingProjectId(projectId);
+      setProjectEditValue(name);
+    };
+
+    // End editing from ProjectHome → also disable title bar input
+    const handleEditEnd = (e: any) => {
+      const { projectId } = e.detail;
+      if (editingProjectId === projectId) {
+        setEditingProjectId(null);
+      }
+    };
+
+    window.addEventListener('project:draft-submit', handleDraftSubmit);
+    window.addEventListener('project:draft-cancel', handleDraftCancel);
+    window.addEventListener('project:name-sync', handleNameSync);
+    window.addEventListener('project:edit-start', handleEditStart);
+    window.addEventListener('project:edit-end', handleEditEnd);
+    return () => {
+      window.removeEventListener('project:draft-submit', handleDraftSubmit);
+      window.removeEventListener('project:draft-cancel', handleDraftCancel);
+      window.removeEventListener('project:name-sync', handleNameSync);
+      window.removeEventListener('project:edit-start', handleEditStart);
+      window.removeEventListener('project:edit-end', handleEditEnd);
+    };
+  }, [lastCreatedProjectId, editingProjectId]);
 
   // Track process status via OSC 133 events
   useEffect(() => {
@@ -873,8 +969,7 @@ function App() {
             // Project is active only if:
             // 1. We are in workspace view (not dashboard)
             // 2. It matches activeProjectId
-            // 3. We are in terminal view (not project home)
-            const isActive = view === 'workspace' && activeProjectId === projectId && workspace.currentView === 'terminal';
+            const isActive = view === 'workspace' && activeProjectId === projectId;
             const isLast = index === openProjectsList.length - 1;
 
             // Count active processes in this project
@@ -894,7 +989,7 @@ function App() {
               <ProjectTabItem
                 key={projectId}
                 projectId={projectId}
-                projectName={project.name}
+                projectName={lastCreatedProjectId === projectId ? projectEditValue : project.name}
                 index={index}
                 isActive={isActive}
                 fontSize={projectTabsFontSize}
