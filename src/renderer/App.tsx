@@ -853,6 +853,7 @@ function App() {
       } else if (cmd === 'insert-prompt') {
         // Insert prompt text into active terminal
         const activeProject = getActiveProject();
+        console.warn('[ContextMenu] insert-prompt: tabId=' + activeProject?.activeTabId + ' len=' + (data?.length || 0) + ' endsR=' + data?.endsWith('\r') + ' first30=' + JSON.stringify(data?.slice(0, 30)));
         if (activeProject?.activeTabId) {
           ipcRenderer.send('terminal:input', activeProject.activeTabId, data);
         }

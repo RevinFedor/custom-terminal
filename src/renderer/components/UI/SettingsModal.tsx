@@ -172,10 +172,13 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
   const [localPromptName, setLocalPromptName] = useState('');
   const [localPromptColor, setLocalPromptColor] = useState('');
   const [localPromptShowInMenu, setLocalPromptShowInMenu] = useState(true);
+  const [localPromptModel, setLocalPromptModel] = useState<AIModel>('gemini-3-flash-preview');
+  const [localPromptThinkingLevel, setLocalPromptThinkingLevel] = useState<ThinkingLevel>('HIGH');
+  const [savedFlashField, setSavedFlashField] = useState<'name' | 'content' | null>(null);
+  const savedFlashTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Refs for editing containers (to check if blur target is inside)
   const claudeEditRef = useRef<HTMLDivElement>(null);
-  const aiPromptEditRef = useRef<HTMLDivElement>(null);
   const docEditRef = useRef<HTMLDivElement>(null);
   const promptEditRefs = useRef<Map<number, HTMLDivElement>>(new Map());
 
@@ -209,6 +212,8 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
         }
       });
     } else {
+      // Save current AI prompt before resetting (no flash — modal is closing)
+      saveCurrentAIPrompt();
       // Reset editing states when modal closes
       setEditingClaude(false);
       setEditingPromptId(null);
@@ -248,9 +253,8 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
     setEditingClaude(false);
   };
 
-  const handleAIPromptBlur = (e: React.FocusEvent) => {
-    if (isBlurInsideContainer(e, aiPromptEditRef)) return;
-    // Save the currently editing AI prompt
+  // Save current AI prompt from local state to DB (all fields from local state)
+  const saveCurrentAIPrompt = (flashField?: 'name' | 'content') => {
     if (editingPromptId) {
       const prompt = aiPrompts.find(p => p.id === editingPromptId);
       if (prompt) {
@@ -259,10 +263,21 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
           content: localPromptContent,
           name: localPromptName,
           color: localPromptColor,
-          showInContextMenu: localPromptShowInMenu
+          showInContextMenu: localPromptShowInMenu,
+          model: localPromptModel,
+          thinkingLevel: localPromptThinkingLevel
         });
+        if (flashField) {
+          if (savedFlashTimer.current) clearTimeout(savedFlashTimer.current);
+          setSavedFlashField(flashField);
+          savedFlashTimer.current = setTimeout(() => setSavedFlashField(null), 400);
+        }
       }
     }
+  };
+
+  const closeAIPromptEditor = () => {
+    saveCurrentAIPrompt();
     setEditingPromptId(null);
   };
 
@@ -286,13 +301,17 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
     setEditingPrompt(null);
   };
 
-  // Start editing an AI prompt
+  // Start editing an AI prompt (auto-saves current before switching)
   const startEditingAIPrompt = (prompt: AIPrompt) => {
+    if (prompt.id === editingPromptId) return; // Already editing this prompt
+    saveCurrentAIPrompt(); // no flash on auto-save switch
     setEditingPromptId(prompt.id);
     setLocalPromptContent(prompt.content);
     setLocalPromptName(prompt.name);
     setLocalPromptColor(prompt.color);
     setLocalPromptShowInMenu(prompt.showInContextMenu);
+    setLocalPromptModel(prompt.model);
+    setLocalPromptThinkingLevel(prompt.thinkingLevel);
   };
 
   // Add new custom AI prompt
@@ -598,137 +617,54 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
           )}
 
           {activeTab === 'ai' && (
-            <div style={{ display: 'flex', gap: '24px' }}>
-              {/* Left Column - AI Prompts (dynamic) */}
-              <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ display: 'flex', gap: '24px', height: 'calc(85vh - 130px)' }}>
+              {/* Left Column - AI Prompts (always compact, scrollable) */}
+              <div style={{ flex: 1, minWidth: 0, overflowY: 'auto', paddingRight: '4px' }}>
                 <div style={{ fontSize: '11px', fontWeight: '600', color: '#666', marginBottom: '12px', textTransform: 'uppercase' }}>
                   AI промпты (Gemini)
                 </div>
 
-                {/* Dynamic AI Prompts */}
+                {/* Dynamic AI Prompts — always compact, selected reads from local state */}
                 {aiPrompts.map((aiPrompt) => {
-                  const isEditing = editingPromptId === aiPrompt.id;
+                  const isSelected = editingPromptId === aiPrompt.id;
+                  // For selected prompt, read live from local state; otherwise from store
+                  const displayName = isSelected ? localPromptName : aiPrompt.name;
+                  const displayContent = isSelected ? localPromptContent : aiPrompt.content;
+                  const displayColor = isSelected ? localPromptColor : aiPrompt.color;
+                  const displayModel = isSelected ? localPromptModel : aiPrompt.model;
+                  const displayThinking = isSelected ? localPromptThinkingLevel : aiPrompt.thinkingLevel;
+                  const displayMenu = isSelected ? localPromptShowInMenu : aiPrompt.showInContextMenu;
+
                   return (
                     <div
                       key={aiPrompt.id}
-                      ref={isEditing ? aiPromptEditRef : undefined}
-                      onClick={() => !isEditing && startEditingAIPrompt(aiPrompt)}
+                      onClick={() => startEditingAIPrompt(aiPrompt)}
                       style={{
                         padding: '12px',
-                        backgroundColor: isEditing ? '#252525' : '#222',
-                        border: isEditing ? `2px solid ${aiPrompt.color}` : `2px solid ${aiPrompt.color}33`,
+                        backgroundColor: isSelected ? '#252525' : '#222',
+                        border: `2px solid ${isSelected ? displayColor : displayColor + '33'}`,
                         borderRadius: '10px',
-                        cursor: isEditing ? 'default' : 'pointer',
+                        cursor: 'pointer',
                         marginBottom: '10px'
                       }}
                     >
-                      {isEditing ? (
-                        <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                          <input
-                            type="text"
-                            value={localPromptName}
-                            onChange={(e) => setLocalPromptName(e.target.value)}
-                            onBlur={handleAIPromptBlur}
-                            placeholder="Название..."
-                            autoFocus
-                            style={{ width: '100%', padding: '8px', backgroundColor: '#1a1a1a', border: '1px solid #444', borderRadius: '6px', color: '#fff', fontSize: '12px', outline: 'none', boxSizing: 'border-box' as const }}
-                          />
-                          <textarea
-                            value={localPromptContent}
-                            onChange={(e) => setLocalPromptContent(e.target.value)}
-                            onBlur={handleAIPromptBlur}
-                            rows={3}
-                            style={{ width: '100%', padding: '8px', backgroundColor: '#1a1a1a', border: '1px solid #444', borderRadius: '6px', color: '#aaa', fontSize: '11px', fontFamily: 'monospace', outline: 'none', resize: 'none', boxSizing: 'border-box' as const }}
-                          />
-                          {/* Model selector */}
-                          <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                            <span style={{ fontSize: '10px', color: '#888' }}>Модель:</span>
-                            {([
-                              { value: 'gemini-3-flash-preview' as AIModel, label: 'Flash' },
-                              { value: 'gemini-3-pro-preview' as AIModel, label: 'Pro' }
-                            ]).map((m) => (
-                              <button
-                                key={m.value}
-                                onClick={(e) => { e.stopPropagation(); saveAIPrompt({ ...aiPrompt, model: m.value }); }}
-                                style={{
-                                  padding: '2px 8px',
-                                  backgroundColor: aiPrompt.model === m.value ? aiPrompt.color : '#333',
-                                  color: aiPrompt.model === m.value ? '#fff' : '#888',
-                                  border: 'none', borderRadius: '4px', fontSize: '10px', cursor: 'pointer'
-                                }}
-                              >
-                                {m.label}
-                              </button>
-                            ))}
-                          </div>
-                          {/* Show in context menu toggle */}
-                          <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                            <span style={{ fontSize: '10px', color: '#888' }}>В контекстном меню:</span>
-                            <div
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                const newVal = !localPromptShowInMenu;
-                                setLocalPromptShowInMenu(newVal);
-                                saveAIPrompt({ ...aiPrompt, showInContextMenu: newVal });
-                              }}
-                              style={{ width: '28px', height: '16px', borderRadius: '8px', backgroundColor: localPromptShowInMenu ? aiPrompt.color : '#444', position: 'relative' as const, cursor: 'pointer', transition: 'background-color 0.2s', flexShrink: 0 }}
-                            >
-                              <div style={{ width: '12px', height: '12px', borderRadius: '50%', backgroundColor: '#fff', position: 'absolute' as const, top: '2px', left: localPromptShowInMenu ? '14px' : '2px', transition: 'left 0.2s' }} />
-                            </div>
-                          </div>
-                          {/* Color picker (simple presets) */}
-                          <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
-                            <span style={{ fontSize: '10px', color: '#888' }}>Цвет:</span>
-                            {['#0ea5e9', '#a855f7', '#f59e0b', '#22c55e', '#ef4444', '#6366f1', '#ec4899'].map((c) => (
-                              <div
-                                key={c}
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  setLocalPromptColor(c);
-                                  saveAIPrompt({ ...aiPrompt, color: c });
-                                }}
-                                style={{
-                                  width: '14px', height: '14px', borderRadius: '50%', backgroundColor: c, cursor: 'pointer',
-                                  border: aiPrompt.color === c ? '2px solid #fff' : '2px solid transparent'
-                                }}
-                              />
-                            ))}
-                          </div>
-                          <div style={{ display: 'flex', gap: '6px' }}>
-                            {aiPrompt.isBuiltIn && (
-                              <button
-                                onClick={(e) => { e.stopPropagation(); /* Reset: reload from DB default would need original, just keep as-is */ }}
-                                style={{ padding: '4px 8px', backgroundColor: 'transparent', color: '#666', border: 'none', fontSize: '10px', cursor: 'pointer' }}
-                              >
-                                Сбросить
-                              </button>
-                            )}
-                            {!aiPrompt.isBuiltIn && (
-                              <button
-                                onClick={(e) => { e.stopPropagation(); deleteAIPrompt(aiPrompt.id); setEditingPromptId(null); showToast('Deleted', 'success'); }}
-                                style={{ padding: '4px 8px', backgroundColor: 'transparent', color: '#ef4444', border: 'none', fontSize: '10px', cursor: 'pointer' }}
-                              >
-                                Удалить
-                              </button>
-                            )}
-                          </div>
-                        </div>
-                      ) : (
-                        <>
-                          <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '4px' }}>
-                            <span style={{ fontSize: '13px', color: aiPrompt.color, fontWeight: '500' }}>{aiPrompt.name}</span>
-                            <span style={{ fontSize: '9px', padding: '1px 4px', backgroundColor: `${aiPrompt.color}22`, color: aiPrompt.color, borderRadius: '3px' }}>
-                              {aiPrompt.model.includes('pro') ? 'PRO' : 'FLASH'}
-                            </span>
-                            {aiPrompt.showInContextMenu && (
-                              <span style={{ fontSize: '9px', padding: '1px 4px', backgroundColor: '#ffffff11', color: '#666', borderRadius: '3px' }}>ПКМ</span>
-                            )}
-                          </div>
-                          <div style={{ fontSize: '11px', color: '#666', overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' as const }}>
-                            {aiPrompt.content}
-                          </div>
-                        </>
-                      )}
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '4px' }}>
+                        <span style={{ fontSize: '13px', color: displayColor, fontWeight: '500' }}>{displayName}</span>
+                        <span style={{ fontSize: '9px', padding: '1px 4px', backgroundColor: `${displayColor}22`, color: displayColor, borderRadius: '3px' }}>
+                          {displayModel.includes('pro') ? 'PRO' : 'FLASH'}
+                        </span>
+                        {displayThinking !== 'HIGH' && (
+                          <span style={{ fontSize: '9px', padding: '1px 4px', backgroundColor: '#ffffff11', color: '#888', borderRadius: '3px' }}>
+                            {displayThinking}
+                          </span>
+                        )}
+                        {displayMenu && (
+                          <span style={{ fontSize: '9px', padding: '1px 4px', backgroundColor: '#ffffff11', color: '#666', borderRadius: '3px' }}>ПКМ</span>
+                        )}
+                      </div>
+                      <div style={{ fontSize: '11px', color: '#666', overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' as const }}>
+                        {displayContent}
+                      </div>
                     </div>
                   );
                 })}
@@ -762,7 +698,7 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                   </span>
                 </div>
 
-                {/* Claude Default Prompt — separate (toggle logic) */}
+                {/* Claude Default Prompt */}
                 <div
                   ref={claudeEditRef}
                   onClick={() => !editingClaude && setEditingClaude(true)}
@@ -804,7 +740,7 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                   )}
                 </div>
 
-                {/* Documentation Prompt — separate (file/inline logic) */}
+                {/* Documentation Prompt */}
                 <div
                   ref={docEditRef}
                   onClick={() => !editingDocPrompt && setEditingDocPrompt(true)}
@@ -844,44 +780,204 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                 </div>
               </div>
 
-              {/* Right Column - Text Insertion Prompts (context menu snippets) */}
-              <div style={{ flex: 1, minWidth: 0 }}>
-                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '12px' }}>
-                  <div style={{ fontSize: '11px', fontWeight: '600', color: '#666', textTransform: 'uppercase' }}>
-                    Текстовые вставки
-                  </div>
-                  <button onClick={addPrompt} style={{ padding: '4px 10px', backgroundColor: '#8b5cf6', color: '#fff', border: 'none', borderRadius: '4px', fontSize: '10px', cursor: 'pointer' }}>+ Добавить</button>
-                </div>
+              {/* Right Column - Editor Panel or Text Insertions */}
+              <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column' }}>
+                {editingPromptId !== null ? (
+                  (() => {
+                    const editingAIPrompt = aiPrompts.find(p => p.id === editingPromptId);
+                    if (!editingAIPrompt) return null;
 
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                  {prompts.length === 0 ? (
-                    <div style={{ padding: '24px', textAlign: 'center', color: '#555', fontSize: '12px', border: '2px dashed #333', borderRadius: '10px' }}>Пока нет промптов</div>
-                  ) : (
-                    prompts.map((prompt, index) => (
-                      <div
-                        key={index}
-                        ref={(el) => { if (el) promptEditRefs.current.set(index, el); }}
-                        onClick={() => editingPrompt !== index && setEditingPrompt(index)}
-                        style={{ padding: '12px', backgroundColor: editingPrompt === index ? '#252525' : '#222', border: editingPrompt === index ? '2px solid #8b5cf6' : '2px solid #333', borderRadius: '10px', cursor: editingPrompt === index ? 'default' : 'pointer' }}
-                      >
-                        {editingPrompt === index ? (
-                          <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                            <input type="text" value={prompt.title} onChange={(e) => updatePrompt(index, 'title', e.target.value)} onBlur={(e) => handlePromptBlur(e, index)} placeholder="Название" autoFocus style={{ width: '100%', padding: '8px', backgroundColor: '#1a1a1a', border: '1px solid #444', borderRadius: '6px', color: '#fff', fontSize: '12px', outline: 'none', boxSizing: 'border-box' as const }} />
-                            <textarea value={prompt.content} onChange={(e) => updatePrompt(index, 'content', e.target.value)} onBlur={(e) => handlePromptBlur(e, index)} placeholder="Содержимое..." rows={2} style={{ width: '100%', padding: '8px', backgroundColor: '#1a1a1a', border: '1px solid #444', borderRadius: '6px', color: '#aaa', fontSize: '11px', fontFamily: 'monospace', outline: 'none', resize: 'none', boxSizing: 'border-box' as const }} />
-                            <button onClick={(e) => { e.stopPropagation(); deletePrompt(index); }} style={{ alignSelf: 'flex-start', padding: '4px 8px', backgroundColor: 'transparent', color: '#ef4444', border: 'none', fontSize: '10px', cursor: 'pointer' }}>Удалить</button>
+                    // Helper: save all local edits + overrides to DB (all fields from local state, no stale store reads)
+                    const saveField = (overrides: Partial<AIPrompt>) => {
+                      saveAIPrompt({
+                        ...editingAIPrompt,
+                        name: localPromptName,
+                        content: localPromptContent,
+                        color: localPromptColor,
+                        showInContextMenu: localPromptShowInMenu,
+                        model: localPromptModel,
+                        thinkingLevel: localPromptThinkingLevel,
+                        ...overrides
+                      });
+                    };
+
+                    return (
+                      <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+                        {/* Header: Name input + close button */}
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '12px', flexShrink: 0 }}>
+                          <input
+                            type="text"
+                            value={localPromptName}
+                            onChange={(e) => setLocalPromptName(e.target.value)}
+                            onBlur={() => saveCurrentAIPrompt('name')}
+                            placeholder="Название..."
+                            style={{ flex: 1, padding: '8px', backgroundColor: '#1a1a1a', border: savedFlashField === 'name' ? '1px solid #22c55e' : '1px solid #444', borderRadius: '6px', color: '#fff', fontSize: '13px', outline: 'none', boxSizing: 'border-box' as const, transition: 'border-color 0.15s ease' }}
+                          />
+                          <button
+                            onClick={(e) => { e.stopPropagation(); closeAIPromptEditor(); }}
+                            style={{ background: 'none', border: 'none', color: '#666', fontSize: '18px', cursor: 'pointer', padding: '4px 8px', lineHeight: 1 }}
+                          >
+                            &times;
+                          </button>
+                        </div>
+
+                        {/* Controls */}
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginBottom: '12px', flexShrink: 0 }}>
+                          {/* Model selector — full names */}
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                            <span style={{ fontSize: '10px', color: '#888', flexShrink: 0 }}>Модель:</span>
+                            {([
+                              { value: 'gemini-3-flash-preview' as AIModel, label: 'Gemini 3 Flash' },
+                              { value: 'gemini-3-pro-preview' as AIModel, label: 'Gemini 3 Pro' }
+                            ]).map((m) => (
+                              <button
+                                key={m.value}
+                                onClick={(e) => { e.stopPropagation(); setLocalPromptModel(m.value); saveField({ model: m.value }); }}
+                                style={{
+                                  padding: '3px 10px',
+                                  backgroundColor: localPromptModel === m.value ? localPromptColor : '#333',
+                                  color: localPromptModel === m.value ? '#fff' : '#888',
+                                  border: 'none', borderRadius: '4px', fontSize: '10px', cursor: 'pointer'
+                                }}
+                              >
+                                {m.label}
+                              </button>
+                            ))}
                           </div>
-                        ) : (
-                          <>
-                            <div style={{ fontSize: '13px', color: '#fff', fontWeight: '500', marginBottom: '2px' }}>{prompt.title}</div>
-                            {prompt.content && (
-                              <div style={{ fontSize: '11px', color: '#666', overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' as const }}>{prompt.content}</div>
-                            )}
-                          </>
+
+                          {/* Thinking level selector */}
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                            <span style={{ fontSize: '10px', color: '#888', flexShrink: 0 }}>Думание:</span>
+                            {(['NONE', 'LOW', 'MEDIUM', 'HIGH'] as ThinkingLevel[]).map((level) => (
+                              <button
+                                key={level}
+                                onClick={(e) => { e.stopPropagation(); setLocalPromptThinkingLevel(level); saveField({ thinkingLevel: level }); }}
+                                style={{
+                                  padding: '3px 8px',
+                                  backgroundColor: localPromptThinkingLevel === level ? localPromptColor : '#333',
+                                  color: localPromptThinkingLevel === level ? '#fff' : '#888',
+                                  border: 'none', borderRadius: '4px', fontSize: '10px', cursor: 'pointer'
+                                }}
+                              >
+                                {level}
+                              </button>
+                            ))}
+                          </div>
+
+                          {/* Color picker */}
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                            <span style={{ fontSize: '10px', color: '#888', flexShrink: 0 }}>Цвет:</span>
+                            {['#0ea5e9', '#a855f7', '#f59e0b', '#22c55e', '#ef4444', '#6366f1', '#ec4899'].map((c) => (
+                              <div
+                                key={c}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setLocalPromptColor(c);
+                                  saveField({ color: c });
+                                }}
+                                style={{
+                                  width: '14px', height: '14px', borderRadius: '50%', backgroundColor: c, cursor: 'pointer',
+                                  border: localPromptColor === c ? '2px solid #fff' : '2px solid transparent'
+                                }}
+                              />
+                            ))}
+                          </div>
+
+                          {/* Context menu toggle */}
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                            <span style={{ fontSize: '10px', color: '#888' }}>В контекстном меню:</span>
+                            <div
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                const newVal = !localPromptShowInMenu;
+                                setLocalPromptShowInMenu(newVal);
+                                saveField({ showInContextMenu: newVal });
+                              }}
+                              style={{ width: '28px', height: '16px', borderRadius: '8px', backgroundColor: localPromptShowInMenu ? localPromptColor : '#444', position: 'relative' as const, cursor: 'pointer', transition: 'background-color 0.2s', flexShrink: 0 }}
+                            >
+                              <div style={{ width: '12px', height: '12px', borderRadius: '50%', backgroundColor: '#fff', position: 'absolute' as const, top: '2px', left: localPromptShowInMenu ? '14px' : '2px', transition: 'left 0.2s' }} />
+                            </div>
+                          </div>
+                        </div>
+
+                        {/* Textarea — fills remaining space */}
+                        <textarea
+                          value={localPromptContent}
+                          onChange={(e) => setLocalPromptContent(e.target.value)}
+                          onBlur={() => saveCurrentAIPrompt('content')}
+                          placeholder="Содержимое промпта..."
+                          style={{
+                            flex: 1,
+                            padding: '10px',
+                            backgroundColor: '#1a1a1a',
+                            border: savedFlashField === 'content' ? '1px solid #22c55e' : '1px solid #444',
+                            transition: 'border-color 0.15s ease',
+                            borderRadius: '6px',
+                            color: '#aaa',
+                            fontSize: '11px',
+                            fontFamily: 'monospace',
+                            outline: 'none',
+                            resize: 'none',
+                            boxSizing: 'border-box' as const,
+                            minHeight: 0
+                          }}
+                        />
+
+                        {/* Footer: Delete button (non-builtIn only) */}
+                        {!editingAIPrompt.isBuiltIn && (
+                          <div style={{ marginTop: '8px', flexShrink: 0 }}>
+                            <button
+                              onClick={(e) => { e.stopPropagation(); deleteAIPrompt(editingAIPrompt.id); setEditingPromptId(null); showToast('Deleted', 'success'); }}
+                              style={{ padding: '4px 8px', backgroundColor: 'transparent', color: '#ef4444', border: 'none', fontSize: '10px', cursor: 'pointer' }}
+                            >
+                              Удалить промпт
+                            </button>
+                          </div>
                         )}
                       </div>
-                    ))
-                  )}
-                </div>
+                    );
+                  })()
+                ) : (
+                  /* Text Insertions (existing UI) */
+                  <>
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '12px', flexShrink: 0 }}>
+                      <div style={{ fontSize: '11px', fontWeight: '600', color: '#666', textTransform: 'uppercase' }}>
+                        Текстовые вставки
+                      </div>
+                      <button onClick={addPrompt} style={{ padding: '4px 10px', backgroundColor: '#8b5cf6', color: '#fff', border: 'none', borderRadius: '4px', fontSize: '10px', cursor: 'pointer' }}>+ Добавить</button>
+                    </div>
+
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', overflowY: 'auto', flex: 1, minHeight: 0 }}>
+                      {prompts.length === 0 ? (
+                        <div style={{ padding: '24px', textAlign: 'center', color: '#555', fontSize: '12px', border: '2px dashed #333', borderRadius: '10px' }}>Пока нет промптов</div>
+                      ) : (
+                        prompts.map((prompt, index) => (
+                          <div
+                            key={index}
+                            ref={(el) => { if (el) promptEditRefs.current.set(index, el); }}
+                            onClick={() => editingPrompt !== index && setEditingPrompt(index)}
+                            style={{ padding: '12px', backgroundColor: editingPrompt === index ? '#252525' : '#222', border: editingPrompt === index ? '2px solid #8b5cf6' : '2px solid #333', borderRadius: '10px', cursor: editingPrompt === index ? 'default' : 'pointer' }}
+                          >
+                            {editingPrompt === index ? (
+                              <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                                <input type="text" value={prompt.title} onChange={(e) => updatePrompt(index, 'title', e.target.value)} onBlur={(e) => handlePromptBlur(e, index)} placeholder="Название" autoFocus style={{ width: '100%', padding: '8px', backgroundColor: '#1a1a1a', border: '1px solid #444', borderRadius: '6px', color: '#fff', fontSize: '12px', outline: 'none', boxSizing: 'border-box' as const }} />
+                                <textarea value={prompt.content} onChange={(e) => updatePrompt(index, 'content', e.target.value)} onBlur={(e) => handlePromptBlur(e, index)} placeholder="Содержимое..." rows={2} style={{ width: '100%', padding: '8px', backgroundColor: '#1a1a1a', border: '1px solid #444', borderRadius: '6px', color: '#aaa', fontSize: '11px', fontFamily: 'monospace', outline: 'none', resize: 'none', boxSizing: 'border-box' as const }} />
+                                <button onClick={(e) => { e.stopPropagation(); deletePrompt(index); }} style={{ alignSelf: 'flex-start', padding: '4px 8px', backgroundColor: 'transparent', color: '#ef4444', border: 'none', fontSize: '10px', cursor: 'pointer' }}>Удалить</button>
+                              </div>
+                            ) : (
+                              <>
+                                <div style={{ fontSize: '13px', color: '#fff', fontWeight: '500', marginBottom: '2px' }}>{prompt.title}</div>
+                                {prompt.content && (
+                                  <div style={{ fontSize: '11px', color: '#666', overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' as const }}>{prompt.content}</div>
+                                )}
+                              </>
+                            )}
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  </>
+                )}
               </div>
             </div>
           )}

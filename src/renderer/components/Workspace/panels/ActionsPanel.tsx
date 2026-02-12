@@ -286,7 +286,10 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
 
       const promptFileContent = await ipcRenderer.invoke('file:read', promptResult.promptFile);
       if (promptFileContent.success) {
+        console.warn('[UpdateDocs] Sending prompt to terminal: tabId=' + newTabId + ' len=' + promptFileContent.content.length + ' +\\r');
         ipcRenderer.send('terminal:input', newTabId, promptFileContent.content + '\r');
+      } else {
+        console.warn('[UpdateDocs] ⚠️ Failed to read prompt file:', promptResult.promptFile);
       }
 
       await ipcRenderer.invoke('docs:cleanup-temp', { exportedPath: null, promptPath: promptResult.promptFile });
