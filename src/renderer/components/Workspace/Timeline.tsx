@@ -155,11 +155,31 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
       return;
     }
 
-    // Helper: extract search key from entry (full content up to 1000 chars)
-    const getSearchKey = (entry: TimelineEntry): string | null => {
+    // Extract first line of content, max 80 chars — the only part that reliably
+    // matches 1:1 in the terminal buffer (multi-line content gets reformatted by Ink TUI
+    // with indentation, prompt prefix, word wrapping — raw JSONL ≠ buffer text)
+    const getEntryKey = (entry: TimelineEntry): string | null => {
       if (entry.type === 'compact') return null;
-      const text = entry.content.slice(0, 1000).trim();
+      const text = entry.content.split('\n')[0].slice(0, 80).trim();
       return text || null;
+    };
+
+    // Check if key exists at a user prompt position in buffer text.
+    // In Claude Code TUI, user input appears as "❯ <text>" (U+276F).
+    // We find the key in the buffer, then walk back to the start of that line
+    // and check if the line begins with ❯. Handles any amount of whitespace.
+    const matchesAtUserPrompt = (bufferText: string, key: string): boolean => {
+      let searchFrom = 0;
+      while (true) {
+        const pos = bufferText.indexOf(key, searchFrom);
+        if (pos === -1) return false;
+        // Find start of the line containing this match
+        const lineStart = bufferText.lastIndexOf('\n', pos - 1) + 1;
+        // Check first few chars of the line for ❯ (allows leading whitespace before prompt)
+        const lineHead = bufferText.slice(lineStart, Math.min(lineStart + 5, pos));
+        if (lineHead.includes('\u276F')) return true;
+        searchFrom = pos + 1;
+      }
     };
 
     // Viewport visibility — which entries are currently on screen
@@ -172,8 +192,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
 
       const newVisible = new Set<number>();
       entries.forEach((entry, index) => {
-        const key = getSearchKey(entry);
-        if (key && visibleText.includes(key)) {
+        const key = getEntryKey(entry);
+        if (key && matchesAtUserPrompt(visibleText, key)) {
           newVisible.add(index);
         }
       });
@@ -194,9 +214,9 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
 
       const newUnreachable = new Set<number>();
       entries.forEach((entry, index) => {
-        if (entry.type === 'compact' || entry.type === 'continued') return; // system entries have their own visual
-        const key = getSearchKey(entry);
-        if (key && !fullText.includes(key)) {
+        if (entry.type === 'compact' || entry.type === 'continued') return;
+        const key = getEntryKey(entry);
+        if (key && !matchesAtUserPrompt(fullText, key)) {
           newUnreachable.add(index);
         }
       });
@@ -338,9 +358,19 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
 
     clickTimerRef.current = setTimeout(() => {
       clickTimerRef.current = null;
-      const searchText = entry.content.slice(0, 1000).trim();
+      // Use first line, max 80 chars — same as getSearchKey in reachability check
+      const searchText = entry.content.split('\n')[0].slice(0, 80).trim();
       if (searchText) {
-        const found = terminalRegistry.searchAndScroll(tabId, searchText);
+        // Count earlier entries with the same search key (duplicate handling)
+        let occurrenceIndex = 0;
+        for (let i = 0; i < index; i++) {
+          const e = entries[i];
+          if (e.type === 'compact' || e.type === 'continued') continue;
+          const eKey = e.content.split('\n')[0].slice(0, 80).trim();
+          if (eKey === searchText) occurrenceIndex++;
+        }
+
+        const found = terminalRegistry.searchAndScrollToNth(tabId, searchText, occurrenceIndex);
         if (found) {
           setTimeout(() => setClickedState(null), 300);
         } else {
