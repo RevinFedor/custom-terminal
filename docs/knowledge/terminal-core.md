@@ -108,15 +108,64 @@ add-zsh-hook precmd __custom_precmd
 1. **macOS (TTYHOG):** Критический лимит равен **1024 байтам** (raw input queue size в `bsd/sys/tty.h`). Ядро физически не может удержать `term.write()` больше 1024 байт за раз. Данные гарантированно режутся на куски, и точки разрыва непредсказуемы. Это может разорвать escape-последовательность bracketed paste (например, `\x1b[20` в одном `read()`, `1~` в другом), что Ink TUI не умеет обрабатывать.
 2. **Linux (N_TTY_BUF_SIZE):** Лимит обычно равен **4096 байтам**. На Linux вероятность разрыва меньше, но атомарность всё равно не гарантируется (возможны "short reads").
 
-## Решение: safePasteAndSubmit (Chunked Paste + Sync Verification)
+## Двухуровневая система вставки (Two-Tier Paste)
+
+В проекте реализованы два разных механизма вставки данных в PTY, каждый для своего сценария:
+
+| | User Paste (Ctrl+V) | Programmatic Paste |
+|---|---|---|
+| **Путь данных** | Пользователь → xterm.js → `terminal:input` IPC → `term.write()` | Наш код → `safePasteAndSubmit()` → `term.write()` напрямую |
+| **xterm.js в цепи** | Да (сам добавляет brackets) | Нет |
+| **Кто шлёт Enter** | Человек (через секунды) | Код (через миллисекунды) |
+| **React Batching Race** | Нет (человек медленный) | Да (код быстрый) |
+| **Нужен sync marker** | Нет | Да |
+| **Где применяется** | Любой терминал (bash, Claude, Gemini) | Handshake, send-command, Rewind |
+
+---
+
+### Tier 1: Simple TTYHOG-Safe Chunking (User Paste)
+
+Обработчик IPC `terminal:input` для вставок > 1024 байт.
+
+**Проблема (была до фикса):** `terminal:input` прогонял ВСЕ вставки через `safePasteAndSubmit`. Это вызывало:
+1. **В обычных терминалах (bash/zsh):** Ожидание sync markers, которые bash не шлёт → 5-секундный таймаут на каждый чанк → вставка 5KB = 30 секунд.
+2. **В Claude TUI:** xterm.js уже обернул текст в brackets + `safePasteAndSubmit` добавила ВТОРОЙ слой brackets → двойное обрамление → сломанный ввод.
+
+**Решение:** Простой chunking без sync markers:
+1. **Детекция brackets:** Если `data` содержит `\x1b[200~` — xterm.js добавил brackets (приложение в терминале запросило bracketed paste mode).
+2. **Strip:** Убрать существующие brackets.
+3. **Chunk:** Разбить текст на куски по 900 байт.
+4. **Re-wrap:** Каждый кусок обернуть в ПОЛНЫЕ brackets `\x1b[200~...\x1b[201~` (если оригинал содержал brackets). Для обычных терминалов — отправить raw.
+5. **Delay:** 10ms между чанками (дать ядру очистить буфер).
+6. **Enter:** Отдельно, с задержкой 50ms (brackets) / 10ms (raw).
+
+```javascript
+// terminal:input — simple chunking for user paste
+if (data.length > 1024) {
+  const hasBrackets = data.includes('\x1b[200~');
+  let content = data;
+  if (hasBrackets) {
+    content = content.replace(/\x1b\[200~/g, '').replace(/\x1b\[201~/g, '');
+  }
+  // ... chunk + re-wrap + small delays
+}
+```
+
+**Почему sync markers не нужны:** Enter всегда приходит как отдельное событие от пользователя (отдельный keystroke). К моменту нажатия Enter React гарантированно обработал вставку. Race condition невозможен.
+
+---
+
+### Tier 2: safePasteAndSubmit (Programmatic Paste)
+
+Функция для программных операций, где код отправляет текст И Enter автоматически.
 
 ### Проблема с предыдущим подходом (writeToPtySafe)
-Старая функция `writeToPtySafe` разбивала ВЕСЬ payload (включая escape-последовательности `\x1b[200~` и `\x1b[201~`) на чанки по 1KB. Это ломало bracketed paste — Ink TUI получал фрагментированные escape sequences и не мог их собрать. Дополнительно, macOS TTYHOG limit = 1024 bytes — ядро режет любой `term.write()` > 1024 байт.
+Старая функция `writeToPtySafe` разбивала ВЕСЬ payload (включая escape-последовательности `\x1b[200~` и `\x1b[201~`) на чанки по 1KB. Это ломало bracketed paste — Ink TUI получал фрагментированные escape sequences и не мог их собрать.
 
-### Новый подход: `safePasteAndSubmit(term, content, options)`
+### Алгоритм `safePasteAndSubmit(term, content, options)`:
 1. **Chunking:** Контент делится на чанки по 900 байт. Каждый чанк оборачивается в ПОЛНЫЙ bracketed paste (`\x1b[200~` + chunk + `\x1b[201~`), итого < 1024 байт — ядро не режет.
 2. **Sync Marker Verification:** После каждого чанка функция слушает PTY output и ждёт sync marker `\x1b[?2026l` (конец Ink render frame). Это подтверждает что Ink обработал paste и React state committed. (**НЕ** text echo — Ink коллапсирует вставки в `[Pasted text #N +M lines]`, поэтому текст не появляется в выводе.)
-3. **Submit:** `\r` отправляется ТОЛЬКО после подтверждения последнего чанка — гарантия что `onSubmit(value)` прочитает правильный state.
+3. **Submit:** `\r` отправляется ТОЛЬКО после подтверждения последнего чанка — гарантия что `onSubmit(value)` прочитает уже зафиксированный в стейте текст.
 
 ```javascript
 await safePasteAndSubmit(term, content, {
@@ -127,10 +176,12 @@ await safePasteAndSubmit(term, content, {
 });
 ```
 
+**Почему sync markers критичны именно здесь:** Код отправляет текст и `\r` с минимальным разрывом. Без sync marker verification React может не успеть закоммитить state, и `onSubmit` увидит пустую строку.
+
 ### Ключевые свойства
 - **Event-driven:** Никаких фиксированных таймаутов. Sync marker = факт render, не предположение.
 - **Любая длина:** Чанков может быть сколько угодно (900 байт каждый).
-- **Universal:** Используется для Handshake, send-command, terminal:input, Restore:History.
+- **Только для программных операций:** Handshake, send-command, Rewind (Restore:History). **НЕ** для `terminal:input`.
 - **Safety timeout:** 8s — это не "подождать", а "что-то фатально сломалось, abort".
 
 ### Bracketed Paste Mode
@@ -138,10 +189,10 @@ await safePasteAndSubmit(term, content, {
 - Начало: `\x1b[200~`
 - Конец: `\x1b[201~`
 
-**Важно:** `\r` для submit отправляется **после** закрывающего тега И подтверждения echo.
+**Важно:** `\r` для submit отправляется **после** закрывающего тега И подтверждения sync marker.
 
 ## Код
-Реализовано в `src/main/main.js`: функции `safePasteAndSubmit()`, `waitForRender()`. Автоматически применяется для любых данных длиннее 1024 байт через `terminal:input`, а также для всех Claude TUI операций.
+Реализовано в `src/main/main.js`: функции `safePasteAndSubmit()`, `waitForRender()`. Применяется для Handshake, `claude:send-command`, Rewind (`claude:open-history-menu`). User paste (Ctrl+V) обрабатывается отдельным simple chunking в `terminal:input`.
 
 ---
 

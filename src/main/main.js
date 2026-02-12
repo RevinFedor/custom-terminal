@@ -967,16 +967,51 @@ ipcMain.on('terminal:input', async (event, tabId, data) => {
     return;
   }
 
-  // For large data: use safePasteAndSubmit (chunked paste + echo verification)
+  // For large data: simple TTYHOG-safe chunking (no sync marker waits)
+  // safePasteAndSubmit is only for programmatic operations (Handshake, send-command, Rewind)
+  // where sync marker verification is critical. User paste (Ctrl+V) doesn't need it:
+  // - Regular terminals (bash/zsh) don't emit sync markers → 5s timeout per chunk
+  // - xterm.js already wraps paste in brackets → safePasteAndSubmit would double-wrap
   if (data.length > 1024) {
-    const endsWithEnter = data.endsWith('\r');
-    const contentToSend = endsWithEnter ? data.slice(0, -1) : data;
+    // Detect xterm.js bracketed paste (app requested \x1b[?2004h)
+    const hasBrackets = data.includes('\x1b[200~');
+    let content = data;
 
-    await safePasteAndSubmit(term, contentToSend, {
-      submit: endsWithEnter,
-      logPrefix: '[terminal:input:' + tabId + ']',
-      safetyTimeoutMs: 5000
-    });
+    // Strip existing brackets — we'll re-wrap each chunk individually
+    if (hasBrackets) {
+      content = content.replace(/\x1b\[200~/g, '').replace(/\x1b\[201~/g, '');
+    }
+
+    // Separate trailing Enter (will send after all chunks)
+    let trailingEnter = '';
+    if (content.endsWith('\r')) {
+      trailingEnter = '\r';
+      content = content.slice(0, -1);
+    }
+
+    const CHUNK_MAX = 900; // < 1024 - bracket overhead (12 bytes)
+    const totalChunks = Math.ceil(content.length / CHUNK_MAX);
+    console.log('[terminal:input] tabId=' + tabId + ' large paste: ' + data.length + 'B → ' + totalChunks + ' chunk(s), brackets=' + hasBrackets);
+
+    for (let i = 0; i < content.length; i += CHUNK_MAX) {
+      const chunk = content.substring(i, i + CHUNK_MAX);
+      if (hasBrackets) {
+        // Each chunk wrapped in COMPLETE brackets — Ink TUI requires atomic paste per chunk
+        term.write(PASTE_START + chunk + PASTE_END);
+      } else {
+        term.write(chunk);
+      }
+      // Small delay between chunks to let kernel PTY buffer drain
+      if (i + CHUNK_MAX < content.length) {
+        await new Promise(r => setTimeout(r, 10));
+      }
+    }
+
+    // Send Enter separately (if present) with delay for Ink React render cycle
+    if (trailingEnter) {
+      await new Promise(r => setTimeout(r, hasBrackets ? 50 : 10));
+      term.write(trailingEnter);
+    }
   } else {
     // Small data path — log for diagnosing "text pasted but not sent" bug
     const endsWithR = data.endsWith('\r');
