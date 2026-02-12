@@ -1007,6 +1007,63 @@ ipcMain.handle('claude:toggle-thinking', async (event, tabId) => {
   });
 });
 
+// Debug: Open history menu via Ctrl+C + Escape sequence, capture PTY output
+ipcMain.handle('claude:open-history-menu', async (event, tabId) => {
+  const term = terminals.get(tabId);
+  if (!term) return { success: false, error: 'no terminal' };
+
+  const stripped = require('node:util').stripVTControlCharacters;
+
+  return new Promise((resolve) => {
+    let resolved = false;
+
+    // Step 1: Send Ctrl+C to cancel any current input
+    term.write('\x03');
+
+    setTimeout(() => {
+      let buffer = '';
+
+      // Step 2: Subscribe to PTY output to capture response
+      const sub = term.onData((data) => {
+        buffer += data;
+      });
+
+      // Step 3: Send first Escape
+      term.write('\x1b');
+
+      setTimeout(() => {
+        // Step 4: Send second Escape
+        term.write('\x1b');
+
+        // Step 5: Collect data for 3 seconds
+        setTimeout(() => {
+          if (resolved) return;
+          resolved = true;
+          sub.dispose();
+
+          const cleanText = stripped(buffer);
+          console.log('[Restore:History] Raw buffer length:', buffer.length);
+          console.log('[Restore:History] Raw (first 500):', JSON.stringify(buffer).substring(0, 500));
+          console.log('[Restore:History] Clean text:', JSON.stringify(cleanText).substring(0, 500));
+
+          // Step 6: Send third Escape to close any opened menu
+          term.write('\x1b');
+
+          resolve({ success: true, cleanText, rawBuffer: buffer, rawLength: buffer.length });
+        }, 3000);
+      }, 100);
+    }, 50);
+
+    // Safety timeout — 5 seconds total
+    setTimeout(() => {
+      if (resolved) return;
+      resolved = true;
+      console.log('[Restore:History] Safety timeout reached');
+      resolve({ success: false, error: 'timeout' });
+    }, 5000);
+  });
+});
+
 // Resize terminal
 ipcMain.on('terminal:resize', (event, tabId, cols, rows) => {
   const term = terminals.get(tabId);
