@@ -141,8 +141,6 @@ export const terminalRegistry = {
       return false;
     }
 
-    console.log('[terminalRegistry.searchAndScroll] searchText:', JSON.stringify(searchText), 'len:', searchText.length);
-
     // Update search state
     const state = searchStates.get(tabId) || { term: '', resultIndex: 0, resultCount: 0 };
     state.term = searchText;
@@ -153,11 +151,34 @@ export const terminalRegistry = {
 
     if (terminal) {
       const buf = terminal.buffer.active;
-      console.log('[terminalRegistry.searchAndScroll] found:', found, '| viewportY:', buf.viewportY, '| baseY:', buf.baseY, '| length:', buf.length);
-    } else {
-      console.log('[terminalRegistry.searchAndScroll] found:', found, '(no terminal ref)');
+      console.log('[terminalRegistry.searchAndScroll] found:', found, '| len:', searchText.length, '| viewportY:', buf.viewportY);
     }
 
+    return found;
+  },
+
+  // Search for the Nth occurrence of text (0-indexed) and scroll to it.
+  // Used for duplicate timeline entries with identical search keys.
+  searchAndScrollToNth(tabId: string, searchText: string, occurrenceIndex: number): boolean {
+    const searchAddon = searchAddons.get(tabId);
+    if (!searchAddon) return false;
+
+    // Reset search state so findNext starts from the beginning (row 0, col 0)
+    searchAddon.clearDecorations();
+
+    // Update search state
+    const state = searchStates.get(tabId) || { term: '', resultIndex: 0, resultCount: 0 };
+    state.term = searchText;
+    searchStates.set(tabId, state);
+
+    // Find the Nth occurrence (0-indexed)
+    let found = false;
+    for (let i = 0; i <= occurrenceIndex; i++) {
+      found = searchAddon.findNext(searchText, defaultSearchOptions);
+      if (!found) return false;
+    }
+
+    console.log('[terminalRegistry.searchAndScrollToNth] key:', JSON.stringify(searchText), 'occurrence:', occurrenceIndex, 'found:', found);
     return found;
   },
 
@@ -337,12 +358,16 @@ export const terminalRegistry = {
     const buf = terminal.buffer.active;
     const startLine = buf.viewportY;
     const endLine = Math.min(startLine + terminal.rows, buf.length);
-    const lines: string[] = [];
+    const parts: string[] = [];
     for (let i = startLine; i < endLine; i++) {
       const line = buf.getLine(i);
-      if (line) lines.push(line.translateToString(true));
+      if (!line) continue;
+      if (i > startLine && !line.isWrapped) parts.push('\n');
+      // Preserve trailing spaces on lines that wrap to next (the space is content, not padding)
+      const nextLine = (i + 1 < buf.length) ? buf.getLine(i + 1) : null;
+      parts.push(line.translateToString(!nextLine?.isWrapped));
     }
-    return lines.join('\n');
+    return parts.join('');
   },
 
   // Get full buffer text (viewport + scrollback) for reachability checks
@@ -350,11 +375,15 @@ export const terminalRegistry = {
     const terminal = terminals.get(tabId);
     if (!terminal) return '';
     const buf = terminal.buffer.active;
-    const lines: string[] = [];
+    const parts: string[] = [];
     for (let i = 0; i < buf.length; i++) {
       const line = buf.getLine(i);
-      if (line) lines.push(line.translateToString(true));
+      if (!line) continue;
+      if (i > 0 && !line.isWrapped) parts.push('\n');
+      // Preserve trailing spaces on lines that wrap to next (the space is content, not padding)
+      const nextLine = (i + 1 < buf.length) ? buf.getLine(i + 1) : null;
+      parts.push(line.translateToString(!nextLine?.isWrapped));
     }
-    return lines.join('\n');
+    return parts.join('');
   }
 };
