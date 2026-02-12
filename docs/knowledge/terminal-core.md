@@ -105,31 +105,40 @@ add-zsh-hook precmd __custom_precmd
 ## Причина
 В UNIX-системах (macOS/Linux) стандартный буфер ввода терминала (TTY Kernel Buffer) ограничен. При моментальной записи большого объема данных происходит переполнение, и остаток отбрасывается ОС.
 
-## Решение: Chunked Write & Bracketed Paste
+## Решение: safePasteAndSubmit (Chunked Paste + Echo Verification)
 
-### 1. Разбиение на чанки (Chunking)
-Данные разбиваются на куски по 1KB с микро-задержкой (10ms) между ними. Это дает время ОС и процессу CLI обработать входящий поток.
+### Проблема с предыдущим подходом (writeToPtySafe)
+Старая функция `writeToPtySafe` разбивала ВЕСЬ payload (включая escape-последовательности `\x1b[200~` и `\x1b[201~`) на чанки по 1KB. Это ломало bracketed paste — Ink TUI получал фрагментированные escape sequences и не мог их собрать. Дополнительно, macOS TTYHOG limit = 1024 bytes — ядро режет любой `term.write()` > 1024 байт.
+
+### Новый подход: `safePasteAndSubmit(term, content, options)`
+1. **Chunking:** Контент делится на чанки по 900 байт. Каждый чанк оборачивается в ПОЛНЫЙ bracketed paste (`\x1b[200~` + chunk + `\x1b[201~`), итого < 1024 байт — ядро не режет.
+2. **Sync Marker Verification:** После каждого чанка функция слушает PTY output и ждёт sync marker `\x1b[?2026l` (конец Ink render frame). Это подтверждает что Ink обработал paste и React state committed. (**НЕ** text echo — Ink коллапсирует вставки в `[Pasted text #N +M lines]`, поэтому текст не появляется в выводе.)
+3. **Submit:** `\r` отправляется ТОЛЬКО после подтверждения последнего чанка — гарантия что `onSubmit(value)` прочитает правильный state.
 
 ```javascript
-async function writeToPtySafe(term, data) {
-  const CHUNK_SIZE = 1024;
-  const DELAY_MS = 10;
-  for (let i = 0; i < data.length; i += CHUNK_SIZE) {
-    term.write(data.substring(i, i + CHUNK_SIZE));
-    await new Promise(r => setTimeout(r, DELAY_MS));
-  }
-}
+await safePasteAndSubmit(term, content, {
+  submit: true,         // отправить \r после всех чанков
+  ctrlCFirst: false,    // Ctrl+C перед paste (для очистки инпута)
+  logPrefix: '[tag]',   // для логов
+  safetyTimeoutMs: 8000 // fallback timeout (не основной механизм)
+});
 ```
 
-### 2. Bracketed Paste Mode
-Чтобы CLI не пытался интерпретировать переносы строк внутри промпта как команду "Выполнить" (Enter), данные оборачиваются в специальные escape-последовательности:
+### Ключевые свойства
+- **Event-driven:** Никаких фиксированных таймаутов. Sync marker = факт render, не предположение.
+- **Любая длина:** Чанков может быть сколько угодно (900 байт каждый).
+- **Universal:** Используется для Handshake, send-command, terminal:input, Restore:History.
+- **Safety timeout:** 8s — это не "подождать", а "что-то фатально сломалось, abort".
+
+### Bracketed Paste Mode
+Данные оборачиваются в escape-последовательности:
 - Начало: `\x1b[200~`
 - Конец: `\x1b[201~`
 
-**Важно:** Символ переноса строки (`\r`) для запуска команды должен отправляться **после** закрывающего тега вставки, иначе он будет воспринят как часть текста.
+**Важно:** `\r` для submit отправляется **после** закрывающего тега И подтверждения echo.
 
 ## Код
-Реализовано в `src/main/main.js` внутри IPC-хендлера `terminal:input`. Автоматически применяется для любых данных длиннее 1024 байт.
+Реализовано в `src/main/main.js`: функции `safePasteAndSubmit()`, `waitForRender()`. Автоматически применяется для любых данных длиннее 1024 байт через `terminal:input`, а также для всех Claude TUI операций.
 
 ---
 

@@ -751,30 +751,11 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
               const pendingPrompt = claudePendingPrompt.get(tabId);
               claudePendingPrompt.delete(tabId);
 
-              const PASTE_START = '\x1b[200~';
-              const PASTE_END = '\x1b[201~';
-
-              console.log('[Claude Handshake] Tab ' + tabId + ': Sending prompt (' + pendingPrompt.length + ' chars) via Bracketed Paste...');
-              const termAlive1 = terminals.has(tabId);
-              console.log('[Claude Handshake] Tab ' + tabId + ': terminal alive=' + termAlive1);
-              if (pendingPrompt.length > 1024) {
-                await writeToPtySafe(term, PASTE_START + pendingPrompt + PASTE_END);
-                console.log('[Claude Handshake] Tab ' + tabId + ': writeToPtySafe done, scheduling Enter in 100ms');
-              } else {
-                term.write(PASTE_START + pendingPrompt + PASTE_END);
-                console.log('[Claude Handshake] Tab ' + tabId + ': paste written, scheduling Enter in 100ms');
-              }
-
-              setTimeout(() => {
-                const termAlive2 = terminals.has(tabId);
-                console.log('[Claude Handshake] Tab ' + tabId + ': Enter timer fired, terminal alive=' + termAlive2);
-                if (termAlive2) {
-                  term.write('\r');
-                  console.log('[Claude Handshake] Tab ' + tabId + ': ✅ Enter sent!');
-                } else {
-                  console.log('[Claude Handshake] Tab ' + tabId + ': ❌ Terminal GONE before Enter!');
-                }
-              }, 100);
+              console.log('[Claude Handshake] Tab ' + tabId + ': Sending prompt (' + pendingPrompt.length + ' chars) via safePasteAndSubmit...');
+              await safePasteAndSubmit(term, pendingPrompt, {
+                submit: true,
+                logPrefix: '[Handshake:' + tabId + ']'
+              });
             } else {
               console.log('[Claude Handshake] Tab ' + tabId + ': ⚠️ No pending prompt found!');
             }
@@ -796,29 +777,11 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
               const pendingPrompt = claudePendingPrompt.get(tabId);
               claudePendingPrompt.delete(tabId);
 
-              const PASTE_START = '\x1b[200~';
-              const PASTE_END = '\x1b[201~';
-
-              const termAlive1 = terminals.has(tabId);
-              console.log('[Claude Handshake] Tab ' + tabId + ': (reset) terminal alive=' + termAlive1 + ' len=' + pendingPrompt.length);
-              if (pendingPrompt.length > 1024) {
-                await writeToPtySafe(term, PASTE_START + pendingPrompt + PASTE_END);
-                console.log('[Claude Handshake] Tab ' + tabId + ': (reset) writeToPtySafe done');
-              } else {
-                term.write(PASTE_START + pendingPrompt + PASTE_END);
-                console.log('[Claude Handshake] Tab ' + tabId + ': (reset) paste written');
-              }
-
-              setTimeout(() => {
-                const termAlive2 = terminals.has(tabId);
-                console.log('[Claude Handshake] Tab ' + tabId + ': (reset) Enter timer fired, terminal alive=' + termAlive2);
-                if (termAlive2) {
-                  term.write('\r');
-                  console.log('[Claude Handshake] Tab ' + tabId + ': (reset) ✅ Enter sent!');
-                } else {
-                  console.log('[Claude Handshake] Tab ' + tabId + ': (reset) ❌ Terminal GONE before Enter!');
-                }
-              }, 100);
+              console.log('[Claude Handshake] Tab ' + tabId + ': (reset) Sending prompt (' + pendingPrompt.length + ' chars) via safePasteAndSubmit...');
+              await safePasteAndSubmit(term, pendingPrompt, {
+                submit: true,
+                logPrefix: '[Handshake:' + tabId + ':reset]'
+              });
             } else {
               console.log('[Claude Handshake] Tab ' + tabId + ': (reset) ⚠️ No pending prompt found!');
             }
@@ -859,37 +822,131 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
     return { pid: ptyProcess.pid, cwd: workingDir };
   });
 
-// Safe PTY write with chunking (prevents TTY buffer overflow)
-async function writeToPtySafe(term, data) {
-  const CHUNK_SIZE = 1024; // 1KB - safe for TTY buffer (OS limit ~4KB)
-  const DELAY_MS = 10;     // 10ms - enough for buffer to flush
-
-  console.log('[writeToPtySafe] Starting write, total length:', data.length);
-  console.log('[writeToPtySafe] Data ends with \\r:', data.endsWith('\r'));
-  console.log('[writeToPtySafe] Data ends with \\n:', data.endsWith('\n'));
-  console.log('[writeToPtySafe] Last 10 chars (escaped):', JSON.stringify(data.slice(-10)));
-
-  const totalChunks = Math.ceil(data.length / CHUNK_SIZE);
-  console.log('[writeToPtySafe] Will write in', totalChunks, 'chunk(s)');
-
-  for (let i = 0; i < data.length; i += CHUNK_SIZE) {
-    const chunk = data.substring(i, i + CHUNK_SIZE);
-    const chunkNum = Math.floor(i / CHUNK_SIZE) + 1;
-    console.log(`[writeToPtySafe] Writing chunk ${chunkNum}/${totalChunks}, size: ${chunk.length}`);
-    term.write(chunk);
-
-    // Wait for Event Loop and TTY to process
-    if (i + CHUNK_SIZE < data.length) {
-      console.log('[writeToPtySafe] Waiting', DELAY_MS, 'ms before next chunk...');
-      await new Promise(resolve => setTimeout(resolve, DELAY_MS));
-    }
-  }
-  console.log('[writeToPtySafe] ✅ All chunks written');
-}
-
 // Bracketed Paste Mode escape sequences
 const PASTE_START = '\x1b[200~';
 const PASTE_END = '\x1b[201~';
+
+// ============================================================
+// Safe Paste + Echo Verification for PTY
+// ============================================================
+// Problem: macOS TTYHOG = 1024 bytes. Any single term.write() > 1024 bytes
+// gets split by the kernel. Ink TUI can't reassemble fragmented bracketed paste.
+// Old writeToPtySafe chunked the ENTIRE payload (including escape sequences),
+// breaking them across writes.
+//
+// Solution: Split content into chunks < 900 bytes. Each chunk is a COMPLETE
+// bracketed paste (\x1b[200~ + chunk + \x1b[201~), total < 1024 bytes.
+// After each chunk, wait for echo in PTY output (event-driven, no fixed timeouts).
+// Send \r only after last chunk's echo is confirmed.
+// ============================================================
+
+// Wait for Ink render cycle (sync marker \x1b[?2026l = end of synchronized output)
+// Used for: Ctrl+C clear, paste chunk confirmation, post-action waits.
+// WHY sync marker works for paste: with chunking < 1024 bytes, each paste is delivered
+// intact to Ink (no TTYHOG split) → Ink processes it → state update → re-render → sync marker.
+// WHY NOT text echo: Ink collapses long pastes into "[Pasted text #N +M lines]",
+// so the actual pasted text never appears verbatim in PTY output.
+function waitForRender(term, timeoutMs, logPrefix) {
+  return new Promise((resolve) => {
+    let buf = '';
+    let resolved = false;
+
+    const cleanup = () => {
+      if (!resolved) {
+        resolved = true;
+        clearTimeout(timer);
+        sub.dispose();
+      }
+    };
+
+    const timer = setTimeout(() => {
+      console.log(logPrefix + ' Render timeout (' + timeoutMs + 'ms), buf=' + buf.length + 'B');
+      cleanup();
+      resolve({ timedOut: true });
+    }, timeoutMs);
+
+    const sub = term.onData((data) => {
+      if (resolved) return;
+      buf += data;
+      if (buf.includes('\x1b[?2026l')) {
+        cleanup();
+        resolve({ timedOut: false });
+      }
+    });
+  });
+}
+
+// Main helper: chunked paste + echo verification + optional submit
+async function safePasteAndSubmit(term, content, options = {}) {
+  const {
+    submit = true,
+    ctrlCFirst = false,
+    logPrefix = '[safePaste]',
+    safetyTimeoutMs = 8000
+  } = options;
+
+  // TTYHOG on macOS = 1024 bytes. Paste brackets = 12 bytes. Leave margin.
+  const CHUNK_MAX = 900;
+
+  if (!term || typeof term.write !== 'function') {
+    console.log(logPrefix + ' ❌ Terminal not available');
+    return { success: false, error: 'terminal not available' };
+  }
+
+  // Split content into chunks
+  const chunks = [];
+  for (let i = 0; i < content.length; i += CHUNK_MAX) {
+    chunks.push(content.substring(i, i + CHUNK_MAX));
+  }
+
+  console.log(logPrefix + ' Start: ' + content.length + ' chars → ' + chunks.length + ' chunk(s), submit=' + submit + ', ctrlC=' + ctrlCFirst);
+
+  // Optional: Ctrl+C to clear input, wait for Ink render
+  if (ctrlCFirst) {
+    term.write('\x03');
+    console.log(logPrefix + ' Ctrl+C sent, waiting for render...');
+    const renderResult = await waitForRender(term, 2000, logPrefix + ':ctrl-c');
+    console.log(logPrefix + ' Ctrl+C render ' + (renderResult.timedOut ? 'timeout' : 'confirmed'));
+  }
+
+  const renderTimes = [];
+
+  for (let i = 0; i < chunks.length; i++) {
+    const chunk = chunks[i];
+    const payload = PASTE_START + chunk + PASTE_END;
+
+    console.log(logPrefix + ' Chunk ' + (i + 1) + '/' + chunks.length + ': ' + chunk.length + ' chars, payload ' + payload.length + 'B');
+
+    const startTime = Date.now();
+
+    // Subscribe BEFORE write to capture Ink's render after our paste
+    const renderPromise = waitForRender(term, safetyTimeoutMs, logPrefix + ':chunk' + (i + 1));
+
+    // Write complete bracketed paste (< 1024 bytes = atomic in TTYHOG)
+    term.write(payload);
+
+    // Wait for Ink render cycle (sync marker = paste processed, React state committed)
+    const result = await renderPromise;
+    const elapsed = Date.now() - startTime;
+    renderTimes.push(elapsed);
+
+    if (result.timedOut) {
+      console.log(logPrefix + ' ⚠️ Chunk ' + (i + 1) + ' render TIMEOUT after ' + elapsed + 'ms — continuing anyway');
+    } else {
+      console.log(logPrefix + ' ✅ Chunk ' + (i + 1) + '/' + chunks.length + ' render confirmed in ' + elapsed + 'ms');
+    }
+  }
+
+  // All chunks sent and render-confirmed → submit
+  if (submit) {
+    term.write('\r');
+    console.log(logPrefix + ' ✅ Enter sent after ' + chunks.length + ' chunk(s). Render times: [' + renderTimes.join(', ') + ']ms');
+  } else {
+    console.log(logPrefix + ' Done (no submit). Render times: [' + renderTimes.join(', ') + ']ms');
+  }
+
+  return { success: true, chunksTotal: chunks.length, renderTimeMs: renderTimes };
+}
 
 // Send input to terminal
 // Force command-started signal (for Claude commands that bypass OSC 133 detection)
@@ -910,29 +967,16 @@ ipcMain.on('terminal:input', async (event, tabId, data) => {
     return;
   }
 
-  // For large data: use chunked write with bracketed paste
+  // For large data: use safePasteAndSubmit (chunked paste + echo verification)
   if (data.length > 1024) {
-    console.log(`[main] Large input (${data.length} bytes), using chunked write`);
-
-    // Check if data ends with \r (Enter) - need to send it AFTER paste ends
     const endsWithEnter = data.endsWith('\r');
-    console.log(`[main] endsWithEnter: ${endsWithEnter}, last chars: ${JSON.stringify(data.slice(-5))}`);
     const contentToSend = endsWithEnter ? data.slice(0, -1) : data;
 
-    console.log('[main] Starting writeToPtySafe...');
-    await writeToPtySafe(term, PASTE_START + contentToSend + PASTE_END);
-    console.log('[main] writeToPtySafe completed');
-
-    // Send Enter separately, outside of bracketed paste
-    if (endsWithEnter) {
-      console.log('[main] Waiting 50ms before Enter...');
-      await new Promise(resolve => setTimeout(resolve, 50));
-      console.log('[main] Sending Enter now!');
-      term.write('\r');
-      console.log('[main] Enter sent!');
-    } else {
-      console.log('[main] ⚠️ NO ENTER TO SEND - data did not end with \r');
-    }
+    await safePasteAndSubmit(term, contentToSend, {
+      submit: endsWithEnter,
+      logPrefix: '[terminal:input:' + tabId + ']',
+      safetyTimeoutMs: 5000
+    });
   } else {
     // Small data path — log for diagnosing "text pasted but not sent" bug
     const endsWithR = data.endsWith('\r');
@@ -945,21 +989,17 @@ ipcMain.on('terminal:input', async (event, tabId, data) => {
   }
 });
 
-// Send a slash command to Claude's Ink TUI (paste brackets + delayed Enter)
-// Ink in raw mode ignores bare \r/\n — need paste wrapper then separate \r
+// Send a slash command to Claude's Ink TUI (chunked paste + echo verification)
 ipcMain.on('claude:send-command', (event, tabId, command) => {
   const term = terminals.get(tabId);
   if (!term) return;
-  // Ctrl+C clears entire input (even multiline), single press doesn't exit
-  term.write('\x03');
-  setTimeout(() => {
-    const PASTE_START = '\x1b[200~';
-    const PASTE_END = '\x1b[201~';
-    term.write(PASTE_START + command + PASTE_END);
-    setTimeout(() => {
-      term.write('\r');
-    }, 100);
-  }, 50);
+  (async () => {
+    await safePasteAndSubmit(term, command, {
+      submit: true,
+      ctrlCFirst: true,
+      logPrefix: '[send-command:' + tabId + ']'
+    });
+  })();
 });
 
 // Toggle thinking mode reactively: open picker → detect state → navigate → confirm
@@ -1197,20 +1237,22 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
       (cursorPos >= 0 && cursorPos < knownEntries.length ? ' (' + knownEntries[cursorPos].substring(0, 80) + ')' : ' (current)'));
 
     // Step 5: Confirm selection with Enter → triggers actual rewind
+    // Claude rebuilds context here — can take a while for large sessions
+    const rewindStartTime = Date.now();
     console.log('[Restore:History] Confirming selection with Enter...');
     const confirmText = await sendAndCapture('\r', 5000);
-    console.log('[Restore:History] Confirm response (first sync):', confirmText.substring(0, 200));
+    console.log('[Restore:History] Confirm response in ' + (Date.now() - rewindStartTime) + 'ms:', confirmText.substring(0, 200));
 
     // Step 6: Paste compact text if provided
     if (pasteAfter && typeof pasteAfter === 'string' && pasteAfter.length > 0) {
       // Wait for Claude's prompt to FULLY render — the first sync marker (Step 5) is just the banner.
       // We need to wait for subsequent render cycles until the prompt box (╭...╰ or ⏵ or >) appears.
       // Claude TUI uses Ink which renders in frames, each ending with \x1b[?2026l.
+      const promptWaitStart = Date.now();
       console.log('[Restore:History] Waiting for prompt to fully render...');
 
       let promptReady = false;
       let renderCount = 0;
-      let lastRenderText = '';
 
       await new Promise((resolve) => {
         let buf = '';
@@ -1221,8 +1263,7 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
           while (buf.includes('\x1b[?2026l')) {
             renderCount++;
             const clean = cleanBuffer(buf.split('\x1b[?2026l')[0]);
-            lastRenderText = clean;
-            console.log('[Restore:History] Render frame #' + renderCount + ':', clean.substring(0, 150));
+            console.log('[Restore:History] Render frame #' + renderCount + ' (' + (Date.now() - promptWaitStart) + 'ms):', clean.substring(0, 150));
 
             // Prompt is ready when we see the prompt box bottom (╰) or prompt symbols (⏵ or >)
             if (buf.includes('\u2335') || buf.includes('\u23F5') || buf.includes('╰') || renderCount >= 5) {
@@ -1240,69 +1281,21 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
         // Safety: 15s timeout (large sessions can take longer to rebuild context)
         setTimeout(() => {
           sub.dispose();
-          console.log('[Restore:History] Prompt render timeout after ' + renderCount + ' frames');
+          console.log('[Restore:History] Prompt render timeout after ' + renderCount + ' frames (' + (Date.now() - promptWaitStart) + 'ms)');
           resolve();
         }, 15000);
       });
 
-      console.log('[Restore:History] Prompt ready=' + promptReady + ' after ' + renderCount + ' render frames');
+      console.log('[Restore:History] Prompt ready=' + promptReady + ' after ' + renderCount + ' frames (' + (Date.now() - promptWaitStart) + 'ms)');
 
-      // Extra settle time after last render
-      await new Promise(r => setTimeout(r, 500));
-
-      // CRITICAL: Write paste as SINGLE atomic term.write() — no chunking.
-      // Ink TUI exits bracketed paste mode after each read(). If the paste is chunked
-      // into multiple writes, Ink processes chunk 1 as paste, re-renders, then treats
-      // chunks 2+ as raw keystrokes → text gets wiped.
-      // claude:send-command works because it writes everything in one term.write().
-      const pastePayload = PASTE_START + pasteAfter + PASTE_END;
-      console.log('[Restore:History] Pasting compact text: ' + pasteAfter.length + ' chars, payload: ' + pastePayload.length + ' bytes (single write)');
-
-      // Ctrl+C to clear pre-filled input (Claude restores the old message after rewind)
-      // Then wait for Ink re-render to complete before pasting
-      term.write('\x03');
-      console.log('[Restore:History] Ctrl+C sent, waiting for input clear render...');
-      await new Promise((resolve) => {
-        let buf = '';
-        const sub = term.onData((data) => {
-          buf += data;
-          if (buf.includes('\x1b[?2026l')) {
-            sub.dispose();
-            resolve();
-          }
-        });
-        setTimeout(() => { sub.dispose(); resolve(); }, 2000);
+      // Paste compact text using safePasteAndSubmit (chunked + echo verification)
+      // ctrlCFirst: true — Claude restores old message after rewind, need to clear it
+      console.log('[Restore:History] Pasting compact text: ' + pasteAfter.length + ' chars via safePasteAndSubmit');
+      await safePasteAndSubmit(term, pasteAfter, {
+        submit: true,
+        ctrlCFirst: true,
+        logPrefix: '[Restore:History:paste]'
       });
-
-      // Now paste into clean input (single atomic write)
-      term.write(pastePayload);
-
-      // Wait for Ink to process the paste and re-render (sync marker = frame complete)
-      console.log('[Restore:History] Waiting for Ink to process paste...');
-      await new Promise((resolve) => {
-        let buf = '';
-        const sub = term.onData((data) => {
-          buf += data;
-          if (buf.includes('\x1b[?2026l')) {
-            sub.dispose();
-            const clean = cleanBuffer(buf);
-            console.log('[Restore:History] Paste render confirmed:', clean.substring(0, 200));
-            resolve();
-          }
-        });
-        setTimeout(() => {
-          sub.dispose();
-          console.log('[Restore:History] Paste render timeout (5s), submitting anyway');
-          resolve();
-        }, 5000);
-      });
-
-      // Small settle after render
-      await new Promise(r => setTimeout(r, 50));
-
-      // Submit with \r — triggers JSONL rewrite
-      term.write('\r');
-      console.log('[Restore:History] Submitted with \\r');
     }
 
     return { success: true, entries: knownEntries, cursorIndex: cursorPos, targetIndex: target };
