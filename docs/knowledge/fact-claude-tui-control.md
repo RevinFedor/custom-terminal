@@ -17,6 +17,10 @@ Claude Code CLI работает на базе Ink (React TUI) в raw mode с в
 5. \r                                      — Enter отдельно от paste (Ink обрабатывает как submit)
 ```
 
+**⚠️ КРИТИЧЕСКОЕ ПРАВИЛО: Атомарная запись.**
+Ink TUI (на котором написан Claude Code) сбрасывает состояние "Paste Mode", если данные приходят несколькими кусками (`read()`). Это происходит при использовании `writeToPtySafe`, который делит текст на чанки по 1КБ. 
+**Решение:** Для вставки команд и резюме ВСЕГДА использовать одиночный `term.write(PASTE_START + content + PASTE_END)`. Для данных < 4КБ это гарантированно атомарно в PTY.
+
 **Почему именно так:**
 - Ctrl+C безопаснее Ctrl+U — очищает многострочный ввод, одиночное нажатие не выходит из Claude
 - Paste brackets нужны потому что Ink в raw mode иначе обрабатывает каждый символ как keypress
@@ -30,6 +34,33 @@ ipcRenderer.send('claude:send-command', tabId, '/model sonnet');
 ```
 
 Текущая модель определяется из bridge-данных (`claude:bridge-update` → `data.model`).
+
+## Реактивное управление TUI через синхронизацию
+
+### Особенности парсинга Claude Code TUI
+1. **Sync Markers (\x1b[?2026h/l):** Современные TUI (включая Claude) используют эти маркеры для обозначения границ кадра отрисовки. 
+    - **Правило:** Любой парсинг буфера (меню истории, пикер модели) должен начинаться только ПОСЛЕ детекции `\x1b[?2026l` (конец кадра).
+2. **Проблема исчезновения пробелов:** Claude TUI не всегда использует `0x20` (пробел). Вместо этого часто шлется `\x1b[NC` (cursor forward). 
+    - **Правило:** Перед очисткой VT-символов необходимо заменять `\x1b[(\d*)C` на соответствующее количество пробелов. Иначе текст склеится (`каксейчасработает`).
+3. **Детекция готовности инпута:** После выполнения команд (например, `/model` или откат), нужно ждать отрисовки промпт-бокса. Признак готовности — появление в кадре символов `╰` (низ бокса), `⏵` или `>`.
+
+## Rewind Automation (Откат истории)
+
+Для программного отката используется IPC `claude:open-history-menu`.
+
+**Алгоритм навигации:**
+1. **Открытие:** Отправить `\x03` (Ctrl+C) → `\x1b` (Esc) → `\x1b` (Esc).
+2. **Парсинг:** Ждать sync marker, извлечь список записей.
+3. **Сопоставление (Text Match):** Найти нужную запись по префиксу текста сообщения.
+4. **Синхронная навигация:** Каждое нажатие `Arrow Up` верифицируется — система ждет новый кадр и проверяет, что курсор `❯` переместился на нужную строку.
+5. **Подтверждение:** Отправить `\r` (Enter) для выбора точки отката.
+
+**Очистка и вставка:**
+После отката Claude часто сохраняет старое сообщение в инпуте.
+1. **Wait for prompt:** Ждем полной отрисовки промпта (sync marker + `╰`).
+2. **Clear:** Отправить `\x03` (Ctrl+C).
+3. **Atomic Paste:** Вставить сжатое резюме единым блоком.
+4. **Submit:** Отправить `\r`.
 
 ## Реактивное управление Think Mode
 
@@ -79,7 +110,7 @@ wasEnabled  = |checkIdx - enabledIdx| < |checkIdx - disabledIdx|
 WAITING_PROMPT → DEBOUNCE_PROMPT → send prompt → done
 ```
 
-Thinking mode при запуске **не отправляется** через Handshake — это делает `alwaysThinkingEnabled: true` в `~/.claude/settings.json` глобально.
+Thinking mode при запуске **не отправляется** через Handshake — это делает `alwaysThinkingEnabled: true` in `~/.claude/settings.json` глобально.
 
 ### Шаги
 1. **WAITING_PROMPT:** Ждёт prompt-символа (`⏵` или `>`) в PTY output через `stripVTControlCharacters()`
@@ -92,6 +123,7 @@ Thinking mode при запуске **не отправляется** через
 
 ## Code Map
 - **Main (send command):** `src/main/main.js` — IPC `claude:send-command`
+- **Main (history menu / rewind):** `src/main/main.js` — IPC `claude:open-history-menu`
 - **Main (think toggle):** `src/main/main.js` — IPC `claude:toggle-thinking` (handle)
 - **Main (handshake):** `src/main/main.js` — стейт-машина `claudeState` в `ptyProcess.onData`
 - **Renderer (UI):** `src/renderer/components/Workspace/panels/InfoPanel.tsx` — кнопки модели + think toggle

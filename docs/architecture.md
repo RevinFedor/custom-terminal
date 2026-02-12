@@ -50,6 +50,7 @@
         - **Legacy:** Ранняя реализация через Sniper Watcher (отслеживание создания файлов) сохранена в `docs/knowledge/fact-legacy-sniper-watcher.md`.
     - **Claude Handshake:** Упрощённая стейт-машина (WAITING_PROMPT → DEBOUNCE_PROMPT → send prompt) для автоматической отправки промпта при запуске. Thinking mode обеспечивается `alwaysThinkingEnabled` в settings.json. Поддерживает `⏵` (Claude v2.1.32+) и `>`. Используется `stripVTControlCharacters()`.
     - **Claude TUI Control:** Программное управление Ink TUI через PTY. Модель (`/model <alias>`) переключается через bracketed paste + delayed Enter. Think mode — через реактивный парсинг TUI-пикера (`meta+t`). См. `knowledge/fact-claude-tui-control.md`.
+    - **Rewind (Откат):** Автоматизированный возврат к любой точке истории Claude. 3-фазный процесс: 1. Compaction (Gemini сжимает "теряемую" часть истории), 2. PTY Automation (открытие TUI меню истории, навигация, подтверждение), 3. Context Injection (вставка сжатого контекста через атомарный paste). См. `knowledge/fact-claude-tui-control.md`.
     - **Gemini Sniper:** Захват UUID через `fs.watch` на `session-*.json`. См. `knowledge/ai-automation.md`.
     - **Timeline & Export Engine:** Асинхронный парсинг JSONL файлов с использованием алгоритма **Backtrace** для фильтрации отменённых (Undo) веток диалога. 
      
@@ -93,7 +94,7 @@ Continue → claude --resume ID | Dismiss → overlayDismissed = true
 - **Категории:** `app:claude`, `app:tabs`, `app:commands`, `app:perf`, `app:terminal`, `app:store`, `app:ui`.
 - **Управление:** Включается через консоль DevTools: `localStorage.debug = 'app:*'`.
 - **Принудительный режим:** В режиме разработки логгер принудительно включает `app:tabs` для отслеживания жизненного цикла сессий. См. `knowledge/ui-ux-stability.md`.
-- **ЛОВУШКА: console.log перехвачен.** В `main.tsx` установлен глобальный фильтр — `console.log()` пропускает только логи с префиксом `[RESTORE]`. Для отладки использовать `console.warn()`. См. `knowledge/fact-console-interceptor.md`.
+- **Tag-based Log Filter:** В `main.tsx` установлен глобальный перехватчик `console.log` и `console.warn`. Логи фильтруются по префиксам `[TAG]`. Управление (включение/выключение групп) осуществляется через `window.logs` API в консоли DevTools. См. `knowledge/fact-console-interceptor.md`.
 
 ## 7. Styling & Rendering
 - **Tailwind v4 + Vite:** Используется официальный плагin `@tailwindcss/vite`, обеспечивающий мгновенный HMR и автоматическое сканирование зависимостей. См. `knowledge/rendering-styles.md`.

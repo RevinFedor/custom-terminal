@@ -755,16 +755,28 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
               const PASTE_END = '\x1b[201~';
 
               console.log('[Claude Handshake] Tab ' + tabId + ': Sending prompt (' + pendingPrompt.length + ' chars) via Bracketed Paste...');
+              const termAlive1 = terminals.has(tabId);
+              console.log('[Claude Handshake] Tab ' + tabId + ': terminal alive=' + termAlive1);
               if (pendingPrompt.length > 1024) {
                 await writeToPtySafe(term, PASTE_START + pendingPrompt + PASTE_END);
+                console.log('[Claude Handshake] Tab ' + tabId + ': writeToPtySafe done, scheduling Enter in 100ms');
               } else {
                 term.write(PASTE_START + pendingPrompt + PASTE_END);
+                console.log('[Claude Handshake] Tab ' + tabId + ': paste written, scheduling Enter in 100ms');
               }
 
               setTimeout(() => {
-                term.write('\r');
-                console.log('[Claude Handshake] Tab ' + tabId + ': Prompt sent!');
+                const termAlive2 = terminals.has(tabId);
+                console.log('[Claude Handshake] Tab ' + tabId + ': Enter timer fired, terminal alive=' + termAlive2);
+                if (termAlive2) {
+                  term.write('\r');
+                  console.log('[Claude Handshake] Tab ' + tabId + ': ✅ Enter sent!');
+                } else {
+                  console.log('[Claude Handshake] Tab ' + tabId + ': ❌ Terminal GONE before Enter!');
+                }
               }, 100);
+            } else {
+              console.log('[Claude Handshake] Tab ' + tabId + ': ⚠️ No pending prompt found!');
             }
 
             claudeState.delete(tabId);
@@ -778,7 +790,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
           clearTimeout(claudeDebounceTimers.get(tabId));
 
           const timerId = setTimeout(async () => {
-            console.log('[Claude Handshake] Tab ' + tabId + ': UI settled. Sending prompt...');
+            console.log('[Claude Handshake] Tab ' + tabId + ': UI settled (debounce reset). Sending prompt...');
 
             if (claudePendingPrompt.has(tabId)) {
               const pendingPrompt = claudePendingPrompt.get(tabId);
@@ -787,16 +799,28 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
               const PASTE_START = '\x1b[200~';
               const PASTE_END = '\x1b[201~';
 
+              const termAlive1 = terminals.has(tabId);
+              console.log('[Claude Handshake] Tab ' + tabId + ': (reset) terminal alive=' + termAlive1 + ' len=' + pendingPrompt.length);
               if (pendingPrompt.length > 1024) {
                 await writeToPtySafe(term, PASTE_START + pendingPrompt + PASTE_END);
+                console.log('[Claude Handshake] Tab ' + tabId + ': (reset) writeToPtySafe done');
               } else {
                 term.write(PASTE_START + pendingPrompt + PASTE_END);
+                console.log('[Claude Handshake] Tab ' + tabId + ': (reset) paste written');
               }
 
               setTimeout(() => {
-                term.write('\r');
-                console.log('[Claude Handshake] Tab ' + tabId + ': Prompt sent!');
+                const termAlive2 = terminals.has(tabId);
+                console.log('[Claude Handshake] Tab ' + tabId + ': (reset) Enter timer fired, terminal alive=' + termAlive2);
+                if (termAlive2) {
+                  term.write('\r');
+                  console.log('[Claude Handshake] Tab ' + tabId + ': (reset) ✅ Enter sent!');
+                } else {
+                  console.log('[Claude Handshake] Tab ' + tabId + ': (reset) ❌ Terminal GONE before Enter!');
+                }
               }, 100);
+            } else {
+              console.log('[Claude Handshake] Tab ' + tabId + ': (reset) ⚠️ No pending prompt found!');
             }
 
             claudeState.delete(tabId);
@@ -910,6 +934,13 @@ ipcMain.on('terminal:input', async (event, tabId, data) => {
       console.log('[main] ⚠️ NO ENTER TO SEND - data did not end with \r');
     }
   } else {
+    // Small data path — log for diagnosing "text pasted but not sent" bug
+    const endsWithR = data.endsWith('\r');
+    const endsWithN = data.endsWith('\n');
+    const hasNewline = data.includes('\r') || data.includes('\n');
+    if (data.length > 1) {
+      console.log(`[terminal:input] tabId=${tabId} len=${data.length} endsWithR=${endsWithR} endsWithN=${endsWithN} hasNewline=${hasNewline} last5=${JSON.stringify(data.slice(-5))} first30=${JSON.stringify(data.slice(0, 30))}`);
+    }
     term.write(data);
   }
 });

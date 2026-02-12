@@ -1,38 +1,34 @@
-# ЛОВУШКА: Глобальный перехватчик console.log в Renderer
+# Факт: Глобальный фильтр логов по тегам
 
-## Файл: `src/renderer/main.tsx` (строки 6-22)
+## Файл: `src/renderer/main.tsx` (строки 6-45)
 
 ## Проблема
-`console.log()` в renderer-процессе **НЕ выводит ничего** в DevTools Console. Логи молча проглатываются. Это может стоить часов отладки.
+Избыточное логирование в Renderer-процессе (особенно `[Workspace:RENDER]`) засоряет консоль DevTools, снижает производительность при открытой консоли и мешает отладке критических процессов.
 
-## Причина
-В `main.tsx` установлен глобальный фильтр:
-```javascript
-const RESTORE_DEBUG = true;
-if (RESTORE_DEBUG) {
-  console.log = (...args) => {
-    const first = args[0];
-    if (typeof first === 'string' && first.startsWith('[RESTORE]')) {
-      _origLog(...args);
-    }
-  };
-}
-```
-Пропускаются **только** логи с префиксом `[RESTORE]`. Всё остальное — в /dev/null.
+## Решение: Tag-based Interceptor
+В `main.tsx` реализован перехватчик `console.log` и `console.warn`, который фильтрует сообщения на основе тегов.
 
-## Что НЕ затронуто
-- `console.warn()` — работает нормально, НЕ фильтруется
-- `console.error()` — работает нормально, НЕ фильтруется
-- Main process логи (терминал `npm run dev`) — не затронуты, это другой процесс
+### Как это работает
+1. **Парсинг тега:** Перехватчик ищет паттерн `[TAG]` или `[TAG:SUBTAG]` в первом аргументе лога. 
+2. **Фильтрация:** Сообщение выводится только если:
+    - Тег входит в список `LOG_ALWAYS_TAGS` (например, `RESTORE`, `ErrorBoundary`).
+    - Тег НЕ входит в список `LOG_DISABLED_TAGS`.
+3. **console.error:** Никогда не фильтруется и всегда выводится в консоль.
 
-## Правило для отладки
-Для временных отладочных логов в renderer использовать `console.warn()`, а не `console.log()`.
+### Список отключенных тегов (по умолчанию)
+`Workspace`, `TerminalArea`, `Terminal`, `safeFit`, `ProjectHome`, `Store`, `Link`, `Settings`, `SessionsPanel`, `CURSOR`, `SILENCE`, `DIAG`, `UIStore`, `Dashboard`, `NotesEditor`, `ResearchInput`, `Research`, `Timeline`, `Think`.
 
-## Пример
-```typescript
-// ❌ НЕ ПОЯВИТСЯ в DevTools
-console.log('[Timeline] click:', entry.uuid);
+## Управление: window.logs API
+Для динамического управления логированием в рантайме (через DevTools Console) доступен объект `window.logs`:
 
-// ✅ Появится в DevTools
-console.warn('[Timeline] click:', entry.uuid);
-```
+- `logs.status()` — показать список всех тегов и их текущее состояние (вкл/выкл).
+- `logs.on('Tag')` — включить отображение логов для конкретного тега.
+- `logs.off('Tag')` — выключить отображение.
+- `logs.only('Tag1', 'Tag2')` — выключить всё, кроме указанных тегов.
+- `logs.all()` — включить вообще все логи (включая шумные).
+- `logs.reset()` — вернуть настройки к значениям по умолчанию.
+
+## Правила для разработки
+1. **Всегда используйте теги:** Начинайте лог со строки в квадратных скобках: `console.log('[MyFeature] init done')`.
+2. **Иерархия:** Можно использовать подтеги: `[MyFeature:Internal]`. Фильтрация идет по основной части (до двоеточия).
+3. **console.warn:** Теперь тоже фильтруется. Используйте его для важных предупреждений, которые должны быть видны при включенном соответствующем теге.
