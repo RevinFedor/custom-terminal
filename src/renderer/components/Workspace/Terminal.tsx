@@ -1390,22 +1390,26 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
   // opacity:0 initially to prevent jitter during first fit
 
   return (
-    <div className="absolute inset-0" style={{ zIndex: effectiveActive ? 1 : -1, isolation: 'isolate' }}>
+    <>
+      <div className="absolute inset-0" style={{ zIndex: effectiveActive ? 1 : -1, isolation: 'isolate' }}>
 
-      {/* Layer 1: Terminal (Lower) */}
-      <div
-        ref={terminalRef}
-        className="terminal-instance w-full h-full"
-        style={{
-          visibility: effectiveActive ? 'visible' : 'hidden',
-          opacity: isVisible ? 1 : 0,
-          transition: 'opacity 0.05s ease-in'
-        }}
-        onClick={handleClick}
-        onContextMenu={handleContextMenu}
-      />
+        {/* Layer 1: Terminal (Lower) */}
+        <div
+          ref={terminalRef}
+          className="terminal-instance w-full h-full"
+          style={{
+            visibility: effectiveActive ? 'visible' : 'hidden',
+            opacity: isVisible ? 1 : 0,
+            transition: 'opacity 0.05s ease-in'
+          }}
+          onClick={handleClick}
+          onContextMenu={handleContextMenu}
+        />
 
-      {/* Layer 2: UI Overlay - Scroll to bottom button */}
+      </div>
+
+      {/* Scroll-to-bottom button — OUTSIDE isolation:isolate wrapper so its z-index
+          participates in root stacking context (above Timeline tooltip portal z:10000) */}
       {active && showScrollButton && (
         <button
           onClick={scrollToBottom}
@@ -1424,7 +1428,7 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
             color: 'rgba(255, 255, 255, 0.8)',
             fontSize: '18px',
             boxShadow: '0 4px 12px rgba(0, 0, 0, 0.3)',
-            zIndex: 100
+            zIndex: 10001
           }}
           onMouseEnter={(e) => {
             e.currentTarget.style.backgroundColor = 'rgba(80, 80, 80, 0.95)';
@@ -1440,8 +1444,7 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
           ↓
         </button>
       )}
-
-    </div>
+    </>
   );
 }
 

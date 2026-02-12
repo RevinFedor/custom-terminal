@@ -155,10 +155,10 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
       return;
     }
 
-    // Helper: extract search key from entry
+    // Helper: extract search key from entry (full content up to 1000 chars)
     const getSearchKey = (entry: TimelineEntry): string | null => {
       if (entry.type === 'compact') return null;
-      const text = entry.content.split('\n')[0].slice(0, 40).trim();
+      const text = entry.content.slice(0, 1000).trim();
       return text || null;
     };
 
@@ -250,6 +250,19 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
     }
   }, [activeTooltipIndex, isExpanded]);
 
+  // Dismiss tooltip on any mousedown outside tooltip content
+  // Handles: dead zone clicks, scrollbar grabs, clicks elsewhere
+  useEffect(() => {
+    if (activeTooltipIndex === null) return;
+    const handleGlobalMouseDown = (e: MouseEvent) => {
+      if (tooltipContentRef.current?.contains(e.target as Node)) return;
+      setActiveTooltipIndex(null);
+      setHoveredIndex(null);
+    };
+    window.addEventListener('mousedown', handleGlobalMouseDown);
+    return () => window.removeEventListener('mousedown', handleGlobalMouseDown);
+  }, [activeTooltipIndex]);
+
   const handleMouseEnterSegment = (index: number) => {
     setHoveredIndex(index);
     setActiveTooltipIndex(index);
@@ -325,7 +338,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
 
     clickTimerRef.current = setTimeout(() => {
       clickTimerRef.current = null;
-      const searchText = entry.content.split('\n')[0].slice(0, 40).trim();
+      const searchText = entry.content.slice(0, 1000).trim();
       if (searchText) {
         const found = terminalRegistry.searchAndScroll(tabId, searchText);
         if (found) {
