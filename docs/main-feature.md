@@ -70,4 +70,4 @@
 - **Отрисовка:** [Canvas вместо WebGL](knowledge/ui-ux-stability.md) для стабильности.
 - **Пути:** [Реактивный OSC 7](knowledge/terminal-core.md) для мгновенного отслеживания CWD.
 - **Слои:** [Layering Pattern](knowledge/ui-ux-stability.md) для отрисовки UI поверх терминала.
-- **Ввод:** [Safe Write](knowledge/terminal-core.md) для вставки огромных промптов без обрывов.
+- **Ввод:** [safePasteAndSubmit](knowledge/terminal-core.md) для вставки огромных промптов чанками с обходом macOS TTYHOG лимитов.
