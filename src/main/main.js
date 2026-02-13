@@ -930,7 +930,8 @@ function waitForRender(term, timeoutMs, logPrefix) {
   });
 }
 
-// Main helper: chunked paste + echo verification + optional submit
+// Main helper: chunked paste + sync marker verification + optional submit
+// ДИАГНОСТИЧЕСКАЯ ВЕРСИЯ — подробное логирование для отладки stale sync markers
 async function safePasteAndSubmit(term, content, options = {}) {
   const {
     submit = true,
@@ -961,15 +962,25 @@ async function safePasteAndSubmit(term, content, options = {}) {
     console.log(logPrefix + ' Ctrl+C sent, waiting for render...');
     const renderResult = await waitForRender(term, 2000, logPrefix + ':ctrl-c');
     console.log(logPrefix + ' Ctrl+C render ' + (renderResult.timedOut ? 'timeout' : 'confirmed'));
+    // DIAG: drain pause after Ctrl+C — let Ink finish all render cycles
+    await new Promise(r => setTimeout(r, 50));
+    console.log(logPrefix + ' 🔍 Drain pause 50ms after Ctrl+C');
   }
 
   const renderTimes = [];
+  let staleCount = 0;
 
   for (let i = 0; i < chunks.length; i++) {
     const chunk = chunks[i];
     const payload = PASTE_START + chunk + PASTE_END;
 
     console.log(logPrefix + ' Chunk ' + (i + 1) + '/' + chunks.length + ': ' + chunk.length + ' chars, payload ' + payload.length + 'B');
+
+    // DIAG: drain pause between chunks to flush stale sync markers
+    if (i > 0) {
+      await new Promise(r => setTimeout(r, 50));
+      console.log(logPrefix + ' 🔍 Drain pause 50ms before chunk ' + (i + 1));
+    }
 
     const startTime = Date.now();
 
@@ -987,19 +998,49 @@ async function safePasteAndSubmit(term, content, options = {}) {
     if (result.timedOut) {
       console.log(logPrefix + ' ⚠️ Chunk ' + (i + 1) + ' render TIMEOUT after ' + elapsed + 'ms — continuing anyway');
     } else {
-      console.log(logPrefix + ' ✅ Chunk ' + (i + 1) + '/' + chunks.length + ' render confirmed in ' + elapsed + 'ms');
+      const staleFlag = result.isStale ? ' ⚠️ STALE' : '';
+      console.log(logPrefix + ' ✅ Chunk ' + (i + 1) + '/' + chunks.length + ' render confirmed in ' + elapsed + 'ms' + staleFlag);
+      if (result.isStale) staleCount++;
     }
   }
 
   // All chunks sent and render-confirmed → submit
   if (submit) {
+    // DIAG: extra drain pause before Enter to let Ink finish all pending renders
+    await new Promise(r => setTimeout(r, 100));
+    console.log(logPrefix + ' 🔍 Pre-Enter drain pause 100ms');
+
     term.write('\r');
-    console.log(logPrefix + ' ✅ Enter sent after ' + chunks.length + ' chunk(s). Render times: [' + renderTimes.join(', ') + ']ms');
+    console.log(logPrefix + ' ✅ Enter sent after ' + chunks.length + ' chunk(s). Render times: [' + renderTimes.join(', ') + ']ms. Stale markers: ' + staleCount);
+
+    // DIAG: monitor PTY for 3s after Enter to see if Claude responds
+    const enterTime = Date.now();
+    const postEnterEvents = [];
+    const diagSub = term.onData((data) => {
+      const elapsed = Date.now() - enterTime;
+      const hasSyncEnd = data.includes('\x1b[?2026l');
+      const hasSyncStart = data.includes('\x1b[?2026h');
+      postEnterEvents.push({ elapsed, len: data.length, hasSyncEnd, hasSyncStart });
+    });
+
+    await new Promise(r => setTimeout(r, 3000));
+    diagSub.dispose();
+
+    console.log(logPrefix + ' 🔍 Post-Enter PTY activity (' + postEnterEvents.length + ' events in 3s):');
+    postEnterEvents.slice(0, 20).forEach((e, i) => {
+      console.log(logPrefix + '   [' + i + '] +' + e.elapsed + 'ms len=' + e.len + (e.hasSyncStart ? ' SYNC_START' : '') + (e.hasSyncEnd ? ' SYNC_END' : ''));
+    });
+    if (postEnterEvents.length > 20) {
+      console.log(logPrefix + '   ... and ' + (postEnterEvents.length - 20) + ' more events');
+    }
+    if (postEnterEvents.length === 0) {
+      console.log(logPrefix + ' ❌ NO PTY activity after Enter — Claude did NOT process the submission!');
+    }
   } else {
     console.log(logPrefix + ' Done (no submit). Render times: [' + renderTimes.join(', ') + ']ms');
   }
 
-  return { success: true, chunksTotal: chunks.length, renderTimeMs: renderTimes };
+  return { success: true, chunksTotal: chunks.length, renderTimeMs: renderTimes, staleCount };
 }
 
 // Send input to terminal
@@ -1021,61 +1062,18 @@ ipcMain.on('terminal:input', async (event, tabId, data) => {
     return;
   }
 
-  // For large data: simple TTYHOG-safe chunking (no sync marker waits)
-  // safePasteAndSubmit is only for programmatic operations (Handshake, send-command, Rewind)
-  // where sync marker verification is critical. User paste (Ctrl+V) doesn't need it:
-  // - Regular terminals (bash/zsh) don't emit sync markers → 5s timeout per chunk
-  // - xterm.js already wraps paste in brackets → safePasteAndSubmit would double-wrap
-  if (data.length > 1024) {
-    // Detect xterm.js bracketed paste (app requested \x1b[?2004h)
-    const hasBrackets = data.includes('\x1b[200~');
-    let content = data;
-
-    // Strip existing brackets — we'll re-wrap each chunk individually
-    if (hasBrackets) {
-      content = content.replace(/\x1b\[200~/g, '').replace(/\x1b\[201~/g, '');
-    }
-
-    // Separate trailing Enter (will send after all chunks)
-    let trailingEnter = '';
-    if (content.endsWith('\r')) {
-      trailingEnter = '\r';
-      content = content.slice(0, -1);
-    }
-
-    const CHUNK_MAX = 900; // < 1024 - bracket overhead (12 bytes)
-    const totalChunks = Math.ceil(content.length / CHUNK_MAX);
-    console.log('[terminal:input] tabId=' + tabId + ' large paste: ' + data.length + 'B → ' + totalChunks + ' chunk(s), brackets=' + hasBrackets);
-
-    for (let i = 0; i < content.length; i += CHUNK_MAX) {
-      const chunk = content.substring(i, i + CHUNK_MAX);
-      if (hasBrackets) {
-        // Each chunk wrapped in COMPLETE brackets — Ink TUI requires atomic paste per chunk
-        term.write(PASTE_START + chunk + PASTE_END);
-      } else {
-        term.write(chunk);
-      }
-      // Small delay between chunks to let kernel PTY buffer drain
-      if (i + CHUNK_MAX < content.length) {
-        await new Promise(r => setTimeout(r, 10));
-      }
-    }
-
-    // Send Enter separately (if present) with delay for Ink React render cycle
-    if (trailingEnter) {
-      await new Promise(r => setTimeout(r, hasBrackets ? 50 : 10));
-      term.write(trailingEnter);
-    }
-  } else {
-    // Small data path — log for diagnosing "text pasted but not sent" bug
+  // User paste (Cmd+V) — direct passthrough, no chunking needed.
+  // xterm.js wraps paste in brackets (\x1b[200~...\x1b[201~).
+  // macOS kernel may split large writes at TTYHOG (1024B) boundary,
+  // but Ink/bash buffer between brackets and assemble one paste event.
+  // Chunking is ONLY needed in safePasteAndSubmit (programmatic paste + immediate Enter).
+  if (data.length > 1) {
     const endsWithR = data.endsWith('\r');
     const endsWithN = data.endsWith('\n');
     const hasNewline = data.includes('\r') || data.includes('\n');
-    if (data.length > 1) {
-      console.log(`[terminal:input] tabId=${tabId} len=${data.length} endsWithR=${endsWithR} endsWithN=${endsWithN} hasNewline=${hasNewline} last5=${JSON.stringify(data.slice(-5))} first30=${JSON.stringify(data.slice(0, 30))}`);
-    }
-    term.write(data);
+    console.log(`[terminal:input] tabId=${tabId} len=${data.length} endsWithR=${endsWithR} endsWithN=${endsWithN} hasNewline=${hasNewline} last5=${JSON.stringify(data.slice(-5))} first30=${JSON.stringify(data.slice(0, 30))}`);
   }
+  term.write(data);
 });
 
 // Send a slash command to Claude's Ink TUI (chunked paste + echo verification)
@@ -1226,22 +1224,23 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
     return { entries, cursorIndex };
   }
 
-  // Helper: find cursor position in partial re-render (arrow response)
-  // Arrow responses are diffs — only changed lines, not full menu
-  // Match ❯ text against known entries list
-  function findCursorInDiff(cleanText, knownEntries) {
+  // Helper: extract ❯ cursor text from diff (cleaned PTY output after arrow key)
+  function extractCursorText(cleanText) {
     const lines = cleanText.split(/[\r\n]+/).map(l => l.trim()).filter(Boolean);
     for (const line of lines) {
       if (!line.startsWith('❯')) continue;
       const text = line.replace(/^❯\s*/, '').trim();
-      if (text === '(current)' || !text) return knownEntries.length; // at (current)
-      // Match against known entries by prefix (entries are truncated with …)
-      for (let i = 0; i < knownEntries.length; i++) {
-        const prefix = knownEntries[i].substring(0, 30);
-        if (text.startsWith(prefix) || knownEntries[i].startsWith(text.substring(0, 30))) return i;
-      }
+      return text || null;
     }
-    return -1;
+    return null;
+  }
+
+  // Helper: check if cursor text matches target text (prefix comparison)
+  function textMatchesTarget(cursorText, targetPrefix) {
+    if (!cursorText || !targetPrefix) return false;
+    const ct = cursorText.substring(0, 30);
+    const tp = targetPrefix.substring(0, 30);
+    return ct === tp || cursorText.startsWith(tp) || targetPrefix.startsWith(ct);
   }
 
   // Helper: send key → wait for \x1b[?2026l → return cleaned text
@@ -1282,48 +1281,64 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
     });
 
     // Step 4: Navigate to target entry
-    // Cursor starts at (current) = after last entry (cursorPos = entries.length)
-    // Primary: match by targetText (robust — timeline and menu may have different entry counts)
-    // Fallback: numeric targetIndex (clamped to valid range)
-    let target;
-    if (targetText && typeof targetText === 'string') {
-      const prefix = targetText.substring(0, 30);
+    // HYBRID: calculate numeric steps + verify by text after each press.
+    // Text match finds target in TUI menu. Numeric fallback if text not in menu.
+
+    // Find target index in TUI menu by text
+    const targetPrefix = (targetText || '').substring(0, 30);
+    let target = -1;
+    if (targetPrefix) {
       target = knownEntries.findIndex(e =>
-        e.substring(0, 30) === prefix || e.startsWith(prefix) || prefix.startsWith(e.substring(0, 30))
+        e.substring(0, 30) === targetPrefix || e.startsWith(targetPrefix) || targetPrefix.startsWith(e.substring(0, 30))
       );
-      if (target >= 0) {
-        console.log('[Restore:History] Text match found at index ' + target + ': "' + knownEntries[target].substring(0, 50) + '"');
-      } else {
-        console.log('[Restore:History] Text match failed for: "' + prefix + '", falling back to index');
-        target = Math.min(typeof targetIndex === 'number' ? targetIndex : 0, knownEntries.length - 1);
-      }
+    }
+
+    if (target >= 0) {
+      console.log('[Restore:History] Text match found at index ' + target + ': "' + knownEntries[target].substring(0, 50) + '"');
     } else {
+      console.log('[Restore:History] Text match failed for: "' + targetPrefix + '", falling back to numeric index');
       target = Math.min(typeof targetIndex === 'number' ? targetIndex : 0, knownEntries.length - 1);
     }
+
+    // Navigate: press Arrow Up, verify cursor text after each press
+    // Send stepsNeeded presses, but allow up to +2 extra to handle first-UP-no-op
     const stepsNeeded = cursorPos - target;
-    console.log('[Restore:History] Target=' + target + ', need ' + stepsNeeded + ' arrow-up presses');
+    const maxPresses = stepsNeeded + 2; // +2 for first-UP-no-op safety
+    let pressCount = 0;
+    let found = false;
 
-    for (let i = 0; i < stepsNeeded; i++) {
+    console.log('[Restore:History] Target=' + target + ', stepsNeeded=' + stepsNeeded + ', maxPresses=' + maxPresses);
+
+    for (let i = 0; i < maxPresses; i++) {
       try {
-        const diffText = await sendAndCapture('\x1b[A', 1500); // Arrow Up, 1.5s timeout
-        const newPos = findCursorInDiff(diffText, knownEntries);
-        console.log('[Restore:History] Arrow UP #' + (i + 1) + ' → cursor=' + newPos +
-          (newPos >= 0 && newPos < knownEntries.length ? ' (' + knownEntries[newPos].substring(0, 50) + ')' : ''));
+        const diffText = await sendAndCapture('\x1b[A', 1500);
+        const cursorText = extractCursorText(diffText);
+        pressCount++;
 
-        if (newPos >= 0) cursorPos = newPos;
-        if (cursorPos === target) {
-          console.log('[Restore:History] Reached target!');
+        console.log('[Restore:History] Arrow UP #' + pressCount + ' → ❯ "' + (cursorText || '(unparsed)').substring(0, 60) + '"');
+
+        // Check if cursor text matches target
+        if (cursorText && textMatchesTarget(cursorText, targetPrefix)) {
+          console.log('[Restore:History] ✅ Target reached after ' + pressCount + ' presses (text match)');
+          found = true;
           break;
         }
+
+        // Numeric fallback: if we've done at least stepsNeeded presses and text doesn't match, stop
+        if (pressCount >= stepsNeeded && !found) {
+          // Give 1-2 extra presses for first-UP-no-op, but no more
+          if (pressCount >= stepsNeeded + 2) {
+            console.log('[Restore:History] Max presses reached without text match, accepting position');
+            break;
+          }
+        }
       } catch (e) {
-        // Timeout = no re-render = cursor at boundary, stop
-        console.log('[Restore:History] Arrow #' + (i + 1) + ' no response (boundary), stopping');
+        console.log('[Restore:History] Arrow #' + pressCount + ' no response (boundary), stopping');
         break;
       }
     }
 
-    console.log('[Restore:History] Final cursor=' + cursorPos +
-      (cursorPos >= 0 && cursorPos < knownEntries.length ? ' (' + knownEntries[cursorPos].substring(0, 80) + ')' : ' (current)'));
+    console.log('[Restore:History] Final: ' + pressCount + ' presses, found=' + found);
 
     // Step 5: Confirm selection with Enter → triggers actual rewind
     // Claude rebuilds context here — can take a while for large sessions
@@ -1345,7 +1360,18 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
 
       await new Promise((resolve) => {
         let buf = '';
+        let resolved = false;
+
+        const safetyTimer = setTimeout(() => {
+          if (resolved) return;
+          resolved = true;
+          sub.dispose();
+          console.log('[Restore:History] Prompt render timeout after ' + renderCount + ' frames (' + (Date.now() - promptWaitStart) + 'ms)');
+          resolve();
+        }, 15000);
+
         const sub = term.onData((data) => {
+          if (resolved) return;
           buf += data;
 
           // Count sync markers = render frames
@@ -1357,6 +1383,8 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
             // Prompt is ready when we see the prompt box bottom (╰) or prompt symbols (⏵ or >)
             if (buf.includes('\u2335') || buf.includes('\u23F5') || buf.includes('╰') || renderCount >= 5) {
               promptReady = true;
+              resolved = true;
+              clearTimeout(safetyTimer);
               sub.dispose();
               resolve();
               return;
@@ -1366,13 +1394,6 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
             buf = buf.split('\x1b[?2026l').slice(1).join('\x1b[?2026l');
           }
         });
-
-        // Safety: 15s timeout (large sessions can take longer to rebuild context)
-        setTimeout(() => {
-          sub.dispose();
-          console.log('[Restore:History] Prompt render timeout after ' + renderCount + ' frames (' + (Date.now() - promptWaitStart) + 'ms)');
-          resolve();
-        }, 15000);
       });
 
       console.log('[Restore:History] Prompt ready=' + promptReady + ' after ' + renderCount + ' frames (' + (Date.now() - promptWaitStart) + 'ms)');
