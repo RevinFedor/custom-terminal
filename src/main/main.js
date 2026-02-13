@@ -409,6 +409,22 @@ ipcMain.on('show-terminal-context-menu', async (event, { hasSelection, prompts, 
 
   template.push({ type: 'separator' });
 
+  // Add Insert Prompt submenu
+  if (prompts && prompts.length > 0) {
+    const promptsSubmenu = prompts.map(prompt => ({
+      label: prompt.title,
+      click: () => {
+        event.sender.send('context-menu-command', 'insert-prompt', prompt.content);
+      }
+    }));
+
+    template.push({
+      label: 'Insert Prompt',
+      submenu: promptsSubmenu
+    });
+    template.push({ type: 'separator' });
+  }
+
   // Scripts submenu: npm scripts from package.json + .sh files
   const scripts = [];
   if (cwd) {
@@ -462,22 +478,6 @@ ipcMain.on('show-terminal-context-menu', async (event, { hasSelection, prompts, 
   }
 
   // Removed: Add to Favorites (only in TabBar context menu)
-
-  // Add Insert Prompt submenu
-  if (prompts && prompts.length > 0) {
-    const promptsSubmenu = prompts.map(prompt => ({
-      label: prompt.title,
-      click: () => {
-        event.sender.send('context-menu-command', 'insert-prompt', prompt.content);
-      }
-    }));
-
-    template.push({
-      label: 'Insert Prompt',
-      submenu: promptsSubmenu
-    });
-    template.push({ type: 'separator' });
-  }
 
   template.push({ role: 'copy' });
   template.push({ role: 'paste' });
@@ -1261,9 +1261,20 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
   function textMatchesTarget(cursorText, targetPrefix) {
     if (!cursorText || !targetPrefix) return false;
     // Normalize spaces for comparison
-    const ct = cursorText.replace(/\s+/g, ' ').substring(0, 40);
-    const tp = targetPrefix.replace(/\s+/g, ' ').substring(0, 40);
-    return ct.includes(tp) || tp.includes(ct);
+    // TRIM both to ensure leading spaces (indents) don't break match
+    const ct = cursorText.trim().replace(/\s+/g, ' ').substring(0, 50);
+    const tp = targetPrefix.trim().replace(/\s+/g, ' ').substring(0, 50);
+    
+    // Log for debugging failures
+    const match = ct.includes(tp) || tp.includes(ct);
+    if (!match) {
+        // Only log mismatches in verbose mode or if requested, to avoid spam
+        // console.log(`[Restore:Debug] Mismatch: TUI="${ct}" vs Target="${tp}"`);
+    } else {
+        console.log(`[Restore:Debug] MATCH: TUI="${ct}" vs Target="${tp}"`);
+    }
+    
+    return match;
   }
 
   // Helper: send key → wait for \x1b[?2026l → return RAW buffer
@@ -1355,7 +1366,14 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
     }
 
     if (!found) {
-        console.log('[Restore:History] ⚠️ Target not confirmed by text match, using best-effort position');
+        console.error('[Restore:History] ❌ Target NOT found in menu after ' + pressCount + ' steps. Aborting rewind.');
+        // GUARD: Close menu with Escape to avoid selecting wrong entry (which defaults to top/bottom)
+        try {
+            term.write('\x1b'); 
+            await new Promise(r => setTimeout(r, 200));
+        } catch (ign) {}
+        
+        return { success: false, error: 'Target not found in Claude history menu' };
     }
 
     // Step 5: Confirm selection with Enter
