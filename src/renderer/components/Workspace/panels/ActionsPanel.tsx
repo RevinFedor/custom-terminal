@@ -252,14 +252,22 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
 
       if (cancelledRef.current) return;
 
-      // 4. Build combined prompt (Text only, no files!)
-      const combinedPrompt = [
+      // 4. Save session content to /tmp/ file (large data stays on disk, not pasted)
+      const saveResult = await ipcRenderer.invoke('docs:save-temp', { content });
+      if (!saveResult.success) throw new Error('Failed to save temp file: ' + saveResult.error);
+      console.warn('[UpdateDocs] Session data saved to: ' + saveResult.filePath + ' (' + content.length + ' chars)');
+
+      if (cancelledRef.current) return;
+
+      // 5. Build prompt text: system prompt + @filepath reference + additional
+      // Only the prompt (small) is typed; Gemini reads the big file via @path
+      const promptText = [
         systemPrompt,
-        '\nВот данные для анализа:\n:::session\n' + content + '\n:::',
+        '\n' + saveResult.filePath,
         additionalPrompt.trim() ? '\n' + additionalPrompt.trim() : ''
       ].filter(Boolean).join('\n');
 
-      // 5. Start Gemini and send combined prompt directly
+      // 6. Start Gemini and send prompt
       await ipcRenderer.invoke('terminal:executeCommandAsync', newTabId, 'gemini');
 
       const geminiReady = await waitForGeminiReady(newTabId, 30000);
@@ -269,14 +277,8 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
       await new Promise(resolve => setTimeout(resolve, 500));
       if (cancelledRef.current) return;
 
-      // Save combined prompt to /tmp/ file, then send @filepath to Gemini
-      // (Direct text injection via terminal:paste is available but disabled —
-      //  file approach is more reliable for very large payloads)
-      const saveResult = await ipcRenderer.invoke('docs:save-temp', { content: combinedPrompt });
-      if (!saveResult.success) throw new Error('Failed to save temp file: ' + saveResult.error);
-
-      console.warn('[UpdateDocs] Saved to temp file: ' + saveResult.filePath + ' (' + combinedPrompt.length + ' chars)');
-      ipcRenderer.send('terminal:input', newTabId, '@' + saveResult.filePath + '\r');
+      console.warn('[UpdateDocs] Sending prompt to Gemini: ' + promptText.length + ' chars');
+      ipcRenderer.send('terminal:input', newTabId, promptText + '\r');
 
       docsGeminiTabIdRef.current = null;
       showToast('Gemini started with session context', 'success');
