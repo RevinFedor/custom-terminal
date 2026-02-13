@@ -1187,7 +1187,7 @@ ipcMain.handle('claude:toggle-thinking', async (event, tabId) => {
 });
 
 // Open Rewind menu, navigate to target entry with arrow keys
-// Each arrow key confirmed via synchronized output (\x1b[?2026l) — no timers
+// Uses specific color detection for reliability
 ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, targetText, pasteAfter }) => {
   const term = terminals.get(tabId);
   if (!term) return { success: false, error: 'no terminal' };
@@ -1224,34 +1224,56 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
     return { entries, cursorIndex };
   }
 
-  // Helper: extract ❯ cursor text from diff (cleaned PTY output after arrow key)
-  function extractCursorText(cleanText) {
-    const lines = cleanText.split(/[\r\n]+/).map(l => l.trim()).filter(Boolean);
-    for (const line of lines) {
-      if (!line.startsWith('❯')) continue;
-      const text = line.replace(/^❯\s*/, '').trim();
-      return text || null;
+  // Helper: extract selected text from RAW PTY buffer
+  // Strategies:
+  // 1. Specific Lavender RGB color used by Claude Code TUI (most reliable)
+  // 2. Standard '❯' cursor
+  function extractSelectedText(raw) {
+    // Strategy 1: Look for the lavender color \x1b[38;2;177;185;249m
+    // This persists even when the '❯' cursor is not redrawn in diffs
+    const colorStart = '\x1b[38;2;177;185;249m';
+    const colorEnd = '\x1b[39m'; // Reset text color
+    
+    // Search from the end because diffs often append the newest state
+    const startIdx = raw.lastIndexOf(colorStart);
+    if (startIdx !== -1) {
+      let endIdx = raw.indexOf(colorEnd, startIdx);
+      if (endIdx === -1) endIdx = raw.length; // If no reset, take till end
+      
+      const coloredContent = raw.substring(startIdx + colorStart.length, endIdx);
+      // Clean up the content (remove nested codes or motion codes)
+      return cleanBuffer(coloredContent).trim();
     }
+    
+    // Strategy 2: Fallback to '❯' if color not found (e.g. initial render)
+    const clean = cleanBuffer(raw);
+    const match = clean.match(/❯\s*(.*)/);
+    if (match) {
+        // Remove (current) label if present
+        return match[1].replace(/^\(current\)\s*/, '').trim();
+    }
+    
     return null;
   }
 
   // Helper: check if cursor text matches target text (prefix comparison)
   function textMatchesTarget(cursorText, targetPrefix) {
     if (!cursorText || !targetPrefix) return false;
-    const ct = cursorText.substring(0, 30);
-    const tp = targetPrefix.substring(0, 30);
-    return ct === tp || cursorText.startsWith(tp) || targetPrefix.startsWith(ct);
+    // Normalize spaces for comparison
+    const ct = cursorText.replace(/\s+/g, ' ').substring(0, 40);
+    const tp = targetPrefix.replace(/\s+/g, ' ').substring(0, 40);
+    return ct.includes(tp) || tp.includes(ct);
   }
 
-  // Helper: send key → wait for \x1b[?2026l → return cleaned text
-  function sendAndCapture(key, timeout = 3000) {
+  // Helper: send key → wait for \x1b[?2026l → return RAW buffer
+  function sendAndCaptureRaw(key, timeout = 3000) {
     return new Promise((resolve, reject) => {
       let buf = '';
       const sub = term.onData((data) => {
         buf += data;
         if (buf.includes('\x1b[?2026l')) {
           sub.dispose();
-          resolve(cleanBuffer(buf));
+          resolve(buf);
         }
       });
       term.write(key);
@@ -1268,90 +1290,85 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
     term.write('\x1b');
     await new Promise(r => setTimeout(r, 100));
 
-    // Step 3: Second Escape → Rewind menu opens (sync output = full render)
-    const menuText = await sendAndCapture('\x1b');
-    const initialState = parseMenu(menuText);
+    // Step 3: Second Escape → Rewind menu opens
+    // Initial render usually has the full text, so we can parse structure
+    const menuRaw = await sendAndCaptureRaw('\x1b');
+    const menuClean = cleanBuffer(menuRaw);
+    const initialState = parseMenu(menuClean);
     const knownEntries = initialState.entries;
     let cursorPos = initialState.cursorIndex;
 
     console.log('[Restore:History] Menu opened: ' + knownEntries.length + ' entries, cursor=' + cursorPos);
-    knownEntries.forEach((entry, i) => {
-      const marker = i === cursorPos ? ' ❯' : '';
-      console.log('  [' + i + ']' + marker + ' ' + entry.substring(0, 200));
-    });
 
     // Step 4: Navigate to target entry
-    // HYBRID: calculate numeric steps + verify by text after each press.
-    // Text match finds target in TUI menu. Numeric fallback if text not in menu.
-
-    // Find target index in TUI menu by text
-    const targetPrefix = (targetText || '').substring(0, 30);
-    let target = -1;
+    const targetPrefix = (targetText || '').substring(0, 40);
+    
+    // Check if target is currently visible in the initial menu render
+    let targetIdx = -1;
     if (targetPrefix) {
-      target = knownEntries.findIndex(e =>
-        e.substring(0, 30) === targetPrefix || e.startsWith(targetPrefix) || targetPrefix.startsWith(e.substring(0, 30))
-      );
+       targetIdx = knownEntries.findIndex(e => textMatchesTarget(e, targetPrefix));
     }
-
-    if (target >= 0) {
-      console.log('[Restore:History] Text match found at index ' + target + ': "' + knownEntries[target].substring(0, 50) + '"');
+    
+    let maxPresses = 0;
+    
+    if (targetIdx !== -1) {
+        // CASE 1: Target is visible immediately. We can calculate exact steps.
+        const stepsNeeded = cursorPos - targetIdx;
+        maxPresses = stepsNeeded + 2; // +2 safety
+        console.log('[Restore:History] Target visible at relative index ' + targetIdx + '. Steps needed: ' + stepsNeeded);
     } else {
-      console.log('[Restore:History] Text match failed for: "' + targetPrefix + '", falling back to numeric index');
-      target = Math.min(typeof targetIndex === 'number' ? targetIndex : 0, knownEntries.length - 1);
+        // CASE 2: Target is NOT visible (scrolled out of view).
+        // We cannot rely on absolute 'targetIndex' because TUI might use different indexing.
+        // STRATEGY: Visual Search. Set a high limit and loop until we see the RGB match.
+        maxPresses = 50; 
+        console.log('[Restore:History] Target NOT visible initially. Starting visual search (max 50 steps) for: "' + targetPrefix + '..."');
     }
 
-    // Navigate: press Arrow Up, verify cursor text after each press
-    // Send stepsNeeded presses, but allow up to +2 extra to handle first-UP-no-op
-    const stepsNeeded = cursorPos - target;
-    const maxPresses = stepsNeeded + 2; // +2 for first-UP-no-op safety
-    let pressCount = 0;
     let found = false;
-
-    console.log('[Restore:History] Target=' + target + ', stepsNeeded=' + stepsNeeded + ', maxPresses=' + maxPresses);
+    let pressCount = 0;
 
     for (let i = 0; i < maxPresses; i++) {
       try {
-        const diffText = await sendAndCapture('\x1b[A', 1500);
-        const cursorText = extractCursorText(diffText);
+        // Press UP
+        const diffRaw = await sendAndCaptureRaw('\x1b[A', 1500);
         pressCount++;
-
-        console.log('[Restore:History] Arrow UP #' + pressCount + ' → ❯ "' + (cursorText || '(unparsed)').substring(0, 60) + '"');
-
-        // Check if cursor text matches target
-        if (cursorText && textMatchesTarget(cursorText, targetPrefix)) {
-          console.log('[Restore:History] ✅ Target reached after ' + pressCount + ' presses (text match)');
+        
+        // Identify what is currently selected
+        const selectedText = extractSelectedText(diffRaw);
+        
+        console.log(`[Restore:History] UP #${pressCount} -> Selected: "${(selectedText || 'null').substring(0, 50)}..."`);
+        
+        if (selectedText && textMatchesTarget(selectedText, targetPrefix)) {
+          console.log('[Restore:History] ✅ Target matched!');
           found = true;
           break;
         }
+        
+        // Optimization: If we hit the top boundary (diff is empty or repeated), we should probably stop?
+        // But Claude's TUI is complex, so we'll trust the text match or max limit.
 
-        // Numeric fallback: if we've done at least stepsNeeded presses and text doesn't match, stop
-        if (pressCount >= stepsNeeded && !found) {
-          // Give 1-2 extra presses for first-UP-no-op, but no more
-          if (pressCount >= stepsNeeded + 2) {
-            console.log('[Restore:History] Max presses reached without text match, accepting position');
-            break;
-          }
-        }
       } catch (e) {
-        console.log('[Restore:History] Arrow #' + pressCount + ' no response (boundary), stopping');
+        console.log('[Restore:History] Error during navigation:', e.message);
         break;
       }
     }
 
-    console.log('[Restore:History] Final: ' + pressCount + ' presses, found=' + found);
+    if (!found) {
+        console.log('[Restore:History] ⚠️ Target not confirmed by text match, using best-effort position');
+    }
 
-    // Step 5: Confirm selection with Enter → triggers actual rewind
-    // Claude rebuilds context here — can take a while for large sessions
+    // Step 5: Confirm selection with Enter
     const rewindStartTime = Date.now();
     console.log('[Restore:History] Confirming selection with Enter...');
-    const confirmText = await sendAndCapture('\r', 5000);
-    console.log('[Restore:History] Confirm response in ' + (Date.now() - rewindStartTime) + 'ms:', confirmText.substring(0, 200));
+    
+    // We expect a re-render. 
+    // Sometimes Enter doesn't produce an immediate sync marker if Claude is busy processing.
+    // We use a longer timeout.
+    const confirmRaw = await sendAndCaptureRaw('\r', 5000);
+    console.log('[Restore:History] Confirm response in ' + (Date.now() - rewindStartTime) + 'ms');
 
     // Step 6: Paste compact text if provided
     if (pasteAfter && typeof pasteAfter === 'string' && pasteAfter.length > 0) {
-      // Wait for Claude's prompt to FULLY render — the first sync marker (Step 5) is just the banner.
-      // We need to wait for subsequent render cycles until the prompt box (╭...╰ or ⏵ or >) appears.
-      // Claude TUI uses Ink which renders in frames, each ending with \x1b[?2026l.
       const promptWaitStart = Date.now();
       console.log('[Restore:History] Waiting for prompt to fully render...');
 
@@ -1366,7 +1383,7 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
           if (resolved) return;
           resolved = true;
           sub.dispose();
-          console.log('[Restore:History] Prompt render timeout after ' + renderCount + ' frames (' + (Date.now() - promptWaitStart) + 'ms)');
+          console.log('[Restore:History] Prompt render timeout');
           resolve();
         }, 15000);
 
@@ -1374,13 +1391,9 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
           if (resolved) return;
           buf += data;
 
-          // Count sync markers = render frames
           while (buf.includes('\x1b[?2026l')) {
             renderCount++;
-            const clean = cleanBuffer(buf.split('\x1b[?2026l')[0]);
-            console.log('[Restore:History] Render frame #' + renderCount + ' (' + (Date.now() - promptWaitStart) + 'ms):', clean.substring(0, 150));
-
-            // Prompt is ready when we see the prompt box bottom (╰) or prompt symbols (⏵ or >)
+            // Prompt is ready when we see prompt symbols
             if (buf.includes('\u2335') || buf.includes('\u23F5') || buf.includes('╰') || renderCount >= 5) {
               promptReady = true;
               resolved = true;
@@ -1389,18 +1402,12 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
               resolve();
               return;
             }
-
-            // Remove processed part, keep remainder after the sync marker
             buf = buf.split('\x1b[?2026l').slice(1).join('\x1b[?2026l');
           }
         });
       });
 
-      console.log('[Restore:History] Prompt ready=' + promptReady + ' after ' + renderCount + ' frames (' + (Date.now() - promptWaitStart) + 'ms)');
-
-      // Paste compact text using safePasteAndSubmit (chunked + echo verification)
-      // ctrlCFirst: true — Claude restores old message after rewind, need to clear it
-      console.log('[Restore:History] Pasting compact text: ' + pasteAfter.length + ' chars via safePasteAndSubmit');
+      console.log('[Restore:History] Pasting compact text (' + pasteAfter.length + ' chars)...');
       await safePasteAndSubmit(term, pasteAfter, {
         submit: true,
         ctrlCFirst: true,
@@ -1408,7 +1415,8 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
       });
     }
 
-    return { success: true, entries: knownEntries, cursorIndex: cursorPos, targetIndex: target };
+    return { success: true, found };
+
   } catch (err) {
     console.log('[Restore:History] Error:', err.message);
     term.write('\x1b'); // try to close menu on error
