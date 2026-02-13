@@ -46,7 +46,8 @@
     - **Claude StatusLine Bridge:** Основной механизм захвата и мониторинга Session ID. 
         - **Принцип:** Приложение прописывает скрипт-мост в `~/.claude/settings.json` (секция `statusLine`). Claude автоматически вызывает этот скрипт после каждого ответа.
         - **Flow:** Claude → `statusline-bridge.sh` → запись JSON (`session_id`, `ppid`) в `~/.claude/bridge/` → `fs.watch` в Main процессе.
-        - **Stability:** Это обеспечивает 100% точность привязки сессии к конкретному табу через сопоставление PID (ppid из файла → родительский shell PID → наш PTY).
+        - **Stability:** Это обеспечивает 100% точность привязки сессии к конкретному табу через сопоставление PID.
+        - **TUI Fallback:** Дополнительно «подслушивается» вывод `/status` в PTY. Для защиты от ложных срабатываний (например, в Gemini) этот механизм активен только если Bridge уже подтвердил наличие сессии Клода в табе. См. `knowledge/fact-claude-tui-mechanics.md`.
         - **Legacy:** Ранняя реализация через Sniper Watcher (отслеживание создания файлов) сохранена в `docs/knowledge/fact-legacy-sniper-watcher.md`.
     - **Claude Handshake:** Упрощённая стейт-машина (WAITING_PROMPT → DEBOUNCE_PROMPT → send prompt) для автоматической отправки промпта при запуске. Thinking mode обеспечивается `alwaysThinkingEnabled` в settings.json. Поддерживает `⏵` (Claude v2.1.32+) и `>`. Используется `stripVTControlCharacters()`.
     - **Claude TUI Control:** Программное управление Ink TUI через PTY. Модель (`/model <alias>`) переключается через bracketed paste + delayed Enter. Think mode — через реактивный парсинг TUI-пикера (`meta+t`). Детали реализации (RGB навигация, Stale Markers, Atomic Paste): `knowledge/fact-claude-tui-mechanics.md`. См. также `knowledge/fact-claude-tui-control.md` (legacy).
