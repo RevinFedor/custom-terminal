@@ -253,7 +253,7 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
       if (cancelledRef.current) return;
 
       // 4. Save session content to /tmp/ file (large data stays on disk, not pasted)
-      const saveResult = await ipcRenderer.invoke('docs:save-temp', { content });
+      const saveResult = await ipcRenderer.invoke('docs:save-temp', { content, projectPath: workingDir });
       if (!saveResult.success) throw new Error('Failed to save temp file: ' + saveResult.error);
       console.warn('[UpdateDocs] Session data saved to: ' + saveResult.filePath + ' (' + content.length + ' chars)');
 
@@ -262,6 +262,7 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
       // 5. Build prompt text: system prompt + @filepath reference + additional
       // Only the prompt (small) is typed; Gemini reads the big file via @path
       const promptText = [
+        'Ниже промпт документации:\n',
         systemPrompt,
         '\n' + saveResult.filePath,
         additionalPrompt.trim() ? '\n' + additionalPrompt.trim() : ''
@@ -277,8 +278,12 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
       await new Promise(resolve => setTimeout(resolve, 500));
       if (cancelledRef.current) return;
 
-      console.warn('[UpdateDocs] Sending prompt to Gemini: ' + promptText.length + ' chars');
-      ipcRenderer.send('terminal:input', newTabId, promptText + '\r');
+      console.warn('[UpdateDocs] Sending prompt to Gemini via paste: ' + promptText.length + ' chars');
+      await ipcRenderer.invoke('terminal:paste', {
+        tabId: newTabId,
+        content: promptText,
+        submit: true
+      });
 
       docsGeminiTabIdRef.current = null;
       showToast('Gemini started with session context', 'success');

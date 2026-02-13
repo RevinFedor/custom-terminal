@@ -10,27 +10,31 @@
     - **Multi-select:** Если выбрано несколько вкладок (Shift/Cmd+Click), данные сессий объединяются в один файл.
     - **Кнопка "Ножницы" (✂️):** Использование выделенного в данный момент текста в терминале.
     - **Кнопка "Планшет" (📋):** Использование содержимого буфера обмена (доступно только при одиночном выборе таба).
-- **Составной Промпт (Temp File + inline prompt):**
-    Данные сессии сохраняются в `/tmp/noted-docs-<timestamp>.txt`. Промпт вставляется как текст, содержащий системную инструкцию + путь к файлу + дополнительный промпт. Gemini сам читает файл по пути.
-    1.  **Инструкция:** Берется из настроек (`Settings` -> `AI Prompts` -> `Documentation Prompt`). Вставляется как текст.
-    2.  **Путь к данным:** `/tmp/noted-docs-<ts>.txt` — сырые данные сессии/выделения/буфера.
-    3.  **Дополнение:** Текст из поля ввода в раскрывающемся блоке (▶/▼).
+- **Составной Промпт (Temp File + Bracketed Paste):**
+    Данные сессии сохраняются в `<projectPath>/tmp/noted-docs-<timestamp>.txt`. Промпт (маленький текст: инструкция + путь к файлу + дополнение) вставляется через `terminal:paste` → `safePasteAndSubmit(fast=true)` с Bracketed Paste Mode, чтобы `\n` не интерпретировались как Enter.
+    1.  **Префикс:** `Ниже промпт документации:` — защита от shell mode (если промпт начинается с `$`).
+    2.  **Инструкция:** Берется из настроек (`Settings` -> `AI Prompts` -> `Documentation Prompt`).
+    3.  **Путь к данным:** `tmp/noted-docs-<ts>.txt` — сырые данные сессии/выделения/буфера. Gemini читает файл сам.
+    4.  **Дополнение:** Текст из поля ввода в раскрывающемся блоке (▶/▼).
 
-    *Что печатается в Gemini:*
-    `{System Prompt}`
-    `/tmp/noted-docs-<ts>.txt`
-    `{Additional Prompt}`
+    *Что вставляется в Gemini (одна атомарная вставка):*
+    ```
+    Ниже промпт документации:
+    {System Prompt}
+    tmp/noted-docs-<ts>.txt
+    {Additional Prompt}
+    ```
 
-    > **NOTE:** Альтернативный метод Direct Text Injection через `terminal:paste` (Bracketed Paste Mode, fast chunking) реализован в `main.js` → `safePasteAndSubmit(fast=true)` + `terminal:paste` IPC, но отключён в пользу файлового подхода.
+    **Важно:** После Bracketed Paste (`\x1b[201~`) нужна задержка ~500ms перед `\r`, иначе Gemini интерпретирует Enter как перенос строки, а не submit.
 - **Интерактивность:**
     - `⌘+Enter` в поле ввода запускает процесс обновления.
     - Состояние выделения вкладок (Multi-select) сохраняется при кликах внутрь панели и вводе текста (см. `knowledge/ui-ux-stability.md`).
 - **Анализ (Gemini):**
-    - Система создает специальный Gemini-таб, дожидается его готовности и автоматически вставляет собранный промпт через **Large Input Mechanism** (разбиение на чанки < 1024B).
+    - Система создает специальный Gemini-таб, дожидается его готовности и вставляет промпт через Bracketed Paste + 500ms delay + Enter.
 
 ## Code Map
 - **UI & Logic:** `src/renderer/components/Workspace/panels/ActionsPanel.tsx` -> `handleUpdateDocs`.
-- **Main Process:** `docs:save-temp` — сохранение данных сессии в `/tmp/`. `terminal:paste` + `safePasteAndSubmit(fast)` — резервный метод (disabled). Промпт отправляется в PTY через `terminal:input` (путь к файлу внутри текста).
+- **Main Process:** `docs:save-temp` — сохранение данных сессии в `<projectPath>/tmp/`. Промпт отправляется через `terminal:paste` → `safePasteAndSubmit(fast=true)` (Bracketed Paste Mode, chunked < 900B, 500ms delay before Enter).
 - **Styles:** Анимация вращающегося кольца при загрузке.
 - **Fixes:**
     - `knowledge/ai-automation.md` — детали унифицированного экспорта.

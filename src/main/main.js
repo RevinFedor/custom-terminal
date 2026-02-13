@@ -1016,9 +1016,8 @@ async function safePasteAndSubmit(term, content, options = {}) {
   }
 
   if (submit) {
-    if (!fast) {
-        await new Promise(r => setTimeout(r, 100));
-    }
+    // Delay before Enter: CLI needs time to process PASTE_END before \r is recognized as submit
+    await new Promise(r => setTimeout(r, fast ? 500 : 100));
     term.write('\r');
     console.log(logPrefix + ' ✅ Sent Enter');
   }
@@ -2128,14 +2127,16 @@ ipcMain.handle('ai-prompts:delete', async (event, id) => {
 // Export Claude session for documentation update (with file watcher approach)
 // Read documentation prompt from file
 // Save combined prompt to /tmp/ for Gemini to read via @filepath
-ipcMain.handle('docs:save-temp', async (event, { content }) => {
+ipcMain.handle('docs:save-temp', async (event, { content, projectPath }) => {
   const fs = require('fs');
-  const os = require('os');
-  const path = require('path');
 
   try {
+    const tmpDir = path.join(projectPath, 'tmp');
+    if (!fs.existsSync(tmpDir)) {
+      fs.mkdirSync(tmpDir, { recursive: true });
+    }
     const filename = 'noted-docs-' + Date.now() + '.txt';
-    const filePath = path.join(os.tmpdir(), filename);
+    const filePath = path.join(tmpDir, filename);
     fs.writeFileSync(filePath, content, 'utf-8');
     console.log('[docs:save-temp] Saved', content.length, 'chars to', filePath);
     return { success: true, filePath };
