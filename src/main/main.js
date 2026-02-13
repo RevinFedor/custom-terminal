@@ -843,10 +843,11 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
       // ========== END HANDSHAKE ==========
 
       // Detect Session ID from /status TUI output → show toast in renderer
+      // Only send if this tab is known to have an active Claude session to avoid Gemini false positives
       {
         const sc = stripVTControlCharacters(data);
         const m = sc.match(/Session\s*ID[:\s]*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
-        if (m && mainWindow && !mainWindow.isDestroyed()) {
+        if (m && bridgeKnownSessions.has(tabId) && mainWindow && !mainWindow.isDestroyed()) {
           mainWindow.webContents.send('claude:status-session-detected', { tabId, sessionId: m[1] });
         }
       }
