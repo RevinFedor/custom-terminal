@@ -206,7 +206,17 @@ export const terminalRegistry = {
       // Check if this match is a valid user entry (not a random substring)
       if (this.isValidMatch(terminal)) {
         if (validCount === occurrenceIndex) {
-          console.log('[terminalRegistry.searchAndScrollToNth] Found target occurrence:', occurrenceIndex);
+          // Found it! 
+          // xterm.js findNext scrolls it into view, but we want to CENTER it.
+          const selection = terminal.getSelectionPosition();
+          if (selection) {
+             const line = selection.start.y;
+             const rows = terminal.rows;
+             // Calculate line to scroll to so that 'line' is in the middle
+             const centerLine = Math.max(0, line - Math.floor(rows / 2));
+             terminal.scrollToLine(centerLine);
+             console.log('[terminalRegistry.searchAndScrollToNth] Found and centered target occurrence:', occurrenceIndex, 'at line:', line);
+          }
           return true;
         }
         validCount++;
