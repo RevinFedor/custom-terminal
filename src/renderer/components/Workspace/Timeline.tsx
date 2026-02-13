@@ -805,22 +805,22 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
                 <div
                   ref={el => segmentRefs.current[index] = el}
                   data-segment
-                  className="relative flex-1 min-h-[4px] w-full flex items-center justify-center transition-colors"
+                  className="relative flex-1 min-h-[4px] w-full flex items-center justify-center transition-colors pointer-events-none"
                   style={{
                     backgroundColor: active
                       ? 'rgba(59, 130, 246, 0.15)'
                       : (isUnreachable ? 'rgba(239, 68, 68, 0.06)' : 'transparent'),
-                    cursor: isContinued ? 'default' : 'pointer',
                   }}
-                  onMouseEnter={() => handleMouseEnterSegment(index)}
-                  onMouseLeave={(e) => handleMouseLeaveSegment(e)}
-                  onClick={() => handleEntryClick(entry)}
-                  onDoubleClick={() => handleEntryDoubleClick(entry)}
-                  onContextMenu={(e) => handleRightClick(e, entry)}
                 >
                   {/* Visual Indicator: Dot (normal), Line (compact), or Dot (continued=orange) */}
+                  {/* Now handles all interaction events to create dead zones between dots */}
                   <div
-                    className="transition-all duration-200"
+                    className="transition-all duration-200 pointer-events-auto"
+                    onMouseEnter={() => handleMouseEnterSegment(index)}
+                    onMouseLeave={(e) => handleMouseLeaveSegment(e)}
+                    onClick={() => handleEntryClick(entry)}
+                    onDoubleClick={() => handleEntryDoubleClick(entry)}
+                    onContextMenu={(e) => handleRightClick(e, entry)}
                     style={{
                       width: isCompacted ? '12px' : (hoveredIndex === index || activeTooltipIndex === index ? '8px' : (isInViewport ? '10px' : '4px')),
                       height: isCompacted ? '2px' : (hoveredIndex === index || activeTooltipIndex === index ? '8px' : (isInViewport ? '3px' : '4px')),
@@ -831,6 +831,12 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
                       boxShadow: (hoveredIndex === index || activeTooltipIndex === index)
                         ? (isContinued ? '0 0 8px rgba(245, 158, 11, 0.4)' : '0 0 8px rgba(255,255,255,0.4)')
                         : (isInViewport ? '0 0 6px rgba(255,255,255,0.25)' : 'none'),
+                      cursor: isContinued ? 'default' : 'pointer',
+                      // Large invisible padding to make the hit-box easy to target
+                      padding: '10px',
+                      margin: '-10px',
+                      boxSizing: 'content-box',
+                      backgroundClip: 'content-box'
                     }}
                   />
                   {/* Loading spinner — instant feedback on click */}
