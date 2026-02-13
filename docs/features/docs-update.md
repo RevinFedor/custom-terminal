@@ -10,21 +10,18 @@
     - **Multi-select:** Если выбрано несколько вкладок (Shift/Cmd+Click), данные сессий объединяются в один файл.
     - **Кнопка "Ножницы" (✂️):** Использование выделенного в данный момент текста в терминале.
     - **Кнопка "Планшет" (📋):** Использование содержимого буфера обмена (доступно только при одиночном выборе таба).
-- **Составной Промпт (Temp File + @filepath):**
-    Составной промпт сохраняется во временный файл `/tmp/noted-docs-<timestamp>.txt`, после чего Gemini получает команду `@<filepath>` для чтения. Это избегает проблем с посимвольной вставкой огромных текстов в PTY.
-    1.  **Инструкция:** Берется из настроек (`Settings` -> `AI Prompts` -> `Documentation Prompt`).
-    2.  **Контекст:** Содержимое сессии или буфера, обёрнутое в блок `:::session ... :::`.
+- **Составной Промпт (Temp File + inline prompt):**
+    Данные сессии сохраняются в `/tmp/noted-docs-<timestamp>.txt`. Промпт вставляется как текст, содержащий системную инструкцию + путь к файлу + дополнительный промпт. Gemini сам читает файл по пути.
+    1.  **Инструкция:** Берется из настроек (`Settings` -> `AI Prompts` -> `Documentation Prompt`). Вставляется как текст.
+    2.  **Путь к данным:** `/tmp/noted-docs-<ts>.txt` — сырые данные сессии/выделения/буфера.
     3.  **Дополнение:** Текст из поля ввода в раскрывающемся блоке (▶/▼).
 
-    *Формат файла:*
-    `{Global Prompt}`
-    `Вот данные для анализа:`
-    `:::session`
-    `{Session Content}`
-    `:::`
+    *Что печатается в Gemini:*
+    `{System Prompt}`
+    `/tmp/noted-docs-<ts>.txt`
     `{Additional Prompt}`
 
-    > **NOTE:** Альтернативный метод Direct Text Injection через `terminal:paste` (Bracketed Paste Mode, fast chunking) реализован в `main.js` → `safePasteAndSubmit(fast=true)`, но отключён в пользу файлового подхода.
+    > **NOTE:** Альтернативный метод Direct Text Injection через `terminal:paste` (Bracketed Paste Mode, fast chunking) реализован в `main.js` → `safePasteAndSubmit(fast=true)` + `terminal:paste` IPC, но отключён в пользу файлового подхода.
 - **Интерактивность:**
     - `⌘+Enter` в поле ввода запускает процесс обновления.
     - Состояние выделения вкладок (Multi-select) сохраняется при кликах внутрь панели и вводе текста (см. `knowledge/ui-ux-stability.md`).
@@ -33,7 +30,7 @@
 
 ## Code Map
 - **UI & Logic:** `src/renderer/components/Workspace/panels/ActionsPanel.tsx` -> `handleUpdateDocs`.
-- **Main Process:** `docs:save-temp` — сохранение промпта в `/tmp/`. `terminal:paste` — резервный метод (disabled). Отправка в PTY через `terminal:input` с `@filepath`.
+- **Main Process:** `docs:save-temp` — сохранение данных сессии в `/tmp/`. `terminal:paste` + `safePasteAndSubmit(fast)` — резервный метод (disabled). Промпт отправляется в PTY через `terminal:input` (путь к файлу внутри текста).
 - **Styles:** Анимация вращающегося кольца при загрузке.
 - **Fixes:**
     - `knowledge/ai-automation.md` — детали унифицированного экспорта.
