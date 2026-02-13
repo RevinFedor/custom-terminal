@@ -10,23 +10,32 @@
     - **Multi-select:** Если выбрано несколько вкладок (Shift/Cmd+Click), данные сессий объединяются в один файл.
     - **Кнопка "Ножницы" (✂️):** Использование выделенного в данный момент текста в терминале.
     - **Кнопка "Планшет" (📋):** Использование содержимого буфера обмена (доступно только при одиночном выборе таба).
-- **Составной Промпт (Prompt Assembly):**
-    В чат Gemini отправляется сообщение, состоящее из трех частей:
+- **Составной Промпт (Temp File + @filepath):**
+    Составной промпт сохраняется во временный файл `/tmp/noted-docs-<timestamp>.txt`, после чего Gemini получает команду `@<filepath>` для чтения. Это избегает проблем с посимвольной вставкой огромных текстов в PTY.
     1.  **Инструкция:** Берется из настроек (`Settings` -> `AI Prompts` -> `Documentation Prompt`).
-    2.  **Контекст:** Путь к временному `.txt` файлу с данными (сессия/буфер).
+    2.  **Контекст:** Содержимое сессии или буфера, обёрнутое в блок `:::session ... :::`.
     3.  **Дополнение:** Текст из поля ввода в раскрывающемся блоке (▶/▼).
-    
-    *Формат в чате:* `{Global Prompt}\n\n{File Path}\n\n{Additional Prompt}`.
+
+    *Формат файла:*
+    `{Global Prompt}`
+    `Вот данные для анализа:`
+    `:::session`
+    `{Session Content}`
+    `:::`
+    `{Additional Prompt}`
+
+    > **NOTE:** Альтернативный метод Direct Text Injection через `terminal:paste` (Bracketed Paste Mode, fast chunking) реализован в `main.js` → `safePasteAndSubmit(fast=true)`, но отключён в пользу файлового подхода.
 - **Интерактивность:**
     - `⌘+Enter` в поле ввода запускает процесс обновления.
     - Состояние выделения вкладок (Multi-select) сохраняется при кликах внутрь панели и вводе текста (см. `knowledge/ui-ux-stability.md`).
 - **Анализ (Gemini):**
-    - Система создает специальный Gemini-таб, дожидается его готовности и автоматически вставляет собранный промпт.
+    - Система создает специальный Gemini-таб, дожидается его готовности и автоматически вставляет собранный промпт через **Large Input Mechanism** (разбиение на чанки < 1024B).
 
 ## Code Map
 - **UI & Logic:** `src/renderer/components/Workspace/panels/ActionsPanel.tsx` -> `handleUpdateDocs`.
-- **Main Process:** `src/main/main.js` -> хендлеры `docs:save-selection` и `docs:save-prompt-temp` (сборка финального текста).
+- **Main Process:** `docs:save-temp` — сохранение промпта в `/tmp/`. `terminal:paste` — резервный метод (disabled). Отправка в PTY через `terminal:input` с `@filepath`.
 - **Styles:** Анимация вращающегося кольца при загрузке.
 - **Fixes:**
     - `knowledge/ai-automation.md` — детали унифицированного экспорта.
     - `knowledge/ui-ux-stability.md` — механизм удержания выделения табов.
+    - `knowledge/fact-claude-tui-mechanics.md` — как работает вставка больших промптов.
