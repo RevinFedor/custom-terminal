@@ -157,29 +157,66 @@ export const terminalRegistry = {
     return found;
   },
 
+  // Helper to check if current selection looks like a valid user prompt match
+  isValidMatch(terminal: XTerminal): boolean {
+    const selection = terminal.getSelectionPosition();
+    if (!selection) return false;
+    
+    const buf = terminal.buffer.active;
+    // selection.start.y is absolute buffer index in xterm.js
+    const line = buf.getLine(selection.start.y);
+    if (!line) return false;
+    
+    // Get prefix before the match
+    const prefix = line.translateToString(true).slice(0, selection.start.x);
+    
+    // 1. Strict prompt check (same as Timeline)
+    const hasPrompt = prefix.includes('\u276F') || prefix.includes('\u23F5') || prefix.includes('>');
+    // 2. Relaxed check (whitespace, bullets)
+    const isValidIndent = /^[\s*·\-\.]*$/.test(prefix);
+    
+    return hasPrompt || isValidIndent;
+  },
+
   // Search for the Nth occurrence of text (0-indexed) and scroll to it.
   // Used for duplicate timeline entries with identical search keys.
   searchAndScrollToNth(tabId: string, searchText: string, occurrenceIndex: number): boolean {
     const searchAddon = searchAddons.get(tabId);
-    if (!searchAddon) return false;
+    const terminal = terminals.get(tabId);
+    if (!searchAddon || !terminal) return false;
 
-    // Reset search state so findNext starts from the beginning (row 0, col 0)
+    // Reset search state so findNext starts from the beginning
     searchAddon.clearDecorations();
+    terminal.clearSelection();
 
     // Update search state
     const state = searchStates.get(tabId) || { term: '', resultIndex: 0, resultCount: 0 };
     state.term = searchText;
     searchStates.set(tabId, state);
 
-    // Find the Nth occurrence (0-indexed)
+    // Find the Nth VALID occurrence (0-indexed)
     let found = false;
-    for (let i = 0; i <= occurrenceIndex; i++) {
+    let validCount = 0;
+    
+    // Limit iterations to prevent freezing on large buffers with many matches
+    for (let i = 0; i < 2000; i++) {
       found = searchAddon.findNext(searchText, defaultSearchOptions);
-      if (!found) return false;
+      if (!found) break; // End of buffer reached
+      
+      // Check if this match is a valid user entry (not a random substring)
+      if (this.isValidMatch(terminal)) {
+        if (validCount === occurrenceIndex) {
+          console.log('[terminalRegistry.searchAndScrollToNth] Found target occurrence:', occurrenceIndex);
+          return true;
+        }
+        validCount++;
+      } else {
+        // console.log('[terminalRegistry] Skipping invalid match (inside content)');
+      }
     }
 
-    console.log('[terminalRegistry.searchAndScrollToNth] key:', JSON.stringify(searchText), 'occurrence:', occurrenceIndex, 'found:', found);
-    return found;
+    console.log('[terminalRegistry.searchAndScrollToNth] key:', JSON.stringify(searchText), 'occurrence:', occurrenceIndex, 'found:', found, 'validMatches:', validCount);
+    return false;
   },
 
   // Find next occurrence

@@ -147,6 +147,50 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
     return () => clearInterval(interval);
   }, [sessionId, loadTimeline]);
 
+  // Extract first line of content, max 80 chars — the only part that reliably
+  // matches 1:1 in the terminal buffer
+  const getEntryKey = useCallback((entry: TimelineEntry): string | null => {
+    if (entry.type === 'compact') return null;
+    const text = entry.content.split('\n')[0].slice(0, 80).trim();
+    return text || null;
+  }, []);
+
+  // Check if key exists at a user prompt position in buffer text.
+  const matchesAtUserPrompt = useCallback((bufferText: string, key: string, debug = false): boolean => {
+    let searchFrom = 0;
+    while (true) {
+      const pos = bufferText.indexOf(key, searchFrom);
+      if (pos === -1) {
+        return false;
+      }
+      
+      // Find start of the line containing this match
+      const lineStart = bufferText.lastIndexOf('\n', pos - 1) + 1;
+      
+      // Check first few chars of the line for prompt markers OR valid indent
+      // Increased to 50 chars to handle very long indents
+      const lineHead = bufferText.slice(lineStart, Math.min(lineStart + 50, pos));
+      
+      // 1. Strict prompt check (standard case)
+      const hasPrompt = lineHead.includes('\u276F') || lineHead.includes('\u23F5') || lineHead.includes('>');
+      
+      // 2. Relaxed check for pasted text/code/lists (indentation or bullets)
+      // If the prefix is just whitespace, stars, dashes, or dots, assume it's a valid user entry
+      // that was pasted or formatted without a visible prompt on the same line.
+      const isValidIndent = /^[\s*·\-\.]*$/.test(lineHead);
+
+      if (hasPrompt || isValidIndent) return true;
+      
+      if (debug) {
+          // Keep debug log only if explicitly requested by checkReachability diagnosis
+          console.log(`[Timeline:Reachability] Key found at ${pos} but invalid prefix: "${lineHead.replace(/\n/g, '\\n')}"`);
+      }
+      
+      // Try next occurrence
+      searchFrom = pos + 1;
+    }
+  }, []);
+
   // Viewport visibility + buffer reachability tracking
   useEffect(() => {
     if (!isVisible || entries.length === 0) {
@@ -154,33 +198,6 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
       setUnreachableIndices(prev => prev.size === 0 ? prev : new Set());
       return;
     }
-
-    // Extract first line of content, max 80 chars — the only part that reliably
-    // matches 1:1 in the terminal buffer (multi-line content gets reformatted by Ink TUI
-    // with indentation, prompt prefix, word wrapping — raw JSONL ≠ buffer text)
-    const getEntryKey = (entry: TimelineEntry): string | null => {
-      if (entry.type === 'compact') return null;
-      const text = entry.content.split('\n')[0].slice(0, 80).trim();
-      return text || null;
-    };
-
-    // Check if key exists at a user prompt position in buffer text.
-    // In Claude Code TUI, user input appears as "❯ <text>" (U+276F).
-    // We find the key in the buffer, then walk back to the start of that line
-    // and check if the line begins with ❯. Handles any amount of whitespace.
-    const matchesAtUserPrompt = (bufferText: string, key: string): boolean => {
-      let searchFrom = 0;
-      while (true) {
-        const pos = bufferText.indexOf(key, searchFrom);
-        if (pos === -1) return false;
-        // Find start of the line containing this match
-        const lineStart = bufferText.lastIndexOf('\n', pos - 1) + 1;
-        // Check first few chars of the line for ❯ (allows leading whitespace before prompt)
-        const lineHead = bufferText.slice(lineStart, Math.min(lineStart + 5, pos));
-        if (lineHead.includes('\u276F')) return true;
-        searchFrom = pos + 1;
-      }
-    };
 
     // Viewport visibility — which entries are currently on screen
     const checkVisibility = () => {
@@ -216,8 +233,11 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
       entries.forEach((entry, index) => {
         if (entry.type === 'compact' || entry.type === 'continued') return;
         const key = getEntryKey(entry);
-        if (key && !matchesAtUserPrompt(fullText, key)) {
-          newUnreachable.add(index);
+        if (key) {
+             const isReachable = matchesAtUserPrompt(fullText, key, false);
+             if (!isReachable) {
+                 newUnreachable.add(index);
+             }
         }
       });
 
@@ -248,7 +268,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
       if (reachTimer) clearTimeout(reachTimer);
       terminalRegistry.offViewportChange(tabId);
     };
-  }, [tabId, entries, isVisible]);
+  }, [tabId, entries, isVisible, getEntryKey, matchesAtUserPrompt]);
 
   // Refs
   const tooltipRef = useRef<HTMLDivElement>(null);
@@ -355,6 +375,20 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
     // Instant visual feedback — loader appears immediately
     const index = entries.findIndex(e => e.uuid === entry.uuid);
     setClickedState({ index, status: 'loading' });
+
+    // ALWAYS DIAGNOSE CLICK (Temporary Debug)
+    // if (unreachableIndices.has(index)) {
+         console.warn(`[Timeline] Clicking entry #${index}. Diagnosing...`);
+         const fullText = terminalRegistry.getFullBufferText(tabId);
+         const key = getEntryKey(entry);
+         if (fullText && key) {
+             const found = matchesAtUserPrompt(fullText, key, true); // Force debug logs
+             if (found) console.log(`[Timeline] Diagnosis: Entry IS reachable (found=${found}). Red status might be stale.`);
+             else console.log(`[Timeline] Diagnosis: Entry UNREACHABLE (found=${found}).`);
+         } else {
+             console.log(`[Timeline] Diagnosis failed: fullText=${!!fullText}, key=${!!key}`);
+         }
+    // }
 
     clickTimerRef.current = setTimeout(() => {
       clickTimerRef.current = null;
@@ -591,7 +625,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
       const rewindResult = await ipcRenderer.invoke('claude:open-history-menu', {
         tabId,
         targetIndex,
-        targetText: entry.content.substring(0, 40),
+        targetText: entry.content.trim().substring(0, 40),
         pasteAfter: compactText || undefined
       });
       console.warn('[Restore:Rewind] Rewind result:', rewindResult.success ? 'OK' : 'FAIL',
