@@ -748,6 +748,9 @@ function App() {
       // Arrow keys for project navigation (only when projects area is focused)
       if (activeArea === 'projects') {
         if (e.code === 'ArrowRight' || e.code === 'ArrowLeft') {
+          // Skip navigation if currently editing a project name (Bug #307)
+          if (editingProjectId) return;
+
           e.preventDefault();
           const projectIds = Array.from(openProjects.keys());
           if (projectIds.length === 0) return;
@@ -879,6 +882,12 @@ function App() {
             });
             showToast(`"${tab.name}" added to favorites`, 'success');
           }
+        }
+      } else if (cmd === 'run-script') {
+        // Run npm script or .sh file from terminal context menu
+        const { tabId, command } = data || {};
+        if (tabId && command) {
+          ipcRenderer.send('terminal:input', tabId, command);
         }
       }
     };

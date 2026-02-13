@@ -666,6 +666,13 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
       // Intercept Enter key to replace claude/claude-c/claude-f with explicit --resume
       // Commands: claude (new), claude-c (continue), claude-f (fork)
       term.attachCustomKeyEventHandler((event) => {
+        // Skip xterm.js processing for app-level Meta (Cmd) shortcuts.
+        // Prevents Cmd+, (Settings), Cmd+T (new tab), etc. from leaking characters to PTY.
+        // Preserve: Cmd+C (copy/SIGINT), Cmd+V (paste), Cmd+A (selectAll), Cmd+X (cut)
+        if (event.metaKey && !['c', 'v', 'a', 'x'].includes(event.key.toLowerCase())) {
+          return false;
+        }
+
         // Only intercept Enter key on keydown
         if (event.key !== 'Enter' || event.type !== 'keydown') {
           return true; // Allow default handling
@@ -1083,6 +1090,13 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
 
         // === INPUT INTERCEPTION for Claude Commands (same as initTerminal) ===
         term.attachCustomKeyEventHandler((event) => {
+          // Skip xterm.js processing for app-level Meta (Cmd) shortcuts.
+          // Prevents Cmd+, (Settings), Cmd+T (new tab), etc. from leaking characters to PTY.
+          // Preserve: Cmd+C (copy/SIGINT), Cmd+V (paste), Cmd+A (selectAll), Cmd+X (cut)
+          if (event.metaKey && !['c', 'v', 'a', 'x'].includes(event.key.toLowerCase())) {
+            return false;
+          }
+
           if (event.key !== 'Enter' || event.type !== 'keydown') {
             return true;
           }
@@ -1382,7 +1396,10 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
       if (workspace.tabs.has(tabId)) { currentProjectId = projId; break; }
     }
 
-    ipcRenderer.send('show-terminal-context-menu', { hasSelection, prompts, tabId, projectId: currentProjectId });
+    // Get current CWD for scripts detection
+    const termCwd = await ipcRenderer.invoke('terminal:getCwd', tabId);
+
+    ipcRenderer.send('show-terminal-context-menu', { hasSelection, prompts, tabId, projectId: currentProjectId, cwd: termCwd || cwd });
   };
 
   // CSS: visibility:hidden preserves geometry, prevents WebGL context loss

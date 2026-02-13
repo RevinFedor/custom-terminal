@@ -373,7 +373,7 @@ function createWindow() {
 }
 
 // Context Menu IPC
-ipcMain.on('show-terminal-context-menu', async (event, { hasSelection, prompts, tabId, projectId }) => {
+ipcMain.on('show-terminal-context-menu', async (event, { hasSelection, prompts, tabId, projectId, cwd }) => {
   // Load dynamic AI prompts from DB
   let aiPrompts = [];
   try {
@@ -408,12 +408,60 @@ ipcMain.on('show-terminal-context-menu', async (event, { hasSelection, prompts, 
   }
 
   template.push({ type: 'separator' });
-  template.push({
-    label: '⭐ Add to Favorites',
-    enabled: !!(tabId && projectId),
-    click: () => { event.sender.send('context-menu-command', 'add-to-favorites-from-terminal', { tabId, projectId }); }
-  });
-  template.push({ type: 'separator' });
+
+  // Scripts submenu: npm scripts from package.json + .sh files
+  const scripts = [];
+  if (cwd) {
+    try {
+      const fs = require('fs');
+      const path = require('path');
+
+      // 1. npm scripts from package.json
+      const pkgPath = path.join(cwd, 'package.json');
+      if (fs.existsSync(pkgPath)) {
+        try {
+          const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+          if (pkg.scripts) {
+            Object.keys(pkg.scripts)
+              .filter(name => !name.startsWith('_'))
+              .forEach(name => {
+                scripts.push({
+                  label: `npm run ${name}`,
+                  click: () => {
+                    event.sender.send('context-menu-command', 'run-script', { tabId, command: `npm run ${name}\r` });
+                  }
+                });
+              });
+          }
+        } catch (e) {
+          console.error('[ContextMenu] Failed to parse package.json:', e);
+        }
+      }
+
+      // 2. .sh files in CWD
+      const shFiles = fs.readdirSync(cwd).filter(f => f.endsWith('.sh') && !f.startsWith('.'));
+      shFiles.forEach(file => {
+        scripts.push({
+          label: `./${file}`,
+          click: () => {
+            event.sender.send('context-menu-command', 'run-script', { tabId, command: `./${file}\r` });
+          }
+        });
+      });
+    } catch (e) {
+      console.error('[ContextMenu] Failed to load scripts:', e);
+    }
+  }
+
+  if (scripts.length > 0) {
+    template.push({
+      label: `Scripts (${scripts.length})`,
+      submenu: scripts
+    });
+    template.push({ type: 'separator' });
+  }
+
+  // Removed: Add to Favorites (only in TabBar context menu)
 
   // Add Insert Prompt submenu
   if (prompts && prompts.length > 0) {
@@ -850,6 +898,7 @@ function waitForRender(term, timeoutMs, logPrefix) {
   return new Promise((resolve) => {
     let buf = '';
     let resolved = false;
+    const subscribeTime = Date.now();
 
     const cleanup = () => {
       if (!resolved) {
@@ -869,8 +918,13 @@ function waitForRender(term, timeoutMs, logPrefix) {
       if (resolved) return;
       buf += data;
       if (buf.includes('\x1b[?2026l')) {
+        const elapsed = Date.now() - subscribeTime;
+        const isStale = elapsed < 15;
+        if (isStale) {
+          console.log(logPrefix + ' ⚠️ STALE sync marker at +' + elapsed + 'ms (data arrived before our write could be processed)');
+        }
         cleanup();
-        resolve({ timedOut: false });
+        resolve({ timedOut: false, elapsedMs: elapsed, isStale });
       }
     });
   });
