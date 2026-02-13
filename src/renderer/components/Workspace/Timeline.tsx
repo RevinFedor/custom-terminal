@@ -21,6 +21,7 @@ interface TimelineEntry {
   isCompactSummary?: boolean;
   preTokens?: number;
   sessionId?: string;
+  isPlan?: boolean;
 }
 
 interface SessionBoundary {
@@ -231,7 +232,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
 
       const newUnreachable = new Set<number>();
       entries.forEach((entry, index) => {
-        if (entry.type === 'compact' || entry.type === 'continued') return;
+        if (entry.type === 'compact' || entry.type === 'continued' || entry.isPlan) return;
         const key = getEntryKey(entry);
         if (key) {
              const isReachable = matchesAtUserPrompt(fullText, key, false);
@@ -392,19 +393,24 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
 
     clickTimerRef.current = setTimeout(() => {
       clickTimerRef.current = null;
-      // Use first line, max 80 chars — same as getSearchKey in reachability check
-      const searchText = entry.content.split('\n')[0].slice(0, 80).trim();
+      // Plan entries: Claude TUI renders plan in a box with "Plan to implement" header,
+      // the actual JSONL content is NOT in the terminal buffer
+      const searchText = entry.isPlan
+        ? 'Plan to implement'
+        : entry.content.split('\n')[0].slice(0, 80).trim();
       if (searchText) {
         // Count earlier entries with the same search key (duplicate handling)
         let occurrenceIndex = 0;
         for (let i = 0; i < index; i++) {
           const e = entries[i];
           if (e.type === 'compact' || e.type === 'continued') continue;
-          const eKey = e.content.split('\n')[0].slice(0, 80).trim();
+          const eKey = e.isPlan
+            ? 'Plan to implement'
+            : e.content.split('\n')[0].slice(0, 80).trim();
           if (eKey === searchText) occurrenceIndex++;
         }
 
-        const found = terminalRegistry.searchAndScrollToNth(tabId, searchText, occurrenceIndex);
+        const found = terminalRegistry.searchAndScrollToNth(tabId, searchText, occurrenceIndex, !!entry.isPlan);
         if (found) {
           setTimeout(() => setClickedState(null), 300);
         } else {
@@ -798,6 +804,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
             const isInViewport = visibleEntryIndices.has(index);
             const isUnreachable = unreachableIndices.has(index);
             const isContinued = entry.type === 'continued';
+            const isPlan = !!entry.isPlan;
             const dotClickState = clickedState?.index === index ? clickedState.status : null;
 
             return (
@@ -827,9 +834,11 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
                       borderRadius: (isCompacted || (isInViewport && hoveredIndex !== index && activeTooltipIndex !== index)) ? '1px' : '50%',
                       backgroundColor: isCompacted || isContinued
                         ? '#f59e0b'
-                        : (active ? '#3b82f6' : (hoveredIndex === index || activeTooltipIndex === index ? 'white' : (isInViewport ? 'rgba(255,255,255,0.75)' : 'rgba(255,255,255,0.3)'))),
+                        : isPlan
+                          ? '#48968c'
+                          : (active ? '#3b82f6' : (hoveredIndex === index || activeTooltipIndex === index ? 'white' : (isInViewport ? 'rgba(255,255,255,0.75)' : 'rgba(255,255,255,0.3)'))),
                       boxShadow: (hoveredIndex === index || activeTooltipIndex === index)
-                        ? (isContinued ? '0 0 8px rgba(245, 158, 11, 0.4)' : '0 0 8px rgba(255,255,255,0.4)')
+                        ? (isContinued ? '0 0 8px rgba(245, 158, 11, 0.4)' : isPlan ? '0 0 8px rgba(72, 150, 140, 0.4)' : '0 0 8px rgba(255,255,255,0.4)')
                         : (isInViewport ? '0 0 6px rgba(255,255,255,0.25)' : 'none'),
                       cursor: isContinued ? 'default' : 'pointer',
                       // Large invisible padding to make the hit-box easy to target
@@ -978,7 +987,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
               onMouseLeave={handleMouseLeaveTooltipArea}
               style={{
                 position: 'fixed',
-                right: `${notesPanelWidth + 8}px`,
+                right: `${notesPanelWidth}px`,
                 top: `${tooltipPos.wTop}px`,
                 height: `${tooltipPos.wH}px`,
                 zIndex: 10000,
@@ -1032,6 +1041,37 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
                         {isExpanded ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
                       </button>
                     )}
+                  </>
+                ) : currentActiveEntry.isPlan ? (
+                  <>
+                    <span style={{ color: '#48968c' }} className="font-medium">Plan Mode (auto-submitted)</span>
+                    <div
+                      className={`text-white/70 leading-snug font-mono text-[11px] ${isExpanded ? 'overflow-y-auto' : 'line-clamp-4'}`}
+                      style={{ whiteSpace: 'pre-wrap' }}
+                    >
+                      {isExpanded ? currentActiveEntry.content : truncateText(currentActiveEntry.content, 200)}
+                    </div>
+                    <div className="flex justify-between items-center mt-1 pt-2 border-t border-white/5">
+                      <span className="text-[10px] text-white/30">{new Date(currentActiveEntry.timestamp).toLocaleTimeString()}</span>
+                      <div className="flex items-center gap-1">
+                        {(currentActiveEntry.content.length > 200 || isExpanded) && (
+                          <button
+                            onClick={(e) => { e.stopPropagation(); setIsExpanded(!isExpanded); }}
+                            className="p-1.5 rounded hover:bg-white/10 text-white/40 hover:text-white transition-colors cursor-pointer shrink-0"
+                            title={isExpanded ? "Свернуть" : "Развернуть полностью"}
+                          >
+                            {isExpanded ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
+                          </button>
+                        )}
+                        <button
+                          onClick={(e) => { e.stopPropagation(); clipboard.writeText(currentActiveEntry.content); }}
+                          className="flex items-center gap-1.5 px-2 py-1 rounded bg-white/5 hover:bg-white/10 text-[10px] text-white/60 hover:text-white transition-colors cursor-pointer"
+                        >
+                          <Copy size={12} />
+                          Копировать
+                        </button>
+                      </div>
+                    </div>
                   </>
                 ) : (
                   <>
