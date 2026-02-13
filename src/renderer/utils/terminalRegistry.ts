@@ -180,7 +180,7 @@ export const terminalRegistry = {
 
   // Search for the Nth occurrence of text (0-indexed) and scroll to it.
   // Used for duplicate timeline entries with identical search keys.
-  searchAndScrollToNth(tabId: string, searchText: string, occurrenceIndex: number): boolean {
+  searchAndScrollToNth(tabId: string, searchText: string, occurrenceIndex: number, skipValidation: boolean = false): boolean {
     const searchAddon = searchAddons.get(tabId);
     const terminal = terminals.get(tabId);
     if (!searchAddon || !terminal) return false;
@@ -204,7 +204,7 @@ export const terminalRegistry = {
       if (!found) break; // End of buffer reached
       
       // Check if this match is a valid user entry (not a random substring)
-      if (this.isValidMatch(terminal)) {
+      if (skipValidation || this.isValidMatch(terminal)) {
         if (validCount === occurrenceIndex) {
           // Found it! 
           // xterm.js findNext scrolls it into view, but we want to CENTER it.

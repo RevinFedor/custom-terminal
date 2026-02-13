@@ -3368,7 +3368,8 @@ ipcMain.handle('claude:get-timeline', async (event, { sessionId, cwd }) => {
           timestamp: entry.timestamp,
           content: cleanContent,
           isCompactSummary: entry.isCompactSummary || false,
-          sessionId: entry.sessionId || entry._fromFile
+          sessionId: entry.sessionId || entry._fromFile,
+          isPlan: !!entry.planContent
         });
       } else if (entry.type === 'system' && entry.subtype === 'compact_boundary') {
         entries.push({
