@@ -204,6 +204,7 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
 
         if (validTabs.length === 0) {
           showToast('Нет сессий для экспорта', 'warning');
+          setIsUpdatingDocs(false);
           return;
         }
 
@@ -220,37 +221,27 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
           if (result.success) results.push(result.content);
         }
 
-        if (results.length === 0) { showToast('Export failed', 'error'); return; }
+        if (results.length === 0) { showToast('Export failed', 'error'); setIsUpdatingDocs(false); return; }
         content = results.join('\n\n' + '='.repeat(40) + '\n\n');
         if (isMultiSelect) clearSelection(activeProject.projectId);
       }
 
       if (cancelledRef.current) return;
 
-      // 2. Save content to temp file
-      const saveResult = await ipcRenderer.invoke('docs:save-selection', {
-        projectPath: workingDir,
-        selectionText: content
-      });
-      if (!saveResult.success) throw new Error(saveResult.error || 'Failed to save content file');
-
-      showToast('Content saved, preparing Gemini...', 'info');
-      if (cancelledRef.current) return;
-
-      // 3. Get documentation prompt from settings
-      let promptContent: string;
+      // 2. Get documentation prompt from settings
+      let systemPrompt: string;
       if (docPrompt.useFile) {
         const promptResult = await ipcRenderer.invoke('docs:read-prompt-file', { filePath: docPrompt.filePath });
         if (!promptResult.success) throw new Error(promptResult.error || 'Failed to read prompt file');
-        promptContent = promptResult.content;
+        systemPrompt = promptResult.content;
       } else {
-        promptContent = docPrompt.inlineContent;
+        systemPrompt = docPrompt.inlineContent;
       }
-      if (!promptContent) throw new Error('Documentation prompt is empty');
+      if (!systemPrompt) throw new Error('Documentation prompt is empty');
 
       if (cancelledRef.current) return;
 
-      // 4. Create Gemini tab
+      // 3. Create Gemini tab
       const existingDocsTabs = Array.from(activeProject.tabs.values())
         .filter(t => t.name.startsWith('docs-gemini-')).length;
       const tabName = `docs-gemini-${String(existingDocsTabs + 1).padStart(2, '0')}`;
@@ -261,41 +252,34 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
 
       if (cancelledRef.current) return;
 
-      await new Promise(resolve => setTimeout(resolve, 500));
+      // 4. Build combined prompt (Text only, no files!)
+      const combinedPrompt = [
+        systemPrompt,
+        '\nВот данные для анализа:\n:::session\n' + content + '\n:::',
+        additionalPrompt.trim() ? '\n' + additionalPrompt.trim() : ''
+      ].filter(Boolean).join('\n');
 
-      // 5. Save combined prompt (settings prompt + file path + additional prompt)
-      const promptResult = await ipcRenderer.invoke('docs:save-prompt-temp', {
-        projectPath: workingDir,
-        promptContent,
-        exportedFilePath: saveResult.selectionPath,
-        additionalPrompt: additionalPrompt.trim() || undefined
-      });
-      if (!promptResult.success) throw new Error(promptResult.error || 'Failed to save prompt file');
-
-      if (cancelledRef.current) return;
-
-      // 6. Start Gemini and send prompt
+      // 5. Start Gemini and send combined prompt directly
       await ipcRenderer.invoke('terminal:executeCommandAsync', newTabId, 'gemini');
 
       const geminiReady = await waitForGeminiReady(newTabId, 30000);
       if (cancelledRef.current) return;
       if (!geminiReady) throw new Error('Timeout waiting for Gemini to start');
 
-      await new Promise(resolve => setTimeout(resolve, 300));
+      await new Promise(resolve => setTimeout(resolve, 500));
       if (cancelledRef.current) return;
 
-      const promptFileContent = await ipcRenderer.invoke('file:read', promptResult.promptFile);
-      if (promptFileContent.success) {
-        console.warn('[UpdateDocs] Sending prompt to terminal: tabId=' + newTabId + ' len=' + promptFileContent.content.length + ' +\\r');
-        ipcRenderer.send('terminal:input', newTabId, promptFileContent.content + '\r');
-      } else {
-        console.warn('[UpdateDocs] ⚠️ Failed to read prompt file:', promptResult.promptFile);
-      }
+      // Save combined prompt to /tmp/ file, then send @filepath to Gemini
+      // (Direct text injection via terminal:paste is available but disabled —
+      //  file approach is more reliable for very large payloads)
+      const saveResult = await ipcRenderer.invoke('docs:save-temp', { content: combinedPrompt });
+      if (!saveResult.success) throw new Error('Failed to save temp file: ' + saveResult.error);
 
-      await ipcRenderer.invoke('docs:cleanup-temp', { exportedPath: null, promptPath: promptResult.promptFile });
+      console.warn('[UpdateDocs] Saved to temp file: ' + saveResult.filePath + ' (' + combinedPrompt.length + ' chars)');
+      ipcRenderer.send('terminal:input', newTabId, '@' + saveResult.filePath + '\r');
 
       docsGeminiTabIdRef.current = null;
-      showToast('Gemini started', 'success');
+      showToast('Gemini started with session context', 'success');
 
     } catch (error: any) {
       if (cancelledRef.current) return;

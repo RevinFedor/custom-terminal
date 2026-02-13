@@ -932,13 +932,13 @@ function waitForRender(term, timeoutMs, logPrefix) {
 }
 
 // Main helper: chunked paste + sync marker verification + optional submit
-// ДИАГНОСТИЧЕСКАЯ ВЕРСИЯ — подробное логирование для отладки stale sync markers
 async function safePasteAndSubmit(term, content, options = {}) {
   const {
     submit = true,
     ctrlCFirst = false,
     logPrefix = '[safePaste]',
-    safetyTimeoutMs = 8000
+    safetyTimeoutMs = 8000,
+    fast = false // Turbo mode for Gemini/Bash (skip render waits)
   } = options;
 
   // TTYHOG on macOS = 1024 bytes. Paste brackets = 12 bytes. Leave margin.
@@ -955,93 +955,75 @@ async function safePasteAndSubmit(term, content, options = {}) {
     chunks.push(content.substring(i, i + CHUNK_MAX));
   }
 
-  console.log(logPrefix + ' Start: ' + content.length + ' chars → ' + chunks.length + ' chunk(s), submit=' + submit + ', ctrlC=' + ctrlCFirst);
+  console.log(logPrefix + ' Start: ' + content.length + ' chars → ' + chunks.length + ' chunk(s), fast=' + fast);
 
-  // Optional: Ctrl+C to clear input, wait for Ink render
+  // Optional: Ctrl+C to clear input
   if (ctrlCFirst) {
     term.write('\x03');
-    console.log(logPrefix + ' Ctrl+C sent, waiting for render...');
-    const renderResult = await waitForRender(term, 2000, logPrefix + ':ctrl-c');
-    console.log(logPrefix + ' Ctrl+C render ' + (renderResult.timedOut ? 'timeout' : 'confirmed'));
-    // DIAG: drain pause after Ctrl+C — let Ink finish all render cycles
-    await new Promise(r => setTimeout(r, 50));
-    console.log(logPrefix + ' 🔍 Drain pause 50ms after Ctrl+C');
+    if (!fast) {
+      await waitForRender(term, 2000, logPrefix + ':ctrl-c');
+      await new Promise(r => setTimeout(r, 50));
+    } else {
+      // Tiny delay even in fast mode to let kernel process SIGINT
+      await new Promise(r => setTimeout(r, 10));
+    }
   }
 
   const renderTimes = [];
-  let staleCount = 0;
+
+  // Bracketed Paste wrapping strategy:
+  // - fast mode (Gemini/bash): single bracket pair across ALL chunks → CLI sees one atomic paste
+  //   Chunk 1: \x1b[200~ + text, Chunk 2..N-1: text, Chunk N: text + \x1b[201~
+  // - slow mode (Claude Ink TUI): each chunk wrapped individually → Ink renders after each,
+  //   sync marker confirms before next chunk
+  //   Each chunk: \x1b[200~ + text + \x1b[201~
 
   for (let i = 0; i < chunks.length; i++) {
     const chunk = chunks[i];
-    const payload = PASTE_START + chunk + PASTE_END;
+    let payload;
 
-    console.log(logPrefix + ' Chunk ' + (i + 1) + '/' + chunks.length + ': ' + chunk.length + ' chars, payload ' + payload.length + 'B');
+    if (fast) {
+      // Single bracket pair across all chunks
+      payload = chunk;
+      if (i === 0) payload = PASTE_START + payload;
+      if (i === chunks.length - 1) payload = payload + PASTE_END;
+    } else {
+      // Per-chunk wrapping for Ink TUI sync marker verification
+      payload = PASTE_START + chunk + PASTE_END;
+    }
 
-    // DIAG: drain pause between chunks to flush stale sync markers
-    if (i > 0) {
+    if (!fast && i > 0) {
       await new Promise(r => setTimeout(r, 50));
-      console.log(logPrefix + ' 🔍 Drain pause 50ms before chunk ' + (i + 1));
     }
 
     const startTime = Date.now();
+    let renderPromise = null;
 
-    // Subscribe BEFORE write to capture Ink's render after our paste
-    const renderPromise = waitForRender(term, safetyTimeoutMs, logPrefix + ':chunk' + (i + 1));
+    if (!fast) {
+       renderPromise = waitForRender(term, safetyTimeoutMs, logPrefix + ':chunk' + (i + 1));
+    }
 
-    // Write complete bracketed paste (< 1024 bytes = atomic in TTYHOG)
     term.write(payload);
 
-    // Wait for Ink render cycle (sync marker = paste processed, React state committed)
-    const result = await renderPromise;
-    const elapsed = Date.now() - startTime;
-    renderTimes.push(elapsed);
-
-    if (result.timedOut) {
-      console.log(logPrefix + ' ⚠️ Chunk ' + (i + 1) + ' render TIMEOUT after ' + elapsed + 'ms — continuing anyway');
+    if (!fast && renderPromise) {
+      await renderPromise;
     } else {
-      const staleFlag = result.isStale ? ' ⚠️ STALE' : '';
-      console.log(logPrefix + ' ✅ Chunk ' + (i + 1) + '/' + chunks.length + ' render confirmed in ' + elapsed + 'ms' + staleFlag);
-      if (result.isStale) staleCount++;
+      // In fast mode, tiny tick every 10 chunks to prevent node-pty buffer flooding
+      if (i % 10 === 0) await new Promise(r => setTimeout(r, 5));
     }
+
+    renderTimes.push(Date.now() - startTime);
   }
 
-  // All chunks sent and render-confirmed → submit
   if (submit) {
-    // DIAG: extra drain pause before Enter to let Ink finish all pending renders
-    await new Promise(r => setTimeout(r, 100));
-    console.log(logPrefix + ' 🔍 Pre-Enter drain pause 100ms');
-
+    if (!fast) {
+        await new Promise(r => setTimeout(r, 100));
+    }
     term.write('\r');
-    console.log(logPrefix + ' ✅ Enter sent after ' + chunks.length + ' chunk(s). Render times: [' + renderTimes.join(', ') + ']ms. Stale markers: ' + staleCount);
-
-    // DIAG: monitor PTY for 3s after Enter to see if Claude responds
-    const enterTime = Date.now();
-    const postEnterEvents = [];
-    const diagSub = term.onData((data) => {
-      const elapsed = Date.now() - enterTime;
-      const hasSyncEnd = data.includes('\x1b[?2026l');
-      const hasSyncStart = data.includes('\x1b[?2026h');
-      postEnterEvents.push({ elapsed, len: data.length, hasSyncEnd, hasSyncStart });
-    });
-
-    await new Promise(r => setTimeout(r, 3000));
-    diagSub.dispose();
-
-    console.log(logPrefix + ' 🔍 Post-Enter PTY activity (' + postEnterEvents.length + ' events in 3s):');
-    postEnterEvents.slice(0, 20).forEach((e, i) => {
-      console.log(logPrefix + '   [' + i + '] +' + e.elapsed + 'ms len=' + e.len + (e.hasSyncStart ? ' SYNC_START' : '') + (e.hasSyncEnd ? ' SYNC_END' : ''));
-    });
-    if (postEnterEvents.length > 20) {
-      console.log(logPrefix + '   ... and ' + (postEnterEvents.length - 20) + ' more events');
-    }
-    if (postEnterEvents.length === 0) {
-      console.log(logPrefix + ' ❌ NO PTY activity after Enter — Claude did NOT process the submission!');
-    }
-  } else {
-    console.log(logPrefix + ' Done (no submit). Render times: [' + renderTimes.join(', ') + ']ms');
+    console.log(logPrefix + ' ✅ Sent Enter');
   }
 
-  return { success: true, chunksTotal: chunks.length, renderTimeMs: renderTimes, staleCount };
+  return { success: true, chunksTotal: chunks.length, renderTimeMs: renderTimes };
 }
 
 // Send input to terminal
@@ -1064,19 +1046,38 @@ ipcMain.on('terminal:input', async (event, tabId, data) => {
   }
 
   // User paste (Cmd+V) — direct passthrough, no chunking needed.
-  // xterm.js wraps paste in brackets (\x1b[200~...\x1b[201~).
-  // macOS kernel may split large writes at TTYHOG (1024B) boundary,
-  // but Ink/bash buffer between brackets and assemble one paste event.
-  // Chunking is ONLY needed in safePasteAndSubmit (programmatic paste + immediate Enter).
   if (data.length > 1) {
     const endsWithR = data.endsWith('\r');
     const endsWithN = data.endsWith('\n');
     const hasNewline = data.includes('\r') || data.includes('\n');
-    console.log(`[terminal:input] tabId=${tabId} len=${data.length} endsWithR=${endsWithR} endsWithN=${endsWithN} hasNewline=${hasNewline} last5=${JSON.stringify(data.slice(-5))} first30=${JSON.stringify(data.slice(0, 30))}`);
+    console.log(`[terminal:input] tabId=${tabId} len=${data.length} endsWithR=${endsWithR} endsWithN=${endsWithN} hasNewline=${hasNewline}`);
   }
   term.write(data);
 });
 
+// Programmatic paste (used for automated tools like Update Docs)
+// Uses safePasteAndSubmit to ensure Bracketed Paste Mode and avoid TTYHOG issues.
+ipcMain.handle('terminal:paste', async (event, { tabId, content, submit = true, fast = true }) => {
+  const term = terminals.get(tabId);
+  if (!term) {
+    return { success: false, error: 'terminal not found' };
+  }
+
+  console.log('[terminal:paste] Pasting ' + content.length + ' chars to tab ' + tabId + ' (submit=' + submit + ', fast=' + fast + ')');
+  
+  try {
+    const result = await safePasteAndSubmit(term, content, {
+      submit,
+      ctrlCFirst: false, // Don't clear by default
+      logPrefix: '[paste:' + tabId + ']',
+      fast // Enable fast mode by default for general paste
+    });
+    return result;
+  } catch (error) {
+    console.error('[terminal:paste] Error:', error);
+    return { success: false, error: error.message };
+  }
+});
 // Send a slash command to Claude's Ink TUI (chunked paste + echo verification)
 ipcMain.on('claude:send-command', (event, tabId, command) => {
   const term = terminals.get(tabId);
@@ -2126,6 +2127,24 @@ ipcMain.handle('ai-prompts:delete', async (event, id) => {
 
 // Export Claude session for documentation update (with file watcher approach)
 // Read documentation prompt from file
+// Save combined prompt to /tmp/ for Gemini to read via @filepath
+ipcMain.handle('docs:save-temp', async (event, { content }) => {
+  const fs = require('fs');
+  const os = require('os');
+  const path = require('path');
+
+  try {
+    const filename = 'noted-docs-' + Date.now() + '.txt';
+    const filePath = path.join(os.tmpdir(), filename);
+    fs.writeFileSync(filePath, content, 'utf-8');
+    console.log('[docs:save-temp] Saved', content.length, 'chars to', filePath);
+    return { success: true, filePath };
+  } catch (error) {
+    console.error('[docs:save-temp] Error:', error);
+    return { success: false, error: error.message };
+  }
+});
+
 ipcMain.handle('docs:read-prompt-file', async (event, { filePath }) => {
   const fs = require('fs');
 
@@ -2139,80 +2158,6 @@ ipcMain.handle('docs:read-prompt-file', async (event, { filePath }) => {
     return { success: true, content };
   } catch (error) {
     console.error('[docs:read-prompt] Error reading prompt file:', error);
-    return { success: false, error: error.message };
-  }
-});
-
-// Save combined prompt to temp file for Gemini (avoids shell escaping issues)
-ipcMain.handle('docs:save-prompt-temp', async (event, { projectPath, promptContent, exportedFilePath, additionalPrompt }) => {
-  const fs = require('fs');
-
-  try {
-    const tmpDir = path.join(projectPath, 'docs', 'tmp');
-    if (!fs.existsSync(tmpDir)) {
-      fs.mkdirSync(tmpDir, { recursive: true });
-    }
-
-    const timestamp = Date.now();
-    const promptFile = path.join(tmpDir, `gemini-prompt-${timestamp}.txt`);
-    let fullPrompt = `${promptContent}\n\n${exportedFilePath}`;
-    if (additionalPrompt) {
-      fullPrompt += `\n\n${additionalPrompt}`;
-    }
-
-    fs.writeFileSync(promptFile, fullPrompt, 'utf-8');
-    console.log('[docs:save-prompt] Saved prompt to:', promptFile);
-
-    return { success: true, promptFile };
-  } catch (error) {
-    console.error('[docs:save-prompt] Error:', error);
-    return { success: false, error: error.message };
-  }
-});
-
-// Save terminal selection to temp file (similar to session export, but for copied text)
-ipcMain.handle('docs:save-selection', async (event, { projectPath, selectionText }) => {
-  const fs = require('fs');
-
-  try {
-    const tmpDir = path.join(projectPath, 'docs', 'tmp');
-    if (!fs.existsSync(tmpDir)) {
-      fs.mkdirSync(tmpDir, { recursive: true });
-    }
-
-    const timestamp = Date.now();
-    const selectionFile = path.join(tmpDir, `selection-${timestamp}.txt`);
-
-    // Add preamble explaining this is copied AI history
-    const preamble = '(Весь текст ниже является копипастом из истории Claude Code / нейросетки, а не содержимым файла)\n\n---\n\n';
-    const fullContent = preamble + selectionText;
-
-    fs.writeFileSync(selectionFile, fullContent, 'utf-8');
-    console.log('[docs:save-selection] Saved selection to:', selectionFile);
-
-    return { success: true, selectionPath: selectionFile };
-  } catch (error) {
-    console.error('[docs:save-selection] Error:', error);
-    return { success: false, error: error.message };
-  }
-});
-
-// Cleanup temp files after successful Gemini start
-ipcMain.handle('docs:cleanup-temp', async (event, { exportedPath, promptPath }) => {
-  const fs = require('fs');
-
-  try {
-    if (exportedPath && fs.existsSync(exportedPath)) {
-      fs.unlinkSync(exportedPath);
-      console.log('[docs:cleanup] Deleted:', exportedPath);
-    }
-    if (promptPath && fs.existsSync(promptPath)) {
-      fs.unlinkSync(promptPath);
-      console.log('[docs:cleanup] Deleted:', promptPath);
-    }
-    return { success: true };
-  } catch (error) {
-    console.error('[docs:cleanup] Error:', error);
     return { success: false, error: error.message };
   }
 });
