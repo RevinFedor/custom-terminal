@@ -5,6 +5,7 @@
   "main": "dist/main/main.js",
   "scripts": {
     "dev": "electron-vite dev",
+    "dev:d": "cd design-lab && npm run dev",
     "build:editor": "cd ../gt-editor/packages/markdown-editor && npm run build",
     "build": "npm run build:editor && electron-vite build && electron-builder",
     "build:install": "pkill -f 'Noted Terminal' || true && npm run build:editor && electron-vite build && electron-builder && rm -rf /Applications/Noted\\ Terminal.app && cp -R release/mac-arm64/Noted\\ Terminal.app /Applications/ && open /Applications/Noted\\ Terminal.app",
