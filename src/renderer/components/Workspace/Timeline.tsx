@@ -315,14 +315,20 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
       setHoveredIndex(null);
     }
 
+    // Direct DOM check: if we moved into the tooltip wrapper, definitely keep it open
+    if (tooltipRef.current && e.relatedTarget instanceof Node && tooltipRef.current.contains(e.relatedTarget)) {
+      return;
+    }
+
     // Get segment bounds to determine direction
     const segmentRect = (e.currentTarget as HTMLElement).getBoundingClientRect();
     const mouseX = e.clientX;
     const mouseY = e.clientY;
 
     // If mouse went LEFT (towards tooltip) - keep open only if within tooltip wrapper bounds
-    // If mouse went RIGHT (towards sidebar) - close
-    const wentLeft = mouseX < segmentRect.left;
+    // Relaxed check (+5px buffer) to catch edge cases where mouseX is slightly inside segment
+    // or exactly on the border.
+    const wentLeft = mouseX <= segmentRect.left + 5;
 
     if (wentLeft && !isExpanded) {
       // Check if mouse Y is within tooltip wrapper bounds — if not, cursor is in empty space
