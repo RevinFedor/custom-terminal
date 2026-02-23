@@ -997,7 +997,7 @@ function waitForRender(term, timeoutMs, logPrefix) {
     };
 
     const timer = setTimeout(() => {
-      console.log(logPrefix + ' Render timeout (' + timeoutMs + 'ms), buf=' + buf.length + 'B');
+      console.log(logPrefix + ' ⏱️ TIMEOUT (' + timeoutMs + 'ms), buf=' + buf.length + 'B');
       cleanup();
       resolve({ timedOut: true });
     }, timeoutMs);
@@ -1010,6 +1010,8 @@ function waitForRender(term, timeoutMs, logPrefix) {
         const isStale = elapsed < 15;
         if (isStale) {
           console.log(logPrefix + ' ⚠️ STALE sync marker at +' + elapsed + 'ms (data arrived before our write could be processed)');
+        } else {
+          console.log(logPrefix + ' ✅ sync marker at +' + elapsed + 'ms');
         }
         cleanup();
         resolve({ timedOut: false, elapsedMs: elapsed, isStale });
@@ -1042,13 +1044,16 @@ async function safePasteAndSubmit(term, content, options = {}) {
     chunks.push(content.substring(i, i + CHUNK_MAX));
   }
 
-  console.log(logPrefix + ' Start: ' + content.length + ' chars → ' + chunks.length + ' chunk(s), fast=' + fast);
+  const t0 = Date.now();
+  console.log(logPrefix + ' 🚀 Start: "' + content.substring(0, 40) + '" (' + content.length + ' chars → ' + chunks.length + ' chunk(s), fast=' + fast + ', ctrlCFirst=' + ctrlCFirst + ')');
 
   // Optional: Ctrl+C to clear input
   if (ctrlCFirst) {
+    console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] Sending Ctrl+C...');
     term.write('\x03');
     if (!fast) {
-      await waitForRender(term, 2000, logPrefix + ':ctrl-c');
+      const ctrlCResult = await waitForRender(term, 2000, logPrefix + ':ctrl-c');
+      console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] Ctrl+C render: timedOut=' + ctrlCResult.timedOut + ' stale=' + (ctrlCResult.isStale || false) + ' elapsed=' + (ctrlCResult.elapsedMs || 'n/a') + 'ms');
       await new Promise(r => setTimeout(r, 50));
     } else {
       // Tiny delay even in fast mode to let kernel process SIGINT
@@ -1093,7 +1098,8 @@ async function safePasteAndSubmit(term, content, options = {}) {
     term.write(payload);
 
     if (!fast && renderPromise) {
-      await renderPromise;
+      const chunkResult = await renderPromise;
+      console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] Chunk ' + (i + 1) + '/' + chunks.length + ' render: timedOut=' + chunkResult.timedOut + ' stale=' + (chunkResult.isStale || false) + ' elapsed=' + (chunkResult.elapsedMs || 'n/a') + 'ms');
     } else {
       // In fast mode, tiny tick every 10 chunks to prevent node-pty buffer flooding
       if (i % 10 === 0) await new Promise(r => setTimeout(r, 5));
@@ -1104,9 +1110,11 @@ async function safePasteAndSubmit(term, content, options = {}) {
 
   if (submit) {
     // Delay before Enter: CLI needs time to process PASTE_END before \r is recognized as submit
-    await new Promise(r => setTimeout(r, fast ? 500 : 100));
+    const enterDelay = fast ? 500 : 100;
+    console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] Waiting ' + enterDelay + 'ms before Enter...');
+    await new Promise(r => setTimeout(r, enterDelay));
     term.write('\r');
-    console.log(logPrefix + ' ✅ Sent Enter');
+    console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] ✅ Sent Enter (total: ' + (Date.now() - t0) + 'ms)');
   }
 
   return { success: true, chunksTotal: chunks.length, renderTimeMs: renderTimes };
@@ -1166,8 +1174,9 @@ ipcMain.handle('terminal:paste', async (event, { tabId, content, submit = true, 
 });
 // Send a slash command to Claude's Ink TUI (chunked paste + echo verification)
 ipcMain.on('claude:send-command', (event, tabId, command) => {
+  console.log('[send-command] 📩 Received: tabId=' + tabId + ' command="' + command + '" ts=' + Date.now());
   const term = terminals.get(tabId);
-  if (!term) return;
+  if (!term) { console.log('[send-command] ❌ Terminal not found for tabId=' + tabId); return; }
   (async () => {
     // If in danger zone ("Press Ctrl-C again to exit" is active):
     // Skip ctrlCFirst — input is already cleared by the first Ctrl+C.
@@ -1562,6 +1571,7 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
 ipcMain.on('terminal:resize', (event, tabId, cols, rows) => {
   const term = terminals.get(tabId);
   if (term) {
+    console.log('[terminal:resize] tabId=' + tabId + ' cols=' + cols + ' rows=' + rows + ' ts=' + Date.now());
     term.resize(cols, rows);
   }
 });
