@@ -680,11 +680,23 @@ function App() {
         console.log('[Hotkey] Cmd +', e.code, e.key, 'view:', view);
       }
 
-      // Cmd+\ or Cmd+B - Toggle file explorer (also close file preview if open)
-      // Check both code and key for compatibility with different keyboards
+      // Cmd+\ - Open VS Code in current terminal's CWD
       const isBackslash = e.code === 'Backslash' || e.key === '\\' || e.code === 'IntlBackslash';
+      if (e.metaKey && isBackslash) {
+        e.preventDefault();
+        const activeProject = getActiveProject();
+        const currentProject = projects[activeProjectId!];
+        const currentTab = activeProject?.activeTabId ? activeProject.tabs.get(activeProject.activeTabId) : null;
+        const cwd = currentTab?.cwd || currentProject?.path || process.env.HOME;
+        console.log('[Hotkey] Opening VS Code in:', cwd);
+        const { exec } = window.require('child_process');
+        exec('code .', { cwd });
+        return;
+      }
+
+      // Cmd+B - Toggle file explorer (also close file preview if open)
       const isCmdB = e.code === 'KeyB';
-      if (e.metaKey && (isBackslash || isCmdB)) {
+      if (e.metaKey && isCmdB) {
         console.log('[Hotkey] FileExplorer toggle triggered, view:', view);
         e.preventDefault();
         if (view === 'workspace' && activeProjectId) {

@@ -147,6 +147,12 @@ interface UIStore {
 
 
 
+  // History Panel
+  historyPanelOpen: boolean;
+  historyPanelWidth: number;
+  setHistoryPanelOpen: (open: boolean) => void;
+  setHistoryPanelWidth: (width: number) => void;
+
   // Notes Panel Width
 
   notesPanelWidth: number;
@@ -625,6 +631,21 @@ export const useUIStore = create<UIStore>((set, get) => ({
   removeToast: (id) => set((state) => ({
     toasts: state.toasts.filter((t) => t.id !== id)
   })),
+
+  // History Panel
+  historyPanelOpen: false,
+  historyPanelWidth: (() => {
+    try {
+      const saved = localStorage.getItem('noted-terminal-history-panel-width');
+      return saved ? Math.max(280, Math.min(700, parseInt(saved, 10))) : 420;
+    } catch { return 420; }
+  })(),
+  setHistoryPanelOpen: (open) => set({ historyPanelOpen: open }),
+  setHistoryPanelWidth: (width) => {
+    const clamped = Math.max(280, Math.min(700, width));
+    set({ historyPanelWidth: clamped });
+    localStorage.setItem('noted-terminal-history-panel-width', String(clamped));
+  },
 
   // Notes Panel Width
   notesPanelWidth: 300,

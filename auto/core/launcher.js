@@ -7,6 +7,7 @@
 
 const { _electron: electron } = require('playwright')
 const path = require('path')
+const http = require('http')
 
 const DEFAULT_OPTIONS = {
   timeout: 30000,
@@ -27,16 +28,28 @@ async function launch(options = {}) {
 
   console.log('[Launcher] Starting app from:', appPath)
 
+  // Проверка dev server
+  const serverOk = await new Promise((resolve) => {
+    http.get(opts.devServerUrl, () => resolve(true)).on('error', () => resolve(false))
+  })
+  if (!serverOk) {
+    throw new Error(`Dev server not running on ${opts.devServerUrl}. Start it with: npm run dev`)
+  }
+  console.log('[Launcher] Dev server OK')
+
   // Массив для сбора console логов
   const consoleLogs = []
   const mainProcessLogs = []
 
   // Запуск Electron
+  // Strip CLAUDECODE so nested terminals don't block claude from launching
+  const { CLAUDECODE, ...cleanEnv } = process.env
+
   const app = await electron.launch({
     args: [appPath],
     timeout: opts.timeout,
     env: {
-      ...process.env,
+      ...cleanEnv,
       NODE_ENV: 'development',
       VITE_DEV_SERVER_URL: opts.devServerUrl
     }
@@ -156,11 +169,45 @@ function findInLogs(logs, pattern) {
   return matches
 }
 
+/**
+ * Ждёт появления Claude Session ID в store (event-driven, не таймаут)
+ * @param {Page} page
+ * @param {number} timeout
+ */
+async function waitForClaudeSessionId(page, timeout = 30000) {
+  await page.waitForFunction(() => {
+    const store = window.useWorkspaceStore?.getState?.()
+    if (!store) return false
+    const proj = store.openProjects?.get?.(store.activeProjectId)
+    if (!proj) return false
+    const tab = proj.tabs?.get?.(proj.activeTabId)
+    return tab?.claudeSessionId?.length > 10
+  }, { timeout })
+}
+
+/**
+ * Ждёт появления Gemini Session ID в store (event-driven, не таймаут)
+ * @param {Page} page
+ * @param {number} timeout
+ */
+async function waitForGeminiSessionId(page, timeout = 30000) {
+  await page.waitForFunction(() => {
+    const store = window.useWorkspaceStore?.getState?.()
+    if (!store) return false
+    const proj = store.openProjects?.get?.(store.activeProjectId)
+    if (!proj) return false
+    const tab = proj.tabs?.get?.(proj.activeTabId)
+    return tab?.geminiSessionId?.length > 10
+  }, { timeout })
+}
+
 module.exports = {
   launch,
   waitForTerminal,
   typeCommand,
   waitForTimeline,
+  waitForClaudeSessionId,
+  waitForGeminiSessionId,
   findInLogs,
   DEFAULT_OPTIONS
 }

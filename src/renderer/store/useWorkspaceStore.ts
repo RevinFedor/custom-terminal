@@ -601,22 +601,30 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       isCollapsed: (options as any)?.isCollapsed
     };
 
-    console.log('[Store] createTab: Creating PTY terminal for:', tabId, 'cwd:', newTab.cwd);
-    // Only pass initialCommand for shell-command type, not for internal commands
-    const initialCommand = options?.pendingAction?.type === 'shell-command'
-      ? options.pendingAction.command
-      : undefined;
+    // Browser tabs: skip PTY creation — Terminal component creates it lazily
+    // when user first switches to terminal view. Avoids race condition where
+    // PTY data arrives before React registers IPC listener, and saves resources.
+    if (newTab.tabType === 'browser') {
+      console.log('[Store] createTab: Browser tab — skipping eager PTY creation for:', tabId);
+      newTab.pid = 0; // Sentinel: no PTY yet
+    } else {
+      console.log('[Store] createTab: Creating PTY terminal for:', tabId, 'cwd:', newTab.cwd);
+      // Only pass initialCommand for shell-command type, not for internal commands
+      const initialCommand = options?.pendingAction?.type === 'shell-command'
+        ? options.pendingAction.command
+        : undefined;
 
-    const { pid } = await ipcRenderer.invoke('terminal:create', {
-      tabId,
-      cwd: newTab.cwd,
-      rows: 24,
-      cols: 80,
-      initialCommand
-    });
+      const { pid } = await ipcRenderer.invoke('terminal:create', {
+        tabId,
+        cwd: newTab.cwd,
+        rows: 24,
+        cols: 80,
+        initialCommand
+      });
 
-    console.log('[Store] createTab: PTY created with pid:', pid);
-    newTab.pid = pid;
+      console.log('[Store] createTab: PTY created with pid:', pid);
+      newTab.pid = pid;
+    }
     workspace.tabs.set(tabId, newTab);
 
     // Don't switch activeTabId during session restore to avoid UI flickering
@@ -1179,14 +1187,19 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     for (const [projectId, workspace] of openProjects) {
       const tab = workspace.tabs.get(tabId);
       if (tab) {
+        // Skip if session ID unchanged (Bridge polls repeatedly with same ID)
+        if (tab.claudeSessionId === sessionId) return;
+
+        console.warn('[Store:setClaudeSessionId] ' + (tab.claudeSessionId || 'null') + ' -> ' + sessionId);
         tab.claudeSessionId = sessionId;
         // Reset overlay flags when new session starts (so overlay shows again if interrupted)
         tab.wasInterrupted = false;
         tab.overlayDismissed = false;
-        console.log(`[Workspace] Claude session set for tab ${tabId}: ${sessionId} (reset overlay flags)`);
         // Save to database so session persists across restarts
         saveTabs(workspace.projectId, workspace.tabs);
-        // NOTE: Not calling set() here to avoid re-render that breaks terminal
+        // Trigger Zustand re-render so Workspace/Timeline pick up the new sessionId.
+        // Guard above ensures this only fires on actual changes, not repeated Bridge polls.
+        set({});
         return;
       }
     }

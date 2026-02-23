@@ -222,9 +222,9 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
               url={tab.url || 'http://localhost:3000'}
               active={isActive}
               isActiveProject={isActiveProject}
-              terminalId={tab.terminalId}
+              terminalId={tab.terminalId || tab.id}
               terminalName={tab.terminalName}
-              activeView={tab.activeView || 'terminal'}
+              activeView={tab.activeView || 'browser'}
               cwd={tab.cwd}
             />
           );
