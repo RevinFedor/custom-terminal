@@ -76,6 +76,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
   const [rewindState, setRewindState] = useState<{ index: number; phase: 'compacting' | 'rewinding' | 'pasting' | 'done' } | null>(null);
 
   const notesPanelWidth = useUIStore(state => state.notesPanelWidth);
+  const setHistoryPanelOpen = useUIStore(state => state.setHistoryPanelOpen);
+  const setHistoryScrollToUuid = useUIStore(state => state.setHistoryScrollToUuid);
   const containerRef = useRef<HTMLDivElement>(null);
   const segmentRefs = useRef<(HTMLDivElement | null)[]>([]);
 
@@ -378,6 +380,10 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
     }
 
     if (entry.type === 'compact' || entry.type === 'continued') return;
+
+    // Open HistoryPanel and scroll to this entry
+    setHistoryPanelOpen(true);
+    setHistoryScrollToUuid(entry.uuid);
 
     // Instant visual feedback — loader appears immediately
     const index = entries.findIndex(e => e.uuid === entry.uuid);

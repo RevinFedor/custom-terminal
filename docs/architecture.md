@@ -33,8 +33,9 @@
 - **Large Input (Two-Tier Paste):** Обход macOS TTYHOG (1024 bytes) через атомарный чанкинг. См. `knowledge/fact-claude-tui-mechanics.md` и `knowledge/terminal-core.md`.
 
 ## 5. AI Session Recovery
-Система восстановления прерванных сессий при перезагрузке.
+Система восстановления прерванных сессий при перезагрузке и склеивания разорванных цепочек.
 - **Tab Metadata:** `wasInterrupted`, `claudeSessionId` сохраняются в SQLite.
+- **Session Linking:** Использование таблицы `session_links` для восстановления цепочек в Claude при Clear Context (Plan Mode), когда JSONL не содержит bridge-записей. См. `knowledge/fix-claude-plan-mode-chain.md`.
 - **Interrupted Overlay:** UI для предложения восстановления. См. `knowledge/ui-ux-stability.md`.
 
 ## 6. Debug Logger
