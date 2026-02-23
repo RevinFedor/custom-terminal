@@ -244,7 +244,37 @@ async function main() {
     // ═══════════════════════════════════════════════════════════
     console.log(`\n${c.bold}═══ TEST B: Click INSIDE terminal → Model Switch ═══${c.reset}`)
 
-    // Switch away to second tab, then back
+    // Test A killed Claude. Dismiss overlay + restart.
+    log.step('Dismiss overlay + restart Claude for Test B...')
+    await page.evaluate((tid) => {
+      const s = window.useWorkspaceStore?.getState?.()
+      if (s?.dismissInterruptedSession) s.dismissInterruptedSession(tid)
+      // Also manually clear flags
+      const proj = s?.openProjects?.get?.(s?.activeProjectId)
+      const tab = proj?.tabs?.get?.(tid)
+      if (tab) {
+        tab.wasInterrupted = false
+        tab.overlayDismissed = true
+        tab.commandType = undefined
+        tab.claudeSessionId = undefined
+      }
+    }, claudeTabId)
+    await page.waitForTimeout(500)
+
+    // Click terminal (overlay dismissed)
+    await clickInsideTerminal(page)
+    await page.waitForTimeout(300)
+
+    // Restart Claude
+    log.step('Restarting Claude...')
+    await typeCommand(page, 'claude')
+    try {
+      await waitForClaudeSessionId(page, 30000)
+      log.pass('Claude restarted for Test B')
+    } catch { log.warn('Session ID timeout on restart') }
+    await page.waitForTimeout(5000)
+
+    // Switch away, then back via tab click, then click inside terminal
     log.step('Switching away to second tab...')
     await switchToTabViaStore(page, secondTabId)
     await page.waitForTimeout(1000)
@@ -253,28 +283,11 @@ async function main() {
     await clickTabByName(page, 'claude')
     await page.waitForTimeout(1500)
 
-    // NOW click inside the terminal
+    // THIS TIME: click inside terminal first
     log.step('Клик ВНУТРИ терминала...')
     const logMarkB = mainProcessLogs.length
     await clickInsideTerminal(page)
     await page.waitForTimeout(500)
-
-    // Check Claude alive
-    const beforeB = await isClaudeAlive(page, claudeTabId)
-    log.info('Claude before B: ' + JSON.stringify(beforeB))
-
-    if (!beforeB.alive) {
-      log.fail('Claude died in Test A, cannot run Test B. Restarting Claude...')
-      // Restart Claude for Test B
-      await clickInsideTerminal(page)
-      await page.waitForTimeout(300)
-      await typeCommand(page, 'claude')
-      try {
-        await waitForClaudeSessionId(page, 30000)
-        log.pass('Claude restarted')
-      } catch { log.warn('Session ID timeout on restart') }
-      await page.waitForTimeout(5000)
-    }
 
     log.step('Model switch (opus) — AFTER clicking inside terminal...')
     await sendModelSwitch(page, claudeTabId, 'opus')
