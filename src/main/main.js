@@ -716,15 +716,6 @@ ipcMain.handle('claude:copy-range', async (event, { sessionId, cwd, startUuid, e
 // Create new terminal for a tab
 ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initialCommand }) => {
     console.time(`[PERF:main] terminal:create ${tabId}`);
-
-    // Idempotency: if PTY already exists for this tabId, return existing PID
-    if (terminals.has(tabId)) {
-      const existing = terminals.get(tabId);
-      console.log(`[terminal:create] PTY already exists for ${tabId}, pid=${existing.pid}`);
-      console.timeEnd(`[PERF:main] terminal:create ${tabId}`);
-      return { pid: existing.pid, cwd: cwd || process.env.HOME };
-    }
-
     const shell = process.env.SHELL || '/bin/bash';
     const shellName = path.basename(shell);
     const workingDir = cwd || process.env.HOME;
@@ -777,6 +768,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
       env: shellEnv
     });
     console.timeEnd(`[PERF:main] pty.spawn ${tabId}`);
+    console.log(`[PTY:CREATED] tabId=${tabId} pid=${ptyProcess.pid} cwd=${workingDir} shell=${shell} args=${JSON.stringify(shellArgs)}`);
 
     terminals.set(tabId, ptyProcess);
     terminalProjects.set(tabId, workingDir);
@@ -928,6 +920,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
     });
 
     ptyProcess.onExit((exitCode) => {
+      console.error(`[PTY:EXIT] tabId=${tabId} pid=${ptyProcess.pid} exitCode=${JSON.stringify(exitCode)} cwd=${workingDir} shell=${shell} args=${JSON.stringify(shellArgs)}`);
       if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.webContents.send('terminal:exit', tabId, exitCode);
       }

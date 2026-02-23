@@ -601,30 +601,22 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       isCollapsed: (options as any)?.isCollapsed
     };
 
-    // Browser tabs: skip PTY creation — Terminal component creates it lazily
-    // when user first switches to terminal view. Avoids race condition where
-    // PTY data arrives before React registers IPC listener, and saves resources.
-    if (newTab.tabType === 'browser') {
-      console.log('[Store] createTab: Browser tab — skipping eager PTY creation for:', tabId);
-      newTab.pid = 0; // Sentinel: no PTY yet
-    } else {
-      console.log('[Store] createTab: Creating PTY terminal for:', tabId, 'cwd:', newTab.cwd);
-      // Only pass initialCommand for shell-command type, not for internal commands
-      const initialCommand = options?.pendingAction?.type === 'shell-command'
-        ? options.pendingAction.command
-        : undefined;
+    console.log('[Store] createTab: Creating PTY terminal for:', tabId, 'cwd:', newTab.cwd);
+    // Only pass initialCommand for shell-command type, not for internal commands
+    const initialCommand = options?.pendingAction?.type === 'shell-command'
+      ? options.pendingAction.command
+      : undefined;
 
-      const { pid } = await ipcRenderer.invoke('terminal:create', {
-        tabId,
-        cwd: newTab.cwd,
-        rows: 24,
-        cols: 80,
-        initialCommand
-      });
+    const { pid } = await ipcRenderer.invoke('terminal:create', {
+      tabId,
+      cwd: newTab.cwd,
+      rows: 24,
+      cols: 80,
+      initialCommand
+    });
 
-      console.log('[Store] createTab: PTY created with pid:', pid);
-      newTab.pid = pid;
-    }
+    console.log('[Store] createTab: PTY created with pid:', pid);
+    newTab.pid = pid;
     workspace.tabs.set(tabId, newTab);
 
     // Don't switch activeTabId during session restore to avoid UI flickering
