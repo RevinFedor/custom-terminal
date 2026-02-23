@@ -54,6 +54,14 @@ await electron.paste(app)
 await electron.focusWindow(app)   // BrowserWindow.focus() + webContents.focus()
 ```
 
+### Webview Input Trap
+
+`webview` в Electron является отдельным `WebContents`. Он удерживает фокус ввода на уровне Chromium даже если скрыт через `visibility: hidden` или перекрыт другими элементами.
+
+**Проблема:** если тест пытается печатать в терминал браузерной вкладки, но `webview` активен, ввод может уходить в браузер, а не в терминал.
+
+**Решение:** в коде приложения реализован принудительный `webview.blur()` при переключении на терминал. В тестах необходимо дождаться смены `activeView` в store перед началом ввода.
+
 ## IPC: структура ответов
 
 IPC возвращает обёртку `{ success, content, error }`, не чистые данные:
