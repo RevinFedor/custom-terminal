@@ -213,16 +213,22 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth }: History
       if (result.success) {
         const newEntries = result.entries || [];
         const prevLen = entriesRef.current.length;
-        // Only update if count changed (incremental check)
-        if (!isRefresh || newEntries.length !== prevLen) {
+        const changed = !isRefresh || newEntries.length !== prevLen;
+
+        console.warn(`[HP] loadHistory isRefresh=${isRefresh} prev=${prevLen} new=${newEntries.length} changed=${changed} isInitial=${isInitialLoadRef.current} atBottom=${isAtBottomRef.current}`);
+
+        if (changed) {
           entriesRef.current = newEntries;
           setVersion((v) => v + 1);
 
-          // Auto-scroll to bottom ONLY on initial load OR when new entries arrive AND user is at bottom
           const hasNewEntries = newEntries.length > prevLen;
-          if (isInitialLoadRef.current || (hasNewEntries && isAtBottomRef.current)) {
+          const willScroll = isInitialLoadRef.current || (hasNewEntries && isAtBottomRef.current);
+          console.warn(`[HP] setVersion! hasNew=${hasNewEntries} willScroll=${willScroll}`);
+
+          if (willScroll) {
             isInitialLoadRef.current = false;
             setTimeout(() => {
+              console.warn(`[HP] >>> scrollToIndex(${newEntries.length - 1}) behavior=${isRefresh ? 'smooth' : 'auto'}`);
               virtuosoRef.current?.scrollToIndex({
                 index: newEntries.length - 1,
                 behavior: isRefresh ? 'smooth' : 'auto',
@@ -240,6 +246,7 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth }: History
 
   // Initial load
   useEffect(() => {
+    console.warn('[HP] === INITIAL LOAD === sessionId=', sessionId?.slice(0, 8));
     setLoading(true);
     entriesRef.current = [];
     isInitialLoadRef.current = true;
@@ -381,6 +388,9 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth }: History
             )}
             style={{ height: '100%' }}
             atBottomStateChange={(atBottom) => {
+              if (atBottom !== isAtBottomRef.current) {
+                console.warn(`[HP] atBottom changed: ${isAtBottomRef.current} → ${atBottom}`);
+              }
               isAtBottomRef.current = atBottom;
             }}
             atBottomThreshold={100}

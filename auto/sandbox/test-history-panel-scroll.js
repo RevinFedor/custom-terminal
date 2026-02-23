@@ -55,39 +55,59 @@ async function main() {
     await electron.focusWindow(app)
     await page.waitForTimeout(500)
 
-    // 2. Проверяем есть ли активная Claude сессия
-    log.step('Проверяем наличие Claude сессии...')
-    const sessionInfo = await page.evaluate(() => {
+    // 2. Подставляем claudeSessionId в активный таб текущего проекта
+    const TARGET_SESSION = 'fb6da3fa-da19-42b6-9a76-b9ede4116e90'
+    const TARGET_CWD = '/Users/fedor/Desktop/custom-terminal'
+
+    log.step('Подставляем Claude session в активный таб...')
+    const setupResult = await page.evaluate(({ sid, cwd }) => {
       const store = window.useWorkspaceStore?.getState?.()
       if (!store) return { error: 'no store' }
-      const proj = store.openProjects?.get?.(store.activeProjectId)
-      if (!proj) return { error: 'no project' }
-      const tab = proj.tabs?.get?.(proj.activeTabId)
-      return {
-        tabId: tab?.id,
-        claudeSessionId: tab?.claudeSessionId,
-        commandType: tab?.commandType,
-        cwd: tab?.cwd,
-      }
-    })
-    console.log('Session info:', JSON.stringify(sessionInfo, null, 2))
 
-    if (!sessionInfo.claudeSessionId) {
-      log.warn('Нет активной Claude сессии — запускаем claude...')
-      const { typeCommand } = require('../core/launcher')
-      await typeCommand(page, 'claude')
-      log.step('Ожидание Session ID...')
-      try {
-        await waitForClaudeSessionId(page, 30000)
-        log.pass('Session ID захвачен')
-      } catch (e) {
-        log.fail('Не удалось захватить Session ID — тест невозможен')
-        return
+      const projId = store.activeProjectId
+      const workspace = store.openProjects.get(projId)
+      if (!workspace) return { error: 'no workspace' }
+
+      const tab = workspace.tabs.get(workspace.activeTabId)
+      if (!tab) return { error: 'no active tab', tabCount: workspace.tabs.size }
+
+      // Мутируем таб + forceUpdate через set()
+      tab.claudeSessionId = sid
+      tab.commandType = 'claude'
+      tab.cwd = cwd
+
+      // Zustand: openProjects = new Map() чтобы сработал re-render
+      const updatedProjects = new Map(store.openProjects)
+      updatedProjects.set(projId, { ...workspace, tabs: new Map(workspace.tabs) })
+
+      // Внутренний set через прямой вызов (store exposed на window)
+      window.useWorkspaceStore.setState({
+        openProjects: updatedProjects,
+      })
+
+      // Убеждаемся что view = terminal
+      store.setProjectView?.(projId, 'terminal')
+
+      return {
+        projId,
+        tabId: tab.id,
+        claudeSessionId: tab.claudeSessionId,
+        cwd: tab.cwd,
+        commandType: tab.commandType,
+        currentView: workspace.currentView,
       }
-      await page.waitForTimeout(2000) // подождём чтобы Claude начал отвечать
-    } else {
-      log.pass(`Claude сессия есть: ${sessionInfo.claudeSessionId.slice(0, 8)}...`)
+    }, { sid: TARGET_SESSION, cwd: TARGET_CWD })
+
+    console.log('Setup result:', JSON.stringify(setupResult, null, 2))
+
+    if (setupResult.error) {
+      log.fail(`Setup failed: ${setupResult.error}`)
+      return
     }
+    log.pass(`Таб настроен: session=${TARGET_SESSION.slice(0,8)}...`)
+
+    // Даём UI обновиться
+    await page.waitForTimeout(1500)
 
     // 3. Инжектим диагностический monkey-patch ПЕРЕД открытием панели
     log.step('Инжектим scroll/render мониторинг...')
@@ -122,37 +142,52 @@ async function main() {
     // Ждём появления панели
     await page.waitForTimeout(500)
 
-    // Проверяем что панель появилась
-    const panelVisible = await page.evaluate(() => {
-      // Ищем History Panel по z-index 9000
-      const panels = document.querySelectorAll('div[style*="z-index: 9000"]')
-      return panels.length > 0
-    })
-
-    if (!panelVisible) {
-      // Может быть z-index без пробела
-      const panelVisible2 = await page.evaluate(() => {
-        const panels = document.querySelectorAll('div[style*="zIndex"]')
-        // Fallback: ищем по тексту "History"
-        const allDivs = document.querySelectorAll('div')
-        for (const div of allDivs) {
-          const span = div.querySelector('span')
-          if (span && span.textContent === 'History') return true
+    // Проверяем что панель появилась (React inline styles → style.zIndex, не атрибут)
+    const panelCheck = await page.evaluate(() => {
+      // React sets style as object → element.style.zIndex
+      const allDivs = document.querySelectorAll('div')
+      for (const div of allDivs) {
+        if (div.style.zIndex === '9000' || div.style.zIndex === 9000) {
+          return { found: true, method: 'zIndex' }
         }
-        return false
-      })
-      if (!panelVisible2) {
-        log.fail('History Panel НЕ появилась')
-        log.info('Проверяем UIStore...')
-        const uiState = await page.evaluate(() => {
-          const s = window.useUIStore?.getState?.()
-          return { historyPanelOpen: s?.historyPanelOpen, historyPanelWidth: s?.historyPanelWidth }
-        })
-        console.log('UIStore:', JSON.stringify(uiState))
-        return
       }
+      // Fallback: ищем span с текстом "History" внутри fixed div
+      for (const div of allDivs) {
+        if (div.style.position === 'fixed') {
+          const span = div.querySelector('span')
+          if (span && span.textContent === 'History') {
+            return { found: true, method: 'text-History' }
+          }
+        }
+      }
+      return { found: false }
+    })
+    console.log('Panel check:', JSON.stringify(panelCheck))
+
+    if (!panelCheck.found) {
+      log.fail('History Panel НЕ появилась')
+
+      // Детальная диагностика
+      const diagState = await page.evaluate(() => {
+        const ui = window.useUIStore?.getState?.()
+        const ws = window.useWorkspaceStore?.getState?.()
+        const proj = ws?.openProjects?.get?.(ws?.activeProjectId)
+        const tab = proj?.tabs?.get?.(proj?.activeTabId)
+        return {
+          historyPanelOpen: ui?.historyPanelOpen,
+          historyPanelWidth: ui?.historyPanelWidth,
+          currentView: proj?.currentView,
+          claudeSessionId: tab?.claudeSessionId,
+          commandType: tab?.commandType,
+          hasActiveTab: !!tab,
+          activeProjectId: ws?.activeProjectId,
+        }
+      })
+      console.log('Diagnostic state:', JSON.stringify(diagState, null, 2))
+      log.info('Render conditions: historyPanelOpen && claudeSessionId && activeTab && currentView===terminal')
+      return
     }
-    log.pass('History Panel открыта')
+    log.pass(`History Panel открыта (${panelCheck.method})`)
 
     // 5. Устанавливаем scroll listener на Virtuoso scroller
     log.step('Устанавливаем scroll listener...')
@@ -160,11 +195,11 @@ async function main() {
       // Virtuoso создаёт div с data-testid="virtuoso-scroller" или просто scrollable div
       // Ищем scrollable div внутри History Panel
       const findScrollContainer = () => {
-        // History Panel = div с position:fixed и zIndex:9000
+        // History Panel = div с position:fixed и zIndex 9000 (React inline style)
         const allFixed = document.querySelectorAll('div')
         for (const el of allFixed) {
           const style = el.style
-          if (style.position === 'fixed' && (style.zIndex === '9000' || style.zIndex === 9000)) {
+          if (style.position === 'fixed' && (String(style.zIndex) === '9000')) {
             // Внутри ищем virtuoso scroller
             const scroller = el.querySelector('[data-virtuoso-scroller="true"]') ||
                              el.querySelector('[data-testid="virtuoso-scroller"]')
@@ -348,12 +383,12 @@ async function main() {
     }
     await page.waitForTimeout(500)
 
-    const afterScrollUp = await page.evaluate(() => {
+    const afterScrollUp = await page.evaluate((prevCount) => {
       const d = window.__historyDiag
       const recent = d.scrolls.slice(-20)
       return {
         totalScrolls: d.scrolls.length,
-        newScrollEvents: d.scrolls.length - (arguments[0] || 0),
+        newScrollEvents: d.scrolls.length - prevCount,
         recentScrolls: recent.map(s => ({
           dir: s.direction,
           delta: s.delta,
@@ -361,7 +396,7 @@ async function main() {
         })),
         currentScrollTop: recent[recent.length - 1]?.scrollTop,
       }
-    })
+    }, beforeScrollUp)
     console.log('After scroll up:', JSON.stringify(afterScrollUp, null, 2))
 
     // 10. Ждём 4с — проверяем что refresh не сбросил позицию
