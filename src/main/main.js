@@ -89,10 +89,21 @@ function startSessionBridge() {
       }
 
       // Check for session change
-      if (bridgeKnownSessions.get(tabId) === data.session_id) return;
+      const oldSessionId = bridgeKnownSessions.get(tabId);
+      if (oldSessionId === data.session_id) return;
 
       bridgeKnownSessions.set(tabId, data.session_id);
       console.log('[Bridge] Tab', tabId, '-> session:', data.session_id.substring(0, 8) + '...', '(model:', data.model + ', ctx:', data.context_pct + '%)');
+
+      // Save session link for Clear Context chain resolution (old → new)
+      if (oldSessionId) {
+        console.log('[Bridge] Session transition:', oldSessionId.substring(0, 8) + '...', '→', data.session_id.substring(0, 8) + '...');
+        try {
+          projectManager.db.saveSessionLink(oldSessionId, data.session_id);
+        } catch (e) {
+          console.error('[Bridge] Failed to save session link:', e.message);
+        }
+      }
 
       if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.webContents.send('claude:session-detected', { tabId, sessionId: data.session_id });
@@ -686,7 +697,7 @@ ipcMain.handle('claude:copy-range', async (event, { sessionId, cwd, startUuid, e
         if (Array.isArray(content)) {
           for (const block of content) {
             if (block.type === 'text') output += `${block.text}\n`;
-            if (block.type === 'thinking') output += `> Thinking: ${block.thinking.slice(0, 200)}...\n`;
+            if (block.type === 'thinking') output += `<thinking>\n${block.thinking}\n</thinking>\n`;
             if (block.type === 'tool_use') {
               const name = block.name;
               const fPath = block.input?.file_path || block.input?.path;
@@ -2970,6 +2981,7 @@ function findSessionFile(sessionId, cwd) {
       }
     }
   }
+  console.log('[findSessionFile] NOT FOUND:', sessionId.substring(0, 8), 'cwd:', cwd || 'null');
   return null;
 }
 
@@ -3049,6 +3061,20 @@ function resolveSessionChain(sessionId, cwd, maxDepth = 10) {
       });
       currentSessionId = bridgeSessionId;
     } else {
+      // No JSONL bridge — check SQLite for session link (Clear Context without bridge entry)
+      try {
+        const parentId = projectManager.db.getSessionParent(currentSessionId);
+        if (parentId) {
+          console.log('[SessionChain] SQLite link:', currentSessionId.substring(0, 8) + '...', '→ parent:', parentId.substring(0, 8) + '...');
+          sessionBoundaries.push({
+            childSessionId: currentSessionId,
+            parentSessionId: parentId,
+          });
+          currentSessionId = parentId;
+          depth++;
+          continue;
+        }
+      } catch (e) {}
       break;
     }
 
@@ -3105,6 +3131,15 @@ function resolveLatestSessionInChain(sessionId, cwd) {
       // SessionChain child found silently
       currentId = childId;
     } else {
+      // No JSONL bridge child — check SQLite for session link (Clear Context without bridge entry)
+      try {
+        const sqliteChild = projectManager.db.getSessionChild(currentId);
+        if (sqliteChild && !visited.has(sqliteChild)) {
+          console.log('[SessionChain] SQLite forward link:', currentId.substring(0, 8) + '...', '→ child:', sqliteChild.substring(0, 8) + '...');
+          currentId = sqliteChild;
+          continue;
+        }
+      } catch (e) {}
       break; // No child found, currentId is the tip
     }
   }
@@ -3865,8 +3900,7 @@ ipcMain.handle('claude:export-clean-session', async (event, { sessionId, cwd, in
           const textParts = [];
           for (const block of msgContent) {
             if (block.type === 'thinking' && block.thinking) {
-              const thinking = block.thinking.length > 500 ? block.thinking.substring(0, 500) + '...[truncated]' : block.thinking;
-              textParts.push(`<thinking>\n${thinking}\n</thinking>`);
+              textParts.push(`<thinking>\n${block.thinking}\n</thinking>`);
             }
             if (block.type === 'text' && block.text) {
               textParts.push(block.text);
@@ -4137,9 +4171,7 @@ ipcMain.handle('claude:get-full-history', async (event, { sessionId, cwd }) => {
           const textParts = [];
           for (const block of msgContent) {
             if (block.type === 'thinking' && block.thinking) {
-              thinking = block.thinking.length > 500
-                ? block.thinking.substring(0, 500) + '...[truncated]'
-                : block.thinking;
+              thinking = block.thinking;
             }
             if (block.type === 'text' && block.text) {
               textParts.push(block.text);

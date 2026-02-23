@@ -14,6 +14,8 @@ interface BrowserTabProps {
   cwd: string;
 }
 
+const { ipcRenderer } = window.require('electron');
+
 function BrowserTab({ tabId, url, active, isActiveProject, terminalId, terminalName, activeView = 'browser', cwd }: BrowserTabProps) {
   const webviewRef = useRef<any>(null);
   const initialUrl = url || 'http://localhost:3000';
@@ -21,8 +23,30 @@ function BrowserTab({ tabId, url, active, isActiveProject, terminalId, terminalN
   const [isLoading, setIsLoading] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [isReady, setIsReady] = useState(false);
+  const [hasProcess, setHasProcess] = useState(false);
   const updateTabUrl = useWorkspaceStore((s) => s.updateTabUrl);
   const setBrowserActiveView = useWorkspaceStore((s) => s.setBrowserActiveView);
+
+  // Track running process in embedded terminal (same IPC as TabBar uses)
+  useEffect(() => {
+    const tid = terminalId || tabId;
+    const onStarted = (_: any, { tabId: startedTabId }: { tabId: string }) => {
+      if (startedTabId === tid) setHasProcess(true);
+    };
+    const onFinished = (_: any, { tabId: finishedTabId }: { tabId: string }) => {
+      if (finishedTabId === tid) setHasProcess(false);
+    };
+    ipcRenderer.on('terminal:command-started', onStarted);
+    ipcRenderer.on('terminal:command-finished', onFinished);
+    // Initial sync
+    ipcRenderer.invoke('terminal:getCommandState', tid).then((state: any) => {
+      if (state?.isRunning) setHasProcess(true);
+    }).catch(() => {});
+    return () => {
+      ipcRenderer.removeListener('terminal:command-started', onStarted);
+      ipcRenderer.removeListener('terminal:command-finished', onFinished);
+    };
+  }, [terminalId, tabId]);
 
   // Sync address bar when url prop changes (ignore about:blank)
   useEffect(() => {
@@ -96,9 +120,10 @@ function BrowserTab({ tabId, url, active, isActiveProject, terminalId, terminalN
     const webview = webviewRef.current;
     if (webview && isReady) {
       setLoadError(null);
+      setBrowserActiveView(tabId, 'browser');
       webview.reload();
     }
-  }, [isReady]);
+  }, [isReady, tabId, setBrowserActiveView]);
 
   const handleGoBack = useCallback(() => {
     const webview = webviewRef.current;
@@ -140,6 +165,18 @@ function BrowserTab({ tabId, url, active, isActiveProject, terminalId, terminalN
   const handleSwitchToBrowser = useCallback(() => {
     setBrowserActiveView(tabId, 'browser');
   }, [tabId, setBrowserActiveView]);
+
+  // Handle Cmd+click on URL in embedded terminal — open in webview instead of system browser
+  const handleTerminalLinkClick = useCallback((linkUrl: string) => {
+    setAddressValue(linkUrl);
+    updateTabUrl(tabId, linkUrl);
+    setLoadError(null);
+    setBrowserActiveView(tabId, 'browser');
+    const webview = webviewRef.current;
+    if (webview && isReady) {
+      webview.src = linkUrl;
+    }
+  }, [tabId, updateTabUrl, setBrowserActiveView, isReady]);
 
   return (
     <div
@@ -233,6 +270,19 @@ function BrowserTab({ tabId, url, active, isActiveProject, terminalId, terminalN
             }}
             title="Terminal view"
           >
+            {hasProcess && (
+              <span
+                style={{
+                  display: 'block',
+                  width: '6px',
+                  height: '6px',
+                  borderRadius: '50%',
+                  backgroundColor: '#4ade80',
+                  boxShadow: '0 0 4px rgba(74, 222, 128, 0.5)',
+                  flexShrink: 0,
+                }}
+              />
+            )}
             <TerminalSquare size={12} />
             <span>Term</span>
           </button>
@@ -299,6 +349,7 @@ function BrowserTab({ tabId, url, active, isActiveProject, terminalId, terminalN
               cwd={cwd}
               active={active && isTerminalView}
               isActiveProject={isActiveProject}
+              onLinkClick={handleTerminalLinkClick}
             />
           </div>
         )}

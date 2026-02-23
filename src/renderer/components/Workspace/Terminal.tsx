@@ -268,9 +268,10 @@ interface TerminalProps {
   cwd: string;
   active: boolean;
   isActiveProject?: boolean; // For lazy init optimization
+  onLinkClick?: (url: string) => void; // Override link handler (used by BrowserTab)
 }
 
-function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps) {
+function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: TerminalProps) {
   // Removed: excessive render log
 
   const terminalRef = useRef<HTMLDivElement>(null);
@@ -290,6 +291,8 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
   const [showScrollButton, setShowScrollButton] = useState(false); // Show "scroll to bottom" button
   const savedScrollPosition = useRef<number | null>(null); // Save scroll position when tab becomes inactive
   const wasAtBottom = useRef<boolean>(true); // Track if terminal was at bottom when deactivated
+  const onLinkClickRef = useRef(onLinkClick);
+  onLinkClickRef.current = onLinkClick;
   const claudeSessionDetected = useRef<string | null>(null); // Track detected Claude session UUID
   const pendingActionExecuted = useRef(false); // Track if pendingAction was executed
 
@@ -578,7 +581,13 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
       term.loadAddon(fitAddon);
       term.loadAddon(serializeAddon);
       term.loadAddon(searchAddon);
-      term.loadAddon(new WebLinksAddon(handleLinkActivation));
+      term.loadAddon(new WebLinksAddon((event, uri) => {
+        if (onLinkClickRef.current && event.metaKey && uri.match(/^https?:\/\//i)) {
+          onLinkClickRef.current(uri);
+        } else {
+          handleLinkActivation(event, uri);
+        }
+      }));
 
       term.open(containerRef);
 
@@ -1024,7 +1033,13 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
         term.loadAddon(fitAddon);
         term.loadAddon(serializeAddon);
         term.loadAddon(searchAddon);
-        term.loadAddon(new WebLinksAddon(handleLinkActivation));
+        term.loadAddon(new WebLinksAddon((event, uri) => {
+        if (onLinkClickRef.current && event.metaKey && uri.match(/^https?:\/\//i)) {
+          onLinkClickRef.current(uri);
+        } else {
+          handleLinkActivation(event, uri);
+        }
+      }));
 
         term.open(terminalRef.current);
 

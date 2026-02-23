@@ -8,7 +8,8 @@ auto/
 │   └── electron.md                # Electron-специфика: env, clipboard, IPC, build sync, logs
 ├── libraries/                     # Цели: специфика тестирования конкретных подсистем
 │   ├── xterm.md                   # xterm.js: селекторы, readiness, ввод, OSC 133
-│   └── zustand-store.md           # Zustand: чтение store, поля таба, event-driven polling
+│   ├── zustand-store.md           # Zustand: чтение store, поля таба, event-driven polling
+│   └── browser-tab.md             # BrowserTab: activeView, webview focus, URL sync
 ├── core/                          # Код: launcher, electron helpers
 │   ├── launcher.js                # Запуск Electron, env cleanup, log capture, wait-хелперы
 │   └── electron.js                # Хелперы: clipboard, focus, webContents, insertText

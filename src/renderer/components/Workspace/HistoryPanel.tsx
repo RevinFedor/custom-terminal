@@ -1,7 +1,6 @@
 import React, { useEffect, useState, useRef, useCallback, memo } from 'react';
 import { createPortal } from 'react-dom';
 import { X, ChevronDown, ChevronRight } from 'lucide-react';
-import { Virtuoso, VirtuosoHandle } from 'react-virtuoso';
 import { useUIStore } from '../../store/useUIStore';
 import MarkdownRenderer from '../Research/MarkdownRenderer';
 
@@ -66,13 +65,7 @@ const ThinkingBlock = memo(({ text }: { text: string }) => {
 const HistoryEntry = memo(({ entry }: { entry: FullHistoryEntry }) => {
   if (entry.role === 'compact') {
     return (
-      <div style={{
-        textAlign: 'center',
-        padding: '8px 0',
-        color: '#666',
-        fontSize: 11,
-        letterSpacing: 2,
-      }}>
+      <div style={{ textAlign: 'center', padding: '8px 0', color: '#666', fontSize: 11, letterSpacing: 2 }}>
         {'═══ COMPACTED ═══'}
       </div>
     );
@@ -80,13 +73,7 @@ const HistoryEntry = memo(({ entry }: { entry: FullHistoryEntry }) => {
 
   if (entry.role === 'fork') {
     return (
-      <div style={{
-        textAlign: 'center',
-        padding: '8px 0',
-        color: '#5b9cf5',
-        fontSize: 11,
-        letterSpacing: 1,
-      }}>
+      <div style={{ textAlign: 'center', padding: '8px 0', color: '#5b9cf5', fontSize: 11, letterSpacing: 1 }}>
         {'FORK'}
       </div>
     );
@@ -94,13 +81,7 @@ const HistoryEntry = memo(({ entry }: { entry: FullHistoryEntry }) => {
 
   if (entry.role === 'plan-mode') {
     return (
-      <div style={{
-        textAlign: 'center',
-        padding: '8px 0',
-        color: '#4ade80',
-        fontSize: 11,
-        letterSpacing: 1,
-      }}>
+      <div style={{ textAlign: 'center', padding: '8px 0', color: '#4ade80', fontSize: 11, letterSpacing: 1 }}>
         {'CLEAR CONTEXT'}
       </div>
     );
@@ -110,12 +91,8 @@ const HistoryEntry = memo(({ entry }: { entry: FullHistoryEntry }) => {
     return (
       <div style={{
         padding: '8px 12px',
-        margin: '4px 0',
-        backgroundColor: 'rgba(100, 100, 255, 0.06)',
-        borderRadius: 6,
-        fontSize: 12,
-        color: '#8888cc',
-        fontStyle: 'italic',
+        backgroundColor: 'rgba(100, 100, 255, 0.06)', borderRadius: 6,
+        fontSize: 12, color: '#8888cc', fontStyle: 'italic',
       }}>
         Session continued from previous conversation...
       </div>
@@ -126,9 +103,7 @@ const HistoryEntry = memo(({ entry }: { entry: FullHistoryEntry }) => {
     return (
       <div style={{
         padding: '8px 12px',
-        margin: '4px 0',
-        backgroundColor: 'rgba(255, 255, 255, 0.04)',
-        borderRadius: 6,
+        backgroundColor: 'rgba(255, 255, 255, 0.04)', borderRadius: 6,
         borderLeft: '3px solid rgba(255, 255, 255, 0.2)',
       }}>
         <div style={{ fontSize: 10, color: '#666', marginBottom: 4 }}>
@@ -148,10 +123,7 @@ const HistoryEntry = memo(({ entry }: { entry: FullHistoryEntry }) => {
 
   // Assistant
   return (
-    <div style={{
-      padding: '8px 12px',
-      margin: '4px 0',
-    }}>
+    <div style={{ padding: '8px 12px' }}>
       <div style={{ fontSize: 10, color: '#666', marginBottom: 4 }}>
         CLAUDE
         {entry.timestamp && (
@@ -175,12 +147,9 @@ const HistoryEntry = memo(({ entry }: { entry: FullHistoryEntry }) => {
             <span
               key={i}
               style={{
-                fontSize: 11,
-                color: '#999',
+                fontSize: 11, color: '#999',
                 backgroundColor: 'rgba(255,255,255,0.04)',
-                padding: '2px 6px',
-                borderRadius: 4,
-                wordBreak: 'break-all',
+                padding: '2px 6px', borderRadius: 4, wordBreak: 'break-all',
               }}
             >
               {action}
@@ -192,18 +161,30 @@ const HistoryEntry = memo(({ entry }: { entry: FullHistoryEntry }) => {
   );
 });
 
+// content-visibility style for off-screen rendering skip (browser-native virtualization)
+const entryWrapperStyle: React.CSSProperties = {
+  paddingTop: 4,
+  paddingBottom: 4,
+  contentVisibility: 'auto',
+  containIntrinsicSize: 'auto 100px',
+};
+
 function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth }: HistoryPanelProps) {
   const setHistoryPanelOpen = useUIStore((s) => s.setHistoryPanelOpen);
   const setHistoryPanelWidth = useUIStore((s) => s.setHistoryPanelWidth);
 
-  const entriesRef = useRef<FullHistoryEntry[]>([]);
-  const [version, setVersion] = useState(0);
+  const [entries, setEntries] = useState<FullHistoryEntry[]>([]);
   const [loading, setLoading] = useState(true);
-  const virtuosoRef = useRef<VirtuosoHandle>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
   const isResizing = useRef(false);
-  const prevSessionIdRef = useRef(sessionId);
   const isAtBottomRef = useRef(true);
-  const isInitialLoadRef = useRef(true);
+
+  // Scroll to bottom helper
+  const scrollToBottom = useCallback((smooth = false) => {
+    const el = scrollRef.current;
+    if (!el) return;
+    el.scrollTo({ top: el.scrollHeight, behavior: smooth ? 'smooth' : 'instant' as ScrollBehavior });
+  }, []);
 
   // Load full history
   const loadHistory = useCallback(async (isRefresh = false) => {
@@ -211,57 +192,56 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth }: History
     try {
       const result = await ipcRenderer.invoke('claude:get-full-history', { sessionId, cwd });
       if (result.success) {
-        const newEntries = result.entries || [];
-        const prevLen = entriesRef.current.length;
-        const changed = !isRefresh || newEntries.length !== prevLen;
+        const newEntries: FullHistoryEntry[] = result.entries || [];
 
-        console.warn(`[HP] loadHistory isRefresh=${isRefresh} prev=${prevLen} new=${newEntries.length} changed=${changed} isInitial=${isInitialLoadRef.current} atBottom=${isAtBottomRef.current}`);
-
-        if (changed) {
-          entriesRef.current = newEntries;
-          setVersion((v) => v + 1);
-
-          const hasNewEntries = newEntries.length > prevLen;
-          const willScroll = isInitialLoadRef.current || (hasNewEntries && isAtBottomRef.current);
-          console.warn(`[HP] setVersion! hasNew=${hasNewEntries} willScroll=${willScroll}`);
-
-          if (willScroll) {
-            isInitialLoadRef.current = false;
-            setTimeout(() => {
-              console.warn(`[HP] >>> scrollToIndex(${newEntries.length - 1}) behavior=${isRefresh ? 'smooth' : 'auto'}`);
-              virtuosoRef.current?.scrollToIndex({
-                index: newEntries.length - 1,
-                behavior: isRefresh ? 'smooth' : 'auto',
-              });
-            }, 50);
-          }
+        if (!isRefresh) {
+          console.warn(`[HP] initial load: ${newEntries.length} entries`);
+          setEntries(newEntries);
+          setLoading(false);
+          // Scroll to bottom after DOM renders
+          requestAnimationFrame(() => {
+            requestAnimationFrame(() => {
+              scrollToBottom();
+            });
+          });
+        } else {
+          // Refresh: only update if count changed
+          setEntries(prev => {
+            if (newEntries.length === prev.length) return prev;
+            console.warn(`[HP] refresh: ${prev.length} → ${newEntries.length}`);
+            if (isAtBottomRef.current && newEntries.length > prev.length) {
+              setTimeout(() => scrollToBottom(true), 100);
+            }
+            return newEntries;
+          });
         }
       }
     } catch (e) {
       console.warn('[HistoryPanel] Load error:', e);
-    } finally {
       if (!isRefresh) setLoading(false);
     }
-  }, [sessionId, cwd]);
+  }, [sessionId, cwd, scrollToBottom]);
 
-  // Initial load
+  // Initial load on mount / session change
   useEffect(() => {
-    console.warn('[HP] === INITIAL LOAD === sessionId=', sessionId?.slice(0, 8));
     setLoading(true);
-    entriesRef.current = [];
-    isInitialLoadRef.current = true;
-    setVersion((v) => v + 1);
+    setEntries([]);
     loadHistory(false);
-    prevSessionIdRef.current = sessionId;
   }, [sessionId]);
 
   // Incremental refresh every 3s
   useEffect(() => {
-    const interval = setInterval(() => {
-      loadHistory(true);
-    }, 3000);
+    const interval = setInterval(() => loadHistory(true), 3000);
     return () => clearInterval(interval);
   }, [loadHistory]);
+
+  // Native scroll handler — at-bottom detection
+  const handleScroll = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const distFromBottom = el.scrollHeight - (el.scrollTop + el.clientHeight);
+    isAtBottomRef.current = distFromBottom < 150;
+  }, []);
 
   // Resize handle
   const handleResizeMouseDown = useCallback((e: React.MouseEvent) => {
@@ -280,7 +260,6 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth }: History
         setHistoryPanelWidth(newWidth);
       }
     };
-
     const handleMouseUp = () => {
       if (isResizing.current) {
         isResizing.current = false;
@@ -288,7 +267,6 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth }: History
         document.body.style.userSelect = '';
       }
     };
-
     window.addEventListener('mousemove', handleMouseMove);
     window.addEventListener('mouseup', handleMouseUp);
     return () => {
@@ -297,12 +275,9 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth }: History
     };
   }, [notesPanelWidth, setHistoryPanelWidth]);
 
-  // Double-click resize handle to close
   const handleResizeDoubleClick = useCallback(() => {
     setHistoryPanelOpen(false);
   }, [setHistoryPanelOpen]);
-
-  const entries = entriesRef.current;
 
   const panel = (
     <div
@@ -324,14 +299,8 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth }: History
         onMouseDown={handleResizeMouseDown}
         onDoubleClick={handleResizeDoubleClick}
         style={{
-          position: 'absolute',
-          left: 0,
-          top: 0,
-          bottom: 0,
-          width: 4,
-          cursor: 'col-resize',
-          zIndex: 10,
-          backgroundColor: 'transparent',
+          position: 'absolute', left: 0, top: 0, bottom: 0, width: 4,
+          cursor: 'col-resize', zIndex: 10, backgroundColor: 'transparent',
         }}
         onMouseEnter={(e) => { (e.currentTarget as HTMLDivElement).style.backgroundColor = '#5b9cf5'; }}
         onMouseLeave={(e) => { (e.currentTarget as HTMLDivElement).style.backgroundColor = 'transparent'; }}
@@ -340,26 +309,16 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth }: History
       {/* Header */}
       <div
         style={{
-          height: 30,
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'space-between',
-          padding: '0 12px',
-          borderBottom: '1px solid #333',
-          flexShrink: 0,
+          height: 30, display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+          padding: '0 12px', borderBottom: '1px solid #333', flexShrink: 0,
         }}
       >
         <span style={{ fontSize: 12, color: '#999', fontWeight: 500 }}>History</span>
         <button
           onClick={() => setHistoryPanelOpen(false)}
           style={{
-            background: 'none',
-            border: 'none',
-            color: '#666',
-            cursor: 'pointer',
-            padding: 2,
-            display: 'flex',
-            alignItems: 'center',
+            background: 'none', border: 'none', color: '#666',
+            cursor: 'pointer', padding: 2, display: 'flex', alignItems: 'center',
           }}
           onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.color = '#fff'; }}
           onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.color = '#666'; }}
@@ -379,22 +338,17 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth }: History
             No history entries
           </div>
         ) : (
-          <Virtuoso
-            ref={virtuosoRef}
-            data={entries}
-            totalCount={entries.length}
-            itemContent={(index, entry) => (
-              <HistoryEntry entry={entry} />
-            )}
-            style={{ height: '100%' }}
-            atBottomStateChange={(atBottom) => {
-              if (atBottom !== isAtBottomRef.current) {
-                console.warn(`[HP] atBottom changed: ${isAtBottomRef.current} → ${atBottom}`);
-              }
-              isAtBottomRef.current = atBottom;
-            }}
-            atBottomThreshold={100}
-          />
+          <div
+            ref={scrollRef}
+            onScroll={handleScroll}
+            style={{ height: '100%', overflowY: 'auto' }}
+          >
+            {entries.map((entry) => (
+              <div key={entry.uuid} style={entryWrapperStyle}>
+                <HistoryEntry entry={entry} />
+              </div>
+            ))}
+          </div>
         )}
       </div>
     </div>

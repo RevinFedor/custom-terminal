@@ -1289,7 +1289,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   createBrowserTab: async (projectId) => {
     const { openProjects, createTab } = get();
     const workspace = openProjects.get(projectId);
-    const cwd = workspace?.projectPath || process.env.HOME || '~';
+    const projectPath = workspace?.projectPath;
+    const cwd = (projectPath && !projectPath.startsWith('__unset__')) ? projectPath : (process.env.HOME || '~');
     return createTab(projectId, 'Browser', cwd, { tabType: 'browser', url: 'http://localhost:3000' });
   },
 

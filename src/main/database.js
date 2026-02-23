@@ -281,6 +281,15 @@ class DatabaseManager {
     `);
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_favorites_project ON favorites(project_id)`);
 
+    // Session links table - tracks parent→child session transitions (Clear Context without JSONL bridge)
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS session_links (
+        parent_session_id TEXT NOT NULL,
+        child_session_id TEXT NOT NULL PRIMARY KEY,
+        created_at TEXT DEFAULT (datetime('now'))
+      )
+    `);
+
   }
 
   // ========== APP STATE ========== 
@@ -802,6 +811,25 @@ transaction(tabs);
       FROM fork_markers
       WHERE forked_to_session_id = ?
     `).get(sessionId) || null;
+  }
+
+  // ========== SESSION LINKS (Clear Context chain) ==========
+
+  saveSessionLink(parentId, childId) {
+    this.db.prepare(`
+      INSERT OR IGNORE INTO session_links (parent_session_id, child_session_id)
+      VALUES (?, ?)
+    `).run(parentId, childId);
+  }
+
+  getSessionParent(childId) {
+    const row = this.db.prepare('SELECT parent_session_id FROM session_links WHERE child_session_id = ?').get(childId);
+    return row ? row.parent_session_id : null;
+  }
+
+  getSessionChild(parentId) {
+    const row = this.db.prepare('SELECT child_session_id FROM session_links WHERE parent_session_id = ?').get(parentId);
+    return row ? row.child_session_id : null;
   }
 
   close() { this.db.close(); }
