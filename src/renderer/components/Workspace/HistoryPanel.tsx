@@ -266,6 +266,8 @@ const entryWrapperStyle: React.CSSProperties = {
 function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth }: HistoryPanelProps) {
   const setHistoryPanelOpen = useUIStore((s) => s.setHistoryPanelOpen);
   const setHistoryPanelWidth = useUIStore((s) => s.setHistoryPanelWidth);
+  const historyScrollToUuid = useUIStore((s) => s.historyScrollToUuid);
+  const setHistoryScrollToUuid = useUIStore((s) => s.setHistoryScrollToUuid);
 
   const [entries, setEntries] = useState<FullHistoryEntry[]>([]);
   const [loading, setLoading] = useState(true);
@@ -328,6 +330,18 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth }: History
     const interval = setInterval(() => loadHistory(true), 3000);
     return () => clearInterval(interval);
   }, [loadHistory]);
+
+  // Scroll to entry when Timeline click sets historyScrollToUuid
+  useEffect(() => {
+    if (!historyScrollToUuid || loading || entries.length === 0) return;
+    const el = scrollRef.current;
+    if (!el) return;
+    const target = el.querySelector(`[data-uuid="${historyScrollToUuid}"]`);
+    if (target) {
+      target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+    setHistoryScrollToUuid(null);
+  }, [historyScrollToUuid, loading, entries]);
 
   // Native scroll handler — at-bottom detection
   const handleScroll = useCallback(() => {
@@ -438,7 +452,7 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth }: History
             style={{ height: '100%', overflowY: 'auto' }}
           >
             {entries.map((entry) => (
-              <div key={entry.uuid} style={entryWrapperStyle}>
+              <div key={entry.uuid} data-uuid={entry.uuid} style={entryWrapperStyle}>
                 <HistoryEntry entry={entry} />
               </div>
             ))}
@@ -448,7 +462,23 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth }: History
     </div>
   );
 
-  return createPortal(panel, document.body);
+  return createPortal(
+    <>
+      {/* Backdrop overlay — covers terminal area, click to close */}
+      <div
+        onClick={() => setHistoryPanelOpen(false)}
+        style={{
+          position: 'fixed',
+          top: 30, left: 0, bottom: 0,
+          right: notesPanelWidth + width,
+          backgroundColor: 'rgba(0, 0, 0, 0.3)',
+          zIndex: 8999,
+        }}
+      />
+      {panel}
+    </>,
+    document.body,
+  );
 }
 
 export default memo(HistoryPanel);

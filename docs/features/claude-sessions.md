@@ -18,7 +18,7 @@
 - **Механизм:** После каждого ответа Claude вызывает наш скрипт-мост.
 - **Данные:** Скрипт записывает актуальный `session_id` и `ppid` (PID процесса Claude) в `~/.claude/bridge/`.
 - **Синхронизация:** Main процесс следит за папкой и мгновенно сопоставляет PID Клода с конкретной вкладкой терминала. Это гарантирует 100% точность даже при параллельной работе в одной папке.
-- **Plan Mode:** Позволяет автоматически обновлять ID в UI, когда пользователь делает Clear Context или переходит в Plan Mode внутри того же процесса.
+- **Plan Mode:** Позволяет автоматически обновлять ID в UI, когда пользователь делает Clear Context или переходит в Plan Mode внутри того же процесса. При сбросе контекста (Clear Context) система фиксирует связь между старым и новым ID в SQLite для бесшовного восстановления истории. См. `knowledge/fix-claude-plan-mode-chain.md`.
 
 ### 2. /status Interception (Отладка)
 Приложение перехватывает вывод команды `/status` напрямую из PTY-потока.
@@ -87,3 +87,4 @@ Thinking mode при запуске обеспечивается `alwaysThinking
 - **Main (Handshake):** `src/main/main.js` — стейт-машина `claudeState` в обработчике `terminal:create` data.
 - **State:** `useWorkspaceStore.ts` — хранение `pendingAction`, `wasInterrupted` и `claudeSessionId`.
 - **Optimization:** См. `knowledge/fix-ui-stability.md` для деталей нативной виртуализации.
+- **Session Linking:** См. `knowledge/fix-claude-plan-mode-chain.md` для деталей связывания сессий в Plan Mode.
