@@ -44,6 +44,7 @@
 - **Tailwind v4 + Vite:** Плагин `@tailwindcss/vite` для HMR и авто-сканирования. См. `knowledge/rendering-styles.md`.
 - **Dynamic Styles:** Для рантайм-цветов используются Inline Styles. См. `knowledge/fix-tailwind-dynamic-runtime.md`.
 - **Markdown Rendering:** Унифицированный просмотр через `@anthropic/markdown-editor`. См. `knowledge/file-preview-markdown.md`.
+- **Native Virtualization:** Для списков до 1000 элементов используется `content-visibility: auto` вместо тяжелых JS-библиотек. См. `knowledge/fix-ui-stability.md`.
 
 ## 8. State Management (Zustand)
 - **КРИТИЧЕСКОЕ ПРАВИЛО:** Любая мутация `tab.*` свойств в store **обязана** вызывать `set()`. Без `set()` Zustand не нотифицирует subscribers → компоненты показывают stale data. См. `knowledge/fix-zustand-silent-mutation.md`.

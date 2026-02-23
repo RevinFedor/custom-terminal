@@ -309,6 +309,7 @@ function parseOSC133AndEmit(tabId, data) {
 }
 
 function createWindow() {
+  console.log('Plan Mode test OK');
   console.log('[Window] Creating main window...');
 
   const windowOptions = {
@@ -635,6 +636,19 @@ ipcMain.handle('claude:copy-range', async (event, { sessionId, cwd, startUuid, e
               !seen.has(entry.parentUuid)) {
             nextUuid = entry.parentUuid;
             break;
+          }
+        }
+        if (!nextUuid && record.sessionId) {
+          const boundary = sessionBoundaries.find(b => b.childSessionId === record.sessionId);
+          if (boundary) {
+            let parentLast = null;
+            for (const [uuid, entry] of recordMap) {
+              if (seen.has(uuid)) continue;
+              if (entry._fromFile === boundary.parentSessionId) {
+                if (!parentLast || entry._fileIndex > parentLast._fileIndex) parentLast = entry;
+              }
+            }
+            if (parentLast) nextUuid = parentLast.uuid;
           }
         }
       }
@@ -2960,29 +2974,32 @@ ipcMain.handle('gemini:rollback', async (event, { sessionId, turnNumber, cwd, ta
 
 // Find a JSONL session file by ID, searching cwd-based path first, then all project dirs
 function findSessionFile(sessionId, cwd) {
-  const claudeProjectsDir = path.join(os.homedir(), '.claude', 'projects');
+  try {
+    const claudeProjectsDir = path.join(os.homedir(), '.claude', 'projects');
 
-  if (cwd) {
-    const projectSlug = cwd.replace(/\//g, '-');
-    const primaryPath = path.join(claudeProjectsDir, projectSlug, `${sessionId}.jsonl`);
-    if (fs.existsSync(primaryPath)) {
-      return { filePath: primaryPath, projectDir: path.join(claudeProjectsDir, projectSlug) };
-    }
-  }
-
-  if (fs.existsSync(claudeProjectsDir)) {
-    const projectDirs = fs.readdirSync(claudeProjectsDir, { withFileTypes: true })
-      .filter(dirent => dirent.isDirectory())
-      .map(dirent => dirent.name);
-    for (const dir of projectDirs) {
-      const checkPath = path.join(claudeProjectsDir, dir, `${sessionId}.jsonl`);
-      if (fs.existsSync(checkPath)) {
-        return { filePath: checkPath, projectDir: path.join(claudeProjectsDir, dir) };
+    if (cwd) {
+      const projectSlug = cwd.replace(/\//g, '-');
+      const primaryPath = path.join(claudeProjectsDir, projectSlug, `${sessionId}.jsonl`);
+      if (fs.existsSync(primaryPath)) {
+        return { filePath: primaryPath, projectDir: path.join(claudeProjectsDir, projectSlug) };
       }
     }
+
+    if (fs.existsSync(claudeProjectsDir)) {
+      const projectDirs = fs.readdirSync(claudeProjectsDir, { withFileTypes: true })
+        .filter(dirent => dirent.isDirectory())
+        .map(dirent => dirent.name);
+      for (const dir of projectDirs) {
+        const checkPath = path.join(claudeProjectsDir, dir, `${sessionId}.jsonl`);
+        if (fs.existsSync(checkPath)) {
+          return { filePath: checkPath, projectDir: path.join(claudeProjectsDir, dir) };
+        }
+      }
+    }
+    return null;
+  } catch (e) {
+    return null;
   }
-  console.log('[findSessionFile] NOT FOUND:', sessionId.substring(0, 8), 'cwd:', cwd || 'null');
-  return null;
 }
 
 // Load all records from a JSONL file into a Map (uuid → record)
@@ -3393,14 +3410,35 @@ ipcMain.handle('claude:get-timeline', async (event, { sessionId, cwd }) => {
       // Bridge entry has a DIFFERENT sessionId and its parentUuid points into the parent file.
       // We need to follow the bridge to continue backtrace into the parent chain.
       if (!nextUuid && sessionBoundaries.length > 0) {
-        // Find bridge entry: an entry in mergedMap with a different sessionId whose parentUuid
-        // points to a record in the parent file AND has not been visited yet
+        // Method 1: Find JSONL bridge entry (classic Clear Context with bridge)
         for (const [uuid, entry] of recordMap) {
           if (seen.has(uuid)) continue;
           if (entry._isBridge && entry.parentUuid && entry.sessionId !== record.sessionId &&
               !seen.has(entry.parentUuid)) {
             nextUuid = entry.parentUuid;
             break;
+          }
+        }
+
+        // Method 2: SQLite session link fallback (Clear Context without JSONL bridge)
+        // When no _isBridge entry exists, use sessionBoundaries to find the parent session's last record
+        if (!nextUuid && record.sessionId) {
+          const boundary = sessionBoundaries.find(b => b.childSessionId === record.sessionId);
+          if (boundary) {
+            // Find the last record (by _fileIndex) in the parent session
+            let parentLastRecord = null;
+            for (const [uuid, entry] of recordMap) {
+              if (seen.has(uuid)) continue;
+              if (entry._fromFile === boundary.parentSessionId) {
+                if (!parentLastRecord || entry._fileIndex > parentLastRecord._fileIndex) {
+                  parentLastRecord = entry;
+                }
+              }
+            }
+            if (parentLastRecord) {
+              nextUuid = parentLastRecord.uuid;
+              console.log('[Backtrace] SQLite bridge:', record.sessionId.substring(0, 8), '→ parent last record:', parentLastRecord.uuid.substring(0, 8));
+            }
           }
         }
       }
@@ -3608,6 +3646,19 @@ ipcMain.handle('claude:export-clean-session', async (event, { sessionId, cwd, in
             console.log('[Claude Export] Following bridge:', uuid.slice(0, 12), '\u2192 parent:', entry.parentUuid?.slice(0, 12));
             nextUuid = entry.parentUuid;
             break;
+          }
+        }
+        if (!nextUuid && record.sessionId) {
+          const boundary = sessionBoundaries.find(b => b.childSessionId === record.sessionId);
+          if (boundary) {
+            let parentLast = null;
+            for (const [uuid, entry] of recordMap) {
+              if (seen.has(uuid)) continue;
+              if (entry._fromFile === boundary.parentSessionId) {
+                if (!parentLast || entry._fileIndex > parentLast._fileIndex) parentLast = entry;
+              }
+            }
+            if (parentLast) nextUuid = parentLast.uuid;
           }
         }
       }
@@ -4036,17 +4087,43 @@ ipcMain.handle('claude:get-full-history', async (event, { sessionId, cwd }) => {
             break;
           }
         }
+        if (!nextUuid && record.sessionId) {
+          const boundary = sessionBoundaries.find(b => b.childSessionId === record.sessionId);
+          if (boundary) {
+            let parentLast = null;
+            for (const [uuid, entry] of recordMap) {
+              if (seen.has(uuid)) continue;
+              if (entry._fromFile === boundary.parentSessionId) {
+                if (!parentLast || entry._fileIndex > parentLast._fileIndex) parentLast = entry;
+              }
+            }
+            if (parentLast) nextUuid = parentLast.uuid;
+          }
+        }
       }
 
       currentUuid = nextUuid;
     }
 
     // Format tool action label (standalone, no includeCode dependency)
+    const mkFileAction = (toolName, input) => {
+      const base = { tool: toolName, filePath: input.file_path || '?' };
+      if (toolName === 'Edit') {
+        return { ...base, oldString: input.old_string || '', newString: input.new_string || '' };
+      }
+      if (toolName === 'Write') {
+        const content = input.content || '';
+        const lines = content.split('\n');
+        return { ...base, content: lines.length > 100
+          ? lines.slice(0, 100).join('\n') + '\n... (' + lines.length + ' lines total)'
+          : content };
+      }
+      return base;
+    };
+
     const fmtAction = (toolName, input) => {
       switch (toolName) {
-        case 'Read': return '\u{1F4C4} ' + (input.file_path || '?');
-        case 'Edit': return '\u{270F}\u{FE0F} ' + (input.file_path || '?');
-        case 'Write': return '\u{1F4DD} ' + (input.file_path || '?');
+        case 'Read': return { tool: 'Read', filePath: input.file_path || '?' };
         case 'Bash': {
           const cmd = (input.command || '').substring(0, 60);
           return '\u{1F5A5} ' + cmd + (input.command?.length > 60 ? '...' : '');
@@ -4177,7 +4254,13 @@ ipcMain.handle('claude:get-full-history', async (event, { sessionId, cwd }) => {
               textParts.push(block.text);
             }
             if (block.type === 'tool_use') {
-              actions.push(fmtAction(block.name, block.input || {}));
+              const name = block.name;
+              const input = block.input || {};
+              if (name === 'Edit' || name === 'Write') {
+                actions.push(mkFileAction(name, input));
+              } else {
+                actions.push(fmtAction(name, input));
+              }
             }
           }
           textContent = textParts.join('\n\n');
