@@ -28,6 +28,7 @@
     - **Claude StatusLine Bridge:** Захват Session ID через хук в Claude settings. См. `knowledge/fact-claude-tui-mechanics.md`.
     - **Claude Handshake:** Автоматическая отправка промпта при запуске (WAITING_PROMPT стейт).
     - **Claude TUI Control:** Программное управление Ink TUI через PTY. См. `knowledge/fact-claude-tui-mechanics.md` и `knowledge/fix-rewind-navigation.md`.
+    - **Claude Ctrl-C Protection:** Предотвращение случайного выхода при быстром переключении моделей. См. `knowledge/fix-claude-ctrlc-exit.md`.
     - **Timeline Engine:** Асинхронный парсинг JSONL с алгоритмом Backtrace. См. `knowledge/ai-automation.md`.
 - **Large Input (Two-Tier Paste):** Обход macOS TTYHOG (1024 bytes) через атомарный чанкинг. См. `knowledge/fact-claude-tui-mechanics.md` и `knowledge/terminal-core.md`.
 
@@ -44,6 +45,11 @@
 - **Dynamic Styles:** Для рантайм-цветов используются Inline Styles. См. `knowledge/fix-tailwind-dynamic-runtime.md`.
 - **Markdown Rendering:** Унифицированный просмотр через `@anthropic/markdown-editor`. См. `knowledge/file-preview-markdown.md`.
 
-## 8. UI Patterns
+## 8. State Management (Zustand)
+- **КРИТИЧЕСКОЕ ПРАВИЛО:** Любая мутация `tab.*` свойств в store **обязана** вызывать `set()`. Без `set()` Zustand не нотифицирует subscribers → компоненты показывают stale data. См. `knowledge/fix-zustand-silent-mutation.md`.
+- **Guard Pattern:** Если мутация вызывается часто (Bridge poll каждые 2с), добавлять `if (old === new) return` перед `set()` чтобы избежать лишних re-render.
+- **Polling Workaround (anti-pattern):** InfoPanel использует `setInterval(500ms)` + `getState()` для чтения session ID. Это обход проблемы silent mutation — новый код должен полагаться на `set()`, а не polling.
+
+## 9. UI Patterns
 - **Interactive Hover Zones:** Стратегия "Невидимого мостика". См. `knowledge/ui-ux-stability.md`.
 - **Context Modals:** Рендеринг внутри Workspace с `absolute positioning` (не Portals в body).

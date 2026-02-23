@@ -14,6 +14,7 @@ import FilePreview from './FilePreview';
 import Resizer from './Resizer';
 import ResearchSheet from '../Research/ResearchSheet';
 import NotesEditorModal from './NotesEditorModal';
+import HistoryPanel from './HistoryPanel';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -57,6 +58,8 @@ export default function Workspace() {
   const openNotesEditor = useUIStore((s) => s.openNotesEditor);
   const notesEditorOpen = useUIStore((s) => s.notesEditorOpen);
   const notesPanelWidth = useUIStore((s) => s.notesPanelWidth);
+  const historyPanelOpen = useUIStore((s) => s.historyPanelOpen);
+  const historyPanelWidth = useUIStore((s) => s.historyPanelWidth);
   const setProjectView = useWorkspaceStore((s) => s.setProjectView);
   const [showSearch, setShowSearch] = useState(false);
   const [searchText, setSearchText] = useState('');
@@ -415,6 +418,17 @@ export default function Workspace() {
 
       {/* Notes Editor Modal */}
       <NotesEditorModal />
+
+      {/* History Panel — Portal overlay, rendered when open and Claude session exists */}
+      {historyPanelOpen && claudeSessionId && activeTab && currentView === 'terminal' && (
+        <HistoryPanel
+          tabId={activeTab.id}
+          sessionId={claudeSessionId}
+          cwd={activeTab.cwd || currentProject.path}
+          width={historyPanelWidth}
+          notesPanelWidth={notesPanelWidth}
+        />
+      )}
 
     </div>
   );

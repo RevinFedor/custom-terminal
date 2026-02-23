@@ -50,6 +50,13 @@ Thinking mode при запуске обеспечивается `alwaysThinking
 - **Model:** Кнопки sonnet/opus/haiku в InfoPanel → `/model <alias>` через bracketed paste. Текущая модель из bridge-данных.
 - **Think:** Реактивный toggle через `meta+t` → парсинг TUI-пикера → auto-navigate → confirm. Обрабатывает второй диалог "Do you want to proceed?" автоматически.
 
+### Ctrl-C Danger Zone Protection
+Защита от случайного закрытия Claude при быстром переключении моделей.
+- **Problem:** Первое нажатие Ctrl+C переводит Claude в режим подтверждения выхода. Вторая команда от UI (которая шлёт Ctrl+C для очистки инпута) убивает сессию.
+- **Logic:** Система ловит маркер `again to exit` в PTY и блокирует выполнение новых команд до возврата промпта (с задержкой 3с).
+- **Feedback:** Статус блокировки транслируется в Renderer через IPC `claude:ctrlc-danger-zone`.
+- **Подробнее:** См. `knowledge/fix-claude-ctrlc-exit.md`.
+
 ## Behavior Specs
 - **Claude Process Monitor:** Виджет на Dashboard для отслеживания всех запущенных в системе процессов Claude CLI.
     - **In-App:** Процессы, запущенные из терминалов приложения. Отображаются с указанием "Имя Проекта / Имя Таба".

@@ -32,6 +32,7 @@ const terminalCommandState = new Map(); // tabId -> { isRunning: boolean, lastEx
 const claudeState = new Map(); // tabId -> state string | null
 const claudePendingPrompt = new Map(); // tabId -> prompt string
 const claudeDebounceTimers = new Map(); // tabId -> debounce timer ID
+const claudeCtrlCDangerZone = new Map(); // tabId -> { resolve, promise, timer } (event-driven clear on prompt return)
 let sessionManager; // Initialized after projectManager is ready
 let claudeManager; // Initialized with terminals map
 
@@ -313,6 +314,7 @@ function createWindow() {
     webPreferences: {
       nodeIntegration: true,
       contextIsolation: false,
+      webviewTag: true,
     },
   };
 
@@ -714,6 +716,15 @@ ipcMain.handle('claude:copy-range', async (event, { sessionId, cwd, startUuid, e
 // Create new terminal for a tab
 ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initialCommand }) => {
     console.time(`[PERF:main] terminal:create ${tabId}`);
+
+    // Idempotency: if PTY already exists for this tabId, return existing PID
+    if (terminals.has(tabId)) {
+      const existing = terminals.get(tabId);
+      console.log(`[terminal:create] PTY already exists for ${tabId}, pid=${existing.pid}`);
+      console.timeEnd(`[PERF:main] terminal:create ${tabId}`);
+      return { pid: existing.pid, cwd: cwd || process.env.HOME };
+    }
+
     const shell = process.env.SHELL || '/bin/bash';
     const shellName = path.basename(shell);
     const workingDir = cwd || process.env.HOME;
@@ -849,6 +860,64 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
         const m = sc.match(/Session\s*ID[:\s]*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
         if (m && bridgeKnownSessions.has(tabId) && mainWindow && !mainWindow.isDestroyed()) {
           mainWindow.webContents.send('claude:status-session-detected', { tabId, sessionId: m[1] });
+        }
+      }
+
+      // ========== CTRL-C DANGER ZONE DETECTION ==========
+      // Claude shows "Press Ctrl-C again to exit" after first Ctrl+C.
+      // If we send another Ctrl+C (e.g. from send-command ctrlCFirst), Claude exits.
+      // Hybrid: ON when marker detected, OFF when prompt returns AFTER minimum hold (3s).
+      // Why min hold: Claude's Ink TUI re-renders full screen immediately after Ctrl+C,
+      // and that re-render includes ⏵ prompt char. Without min hold, DZ would be set ON
+      // and cleared OFF within milliseconds — but Claude's warning lasts ~3-4 seconds.
+      {
+        const sc = stripVTControlCharacters(data);
+
+        // ENTER danger zone: detected "Press Ctrl-C again to exit" in PTY output
+        // Claude Ink TUI uses cursor motion codes — after stripping, text can be:
+        //   "PresCtrl-C again to exit" (from ctrlCFirst \x03)
+        //   "Press Ctrl-Cagain to exit" (from user keyboard \x03)
+        // Match "again to exit" which is stable across all variants.
+        if (sc.includes('again to exit')) {
+          // Clean up previous if any
+          const prev = claudeCtrlCDangerZone.get(tabId);
+          if (prev) clearTimeout(prev.timer);
+
+          let resolve;
+          const promise = new Promise(r => { resolve = r; });
+          const timer = setTimeout(() => {
+            // Safety fallback: clear after Claude's warning expires (~4s)
+            if (claudeCtrlCDangerZone.has(tabId)) {
+              claudeCtrlCDangerZone.delete(tabId);
+              resolve();
+              console.log('[CtrlC-DangerZone] Tab ' + tabId + ': CLEARED (TTL expired)');
+              if (mainWindow && !mainWindow.isDestroyed()) {
+                mainWindow.webContents.send('claude:ctrlc-danger-zone', { tabId, active: false });
+              }
+            }
+          }, 4000);
+          claudeCtrlCDangerZone.set(tabId, { resolve, promise, timer, setAt: Date.now() });
+          console.log('[CtrlC-DangerZone] Tab ' + tabId + ': ON — detected "Press Ctrl-C again to exit"');
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send('claude:ctrlc-danger-zone', { tabId, active: true });
+          }
+        } else {
+          // EXIT danger zone: prompt returned (⏵ or >) while danger zone is active
+          // CRITICAL: must be `else` — same PTY chunk can contain both marker and ⏵.
+          // CRITICAL: minimum hold 3s — Claude re-renders ⏵ immediately after Ctrl-C
+          // but warning lasts ~3-4 seconds. Only accept ⏵ after min hold.
+          const dz = claudeCtrlCDangerZone.get(tabId);
+          if (dz && (Date.now() - dz.setAt >= 3000) &&
+              (sc.includes('\u23F5') || sc.includes('\u2335') || sc.includes('\u2570'))) {
+            // ⏵ (U+23F5) = Claude prompt, ⌵ (U+2335) = alt prompt, ╰ (U+2570) = input box bottom
+            clearTimeout(dz.timer);
+            claudeCtrlCDangerZone.delete(tabId);
+            dz.resolve();
+            console.log('[CtrlC-DangerZone] Tab ' + tabId + ': OFF — prompt returned after hold (event-driven)');
+            if (mainWindow && !mainWindow.isDestroyed()) {
+              mainWindow.webContents.send('claude:ctrlc-danger-zone', { tabId, active: false });
+            }
+          }
         }
       }
 
@@ -1082,11 +1151,31 @@ ipcMain.on('claude:send-command', (event, tabId, command) => {
   const term = terminals.get(tabId);
   if (!term) return;
   (async () => {
-    await safePasteAndSubmit(term, command, {
-      submit: true,
-      ctrlCFirst: true,
-      logPrefix: '[send-command:' + tabId + ']'
-    });
+    // If in danger zone ("Press Ctrl-C again to exit" is active):
+    // Skip ctrlCFirst — input is already cleared by the first Ctrl+C.
+    // Sending another \x03 would EXIT Claude.
+    const dz = claudeCtrlCDangerZone.get(tabId);
+    if (dz) {
+      console.log('[send-command] Tab ' + tabId + ': ⚠️ Danger zone — skipping ctrlCFirst, sending command directly');
+      // Clear DZ since we're about to send a command (which cancels the warning)
+      clearTimeout(dz.timer);
+      claudeCtrlCDangerZone.delete(tabId);
+      dz.resolve();
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('claude:ctrlc-danger-zone', { tabId, active: false });
+      }
+      await safePasteAndSubmit(term, command, {
+        submit: true,
+        ctrlCFirst: false,
+        logPrefix: '[send-command:' + tabId + ']'
+      });
+    } else {
+      await safePasteAndSubmit(term, command, {
+        submit: true,
+        ctrlCFirst: true,
+        logPrefix: '[send-command:' + tabId + ']'
+      });
+    }
   })();
 });
 
@@ -1094,6 +1183,14 @@ ipcMain.on('claude:send-command', (event, tabId, command) => {
 ipcMain.handle('claude:toggle-thinking', async (event, tabId) => {
   const term = terminals.get(tabId);
   if (!term) return { success: false, error: 'no terminal' };
+
+  // Wait for danger zone to clear (event-driven: resolves when prompt returns)
+  const dz = claudeCtrlCDangerZone.get(tabId);
+  if (dz) {
+    console.log('[Think] ⚠️ Danger zone active — waiting for prompt...');
+    await dz.promise;
+    console.log('[Think] ✅ Prompt returned, proceeding');
+  }
 
   const stripped = require('node:util').stripVTControlCharacters;
 
@@ -3844,6 +3941,261 @@ ipcMain.handle('claude:export-clean-session', async (event, { sessionId, cwd, in
   } catch (error) {
     console.error('[Claude Export] Error:', error);
     console.error('[Claude Export] Stack:', error.stack);
+    return { success: false, error: error.message };
+  }
+});
+
+// Get full chat history for History Panel (structured entries, not markdown)
+ipcMain.handle('claude:get-full-history', async (event, { sessionId, cwd }) => {
+  if (!sessionId) {
+    return { success: false, error: 'No session ID provided' };
+  }
+
+  try {
+    const { mergedMap: recordMap, lastRecord, sessionBoundaries } = resolveSessionChain(sessionId, cwd);
+
+    if (!lastRecord) {
+      return { success: true, entries: [], latestSessionId: sessionId };
+    }
+
+    // BACKTRACE: Walk backwards from the last record following parentUuid
+    const activeBranch = [];
+    let currentUuid = lastRecord.uuid;
+    const seen = new Set();
+
+    while (currentUuid && !seen.has(currentUuid)) {
+      seen.add(currentUuid);
+      const record = recordMap.get(currentUuid);
+      if (!record) {
+        let recovered = false;
+        if (activeBranch.length > 0) {
+          const lastAdded = activeBranch[0];
+          if (lastAdded.type === 'system' && lastAdded.subtype === 'compact_boundary' &&
+              lastAdded.logicalParentUuid === currentUuid) {
+            if (lastAdded.parentUuid && recordMap.has(lastAdded.parentUuid) && !seen.has(lastAdded.parentUuid)) {
+              currentUuid = lastAdded.parentUuid;
+              recovered = true;
+            } else {
+              let bestPred = null;
+              for (const [uuid, entry] of recordMap) {
+                if (seen.has(uuid)) continue;
+                if (entry._fromFile === lastAdded._fromFile &&
+                    entry._fileIndex < lastAdded._fileIndex) {
+                  if (!bestPred || entry._fileIndex > bestPred._fileIndex) {
+                    bestPred = entry;
+                  }
+                }
+              }
+              if (bestPred) {
+                currentUuid = bestPred.uuid;
+                recovered = true;
+              }
+            }
+          }
+        }
+        if (recovered) continue;
+        break;
+      }
+
+      activeBranch.unshift(record);
+
+      let nextUuid = record.logicalParentUuid || record.parentUuid;
+      if (!nextUuid && sessionBoundaries.length > 0) {
+        for (const [uuid, entry] of recordMap) {
+          if (seen.has(uuid)) continue;
+          if (entry._isBridge && entry.parentUuid && entry.sessionId !== record.sessionId &&
+              !seen.has(entry.parentUuid)) {
+            nextUuid = entry.parentUuid;
+            break;
+          }
+        }
+      }
+
+      currentUuid = nextUuid;
+    }
+
+    // Format tool action label (standalone, no includeCode dependency)
+    const fmtAction = (toolName, input) => {
+      switch (toolName) {
+        case 'Read': return '\u{1F4C4} ' + (input.file_path || '?');
+        case 'Edit': return '\u{270F}\u{FE0F} ' + (input.file_path || '?');
+        case 'Write': return '\u{1F4DD} ' + (input.file_path || '?');
+        case 'Bash': {
+          const cmd = (input.command || '').substring(0, 60);
+          return '\u{1F5A5} ' + cmd + (input.command?.length > 60 ? '...' : '');
+        }
+        case 'Glob': return '\u{1F50D} glob ' + (input.pattern || '?');
+        case 'Grep': return '\u{1F50D} grep ' + (input.pattern || '?');
+        case 'Task': return '\u{1F9F5} Task agent';
+        case 'WebSearch': return '\u{1F310} WebSearch';
+        case 'WebFetch': return '\u{1F310} WebFetch';
+        default: return '\u{2699}\u{FE0F} ' + toolName;
+      }
+    };
+
+    // Fork markers
+    const forkBoundaryUuids = new Set();
+    let hasForkAtBeginning = false;
+    try {
+      const forkMarkers = projectManager.db.getForkMarkers(sessionId);
+      for (const marker of forkMarkers) {
+        const snapshotSet = new Set(marker.entry_uuids || []);
+        if (snapshotSet.size === 0) {
+          hasForkAtBeginning = true;
+          continue;
+        }
+        const isTimelineEntry = (rec) => {
+          if (rec.type === 'system' && rec.subtype === 'compact_boundary') return true;
+          if (rec.type !== 'user') return false;
+          if (rec.isSidechain || rec.isMeta) return false;
+          const content = rec.message?.content;
+          if (Array.isArray(content) && content.some(item => item.type === 'tool_result')) return false;
+          return true;
+        };
+        for (let idx = 0; idx < activeBranch.length; idx++) {
+          const rec = activeBranch[idx];
+          if (!snapshotSet.has(rec.uuid)) continue;
+          let nextTE = null;
+          for (let j = idx + 1; j < activeBranch.length; j++) {
+            if (isTimelineEntry(activeBranch[j])) { nextTE = activeBranch[j]; break; }
+          }
+          if (!nextTE || !snapshotSet.has(nextTE.uuid)) {
+            forkBoundaryUuids.add(rec.uuid);
+          }
+        }
+      }
+    } catch (e) {
+      // Fork markers not available — that's OK
+    }
+
+    // Build structured entries
+    const entries = [];
+    let prevSessionId = null;
+
+    if (hasForkAtBeginning) {
+      entries.push({ uuid: 'fork-begin', role: 'fork', timestamp: '', content: 'FORK', sessionId: '' });
+    }
+
+    for (let i = 0; i < activeBranch.length; i++) {
+      const entry = activeBranch[i];
+      if (entry.isSidechain || entry.type === 'summary') continue;
+
+      // Plan mode / clear context boundary detection
+      const entrySid = entry.sessionId || entry._fromFile;
+      if (prevSessionId && entrySid !== prevSessionId) {
+        // Check if bridge-based transition (clear context) or fork
+        let hasBridge = false;
+        for (const [, rec] of recordMap) {
+          if (rec._isBridge && rec.sessionId === prevSessionId) { hasBridge = true; break; }
+        }
+        entries.push({
+          uuid: 'boundary-' + entry.uuid,
+          role: hasBridge ? 'plan-mode' : 'fork',
+          timestamp: entry.timestamp || '',
+          content: hasBridge ? 'CLEAR CONTEXT' : 'FORK',
+          sessionId: entrySid
+        });
+      }
+      prevSessionId = entrySid;
+
+      if (entry.type === 'user') {
+        let rawContent = entry.message?.content;
+        if (Array.isArray(rawContent) && rawContent.some(item => item.type === 'tool_result')) continue;
+        if (typeof rawContent !== 'string') {
+          if (Array.isArray(rawContent)) {
+            rawContent = rawContent.find(item => item.type === 'text')?.text || null;
+          } else {
+            rawContent = null;
+          }
+        }
+        if (!rawContent) continue;
+        if (rawContent.startsWith('[Request interrupted') || rawContent === '[User cancelled]') continue;
+        if (rawContent.includes('<command-name>') || rawContent.includes('<local-command-stdout>')) continue;
+        if (rawContent.includes('<bash-notification>') || rawContent.includes('<shell-id>')) continue;
+        if (rawContent.includes('<user-prompt-submit-hook>') || rawContent.includes('<task-notification>')) continue;
+        if (rawContent.startsWith('Caveat: The messages below')) continue;
+        if (entry.isMeta) continue;
+
+        let cleanContent = rawContent
+          .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '')
+          .replace(/\[200~/g, '').replace(/~\]/g, '').trim();
+        if (!cleanContent) continue;
+
+        const isContinued = cleanContent.startsWith('This session is being continued from a previous conversation');
+
+        entries.push({
+          uuid: entry.uuid,
+          role: isContinued ? 'continued' : 'user',
+          timestamp: entry.timestamp || '',
+          content: cleanContent,
+          sessionId: entrySid
+        });
+      } else if (entry.type === 'assistant') {
+        const msgContent = entry.message?.content;
+        if (!msgContent) continue;
+
+        let textContent = '';
+        let thinking = '';
+        const actions = [];
+
+        if (typeof msgContent === 'string') {
+          textContent = msgContent;
+        } else if (Array.isArray(msgContent)) {
+          const textParts = [];
+          for (const block of msgContent) {
+            if (block.type === 'thinking' && block.thinking) {
+              thinking = block.thinking.length > 500
+                ? block.thinking.substring(0, 500) + '...[truncated]'
+                : block.thinking;
+            }
+            if (block.type === 'text' && block.text) {
+              textParts.push(block.text);
+            }
+            if (block.type === 'tool_use') {
+              actions.push(fmtAction(block.name, block.input || {}));
+            }
+          }
+          textContent = textParts.join('\n\n');
+        }
+
+        if (textContent.trim() || actions.length > 0) {
+          entries.push({
+            uuid: entry.uuid,
+            role: 'assistant',
+            timestamp: entry.timestamp || '',
+            content: textContent.trim(),
+            thinking: thinking || undefined,
+            actions: actions.length > 0 ? actions : undefined,
+            sessionId: entrySid
+          });
+        }
+      } else if (entry.type === 'system' && entry.subtype === 'compact_boundary') {
+        entries.push({
+          uuid: entry.uuid,
+          role: 'compact',
+          timestamp: entry.timestamp || '',
+          content: 'COMPACTED',
+          sessionId: entrySid
+        });
+      }
+
+      // Fork boundary after entry
+      if (forkBoundaryUuids.has(entry.uuid)) {
+        entries.push({
+          uuid: 'fork-after-' + entry.uuid,
+          role: 'fork',
+          timestamp: '',
+          content: 'FORK',
+          sessionId: entrySid
+        });
+      }
+    }
+
+    const latestSessionId = resolveLatestSessionInChain(sessionId, cwd);
+
+    return { success: true, entries, latestSessionId };
+  } catch (error) {
+    console.error('[Claude FullHistory] Error:', error);
     return { success: false, error: error.message };
   }
 });

@@ -985,6 +985,15 @@ function Terminal({ tabId, cwd, active, isActiveProject = true }: TerminalProps)
 
         if (!isMounted.current || !terminalRef.current) return;
 
+        // Ensure PTY exists — browser tabs skip eager PTY creation in createTab
+        // terminal:create is idempotent (returns existing PID if already exists)
+        try {
+          const { pid } = await ipcRenderer.invoke('terminal:create', { tabId, cwd, rows: 24, cols: 80 });
+          console.warn(`[Terminal:LAZY_INIT] tabId=${tabId} — ensured PTY exists, pid=${pid}`);
+        } catch (e) {
+          console.error(`[Terminal:LAZY_INIT] tabId=${tabId} — failed to create PTY:`, e);
+        }
+
         const currentFontSize = useUIStore.getState().terminalFontSize;
         const term = new XTerminal({
           theme: {

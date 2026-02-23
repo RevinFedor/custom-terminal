@@ -25,7 +25,8 @@ let lastActiveTab: SettingsTab = 'shortcuts';
 // Shortcuts data
 const SHORTCUTS = [
   { keys: '⌘ + T', description: 'Новый таб' },
-  { keys: '⌘ + \\', description: 'Показать/скрыть боковую панель' },
+  { keys: '⌘ + \\', description: 'Открыть VS Code в текущей директории' },
+  { keys: '⌘ + B', description: 'Показать/скрыть боковую панель' },
   { keys: '⌘ + ,', description: 'Открыть настройки' },
   { keys: '⌘ + E', description: 'Редактор заметок проекта' },
   { keys: '⌘ + S', description: 'Сохранить заметки (в редакторе)' },

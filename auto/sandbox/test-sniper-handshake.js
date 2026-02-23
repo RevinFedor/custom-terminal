@@ -10,7 +10,7 @@
  * Запуск: ./run.sh sandbox/test-sniper-handshake.js
  */
 
-const { launch, waitForTerminal, typeCommand, findInLogs } = require('../core/launcher')
+const { launch, waitForTerminal, typeCommand, waitForClaudeSessionId, findInLogs } = require('../core/launcher')
 const electron = require('../core/electron')
 
 // Colors for logging
@@ -84,9 +84,14 @@ async function main() {
     await typeCommand(page, 'claude')
     log.pass('Команда claude введена')
 
-    // Ждём запуска Claude + handshake + sniper (20 сек)
-    log.step('Ожидание Sniper detection + Handshake (20 сек)...')
-    await page.waitForTimeout(20000)
+    // Ждём появления Session ID в store (event-driven, не таймаут)
+    log.step('Ожидание Session ID в store (Sniper detection + Handshake)...')
+    try {
+      await waitForClaudeSessionId(page, 30000)
+      log.pass('Session ID захвачен!')
+    } catch (e) {
+      log.warn('Таймаут ожидания Session ID (может быть OK если тест всё равно пройдёт)')
+    }
 
     // ===== ПРОВЕРКА: Tab State =====
     log.step('Проверка tab state...')

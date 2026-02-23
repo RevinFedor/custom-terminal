@@ -52,4 +52,4 @@ Noted Terminal — это кастомный эмулятор терминала
 - **Код (Архитектура):** `docs/architecture.md`
 - **Инфраструктура (Ops):** `docs/infrastructure/`
 - **База Знаний:** `docs/knowledge/`
-- **Тестирование (Automation):** `auto/` — Playwright-тесты для Electron. Запуск: `./auto/run.sh sandbox/test-name.js`
+- **Тестирование (Automation):** `auto/` — Playwright-тесты для Electron. Entry point: `auto/context.md`. Запуск: `node auto/stable/test-name.js`

@@ -262,17 +262,30 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
   };
 
   const handleApplyManualSession = () => {
-    if (!activeTabId || !manualSessionId.trim()) return;
+    console.warn('[ReplaceSession] called, activeTabId:', activeTabId, 'input:', manualSessionId.trim());
+    if (!activeTabId || !manualSessionId.trim()) { console.warn('[ReplaceSession] BAIL: no tabId or empty input'); return; }
     const uuidMatch = manualSessionId.trim().match(UUID_EXTRACT_REGEX);
-    if (!uuidMatch) { showToast('Invalid UUID format', 'warning'); return; }
+    if (!uuidMatch) { console.warn('[ReplaceSession] BAIL: invalid UUID'); showToast('Invalid UUID format', 'warning'); return; }
     const newId = uuidMatch[0];
+    console.warn('[ReplaceSession] extracted UUID:', newId, 'current sessionId:', sessionId);
     if (newId === sessionId) {
+      console.warn('[ReplaceSession] BAIL: same as current');
       showToast('Already current session', 'warning');
       setShowSessionInput(false);
       setManualSessionId('');
       return;
     }
     useWorkspaceStore.getState().setClaudeSessionId(activeTabId, newId);
+    console.warn('[ReplaceSession] store updated, verifying...');
+    // Verify the change took effect
+    const verify = useWorkspaceStore.getState();
+    for (const [, ws] of verify.openProjects) {
+      const tab = ws.tabs.get(activeTabId);
+      if (tab) {
+        console.warn('[ReplaceSession] verify tab.claudeSessionId:', tab.claudeSessionId);
+        break;
+      }
+    }
     showToast('Session set: ' + newId.substring(0, 8) + '...', 'success');
     setShowSessionInput(false);
     setManualSessionId('');
