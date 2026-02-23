@@ -71,8 +71,14 @@ Thinking mode при запуске обеспечивается `alwaysThinking
 - **Interrupted Recovery:** При аварийном закрытии показывается оверлей. Покажется только если `currentView === 'terminal'`, чтобы не перекрывать вкладку Home. Выбор пользователя сохраняется в БД. См. `knowledge/ui-ux-stability.md`.
 - **Session Waiting State:** Промежуточное состояние "Ожидание сессии..." с пульсирующим жёлтым индикатором. См. `knowledge/ai-automation.md`.
 - **History Restore:** При восстановлении из History `claudeSessionId` передаётся напрямую в `createTab()` (Immediate Injection). См. `features/project-home.md`.
+- **History View (HistoryPanel):** Окно просмотра полной истории сессий Claude.
+    - **Engine:** Нативный скролл с `content-visibility: auto`. Отказ от тяжелых JS-виртуализаторов для стабильности при динамической высоте сообщений (от 30px до 1000px). См. `knowledge/fix-ui-stability.md`.
+    - **Rich File Actions:** Детальное отображение изменений файлов прямо в истории. Edit показывает диффы (`+`/`-`), Write показывает превью контента. Каждый файл — отдельный фиолетовый раскрывающийся блок.
+    - **Sync:** Автоматическое обновление каждые 3с при изменении количества сообщений в файле истории.
+    - **Auto-scroll:** "Умное" прилипание к низу списка только при первой загрузке или если пользователь уже находится в "зоне прилипания" (150px от дна).
 
 ## Code Map
+- **Renderer (UI):** `src/renderer/components/Workspace/HistoryPanel.tsx` — нативный скролл с CSS-оптимизацией.
 - **Renderer (UI):** `src/renderer/components/Workspace/TerminalArea.tsx` — рендеринг `InterruptedOverlay` через `Layering Pattern`.
 - **PendingAction:** `src/renderer/components/Workspace/Terminal.tsx` — обработка `pendingAction` при первом PTY output (`executePendingAction`).
 - **Logic:** `src/renderer/components/Workspace/TabBar.tsx` — метод `checkProcessStatus` очищает сессию при нормальном выходе.
@@ -80,3 +86,4 @@ Thinking mode при запуске обеспечивается `alwaysThinking
 - **Main (Runner):** `src/main/main.js` — IPC `claude:run-command` (switch: `claude`, `claude-c`, `claude-fork`).
 - **Main (Handshake):** `src/main/main.js` — стейт-машина `claudeState` в обработчике `terminal:create` data.
 - **State:** `useWorkspaceStore.ts` — хранение `pendingAction`, `wasInterrupted` и `claudeSessionId`.
+- **Optimization:** См. `knowledge/fix-ui-stability.md` для деталей нативной виртуализации.

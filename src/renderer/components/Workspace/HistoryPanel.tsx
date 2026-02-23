@@ -6,13 +6,24 @@ import MarkdownRenderer from '../Research/MarkdownRenderer';
 
 const { ipcRenderer } = window.require('electron');
 
+interface FileAction {
+  tool: 'Edit' | 'Write' | 'Read';
+  filePath: string;
+  oldString?: string;
+  newString?: string;
+  content?: string;
+}
+type Action = string | FileAction;
+
+const isFileAction = (a: Action): a is FileAction => typeof a === 'object' && a !== null && 'tool' in a;
+
 interface FullHistoryEntry {
   uuid: string;
   role: 'user' | 'assistant' | 'compact' | 'fork' | 'plan-mode' | 'continued';
   timestamp: string;
   content: string;
   thinking?: string;
-  actions?: string[];
+  actions?: Action[];
   sessionId: string;
 }
 
@@ -60,6 +71,66 @@ const ThinkingBlock = memo(({ text }: { text: string }) => {
     </div>
   );
 });
+
+// Short path: last 2 segments
+const shortPath = (p: string) => {
+  const parts = p.split('/');
+  return parts.length > 2 ? '.../' + parts.slice(-2).join('/') : p;
+};
+
+// Edit/Write — purple border, collapsible, no emoji
+const FileActionBlock = memo(({ action }: { action: FileAction }) => {
+  const [open, setOpen] = useState(false);
+
+  return (
+    <div style={{ marginTop: 4, borderLeft: '3px solid #c084fc', paddingLeft: 8 }}>
+      <button
+        onClick={() => setOpen(!open)}
+        style={{
+          background: 'none', border: 'none', color: '#c084fc',
+          cursor: 'pointer', fontSize: 11, display: 'flex',
+          alignItems: 'center', gap: 4, padding: 0,
+        }}
+      >
+        {open ? <ChevronDown size={10} /> : <ChevronRight size={10} />}
+        {shortPath(action.filePath)}
+      </button>
+      {open && action.tool === 'Edit' && (
+        <div style={{
+          marginTop: 2, fontSize: 11, fontFamily: 'monospace',
+          whiteSpace: 'pre-wrap', wordBreak: 'break-all', lineHeight: 1.5,
+        }}>
+          {action.oldString && action.oldString.split('\n').map((line, i) => (
+            <div key={'o' + i} style={{ color: '#fca5a5', backgroundColor: 'rgba(239,68,68,0.07)' }}>
+              {'\u2212 '}{line}
+            </div>
+          ))}
+          {action.newString && action.newString.split('\n').map((line, i) => (
+            <div key={'n' + i} style={{ color: '#86efac', backgroundColor: 'rgba(34,197,94,0.07)' }}>
+              {'+ '}{line}
+            </div>
+          ))}
+        </div>
+      )}
+      {open && action.tool === 'Write' && action.content && (
+        <div style={{
+          marginTop: 2, fontSize: 11, fontFamily: 'monospace',
+          whiteSpace: 'pre-wrap', wordBreak: 'break-all', color: '#999', lineHeight: 1.5,
+          maxHeight: 200, overflowY: 'auto',
+        }}>
+          {action.content}
+        </div>
+      )}
+    </div>
+  );
+});
+
+// Read — orange border, not collapsible, no emoji
+const ReadActionBlock = ({ filePath }: { filePath: string }) => (
+  <div style={{ marginTop: 4, borderLeft: '3px solid #f59e0b', paddingLeft: 8 }}>
+    <span style={{ fontSize: 11, color: '#f59e0b' }}>{shortPath(filePath)}</span>
+  </div>
+);
 
 // Single history entry renderer
 const HistoryEntry = memo(({ entry }: { entry: FullHistoryEntry }) => {
@@ -141,22 +212,45 @@ const HistoryEntry = memo(({ entry }: { entry: FullHistoryEntry }) => {
 
       {entry.thinking && <ThinkingBlock text={entry.thinking} />}
 
-      {entry.actions && entry.actions.length > 0 && (
-        <div style={{ marginTop: 6, display: 'flex', flexWrap: 'wrap', gap: 4 }}>
-          {entry.actions.map((action, i) => (
-            <span
-              key={i}
-              style={{
-                fontSize: 11, color: '#999',
-                backgroundColor: 'rgba(255,255,255,0.04)',
-                padding: '2px 6px', borderRadius: 4, wordBreak: 'break-all',
-              }}
-            >
-              {action}
-            </span>
-          ))}
-        </div>
-      )}
+      {entry.actions && entry.actions.length > 0 && (() => {
+        const editWriteActions: FileAction[] = [];
+        const readActions: FileAction[] = [];
+        const otherActions: string[] = [];
+        for (const a of entry.actions) {
+          if (isFileAction(a)) {
+            if (a.tool === 'Read') readActions.push(a);
+            else editWriteActions.push(a);
+          } else {
+            otherActions.push(a);
+          }
+        }
+        return (
+          <>
+            {editWriteActions.map((action, i) => (
+              <FileActionBlock key={'ew' + i} action={action} />
+            ))}
+            {readActions.map((action, i) => (
+              <ReadActionBlock key={'rd' + i} filePath={action.filePath} />
+            ))}
+            {otherActions.length > 0 && (
+              <div style={{ marginTop: 6, display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+                {otherActions.map((action, i) => (
+                  <span
+                    key={i}
+                    style={{
+                      fontSize: 11, color: '#999',
+                      backgroundColor: 'rgba(255,255,255,0.04)',
+                      padding: '2px 6px', borderRadius: 4, wordBreak: 'break-all',
+                    }}
+                  >
+                    {action}
+                  </span>
+                ))}
+              </div>
+            )}
+          </>
+        );
+      })()}
     </div>
   );
 });
