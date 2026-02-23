@@ -637,8 +637,8 @@ export const useUIStore = create<UIStore>((set, get) => ({
   historyPanelWidth: (() => {
     try {
       const saved = localStorage.getItem('noted-terminal-history-panel-width');
-      return saved ? Math.max(280, Math.min(700, parseInt(saved, 10))) : 420;
-    } catch { return 420; }
+      return saved ? Math.max(280, Math.min(700, parseInt(saved, 10))) : 580;
+    } catch { return 580; }
   })(),
   setHistoryPanelOpen: (open) => set({ historyPanelOpen: open }),
   setHistoryPanelWidth: (width) => {
