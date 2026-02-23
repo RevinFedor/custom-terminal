@@ -442,7 +442,7 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                     <button
                       key={model}
                       className={`flex-1 text-[10px] px-1.5 py-1 rounded cursor-pointer ${isActive ? 'bg-[#DA7756] text-white font-medium' : 'bg-[#2d2d2d] text-[#888] hover:text-white hover:bg-[#3d3d3d]'}`}
-                      onClick={() => ipcRenderer.send('claude:send-command', activeTabId, '/model ' + model)}
+                      onClick={() => { console.warn('[InfoPanel:ModelSwitch] clicked=' + model + ' tabId=' + activeTabId + ' ts=' + Date.now()); ipcRenderer.send('claude:send-command', activeTabId, '/model ' + model); }}
                       title={'Switch to ' + model}
                     >
                       {model}

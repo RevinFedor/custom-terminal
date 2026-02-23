@@ -747,6 +747,7 @@ function TabBar({ projectId }: TabBarProps) {
     } else if (e.metaKey || e.ctrlKey) {
       toggleTabSelection(projectId, tabId, true);
     } else {
+      console.warn('[TabBar:click] switchTab tabId=' + tabId + ' ts=' + Date.now());
       switchTab(projectId, tabId);
       // Always switch to terminal view when clicking a tab
       // (fixes: clicking tab from Home view didn't switch currentView from 'home' to 'terminal')

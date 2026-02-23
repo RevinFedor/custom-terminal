@@ -379,14 +379,18 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
       fit.fit();
 
       const dims = fit.proposeDimensions();
-      if (dims) {
-        ipcRenderer.send('terminal:resize', tabId, dims.cols, dims.rows);
-      }
 
       const colsAfter = term.cols;
       const rowsAfter = term.rows;
-      if (colsBefore !== colsAfter || rowsBefore !== rowsAfter) {
-        console.warn(`[safeFit] tabId=${tabId} RESIZED ${colsBefore}x${rowsBefore} → ${colsAfter}x${rowsAfter}, sent to PTY: ${dims?.cols}x${dims?.rows}`);
+      const dimsChanged = colsBefore !== colsAfter || rowsBefore !== rowsAfter;
+
+      if (dims) {
+        if (dimsChanged) {
+          console.warn(`[safeFit] tabId=${tabId} RESIZED ${colsBefore}x${rowsBefore} → ${colsAfter}x${rowsAfter}, sending resize to PTY`);
+        } else {
+          console.warn(`[safeFit] tabId=${tabId} dims unchanged (${colsAfter}x${rowsAfter}), sending resize to PTY anyway`);
+        }
+        ipcRenderer.send('terminal:resize', tabId, dims.cols, dims.rows);
       }
     } catch (e) {
       console.warn('[safeFit] ERROR:', e);
