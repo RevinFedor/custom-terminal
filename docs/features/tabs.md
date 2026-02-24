@@ -54,6 +54,7 @@
 
 ## Code Map
 - **UI:** `src/renderer/components/Workspace/TabBar.tsx` — логика меню, `RestartZone`, `onGenerateDragPreview` для multi-drag и `useEffect` для авто-скролла.
+- **Floating Panels:** `src/renderer/components/Workspace/panels/ActionsPanel.tsx` — позиционирование "Параметров" и "Настроек" через CSS-трансформации (`translate(-100%, -50%)`).
 - **Logic:** `src/renderer/store/useWorkspaceStore.ts` — функции `getNextAvailableName`, `setTabCommandType`, `moveTabsToProject` (batch move).
 - **IPC:** `main.js` — хендлеры `project:add-favorite`, `project:get-favorites`, `project:delete-favorite`.
 - **Terminal:** `src/renderer/components/Workspace/Terminal.tsx` — перехват ввода для детекции типа процесса и блокировки дублирующих AI сессий.
