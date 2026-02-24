@@ -574,8 +574,45 @@ app.on('activate', () => {
   }
 });
 
+// Shared helper: format tool_use block for clean export
+function formatToolAction(toolName, input, toolResult = null, includeEditing = false, includeReading = false) {
+  let label = '';
+  switch (toolName) {
+    case 'Read': label = '📄 Чтение (' + (input.file_path || '?') + ')'; break;
+    case 'Edit': label = '✏️ Редактирование (' + (input.file_path || '?') + ')'; break;
+    case 'Write': label = '📝 Создание (' + (input.file_path || '?') + ')'; break;
+    case 'Bash': {
+      const cmd = (input.command || '').substring(0, 50);
+      label = '🖥 Команда ("' + cmd + (input.command?.length > 50 ? '...' : '') + '")';
+      break;
+    }
+    case 'Glob': label = '🔍 Поиск файлов (' + (input.pattern || '?') + ')'; break;
+    case 'Grep': label = '🔍 Поиск в коде (' + (input.pattern || '?') + ')'; break;
+    default: label = '⚙️ ' + toolName;
+  }
+
+  const shouldInclude =
+    ((toolName === 'Edit' || toolName === 'Write' || toolName === 'Bash') && includeEditing) ||
+    (toolName === 'Read' && includeReading);
+
+  if (!shouldInclude) return label;
+
+  let detail = '';
+  if (toolName === 'Read' && toolResult?.content) {
+    detail = '\n```\n' + toolResult.content + '\n```';
+  } else if (toolName === 'Edit' && input.old_string != null) {
+    detail = '\n```diff\n- ' + input.old_string + '\n+ ' + input.new_string + '\n```';
+  } else if (toolName === 'Write' && input.content) {
+    detail = '\n```\n' + input.content + '\n```';
+  } else if (toolName === 'Bash' && toolResult?.content) {
+    detail = '\n```\n' + toolResult.content + '\n```';
+  }
+
+  return label + detail;
+}
+
 // Export a range of messages from Claude session
-ipcMain.handle('claude:copy-range', async (event, { sessionId, cwd, startUuid, endUuid }) => {
+ipcMain.handle('claude:copy-range', async (event, { sessionId, cwd, startUuid, endUuid, includeEditing = false, includeReading = false }) => {
   console.log('[Claude Export] Exporting range from', startUuid, 'to', endUuid);
 
   if (!sessionId) return { success: false, error: 'No session ID' };
@@ -683,19 +720,19 @@ ipcMain.handle('claude:copy-range', async (event, { sessionId, cwd, startUuid, e
     // Format the range
     let output = `# Claude Session Export (Range)\nSession: ${sessionId}\n\n---\n\n`;
 
-    for (const entry of range) {
+    for (let i = 0; i < range.length; i++) {
+      const entry = range[i];
       if (entry.isSidechain || entry.type === 'summary') continue;
 
       if (entry.type === 'user') {
         let rawContent = entry.message?.content;
         if (Array.isArray(rawContent)) {
-          if (rawContent.some(i => i.type === 'tool_result')) continue;
-          const textBlock = rawContent.find(i => i.type === 'text');
+          if (rawContent.some(item => item.type === 'tool_result')) continue;
+          const textBlock = rawContent.find(item => item.type === 'text');
           rawContent = textBlock?.text || '';
         }
         if (!rawContent || typeof rawContent !== 'string') continue;
         if (rawContent.includes('[Request interrupted')) continue;
-        // Skip system artifacts
         if (rawContent.includes('<command-name>') ||
             rawContent.includes('<command-message>') ||
             rawContent.includes('<local-command-stdout>') ||
@@ -703,31 +740,63 @@ ipcMain.handle('claude:copy-range', async (event, { sessionId, cwd, startUuid, e
             rawContent.includes('<bash-notification>') ||
             rawContent.startsWith('Caveat: The messages below')) continue;
 
-        output += `## User\n${rawContent.replace(/\[200~/g, '').replace(/~\]/g, '').trim()}\n\n`;
+        output += '## User\n' + rawContent.replace(/\[200~/g, '').replace(/~\]/g, '').trim() + '\n\n';
       }
       else if (entry.type === 'assistant') {
-        output += `## Claude\n`;
-        const content = entry.message?.content;
-        if (Array.isArray(content)) {
-          for (const block of content) {
-            if (block.type === 'text') output += `${block.text}\n`;
-            if (block.type === 'thinking') output += `<thinking>\n${block.thinking}\n</thinking>\n`;
+        const msgContent = entry.message?.content;
+        if (!msgContent) continue;
+
+        let textContent = '';
+        const toolActions = [];
+
+        if (typeof msgContent === 'string') {
+          textContent = msgContent;
+        } else if (Array.isArray(msgContent)) {
+          const textParts = [];
+          for (const block of msgContent) {
+            if (block.type === 'thinking' && block.thinking) {
+              textParts.push('<thinking>\n' + block.thinking + '\n</thinking>');
+            }
+            if (block.type === 'text' && block.text) {
+              textParts.push(block.text);
+            }
             if (block.type === 'tool_use') {
-              const name = block.name;
-              const fPath = block.input?.file_path || block.input?.path;
-              if (name === 'Read') output += `→ Read(${fPath})\n`;
-              else if (name === 'Edit') output += `→ Updated ${fPath}\n`;
-              else if (name === 'Write') output += `→ Created ${fPath}\n`;
-              else output += `→ Tool: ${name}\n`;
+              // Find matching tool_result in subsequent range records
+              let toolResult = null;
+              if (includeEditing || includeReading) {
+                for (let j = i + 1; j < range.length; j++) {
+                  const nextEntry = range[j];
+                  if (nextEntry.type === 'user' && Array.isArray(nextEntry.message?.content)) {
+                    const res = nextEntry.message.content.find(c => c.type === 'tool_result' && c.tool_use_id === block.id);
+                    if (res) {
+                      toolResult = res;
+                      break;
+                    }
+                  }
+                }
+              }
+              const action = formatToolAction(block.name, block.input || {}, toolResult, includeEditing, includeReading);
+              if (action) toolActions.push(action);
             }
           }
-        } else if (typeof content === 'string') {
-          output += `${content}\n`;
+          textContent = textParts.join('\n\n');
         }
-        output += `\n`;
+
+        if (textContent.trim() || toolActions.length > 0) {
+          output += '## Claude\n';
+          if (textContent.trim()) output += textContent + '\n';
+          if (toolActions.length > 0) {
+            if (includeEditing || includeReading) {
+              output += '\n**Actions:**\n' + toolActions.join('\n\n') + '\n';
+            } else {
+              output += '   [Действия: ' + toolActions.join(', ') + ']\n';
+            }
+          }
+          output += '\n';
+        }
       }
       else if (entry.type === 'system' && entry.subtype === 'compact_boundary') {
-        output += `\n═══ HISTORY COMPACTED ═══\n\n`;
+        output += '\n═══ HISTORY COMPACTED ═══\n\n';
       }
     }
 
@@ -1025,6 +1094,20 @@ function waitForRender(term, timeoutMs, logPrefix) {
   });
 }
 
+// Helper: drain any pending PTY data (wait for silence)
+function drainPtyData(term, ms = 300) {
+  return new Promise((resolve) => {
+    let buf = '';
+    let timer = null;
+    const sub = term.onData((data) => {
+      buf += data;
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => { sub.dispose(); resolve(buf); }, ms);
+    });
+    timer = setTimeout(() => { sub.dispose(); resolve(buf); }, ms);
+  });
+}
+
 // Main helper: chunked paste + sync marker verification + optional submit
 async function safePasteAndSubmit(term, content, options = {}) {
   const {
@@ -1064,6 +1147,12 @@ async function safePasteAndSubmit(term, content, options = {}) {
       // Tiny delay even in fast mode to let kernel process SIGINT
       await new Promise(r => setTimeout(r, 10));
     }
+  }
+
+  // Drain deferred renders (from focus loss/regain, periodic updates, etc.)
+  // These would produce stale sync markers that pass the 15ms threshold
+  if (!fast) {
+    await drainPtyData(term, 150);
   }
 
   const renderTimes = [];
@@ -1114,10 +1203,16 @@ async function safePasteAndSubmit(term, content, options = {}) {
   }
 
   if (submit) {
-    // Delay before Enter: CLI needs time to process PASTE_END before \r is recognized as submit
-    const enterDelay = fast ? 500 : 100;
-    console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] Waiting ' + enterDelay + 'ms before Enter...');
-    await new Promise(r => setTimeout(r, enterDelay));
+    if (fast) {
+      // Fast mode: fixed delay (Gemini/bash don't use Ink sync)
+      console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] Waiting 500ms before Enter (fast mode)...');
+      await new Promise(r => setTimeout(r, 500));
+    } else {
+      // Slow mode: wait for PTY silence (render fully settled)
+      // Catches secondary React renders, re-layouts after paste
+      console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] Draining PTY before Enter (slow mode)...');
+      await drainPtyData(term, 150);
+    }
     term.write('\r');
     console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] ✅ Sent Enter (total: ' + (Date.now() - t0) + 'ms)');
   }
@@ -1318,7 +1413,7 @@ ipcMain.handle('claude:toggle-thinking', async (event, tabId) => {
 
 // Open Rewind menu, navigate to target entry with arrow keys
 // Uses specific color detection for reliability
-ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, targetText, pasteAfter }) => {
+ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, targetText, skipDuplicates = 0, pasteAfter }) => {
   const term = terminals.get(tabId);
   if (!term) return { success: false, error: 'no terminal' };
 
@@ -1422,21 +1517,6 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
     });
   }
 
-  // Helper: drain any pending PTY data (wait for silence)
-  function drainPtyData(ms = 300) {
-    return new Promise((resolve) => {
-      let buf = '';
-      let timer = null;
-      const sub = term.onData((data) => {
-        buf += data;
-        if (timer) clearTimeout(timer);
-        timer = setTimeout(() => { sub.dispose(); resolve(buf); }, ms);
-      });
-      // If no data comes at all, resolve after ms
-      timer = setTimeout(() => { sub.dispose(); resolve(buf); }, ms);
-    });
-  }
-
   try {
     // Step 0: Check DangerZone — if active, wait for it to clear (same pattern as toggle-thinking)
     // Ctrl+C at idle prompt triggers DZ ("Press Ctrl-C again to exit"),
@@ -1465,7 +1545,7 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
       await dzAfter.promise;
       console.log('[Restore:History] ✅ DangerZone cleared after Ctrl+C');
       // Drain any residual PTY data after DZ clear
-      await drainPtyData(300);
+      await drainPtyData(term, 300);
     }
 
     // Step 2: First Escape (prep)
@@ -1481,7 +1561,7 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
     console.log('[Restore:History] Step 3: Second Escape (menu)');
     term.write('\x1b');
     // Wait for Ink to process Escape (~200ms) + render the menu
-    const menuRaw = await drainPtyData(800);
+    const menuRaw = await drainPtyData(term, 800);
 
     const menuClean = cleanBuffer(menuRaw);
     const initialState = parseMenu(menuClean);
@@ -1521,27 +1601,53 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
 
     let found = false;
     let pressCount = 0;
+    let duplicatesRemaining = skipDuplicates; // Skip N newer duplicates before accepting match
 
+    console.log('[Restore:History] Navigation: maxPresses=' + maxPresses + ', skipDuplicates=' + skipDuplicates);
+
+    // Unified navigation loop: per-step Lavender RGB verification (see fix-rewind-navigation.md).
+    // Ink diff renders corrupt individual characters (cursor-movement artifacts in cleanBuffer),
+    // so we use exact match first, then fuzzy word-overlap as fallback.
     for (let i = 0; i < maxPresses; i++) {
       try {
-        // Press UP
         const diffRaw = await sendAndCaptureRaw('\x1b[A', 1500);
         pressCount++;
-        
-        // Identify what is currently selected
         const selectedText = extractSelectedText(diffRaw);
-        
         console.log(`[Restore:History] UP #${pressCount} -> Selected: "${(selectedText || 'null').substring(0, 50)}..."`);
-        
+
+        let matched = false;
+
+        // Exact match (works when diff render is clean)
         if (selectedText && textMatchesTarget(selectedText, targetPrefix)) {
+          matched = true;
+        }
+
+        // Fuzzy fallback: Ink diff renders corrupt individual characters via cursor
+        // repositioning (\x1b[nC, \x1b[r;cH) that cleanBuffer can't simulate.
+        // Whole words survive though. Check ≥60% word overlap.
+        if (!matched && selectedText && targetPrefix) {
+          const targetWords = targetPrefix.trim().split(/\s+/).filter(w => w.length > 2);
+          const selectedNorm = selectedText.trim().replace(/\s+/g, ' ');
+          if (targetWords.length > 0) {
+            const matchedWords = targetWords.filter(w => selectedNorm.includes(w));
+            const ratio = matchedWords.length / targetWords.length;
+            if (ratio >= 0.6) {
+              console.log('[Restore:History] Fuzzy match (' + Math.round(ratio * 100) + '%, ' + matchedWords.length + '/' + targetWords.length + ' words)');
+              matched = true;
+            }
+          }
+        }
+
+        if (matched) {
+          if (duplicatesRemaining > 0) {
+            duplicatesRemaining--;
+            console.log('[Restore:History] ⏩ Skipping duplicate (' + duplicatesRemaining + ' remaining)');
+            continue;
+          }
           console.log('[Restore:History] ✅ Target matched!');
           found = true;
           break;
         }
-        
-        // Optimization: If we hit the top boundary (diff is empty or repeated), we should probably stop?
-        // But Claude's TUI is complex, so we'll trust the text match or max limit.
-
       } catch (e) {
         console.log('[Restore:History] Error during navigation:', e.message);
         break;
@@ -1552,10 +1658,10 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
         console.error('[Restore:History] ❌ Target NOT found in menu after ' + pressCount + ' steps. Aborting rewind.');
         // GUARD: Close menu with Escape to avoid selecting wrong entry (which defaults to top/bottom)
         try {
-            term.write('\x1b'); 
+            term.write('\x1b');
             await new Promise(r => setTimeout(r, 200));
         } catch (ign) {}
-        
+
         return { success: false, error: 'Target not found in Claude history menu', cursorIndex: cursorPos, targetIndex: targetIdx, pressCount, menuEntries: knownEntries.length };
     }
 
@@ -3941,43 +4047,9 @@ ipcMain.handle('claude:export-clean-session', async (event, { sessionId, cwd, in
       outputParts.push('');
     }
 
-    // Helper: format tool_use
-    const formatToolAction = (toolName, input, toolResult = null) => {
-      let label = '';
-      switch (toolName) {
-        case 'Read': label = `📄 Чтение (${input.file_path || '?'})`; break;
-        case 'Edit': label = `✏️ Редактирование (${input.file_path || '?'})`; break;
-        case 'Write': label = `📝 Создание (${input.file_path || '?'})`; break;
-        case 'Bash': 
-          const cmd = (input.command || '').substring(0, 50);
-          label = `🖥 Команда ("${cmd}${input.command?.length > 50 ? '...' : ''}")`; 
-          break;
-        case 'Glob': label = `🔍 Поиск файлов (${input.pattern || '?'})`; break;
-        case 'Grep': label = `🔍 Поиск в коде (${input.pattern || '?'})`; break;
-        default: label = `⚙️ ${toolName}`;
-      }
-
-      // Per-tool code inclusion: editing (Edit/Write/Bash) vs reading (Read)
-      const shouldInclude =
-        ((toolName === 'Edit' || toolName === 'Write' || toolName === 'Bash') && includeEditing) ||
-        (toolName === 'Read' && includeReading);
-
-      if (!shouldInclude) return label;
-
-      // Add the content if available
-      let detail = '';
-      if (toolName === 'Read' && toolResult?.content) {
-        detail = `\n\`\`\`\n${toolResult.content}\n\`\`\``;
-      } else if (toolName === 'Edit' && input.old_string != null) {
-        // Edit tool has old_string/new_string, not content
-        detail = `\n\`\`\`diff\n- ${input.old_string}\n+ ${input.new_string}\n\`\`\``;
-      } else if (toolName === 'Write' && input.content) {
-        detail = `\n\`\`\`\n${input.content}\n\`\`\``;
-      } else if (toolName === 'Bash' && toolResult?.content) {
-        detail = `\n\`\`\`\n${toolResult.content}\n\`\`\``;
-      }
-
-      return `${label}${detail}`;
+    // Delegate to shared formatToolAction with current session's settings
+    const formatTool = (toolName, input, toolResult = null) => {
+      return formatToolAction(toolName, input, toolResult, includeEditing, includeReading);
     };
 
     // Process the active branch
@@ -4053,7 +4125,7 @@ ipcMain.handle('claude:export-clean-session', async (event, { sessionId, cwd, in
                   }
                 }
               }
-              const action = formatToolAction(block.name, block.input || {}, toolResult);
+              const action = formatTool(block.name, block.input || {}, toolResult);
               if (action) toolActions.push(action);
             }
           }

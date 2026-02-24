@@ -21,7 +21,12 @@ interface ActionsPanelProps {
 }
 
 export default function ActionsPanel({ activeTabId, embedded = false }: ActionsPanelProps) {
-  const { showToast, docPrompt, terminalSelection } = useUIStore();
+  const {
+    showToast, docPrompt, terminalSelection,
+    copyIncludeEditing: includeEditing, setCopyIncludeEditing: setIncludeEditing,
+    copyIncludeReading: includeReading, setCopyIncludeReading: setIncludeReading,
+    copyFromStart: fromStart, setCopyFromStart: setFromStart,
+  } = useUIStore();
   const { activeProjectId, createTab, closeTab, getActiveProject, switchTab, getSelectedTabs, clearSelection } = useWorkspaceStore();
   const [isUpdatingDocs, setIsUpdatingDocs] = useState(false);
   const cancelledRef = useRef(false);
@@ -38,10 +43,6 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
   const [copySessionInput, setCopySessionInput] = useState('');
   const [isCopying, setIsCopying] = useState(false);
   
-  // New toggles
-  const [includeEditing, setIncludeEditing] = useState(true);
-  const [includeReading, setIncludeReading] = useState(false);
-  const [fromStart, setFromStart] = useState(true);
   const [showCopySettings, setShowCopySettings] = useState(false);
   const [showDocsInfo, setShowDocsInfo] = useState(false);
   const [showCopyInfo, setShowCopyInfo] = useState(false);

@@ -201,6 +201,14 @@ interface UIStore {
 
   closeSessionModal: (value: string | null) => void;
 
+  // Copy Settings (shared between ActionsPanel and Timeline)
+  copyIncludeEditing: boolean;
+  copyIncludeReading: boolean;
+  copyFromStart: boolean;
+  setCopyIncludeEditing: (v: boolean) => void;
+  setCopyIncludeReading: (v: boolean) => void;
+  setCopyFromStart: (v: boolean) => void;
+
   // Notes Editor Modal
   notesEditorOpen: boolean;
   notesEditorProjectId: string | null;
@@ -455,6 +463,33 @@ const saveClaudeDefaultPromptEnabled = (enabled: boolean) => {
 };
 
 const initialClaudeDefaultPromptEnabled = loadClaudeDefaultPromptEnabled();
+
+const loadCopySettings = (): { copyIncludeEditing: boolean; copyIncludeReading: boolean; copyFromStart: boolean } => {
+  try {
+    const saved = localStorage.getItem('noted-terminal-copy-settings');
+    if (saved) {
+      const parsed = JSON.parse(saved);
+      return {
+        copyIncludeEditing: parsed.copyIncludeEditing ?? true,
+        copyIncludeReading: parsed.copyIncludeReading ?? false,
+        copyFromStart: parsed.copyFromStart ?? true,
+      };
+    }
+  } catch (e) {
+    console.error('Failed to load copy settings:', e);
+  }
+  return { copyIncludeEditing: true, copyIncludeReading: false, copyFromStart: true };
+};
+
+const saveCopySettings = (settings: { copyIncludeEditing: boolean; copyIncludeReading: boolean; copyFromStart: boolean }) => {
+  try {
+    localStorage.setItem('noted-terminal-copy-settings', JSON.stringify(settings));
+  } catch (e) {
+    console.error('Failed to save copy settings:', e);
+  }
+};
+
+const initialCopySettings = loadCopySettings();
 
 const loadDragAreaWidth = (): number => {
   try {
@@ -724,6 +759,26 @@ export const useUIStore = create<UIStore>((set, get) => ({
         resolve: null
       }
     });
+  },
+
+  // Copy Settings
+  copyIncludeEditing: initialCopySettings.copyIncludeEditing,
+  copyIncludeReading: initialCopySettings.copyIncludeReading,
+  copyFromStart: initialCopySettings.copyFromStart,
+  setCopyIncludeEditing: (v) => {
+    set({ copyIncludeEditing: v });
+    const { copyIncludeReading, copyFromStart } = get();
+    saveCopySettings({ copyIncludeEditing: v, copyIncludeReading, copyFromStart });
+  },
+  setCopyIncludeReading: (v) => {
+    set({ copyIncludeReading: v });
+    const { copyIncludeEditing, copyFromStart } = get();
+    saveCopySettings({ copyIncludeEditing, copyIncludeReading: v, copyFromStart });
+  },
+  setCopyFromStart: (v) => {
+    set({ copyFromStart: v });
+    const { copyIncludeEditing, copyIncludeReading } = get();
+    saveCopySettings({ copyIncludeEditing, copyIncludeReading, copyFromStart: v });
   },
 
   // Notes Editor Modal
