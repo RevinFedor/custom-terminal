@@ -296,6 +296,17 @@ export default function Workspace() {
   // Per-tab history panel state
   const isHistoryOpen = activeTab?.id ? (historyPanelOpenTabs[activeTab.id] ?? false) : false;
 
+  // Delayed unmount for slide-out animation (keep mounted 200ms after close)
+  const [historyMounted, setHistoryMounted] = useState(false);
+  useEffect(() => {
+    if (isHistoryOpen) {
+      setHistoryMounted(true);
+    } else if (historyMounted) {
+      const timer = setTimeout(() => setHistoryMounted(false), 60);
+      return () => clearTimeout(timer);
+    }
+  }, [isHistoryOpen]);
+
   // DEBUG: Track state changes
   console.warn(`[Workspace:RENDER] currentView=${currentView} showTimeline=${showTimeline} activeTabId=${activeTab?.id} isCommandRunning=${isCommandRunning}`);
 
@@ -310,8 +321,8 @@ export default function Workspace() {
 
         {/* Terminal Area — Timeline + HistoryPanel are constrained to this height */}
         <div className="flex-1 flex min-w-0 relative">
-          {/* Terminal content */}
-          <div className="flex-1 relative min-w-0">
+          {/* Terminal content — overflow hidden clips HistoryPanel slide animation */}
+          <div className="flex-1 relative min-w-0 overflow-hidden">
             <TerminalArea projectId={activeProjectId} />
 
             {/* Search Bar (Cmd+F) - only in terminal view */}
@@ -393,13 +404,14 @@ export default function Workspace() {
             <ResearchSheet projectId={activeProjectId} projectPath={currentProject.path} />
 
             {/* History Panel — absolute overlay within terminal area only */}
-            {isHistoryOpen && claudeSessionId && activeTab && currentView === 'terminal' && (
+            {(isHistoryOpen || historyMounted) && claudeSessionId && activeTab && currentView === 'terminal' && (
               <HistoryPanel
                 tabId={activeTab.id}
                 sessionId={claudeSessionId}
                 cwd={activeTab.cwd || currentProject.path}
                 width={historyPanelWidth}
                 notesPanelWidth={notesPanelWidth}
+                isOpen={isHistoryOpen}
               />
             )}
           </div>

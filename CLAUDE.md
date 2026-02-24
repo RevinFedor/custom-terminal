@@ -10,7 +10,7 @@
     IDENTIFY RELEVANCE:
     Based on the task, find the corresponding file in `docs/features/`.
     Read it and extract ONLY those `knowledge/` links that are relevant to the current problem.
-    (e.g., if fixing terminal rendering → extract `knowledge/ui-ux-stability.md`, `knowledge/rendering-styles.md`).
+    (e.g., if fixing terminal rendering → extract `knowledge/ui-terminal-rendering.md`, `knowledge/rendering-styles.md`).
     Read the selected knowledge files.
   </step>
   <step index="3">
@@ -20,11 +20,11 @@
 
     BAD (generic, useless):
     "⚠️ terminal-core.md — use OSC 7 for CWD"
-    "⚠️ ui-ux-stability.md — avoid flickering"
+    "⚠️ ui-terminal-rendering.md — avoid flickering"
 
     GOOD (code-specific, actionable):
     "⚠️ terminal-core.md — CWD отслеживается через OSC 7 escape-последовательности от shell, а не через lsof/pgrep; shell-integration файлы инжектятся через ZDOTDIR при старте в ~/Library/Application Support/custom-terminal/shell-integration/"
-    "⚠️ ui-ux-stability.md — Ink/TUI рендеринг (Claude CLI, Gemini CLI) вызывает jitter input bar; решение через конкретный механизм в xterm.js Canvas renderer"
+    "⚠️ ui-terminal-rendering.md — Ink/TUI рендеринг (Claude CLI, Gemini CLI) вызывает jitter input bar; решение через конкретный механизм в xterm.js Canvas renderer"
   </step>
   <step index="4">
     ONLY after steps 1-3, propose a solution.
@@ -42,7 +42,7 @@ Noted Terminal — это кастомный эмулятор терминала
 - **Runtime:** Electron 28
 - **Frontend:** React 19 + Vite + TypeScript
 - **State:** Zustand
-- **Terminal:** xterm.js (Canvas renderer) — см. `docs/knowledge/ui-ux-stability.md`
+- **Terminal:** xterm.js (Canvas renderer) — см. `docs/knowledge/ui-terminal-rendering.md`
 - **Styling:** Tailwind CSS v4 — см. `docs/knowledge/rendering-styles.md`
 - **AI Rendering:** react-markdown + remark-gfm + syntax-highlighter
 - **DB:** SQLite (Sessions & Projects)

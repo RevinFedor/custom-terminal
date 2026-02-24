@@ -230,7 +230,7 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
     setIsGeneratingDesc(true);
     try {
       const exportResult = await ipcRenderer.invoke('claude:export-clean-session', {
-        sessionId: targetSessionId, cwd: tabCwd, includeCode: false, fromStart: true
+        sessionId: targetSessionId, cwd: tabCwd, includeEditing: false, includeReading: false, fromStart: true
       });
       if (!exportResult.success) throw new Error(exportResult.error || 'Export failed');
       const descPrompt = getPromptById('description');
@@ -299,28 +299,30 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
       {/* Upper sections — scrollable independently */}
       <div className="overflow-y-auto min-h-0 shrink">
       <div className="mb-4">
-        <div className="flex items-center mb-2" style={{ gap: 5 }}>
-          {hasClaudeSession && activeTabId && (
-            <button
-              onClick={() => setHistoryPanelOpen(activeTabId, !isHistoryOpen)}
-              className="cursor-pointer"
-              style={{
-                background: 'none',
-                border: 'none',
-                color: isHistoryOpen ? '#fff' : '#666',
-                padding: 2,
-                display: 'flex',
-                alignItems: 'center',
-              }}
-              onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.color = '#fff'; }}
-              onMouseLeave={(e) => { if (!isHistoryOpen) (e.currentTarget as HTMLButtonElement).style.color = '#666'; }}
-              title={isHistoryOpen ? 'Close History' : 'Open History'}
-            >
-              <ScrollText size={12} />
-            </button>
-          )}
-          <div className="text-[11px] uppercase text-[#888]">AI Session</div>
-        </div>
+        {hasClaudeSession && activeTabId ? (
+          <button
+            onClick={() => setHistoryPanelOpen(activeTabId, !isHistoryOpen)}
+            className="flex items-center mb-2 cursor-pointer"
+            style={{
+              gap: 5,
+              background: 'none',
+              border: 'none',
+              padding: 0,
+              color: isHistoryOpen ? '#ccc' : '#888',
+            }}
+            onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.color = '#fff'; }}
+            onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.color = isHistoryOpen ? '#ccc' : '#888'; }}
+            title={isHistoryOpen ? 'Close History' : 'Open History'}
+          >
+            <ScrollText size={12} />
+            <span className="text-[11px] uppercase">AI Session</span>
+          </button>
+        ) : (
+          <div className="flex items-center mb-2 text-[#888]" style={{ gap: 5 }}>
+            <ScrollText size={12} />
+            <span className="text-[11px] uppercase">AI Session</span>
+          </div>
+        )}
         {hasAnySession ? (
           <div className={`rounded p-2 ${currentSessionType === 'claude' ? 'bg-[#2a3a2a] border border-[#3a5a3a]' : 'bg-[#1a2a3a] border border-[#2a4a6a]'}`}>
             <div className="flex items-center gap-2 mb-1">
