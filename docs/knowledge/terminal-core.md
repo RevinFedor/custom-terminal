@@ -165,6 +165,7 @@ if (data.length > 1024) {
 ### Алгоритм `safePasteAndSubmit(term, content, options)`:
 1. **Chunking:** Контент делится на чанки по 900 байт. Каждый чанк оборачивается в ПОЛНЫЙ bracketed paste (`\x1b[200~` + chunk + `\x1b[201~`), итого < 1024 байт — ядро не режет.
 2. **Sync Marker Verification:** После каждого чанка функция слушает PTY output и ждёт sync marker `\x1b[?2026l` (конец Ink render frame). Это подтверждает что Ink обработал paste и React state committed. (**НЕ** text echo — Ink коллапсирует вставки в `[Pasted text #N +M lines]`, поэтому текст не появляется в выводе.)
+   - **Stale Marker Protection:** Введена фильтрация маркеров, приходящих < 15мс после записи. Это предотвращает ложные срабатывания от предыдущих циклов рендеринга (спиннеры, статус-бары). См. `knowledge/fix-stale-sync-markers.md`.
 3. **Submit:** `\r` отправляется ТОЛЬКО после подтверждения последнего чанка — гарантия что `onSubmit(value)` прочитает уже зафиксированный в стейте текст.
 
 ```javascript

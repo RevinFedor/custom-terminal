@@ -890,6 +890,34 @@ clipboard.writeText(text);
 - **Вес:** Бандл уменьшается (минус ~20KB на библиотеку).
 - **Интерактивность:** Раскрытие/скрытие блоков (аккордеонов) внутри списка не ломает скролл. Благодаря `contain-intrinsic-size: auto`, браузер мгновенно обновляет кэшированную высоту элемента сразу после его раскрытия пользователем.
 
-### Когда НЕ применять
-Если количество элементов превышает 5000+, DOM-дерево станет слишком тяжелым даже с `content-visibility`, и тогда придется возвращаться к JS-виртуализации с обязательным pre-computing высот.
+---
+
+## 19. Idempotent Resize (SIGWINCH Storm Protection)
+
+### Проблема: Лишние сигналы при переключении табов
+При каждом переключении на вкладку терминала вызывался метод `fit()`, который отправлял IPC-сообщение `terminal:resize` в Main процесс. Main процесс, в свою очередь, вызывал `pty.resize()`, что порождало системный сигнал `SIGWINCH`. 
+
+**Следствие:** Даже если физический размер окна не менялся, Claude CLI (Ink TUI) получал сигнал о ресайзе. Это заставляло его полностью перерисовывать интерфейс, генерируя новые sync-маркеры. Это ломало логику ожидания в `safePasteAndSubmit` (см. `knowledge/fix-stale-sync-markers.md`).
+
+### Решение: Проверка изменений (Safe Fit)
+В функцию `safeFit` добавлена проверка текущих размеров.
+
+```javascript
+const safeFit = () => {
+  if (!xtermInstance.current || !containerRef.current) return;
+  const { cols, rows } = fitAddon.current.proposeDimensions();
+  
+  // 🛡️ Фильтр: не шлем resize если размеры те же
+  if (cols === lastSize.current.cols && rows === lastSize.current.rows) {
+    return; 
+  }
+
+  lastSize.current = { cols, rows };
+  fitAddon.current.fit();
+  ipcRenderer.send('terminal:resize', tabId, cols, rows);
+};
+```
+
+### Результат
+Переключение вкладок стало "бесшумным" для процессов внутри терминала. Claude CLI больше не ловит ложных ресайзов, что стабилизирует работу всех автоматизаций (модели, форки, откаты).
 
