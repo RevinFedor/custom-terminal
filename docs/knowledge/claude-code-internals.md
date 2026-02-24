@@ -1,5 +1,8 @@
 # Claude Code CLI: Internals & Reverse Engineering (2026-02-09)
 
+### Симптомы
+При попытке форкнуть сессию через UI новая вкладка открывается с пустой историей, либо Timeline неправильно отображает границы сессий (Plan Mode / Fork), склеивая несколько разных диалогов в одну ленту без разделителей и возможности вернуться к корню.
+
 ## Архитектура
 - **Binary:** Bun-compiled single executable (172MB, ARM64 Mach-O), не Node.js
 - **Путь:** `/opt/homebrew/Caskroom/claude-code/<version>/claude`
