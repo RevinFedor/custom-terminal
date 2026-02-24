@@ -462,22 +462,21 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth }: History
     </div>
   );
 
-  return createPortal(
+  return (
     <>
-      {/* Backdrop overlay — covers terminal area, click to close */}
+      {/* Backdrop overlay — covers terminal area only, click to close */}
       <div
-        onClick={() => setHistoryPanelOpen(false)}
+        onClick={closePanel}
         style={{
-          position: 'fixed',
-          top: 30, left: 0, bottom: 0,
-          right: notesPanelWidth + width,
+          position: 'absolute',
+          top: 0, left: 0, bottom: 0,
+          right: width,
           backgroundColor: 'rgba(0, 0, 0, 0.3)',
-          zIndex: 8999,
+          zIndex: 100,
         }}
       />
       {panel}
-    </>,
-    document.body,
+    </>
   );
 }
 
