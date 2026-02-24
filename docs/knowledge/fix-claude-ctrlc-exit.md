@@ -1,5 +1,8 @@
 # Fix: Claude CLI Accidental Exit (Ctrl-C Danger Zone)
 
+### Симптомы
+При быстром клике на кнопки в интерфейсе (например, смена модели Sonnet/Haiku или переключение Think mode) терминал с Claude внезапно закрывается (процесс завершается), вместо того чтобы просто выполнить команду.
+
 ## Problem (The Double Ctrl-C Trap)
 In Claude Code CLI, pressing **Ctrl+C** once triggers a confirmation message: `"Press Ctrl-C again to exit"`.
 If the user immediately clicks a Model switch button (sonnet/opus/haiku) or Think toggle, the app sends another `\x03` (Ctrl+C) to clear the input before sending the command (the `ctrlCFirst` strategy).

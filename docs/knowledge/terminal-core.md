@@ -261,6 +261,9 @@ if (activeRef.current) {
 ## Problem
 Noted Terminal was causing extreme CPU load on `sysmond` (334% CPU) due to constant polling for process status.
 
+### Симптомы
+Вентиляторы компьютера начинают сильно шуметь (высокая нагрузка на CPU), а индикаторы активности на вкладках терминала (зеленые точки запущенных процессов) обновляются с заметной задержкой или "залипают".
+
 ### Диагностика (как обнаружили)
 При работе с несколькими терминалами Activity Monitor показывал `sysmond` на 334% CPU. Диагностика через `sample`:
 

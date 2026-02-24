@@ -5,6 +5,9 @@
 ## Enter Key Not Working in Auto-Commands
 **Файл-источник:** `fix-enter-not-working.md`
 
+### Симптомы
+При нажатии кнопок автоматизации (например, "Save Chat" или "Clear History") команда появляется в строке ввода терминала, но ничего не происходит — нажатие Enter как бы игнорируется системой, и команда не уходит в выполнение.
+
 ### Problem
 Commands sent via `terminal:executeCommand` (like `/chat save`) appeared in terminal but didn't execute (Enter was ignored).
 
@@ -113,6 +116,9 @@ clipboard.writeText(text);
 
 ## prompt() and alert() Not Supported fix
 **Файл-источник:** `fix-prompt-alert-fix.md`
+
+### Симптомы
+Приложение внезапно "падает" или полностью перестает реагировать на действия пользователя (белый экран или зависание) в моменты, когда должен появиться диалог подтверждения (например, ввод API ключа или подтверждение удаления).
 
 ### Problem
 App crashed with `Error: prompt() is and will not be supported` because Electron renderer doesn't support blocking browser dialogs.
