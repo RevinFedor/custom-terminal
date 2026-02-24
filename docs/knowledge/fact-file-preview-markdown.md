@@ -56,7 +56,7 @@ clipboard.writeText(filePreview.content);
 В Electron `navigator.clipboard` **ненадёжен** (race conditions, permissions issues).
 Всегда использовать `window.require('electron').clipboard` для операций с буфером обмена.
 
-См. также: `docs/knowledge/ui-input-events.md` (раздел про Clipboard).
+См. также: `docs/knowledge/fact-input-events.md` (раздел про Clipboard).
 
 ### 5. FoldStateKey — персистентное состояние фолдинга
 

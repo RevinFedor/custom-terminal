@@ -11,7 +11,7 @@
    - Используется [State-driven триггер](knowledge/fix-research-activation.md), чтобы панель открылась и сразу начала поиск.
 3. **Ожидание:** В списке чатов слева и в самом чате отображаются анимированные лоадеры вместо статических иконок.
 4. **Анализ:** Ответ рендерится с поддержкой Markdown. 
-   - Inline-код отображается корректно. См. `knowledge/rendering-styles.md`.
+   - Inline-код отображается корректно. См. `knowledge/fact-rendering-styles.md`.
    - Блоки кода имеют кнопку Copy.
 5. **Итерация:** 
    - Если ответ не помог, пользователь нажимает **Retry** (липкая кнопка в конце сообщения). Хвост истории удаляется, и запрос отправляется снова.
@@ -22,7 +22,7 @@
     - **🔍 Research:** `gemini-2.0-flash`.
     - **📋 Compact:** `gemini-3-flash` (Thinking: HIGH).
 - **Tools:** Автоматическая активация Google Search для моделей серии 3. См. `knowledge/fix-research-activation.md`.
-- **UI Stability:** Ответы рендерятся через `react-virtuoso` для плавной прокрутки. См. `knowledge/rendering-styles.md`.
+- **UI Stability:** Ответы рендерятся через `react-virtuoso` для плавной прокрутки. См. `knowledge/fact-rendering-styles.md`.
 
 ## Code Map
 - **UI:** `src/renderer/components/Research/ChatArea.tsx` — кнопки Retry/Delete.

@@ -145,7 +145,7 @@ if (isOutside) {
 1.  **Terminal.tsx:** Слушает событие `onSelectionChange` и обновляет глобальный стейт.
 2.  **Context Menu:** Принудительно вызывает `getSelection()` перед открытием меню.
 3.  **UI:** Кнопки поиска используют `terminalSelection` для управления состоянием `disabled` и отображения счетчика символов.
-См. также: `knowledge/terminal-core.md`.
+См. также: `knowledge/fact-fact-terminal-core.md`.
 
 ---
 
@@ -255,7 +255,7 @@ Timeline должен отслеживать видимость сообщени
 
 ### Применение паттерна
 1. **Fork/Rollback:** При создании форка или отката ID сессии передаётся в `createTab()` напрямую.
-2. **History Restore:** При восстановлении вкладки из History (ProjectHome) `claudeSessionId` / `geminiSessionId` берутся из SQLite и передаются в `createTab()`. Sniper Watcher **не нужен** — ID уже известен. См. `features/project-home.md`.
+2. **History Restore:** При восстановлении вкладки из History (ProjectHome) `claudeSessionId` / `geminiSessionId` берутся из SQLite и передаются в `createTab()`. Sniper Watcher **не нужен** — ID уже известен. См. `knowledge/fact-project-home.md`.
 
 ## Результат
 Бесшовный переход между вкладками и мгновенное отображение статуса сессии после отката или восстановления из истории.

@@ -40,7 +40,7 @@ WAITING_PROMPT → DEBOUNCE_PROMPT → send prompt → done
 ### Шаги
 1. **WAITING_PROMPT:** Ждёт появления prompt-символа (`⏵` для Claude v2.1.32+ или `>` для старых версий). Используется `stripVTControlCharacters()` для очистки ANSI.
 2. **DEBOUNCE_PROMPT:** Задержка 300мс после обнаружения промпта (Claude может вывести несколько строк).
-3. **Send prompt:** Отправляет `pendingPrompt` через Bracketed Paste + delayed `\r`. См. `knowledge/terminal-core.md`.
+3. **Send prompt:** Отправляет `pendingPrompt` через Bracketed Paste + delayed `\r`. См. `knowledge/fact-fact-terminal-core.md`.
 
 Thinking mode при запуске обеспечивается `alwaysThinkingEnabled: true` в `~/.claude/settings.json`, Tab (`\t`) больше не отправляется.
 
@@ -62,15 +62,15 @@ Thinking mode при запуске обеспечивается `alwaysThinking
     - **In-App:** Процессы, запущенные из терминалов приложения. Отображаются с указанием "Имя Проекта / Имя Таба".
     - **External:** Процессы, запущенные во внешних терминалах (iTerm, Terminal.app).
     - **Manual Stop:** Каждая карточка процесса имеет кнопку "Stop" (Square icon), которая отправляет сигнал `kill` процессу.
-- **Clean Export:** При копировании сессии блоки кода заменяются на компактные метки. См. `knowledge/ai-export-session.md`.
+- **Clean Export:** При копировании сессии блоки кода заменяются на компактные метки. См. `knowledge/fact-export-session.md`.
 - **Hierarchical Session Tree:** Заголовок экспорта содержит вложенную структуру сессий.
     - **Метки:** `(root)`, `(plan mode)` (новый файл через clear context), `(fork)` (клон файла).
     - **Индикаторы:** `*` помечает активную ветку, `♻️ ×N` показывает количество сжатий контекста в сегменте.
     - **Stats:** Напротив каждой сессии отображается количество сообщений (`messages`).
-- **Backtrace Timeline:** История сессии отображается на вертикальном таймлайне с фильтрацией Undo-веток. См. `features/timeline.md`.
-- **Interrupted Recovery:** При аварийном закрытии показывается оверлей. Покажется только если `currentView === 'terminal'`, чтобы не перекрывать вкладку Home. Выбор пользователя сохраняется в БД. См. `knowledge/ui-ux-patterns.md`.
-- **Session Waiting State:** Промежуточное состояние "Ожидание сессии..." с пульсирующим жёлтым индикатором. См. `knowledge/ai-session-capture.md`.
-- **History Restore:** При восстановлении из History `claudeSessionId` передаётся напрямую в `createTab()` (Immediate Injection). См. `features/project-home.md`.
+- **Backtrace Timeline:** История сессии отображается на вертикальном таймлайне с фильтрацией Undo-веток. См. `knowledge/fact-timeline.md`.
+- **Interrupted Recovery:** При аварийном закрытии показывается оверлей. Покажется только если `currentView === 'terminal'`, чтобы не перекрывать вкладку Home. Выбор пользователя сохраняется в БД. См. `knowledge/fact-ux-patterns.md`.
+- **Session Waiting State:** Промежуточное состояние "Ожидание сессии..." с пульсирующим жёлтым индикатором. См. `knowledge/fact-session-capture.md`.
+- **History Restore:** При восстановлении из History `claudeSessionId` передаётся напрямую в `createTab()` (Immediate Injection). См. `knowledge/fact-project-home.md`.
 - **History View (HistoryPanel):** Окно просмотра полной истории сессий Claude.
     - **Engine:** Нативный скролл с `content-visibility: auto`. Отказ от тяжелых JS-виртуализаторов для стабильности при динамической высоте сообщений (от 30px до 1000px). См. `knowledge/fix-ui-stability.md`.
     - **Rich File Actions:** Детальное отображение изменений файлов прямо в истории. Edit показывает диффы (`+`/`-`), Write показывает превью контента. Каждый файл — отдельный фиолетовый раскрывающийся блок.

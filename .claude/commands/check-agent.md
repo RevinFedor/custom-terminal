@@ -63,11 +63,10 @@ for ch in sorted(changes):
 
 ## Шаг 2. Прочитай constraints
 
-1. Прочитай `docs/architecture.md` — общие Anti-Patterns.
+1. Прочитай `CLAUDE.md` — общие Anti-Patterns.
 2. Для каждого изменённого файла определи релевантные `docs/knowledge/` файлы:
-   - По имени файла/директории (terminal → terminal-core.md, xterm → ui-terminal-rendering.md, tabs → *, claude → claude-*, etc.)
-   - Прочитай каждый найденный knowledge-файл.
-3. Найди соответствующий файл в `docs/features/` и прочитай его.
+   - По имени файла/директории (terminal → fact-terminal-core.md, xterm → fact-terminal-rendering.md, tabs → fact-tabs.md, claude → fact-claude-*, etc.)
+   - Прочитай каждый найденный knowledge-файл (все файлы fix-* и fact-*).
 
 ## Шаг 3. Прочитай изменённые файлы и проверь
 

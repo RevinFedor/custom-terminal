@@ -1,7 +1,7 @@
 #!/bin/bash
 # =============================================================================
 # Semantic Indexer — Phase 1 (Parallel)
-# Сканирует docs/ (и опционально src/), отправляет каждый файл в Haiku 4.5
+# Сканирует docs/knowledge/ (fix-* и fact-*), отправляет в Haiku 4.5
 # через `claude -p`, получает "семантический паспорт" и складывает в .semantic-index.json
 #
 # Запуск: bash scripts/ai/build-index.sh
@@ -76,47 +76,63 @@ cleanup() {
 }
 trap cleanup EXIT
 
-SYSTEM_PROMPT='Ты — Semantic Indexer для проекта Noted Terminal (Electron + React 19 + xterm.js + Claude/Gemini AI).
-Твоя задача — создать семантический JSON-паспорт файла для поисковой системы.
+SYSTEM_PROMPT='You are a Semantic Indexer for Noted Terminal (Electron + React 19 + xterm.js + Claude/Gemini AI).
+Your task: create a semantic JSON passport for a file, used by a search router.
 
-АРХИТЕКТУРА ПРОЕКТА:
-- features/ — бизнес-логика, UI/UX флоу (tabs, timeline, settings, claude-sessions)
-- knowledge/ — шрамы: баги платформ, обходные решения, структурные костыли
-- Electron Main (main.js) ↔ Renderer (React) через IPC
-- PTY терминалы (node-pty + xterm.js), AI интеграция (Claude CLI + Gemini)
-- Zustand стейт, SQLite персистенция, JSONL сессии Claude
+ALL OUTPUT MUST BE IN ENGLISH. Tags, symptoms, questions — everything in English only.
 
-КРИТИЧНЫЕ ПРАВИЛА ДЛЯ implicit ТЕГОВ:
+PROJECT ARCHITECTURE:
+- All docs in docs/knowledge/ — flat structure, two types:
+  - fix-* — scars: bugs, workarounds, structural hacks
+  - fact-* — how subsystems work, platform constraints, feature behavior
+- Electron Main (main.js) ↔ Renderer (React) via IPC
+- PTY terminals (node-pty + xterm.js), AI integration (Claude CLI + Gemini)
+- Zustand state, SQLite persistence, JSONL Claude sessions
 
-1. КОНКРЕТНЫЕ ИМЕНА, НЕ АБСТРАКЦИИ:
-   ПЛОХО: "State Machine Detection", "Race Condition Handling"
-   ХОРОШО: "handshake_prompt_injection", "safePasteAndSubmit_chunking", "rewind_visual_search_rgb"
+RULES FOR implicit TAGS:
 
-2. НАЗВАНИЯ ПОДСИСТЕМ — если файл описывает несколько механизмов, каждый должен быть отдельным тегом:
-   Пример: большой файл содержит 5 подсистем → каждая как отдельный тег: "handshake_auto_prompt", "fork_session_copy", "compact_gap_recovery", "rewind_paste_insert", "silence_detection"
+1. CONCRETE NAMES, NOT ABSTRACTIONS:
+   BAD: "State Machine Detection", "Race Condition Handling"
+   GOOD: "handshake_prompt_injection", "safePasteAndSubmit_chunking", "rewind_visual_search_rgb"
 
-3. СИМПТОМЫ — баги и проблемы, которые приведут пользователя к этому файлу:
-   Пример: файл про sync markers → теги: "terminal_freeze_after_paste", "enter_not_working_after_rewind", "model_switch_kills_claude"
-   Пример: файл про Zustand → теги: "ui_not_updating_after_state_change", "timeline_stale_data", "tab_name_reset_after_restart"
+2. SUBSYSTEM NAMES — if the file describes multiple mechanisms, each gets its own tag:
+   Example: file has 5 subsystems → 5 tags: "handshake_auto_prompt", "fork_session_copy", "compact_gap_recovery", "rewind_paste_insert", "silence_detection"
 
-4. КРОСС-ДОМЕННЫЕ МОСТЫ — 8 категорий неявных связей:
-   a) Zustand silent mutation → UI не обновляется (любой файл с reactivity на store)
+3. CROSS-DOMAIN BRIDGES — 8 categories of hidden connections:
+   a) Zustand silent mutation → UI not updating (any file with store reactivity)
    b) Sync marker validity → safePasteAndSubmit, model switch, Handshake, Rewind (15ms filter)
-   c) Paste path routing → user paste (Tier 1) vs programmatic paste (Tier 2) — разные механизмы
+   c) Paste path routing → user paste (Tier 1) vs programmatic paste (Tier 2)
    d) CSS visibility → Canvas stale → fit() no-op → SIGWINCH → Ink TUI corruption
    e) JSONL chain resolution → bridges → compact gaps → fork contamination
-   f) React useEffect + IPC listener → event drop window при re-subscription
-   g) Vite dollar-sign escaping → escape sequences в main.js ломаются при сборке
-   h) Layout depth sensitivity → одинаковый компонент ведет себя по-разному в разной DOM глубине
+   f) React useEffect + IPC listener → event drop window on re-subscription
+   g) Vite dollar-sign escaping → escape sequences in main.js break after build
+   h) Layout depth sensitivity → same component behaves differently at different DOM depth
 
-   Если файл КАСАЕТСЯ любой из этих категорий (даже косвенно) — добавь соответствующий тег.
+   If the file TOUCHES any of these categories (even indirectly) — add the corresponding tag.
 
-5. ВОПРОСЫ-ТРИГГЕРЫ — представь, какой вопрос задаст разработчик, которому нужен ИМЕННО этот файл:
-   Пример: fix-stale-sync-markers.md → "почему Enter не срабатывает", "paste зависает на 30 секунд", "шрифт загрузился поздно и строки переносятся неправильно"
-   Добавь 2-3 таких триггера как implicit теги в формате вопроса.
+RULES FOR symptoms ARRAY (NEW — CRITICAL):
 
-Ответь СТРОГО JSON (без markdown, без комментариев, без обратных кавычек):
-{"path": "...", "type": "feature|knowledge|architecture|code", "explicit": ["тема1", "тема2"], "implicit": ["конкретный_тег_1", "конкретный_тег_2", "...минимум 8 тегов..."], "related_components": ["src/path/file.tsx"]}'
+The "symptoms" field is the MOST IMPORTANT field for search quality.
+Write 3-5 SHORT ENGLISH SENTENCES describing WHEN a developer needs this file.
+Focus on OBSERVABLE SYMPTOMS, not implementation details.
+
+Example for a file about Zustand silent mutation:
+  "symptoms": [
+    "UI shows stale data after store update",
+    "Timeline displays wrong session after tab switch",
+    "Component does not re-render after state change in Zustand"
+  ]
+
+Example for a file about React patterns with portals:
+  "symptoms": [
+    "Copied range from Timeline returns empty data",
+    "Button in portal resets immediately after click",
+    "Click handler uses outdated state from previous render",
+    "Menu or tooltip is clipped or positioned incorrectly"
+  ]
+
+Respond with STRICT JSON (no markdown, no comments, no backticks):
+{"path": "...", "type": "fix|fact", "explicit": ["topic1", "topic2"], "implicit": ["concrete_tag_1", "concrete_tag_2", "...minimum 8 tags..."], "symptoms": ["When X happens and Y is visible", "If Z returns empty after W"], "related_components": ["src/path/file.tsx"]}'
 
 # Экспортируем для дочерних процессов
 export SYSTEM_PROMPT LOG_FILE RESULTS_DIR
@@ -127,7 +143,7 @@ FILES=()
 
 while IFS= read -r -d '' f; do
   FILES+=("$f")
-done < <(find "$PROJECT_DIR/docs" -name '*.md' -not -path '*/tmp/*' -not -path '*/dev-journal/*' -print0 2>/dev/null)
+done < <(find "$PROJECT_DIR/docs/knowledge" -name '*.md' -print0 2>/dev/null)
 
 if [ "$WITH_SRC" = true ]; then
   echo -e "${YELLOW}Including src/ components and stores...${NC}"

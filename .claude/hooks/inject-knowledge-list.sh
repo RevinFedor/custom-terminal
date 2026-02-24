@@ -1,6 +1,6 @@
 #!/bin/bash
 # Hook: UserPromptSubmit
-# Извлекает ВСЕ ссылки на knowledge/ из CLAUDE.md и docs/architecture.md
+# Извлекает ВСЕ ссылки на knowledge/ из CLAUDE.md
 # и вклеивает их как обязательный список для чтения
 # По умолчанию НЕ инжектит. Инжектит только если промпт начинается с "q " (quality mode)
 
@@ -11,16 +11,12 @@ if [ -z "$PROMPT" ] || ! echo "$PROMPT" | grep -qi '^q '; then
 fi
 
 CLAUDE_FILE="CLAUDE.md"
-ARCH_FILE="docs/architecture.md"
 
 FILES=""
 
-for f in "$CLAUDE_FILE" "$ARCH_FILE"; do
-  if [ -f "$f" ]; then
-    FOUND=$(grep -oE '(docs/)?knowledge/[a-zA-Z0-9_.-]+\.md' "$f")
-    FILES="$FILES"$'\n'"$FOUND"
-  fi
-done
+if [ -f "$CLAUDE_FILE" ]; then
+  FILES=$(grep -oE '(docs/)?knowledge/[a-zA-Z0-9_.-]+\.md' "$CLAUDE_FILE")
+fi
 
 # Нормализуем пути (всё к формату docs/knowledge/...)
 FILES=$(echo "$FILES" | sed 's|^knowledge/|docs/knowledge/|' | sort -u | grep -v '^$')
@@ -33,5 +29,5 @@ if [ -n "$FILES" ]; then
     echo "  - $f"
   done
   echo ""
-  echo "Then find the relevant feature file(s) for the user's request and read ALL knowledge/ files mentioned in them too."
+  echo "Then read ALL related knowledge/ files mentioned inside them."
 fi

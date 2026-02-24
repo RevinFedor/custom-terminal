@@ -122,4 +122,4 @@ export function MarkdownEditor({ includeOffsets }: Props) {
 - @tailwindcss/vite (plugin)
 - React 19
 
-См. `architecture.md` (раздел Styling).
+См. CLAUDE.md.

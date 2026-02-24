@@ -26,4 +26,4 @@
 - **UI (Full Editor):** `src/renderer/components/Workspace/NotesEditorModal.tsx` — основной модальный редактор.
 - **Store:** `src/renderer/store/useUIStore.ts` — управление открытием/закрытием (`notesEditorOpen`).
 - **Backend:** `src/main/project-manager.js` -> `src/main/database.js` — сохранение в SQLite/JSON.
-- **Knowledge:** `docs/knowledge/data-persistence.md` — о стратегии дебаунса и надежного сохранения.
+- **Knowledge:** `docs/knowledge/fact-data-persistence.md` — о стратегии дебаунса и надежного сохранения.
