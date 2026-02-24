@@ -384,12 +384,8 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
       const rowsAfter = term.rows;
       const dimsChanged = colsBefore !== colsAfter || rowsBefore !== rowsAfter;
 
-      if (dims) {
-        if (dimsChanged) {
-          console.warn(`[safeFit] tabId=${tabId} RESIZED ${colsBefore}x${rowsBefore} → ${colsAfter}x${rowsAfter}, sending resize to PTY`);
-        } else {
-          console.warn(`[safeFit] tabId=${tabId} dims unchanged (${colsAfter}x${rowsAfter}), sending resize to PTY anyway`);
-        }
+      if (dims && dimsChanged) {
+        console.warn(`[safeFit] tabId=${tabId} RESIZED ${colsBefore}x${rowsBefore} → ${colsAfter}x${rowsAfter}, sending resize to PTY`);
         ipcRenderer.send('terminal:resize', tabId, dims.cols, dims.rows);
       }
     } catch (e) {

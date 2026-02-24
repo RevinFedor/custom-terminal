@@ -986,6 +986,7 @@ function waitForRender(term, timeoutMs, logPrefix) {
   return new Promise((resolve) => {
     let buf = '';
     let resolved = false;
+    let staleCount = 0;
     const subscribeTime = Date.now();
 
     const cleanup = () => {
@@ -997,7 +998,7 @@ function waitForRender(term, timeoutMs, logPrefix) {
     };
 
     const timer = setTimeout(() => {
-      console.log(logPrefix + ' ⏱️ TIMEOUT (' + timeoutMs + 'ms), buf=' + buf.length + 'B');
+      console.log(logPrefix + ' ⏱️ TIMEOUT (' + timeoutMs + 'ms), buf=' + buf.length + 'B, staleSkipped=' + staleCount);
       cleanup();
       resolve({ timedOut: true });
     }, timeoutMs);
@@ -1009,12 +1010,16 @@ function waitForRender(term, timeoutMs, logPrefix) {
         const elapsed = Date.now() - subscribeTime;
         const isStale = elapsed < 15;
         if (isStale) {
-          console.log(logPrefix + ' ⚠️ STALE sync marker at +' + elapsed + 'ms (data arrived before our write could be processed)');
-        } else {
-          console.log(logPrefix + ' ✅ sync marker at +' + elapsed + 'ms');
+          // Stale marker from previous Ink render (resize, periodic update, etc.)
+          // Discard and wait for the REAL marker from our write
+          staleCount++;
+          console.log(logPrefix + ' ⚠️ STALE sync marker at +' + elapsed + 'ms — discarding, waiting for real marker (stale #' + staleCount + ')');
+          buf = ''; // Reset buffer, keep listening
+          return;
         }
+        console.log(logPrefix + ' ✅ sync marker at +' + elapsed + 'ms' + (staleCount > 0 ? ' (skipped ' + staleCount + ' stale)' : ''));
         cleanup();
-        resolve({ timedOut: false, elapsedMs: elapsed, isStale });
+        resolve({ timedOut: false, elapsedMs: elapsed, isStale: false });
       }
     });
   });

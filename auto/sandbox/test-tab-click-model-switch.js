@@ -3,18 +3,12 @@
  *
  * Воспроизводит баг: при клике по вкладке терминала (TabBar),
  * а не внутри самого терминала, model switch не работает —
- * курсор просто переносится на следующую строку.
- *
- * Сценарий:
- * 1. Запускаем Claude в первом табе (tab-0)
- * 2. Создаём второй таб и переключаемся на него
- * 3. Переключаемся обратно на Claude таб кликом по ВКЛАДКЕ в TabBar
- * 4. Отправляем model switch и проверяем логи
+ * Ctrl+C от safePasteAndSubmit убивает Claude (exitCode=130).
  *
  * Запуск: node auto/sandbox/test-tab-click-model-switch.js
  */
 
-const { launch, waitForTerminal, typeCommand, waitForClaudeSessionId, findInLogs } = require('../core/launcher')
+const { launch, waitForTerminal, typeCommand, waitForClaudeSessionId } = require('../core/launcher')
 const electron = require('../core/electron')
 
 const c = {
@@ -37,17 +31,6 @@ async function getActiveTabId(page) {
   })
 }
 
-async function getTabInfo(page) {
-  return page.evaluate(() => {
-    const s = window.useWorkspaceStore?.getState?.()
-    const p = s?.openProjects?.get?.(s?.activeProjectId)
-    if (!p?.tabs) return { tabs: [], activeTabId: null, tabOrder: [] }
-    const tabs = []
-    p.tabs.forEach((t, id) => tabs.push({ id, name: t.name, commandType: t.commandType, claudeSessionId: t.claudeSessionId }))
-    return { tabs, activeTabId: p.activeTabId, tabOrder: p.tabOrder || [] }
-  })
-}
-
 async function getTerminalContent(page, lastN = 20) {
   return page.evaluate((n) => {
     const rows = document.querySelectorAll('.xterm-rows > div')
@@ -67,9 +50,6 @@ async function sendModelSwitch(page, tabId, model) {
   }, { tid: tabId, cmd: model })
 }
 
-/**
- * Switch to a specific tab via store (programmatic, like Cmd+click)
- */
 async function switchToTabViaStore(page, tabId) {
   await page.evaluate((tid) => {
     const s = window.useWorkspaceStore?.getState?.()
@@ -81,263 +61,194 @@ async function switchToTabViaStore(page, tabId) {
 }
 
 /**
- * Click on a tab in TabBar by finding the DOM element that contains the tab name text.
- * This clicks on the [data-tab-item] element, NOT inside the terminal.
+ * Click on a tab in TabBar by its store tab ID.
+ * Gets tab name from store, then clicks the matching [data-tab-item].
  */
-async function clickTabByName(page, name) {
+async function clickTabInTabBarById(page, tabId) {
+  // Get the tab name from the store
+  const tabName = await page.evaluate((tid) => {
+    const s = window.useWorkspaceStore?.getState?.()
+    const p = s?.openProjects?.get?.(s?.activeProjectId)
+    return p?.tabs?.get?.(tid)?.name
+  }, tabId)
+  log.info(`Tab "${tabId?.slice(-8)}" has name "${tabName}"`)
+
+  if (!tabName) {
+    log.warn('Tab name is null!')
+    return false
+  }
+
+  // Find the EXACT tab name match in DOM
   const tabItems = page.locator('[data-tab-item]')
   const count = await tabItems.count()
-  log.info(`Looking for tab "${name}" among ${count} tab items...`)
 
   for (let i = 0; i < count; i++) {
-    const text = await tabItems.nth(i).textContent()
-    log.info(`  tab[${i}] text: "${text?.trim()}"`)
-    if (text?.trim()?.toLowerCase().includes(name.toLowerCase())) {
-      log.info(`  → clicking tab[${i}]`)
+    const text = (await tabItems.nth(i).textContent())?.trim()
+    if (text === tabName) {
+      log.info(`Clicking tab[${i}] text="${text}"`)
       await tabItems.nth(i).click()
       return true
     }
   }
-  log.warn(`Tab with name "${name}" not found in DOM`)
+
+  log.warn(`Tab "${tabName}" not found in ${count} DOM items`)
   return false
 }
 
-async function clickInsideTerminal(page) {
-  // Multiple .xterm-screen elements exist (one per tab). Use .first() for the visible one.
-  const terminal = page.locator('.xterm-screen').first()
-  await terminal.click()
+/**
+ * Create a new tab and return its ID.
+ * Names the tab for easy identification.
+ */
+async function createFreshTab(page) {
+  await page.keyboard.press('Meta+t')
+  await page.waitForTimeout(1500)
+  return getActiveTabId(page)
 }
 
-async function isClaudeAlive(page, tabId) {
-  return page.evaluate((tid) => {
-    const s = window.useWorkspaceStore?.getState?.()
-    const p = s?.openProjects?.get?.(s?.activeProjectId)
-    const t = tid ? p?.tabs?.get?.(tid) : p?.tabs?.get?.(p?.activeTabId)
-    return {
-      alive: !!(t?.commandType === 'claude' || t?.claudeSessionId),
-      commandType: t?.commandType,
-      sessionId: t?.claudeSessionId?.slice(0, 8)
-    }
-  }, tabId)
-}
 
 async function main() {
   log.step('Запуск Noted Terminal...')
-  const { app, page, consoleLogs, mainProcessLogs } = await launch({
+  const { app, page, mainProcessLogs } = await launch({
     logConsole: false, logMainProcess: true, waitForReady: 4000
   })
   log.pass('Приложение запущено')
 
   try {
-    // ═══════════════════════════════════════════════════════════
-    // SETUP: Launch Claude in the default tab
-    // ═══════════════════════════════════════════════════════════
     log.step('Ожидание терминала...')
     await waitForTerminal(page, 15000)
     await electron.focusWindow(app)
     await page.waitForTimeout(500)
 
-    // Use the default tab (tab-0) — no need to create a new one
+    // ═══════════════════════════════════════════════════════════
+    // SETUP: Create FRESH tab for Claude (avoid stale session data)
+    // ═══════════════════════════════════════════════════════════
+    log.step('Создание свежего таба для Claude...')
+    const claudeTabId = await createFreshTab(page)
+    log.info('Fresh Claude tab: ' + claudeTabId)
+
+    // Note: don't rename — Claude auto-renames on launch
+
     await typeCommand(page, 'cd /Users/fedor/Desktop/custom-terminal')
     await page.waitForTimeout(2000)
 
-    const claudeTabId = await getActiveTabId(page)
-    log.info('Claude tab ID: ' + claudeTabId)
-
     log.step('Запуск Claude...')
     await typeCommand(page, 'claude')
+
+    // Wait for NEW session ID (not a stale one)
     try {
       await waitForClaudeSessionId(page, 30000)
       log.pass('Session ID detected')
     } catch {
-      log.warn('Session ID timeout — continuing anyway')
+      log.warn('Session ID timeout')
     }
 
+    // Verify Claude is actually running by checking terminal content
     log.step('Ожидание готовности Claude (5с)...')
     await page.waitForTimeout(5000)
 
-    // Dump tab info
-    let info = await getTabInfo(page)
-    log.info('Tabs: ' + JSON.stringify(info.tabs.map(t => `${t.name}(${t.id.slice(-6)})`)))
-    log.info('Active: ' + info.activeTabId?.slice(-6))
+    const claudeContent = await getTerminalContent(page, 5)
+    log.info('Claude terminal: ' + claudeContent.substring(0, 100))
 
-    // Create second tab to have something to switch away to
-    log.step('Создание второго таба (Cmd+T)...')
-    await page.keyboard.press('Meta+t')
-    await page.waitForTimeout(1500)
+    if (claudeContent.includes('fedor@') && !claudeContent.includes('>')) {
+      log.fail('Claude did not start — still at shell prompt!')
+      return
+    }
+    log.pass('Claude appears to be running')
 
-    const secondTabId = await getActiveTabId(page)
-    log.info('Second tab ID: ' + secondTabId)
+    // Create a second tab (to switch away from Claude)
+    log.step('Создание второго таба...')
+    const otherTabId = await createFreshTab(page)
+    // Don't rename — just use as-is
+    log.info('Other tab: ' + otherTabId)
 
-    info = await getTabInfo(page)
-    log.info('All tabs after: ' + JSON.stringify(info.tabs.map(t => `${t.name}(${t.id.slice(-6)})`)))
-    log.info('Active: ' + info.activeTabId?.slice(-6))
-
-    // We're now on the second (empty) tab.
-    // The Claude tab should be named "claude" (name updates when claude starts).
+    // We're now on the OTHER tab.
 
     // ═══════════════════════════════════════════════════════════
     // TEST A: Click TAB in TabBar → Model Switch (BUG scenario)
     // ═══════════════════════════════════════════════════════════
-    console.log(`\n${c.bold}═══ TEST A: Click TAB → Model Switch ═══${c.reset}`)
+    console.log(`\n${c.bold}═══ TEST A: Click TAB → Model Switch (no terminal click) ═══${c.reset}`)
 
-    log.step('Переключение на Claude таб кликом по ВКЛАДКЕ...')
     const logMarkA = mainProcessLogs.length
 
-    const found = await clickTabByName(page, 'claude')
-    if (!found) {
-      // Fallback: try clicking by tab with claudeSessionId
-      log.warn('Fallback: switching via store...')
-      await switchToTabViaStore(page, claudeTabId)
+    // Switch back to Claude tab by clicking the tab in DOM
+    log.step('Click on Claude tab in TabBar...')
+    const clicked = await clickTabInTabBarById(page, claudeTabId)
+    if (!clicked) {
+      log.fail('Could not find Claude tab in TabBar!')
+      return
     }
-    await page.waitForTimeout(1500) // Wait for activation + safeFit
-
-    // Verify we switched
-    const activeAfterClick = await getActiveTabId(page)
-    log.info('Active tab after click: ' + activeAfterClick?.slice(-6) + ' (expected: ' + claudeTabId?.slice(-6) + ')')
-    if (activeAfterClick === claudeTabId) {
-      log.pass('Switched to Claude tab')
-    } else {
-      log.fail('Did NOT switch to Claude tab!')
-    }
-
-    // Check Claude is alive before
-    const beforeState = await isClaudeAlive(page, claudeTabId)
-    log.info('Claude before model switch: ' + JSON.stringify(beforeState))
-
-    // Model switch WITHOUT clicking inside terminal
-    log.step('Model switch (sonnet) — WITHOUT clicking inside terminal...')
-    const contentBefore = await getTerminalContent(page, 5)
-    log.info('Terminal before: ' + contentBefore.substring(0, 100))
-
-    await sendModelSwitch(page, claudeTabId, 'sonnet')
-    await page.waitForTimeout(6000)
-
-    const contentAfterA = await getTerminalContent(page, 10)
-    log.info('Terminal after A: ' + contentAfterA.substring(0, 200))
-
-    // Check if Claude is still alive (main indicator)
-    const afterStateA = await isClaudeAlive(page, claudeTabId)
-    log.info('Claude after model switch: ' + JSON.stringify(afterStateA))
-
-    const modelSwitchA = afterStateA.alive && !contentAfterA.includes('fedor@') // shell prompt = Claude died
-
-    // Logs
-    const logsA = mainProcessLogs.slice(logMarkA)
-    console.log(`\n--- Logs (Test A) ---`)
-    logsA.filter(l =>
-      l.includes('safeFit') || l.includes('terminal:resize') ||
-      l.includes('send-command') || l.includes('safePasteAndSubmit') ||
-      l.includes('waitForRender') || l.includes('sync marker') ||
-      l.includes('TabBar:click')
-    ).forEach(l => console.log('  ' + l.trim()))
-    console.log('---')
-
-    if (modelSwitchA) {
-      log.pass('TEST A: Model switch worked after tab click')
-    } else {
-      log.fail('TEST A: Model switch FAILED after tab click')
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    // TEST B: Click INSIDE terminal → Model Switch (WORKING scenario)
-    // ═══════════════════════════════════════════════════════════
-    console.log(`\n${c.bold}═══ TEST B: Click INSIDE terminal → Model Switch ═══${c.reset}`)
-
-    // Test A killed Claude. Dismiss overlay + restart.
-    log.step('Dismiss overlay + restart Claude for Test B...')
-    await page.evaluate((tid) => {
-      const s = window.useWorkspaceStore?.getState?.()
-      if (s?.dismissInterruptedSession) s.dismissInterruptedSession(tid)
-      // Also manually clear flags
-      const proj = s?.openProjects?.get?.(s?.activeProjectId)
-      const tab = proj?.tabs?.get?.(tid)
-      if (tab) {
-        tab.wasInterrupted = false
-        tab.overlayDismissed = true
-        tab.commandType = undefined
-        tab.claudeSessionId = undefined
-      }
-    }, claudeTabId)
-    await page.waitForTimeout(500)
-
-    // Click terminal (overlay dismissed)
-    await clickInsideTerminal(page)
-    await page.waitForTimeout(300)
-
-    // Restart Claude
-    log.step('Restarting Claude...')
-    await typeCommand(page, 'claude')
-    try {
-      await waitForClaudeSessionId(page, 30000)
-      log.pass('Claude restarted for Test B')
-    } catch { log.warn('Session ID timeout on restart') }
-    await page.waitForTimeout(5000)
-
-    // Switch away, then back via tab click, then click inside terminal
-    log.step('Switching away to second tab...')
-    await switchToTabViaStore(page, secondTabId)
-    await page.waitForTimeout(1000)
-
-    log.step('Switching back to Claude tab (tab click)...')
-    await clickTabByName(page, 'claude')
     await page.waitForTimeout(1500)
 
-    // THIS TIME: click inside terminal first
-    log.step('Клик ВНУТРИ терминала...')
-    const logMarkB = mainProcessLogs.length
-    await clickInsideTerminal(page)
-    await page.waitForTimeout(500)
+    const activeA = await getActiveTabId(page)
+    log.info('Active after tab click: ' + activeA?.slice(-8))
+    if (activeA !== claudeTabId) {
+      log.fail('Wrong tab active!')
+    }
 
-    log.step('Model switch (opus) — AFTER clicking inside terminal...')
-    await sendModelSwitch(page, claudeTabId, 'opus')
-    await page.waitForTimeout(6000)
+    // Send model switch WITHOUT clicking inside terminal
+    log.step('Sending /model sonnet via IPC...')
+    await sendModelSwitch(page, claudeTabId, 'sonnet')
+    await page.waitForTimeout(8000) // Wait for safePasteAndSubmit to finish
 
-    const contentAfterB = await getTerminalContent(page, 10)
-    log.info('Terminal after B: ' + contentAfterB.substring(0, 200))
+    const contentA = await getTerminalContent(page, 15)
+    log.info('Terminal after A:\n' + contentA.substring(0, 300))
 
-    const afterStateB = await isClaudeAlive(page, claudeTabId)
-    log.info('Claude after B: ' + JSON.stringify(afterStateB))
+    // Collect safePasteAndSubmit logs
+    const logsA = mainProcessLogs.slice(logMarkA)
 
-    const modelSwitchB = afterStateB.alive
-
-    const logsB = mainProcessLogs.slice(logMarkB)
-    console.log(`\n--- Logs (Test B) ---`)
-    logsB.filter(l =>
-      l.includes('safeFit') || l.includes('terminal:resize') ||
+    // Check: did Claude exit? Look for exitCode=130 in main process logs for our tab
+    const tabSuffix = claudeTabId.slice(-8)
+    const exitLogs = logsA.filter(l => l.includes('exitCode=130') && l.includes(tabSuffix))
+    const aliveA = exitLogs.length === 0
+    // Check: did model actually switch? Look for "Set m" or model name in terminal
+    const switchedA = contentA.includes('/model') && (contentA.includes('Set m') || contentA.includes('Already') || contentA.includes('sonnet'))
+    // Check: DangerZone was triggered? (Ctrl+C wasted on exit warning)
+    const dzTriggered = logsA.some(l => l.includes('DangerZone') && l.includes('ON') && l.includes(tabSuffix))
+    log.info('alive: ' + aliveA + ', switched: ' + switchedA + ', DZ triggered: ' + dzTriggered)
+    console.log(`\n--- Key Logs (Test A) ---`)
+    logsA.filter(l =>
       l.includes('send-command') || l.includes('safePasteAndSubmit') ||
-      l.includes('waitForRender') || l.includes('sync marker')
+      l.includes('Render timeout') || l.includes('sync marker') ||
+      l.includes('terminal:resize') || l.includes('safeFit') ||
+      l.includes('exitCode=130') || l.includes('Command FINISHED') ||
+      l.includes('Prompt ready')
     ).forEach(l => console.log('  ' + l.trim()))
     console.log('---')
 
-    if (modelSwitchB) {
-      log.pass('TEST B: Model switch worked after terminal click')
+    if (aliveA && switchedA && !dzTriggered) {
+      log.pass('TEST A: Model switch worked cleanly after tab click')
+    } else if (aliveA && switchedA && dzTriggered) {
+      log.warn('TEST A: Model switch worked BUT DangerZone was triggered (Ctrl+C caused exit warning)')
+      log.warn('This means Ctrl+C was not just clearing input — it was interpreted as exit attempt')
+    } else if (!aliveA) {
+      log.fail('TEST A: Claude DIED (exitCode=130)')
     } else {
-      log.fail('TEST B: Model switch FAILED after terminal click')
+      log.fail('TEST A: Model switch did not work')
     }
+
+    // Check stale marker handling
+    const staleSkipped = logsA.some(l => l.includes('STALE') && l.includes('discarding'))
+    const realMarkerOk = logsA.some(l => l.includes('✅ sync marker') && l.includes('skipped'))
 
     // ═══════════════════════════════════════════════════════════
     // SUMMARY
     // ═══════════════════════════════════════════════════════════
     console.log(`\n${c.bold}═══════════════════════════════════════${c.reset}`)
-    console.log(`  Test A (Tab Click → Model):      ${modelSwitchA ? c.green + 'PASS' : c.red + 'FAIL'}${c.reset}`)
-    console.log(`  Test B (Terminal Click → Model):  ${modelSwitchB ? c.green + 'PASS' : c.red + 'FAIL'}${c.reset}`)
+    console.log(`  Claude alive:     ${aliveA ? c.green + 'YES' : c.red + 'NO'}${c.reset}`)
+    console.log(`  Model switched:   ${switchedA ? c.green + 'YES' : c.red + 'NO'}${c.reset}`)
+    console.log(`  DZ triggered:     ${dzTriggered ? c.yellow + 'YES (exit warning)' : c.green + 'NO'}${c.reset}`)
+    console.log(`  Stale skipped:    ${staleSkipped ? c.green + 'YES (fix working)' : c.yellow + 'NO'}${c.reset}`)
+    console.log(`  Real marker OK:   ${realMarkerOk ? c.green + 'YES' : c.red + 'NO'}${c.reset}`)
 
-    if (!modelSwitchA && modelSwitchB) {
-      console.log(`\n${c.yellow}${c.bold}BUG CONFIRMED: Tab click breaks model switch${c.reset}`)
-    } else if (modelSwitchA && modelSwitchB) {
-      console.log(`\n${c.green}${c.bold}Both work — bug not reproduced${c.reset}`)
-    } else if (!modelSwitchA && !modelSwitchB) {
-      console.log(`\n${c.red}${c.bold}Both fail — different issue${c.reset}`)
+    const overallPass = aliveA && switchedA && !dzTriggered
+    console.log(`\n  Overall: ${overallPass ? c.green + 'PASS' : (aliveA && switchedA) ? c.yellow + 'PARTIAL' : c.red + 'FAIL'}${c.reset}`)
+
+    if (dzTriggered) {
+      console.log(`\n${c.yellow}DangerZone was triggered — Ctrl+C hit Claude's "exit warning" state.`)
+      console.log(`This happens because Ctrl+C is sent to a CLEAN prompt (no input to clear).`)
+      console.log(`Fix: skip Ctrl+C when Claude is at empty prompt, or drain DZ before paste.${c.reset}`)
     }
     console.log(`${c.bold}═══════════════════════════════════════${c.reset}`)
-
-    // Dump ALL safePasteAndSubmit + resize logs
-    console.log(`\n--- ALL safePasteAndSubmit + resize logs ---`)
-    mainProcessLogs
-      .filter(l => l.includes('safePasteAndSubmit') || l.includes('sync marker') || l.includes('terminal:resize') || l.includes('safeFit'))
-      .forEach(l => console.log('  ' + l.trim()))
-    console.log('---')
 
   } finally {
     log.step('Закрытие...')
