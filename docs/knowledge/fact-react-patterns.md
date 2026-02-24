@@ -151,7 +151,7 @@ return createPortal(
 - **Точность:** Логика срабатывает мгновенно и не зависит от скорости движения мыши (в отличие от дебаунса).
 
 ## Примеры реализации
-- `docs/features/timeline.md`: Превью сообщений.
+- `docs/knowledge/fact-timeline.md`: Превью сообщений.
 - `src/renderer/components/Workspace/panels/ActionsPanel.tsx`: Меню настроек копирования (📋).
 
 ## Когда применять

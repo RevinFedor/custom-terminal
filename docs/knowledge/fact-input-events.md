@@ -24,13 +24,13 @@ term.write('\r'); // Now send Enter separately
 ---
 
 ## Large Text Input (Buffer Overflow)
-**Файл-источник:** `terminal-core.md`
+**Файл-источник:** `fact-terminal-core.md`
 
 ### Problem
 Вставка текста > 4KB (длинные промпты) обрывается из-за ограничений буфера TTY в ОС.
 
 ### Solution
-Реализована функция `writeToPtySafe` с разбиением на чанки по 1KB и использованием **Bracketed Paste Mode**. Подробности в `knowledge/terminal-core.md`.
+Реализована функция `writeToPtySafe` с разбиением на чанки по 1KB и использованием **Bracketed Paste Mode**. Подробности в `knowledge/fact-fact-terminal-core.md`.
 
 ---
 

@@ -1422,24 +1422,78 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
     });
   }
 
+  // Helper: drain any pending PTY data (wait for silence)
+  function drainPtyData(ms = 300) {
+    return new Promise((resolve) => {
+      let buf = '';
+      let timer = null;
+      const sub = term.onData((data) => {
+        buf += data;
+        if (timer) clearTimeout(timer);
+        timer = setTimeout(() => { sub.dispose(); resolve(buf); }, ms);
+      });
+      // If no data comes at all, resolve after ms
+      timer = setTimeout(() => { sub.dispose(); resolve(buf); }, ms);
+    });
+  }
+
   try {
-    // Step 1: Ctrl+C to cancel current input
-    term.write('\x03');
-    await new Promise(r => setTimeout(r, 50));
+    // Step 0: Check DangerZone — if active, wait for it to clear (same pattern as toggle-thinking)
+    // Ctrl+C at idle prompt triggers DZ ("Press Ctrl-C again to exit"),
+    // and Escape cannot open the Rewind menu while DZ is active.
+    const dz = claudeCtrlCDangerZone.get(tabId);
+    if (dz) {
+      console.log('[Restore:History] ⚠️ DangerZone active — waiting for prompt return...');
+      await dz.promise;
+      console.log('[Restore:History] ✅ DangerZone cleared, proceeding');
+    }
+
+    // Step 1: Ctrl+C to cancel current input (only if Claude might be busy)
+    // Use sendAndCaptureRaw to properly wait for Ink re-render before next step
+    console.log('[Restore:History] Step 1: Ctrl+C');
+    try {
+      await sendAndCaptureRaw('\x03', 3000);
+    } catch (e) {
+      // Ctrl+C might not produce sync marker if Claude is already idle — that's OK
+      console.log('[Restore:History] Ctrl+C sync: ' + e.message + ' (OK, continuing)');
+    }
+
+    // Step 1.5: If Ctrl+C triggered DangerZone, wait for it to clear
+    const dzAfter = claudeCtrlCDangerZone.get(tabId);
+    if (dzAfter) {
+      console.log('[Restore:History] ⚠️ Ctrl+C triggered DangerZone — waiting for clear...');
+      await dzAfter.promise;
+      console.log('[Restore:History] ✅ DangerZone cleared after Ctrl+C');
+      // Drain any residual PTY data after DZ clear
+      await drainPtyData(300);
+    }
 
     // Step 2: First Escape (prep)
+    // Escape (\x1b) doesn't produce \x1b[?2026l sync markers — Ink needs ~200ms
+    // to distinguish standalone Escape from ANSI sequence start (\x1b[A etc.)
+    // So we use fixed delays instead of sendAndCaptureRaw.
+    console.log('[Restore:History] Step 2: First Escape');
     term.write('\x1b');
-    await new Promise(r => setTimeout(r, 100));
+    await new Promise(r => setTimeout(r, 500));
 
-    // Step 3: Second Escape → Rewind menu opens
-    // Initial render usually has the full text, so we can parse structure
-    const menuRaw = await sendAndCaptureRaw('\x1b');
+    // Step 3: Second Escape → Rewind menu should open
+    // Use drainPtyData to capture whatever Ink renders after the menu opens
+    console.log('[Restore:History] Step 3: Second Escape (menu)');
+    term.write('\x1b');
+    // Wait for Ink to process Escape (~200ms) + render the menu
+    const menuRaw = await drainPtyData(800);
+
     const menuClean = cleanBuffer(menuRaw);
     const initialState = parseMenu(menuClean);
     const knownEntries = initialState.entries;
     let cursorPos = initialState.cursorIndex;
 
     console.log('[Restore:History] Menu opened: ' + knownEntries.length + ' entries, cursor=' + cursorPos);
+    if (knownEntries.length > 0) {
+      console.log('[Restore:History] Menu entries: ' + knownEntries.map(e => e.substring(0, 40)).join(' | '));
+    } else {
+      console.log('[Restore:History] Menu raw (first 500): ' + menuRaw.substring(0, 500).replace(/[\x00-\x1f]/g, '.'));
+    }
 
     // Step 4: Navigate to target entry
     const targetPrefix = (targetText || '').substring(0, 40);
@@ -1502,7 +1556,7 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
             await new Promise(r => setTimeout(r, 200));
         } catch (ign) {}
         
-        return { success: false, error: 'Target not found in Claude history menu' };
+        return { success: false, error: 'Target not found in Claude history menu', cursorIndex: cursorPos, targetIndex: targetIdx, pressCount, menuEntries: knownEntries.length };
     }
 
     // Step 5: Confirm selection with Enter
@@ -1563,7 +1617,7 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
       });
     }
 
-    return { success: true, found };
+    return { success: true, found, cursorIndex: cursorPos, targetIndex: targetIdx, pressCount };
 
   } catch (err) {
     console.log('[Restore:History] Error:', err.message);

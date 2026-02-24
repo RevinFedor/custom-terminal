@@ -80,7 +80,7 @@ ipcRenderer.send('claude:send-command', tabId, '/model sonnet');
 1. Обычные терминалы (bash/zsh) не шлют sync markers → 5-сек таймаут на каждый чанк.
 2. xterm.js уже добавил brackets → `safePasteAndSubmit` создавала второй слой → двойное обрамление.
 
-Подробнее: `knowledge/terminal-core.md` (секция "Двухуровневая система вставки").
+Подробнее: `knowledge/fact-fact-terminal-core.md` (секция "Двухуровневая система вставки").
 
 ### Алгоритм `safePasteAndSubmit`:
 1. **Chunking:** Контент делится на чанки по ~900 байт.

@@ -353,11 +353,11 @@ if (state.isRunning) {
 - `src/renderer/store/useWorkspaceStore.ts`
 
 ## Related
-- `terminal-core.md` - OSC 133 protocol specification
-- `terminal-core.md` - Similar event-driven pattern for CWD tracking
-- `ui-input-events.md` (section 8) - execSync → execAsync migration
+- `fact-terminal-core.md` - OSC 133 protocol specification
+- `fact-terminal-core.md` - Similar event-driven pattern for CWD tracking
+- `fact-input-events.md` (section 8) - execSync → execAsync migration
 
-## Критическое правило (см. architecture.md)
+## Критическое правило (см. CLAUDE.md)
 **ЗАПРЕЩЁН polling через `pgrep`/`ps`** для определения статуса процесса. Использовать только:
 - `terminal:getCommandState` (читает из памяти, 0 syscalls)
 - IPC-события `terminal:command-started` / `terminal:command-finished`

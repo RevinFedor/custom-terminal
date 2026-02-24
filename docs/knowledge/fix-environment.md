@@ -1,5 +1,5 @@
 # Environment, OS & Infrastructure\n
-\n---\n## File: environment-fixes.md\n
+\n---\n## File: fix-environment.md\n
 # Fix: Electron-vite окно не появляется на macOS
 
 ## Проблема
@@ -76,7 +76,7 @@ app.whenReady().then(() => {
 - macOS NSApplicationActivationPolicy
 - Electron app.setActivationPolicy() API
 - electron-vite process model
-\n---\n## File: environment-fixes.md\n
+\n---\n## File: fix-environment.md\n
 # Fix: MacOS Titlebar Click & Drag Conflict
 
 ## Проблема
@@ -92,7 +92,7 @@ app.whenReady().then(() => {
 
 ## Результат
 Пользователь может перетаскивать окно за любую свободную часть шапки, но при этом двойной клик по пустой зоне создает проект, а двойной клик слева — масштабирует окно.
-\n---\n## File: environment-fixes.md\n
+\n---\n## File: fix-environment.md\n
 # Knowledge: Title Bar — Layered Drag Strategy
 
 ## Проблема
@@ -185,7 +185,7 @@ const handleMouseDown = () => {
 ## Связанные файлы
 - `src/renderer/App.tsx` — Title Bar, ProjectTabItem, ProjectEmptyDropZone
 - `src/renderer/styles/globals.css` — `.title-bar`, `.window-controls-placeholder`
-\n---\n## File: environment-fixes.md\n
+\n---\n## File: fix-environment.md\n
 # ОПЫТ: Экранирование символов в Main процессе (Vite Transform Error)
 
 ## Проблема
@@ -218,7 +218,7 @@ const cmd = 'lsof -p ' + pid + ' | grep cwd | awk \'{print ' + '\$' + '9}\'';
 
 ## Результат
 Ошибка сборки устранена, команды корректно передаются в оболочку.
-\n---\n## File: environment-fixes.md\n
+\n---\n## File: fix-environment.md\n
 # Fact: Gemini CLI Behavior
 
 Внешние особенности работы с Gemini CLI в Raw Mode.
@@ -236,7 +236,7 @@ const cmd = 'lsof -p ' + pid + ' | grep cwd | awk \'{print ' + '\$' + '9}\'';
 - Библиотека от Atlassian (`@atlaskit/pragmatic-drag-and-drop`).
 - **Особенности:** Не предоставляет готовых UI-компонентов, только логику.
 - **Индикаторы:** Должны реализовываться через Absolute Overlay, чтобы избежать Layout Shift во Flexbox-контейнерах.
-\n---\n## File: environment-fixes.md\n
+\n---\n## File: fix-environment.md\n
 # Fact: Log Compression Algorithms
 
 В приложении реализована интеллектуальная очистка логов для экономии контекстного окна AI и улучшения читаемости.

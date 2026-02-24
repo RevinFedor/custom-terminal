@@ -72,4 +72,4 @@ Claude только добавляет запись типа `compact_boundary`,
 `sessionBoundaries` из `resolveSessionChain` НЕ содержит всех plan mode переходов. Записи внутри `entries` при этом СОДЕРЖАТ правильные `sessionId` (из оригинальных данных).
 
 ### Решение (Timeline)
-Plan mode маркеры в Timeline детектируются **не через `sessionBoundaries`**, а через прямое сравнение `entry.sessionId` между соседними записями. Если `sessionId` меняется и в этой позиции нет fork-маркера → это plan mode граница. См. `features/timeline.md`.
+Plan mode маркеры в Timeline детектируются **не через `sessionBoundaries`**, а через прямое сравнение `entry.sessionId` между соседними записями. Если `sessionId` меняется и в этой позиции нет fork-маркера → это plan mode граница. См. `knowledge/fact-timeline.md`.
