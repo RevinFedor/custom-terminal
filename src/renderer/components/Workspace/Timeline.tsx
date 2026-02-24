@@ -76,6 +76,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
   const [rewindState, setRewindState] = useState<{ index: number; phase: 'compacting' | 'rewinding' | 'pasting' | 'done' } | null>(null);
 
   const notesPanelWidth = useUIStore(state => state.notesPanelWidth);
+  const copyIncludeEditing = useUIStore(state => state.copyIncludeEditing);
+  const copyIncludeReading = useUIStore(state => state.copyIncludeReading);
   const setHistoryScrollToUuid = useUIStore(state => state.setHistoryScrollToUuid);
   const isHistoryOpen = useUIStore(state => state.historyPanelOpenTabs[tabId] ?? false);
   const historyVisibleUuids = useUIStore(state => state.historyVisibleUuids[tabId]);
@@ -487,11 +489,14 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
         ? 'Plan to implement'
         : entry.content.split('\n')[0].slice(0, 80).trim();
       if (searchText) {
-        // Count earlier entries with the same search key (duplicate handling)
+        // Count earlier entries with the same search key (duplicate handling).
+        // Only count same-type entries: isValidMatch in terminal only passes for
+        // user prompts (preceded by ❯/⏵/>), so assistant entries with same text
+        // would inflate the count but never match in the buffer.
         let occurrenceIndex = 0;
         for (let i = 0; i < index; i++) {
           const e = entries[i];
-          if (e.type === 'compact' || e.type === 'continued') continue;
+          if (e.type !== entry.type) continue;
           const eKey = e.isPlan
             ? 'Plan to implement'
             : e.content.split('\n')[0].slice(0, 80).trim();
@@ -578,7 +583,9 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
         sessionId,
         cwd,
         startUuid: startId,
-        endUuid: endEntry.uuid
+        endUuid: endEntry.uuid,
+        includeEditing: copyIncludeEditing,
+        includeReading: copyIncludeReading,
       });
 
       // Loading done — hide blinking blue
@@ -641,7 +648,16 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
     const targetIndex = userEntries.findIndex(e => e.uuid === entry.uuid);
     if (targetIndex === -1) return;
 
-    console.warn('[Restore:Rewind] Starting rewind to entry', targetIndex, '/', userEntries.length, '- uuid:', entry.uuid);
+    // Count duplicate prefixes AFTER the target (we navigate UP from bottom,
+    // so we encounter newer duplicates first and need to skip them)
+    const targetPrefix = entry.content.trim().substring(0, 40);
+    let skipDuplicates = 0;
+    for (let i = targetIndex + 1; i < userEntries.length; i++) {
+      const ePrefix = userEntries[i].content.trim().substring(0, 40);
+      if (ePrefix === targetPrefix) skipDuplicates++;
+    }
+
+    console.warn('[Restore:Rewind] Starting rewind to entry', targetIndex, '/', userEntries.length, '- uuid:', entry.uuid, 'skipDuplicates:', skipDuplicates);
 
     // Phase 1: Compact entries being lost (from next entry to end)
     let compactText = '';
@@ -720,6 +736,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
         tabId,
         targetIndex,
         targetText: entry.content.trim().substring(0, 40),
+        skipDuplicates,
         pasteAfter: compactText || undefined
       });
       console.warn('[Restore:Rewind] Rewind result:', rewindResult.success ? 'OK' : 'FAIL',
