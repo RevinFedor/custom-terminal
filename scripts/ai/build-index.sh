@@ -1,21 +1,24 @@
 #!/bin/bash
 # =============================================================================
-# Semantic Indexer — Phase 1
+# Semantic Indexer — Phase 1 (Parallel)
 # Сканирует docs/ (и опционально src/), отправляет каждый файл в Haiku 4.5
 # через `claude -p`, получает "семантический паспорт" и складывает в .semantic-index.json
 #
 # Запуск: bash scripts/ai/build-index.sh
-# Опции: --with-src  — также индексировать src/ (только компоненты и сторы)
+# Опции: --with-src    — также индексировать src/ (компоненты и сторы)
+#         --parallel N  — количество параллельных запросов (по умолчанию 10)
 #
 # CLAUDE.md переименовывается автоматически (mv → .bak) и восстанавливается при выходе
 # =============================================================================
 
-# НЕ используем set -e — обрабатываем ошибки вручную
 set -u
 
 PROJECT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 INDEX_FILE="$PROJECT_DIR/.semantic-index.json"
 LOG_FILE="$PROJECT_DIR/scripts/ai/indexer.log"
+RESULTS_DIR=$(mktemp -d /tmp/indexer-results-XXXXXXXX)
+
+MAX_PARALLEL=10
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -23,7 +26,16 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-# Очищаем лог
+# Парсим аргументы
+WITH_SRC=false
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --with-src) WITH_SRC=true; shift ;;
+    --parallel) MAX_PARALLEL="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+
 echo "=== Indexer started: $(date) ===" > "$LOG_FILE"
 
 log() {
@@ -53,12 +65,13 @@ if [ -f "$PROJECT_DIR/CLAUDE.md" ]; then
   echo -e "${GREEN}CLAUDE.md → CLAUDE.md.bak (будет восстановлен в конце)${NC}"
 fi
 
-# Гарантируем восстановление CLAUDE.md при любом выходе (Ctrl+C, ошибка, успех)
+# Гарантируем восстановление CLAUDE.md и очистку tmp при любом выходе
 cleanup() {
   if [ "$CLAUDE_MD_MOVED" = true ] && [ -f "$PROJECT_DIR/CLAUDE.md.bak" ]; then
     mv "$PROJECT_DIR/CLAUDE.md.bak" "$PROJECT_DIR/CLAUDE.md"
     echo -e "\n${GREEN}CLAUDE.md.bak → CLAUDE.md (восстановлен)${NC}"
   fi
+  rm -rf "$RESULTS_DIR" 2>/dev/null
 }
 trap cleanup EXIT
 
@@ -104,6 +117,9 @@ SYSTEM_PROMPT='Ты — Semantic Indexer для проекта Noted Terminal (E
 Ответь СТРОГО JSON (без markdown, без комментариев, без обратных кавычек):
 {"path": "...", "type": "feature|knowledge|architecture|code", "explicit": ["тема1", "тема2"], "implicit": ["конкретный_тег_1", "конкретный_тег_2", "...минимум 8 тегов..."], "related_components": ["src/path/file.tsx"]}'
 
+# Экспортируем для дочерних процессов
+export SYSTEM_PROMPT LOG_FILE RESULTS_DIR
+
 echo -e "${BLUE}Scanning project: $PROJECT_DIR${NC}"
 
 FILES=()
@@ -112,9 +128,7 @@ while IFS= read -r -d '' f; do
   FILES+=("$f")
 done < <(find "$PROJECT_DIR/docs" -name '*.md' -not -path '*/tmp/*' -not -path '*/dev-journal/*' -print0 2>/dev/null)
 
-# НЕ индексируем CLAUDE.md — он уже в контексте Claude Code по умолчанию
-
-if [[ "${1:-}" == "--with-src" ]]; then
+if [ "$WITH_SRC" = true ]; then
   echo -e "${YELLOW}Including src/ components and stores...${NC}"
   while IFS= read -r -d '' f; do
     FILES+=("$f")
@@ -123,7 +137,7 @@ fi
 
 TOTAL=${#FILES[@]}
 echo -e "${GREEN}Found $TOTAL files to index${NC}"
-echo -e "${YELLOW}Estimated time: ~$((TOTAL * 5)) seconds (~$((TOTAL * 5 / 60)) min)${NC}"
+echo -e "${YELLOW}Parallel: $MAX_PARALLEL workers${NC}"
 echo ""
 
 if [ "$TOTAL" -eq 0 ]; then
@@ -131,32 +145,28 @@ if [ "$TOTAL" -eq 0 ]; then
   exit 1
 fi
 
-RESULTS="[]"
-COUNT=0
-ERRORS=0
-START_TIME=$(date +%s)
+# ===== Функция обработки одного файла (запускается как background job) =====
+process_file() {
+  local FILE="$1"
+  local IDX="$2"
+  local REL_PATH="${FILE#$PROJECT_DIR/}"
+  local RESULT_FILE="$RESULTS_DIR/$IDX.json"
+  local FILE_START=$(date +%s)
 
-for FILE in "${FILES[@]}"; do
-  COUNT=$((COUNT + 1))
-  REL_PATH="${FILE#$PROJECT_DIR/}"
-  FILE_START=$(date +%s)
-  echo -ne "${BLUE}[$COUNT/$TOTAL]${NC} $REL_PATH ... "
-
-  # Читаем содержимое файла
-  CONTENT=""
-  CONTENT=$(cat "$FILE" 2>/dev/null | head -c 8000) || true
+  # Читаем содержимое
+  local CONTENT=""
+  CONTENT=$(cat "$FILE" 2>/dev/null) || true
   if [ -z "$CONTENT" ]; then
-    echo -e "${YELLOW}skip (empty)${NC}"
-    log "SKIP (empty): $REL_PATH"
-    continue
+    echo "SKIP" > "$RESULT_FILE"
+    return
   fi
 
-  # Пишем промпт во временный файл (избегаем проблем с pipe + subshell)
-  TMPFILE=$(mktemp /tmp/indexer-XXXXXXXX)
+  # Пишем промпт во временный файл
+  local TMPFILE=$(mktemp /tmp/indexer-XXXXXXXX)
   printf 'Файл: %s\n\nСодержимое:\n%s' "$REL_PATH" "$CONTENT" > "$TMPFILE"
 
-  # Вызываем claude -p, stderr в лог
-  TEXT=""
+  # Вызываем claude -p
+  local TEXT=""
   TEXT=$(claude -p \
     --model haiku \
     --system-prompt "$SYSTEM_PROMPT" \
@@ -167,55 +177,140 @@ for FILE in "${FILES[@]}"; do
   rm -f "$TMPFILE"
 
   if [ -z "$TEXT" ]; then
-    echo -e "${RED}error (empty response, see indexer.log)${NC}"
+    echo "ERROR" > "$RESULT_FILE"
     log "ERROR (empty response): $REL_PATH"
-    ERRORS=$((ERRORS + 1))
-    continue
+    return
   fi
 
   log "RESPONSE for $REL_PATH: $(echo "$TEXT" | head -c 200)"
 
-  # Пробуем распарсить JSON
-  # Шаг 1: чистый JSON?
-  PARSED=""
+  # Парсим JSON (4 стратегии)
+  local PARSED=""
+
+  # Шаг 1: чистый JSON
   PARSED=$(echo "$TEXT" | jq --arg path "$REL_PATH" '. + {path: $path}' 2>/dev/null) || true
 
-  # Шаг 2: Haiku обернул в ```json ... ``` — вырезаем
+  # Шаг 2: markdown fence
   if [ -z "$PARSED" ] || [ "$PARSED" = "null" ]; then
-    CLEANED=$(echo "$TEXT" | sed -n '/^```/,/^```/p' | sed '/^```/d')
+    local CLEANED=$(echo "$TEXT" | sed -n '/^```/,/^```/p' | sed '/^```/d')
     PARSED=$(echo "$CLEANED" | jq --arg path "$REL_PATH" '. + {path: $path}' 2>/dev/null) || true
   fi
 
-  # Шаг 3: ищем JSON между { и }
+  # Шаг 3: { на начале строки
   if [ -z "$PARSED" ] || [ "$PARSED" = "null" ]; then
-    EXTRACTED=$(echo "$TEXT" | sed -n '/^{/,/^}/p' | head -20)
+    local EXTRACTED=$(echo "$TEXT" | sed -n '/^{/,/^}/p' | head -20)
     PARSED=$(echo "$EXTRACTED" | jq --arg path "$REL_PATH" '. + {path: $path}' 2>/dev/null) || true
   fi
 
-  # Шаг 4: ищем { где угодно в строке
+  # Шаг 4: { где угодно
   if [ -z "$PARSED" ] || [ "$PARSED" = "null" ]; then
-    EXTRACTED=$(echo "$TEXT" | grep -o '{.*}' | head -1)
+    local EXTRACTED=$(echo "$TEXT" | grep -o '{.*}' | head -1)
     PARSED=$(echo "$EXTRACTED" | jq --arg path "$REL_PATH" '. + {path: $path}' 2>/dev/null) || true
   fi
 
-  FILE_END=$(date +%s)
-  FILE_ELAPSED=$((FILE_END - FILE_START))
+  local FILE_END=$(date +%s)
+  local FILE_ELAPSED=$((FILE_END - FILE_START))
 
   if [ -z "$PARSED" ] || [ "$PARSED" = "null" ]; then
-    echo -e "${YELLOW}wrapped (non-JSON) [${FILE_ELAPSED}s]${NC}"
-    log "WARN (non-JSON): $REL_PATH"
     PARSED=$(jq -n --arg path "$REL_PATH" --arg raw "$TEXT" \
       '{path: $path, type: "unknown", explicit: [], implicit: [], related_components: [], raw_response: $raw}') || true
+    echo "WARN:${FILE_ELAPSED}s" > "$RESULT_FILE.status"
   else
-    echo -e "${GREEN}ok [${FILE_ELAPSED}s]${NC}"
+    echo "OK:${FILE_ELAPSED}s" > "$RESULT_FILE.status"
   fi
 
-  if [ -n "$PARSED" ] && [ "$PARSED" != "null" ]; then
-    RESULTS=$(echo "$RESULTS" | jq --argjson item "$PARSED" '. += [$item]') || true
+  echo "$PARSED" > "$RESULT_FILE"
+}
+
+# ===== Параллельный запуск =====
+START_TIME=$(date +%s)
+RUNNING=0
+
+for i in "${!FILES[@]}"; do
+  FILE="${FILES[$i]}"
+  REL_PATH="${FILE#$PROJECT_DIR/}"
+
+  # Запускаем в фоне
+  process_file "$FILE" "$i" &
+  RUNNING=$((RUNNING + 1))
+
+  echo -e "${BLUE}[launched $((i+1))/$TOTAL]${NC} $REL_PATH"
+
+  # Ждём, если достигли лимита параллельности
+  if [ "$RUNNING" -ge "$MAX_PARALLEL" ]; then
+    wait -n 2>/dev/null || true
+    RUNNING=$((RUNNING - 1))
   fi
 done
 
-echo "$RESULTS" | jq '.' > "$INDEX_FILE"
+# Ждём оставшиеся
+echo ""
+echo -e "${YELLOW}Waiting for remaining workers...${NC}"
+wait
+
+# ===== Сборка результатов =====
+echo -e "${BLUE}Merging results...${NC}"
+
+ERRORS=0
+INDEXED=0
+SKIPPED=0
+WARNINGS=0
+
+RESULTS="["
+FIRST=true
+
+for i in "${!FILES[@]}"; do
+  RESULT_FILE="$RESULTS_DIR/$i.json"
+  STATUS_FILE="$RESULTS_DIR/$i.json.status"
+  REL_PATH="${FILES[$i]#$PROJECT_DIR/}"
+
+  if [ ! -f "$RESULT_FILE" ]; then
+    echo -e "  ${RED}missing${NC} $REL_PATH"
+    ERRORS=$((ERRORS + 1))
+    continue
+  fi
+
+  CONTENT=$(cat "$RESULT_FILE")
+
+  if [ "$CONTENT" = "SKIP" ]; then
+    SKIPPED=$((SKIPPED + 1))
+    continue
+  fi
+
+  if [ "$CONTENT" = "ERROR" ]; then
+    echo -e "  ${RED}error${NC} $REL_PATH"
+    ERRORS=$((ERRORS + 1))
+    continue
+  fi
+
+  # Читаем статус
+  STATUS=""
+  if [ -f "$STATUS_FILE" ]; then
+    STATUS=$(cat "$STATUS_FILE")
+  fi
+  TIME_STR=$(echo "$STATUS" | cut -d: -f2)
+
+  if echo "$STATUS" | grep -q "^WARN"; then
+    echo -e "  ${YELLOW}wrapped${NC} $REL_PATH [${TIME_STR}]"
+    WARNINGS=$((WARNINGS + 1))
+  else
+    echo -e "  ${GREEN}ok${NC} $REL_PATH [${TIME_STR}]"
+  fi
+
+  # Добавляем в JSON массив
+  if [ "$FIRST" = true ]; then
+    FIRST=false
+  else
+    RESULTS="${RESULTS},"
+  fi
+  RESULTS="${RESULTS}${CONTENT}"
+  INDEXED=$((INDEXED + 1))
+done
+
+RESULTS="${RESULTS}]"
+
+# Записываем и форматируем
+echo "$RESULTS" | jq '.' > "$INDEX_FILE" 2>/dev/null
 
 END_TIME=$(date +%s)
 ELAPSED=$((END_TIME - START_TIME))
@@ -223,9 +318,6 @@ ELAPSED=$((END_TIME - START_TIME))
 echo ""
 echo -e "${GREEN}========================================${NC}"
 echo -e "${GREEN}Index built: $INDEX_FILE${NC}"
-echo -e "${GREEN}Files indexed: $((COUNT - ERRORS))/$TOTAL${NC}"
-echo -e "${GREEN}Time: ${ELAPSED}s${NC}"
-if [ "$ERRORS" -gt 0 ]; then
-  echo -e "${YELLOW}Errors: $ERRORS (see scripts/ai/indexer.log)${NC}"
-fi
+echo -e "${GREEN}Files indexed: $INDEXED/$TOTAL (skip: $SKIPPED, warn: $WARNINGS, err: $ERRORS)${NC}"
+echo -e "${GREEN}Time: ${ELAPSED}s (parallel: $MAX_PARALLEL)${NC}"
 echo -e "${GREEN}========================================${NC}"
