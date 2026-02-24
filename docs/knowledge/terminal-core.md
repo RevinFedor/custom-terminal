@@ -352,7 +352,7 @@ if (state.isRunning) {
 ## Related
 - `terminal-core.md` - OSC 133 protocol specification
 - `terminal-core.md` - Similar event-driven pattern for CWD tracking
-- `ui-ux-stability.md` (section 8) - execSync → execAsync migration
+- `ui-input-events.md` (section 8) - execSync → execAsync migration
 
 ## Критическое правило (см. architecture.md)
 **ЗАПРЕЩЁН polling через `pgrep`/`ps`** для определения статуса процесса. Использовать только:

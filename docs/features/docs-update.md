@@ -28,7 +28,7 @@
     **Важно:** После Bracketed Paste (`\x1b[201~`) нужна задержка ~500ms перед `\r`, иначе Gemini интерпретирует Enter как перенос строки, а не submit.
 - **Интерактивность:**
     - `⌘+Enter` в поле ввода запускает процесс обновления.
-    - Состояние выделения вкладок (Multi-select) сохраняется при кликах внутрь панели и вводе текста (см. `knowledge/ui-ux-stability.md`).
+    - Состояние выделения вкладок (Multi-select) сохраняется при кликах внутрь панели и вводе текста (см. `knowledge/ui-ux-patterns.md`).
 - **Анализ (Gemini):**
     - Система создает специальный Gemini-таб, дожидается его готовности и вставляет промпт через Bracketed Paste + 500ms delay + Enter.
 
@@ -37,6 +37,6 @@
 - **Main Process:** `docs:save-temp` — сохранение данных сессии в `<projectPath>/tmp/`. Промпт отправляется через `terminal:paste` → `safePasteAndSubmit(fast=true)` (Bracketed Paste Mode, chunked < 900B, 500ms delay before Enter).
 - **Styles:** Анимация вращающегося кольца при загрузке.
 - **Fixes:**
-    - `knowledge/ai-automation.md` — детали унифицированного экспорта.
-    - `knowledge/ui-ux-stability.md` — механизм удержания выделения табов.
+    - `knowledge/ai-export-session.md` — детали унифицированного экспорта.
+    - `knowledge/ui-ux-patterns.md` — механизм удержания выделения табов.
     - `knowledge/fact-claude-tui-mechanics.md` — как работает вставка больших промптов.

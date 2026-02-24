@@ -680,9 +680,8 @@ function App() {
         console.log('[Hotkey] Cmd +', e.code, e.key, 'view:', view);
       }
 
-      // Cmd+\ - Open VS Code in current terminal's CWD
-      const isBackslash = e.code === 'Backslash' || e.key === '\\' || e.code === 'IntlBackslash';
-      if (e.metaKey && isBackslash) {
+      // Cmd+. - Open VS Code in current terminal's CWD
+      if (e.metaKey && e.key === '.') {
         e.preventDefault();
         const activeProject = getActiveProject();
         const currentProject = projects[activeProjectId!];

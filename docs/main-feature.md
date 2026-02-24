@@ -39,7 +39,7 @@
     - Выбор нескольких вкладок (массовый экспорт).
     - Флаг `includeCode`: включение/исключение содержимого файлов.
     - Флаг `fromStart`: экспорт всей истории или только с последнего форка.
-    - См. [`knowledge/ai-automation.md`](knowledge/ai-automation.md).
+    - См. [`knowledge/ai-export-session.md`](knowledge/ai-export-session.md).
 - **Подробнее:** [`features/docs-update.md`](features/docs-update.md)
 
 ## 5. Flow: Безопасное восстановление (Persistence)
@@ -65,9 +65,9 @@
 
 ## Технические "фундаменты" (Knowledge Base)
 Все флоу опираются на критические решения:
-- **Форк:** [True Fork для Gemini](knowledge/ai-automation.md) — почему просто resume не работает.
-- **Стабильность:** [Устранение мерцания AI UI](knowledge/ui-ux-stability.md) через прямую инъекцию ID.
-- **Отрисовка:** [Canvas вместо WebGL](knowledge/ui-ux-stability.md) для стабильности.
+- **Форк:** [True Fork для Gemini](knowledge/ai-gemini-automation.md) — почему просто resume не работает.
+- **Стабильность:** [Устранение мерцания AI UI](knowledge/ai-gemini-automation.md) через прямую инъекцию ID.
+- **Отрисовка:** [Canvas вместо WebGL](knowledge/ui-terminal-rendering.md) для стабильности.
 - **Пути:** [Реактивный OSC 7](knowledge/terminal-core.md) для мгновенного отслеживания CWD.
-- **Слои:** [Layering Pattern](knowledge/ui-ux-stability.md) для отрисовки UI поверх терминала.
+- **Слои:** [Layering Pattern](knowledge/ui-terminal-rendering.md) для отрисовки UI поверх терминала.
 - **Ввод:** [Two-Tier Paste](knowledge/terminal-core.md) — simple chunking для user paste (Ctrl+V) и `safePasteAndSubmit` для программных операций (Handshake, Rewind). Обход macOS TTYHOG лимитов.

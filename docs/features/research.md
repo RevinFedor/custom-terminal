@@ -8,7 +8,7 @@
    - **Выделение:** Пользователь выделяет ошибку в терминале -> ПКМ -> "Research Selection".
    - **Буфер:** В панели Gemini нажимает кнопку **"Буфер"** -> Research или Compact. Контент берется из буфера обмена.
 2. **Активация:** Правая панель (InfoPanel) автоматически переключается на вкладку **AI**.
-   - Используется [State-driven триггер](knowledge/ai-automation.md), чтобы панель открылась и сразу начала поиск.
+   - Используется [State-driven триггер](knowledge/fix-research-activation.md), чтобы панель открылась и сразу начала поиск.
 3. **Ожидание:** В списке чатов слева и в самом чате отображаются анимированные лоадеры вместо статических иконок.
 4. **Анализ:** Ответ рендерится с поддержкой Markdown. 
    - Inline-код отображается корректно. См. `knowledge/rendering-styles.md`.
@@ -21,7 +21,7 @@
 - **Режимы (Modes):**
     - **🔍 Research:** `gemini-2.0-flash`.
     - **📋 Compact:** `gemini-3-flash` (Thinking: HIGH).
-- **Tools:** Автоматическая активация Google Search для моделей серии 3. См. `knowledge/ai-automation.md`.
+- **Tools:** Автоматическая активация Google Search для моделей серии 3. См. `knowledge/fix-research-activation.md`.
 - **UI Stability:** Ответы рендерятся через `react-virtuoso` для плавной прокрутки. См. `knowledge/rendering-styles.md`.
 
 ## Code Map

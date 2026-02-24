@@ -60,19 +60,19 @@ SYSTEM_PROMPT='Ты — Semantic Router для Noted Terminal (Electron + React 
 
 ШАГ 2 — Подумай о ROOT CAUSE, а не о ключевых словах:
 КРИТИЧНО: Не хватай файл по совпадению слов! Думай о ПРИЧИНЕ.
-- "кнопка restart пропала после создания таба" — это НЕ про restart и НЕ про табы. Это про useEffect dependency change → IPC listener re-subscription → event drop window. Ищи terminal-core.md (IPC trap) и ui-ux-stability.md (useEffect).
-- "копирование из Timeline возвращает пустое" — это НЕ про Timeline UI. Это про Zustand silent mutation → stale sessionId → wrong JSONL chain loaded. Ищи fix-zustand-silent-mutation.md и ai-automation.md (Backtrace).
+- "кнопка restart пропала после создания таба" — это НЕ про restart и НЕ про табы. Это про useEffect dependency change → IPC listener re-subscription → event drop window. Ищи terminal-core.md (IPC trap) и ui-react-patterns.md (useEffect).
+- "копирование из Timeline возвращает пустое" — это НЕ про Timeline UI. Это про Zustand silent mutation → stale sessionId → wrong JSONL chain loaded. Ищи fix-zustand-silent-mutation.md и ai-backtrace-jsonl.md (Backtrace).
 - "paste зависает на 30 секунд" — это НЕ про UI freeze. Это про wrong paste path routing: user paste попал в programmatic path (safePasteAndSubmit), который ждет sync markers от bash/zsh, но те их не шлют → 5s timeout × N chunks. Ищи terminal-core.md (Two-Tier Paste).
 
 ШАГ 3 — Проверь 8 категорий кросс-доменных мостов:
 a) Zustand silent mutation — если что-то "не обновляется", "стейл", "пропадает после" → fix-zustand-silent-mutation.md
 b) Sync marker timing — если paste/Enter/команда "не срабатывает", "зависает", "теряется" → fix-stale-sync-markers.md
 c) Paste path routing — если paste "ломает текст", "зависает", "дублирует" → terminal-core.md (Two-Tier)
-d) CSS visibility chain — если терминал "показывает мусор", "дублирует UI", "не перерисовывается" после переключения → ui-ux-stability.md + terminal-core.md (safeFit)
-e) JSONL chain resolution — если Timeline/export "неправильный", "пропускает", "не показывает" → ai-automation.md (Backtrace) + fix-claude-plan-mode-chain.md
+d) CSS visibility chain — если терминал "показывает мусор", "дублирует UI", "не перерисовывается" после переключения → ui-terminal-rendering.md + terminal-core.md (safeFit)
+e) JSONL chain resolution — если Timeline/export "неправильный", "пропускает", "не показывает" → ai-backtrace-jsonl.md (Backtrace) + fix-claude-plan-mode-chain.md
 f) React useEffect + IPC — если индикатор/кнопка "пропадает", "моргает" после создания/закрытия таба → terminal-core.md (IPC listener trap)
 g) Vite escaping — если escape sequences "не работают" после сборки → environment-fixes.md
-h) Layout depth — если компонент "работает в одном месте, но не в другом" → ui-ux-stability.md + rendering-styles.md
+h) Layout depth — если компонент "работает в одном месте, но не в другом" → ui-css-layout.md + rendering-styles.md
 
 ШАГ 4 — Сканируй implicit теги:
 Пройдись по ВСЕМ записям индекса. Сравни implicit теги с симптомом и root cause.

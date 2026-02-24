@@ -14,7 +14,7 @@
 
 ## Behavior Specs
 - **Genie Tooltip:** Анимация появления из точки «?» с использованием `origin-right/left` и масштабирования. Направление выбирается автоматически в зависимости от свободного места на экране.
-- **Manual Bounds Check:** Предотвращение «залипания» фокуса при взаимодействии с меню. См. `knowledge/ui-ux-stability.md`.
+- **Manual Bounds Check:** Предотвращение «залипания» фокуса при взаимодействии с меню. См. `knowledge/ui-react-patterns.md`.
 - **Sync:** Закладки хранятся в таблице `bookmarks` SQLite.
 
 ## Code Map

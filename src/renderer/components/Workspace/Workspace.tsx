@@ -60,6 +60,7 @@ export default function Workspace() {
   const notesPanelWidth = useUIStore((s) => s.notesPanelWidth);
   const historyPanelOpenTabs = useUIStore((s) => s.historyPanelOpenTabs);
   const historyPanelWidth = useUIStore((s) => s.historyPanelWidth);
+  const setHistoryPanelOpen = useUIStore((s) => s.setHistoryPanelOpen);
   const setProjectView = useWorkspaceStore((s) => s.setProjectView);
   const [showSearch, setShowSearch] = useState(false);
   const [searchText, setSearchText] = useState('');
@@ -166,6 +167,21 @@ export default function Workspace() {
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [activeProjectId, notesEditorOpen, openNotesEditor, workspaceView]);
+
+  // CMD+\ hotkey to toggle history panel
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (workspaceView !== 'workspace') return;
+      const isBackslash = e.code === 'Backslash' || e.key === '\\' || e.code === 'IntlBackslash';
+      if (e.metaKey && isBackslash && activeTab?.id && activeTab.claudeSessionId && activeTab.commandType === 'claude') {
+        e.preventDefault();
+        const currentOpen = useUIStore.getState().historyPanelOpenTabs[activeTab.id] ?? false;
+        setHistoryPanelOpen(activeTab.id, !currentOpen);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [workspaceView, activeTab?.id, activeTab?.claudeSessionId, activeTab?.commandType, setHistoryPanelOpen]);
 
   // CMD+F hotkey for terminal search
   useEffect(() => {

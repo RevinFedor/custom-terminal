@@ -872,22 +872,22 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
                 <div
                   ref={el => segmentRefs.current[index] = el}
                   data-segment
-                  className="relative flex-1 min-h-[4px] w-full flex items-center justify-center transition-colors pointer-events-none"
+                  className="relative flex-1 min-h-[4px] w-full flex items-center justify-center transition-colors"
+                  onMouseEnter={() => handleMouseEnterSegment(index)}
+                  onMouseLeave={(e) => handleMouseLeaveSegment(e)}
+                  onClick={() => handleEntryClick(entry)}
+                  onDoubleClick={() => handleEntryDoubleClick(entry)}
+                  onContextMenu={(e) => handleRightClick(e, entry)}
                   style={{
                     backgroundColor: active
                       ? 'rgba(59, 130, 246, 0.15)'
                       : (isUnreachable ? 'rgba(239, 68, 68, 0.06)' : 'transparent'),
+                    cursor: isContinued ? 'default' : 'pointer',
                   }}
                 >
                   {/* Visual Indicator: Dot (normal), Line (compact), or Dot (continued=orange) */}
-                  {/* Now handles all interaction events to create dead zones between dots */}
                   <div
-                    className="transition-all duration-200 pointer-events-auto"
-                    onMouseEnter={() => handleMouseEnterSegment(index)}
-                    onMouseLeave={(e) => handleMouseLeaveSegment(e)}
-                    onClick={() => handleEntryClick(entry)}
-                    onDoubleClick={() => handleEntryDoubleClick(entry)}
-                    onContextMenu={(e) => handleRightClick(e, entry)}
+                    className="transition-all duration-200 pointer-events-none"
                     style={{
                       width: isCompacted ? '12px' : (hoveredIndex === index || activeTooltipIndex === index ? '8px' : (isInViewport ? '10px' : '4px')),
                       height: isCompacted ? '2px' : (hoveredIndex === index || activeTooltipIndex === index ? '8px' : (isInViewport ? '3px' : '4px')),
@@ -900,12 +900,6 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
                       boxShadow: (hoveredIndex === index || activeTooltipIndex === index)
                         ? (isContinued ? '0 0 8px rgba(245, 158, 11, 0.4)' : isPlan ? '0 0 8px rgba(72, 150, 140, 0.4)' : '0 0 8px rgba(255,255,255,0.4)')
                         : (isInViewport ? '0 0 6px rgba(255,255,255,0.25)' : 'none'),
-                      cursor: isContinued ? 'default' : 'pointer',
-                      // Large invisible padding to make the hit-box easy to target
-                      padding: '10px',
-                      margin: '-10px',
-                      boxSizing: 'content-box',
-                      backgroundClip: 'content-box'
                     }}
                   />
                   {/* Loading spinner — instant feedback on click */}
@@ -1047,7 +1041,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
               onMouseLeave={handleMouseLeaveTooltipArea}
               style={{
                 position: 'fixed',
-                right: `${notesPanelWidth + 24}px`,
+                right: `${notesPanelWidth + 24 - 8}px`,
                 top: `${tooltipPos.wTop}px`,
                 height: `${tooltipPos.wH}px`,
                 zIndex: 10000,
@@ -1066,14 +1060,14 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
                   backgroundColor: 'rgba(25, 25, 25, 0.98)',
                   backdropFilter: 'blur(12px)',
                   border: '1px solid rgba(255, 255, 255, 0.1)',
-                  borderRadius: '6px',
+                  borderRadius: '6px 0 0 6px',
                   padding: '10px 14px',
                   fontSize: '12px',
                   color: 'white',
                   minWidth: '240px',
                   maxWidth: '320px',
                   maxHeight: isExpanded ? '60vh' : '200px',
-                  boxShadow: '0 8px 30px rgba(255,255,255,0.08), 0 2px 8px rgba(255,255,255,0.05)',
+                  boxShadow: '-8px 8px 30px rgba(255,255,255,0.08), -2px 2px 8px rgba(255,255,255,0.05)',
                   display: 'flex',
                   flexDirection: 'column',
                   gap: '8px',
