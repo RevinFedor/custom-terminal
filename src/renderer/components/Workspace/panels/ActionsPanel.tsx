@@ -81,14 +81,13 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
     const blockRect = blockRef.current.getBoundingClientRect();
     const accent = color === 'blue' ? 'rgba(59, 130, 246, 0.3)' : 'rgba(218, 119, 86, 0.3)';
     const headerColor = color === 'blue' ? '#60a5fa' : '#DA7756';
-    const panelWidth = 150;
-    const panelHeight = 68;
     return (
       <SettingsPortal>
         <div style={{
           position: 'fixed',
-          left: blockRect.left - panelWidth,
-          top: blockRect.top + blockRect.height / 2 - panelHeight / 2,
+          left: blockRect.left - 3,
+          top: blockRect.top + blockRect.height / 2,
+          transform: 'translate(-100%, -50%)',
           zIndex: 10000,
           pointerEvents: 'none',
         }}>
@@ -620,16 +619,15 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
               {showCopySettings && (() => {
                 const bRect = copyContainerRef.current?.getBoundingClientRect();
                 if (!bRect) return null;
-                const menuWidth = 170;
-                const menuHeight = 128;
                 return (
                   <SettingsPortal>
                     <div
                       onMouseLeave={handleMouseLeaveSettingsArea}
                       style={{
                         position: 'fixed',
-                        left: bRect.left - menuWidth,
-                        top: bRect.top + bRect.height / 2 - menuHeight / 2,
+                        left: bRect.left - 3,
+                        top: bRect.top + bRect.height / 2,
+                        transform: 'translate(-100%, -50%)',
                         zIndex: 10000,
                         display: 'flex',
                         flexDirection: 'row',
@@ -671,8 +669,6 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
                           </div>
                         </label>
                       </div>
-                      {/* Horizontal bridge — covers gap from menu right edge to icon inside the block */}
-                      <div style={{ width: '30px', height: '80px' }} />
                     </div>
                   </SettingsPortal>
                 );

@@ -30,6 +30,7 @@
     - **Claude TUI Control:** Программное управление Ink TUI через PTY. См. `knowledge/fact-claude-tui-mechanics.md` и `knowledge/fix-rewind-navigation.md`.
     - **Claude Ctrl-C Protection:** Предотвращение случайного выхода при быстром переключении моделей. См. `knowledge/fix-claude-ctrlc-exit.md`.
     - **Timeline Engine:** Асинхронный парсинг JSONL с алгоритмом Backtrace. См. `knowledge/ai-backtrace-jsonl.md`.
+    - **Layout Constraint:** Timeline и панель истории ограничены высотой терминала (не перекрывают TabBar). Оверлей затемнения также ограничен областью терминала.
 - **Large Input (Two-Tier Paste):** Обход macOS TTYHOG (1024 bytes) через атомарный чанкинг. См. `knowledge/fact-claude-tui-mechanics.md` и `knowledge/terminal-core.md`.
 
 ## 5. AI Session Recovery

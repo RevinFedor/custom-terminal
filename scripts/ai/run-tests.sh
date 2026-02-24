@@ -58,14 +58,23 @@ TOTAL=${#TESTS[@]}
 PASS=0
 PARTIAL=0
 FAIL=0
+RUN_ONLY="${1:-}"
 
 echo -e "${BLUE}=== Semantic Router Test Suite ===${NC}"
 echo -e "${BLUE}Tests: $TOTAL | Index: $(jq 'length' "$PROJECT_DIR/.semantic-index.json") files${NC}"
+if [ -n "$RUN_ONLY" ]; then
+  echo -e "${YELLOW}Running only test #$RUN_ONLY${NC}"
+fi
 echo ""
 
 for i in "${!TESTS[@]}"; do
   IFS='|' read -r NAME PROMPT EXPECTED <<< "${TESTS[$i]}"
   NUM=$((i + 1))
+
+  # Пропускаем если указан конкретный тест
+  if [ -n "$RUN_ONLY" ] && [ "$NUM" != "$RUN_ONLY" ]; then
+    continue
+  fi
 
   # Запускаем хук
   START_TIME=$(date +%s)
