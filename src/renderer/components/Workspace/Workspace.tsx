@@ -58,7 +58,7 @@ export default function Workspace() {
   const openNotesEditor = useUIStore((s) => s.openNotesEditor);
   const notesEditorOpen = useUIStore((s) => s.notesEditorOpen);
   const notesPanelWidth = useUIStore((s) => s.notesPanelWidth);
-  const historyPanelOpen = useUIStore((s) => s.historyPanelOpen);
+  const historyPanelOpenTabs = useUIStore((s) => s.historyPanelOpenTabs);
   const historyPanelWidth = useUIStore((s) => s.historyPanelWidth);
   const setProjectView = useWorkspaceStore((s) => s.setProjectView);
   const [showSearch, setShowSearch] = useState(false);
@@ -277,6 +277,9 @@ export default function Workspace() {
   // DEBUG: Uncomment to debug Timeline visibility
   // console.log('[Timeline Debug] showTimeline:', showTimeline, 'claudeSessionId:', claudeSessionId, 'commandType:', activeTab?.commandType, 'isRunning:', isCommandRunning);
 
+  // Per-tab history panel state
+  const isHistoryOpen = activeTab?.id ? (historyPanelOpenTabs[activeTab.id] ?? false) : false;
+
   // DEBUG: Track state changes
   console.warn(`[Workspace:RENDER] currentView=${currentView} showTimeline=${showTimeline} activeTabId=${activeTab?.id} isCommandRunning=${isCommandRunning}`);
 
@@ -289,87 +292,112 @@ export default function Workspace() {
           <TabBar projectId={activeProjectId} />
         </div>
 
-        {/* Terminal Area */}
-        <div className="flex-1 relative min-w-0">
-          <TerminalArea projectId={activeProjectId} />
+        {/* Terminal Area — Timeline + HistoryPanel are constrained to this height */}
+        <div className="flex-1 flex min-w-0 relative">
+          {/* Terminal content */}
+          <div className="flex-1 relative min-w-0">
+            <TerminalArea projectId={activeProjectId} />
 
-          {/* Search Bar (Cmd+F) - only in terminal view */}
-          {currentView === 'terminal' && showSearch && (
-            <div
-              style={{
-                position: 'absolute',
-                top: '8px',
-                right: '16px',
-                zIndex: 100,
-                display: 'flex',
-                alignItems: 'center',
-                gap: '6px',
-                backgroundColor: 'rgba(40, 40, 40, 0.95)',
-                backdropFilter: 'blur(8px)',
-                border: '1px solid rgba(255, 255, 255, 0.1)',
-                borderRadius: '8px',
-                padding: '6px 10px',
-                boxShadow: '0 4px 12px rgba(0, 0, 0, 0.3)'
-              }}
-            >
-              {/* ... search input content ... */}
-              <input
-                ref={searchInputRef}
-                type="text"
-                value={searchText}
-                onChange={(e) => handleSearch(e.target.value)}
-                onKeyDown={handleSearchKeyDown}
-                placeholder="Search..."
+            {/* Search Bar (Cmd+F) - only in terminal view */}
+            {currentView === 'terminal' && showSearch && (
+              <div
                 style={{
-                  backgroundColor: 'transparent',
-                  border: 'none',
-                  outline: 'none',
-                  color: '#fff',
-                  fontSize: '13px',
-                  width: '160px'
+                  position: 'absolute',
+                  top: '8px',
+                  right: '16px',
+                  zIndex: 100,
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '6px',
+                  backgroundColor: 'rgba(40, 40, 40, 0.95)',
+                  backdropFilter: 'blur(8px)',
+                  border: '1px solid rgba(255, 255, 255, 0.1)',
+                  borderRadius: '8px',
+                  padding: '6px 10px',
+                  boxShadow: '0 4px 12px rgba(0, 0, 0, 0.3)'
                 }}
+              >
+                {/* ... search input content ... */}
+                <input
+                  ref={searchInputRef}
+                  type="text"
+                  value={searchText}
+                  onChange={(e) => handleSearch(e.target.value)}
+                  onKeyDown={handleSearchKeyDown}
+                  placeholder="Search..."
+                  style={{
+                    backgroundColor: 'transparent',
+                    border: 'none',
+                    outline: 'none',
+                    color: '#fff',
+                    fontSize: '13px',
+                    width: '160px'
+                  }}
+                />
+                {searchText && (
+                  <span style={{
+                    fontSize: '11px',
+                    color: searchResults.resultCount > 0 ? 'rgba(255, 255, 255, 0.6)' : 'rgba(255, 100, 100, 0.8)',
+                    minWidth: '50px',
+                    textAlign: 'center'
+                  }}>
+                    {searchResults.resultCount > 0
+                      ? `${searchResults.resultIndex}/${searchResults.resultCount}`
+                      : 'No results'}
+                  </span>
+                )}
+                <button
+                  onClick={handleFindPrevious}
+                  disabled={searchResults.resultCount === 0}
+                  style={{ background: 'none', border: 'none', color: searchResults.resultCount > 0 ? 'rgba(255, 255, 255, 0.7)' : 'rgba(255, 255, 255, 0.3)', cursor: searchResults.resultCount > 0 ? 'pointer' : 'default', fontSize: '12px', padding: '2px 4px' }}
+                >▲</button>
+                <button
+                  onClick={handleFindNext}
+                  disabled={searchResults.resultCount === 0}
+                  style={{ background: 'none', border: 'none', color: searchResults.resultCount > 0 ? 'rgba(255, 255, 255, 0.7)' : 'rgba(255, 255, 255, 0.3)', cursor: searchResults.resultCount > 0 ? 'pointer' : 'default', fontSize: '12px', padding: '2px 4px' }}
+                >▼</button>
+                <button
+                  onClick={() => {
+                    setShowSearch(false);
+                    setSearchText('');
+                    setSearchResults({ resultIndex: 0, resultCount: 0 });
+                    if (activeTab?.id) {
+                      terminalRegistry.clearSearch(activeTab.id);
+                    }
+                  }}
+                  style={{ background: 'none', border: 'none', color: 'rgba(255, 255, 255, 0.5)', cursor: 'pointer', fontSize: '14px', padding: '2px 4px', marginLeft: '4px' }}
+                >✕</button>
+              </div>
+            )}
+
+            {/* File Preview Overlay */}
+            {filePreview && <FilePreview />}
+
+            {/* Research Sheet */}
+            <ResearchSheet projectId={activeProjectId} projectPath={currentProject.path} />
+
+            {/* History Panel — absolute overlay within terminal area only */}
+            {isHistoryOpen && claudeSessionId && activeTab && currentView === 'terminal' && (
+              <HistoryPanel
+                tabId={activeTab.id}
+                sessionId={claudeSessionId}
+                cwd={activeTab.cwd || currentProject.path}
+                width={historyPanelWidth}
+                notesPanelWidth={notesPanelWidth}
               />
-              {searchText && (
-                <span style={{
-                  fontSize: '11px',
-                  color: searchResults.resultCount > 0 ? 'rgba(255, 255, 255, 0.6)' : 'rgba(255, 100, 100, 0.8)',
-                  minWidth: '50px',
-                  textAlign: 'center'
-                }}>
-                  {searchResults.resultCount > 0
-                    ? `${searchResults.resultIndex}/${searchResults.resultCount}`
-                    : 'No results'}
-                </span>
-              )}
-              <button
-                onClick={handleFindPrevious}
-                disabled={searchResults.resultCount === 0}
-                style={{ background: 'none', border: 'none', color: searchResults.resultCount > 0 ? 'rgba(255, 255, 255, 0.7)' : 'rgba(255, 255, 255, 0.3)', cursor: searchResults.resultCount > 0 ? 'pointer' : 'default', fontSize: '12px', padding: '2px 4px' }}
-              >▲</button>
-              <button
-                onClick={handleFindNext}
-                disabled={searchResults.resultCount === 0}
-                style={{ background: 'none', border: 'none', color: searchResults.resultCount > 0 ? 'rgba(255, 255, 255, 0.7)' : 'rgba(255, 255, 255, 0.3)', cursor: searchResults.resultCount > 0 ? 'pointer' : 'default', fontSize: '12px', padding: '2px 4px' }}
-              >▼</button>
-              <button
-                onClick={() => {
-                  setShowSearch(false);
-                  setSearchText('');
-                  setSearchResults({ resultIndex: 0, resultCount: 0 });
-                  if (activeTab?.id) {
-                    terminalRegistry.clearSearch(activeTab.id);
-                  }
-                }}
-                style={{ background: 'none', border: 'none', color: 'rgba(255, 255, 255, 0.5)', cursor: 'pointer', fontSize: '14px', padding: '2px 4px', marginLeft: '4px' }}
-              >✕</button>
-            </div>
+            )}
+          </div>
+
+          {/* Timeline — inside terminal row so it only spans terminal height */}
+          {showTimeline && (
+            <Timeline
+              tabId={activeTab.id}
+              sessionId={claudeSessionId}
+              cwd={activeTab.cwd || currentProject.path}
+              isActive={isCommandRunning}
+              isVisible={workspaceView === 'workspace' && currentView === 'terminal'}
+            />
           )}
-
-          {/* File Preview Overlay */}
-          {filePreview && <FilePreview />}
-
-          {/* Research Sheet */}
-          <ResearchSheet projectId={activeProjectId} projectPath={currentProject.path} />
         </div>
 
         {/* Project Home - Overlay AFTER TabBar+TerminalArea to keep children indices stable */}
@@ -382,28 +410,15 @@ export default function Workspace() {
       </div>
 
       {/* RIGHT COLUMN: Toolbar + Notes + Resizer */}
-      <div className="flex shrink-0 overflow-hidden relative" style={{ width: notesPanelWidth }}>
-        {/* Timeline for Claude session navigation - correctly positioned LEFT of Resizer */}
-        {/* Timeline stays mounted to prevent layout shift, visibility controlled via prop */}
-        {showTimeline && (
-          <Timeline
-            tabId={activeTab.id}
-            sessionId={claudeSessionId}
-            cwd={activeTab.cwd || currentProject.path}
-            isActive={isCommandRunning}
-            isVisible={workspaceView === 'workspace' && currentView === 'terminal'}
-          />
-        )}
+      <div className="flex flex-col shrink-0 overflow-hidden relative border-l border-border-main" style={{ width: notesPanelWidth }}>
+        {/* ProjectToolbar Row — aligned with TabBar */}
+        <div className="h-[30px] border-b border-border-main">
+          <ProjectToolbar />
+        </div>
 
-        <Resizer onResize={handleResize} />
-        
-        <div className="flex-1 flex flex-col min-w-0 border-l border-border-main">
-          {/* ProjectToolbar Row */}
-          <div className="h-[30px] border-b border-border-main">
-            <ProjectToolbar />
-          </div>
-
-          {/* Notes Panel Content */}
+        {/* Bottom Row: Resizer + Notes Panel */}
+        <div className="flex-1 flex overflow-hidden">
+          <Resizer onResize={handleResize} />
           <div className="flex-1 overflow-hidden relative">
             {!filePreview && (
               <NotesPanel projectId={activeProjectId} project={currentProject} />
@@ -418,17 +433,6 @@ export default function Workspace() {
 
       {/* Notes Editor Modal */}
       <NotesEditorModal />
-
-      {/* History Panel — Portal overlay, rendered when open and Claude session exists */}
-      {historyPanelOpen && claudeSessionId && activeTab && currentView === 'terminal' && (
-        <HistoryPanel
-          tabId={activeTab.id}
-          sessionId={claudeSessionId}
-          cwd={activeTab.cwd || currentProject.path}
-          width={historyPanelWidth}
-          notesPanelWidth={notesPanelWidth}
-        />
-      )}
 
     </div>
   );

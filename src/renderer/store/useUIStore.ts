@@ -147,11 +147,11 @@ interface UIStore {
 
 
 
-  // History Panel
-  historyPanelOpen: boolean;
+  // History Panel (per-tab state)
+  historyPanelOpenTabs: Record<string, boolean>;
   historyPanelWidth: number;
   historyScrollToUuid: string | null;
-  setHistoryPanelOpen: (open: boolean) => void;
+  setHistoryPanelOpen: (tabId: string, open: boolean) => void;
   setHistoryPanelWidth: (width: number) => void;
   setHistoryScrollToUuid: (uuid: string | null) => void;
 
@@ -634,8 +634,8 @@ export const useUIStore = create<UIStore>((set, get) => ({
     toasts: state.toasts.filter((t) => t.id !== id)
   })),
 
-  // History Panel
-  historyPanelOpen: false,
+  // History Panel (per-tab state)
+  historyPanelOpenTabs: {},
   historyPanelWidth: (() => {
     try {
       const saved = localStorage.getItem('noted-terminal-history-panel-width');
@@ -643,7 +643,9 @@ export const useUIStore = create<UIStore>((set, get) => ({
     } catch { return 580; }
   })(),
   historyScrollToUuid: null,
-  setHistoryPanelOpen: (open) => set({ historyPanelOpen: open }),
+  setHistoryPanelOpen: (tabId, open) => set(state => ({
+    historyPanelOpenTabs: { ...state.historyPanelOpenTabs, [tabId]: open }
+  })),
   setHistoryScrollToUuid: (uuid) => set({ historyScrollToUuid: uuid }),
   setHistoryPanelWidth: (width) => {
     const clamped = Math.max(280, Math.min(700, width));

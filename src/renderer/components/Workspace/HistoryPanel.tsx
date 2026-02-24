@@ -1,5 +1,4 @@
 import React, { useEffect, useState, useRef, useCallback, memo } from 'react';
-import { createPortal } from 'react-dom';
 import { X, ChevronDown, ChevronRight } from 'lucide-react';
 import { useUIStore } from '../../store/useUIStore';
 import MarkdownRenderer from '../Research/MarkdownRenderer';
@@ -268,6 +267,7 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth }: History
   const setHistoryPanelWidth = useUIStore((s) => s.setHistoryPanelWidth);
   const historyScrollToUuid = useUIStore((s) => s.historyScrollToUuid);
   const setHistoryScrollToUuid = useUIStore((s) => s.setHistoryScrollToUuid);
+  const closePanel = useCallback(() => setHistoryPanelOpen(tabId, false), [tabId, setHistoryPanelOpen]);
 
   const [entries, setEntries] = useState<FullHistoryEntry[]>([]);
   const [loading, setLoading] = useState(true);
@@ -384,20 +384,20 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth }: History
   }, [notesPanelWidth, setHistoryPanelWidth]);
 
   const handleResizeDoubleClick = useCallback(() => {
-    setHistoryPanelOpen(false);
-  }, [setHistoryPanelOpen]);
+    closePanel();
+  }, [closePanel]);
 
   const panel = (
     <div
       style={{
-        position: 'fixed',
-        top: 30,
+        position: 'absolute',
+        top: 0,
         bottom: 0,
-        right: notesPanelWidth,
+        right: 0,
         width: width,
         backgroundColor: '#1a1a1a',
         borderLeft: '1px solid #333',
-        zIndex: 9000,
+        zIndex: 101,
         display: 'flex',
         flexDirection: 'column',
       }}
@@ -423,7 +423,7 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth }: History
       >
         <span style={{ fontSize: 12, color: '#999', fontWeight: 500 }}>History</span>
         <button
-          onClick={() => setHistoryPanelOpen(false)}
+          onClick={closePanel}
           style={{
             background: 'none', border: 'none', color: '#666',
             cursor: 'pointer', padding: 2, display: 'flex', alignItems: 'center',
