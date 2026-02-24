@@ -299,8 +299,7 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
       {/* Upper sections — scrollable independently */}
       <div className="overflow-y-auto min-h-0 shrink">
       <div className="mb-4">
-        <div className="flex items-center justify-between mb-2">
-          <div className="text-[11px] uppercase text-[#888]">AI Session</div>
+        <div className="flex items-center mb-2" style={{ gap: 5 }}>
           {hasClaudeSession && activeTabId && (
             <button
               onClick={() => setHistoryPanelOpen(activeTabId, !isHistoryOpen)}
@@ -320,6 +319,7 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
               <ScrollText size={12} />
             </button>
           )}
+          <div className="text-[11px] uppercase text-[#888]">AI Session</div>
         </div>
         {hasAnySession ? (
           <div className={`rounded p-2 ${currentSessionType === 'claude' ? 'bg-[#2a3a2a] border border-[#3a5a3a]' : 'bg-[#1a2a3a] border border-[#2a4a6a]'}`}>

@@ -21,5 +21,5 @@
 - Быстрое переключение вкладок (где раньше случался лишний ресайз).
 
 ## Связанные решения
-- **Idempotent Resize:** См. `knowledge/ui-ux-stability.md` (запрет ресайза при неизменных размерах).
+- **Idempotent Resize:** См. `knowledge/ui-terminal-rendering.md` (запрет ресайза при неизменных размерах).
 - **safePasteAndSubmit:** См. `knowledge/terminal-core.md` (основной потребитель механизма).
