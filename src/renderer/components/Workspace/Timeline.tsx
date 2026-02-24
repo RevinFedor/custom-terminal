@@ -81,6 +81,10 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
   const containerRef = useRef<HTMLDivElement>(null);
   const segmentRefs = useRef<(HTMLDivElement | null)[]>([]);
 
+  // CMD key state for tooltip activation
+  const [isCmdHeld, setIsCmdHeld] = useState(false);
+  const isCmdHeldRef = useRef(false);
+
   // Adjust segmentRefs length
   useEffect(() => {
     segmentRefs.current = segmentRefs.current.slice(0, entries.length);
@@ -97,6 +101,43 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
   useEffect(() => {
     setIsExpanded(false);
   }, [activeTooltipIndex]);
+
+  // CMD key tracking — tooltip only appears when CMD is held
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Meta') {
+        isCmdHeldRef.current = true;
+        setIsCmdHeld(true);
+      }
+    };
+    const handleKeyUp = (e: KeyboardEvent) => {
+      if (e.key === 'Meta') {
+        isCmdHeldRef.current = false;
+        setIsCmdHeld(false);
+      }
+    };
+    const handleBlur = () => {
+      isCmdHeldRef.current = false;
+      setIsCmdHeld(false);
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('keyup', handleKeyUp);
+    window.addEventListener('blur', handleBlur);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('keyup', handleKeyUp);
+      window.removeEventListener('blur', handleBlur);
+    };
+  }, []);
+
+  // Sync tooltip with CMD key state: show when CMD pressed during hover, hide when released
+  useEffect(() => {
+    if (isCmdHeld && hoveredIndex !== null) {
+      setActiveTooltipIndex(hoveredIndex);
+    } else if (!isCmdHeld && !isExpanded) {
+      setActiveTooltipIndex(null);
+    }
+  }, [isCmdHeld, hoveredIndex, isExpanded]);
 
   // Load timeline and fork markers when sessionId changes
   const loadTimeline = useCallback(async () => {
@@ -308,7 +349,10 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
 
   const handleMouseEnterSegment = (index: number) => {
     setHoveredIndex(index);
-    setActiveTooltipIndex(index);
+    // Tooltip only appears when CMD is held (synced via useEffect)
+    if (isCmdHeldRef.current) {
+      setActiveTooltipIndex(index);
+    }
   };
 
   const handleMouseLeaveSegment = (e: React.MouseEvent) => {
@@ -1003,7 +1047,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
               onMouseLeave={handleMouseLeaveTooltipArea}
               style={{
                 position: 'fixed',
-                right: `${notesPanelWidth}px`,
+                right: `${notesPanelWidth + 24}px`,
                 top: `${tooltipPos.wTop}px`,
                 height: `${tooltipPos.wH}px`,
                 zIndex: 10000,
