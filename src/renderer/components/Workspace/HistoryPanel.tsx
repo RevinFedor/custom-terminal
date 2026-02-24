@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useRef, useCallback, memo } from 'react';
+import React, { useEffect, useLayoutEffect, useState, useRef, useCallback, memo } from 'react';
 import { X, ChevronDown, ChevronRight } from 'lucide-react';
 import { useUIStore } from '../../store/useUIStore';
 import MarkdownRenderer from '../Research/MarkdownRenderer';
@@ -32,6 +32,7 @@ interface HistoryPanelProps {
   cwd: string;
   width: number;
   notesPanelWidth: number;
+  isOpen: boolean;
 }
 
 // Thinking block — collapsible
@@ -262,18 +263,32 @@ const entryWrapperStyle: React.CSSProperties = {
   containIntrinsicSize: 'auto 100px',
 };
 
-function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth }: HistoryPanelProps) {
+function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen }: HistoryPanelProps) {
   const setHistoryPanelOpen = useUIStore((s) => s.setHistoryPanelOpen);
   const setHistoryPanelWidth = useUIStore((s) => s.setHistoryPanelWidth);
   const historyScrollToUuid = useUIStore((s) => s.historyScrollToUuid);
   const setHistoryScrollToUuid = useUIStore((s) => s.setHistoryScrollToUuid);
+  const setHistoryVisibleUuids = useUIStore((s) => s.setHistoryVisibleUuids);
   const closePanel = useCallback(() => setHistoryPanelOpen(tabId, false), [tabId, setHistoryPanelOpen]);
+
+  // Slide animation state
+  const [slideIn, setSlideIn] = useState(false);
+  useEffect(() => {
+    if (isOpen) {
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => setSlideIn(true));
+      });
+    } else {
+      setSlideIn(false);
+    }
+  }, [isOpen]);
 
   const [entries, setEntries] = useState<FullHistoryEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const scrollRef = useRef<HTMLDivElement>(null);
   const isResizing = useRef(false);
   const isAtBottomRef = useRef(true);
+  const prevVisibleUuidsRef = useRef('');
 
   // Scroll to bottom helper
   const scrollToBottom = useCallback((smooth = false) => {
@@ -294,12 +309,7 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth }: History
           console.warn(`[HP] initial load: ${newEntries.length} entries`);
           setEntries(newEntries);
           setLoading(false);
-          // Scroll to bottom after DOM renders
-          requestAnimationFrame(() => {
-            requestAnimationFrame(() => {
-              scrollToBottom();
-            });
-          });
+          // Starts at the top by default (no scrollToBottom on initial load)
         } else {
           // Refresh: only update if count changed
           setEntries(prev => {
@@ -351,6 +361,42 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth }: History
     isAtBottomRef.current = distFromBottom < 150;
   }, []);
 
+  // Track visible entries for Timeline viewport indicator (UUID-based, no text search)
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el || entries.length === 0) {
+      setHistoryVisibleUuids(tabId, []);
+      return;
+    }
+
+    const visibleSet = new Set<string>();
+    prevVisibleUuidsRef.current = '';
+
+    const observer = new IntersectionObserver(
+      (observed) => {
+        for (const oe of observed) {
+          const uuid = (oe.target as HTMLElement).dataset.uuid;
+          if (!uuid) continue;
+          if (oe.isIntersecting) visibleSet.add(uuid);
+          else visibleSet.delete(uuid);
+        }
+        const key = [...visibleSet].sort().join(',');
+        if (key !== prevVisibleUuidsRef.current) {
+          prevVisibleUuidsRef.current = key;
+          setHistoryVisibleUuids(tabId, [...visibleSet]);
+        }
+      },
+      { root: el, threshold: 0.1 }
+    );
+
+    el.querySelectorAll('[data-uuid]').forEach(child => observer.observe(child));
+
+    return () => {
+      observer.disconnect();
+      setHistoryVisibleUuids(tabId, []);
+    };
+  }, [tabId, entries.length, setHistoryVisibleUuids]);
+
   // Resize handle
   const handleResizeMouseDown = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
@@ -400,6 +446,8 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth }: History
         zIndex: 101,
         display: 'flex',
         flexDirection: 'column',
+        transform: slideIn ? 'translateX(0)' : 'translateX(100%)',
+        transition: 'transform 50ms ease-out',
       }}
     >
       {/* Resize handle (left edge) */}
@@ -472,6 +520,8 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth }: History
           top: 0, left: 0, bottom: 0,
           right: width,
           backgroundColor: 'rgba(0, 0, 0, 0.3)',
+          opacity: slideIn ? 1 : 0,
+          transition: 'opacity 50ms ease-out',
           zIndex: 100,
         }}
       />

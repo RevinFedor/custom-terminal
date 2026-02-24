@@ -151,9 +151,11 @@ interface UIStore {
   historyPanelOpenTabs: Record<string, boolean>;
   historyPanelWidth: number;
   historyScrollToUuid: string | null;
+  historyVisibleUuids: Record<string, string[]>;
   setHistoryPanelOpen: (tabId: string, open: boolean) => void;
   setHistoryPanelWidth: (width: number) => void;
   setHistoryScrollToUuid: (uuid: string | null) => void;
+  setHistoryVisibleUuids: (tabId: string, uuids: string[]) => void;
 
   // Notes Panel Width
 
@@ -643,10 +645,14 @@ export const useUIStore = create<UIStore>((set, get) => ({
     } catch { return 580; }
   })(),
   historyScrollToUuid: null,
+  historyVisibleUuids: {},
   setHistoryPanelOpen: (tabId, open) => set(state => ({
     historyPanelOpenTabs: { ...state.historyPanelOpenTabs, [tabId]: open }
   })),
   setHistoryScrollToUuid: (uuid) => set({ historyScrollToUuid: uuid }),
+  setHistoryVisibleUuids: (tabId, uuids) => set(state => ({
+    historyVisibleUuids: { ...state.historyVisibleUuids, [tabId]: uuids }
+  })),
   setHistoryPanelWidth: (width) => {
     const clamped = Math.max(280, Math.min(700, width));
     set({ historyPanelWidth: clamped });

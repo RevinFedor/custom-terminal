@@ -3574,10 +3574,15 @@ ipcMain.handle('claude:get-timeline', async (event, { sessionId, cwd }) => {
 });
 
 // Export Claude session as clean text (with options and backtrace)
-ipcMain.handle('claude:export-clean-session', async (event, { sessionId, cwd, includeCode = false, fromStart = true }) => {
+ipcMain.handle('claude:export-clean-session', async (event, { sessionId, cwd, includeEditing = false, includeReading = false, includeCode, fromStart = true }) => {
+  // Backward compat: old callers may pass includeCode
+  if (includeCode !== undefined && includeEditing === undefined) {
+    includeEditing = includeCode;
+    includeReading = includeCode;
+  }
   console.log('[Claude Export] ========================================');
   console.log('[Claude Export] Exporting session:', sessionId);
-  console.log('[Claude Export] Options:', { includeCode, fromStart, cwd });
+  console.log('[Claude Export] Options:', { includeEditing, includeReading, fromStart, cwd });
 
   if (!sessionId) {
     return { success: false, error: 'No session ID provided' };
@@ -3898,13 +3903,21 @@ ipcMain.handle('claude:export-clean-session', async (event, { sessionId, cwd, in
         default: label = `⚙️ ${toolName}`;
       }
 
-      if (!includeCode) return label;
+      // Per-tool code inclusion: editing (Edit/Write/Bash) vs reading (Read)
+      const shouldInclude =
+        ((toolName === 'Edit' || toolName === 'Write' || toolName === 'Bash') && includeEditing) ||
+        (toolName === 'Read' && includeReading);
 
-      // If including code, add the content if available
+      if (!shouldInclude) return label;
+
+      // Add the content if available
       let detail = '';
       if (toolName === 'Read' && toolResult?.content) {
         detail = `\n\`\`\`\n${toolResult.content}\n\`\`\``;
-      } else if ((toolName === 'Edit' || toolName === 'Write') && input.content) {
+      } else if (toolName === 'Edit' && input.old_string != null) {
+        // Edit tool has old_string/new_string, not content
+        detail = `\n\`\`\`diff\n- ${input.old_string}\n+ ${input.new_string}\n\`\`\``;
+      } else if (toolName === 'Write' && input.content) {
         detail = `\n\`\`\`\n${input.content}\n\`\`\``;
       } else if (toolName === 'Bash' && toolResult?.content) {
         detail = `\n\`\`\`\n${toolResult.content}\n\`\`\``;
@@ -3974,7 +3987,7 @@ ipcMain.handle('claude:export-clean-session', async (event, { sessionId, cwd, in
             if (block.type === 'tool_use') {
               // Find matching tool_result in subsequent records
               let toolResult = null;
-              if (includeCode) {
+              if (includeEditing || includeReading) {
                 for (let j = i + 1; j < activeBranch.length; j++) {
                   const nextEntry = activeBranch[j];
                   if (nextEntry.type === 'user' && Array.isArray(nextEntry.message?.content)) {
@@ -3997,7 +4010,7 @@ ipcMain.handle('claude:export-clean-session', async (event, { sessionId, cwd, in
           outputParts.push('🤖 CLAUDE:');
           if (textContent.trim()) outputParts.push(textContent);
           if (toolActions.length > 0) {
-            if (includeCode) {
+            if (includeEditing || includeReading) {
               outputParts.push('\n**Actions:**\n' + toolActions.join('\n\n'));
             } else {
               outputParts.push(`   [Действия: ${toolActions.join(', ')}]`);

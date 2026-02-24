@@ -9,6 +9,7 @@
 #         --parallel N  — количество параллельных запросов (по умолчанию 10)
 #
 # CLAUDE.md переименовывается автоматически (mv → .bak) и восстанавливается при выходе
+#
 # =============================================================================
 
 set -u
@@ -92,7 +93,7 @@ SYSTEM_PROMPT='Ты — Semantic Indexer для проекта Noted Terminal (E
    ХОРОШО: "handshake_prompt_injection", "safePasteAndSubmit_chunking", "rewind_visual_search_rgb"
 
 2. НАЗВАНИЯ ПОДСИСТЕМ — если файл описывает несколько механизмов, каждый должен быть отдельным тегом:
-   Пример: ai-automation.md содержит 9 подсистем → теги: "handshake_auto_prompt", "fork_session_copy", "compact_gap_recovery", "rewind_paste_insert", "silence_detection", "sniper_watcher", "code_stripping_export", "session_tree_hierarchy", "gemini_research_activation"
+   Пример: большой файл содержит 5 подсистем → каждая как отдельный тег: "handshake_auto_prompt", "fork_session_copy", "compact_gap_recovery", "rewind_paste_insert", "silence_detection"
 
 3. СИМПТОМЫ — баги и проблемы, которые приведут пользователя к этому файлу:
    Пример: файл про sync markers → теги: "terminal_freeze_after_paste", "enter_not_working_after_rewind", "model_switch_kills_claude"

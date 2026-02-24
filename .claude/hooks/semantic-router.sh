@@ -12,13 +12,13 @@
 INPUT=$(cat)
 PROMPT=$(echo "$INPUT" | jq -r '.prompt // empty' 2>/dev/null)
 
-# Check trigger: prompt ends with ???
-if [ -z "$PROMPT" ] || ! echo "$PROMPT" | grep -qE '\?\?\?[[:space:]]*$'; then
+# Check trigger: prompt ends with ??? or &&&
+if [ -z "$PROMPT" ] || ! echo "$PROMPT" | grep -qE '(\?\?\?|&&&)[[:space:]]*$'; then
   exit 0
 fi
 
 # Strip trigger
-CLEAN_PROMPT=$(echo "$PROMPT" | sed 's/[[:space:]]*???[[:space:]]*$//')
+CLEAN_PROMPT=$(echo "$PROMPT" | sed -E 's/[[:space:]]*((\?\?\?)|(&&&))[[:space:]]*$//')
 
 PROJECT_DIR="${CLAUDE_PROJECT_DIR:-.}"
 INDEX_FILE="$PROJECT_DIR/.semantic-index.json"

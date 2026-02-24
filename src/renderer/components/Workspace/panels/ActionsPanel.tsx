@@ -39,11 +39,17 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
   const [isCopying, setIsCopying] = useState(false);
   
   // New toggles
-  const [includeCode, setIncludeCode] = useState(false);
+  const [includeEditing, setIncludeEditing] = useState(true);
+  const [includeReading, setIncludeReading] = useState(false);
   const [fromStart, setFromStart] = useState(true);
   const [showCopySettings, setShowCopySettings] = useState(false);
+  const [showDocsInfo, setShowDocsInfo] = useState(false);
+  const [showCopyInfo, setShowCopyInfo] = useState(false);
   const copyIconRef = useRef<HTMLSpanElement>(null);
   const copyContainerRef = useRef<HTMLDivElement>(null);
+  const docsTitleRef = useRef<HTMLDivElement>(null);
+  const copyTitleRef = useRef<HTMLDivElement>(null);
+  const docsBlockRef = useRef<HTMLDivElement>(null);
 
   const selectedTabs = activeProjectId ? getSelectedTabs(activeProjectId) : [];
 
@@ -65,30 +71,54 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
     };
   }, []);
 
-  // Get icon position for portal positioning
-  const getIconPosition = useCallback(() => {
-    if (!copyIconRef.current) return { x: 0, y: 0 };
-    const rect = copyIconRef.current.getBoundingClientRect();
-    return { x: rect.left, y: rect.top + rect.height / 2 };
-  }, []);
-
-  // Direction-based close (exactly like Timeline)
-  const handleMouseLeaveIcon = useCallback((e: React.MouseEvent) => {
-    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-    const mouseX = e.clientX;
-
-    // If mouse went LEFT (towards settings menu) - keep open
-    // If mouse went RIGHT or other direction - close
-    const wentLeft = mouseX < rect.left;
-
-    if (!wentLeft) {
-      setShowCopySettings(false);
-    }
-  }, []);
-
   const handleMouseLeaveSettingsArea = useCallback(() => {
     setShowCopySettings(false);
   }, []);
+  // Info panel helper — read-only reference showing current parameters
+  // Uses block ref for horizontal alignment (flush with block left edge)
+  const renderInfoPanel = (blockRef: React.RefObject<HTMLDivElement | null>, color: 'blue' | 'orange') => {
+    if (!blockRef.current) return null;
+    const blockRect = blockRef.current.getBoundingClientRect();
+    const accent = color === 'blue' ? 'rgba(59, 130, 246, 0.3)' : 'rgba(218, 119, 86, 0.3)';
+    const headerColor = color === 'blue' ? '#60a5fa' : '#DA7756';
+    const panelWidth = 150;
+    const panelHeight = 68;
+    return (
+      <SettingsPortal>
+        <div style={{
+          position: 'fixed',
+          left: blockRect.left - panelWidth,
+          top: blockRect.top + blockRect.height / 2 - panelHeight / 2,
+          zIndex: 10000,
+          pointerEvents: 'none',
+        }}>
+          <div style={{
+            backgroundColor: 'rgba(26, 26, 26, 0.98)',
+            border: `1px solid ${accent}`,
+            borderRadius: '6px',
+            padding: '6px 10px',
+            fontSize: '10px',
+            minWidth: '130px',
+            backdropFilter: 'blur(12px)',
+            boxShadow: `0 8px 24px rgba(0,0,0,0.5)`,
+          }}>
+            <div style={{ color: headerColor, fontWeight: 600, marginBottom: 4, fontSize: 9, textTransform: 'uppercase' }}>Параметры</div>
+            {[
+              { label: 'Чтение', active: includeReading },
+              { label: 'Редактирование', active: includeEditing },
+              { label: 'С начала', active: fromStart },
+            ].map(({ label, active }) => (
+              <div key={label} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '1px 0', color: '#999' }}>
+                <span>{label}</span>
+                <span style={{ color: active ? '#4ade80' : '#555', fontSize: 11 }}>{active ? '●' : '○'}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      </SettingsPortal>
+    );
+  };
+
   const isMultiSelect = selectedTabs.length > 1;
 
   useEffect(() => {
@@ -215,7 +245,8 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
           const result = await ipcRenderer.invoke('claude:export-clean-session', {
             sessionId: tab.claudeSessionId,
             cwd,
-            includeCode,
+            includeEditing,
+            includeReading,
             fromStart
           });
           if (result.success) results.push(result.content);
@@ -304,7 +335,8 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
       isMultiSelect,
       selectedTabsCount: selectedTabs.length,
       activeTabId,
-      includeCode,
+      includeEditing,
+      includeReading,
       fromStart
     });
 
@@ -366,14 +398,16 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
           tabName: tab.name,
           sessionId: targetSessionId,
           cwd,
-          includeCode,
+          includeEditing,
+          includeReading,
           fromStart
         });
 
         const result = await ipcRenderer.invoke('claude:export-clean-session', {
           sessionId: targetSessionId,
           cwd,
-          includeCode,
+          includeEditing,
+          includeReading,
           fromStart
         });
 
@@ -421,6 +455,7 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
 
           <div className="flex flex-col gap-1">
               <div
+                ref={docsBlockRef}
                 className={`w-full bg-blue-900/30 border border-blue-700/30 text-blue-400 p-3 text-left rounded-lg text-xs flex items-center gap-2 ${
                   isUpdatingDocs ? 'opacity-50 cursor-not-allowed' : ''
                 }`}
@@ -429,8 +464,11 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
                 <span className="text-base">📚</span>
                 <div className="flex-1">
                   <div
+                    ref={docsTitleRef}
                     className="font-medium cursor-pointer hover:text-white hover:underline inline-block"
                     onMouseDown={(e) => e.stopPropagation()}
+                    onMouseEnter={() => setShowDocsInfo(true)}
+                    onMouseLeave={() => setShowDocsInfo(false)}
                     onClick={(e) => {
                       e.stopPropagation();
                       if (!isUpdatingDocs) handleUpdateDocs('session');
@@ -439,6 +477,7 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
                   >
                     {isMultiSelect ? `Update Docs (${selectedTabs.length})` : 'Update Docs'}
                   </div>
+                  {showDocsInfo && renderInfoPanel(docsBlockRef, 'blue')}
                   <div
                     className="text-[10px] text-blue-600 mt-0.5 cursor-pointer"
                     onClick={() => !isUpdatingDocs && setDocsExpanded(!docsExpanded)}
@@ -555,80 +594,98 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
                 e.currentTarget.style.borderColor = 'rgba(218, 119, 86, 0.15)';
               }}
             >
-              {/* Icon with simple hover (no scale - like Timeline) */}
+              {/* Settings icon — inside the orange block */}
               <div
                 ref={copyIconRef}
-                className={`relative w-6 h-6 flex items-center justify-center cursor-pointer rounded ${showCopySettings ? 'bg-white/15' : 'hover:bg-white/10'}`}
+                className={`relative w-6 h-6 flex items-center justify-center cursor-pointer rounded shrink-0 ${showCopySettings ? 'bg-white/15' : 'hover:bg-white/10'}`}
                 onMouseEnter={() => setShowCopySettings(true)}
-                onMouseLeave={handleMouseLeaveIcon}
+                onMouseLeave={(e) => {
+                  // Keep open only if mouse went LEFT (towards the settings menu portal)
+                  const rect = e.currentTarget.getBoundingClientRect();
+                  if (e.clientX >= rect.left) {
+                    setShowCopySettings(false);
+                  }
+                }}
               >
                 <span className="text-base">📋</span>
                 {/* Indicators */}
                 <div className="absolute -bottom-1 -right-1 flex gap-0.5 pointer-events-none">
-                  {includeCode && <div className="w-1.5 h-1.5 rounded-full bg-green-500 border border-[#1a1a1a]" title="С кодом" />}
+                  {includeReading && <div className="w-1.5 h-1.5 rounded-full bg-amber-400 border border-[#1a1a1a]" title="Чтение" />}
+                  {includeEditing && <div className="w-1.5 h-1.5 rounded-full bg-purple-400 border border-[#1a1a1a]" title="Редактирование" />}
                   {!fromStart && <div className="w-1.5 h-1.5 rounded-full bg-blue-500 border border-[#1a1a1a]" title="С последнего форка" />}
                 </div>
               </div>
 
-              {/* Settings Menu Portal (like Timeline tooltip) */}
-              {showCopySettings && (
-                <SettingsPortal>
-                  <div
-                    onMouseLeave={handleMouseLeaveSettingsArea}
-                    style={{
-                      position: 'fixed',
-                      left: getIconPosition().x - 190, // Menu width (150) + bridge (40)
-                      top: getIconPosition().y - 60,   // Center vertically
-                      zIndex: 10000,
-                      display: 'flex',
-                      flexDirection: 'row',
-                      alignItems: 'center',
-                    }}
-                  >
-                    {/* Settings Menu Content */}
+              {/* Settings Menu Portal — positioned LEFT of the block, vertically centered */}
+              {showCopySettings && (() => {
+                const bRect = copyContainerRef.current?.getBoundingClientRect();
+                if (!bRect) return null;
+                const menuWidth = 170;
+                const menuHeight = 128;
+                return (
+                  <SettingsPortal>
                     <div
-                      className="bg-[#1a1a1a] border border-[#444] rounded-lg shadow-2xl p-2 min-w-[150px] flex flex-col gap-2"
+                      onMouseLeave={handleMouseLeaveSettingsArea}
                       style={{
-                        backdropFilter: 'blur(12px)',
-                        boxShadow: '0 15px 35px rgba(0,0,0,0.6)',
+                        position: 'fixed',
+                        left: bRect.left - menuWidth,
+                        top: bRect.top + bRect.height / 2 - menuHeight / 2,
+                        zIndex: 10000,
+                        display: 'flex',
+                        flexDirection: 'row',
                       }}
                     >
-                      <div className="px-1 py-0.5 text-[9px] uppercase font-bold text-[#666] border-b border-[#333] mb-1">Настройки</div>
+                      <div
+                        className="bg-[#1a1a1a] border border-[#444] rounded-lg shadow-2xl p-2 min-w-[150px] flex flex-col gap-2"
+                        style={{ backdropFilter: 'blur(12px)', boxShadow: '0 15px 35px rgba(0,0,0,0.6)' }}
+                      >
+                        <div className="px-1 py-0.5 text-[9px] uppercase font-bold text-[#666] border-b border-[#333] mb-1">Настройки</div>
 
-                      <label className="flex items-center justify-between gap-3 cursor-pointer group/label px-1">
-                        <span className="text-[10px] text-[#aaa] group-hover/label:text-white">С кодом</span>
-                        <div
-                          className={`w-7 h-4 rounded-full relative cursor-pointer ${includeCode ? 'bg-[#DA7756]' : 'bg-[#444]'}`}
-                          onClick={(e) => { e.stopPropagation(); setIncludeCode(!includeCode); }}
-                        >
-                          <div className={`absolute top-0.5 w-3 h-3 bg-white rounded-full ${includeCode ? 'left-[14px]' : 'left-0.5'}`} />
-                        </div>
-                      </label>
+                        <label className="flex items-center justify-between gap-3 cursor-pointer group/label px-1">
+                          <span className="text-[10px] text-[#aaa] group-hover/label:text-white">Чтение</span>
+                          <div
+                            className={`w-7 h-4 rounded-full relative cursor-pointer ${includeReading ? 'bg-[#DA7756]' : 'bg-[#444]'}`}
+                            onClick={(e) => { e.stopPropagation(); setIncludeReading(!includeReading); }}
+                          >
+                            <div className={`absolute top-0.5 w-3 h-3 bg-white rounded-full ${includeReading ? 'left-[14px]' : 'left-0.5'}`} />
+                          </div>
+                        </label>
 
-                      <label className="flex items-center justify-between gap-3 cursor-pointer group/label px-1">
-                        <span className="text-[10px] text-[#aaa] group-hover/label:text-white">С начала</span>
-                        <div
-                          className={`w-7 h-4 rounded-full relative cursor-pointer ${fromStart ? 'bg-[#DA7756]' : 'bg-[#444]'}`}
-                          onClick={(e) => { e.stopPropagation(); setFromStart(!fromStart); }}
-                        >
-                          <div className={`absolute top-0.5 w-3 h-3 bg-white rounded-full ${fromStart ? 'left-[14px]' : 'left-0.5'}`} />
-                        </div>
-                      </label>
+                        <label className="flex items-center justify-between gap-3 cursor-pointer group/label px-1">
+                          <span className="text-[10px] text-[#aaa] group-hover/label:text-white">Редактирование</span>
+                          <div
+                            className={`w-7 h-4 rounded-full relative cursor-pointer ${includeEditing ? 'bg-[#DA7756]' : 'bg-[#444]'}`}
+                            onClick={(e) => { e.stopPropagation(); setIncludeEditing(!includeEditing); }}
+                          >
+                            <div className={`absolute top-0.5 w-3 h-3 bg-white rounded-full ${includeEditing ? 'left-[14px]' : 'left-0.5'}`} />
+                          </div>
+                        </label>
+
+                        <label className="flex items-center justify-between gap-3 cursor-pointer group/label px-1">
+                          <span className="text-[10px] text-[#aaa] group-hover/label:text-white">С начала</span>
+                          <div
+                            className={`w-7 h-4 rounded-full relative cursor-pointer ${fromStart ? 'bg-[#DA7756]' : 'bg-[#444]'}`}
+                            onClick={(e) => { e.stopPropagation(); setFromStart(!fromStart); }}
+                          >
+                            <div className={`absolute top-0.5 w-3 h-3 bg-white rounded-full ${fromStart ? 'left-[14px]' : 'left-0.5'}`} />
+                          </div>
+                        </label>
+                      </div>
+                      {/* Horizontal bridge — covers gap from menu right edge to icon inside the block */}
+                      <div style={{ width: '30px', height: '80px' }} />
                     </div>
-
-                    {/* CSS Bridge - invisible area connecting menu to icon */}
-                    <div style={{ width: '40px', height: '80px' }} />
-                  </div>
-                </SettingsPortal>
-              )}
+                  </SettingsPortal>
+                );
+              })()}
 
               <div className="flex-1">
                 {/* Clickable title - copies current session(s) */}
                 <div
+                  ref={copyTitleRef}
                   className="font-medium cursor-pointer hover:text-white hover:underline inline-block"
-                  onMouseDown={(e) => {
-                    e.stopPropagation();
-                  }}
+                  onMouseDown={(e) => e.stopPropagation()}
+                  onMouseEnter={() => setShowCopyInfo(true)}
+                  onMouseLeave={() => setShowCopyInfo(false)}
                   onClick={(e) => {
                     e.stopPropagation();
                     if (!isCopying) handleCopySession();
@@ -637,6 +694,7 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
                 >
                   {isMultiSelect ? `Copy ${selectedTabs.length} Sessions` : copySessionInput.trim() ? 'Copy Custom Session' : 'Copy Session'}
                 </div>
+                {showCopyInfo && renderInfoPanel(copyContainerRef, 'orange')}
                 <div
                   className="text-[10px] text-[#DA7756]/70 mt-0.5 cursor-pointer"
                   onClick={() => !isCopying && setCopySessionExpanded(!copySessionExpanded)}
@@ -645,7 +703,6 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
                     isMultiSelect ? `Экспорт ${selectedTabs.length} сессий в буфер` : copySessionInput.trim() ? `ID: ${copySessionInput.trim().slice(0, 30)}` : 'Claude JSONL → clipboard'}
                 </div>
               </div>
-              {/* Hide expand button when multi-select - no need for manual ID input */}
               {!isMultiSelect && (
                 <span
                   className="text-[10px] text-[#DA7756]/50 cursor-pointer hover:text-[#DA7756] px-1"

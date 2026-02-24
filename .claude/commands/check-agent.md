@@ -65,7 +65,7 @@ for ch in sorted(changes):
 
 1. Прочитай `docs/architecture.md` — общие Anti-Patterns.
 2. Для каждого изменённого файла определи релевантные `docs/knowledge/` файлы:
-   - По имени файла/директории (terminal → terminal-core.md, xterm → ui-ux-stability.md, tabs → *, claude → claude-*, etc.)
+   - По имени файла/директории (terminal → terminal-core.md, xterm → ui-terminal-rendering.md, tabs → *, claude → claude-*, etc.)
    - Прочитай каждый найденный knowledge-файл.
 3. Найди соответствующий файл в `docs/features/` и прочитай его.
 

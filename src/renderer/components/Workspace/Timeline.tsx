@@ -78,6 +78,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
   const notesPanelWidth = useUIStore(state => state.notesPanelWidth);
   const setHistoryScrollToUuid = useUIStore(state => state.setHistoryScrollToUuid);
   const isHistoryOpen = useUIStore(state => state.historyPanelOpenTabs[tabId] ?? false);
+  const historyVisibleUuids = useUIStore(state => state.historyVisibleUuids[tabId]);
   const containerRef = useRef<HTMLDivElement>(null);
   const segmentRefs = useRef<(HTMLDivElement | null)[]>([]);
 
@@ -243,6 +244,22 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
       return;
     }
 
+    // History panel open — UUID-based visibility, no unreachable zone
+    if (isHistoryOpen) {
+      setUnreachableIndices(prev => prev.size === 0 ? prev : new Set());
+
+      const uuidSet = historyVisibleUuids ? new Set(historyVisibleUuids) : new Set<string>();
+      const newVisible = new Set<number>();
+      entries.forEach((entry, index) => {
+        if (uuidSet.has(entry.uuid)) newVisible.add(index);
+      });
+      setVisibleEntryIndices(prev => {
+        if (prev.size === newVisible.size && [...prev].every(i => newVisible.has(i))) return prev;
+        return newVisible;
+      });
+      return;
+    }
+
     // Viewport visibility — which entries are currently on screen
     const checkVisibility = () => {
       const visibleText = terminalRegistry.getVisibleText(tabId);
@@ -285,6 +302,17 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
         }
       });
 
+      // Inherit unreachable for compact/continued/plan entries from next regular entry
+      entries.forEach((entry, index) => {
+        if (entry.type !== 'compact' && entry.type !== 'continued' && !entry.isPlan) return;
+        for (let j = index + 1; j < entries.length; j++) {
+          const next = entries[j];
+          if (next.type === 'compact' || next.type === 'continued' || next.isPlan) continue;
+          if (newUnreachable.has(j)) newUnreachable.add(index);
+          break;
+        }
+      });
+
       setUnreachableIndices(prev => {
         if (prev.size === newUnreachable.size && [...prev].every(i => newUnreachable.has(i))) return prev;
         return newUnreachable;
@@ -312,7 +340,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
       if (reachTimer) clearTimeout(reachTimer);
       terminalRegistry.offViewportChange(tabId);
     };
-  }, [tabId, entries, isVisible, getEntryKey, matchesAtUserPrompt]);
+  }, [tabId, entries, isVisible, getEntryKey, matchesAtUserPrompt, isHistoryOpen, historyVisibleUuids]);
 
   // Refs
   const tooltipRef = useRef<HTMLDivElement>(null);
@@ -802,15 +830,17 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
             !forkMarkers.some(m => !m.entry_uuids || m.entry_uuids.length === 0) && (
             <div
               className="flex-shrink-0 w-full flex items-center justify-center"
-              style={{ height: '8px' }}
+              style={{ height: '8px', backgroundColor: unreachableIndices.has(0) ? 'rgba(239, 68, 68, 0.06)' : 'transparent' }}
               title="Plan mode - context was cleared here"
             >
               <div
                 style={{
-                  width: '12px',
-                  height: '2px',
+                  width: visibleEntryIndices.has(0) ? '10px' : '12px',
+                  height: visibleEntryIndices.has(0) ? '3px' : '2px',
                   borderRadius: '1px',
-                  backgroundColor: '#48968c',
+                  backgroundColor: visibleEntryIndices.has(0) ? '#5eada3' : '#48968c',
+                  boxShadow: visibleEntryIndices.has(0) ? '0 0 6px rgba(72, 150, 140, 0.25)' : 'none',
+                  transition: 'all 0.2s',
                 }}
               />
             </div>
@@ -819,15 +849,17 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
           {forkMarkers.some(m => !m.entry_uuids || m.entry_uuids.length === 0) && entries.length > 0 && (
             <div
               className="flex-shrink-0 w-full flex items-center justify-center"
-              style={{ height: '8px' }}
+              style={{ height: '8px', backgroundColor: unreachableIndices.has(0) ? 'rgba(239, 68, 68, 0.06)' : 'transparent' }}
               title="Fork point - this session was forked from here"
             >
               <div
                 style={{
-                  width: '12px',
-                  height: '2px',
+                  width: visibleEntryIndices.has(0) ? '10px' : '12px',
+                  height: visibleEntryIndices.has(0) ? '3px' : '2px',
                   borderRadius: '1px',
-                  backgroundColor: '#3b82f6',
+                  backgroundColor: visibleEntryIndices.has(0) ? '#60a5fa' : '#3b82f6',
+                  boxShadow: visibleEntryIndices.has(0) ? '0 0 6px rgba(59, 130, 246, 0.25)' : 'none',
+                  transition: 'all 0.2s',
                 }}
               />
             </div>
@@ -889,17 +921,19 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
                   <div
                     className="transition-all duration-200 pointer-events-none"
                     style={{
-                      width: isCompacted ? '12px' : (hoveredIndex === index || activeTooltipIndex === index ? '8px' : (isInViewport ? '10px' : '4px')),
-                      height: isCompacted ? '2px' : (hoveredIndex === index || activeTooltipIndex === index ? '8px' : (isInViewport ? '3px' : '4px')),
+                      width: isCompacted ? (isInViewport ? '10px' : '12px') : (hoveredIndex === index || activeTooltipIndex === index ? '8px' : (isInViewport ? '10px' : '4px')),
+                      height: isCompacted ? (isInViewport ? '3px' : '2px') : (hoveredIndex === index || activeTooltipIndex === index ? '8px' : (isInViewport ? '3px' : '4px')),
                       borderRadius: (isCompacted || (isInViewport && hoveredIndex !== index && activeTooltipIndex !== index)) ? '1px' : '50%',
-                      backgroundColor: isCompacted || isContinued
-                        ? '#f59e0b'
-                        : isPlan
-                          ? '#48968c'
-                          : (active ? '#3b82f6' : (hoveredIndex === index || activeTooltipIndex === index ? 'white' : (isInViewport ? 'rgba(255,255,255,0.75)' : 'rgba(255,255,255,0.3)'))),
+                      backgroundColor: isCompacted
+                        ? (isInViewport ? '#fbbf24' : '#f59e0b')
+                        : isContinued
+                          ? '#f59e0b'
+                          : isPlan
+                            ? '#48968c'
+                            : (active ? '#3b82f6' : (hoveredIndex === index || activeTooltipIndex === index ? 'white' : (isInViewport ? 'rgba(255,255,255,0.75)' : 'rgba(255,255,255,0.3)'))),
                       boxShadow: (hoveredIndex === index || activeTooltipIndex === index)
                         ? (isContinued ? '0 0 8px rgba(245, 158, 11, 0.4)' : isPlan ? '0 0 8px rgba(72, 150, 140, 0.4)' : '0 0 8px rgba(255,255,255,0.4)')
-                        : (isInViewport ? '0 0 6px rgba(255,255,255,0.25)' : 'none'),
+                        : (isInViewport ? (isCompacted ? '0 0 6px rgba(245, 158, 11, 0.25)' : '0 0 6px rgba(255,255,255,0.25)') : 'none'),
                     }}
                   />
                   {/* Loading spinner — instant feedback on click */}
@@ -932,15 +966,17 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
                 {forkMarker && (
                   <div
                     className="flex-shrink-0 w-full flex items-center justify-center"
-                    style={{ height: '8px' }}
+                    style={{ height: '8px', backgroundColor: isUnreachable ? 'rgba(239, 68, 68, 0.06)' : 'transparent' }}
                     title="Fork point - this session was forked from here"
                   >
                     <div
                       style={{
-                        width: '12px',
-                        height: '2px',
+                        width: isInViewport ? '10px' : '12px',
+                        height: isInViewport ? '3px' : '2px',
                         borderRadius: '1px',
-                        backgroundColor: '#3b82f6',  // Blue for fork
+                        backgroundColor: isInViewport ? '#60a5fa' : '#3b82f6',
+                        boxShadow: isInViewport ? '0 0 6px rgba(59, 130, 246, 0.25)' : 'none',
+                        transition: 'all 0.2s',
                       }}
                     />
                   </div>
@@ -949,15 +985,17 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
                 {isPlanModeBoundary && (
                   <div
                     className="flex-shrink-0 w-full flex items-center justify-center"
-                    style={{ height: '8px' }}
+                    style={{ height: '8px', backgroundColor: isUnreachable ? 'rgba(239, 68, 68, 0.06)' : 'transparent' }}
                     title="Plan mode - context was cleared here"
                   >
                     <div
                       style={{
-                        width: '12px',
-                        height: '2px',
+                        width: isInViewport ? '10px' : '12px',
+                        height: isInViewport ? '3px' : '2px',
                         borderRadius: '1px',
-                        backgroundColor: '#48968c',
+                        backgroundColor: isInViewport ? '#5eada3' : '#48968c',
+                        boxShadow: isInViewport ? '0 0 6px rgba(72, 150, 140, 0.25)' : 'none',
+                        transition: 'all 0.2s',
                       }}
                     />
                   </div>
