@@ -76,8 +76,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
   const [rewindState, setRewindState] = useState<{ index: number; phase: 'compacting' | 'rewinding' | 'pasting' | 'done' } | null>(null);
 
   const notesPanelWidth = useUIStore(state => state.notesPanelWidth);
-  const setHistoryPanelOpen = useUIStore(state => state.setHistoryPanelOpen);
   const setHistoryScrollToUuid = useUIStore(state => state.setHistoryScrollToUuid);
+  const isHistoryOpen = useUIStore(state => state.historyPanelOpenTabs[tabId] ?? false);
   const containerRef = useRef<HTMLDivElement>(null);
   const segmentRefs = useRef<(HTMLDivElement | null)[]>([]);
 
@@ -381,12 +381,16 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
 
     if (entry.type === 'compact' || entry.type === 'continued') return;
 
-    // Open HistoryPanel and scroll to this entry
-    setHistoryPanelOpen(true);
-    setHistoryScrollToUuid(entry.uuid);
-
-    // Instant visual feedback — loader appears immediately
     const index = entries.findIndex(e => e.uuid === entry.uuid);
+
+    // If history panel is open — scroll to entry in history only, skip terminal scroll
+    if (isHistoryOpen) {
+      setHistoryScrollToUuid(entry.uuid);
+      return;
+    }
+
+    // History panel NOT open — scroll in terminal only
+    // Instant visual feedback — loader appears immediately
     setClickedState({ index, status: 'loading' });
 
     // ALWAYS DIAGNOSE CLICK (Temporary Debug)

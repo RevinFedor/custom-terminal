@@ -4,7 +4,7 @@ import '@anthropic/markdown-editor/styles.css';
 import { useWorkspaceStore } from '../../../store/useWorkspaceStore';
 import { useUIStore } from '../../../store/useUIStore';
 import { usePromptsStore } from '../../../store/usePromptsStore';
-import { RotateCcw, Clock, ChevronDown, ChevronRight } from 'lucide-react';
+import { RotateCcw, Clock, ChevronDown, ChevronRight, ScrollText } from 'lucide-react';
 import ActionsPanel from './ActionsPanel';
 
 const { ipcRenderer } = window.require('electron');
@@ -61,6 +61,9 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
   const [manualSessionId, setManualSessionId] = useState('');
   const sessionInputRef = useRef<HTMLInputElement>(null);
   const { showToast, claudeDefaultPromptEnabled } = useUIStore();
+  const historyPanelOpenTabs = useUIStore((s) => s.historyPanelOpenTabs);
+  const setHistoryPanelOpen = useUIStore((s) => s.setHistoryPanelOpen);
+  const isHistoryOpen = activeTabId ? (historyPanelOpenTabs[activeTabId] ?? false) : false;
   const { getPromptById } = usePromptsStore();
   const wordWrap = useUIStore((s) => s.wordWrap);
   const tabNotesFontSize = useUIStore((s) => s.tabNotesFontSize);
@@ -296,7 +299,28 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
       {/* Upper sections — scrollable independently */}
       <div className="overflow-y-auto min-h-0 shrink">
       <div className="mb-4">
-        <div className="text-[11px] uppercase text-[#888] mb-2">AI Session</div>
+        <div className="flex items-center justify-between mb-2">
+          <div className="text-[11px] uppercase text-[#888]">AI Session</div>
+          {hasClaudeSession && activeTabId && (
+            <button
+              onClick={() => setHistoryPanelOpen(activeTabId, !isHistoryOpen)}
+              className="cursor-pointer"
+              style={{
+                background: 'none',
+                border: 'none',
+                color: isHistoryOpen ? '#fff' : '#666',
+                padding: 2,
+                display: 'flex',
+                alignItems: 'center',
+              }}
+              onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.color = '#fff'; }}
+              onMouseLeave={(e) => { if (!isHistoryOpen) (e.currentTarget as HTMLButtonElement).style.color = '#666'; }}
+              title={isHistoryOpen ? 'Close History' : 'Open History'}
+            >
+              <ScrollText size={12} />
+            </button>
+          )}
+        </div>
         {hasAnySession ? (
           <div className={`rounded p-2 ${currentSessionType === 'claude' ? 'bg-[#2a3a2a] border border-[#3a5a3a]' : 'bg-[#1a2a3a] border border-[#2a4a6a]'}`}>
             <div className="flex items-center gap-2 mb-1">

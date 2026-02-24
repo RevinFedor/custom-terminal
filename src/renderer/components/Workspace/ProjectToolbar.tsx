@@ -1,5 +1,5 @@
 import React, { useState, useMemo } from 'react';
-import { Home, Minimize2, RotateCcw, Globe, ScrollText } from 'lucide-react';
+import { Home, Minimize2, RotateCcw, Globe } from 'lucide-react';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore, isTabInterrupted } from '../../store/useWorkspaceStore';
 import { compressLogs } from '../../utils/compressLogs';
@@ -7,18 +7,13 @@ import { compressLogs } from '../../utils/compressLogs';
 const { ipcRenderer } = window.require('electron');
 
 export default function ProjectToolbar() {
-  const { showToast, historyPanelOpen, setHistoryPanelOpen } = useUIStore();
+  const { showToast } = useUIStore();
   const { activeProjectId, openProjects, clearInterruptedState, setTabCommandType, createBrowserTab, setProjectView } = useWorkspaceStore();
 
   const [isCompressing, setIsCompressing] = useState(false);
 
   const currentView = activeProjectId ? openProjects.get(activeProjectId)?.currentView || 'terminal' : 'terminal';
   const isHomeActive = currentView === 'home';
-
-  // Get claudeSessionId from active tab
-  const activeWorkspace = activeProjectId ? openProjects.get(activeProjectId) : null;
-  const activeTab = activeWorkspace?.activeTabId ? activeWorkspace.tabs.get(activeWorkspace.activeTabId) : null;
-  const claudeSessionId = activeTab?.claudeSessionId || null;
 
   // Get interrupted tabs for CURRENT project only
   const interruptedTabs = useMemo(() => {
@@ -128,19 +123,6 @@ export default function ProjectToolbar() {
     <div
       className="h-[30px] w-full bg-panel flex items-stretch"
     >
-      {/* History Panel Button — only when Claude session active */}
-      {claudeSessionId && (
-        <button
-          onClick={() => setHistoryPanelOpen(!historyPanelOpen)}
-          style={buttonStyle(historyPanelOpen)}
-          onMouseEnter={(e) => handleMouseEnter(e, historyPanelOpen)}
-          onMouseLeave={(e) => handleMouseLeave(e, historyPanelOpen)}
-          title="Chat History"
-        >
-          <ScrollText size={14} />
-        </button>
-      )}
-
       {/* Home Button */}
       <button
         onClick={() => activeProjectId && setProjectView(activeProjectId, isHomeActive ? 'terminal' : 'home')}
