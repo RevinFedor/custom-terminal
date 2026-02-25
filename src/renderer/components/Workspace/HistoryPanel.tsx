@@ -33,6 +33,7 @@ interface HistoryPanelProps {
   width: number;
   notesPanelWidth: number;
   isOpen: boolean;
+  toolType?: 'claude' | 'gemini';
 }
 
 // Thinking block — collapsible
@@ -133,7 +134,7 @@ const ReadActionBlock = ({ filePath }: { filePath: string }) => (
 );
 
 // Single history entry renderer
-const HistoryEntry = memo(({ entry }: { entry: FullHistoryEntry }) => {
+const HistoryEntry = memo(({ entry, toolType }: { entry: FullHistoryEntry; toolType?: 'claude' | 'gemini' }) => {
   if (entry.role === 'compact') {
     return (
       <div style={{ textAlign: 'center', padding: '8px 0', color: '#666', fontSize: 11, letterSpacing: 2 }}>
@@ -196,7 +197,7 @@ const HistoryEntry = memo(({ entry }: { entry: FullHistoryEntry }) => {
   return (
     <div style={{ padding: '8px 12px' }}>
       <div style={{ fontSize: 10, color: '#666', marginBottom: 4 }}>
-        CLAUDE
+        {toolType === 'gemini' ? 'GEMINI' : 'CLAUDE'}
         {entry.timestamp && (
           <span style={{ marginLeft: 8 }}>
             {new Date(entry.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
@@ -255,6 +256,18 @@ const HistoryEntry = memo(({ entry }: { entry: FullHistoryEntry }) => {
   );
 });
 
+// Flash highlight keyframes (injected once)
+if (!document.getElementById('hp-flash-style')) {
+  const style = document.createElement('style');
+  style.id = 'hp-flash-style';
+  style.textContent = `@keyframes hp-flash {
+  0%   { background-color: transparent; }
+  20%  { background-color: rgba(91, 156, 245, 0.2); }
+  100% { background-color: transparent; }
+}`;
+  document.head.appendChild(style);
+}
+
 // content-visibility style for off-screen rendering skip (browser-native virtualization)
 const entryWrapperStyle: React.CSSProperties = {
   paddingTop: 4,
@@ -263,7 +276,7 @@ const entryWrapperStyle: React.CSSProperties = {
   containIntrinsicSize: 'auto 100px',
 };
 
-function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen }: HistoryPanelProps) {
+function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, toolType = 'claude' }: HistoryPanelProps) {
   const setHistoryPanelOpen = useUIStore((s) => s.setHistoryPanelOpen);
   const setHistoryPanelWidth = useUIStore((s) => s.setHistoryPanelWidth);
   const historyScrollToUuid = useUIStore((s) => s.historyScrollToUuid);
@@ -301,7 +314,8 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen }:
   const loadHistory = useCallback(async (isRefresh = false) => {
     if (!sessionId) return;
     try {
-      const result = await ipcRenderer.invoke('claude:get-full-history', { sessionId, cwd });
+      const ipcChannel = toolType === 'gemini' ? 'gemini:get-full-history' : 'claude:get-full-history';
+      const result = await ipcRenderer.invoke(ipcChannel, { sessionId, cwd });
       if (result.success) {
         const newEntries: FullHistoryEntry[] = result.entries || [];
 
@@ -326,7 +340,7 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen }:
       console.warn('[HistoryPanel] Load error:', e);
       if (!isRefresh) setLoading(false);
     }
-  }, [sessionId, cwd, scrollToBottom]);
+  }, [sessionId, cwd, scrollToBottom, toolType]);
 
   // Initial load on mount / session change
   useEffect(() => {
@@ -342,24 +356,66 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen }:
   }, [loadHistory]);
 
   // Scroll to entry when Timeline click sets historyScrollToUuid
+  // Uses instant scroll + retry: contentVisibility:auto causes layout shifts on first scroll,
+  // so we scroll twice to land accurately regardless of session length.
+  // Adds ~10% top offset so the entry isn't flush against the edge, plus a flash highlight.
+  const [flashUuid, setFlashUuid] = useState<string | null>(null);
+
   useEffect(() => {
     if (!historyScrollToUuid || loading || entries.length === 0) return;
     const el = scrollRef.current;
     if (!el) return;
-    const target = el.querySelector(`[data-uuid="${historyScrollToUuid}"]`);
+    const target = el.querySelector(`[data-uuid="${historyScrollToUuid}"]`) as HTMLElement | null;
     if (target) {
-      target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      const scrollWithOffset = () => {
+        const targetRect = target.getBoundingClientRect();
+        const containerRect = el.getBoundingClientRect();
+        const offset = targetRect.top - containerRect.top + el.scrollTop;
+        const topPadding = el.clientHeight * 0.1;
+        el.scrollTop = Math.max(0, offset - topPadding);
+      };
+      scrollWithOffset();
+      // Retry after layout recalculation (contentVisibility: auto re-measures nearby elements)
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          scrollWithOffset();
+          // Flash highlight AFTER scroll has settled
+          setTimeout(() => {
+            setFlashUuid(historyScrollToUuid);
+            setTimeout(() => setFlashUuid(null), 500);
+          }, 80);
+        });
+      });
     }
     setHistoryScrollToUuid(null);
   }, [historyScrollToUuid, loading, entries]);
 
-  // Native scroll handler — at-bottom detection
+  // Native scroll handler — at-bottom detection + scroll direction tracking
+  const lastScrollTopRef = useRef(0);
+  const scrollDirectionRef = useRef<'down' | 'up'>('down');
   const handleScroll = useCallback(() => {
     const el = scrollRef.current;
     if (!el) return;
     const distFromBottom = el.scrollHeight - (el.scrollTop + el.clientHeight);
     isAtBottomRef.current = distFromBottom < 150;
+    scrollDirectionRef.current = el.scrollTop >= lastScrollTopRef.current ? 'down' : 'up';
+    lastScrollTopRef.current = el.scrollTop;
   }, []);
+
+  // Build mapping: assistant/non-user UUID → preceding user UUID
+  // So when an assistant response is visible, the parent user dot stays highlighted in Timeline.
+  const assistantToUserMap = React.useMemo(() => {
+    const map = new Map<string, string>();
+    let lastUserUuid: string | null = null;
+    for (const e of entries) {
+      if (e.role === 'user') {
+        lastUserUuid = e.uuid;
+      } else if (lastUserUuid) {
+        map.set(e.uuid, lastUserUuid);
+      }
+    }
+    return map;
+  }, [entries]);
 
   // Track visible entries for Timeline viewport indicator (UUID-based, no text search)
   useEffect(() => {
@@ -380,10 +436,35 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen }:
           if (oe.isIntersecting) visibleSet.add(uuid);
           else visibleSet.delete(uuid);
         }
-        const key = [...visibleSet].sort().join(',');
+        // Resolve assistant UUIDs to their parent user UUIDs for Timeline
+        const resolvedSet = new Set<string>();
+        for (const uuid of visibleSet) {
+          resolvedSet.add(uuid);
+          const parentUser = assistantToUserMap.get(uuid);
+          if (parentUser) resolvedSet.add(parentUser);
+        }
+        // Single-turn highlight: if multiple user entries are directly visible (>10%),
+        // keep only one based on scroll direction:
+        //   scrolling DOWN → keep last (bottom-most, the "next" turn)
+        //   scrolling UP   → keep first (top-most, the "previous" turn)
+        const directlyVisibleUsers: string[] = [];
+        for (const e of entries) {
+          if (e.role === 'user' && visibleSet.has(e.uuid)) {
+            directlyVisibleUsers.push(e.uuid);
+          }
+        }
+        if (directlyVisibleUsers.length > 1) {
+          const keepIdx = scrollDirectionRef.current === 'down'
+            ? directlyVisibleUsers.length - 1
+            : 0;
+          for (let j = 0; j < directlyVisibleUsers.length; j++) {
+            if (j !== keepIdx) resolvedSet.delete(directlyVisibleUsers[j]);
+          }
+        }
+        const key = [...resolvedSet].sort().join(',');
         if (key !== prevVisibleUuidsRef.current) {
           prevVisibleUuidsRef.current = key;
-          setHistoryVisibleUuids(tabId, [...visibleSet]);
+          setHistoryVisibleUuids(tabId, [...resolvedSet]);
         }
       },
       { root: el, threshold: 0.1 }
@@ -395,7 +476,7 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen }:
       observer.disconnect();
       setHistoryVisibleUuids(tabId, []);
     };
-  }, [tabId, entries.length, setHistoryVisibleUuids]);
+  }, [tabId, entries.length, setHistoryVisibleUuids, assistantToUserMap]);
 
   // Resize handle
   const handleResizeMouseDown = useCallback((e: React.MouseEvent) => {
@@ -500,8 +581,15 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen }:
             style={{ height: '100%', overflowY: 'auto' }}
           >
             {entries.map((entry) => (
-              <div key={entry.uuid} data-uuid={entry.uuid} style={entryWrapperStyle}>
-                <HistoryEntry entry={entry} />
+              <div
+                key={entry.uuid}
+                data-uuid={entry.uuid}
+                style={{
+                  ...entryWrapperStyle,
+                  ...(flashUuid === entry.uuid ? { animation: 'hp-flash 500ms ease-in-out' } : undefined),
+                }}
+              >
+                <HistoryEntry entry={entry} toolType={toolType} />
               </div>
             ))}
           </div>

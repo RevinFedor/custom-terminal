@@ -2904,6 +2904,298 @@ ipcMain.on('gemini:run-command', (event, { tabId, command, sessionId, cwd }) => 
   }
 });
 
+// Send a slash command to Gemini CLI (chunked paste, fast mode)
+// Serialized per tab: rapid clicks queue up instead of overlapping.
+// Without this, two rapid Ctrl+C from ctrlCFirst trigger Gemini's
+// "Press Ctrl+C again to exit" → second Ctrl+C kills the process.
+const geminiCommandQueue = new Map(); // tabId -> Promise
+
+ipcMain.on('gemini:send-command', (event, tabId, command) => {
+  console.log('[gemini:send-command] Received: tabId=' + tabId + ' command="' + command + '"');
+  const term = terminals.get(tabId);
+  if (!term) { console.log('[gemini:send-command] Terminal not found'); return; }
+
+  const prev = geminiCommandQueue.get(tabId) || Promise.resolve();
+  const next = prev.then(async () => {
+    // Wait for Gemini to settle after previous command
+    await drainPtyData(term, 300);
+
+    // Clear input line WITHOUT Ctrl+C (which triggers "Press Ctrl+C again to exit").
+    // Ctrl+C at idle in Gemini = danger zone. Instead:
+    // 1. Ctrl+A (Home) to move cursor to start
+    // 2. Ctrl+K to kill from cursor to end of line (clears input)
+    // Both are readline-compatible and safe in Gemini's TUI.
+    term.write('\x01'); // Ctrl+A (beginning of line)
+    term.write('\x0b'); // Ctrl+K (kill to end of line)
+    await new Promise(r => setTimeout(r, 100));
+
+    await safePasteAndSubmit(term, command, {
+      submit: true,
+      ctrlCFirst: false,
+      fast: true,
+      logPrefix: '[gemini:send-command:' + tabId + ']'
+    });
+    // Wait for Gemini to process the command before allowing next
+    await drainPtyData(term, 500);
+  });
+  geminiCommandQueue.set(tabId, next.catch((err) => {
+    console.error('[gemini:send-command] Error:', err.message);
+  }));
+});
+
+// ========== GEMINI REWIND (TUI NAVIGATION) ==========
+// Programmatic rewind: open /rewind menu, navigate to target, confirm.
+// Gemini rewind menu:
+//   /rewind\r → modal with ● on "Stay at current position" (bottom)
+//   UP moves ● through messages (newest→oldest)
+//   Enter → confirmation dialog "● 1. Rewind conversation / 2. Do nothing"
+//   Enter → rewind executed
+// Detection: RGB(166,227,161) green text = selected entry
+
+ipcMain.handle('gemini:open-history-menu', async (event, { tabId, targetText, skipDuplicates = 0, pasteAfter }) => {
+  const term = terminals.get(tabId);
+  if (!term) return { success: false, error: 'no terminal' };
+
+  const stripped = require('node:util').stripVTControlCharacters;
+
+  // Extract text colored with RGB(166,227,161) — green selection color
+  function extractGreenText(raw) {
+    const GREEN_START = '\x1b[38;2;166;227;161m';
+    const results = [];
+    let searchFrom = 0;
+    while (true) {
+      const startIdx = raw.indexOf(GREEN_START, searchFrom);
+      if (startIdx === -1) break;
+      let endIdx = startIdx + GREEN_START.length;
+      let text = '';
+      while (endIdx < raw.length) {
+        if (raw[endIdx] === '\x1b') {
+          const remaining = raw.substring(endIdx);
+          if (remaining.startsWith('\x1b[39m') || remaining.startsWith('\x1b[38;2;') || remaining.startsWith('\x1b[0m')) break;
+          const escEnd = remaining.indexOf('m');
+          if (escEnd !== -1 && escEnd < 30) { endIdx += escEnd + 1; continue; }
+        }
+        text += raw[endIdx];
+        endIdx++;
+      }
+      const cleaned = stripped(text).trim();
+      if (cleaned.length > 0 && cleaned !== '\u25CF') results.push(cleaned);
+      searchFrom = endIdx;
+    }
+    return results;
+  }
+
+  function textMatchesTarget(selectedText, targetPrefix) {
+    if (!selectedText || !targetPrefix) return false;
+    const st = selectedText.trim().replace(/\s+/g, ' ').substring(0, 50);
+    const tp = targetPrefix.trim().replace(/\s+/g, ' ').substring(0, 50);
+    if (st.includes(tp) || tp.includes(st)) return true;
+    // Fuzzy: >=60% word overlap
+    const targetWords = tp.split(/\s+/).filter(w => w.length > 2);
+    if (targetWords.length > 0) {
+      const matched = targetWords.filter(w => st.includes(w));
+      if (matched.length / targetWords.length >= 0.6) return true;
+    }
+    return false;
+  }
+
+  // Serialize with geminiCommandQueue
+  const prev = geminiCommandQueue.get(tabId) || Promise.resolve();
+  const result = await new Promise((resolveOuter) => {
+    const next = prev.then(async () => {
+      try {
+        // Step 0: Check DangerZone
+        const dz = claudeCtrlCDangerZone.get(tabId);
+        if (dz) {
+          console.log('[Gemini:Rewind] \u26A0\uFE0F DangerZone active — waiting...');
+          await dz.promise;
+          console.log('[Gemini:Rewind] \u2705 DangerZone cleared');
+        }
+
+        // Step 1: Clear input and send /rewind
+        console.log('[Gemini:Rewind] Step 1: Sending /rewind...');
+        term.write('\x01'); // Ctrl+A
+        term.write('\x0b'); // Ctrl+K
+        await new Promise(r => setTimeout(r, 100));
+
+        await safePasteAndSubmit(term, '/rewind', {
+          submit: true,
+          ctrlCFirst: false,
+          fast: true,
+          logPrefix: '[Gemini:Rewind]'
+        });
+
+        // Step 2: Wait for menu to render (silence-based)
+        console.log('[Gemini:Rewind] Step 2: Waiting for menu...');
+        const menuRaw = await drainPtyData(term, 3000);
+
+        if (!menuRaw.includes('Rewind') && !menuRaw.includes('\u25CF')) {
+          console.error('[Gemini:Rewind] Menu did not open (' + menuRaw.length + 'B)');
+          resolveOuter({ success: false, error: 'Rewind menu did not open' });
+          return;
+        }
+        console.log('[Gemini:Rewind] Menu opened (' + menuRaw.length + 'B)');
+
+        // Step 3: Navigate UP to target
+        const targetPrefix = (targetText || '').substring(0, 40);
+        console.log('[Gemini:Rewind] Step 3: Navigating to: "' + targetPrefix + '"');
+
+        let found = false;
+        let pressCount = 0;
+        const maxPresses = 50;
+        let duplicatesRemaining = skipDuplicates;
+
+        for (let i = 0; i < maxPresses; i++) {
+          term.write('\x1b[A'); // UP
+          const navRaw = await drainPtyData(term, 1500);
+          pressCount++;
+
+          if (navRaw.length === 0) {
+            console.log('[Gemini:Rewind] Hit top boundary at press #' + pressCount);
+            break;
+          }
+
+          const greenTexts = extractGreenText(navRaw);
+          // Last green text is the entry text (first is ● symbol)
+          const selectedText = greenTexts.length > 0 ? greenTexts[greenTexts.length - 1] : null;
+          console.log('[Gemini:Rewind] UP #' + pressCount + ' \u2192 "' + (selectedText || 'null').substring(0, 50) + '"');
+
+          if (selectedText && textMatchesTarget(selectedText, targetPrefix)) {
+            if (duplicatesRemaining > 0) {
+              duplicatesRemaining--;
+              console.log('[Gemini:Rewind] \u23E9 Skipping duplicate (' + duplicatesRemaining + ' remaining)');
+              continue;
+            }
+            console.log('[Gemini:Rewind] \u2705 Target matched!');
+            found = true;
+            break;
+          }
+        }
+
+        if (!found) {
+          console.error('[Gemini:Rewind] \u274C Target not found after ' + pressCount + ' presses. Closing menu.');
+          term.write('\x1b'); // Escape to close
+          await new Promise(r => setTimeout(r, 500));
+          resolveOuter({ success: false, error: 'Target not found', pressCount });
+          return;
+        }
+
+        // Step 4: Confirm selection (Enter)
+        console.log('[Gemini:Rewind] Step 4: Confirming selection...');
+        term.write('\r');
+        const confirmRaw = await drainPtyData(term, 3000);
+
+        // Step 5: Handle confirmation dialog
+        // After selecting an entry, Gemini shows: "● 1. Rewind conversation / 2. Do nothing"
+        // ● is already on "Rewind conversation" — just press Enter
+        const confirmClean = stripped(confirmRaw.replace(/\x1b\[\d+;\d+[Hf]/g, '\n').replace(/\x1b\[(\d*)C/g, ' '));
+        if (confirmClean.includes('Rewind conversation') || confirmClean.includes('Do nothing')) {
+          console.log('[Gemini:Rewind] Step 5: Confirmation dialog detected — pressing Enter...');
+          term.write('\r');
+          await drainPtyData(term, 5000);
+        } else {
+          console.log('[Gemini:Rewind] Step 5: No confirmation dialog (direct rewind)');
+          // Menu might have closed already
+        }
+
+        // Step 6: Wait for rewind to complete and prompt to restore
+        console.log('[Gemini:Rewind] Step 6: Waiting for prompt...');
+        await drainPtyData(term, 3000);
+
+        // Step 7: Paste compact if provided
+        if (pasteAfter && typeof pasteAfter === 'string' && pasteAfter.length > 0) {
+          console.log('[Gemini:Rewind] Step 7: Pasting compact (' + pasteAfter.length + ' chars)...');
+          await new Promise(r => setTimeout(r, 1000));
+
+          term.write('\x01'); // Ctrl+A
+          term.write('\x0b'); // Ctrl+K
+          await new Promise(r => setTimeout(r, 100));
+
+          await safePasteAndSubmit(term, pasteAfter, {
+            submit: true,
+            ctrlCFirst: false,
+            fast: true,
+            logPrefix: '[Gemini:Rewind:paste]'
+          });
+          await drainPtyData(term, 2000);
+        }
+
+        console.log('[Gemini:Rewind] \u2705 Rewind complete');
+        resolveOuter({ success: true, found: true, pressCount });
+      } catch (err) {
+        console.error('[Gemini:Rewind] Error:', err.message);
+        try { term.write('\x1b'); } catch (e) {} // try close menu
+        resolveOuter({ success: false, error: err.message });
+      }
+    });
+    geminiCommandQueue.set(tabId, next.catch(() => {}));
+  });
+
+  return result;
+});
+
+// Copy a range of messages from Gemini session (for compact/rewind)
+ipcMain.handle('gemini:copy-range', async (event, { sessionId, cwd, startUuid, endUuid }) => {
+  console.log('[Gemini:CopyRange] sessionId=' + sessionId + ' start=' + startUuid + ' end=' + endUuid);
+
+  if (!sessionId || !cwd) {
+    return { success: false, content: '' };
+  }
+
+  try {
+    const resolved = resolveGeminiProjectDir(cwd);
+    if (!resolved) return { success: false, content: '', error: 'Project dir not found' };
+
+    const found = findGeminiSessionFile(sessionId, resolved.chatsDir);
+    if (!found) return { success: false, content: '', error: 'Session file not found' };
+
+    const { data } = found;
+    if (!data.messages || !Array.isArray(data.messages)) {
+      return { success: false, content: '', error: 'No messages in session' };
+    }
+
+    // Find start and end message indices
+    let startIdx = -1;
+    let endIdx = -1;
+    for (let i = 0; i < data.messages.length; i++) {
+      const msg = data.messages[i];
+      if (msg.id === startUuid && startIdx === -1) startIdx = i;
+      if (msg.id === endUuid) endIdx = i;
+    }
+
+    if (startIdx === -1) {
+      console.log('[Gemini:CopyRange] Start UUID not found, using first message');
+      startIdx = 0;
+    }
+    if (endIdx === -1) {
+      endIdx = data.messages.length - 1;
+    }
+
+    // Extract messages in range
+    const parts = [];
+    for (let i = startIdx; i <= endIdx; i++) {
+      const msg = data.messages[i];
+      let content = '';
+      if (typeof msg.content === 'string') {
+        content = msg.content;
+      } else if (Array.isArray(msg.content)) {
+        content = msg.content.filter(p => p.text).map(p => p.text).join('\n');
+      }
+      if (!content) continue;
+
+      const role = msg.type === 'user' ? 'Human' : 'Assistant';
+      parts.push(role + ': ' + content);
+    }
+
+    const result = parts.join('\n\n');
+    console.log('[Gemini:CopyRange] Extracted ' + parts.length + ' messages, ' + result.length + ' chars');
+    return { success: true, content: result };
+  } catch (err) {
+    console.error('[Gemini:CopyRange] Error:', err.message);
+    return { success: false, content: '', error: err.message };
+  }
+});
+
 // ========== GEMINI TIME MACHINE ==========
 // Auto-backup session on every change, allow rollback to any turn
 
@@ -3220,6 +3512,71 @@ ipcMain.handle('gemini:get-timeline', async (event, { sessionId, cwd }) => {
   } catch (error) {
     console.error('[Gemini Timeline] Error:', error);
     return { success: false, entries: [], sessionBoundaries: [], latestSessionId: null };
+  }
+});
+
+// ========== GEMINI FULL HISTORY ==========
+
+ipcMain.handle('gemini:get-full-history', async (event, { sessionId, cwd }) => {
+  console.log('[Gemini FullHistory] Getting full history for session:', sessionId);
+
+  if (!sessionId || !cwd) {
+    return { success: false, error: 'No session ID or cwd' };
+  }
+
+  try {
+    const resolved = resolveGeminiProjectDir(cwd);
+    if (!resolved) {
+      return { success: false, error: 'Project dir not found' };
+    }
+
+    const found = findGeminiSessionFile(sessionId, resolved.chatsDir);
+    if (!found) {
+      return { success: false, error: 'Session file not found' };
+    }
+
+    const { data } = found;
+    if (!data.messages || !Array.isArray(data.messages)) {
+      return { success: true, entries: [] };
+    }
+
+    const entries = [];
+
+    for (const msg of data.messages) {
+      // Normalize content
+      let content = '';
+      if (typeof msg.content === 'string') {
+        content = msg.content;
+      } else if (Array.isArray(msg.content)) {
+        content = msg.content.filter(p => p.text).map(p => p.text).join('\n');
+      }
+      if (!content) continue;
+
+      if (msg.type === 'user') {
+        entries.push({
+          uuid: msg.id || crypto.randomUUID(),
+          role: 'user',
+          timestamp: msg.timestamp || data.startTime || '',
+          content,
+          sessionId
+        });
+      } else if (msg.type === 'gemini') {
+        entries.push({
+          uuid: msg.id || crypto.randomUUID(),
+          role: 'assistant',
+          timestamp: msg.timestamp || '',
+          content,
+          sessionId
+        });
+      }
+      // Skip 'info' type messages
+    }
+
+    console.log('[Gemini FullHistory] Returning', entries.length, 'entries');
+    return { success: true, entries };
+  } catch (error) {
+    console.error('[Gemini FullHistory] Error:', error);
+    return { success: false, error: error.message };
   }
 });
 
@@ -3885,12 +4242,6 @@ ipcMain.handle('claude:export-clean-session', async (event, { sessionId, cwd, in
       }
 
       activeBranch.unshift(record);
-
-      // Stop at compact boundary if fromStart=false
-      if (!fromStart && (record.type === 'system' && record.subtype === 'compact_boundary')) {
-        console.log('[Claude Export] Stopping at compact_boundary (fromStart=false)');
-        break;
-      }
 
       let nextUuid = record.logicalParentUuid || record.parentUuid;
 

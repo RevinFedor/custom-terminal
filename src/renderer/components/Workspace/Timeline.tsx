@@ -230,41 +230,47 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
 
   // Check if key exists at a user prompt position in buffer text.
   const matchesAtUserPrompt = useCallback((bufferText: string, key: string, debug = false): boolean => {
+    // Gemini CLI doesn't use ❯/⏵ prompt markers — its Ink TUI renders user messages
+    // without recognizable prompt prefixes. Skip prompt validation entirely for Gemini.
+    if (isGemini) {
+      return bufferText.includes(key);
+    }
+
     let searchFrom = 0;
     while (true) {
       const pos = bufferText.indexOf(key, searchFrom);
       if (pos === -1) {
         return false;
       }
-      
+
       // Find start of the line containing this match
       const lineStart = bufferText.lastIndexOf('\n', pos - 1) + 1;
-      
+
       // Check first few chars of the line for prompt markers OR valid indent
       // Increased to 50 chars to handle very long indents
       const lineHead = bufferText.slice(lineStart, Math.min(lineStart + 50, pos));
-      
+
       // 1. Strict prompt check (standard case)
       // Only ❯ (U+276F) and ⏵ (U+23F5) — NOT '>' which matches markdown blockquotes
       // in Claude responses, causing false positives in reachability checks
       const hasPrompt = lineHead.includes('\u276F') || lineHead.includes('\u23F5');
-      
+
       // 2. Relaxed check for pasted text/code/lists (indentation or bullets)
       // If the prefix is just whitespace, stars, dashes, or dots, assume it's a valid user entry
       // that was pasted or formatted without a visible prompt on the same line.
       const isValidIndent = /^[\s*·\-\.]*$/.test(lineHead);
 
       if (hasPrompt || isValidIndent) return true;
-      
+
       if (debug) {
           // Keep debug log only if explicitly requested by checkReachability diagnosis
           console.log(`[Timeline:Reachability] Key found at ${pos} but invalid prefix: "${lineHead.replace(/\n/g, '\\n')}"`);
       }
-      
+
       // Try next occurrence
       searchFrom = pos + 1;
     }
-  }, []);
+  }, [isGemini]);
 
   // Viewport visibility + buffer reachability tracking
   useEffect(() => {
@@ -554,7 +560,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
           if (eKey === searchText) occurrenceIndex++;
         }
 
-        const found = terminalRegistry.searchAndScrollToNth(tabId, searchText, occurrenceIndex, !!entry.isPlan);
+        const found = terminalRegistry.searchAndScrollToNth(tabId, searchText, occurrenceIndex, !!entry.isPlan || isGemini);
         if (found) {
           setTimeout(() => setClickedState(null), 300);
         } else {
@@ -695,13 +701,14 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
     if (entryIndex === -1) return;
 
     // Find the last compact/plan-mode boundary — Rewind TUI only shows entries after it.
-    // Everything before compact/plan-mode is cleared from terminal and not in the Rewind menu.
-    // Note: 'continued' (fork) does NOT clear terminal — only compact and plan-mode do.
+    // Gemini doesn't have compact/plan-mode, so all entries are rewindable.
     let lastBoundaryIdx = -1;
-    for (let i = 0; i < entryIndex; i++) {
-      const e = entries[i];
-      if (e.type === 'compact' || e.isPlan) {
-        lastBoundaryIdx = i;
+    if (!isGemini) {
+      for (let i = 0; i < entryIndex; i++) {
+        const e = entries[i];
+        if (e.type === 'compact' || e.isPlan) {
+          lastBoundaryIdx = i;
+        }
       }
     }
 
@@ -724,17 +731,19 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
     }
 
     console.warn('[Restore:Rewind] Starting rewind to entry', targetIndex, '/', rewindableEntries.length,
-      '- uuid:', entry.uuid, 'skipDuplicates:', skipDuplicates, 'boundaryIdx:', lastBoundaryIdx);
+      '- uuid:', entry.uuid, 'skipDuplicates:', skipDuplicates, 'boundaryIdx:', lastBoundaryIdx,
+      'tool:', isGemini ? 'gemini' : 'claude');
 
-    // Phase 1: Compact entries being lost (from next entry to end)
+    // IPC channel names based on tool type
+    const copyRangeChannel = isGemini ? 'gemini:copy-range' : 'claude:copy-range';
+    const historyMenuChannel = isGemini ? 'gemini:open-history-menu' : 'claude:open-history-menu';
+
+    // Phase 1: Compact entries being lost (from clicked entry to end)
     let compactText = '';
-    // Always compact from clicked entry to end — copy-range expands to include
-    // Claude's response after each user message. Even for the last entry,
-    // Claude's response is included and will be compacted.
     setRewindState({ index: entryIndex, phase: 'compacting' });
 
     try {
-      const rangeResult = await ipcRenderer.invoke('claude:copy-range', {
+      const rangeResult = await ipcRenderer.invoke(copyRangeChannel, {
         sessionId,
         cwd,
         startUuid: entry.uuid,
@@ -744,7 +753,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
       if (rangeResult.success && rangeResult.content) {
         console.warn('[Restore:Rewind] Range copied, length:', rangeResult.content.length);
 
-        // Compact via Gemini using rewind prompt
+        // Compact via Gemini API using rewind prompt
         const { getPromptById, rewindPromptId } = usePromptsStore.getState();
         const promptConfig = getPromptById(rewindPromptId);
 
@@ -795,11 +804,11 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
       console.error('[Restore:Rewind] Copy range failed:', rangeErr);
     }
 
-    // Phase 2: Execute rewind in TUI + paste compact (all in main process via writeToPtySafe + \r)
+    // Phase 2: Execute rewind in TUI + paste compact
     setRewindState({ index: entryIndex, phase: 'rewinding' });
 
     try {
-      const rewindResult = await ipcRenderer.invoke('claude:open-history-menu', {
+      const rewindResult = await ipcRenderer.invoke(historyMenuChannel, {
         tabId,
         targetIndex,
         targetText: entry.content.trim().substring(0, 40),
@@ -807,10 +816,10 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
         pasteAfter: compactText || undefined
       });
       console.warn('[Restore:Rewind] Rewind result:', rewindResult.success ? 'OK' : 'FAIL',
-        'cursor:', rewindResult.cursorIndex, 'target:', rewindResult.targetIndex,
+        'pressCount:', rewindResult.pressCount,
         'compactPasted:', !!compactText);
 
-      // Auto-scroll to bottom after rewind (Claude TUI re-renders cause scroll jumps)
+      // Auto-scroll to bottom after rewind
       const term = terminalRegistry.get(tabId);
       if (term) {
         let scrollDebounce: ReturnType<typeof setTimeout> | null = null;
@@ -824,17 +833,13 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
           term.scrollToBottom();
         };
 
-        // Listen for scroll events — each resets the debounce
         const scrollSub = term.onScroll(() => {
           if (cleaned) return;
           if (scrollDebounce) clearTimeout(scrollDebounce);
           scrollDebounce = setTimeout(doCleanup, 200);
         });
 
-        // Safety: cleanup after 5s even if no scroll events
         setTimeout(doCleanup, 5000);
-
-        // Immediate scroll
         term.scrollToBottom();
       }
 
@@ -1333,22 +1338,18 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
                   >
                     Копировать текст сообщения
                   </button>
-                  {/* Rewind — Claude only (Gemini has built-in /rewind) */}
-                  {!isGemini && (
-                    <>
-                      <div className="border-t border-white/10 my-1" />
-                      <button
-                        className={`w-full text-left px-3 py-2 text-xs rounded transition-colors ${isActive && !rewindState ? 'text-amber-400 hover:bg-amber-600/20 cursor-pointer' : 'text-white/20 cursor-not-allowed'}`}
-                        disabled={!isActive || !!rewindState}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          if (isActive && !rewindState) handleRewind(contextMenu.entry);
-                        }}
-                      >
-                        {rewindState ? (rewindState.phase === 'compacting' ? 'Компакт...' : rewindState.phase === 'rewinding' ? 'Откат...' : 'Вставка...') : 'Откатиться'}
-                      </button>
-                    </>
-                  )}
+                  {/* Rewind — Claude & Gemini */}
+                  <div className="border-t border-white/10 my-1" />
+                  <button
+                    className={`w-full text-left px-3 py-2 text-xs rounded transition-colors ${isActive && !rewindState ? 'text-amber-400 hover:bg-amber-600/20 cursor-pointer' : 'text-white/20 cursor-not-allowed'}`}
+                    disabled={!isActive || !!rewindState}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      if (isActive && !rewindState) handleRewind(contextMenu.entry);
+                    }}
+                  >
+                    {rewindState ? (rewindState.phase === 'compacting' ? 'Компакт...' : rewindState.phase === 'rewinding' ? 'Откат...' : 'Вставка...') : 'Откатиться'}
+                  </button>
                 </>
               ) : (
                 <button

@@ -410,14 +410,15 @@ export default function Workspace() {
             <ResearchSheet projectId={activeProjectId} projectPath={currentProject.path} />
 
             {/* History Panel — absolute overlay within terminal area only */}
-            {(isHistoryOpen || historyMounted) && claudeSessionId && activeTab && currentView === 'terminal' && (
+            {(isHistoryOpen || historyMounted) && timelineSessionId && activeTab && currentView === 'terminal' && (
               <HistoryPanel
                 tabId={activeTab.id}
-                sessionId={claudeSessionId}
+                sessionId={timelineSessionId}
                 cwd={activeTab.cwd || currentProject.path}
                 width={historyPanelWidth}
                 notesPanelWidth={notesPanelWidth}
                 isOpen={isHistoryOpen}
+                toolType={timelineToolType}
               />
             )}
           </div>
