@@ -6,7 +6,7 @@
  * 2. resolveGeminiProjectDir находит slug-based директорию
  * 3. Timeline DOM появляется когда geminiSessionId установлен в store
  * 4. Точки Timeline соответствуют количеству user messages
- * 5. Context menu для Gemini НЕ показывает Rewind и Range Copy
+ * 5. Context menu для Gemini показывает Rewind (но НЕ Range Copy)
  *
  * Запуск: node auto/stable/test-gemini-timeline.js
  */
@@ -190,7 +190,7 @@ async function main() {
     // ═══════════════════════════════════════════════════════════
     // TEST 4: Context menu hides Claude-only features
     // ═══════════════════════════════════════════════════════════
-    log.step('TEST 4: Проверка context menu (нет Rewind/Range Copy для Gemini)...')
+    log.step('TEST 4: Проверка context menu (Rewind доступен, Range Copy скрыт для Gemini)...')
 
     // Find a timeline dot and right-click on it
     const dotPosition = await page.evaluate(() => {
@@ -229,7 +229,7 @@ async function main() {
       const hasCopyText = menuContent.some(l => l?.includes('Копировать текст'))
 
       assert(!hasRangeCopy, 'Range copy скрыт для Gemini')
-      assert(!hasRewind, 'Rewind скрыт для Gemini')
+      assert(hasRewind, 'Rewind доступен для Gemini')
       assert(hasCopyText, 'Копировать текст доступен для Gemini')
 
       // Close menu by moving mouse away

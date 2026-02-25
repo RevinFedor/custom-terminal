@@ -1,0 +1,275 @@
+{
+  "sessionId": "test-rewind-fbdff71c-0000-0000-0000-000000000000",
+  "projectHash": "bfc020d470f4f905686798da1854f10e34088be51ab062febde7a85b70de8512",
+  "startTime": "2026-02-25T11:38:55.640Z",
+  "lastUpdated": "2026-02-25T11:43:55.640Z",
+  "messages": [
+    {
+      "id": "a9632e31-fe95-484a-be32-96fbe7b29fff",
+      "timestamp": "2026-02-25T11:38:55.640Z",
+      "type": "info",
+      "content": "Session initialized for rewind testing"
+    },
+    {
+      "id": "69489311-e103-4596-bd91-c7a154a49bb2",
+      "timestamp": "2026-02-25T11:39:35.640Z",
+      "type": "user",
+      "content": [
+        {
+          "text": "MSG-01: What is 2+2? Simple math question"
+        }
+      ]
+    },
+    {
+      "id": "ee9c44f3-dbb9-4b7d-a196-94a79388dcef",
+      "timestamp": "2026-02-25T11:39:40.640Z",
+      "type": "gemini",
+      "content": [
+        {
+          "text": "Response to: MSG-01: What is 2+2? Simple ma..."
+        }
+      ]
+    },
+    {
+      "id": "4be7706c-de68-43b5-8af1-94c0076b4851",
+      "timestamp": "2026-02-25T11:39:55.640Z",
+      "type": "user",
+      "content": [
+        {
+          "text": "MSG-02: What is the capital of France?"
+        }
+      ]
+    },
+    {
+      "id": "84af848d-a733-40d9-9705-f05e5769ceea",
+      "timestamp": "2026-02-25T11:40:00.640Z",
+      "type": "gemini",
+      "content": [
+        {
+          "text": "Response to: MSG-02: What is the capital of..."
+        }
+      ]
+    },
+    {
+      "id": "5e94e48c-7a31-41d8-a26f-bc3910c252e8",
+      "timestamp": "2026-02-25T11:40:15.640Z",
+      "type": "user",
+      "content": [
+        {
+          "text": "MSG-03: What color is the sky on a clear day?"
+        }
+      ]
+    },
+    {
+      "id": "fc337f14-053c-43fa-b652-8915f007cdde",
+      "timestamp": "2026-02-25T11:40:20.640Z",
+      "type": "gemini",
+      "content": [
+        {
+          "text": "Response to: MSG-03: What color is the sky ..."
+        }
+      ]
+    },
+    {
+      "id": "3e03dfe0-7806-4139-a75b-39aacaf3dce3",
+      "timestamp": "2026-02-25T11:40:35.640Z",
+      "type": "user",
+      "content": [
+        {
+          "text": "MSG-04: How many days in a year?"
+        }
+      ]
+    },
+    {
+      "id": "54552f04-40dd-47a0-86ea-e92f5f4c85d0",
+      "timestamp": "2026-02-25T11:40:40.640Z",
+      "type": "gemini",
+      "content": [
+        {
+          "text": "Response to: MSG-04: How many days in a yea..."
+        }
+      ]
+    },
+    {
+      "id": "b97e785c-3819-4b30-9843-838bd0c70a7d",
+      "timestamp": "2026-02-25T11:40:55.640Z",
+      "type": "user",
+      "content": [
+        {
+          "text": " MSG-05: This message has a leading space"
+        }
+      ]
+    },
+    {
+      "id": "a5758dad-62a2-4115-8f4c-e816df3ef0cf",
+      "timestamp": "2026-02-25T11:41:00.640Z",
+      "type": "gemini",
+      "content": [
+        {
+          "text": "Response to:  MSG-05: This message has a le..."
+        }
+      ]
+    },
+    {
+      "id": "2c0bb70b-3ef5-4e33-924b-565a1d6528f2",
+      "timestamp": "2026-02-25T11:41:15.640Z",
+      "type": "user",
+      "content": [
+        {
+          "text": "MSG-06: This is a repeated prompt that appears twice in conversation — alpha variant"
+        }
+      ]
+    },
+    {
+      "id": "4a5ff794-fa04-42b2-a9dd-8e2fd8e4eee4",
+      "timestamp": "2026-02-25T11:41:20.640Z",
+      "type": "gemini",
+      "content": [
+        {
+          "text": "Response to: MSG-06: duplicate prefix test ..."
+        }
+      ]
+    },
+    {
+      "id": "59f4777a-32aa-4aa0-bd58-86c4916b1672",
+      "timestamp": "2026-02-25T11:41:35.640Z",
+      "type": "user",
+      "content": [
+        {
+          "text": "MSG-06: This is a repeated prompt that appears twice in conversation — beta variant"
+        }
+      ]
+    },
+    {
+      "id": "ab778fc7-5823-4dde-8355-d6f73844dda7",
+      "timestamp": "2026-02-25T11:41:40.640Z",
+      "type": "gemini",
+      "content": [
+        {
+          "text": "Response to: MSG-06: duplicate prefix test ..."
+        }
+      ]
+    },
+    {
+      "id": "67f9736d-260a-4aa6-8d13-581ae96c2033",
+      "timestamp": "2026-02-25T11:41:55.640Z",
+      "type": "user",
+      "content": [
+        {
+          "text": "MSG-07: short"
+        }
+      ]
+    },
+    {
+      "id": "384a1b8c-97e5-4d6e-b02e-8a39998f809d",
+      "timestamp": "2026-02-25T11:42:00.640Z",
+      "type": "gemini",
+      "content": [
+        {
+          "text": "Response to: MSG-07: short..."
+        }
+      ]
+    },
+    {
+      "id": "66885c99-b390-4336-882d-fd112994f7b6",
+      "timestamp": "2026-02-25T11:42:15.640Z",
+      "type": "user",
+      "content": [
+        {
+          "text": "MSG-08: a somewhat longer message to test if truncation works correctly at the forty character boundary"
+        }
+      ]
+    },
+    {
+      "id": "741de23a-2e7b-4027-80fa-2f07fb6aefa0",
+      "timestamp": "2026-02-25T11:42:20.640Z",
+      "type": "gemini",
+      "content": [
+        {
+          "text": "Response to: MSG-08: a somewhat longer mess..."
+        }
+      ]
+    },
+    {
+      "id": "a46a7006-aa80-4b0c-b5c8-b652b31ad2bf",
+      "timestamp": "2026-02-25T11:42:35.640Z",
+      "type": "user",
+      "content": [
+        {
+          "text": "MSG-09: What is the value of pi to 5 decimal places?"
+        }
+      ]
+    },
+    {
+      "id": "efb40ac8-26a9-4567-acab-9888956a58b4",
+      "timestamp": "2026-02-25T11:42:40.640Z",
+      "type": "gemini",
+      "content": [
+        {
+          "text": "Response to: MSG-09: What is the value of p..."
+        }
+      ]
+    },
+    {
+      "id": "7aab366b-96f1-4e92-b48a-92eee2f1a9e2",
+      "timestamp": "2026-02-25T11:42:55.640Z",
+      "type": "user",
+      "content": [
+        {
+          "text": "MSG-10: Tell me about the weather"
+        }
+      ]
+    },
+    {
+      "id": "f3aa3fa7-47ad-4011-a523-88f7ba16b44e",
+      "timestamp": "2026-02-25T11:43:00.640Z",
+      "type": "gemini",
+      "content": [
+        {
+          "text": "Response to: MSG-10: Tell me about the weat..."
+        }
+      ]
+    },
+    {
+      "id": "1a0c4159-91f7-484a-a5ef-b1d87daf7e82",
+      "timestamp": "2026-02-25T11:43:15.640Z",
+      "type": "user",
+      "content": [
+        {
+          "text": "MSG-11: What programming languages does Google use?"
+        }
+      ]
+    },
+    {
+      "id": "ea849080-23d1-4496-b3c5-4639a02dbf5a",
+      "timestamp": "2026-02-25T11:43:20.640Z",
+      "type": "gemini",
+      "content": [
+        {
+          "text": "Response to: MSG-11: What programming langu..."
+        }
+      ]
+    },
+    {
+      "id": "f07b1d3c-bd11-4187-9104-32c4d3f603c8",
+      "timestamp": "2026-02-25T11:43:35.640Z",
+      "type": "user",
+      "content": [
+        {
+          "text": "MSG-12: Final message in the test session"
+        }
+      ]
+    },
+    {
+      "id": "374acb47-5127-4b31-8f9e-84125820e4e1",
+      "timestamp": "2026-02-25T11:43:40.640Z",
+      "type": "gemini",
+      "content": [
+        {
+          "text": "Response to: MSG-12: Final message in the t..."
+        }
+      ]
+    }
+  ],
+  "summary": "Test session for rewind with 13 user messages and edge cases"
+}

@@ -106,7 +106,7 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
             {[
               { label: 'Чтение', active: includeReading },
               { label: 'Редактирование', active: includeEditing },
-              { label: 'С начала', active: fromStart },
+              { label: 'От fork', active: !fromStart },
             ].map(({ label, active }) => (
               <div key={label} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '1px 0', color: '#999' }}>
                 <span>{label}</span>
@@ -661,12 +661,12 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
                         </label>
 
                         <label className="flex items-center justify-between gap-3 cursor-pointer group/label px-1">
-                          <span className="text-[10px] text-[#aaa] group-hover/label:text-white">С начала</span>
+                          <span className="text-[10px] text-[#aaa] group-hover/label:text-white">От fork</span>
                           <div
-                            className={`w-7 h-4 rounded-full relative cursor-pointer ${fromStart ? 'bg-[#DA7756]' : 'bg-[#444]'}`}
+                            className={`w-7 h-4 rounded-full relative cursor-pointer ${!fromStart ? 'bg-[#DA7756]' : 'bg-[#444]'}`}
                             onClick={(e) => { e.stopPropagation(); setFromStart(!fromStart); }}
                           >
-                            <div className={`absolute top-0.5 w-3 h-3 bg-white rounded-full ${fromStart ? 'left-[14px]' : 'left-0.5'}`} />
+                            <div className={`absolute top-0.5 w-3 h-3 bg-white rounded-full ${!fromStart ? 'left-[14px]' : 'left-0.5'}`} />
                           </div>
                         </label>
                       </div>

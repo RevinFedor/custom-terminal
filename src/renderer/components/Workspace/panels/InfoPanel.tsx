@@ -293,7 +293,7 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
       {/* Upper sections — scrollable independently */}
       <div className="overflow-y-auto min-h-0 shrink">
       <div className="mb-4">
-        {hasClaudeSession && activeTabId ? (
+        {hasAnySession && activeTabId ? (
           <button
             onClick={() => setHistoryPanelOpen(activeTabId, !isHistoryOpen)}
             className="flex items-center mb-2 cursor-pointer"
@@ -523,6 +523,31 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                 <span className={`text-[10px] ${contextPct > 80 ? 'text-red-400' : contextPct > 50 ? 'text-yellow-400' : 'text-[#666]'}`}>{contextPct}%</span>
               </div>
             )}
+          </div>
+        </div>
+      )}
+
+      {hasGeminiSession && activeTabId && (
+        <div className="mb-4">
+          <div className="text-[11px] uppercase text-[#888] mb-2">Контроль</div>
+          <div className="space-y-2">
+            <div className="flex items-center gap-1">
+              <span className="text-[10px] text-[#666] w-12 flex-shrink-0">Model</span>
+              <div className="flex gap-1 flex-1">
+                {(['pro', 'flash'] as const).map((model) => (
+                  <button
+                    key={model}
+                    className="flex-1 text-[10px] px-1.5 py-1 rounded cursor-pointer bg-[#2d2d2d] text-[#888] hover:text-white hover:bg-[#3d3d3d]"
+                    onClick={() => {
+                      ipcRenderer.send('gemini:send-command', activeTabId, '/model set ' + model);
+                    }}
+                    title={'Switch to ' + model}
+                  >
+                    {model}
+                  </button>
+                ))}
+              </div>
+            </div>
           </div>
         </div>
       )}
