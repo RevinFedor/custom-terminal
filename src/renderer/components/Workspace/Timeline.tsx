@@ -33,8 +33,9 @@ interface TimelineProps {
   tabId: string;
   sessionId: string | null;
   cwd: string;
-  isActive?: boolean; // Claude is currently running
+  isActive?: boolean; // Claude/Gemini is currently running
   isVisible?: boolean; // New prop to control visibility from parent
+  toolType?: 'claude' | 'gemini'; // Which AI tool this timeline is for
 }
 
 // Truncate text for tooltip display
@@ -57,7 +58,25 @@ interface ForkMarker {
   entry_uuids: string[];  // Snapshot of all entry UUIDs at fork time
 }
 
-function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: TimelineProps) {
+// Extract search text from entry content for terminal buffer search.
+// - Skips separator lines (repeated single char like ========)
+// - Limits to 50 chars to avoid spanning terminal line wraps
+//   (Ink adds indent on wrapped continuation lines → extra spaces break search)
+function getSearchText(content: string): string {
+  const lines = content.split('\n');
+  for (const line of lines) {
+    const t = line.trim();
+    if (!t || t.length < 3) continue;
+    // Skip separators: lines made of a single repeated character
+    if (/^(.)\1+$/.test(t)) continue;
+    return t.slice(0, 50);
+  }
+  // Fallback: first non-empty line, even if it's a separator
+  return lines.find(l => l.trim())?.trim().slice(0, 50) || '';
+}
+
+function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, toolType = 'claude' }: TimelineProps) {
+  const isGemini = toolType === 'gemini';
   const [entries, setEntries] = useState<TimelineEntry[]>([]);
   const [forkMarkers, setForkMarkers] = useState<ForkMarker[]>([]);
   const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
@@ -152,35 +171,43 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
 
     setIsLoading(true);
     try {
-      // Load timeline entries and fork markers in parallel
-      const [timelineResult, markersResult] = await Promise.all([
-        ipcRenderer.invoke('claude:get-timeline', { sessionId, cwd }),
-        ipcRenderer.invoke('claude:get-fork-markers', { sessionId })
-      ]);
-
-      if (timelineResult.success) {
-        setEntries(timelineResult.entries);
-        setSessionBoundaries(timelineResult.sessionBoundaries || []);
-
-        // Detect session ID change (e.g., after "Clear Context" in plan mode)
-        // If the timeline resolved a newer session, update our store
-        if (timelineResult.latestSessionId && timelineResult.latestSessionId !== sessionId) {
-          console.log('[Timeline] Session chain detected! Updating sessionId:', sessionId, '→', timelineResult.latestSessionId);
-          useWorkspaceStore.getState().setClaudeSessionId(tabId, timelineResult.latestSessionId);
+      if (isGemini) {
+        // Gemini: single IPC call, no fork markers or session chains
+        const timelineResult = await ipcRenderer.invoke('gemini:get-timeline', { sessionId, cwd });
+        if (timelineResult.success) {
+          setEntries(timelineResult.entries);
+          setSessionBoundaries([]);
+          setForkMarkers([]);
         }
+      } else {
+        // Claude: load timeline entries and fork markers in parallel
+        const [timelineResult, markersResult] = await Promise.all([
+          ipcRenderer.invoke('claude:get-timeline', { sessionId, cwd }),
+          ipcRenderer.invoke('claude:get-fork-markers', { sessionId })
+        ]);
 
-      }
-      if (markersResult.success) {
-        const markers = markersResult.markers || [];
-        console.log('[Timeline] Fork markers for session', sessionId, ':', markers.length, markers.length > 0 ? JSON.stringify(markers.map((m: ForkMarker) => m.source_session_id)) : '(empty)');
-        setForkMarkers(markers);
+        if (timelineResult.success) {
+          setEntries(timelineResult.entries);
+          setSessionBoundaries(timelineResult.sessionBoundaries || []);
+
+          // Detect session ID change (e.g., after "Clear Context" in plan mode)
+          if (timelineResult.latestSessionId && timelineResult.latestSessionId !== sessionId) {
+            console.log('[Timeline] Session chain detected! Updating sessionId:', sessionId, '→', timelineResult.latestSessionId);
+            useWorkspaceStore.getState().setClaudeSessionId(tabId, timelineResult.latestSessionId);
+          }
+        }
+        if (markersResult.success) {
+          const markers = markersResult.markers || [];
+          console.log('[Timeline] Fork markers for session', sessionId, ':', markers.length, markers.length > 0 ? JSON.stringify(markers.map((m: ForkMarker) => m.source_session_id)) : '(empty)');
+          setForkMarkers(markers);
+        }
       }
     } catch (error) {
       console.error('[Timeline] Error loading timeline:', error);
     } finally {
       setIsLoading(false);
     }
-  }, [sessionId, cwd, tabId]);
+  }, [sessionId, cwd, tabId, isGemini]);
 
   useEffect(() => {
     loadTimeline();
@@ -198,8 +225,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
   // matches 1:1 in the terminal buffer
   const getEntryKey = useCallback((entry: TimelineEntry): string | null => {
     if (entry.type === 'compact') return null;
-    const text = entry.content.split('\n')[0].slice(0, 80).trim();
-    return text || null;
+    return getSearchText(entry.content) || null;
   }, []);
 
   // Check if key exists at a user prompt position in buffer text.
@@ -219,7 +245,9 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
       const lineHead = bufferText.slice(lineStart, Math.min(lineStart + 50, pos));
       
       // 1. Strict prompt check (standard case)
-      const hasPrompt = lineHead.includes('\u276F') || lineHead.includes('\u23F5') || lineHead.includes('>');
+      // Only ❯ (U+276F) and ⏵ (U+23F5) — NOT '>' which matches markdown blockquotes
+      // in Claude responses, causing false positives in reachability checks
+      const hasPrompt = lineHead.includes('\u276F') || lineHead.includes('\u23F5');
       
       // 2. Relaxed check for pasted text/code/lists (indentation or bullets)
       // If the prefix is just whitespace, stars, dashes, or dots, assume it's a valid user entry
@@ -262,6 +290,17 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
       return;
     }
 
+    // Find the last compact/plan-mode boundary.
+    // Entries before this index are cleared from terminal — always unreachable, never visible.
+    // Note: 'continued' (fork) and sessionId changes do NOT clear terminal — only compact and plan-mode do.
+    let lastBoundaryIdx = -1;
+    for (let i = 0; i < entries.length; i++) {
+      const e = entries[i];
+      if (e.type === 'compact' || e.isPlan) {
+        lastBoundaryIdx = i;
+      }
+    }
+
     // Viewport visibility — which entries are currently on screen
     const checkVisibility = () => {
       const visibleText = terminalRegistry.getVisibleText(tabId);
@@ -272,6 +311,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
 
       const newVisible = new Set<number>();
       entries.forEach((entry, index) => {
+        // Entries before boundary can't be in viewport (cleared from terminal)
+        if (index <= lastBoundaryIdx) return;
         const key = getEntryKey(entry);
         if (key && matchesAtUserPrompt(visibleText, key)) {
           newVisible.add(index);
@@ -295,6 +336,11 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
       const newUnreachable = new Set<number>();
       entries.forEach((entry, index) => {
         if (entry.type === 'compact' || entry.type === 'continued' || entry.isPlan) return;
+        // Entries before boundary are always unreachable (cleared from terminal)
+        if (index <= lastBoundaryIdx) {
+          newUnreachable.add(index);
+          return;
+        }
         const key = getEntryKey(entry);
         if (key) {
              const isReachable = matchesAtUserPrompt(fullText, key, false);
@@ -307,6 +353,11 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
       // Inherit unreachable for compact/continued/plan entries from next regular entry
       entries.forEach((entry, index) => {
         if (entry.type !== 'compact' && entry.type !== 'continued' && !entry.isPlan) return;
+        // Boundary entries themselves and everything before — always unreachable
+        if (index <= lastBoundaryIdx) {
+          newUnreachable.add(index);
+          return;
+        }
         for (let j = index + 1; j < entries.length; j++) {
           const next = entries[j];
           if (next.type === 'compact' || next.type === 'continued' || next.isPlan) continue;
@@ -487,7 +538,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
       // the actual JSONL content is NOT in the terminal buffer
       const searchText = entry.isPlan
         ? 'Plan to implement'
-        : entry.content.split('\n')[0].slice(0, 80).trim();
+        : getSearchText(entry.content);
       if (searchText) {
         // Count earlier entries with the same search key (duplicate handling).
         // Only count same-type entries: isValidMatch in terminal only passes for
@@ -499,7 +550,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
           if (e.type !== entry.type) continue;
           const eKey = e.isPlan
             ? 'Plan to implement'
-            : e.content.split('\n')[0].slice(0, 80).trim();
+            : getSearchText(e.content);
           if (eKey === searchText) occurrenceIndex++;
         }
 
@@ -643,21 +694,37 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
     const entryIndex = entries.findIndex(e => e.uuid === entry.uuid);
     if (entryIndex === -1) return;
 
-    // Calculate targetIndex: position in user-only list for TUI menu navigation
-    const userEntries = entries.filter(e => e.type === 'user');
-    const targetIndex = userEntries.findIndex(e => e.uuid === entry.uuid);
-    if (targetIndex === -1) return;
+    // Find the last compact/plan-mode boundary — Rewind TUI only shows entries after it.
+    // Everything before compact/plan-mode is cleared from terminal and not in the Rewind menu.
+    // Note: 'continued' (fork) does NOT clear terminal — only compact and plan-mode do.
+    let lastBoundaryIdx = -1;
+    for (let i = 0; i < entryIndex; i++) {
+      const e = entries[i];
+      if (e.type === 'compact' || e.isPlan) {
+        lastBoundaryIdx = i;
+      }
+    }
 
-    // Count duplicate prefixes AFTER the target (we navigate UP from bottom,
-    // so we encounter newer duplicates first and need to skip them)
+    // Filter to rewindable user entries only (after last boundary)
+    const rewindableEntries = entries
+      .filter((e, i) => e.type === 'user' && i > lastBoundaryIdx);
+    const targetIndex = rewindableEntries.findIndex(e => e.uuid === entry.uuid);
+    if (targetIndex === -1) {
+      console.warn('[Restore:Rewind] Target is before compact/plan-mode boundary, cannot rewind');
+      return;
+    }
+
+    // Count duplicate prefixes AFTER the target within rewindable range.
+    // Use first 40 chars (TUI menu shows ~50 char prefix).
     const targetPrefix = entry.content.trim().substring(0, 40);
     let skipDuplicates = 0;
-    for (let i = targetIndex + 1; i < userEntries.length; i++) {
-      const ePrefix = userEntries[i].content.trim().substring(0, 40);
+    for (let i = targetIndex + 1; i < rewindableEntries.length; i++) {
+      const ePrefix = rewindableEntries[i].content.trim().substring(0, 40);
       if (ePrefix === targetPrefix) skipDuplicates++;
     }
 
-    console.warn('[Restore:Rewind] Starting rewind to entry', targetIndex, '/', userEntries.length, '- uuid:', entry.uuid, 'skipDuplicates:', skipDuplicates);
+    console.warn('[Restore:Rewind] Starting rewind to entry', targetIndex, '/', rewindableEntries.length,
+      '- uuid:', entry.uuid, 'skipDuplicates:', skipDuplicates, 'boundaryIdx:', lastBoundaryIdx);
 
     // Phase 1: Compact entries being lost (from next entry to end)
     let compactText = '';
@@ -1247,12 +1314,15 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
             >
               {!selectionStartId ? (
                 <>
-                  <button
-                    className="w-full text-left px-3 py-2 text-xs text-white hover:bg-blue-600 rounded transition-colors cursor-pointer"
-                    onClick={(e) => { e.stopPropagation(); startRangeSelection(contextMenu.entry); }}
-                  >
-                    Начать копирование
-                  </button>
+                  {/* Range copy — Claude only */}
+                  {!isGemini && (
+                    <button
+                      className="w-full text-left px-3 py-2 text-xs text-white hover:bg-blue-600 rounded transition-colors cursor-pointer"
+                      onClick={(e) => { e.stopPropagation(); startRangeSelection(contextMenu.entry); }}
+                    >
+                      Начать копирование
+                    </button>
+                  )}
                   <button
                     className="w-full text-left px-3 py-2 text-xs text-white/60 hover:bg-white/5 rounded transition-colors cursor-pointer"
                     onClick={(e) => {
@@ -1263,17 +1333,22 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true }: 
                   >
                     Копировать текст сообщения
                   </button>
-                  <div className="border-t border-white/10 my-1" />
-                  <button
-                    className={`w-full text-left px-3 py-2 text-xs rounded transition-colors ${isActive && !rewindState ? 'text-amber-400 hover:bg-amber-600/20 cursor-pointer' : 'text-white/20 cursor-not-allowed'}`}
-                    disabled={!isActive || !!rewindState}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      if (isActive && !rewindState) handleRewind(contextMenu.entry);
-                    }}
-                  >
-                    {rewindState ? (rewindState.phase === 'compacting' ? 'Компакт...' : rewindState.phase === 'rewinding' ? 'Откат...' : 'Вставка...') : 'Откатиться'}
-                  </button>
+                  {/* Rewind — Claude only (Gemini has built-in /rewind) */}
+                  {!isGemini && (
+                    <>
+                      <div className="border-t border-white/10 my-1" />
+                      <button
+                        className={`w-full text-left px-3 py-2 text-xs rounded transition-colors ${isActive && !rewindState ? 'text-amber-400 hover:bg-amber-600/20 cursor-pointer' : 'text-white/20 cursor-not-allowed'}`}
+                        disabled={!isActive || !!rewindState}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          if (isActive && !rewindState) handleRewind(contextMenu.entry);
+                        }}
+                      >
+                        {rewindState ? (rewindState.phase === 'compacting' ? 'Компакт...' : rewindState.phase === 'rewinding' ? 'Откат...' : 'Вставка...') : 'Откатиться'}
+                      </button>
+                    </>
+                  )}
                 </>
               ) : (
                 <button

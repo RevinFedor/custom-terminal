@@ -2,6 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
+const { resolveGeminiProjectDir, calculateGeminiHash } = require(path.join(__dirname, 'gemini-utils'));
 
 /**
  * SessionManager - Unified session persistence for Gemini CLI and Claude Code
@@ -24,13 +25,9 @@ class SessionManager {
    */
   async listAvailableGeminiCheckpoints(projectPath) {
     try {
-      const normalizedPath = path.resolve(projectPath);
-      const dirHash = this.calculateGeminiHash(normalizedPath);
-      const geminiTmpDir = path.join(os.homedir(), '.gemini', 'tmp', dirHash);
-
-      if (!fs.existsSync(geminiTmpDir)) {
-        return [];
-      }
+      const resolved = resolveGeminiProjectDir(projectPath);
+      if (!resolved) return [];
+      const geminiTmpDir = resolved.projectDir;
 
       const files = fs.readdirSync(geminiTmpDir);
       const checkpoints = files
@@ -57,23 +54,19 @@ class SessionManager {
       const normalizedCwd = path.resolve(dirPath);
       const normalizedProject = projectPath ? path.resolve(projectPath) : normalizedCwd;
 
-      // Calculate directory hash (SHA-256 of tab cwd - this is what Gemini uses)
-      const dirHash = this.calculateGeminiHash(normalizedCwd);
+      // Resolve project directory: slug (v0.30+) → hash (legacy)
+      const resolved = resolveGeminiProjectDir(normalizedCwd);
+      if (!resolved) {
+        return { success: false, message: 'Gemini project directory not found.' };
+      }
+      const geminiTmpDir = resolved.projectDir;
 
-      // Find checkpoint file
-      const geminiTmpDir = path.join(os.homedir(), '.gemini', 'tmp', dirHash);
-
-      const checkpointPattern = `checkpoint-${sessionKey}.json`;
-      const checkpointPath = path.join(geminiTmpDir, checkpointPattern);
-
+      const checkpointPath = path.join(geminiTmpDir, `checkpoint-${sessionKey}.json`);
       console.log('[SessionManager] Looking for checkpoint at:', checkpointPath);
 
       if (!fs.existsSync(checkpointPath)) {
-        // List available checkpoints for debugging
-        if (fs.existsSync(geminiTmpDir)) {
-          const files = fs.readdirSync(geminiTmpDir).filter(f => f.startsWith('checkpoint-'));
-          console.log('[SessionManager] Available checkpoints:', files);
-        }
+        const files = fs.readdirSync(geminiTmpDir).filter(f => f.startsWith('checkpoint-'));
+        console.log('[SessionManager] Available checkpoints:', files);
         return {
           success: false,
           message: `Checkpoint "${sessionKey}" not found. Run "/chat save ${sessionKey}" first.`
@@ -83,15 +76,14 @@ class SessionManager {
       // Read checkpoint content
       const checkpointContent = fs.readFileSync(checkpointPath, 'utf-8');
 
-      // Save to database
-      // - projectPath for organization (which project this belongs to)
-      // - original_cwd = dirPath (where checkpoint was created, for import patching)
+      // Save to database — keep hash for DB storage and content patching
+      const dirHash = calculateGeminiHash(normalizedCwd);
       const sessionId = this.db.saveAISession(
-        normalizedProject,    // project for DB organization
+        normalizedProject,
         'gemini',
         sessionKey,
         checkpointContent,
-        normalizedCwd,        // original_cwd = tab cwd where checkpoint was created
+        normalizedCwd,
         dirHash
       );
 
@@ -209,8 +201,11 @@ class SessionManager {
   patchCheckpointFile(targetCwd, sessionKey, patchedContent) {
     try {
       const normalizedTarget = path.resolve(targetCwd);
-      const targetHash = this.calculateGeminiHash(normalizedTarget);
-      const geminiTmpDir = path.join(os.homedir(), '.gemini', 'tmp', targetHash);
+      const resolved = resolveGeminiProjectDir(normalizedTarget);
+      // Fallback to hash if project dir not found yet (Gemini may have just created it)
+      const geminiTmpDir = resolved
+        ? resolved.projectDir
+        : path.join(os.homedir(), '.gemini', 'tmp', calculateGeminiHash(normalizedTarget));
       const checkpointPath = path.join(geminiTmpDir, `checkpoint-${sessionKey}.json`);
 
       console.log('[SessionManager] Patching checkpoint at:', checkpointPath);
@@ -240,8 +235,11 @@ class SessionManager {
   deleteDeployment(sessionId, sessionKey, deployedCwd) {
     try {
       const normalizedCwd = path.resolve(deployedCwd);
-      const hash = this.calculateGeminiHash(normalizedCwd);
-      const checkpointPath = path.join(os.homedir(), '.gemini', 'tmp', hash, `checkpoint-${sessionKey}.json`);
+      const resolved = resolveGeminiProjectDir(normalizedCwd);
+      const projectDir = resolved
+        ? resolved.projectDir
+        : path.join(os.homedir(), '.gemini', 'tmp', calculateGeminiHash(normalizedCwd));
+      const checkpointPath = path.join(projectDir, `checkpoint-${sessionKey}.json`);
 
       console.log('[SessionManager] Deleting deployment:', checkpointPath);
 

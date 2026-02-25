@@ -57,7 +57,7 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
   const [claudeModel, setClaudeModel] = useState<string | null>(cached?.model ?? null);
   const [contextPct, setContextPct] = useState(cached?.contextPct ?? 0);
   const [isCommandRunning, setIsCommandRunning] = useState(false);
-  const [showSessionInput, setShowSessionInput] = useState(false);
+  const [sessionInputMode, setSessionInputMode] = useState<'claude' | 'gemini' | null>(null);
   const [manualSessionId, setManualSessionId] = useState('');
   const sessionInputRef = useRef<HTMLInputElement>(null);
   const { showToast, claudeDefaultPromptEnabled } = useUIStore();
@@ -84,7 +84,7 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
   }, []);
 
   useEffect(() => {
-    setShowSessionInput(false);
+    setSessionInputMode(null);
     setManualSessionId('');
     const c = activeTabId ? bridgeCacheRef.current.get(activeTabId) : undefined;
     setClaudeModel(c?.model ?? null);
@@ -264,33 +264,27 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
     finally { setIsGeneratingDesc(false); }
   };
 
-  const handleApplyManualSession = () => {
-    console.warn('[ReplaceSession] called, activeTabId:', activeTabId, 'input:', manualSessionId.trim());
+  const handleApplyManualSession = (mode: 'claude' | 'gemini') => {
+    console.warn('[ReplaceSession] called, mode:', mode, 'activeTabId:', activeTabId, 'input:', manualSessionId.trim());
     if (!activeTabId || !manualSessionId.trim()) { console.warn('[ReplaceSession] BAIL: no tabId or empty input'); return; }
     const uuidMatch = manualSessionId.trim().match(UUID_EXTRACT_REGEX);
     if (!uuidMatch) { console.warn('[ReplaceSession] BAIL: invalid UUID'); showToast('Invalid UUID format', 'warning'); return; }
     const newId = uuidMatch[0];
-    console.warn('[ReplaceSession] extracted UUID:', newId, 'current sessionId:', sessionId);
-    if (newId === sessionId) {
-      console.warn('[ReplaceSession] BAIL: same as current');
+    const targetId = mode === 'gemini' ? geminiSessionId : claudeSessionId;
+    if (newId === targetId) {
       showToast('Already current session', 'warning');
-      setShowSessionInput(false);
+      setSessionInputMode(null);
       setManualSessionId('');
       return;
     }
-    useWorkspaceStore.getState().setClaudeSessionId(activeTabId, newId);
-    console.warn('[ReplaceSession] store updated, verifying...');
-    // Verify the change took effect
-    const verify = useWorkspaceStore.getState();
-    for (const [, ws] of verify.openProjects) {
-      const tab = ws.tabs.get(activeTabId);
-      if (tab) {
-        console.warn('[ReplaceSession] verify tab.claudeSessionId:', tab.claudeSessionId);
-        break;
-      }
+    if (mode === 'gemini') {
+      useWorkspaceStore.getState().setGeminiSessionId(activeTabId, newId);
+    } else {
+      useWorkspaceStore.getState().setClaudeSessionId(activeTabId, newId);
     }
-    showToast('Session set: ' + newId.substring(0, 8) + '...', 'success');
-    setShowSessionInput(false);
+    console.warn('[ReplaceSession] store updated for', mode);
+    showToast(`${mode === 'gemini' ? 'Gemini' : 'Claude'} session set: ` + newId.substring(0, 8) + '...', 'success');
+    setSessionInputMode(null);
     setManualSessionId('');
   };
 
@@ -343,16 +337,25 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
               <span className={`text-xs font-medium ${currentSessionType === 'claude' ? 'text-[#DA7756]' : 'text-[#4E86F8]'}`}>
                 {currentSessionType === 'claude' ? 'Claude' : 'Gemini'}
               </span>
-              {hasClaudeSession && activeTabId && !isCommandRunning && (
+              {hasAnySession && activeTabId && !isCommandRunning && (
                 <button
-                  className="text-[10px] px-2 py-0.5 rounded cursor-pointer bg-[#DA7756]/15 text-[#DA7756] hover:bg-[#DA7756]/25"
+                  className="text-[10px] px-2 py-0.5 rounded cursor-pointer"
+                  style={{
+                    backgroundColor: currentSessionType === 'claude' ? 'rgba(218,119,86,0.15)' : 'rgba(78,134,248,0.15)',
+                    color: currentSessionType === 'claude' ? '#DA7756' : '#4E86F8',
+                  }}
+                  onMouseEnter={(e) => { e.currentTarget.style.backgroundColor = currentSessionType === 'claude' ? 'rgba(218,119,86,0.25)' : 'rgba(78,134,248,0.25)'; }}
+                  onMouseLeave={(e) => { e.currentTarget.style.backgroundColor = currentSessionType === 'claude' ? 'rgba(218,119,86,0.15)' : 'rgba(78,134,248,0.15)'; }}
                   onClick={() => {
-                    if (activeTabId) {
+                    if (activeTabId && currentSessionType === 'claude') {
                       setTabCommandType(activeTabId, 'claude');
                       ipcRenderer.send('claude:run-command', { tabId: activeTabId, command: 'claude-c', sessionId: claudeSessionId });
+                    } else if (activeTabId && currentSessionType === 'gemini') {
+                      setTabCommandType(activeTabId, 'gemini');
+                      ipcRenderer.send('gemini:run-command', { tabId: activeTabId, command: 'gemini-c', sessionId: geminiSessionId });
                     }
                   }}
-                  title="Продолжить сессию (claude --resume)"
+                  title={currentSessionType === 'claude' ? 'Продолжить (claude --resume)' : 'Продолжить (gemini --resume)'}
                 >
                   Продолжить
                 </button>
@@ -361,22 +364,19 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
               {activeTabId && (
                 <button
                   className={`text-[10px] px-1.5 py-0.5 rounded cursor-pointer ${
-                    showSessionInput ? 'text-[#aaa] bg-[#ffffff10]' : 'text-[#444] hover:text-[#aaa] hover:bg-[#ffffff08]'
+                    sessionInputMode ? 'text-[#aaa] bg-[#ffffff10]' : 'text-[#444] hover:text-[#aaa] hover:bg-[#ffffff08]'
                   }`}
                   onClick={() => {
-                    setShowSessionInput(!showSessionInput);
-                    setManualSessionId('');
-                    if (!showSessionInput) setTimeout(() => sessionInputRef.current?.focus(), 50);
+                    if (sessionInputMode) { setSessionInputMode(null); setManualSessionId(''); }
+                    else { setSessionInputMode('claude'); setManualSessionId(''); setTimeout(() => sessionInputRef.current?.focus(), 50); }
                   }}
                   title="Replace session ID"
-                >
-                  ✎
-                </button>
+                >✎</button>
               )}
             </div>
             <code className="text-[10px] text-[#aaa] break-all block">{sessionId}</code>
 
-            {showSessionInput && (
+            {sessionInputMode && (
               <div className="mt-2" style={{ animation: 'fadeIn 0.15s ease-out' }}>
                 <input
                   ref={sessionInputRef}
@@ -384,15 +384,22 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                   value={manualSessionId}
                   onChange={(e) => setManualSessionId(e.target.value)}
                   onKeyDown={(e) => {
-                    if (e.key === 'Enter') { e.preventDefault(); handleApplyManualSession(); }
-                    else if (e.key === 'Escape') { setShowSessionInput(false); setManualSessionId(''); }
+                    if (e.key === 'Escape') { setSessionInputMode(null); setManualSessionId(''); }
                   }}
                   placeholder="Paste session UUID..."
-                  className="w-full px-2 py-1 bg-[#1a1a1a] border border-[#444] rounded text-[10px] text-[#aaa] font-mono focus:outline-none focus:border-[#DA7756] placeholder:text-[#555]"
+                  className={`w-full px-2 py-1 bg-[#1a1a1a] border border-[#444] rounded text-[10px] text-[#aaa] font-mono focus:outline-none placeholder:text-[#555] ${sessionInputMode === 'gemini' ? 'focus:border-[#4E86F8]' : 'focus:border-[#DA7756]'}`}
                 />
-                <div className="flex gap-2 mt-1.5">
-                  <button className="flex-1 text-[10px] px-2 py-1 rounded bg-[#DA7756]/20 text-[#DA7756] hover:bg-[#DA7756]/30 cursor-pointer disabled:opacity-40" onClick={handleApplyManualSession} disabled={!manualSessionId.trim()}>Replace</button>
-                  <button className="flex-1 text-[10px] px-2 py-1 rounded bg-[#333] text-[#888] hover:bg-[#444] cursor-pointer" onClick={() => { setShowSessionInput(false); setManualSessionId(''); }}>Отмена</button>
+                <div className="flex gap-1 mt-1.5">
+                  <button
+                    className="flex-1 text-[10px] px-2 py-1 rounded-l cursor-pointer disabled:opacity-40 bg-[#DA7756]/20 text-[#DA7756] hover:bg-[#DA7756]/30"
+                    onClick={() => handleApplyManualSession('claude')}
+                    disabled={!manualSessionId.trim()}
+                  >C</button>
+                  <button
+                    className="flex-1 text-[10px] px-2 py-1 rounded-r cursor-pointer disabled:opacity-40 bg-[#4E86F8]/20 text-[#4E86F8] hover:bg-[#4E86F8]/30"
+                    onClick={() => handleApplyManualSession('gemini')}
+                    disabled={!manualSessionId.trim()}
+                  >G</button>
                 </div>
               </div>
             )}
@@ -437,18 +444,35 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                 <span className="text-[#888] text-xs">Нет активной сессии</span>
               </div>
               {activeTabId && (
-                <button className={`text-[10px] cursor-pointer ${showSessionInput ? 'text-[#aaa]' : 'text-[#555] hover:text-[#aaa]'}`} onClick={() => { setShowSessionInput(!showSessionInput); setManualSessionId(''); if (!showSessionInput) setTimeout(() => sessionInputRef.current?.focus(), 50); }}>Set ID</button>
+                <button
+                  className={`text-[10px] cursor-pointer ${sessionInputMode ? 'text-[#aaa]' : 'text-[#555] hover:text-[#aaa]'}`}
+                  onClick={() => {
+                    if (sessionInputMode) { setSessionInputMode(null); setManualSessionId(''); }
+                    else { setSessionInputMode('claude'); setManualSessionId(''); setTimeout(() => sessionInputRef.current?.focus(), 50); }
+                  }}
+                >Set ID</button>
               )}
             </div>
-            {showSessionInput && activeTabId && (
+            {sessionInputMode && activeTabId && (
               <div className="mt-2" style={{ animation: 'fadeIn 0.15s ease-out' }}>
                 <input
                   ref={sessionInputRef} type="text" value={manualSessionId} onChange={(e) => setManualSessionId(e.target.value)}
-                  onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); handleApplyManualSession(); } else if (e.key === 'Escape') { setShowSessionInput(false); setManualSessionId(''); } }}
+                  onKeyDown={(e) => { if (e.key === 'Escape') { setSessionInputMode(null); setManualSessionId(''); } }}
                   placeholder="Paste session UUID..."
-                  className="w-full px-2 py-1 bg-[#1a1a1a] border border-[#444] rounded text-[10px] text-[#aaa] font-mono focus:outline-none focus:border-[#DA7756] placeholder:text-[#555]"
+                  className={`w-full px-2 py-1 bg-[#1a1a1a] border border-[#444] rounded text-[10px] text-[#aaa] font-mono focus:outline-none placeholder:text-[#555] ${sessionInputMode === 'gemini' ? 'focus:border-[#4E86F8]' : 'focus:border-[#DA7756]'}`}
                 />
-                <button className="mt-1.5 w-full text-[10px] px-2 py-1 rounded bg-[#DA7756]/20 text-[#DA7756] hover:bg-[#DA7756]/30 cursor-pointer disabled:opacity-40" onClick={handleApplyManualSession} disabled={!manualSessionId.trim()}>Set session</button>
+                <div className="flex gap-1 mt-1.5">
+                  <button
+                    className="flex-1 text-[10px] px-2 py-1 rounded-l cursor-pointer disabled:opacity-40 bg-[#DA7756]/20 text-[#DA7756] hover:bg-[#DA7756]/30"
+                    onClick={() => handleApplyManualSession('claude')}
+                    disabled={!manualSessionId.trim()}
+                  >C</button>
+                  <button
+                    className="flex-1 text-[10px] px-2 py-1 rounded-r cursor-pointer disabled:opacity-40 bg-[#4E86F8]/20 text-[#4E86F8] hover:bg-[#4E86F8]/30"
+                    onClick={() => handleApplyManualSession('gemini')}
+                    disabled={!manualSessionId.trim()}
+                  >G</button>
+                </div>
               </div>
             )}
           </div>
@@ -555,27 +579,6 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                   )}
                 </div>
               )}
-              {!hasAnySession && (
-                <div className="bg-[#2d2d2d] rounded p-2">
-                  <div className="flex items-center justify-between">
-                    <code
-                      className="text-xs cursor-pointer hover:underline" style={{ color: '#DA7756' }}
-                      onClick={async () => {
-                        if (!activeTabId) { showToast('Нет активного таба', 'error'); return; }
-                        try {
-                          const clipboardText = await navigator.clipboard.readText();
-                          const match = clipboardText.match(UUID_EXTRACT_REGEX);
-                          if (match) { const extractedUuid = match[0]; setTabCommandType(activeTabId, 'claude'); ipcRenderer.send('claude:run-command', { tabId: activeTabId, command: 'claude-f', forkSessionId: extractedUuid }); }
-                          else showToast('В буфере нет UUID', 'warning');
-                        } catch (err) { showToast('Не удалось прочитать буфер', 'error'); }
-                      }}
-                      title="Fork по UUID из буфера"
-                    >claude-f</code>
-                    <span className="text-[10px] text-[#666]">clipboard</span>
-                  </div>
-                  <p className="text-[10px] text-[#666] mt-1">Fork из буфера</p>
-                </div>
-              )}
             </>
           ) : (
             <>
@@ -588,37 +591,56 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                   <p className="text-[10px] text-[#666] mt-1">Новая сессия</p>
                 </div>
               )}
-              <div className={`rounded p-2 ${hasGeminiSession ? 'bg-[#2d2d2d]' : 'bg-[#252525] opacity-60'}`}>
-                <div className="flex items-center justify-between">
-                  <code className={`text-xs hover:underline ${hasGeminiSession ? 'cursor-pointer' : 'cursor-not-allowed'}`} style={{ color: hasGeminiSession ? '#4E86F8' : '#666' }} onClick={() => { if (!hasGeminiSession) { showToast('Нет Gemini сессии', 'warning'); return; } if (activeTabId) { setTabCommandType(activeTabId, 'gemini'); ipcRenderer.send('gemini:run-command', { tabId: activeTabId, command: 'gemini-c', sessionId: geminiSessionId }); } }} title={hasGeminiSession ? 'Продолжить' : 'Нет сессии'}>gemini-c</code>
-                  <span className={`text-[10px] ${hasGeminiSession ? 'text-green-400' : 'text-[#666]'}`}>{hasGeminiSession ? 'готово' : '—'}</span>
-                </div>
-                <p className="text-[10px] text-[#666] mt-1">Продолжить</p>
-              </div>
-              <div className={`rounded p-2 ${hasGeminiSession ? 'bg-[#2d2d2d]' : 'bg-[#252525] opacity-60'}`}>
-                <div className="flex items-center justify-between">
-                  <code
-                    className={`text-xs hover:underline ${hasGeminiSession ? 'cursor-pointer' : 'cursor-not-allowed'}`} style={{ color: hasGeminiSession ? '#4E86F8' : '#666' }}
-                    onClick={async () => {
-                      if (!hasGeminiSession || !geminiSessionId) { showToast('Нет Gemini сессии для fork', 'warning'); return; }
-                      if (!activeTabId) { showToast('Нет активного таба', 'error'); return; }
-                      const state = useWorkspaceStore.getState();
-                      for (const [projectId, workspace] of state.openProjects) {
-                        const tab = workspace.tabs.get(activeTabId);
-                        if (tab) {
-                          const currentCwd = tab.cwd || project?.path || '';
-                          await state.createTabAfterCurrent(projectId, undefined, currentCwd, { pendingAction: { type: 'gemini-fork', sessionId: geminiSessionId } });
-                          showToast('Fork Gemini → новая вкладка', 'success'); break;
-                        }
-                      }
-                    }}
-                    title={hasGeminiSession ? 'Fork в новую вкладку' : 'Нет сессии'}
-                  >gemini-f</code>
-                  <span className={`text-[10px] ${hasGeminiSession ? 'text-green-400' : 'text-[#666]'}`}>{hasGeminiSession ? 'готово' : '—'}</span>
-                </div>
-                <p className="text-[10px] text-[#666] mt-1">Fork → новая вкладка</p>
-              </div>
             </>
+          )}
+
+          {!hasAnySession && (
+            <div className="bg-[#2d2d2d] rounded p-2">
+              <div className="flex items-center justify-between">
+                <div className="flex">
+                  <code
+                    className="text-xs cursor-pointer hover:underline px-1.5 py-0.5 bg-[#1a1a1a] rounded-l"
+                    style={{ color: '#DA7756' }}
+                    onClick={async () => {
+                      if (!activeTabId) { showToast('Нет активного таба', 'error'); return; }
+                      try {
+                        const clipboardText = await navigator.clipboard.readText();
+                        const match = clipboardText.match(UUID_EXTRACT_REGEX);
+                        if (match) { setTabCommandType(activeTabId, 'claude'); ipcRenderer.send('claude:run-command', { tabId: activeTabId, command: 'claude-f', forkSessionId: match[0] }); }
+                        else showToast('В буфере нет UUID', 'warning');
+                      } catch (err) { showToast('Не удалось прочитать буфер', 'error'); }
+                    }}
+                    title="Fork Claude по UUID из буфера"
+                  >claude-f</code>
+                  <code
+                    className="text-xs cursor-pointer hover:underline px-1.5 py-0.5 bg-[#1a1a1a] rounded-r border-l border-[#333]"
+                    style={{ color: '#4E86F8' }}
+                    onClick={async () => {
+                      if (!activeTabId) { showToast('Нет активного таба', 'error'); return; }
+                      try {
+                        const clipboardText = await navigator.clipboard.readText();
+                        const match = clipboardText.match(UUID_EXTRACT_REGEX);
+                        if (match) {
+                          const state = useWorkspaceStore.getState();
+                          for (const [projectId, workspace] of state.openProjects) {
+                            const tab = workspace.tabs.get(activeTabId);
+                            if (tab) {
+                              const currentCwd = tab.cwd || project?.path || '';
+                              await state.createTabAfterCurrent(projectId, undefined, currentCwd, { pendingAction: { type: 'gemini-fork', sessionId: match[0] } });
+                              showToast('Fork Gemini → новая вкладка', 'success');
+                              break;
+                            }
+                          }
+                        } else showToast('В буфере нет UUID', 'warning');
+                      } catch (err) { showToast('Не удалось прочитать буфер', 'error'); }
+                    }}
+                    title="Fork Gemini по UUID из буфера"
+                  >gemini-f</code>
+                </div>
+                <span className="text-[10px] text-[#666]">clipboard</span>
+              </div>
+              <p className="text-[10px] text-[#666] mt-1">Fork из буфера</p>
+            </div>
           )}
         </div>
       </div>

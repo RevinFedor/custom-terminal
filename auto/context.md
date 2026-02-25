@@ -16,7 +16,12 @@ auto/
 ├── stable/                        # Рабочие тесты (проходят, можно запускать повторно)
 │   ├── test-sniper-handshake.js   # Sniper + Handshake: Claude Session ID detection
 │   ├── test-ctrlc-danger-zone.js  # Ctrl-C: детекция "again to exit" и блокировка
-│   └── test-ctrlc-rapid-model-switch.js # Claude: быстрая смена моделей под нагрузкой
+│   ├── test-ctrlc-rapid-model-switch.js # Claude: быстрая смена моделей под нагрузкой
+│   ├── test-timeline.js           # Timeline: запуск Claude, появление точек, парсинг DOM
+│   ├── test-rewind-navigation.js  # Rewind: сложная TUI-навигация, RGB поиск, откат
+│   ├── test-session-export.js     # Export: работа backtrace, форматирование кода/диффов
+│   ├── test-plan-mode-detect.js   # Plan Mode: детекция Clear Context и смены сессии
+│   └── test-history-restore.js    # History: восстановление вкладок из SQLite
 ├── sandbox/                       # Одноразовые эксперименты и дебаг
 └── screenshots/                   # Артефакты тестов
 ```
@@ -29,12 +34,36 @@ auto/
 
 **sandbox/** — одноразовые скрипты для отладки. Тест прошёл → переносить в `stable/`.
 
-Тест: "Это ограничение Playwright или особенность тестируемой подсистемы?"
-- Hover не срабатывает через `mouse.move()` → **playwright/basics.md** (эффект телепортации)
-- `waitForFunction` на Zustand store → **libraries/zustand-store.md** (как читать store)
-- OSC 133 не приходит → **libraries/xterm.md** (command lifecycle)
-- `CLAUDECODE` блокирует запуск → **playwright/electron.md** (env изоляция)
-- `dist/` не обновляется → **playwright/electron.md** (build sync)
+## Специфика сложных тестов (Terminal & Timeline)
+
+Тестирование AI-интерфейсов (Claude TUI) требует особого подхода из-за инкрементального рендеринга и ANSI-кодов.
+
+### 1. Парсинг терминала (xterm.js)
+Для чтения текста из терминала используется `page.evaluate` с обходом `.xterm-rows > div`. 
+- **Нюанс:** Текст в DOM часто разбит на мелкие `span` с разными стилями. Нужно джойнить их через `textContent`.
+- **Индексация:** Последние строки в DOM могут быть пустыми — используй `.slice(-30)` и `.filter(line => line.trim())`.
+
+### 2. Взаимодействие с Timeline
+- **DOM Check:** Точки таймлайна ищутся по ширине (`16px`) и наличию `border-radius: 50%`.
+- **Async Timing:** Claude может инициализировать сессию до 10-15 секунд. Используй `waitForClaudeSessionId` из `launcher.js` с таймаутом 35с+.
+
+### 3. Rewind & TUI Navigation (Критично)
+Тестирование отката по истории (`test-rewind-navigation.js`) — самый сложный сценарий:
+- **Sync Markers:** После нажатия `Esc` для открытия меню, система ДОЛЖНА дождаться маркера готовности отрисовки `\x1b[?2026l`.
+- **RGB Matching:** В тестах навигации по меню используется анализ сырого PTY-вывода на предмет Lavender цвета (`177;185;249m`).
+- **Safety:** Тест должен имитировать ввод нескольких команд (например, ALPHA, BRAVO, CHARLIE), чтобы создать историю, а затем проверять точность возврата к первой.
+
+### 4. Plan Mode & Session Links
+Тест `test-plan-mode-detect.js` проверяет "невидимые" связи:
+- **Polling:** Отслеживает смену `claudeSessionId` в Zustand store после того, как пользователь выбирает "Clear Context" в Claude.
+- **SQLite Bridge:** Проверяет, что Main процесс успел записать связь сессий в БД до того, как Timeline попытается их джойнить.
+
+### 5. Zustand Store Polling
+Для проверки захвата сессий тесты читают состояние напрямую из window:
+```javascript
+const tab = window.useWorkspaceStore.getState().openProjects.get(projectId).tabs.get(tabId);
+```
+Это надёжнее, чем ждать изменений в DOM, так как Store обновляется мгновенно.
 
 ## Запуск
 
@@ -44,7 +73,9 @@ npm run dev   # → http://localhost:5182
 
 # Запуск напрямую через node (launcher сам проверит dev server)
 node auto/stable/test-sniper-handshake.js
-node auto/sandbox/test-timeline.js
+node auto/stable/test-timeline.js
+node auto/stable/test-rewind-navigation.js
+node auto/stable/test-plan-mode-detect.js
 ```
 
 Launcher поднимает **отдельный Electron-инстанс** (не трогает основной), делает проверки, закрывает.
