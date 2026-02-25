@@ -75,6 +75,28 @@ function getSearchText(content: string): string {
   return lines.find(l => l.trim())?.trim().slice(0, 50) || '';
 }
 
+// Multi-line search: returns up to 3 meaningful lines (each truncated to 50 chars).
+// Used for Gemini buffer-text search where single-line xterm search is insufficient.
+// Multiple lines dramatically improve match precision for short messages like "да".
+function getSearchLines(content: string): string[] {
+  const rawLines = content.split('\n');
+  const result: string[] = [];
+  for (const line of rawLines) {
+    const t = line.trim();
+    if (!t) continue;
+    // Skip separators
+    if (t.length >= 3 && /^(.)\1+$/.test(t)) continue;
+    result.push(t.slice(0, 50));
+    if (result.length >= 3) break;
+  }
+  // Fallback: at least return first non-empty line
+  if (result.length === 0) {
+    const first = rawLines.find(l => l.trim())?.trim().slice(0, 50);
+    if (first) result.push(first);
+  }
+  return result;
+}
+
 function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, toolType = 'claude' }: TimelineProps) {
   const isGemini = toolType === 'gemini';
   const [entries, setEntries] = useState<TimelineEntry[]>([]);
@@ -540,35 +562,53 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
 
     clickTimerRef.current = setTimeout(() => {
       clickTimerRef.current = null;
-      // Plan entries: Claude TUI renders plan in a box with "Plan to implement" header,
-      // the actual JSONL content is NOT in the terminal buffer
-      const searchText = entry.isPlan
-        ? 'Plan to implement'
-        : getSearchText(entry.content);
-      if (searchText) {
-        // Count earlier entries with the same search key (duplicate handling).
-        // Only count same-type entries: isValidMatch in terminal only passes for
-        // user prompts (preceded by ❯/⏵/>), so assistant entries with same text
-        // would inflate the count but never match in the buffer.
+
+      let found = false;
+
+      if (isGemini) {
+        // Gemini: buffer-text search with multi-line matching.
+        // Gemini CLI (Ink TUI) doesn't use ❯/⏵ prompt markers,
+        // so xterm search addon validation is useless. Instead we search
+        // the full buffer text for consecutive lines matching the entry content.
+        const searchLines = getSearchLines(entry.content);
+
+        // Count earlier entries with same searchLines[0] (duplicate handling)
         let occurrenceIndex = 0;
         for (let i = 0; i < index; i++) {
           const e = entries[i];
           if (e.type !== entry.type) continue;
-          const eKey = e.isPlan
-            ? 'Plan to implement'
-            : getSearchText(e.content);
-          if (eKey === searchText) occurrenceIndex++;
+          const eLines = getSearchLines(e.content);
+          // Compare all search lines for precise duplicate detection
+          if (eLines.length === searchLines.length && eLines.every((l, j) => l === searchLines[j])) {
+            occurrenceIndex++;
+          }
         }
 
-        const found = terminalRegistry.searchAndScrollToNth(tabId, searchText, occurrenceIndex, !!entry.isPlan || isGemini);
-        if (found) {
-          setTimeout(() => setClickedState(null), 300);
-        } else {
-          setClickedState({ index, status: 'failed' });
-          setTimeout(() => setClickedState(null), 1200);
-        }
+        found = terminalRegistry.scrollToTextInBuffer(tabId, searchLines, occurrenceIndex);
       } else {
-        setClickedState(null);
+        // Claude: xterm search addon with ❯/⏵ prompt marker validation
+        const searchText = entry.isPlan
+          ? 'Plan to implement'
+          : getSearchText(entry.content);
+        if (searchText) {
+          let occurrenceIndex = 0;
+          for (let i = 0; i < index; i++) {
+            const e = entries[i];
+            if (e.type !== entry.type) continue;
+            const eKey = e.isPlan
+              ? 'Plan to implement'
+              : getSearchText(e.content);
+            if (eKey === searchText) occurrenceIndex++;
+          }
+          found = terminalRegistry.searchAndScrollToNth(tabId, searchText, occurrenceIndex, !!entry.isPlan);
+        }
+      }
+
+      if (found) {
+        setTimeout(() => setClickedState(null), 300);
+      } else {
+        setClickedState({ index, status: 'failed' });
+        setTimeout(() => setClickedState(null), 1200);
       }
     }, 250);
   };
