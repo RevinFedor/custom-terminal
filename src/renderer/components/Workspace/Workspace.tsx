@@ -283,12 +283,18 @@ export default function Workspace() {
   // Get current tab's cwd for FileExplorer (fallback to project path)
   const explorerPath = activeTab?.cwd || (currentProject.path?.startsWith('__unset__') ? '' : currentProject.path);
 
-  // Get Claude session ID for Timeline
+  // Get session IDs for Timeline
   const claudeSessionId = activeTab?.claudeSessionId || null;
+  const geminiSessionId = activeTab?.geminiSessionId || null;
 
-  // Show Timeline when tab has Claude session (commandType='claude' and sessionId exists)
-  // Timeline stays visible even when Claude is not running (dimmed background)
-  const showTimeline = !filePreview && claudeSessionId && activeTab?.commandType === 'claude';
+  // Show Timeline when tab has Claude or Gemini session
+  // Timeline stays visible even when AI is not running (dimmed background)
+  const showTimeline = !filePreview && (
+    (claudeSessionId && activeTab?.commandType === 'claude') ||
+    (geminiSessionId && activeTab?.commandType === 'gemini')
+  );
+  const timelineSessionId = activeTab?.commandType === 'gemini' ? geminiSessionId : claudeSessionId;
+  const timelineToolType = (activeTab?.commandType === 'gemini' ? 'gemini' : 'claude') as 'claude' | 'gemini';
 
   // DEBUG: Uncomment to debug Timeline visibility
   // console.log('[Timeline Debug] showTimeline:', showTimeline, 'claudeSessionId:', claudeSessionId, 'commandType:', activeTab?.commandType, 'isRunning:', isCommandRunning);
@@ -420,10 +426,11 @@ export default function Workspace() {
           {showTimeline && (
             <Timeline
               tabId={activeTab.id}
-              sessionId={claudeSessionId}
+              sessionId={timelineSessionId}
               cwd={activeTab.cwd || currentProject.path}
               isActive={isCommandRunning}
               isVisible={workspaceView === 'workspace' && currentView === 'terminal'}
+              toolType={timelineToolType}
             />
           )}
         </div>

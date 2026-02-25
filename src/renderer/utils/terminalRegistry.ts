@@ -171,7 +171,8 @@ export const terminalRegistry = {
     const prefix = line.translateToString(true).slice(0, selection.start.x);
     
     // 1. Strict prompt check (same as Timeline)
-    const hasPrompt = prefix.includes('\u276F') || prefix.includes('\u23F5') || prefix.includes('>');
+    // Only ❯ (U+276F) and ⏵ (U+23F5) — NOT '>' which matches markdown blockquotes
+    const hasPrompt = prefix.includes('\u276F') || prefix.includes('\u23F5');
     // 2. Relaxed check (whitespace, bullets)
     const isValidIndent = /^[\s*·\-\.]*$/.test(prefix);
     

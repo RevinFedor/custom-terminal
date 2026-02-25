@@ -13,6 +13,7 @@ const srcMainDir = path.join(__dirname, '..', '..', 'src', 'main');
 const projectManager = require(path.join(srcMainDir, 'project-manager'));
 const SessionManager = require(path.join(srcMainDir, 'session-manager'));
 const ClaudeManager = require(path.join(srcMainDir, 'claude-manager'));
+const { resolveGeminiProjectDir, findGeminiSessionFile, invalidateProjectsJsonCache } = require(path.join(srcMainDir, 'gemini-utils'));
 
 const isDev = !app.isPackaged;
 
@@ -2627,13 +2628,28 @@ ipcMain.on('gemini:spawn-with-watcher', (event, { tabId, cwd }) => {
     geminiWatchers.delete(tabId);
   }
 
-  // Calculate SHA256 hash of the cwd (this is how Gemini organizes projects)
+  // Resolve project directory: slug (v0.30+) → hash (legacy) fallback
   const normalizedCwd = path.resolve(cwd || os.homedir());
-  const dirHash = crypto.createHash('sha256').update(normalizedCwd).digest('hex');
-  const chatsDir = path.join(os.homedir(), '.gemini', 'tmp', dirHash, 'chats');
+  invalidateProjectsJsonCache(); // Fresh read — Gemini may have just created the mapping
+  let resolved = resolveGeminiProjectDir(normalizedCwd);
+  let chatsDir = resolved ? resolved.chatsDir : null;
+
+  // If no existing dir found, predict slug-based path (Gemini 0.30+ will create it on first message)
+  if (!chatsDir) {
+    const { getGeminiProjectsJson, calculateGeminiHash } = require(path.join(srcMainDir, 'gemini-utils'));
+    const pj = getGeminiProjectsJson();
+    const slug = pj?.projects?.[normalizedCwd];
+    if (slug) {
+      chatsDir = path.join(os.homedir(), '.gemini', 'tmp', slug, 'chats');
+    } else {
+      // Hash fallback for projects not yet in projects.json
+      const dirHash = calculateGeminiHash(normalizedCwd);
+      chatsDir = path.join(os.homedir(), '.gemini', 'tmp', dirHash, 'chats');
+    }
+  }
 
   console.log('[Gemini Sniper] Normalized CWD:', normalizedCwd);
-  console.log('[Gemini Sniper] Dir hash:', dirHash);
+  console.log('[Gemini Sniper] Resolved method:', resolved ? resolved.method : 'predicted');
   console.log('[Gemini Sniper] Watching directory:', chatsDir);
 
   // List existing files in chats dir for debugging
@@ -2714,6 +2730,47 @@ ipcMain.on('gemini:spawn-with-watcher', (event, { tabId, cwd }) => {
     geminiWatchers.set(tabId, watcher);
     console.log('[Gemini Sniper] fs.watch active (will wait for first Gemini message)');
 
+    // 2s re-check: Gemini may create slug mapping after start — switch watcher if needed
+    if (!resolved) {
+      setTimeout(() => {
+        if (sessionFound || !geminiWatchers.has(tabId)) return;
+        invalidateProjectsJsonCache();
+        const newResolved = resolveGeminiProjectDir(normalizedCwd);
+        if (newResolved && newResolved.chatsDir !== chatsDir) {
+          console.log('[Gemini Sniper] Re-check: slug dir appeared, switching watcher →', newResolved.chatsDir);
+          closeWatcher();
+          chatsDir = newResolved.chatsDir;
+          // Re-create watcher on new dir (recursive re-entry via IPC)
+          event.sender.send('gemini:watcher-redirect', { tabId, newChatsDir: chatsDir });
+          // Note: the watcher restart is handled by re-setting up fs.watch below
+          if (!fs.existsSync(chatsDir)) fs.mkdirSync(chatsDir, { recursive: true });
+          watcher = fs.watch(chatsDir, (eventType, filename) => {
+            if (sessionFound) return;
+            if (!filename || !filename.startsWith('session-') || !filename.endsWith('.json')) return;
+            const filePath = path.join(chatsDir, filename);
+            fs.stat(filePath, (err, stats) => {
+              if (err || sessionFound) return;
+              const fileTime = stats.birthtimeMs || stats.mtimeMs;
+              if (fileTime >= startTime - 500) {
+                sessionFound = true;
+                try {
+                  const content = fs.readFileSync(filePath, 'utf-8');
+                  const data = JSON.parse(content);
+                  console.log('[Gemini Sniper] ✅ SUCCESS (re-check)! Session:', data.sessionId);
+                  event.sender.send('gemini:session-detected', { tabId, sessionId: data.sessionId });
+                } catch (parseErr) {
+                  const match = filename.match(/session-.*-([a-f0-9]{8})\.json$/i);
+                  if (match) event.sender.send('gemini:session-detected', { tabId, sessionId: match[1] });
+                }
+                closeWatcher();
+              }
+            });
+          });
+          geminiWatchers.set(tabId, watcher);
+        }
+      }, 2000);
+    }
+
     // Safety timeout: 5 minutes (user might take a while to send first message)
     setTimeout(() => {
       if (!sessionFound && geminiWatchers.has(tabId)) {
@@ -2783,48 +2840,26 @@ ipcMain.on('gemini:run-command', (event, { tabId, command, sessionId, cwd }) => 
       console.log('[Gemini Fork] Source sessionId:', sessionId);
 
       try {
-        // Calculate hash for chats directory
-        const normalizedCwd = path.resolve(termCwd || os.homedir());
-        const dirHash = crypto.createHash('sha256').update(normalizedCwd).digest('hex');
-        const chatsDir = path.join(os.homedir(), '.gemini', 'tmp', dirHash, 'chats');
-
-        console.log('[Gemini Fork] CWD:', normalizedCwd);
-        console.log('[Gemini Fork] Chats dir:', chatsDir);
-
-        if (!fs.existsSync(chatsDir)) {
+        // Resolve project directory: slug (v0.30+) → hash (legacy) fallback
+        const resolved = resolveGeminiProjectDir(termCwd || os.homedir());
+        if (!resolved) {
           console.error('[Gemini Fork] Chats directory not found');
           term.write(`echo "❌ Gemini chats directory not found"\r`);
           return;
         }
+        const chatsDir = resolved.chatsDir;
+        console.log('[Gemini Fork] Chats dir:', chatsDir, '(method:', resolved.method + ')');
 
-        // Find source session file by reading each JSON and matching sessionId
-        const files = fs.readdirSync(chatsDir).filter(f => f.startsWith('session-') && f.endsWith('.json'));
-        console.log('[Gemini Fork] Found', files.length, 'session files');
-
-        let sourceFile = null;
-        let sourceData = null;
-
-        for (const file of files) {
-          try {
-            const filePath = path.join(chatsDir, file);
-            const content = fs.readFileSync(filePath, 'utf-8');
-            const data = JSON.parse(content);
-            if (data.sessionId === sessionId) {
-              sourceFile = filePath;
-              sourceData = data;
-              console.log('[Gemini Fork] ✓ Found source file:', file);
-              break;
-            }
-          } catch (e) {
-            // Ignore parse errors, continue searching
-          }
-        }
-
-        if (!sourceFile || !sourceData) {
+        // Find source session file
+        const found = findGeminiSessionFile(sessionId, chatsDir);
+        if (!found) {
           console.error('[Gemini Fork] Source session not found:', sessionId);
           term.write(`echo "❌ Session not found: ${sessionId}"\r`);
           return;
         }
+        const sourceFile = found.filePath;
+        const sourceData = found.data;
+        console.log('[Gemini Fork] ✓ Found source file:', path.basename(sourceFile));
 
         // Generate new UUID and timestamp
         const newUUID = crypto.randomUUID();
@@ -2897,10 +2932,17 @@ function getGeminiTurnInfo(sessionData) {
     const msg = sessionData.messages[i];
     if (msg.type === 'user') {
       turnIndex++;
+      // Normalize content: string || [{text}] → string
+      let contentStr = '';
+      if (typeof msg.content === 'string') {
+        contentStr = msg.content;
+      } else if (Array.isArray(msg.content)) {
+        contentStr = msg.content.filter(p => p.text).map(p => p.text).join('\n');
+      }
       turns.push({
         turnNumber: turnIndex,
         messageIndex: i,
-        preview: msg.content.slice(0, 100).replace(/\n/g, ' '),
+        preview: contentStr.slice(0, 100).replace(/\n/g, ' '),
         timestamp: msg.timestamp
       });
     }
@@ -2939,34 +2981,18 @@ ipcMain.on('gemini:start-history-watcher', (event, { sessionId, cwd }) => {
     geminiHistoryWatchers.delete(sessionId);
   }
 
-  // Find the session file
-  const normalizedCwd = path.resolve(cwd || os.homedir());
-  const dirHash = crypto.createHash('sha256').update(normalizedCwd).digest('hex');
-  const chatsDir = path.join(os.homedir(), '.gemini', 'tmp', dirHash, 'chats');
-
-  // Find file by sessionId
-  let sessionFilePath = null;
-  try {
-    const files = fs.readdirSync(chatsDir).filter(f => f.startsWith('session-') && f.endsWith('.json'));
-    for (const file of files) {
-      const filePath = path.join(chatsDir, file);
-      const content = fs.readFileSync(filePath, 'utf-8');
-      const data = JSON.parse(content);
-      if (data.sessionId === sessionId) {
-        sessionFilePath = filePath;
-        break;
-      }
-    }
-  } catch (e) {
-    console.error('[Gemini TimeMachine] Error finding session file:', e.message);
+  // Find the session file via slug/hash resolver
+  const resolved = resolveGeminiProjectDir(cwd);
+  if (!resolved) {
+    console.error('[Gemini TimeMachine] Project dir not found for:', cwd);
     return;
   }
-
-  if (!sessionFilePath) {
+  const found = findGeminiSessionFile(sessionId, resolved.chatsDir);
+  if (!found) {
     console.error('[Gemini TimeMachine] Session file not found:', sessionId);
     return;
   }
-
+  const sessionFilePath = found.filePath;
   console.log('[Gemini TimeMachine] Watching file:', sessionFilePath);
 
   // Read initial state
@@ -3069,30 +3095,16 @@ ipcMain.handle('gemini:rollback', async (event, { sessionId, turnNumber, cwd, ta
     return { success: false, error: 'Snapshot not found' };
   }
 
-  // Find the original session file
-  const normalizedCwd = path.resolve(cwd || os.homedir());
-  const dirHash = crypto.createHash('sha256').update(normalizedCwd).digest('hex');
-  const chatsDir = path.join(os.homedir(), '.gemini', 'tmp', dirHash, 'chats');
-
-  let originalFilePath = null;
-  try {
-    const files = fs.readdirSync(chatsDir).filter(f => f.startsWith('session-') && f.endsWith('.json'));
-    for (const file of files) {
-      const filePath = path.join(chatsDir, file);
-      const content = fs.readFileSync(filePath, 'utf-8');
-      const data = JSON.parse(content);
-      if (data.sessionId === sessionId) {
-        originalFilePath = filePath;
-        break;
-      }
-    }
-  } catch (e) {
-    return { success: false, error: 'Could not find original session file' };
+  // Find the original session file via slug/hash resolver
+  const resolved = resolveGeminiProjectDir(cwd);
+  if (!resolved) {
+    return { success: false, error: 'Gemini project directory not found' };
   }
-
-  if (!originalFilePath) {
+  const found = findGeminiSessionFile(sessionId, resolved.chatsDir);
+  if (!found) {
     return { success: false, error: 'Original session file not found' };
   }
+  const originalFilePath = found.filePath;
 
   // Stop the history watcher temporarily
   if (geminiHistoryWatchers.has(sessionId)) {
@@ -3143,6 +3155,72 @@ ipcMain.handle('gemini:rollback', async (event, { sessionId, turnNumber, cwd, ta
   }
 
   return { success: true, sessionId, cwd };
+});
+
+// ========== GEMINI TIMELINE ==========
+
+ipcMain.handle('gemini:get-timeline', async (event, { sessionId, cwd }) => {
+  console.log('[Gemini Timeline] Getting timeline for session:', sessionId, 'cwd:', cwd);
+
+  if (!sessionId || !cwd) {
+    return { success: false, entries: [], sessionBoundaries: [], latestSessionId: null };
+  }
+
+  try {
+    const resolved = resolveGeminiProjectDir(cwd);
+    if (!resolved) {
+      console.log('[Gemini Timeline] Project dir not found');
+      return { success: false, entries: [], sessionBoundaries: [], latestSessionId: null };
+    }
+
+    const found = findGeminiSessionFile(sessionId, resolved.chatsDir);
+    if (!found) {
+      console.log('[Gemini Timeline] Session file not found:', sessionId);
+      return { success: false, entries: [], sessionBoundaries: [], latestSessionId: null };
+    }
+
+    const { data } = found;
+    const entries = [];
+
+    if (data.messages && Array.isArray(data.messages)) {
+      for (const msg of data.messages) {
+        if (msg.type !== 'user') continue;
+
+        // Normalize content: string || [{text}] || [{type:'text', text}] → string
+        let content = '';
+        if (typeof msg.content === 'string') {
+          content = msg.content;
+        } else if (Array.isArray(msg.content)) {
+          // Gemini format: [{text: "..."}] or [{type: 'text', text: "..."}]
+          const textParts = msg.content
+            .filter(p => p.text)
+            .map(p => p.text);
+          content = textParts.join('\n') || JSON.stringify(msg.content);
+        } else if (msg.content) {
+          content = String(msg.content);
+        }
+
+        entries.push({
+          uuid: msg.id || crypto.randomUUID(),
+          type: 'user',
+          timestamp: msg.timestamp || data.startTime || new Date().toISOString(),
+          content,
+          sessionId
+        });
+      }
+    }
+
+    console.log('[Gemini Timeline] Returning', entries.length, 'entries');
+    return {
+      success: true,
+      entries,
+      sessionBoundaries: [],
+      latestSessionId: null
+    };
+  } catch (error) {
+    console.error('[Gemini Timeline] Error:', error);
+    return { success: false, entries: [], sessionBoundaries: [], latestSessionId: null };
+  }
 });
 
 // ========== SESSION CHAIN HELPERS ==========
