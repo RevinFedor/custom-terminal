@@ -34,13 +34,12 @@ interface InfoPanelProps {
   project?: Project;
 }
 
-type AIMode = 'claude' | 'gemini';
 
 export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
   const [claudeSessionId, setClaudeSessionId] = useState<string | null>(null);
   const [geminiSessionId, setGeminiSessionId] = useState<string | null>(null);
   const [activeCommandType, setActiveCommandType] = useState<string | null>(null);
-  const [aiMode, setAiMode] = useState<AIMode>('claude');
+  // aiMode removed — start buttons now show both claude & gemini inline
   const [showTooltip, setShowTooltip] = useState(false);
   const [historyTurns, setHistoryTurns] = useState<HistoryTurn[]>([]);
   const [historyExpanded, setHistoryExpanded] = useState(false);
@@ -338,14 +337,9 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                 {currentSessionType === 'claude' ? 'Claude' : 'Gemini'}
               </span>
               {hasAnySession && activeTabId && !isCommandRunning && (
-                <button
-                  className="text-[10px] px-2 py-0.5 rounded cursor-pointer"
-                  style={{
-                    backgroundColor: currentSessionType === 'claude' ? 'rgba(218,119,86,0.15)' : 'rgba(78,134,248,0.15)',
-                    color: currentSessionType === 'claude' ? '#DA7756' : '#4E86F8',
-                  }}
-                  onMouseEnter={(e) => { e.currentTarget.style.backgroundColor = currentSessionType === 'claude' ? 'rgba(218,119,86,0.25)' : 'rgba(78,134,248,0.25)'; }}
-                  onMouseLeave={(e) => { e.currentTarget.style.backgroundColor = currentSessionType === 'claude' ? 'rgba(218,119,86,0.15)' : 'rgba(78,134,248,0.15)'; }}
+                <code
+                  className="text-xs cursor-pointer hover:underline px-1.5 py-0.5 bg-[#1a1a1a] rounded"
+                  style={{ color: currentSessionType === 'claude' ? '#DA7756' : '#4E86F8' }}
                   onClick={() => {
                     if (activeTabId && currentSessionType === 'claude') {
                       setTabCommandType(activeTabId, 'claude');
@@ -356,9 +350,7 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                     }
                   }}
                   title={currentSessionType === 'claude' ? 'Продолжить (claude --resume)' : 'Продолжить (gemini --resume)'}
-                >
-                  Продолжить
-                </button>
+                >Продолжить</code>
               )}
               <div className="flex-1" />
               {activeTabId && (
@@ -566,57 +558,48 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
               )}
             </div>
           </div>
-          {hasAnySession ? (
+          {hasAnySession && (
             <span className="text-[9px] font-medium px-2 h-4 rounded-full flex items-center" style={{ backgroundColor: currentSessionType === 'claude' ? '#DA7756' : '#4E86F8', color: 'white' }}>{currentSessionType === 'claude' ? 'Claude' : 'Gemini'}</span>
-          ) : (
-            <div className="flex items-center h-4 bg-[#1a1a1a] rounded-full p-0.5">
-              <button onClick={() => setAiMode('claude')} className={`px-2 h-3 rounded-full text-[9px] font-medium leading-none flex items-center ${aiMode === 'claude' ? 'bg-[#DA7756] text-white' : 'text-[#666] hover:text-[#999]'}`}>Claude</button>
-              <button onClick={() => setAiMode('gemini')} className={`px-2 h-3 rounded-full text-[9px] font-medium leading-none flex items-center ${aiMode === 'gemini' ? 'bg-[#4E86F8] text-white' : 'text-[#666] hover:text-[#999]'}`}>Gemini</button>
-            </div>
           )}
         </div>
 
         <div className="space-y-2">
-          {(hasAnySession ? currentSessionType === 'claude' : aiMode === 'claude') ? (
-            <>
-              {!hasAnySession && (
-                <div className="rounded p-2 bg-[#2d2d2d]">
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-1">
-                      <button onClick={() => { setClaudeExpanded(!claudeExpanded); if (!claudeExpanded) setTimeout(() => claudeTextareaRef.current?.focus(), 50); }} className="p-0.5 rounded text-[#666] hover:text-[#DA7756] hover:bg-[#333]">{claudeExpanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}</button>
-                      <code className="text-xs hover:underline cursor-pointer" style={{ color: '#DA7756' }} onClick={() => { if (!activeTabId) { showToast('Нет активного таба', 'error'); return; } const effectiveDefault = claudeDefaultPromptEnabled ? claudeDefaultPrompt : ''; const finalPrompt = [effectiveDefault, claudeExtraPrompt].filter(Boolean).join('\n\n'); setTabCommandType(activeTabId, 'claude'); ipcRenderer.send('claude:run-command', { tabId: activeTabId, command: 'claude', prompt: finalPrompt || undefined }); setClaudeExpanded(false); setClaudeExtraPrompt(''); }}>claude</code>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      {claudeDefaultPrompt && claudeDefaultPromptEnabled && (
-                        <div className="relative group">
-                          <span className="text-[9px] px-1.5 py-0.5 bg-[#DA7756]/20 text-[#DA7756] rounded cursor-default">Default</span>
-                          <div className="absolute right-0 top-full mt-1 z-50 hidden group-hover:block"><div className="p-2 bg-[#1a1a1a] border border-[#444] rounded shadow-lg max-w-[200px] text-[10px] text-[#888] font-mono whitespace-pre-wrap">{claudeDefaultPrompt}</div></div>
-                        </div>
-                      )}
-                      <span className="text-[10px] text-green-400">готово</span>
-                    </div>
+          {!hasAnySession && (
+            <div className="rounded p-2 bg-[#2d2d2d]">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-1">
+                  <button onClick={() => { setClaudeExpanded(!claudeExpanded); if (!claudeExpanded) setTimeout(() => claudeTextareaRef.current?.focus(), 50); }} className="p-0.5 rounded text-[#666] hover:text-[#DA7756] hover:bg-[#333]">{claudeExpanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}</button>
+                  <div className="flex">
+                    <code
+                      className="text-xs cursor-pointer hover:underline px-1.5 py-0.5 bg-[#1a1a1a] rounded-l"
+                      style={{ color: '#DA7756' }}
+                      onClick={() => { if (!activeTabId) { showToast('Нет активного таба', 'error'); return; } const effectiveDefault = claudeDefaultPromptEnabled ? claudeDefaultPrompt : ''; const finalPrompt = [effectiveDefault, claudeExtraPrompt].filter(Boolean).join('\n\n'); setTabCommandType(activeTabId, 'claude'); ipcRenderer.send('claude:run-command', { tabId: activeTabId, command: 'claude', prompt: finalPrompt || undefined }); setClaudeExpanded(false); setClaudeExtraPrompt(''); }}
+                    >claude</code>
+                    <code
+                      className="text-xs cursor-pointer hover:underline px-1.5 py-0.5 bg-[#1a1a1a] rounded-r border-l border-[#333]"
+                      style={{ color: '#4E86F8' }}
+                      onClick={() => { if (!activeTabId) { showToast('Нет активного таба', 'error'); return; } setTabCommandType(activeTabId, 'gemini'); ipcRenderer.send('gemini:spawn-with-watcher', { tabId: activeTabId, cwd: getCurrentCwd() }); }}
+                      title="Новая Gemini сессия"
+                    >gemini</code>
                   </div>
-                  <p className="text-[10px] text-[#666] mt-1">{claudeDefaultPrompt && claudeDefaultPromptEnabled ? 'С промптом' : 'Новая сессия'}</p>
-                  {claudeExpanded && (
-                    <div className="mt-2 pt-2 border-t border-[#333]">
-                      <textarea ref={claudeTextareaRef} value={claudeExtraPrompt} onChange={(e) => setClaudeExtraPrompt(e.target.value)} placeholder="Дополнительный текст..." className="w-full min-h-[40px] p-2 bg-[#1a1a1a] border border-[#333] rounded text-[11px] text-[#888] font-mono resize-none focus:outline-none focus:border-[#DA7756] placeholder:text-[#555]" onKeyDown={(e) => { if (e.key === 'Enter' && e.metaKey) { e.preventDefault(); if (!activeTabId) return; const effectiveDefault = claudeDefaultPromptEnabled ? claudeDefaultPrompt : ''; const finalPrompt = [effectiveDefault, claudeExtraPrompt].filter(Boolean).join('\n\n'); setTabCommandType(activeTabId, 'claude'); ipcRenderer.send('claude:run-command', { tabId: activeTabId, command: 'claude', prompt: finalPrompt || undefined }); setClaudeExpanded(false); setClaudeExtraPrompt(''); } }} />
+                </div>
+                <div className="flex items-center gap-2">
+                  {claudeDefaultPrompt && claudeDefaultPromptEnabled && (
+                    <div className="relative group">
+                      <span className="text-[9px] px-1.5 py-0.5 bg-[#DA7756]/20 text-[#DA7756] rounded cursor-default">Default</span>
+                      <div className="absolute right-0 top-full mt-1 z-50 hidden group-hover:block"><div className="p-2 bg-[#1a1a1a] border border-[#444] rounded shadow-lg max-w-[200px] text-[10px] text-[#888] font-mono whitespace-pre-wrap">{claudeDefaultPrompt}</div></div>
                     </div>
                   )}
+                  <span className="text-[10px] text-green-400">готово</span>
+                </div>
+              </div>
+              <p className="text-[10px] text-[#666] mt-1">{claudeDefaultPrompt && claudeDefaultPromptEnabled ? 'С промптом (Claude)' : 'Новая сессия'}</p>
+              {claudeExpanded && (
+                <div className="mt-2 pt-2 border-t border-[#333]">
+                  <textarea ref={claudeTextareaRef} value={claudeExtraPrompt} onChange={(e) => setClaudeExtraPrompt(e.target.value)} placeholder="Дополнительный текст (Claude)..." className="w-full min-h-[40px] p-2 bg-[#1a1a1a] border border-[#333] rounded text-[11px] text-[#888] font-mono resize-none focus:outline-none focus:border-[#DA7756] placeholder:text-[#555]" onKeyDown={(e) => { if (e.key === 'Enter' && e.metaKey) { e.preventDefault(); if (!activeTabId) return; const effectiveDefault = claudeDefaultPromptEnabled ? claudeDefaultPrompt : ''; const finalPrompt = [effectiveDefault, claudeExtraPrompt].filter(Boolean).join('\n\n'); setTabCommandType(activeTabId, 'claude'); ipcRenderer.send('claude:run-command', { tabId: activeTabId, command: 'claude', prompt: finalPrompt || undefined }); setClaudeExpanded(false); setClaudeExtraPrompt(''); } }} />
                 </div>
               )}
-            </>
-          ) : (
-            <>
-              {!hasAnySession && (
-                <div className="rounded p-2 bg-[#2d2d2d]">
-                  <div className="flex items-center justify-between">
-                    <code className="text-xs hover:underline cursor-pointer" style={{ color: '#4E86F8' }} onClick={() => { if (!activeTabId) { showToast('Нет активного таба', 'error'); return; } setTabCommandType(activeTabId, 'gemini'); ipcRenderer.send('gemini:spawn-with-watcher', { tabId: activeTabId, cwd: getCurrentCwd() }); }} title="Новая Gemini сессия">gemini</code>
-                    <span className="text-[10px] text-green-400">готово</span>
-                  </div>
-                  <p className="text-[10px] text-[#666] mt-1">Новая сессия</p>
-                </div>
-              )}
-            </>
+            </div>
           )}
 
           {!hasAnySession && (

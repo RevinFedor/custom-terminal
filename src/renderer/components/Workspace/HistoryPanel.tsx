@@ -342,12 +342,12 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
     }
   }, [sessionId, cwd, scrollToBottom, toolType]);
 
-  // Initial load on mount / session change
+  // Initial load on mount / session change / tool type switch
   useEffect(() => {
     setLoading(true);
     setEntries([]);
     loadHistory(false);
-  }, [sessionId]);
+  }, [sessionId, toolType]);
 
   // Incremental refresh every 3s
   useEffect(() => {
@@ -365,6 +365,7 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
     if (!historyScrollToUuid || loading || entries.length === 0) return;
     const el = scrollRef.current;
     if (!el) return;
+    let cancelled = false;
     const target = el.querySelector(`[data-uuid="${historyScrollToUuid}"]`) as HTMLElement | null;
     if (target) {
       const scrollWithOffset = () => {
@@ -378,16 +379,19 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
       // Retry after layout recalculation (contentVisibility: auto re-measures nearby elements)
       requestAnimationFrame(() => {
         requestAnimationFrame(() => {
+          if (cancelled) return;
           scrollWithOffset();
           // Flash highlight AFTER scroll has settled
           setTimeout(() => {
+            if (cancelled) return;
             setFlashUuid(historyScrollToUuid);
-            setTimeout(() => setFlashUuid(null), 500);
+            setTimeout(() => { if (!cancelled) setFlashUuid(null); }, 500);
           }, 80);
         });
       });
     }
     setHistoryScrollToUuid(null);
+    return () => { cancelled = true; };
   }, [historyScrollToUuid, loading, entries]);
 
   // Native scroll handler — at-bottom detection + scroll direction tracking
@@ -401,6 +405,10 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
     scrollDirectionRef.current = el.scrollTop >= lastScrollTopRef.current ? 'down' : 'up';
     lastScrollTopRef.current = el.scrollTop;
   }, []);
+
+  // Keep entries ref fresh for observer closure (avoids stale data if entries update with same length)
+  const entriesRef = useRef(entries);
+  entriesRef.current = entries;
 
   // Build mapping: assistant/non-user UUID → preceding user UUID
   // So when an assistant response is visible, the parent user dot stays highlighted in Timeline.
@@ -448,7 +456,7 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
         //   scrolling DOWN → keep last (bottom-most, the "next" turn)
         //   scrolling UP   → keep first (top-most, the "previous" turn)
         const directlyVisibleUsers: string[] = [];
-        for (const e of entries) {
+        for (const e of entriesRef.current) {
           if (e.role === 'user' && visibleSet.has(e.uuid)) {
             directlyVisibleUsers.push(e.uuid);
           }

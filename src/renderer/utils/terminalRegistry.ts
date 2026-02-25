@@ -433,5 +433,95 @@ export const terminalRegistry = {
       parts.push(line.translateToString(!nextLine?.isWrapped));
     }
     return parts.join('');
+  },
+
+  // Buffer-text based search + scroll. Used for Gemini where xterm search addon
+  // validation (❯/⏵ prompt markers) doesn't apply.
+  // Searches full buffer text for multi-line content patterns and scrolls to match.
+  // Returns true if found and scrolled.
+  scrollToTextInBuffer(tabId: string, contentLines: string[], occurrenceIndex: number): boolean {
+    const terminal = terminals.get(tabId);
+    if (!terminal) return false;
+
+    const buf = terminal.buffer.active;
+
+    // Build line-to-bufferRow mapping: logical line index → first buffer row
+    // (accounts for wrapped lines being part of the same logical line)
+    const logicalLines: { text: string; bufRow: number }[] = [];
+    let currentText = '';
+    let currentStartRow = 0;
+
+    for (let i = 0; i < buf.length; i++) {
+      const line = buf.getLine(i);
+      if (!line) continue;
+
+      if (i > 0 && !line.isWrapped) {
+        // New logical line — flush previous
+        logicalLines.push({ text: currentText, bufRow: currentStartRow });
+        currentText = '';
+        currentStartRow = i;
+      }
+      const nextLine = (i + 1 < buf.length) ? buf.getLine(i + 1) : null;
+      currentText += line.translateToString(!nextLine?.isWrapped);
+    }
+    // Flush last
+    if (currentText) {
+      logicalLines.push({ text: currentText, bufRow: currentStartRow });
+    }
+
+    if (logicalLines.length === 0 || contentLines.length === 0) return false;
+
+    // For short search strings (< 5 chars), use word-boundary matching
+    // to avoid matching "да" inside "документации"
+    function lineContains(haystack: string, needle: string): boolean {
+      if (needle.length >= 5) return haystack.includes(needle);
+      // Word-boundary: check chars before and after the match aren't word chars
+      let from = 0;
+      while (true) {
+        const pos = haystack.indexOf(needle, from);
+        if (pos === -1) return false;
+        const before = pos > 0 ? haystack[pos - 1] : ' ';
+        const after = pos + needle.length < haystack.length ? haystack[pos + needle.length] : ' ';
+        // Word boundary: space, punctuation, line start/end, or non-alpha
+        const boundaryRe = /[\s\.,;:!?\-—–()\[\]{}<>\/\\|"'`~@#$%^&*+=]/;
+        if ((pos === 0 || boundaryRe.test(before)) && (pos + needle.length === haystack.length || boundaryRe.test(after))) {
+          return true;
+        }
+        from = pos + 1;
+      }
+    }
+
+    // Search for multi-line match: all contentLines must match consecutive logical lines
+    const firstLine = contentLines[0];
+    let validCount = 0;
+
+    for (let i = 0; i <= logicalLines.length - contentLines.length; i++) {
+      // First content line must be found within this logical line
+      if (!lineContains(logicalLines[i].text, firstLine)) continue;
+
+      // Check remaining content lines match subsequent logical lines
+      let allMatch = true;
+      for (let j = 1; j < contentLines.length; j++) {
+        if (i + j >= logicalLines.length || !lineContains(logicalLines[i + j].text, contentLines[j])) {
+          allMatch = false;
+          break;
+        }
+      }
+
+      if (!allMatch) continue;
+
+      if (validCount === occurrenceIndex) {
+        // Found target — scroll to center
+        const targetRow = logicalLines[i].bufRow;
+        const centerRow = Math.max(0, targetRow - Math.floor(terminal.rows / 2));
+        terminal.scrollToLine(centerRow);
+        console.log('[terminalRegistry.scrollToTextInBuffer] Found at logicalLine:', i, 'bufRow:', targetRow, 'occurrence:', occurrenceIndex);
+        return true;
+      }
+      validCount++;
+    }
+
+    console.log('[terminalRegistry.scrollToTextInBuffer] NOT found. contentLines[0]:', JSON.stringify(firstLine), 'occurrence:', occurrenceIndex, 'validMatches:', validCount);
+    return false;
   }
 };
