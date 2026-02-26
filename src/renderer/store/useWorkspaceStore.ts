@@ -44,6 +44,8 @@ interface Tab {
   overlayDismissed?: boolean; // True if user dismissed the interrupted overlay (don't show again)
   notes?: string; // Tab-specific notes
   isCollapsed?: boolean; // Collapsed tab — icon-only, for archiving completed sessions
+  claudeAgentSessionId?: string; // Claude Agent SDK session ID (for @claude:...@end orchestration)
+  claudeAgentStatus?: 'idle' | 'running' | 'done' | 'error'; // Claude Agent current status
 }
 
 interface ProjectWorkspace {
@@ -129,6 +131,9 @@ interface WorkspaceStore {
   // Gemini session tracking
   setGeminiSessionId: (tabId: string, sessionId: string) => void;
   getGeminiSessionId: (tabId: string) => string | null;
+
+  // Claude Agent orchestration
+  setClaudeAgentStatus: (tabId: string, status: 'idle' | 'running' | 'done' | 'error', sessionId?: string) => void;
 
   // Tab notes
   setTabNotes: (tabId: string, notes: string) => void;
@@ -1240,6 +1245,19 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       }
     }
     return null;
+  },
+
+  // Claude Agent orchestration status
+  setClaudeAgentStatus: (tabId, status, sessionId) => {
+    const { openProjects } = get();
+    for (const [, workspace] of openProjects) {
+      const tab = workspace.tabs.get(tabId);
+      if (tab) {
+        tab.claudeAgentStatus = status;
+        if (sessionId) tab.claudeAgentSessionId = sessionId;
+        return;
+      }
+    }
   },
 
   // Tab notes

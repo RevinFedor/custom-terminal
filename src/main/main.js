@@ -14,6 +14,7 @@ const projectManager = require(path.join(srcMainDir, 'project-manager'));
 const SessionManager = require(path.join(srcMainDir, 'session-manager'));
 const ClaudeManager = require(path.join(srcMainDir, 'claude-manager'));
 const { resolveGeminiProjectDir, findGeminiSessionFile, invalidateProjectsJsonCache } = require(path.join(srcMainDir, 'gemini-utils'));
+const ClaudeAgentManager = require(path.join(srcMainDir, 'claude-agent'));
 
 const isDev = !app.isPackaged;
 
@@ -36,6 +37,8 @@ const claudeDebounceTimers = new Map(); // tabId -> debounce timer ID
 const claudeCtrlCDangerZone = new Map(); // tabId -> { resolve, promise, timer } (event-driven clear on prompt return)
 let sessionManager; // Initialized after projectManager is ready
 let claudeManager; // Initialized with terminals map
+const claudeAgentManager = new ClaudeAgentManager();
+const claudeAgentBuffer = new Map(); // tabId -> stripped text buffer for @claude:...@end detection
 
 // ========== SESSION BRIDGE (StatusLine-based session detection) ==========
 // Claude's statusLine feature calls ~/.claude/statusline-bridge.sh after every response,
@@ -1008,6 +1011,33 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
         }
       }
 
+      // ========== CLAUDE AGENT PATTERN DETECTOR (:::claude ... :::) ==========
+      // Runs on all tabs — pattern is unique enough to avoid false positives.
+      // Skip detection while Claude Agent is already running (prevents re-trigger from pasted response)
+      if (claudeAgentManager.getStatus(tabId) !== 'running') {
+        const AGENT_BUFFER_LIMIT = 50 * 1024; // 50KB
+        const sc = stripVTControlCharacters(data);
+        const prev = claudeAgentBuffer.get(tabId) || '';
+        let buf = prev + sc;
+        // Trim buffer from the front if too large
+        if (buf.length > AGENT_BUFFER_LIMIT) {
+          buf = buf.slice(buf.length - AGENT_BUFFER_LIMIT);
+        }
+
+        const agentMatch = buf.match(/:::claude\s+([\s\S]*?):::/i);
+        if (agentMatch) {
+          const prompt = agentMatch[1].trim();
+          // Clear the matched portion from buffer
+          buf = buf.slice(buf.indexOf(agentMatch[0]) + agentMatch[0].length);
+          claudeAgentBuffer.set(tabId, buf);
+          console.log('[ClaudeAgent:Detect] Tab ' + tabId + ': Pattern matched, prompt (' + prompt.length + ' chars): "' + prompt.substring(0, 80) + '..."');
+          handleClaudeAgentRequest(tabId, prompt);
+        } else {
+          claudeAgentBuffer.set(tabId, buf);
+        }
+      }
+      // ========== END CLAUDE AGENT PATTERN DETECTOR ==========
+
       // Send raw data to renderer - xterm.js handles OSC sequences itself
       if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.webContents.send('terminal:data', { pid: ptyProcess.pid, tabId, data });
@@ -1022,6 +1052,8 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
       terminals.delete(tabId);
       terminalProjects.delete(tabId);
       terminalCommandState.delete(tabId);
+      claudeAgentManager.cleanup(tabId);
+      claudeAgentBuffer.delete(tabId);
     });
 
     console.timeEnd(`[PERF:main] terminal:create ${tabId}`);
@@ -1749,7 +1781,126 @@ ipcMain.on('terminal:kill', (event, tabId) => {
     term.kill();
     terminals.delete(tabId);
   }
+  claudeAgentManager.cleanup(tabId);
+  claudeAgentBuffer.delete(tabId);
 });
+
+// ========== CLAUDE AGENT ORCHESTRATION ==========
+// Handles @claude:...@end pattern from Gemini PTY output.
+// Sends prompt to Claude via Agent SDK, pastes response back into Gemini.
+
+function formatAgentResponse(result, sessionId) {
+  const sid = sessionId ? sessionId.substring(0, 8) : 'unknown';
+  return '[Claude Agent Response | session: ' + sid + ']\n' + result + '\n[/Claude Agent Response]';
+}
+
+async function handleClaudeAgentRequest(tabId, prompt) {
+  const cwd = terminalProjects.get(tabId) || process.cwd();
+  const term = terminals.get(tabId);
+
+  console.log('[ClaudeAgent:Handle] Tab ' + tabId + ': Starting request (cwd=' + cwd + ')');
+
+  // Notify renderer: running
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('claude-agent:status', {
+      tabId,
+      status: 'running',
+      sessionId: claudeAgentManager.getSessionId(tabId),
+    });
+  }
+
+  try {
+    const result = await claudeAgentManager.send(tabId, prompt, {
+      cwd,
+      onStatus: (status) => {
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('claude-agent:status', {
+            tabId,
+            status,
+            sessionId: claudeAgentManager.getSessionId(tabId),
+          });
+        }
+      },
+    });
+
+    console.log('[ClaudeAgent:Handle] Tab ' + tabId + ': Done. Session=' + result.sessionId + ' Cost=$' + (result.costUsd || 0).toFixed(4) + ' Duration=' + (result.durationMs || 0) + 'ms Result=' + result.result.length + ' chars');
+
+    // Notify renderer: done
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('claude-agent:status', {
+        tabId,
+        status: 'done',
+        sessionId: result.sessionId,
+      });
+    }
+
+    // Paste response back into Gemini
+    if (term) {
+      const response = formatAgentResponse(result.result, result.sessionId);
+      await safePasteAndSubmit(term, response, {
+        submit: true,
+        fast: true, // Gemini mode
+        logPrefix: '[ClaudeAgent:Paste:' + tabId + ']',
+      });
+    }
+
+    // Clear buffer after paste to prevent re-trigger from echoed response
+    claudeAgentBuffer.delete(tabId);
+  } catch (err) {
+    console.error('[ClaudeAgent:Handle] Tab ' + tabId + ': Error:', err.message);
+
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('claude-agent:status', {
+        tabId,
+        status: 'error',
+        error: err.message,
+        sessionId: claudeAgentManager.getSessionId(tabId),
+      });
+    }
+
+    // Paste error message into Gemini so it knows what happened
+    if (term && err.message !== 'Cancelled') {
+      const errResponse = '[Claude Agent Error]\n' + err.message + '\n[/Claude Agent Error]';
+      await safePasteAndSubmit(term, errResponse, {
+        submit: true,
+        fast: true,
+        logPrefix: '[ClaudeAgent:ErrPaste:' + tabId + ']',
+      });
+    }
+  }
+}
+
+// IPC: Send prompt to Claude Agent manually (from UI)
+ipcMain.handle('claude-agent:send', async (event, { tabId, prompt, cwd }) => {
+  try {
+    const workDir = cwd || terminalProjects.get(tabId) || process.cwd();
+    const result = await claudeAgentManager.send(tabId, prompt, { cwd: workDir });
+    return { success: true, ...result };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+});
+
+// IPC: Cancel running Claude Agent request
+ipcMain.handle('claude-agent:cancel', async (event, { tabId }) => {
+  claudeAgentManager.cancel(tabId);
+  return { success: true };
+});
+
+// IPC: Get Claude Agent status for a tab
+ipcMain.handle('claude-agent:status', async (event, { tabId }) => {
+  return {
+    status: claudeAgentManager.getStatus(tabId),
+    sessionId: claudeAgentManager.getSessionId(tabId),
+  };
+});
+
+// IPC: Get Claude Agent session ID
+ipcMain.handle('claude-agent:get-session', async (event, { tabId }) => {
+  return { sessionId: claudeAgentManager.getSessionId(tabId) };
+});
+
+// ========== END CLAUDE AGENT ORCHESTRATION ==========
 
 // Helper: async exec with timeout
 const execAsync = (cmd, timeout = 1000) => {
