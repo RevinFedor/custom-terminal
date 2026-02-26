@@ -201,6 +201,34 @@ async function waitForGeminiSessionId(page, timeout = 30000) {
   }, { timeout })
 }
 
+/**
+ * Ждёт появления паттерна в mainProcessLogs (polling).
+ * mainProcessLogs — обычный массив, пополняется через stdout/stderr.
+ *
+ * @param {string[]} logs - массив mainProcessLogs из launch()
+ * @param {string|RegExp} pattern - строка или регулярка
+ * @param {number} timeout - максимальное ожидание (мс)
+ * @param {number} pollInterval - частота проверки (мс)
+ * @returns {Promise<string|null>} - первый совпавший лог или null при таймауте
+ */
+async function waitForMainProcessLog(logs, pattern, timeout = 30000, pollInterval = 300) {
+  const start = Date.now()
+  let lastChecked = 0
+
+  while (Date.now() - start < timeout) {
+    // Проверяем только новые записи с последней проверки
+    for (let i = lastChecked; i < logs.length; i++) {
+      const match = typeof pattern === 'string'
+        ? logs[i].includes(pattern)
+        : pattern.test(logs[i])
+      if (match) return logs[i]
+    }
+    lastChecked = logs.length
+    await new Promise(r => setTimeout(r, pollInterval))
+  }
+  return null
+}
+
 module.exports = {
   launch,
   waitForTerminal,
@@ -208,6 +236,7 @@ module.exports = {
   waitForTimeline,
   waitForClaudeSessionId,
   waitForGeminiSessionId,
+  waitForMainProcessLog,
   findInLogs,
   DEFAULT_OPTIONS
 }

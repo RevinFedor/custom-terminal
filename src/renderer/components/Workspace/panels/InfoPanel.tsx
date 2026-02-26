@@ -471,6 +471,8 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                 for (const [projectId, workspace] of state.openProjects) {
                   const tab = workspace.tabs.get(activeTabId);
                   if (tab) {
+                    const storeId = currentSessionType === 'claude' ? tab.claudeSessionId : tab.geminiSessionId;
+                    console.warn('[InfoPanel:Fork] activeTabId:', activeTabId, 'closureSessionId:', sessionId, 'storeSessionId:', storeId, 'match:', sessionId === storeId);
                     const currentCwd = tab.cwd || project?.path || '';
                     await state.createTabAfterCurrent(projectId, undefined, currentCwd, {
                       pendingAction: { type: currentSessionType === 'claude' ? 'claude-fork' : 'gemini-fork', sessionId: sessionId }
