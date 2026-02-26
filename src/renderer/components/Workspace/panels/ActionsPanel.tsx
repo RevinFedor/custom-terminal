@@ -386,44 +386,45 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
       const newTabId = await createTab(activeProjectId, tabName, workingDir, { color: 'gemini', isUtility: false });
       if (!newTabId) throw new Error('Failed to create tab');
       docsGeminiTabIdRef.current = newTabId;
+      useWorkspaceStore.getState().setTabCommandType(newTabId, 'gemini');
 
       if (cancelledRef.current) return;
 
-      // 4. Save session content to /tmp/ file (large data stays on disk, not pasted)
-      const saveResult = await ipcRenderer.invoke('docs:save-temp', { content, projectPath: workingDir });
-      if (!saveResult.success) throw new Error('Failed to save temp file: ' + saveResult.error);
-      console.warn('[UpdateDocs] Session data saved to: ' + saveResult.filePath + ' (' + content.length + ' chars)');
-
-      if (cancelledRef.current) return;
-
-      // 5. Build prompt text: system prompt + @filepath reference + additional
-      // Only the prompt (small) is typed; Gemini reads the big file via @path
-      const promptText = [
-        'Ниже промпт документации:\n',
+      // 4. Create pre-filled Gemini session with full content injected directly
+      // Bypasses @file truncation (~96KB) and read_file limit (5000 lines)
+      // Content goes into session JSON content[] (model sees full data), displayContent[] shows short summary in TUI
+      const prefilledResult = await ipcRenderer.invoke('gemini:create-prefilled-session', {
+        sessionContent: content,
         systemPrompt,
-        '\n@' + saveResult.filePath,
-        additionalPrompt.trim() ? '\n' + additionalPrompt.trim() : ''
-      ].filter(Boolean).join('\n');
+        additionalPrompt: additionalPrompt.trim() || '',
+        cwd: workingDir
+      });
+      if (!prefilledResult.success) throw new Error('Failed to create prefilled session: ' + prefilledResult.error);
+      console.warn('[UpdateDocs] Prefilled session created: ' + prefilledResult.sessionId + ' (' + prefilledResult.totalChars + ' chars)');
 
-      // 6. Start Gemini WITH watcher (writes 'gemini\r' to PTY + sets up fs.watch)
-      ipcRenderer.send('gemini:spawn-with-watcher', { tabId: newTabId, cwd: workingDir });
+      if (cancelledRef.current) return;
+
+      // 5. Start Gemini with resume (writes 'gemini -r <uuid>\r' to PTY)
+      // Session file already exists, so Gemini loads full context from JSON directly
+      ipcRenderer.send('gemini:spawn-with-watcher', { tabId: newTabId, cwd: workingDir, resumeSessionId: prefilledResult.sessionId });
 
       const geminiReady = await waitForGeminiReady(newTabId, 30000);
       if (cancelledRef.current) return;
       if (!geminiReady) throw new Error('Timeout waiting for Gemini to start');
 
+      // Gemini resumes with user message in context — send Enter to trigger response
       await new Promise(resolve => setTimeout(resolve, 500));
       if (cancelledRef.current) return;
 
-      console.warn('[UpdateDocs] Sending prompt to Gemini via paste: ' + promptText.length + ' chars');
+      console.warn('[UpdateDocs] Sending Enter to trigger Gemini response');
       await ipcRenderer.invoke('terminal:paste', {
         tabId: newTabId,
-        content: promptText,
+        content: 'Ответь на промпт выше.',
         submit: true
       });
 
       docsGeminiTabIdRef.current = null;
-      showToast('Gemini started with session context', 'success');
+      showToast('Gemini started with full context (' + Math.round(prefilledResult.totalChars / 1024) + 'KB)', 'success');
 
     } catch (error: any) {
       if (cancelledRef.current) return;

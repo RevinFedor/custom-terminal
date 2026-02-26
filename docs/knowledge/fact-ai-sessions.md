@@ -25,3 +25,4 @@ Noted Terminal обеспечивает глубокую интеграцию с
     - **Ownership:** Приложение автоматически определяет, какие процессы запущены внутри него (In-App), а какие во внешних терминалах (External) через PPID mapping.
     - **Batch Kill:** Возможность остановки любого процесса прямо из Dashboard.
 - **PendingAction Pattern:** Очередь команд, выполняемых сразу после готовности Shell в новом табе. См. CLAUDE.md.
+- **Orchestration (Gemini → Claude):** Автоматический перехват паттерна `:::claude ... :::` из вывода Gemini для запуска Claude Agent SDK. См. [`fact-claude-agent-orchestration.md`](fact-claude-agent-orchestration.md).

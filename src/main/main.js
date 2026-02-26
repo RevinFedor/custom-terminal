@@ -4,6 +4,7 @@ const pty = require('node-pty');
 const fs = require('fs');
 const os = require('os');
 const { stripVTControlCharacters } = require('node:util');
+const crypto = require('crypto');
 
 // Disable HTTP cache to ensure fresh code after updates
 app.commandLine.appendSwitch('disable-http-cache');
@@ -13,7 +14,7 @@ const srcMainDir = path.join(__dirname, '..', '..', 'src', 'main');
 const projectManager = require(path.join(srcMainDir, 'project-manager'));
 const SessionManager = require(path.join(srcMainDir, 'session-manager'));
 const ClaudeManager = require(path.join(srcMainDir, 'claude-manager'));
-const { resolveGeminiProjectDir, findGeminiSessionFile, invalidateProjectsJsonCache } = require(path.join(srcMainDir, 'gemini-utils'));
+const { resolveGeminiProjectDir, findGeminiSessionFile, invalidateProjectsJsonCache, getGeminiProjectsJson, calculateGeminiHash } = require(path.join(srcMainDir, 'gemini-utils'));
 const ClaudeAgentManager = require(path.join(srcMainDir, 'claude-agent'));
 
 const isDev = !app.isPackaged;
@@ -2720,6 +2721,108 @@ ipcMain.handle('docs:save-temp', async (event, { content, projectPath }) => {
   }
 });
 
+// Create a pre-filled Gemini session JSON with full content injected directly.
+// Bypasses @file truncation (~96KB) and read_file limit (5000 lines).
+// Content goes into content[] (sent to model), displayContent[] shows short summary in TUI.
+ipcMain.handle('gemini:create-prefilled-session', async (event, { sessionContent, systemPrompt, additionalPrompt, cwd }) => {
+  try {
+    // 1. Resolve Gemini project directory
+    invalidateProjectsJsonCache();
+    let resolved = resolveGeminiProjectDir(cwd);
+    if (!resolved) {
+      // Predict slug-based path
+      const pj = getGeminiProjectsJson();
+      const normalizedCwd = path.resolve(cwd);
+      const slug = pj?.projects?.[normalizedCwd];
+      let chatsDir;
+      if (slug) {
+        chatsDir = path.join(os.homedir(), '.gemini', 'tmp', slug, 'chats');
+      } else {
+        const dirHash = calculateGeminiHash(normalizedCwd);
+        chatsDir = path.join(os.homedir(), '.gemini', 'tmp', dirHash, 'chats');
+      }
+      if (!fs.existsSync(chatsDir)) fs.mkdirSync(chatsDir, { recursive: true });
+      resolved = { chatsDir, projectDir: path.dirname(chatsDir), method: 'predicted' };
+    }
+
+    // 2. Read all docs/knowledge/* files
+    const knowledgeDir = path.join(cwd, 'docs', 'knowledge');
+    let knowledgeParts = [];
+    let knowledgeTotalChars = 0;
+    if (fs.existsSync(knowledgeDir)) {
+      const files = fs.readdirSync(knowledgeDir).filter(f => f.endsWith('.md')).sort();
+      for (const file of files) {
+        try {
+          const content = fs.readFileSync(path.join(knowledgeDir, file), 'utf-8');
+          knowledgeParts.push('=== ' + file + ' ===\n' + content);
+          knowledgeTotalChars += content.length;
+        } catch (e) { /* skip unreadable files */ }
+      }
+    }
+    const knowledgeContent = knowledgeParts.join('\n\n');
+
+    // 3. Generate session IDs and timestamps
+    const sessionId = crypto.randomUUID();
+    const shortId = sessionId.slice(0, 8);
+    const now = new Date();
+    const timestamp = now.toISOString();
+    // Filename format: session-2026-02-26T07-27-66148ceb.json
+    const dateStr = timestamp.slice(0, 16).replace(/:/g, '-');
+    const projectHash = calculateGeminiHash(cwd);
+
+    // 4. Build prompt
+    const fullPrompt = [systemPrompt, additionalPrompt].filter(Boolean).join('\n');
+
+    // 5. Build content parts (what model sees - FULL content)
+    const contentParts = [{ text: fullPrompt }];
+    if (knowledgeContent) {
+      contentParts.push({ text: '\n--- Project Knowledge Base (' + knowledgeParts.length + ' files) ---\n' });
+      contentParts.push({ text: knowledgeContent });
+    }
+    if (sessionContent) {
+      contentParts.push({ text: '\n--- Session Export ---\n' });
+      contentParts.push({ text: sessionContent });
+    }
+
+    // 6. Build displayContent (what TUI shows - SHORT summary)
+    const sessionLines = sessionContent ? sessionContent.split('\n').length : 0;
+    const sessionKB = sessionContent ? Math.round(sessionContent.length / 1024) : 0;
+    const displayText = fullPrompt + '\n[📎 Context: ' + knowledgeParts.length + ' knowledge files (' + Math.round(knowledgeTotalChars / 1024) + 'KB) + session export (' + sessionLines + ' lines, ' + sessionKB + 'KB)]';
+
+    // 7. Create session JSON
+    const sessionData = {
+      sessionId,
+      projectHash,
+      startTime: timestamp,
+      lastUpdated: timestamp,
+      messages: [
+        {
+          id: crypto.randomUUID(),
+          timestamp,
+          type: 'user',
+          content: contentParts,
+          displayContent: [{ text: displayText }]
+        }
+      ]
+    };
+
+    // 8. Save to chats dir
+    const filename = 'session-' + dateStr + '-' + shortId + '.json';
+    const filePath = path.join(resolved.chatsDir, filename);
+    fs.writeFileSync(filePath, JSON.stringify(sessionData, null, 2), 'utf-8');
+
+    const totalChars = contentParts.reduce((sum, p) => sum + p.text.length, 0);
+    console.log('[Prefilled Session] Created:', filePath);
+    console.log('[Prefilled Session] SessionId:', sessionId);
+    console.log('[Prefilled Session] Content: ' + knowledgeParts.length + ' knowledge files + ' + sessionLines + ' session lines = ' + totalChars + ' chars total');
+
+    return { success: true, sessionId, filePath, totalChars };
+  } catch (error) {
+    console.error('[Prefilled Session] Error:', error);
+    return { success: false, error: error.message };
+  }
+});
+
 ipcMain.handle('docs:read-prompt-file', async (event, { filePath }) => {
   const fs = require('fs');
 
@@ -2945,8 +3048,6 @@ ipcMain.handle('session:validate-id', async (event, { input, mode, tabId }) => {
 
 // ========== CLAUDE INPUT INTERCEPTION ==========
 
-const crypto = require('crypto');
-
 // Claude launcher: start claude with handshake (session detected via Bridge watcher)
 ipcMain.on('claude:spawn-with-watcher', (event, { tabId, cwd }) => {
   console.log('[Claude Launch] Starting Claude for tab:', tabId);
@@ -2968,7 +3069,7 @@ const geminiWatchers = new Map();
 // Gemini Sniper Watcher: watch for new session file creation when gemini starts
 // IMPORTANT: Gemini creates session file only AFTER first user message, not at startup!
 // Session files are stored in ~/.gemini/tmp/<SHA256_HASH>/chats/session-<datetime>-<id>.json
-ipcMain.on('gemini:spawn-with-watcher', (event, { tabId, cwd }) => {
+ipcMain.on('gemini:spawn-with-watcher', (event, { tabId, cwd, resumeSessionId, bareResume }) => {
   console.log('[Gemini Sniper] ========================================');
   console.log('[Gemini Sniper] IPC received: gemini:spawn-with-watcher');
   console.log('[Gemini Sniper] TabId:', tabId);
@@ -3050,14 +3151,14 @@ ipcMain.on('gemini:spawn-with-watcher', (event, { tabId, cwd }) => {
       console.log('[Gemini Sniper] Session file event:', eventType, filename);
       const filePath = path.join(chatsDir, filename);
 
-      // Check if file is fresh (created after our start time)
+      // Check if file is fresh (created or modified after our start time)
       fs.stat(filePath, (err, stats) => {
         if (err || sessionFound) return;
 
-        const fileTime = stats.birthtimeMs || stats.mtimeMs;
+        const fileTime = Math.max(stats.mtimeMs, stats.birthtimeMs || 0);
         if (fileTime >= startTime - 500) {
           sessionFound = true;
-          console.log('[Gemini Sniper] Fresh session file detected!');
+          console.log('[Gemini Sniper] Fresh/modified session file detected!');
 
           // Read the file to get the full sessionId
           try {
@@ -3104,7 +3205,7 @@ ipcMain.on('gemini:spawn-with-watcher', (event, { tabId, cwd }) => {
             const filePath = path.join(chatsDir, filename);
             fs.stat(filePath, (err, stats) => {
               if (err || sessionFound) return;
-              const fileTime = stats.birthtimeMs || stats.mtimeMs;
+              const fileTime = Math.max(stats.mtimeMs, stats.birthtimeMs || 0);
               if (fileTime >= startTime - 500) {
                 sessionFound = true;
                 try {
@@ -3137,11 +3238,42 @@ ipcMain.on('gemini:spawn-with-watcher', (event, { tabId, cwd }) => {
     console.error('[Gemini Sniper] ❌ Error setting up watcher:', e.message);
   }
 
-  // Let the command through - write 'gemini' to PTY
+  // Let the command through - write 'gemini' (or 'gemini -r <id>') to PTY
   const term = terminals.get(tabId);
   if (term) {
-    console.log('[Gemini Sniper] Writing "gemini" to terminal');
-    term.write('gemini\r');
+    if (resumeSessionId) {
+      console.log('[Gemini Sniper] Writing "gemini -r ' + resumeSessionId + '" to terminal');
+      term.write('gemini -r ' + resumeSessionId + '\r');
+      // For prefilled sessions, emit session-detected immediately (file already exists)
+      sessionFound = true;
+      event.sender.send('gemini:session-detected', { tabId, sessionId: resumeSessionId });
+      closeWatcher();
+    } else if (bareResume) {
+      console.log('[Gemini Sniper] Writing "gemini -r" to terminal (bare resume)');
+      term.write('gemini -r\r');
+      // Bare "gemini -r" resumes latest session — find it by mtime (no new file created)
+      closeWatcher(); // Don't need fs.watch, file already exists
+      sessionFound = true;
+      try {
+        const chatFiles = fs.readdirSync(chatsDir)
+          .filter(f => f.startsWith('session-') && f.endsWith('.json'))
+          .map(f => ({ name: f, mtime: fs.statSync(path.join(chatsDir, f)).mtimeMs }))
+          .sort((a, b) => b.mtime - a.mtime);
+        if (chatFiles.length > 0) {
+          const latestFile = path.join(chatsDir, chatFiles[0].name);
+          const data = JSON.parse(fs.readFileSync(latestFile, 'utf-8'));
+          console.log('[Gemini Sniper] ✅ Bare resume → latest session:', data.sessionId, '(' + chatFiles[0].name + ')');
+          event.sender.send('gemini:session-detected', { tabId, sessionId: data.sessionId });
+        } else {
+          console.log('[Gemini Sniper] ⚠️ No session files found for bare resume');
+        }
+      } catch (e) {
+        console.error('[Gemini Sniper] ❌ Error finding latest session:', e.message);
+      }
+    } else {
+      console.log('[Gemini Sniper] Writing "gemini" to terminal');
+      term.write('gemini\r');
+    }
   } else {
     console.log('[Gemini Sniper] ❌ Terminal not found for tabId:', tabId);
   }
@@ -3833,18 +3965,20 @@ ipcMain.handle('gemini:get-timeline', async (event, { sessionId, cwd }) => {
         const msg = data.messages[i];
         if (msg.type !== 'user') continue;
 
+        // Prefer displayContent (short summary for prefilled sessions) over full content
+        const source = (Array.isArray(msg.displayContent) && msg.displayContent.length > 0) ? msg.displayContent : msg.content;
+
         // Normalize content: string || [{text}] || [{type:'text', text}] → string
         let content = '';
-        if (typeof msg.content === 'string') {
-          content = msg.content;
-        } else if (Array.isArray(msg.content)) {
-          // Gemini format: [{text: "..."}] or [{type: 'text', text: "..."}]
-          const textParts = msg.content
+        if (typeof source === 'string') {
+          content = source;
+        } else if (Array.isArray(source)) {
+          const textParts = source
             .filter(p => p.text)
             .map(p => p.text);
-          content = textParts.join('\n') || JSON.stringify(msg.content);
-        } else if (msg.content) {
-          content = String(msg.content);
+          content = textParts.join('\n') || JSON.stringify(source);
+        } else if (source) {
+          content = String(source);
         }
 
         entries.push({
