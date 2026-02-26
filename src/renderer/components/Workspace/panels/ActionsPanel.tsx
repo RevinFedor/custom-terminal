@@ -393,7 +393,7 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
       const promptText = [
         'Ниже промпт документации:\n',
         systemPrompt,
-        '\n' + saveResult.filePath,
+        '\n@' + saveResult.filePath,
         additionalPrompt.trim() ? '\n' + additionalPrompt.trim() : ''
       ].filter(Boolean).join('\n');
 
