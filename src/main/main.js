@@ -1112,8 +1112,10 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
           if (agentMatch) {
             const subcmd = (agentMatch[1] || '').toLowerCase(); // '', 'new', 'status', 'compact'
             const body = agentMatch[2].trim();
-            buf = buf.slice(buf.indexOf(agentMatch[0]) + agentMatch[0].length);
-            claudeAgentBuffer.set(tabId, buf);
+            // SYNCHRONOUS LOCK — must happen BEFORE async handler call.
+            // Without this, next onData event can slip through before handler sets cooldown.
+            claudeAgentBuffer.delete(tabId);
+            claudeAgentCooldown.set(tabId, Date.now() + 30000);
             console.log('[ClaudeAgent:Detect] Tab ' + tabId + ': Pattern matched, subcmd=' + (subcmd || 'send') + ', body (' + body.length + ' chars): "' + body.substring(0, 80) + '"');
             handleClaudeAgentCommand(tabId, subcmd, body);
           } else {
@@ -1122,20 +1124,6 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
         }
       }
       // ========== END CLAUDE AGENT PATTERN DETECTOR ==========
-
-      // ========== DEBUG: PTY data flow after Claude Agent paste ==========
-      // Logs every PTY chunk during cooldown period (= after our paste, when Gemini responds)
-      {
-        const cdUntil = claudeAgentCooldown.get(tabId) || 0;
-        const agentStatus = claudeAgentManager.getStatus(tabId);
-        if (cdUntil > 0 || agentStatus === 'running') {
-          const stripped = stripVTControlCharacters(data).substring(0, 120).replace(/\n/g, '\\n').replace(/\r/g, '\\r');
-          const now = Date.now();
-          const cdRemain = cdUntil > now ? (cdUntil - now) + 'ms' : 'expired';
-          console.log('[ClaudeAgent:PTY] Tab ' + tabId + ' | status=' + agentStatus + ' cd=' + cdRemain + ' | raw=' + data.length + 'B stripped="' + stripped + '"');
-        }
-      }
-      // ========== END DEBUG ==========
 
       // Send raw data to renderer - xterm.js handles OSC sequences itself
       if (mainWindow && !mainWindow.isDestroyed()) {
@@ -1154,6 +1142,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
       claudeAgentManager.cleanup(tabId);
       claudeAgentBuffer.delete(tabId);
       claudeAgentArmed.delete(tabId);
+      claudeAgentCooldown.delete(tabId);
     });
 
     console.timeEnd(`[PERF:main] terminal:create ${tabId}`);
@@ -1923,11 +1912,8 @@ function formatStatusResponse(meta) {
 }
 
 async function handleClaudeAgentCommand(tabId, subcmd, body) {
-  // SYNCHRONOUS LOCK: prevent re-entry from subsequent onData events
-  // (SDK import is async — without this, 10+ detections fire before status='running')
-  claudeAgentBuffer.delete(tabId);
-  claudeAgentCooldown.set(tabId, Date.now() + 30000); // 30s guard, refreshed on completion
-
+  // NOTE: Buffer clear + cooldown already set SYNCHRONOUSLY in detector (onData)
+  // before this async function is called. No race window possible.
   const cwd = terminalProjects.get(tabId) || process.cwd();
   const term = terminals.get(tabId);
 
