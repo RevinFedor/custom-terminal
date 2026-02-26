@@ -84,8 +84,16 @@ function getSearchLines(content: string): string[] {
   for (const line of rawLines) {
     const t = line.trim();
     if (!t) continue;
-    // Skip separators
-    if (t.length >= 3 && /^(.)\1+$/.test(t)) continue;
+    // Skip separators: lines of repeated chars (═══, ───, ---) including
+    // near-separators like "────────╯" where >80% is the same char
+    if (t.length >= 3) {
+      if (/^(.)\1+$/.test(t)) continue;
+      // Near-separator: count most frequent char
+      const freq = new Map<string, number>();
+      for (const ch of t) freq.set(ch, (freq.get(ch) || 0) + 1);
+      const maxFreq = Math.max(...freq.values());
+      if (maxFreq / t.length >= 0.8) continue;
+    }
     result.push(t.slice(0, 50));
     if (result.length >= 3) break;
   }
@@ -119,7 +127,7 @@ function geminiLineMatch(bufferLines: string[], needle: string, isStrictShort: b
       if (!nonAlphaRe.test(prefix)) return true;
     } else if (isIsolatedShort) {
       const trimmed = hay.trim();
-      if (trimmed.length > needle.length + 10) continue;
+      if (trimmed.length > needle.length + 25) continue;
       const pos = trimmed.indexOf(needle);
       if (pos < 0) continue;
       if (pos === 0) return true;
@@ -737,6 +745,14 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
         }
 
         found = terminalRegistry.scrollToTextInBuffer(tabId, searchLines, occurrenceIndex, startAfterRow);
+
+        // Fallback: if anchored search failed, retry without anchor.
+        // This handles cases where the previous entry's anchor was placed too far
+        // (e.g., separator patterns matching at wrong position in buffer).
+        if (!found && startAfterRow >= 0) {
+          console.warn('[Timeline] Anchored search failed (startAfterRow=' + startAfterRow + '), retrying without anchor...');
+          found = terminalRegistry.scrollToTextInBuffer(tabId, searchLines, occurrenceIndex, -1);
+        }
       } else {
         // Claude: try marker-based navigation first (deterministic), fall back to SearchAddon
         found = terminalRegistry.scrollToEntry(tabId, entry.uuid);

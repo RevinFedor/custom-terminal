@@ -577,8 +577,9 @@ export const terminalRegistry = {
         // not mid-sentence in AI text. Prefix before needle must be non-alphanumeric.
         // This prevents "continue" from matching AI lines like "OK, continue." or
         // "Sure, I'll continue working..." where the word is embedded in a sentence.
+        // Gemini TUI adds indentation/decorations, so allow generous prefix (+25 chars).
         const trimmed = haystack.trim();
-        if (trimmed.length > needle.length + 10) return false;
+        if (trimmed.length > needle.length + 25) return false;
         const pos = trimmed.indexOf(needle);
         if (pos < 0) return false;
         if (pos === 0) return true;
@@ -608,30 +609,48 @@ export const terminalRegistry = {
     const firstLine = contentLines[0];
     let validCount = 0;
 
-    for (let i = 0; i <= logicalLines.length - contentLines.length; i++) {
+    for (let i = 0; i < logicalLines.length; i++) {
       // Skip lines before startAfterRow (anchored search for ordered entries)
       if (startAfterRow >= 0 && logicalLines[i].bufRow <= startAfterRow) continue;
 
       // First content line must be found within this logical line
       if (!lineContains(logicalLines[i].text, firstLine)) continue;
 
-      // Check remaining content lines: scan forward, allowing up to 5 gap lines
-      // (empty lines, separators like "---", or other TUI formatting) between matches.
       let allMatch = true;
-      let bufIdx = i + 1;
-      for (let j = 1; j < contentLines.length; j++) {
-        let found = false;
-        const maxGap = 5;
-        for (let gap = 0; gap < maxGap && bufIdx < logicalLines.length; gap++, bufIdx++) {
-          if (lineContains(logicalLines[bufIdx].text, contentLines[j])) {
-            found = true;
-            bufIdx++;
+
+      if (contentLines.length > 1) {
+        // Multi-line match: check remaining content lines in subsequent logical lines
+        // allowing up to 5 gap lines (empty, separators, TUI formatting) between matches.
+        let bufIdx = i + 1;
+        for (let j = 1; j < contentLines.length; j++) {
+          let found = false;
+          const maxGap = 5;
+          for (let gap = 0; gap < maxGap && bufIdx < logicalLines.length; gap++, bufIdx++) {
+            if (lineContains(logicalLines[bufIdx].text, contentLines[j])) {
+              found = true;
+              bufIdx++;
+              break;
+            }
+          }
+          if (!found) {
+            allMatch = false;
             break;
           }
         }
-        if (!found) {
-          allMatch = false;
-          break;
+
+        // Same-line fallback: Gemini Ink TUI may collapse multi-line user input
+        // into a single logical line. If multi-line match failed, check if ALL
+        // remaining content lines exist as substrings within the same logical line.
+        if (!allMatch) {
+          const sameLine = logicalLines[i].text;
+          allMatch = contentLines.slice(1).every(cl => sameLine.includes(cl));
+        }
+
+        // Truncation fallback: Gemini TUI truncates long user messages in display.
+        // If first line (up to 50 chars) is found but remaining lines are absent
+        // from the buffer entirely, accept first-line-only match when it's long enough.
+        if (!allMatch && firstLine.length >= 15) {
+          allMatch = true;
         }
       }
 
@@ -702,8 +721,9 @@ export const terminalRegistry = {
       if (isIsolatedShort) {
         // Isolated: needle must appear near the START of trimmed line (user-typed text),
         // not mid-sentence in AI responses. Prefix must be non-alphanumeric.
+        // Gemini TUI adds indentation/decorations, so allow generous prefix (+25 chars).
         const trimmed = haystack.trim();
-        if (trimmed.length > needle.length + 10) return false;
+        if (trimmed.length > needle.length + 25) return false;
         const pos = trimmed.indexOf(needle);
         if (pos < 0) return false;
         if (pos === 0) return true;
@@ -728,27 +748,44 @@ export const terminalRegistry = {
     const firstLine = contentLines[0];
     let validCount = 0;
 
-    for (let i = 0; i <= logicalLines.length - contentLines.length; i++) {
+    for (let i = 0; i < logicalLines.length; i++) {
       if (startAfterRow >= 0 && logicalLines[i].bufRow <= startAfterRow) continue;
 
       if (!lineContains(logicalLines[i].text, firstLine)) continue;
 
-      // Allow up to 5 gap lines (empty, separators, TUI formatting) between matches
       let allMatch = true;
-      let bufIdx = i + 1;
-      for (let j = 1; j < contentLines.length; j++) {
-        let found = false;
-        const maxGap = 5;
-        for (let gap = 0; gap < maxGap && bufIdx < logicalLines.length; gap++, bufIdx++) {
-          if (lineContains(logicalLines[bufIdx].text, contentLines[j])) {
-            found = true;
-            bufIdx++;
+
+      if (contentLines.length > 1) {
+        // Allow up to 5 gap lines (empty, separators, TUI formatting) between matches
+        let bufIdx = i + 1;
+        for (let j = 1; j < contentLines.length; j++) {
+          let found = false;
+          const maxGap = 5;
+          for (let gap = 0; gap < maxGap && bufIdx < logicalLines.length; gap++, bufIdx++) {
+            if (lineContains(logicalLines[bufIdx].text, contentLines[j])) {
+              found = true;
+              bufIdx++;
+              break;
+            }
+          }
+          if (!found) {
+            allMatch = false;
             break;
           }
         }
-        if (!found) {
-          allMatch = false;
-          break;
+
+        // Same-line fallback: Gemini Ink TUI may collapse multi-line user input
+        // into a single logical line. Check if all remaining content lines exist
+        // as substrings within the same logical line.
+        if (!allMatch) {
+          const sameLine = logicalLines[i].text;
+          allMatch = contentLines.slice(1).every(cl => sameLine.includes(cl));
+        }
+
+        // Truncation fallback: Gemini TUI truncates long user messages in display.
+        // Accept first-line-only match when it's long enough (>= 30 chars).
+        if (!allMatch && firstLine.length >= 15) {
+          allMatch = true;
         }
       }
 
