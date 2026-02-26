@@ -69,8 +69,40 @@ await page.keyboard.type('npm run dev')
 // ХОРОШО:
 await waitForTerminal(page)           // .xterm-screen visible
 await electron.focusWindow(app)       // фокус на окно
-await page.waitForTimeout(500)        // PTY инициализация
+await page.waitForFunction(() => document.hasFocus(), null, { timeout: 3000 })
 await typeCommand(page, 'npm run dev')
+```
+
+## Event-driven замены типичных таймаутов
+
+```javascript
+// Вместо waitForTimeout(1500) после Cmd+T:
+const countBefore = await page.evaluate(() => {
+  const s = window.useWorkspaceStore?.getState?.()
+  const p = s?.openProjects?.get?.(s?.activeProjectId)
+  return p?.tabs?.size ?? 0
+})
+await page.keyboard.press('Meta+t')
+await page.waitForFunction((prev) => {
+  const s = window.useWorkspaceStore?.getState?.()
+  const p = s?.openProjects?.get?.(s?.activeProjectId)
+  return (p?.tabs?.size ?? 0) > prev
+}, countBefore, { timeout: 5000 })
+
+// Вместо waitForTimeout(15000) "ждём ответ Claude":
+// Main process логирует [BoundaryMarker] при возврате промта
+// Ищи в mainProcessLogs или жди OSC 133 "Prompt ready (A)"
+const waitForPromptReturn = async (mainProcessLogs, timeout = 30000) => {
+  const start = Date.now()
+  while (Date.now() - start < timeout) {
+    if (mainProcessLogs.some(l => l.includes('BoundaryMarker'))) return true
+    await page.waitForTimeout(500)  // poll interval, не слепой таймаут
+  }
+  return false
+}
+
+// Вместо waitForTimeout(4000) для Timeline:
+await page.waitForSelector('div[style*="border-radius: 50%"]', { timeout: 10000 })
 ```
 
 ## CWD: принудительный переход
@@ -80,7 +112,13 @@ PTY стартует в домашней папке. Первый шаг тес�
 ```javascript
 const targetDir = '/Users/fedor/Desktop/custom-terminal'
 await typeCommand(page, `cd ${targetDir}`)
-await page.waitForTimeout(2000)  // OSC 7 обновит CWD в store
+// Event-driven: ждём OSC 7 → store.tab.cwd обновится
+await page.waitForFunction((dir) => {
+  const s = window.useWorkspaceStore?.getState?.()
+  const p = s?.openProjects?.get?.(s?.activeProjectId)
+  const t = p?.tabs?.get?.(p?.activeTabId)
+  return t?.cwd?.includes?.(dir)
+}, targetDir, { timeout: 5000 })
 ```
 
 ## Доставка Ctrl+C (\x03)
