@@ -981,9 +981,36 @@ function TabBar({ projectId }: TabBarProps) {
     setProjectView(projectId, 'terminal');
   };
 
-  const handleCloseTab = (e: React.MouseEvent, tabId: string) => {
+  const handleCloseTab = async (e: React.MouseEvent, tabId: string) => {
     e.stopPropagation();
-    closeTab(projectId, tabId);
+    // If multi-select and clicked tab is among selected — close all selected
+    if (isMultiSelect && selectedTabIds.includes(tabId)) {
+      const running: { id: string; name: string }[] = [];
+      for (const id of selectedTabIds) {
+        const state = await ipcRenderer.invoke('terminal:getCommandState', id);
+        if (state.isRunning) {
+          const { processName } = await ipcRenderer.invoke('terminal:hasRunningProcess', id);
+          running.push({ id, name: processName || 'unknown' });
+        }
+      }
+
+      let confirmed = true;
+      if (running.length > 0) {
+        confirmed = window.confirm(
+          `${running.length} tab(s) have running processes:\n${running.map(r => `\u2022 ${r.name}`).join('\n')}\n\nClose all ${selectedTabIds.length} tabs?`
+        );
+      } else {
+        confirmed = window.confirm(`Close ${selectedTabIds.length} tabs?`);
+      }
+
+      if (confirmed) {
+        for (const id of selectedTabIds) {
+          await closeTab(projectId, id, { skipProcessCheck: true });
+        }
+      }
+    } else {
+      closeTab(projectId, tabId);
+    }
   };
 
   const handleDoubleClick = (tabId: string, currentName: string) => {

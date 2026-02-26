@@ -158,9 +158,10 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
     showToast(`Running: ${command.substring(0, 30)}...`, 'info');
   };
 
-  // Wait for Gemini to be ready (detects "type your message" in terminal output)
+  // Wait for Gemini to be ready (detects TUI status bar in terminal output)
   const waitForGeminiReady = (tabId: string, timeoutMs: number = 40000): Promise<boolean> => {
-    const pattern = 'type your message';
+    // Gemini CLI shows "[INSERT]" in status bar when ready for input
+    const patterns = ['[INSERT]', 'type your message'];
 
     return new Promise((resolve) => {
       const timeout = setTimeout(() => {
@@ -176,10 +177,13 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
         // Strip ANSI codes for matching
         const cleanBuffer = buffer.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').replace(/\x1b\].*?\x07/g, '');
 
-        if (cleanBuffer.toLowerCase().includes(pattern)) {
-          clearTimeout(timeout);
-          ipcRenderer.removeListener('terminal:data', handler);
-          resolve(true);
+        for (const pattern of patterns) {
+          if (cleanBuffer.includes(pattern)) {
+            clearTimeout(timeout);
+            ipcRenderer.removeListener('terminal:data', handler);
+            resolve(true);
+            return;
+          }
         }
       };
 
@@ -397,7 +401,7 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
         additionalPrompt.trim() ? '\n' + additionalPrompt.trim() : ''
       ].filter(Boolean).join('\n');
 
-      // 6. Start Gemini WITH watcher (so session is captured like manual 'gemini' command)
+      // 6. Start Gemini WITH watcher (writes 'gemini\r' to PTY + sets up fs.watch)
       ipcRenderer.send('gemini:spawn-with-watcher', { tabId: newTabId, cwd: workingDir });
 
       const geminiReady = await waitForGeminiReady(newTabId, 30000);
@@ -583,9 +587,10 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
               >
                 <span className="text-base">📚</span>
                 <div className="flex-1">
-                  <div
+                  <code
                     ref={docsTitleRef}
-                    className="font-medium cursor-pointer hover:text-white hover:underline inline-block"
+                    className="text-xs cursor-pointer hover:underline px-1.5 py-0.5 bg-[#1a1a1a] rounded"
+                    style={{ color: '#4E86F8' }}
                     onMouseDown={(e) => e.stopPropagation()}
                     onMouseEnter={() => setShowDocsInfo(true)}
                     onMouseLeave={() => setShowDocsInfo(false)}
@@ -596,7 +601,7 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
                     title={isMultiSelect ? `Export ${selectedTabs.length} sessions → Gemini` : 'Export session → Gemini'}
                   >
                     {isMultiSelect ? `Update Docs (${selectedTabs.length})` : 'Update Docs'}
-                  </div>
+                  </code>
                   {/* Copy docs+prompt to clipboard — inline button next to title */}
                   {!isUpdatingDocs && (
                     <span
@@ -822,9 +827,10 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
 
               <div className="flex-1">
                 {/* Clickable title - copies current session(s) */}
-                <div
+                <code
                   ref={copyTitleRef}
-                  className="font-medium cursor-pointer hover:text-white hover:underline inline-block"
+                  className="text-xs cursor-pointer hover:underline px-1.5 py-0.5 bg-[#1a1a1a] rounded"
+                  style={{ color: copyAccentColor }}
                   onMouseDown={(e) => e.stopPropagation()}
                   onMouseEnter={() => setShowCopyInfo(true)}
                   onMouseLeave={() => setShowCopyInfo(false)}
@@ -835,7 +841,7 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
                   title={isMultiSelect ? `Копировать ${selectedTabs.length} сессий` : copySessionInput.trim() ? `Копировать: ${copySessionInput.trim().slice(0, 40)}...` : "Копировать текущую сессию"}
                 >
                   {isMultiSelect ? `Copy ${selectedTabs.length} Sessions` : copySessionInput.trim() ? 'Copy Custom Session' : 'Copy Session'}
-                </div>
+                </code>
                 {showCopyInfo && !isGeminiCopy && renderInfoPanel(copyContainerRef, 'orange')}
                 <div
                   className="text-[10px] mt-0.5 cursor-pointer"
