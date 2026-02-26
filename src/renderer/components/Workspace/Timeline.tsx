@@ -97,6 +97,57 @@ function getSearchLines(content: string): string[] {
   return result;
 }
 
+// Check if a needle string appears as an isolated line in buffer text (not as a substring
+// of AI response text). Uses the same strictness logic as terminalRegistry.lineContains:
+// - isStrictShort (< 5 chars, e.g. "да"): trimmed line must equal needle, or have only
+//   non-alphanumeric prefix (prompt chars).
+// - isIsolatedShort (< 30 chars, e.g. "continue"): needle must be near start of trimmed
+//   line, line must not be much longer than needle.
+// - Regular (>= 30 chars): simple includes() is fine since long text is unique enough.
+function geminiLineMatch(bufferLines: string[], needle: string, isStrictShort: boolean, isIsolatedShort: boolean): boolean {
+  const nonAlphaRe = /[a-zA-Z0-9\u0400-\u04FF\u0600-\u06FF\u4E00-\u9FFF\u3040-\u309F\u30A0-\u30FF]/;
+
+  for (const hay of bufferLines) {
+    if (isStrictShort) {
+      const trimmed = hay.trim();
+      if (trimmed === needle) return true;
+      if (trimmed.length > needle.length + 4) continue;
+      const pos = trimmed.indexOf(needle);
+      if (pos < 0) continue;
+      if (pos === 0) return true;
+      const prefix = trimmed.slice(0, pos);
+      if (!nonAlphaRe.test(prefix)) return true;
+    } else if (isIsolatedShort) {
+      const trimmed = hay.trim();
+      if (trimmed.length > needle.length + 10) continue;
+      const pos = trimmed.indexOf(needle);
+      if (pos < 0) continue;
+      if (pos === 0) return true;
+      const prefix = trimmed.slice(0, pos);
+      if (!nonAlphaRe.test(prefix)) return true;
+    } else {
+      if (hay.includes(needle)) return true;
+    }
+  }
+  return false;
+}
+
+// Check if search lines (from getSearchLines) match anywhere in buffer text.
+// Used for Gemini viewport visibility and buffer reachability checks.
+// Only checks the FIRST search line with strict line-level matching — this is
+// sufficient for visibility/reachability (we don't need multi-line precision here,
+// just need to avoid false substring matches in AI responses).
+function matchesInGeminiBuffer(bufferText: string, searchLines: string[]): boolean {
+  if (searchLines.length === 0) return false;
+
+  const firstLine = searchLines[0];
+  const isStrictShort = searchLines.length === 1 && firstLine.length < 5;
+  const isIsolatedShort = searchLines.length === 1 && firstLine.length < 30;
+
+  const bufferLines = bufferText.split('\n');
+  return geminiLineMatch(bufferLines, firstLine, isStrictShort, isIsolatedShort);
+}
+
 function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, toolType = 'claude' }: TimelineProps) {
   const isGemini = toolType === 'gemini';
   const [entries, setEntries] = useState<TimelineEntry[]>([]);
@@ -251,11 +302,12 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
   }, []);
 
   // Check if key exists at a user prompt position in buffer text.
+  // For Claude only — Gemini uses matchesInGeminiBuffer() with line-level matching.
   const matchesAtUserPrompt = useCallback((bufferText: string, key: string, debug = false): boolean => {
-    // Gemini CLI doesn't use ❯/⏵ prompt markers — its Ink TUI renders user messages
-    // without recognizable prompt prefixes. Skip prompt validation entirely for Gemini.
+    // Gemini: delegate to line-level matcher (this path shouldn't be hit for
+    // visibility/reachability, but kept as safety fallback for diagnosis etc.)
     if (isGemini) {
-      return bufferText.includes(key);
+      return matchesInGeminiBuffer(bufferText, [key]);
     }
 
     let searchFrom = 0;
@@ -341,9 +393,18 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
       entries.forEach((entry, index) => {
         // Entries before boundary can't be in viewport (cleared from terminal)
         if (index <= lastBoundaryIdx) return;
-        const key = getEntryKey(entry);
-        if (key && matchesAtUserPrompt(visibleText, key)) {
-          newVisible.add(index);
+        if (isGemini) {
+          // Gemini: line-level matching with strict short-text handling
+          if (entry.type === 'compact') return;
+          const lines = getSearchLines(entry.content);
+          if (lines.length > 0 && matchesInGeminiBuffer(visibleText, lines)) {
+            newVisible.add(index);
+          }
+        } else {
+          const key = getEntryKey(entry);
+          if (key && matchesAtUserPrompt(visibleText, key)) {
+            newVisible.add(index);
+          }
         }
       });
 
@@ -369,12 +430,23 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
           newUnreachable.add(index);
           return;
         }
-        const key = getEntryKey(entry);
-        if (key) {
-             const isReachable = matchesAtUserPrompt(fullText, key, false);
-             if (!isReachable) {
-                 newUnreachable.add(index);
-             }
+        if (isGemini) {
+          // Gemini: line-level matching with strict short-text handling
+          const lines = getSearchLines(entry.content);
+          if (lines.length > 0) {
+            const isReachable = matchesInGeminiBuffer(fullText, lines);
+            if (!isReachable) {
+              newUnreachable.add(index);
+            }
+          }
+        } else {
+          const key = getEntryKey(entry);
+          if (key) {
+               const isReachable = matchesAtUserPrompt(fullText, key, false);
+               if (!isReachable) {
+                   newUnreachable.add(index);
+               }
+          }
         }
       });
 
@@ -421,7 +493,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
       if (reachTimer) clearTimeout(reachTimer);
       terminalRegistry.offViewportChange(tabId);
     };
-  }, [tabId, entries, isVisible, getEntryKey, matchesAtUserPrompt, isHistoryOpen, historyVisibleUuids]);
+  }, [tabId, entries, isVisible, isGemini, getEntryKey, matchesAtUserPrompt, isHistoryOpen, historyVisibleUuids]);
 
   // Refs
   const tooltipRef = useRef<HTMLDivElement>(null);
@@ -550,13 +622,24 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
     // if (unreachableIndices.has(index)) {
          console.warn(`[Timeline] Clicking entry #${index}. Diagnosing...`);
          const fullText = terminalRegistry.getFullBufferText(tabId);
-         const key = getEntryKey(entry);
-         if (fullText && key) {
-             const found = matchesAtUserPrompt(fullText, key, true); // Force debug logs
+         if (isGemini) {
+           const lines = getSearchLines(entry.content);
+           if (fullText && lines.length > 0) {
+             const found = matchesInGeminiBuffer(fullText, lines);
              if (found) console.log(`[Timeline] Diagnosis: Entry IS reachable (found=${found}). Red status might be stale.`);
              else console.log(`[Timeline] Diagnosis: Entry UNREACHABLE (found=${found}).`);
+           } else {
+             console.log(`[Timeline] Diagnosis failed: fullText=${!!fullText}, lines=${lines.length}`);
+           }
          } else {
-             console.log(`[Timeline] Diagnosis failed: fullText=${!!fullText}, key=${!!key}`);
+           const key = getEntryKey(entry);
+           if (fullText && key) {
+               const found = matchesAtUserPrompt(fullText, key, true); // Force debug logs
+               if (found) console.log(`[Timeline] Diagnosis: Entry IS reachable (found=${found}). Red status might be stale.`);
+               else console.log(`[Timeline] Diagnosis: Entry UNREACHABLE (found=${found}).`);
+           } else {
+               console.log(`[Timeline] Diagnosis failed: fullText=${!!fullText}, key=${!!key}`);
+           }
          }
     // }
 
@@ -584,7 +667,40 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
           }
         }
 
-        found = terminalRegistry.scrollToTextInBuffer(tabId, searchLines, occurrenceIndex);
+        // Anchored search: find the previous entry's buffer position so we skip
+        // past false matches in AI responses. For "continue" (Entry 4), without
+        // anchoring it would match "continue" in an AI response before the user
+        // actually typed it. By starting after the previous entry, we guarantee
+        // the correct chronological match.
+        let startAfterRow = -1;
+        if (index > 0) {
+          // Walk backwards to find the closest previous entry with a locatable position
+          for (let pi = index - 1; pi >= 0; pi--) {
+            const prevEntry = entries[pi];
+            if (prevEntry.type === 'compact') continue;
+            const prevLines = getSearchLines(prevEntry.content);
+            if (prevLines.length === 0) continue;
+
+            // Count occurrences of this previous entry before it
+            let prevOccurrence = 0;
+            for (let j = 0; j < pi; j++) {
+              const ej = entries[j];
+              if (ej.type !== prevEntry.type) continue;
+              const ejLines = getSearchLines(ej.content);
+              if (ejLines.length === prevLines.length && ejLines.every((l, k) => l === prevLines[k])) {
+                prevOccurrence++;
+              }
+            }
+
+            const prevRow = terminalRegistry.findTextBufferRow(tabId, prevLines, prevOccurrence, startAfterRow);
+            if (prevRow >= 0) {
+              startAfterRow = prevRow;
+              break;
+            }
+          }
+        }
+
+        found = terminalRegistry.scrollToTextInBuffer(tabId, searchLines, occurrenceIndex, startAfterRow);
       } else {
         // Claude: xterm search addon with ❯/⏵ prompt marker validation
         const searchText = entry.isPlan
