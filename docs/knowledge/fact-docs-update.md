@@ -34,6 +34,7 @@
     - Состояние выделения вкладок (Multi-select) сохраняется при кликах внутрь панели и вводе текста (см. `knowledge/fact-ux-patterns.md`).
 - **Анализ (Gemini):**
     - Система создает специальный Gemini-таб через `gemini:spawn-with-watcher`. Это гарантирует, что сессия обновления будет захвачена "Снайпером" и доступна для последующего Fork/Resume. См. [`knowledge/fix-gemini-capture.md`](fix-gemini-capture.md).
+    - **Visibility Fix:** При создании таба принудительно устанавливается `commandType: 'gemini'`. Это критично для того, чтобы `Timeline` и `InfoPanel` сразу распознали сессию и начали отображение истории, не дожидаясь первого ответа от AI.
     - Система дожидается готовности Gemini и вставляет промпт через Bracketed Paste + 500ms delay + Enter.
 
 ## Code Map
