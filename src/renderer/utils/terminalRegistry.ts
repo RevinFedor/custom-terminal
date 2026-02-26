@@ -30,6 +30,10 @@ interface TrackedEntry {
 // Map<tabId, Map<uuid, TrackedEntry>>
 const entryMarkers = new Map<string, Map<string, TrackedEntry>>();
 
+// Prompt boundary markers injected via OSC 7777 from main.js
+// Map<tabId, Map<seq, IMarker>>
+const promptBoundaries = new Map<string, Map<number, IMarker>>();
+
 // Callbacks
 type SearchResultsCallback = (results: { resultIndex: number; resultCount: number }) => void;
 const searchCallbacks = new Map<string, SearchResultsCallback>();
@@ -79,6 +83,7 @@ export const terminalRegistry = {
     viewportStates.delete(tabId);
     viewportCallbacks.delete(tabId);
     entryMarkers.delete(tabId);
+    promptBoundaries.delete(tabId);
   },
 
   get(tabId: string): XTerminal | undefined {
@@ -399,6 +404,68 @@ export const terminalRegistry = {
     return entryMarkers.get(tabId);
   },
 
+  // === Prompt Boundary API (OSC 7777 markers from main.js) ===
+
+  // Register a prompt boundary marker at the current cursor position.
+  // Called from OSC 7777 handler when main.js injects prompt:<seq> into PTY stream.
+  registerPromptBoundary(tabId: string, seq: number): void {
+    const terminal = terminals.get(tabId);
+    if (!terminal) return;
+
+    let tabBoundaries = promptBoundaries.get(tabId);
+    if (!tabBoundaries) {
+      tabBoundaries = new Map();
+      promptBoundaries.set(tabId, tabBoundaries);
+    }
+
+    // Don't re-register same sequence
+    if (tabBoundaries.has(seq)) return;
+
+    const marker = terminal.registerMarker(0);
+    if (marker) {
+      tabBoundaries.set(seq, marker);
+      marker.onDispose(() => tabBoundaries!.delete(seq));
+      console.log('[terminalRegistry] Prompt boundary #' + seq + ' at line ' + marker.line);
+    }
+  },
+
+  // Bind a timeline entry UUID to the Nth prompt boundary marker.
+  // Returns true if bound successfully. Entry N maps to prompt boundary N.
+  bindEntryToPromptBoundary(tabId: string, uuid: string, promptSeq: number): boolean {
+    const tabBoundaries = promptBoundaries.get(tabId);
+    if (!tabBoundaries) return false;
+
+    const marker = tabBoundaries.get(promptSeq);
+    if (!marker || marker.isDisposed) return false;
+
+    // Skip if already bound with a live marker
+    const tabMarkers = entryMarkers.get(tabId);
+    if (tabMarkers) {
+      const existing = tabMarkers.get(uuid);
+      if (existing?.marker && !existing.marker.isDisposed) return true;
+    }
+
+    let markers = entryMarkers.get(tabId);
+    if (!markers) {
+      markers = new Map();
+      entryMarkers.set(tabId, markers);
+    }
+
+    const tracked: TrackedEntry = { uuid, marker, isReachable: true };
+    marker.onDispose(() => {
+      tracked.isReachable = false;
+      tracked.marker = null;
+    });
+    markers.set(uuid, tracked);
+    console.log('[terminalRegistry] Bound entry', uuid, 'to prompt boundary #' + promptSeq, 'at line', marker.line);
+    return true;
+  },
+
+  // Get the number of prompt boundaries detected for a tab
+  getPromptBoundaryCount(tabId: string): number {
+    return promptBoundaries.get(tabId)?.size ?? 0;
+  },
+
   // Get visible text in the current terminal viewport (for Timeline visibility check)
   getVisibleText(tabId: string): string {
     const terminal = terminals.get(tabId);
@@ -696,3 +763,6 @@ export const terminalRegistry = {
     return -1;
   }
 };
+
+// Expose for testing (accessed via page.evaluate in Playwright tests)
+(window as any).__terminalRegistry = terminalRegistry;

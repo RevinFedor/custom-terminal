@@ -641,13 +641,18 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
         return true;
       });
 
-      // OSC 7777 handler - entry marker registration (future: main process sends before user prompt)
-      // Format: entry:<uuid>
+      // OSC 7777 handler - marker registration from main.js PTY middleware
+      // Formats: entry:<uuid>  |  prompt:<seq>
       term.parser.registerOscHandler(7777, (data: string) => {
         if (data.startsWith('entry:')) {
           const uuid = data.slice(6);
           console.log('[Terminal] OSC 7777 entry marker:', uuid);
           terminalRegistry.registerEntryMarker(tabId, uuid);
+        } else if (data.startsWith('prompt:')) {
+          const seq = parseInt(data.slice(7), 10);
+          if (!isNaN(seq)) {
+            terminalRegistry.registerPromptBoundary(tabId, seq);
+          }
         }
         return true;
       });

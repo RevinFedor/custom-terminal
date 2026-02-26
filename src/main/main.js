@@ -43,6 +43,13 @@ const claudeAgentBuffer = new Map(); // tabId -> stripped text buffer for :::cla
 const claudeAgentCooldown = new Map(); // tabId -> timestamp (ms) — ignore detections until cooldown expires
 const claudeAgentArmed = new Map();   // tabId -> boolean — only detect after first user input (prevents restore replay)
 
+// ========== PROMPT BOUNDARY MARKERS (OSC 7777 injection for deterministic navigation) ==========
+// State machine per tab: 'idle' (prompt visible) → 'busy' (Claude processing) → 'idle' (inject marker!)
+// When BUSY→IDLE transition detected, we inject OSC 7777 into PTY data BEFORE sending to renderer.
+// xterm.js parser fires registerOscHandler(7777) → registerMarker(0) at exact buffer position.
+const promptBoundaryState = new Map(); // tabId → 'idle' | 'busy'
+const promptBoundarySeq = new Map();   // tabId → number (auto-increment sequence)
+
 // ========== SESSION BRIDGE (StatusLine-based session detection) ==========
 // Claude's statusLine feature calls ~/.claude/statusline-bridge.sh after every response,
 // writing {session_id, ppid, cwd, ...} to ~/.claude/bridge/{session_id}.json.
@@ -152,6 +159,8 @@ function stopSessionBridge() {
 
 function clearBridgeTab(tabId) {
   bridgeKnownSessions.delete(tabId);
+  promptBoundaryState.delete(tabId);
+  promptBoundarySeq.delete(tabId);
   for (const [pid, tid] of bridgePidCache) {
     if (tid === tabId) bridgePidCache.delete(pid);
   }
@@ -1148,6 +1157,35 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
       }
       // ========== END CLAUDE AGENT PATTERN DETECTOR ==========
 
+      // ========== PROMPT BOUNDARY MARKER INJECTION ==========
+      // Detect Claude prompt (⏵ U+23F5 / ❯ U+276F) transitions to inject OSC 7777 markers.
+      // State machine: IDLE → BUSY (non-prompt data) → IDLE (prompt returns = inject!)
+      // Marker is injected into the data stream BEFORE IPC send, so xterm.js parser
+      // fires registerOscHandler(7777) at the exact buffer position of the prompt line.
+      {
+        if (bridgeKnownSessions.has(tabId)) {
+          const sc = stripVTControlCharacters(data);
+          const hasPrompt = sc.includes('\u23F5') || sc.includes('\u276F');
+          const state = promptBoundaryState.get(tabId) || 'idle';
+
+          if (state === 'idle') {
+            // Non-prompt data with substance while idle → Claude started processing
+            if (!hasPrompt && sc.replace(/\s/g, '').length > 5) {
+              promptBoundaryState.set(tabId, 'busy');
+            }
+          } else if (state === 'busy' && hasPrompt) {
+            // Prompt returned while busy → response complete, inject marker
+            promptBoundaryState.set(tabId, 'idle');
+            const seq = promptBoundarySeq.get(tabId) || 0;
+            promptBoundarySeq.set(tabId, seq + 1);
+            // Prepend OSC before data chunk so marker lands at start of prompt frame
+            data = '\x1b]7777;prompt:' + seq + '\x07' + data;
+            console.log('[BoundaryMarker] Tab ' + tabId + ': Injected prompt #' + seq);
+          }
+        }
+      }
+      // ========== END PROMPT BOUNDARY MARKER INJECTION ==========
+
       // Send raw data to renderer - xterm.js handles OSC sequences itself
       if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.webContents.send('terminal:data', { pid: ptyProcess.pid, tabId, data });
@@ -1250,6 +1288,30 @@ function drainPtyData(term, ms = 300) {
       timer = setTimeout(() => { sub.dispose(); resolve(buf); }, ms);
     });
     timer = setTimeout(() => { sub.dispose(); resolve(buf); }, ms);
+  });
+}
+
+// Helper: wait for specific text/regex in PTY output (deterministic marker)
+function waitForPtyText(term, textOrRegex, timeoutMs = 5000, logPrefix = '') {
+  return new Promise((resolve) => {
+    let buf = '';
+    const stripped = require('node:util').stripVTControlCharacters;
+    const timer = setTimeout(() => {
+      sub.dispose();
+      console.log(logPrefix + ' waitForPtyText TIMEOUT (' + timeoutMs + 'ms) waiting for "' + textOrRegex + '" (got ' + buf.length + 'B)');
+      resolve(buf);
+    }, timeoutMs);
+    const sub = term.onData((data) => {
+      buf += data;
+      const found = typeof textOrRegex === 'string'
+        ? stripped(buf).includes(textOrRegex)
+        : textOrRegex.test(buf);
+      if (found) {
+        clearTimeout(timer);
+        sub.dispose();
+        resolve(buf);
+      }
+    });
   });
 }
 
@@ -3537,9 +3599,9 @@ ipcMain.handle('gemini:open-history-menu', async (event, { tabId, targetText, sk
           logPrefix: '[Gemini:Rewind]'
         });
 
-        // Step 2: Wait for menu to render (silence-based)
+        // Step 2: Wait for menu to render (deterministic marker)
         console.log('[Gemini:Rewind] Step 2: Waiting for menu...');
-        const menuRaw = await drainPtyData(term, 3000);
+        const menuRaw = await waitForPtyText(term, 'Stay at current position', 5000, '[Gemini:Rewind]');
 
         if (!menuRaw.includes('Rewind') && !menuRaw.includes('\u25CF')) {
           console.error('[Gemini:Rewind] Menu did not open (' + menuRaw.length + 'B)');
@@ -3559,7 +3621,7 @@ ipcMain.handle('gemini:open-history-menu', async (event, { tabId, targetText, sk
 
         for (let i = 0; i < maxPresses; i++) {
           term.write('\x1b[A'); // UP
-          const navRaw = await drainPtyData(term, 1500);
+          const navRaw = await waitForPtyText(term, /\x1b\[38;2;166;227;161m/, 2000, '[Gemini:Rewind]');
           pressCount++;
 
           if (navRaw.length === 0) {
@@ -3587,7 +3649,7 @@ ipcMain.handle('gemini:open-history-menu', async (event, { tabId, targetText, sk
         if (!found) {
           console.error('[Gemini:Rewind] \u274C Target not found after ' + pressCount + ' presses. Closing menu.');
           term.write('\x1b'); // Escape to close
-          await new Promise(r => setTimeout(r, 500));
+          await waitForPtyText(term, /INSERT|NORMAL/, 2000, '[Gemini:Rewind]');
           resolveOuter({ success: false, error: 'Target not found', pressCount });
           return;
         }
@@ -3595,7 +3657,7 @@ ipcMain.handle('gemini:open-history-menu', async (event, { tabId, targetText, sk
         // Step 4: Confirm selection (Enter)
         console.log('[Gemini:Rewind] Step 4: Confirming selection...');
         term.write('\r');
-        const confirmRaw = await drainPtyData(term, 3000);
+        const confirmRaw = await waitForPtyText(term, 'Do nothing', 5000, '[Gemini:Rewind]');
 
         // Step 5: Handle confirmation dialog
         // After selecting an entry, Gemini shows: "● 1. Rewind conversation / 2. Do nothing"
@@ -3604,20 +3666,18 @@ ipcMain.handle('gemini:open-history-menu', async (event, { tabId, targetText, sk
         if (confirmClean.includes('Rewind conversation') || confirmClean.includes('Do nothing')) {
           console.log('[Gemini:Rewind] Step 5: Confirmation dialog detected — pressing Enter...');
           term.write('\r');
-          await drainPtyData(term, 5000);
+          await waitForPtyText(term, /shift\+tab|INSERT|NORMAL/, 8000, '[Gemini:Rewind]');
         } else {
           console.log('[Gemini:Rewind] Step 5: No confirmation dialog (direct rewind)');
-          // Menu might have closed already
         }
 
         // Step 6: Wait for rewind to complete and prompt to restore
         console.log('[Gemini:Rewind] Step 6: Waiting for prompt...');
-        await drainPtyData(term, 3000);
+        await waitForPtyText(term, /shift\+tab|INSERT|NORMAL/, 5000, '[Gemini:Rewind]');
 
         // Step 7: Paste compact if provided
         if (pasteAfter && typeof pasteAfter === 'string' && pasteAfter.length > 0) {
           console.log('[Gemini:Rewind] Step 7: Pasting compact (' + pasteAfter.length + ' chars)...');
-          await new Promise(r => setTimeout(r, 1000));
 
           term.write('\x01'); // Ctrl+A
           term.write('\x0b'); // Ctrl+K
@@ -3629,7 +3689,7 @@ ipcMain.handle('gemini:open-history-menu', async (event, { tabId, targetText, sk
             fast: true,
             logPrefix: '[Gemini:Rewind:paste]'
           });
-          await drainPtyData(term, 2000);
+          await waitForPtyText(term, /shift\+tab/, 5000, '[Gemini:Rewind]');
         }
 
         console.log('[Gemini:Rewind] \u2705 Rewind complete');
