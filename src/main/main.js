@@ -3475,7 +3475,8 @@ ipcMain.handle('gemini:get-timeline', async (event, { sessionId, cwd }) => {
     const entries = [];
 
     if (data.messages && Array.isArray(data.messages)) {
-      for (const msg of data.messages) {
+      for (let i = 0; i < data.messages.length; i++) {
+        const msg = data.messages[i];
         if (msg.type !== 'user') continue;
 
         // Normalize content: string || [{text}] || [{type:'text', text}] → string
@@ -3493,7 +3494,7 @@ ipcMain.handle('gemini:get-timeline', async (event, { sessionId, cwd }) => {
         }
 
         entries.push({
-          uuid: msg.id || crypto.randomUUID(),
+          uuid: msg.id || `${sessionId}-msg-${i}`,
           type: 'user',
           timestamp: msg.timestamp || data.startTime || new Date().toISOString(),
           content,
@@ -3542,7 +3543,8 @@ ipcMain.handle('gemini:get-full-history', async (event, { sessionId, cwd }) => {
 
     const entries = [];
 
-    for (const msg of data.messages) {
+    for (let i = 0; i < data.messages.length; i++) {
+      const msg = data.messages[i];
       // Normalize content
       let content = '';
       if (typeof msg.content === 'string') {
@@ -3552,9 +3554,11 @@ ipcMain.handle('gemini:get-full-history', async (event, { sessionId, cwd }) => {
       }
       if (!content) continue;
 
+      const stableUuid = msg.id || `${sessionId}-msg-${i}`;
+
       if (msg.type === 'user') {
         entries.push({
-          uuid: msg.id || crypto.randomUUID(),
+          uuid: stableUuid,
           role: 'user',
           timestamp: msg.timestamp || data.startTime || '',
           content,
@@ -3562,7 +3566,7 @@ ipcMain.handle('gemini:get-full-history', async (event, { sessionId, cwd }) => {
         });
       } else if (msg.type === 'gemini') {
         entries.push({
-          uuid: msg.id || crypto.randomUUID(),
+          uuid: stableUuid,
           role: 'assistant',
           timestamp: msg.timestamp || '',
           content,
