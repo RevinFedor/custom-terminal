@@ -21,16 +21,18 @@
     ```
     Ниже промпт документации:
     {System Prompt}
-    tmp/noted-docs-<ts>.txt
+    @{projectPath}/tmp/noted-docs-<ts>.txt
     {Additional Prompt}
     ```
+    **Важно:** Префикс `@` перед полным путем критичен для Gemini CLI — это заставляет его прочитать содержимое файла и включить его в контекст. Без него путь будет воспринят как обычная строка текста.
 
     **Важно:** После Bracketed Paste (`\x1b[201~`) нужна задержка ~500ms перед `\r`, иначе Gemini интерпретирует Enter как перенос строки, а не submit.
 - **Интерактивность:**
     - `⌘+Enter` в поле ввода запускает процесс обновления.
     - Состояние выделения вкладок (Multi-select) сохраняется при кликах внутрь панели и вводе текста (см. `knowledge/fact-ux-patterns.md`).
 - **Анализ (Gemini):**
-    - Система создает специальный Gemini-таб, дожидается его готовности и вставляет промпт через Bracketed Paste + 500ms delay + Enter.
+    - Система создает специальный Gemini-таб через `gemini:spawn-with-watcher`. Это гарантирует, что сессия обновления будет захвачена "Снайпером" и доступна для последующего Fork/Resume. См. [`knowledge/fix-gemini-capture.md`](fix-gemini-capture.md).
+    - Система дожидается готовности Gemini и вставляет промпт через Bracketed Paste + 500ms delay + Enter.
 
 ## Code Map
 - **UI & Logic:** `src/renderer/components/Workspace/panels/ActionsPanel.tsx` -> `handleUpdateDocs`.

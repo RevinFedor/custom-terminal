@@ -787,10 +787,39 @@ function App() {
       if (e.metaKey && e.code === 'KeyW') {
         e.preventDefault();
         if (view === 'workspace') {
-          // In workspace - close active tab
           const activeProject = getActiveProject();
           if (activeProject && activeProject.activeTabId) {
-            closeTab(activeProjectId!, activeProject.activeTabId);
+            const selected = activeProject.selectedTabIds;
+            if (selected.length > 1) {
+              // Multi-select: close all selected tabs with batch confirmation
+              (async () => {
+                const running: { id: string; name: string }[] = [];
+                for (const id of selected) {
+                  const state = await ipcRenderer.invoke('terminal:getCommandState', id);
+                  if (state.isRunning) {
+                    const { processName } = await ipcRenderer.invoke('terminal:hasRunningProcess', id);
+                    running.push({ id, name: processName || 'unknown' });
+                  }
+                }
+
+                let confirmed = true;
+                if (running.length > 0) {
+                  confirmed = window.confirm(
+                    `${running.length} tab(s) have running processes:\n${running.map(r => `\u2022 ${r.name}`).join('\n')}\n\nClose all ${selected.length} tabs?`
+                  );
+                } else {
+                  confirmed = window.confirm(`Close ${selected.length} tabs?`);
+                }
+
+                if (confirmed) {
+                  for (const id of selected) {
+                    await closeTab(activeProjectId!, id, { skipProcessCheck: true });
+                  }
+                }
+              })();
+            } else {
+              closeTab(activeProjectId!, activeProject.activeTabId);
+            }
           }
         } else {
           // On dashboard - close active project chip
