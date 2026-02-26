@@ -16,7 +16,18 @@
 
 ---
 
-## 2. Silence & Cursor Detection (Automation Stability)
+## 2. Sniper Watcher (Auto-Capture)
+Sniper — фоновый процесс, следящий за активностью Gemini CLI.
+
+### Динамический резолвинг (v0.30+)
+Ранее Sniper следил за жестко заданным списком SHA256-директорий. Теперь он использует `resolveGeminiProjectDir`:
+1. При запуске `gemini` в табе Sniper запрашивает slug проекта через `projects.json`.
+2. Путь наблюдения (`fs.watch`) динамически переключается на `~/.gemini/tmp/<slug>/chats/`.
+3. Это позволяет мгновенно подхватывать новые сессии даже в проектах, которые только что были проиндексированы Gemini CLI.
+
+---
+
+## 3. Handshake Strategy
 **Файл-источник:** `fix-gemini-cli-automation.md`
 
 ### Problems
@@ -29,7 +40,7 @@
 
 ---
 
-## 3. Session Restore: From "Trojan Horse" to Direct Injection
+## 4. Session Restore: From "Trojan Horse" to Direct Injection
 **Файл-источник:** `fix-trojan-horse-replaced.md`
 
 ### Problem
@@ -45,7 +56,7 @@ Gemini CLI doesn't have an internal registry; it just scans `~/.gemini/tmp/<SHA2
 
 ---
 
-## 4. Поддержка Truecolor (24-bit) в терминале
+## 5. Поддержка Truecolor (24-bit) в терминале
 
 ### Проблема
 Интерфейсы на базе Ink (Gemini CLI, Claude Code) выглядели тусклыми (16/256 цветов), несмотря на поддержку Canvas рендерера.
@@ -71,7 +82,7 @@ const ptyProcess = pty.spawn(shell, [], {
 
 ---
 
-## 5. Почему Gemini -r не является форком (True Fork)
+## 6. Почему Gemini -r не является форком (True Fork)
 
 ### Problem
 Первоначальная попытка реализовать `gemini-f` через простую команду `gemini -r <sessionId>` в новой вкладке привела к конфликту состояний.
