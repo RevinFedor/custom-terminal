@@ -33,6 +33,7 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
   const docsGeminiTabIdRef = useRef<string | null>(null);
   const [actions, setActions] = useState<Action[]>([]); // Kept for potential future use, loaded from global_commands DB table
   const [isScissorsHovered, setIsScissorsHovered] = useState(false);
+  const [isCopyingDocs, setIsCopyingDocs] = useState(false);
 
   // Update Docs expandable prompt
   const [docsExpanded, setDocsExpanded] = useState(false);
@@ -53,6 +54,17 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
   const docsBlockRef = useRef<HTMLDivElement>(null);
 
   const selectedTabs = activeProjectId ? getSelectedTabs(activeProjectId) : [];
+
+  // Detect active tab session type for Copy Session color/label
+  const activeTab = (() => {
+    if (!activeTabId || !activeProjectId) return null;
+    const proj = getActiveProject();
+    return proj?.tabs.get(activeTabId) || null;
+  })();
+  const activeSessionType: 'claude' | 'gemini' | null = activeTab?.claudeSessionId ? 'claude' : activeTab?.geminiSessionId ? 'gemini' : null;
+  const isGeminiCopy = activeSessionType === 'gemini';
+  const copyAccentColor = isGeminiCopy ? '#4E86F8' : '#DA7756';
+  const copyAccentRgba = isGeminiCopy ? 'rgba(78, 134, 248,' : 'rgba(218, 119, 86,';
 
   // DEBUG: native event listener to bypass React delegation
   useEffect(() => {
@@ -186,6 +198,89 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
     showToast('Отменено', 'info');
   }, [activeProjectId, closeTab, showToast]);
 
+  // Copy Docs to Clipboard — same logic as Update Docs but copies assembled prompt to clipboard
+  const handleCopyDocsToClipboard = async () => {
+    if (!activeTabId || !activeProjectId) {
+      showToast('No active terminal tab', 'error');
+      return;
+    }
+
+    const activeProject = getActiveProject();
+    if (!activeProject) {
+      showToast('No active project', 'error');
+      return;
+    }
+
+    setIsCopyingDocs(true);
+    try {
+      // 1. Export session content
+      const tabsToCopy = isMultiSelect ? selectedTabs : [activeProject.tabs.get(activeTabId)];
+      const validTabs = tabsToCopy.filter(t => t?.claudeSessionId || t?.geminiSessionId);
+
+      if (validTabs.length === 0) {
+        showToast('Нет сессий для экспорта', 'warning');
+        setIsCopyingDocs(false);
+        return;
+      }
+
+      const results: string[] = [];
+      for (const tab of validTabs) {
+        if (!tab) continue;
+        const cwd = await ipcRenderer.invoke('terminal:getCwd', tab.id).catch(() => null) || tab.cwd || activeProject.projectPath;
+        let result;
+        if (tab.geminiSessionId && !tab.claudeSessionId) {
+          result = await ipcRenderer.invoke('gemini:copy-range', {
+            sessionId: tab.geminiSessionId, cwd, startUuid: null, endUuid: null
+          });
+        } else {
+          result = await ipcRenderer.invoke('claude:export-clean-session', {
+            sessionId: tab.claudeSessionId, cwd, includeEditing, includeReading, fromStart
+          });
+        }
+        if (result.success) results.push(result.content);
+      }
+
+      if (results.length === 0) {
+        showToast('Export failed', 'error');
+        setIsCopyingDocs(false);
+        return;
+      }
+
+      const content = results.join('\n\n' + '='.repeat(40) + '\n\n');
+      if (isMultiSelect) clearSelection(activeProject.projectId);
+
+      // 2. Get documentation prompt
+      let systemPrompt: string;
+      if (docPrompt.useFile) {
+        const promptResult = await ipcRenderer.invoke('docs:read-prompt-file', { filePath: docPrompt.filePath });
+        if (!promptResult.success) throw new Error(promptResult.error || 'Failed to read prompt file');
+        systemPrompt = promptResult.content;
+      } else {
+        systemPrompt = docPrompt.inlineContent;
+      }
+      if (!systemPrompt) throw new Error('Documentation prompt is empty');
+
+      // 3. Assemble and copy to clipboard
+      const promptText = [
+        'Ниже промпт документации:\n',
+        systemPrompt,
+        '\n--- SESSION DATA ---\n',
+        content,
+        additionalPrompt.trim() ? '\n' + additionalPrompt.trim() : ''
+      ].filter(Boolean).join('\n');
+
+      const { clipboard } = window.require('electron');
+      clipboard.writeText(promptText);
+      const sizeKB = Math.round(promptText.length / 1024);
+      showToast(`Скопировано: промпт + ${validTabs.length} сессий (${sizeKB}KB)`, 'success');
+    } catch (error: any) {
+      console.error('[CopyDocs] Error:', error);
+      showToast(error.message || 'Copy docs failed', 'error');
+    } finally {
+      setIsCopyingDocs(false);
+    }
+  };
+
   // Unified Update Docs — exports content and opens Gemini in new blue tab
   const handleUpdateDocs = async (source: 'session' | 'selection' | 'clipboard' = 'session', e?: React.MouseEvent) => {
     if (e) { e.preventDefault(); e.stopPropagation(); }
@@ -227,10 +322,10 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
         } catch { showToast('Не удалось прочитать буфер обмена', 'error'); return; }
         showToast('Using clipboard content...', 'info');
       } else {
-        // Session export via claude:export-clean-session (same as Copy Session)
+        // Session export (same as Copy Session — supports Claude and Gemini)
         showToast('Exporting session...', 'info');
         const tabsToCopy = isMultiSelect ? selectedTabs : [activeProject.tabs.get(activeTabId)];
-        const validTabs = tabsToCopy.filter(t => t?.claudeSessionId);
+        const validTabs = tabsToCopy.filter(t => t?.claudeSessionId || t?.geminiSessionId);
 
         if (validTabs.length === 0) {
           showToast('Нет сессий для экспорта', 'warning');
@@ -242,13 +337,16 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
         for (const tab of validTabs) {
           if (!tab) continue;
           const cwd = await ipcRenderer.invoke('terminal:getCwd', tab.id).catch(() => null) || tab.cwd || activeProject.projectPath;
-          const result = await ipcRenderer.invoke('claude:export-clean-session', {
-            sessionId: tab.claudeSessionId,
-            cwd,
-            includeEditing,
-            includeReading,
-            fromStart
-          });
+          let result;
+          if (tab.geminiSessionId && !tab.claudeSessionId) {
+            result = await ipcRenderer.invoke('gemini:copy-range', {
+              sessionId: tab.geminiSessionId, cwd, startUuid: null, endUuid: null
+            });
+          } else {
+            result = await ipcRenderer.invoke('claude:export-clean-session', {
+              sessionId: tab.claudeSessionId, cwd, includeEditing, includeReading, fromStart
+            });
+          }
           if (result.success) results.push(result.content);
         }
 
@@ -299,8 +397,8 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
         additionalPrompt.trim() ? '\n' + additionalPrompt.trim() : ''
       ].filter(Boolean).join('\n');
 
-      // 6. Start Gemini and send prompt
-      await ipcRenderer.invoke('terminal:executeCommandAsync', newTabId, 'gemini');
+      // 6. Start Gemini WITH watcher (so session is captured like manual 'gemini' command)
+      ipcRenderer.send('gemini:spawn-with-watcher', { tabId: newTabId, cwd: workingDir });
 
       const geminiReady = await waitForGeminiReady(newTabId, 30000);
       if (cancelledRef.current) return;
@@ -351,7 +449,7 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
     const tabsToCopy = isMultiSelect ? selectedTabs : (activeTabId ? [activeProject.tabs.get(activeTabId)] : []);
     console.log('[CopySession] Tabs to copy:', tabsToCopy.map(t => t && { id: t.id, name: t.name, claudeSessionId: t.claudeSessionId }));
 
-    const validTabsToCopy = tabsToCopy.filter(t => t && (t.claudeSessionId || sessionIdOverride || copySessionInput.trim()));
+    const validTabsToCopy = tabsToCopy.filter(t => t && (t.claudeSessionId || t.geminiSessionId || sessionIdOverride || copySessionInput.trim()));
     console.log('[CopySession] Valid tabs to copy:', validTabsToCopy.length);
 
     if (validTabsToCopy.length === 0) {
@@ -369,6 +467,7 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
 
         let targetSessionId = '';
         let parsedCwd = '';
+        let sessionType: 'claude' | 'gemini' = 'claude';
 
         if (sessionIdOverride || copySessionInput.trim()) {
           const inputText = sessionIdOverride || copySessionInput.trim();
@@ -380,10 +479,20 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
 
           const cwdMatch = inputText.match(cwdPattern);
           if (cwdMatch) parsedCwd = cwdMatch[1];
+
+          // For manual input, detect type from tab
+          sessionType = tab.geminiSessionId ? 'gemini' : 'claude';
         }
 
         if (!targetSessionId) {
-          targetSessionId = tab.claudeSessionId || '';
+          // Prefer Claude, fallback to Gemini
+          if (tab.claudeSessionId) {
+            targetSessionId = tab.claudeSessionId;
+            sessionType = 'claude';
+          } else if (tab.geminiSessionId) {
+            targetSessionId = tab.geminiSessionId;
+            sessionType = 'gemini';
+          }
         }
 
         if (!targetSessionId) {
@@ -397,19 +506,30 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
         console.log('[CopySession] Exporting session:', {
           tabName: tab.name,
           sessionId: targetSessionId,
+          sessionType,
           cwd,
           includeEditing,
           includeReading,
           fromStart
         });
 
-        const result = await ipcRenderer.invoke('claude:export-clean-session', {
-          sessionId: targetSessionId,
-          cwd,
-          includeEditing,
-          includeReading,
-          fromStart
-        });
+        let result;
+        if (sessionType === 'gemini') {
+          result = await ipcRenderer.invoke('gemini:copy-range', {
+            sessionId: targetSessionId,
+            cwd,
+            startUuid: null,
+            endUuid: null
+          });
+        } else {
+          result = await ipcRenderer.invoke('claude:export-clean-session', {
+            sessionId: targetSessionId,
+            cwd,
+            includeEditing,
+            includeReading,
+            fromStart
+          });
+        }
 
         if (result.success) {
           console.log('[CopySession] Success for tab:', tab.name, 'Content length:', result.content?.length);
@@ -477,6 +597,30 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
                   >
                     {isMultiSelect ? `Update Docs (${selectedTabs.length})` : 'Update Docs'}
                   </div>
+                  {/* Copy docs+prompt to clipboard — inline button next to title */}
+                  {!isUpdatingDocs && (
+                    <span
+                      className="inline-flex items-center justify-center cursor-pointer select-none rounded"
+                      style={{
+                        width: '20px',
+                        height: '16px',
+                        marginLeft: '6px',
+                        fontSize: '10px',
+                        backgroundColor: isCopyingDocs ? 'rgba(96, 165, 250, 0.15)' : 'rgba(96, 165, 250, 0.1)',
+                        color: '#7cacf0',
+                        verticalAlign: 'middle',
+                        transition: 'all 0.15s ease',
+                        opacity: isCopyingDocs ? 0.4 : 1,
+                      }}
+                      onMouseEnter={(e) => { e.currentTarget.style.backgroundColor = 'rgba(96, 165, 250, 0.25)'; e.currentTarget.style.color = '#a5c8ff'; }}
+                      onMouseLeave={(e) => { e.currentTarget.style.backgroundColor = 'rgba(96, 165, 250, 0.1)'; e.currentTarget.style.color = '#7cacf0'; }}
+                      onMouseDown={(e) => e.stopPropagation()}
+                      onClick={(e) => { e.stopPropagation(); if (!isCopyingDocs) handleCopyDocsToClipboard(); }}
+                      title="Копировать промпт + сессии в буфер"
+                    >
+                      📄
+                    </span>
+                  )}
                   {showDocsInfo && renderInfoPanel(docsBlockRef, 'blue')}
                   <div
                     className="text-[10px] text-blue-600 mt-0.5 cursor-pointer"
@@ -573,25 +717,26 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
             </div>
           </div>
 
-          {/* Copy Session - export Claude session */}
+          {/* Copy Session - export Claude/Gemini session */}
           <div className="mt-2">
             <div
               ref={copyContainerRef}
               data-copy-session
-              className={`w-full text-[#DA7756] p-3 text-left rounded-lg text-xs flex items-center gap-2 ${
+              className={`w-full p-3 text-left rounded-lg text-xs flex items-center gap-2 ${
                 isCopying ? 'opacity-50' : ''
               }`}
               style={{
-                backgroundColor: 'rgba(218, 119, 86, 0.1)',
-                border: '1px solid rgba(218, 119, 86, 0.15)'
+                color: copyAccentColor,
+                backgroundColor: `${copyAccentRgba} 0.1)`,
+                border: `1px solid ${copyAccentRgba} 0.15)`
               }}
               onMouseEnter={(e) => {
-                e.currentTarget.style.backgroundColor = 'rgba(218, 119, 86, 0.18)';
-                e.currentTarget.style.borderColor = 'rgba(218, 119, 86, 0.25)';
+                e.currentTarget.style.backgroundColor = `${copyAccentRgba} 0.18)`;
+                e.currentTarget.style.borderColor = `${copyAccentRgba} 0.25)`;
               }}
               onMouseLeave={(e) => {
-                e.currentTarget.style.backgroundColor = 'rgba(218, 119, 86, 0.1)';
-                e.currentTarget.style.borderColor = 'rgba(218, 119, 86, 0.15)';
+                e.currentTarget.style.backgroundColor = `${copyAccentRgba} 0.1)`;
+                e.currentTarget.style.borderColor = `${copyAccentRgba} 0.15)`;
               }}
             >
               {/* Settings icon — inside the orange block */}
@@ -608,16 +753,16 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
                 }}
               >
                 <span className="text-base">📋</span>
-                {/* Indicators */}
+                {/* Indicators — Claude-specific settings, hidden for Gemini */}
                 <div className="absolute -bottom-1 -right-1 flex gap-0.5 pointer-events-none">
-                  {includeReading && <div className="w-1.5 h-1.5 rounded-full bg-amber-400 border border-[#1a1a1a]" title="Чтение" />}
-                  {includeEditing && <div className="w-1.5 h-1.5 rounded-full bg-purple-400 border border-[#1a1a1a]" title="Редактирование" />}
-                  {!fromStart && <div className="w-1.5 h-1.5 rounded-full bg-blue-500 border border-[#1a1a1a]" title="С последнего форка" />}
+                  {!isGeminiCopy && includeReading && <div className="w-1.5 h-1.5 rounded-full bg-amber-400 border border-[#1a1a1a]" title="Чтение" />}
+                  {!isGeminiCopy && includeEditing && <div className="w-1.5 h-1.5 rounded-full bg-purple-400 border border-[#1a1a1a]" title="Редактирование" />}
+                  {!isGeminiCopy && !fromStart && <div className="w-1.5 h-1.5 rounded-full bg-blue-500 border border-[#1a1a1a]" title="С последнего форка" />}
                 </div>
               </div>
 
               {/* Settings Menu Portal — positioned LEFT of the block, vertically centered */}
-              {showCopySettings && (() => {
+              {showCopySettings && !isGeminiCopy && (() => {
                 const bRect = copyContainerRef.current?.getBoundingClientRect();
                 if (!bRect) return null;
                 return (
@@ -691,18 +836,22 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
                 >
                   {isMultiSelect ? `Copy ${selectedTabs.length} Sessions` : copySessionInput.trim() ? 'Copy Custom Session' : 'Copy Session'}
                 </div>
-                {showCopyInfo && renderInfoPanel(copyContainerRef, 'orange')}
+                {showCopyInfo && !isGeminiCopy && renderInfoPanel(copyContainerRef, 'orange')}
                 <div
-                  className="text-[10px] text-[#DA7756]/70 mt-0.5 cursor-pointer"
+                  className="text-[10px] mt-0.5 cursor-pointer"
+                  style={{ color: `${copyAccentRgba} 0.7)` }}
                   onClick={() => !isCopying && setCopySessionExpanded(!copySessionExpanded)}
                 >
                   {isCopying ? 'Копирование...' :
-                    isMultiSelect ? `Экспорт ${selectedTabs.length} сессий в буфер` : copySessionInput.trim() ? `ID: ${copySessionInput.trim().slice(0, 30)}` : 'Claude JSONL → clipboard'}
+                    isMultiSelect ? `Экспорт ${selectedTabs.length} сессий в буфер` : copySessionInput.trim() ? `ID: ${copySessionInput.trim().slice(0, 30)}` : isGeminiCopy ? 'Gemini JSON → clipboard' : 'Claude JSONL → clipboard'}
                 </div>
               </div>
               {!isMultiSelect && (
                 <span
-                  className="text-[10px] text-[#DA7756]/50 cursor-pointer hover:text-[#DA7756] px-1"
+                  className="text-[10px] cursor-pointer px-1"
+                  style={{ color: `${copyAccentRgba} 0.5)` }}
+                  onMouseEnter={(e) => { e.currentTarget.style.color = copyAccentColor; }}
+                  onMouseLeave={(e) => { e.currentTarget.style.color = `${copyAccentRgba} 0.5)`; }}
                   onClick={() => !isCopying && setCopySessionExpanded(!copySessionExpanded)}
                 >
                   {copySessionExpanded ? '▼' : '▶'}
@@ -712,7 +861,7 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
 
             {/* Expanded area with textarea (only show for single select) */}
             {copySessionExpanded && !isMultiSelect && (
-              <div className="mt-2 p-2 bg-[#1a1a1a] border border-[#DA7756]/30 rounded-lg">
+              <div className="mt-2 p-2 bg-[#1a1a1a] rounded-lg" style={{ border: `1px solid ${copyAccentRgba} 0.3)` }}>
                 <textarea
                   value={copySessionInput}
                   onChange={(e) => setCopySessionInput(e.target.value)}

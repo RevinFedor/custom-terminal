@@ -21,7 +21,8 @@ auto/
 │   ├── test-rewind-navigation.js  # Rewind: сложная TUI-навигация, RGB поиск, откат
 │   ├── test-session-export.js     # Export: работа backtrace, форматирование кода/диффов
 │   ├── test-plan-mode-detect.js   # Plan Mode: детекция Clear Context и смены сессии
-│   └── test-history-restore.js    # History: восстановление вкладок из SQLite
+│   ├── test-history-restore.js    # History: восстановление вкладок из SQLite
+│   └── test-gemini-rewind.js      # Gemini Rewind: нативный /rewind, парсинг зеленого меню
 ├── sandbox/                       # Одноразовые эксперименты и дебаг
 └── screenshots/                   # Артефакты тестов
 ```

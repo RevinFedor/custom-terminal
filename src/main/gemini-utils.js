@@ -114,7 +114,9 @@ function findGeminiSessionFile(sessionId, chatsDir) {
         const content = fs.readFileSync(filePath, 'utf-8');
         const data = JSON.parse(content);
 
-        if (data.sessionId === sessionId) {
+        const isMatch = data.sessionId === sessionId
+          || (sessionId.length === 8 && data.sessionId.startsWith(sessionId));
+        if (isMatch) {
           const msgCount = data.messages ? data.messages.length : 0;
           if (msgCount > bestMessageCount) {
             bestMatch = { filePath, data };

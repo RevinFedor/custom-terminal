@@ -30,17 +30,26 @@ Sniper — фоновый процесс, следящий за активнос
 ## 3. Handshake Strategy
 **Файл-источник:** `fix-gemini-cli-automation.md`
 
-### Problems
-1. **Fake Prompt**: Gemini CLI (Ink) draws `>` instantly, but internal loop is still busy.
-2. **Error "Slash commands cannot be queued"**: Happens if command sent during "Generating" state.
-
-### Solutions
-- **Method A: HIDE Cursor Detection (Primary)**: Gemini hides cursor (`\x1b[?25l`) when ready for input. This is the fastest and most accurate method.
-- **Method B: Silence Detection (Fallback)**: Wait for 1500-2000ms pause in PTY data stream.
+### Model Switching & Queueing
+Gemini CLI не поддерживает очередь команд (ошибка "Slash commands cannot be queued"). 
+- **Mechanism:** В `main.js` реализована `geminiCommandQueue` для каждого таба.
+- **Execution:** Кнопки моделей (pro/flash) вызывают `gemini:send-command`. Система ждет `HIDE CURSOR` (`\x1b[?25l`) или окно тишины перед отправкой следующей команды. Это гарантирует, что команда `/model` уйдет только тогда, когда CLI готов.
 
 ---
 
-## 4. Session Restore: From "Trojan Horse" to Direct Injection
+## 4. Gemini Rewind Flow (The Green Logic)
+
+### Навигация в меню
+В отличие от Claude Code (где используется Lavender RGB), активный пункт в меню `/rewind` Gemini подсвечивается **зеленым цветом**. 
+- **Detection:** Функция `extractGreenText` анализирует сырой PTY-вывод на наличие ANSI-последовательностей зеленого цвета для определения текущей позиции курсора в меню истории.
+- **Confirmation (Double Enter):** Для подтверждения выбора в Gemini CLI требуется отправить **два символа возврата каретки** (`\r\r`). Первый `Enter` часто только переводит фокус TUI на элемент, второй — инициирует выполнение.
+
+### Визуальная синхронизация
+После успешного отката вызывается `scrollToTextInBuffer`. Система сканирует буфер xterm.js на наличие текста восстановленного сообщения и принудительно скроллит терминал к этой позиции, обеспечивая визуальное подтверждение успеха операции.
+
+---
+
+## 5. Session Restore: From "Trojan Horse" to Direct Injection
 **Файл-источник:** `fix-trojan-horse-replaced.md`
 
 ### Problem
