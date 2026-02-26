@@ -2589,7 +2589,78 @@ ipcMain.handle('session:get-visual', async (event, { dirPath, tabIndex }) => {
   }
 });
 
-// ========== CLAUDE INPUT INTERCEPTION ========== 
+// Validate session ID: check if it exists on disk for Claude/Gemini
+ipcMain.handle('session:validate-id', async (event, { input, mode, tabId }) => {
+  if (!input || !input.trim()) return {};
+  const trimmed = input.trim();
+  const cwd = terminalProjects.get(tabId) || null;
+  const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+  const SHORT_RE = /^[0-9a-f]{8}$/i;
+  const result = {};
+
+  // Claude check
+  if (mode === 'claude' || mode === 'auto') {
+    const uuidMatch = trimmed.match(UUID_RE);
+    if (uuidMatch) {
+      const found = findSessionFile(uuidMatch[0], cwd);
+      if (found) {
+        let preview = null;
+        try {
+          const content = fs.readFileSync(found.filePath, 'utf-8');
+          const lines = content.trim().split('\n');
+          for (const line of lines) {
+            const entry = JSON.parse(line);
+            if (entry.type === 'human') {
+              preview = (entry.message?.content || '').slice(0, 80);
+              break;
+            }
+          }
+        } catch (e) { /* ignore */ }
+        result.claude = { status: 'found', fullId: uuidMatch[0], preview };
+      } else {
+        result.claude = { status: 'not-found' };
+      }
+    } else {
+      result.claude = { status: 'invalid-format' };
+    }
+  }
+
+  // Gemini check
+  if (mode === 'gemini' || mode === 'auto') {
+    const resolved = resolveGeminiProjectDir(cwd || os.homedir());
+    if (!resolved) {
+      result.gemini = { status: 'no-project' };
+    } else {
+      const uuidMatch = trimmed.match(UUID_RE);
+      const isShort = SHORT_RE.test(trimmed);
+      const searchId = uuidMatch ? uuidMatch[0] : (isShort ? trimmed : null);
+      if (searchId) {
+        const found = findGeminiSessionFile(searchId, resolved.chatsDir);
+        if (found) {
+          let preview = null;
+          try {
+            const msgs = found.data.messages || [];
+            for (const msg of msgs) {
+              if (msg.role === 'user') {
+                preview = (msg.parts?.[0]?.text || '').slice(0, 80);
+                break;
+              }
+            }
+          } catch (e) { /* ignore */ }
+          result.gemini = { status: 'found', fullId: found.data.sessionId, preview };
+        } else {
+          result.gemini = { status: 'not-found' };
+        }
+      } else {
+        result.gemini = { status: 'invalid-format' };
+      }
+    }
+  }
+
+  return result;
+});
+
+// ========== CLAUDE INPUT INTERCEPTION ==========
 
 const crypto = require('crypto');
 

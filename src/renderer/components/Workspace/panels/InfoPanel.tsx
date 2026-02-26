@@ -59,6 +59,9 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
   const [sessionInputMode, setSessionInputMode] = useState<'claude' | 'gemini' | null>(null);
   const [manualSessionId, setManualSessionId] = useState('');
   const sessionInputRef = useRef<HTMLInputElement>(null);
+  const [validationResult, setValidationResult] = useState<{ claude?: { status: string; fullId?: string; preview?: string }; gemini?: { status: string; fullId?: string; preview?: string } } | null>(null);
+  const [isValidating, setIsValidating] = useState(false);
+  const validationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const { showToast, claudeDefaultPromptEnabled } = useUIStore();
   const historyPanelOpenTabs = useUIStore((s) => s.historyPanelOpenTabs);
   const setHistoryPanelOpen = useUIStore((s) => s.setHistoryPanelOpen);
@@ -85,10 +88,32 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
   useEffect(() => {
     setSessionInputMode(null);
     setManualSessionId('');
+    setValidationResult(null);
+    setIsValidating(false);
     const c = activeTabId ? bridgeCacheRef.current.get(activeTabId) : undefined;
     setClaudeModel(c?.model ?? null);
     setContextPct(c?.contextPct ?? 0);
   }, [activeTabId]);
+
+  // Debounced session ID validation
+  useEffect(() => {
+    if (validationTimerRef.current) { clearTimeout(validationTimerRef.current); validationTimerRef.current = null; }
+    const trimmed = manualSessionId.trim();
+    if (!trimmed || !activeTabId || trimmed.length < 8) {
+      setValidationResult(null);
+      setIsValidating(false);
+      return;
+    }
+    setIsValidating(true);
+    validationTimerRef.current = setTimeout(async () => {
+      try {
+        const result = await ipcRenderer.invoke('session:validate-id', { input: trimmed, mode: 'auto', tabId: activeTabId });
+        setValidationResult(result);
+      } catch (e) { setValidationResult(null); }
+      finally { setIsValidating(false); }
+    }, 300);
+    return () => { if (validationTimerRef.current) clearTimeout(validationTimerRef.current); };
+  }, [manualSessionId, activeTabId]);
 
   useEffect(() => {
     if (!activeTabId) { setIsCommandRunning(false); return; }
@@ -264,16 +289,19 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
   };
 
   const handleApplyManualSession = (mode: 'claude' | 'gemini') => {
-    console.warn('[ReplaceSession] called, mode:', mode, 'activeTabId:', activeTabId, 'input:', manualSessionId.trim());
-    if (!activeTabId || !manualSessionId.trim()) { console.warn('[ReplaceSession] BAIL: no tabId or empty input'); return; }
-    const uuidMatch = manualSessionId.trim().match(UUID_EXTRACT_REGEX);
-    if (!uuidMatch) { console.warn('[ReplaceSession] BAIL: invalid UUID'); showToast('Invalid UUID format', 'warning'); return; }
-    const newId = uuidMatch[0];
+    if (!activeTabId || !validationResult) return;
+    const result = mode === 'claude' ? validationResult.claude : validationResult.gemini;
+    if (!result || result.status !== 'found' || !result.fullId) {
+      showToast('Session not found', 'warning');
+      return;
+    }
+    const newId = result.fullId;
     const targetId = mode === 'gemini' ? geminiSessionId : claudeSessionId;
     if (newId === targetId) {
       showToast('Already current session', 'warning');
       setSessionInputMode(null);
       setManualSessionId('');
+      setValidationResult(null);
       return;
     }
     if (mode === 'gemini') {
@@ -281,11 +309,67 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
     } else {
       useWorkspaceStore.getState().setClaudeSessionId(activeTabId, newId);
     }
-    console.warn('[ReplaceSession] store updated for', mode);
-    showToast(`${mode === 'gemini' ? 'Gemini' : 'Claude'} session set: ` + newId.substring(0, 8) + '...', 'success');
+    showToast(`${mode === 'gemini' ? 'Gemini' : 'Claude'} session set: ${newId.substring(0, 8)}...`, 'success');
     setSessionInputMode(null);
     setManualSessionId('');
+    setValidationResult(null);
   };
+
+  const getInputBorderClass = () => {
+    if (isValidating) return 'border-yellow-500/50';
+    if (!validationResult) return 'border-[#444]';
+    const cf = validationResult.claude?.status === 'found';
+    const gf = validationResult.gemini?.status === 'found';
+    if (cf || gf) return 'border-green-500/70';
+    return 'border-red-500/50';
+  };
+
+  const renderValidationStatus = () => {
+    if (isValidating) return <span className="text-[9px] text-yellow-500/70 mt-0.5 block">Checking...</span>;
+    if (!validationResult) return null;
+    const parts: React.ReactNode[] = [];
+    if (validationResult.claude?.status === 'found') {
+      parts.push(<span key="c" className="text-green-400" title={validationResult.claude.preview || ''}>C: {validationResult.claude.fullId?.substring(0, 8)}</span>);
+    } else if (validationResult.claude?.status === 'not-found') {
+      parts.push(<span key="c" className="text-red-400/60">C: not found</span>);
+    }
+    if (validationResult.gemini?.status === 'found') {
+      parts.push(<span key="g" className="text-green-400" title={validationResult.gemini.preview || ''}>G: {validationResult.gemini.fullId?.substring(0, 8)}</span>);
+    } else if (validationResult.gemini?.status === 'not-found') {
+      parts.push(<span key="g" className="text-red-400/60">G: not found</span>);
+    }
+    if (parts.length === 0) return null;
+    return <div className="flex gap-2 text-[9px] mt-0.5">{parts}</div>;
+  };
+
+  const renderSessionInput = () => (
+    <div className="mt-2" style={{ animation: 'fadeIn 0.15s ease-out' }}>
+      <input
+        ref={sessionInputRef}
+        type="text"
+        value={manualSessionId}
+        onChange={(e) => setManualSessionId(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === 'Escape') { setSessionInputMode(null); setManualSessionId(''); setValidationResult(null); }
+        }}
+        placeholder="UUID or 8-char short ID..."
+        className={`w-full px-2 py-1 bg-[#1a1a1a] border ${getInputBorderClass()} rounded text-[10px] text-[#aaa] font-mono focus:outline-none placeholder:text-[#555] transition-colors`}
+      />
+      {renderValidationStatus()}
+      <div className="flex gap-1 mt-1.5">
+        <button
+          className="flex-1 text-[10px] px-2 py-1 rounded-l cursor-pointer disabled:opacity-40 bg-[#DA7756]/20 text-[#DA7756] hover:bg-[#DA7756]/30"
+          onClick={() => handleApplyManualSession('claude')}
+          disabled={!validationResult?.claude || validationResult.claude.status !== 'found'}
+        >C</button>
+        <button
+          className="flex-1 text-[10px] px-2 py-1 rounded-r cursor-pointer disabled:opacity-40 bg-[#4E86F8]/20 text-[#4E86F8] hover:bg-[#4E86F8]/30"
+          onClick={() => handleApplyManualSession('gemini')}
+          disabled={!validationResult?.gemini || validationResult.gemini.status !== 'found'}
+        >G</button>
+      </div>
+    </div>
+  );
 
   return (
     <div className="h-full flex flex-col p-3">
@@ -359,7 +443,7 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                     sessionInputMode ? 'text-[#aaa] bg-[#ffffff10]' : 'text-[#444] hover:text-[#aaa] hover:bg-[#ffffff08]'
                   }`}
                   onClick={() => {
-                    if (sessionInputMode) { setSessionInputMode(null); setManualSessionId(''); }
+                    if (sessionInputMode) { setSessionInputMode(null); setManualSessionId(''); setValidationResult(null); }
                     else { setSessionInputMode('claude'); setManualSessionId(''); setTimeout(() => sessionInputRef.current?.focus(), 50); }
                   }}
                   title="Replace session ID"
@@ -368,33 +452,7 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
             </div>
             <code className="text-[10px] text-[#aaa] break-all block">{sessionId}</code>
 
-            {sessionInputMode && (
-              <div className="mt-2" style={{ animation: 'fadeIn 0.15s ease-out' }}>
-                <input
-                  ref={sessionInputRef}
-                  type="text"
-                  value={manualSessionId}
-                  onChange={(e) => setManualSessionId(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Escape') { setSessionInputMode(null); setManualSessionId(''); }
-                  }}
-                  placeholder="Paste session UUID..."
-                  className={`w-full px-2 py-1 bg-[#1a1a1a] border border-[#444] rounded text-[10px] text-[#aaa] font-mono focus:outline-none placeholder:text-[#555] ${sessionInputMode === 'gemini' ? 'focus:border-[#4E86F8]' : 'focus:border-[#DA7756]'}`}
-                />
-                <div className="flex gap-1 mt-1.5">
-                  <button
-                    className="flex-1 text-[10px] px-2 py-1 rounded-l cursor-pointer disabled:opacity-40 bg-[#DA7756]/20 text-[#DA7756] hover:bg-[#DA7756]/30"
-                    onClick={() => handleApplyManualSession('claude')}
-                    disabled={!manualSessionId.trim()}
-                  >C</button>
-                  <button
-                    className="flex-1 text-[10px] px-2 py-1 rounded-r cursor-pointer disabled:opacity-40 bg-[#4E86F8]/20 text-[#4E86F8] hover:bg-[#4E86F8]/30"
-                    onClick={() => handleApplyManualSession('gemini')}
-                    disabled={!manualSessionId.trim()}
-                  >G</button>
-                </div>
-              </div>
-            )}
+            {sessionInputMode && renderSessionInput()}
 
             <button
               className="mt-2 w-full text-[10px] px-2 py-1 rounded text-[#888] hover:text-white bg-[#333] hover:bg-[#444] cursor-pointer"
@@ -439,34 +497,13 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                 <button
                   className={`text-[10px] cursor-pointer ${sessionInputMode ? 'text-[#aaa]' : 'text-[#555] hover:text-[#aaa]'}`}
                   onClick={() => {
-                    if (sessionInputMode) { setSessionInputMode(null); setManualSessionId(''); }
+                    if (sessionInputMode) { setSessionInputMode(null); setManualSessionId(''); setValidationResult(null); }
                     else { setSessionInputMode('claude'); setManualSessionId(''); setTimeout(() => sessionInputRef.current?.focus(), 50); }
                   }}
                 >Set ID</button>
               )}
             </div>
-            {sessionInputMode && activeTabId && (
-              <div className="mt-2" style={{ animation: 'fadeIn 0.15s ease-out' }}>
-                <input
-                  ref={sessionInputRef} type="text" value={manualSessionId} onChange={(e) => setManualSessionId(e.target.value)}
-                  onKeyDown={(e) => { if (e.key === 'Escape') { setSessionInputMode(null); setManualSessionId(''); } }}
-                  placeholder="Paste session UUID..."
-                  className={`w-full px-2 py-1 bg-[#1a1a1a] border border-[#444] rounded text-[10px] text-[#aaa] font-mono focus:outline-none placeholder:text-[#555] ${sessionInputMode === 'gemini' ? 'focus:border-[#4E86F8]' : 'focus:border-[#DA7756]'}`}
-                />
-                <div className="flex gap-1 mt-1.5">
-                  <button
-                    className="flex-1 text-[10px] px-2 py-1 rounded-l cursor-pointer disabled:opacity-40 bg-[#DA7756]/20 text-[#DA7756] hover:bg-[#DA7756]/30"
-                    onClick={() => handleApplyManualSession('claude')}
-                    disabled={!manualSessionId.trim()}
-                  >C</button>
-                  <button
-                    className="flex-1 text-[10px] px-2 py-1 rounded-r cursor-pointer disabled:opacity-40 bg-[#4E86F8]/20 text-[#4E86F8] hover:bg-[#4E86F8]/30"
-                    onClick={() => handleApplyManualSession('gemini')}
-                    disabled={!manualSessionId.trim()}
-                  >G</button>
-                </div>
-              </div>
-            )}
+            {sessionInputMode && activeTabId && renderSessionInput()}
           </div>
         )}
       </div>
