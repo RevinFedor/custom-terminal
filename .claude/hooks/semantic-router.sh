@@ -12,13 +12,13 @@
 INPUT=$(cat)
 PROMPT=$(echo "$INPUT" | jq -r '.prompt // empty' 2>/dev/null)
 
-# Check trigger: prompt ends with ??? or &&&
-if [ -z "$PROMPT" ] || ! echo "$PROMPT" | grep -qE '(\?\?\?|&&&)[[:space:]]*$'; then
+# Check trigger: ??? or &&& at start or end of prompt
+if [ -z "$PROMPT" ] || ! echo "$PROMPT" | grep -qE '(^[[:space:]]*(\?\?\?|&&&)|(\?\?\?|&&&)[[:space:]]*$)'; then
   exit 0
 fi
 
-# Strip trigger
-CLEAN_PROMPT=$(echo "$PROMPT" | sed -E 's/[[:space:]]*((\?\?\?)|(&&&))[[:space:]]*$//')
+# Strip trigger (from start or end)
+CLEAN_PROMPT=$(echo "$PROMPT" | sed -E 's/^[[:space:]]*((\?\?\?)|(&&&))[[:space:]]*//' | sed -E 's/[[:space:]]*((\?\?\?)|(&&&))[[:space:]]*$//')
 
 PROJECT_DIR="${CLAUDE_PROJECT_DIR:-.}"
 INDEX_FILE="$PROJECT_DIR/.semantic-index.json"
@@ -105,7 +105,10 @@ TEXT=$(echo "$USER_MSG" | env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT claude -p 
   --no-session-persistence \
   2>/dev/null) || true
 
+ROUTER_LOG="/tmp/semantic-router.log"
+
 if [ -z "$TEXT" ]; then
+  echo "[$(date '+%H:%M:%S')] FAIL: empty response from Haiku" >> "$ROUTER_LOG"
   exit 0
 fi
 
@@ -118,11 +121,19 @@ if [ -z "$FILE_LIST" ]; then
 fi
 
 if [ -z "$FILE_LIST" ]; then
+  echo "[$(date '+%H:%M:%S')] FAIL: could not parse files from Haiku response" >> "$ROUTER_LOG"
   exit 0
 fi
 
-# Log selected files (visible to user as first line of hook output)
+# Log selected files
 FILE_NAMES=$(echo "$FILE_LIST" | xargs -I{} basename {} | tr '\n' ', ' | sed 's/,$//')
+
+# Лог в файл — пользователь видит через: tail -f /tmp/semantic-router.log
+ROUTER_LOG="/tmp/semantic-router.log"
+echo "[$(date '+%H:%M:%S')] Selected: $FILE_NAMES" >> "$ROUTER_LOG"
+echo "[$(date '+%H:%M:%S')] Prompt: $(echo "$CLEAN_PROMPT" | head -c 80)..." >> "$ROUTER_LOG"
+
+# Контекст для Claude (stdout)
 echo "[Semantic Router] Haiku selected: $FILE_NAMES"
 echo ""
 
