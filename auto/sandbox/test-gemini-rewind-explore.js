@@ -50,6 +50,27 @@ function drainData(term, ms = 500) {
   })
 }
 
+function waitForText(term, textOrRegex, timeoutMs = 5000) {
+  return new Promise((resolve) => {
+    let buf = ''
+    const timer = setTimeout(() => {
+      handler.dispose()
+      resolve(buf)
+    }, timeoutMs)
+    const handler = term.onData((data) => {
+      buf += data
+      const found = typeof textOrRegex === 'string'
+        ? stripVTControlCharacters(buf).includes(textOrRegex)
+        : textOrRegex.test(buf)
+      if (found) {
+        clearTimeout(timer)
+        handler.dispose()
+        resolve(buf)
+      }
+    })
+  })
+}
+
 function smartClean(raw) {
   let text = raw.replace(/\x1b\[\d+;\d+[Hf]/g, '\n')
   text = text.replace(/\x1b\[(\d*)C/g, (_, n) => ' '.repeat(parseInt(n) || 1))
@@ -265,6 +286,76 @@ async function main() {
     term.write('/help\r')
     const helpRaw = await helpCapture
     const helpClean = dumpRawAnsi(helpRaw, '/help response', true)
+
+    // ═══════════════════════════════════════════════════════════
+    // TEST E: Deterministic marker validation
+    // ═══════════════════════════════════════════════════════════
+    console.log(`\n${c.bold}═══ TEST E: Deterministic marker validation ═══${c.reset}`)
+
+    // E.1: /rewind → wait for "Stay at current position"
+    log.step('E.1: /rewind → waiting for "Stay at current position"...')
+    term.write('\x01\x0b')
+    await sleep(100)
+    for (const ch of '/rewind') { term.write(ch); await sleep(50) }
+    await sleep(200)
+    term.write('\r')
+    const e1Raw = await waitForText(term, 'Stay at current position', 8000)
+    const e1Clean = smartClean(e1Raw)
+    if (e1Clean.includes('Stay at current position')) {
+      log.pass('E.1: "Stay at current position" detected')
+    } else {
+      log.fail('E.1: "Stay at current position" NOT found (' + e1Raw.length + 'B)')
+    }
+
+    // E.2: UP → wait for green RGB marker
+    log.step('E.2: UP → waiting for green RGB(166,227,161)...')
+    term.write('\x1b[A')
+    const e2Raw = await waitForText(term, /\x1b\[38;2;166;227;161m/, 3000)
+    if (/\x1b\[38;2;166;227;161m/.test(e2Raw)) {
+      log.pass('E.2: Green RGB marker detected (' + e2Raw.length + 'B)')
+    } else {
+      log.fail('E.2: Green RGB marker NOT found (' + e2Raw.length + 'B)')
+    }
+
+    // E.3: Navigate to boundary (keep pressing UP until 0B)
+    log.step('E.3: Navigate to boundary (UP until 0B timeout)...')
+    let boundaryHit = false
+    for (let i = 0; i < 20; i++) {
+      term.write('\x1b[A')
+      const navRaw = await waitForText(term, /\x1b\[38;2;166;227;161m/, 1500)
+      if (navRaw.length === 0) {
+        log.pass('E.3: Boundary hit at UP #' + (i + 1) + ' (0B)')
+        boundaryHit = true
+        break
+      }
+    }
+    if (!boundaryHit) log.warn('E.3: No boundary hit after 20 UPs')
+
+    // E.4: Enter → wait for "Rewind conversation"
+    log.step('E.4: Enter → waiting for confirmation dialog...')
+    term.write('\r')
+    const e4Raw = await waitForText(term, 'Do nothing', 5000)
+    const e4Clean = smartClean(e4Raw)
+    if (e4Clean.includes('Rewind conversation')) {
+      log.pass('E.4: "Rewind conversation" detected')
+    } else {
+      log.fail('E.4: "Rewind conversation" NOT found (' + e4Raw.length + 'B)')
+    }
+    if (e4Clean.includes('Do nothing')) {
+      log.pass('E.4: "Do nothing" detected')
+    } else {
+      log.fail('E.4: "Do nothing" NOT found')
+    }
+
+    // E.5: Escape to close instead of confirming
+    log.step('E.5: Escape to close menu...')
+    term.write('\x1b')
+    const e5Raw = await waitForText(term, /INSERT|NORMAL|shift\+tab/, 3000)
+    if (e5Raw.length > 0) {
+      log.pass('E.5: Menu closed, prompt restored (' + e5Raw.length + 'B)')
+    } else {
+      log.warn('E.5: No prompt marker after Escape (' + e5Raw.length + 'B)')
+    }
 
     console.log(`\n${c.bold}═══ DONE ═══${c.reset}`)
 

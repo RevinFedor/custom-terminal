@@ -306,6 +306,30 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
     return () => window.removeEventListener('timeline:force-refresh', handler);
   }, [tabId, loadTimeline]);
 
+  // Bind timeline entries to prompt boundary markers (OSC 7777 from main.js).
+  // Entry N (user message) maps to prompt boundary N (the prompt shown after response N,
+  // where the next message will be typed). Sequence 0 = after first response.
+  // Entries without markers will fall back to SearchAddon navigation.
+  useEffect(() => {
+    if (isGemini || entries.length === 0) return;
+    const boundaryCount = terminalRegistry.getPromptBoundaryCount(tabId);
+    if (boundaryCount === 0) return;
+
+    // User-type entries only (skip compact, continued)
+    let promptSeq = 0;
+    for (const entry of entries) {
+      if (entry.type === 'compact' || entry.type === 'continued') continue;
+      // Try to bind this entry to the next available prompt boundary
+      // Boundary 0 = prompt after first response → where second message was typed
+      // For entry 0 (first message), there's no boundary (it was typed at the initial prompt)
+      // So entry 1 → boundary 0, entry 2 → boundary 1, etc.
+      if (promptSeq > 0) {
+        terminalRegistry.bindEntryToPromptBoundary(tabId, entry.uuid, promptSeq - 1);
+      }
+      promptSeq++;
+    }
+  }, [entries, tabId, isGemini]);
+
   // Extract first line of content, max 80 chars — the only part that reliably
   // matches 1:1 in the terminal buffer
   const getEntryKey = useCallback((entry: TimelineEntry): string | null => {
@@ -714,21 +738,27 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
 
         found = terminalRegistry.scrollToTextInBuffer(tabId, searchLines, occurrenceIndex, startAfterRow);
       } else {
-        // Claude: xterm search addon with ❯/⏵ prompt marker validation
-        const searchText = entry.isPlan
-          ? 'Plan to implement'
-          : getSearchText(entry.content);
-        if (searchText) {
-          let occurrenceIndex = 0;
-          for (let i = 0; i < index; i++) {
-            const e = entries[i];
-            if (e.type !== entry.type) continue;
-            const eKey = e.isPlan
-              ? 'Plan to implement'
-              : getSearchText(e.content);
-            if (eKey === searchText) occurrenceIndex++;
+        // Claude: try marker-based navigation first (deterministic), fall back to SearchAddon
+        found = terminalRegistry.scrollToEntry(tabId, entry.uuid);
+        if (found) {
+          console.log('[Timeline] Marker-based scroll succeeded for', entry.uuid);
+        } else {
+          // Fallback: xterm search addon with ❯/⏵ prompt marker validation
+          const searchText = entry.isPlan
+            ? 'Plan to implement'
+            : getSearchText(entry.content);
+          if (searchText) {
+            let occurrenceIndex = 0;
+            for (let i = 0; i < index; i++) {
+              const e = entries[i];
+              if (e.type !== entry.type) continue;
+              const eKey = e.isPlan
+                ? 'Plan to implement'
+                : getSearchText(e.content);
+              if (eKey === searchText) occurrenceIndex++;
+            }
+            found = terminalRegistry.searchAndScrollToNth(tabId, searchText, occurrenceIndex, !!entry.isPlan);
           }
-          found = terminalRegistry.searchAndScrollToNth(tabId, searchText, occurrenceIndex, !!entry.isPlan);
         }
       }
 
