@@ -490,10 +490,32 @@ ipcMain.on('show-terminal-context-menu', async (event, { hasSelection, prompts, 
     }
   }
 
-  if (scripts.length > 0) {
+  // Check if tab has a running devServer process
+  const cmdState = terminalCommandState.get(tabId);
+  const isRunning = cmdState && cmdState.isRunning;
+
+  if (scripts.length > 0 || isRunning) {
+    const submenu = [];
+
+    // Active process — stop option at top
+    if (isRunning) {
+      submenu.push({
+        label: '\u25CF Stop process (Ctrl+C)',
+        click: () => {
+          const term = terminals.get(tabId);
+          if (term) term.write('\x03');
+        }
+      });
+      if (scripts.length > 0) {
+        submenu.push({ type: 'separator' });
+      }
+    }
+
+    submenu.push(...scripts);
+
     template.push({
-      label: `Scripts (${scripts.length})`,
-      submenu: scripts
+      label: isRunning ? `Scripts (\u25CF running)` : `Scripts (${scripts.length})`,
+      submenu
     });
     template.push({ type: 'separator' });
   }
@@ -2249,6 +2271,10 @@ ipcMain.handle('project:archive-tab', (event, { projectId, tab }) => {
 
 ipcMain.handle('project:get-tab-history', (event, { projectId }) => {
   return projectManager.db.getTabHistory(projectId);
+});
+
+ipcMain.handle('project:get-tab-history-count', (event, { projectId }) => {
+  return projectManager.db.getTabHistoryCount(projectId);
 });
 
 ipcMain.handle('project:clear-tab-history', (event, { projectId }) => {

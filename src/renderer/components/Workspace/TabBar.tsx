@@ -90,12 +90,13 @@ const DropIndicatorLine = memo(({ edge }: IndicatorProps) => {
 
 // Restart zone - left part of tab, shows restart button on hover when process is running
 // Only shows restart for devServer commands (npm/yarn/etc), not for claude/gemini
-const RestartZone = memo(({ hasProcess, hasColor, commandType, hasSession, onRestart }: {
+const RestartZone = memo(({ hasProcess, hasColor, commandType, hasSession, onRestart, onStop }: {
   hasProcess: boolean;
   hasColor: boolean;
   commandType?: string;
   hasSession?: boolean;
   onRestart: () => void;
+  onStop: () => void;
 }) => {
   const [isHovered, setIsHovered] = useState(false);
 
@@ -121,6 +122,13 @@ const RestartZone = memo(({ hasProcess, hasColor, commandType, hasSession, onRes
         if (showRestart) {
           e.stopPropagation();
           onRestart();
+        }
+      }}
+      onAuxClick={(e) => {
+        if (e.button === 1 && showRestart) {
+          e.preventDefault();
+          e.stopPropagation();
+          onStop();
         }
       }}
     >
@@ -189,6 +197,7 @@ interface TabItemProps {
   hasProcess?: boolean; // Whether tab has a running process
   commandType?: string; // Type of command running (devServer, claude, gemini, generic)
   onRestart?: (tabId: string) => void; // Restart process (Ctrl+C, Up, Enter)
+  onStop?: (tabId: string) => void; // Stop process (Ctrl+C only, no restart)
   isInterrupted?: boolean; // Tab has an interrupted AI session
   draggingGroupIds?: string[]; // IDs of tabs being dragged as a group
   onHoverChange?: (hovering: boolean, rect?: DOMRect) => void; // CMD+hover notes preview
@@ -219,6 +228,7 @@ const TabItem = memo(({
   hasProcess = false,
   commandType,
   onRestart,
+  onStop,
   isInterrupted = false,
   draggingGroupIds = [],
   onHoverChange,
@@ -461,6 +471,7 @@ const TabItem = memo(({
               commandType={commandType}
               hasSession={hasSession}
               onRestart={() => onRestart && onRestart(tab.id)}
+              onStop={() => onStop && onStop(tab.id)}
             />
           )}
 
@@ -1055,6 +1066,11 @@ function TabBar({ projectId }: TabBarProps) {
     }, 300);
   };
 
+  // Stop process: Ctrl+C only (no restart)
+  const handleStop = (tabId: string) => {
+    ipcRenderer.send('terminal:input', tabId, '\x03');
+  };
+
   const handleRenameSubmit = () => {
     if (editingTabId && editValue.trim()) {
       renameTab(projectId, editingTabId, editValue.trim());
@@ -1414,6 +1430,7 @@ function TabBar({ projectId }: TabBarProps) {
                         commandType={tab.commandType}
                         hasSession={sessionStatus.get(tab.id) || !!tab.claudeSessionId}
                         onRestart={handleRestart}
+                        onStop={handleStop}
                         isInterrupted={isTabInterrupted(tab)}
                         draggingGroupIds={draggingGroupIds}
                         onHoverChange={(hovering, rect) => handleTabHoverChange(tab.id, hovering, rect)}
@@ -1481,6 +1498,7 @@ function TabBar({ projectId }: TabBarProps) {
                     commandType={tab.commandType}
                     hasSession={sessionStatus.get(tab.id) || !!tab.claudeSessionId}
                     onRestart={handleRestart}
+                    onStop={handleStop}
                     isInterrupted={isTabInterrupted(tab)}
                     draggingGroupIds={draggingGroupIds}
                     onHoverChange={(hovering, rect) => handleTabHoverChange(tab.id, hovering, rect)}
@@ -1634,7 +1652,7 @@ function TabBar({ projectId }: TabBarProps) {
           )}
 
           {/* Scripts - submenu */}
-          {!isMultiSelect && contextScripts.length > 0 && (
+          {!isMultiSelect && (contextScripts.length > 0 || (contextMenu && processStatus.get(contextMenu.tabId) && workspace.tabs.get(contextMenu.tabId)?.commandType === 'devServer')) && (
             <div className="relative group/scripts">
               <button
                 className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center justify-between"
@@ -1642,12 +1660,29 @@ function TabBar({ projectId }: TabBarProps) {
                 <span className="flex items-center gap-2">
                   <Play size={12} className="text-[#666]" />
                   Scripts
-                  <span className="text-[10px] text-[#555]">{contextScripts.length}</span>
+                  {contextScripts.length > 0 && <span className="text-[10px] text-[#555]">{contextScripts.length}</span>}
                 </span>
                 <span className="text-[#666]">{'\u203A'}</span>
               </button>
               <div className="absolute left-full top-0 -ml-2 pl-2 hidden group-hover/scripts:block">
                 <div className="bg-[#2a2a2a] border border-[#444] rounded-xl shadow-2xl py-1 min-w-[160px] max-h-[300px] overflow-y-auto">
+                  {/* Active process — stop button */}
+                  {contextMenu && processStatus.get(contextMenu.tabId) && workspace.tabs.get(contextMenu.tabId)?.commandType === 'devServer' && (
+                    <>
+                      <button
+                        className="w-full text-left px-4 py-1.5 text-[13px] text-[#f87171] hover:bg-white/10 cursor-pointer flex items-center gap-2"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleStop(contextMenu.tabId);
+                          setContextMenu(null);
+                        }}
+                      >
+                        <div className="w-1.5 h-1.5 rounded-full bg-[#4ade80] animate-pulse" />
+                        <span className="truncate">Stop: {workspace.tabs.get(contextMenu.tabId)?.name}</span>
+                      </button>
+                      {contextScripts.length > 0 && <div className="my-1 border-t border-[#444]" />}
+                    </>
+                  )}
                   {contextScripts.map((script) => (
                     <button
                       key={script}

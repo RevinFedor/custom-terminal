@@ -439,6 +439,15 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
               <div className="flex-1" />
               {activeTabId && (
                 <button
+                  className="text-[10px] px-1.5 py-0.5 rounded cursor-pointer text-[#444] hover:text-[#aaa] hover:bg-[#ffffff08]"
+                  onClick={() => {
+                    window.dispatchEvent(new CustomEvent('timeline:force-refresh', { detail: { tabId: activeTabId } }));
+                  }}
+                  title="Refresh timeline"
+                >↻</button>
+              )}
+              {activeTabId && (
+                <button
                   className={`text-[10px] px-1.5 py-0.5 rounded cursor-pointer ${
                     sessionInputMode ? 'text-[#aaa] bg-[#ffffff10]' : 'text-[#444] hover:text-[#aaa] hover:bg-[#ffffff08]'
                   }`}

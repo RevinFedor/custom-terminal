@@ -17,6 +17,7 @@ interface Project {
 interface TabsStats {
   total: number;
   active: number;
+  history: number;
 }
 
 interface ProjectCardProps {
@@ -32,7 +33,7 @@ export default function ProjectCard({
   isOpen = false,
   onOpen,
   onMiddleClick,
-  tabsStats = { total: 0, active: 0 }
+  tabsStats = { total: 0, active: 0, history: 0 }
 }: ProjectCardProps) {
   const [pathHovered, setPathHovered] = useState(false);
   const [isHoveringName, setIsHoveringName] = useState(false);
@@ -124,6 +125,11 @@ export default function ProjectCard({
             '—'
           )}
         </span>
+        {tabsStats.history > 0 && (
+          <span className="text-[10px] ml-1.5" style={{ color: '#b0956e' }}>
+            +{tabsStats.history}
+          </span>
+        )}
       </div>
 
       {/* Settings Button - Bottom Right */}

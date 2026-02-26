@@ -29,6 +29,7 @@ interface Tab {
   pid?: number;
   color?: TabColor;
   colorSetManually?: boolean; // True if user changed color manually - prevents auto-color override
+  nameSetManually?: boolean; // True if user renamed tab manually - prevents auto-rename on commandType detection
   commandType?: CommandType; // Type of running command (for restart button visibility)
   isUtility?: boolean;
   tabType?: TabType; // Terminal or browser tab
@@ -93,7 +94,7 @@ interface WorkspaceStore {
   closeProject: (projectId: string) => Promise<void>;
 
   // Tab management
-  createTab: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; tabType?: TabType; url?: string }) => Promise<string>;
+  createTab: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; tabType?: TabType; url?: string; background?: boolean }) => Promise<string>;
   createTabAfterCurrent: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; tabType?: TabType; url?: string }) => Promise<string>;
   closeTab: (projectId: string, tabId: string, options?: { skipProcessCheck?: boolean }) => Promise<void>;
   switchTab: (projectId: string, tabId: string) => void;
@@ -220,7 +221,8 @@ const saveTabs = (projectId: string, tabs: Map<string, Tab>) => {
     terminalName: tab.terminalName,
     activeView: tab.activeView,
     createdAt: tab.createdAt,
-    isCollapsed: tab.isCollapsed
+    isCollapsed: tab.isCollapsed,
+    nameSetManually: tab.nameSetManually
   }));
   ipcRenderer.invoke('project:save-tabs', { projectId, tabs: tabsArray });
 };
@@ -484,7 +486,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
               tabType: savedTab.tabType,
               url: savedTab.url,
               createdAt: savedTab.createdAt,
-              isCollapsed: savedTab.isCollapsed
+              isCollapsed: savedTab.isCollapsed,
+              nameSetManually: savedTab.nameSetManually
             } as any);
           }
         } else {
@@ -603,7 +606,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       tabType: options?.tabType || 'terminal',
       url: options?.url,
       createdAt: (options as any)?.createdAt || Math.floor(Date.now() / 1000),
-      isCollapsed: (options as any)?.isCollapsed
+      isCollapsed: (options as any)?.isCollapsed,
+      nameSetManually: (options as any)?.nameSetManually
     };
 
     console.log('[Store] createTab: Creating PTY terminal for:', tabId, 'cwd:', newTab.cwd);
@@ -624,9 +628,9 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     newTab.pid = pid;
     workspace.tabs.set(tabId, newTab);
 
-    // Don't switch activeTabId during session restore to avoid UI flickering
+    // Don't switch activeTabId during session restore or background creation
     const { isRestoring } = get();
-    if (!isRestoring) {
+    if (!isRestoring && !options?.background) {
       workspace.activeTabId = tabId;
       // Push to tab history (LRU, max 20)
       workspace.tabHistory = [...workspace.tabHistory.filter(id => id !== tabId), tabId].slice(-20);
@@ -856,6 +860,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       const tab = workspace.tabs.get(tabId);
       if (tab) {
         tab.name = newName;
+        tab.nameSetManually = true;
         set({ openProjects: new Map(openProjects) });
 
         // Save tabs
@@ -911,8 +916,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         const isFirstRun = !tab.commandType;
         tab.commandType = commandType;
 
-        // Auto-rename on first run
-        if (isFirstRun) {
+        // Auto-rename on first run (skip if user renamed tab manually)
+        if (isFirstRun && !tab.nameSetManually) {
           const existingNames = Array.from(workspace.tabs.values()).map(t => t.name);
           let baseName = '';
 
