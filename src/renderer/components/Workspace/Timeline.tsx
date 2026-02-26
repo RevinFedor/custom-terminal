@@ -294,6 +294,18 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
     return () => clearInterval(interval);
   }, [sessionId, loadTimeline]);
 
+  // Listen for manual refresh requests from InfoPanel
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent).detail;
+      if (detail?.tabId === tabId) {
+        loadTimeline();
+      }
+    };
+    window.addEventListener('timeline:force-refresh', handler);
+    return () => window.removeEventListener('timeline:force-refresh', handler);
+  }, [tabId, loadTimeline]);
+
   // Extract first line of content, max 80 chars — the only part that reliably
   // matches 1:1 in the terminal buffer
   const getEntryKey = useCallback((entry: TimelineEntry): string | null => {

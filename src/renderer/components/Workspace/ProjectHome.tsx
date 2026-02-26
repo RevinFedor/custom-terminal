@@ -304,6 +304,39 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
     setHistory(prev => prev.filter(h => h.id !== entry.id));
   };
 
+  // Restore a history tab in the background (middle-click) — no view switch, no activation
+  const restoreTabBackground = async (entry: TabHistoryEntry) => {
+    let pendingAction: PendingAction | undefined;
+    if (entry.command_type === 'claude') {
+      if (entry.claude_session_id) {
+        pendingAction = { type: 'claude-continue', sessionId: entry.claude_session_id };
+      } else {
+        pendingAction = { type: 'claude-new' };
+      }
+    } else if (entry.command_type === 'gemini') {
+      if (entry.gemini_session_id) {
+        pendingAction = { type: 'gemini-continue', sessionId: entry.gemini_session_id };
+      } else {
+        pendingAction = { type: 'gemini-new' };
+      }
+    }
+
+    await createTab(projectId, entry.name, entry.cwd, {
+      color: (entry.color || undefined) as TabColor | undefined,
+      notes: entry.notes || undefined,
+      commandType: entry.command_type as any || undefined,
+      tabType: (entry.tab_type || 'terminal') as TabType,
+      url: entry.url || undefined,
+      pendingAction,
+      claudeSessionId: entry.claude_session_id || undefined,
+      geminiSessionId: entry.gemini_session_id || undefined,
+      background: true,
+    });
+
+    await ipcRenderer.invoke('project:delete-tab-history-entry', { id: entry.id });
+    setHistory(prev => prev.filter(h => h.id !== entry.id));
+  };
+
   // Restore from favorite (creates new tab, does NOT delete favorite)
   const restoreFromFavorite = async (entry: FavoriteEntry) => {
     let pendingAction: PendingAction | undefined;
@@ -823,7 +856,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
                           onAuxClick={(e) => {
                             if (e.button === 1) {
                               e.preventDefault();
-                              deleteHistoryEntry(entry.id);
+                              restoreTabBackground(entry);
                             }
                           }}
                           style={{

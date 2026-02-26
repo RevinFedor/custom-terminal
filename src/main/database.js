@@ -496,6 +496,13 @@ transaction(tabs);
     ).all(projectId, limit);
   }
 
+  getTabHistoryCount(projectId) {
+    const row = this.db.prepare(
+      'SELECT COUNT(*) as count FROM tab_history WHERE project_id = ?'
+    ).get(projectId);
+    return row ? row.count : 0;
+  }
+
   clearTabHistory(projectId) {
     this.db.prepare('DELETE FROM tab_history WHERE project_id = ?').run(projectId);
   }

@@ -27,6 +27,7 @@ export default function Dashboard() {
   const [isProcessesLoading, setIsProcessesLoading] = useState(true);
 
   const [killTooltip, setKillTooltip] = useState<'claude' | 'gemini' | null>(null);
+  const [historyCounts, setHistoryCounts] = useState<Map<string, number>>(new Map());
 
   // CMD+hover popover (unified hook)
   const isCmdPressed = useCmdKey();
@@ -46,6 +47,27 @@ export default function Dashboard() {
     loadProjects();
     loadBookmarks();
   }, []);
+
+  // Fetch history counts for all projects
+  useEffect(() => {
+    const fetchHistoryCounts = async () => {
+      const ids = Object.keys(projects);
+      if (ids.length === 0) return;
+      const counts = new Map<string, number>();
+      await Promise.all(
+        ids.map(async (id) => {
+          try {
+            const count = await ipcRenderer.invoke('project:get-tab-history-count', { projectId: id });
+            counts.set(id, count);
+          } catch {
+            counts.set(id, 0);
+          }
+        })
+      );
+      setHistoryCounts(counts);
+    };
+    fetchHistoryCounts();
+  }, [Object.keys(projects).length]);
 
   // OSC 133 Event-driven process status
   useEffect(() => {
@@ -177,7 +199,7 @@ export default function Dashboard() {
   // Get tabs stats for each project
   const getTabsStats = (projectId: string) => {
     const projectData = openProjects.get(projectId);
-    if (!projectData) return { total: 0, active: 0 };
+    if (!projectData) return { total: 0, active: 0, history: historyCounts.get(projectId) || 0 };
 
     const total = projectData.tabs.size;
     let active = 0;
@@ -188,7 +210,7 @@ export default function Dashboard() {
       }
     }
 
-    return { total, active };
+    return { total, active, history: historyCounts.get(projectId) || 0 };
   };
 
   // Handle edit bookmark
