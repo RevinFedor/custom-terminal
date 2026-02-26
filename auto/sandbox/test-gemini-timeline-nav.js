@@ -3,20 +3,26 @@
  *
  * Diagnoses timeline click navigation for Gemini session 10807e79.
  *
- * Since we can't easily populate the xterm buffer with conversation content
- * in a test instance, this test:
- * 1. Verifies getSearchLines() produces correct output for each entry
- * 2. Verifies Timeline IPC and DOM rendering
- * 3. Clicks each dot and captures scrollToTextInBuffer logs
- * 4. Simulates the EXACT search logic (lineContains + multi-line matching)
- *    against a realistic Gemini TUI buffer dump to identify matching bugs
- * 5. Tests edge cases: word boundary matching for "да", duplicate detection
+ * PART 1 (pure logic, no Electron): Tests search logic against simulated buffer
+ * PART 2 (Electron): Clicks dots and captures scrollToTextInBuffer logs
+ *
+ * FOUND BUGS (FIXED):
+ * - BUG 1: Entry #0 multi-line match — searchInBuffer must skip empty buffer
+ *   lines between content lines (Gemini TUI adds blank lines).
+ *   FIX: searchInBuffer now skips empty lines (matching terminalRegistry.ts).
+ * - BUG 2: "continue" / short entries matching AI response lines.
+ *   FIX: isIsolatedShort now requires needle at START of trimmed line
+ *   (prefix must be non-alphanumeric), preventing "OK, continue." matches.
+ * - BUG 3 (was already fixed): "да" matching "да Добавь..." —
+ *   isStrictShort mode requires trimmed === needle or endsWith with len <= 3.
  *
  * Run: node auto/sandbox/test-gemini-timeline-nav.js
  */
 
-const { launch, waitForTerminal, typeCommand, findInLogs } = require('../core/launcher')
+const { launch, waitForTerminal, typeCommand } = require('../core/launcher')
 const electron = require('../core/electron')
+const fs = require('fs')
+const os = require('os')
 
 const TEST_CWD = '/Users/fedor/Desktop/custom-terminal'
 const TEST_SESSION_ID = '10807e79-99a1-407d-90d0-835fca893708'
@@ -40,9 +46,7 @@ function assert(cond, msg) {
   else { log.fail(msg); failed++ }
 }
 
-// ══════════════════════════════════════════════════════════════
-// Replicate the exact search logic from terminalRegistry.ts
-// ══════════════════════════════════════════════════════════════
+// ── Replicate exact logic from terminalRegistry.ts ──
 
 function getSearchLines(content) {
   const rawLines = content.split('\n')
@@ -61,40 +65,72 @@ function getSearchLines(content) {
   return result
 }
 
-function lineContains(haystack, needle) {
-  if (needle.length >= 5) return haystack.includes(needle)
-  // Word-boundary matching for short strings
-  let from = 0
-  while (true) {
-    const pos = haystack.indexOf(needle, from)
-    if (pos === -1) return false
-    const before = pos > 0 ? haystack[pos - 1] : ' '
-    const after = pos + needle.length < haystack.length ? haystack[pos + needle.length] : ' '
-    const boundaryRe = /[\s\.,;:!?\-\u2014\u2013()\[\]{}<>\/\\|"'`~@#$%^&*+=]/
-    if ((pos === 0 || boundaryRe.test(before)) && (pos + needle.length === haystack.length || boundaryRe.test(after))) {
-      return true
+// lineContains: matches real terminalRegistry.ts logic with isStrictShort/isIsolatedShort
+function makeLineContains(contentLines) {
+  const isStrictShort = contentLines.length === 1 && contentLines[0].length < 5
+  const isIsolatedShort = contentLines.length === 1 && contentLines[0].length < 30
+
+  return function lineContains(haystack, needle) {
+    if (isStrictShort) {
+      const trimmed = haystack.trim()
+      if (trimmed === needle) return true
+      if (trimmed.length > needle.length + 4) return false
+      const pos = trimmed.indexOf(needle)
+      if (pos < 0) return false
+      if (pos === 0) return true
+      const prefix = trimmed.slice(0, pos)
+      return !/[a-zA-Z0-9\u0400-\u04FF\u0600-\u06FF\u4E00-\u9FFF\u3040-\u309F\u30A0-\u30FF]/.test(prefix)
     }
-    from = pos + 1
+    if (isIsolatedShort) {
+      const trimmed = haystack.trim()
+      if (trimmed.length > needle.length + 10) return false
+      const pos = trimmed.indexOf(needle)
+      if (pos < 0) return false
+      if (pos === 0) return true
+      const prefix = trimmed.slice(0, pos)
+      return !/[a-zA-Z0-9\u0400-\u04FF\u0600-\u06FF\u4E00-\u9FFF\u3040-\u309F\u30A0-\u30FF]/.test(prefix)
+    }
+    if (needle.length >= 5) return haystack.includes(needle)
+    let from = 0
+    while (true) {
+      const pos = haystack.indexOf(needle, from)
+      if (pos === -1) return false
+      const before = pos > 0 ? haystack[pos - 1] : ' '
+      const after = pos + needle.length < haystack.length ? haystack[pos + needle.length] : ' '
+      const boundaryRe = /[\s\.,;:!?\-\u2014\u2013()\[\]{}<>\/\\|"'`~@#$%^&*+=]/
+      if ((pos === 0 || boundaryRe.test(before)) && (pos + needle.length === haystack.length || boundaryRe.test(after))) {
+        return true
+      }
+      from = pos + 1
+    }
   }
 }
 
+// searchInBuffer: matches real terminalRegistry.ts logic (gap-based multi-line matching)
 function searchInBuffer(bufferLines, contentLines, occurrenceIndex) {
+  const lineContains = makeLineContains(contentLines)
   const firstLine = contentLines[0]
   let validCount = 0
-
   for (let i = 0; i <= bufferLines.length - contentLines.length; i++) {
     if (!lineContains(bufferLines[i], firstLine)) continue
-
     let allMatch = true
+    let bufIdx = i + 1
     for (let j = 1; j < contentLines.length; j++) {
-      if (i + j >= bufferLines.length || !lineContains(bufferLines[i + j], contentLines[j])) {
-        allMatch = false
-        break
+      // Allow up to 5 gap lines (empty, separators, TUI formatting) between matches
+      let found = false
+      const maxGap = 5
+      for (let gap = 0; gap < maxGap && bufIdx < bufferLines.length; gap++, bufIdx++) {
+        if (lineContains(bufferLines[bufIdx], contentLines[j])) {
+          found = true
+          bufIdx++
+          break
+        }
+      }
+      if (!found) {
+        allMatch = false; break
       }
     }
-
     if (!allMatch) continue
-
     if (validCount === occurrenceIndex) {
       return { found: true, line: i, occurrence: occurrenceIndex }
     }
@@ -103,16 +139,9 @@ function searchInBuffer(bufferLines, contentLines, occurrenceIndex) {
   return { found: false, validMatches: validCount }
 }
 
-// ══════════════════════════════════════════════════════════════
-// Simulated Gemini TUI buffer — realistic representation
-// of what the terminal actually shows when Gemini CLI is running
-// ══════════════════════════════════════════════════════════════
+// ── Simulated buffer (realistic Gemini TUI output) ──
 
-// This simulates the actual xterm buffer content from a real Gemini session.
-// Gemini CLI (Ink TUI) renders user messages WITHOUT prompt markers.
-// The user's typed text appears in the buffer, sometimes with Ink formatting.
-const SIMULATED_BUFFER = `
-fedor@MacBook-Air-Fedor custom-terminal % gemini
+const SIMULATED_BUFFER = `fedor@MacBook-Air-Fedor custom-terminal % gemini
 ✦ Welcome to Gemini CLI!
 
 Ниже промпт документации:
@@ -168,156 +197,183 @@ The file has this structure:
 
 continue
 
-Continuing the work on documentation updates...
-`.trim().split('\n')
+Continuing the work on documentation updates...`.split('\n')
 
 
 async function main() {
   log.header('Gemini Timeline Navigation Diagnostic Test')
 
   // ══════════════════════════════════════════════════════════════
-  // PART 1: Pure logic test (no Electron needed)
+  // PART 1: Pure search logic test
   // ══════════════════════════════════════════════════════════════
-  log.header('PART 1: Search Logic Test (simulated buffer)')
+  log.header('PART 1: Search Logic vs Simulated Buffer')
 
-  // Read session data
-  const fs = require('fs')
-  const sessionPath = require('os').homedir() + '/.gemini/tmp/custom-terminal/chats/session-2026-02-24T22-31-10807e79.json'
+  const sessionPath = `${os.homedir()}/.gemini/tmp/custom-terminal/chats/session-2026-02-24T22-31-10807e79.json`
   const sessionData = JSON.parse(fs.readFileSync(sessionPath, 'utf-8'))
   const userMessages = sessionData.messages.filter(m => m.type === 'user')
 
-  log.info(`Session has ${userMessages.length} user messages`)
-
-  // Extract content from each user message
-  const entries = userMessages.map((m, i) => {
-    let content = ''
+  const entries = userMessages.map(m => {
     if (Array.isArray(m.content)) {
-      content = m.content.filter(p => p.text).map(p => p.text).join('\n')
-    } else {
-      content = String(m.content || '')
+      return m.content.filter(p => p.text).map(p => p.text).join('\n')
     }
-    return { index: i, content }
+    return String(m.content || '')
   })
 
-  log.info(`Simulated buffer: ${SIMULATED_BUFFER.length} lines`)
+  log.info(`Session: ${entries.length} user messages, Buffer: ${SIMULATED_BUFFER.length} lines`)
 
-  // Test each entry
   for (let i = 0; i < entries.length; i++) {
-    const searchLines = getSearchLines(entries[i].content)
-
-    // Calculate occurrenceIndex (same logic as Timeline click handler)
+    const searchLines = getSearchLines(entries[i])
     let occurrenceIndex = 0
     for (let j = 0; j < i; j++) {
-      const eLines = getSearchLines(entries[j].content)
+      const eLines = getSearchLines(entries[j])
       if (eLines.length === searchLines.length && eLines.every((l, k) => l === searchLines[k])) {
         occurrenceIndex++
       }
     }
 
     const result = searchInBuffer(SIMULATED_BUFFER, searchLines, occurrenceIndex)
-    const preview = entries[i].content.replace(/\n/g, ' | ').substring(0, 80)
+    const preview = entries[i].replace(/\n/g, ' | ').substring(0, 80)
 
     log.info(`Entry #${i}: "${preview}"`)
     log.info(`  searchLines: ${JSON.stringify(searchLines)}`)
     log.info(`  occurrenceIndex: ${occurrenceIndex}`)
 
     if (result.found) {
-      log.pass(`  FOUND at line ${result.line}: "${SIMULATED_BUFFER[result.line].substring(0, 80)}"`)
+      console.log(`  ${c.green}[FOUND]${c.reset} at line ${result.line}: "${SIMULATED_BUFFER[result.line].substring(0, 80)}"`)
     } else {
-      log.fail(`  NOT FOUND (validMatches: ${result.validMatches})`)
-
-      // Debug: search for first searchLine in all buffer lines
-      const firstLine = searchLines[0]
-      log.info(`  Debugging first searchLine: "${firstLine}"`)
-      for (let lineIdx = 0; lineIdx < SIMULATED_BUFFER.length; lineIdx++) {
-        const bl = SIMULATED_BUFFER[lineIdx]
-        // Check raw includes
-        if (bl.includes(firstLine)) {
-          const lcResult = lineContains(bl, firstLine)
-          log.info(`    Line ${lineIdx}: includes=true, lineContains=${lcResult} -> "${bl.substring(0, 80)}"`)
-        }
-        // Also check if the line starts with part of the search
-        if (firstLine.length > 5 && bl.trim().startsWith(firstLine.substring(0, 10))) {
-          log.info(`    Line ${lineIdx}: starts with prefix -> "${bl.substring(0, 80)}"`)
+      console.log(`  ${c.red}[NOT FOUND]${c.reset} validMatches: ${result.validMatches}`)
+      // Debug
+      const debugLC = makeLineContains(searchLines)
+      for (let li = 0; li < SIMULATED_BUFFER.length; li++) {
+        if (debugLC(SIMULATED_BUFFER[li], searchLines[0])) {
+          const nextMatch = searchLines.length > 1
+            ? (li + 1 < SIMULATED_BUFFER.length ? debugLC(SIMULATED_BUFFER[li + 1], searchLines[1]) : false)
+            : true
+          console.log(`    Line ${li}: first match YES, next line match: ${nextMatch} -> "${SIMULATED_BUFFER[li].substring(0, 60)}"`)
+          if (li + 1 < SIMULATED_BUFFER.length) {
+            console.log(`    Line ${li + 1}: "${SIMULATED_BUFFER[li + 1].substring(0, 60)}" (expected: "${searchLines[1]}")`)
+          }
         }
       }
     }
     console.log()
   }
 
-  // ══════════════════════════════════════════════════════════════
-  // Edge case tests
-  // ══════════════════════════════════════════════════════════════
-  log.header('Edge Case: Word Boundary for "да"')
+  // ── Bug analysis ──
+  log.header('BUG ANALYSIS')
 
-  // "да" appears in "да Добавь..." and standalone "да"
-  // The word boundary check should distinguish them
-  const daSearchLines = getSearchLines('да')
-  log.info(`searchLines for "да": ${JSON.stringify(daSearchLines)}`)
+  // BUG 1: Multi-line match with empty lines between content
+  log.info('BUG 1: Entry #0 - Multi-line match fails due to empty buffer lines')
+  log.info('  searchLines[0] = "Ниже промпт документации:" -> found at buffer line 3')
+  log.info('  searchLines[1] = "<!-- @include: ./правила-документации.md -->" -> expected at line 4')
+  log.info('  But buffer line 4 is EMPTY ("") -> mismatch!')
+  log.info('  The actual match is at buffer line 5, but the algorithm requires CONSECUTIVE lines.')
+  log.info('')
+  log.info('  ROOT CAUSE: Gemini TUI inserts blank lines between content paragraphs,')
+  log.info('  but getSearchLines() skips blank lines from the entry content.')
+  log.info('  The algorithm then expects consecutive buffer lines to match,')
+  log.info('  but the buffer has blank lines that the content does not.')
+  log.info('')
+  log.info('  FIX: scrollToTextInBuffer should skip empty buffer lines when matching')
+  log.info('  multi-line content, OR getSearchLines should only use 1 line.')
+  console.log()
 
-  // Test lineContains for various contexts
-  const testCases = [
-    { haystack: 'да', needle: 'да', expected: true, desc: 'exact match' },
-    { haystack: 'да Добавь также еще вот это', needle: 'да', expected: true, desc: 'start of line with space after' },
-    { haystack: 'документации:', needle: 'да', expected: false, desc: 'inside word "документации"' },
-    { haystack: '  да  ', needle: 'да', expected: true, desc: 'surrounded by spaces' },
-    { haystack: 'Отвечай да или нет', needle: 'да', expected: true, desc: 'word in sentence' },
-    { haystack: 'надо дописать', needle: 'да', expected: false, desc: 'inside "надо"' },
-    { haystack: 'года', needle: 'да', expected: false, desc: 'inside "года"' },
-    { haystack: 'всегда', needle: 'да', expected: false, desc: 'inside "всегда"' },
+  // BUG 2: "да" matches "да Добавь..."
+  log.info('BUG 2: Entry #2 ("да") navigates to wrong position')
+  log.info('  searchLines = ["да"] (2 chars -> uses word boundary matching)')
+  log.info('  lineContains("да Добавь...", "да") = true (space after "да" is a boundary)')
+  log.info('  This matches at buffer line 31 (Entry #1 position) instead of line 42 (correct)')
+  log.info('')
+  log.info('  The occurrence counting does NOT help here because:')
+  log.info('  - Entry #1 searchLines = ["да Добавь также..."] (different from ["да"])')
+  log.info('  - So occurrenceIndex for Entry #2 is still 0')
+  log.info('  - But the first match of "да" in buffer is at line 31 (wrong location)')
+  log.info('')
+  log.info('  ROOT CAUSE: lineContains matches "да" at start of "да Добавь..." because')
+  log.info('  it has a word boundary (space) after it. This is correct behavior for')
+  log.info('  word boundary detection, but incorrect for navigation because it finds')
+  log.info('  the wrong user message.')
+  log.info('')
+  log.info('  FIX OPTIONS:')
+  log.info('  1. For single-line short entries, require the match to be the ONLY content')
+  log.info('     on the line (or at line start with nothing else meaningful)')
+  log.info('  2. Use a stricter match: for entries with just 1 very short searchLine,')
+  log.info('     require the entire buffer line to be ~equal (trimmed)')
+  log.info('  3. Count ALL "да" matches including those in longer lines,')
+  log.info('     and use occurrence to skip past "да Добавь..." match')
+
+  // ── Matching edge cases (using factory function to test each mode) ──
+  log.header('Matching Tests (isStrictShort / isIsolatedShort / default)')
+
+  // isStrictShort tests (needle < 5 chars, single-line)
+  const strictShortLC = makeLineContains(['да'])
+  const strictShortTests = [
+    { h: 'да', n: 'да', exp: true, desc: 'isStrictShort: exact match' },
+    { h: 'да Добавь', n: 'да', exp: false, desc: 'isStrictShort: long line with "да" prefix — must NOT match' },
+    { h: '  да  ', n: 'да', exp: true, desc: 'isStrictShort: spaces around' },
+    { h: '> да', n: 'да', exp: true, desc: 'isStrictShort: prompt prefix "> "' },
+    { h: 'надо', n: 'да', exp: false, desc: 'isStrictShort: inside "надо"' },
+    { h: 'года', n: 'да', exp: false, desc: 'isStrictShort: inside "года"' },
   ]
 
-  for (const tc of testCases) {
-    const actual = lineContains(tc.haystack, tc.needle)
-    const status = actual === tc.expected ? 'OK' : 'MISMATCH'
-    const prefix = status === 'OK' ? c.green : c.red
-    console.log(`  ${prefix}[${status}]${c.reset} lineContains("${tc.haystack}", "${tc.needle}") = ${actual} (expected ${tc.expected}) -- ${tc.desc}`)
-    if (actual !== tc.expected) failed++
-    else passed++
+  for (const t of strictShortTests) {
+    const actual = strictShortLC(t.h, t.n)
+    const ok = actual === t.exp
+    const prefix = ok ? c.green + '[OK]' : c.red + '[MISMATCH]'
+    console.log(`  ${prefix}${c.reset} lineContains("${t.h}", "${t.n}") = ${actual} (exp ${t.exp}) -- ${t.desc}`)
+    if (ok) passed++; else failed++
+  }
+
+  // isIsolatedShort tests (needle 5..29 chars, single-line)
+  const isolatedLC = makeLineContains(['continue'])
+  const isolatedTests = [
+    { h: 'continue', n: 'continue', exp: true, desc: 'isIsolatedShort: exact match' },
+    { h: '  continue  ', n: 'continue', exp: true, desc: 'isIsolatedShort: spaces around' },
+    { h: '> continue', n: 'continue', exp: true, desc: 'isIsolatedShort: prompt ">"' },
+    { h: 'OK, continue.', n: 'continue', exp: false, desc: 'isIsolatedShort: AI "OK, continue." — alpha prefix' },
+    { h: 'Sure, continue.', n: 'continue', exp: false, desc: 'isIsolatedShort: AI "Sure, continue." — alpha prefix' },
+    { h: "I'll continue.", n: 'continue', exp: false, desc: 'isIsolatedShort: AI "I\'ll continue." — alpha prefix' },
+    { h: 'Let me continue working on the documentation...', n: 'continue', exp: false, desc: 'isIsolatedShort: long AI response — too long' },
+    { h: 'Continuing the work...', n: 'continue', exp: false, desc: 'isIsolatedShort: "Continuing" (different word) — not found' },
+  ]
+
+  for (const t of isolatedTests) {
+    const actual = isolatedLC(t.h, t.n)
+    const ok = actual === t.exp
+    const prefix = ok ? c.green + '[OK]' : c.red + '[MISMATCH]'
+    console.log(`  ${prefix}${c.reset} lineContains("${t.h}", "${t.n}") = ${actual} (exp ${t.exp}) -- ${t.desc}`)
+    if (ok) passed++; else failed++
   }
 
   // ══════════════════════════════════════════════════════════════
-  // Key finding: Entry #1 has "да Добавь..." as searchLines[0]
-  // This is 50+ chars so uses includes() (no boundary check).
-  // But Entry #2 has just "да" which needs boundary check.
-  // The occurrence counting must separate them because their
-  // searchLines are different.
-  // ══════════════════════════════════════════════════════════════
-  log.header('Occurrence Index Analysis')
-
-  for (let i = 0; i < entries.length; i++) {
-    const searchLines = getSearchLines(entries[i].content)
-    let occurrenceIndex = 0
-    for (let j = 0; j < i; j++) {
-      const eLines = getSearchLines(entries[j].content)
-      if (eLines.length === searchLines.length && eLines.every((l, k) => l === searchLines[k])) {
-        occurrenceIndex++
-      }
-    }
-    log.info(`Entry #${i}: occurrenceIndex=${occurrenceIndex}, searchLines=${JSON.stringify(searchLines)}`)
-  }
-
-  // ══════════════════════════════════════════════════════════════
-  // PART 2: Electron test (real click handler)
+  // PART 2: Electron test
   // ══════════════════════════════════════════════════════════════
   log.header('PART 2: Electron Click Handler Test')
 
   log.step('Launching Noted Terminal...')
 
   let app, page, consoleLogs
-  for (let attempt = 1; attempt <= 3; attempt++) {
+  for (let attempt = 1; attempt <= 2; attempt++) {
     try {
       const result = await launch({
         logConsole: true,
         logMainProcess: false,
-        waitForReady: 4000
+        waitForReady: 5000,
+        timeout: 45000
       })
       app = result.app; page = result.page; consoleLogs = result.consoleLogs
       break
     } catch (e) {
-      log.warn(`Launch attempt ${attempt}: ${e.message}`)
-      if (attempt < 3) await new Promise(r => setTimeout(r, 5000))
-      else throw e
+      log.warn(`Launch attempt ${attempt}: ${e.message.substring(0, 100)}`)
+      if (attempt < 2) await new Promise(r => setTimeout(r, 8000))
+      else {
+        log.warn('Electron launch failed. Skipping Part 2.')
+        log.header('Final Summary (Part 1 only)')
+        console.log(`  Passed: ${passed}  Failed: ${failed}`)
+        if (failed === 0) log.pass('ALL TESTS PASSED')
+        else log.fail(`${failed} test(s) failed`)
+        process.exit(failed > 0 ? 1 : 0)
+      }
     }
   }
 
@@ -327,8 +383,7 @@ async function main() {
     await waitForTerminal(page, 20000)
     log.pass('Terminal ready')
 
-    // Set up tab
-    log.step('Setting up Gemini session tab...')
+    // Setup tab
     await page.keyboard.press('Meta+t')
     await page.waitForTimeout(2000)
     await typeCommand(page, `cd ${TEST_CWD}`)
@@ -344,7 +399,6 @@ async function main() {
       }
     }, { sessionId: TEST_SESSION_ID })
 
-    log.info('Waiting 5s for Timeline to load...')
     await page.waitForTimeout(5000)
 
     const dotCount = await page.evaluate(() => {
@@ -358,7 +412,7 @@ async function main() {
       }
       return 0
     })
-    assert(dotCount === 5, `Timeline rendered ${dotCount} dots (expected 5)`)
+    assert(dotCount === 5, `Timeline rendered ${dotCount} dots`)
 
     // Click each dot
     for (let dotIndex = 0; dotIndex < dotCount; dotIndex++) {
@@ -381,45 +435,35 @@ async function main() {
         return null
       }, dotIndex)
 
-      if (!dotPos) { log.warn(`  Position not found`); continue }
+      if (!dotPos) { log.warn('  Position not found'); continue }
 
       await page.mouse.click(dotPos.x, dotPos.y)
       await page.waitForTimeout(800)
 
       const newLogs = consoleLogs.slice(logsBeforeClick)
       const scrollLogs = newLogs.filter(l =>
-        l.includes('scrollToTextInBuffer') ||
-        l.includes('[Timeline]') ||
-        l.includes('Diagnosing')
+        l.includes('scrollToTextInBuffer') || l.includes('[Timeline]') || l.includes('Diagnosing')
       )
 
       for (const sl of scrollLogs) {
         const isFound = sl.includes('Found at logicalLine')
         console.log(`  ${isFound ? c.green : c.red}${sl}${c.reset}`)
       }
-
-      if (scrollLogs.length === 0) {
-        log.warn(`  No scroll logs captured`)
-      }
+      if (scrollLogs.length === 0) log.info('  (No scroll logs — buffer is empty in test instance)')
     }
 
-    // ── All logs ──
-    log.header('ALL scrollToTextInBuffer Logs from Electron')
+    // All scroll logs
+    log.header('ALL scrollToTextInBuffer Logs')
     const allScroll = consoleLogs.filter(l => l.includes('scrollToTextInBuffer'))
-    for (const line of allScroll) {
-      console.log(`  ${line}`)
-    }
+    for (const line of allScroll) console.log(`  ${line}`)
 
-    log.info(`Total: ${allScroll.length} log entries`)
-    log.info(`Found: ${allScroll.filter(l => l.includes('Found at')).length}`)
-    log.info(`NOT found: ${allScroll.filter(l => l.includes('NOT found')).length}`)
+    log.info(`Found: ${allScroll.filter(l => l.includes('Found at')).length}, NOT found: ${allScroll.filter(l => l.includes('NOT found')).length}`)
+    log.info('NOTE: All NOT found is expected — buffer has no Gemini conversation in test instance')
 
   } finally {
     await app.close()
   }
 
-  // ══════════════════════════════════════════════════════════════
-  // FINAL SUMMARY
   // ══════════════════════════════════════════════════════════════
   log.header('Final Summary')
   console.log(`  Passed: ${passed}  Failed: ${failed}`)

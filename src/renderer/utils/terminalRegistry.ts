@@ -438,8 +438,13 @@ export const terminalRegistry = {
   // Buffer-text based search + scroll. Used for Gemini where xterm search addon
   // validation (❯/⏵ prompt markers) doesn't apply.
   // Searches full buffer text for multi-line content patterns and scrolls to match.
+  //
+  // startAfterRow: if provided, only consider matches starting after this buffer row.
+  // Used by Gemini click handler to anchor navigation: find current entry only AFTER
+  // the previous entry's position, avoiding false matches in earlier AI responses.
+  //
   // Returns true if found and scrolled.
-  scrollToTextInBuffer(tabId: string, contentLines: string[], occurrenceIndex: number): boolean {
+  scrollToTextInBuffer(tabId: string, contentLines: string[], occurrenceIndex: number, startAfterRow: number = -1): boolean {
     const terminal = terminals.get(tabId);
     if (!terminal) return false;
 
@@ -471,9 +476,49 @@ export const terminalRegistry = {
 
     if (logicalLines.length === 0 || contentLines.length === 0) return false;
 
-    // For short search strings (< 5 chars), use word-boundary matching
-    // to avoid matching "да" inside "документации"
+    // Matching logic: for very short single-line entries (< 5 chars, e.g. "да"),
+    // require the buffer line to be a near-exact match (trimmed line ≈ search text),
+    // otherwise "да" would match "да Добавь также..." which is a different entry.
+    const isStrictShort = contentLines.length === 1 && contentLines[0].length < 5;
+
+    // Isolated match: for single-line entries that are short-ish (< 30 chars),
+    // common words like "continue", "yes", "done" appear in AI responses too.
+    // Require the buffer line (trimmed) to be close in length to the needle:
+    // the line should not have much more content beyond the match + prompt prefix.
+    // This prevents "continue" from matching "Let me continue working on docs..."
+    const isIsolatedShort = contentLines.length === 1 && contentLines[0].length < 30;
+
     function lineContains(haystack: string, needle: string): boolean {
+      if (isStrictShort) {
+        // Strict: very short entries (< 5 chars, e.g. "да", "yes", "ok").
+        // Trimmed line must be the needle alone, or needle with a short non-alphanumeric
+        // prefix (prompt chars like "> "). This prevents matching "года" or "тогда"
+        // where "да" appears at the end of a word.
+        const trimmed = haystack.trim();
+        if (trimmed === needle) return true;
+        if (trimmed.length > needle.length + 4) return false;
+        const pos = trimmed.indexOf(needle);
+        if (pos < 0) return false;
+        if (pos === 0) return true;
+        // Prefix must be non-alphanumeric (prompt chars, punctuation, spaces)
+        const prefix = trimmed.slice(0, pos);
+        return !/[a-zA-Z0-9\u0400-\u04FF\u0600-\u06FF\u4E00-\u9FFF\u3040-\u309F\u30A0-\u30FF]/.test(prefix);
+      }
+      if (isIsolatedShort) {
+        // Isolated: short entries (5-29 chars, e.g. "continue", "done").
+        // Needle must appear near the START of trimmed line (user typed it at prompt),
+        // not mid-sentence in AI text. Prefix before needle must be non-alphanumeric.
+        // This prevents "continue" from matching AI lines like "OK, continue." or
+        // "Sure, I'll continue working..." where the word is embedded in a sentence.
+        const trimmed = haystack.trim();
+        if (trimmed.length > needle.length + 10) return false;
+        const pos = trimmed.indexOf(needle);
+        if (pos < 0) return false;
+        if (pos === 0) return true;
+        // Prefix before needle must contain no letters/digits (just prompt/punctuation)
+        const prefix = trimmed.slice(0, pos);
+        return !/[a-zA-Z0-9\u0400-\u04FF\u0600-\u06FF\u4E00-\u9FFF\u3040-\u309F\u30A0-\u30FF]/.test(prefix);
+      }
       if (needle.length >= 5) return haystack.includes(needle);
       // Word-boundary: check chars before and after the match aren't word chars
       let from = 0;
@@ -482,7 +527,6 @@ export const terminalRegistry = {
         if (pos === -1) return false;
         const before = pos > 0 ? haystack[pos - 1] : ' ';
         const after = pos + needle.length < haystack.length ? haystack[pos + needle.length] : ' ';
-        // Word boundary: space, punctuation, line start/end, or non-alpha
         const boundaryRe = /[\s\.,;:!?\-—–()\[\]{}<>\/\\|"'`~@#$%^&*+=]/;
         if ((pos === 0 || boundaryRe.test(before)) && (pos + needle.length === haystack.length || boundaryRe.test(after))) {
           return true;
@@ -491,18 +535,34 @@ export const terminalRegistry = {
       }
     }
 
-    // Search for multi-line match: all contentLines must match consecutive logical lines
+    // Search for multi-line match: all contentLines must match logical lines.
+    // Buffer may have empty lines between content (Gemini TUI formatting),
+    // so we skip empty lines when matching subsequent contentLines.
     const firstLine = contentLines[0];
     let validCount = 0;
 
     for (let i = 0; i <= logicalLines.length - contentLines.length; i++) {
+      // Skip lines before startAfterRow (anchored search for ordered entries)
+      if (startAfterRow >= 0 && logicalLines[i].bufRow <= startAfterRow) continue;
+
       // First content line must be found within this logical line
       if (!lineContains(logicalLines[i].text, firstLine)) continue;
 
-      // Check remaining content lines match subsequent logical lines
+      // Check remaining content lines: scan forward, allowing up to 5 gap lines
+      // (empty lines, separators like "---", or other TUI formatting) between matches.
       let allMatch = true;
+      let bufIdx = i + 1;
       for (let j = 1; j < contentLines.length; j++) {
-        if (i + j >= logicalLines.length || !lineContains(logicalLines[i + j].text, contentLines[j])) {
+        let found = false;
+        const maxGap = 5;
+        for (let gap = 0; gap < maxGap && bufIdx < logicalLines.length; gap++, bufIdx++) {
+          if (lineContains(logicalLines[bufIdx].text, contentLines[j])) {
+            found = true;
+            bufIdx++;
+            break;
+          }
+        }
+        if (!found) {
           allMatch = false;
           break;
         }
@@ -515,13 +575,124 @@ export const terminalRegistry = {
         const targetRow = logicalLines[i].bufRow;
         const centerRow = Math.max(0, targetRow - Math.floor(terminal.rows / 2));
         terminal.scrollToLine(centerRow);
-        console.log('[terminalRegistry.scrollToTextInBuffer] Found at logicalLine:', i, 'bufRow:', targetRow, 'occurrence:', occurrenceIndex);
+        console.log('[terminalRegistry.scrollToTextInBuffer] Found at logicalLine:', i, 'bufRow:', targetRow, 'occurrence:', occurrenceIndex, 'startAfterRow:', startAfterRow);
         return true;
       }
       validCount++;
     }
 
-    console.log('[terminalRegistry.scrollToTextInBuffer] NOT found. contentLines[0]:', JSON.stringify(firstLine), 'occurrence:', occurrenceIndex, 'validMatches:', validCount);
+    console.log('[terminalRegistry.scrollToTextInBuffer] NOT found. contentLines[0]:', JSON.stringify(firstLine), 'occurrence:', occurrenceIndex, 'validMatches:', validCount, 'startAfterRow:', startAfterRow);
     return false;
+  },
+
+  // Find the buffer row of a text match WITHOUT scrolling.
+  // Used by Gemini click handler to find previous entry positions for anchored search.
+  // Returns the buffer row number, or -1 if not found.
+  findTextBufferRow(tabId: string, contentLines: string[], occurrenceIndex: number, startAfterRow: number = -1): number {
+    const terminal = terminals.get(tabId);
+    if (!terminal) return -1;
+
+    const buf = terminal.buffer.active;
+
+    // Build logical lines (same as scrollToTextInBuffer)
+    const logicalLines: { text: string; bufRow: number }[] = [];
+    let currentText = '';
+    let currentStartRow = 0;
+
+    for (let i = 0; i < buf.length; i++) {
+      const line = buf.getLine(i);
+      if (!line) continue;
+
+      if (i > 0 && !line.isWrapped) {
+        logicalLines.push({ text: currentText, bufRow: currentStartRow });
+        currentText = '';
+        currentStartRow = i;
+      }
+      const nextLine = (i + 1 < buf.length) ? buf.getLine(i + 1) : null;
+      currentText += line.translateToString(!nextLine?.isWrapped);
+    }
+    if (currentText) {
+      logicalLines.push({ text: currentText, bufRow: currentStartRow });
+    }
+
+    if (logicalLines.length === 0 || contentLines.length === 0) return -1;
+
+    const isStrictShort = contentLines.length === 1 && contentLines[0].length < 5;
+    const isIsolatedShort = contentLines.length === 1 && contentLines[0].length < 30;
+
+    function lineContains(haystack: string, needle: string): boolean {
+      if (isStrictShort) {
+        // Strict: very short entries (< 5 chars). Prefix must be non-alphanumeric.
+        const trimmed = haystack.trim();
+        if (trimmed === needle) return true;
+        if (trimmed.length > needle.length + 4) return false;
+        const pos = trimmed.indexOf(needle);
+        if (pos < 0) return false;
+        if (pos === 0) return true;
+        const prefix = trimmed.slice(0, pos);
+        return !/[a-zA-Z0-9\u0400-\u04FF\u0600-\u06FF\u4E00-\u9FFF\u3040-\u309F\u30A0-\u30FF]/.test(prefix);
+      }
+      if (isIsolatedShort) {
+        // Isolated: needle must appear near the START of trimmed line (user-typed text),
+        // not mid-sentence in AI responses. Prefix must be non-alphanumeric.
+        const trimmed = haystack.trim();
+        if (trimmed.length > needle.length + 10) return false;
+        const pos = trimmed.indexOf(needle);
+        if (pos < 0) return false;
+        if (pos === 0) return true;
+        const prefix = trimmed.slice(0, pos);
+        return !/[a-zA-Z0-9\u0400-\u04FF\u0600-\u06FF\u4E00-\u9FFF\u3040-\u309F\u30A0-\u30FF]/.test(prefix);
+      }
+      if (needle.length >= 5) return haystack.includes(needle);
+      let from = 0;
+      while (true) {
+        const pos = haystack.indexOf(needle, from);
+        if (pos === -1) return false;
+        const before = pos > 0 ? haystack[pos - 1] : ' ';
+        const after = pos + needle.length < haystack.length ? haystack[pos + needle.length] : ' ';
+        const boundaryRe = /[\s\.,;:!?\-—–()\[\]{}<>\/\\|"'`~@#$%^&*+=]/;
+        if ((pos === 0 || boundaryRe.test(before)) && (pos + needle.length === haystack.length || boundaryRe.test(after))) {
+          return true;
+        }
+        from = pos + 1;
+      }
+    }
+
+    const firstLine = contentLines[0];
+    let validCount = 0;
+
+    for (let i = 0; i <= logicalLines.length - contentLines.length; i++) {
+      if (startAfterRow >= 0 && logicalLines[i].bufRow <= startAfterRow) continue;
+
+      if (!lineContains(logicalLines[i].text, firstLine)) continue;
+
+      // Allow up to 5 gap lines (empty, separators, TUI formatting) between matches
+      let allMatch = true;
+      let bufIdx = i + 1;
+      for (let j = 1; j < contentLines.length; j++) {
+        let found = false;
+        const maxGap = 5;
+        for (let gap = 0; gap < maxGap && bufIdx < logicalLines.length; gap++, bufIdx++) {
+          if (lineContains(logicalLines[bufIdx].text, contentLines[j])) {
+            found = true;
+            bufIdx++;
+            break;
+          }
+        }
+        if (!found) {
+          allMatch = false;
+          break;
+        }
+      }
+
+      if (!allMatch) continue;
+
+      if (validCount === occurrenceIndex) {
+        return logicalLines[i].bufRow;
+      }
+      validCount++;
+    }
+
+    return -1;
   }
 };
