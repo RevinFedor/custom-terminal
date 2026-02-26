@@ -899,7 +899,7 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
         }
 
         // --- CASE: gemini -r [uuid] (resume session) ---
-        const geminiResumeMatch = fullLine.match(/(?:^|\s)gemini\s+-r(?:\s+([a-f0-9-]+))?\s*$/);
+        const geminiResumeMatch = fullLine.match(/\bgemini\s+-r(?:\s+([a-f0-9-]+))?\s*$/);
         if (geminiResumeMatch) {
           const resumeId = geminiResumeMatch[1] || null; // null if bare "gemini -r"
           log.gemini('Detected gemini -r command, resumeId: %s', resumeId);
@@ -1197,6 +1197,52 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
           } else if (geminiMatch) {
             log.commands('Detected gemini command, setting commandType');
             getSetTabCommandType()(tabId, 'gemini');
+          }
+
+          // --- Gemini interception (mirrors initTerminal logic) ---
+          if (fullLine.endsWith(' gemini') || fullLine === 'gemini') {
+            getSetTabCommandType()(tabId, 'gemini');
+            event.preventDefault();
+            const existingGeminiId = getGeminiSessionId(tabId);
+            const existingClaudeId = getClaudeSessionId(tabId);
+            if (existingGeminiId) {
+              ipcRenderer.send('terminal:input', tabId, '\x15echo "❌ Уже есть Gemini сессия: ' + existingGeminiId + '"\r');
+              return false;
+            }
+            if (existingClaudeId) {
+              ipcRenderer.send('terminal:input', tabId, '\x15echo "❌ Уже есть Claude сессия. Откройте новую вкладку."\r');
+              return false;
+            }
+            ipcRenderer.send('terminal:input', tabId, '\x15');
+            const cwd2 = getTabCwd(tabId);
+            ipcRenderer.send('gemini:spawn-with-watcher', { tabId, cwd: cwd2 });
+            return false;
+          }
+
+          const geminiResumeMatch2 = fullLine.match(/\bgemini\s+-r(?:\s+([a-f0-9-]+))?\s*$/);
+          if (geminiResumeMatch2) {
+            const resumeId = geminiResumeMatch2[1] || null;
+            getSetTabCommandType()(tabId, 'gemini');
+            event.preventDefault();
+            const existingGeminiId = getGeminiSessionId(tabId);
+            const existingClaudeId = getClaudeSessionId(tabId);
+            if (existingGeminiId) {
+              ipcRenderer.send('terminal:input', tabId, '\x15echo "❌ Уже есть Gemini сессия: ' + existingGeminiId + '"\r');
+              return false;
+            }
+            if (existingClaudeId) {
+              ipcRenderer.send('terminal:input', tabId, '\x15echo "❌ Уже есть Claude сессия. Откройте новую вкладку."\r');
+              return false;
+            }
+            ipcRenderer.send('terminal:input', tabId, '\x15');
+            if (resumeId) {
+              getSetGeminiSessionId()(tabId, resumeId);
+              ipcRenderer.send('terminal:input', tabId, 'gemini -r ' + resumeId + '\r');
+            } else {
+              const cwd2 = getTabCwd(tabId);
+              ipcRenderer.send('gemini:spawn-with-watcher', { tabId, cwd: cwd2, bareResume: true });
+            }
+            return false;
           }
 
           if (fullLine.endsWith(' claude') || fullLine === 'claude') {
