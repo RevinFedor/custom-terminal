@@ -273,7 +273,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
 
           // Detect session ID change (e.g., after "Clear Context" in plan mode)
           if (timelineResult.latestSessionId && timelineResult.latestSessionId !== sessionId) {
-            console.log('[Timeline] Session chain detected! Updating sessionId:', sessionId, '→', timelineResult.latestSessionId);
+            console.warn('[Timeline:ChainResolve] OVERWRITE session for tab', tabId, ':', sessionId.substring(0, 8), '→', timelineResult.latestSessionId.substring(0, 8), '(Timeline resolved chain)');
             useWorkspaceStore.getState().setClaudeSessionId(tabId, timelineResult.latestSessionId);
           }
         }

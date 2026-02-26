@@ -476,7 +476,7 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
       if (data.tabId !== tabId) return;
       const currentId = getClaudeSessionId(tabId);
       if (currentId !== data.sessionId) {
-        console.log('[Terminal] Bridge session:', data.sessionId.substring(0, 8) + '...', currentId ? '(was: ' + currentId.substring(0, 8) + '...)' : '(new)');
+        console.warn('[Terminal:Bridge] OVERWRITE session for tab', tabId, ':', (currentId || 'null').substring(0, 8), '→', data.sessionId.substring(0, 8));
       }
       getSetClaudeSessionId()(tabId, data.sessionId);
     };

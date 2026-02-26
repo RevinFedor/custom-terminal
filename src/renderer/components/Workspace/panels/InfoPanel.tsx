@@ -307,6 +307,7 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
     if (mode === 'gemini') {
       useWorkspaceStore.getState().setGeminiSessionId(activeTabId, newId);
     } else {
+      console.warn('[InfoPanel:ManualSet] MANUAL session set for tab', activeTabId, ':', newId.substring(0, 8));
       useWorkspaceStore.getState().setClaudeSessionId(activeTabId, newId);
     }
     showToast(`${mode === 'gemini' ? 'Gemini' : 'Claude'} session set: ${newId.substring(0, 8)}...`, 'success');

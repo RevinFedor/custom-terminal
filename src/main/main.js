@@ -77,6 +77,7 @@ function startSessionBridge() {
 
       // Check PID cache first
       let tabId = bridgePidCache.get(data.ppid);
+      let pidSource = tabId ? 'cache' : 'resolve';
 
       if (!tabId) {
         // Resolve Claude PID → parent (shell PID) → match to our PTY
@@ -91,6 +92,12 @@ function startSessionBridge() {
       }
 
       if (!tabId) return; // Not our process
+
+      // Debug: log PID chain resolution for session detection
+      const knownForTab = bridgeKnownSessions.get(tabId);
+      if (knownForTab !== data.session_id) {
+        console.log('[Bridge:PID] session=' + data.session_id.substring(0, 8) + '... claudePid=' + data.ppid + ' → tab=' + tabId + ' (via ' + pidSource + ') | was=' + (knownForTab ? knownForTab.substring(0, 8) + '...' : 'none'));
+      }
 
       // Always send bridge metadata (model, context) on every update
       if (mainWindow && !mainWindow.isDestroyed()) {
