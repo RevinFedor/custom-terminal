@@ -1192,7 +1192,13 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         // Skip if session ID unchanged (Bridge polls repeatedly with same ID)
         if (tab.claudeSessionId === sessionId) return;
 
-        console.warn('[Store:setClaudeSessionId] ' + (tab.claudeSessionId || 'null') + ' -> ' + sessionId);
+        const caller = new Error().stack?.split('\n')[2]?.trim() || 'unknown';
+        const logEntry = { ts: Date.now(), tabId, from: (tab.claudeSessionId || 'null').substring(0, 8), to: sessionId.substring(0, 8), caller };
+        // Ring buffer: always available even if DevTools was closed
+        const buf = ((window as any).__sessionLog = (window as any).__sessionLog || []);
+        buf.push(logEntry);
+        if (buf.length > 100) buf.shift();
+        console.warn('[Store:setClaudeSessionId] ' + logEntry.from + ' -> ' + logEntry.to + ' | tabId=' + tabId + ' | caller=' + caller);
         tab.claudeSessionId = sessionId;
         // Reset overlay flags when new session starts (so overlay shows again if interrupted)
         tab.wasInterrupted = false;
