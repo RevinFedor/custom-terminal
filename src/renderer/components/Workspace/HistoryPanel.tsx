@@ -12,9 +12,19 @@ interface FileAction {
   newString?: string;
   content?: string;
 }
-type Action = string | FileAction;
+interface TaskAction {
+  tool: 'Task';
+  description: string;
+  toolUseId?: string;
+  result?: string;
+  history?: Array<{ type: string; content?: string; tools?: string[] }>;
+}
+type Action = string | FileAction | TaskAction;
 
-const isFileAction = (a: Action): a is FileAction => typeof a === 'object' && a !== null && 'tool' in a;
+const isFileAction = (a: Action): a is FileAction =>
+  typeof a === 'object' && a !== null && 'tool' in a && (a as any).tool !== 'Task';
+const isTaskAction = (a: Action): a is TaskAction =>
+  typeof a === 'object' && a !== null && 'tool' in a && (a as any).tool === 'Task';
 
 interface FullHistoryEntry {
   uuid: string;
@@ -133,6 +143,89 @@ const ReadActionBlock = ({ filePath }: { filePath: string }) => (
   </div>
 );
 
+// Sub-agent (Task) — blue border, collapsible result and history
+const SubAgentBlock = memo(({ action }: { action: TaskAction }) => {
+  const [showResult, setShowResult] = useState(false);
+  const [showHistory, setShowHistory] = useState(false);
+
+  return (
+    <div style={{ marginTop: 4, borderLeft: '3px solid #60a5fa', paddingLeft: 8 }}>
+      <span style={{ fontSize: 11, color: '#60a5fa' }}>
+        {'\u{1F9F5}'} {action.description || 'Task agent'}
+      </span>
+
+      {action.result && (
+        <div style={{ marginTop: 2 }}>
+          <button
+            onClick={() => setShowResult(!showResult)}
+            style={{
+              background: 'none', border: 'none', color: '#60a5fa',
+              cursor: 'pointer', fontSize: 10, display: 'flex',
+              alignItems: 'center', gap: 3, padding: 0, opacity: 0.8,
+            }}
+          >
+            {showResult ? <ChevronDown size={10} /> : <ChevronRight size={10} />}
+            Результат
+          </button>
+          {showResult && (
+            <div style={{
+              marginTop: 2, fontSize: 11, color: '#bbb',
+              whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+              maxHeight: 300, overflowY: 'auto',
+              backgroundColor: 'rgba(96, 165, 250, 0.05)',
+              padding: '4px 6px', borderRadius: 4,
+            }}>
+              {action.result}
+            </div>
+          )}
+        </div>
+      )}
+
+      {action.history && action.history.length > 0 && (
+        <div style={{ marginTop: 2 }}>
+          <button
+            onClick={() => setShowHistory(!showHistory)}
+            style={{
+              background: 'none', border: 'none', color: '#4ade80',
+              cursor: 'pointer', fontSize: 10, display: 'flex',
+              alignItems: 'center', gap: 3, padding: 0, opacity: 0.8,
+            }}
+          >
+            {showHistory ? <ChevronDown size={10} /> : <ChevronRight size={10} />}
+            История ({action.history.length} turns)
+          </button>
+          {showHistory && (
+            <div style={{
+              marginTop: 2, fontSize: 11, maxHeight: 400, overflowY: 'auto',
+              display: 'flex', flexDirection: 'column', gap: 2,
+            }}>
+              {action.history.map((turn, i) => (
+                <div key={i} style={{
+                  padding: '2px 4px', borderRadius: 3,
+                  backgroundColor: turn.type === 'user'
+                    ? 'rgba(255,255,255,0.03)' : 'transparent',
+                }}>
+                  <span style={{ color: turn.type === 'user' ? '#888' : '#60a5fa', fontSize: 10 }}>
+                    {turn.type === 'user' ? '\u{1F464}' : '\u{1F916}'}
+                  </span>{' '}
+                  {turn.content && (
+                    <span style={{ color: '#aaa', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+                      {turn.content.length > 300 ? turn.content.substring(0, 300) + '...' : turn.content}
+                    </span>
+                  )}
+                  {turn.tools && turn.tools.map((t, j) => (
+                    <div key={j} style={{ color: '#777', fontSize: 10, paddingLeft: 14 }}>{t}</div>
+                  ))}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+});
+
 // Single history entry renderer
 const HistoryEntry = memo(({ entry, toolType }: { entry: FullHistoryEntry; toolType?: 'claude' | 'gemini' }) => {
   if (entry.role === 'compact') {
@@ -216,12 +309,15 @@ const HistoryEntry = memo(({ entry, toolType }: { entry: FullHistoryEntry; toolT
       {entry.actions && entry.actions.length > 0 && (() => {
         const editWriteActions: FileAction[] = [];
         const readActions: FileAction[] = [];
+        const taskActions: TaskAction[] = [];
         const otherActions: string[] = [];
         for (const a of entry.actions) {
-          if (isFileAction(a)) {
+          if (isTaskAction(a)) {
+            taskActions.push(a);
+          } else if (isFileAction(a)) {
             if (a.tool === 'Read') readActions.push(a);
             else editWriteActions.push(a);
-          } else {
+          } else if (typeof a === 'string') {
             otherActions.push(a);
           }
         }
@@ -232,6 +328,9 @@ const HistoryEntry = memo(({ entry, toolType }: { entry: FullHistoryEntry; toolT
             ))}
             {readActions.map((action, i) => (
               <ReadActionBlock key={'rd' + i} filePath={action.filePath} />
+            ))}
+            {taskActions.map((action, i) => (
+              <SubAgentBlock key={'task' + i} action={action} />
             ))}
             {otherActions.length > 0 && (
               <div style={{ marginTop: 6, display: 'flex', flexWrap: 'wrap', gap: 4 }}>

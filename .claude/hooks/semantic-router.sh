@@ -12,13 +12,13 @@
 INPUT=$(cat)
 PROMPT=$(echo "$INPUT" | jq -r '.prompt // empty' 2>/dev/null)
 
-# Check trigger: ??? or &&& at start or end of prompt
-if [ -z "$PROMPT" ] || ! echo "$PROMPT" | grep -qE '(^[[:space:]]*(\?\?\?|&&&)|(\?\?\?|&&&)[[:space:]]*$)'; then
+# Check trigger: ??? or &&& anywhere in prompt
+if [ -z "$PROMPT" ] || ! echo "$PROMPT" | grep -qE '\?\?\?|&&&'; then
   exit 0
 fi
 
-# Strip trigger (from start or end)
-CLEAN_PROMPT=$(echo "$PROMPT" | sed -E 's/^[[:space:]]*((\?\?\?)|(&&&))[[:space:]]*//' | sed -E 's/[[:space:]]*((\?\?\?)|(&&&))[[:space:]]*$//')
+# Strip all occurrences of trigger from prompt
+CLEAN_PROMPT=$(echo "$PROMPT" | sed -E 's/[[:space:]]*((\?\?\?)|(&&&))[[:space:]]*/ /g' | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')
 
 PROJECT_DIR="${CLAUDE_PROJECT_DIR:-.}"
 INDEX_FILE="$PROJECT_DIR/.semantic-index.json"
@@ -133,37 +133,16 @@ ROUTER_LOG="/tmp/semantic-router.log"
 echo "[$(date '+%H:%M:%S')] Selected: $FILE_NAMES" >> "$ROUTER_LOG"
 echo "[$(date '+%H:%M:%S')] Prompt: $(echo "$CLEAN_PROMPT" | head -c 80)..." >> "$ROUTER_LOG"
 
-# Буферизуем весь output во временный файл (избегаем потери при постепенном stdout)
-OUTPUT_TMP=$(mktemp /tmp/sr-output-XXXXXXXX)
-
-{
-  echo "[Semantic Router] Haiku selected: $FILE_NAMES"
-  echo ""
-  echo "<semantic_context>"
-  echo "These files were pre-selected by Haiku 4.5 as most relevant to the user's task."
-  echo "Read them carefully. DO NOT re-read these files with the Read tool."
-  echo ""
-
-  INJECTED=0
-  while IFS= read -r rel_path; do
-    FULL_PATH="$PROJECT_DIR/$rel_path"
-    if [ -f "$FULL_PATH" ]; then
-      echo "--- FILE: $rel_path ---"
-      cat "$FULL_PATH"
-      echo ""
-      echo "--- END: $rel_path ---"
-      echo ""
-      INJECTED=$((INJECTED + 1))
-    fi
-  done <<< "$FILE_LIST"
-
-  if [ "$INJECTED" -gt 0 ]; then
-    echo "Total files injected: $INJECTED"
-    echo "Now proceed with the user task. DO NOT re-read these files with Read tool."
-  fi
-  echo "</semantic_context>"
-} > "$OUTPUT_TMP"
-
-# Выдаём весь буфер одним куском в stdout
-cat "$OUTPUT_TMP"
-rm -f "$OUTPUT_TMP"
+# stdout: инструкция для Claude (приходит как <system-reminder>)
+echo "BLOCKING INSTRUCTION — you MUST complete these steps before responding to the user:"
+echo ""
+echo "1. Use the Read tool to read EACH of these files (all of them, in parallel):"
+while IFS= read -r rel_path; do
+  echo "   - $PROJECT_DIR/$rel_path"
+done <<< "$FILE_LIST"
+echo ""
+echo "2. Use the knowledge from these files to answer the user's question."
+echo "3. Do NOT tell the user you are reading files. Just read them silently and answer."
+echo ""
+echo "These files were selected by a semantic search AI (Haiku) as the most relevant docs for this task."
+echo "Skipping them will result in an incorrect or incomplete answer."

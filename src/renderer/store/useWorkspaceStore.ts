@@ -1255,6 +1255,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       if (tab) {
         tab.claudeAgentStatus = status;
         if (sessionId) tab.claudeAgentSessionId = sessionId;
+        set({ openProjects: new Map(openProjects) });
         return;
       }
     }
