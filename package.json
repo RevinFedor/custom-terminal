@@ -28,6 +28,7 @@
     }
   },
   "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.2.59",
     "@anthropic/markdown-editor": "file:../gt-editor/packages/markdown-editor",
     "@atlaskit/pragmatic-drag-and-drop": "^1.7.7",
     "@atlaskit/pragmatic-drag-and-drop-auto-scroll": "^2.1.5",

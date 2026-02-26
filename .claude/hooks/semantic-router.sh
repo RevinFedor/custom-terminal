@@ -133,31 +133,37 @@ ROUTER_LOG="/tmp/semantic-router.log"
 echo "[$(date '+%H:%M:%S')] Selected: $FILE_NAMES" >> "$ROUTER_LOG"
 echo "[$(date '+%H:%M:%S')] Prompt: $(echo "$CLEAN_PROMPT" | head -c 80)..." >> "$ROUTER_LOG"
 
-# Контекст для Claude (stdout)
-echo "[Semantic Router] Haiku selected: $FILE_NAMES"
-echo ""
+# Буферизуем весь output во временный файл (избегаем потери при постепенном stdout)
+OUTPUT_TMP=$(mktemp /tmp/sr-output-XXXXXXXX)
 
-# Inject file contents
-echo "<semantic_context>"
-echo "These files were pre-selected by Haiku 4.5 as most relevant to the user's task."
-echo "Read them carefully. DO NOT re-read these files with the Read tool."
-echo ""
+{
+  echo "[Semantic Router] Haiku selected: $FILE_NAMES"
+  echo ""
+  echo "<semantic_context>"
+  echo "These files were pre-selected by Haiku 4.5 as most relevant to the user's task."
+  echo "Read them carefully. DO NOT re-read these files with the Read tool."
+  echo ""
 
-INJECTED=0
-while IFS= read -r rel_path; do
-  FULL_PATH="$PROJECT_DIR/$rel_path"
-  if [ -f "$FULL_PATH" ]; then
-    echo "--- FILE: $rel_path ---"
-    cat "$FULL_PATH"
-    echo ""
-    echo "--- END: $rel_path ---"
-    echo ""
-    INJECTED=$((INJECTED + 1))
+  INJECTED=0
+  while IFS= read -r rel_path; do
+    FULL_PATH="$PROJECT_DIR/$rel_path"
+    if [ -f "$FULL_PATH" ]; then
+      echo "--- FILE: $rel_path ---"
+      cat "$FULL_PATH"
+      echo ""
+      echo "--- END: $rel_path ---"
+      echo ""
+      INJECTED=$((INJECTED + 1))
+    fi
+  done <<< "$FILE_LIST"
+
+  if [ "$INJECTED" -gt 0 ]; then
+    echo "Total files injected: $INJECTED"
+    echo "Now proceed with the user task. DO NOT re-read these files with Read tool."
   fi
-done <<< "$FILE_LIST"
+  echo "</semantic_context>"
+} > "$OUTPUT_TMP"
 
-if [ "$INJECTED" -gt 0 ]; then
-  echo "Total files injected: $INJECTED"
-  echo "Now proceed with the user task. DO NOT re-read these files with Read tool."
-fi
-echo "</semantic_context>"
+# Выдаём весь буфер одним куском в stdout
+cat "$OUTPUT_TMP"
+rm -f "$OUTPUT_TMP"

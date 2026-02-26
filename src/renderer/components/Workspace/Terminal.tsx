@@ -78,6 +78,9 @@ const getClaudeSessionId = (tabId: string) => useWorkspaceStore.getState().getCl
 const getSetGeminiSessionId = () => useWorkspaceStore.getState().setGeminiSessionId;
 const getGeminiSessionId = (tabId: string) => useWorkspaceStore.getState().getGeminiSessionId(tabId);
 
+// Claude Agent orchestration status setter
+const getSetClaudeAgentStatus = () => useWorkspaceStore.getState().setClaudeAgentStatus;
+
 // Get setTabCommandType for auto-color and restart button visibility
 const getSetTabCommandType = () => useWorkspaceStore.getState().setTabCommandType;
 
@@ -491,12 +494,29 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
       getSetGeminiSessionId()(tabId, data.sessionId);
     };
 
+    // Claude Agent orchestration: status updates from main process
+    const handleClaudeAgentStatus = (_: any, data: { tabId: string; status: string; sessionId?: string; error?: string }) => {
+      if (data.tabId !== tabId) return;
+      console.warn('[Terminal] Claude Agent status:', data.status, data.sessionId || '');
+      getSetClaudeAgentStatus()(tabId, data.status as any, data.sessionId);
+
+      // UX toasts so user knows what's happening
+      if (data.status === 'running') {
+        useUIStore.getState().showToast('Claude Agent: working...', 'info', 3000);
+      } else if (data.status === 'done') {
+        useUIStore.getState().showToast('Claude Agent: done, response pasted', 'success', 3000);
+      } else if (data.status === 'error') {
+        useUIStore.getState().showToast('Claude Agent: error — ' + (data.error || 'unknown'), 'error', 5000);
+      }
+    };
+
     // Register IPC listeners synchronously
     ipcRenderer.on('terminal:data', handleData);
     ipcRenderer.on('terminal:exit', handleExit);
     ipcRenderer.on('claude:session-detected', handleSessionDetected);
     ipcRenderer.on('claude:status-session-detected', handleStatusSessionDetected);
     ipcRenderer.on('gemini:session-detected', handleGeminiSessionDetected);
+    ipcRenderer.on('claude-agent:status', handleClaudeAgentStatus);
 
     // Resize observer with Guard Clause (prevents WebGL accordion effect)
     const resizeObserver = new ResizeObserver((entries) => {
@@ -910,6 +930,7 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
       ipcRenderer.removeListener('claude:session-detected', handleSessionDetected);
       ipcRenderer.removeListener('claude:status-session-detected', handleStatusSessionDetected);
       ipcRenderer.removeListener('gemini:session-detected', handleGeminiSessionDetected);
+      ipcRenderer.removeListener('claude-agent:status', handleClaudeAgentStatus);
       // Close Gemini watcher if active for this tab
       ipcRenderer.send('gemini:close-watcher', { tabId });
 
