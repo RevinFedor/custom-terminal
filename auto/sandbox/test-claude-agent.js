@@ -229,7 +229,7 @@ async function main() {
     console.log('--- End ---\n')
 
     // Renderer logs (claude-agent related)
-    const rendererAgentLogs = findInLogs(consoleLogs, 'Claude Agent')
+    const rendererAgentLogs = findInLogs(consoleLogs, 'ClaudeAgent')
     console.log('--- Renderer Claude Agent Logs ---')
     rendererAgentLogs.forEach(l => log.log(l.substring(0, 200)))
     console.log('--- End ---\n')
@@ -245,20 +245,20 @@ async function main() {
     // Check 1: Pattern detection in main process
     const patternDetected = allDetectLogs.length > 0
     if (patternDetected) {
-      log.pass('CHECK 1: Pattern @claude:...@end detected in main process')
+      log.pass('CHECK 1: Pattern :::claude::: detected in main process')
       passCount++
     } else {
-      log.fail('CHECK 1: Pattern @claude:...@end NOT detected in main process')
+      log.fail('CHECK 1: Pattern :::claude::: NOT detected in main process')
       failCount++
     }
 
     // Check 2: Handle started
-    const handleStarted = allHandleLogs.some(l => l.includes('Starting request'))
+    const handleStarted = allHandleLogs.some(l => l.includes('Send') || l.includes('NEW session'))
     if (handleStarted) {
-      log.pass('CHECK 2: handleClaudeAgentRequest started')
+      log.pass('CHECK 2: handleClaudeAgentCommand started')
       passCount++
     } else {
-      log.fail('CHECK 2: handleClaudeAgentRequest did NOT start')
+      log.fail('CHECK 2: handleClaudeAgentCommand did NOT start')
       failCount++
     }
 
@@ -319,6 +319,19 @@ async function main() {
       }
     } else {
       log.fail('CHECK 6: Skipped (no completion)')
+      failCount++
+    }
+
+    // Check 7: Response contains metadata (turn, tokens, cost)
+    const metaLog = allHandleLogs.find(l => l.includes('Turn=') && l.includes('Tokens='))
+    if (metaLog) {
+      log.pass('CHECK 7: Response contains metadata (turn, tokens, cost)')
+      log.log(metaLog.substring(0, 200))
+      passCount++
+    } else if (finalStatus === 'error') {
+      log.warn('CHECK 7: Skipped (status is "error")')
+    } else {
+      log.fail('CHECK 7: No metadata in handle logs')
       failCount++
     }
 

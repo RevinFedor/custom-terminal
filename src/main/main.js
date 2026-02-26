@@ -38,7 +38,9 @@ const claudeCtrlCDangerZone = new Map(); // tabId -> { resolve, promise, timer }
 let sessionManager; // Initialized after projectManager is ready
 let claudeManager; // Initialized with terminals map
 const claudeAgentManager = new ClaudeAgentManager();
-const claudeAgentBuffer = new Map(); // tabId -> stripped text buffer for @claude:...@end detection
+const claudeAgentBuffer = new Map(); // tabId -> stripped text buffer for :::claude::: detection
+const claudeAgentCooldown = new Map(); // tabId -> timestamp (ms) — ignore detections until cooldown expires
+const claudeAgentArmed = new Map();   // tabId -> boolean — only detect after first user input (prevents restore replay)
 
 // ========== SESSION BRIDGE (StatusLine-based session detection) ==========
 // Claude's statusLine feature calls ~/.claude/statusline-bridge.sh after every response,
@@ -579,7 +581,8 @@ app.on('activate', () => {
 });
 
 // Shared helper: format tool_use block for clean export
-function formatToolAction(toolName, input, toolResult = null, includeEditing = false, includeReading = false) {
+function formatToolAction(toolName, input, toolResult = null, includeEditing = false, includeReading = false, opts = {}) {
+  const { includeSubagentResult = false, includeSubagentHistory = false, progressEntries = [] } = opts;
   let label = '';
   switch (toolName) {
     case 'Read': label = '📄 Чтение (' + (input.file_path || '?') + ')'; break;
@@ -592,12 +595,18 @@ function formatToolAction(toolName, input, toolResult = null, includeEditing = f
     }
     case 'Glob': label = '🔍 Поиск файлов (' + (input.pattern || '?') + ')'; break;
     case 'Grep': label = '🔍 Поиск в коде (' + (input.pattern || '?') + ')'; break;
+    case 'Task': {
+      const desc = input.description || input.prompt?.substring(0, 60) || '';
+      label = '🧵 Субагент (' + desc + ')';
+      break;
+    }
     default: label = '⚙️ ' + toolName;
   }
 
   const shouldInclude =
     ((toolName === 'Edit' || toolName === 'Write' || toolName === 'Bash') && includeEditing) ||
-    (toolName === 'Read' && includeReading);
+    (toolName === 'Read' && includeReading) ||
+    (toolName === 'Task' && (includeSubagentResult || includeSubagentHistory));
 
   if (!shouldInclude) return label;
 
@@ -610,13 +619,63 @@ function formatToolAction(toolName, input, toolResult = null, includeEditing = f
     detail = '\n```\n' + input.content + '\n```';
   } else if (toolName === 'Bash' && toolResult?.content) {
     detail = '\n```\n' + toolResult.content + '\n```';
+  } else if (toolName === 'Task') {
+    // Sub-agent result
+    if (includeSubagentResult && toolResult) {
+      const resultText = typeof toolResult.content === 'string'
+        ? toolResult.content
+        : Array.isArray(toolResult.content)
+          ? toolResult.content.filter(c => c.type === 'text').map(c => c.text).join('\n')
+          : '';
+      if (resultText) {
+        detail += '\n> **Result:** ' + resultText.split('\n').join('\n> ');
+      }
+    }
+    // Sub-agent history from progress entries
+    if (includeSubagentHistory && progressEntries.length > 0) {
+      const historyLines = [];
+      for (const pe of progressEntries) {
+        const msg = pe.data?.message;
+        if (!msg) continue;
+        if (msg.type === 'user') {
+          const content = typeof msg.message?.content === 'string'
+            ? msg.message.content
+            : Array.isArray(msg.message?.content)
+              ? msg.message.content.filter(c => c.type === 'text').map(c => c.text).join(' ')
+              : '';
+          if (content) historyLines.push('> 👤 ' + content.substring(0, 200));
+        } else if (msg.type === 'assistant') {
+          const mc = msg.message?.content;
+          if (typeof mc === 'string') {
+            historyLines.push('> 🤖 ' + mc.substring(0, 200));
+          } else if (Array.isArray(mc)) {
+            const textParts = mc.filter(c => c.type === 'text').map(c => c.text);
+            const toolUses = mc.filter(c => c.type === 'tool_use');
+            if (textParts.length > 0) historyLines.push('> 🤖 ' + textParts.join(' ').substring(0, 200));
+            for (const tu of toolUses) {
+              const tuInput = tu.input || {};
+              if (tu.name === 'Bash') {
+                historyLines.push('> 🖥 Команда ("' + (tuInput.command || '').substring(0, 80) + '")');
+              } else if (tu.name === 'Edit' || tu.name === 'Write' || tu.name === 'Read') {
+                historyLines.push('> 📄 ' + tu.name + ' (' + (tuInput.file_path || '?') + ')');
+              } else {
+                historyLines.push('> ⚙️ ' + tu.name);
+              }
+            }
+          }
+        }
+      }
+      if (historyLines.length > 0) {
+        detail += '\n>\n> **History:**\n' + historyLines.join('\n');
+      }
+    }
   }
 
   return label + detail;
 }
 
 // Export a range of messages from Claude session
-ipcMain.handle('claude:copy-range', async (event, { sessionId, cwd, startUuid, endUuid, includeEditing = false, includeReading = false }) => {
+ipcMain.handle('claude:copy-range', async (event, { sessionId, cwd, startUuid, endUuid, includeEditing = false, includeReading = false, includeSubagentResult = false, includeSubagentHistory = false }) => {
   console.log('[Claude Export] Exporting range from', startUuid, 'to', endUuid);
 
   if (!sessionId) return { success: false, error: 'No session ID' };
@@ -624,7 +683,15 @@ ipcMain.handle('claude:copy-range', async (event, { sessionId, cwd, startUuid, e
   try {
     // Use the same chain resolution as claude:get-timeline
     // This ensures we can find UUIDs across plan mode boundaries
-    const { mergedMap: recordMap, lastRecord, sessionBoundaries } = resolveSessionChain(sessionId, cwd);
+    const { mergedMap: recordMap, lastRecord, sessionBoundaries, progressEntries: allProgressEntries } = resolveSessionChain(sessionId, cwd);
+
+    // Build progress entries index by parentToolUseID
+    const progressByToolUseId = new Map();
+    for (const pe of allProgressEntries) {
+      const key = pe.parentToolUseID;
+      if (!progressByToolUseId.has(key)) progressByToolUseId.set(key, []);
+      progressByToolUseId.get(key).push(pe);
+    }
 
     if (!lastRecord) return { success: false, error: 'No records found' };
 
@@ -767,7 +834,8 @@ ipcMain.handle('claude:copy-range', async (event, { sessionId, cwd, startUuid, e
             if (block.type === 'tool_use') {
               // Find matching tool_result in subsequent range records
               let toolResult = null;
-              if (includeEditing || includeReading) {
+              const needResult = includeEditing || includeReading || (block.name === 'Task' && includeSubagentResult);
+              if (needResult) {
                 for (let j = i + 1; j < range.length; j++) {
                   const nextEntry = range[j];
                   if (nextEntry.type === 'user' && Array.isArray(nextEntry.message?.content)) {
@@ -779,7 +847,10 @@ ipcMain.handle('claude:copy-range', async (event, { sessionId, cwd, startUuid, e
                   }
                 }
               }
-              const action = formatToolAction(block.name, block.input || {}, toolResult, includeEditing, includeReading);
+              const taskProgress = block.name === 'Task' && block.id ? (progressByToolUseId.get(block.id) || []) : [];
+              const action = formatToolAction(block.name, block.input || {}, toolResult, includeEditing, includeReading, {
+                includeSubagentResult, includeSubagentHistory, progressEntries: taskProgress
+              });
               if (action) toolActions.push(action);
             }
           }
@@ -1011,32 +1082,60 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
         }
       }
 
-      // ========== CLAUDE AGENT PATTERN DETECTOR (:::claude ... :::) ==========
-      // Runs on all tabs — pattern is unique enough to avoid false positives.
-      // Skip detection while Claude Agent is already running (prevents re-trigger from pasted response)
-      if (claudeAgentManager.getStatus(tabId) !== 'running') {
-        const AGENT_BUFFER_LIMIT = 50 * 1024; // 50KB
+      // ========== CLAUDE AGENT PATTERN DETECTOR (:::claude[:cmd] ... :::) ==========
+      // Patterns: :::claude <prompt> :::       — send to current session
+      //           :::claude:new <prompt> :::   — force new session
+      //           :::claude:status :::         — return session meta
+      //           :::claude:compact :::        — TODO: compact current session
+      // Guards: 1) geminiWatcher (only Gemini tabs — prevents Claude/shell false positives)
+      //         2) armed (user typed at least once — prevents restore replay)
+      //         3) not running  4) cooldown expired (prevents re-trigger & race condition)
+      const cooldownUntil = claudeAgentCooldown.get(tabId) || 0;
+      if (geminiWatchers.has(tabId) && claudeAgentArmed.get(tabId) && claudeAgentManager.getStatus(tabId) !== 'running' && Date.now() > cooldownUntil) {
         const sc = stripVTControlCharacters(data);
-        const prev = claudeAgentBuffer.get(tabId) || '';
-        let buf = prev + sc;
-        // Trim buffer from the front if too large
-        if (buf.length > AGENT_BUFFER_LIMIT) {
-          buf = buf.slice(buf.length - AGENT_BUFFER_LIMIT);
-        }
 
-        const agentMatch = buf.match(/:::claude\s+([\s\S]*?):::/i);
-        if (agentMatch) {
-          const prompt = agentMatch[1].trim();
-          // Clear the matched portion from buffer
-          buf = buf.slice(buf.indexOf(agentMatch[0]) + agentMatch[0].length);
-          claudeAgentBuffer.set(tabId, buf);
-          console.log('[ClaudeAgent:Detect] Tab ' + tabId + ': Pattern matched, prompt (' + prompt.length + ' chars): "' + prompt.substring(0, 80) + '..."');
-          handleClaudeAgentRequest(tabId, prompt);
+        // Guard 5: Gemini spinner = TUI re-render. All :::claude in output is OLD history, not fresh.
+        // Clear buffer to prevent false positives from re-rendered conversation history.
+        const isSpinnerFrame = /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/.test(sc) && sc.includes('esc to cancel');
+        if (isSpinnerFrame) {
+          claudeAgentBuffer.delete(tabId);
         } else {
-          claudeAgentBuffer.set(tabId, buf);
+          const AGENT_BUFFER_LIMIT = 4 * 1024; // 4KB — tight window, old re-rendered content drops out fast
+          const prev = claudeAgentBuffer.get(tabId) || '';
+          let buf = prev + sc;
+          if (buf.length > AGENT_BUFFER_LIMIT) {
+            buf = buf.slice(buf.length - AGENT_BUFFER_LIMIT);
+          }
+
+          // Match :::claude or :::claude:subcmd, then content, then :::
+          const agentMatch = buf.match(/:::claude(?::(\w+))?\s+([\s\S]*?):::/i);
+          if (agentMatch) {
+            const subcmd = (agentMatch[1] || '').toLowerCase(); // '', 'new', 'status', 'compact'
+            const body = agentMatch[2].trim();
+            buf = buf.slice(buf.indexOf(agentMatch[0]) + agentMatch[0].length);
+            claudeAgentBuffer.set(tabId, buf);
+            console.log('[ClaudeAgent:Detect] Tab ' + tabId + ': Pattern matched, subcmd=' + (subcmd || 'send') + ', body (' + body.length + ' chars): "' + body.substring(0, 80) + '"');
+            handleClaudeAgentCommand(tabId, subcmd, body);
+          } else {
+            claudeAgentBuffer.set(tabId, buf);
+          }
         }
       }
       // ========== END CLAUDE AGENT PATTERN DETECTOR ==========
+
+      // ========== DEBUG: PTY data flow after Claude Agent paste ==========
+      // Logs every PTY chunk during cooldown period (= after our paste, when Gemini responds)
+      {
+        const cdUntil = claudeAgentCooldown.get(tabId) || 0;
+        const agentStatus = claudeAgentManager.getStatus(tabId);
+        if (cdUntil > 0 || agentStatus === 'running') {
+          const stripped = stripVTControlCharacters(data).substring(0, 120).replace(/\n/g, '\\n').replace(/\r/g, '\\r');
+          const now = Date.now();
+          const cdRemain = cdUntil > now ? (cdUntil - now) + 'ms' : 'expired';
+          console.log('[ClaudeAgent:PTY] Tab ' + tabId + ' | status=' + agentStatus + ' cd=' + cdRemain + ' | raw=' + data.length + 'B stripped="' + stripped + '"');
+        }
+      }
+      // ========== END DEBUG ==========
 
       // Send raw data to renderer - xterm.js handles OSC sequences itself
       if (mainWindow && !mainWindow.isDestroyed()) {
@@ -1054,6 +1153,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
       terminalCommandState.delete(tabId);
       claudeAgentManager.cleanup(tabId);
       claudeAgentBuffer.delete(tabId);
+      claudeAgentArmed.delete(tabId);
     });
 
     console.timeEnd(`[PERF:main] terminal:create ${tabId}`);
@@ -1272,6 +1372,12 @@ ipcMain.on('terminal:input', async (event, tabId, data) => {
     return;
   }
 
+  // Arm Claude Agent detector on first user input (prevents restore replay triggers)
+  if (!claudeAgentArmed.get(tabId)) {
+    claudeAgentArmed.set(tabId, true);
+    console.log('[ClaudeAgent:Arm] Tab ' + tabId + ': Armed (first user input)');
+  }
+
   // User paste (Cmd+V) — direct passthrough, no chunking needed.
   if (data.length > 1) {
     const endsWithR = data.endsWith('\r');
@@ -1279,6 +1385,16 @@ ipcMain.on('terminal:input', async (event, tabId, data) => {
     const hasNewline = data.includes('\r') || data.includes('\n');
     console.log(`[terminal:input] tabId=${tabId} len=${data.length} endsWithR=${endsWithR} endsWithN=${endsWithN} hasNewline=${hasNewline}`);
   }
+
+  // Suppress Claude Agent detection for user input echo (prevents false triggers
+  // when user's text contains :::claude::: examples). PTY echoes this text back
+  // through onData — cooldown ensures only Gemini's own output triggers detection.
+  if (data.length > 10 && data.includes(':::claude')) {
+    claudeAgentCooldown.set(tabId, Date.now() + 5000);
+    claudeAgentBuffer.delete(tabId);
+    console.log('[ClaudeAgent:Input] Tab ' + tabId + ': User input contains :::claude, suppressing detection for 5s');
+  }
+
   term.write(data);
 });
 
@@ -1783,87 +1899,117 @@ ipcMain.on('terminal:kill', (event, tabId) => {
   }
   claudeAgentManager.cleanup(tabId);
   claudeAgentBuffer.delete(tabId);
+  claudeAgentArmed.delete(tabId);
 });
 
 // ========== CLAUDE AGENT ORCHESTRATION ==========
 // Handles @claude:...@end pattern from Gemini PTY output.
 // Sends prompt to Claude via Agent SDK, pastes response back into Gemini.
 
-function formatAgentResponse(result, sessionId) {
-  const sid = sessionId ? sessionId.substring(0, 8) : 'unknown';
-  return '[Claude Agent Response | session: ' + sid + ']\n' + result + '\n[/Claude Agent Response]';
+function formatAgentResponse(result, meta) {
+  const sid = meta.sessionId ? meta.sessionId.substring(0, 8) : 'unknown';
+  const tokensIn = meta.totalInputTokens || 0;
+  const tokensOut = meta.totalOutputTokens || 0;
+  const cost = (meta.totalCostUsd || 0).toFixed(4);
+  const turn = meta.turn || 0;
+  const dur = meta.turnDurationMs ? Math.round(meta.turnDurationMs / 1000) + 's' : '?';
+  return '[Claude Agent Response | session: ' + sid + ' | turn: ' + turn + ' | tokens: ' + tokensIn + '/' + tokensOut + ' | cost: \x24' + cost + ' | time: ' + dur + ']\n' + result + '\n[/Claude Agent Response]';
 }
 
-async function handleClaudeAgentRequest(tabId, prompt) {
+function formatStatusResponse(meta) {
+  if (!meta) return '[Claude Agent Status] No active session [/Claude Agent Status]';
+  const sid = meta.sessionId ? meta.sessionId.substring(0, 8) : 'none';
+  return '[Claude Agent Status | session: ' + sid + ' | turns: ' + meta.turns + ' | tokens: ' + meta.totalInputTokens + '/' + meta.totalOutputTokens + ' | cost: \x24' + (meta.totalCostUsd || 0).toFixed(4) + ' | status: ' + meta.status + '] [/Claude Agent Status]';
+}
+
+async function handleClaudeAgentCommand(tabId, subcmd, body) {
+  // SYNCHRONOUS LOCK: prevent re-entry from subsequent onData events
+  // (SDK import is async — without this, 10+ detections fire before status='running')
+  claudeAgentBuffer.delete(tabId);
+  claudeAgentCooldown.set(tabId, Date.now() + 30000); // 30s guard, refreshed on completion
+
   const cwd = terminalProjects.get(tabId) || process.cwd();
   const term = terminals.get(tabId);
 
-  console.log('[ClaudeAgent:Handle] Tab ' + tabId + ': Starting request (cwd=' + cwd + ')');
+  // ── :status — return meta without calling Claude ──
+  if (subcmd === 'status') {
+    const meta = claudeAgentManager.getSessionMeta(tabId);
+    console.log('[ClaudeAgent:Status] Tab ' + tabId + ':', JSON.stringify(meta));
+    if (term) {
+      await safePasteAndSubmit(term, formatStatusResponse(meta), {
+        submit: true, fast: true,
+        logPrefix: '[ClaudeAgent:StatusPaste:' + tabId + ']',
+      });
+    }
+    return;
+  }
+
+  // ── :new — force new session, then send ──
+  // ── (default) — send to current/resumed session ──
+  const isNew = subcmd === 'new';
+  const prompt = body;
+
+  if (!prompt) {
+    console.log('[ClaudeAgent:Handle] Tab ' + tabId + ': Empty prompt, skipping');
+    return;
+  }
+
+  console.log('[ClaudeAgent:Handle] Tab ' + tabId + ': ' + (isNew ? 'NEW session' : 'Send') + ' (cwd=' + cwd + ')');
 
   // Notify renderer: running
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('claude-agent:status', {
-      tabId,
-      status: 'running',
+      tabId, status: 'running',
       sessionId: claudeAgentManager.getSessionId(tabId),
     });
   }
 
   try {
-    const result = await claudeAgentManager.send(tabId, prompt, {
-      cwd,
-      onStatus: (status) => {
-        if (mainWindow && !mainWindow.isDestroyed()) {
-          mainWindow.webContents.send('claude-agent:status', {
-            tabId,
-            status,
-            sessionId: claudeAgentManager.getSessionId(tabId),
-          });
-        }
-      },
-    });
+    const sendFn = isNew
+      ? claudeAgentManager.sendNew.bind(claudeAgentManager)
+      : claudeAgentManager.send.bind(claudeAgentManager);
 
-    console.log('[ClaudeAgent:Handle] Tab ' + tabId + ': Done. Session=' + result.sessionId + ' Cost=$' + (result.costUsd || 0).toFixed(4) + ' Duration=' + (result.durationMs || 0) + 'ms Result=' + result.result.length + ' chars');
+    const result = await sendFn(tabId, prompt, { cwd });
+
+    console.log('[ClaudeAgent:Handle] Tab ' + tabId + ': Done. Session=' + result.sessionId + ' Turn=' + result.meta.turn + ' Cost=\x24' + result.meta.totalCostUsd.toFixed(4) + ' Tokens=' + result.meta.totalInputTokens + '/' + result.meta.totalOutputTokens);
 
     // Notify renderer: done
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('claude-agent:status', {
-        tabId,
-        status: 'done',
+        tabId, status: 'done',
         sessionId: result.sessionId,
       });
     }
 
-    // Paste response back into Gemini
+    // Clear buffer + set cooldown BEFORE paste (paste triggers PTY onData → detector)
+    claudeAgentBuffer.delete(tabId);
+    claudeAgentCooldown.set(tabId, Date.now() + 10000); // 10s cooldown
+
+    // Paste response back
     if (term) {
-      const response = formatAgentResponse(result.result, result.sessionId);
+      const response = formatAgentResponse(result.result, result.meta);
       await safePasteAndSubmit(term, response, {
-        submit: true,
-        fast: true, // Gemini mode
+        submit: true, fast: true,
         logPrefix: '[ClaudeAgent:Paste:' + tabId + ']',
       });
     }
-
-    // Clear buffer after paste to prevent re-trigger from echoed response
-    claudeAgentBuffer.delete(tabId);
   } catch (err) {
     console.error('[ClaudeAgent:Handle] Tab ' + tabId + ': Error:', err.message);
 
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('claude-agent:status', {
-        tabId,
-        status: 'error',
-        error: err.message,
+        tabId, status: 'error', error: err.message,
         sessionId: claudeAgentManager.getSessionId(tabId),
       });
     }
 
-    // Paste error message into Gemini so it knows what happened
+    claudeAgentBuffer.delete(tabId);
+    claudeAgentCooldown.set(tabId, Date.now() + 10000);
+
     if (term && err.message !== 'Cancelled') {
       const errResponse = '[Claude Agent Error]\n' + err.message + '\n[/Claude Agent Error]';
       await safePasteAndSubmit(term, errResponse, {
-        submit: true,
-        fast: true,
+        submit: true, fast: true,
         logPrefix: '[ClaudeAgent:ErrPaste:' + tabId + ']',
       });
     }
@@ -3847,6 +3993,7 @@ function loadJsonlRecords(filePath) {
   const sessionId = path.basename(filePath, '.jsonl');
 
   const recordMap = new Map();
+  const progressEntries = [];
   let lastRecord = null;
   let bridgeSessionId = null;
   let fileIndex = 0;
@@ -3854,6 +4001,10 @@ function loadJsonlRecords(filePath) {
   for (const line of lines) {
     try {
       const entry = JSON.parse(line);
+      // Collect agent_progress entries (sub-agent turns from Task tool)
+      if (entry.type === 'progress' && entry.data?.type === 'agent_progress' && entry.parentToolUseID) {
+        progressEntries.push(entry);
+      }
       if (entry.uuid) {
         entry._fileIndex = fileIndex++;
         entry._fromFile = sessionId;
@@ -3870,7 +4021,7 @@ function loadJsonlRecords(filePath) {
     } catch {}
   }
 
-  return { recordMap, lastRecord, bridgeSessionId: bridgeSessionId || null };
+  return { recordMap, lastRecord, bridgeSessionId: bridgeSessionId || null, progressEntries };
 }
 
 // Resolve the full chain of JSONL files by following bridge entries backwards.
@@ -3879,6 +4030,7 @@ function loadJsonlRecords(filePath) {
 // sessionBoundaries: array of { childSessionId, parentSessionId, bridgeUuid }
 function resolveSessionChain(sessionId, cwd, maxDepth = 10) {
   const mergedMap = new Map();
+  const allProgressEntries = [];
   const sessionBoundaries = [];
   let currentSessionId = sessionId;
   let lastRecord = null;
@@ -3891,7 +4043,10 @@ function resolveSessionChain(sessionId, cwd, maxDepth = 10) {
       break;
     }
 
-    const { recordMap, lastRecord: fileLastRecord, bridgeSessionId } = loadJsonlRecords(found.filePath);
+    const { recordMap, lastRecord: fileLastRecord, bridgeSessionId, progressEntries } = loadJsonlRecords(found.filePath);
+    if (progressEntries.length > 0) {
+      allProgressEntries.push(...progressEntries);
+    }
 
     // On the first file (newest), capture the lastRecord for backtrace start
     if (depth === 0) {
@@ -3934,7 +4089,7 @@ function resolveSessionChain(sessionId, cwd, maxDepth = 10) {
     depth++;
   }
 
-  return { mergedMap, lastRecord, sessionBoundaries };
+  return { mergedMap, lastRecord, sessionBoundaries, progressEntries: allProgressEntries };
 }
 
 // Find the latest (tip) session in a chain starting from a given session.
@@ -4395,7 +4550,7 @@ ipcMain.handle('claude:get-timeline', async (event, { sessionId, cwd }) => {
 });
 
 // Export Claude session as clean text (with options and backtrace)
-ipcMain.handle('claude:export-clean-session', async (event, { sessionId, cwd, includeEditing = false, includeReading = false, includeCode, fromStart = true }) => {
+ipcMain.handle('claude:export-clean-session', async (event, { sessionId, cwd, includeEditing = false, includeReading = false, includeCode, fromStart = true, includeSubagentResult = false, includeSubagentHistory = false }) => {
   // Backward compat: old callers may pass includeCode
   if (includeCode !== undefined && includeEditing === undefined) {
     includeEditing = includeCode;
@@ -4403,7 +4558,7 @@ ipcMain.handle('claude:export-clean-session', async (event, { sessionId, cwd, in
   }
   console.log('[Claude Export] ========================================');
   console.log('[Claude Export] Exporting session:', sessionId);
-  console.log('[Claude Export] Options:', { includeEditing, includeReading, fromStart, cwd });
+  console.log('[Claude Export] Options:', { includeEditing, includeReading, fromStart, includeSubagentResult, includeSubagentHistory, cwd });
 
   if (!sessionId) {
     return { success: false, error: 'No session ID provided' };
@@ -4412,9 +4567,9 @@ ipcMain.handle('claude:export-clean-session', async (event, { sessionId, cwd, in
   try {
     // Resolve the full session chain (follows bridge entries across "Clear Context" boundaries)
     // Same as Timeline — loads all JSONL files in the chain and merges records
-    const { mergedMap: recordMap, lastRecord, sessionBoundaries } = resolveSessionChain(sessionId, cwd);
+    const { mergedMap: recordMap, lastRecord, sessionBoundaries, progressEntries: allProgressEntries } = resolveSessionChain(sessionId, cwd);
 
-    console.log('[Claude Export] Merged records:', recordMap.size, '| Chain depth:', sessionBoundaries.length + 1);
+    console.log('[Claude Export] Merged records:', recordMap.size, '| Chain depth:', sessionBoundaries.length + 1, '| Progress entries:', allProgressEntries.length);
     console.log('[Claude Export] Last record type:', lastRecord?.type);
 
     if (!lastRecord) {
@@ -4702,9 +4857,20 @@ ipcMain.handle('claude:export-clean-session', async (event, { sessionId, cwd, in
       outputParts.push('');
     }
 
+    // Build progress entries index by parentToolUseID for fast lookup
+    const progressByToolUseId = new Map();
+    for (const pe of allProgressEntries) {
+      const key = pe.parentToolUseID;
+      if (!progressByToolUseId.has(key)) progressByToolUseId.set(key, []);
+      progressByToolUseId.get(key).push(pe);
+    }
+
     // Delegate to shared formatToolAction with current session's settings
-    const formatTool = (toolName, input, toolResult = null) => {
-      return formatToolAction(toolName, input, toolResult, includeEditing, includeReading);
+    const formatTool = (toolName, input, toolResult = null, toolUseId = null) => {
+      const taskProgress = toolName === 'Task' && toolUseId ? (progressByToolUseId.get(toolUseId) || []) : [];
+      return formatToolAction(toolName, input, toolResult, includeEditing, includeReading, {
+        includeSubagentResult, includeSubagentHistory, progressEntries: taskProgress
+      });
     };
 
     // Process the active branch
@@ -4768,7 +4934,8 @@ ipcMain.handle('claude:export-clean-session', async (event, { sessionId, cwd, in
             if (block.type === 'tool_use') {
               // Find matching tool_result in subsequent records
               let toolResult = null;
-              if (includeEditing || includeReading) {
+              const needResult = includeEditing || includeReading || (block.name === 'Task' && includeSubagentResult);
+              if (needResult) {
                 for (let j = i + 1; j < activeBranch.length; j++) {
                   const nextEntry = activeBranch[j];
                   if (nextEntry.type === 'user' && Array.isArray(nextEntry.message?.content)) {
@@ -4780,7 +4947,7 @@ ipcMain.handle('claude:export-clean-session', async (event, { sessionId, cwd, in
                   }
                 }
               }
-              const action = formatTool(block.name, block.input || {}, toolResult);
+              const action = formatTool(block.name, block.input || {}, toolResult, block.id);
               if (action) toolActions.push(action);
             }
           }
@@ -4839,7 +5006,15 @@ ipcMain.handle('claude:get-full-history', async (event, { sessionId, cwd }) => {
   }
 
   try {
-    const { mergedMap: recordMap, lastRecord, sessionBoundaries } = resolveSessionChain(sessionId, cwd);
+    const { mergedMap: recordMap, lastRecord, sessionBoundaries, progressEntries: allProgressEntries } = resolveSessionChain(sessionId, cwd);
+
+    // Build progress entries index by parentToolUseID
+    const progressByToolUseId = new Map();
+    for (const pe of allProgressEntries) {
+      const key = pe.parentToolUseID;
+      if (!progressByToolUseId.has(key)) progressByToolUseId.set(key, []);
+      progressByToolUseId.get(key).push(pe);
+    }
 
     if (!lastRecord) {
       return { success: true, entries: [], latestSessionId: sessionId };
@@ -4930,7 +5105,7 @@ ipcMain.handle('claude:get-full-history', async (event, { sessionId, cwd }) => {
       return base;
     };
 
-    const fmtAction = (toolName, input) => {
+    const fmtAction = (toolName, input, toolUseId = null) => {
       switch (toolName) {
         case 'Read': return { tool: 'Read', filePath: input.file_path || '?' };
         case 'Bash': {
@@ -4939,7 +5114,45 @@ ipcMain.handle('claude:get-full-history', async (event, { sessionId, cwd }) => {
         }
         case 'Glob': return '\u{1F50D} glob ' + (input.pattern || '?');
         case 'Grep': return '\u{1F50D} grep ' + (input.pattern || '?');
-        case 'Task': return '\u{1F9F5} Task agent';
+        case 'Task': {
+          const taskObj = {
+            tool: 'Task',
+            description: input.description || input.prompt?.substring(0, 60) || 'Task agent',
+            toolUseId: toolUseId,
+          };
+          // Attach progress history from agent_progress entries
+          const taskProgress = toolUseId ? (progressByToolUseId.get(toolUseId) || []) : [];
+          if (taskProgress.length > 0) {
+            taskObj.history = [];
+            for (const pe of taskProgress) {
+              const msg = pe.data?.message;
+              if (!msg) continue;
+              const turn = { type: msg.type };
+              if (msg.type === 'user') {
+                const c = msg.message?.content;
+                turn.content = typeof c === 'string' ? c : Array.isArray(c)
+                  ? c.filter(x => x.type === 'text').map(x => x.text).join(' ') : '';
+              } else if (msg.type === 'assistant') {
+                const mc = msg.message?.content;
+                if (typeof mc === 'string') {
+                  turn.content = mc;
+                } else if (Array.isArray(mc)) {
+                  turn.content = mc.filter(x => x.type === 'text').map(x => x.text).join('\n');
+                  const tools = mc.filter(x => x.type === 'tool_use');
+                  if (tools.length > 0) {
+                    turn.tools = tools.map(t => {
+                      if (t.name === 'Bash') return '\u{1F5A5} ' + (t.input?.command || '').substring(0, 80);
+                      if (t.name === 'Read' || t.name === 'Edit' || t.name === 'Write') return '\u{1F4C4} ' + t.name + ' (' + (t.input?.file_path || '?') + ')';
+                      return '\u{2699}\u{FE0F} ' + t.name;
+                    });
+                  }
+                }
+              }
+              taskObj.history.push(turn);
+            }
+          }
+          return taskObj;
+        }
         case 'WebSearch': return '\u{1F310} WebSearch';
         case 'WebFetch': return '\u{1F310} WebFetch';
         default: return '\u{2699}\u{FE0F} ' + toolName;
@@ -5068,7 +5281,26 @@ ipcMain.handle('claude:get-full-history', async (event, { sessionId, cwd }) => {
               if (name === 'Edit' || name === 'Write') {
                 actions.push(mkFileAction(name, input));
               } else {
-                actions.push(fmtAction(name, input));
+                const actionObj = fmtAction(name, input, block.id);
+                // For Task: find tool_result to get final answer
+                if (name === 'Task' && typeof actionObj === 'object' && actionObj.tool === 'Task') {
+                  for (let j = i + 1; j < activeBranch.length; j++) {
+                    const nextEntry = activeBranch[j];
+                    if (nextEntry.type === 'user' && Array.isArray(nextEntry.message?.content)) {
+                      const res = nextEntry.message.content.find(c => c.type === 'tool_result' && c.tool_use_id === block.id);
+                      if (res) {
+                        const resContent = res.content;
+                        if (typeof resContent === 'string') {
+                          actionObj.result = resContent;
+                        } else if (Array.isArray(resContent)) {
+                          actionObj.result = resContent.filter(c => c.type === 'text').map(c => c.text).join('\n');
+                        }
+                        break;
+                      }
+                    }
+                  }
+                }
+                actions.push(actionObj);
               }
             }
           }

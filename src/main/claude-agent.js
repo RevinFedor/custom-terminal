@@ -5,7 +5,9 @@
  * SDK is ESM-only → uses lazy dynamic import() (compatible with Electron's CommonJS main process).
  *
  * API:
- *   send(tabId, prompt, options?) → Promise<{ sessionId, result, usage }>
+ *   send(tabId, prompt, options?) → Promise<{ sessionId, result, meta }>
+ *   sendNew(tabId, prompt, options?) → Force new session
+ *   getSessionMeta(tabId) → { sessionId, turns, totalCostUsd, totalInputTokens, totalOutputTokens }
  *   cancel(tabId) → void
  *   getStatus(tabId) → 'idle' | 'running' | 'error'
  *   getSessionId(tabId) → string | null
@@ -23,7 +25,7 @@ async function getSDK() {
 
 class ClaudeAgentManager {
   constructor() {
-    // tabId → { session, sessionId, status, abortController, queue }
+    // tabId → { session, sessionId, status, abortController, queue, meta }
     this.tabs = new Map();
   }
 
@@ -34,7 +36,8 @@ class ClaudeAgentManager {
         sessionId: null,
         status: 'idle',
         abortController: null,
-        queue: Promise.resolve() // serializes calls per tab
+        queue: Promise.resolve(),
+        meta: { turns: 0, totalCostUsd: 0, totalInputTokens: 0, totalOutputTokens: 0 }
       });
     }
     return this.tabs.get(tabId);
@@ -44,18 +47,27 @@ class ClaudeAgentManager {
    * Send a prompt to Claude Agent for a given tab.
    * Queued: only one call runs at a time per tab.
    * Reuses session (multi-turn) if one exists.
-   *
-   * @param {string} tabId
-   * @param {string} prompt
-   * @param {{ cwd?: string, model?: string, onStatus?: (status: string) => void }} options
-   * @returns {Promise<{ sessionId: string, result: string, costUsd?: number, durationMs?: number }>}
    */
   send(tabId, prompt, options = {}) {
     const tab = this._getTab(tabId);
-    // Chain onto the queue so parallel calls serialize
     const task = tab.queue.then(() => this._doSend(tabId, prompt, options));
-    tab.queue = task.catch(() => {}); // swallow to keep queue alive
+    tab.queue = task.catch(() => {});
     return task;
+  }
+
+  /**
+   * Force a new session (discard current).
+   */
+  sendNew(tabId, prompt, options = {}) {
+    const tab = this._getTab(tabId);
+    // Close existing session
+    if (tab.session) {
+      try { tab.session.close(); } catch {}
+      tab.session = null;
+    }
+    tab.sessionId = null;
+    tab.meta = { turns: 0, totalCostUsd: 0, totalInputTokens: 0, totalOutputTokens: 0 };
+    return this.send(tabId, prompt, options);
   }
 
   async _doSend(tabId, prompt, options = {}) {
@@ -73,7 +85,6 @@ class ClaudeAgentManager {
       let session = tab.session;
       if (!session) {
         if (tab.sessionId) {
-          // Resume existing session
           console.log('[ClaudeAgent] Tab ' + tabId + ': Resuming session ' + tab.sessionId);
           session = sdk.unstable_v2_resumeSession(tab.sessionId, {
             model,
@@ -82,7 +93,6 @@ class ClaudeAgentManager {
             abortController: tab.abortController,
           });
         } else {
-          // New session
           console.log('[ClaudeAgent] Tab ' + tabId + ': Creating new session (cwd=' + cwd + ')');
           session = sdk.unstable_v2_createSession({
             model,
@@ -101,10 +111,12 @@ class ClaudeAgentManager {
       let resultText = '';
       let costUsd = undefined;
       let durationMs = undefined;
+      let inputTokens = 0;
+      let outputTokens = 0;
 
       for await (const msg of session.stream()) {
-        // Capture session ID from any message
-        if (msg.session_id && !tab.sessionId) {
+        // Capture session ID from init message
+        if (msg.type === 'system' && msg.subtype === 'init' && msg.session_id) {
           tab.sessionId = msg.session_id;
           console.log('[ClaudeAgent] Tab ' + tabId + ': Session ID = ' + tab.sessionId);
         }
@@ -115,32 +127,54 @@ class ClaudeAgentManager {
             .map(b => b.text)
             .join('');
           if (text) resultText += text;
+
+          // Track token usage from assistant message
+          if (msg.message.usage) {
+            inputTokens += msg.message.usage.input_tokens || 0;
+            outputTokens += msg.message.usage.output_tokens || 0;
+          }
         }
 
         if (msg.type === 'result') {
           if (msg.subtype === 'success' && msg.result) {
-            // Use result text if we didn't capture from assistant messages
             if (!resultText) resultText = msg.result;
           } else if (msg.subtype !== 'success') {
             throw new Error('Claude agent error: ' + (msg.error || msg.subtype));
           }
           costUsd = msg.total_cost_usd;
           durationMs = msg.duration_ms;
+          // Result-level usage overrides accumulated
+          if (msg.usage) {
+            inputTokens = msg.usage.input_tokens || inputTokens;
+            outputTokens = msg.usage.output_tokens || outputTokens;
+          }
         }
       }
+
+      // Update cumulative meta
+      tab.meta.turns += 1;
+      tab.meta.totalCostUsd += costUsd || 0;
+      tab.meta.totalInputTokens += inputTokens;
+      tab.meta.totalOutputTokens += outputTokens;
 
       tab.status = 'idle';
       if (onStatus) onStatus('done');
       tab.abortController = null;
 
-      return {
+      const meta = {
         sessionId: tab.sessionId,
-        result: resultText,
-        costUsd,
-        durationMs,
+        turn: tab.meta.turns,
+        turnCostUsd: costUsd || 0,
+        turnDurationMs: durationMs || 0,
+        turnInputTokens: inputTokens,
+        turnOutputTokens: outputTokens,
+        totalCostUsd: tab.meta.totalCostUsd,
+        totalInputTokens: tab.meta.totalInputTokens,
+        totalOutputTokens: tab.meta.totalOutputTokens,
       };
+
+      return { sessionId: tab.sessionId, result: resultText, meta };
     } catch (err) {
-      // Session may be broken after abort/error — force re-create on next call
       tab.session = null;
       tab.abortController = null;
 
@@ -158,8 +192,21 @@ class ClaudeAgentManager {
   }
 
   /**
-   * Cancel a running request for a tab.
+   * Get session metadata (for :::claude:status :::)
    */
+  getSessionMeta(tabId) {
+    const tab = this.tabs.get(tabId);
+    if (!tab) return null;
+    return {
+      sessionId: tab.sessionId,
+      status: tab.status,
+      turns: tab.meta.turns,
+      totalCostUsd: tab.meta.totalCostUsd,
+      totalInputTokens: tab.meta.totalInputTokens,
+      totalOutputTokens: tab.meta.totalOutputTokens,
+    };
+  }
+
   cancel(tabId) {
     const tab = this.tabs.get(tabId);
     if (!tab) return;
@@ -170,25 +217,16 @@ class ClaudeAgentManager {
     }
   }
 
-  /**
-   * @returns {'idle' | 'running' | 'error'}
-   */
   getStatus(tabId) {
     const tab = this.tabs.get(tabId);
     return tab ? tab.status : 'idle';
   }
 
-  /**
-   * @returns {string | null}
-   */
   getSessionId(tabId) {
     const tab = this.tabs.get(tabId);
     return tab ? tab.sessionId : null;
   }
 
-  /**
-   * Clean up a tab's session (e.g. when tab closes).
-   */
   cleanup(tabId) {
     const tab = this.tabs.get(tabId);
     if (!tab) return;

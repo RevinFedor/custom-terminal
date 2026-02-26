@@ -26,6 +26,8 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
     copyIncludeEditing: includeEditing, setCopyIncludeEditing: setIncludeEditing,
     copyIncludeReading: includeReading, setCopyIncludeReading: setIncludeReading,
     copyFromStart: fromStart, setCopyFromStart: setFromStart,
+    copyIncludeSubagentResult: includeSubagentResult, setCopyIncludeSubagentResult: setIncludeSubagentResult,
+    copyIncludeSubagentHistory: includeSubagentHistory, setCopyIncludeSubagentHistory: setIncludeSubagentHistory,
   } = useUIStore();
   const { activeProjectId, createTab, closeTab, getActiveProject, switchTab, getSelectedTabs, clearSelection } = useWorkspaceStore();
   const [isUpdatingDocs, setIsUpdatingDocs] = useState(false);
@@ -119,6 +121,8 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
               { label: 'Чтение', active: includeReading },
               { label: 'Редактирование', active: includeEditing },
               { label: 'От fork', active: !fromStart },
+              { label: 'Результат 🧵', active: includeSubagentResult },
+              { label: 'История 🧵', active: includeSubagentHistory },
             ].map(({ label, active }) => (
               <div key={label} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '1px 0', color: '#999' }}>
                 <span>{label}</span>
@@ -238,7 +242,7 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
           });
         } else {
           result = await ipcRenderer.invoke('claude:export-clean-session', {
-            sessionId: tab.claudeSessionId, cwd, includeEditing, includeReading, fromStart
+            sessionId: tab.claudeSessionId, cwd, includeEditing, includeReading, fromStart, includeSubagentResult, includeSubagentHistory
           });
         }
         if (result.success) results.push(result.content);
@@ -531,7 +535,9 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
             cwd,
             includeEditing,
             includeReading,
-            fromStart
+            fromStart,
+            includeSubagentResult,
+            includeSubagentHistory
           });
         }
 
@@ -763,6 +769,8 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
                   {!isGeminiCopy && includeReading && <div className="w-1.5 h-1.5 rounded-full bg-amber-400 border border-[#1a1a1a]" title="Чтение" />}
                   {!isGeminiCopy && includeEditing && <div className="w-1.5 h-1.5 rounded-full bg-purple-400 border border-[#1a1a1a]" title="Редактирование" />}
                   {!isGeminiCopy && !fromStart && <div className="w-1.5 h-1.5 rounded-full bg-blue-500 border border-[#1a1a1a]" title="С последнего форка" />}
+                  {!isGeminiCopy && includeSubagentResult && <div className="w-1.5 h-1.5 rounded-full bg-orange-400 border border-[#1a1a1a]" title="Результат субагента" />}
+                  {!isGeminiCopy && includeSubagentHistory && <div className="w-1.5 h-1.5 rounded-full bg-green-400 border border-[#1a1a1a]" title="История субагента" />}
                 </div>
               </div>
 
@@ -817,6 +825,28 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
                             onClick={(e) => { e.stopPropagation(); setFromStart(!fromStart); }}
                           >
                             <div className={`absolute top-0.5 w-3 h-3 bg-white rounded-full ${!fromStart ? 'left-[14px]' : 'left-0.5'}`} />
+                          </div>
+                        </label>
+
+                        <div className="h-px bg-[#333] my-1" />
+
+                        <label className="flex items-center justify-between gap-3 cursor-pointer group/label px-1">
+                          <span className="text-[10px] text-[#aaa] group-hover/label:text-white">Результат 🧵</span>
+                          <div
+                            className={`w-7 h-4 rounded-full relative cursor-pointer ${includeSubagentResult ? 'bg-orange-500' : 'bg-[#444]'}`}
+                            onClick={(e) => { e.stopPropagation(); setIncludeSubagentResult(!includeSubagentResult); }}
+                          >
+                            <div className={`absolute top-0.5 w-3 h-3 bg-white rounded-full ${includeSubagentResult ? 'left-[14px]' : 'left-0.5'}`} />
+                          </div>
+                        </label>
+
+                        <label className="flex items-center justify-between gap-3 cursor-pointer group/label px-1">
+                          <span className="text-[10px] text-[#aaa] group-hover/label:text-white">История 🧵</span>
+                          <div
+                            className={`w-7 h-4 rounded-full relative cursor-pointer ${includeSubagentHistory ? 'bg-green-500' : 'bg-[#444]'}`}
+                            onClick={(e) => { e.stopPropagation(); setIncludeSubagentHistory(!includeSubagentHistory); }}
+                          >
+                            <div className={`absolute top-0.5 w-3 h-3 bg-white rounded-full ${includeSubagentHistory ? 'left-[14px]' : 'left-0.5'}`} />
                           </div>
                         </label>
                       </div>

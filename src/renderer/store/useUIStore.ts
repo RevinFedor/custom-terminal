@@ -205,9 +205,13 @@ interface UIStore {
   copyIncludeEditing: boolean;
   copyIncludeReading: boolean;
   copyFromStart: boolean;
+  copyIncludeSubagentResult: boolean;
+  copyIncludeSubagentHistory: boolean;
   setCopyIncludeEditing: (v: boolean) => void;
   setCopyIncludeReading: (v: boolean) => void;
   setCopyFromStart: (v: boolean) => void;
+  setCopyIncludeSubagentResult: (v: boolean) => void;
+  setCopyIncludeSubagentHistory: (v: boolean) => void;
 
   // Notes Editor Modal
   notesEditorOpen: boolean;
@@ -464,7 +468,7 @@ const saveClaudeDefaultPromptEnabled = (enabled: boolean) => {
 
 const initialClaudeDefaultPromptEnabled = loadClaudeDefaultPromptEnabled();
 
-const loadCopySettings = (): { copyIncludeEditing: boolean; copyIncludeReading: boolean; copyFromStart: boolean } => {
+const loadCopySettings = (): { copyIncludeEditing: boolean; copyIncludeReading: boolean; copyFromStart: boolean; copyIncludeSubagentResult: boolean; copyIncludeSubagentHistory: boolean } => {
   try {
     const saved = localStorage.getItem('noted-terminal-copy-settings');
     if (saved) {
@@ -473,15 +477,17 @@ const loadCopySettings = (): { copyIncludeEditing: boolean; copyIncludeReading: 
         copyIncludeEditing: parsed.copyIncludeEditing ?? true,
         copyIncludeReading: parsed.copyIncludeReading ?? false,
         copyFromStart: parsed.copyFromStart ?? true,
+        copyIncludeSubagentResult: parsed.copyIncludeSubagentResult ?? false,
+        copyIncludeSubagentHistory: parsed.copyIncludeSubagentHistory ?? false,
       };
     }
   } catch (e) {
     console.error('Failed to load copy settings:', e);
   }
-  return { copyIncludeEditing: true, copyIncludeReading: false, copyFromStart: true };
+  return { copyIncludeEditing: true, copyIncludeReading: false, copyFromStart: true, copyIncludeSubagentResult: false, copyIncludeSubagentHistory: false };
 };
 
-const saveCopySettings = (settings: { copyIncludeEditing: boolean; copyIncludeReading: boolean; copyFromStart: boolean }) => {
+const saveCopySettings = (settings: { copyIncludeEditing: boolean; copyIncludeReading: boolean; copyFromStart: boolean; copyIncludeSubagentResult: boolean; copyIncludeSubagentHistory: boolean }) => {
   try {
     localStorage.setItem('noted-terminal-copy-settings', JSON.stringify(settings));
   } catch (e) {
@@ -765,20 +771,32 @@ export const useUIStore = create<UIStore>((set, get) => ({
   copyIncludeEditing: initialCopySettings.copyIncludeEditing,
   copyIncludeReading: initialCopySettings.copyIncludeReading,
   copyFromStart: initialCopySettings.copyFromStart,
+  copyIncludeSubagentResult: initialCopySettings.copyIncludeSubagentResult,
+  copyIncludeSubagentHistory: initialCopySettings.copyIncludeSubagentHistory,
   setCopyIncludeEditing: (v) => {
     set({ copyIncludeEditing: v });
-    const { copyIncludeReading, copyFromStart } = get();
-    saveCopySettings({ copyIncludeEditing: v, copyIncludeReading, copyFromStart });
+    const { copyIncludeReading, copyFromStart, copyIncludeSubagentResult, copyIncludeSubagentHistory } = get();
+    saveCopySettings({ copyIncludeEditing: v, copyIncludeReading, copyFromStart, copyIncludeSubagentResult, copyIncludeSubagentHistory });
   },
   setCopyIncludeReading: (v) => {
     set({ copyIncludeReading: v });
-    const { copyIncludeEditing, copyFromStart } = get();
-    saveCopySettings({ copyIncludeEditing, copyIncludeReading: v, copyFromStart });
+    const { copyIncludeEditing, copyFromStart, copyIncludeSubagentResult, copyIncludeSubagentHistory } = get();
+    saveCopySettings({ copyIncludeEditing, copyIncludeReading: v, copyFromStart, copyIncludeSubagentResult, copyIncludeSubagentHistory });
   },
   setCopyFromStart: (v) => {
     set({ copyFromStart: v });
-    const { copyIncludeEditing, copyIncludeReading } = get();
-    saveCopySettings({ copyIncludeEditing, copyIncludeReading, copyFromStart: v });
+    const { copyIncludeEditing, copyIncludeReading, copyIncludeSubagentResult, copyIncludeSubagentHistory } = get();
+    saveCopySettings({ copyIncludeEditing, copyIncludeReading, copyFromStart: v, copyIncludeSubagentResult, copyIncludeSubagentHistory });
+  },
+  setCopyIncludeSubagentResult: (v) => {
+    set({ copyIncludeSubagentResult: v });
+    const { copyIncludeEditing, copyIncludeReading, copyFromStart, copyIncludeSubagentHistory } = get();
+    saveCopySettings({ copyIncludeEditing, copyIncludeReading, copyFromStart, copyIncludeSubagentResult: v, copyIncludeSubagentHistory });
+  },
+  setCopyIncludeSubagentHistory: (v) => {
+    set({ copyIncludeSubagentHistory: v });
+    const { copyIncludeEditing, copyIncludeReading, copyFromStart, copyIncludeSubagentResult } = get();
+    saveCopySettings({ copyIncludeEditing, copyIncludeReading, copyFromStart, copyIncludeSubagentResult, copyIncludeSubagentHistory: v });
   },
 
   // Notes Editor Modal
