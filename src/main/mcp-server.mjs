@@ -71,13 +71,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
       name: 'delegate_to_claude',
-      description: 'Delegate a task to Claude Code. Claude will work in a visible terminal tab with full capabilities (file editing, bash, etc). The task runs asynchronously — this tool returns immediately with a taskId. The result will be automatically pasted back into your conversation when Claude finishes.',
+      description: 'Delegate a task to Claude Code. Claude runs in a visible terminal tab with full capabilities (file editing, bash, etc). IMPORTANT: This is fire-and-forget. The result will be AUTOMATICALLY delivered back into your terminal when Claude finishes — you do NOT need to poll or check status. After calling this tool, simply continue with your other work or wait for the result to appear in your conversation. Do NOT call get_task_status in a loop.',
       inputSchema: {
         type: 'object',
         properties: {
           prompt: {
             type: 'string',
-            description: 'The task description / prompt to send to Claude Code',
+            description: 'The task description / prompt to send to Claude Code. If you need a specific model, put the /model command on the first line followed by the prompt on the next line.',
           },
         },
         required: ['prompt'],
@@ -85,13 +85,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'send_claude_command',
-      description: 'Send a command to the active Claude Code sub-agent (e.g. /compact, /model sonnet, /clear). Useful for managing Claude\'s context or switching models.',
+      description: 'Send a slash command to the active Claude Code sub-agent (e.g. /compact, /model sonnet, /clear). Only use this for managing Claude\'s context or switching models. Do NOT use this to check status — results are delivered automatically.',
       inputSchema: {
         type: 'object',
         properties: {
           command: {
             type: 'string',
-            description: 'The command to send (e.g. "/compact", "/model sonnet")',
+            description: 'The slash command to send (e.g. "/compact", "/model sonnet")',
           },
         },
         required: ['command'],
@@ -99,7 +99,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'get_task_status',
-      description: 'Check the status of a previously delegated task.',
+      description: 'Check the status of a delegated task. Use this ONLY if you need a one-time diagnostic check. Do NOT poll this in a loop — results are automatically delivered to your terminal when the task completes.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -132,7 +132,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           content: [
             {
               type: 'text',
-              text: 'Task accepted. ID: ' + result.taskId + '\nClaude is now working on your task in a visible terminal tab. The result will be automatically delivered back to this conversation when Claude finishes.',
+              text: 'Task accepted. ID: ' + result.taskId + '\nClaude is now working in a terminal tab. The result will be AUTOMATICALLY injected into your conversation when done — no need to poll or check status. Just continue with your other work.',
             },
           ],
         };

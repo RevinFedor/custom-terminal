@@ -67,6 +67,20 @@ let mcpHttpServer = null;               // http.Server instance
 let mcpHttpPort = null;                 // assigned port number
 const geminiCommandQueue = new Map();   // tabId -> Promise (serialized Gemini commands)
 
+// ========== CLAUDE SPINNER DETECTION (UI busy indicator) ==========
+// Detects Claude TUI spinner chars (✢✳✶✻✽·) colored with Claude orange RGB(215,119,87).
+// Independent of Bridge — works for any Claude tab.
+const claudeSpinnerBusy = new Map();   // tabId → boolean
+const claudeSpinnerIdleTimers = new Map(); // tabId → timeout ID (debounce idle transition)
+const CLAUDE_SPINNER_RE = /\x1b\[38;2;215;119;87m[\xB7\u2722\u2733\u2736\u273B\u273D]/;
+
+// ========== GEMINI SPINNER DETECTION (Braille busy indicator) ==========
+// Detects Gemini CLI Braille spinner chars (⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏) + "esc to cancel" text.
+// Emits gemini:busy-state IPC and logs [GeminiSpinner] for E2E test observability.
+const geminiSpinnerBusy = new Map();       // tabId → boolean
+const geminiSpinnerIdleTimers = new Map(); // tabId → timeout ID (debounce idle transition)
+const GEMINI_SPINNER_RE = /[\u280B\u2819\u2839\u2838\u283C\u2834\u2826\u2827\u2807\u280F]/;
+
 // ========== PROMPT BOUNDARY MARKERS (OSC 7777 injection for deterministic navigation) ==========
 // State machine per tab: 'idle' (prompt visible) → 'busy' (Claude processing) → 'idle' (inject marker!)
 // When BUSY→IDLE transition detected, we inject OSC 7777 into PTY data BEFORE sending to renderer.
@@ -611,7 +625,7 @@ ipcMain.on('show-terminal-context-menu', async (event, { hasSelection, prompts, 
 // ========== MCP DELEGATION: HTTP SERVER + TASK MANAGER ==========
 
 const MCP_PORT_FILE = path.join(os.homedir(), '.noted-terminal', 'mcp-port');
-const MCP_TASK_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes safety timeout
+const MCP_TASK_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes safety timeout
 
 function startMcpHttpServer() {
   mcpHttpServer = http.createServer(async (req, res) => {
@@ -637,7 +651,12 @@ function startMcpHttpServer() {
           delegateToClaudeSubAgent(taskId, prompt, ppid).catch(err => {
             console.error('[MCP:Delegate] Error:', err.message);
             const task = mcpTasks.get(taskId);
-            if (task) { task.status = 'error'; task.error = err.message; }
+            if (task) {
+              task.status = 'error'; task.error = err.message;
+              if (task.claudeTabId && mainWindow && !mainWindow.isDestroyed()) {
+                mainWindow.webContents.send('mcp:task-status', { taskId, claudeTabId: task.claudeTabId, status: 'error' });
+              }
+            }
           });
 
           res.writeHead(200);
@@ -684,8 +703,8 @@ function startMcpHttpServer() {
             return;
           }
 
-          // Send command via safePasteAndSubmit
-          await safePasteAndSubmit(term, command, { submit: true, logPrefix: '[MCP:command]' });
+          // Send command via safePasteAndSubmit (ctrlCFirst clears any existing input)
+          await safePasteAndSubmit(term, command, { submit: true, ctrlCFirst: true, logPrefix: '[MCP:command]' });
           res.writeHead(200);
           res.end(JSON.stringify({ status: 'sent' }));
         } catch (e) {
@@ -751,6 +770,9 @@ async function delegateToClaudeSubAgent(taskId, prompt, ppid) {
       // Send timeout error back to Gemini
       if (task.geminiTabId) {
         deliverResultToGemini(task.geminiTabId, '[Claude Sub-Agent Timeout]\nTask exceeded ' + (MCP_TASK_TIMEOUT_MS / 1000) + 's limit.\n[/Claude Sub-Agent Timeout]');
+      }
+      if (task.claudeTabId && mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('mcp:task-status', { taskId, claudeTabId: task.claudeTabId, status: 'error' });
       }
     }
   }, MCP_TASK_TIMEOUT_MS);
@@ -1206,6 +1228,70 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
       // Note: Tab (\t) for thinking mode is NOT sent here — alwaysThinkingEnabled in
       // ~/.claude/settings.json handles it globally. Toggle is available via UI buttons.
       const DEBOUNCE_MS = 300;
+
+      // Split slash-commands from prompt body and send sequentially.
+      // e.g. "/model haiku\nDo something" → send "/model haiku", wait for prompt, send "Do something"
+      async function sendHandshakePrompt(term, tabId, fullPrompt) {
+        var lines = fullPrompt.split('\n');
+        var slashCommands = [];
+        var bodyLines = [];
+        var hitBody = false;
+        for (var li = 0; li < lines.length; li++) {
+          if (!hitBody && lines[li].trim().startsWith('/')) {
+            slashCommands.push(lines[li].trim());
+          } else {
+            hitBody = true;
+            bodyLines.push(lines[li]);
+          }
+        }
+        // Strip leading empty lines from body
+        while (bodyLines.length > 0 && bodyLines[0].trim() === '') bodyLines.shift();
+        var body = bodyLines.join('\n').trim();
+
+        if (slashCommands.length > 0) {
+          // Send each slash command separately, waiting for prompt return after each
+          for (var ci = 0; ci < slashCommands.length; ci++) {
+            console.log('[Handshake:' + tabId + '] Sending slash command: ' + slashCommands[ci]);
+            await safePasteAndSubmit(term, slashCommands[ci], {
+              submit: true,
+              ctrlCFirst: ci > 0,
+              logPrefix: '[Handshake:cmd:' + tabId + ']'
+            });
+            // Wait for Claude to process the command and show prompt again
+            await waitForPromptReturn(term, tabId, 10000);
+          }
+        }
+
+        if (body) {
+          console.log('[Handshake:' + tabId + '] Sending body prompt (' + body.length + ' chars)');
+          await safePasteAndSubmit(term, body, {
+            submit: true,
+            logPrefix: '[Handshake:' + tabId + ']'
+          });
+        } else if (slashCommands.length === 0) {
+          console.log('[Handshake:' + tabId + '] Empty prompt, nothing to send');
+        }
+      }
+
+      // Wait for Claude prompt char (⏵ or >) to reappear after a command
+      function waitForPromptReturn(term, tabId, timeoutMs) {
+        return new Promise(function(resolve) {
+          var sub = null;
+          var timer = setTimeout(function() {
+            if (sub) sub.dispose();
+            console.log('[Handshake:' + tabId + '] Prompt return timeout (' + timeoutMs + 'ms)');
+            resolve();
+          }, timeoutMs);
+          sub = term.onData(function(d) {
+            var s = stripVTControlCharacters(d);
+            if (s.includes('\u23F5') || s.includes('>')) {
+              // Prompt returned — add small debounce for UI to settle
+              clearTimeout(timer);
+              setTimeout(function() { if (sub) sub.dispose(); resolve(); }, 200);
+            }
+          });
+        });
+      }
       const currentState = claudeState.get(tabId);
 
       if (currentState) {
@@ -1225,11 +1311,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
               const pendingPrompt = claudePendingPrompt.get(tabId);
               claudePendingPrompt.delete(tabId);
 
-              console.log('[Claude Handshake] Tab ' + tabId + ': Sending prompt (' + pendingPrompt.length + ' chars) via safePasteAndSubmit...');
-              await safePasteAndSubmit(term, pendingPrompt, {
-                submit: true,
-                logPrefix: '[Handshake:' + tabId + ']'
-              });
+              await sendHandshakePrompt(term, tabId, pendingPrompt);
               // Mark prompt sent time for MCP completion cooldown
               if (subAgentParentTab.has(tabId)) subAgentPromptSentAt.set(tabId, Date.now());
             } else {
@@ -1253,11 +1335,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
               const pendingPrompt = claudePendingPrompt.get(tabId);
               claudePendingPrompt.delete(tabId);
 
-              console.log('[Claude Handshake] Tab ' + tabId + ': (reset) Sending prompt (' + pendingPrompt.length + ' chars) via safePasteAndSubmit...');
-              await safePasteAndSubmit(term, pendingPrompt, {
-                submit: true,
-                logPrefix: '[Handshake:' + tabId + ':reset]'
-              });
+              await sendHandshakePrompt(term, tabId, pendingPrompt);
               // Mark prompt sent time for MCP completion cooldown
               if (subAgentParentTab.has(tabId)) subAgentPromptSentAt.set(tabId, Date.now());
             } else {
@@ -1383,45 +1461,39 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
       }
       // ========== END CLAUDE AGENT PATTERN DETECTOR ==========
 
-      // ========== MCP SUB-AGENT COMPLETION DETECTOR ==========
-      // For tabs in subAgentParentTab: detect ⏵ (prompt returned) → debounce 500ms → completion
-      // GUARD: Skip during handshake (claudeState active) — the initial ⏵ before prompt is sent
-      if (subAgentParentTab.has(tabId) && !claudeState.has(tabId) && !claudePendingPrompt.has(tabId)) {
-        const sc = stripVTControlCharacters(data);
-        if (sc.includes('\u23F5') || sc.includes('\u276F')) {
-          // Debounce: Claude may re-render prompt multiple times
-          clearTimeout(subAgentCompletionTimers.get(tabId));
-          // Calculate debounce delay: normal 500ms, or defer to cooldown end if within cooldown
-          var debounceMs = 500;
-          var sentAt = subAgentPromptSentAt.get(tabId);
-          if (sentAt) {
-            var elapsed = Date.now() - sentAt;
-            if (elapsed < 5000) {
-              // Defer: schedule check for when cooldown expires + 1s buffer
-              debounceMs = (5000 - elapsed) + 1000;
-              console.log('[MCP:Detector] Deferring check by ' + debounceMs + 'ms (cooldown, ' + elapsed + 'ms since prompt)');
+      // ========== GEMINI SPINNER BUSY DETECTION ==========
+      // Detect Braille spinner + "esc to cancel" → Gemini is thinking
+      // No spinner for 1.5s → Gemini finished (idle)
+      {
+        if (geminiWatchers.has(tabId)) {
+          var gsc = stripVTControlCharacters(data);
+          var isGeminiSpinner = GEMINI_SPINNER_RE.test(gsc);
+
+          if (isGeminiSpinner) {
+            clearTimeout(geminiSpinnerIdleTimers.get(tabId));
+            geminiSpinnerIdleTimers.delete(tabId);
+            if (!geminiSpinnerBusy.get(tabId)) {
+              geminiSpinnerBusy.set(tabId, true);
+              console.log('[GeminiSpinner] Tab ' + tabId + ': THINKING');
+              if (mainWindow && !mainWindow.isDestroyed()) {
+                mainWindow.webContents.send('gemini:busy-state', { tabId, busy: true });
+              }
             }
+          } else if (geminiSpinnerBusy.get(tabId)) {
+            // Was busy, no spinner in this chunk — schedule idle after 1.5s silence
+            clearTimeout(geminiSpinnerIdleTimers.get(tabId));
+            geminiSpinnerIdleTimers.set(tabId, setTimeout(function() {
+              geminiSpinnerBusy.set(tabId, false);
+              geminiSpinnerIdleTimers.delete(tabId);
+              console.log('[GeminiSpinner] Tab ' + tabId + ': IDLE (response complete)');
+              if (mainWindow && !mainWindow.isDestroyed()) {
+                mainWindow.webContents.send('gemini:busy-state', { tabId, busy: false });
+              }
+            }, 1500));
           }
-          subAgentCompletionTimers.set(tabId, setTimeout(() => {
-            subAgentCompletionTimers.delete(tabId);
-            // Double-check handshake still not active
-            if (claudeState.has(tabId) || claudePendingPrompt.has(tabId)) {
-              console.log('[MCP:Detector] Skipping — handshake still active for: ' + tabId);
-              return;
-            }
-            console.log('[MCP:Detector] Prompt detected in sub-agent tab: ' + tabId);
-            // Only trigger if there's a running task for this tab
-            let hasRunningTask = false;
-            for (const [, t] of mcpTasks) {
-              if (t.claudeTabId === tabId && t.status === 'running') { hasRunningTask = true; break; }
-            }
-            if (hasRunningTask) {
-              handleSubAgentCompletion(tabId);
-            }
-          }, debounceMs));
         }
       }
-      // ========== END MCP SUB-AGENT COMPLETION DETECTOR ==========
+      // ========== END GEMINI SPINNER BUSY DETECTION ==========
 
       // ========== PROMPT BOUNDARY MARKER INJECTION ==========
       // Detect Claude prompt (⏵ U+23F5 / ❯ U+276F) transitions to inject OSC 7777 markers.
@@ -1474,6 +1546,49 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
       }
       // ========== END PROMPT BOUNDARY MARKER INJECTION ==========
 
+      // ========== CLAUDE SPINNER BUSY DETECTION ==========
+      // Detect spinner chars ·✢✳✶✻✽ colored with Claude orange → busy
+      // Detect ⏵ (U+23F5) without spinner → idle (debounced)
+      {
+        if (CLAUDE_SPINNER_RE.test(data)) {
+          // Spinner detected → Claude is busy
+          clearTimeout(claudeSpinnerIdleTimers.get(tabId));
+          claudeSpinnerIdleTimers.delete(tabId);
+          if (!claudeSpinnerBusy.get(tabId)) {
+            claudeSpinnerBusy.set(tabId, true);
+            console.log('[Spinner] Tab ' + tabId + ': BUSY (spinner detected)');
+            if (mainWindow && !mainWindow.isDestroyed()) {
+              mainWindow.webContents.send('claude:busy-state', { tabId, busy: true });
+            }
+          }
+        } else if (claudeSpinnerBusy.get(tabId)) {
+          // No spinner in this chunk but was busy — check for idle prompt ⏵
+          var sc2 = stripVTControlCharacters(data);
+          if (sc2.includes('\u23F5')) {
+            // ⏵ seen without spinner → schedule idle transition (debounce 500ms)
+            clearTimeout(claudeSpinnerIdleTimers.get(tabId));
+            claudeSpinnerIdleTimers.set(tabId, setTimeout(function() {
+              claudeSpinnerBusy.set(tabId, false);
+              claudeSpinnerIdleTimers.delete(tabId);
+              console.log('[Spinner] Tab ' + tabId + ': IDLE (prompt returned)');
+              if (mainWindow && !mainWindow.isDestroyed()) {
+                mainWindow.webContents.send('claude:busy-state', { tabId, busy: false });
+              }
+              // MCP sub-agent completion: if this tab is a sub-agent, trigger completion
+              if (subAgentParentTab.has(tabId) && !claudeState.has(tabId) && !claudePendingPrompt.has(tabId)) {
+                var hasRunningTask = false;
+                for (var _e of mcpTasks) { if (_e[1].claudeTabId === tabId && _e[1].status === 'running') { hasRunningTask = true; break; } }
+                if (hasRunningTask) {
+                  console.log('[Spinner] Sub-agent completion triggered for: ' + tabId);
+                  handleSubAgentCompletion(tabId);
+                }
+              }
+            }, 500));
+          }
+        }
+      }
+      // ========== END CLAUDE SPINNER BUSY DETECTION ==========
+
       // Send raw data to renderer - xterm.js handles OSC sequences itself
       if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.webContents.send('terminal:data', { pid: ptyProcess.pid, tabId, data });
@@ -1492,6 +1607,9 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
       claudeAgentBuffer.delete(tabId);
       claudeAgentArmed.delete(tabId);
       claudeAgentCooldown.delete(tabId);
+      clearTimeout(geminiSpinnerIdleTimers.get(tabId));
+      geminiSpinnerBusy.delete(tabId);
+      geminiSpinnerIdleTimers.delete(tabId);
 
       // MCP: Handle sub-agent PTY exit (Claude crash)
       if (subAgentParentTab.has(tabId)) {
@@ -1505,6 +1623,9 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
               task.status = 'error';
               task.error = 'Claude process exited with code ' + JSON.stringify(exitCode);
               deliverResultToGemini(geminiTabId, '[Claude Sub-Agent Error]\nClaude process exited (code: ' + JSON.stringify(exitCode) + ')\n[/Claude Sub-Agent Error]');
+              if (mainWindow && !mainWindow.isDestroyed()) {
+                mainWindow.webContents.send('mcp:task-status', { taskId: tid, claudeTabId: tabId, status: 'error' });
+              }
             }
           }
         }
@@ -2311,6 +2432,9 @@ ipcMain.on('terminal:kill', (event, tabId) => {
           task.status = 'error';
           task.error = 'Claude sub-agent terminated';
           deliverResultToGemini(geminiTabId, '[Claude Sub-Agent Error]\nClaude process terminated unexpectedly.\n[/Claude Sub-Agent Error]');
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send('mcp:task-status', { taskId: tid, claudeTabId: tabId, status: 'error' });
+          }
         }
       }
     }

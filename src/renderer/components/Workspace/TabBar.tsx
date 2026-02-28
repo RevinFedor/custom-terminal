@@ -32,6 +32,7 @@ interface TabData {
   geminiSessionId?: string;
   tabType?: string;
   isCollapsed?: boolean;
+  parentTabId?: string;
 }
 
 type DragData = {
@@ -90,11 +91,12 @@ const DropIndicatorLine = memo(({ edge }: IndicatorProps) => {
 
 // Restart zone - left part of tab, shows restart button on hover when process is running
 // Only shows restart for devServer commands (npm/yarn/etc), not for claude/gemini
-const RestartZone = memo(({ hasProcess, hasColor, commandType, hasSession, onRestart, onStop }: {
+const RestartZone = memo(({ hasProcess, hasColor, commandType, hasSession, isBusy, onRestart, onStop }: {
   hasProcess: boolean;
   hasColor: boolean;
   commandType?: string;
   hasSession?: boolean;
+  isBusy?: boolean;
   onRestart: () => void;
   onStop: () => void;
 }) => {
@@ -155,7 +157,7 @@ const RestartZone = memo(({ hasProcess, hasColor, commandType, hasSession, onRes
           </div>
         ) : (
           // Green dot (process running) or red dot (claude without saved session)
-          // Claude/Gemini AI tabs get a pulsing animation
+          // Claude tabs pulse only when actively busy (thinking/streaming)
           <span
             style={{
               display: 'block',
@@ -167,7 +169,7 @@ const RestartZone = memo(({ hasProcess, hasColor, commandType, hasSession, onRes
               boxShadow: (commandType === 'claude' && !hasSession)
                 ? '0 0 4px rgba(248, 113, 113, 0.5)'
                 : '0 0 4px rgba(74, 222, 128, 0.5)',
-              animation: (commandType === 'claude' || commandType === 'gemini')
+              animation: (commandType === 'claude' && isBusy)
                 ? 'tab-dot-pulse 1.5s ease-in-out infinite' : 'none',
             }}
           />
@@ -207,6 +209,7 @@ interface TabItemProps {
   showNotesIndicator?: boolean; // CMD held + cursor in TabBar = highlight tabs with notes
   isCollapsed?: boolean; // Collapsed tab — icon-only
   hasSession?: boolean; // Whether tab has an active AI session
+  isBusy?: boolean; // Claude is actively thinking/streaming (promptBoundaryState === 'busy')
 }
 
 const TabItem = memo(({
@@ -238,6 +241,7 @@ const TabItem = memo(({
   showNotesIndicator = false,
   isCollapsed = false,
   hasSession = false,
+  isBusy = false,
 }: TabItemProps) => {
   const ref = useRef<HTMLDivElement>(null);
   const [closestEdge, setClosestEdge] = useState<Edge | null>(null);
@@ -473,6 +477,7 @@ const TabItem = memo(({
               hasColor={!!hasColor}
               commandType={commandType}
               hasSession={hasSession}
+              isBusy={isBusy}
               onRestart={() => onRestart && onRestart(tab.id)}
               onStop={() => onStop && onStop(tab.id)}
             />
@@ -737,6 +742,7 @@ function TabBar({ projectId }: TabBarProps) {
   const [emptyZoneHovered, setEmptyZoneHovered] = useState(false);
   const [processStatus, setProcessStatus] = useState<Map<string, boolean>>(new Map());
   const [sessionStatus, setSessionStatus] = useState<Map<string, boolean>>(new Map());
+  const [claudeBusyMap, setClaudeBusyMap] = useState<Map<string, boolean>>(new Map());
   const inputRef = useRef<HTMLInputElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const contextMenuRef = useRef<HTMLDivElement>(null);
@@ -806,14 +812,25 @@ function TabBar({ projectId }: TabBarProps) {
       });
     };
 
+    const handleClaudeBusy = (_: any, { tabId, busy }: { tabId: string; busy: boolean }) => {
+      setClaudeBusyMap(prev => {
+        if (prev.get(tabId) === busy) return prev;
+        const next = new Map(prev);
+        next.set(tabId, busy);
+        return next;
+      });
+    };
+
     ipcRenderer.on('terminal:command-started', handleCommandStarted);
     ipcRenderer.on('terminal:command-finished', handleCommandFinished);
     ipcRenderer.on('claude:session-detected', handleSessionDetected);
+    ipcRenderer.on('claude:busy-state', handleClaudeBusy);
 
     return () => {
       ipcRenderer.removeListener('terminal:command-started', handleCommandStarted);
       ipcRenderer.removeListener('terminal:command-finished', handleCommandFinished);
       ipcRenderer.removeListener('claude:session-detected', handleSessionDetected);
+      ipcRenderer.removeListener('claude:busy-state', handleClaudeBusy);
     };
   }, []); // Stable — no re-subscriptions
 
@@ -874,8 +891,9 @@ function TabBar({ projectId }: TabBarProps) {
         if (!currentWorkspace) return;
 
         const allTabsNow = Array.from(currentWorkspace.tabs.values());
-        const mainTabsNow = allTabsNow.filter(t => !t.isUtility);
-        const utilityTabsNow = allTabsNow.filter(t => t.isUtility);
+        const visibleTabsNow = allTabsNow.filter(t => !t.parentTabId);
+        const mainTabsNow = visibleTabsNow.filter(t => !t.isUtility);
+        const utilityTabsNow = visibleTabsNow.filter(t => t.isUtility);
 
         // Dropped on zone container (empty zone)
         if (targetData.type === 'ZONE') {
@@ -975,8 +993,10 @@ function TabBar({ projectId }: TabBarProps) {
   if (!workspace || !project) return null;
 
   const allTabs = Array.from(workspace.tabs.values());
-  const mainTabs = allTabs.filter(t => !t.isUtility);
-  const utilityTabs = allTabs.filter(t => t.isUtility);
+  // Hide sub-agent tabs (parentTabId set) — they are only shown in SubAgentBar
+  const visibleTabs = allTabs.filter(t => !t.parentTabId);
+  const mainTabs = visibleTabs.filter(t => !t.isUtility);
+  const utilityTabs = visibleTabs.filter(t => t.isUtility);
 
   const handleNewTab = () => {
     // Get current tab's cwd
@@ -1432,6 +1452,7 @@ function TabBar({ projectId }: TabBarProps) {
                         hasProcess={processStatus.get(tab.id) || false}
                         commandType={tab.commandType}
                         hasSession={sessionStatus.get(tab.id) || !!tab.claudeSessionId}
+                        isBusy={claudeBusyMap.get(tab.id) || false}
                         onRestart={handleRestart}
                         onStop={handleStop}
                         isInterrupted={isTabInterrupted(tab)}
@@ -1500,6 +1521,7 @@ function TabBar({ projectId }: TabBarProps) {
                     hasProcess={processStatus.get(tab.id) || false}
                     commandType={tab.commandType}
                     hasSession={sessionStatus.get(tab.id) || !!tab.claudeSessionId}
+                    isBusy={claudeBusyMap.get(tab.id) || false}
                     onRestart={handleRestart}
                     onStop={handleStop}
                     isInterrupted={isTabInterrupted(tab)}

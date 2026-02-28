@@ -501,6 +501,8 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
       if (data.tabId !== tabId) return;
       console.log('[Terminal] Sniper caught Gemini session:', data.sessionId);
       getSetGeminiSessionId()(tabId, data.sessionId);
+      // Ensure commandType is 'gemini' — spawn-with-watcher bypasses the Enter key handler
+      getSetTabCommandType()(tabId, 'gemini');
     };
 
     // Claude Agent orchestration: status updates from main process
@@ -617,6 +619,33 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
           handleLinkActivation(event, uri);
         }
       }));
+
+      // UUID Link Provider — clickable Task IDs from MCP delegation
+      const uuidRegex = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
+      term.registerLinkProvider({
+        provideLinks(lineNumber: number, callback: (links: any[] | undefined) => void) {
+          const line = term.buffer.active.getLine(lineNumber - 1);
+          if (!line) { callback(undefined); return; }
+          const text = line.translateToString();
+          const links: any[] = [];
+          let match;
+          uuidRegex.lastIndex = 0;
+          while ((match = uuidRegex.exec(text)) !== null) {
+            links.push({
+              range: {
+                start: { x: match.index + 1, y: lineNumber },
+                end: { x: match.index + match[0].length + 1, y: lineNumber },
+              },
+              text: match[0],
+              activate() {
+                console.log('[Link] UUID clicked:', match![0]);
+                ipcRenderer.send('mcp:focus-task', match![0]);
+              },
+            });
+          }
+          callback(links.length > 0 ? links : undefined);
+        },
+      });
 
       term.open(containerRef);
 
