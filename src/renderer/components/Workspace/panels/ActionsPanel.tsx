@@ -380,9 +380,11 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
         throw new Error(apiResult.error || 'API request failed');
       }
 
-      // 5. Copy response to clipboard
+      // 5. Copy response to clipboard with preamble
+      // Preamble tells downstream AI that session is already analyzed — just apply file changes
+      const preamble = 'Сессия уже обработана внешним агентом. Ниже готовые инструкции по изменению файлов — не нужно заново читать или анализировать сессию, только примени указанные правки.\n\n';
       const { clipboard } = window.require('electron');
-      clipboard.writeText(apiResult.text);
+      clipboard.writeText(preamble + apiResult.text);
       const { input_tokens, output_tokens } = apiResult.usage || {};
       const inK = input_tokens ? (input_tokens / 1000).toFixed(1) + 'K' : '?';
       const outK = output_tokens ? (output_tokens / 1000).toFixed(1) + 'K' : '?';
