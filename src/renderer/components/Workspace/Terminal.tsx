@@ -621,25 +621,26 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
       }));
 
       // UUID Link Provider — clickable Task IDs from MCP delegation
-      const uuidRegex = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
       term.registerLinkProvider({
         provideLinks(lineNumber: number, callback: (links: any[] | undefined) => void) {
           const line = term.buffer.active.getLine(lineNumber - 1);
           if (!line) { callback(undefined); return; }
           const text = line.translateToString();
           const links: any[] = [];
-          let match;
-          uuidRegex.lastIndex = 0;
-          while ((match = uuidRegex.exec(text)) !== null) {
+          const re = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
+          let m;
+          while ((m = re.exec(text)) !== null) {
+            const uuid = m[0];
+            const startX = m.index + 1;
             links.push({
               range: {
-                start: { x: match.index + 1, y: lineNumber },
-                end: { x: match.index + match[0].length + 1, y: lineNumber },
+                start: { x: startX, y: lineNumber },
+                end: { x: startX + uuid.length, y: lineNumber },
               },
-              text: match[0],
+              text: uuid,
               activate() {
-                console.log('[Link] UUID clicked:', match![0]);
-                ipcRenderer.send('mcp:focus-task', match![0]);
+                console.log('[Link] UUID clicked:', uuid);
+                ipcRenderer.send('mcp:focus-task', uuid);
               },
             });
           }
@@ -1136,6 +1137,34 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
           handleLinkActivation(event, uri);
         }
       }));
+
+        // UUID Link Provider — clickable Task IDs from MCP delegation
+        term.registerLinkProvider({
+          provideLinks(lineNumber: number, callback: (links: any[] | undefined) => void) {
+            const line = term.buffer.active.getLine(lineNumber - 1);
+            if (!line) { callback(undefined); return; }
+            const text = line.translateToString();
+            const links: any[] = [];
+            const re = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
+            let m;
+            while ((m = re.exec(text)) !== null) {
+              const uuid = m[0];
+              const startX = m.index + 1;
+              links.push({
+                range: {
+                  start: { x: startX, y: lineNumber },
+                  end: { x: startX + uuid.length, y: lineNumber },
+                },
+                text: uuid,
+                activate() {
+                  console.log('[Link] UUID clicked:', uuid);
+                  ipcRenderer.send('mcp:focus-task', uuid);
+                },
+              });
+            }
+            callback(links.length > 0 ? links : undefined);
+          },
+        });
 
         term.open(terminalRef.current);
 
