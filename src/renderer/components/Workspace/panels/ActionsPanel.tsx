@@ -35,6 +35,7 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
   const docsGeminiTabIdRef = useRef<string | null>(null);
   const [actions, setActions] = useState<Action[]>([]); // Kept for potential future use, loaded from global_commands DB table
   const [isScissorsHovered, setIsScissorsHovered] = useState(false);
+  const [isDocsHovered, setIsDocsHovered] = useState(false);
   const [isCopyingDocs, setIsCopyingDocs] = useState(false);
   const [isApiLoading, setIsApiLoading] = useState(false);
   const apiCancelledRef = useRef(false);
@@ -197,6 +198,55 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
     });
   };
 
+  // ── Shared helpers for docs export pipeline ──
+
+  /** Export session content from selected tabs (Claude or Gemini) */
+  const exportSessionContent = async (activeProject: any): Promise<string | null> => {
+    const tabsToCopy = isMultiSelect ? selectedTabs : [activeProject.tabs.get(activeTabId)];
+    const validTabs = tabsToCopy.filter((t: any) => t?.claudeSessionId || t?.geminiSessionId);
+
+    if (validTabs.length === 0) {
+      showToast('Нет сессий для экспорта', 'warning');
+      return null;
+    }
+
+    const results: string[] = [];
+    for (const tab of validTabs) {
+      if (!tab) continue;
+      const cwd = await ipcRenderer.invoke('terminal:getCwd', tab.id).catch(() => null) || tab.cwd || activeProject.projectPath;
+      let result;
+      if (tab.geminiSessionId && !tab.claudeSessionId) {
+        result = await ipcRenderer.invoke('gemini:copy-range', {
+          sessionId: tab.geminiSessionId, cwd, startUuid: null, endUuid: null
+        });
+      } else {
+        result = await ipcRenderer.invoke('claude:export-clean-session', {
+          sessionId: tab.claudeSessionId, cwd, includeEditing, includeReading, fromStart, includeSubagentResult, includeSubagentHistory
+        });
+      }
+      if (result.success) results.push(result.content);
+    }
+
+    if (results.length === 0) return null;
+
+    if (isMultiSelect) clearSelection(activeProject.projectId);
+    return results.join('\n\n' + '='.repeat(40) + '\n\n');
+  };
+
+  /** Read documentation prompt from settings (file or inline) */
+  const getDocumentationPrompt = async (): Promise<string> => {
+    let systemPrompt: string;
+    if (docPrompt.useFile) {
+      const promptResult = await ipcRenderer.invoke('docs:read-prompt-file', { filePath: docPrompt.filePath });
+      if (!promptResult.success) throw new Error(promptResult.error || 'Failed to read prompt file');
+      systemPrompt = promptResult.content;
+    } else {
+      systemPrompt = docPrompt.inlineContent;
+    }
+    if (!systemPrompt) throw new Error('Documentation prompt is empty');
+    return systemPrompt;
+  };
+
   // Cancel Update Docs — close created Gemini tab if any
   const handleCancelUpdateDocs = useCallback(() => {
     cancelledRef.current = true;
@@ -224,51 +274,11 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
     setIsCopyingDocs(true);
     try {
       // 1. Export session content
-      const tabsToCopy = isMultiSelect ? selectedTabs : [activeProject.tabs.get(activeTabId)];
-      const validTabs = tabsToCopy.filter(t => t?.claudeSessionId || t?.geminiSessionId);
-
-      if (validTabs.length === 0) {
-        showToast('Нет сессий для экспорта', 'warning');
-        setIsCopyingDocs(false);
-        return;
-      }
-
-      const results: string[] = [];
-      for (const tab of validTabs) {
-        if (!tab) continue;
-        const cwd = await ipcRenderer.invoke('terminal:getCwd', tab.id).catch(() => null) || tab.cwd || activeProject.projectPath;
-        let result;
-        if (tab.geminiSessionId && !tab.claudeSessionId) {
-          result = await ipcRenderer.invoke('gemini:copy-range', {
-            sessionId: tab.geminiSessionId, cwd, startUuid: null, endUuid: null
-          });
-        } else {
-          result = await ipcRenderer.invoke('claude:export-clean-session', {
-            sessionId: tab.claudeSessionId, cwd, includeEditing, includeReading, fromStart, includeSubagentResult, includeSubagentHistory
-          });
-        }
-        if (result.success) results.push(result.content);
-      }
-
-      if (results.length === 0) {
-        showToast('Export failed', 'error');
-        setIsCopyingDocs(false);
-        return;
-      }
-
-      const content = results.join('\n\n' + '='.repeat(40) + '\n\n');
-      if (isMultiSelect) clearSelection(activeProject.projectId);
+      const content = await exportSessionContent(activeProject);
+      if (!content) { setIsCopyingDocs(false); return; }
 
       // 2. Get documentation prompt
-      let systemPrompt: string;
-      if (docPrompt.useFile) {
-        const promptResult = await ipcRenderer.invoke('docs:read-prompt-file', { filePath: docPrompt.filePath });
-        if (!promptResult.success) throw new Error(promptResult.error || 'Failed to read prompt file');
-        systemPrompt = promptResult.content;
-      } else {
-        systemPrompt = docPrompt.inlineContent;
-      }
-      if (!systemPrompt) throw new Error('Documentation prompt is empty');
+      const systemPrompt = await getDocumentationPrompt();
 
       // 3. Assemble and copy to clipboard
       const promptText = [
@@ -282,7 +292,7 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
       const { clipboard } = window.require('electron');
       clipboard.writeText(promptText);
       const sizeKB = Math.round(promptText.length / 1024);
-      showToast(`Скопировано: промпт + ${validTabs.length} сессий (${sizeKB}KB)`, 'success');
+      showToast(`Скопировано: промпт + сессия (${sizeKB}KB)`, 'success');
     } catch (error: any) {
       console.error('[CopyDocs] Error:', error);
       showToast(error.message || 'Copy docs failed', 'error');
@@ -308,52 +318,12 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
     apiCancelledRef.current = false;
 
     try {
-      // 1. Export session content (same pipeline as handleCopyDocsToClipboard)
-      const tabsToCopy = isMultiSelect ? selectedTabs : [activeProject.tabs.get(activeTabId)];
-      const validTabs = tabsToCopy.filter(t => t?.claudeSessionId || t?.geminiSessionId);
-
-      if (validTabs.length === 0) {
-        showToast('Нет сессий для экспорта', 'warning');
-        setIsApiLoading(false);
-        return;
-      }
-
-      const results: string[] = [];
-      for (const tab of validTabs) {
-        if (!tab) continue;
-        const cwd = await ipcRenderer.invoke('terminal:getCwd', tab.id).catch(() => null) || tab.cwd || activeProject.projectPath;
-        let result;
-        if (tab.geminiSessionId && !tab.claudeSessionId) {
-          result = await ipcRenderer.invoke('gemini:copy-range', {
-            sessionId: tab.geminiSessionId, cwd, startUuid: null, endUuid: null
-          });
-        } else {
-          result = await ipcRenderer.invoke('claude:export-clean-session', {
-            sessionId: tab.claudeSessionId, cwd, includeEditing, includeReading, fromStart, includeSubagentResult, includeSubagentHistory
-          });
-        }
-        if (result.success) results.push(result.content);
-      }
-
-      if (results.length === 0) {
-        showToast('Export failed', 'error');
-        setIsApiLoading(false);
-        return;
-      }
-
-      const content = results.join('\n\n' + '='.repeat(40) + '\n\n');
-      if (isMultiSelect) clearSelection(activeProject.projectId);
+      // 1. Export session content
+      const content = await exportSessionContent(activeProject);
+      if (!content) { setIsApiLoading(false); return; }
 
       // 2. Get documentation prompt
-      let systemPrompt: string;
-      if (docPrompt.useFile) {
-        const promptResult = await ipcRenderer.invoke('docs:read-prompt-file', { filePath: docPrompt.filePath });
-        if (!promptResult.success) throw new Error(promptResult.error || 'Failed to read prompt file');
-        systemPrompt = promptResult.content;
-      } else {
-        systemPrompt = docPrompt.inlineContent;
-      }
-      if (!systemPrompt) throw new Error('Documentation prompt is empty');
+      const systemPrompt = await getDocumentationPrompt();
 
       // 3. Assemble full prompt
       const promptText = [
@@ -445,53 +415,26 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
       } else {
         // Session export (same as Copy Session — supports Claude and Gemini)
         showToast('Exporting session...', 'info');
-        const tabsToCopy = isMultiSelect ? selectedTabs : [activeProject.tabs.get(activeTabId)];
-        const validTabs = tabsToCopy.filter(t => t?.claudeSessionId || t?.geminiSessionId);
-
-        if (validTabs.length === 0) {
-          showToast('Нет сессий для экспорта', 'warning');
-          setIsUpdatingDocs(false);
-          return;
-        }
-
-        const results: string[] = [];
-        for (const tab of validTabs) {
-          if (!tab) continue;
-          const cwd = await ipcRenderer.invoke('terminal:getCwd', tab.id).catch(() => null) || tab.cwd || activeProject.projectPath;
-          let result;
-          if (tab.geminiSessionId && !tab.claudeSessionId) {
-            result = await ipcRenderer.invoke('gemini:copy-range', {
-              sessionId: tab.geminiSessionId, cwd, startUuid: null, endUuid: null
-            });
-          } else {
-            result = await ipcRenderer.invoke('claude:export-clean-session', {
-              sessionId: tab.claudeSessionId, cwd, includeEditing, includeReading, fromStart
-            });
-          }
-          if (result.success) results.push(result.content);
-        }
-
-        if (results.length === 0) { showToast('Export failed', 'error'); setIsUpdatingDocs(false); return; }
-        content = results.join('\n\n' + '='.repeat(40) + '\n\n');
-        if (isMultiSelect) clearSelection(activeProject.projectId);
+        const exported = await exportSessionContent(activeProject);
+        if (!exported) { setIsUpdatingDocs(false); return; }
+        content = exported;
       }
 
       if (cancelledRef.current) return;
 
       // 2. Get documentation prompt from settings
-      let systemPrompt: string;
-      if (docPrompt.useFile) {
-        const promptResult = await ipcRenderer.invoke('docs:read-prompt-file', { filePath: docPrompt.filePath });
-        if (!promptResult.success) throw new Error(promptResult.error || 'Failed to read prompt file');
-        systemPrompt = promptResult.content;
-      } else {
-        systemPrompt = docPrompt.inlineContent;
-      }
-      if (!systemPrompt) throw new Error('Documentation prompt is empty');
+      const systemPrompt = await getDocumentationPrompt();
 
       if (cancelledRef.current) return;
 
-      // 3. Create Gemini tab
+      // 3. Save session data to temp file (Gemini reads via @filepath)
+      const tempResult = await ipcRenderer.invoke('docs:save-temp', { content, projectPath: workingDir });
+      if (!tempResult.success) throw new Error('Failed to save temp file: ' + tempResult.error);
+      console.warn('[UpdateDocs] Temp file saved:', tempResult.filePath, '(' + content.length + ' chars)');
+
+      if (cancelledRef.current) return;
+
+      // 4. Create Gemini tab
       const existingDocsTabs = Array.from(activeProject.tabs.values())
         .filter(t => t.name.startsWith('docs-gemini-')).length;
       const tabName = `docs-gemini-${String(existingDocsTabs + 1).padStart(2, '0')}`;
@@ -503,41 +446,35 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
 
       if (cancelledRef.current) return;
 
-      // 4. Create pre-filled Gemini session with full content injected directly
-      // Bypasses @file truncation (~96KB) and read_file limit (5000 lines)
-      // Content goes into session JSON content[] (model sees full data), displayContent[] shows short summary in TUI
-      const prefilledResult = await ipcRenderer.invoke('gemini:create-prefilled-session', {
-        sessionContent: content,
-        systemPrompt,
-        additionalPrompt: additionalPrompt.trim() || '',
-        cwd: workingDir
-      });
-      if (!prefilledResult.success) throw new Error('Failed to create prefilled session: ' + prefilledResult.error);
-      console.warn('[UpdateDocs] Prefilled session created: ' + prefilledResult.sessionId + ' (' + prefilledResult.totalChars + ' chars)');
-
-      if (cancelledRef.current) return;
-
-      // 5. Start Gemini with resume (writes 'gemini -r <uuid>\r' to PTY)
-      // Session file already exists, so Gemini loads full context from JSON directly
-      ipcRenderer.send('gemini:spawn-with-watcher', { tabId: newTabId, cwd: workingDir, resumeSessionId: prefilledResult.sessionId });
+      // 5. Start Gemini fresh with auto-approve (gemini -y)
+      ipcRenderer.send('gemini:spawn-with-watcher', { tabId: newTabId, cwd: workingDir, yesMode: true });
 
       const geminiReady = await waitForGeminiReady(newTabId, 30000);
       if (cancelledRef.current) return;
       if (!geminiReady) throw new Error('Timeout waiting for Gemini to start');
 
-      // Gemini resumes with user message in context — send Enter to trigger response
+      // 6. Paste assembled prompt with @filepath reference
+      // Gemini CLI interprets @path as "read this file into context"
+      const promptParts = [
+        'Ниже промпт документации:',
+        systemPrompt,
+        '@' + tempResult.filePath,
+        additionalPrompt.trim() || ''
+      ].filter(Boolean).join('\n');
+
       await new Promise(resolve => setTimeout(resolve, 500));
       if (cancelledRef.current) return;
 
-      console.warn('[UpdateDocs] Sending Enter to trigger Gemini response');
+      console.warn('[UpdateDocs] Pasting prompt (' + promptParts.length + ' chars) with @filepath');
       await ipcRenderer.invoke('terminal:paste', {
         tabId: newTabId,
-        content: 'Ответь на промпт выше.',
+        content: promptParts,
         submit: true
       });
 
       docsGeminiTabIdRef.current = null;
-      showToast('Gemini started with full context (' + Math.round(prefilledResult.totalChars / 1024) + 'KB)', 'success');
+      const sizeKB = Math.round(content.length / 1024);
+      showToast('Gemini -y started (' + sizeKB + 'KB data)', 'success');
 
     } catch (error: any) {
       if (cancelledRef.current) return;

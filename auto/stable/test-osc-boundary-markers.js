@@ -14,57 +14,12 @@
  */
 
 const { Terminal } = require('@xterm/xterm')
-const { stripVTControlCharacters } = require('node:util')
+const { assert, log, writeAndWait, createMiddleware } = require('../core/headless')
 
+// Use local counters since headless.js tracks its own
 const c = {
   reset: '\x1b[0m', green: '\x1b[32m', red: '\x1b[31m',
   cyan: '\x1b[36m', yellow: '\x1b[33m', dim: '\x1b[2m', bold: '\x1b[1m'
-}
-const log = {
-  step: (m) => console.log(`${c.cyan}[STEP]${c.reset} ${m}`),
-  pass: (m) => console.log(`${c.green}[PASS]${c.reset} ${m}`),
-  fail: (m) => console.log(`${c.red}[FAIL]${c.reset} ${m}`),
-  warn: (m) => console.log(`${c.yellow}[WARN]${c.reset} ${m}`),
-  info: (m) => console.log(`${c.dim}[INFO]${c.reset} ${m}`)
-}
-
-let passed = 0
-let failed = 0
-
-function assert(condition, msg) {
-  if (condition) { log.pass(msg); passed++ }
-  else { log.fail(msg); failed++ }
-}
-
-// Replicate the state machine from main.js
-function createMiddleware() {
-  let state = 'idle'
-  let seq = 0
-
-  return {
-    process(rawData) {
-      let data = rawData
-      const sc = stripVTControlCharacters(data)
-      const hasPrompt = sc.includes('\u23F5') || sc.includes('\u276F')
-
-      if (state === 'idle') {
-        if (!hasPrompt && sc.replace(/\s/g, '').length > 5) {
-          state = 'busy'
-        }
-      } else if (state === 'busy' && hasPrompt) {
-        state = 'idle'
-        data = '\x1b]7777;prompt:' + seq + '\x07' + data
-        seq++
-      }
-      return data
-    },
-    getState() { return state },
-    getSeq() { return seq }
-  }
-}
-
-function writeAndWait(term, data) {
-  return new Promise(resolve => term.write(data, resolve))
 }
 
 async function testBasicStateMachine() {
@@ -394,6 +349,7 @@ async function main() {
   await testEntryToMarkerBinding()
   await testWithRealAnsiSequences()
 
+  const { passed, failed } = require('../core/headless').getCounts()
   console.log(`\n${c.bold}=== RESULTS ===${c.reset}`)
   console.log(`${c.green}Passed: ${passed}${c.reset}`)
   if (failed > 0) console.log(`${c.red}Failed: ${failed}${c.reset}`)

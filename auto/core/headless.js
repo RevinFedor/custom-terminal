@@ -78,12 +78,45 @@ function writeAndWait(term, data) {
 // ── OSC 7777 State Machine ──
 
 /**
+ * Detect incomplete escape sequence at end of data chunk.
+ * Returns number of bytes to buffer (0 if all complete).
+ */
+function detectIncompleteEscapeTail(data) {
+  for (let i = data.length - 1; i >= Math.max(0, data.length - 128); i--) {
+    if (data.charCodeAt(i) === 0x1b) {
+      const tail = data.slice(i)
+      if (tail.length === 1) return tail.length
+      const second = tail.charCodeAt(1)
+      if (second === 0x5b) { // CSI: ESC [
+        for (let j = 2; j < tail.length; j++) {
+          if (tail.charCodeAt(j) >= 0x40 && tail.charCodeAt(j) <= 0x7e) return 0
+        }
+        return tail.length
+      }
+      if (second === 0x5d) { // OSC: ESC ]
+        if (tail.includes('\x07') || tail.includes('\x1b\\')) return 0
+        return tail.length
+      }
+      if (second === 0x50) { // DCS: ESC P
+        if (tail.includes('\x1b\\')) return 0
+        return tail.length
+      }
+      if (second >= 0x40 && second <= 0x7e) return 0
+      return tail.length
+    }
+  }
+  return 0
+}
+
+/**
  * Replicates the prompt boundary state machine from main.js.
  *
  * Detects Claude prompt transitions (⏵/❯) and injects OSC 7777
  * escape sequences into the data stream.
  *
- * Flow: IDLE (prompt) → BUSY (AI response) → IDLE (prompt returns) → inject OSC
+ * Includes escape carryover: buffers incomplete escape tails from one chunk
+ * and reassembles them into the next chunk before injection, preventing
+ * OSC 7777 from splitting multi-chunk escape sequences.
  *
  *   const mw = createMiddleware()
  *   const processed = mw.process(rawPtyChunk)
@@ -92,10 +125,18 @@ function writeAndWait(term, data) {
 function createMiddleware() {
   let state = 'idle'
   let seq = 0
+  let carryover = ''
 
   return {
     process(rawData) {
       let data = rawData
+
+      // Reassemble carryover from previous chunk
+      if (carryover) {
+        data = carryover + data
+        carryover = ''
+      }
+
       const sc = stripVTControlCharacters(data)
       const hasPrompt = sc.includes('\u23F5') || sc.includes('\u276F')
 
@@ -108,6 +149,16 @@ function createMiddleware() {
         data = '\x1b]7777;prompt:' + seq + '\x07' + data
         seq++
       }
+
+      // While busy, buffer trailing incomplete escapes
+      if (state === 'busy') {
+        const tail = detectIncompleteEscapeTail(data)
+        if (tail > 0) {
+          carryover = data.slice(data.length - tail)
+          data = data.slice(0, data.length - tail)
+        }
+      }
+
       return data
     },
     getState() { return state },
@@ -122,5 +173,6 @@ module.exports = {
   summary,
   getCounts,
   writeAndWait,
-  createMiddleware
+  createMiddleware,
+  detectIncompleteEscapeTail
 }

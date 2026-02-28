@@ -49,6 +49,42 @@ const claudeAgentArmed = new Map();   // tabId -> boolean — only detect after 
 // xterm.js parser fires registerOscHandler(7777) → registerMarker(0) at exact buffer position.
 const promptBoundaryState = new Map(); // tabId → 'idle' | 'busy'
 const promptBoundarySeq = new Map();   // tabId → number (auto-increment sequence)
+const escapeCarryover = new Map();     // tabId → string (buffered incomplete escape tail from previous chunk)
+
+// Detect incomplete escape sequence at the end of a PTY data chunk.
+// Returns number of bytes to buffer (0 if no incomplete sequence).
+// This prevents OSC 7777 injection from splitting a multi-chunk escape sequence.
+function detectIncompleteEscapeTail(data) {
+  for (let i = data.length - 1; i >= Math.max(0, data.length - 128); i--) {
+    if (data.charCodeAt(i) === 0x1b) {
+      const tail = data.slice(i);
+      if (tail.length === 1) return tail.length; // ESC alone
+      const second = tail.charCodeAt(1);
+      // CSI: ESC [
+      if (second === 0x5b) {
+        for (let j = 2; j < tail.length; j++) {
+          const ch = tail.charCodeAt(j);
+          if (ch >= 0x40 && ch <= 0x7e) return 0; // Final byte found → complete
+        }
+        return tail.length; // No final byte → incomplete CSI
+      }
+      // OSC: ESC ]
+      if (second === 0x5d) {
+        if (tail.includes('\x07') || tail.includes('\x1b\\')) return 0;
+        return tail.length; // No terminator → incomplete OSC
+      }
+      // DCS: ESC P
+      if (second === 0x50) {
+        if (tail.includes('\x1b\\')) return 0;
+        return tail.length;
+      }
+      // Two-byte escape (ESC + 0x40..0x7E)
+      if (second >= 0x40 && second <= 0x7e) return 0;
+      return tail.length; // Unknown → buffer for safety
+    }
+  }
+  return 0;
+}
 
 // ========== SESSION BRIDGE (StatusLine-based session detection) ==========
 // Claude's statusLine feature calls ~/.claude/statusline-bridge.sh after every response,
@@ -168,6 +204,7 @@ function clearBridgeTab(tabId) {
   bridgeKnownSessions.delete(tabId);
   promptBoundaryState.delete(tabId);
   promptBoundarySeq.delete(tabId);
+  escapeCarryover.delete(tabId);
   for (const [pid, tid] of bridgePidCache) {
     if (tid === tabId) bridgePidCache.delete(pid);
   }
@@ -1169,8 +1206,20 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
       // State machine: IDLE → BUSY (non-prompt data) → IDLE (prompt returns = inject!)
       // Marker is injected into the data stream BEFORE IPC send, so xterm.js parser
       // fires registerOscHandler(7777) at the exact buffer position of the prompt line.
+      //
+      // FIX: Escape Carryover — PTY can split data mid-escape-sequence (e.g. \x1b[ in chunk1,
+      // 38;2;153;153;153m❯ in chunk2). Blind prepend of OSC 7777 to chunk2 would abort the
+      // in-progress CSI in xterm.js parser, rendering escape params as visible text.
+      // Solution: buffer incomplete escape tails, reassemble before injection.
       {
         if (bridgeKnownSessions.has(tabId)) {
+          // Reassemble any carryover escape bytes from previous chunk
+          const carryover = escapeCarryover.get(tabId);
+          if (carryover) {
+            data = carryover + data;
+            escapeCarryover.delete(tabId);
+          }
+
           const sc = stripVTControlCharacters(data);
           const hasPrompt = sc.includes('\u23F5') || sc.includes('\u276F');
           const state = promptBoundaryState.get(tabId) || 'idle';
@@ -1188,6 +1237,16 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
             // Prepend OSC before data chunk so marker lands at start of prompt frame
             data = '\x1b]7777;prompt:' + seq + '\x07' + data;
             console.log('[BoundaryMarker] Tab ' + tabId + ': Injected prompt #' + seq);
+          }
+
+          // While busy, buffer any trailing incomplete escape sequence.
+          // Next chunk might trigger injection — reassembly ensures we don't split escapes.
+          if ((promptBoundaryState.get(tabId) || 'idle') === 'busy') {
+            const tail = detectIncompleteEscapeTail(data);
+            if (tail > 0) {
+              escapeCarryover.set(tabId, data.slice(data.length - tail));
+              data = data.slice(0, data.length - tail);
+            }
           }
         }
       }
@@ -3203,7 +3262,7 @@ const geminiWatchers = new Map();
 // Gemini Sniper Watcher: watch for new session file creation when gemini starts
 // IMPORTANT: Gemini creates session file only AFTER first user message, not at startup!
 // Session files are stored in ~/.gemini/tmp/<SHA256_HASH>/chats/session-<datetime>-<id>.json
-ipcMain.on('gemini:spawn-with-watcher', (event, { tabId, cwd, resumeSessionId, bareResume }) => {
+ipcMain.on('gemini:spawn-with-watcher', (event, { tabId, cwd, resumeSessionId, bareResume, yesMode }) => {
   console.log('[Gemini Sniper] ========================================');
   console.log('[Gemini Sniper] IPC received: gemini:spawn-with-watcher');
   console.log('[Gemini Sniper] TabId:', tabId);
@@ -3404,6 +3463,9 @@ ipcMain.on('gemini:spawn-with-watcher', (event, { tabId, cwd, resumeSessionId, b
       } catch (e) {
         console.error('[Gemini Sniper] ❌ Error finding latest session:', e.message);
       }
+    } else if (yesMode) {
+      console.log('[Gemini Sniper] Writing "gemini -y" to terminal (auto-approve)');
+      term.write('gemini -y\r');
     } else {
       console.log('[Gemini Sniper] Writing "gemini" to terminal');
       term.write('gemini\r');
