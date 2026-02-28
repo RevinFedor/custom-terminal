@@ -67,12 +67,15 @@ let mcpHttpServer = null;               // http.Server instance
 let mcpHttpPort = null;                 // assigned port number
 const geminiCommandQueue = new Map();   // tabId -> Promise (serialized Gemini commands)
 
-// ========== CLAUDE SPINNER DETECTION (UI busy indicator) ==========
-// Detects Claude TUI spinner chars (✢✳✶✻✽·) colored with Claude orange RGB(215,119,87).
-// Independent of Bridge — works for any Claude tab.
+// ========== CLAUDE BUSY DETECTION (Window Title Only) ==========
+// Deterministic, no timers, color-independent. Pure title-based:
+// BUSY: spinner char (✢✳✶✻✽) appears in window title (OSC 0)
+// IDLE: window title changes to one WITHOUT spinner chars
+// No ⏵ prompt detection — title is the single source of truth.
 const claudeSpinnerBusy = new Map();   // tabId → boolean
-const claudeSpinnerIdleTimers = new Map(); // tabId → timeout ID (debounce idle transition)
-const CLAUDE_SPINNER_RE = /\x1b\[38;2;215;119;87m[\xB7\u2722\u2733\u2736\u273B\u273D]/;
+const CLAUDE_TITLE_SPINNER_RE = /\x1b\]0;[^\x07]*[\u2722\u2733\u2736\u273B\u273D][^\x07]*\x07/;
+const CLAUDE_TITLE_RE = /\x1b\]0;([^\x07]*)\x07/g;
+const SPINNER_CHARS_RE = /[\u2722\u2733\u2736\u273B\u273D]/;
 
 // ========== GEMINI SPINNER DETECTION (Braille busy indicator) ==========
 // Detects Gemini CLI Braille spinner chars (⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏) + "esc to cancel" text.
@@ -80,6 +83,18 @@ const CLAUDE_SPINNER_RE = /\x1b\[38;2;215;119;87m[\xB7\u2722\u2733\u2736\u273B\u
 const geminiSpinnerBusy = new Map();       // tabId → boolean
 const geminiSpinnerIdleTimers = new Map(); // tabId → timeout ID (debounce idle transition)
 const GEMINI_SPINNER_RE = /[\u280B\u2819\u2839\u2838\u283C\u2834\u2826\u2827\u2807\u280F]/;
+
+// ========== UUID COLORIZATION (purple highlight for MCP Task IDs in terminal) ==========
+// Wraps UUID patterns in ANSI purple (RGB 180,130,255) before sending to renderer.
+// Safe: dashes in UUID never appear inside ANSI escape sequences.
+const UUID_COLOR_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
+const UUID_COLOR_PREFIX = '\x1b[38;2;180;130;255m';
+const UUID_COLOR_SUFFIX = '\x1b[39m';
+function colorizeUUIDs(data) {
+  return data.replace(UUID_COLOR_RE, function(m) {
+    return UUID_COLOR_PREFIX + m + UUID_COLOR_SUFFIX;
+  });
+}
 
 // ========== PROMPT BOUNDARY MARKERS (OSC 7777 injection for deterministic navigation) ==========
 // State machine per tab: 'idle' (prompt visible) → 'busy' (Claude processing) → 'idle' (inject marker!)
@@ -622,9 +637,59 @@ ipcMain.on('show-terminal-context-menu', async (event, { hasSelection, prompts, 
   menu.popup(BrowserWindow.fromWebContents(event.sender));
 });
 
+// Sub-agent chip context menu (right-click on chip in SubAgentBar)
+ipcMain.on('show-sub-agent-context-menu', (event, { claudeTabId, claudeSessionId }) => {
+  // Find taskId by claudeTabId
+  let taskId = null;
+  for (const [tid, task] of mcpTasks) {
+    if (task.claudeTabId === claudeTabId) {
+      taskId = tid;
+      break;
+    }
+  }
+
+  const { clipboard } = require('electron');
+  const template = [];
+
+  if (taskId) {
+    template.push({
+      label: 'Task: ' + taskId.substring(0, 13) + '\u2026',
+      click: () => {
+        clipboard.writeText(taskId);
+        console.log('[SubAgent:Menu] Copied taskId:', taskId);
+      }
+    });
+  }
+
+  if (claudeSessionId) {
+    template.push({
+      label: 'Session: ' + claudeSessionId.substring(0, 13) + '\u2026',
+      click: () => {
+        clipboard.writeText(claudeSessionId);
+        console.log('[SubAgent:Menu] Copied sessionId:', claudeSessionId);
+      }
+    });
+  }
+
+  if (template.length > 0) {
+    template.push({ type: 'separator' });
+  }
+
+  template.push({
+    label: 'Detach',
+    click: () => {
+      event.sender.send('sub-agent-context-menu-command', { action: 'detach', claudeTabId });
+    }
+  });
+
+  const menu = Menu.buildFromTemplate(template);
+  menu.popup(BrowserWindow.fromWebContents(event.sender));
+});
+
 // ========== MCP DELEGATION: HTTP SERVER + TASK MANAGER ==========
 
-const MCP_PORT_FILE = path.join(os.homedir(), '.noted-terminal', 'mcp-port');
+const MCP_PORT_DIR = path.join(os.homedir(), '.noted-terminal');
+const MCP_PORT_FILE = path.join(MCP_PORT_DIR, 'mcp-port-' + process.pid);
 const MCP_TASK_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes safety timeout
 
 function startMcpHttpServer() {
@@ -732,9 +797,25 @@ function startMcpHttpServer() {
     mcpHttpPort = mcpHttpServer.address().port;
     console.log('[MCP:HTTP] Server listening on 127.0.0.1:' + mcpHttpPort);
 
-    // Write port to file so MCP server can discover it
-    const portDir = path.dirname(MCP_PORT_FILE);
-    try { fs.mkdirSync(portDir, { recursive: true }); } catch {}
+    // Write port to PID-specific file so MCP server can discover it
+    try { fs.mkdirSync(MCP_PORT_DIR, { recursive: true }); } catch {}
+
+    // Cleanup stale port files from dead processes
+    try {
+      const files = fs.readdirSync(MCP_PORT_DIR).filter(f => f.startsWith('mcp-port-'));
+      for (const f of files) {
+        const pid = parseInt(f.replace('mcp-port-', ''));
+        if (!pid || pid === process.pid) continue;
+        try {
+          process.kill(pid, 0); // check if alive (signal 0 = no-op)
+        } catch {
+          // Process dead — remove stale port file
+          try { fs.unlinkSync(path.join(MCP_PORT_DIR, f)); } catch {}
+          console.log('[MCP:HTTP] Cleaned stale port file: ' + f);
+        }
+      }
+    } catch {}
+
     fs.writeFileSync(MCP_PORT_FILE, String(mcpHttpPort));
     console.log('[MCP:HTTP] Port written to ' + MCP_PORT_FILE);
   });
@@ -977,6 +1058,17 @@ async function handleSubAgentCompletion(claudeTabId) {
     });
   }
 }
+
+// IPC: Focus on a sub-agent tab by MCP Task ID (triggered by clicking UUID in terminal)
+ipcMain.on('mcp:focus-task', (event, taskId) => {
+  const task = mcpTasks.get(taskId);
+  if (task && task.claudeTabId && mainWindow && !mainWindow.isDestroyed()) {
+    console.log('[MCP:Focus] Switching to sub-agent tab for task ' + taskId + ' → claudeTabId=' + task.claudeTabId);
+    mainWindow.webContents.send('mcp:switch-to-sub-agent', { claudeTabId: task.claudeTabId });
+  } else {
+    console.log('[MCP:Focus] Task not found or no claudeTabId: ' + taskId);
+  }
+});
 
 app.whenReady().then(() => {
   // Диагностика для отладки проблемы с окном
@@ -1546,50 +1638,46 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
       }
       // ========== END PROMPT BOUNDARY MARKER INJECTION ==========
 
-      // ========== CLAUDE SPINNER BUSY DETECTION ==========
-      // Detect spinner chars ·✢✳✶✻✽ colored with Claude orange → busy
-      // Detect ⏵ (U+23F5) without spinner → idle (debounced)
+      // ========== CLAUDE BUSY DETECTION (Window Title Only) ==========
+      // Pure title-based. No ⏵. Spinner chars in title = single source of truth.
+      // BUSY: title contains ✢✳✶✻✽. IDLE: title without spinner chars.
       {
-        if (CLAUDE_SPINNER_RE.test(data)) {
-          // Spinner detected → Claude is busy
-          clearTimeout(claudeSpinnerIdleTimers.get(tabId));
-          claudeSpinnerIdleTimers.delete(tabId);
-          if (!claudeSpinnerBusy.get(tabId)) {
-            claudeSpinnerBusy.set(tabId, true);
-            console.log('[Spinner] Tab ' + tabId + ': BUSY (spinner detected)');
-            if (mainWindow && !mainWindow.isDestroyed()) {
-              mainWindow.webContents.send('claude:busy-state', { tabId, busy: true });
-            }
+        CLAUDE_TITLE_RE.lastIndex = 0;
+        var titleMatch;
+        var lastTitleHasSpinner = null;
+        while ((titleMatch = CLAUDE_TITLE_RE.exec(data)) !== null) {
+          lastTitleHasSpinner = SPINNER_CHARS_RE.test(titleMatch[1]);
+        }
+        // Only act on the LAST title in this chunk (most recent state)
+        if (lastTitleHasSpinner === true && !claudeSpinnerBusy.get(tabId)) {
+          claudeSpinnerBusy.set(tabId, true);
+          console.log('[Spinner] Tab ' + tabId + ': BUSY (title spinner)');
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send('claude:busy-state', { tabId, busy: true });
           }
-        } else if (claudeSpinnerBusy.get(tabId)) {
-          // No spinner in this chunk but was busy — check for idle prompt ⏵
-          var sc2 = stripVTControlCharacters(data);
-          if (sc2.includes('\u23F5')) {
-            // ⏵ seen without spinner → schedule idle transition (debounce 500ms)
-            clearTimeout(claudeSpinnerIdleTimers.get(tabId));
-            claudeSpinnerIdleTimers.set(tabId, setTimeout(function() {
-              claudeSpinnerBusy.set(tabId, false);
-              claudeSpinnerIdleTimers.delete(tabId);
-              console.log('[Spinner] Tab ' + tabId + ': IDLE (prompt returned)');
-              if (mainWindow && !mainWindow.isDestroyed()) {
-                mainWindow.webContents.send('claude:busy-state', { tabId, busy: false });
-              }
-              // MCP sub-agent completion: if this tab is a sub-agent, trigger completion
-              if (subAgentParentTab.has(tabId) && !claudeState.has(tabId) && !claudePendingPrompt.has(tabId)) {
-                var hasRunningTask = false;
-                for (var _e of mcpTasks) { if (_e[1].claudeTabId === tabId && _e[1].status === 'running') { hasRunningTask = true; break; } }
-                if (hasRunningTask) {
-                  console.log('[Spinner] Sub-agent completion triggered for: ' + tabId);
-                  handleSubAgentCompletion(tabId);
-                }
-              }
-            }, 500));
+        } else if (lastTitleHasSpinner === false && claudeSpinnerBusy.get(tabId)) {
+          claudeSpinnerBusy.set(tabId, false);
+          console.log('[Spinner] Tab ' + tabId + ': IDLE (title clear)');
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send('claude:busy-state', { tabId, busy: false });
+          }
+          // MCP sub-agent completion
+          if (subAgentParentTab.has(tabId) && !claudeState.has(tabId) && !claudePendingPrompt.has(tabId)) {
+            var hasRunningTask = false;
+            for (var _e of mcpTasks) { if (_e[1].claudeTabId === tabId && _e[1].status === 'running') { hasRunningTask = true; break; } }
+            if (hasRunningTask) {
+              console.log('[Spinner] Sub-agent completion triggered for: ' + tabId);
+              handleSubAgentCompletion(tabId);
+            }
           }
         }
       }
-      // ========== END CLAUDE SPINNER BUSY DETECTION ==========
+      // ========== END CLAUDE BUSY DETECTION ==========
 
-      // Send raw data to renderer - xterm.js handles OSC sequences itself
+      // Colorize UUIDs (MCP Task IDs) with purple before sending to renderer
+      data = colorizeUUIDs(data);
+
+      // Send data to renderer - xterm.js handles OSC sequences itself
       if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.webContents.send('terminal:data', { pid: ptyProcess.pid, tabId, data });
       }

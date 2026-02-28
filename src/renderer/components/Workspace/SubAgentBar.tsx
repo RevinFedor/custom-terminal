@@ -1,5 +1,7 @@
-import React, { useCallback, useMemo } from 'react';
+import React, { useCallback, useEffect, useMemo } from 'react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
+
+const { ipcRenderer } = window.require('electron');
 
 interface SubAgentBarProps {
   projectId: string;
@@ -52,12 +54,26 @@ export default function SubAgentBar({ projectId, viewingSubAgentTabId, onViewSub
     }
   }, [viewingSubAgentTabId, onViewSubAgent]);
 
-  const handleDetach = useCallback((e: React.MouseEvent, tabId: string) => {
+  const handleContextMenu = useCallback((e: React.MouseEvent, tab: any) => {
     e.preventDefault();
     e.stopPropagation();
-    const state = useWorkspaceStore.getState();
-    state.setTabParent(tabId, undefined as any);
-    onViewSubAgent(null);
+    ipcRenderer.send('show-sub-agent-context-menu', {
+      claudeTabId: tab.id,
+      claudeSessionId: tab.claudeSessionId || null,
+    });
+  }, []);
+
+  // Listen for detach command from native context menu
+  useEffect(() => {
+    const handler = (_: any, data: { action: string; claudeTabId: string }) => {
+      if (data.action === 'detach') {
+        const state = useWorkspaceStore.getState();
+        state.setTabParent(data.claudeTabId, undefined as any);
+        onViewSubAgent(null);
+      }
+    };
+    ipcRenderer.on('sub-agent-context-menu-command', handler);
+    return () => { ipcRenderer.removeListener('sub-agent-context-menu-command', handler); };
   }, [onViewSubAgent]);
 
   const handleLabelClick = useCallback(() => {
@@ -107,7 +123,7 @@ export default function SubAgentBar({ projectId, viewingSubAgentTabId, onViewSub
           <button
             key={tab.id}
             onClick={() => handleChipClick(tab.id)}
-            onContextMenu={(e) => handleDetach(e, tab.id)}
+            onContextMenu={(e) => handleContextMenu(e, tab)}
             className="flex items-center gap-1.5 px-2 py-0.5 rounded transition-colors"
             style={{
               backgroundColor: isViewing ? 'rgba(204, 120, 50, 0.3)' : 'rgba(255,255,255,0.06)',
@@ -115,7 +131,7 @@ export default function SubAgentBar({ projectId, viewingSubAgentTabId, onViewSub
               color: isViewing ? '#cc7832' : 'rgba(255,255,255,0.7)',
               cursor: 'pointer',
             }}
-            title="Click to view, right-click to detach"
+            title="Click to view, right-click for options"
           >
             {/* Square indicator */}
             <span

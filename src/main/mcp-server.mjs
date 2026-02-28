@@ -9,23 +9,75 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
-import { readFileSync } from 'fs';
+import { readFileSync, readdirSync, statSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
+import { execSync } from 'child_process';
 
-const PORT_FILE = join(homedir(), '.noted-terminal', 'mcp-port');
+const PORT_DIR = join(homedir(), '.noted-terminal');
+
+// Walk up process tree from a PID, returning ancestor PIDs
+// Chain: mcp-server → Gemini CLI → zsh/bash → Electron (node-pty)
+function getAncestorPids(startPid, levels) {
+  const pids = [];
+  let pid = startPid;
+  for (let i = 0; i < levels; i++) {
+    try {
+      const ppid = parseInt(execSync('ps -p ' + pid + ' -o ppid=', { encoding: 'utf-8' }).trim());
+      if (!ppid || ppid <= 1) break;
+      pids.push(ppid);
+      pid = ppid;
+    } catch {
+      break;
+    }
+  }
+  return pids;
+}
 
 function getPort() {
-  try {
-    return parseInt(readFileSync(PORT_FILE, 'utf-8').trim());
-  } catch {
-    return null;
+  // Strategy 1: Walk up process tree to find our Electron instance's port file
+  // Chain: mcp-server(ppid=Gemini) → Gemini → zsh → Electron
+  const ancestors = getAncestorPids(process.ppid, 4);
+  for (const pid of ancestors) {
+    try {
+      const port = parseInt(readFileSync(join(PORT_DIR, 'mcp-port-' + pid), 'utf-8').trim());
+      if (port > 0) return port;
+    } catch {}
   }
+
+  // Strategy 2: Fallback — find most recent port file with a live process
+  try {
+    const files = readdirSync(PORT_DIR).filter(f => f.startsWith('mcp-port-'));
+    let best = null;
+    let bestMtime = 0;
+    for (const f of files) {
+      const pid = parseInt(f.replace('mcp-port-', ''));
+      if (!pid) continue;
+      try {
+        process.kill(pid, 0); // check alive
+        const mtime = statSync(join(PORT_DIR, f)).mtimeMs;
+        if (mtime > bestMtime) {
+          bestMtime = mtime;
+          best = f;
+        }
+      } catch {} // dead process, skip
+    }
+    if (best) {
+      return parseInt(readFileSync(join(PORT_DIR, best), 'utf-8').trim());
+    }
+  } catch {}
+
+  // Strategy 3: Legacy single file (backward compat during migration)
+  try {
+    return parseInt(readFileSync(join(PORT_DIR, 'mcp-port'), 'utf-8').trim());
+  } catch {}
+
+  return null;
 }
 
 async function httpPost(endpoint, body) {
   const port = getPort();
-  if (!port) throw new Error('Noted Terminal is not running (no port file at ' + PORT_FILE + ')');
+  if (!port) throw new Error('Noted Terminal is not running (no port file in ' + PORT_DIR + ')');
 
   const url = 'http://127.0.0.1:' + port + endpoint;
   const res = await fetch(url, {

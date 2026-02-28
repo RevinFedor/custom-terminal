@@ -228,7 +228,8 @@ const saveTabs = (projectId: string, tabs: Map<string, Tab>) => {
     createdAt: tab.createdAt,
     isCollapsed: tab.isCollapsed,
     nameSetManually: tab.nameSetManually,
-    parentTabId: tab.parentTabId
+    parentTabId: tab.parentTabId,
+    tabId: tab.id
   }));
   ipcRenderer.invoke('project:save-tabs', { projectId, tabs: tabsArray });
 };
@@ -478,7 +479,15 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       if (!draft) {
         // Restore saved tabs or create default one
         if (savedTabs.length > 0) {
-          newWorkspace.tabCounter = savedTabs.length;
+          // Set tabCounter higher than any restored tab number to avoid ID collisions
+          let maxTabNum = savedTabs.length;
+          for (const st of savedTabs) {
+            if (st.tabId) {
+              const m = st.tabId.match(/-tab-(\d+)$/);
+              if (m) maxTabNum = Math.max(maxTabNum, parseInt(m[1]) + 1);
+            }
+          }
+          newWorkspace.tabCounter = maxTabNum;
           for (const savedTab of savedTabs) {
             await createTab(projectId, savedTab.name, savedTab.cwd, {
               color: savedTab.color,
@@ -493,8 +502,16 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
               url: savedTab.url,
               createdAt: savedTab.createdAt,
               isCollapsed: savedTab.isCollapsed,
-              nameSetManually: savedTab.nameSetManually
+              nameSetManually: savedTab.nameSetManually,
+              parentTabId: savedTab.parentTabId,
+              restoreId: savedTab.tabId
             } as any);
+          }
+          // After restore: set claudeAgentStatus for sub-agent tabs (not persisted in DB)
+          for (const [, tab] of newWorkspace.tabs) {
+            if (tab.parentTabId) {
+              tab.claudeAgentStatus = 'done';
+            }
           }
         } else {
           // Create default tab
@@ -587,8 +604,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       return '';
     }
 
-    const tabId = `${projectId}-tab-${workspace.tabCounter}`;
-    log.tabs('createTab: Generated tabId:', tabId, 'counter:', workspace.tabCounter);
+    const tabId = (options as any)?.restoreId || `${projectId}-tab-${workspace.tabCounter}`;
+    log.tabs('createTab: tabId:', tabId, 'counter:', workspace.tabCounter, 'restored:', !!(options as any)?.restoreId);
     workspace.tabCounter++;
 
     // Smart naming: find next available name if not provided

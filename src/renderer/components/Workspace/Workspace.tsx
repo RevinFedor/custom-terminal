@@ -97,6 +97,16 @@ export default function Workspace() {
     }
   }, [viewingSubAgentTabId, activeProject?.tabs.size]);
 
+  // Listen for mcp:switch-to-sub-agent (triggered by clicking UUID in terminal)
+  useEffect(() => {
+    const handler = (_: any, data: { claudeTabId: string }) => {
+      console.warn('[Workspace] mcp:switch-to-sub-agent →', data.claudeTabId);
+      setViewingSubAgentTabId(data.claudeTabId);
+    };
+    ipcRenderer.on('mcp:switch-to-sub-agent', handler);
+    return () => { ipcRenderer.removeListener('mcp:switch-to-sub-agent', handler); };
+  }, []);
+
   // Restore file preview when switching projects
   useEffect(() => {
     if (!activeProjectId) return;
