@@ -5,6 +5,7 @@ const fs = require('fs');
 const os = require('os');
 const { stripVTControlCharacters } = require('node:util');
 const crypto = require('crypto');
+const http = require('http');
 
 // E2E test mode: suppress native error dialogs that block Playwright
 if (process.env.NOTED_E2E_TEST === 'true') {
@@ -56,6 +57,15 @@ const claudeAgentManager = new ClaudeAgentManager();
 const claudeAgentBuffer = new Map(); // tabId -> stripped text buffer for :::claude::: detection
 const claudeAgentCooldown = new Map(); // tabId -> timestamp (ms) — ignore detections until cooldown expires
 const claudeAgentArmed = new Map();   // tabId -> boolean — only detect after first user input (prevents restore replay)
+
+// ========== MCP DELEGATION (Gemini → Claude sub-agent via real PTY tab) ==========
+const mcpTasks = new Map();             // taskId -> { status, prompt, geminiTabId, claudeTabId, createdAt, result?, error? }
+const subAgentParentTab = new Map();    // claudeTabId -> geminiTabId
+const subAgentCompletionTimers = new Map(); // claudeTabId -> debounce timer
+const subAgentPromptSentAt = new Map();     // claudeTabId -> timestamp when prompt was sent
+let mcpHttpServer = null;               // http.Server instance
+let mcpHttpPort = null;                 // assigned port number
+const geminiCommandQueue = new Map();   // tabId -> Promise (serialized Gemini commands)
 
 // ========== PROMPT BOUNDARY MARKERS (OSC 7777 injection for deterministic navigation) ==========
 // State machine per tab: 'idle' (prompt visible) → 'busy' (Claude processing) → 'idle' (inject marker!)
@@ -598,6 +608,354 @@ ipcMain.on('show-terminal-context-menu', async (event, { hasSelection, prompts, 
   menu.popup(BrowserWindow.fromWebContents(event.sender));
 });
 
+// ========== MCP DELEGATION: HTTP SERVER + TASK MANAGER ==========
+
+const MCP_PORT_FILE = path.join(os.homedir(), '.noted-terminal', 'mcp-port');
+const MCP_TASK_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes safety timeout
+
+function startMcpHttpServer() {
+  mcpHttpServer = http.createServer(async (req, res) => {
+    // CORS headers for local requests
+    res.setHeader('Content-Type', 'application/json');
+
+    if (req.method === 'POST' && req.url === '/delegate') {
+      let body = '';
+      req.on('data', chunk => { body += chunk; });
+      req.on('end', async () => {
+        try {
+          const { prompt, ppid } = JSON.parse(body);
+          if (!prompt) {
+            res.writeHead(400);
+            res.end(JSON.stringify({ error: 'prompt is required' }));
+            return;
+          }
+
+          const taskId = crypto.randomUUID();
+          console.log('[MCP:HTTP] POST /delegate taskId=' + taskId + ' ppid=' + ppid + ' prompt="' + prompt.substring(0, 60) + '..."');
+
+          // Fire-and-forget: start delegation async, return taskId immediately
+          delegateToClaudeSubAgent(taskId, prompt, ppid).catch(err => {
+            console.error('[MCP:Delegate] Error:', err.message);
+            const task = mcpTasks.get(taskId);
+            if (task) { task.status = 'error'; task.error = err.message; }
+          });
+
+          res.writeHead(200);
+          res.end(JSON.stringify({ taskId, status: 'accepted' }));
+        } catch (e) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: 'Invalid JSON: ' + e.message }));
+        }
+      });
+    } else if (req.method === 'POST' && req.url === '/command') {
+      // Send a command to active Claude sub-agent (e.g. /compact, model switch)
+      let body = '';
+      req.on('data', chunk => { body += chunk; });
+      req.on('end', async () => {
+        try {
+          const { command, ppid } = JSON.parse(body);
+          if (!command) {
+            res.writeHead(400);
+            res.end(JSON.stringify({ error: 'command is required' }));
+            return;
+          }
+
+          console.log('[MCP:HTTP] POST /command ppid=' + ppid + ' command="' + command + '"');
+
+          // Find Claude sub-agent tab for this Gemini
+          let geminiTabId = ppid ? await findTabByChildPid(ppid) : null;
+          let claudeTabId = null;
+          if (geminiTabId) {
+            for (const [cId, gId] of subAgentParentTab) {
+              if (gId === geminiTabId) { claudeTabId = cId; break; }
+            }
+          }
+
+          if (!claudeTabId) {
+            res.writeHead(404);
+            res.end(JSON.stringify({ error: 'No active Claude sub-agent found' }));
+            return;
+          }
+
+          const term = terminals.get(claudeTabId);
+          if (!term) {
+            res.writeHead(404);
+            res.end(JSON.stringify({ error: 'Claude terminal not found' }));
+            return;
+          }
+
+          // Send command via safePasteAndSubmit
+          await safePasteAndSubmit(term, command, { submit: true, logPrefix: '[MCP:command]' });
+          res.writeHead(200);
+          res.end(JSON.stringify({ status: 'sent' }));
+        } catch (e) {
+          res.writeHead(500);
+          res.end(JSON.stringify({ error: e.message }));
+        }
+      });
+    } else if (req.method === 'GET' && req.url?.startsWith('/status/')) {
+      const taskId = req.url.slice('/status/'.length);
+      const task = mcpTasks.get(taskId);
+      if (!task) {
+        res.writeHead(404);
+        res.end(JSON.stringify({ error: 'Task not found' }));
+      } else {
+        res.writeHead(200);
+        res.end(JSON.stringify({ taskId, status: task.status, result: task.result, error: task.error }));
+      }
+    } else {
+      res.writeHead(404);
+      res.end(JSON.stringify({ error: 'Not found' }));
+    }
+  });
+
+  mcpHttpServer.listen(0, '127.0.0.1', () => {
+    mcpHttpPort = mcpHttpServer.address().port;
+    console.log('[MCP:HTTP] Server listening on 127.0.0.1:' + mcpHttpPort);
+
+    // Write port to file so MCP server can discover it
+    const portDir = path.dirname(MCP_PORT_FILE);
+    try { fs.mkdirSync(portDir, { recursive: true }); } catch {}
+    fs.writeFileSync(MCP_PORT_FILE, String(mcpHttpPort));
+    console.log('[MCP:HTTP] Port written to ' + MCP_PORT_FILE);
+  });
+}
+
+function stopMcpHttpServer() {
+  if (mcpHttpServer) {
+    mcpHttpServer.close();
+    mcpHttpServer = null;
+  }
+  try { fs.unlinkSync(MCP_PORT_FILE); } catch {}
+  console.log('[MCP:HTTP] Server stopped, port file removed');
+}
+
+// Main delegation logic: create Claude sub-agent tab, run prompt, return result
+async function delegateToClaudeSubAgent(taskId, prompt, ppid) {
+  // Register task
+  mcpTasks.set(taskId, {
+    status: 'pending',
+    prompt,
+    geminiTabId: null,
+    claudeTabId: null,
+    createdAt: Date.now(),
+  });
+
+  // Safety timeout
+  setTimeout(() => {
+    const task = mcpTasks.get(taskId);
+    if (task && task.status !== 'completed' && task.status !== 'error') {
+      console.log('[MCP:Delegate] Task timeout: ' + taskId);
+      task.status = 'timeout';
+      task.error = 'Task timed out after ' + (MCP_TASK_TIMEOUT_MS / 1000) + 's';
+      // Send timeout error back to Gemini
+      if (task.geminiTabId) {
+        deliverResultToGemini(task.geminiTabId, '[Claude Sub-Agent Timeout]\nTask exceeded ' + (MCP_TASK_TIMEOUT_MS / 1000) + 's limit.\n[/Claude Sub-Agent Timeout]');
+      }
+    }
+  }, MCP_TASK_TIMEOUT_MS);
+
+  // 1. Find Gemini tab by PID
+  let geminiTabId = ppid ? await findTabByChildPid(ppid) : null;
+  if (!geminiTabId) {
+    // Fallback: find first gemini tab (for testing / single-tab scenarios)
+    for (const [tid, pty] of terminals) {
+      // Check if renderer knows this is a gemini tab
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        geminiTabId = tid; // Will be refined by renderer
+        break;
+      }
+    }
+  }
+
+  const task = mcpTasks.get(taskId);
+  task.geminiTabId = geminiTabId;
+  task.status = 'creating';
+
+  console.log('[MCP:Delegate] geminiTabId=' + geminiTabId + ' for ppid=' + ppid);
+
+  // 2. Request renderer to create a sub-agent tab
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    throw new Error('Main window not available');
+  }
+
+  // Resolve CWD from main process (renderer may not find cross-project tabs)
+  const geminiCwd = terminalProjects.get(geminiTabId) || process.cwd();
+  console.log('[MCP:Delegate] Using CWD from main: ' + geminiCwd);
+
+  const claudeTabId = await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error('Sub-agent tab creation timeout')), 10000);
+    // IPC invoke to renderer → creates tab → returns tabId
+    mainWindow.webContents.send('mcp:create-sub-agent-tab', {
+      taskId,
+      geminiTabId,
+      cwd: geminiCwd,
+    });
+    // Renderer will reply via IPC
+    ipcMain.once('mcp:sub-agent-tab-created', (event, data) => {
+      clearTimeout(timeout);
+      if (data.error) reject(new Error(data.error));
+      else resolve(data.tabId);
+    });
+  });
+
+  task.claudeTabId = claudeTabId;
+  task.status = 'starting';
+  subAgentParentTab.set(claudeTabId, geminiTabId);
+
+  console.log('[MCP:Delegate] Claude sub-agent tab created: ' + claudeTabId);
+
+  // 3. Launch Claude in the sub-agent tab
+  // Retry with delay: PTY might not be in terminals yet if shell exits/restarts quickly
+  let claudeTerm = null;
+  for (let retry = 0; retry < 5; retry++) {
+    claudeTerm = terminals.get(claudeTabId);
+    if (claudeTerm) break;
+    console.log('[MCP:Delegate] Terminal not found yet, retry ' + (retry + 1) + '/5...');
+    await new Promise(r => setTimeout(r, 500));
+  }
+  if (!claudeTerm) {
+    throw new Error('Claude terminal not found after creation (tabId=' + claudeTabId + ', terminals.size=' + terminals.size + ')');
+  }
+
+  // Start Claude with --dangerously-skip-permissions
+  claudeTerm.write('claude --dangerously-skip-permissions\r');
+  task.status = 'handshake';
+
+  // 4. Set up handshake: wait for prompt, then paste the user prompt
+  claudeState.set(claudeTabId, 'WAITING_PROMPT');
+  claudePendingPrompt.set(claudeTabId, prompt);
+
+  // Notify renderer about task status
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('mcp:task-status', { taskId, claudeTabId, status: 'running' });
+  }
+
+  task.status = 'running';
+  console.log('[MCP:Delegate] Claude launched, handshake set up. Waiting for completion...');
+  // Completion will be detected by PTY onData handler (Step 3)
+}
+
+// Read the latest assistant message from Claude JSONL session
+function readLatestAssistantMessage(sessionId, cwd) {
+  const found = findSessionFile(sessionId, cwd);
+  if (!found) {
+    console.log('[MCP:Response] Session file not found for: ' + sessionId);
+    return null;
+  }
+
+  const { recordMap, lastRecord } = loadJsonlRecords(found.filePath);
+  if (!lastRecord) return null;
+
+  // Walk backwards from lastRecord to find the latest assistant message
+  let current = lastRecord;
+  const visited = new Set();
+  while (current) {
+    if (visited.has(current.uuid)) break;
+    visited.add(current.uuid);
+
+    if (current.type === 'assistant' && current.message?.content) {
+      // Extract text from content blocks
+      const texts = [];
+      for (const block of current.message.content) {
+        if (block.type === 'text' && block.text) {
+          texts.push(block.text);
+        }
+      }
+      if (texts.length > 0) return texts.join('\n');
+    }
+
+    // Walk up via parentUuid
+    if (current.parentUuid) {
+      current = recordMap.get(current.parentUuid);
+    } else {
+      break;
+    }
+  }
+  return null;
+}
+
+// Format sub-agent response for Gemini paste
+function formatSubAgentResponse(result) {
+  return '[Claude Sub-Agent Response]\n' + result + '\n[/Claude Sub-Agent Response]';
+}
+
+// Deliver result back to Gemini PTY via command queue
+function deliverResultToGemini(geminiTabId, formatted) {
+  const geminiTerm = terminals.get(geminiTabId);
+  if (!geminiTerm) {
+    console.log('[MCP:Deliver] Gemini terminal not found: ' + geminiTabId);
+    return;
+  }
+
+  const prev = geminiCommandQueue.get(geminiTabId) || Promise.resolve();
+  geminiCommandQueue.set(geminiTabId, prev.then(async () => {
+    await drainPtyData(geminiTerm, 300);
+    geminiTerm.write('\x01\x0b'); // Ctrl+A + Ctrl+K (clear input)
+    await new Promise(r => setTimeout(r, 100));
+    await safePasteAndSubmit(geminiTerm, formatted, { submit: true, fast: true, logPrefix: '[MCP:deliver]' });
+  }).catch(err => {
+    console.error('[MCP:Deliver] Error:', err.message);
+  }));
+}
+
+// Handle sub-agent completion (called when ⏵ detected in Claude sub-agent PTY)
+async function handleSubAgentCompletion(claudeTabId) {
+  const geminiTabId = subAgentParentTab.get(claudeTabId);
+  if (!geminiTabId) {
+    console.log('[MCP:Complete] No parent tab for: ' + claudeTabId);
+    return;
+  }
+
+  // Find the task
+  let task = null;
+  for (const [tid, t] of mcpTasks) {
+    if (t.claudeTabId === claudeTabId && t.status === 'running') {
+      task = t;
+      task._taskId = tid;
+      break;
+    }
+  }
+
+  if (!task) {
+    console.log('[MCP:Complete] No running task for claudeTabId: ' + claudeTabId);
+    return;
+  }
+
+  console.log('[MCP:Complete] Task ' + task._taskId + ' completed. Reading JSONL response...');
+
+  // Read Claude session ID from bridge
+  const sessionId = bridgeKnownSessions.get(claudeTabId);
+  const cwd = terminalProjects.get(claudeTabId);
+
+  let result = null;
+  if (sessionId) {
+    result = readLatestAssistantMessage(sessionId, cwd);
+  }
+
+  if (!result) {
+    result = '(No response captured — Claude session ID may not have been detected yet)';
+    console.log('[MCP:Complete] No JSONL response found. sessionId=' + sessionId);
+  }
+
+  task.status = 'completed';
+  task.result = result;
+
+  // Format and deliver to Gemini
+  const formatted = formatSubAgentResponse(result);
+  console.log('[MCPResult] Delivering ' + formatted.length + ' chars to Gemini tab ' + geminiTabId);
+  deliverResultToGemini(geminiTabId, formatted);
+
+  // Notify renderer
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('mcp:task-status', {
+      taskId: task._taskId,
+      claudeTabId,
+      status: 'completed'
+    });
+  }
+}
+
 app.whenReady().then(() => {
   // Диагностика для отладки проблемы с окном
   console.log('[Startup] ═══════════════════════════════════════');
@@ -641,12 +999,24 @@ app.whenReady().then(() => {
     console.error('[Startup] SessionBridge ERROR:', e.message);
   }
 
+  // ========== MCP HTTP SERVER ==========
+  console.log('[Startup] Starting MCP HTTP server...');
+  try {
+    startMcpHttpServer();
+    console.log('[Startup] MCP HTTP server OK');
+  } catch (e) {
+    console.error('[Startup] MCP HTTP server ERROR:', e.message);
+  }
+
   console.log('[Startup] Calling createWindow()...');
   createWindow();
   console.log('[Startup] createWindow() returned');
 });
 
 app.on('window-all-closed', () => {
+  // Cleanup MCP HTTP server
+  stopMcpHttpServer();
+
   // Kill all terminals
   for (const [tabId, term] of terminals) {
     term.kill();
@@ -860,6 +1230,8 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
                 submit: true,
                 logPrefix: '[Handshake:' + tabId + ']'
               });
+              // Mark prompt sent time for MCP completion cooldown
+              if (subAgentParentTab.has(tabId)) subAgentPromptSentAt.set(tabId, Date.now());
             } else {
               console.log('[Claude Handshake] Tab ' + tabId + ': ⚠️ No pending prompt found!');
             }
@@ -886,6 +1258,8 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
                 submit: true,
                 logPrefix: '[Handshake:' + tabId + ':reset]'
               });
+              // Mark prompt sent time for MCP completion cooldown
+              if (subAgentParentTab.has(tabId)) subAgentPromptSentAt.set(tabId, Date.now());
             } else {
               console.log('[Claude Handshake] Tab ' + tabId + ': (reset) ⚠️ No pending prompt found!');
             }
@@ -905,14 +1279,6 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
         const m = sc.match(/Session\s*ID[:\s]*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
         if (m && bridgeKnownSessions.has(tabId) && mainWindow && !mainWindow.isDestroyed()) {
           mainWindow.webContents.send('claude:status-session-detected', { tabId, sessionId: m[1] });
-        }
-      }
-
-      // DEBUG: Track Gemini "Press Esc again to rewind" output
-      {
-        const sc = stripVTControlCharacters(data);
-        if (sc.includes('again to rewind') || sc.includes('Esc again')) {
-          console.log('[ESC-DEBUG] Tab ' + tabId + ': Gemini output "Esc again to rewind" at ' + Date.now());
         }
       }
 
@@ -1017,6 +1383,46 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
       }
       // ========== END CLAUDE AGENT PATTERN DETECTOR ==========
 
+      // ========== MCP SUB-AGENT COMPLETION DETECTOR ==========
+      // For tabs in subAgentParentTab: detect ⏵ (prompt returned) → debounce 500ms → completion
+      // GUARD: Skip during handshake (claudeState active) — the initial ⏵ before prompt is sent
+      if (subAgentParentTab.has(tabId) && !claudeState.has(tabId) && !claudePendingPrompt.has(tabId)) {
+        const sc = stripVTControlCharacters(data);
+        if (sc.includes('\u23F5') || sc.includes('\u276F')) {
+          // Debounce: Claude may re-render prompt multiple times
+          clearTimeout(subAgentCompletionTimers.get(tabId));
+          // Calculate debounce delay: normal 500ms, or defer to cooldown end if within cooldown
+          var debounceMs = 500;
+          var sentAt = subAgentPromptSentAt.get(tabId);
+          if (sentAt) {
+            var elapsed = Date.now() - sentAt;
+            if (elapsed < 5000) {
+              // Defer: schedule check for when cooldown expires + 1s buffer
+              debounceMs = (5000 - elapsed) + 1000;
+              console.log('[MCP:Detector] Deferring check by ' + debounceMs + 'ms (cooldown, ' + elapsed + 'ms since prompt)');
+            }
+          }
+          subAgentCompletionTimers.set(tabId, setTimeout(() => {
+            subAgentCompletionTimers.delete(tabId);
+            // Double-check handshake still not active
+            if (claudeState.has(tabId) || claudePendingPrompt.has(tabId)) {
+              console.log('[MCP:Detector] Skipping — handshake still active for: ' + tabId);
+              return;
+            }
+            console.log('[MCP:Detector] Prompt detected in sub-agent tab: ' + tabId);
+            // Only trigger if there's a running task for this tab
+            let hasRunningTask = false;
+            for (const [, t] of mcpTasks) {
+              if (t.claudeTabId === tabId && t.status === 'running') { hasRunningTask = true; break; }
+            }
+            if (hasRunningTask) {
+              handleSubAgentCompletion(tabId);
+            }
+          }, debounceMs));
+        }
+      }
+      // ========== END MCP SUB-AGENT COMPLETION DETECTOR ==========
+
       // ========== PROMPT BOUNDARY MARKER INJECTION ==========
       // Detect Claude prompt (⏵ U+23F5 / ❯ U+276F) transitions to inject OSC 7777 markers.
       // State machine: IDLE → BUSY (non-prompt data) → IDLE (prompt returns = inject!)
@@ -1086,6 +1492,23 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
       claudeAgentBuffer.delete(tabId);
       claudeAgentArmed.delete(tabId);
       claudeAgentCooldown.delete(tabId);
+
+      // MCP: Handle sub-agent PTY exit (Claude crash)
+      if (subAgentParentTab.has(tabId)) {
+        const geminiTabId = subAgentParentTab.get(tabId);
+        console.log('[MCP:PTYExit] Sub-agent ' + tabId + ' exited, parent: ' + geminiTabId);
+        subAgentParentTab.delete(tabId);
+        subAgentCompletionTimers.delete(tabId);
+        if (geminiTabId) {
+          for (const [tid, task] of mcpTasks) {
+            if (task.claudeTabId === tabId && (task.status === 'running' || task.status === 'handshake')) {
+              task.status = 'error';
+              task.error = 'Claude process exited with code ' + JSON.stringify(exitCode);
+              deliverResultToGemini(geminiTabId, '[Claude Sub-Agent Error]\nClaude process exited (code: ' + JSON.stringify(exitCode) + ')\n[/Claude Sub-Agent Error]');
+            }
+          }
+        }
+      }
     });
 
     console.timeEnd(`[PERF:main] terminal:create ${tabId}`);
@@ -1332,11 +1755,6 @@ ipcMain.on('terminal:input', async (event, tabId, data) => {
   if (!claudeAgentArmed.get(tabId)) {
     claudeAgentArmed.set(tabId, true);
     console.log('[ClaudeAgent:Arm] Tab ' + tabId + ': Armed (first user input)');
-  }
-
-  // DEBUG: Track single-byte Esc presses for Gemini double-Esc rewind diagnostics
-  if (data === '\x1b') {
-    console.log('[terminal:input] ESC received for tab ' + tabId + ' at ' + Date.now());
   }
 
   // User paste (Cmd+V) — direct passthrough, no chunking needed.
@@ -1861,6 +2279,42 @@ ipcMain.on('terminal:kill', (event, tabId) => {
   claudeAgentManager.cleanup(tabId);
   claudeAgentBuffer.delete(tabId);
   claudeAgentArmed.delete(tabId);
+
+  // MCP cleanup: if this is a Gemini tab, cancel sub-agent tasks
+  for (const [claudeTabId, geminiTabId] of subAgentParentTab) {
+    if (geminiTabId === tabId) {
+      console.log('[MCP:Cleanup] Gemini tab ' + tabId + ' closed, cancelling sub-agent: ' + claudeTabId);
+      const claudeTerm = terminals.get(claudeTabId);
+      if (claudeTerm) {
+        claudeTerm.write('\x03'); // Ctrl+C to Claude
+      }
+      // Mark tasks as cancelled
+      for (const [tid, task] of mcpTasks) {
+        if (task.claudeTabId === claudeTabId && task.status === 'running') {
+          task.status = 'cancelled';
+          task.error = 'Gemini tab was closed';
+        }
+      }
+      subAgentParentTab.delete(claudeTabId);
+    }
+  }
+
+  // MCP cleanup: if this is a Claude sub-agent tab, clean up references
+  if (subAgentParentTab.has(tabId)) {
+    const geminiTabId = subAgentParentTab.get(tabId);
+    subAgentParentTab.delete(tabId);
+    subAgentCompletionTimers.delete(tabId);
+    // Notify Gemini about the crash
+    if (geminiTabId) {
+      for (const [tid, task] of mcpTasks) {
+        if (task.claudeTabId === tabId && task.status === 'running') {
+          task.status = 'error';
+          task.error = 'Claude sub-agent terminated';
+          deliverResultToGemini(geminiTabId, '[Claude Sub-Agent Error]\nClaude process terminated unexpectedly.\n[/Claude Sub-Agent Error]');
+        }
+      }
+    }
+  }
 });
 
 // ========== CLAUDE AGENT ORCHESTRATION ==========
@@ -2016,6 +2470,26 @@ const execAsync = (cmd, timeout = 1000) => {
     });
   });
 };
+
+// ========== MCP PID MATCHING ==========
+// Resolve childPid → parent shell PID → match pty.pid → tabId
+// Same logic as Bridge: claudePid → shellPid → pty.pid → tabId
+async function findTabByChildPid(childPid) {
+  try {
+    const ppidStr = await execAsync('ps -p ' + childPid + ' -o ppid=');
+    const shellPid = parseInt(ppidStr.trim());
+    for (const [tid, pty] of terminals) {
+      if (pty.pid === shellPid) return tid;
+    }
+    // Try one more level up (gemini CLI → node → shell → pty)
+    const ppidStr2 = await execAsync('ps -p ' + shellPid + ' -o ppid=');
+    const grandParentPid = parseInt(ppidStr2.trim());
+    for (const [tid, pty] of terminals) {
+      if (pty.pid === grandParentPid) return tid;
+    }
+  } catch {}
+  return null;
+}
 
 // Get current working directory of terminal process
 ipcMain.handle('terminal:getCwd', async (event, tabId) => {
@@ -3107,7 +3581,7 @@ ipcMain.on('gemini:run-command', (event, { tabId, command, sessionId, cwd }) => 
 // Serialized per tab: rapid clicks queue up instead of overlapping.
 // Without this, two rapid Ctrl+C from ctrlCFirst trigger Gemini's
 // "Press Ctrl+C again to exit" → second Ctrl+C kills the process.
-const geminiCommandQueue = new Map(); // tabId -> Promise
+// NOTE: geminiCommandQueue declared at top with other Maps (used by MCP delivery too)
 
 ipcMain.on('gemini:send-command', (event, tabId, command) => {
   console.log('[gemini:send-command] Received: tabId=' + tabId + ' command="' + command + '"');

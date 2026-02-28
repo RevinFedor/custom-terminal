@@ -155,6 +155,7 @@ const RestartZone = memo(({ hasProcess, hasColor, commandType, hasSession, onRes
           </div>
         ) : (
           // Green dot (process running) or red dot (claude without saved session)
+          // Claude/Gemini AI tabs get a pulsing animation
           <span
             style={{
               display: 'block',
@@ -166,6 +167,8 @@ const RestartZone = memo(({ hasProcess, hasColor, commandType, hasSession, onRes
               boxShadow: (commandType === 'claude' && !hasSession)
                 ? '0 0 4px rgba(248, 113, 113, 0.5)'
                 : '0 0 4px rgba(74, 222, 128, 0.5)',
+              animation: (commandType === 'claude' || commandType === 'gemini')
+                ? 'tab-dot-pulse 1.5s ease-in-out infinite' : 'none',
             }}
           />
         )

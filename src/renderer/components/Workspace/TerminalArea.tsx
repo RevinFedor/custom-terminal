@@ -118,9 +118,10 @@ const InterruptedSessionOverlay = memo(({ tabId, sessionId, onContinue, onDismis
 
 interface TerminalAreaProps {
   projectId: string;
+  viewingSubAgentTabId?: string | null;
 }
 
-function TerminalArea({ projectId }: TerminalAreaProps) {
+function TerminalArea({ projectId, viewingSubAgentTabId }: TerminalAreaProps) {
   // DEBUG: Track TerminalArea mount/unmount lifecycle
   useEffect(() => {
     console.warn('[TerminalArea:MOUNT] projectId=', projectId);
@@ -213,7 +214,16 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
 
       workspace.tabs.forEach((tab) => {
         // NOTE: currentView check moved INTO Terminal component to avoid useMemo recalculation on view switch
-        const isActive = isActiveProject && workspace.activeTabId === tab.id;
+        // MCP sub-agent viewport: when viewingSubAgentTabId is set, show that tab instead of the active Gemini tab
+        let isActive = isActiveProject && workspace.activeTabId === tab.id;
+        if (isActiveProject && viewingSubAgentTabId) {
+          // If we're viewing a sub-agent, the sub-agent tab is active and the Gemini parent is hidden
+          if (tab.id === viewingSubAgentTabId) {
+            isActive = true;
+          } else if (tab.id === workspace.activeTabId) {
+            isActive = false; // Hide the Gemini tab
+          }
+        }
         if (tab.tabType === 'browser') {
           result.push(
             <BrowserTab
@@ -243,7 +253,7 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
     });
 
     return result;
-  }, [terminalKeys, projectId, openProjects]);
+  }, [terminalKeys, projectId, openProjects, viewingSubAgentTabId]);
 
   // Listen for Claude fork completion to create new tab with command
   useEffect(() => {
