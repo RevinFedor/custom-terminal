@@ -62,6 +62,7 @@
 #### Claude Code (OSC Markers)
 Для Claude Code навигация является детерминированной и работает через систему **PTY-маркеров**.
 - **Механизм:** При клике система вызывает `terminalRegistry.scrollToEntry(uuid)`. Это мгновенный прыжок $O(1)$ к физической строке в буфере, зафиксированной в момент прихода данных от Claude.
+- **Escape Carryover:** В PTY Middleware реализована защита от разрыва escape-последовательностей при вставке маркеров (PTY chunking). См. `knowledge/fix-osc7777-escape-carryover.md`.
 - **Fallback:** Если маркер отсутствует (например, для самого первого сообщения сессии или после очистки скроллбека), система откатывается к поиску через `SearchAddon`.
 
 #### Gemini CLI (Heuristic Search)
