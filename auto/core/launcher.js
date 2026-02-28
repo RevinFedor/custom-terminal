@@ -51,7 +51,8 @@ async function launch(options = {}) {
     env: {
       ...cleanEnv,
       NODE_ENV: 'development',
-      VITE_DEV_SERVER_URL: opts.devServerUrl
+      VITE_DEV_SERVER_URL: opts.devServerUrl,
+      NOTED_E2E_TEST: 'true'
     }
   })
 

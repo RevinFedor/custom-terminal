@@ -1,0 +1,89 @@
+Сессия уже обработана внешним агентом. Ниже готовые инструкции по изменению файлов — не нужно заново читать или анализировать сессию, только примени указанные правки.
+
+
+
+Сначала прочитаю всю существующую документацию, как требуют правила.
+
+**Actions:**
+�� Чтение (/Users/fedor/Desktop/custom-terminal/docs/CLAUDE.md)
+
+**Actions:**
+�� Поиск файлов (docs/knowledge/*.md)
+
+**Actions:**
+�� Чтение (/Users/fedor/Desktop/custom-terminal/docs/knowledge/fact-backtrace-jsonl.md)
+
+**Actions:**
+�� Чтение (/Users/fedor/Desktop/custom-terminal/docs/knowledge/fact-export-session.md)
+
+**Actions:**
+�� Чтение (/Users/fedor/Desktop/custom-terminal/docs/knowledge/fact-terminal-core.md)
+
+**Actions:**
+�� Чтение (/Users/fedor/Desktop/custom-terminal/docs/knowledge/fact-timeline.md)
+
+**Actions:**
+�� Чтение (/Users/fedor/Desktop/custom-terminal/docs/knowledge/fix-gemini-scroll-sameline.md)
+
+Теперь проанализирую сессию и выделю что нужно документировать.
+
+---
+
+## 1. Краткий список изменений
+
+1. **Баг OSC 7777 с разрывом escape-последовательностей** — PTY разбивает truecolor CSI на два чанка, middleware инжектит OSC между ними, xterm.js рендерит параметры цвета как текст (`38;2;153;153;153m❯`).
+
+2. **Escape Carryover буферизация** — middleware теперь детектит неполные escape-хвосты в чанках, буферизует их и склеивает со следующим чанком перед инжекцией OSC 7777.
+
+3. **Headless тестирование chunk boundary** — новый диагностический тест воспроизводит баг через симуляцию PTY chunking, подтверждает фикс через 38 сценариев.
+
+---
+
+## 2. Детальный план обновления документации
+
+### ➕ ДОБАВЛЯЕТСЯ
+
+**knowledge/** → новый файл `fix-osc7777-escape-carryover.md` (~80 строк)
+→ ссылка: `fact-timeline.md` (секция Click-to-Scroll)
+
+Содержание:
+- **Симптом:** Пользователь видит сырые ANSI-параметры как текст вместо цветного промпта
+- **Root Cause:** PTY kernel chunking разрывает CSI mid-sequence, OSC injection абортит незавершённый CSI в xterm.js parser
+- **Отброшенные подходы:** 
+  - Попытка инжектить OSC после escape вместо prepend (невозможно — не знаем где escape начался в предыдущем чанке)
+  - Отложить injection до следующего чанка (ломает детерминизм маркеров)
+- **Решение:** Escape Carryover — буферизация неполных escape-хвостов между чанками
+- **Критичность:** Без фикса Timeline click-to-scroll работает, но промпт визуально сломан в ~1-5% случаев (зависит от PTY timing)
+
+### ✏️ ИЗМЕНЯЕТСЯ
+
+**fact-timeline.md** (~5 строк) → секция "Click-to-Scroll (Deterministic Navigation) / Claude Code (OSC Markers)":
+- ➕ Добавить: "См. `fix-osc7777-escape-carryover.md` — edge case с PTY chunking"
+
+**fact-terminal-core.md** (~3 строки) → секция "PTY Middleware & OSC 7777":
+- ➕ Добавить: "Middleware включает Escape Carryover логику для защиты от chunk boundary разрывов (детали в `fix-osc7777-escape-carryover.md`)"
+
+### ��️ УДАЛЯЕТСЯ
+
+Ничего не удаляется.
+
+---
+
+## 3. Самопроверка
+
+Проверяю каждый пункт плана на "AI восстановит из кода за 1 минуту?":
+
+**Новый файл `fix-osc7777-escape-carryover.md`:**
+- ✅ **Симптом** — AI не увидит что пользователь видел на экране, только код
+- ✅ **Root Cause** — AI не поймёт что PTY kernel chunking непредсказуем без контекста
+- ✅ **Отброшенные подходы** — AI не узнает что пробовали и почему не сработало
+- ✅ **Критичность 1-5%** — AI не оценит частоту проявления без статистики
+
+**Изменения в `fact-timeline.md` и `fact-terminal-core.md`:**
+- ✅ Ссылки на fix-файл — навигационная информация, не восстановима из кода
+
+**Самопроверка:** Убрал 0 пунктов. Все записи содержат невидимый контекст (симптомы, мотивацию, отброшенные подходы, частоту бага).
+
+---
+
+**Итого:** 1 новый файл + 2 минорных дополнения в существующие. Готов к редактированию после одобрения.
