@@ -67,15 +67,17 @@ let mcpHttpServer = null;               // http.Server instance
 let mcpHttpPort = null;                 // assigned port number
 const geminiCommandQueue = new Map();   // tabId -> Promise (serialized Gemini commands)
 
-// ========== CLAUDE BUSY DETECTION (Window Title Only) ==========
-// Deterministic, no timers, color-independent. Pure title-based:
-// BUSY: spinner char (✢✳✶✻✽) appears in window title (OSC 0)
-// IDLE: window title changes to one WITHOUT spinner chars
-// No ⏵ prompt detection — title is the single source of truth.
-const claudeSpinnerBusy = new Map();   // tabId → boolean
-const CLAUDE_TITLE_SPINNER_RE = /\x1b\]0;[^\x07]*[\u2722\u2733\u2736\u273B\u273D][^\x07]*\x07/;
-const CLAUDE_TITLE_RE = /\x1b\]0;([^\x07]*)\x07/g;
-const SPINNER_CHARS_RE = /[\u2722\u2733\u2736\u273B\u273D]/;
+// ========== CLAUDE BUSY DETECTION (Content Spinner) ==========
+// Color-independent. Detects spinner chars ✢✳✶✻✽ in TUI CONTENT (not window title).
+// · (middle dot) excluded — it's the status bar separator, not a spinner.
+// BUSY: spinner char found in content → instant.
+// IDLE: no spinner char in content for 500ms → debounce (one timer).
+// OSC sequences (title) are stripped before checking to avoid false positives
+// from Claude's static branding title "✳ Claude Code".
+const claudeSpinnerBusy = new Map();       // tabId → boolean
+const claudeSpinnerIdleTimer = new Map();  // tabId → timeout ID
+const OSC_RE = /\x1b\][^\x07]*\x07/g;     // matches all OSC sequences (title, etc)
+const CONTENT_SPINNER_RE = /[\u2722\u2733\u2736\u273B\u273D]/; // ✢✳✶✻✽ (no · !)
 
 // ========== GEMINI SPINNER DETECTION (Braille busy indicator) ==========
 // Detects Gemini CLI Braille spinner chars (⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏) + "esc to cancel" text.
@@ -1638,38 +1640,44 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
       }
       // ========== END PROMPT BOUNDARY MARKER INJECTION ==========
 
-      // ========== CLAUDE BUSY DETECTION (Window Title Only) ==========
-      // Pure title-based. No ⏵. Spinner chars in title = single source of truth.
-      // BUSY: title contains ✢✳✶✻✽. IDLE: title without spinner chars.
+      // ========== CLAUDE BUSY DETECTION (Content Spinner) ==========
+      // Strip OSC sequences (window title "✳ Claude Code" is branding, NOT thinking).
+      // Then check stripped TUI content for spinner chars ✢✳✶✻✽.
       {
-        CLAUDE_TITLE_RE.lastIndex = 0;
-        var titleMatch;
-        var lastTitleHasSpinner = null;
-        while ((titleMatch = CLAUDE_TITLE_RE.exec(data)) !== null) {
-          lastTitleHasSpinner = SPINNER_CHARS_RE.test(titleMatch[1]);
-        }
-        // Only act on the LAST title in this chunk (most recent state)
-        if (lastTitleHasSpinner === true && !claudeSpinnerBusy.get(tabId)) {
-          claudeSpinnerBusy.set(tabId, true);
-          console.log('[Spinner] Tab ' + tabId + ': BUSY (title spinner)');
-          if (mainWindow && !mainWindow.isDestroyed()) {
-            mainWindow.webContents.send('claude:busy-state', { tabId, busy: true });
-          }
-        } else if (lastTitleHasSpinner === false && claudeSpinnerBusy.get(tabId)) {
-          claudeSpinnerBusy.set(tabId, false);
-          console.log('[Spinner] Tab ' + tabId + ': IDLE (title clear)');
-          if (mainWindow && !mainWindow.isDestroyed()) {
-            mainWindow.webContents.send('claude:busy-state', { tabId, busy: false });
-          }
-          // MCP sub-agent completion
-          if (subAgentParentTab.has(tabId) && !claudeState.has(tabId) && !claudePendingPrompt.has(tabId)) {
-            var hasRunningTask = false;
-            for (var _e of mcpTasks) { if (_e[1].claudeTabId === tabId && _e[1].status === 'running') { hasRunningTask = true; break; } }
-            if (hasRunningTask) {
-              console.log('[Spinner] Sub-agent completion triggered for: ' + tabId);
-              handleSubAgentCompletion(tabId);
+        var dataNoOsc = data.replace(OSC_RE, '');
+        var contentStripped = stripVTControlCharacters(dataNoOsc);
+        var hasContentSpinner = CONTENT_SPINNER_RE.test(contentStripped);
+
+        if (hasContentSpinner) {
+          // Spinner in content → BUSY, reset idle timer
+          clearTimeout(claudeSpinnerIdleTimer.get(tabId));
+          claudeSpinnerIdleTimer.delete(tabId);
+          if (!claudeSpinnerBusy.get(tabId)) {
+            claudeSpinnerBusy.set(tabId, true);
+            console.log('[Spinner] Tab ' + tabId + ': BUSY');
+            if (mainWindow && !mainWindow.isDestroyed()) {
+              mainWindow.webContents.send('claude:busy-state', { tabId, busy: true });
             }
           }
+        } else if (claudeSpinnerBusy.get(tabId) && !claudeSpinnerIdleTimer.has(tabId)) {
+          // Was busy, no spinner in this chunk → start 500ms debounce
+          claudeSpinnerIdleTimer.set(tabId, setTimeout(function() {
+            claudeSpinnerBusy.set(tabId, false);
+            claudeSpinnerIdleTimer.delete(tabId);
+            console.log('[Spinner] Tab ' + tabId + ': IDLE');
+            if (mainWindow && !mainWindow.isDestroyed()) {
+              mainWindow.webContents.send('claude:busy-state', { tabId, busy: false });
+            }
+            // MCP sub-agent completion
+            if (subAgentParentTab.has(tabId) && !claudeState.has(tabId) && !claudePendingPrompt.has(tabId)) {
+              var hasRunningTask = false;
+              for (var _e of mcpTasks) { if (_e[1].claudeTabId === tabId && _e[1].status === 'running') { hasRunningTask = true; break; } }
+              if (hasRunningTask) {
+                console.log('[Spinner] Sub-agent completion triggered for: ' + tabId);
+                handleSubAgentCompletion(tabId);
+              }
+            }
+          }, 500));
         }
       }
       // ========== END CLAUDE BUSY DETECTION ==========

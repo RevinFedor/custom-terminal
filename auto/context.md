@@ -32,6 +32,7 @@ auto/
 │   ├── test-gemini-orchestration.js  # [E2E+Gemini+Claude] Gemini → Claude delegation, spinners, MCP
 │   └── test-history-restore.js       # [E2E] History: восстановление из SQLite ⚠️ BROKEN
 ├── sandbox/                          # Одноразовые эксперименты. Готов → перенести в stable/
+│   └── test-claude-busy-indicator.js # [E2E+Claude] Busy State: детекция без цвета + OSC stripping
 └── screenshots/                      # Артефакты тестов
 ```
 
@@ -302,8 +303,8 @@ Main-процесс логирует состояния AI-агентов для
 |---|---|---|
 | `[GeminiSpinner] Tab X: THINKING` | Gemini обрабатывает запрос (Braille spinner ⠋ обнаружен) | `waitForMainProcessLog(logs, /GeminiSpinner.*THINKING/, 15000)` |
 | `[GeminiSpinner] Tab X: IDLE` | Gemini закончил ответ (1.5с без спиннера) | `waitForMainProcessLog(logs, /GeminiSpinner.*IDLE/, 60000)` |
-| `[Spinner] Tab X: BUSY` | Claude Code обрабатывает запрос (оранжевый спиннер) | `waitForMainProcessLog(logs, /Spinner.*BUSY/, 60000)` |
-| `[Spinner] Tab X: IDLE` | Claude Code вернул промт | `waitForMainProcessLog(logs, /Spinner.*IDLE/, 120000)` |
+| `[Spinner] Tab X: BUSY` | Claude Code занят (✢✳✶✻✽, без цвета + OSC stripping) | `waitForMainProcessLog(logs, /Spinner.*BUSY/, 60000)` |
+| `[Spinner] Tab X: IDLE` | Claude Code вернул промт (500ms debounce без спиннера) | `waitForMainProcessLog(logs, /Spinner.*IDLE/, 120000)` |
 | `[MCP:Delegate] Claude sub-agent tab created` | Sub-agent таб создан | `waitForMainProcessLog(logs, /MCP:Delegate.*sub-agent tab created/, 120000)` |
 | `[MCP:HTTP] POST /delegate` | MCP delegation request принят | `findInLogs(logs, 'MCP:')` |
 

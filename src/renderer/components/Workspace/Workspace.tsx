@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState, useRef } from 'react';
+import React, { useCallback, useEffect, useMemo, useState, useRef } from 'react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import { useUIStore } from '../../store/useUIStore';
@@ -97,6 +97,22 @@ export default function Workspace() {
     }
   }, [viewingSubAgentTabId, activeProject?.tabs.size]);
 
+  // effectiveTab: when viewing a sub-agent, resolve to that tab; otherwise fallback to activeTab
+  const effectiveTab = useMemo(() => {
+    if (viewingSubAgentTabId && activeProject) {
+      const subTab = activeProject.tabs.get(viewingSubAgentTabId);
+      if (subTab) return subTab;
+    }
+    return activeTab;
+  }, [viewingSubAgentTabId, activeProject, activeTab]);
+
+  // Clear search when switching between parent tab and sub-agent view
+  useEffect(() => {
+    setSearchText('');
+    setSearchResults({ resultIndex: 0, resultCount: 0 });
+    if (activeTab?.id) terminalRegistry.clearSearch(activeTab.id);
+  }, [viewingSubAgentTabId]);
+
   // Listen for mcp:switch-to-sub-agent (triggered by clicking UUID in terminal)
   useEffect(() => {
     const handler = (_: any, data: { claudeTabId: string }) => {
@@ -141,16 +157,16 @@ export default function Workspace() {
 
   // Listen for OSC 133 command lifecycle events (Shell Integration)
   useEffect(() => {
-    if (!activeTab?.id) return;
+    if (!effectiveTab?.id) return;
 
     const handleCommandStarted = (_: any, data: { tabId: string }) => {
-      if (data.tabId === activeTab.id) {
+      if (data.tabId === effectiveTab.id) {
         setIsCommandRunning(true);
       }
     };
 
     const handleCommandFinished = (_: any, data: { tabId: string; exitCode: number }) => {
-      if (data.tabId === activeTab.id) {
+      if (data.tabId === effectiveTab.id) {
         setIsCommandRunning(false);
       }
     };
@@ -159,7 +175,7 @@ export default function Workspace() {
     ipcRenderer.on('terminal:command-finished', handleCommandFinished);
 
     // Get initial state
-    ipcRenderer.invoke('terminal:getCommandState', activeTab.id).then((state: any) => {
+    ipcRenderer.invoke('terminal:getCommandState', effectiveTab.id).then((state: any) => {
       setIsCommandRunning(state?.isRunning || false);
     });
 
@@ -167,7 +183,7 @@ export default function Workspace() {
       ipcRenderer.removeListener('terminal:command-started', handleCommandStarted);
       ipcRenderer.removeListener('terminal:command-finished', handleCommandFinished);
     };
-  }, [activeTab?.id]);
+  }, [effectiveTab?.id]);
 
   // Handle resize callback for terminal refit
   const handleResize = useCallback(() => {
@@ -194,15 +210,15 @@ export default function Workspace() {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (workspaceView !== 'workspace') return;
       const isBackslash = e.code === 'Backslash' || e.key === '\\' || e.code === 'IntlBackslash';
-      if (e.metaKey && isBackslash && activeTab?.id && activeTab.claudeSessionId && activeTab.commandType === 'claude') {
+      if (e.metaKey && isBackslash && effectiveTab?.id && effectiveTab.claudeSessionId && effectiveTab.commandType === 'claude') {
         e.preventDefault();
-        const currentOpen = useUIStore.getState().historyPanelOpenTabs[activeTab.id] ?? false;
-        setHistoryPanelOpen(activeTab.id, !currentOpen);
+        const currentOpen = useUIStore.getState().historyPanelOpenTabs[effectiveTab.id] ?? false;
+        setHistoryPanelOpen(effectiveTab.id, !currentOpen);
       }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [workspaceView, activeTab?.id, activeTab?.claudeSessionId, activeTab?.commandType, setHistoryPanelOpen]);
+  }, [workspaceView, effectiveTab?.id, effectiveTab?.claudeSessionId, effectiveTab?.commandType, setHistoryPanelOpen]);
 
   // CMD+F hotkey for terminal search
   useEffect(() => {
@@ -221,78 +237,78 @@ export default function Workspace() {
         setSearchText('');
         setSearchResults({ resultIndex: 0, resultCount: 0 });
         // Clear search highlighting
-        if (activeTab?.id) {
-          terminalRegistry.clearSearch(activeTab.id);
+        if (effectiveTab?.id) {
+          terminalRegistry.clearSearch(effectiveTab.id);
         }
       }
     };
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [showSearch, activeTab?.id, workspaceView]);
+  }, [showSearch, effectiveTab?.id, workspaceView]);
 
   // Handle search
   const handleSearch = useCallback((text: string) => {
     setSearchText(text);
-    if (!activeTab?.id || !text.trim()) {
-      if (activeTab?.id) {
-        terminalRegistry.clearSearch(activeTab.id);
+    if (!effectiveTab?.id || !text.trim()) {
+      if (effectiveTab?.id) {
+        terminalRegistry.clearSearch(effectiveTab.id);
       }
       return;
     }
-    terminalRegistry.searchAndScroll(activeTab.id, text);
-  }, [activeTab?.id]);
+    terminalRegistry.searchAndScroll(effectiveTab.id, text);
+  }, [effectiveTab?.id]);
 
   // Handle keyboard in search
   const handleSearchKeyDown = useCallback((e: React.KeyboardEvent) => {
-    if (!activeTab?.id || !searchText.trim()) return;
+    if (!effectiveTab?.id || !searchText.trim()) return;
 
     if (e.key === 'Enter') {
       e.preventDefault();
       if (e.shiftKey) {
         // Shift+Enter = find previous
-        terminalRegistry.findPrevious(activeTab.id, searchText);
+        terminalRegistry.findPrevious(effectiveTab.id, searchText);
       } else {
         // Enter = find next
-        terminalRegistry.findNext(activeTab.id, searchText);
+        terminalRegistry.findNext(effectiveTab.id, searchText);
       }
     } else if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
       e.preventDefault();
       if (e.key === 'ArrowUp') {
-        terminalRegistry.findPrevious(activeTab.id, searchText);
+        terminalRegistry.findPrevious(effectiveTab.id, searchText);
       } else {
-        terminalRegistry.findNext(activeTab.id, searchText);
+        terminalRegistry.findNext(effectiveTab.id, searchText);
       }
     }
-  }, [activeTab?.id, searchText]);
+  }, [effectiveTab?.id, searchText]);
 
   // Find next/previous handlers for buttons
   const handleFindNext = useCallback(() => {
-    if (activeTab?.id && searchText.trim()) {
-      terminalRegistry.findNext(activeTab.id, searchText);
+    if (effectiveTab?.id && searchText.trim()) {
+      terminalRegistry.findNext(effectiveTab.id, searchText);
     }
-  }, [activeTab?.id, searchText]);
+  }, [effectiveTab?.id, searchText]);
 
   const handleFindPrevious = useCallback(() => {
-    if (activeTab?.id && searchText.trim()) {
-      terminalRegistry.findPrevious(activeTab.id, searchText);
+    if (effectiveTab?.id && searchText.trim()) {
+      terminalRegistry.findPrevious(effectiveTab.id, searchText);
     }
-  }, [activeTab?.id, searchText]);
+  }, [effectiveTab?.id, searchText]);
 
   // Subscribe to search results
   useEffect(() => {
-    if (!activeTab?.id || !showSearch) return;
+    if (!effectiveTab?.id || !showSearch) return;
 
-    terminalRegistry.onSearchResults(activeTab.id, (results) => {
+    terminalRegistry.onSearchResults(effectiveTab.id, (results) => {
       setSearchResults(results);
     });
 
     return () => {
-      if (activeTab?.id) {
-        terminalRegistry.offSearchResults(activeTab.id);
+      if (effectiveTab?.id) {
+        terminalRegistry.offSearchResults(effectiveTab.id);
       }
     };
-  }, [activeTab?.id, showSearch]);
+  }, [effectiveTab?.id, showSearch]);
 
   // Tab creation is now handled in useWorkspaceStore.openProject()
 
@@ -302,26 +318,26 @@ export default function Workspace() {
   }
 
   // Get current tab's cwd for FileExplorer (fallback to project path)
-  const explorerPath = activeTab?.cwd || (currentProject.path?.startsWith('__unset__') ? '' : currentProject.path);
+  const explorerPath = effectiveTab?.cwd || (currentProject.path?.startsWith('__unset__') ? '' : currentProject.path);
 
   // Get session IDs for Timeline
-  const claudeSessionId = activeTab?.claudeSessionId || null;
-  const geminiSessionId = activeTab?.geminiSessionId || null;
+  const claudeSessionId = effectiveTab?.claudeSessionId || null;
+  const geminiSessionId = effectiveTab?.geminiSessionId || null;
 
   // Show Timeline when tab has Claude or Gemini session
   // Timeline stays visible even when AI is not running (dimmed background)
   const showTimeline = !filePreview && (
-    (claudeSessionId && activeTab?.commandType === 'claude') ||
-    (geminiSessionId && activeTab?.commandType === 'gemini')
+    (claudeSessionId && effectiveTab?.commandType === 'claude') ||
+    (geminiSessionId && effectiveTab?.commandType === 'gemini')
   );
-  const timelineSessionId = activeTab?.commandType === 'gemini' ? geminiSessionId : claudeSessionId;
-  const timelineToolType = (activeTab?.commandType === 'gemini' ? 'gemini' : 'claude') as 'claude' | 'gemini';
+  const timelineSessionId = effectiveTab?.commandType === 'gemini' ? geminiSessionId : claudeSessionId;
+  const timelineToolType = (effectiveTab?.commandType === 'gemini' ? 'gemini' : 'claude') as 'claude' | 'gemini';
 
   // DEBUG: Uncomment to debug Timeline visibility
   // console.log('[Timeline Debug] showTimeline:', showTimeline, 'claudeSessionId:', claudeSessionId, 'commandType:', activeTab?.commandType, 'isRunning:', isCommandRunning);
 
   // Per-tab history panel state
-  const isHistoryOpen = activeTab?.id ? (historyPanelOpenTabs[activeTab.id] ?? false) : false;
+  const isHistoryOpen = effectiveTab?.id ? (historyPanelOpenTabs[effectiveTab.id] ?? false) : false;
 
   // Delayed unmount for slide-out animation (keep mounted 200ms after close)
   const [historyMounted, setHistoryMounted] = useState(false);
@@ -335,7 +351,7 @@ export default function Workspace() {
   }, [isHistoryOpen]);
 
   // DEBUG: Track state changes
-  console.warn(`[Workspace:RENDER] currentView=${currentView} showTimeline=${showTimeline} activeTabId=${activeTab?.id} isCommandRunning=${isCommandRunning}`);
+  console.warn(`[Workspace:RENDER] currentView=${currentView} showTimeline=${showTimeline} activeTabId=${activeTab?.id} effectiveTabId=${effectiveTab?.id} isCommandRunning=${isCommandRunning}`);
 
   return (
     <div className="flex-1 flex h-full overflow-hidden relative">
@@ -424,8 +440,8 @@ export default function Workspace() {
                     setShowSearch(false);
                     setSearchText('');
                     setSearchResults({ resultIndex: 0, resultCount: 0 });
-                    if (activeTab?.id) {
-                      terminalRegistry.clearSearch(activeTab.id);
+                    if (effectiveTab?.id) {
+                      terminalRegistry.clearSearch(effectiveTab.id);
                     }
                   }}
                   style={{ background: 'none', border: 'none', color: 'rgba(255, 255, 255, 0.5)', cursor: 'pointer', fontSize: '14px', padding: '2px 4px', marginLeft: '4px' }}
@@ -440,11 +456,11 @@ export default function Workspace() {
             <ResearchSheet projectId={activeProjectId} projectPath={currentProject.path} />
 
             {/* History Panel — absolute overlay within terminal area only */}
-            {(isHistoryOpen || historyMounted) && timelineSessionId && activeTab && currentView === 'terminal' && (
+            {(isHistoryOpen || historyMounted) && timelineSessionId && effectiveTab && currentView === 'terminal' && (
               <HistoryPanel
-                tabId={activeTab.id}
+                tabId={effectiveTab.id}
                 sessionId={timelineSessionId}
-                cwd={activeTab.cwd || currentProject.path}
+                cwd={effectiveTab.cwd || currentProject.path}
                 width={historyPanelWidth}
                 notesPanelWidth={notesPanelWidth}
                 isOpen={isHistoryOpen}
@@ -456,9 +472,9 @@ export default function Workspace() {
           {/* Timeline — inside terminal row so it only spans terminal height */}
           {showTimeline && (
             <Timeline
-              tabId={activeTab.id}
+              tabId={effectiveTab.id}
               sessionId={timelineSessionId}
-              cwd={activeTab.cwd || currentProject.path}
+              cwd={effectiveTab.cwd || currentProject.path}
               isActive={isCommandRunning}
               isVisible={workspaceView === 'workspace' && currentView === 'terminal'}
               toolType={timelineToolType}
@@ -487,7 +503,7 @@ export default function Workspace() {
           <Resizer onResize={handleResize} />
           <div className="flex-1 overflow-hidden relative">
             {!filePreview && (
-              <NotesPanel projectId={activeProjectId} project={currentProject} />
+              <NotesPanel projectId={activeProjectId} project={currentProject} effectiveTabId={effectiveTab?.id} />
             )}
           </div>
         </div>

@@ -66,10 +66,11 @@ Gemini CLI часто делегирует задачи в формате:
 ### Проблема
 Индикаторы на чипах суб-агентов в `SubAgentBar` либо не мигали, либо мигали вечно (даже после завершения задачи).
 
-### Причина
-Рендерер не слушал события `mcp:task-status` от Main-процесса. Приложение знало, что задача завершена, но `claudeAgentStatus` в сторе оставался `undefined`.
-
 ### Решение
 1. **IPC Bridge:** В `App.tsx` добавлен глобальный слушатель `mcp:task-status`.
 2. **Mapping:** Статусы MCP (`running`, `completed`, `error`, `timeout`) мапятся на внутренние статусы агента (`running`, `done`, `error`).
-3. **Store Update:** При получении статуса вызывается `setClaudeAgentStatus(tabId, status)`, что мгновенно обновляет визуальное состояние чипа (остановка пульсации, смена иконки на ✓ или ✗).
+3. **Store Update:** При получении статуса вызывается `setClaudeAgentStatus(tabId, status)`, что мгновенно обновляет визуальное состояние чипа.
+4. **Restore Status:** При перезагрузке приложения всем суб-агентам принудительно ставится статус `done`. См. [`fix-tab-persistence.md`](fix-tab-persistence.md).
+
+## 7. Multi-instance Race Conditions
+Решено через PID-based файлы портов и обход дерева процессов. См. [`fix-mcp-multi-instance.md`](fix-mcp-multi-instance.md).
