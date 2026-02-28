@@ -15,26 +15,43 @@ export default function ToastContainer() {
         display: 'flex',
         flexDirection: 'column',
         gap: '8px',
-        maxWidth: '300px'
+        maxWidth: '340px'
       }}
     >
       {toasts.map((toast) => (
         <div
           key={toast.id}
-          className={`pointer-events-auto flex items-center gap-2 px-3 py-2 rounded-lg shadow-lg backdrop-blur-sm transform transition-all duration-300 ease-out animate-slide-in cursor-pointer ${
+          className={`pointer-events-auto flex items-center gap-2 px-3 py-2 rounded-lg shadow-lg backdrop-blur-sm transform transition-all duration-300 ease-out animate-slide-in ${
+            toast.persistent ? '' : 'cursor-pointer'
+          } ${
             toast.type === 'success' ? 'bg-[#22c55e]/90 text-white' :
             toast.type === 'error' ? 'bg-[#ef4444]/90 text-white' :
             toast.type === 'warning' ? 'bg-[#f59e0b]/90 text-white' :
             'bg-[#3b82f6]/90 text-white'
           }`}
-          onClick={() => removeToast(toast.id)}
+          style={toast.persistent ? {
+            borderLeft: '3px solid rgba(255,255,255,0.5)',
+            paddingRight: '8px',
+          } : undefined}
+          onClick={() => !toast.persistent && removeToast(toast.id)}
         >
-          <span className="text-sm">
+          <span className="text-sm shrink-0">
             {toast.type === 'success' ? '✓' :
              toast.type === 'error' ? '✗' :
              toast.type === 'warning' ? '⚠' : 'ℹ'}
           </span>
-          <span className="text-xs font-medium">{toast.message}</span>
+          <span className="text-xs font-medium flex-1">{toast.message}</span>
+          {toast.persistent && (
+            <span
+              className="shrink-0 cursor-pointer rounded-full flex items-center justify-center hover:bg-white/20 transition-colors"
+              style={{ width: '18px', height: '18px', fontSize: '11px', opacity: 0.7 }}
+              onMouseEnter={(e) => { e.currentTarget.style.opacity = '1'; }}
+              onMouseLeave={(e) => { e.currentTarget.style.opacity = '0.7'; }}
+              onClick={(e) => { e.stopPropagation(); removeToast(toast.id); }}
+            >
+              ✕
+            </span>
+          )}
         </div>
       ))}
     </div>

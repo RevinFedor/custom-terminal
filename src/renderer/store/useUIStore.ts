@@ -4,6 +4,7 @@ interface Toast {
   id: string;
   message: string;
   type: 'success' | 'error' | 'info' | 'warning';
+  persistent?: boolean;
 }
 
 interface FilePreview {
@@ -141,7 +142,7 @@ interface UIStore {
 
   toasts: Toast[];
 
-  showToast: (message: string, type?: 'success' | 'error' | 'info' | 'warning', duration?: number) => void;
+  showToast: (message: string, type?: 'success' | 'error' | 'info' | 'warning', duration?: number, persistent?: boolean) => void;
 
   removeToast: (id: string) => void;
 
@@ -663,15 +664,17 @@ export const useUIStore = create<UIStore>((set, get) => ({
 
   // Toast Notifications
   toasts: [],
-  showToast: (message, type = 'success', duration = 2500) => {
+  showToast: (message, type = 'success', duration = 2500, persistent = false) => {
     const id = `toast-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
     set((state) => ({
-      toasts: [...state.toasts, { id, message, type }]
+      toasts: [...state.toasts, { id, message, type, persistent }]
     }));
 
-    setTimeout(() => {
-      get().removeToast(id);
-    }, duration);
+    if (!persistent) {
+      setTimeout(() => {
+        get().removeToast(id);
+      }, duration);
+    }
   },
   removeToast: (id) => set((state) => ({
     toasts: state.toasts.filter((t) => t.id !== id)

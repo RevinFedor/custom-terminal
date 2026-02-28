@@ -36,6 +36,8 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
   const [actions, setActions] = useState<Action[]>([]); // Kept for potential future use, loaded from global_commands DB table
   const [isScissorsHovered, setIsScissorsHovered] = useState(false);
   const [isCopyingDocs, setIsCopyingDocs] = useState(false);
+  const [isApiLoading, setIsApiLoading] = useState(false);
+  const apiCancelledRef = useRef(false);
 
   // Update Docs expandable prompt
   const [docsExpanded, setDocsExpanded] = useState(false);
@@ -286,6 +288,115 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
       showToast(error.message || 'Copy docs failed', 'error');
     } finally {
       setIsCopyingDocs(false);
+    }
+  };
+
+  // API Docs — export session + prompt, send to Claude API, copy response to clipboard
+  const handleApiDocsRequest = async () => {
+    if (!activeTabId || !activeProjectId) {
+      showToast('No active terminal tab', 'error');
+      return;
+    }
+
+    const activeProject = getActiveProject();
+    if (!activeProject) {
+      showToast('No active project', 'error');
+      return;
+    }
+
+    setIsApiLoading(true);
+    apiCancelledRef.current = false;
+
+    try {
+      // 1. Export session content (same pipeline as handleCopyDocsToClipboard)
+      const tabsToCopy = isMultiSelect ? selectedTabs : [activeProject.tabs.get(activeTabId)];
+      const validTabs = tabsToCopy.filter(t => t?.claudeSessionId || t?.geminiSessionId);
+
+      if (validTabs.length === 0) {
+        showToast('Нет сессий для экспорта', 'warning');
+        setIsApiLoading(false);
+        return;
+      }
+
+      const results: string[] = [];
+      for (const tab of validTabs) {
+        if (!tab) continue;
+        const cwd = await ipcRenderer.invoke('terminal:getCwd', tab.id).catch(() => null) || tab.cwd || activeProject.projectPath;
+        let result;
+        if (tab.geminiSessionId && !tab.claudeSessionId) {
+          result = await ipcRenderer.invoke('gemini:copy-range', {
+            sessionId: tab.geminiSessionId, cwd, startUuid: null, endUuid: null
+          });
+        } else {
+          result = await ipcRenderer.invoke('claude:export-clean-session', {
+            sessionId: tab.claudeSessionId, cwd, includeEditing, includeReading, fromStart, includeSubagentResult, includeSubagentHistory
+          });
+        }
+        if (result.success) results.push(result.content);
+      }
+
+      if (results.length === 0) {
+        showToast('Export failed', 'error');
+        setIsApiLoading(false);
+        return;
+      }
+
+      const content = results.join('\n\n' + '='.repeat(40) + '\n\n');
+      if (isMultiSelect) clearSelection(activeProject.projectId);
+
+      // 2. Get documentation prompt
+      let systemPrompt: string;
+      if (docPrompt.useFile) {
+        const promptResult = await ipcRenderer.invoke('docs:read-prompt-file', { filePath: docPrompt.filePath });
+        if (!promptResult.success) throw new Error(promptResult.error || 'Failed to read prompt file');
+        systemPrompt = promptResult.content;
+      } else {
+        systemPrompt = docPrompt.inlineContent;
+      }
+      if (!systemPrompt) throw new Error('Documentation prompt is empty');
+
+      // 3. Assemble full prompt
+      const promptText = [
+        systemPrompt,
+        '\n--- SESSION DATA ---\n',
+        content,
+        additionalPrompt.trim() ? '\n' + additionalPrompt.trim() : ''
+      ].filter(Boolean).join('\n');
+
+      // Rough token estimate: ~3.5 chars/token for mixed content
+      const estTokens = Math.round(promptText.length / 3.5);
+      const estK = estTokens >= 1000 ? (estTokens / 1000).toFixed(1) + 'K' : String(estTokens);
+      showToast(`API ~${estK} tokens...`, 'info');
+
+      // 4. Call Claude API via main process IPC (avoids CORS)
+      const apiResult = await ipcRenderer.invoke('docs:api-request', { prompt: promptText });
+
+      if (apiCancelledRef.current) {
+        showToast('API запрос отменён', 'info');
+        return;
+      }
+
+      if (!apiResult.success) {
+        throw new Error(apiResult.error || 'API request failed');
+      }
+
+      // 5. Copy response to clipboard
+      const { clipboard } = window.require('electron');
+      clipboard.writeText(apiResult.text);
+      const { input_tokens, output_tokens } = apiResult.usage || {};
+      const inK = input_tokens ? (input_tokens / 1000).toFixed(1) + 'K' : '?';
+      const outK = output_tokens ? (output_tokens / 1000).toFixed(1) + 'K' : '?';
+      const cost = input_tokens && output_tokens
+        ? ((input_tokens / 1e6) * 15 + (output_tokens / 1e6) * 75).toFixed(2)
+        : null;
+      showToast(`Скопировано — in: ${inK}  out: ${outK}${cost ? '  ($' + cost + ')' : ''}`, 'success', 0, true);
+
+    } catch (error: any) {
+      if (apiCancelledRef.current) return;
+      console.error('[ApiDocs] Error:', error);
+      showToast(error.message || 'API request failed', 'error');
+    } finally {
+      setIsApiLoading(false);
     }
   };
 
@@ -631,6 +742,53 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
                       title="Копировать промпт + сессии в буфер"
                     >
                       📄
+                    </span>
+                  )}
+                  {/* API button — sends assembled prompt to Claude API, copies response */}
+                  {!isUpdatingDocs && (
+                    <span
+                      className="inline-flex items-center justify-center cursor-pointer select-none rounded font-mono"
+                      style={{
+                        height: '16px',
+                        marginLeft: '3px',
+                        padding: '0 5px',
+                        fontSize: '9px',
+                        fontWeight: 600,
+                        letterSpacing: '0.5px',
+                        backgroundColor: isApiLoading ? 'rgba(168, 85, 247, 0.3)' : 'rgba(168, 85, 247, 0.12)',
+                        color: isApiLoading ? '#d8b4fe' : '#a78bfa',
+                        verticalAlign: 'middle',
+                        transition: 'all 0.2s ease',
+                      }}
+                      onMouseEnter={(e) => { if (!isApiLoading) { e.currentTarget.style.backgroundColor = 'rgba(168, 85, 247, 0.25)'; e.currentTarget.style.color = '#d8b4fe'; }}}
+                      onMouseLeave={(e) => { if (!isApiLoading) { e.currentTarget.style.backgroundColor = 'rgba(168, 85, 247, 0.12)'; e.currentTarget.style.color = '#a78bfa'; }}}
+                      onMouseDown={(e) => e.stopPropagation()}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if (isApiLoading) {
+                          apiCancelledRef.current = true;
+                          setIsApiLoading(false);
+                          showToast('API запрос отменён', 'info');
+                        } else {
+                          handleApiDocsRequest();
+                        }
+                      }}
+                      title={isApiLoading ? 'Клик для отмены' : 'Claude API → ответ в буфер'}
+                    >
+                      {isApiLoading ? (
+                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: '3px' }}>
+                          <span style={{
+                            display: 'inline-block',
+                            width: '6px',
+                            height: '6px',
+                            border: '1.5px solid #d8b4fe',
+                            borderTopColor: 'transparent',
+                            borderRadius: '50%',
+                            animation: 'spin 0.8s linear infinite',
+                          }} />
+                          api
+                        </span>
+                      ) : 'api'}
                     </span>
                   )}
                   {showDocsInfo && renderInfoPanel(docsBlockRef, 'blue')}
