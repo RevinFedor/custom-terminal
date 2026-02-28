@@ -597,12 +597,45 @@ function App() {
       });
     };
 
+    // MCP sub-agent tab creation (main process → renderer)
+    const handleMcpCreateSubAgent = async (_: any, data: { taskId: string; geminiTabId: string; cwd?: string }) => {
+      const state = useWorkspaceStore.getState();
+      const { activeProjectId, openProjects } = state;
+      if (!activeProjectId) {
+        ipcRenderer.send('mcp:sub-agent-tab-created', { error: 'No active project' });
+        return;
+      }
+
+      // Use CWD from main process (reliable), fallback to Gemini tab or project path
+      const workspace = openProjects.get(activeProjectId);
+      const geminiTab = workspace?.tabs.get(data.geminiTabId);
+      const cwd = data.cwd || geminiTab?.cwd || workspace?.projectPath || '';
+
+      try {
+        const tabId = await state.createTab(activeProjectId, 'claude-sub', cwd, {
+          commandType: 'claude',
+          color: 'claude',
+          background: true,
+          parentTabId: data.geminiTabId,
+        } as any);
+
+        // Set parent relationship
+        state.setTabParent(tabId, data.geminiTabId);
+
+        ipcRenderer.send('mcp:sub-agent-tab-created', { tabId, taskId: data.taskId });
+      } catch (err: any) {
+        ipcRenderer.send('mcp:sub-agent-tab-created', { error: err.message });
+      }
+    };
+
     ipcRenderer.on('terminal:command-started', handleCommandStarted);
     ipcRenderer.on('terminal:command-finished', handleCommandFinished);
+    ipcRenderer.on('mcp:create-sub-agent-tab', handleMcpCreateSubAgent);
 
     return () => {
       ipcRenderer.removeListener('terminal:command-started', handleCommandStarted);
       ipcRenderer.removeListener('terminal:command-finished', handleCommandFinished);
+      ipcRenderer.removeListener('mcp:create-sub-agent-tab', handleMcpCreateSubAgent);
     };
   }, [openProjects.size]); // Re-init when projects change
 

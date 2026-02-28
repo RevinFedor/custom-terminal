@@ -15,6 +15,7 @@ import Resizer from './Resizer';
 import ResearchSheet from '../Research/ResearchSheet';
 import NotesEditorModal from './NotesEditorModal';
 import HistoryPanel from './HistoryPanel';
+import SubAgentBar from './SubAgentBar';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -65,6 +66,7 @@ export default function Workspace() {
   const [showSearch, setShowSearch] = useState(false);
   const [searchText, setSearchText] = useState('');
   const [searchResults, setSearchResults] = useState({ resultIndex: 0, resultCount: 0 });
+  const [viewingSubAgentTabId, setViewingSubAgentTabId] = useState<string | null>(null);
   const [isCommandRunning, setIsCommandRunning] = useState(false);
   const searchInputRef = useRef<HTMLInputElement>(null);
 
@@ -325,11 +327,20 @@ export default function Workspace() {
           <TabBar projectId={activeProjectId} />
         </div>
 
+        {/* Sub-agent bar (visible when Gemini tab has Claude sub-agents) */}
+        {activeProjectId && (
+          <SubAgentBar
+            projectId={activeProjectId}
+            viewingSubAgentTabId={viewingSubAgentTabId}
+            onViewSubAgent={setViewingSubAgentTabId}
+          />
+        )}
+
         {/* Terminal Area — Timeline + HistoryPanel are constrained to this height */}
         <div className="flex-1 flex min-w-0 relative">
           {/* Terminal content — overflow hidden clips HistoryPanel slide animation */}
           <div className="flex-1 relative min-w-0 overflow-hidden">
-            <TerminalArea projectId={activeProjectId} />
+            <TerminalArea projectId={activeProjectId} viewingSubAgentTabId={viewingSubAgentTabId} />
 
             {/* Search Bar (Cmd+F) - only in terminal view */}
             {currentView === 'terminal' && showSearch && (

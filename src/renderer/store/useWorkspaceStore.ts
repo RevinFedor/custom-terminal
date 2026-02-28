@@ -47,6 +47,7 @@ interface Tab {
   isCollapsed?: boolean; // Collapsed tab — icon-only, for archiving completed sessions
   claudeAgentSessionId?: string; // Claude Agent SDK session ID (for @claude:...@end orchestration)
   claudeAgentStatus?: 'idle' | 'running' | 'done' | 'error'; // Claude Agent current status
+  parentTabId?: string; // If this is a MCP sub-agent tab, points to parent (Gemini) tab
 }
 
 interface ProjectWorkspace {
@@ -136,6 +137,10 @@ interface WorkspaceStore {
   // Claude Agent orchestration
   setClaudeAgentStatus: (tabId: string, status: 'idle' | 'running' | 'done' | 'error', sessionId?: string) => void;
 
+  // MCP sub-agent tab management
+  setTabParent: (tabId: string, parentTabId: string) => void;
+  getSubAgentTabs: (parentTabId: string) => Tab[];
+
   // Tab notes
   setTabNotes: (tabId: string, notes: string) => void;
   getTabNotes: (tabId: string) => string;
@@ -222,7 +227,8 @@ const saveTabs = (projectId: string, tabs: Map<string, Tab>) => {
     activeView: tab.activeView,
     createdAt: tab.createdAt,
     isCollapsed: tab.isCollapsed,
-    nameSetManually: tab.nameSetManually
+    nameSetManually: tab.nameSetManually,
+    parentTabId: tab.parentTabId
   }));
   ipcRenderer.invoke('project:save-tabs', { projectId, tabs: tabsArray });
 };
@@ -607,7 +613,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       url: options?.url,
       createdAt: (options as any)?.createdAt || Math.floor(Date.now() / 1000),
       isCollapsed: (options as any)?.isCollapsed,
-      nameSetManually: (options as any)?.nameSetManually
+      nameSetManually: (options as any)?.nameSetManually,
+      parentTabId: (options as any)?.parentTabId
     };
 
     console.log('[Store] createTab: Creating PTY terminal for:', tabId, 'cwd:', newTab.cwd);
@@ -1256,6 +1263,33 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       }
     }
     return null;
+  },
+
+  // MCP sub-agent tab management
+  setTabParent: (tabId, parentTabId) => {
+    const { openProjects } = get();
+    for (const [, workspace] of openProjects) {
+      const tab = workspace.tabs.get(tabId);
+      if (tab) {
+        tab.parentTabId = parentTabId;
+        set({ openProjects: new Map(openProjects) });
+        saveTabs(workspace.projectId, workspace.tabs);
+        return;
+      }
+    }
+  },
+
+  getSubAgentTabs: (parentTabId) => {
+    const { openProjects } = get();
+    const result: Tab[] = [];
+    for (const [, workspace] of openProjects) {
+      for (const [, tab] of workspace.tabs) {
+        if (tab.parentTabId === parentTabId) {
+          result.push(tab);
+        }
+      }
+    }
+    return result;
   },
 
   // Claude Agent orchestration status
