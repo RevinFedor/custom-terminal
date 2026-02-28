@@ -88,6 +88,15 @@ export default function Workspace() {
     }
   }, [activeProject?.tabs.size, currentView, activeProjectId, setProjectView]);
 
+  // Reset viewingSubAgentTabId if the viewed tab was closed or detached
+  useEffect(() => {
+    if (!viewingSubAgentTabId || !activeProject) return;
+    const tab = activeProject.tabs.get(viewingSubAgentTabId);
+    if (!tab || !tab.parentTabId) {
+      setViewingSubAgentTabId(null);
+    }
+  }, [viewingSubAgentTabId, activeProject?.tabs.size]);
+
   // Restore file preview when switching projects
   useEffect(() => {
     if (!activeProjectId) return;

@@ -138,7 +138,7 @@ interface WorkspaceStore {
   setClaudeAgentStatus: (tabId: string, status: 'idle' | 'running' | 'done' | 'error', sessionId?: string) => void;
 
   // MCP sub-agent tab management
-  setTabParent: (tabId: string, parentTabId: string) => void;
+  setTabParent: (tabId: string, parentTabId: string | undefined) => void;
   getSubAgentTabs: (parentTabId: string) => Tab[];
 
   // Tab notes
@@ -1271,7 +1271,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     for (const [, workspace] of openProjects) {
       const tab = workspace.tabs.get(tabId);
       if (tab) {
-        tab.parentTabId = parentTabId;
+        // Detach: undefined or empty string both clear the parent
+        tab.parentTabId = parentTabId || undefined;
         set({ openProjects: new Map(openProjects) });
         saveTabs(workspace.projectId, workspace.tabs);
         return;
@@ -1280,13 +1281,14 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   },
 
   getSubAgentTabs: (parentTabId) => {
-    const { openProjects } = get();
+    const { openProjects, activeProjectId } = get();
+    // Scope to active project only — don't return sub-agents from other projects
+    const workspace = activeProjectId ? openProjects.get(activeProjectId) : null;
+    if (!workspace) return [];
     const result: Tab[] = [];
-    for (const [, workspace] of openProjects) {
-      for (const [, tab] of workspace.tabs) {
-        if (tab.parentTabId === parentTabId) {
-          result.push(tab);
-        }
+    for (const [, tab] of workspace.tabs) {
+      if (tab.parentTabId === parentTabId) {
+        result.push(tab);
       }
     }
     return result;

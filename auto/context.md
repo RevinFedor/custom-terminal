@@ -29,6 +29,7 @@ auto/
 │   ├── test-rewind-navigation.js     # [E2E+Claude] Rewind: TUI-навигация, RGB поиск
 │   ├── test-session-export.js        # [E2E+Claude] Export: backtrace, форматирование
 │   ├── test-plan-mode-detect.js      # [E2E+Claude] Plan Mode: Clear Context
+│   ├── test-gemini-orchestration.js  # [E2E+Gemini+Claude] Gemini → Claude delegation, spinners, MCP
 │   └── test-history-restore.js       # [E2E] History: восстановление из SQLite ⚠️ BROKEN
 ├── sandbox/                          # Одноразовые эксперименты. Готов → перенести в stable/
 └── screenshots/                      # Артефакты тестов
@@ -38,6 +39,50 @@ auto/
 - **[Headless]** — чистый Node.js, без Electron. < 1 сек, 100% детерминированный.
 - **[E2E+Fixture]** — Electron + golden session из `fixtures/`. Не требует реального AI.
 - **[E2E+Claude]** — Electron + живой Claude. Требует CLI `claude` и ~30-60 сек.
+- **[E2E+Gemini+Claude]** — Electron + живой Gemini CLI + Claude Code. ~120-300 сек. Используй hard kill 300с.
+
+---
+
+## Reliability & Troubleshooting (Критично)
+
+**ПРАВИЛО НУЛЕВОГО ДЕЙСТВИЯ:** Прежде чем писать тест или менять код, **перечитай эту секцию**. Каждый пункт — результат реального бага, который стоил 30+ минут отладки.
+
+Если тест падает с **Exit code 1** или "зависает" без вывода — проверь следующие пункты:
+
+### 1. Проблема "Пустого вывода" (Empty Output)
+Bash tool в Claude Code буферизирует stdout. Electron + Playwright через pipe теряют вывод при раннем crash'е.
+**ОБЯЗАТЕЛЬНО:** Всегда запускай тесты через `tee`:
+```bash
+node auto/stable/test-name.js 2>&1 | tee /tmp/test-name.log
+```
+Без `tee` ты получишь пустой вывод и exit code 1 без какой-либо диагностики. Потом читай лог: `cat /tmp/test-name.log`.
+
+### 2. State Isolation (Грязное состояние БД)
+При запуске `launch()` приложение восстанавливает последнее состояние рабочей среды (табы, сессии) из SQLite.
+**ЛОВУШКА:** Если активным табом при старте оказался остаток от прошлого теста (например, `claude-sub`), попытка запустить в нём другую команду (например, `gemini`) может не сработать.
+**ПРАВИЛО:** В начале E2E тестов, если тебе нужна чистая среда, **создавай новый таб** (`await page.keyboard.press('Meta+t')`), дождись его появления, и только потом начинай работу. Не полагайся на дефолтный `activeTabId`.
+
+### 3. Build Sync & Dev Server (Рассинхрон)
+E2E тесты запускают приложение, используя `dist/main/main.js` и запущенный Dev Server (порт 5182).
+**ПРАВИЛО (Build-Before-Test):**
+- При **ЛЮБОМ** изменении файлов в `src/main/` — **сначала** `npx electron-vite build`, **потом** запуск теста. Без этого тест запустит старый код и ты будешь отлаживать несуществующий баг.
+- При изменении `src/renderer/`, убедись, что запущен `npm run dev`.
+- **Проверка:** Сравни timestamp `dist/main/main.js` с `src/main/main.js`. Если dist старше — нужен build.
+
+### 4. Live Feedback & Logging
+Тесты НЕ должны молчать. Пользователь/AI должен видеть прогресс в реальном времени.
+- Используй `log.step()` **ДО** вызова `launch()` или `waitForTerminal()`.
+- Если операция может занять >5 сек, выводи "Heartbeat" (точки или сообщения) через `setInterval`.
+- Стриминг логов Main-процесса (`mainProcessLogs`) должен быть отфильтрованным, чтобы не забивать stdout.
+
+### 5. Global Timeouts & Safety
+Любой асинхронный вызов в тесте — потенциальная точка зависания.
+- **withTimeout:** Оборачивай каждый `page.waitFor...` или `httpRequest` в хелпер `withTimeout(promise, ms, label)`.
+- **Hard Kill:** Всегда ставь `const globalTimer = setTimeout(...)` в начале `main()`, который принудительно завершит процесс через 150-180 секунд.
+
+### 6. Conflict: Port & SQLite
+- **MCP Port:** Тестовый инстанс перезаписывает `~/.noted-terminal/mcp-port`.
+- **SQLite Lock:** Приложение использует `better-sqlite3` в WAL-режиме. При параллельном запуске возможны задержки.
 
 ---
 
@@ -250,6 +295,33 @@ State machine в main.js для Claude:
 - Timeline: entry N → marker N-1 (entry 0 не имеет маркера)
 - **Только Claude** — Gemini использует alternate buffer
 
+### AI Spinner Observability (Main Process Logs)
+Main-процесс логирует состояния AI-агентов для E2E тестов:
+
+| Лог-паттерн | Что значит | Используй в тесте |
+|---|---|---|
+| `[GeminiSpinner] Tab X: THINKING` | Gemini обрабатывает запрос (Braille spinner ⠋ обнаружен) | `waitForMainProcessLog(logs, /GeminiSpinner.*THINKING/, 15000)` |
+| `[GeminiSpinner] Tab X: IDLE` | Gemini закончил ответ (1.5с без спиннера) | `waitForMainProcessLog(logs, /GeminiSpinner.*IDLE/, 60000)` |
+| `[Spinner] Tab X: BUSY` | Claude Code обрабатывает запрос (оранжевый спиннер) | `waitForMainProcessLog(logs, /Spinner.*BUSY/, 60000)` |
+| `[Spinner] Tab X: IDLE` | Claude Code вернул промт | `waitForMainProcessLog(logs, /Spinner.*IDLE/, 120000)` |
+| `[MCP:Delegate] Claude sub-agent tab created` | Sub-agent таб создан | `waitForMainProcessLog(logs, /MCP:Delegate.*sub-agent tab created/, 120000)` |
+| `[MCP:HTTP] POST /delegate` | MCP delegation request принят | `findInLogs(logs, 'MCP:')` |
+
+**IPC события:** `gemini:busy-state` и `claude:busy-state` отправляются в renderer для UI-обновлений.
+
+### Gemini Alternate Buffer
+Gemini CLI работает в alternate screen buffer xterm.js. Это значит:
+- **Нельзя** читать историю Gemini через `buffer.getLine()` — видишь только текущий экран
+- **Нельзя** использовать OSC 7777 маркеры для Gemini
+- **Можно** читать видимые строки через `.xterm-rows > div` → `.textContent`, но содержимое перерисовывается при каждом re-render TUI
+- Для отправки команд в Gemini используй IPC `gemini:send-command` (через `safePasteAndSubmit` + `geminiCommandQueue`)
+
+### MCP Delegation (Gemini → Claude)
+Архитектура: Gemini вызывает MCP tool `delegate_to_claude` → HTTP POST `/delegate` → main.js создаёт sub-agent tab → Claude Code запускается → результат автоматически доставляется через `safePasteAndSubmit`.
+- Sub-agent tab имеет `parentTabId` → скрыт из TabBar, виден в SubAgentBar
+- **Fire-and-forget:** Gemini не должен поллить `get_task_status` — описание тулов в `mcp-server.mjs` явно это запрещает
+- Тест: `test-gemini-orchestration.js`
+
 ---
 
 ## Запуск
@@ -272,6 +344,9 @@ node auto/stable/test-gemini-timeline-nav.js
 node auto/stable/test-sniper-handshake.js
 node auto/stable/test-ctrlc-danger-zone.js
 node auto/stable/test-timeline.js
+
+# Gemini + Claude (нужны оба CLI, ~3-5 мин):
+node auto/stable/test-gemini-orchestration.js 2>&1 | tee /tmp/test-gemini-orch.log
 ```
 
 ### Параллельный запуск
@@ -283,10 +358,21 @@ node auto/stable/test-timeline.js
 - Не убивать основной экземпляр
 - Таймаут bash: **минимум 180 секунд**
 
-### Известные проблемы (2026-02-27)
+### Известные проблемы (2026-02-28)
 
 | Тест | Статус | Причина |
 |------|--------|---------|
 | `test-history-restore.js` | BROKEN | `setCurrentView` отсутствует в store API |
 | `test-gemini-rewind.js` | 11/12 | Golden fixture ожидает 13 entries, IPC возвращает 11 |
+| `test-gemini-orchestration.js` | 16/16 PASS, 1 WARN | Claude sub-agent IDLE может не прийти за 120с (Claude долго читает контекст). Не FAIL — soft timeout |
 | Все E2E | WARNING | `MaxListenersExceededWarning` при 8+ сохранённых табах |
+
+### Типичные ошибки при написании тестов (шрамы)
+
+| Ошибка | Последствие | Как избежать |
+|--------|-------------|--------------|
+| Не создать свежий таб в начале теста | `gemini:spawn-with-watcher` идёт в claude-таб, `commandType` остаётся `claude` | См. §2 State Isolation |
+| Не сделать `npx electron-vite build` после правки `src/main/` | Тест запускает старый код, баги "невоспроизводимы" | См. §3 Build Sync |
+| Запустить тест без `\| tee /tmp/file.log` | Пустой вывод, нет диагностики | См. §1 Empty Output |
+| `assert(condition \|\| true, ...)` | Assert всегда PASS, баг скрыт | Code review: никогда `\|\| true` в assert |
+| `logMainProcess: false` в `launch()` | Нет логов Main-процесса для отладки | Всегда `logMainProcess: true` для [E2E+Claude] и [E2E+Gemini+Claude] |

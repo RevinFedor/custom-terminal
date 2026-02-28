@@ -619,23 +619,37 @@ function App() {
           parentTabId: data.geminiTabId,
         } as any);
 
-        // Set parent relationship
-        state.setTabParent(tabId, data.geminiTabId);
-
         ipcRenderer.send('mcp:sub-agent-tab-created', { tabId, taskId: data.taskId });
       } catch (err: any) {
         ipcRenderer.send('mcp:sub-agent-tab-created', { error: err.message });
       }
     };
 
+    // MCP task status updates (main process → renderer): set claudeAgentStatus on sub-agent tabs
+    const handleMcpTaskStatus = (_: any, data: { taskId: string; claudeTabId: string; status: string }) => {
+      const state = useWorkspaceStore.getState();
+      const statusMap: Record<string, 'running' | 'done' | 'error' | 'idle'> = {
+        running: 'running',
+        completed: 'done',
+        error: 'error',
+        timeout: 'error',
+      };
+      const mapped = statusMap[data.status];
+      if (mapped && data.claudeTabId) {
+        state.setClaudeAgentStatus(data.claudeTabId, mapped);
+      }
+    };
+
     ipcRenderer.on('terminal:command-started', handleCommandStarted);
     ipcRenderer.on('terminal:command-finished', handleCommandFinished);
     ipcRenderer.on('mcp:create-sub-agent-tab', handleMcpCreateSubAgent);
+    ipcRenderer.on('mcp:task-status', handleMcpTaskStatus);
 
     return () => {
       ipcRenderer.removeListener('terminal:command-started', handleCommandStarted);
       ipcRenderer.removeListener('terminal:command-finished', handleCommandFinished);
       ipcRenderer.removeListener('mcp:create-sub-agent-tab', handleMcpCreateSubAgent);
+      ipcRenderer.removeListener('mcp:task-status', handleMcpTaskStatus);
     };
   }, [openProjects.size]); // Re-init when projects change
 

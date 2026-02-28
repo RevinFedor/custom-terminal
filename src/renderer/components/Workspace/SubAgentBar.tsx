@@ -8,17 +8,41 @@ interface SubAgentBarProps {
 }
 
 export default function SubAgentBar({ projectId, viewingSubAgentTabId, onViewSubAgent }: SubAgentBarProps) {
-  const getActiveProject = useWorkspaceStore((s) => s.getActiveProject);
-  const getSubAgentTabs = useWorkspaceStore((s) => s.getSubAgentTabs);
+  // Reactive primitives: re-renders when activeTabId or tabs.size changes
+  const activeTabId = useWorkspaceStore((s) => s.openProjects.get(projectId)?.activeTabId);
+  const tabsSize = useWorkspaceStore((s) => s.openProjects.get(projectId)?.tabs.size ?? 0);
 
-  const project = getActiveProject();
-  const activeTabId = project?.activeTabId;
-  const activeTab = activeTabId ? project?.tabs.get(activeTabId) : null;
+  const activeCommandType = useWorkspaceStore((s) => {
+    const workspace = s.openProjects.get(projectId);
+    const tab = workspace?.tabs.get(workspace?.activeTabId ?? '');
+    return tab?.commandType;
+  });
 
+  // Stable string key: re-derive sub-agents only when tab IDs or statuses change
+  const subAgentKey = useWorkspaceStore((s) => {
+    const workspace = s.openProjects.get(projectId);
+    if (!workspace || !activeTabId) return '';
+    const parts: string[] = [];
+    for (const [, tab] of workspace.tabs) {
+      if (tab.parentTabId === activeTabId) {
+        parts.push(tab.id + ':' + (tab.claudeAgentStatus || ''));
+      }
+    }
+    return parts.join(',');
+  });
+
+  // Derive full tab objects (recalculates only when key string changes)
   const subAgentTabs = useMemo(() => {
-    if (!activeTabId || activeTab?.commandType !== 'gemini') return [];
-    return getSubAgentTabs(activeTabId);
-  }, [activeTabId, activeTab?.commandType, getSubAgentTabs]);
+    if (!subAgentKey) return [];
+    const state = useWorkspaceStore.getState();
+    const workspace = state.openProjects.get(projectId);
+    if (!workspace) return [];
+    const result: any[] = [];
+    for (const [, tab] of workspace.tabs) {
+      if (tab.parentTabId === activeTabId) result.push(tab);
+    }
+    return result;
+  }, [subAgentKey, projectId, activeTabId]);
 
   const handleChipClick = useCallback((tabId: string) => {
     if (viewingSubAgentTabId === tabId) {
@@ -32,7 +56,7 @@ export default function SubAgentBar({ projectId, viewingSubAgentTabId, onViewSub
     e.preventDefault();
     e.stopPropagation();
     const state = useWorkspaceStore.getState();
-    state.setTabParent(tabId, '');
+    state.setTabParent(tabId, undefined as any);
     onViewSubAgent(null);
   }, [onViewSubAgent]);
 
@@ -41,8 +65,7 @@ export default function SubAgentBar({ projectId, viewingSubAgentTabId, onViewSub
   }, [viewingSubAgentTabId, onViewSubAgent]);
 
   // Early return AFTER all hooks
-  if (!project || !activeTabId || !activeTab) return null;
-  if (activeTab.commandType !== 'gemini') return null;
+  if (activeCommandType !== 'gemini') return null;
   if (subAgentTabs.length === 0) return null;
 
   return (
@@ -70,9 +93,9 @@ export default function SubAgentBar({ projectId, viewingSubAgentTabId, onViewSub
         {viewingSubAgentTabId ? '← Back' : 'Sub-agents:'}
       </button>
 
-      {subAgentTabs.map((tab, i) => {
+      {subAgentTabs.map((tab: any, i: number) => {
         const isViewing = viewingSubAgentTabId === tab.id;
-        const isRunning = tab.claudeAgentStatus === 'running' || (!tab.claudeAgentStatus && tab.claudeSessionId);
+        const isRunning = tab.claudeAgentStatus === 'running';
         const isDone = tab.claudeAgentStatus === 'done';
         const isError = tab.claudeAgentStatus === 'error';
 
@@ -94,7 +117,7 @@ export default function SubAgentBar({ projectId, viewingSubAgentTabId, onViewSub
             }}
             title="Click to view, right-click to detach"
           >
-            {/* Square indicator instead of robot emoji */}
+            {/* Square indicator */}
             <span
               style={{
                 display: 'inline-block',

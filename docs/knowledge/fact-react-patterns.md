@@ -81,6 +81,49 @@ if (selectionStartIdRef.current) { ... }
 
 ---
 
+## Zustand: Primitive Selectors vs Array Instances (Infinite Loop Trap)
+
+### Проблема
+Использование селекторов, которые конструируют и возвращают новые массивы или объекты на каждый вызов, приводит к ошибке `Maximum update depth exceeded`.
+
+**Пример ловушки:**
+```tsx
+const subAgentTabs = useWorkspaceStore((s) => {
+  // ❌ ПЛОХО: Каждый раз возвращается новый экземпляр []
+  return Array.from(s.tabs.values()).filter(t => t.parentId === id);
+});
+```
+Zustand использует `Object.is` для сравнения результата селектора. Поскольку `[] !== []`, компонент считает, что стейт изменился, и инициирует ре-рендер, что снова вызывает селектор и так до бесконечности.
+
+### Решение 1: Примитивные ключи (String Key Pattern)
+Вместо возврата массива объектов, селектор возвращает строку-ключ, которая меняется только при реальном изменении состава данных.
+
+```tsx
+// ✅ ХОРОШО: Возвращает строку (примитив)
+const subAgentKey = useWorkspaceStore((s) => {
+  const tabs = getTabs(s);
+  return tabs.map(t => `${t.id}:${t.status}`).join(',');
+});
+
+// Массив вычисляется через useMemo на основе ключа
+const subAgentTabs = useMemo(() => {
+  return deriveTabsFromKey(subAgentKey);
+}, [subAgentKey]);
+```
+
+### Решение 2: useShallow
+Использование хука `useShallow` для поверхностного сравнения массивов/объектов.
+```tsx
+import { useShallow } from 'zustand/react/shallow';
+
+const subAgentTabIds = useWorkspaceStore(useShallow((s) => {
+  // ✅ ХОРОШО: Массив пересоздается, но useShallow сравнивает элементы
+  return s.tabs.filter(t => t.parentId === id).map(t => t.id);
+}));
+```
+
+---
+
 ## Layering & Portals (stacking context, Layering Pattern, isCreatingRef lock)
 
 ## Проблема: "WebGL Canvas съедает мой интерфейс"
