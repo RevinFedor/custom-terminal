@@ -16,18 +16,20 @@ interface Project {
 interface NotesPanelProps {
   projectId: string;
   project: Project;
+  effectiveTabId?: string | null;
 }
 
 type TabType = 'info' | 'ai' | 'sessions';
 
-export default function NotesPanel({ projectId, project }: NotesPanelProps) {
+export default function NotesPanel({ projectId, project, effectiveTabId }: NotesPanelProps) {
   const { getActiveProject } = useWorkspaceStore();
   const { pendingResearch } = useResearchStore();
 
   const [activeTab, setActiveTab] = useState<TabType>('info');
 
   const activeProject = getActiveProject();
-  const activeTabId = activeProject?.activeTabId || null;
+  // Use effectiveTabId (sub-agent aware) if provided, otherwise fall back to store
+  const activeTabId = effectiveTabId ?? activeProject?.activeTabId ?? null;
 
   // Check if active tab has an active AI session
   const activeTabData = activeTabId && activeProject ? activeProject.tabs.get(activeTabId) : null;

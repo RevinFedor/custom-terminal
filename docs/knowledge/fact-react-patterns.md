@@ -81,6 +81,39 @@ if (selectionStartIdRef.current) { ... }
 
 ---
 
+## Loop Closure Trap (Link Providers)
+
+### Проблема
+При регистрации провайдеров ссылок в xterm.js (например, для UUID), использование переменной итератора (match) внутри колбэка `activate()` приводит к тому, что все ссылки ссылаются на последнее найденное значение (или `null`).
+
+**Ловушка:**
+```javascript
+let match;
+while ((match = regex.exec(text)) !== null) {
+  links.push({
+    activate() { 
+      // match здесь — это ссылка на переменную, которая 
+      // станет null в конце цикла
+      console.log(match[0]); 
+    }
+  });
+}
+```
+
+### Решение
+Захват значения во внутреннюю константу в теле цикла.
+```javascript
+let m;
+while ((m = re.exec(text)) !== null) {
+  const uuid = m[0]; // Создает новый скоуп для каждой итерации
+  links.push({
+    activate() { console.log(uuid); } // Замыкание на константу
+  });
+}
+```
+
+---
+
 ## Zustand: Primitive Selectors vs Array Instances (Infinite Loop Trap)
 
 ### Проблема

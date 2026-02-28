@@ -19,33 +19,33 @@
 ### Handshake: Slash-Command Splitting
 При делегации промпта вида `/model haiku\nTask` система использует `sendHandshakePrompt()` для разделения текста. Это решает проблему "неизвестной модели", когда Claude пытался интерпретировать весь многострочный блок как имя модели. Подробнее см. [`fix-gemini-delegation-handshake.md`](fix-gemini-delegation-handshake.md).
 
-## Механизм обнаружения (MCP Port)
+## Механизм обнаружения (PID-based Discovery)
 Main-процесс запускает HTTP-сервер на случайном свободном порту (`port 0`).
-- **Endpoint Discovery:** Актуальный порт записывается в `~/.noted-terminal/mcp-port`.
-- **MCP Server:** Автономный процесс `mcp-server.mjs` читает этот файл при старте, чтобы знать, куда пересылать команды.
-
-## PID Matching & Context
-Для правильной доставки результата приложению нужно знать, какой Gemini-таб инициировал вызов.
-- **PPID Chain:** MCP-сервер получает PID своего родителя (Gemini CLI).
-- **Matching:** Main-процесс разрешает цепочку `Gemini -> Shell -> PTY`, чтобы найти соответствующий `tabId`.
-- **Fallback:** Если точное совпадение не найдено (например, при вызове из внешнего терминала), система может использовать первый активный Gemini-таб в качестве цели.
+- **Endpoint Discovery:** Актуальный порт записывается в `~/.noted-terminal/mcp-port-<process.pid>`. Использование PID в имени файла обеспечивает изоляцию при параллельном запуске нескольких экземпляров приложения.
+- **MCP Server:** Процесс `mcp-server.mjs` при старте выполняет **Process Tree Walking** вверх от своего PPID (Gemini), чтобы найти файл порта, соответствующий "родному" инстансу Electron. См. [`fix-mcp-multi-instance.md`](fix-mcp-multi-instance.md).
 
 ## Viewport UX: Seamless Observation
 При делегации создается связь `parentTabId`. Это активирует специальное поведение интерфейса:
 - **SubAgentBar:** Над терминалом появляется панель с чипами активных sub-агентов.
+- **UUID Links in Terminal:** В выводе Gemini (терминал) UUID задач автоматически распознаются как ссылки. Клик по ID вызывает переход к соответствующей вкладке Claude-суб-агента через IPC `mcp:focus-task`. См. [`fix-tab-persistence.md`](fix-tab-persistence.md) (секция Closure Trap).
 - **Viewport Switching:** Клик по чипу переключает видимость (`zIndex`) между терминалом Gemini и Claude. 
 - **Active Context:** Фокус в `TabBar` остается на Gemini. Это позволяет пользователю "подглядывать" за работой Claude, не переключая основной контекст вкладки.
 
 ### Изоляция (Visibility)
 Вкладки суб-агентов **жестко фильтруются** в основном `TabBar`.
-- **Правило:** Таб с установленным `parentTabId` никогда не отображается в основном списке (ни в Main, ни в Utility зонах).
+- **Правило:** Таб с установленным `parentTabId` никогда не отображается в основном списке (ни в Main, ни в Utility зонах). См. [`fix-tab-persistence.md`](fix-tab-persistence.md) для деталей сохранения этой связи после рестарта.
 - **Motivation:** Это предотвращает захламление интерфейса и четко разделяет "оркестратор" (Gemini) и его "рабочих воркеров" (Claude sub-agents).
-- **Detach:** При отсоединении суб-агента (ПКМ → Detach), `parentTabId` сбрасывается в `undefined` (нормализация `'' → undefined`), после чего таб мгновенно появляется в общем списке `TabBar`.
+- **Detach:** При отсоединении суб-агента (через контекстное меню чипа), `parentTabId` сбрасывается в `undefined`, после чего таб мгновенно появляется в общем списке `TabBar`.
 
 ## Behavior Specs
-- **Status Sync:** Чипы sub-агентов в реальном времени отображают статус (`⟳` running, `✓` done, `✗` error).
+- **Status Sync:** Чипы sub-агентов в реальном времени отображают статус (`⟳` running, `✓` done, `✗` error). При перезапуске приложения статус восстанавливается как `done`.
 - **Cleanup:** При закрытии Gemini-таба все связанные с ним sub-агент процессы получают сигнал `Ctrl+C` и отключаются.
-- **Manual Control:** Правый клик по чипу позволяет "отцепить" (Detach) sub-агента, превратив его в самостоятельную вкладку.
+- **Sub-Agent Context Menu:** Правый клик по чипу в SubAgentBar открывает нативное меню:
+    - **Task ID:** Копирование ID задачи (нужно для диалога с Gemini).
+    - **Session ID:** Копирование ID сессии Claude (для Fork/Timeline).
+    - **Detach:** Отсоединение таба и превращение его в самостоятельную вкладку.
 
 ## См. также
+- **Multi-instance Isolation:** [`fix-mcp-multi-instance.md`](fix-mcp-multi-instance.md) — детали реализации PID-портов.
+- **Tab Persistence:** [`fix-tab-persistence.md`](fix-tab-persistence.md) — как сохраняются связи суб-агентов.
 - **Reliability Fixes:** [`fix-mcp-reliability.md`](fix-mcp-reliability.md) — детали реализации cooldown, CWD и retry логики.
