@@ -495,10 +495,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
           const key = getEntryKey(entry);
           if (key) {
                const isReachable = matchesAtUserPrompt(fullText, key, false);
-               // Safety fallback: if text not found but message has image and placeholder is visible
-               const imageFallback = !isReachable && entry.hasImage && fullText.includes('[Image #');
-               
-               if (!isReachable && !imageFallback) {
+               if (!isReachable) {
                    newUnreachable.add(index);
                }
           }
