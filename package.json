@@ -25,7 +25,13 @@
     "directories": {
       "buildResources": "build-resources",
       "output": "release"
-    }
+    },
+    "files": [
+      "dist/**/*",
+      "src/main/**/*",
+      "package.json",
+      "!logs/**"
+    ]
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.2.59",

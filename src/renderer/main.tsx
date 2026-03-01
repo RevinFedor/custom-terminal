@@ -32,9 +32,18 @@ function _shouldLog(args: any[]): boolean {
   return true;
 }
 
-console.log = (...args: any[]) => { if (_shouldLog(args)) _origLog(...args); };
-console.warn = (...args: any[]) => { if (_shouldLog(args)) _origWarn(...args); };
-// console.error is NEVER filtered
+// Forward tagged renderer logs to main process for file logging
+const _ipc = (window as any).require?.('electron')?.ipcRenderer;
+function _forwardToFile(args: any[]) {
+  if (!_ipc || !_extractTag(args)) return;
+  const msg = args.map((a: any) => typeof a === 'string' ? a : JSON.stringify(a)).join(' ');
+  _ipc.send('log:renderer', msg);
+}
+
+console.log = (...args: any[]) => { _forwardToFile(args); if (_shouldLog(args)) _origLog(...args); };
+console.warn = (...args: any[]) => { _forwardToFile(args); if (_shouldLog(args)) _origWarn(...args); };
+console.error = (...args: any[]) => { _origError(...args); _forwardToFile(args); };
+// All tagged logs go to file regardless of DevTools filter
 
 (window as any).logs = {
   on(tag: string) { LOG_DISABLED_TAGS.delete(tag); _origLog(`[logs] enabled: ${tag}`); },

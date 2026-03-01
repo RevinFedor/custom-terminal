@@ -9,6 +9,7 @@ release/
 *.pkg
 
 # Logs
+logs/
 *.log
 npm-debug.log*
 app.log

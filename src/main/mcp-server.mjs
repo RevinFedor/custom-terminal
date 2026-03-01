@@ -150,6 +150,55 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'continue_claude',
+      description: 'Send a follow-up message to an EXISTING Claude Code sub-agent. Use this instead of delegate_to_claude when you want to continue a conversation with the same agent (same session, same context). The agent must have been previously created via delegate_to_claude. If the agent\'s process died (e.g. after app restart), it will be automatically resumed. The result will be AUTOMATICALLY delivered back — no need to poll.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          taskId: {
+            type: 'string',
+            description: 'The task ID from the original delegate_to_claude call',
+          },
+          prompt: {
+            type: 'string',
+            description: 'The follow-up message to send to the existing Claude agent',
+          },
+        },
+        required: ['taskId', 'prompt'],
+      },
+    },
+    {
+      name: 'list_sub_agents',
+      description: 'List all Claude Code sub-agents linked to your current Gemini tab. Returns task IDs, session IDs, and status for each agent. Use this to discover existing agents before calling continue_claude, especially after app restart when you may not remember task IDs.',
+      inputSchema: {
+        type: 'object',
+        properties: {},
+      },
+    },
+    {
+      name: 'read_claude_history',
+      description: 'Read the conversation history of a Claude Code sub-agent. Returns ONLY NEW turns since your last read (or since auto-delivery). This is incremental — each call advances a watermark, so you never see the same turns twice.\n\nUse this when you need to understand WHAT Claude did and WHY — not just the final result. Returns Claude\'s thinking process, responses, and actions (file edits, commands, reads).\n\nDetail levels:\n- "summary": Only the last response with thinking (quick check)\n- "full" (default): New turns — user prompts, Claude thinking, responses, and action labels\n- "with_code": Same as full but includes edit diffs and command output\n\nSet from_beginning=true to get the entire conversation from the start (resets watermark).',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          taskId: {
+            type: 'string',
+            description: 'The task ID from delegate_to_claude or list_sub_agents',
+          },
+          detail: {
+            type: 'string',
+            enum: ['summary', 'full', 'with_code'],
+            description: 'Level of detail. "summary" = last response only, "full" = new turns with thinking and action labels, "with_code" = full + edit diffs and command output. Default: "full"',
+          },
+          from_beginning: {
+            type: 'boolean',
+            description: 'If true, return the entire conversation from the start (ignoring watermark). Default: false — only returns new turns since last read.',
+          },
+        },
+        required: ['taskId'],
+      },
+    },
+    {
       name: 'get_task_status',
       description: 'Check the status of a delegated task. Use this ONLY if you need a one-time diagnostic check. Do NOT poll this in a loop — results are automatically delivered to your terminal when the task completes.',
       inputSchema: {
@@ -190,6 +239,22 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
 
+      case 'continue_claude': {
+        const result = await httpPost('/continue', {
+          taskId: args.taskId,
+          prompt: args.prompt,
+          ppid,
+        });
+        return {
+          content: [
+            {
+              type: 'text',
+              text: 'Follow-up sent to agent ' + args.taskId + '. The result will be AUTOMATICALLY injected into your conversation when done — no need to poll or check status.',
+            },
+          ],
+        };
+      }
+
       case 'send_claude_command': {
         const result = await httpPost('/command', {
           command: args.command,
@@ -200,6 +265,51 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             {
               type: 'text',
               text: 'Command sent: ' + args.command,
+            },
+          ],
+        };
+      }
+
+      case 'list_sub_agents': {
+        const result = await httpGet('/sub-agents?ppid=' + ppid);
+        const agents = result.agents || [];
+        if (agents.length === 0) {
+          return {
+            content: [{ type: 'text', text: 'No sub-agents found for your current Gemini tab. Use delegate_to_claude to create one.' }],
+          };
+        }
+        let text = 'Sub-agents (' + agents.length + '):\n';
+        for (const a of agents) {
+          text += '\n- Task ID: ' + a.taskId;
+          if (a.claudeSessionId) text += '\n  Session: ' + a.claudeSessionId.substring(0, 8) + '...';
+          // Semantic state for Gemini (no implementation details like PTY)
+          if (a.claudeActive) {
+            text += '\n  State: ACTIVE — Claude is running and ready for follow-up';
+            text += '\n  Action: Use continue_claude to send a follow-up message';
+          } else {
+            text += '\n  State: IDLE — Claude finished previous task and is not running';
+            text += '\n  Tasks completed: ' + (a.taskCount || 0);
+            text += '\n  Action: Use continue_claude to give a new task (agent will auto-resume)';
+          }
+          text += '\n';
+        }
+        return {
+          content: [{ type: 'text', text }],
+        };
+      }
+
+      case 'read_claude_history': {
+        const detail = args.detail || 'full';
+        const fromBeginning = args.from_beginning ? 'true' : 'false';
+        let url = '/claude-history/' + args.taskId + '?detail=' + detail + '&from_beginning=' + fromBeginning + '&ppid=' + ppid;
+        const result = await httpGet(url);
+        let header = 'Total turns: ' + (result.totalTurns || 0);
+        if (result.newTurns !== undefined) header += ', new: ' + result.newTurns;
+        return {
+          content: [
+            {
+              type: 'text',
+              text: header + '\n\n' + (result.content || '(No history available)'),
             },
           ],
         };
