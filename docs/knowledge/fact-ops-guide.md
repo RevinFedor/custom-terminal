@@ -12,6 +12,8 @@
 ## 3. Пути данных
 - **DB:** `~/Library/Application Support/noted-terminal/noted-terminal.db`
 - **Config:** `~/Library/Application Support/noted-terminal/projects.json`
+- **Logs (Dev):** `<project_root>/logs/dev.log`
+- **Logs (Production):** `~/Library/Logs/noted-terminal/production.log` (через `app.getPath('logs')`). См. [`fix-packaged-app-logs.md`](fix-packaged-app-logs.md).
 - **AI History:** `~/.minayu/history/` — снепшоты Gemini Time Machine.
 - **Claude Bridge:** `~/.claude/bridge/` — временные JSON-файлы для идентификации активных сессий Клода.
 

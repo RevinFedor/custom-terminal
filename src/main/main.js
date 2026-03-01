@@ -1688,6 +1688,7 @@ function checkJsonlActivity(sessionId, cwd) {
     let lastType = '?';
     let lastAssistantIdx = -1;
     let lastUserIdx = -1;
+    let lastAssistantStopReason = null;
 
     for (let i = lines.length - tailSize; i < lines.length; i++) {
       try {
@@ -1700,6 +1701,7 @@ function checkJsonlActivity(sessionId, cwd) {
         }
         if (entry.type === 'assistant' && entry.message?.content) {
           lastAssistantIdx = i;
+          lastAssistantStopReason = entry.message.stop_reason || null;
           if (entry.message.content.some(b => b.type === 'tool_use')) {
             hasToolUse = true;
           } else {
@@ -1728,9 +1730,8 @@ function checkJsonlActivity(sessionId, cwd) {
       } catch {}
     }
 
-    // turn_duration is the ONLY reliable completion signal from Claude CLI.
-    // Without it, JSONL may be lagging behind TUI rendering (race condition:
-    // spinner IDLE for 500ms between tool calls, but JSONL not yet updated).
+    // turn_duration is the primary completion signal from Claude CLI.
+    // Fallback: stop_reason=end_turn on last assistant (sub-agents may not write turn_duration).
     if (hasTurnDuration) {
       return { stillWorking: false, reason: 'turn_duration found' };
     }
@@ -1747,7 +1748,12 @@ function checkJsonlActivity(sessionId, cwd) {
     if (hasQueueOp) {
       return { stillWorking: true, reason: 'queue-operation entries present, last=' + lastType };
     }
-    // No turn_duration found — JSONL may be lagging behind TUI. Always defer.
+    // Fallback: sub-agent sessions may not write turn_duration at all.
+    // If last assistant has stop_reason=end_turn and no pending tools — Claude is done.
+    if (lastAssistantStopReason === 'end_turn' && !hasToolUse && !hasProgress) {
+      return { stillWorking: false, reason: 'stop_reason=end_turn (no turn_duration in session)' };
+    }
+    // No turn_duration and no stop_reason=end_turn — JSONL may be lagging behind TUI.
     return { stillWorking: true, reason: 'no turn_duration yet (JSONL may lag behind TUI), last=' + lastType };
   } catch (e) {
     return { stillWorking: false, reason: 'error: ' + e.message };
