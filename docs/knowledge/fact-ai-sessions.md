@@ -9,7 +9,7 @@ Noted Terminal обеспечивает глубокую интеграцию с
 | :--- | :--- | :--- |
 | **Механизм Fork** | Resume UUID (через `PendingAction`) | **True Fork** (Клонирование JSON) |
 | **Time Machine** | Нет (в планах) | **Есть** (Snapshots turns) |
-| **Захват ID** | Мгновенно (при старте) | После 1-го сообщения (Sniper) |
+| **Захват ID** | Мгновенно (через `mcp:claude-cli-active` для субагентов или Sniper для обычных) | После 1-го сообщения (Sniper) |
 | **Хранение** | `~/.claude/projects/` | `~/.gemini/tmp/<hash>/` |
 | **История Minayu** | Нет | `~/.minayu/history/<id>/` |
 

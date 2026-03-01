@@ -169,7 +169,7 @@ const RestartZone = memo(({ hasProcess, hasColor, commandType, hasSession, isBus
               boxShadow: (commandType === 'claude' && !hasSession)
                 ? '0 0 4px rgba(248, 113, 113, 0.5)'
                 : '0 0 4px rgba(74, 222, 128, 0.5)',
-              animation: (commandType === 'claude' && isBusy)
+              animation: ((commandType === 'claude' || commandType === 'gemini') && isBusy)
                 ? 'tab-dot-pulse 1.5s ease-in-out infinite' : 'none',
             }}
           />
@@ -209,7 +209,7 @@ interface TabItemProps {
   showNotesIndicator?: boolean; // CMD held + cursor in TabBar = highlight tabs with notes
   isCollapsed?: boolean; // Collapsed tab — icon-only
   hasSession?: boolean; // Whether tab has an active AI session
-  isBusy?: boolean; // Claude is actively thinking/streaming (promptBoundaryState === 'busy')
+  isBusy?: boolean; // AI agent is actively thinking/streaming
 }
 
 const TabItem = memo(({
@@ -743,6 +743,7 @@ function TabBar({ projectId }: TabBarProps) {
   const [processStatus, setProcessStatus] = useState<Map<string, boolean>>(new Map());
   const [sessionStatus, setSessionStatus] = useState<Map<string, boolean>>(new Map());
   const [claudeBusyMap, setClaudeBusyMap] = useState<Map<string, boolean>>(new Map());
+  const [geminiBusyMap, setGeminiBusyMap] = useState<Map<string, boolean>>(new Map());
   const inputRef = useRef<HTMLInputElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const contextMenuRef = useRef<HTMLDivElement>(null);
@@ -821,16 +822,27 @@ function TabBar({ projectId }: TabBarProps) {
       });
     };
 
+    const handleGeminiBusy = (_: any, { tabId, busy }: { tabId: string; busy: boolean }) => {
+      setGeminiBusyMap(prev => {
+        if (prev.get(tabId) === busy) return prev;
+        const next = new Map(prev);
+        next.set(tabId, busy);
+        return next;
+      });
+    };
+
     ipcRenderer.on('terminal:command-started', handleCommandStarted);
     ipcRenderer.on('terminal:command-finished', handleCommandFinished);
     ipcRenderer.on('claude:session-detected', handleSessionDetected);
     ipcRenderer.on('claude:busy-state', handleClaudeBusy);
+    ipcRenderer.on('gemini:busy-state', handleGeminiBusy);
 
     return () => {
       ipcRenderer.removeListener('terminal:command-started', handleCommandStarted);
       ipcRenderer.removeListener('terminal:command-finished', handleCommandFinished);
       ipcRenderer.removeListener('claude:session-detected', handleSessionDetected);
       ipcRenderer.removeListener('claude:busy-state', handleClaudeBusy);
+      ipcRenderer.removeListener('gemini:busy-state', handleGeminiBusy);
     };
   }, []); // Stable — no re-subscriptions
 
@@ -1452,7 +1464,7 @@ function TabBar({ projectId }: TabBarProps) {
                         hasProcess={processStatus.get(tab.id) || false}
                         commandType={tab.commandType}
                         hasSession={sessionStatus.get(tab.id) || !!tab.claudeSessionId}
-                        isBusy={claudeBusyMap.get(tab.id) || false}
+                        isBusy={(tab.commandType === 'gemini' ? geminiBusyMap.get(tab.id) : claudeBusyMap.get(tab.id)) || false}
                         onRestart={handleRestart}
                         onStop={handleStop}
                         isInterrupted={isTabInterrupted(tab)}
@@ -1521,7 +1533,7 @@ function TabBar({ projectId }: TabBarProps) {
                     hasProcess={processStatus.get(tab.id) || false}
                     commandType={tab.commandType}
                     hasSession={sessionStatus.get(tab.id) || !!tab.claudeSessionId}
-                    isBusy={claudeBusyMap.get(tab.id) || false}
+                    isBusy={(tab.commandType === 'gemini' ? geminiBusyMap.get(tab.id) : claudeBusyMap.get(tab.id)) || false}
                     onRestart={handleRestart}
                     onStop={handleStop}
                     isInterrupted={isTabInterrupted(tab)}

@@ -91,10 +91,22 @@ Gemini CLI doesn't have an internal registry; it just scans `~/.gemini/tmp/<SHA2
 ---
 
 ## 8. Spinner Detection (Thinking Signal)
-Для обеспечения стабильности E2E тестов и будущей UI-индикации в Main-процесс добавлена детекция «размышлений» Gemini.
+Для обеспечения стабильности E2E тестов и визуальной индикации в Main-процесс добавлена детекция «размышлений» Gemini.
 
 ### Механика
 Система сканирует поток данных PTY на наличие Unicode Braille-символов (`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`), которые Gemini CLI использует для анимации спиннера.
+
+### Guard: geminiActiveTabs
+Детектор работает только для вкладок, включенных в `geminiActiveTabs` Set.
+- **Почему не geminiWatchers:** Ранее использовался `geminiWatchers.has(tabId)`, но вочеры файловой системы удаляются сразу после захвата сессии при старте. Это приводило к тому, что спиннер детектировался только при первом запуске Gemini и игнорировался во всех последующих промптах.
+- **Lifecycle:** Вкладка добавляется в `geminiActiveTabs` при спавне и удаляется только при завершении PTY-процесса.
+
+### Регистрация
+Вкладка добавляется в `geminiActiveTabs` в **двух** местах:
+- **`gemini:spawn-with-watcher`** — при первом запуске Gemini (new session).
+- **`gemini:run-command`** — при continue/fork/resume (команды `gemini-c`, `gemini-f`).
+
+**Ловушка (fix 2026-03):** Ранее `gemini:run-command` не добавлял в `geminiActiveTabs`. Восстановленные Gemini-сессии (continue после рестарта) не детектировали спиннер — индикатор не мигал, хотя Gemini работал. Логи `[GeminiSpinner]` полностью отсутствовали.
 
 ### Состояния
 - **THINKING:** Активируется мгновенно при появлении любого Braille-символа в активном Gemini-табе.

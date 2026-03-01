@@ -63,10 +63,11 @@ export default function Workspace() {
   const historyPanelWidth = useUIStore((s) => s.historyPanelWidth);
   const setHistoryPanelOpen = useUIStore((s) => s.setHistoryPanelOpen);
   const setProjectView = useWorkspaceStore((s) => s.setProjectView);
+  const viewingSubAgentTabId = useWorkspaceStore((s) => s.getActiveProject()?.viewingSubAgentTabId ?? null);
+  const setViewingSubAgentTabId = useWorkspaceStore((s) => s.setViewingSubAgent);
   const [showSearch, setShowSearch] = useState(false);
   const [searchText, setSearchText] = useState('');
   const [searchResults, setSearchResults] = useState({ resultIndex: 0, resultCount: 0 });
-  const [viewingSubAgentTabId, setViewingSubAgentTabId] = useState<string | null>(null);
   const [isCommandRunning, setIsCommandRunning] = useState(false);
   const searchInputRef = useRef<HTMLInputElement>(null);
 
@@ -89,13 +90,16 @@ export default function Workspace() {
   }, [activeProject?.tabs.size, currentView, activeProjectId, setProjectView]);
 
   // Reset viewingSubAgentTabId if the viewed tab was closed or detached
+  const viewedTabParentId = viewingSubAgentTabId && activeProject
+    ? activeProject.tabs.get(viewingSubAgentTabId)?.parentTabId
+    : undefined;
   useEffect(() => {
     if (!viewingSubAgentTabId || !activeProject) return;
     const tab = activeProject.tabs.get(viewingSubAgentTabId);
     if (!tab || !tab.parentTabId) {
       setViewingSubAgentTabId(null);
     }
-  }, [viewingSubAgentTabId, activeProject?.tabs.size]);
+  }, [viewingSubAgentTabId, viewedTabParentId, activeProject?.tabs.size]);
 
   // effectiveTab: when viewing a sub-agent, resolve to that tab; otherwise fallback to activeTab
   const effectiveTab = useMemo(() => {
@@ -364,18 +368,14 @@ export default function Workspace() {
 
         {/* Sub-agent bar (visible when Gemini tab has Claude sub-agents) */}
         {activeProjectId && (
-          <SubAgentBar
-            projectId={activeProjectId}
-            viewingSubAgentTabId={viewingSubAgentTabId}
-            onViewSubAgent={setViewingSubAgentTabId}
-          />
+          <SubAgentBar projectId={activeProjectId} />
         )}
 
         {/* Terminal Area — Timeline + HistoryPanel are constrained to this height */}
         <div className="flex-1 flex min-w-0 relative">
           {/* Terminal content — overflow hidden clips HistoryPanel slide animation */}
           <div className="flex-1 relative min-w-0 overflow-hidden">
-            <TerminalArea projectId={activeProjectId} viewingSubAgentTabId={viewingSubAgentTabId} />
+            <TerminalArea projectId={activeProjectId} />
 
             {/* Search Bar (Cmd+F) - only in terminal view */}
             {currentView === 'terminal' && showSearch && (
@@ -503,7 +503,7 @@ export default function Workspace() {
           <Resizer onResize={handleResize} />
           <div className="flex-1 overflow-hidden relative">
             {!filePreview && (
-              <NotesPanel projectId={activeProjectId} project={currentProject} effectiveTabId={effectiveTab?.id} />
+              <NotesPanel projectId={activeProjectId} project={currentProject} />
             )}
           </div>
         </div>

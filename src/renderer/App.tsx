@@ -316,7 +316,7 @@ const RestoreLoader = memo(() => (
 ));
 
 function App() {
-  const { view, showDashboard, openProject, openProjects, activeProjectId, closeProject, createTab, createTabAfterCurrent, closeTab, getActiveProject, restoreSession, reorderProjects, moveTabToProject, moveTabsToProject, isRestoring, getSidebarState, setSidebarOpen, setOpenFilePath } = useWorkspaceStore();
+  const { view, showDashboard, openProject, openProjects, activeProjectId, closeProject, createTab, createTabAfterCurrent, closeTab, getActiveProject, getEffectiveTabId, restoreSession, reorderProjects, moveTabToProject, moveTabsToProject, isRestoring, getSidebarState, setSidebarOpen, setOpenFilePath } = useWorkspaceStore();
   const { projects, loadProjects, updateProject } = useProjectsStore();
   const { closeFilePreview, filePreview, showToast, incrementAllFontSizes, decrementAllFontSizes, activeArea, setActiveArea, dragAreaWidth, setDragAreaWidth } = useUIStore();
   const { toggleResearch } = useResearchStore();
@@ -619,6 +619,7 @@ function App() {
           parentTabId: data.geminiTabId,
         } as any);
 
+        // Note: claudeActive will be set by mcp:claude-cli-active when Claude CLI actually launches
         ipcRenderer.send('mcp:sub-agent-tab-created', { tabId, taskId: data.taskId });
       } catch (err: any) {
         ipcRenderer.send('mcp:sub-agent-tab-created', { error: err.message });
@@ -640,16 +641,40 @@ function App() {
       }
     };
 
+    // PTY exit → Claude CLI is dead
+    const handleTerminalExit = (_: any, tabId: string) => {
+      const state = useWorkspaceStore.getState();
+      state.setClaudeActive(tabId, false);
+    };
+
+    // Claude CLI launched/resumed in PTY (from main.js delegate/continue)
+    const handleClaudeCliActive = (_: any, data: { tabId: string; active: boolean }) => {
+      const state = useWorkspaceStore.getState();
+      state.setClaudeActive(data.tabId, data.active);
+    };
+
+    // Claude CLI spinner busy/idle → track on sub-agent tab
+    const handleClaudeBusyState = (_: any, data: { tabId: string; busy: boolean }) => {
+      const state = useWorkspaceStore.getState();
+      state.setClaudeBusy(data.tabId, data.busy);
+    };
+
     ipcRenderer.on('terminal:command-started', handleCommandStarted);
     ipcRenderer.on('terminal:command-finished', handleCommandFinished);
     ipcRenderer.on('mcp:create-sub-agent-tab', handleMcpCreateSubAgent);
     ipcRenderer.on('mcp:task-status', handleMcpTaskStatus);
+    ipcRenderer.on('terminal:exit', handleTerminalExit);
+    ipcRenderer.on('mcp:claude-cli-active', handleClaudeCliActive);
+    ipcRenderer.on('claude:busy-state', handleClaudeBusyState);
 
     return () => {
       ipcRenderer.removeListener('terminal:command-started', handleCommandStarted);
       ipcRenderer.removeListener('terminal:command-finished', handleCommandFinished);
       ipcRenderer.removeListener('mcp:create-sub-agent-tab', handleMcpCreateSubAgent);
       ipcRenderer.removeListener('mcp:task-status', handleMcpTaskStatus);
+      ipcRenderer.removeListener('terminal:exit', handleTerminalExit);
+      ipcRenderer.removeListener('mcp:claude-cli-active', handleClaudeCliActive);
+      ipcRenderer.removeListener('claude:busy-state', handleClaudeBusyState);
     };
   }, [openProjects.size]); // Re-init when projects change
 
@@ -732,7 +757,8 @@ function App() {
         e.preventDefault();
         const activeProject = getActiveProject();
         const currentProject = projects[activeProjectId!];
-        const currentTab = activeProject?.activeTabId ? activeProject.tabs.get(activeProject.activeTabId) : null;
+        const effectiveId = getEffectiveTabId();
+        const currentTab = effectiveId && activeProject ? activeProject.tabs.get(effectiveId) : null;
         const cwd = currentTab?.cwd || currentProject?.path || process.env.HOME;
         console.log('[Hotkey] Opening VS Code in:', cwd);
         const { exec } = window.require('child_process');
@@ -786,9 +812,10 @@ function App() {
           useWorkspaceStore.getState().clearSelection(activeProjectId);
           const activeProject = getActiveProject();
           const currentProject = projects[activeProjectId];
-          if (currentProject && activeProject?.activeTabId) {
-            // Get current tab's cwd
-            const currentTab = activeProject.tabs.get(activeProject.activeTabId);
+          const effectiveId = getEffectiveTabId();
+          if (currentProject && effectiveId) {
+            // Get current tab's cwd (sub-agent aware)
+            const currentTab = activeProject?.tabs.get(effectiveId);
             const cwd = currentTab?.cwd || currentProject.path;
             createTabAfterCurrent(activeProjectId, undefined, cwd);
           } else if (currentProject) {
@@ -835,7 +862,12 @@ function App() {
         e.preventDefault();
         if (view === 'workspace') {
           const activeProject = getActiveProject();
-          if (activeProject && activeProject.activeTabId) {
+          // If viewing a sub-agent, close that sub-agent tab (same as regular tab)
+          if (activeProject?.viewingSubAgentTabId) {
+            const subTabId = activeProject.viewingSubAgentTabId;
+            useWorkspaceStore.getState().setViewingSubAgent(null);
+            closeTab(activeProjectId!, subTabId);
+          } else if (activeProject && activeProject.activeTabId) {
             const selected = activeProject.selectedTabIds;
             if (selected.length > 1) {
               // Multi-select: close all selected tabs with batch confirmation
@@ -941,11 +973,11 @@ function App() {
           showToast('Select text in terminal first', 'error');
         }
       } else if (cmd === 'insert-prompt') {
-        // Insert prompt text into active terminal
-        const activeProject = getActiveProject();
-        console.warn('[ContextMenu] insert-prompt: tabId=' + activeProject?.activeTabId + ' len=' + (data?.length || 0) + ' endsR=' + data?.endsWith('\r') + ' first30=' + JSON.stringify(data?.slice(0, 30)));
-        if (activeProject?.activeTabId) {
-          ipcRenderer.send('terminal:input', activeProject.activeTabId, data);
+        // Insert prompt text into effective terminal (sub-agent aware)
+        const effectiveId = getEffectiveTabId();
+        console.warn('[ContextMenu] insert-prompt: tabId=' + effectiveId + ' len=' + (data?.length || 0) + ' endsR=' + data?.endsWith('\r') + ' first30=' + JSON.stringify(data?.slice(0, 30)));
+        if (effectiveId) {
+          ipcRenderer.send('terminal:input', effectiveId, data);
         }
       } else if (cmd === 'add-to-favorites-from-terminal') {
         const { tabId: favTabId, projectId: favProjectId } = data || {};

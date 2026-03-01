@@ -47,6 +47,9 @@ interface Tab {
   isCollapsed?: boolean; // Collapsed tab — icon-only, for archiving completed sessions
   claudeAgentSessionId?: string; // Claude Agent SDK session ID (for @claude:...@end orchestration)
   claudeAgentStatus?: 'idle' | 'running' | 'done' | 'error'; // Claude Agent current status
+  claudeActive?: boolean; // True if Claude CLI is running inside PTY (not just shell alive)
+  claudeBusy?: boolean; // True if Claude CLI spinner is active (from claude:busy-state)
+  claudeTaskCount?: number; // Number of completed MCP tasks (delegate/continue)
   parentTabId?: string; // If this is a MCP sub-agent tab, points to parent (Gemini) tab
 }
 
@@ -61,6 +64,7 @@ interface ProjectWorkspace {
   sidebarOpen: boolean;
   openFilePath: string | null;
   currentView: 'terminal' | 'home'; // Per-project view state (Home vs Terminal)
+  viewingSubAgentTabId: string | null; // When viewing a sub-agent, points to the Claude sub-agent tab
 }
 
 interface SessionState {
@@ -136,10 +140,14 @@ interface WorkspaceStore {
 
   // Claude Agent orchestration
   setClaudeAgentStatus: (tabId: string, status: 'idle' | 'running' | 'done' | 'error', sessionId?: string) => void;
+  setClaudeActive: (tabId: string, alive: boolean) => void;
+  setClaudeBusy: (tabId: string, busy: boolean) => void;
 
   // MCP sub-agent tab management
   setTabParent: (tabId: string, parentTabId: string | undefined) => void;
   getSubAgentTabs: (parentTabId: string) => Tab[];
+  setViewingSubAgent: (tabId: string | null) => void;
+  getEffectiveTabId: () => string | null;
 
   // Tab notes
   setTabNotes: (tabId: string, notes: string) => void;
@@ -466,7 +474,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         tabCounter: 0, // Start from 0 for new projects
         sidebarOpen: projectData?.sidebarOpen || false,
         openFilePath: projectData?.openFilePath || null,
-        currentView: draft ? 'home' : 'terminal'
+        currentView: draft ? 'home' : 'terminal',
+        viewingSubAgentTabId: null
       };
       openProjects.set(projectId, newWorkspace);
 
@@ -511,6 +520,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           for (const [, tab] of newWorkspace.tabs) {
             if (tab.parentTabId) {
               tab.claudeAgentStatus = 'done';
+              tab.claudeActive = false; // Claude CLI not running after restore
             }
           }
         } else {
@@ -865,6 +875,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
 
     if (workspace && workspace.tabs.has(tabId)) {
       workspace.activeTabId = tabId;
+      workspace.viewingSubAgentTabId = null; // Reset sub-agent view on tab switch
       workspace.selectedTabIds = [tabId]; // Update selection on direct switch
       // Push to tab history (LRU, max 20)
       workspace.tabHistory = [...workspace.tabHistory.filter(id => id !== tabId), tabId].slice(-20);
@@ -1311,6 +1322,26 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     return result;
   },
 
+  setViewingSubAgent: (tabId) => {
+    const { openProjects, activeProjectId } = get();
+    const workspace = activeProjectId ? openProjects.get(activeProjectId) : null;
+    if (!workspace) return;
+    if (workspace.viewingSubAgentTabId === tabId) return;
+    workspace.viewingSubAgentTabId = tabId;
+    set({ openProjects: new Map(openProjects) });
+  },
+
+  getEffectiveTabId: () => {
+    const { openProjects, activeProjectId } = get();
+    const workspace = activeProjectId ? openProjects.get(activeProjectId) : null;
+    if (!workspace) return null;
+    if (workspace.viewingSubAgentTabId) {
+      const subTab = workspace.tabs.get(workspace.viewingSubAgentTabId);
+      if (subTab) return workspace.viewingSubAgentTabId;
+    }
+    return workspace.activeTabId;
+  },
+
   // Claude Agent orchestration status
   setClaudeAgentStatus: (tabId, status, sessionId) => {
     const { openProjects } = get();
@@ -1319,6 +1350,34 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       if (tab) {
         tab.claudeAgentStatus = status;
         if (sessionId) tab.claudeAgentSessionId = sessionId;
+        // Increment task counter on terminal states
+        if (status === 'done' || status === 'error') {
+          tab.claudeTaskCount = (tab.claudeTaskCount || 0) + 1;
+        }
+        set({ openProjects: new Map(openProjects) });
+        return;
+      }
+    }
+  },
+
+  setClaudeActive: (tabId, alive) => {
+    const { openProjects } = get();
+    for (const [, workspace] of openProjects) {
+      const tab = workspace.tabs.get(tabId);
+      if (tab) {
+        tab.claudeActive = alive;
+        set({ openProjects: new Map(openProjects) });
+        return;
+      }
+    }
+  },
+
+  setClaudeBusy: (tabId, busy) => {
+    const { openProjects } = get();
+    for (const [, workspace] of openProjects) {
+      const tab = workspace.tabs.get(tabId);
+      if (tab) {
+        tab.claudeBusy = busy;
         set({ openProjects: new Map(openProjects) });
         return;
       }

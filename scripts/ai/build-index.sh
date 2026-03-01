@@ -33,6 +33,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --with-src) WITH_SRC=true; shift ;;
     --parallel) MAX_PARALLEL="$2"; shift 2 ;;
+    [0-9]*) MAX_PARALLEL="$1"; shift ;;
     *) shift ;;
   esac
 done

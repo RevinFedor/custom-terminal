@@ -34,8 +34,9 @@
     - `⌘+Enter` в поле ввода запускает процесс обновления.
     - Состояние выделения вкладок (Multi-select) сохраняется при кликах внутрь панели и вводе текста (см. `knowledge/fact-ux-patterns.md`).
 - **Анализ (Gemini):**
-    - Система создает специальный Gemini-таб через `gemini:spawn-with-watcher`. Это гарантирует, что сессия обновления будет захвачена "Снайпером" и доступна для последующего Fork/Resume. См. [`knowledge/fix-gemini-capture.md`](fix-gemini-capture.md).
-    - Система дожидается готовности Gemini и вставляет промпт через Bracketed Paste + 500ms delay + Enter.
+    - Система создает prefilled-сессию через `gemini:create-prefilled-session`, затем запускает Gemini-таб через `gemini:spawn-with-watcher` с флагами `resumeSessionId` и `yesMode: true`.
+    - Итоговая команда в PTY: `gemini -y -r <sessionId>` — `-y` (auto-approve) + `-r` (resume prefilled session). Это гарантирует, что Gemini начнет обработку без ручного подтверждения.
+    - Сессия обновления захватывается "Снайпером" и доступна для последующего Fork/Resume. См. [`knowledge/fix-gemini-capture.md`](fix-gemini-capture.md).
 
 ### Claude API Integration (Direct Update)
 - **Интеграция:** Кнопка `[api]` inline справа от иконки копирования, фиолетовый badge.

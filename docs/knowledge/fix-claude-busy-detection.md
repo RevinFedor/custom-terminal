@@ -34,7 +34,21 @@ Claude Code устанавливает заголовок терминала (ч
 ### Неочевидная связь: OSC vs CSI
 Критически важно помнить: библиотека `strip-ansi` (или аналоги) часто игнорирует OSC-коды (Operating System Commands). Если ваш детектор ищет спецсимволы, вы **обязаны** сначала применить регулярное выражение для удаления OSC, иначе вы получите ложные срабатывания от window title или OSC 7 (CWD).
 
-## 3. Верификация
+## 3. Cleanup при выходе PTY (fix 2026-03)
+
+### Проблема
+`claudeSpinnerBusy` и `claudeSpinnerIdleTimer` не очищались при выходе PTY-процесса или `terminal:kill`. Если Claude-таб закрывался пока busy=true — renderer никогда не получал `busy: false`, индикатор залипал.
+
+### Решение
+В обоих местах (PTY `onExit` + `terminal:kill`) добавлен cleanup:
+1. `clearTimeout` для pending debounce timer.
+2. Отправка `claude:busy-state { busy: false }` если был busy.
+3. `.delete()` из обеих Map.
+4. Лог `[Spinner] Tab X: IDLE (PTY exit cleanup)` / `(terminal kill cleanup)` для диагностики.
+
+Аналогичный cleanup для Gemini (`geminiSpinnerBusy.delete`) уже существовал — Claude был пропущен.
+
+## 4. Верификация
 Логика проверена на разных версиях Claude Code (v2.0 - v2.1.32+). Статус `busy` теперь корректно синхронизируется с реальным состоянием "размышления" агента.
 
 **Связанные факты:**

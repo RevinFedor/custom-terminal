@@ -118,10 +118,10 @@ const InterruptedSessionOverlay = memo(({ tabId, sessionId, onContinue, onDismis
 
 interface TerminalAreaProps {
   projectId: string;
-  viewingSubAgentTabId?: string | null;
 }
 
-function TerminalArea({ projectId, viewingSubAgentTabId }: TerminalAreaProps) {
+function TerminalArea({ projectId }: TerminalAreaProps) {
+  const viewingSubAgentTabId = useWorkspaceStore((s) => s.openProjects.get(projectId)?.viewingSubAgentTabId ?? null);
   // DEBUG: Track TerminalArea mount/unmount lifecycle
   useEffect(() => {
     console.warn('[TerminalArea:MOUNT] projectId=', projectId);
@@ -151,7 +151,8 @@ function TerminalArea({ projectId, viewingSubAgentTabId }: TerminalAreaProps) {
   const activeTab = currentWorkspace?.activeTabId
     ? currentWorkspace.tabs.get(currentWorkspace.activeTabId)
     : null;
-  const showInterruptedOverlay = activeTab?.wasInterrupted && activeTab?.claudeSessionId && currentView === 'terminal';
+  // Bug 2 fix: hide overlay if Claude was auto-resumed by MCP (claudeActive = true)
+  const showInterruptedOverlay = activeTab?.wasInterrupted && activeTab?.claudeSessionId && !activeTab?.claudeActive && currentView === 'terminal';
 
   
   // Handle continuing interrupted Claude session

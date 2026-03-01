@@ -34,6 +34,82 @@ const { findSessionFile, loadJsonlRecords, resolveSessionChain, resolveLatestSes
 
 const isDev = !app.isPackaged;
 
+// ========== PRODUCTION FILE LOGGER ==========
+// Intercepts console.log/error/warn → writes tagged messages to file
+// Deduplicates consecutive identical messages (counter instead of spam)
+{
+  const LOG_DIR = isDev
+    ? path.join(__dirname, '..', '..', 'logs')
+    : path.join(app.getPath('logs'));
+  try { fs.mkdirSync(LOG_DIR, { recursive: true }); } catch {}
+  const LOG_PATH = path.join(LOG_DIR, isDev ? 'dev.log' : 'production.log');
+  const MAX_SIZE = 5 * 1024 * 1024; // 5MB — rotate
+  const TAG_RE = /^\[/; // Only log messages starting with [Tag]
+
+  let _lastLine = '';
+  let _lastCount = 0;
+  let _logStream = null;
+
+  function initLogStream() {
+    try {
+      // Rotate if too large
+      if (fs.existsSync(LOG_PATH) && fs.statSync(LOG_PATH).size > MAX_SIZE) {
+        const bak = LOG_PATH + '.old';
+        try { fs.unlinkSync(bak); } catch {}
+        fs.renameSync(LOG_PATH, bak);
+      }
+      _logStream = fs.createWriteStream(LOG_PATH, { flags: 'a' });
+      _logStream.on('error', () => { _logStream = null; });
+      _logStream.write('\n--- Session ' + new Date().toISOString() + ' (PID ' + process.pid + ') ---\n');
+    } catch {}
+  }
+  if (process.env.NOTED_E2E_TEST !== 'true') initLogStream();
+
+  function writeToLog(line) {
+    if (!_logStream) return;
+    // Dedup: if same as previous line, increment counter
+    if (line === _lastLine) {
+      _lastCount++;
+      return;
+    }
+    // Flush dedup counter for previous line
+    if (_lastCount > 0) {
+      _logStream.write('  ×' + (_lastCount + 1) + '\n');
+      _lastCount = 0;
+    }
+    _lastLine = line;
+    const ts = new Date().toISOString().slice(11, 23); // HH:MM:SS.mmm
+    _logStream.write(ts + ' ' + line + '\n');
+  }
+
+  const _origLog = console.log;
+  const _origError = console.error;
+  const _origWarn = console.warn;
+
+  console.log = function(...args) {
+    _origLog.apply(console, args);
+    const msg = args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' ');
+    if (TAG_RE.test(msg)) writeToLog(msg);
+  };
+  console.error = function(...args) {
+    _origError.apply(console, args);
+    const msg = args.map(a => typeof a === 'string' ? a : (a instanceof Error ? a.message : JSON.stringify(a))).join(' ');
+    writeToLog('[ERROR] ' + msg);
+  };
+  console.warn = function(...args) {
+    _origWarn.apply(console, args);
+    const msg = args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' ');
+    if (TAG_RE.test(msg)) writeToLog(msg);
+  };
+
+  // Flush dedup on exit
+  process.on('exit', () => {
+    if (_lastCount > 0 && _logStream) _logStream.write('  ×' + (_lastCount + 1) + '\n');
+    if (_logStream) _logStream.end();
+  });
+}
+// ========== END PRODUCTION FILE LOGGER ==========
+
 // ⚡ КРИТИЧЕСКИ ВАЖНО: Устанавливаем activation policy ДО app.whenReady()
 // Это обходит защиту macOS Sequoia/Tahoe от "focus stealing" для дочерних процессов
 if (process.platform === 'darwin') {
@@ -63,6 +139,8 @@ const mcpTasks = new Map();             // taskId -> { status, prompt, geminiTab
 const subAgentParentTab = new Map();    // claudeTabId -> geminiTabId
 const subAgentCompletionTimers = new Map(); // claudeTabId -> debounce timer
 const subAgentPromptSentAt = new Map();     // claudeTabId -> timestamp when prompt was sent
+const claudeCliActive = new Map();          // claudeTabId -> true (Claude CLI is running inside PTY, not just shell)
+const ppidToGeminiTab = new Map();          // Bug 3 fix: cache ppid -> geminiTabId (stable within MCP server lifetime)
 let mcpHttpServer = null;               // http.Server instance
 let mcpHttpPort = null;                 // assigned port number
 const geminiCommandQueue = new Map();   // tabId -> Promise (serialized Gemini commands)
@@ -85,6 +163,7 @@ const CONTENT_SPINNER_RE = /[\u2722\u2733\u2736\u273B\u273D]/; // ✢✳✶✻�
 const geminiSpinnerBusy = new Map();       // tabId → boolean
 const geminiSpinnerIdleTimers = new Map(); // tabId → timeout ID (debounce idle transition)
 const GEMINI_SPINNER_RE = /[\u280B\u2819\u2839\u2838\u283C\u2834\u2826\u2827\u2807\u280F]/;
+const geminiActiveTabs = new Set();        // tabs with active Gemini process (for spinner detection)
 
 // ========== UUID COLORIZATION (purple highlight for MCP Task IDs in terminal) ==========
 // Wraps UUID patterns in ANSI purple (RGB 180,130,255) before sending to renderer.
@@ -148,6 +227,7 @@ function detectIncompleteEscapeTail(data) {
 // bridge.ppid (Claude PID) → parent PID (shell) → ptyProcess.pid (our tab)
 const bridgeDir = path.join(os.homedir(), '.claude', 'bridge');
 const bridgeKnownSessions = new Map(); // tabId → sessionId
+const bridgeMetadata = new Map(); // tabId → { model, contextPct }
 const bridgePidCache = new Map(); // claudePid → tabId
 const bridgeFileMtimes = new Map(); // filename → mtimeMs
 let bridgeWatcher = null;
@@ -189,6 +269,9 @@ function startSessionBridge() {
       if (knownForTab !== data.session_id) {
         console.log('[Bridge:PID] session=' + data.session_id.substring(0, 8) + '... claudePid=' + data.ppid + ' → tab=' + tabId + ' (via ' + pidSource + ') | was=' + (knownForTab ? knownForTab.substring(0, 8) + '...' : 'none'));
       }
+
+      // Cache bridge metadata for use in sub-agent responses
+      bridgeMetadata.set(tabId, { model: data.model || 'unknown', contextPct: data.context_pct || 0 });
 
       // Always send bridge metadata (model, context) on every update
       if (mainWindow && !mainWindow.isDestroyed()) {
@@ -417,6 +500,16 @@ function parseOSC133AndEmit(tabId, data) {
             tabId,
             exitCode: state.lastExitCode
           });
+        }
+        // Bug 1 fix: if Claude CLI was running in this PTY, it just exited back to shell
+        // Guard: don't clear during handshake — shell fires D during init BEFORE Claude starts
+        // Same guard pattern as sub-agent completion check (line ~2273)
+        if (claudeCliActive.has(tabId) && !claudeState.has(tabId) && !claudePendingPrompt.has(tabId)) {
+          console.log('[MCP:ClaudeExit] Tab ' + tabId + ': Claude CLI exited (OSC 133 D), clearing claudeCliActive');
+          claudeCliActive.delete(tabId);
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send('mcp:claude-cli-active', { tabId, active: false });
+          }
         }
         break;
     }
@@ -749,7 +842,7 @@ function startMcpHttpServer() {
           console.log('[MCP:HTTP] POST /command ppid=' + ppid + ' command="' + command + '"');
 
           // Find Claude sub-agent tab for this Gemini
-          let geminiTabId = ppid ? await findTabByChildPid(ppid) : null;
+          let geminiTabId = ppid ? await findTabByChildPidCached(ppid) : null;
           let claudeTabId = null;
           if (geminiTabId) {
             for (const [cId, gId] of subAgentParentTab) {
@@ -779,6 +872,193 @@ function startMcpHttpServer() {
           res.end(JSON.stringify({ error: e.message }));
         }
       });
+    } else if (req.method === 'POST' && req.url === '/continue') {
+      // Continue conversation with existing Claude sub-agent
+      let body = '';
+      req.on('data', chunk => { body += chunk; });
+      req.on('end', async () => {
+        try {
+          const { taskId, prompt, ppid } = JSON.parse(body);
+          if (!taskId || !prompt) {
+            res.writeHead(400);
+            res.end(JSON.stringify({ error: 'taskId and prompt are required' }));
+            return;
+          }
+
+          console.log('[MCP:HTTP] POST /continue taskId=' + taskId + ' prompt="' + prompt.substring(0, 60) + '..."');
+
+          // Fire-and-forget: continue delegation async, return immediately
+          continueClaudeSubAgent(taskId, prompt, ppid).catch(err => {
+            console.error('[MCP:Continue] Error:', err.message);
+            const task = mcpTasks.get(taskId);
+            if (task && task.claudeTabId && mainWindow && !mainWindow.isDestroyed()) {
+              task.status = 'error'; task.error = err.message;
+              mainWindow.webContents.send('mcp:task-status', { taskId, claudeTabId: task.claudeTabId, status: 'error' });
+            }
+          });
+
+          res.writeHead(200);
+          res.end(JSON.stringify({ taskId, status: 'continued' }));
+        } catch (e) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: 'Invalid JSON: ' + e.message }));
+        }
+      });
+    } else if (req.method === 'GET' && req.url?.startsWith('/sub-agents')) {
+      // List sub-agents for a given Gemini tab (by PPID)
+      (async () => {
+        try {
+          const urlObj = new URL(req.url, 'http://localhost');
+          const ppid = parseInt(urlObj.searchParams.get('ppid') || '0');
+          const geminiTabId = ppid ? await findTabByChildPidCached(ppid) : null;
+
+          if (!geminiTabId) {
+            res.writeHead(200);
+            res.end(JSON.stringify({ agents: [] }));
+            return;
+          }
+
+          const agents = [];
+
+          // 1. Count completed tasks per claudeTabId (for taskCount in response)
+          const taskCountByClaudeTab = new Map();
+          for (const [, task] of mcpTasks) {
+            if (task.claudeTabId) {
+              taskCountByClaudeTab.set(task.claudeTabId, (taskCountByClaudeTab.get(task.claudeTabId) || 0) + 1);
+            }
+          }
+
+          // 2. Collect from in-memory mcpTasks (live tasks)
+          const seenClaudeTabIds = new Set();
+          for (const [tid, task] of mcpTasks) {
+            if (task.geminiTabId === geminiTabId && task.claudeTabId) {
+              seenClaudeTabIds.add(task.claudeTabId);
+              const sessionId = bridgeKnownSessions.get(task.claudeTabId) || null;
+              agents.push({
+                taskId: tid,
+                claudeTabId: task.claudeTabId,
+                status: task.status,
+                claudeSessionId: sessionId,
+                claudeActive: !!claudeCliActive.get(task.claudeTabId),
+                taskCount: taskCountByClaudeTab.get(task.claudeTabId) || 0,
+              });
+            }
+          }
+
+          // 3. Also check SQLite for persisted sub-agents not in mcpTasks (after restart)
+          try {
+            const rows = projectManager.db.db.prepare(
+              'SELECT tab_id, claude_session_id FROM tabs WHERE parent_tab_id = ?'
+            ).all(geminiTabId);
+            for (const row of rows) {
+              if (row.tab_id && !seenClaudeTabIds.has(row.tab_id)) {
+                // Generate a synthetic taskId for agents restored from DB
+                const syntheticTaskId = 'restored-' + row.tab_id.substring(0, 8);
+                agents.push({
+                  taskId: syntheticTaskId,
+                  claudeTabId: row.tab_id,
+                  status: 'done',
+                  claudeSessionId: row.claude_session_id || null,
+                  claudeActive: !!claudeCliActive.get(row.tab_id),
+                  taskCount: taskCountByClaudeTab.get(row.tab_id) || 0,
+                });
+              }
+            }
+          } catch (e) {
+            console.error('[MCP:ListAgents] DB error:', e.message);
+          }
+
+          res.writeHead(200);
+          res.end(JSON.stringify({ agents }));
+        } catch (e) {
+          res.writeHead(500);
+          res.end(JSON.stringify({ error: e.message }));
+        }
+      })();
+    } else if (req.method === 'GET' && req.url?.startsWith('/claude-history/')) {
+      // Read Claude sub-agent session history (incremental — only new turns since last read)
+      const urlParts = req.url.slice('/claude-history/'.length).split('?');
+      const reqTaskId = urlParts[0];
+      const params = new URLSearchParams(urlParts[1] || '');
+      const detail = params.get('detail') || 'full';
+      const fromBeginning = params.get('from_beginning') === 'true';
+
+      void (async () => {
+        try {
+          // Resolve taskId → claudeTabId (same 3-level lookup as continue_claude)
+          const originalTask = mcpTasks.get(reqTaskId);
+          let claudeTabId = null;
+
+          if (originalTask && originalTask.claudeTabId) {
+            claudeTabId = originalTask.claudeTabId;
+          } else {
+            // Synthetic/restored taskId — extract tab from DB via Gemini parent
+            const ppid = parseInt(params.get('ppid') || '0');
+            const geminiTabId = ppid ? await findTabByChildPidCached(ppid) : null;
+            if (geminiTabId) {
+              for (const [cId, gId] of subAgentParentTab) {
+                if (gId === geminiTabId) { claudeTabId = cId; break; }
+              }
+              if (!claudeTabId) {
+                try {
+                  const rows = projectManager.db.db.prepare(
+                    'SELECT tab_id FROM tabs WHERE parent_tab_id = ? ORDER BY created_at DESC LIMIT 1'
+                  ).all(geminiTabId);
+                  if (rows.length > 0) claudeTabId = rows[0].tab_id;
+                } catch {}
+              }
+            }
+          }
+
+          if (!claudeTabId) {
+            res.writeHead(404);
+            res.end(JSON.stringify({ error: 'No sub-agent found for task ' + reqTaskId }));
+            return;
+          }
+
+          // Resolve sessionId: bridgeKnownSessions → SQLite
+          let sessionId = bridgeKnownSessions.get(claudeTabId) || null;
+          if (!sessionId) {
+            try {
+              const row = projectManager.db.db.prepare(
+                'SELECT claude_session_id FROM tabs WHERE tab_id = ? AND claude_session_id IS NOT NULL LIMIT 1'
+              ).get(claudeTabId);
+              if (row) sessionId = row.claude_session_id;
+            } catch {}
+          }
+
+          if (!sessionId) {
+            res.writeHead(404);
+            res.end(JSON.stringify({ error: 'No Claude session ID found for tab ' + claudeTabId }));
+            return;
+          }
+
+          // Incremental delivery: skip already-seen turns unless from_beginning
+          const sinceTurn = fromBeginning ? 0 : (originalTask?.deliveredTurns || 0);
+
+          const cwd = terminalProjects.get(claudeTabId) || process.cwd();
+          const { text, totalTurns } = getClaudeHistory(sessionId, cwd, { detail, sinceTurn });
+
+          // Update deliveredTurns watermark
+          if (originalTask) {
+            originalTask.deliveredTurns = totalTurns;
+          } else {
+            // Create task entry for restored agents so subsequent reads are incremental
+            mcpTasks.set(reqTaskId, {
+              status: 'done',
+              claudeTabId,
+              deliveredTurns: totalTurns,
+              createdAt: Date.now(),
+            });
+          }
+
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ taskId: reqTaskId, totalTurns, newTurns: totalTurns - sinceTurn, content: text }));
+        } catch (e) {
+          res.writeHead(500);
+          res.end(JSON.stringify({ error: e.message }));
+        }
+      })();
     } else if (req.method === 'GET' && req.url?.startsWith('/status/')) {
       const taskId = req.url.slice('/status/'.length);
       const task = mcpTasks.get(taskId);
@@ -841,6 +1121,7 @@ async function delegateToClaudeSubAgent(taskId, prompt, ppid) {
     geminiTabId: null,
     claudeTabId: null,
     createdAt: Date.now(),
+    deliveredTurns: 0,
   });
 
   // Safety timeout
@@ -861,7 +1142,7 @@ async function delegateToClaudeSubAgent(taskId, prompt, ppid) {
   }, MCP_TASK_TIMEOUT_MS);
 
   // 1. Find Gemini tab by PID
-  let geminiTabId = ppid ? await findTabByChildPid(ppid) : null;
+  let geminiTabId = ppid ? await findTabByChildPidCached(ppid) : null;
   if (!geminiTabId) {
     // Fallback: find first gemini tab (for testing / single-tab scenarios)
     for (const [tid, pty] of terminals) {
@@ -925,20 +1206,162 @@ async function delegateToClaudeSubAgent(taskId, prompt, ppid) {
 
   // Start Claude with --dangerously-skip-permissions
   claudeTerm.write('claude --dangerously-skip-permissions\r');
+  claudeCliActive.set(claudeTabId, true);
   task.status = 'handshake';
 
   // 4. Set up handshake: wait for prompt, then paste the user prompt
   claudeState.set(claudeTabId, 'WAITING_PROMPT');
   claudePendingPrompt.set(claudeTabId, prompt);
 
-  // Notify renderer about task status
+  // Notify renderer about task status + Claude CLI active
   if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('mcp:claude-cli-active', { tabId: claudeTabId, active: true });
     mainWindow.webContents.send('mcp:task-status', { taskId, claudeTabId, status: 'running' });
   }
 
   task.status = 'running';
   console.log('[MCP:Delegate] Claude launched, handshake set up. Waiting for completion...');
   // Completion will be detected by PTY onData handler (Step 3)
+}
+
+// Continue conversation with an existing Claude sub-agent
+async function continueClaudeSubAgent(taskId, prompt, ppid) {
+  // 1. Find the original task
+  const originalTask = mcpTasks.get(taskId);
+
+  let claudeTabId = null;
+  let geminiTabId = null;
+
+  if (originalTask && originalTask.claudeTabId) {
+    // Task found in memory — use its claudeTabId
+    claudeTabId = originalTask.claudeTabId;
+    geminiTabId = originalTask.geminiTabId;
+    console.log('[MCP:Continue] Found task in memory: claudeTabId=' + claudeTabId);
+  } else {
+    // Task not in memory (app restarted) — find sub-agent by parent tab relationship
+    console.log('[MCP:Continue] Task not in memory, searching by parent tab...');
+    geminiTabId = ppid ? await findTabByChildPidCached(ppid) : null;
+    if (geminiTabId) {
+      // Look in subAgentParentTab map first (live sub-agents)
+      for (const [cId, gId] of subAgentParentTab) {
+        if (gId === geminiTabId) { claudeTabId = cId; break; }
+      }
+      // If not found in live map, search SQLite for persisted sub-agent tabs
+      if (!claudeTabId) {
+        try {
+          const rows = projectManager.db.db.prepare(
+            'SELECT tab_id FROM tabs WHERE parent_tab_id = ? ORDER BY created_at DESC LIMIT 1'
+          ).all(geminiTabId);
+          if (rows.length > 0 && rows[0].tab_id) {
+            claudeTabId = rows[0].tab_id;
+            console.log('[MCP:Continue] Found persisted sub-agent tab from DB: ' + claudeTabId);
+          }
+        } catch (e) {
+          console.error('[MCP:Continue] DB query error:', e.message);
+        }
+      }
+    }
+  }
+
+  if (!claudeTabId) {
+    throw new Error('No Claude sub-agent found for task ' + taskId + '. Use delegate_to_claude to create a new one.');
+  }
+
+  // 2. Update/create task entry for completion tracking
+  if (originalTask) {
+    originalTask.status = 'running';
+    originalTask.result = undefined;
+    originalTask.error = undefined;
+  } else {
+    // Re-create task entry for tracking
+    mcpTasks.set(taskId, {
+      status: 'running',
+      prompt,
+      geminiTabId,
+      claudeTabId,
+      createdAt: Date.now(),
+      deliveredTurns: 0,
+    });
+  }
+
+  // 3. Check if PTY is alive AND Claude CLI is running inside it
+  const claudeTerm = terminals.get(claudeTabId);
+
+  if (claudeTerm && claudeCliActive.get(claudeTabId)) {
+    // PTY alive AND Claude CLI running — direct paste
+    console.log('[MCP:Continue] PTY alive + Claude CLI active. Sending prompt via safePasteAndSubmit...');
+
+    // Ensure subAgentParentTab mapping exists (may have been lost)
+    if (geminiTabId && !subAgentParentTab.has(claudeTabId)) {
+      subAgentParentTab.set(claudeTabId, geminiTabId);
+    }
+
+    // Send the prompt
+    await safePasteAndSubmit(claudeTerm, prompt, { submit: true, logPrefix: '[MCP:Continue]' });
+    subAgentPromptSentAt.set(claudeTabId, Date.now());
+
+    // Notify renderer
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('mcp:task-status', { taskId, claudeTabId, status: 'running' });
+    }
+
+    console.log('[MCP:Continue] Prompt sent. Waiting for completion...');
+  } else {
+    // PTY dead OR Claude CLI not running (e.g. after restart, PTY has bare shell)
+    console.log('[MCP:Continue] Claude CLI not active (ptyExists=' + !!claudeTerm + '). Attempting auto-resume...');
+
+    // Get claudeSessionId from bridgeKnownSessions or SQLite
+    let claudeSessionId = bridgeKnownSessions.get(claudeTabId) || null;
+    if (!claudeSessionId) {
+      try {
+        const row = projectManager.db.db.prepare(
+          'SELECT claude_session_id FROM tabs WHERE tab_id = ? AND claude_session_id IS NOT NULL LIMIT 1'
+        ).get(claudeTabId);
+        if (row) claudeSessionId = row.claude_session_id;
+      } catch (e) {
+        console.error('[MCP:Continue] DB query for sessionId error:', e.message);
+      }
+    }
+
+    if (!claudeSessionId) {
+      throw new Error('Cannot resume: no Claude session ID found for tab ' + claudeTabId);
+    }
+
+    // Wait for PTY to appear (terminal may need to boot shell)
+    let term = null;
+    for (let retry = 0; retry < 10; retry++) {
+      term = terminals.get(claudeTabId);
+      if (term) break;
+      console.log('[MCP:Continue] Waiting for PTY... retry ' + (retry + 1) + '/10');
+      await new Promise(r => setTimeout(r, 500));
+    }
+
+    if (!term) {
+      throw new Error('Terminal PTY not available for tab ' + claudeTabId + '. Tab may need to be reopened.');
+    }
+
+    // Restore subAgentParentTab mapping
+    if (geminiTabId) {
+      subAgentParentTab.set(claudeTabId, geminiTabId);
+    }
+
+    // Launch claude --resume and use handshake to send prompt
+    console.log('[MCP:Continue] Resuming Claude session ' + claudeSessionId.substring(0, 8) + '...');
+    term.write('claude --resume ' + claudeSessionId + ' --dangerously-skip-permissions\r');
+    claudeCliActive.set(claudeTabId, true);
+
+    // Set up handshake: wait for prompt ready, then send the follow-up prompt
+    claudeState.set(claudeTabId, 'WAITING_PROMPT');
+    claudePendingPrompt.set(claudeTabId, prompt);
+
+    // Notify renderer: Claude CLI now active + task running
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('mcp:claude-cli-active', { tabId: claudeTabId, active: true });
+      mainWindow.webContents.send('mcp:task-status', { taskId, claudeTabId, status: 'running' });
+    }
+
+    console.log('[MCP:Continue] Handshake set up. Waiting for Claude prompt + completion...');
+  }
 }
 
 // Read the latest assistant message from Claude JSONL session
@@ -980,9 +1403,218 @@ function readLatestAssistantMessage(sessionId, cwd) {
   return null;
 }
 
+// Get formatted Claude session history for MCP read_claude_history tool
+// Returns { text, totalTurns } — text is formatted conversation, totalTurns for tracking
+// detail: 'summary' (last response), 'full' (all turns + actions), 'with_code' (+ diffs)
+// sinceTurn: skip first N turns (0 = all), used with deliveredTurns tracking
+function getClaudeHistory(sessionId, cwd, options = {}) {
+  const { detail = 'full', sinceTurn = 0 } = options;
+  const includeEditing = detail === 'with_code';
+  const includeReading = false; // Gemini can read files itself
+
+  // Resolve session chain (handles Clear Context / Plan Mode bridges)
+  const latestSessionId = resolveLatestSessionInChain(sessionId, cwd);
+  const { mergedMap: recordMap, lastRecord, sessionBoundaries, progressEntries } = resolveSessionChain(latestSessionId, cwd);
+
+  if (!lastRecord) return { text: '(Empty session — no records found)', totalTurns: 0 };
+
+  // BACKTRACE: walk backwards from lastRecord via parentUuid
+  const activeBranch = [];
+  let currentUuid = lastRecord.uuid;
+  const seen = new Set();
+
+  while (currentUuid && !seen.has(currentUuid)) {
+    seen.add(currentUuid);
+    const record = recordMap.get(currentUuid);
+    if (!record) {
+      // Compact gap recovery
+      let recovered = false;
+      if (activeBranch.length > 0) {
+        const lastAdded = activeBranch[0];
+        if (lastAdded.type === 'system' && lastAdded.subtype === 'compact_boundary' &&
+            lastAdded.logicalParentUuid === currentUuid) {
+          if (lastAdded.parentUuid && recordMap.has(lastAdded.parentUuid) && !seen.has(lastAdded.parentUuid)) {
+            currentUuid = lastAdded.parentUuid;
+            recovered = true;
+          } else {
+            let bestPred = null;
+            for (const [uuid, entry] of recordMap) {
+              if (seen.has(uuid)) continue;
+              if (entry._fromFile === lastAdded._fromFile && entry._fileIndex < lastAdded._fileIndex) {
+                if (!bestPred || entry._fileIndex > bestPred._fileIndex) bestPred = entry;
+              }
+            }
+            if (bestPred) { currentUuid = bestPred.uuid; recovered = true; }
+          }
+        }
+      }
+      if (recovered) continue;
+      break;
+    }
+
+    activeBranch.unshift(record);
+
+    let nextUuid = record.logicalParentUuid || record.parentUuid;
+    if (!nextUuid && sessionBoundaries.length > 0) {
+      // Bridge following
+      for (const [uuid, entry] of recordMap) {
+        if (seen.has(uuid)) continue;
+        if (entry._isBridge && entry.parentUuid && entry.sessionId !== record.sessionId && !seen.has(entry.parentUuid)) {
+          nextUuid = entry.parentUuid;
+          break;
+        }
+      }
+      if (!nextUuid && record.sessionId) {
+        const boundary = sessionBoundaries.find(b => b.childSessionId === record.sessionId);
+        if (boundary) {
+          let parentLastRecord = null;
+          for (const [uuid, entry] of recordMap) {
+            if (seen.has(uuid)) continue;
+            if (entry._fromFile === boundary.parentSessionId) {
+              if (!parentLastRecord || entry._fileIndex > parentLastRecord._fileIndex) parentLastRecord = entry;
+            }
+          }
+          if (parentLastRecord) nextUuid = parentLastRecord.uuid;
+        }
+      }
+    }
+    currentUuid = nextUuid;
+  }
+
+  if (activeBranch.length === 0) return { text: '(No conversation found in session)', totalTurns: 0 };
+
+  // For 'summary' mode — just find the last assistant message with thinking
+  if (detail === 'summary') {
+    for (let i = activeBranch.length - 1; i >= 0; i--) {
+      const entry = activeBranch[i];
+      if (entry.type !== 'assistant' || !entry.message?.content) continue;
+      let text = '';
+      let thinking = '';
+      for (const block of entry.message.content) {
+        if (block.type === 'thinking' && block.thinking) thinking += block.thinking + '\n';
+        if (block.type === 'text' && block.text) text += block.text + '\n';
+      }
+      let result = '';
+      if (thinking) result += '## Thinking\n' + thinking.trim() + '\n\n';
+      result += '## Response\n' + text.trim();
+      // For summary, count turns quickly (user entries with text)
+      let turnCount = 0;
+      for (const e of activeBranch) {
+        if (e.type !== 'user') continue;
+        const c = e.message?.content;
+        const hasText = typeof c === 'string' ? !!c.trim() : (Array.isArray(c) && c.some(b => b.type === 'text' && b.text?.trim()));
+        const onlyToolResult = Array.isArray(c) && c.every(b => b.type === 'tool_result' || (b.type === 'text' && !b.text?.trim()));
+        if (hasText && !onlyToolResult) turnCount++;
+      }
+      return { text: result, totalTurns: turnCount };
+    }
+    return { text: '(No assistant response found)', totalTurns: 0 };
+  }
+
+  // For 'full' and 'with_code' — format the entire conversation
+  // Build progress lookup (sub-agent entries by parentToolUseID)
+  const progressByToolUse = new Map();
+  for (const pe of progressEntries) {
+    const key = pe.parentToolUseID;
+    if (!progressByToolUse.has(key)) progressByToolUse.set(key, []);
+    progressByToolUse.get(key).push(pe);
+  }
+
+  // Collect turns (user-assistant pairs)
+  const turns = [];
+  let currentTurn = null;
+
+  for (const entry of activeBranch) {
+    if (entry.type === 'user') {
+      // Extract user prompt (skip tool_result entries)
+      const content = entry.message?.content;
+      let promptText = '';
+      if (typeof content === 'string') {
+        promptText = content;
+      } else if (Array.isArray(content)) {
+        const textParts = content.filter(c => c.type === 'text').map(c => c.text);
+        promptText = textParts.join('\n');
+      }
+      // Skip tool_result-only messages (no user text)
+      const hasToolResult = Array.isArray(content) && content.some(c => c.type === 'tool_result');
+      if (!promptText.trim() && hasToolResult) continue;
+      if (!promptText.trim()) continue;
+
+      currentTurn = { user: promptText.trim(), thinking: '', response: '', actions: [] };
+      turns.push(currentTurn);
+    } else if (entry.type === 'assistant' && entry.message?.content && currentTurn) {
+      for (const block of entry.message.content) {
+        if (block.type === 'thinking' && block.thinking) {
+          currentTurn.thinking += block.thinking + '\n';
+        } else if (block.type === 'text' && block.text) {
+          currentTurn.response += block.text + '\n';
+        } else if (block.type === 'tool_use') {
+          // Find matching tool_result in the next user entry
+          let toolResult = null;
+          const toolUseId = block.id;
+          // Search forward for tool_result
+          const entryIdx = activeBranch.indexOf(entry);
+          for (let j = entryIdx + 1; j < activeBranch.length && j < entryIdx + 3; j++) {
+            const nextEntry = activeBranch[j];
+            if (nextEntry.type === 'user' && Array.isArray(nextEntry.message?.content)) {
+              const tr = nextEntry.message.content.find(c => c.type === 'tool_result' && c.tool_use_id === toolUseId);
+              if (tr) { toolResult = tr; break; }
+            }
+          }
+          const label = formatToolAction(block.name, block.input || {}, toolResult, includeEditing, includeReading, {
+            progressEntries: progressByToolUse.get(toolUseId) || [],
+          });
+          currentTurn.actions.push(label);
+        }
+      }
+    } else if (entry.type === 'system' && entry.subtype === 'compact_boundary' && currentTurn) {
+      currentTurn.actions.push('♻️ Context compacted');
+    }
+  }
+
+  if (turns.length === 0) return { text: '(No conversation turns found)', totalTurns: 0 };
+
+  const totalTurns = turns.length;
+
+  // Apply sinceTurn — skip already-delivered turns
+  const displayTurns = sinceTurn > 0 ? turns.slice(sinceTurn) : turns;
+
+  if (displayTurns.length === 0) {
+    return { text: '(No new turns since last read — total: ' + totalTurns + ')', totalTurns };
+  }
+
+  const skipped = turns.length - displayTurns.length;
+
+  // Format output
+  const lines = [];
+  if (skipped > 0) lines.push('(' + skipped + ' earlier turns already delivered)\n');
+
+  for (let i = 0; i < displayTurns.length; i++) {
+    const t = displayTurns[i];
+    lines.push('--- Turn ' + (skipped + i + 1) + '/' + totalTurns + ' ---');
+    lines.push('USER: ' + t.user);
+    if (t.thinking) lines.push('\nTHINKING:\n' + t.thinking.trim());
+    if (t.response) lines.push('\nCLAUDE:\n' + t.response.trim());
+    if (t.actions.length > 0) {
+      lines.push('\nActions:');
+      for (const a of t.actions) lines.push('  ' + a);
+    }
+    lines.push('');
+  }
+
+  return { text: lines.join('\n'), totalTurns };
+}
+
 // Format sub-agent response for Gemini paste
-function formatSubAgentResponse(result) {
-  return '[Claude Sub-Agent Response]\n' + result + '\n[/Claude Sub-Agent Response]';
+function formatSubAgentResponse(result, meta) {
+  let footer = '';
+  if (meta && (meta.contextPct > 0 || meta.model !== 'unknown')) {
+    const parts = [];
+    if (meta.model && meta.model !== 'unknown') parts.push('Model: ' + meta.model);
+    if (meta.contextPct > 0) parts.push('Context: ' + meta.contextPct + '%');
+    footer = '\n---\n' + parts.join(' | ');
+  }
+  return '[Claude Sub-Agent Response]\n' + result + footer + '\n[/Claude Sub-Agent Response]';
 }
 
 // Deliver result back to Gemini PTY via command queue
@@ -1046,9 +1678,18 @@ async function handleSubAgentCompletion(claudeTabId) {
   task.status = 'completed';
   task.result = result;
 
-  // Format and deliver to Gemini
-  const formatted = formatSubAgentResponse(result);
-  console.log('[MCPResult] Delivering ' + formatted.length + ' chars to Gemini tab ' + geminiTabId);
+  // Track delivered turns so read_claude_history returns only new turns
+  try {
+    const { totalTurns } = getClaudeHistory(sessionId, cwd, { sinceTurn: 999999 });
+    task.deliveredTurns = totalTurns;
+  } catch (e) {
+    task.deliveredTurns = 0;
+  }
+
+  // Format and deliver to Gemini (include context metadata)
+  const meta = bridgeMetadata.get(claudeTabId) || null;
+  const formatted = formatSubAgentResponse(result, meta);
+  console.log('[MCPResult] Delivering ' + formatted.length + ' chars to Gemini tab ' + geminiTabId + (meta ? ' (ctx:' + meta.contextPct + '% model:' + meta.model + ')' : ''));
   deliverResultToGemini(geminiTabId, formatted);
 
   // Notify renderer
@@ -1521,7 +2162,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
       //         2) armed (user typed at least once — prevents restore replay)
       //         3) not running  4) cooldown expired (prevents re-trigger & race condition)
       const cooldownUntil = claudeAgentCooldown.get(tabId) || 0;
-      if (geminiWatchers.has(tabId) && claudeAgentArmed.get(tabId) && claudeAgentManager.getStatus(tabId) !== 'running' && Date.now() > cooldownUntil) {
+      if (geminiActiveTabs.has(tabId) && claudeAgentArmed.get(tabId) && claudeAgentManager.getStatus(tabId) !== 'running' && Date.now() > cooldownUntil) {
         const sc = stripVTControlCharacters(data);
 
         // Guard 5: Gemini spinner = TUI re-render. All :::claude in output is OLD history, not fresh.
@@ -1559,7 +2200,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
       // Detect Braille spinner + "esc to cancel" → Gemini is thinking
       // No spinner for 1.5s → Gemini finished (idle)
       {
-        if (geminiWatchers.has(tabId)) {
+        if (geminiActiveTabs.has(tabId)) {
           var gsc = stripVTControlCharacters(data);
           var isGeminiSpinner = GEMINI_SPINNER_RE.test(gsc);
 
@@ -1699,6 +2340,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
       terminals.delete(tabId);
       terminalProjects.delete(tabId);
       terminalCommandState.delete(tabId);
+      claudeCliActive.delete(tabId);
       claudeAgentManager.cleanup(tabId);
       claudeAgentBuffer.delete(tabId);
       claudeAgentArmed.delete(tabId);
@@ -1706,6 +2348,17 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
       clearTimeout(geminiSpinnerIdleTimers.get(tabId));
       geminiSpinnerBusy.delete(tabId);
       geminiSpinnerIdleTimers.delete(tabId);
+      geminiActiveTabs.delete(tabId);
+      // Claude spinner cleanup on PTY exit
+      clearTimeout(claudeSpinnerIdleTimer.get(tabId));
+      if (claudeSpinnerBusy.get(tabId)) {
+        console.log('[Spinner] Tab ' + tabId + ': IDLE (PTY exit cleanup)');
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('claude:busy-state', { tabId, busy: false });
+        }
+      }
+      claudeSpinnerBusy.delete(tabId);
+      claudeSpinnerIdleTimer.delete(tabId);
 
       // MCP: Handle sub-agent PTY exit (Claude crash)
       if (subAgentParentTab.has(tabId)) {
@@ -1959,6 +2612,11 @@ ipcMain.on('terminal:force-command-started', (event, tabId) => {
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('terminal:command-started', { tabId });
   }
+});
+
+// Renderer log forwarding → file logger
+ipcMain.on('log:renderer', (event, msg) => {
+  console.log('[R] ' + msg);
 });
 
 ipcMain.on('terminal:input', async (event, tabId, data) => {
@@ -2496,6 +3154,17 @@ ipcMain.on('terminal:kill', (event, tabId) => {
   claudeAgentManager.cleanup(tabId);
   claudeAgentBuffer.delete(tabId);
   claudeAgentArmed.delete(tabId);
+  geminiActiveTabs.delete(tabId);
+  // Claude spinner cleanup on kill
+  clearTimeout(claudeSpinnerIdleTimer.get(tabId));
+  if (claudeSpinnerBusy.get(tabId)) {
+    console.log('[Spinner] Tab ' + tabId + ': IDLE (terminal kill cleanup)');
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('claude:busy-state', { tabId, busy: false });
+    }
+  }
+  claudeSpinnerBusy.delete(tabId);
+  claudeSpinnerIdleTimer.delete(tabId);
 
   // MCP cleanup: if this is a Gemini tab, cancel sub-agent tasks
   for (const [claudeTabId, geminiTabId] of subAgentParentTab) {
@@ -2711,6 +3380,22 @@ async function findTabByChildPid(childPid) {
   return null;
 }
 
+// Bug 3 fix: cached version — ppid is stable within MCP server lifetime,
+// but findTabByChildPid can fail on subsequent calls if process tree shifts
+async function findTabByChildPidCached(childPid) {
+  if (!childPid) return null;
+  const cached = ppidToGeminiTab.get(childPid);
+  if (cached && terminals.has(cached)) {
+    return cached;
+  }
+  const resolved = await findTabByChildPid(childPid);
+  if (resolved) {
+    console.log('[MCP:PIDCache] Cached ppid ' + childPid + ' → geminiTabId ' + resolved);
+    ppidToGeminiTab.set(childPid, resolved);
+  }
+  return resolved;
+}
+
 // Get current working directory of terminal process
 ipcMain.handle('terminal:getCwd', async (event, tabId) => {
   const term = terminals.get(tabId);
@@ -2746,6 +3431,20 @@ ipcMain.handle('terminal:getCwd', async (event, tabId) => {
 ipcMain.handle('terminal:getCommandState', async (event, tabId) => {
   const state = terminalCommandState.get(tabId);
   return state || { isRunning: false, lastExitCode: 0 };
+});
+
+// Test introspection: get/set claudeCliActive for E2E tests
+ipcMain.handle('__test:get-claude-cli-active', async (event, tabId) => {
+  return !!claudeCliActive.get(tabId);
+});
+ipcMain.handle('__test:set-claude-cli-active', async (event, tabId, active) => {
+  if (active) {
+    claudeCliActive.set(tabId, true);
+    console.log('[Test] claudeCliActive SET for tab ' + tabId);
+  } else {
+    claudeCliActive.delete(tabId);
+    console.log('[Test] claudeCliActive CLEARED for tab ' + tabId);
+  }
 });
 
 // Notes management
@@ -3478,6 +4177,7 @@ ipcMain.on('gemini:spawn-with-watcher', (event, { tabId, cwd, resumeSessionId, b
   console.log('[Gemini Sniper] IPC received: gemini:spawn-with-watcher');
   console.log('[Gemini Sniper] TabId:', tabId);
   console.log('[Gemini Sniper] CWD from renderer:', cwd);
+  geminiActiveTabs.add(tabId);
 
   // Close any existing watcher for this tab
   if (geminiWatchers.has(tabId)) {
@@ -3646,8 +4346,9 @@ ipcMain.on('gemini:spawn-with-watcher', (event, { tabId, cwd, resumeSessionId, b
   const term = terminals.get(tabId);
   if (term) {
     if (resumeSessionId) {
-      console.log('[Gemini Sniper] Writing "gemini -r ' + resumeSessionId + '" to terminal');
-      term.write('gemini -r ' + resumeSessionId + '\r');
+      const cmd = yesMode ? 'gemini -y -r ' + resumeSessionId : 'gemini -r ' + resumeSessionId;
+      console.log('[Gemini Sniper] Writing "' + cmd + '" to terminal');
+      term.write(cmd + '\r');
       // For prefilled sessions, emit session-detected immediately (file already exists)
       sessionFound = true;
       event.sender.send('gemini:session-detected', { tabId, sessionId: resumeSessionId });
@@ -3707,6 +4408,9 @@ ipcMain.on('gemini:run-command', (event, { tabId, command, sessionId, cwd }) => 
   // Get cwd from terminalProjects if not provided
   const termCwd = cwd || terminalProjects.get(tabId);
   console.log('[Gemini] Running command:', command, 'sessionId:', sessionId, 'cwd:', termCwd);
+
+  // Ensure spinner detection works for all Gemini commands (continue, fork, etc.)
+  geminiActiveTabs.add(tabId);
 
   switch (command) {
     case 'gemini':
