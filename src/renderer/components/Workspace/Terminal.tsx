@@ -205,7 +205,7 @@ const executePendingAction = (tabId: string, pendingAction: PendingAction) => {
       getSetTabCommandType()(tabId, 'gemini');
       const geminiCwd = getTabCwd(tabId);
       console.log('[RESTORE] 12. Sending IPC gemini:spawn-with-watcher { cwd:', geminiCwd, '}');
-      ipcRenderer.send('gemini:spawn-with-watcher', { tabId, cwd: geminiCwd });
+      ipcRenderer.send('gemini:spawn-with-watcher', { tabId, cwd: geminiCwd, yesMode: true });
       break;
     }
 
@@ -925,11 +925,11 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
             return false;
           }
 
-          // Clear line, start watcher, then launch gemini
+          // Clear line, start watcher, then launch gemini -y
           ipcRenderer.send('terminal:input', tabId, '\x15');
           log.gemini('Sending gemini:spawn-with-watcher IPC to main process');
-          // Main process will: 1) start fs.watch 2) write 'gemini\r' to PTY
-          ipcRenderer.send('gemini:spawn-with-watcher', { tabId, cwd });
+          // Main process will: 1) start fs.watch 2) write 'gemini -y\r' to PTY
+          ipcRenderer.send('gemini:spawn-with-watcher', { tabId, cwd, yesMode: true });
           return false;
         }
 
@@ -1278,7 +1278,7 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
             }
             ipcRenderer.send('terminal:input', tabId, '\x15');
             const cwd2 = getTabCwd(tabId);
-            ipcRenderer.send('gemini:spawn-with-watcher', { tabId, cwd: cwd2 });
+            ipcRenderer.send('gemini:spawn-with-watcher', { tabId, cwd: cwd2, yesMode: true });
             return false;
           }
 

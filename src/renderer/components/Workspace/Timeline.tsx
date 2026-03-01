@@ -20,6 +20,7 @@ interface TimelineEntry {
   content: string;
   isCompactSummary?: boolean;
   preTokens?: number;
+  hasImage?: boolean;
   sessionId?: string;
   isPlan?: boolean;
 }
@@ -446,7 +447,11 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
           }
         } else {
           const key = getEntryKey(entry);
-          if (key && matchesAtUserPrompt(visibleText, key)) {
+          const hasKey = key && matchesAtUserPrompt(visibleText, key);
+          // Image fallback: Claude TUI shows [Image #N] instead of text
+          const hasImageFilter = entry.hasImage && visibleText.includes('[Image #');
+          
+          if (hasKey || hasImageFilter) {
             newVisible.add(index);
           }
         }
@@ -474,6 +479,9 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
           newUnreachable.add(index);
           return;
         }
+        // Image messages: Claude TUI shows [Image #N] at prompt, not the user's text.
+        // Text search would fail, but OSC 7777 markers guarantee click-to-scroll works.
+        if (entry.hasImage) return;
         if (isGemini) {
           // Gemini: line-level matching with strict short-text handling
           const lines = getSearchLines(entry.content);
@@ -487,7 +495,10 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
           const key = getEntryKey(entry);
           if (key) {
                const isReachable = matchesAtUserPrompt(fullText, key, false);
-               if (!isReachable) {
+               // Safety fallback: if text not found but message has image and placeholder is visible
+               const imageFallback = !isReachable && entry.hasImage && fullText.includes('[Image #');
+               
+               if (!isReachable && !imageFallback) {
                    newUnreachable.add(index);
                }
           }
