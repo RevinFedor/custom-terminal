@@ -715,6 +715,7 @@ function register({ projectManager, formatToolAction }) {
         if (entry.type === 'user') {
           // Normalize content - can be string or array of objects
           let rawContent = entry.message?.content;
+          let hasImage = false;
 
           // Skip tool_result entries - these are automatic, not user input
           if (Array.isArray(rawContent)) {
@@ -723,9 +724,11 @@ function register({ projectManager, formatToolAction }) {
               skippedToolResult++;
               continue;
             }
+            // Detect image blocks (Claude Code shows these as [Image #N] in terminal)
+            hasImage = rawContent.some(item => item.type === 'image');
             // Find first text block for other array types
             const textBlock = rawContent.find(item => item.type === 'text' && item.text);
-            rawContent = textBlock?.text || null;
+            rawContent = textBlock?.text || (hasImage ? '[Image]' : null);
           }
 
           // Skip if no valid content
@@ -785,6 +788,7 @@ function register({ projectManager, formatToolAction }) {
             type: isContinued ? 'continued' : 'user',
             timestamp: entry.timestamp,
             content: cleanContent,
+            hasImage: hasImage || undefined,
             isCompactSummary: entry.isCompactSummary || false,
             sessionId: entry.sessionId || entry._fromFile,
             isPlan: !!entry.planContent

@@ -627,7 +627,7 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                     <code
                       className="text-xs cursor-pointer hover:underline px-1.5 py-0.5 bg-[#1a1a1a] rounded-r border-l border-[#333]"
                       style={{ color: '#4E86F8' }}
-                      onClick={() => { if (!activeTabId) { showToast('Нет активного таба', 'error'); return; } setTabCommandType(activeTabId, 'gemini'); ipcRenderer.send('gemini:spawn-with-watcher', { tabId: activeTabId, cwd: getCurrentCwd() }); }}
+                      onClick={() => { if (!activeTabId) { showToast('Нет активного таба', 'error'); return; } setTabCommandType(activeTabId, 'gemini'); ipcRenderer.send('gemini:spawn-with-watcher', { tabId: activeTabId, cwd: getCurrentCwd(), yesMode: true }); }}
                       title="Новая Gemini сессия"
                     >gemini</code>
                   </div>

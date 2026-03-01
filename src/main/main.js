@@ -167,14 +167,41 @@ const geminiActiveTabs = new Set();        // tabs with active Gemini process (f
 
 // ========== UUID COLORIZATION (purple highlight for MCP Task IDs in terminal) ==========
 // Wraps UUID patterns in ANSI purple (RGB 180,130,255) before sending to renderer.
-// Safe: dashes in UUID never appear inside ANSI escape sequences.
+// IMPORTANT: Skips UUIDs inside OSC sequences (e.g. OSC 8 hyperlinks from Claude Code).
+// Injecting CSI color codes inside an OSC would abort xterm.js parser → URL leaks as visible text.
 const UUID_COLOR_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
 const UUID_COLOR_PREFIX = '\x1b[38;2;180;130;255m';
 const UUID_COLOR_SUFFIX = '\x1b[39m';
 function colorizeUUIDs(data) {
-  return data.replace(UUID_COLOR_RE, function(m) {
-    return UUID_COLOR_PREFIX + m + UUID_COLOR_SUFFIX;
-  });
+  // Split data into OSC sequences (pass-through) and regular text (colorize).
+  // OSC = \x1b] ... \x07 (or \x1b\\). UUIDs inside OSC URLs must NOT be colorized.
+  var result = '';
+  var i = 0;
+  while (i < data.length) {
+    if (data.charCodeAt(i) === 0x1b && i + 1 < data.length && data.charCodeAt(i + 1) === 0x5d) {
+      // OSC start — scan for terminator, pass through as-is
+      var j = i + 2;
+      while (j < data.length) {
+        if (data.charCodeAt(j) === 0x07) { j++; break; }
+        if (data.charCodeAt(j) === 0x1b && j + 1 < data.length && data.charCodeAt(j + 1) === 0x5c) { j += 2; break; }
+        j++;
+      }
+      result += data.slice(i, j);
+      i = j;
+    } else {
+      // Regular text — find next OSC start or end of data
+      var j = i + 1;
+      while (j < data.length) {
+        if (data.charCodeAt(j) === 0x1b && j + 1 < data.length && data.charCodeAt(j + 1) === 0x5d) break;
+        j++;
+      }
+      result += data.slice(i, j).replace(UUID_COLOR_RE, function(m) {
+        return UUID_COLOR_PREFIX + m + UUID_COLOR_SUFFIX;
+      });
+      i = j;
+    }
+  }
+  return result;
 }
 
 // ========== PROMPT BOUNDARY MARKERS (OSC 7777 injection for deterministic navigation) ==========
@@ -1636,8 +1663,106 @@ function deliverResultToGemini(geminiTabId, formatted) {
   }));
 }
 
-// Handle sub-agent completion (called when ⏵ detected in Claude sub-agent PTY)
-async function handleSubAgentCompletion(claudeTabId) {
+// Deferred re-check timers for sub-agent completion (prevent duplicate scheduling)
+const subAgentDeferredCheck = new Map(); // claudeTabId → timeoutId
+const SUB_AGENT_RECHECK_INTERVAL = 3000; // 3s between re-checks
+const SUB_AGENT_MAX_RECHECKS = 40; // 40 × 3s = 2 min max wait
+
+// Check JSONL tail to determine if Claude is still working.
+// Returns { stillWorking, reason } — reason is a human-readable string for logging.
+function checkJsonlActivity(sessionId, cwd) {
+  try {
+    const sessionFile = findSessionFile(sessionId, cwd);
+    if (!sessionFile) return { stillWorking: false, reason: 'no session file' };
+
+    const content = fs.readFileSync(sessionFile.filePath, 'utf-8');
+    const lines = content.trim().split('\n').filter(l => l.trim());
+    if (lines.length === 0) return { stillWorking: false, reason: 'empty session' };
+
+    // Check last 10 records for activity signals (increased from 5 — queue-operation can produce many entries)
+    const tailSize = Math.min(10, lines.length);
+    let hasProgress = false;
+    let hasToolUse = false;
+    let hasTurnDuration = false;
+    let hasQueueOp = false;
+    let lastType = '?';
+    let lastAssistantIdx = -1;
+    let lastUserIdx = -1;
+
+    for (let i = lines.length - tailSize; i < lines.length; i++) {
+      try {
+        const entry = JSON.parse(lines[i]);
+        lastType = entry.type + (entry.subtype ? ':' + entry.subtype : '');
+
+        if (entry.type === 'progress') {
+          hasProgress = true;
+          hasToolUse = false; // progress comes after tool_use, reset
+        }
+        if (entry.type === 'assistant' && entry.message?.content) {
+          lastAssistantIdx = i;
+          if (entry.message.content.some(b => b.type === 'tool_use')) {
+            hasToolUse = true;
+          } else {
+            hasToolUse = false; // text-only assistant clears tool_use flag
+          }
+          hasProgress = false; // assistant entry after progress = tool finished
+        }
+        if (entry.type === 'user') {
+          lastUserIdx = i;
+          hasProgress = false; // user entry (tool_result) = tool finished
+        }
+        // queue-operation = Claude Code message queue (enqueue/popAll).
+        // Presence means continue_claude sent messages while Claude was busy.
+        // If queue-operation appears AFTER turn_duration, a new turn is starting.
+        if (entry.type === 'queue-operation') {
+          hasQueueOp = true;
+          hasTurnDuration = false; // new turn may be starting after previous completion
+        }
+        // turn_duration = definitive completion signal from Claude CLI
+        if (entry.type === 'system' && entry.subtype === 'turn_duration') {
+          hasTurnDuration = true;
+          hasProgress = false;
+          hasToolUse = false;
+          hasQueueOp = false;
+        }
+      } catch {}
+    }
+
+    // turn_duration is the ONLY reliable completion signal from Claude CLI.
+    // Without it, JSONL may be lagging behind TUI rendering (race condition:
+    // spinner IDLE for 500ms between tool calls, but JSONL not yet updated).
+    if (hasTurnDuration) {
+      return { stillWorking: false, reason: 'turn_duration found' };
+    }
+    // Below: specific reasons for detailed logging (all return stillWorking: true)
+    if (hasProgress) {
+      return { stillWorking: true, reason: 'active progress entries (sub-agents running), last=' + lastType };
+    }
+    if (hasToolUse) {
+      return { stillWorking: true, reason: 'pending tool_use (waiting for result), last=' + lastType };
+    }
+    if (hasQueueOp && lastUserIdx > lastAssistantIdx) {
+      return { stillWorking: true, reason: 'queue-operation: pending user message, last=' + lastType };
+    }
+    if (hasQueueOp) {
+      return { stillWorking: true, reason: 'queue-operation entries present, last=' + lastType };
+    }
+    // No turn_duration found — JSONL may be lagging behind TUI. Always defer.
+    return { stillWorking: true, reason: 'no turn_duration yet (JSONL may lag behind TUI), last=' + lastType };
+  } catch (e) {
+    return { stillWorking: false, reason: 'error: ' + e.message };
+  }
+}
+
+// Handle sub-agent completion (called when spinner goes IDLE in Claude sub-agent PTY)
+// Uses JSONL guard + deferred re-check to prevent false triggers between tool calls.
+async function handleSubAgentCompletion(claudeTabId, recheckCount) {
+  recheckCount = recheckCount || 0;
+
+  // Clear any pending deferred check (we're running now)
+  clearTimeout(subAgentDeferredCheck.get(claudeTabId));
+  subAgentDeferredCheck.delete(claudeTabId);
+
   const geminiTabId = subAgentParentTab.get(claudeTabId);
   if (!geminiTabId) {
     console.log('[MCP:Complete] No parent tab for: ' + claudeTabId);
@@ -1659,11 +1784,46 @@ async function handleSubAgentCompletion(claudeTabId) {
     return;
   }
 
-  console.log('[MCP:Complete] Task ' + task._taskId + ' completed. Reading JSONL response...');
+  // GUARD: Block completion while handshake is still in progress.
+  // sendHandshakePrompt may be waiting for prompt return after /model command.
+  if (claudeState.has(claudeTabId) || claudePendingPrompt.has(claudeTabId)) {
+    console.log('[MCP:Complete] Handshake still in progress for ' + claudeTabId + ' (state=' + claudeState.get(claudeTabId) + ', hasPendingPrompt=' + claudePendingPrompt.has(claudeTabId) + '). Deferring.');
+    subAgentDeferredCheck.set(claudeTabId, setTimeout(() => {
+      handleSubAgentCompletion(claudeTabId, recheckCount);
+    }, SUB_AGENT_RECHECK_INTERVAL));
+    return;
+  }
 
-  // Read Claude session ID from bridge
   const sessionId = bridgeKnownSessions.get(claudeTabId);
   const cwd = terminalProjects.get(claudeTabId);
+  const taskAge = Math.round((Date.now() - task.createdAt) / 1000);
+
+  // GUARD: Check JSONL to verify Claude actually finished (not just between tool calls).
+  // Problem: Claude outputs text between Task sub-agent calls → spinner disappears >500ms → false IDLE.
+  // Solution: read JSONL tail — if progress/tool_use entries present, Claude is still working.
+  if (sessionId) {
+    const { stillWorking, reason } = checkJsonlActivity(sessionId, cwd);
+
+    if (stillWorking) {
+      if (recheckCount >= SUB_AGENT_MAX_RECHECKS) {
+        console.log('[MCP:Complete] JSONL guard: max re-checks reached (' + SUB_AGENT_MAX_RECHECKS + '). Forcing completion. reason=' + reason + ' age=' + taskAge + 's');
+        // Fall through to completion
+      } else {
+        console.log('[MCP:Complete] JSONL guard: Claude still working (' + reason + '). Deferred re-check #' + (recheckCount + 1) + ' in ' + (SUB_AGENT_RECHECK_INTERVAL / 1000) + 's. age=' + taskAge + 's');
+        subAgentDeferredCheck.set(claudeTabId, setTimeout(() => {
+          handleSubAgentCompletion(claudeTabId, recheckCount + 1);
+        }, SUB_AGENT_RECHECK_INTERVAL));
+        return;
+      }
+    } else {
+      console.log('[MCP:Complete] JSONL guard passed (' + reason + '). age=' + taskAge + 's' + (recheckCount > 0 ? ' after ' + recheckCount + ' re-checks' : ''));
+    }
+  } else {
+    console.log('[MCP:Complete] No sessionId for tab ' + claudeTabId + ', skipping JSONL guard. age=' + taskAge + 's');
+  }
+
+  // === COMPLETION: Claude is done ===
+  console.log('[MCP:Complete] Task ' + task._taskId + ' completed. Reading JSONL response...');
 
   let result = null;
   if (sessionId) {
@@ -1673,6 +1833,8 @@ async function handleSubAgentCompletion(claudeTabId) {
   if (!result) {
     result = '(No response captured — Claude session ID may not have been detected yet)';
     console.log('[MCP:Complete] No JSONL response found. sessionId=' + sessionId);
+  } else {
+    console.log('[MCP:Complete] Got response: ' + result.length + ' chars, preview: ' + result.substring(0, 80).replace(/\n/g, '\\n') + '...');
   }
 
   task.status = 'completed';
@@ -1682,6 +1844,7 @@ async function handleSubAgentCompletion(claudeTabId) {
   try {
     const { totalTurns } = getClaudeHistory(sessionId, cwd, { sinceTurn: 999999 });
     task.deliveredTurns = totalTurns;
+    console.log('[MCP:Complete] Delivered turns watermark set to ' + totalTurns);
   } catch (e) {
     task.deliveredTurns = 0;
   }
@@ -1689,7 +1852,7 @@ async function handleSubAgentCompletion(claudeTabId) {
   // Format and deliver to Gemini (include context metadata)
   const meta = bridgeMetadata.get(claudeTabId) || null;
   const formatted = formatSubAgentResponse(result, meta);
-  console.log('[MCPResult] Delivering ' + formatted.length + ' chars to Gemini tab ' + geminiTabId + (meta ? ' (ctx:' + meta.contextPct + '% model:' + meta.model + ')' : ''));
+  console.log('[MCP:Complete] Delivering ' + formatted.length + ' chars to Gemini tab ' + geminiTabId + (meta ? ' (ctx:' + meta.contextPct + '% model:' + meta.model + ')' : ''));
   deliverResultToGemini(geminiTabId, formatted);
 
   // Notify renderer
@@ -1983,17 +2146,24 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
         while (bodyLines.length > 0 && bodyLines[0].trim() === '') bodyLines.shift();
         var body = bodyLines.join('\n').trim();
 
+        console.log('[Handshake:' + tabId + '] Parsed prompt: ' + slashCommands.length + ' slash commands, body=' + body.length + ' chars');
+        if (slashCommands.length > 0) {
+          console.log('[Handshake:' + tabId + '] Slash commands: ' + slashCommands.join(' | '));
+        }
+
         if (slashCommands.length > 0) {
           // Send each slash command separately, waiting for prompt return after each
           for (var ci = 0; ci < slashCommands.length; ci++) {
-            console.log('[Handshake:' + tabId + '] Sending slash command: ' + slashCommands[ci]);
+            console.log('[Handshake:' + tabId + '] Sending slash command ' + (ci + 1) + '/' + slashCommands.length + ': ' + slashCommands[ci]);
             await safePasteAndSubmit(term, slashCommands[ci], {
               submit: true,
               ctrlCFirst: ci > 0,
               logPrefix: '[Handshake:cmd:' + tabId + ']'
             });
             // Wait for Claude to process the command and show prompt again
+            console.log('[Handshake:' + tabId + '] Slash command sent, waiting for prompt return...');
             await waitForPromptReturn(term, tabId, 10000);
+            console.log('[Handshake:' + tabId + '] Prompt return resolved for slash command ' + (ci + 1));
           }
         }
 
@@ -2003,8 +2173,11 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
             submit: true,
             logPrefix: '[Handshake:' + tabId + ']'
           });
+          console.log('[Handshake:' + tabId + '] ✅ Body prompt sent successfully');
         } else if (slashCommands.length === 0) {
           console.log('[Handshake:' + tabId + '] Empty prompt, nothing to send');
+        } else {
+          console.log('[Handshake:' + tabId + '] No body after slash commands (slash-only prompt)');
         }
       }
 
@@ -2012,17 +2185,23 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
       function waitForPromptReturn(term, tabId, timeoutMs) {
         return new Promise(function(resolve) {
           var sub = null;
+          var chunkCount = 0;
+          console.log('[Handshake:wait:' + tabId + '] Waiting for prompt return (timeout=' + timeoutMs + 'ms)...');
           var timer = setTimeout(function() {
             if (sub) sub.dispose();
-            console.log('[Handshake:' + tabId + '] Prompt return timeout (' + timeoutMs + 'ms)');
+            console.log('[Handshake:wait:' + tabId + '] ⚠️ TIMEOUT after ' + timeoutMs + 'ms (' + chunkCount + ' chunks received, none matched ⏵ or >)');
             resolve();
           }, timeoutMs);
           sub = term.onData(function(d) {
+            chunkCount++;
             var s = stripVTControlCharacters(d);
+            var printable = s.replace(/[\x00-\x1f]/g, '').trim();
             if (s.includes('\u23F5') || s.includes('>')) {
-              // Prompt returned — add small debounce for UI to settle
               clearTimeout(timer);
+              console.log('[Handshake:wait:' + tabId + '] ✅ Prompt detected in chunk #' + chunkCount + ': "' + printable.substring(0, 80) + '"');
               setTimeout(function() { if (sub) sub.dispose(); resolve(); }, 200);
+            } else if (printable.length > 0) {
+              console.log('[Handshake:wait:' + tabId + '] Chunk #' + chunkCount + ' (no prompt): "' + printable.substring(0, 120) + '"');
             }
           });
         });
@@ -2293,6 +2472,11 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
           // Spinner in content → BUSY, reset idle timer
           clearTimeout(claudeSpinnerIdleTimer.get(tabId));
           claudeSpinnerIdleTimer.delete(tabId);
+          // Cancel deferred completion re-check — Claude is working again
+          if (subAgentDeferredCheck.has(tabId)) {
+            clearTimeout(subAgentDeferredCheck.get(tabId));
+            subAgentDeferredCheck.delete(tabId);
+          }
           if (!claudeSpinnerBusy.get(tabId)) {
             claudeSpinnerBusy.set(tabId, true);
             console.log('[Spinner] Tab ' + tabId + ': BUSY');
@@ -2351,6 +2535,8 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
       geminiActiveTabs.delete(tabId);
       // Claude spinner cleanup on PTY exit
       clearTimeout(claudeSpinnerIdleTimer.get(tabId));
+      clearTimeout(subAgentDeferredCheck.get(tabId));
+      subAgentDeferredCheck.delete(tabId);
       if (claudeSpinnerBusy.get(tabId)) {
         console.log('[Spinner] Tab ' + tabId + ': IDLE (PTY exit cleanup)');
         if (mainWindow && !mainWindow.isDestroyed()) {
@@ -3157,6 +3343,8 @@ ipcMain.on('terminal:kill', (event, tabId) => {
   geminiActiveTabs.delete(tabId);
   // Claude spinner cleanup on kill
   clearTimeout(claudeSpinnerIdleTimer.get(tabId));
+  clearTimeout(subAgentDeferredCheck.get(tabId));
+  subAgentDeferredCheck.delete(tabId);
   if (claudeSpinnerBusy.get(tabId)) {
     console.log('[Spinner] Tab ' + tabId + ': IDLE (terminal kill cleanup)');
     if (mainWindow && !mainWindow.isDestroyed()) {
@@ -4211,13 +4399,13 @@ ipcMain.on('gemini:spawn-with-watcher', (event, { tabId, cwd, resumeSessionId, b
   console.log('[Gemini Sniper] Resolved method:', resolved ? resolved.method : 'predicted');
   console.log('[Gemini Sniper] Watching directory:', chatsDir);
 
-  // List existing files in chats dir for debugging
-  let existingFileCount = 0;
+  // Snapshot existing files — we will IGNORE change events on these (only accept rename = new file)
+  const existingFilesSet = new Set();
   try {
     if (fs.existsSync(chatsDir)) {
       const existingFiles = fs.readdirSync(chatsDir);
-      existingFileCount = existingFiles.length;
-      console.log('[Gemini Sniper] Existing files:', existingFileCount);
+      for (const f of existingFiles) existingFilesSet.add(f);
+      console.log('[Gemini Sniper] Existing files:', existingFilesSet.size);
     } else {
       console.log('[Gemini Sniper] Chats dir does not exist yet');
     }
@@ -4253,16 +4441,27 @@ ipcMain.on('gemini:spawn-with-watcher', (event, { tabId, cwd, resumeSessionId, b
       if (!filename || !filename.startsWith('session-') || !filename.endsWith('.json')) return;
 
       console.log('[Gemini Sniper] Session file event:', eventType, filename);
+
+      // CRITICAL: Ignore 'change' events on files that existed BEFORE we started watching.
+      // Gemini may touch/update old session files on startup (indexing, migration).
+      // Only 'rename' (= new file creation) is valid for pre-existing files.
+      if (eventType === 'change' && existingFilesSet.has(filename)) {
+        console.log('[Gemini Sniper] Ignoring change on pre-existing file:', filename);
+        return;
+      }
+
       const filePath = path.join(chatsDir, filename);
 
-      // Check if file is fresh (created or modified after our start time)
+      // Check if file is fresh (created after our start time)
       fs.stat(filePath, (err, stats) => {
         if (err || sessionFound) return;
 
+        // For rename events (new file): check mtime or birthtime
+        // For change events on NEW files: also check mtime
         const fileTime = Math.max(stats.mtimeMs, stats.birthtimeMs || 0);
         if (fileTime >= startTime - 500) {
           sessionFound = true;
-          console.log('[Gemini Sniper] Fresh/modified session file detected!');
+          console.log('[Gemini Sniper] New session file detected! (event=' + eventType + ')');
 
           // Read the file to get the full sessionId
           try {
@@ -4303,9 +4502,13 @@ ipcMain.on('gemini:spawn-with-watcher', (event, { tabId, cwd, resumeSessionId, b
           event.sender.send('gemini:watcher-redirect', { tabId, newChatsDir: chatsDir });
           // Note: the watcher restart is handled by re-setting up fs.watch below
           if (!fs.existsSync(chatsDir)) fs.mkdirSync(chatsDir, { recursive: true });
+          // Snapshot existing files in new dir
+          const recheckExisting = new Set();
+          try { for (const f of fs.readdirSync(chatsDir)) recheckExisting.add(f); } catch {}
           watcher = fs.watch(chatsDir, (eventType, filename) => {
             if (sessionFound) return;
             if (!filename || !filename.startsWith('session-') || !filename.endsWith('.json')) return;
+            if (eventType === 'change' && recheckExisting.has(filename)) return; // ignore old files
             const filePath = path.join(chatsDir, filename);
             fs.stat(filePath, (err, stats) => {
               if (err || sessionFound) return;

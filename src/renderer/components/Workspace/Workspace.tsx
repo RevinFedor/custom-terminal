@@ -214,15 +214,20 @@ export default function Workspace() {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (workspaceView !== 'workspace') return;
       const isBackslash = e.code === 'Backslash' || e.key === '\\' || e.code === 'IntlBackslash';
-      if (e.metaKey && isBackslash && effectiveTab?.id && effectiveTab.claudeSessionId && effectiveTab.commandType === 'claude') {
-        e.preventDefault();
-        const currentOpen = useUIStore.getState().historyPanelOpenTabs[effectiveTab.id] ?? false;
-        setHistoryPanelOpen(effectiveTab.id, !currentOpen);
+      if (e.metaKey && isBackslash && effectiveTab?.id) {
+        const hasSession =
+          (effectiveTab.commandType === 'claude' && effectiveTab.claudeSessionId) ||
+          (effectiveTab.commandType === 'gemini' && effectiveTab.geminiSessionId);
+        if (hasSession) {
+          e.preventDefault();
+          const currentOpen = useUIStore.getState().historyPanelOpenTabs[effectiveTab.id] ?? false;
+          setHistoryPanelOpen(effectiveTab.id, !currentOpen);
+        }
       }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [workspaceView, effectiveTab?.id, effectiveTab?.claudeSessionId, effectiveTab?.commandType, setHistoryPanelOpen]);
+  }, [workspaceView, effectiveTab?.id, effectiveTab?.claudeSessionId, effectiveTab?.geminiSessionId, effectiveTab?.commandType, setHistoryPanelOpen]);
 
   // CMD+F hotkey for terminal search
   useEffect(() => {
