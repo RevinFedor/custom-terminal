@@ -6,12 +6,13 @@
  * Phase 2: continue_claude follow-up (same session, extracted taskId)
  * Phase 3: Second delegation via Gemini → second sub-agent
  * Phase 4: Final assertions (deliveries, false completions, store state)
+ * Phase 5: read_claude_history verification (watermark, from_beginning, summary, with_code, manual intervention)
  *
  * All delegations go through Gemini (correct ppid via process tree).
  * Direct HTTP is only used for continue_claude (uses taskId, not ppid).
  *
  * [E2E+Gemini+Claude] — Requires: npm run dev (port 5182) + npx electron-vite build + gemini CLI + claude CLI
- * Hard kill: 540s (9 minutes)
+ * Hard kill: 720s (12 minutes)
  *
  * Run: node auto/sandbox/test-orchestration-full.js 2>&1 | tee /tmp/test-orchestration-full.log
  */
@@ -120,11 +121,11 @@ function createLogWatcher(logs) {
 // MAIN TEST
 // ═════════════════════════════════════════════════════════════════════
 async function main() {
-  // Hard kill: 540s (9 minutes)
+  // Hard kill: 720s (12 minutes)
   const globalTimer = setTimeout(() => {
-    console.error(`\n${c.red}[FATAL]${c.reset} Global timeout (540s). Force exit.`)
+    console.error(`\n${c.red}[FATAL]${c.reset} Global timeout (720s). Force exit.`)
     process.exit(1)
-  }, 540000)
+  }, 720000)
 
   // ═══════════════════════════════════════════════════════════════════
   // PHASE 0: SETUP
@@ -409,7 +410,7 @@ async function main() {
       // Verify watermark via read_claude_history HTTP
       log.step('Verifying watermark (read_claude_history)...')
       try {
-        const history = await httpGet(mcpPort, `/history/${taskId1}?from_beginning=true`)
+        const history = await httpGet(mcpPort, `/claude-history/${taskId1}?from_beginning=true`)
         log.info(`History: totalTurns=${history.totalTurns}, new=${history.new}`)
         softAssert(history.totalTurns >= 2, `totalTurns >= 2: ${history.totalTurns}`)
       } catch (e) {
@@ -518,6 +519,145 @@ async function main() {
       return { projectId: s.activeProjectId, count: ours.length }
     }, geminiTabId)
     assert(projectCheck?.count >= 2, `${projectCheck?.count ?? 0} sub-agents in project ${projectCheck?.projectId}`)
+
+    // ═══════════════════════════════════════════════════════════════════
+    // PHASE 5: READ_CLAUDE_HISTORY VERIFICATION
+    // ═══════════════════════════════════════════════════════════════════
+    log.phase(5, 'READ_CLAUDE_HISTORY VERIFICATION')
+
+    if (!taskId1) {
+      log.warn('Skipping Phase 5 — no taskId from Phase 1')
+    } else {
+      // 5a. Incremental read (post-delivery) — watermark at totalTurns, expect 0 new
+      log.step('5a. Incremental read (post-delivery)...')
+      try {
+        const histIncr = await httpGet(mcpPort, `/claude-history/${taskId1}`)
+        log.info(`Incremental: totalTurns=${histIncr.totalTurns}, newTurns=${histIncr.newTurns}`)
+        assert(histIncr.totalTurns !== undefined, `totalTurns is defined: ${histIncr.totalTurns}`)
+        assert(histIncr.newTurns === 0, `Post-delivery newTurns === 0: ${histIncr.newTurns}`)
+        assert(histIncr.content?.includes('No new turns'), `Content says "No new turns"`)
+      } catch (e) {
+        log.fail(`Incremental read failed: ${e.message}`)
+        failed++
+      }
+
+      // 5b. Full history (from_beginning=true) — all turns with content
+      log.step('5b. Full history (from_beginning=true)...')
+      let fullTotalTurns = 0
+      try {
+        const histFull = await httpGet(mcpPort, `/claude-history/${taskId1}?from_beginning=true`)
+        log.info(`Full: totalTurns=${histFull.totalTurns}, newTurns=${histFull.newTurns}, content length=${histFull.content?.length}`)
+        fullTotalTurns = histFull.totalTurns || 0
+        assert(histFull.totalTurns >= 2, `Full totalTurns >= 2: ${histFull.totalTurns}`)
+        assert(histFull.content?.length > 50, `Content has substance (${histFull.content?.length} chars)`)
+        assert(histFull.content?.includes('USER:'), `Content has USER: markers`)
+        assert(histFull.content?.includes('CLAUDE:'), `Content has CLAUDE: markers`)
+        assert(histFull.content?.includes('--- Turn 1/'), `Content has Turn 1 header`)
+      } catch (e) {
+        log.fail(`Full history read failed: ${e.message}`)
+        failed++
+      }
+
+      // 5c. Summary mode — should return last assistant response
+      log.step('5c. Summary mode (detail=summary)...')
+      try {
+        const histSummary = await httpGet(mcpPort, `/claude-history/${taskId1}?detail=summary&from_beginning=true`)
+        log.info(`Summary: totalTurns=${histSummary.totalTurns}, content length=${histSummary.content?.length}`)
+        assert(histSummary.content?.includes('## Response'), `Summary has "## Response" section`)
+        assert(histSummary.totalTurns >= 2, `Summary totalTurns >= 2: ${histSummary.totalTurns}`)
+      } catch (e) {
+        log.fail(`Summary read failed: ${e.message}`)
+        failed++
+      }
+
+      // 5d. with_code mode — should include tool action details
+      log.step('5d. with_code mode (detail=with_code)...')
+      try {
+        const histCode = await httpGet(mcpPort, `/claude-history/${taskId1}?detail=with_code&from_beginning=true`)
+        log.info(`with_code: totalTurns=${histCode.totalTurns}, content length=${histCode.content?.length}`)
+        assert(histCode.totalTurns >= 2, `with_code totalTurns >= 2: ${histCode.totalTurns}`)
+        // Claude was asked to read package.json — should have at least one action
+        const hasActions = histCode.content?.includes('Actions:')
+        softAssert(hasActions, `with_code has Actions section`)
+        // Check if Read tool label is shown (includeReading=false, but label still appears)
+        const hasReadLabel = histCode.content?.includes('Чтение') || histCode.content?.includes('📄')
+        softAssert(hasReadLabel, `with_code shows Read tool label`)
+      } catch (e) {
+        log.fail(`with_code read failed: ${e.message}`)
+        failed++
+      }
+
+      // 5e. Manual intervention — write directly to Claude sub-agent tab, then read
+      log.step('5e. Manual intervention test...')
+      const subAgent1TabId = await page.evaluate((gTabId) => {
+        const s = window.useWorkspaceStore?.getState?.()
+        const p = s?.openProjects?.get?.(s?.activeProjectId)
+        if (!p) return null
+        const subs = Array.from(p.tabs.values()).filter(t => t.parentTabId === gTabId)
+        return subs.length > 0 ? subs[0].id : null
+      }, geminiTabId)
+
+      if (!subAgent1TabId) {
+        log.warn('No sub-agent tab found, skipping manual intervention test')
+      } else {
+        log.info(`Sub-agent 1 tab ID: ${subAgent1TabId}`)
+
+        // Send a simple message to Claude via safePasteAndSubmit (bracketed paste)
+        // Claude Code Ink TUI requires bracketed paste — raw term.write() is collapsed
+        await page.evaluate(async ({ tabId, content }) => {
+          const { ipcRenderer } = window.require('electron')
+          await ipcRenderer.invoke('terminal:paste', { tabId, content, submit: true })
+        }, { tabId: subAgent1TabId, content: 'What is 2+2? Answer with just the number, nothing else.' })
+
+        // Wait for Claude BUSY (processing the manual message)
+        log.step('Waiting for Claude BUSY (manual)...')
+        const stopHb5a = startHeartbeat('claude-busy-manual')
+        const busyManual = await logWatch.waitFor(/\[Spinner\].*BUSY/, 30000)
+        stopHb5a()
+        softAssert(!!busyManual, `Claude BUSY (manual): ${busyManual ? 'detected' : 'TIMEOUT'}`)
+
+        // Wait for Claude IDLE (finished processing)
+        log.step('Waiting for Claude IDLE (manual)...')
+        const stopHb5b = startHeartbeat('claude-idle-manual')
+        const idleManual = await logWatch.waitFor(/\[Spinner\].*IDLE/, 60000)
+        stopHb5b()
+        assert(!!idleManual, `Claude IDLE (manual): ${idleManual ? 'detected' : 'TIMEOUT'}`)
+
+        // Wait for JSONL flush (Claude writes entries in real-time, but small buffer delay)
+        await page.waitForTimeout(3000)
+
+        // Incremental read — should have new turns from manual intervention
+        log.step('5e. Reading history after manual intervention...')
+        try {
+          const histManual = await httpGet(mcpPort, `/claude-history/${taskId1}`)
+          log.info(`Manual: totalTurns=${histManual.totalTurns}, newTurns=${histManual.newTurns}`)
+          log.info(`Manual content preview: ${histManual.content?.substring(0, 200)}`)
+          assert(histManual.newTurns >= 1, `Manual intervention newTurns >= 1: ${histManual.newTurns}`)
+          assert(histManual.totalTurns > fullTotalTurns, `totalTurns increased: ${histManual.totalTurns} > ${fullTotalTurns}`)
+          // Verify content contains the question or answer
+          const hasManualContent = histManual.content?.includes('2+2') ||
+            histManual.content?.includes('2 + 2') || histManual.content?.includes('4')
+          softAssert(hasManualContent, `Manual content mentions 2+2 or 4`)
+        } catch (e) {
+          log.fail(`Manual intervention read failed: ${e.message}`)
+          failed++
+        }
+
+        // 5f. Full history after manual — should include ALL turns
+        log.step('5f. Full history after manual intervention...')
+        try {
+          const histFullAfter = await httpGet(mcpPort, `/claude-history/${taskId1}?from_beginning=true`)
+          log.info(`Full after manual: totalTurns=${histFullAfter.totalTurns}`)
+          assert(histFullAfter.totalTurns > fullTotalTurns,
+            `Total turns grew after manual: ${histFullAfter.totalTurns} > ${fullTotalTurns}`)
+          // Verify full history contains both original and manual content
+          assert(histFullAfter.content?.includes('--- Turn 1/'), `Full history still has Turn 1`)
+        } catch (e) {
+          log.fail(`Full history after manual failed: ${e.message}`)
+          failed++
+        }
+      }
+    }
 
     // ═══════════════════════════════════════════════════════════════════
     // RESULTS
