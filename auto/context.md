@@ -32,6 +32,7 @@ auto/
 │   ├── test-gemini-orchestration.js  # [E2E+Gemini+Claude] Gemini → Claude delegation, spinners, MCP
 │   └── test-history-restore.js       # [E2E] History: восстановление из SQLite ⚠️ BROKEN
 ├── sandbox/                          # Одноразовые эксперименты. Готов → перенести в stable/
+│   ├── test-orchestration-full.js   # [E2E+Gemini+Claude] Full chain: delegation, continue, history, manual intervention (46/46)
 │   └── test-claude-busy-indicator.js # [E2E+Claude] Busy State: детекция без цвета + OSC stripping
 └── screenshots/                      # Артефакты тестов
 ```
@@ -40,7 +41,7 @@ auto/
 - **[Headless]** — чистый Node.js, без Electron. < 1 сек, 100% детерминированный.
 - **[E2E+Fixture]** — Electron + golden session из `fixtures/`. Не требует реального AI.
 - **[E2E+Claude]** — Electron + живой Claude. Требует CLI `claude` и ~30-60 сек.
-- **[E2E+Gemini+Claude]** — Electron + живой Gemini CLI + Claude Code. ~120-300 сек. Используй hard kill 300с.
+- **[E2E+Gemini+Claude]** — Electron + живой Gemini CLI + Claude Code. ~3-5 мин (после JSONL guard fix). Hard kill: 720с.
 
 ---
 
@@ -307,6 +308,9 @@ Main-процесс логирует состояния AI-агентов для
 | `[Spinner] Tab X: IDLE` | Claude Code вернул промт (500ms debounce без спиннера) | `waitForMainProcessLog(logs, /Spinner.*IDLE/, 120000)` |
 | `[MCP:Delegate] Claude sub-agent tab created` | Sub-agent таб создан | `waitForMainProcessLog(logs, /MCP:Delegate.*sub-agent tab created/, 120000)` |
 | `[MCP:HTTP] POST /delegate` | MCP delegation request принят | `findInLogs(logs, 'MCP:')` |
+| `[Spinner] Sub-agent completion triggered` | Spinner IDLE → completion flow | `logWatch.waitFor(/Sub-agent completion triggered/)` |
+| `[MCP:Complete] JSONL guard passed` | Guard подтвердил completion | `logWatch.waitFor(/JSONL guard passed/)` |
+| `[MCP:Complete] Delivering X chars` | Результат доставлен в Gemini | `logWatch.waitFor(/MCP:Complete.*Delivering \d+ chars/)` |
 
 **IPC события:** `gemini:busy-state` и `claude:busy-state` отправляются в renderer для UI-обновлений.
 
@@ -321,7 +325,9 @@ Gemini CLI работает в alternate screen buffer xterm.js. Это знач
 Архитектура: Gemini вызывает MCP tool `delegate_to_claude` → HTTP POST `/delegate` → main.js создаёт sub-agent tab → Claude Code запускается → результат автоматически доставляется через `safePasteAndSubmit`.
 - Sub-agent tab имеет `parentTabId` → скрыт из TabBar, виден в SubAgentBar
 - **Fire-and-forget:** Gemini не должен поллить `get_task_status` — описание тулов в `mcp-server.mjs` явно это запрещает
-- Тест: `test-gemini-orchestration.js`
+- **JSONL guard:** Spinner IDLE → `checkJsonlActivity()` проверяет JSONL на `turn_duration` (primary) или `stop_reason=end_turn` (fallback для суб-агентов, которые не пишут `turn_duration`)
+- **read_claude_history:** `GET /claude-history/{taskId}` — инкрементальное чтение (watermark `deliveredTurns`). Параметры: `detail` (summary/full/with_code), `from_beginning` (сброс watermark)
+- **Тесты:** `test-gemini-orchestration.js` (базовый), `test-orchestration-full.js` (полный: delegation + continue + history + manual intervention)
 
 ---
 
@@ -348,6 +354,7 @@ node auto/stable/test-timeline.js
 
 # Gemini + Claude (нужны оба CLI, ~3-5 мин):
 node auto/stable/test-gemini-orchestration.js 2>&1 | tee /tmp/test-gemini-orch.log
+node auto/sandbox/test-orchestration-full.js 2>&1 | tee /tmp/test-orchestration-full.log
 ```
 
 ### Параллельный запуск
@@ -359,13 +366,14 @@ node auto/stable/test-gemini-orchestration.js 2>&1 | tee /tmp/test-gemini-orch.l
 - Не убивать основной экземпляр
 - Таймаут bash: **минимум 180 секунд**
 
-### Известные проблемы (2026-02-28)
+### Известные проблемы (2026-03-02)
 
 | Тест | Статус | Причина |
 |------|--------|---------|
 | `test-history-restore.js` | BROKEN | `setCurrentView` отсутствует в store API |
 | `test-gemini-rewind.js` | 11/12 | Golden fixture ожидает 13 entries, IPC возвращает 11 |
-| `test-gemini-orchestration.js` | 16/16 PASS, 1 WARN | Claude sub-agent IDLE может не прийти за 120с (Claude долго читает контекст). Не FAIL — soft timeout |
+| `test-gemini-orchestration.js` | 16/16 PASS, 1 WARN | Soft timeout на Gemini session detection |
+| `test-orchestration-full.js` | 46/46 PASS, 2 WARN | WARN: Gemini session detection + commandType timing |
 | Все E2E | WARNING | `MaxListenersExceededWarning` при 8+ сохранённых табах |
 
 ### Типичные ошибки при написании тестов (шрамы)
@@ -377,3 +385,6 @@ node auto/stable/test-gemini-orchestration.js 2>&1 | tee /tmp/test-gemini-orch.l
 | Запустить тест без `\| tee /tmp/file.log` | Пустой вывод, нет диагностики | См. §1 Empty Output |
 | `assert(condition \|\| true, ...)` | Assert всегда PASS, баг скрыт | Code review: никогда `\|\| true` в assert |
 | `logMainProcess: false` в `launch()` | Нет логов Main-процесса для отладки | Всегда `logMainProcess: true` для [E2E+Claude] и [E2E+Gemini+Claude] |
+| `terminal:input` для Claude Code | Ink TUI не обрабатывает raw text, нужен bracketed paste | Используй `terminal:paste` (через `safePasteAndSubmit`) |
+| Эндпоинт `/history/` вместо `/claude-history/` | 404, `totalTurns: undefined` | MCP HTTP: `/claude-history/{taskId}`, `/status/{taskId}`, `/continue`, `/delegate` |
+| JSONL guard ждёт `turn_duration` для суб-агентов | 120s таймаут (40×3s) — суб-агенты не пишут `turn_duration` | Фикс: fallback на `stop_reason=end_turn` в `checkJsonlActivity` |

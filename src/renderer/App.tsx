@@ -600,19 +600,31 @@ function App() {
     // MCP sub-agent tab creation (main process → renderer)
     const handleMcpCreateSubAgent = async (_: any, data: { taskId: string; geminiTabId: string; cwd?: string }) => {
       const state = useWorkspaceStore.getState();
-      const { activeProjectId, openProjects } = state;
-      if (!activeProjectId) {
-        ipcRenderer.send('mcp:sub-agent-tab-created', { error: 'No active project' });
+      const { openProjects } = state;
+
+      // Find the project that actually contains the Gemini tab (NOT activeProjectId —
+      // user may be viewing a different project when delegation happens)
+      let targetProjectId: string | null = null;
+      let workspace: any = null;
+      for (const [projId, ws] of openProjects) {
+        if (ws.tabs.has(data.geminiTabId)) {
+          targetProjectId = projId;
+          workspace = ws;
+          break;
+        }
+      }
+      if (!targetProjectId || !workspace) {
+        console.warn('[MCP:SubAgent] Gemini tab not found in any project:', data.geminiTabId);
+        ipcRenderer.send('mcp:sub-agent-tab-created', { error: 'Gemini tab not found in any open project' });
         return;
       }
 
       // Use CWD from main process (reliable), fallback to Gemini tab or project path
-      const workspace = openProjects.get(activeProjectId);
-      const geminiTab = workspace?.tabs.get(data.geminiTabId);
-      const cwd = data.cwd || geminiTab?.cwd || workspace?.projectPath || '';
+      const geminiTab = workspace.tabs.get(data.geminiTabId);
+      const cwd = data.cwd || geminiTab?.cwd || workspace.projectPath || '';
 
       try {
-        const tabId = await state.createTab(activeProjectId, 'claude-sub', cwd, {
+        const tabId = await state.createTab(targetProjectId, 'claude-sub', cwd, {
           commandType: 'claude',
           color: 'claude',
           background: true,
@@ -620,9 +632,21 @@ function App() {
         } as any);
 
         // Note: claudeActive will be set by mcp:claude-cli-active when Claude CLI actually launches
-        ipcRenderer.send('mcp:sub-agent-tab-created', { tabId, taskId: data.taskId });
+        const createdTab = useWorkspaceStore.getState().openProjects.get(targetProjectId)?.tabs.get(tabId);
+        ipcRenderer.send('mcp:sub-agent-tab-created', { tabId, taskId: data.taskId, tabName: createdTab?.name || 'claude-sub' });
       } catch (err: any) {
         ipcRenderer.send('mcp:sub-agent-tab-created', { error: err.message });
+      }
+    };
+
+    // MCP rename sub-agent tab (main process → renderer)
+    const handleMcpRenameSubAgent = (_: any, data: { claudeTabId: string; name: string }) => {
+      const state = useWorkspaceStore.getState();
+      for (const [projId, ws] of state.openProjects) {
+        if (ws.tabs.has(data.claudeTabId)) {
+          state.renameTab(projId, data.claudeTabId, data.name);
+          break;
+        }
       }
     };
 
@@ -662,6 +686,7 @@ function App() {
     ipcRenderer.on('terminal:command-started', handleCommandStarted);
     ipcRenderer.on('terminal:command-finished', handleCommandFinished);
     ipcRenderer.on('mcp:create-sub-agent-tab', handleMcpCreateSubAgent);
+    ipcRenderer.on('mcp:rename-sub-agent-tab', handleMcpRenameSubAgent);
     ipcRenderer.on('mcp:task-status', handleMcpTaskStatus);
     ipcRenderer.on('terminal:exit', handleTerminalExit);
     ipcRenderer.on('mcp:claude-cli-active', handleClaudeCliActive);
@@ -671,6 +696,7 @@ function App() {
       ipcRenderer.removeListener('terminal:command-started', handleCommandStarted);
       ipcRenderer.removeListener('terminal:command-finished', handleCommandFinished);
       ipcRenderer.removeListener('mcp:create-sub-agent-tab', handleMcpCreateSubAgent);
+      ipcRenderer.removeListener('mcp:rename-sub-agent-tab', handleMcpRenameSubAgent);
       ipcRenderer.removeListener('mcp:task-status', handleMcpTaskStatus);
       ipcRenderer.removeListener('terminal:exit', handleTerminalExit);
       ipcRenderer.removeListener('mcp:claude-cli-active', handleClaudeCliActive);

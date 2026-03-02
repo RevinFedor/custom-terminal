@@ -21,13 +21,15 @@ export default function SubAgentBar({ projectId }: SubAgentBarProps) {
   });
 
   // Stable string key: re-derive sub-agents only when tab IDs, statuses, claudeActive, busy, or taskCount change
+  // Search CROSS-PROJECT: sub-agents may have been created in a different project (activeProjectId bug)
   const subAgentKey = useWorkspaceStore((s) => {
-    const workspace = s.openProjects.get(projectId);
-    if (!workspace || !activeTabId) return '';
+    if (!activeTabId) return '';
     const parts: string[] = [];
-    for (const [, tab] of workspace.tabs) {
-      if (tab.parentTabId === activeTabId) {
-        parts.push(tab.id + ':' + (tab.claudeAgentStatus || '') + ':' + (tab.claudeActive ? '1' : '0') + ':' + (tab.claudeBusy ? '1' : '0') + ':' + (tab.claudeTaskCount || 0));
+    for (const [, workspace] of s.openProjects) {
+      for (const [, tab] of workspace.tabs) {
+        if (tab.parentTabId === activeTabId) {
+          parts.push(tab.id + ':' + (tab.claudeAgentStatus || '') + ':' + (tab.claudeActive ? '1' : '0') + ':' + (tab.claudeBusy ? '1' : '0') + ':' + (tab.claudeTaskCount || 0));
+        }
       }
     }
     return parts.join(',');
@@ -37,14 +39,14 @@ export default function SubAgentBar({ projectId }: SubAgentBarProps) {
   const subAgentTabs = useMemo(() => {
     if (!subAgentKey) return [];
     const state = useWorkspaceStore.getState();
-    const workspace = state.openProjects.get(projectId);
-    if (!workspace) return [];
     const result: any[] = [];
-    for (const [, tab] of workspace.tabs) {
-      if (tab.parentTabId === activeTabId) result.push(tab);
+    for (const [, workspace] of state.openProjects) {
+      for (const [, tab] of workspace.tabs) {
+        if (tab.parentTabId === activeTabId) result.push(tab);
+      }
     }
     return result;
-  }, [subAgentKey, projectId, activeTabId]);
+  }, [subAgentKey, activeTabId]);
 
   const handleChipClick = useCallback((tabId: string) => {
     if (viewingSubAgentTabId === tabId) {
