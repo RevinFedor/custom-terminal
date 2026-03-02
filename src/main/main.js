@@ -824,7 +824,7 @@ function startMcpHttpServer() {
       req.on('data', chunk => { body += chunk; });
       req.on('end', async () => {
         try {
-          const { prompt, ppid } = JSON.parse(body);
+          const { prompt, name, ppid } = JSON.parse(body);
           if (!prompt) {
             res.writeHead(400);
             res.end(JSON.stringify({ error: 'prompt is required' }));
@@ -835,7 +835,7 @@ function startMcpHttpServer() {
           console.log('[MCP:HTTP] POST /delegate taskId=' + taskId + ' ppid=' + ppid + ' prompt="' + prompt.substring(0, 60) + '..."');
 
           // Fire-and-forget: start delegation async, return taskId immediately
-          delegateToClaudeSubAgent(taskId, prompt, ppid).catch(err => {
+          delegateToClaudeSubAgent(taskId, prompt, ppid, name).catch(err => {
             console.error('[MCP:Delegate] Error:', err.message);
             const task = mcpTasks.get(taskId);
             if (task) {
@@ -905,7 +905,7 @@ function startMcpHttpServer() {
       req.on('data', chunk => { body += chunk; });
       req.on('end', async () => {
         try {
-          const { taskId, prompt, ppid } = JSON.parse(body);
+          const { taskId, prompt, name, ppid } = JSON.parse(body);
           if (!taskId || !prompt) {
             res.writeHead(400);
             res.end(JSON.stringify({ error: 'taskId and prompt are required' }));
@@ -913,6 +913,16 @@ function startMcpHttpServer() {
           }
 
           console.log('[MCP:HTTP] POST /continue taskId=' + taskId + ' prompt="' + prompt.substring(0, 60) + '..."');
+
+          // Rename sub-agent tab if requested
+          if (name) {
+            const task = mcpTasks.get(taskId);
+            if (task && task.claudeTabId && mainWindow && !mainWindow.isDestroyed()) {
+              task.tabName = name;
+              mainWindow.webContents.send('mcp:rename-sub-agent-tab', { claudeTabId: task.claudeTabId, name });
+              console.log('[MCP:Continue] Renamed tab ' + task.claudeTabId + ' → ' + name);
+            }
+          }
 
           // Fire-and-forget: continue delegation async, return immediately
           continueClaudeSubAgent(taskId, prompt, ppid).catch(err => {
@@ -964,6 +974,7 @@ function startMcpHttpServer() {
               agents.push({
                 taskId: tid,
                 claudeTabId: task.claudeTabId,
+                tabName: task.tabName || null,
                 status: task.status,
                 claudeSessionId: sessionId,
                 claudeActive: !!claudeCliActive.get(task.claudeTabId),
@@ -975,7 +986,7 @@ function startMcpHttpServer() {
           // 3. Also check SQLite for persisted sub-agents not in mcpTasks (after restart)
           try {
             const rows = projectManager.db.db.prepare(
-              'SELECT tab_id, claude_session_id FROM tabs WHERE parent_tab_id = ?'
+              'SELECT tab_id, name, claude_session_id FROM tabs WHERE parent_tab_id = ?'
             ).all(geminiTabId);
             for (const row of rows) {
               if (row.tab_id && !seenClaudeTabIds.has(row.tab_id)) {
@@ -984,6 +995,7 @@ function startMcpHttpServer() {
                 agents.push({
                   taskId: syntheticTaskId,
                   claudeTabId: row.tab_id,
+                  tabName: row.name || null,
                   status: 'done',
                   claudeSessionId: row.claude_session_id || null,
                   claudeActive: !!claudeCliActive.get(row.tab_id),
@@ -1140,7 +1152,7 @@ function stopMcpHttpServer() {
 }
 
 // Main delegation logic: create Claude sub-agent tab, run prompt, return result
-async function delegateToClaudeSubAgent(taskId, prompt, ppid) {
+async function delegateToClaudeSubAgent(taskId, prompt, ppid, customName) {
   // Register task
   mcpTasks.set(taskId, {
     status: 'pending',
@@ -1196,7 +1208,7 @@ async function delegateToClaudeSubAgent(taskId, prompt, ppid) {
   const geminiCwd = terminalProjects.get(geminiTabId) || process.cwd();
   console.log('[MCP:Delegate] Using CWD from main: ' + geminiCwd);
 
-  const claudeTabId = await new Promise((resolve, reject) => {
+  const { tabId: claudeTabId, tabName: claudeTabName } = await new Promise((resolve, reject) => {
     const timeout = setTimeout(() => reject(new Error('Sub-agent tab creation timeout')), 10000);
     // IPC invoke to renderer → creates tab → returns tabId
     mainWindow.webContents.send('mcp:create-sub-agent-tab', {
@@ -1208,15 +1220,21 @@ async function delegateToClaudeSubAgent(taskId, prompt, ppid) {
     ipcMain.once('mcp:sub-agent-tab-created', (event, data) => {
       clearTimeout(timeout);
       if (data.error) reject(new Error(data.error));
-      else resolve(data.tabId);
+      else resolve({ tabId: data.tabId, tabName: data.tabName || null });
     });
   });
 
   task.claudeTabId = claudeTabId;
+  task.tabName = customName || claudeTabName;
   task.status = 'starting';
   subAgentParentTab.set(claudeTabId, geminiTabId);
 
-  console.log('[MCP:Delegate] Claude sub-agent tab created: ' + claudeTabId);
+  // Rename tab if custom name provided by Gemini
+  if (customName && mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('mcp:rename-sub-agent-tab', { claudeTabId, name: customName });
+  }
+
+  console.log('[MCP:Delegate] Claude sub-agent tab created: ' + claudeTabId + ' (' + (task.tabName || 'unnamed') + ')');
 
   // 3. Launch Claude in the sub-agent tab
   // Retry with delay: PTY might not be in terminals yet if shell exits/restarts quickly
@@ -1633,14 +1651,13 @@ function getClaudeHistory(sessionId, cwd, options = {}) {
 }
 
 // Format sub-agent response for Gemini paste
-function formatSubAgentResponse(result, meta) {
-  let footer = '';
-  if (meta && (meta.contextPct > 0 || meta.model !== 'unknown')) {
-    const parts = [];
-    if (meta.model && meta.model !== 'unknown') parts.push('Model: ' + meta.model);
-    if (meta.contextPct > 0) parts.push('Context: ' + meta.contextPct + '%');
-    footer = '\n---\n' + parts.join(' | ');
-  }
+function formatSubAgentResponse(result, meta, taskId, tabName) {
+  const parts = [];
+  if (tabName) parts.push('Tab: ' + tabName);
+  if (taskId) parts.push('Task ID: ' + taskId);
+  if (meta && meta.model && meta.model !== 'unknown') parts.push('Model: ' + meta.model);
+  if (meta && meta.contextPct > 0) parts.push('Context: ' + meta.contextPct + '%');
+  const footer = parts.length > 0 ? '\n---\n' + parts.join(' | ') : '';
   return '[Claude Sub-Agent Response]\n' + result + footer + '\n[/Claude Sub-Agent Response]';
 }
 
@@ -1857,7 +1874,7 @@ async function handleSubAgentCompletion(claudeTabId, recheckCount) {
 
   // Format and deliver to Gemini (include context metadata)
   const meta = bridgeMetadata.get(claudeTabId) || null;
-  const formatted = formatSubAgentResponse(result, meta);
+  const formatted = formatSubAgentResponse(result, meta, task._taskId, task.tabName);
   console.log('[MCP:Complete] Delivering ' + formatted.length + ' chars to Gemini tab ' + geminiTabId + (meta ? ' (ctx:' + meta.contextPct + '% model:' + meta.model + ')' : ''));
   deliverResultToGemini(geminiTabId, formatted);
 

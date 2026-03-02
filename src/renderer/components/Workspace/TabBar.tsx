@@ -210,6 +210,7 @@ interface TabItemProps {
   isCollapsed?: boolean; // Collapsed tab — icon-only
   hasSession?: boolean; // Whether tab has an active AI session
   isBusy?: boolean; // AI agent is actively thinking/streaming
+  isViewingSubAgent?: boolean; // User is viewing a sub-agent of this tab
 }
 
 const TabItem = memo(({
@@ -242,6 +243,7 @@ const TabItem = memo(({
   isCollapsed = false,
   hasSession = false,
   isBusy = false,
+  isViewingSubAgent = false,
 }: TabItemProps) => {
   const ref = useRef<HTMLDivElement>(null);
   const [closestEdge, setClosestEdge] = useState<Edge | null>(null);
@@ -435,6 +437,8 @@ const TabItem = memo(({
     borderLeft: !isHorizontal ? getLeftBorder() : 'none',
     opacity: isDragging ? 0.5 : (draggingGroupIds.includes(tab.id) && !isDragging ? 0.5 : (isCollapsed && !isActive ? 0.6 : 1)),
     transition: 'color 0.15s ease, background-color 0.15s ease',
+    outline: isViewingSubAgent ? '2px solid rgba(168, 85, 247, 0.6)' : 'none',
+    outlineOffset: isViewingSubAgent ? '-2px' : undefined,
   };
 
   return (
@@ -725,6 +729,8 @@ function TabBar({ projectId }: TabBarProps) {
   
   const { projects } = useProjectsStore();
   const setProjectView = useWorkspaceStore((state) => state.setProjectView);
+  const viewingSubAgentTabId = workspace?.viewingSubAgentTabId ?? null;
+  const viewingSubAgentParentId = viewingSubAgentTabId ? workspace?.tabs.get(viewingSubAgentTabId)?.parentTabId ?? null : null;
   const tabsFontSize = useUIStore((state) => state.tabsFontSize);
   const showToast = useUIStore((state) => state.showToast);
   const tabNotesFontSize = useUIStore((state) => state.tabNotesFontSize);
@@ -1472,6 +1478,7 @@ function TabBar({ projectId }: TabBarProps) {
                         onHoverChange={(hovering, rect) => handleTabHoverChange(tab.id, hovering, rect)}
                         showNotesIndicator={isCmdPressed && isMouseInTabBar && !!workspace.tabs.get(tab.id)?.notes}
                         isCollapsed={!!tab.isCollapsed}
+                        isViewingSubAgent={viewingSubAgentParentId === tab.id}
                       />
                     ))}
                   </div>
@@ -1541,6 +1548,7 @@ function TabBar({ projectId }: TabBarProps) {
                     onHoverChange={(hovering, rect) => handleTabHoverChange(tab.id, hovering, rect)}
                     showNotesIndicator={isCmdPressed && isMouseInTabBar && !!workspace.tabs.get(tab.id)?.notes}
                     isCollapsed={!!tab.isCollapsed}
+                    isViewingSubAgent={viewingSubAgentParentId === tab.id}
                   />
                 ))}
               </div>

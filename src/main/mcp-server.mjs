@@ -131,6 +131,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: 'string',
             description: 'The task description / prompt to send to Claude Code. If you need a specific model, put the /model command on the first line followed by the prompt on the next line.',
           },
+          name: {
+            type: 'string',
+            description: 'Optional: custom name for the agent tab (e.g. "refactor-auth", "fix-bug-123"). If not provided, defaults to "claude-sub".',
+          },
         },
         required: ['prompt'],
       },
@@ -151,7 +155,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'continue_claude',
-      description: 'Send a follow-up message to an EXISTING Claude Code sub-agent. Use this instead of delegate_to_claude when you want to continue a conversation with the same agent (same session, same context). The agent must have been previously created via delegate_to_claude. If the agent\'s process died (e.g. after app restart), it will be automatically resumed. The result will be AUTOMATICALLY delivered back — no need to poll.',
+      description: 'Send a follow-up message to an EXISTING Claude Code sub-agent. Use this instead of delegate_to_claude when you want to continue a conversation with the same agent (same session, same context). The agent must have been previously created via delegate_to_claude. If the agent\'s process died (e.g. after app restart), it will be automatically resumed. The result will be AUTOMATICALLY delivered back — no need to poll. You can also rename the agent tab by passing the optional "name" parameter.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -162,6 +166,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           prompt: {
             type: 'string',
             description: 'The follow-up message to send to the existing Claude agent',
+          },
+          name: {
+            type: 'string',
+            description: 'Optional: rename the agent tab (e.g. "refactor-auth", "fix-bug-123")',
           },
         },
         required: ['taskId', 'prompt'],
@@ -227,6 +235,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case 'delegate_to_claude': {
         const result = await httpPost('/delegate', {
           prompt: args.prompt,
+          name: args.name || undefined,
           ppid,
         });
         return {
@@ -243,6 +252,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const result = await httpPost('/continue', {
           taskId: args.taskId,
           prompt: args.prompt,
+          name: args.name || undefined,
           ppid,
         });
         return {
@@ -280,7 +290,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
         let text = 'Sub-agents (' + agents.length + '):\n';
         for (const a of agents) {
-          text += '\n- Task ID: ' + a.taskId;
+          text += '\n- ' + (a.tabName || 'claude-sub') + ' (Task ID: ' + a.taskId + ')';
           if (a.claudeSessionId) text += '\n  Session: ' + a.claudeSessionId.substring(0, 8) + '...';
           // Semantic state for Gemini (no implementation details like PTY)
           if (a.claudeActive) {

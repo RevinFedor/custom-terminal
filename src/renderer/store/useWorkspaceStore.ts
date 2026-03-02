@@ -666,6 +666,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     const { isRestoring } = get();
     if (!isRestoring && !options?.background) {
       workspace.activeTabId = tabId;
+      workspace.viewingSubAgentTabId = null;
       // Push to tab history (LRU, max 20)
       workspace.tabHistory = [...workspace.tabHistory.filter(id => id !== tabId), tabId].slice(-20);
     }
