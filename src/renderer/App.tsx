@@ -683,6 +683,12 @@ function App() {
       state.setClaudeBusy(data.tabId, data.busy);
     };
 
+    // Interceptor state (armed/disarmed) for sub-agent response delivery
+    const handleInterceptorState = (_: any, data: { claudeTabId: string; state: 'armed' | 'disarmed' | null }) => {
+      const state = useWorkspaceStore.getState();
+      state.setInterceptorState(data.claudeTabId, data.state);
+    };
+
     ipcRenderer.on('terminal:command-started', handleCommandStarted);
     ipcRenderer.on('terminal:command-finished', handleCommandFinished);
     ipcRenderer.on('mcp:create-sub-agent-tab', handleMcpCreateSubAgent);
@@ -691,6 +697,7 @@ function App() {
     ipcRenderer.on('terminal:exit', handleTerminalExit);
     ipcRenderer.on('mcp:claude-cli-active', handleClaudeCliActive);
     ipcRenderer.on('claude:busy-state', handleClaudeBusyState);
+    ipcRenderer.on('mcp:interceptor-state', handleInterceptorState);
 
     return () => {
       ipcRenderer.removeListener('terminal:command-started', handleCommandStarted);
@@ -701,6 +708,7 @@ function App() {
       ipcRenderer.removeListener('terminal:exit', handleTerminalExit);
       ipcRenderer.removeListener('mcp:claude-cli-active', handleClaudeCliActive);
       ipcRenderer.removeListener('claude:busy-state', handleClaudeBusyState);
+      ipcRenderer.removeListener('mcp:interceptor-state', handleInterceptorState);
     };
   }, [openProjects.size]); // Re-init when projects change
 
