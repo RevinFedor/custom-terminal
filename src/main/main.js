@@ -175,8 +175,35 @@ const subAgentInterceptor = new Map();      // claudeTabId → 'armed' | 'disarm
 // ========== GEMINI INPUT STATE & RESPONSE QUEUE ==========
 // Tracks whether user has text typed in Gemini input field.
 // When input is active OR Gemini is busy, sub-agent responses are queued.
-const geminiInputHasText = new Map();       // tabId → boolean
+// Uses character counter (not boolean) to handle backspace correctly.
+const geminiInputCharCount = new Map();    // tabId → number (approximate character count)
 const geminiResponseQueue = new Map();      // tabId → Array<{ formatted, taskId, tabName, promptPreview }>
+
+// Helper: check if Gemini tab has text in input
+function geminiHasInput(tabId) {
+  return (geminiInputCharCount.get(tabId) || 0) > 0;
+}
+
+// Helper: update char count and notify renderer on state transitions
+function updateGeminiCharCount(tabId, newCount, reason) {
+  const prev = geminiInputCharCount.get(tabId) || 0;
+  const count = Math.max(0, newCount);
+  geminiInputCharCount.set(tabId, count);
+
+  const prevHasText = prev > 0;
+  const nowHasText = count > 0;
+
+  if (prevHasText !== nowHasText) {
+    console.log('[GeminiInput] Tab ' + tabId + ': ' + (nowHasText ? 'Input detected' : 'Input cleared') + ' (' + reason + ', count=' + count + ')');
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('gemini:input-state', { tabId, hasText: nowHasText });
+    }
+    if (!nowHasText) {
+      // Input just cleared → try to process queue
+      setTimeout(() => processGeminiQueue(tabId), 200);
+    }
+  }
+}
 
 
 // ========== UUID COLORIZATION (purple highlight for MCP Task IDs in terminal) ==========
@@ -1786,7 +1813,7 @@ function deliverResultToGemini(geminiTabId, formatted, taskId, tabName) {
   }
 
   const isBusy = geminiSpinnerBusy.get(geminiTabId) || false;
-  const hasInput = geminiInputHasText.get(geminiTabId) || false;
+  const hasInput = geminiHasInput(geminiTabId);
 
   if (isBusy || hasInput) {
     // Queue the response — Gemini is busy or user is typing
@@ -1795,13 +1822,7 @@ function deliverResultToGemini(geminiTabId, formatted, taskId, tabName) {
     queue.push({ formatted, taskId: taskId || 'unknown', tabName: tabName || 'Claude', promptPreview });
     geminiResponseQueue.set(geminiTabId, queue);
     console.log('[MCP:Queue] Response queued for Gemini tab ' + geminiTabId + ' (busy=' + isBusy + ', hasInput=' + hasInput + ', queueSize=' + queue.length + ')');
-    // Notify renderer about queue update
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('gemini:queue-update', {
-        tabId: geminiTabId,
-        queue: queue.map(q => ({ taskId: q.taskId, tabName: q.tabName, promptPreview: q.promptPreview })),
-      });
-    }
+    notifyQueueUpdate(geminiTabId);
     return;
   }
 
@@ -1829,7 +1850,7 @@ function processGeminiQueue(geminiTabId) {
   if (!queue || queue.length === 0) return;
 
   const isBusy = geminiSpinnerBusy.get(geminiTabId) || false;
-  const hasInput = geminiInputHasText.get(geminiTabId) || false;
+  const hasInput = geminiHasInput(geminiTabId);
 
   if (isBusy || hasInput) {
     console.log('[MCP:Queue] Cannot process queue for tab ' + geminiTabId + ' (busy=' + isBusy + ', hasInput=' + hasInput + ')');
@@ -1847,20 +1868,25 @@ function processGeminiQueue(geminiTabId) {
   const item = queue.shift();
   console.log('[MCP:Queue] Delivering queued response for tab ' + geminiTabId + ' (taskId=' + item.taskId + ', remaining=' + queue.length + ')');
 
-  // Notify renderer about queue update
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send('gemini:queue-update', {
-      tabId: geminiTabId,
-      queue: queue.map(q => ({ taskId: q.taskId, tabName: q.tabName, promptPreview: q.promptPreview })),
-    });
-  }
-
   if (queue.length === 0) {
     geminiResponseQueue.delete(geminiTabId);
   }
 
+  notifyQueueUpdate(geminiTabId);
+
   // Deliver the item, then try to process next after Gemini goes IDLE again
   deliverToGeminiImmediate(geminiTabId, geminiTerm, item.formatted);
+}
+
+// Notify renderer about queue state changes
+function notifyQueueUpdate(tabId) {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    const queue = geminiResponseQueue.get(tabId) || [];
+    mainWindow.webContents.send('gemini:queue-update', {
+      tabId,
+      queue: queue.map(q => ({ taskId: q.taskId, tabName: q.tabName, promptPreview: q.promptPreview })),
+    });
+  }
 }
 
 // Deferred re-check timers for sub-agent completion (prevent duplicate scheduling)
@@ -2762,14 +2788,8 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
             geminiSpinnerIdleTimers.delete(tabId);
             if (!geminiSpinnerBusy.get(tabId)) {
               geminiSpinnerBusy.set(tabId, true);
-              // Gemini became busy → user submitted input → clear input state
-              if (geminiInputHasText.get(tabId)) {
-                geminiInputHasText.set(tabId, false);
-                console.log('[GeminiInput] Tab ' + tabId + ': Input cleared (Gemini BUSY)');
-                if (mainWindow && !mainWindow.isDestroyed()) {
-                  mainWindow.webContents.send('gemini:input-state', { tabId, hasText: false });
-                }
-              }
+              // Gemini became busy → user submitted input → reset char counter
+              updateGeminiCharCount(tabId, 0, 'Gemini BUSY');
               console.log('[GeminiSpinner] Tab ' + tabId + ': THINKING');
               if (mainWindow && !mainWindow.isDestroyed()) {
                 mainWindow.webContents.send('gemini:busy-state', { tabId, busy: true });
@@ -2930,7 +2950,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
       geminiSpinnerBusy.delete(tabId);
       geminiSpinnerIdleTimers.delete(tabId);
       geminiActiveTabs.delete(tabId);
-      geminiInputHasText.delete(tabId);
+      geminiInputCharCount.delete(tabId);
       geminiResponseQueue.delete(tabId);
       // Claude spinner cleanup on PTY exit
       clearTimeout(claudeSpinnerIdleTimer.get(tabId));
@@ -3193,9 +3213,37 @@ async function safePasteAndSubmit(term, content, options = {}) {
 ipcMain.handle('gemini:get-queue', (event, tabId) => {
   const queue = geminiResponseQueue.get(tabId) || [];
   return {
-    hasText: geminiInputHasText.get(tabId) || false,
+    hasText: geminiHasInput(tabId),
     queue: queue.map(q => ({ taskId: q.taskId, tabName: q.tabName, promptPreview: q.promptPreview })),
   };
+});
+
+// Force-flush: deliver next queued response immediately, bypassing input check.
+// Used by the "Send now" button in SubAgentBar queue indicator.
+ipcMain.handle('gemini:force-flush-queue', async (event, tabId) => {
+  const queue = geminiResponseQueue.get(tabId);
+  if (!queue || queue.length === 0) return { success: false, error: 'empty queue' };
+
+  const term = terminals.get(tabId);
+  if (!term) return { success: false, error: 'terminal not found' };
+
+  console.log('[MCP:Queue] Force flush for tab ' + tabId + ' (' + queue.length + ' items)');
+
+  // Reset input char counter (force override)
+  updateGeminiCharCount(tabId, 0, 'force-flush');
+
+  // Dequeue first item
+  const item = queue.shift();
+  if (queue.length === 0) {
+    geminiResponseQueue.delete(tabId);
+  }
+
+  notifyQueueUpdate(tabId);
+
+  // deliverToGeminiImmediate already sends Ctrl+A+Ctrl+K to clear PTY input
+  deliverToGeminiImmediate(tabId, term, item.formatted);
+
+  return { success: true, remaining: (geminiResponseQueue.get(tabId) || []).length };
 });
 
 // Send input to terminal
@@ -3237,43 +3285,28 @@ ipcMain.on('terminal:input', async (event, tabId, data) => {
   }
 
   // ========== GEMINI INPUT STATE TRACKING ==========
-  // Track whether user has text in Gemini input field for response queue system.
-  // Printable chars → hasInput=true. Enter/Ctrl+C/Escape → hasInput=false.
+  // Track character count in Gemini input field for response queue system.
+  // Uses counter (not boolean) to correctly handle backspace → auto-deliver when empty.
   if (geminiActiveTabs.has(tabId)) {
-    const prevHasText = geminiInputHasText.get(tabId) || false;
+    const count = geminiInputCharCount.get(tabId) || 0;
 
     if (data === '\r' || data === '\x03') {
-      // Enter or Ctrl+C → input submitted/cleared
-      if (prevHasText) {
-        geminiInputHasText.set(tabId, false);
-        console.log('[GeminiInput] Tab ' + tabId + ': Input cleared (submit/cancel)');
-        if (mainWindow && !mainWindow.isDestroyed()) {
-          mainWindow.webContents.send('gemini:input-state', { tabId, hasText: false });
-        }
-        // Try to process queue after input clears (with small delay for submission to complete)
-        setTimeout(() => processGeminiQueue(tabId), 200);
-      }
+      // Enter or Ctrl+C → input submitted/cleared → reset counter
+      updateGeminiCharCount(tabId, 0, 'submit/cancel');
+    } else if (data === '\x7f' || data === '\x08') {
+      // Backspace (DEL) or BS → decrement counter
+      updateGeminiCharCount(tabId, count - 1, 'backspace');
+    } else if (data === '\x15') {
+      // Ctrl+U (kill line) → clear all
+      updateGeminiCharCount(tabId, 0, 'kill-line');
     } else if (data === '\x1b' || (data.length >= 2 && data.startsWith('\x1b['))) {
       // Escape or escape sequence (arrow keys, etc.) — don't change state
-      // These are navigation keys, not text input
     } else if (data.length === 1 && data.charCodeAt(0) >= 32) {
-      // Printable character → user is typing
-      if (!prevHasText) {
-        geminiInputHasText.set(tabId, true);
-        console.log('[GeminiInput] Tab ' + tabId + ': Input detected (user typing)');
-        if (mainWindow && !mainWindow.isDestroyed()) {
-          mainWindow.webContents.send('gemini:input-state', { tabId, hasText: true });
-        }
-      }
+      // Printable character → increment counter
+      updateGeminiCharCount(tabId, count + 1, 'typing');
     } else if (data.length > 1 && !data.startsWith('\x1b')) {
-      // Multi-char paste (not escape sequence) → user pasted text
-      if (!prevHasText) {
-        geminiInputHasText.set(tabId, true);
-        console.log('[GeminiInput] Tab ' + tabId + ': Input detected (paste ' + data.length + ' chars)');
-        if (mainWindow && !mainWindow.isDestroyed()) {
-          mainWindow.webContents.send('gemini:input-state', { tabId, hasText: true });
-        }
-      }
+      // Multi-char paste (not escape sequence) → add paste length
+      updateGeminiCharCount(tabId, count + data.length, 'paste');
     }
   }
   // ========== END GEMINI INPUT STATE TRACKING ==========
@@ -3793,7 +3826,7 @@ ipcMain.on('terminal:kill', (event, tabId) => {
   claudeAgentBuffer.delete(tabId);
   claudeAgentArmed.delete(tabId);
   geminiActiveTabs.delete(tabId);
-  geminiInputHasText.delete(tabId);
+  geminiInputCharCount.delete(tabId);
   geminiResponseQueue.delete(tabId);
   // Claude spinner cleanup on kill
   clearTimeout(claudeSpinnerIdleTimer.get(tabId));
