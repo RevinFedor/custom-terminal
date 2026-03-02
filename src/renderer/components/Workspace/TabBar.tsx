@@ -729,8 +729,6 @@ function TabBar({ projectId }: TabBarProps) {
   
   const { projects } = useProjectsStore();
   const setProjectView = useWorkspaceStore((state) => state.setProjectView);
-  const viewingSubAgentTabId = workspace?.viewingSubAgentTabId ?? null;
-  const viewingSubAgentParentId = viewingSubAgentTabId ? workspace?.tabs.get(viewingSubAgentTabId)?.parentTabId ?? null : null;
   const tabsFontSize = useUIStore((state) => state.tabsFontSize);
   const showToast = useUIStore((state) => state.showToast);
   const tabNotesFontSize = useUIStore((state) => state.tabNotesFontSize);
@@ -761,6 +759,8 @@ function TabBar({ projectId }: TabBarProps) {
   const [isMouseInTabBar, setIsMouseInTabBar] = useState(false);
 
   const workspace = openProjects.get(projectId);
+  const viewingSubAgentTabId = workspace?.viewingSubAgentTabId ?? null;
+  const viewingSubAgentParentId = viewingSubAgentTabId ? workspace?.tabs.get(viewingSubAgentTabId)?.parentTabId ?? null : null;
   const project = projects[projectId];
   const currentView = workspace?.currentView || 'terminal';
 

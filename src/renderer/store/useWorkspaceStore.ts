@@ -51,6 +51,7 @@ interface Tab {
   claudeBusy?: boolean; // True if Claude CLI spinner is active (from claude:busy-state)
   claudeTaskCount?: number; // Number of completed MCP tasks (delegate/continue)
   parentTabId?: string; // If this is a MCP sub-agent tab, points to parent (Gemini) tab
+  interceptorState?: 'armed' | 'disarmed' | null; // Interceptor state for MCP response delivery
 }
 
 interface ProjectWorkspace {
@@ -142,6 +143,7 @@ interface WorkspaceStore {
   setClaudeAgentStatus: (tabId: string, status: 'idle' | 'running' | 'done' | 'error', sessionId?: string) => void;
   setClaudeActive: (tabId: string, alive: boolean) => void;
   setClaudeBusy: (tabId: string, busy: boolean) => void;
+  setInterceptorState: (tabId: string, state: 'armed' | 'disarmed' | null) => void;
 
   // MCP sub-agent tab management
   setTabParent: (tabId: string, parentTabId: string | undefined) => void;
@@ -1379,6 +1381,19 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       const tab = workspace.tabs.get(tabId);
       if (tab) {
         tab.claudeBusy = busy;
+        set({ openProjects: new Map(openProjects) });
+        return;
+      }
+    }
+  },
+
+  setInterceptorState: (tabId: string, state: 'armed' | 'disarmed' | null) => {
+    const { openProjects } = get();
+    for (const [, workspace] of openProjects) {
+      const tab = workspace.tabs.get(tabId);
+      if (tab) {
+        if (tab.interceptorState === state) return; // Guard: no re-render if unchanged
+        tab.interceptorState = state;
         set({ openProjects: new Map(openProjects) });
         return;
       }

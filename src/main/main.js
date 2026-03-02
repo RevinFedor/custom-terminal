@@ -165,6 +165,20 @@ const geminiSpinnerIdleTimers = new Map(); // tabId → timeout ID (debounce idl
 const GEMINI_SPINNER_RE = /[\u280B\u2819\u2839\u2838\u283C\u2834\u2826\u2827\u2807\u280F]/;
 const geminiActiveTabs = new Set();        // tabs with active Gemini process (for spinner detection)
 
+// ========== SUB-AGENT INTERCEPTOR STATE ==========
+// Controls whether Claude sub-agent responses are auto-delivered to Gemini.
+// 'armed' = response WILL be delivered, 'disarmed' = response will NOT be delivered.
+// Set to 'armed' on delegate/continue. Set to 'disarmed' after completion.
+// User can toggle via UI (badge click or context menu).
+const subAgentInterceptor = new Map();      // claudeTabId → 'armed' | 'disarmed'
+
+// ========== GEMINI INPUT STATE & RESPONSE QUEUE ==========
+// Tracks whether user has text typed in Gemini input field.
+// When input is active OR Gemini is busy, sub-agent responses are queued.
+const geminiInputHasText = new Map();       // tabId → boolean
+const geminiResponseQueue = new Map();      // tabId → Array<{ formatted, taskId, tabName, promptPreview }>
+
+
 // ========== UUID COLORIZATION (purple highlight for MCP Task IDs in terminal) ==========
 // Wraps UUID patterns in ANSI purple (RGB 180,130,255) before sending to renderer.
 // IMPORTANT: Skips UUIDs inside OSC sequences (e.g. OSC 8 hyperlinks from Claude Code).
@@ -797,6 +811,45 @@ ipcMain.on('show-sub-agent-context-menu', (event, { claudeTabId, claudeSessionId
     template.push({ type: 'separator' });
   }
 
+  // Interceptor controls
+  const interceptorState = subAgentInterceptor.get(claudeTabId);
+  const isBusy = claudeSpinnerBusy.get(claudeTabId) || false;
+
+  if (interceptorState === 'disarmed') {
+    template.push({
+      label: 'Arm interceptor',
+      click: () => {
+        subAgentInterceptor.set(claudeTabId, 'armed');
+        console.log('[MCP:Interceptor] Armed via context menu: ' + claudeTabId);
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('mcp:interceptor-state', { claudeTabId, state: 'armed' });
+        }
+      }
+    });
+    // Deliver last response (only when IDLE + disarmed)
+    if (!isBusy) {
+      template.push({
+        label: 'Deliver last response',
+        click: () => {
+          event.sender.send('sub-agent-context-menu-command', { action: 'deliver-last-response', claudeTabId });
+        }
+      });
+    }
+  } else if (interceptorState === 'armed') {
+    template.push({
+      label: 'Disarm interceptor',
+      click: () => {
+        subAgentInterceptor.set(claudeTabId, 'disarmed');
+        console.log('[MCP:Interceptor] Disarmed via context menu: ' + claudeTabId);
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('mcp:interceptor-state', { claudeTabId, state: 'disarmed' });
+        }
+      }
+    });
+  }
+
+  template.push({ type: 'separator' });
+
   template.push({
     label: 'Detach',
     click: () => {
@@ -813,6 +866,59 @@ ipcMain.on('show-sub-agent-context-menu', (event, { claudeTabId, claudeSessionId
 const MCP_PORT_DIR = path.join(os.homedir(), '.noted-terminal');
 const MCP_PORT_FILE = path.join(MCP_PORT_DIR, 'mcp-port-' + process.pid);
 const MCP_TASK_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes safety timeout
+
+// Start (or restart) the safety timeout for a task. Clears any previous timer.
+function startTaskTimeout(taskId) {
+  const task = mcpTasks.get(taskId);
+  if (!task) return;
+
+  // Clear previous timeout if any
+  if (task.timeoutId) {
+    clearTimeout(task.timeoutId);
+    task.timeoutId = null;
+  }
+
+  // Update createdAt to reset the clock
+  task.createdAt = Date.now();
+
+  // Persist to DB
+  if (task.claudeTabId && projectManager && projectManager.db) {
+    projectManager.db.setMcpTaskStartedAt(task.claudeTabId, task.createdAt);
+  }
+
+  task.timeoutId = setTimeout(() => {
+    const t = mcpTasks.get(taskId);
+    if (t && t.status !== 'completed' && t.status !== 'error' && t.status !== 'timeout') {
+      console.log('[MCP:Timeout] Task timeout: ' + taskId + ' after ' + (MCP_TASK_TIMEOUT_MS / 1000) + 's');
+      t.status = 'timeout';
+      t.error = 'Task timed out after ' + (MCP_TASK_TIMEOUT_MS / 1000) + 's';
+      t.timeoutId = null;
+      // Clear DB
+      if (t.claudeTabId && projectManager && projectManager.db) {
+        projectManager.db.setMcpTaskStartedAt(t.claudeTabId, null);
+      }
+      if (t.geminiTabId) {
+        deliverResultToGemini(t.geminiTabId, '[Claude Sub-Agent Timeout]\nTask exceeded ' + (MCP_TASK_TIMEOUT_MS / 1000) + 's limit.\n[/Claude Sub-Agent Timeout]');
+      }
+      if (t.claudeTabId && mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('mcp:task-status', { taskId, claudeTabId: t.claudeTabId, status: 'error' });
+      }
+    }
+  }, MCP_TASK_TIMEOUT_MS);
+}
+
+// Clear task timeout and DB field
+function clearTaskTimeout(taskId) {
+  const task = mcpTasks.get(taskId);
+  if (!task) return;
+  if (task.timeoutId) {
+    clearTimeout(task.timeoutId);
+    task.timeoutId = null;
+  }
+  if (task.claudeTabId && projectManager && projectManager.db) {
+    projectManager.db.setMcpTaskStartedAt(task.claudeTabId, null);
+  }
+}
 
 function startMcpHttpServer() {
   mcpHttpServer = http.createServer(async (req, res) => {
@@ -840,6 +946,7 @@ function startMcpHttpServer() {
             const task = mcpTasks.get(taskId);
             if (task) {
               task.status = 'error'; task.error = err.message;
+              clearTaskTimeout(taskId);
               if (task.claudeTabId && mainWindow && !mainWindow.isDestroyed()) {
                 mainWindow.webContents.send('mcp:task-status', { taskId, claudeTabId: task.claudeTabId, status: 'error' });
               }
@@ -928,9 +1035,12 @@ function startMcpHttpServer() {
           continueClaudeSubAgent(taskId, prompt, ppid).catch(err => {
             console.error('[MCP:Continue] Error:', err.message);
             const task = mcpTasks.get(taskId);
-            if (task && task.claudeTabId && mainWindow && !mainWindow.isDestroyed()) {
+            if (task) {
               task.status = 'error'; task.error = err.message;
-              mainWindow.webContents.send('mcp:task-status', { taskId, claudeTabId: task.claudeTabId, status: 'error' });
+              clearTaskTimeout(taskId);
+              if (task.claudeTabId && mainWindow && !mainWindow.isDestroyed()) {
+                mainWindow.webContents.send('mcp:task-status', { taskId, claudeTabId: task.claudeTabId, status: 'error' });
+              }
             }
           });
 
@@ -1163,23 +1273,6 @@ async function delegateToClaudeSubAgent(taskId, prompt, ppid, customName) {
     deliveredTurns: 0,
   });
 
-  // Safety timeout
-  setTimeout(() => {
-    const task = mcpTasks.get(taskId);
-    if (task && task.status !== 'completed' && task.status !== 'error') {
-      console.log('[MCP:Delegate] Task timeout: ' + taskId);
-      task.status = 'timeout';
-      task.error = 'Task timed out after ' + (MCP_TASK_TIMEOUT_MS / 1000) + 's';
-      // Send timeout error back to Gemini
-      if (task.geminiTabId) {
-        deliverResultToGemini(task.geminiTabId, '[Claude Sub-Agent Timeout]\nTask exceeded ' + (MCP_TASK_TIMEOUT_MS / 1000) + 's limit.\n[/Claude Sub-Agent Timeout]');
-      }
-      if (task.claudeTabId && mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('mcp:task-status', { taskId, claudeTabId: task.claudeTabId, status: 'error' });
-      }
-    }
-  }, MCP_TASK_TIMEOUT_MS);
-
   // 1. Find Gemini tab by PID
   let geminiTabId = ppid ? await findTabByChildPidCached(ppid) : null;
   if (!geminiTabId) {
@@ -1229,6 +1322,9 @@ async function delegateToClaudeSubAgent(taskId, prompt, ppid, customName) {
   task.status = 'starting';
   subAgentParentTab.set(claudeTabId, geminiTabId);
 
+  // Safety timeout (resettable — stored as task.timeoutId, persisted in DB)
+  startTaskTimeout(taskId);
+
   // Rename tab if custom name provided by Gemini
   if (customName && mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('mcp:rename-sub-agent-tab', { claudeTabId, name: customName });
@@ -1265,7 +1361,13 @@ async function delegateToClaudeSubAgent(taskId, prompt, ppid, customName) {
   }
 
   task.status = 'running';
-  console.log('[MCP:Delegate] Claude launched, handshake set up. Waiting for completion...');
+  subAgentInterceptor.set(claudeTabId, 'armed');
+  console.log('[MCP:Delegate] Claude launched, handshake set up. interceptor=armed. Waiting for completion...');
+
+  // Notify renderer about interceptor state
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('mcp:interceptor-state', { claudeTabId, state: 'armed' });
+  }
   // Completion will be detected by PTY onData handler (Step 3)
 }
 
@@ -1317,6 +1419,8 @@ async function continueClaudeSubAgent(taskId, prompt, ppid) {
     originalTask.status = 'running';
     originalTask.result = undefined;
     originalTask.error = undefined;
+    originalTask.claudeTabId = originalTask.claudeTabId || claudeTabId;
+    originalTask.geminiTabId = originalTask.geminiTabId || geminiTabId;
   } else {
     // Re-create task entry for tracking
     mcpTasks.set(taskId, {
@@ -1328,6 +1432,9 @@ async function continueClaudeSubAgent(taskId, prompt, ppid) {
       deliveredTurns: 0,
     });
   }
+
+  // Reset safety timeout (30 min from NOW, not from original delegate)
+  startTaskTimeout(taskId);
 
   // 3. Check if PTY is alive AND Claude CLI is running inside it
   const claudeTerm = terminals.get(claudeTabId);
@@ -1345,12 +1452,16 @@ async function continueClaudeSubAgent(taskId, prompt, ppid) {
     await safePasteAndSubmit(claudeTerm, prompt, { submit: true, logPrefix: '[MCP:Continue]' });
     subAgentPromptSentAt.set(claudeTabId, Date.now());
 
+    // Arm interceptor (MCP flow restored)
+    subAgentInterceptor.set(claudeTabId, 'armed');
+
     // Notify renderer
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('mcp:task-status', { taskId, claudeTabId, status: 'running' });
+      mainWindow.webContents.send('mcp:interceptor-state', { claudeTabId, state: 'armed' });
     }
 
-    console.log('[MCP:Continue] Prompt sent. Waiting for completion...');
+    console.log('[MCP:Continue] Prompt sent. interceptor=armed. Waiting for completion...');
   } else {
     // PTY dead OR Claude CLI not running (e.g. after restart, PTY has bare shell)
     console.log('[MCP:Continue] Claude CLI not active (ptyExists=' + !!claudeTerm + '). Attempting auto-resume...');
@@ -1399,13 +1510,17 @@ async function continueClaudeSubAgent(taskId, prompt, ppid) {
     claudeState.set(claudeTabId, 'WAITING_PROMPT');
     claudePendingPrompt.set(claudeTabId, prompt);
 
+    // Arm interceptor (MCP flow restored)
+    subAgentInterceptor.set(claudeTabId, 'armed');
+
     // Notify renderer: Claude CLI now active + task running
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('mcp:claude-cli-active', { tabId: claudeTabId, active: true });
       mainWindow.webContents.send('mcp:task-status', { taskId, claudeTabId, status: 'running' });
+      mainWindow.webContents.send('mcp:interceptor-state', { claudeTabId, state: 'armed' });
     }
 
-    console.log('[MCP:Continue] Handshake set up. Waiting for Claude prompt + completion...');
+    console.log('[MCP:Continue] Handshake set up. interceptor=armed. Waiting for Claude prompt + completion...');
   }
 }
 
@@ -1661,14 +1776,41 @@ function formatSubAgentResponse(result, meta, taskId, tabName) {
   return '[Claude Sub-Agent Response]\n' + result + footer + '\n[/Claude Sub-Agent Response]';
 }
 
-// Deliver result back to Gemini PTY via command queue
-function deliverResultToGemini(geminiTabId, formatted) {
+// Deliver result back to Gemini PTY via command queue.
+// If Gemini is busy or user has text in input → queue the response.
+function deliverResultToGemini(geminiTabId, formatted, taskId, tabName) {
   const geminiTerm = terminals.get(geminiTabId);
   if (!geminiTerm) {
     console.log('[MCP:Deliver] Gemini terminal not found: ' + geminiTabId);
     return;
   }
 
+  const isBusy = geminiSpinnerBusy.get(geminiTabId) || false;
+  const hasInput = geminiInputHasText.get(geminiTabId) || false;
+
+  if (isBusy || hasInput) {
+    // Queue the response — Gemini is busy or user is typing
+    const queue = geminiResponseQueue.get(geminiTabId) || [];
+    const promptPreview = formatted.substring(0, 120).replace(/\n/g, ' ');
+    queue.push({ formatted, taskId: taskId || 'unknown', tabName: tabName || 'Claude', promptPreview });
+    geminiResponseQueue.set(geminiTabId, queue);
+    console.log('[MCP:Queue] Response queued for Gemini tab ' + geminiTabId + ' (busy=' + isBusy + ', hasInput=' + hasInput + ', queueSize=' + queue.length + ')');
+    // Notify renderer about queue update
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('gemini:queue-update', {
+        tabId: geminiTabId,
+        queue: queue.map(q => ({ taskId: q.taskId, tabName: q.tabName, promptPreview: q.promptPreview })),
+      });
+    }
+    return;
+  }
+
+  // Deliver immediately — Gemini is idle and input is empty
+  deliverToGeminiImmediate(geminiTabId, geminiTerm, formatted);
+}
+
+// Internal: immediately deliver formatted response to Gemini PTY
+function deliverToGeminiImmediate(geminiTabId, geminiTerm, formatted) {
   const prev = geminiCommandQueue.get(geminiTabId) || Promise.resolve();
   geminiCommandQueue.set(geminiTabId, prev.then(async () => {
     await drainPtyData(geminiTerm, 300);
@@ -1678,6 +1820,47 @@ function deliverResultToGemini(geminiTabId, formatted) {
   }).catch(err => {
     console.error('[MCP:Deliver] Error:', err.message);
   }));
+}
+
+// Process queued responses for a Gemini tab.
+// Called when Gemini goes IDLE or user input clears.
+function processGeminiQueue(geminiTabId) {
+  const queue = geminiResponseQueue.get(geminiTabId);
+  if (!queue || queue.length === 0) return;
+
+  const isBusy = geminiSpinnerBusy.get(geminiTabId) || false;
+  const hasInput = geminiInputHasText.get(geminiTabId) || false;
+
+  if (isBusy || hasInput) {
+    console.log('[MCP:Queue] Cannot process queue for tab ' + geminiTabId + ' (busy=' + isBusy + ', hasInput=' + hasInput + ')');
+    return;
+  }
+
+  const geminiTerm = terminals.get(geminiTabId);
+  if (!geminiTerm) {
+    console.log('[MCP:Queue] Terminal not found for tab ' + geminiTabId + ', clearing queue');
+    geminiResponseQueue.delete(geminiTabId);
+    return;
+  }
+
+  // Dequeue first item
+  const item = queue.shift();
+  console.log('[MCP:Queue] Delivering queued response for tab ' + geminiTabId + ' (taskId=' + item.taskId + ', remaining=' + queue.length + ')');
+
+  // Notify renderer about queue update
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('gemini:queue-update', {
+      tabId: geminiTabId,
+      queue: queue.map(q => ({ taskId: q.taskId, tabName: q.tabName, promptPreview: q.promptPreview })),
+    });
+  }
+
+  if (queue.length === 0) {
+    geminiResponseQueue.delete(geminiTabId);
+  }
+
+  // Deliver the item, then try to process next after Gemini goes IDLE again
+  deliverToGeminiImmediate(geminiTabId, geminiTerm, item.formatted);
 }
 
 // Deferred re-check timers for sub-agent completion (prevent duplicate scheduling)
@@ -1846,6 +2029,9 @@ async function handleSubAgentCompletion(claudeTabId, recheckCount) {
   }
 
   // === COMPLETION: Claude is done ===
+  // Clear the safety timeout — task finished before 30 min limit
+  clearTaskTimeout(task._taskId);
+
   console.log('[MCP:Complete] Task ' + task._taskId + ' completed. Reading JSONL response...');
 
   let result = null;
@@ -1876,7 +2062,10 @@ async function handleSubAgentCompletion(claudeTabId, recheckCount) {
   const meta = bridgeMetadata.get(claudeTabId) || null;
   const formatted = formatSubAgentResponse(result, meta, task._taskId, task.tabName);
   console.log('[MCP:Complete] Delivering ' + formatted.length + ' chars to Gemini tab ' + geminiTabId + (meta ? ' (ctx:' + meta.contextPct + '% model:' + meta.model + ')' : ''));
-  deliverResultToGemini(geminiTabId, formatted);
+  deliverResultToGemini(geminiTabId, formatted, task._taskId, task.tabName);
+
+  // Interceptor: set to disarmed after delivery (user must re-arm for manual prompts)
+  subAgentInterceptor.set(claudeTabId, 'disarmed');
 
   // Notify renderer
   if (mainWindow && !mainWindow.isDestroyed()) {
@@ -1885,6 +2074,94 @@ async function handleSubAgentCompletion(claudeTabId, recheckCount) {
       claudeTabId,
       status: 'completed'
     });
+    mainWindow.webContents.send('mcp:interceptor-state', { claudeTabId, state: 'disarmed' });
+  }
+}
+
+// Handle sub-agent completion when interceptor is DISARMED (user doesn't want auto-delivery)
+// Completes the task but sends a notification to Gemini instead of the actual response.
+async function handleSubAgentCompletionDisarmed(claudeTabId) {
+  const geminiTabId = subAgentParentTab.get(claudeTabId);
+
+  // Find and complete the task
+  let task = null;
+  for (const [tid, t] of mcpTasks) {
+    if (t.claudeTabId === claudeTabId && t.status === 'running') {
+      task = t;
+      task._taskId = tid;
+      break;
+    }
+  }
+  if (!task) return;
+
+  clearTaskTimeout(task._taskId);
+  task.status = 'completed';
+
+  // Notify Gemini that response was not delivered
+  if (geminiTabId) {
+    const formatted = '[Claude Sub-Agent Response]\n[Interceptor disarmed by user]\nResponse not delivered. Use continue_claude to send a new prompt.\n[/Claude Sub-Agent Response]';
+    console.log('[MCP:Disarmed] Notifying Gemini about disarmed delivery for task ' + task._taskId);
+    deliverResultToGemini(geminiTabId, formatted, task._taskId, task.tabName);
+  }
+
+  // Keep interceptor as disarmed
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('mcp:task-status', {
+      taskId: task._taskId,
+      claudeTabId,
+      status: 'completed'
+    });
+  }
+}
+
+// Handle re-armed interceptor delivery (user re-armed, Claude finished working on manual prompt)
+async function handleReArmedDelivery(claudeTabId) {
+  const geminiTabId = subAgentParentTab.get(claudeTabId);
+  if (!geminiTabId) {
+    console.log('[MCP:ReArm] No parent tab for: ' + claudeTabId);
+    return;
+  }
+
+  // JSONL Guard: verify Claude actually finished
+  const sessionId = bridgeKnownSessions.get(claudeTabId);
+  const cwd = terminalProjects.get(claudeTabId);
+  if (sessionId) {
+    const { stillWorking } = checkJsonlActivity(sessionId, cwd);
+    if (stillWorking) {
+      console.log('[MCP:ReArm] Claude still working, deferring...');
+      subAgentDeferredCheck.set(claudeTabId, setTimeout(() => {
+        if (subAgentInterceptor.get(claudeTabId) === 'armed') {
+          handleReArmedDelivery(claudeTabId);
+        }
+      }, SUB_AGENT_RECHECK_INTERVAL));
+      return;
+    }
+  }
+
+  const result = readLatestAssistantMessage(sessionId, cwd);
+  if (!result) {
+    console.log('[MCP:ReArm] No response found in JSONL');
+    return;
+  }
+
+  // Find task for metadata
+  let task = null;
+  for (const [, t] of mcpTasks) {
+    if (t.claudeTabId === claudeTabId) { task = t; break; }
+  }
+
+  const meta = bridgeMetadata.get(claudeTabId) || null;
+  const taskName = task ? task.tabName : null;
+  const taskId = task ? task._taskId : null;
+  const formatted = formatSubAgentResponse(result, meta, taskId, taskName);
+
+  console.log('[MCP:ReArm] Delivering re-armed response (' + formatted.length + ' chars) to Gemini tab ' + geminiTabId);
+  deliverResultToGemini(geminiTabId, formatted, taskId, taskName);
+
+  // Reset interceptor to disarmed after delivery
+  subAgentInterceptor.set(claudeTabId, 'disarmed');
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('mcp:interceptor-state', { claudeTabId, state: 'disarmed' });
   }
 }
 
@@ -1897,6 +2174,80 @@ ipcMain.on('mcp:focus-task', (event, taskId) => {
   } else {
     console.log('[MCP:Focus] Task not found or no claudeTabId: ' + taskId);
   }
+});
+
+// IPC: Toggle interceptor state (armed ↔ disarmed) for sub-agent tab
+ipcMain.handle('mcp:toggle-interceptor', (event, claudeTabId) => {
+  const current = subAgentInterceptor.get(claudeTabId);
+  const next = current === 'armed' ? 'disarmed' : 'armed';
+  subAgentInterceptor.set(claudeTabId, next);
+  console.log('[MCP:Interceptor] Toggle ' + claudeTabId + ': ' + current + ' → ' + next);
+
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('mcp:interceptor-state', { claudeTabId, state: next });
+  }
+
+  // If disarmed while task is running → notify Gemini about disarm
+  if (next === 'disarmed') {
+    for (const [tid, task] of mcpTasks) {
+      if (task.claudeTabId === claudeTabId && task.status === 'running') {
+        // Don't cancel the task — just prevent delivery
+        console.log('[MCP:Interceptor] Task ' + tid + ' will not auto-deliver (disarmed by user)');
+        break;
+      }
+    }
+  }
+
+  return { claudeTabId, state: next };
+});
+
+// IPC: Get interceptor state for a sub-agent tab
+ipcMain.handle('mcp:get-interceptor-state', (event, claudeTabId) => {
+  return { claudeTabId, state: subAgentInterceptor.get(claudeTabId) || null };
+});
+
+// IPC: Deliver last response manually (re-arm after IDLE)
+ipcMain.handle('mcp:deliver-last-response', async (event, claudeTabId) => {
+  const geminiTabId = subAgentParentTab.get(claudeTabId);
+  if (!geminiTabId) {
+    console.log('[MCP:ManualDeliver] No parent tab for: ' + claudeTabId);
+    return { error: 'No parent Gemini tab' };
+  }
+
+  const sessionId = bridgeKnownSessions.get(claudeTabId);
+  const cwd = terminalProjects.get(claudeTabId);
+  if (!sessionId) {
+    console.log('[MCP:ManualDeliver] No session ID for tab: ' + claudeTabId);
+    return { error: 'No Claude session ID' };
+  }
+
+  const result = readLatestAssistantMessage(sessionId, cwd);
+  if (!result) {
+    console.log('[MCP:ManualDeliver] No response found in JSONL');
+    return { error: 'No response found' };
+  }
+
+  // Find task for metadata
+  let task = null;
+  for (const [, t] of mcpTasks) {
+    if (t.claudeTabId === claudeTabId) { task = t; break; }
+  }
+
+  const meta = bridgeMetadata.get(claudeTabId) || null;
+  const taskName = task ? task.tabName : null;
+  const taskId = task ? task._taskId : null;
+  const formatted = formatSubAgentResponse(result, meta, taskId, taskName);
+
+  console.log('[MCP:ManualDeliver] Delivering ' + formatted.length + ' chars to Gemini tab ' + geminiTabId);
+  deliverResultToGemini(geminiTabId, formatted, taskId, taskName);
+
+  // Reset interceptor to disarmed after manual delivery
+  subAgentInterceptor.set(claudeTabId, 'disarmed');
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('mcp:interceptor-state', { claudeTabId, state: 'disarmed' });
+  }
+
+  return { success: true };
 });
 
 app.whenReady().then(() => {
@@ -2411,6 +2762,14 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
             geminiSpinnerIdleTimers.delete(tabId);
             if (!geminiSpinnerBusy.get(tabId)) {
               geminiSpinnerBusy.set(tabId, true);
+              // Gemini became busy → user submitted input → clear input state
+              if (geminiInputHasText.get(tabId)) {
+                geminiInputHasText.set(tabId, false);
+                console.log('[GeminiInput] Tab ' + tabId + ': Input cleared (Gemini BUSY)');
+                if (mainWindow && !mainWindow.isDestroyed()) {
+                  mainWindow.webContents.send('gemini:input-state', { tabId, hasText: false });
+                }
+              }
               console.log('[GeminiSpinner] Tab ' + tabId + ': THINKING');
               if (mainWindow && !mainWindow.isDestroyed()) {
                 mainWindow.webContents.send('gemini:busy-state', { tabId, busy: true });
@@ -2426,6 +2785,8 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
               if (mainWindow && !mainWindow.isDestroyed()) {
                 mainWindow.webContents.send('gemini:busy-state', { tabId, busy: false });
               }
+              // Try to process queue after Gemini finishes responding
+              processGeminiQueue(tabId);
             }, 1500));
           }
         }
@@ -2516,13 +2877,26 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
             if (mainWindow && !mainWindow.isDestroyed()) {
               mainWindow.webContents.send('claude:busy-state', { tabId, busy: false });
             }
-            // MCP sub-agent completion
+            // MCP sub-agent completion (with interceptor state check)
             if (subAgentParentTab.has(tabId) && !claudeState.has(tabId) && !claudePendingPrompt.has(tabId)) {
               var hasRunningTask = false;
               for (var _e of mcpTasks) { if (_e[1].claudeTabId === tabId && _e[1].status === 'running') { hasRunningTask = true; break; } }
+              var interceptorVal = subAgentInterceptor.get(tabId);
+
               if (hasRunningTask) {
-                console.log('[Spinner] Sub-agent completion triggered for: ' + tabId);
-                handleSubAgentCompletion(tabId);
+                // Normal MCP flow — check interceptor
+                if (interceptorVal === 'disarmed') {
+                  // User disarmed interceptor during task execution → don't deliver
+                  console.log('[Spinner] Sub-agent completion skipped (interceptor disarmed): ' + tabId);
+                  handleSubAgentCompletionDisarmed(tabId);
+                } else {
+                  console.log('[Spinner] Sub-agent completion triggered for: ' + tabId);
+                  handleSubAgentCompletion(tabId);
+                }
+              } else if (interceptorVal === 'armed') {
+                // No running task but user re-armed → deliver last response manually
+                console.log('[Spinner] Re-armed interceptor delivery for: ' + tabId);
+                handleReArmedDelivery(tabId);
               }
             }
           }, 500));
@@ -2556,6 +2930,8 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
       geminiSpinnerBusy.delete(tabId);
       geminiSpinnerIdleTimers.delete(tabId);
       geminiActiveTabs.delete(tabId);
+      geminiInputHasText.delete(tabId);
+      geminiResponseQueue.delete(tabId);
       // Claude spinner cleanup on PTY exit
       clearTimeout(claudeSpinnerIdleTimer.get(tabId));
       clearTimeout(subAgentDeferredCheck.get(tabId));
@@ -2568,6 +2944,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
       }
       claudeSpinnerBusy.delete(tabId);
       claudeSpinnerIdleTimer.delete(tabId);
+      subAgentInterceptor.delete(tabId);
 
       // MCP: Handle sub-agent PTY exit (Claude crash)
       if (subAgentParentTab.has(tabId)) {
@@ -2580,6 +2957,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
             if (task.claudeTabId === tabId && (task.status === 'running' || task.status === 'handshake')) {
               task.status = 'error';
               task.error = 'Claude process exited with code ' + JSON.stringify(exitCode);
+              clearTaskTimeout(tid);
               deliverResultToGemini(geminiTabId, '[Claude Sub-Agent Error]\nClaude process exited (code: ' + JSON.stringify(exitCode) + ')\n[/Claude Sub-Agent Error]');
               if (mainWindow && !mainWindow.isDestroyed()) {
                 mainWindow.webContents.send('mcp:task-status', { taskId: tid, claudeTabId: tabId, status: 'error' });
@@ -2811,6 +3189,15 @@ async function safePasteAndSubmit(term, content, options = {}) {
   return { success: true, chunksTotal: chunks.length, renderTimeMs: renderTimes };
 }
 
+// Get Gemini response queue state (for renderer initial load)
+ipcMain.handle('gemini:get-queue', (event, tabId) => {
+  const queue = geminiResponseQueue.get(tabId) || [];
+  return {
+    hasText: geminiInputHasText.get(tabId) || false,
+    queue: queue.map(q => ({ taskId: q.taskId, tabName: q.tabName, promptPreview: q.promptPreview })),
+  };
+});
+
 // Send input to terminal
 // Force command-started signal (for Claude commands that bypass OSC 133 detection)
 ipcMain.on('terminal:force-command-started', (event, tabId) => {
@@ -2848,6 +3235,48 @@ ipcMain.on('terminal:input', async (event, tabId, data) => {
     const hasNewline = data.includes('\r') || data.includes('\n');
     console.log(`[terminal:input] tabId=${tabId} len=${data.length} endsWithR=${endsWithR} endsWithN=${endsWithN} hasNewline=${hasNewline}`);
   }
+
+  // ========== GEMINI INPUT STATE TRACKING ==========
+  // Track whether user has text in Gemini input field for response queue system.
+  // Printable chars → hasInput=true. Enter/Ctrl+C/Escape → hasInput=false.
+  if (geminiActiveTabs.has(tabId)) {
+    const prevHasText = geminiInputHasText.get(tabId) || false;
+
+    if (data === '\r' || data === '\x03') {
+      // Enter or Ctrl+C → input submitted/cleared
+      if (prevHasText) {
+        geminiInputHasText.set(tabId, false);
+        console.log('[GeminiInput] Tab ' + tabId + ': Input cleared (submit/cancel)');
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('gemini:input-state', { tabId, hasText: false });
+        }
+        // Try to process queue after input clears (with small delay for submission to complete)
+        setTimeout(() => processGeminiQueue(tabId), 200);
+      }
+    } else if (data === '\x1b' || (data.length >= 2 && data.startsWith('\x1b['))) {
+      // Escape or escape sequence (arrow keys, etc.) — don't change state
+      // These are navigation keys, not text input
+    } else if (data.length === 1 && data.charCodeAt(0) >= 32) {
+      // Printable character → user is typing
+      if (!prevHasText) {
+        geminiInputHasText.set(tabId, true);
+        console.log('[GeminiInput] Tab ' + tabId + ': Input detected (user typing)');
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('gemini:input-state', { tabId, hasText: true });
+        }
+      }
+    } else if (data.length > 1 && !data.startsWith('\x1b')) {
+      // Multi-char paste (not escape sequence) → user pasted text
+      if (!prevHasText) {
+        geminiInputHasText.set(tabId, true);
+        console.log('[GeminiInput] Tab ' + tabId + ': Input detected (paste ' + data.length + ' chars)');
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('gemini:input-state', { tabId, hasText: true });
+        }
+      }
+    }
+  }
+  // ========== END GEMINI INPUT STATE TRACKING ==========
 
   // Suppress Claude Agent detection for user input echo (prevents false triggers
   // when user's text contains :::claude::: examples). PTY echoes this text back
@@ -3364,6 +3793,8 @@ ipcMain.on('terminal:kill', (event, tabId) => {
   claudeAgentBuffer.delete(tabId);
   claudeAgentArmed.delete(tabId);
   geminiActiveTabs.delete(tabId);
+  geminiInputHasText.delete(tabId);
+  geminiResponseQueue.delete(tabId);
   // Claude spinner cleanup on kill
   clearTimeout(claudeSpinnerIdleTimer.get(tabId));
   clearTimeout(subAgentDeferredCheck.get(tabId));
@@ -3376,6 +3807,7 @@ ipcMain.on('terminal:kill', (event, tabId) => {
   }
   claudeSpinnerBusy.delete(tabId);
   claudeSpinnerIdleTimer.delete(tabId);
+  subAgentInterceptor.delete(tabId);
 
   // MCP cleanup: if this is a Gemini tab, cancel sub-agent tasks
   for (const [claudeTabId, geminiTabId] of subAgentParentTab) {
@@ -3407,6 +3839,7 @@ ipcMain.on('terminal:kill', (event, tabId) => {
         if (task.claudeTabId === tabId && task.status === 'running') {
           task.status = 'error';
           task.error = 'Claude sub-agent terminated';
+          clearTaskTimeout(tid);
           deliverResultToGemini(geminiTabId, '[Claude Sub-Agent Error]\nClaude process terminated unexpectedly.\n[/Claude Sub-Agent Error]');
           if (mainWindow && !mainWindow.isDestroyed()) {
             mainWindow.webContents.send('mcp:task-status', { taskId: tid, claudeTabId: tabId, status: 'error' });

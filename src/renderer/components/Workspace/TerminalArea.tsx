@@ -1,4 +1,4 @@
-import React, { memo, useMemo, useEffect, useState, useRef } from 'react';
+import React, { memo, useCallback, useMemo, useEffect, useState, useRef } from 'react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import Terminal from './Terminal';
@@ -6,6 +6,62 @@ import BrowserTab from './BrowserTab';
 import { motion, AnimatePresence } from 'framer-motion';
 
 const { ipcRenderer } = window.require('electron');
+
+// ========== INTERCEPTOR BADGE ==========
+// Shows on sub-agent terminal viewport when Claude is busy.
+// Purple = armed (response will be delivered), Red = disarmed (won't deliver).
+// Clickable to toggle state.
+function InterceptorBadge({ claudeTabId, interceptorState, busy }: {
+  claudeTabId: string;
+  interceptorState: 'armed' | 'disarmed' | null | undefined;
+  busy: boolean;
+}) {
+  if (!busy || !interceptorState) return null;
+
+  const isArmed = interceptorState === 'armed';
+  const bgColor = isArmed ? 'rgba(180, 160, 255, 0.15)' : 'rgba(243, 139, 168, 0.15)';
+  const borderColor = isArmed ? 'rgba(180, 160, 255, 0.4)' : 'rgba(243, 139, 168, 0.4)';
+  const textColor = isArmed ? '#b4a0ff' : '#f38ba8';
+  const label = isArmed ? 'Interceptor ON' : 'Interceptor OFF';
+  const actionHint = isArmed ? 'Click to disarm' : 'Click to arm';
+
+  const handleClick = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    ipcRenderer.invoke('mcp:toggle-interceptor', claudeTabId);
+  };
+
+  return (
+    <button
+      onClick={handleClick}
+      className="flex items-center gap-1.5 rounded transition-all"
+      style={{
+        position: 'absolute',
+        top: '8px',
+        right: '12px',
+        zIndex: 100,
+        backgroundColor: bgColor,
+        border: `1px solid ${borderColor}`,
+        color: textColor,
+        padding: '4px 10px',
+        fontSize: '11px',
+        cursor: 'pointer',
+        backdropFilter: 'blur(8px)',
+      }}
+      title={`${label}\n${actionHint}`}
+    >
+      <span
+        style={{
+          fontSize: '8px',
+          lineHeight: 1,
+          animation: 'tab-dot-pulse 1.5s ease-in-out infinite',
+        }}
+      >
+        {'\u25CF'}
+      </span>
+      <span>{label}</span>
+    </button>
+  );
+}
 
 // Overlay for interrupted Claude sessions
 const InterruptedSessionOverlay = memo(({ tabId, sessionId, onContinue, onDismiss }: {
@@ -122,6 +178,23 @@ interface TerminalAreaProps {
 
 function TerminalArea({ projectId }: TerminalAreaProps) {
   const viewingSubAgentTabId = useWorkspaceStore((s) => s.openProjects.get(projectId)?.viewingSubAgentTabId ?? null);
+
+  // Interceptor badge: get sub-agent tab's busy + interceptor state
+  const subAgentBadgeProps = useWorkspaceStore((s) => {
+    if (!viewingSubAgentTabId) return null;
+    for (const [, workspace] of s.openProjects) {
+      const tab = workspace.tabs.get(viewingSubAgentTabId);
+      if (tab) {
+        return {
+          claudeTabId: tab.id,
+          interceptorState: tab.interceptorState,
+          busy: tab.claudeBusy === true,
+        };
+      }
+    }
+    return null;
+  });
+
   // DEBUG: Track TerminalArea mount/unmount lifecycle
   useEffect(() => {
     console.warn('[TerminalArea:MOUNT] projectId=', projectId);
@@ -312,6 +385,15 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
     >
       {/* Render all terminals from all projects */}
       {terminals}
+
+      {/* Interceptor badge on sub-agent viewport */}
+      {subAgentBadgeProps && (
+        <InterceptorBadge
+          claudeTabId={subAgentBadgeProps.claudeTabId}
+          interceptorState={subAgentBadgeProps.interceptorState}
+          busy={subAgentBadgeProps.busy}
+        />
+      )}
 
       {/* Interrupted session overlay */}
       <AnimatePresence>
