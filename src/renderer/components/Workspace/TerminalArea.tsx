@@ -180,20 +180,27 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
   const viewingSubAgentTabId = useWorkspaceStore((s) => s.openProjects.get(projectId)?.viewingSubAgentTabId ?? null);
 
   // Interceptor badge: get sub-agent tab's busy + interceptor state
-  const subAgentBadgeProps = useWorkspaceStore((s) => {
+  // IMPORTANT: separate primitive selectors to avoid infinite re-render loop.
+  // Returning a new object from useWorkspaceStore selector causes Object.is mismatch → re-render → new object → loop.
+  const subAgentInterceptorState = useWorkspaceStore((s) => {
     if (!viewingSubAgentTabId) return null;
     for (const [, workspace] of s.openProjects) {
       const tab = workspace.tabs.get(viewingSubAgentTabId);
-      if (tab) {
-        return {
-          claudeTabId: tab.id,
-          interceptorState: tab.interceptorState,
-          busy: tab.claudeBusy === true,
-        };
-      }
+      if (tab) return tab.interceptorState ?? null;
     }
     return null;
   });
+  const subAgentBusy = useWorkspaceStore((s) => {
+    if (!viewingSubAgentTabId) return false;
+    for (const [, workspace] of s.openProjects) {
+      const tab = workspace.tabs.get(viewingSubAgentTabId);
+      if (tab) return tab.claudeBusy === true;
+    }
+    return false;
+  });
+  const subAgentBadgeProps = viewingSubAgentTabId && (subAgentInterceptorState || subAgentBusy)
+    ? { claudeTabId: viewingSubAgentTabId, interceptorState: subAgentInterceptorState, busy: subAgentBusy }
+    : null;
 
   // DEBUG: Track TerminalArea mount/unmount lifecycle
   useEffect(() => {

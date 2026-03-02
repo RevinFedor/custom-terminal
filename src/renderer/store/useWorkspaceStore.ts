@@ -101,7 +101,7 @@ interface WorkspaceStore {
 
   // Tab management
   createTab: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; tabType?: TabType; url?: string; background?: boolean }) => Promise<string>;
-  createTabAfterCurrent: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; tabType?: TabType; url?: string }) => Promise<string>;
+  createTabAfterCurrent: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; tabType?: TabType; url?: string; afterTabId?: string }) => Promise<string>;
   closeTab: (projectId: string, tabId: string, options?: { skipProcessCheck?: boolean }) => Promise<void>;
   switchTab: (projectId: string, tabId: string) => void;
   renameTab: (projectId: string, tabId: string, newName: string) => void;
@@ -739,31 +739,31 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     console.log('[Store:createTabAfterCurrent] Terminal created with pid:', pid);
     newTab.pid = pid;
 
-    // Insert after current tab (or at end if no active tab)
-    const currentActiveTabId = workspace.activeTabId;
+    // Insert after specified tab or current active tab (or at end if no active tab)
+    const referenceTabId = options?.afterTabId || workspace.activeTabId;
     const tabsArray = Array.from(workspace.tabs.entries());
     const isUtility = options?.isUtility || false;
 
-    // Find position: after current tab in same zone, or at end of zone
+    // Find position: after reference tab in same zone, or at end of zone
     let insertIndex = tabsArray.length;
 
-    if (currentActiveTabId && !isUtility) {
-      // Find current active tab index
-      const currentIndex = tabsArray.findIndex(([id]) => id === currentActiveTabId);
+    if (referenceTabId && !isUtility) {
+      // Find reference tab index
+      const currentIndex = tabsArray.findIndex(([id]) => id === referenceTabId);
       if (currentIndex !== -1) {
         // Find the first utility tab to know where main zone ends
         const firstUtilityIndex = tabsArray.findIndex(([_, tab]) => tab.isUtility);
         if (firstUtilityIndex === -1) {
-          // No utility tabs, insert right after current
+          // No utility tabs, insert right after reference
           insertIndex = currentIndex + 1;
         } else if (currentIndex < firstUtilityIndex) {
-          // Current is in main zone, insert after it but before utility zone
+          // Reference is in main zone, insert after it but before utility zone
           insertIndex = Math.min(currentIndex + 1, firstUtilityIndex);
         }
       }
-    } else if (currentActiveTabId && isUtility) {
-      // Insert after current utility tab
-      const currentIndex = tabsArray.findIndex(([id]) => id === currentActiveTabId);
+    } else if (referenceTabId && isUtility) {
+      // Insert after reference utility tab
+      const currentIndex = tabsArray.findIndex(([id]) => id === referenceTabId);
       if (currentIndex !== -1 && tabsArray[currentIndex]?.[1]?.isUtility) {
         insertIndex = currentIndex + 1;
       }

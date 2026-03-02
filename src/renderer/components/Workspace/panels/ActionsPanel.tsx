@@ -29,7 +29,7 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
     copyIncludeSubagentResult: includeSubagentResult, setCopyIncludeSubagentResult: setIncludeSubagentResult,
     copyIncludeSubagentHistory: includeSubagentHistory, setCopyIncludeSubagentHistory: setIncludeSubagentHistory,
   } = useUIStore();
-  const { activeProjectId, createTab, closeTab, getActiveProject, switchTab, getSelectedTabs, clearSelection } = useWorkspaceStore();
+  const { activeProjectId, createTabAfterCurrent, closeTab, getActiveProject, switchTab, getSelectedTabs, clearSelection } = useWorkspaceStore();
   const [isUpdatingDocs, setIsUpdatingDocs] = useState(false);
   const cancelledRef = useRef(false);
   const docsGeminiTabIdRef = useRef<string | null>(null);
@@ -442,12 +442,26 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
 
       if (cancelledRef.current) return;
 
-      // 4. Create Gemini tab
+      // 4. Create Gemini tab (insert after current tab, or after last selected if multi-select)
       const existingDocsTabs = Array.from(activeProject.tabs.values())
         .filter(t => t.name.startsWith('docs-gemini-')).length;
       const tabName = `docs-gemini-${String(existingDocsTabs + 1).padStart(2, '0')}`;
 
-      const newTabId = await createTab(activeProjectId, tabName, workingDir, { color: 'gemini', isUtility: false });
+      // For multi-select: find the rightmost selected tab by position in tab list
+      let afterTabId: string | undefined;
+      if (selectedTabs.length > 1) {
+        const tabsArray = Array.from(activeProject.tabs.keys());
+        let maxIndex = -1;
+        for (const st of selectedTabs) {
+          const idx = tabsArray.indexOf(st.id);
+          if (idx > maxIndex) {
+            maxIndex = idx;
+            afterTabId = st.id;
+          }
+        }
+      }
+
+      const newTabId = await createTabAfterCurrent(activeProjectId, tabName, workingDir, { color: 'gemini', isUtility: false, afterTabId });
       if (!newTabId) throw new Error('Failed to create tab');
       docsGeminiTabIdRef.current = newTabId;
       useWorkspaceStore.getState().setTabCommandType(newTabId, 'gemini');
