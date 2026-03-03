@@ -51,6 +51,7 @@ interface Tab {
   claudeBusy?: boolean; // True if Claude CLI spinner is active (from claude:busy-state)
   claudeTaskCount?: number; // Number of completed MCP tasks (delegate/continue)
   parentTabId?: string; // If this is a MCP sub-agent tab, points to parent (Gemini) tab
+  mcpTaskId?: string; // MCP task UUID assigned when delegate_to_claude created this sub-agent
   interceptorState?: 'armed' | 'disarmed' | null; // Interceptor state for MCP response delivery
 }
 
@@ -102,7 +103,7 @@ interface WorkspaceStore {
   // Tab management
   createTab: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; tabType?: TabType; url?: string; background?: boolean }) => Promise<string>;
   createTabAfterCurrent: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; tabType?: TabType; url?: string; afterTabId?: string }) => Promise<string>;
-  closeTab: (projectId: string, tabId: string, options?: { skipProcessCheck?: boolean }) => Promise<void>;
+  closeTab: (projectId: string, tabId: string, options?: { skipProcessCheck?: boolean; forceCleanup?: boolean }) => Promise<void>;
   switchTab: (projectId: string, tabId: string) => void;
   renameTab: (projectId: string, tabId: string, newName: string) => void;
 
@@ -218,7 +219,8 @@ const getNextAvailableName = (baseName: string, existingNames: string[]): string
 let saveSessionTimer: NodeJS.Timeout | null = null;
 
 // Helper to save tabs to database (immediate, no debounce)
-const saveTabs = (projectId: string, tabs: Map<string, Tab>) => {
+// forceCleanup: bypass safety guard when reduction is intentional (batch move/close)
+const saveTabs = (projectId: string, tabs: Map<string, Tab>, forceCleanup = false) => {
   const tabsArray = Array.from(tabs.values()).map((tab) => ({
     name: tab.name,
     cwd: tab.cwd,
@@ -239,9 +241,11 @@ const saveTabs = (projectId: string, tabs: Map<string, Tab>) => {
     isCollapsed: tab.isCollapsed,
     nameSetManually: tab.nameSetManually,
     parentTabId: tab.parentTabId,
+    mcpTaskId: tab.mcpTaskId,
+    claudeTaskCount: tab.claudeTaskCount || 0,
     tabId: tab.id
   }));
-  ipcRenderer.invoke('project:save-tabs', { projectId, tabs: tabsArray });
+  ipcRenderer.invoke('project:save-tabs', { projectId, tabs: tabsArray, forceCleanup });
 };
 
 export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
@@ -515,6 +519,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
               isCollapsed: savedTab.isCollapsed,
               nameSetManually: savedTab.nameSetManually,
               parentTabId: savedTab.parentTabId,
+              mcpTaskId: savedTab.mcpTaskId,
+              claudeTaskCount: savedTab.claudeTaskCount || 0,
               restoreId: savedTab.tabId
             } as any);
           }
@@ -643,7 +649,9 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       createdAt: (options as any)?.createdAt || Math.floor(Date.now() / 1000),
       isCollapsed: (options as any)?.isCollapsed,
       nameSetManually: (options as any)?.nameSetManually,
-      parentTabId: (options as any)?.parentTabId
+      parentTabId: (options as any)?.parentTabId,
+      mcpTaskId: (options as any)?.mcpTaskId,
+      claudeTaskCount: (options as any)?.claudeTaskCount || 0
     };
 
     console.log('[Store] createTab: Creating PTY terminal for:', tabId, 'cwd:', newTab.cwd);
@@ -674,10 +682,12 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     }
 
     console.log('[Store] createTab: Setting state, tabs count:', workspace.tabs.size, 'isRestoring:', isRestoring);
-    set({ openProjects: new Map(openProjects) });
 
-    // Save tabs
-    saveTabs(workspace.projectId, workspace.tabs);
+    // During restore, skip per-tab state updates and DB writes — openProject will batch them at the end
+    if (!isRestoring) {
+      set({ openProjects: new Map(openProjects) });
+      saveTabs(workspace.projectId, workspace.tabs);
+    }
 
     console.log('[Store] createTab: Done, returning tabId:', tabId);
     return tabId;
@@ -868,8 +878,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       set({ openProjects: new Map(openProjects) });
     });
 
-    // Save tabs
-    saveTabs(workspace.projectId, workspace.tabs);
+    // Save tabs (forceCleanup when called from batch close)
+    saveTabs(workspace.projectId, workspace.tabs, options?.forceCleanup);
   },
 
   switchTab: (projectId, tabId) => {
@@ -878,7 +888,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
 
     if (workspace && workspace.tabs.has(tabId)) {
       workspace.activeTabId = tabId;
-      workspace.viewingSubAgentTabId = null; // Reset sub-agent view on tab switch
+      // Don't reset viewingSubAgentTabId here — it persists across tab switches.
+      // User dismisses it explicitly via SubAgentBar "← Back" button or clicking the active chip.
       workspace.selectedTabIds = [tabId]; // Update selection on direct switch
       // Push to tab history (LRU, max 20)
       workspace.tabHistory = [...workspace.tabHistory.filter(id => id !== tabId), tabId].slice(-20);
@@ -1177,7 +1188,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     if (lastId) tgt.activeTabId = lastId;
 
     set({ openProjects: new Map(openProjects) });
-    saveTabs(src.projectId, src.tabs);
+    saveTabs(src.projectId, src.tabs, true);  // forceCleanup: intentional batch move
     saveTabs(tgt.projectId, tgt.tabs);
 
     log.tabs(`[moveTabsToProject] Moved ${tabIds.length} tabs from ${sourceProjectId} to ${targetProjectId}`);
@@ -1273,12 +1284,15 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     for (const [projectId, workspace] of openProjects) {
       const tab = workspace.tabs.get(tabId);
       if (tab) {
+        // Guard: skip if unchanged (Sniper Watcher may fire with same ID)
+        if (tab.geminiSessionId === sessionId) return;
         tab.geminiSessionId = sessionId;
         // Reset overlay flags when new session starts (so overlay shows again if interrupted)
         tab.wasInterrupted = false;
         tab.overlayDismissed = false;
         console.log(`[Workspace] Gemini session set for tab ${tabId}: ${sessionId} (reset overlay flags)`);
         saveTabs(workspace.projectId, workspace.tabs);
+        set({});
         return;
       }
     }
@@ -1407,8 +1421,11 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     for (const [, workspace] of openProjects) {
       const tab = workspace.tabs.get(tabId);
       if (tab) {
+        // Guard: skip if unchanged
+        if (tab.notes === notes) return;
         tab.notes = notes;
         saveTabs(workspace.projectId, workspace.tabs);
+        set({});
         return;
       }
     }
@@ -1457,8 +1474,11 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     for (const [, workspace] of openProjects) {
       const tab = workspace.tabs.get(tabId);
       if (tab) {
+        // Guard: skip if unchanged
+        if (tab.url === url) return;
         tab.url = url;
         saveTabs(workspace.projectId, workspace.tabs);
+        set({});
         return;
       }
     }
@@ -1534,6 +1554,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   // Mark all tabs with active AI sessions as interrupted (called on shutdown)
   markAllSessionsInterrupted: () => {
     const { openProjects } = get();
+    let anyChanged = false;
 
     for (const [projectId, workspace] of openProjects) {
       let changed = false;
@@ -1543,6 +1564,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         if ((tab.claudeSessionId || tab.geminiSessionId) && !tab.wasInterrupted && !tab.overlayDismissed) {
           tab.wasInterrupted = true;
           changed = true;
+          anyChanged = true;
           console.log('[Store] Marking tab as interrupted:', tabId, 'claude:', tab.claudeSessionId, 'gemini:', tab.geminiSessionId);
         }
       }
@@ -1551,6 +1573,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         saveTabs(workspace.projectId, workspace.tabs);
       }
     }
+    // Notify subscribers (future-proof: currently called at shutdown, but may be used elsewhere)
+    if (anyChanged) set({});
   },
 
   // Save session immediately without debounce (for shutdown)

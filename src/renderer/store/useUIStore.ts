@@ -17,6 +17,15 @@ export type AIModel = 'gemini-3-flash-preview' | 'gemini-3-pro-preview';
 
 export type ThinkingLevel = 'NONE' | 'LOW' | 'MEDIUM' | 'HIGH';
 
+export type ApiGeminiModel = 'gemini-3-flash-preview' | 'gemini-3-pro-preview';
+export type ApiClaudeModel = 'claude-opus-4.6' | 'claude-sonnet-4.5';
+
+export interface ApiSettings {
+  claudeModel: ApiClaudeModel;
+  geminiModel: ApiGeminiModel;
+  geminiThinking: ThinkingLevel;
+}
+
 
 interface DocPromptSettings {
 
@@ -227,6 +236,15 @@ interface UIStore {
   setTabNotesPaddingX: (px: number) => void;
   tabNotesPaddingY: number;
   setTabNotesPaddingY: (px: number) => void;
+
+  // API Settings Modal
+  apiSettingsOpen: boolean;
+  openApiSettings: () => void;
+  closeApiSettings: () => void;
+  apiSettings: ApiSettings;
+  setApiClaudeModel: (model: ApiClaudeModel) => void;
+  setApiGeminiModel: (model: ApiGeminiModel) => void;
+  setApiGeminiThinking: (level: ThinkingLevel) => void;
 
 }
 
@@ -511,6 +529,34 @@ const loadDragAreaWidth = (): number => {
   return 300;
 };
 const initialDragAreaWidth = loadDragAreaWidth();
+
+// API Settings (for [api] button in ActionsPanel)
+const loadApiSettings = (): ApiSettings => {
+  try {
+    const saved = localStorage.getItem('noted-terminal-api-settings');
+    if (saved) {
+      const parsed = JSON.parse(saved);
+      return {
+        claudeModel: parsed.claudeModel || 'claude-sonnet-4.5',
+        geminiModel: parsed.geminiModel || 'gemini-3-flash-preview',
+        geminiThinking: parsed.geminiThinking || 'HIGH',
+      };
+    }
+  } catch (e) {
+    console.error('Failed to load API settings:', e);
+  }
+  return { claudeModel: 'claude-sonnet-4.5', geminiModel: 'gemini-3-flash-preview', geminiThinking: 'HIGH' };
+};
+
+const saveApiSettings = (settings: ApiSettings) => {
+  try {
+    localStorage.setItem('noted-terminal-api-settings', JSON.stringify(settings));
+  } catch (e) {
+    console.error('Failed to save API settings:', e);
+  }
+};
+
+const initialApiSettings = loadApiSettings();
 
 export const useUIStore = create<UIStore>((set, get) => ({
   // Font Settings
@@ -841,6 +887,30 @@ export const useUIStore = create<UIStore>((set, get) => ({
     const clamped = Math.max(0, Math.min(32, px));
     set({ tabNotesPaddingY: clamped });
     localStorage.setItem('noted-terminal-tab-notes-padding-y', String(clamped));
+  },
+
+  // API Settings Modal
+  apiSettingsOpen: false,
+  openApiSettings: () => set({ apiSettingsOpen: true }),
+  closeApiSettings: () => set({ apiSettingsOpen: false }),
+  apiSettings: initialApiSettings,
+  setApiClaudeModel: (model) => {
+    const current = get().apiSettings;
+    const updated = { ...current, claudeModel: model };
+    set({ apiSettings: updated });
+    saveApiSettings(updated);
+  },
+  setApiGeminiModel: (model) => {
+    const current = get().apiSettings;
+    const updated = { ...current, geminiModel: model };
+    set({ apiSettings: updated });
+    saveApiSettings(updated);
+  },
+  setApiGeminiThinking: (level) => {
+    const current = get().apiSettings;
+    const updated = { ...current, geminiThinking: level };
+    set({ apiSettings: updated });
+    saveApiSettings(updated);
   },
 
   // Focus Area

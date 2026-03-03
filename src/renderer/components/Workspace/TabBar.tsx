@@ -437,8 +437,7 @@ const TabItem = memo(({
     borderLeft: !isHorizontal ? getLeftBorder() : 'none',
     opacity: isDragging ? 0.5 : (draggingGroupIds.includes(tab.id) && !isDragging ? 0.5 : (isCollapsed && !isActive ? 0.6 : 1)),
     transition: 'color 0.15s ease, background-color 0.15s ease',
-    outline: isViewingSubAgent ? '2px solid rgba(168, 85, 247, 0.6)' : 'none',
-    outlineOffset: isViewingSubAgent ? '-2px' : undefined,
+    borderRight: isViewingSubAgent ? '2px solid rgba(168, 85, 247, 0.6)' : 'none',
   };
 
   return (
@@ -1057,7 +1056,7 @@ function TabBar({ projectId }: TabBarProps) {
 
       if (confirmed) {
         for (const id of selectedTabIds) {
-          await closeTab(projectId, id, { skipProcessCheck: true });
+          await closeTab(projectId, id, { skipProcessCheck: true, forceCleanup: true });
         }
       }
     } else {
@@ -1613,7 +1612,7 @@ function TabBar({ projectId }: TabBarProps) {
 
                 if (confirmed) {
                   for (const id of selectedTabIds) {
-                    await closeTab(projectId, id, { skipProcessCheck: true });
+                    await closeTab(projectId, id, { skipProcessCheck: true, forceCleanup: true });
                   }
                 }
               } else {

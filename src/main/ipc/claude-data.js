@@ -6,6 +6,13 @@ const crypto = require('crypto');
 
 let _projectManager = null;
 
+// ========== JSONL INCREMENTAL CACHE ==========
+// JSONL is append-only — when file grows we only parse NEW bytes, not the whole file.
+// For a 159MB session file: first read ~3.5s, all subsequent reads ~0ms (if no new entries)
+// or microseconds (if only a few new lines added).
+const _jsonlCache = new Map();
+// filePath → { size, mtimeMs, recordMap, lastRecord, bridgeSessionId, progressEntries }
+
 // ========== SESSION CHAIN HELPERS ==========
 
 // Find a JSONL session file by ID, searching cwd-based path first, then all project dirs
@@ -38,24 +45,16 @@ function findSessionFile(sessionId, cwd) {
   }
 }
 
-// Load all records from a JSONL file into a Map (uuid → record)
-// Returns { recordMap, lastRecord, bridgeSessionId }
-// bridgeSessionId is set if the first entry references a different session (clear-context bridge)
-function loadJsonlRecords(filePath) {
-  const content = fs.readFileSync(filePath, 'utf-8');
-  const lines = content.trim().split('\n').filter(line => line.trim());
-  const sessionId = path.basename(filePath, '.jsonl');
-
-  const recordMap = new Map();
-  const progressEntries = [];
+// Parse JSONL lines into an existing recordMap (shared logic for full + incremental reads)
+function _parseJsonlLines(lines, sessionId, recordMap, progressEntries, startFileIndex, bridgeSessionIdIn) {
   let lastRecord = null;
-  let bridgeSessionId = null;
-  let fileIndex = 0;
+  let bridgeSessionId = bridgeSessionIdIn;
+  let fileIndex = startFileIndex;
 
   for (const line of lines) {
+    if (!line.trim()) continue;
     try {
       const entry = JSON.parse(line);
-      // Collect agent_progress entries (sub-agent turns from Task tool)
       if (entry.type === 'progress' && entry.data?.type === 'agent_progress' && entry.parentToolUseID) {
         progressEntries.push(entry);
       }
@@ -64,16 +63,92 @@ function loadJsonlRecords(filePath) {
         entry._fromFile = sessionId;
         recordMap.set(entry.uuid, entry);
         lastRecord = entry;
-        // Detect bridge: first entry with uuid that has a different sessionId
         if (bridgeSessionId === null && entry.sessionId && entry.sessionId !== sessionId) {
           bridgeSessionId = entry.sessionId;
-          entry._isBridge = true; // Mark for backtrace bridge following
+          entry._isBridge = true;
         } else if (bridgeSessionId === null && entry.sessionId === sessionId) {
-          bridgeSessionId = undefined; // No bridge
+          bridgeSessionId = undefined;
         }
       }
     } catch {}
   }
+
+  return { lastRecord, bridgeSessionId, fileIndex };
+}
+
+// Load all records from a JSONL file into a Map (uuid → record)
+// Incremental: JSONL is append-only — when file grows we only parse NEW bytes.
+// First read of a 159MB file takes ~3.5s (CPU-bound JSON parse).
+// Subsequent reads with new entries only parse the delta — near-instant.
+async function loadJsonlRecords(filePath) {
+  let stat;
+  try {
+    stat = fs.statSync(filePath);
+  } catch {
+    return { recordMap: new Map(), lastRecord: null, bridgeSessionId: null, progressEntries: [] };
+  }
+
+  const cached = _jsonlCache.get(filePath);
+  const sessionId = path.basename(filePath, '.jsonl');
+
+  // ── Case 1: File unchanged → return cached result immediately ──────────────
+  if (cached && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs) {
+    return { recordMap: cached.recordMap, lastRecord: cached.lastRecord, bridgeSessionId: cached.bridgeSessionId, progressEntries: cached.progressEntries };
+  }
+
+  // ── Case 2: File grew (normal for active sessions) → read ONLY new bytes ──
+  if (cached && stat.size > cached.size) {
+    const fd = await fs.promises.open(filePath, 'r');
+    let newContent = '';
+    try {
+      const newByteCount = stat.size - cached.size;
+      const buf = Buffer.allocUnsafe(newByteCount);
+      await fd.read(buf, 0, newByteCount, cached.size);
+      newContent = buf.toString('utf-8');
+    } finally {
+      await fd.close();
+    }
+
+    // The first "line" may be a partial line from the previous read — prepend leftover
+    const content = (cached.leftover || '') + newContent;
+    const lines = content.split('\n');
+    // Last element may be incomplete (file written mid-line) — save as leftover
+    const leftover = lines.pop();
+
+    const { lastRecord, bridgeSessionId, fileIndex } = _parseJsonlLines(
+      lines, sessionId, cached.recordMap, cached.progressEntries,
+      cached.fileIndex, cached.bridgeSessionId
+    );
+
+    const newLastRecord = lastRecord || cached.lastRecord;
+    const newBridgeId = bridgeSessionId !== undefined ? bridgeSessionId : cached.bridgeSessionId;
+
+    _jsonlCache.set(filePath, {
+      size: stat.size, mtimeMs: stat.mtimeMs, leftover: leftover || '',
+      recordMap: cached.recordMap, lastRecord: newLastRecord,
+      bridgeSessionId: newBridgeId, progressEntries: cached.progressEntries,
+      fileIndex
+    });
+
+    return { recordMap: cached.recordMap, lastRecord: newLastRecord, bridgeSessionId: newBridgeId, progressEntries: cached.progressEntries };
+  }
+
+  // ── Case 3: First read or file shrunk (shouldn't happen for JSONL) → full read ──
+  const content = await fs.promises.readFile(filePath, 'utf-8');
+  const lines = content.split('\n');
+  const leftover = lines.pop(); // may be incomplete last line
+
+  const recordMap = new Map();
+  const progressEntries = [];
+  const { lastRecord, bridgeSessionId, fileIndex } = _parseJsonlLines(
+    lines, sessionId, recordMap, progressEntries, 0, null
+  );
+
+  _jsonlCache.set(filePath, {
+    size: stat.size, mtimeMs: stat.mtimeMs, leftover: leftover || '',
+    recordMap, lastRecord, bridgeSessionId: bridgeSessionId || null,
+    progressEntries, fileIndex
+  });
 
   return { recordMap, lastRecord, bridgeSessionId: bridgeSessionId || null, progressEntries };
 }
@@ -82,7 +157,7 @@ function loadJsonlRecords(filePath) {
 // Returns a merged recordMap with all records from all files in the chain,
 // plus metadata about session boundaries.
 // sessionBoundaries: array of { childSessionId, parentSessionId, bridgeUuid }
-function resolveSessionChain(sessionId, cwd, maxDepth = 10) {
+async function resolveSessionChain(sessionId, cwd, maxDepth = 10) {
   const mergedMap = new Map();
   const allProgressEntries = [];
   const sessionBoundaries = [];
@@ -97,7 +172,7 @@ function resolveSessionChain(sessionId, cwd, maxDepth = 10) {
       break;
     }
 
-    const { recordMap, lastRecord: fileLastRecord, bridgeSessionId, progressEntries } = loadJsonlRecords(found.filePath);
+    const { recordMap, lastRecord: fileLastRecord, bridgeSessionId, progressEntries } = await loadJsonlRecords(found.filePath);
     if (progressEntries.length > 0) {
       allProgressEntries.push(...progressEntries);
     }
@@ -320,7 +395,7 @@ function register({ projectManager, formatToolAction }) {
     try {
       // Use the same chain resolution as claude:get-timeline
       // This ensures we can find UUIDs across plan mode boundaries
-      const { mergedMap: recordMap, lastRecord, sessionBoundaries, progressEntries: allProgressEntries } = resolveSessionChain(sessionId, cwd);
+      const { mergedMap: recordMap, lastRecord, sessionBoundaries, progressEntries: allProgressEntries } = await resolveSessionChain(sessionId, cwd);
 
       // Build progress entries index by parentToolUseID
       const progressByToolUseId = new Map();
@@ -606,7 +681,7 @@ function register({ projectManager, formatToolAction }) {
 
     try {
       // Resolve the full session chain (follows bridge entries across "Clear Context" boundaries)
-      const { mergedMap: recordMap, lastRecord, sessionBoundaries } = resolveSessionChain(sessionId, cwd);
+      const { mergedMap: recordMap, lastRecord, sessionBoundaries } = await resolveSessionChain(sessionId, cwd);
 
       if (!lastRecord) {
         return { success: true, entries: [] };
@@ -835,7 +910,7 @@ function register({ projectManager, formatToolAction }) {
     try {
       // Resolve the full session chain (follows bridge entries across "Clear Context" boundaries)
       // Same as Timeline — loads all JSONL files in the chain and merges records
-      const { mergedMap: recordMap, lastRecord, sessionBoundaries, progressEntries: allProgressEntries } = resolveSessionChain(sessionId, cwd);
+      const { mergedMap: recordMap, lastRecord, sessionBoundaries, progressEntries: allProgressEntries } = await resolveSessionChain(sessionId, cwd);
 
       console.log('[Claude Export] Merged records:', recordMap.size, '| Chain depth:', sessionBoundaries.length + 1, '| Progress entries:', allProgressEntries.length);
       console.log('[Claude Export] Last record type:', lastRecord?.type);
@@ -1274,7 +1349,7 @@ function register({ projectManager, formatToolAction }) {
     }
 
     try {
-      const { mergedMap: recordMap, lastRecord, sessionBoundaries, progressEntries: allProgressEntries } = resolveSessionChain(sessionId, cwd);
+      const { mergedMap: recordMap, lastRecord, sessionBoundaries, progressEntries: allProgressEntries } = await resolveSessionChain(sessionId, cwd);
 
       // Build progress entries index by parentToolUseID
       const progressByToolUseId = new Map();

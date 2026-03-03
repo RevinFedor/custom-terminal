@@ -248,6 +248,12 @@ class DatabaseManager {
     // Migration: add mcp_task_started_at for sub-agent timeout tracking
     try { this.db.exec(`ALTER TABLE tabs ADD COLUMN mcp_task_started_at INTEGER DEFAULT NULL`); } catch (e) {}
 
+    // Migration: add mcp_task_id to persist MCP task IDs across restarts
+    try { this.db.exec(`ALTER TABLE tabs ADD COLUMN mcp_task_id TEXT DEFAULT NULL`); } catch (e) {}
+
+    // Migration: add claude_task_count to persist iteration counter across restarts
+    try { this.db.exec(`ALTER TABLE tabs ADD COLUMN claude_task_count INTEGER DEFAULT 0`); } catch (e) {}
+
     // Index on tab_id for faster lookups in saveTabs
     try { this.db.exec(`CREATE INDEX IF NOT EXISTS idx_tabs_tab_id ON tabs(tab_id) WHERE tab_id IS NOT NULL`); } catch (e) {}
 
@@ -370,7 +376,9 @@ class DatabaseManager {
         isCollapsed: t.is_collapsed === 1,
         parentTabId: t.parent_tab_id || undefined,
         tabId: t.tab_id || undefined,
-        mcpTaskStartedAt: t.mcp_task_started_at || undefined
+        mcpTaskStartedAt: t.mcp_task_started_at || undefined,
+        mcpTaskId: t.mcp_task_id || undefined,
+        claudeTaskCount: t.claude_task_count || 0
       }))
     };
   }
@@ -467,7 +475,7 @@ class DatabaseManager {
 
   // ========== TABS ========== 
 
-  saveTabs(projectId, tabs) {
+  saveTabs(projectId, tabs, forceCleanup = false) {
     // Check if project exists to avoid FOREIGN KEY constraint error
     const projectExists = this.db.prepare('SELECT 1 FROM projects WHERE id = ?').get(projectId);
     if (!projectExists) {
@@ -489,8 +497,8 @@ class DatabaseManager {
 
     const deleteByTabId = this.db.prepare('DELETE FROM tabs WHERE project_id = ? AND tab_id = ?');
     const insert = this.db.prepare(`
-      INSERT INTO tabs (project_id, name, cwd, position, color, is_utility, command_type, claude_session_id, gemini_session_id, was_interrupted, overlay_dismissed, notes, tab_type, url, terminal_id, terminal_name, active_view, created_at, is_collapsed, parent_tab_id, tab_id, mcp_task_started_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO tabs (project_id, name, cwd, position, color, is_utility, command_type, claude_session_id, gemini_session_id, was_interrupted, overlay_dismissed, notes, tab_type, url, terminal_id, terminal_name, active_view, created_at, is_collapsed, parent_tab_id, tab_id, mcp_task_started_at, mcp_task_id, claude_task_count)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     const transaction = this.db.transaction((tabList) => {
@@ -505,13 +513,13 @@ class DatabaseManager {
 
       // Step 3: Insert all tabs fresh
       tabList.forEach((tab, index) => {
-        insert.run(projectId, tab.name, tab.cwd, index, tab.color || null, tab.isUtility ? 1 : 0, tab.commandType || null, tab.claudeSessionId || null, tab.geminiSessionId || null, tab.wasInterrupted ? 1 : 0, tab.overlayDismissed ? 1 : 0, tab.notes || '', tab.tabType || 'terminal', tab.url || null, tab.terminalId || null, tab.terminalName || null, tab.activeView || null, tab.createdAt || null, tab.isCollapsed ? 1 : 0, tab.parentTabId || null, tab.tabId || null, tab.mcpTaskStartedAt || null);
+        insert.run(projectId, tab.name, tab.cwd, index, tab.color || null, tab.isUtility ? 1 : 0, tab.commandType || null, tab.claudeSessionId || null, tab.geminiSessionId || null, tab.wasInterrupted ? 1 : 0, tab.overlayDismissed ? 1 : 0, tab.notes || '', tab.tabType || 'terminal', tab.url || null, tab.terminalId || null, tab.terminalName || null, tab.activeView || null, tab.createdAt || null, tab.isCollapsed ? 1 : 0, tab.parentTabId || null, tab.tabId || null, tab.mcpTaskStartedAt || null, tab.mcpTaskId || null, tab.claudeTaskCount || 0);
       });
 
       // Step 4: Clean up tabs that exist in DB but NOT in the new set
       // Safety: only do this if tab count is stable (not losing more than 2 tabs)
-      // This prevents mass deletion when the in-memory Map is incomplete due to bugs
-      if (newTabIds.length > 0 && newCount >= existingCount - 2) {
+      // forceCleanup bypasses the guard for intentional batch operations (moveTabsToProject, batch close)
+      if (newTabIds.length > 0 && (forceCleanup || newCount >= existingCount - 2)) {
         const placeholders = newTabIds.map(() => '?').join(',');
         this.db.prepare('DELETE FROM tabs WHERE project_id = ? AND tab_id IS NOT NULL AND tab_id NOT IN (' + placeholders + ')').run(projectId, ...newTabIds);
       } else if (newTabIds.length > 0 && newCount < existingCount - 2) {
@@ -620,16 +628,34 @@ class DatabaseManager {
 
   getGlobalCommands() { return this.db.prepare('SELECT * FROM global_commands ORDER BY position').all(); }
   saveGlobalCommands(commands) {
-    this.db.prepare('DELETE FROM global_commands').run();
-    const insert = this.db.prepare('INSERT INTO global_commands (name, command, position) VALUES (?, ?, ?)');
-    commands.forEach((cmd, index) => insert.run(cmd.name, cmd.command, index));
+    if (!Array.isArray(commands)) return;
+    const existingCount = this.db.prepare('SELECT COUNT(*) as cnt FROM global_commands').get()?.cnt || 0;
+    if (commands.length === 0 && existingCount > 0) {
+      console.warn('[DB] saveGlobalCommands: refusing to delete ' + existingCount + ' commands with empty array');
+      return;
+    }
+    const transaction = this.db.transaction((cmds) => {
+      this.db.prepare('DELETE FROM global_commands').run();
+      const insert = this.db.prepare('INSERT INTO global_commands (name, command, position) VALUES (?, ?, ?)');
+      cmds.forEach((cmd, index) => insert.run(cmd.name, cmd.command, index));
+    });
+    transaction(commands);
   }
 
   getPrompts() { return this.db.prepare('SELECT * FROM prompts ORDER BY position').all(); }
   savePrompts(prompts) {
-    this.db.prepare('DELETE FROM prompts').run();
-    const insert = this.db.prepare('INSERT INTO prompts (title, content, position) VALUES (?, ?, ?)');
-    prompts.forEach((p, index) => insert.run(p.title, p.content, index));
+    if (!Array.isArray(prompts)) return;
+    const existingCount = this.db.prepare('SELECT COUNT(*) as cnt FROM prompts').get()?.cnt || 0;
+    if (prompts.length === 0 && existingCount > 0) {
+      console.warn('[DB] savePrompts: refusing to delete ' + existingCount + ' prompts with empty array');
+      return;
+    }
+    const transaction = this.db.transaction((list) => {
+      this.db.prepare('DELETE FROM prompts').run();
+      const insert = this.db.prepare('INSERT INTO prompts (title, content, position) VALUES (?, ?, ?)');
+      list.forEach((p, index) => insert.run(p.title, p.content, index));
+    });
+    transaction(prompts);
   }
 
   createDefaultPrompts() {
