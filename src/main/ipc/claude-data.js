@@ -256,7 +256,16 @@ function resolveLatestSessionInChain(sessionId, cwd) {
         try {
           const entry = JSON.parse(firstLine);
           if (entry.sessionId === currentId && entry.uuid) {
-            // This file bridges from currentId
+            // Check: is this a fork copy or a real bridge?
+            // Fork copies (our copyFileSync) have original sessionId but are NOT bridges.
+            // Real bridges are created by Clear Context and are NOT fork targets.
+            try {
+              const forkInfo = _projectManager.db.getParentSession(fId);
+              if (forkInfo) {
+                // This is a fork target — skip, not a bridge
+                continue;
+              }
+            } catch {}
             childId = fId;
             break;
           }
