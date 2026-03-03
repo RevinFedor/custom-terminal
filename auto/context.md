@@ -326,7 +326,7 @@ Gemini CLI работает в alternate screen buffer xterm.js. Это знач
 - Sub-agent tab имеет `parentTabId` → скрыт из TabBar, виден в SubAgentBar
 - **Fire-and-forget:** Gemini не должен поллить `get_task_status` — описание тулов в `mcp-server.mjs` явно это запрещает
 - **JSONL guard:** Spinner IDLE → `checkJsonlActivity()` проверяет JSONL на `turn_duration` (primary) или `stop_reason=end_turn` (fallback для суб-агентов, которые не пишут `turn_duration`)
-- **read_claude_history:** `GET /claude-history/{taskId}` — инкрементальное чтение (watermark `deliveredTurns`). Параметры: `detail` (summary/full/with_code), `from_beginning` (сброс watermark)
+- **read_claude_history:** `GET /claude-history/{taskId}` — stateless чтение истории (backtrace из JSONL). Параметры: `detail` (summary/full/with_code), `last_n` (количество последних ходов, дефолт 1, 0 = все)
 - **Тесты:** `test-gemini-orchestration.js` (базовый), `test-orchestration-full.js` (полный: delegation + continue + history + manual intervention)
 
 ---

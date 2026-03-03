@@ -33,8 +33,15 @@ Step 4: DELETE WHERE tab_id NOT IN (new_set)      -- ТОЛЬКО если count
 ### Почему порог = 2
 Нормальные операции (закрытие 1-2 табов) не должны блокироваться. Потеря 3+ табов за один вызов — аномалия, требующая расследования.
 
+### forceCleanup Flag
+Для intentional batch-операций (перенос 3+ табов между проектами, массовое закрытие) Safety Guard можно обойти через параметр `forceCleanup: true`:
+- `saveTabs(projectId, tabs, true)` — принудительно выполняет Step 4 cleanup
+- Используется в `moveTabsToProject` и batch close (`closeTab` с `{ forceCleanup: true }`)
+- **Никогда** не передавай `forceCleanup` из обычных single-tab операций
+
 ## Файлы
 - `src/main/database.js` — метод `saveTabs()` (~line 470)
+- `src/main/project-manager.js` — прокси `saveProjectTabs()` с `forceCleanup`
 - `src/renderer/store/useWorkspaceStore.ts` — все места вызова `saveTabs()`
 
 ## Правило

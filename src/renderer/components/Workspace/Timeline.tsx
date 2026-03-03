@@ -295,13 +295,13 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
     loadTimeline();
   }, [loadTimeline]);
 
-  // Refresh timeline periodically (faster when command is running for Escape detection)
+  // Refresh timeline periodically (only when visible)
   useEffect(() => {
-    if (!sessionId) return;
+    if (!sessionId || !isVisible) return;
     // Refresh every 2 seconds to catch Escape/Undo changes quickly
     const interval = setInterval(loadTimeline, 2000);
     return () => clearInterval(interval);
-  }, [sessionId, loadTimeline]);
+  }, [sessionId, loadTimeline, isVisible]);
 
   // Listen for manual refresh requests from InfoPanel
   useEffect(() => {

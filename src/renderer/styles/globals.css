@@ -205,3 +205,6 @@
   .project-card.active { @apply !bg-accent !text-white; }
   .tab.active { @apply !bg-tab-active !text-white !border-t-2 !border-accent; }
 }
+
+/* API split button: hover shows absolute popup with claude | gemini */
+.api-split-btn:hover .api-split-popup { display: inline-flex !important; }

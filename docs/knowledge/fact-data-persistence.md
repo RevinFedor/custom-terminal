@@ -19,7 +19,7 @@
 1. Обновлен метод `saveTabs` в `useWorkspaceStore.ts`: теперь в объект сохранения включены поля `color`, `isUtility` и `mcp_task_started_at`.
 2. Обновлен метод `createTab`: добавлен параметр `options` для инициализации таба с нужными метаданными (включая статус задачи) при загрузке.
 
-**Примечание:** Поля `claudeAgentStatus` и `claudeAgentSessionId` — runtime-only (в `Tab` interface), НЕ персистятся в SQLite. После перезапуска агент-сессия начинается с нуля.
+**Примечание:** Поля `claudeAgentStatus`, `claudeActive`, `claudeBusy`, `interceptorState` — runtime-only (в `Tab` interface), НЕ персистятся в SQLite. После перезапуска сбрасываются к значениям по умолчанию. Персистентные MCP-поля: `mcp_task_id` (UUID задачи), `claude_task_count` (счётчик итераций), `mcp_task_started_at` (время старта). См. [`fix-tab-persistence.md`](fix-tab-persistence.md).
 
 ---
 
@@ -55,7 +55,13 @@ style={{ backgroundColor: c.bgColor }} // ✅ Всегда работает
 Это разгружает шину IPC и дисковую подсистему, позволяя React мгновенно реагировать на ввод пользователя, а использование SQLite вместо LocalStorage повышает надежность хранения системных данных.
 
 ### Критическое правило: Safe saveTabs
-Метод `saveTabs` использует **targeted DELETE + INSERT** вместо `DELETE ALL + re-INSERT`. Это защищает от потери данных, если in-memory Map неполный (race conditions, параллельные IPC). Детали: [`fix-save-tabs-data-loss.md`](fix-save-tabs-data-loss.md).
+Метод `saveTabs` использует **targeted DELETE + INSERT** вместо `DELETE ALL + re-INSERT`. Это защищает от потери данных, если in-memory Map неполный (race conditions, параллельные IPC). Для batch-операций (перенос 3+ табов, массовое закрытие) используется флаг `forceCleanup`, обходящий safety guard. Детали: [`fix-save-tabs-data-loss.md`](fix-save-tabs-data-loss.md).
+
+### Transaction Safety: Global Commands & Prompts
+Методы `saveGlobalCommands()` и `savePrompts()` обёрнуты в `db.transaction()` с **empty-array guard**: если передан пустой массив при наличии данных в БД, удаление блокируется и логируется предупреждение. Это предотвращает потерю пользовательских данных из-за багов рендерера.
+
+### Response Queue Persistence
+Очередь ответов субагентов (`geminiResponseQueue`) сохраняется в `app_state` при закрытии приложения и восстанавливается при запуске. Это предотвращает потерю auto-delivery, если Gemini был busy в момент shutdown.
 \n---\n## File: data-persistence.md\n
 ## Философия: От «Пути» к «Сущности»
 Раньше проект в приложении определялся исключительно его путем на диске (path). Это было архитектурным тупиком: нельзя было открыть одну и ту же папку дважды с разными контекстами (наборами вкладок, чатами). База данных «схлопывала» данные при совпадении путей.

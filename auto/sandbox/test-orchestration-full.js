@@ -6,7 +6,7 @@
  * Phase 2: continue_claude follow-up (same session, extracted taskId)
  * Phase 3: Second delegation via Gemini → second sub-agent
  * Phase 4: Final assertions (deliveries, false completions, store state)
- * Phase 5: read_claude_history verification (watermark, from_beginning, summary, with_code, manual intervention)
+ * Phase 5: read_claude_history verification (last_n, summary, with_code, manual intervention)
  *
  * All delegations go through Gemini (correct ppid via process tree).
  * Direct HTTP is only used for continue_claude (uses taskId, not ppid).
@@ -407,11 +407,11 @@ async function main() {
       stopHb2c()
       assert(!!delivery2, `Delivery 2: ${delivery2 ? 'detected' : 'TIMEOUT'}`)
 
-      // Verify watermark via read_claude_history HTTP
-      log.step('Verifying watermark (read_claude_history)...')
+      // Verify read_claude_history HTTP (last_n=0 = all turns)
+      log.step('Verifying read_claude_history...')
       try {
-        const history = await httpGet(mcpPort, `/claude-history/${taskId1}?from_beginning=true`)
-        log.info(`History: totalTurns=${history.totalTurns}, new=${history.new}`)
+        const history = await httpGet(mcpPort, `/claude-history/${taskId1}?last_n=0`)
+        log.info(`History: totalTurns=${history.totalTurns}`)
         softAssert(history.totalTurns >= 2, `totalTurns >= 2: ${history.totalTurns}`)
       } catch (e) {
         log.warn(`History check failed: ${e.message}`)
@@ -528,25 +528,25 @@ async function main() {
     if (!taskId1) {
       log.warn('Skipping Phase 5 — no taskId from Phase 1')
     } else {
-      // 5a. Incremental read (post-delivery) — watermark at totalTurns, expect 0 new
-      log.step('5a. Incremental read (post-delivery)...')
+      // 5a. Default read (last_n=1) — should return last turn only
+      log.step('5a. Default read (last_n=1)...')
       try {
-        const histIncr = await httpGet(mcpPort, `/claude-history/${taskId1}`)
-        log.info(`Incremental: totalTurns=${histIncr.totalTurns}, newTurns=${histIncr.newTurns}`)
-        assert(histIncr.totalTurns !== undefined, `totalTurns is defined: ${histIncr.totalTurns}`)
-        assert(histIncr.newTurns === 0, `Post-delivery newTurns === 0: ${histIncr.newTurns}`)
-        assert(histIncr.content?.includes('No new turns'), `Content says "No new turns"`)
+        const histDefault = await httpGet(mcpPort, `/claude-history/${taskId1}?last_n=1`)
+        log.info(`Default: totalTurns=${histDefault.totalTurns}, lastN=${histDefault.lastN}, content length=${histDefault.content?.length}`)
+        assert(histDefault.totalTurns !== undefined, `totalTurns is defined: ${histDefault.totalTurns}`)
+        assert(histDefault.totalTurns >= 2, `totalTurns >= 2: ${histDefault.totalTurns}`)
+        assert(histDefault.content?.includes('earlier turns omitted'), `Content says "earlier turns omitted"`)
       } catch (e) {
-        log.fail(`Incremental read failed: ${e.message}`)
+        log.fail(`Default read failed: ${e.message}`)
         failed++
       }
 
-      // 5b. Full history (from_beginning=true) — all turns with content
-      log.step('5b. Full history (from_beginning=true)...')
+      // 5b. Full history (last_n=0) — all turns with content
+      log.step('5b. Full history (last_n=0)...')
       let fullTotalTurns = 0
       try {
-        const histFull = await httpGet(mcpPort, `/claude-history/${taskId1}?from_beginning=true`)
-        log.info(`Full: totalTurns=${histFull.totalTurns}, newTurns=${histFull.newTurns}, content length=${histFull.content?.length}`)
+        const histFull = await httpGet(mcpPort, `/claude-history/${taskId1}?last_n=0`)
+        log.info(`Full: totalTurns=${histFull.totalTurns}, lastN=${histFull.lastN}, content length=${histFull.content?.length}`)
         fullTotalTurns = histFull.totalTurns || 0
         assert(histFull.totalTurns >= 2, `Full totalTurns >= 2: ${histFull.totalTurns}`)
         assert(histFull.content?.length > 50, `Content has substance (${histFull.content?.length} chars)`)
@@ -561,7 +561,7 @@ async function main() {
       // 5c. Summary mode — should return last assistant response
       log.step('5c. Summary mode (detail=summary)...')
       try {
-        const histSummary = await httpGet(mcpPort, `/claude-history/${taskId1}?detail=summary&from_beginning=true`)
+        const histSummary = await httpGet(mcpPort, `/claude-history/${taskId1}?detail=summary&last_n=0`)
         log.info(`Summary: totalTurns=${histSummary.totalTurns}, content length=${histSummary.content?.length}`)
         assert(histSummary.content?.includes('## Response'), `Summary has "## Response" section`)
         assert(histSummary.totalTurns >= 2, `Summary totalTurns >= 2: ${histSummary.totalTurns}`)
@@ -573,7 +573,7 @@ async function main() {
       // 5d. with_code mode — should include tool action details
       log.step('5d. with_code mode (detail=with_code)...')
       try {
-        const histCode = await httpGet(mcpPort, `/claude-history/${taskId1}?detail=with_code&from_beginning=true`)
+        const histCode = await httpGet(mcpPort, `/claude-history/${taskId1}?detail=with_code&last_n=0`)
         log.info(`with_code: totalTurns=${histCode.totalTurns}, content length=${histCode.content?.length}`)
         assert(histCode.totalTurns >= 2, `with_code totalTurns >= 2: ${histCode.totalTurns}`)
         // Claude was asked to read package.json — should have at least one action
@@ -626,13 +626,12 @@ async function main() {
         // Wait for JSONL flush (Claude writes entries in real-time, but small buffer delay)
         await page.waitForTimeout(3000)
 
-        // Incremental read — should have new turns from manual intervention
+        // Read all history — should have more turns from manual intervention
         log.step('5e. Reading history after manual intervention...')
         try {
-          const histManual = await httpGet(mcpPort, `/claude-history/${taskId1}`)
-          log.info(`Manual: totalTurns=${histManual.totalTurns}, newTurns=${histManual.newTurns}`)
+          const histManual = await httpGet(mcpPort, `/claude-history/${taskId1}?last_n=0`)
+          log.info(`Manual: totalTurns=${histManual.totalTurns}`)
           log.info(`Manual content preview: ${histManual.content?.substring(0, 200)}`)
-          assert(histManual.newTurns >= 1, `Manual intervention newTurns >= 1: ${histManual.newTurns}`)
           assert(histManual.totalTurns > fullTotalTurns, `totalTurns increased: ${histManual.totalTurns} > ${fullTotalTurns}`)
           // Verify content contains the question or answer
           const hasManualContent = histManual.content?.includes('2+2') ||
@@ -646,7 +645,7 @@ async function main() {
         // 5f. Full history after manual — should include ALL turns
         log.step('5f. Full history after manual intervention...')
         try {
-          const histFullAfter = await httpGet(mcpPort, `/claude-history/${taskId1}?from_beginning=true`)
+          const histFullAfter = await httpGet(mcpPort, `/claude-history/${taskId1}?last_n=0`)
           log.info(`Full after manual: totalTurns=${histFullAfter.totalTurns}`)
           assert(histFullAfter.totalTurns > fullTotalTurns,
             `Total turns grew after manual: ${histFullAfter.totalTurns} > ${fullTotalTurns}`)

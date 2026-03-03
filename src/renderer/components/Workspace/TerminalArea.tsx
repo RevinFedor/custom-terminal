@@ -210,87 +210,93 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
     };
   }, []);
 
-  // Use selectors to minimize re-renders
-  const openProjects = useWorkspaceStore((state) => state.openProjects);
+  // Targeted selectors — avoid subscribing to entire openProjects Map
   const createTab = useWorkspaceStore((state) => state.createTab);
   const clearInterruptedState = useWorkspaceStore((state) => state.clearInterruptedState);
-  const projects = useProjectsStore((state) => state.projects);
+  const currentView = useWorkspaceStore((s) => s.openProjects.get(projectId)?.currentView || 'terminal');
+  const activeTabId = useWorkspaceStore((s) => s.openProjects.get(projectId)?.activeTabId ?? null);
 
   // DEBUG: Track render reason
   const renderCountRef = useRef(0);
   renderCountRef.current++;
 
-  const currentWorkspace = openProjects.get(projectId);
-  const currentView = currentWorkspace?.currentView || 'terminal';
+  // Check if sub-agent is actively visible (parent Gemini tab is the active tab)
+  const isSubAgentVisible = useWorkspaceStore((s) => {
+    if (!viewingSubAgentTabId) return false;
+    const ws = s.openProjects.get(projectId);
+    if (!ws?.activeTabId) return false;
+    const viewedTab = ws.tabs.get(viewingSubAgentTabId);
+    return !!viewedTab && viewedTab.parentTabId === ws.activeTabId;
+  });
 
-  console.warn(`[TerminalArea:RENDER #${renderCountRef.current}] projectId=${projectId} currentView=${currentView} openProjects.size=${openProjects.size}`);
+  console.warn(`[TerminalArea:RENDER #${renderCountRef.current}] projectId=${projectId} currentView=${currentView}`);
 
-  const currentProject = projects[projectId];
-
-  // Get active tab info for interrupted session overlay
-  const activeTab = currentWorkspace?.activeTabId
-    ? currentWorkspace.tabs.get(currentWorkspace.activeTabId)
-    : null;
-  // Bug 2 fix: hide overlay if Claude was auto-resumed by MCP (claudeActive = true)
-  const showInterruptedOverlay = activeTab?.wasInterrupted && activeTab?.claudeSessionId && !activeTab?.claudeActive && currentView === 'terminal';
+  // Get active tab info for interrupted session overlay (targeted selectors)
+  const activeTabWasInterrupted = useWorkspaceStore((s) => {
+    const ws = s.openProjects.get(projectId);
+    if (!ws?.activeTabId) return false;
+    const tab = ws.tabs.get(ws.activeTabId);
+    return !!tab?.wasInterrupted && !!tab?.claudeSessionId && !tab?.claudeActive;
+  });
+  const activeTabSessionId = useWorkspaceStore((s) => {
+    const ws = s.openProjects.get(projectId);
+    if (!ws?.activeTabId) return null;
+    return ws.tabs.get(ws.activeTabId)?.claudeSessionId ?? null;
+  });
+  const activeTabIdForOverlay = activeTabId;
+  const showInterruptedOverlay = activeTabWasInterrupted && activeTabSessionId && currentView === 'terminal';
 
   
-  // Handle continuing interrupted Claude session
+  // Handle continuing interrupted Claude session (use fresh state from getState)
   const handleContinueSession = (sessionId?: string) => {
-    const targetSessionId = sessionId || activeTab?.claudeSessionId;
-    console.log('[TerminalArea] handleContinueSession called, activeTab:', activeTab?.id, 'sessionId:', targetSessionId);
+    const tabId = activeTabId;
+    const targetSessionId = sessionId || activeTabSessionId;
+    console.log('[TerminalArea] handleContinueSession called, activeTab:', tabId, 'sessionId:', targetSessionId);
 
-    if (activeTab?.id && targetSessionId) {
+    if (tabId && targetSessionId) {
       console.log('[TerminalArea] Clearing interrupted state and sending command');
-      // Clear the interrupted state
-      clearInterruptedState(activeTab.id);
+      clearInterruptedState(tabId);
 
-      // Set command type to 'claude' for Timeline visibility
       const setTabCommandType = useWorkspaceStore.getState().setTabCommandType;
-      setTabCommandType(activeTab.id, 'claude');
+      setTabCommandType(tabId, 'claude');
 
-      // Send command to terminal
       const cmd = `claude --dangerously-skip-permissions --resume ${targetSessionId}\r`;
       console.log('[TerminalArea] Sending terminal:input:', cmd);
-      ipcRenderer.send('terminal:input', activeTab.id, cmd);
-
-      // Signal command started immediately for Timeline visibility
-      ipcRenderer.send('terminal:force-command-started', activeTab.id);
+      ipcRenderer.send('terminal:input', tabId, cmd);
+      ipcRenderer.send('terminal:force-command-started', tabId);
     } else {
       console.log('[TerminalArea] handleContinueSession: Missing activeTab or sessionId!');
     }
   };
 
-  // Handle dismissing the interrupted overlay (clear session completely)
+  // Handle dismissing the interrupted overlay
   const handleDismissOverlay = () => {
-    console.log('[TerminalArea] handleDismissOverlay called, activeTab:', activeTab?.id);
-    if (activeTab?.id) {
-      console.log('[TerminalArea] Clearing Claude session completely');
-      // Clear both wasInterrupted AND claudeSessionId using dismiss action that triggers re-render
+    const tabId = activeTabId;
+    console.log('[TerminalArea] handleDismissOverlay called, activeTab:', tabId);
+    if (tabId) {
       const dismissInterruptedSession = useWorkspaceStore.getState().dismissInterruptedSession;
-      dismissInterruptedSession(activeTab.id);
-    } else {
-      console.log('[TerminalArea] handleDismissOverlay: No activeTab!');
+      dismissInterruptedSession(tabId);
     }
   };
 
-  // Memoize terminal list - use stable key for comparison
-  // Only rebuild when tabs actually change (add/remove), not on every state update
-  const terminalKeys = useMemo(() => {
-    const keys: string[] = [];
-    openProjects.forEach((workspace) => {
+  // Stable string selector — only changes when tab IDs are added/removed (not on every state mutation)
+  const terminalFingerprint = useWorkspaceStore((s) => {
+    const parts: string[] = [];
+    s.openProjects.forEach((workspace, projId) => {
+      parts.push(`${projId}:${workspace.activeTabId}`);
       workspace.tabs.forEach((tab) => {
-        keys.push(tab.id);
+        parts.push(`${tab.id}:${tab.tabType || 'terminal'}`);
       });
     });
-    return keys.join(',');
-  }, [openProjects]);
+    return parts.join(',');
+  });
 
   const terminals = useMemo(() => {
-    console.warn('[TerminalArea:useMemo] RECALCULATING terminals. terminalKeys:', terminalKeys, 'projectId:', projectId);
+    console.warn('[TerminalArea:useMemo] RECALCULATING terminals. fingerprint:', terminalFingerprint, 'projectId:', projectId);
     const result: React.ReactNode[] = [];
+    const currentOpenProjects = useWorkspaceStore.getState().openProjects;
 
-    openProjects.forEach((workspace, projId) => {
+    currentOpenProjects.forEach((workspace, projId) => {
       const isActiveProject = projId === projectId;
 
       workspace.tabs.forEach((tab) => {
@@ -298,11 +304,14 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
         // MCP sub-agent viewport: when viewingSubAgentTabId is set, show that tab instead of the active Gemini tab
         let isActive = isActiveProject && workspace.activeTabId === tab.id;
         if (isActiveProject && viewingSubAgentTabId) {
-          // If we're viewing a sub-agent, the sub-agent tab is active and the Gemini parent is hidden
-          if (tab.id === viewingSubAgentTabId) {
-            isActive = true;
-          } else if (tab.id === workspace.activeTabId) {
-            isActive = false; // Hide the Gemini tab
+          const viewedTab = workspace.tabs.get(viewingSubAgentTabId);
+          // Only apply sub-agent override when active tab IS the parent Gemini tab
+          if (viewedTab && viewedTab.parentTabId === workspace.activeTabId) {
+            if (tab.id === viewingSubAgentTabId) {
+              isActive = true;
+            } else if (tab.id === workspace.activeTabId) {
+              isActive = false; // Hide the Gemini tab, show sub-agent instead
+            }
           }
         }
         if (tab.tabType === 'browser') {
@@ -334,7 +343,7 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
     });
 
     return result;
-  }, [terminalKeys, projectId, openProjects, viewingSubAgentTabId]);
+  }, [terminalFingerprint, projectId, viewingSubAgentTabId]);
 
   // Listen for Claude fork completion to create new tab with command
   useEffect(() => {
@@ -349,20 +358,19 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
       const pendingCommand = `claude --dangerously-skip-permissions --resume ${data.newSessionId}`;
       console.log('[TerminalArea] Creating new tab with command:', pendingCommand);
 
-      // Find project that contains this cwd
+      // Find project that contains this cwd (read fresh state)
+      const currentOpenProjects = useWorkspaceStore.getState().openProjects;
       let targetProjectId: string | null = null;
-      openProjects.forEach((workspace, projId) => {
+      currentOpenProjects.forEach((workspace, projId) => {
         if (workspace.projectPath === data.cwd || data.cwd?.startsWith(workspace.projectPath)) {
           targetProjectId = projId;
         }
       });
 
       if (!targetProjectId) {
-        // Default to current project
         targetProjectId = projectId;
       }
 
-      // Create new tab
       await createTab(targetProjectId, 'Claude Fork', data.cwd, {
         pendingCommand,
         claudeSessionId: data.newSessionId
@@ -373,13 +381,13 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
     return () => {
       ipcRenderer.removeListener('claude:fork-complete', handleForkComplete);
     };
-  }, [createTab, openProjects, projectId]);
+  }, [createTab, projectId]);
 
   // Handle double-click on empty space to create new tab
   const handleDoubleClick = (e: React.MouseEvent) => {
-    // Only trigger if clicking directly on the container (not on terminal)
-    if (e.target === e.currentTarget && currentProject) {
-      createTab(projectId, undefined, currentProject.path);
+    if (e.target === e.currentTarget) {
+      const project = useProjectsStore.getState().projects[projectId];
+      if (project) createTab(projectId, undefined, project.path);
     }
   };
 
@@ -393,6 +401,18 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
       {/* Render all terminals from all projects */}
       {terminals}
 
+      {/* Orange border overlay when viewing sub-agent */}
+      {isSubAgentVisible && (
+        <div
+          className="absolute inset-0 pointer-events-none"
+          style={{
+            boxShadow: 'inset 0 0 0 2px rgba(204, 120, 50, 0.4)',
+            borderRadius: '4px',
+            zIndex: 10,
+          }}
+        />
+      )}
+
       {/* Interceptor badge on sub-agent viewport */}
       {subAgentBadgeProps && (
         <InterceptorBadge
@@ -404,11 +424,11 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
 
       {/* Interrupted session overlay */}
       <AnimatePresence>
-        {showInterruptedOverlay && activeTab && (
+        {showInterruptedOverlay && activeTabId && activeTabSessionId && (
           <InterruptedSessionOverlay
-            tabId={activeTab.id}
-            sessionId={activeTab.claudeSessionId!}
-            onContinue={() => handleContinueSession(activeTab.claudeSessionId!)}
+            tabId={activeTabId}
+            sessionId={activeTabSessionId}
+            onContinue={() => handleContinueSession(activeTabSessionId)}
             onDismiss={handleDismissOverlay}
           />
         )}

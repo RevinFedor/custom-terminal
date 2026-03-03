@@ -42,13 +42,14 @@ setClaudeSessionId: (tabId, sessionId) => {
 ### Почему guard обязателен
 Без guard'а `set({})` вызывался бы на КАЖДОМ Bridge poll (каждые 2с), вызывая ненужные re-render всех subscribers. Guard `if (tab.prop === value) return` гарантирует, что `set({})` fires только при реальном изменении.
 
-### Затронутые методы (на момент фикса)
+### Затронутые методы
 | Метод | `set()` | Guard | Статус |
 |-------|---------|-------|--------|
 | `setClaudeSessionId` | `set({})` | ✅ | Исправлен |
-| `setGeminiSessionId` | ❌ | ❌ | TODO |
-| `setTabNotes` | ❌ | ❌ | TODO |
-| `updateTabUrl` | ❌ | ❌ | TODO |
+| `setGeminiSessionId` | `set({})` | ✅ | Исправлен |
+| `setTabNotes` | `set({})` | ✅ | Исправлен |
+| `updateTabUrl` | `set({})` | ✅ | Исправлен |
+| `markAllSessionsInterrupted` | `set({})` | — | Исправлен (shutdown + future-proof) |
 
 ## Правило
 

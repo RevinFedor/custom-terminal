@@ -185,7 +185,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'read_claude_history',
-      description: 'Read the conversation history of a Claude Code sub-agent. Returns ONLY NEW turns since your last read (or since auto-delivery). This is incremental — each call advances a watermark, so you never see the same turns twice.\n\nUse this when you need to understand WHAT Claude did and WHY — not just the final result. Returns Claude\'s thinking process, responses, and actions (file edits, commands, reads).\n\nDetail levels:\n- "summary": Only the last response with thinking (quick check)\n- "full" (default): New turns — user prompts, Claude thinking, responses, and action labels\n- "with_code": Same as full but includes edit diffs and command output\n\nSet from_beginning=true to get the entire conversation from the start (resets watermark).',
+      description: 'Read the conversation history of a Claude Code sub-agent. By default returns ONLY the LAST turn (last_n=1). You control what to read via last_n.\n\nUse this when you need to understand WHAT Claude did and WHY — not just the final result. Returns Claude\'s thinking process, responses, and actions.\n\nDetail levels:\n- "summary": Only the last response with thinking (quick check)\n- "full" (default): User prompts, Claude thinking, responses, and action labels\n- "with_code": Same as full but includes edit diffs and command output\n\nExamples:\n- Quick check last response: detail="summary" (last_n is ignored for summary)\n- Re-read last turn with code: detail="with_code", last_n=1\n- Get context of last 3 turns: last_n=3\n- Full session dump: last_n=0 (all turns, use sparingly)',
       inputSchema: {
         type: 'object',
         properties: {
@@ -196,11 +196,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           detail: {
             type: 'string',
             enum: ['summary', 'full', 'with_code'],
-            description: 'Level of detail. "summary" = last response only, "full" = new turns with thinking and action labels, "with_code" = full + edit diffs and command output. Default: "full"',
+            description: 'Level of detail. "summary" = last response only, "full" = turns with thinking and action labels, "with_code" = full + edit diffs and command output. Default: "full"',
           },
-          from_beginning: {
-            type: 'boolean',
-            description: 'If true, return the entire conversation from the start (ignoring watermark). Default: false — only returns new turns since last read.',
+          last_n: {
+            type: 'integer',
+            description: 'Number of recent turns to return. Default: 1 (last turn only). Set to 0 for all turns (use sparingly — sessions can be very large).',
           },
         },
         required: ['taskId'],
@@ -218,6 +218,26 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
         },
         required: ['taskId'],
+      },
+    },
+    {
+      name: 'update_docs',
+      description: 'Run "Update Docs" analysis on one or more Claude sub-agent sessions via API. Exports each agent\'s session history, sends it with the documentation prompt to an AI API (Claude or Gemini), and returns the analysis results directly.\n\nUse list_sub_agents first to get task IDs. This is SYNCHRONOUS — results are returned in the tool response. Processing may take 30-120 seconds per session depending on size.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          taskIds: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Array of task IDs from list_sub_agents. Each session will be analyzed independently.',
+          },
+          provider: {
+            type: 'string',
+            enum: ['claude', 'gemini'],
+            description: 'Which API to use for analysis. Default: "gemini".',
+          },
+        },
+        required: ['taskIds'],
       },
     },
   ],
@@ -310,11 +330,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'read_claude_history': {
         const detail = args.detail || 'full';
-        const fromBeginning = args.from_beginning ? 'true' : 'false';
-        let url = '/claude-history/' + args.taskId + '?detail=' + detail + '&from_beginning=' + fromBeginning + '&ppid=' + ppid;
+        const lastN = args.last_n !== undefined ? args.last_n : 1;
+        let url = '/claude-history/' + args.taskId + '?detail=' + detail + '&last_n=' + lastN + '&ppid=' + ppid;
         const result = await httpGet(url);
         let header = 'Total turns: ' + (result.totalTurns || 0);
-        if (result.newTurns !== undefined) header += ', new: ' + result.newTurns;
+        if (result.lastN > 0) header += ', showing last ' + result.lastN;
         return {
           content: [
             {
@@ -330,6 +350,41 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         let text = 'Task ' + args.taskId + ': ' + result.status;
         if (result.result) text += '\nResult: ' + result.result.substring(0, 500);
         if (result.error) text += '\nError: ' + result.error;
+        return {
+          content: [{ type: 'text', text }],
+        };
+      }
+
+      case 'update_docs': {
+        const result = await httpPost('/update-docs', {
+          taskIds: args.taskIds,
+          provider: args.provider || undefined,
+          ppid,
+        });
+
+        const results = result.results || [];
+        if (results.length === 0) {
+          return {
+            content: [{ type: 'text', text: 'No results returned.' }],
+            isError: true,
+          };
+        }
+
+        let text = 'Update Docs — ' + results.length + ' session(s) analyzed:\n';
+        for (const r of results) {
+          text += '\n' + '='.repeat(60) + '\n';
+          text += 'Task: ' + r.taskId + '\n';
+          if (r.success) {
+            text += r.text + '\n';
+            if (r.usage) {
+              const inK = r.usage.input_tokens ? (r.usage.input_tokens / 1000).toFixed(1) + 'K' : '?';
+              const outK = r.usage.output_tokens ? (r.usage.output_tokens / 1000).toFixed(1) + 'K' : '?';
+              text += '\n[Tokens — in: ' + inK + ', out: ' + outK + ']\n';
+            }
+          } else {
+            text += 'ERROR: ' + r.error + '\n';
+          }
+        }
         return {
           content: [{ type: 'text', text }],
         };

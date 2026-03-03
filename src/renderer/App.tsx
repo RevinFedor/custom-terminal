@@ -10,6 +10,7 @@ import ToastContainer from './components/UI/Toast';
 import EditProjectModal from './components/UI/EditProjectModal';
 import SessionInputModal from './components/UI/SessionInputModal';
 import SettingsModal from './components/UI/SettingsModal';
+import ApiSettingsModal from './components/UI/ApiSettingsModal';
 
 // Drag and drop
 import { draggable, dropTargetForElements, monitorForElements } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
@@ -316,7 +317,27 @@ const RestoreLoader = memo(() => (
 ));
 
 function App() {
-  const { view, showDashboard, openProject, openProjects, activeProjectId, closeProject, createTab, createTabAfterCurrent, closeTab, getActiveProject, getEffectiveTabId, restoreSession, reorderProjects, moveTabToProject, moveTabsToProject, isRestoring, getSidebarState, setSidebarOpen, setOpenFilePath } = useWorkspaceStore();
+  // Individual selectors — only re-render when specific values change (not on every store mutation)
+  const view = useWorkspaceStore((s) => s.view);
+  const activeProjectId = useWorkspaceStore((s) => s.activeProjectId);
+  const openProjects = useWorkspaceStore((s) => s.openProjects);
+  const isRestoring = useWorkspaceStore((s) => s.isRestoring);
+  // Functions are stable references in Zustand — selecting them individually avoids re-renders
+  const showDashboard = useWorkspaceStore((s) => s.showDashboard);
+  const openProject = useWorkspaceStore((s) => s.openProject);
+  const closeProject = useWorkspaceStore((s) => s.closeProject);
+  const createTab = useWorkspaceStore((s) => s.createTab);
+  const createTabAfterCurrent = useWorkspaceStore((s) => s.createTabAfterCurrent);
+  const closeTab = useWorkspaceStore((s) => s.closeTab);
+  const getActiveProject = useWorkspaceStore((s) => s.getActiveProject);
+  const getEffectiveTabId = useWorkspaceStore((s) => s.getEffectiveTabId);
+  const restoreSession = useWorkspaceStore((s) => s.restoreSession);
+  const reorderProjects = useWorkspaceStore((s) => s.reorderProjects);
+  const moveTabToProject = useWorkspaceStore((s) => s.moveTabToProject);
+  const moveTabsToProject = useWorkspaceStore((s) => s.moveTabsToProject);
+  const getSidebarState = useWorkspaceStore((s) => s.getSidebarState);
+  const setSidebarOpen = useWorkspaceStore((s) => s.setSidebarOpen);
+  const setOpenFilePath = useWorkspaceStore((s) => s.setOpenFilePath);
   const { projects, loadProjects, updateProject } = useProjectsStore();
   const { closeFilePreview, filePreview, showToast, incrementAllFontSizes, decrementAllFontSizes, activeArea, setActiveArea, dragAreaWidth, setDragAreaWidth } = useUIStore();
   const { toggleResearch } = useResearchStore();
@@ -478,6 +499,28 @@ function App() {
     usePromptsStore.getState().loadPrompts();
   }, []); // Empty deps = only on mount
 
+  // Sync apiSettings + docPrompt to main process (for MCP update_docs tool)
+  useEffect(() => {
+    const syncToMain = () => {
+      const { apiSettings, docPrompt } = useUIStore.getState();
+      ipcRenderer.invoke('docs:sync-settings', { apiSettings, docPrompt });
+    };
+
+    // Sync on mount
+    syncToMain();
+
+    // Sync on changes
+    let prev = JSON.stringify({ a: useUIStore.getState().apiSettings, d: useUIStore.getState().docPrompt });
+    const unsub = useUIStore.subscribe((state) => {
+      const curr = JSON.stringify({ a: state.apiSettings, d: state.docPrompt });
+      if (curr !== prev) {
+        prev = curr;
+        ipcRenderer.invoke('docs:sync-settings', { apiSettings: state.apiSettings, docPrompt: state.docPrompt });
+      }
+    });
+    return unsub;
+  }, []);
+
   // Listen for draft project events from ProjectHome
   useEffect(() => {
     const handleDraftSubmit = async (e: any) => {
@@ -629,6 +672,7 @@ function App() {
           color: 'claude',
           background: true,
           parentTabId: data.geminiTabId,
+          mcpTaskId: data.taskId,
         } as any);
 
         // Note: claudeActive will be set by mcp:claude-cli-active when Claude CLI actually launches
@@ -926,7 +970,7 @@ function App() {
 
                 if (confirmed) {
                   for (const id of selected) {
-                    await closeTab(activeProjectId!, id, { skipProcessCheck: true });
+                    await closeTab(activeProjectId!, id, { skipProcessCheck: true, forceCleanup: true });
                   }
                 }
               })();
@@ -1265,6 +1309,7 @@ function App() {
       <EditProjectModal />
       <SessionInputModal />
       <SettingsModal isOpen={settingsOpen} onClose={() => setSettingsOpen(false)} />
+      <ApiSettingsModal />
 
       {/* Project Context Menu */}
       {projectContextMenu && (
