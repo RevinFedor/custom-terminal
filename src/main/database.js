@@ -905,6 +905,14 @@ class DatabaseManager {
   // ========== SESSION LINKS (Clear Context chain) ==========
 
   saveSessionLink(parentId, childId) {
+    // Cycle guard: if reverse link (child→parent) already exists, skip to prevent circular chains
+    const reverse = this.db.prepare(
+      'SELECT 1 FROM session_links WHERE parent_session_id = ? AND child_session_id = ?'
+    ).get(childId, parentId);
+    if (reverse) {
+      console.log('[DB] saveSessionLink: SKIPPING circular link', parentId.substring(0, 8), '→', childId.substring(0, 8), '(reverse exists)');
+      return;
+    }
     this.db.prepare(`
       INSERT OR IGNORE INTO session_links (parent_session_id, child_session_id)
       VALUES (?, ?)

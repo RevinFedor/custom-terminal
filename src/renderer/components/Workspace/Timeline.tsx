@@ -188,6 +188,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
   // CMD key state for tooltip activation
   const [isCmdHeld, setIsCmdHeld] = useState(false);
   const isCmdHeldRef = useRef(false);
+  const chainResolvedRef = useRef<string | null>(null); // prevents A→B→A→B feedback loop
 
   // Adjust segmentRefs length
   useEffect(() => {
@@ -273,9 +274,16 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
           setSessionBoundaries(timelineResult.sessionBoundaries || []);
 
           // Detect session ID change (e.g., after "Clear Context" in plan mode)
+          // Guard: prevent A→B→A→B feedback loop (circular session_links from dual-PID Bridge)
           if (timelineResult.latestSessionId && timelineResult.latestSessionId !== sessionId) {
-            console.warn('[Timeline:ChainResolve] OVERWRITE session for tab', tabId, ':', sessionId.substring(0, 8), '→', timelineResult.latestSessionId.substring(0, 8), '(Timeline resolved chain)');
-            useWorkspaceStore.getState().setClaudeSessionId(tabId, timelineResult.latestSessionId);
+            if (chainResolvedRef.current === timelineResult.latestSessionId) {
+              // We already resolved TO this session, and now it wants to go back — cycle detected
+              console.warn('[Timeline:ChainResolve] BLOCKED cycle:', sessionId.substring(0, 8), '→', timelineResult.latestSessionId.substring(0, 8), '(already resolved from there)');
+            } else {
+              console.warn('[Timeline:ChainResolve] OVERWRITE session for tab', tabId, ':', sessionId.substring(0, 8), '→', timelineResult.latestSessionId.substring(0, 8), '(Timeline resolved chain)');
+              chainResolvedRef.current = sessionId; // remember WHERE we resolved FROM
+              useWorkspaceStore.getState().setClaudeSessionId(tabId, timelineResult.latestSessionId);
+            }
           }
         }
         if (markersResult.success) {

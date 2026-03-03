@@ -81,6 +81,40 @@ if (selectionStartIdRef.current) { ... }
 
 ---
 
+## The Deterministic Oscillator Trap (Feedback Loop)
+
+### Проблема
+Паттерн бага, когда `useEffect` (или `setInterval`) вызывает IPC-метод, который выполняет логику на бэкенде и возвращает результат, меняющий стейт в `useWorkspaceStore`. Если бэкенд возвращает значение, отличное от текущего, происходит ре-рендер, который снова запускает эффект, а бэкенд снова возвращает предыдущее значение.
+
+**Пример (Timeline):**
+1. Timeline запрашивает историю для `Session A`.
+2. Бэкенд резолвит цепочку и говорит: «На самом деле сейчас актуальна `Session B`».
+3. Timeline обновляет стор: `Session A` → `Session B`.
+4. Ре-рендер. Timeline запрашивает историю для `Session B`.
+5. Бэкенд (из-за ошибки в логике или кольцевой связи) говорит: «Актуальна `Session A`».
+6. Бесконечный цикл переключения ID.
+
+### Решение: useRef Memory
+Использование `useRef` для запоминания «последней удачной пары» резолюции. Если мы видим, что нас пытаются переключить обратно на то, откуда мы только что пришли — мы блокируем обновление.
+
+```tsx
+const lastResolvedPair = useRef<{ from: string; to: string } | null>(null);
+
+// В обработчике ответа от IPC:
+if (result.latestId !== currentId) {
+  // Проверяем, не является ли это "отскоком" назад
+  if (lastResolvedPair.current?.from === result.latestId && 
+      lastResolvedPair.current?.to === currentId) {
+    return; // Блокируем осцилляцию
+  }
+  
+  lastResolvedPair.current = { from: currentId, to: result.latestId };
+  setSessionId(result.latestId);
+}
+```
+
+---
+
 ## Loop Closure Trap (Link Providers)
 
 ### Проблема
@@ -154,6 +188,30 @@ const subAgentTabIds = useWorkspaceStore(useShallow((s) => {
   return s.tabs.filter(t => t.parentId === id).map(t => t.id);
 }));
 ```
+
+### Решение 3: Zustand Map Reference Trap (Performance Fix)
+
+**Проблема:**
+Когда в сторе хранится Map (например, `openProjects`) и обновление происходит через `set({ openProjects: new Map(get().openProjects) })`, создаётся **новая ссылка**.
+Если компонент подписан на весь Map (`s => s.openProjects`), он будет ре-рендериться при ЛЮБОМ изменении в любой части Map (например, при смене `cwd` или `busy` статуса одной вкладки).
+
+**Решение: Fingerprint Selector**
+Если компоненту нужно знать только *состав* вкладок (их количество или ID), используй селектор, возвращающий примитивную строку (fingerprint).
+
+```tsx
+// ✅ Эффективно: Ре-рендер только при добавлении/удалении табов
+const terminalFingerprint = useWorkspaceStore((s) => {
+  const tabs = getTabs(s);
+  return Array.from(tabs.keys()).join(',');
+});
+
+// Тяжелый useMemo теперь зависит от стабильной строки
+const terminals = useMemo(() => {
+  return renderTerminals(fingerprint);
+}, [terminalFingerprint]);
+```
+
+Этот паттерн позволил устранить O(n²) ре-рендеры в `TerminalArea.tsx`, когда переключение одной вкладки заставляло пересчитывать все терминалы всех проектов.
 
 ---
 
