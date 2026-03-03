@@ -248,6 +248,9 @@ class DatabaseManager {
     // Migration: add mcp_task_started_at for sub-agent timeout tracking
     try { this.db.exec(`ALTER TABLE tabs ADD COLUMN mcp_task_started_at INTEGER DEFAULT NULL`); } catch (e) {}
 
+    // Index on tab_id for faster lookups in saveTabs
+    try { this.db.exec(`CREATE INDEX IF NOT EXISTS idx_tabs_tab_id ON tabs(tab_id) WHERE tab_id IS NOT NULL`); } catch (e) {}
+
     // Migration: add session IDs to tab_history (for resume on restore)
     try { this.db.exec(`ALTER TABLE tab_history ADD COLUMN claude_session_id TEXT DEFAULT NULL`); } catch (e) {}
     try { this.db.exec(`ALTER TABLE tab_history ADD COLUMN gemini_session_id TEXT DEFAULT NULL`); } catch (e) {}
@@ -472,18 +475,50 @@ class DatabaseManager {
       return;
     }
 
-    this.db.prepare('DELETE FROM tabs WHERE project_id = ?').run(projectId);
+    // Safety: count existing tabs to detect accidental mass deletion
+    const existingCount = this.db.prepare('SELECT COUNT(*) as cnt FROM tabs WHERE project_id = ?').get(projectId)?.cnt || 0;
+    const newCount = tabs.length;
+
+    if (existingCount > 0 && newCount < existingCount - 2) {
+      const subAgentCount = tabs.filter(t => t.parentTabId).length;
+      const dbSubAgents = this.db.prepare('SELECT COUNT(*) as cnt FROM tabs WHERE project_id = ? AND parent_tab_id IS NOT NULL').get(projectId)?.cnt || 0;
+      console.warn('[DB] saveTabs: WARNING — saving ' + newCount + ' tabs (sub-agents: ' + subAgentCount + ') but DB has ' + existingCount + ' (sub-agents: ' + dbSubAgents + '). Project: ' + projectId);
+    }
+
+    const newTabIds = tabs.map(t => t.tabId).filter(Boolean);
+
+    const deleteByTabId = this.db.prepare('DELETE FROM tabs WHERE project_id = ? AND tab_id = ?');
     const insert = this.db.prepare(`
       INSERT INTO tabs (project_id, name, cwd, position, color, is_utility, command_type, claude_session_id, gemini_session_id, was_interrupted, overlay_dismissed, notes, tab_type, url, terminal_id, terminal_name, active_view, created_at, is_collapsed, parent_tab_id, tab_id, mcp_task_started_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     const transaction = this.db.transaction((tabList) => {
+      // Step 1: Delete old rows for tabs we're about to re-insert (by tab_id)
+      tabList.forEach((tab) => {
+        if (tab.tabId) {
+          deleteByTabId.run(projectId, tab.tabId);
+        }
+      });
+      // Step 2: Delete orphan rows without tab_id (legacy tabs)
+      this.db.prepare('DELETE FROM tabs WHERE project_id = ? AND tab_id IS NULL').run(projectId);
+
+      // Step 3: Insert all tabs fresh
       tabList.forEach((tab, index) => {
         insert.run(projectId, tab.name, tab.cwd, index, tab.color || null, tab.isUtility ? 1 : 0, tab.commandType || null, tab.claudeSessionId || null, tab.geminiSessionId || null, tab.wasInterrupted ? 1 : 0, tab.overlayDismissed ? 1 : 0, tab.notes || '', tab.tabType || 'terminal', tab.url || null, tab.terminalId || null, tab.terminalName || null, tab.activeView || null, tab.createdAt || null, tab.isCollapsed ? 1 : 0, tab.parentTabId || null, tab.tabId || null, tab.mcpTaskStartedAt || null);
       });
+
+      // Step 4: Clean up tabs that exist in DB but NOT in the new set
+      // Safety: only do this if tab count is stable (not losing more than 2 tabs)
+      // This prevents mass deletion when the in-memory Map is incomplete due to bugs
+      if (newTabIds.length > 0 && newCount >= existingCount - 2) {
+        const placeholders = newTabIds.map(() => '?').join(',');
+        this.db.prepare('DELETE FROM tabs WHERE project_id = ? AND tab_id IS NOT NULL AND tab_id NOT IN (' + placeholders + ')').run(projectId, ...newTabIds);
+      } else if (newTabIds.length > 0 && newCount < existingCount - 2) {
+        console.error('[DB] saveTabs: SKIPPING cleanup — new set (' + newCount + ') is much smaller than DB (' + existingCount + '). Orphan tabs preserved to prevent data loss.');
+      }
     });
-transaction(tabs);
+    transaction(tabs);
     this.db.prepare('UPDATE projects SET updated_at = strftime(\'%s\', \'now\') WHERE id = ?').run(projectId);
   }
 

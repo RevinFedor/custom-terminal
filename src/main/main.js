@@ -2104,6 +2104,49 @@ async function handleSubAgentCompletion(claudeTabId, recheckCount) {
   }
 }
 
+// Cancel all active completion watchers and queued responses for a Gemini tab.
+// Called after Gemini rewind to prevent stale responses from force-delivering.
+function cancelActiveWatchersForGeminiTab(geminiTabId) {
+  let cancelledWatchers = 0;
+  let cancelledTasks = 0;
+
+  // 1. Cancel deferred re-check timers and running tasks for all sub-agents of this Gemini tab
+  for (const [claudeTabId, parentTabId] of subAgentParentTab) {
+    if (parentTabId !== geminiTabId) continue;
+
+    // Clear deferred re-check timer
+    if (subAgentDeferredCheck.has(claudeTabId)) {
+      clearTimeout(subAgentDeferredCheck.get(claudeTabId));
+      subAgentDeferredCheck.delete(claudeTabId);
+      cancelledWatchers++;
+    }
+
+    // Cancel running tasks so IDLE handler won't trigger delivery
+    for (const [taskId, task] of mcpTasks) {
+      if (task.claudeTabId === claudeTabId && task.status === 'running') {
+        task.status = 'completed';
+        clearTaskTimeout(taskId);
+        cancelledTasks++;
+        // Notify renderer
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('mcp:task-status', { taskId, claudeTabId, status: 'completed' });
+        }
+      }
+    }
+  }
+
+  // 2. Clear queued responses (stale responses waiting for Gemini IDLE)
+  const queueSize = (geminiResponseQueue.get(geminiTabId) || []).length;
+  if (queueSize > 0) {
+    geminiResponseQueue.delete(geminiTabId);
+    notifyQueueUpdate(geminiTabId);
+  }
+
+  if (cancelledWatchers > 0 || cancelledTasks > 0 || queueSize > 0) {
+    console.log('[MCP:RewindCleanup] Gemini tab ' + geminiTabId + ': cancelled ' + cancelledWatchers + ' watcher(s), ' + cancelledTasks + ' task(s), ' + queueSize + ' queued response(s)');
+  }
+}
+
 // Handle sub-agent completion when interceptor is DISARMED (user doesn't want auto-delivery)
 // Completes the task but sends a notification to Gemini instead of the actual response.
 async function handleSubAgentCompletionDisarmed(claudeTabId) {
@@ -5389,6 +5432,9 @@ ipcMain.handle('gemini:open-history-menu', async (event, { tabId, targetText, sk
         // Step 6: Wait for rewind to complete and prompt to restore
         console.log('[Gemini:Rewind] Step 6: Waiting for prompt...');
         await waitForPtyText(term, /shift\+tab|INSERT|NORMAL/, 5000, '[Gemini:Rewind]');
+
+        // Step 6b: Cancel active MCP completion watchers (prevent stale response delivery after rewind)
+        cancelActiveWatchersForGeminiTab(tabId);
 
         // Step 7: Paste compact if provided
         if (pasteAfter && typeof pasteAfter === 'string' && pasteAfter.length > 0) {

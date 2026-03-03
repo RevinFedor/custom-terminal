@@ -171,6 +171,8 @@ export default function SubAgentBar({ projectId }: SubAgentBarProps) {
             {viewingSubAgentTabId ? '← Back' : 'Sub-agents:'}
           </button>
 
+          {/* Scrollable chips container */}
+          <div className="flex items-center gap-1.5 min-w-0 overflow-x-auto scrollbar-hide">
           {subAgentTabs.map((tab: any, i: number) => {
             const isViewing = viewingSubAgentTabId === tab.id;
             const isRunning = tab.claudeAgentStatus === 'running';
@@ -226,7 +228,7 @@ export default function SubAgentBar({ projectId }: SubAgentBarProps) {
                 onClick={() => handleChipClick(tab.id)}
                 onAuxClick={(e) => handleChipMiddleClick(e, tab.id)}
                 onContextMenu={(e) => handleContextMenu(e, tab)}
-                className="flex items-center gap-1.5 px-2 py-0.5 rounded transition-colors"
+                className="flex items-center gap-1.5 px-2 py-0.5 rounded transition-colors shrink-0"
                 style={{
                   backgroundColor: isViewing ? 'rgba(204, 120, 50, 0.3)' : 'rgba(255,255,255,0.06)',
                   border: isViewing ? '1px solid rgba(204, 120, 50, 0.5)' : '1px solid transparent',
@@ -260,6 +262,7 @@ export default function SubAgentBar({ projectId }: SubAgentBarProps) {
               </button>
             );
           })}
+          </div>
         </>
       )}
 
