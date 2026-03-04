@@ -1,27 +1,89 @@
 #!/bin/bash
 # =============================================================================
 # Semantic Router — Phase 2 (UserPromptSubmit Hook)
-# Триггер: промпт заканчивается на "???"
+# Triggers: ???/&&& (route files), ???+/&&&+ (route + previous Claude response as context)
 #
 # 1. Читает промпт пользователя
-# 2. Отправляет его + .semantic-index.json в Haiku 4.5 через claude -p
-# 3. Haiku выбирает 2-4 релевантных файла
-# 4. Содержимое файлов выводится в stdout -> инжектится как контекст для Claude
+# 2. Отправляет его + .semantic-index.json (+ опционально последний ответ Claude) в Haiku через claude -p
+# 3. Haiku выбирает 2-5 релевантных файлов
+# 4. Имена файлов + инструкция на чтение выводятся в stdout -> инжектятся как контекст для Claude
 # =============================================================================
 
 INPUT=$(cat)
 PROMPT=$(echo "$INPUT" | jq -r '.prompt // empty' 2>/dev/null)
 
-# Check trigger: ??? or &&& anywhere in prompt
+# Check trigger: ???/&&&[+[N|full]] anywhere in prompt
 if [ -z "$PROMPT" ] || ! echo "$PROMPT" | grep -qE '\?\?\?|&&&'; then
   exit 0
 fi
 
-# Strip all occurrences of trigger from prompt
-CLEAN_PROMPT=$(echo "$PROMPT" | sed -E 's/[[:space:]]*((\?\?\?)|(&&&))[[:space:]]*/ /g' | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')
+# Detect context mode: +full, +N, + (bare=1), or none
+CONTEXT_MODE=""
+if echo "$PROMPT" | grep -qE '(\?\?\?|&&&)\+full'; then
+  CONTEXT_MODE="full"
+elif echo "$PROMPT" | grep -qE '(\?\?\?|&&&)\+[0-9]'; then
+  CONTEXT_MODE=$(echo "$PROMPT" | grep -oE '(\?\?\?|&&&)\+[0-9]+' | head -1 | grep -oE '[0-9]+')
+elif echo "$PROMPT" | grep -qE '(\?\?\?|&&&)\+'; then
+  CONTEXT_MODE="1"
+fi
+
+# Strip all trigger variants from prompt
+CLEAN_PROMPT=$(echo "$PROMPT" | sed -E 's/[[:space:]]*((\?\?\?|&&&)\+?(full|[0-9]+)?)[[:space:]]*/ /g' | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')
 
 PROJECT_DIR="${CLAUDE_PROJECT_DIR:-.}"
 INDEX_FILE="$PROJECT_DIR/.semantic-index.json"
+
+# Extract context from JSONL based on mode
+LAST_RESPONSE=""
+if [ -n "$CONTEXT_MODE" ]; then
+  JSONL_PATH=$(echo "$INPUT" | jq -r '.transcript_path // empty' 2>/dev/null)
+  if [ -n "$JSONL_PATH" ] && [ -f "$JSONL_PATH" ]; then
+    if [ "$CONTEXT_MODE" = "full" ]; then
+      # Full session context: thinking + edits + commands + text (skip file reads)
+      LAST_RESPONSE=$(tail -500 "$JSONL_PATH" | jq -r '
+        if .type == "user" and (.message.content | type) == "string" then
+          "Human: " + (.message.content | tostring | .[0:500])
+        elif .type == "assistant" and .message.content[0].type == "text" then
+          "Assistant: " + (.message.content[0].text | .[0:1000])
+        elif .type == "assistant" and .message.content[0].type == "thinking" then
+          "Thinking: " + (.message.content[0].thinking | .[0:300]) + "..."
+        elif .type == "assistant" and .message.content[0].type == "tool_use" then
+          (if .message.content[0].name == "Edit" then
+            "✏️ Edit: " + (.message.content[0].input.file_path // "?")
+          elif .message.content[0].name == "Write" then
+            "✏️ Write: " + (.message.content[0].input.file_path // "?")
+          elif .message.content[0].name == "Bash" then
+            "🖥 Cmd: " + ((.message.content[0].input.command // "?") | .[0:200])
+          else empty end)
+        else empty end
+      ' 2>/dev/null | head -c 8000)
+    else
+      # Numeric mode: last N assistant text blocks (chronological order)
+      COUNT="$CONTEXT_MODE"
+      LAST_RESPONSE=$(tail -500 "$JSONL_PATH" | tail -r | {
+        found=0
+        result=""
+        while IFS= read -r line; do
+          TXT=$(echo "$line" | jq -r 'select(.type == "assistant") | .message.content[0] | select(.type == "text") | .text' 2>/dev/null)
+          if [ -n "$TXT" ] && [ "$TXT" != "null" ]; then
+            if [ -n "$result" ]; then
+              result="${TXT}
+---
+${result}"
+            else
+              result="$TXT"
+            fi
+            found=$((found + 1))
+            if [ "$found" -ge "$COUNT" ]; then
+              break
+            fi
+          fi
+        done
+        echo "$result"
+      } | head -c 6000)
+    fi
+  fi
+fi
 
 # Silent exits if prerequisites missing
 if ! command -v claude &>/dev/null; then
@@ -95,7 +157,11 @@ RULES:
 Respond ONLY with a valid JSON array of paths. No markdown, no explanations, no reasoning.
 Example: ["docs/knowledge/fact-terminal-core.md", "docs/knowledge/fix-zustand-silent-mutation.md", "docs/knowledge/fact-css-layout.md"]'
 
-USER_MSG=$(printf 'Запрос пользователя: %s\n\nДоступный индекс:\n%s' "$CLEAN_PROMPT" "$INDEX_COMPACT")
+if [ -n "$CONTEXT_MODE" ] && [ -n "$LAST_RESPONSE" ]; then
+  USER_MSG=$(printf 'User request: %s\n\nPrevious Claude context (mode: %s):\n%s\n\nAvailable index:\n%s' "$CLEAN_PROMPT" "$CONTEXT_MODE" "$LAST_RESPONSE" "$INDEX_COMPACT")
+else
+  USER_MSG=$(printf 'User request: %s\n\nAvailable index:\n%s' "$CLEAN_PROMPT" "$INDEX_COMPACT")
+fi
 
 # Call Haiku via claude -p
 # env -u CLAUDECODE — обязательно, иначе "nested session" error
@@ -128,10 +194,9 @@ fi
 # Log selected files
 FILE_NAMES=$(echo "$FILE_LIST" | xargs -I{} basename {} | tr '\n' ', ' | sed 's/,$//')
 
-# Лог в файл — пользователь видит через: tail -f /tmp/semantic-router.log
-ROUTER_LOG="/tmp/semantic-router.log"
-echo "[$(date '+%H:%M:%S')] Selected: $FILE_NAMES" >> "$ROUTER_LOG"
-echo "[$(date '+%H:%M:%S')] Prompt: $(echo "$CLEAN_PROMPT" | head -c 80)..." >> "$ROUTER_LOG"
+CTX_LABEL=""; if [ -n "$CONTEXT_MODE" ]; then CTX_LABEL=" [+$CONTEXT_MODE]"; fi
+echo "[$(date '+%H:%M:%S')]${CTX_LABEL} Selected: $FILE_NAMES" >> "$ROUTER_LOG"
+echo "[$(date '+%H:%M:%S')]${CTX_LABEL} Prompt: $(echo "$CLEAN_PROMPT" | head -c 80)..." >> "$ROUTER_LOG"
 
 # stdout: инструкция для Claude (приходит как <system-reminder>)
 echo "BLOCKING INSTRUCTION — you MUST complete these steps before responding to the user:"
