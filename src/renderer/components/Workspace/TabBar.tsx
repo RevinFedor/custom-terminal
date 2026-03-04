@@ -157,22 +157,35 @@ const RestartZone = memo(({ hasProcess, hasColor, commandType, hasSession, isBus
           </div>
         ) : (
           // Green dot (process running) or red dot (claude without saved session)
-          // Claude tabs pulse only when actively busy (thinking/streaming)
-          <span
-            style={{
-              display: 'block',
-              width: '6px',
-              height: '6px',
-              borderRadius: '50%',
-              backgroundColor: (commandType === 'claude' && !hasSession) ? '#f87171' : '#4ade80',
-              opacity: hasColor ? 0.9 : 0.8,
-              boxShadow: (commandType === 'claude' && !hasSession)
-                ? '0 0 4px rgba(248, 113, 113, 0.5)'
-                : '0 0 4px rgba(74, 222, 128, 0.5)',
-              animation: ((commandType === 'claude' || commandType === 'gemini') && isBusy)
-                ? 'tab-dot-pulse 1.5s ease-in-out infinite' : 'none',
-            }}
-          />
+          // Claude/Gemini tabs show spinning arc when busy
+          ((commandType === 'claude' || commandType === 'gemini') && isBusy) ? (
+            <span
+              style={{
+                display: 'block',
+                width: '8px',
+                height: '8px',
+                borderRadius: '50%',
+                border: '1.5px solid rgba(74, 222, 128, 0.2)',
+                borderTopColor: '#4ade80',
+                boxSizing: 'border-box',
+                animation: 'tab-dot-spin 0.8s linear infinite',
+              }}
+            />
+          ) : (
+            <span
+              style={{
+                display: 'block',
+                width: '6px',
+                height: '6px',
+                borderRadius: '50%',
+                backgroundColor: (commandType === 'claude' && !hasSession) ? '#f87171' : '#4ade80',
+                opacity: hasColor ? 0.9 : 0.8,
+                boxShadow: (commandType === 'claude' && !hasSession)
+                  ? '0 0 4px rgba(248, 113, 113, 0.5)'
+                  : '0 0 4px rgba(74, 222, 128, 0.5)',
+              }}
+            />
+          )
         )
       ) : null}
     </div>

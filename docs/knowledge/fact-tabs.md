@@ -44,6 +44,9 @@
     - Данные транслируются через унифицированный механизм `busy-state` IPC. 
     - См. [`fix-claude-busy-detection.md`](knowledge/fix-claude-busy-detection.md) и [`fact-gemini-automation.md`](knowledge/fact-gemini-automation.md).
 - **SubAgentBar: Бесшовный лейбл.** Панель sub-агентов использует лейбл с фиксированной шириной `min-width: 68px`. При переключении между "Sub-agents:" и "← Back" позиция вкладок sub-агентов не меняется (отсутствие Layout Shift).
+- **SubAgentBar: Dashboard & Monitoring.** Панель видна всегда при наличии хотя бы одного связанного агента. Бейдж справа отображает суммарную активность. 
+    - **Dashboard Dropdown:** Открывает расширенный список всех агентов. Позволяет мгновенно переключаться между ними кликом по строке.
+    - **Pin Logic:** Кнопка-иголка в меню позволяет закрепить панель в открытом состоянии. Это отключает `onMouseLeave` закрытие, позволяя пользователю держать список статусов перед глазами.
 - **SubAgentBar: Reactive Logic.** Компонент использует строковые ключи для селекторов (String Key Pattern), чтобы избежать бесконечных рендеров при обновлении списка суб-агентов. Валидация всей цепочки (Gemini → Claude Sub-agent) выполняется E2E тестом `auto/sandbox/test-sub-agent-state.js`.
 - **SubAgentBar: Visual Indicators.** Статус субагента отображается комбинацией символов и прозрачности:
     - **● (Filled):** Claude CLI запущен и активен (через `claudeActive`).

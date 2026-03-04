@@ -1,4 +1,5 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Pin } from 'lucide-react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 
 const { ipcRenderer } = window.require('electron');
@@ -28,7 +29,9 @@ export default function SubAgentBar({ projectId }: SubAgentBarProps) {
 
   // ========== RESPONSE QUEUE STATE ==========
   const [queueItems, setQueueItems] = useState<QueueItem[]>([]);
-  const [showQueueTooltip, setShowQueueTooltip] = useState(false);
+  const [showDropdown, setShowDropdown] = useState(false);
+  const [pinned, setPinned] = useState(false);
+  const dropdownRef = useRef<HTMLDivElement>(null);
 
   // Listen for queue updates from main process
   useEffect(() => {
@@ -52,8 +55,22 @@ export default function SubAgentBar({ projectId }: SubAgentBarProps) {
   // Reset queue when tab changes
   useEffect(() => {
     setQueueItems([]);
-    setShowQueueTooltip(false);
+    setShowDropdown(false);
+    setPinned(false);
   }, [activeTabId]);
+
+  // Close dropdown on click outside (when pinned)
+  useEffect(() => {
+    if (!pinned) return;
+    const handler = (e: MouseEvent) => {
+      if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node)) {
+        setPinned(false);
+        setShowDropdown(false);
+      }
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [pinned]);
 
   // Stable string key: re-derive sub-agents only when tab IDs, statuses, claudeActive, busy, taskCount, or interceptor change
   // Search CROSS-PROJECT: sub-agents may have been created in a different project (activeProjectId bug)
@@ -143,6 +160,18 @@ export default function SubAgentBar({ projectId }: SubAgentBarProps) {
   // Show bar if we have sub-agents OR queued responses
   if (!hasSubAgents && !hasQueue) return null;
 
+  // Active processes: sub-agents working with armed interceptor
+  const activeProcesses = subAgentTabs.filter((t: any) =>
+    t.claudeBusy === true && t.interceptorState === 'armed'
+  );
+  const hasActive = activeProcesses.length > 0;
+
+  // Badge label
+  const badgeParts: string[] = [];
+  if (hasActive) badgeParts.push(activeProcesses.length === 1 ? '1 active' : `${activeProcesses.length} active`);
+  if (hasQueue) badgeParts.push(queueItems.length === 1 ? '1 queued' : `${queueItems.length} queued`);
+  const badgeLabel = badgeParts.length > 0 ? badgeParts.join(', ') : `${subAgentTabs.length} agent${subAgentTabs.length > 1 ? 's' : ''}`;
+
   return (
     <div
       className="flex items-center gap-1.5 px-2 border-b border-border-main"
@@ -183,20 +212,14 @@ export default function SubAgentBar({ projectId }: SubAgentBarProps) {
             const isBusy = tab.claudeBusy === true;
             const interceptor = tab.interceptorState as 'armed' | 'disarmed' | null | undefined;
 
-            // Indicator color: interceptor state takes priority when busy
+            // Indicator color: interceptor state shown via color, busy via spinner
             let dotColor: string;
-            let dotPulsing = false;
+            let dotSpinning = false;
             if (!alive) {
               dotColor = 'rgba(255,255,255,0.25)'; // gray = dead
-            } else if (isBusy && interceptor === 'armed') {
-              dotColor = '#b4a0ff'; // purple = armed + busy
-              dotPulsing = true;
-            } else if (isBusy && interceptor === 'disarmed') {
-              dotColor = '#f38ba8'; // red = disarmed + busy
-              dotPulsing = true;
             } else if (isBusy) {
-              dotColor = '#DA7756'; // orange = busy (no interceptor state — legacy)
-              dotPulsing = true;
+              dotColor = '#a6e3a1'; // green spinner when busy
+              dotSpinning = true;
             } else {
               dotColor = '#a6e3a1'; // green = idle, alive
             }
@@ -238,17 +261,32 @@ export default function SubAgentBar({ projectId }: SubAgentBarProps) {
                 }}
                 title={tooltipParts.join('\n')}
               >
-                {/* Process indicator: color depends on interceptor + busy state */}
-                <span
-                  style={{
-                    fontSize: '9px',
-                    lineHeight: 1,
-                    color: dotColor,
-                    animation: dotPulsing ? 'tab-dot-pulse 1.5s ease-in-out infinite' : 'none',
-                  }}
-                >
-                  {alive ? '\u25CF' : '\u25CC'}
-                </span>
+                {/* Process indicator: spinner when busy, dot when idle */}
+                {dotSpinning ? (
+                  <span
+                    style={{
+                      display: 'inline-block',
+                      width: '8px',
+                      height: '8px',
+                      borderRadius: '50%',
+                      border: '1.5px solid rgba(166, 227, 161, 0.2)',
+                      borderTopColor: '#a6e3a1',
+                      boxSizing: 'border-box',
+                      animation: 'tab-dot-spin 0.8s linear infinite',
+                      verticalAlign: 'middle',
+                    }}
+                  />
+                ) : (
+                  <span
+                    style={{
+                      fontSize: '9px',
+                      lineHeight: 1,
+                      color: dotColor,
+                    }}
+                  >
+                    {alive ? '\u25CF' : '\u25CC'}
+                  </span>
+                )}
                 <span>Claude #{i + 1}</span>
                 {statusText && (
                   <span style={{
@@ -266,64 +304,85 @@ export default function SubAgentBar({ projectId }: SubAgentBarProps) {
         </>
       )}
 
-      {/* Spacer pushes queue indicator to the right */}
+      {/* Spacer pushes status indicator to the right */}
       <div className="flex-1" />
 
-      {/* Right side: Queue indicator with force-send */}
-      {hasQueue && (
+      {/* Right side: Status badge (always visible when sub-agents exist) */}
+      {hasSubAgents && (
         <div
+          ref={dropdownRef}
           className="relative flex items-center gap-1.5 shrink-0"
-          onMouseEnter={() => setShowQueueTooltip(true)}
-          onMouseLeave={() => setShowQueueTooltip(false)}
+          onMouseEnter={() => { if (!pinned) setShowDropdown(true); }}
+          onMouseLeave={() => { if (!pinned) setShowDropdown(false); }}
         >
-          {/* Queue badge */}
+          {/* Status badge — click to pin/unpin dropdown */}
           <div
+            onClick={() => { setPinned(!pinned); setShowDropdown(true); }}
             className="flex items-center gap-1 px-2 py-0.5 rounded"
             style={{
-              backgroundColor: 'rgba(180, 130, 255, 0.15)',
-              border: '1px solid rgba(180, 130, 255, 0.3)',
-              color: 'rgba(180, 130, 255, 0.9)',
-              fontSize: '10px',
-            }}
-          >
-            <span style={{
-              fontSize: '9px',
-              animation: 'tab-dot-pulse 2s ease-in-out infinite',
-            }}>
-              {'\u25CF'}
-            </span>
-            <span>
-              {queueItems.length === 1
-                ? '1 queued'
-                : `${queueItems.length} queued`
-              }
-            </span>
-          </div>
-
-          {/* Send now button */}
-          <button
-            onClick={handleForceFlush}
-            className="flex items-center gap-1 px-2 py-0.5 rounded transition-colors"
-            style={{
-              backgroundColor: 'rgba(166, 227, 161, 0.15)',
-              border: '1px solid rgba(166, 227, 161, 0.3)',
-              color: 'rgba(166, 227, 161, 0.9)',
+              backgroundColor: (hasActive || hasQueue) ? 'rgba(180, 130, 255, 0.15)' : 'rgba(255,255,255,0.04)',
+              border: pinned ? '1px solid rgba(180, 130, 255, 0.5)' : (hasActive || hasQueue) ? '1px solid rgba(180, 130, 255, 0.3)' : '1px solid rgba(255,255,255,0.08)',
+              color: (hasActive || hasQueue) ? 'rgba(180, 130, 255, 0.9)' : 'rgba(255,255,255,0.4)',
               fontSize: '10px',
               cursor: 'pointer',
             }}
-            title="Force deliver next response (clears input)"
           >
-            Send now
-          </button>
+            {(hasActive || hasQueue) && (
+              <span
+                style={{
+                  display: 'inline-block',
+                  width: '8px',
+                  height: '8px',
+                  borderRadius: '50%',
+                  border: '1.5px solid rgba(180, 130, 255, 0.2)',
+                  borderTopColor: 'rgba(180, 130, 255, 0.9)',
+                  boxSizing: 'border-box',
+                  animation: 'tab-dot-spin 0.8s linear infinite',
+                  verticalAlign: 'middle',
+                }}
+              />
+            )}
+            <span>{badgeLabel}</span>
+            {/* Pin icon — reserved space always, visible on hover/pinned */}
+            <Pin
+              size={10}
+              style={{
+                width: '12px',
+                flexShrink: 0,
+                opacity: pinned || showDropdown ? 1 : 0,
+                color: pinned ? 'rgba(180, 130, 255, 0.9)' : 'rgba(255,255,255,0.3)',
+                transition: 'opacity 0.15s',
+                transform: pinned ? 'rotate(0deg)' : 'rotate(45deg)',
+              }}
+            />
+          </div>
 
-          {/* Tooltip with queue details */}
-          {showQueueTooltip && (
+          {/* Send now button (only when queue has items) */}
+          {hasQueue && (
+            <button
+              onClick={handleForceFlush}
+              className="flex items-center gap-1 px-2 py-0.5 rounded transition-colors"
+              style={{
+                backgroundColor: 'rgba(166, 227, 161, 0.15)',
+                border: '1px solid rgba(166, 227, 161, 0.3)',
+                color: 'rgba(166, 227, 161, 0.9)',
+                fontSize: '10px',
+                cursor: 'pointer',
+              }}
+              title="Force deliver next response (clears input)"
+            >
+              Send now
+            </button>
+          )}
+
+          {/* Dropdown */}
+          {showDropdown && (
             <div
               style={{
                 position: 'absolute',
                 top: '100%',
                 right: 0,
-                paddingTop: '6px', // invisible bridge — keeps hover alive between badge and tooltip
+                paddingTop: '6px', // invisible bridge
                 zIndex: 200,
               }}
             >
@@ -338,34 +397,114 @@ export default function SubAgentBar({ projectId }: SubAgentBarProps) {
                 boxShadow: '0 4px 12px rgba(0, 0, 0, 0.4)',
               }}
             >
-              <div style={{
-                fontSize: '10px',
-                color: 'rgba(255,255,255,0.4)',
-                marginBottom: '6px',
-              }}>
-                Waiting for input to clear
+              {/* Header */}
+              <div style={{ fontSize: '10px', color: 'rgba(255,255,255,0.4)', marginBottom: '6px' }}>
+                {hasActive ? 'Working' : hasQueue ? 'Queued' : 'Agents'}
               </div>
-              {queueItems.map((item, i) => (
+
+              {/* Active processes section */}
+              {hasActive && activeProcesses.map((tab: any, i: number) => (
                 <div
-                  key={item.taskId + '-' + i}
+                  key={tab.id}
+                  onClick={() => handleChipClick(tab.id)}
                   style={{
                     fontSize: '10px',
                     color: 'rgba(255,255,255,0.7)',
-                    padding: '3px 0',
+                    padding: '4px 6px',
                     borderTop: i > 0 ? '1px solid rgba(255,255,255,0.06)' : 'none',
+                    cursor: 'pointer',
+                    borderRadius: '3px',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '6px',
                   }}
+                  onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.backgroundColor = 'rgba(255,255,255,0.06)'; }}
+                  onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.backgroundColor = 'transparent'; }}
                 >
-                  <span style={{ color: 'rgba(180, 130, 255, 0.7)' }}>
-                    {item.tabName}:
-                  </span>{' '}
-                  <span style={{ color: 'rgba(255,255,255,0.5)' }}>
-                    {item.promptPreview.length > 80
-                      ? item.promptPreview.substring(0, 80) + '...'
-                      : item.promptPreview
-                    }
-                  </span>
+                  <span style={{
+                    fontSize: '9px',
+                    color: '#b4a0ff',
+                    animation: 'tab-dot-pulse 1.5s ease-in-out infinite',
+                  }}>{'\u25CF'}</span>
+                  <span style={{ color: '#b4a0ff' }}>{tab.name || 'claude-sub'}</span>
+                  <span style={{ color: 'rgba(255,255,255,0.35)', fontStyle: 'italic' }}>awaiting response</span>
                 </div>
               ))}
+
+              {/* Queue section */}
+              {hasQueue && (
+                <>
+                  {hasActive && (
+                    <div style={{
+                      fontSize: '10px',
+                      color: 'rgba(255,255,255,0.4)',
+                      marginBottom: '4px',
+                      marginTop: '8px',
+                      paddingTop: '6px',
+                      borderTop: '1px solid rgba(255,255,255,0.08)',
+                    }}>
+                      Queued — waiting for input to clear
+                    </div>
+                  )}
+                  {queueItems.map((item, i) => (
+                    <div
+                      key={item.taskId + '-' + i}
+                      style={{
+                        fontSize: '10px',
+                        color: 'rgba(255,255,255,0.7)',
+                        padding: '3px 0',
+                        borderTop: (i > 0 || hasActive) ? '1px solid rgba(255,255,255,0.06)' : 'none',
+                      }}
+                    >
+                      <span style={{ color: 'rgba(180, 130, 255, 0.7)' }}>
+                        {item.tabName}:
+                      </span>{' '}
+                      <span style={{ color: 'rgba(255,255,255,0.5)' }}>
+                        {item.promptPreview.length > 80
+                          ? item.promptPreview.substring(0, 80) + '...'
+                          : item.promptPreview
+                        }
+                      </span>
+                    </div>
+                  ))}
+                </>
+              )}
+
+              {/* Idle agents list (when nothing active/queued) */}
+              {!hasActive && !hasQueue && subAgentTabs.map((tab: any, i: number) => {
+                const alive = tab.claudeActive !== false;
+                const taskCount = tab.claudeTaskCount || 0;
+                return (
+                  <div
+                    key={tab.id}
+                    onClick={() => handleChipClick(tab.id)}
+                    style={{
+                      fontSize: '10px',
+                      color: 'rgba(255,255,255,0.7)',
+                      padding: '4px 6px',
+                      borderTop: i > 0 ? '1px solid rgba(255,255,255,0.06)' : 'none',
+                      cursor: 'pointer',
+                      borderRadius: '3px',
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '6px',
+                    }}
+                    onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.backgroundColor = 'rgba(255,255,255,0.06)'; }}
+                    onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.backgroundColor = 'transparent'; }}
+                  >
+                    <span style={{
+                      fontSize: '9px',
+                      color: alive ? '#a6e3a1' : 'rgba(255,255,255,0.25)',
+                    }}>{alive ? '\u25CF' : '\u25CC'}</span>
+                    <span>{tab.name || 'claude-sub'}</span>
+                    {taskCount > 0 && (
+                      <span style={{ color: 'rgba(255,255,255,0.35)' }}>
+                        {taskCount} task{taskCount > 1 ? 's' : ''}
+                      </span>
+                    )}
+                  </div>
+                );
+              })}
             </div>
             </div>
           )}

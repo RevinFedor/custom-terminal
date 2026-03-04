@@ -745,6 +745,12 @@ function App() {
       }
     };
 
+    // MCP respawn PTY for dead sub-agent (continue_claude needs a live PTY)
+    const handleRespawnSubAgentPty = (_: any, data: { tabId: string; cwd: string }) => {
+      console.warn('[MCP:Respawn] Creating PTY for dead sub-agent tab:', data.tabId);
+      ipcRenderer.invoke('terminal:create', { tabId: data.tabId, cwd: data.cwd, rows: 32, cols: 96 });
+    };
+
     ipcRenderer.on('terminal:command-started', handleCommandStarted);
     ipcRenderer.on('terminal:command-finished', handleCommandFinished);
     ipcRenderer.on('mcp:create-sub-agent-tab', handleMcpCreateSubAgent);
@@ -755,6 +761,7 @@ function App() {
     ipcRenderer.on('claude:busy-state', handleClaudeBusyState);
     ipcRenderer.on('mcp:interceptor-state', handleInterceptorState);
     ipcRenderer.on('mcp:close-sub-agent-tab', handleMcpCloseSubAgent);
+    ipcRenderer.on('mcp:respawn-sub-agent-pty', handleRespawnSubAgentPty);
 
     return () => {
       ipcRenderer.removeListener('terminal:command-started', handleCommandStarted);
@@ -767,6 +774,7 @@ function App() {
       ipcRenderer.removeListener('claude:busy-state', handleClaudeBusyState);
       ipcRenderer.removeListener('mcp:interceptor-state', handleInterceptorState);
       ipcRenderer.removeListener('mcp:close-sub-agent-tab', handleMcpCloseSubAgent);
+      ipcRenderer.removeListener('mcp:respawn-sub-agent-pty', handleRespawnSubAgentPty);
     };
   }, [openProjects.size]); // Re-init when projects change
 

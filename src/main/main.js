@@ -1745,7 +1745,22 @@ async function continueClaudeSubAgent(taskId, prompt, ppid) {
       throw new Error('Cannot resume: no Claude session ID found for tab ' + claudeTabId);
     }
 
-    // Wait for PTY to appear (terminal may need to boot shell)
+    // Respawn PTY if dead (e.g. sub-agent PTY exited while app was running)
+    if (!terminals.get(claudeTabId) && mainWindow && !mainWindow.isDestroyed()) {
+      let respawnCwd = terminalProjects.get(claudeTabId);
+      if (!respawnCwd) {
+        try {
+          const cwdRow = projectManager.db.db.prepare('SELECT cwd FROM tabs WHERE tab_id = ? LIMIT 1').get(claudeTabId);
+          respawnCwd = cwdRow?.cwd || process.env.HOME;
+        } catch (e) {
+          respawnCwd = process.env.HOME;
+        }
+      }
+      console.log('[MCP:Continue] PTY dead for ' + claudeTabId + '. Requesting respawn (cwd=' + respawnCwd + ')');
+      mainWindow.webContents.send('mcp:respawn-sub-agent-pty', { tabId: claudeTabId, cwd: respawnCwd });
+    }
+
+    // Wait for PTY to appear (renderer will create it via terminal:create IPC)
     let term = null;
     for (let retry = 0; retry < 10; retry++) {
       term = terminals.get(claudeTabId);
@@ -1787,7 +1802,7 @@ async function continueClaudeSubAgent(taskId, prompt, ppid) {
 }
 
 // Read the latest assistant message from Claude JSONL session
-function readLatestAssistantMessage(sessionId, cwd) {
+async function readLatestAssistantMessage(sessionId, cwd) {
   const found = findSessionFile(sessionId, cwd);
   if (!found) {
     console.log('[MCP:Response] Session file not found for: ' + sessionId + ' cwd=' + cwd);
@@ -1795,7 +1810,7 @@ function readLatestAssistantMessage(sessionId, cwd) {
   }
 
   console.log('[MCP:Response] Found session file: ' + found.filePath);
-  const { recordMap, lastRecord } = loadJsonlRecords(found.filePath);
+  const { recordMap, lastRecord } = await loadJsonlRecords(found.filePath);
   if (!lastRecord) {
     console.log('[MCP:Response] No lastRecord in JSONL (empty or parse error). recordMap.size=' + recordMap.size);
     return null;
@@ -2320,7 +2335,7 @@ async function handleSubAgentCompletion(claudeTabId, recheckCount) {
 
   let result = null;
   if (sessionId) {
-    result = readLatestAssistantMessage(sessionId, cwd);
+    result = await readLatestAssistantMessage(sessionId, cwd);
   }
 
   if (!result) {
@@ -2457,7 +2472,7 @@ async function handleReArmedDelivery(claudeTabId) {
     }
   }
 
-  const result = readLatestAssistantMessage(sessionId, cwd);
+  const result = await readLatestAssistantMessage(sessionId, cwd);
   if (!result) {
     console.log('[MCP:ReArm] No response found in JSONL');
     return;
@@ -2540,7 +2555,7 @@ ipcMain.handle('mcp:deliver-last-response', async (event, claudeTabId) => {
     return { error: 'No Claude session ID' };
   }
 
-  const result = readLatestAssistantMessage(sessionId, cwd);
+  const result = await readLatestAssistantMessage(sessionId, cwd);
   if (!result) {
     console.log('[MCP:ManualDeliver] No response found in JSONL');
     return { error: 'No response found' };
@@ -2796,6 +2811,13 @@ function formatToolAction(toolName, input, toolResult = null, includeEditing = f
 
 // Create new terminal for a tab
 ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initialCommand }) => {
+    // Guard: if PTY already exists (e.g. respawned by MCP continue_claude), reuse it
+    const existingPty = terminals.get(tabId);
+    if (existingPty) {
+      console.log('[terminal:create] PTY already exists for ' + tabId + ' (pid=' + existingPty.pid + '), reusing');
+      return { pid: existingPty.pid, cwd: terminalProjects.get(tabId) };
+    }
+
     console.time(`[PERF:main] terminal:create ${tabId}`);
     const shell = process.env.SHELL || '/bin/bash';
     const shellName = path.basename(shell);
@@ -3134,7 +3156,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
               }
             }
           } else if (geminiSpinnerBusy.get(tabId)) {
-            // Was busy, no spinner in this chunk — schedule idle after 1.5s silence
+            // Was busy, no spinner in this chunk — schedule idle after 500ms silence
             clearTimeout(geminiSpinnerIdleTimers.get(tabId));
             geminiSpinnerIdleTimers.set(tabId, setTimeout(function() {
               geminiSpinnerBusy.set(tabId, false);
@@ -3145,7 +3167,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
               }
               // Try to process queue after Gemini finishes responding
               processGeminiQueue(tabId);
-            }, 1500));
+            }, 500));
           }
         }
       }

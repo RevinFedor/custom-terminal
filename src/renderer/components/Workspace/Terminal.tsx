@@ -1596,15 +1596,6 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
     <>
       <div className="absolute inset-0" style={{ zIndex: effectiveActive ? 1 : -1, isolation: 'isolate' }}>
 
-        {/* Claude Agent working indicator — top-right corner */}
-        {claudeAgentStatus === 'running' && effectiveActive && (
-          <div className="absolute top-2 right-2 z-10 flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs"
-            style={{ background: 'rgb(99, 102, 241)', color: 'rgb(255, 255, 255)' }}>
-            <span className="inline-block w-1.5 h-1.5 rounded-full animate-pulse" style={{ background: 'rgb(255, 255, 255)' }} />
-            Claude Agent
-          </div>
-        )}
-
         {/* Layer 1: Terminal (Lower) */}
         <div
           ref={terminalRef}
