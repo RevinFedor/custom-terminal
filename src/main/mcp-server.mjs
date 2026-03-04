@@ -135,6 +135,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: 'string',
             description: 'Optional: custom name for the agent tab (e.g. "refactor-auth", "fix-bug-123"). If not provided, defaults to "claude-sub".',
           },
+          session_id: {
+            type: 'string',
+            description: 'Optional: existing Claude session UUID to resume. If provided, the agent will continue this session instead of starting fresh. Use this to attach an existing conversation as a sub-agent.',
+          },
         },
         required: ['prompt'],
       },
@@ -240,6 +244,20 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ['taskIds'],
       },
     },
+    {
+      name: 'close_sub_agent',
+      description: 'Close a Claude Code sub-agent tab. The tab will be closed and removed from the UI (same as Cmd+W). Use this to clean up sub-agents that have finished their work. The session history is preserved in the archive.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          taskId: {
+            type: 'string',
+            description: 'The task ID of the sub-agent to close (from list_sub_agents or delegate_to_claude)',
+          },
+        },
+        required: ['taskId'],
+      },
+    },
   ],
 }));
 
@@ -256,13 +274,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const result = await httpPost('/delegate', {
           prompt: args.prompt,
           name: args.name || undefined,
+          session_id: args.session_id || undefined,
           ppid,
         });
         return {
           content: [
             {
               type: 'text',
-              text: 'Task accepted. ID: ' + result.taskId + '\nClaude is now working in a terminal tab. The result will be AUTOMATICALLY injected into your conversation when done — no need to poll or check status. Just continue with your other work.',
+              text: 'Task accepted. ID: ' + result.taskId + (args.session_id ? ' (resuming session ' + args.session_id.substring(0, 8) + '...)' : '') + '\nClaude is now working in a terminal tab. The result will be AUTOMATICALLY injected into your conversation when done — no need to poll or check status. Just continue with your other work.',
             },
           ],
         };
@@ -387,6 +406,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
         return {
           content: [{ type: 'text', text }],
+        };
+      }
+
+      case 'close_sub_agent': {
+        const result = await httpPost('/close-sub-agent', {
+          taskId: args.taskId,
+          ppid,
+        });
+        return {
+          content: [
+            {
+              type: 'text',
+              text: 'Sub-agent closed. Tab ' + (result.claudeTabId || args.taskId) + ' has been removed.',
+            },
+          ],
         };
       }
 

@@ -146,7 +146,11 @@ setActiveCommandType(tab.commandType || null);
 ### Когда Sniper срабатывает
 - **С Default Prompt:** Промпт отправляется автоматически через Handshake → Claude отвечает → `.jsonl` создан → Sniper ловит → `claudeSessionId` установлен → InfoPanel переключается на "Активная сессия".
 - **Без Default Prompt:** Пользователь вводит промпт вручную → Claude отвечает → `.jsonl` создан → Sniper ловит → переход из "Ожидание" в "Активная".
-- **History Restore:** `claudeSessionId` берётся из БД (Immediate Injection), Sniper не нужен.
+
+### Когда используется Immediate Injection (Sniper не нужен)
+1. **History Restore:** `claudeSessionId` берется из БД.
+2. **Rollback / Fork:** ID новой сессии передается напрямую в `createTab()`.
+3. **Sub-agent Delegation:** При вызове `delegate_to_claude` с `session_id` идентификатор мгновенно прописывается в `bridgeKnownSessions`. Это критично для обхода фазы «Ожидания» и немедленной готовности Timeline. См. `knowledge/fact-mcp-delegation.md`.
 
 ### Результат
 Пользователь всегда видит корректный статус: AI запущен, но ID ещё не захвачен — жёлтый индикатор с пульсом.
