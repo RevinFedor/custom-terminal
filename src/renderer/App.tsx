@@ -673,6 +673,7 @@ function App() {
           background: true,
           parentTabId: data.geminiTabId,
           mcpTaskId: data.taskId,
+          claudeSessionId: data.claudeSessionId || undefined,
         } as any);
 
         // Note: claudeActive will be set by mcp:claude-cli-active when Claude CLI actually launches
@@ -733,6 +734,17 @@ function App() {
       state.setInterceptorState(data.claudeTabId, data.state);
     };
 
+    // MCP close sub-agent tab (main process → renderer, triggered by Gemini via close_sub_agent tool)
+    const handleMcpCloseSubAgent = (_: any, data: { claudeTabId: string }) => {
+      const state = useWorkspaceStore.getState();
+      for (const [projId, ws] of state.openProjects) {
+        if (ws.tabs.has(data.claudeTabId)) {
+          state.closeTab(projId, data.claudeTabId, { skipProcessCheck: true });
+          break;
+        }
+      }
+    };
+
     ipcRenderer.on('terminal:command-started', handleCommandStarted);
     ipcRenderer.on('terminal:command-finished', handleCommandFinished);
     ipcRenderer.on('mcp:create-sub-agent-tab', handleMcpCreateSubAgent);
@@ -742,6 +754,7 @@ function App() {
     ipcRenderer.on('mcp:claude-cli-active', handleClaudeCliActive);
     ipcRenderer.on('claude:busy-state', handleClaudeBusyState);
     ipcRenderer.on('mcp:interceptor-state', handleInterceptorState);
+    ipcRenderer.on('mcp:close-sub-agent-tab', handleMcpCloseSubAgent);
 
     return () => {
       ipcRenderer.removeListener('terminal:command-started', handleCommandStarted);
@@ -753,6 +766,7 @@ function App() {
       ipcRenderer.removeListener('mcp:claude-cli-active', handleClaudeCliActive);
       ipcRenderer.removeListener('claude:busy-state', handleClaudeBusyState);
       ipcRenderer.removeListener('mcp:interceptor-state', handleInterceptorState);
+      ipcRenderer.removeListener('mcp:close-sub-agent-tab', handleMcpCloseSubAgent);
     };
   }, [openProjects.size]); // Re-init when projects change
 

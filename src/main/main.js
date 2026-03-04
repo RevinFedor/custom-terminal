@@ -957,7 +957,7 @@ function startMcpHttpServer() {
       req.on('data', chunk => { body += chunk; });
       req.on('end', async () => {
         try {
-          const { prompt, name, ppid } = JSON.parse(body);
+          const { prompt, name, session_id, ppid } = JSON.parse(body);
           if (!prompt) {
             res.writeHead(400);
             res.end(JSON.stringify({ error: 'prompt is required' }));
@@ -965,10 +965,10 @@ function startMcpHttpServer() {
           }
 
           const taskId = crypto.randomUUID();
-          console.log('[MCP:HTTP] POST /delegate taskId=' + taskId + ' ppid=' + ppid + ' prompt="' + prompt.substring(0, 60) + '..."');
+          console.log('[MCP:HTTP] POST /delegate taskId=' + taskId + ' ppid=' + ppid + (session_id ? ' resume=' + session_id.substring(0, 8) : '') + ' prompt="' + prompt.substring(0, 60) + '..."');
 
           // Fire-and-forget: start delegation async, return taskId immediately
-          delegateToClaudeSubAgent(taskId, prompt, ppid, name).catch(err => {
+          delegateToClaudeSubAgent(taskId, prompt, ppid, name, session_id).catch(err => {
             console.error('[MCP:Delegate] Error:', err.message);
             const task = mcpTasks.get(taskId);
             if (task) {
@@ -1307,6 +1307,16 @@ function startMcpHttpServer() {
               }
 
               if (!claudeTabId) {
+                // Try resolving by claude_session_id (Gemini may pass session ID instead of task ID)
+                try {
+                  const row = projectManager.db.db.prepare(
+                    'SELECT tab_id FROM tabs WHERE claude_session_id = ? LIMIT 1'
+                  ).get(taskId);
+                  if (row) claudeTabId = row.tab_id;
+                } catch {}
+              }
+
+              if (!claudeTabId) {
                 results.push({ taskId, success: false, error: 'Could not resolve taskId to tab' });
                 continue;
               }
@@ -1363,6 +1373,90 @@ function startMcpHttpServer() {
         }
       });
 
+    } else if (req.method === 'POST' && req.url === '/close-sub-agent') {
+      // Close a sub-agent tab (same as Cmd+W)
+      let body = '';
+      req.on('data', chunk => { body += chunk; });
+      req.on('end', async () => {
+        try {
+          const { taskId, ppid } = JSON.parse(body);
+          if (!taskId) {
+            res.writeHead(400);
+            res.end(JSON.stringify({ error: 'taskId is required' }));
+            return;
+          }
+
+          console.log('[MCP:HTTP] POST /close-sub-agent taskId=' + taskId);
+
+          // Resolve taskId → claudeTabId (same fallback chain as other endpoints)
+          const task = mcpTasks.get(taskId);
+          let claudeTabId = task?.claudeTabId || null;
+
+          if (!claudeTabId) {
+            try {
+              const row = projectManager.db.db.prepare(
+                'SELECT tab_id FROM tabs WHERE mcp_task_id = ? LIMIT 1'
+              ).get(taskId);
+              if (row) claudeTabId = row.tab_id;
+            } catch {}
+          }
+
+          if (!claudeTabId) {
+            const geminiTabId = ppid ? await findTabByChildPidCached(ppid) : null;
+            if (geminiTabId) {
+              try {
+                const rows = projectManager.db.db.prepare(
+                  'SELECT tab_id FROM tabs WHERE parent_tab_id = ? ORDER BY created_at DESC'
+                ).all(geminiTabId);
+                for (const row of rows) {
+                  if (taskId === 'restored-' + row.tab_id) {
+                    claudeTabId = row.tab_id;
+                    break;
+                  }
+                }
+              } catch {}
+            }
+          }
+
+          if (!claudeTabId) {
+            try {
+              const row = projectManager.db.db.prepare(
+                'SELECT tab_id FROM tabs WHERE claude_session_id = ? LIMIT 1'
+              ).get(taskId);
+              if (row) claudeTabId = row.tab_id;
+            } catch {}
+          }
+
+          if (!claudeTabId) {
+            res.writeHead(404);
+            res.end(JSON.stringify({ error: 'Could not resolve taskId to tab' }));
+            return;
+          }
+
+          // Tell renderer to close the tab (triggers terminal:kill → full cleanup)
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send('mcp:close-sub-agent-tab', { claudeTabId });
+          }
+
+          // Clean up MCP task references (delete, not just status change — removes from list_sub_agents)
+          for (const [tid, t] of mcpTasks) {
+            if (t.claudeTabId === claudeTabId) {
+              clearTaskTimeout(tid);
+              mcpTasks.delete(tid);
+            }
+          }
+          subAgentParentTab.delete(claudeTabId);
+          subAgentCompletionTimers.delete(claudeTabId);
+
+          console.log('[MCP:CloseAgent] Closed sub-agent tab: ' + claudeTabId);
+          res.writeHead(200);
+          res.end(JSON.stringify({ status: 'closed', claudeTabId }));
+        } catch (e) {
+          res.writeHead(500);
+          res.end(JSON.stringify({ error: e.message }));
+        }
+      });
+
     } else {
       res.writeHead(404);
       res.end(JSON.stringify({ error: 'Not found' }));
@@ -1407,7 +1501,7 @@ function stopMcpHttpServer() {
 }
 
 // Main delegation logic: create Claude sub-agent tab, run prompt, return result
-async function delegateToClaudeSubAgent(taskId, prompt, ppid, customName) {
+async function delegateToClaudeSubAgent(taskId, prompt, ppid, customName, resumeSessionId) {
   // Register task
   mcpTasks.set(taskId, {
     status: 'pending',
@@ -1452,6 +1546,7 @@ async function delegateToClaudeSubAgent(taskId, prompt, ppid, customName) {
       taskId,
       geminiTabId,
       cwd: geminiCwd,
+      claudeSessionId: resumeSessionId || undefined,
     });
     // Renderer will reply via IPC
     ipcMain.once('mcp:sub-agent-tab-created', (event, data) => {
@@ -1489,8 +1584,18 @@ async function delegateToClaudeSubAgent(taskId, prompt, ppid, customName) {
     throw new Error('Claude terminal not found after creation (tabId=' + claudeTabId + ', terminals.size=' + terminals.size + ')');
   }
 
-  // Start Claude with --dangerously-skip-permissions
-  claudeTerm.write('claude --dangerously-skip-permissions\r');
+  // Start Claude with --dangerously-skip-permissions (optionally resuming existing session)
+  if (resumeSessionId) {
+    claudeTerm.write('claude --dangerously-skip-permissions --resume ' + resumeSessionId + '\r');
+    console.log('[MCP:Delegate] Resuming existing session: ' + resumeSessionId.substring(0, 8) + '...');
+    // Immediately register session ID (Immediate Injection)
+    bridgeKnownSessions.set(claudeTabId, resumeSessionId);
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('claude:session-detected', { tabId: claudeTabId, sessionId: resumeSessionId });
+    }
+  } else {
+    claudeTerm.write('claude --dangerously-skip-permissions\r');
+  }
   claudeCliActive.set(claudeTabId, true);
   task.status = 'handshake';
 
@@ -1685,38 +1790,57 @@ async function continueClaudeSubAgent(taskId, prompt, ppid) {
 function readLatestAssistantMessage(sessionId, cwd) {
   const found = findSessionFile(sessionId, cwd);
   if (!found) {
-    console.log('[MCP:Response] Session file not found for: ' + sessionId);
+    console.log('[MCP:Response] Session file not found for: ' + sessionId + ' cwd=' + cwd);
     return null;
   }
 
+  console.log('[MCP:Response] Found session file: ' + found.filePath);
   const { recordMap, lastRecord } = loadJsonlRecords(found.filePath);
-  if (!lastRecord) return null;
+  if (!lastRecord) {
+    console.log('[MCP:Response] No lastRecord in JSONL (empty or parse error). recordMap.size=' + recordMap.size);
+    return null;
+  }
+
+  console.log('[MCP:Response] lastRecord: type=' + lastRecord.type + ' uuid=' + (lastRecord.uuid || '?').substring(0, 8) + ' ts=' + (lastRecord.timestamp || '?') + ' recordMap.size=' + recordMap.size);
 
   // Walk backwards from lastRecord to find the latest assistant message
   let current = lastRecord;
   const visited = new Set();
+  let walkSteps = 0;
   while (current) {
     if (visited.has(current.uuid)) break;
     visited.add(current.uuid);
+    walkSteps++;
 
     if (current.type === 'assistant' && current.message?.content) {
       // Extract text from content blocks
       const texts = [];
+      const blockTypes = [];
       for (const block of current.message.content) {
+        blockTypes.push(block.type);
         if (block.type === 'text' && block.text) {
           texts.push(block.text);
         }
       }
-      if (texts.length > 0) return texts.join('\n');
+      if (texts.length > 0) {
+        console.log('[MCP:Response] Found assistant message after ' + walkSteps + ' steps. blocks=[' + blockTypes.join(',') + '] textLen=' + texts.join('\n').length);
+        return texts.join('\n');
+      }
+      // Assistant without text blocks — keep walking
+      console.log('[MCP:Response] Assistant at step ' + walkSteps + ' has no text blocks: [' + blockTypes.join(',') + ']. Continuing walk...');
     }
 
     // Walk up via parentUuid
     if (current.parentUuid) {
       current = recordMap.get(current.parentUuid);
+      if (!current) {
+        console.log('[MCP:Response] parentUuid chain broken at step ' + walkSteps + '. parentUuid not found in recordMap.');
+      }
     } else {
       break;
     }
   }
+  console.log('[MCP:Response] Walk exhausted after ' + walkSteps + ' steps. No assistant with text found.');
   return null;
 }
 
@@ -2021,7 +2145,9 @@ const SUB_AGENT_MAX_RECHECKS = 40; // 40 × 3s = 2 min max wait
 
 // Check JSONL tail to determine if Claude is still working.
 // Returns { stillWorking, reason } — reason is a human-readable string for logging.
-function checkJsonlActivity(sessionId, cwd) {
+// promptSentAt (optional): timestamp (ms) when the last prompt was sent via continue_claude.
+// Used to detect stale end_turn from previous turns.
+function checkJsonlActivity(sessionId, cwd, promptSentAt) {
   try {
     const sessionFile = findSessionFile(sessionId, cwd);
     if (!sessionFile) return { stillWorking: false, reason: 'no session file' };
@@ -2040,6 +2166,7 @@ function checkJsonlActivity(sessionId, cwd) {
     let lastAssistantIdx = -1;
     let lastUserIdx = -1;
     let lastAssistantStopReason = null;
+    let lastAssistantTimestamp = null;
 
     for (let i = lines.length - tailSize; i < lines.length; i++) {
       try {
@@ -2053,6 +2180,7 @@ function checkJsonlActivity(sessionId, cwd) {
         if (entry.type === 'assistant' && entry.message?.content) {
           lastAssistantIdx = i;
           lastAssistantStopReason = entry.message.stop_reason || null;
+          lastAssistantTimestamp = entry.timestamp ? new Date(entry.timestamp).getTime() : null;
           if (entry.message.content.some(b => b.type === 'tool_use')) {
             hasToolUse = true;
           } else {
@@ -2101,7 +2229,11 @@ function checkJsonlActivity(sessionId, cwd) {
     }
     // Fallback: sub-agent sessions may not write turn_duration at all.
     // If last assistant has stop_reason=end_turn and no pending tools — Claude is done.
+    // BUT: reject stale end_turn from a PREVIOUS turn (before continue_claude sent a new prompt).
     if (lastAssistantStopReason === 'end_turn' && !hasToolUse && !hasProgress) {
+      if (promptSentAt && lastAssistantTimestamp && lastAssistantTimestamp < promptSentAt) {
+        return { stillWorking: true, reason: 'stale end_turn (assistant ts=' + new Date(lastAssistantTimestamp).toISOString() + ' < promptSentAt=' + new Date(promptSentAt).toISOString() + '), last=' + lastType };
+      }
       return { stillWorking: false, reason: 'stop_reason=end_turn (no turn_duration in session)' };
     }
     // No turn_duration and no stop_reason=end_turn — JSONL may be lagging behind TUI.
@@ -2159,7 +2291,8 @@ async function handleSubAgentCompletion(claudeTabId, recheckCount) {
   // Problem: Claude outputs text between Task sub-agent calls → spinner disappears >500ms → false IDLE.
   // Solution: read JSONL tail — if progress/tool_use entries present, Claude is still working.
   if (sessionId) {
-    const { stillWorking, reason } = checkJsonlActivity(sessionId, cwd);
+    const promptSentAt = subAgentPromptSentAt.get(claudeTabId) || null;
+    const { stillWorking, reason } = checkJsonlActivity(sessionId, cwd, promptSentAt);
 
     if (stillWorking) {
       if (recheckCount >= SUB_AGENT_MAX_RECHECKS) {
@@ -2311,7 +2444,8 @@ async function handleReArmedDelivery(claudeTabId) {
   const sessionId = bridgeKnownSessions.get(claudeTabId);
   const cwd = terminalProjects.get(claudeTabId);
   if (sessionId) {
-    const { stillWorking } = checkJsonlActivity(sessionId, cwd);
+    const promptSentAt = subAgentPromptSentAt.get(claudeTabId) || null;
+    const { stillWorking } = checkJsonlActivity(sessionId, cwd, promptSentAt);
     if (stillWorking) {
       console.log('[MCP:ReArm] Claude still working, deferring...');
       subAgentDeferredCheck.set(claudeTabId, setTimeout(() => {
