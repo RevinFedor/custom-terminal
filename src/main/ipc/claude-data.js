@@ -1549,6 +1549,7 @@ function register({ projectManager, formatToolAction }) {
       // Build structured entries
       const entries = [];
       let prevSessionId = null;
+      let lastWasCompact = false;
 
       if (hasForkAtBeginning) {
         entries.push({ uuid: 'fork-begin', role: 'fork', timestamp: '', content: 'FORK', sessionId: '' });
@@ -1560,8 +1561,9 @@ function register({ projectManager, formatToolAction }) {
 
         // Plan mode / clear context boundary detection
         const entrySid = entry.sessionId || entry._fromFile;
-        if (prevSessionId && entrySid !== prevSessionId) {
+        if (prevSessionId && entrySid !== prevSessionId && !lastWasCompact) {
           // Check if bridge-based transition (clear context) or fork
+          // Skip after compact — compact already serves as the boundary marker
           let hasBridge = false;
           for (const [, rec] of recordMap) {
             if (rec._isBridge && rec.sessionId === prevSessionId) { hasBridge = true; break; }
@@ -1574,6 +1576,7 @@ function register({ projectManager, formatToolAction }) {
             sessionId: entrySid
           });
         }
+        lastWasCompact = (entry.type === 'system' && entry.subtype === 'compact_boundary');
         prevSessionId = entrySid;
 
         if (entry.type === 'user') {
@@ -1671,17 +1674,37 @@ function register({ projectManager, formatToolAction }) {
             });
           }
         } else if (entry.type === 'system' && entry.subtype === 'compact_boundary') {
+          // Look ahead for compact summary content
+          let compactSummary = '';
+          for (let j = i + 1; j < activeBranch.length; j++) {
+            const next = activeBranch[j];
+            if (next.isCompactSummary && next.type === 'user') {
+              const raw = typeof next.message?.content === 'string'
+                ? next.message.content
+                : Array.isArray(next.message?.content)
+                  ? (next.message.content.find(c => c.type === 'text')?.text || '')
+                  : '';
+              compactSummary = raw
+                .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '')
+                .replace(/\[200~/g, '').replace(/~\]/g, '').trim();
+              break;
+            }
+            if (next.type === 'user' && !next.isSidechain && !next.isMeta) break;
+          }
           entries.push({
             uuid: entry.uuid,
             role: 'compact',
             timestamp: entry.timestamp || '',
             content: 'COMPACTED',
+            compactSummary: compactSummary || undefined,
+            preTokens: entry.compactMetadata?.preTokens || undefined,
             sessionId: entrySid
           });
         }
 
-        // Fork boundary after entry
-        if (forkBoundaryUuids.has(entry.uuid)) {
+        // Fork boundary after entry (skip compact entries — compact IS the boundary)
+        if (forkBoundaryUuids.has(entry.uuid) &&
+            !(entry.type === 'system' && entry.subtype === 'compact_boundary')) {
           entries.push({
             uuid: 'fork-after-' + entry.uuid,
             role: 'fork',

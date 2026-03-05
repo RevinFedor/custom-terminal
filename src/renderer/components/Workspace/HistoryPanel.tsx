@@ -34,6 +34,8 @@ interface FullHistoryEntry {
   thinking?: string;
   actions?: Action[];
   sessionId: string;
+  compactSummary?: string;
+  preTokens?: number;
 }
 
 interface HistoryPanelProps {
@@ -226,14 +228,51 @@ const SubAgentBlock = memo(({ action }: { action: TaskAction }) => {
   );
 });
 
+// Compact block — expandable with summary
+const CompactBlock = memo(({ entry }: { entry: FullHistoryEntry }) => {
+  const [open, setOpen] = useState(false);
+  const hasSummary = !!entry.compactSummary;
+  const tokensLabel = entry.preTokens ? `${Math.round(entry.preTokens / 1000)}k tokens` : null;
+  return (
+    <div style={{ padding: '4px 0' }}>
+      <div
+        style={{
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          gap: 6, cursor: hasSummary ? 'pointer' : 'default',
+        }}
+        onClick={hasSummary ? () => setOpen(!open) : undefined}
+      >
+        <div style={{ flex: 1, height: 1, backgroundColor: '#f59e0b', opacity: 0.3 }} />
+        {hasSummary && (
+          open ? <ChevronDown size={10} style={{ color: '#f59e0b', flexShrink: 0 }} />
+               : <ChevronRight size={10} style={{ color: '#f59e0b', flexShrink: 0 }} />
+        )}
+        <span style={{ color: '#f59e0b', fontSize: 11, letterSpacing: 1, flexShrink: 0, opacity: 0.8 }}>
+          COMPACTED{tokensLabel ? ` (${tokensLabel})` : ''}
+        </span>
+        <div style={{ flex: 1, height: 1, backgroundColor: '#f59e0b', opacity: 0.3 }} />
+      </div>
+      {open && entry.compactSummary && (
+        <div style={{
+          marginTop: 6, padding: '8px 12px',
+          backgroundColor: 'rgba(245, 158, 11, 0.04)',
+          borderLeft: '2px solid rgba(245, 158, 11, 0.3)',
+          borderRadius: 4,
+          fontSize: 12, color: '#999',
+          whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+          maxHeight: 300, overflowY: 'auto',
+        }}>
+          {entry.compactSummary}
+        </div>
+      )}
+    </div>
+  );
+});
+
 // Single history entry renderer
 const HistoryEntry = memo(({ entry, toolType }: { entry: FullHistoryEntry; toolType?: 'claude' | 'gemini' }) => {
   if (entry.role === 'compact') {
-    return (
-      <div style={{ textAlign: 'center', padding: '8px 0', color: '#666', fontSize: 11, letterSpacing: 2 }}>
-        {'═══ COMPACTED ═══'}
-      </div>
-    );
+    return <CompactBlock entry={entry} />;
   }
 
   if (entry.role === 'fork') {
