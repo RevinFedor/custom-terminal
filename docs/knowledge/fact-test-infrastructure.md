@@ -23,6 +23,10 @@ auto/
 |---|---|---|
 | [Headless] | Node.js | < 1с |
 | [E2E+Fixture] | Electron + dev server | 15-60с |
+
+### Ключевые headless-тесты (Логика вьюпорта)
+- **`test-buildposition-duplicate-firstline.js`**: Проверка пакетного индексирования Gemini. Валидирует защиту от false positives (цитирование AI) и корректность range-based visibility при дублировании текста.
+- **`test-claude-timeline-visibility.js`**: Проверка OSC 7777 маркеров. Валидирует O(1) поиск позиций, обработку первого сообщения (pos 0) и disposal маркеров.
 | [E2E+Claude] | + Claude CLI | 30-60с |
 | [E2E+Gemini+Claude] | + Gemini CLI | 3-5 мин |
 

@@ -370,8 +370,30 @@ function register({ projectManager, geminiUtils, terminals, terminalProjects, ge
       const entries = [];
 
       if (data.messages && Array.isArray(data.messages)) {
+        // Track last gemini input tokens for compact detection
+        let lastGeminiInputTokens = 0;
+
         for (let i = 0; i < data.messages.length; i++) {
           const msg = data.messages[i];
+
+          // Track gemini response tokens for compact preTokens
+          if (msg.type === 'gemini' && msg.tokens && msg.tokens.input) {
+            lastGeminiInputTokens = msg.tokens.input;
+          }
+
+          // Detect compact: info message with empty content
+          if (msg.type === 'info' && (msg.content === '' || msg.content == null)) {
+            entries.push({
+              uuid: msg.id || `${sessionId}-compact-${i}`,
+              type: 'compact',
+              timestamp: msg.timestamp || new Date().toISOString(),
+              content: 'Conversation compacted',
+              preTokens: lastGeminiInputTokens || undefined,
+              sessionId
+            });
+            continue;
+          }
+
           if (msg.type !== 'user') continue;
 
           // Prefer displayContent (short summary for prefilled sessions) over full content
@@ -439,9 +461,29 @@ function register({ projectManager, geminiUtils, terminals, terminalProjects, ge
       }
 
       const entries = [];
+      let lastGeminiInputTokens = 0;
 
       for (let i = 0; i < data.messages.length; i++) {
         const msg = data.messages[i];
+
+        // Track gemini response tokens for compact preTokens
+        if (msg.type === 'gemini' && msg.tokens && msg.tokens.input) {
+          lastGeminiInputTokens = msg.tokens.input;
+        }
+
+        // Detect compact: info message with empty content
+        if (msg.type === 'info' && (msg.content === '' || msg.content == null)) {
+          entries.push({
+            uuid: msg.id || `${sessionId}-compact-${i}`,
+            role: 'compact',
+            timestamp: msg.timestamp || '',
+            content: 'COMPACTED',
+            preTokens: lastGeminiInputTokens || undefined,
+            sessionId
+          });
+          continue;
+        }
+
         // Normalize content
         let content = '';
         if (typeof msg.content === 'string') {
@@ -470,7 +512,6 @@ function register({ projectManager, geminiUtils, terminals, terminalProjects, ge
             sessionId
           });
         }
-        // Skip 'info' type messages
       }
 
       console.log('[Gemini FullHistory] Returning', entries.length, 'entries');

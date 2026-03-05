@@ -662,15 +662,17 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
       return;
     }
 
-    if (entry.type === 'compact' || entry.type === 'continued') return;
-
     const index = entries.findIndex(e => e.uuid === entry.uuid);
 
     // If history panel is open — scroll to entry in history only, skip terminal scroll
+    // This includes compact/continued entries which have no terminal position but DO exist in history panel
     if (isHistoryOpen) {
       setHistoryScrollToUuid(entry.uuid);
       return;
     }
+
+    // Compact/continued entries have no terminal position — skip terminal scroll
+    if (entry.type === 'compact' || entry.type === 'continued') return;
 
     // History panel NOT open — scroll in terminal only
     // Instant visual feedback — loader appears immediately
