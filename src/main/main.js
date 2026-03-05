@@ -3187,7 +3187,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
       // in-progress CSI in xterm.js parser, rendering escape params as visible text.
       // Solution: buffer incomplete escape tails, reassemble before injection.
       {
-        if (bridgeKnownSessions.has(tabId)) {
+        if (claudeSpinnerBusy.has(tabId)) {
           // Reassemble any carryover escape bytes from previous chunk
           const carryover = escapeCarryover.get(tabId);
           if (carryover) {
@@ -3198,11 +3198,13 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
           const sc = stripVTControlCharacters(data);
           const hasPrompt = sc.includes('\u23F5') || sc.includes('\u276F');
           const state = promptBoundaryState.get(tabId) || 'idle';
+          const substance = sc.replace(/\s/g, '').length;
 
           if (state === 'idle') {
             // Non-prompt data with substance while idle → Claude started processing
             if (!hasPrompt && sc.replace(/\s/g, '').length > 5) {
               promptBoundaryState.set(tabId, 'busy');
+              console.log('[BoundarySM] Tab ' + tabId.slice(-8) + ': idle→busy (seq=' + (promptBoundarySeq.get(tabId) || 0) + ')');
             }
           } else if (state === 'busy' && hasPrompt) {
             // Prompt returned while busy → response complete, inject marker

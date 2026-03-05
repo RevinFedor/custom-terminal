@@ -44,6 +44,8 @@
 - **Error Handling:** Если текст сообщения не найден в буфере (например, из-за очистки истории), на месте точки на 1.2с появляется красный крестик.
 - **Tooltip Sync:** Тултип отображается вплотную к левому краю таймлайна с мягким белым свечением (`shadow-white`) для лучшей читаемости.
 - **Auto-Refresh & Debounce:** Обновление данных происходит каждые 2с. Проверка видимости во вьюпорте (трансформация в черточку) выполняется при скролле с дебаунсом 100мс. Проверка доступности в полном буфере (красный фон) — с дебаунсом 500мс.
+- **hasAnyPosition Guard:** Если `computePositions()` не нашёл ни одной позиции (все entries = -1), `checkReachability()` НЕ помечает entries как unreachable. Красный фон активируется только когда хотя бы одна entry имеет валидную позицию (т.е. остальные реально trimmed из scrollback). Это предотвращает полностью красный Timeline при свежем запуске с пустым буфером.
+- **Boundary Gate Fix:** OSC 7777 injection в main.js гейтится на `claudeSpinnerBusy.has(tabId)` (не `bridgeKnownSessions`). См. [`fix-boundary-bridge-race.md`](fix-boundary-bridge-race.md).
 - **Opaque Dots:** Все точки используют непрозрачные (solid) цвета. Это необходимо, чтобы они полностью перекрывали центральную вертикальную линию (Central Axis), исключая визуальный мусор и «просвечивание» полосы сквозь индикаторы.
 
 ### Кастомный скроллбар (In-strip Indicator)
@@ -51,6 +53,13 @@
 - **Почему не нативный:** Нативный скроллбар браузера (даже стилизованный через webkit) конфликтовал с расположенным рядом `Resizer`. Клик по скроллбару часто интерпретировался системой как начало ресайза боковой панели.
 - **Реализация:** Тонкий (3px) ярко-белый индикатор внутри 32px-полосы Timeline.
 - **Изоляция:** Индикатор имеет `pointer-events: none`. Пользователь скроллит Timeline вращением колеса мыши над его областью, а физические клики «пролетают» сквозь индикатор, не мешая работе соседнего ресайзера.
+
+### Scroll-to-Bottom Arrow
+Фиолетовая стрелка (`ChevronDown`, цвет `#a78bfa`) в нижней части Timeline.
+- **Условие показа:** Появляется только когда ниже видимой области есть reachable (не-красные) entries. Проверка через `data-unreachable` атрибут на segment-div'ах.
+- **Действие:** Плавный скролл (`behavior: 'smooth'`) scrollRef контейнера до конца.
+- **Детекция:** Встроена в существующий `updateThumb()` scroll handler (без дополнительных event listeners). При `isAtBottom` (scrollTop >= maxScroll - 5) стрелка скрывается.
+- **Motivation:** В длинных сессиях (50+ entries) пользователь может случайно проскроллить вверх и не знать, что ниже есть актуальные (не-красные) данные.
 
 ### Click-to-Scroll (Deterministic Navigation)
 
@@ -147,7 +156,9 @@
 **Phase 1 — Visual Differentiation:**
 - Записи `[Claude Sub-Agent Response]` отображаются **индиго** цветом (`#818cf8`) вместо белого.
 - Записи `[Claude Sub-Agent Timeout]` отображаются **красным** (`#ef4444`).
-- Метаданные агента (имя, taskId) парсятся из footer ответа: `Tab: <name> | Task ID: <id>`.
+- Метаданные агента (имя, taskId) парсятся из footer ответа: `Tab: <name> | Task ID: <id> | Model: <model>`.
+- **Footer Variants:** Footer может начинаться с `Tab:`, `Task ID:` или `Model:` (без `Tab:`/`Task ID:`). Если `Tab:` отсутствует, имя формируется из модели: `Claude (<model>)`.
+- **Closing Tag Guard:** `parseSubAgentMeta()` требует наличие И открывающего `[Claude Sub-Agent Response]` И закрывающего `[/Claude Sub-Agent Response]`. Это предотвращает ложные срабатывания когда пользователь упоминает тег в тексте промпта.
 - Backend: `parseSubAgentMeta()` в `gemini-data.js`.
 
 **Phase 2 — Collapsible Groups:**
@@ -156,6 +167,7 @@
 - **Collapsed:** одна индиго-точка с badge `×N` справа. Клик → expand.
 - **Expanded:** toggle-бар сверху (горизонтальная индиго-линия 8×2px, клик → collapse) + ВСЕ entries группы как children (indent, уменьшенный dot 3px, кликабельные для навигации).
 - **Dual-role header:** Первый entry группы (`isGroupHeader: true && isGroupChild: true`) — при collapsed работает как toggle, при expanded рендерится как child entry + отдельный toggle-бар сверху.
+- **Tooltip Guard:** Badge `×N agents` в tooltip показывается только когда группа **collapsed** (`!expandedGroups.has(gi.groupId)`). При expanded каждый child entry показывает собственный tooltip без group badge.
 - Группировка: `computeGroups()` возвращает `Map<number, GroupInfo>`. Собирает уникальные имена агентов (`Set<string>`). `agentName` = имя если один агент, `"N agents"` если несколько, `"Claude"` если unnamed.
 - Visibility агрегируется для collapsed headers (any child visible → header visible).
 - Состояние: `expandedGroups: Set<string>`, сбрасывается при смене сессии.
@@ -170,8 +182,11 @@
 - **Trigger:** Кнопка переключения (иконка GitBranch) вынесена в `InfoPanel` (сайдбар) рядом с кнопкой "AI SESSION".
 
 ## Code Map
-- `Timeline.tsx`: UI компонент (полоса, точки, портал для тултипов, range copy, sub-agent groups, tree view).
+- `Timeline.tsx`: UI компонент (полоса, точки, портал для тултипов, range copy, sub-agent groups, tree view, scroll-down arrow).
+- `Timeline.tsx` → `computePositions()`: Claude: OSC 7777 prompt boundaries → text fallback (`buildPositionIndex`). Gemini: text search.
+- `Timeline.tsx` → `checkReachability()`: position < 0 → unreachable (red). Guard: `hasAnyPosition`.
 - `gemini-data.js` (`gemini:get-timeline`): Парсинг Gemini JSON + `parseSubAgentMeta()` для извлечения метаданных агентов.
-- `main.js` (`claude:get-timeline`): Парсинг и фильтрация JSONL. Детекция типа `continued`.
-- `terminalRegistry.ts`: Методы `searchAndScroll`, `getVisibleText` (чтение вьюпорта) и `getFullBufferText` (проверка reachability).
+- `ipc/claude-data.js` (`claude:get-timeline`): Парсинг и фильтрация JSONL. Детекция типа `continued`.
+- `main.js` (~line 3190): OSC 7777 boundary injection state machine. Gate: `claudeSpinnerBusy.has(tabId)`.
+- `terminalRegistry.ts`: Методы `searchAndScroll`, `getVisibleText` (чтение вьюпорта), `getPromptBoundaryLines`, `buildPositionIndex`.
 

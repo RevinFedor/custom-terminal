@@ -10,31 +10,40 @@ const MINAYU_HISTORY_DIR = path.join(os.homedir(), '.minayu', 'history');
 function parseSubAgentMeta(content) {
   if (!content) return null;
 
-  const isResponse = content.startsWith('[Claude Sub-Agent Response]') ||
-                     content.startsWith('[Claude Sub-Agent Response —');
+  const isResponse = (content.startsWith('[Claude Sub-Agent Response]') ||
+                      content.startsWith('[Claude Sub-Agent Response —')) &&
+                     content.includes('[/Claude Sub-Agent Response]');
   const isTimeout = content.startsWith('[Claude Sub-Agent Timeout]');
 
   if (!isResponse && !isTimeout) return null;
 
   let subAgentName = null;
   let subAgentTaskId = null;
+  let subAgentModel = null;
 
   if (isResponse) {
-    // Footer format: "---\nTab: Name | Task ID: xxx | Model: yyy | Context: nn%\n[/Claude Sub-Agent Response]"
-    const footerMatch = content.match(/\n---\n((?:Tab|Task ID)[^\n]+)/);
+    // Footer formats:
+    //   "---\nTab: Name | Task ID: xxx | Model: yyy | Context: nn%\n[/Claude Sub-Agent Response]"
+    //   "---\nModel: yyy | Context: nn%\n[/Claude Sub-Agent Response]"
+    //   "---\nModel: yyy\n[/Claude Sub-Agent Response]"
+    const footerMatch = content.match(/\n---\n((?:Tab|Task ID|Model)[^\n]+)/);
     if (footerMatch) {
       const footer = footerMatch[1];
       const tabMatch = footer.match(/Tab:\s*(.+?)(?:\s*\||$)/);
       const taskMatch = footer.match(/Task ID:\s*(.+?)(?:\s*\||$)/);
+      const modelMatch = footer.match(/Model:\s*(.+?)(?:\s*\||$)/);
       if (tabMatch) subAgentName = tabMatch[1].trim();
       if (taskMatch) subAgentTaskId = taskMatch[1].trim();
+      if (modelMatch) subAgentModel = modelMatch[1].trim();
+    } else {
+      console.log('[SubAgentMeta] No footer found in response (' + content.length + ' chars), preview: ' + content.slice(0, 80).replace(/\n/g, '\\n'));
     }
   }
 
   return {
     isSubAgent: true,
     isSubAgentTimeout: isTimeout,
-    subAgentName: subAgentName || undefined,
+    subAgentName: subAgentName || (subAgentModel ? `Claude (${subAgentModel})` : undefined),
     subAgentTaskId: subAgentTaskId || undefined,
   };
 }
@@ -457,7 +466,8 @@ function register({ projectManager, geminiUtils, terminals, terminalProjects, ge
         }
       }
 
-      console.log('[Gemini Timeline] Returning', entries.length, 'entries');
+      const subAgentCount = entries.filter(e => e.isSubAgent).length;
+      console.log('[Gemini Timeline] Returning', entries.length, 'entries' + (subAgentCount > 0 ? ' (' + subAgentCount + ' sub-agent)' : ''));
       return {
         success: true,
         entries,

@@ -308,9 +308,23 @@ class DatabaseManager {
       )
     `);
 
+    // Timeline notes table - user annotations attached to timeline entries
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS timeline_notes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        entry_uuid TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        tab_id TEXT NOT NULL,
+        content TEXT NOT NULL DEFAULT '',
+        created_at INTEGER DEFAULT (strftime('%s', 'now')),
+        updated_at INTEGER DEFAULT (strftime('%s', 'now')),
+        UNIQUE(entry_uuid, session_id)
+      )
+    `);
+
   }
 
-  // ========== APP STATE ========== 
+  // ========== APP STATE ==========
 
   getAppState(key) {
     const row = this.db.prepare('SELECT value FROM app_state WHERE key = ?').get(key);
@@ -927,6 +941,24 @@ class DatabaseManager {
   getSessionChild(parentId) {
     const row = this.db.prepare('SELECT child_session_id FROM session_links WHERE parent_session_id = ?').get(parentId);
     return row ? row.child_session_id : null;
+  }
+
+  // ========== TIMELINE NOTES ==========
+
+  getTimelineNotes(sessionId) {
+    return this.db.prepare('SELECT entry_uuid, content FROM timeline_notes WHERE session_id = ?').all(sessionId);
+  }
+
+  saveTimelineNote(entryUuid, sessionId, tabId, content) {
+    this.db.prepare(`
+      INSERT INTO timeline_notes (entry_uuid, session_id, tab_id, content, updated_at)
+      VALUES (?, ?, ?, ?, strftime('%s', 'now'))
+      ON CONFLICT(entry_uuid, session_id) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at
+    `).run(entryUuid, sessionId, tabId, content);
+  }
+
+  deleteTimelineNote(entryUuid, sessionId) {
+    this.db.prepare('DELETE FROM timeline_notes WHERE entry_uuid = ? AND session_id = ?').run(entryUuid, sessionId);
   }
 
   close() { this.db.close(); }

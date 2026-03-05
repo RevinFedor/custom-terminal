@@ -1723,6 +1723,45 @@ function register({ projectManager, formatToolAction }) {
       return { success: false, error: error.message };
     }
   });
+
+  // ========== TIMELINE NOTES ==========
+
+  ipcMain.handle('timeline:get-notes', async (event, { sessionId }) => {
+    try {
+      const db = projectManager.db;
+      const rows = db.getTimelineNotes(sessionId);
+      const notesMap = {};
+      for (const row of rows) {
+        notesMap[row.entry_uuid] = row.content;
+      }
+      return { success: true, notes: notesMap };
+    } catch (error) {
+      console.error('[TimelineNotes] get-notes error:', error);
+      return { success: false, error: error.message };
+    }
+  });
+
+  ipcMain.handle('timeline:save-note', async (event, { entryUuid, sessionId, tabId, content }) => {
+    try {
+      const db = projectManager.db;
+      db.saveTimelineNote(entryUuid, sessionId, tabId, content);
+      return { success: true };
+    } catch (error) {
+      console.error('[TimelineNotes] save-note error:', error);
+      return { success: false, error: error.message };
+    }
+  });
+
+  ipcMain.handle('timeline:delete-note', async (event, { entryUuid, sessionId }) => {
+    try {
+      const db = projectManager.db;
+      db.deleteTimelineNote(entryUuid, sessionId);
+      return { success: true };
+    } catch (error) {
+      console.error('[TimelineNotes] delete-note error:', error);
+      return { success: false, error: error.message };
+    }
+  });
 }
 
 module.exports = { register, findSessionFile, loadJsonlRecords, resolveSessionChain, resolveLatestSessionInChain, parseTimelineUuids };
