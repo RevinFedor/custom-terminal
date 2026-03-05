@@ -6,6 +6,7 @@ import { useUIStore } from '../../../store/useUIStore';
 import { usePromptsStore } from '../../../store/usePromptsStore';
 import { RotateCcw, Clock, ChevronDown, ChevronRight, ScrollText, GitBranch } from 'lucide-react';
 import ActionsPanel from './ActionsPanel';
+import { terminalRegistry } from '../../../utils/terminalRegistry';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -452,9 +453,11 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                   onClick={() => {
                     if (activeTabId && currentSessionType === 'claude') {
                       setTabCommandType(activeTabId, 'claude');
+                      terminalRegistry.get(activeTabId)?.scrollToBottom();
                       ipcRenderer.send('claude:run-command', { tabId: activeTabId, command: 'claude-c', sessionId: claudeSessionId });
                     } else if (activeTabId && currentSessionType === 'gemini') {
                       setTabCommandType(activeTabId, 'gemini');
+                      terminalRegistry.get(activeTabId)?.scrollToBottom();
                       ipcRenderer.send('gemini:run-command', { tabId: activeTabId, command: 'gemini-c', sessionId: geminiSessionId });
                     }
                   }}

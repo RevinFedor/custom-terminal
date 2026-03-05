@@ -4,6 +4,7 @@ import { useProjectsStore } from '../../store/useProjectsStore';
 import Terminal from './Terminal';
 import BrowserTab from './BrowserTab';
 import { motion, AnimatePresence } from 'framer-motion';
+import { terminalRegistry } from '../../utils/terminalRegistry';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -260,6 +261,7 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
       const setTabCommandType = useWorkspaceStore.getState().setTabCommandType;
       setTabCommandType(tabId, 'claude');
 
+      terminalRegistry.get(tabId)?.scrollToBottom();
       const cmd = `claude --dangerously-skip-permissions --resume ${targetSessionId}\r`;
       console.log('[TerminalArea] Sending terminal:input:', cmd);
       ipcRenderer.send('terminal:input', tabId, cmd);

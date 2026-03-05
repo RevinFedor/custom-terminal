@@ -1,6 +1,6 @@
 import React, { useEffect, useLayoutEffect, useState, useCallback, useRef, useMemo } from 'react';
 import { createPortal } from 'react-dom';
-import { Maximize2, Copy, Minimize2 } from 'lucide-react';
+import { Maximize2, Copy, Minimize2, Pencil, Trash2, StickyNote, ChevronDown } from 'lucide-react';
 import { terminalRegistry } from '../../utils/terminalRegistry';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
@@ -120,57 +120,6 @@ function getSearchLines(content: string): string[] {
   return result;
 }
 
-// Check if a needle string appears as an isolated line in buffer text (not as a substring
-// of AI response text). Uses the same strictness logic as terminalRegistry.lineContains:
-// - isStrictShort (< 5 chars, e.g. "да"): trimmed line must equal needle, or have only
-//   non-alphanumeric prefix (prompt chars).
-// - isIsolatedShort (< 30 chars, e.g. "continue"): needle must be near start of trimmed
-//   line, line must not be much longer than needle.
-// - Regular (>= 30 chars): simple includes() is fine since long text is unique enough.
-function geminiLineMatch(bufferLines: string[], needle: string, isStrictShort: boolean, isIsolatedShort: boolean): boolean {
-  const nonAlphaRe = /[a-zA-Z0-9\u0400-\u04FF\u0600-\u06FF\u4E00-\u9FFF\u3040-\u309F\u30A0-\u30FF]/;
-
-  for (const hay of bufferLines) {
-    if (isStrictShort) {
-      const trimmed = hay.trim();
-      if (trimmed === needle) return true;
-      if (trimmed.length > needle.length + 4) continue;
-      const pos = trimmed.indexOf(needle);
-      if (pos < 0) continue;
-      if (pos === 0) return true;
-      const prefix = trimmed.slice(0, pos);
-      if (!nonAlphaRe.test(prefix)) return true;
-    } else if (isIsolatedShort) {
-      const trimmed = hay.trim();
-      if (trimmed.length > needle.length + 25) continue;
-      const pos = trimmed.indexOf(needle);
-      if (pos < 0) continue;
-      if (pos === 0) return true;
-      const prefix = trimmed.slice(0, pos);
-      if (!nonAlphaRe.test(prefix)) return true;
-    } else {
-      if (hay.includes(needle)) return true;
-    }
-  }
-  return false;
-}
-
-// Check if search lines (from getSearchLines) match anywhere in buffer text.
-// Used for Gemini viewport visibility and buffer reachability checks.
-// Only checks the FIRST search line with strict line-level matching — this is
-// sufficient for visibility/reachability (we don't need multi-line precision here,
-// just need to avoid false substring matches in AI responses).
-function matchesInGeminiBuffer(bufferText: string, searchLines: string[]): boolean {
-  if (searchLines.length === 0) return false;
-
-  const firstLine = searchLines[0];
-  const isStrictShort = searchLines.length === 1 && firstLine.length < 5;
-  const isIsolatedShort = searchLines.length === 1 && firstLine.length < 30;
-
-  const bufferLines = bufferText.split('\n');
-  return geminiLineMatch(bufferLines, firstLine, isStrictShort, isIsolatedShort);
-}
-
 // Build grouping map: consecutive sub-agent entries with same taskId/name → collapsed group
 function computeGroups(entries: TimelineEntry[]): Map<number, GroupInfo> {
   const groups = new Map<number, GroupInfo>();
@@ -284,10 +233,22 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
   // Custom scroll indicator state (overlays the Resizer bar)
   const [scrollThumb, setScrollThumb] = useState<{ top: number; height: number } | null>(null);
 
+  // "Scroll to bottom" arrow — shown when reachable (non-red) entries exist below visible area
+  const [showScrollDown, setShowScrollDown] = useState(false);
+
   // CMD key state for tooltip activation
   const [isCmdHeld, setIsCmdHeld] = useState(false);
   const isCmdHeldRef = useRef(false);
   const chainResolvedRef = useRef<string | null>(null); // prevents A→B→A→B feedback loop
+
+  // Timeline notes state
+  const [notes, setNotes] = useState<Record<string, string>>({});
+  const [activeNoteIndex, setActiveNoteIndex] = useState<number | null>(null);
+  const [isNoteEditing, setIsNoteEditing] = useState(false);
+  const [noteEditText, setNoteEditText] = useState('');
+  const noteTextareaRef = useRef<HTMLTextAreaElement>(null);
+  const noteTooltipRef = useRef<HTMLDivElement>(null);
+  const [hoveredNoteIndex, setHoveredNoteIndex] = useState<number | null>(null);
 
   // Compute group map for sub-agent entries (Phase 2)
   const groupMap = useMemo(() => computeGroups(entries), [entries]);
@@ -306,7 +267,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
     const updateThumb = () => {
       const { scrollTop, scrollHeight, clientHeight } = el;
       if (scrollHeight <= clientHeight) {
-        setScrollThumb(null); // no scroll needed
+        setScrollThumb(null);
+        setShowScrollDown(false);
         return;
       }
       const ratio = clientHeight / scrollHeight;
@@ -314,6 +276,25 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
       const maxScroll = scrollHeight - clientHeight;
       const thumbTop = (scrollTop / maxScroll) * (clientHeight - thumbH);
       setScrollThumb({ top: thumbTop, height: thumbH });
+
+      // "Scroll down" arrow: check if reachable entries exist below visible area
+      const isAtBottom = scrollTop >= maxScroll - 5;
+      if (isAtBottom) {
+        setShowScrollDown(false);
+      } else {
+        // Find the last visible child index based on scroll position
+        const visibleBottom = scrollTop + clientHeight;
+        let hasReachableBelow = false;
+        const children = el.children;
+        for (let i = children.length - 1; i >= 0; i--) {
+          const child = children[i] as HTMLElement;
+          if (child.offsetTop >= visibleBottom && !child.dataset.unreachable) {
+            hasReachableBelow = true;
+            break;
+          }
+        }
+        setShowScrollDown(hasReachableBelow);
+      }
     };
     updateThumb();
     el.addEventListener('scroll', updateThumb, { passive: true });
@@ -371,13 +352,24 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
   }, []);
 
   // Sync tooltip with CMD key state: show when CMD pressed during hover, hide when released
+  // Do NOT close if cursor is inside the tooltip (user is interacting with buttons)
   useEffect(() => {
     if (isCmdHeld && hoveredIndex !== null) {
       setActiveTooltipIndex(hoveredIndex);
-    } else if (!isCmdHeld && !isExpanded) {
+    } else if (!isCmdHeld && !isExpanded && !isMouseInTooltipRef.current) {
       setActiveTooltipIndex(null);
     }
   }, [isCmdHeld, hoveredIndex, isExpanded]);
+
+  // Note tooltip: sync with CMD key — open when CMD pressed while hovering strip, close when released
+  useEffect(() => {
+    if (isCmdHeld && hoveredNoteIndex !== null) {
+      setActiveNoteIndex(hoveredNoteIndex);
+      setActiveTooltipIndex(null); // hide entry tooltip
+    } else if (!isCmdHeld && !isNoteEditing && activeNoteIndex !== null && !isMouseInNoteTooltipRef.current) {
+      setActiveNoteIndex(null);
+    }
+  }, [isCmdHeld, hoveredNoteIndex, isNoteEditing, activeNoteIndex]);
 
   // Load timeline and fork markers when sessionId changes
   const loadTimeline = useCallback(async () => {
@@ -428,6 +420,11 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
           console.log('[Timeline] Fork markers for session', sessionId, ':', markers.length, markers.length > 0 ? JSON.stringify(markers.map((m: ForkMarker) => m.source_session_id)) : '(empty)');
           setForkMarkers(markers);
         }
+      }
+      // Load notes for this session (works for both Claude and Gemini)
+      const notesResult = await ipcRenderer.invoke('timeline:get-notes', { sessionId });
+      if (notesResult.success) {
+        setNotes(notesResult.notes || {});
       }
     } catch (error) {
       console.error('[Timeline] Error loading timeline:', error);
@@ -570,7 +567,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
         });
 
         if (boundaryLines.length > 0 && realIndices.length > 0) {
-          // K prompt boundaries → last K+1 real entries get positions
+          // Primary: K prompt boundaries → last K+1 real entries get positions
           const positionable = boundaryLines.length + 1;
           const startFrom = Math.max(0, realIndices.length - positionable);
 
@@ -580,6 +577,19 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
           // Subsequent entries → prompt boundary lines in order
           for (let i = 1; i < positionable && (startFrom + i) < realIndices.length; i++) {
             pos[realIndices[startFrom + i]] = boundaryLines[i - 1];
+          }
+        } else if (realIndices.length > 0) {
+          // Fallback: no prompt boundaries registered yet (startup, HMR, etc.)
+          // Use text-based buffer search (same approach as Gemini) to find positions.
+          const searchData: { searchLines: string[]; entryIndex: number }[] = [];
+          for (const idx of realIndices) {
+            const entry = entries[idx];
+            const text = entry.hasImage ? '[Image' : getSearchText(entry.content);
+            if (text) searchData.push({ searchLines: [text], entryIndex: idx });
+          }
+          if (searchData.length > 0) {
+            const rows = terminalRegistry.buildPositionIndex(tabId, searchData);
+            searchData.forEach((sd, i) => { pos[sd.entryIndex] = rows[i]; });
           }
         }
       }
@@ -631,46 +641,32 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
       });
     };
 
-    // Buffer reachability — does the entry's text exist somewhere in the buffer?
-    // Uses text-based search (not positions) for robustness: anchored position search
-    // can miss entries due to false positive cascading, but text search is independent per entry.
+    // Buffer reachability — does the entry exist in the terminal buffer?
+    // Uses positions from computePositions: pos >= 0 → reachable, pos < 0 → unreachable.
+    // For Gemini, buildPositionIndex already does anchored text search with fallback.
+    // For Claude, prompt boundary markers track disposal on scrollback trim.
     const checkReachability = () => {
-      // Also recompute positions for visibility
+      // Recompute positions (one buffer scan — serves both visibility and reachability)
       positions = computePositions();
+
+      // If NO entry got a valid position, we have zero positioning data
+      // (fresh start, no boundaries, text search found nothing).
+      // Don't mark anything unreachable — red state only makes sense when
+      // some entries ARE positioned and others have been trimmed from scrollback.
+      const hasAnyPosition = positions.some(p => p >= 0);
 
       const newUnreachable = new Set<number>();
 
-      if (isGemini) {
-        // Gemini: text-based reachability (search full buffer independently per entry)
-        const fullText = terminalRegistry.getFullBufferText(tabId);
-        if (!fullText) {
-          setUnreachableIndices(prev => prev.size === 0 ? prev : new Set());
+      entries.forEach((entry, index) => {
+        if (entry.type === 'compact' || entry.type === 'continued' || entry.isPlan) return;
+        if (index <= lastBoundaryIdx) {
+          newUnreachable.add(index);
           return;
         }
-        entries.forEach((entry, index) => {
-          if (entry.type === 'compact' || entry.type === 'continued' || entry.isPlan) return;
-          if (index <= lastBoundaryIdx) {
-            newUnreachable.add(index);
-            return;
-          }
-          const lines = getSearchLines(entry.content);
-          if (lines.length > 0 && !matchesInGeminiBuffer(fullText, lines)) {
-            newUnreachable.add(index);
-          }
-        });
-      } else {
-        // Claude: position-based reachability (prompt boundaries dispose when scrollback trimmed)
-        entries.forEach((entry, index) => {
-          if (entry.type === 'compact' || entry.type === 'continued' || entry.isPlan) return;
-          if (index <= lastBoundaryIdx) {
-            newUnreachable.add(index);
-            return;
-          }
-          if (positions[index] < 0) {
-            newUnreachable.add(index);
-          }
-        });
-      }
+        if (hasAnyPosition && positions[index] < 0) {
+          newUnreachable.add(index);
+        }
+      });
 
       // Inherit unreachable for compact/continued/plan entries from next regular entry
       entries.forEach((entry, index) => {
@@ -701,8 +697,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
     checkReachability();
 
     // On viewport change (scroll + buffer writes via onWriteParsed):
-    // - checkVisibility: 100ms debounce (just reads cached positions + viewport state)
-    // - checkReachability: 500ms debounce (recomputes positions from buffer)
+    // - checkVisibility: 100ms debounce (reads cached positions + viewport state — O(n) cheap)
+    // - checkReachability: 500ms debounce (recomputes positions from buffer — more expensive)
     let visTimer: ReturnType<typeof setTimeout> | null = null;
     let reachTimer: ReturnType<typeof setTimeout> | null = null;
     terminalRegistry.onViewportChange(tabId, () => {
@@ -722,6 +718,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
   // Refs
   const tooltipRef = useRef<HTMLDivElement>(null);
   const tooltipContentRef = useRef<HTMLDivElement>(null);
+  const isMouseInTooltipRef = useRef(false);
+  const isMouseInNoteTooltipRef = useRef(false);
   const tooltipMeasuredRef = useRef(0);
   const [tooltipMeasuredH, setTooltipMeasuredH] = useState(0);
 
@@ -962,7 +960,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
 
     // Context menu dimensions (approximate)
     const menuWidth = 160;
-    const menuHeight = selectionStartIdRef.current ? 40 : 112;
+    const menuHeight = selectionStartIdRef.current ? 40 : 148;
 
     // Position: right-center of cursor
     let x = e.pageX + 4;
@@ -1057,6 +1055,11 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
         setIsExpanded(false);
         setActiveTooltipIndex(null);
       }
+      // Close note editing on outside click
+      if (isNoteEditing) {
+        setIsNoteEditing(false);
+        setActiveNoteIndex(null);
+      }
       // Cancel range selection if clicking outside timeline
       if (selectionStartIdRef.current && containerRef.current && !containerRef.current.contains(e.target as Node)) {
         selectionStartIdRef.current = null;
@@ -1065,7 +1068,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
     };
     window.addEventListener('click', handleClickOutside);
     return () => window.removeEventListener('click', handleClickOutside);
-  }, [isExpanded]);
+  }, [isExpanded, isNoteEditing]);
 
   const handleRewind = async (entry: TimelineEntry) => {
     setContextMenu(null);
@@ -1227,6 +1230,98 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
     }
   };
 
+  // ── Note handlers ──
+
+  const handleAddNote = (entry: TimelineEntry) => {
+    setContextMenu(null);
+    setNoteEditText(notes[entry.uuid] || '');
+    setIsNoteEditing(true);
+    const idx = entries.findIndex(e => e.uuid === entry.uuid);
+    setActiveNoteIndex(idx);
+    // Deactivate entry tooltip
+    setActiveTooltipIndex(null);
+    setTimeout(() => noteTextareaRef.current?.focus(), 50);
+  };
+
+  const handleEditNote = (entry: TimelineEntry) => {
+    setNoteEditText(notes[entry.uuid] || '');
+    setIsNoteEditing(true);
+    setTimeout(() => noteTextareaRef.current?.focus(), 50);
+  };
+
+  const handleSaveNote = async (entry: TimelineEntry) => {
+    const text = noteEditText.trim();
+    if (!text) {
+      // Empty note = delete
+      await handleDeleteNote(entry);
+      return;
+    }
+    await ipcRenderer.invoke('timeline:save-note', {
+      entryUuid: entry.uuid,
+      sessionId,
+      tabId,
+      content: text,
+    });
+    setNotes(prev => ({ ...prev, [entry.uuid]: text }));
+    setIsNoteEditing(false);
+  };
+
+  const handleDeleteNote = async (entry: TimelineEntry) => {
+    await ipcRenderer.invoke('timeline:delete-note', {
+      entryUuid: entry.uuid,
+      sessionId,
+    });
+    setNotes(prev => {
+      const next = { ...prev };
+      delete next[entry.uuid];
+      return next;
+    });
+    setIsNoteEditing(false);
+    setActiveNoteIndex(null);
+  };
+
+  const handleNoteStripEnter = (index: number) => {
+    setHoveredNoteIndex(index);
+    if (isCmdHeldRef.current && !isNoteEditing) {
+      setActiveNoteIndex(index);
+      setActiveTooltipIndex(null); // hide entry tooltip
+    }
+  };
+
+  const handleNoteStripLeave = (e: React.MouseEvent) => {
+    setHoveredNoteIndex(null);
+    if (isNoteEditing) return;
+
+    // Direct DOM check: if we moved into the note tooltip wrapper, keep open
+    if (noteTooltipRef.current && e.relatedTarget instanceof Node && noteTooltipRef.current.contains(e.relatedTarget)) {
+      return;
+    }
+
+    const segmentRect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    const mouseX = e.clientX;
+    const mouseY = e.clientY;
+    const wentLeft = mouseX <= segmentRect.left + 5;
+
+    if (wentLeft) {
+      // Check if mouse Y is within note tooltip wrapper bounds
+      if (noteTooltipRef.current) {
+        const wrapperRect = noteTooltipRef.current.getBoundingClientRect();
+        if (mouseY < wrapperRect.top || mouseY > wrapperRect.bottom) {
+          setActiveNoteIndex(null);
+        }
+        // else: mouse heading toward tooltip — keep open
+      }
+    } else {
+      setActiveNoteIndex(null);
+    }
+  };
+
+  const handleMouseLeaveNoteTooltip = () => {
+    if (!isNoteEditing) {
+      setActiveNoteIndex(null);
+    }
+  };
+
   if (!sessionId) return null;
 
   const currentActiveEntry = activeTooltipIndex !== null ? entries[activeTooltipIndex] : null;
@@ -1264,6 +1359,17 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
       window.innerHeight // never extend below viewport
     );
     return { clampedTop, wTop, wH: wBottom - wTop, offset: clampedTop - wTop, vAlign };
+  })() : null;
+
+  // Note tooltip position (same logic, simpler — smaller tooltip)
+  const activeNoteEntry = activeNoteIndex !== null ? entries[activeNoteIndex] : null;
+  const noteTooltipPos = activeNoteIndex !== null ? (() => {
+    const eCenterY = getElementCenterY(activeNoteIndex);
+    const h = isNoteEditing ? 200 : 120;
+    let clampedTop = Math.max(40, Math.min(eCenterY - h / 2, window.innerHeight - h - 10));
+    const wTop = Math.min(clampedTop, eCenterY - 20);
+    const wBottom = Math.min(Math.max(clampedTop + h, eCenterY + 20), window.innerHeight);
+    return { clampedTop, wTop, wH: wBottom - wTop, offset: clampedTop - wTop };
   })() : null;
 
   return (
@@ -1499,9 +1605,33 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
                     }} />
                   </div>
                 )}
+                {/* Note indicator strip — shown above the dot */}
+                {(notes[entry.uuid] || (activeNoteIndex === index && isNoteEditing)) && (() => {
+                  const noteHovered = hoveredNoteIndex === index || activeNoteIndex === index;
+                  return (
+                    <div
+                      className="flex-shrink-0 w-full flex items-center justify-center"
+                      style={{ height: '6px', cursor: 'pointer' }}
+                      onMouseEnter={() => handleNoteStripEnter(index)}
+                      onMouseLeave={handleNoteStripLeave}
+                    >
+                      <div
+                        style={{
+                          width: noteHovered ? '18px' : '14px',
+                          height: noteHovered ? '3px' : '2px',
+                          borderRadius: '1px',
+                          backgroundColor: noteHovered ? '#c084fc' : '#9333ea',
+                          boxShadow: noteHovered ? '0 0 8px rgba(168, 85, 247, 0.5)' : 'none',
+                          transition: 'all 0.2s',
+                        }}
+                      />
+                    </div>
+                  );
+                })()}
                 <div
                   ref={el => segmentRefs.current[index] = el}
                   data-segment
+                  {...(isUnreachable ? { 'data-unreachable': '' } : {})}
                   className="relative w-full flex items-center"
                   onMouseEnter={() => handleMouseEnterSegment(index)}
                   onMouseLeave={(e) => handleMouseLeaveSegment(e)}
@@ -1739,7 +1869,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
             {/* Outer wrapper — explicit height ensures bridge connects tooltip to entry */}
             <div
               ref={tooltipRef}
-              onMouseLeave={handleMouseLeaveTooltipArea}
+              onMouseEnter={() => { isMouseInTooltipRef.current = true; }}
+              onMouseLeave={(e) => { isMouseInTooltipRef.current = false; handleMouseLeaveTooltipArea(); }}
               style={{
                 position: 'fixed',
                 right: `${notesPanelWidth + (treeMode ? 160 : 32) - 8}px`,
@@ -1807,7 +1938,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
                     </div>
                     {(() => {
                       const gi = groupMap.get(activeTooltipIndex!);
-                      if (gi?.isGroupHeader) {
+                      if (gi?.isGroupHeader && !expandedGroups.has(gi.groupId)) {
                         return (
                           <span className="text-[10px] text-white/40">
                             ×{gi.groupSize} agents{gi.hasTimeout ? ' (with timeout)' : ''}
@@ -1948,6 +2079,16 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
                   >
                     Копировать текст сообщения
                   </button>
+                  <button
+                    className="w-full text-left px-3 py-2 text-xs text-purple-400 hover:bg-purple-600/20 rounded transition-colors cursor-pointer flex items-center gap-2"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      handleAddNote(contextMenu.entry);
+                    }}
+                  >
+                    <StickyNote size={12} />
+                    {notes[contextMenu.entry.uuid] ? 'Редактировать заметку' : 'Добавить заметку'}
+                  </button>
                   {/* Rewind — Claude & Gemini */}
                   <div className="border-t border-white/10 my-1" />
                   <button
@@ -1978,10 +2119,163 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
           </TooltipPortal>
         )}
 
+        {/* Note Tooltip Portal */}
+        {isVisible && activeNoteIndex !== null && activeNoteEntry && noteTooltipPos && (
+          <TooltipPortal>
+            <div
+              ref={noteTooltipRef}
+              onClick={(e) => e.stopPropagation()}
+              onMouseEnter={() => { isMouseInNoteTooltipRef.current = true; }}
+              onMouseLeave={(e) => { isMouseInNoteTooltipRef.current = false; handleMouseLeaveNoteTooltip(); }}
+              style={{
+                position: 'fixed',
+                right: `${notesPanelWidth + (treeMode ? 160 : 32) - 8}px`,
+                top: `${noteTooltipPos.wTop}px`,
+                height: `${noteTooltipPos.wH}px`,
+                zIndex: 10002,
+                display: 'flex',
+                flexDirection: 'row',
+                alignItems: 'center',
+              }}
+            >
+              <div
+                style={{
+                  marginTop: `${noteTooltipPos.offset}px`,
+                  outline: 'none',
+                  backgroundColor: 'rgba(25, 25, 25, 0.98)',
+                  backdropFilter: 'blur(12px)',
+                  border: '1px solid rgba(168, 85, 247, 0.3)',
+                  borderRadius: '6px 0 0 6px',
+                  padding: '10px 14px',
+                  fontSize: '12px',
+                  color: 'white',
+                  minWidth: '220px',
+                  maxWidth: '300px',
+                  boxShadow: '-8px 8px 30px rgba(168,85,247,0.12), -2px 2px 8px rgba(168,85,247,0.08)',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: '8px',
+                }}
+              >
+                {isNoteEditing ? (
+                  <>
+                    <span className="text-purple-400 font-medium text-[11px]">Заметка</span>
+                    <textarea
+                      ref={noteTextareaRef}
+                      value={noteEditText}
+                      onChange={(e) => setNoteEditText(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' && e.metaKey) {
+                          e.preventDefault();
+                          handleSaveNote(activeNoteEntry);
+                        }
+                        if (e.key === 'Escape') {
+                          e.preventDefault();
+                          if (notes[activeNoteEntry.uuid]) {
+                            // Had existing note — cancel edit
+                            setIsNoteEditing(false);
+                          } else {
+                            // Was creating new — close
+                            setIsNoteEditing(false);
+                            setActiveNoteIndex(null);
+                          }
+                        }
+                      }}
+                      className="w-full bg-white/5 border border-white/10 rounded px-2 py-1.5 text-[11px] text-white/90 font-mono resize-none focus:outline-none focus:border-purple-500/50"
+                      style={{ minHeight: '60px', maxHeight: '120px' }}
+                      placeholder="Введите заметку... (⌘+Enter сохранить)"
+                    />
+                    <div className="flex justify-between items-center">
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          if (notes[activeNoteEntry.uuid]) {
+                            setIsNoteEditing(false);
+                          } else {
+                            setIsNoteEditing(false);
+                            setActiveNoteIndex(null);
+                          }
+                        }}
+                        className="px-2 py-1 rounded text-[10px] text-white/40 hover:text-white hover:bg-white/10 transition-colors cursor-pointer"
+                      >
+                        Отмена
+                      </button>
+                      <div className="flex gap-1">
+                        {notes[activeNoteEntry.uuid] && (
+                          <button
+                            onClick={(e) => { e.stopPropagation(); handleDeleteNote(activeNoteEntry); }}
+                            className="p-1 rounded hover:bg-red-600/20 text-red-400/60 hover:text-red-400 transition-colors cursor-pointer"
+                            title="Удалить заметку"
+                          >
+                            <Trash2 size={12} />
+                          </button>
+                        )}
+                        <button
+                          onClick={(e) => { e.stopPropagation(); handleSaveNote(activeNoteEntry); }}
+                          className="px-2 py-1 rounded bg-purple-600/30 hover:bg-purple-600/50 text-[10px] text-purple-300 hover:text-white transition-colors cursor-pointer"
+                        >
+                          Сохранить
+                        </button>
+                      </div>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div className="flex justify-between items-start gap-2">
+                      <div className="text-white/80 leading-snug font-mono text-[11px] flex-1" style={{ whiteSpace: 'pre-wrap' }}>
+                        {notes[activeNoteEntry.uuid]}
+                      </div>
+                      <button
+                        onClick={(e) => { e.stopPropagation(); handleEditNote(activeNoteEntry); }}
+                        className="p-1.5 rounded hover:bg-white/10 text-purple-400/60 hover:text-purple-300 transition-colors cursor-pointer shrink-0"
+                        title="Редактировать"
+                      >
+                        <Pencil size={12} />
+                      </button>
+                    </div>
+                    <div className="flex justify-between items-center pt-1 border-t border-white/5">
+                      <span className="text-[10px] text-purple-400/40">Заметка</span>
+                      <button
+                        onClick={(e) => { e.stopPropagation(); handleDeleteNote(activeNoteEntry); }}
+                        className="p-1 rounded hover:bg-red-600/20 text-white/30 hover:text-red-400 transition-colors cursor-pointer"
+                        title="Удалить"
+                      >
+                        <Trash2 size={12} />
+                      </button>
+                    </div>
+                  </>
+                )}
+              </div>
+              {/* CSS Bridge */}
+              <div style={{ width: '8px', alignSelf: 'stretch' }} />
+            </div>
+          </TooltipPortal>
+        )}
+
         {/* Loading */}
         {isVisible && isLoading && entries.length === 0 && (
           <div className="absolute inset-0 flex items-center justify-center bg-black/20">
             <div className="w-1 h-1 bg-white animate-ping rounded-full" />
+          </div>
+        )}
+
+        {/* Scroll-to-bottom arrow — shown when reachable entries exist below visible area */}
+        {isVisible && showScrollDown && (
+          <div
+            className="absolute left-1/2 -translate-x-1/2 cursor-pointer z-50 flex items-center justify-center transition-all"
+            onClick={() => scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' })}
+            title="Scroll to bottom"
+            style={{
+              bottom: '9px',
+              width: '24px',
+              height: '24px',
+              borderRadius: '6px',
+              backgroundColor: '#323237',
+              border: '1px solid rgba(167, 139, 250, 0.3)',
+              boxShadow: '0 2px 8px rgba(0, 0, 0, 0.5)',
+            }}
+          >
+            <ChevronDown size={16} color="#a78bfa" strokeWidth={2.5} />
           </div>
         )}
 

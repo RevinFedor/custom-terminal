@@ -712,6 +712,7 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
       // Fit after opening, then reveal terminal
       setTimeout(() => {
         safeFit();
+        term.scrollToBottom();
         isReadyRef.current = true;
         setIsVisible(true); // Reveal after first fit to prevent jitter
         if (active) {
@@ -1184,16 +1185,6 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
             }
           } catch (e) {
             console.error('[Terminal] OSC 7 parse error:', e);
-          }
-          return true;
-        });
-
-        // OSC 7777 handler - entry marker registration (future: main process sends before user prompt)
-        term.parser.registerOscHandler(7777, (data: string) => {
-          if (data.startsWith('entry:')) {
-            const uuid = data.slice(6);
-            console.log('[Terminal] OSC 7777 entry marker:', uuid);
-            terminalRegistry.registerEntryMarker(tabId, uuid);
           }
           return true;
         });
