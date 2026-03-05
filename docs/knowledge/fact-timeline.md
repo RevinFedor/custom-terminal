@@ -154,8 +154,35 @@
 - **Portal Rule:** Кнопки в контекстном меню (Portal) обязательно используют `e.stopPropagation()` — см. `knowledge/fact-react-patterns.md`.
 - **Button Status:** Во время отката кнопка "Откатиться" заменяется на статус выполнения ("Компакт...", "Откат...", "Вставка...") и блокируется.
 
+### Sub-Agent Orchestration View (Gemini only)
+При работе с оркестратором Gemini → Claude, Timeline поддерживает визуализацию работы суб-агентов.
+
+**Phase 1 — Visual Differentiation:**
+- Записи `[Claude Sub-Agent Response]` отображаются **индиго** цветом (`#818cf8`) вместо белого.
+- Записи `[Claude Sub-Agent Timeout]` отображаются **красным** (`#ef4444`).
+- Метаданные агента (имя, taskId) парсятся из footer ответа: `Tab: <name> | Task ID: <id>`.
+- Backend: `parseSubAgentMeta()` в `gemini-data.js`.
+
+**Phase 2 — Collapsible Groups:**
+- ВСЕ последовательные sub-agent entries схлопываются в одну ноду (один "раунд оркестрации"), независимо от TaskID/имени агента.
+- **Collapsed:** одна индиго-точка с badge `×N` справа. Клик → expand.
+- **Expanded:** toggle-бар сверху (горизонтальная индиго-линия 8×2px, клик → collapse) + ВСЕ entries группы как children (indent, уменьшенный dot 3px, кликабельные для навигации).
+- **Dual-role header:** Первый entry группы (`isGroupHeader: true && isGroupChild: true`) — при collapsed работает как toggle, при expanded рендерится как child entry + отдельный toggle-бар сверху.
+- Группировка: `computeGroups()` возвращает `Map<number, GroupInfo>`. Собирает уникальные имена агентов (`Set<string>`). `agentName` = имя если один агент, `"N agents"` если несколько, `"Claude"` если unnamed.
+- Visibility агрегируется для collapsed headers (any child visible → header visible).
+- Состояние: `expandedGroups: Set<string>`, сбрасывается при смене сессии.
+
+**Phase 3 — Tree View:**
+- Toggle кнопка (появляется при hover если есть sub-agent groups): расширяет таймлайн с 24px до 160px.
+- В tree mode каждая нода показывает текстовый label (имя агента или превью промпта).
+- Вертикальные линии-коннекторы для sub-agent записей (CSS absolute positioned).
+- Центральная ось перемещается влево (left: 4px).
+- Tooltip `right` позиция учитывает ширину tree mode.
+- Состояние: `treeMode: boolean`, сбрасывается при смене сессии.
+
 ## Code Map
-- `Timeline.tsx`: UI компонент (полоса, точки, портал для тултипов, range copy).
+- `Timeline.tsx`: UI компонент (полоса, точки, портал для тултипов, range copy, sub-agent groups, tree view).
+- `gemini-data.js` (`gemini:get-timeline`): Парсинг Gemini JSON + `parseSubAgentMeta()` для извлечения метаданных агентов.
 - `main.js` (`claude:get-timeline`): Парсинг и фильтрация JSONL. Детекция типа `continued`.
 - `terminalRegistry.ts`: Методы `searchAndScroll`, `getVisibleText` (чтение вьюпорта) и `getFullBufferText` (проверка reachability).
 
