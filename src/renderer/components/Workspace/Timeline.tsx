@@ -184,42 +184,55 @@ function computeGroups(entries: TimelineEntry[]): Map<number, GroupInfo> {
       continue;
     }
 
-    const groupKey = entry.subAgentTaskId || entry.subAgentName || null;
     const startIdx = i;
     let j = i + 1;
 
-    // Group consecutive sub-agent entries with the same key
-    if (groupKey) {
-      while (j < entries.length && (entries[j].isSubAgent || entries[j].isSubAgentTimeout)) {
-        const nextKey = entries[j].subAgentTaskId || entries[j].subAgentName || null;
-        if (nextKey !== groupKey) break;
-        j++;
-      }
+    // Group ALL consecutive sub-agent entries together (one orchestration round)
+    while (j < entries.length && (entries[j].isSubAgent || entries[j].isSubAgentTimeout)) {
+      j++;
     }
 
     const size = j - startIdx;
     const groupId = `group-${groupCounter++}`;
     const hasTimeout = entries.slice(startIdx, j).some(e => e.isSubAgentTimeout);
-    const agentName = entry.subAgentName || 'Claude';
+    // Collect unique agent names for the group
+    const agentNames = new Set<string>();
+    for (let k = startIdx; k < j; k++) {
+      if (entries[k].subAgentName) agentNames.add(entries[k].subAgentName!);
+    }
+    const agentName = agentNames.size === 1 ? [...agentNames][0] : (agentNames.size > 1 ? `${agentNames.size} agents` : 'Claude');
 
-    // Header (always visible)
-    groups.set(startIdx, {
-      isGroupHeader: size > 1,
-      isGroupChild: false,
-      groupId,
-      groupSize: size,
-      agentName,
-      hasTimeout,
-      startIndex: startIdx,
-    });
-
-    // Children (hidden when collapsed)
-    for (let k = startIdx + 1; k < j; k++) {
-      groups.set(k, {
-        isGroupHeader: false,
+    if (size > 1) {
+      // First entry is BOTH header and first child
+      groups.set(startIdx, {
+        isGroupHeader: true,
         isGroupChild: true,
         groupId,
         groupSize: size,
+        agentName,
+        hasTimeout,
+        startIndex: startIdx,
+      });
+
+      // Remaining entries are children
+      for (let k = startIdx + 1; k < j; k++) {
+        groups.set(k, {
+          isGroupHeader: false,
+          isGroupChild: true,
+          groupId,
+          groupSize: size,
+          agentName,
+          hasTimeout,
+          startIndex: startIdx,
+        });
+      }
+    } else {
+      // Single entry — no group
+      groups.set(startIdx, {
+        isGroupHeader: false,
+        isGroupChild: false,
+        groupId,
+        groupSize: 1,
         agentName,
         hasTimeout,
         startIndex: startIdx,
@@ -254,8 +267,9 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
 
   // Phase 2: Collapsible groups
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
-  // Phase 3: Tree view
-  const [treeMode, setTreeMode] = useState(false);
+  // Phase 3: Tree view (per-tab, persisted in UIStore)
+  const treeMode = useUIStore(state => state.timelineTreeModeTabs[tabId] ?? false);
+  const setTimelineTreeMode = useUIStore(state => state.setTimelineTreeMode);
 
   const notesPanelWidth = useUIStore(state => state.notesPanelWidth);
   const copyIncludeEditing = useUIStore(state => state.copyIncludeEditing);
@@ -264,7 +278,11 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
   const isHistoryOpen = useUIStore(state => state.historyPanelOpenTabs[tabId] ?? false);
   const historyVisibleUuids = useUIStore(state => state.historyVisibleUuids[tabId]);
   const containerRef = useRef<HTMLDivElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
   const segmentRefs = useRef<(HTMLDivElement | null)[]>([]);
+
+  // Custom scroll indicator state (overlays the Resizer bar)
+  const [scrollThumb, setScrollThumb] = useState<{ top: number; height: number } | null>(null);
 
   // CMD key state for tooltip activation
   const [isCmdHeld, setIsCmdHeld] = useState(false);
@@ -280,6 +298,32 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
     }
     return false;
   }, [groupMap]);
+
+  // Custom scroll indicator: track scroll position on the scrollable div
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const updateThumb = () => {
+      const { scrollTop, scrollHeight, clientHeight } = el;
+      if (scrollHeight <= clientHeight) {
+        setScrollThumb(null); // no scroll needed
+        return;
+      }
+      const ratio = clientHeight / scrollHeight;
+      const thumbH = Math.max(ratio * clientHeight, 20); // min 20px
+      const maxScroll = scrollHeight - clientHeight;
+      const thumbTop = (scrollTop / maxScroll) * (clientHeight - thumbH);
+      setScrollThumb({ top: thumbTop, height: thumbH });
+    };
+    updateThumb();
+    el.addEventListener('scroll', updateThumb, { passive: true });
+    const ro = new ResizeObserver(updateThumb);
+    ro.observe(el);
+    return () => {
+      el.removeEventListener('scroll', updateThumb);
+      ro.disconnect();
+    };
+  }, [entries, treeMode]); // recalc when entries change or tree mode toggles
 
   // Adjust segmentRefs length
   useEffect(() => {
@@ -340,6 +384,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
     if (!sessionId) {
       setEntries([]);
       setForkMarkers([]);
+      setExpandedGroups(new Set());
+      setTimelineTreeMode(tabId, false);
       return;
     }
 
@@ -1241,35 +1287,49 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
         data-timeline
         className="relative flex flex-col group"
         style={{
-          width: treeMode ? '160px' : '24px',
+          width: '24px',
           backgroundColor: 'rgba(0, 0, 0, 0.2)',
           backdropFilter: 'blur(4px)',
           borderLeft: '1px solid rgba(255, 255, 255, 0.05)',
           height: '100%',
           zIndex: 40,
           visibility: isVisible ? 'inherit' : 'hidden',
-          transition: 'width 0.3s ease',
+          overflow: 'visible',
         }}
       >
-        {/* Central Axis Line (hidden in tree mode) */}
+        {/* Central Axis Line (compact mode only) */}
         {!treeMode && (
           <div className="absolute left-1/2 top-0 bottom-0 w-[1px] bg-white/10 -translate-x-1/2 pointer-events-none" />
         )}
 
-        {/* Tree mode toggle (visible on hover when sub-agent groups exist) */}
-        {isGemini && hasSubAgentGroups && (
-          <div
-            className="absolute top-0 left-0 right-0 h-[14px] flex items-center justify-center z-10 cursor-pointer opacity-0 group-hover:opacity-100 transition-opacity"
-            style={{ backgroundColor: 'rgba(0,0,0,0.6)' }}
-            onClick={() => setTreeMode(prev => !prev)}
-            title={treeMode ? 'Compact view' : 'Tree view'}
-          >
-            <span className="text-[8px] text-white/50">{treeMode ? '◀' : '▶'}</span>
-          </div>
-        )}
+        {/* Tree mode toggle removed — now controlled from InfoPanel sidebar */}
 
-        {/* Segmented Hit-boxes */}
-        <div className="flex flex-col h-full w-full" style={{ opacity: isVisible ? 1 : 0, overflowY: 'auto' }}>
+        {/* Segmented Hit-boxes — in tree mode, expands LEFT as absolute overlay */}
+        <div
+          ref={scrollRef}
+          className="flex flex-col h-full scrollbar-hide"
+          style={{
+            opacity: isVisible ? 1 : 0,
+            overflowY: 'auto',
+            ...(treeMode ? {
+              position: 'absolute' as const,
+              top: 0,
+              bottom: 0,
+              right: 0,
+              width: '160px',
+              backgroundColor: 'rgba(0, 0, 0, 0.88)',
+              backdropFilter: 'blur(8px)',
+              borderLeft: '1px solid rgba(129, 140, 248, 0.15)',
+              zIndex: 50,
+            } : {
+              width: '100%',
+            }),
+          }}
+        >
+          {/* Tree mode: left axis line */}
+          {treeMode && (
+            <div className="absolute top-0 bottom-0 w-px pointer-events-none" style={{ left: '4px', backgroundColor: 'rgba(255, 255, 255, 0.08)' }} />
+          )}
           {/* Plan mode marker at the very beginning (first entry is from a child session — chain started before visible entries) */}
           {entries.length > 0 && entries[0].sessionId && sessionBoundaries.length > 0 &&
             sessionBoundaries.some(b => b.childSessionId === entries[0].sessionId) &&
@@ -1311,27 +1371,26 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
             </div>
           )}
           {entries.map((entry, index) => {
+            const groupInfo = groupMap.get(index);
+
+            // Phase 2: Hide collapsed group children (but NOT the header)
+            if (groupInfo?.isGroupChild && !groupInfo?.isGroupHeader && !expandedGroups.has(groupInfo.groupId)) {
+              // Still need ref for visibility system — render invisible placeholder
+              return <div key={entry.uuid} ref={el => segmentRefs.current[index] = el} style={{ display: 'none' }} />;
+            }
+
             const active = isSelected(entry, index);
             const isCompacted = entry.type === 'compact';
             const isLastEntry = index === entries.length - 1;
-            // Check if fork marker should appear AFTER this entry
-            // Fork marker shows after the LAST entry that exists in the fork snapshot
-            // This handles Escape/Undo correctly - marker stays with inherited entries
             const forkMarker = forkMarkers.find(m => {
               if (!m.entry_uuids || m.entry_uuids.length === 0) return false;
               const snapshotUuids = new Set(m.entry_uuids);
-
-              // This entry must be in snapshot (inherited)
               if (!snapshotUuids.has(entry.uuid)) return false;
-
-              // Check if NEXT entry is NOT in snapshot (new) or this is last entry
               if (isLastEntry) return true;
               const nextEntry = entries[index + 1];
               return nextEntry && !snapshotUuids.has(nextEntry.uuid);
             });
 
-            // Check for plan mode boundary: sessionId changed and no fork marker at this position
-            // Fork boundaries are already handled by forkMarker; any other sessionId change = plan mode
             const isPlanModeBoundary = (() => {
               if (isLastEntry || forkMarker) return false;
               const nextEntry = entries[index + 1];
@@ -1339,51 +1398,212 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
               return entry.sessionId !== nextEntry.sessionId;
             })();
 
-            const isInViewport = visibleEntryIndices.has(index);
-            const isResponseOnly = responseOnlyIndices.has(index);
+            // Phase 2: Group state
+            const isGroupExpanded = !!(groupInfo?.groupId && expandedGroups.has(groupInfo.groupId));
+            const isGroupCollapsed = !!(groupInfo?.isGroupHeader && !isGroupExpanded);
+            const isGroupChild = !!(groupInfo?.isGroupChild && isGroupExpanded);
+            // When collapsed, header entry is the visible toggle (not a child)
+            // When expanded, header entry renders as a child too
+            const showAsChild = isGroupChild && !(groupInfo?.isGroupHeader && !isGroupExpanded);
+            const isInViewport = isGroupCollapsed
+              ? Array.from({ length: groupInfo!.groupSize }, (_, offset) => index + offset).some(idx => visibleEntryIndices.has(idx))
+              : visibleEntryIndices.has(index);
+            const isResponseOnly = isGroupCollapsed ? false : responseOnlyIndices.has(index);
             const isUnreachable = unreachableIndices.has(index);
             const isContinued = entry.type === 'continued';
             const isPlan = !!entry.isPlan;
             const dotClickState = clickedState?.index === index ? clickedState.status : null;
 
+            // Entry type flags
+            const entryIsSubAgent = !!(entry.isSubAgent || entry.isSubAgentTimeout);
+            const entryIsTimeout = !!entry.isSubAgentTimeout;
+            const isHovered = hoveredIndex === index || activeTooltipIndex === index;
+
+            // ── Dot color ──
+            let dotColor: string;
+            let dotGlow: string;
+
+            if (isCompacted) {
+              dotColor = isInViewport ? '#fbbf24' : '#f59e0b';
+              dotGlow = isHovered ? '0 0 8px rgba(245, 158, 11, 0.4)' : (isInViewport ? '0 0 6px rgba(245, 158, 11, 0.25)' : 'none');
+            } else if (isContinued) {
+              dotColor = '#f59e0b';
+              dotGlow = isHovered ? '0 0 8px rgba(245, 158, 11, 0.4)' : 'none';
+            } else if (isPlan) {
+              dotColor = isHovered ? '#5eada3' : '#48968c';
+              dotGlow = isHovered ? '0 0 8px rgba(72, 150, 140, 0.4)' : 'none';
+            } else if (active) {
+              dotColor = '#3b82f6';
+              dotGlow = 'none';
+            } else if (isHovered) {
+              if (entryIsTimeout) { dotColor = '#ef4444'; dotGlow = '0 0 8px rgba(239, 68, 68, 0.4)'; }
+              else if (entryIsSubAgent) { dotColor = '#818cf8'; dotGlow = '0 0 8px rgba(129, 140, 248, 0.4)'; }
+              else { dotColor = 'white'; dotGlow = '0 0 8px rgba(255,255,255,0.4)'; }
+            } else if (entryIsTimeout) {
+              dotColor = isInViewport ? 'rgba(239, 68, 68, 0.7)' : 'rgba(239, 68, 68, 0.35)';
+              dotGlow = isInViewport ? '0 0 6px rgba(239, 68, 68, 0.25)' : 'none';
+            } else if (entryIsSubAgent) {
+              dotColor = isInViewport ? (isResponseOnly ? 'rgba(129, 140, 248, 0.35)' : 'rgba(129, 140, 248, 0.8)') : 'rgba(129, 140, 248, 0.3)';
+              dotGlow = isInViewport ? (isResponseOnly ? 'none' : '0 0 6px rgba(129, 140, 248, 0.25)') : 'none';
+            } else {
+              dotColor = isInViewport ? (isResponseOnly ? 'rgba(255,255,255,0.35)' : 'rgba(255,255,255,0.75)') : 'rgba(255,255,255,0.3)';
+              dotGlow = isInViewport ? (isResponseOnly ? 'none' : '0 0 6px rgba(255,255,255,0.25)') : 'none';
+            }
+
+            // ── Dot size ──
+            const dotWidth = isCompacted
+              ? (isInViewport ? '10px' : '12px')
+              : showAsChild
+                ? (isHovered ? '6px' : (isInViewport ? '8px' : '3px'))
+                : (isHovered ? '8px' : (isInViewport ? '10px' : '4px'));
+            const dotHeight = isCompacted
+              ? (isInViewport ? '3px' : '2px')
+              : showAsChild
+                ? (isHovered ? '6px' : (isInViewport ? '2px' : '3px'))
+                : (isHovered ? '8px' : (isInViewport ? '3px' : '4px'));
+            const dotRadius = (isCompacted || (isInViewport && !isHovered)) ? '1px' : '50%';
+
+            // Expanded group header: render toggle bar THEN the entry as child
+            const isExpandedHeader = !!(groupInfo?.isGroupHeader && isGroupExpanded);
+
             return (
               <React.Fragment key={entry.uuid}>
+                {/* Phase 2: Expanded group toggle bar (separate from entry) */}
+                {isExpandedHeader && (
+                  <div
+                    className="relative w-full flex items-center justify-center"
+                    style={{
+                      flex: '0 0 auto',
+                      minHeight: '10px',
+                      cursor: 'pointer',
+                    }}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setExpandedGroups(prev => {
+                        const next = new Set(prev);
+                        next.delete(groupInfo!.groupId);
+                        return next;
+                      });
+                    }}
+                  >
+                    {/* Collapse indicator: small horizontal line */}
+                    <div style={{
+                      width: '8px',
+                      height: '2px',
+                      borderRadius: '1px',
+                      backgroundColor: 'rgba(129, 140, 248, 0.5)',
+                    }} />
+                    {treeMode && (
+                      <span className="ml-1 truncate pointer-events-none select-none" style={{
+                        fontSize: '8px',
+                        color: 'rgba(129, 140, 248, 0.4)',
+                      }}>
+                        ▾ {groupInfo!.agentName} ×{groupInfo!.groupSize}
+                      </span>
+                    )}
+                  </div>
+                )}
                 <div
                   ref={el => segmentRefs.current[index] = el}
                   data-segment
-                  className="relative flex-1 min-h-[4px] w-full flex items-center justify-center transition-colors"
+                  className="relative w-full flex items-center transition-colors"
                   onMouseEnter={() => handleMouseEnterSegment(index)}
                   onMouseLeave={(e) => handleMouseLeaveSegment(e)}
-                  onClick={() => handleEntryClick(entry)}
+                  onClick={(e) => {
+                    // Phase 2: Click on collapsed group header toggles expansion
+                    if (groupInfo?.isGroupHeader && !isGroupExpanded) {
+                      e.stopPropagation();
+                      setExpandedGroups(prev => {
+                        const next = new Set(prev);
+                        next.add(groupInfo.groupId);
+                        return next;
+                      });
+                    } else {
+                      handleEntryClick(entry);
+                    }
+                  }}
                   onDoubleClick={() => handleEntryDoubleClick(entry)}
                   onContextMenu={(e) => handleRightClick(e, entry)}
                   style={{
+                    flex: showAsChild ? '0 0 auto' : '1 0 8px',
+                    minHeight: treeMode ? '18px' : (showAsChild ? '3px' : '8px'),
+                    justifyContent: treeMode ? 'flex-start' : 'center',
+                    paddingLeft: treeMode
+                      ? (showAsChild ? '20px' : entryIsSubAgent ? '10px' : '4px')
+                      : (showAsChild ? '4px' : undefined),
                     backgroundColor: active
                       ? 'rgba(59, 130, 246, 0.15)'
                       : (isUnreachable ? 'rgba(239, 68, 68, 0.06)' : 'transparent'),
                     cursor: isContinued ? 'default' : 'pointer',
                   }}
                 >
-                  {/* Visual Indicator: Dot (normal), Line (compact), or Dot (continued=orange) */}
+                  {/* Tree mode: vertical connector lines */}
+                  {treeMode && entryIsSubAgent && !showAsChild && (
+                    <div className="absolute top-0 bottom-0 w-px pointer-events-none" style={{ left: '8px', backgroundColor: 'rgba(129, 140, 248, 0.15)' }} />
+                  )}
+                  {treeMode && showAsChild && (
+                    <div className="absolute top-0 bottom-0 w-px pointer-events-none" style={{ left: '14px', backgroundColor: 'rgba(129, 140, 248, 0.1)' }} />
+                  )}
+
+                  {/* Dot */}
                   <div
-                    className="transition-all duration-200 pointer-events-none"
+                    className="transition-all duration-200 pointer-events-none shrink-0"
                     style={{
-                      width: isCompacted ? (isInViewport ? '10px' : '12px') : (hoveredIndex === index || activeTooltipIndex === index ? '8px' : (isInViewport ? '10px' : '4px')),
-                      height: isCompacted ? (isInViewport ? '3px' : '2px') : (hoveredIndex === index || activeTooltipIndex === index ? '8px' : (isInViewport ? '3px' : '4px')),
-                      borderRadius: (isCompacted || (isInViewport && hoveredIndex !== index && activeTooltipIndex !== index)) ? '1px' : '50%',
-                      backgroundColor: isCompacted
-                        ? (isInViewport ? '#fbbf24' : '#f59e0b')
-                        : isContinued
-                          ? '#f59e0b'
-                          : isPlan
-                            ? '#48968c'
-                            : (active ? '#3b82f6' : (hoveredIndex === index || activeTooltipIndex === index ? 'white' : (isInViewport ? (isResponseOnly ? 'rgba(255,255,255,0.35)' : 'rgba(255,255,255,0.75)') : 'rgba(255,255,255,0.3)'))),
-                      boxShadow: (hoveredIndex === index || activeTooltipIndex === index)
-                        ? (isContinued ? '0 0 8px rgba(245, 158, 11, 0.4)' : isPlan ? '0 0 8px rgba(72, 150, 140, 0.4)' : '0 0 8px rgba(255,255,255,0.4)')
-                        : (isInViewport ? (isCompacted ? '0 0 6px rgba(245, 158, 11, 0.25)' : (isResponseOnly ? 'none' : '0 0 6px rgba(255,255,255,0.25)')) : 'none'),
+                      width: dotWidth,
+                      height: dotHeight,
+                      borderRadius: dotRadius,
+                      backgroundColor: dotColor,
+                      boxShadow: dotGlow,
                     }}
                   />
-                  {/* Loading spinner — instant feedback on click */}
+
+                  {/* Phase 2: Group count badge (collapsed only) */}
+                  {groupInfo?.isGroupHeader && !isGroupExpanded && !treeMode && (
+                    <div
+                      className="absolute pointer-events-none"
+                      style={{
+                        right: '2px',
+                        top: '50%',
+                        transform: 'translateY(-50%)',
+                        fontSize: '7px',
+                        lineHeight: '1',
+                        color: 'rgba(129, 140, 248, 0.7)',
+                        fontWeight: 600,
+                        fontFamily: 'monospace',
+                      }}
+                    >
+                      ×{groupInfo.groupSize}
+                    </div>
+                  )}
+
+                  {/* Phase 3: Tree mode label */}
+                  {treeMode && !isExpandedHeader && (
+                    <span
+                      className="ml-1 truncate pointer-events-none select-none flex-1 min-w-0"
+                      style={{
+                        fontSize: '9px',
+                        lineHeight: '1.2',
+                        color: entryIsTimeout
+                          ? 'rgba(239, 68, 68, 0.5)'
+                          : entryIsSubAgent
+                            ? 'rgba(129, 140, 248, 0.5)'
+                            : 'rgba(255, 255, 255, 0.4)',
+                      }}
+                    >
+                      {isGroupCollapsed
+                        ? `${groupInfo!.agentName} ×${groupInfo!.groupSize}`
+                        : entryIsTimeout
+                          ? 'timeout'
+                          : entryIsSubAgent
+                            ? (entry.subAgentName || 'Claude')
+                            : isCompacted
+                              ? 'compact'
+                              : truncateText(entry.content, 60)
+                      }
+                    </span>
+                  )}
+
+                  {/* Loading spinner */}
                   {dotClickState === 'loading' && (
                     <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
                       <div
@@ -1399,7 +1619,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
                       />
                     </div>
                   )}
-                  {/* Failed X — search text not found in terminal buffer */}
+                  {/* Failed X */}
                   {dotClickState === 'failed' && (
                     <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
                       <svg width="10" height="10" viewBox="0 0 10 10" style={{ opacity: 0.7 }}>
@@ -1409,7 +1629,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
                     </div>
                   )}
                 </div>
-                {/* Fork marker - appears AFTER the entry at position (entry_count - 1) */}
+                {/* Fork marker */}
                 {forkMarker && (
                   <div
                     className="flex-shrink-0 w-full flex items-center justify-center"
@@ -1428,7 +1648,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
                     />
                   </div>
                 )}
-                {/* Plan mode marker - appears where session context was cleared */}
+                {/* Plan mode marker */}
                 {isPlanModeBoundary && (
                   <div
                     className="flex-shrink-0 w-full flex items-center justify-center"
@@ -1526,7 +1746,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
               onMouseLeave={handleMouseLeaveTooltipArea}
               style={{
                 position: 'fixed',
-                right: `${notesPanelWidth + 24 - 8}px`,
+                right: `${notesPanelWidth + (treeMode ? 160 : 24) - 8}px`,
                 top: `${tooltipPos.wTop}px`,
                 height: `${tooltipPos.wH}px`,
                 zIndex: 10000,
@@ -1580,6 +1800,42 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
                         {isExpanded ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
                       </button>
                     )}
+                  </>
+                ) : (currentActiveEntry.isSubAgent || currentActiveEntry.isSubAgentTimeout) ? (
+                  <>
+                    <div className="flex items-center gap-2">
+                      <div style={{ width: '6px', height: '6px', borderRadius: '50%', backgroundColor: currentActiveEntry.isSubAgentTimeout ? '#ef4444' : '#818cf8', flexShrink: 0 }} />
+                      <span style={{ color: currentActiveEntry.isSubAgentTimeout ? '#ef4444' : '#818cf8' }} className="font-medium text-[11px]">
+                        {currentActiveEntry.isSubAgentTimeout ? 'Timeout' : (currentActiveEntry.subAgentName || 'Claude Sub-Agent')}
+                      </span>
+                    </div>
+                    {(() => {
+                      const gi = groupMap.get(activeTooltipIndex!);
+                      if (gi?.isGroupHeader) {
+                        return (
+                          <span className="text-[10px] text-white/40">
+                            ×{gi.groupSize} agents{gi.hasTimeout ? ' (with timeout)' : ''}
+                          </span>
+                        );
+                      }
+                      return null;
+                    })()}
+                    <div
+                      className={`text-white/70 leading-snug font-mono text-[11px] ${isExpanded ? 'overflow-y-auto' : 'line-clamp-4'}`}
+                      style={{ whiteSpace: 'pre-wrap' }}
+                    >
+                      {isExpanded ? currentActiveEntry.content : truncateText(currentActiveEntry.content, 200)}
+                    </div>
+                    <div className="flex justify-between items-center mt-1 pt-2 border-t border-white/5">
+                      <span className="text-[10px] text-white/30">{new Date(currentActiveEntry.timestamp).toLocaleTimeString()}</span>
+                      <button
+                        onClick={(e) => { e.stopPropagation(); clipboard.writeText(currentActiveEntry.content); }}
+                        className="flex items-center gap-1.5 px-2 py-1 rounded bg-white/5 hover:bg-white/10 text-[10px] text-white/60 hover:text-white transition-colors cursor-pointer"
+                      >
+                        <Copy size={12} />
+                        Copy
+                      </button>
+                    </div>
                   </>
                 ) : currentActiveEntry.isPlan ? (
                   <>
@@ -1731,6 +1987,23 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
           <div className="absolute inset-0 flex items-center justify-center bg-black/20">
             <div className="w-1 h-1 bg-white animate-ping rounded-full" />
           </div>
+        )}
+
+        {/* Custom scroll indicator — right edge of Timeline strip (compact) or tree overlay */}
+        {isVisible && scrollThumb && (
+          <div
+            className="absolute pointer-events-none"
+            style={{
+              right: '0px',
+              width: '3px',
+              top: scrollThumb.top,
+              height: scrollThumb.height,
+              backgroundColor: 'rgba(255, 255, 255, 0.4)',
+              borderRadius: '1.5px',
+              transition: 'top 0.05s ease-out',
+              zIndex: 55,
+            }}
+          />
         )}
       </div>
     </>

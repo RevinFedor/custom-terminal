@@ -4,7 +4,7 @@ import '@anthropic/markdown-editor/styles.css';
 import { useWorkspaceStore } from '../../../store/useWorkspaceStore';
 import { useUIStore } from '../../../store/useUIStore';
 import { usePromptsStore } from '../../../store/usePromptsStore';
-import { RotateCcw, Clock, ChevronDown, ChevronRight, ScrollText } from 'lucide-react';
+import { RotateCcw, Clock, ChevronDown, ChevronRight, ScrollText, GitBranch } from 'lucide-react';
 import ActionsPanel from './ActionsPanel';
 
 const { ipcRenderer } = window.require('electron');
@@ -66,6 +66,9 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
   const historyPanelOpenTabs = useUIStore((s) => s.historyPanelOpenTabs);
   const setHistoryPanelOpen = useUIStore((s) => s.setHistoryPanelOpen);
   const isHistoryOpen = activeTabId ? (historyPanelOpenTabs[activeTabId] ?? false) : false;
+  const timelineTreeModeTabs = useUIStore((s) => s.timelineTreeModeTabs);
+  const setTimelineTreeMode = useUIStore((s) => s.setTimelineTreeMode);
+  const isTreeMode = activeTabId ? (timelineTreeModeTabs[activeTabId] ?? false) : false;
   const { getPromptById } = usePromptsStore();
   const wordWrap = useUIStore((s) => s.wordWrap);
   const tabNotesFontSize = useUIStore((s) => s.tabNotesFontSize);
@@ -377,30 +380,51 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
       {/* Upper sections — scrollable independently */}
       <div className="overflow-y-auto min-h-0 shrink">
       <div className="mb-4">
-        {hasAnySession && activeTabId ? (
-          <button
-            onClick={() => setHistoryPanelOpen(activeTabId, !isHistoryOpen)}
-            className="flex items-center mb-2 cursor-pointer"
-            style={{
-              gap: 5,
-              background: 'none',
-              border: 'none',
-              padding: 0,
-              color: isHistoryOpen ? '#ccc' : '#888',
-            }}
-            onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.color = '#fff'; }}
-            onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.color = isHistoryOpen ? '#ccc' : '#888'; }}
-            title={isHistoryOpen ? 'Close History' : 'Open History'}
-          >
-            <ScrollText size={12} />
-            <span className="text-[11px] uppercase">AI Session</span>
-          </button>
-        ) : (
-          <div className="flex items-center mb-2 text-[#888]" style={{ gap: 5 }}>
-            <ScrollText size={12} />
-            <span className="text-[11px] uppercase">AI Session</span>
-          </div>
-        )}
+        <div className="flex items-center mb-2" style={{ gap: 6 }}>
+          {/* Tree mode toggle — only for Gemini sessions */}
+          {hasAnySession && activeTabId && currentSessionType === 'gemini' && (
+            <button
+              onClick={() => setTimelineTreeMode(activeTabId, !isTreeMode)}
+              className="cursor-pointer"
+              style={{
+                background: 'none',
+                border: 'none',
+                padding: 0,
+                color: isTreeMode ? '#818cf8' : '#555',
+              }}
+              onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.color = isTreeMode ? '#a5b4fc' : '#888'; }}
+              onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.color = isTreeMode ? '#818cf8' : '#555'; }}
+              title={isTreeMode ? 'Close tree view' : 'Open tree view'}
+            >
+              <GitBranch size={12} />
+            </button>
+          )}
+          {/* AI Session button */}
+          {hasAnySession && activeTabId ? (
+            <button
+              onClick={() => setHistoryPanelOpen(activeTabId, !isHistoryOpen)}
+              className="flex items-center cursor-pointer"
+              style={{
+                gap: 5,
+                background: 'none',
+                border: 'none',
+                padding: 0,
+                color: isHistoryOpen ? '#ccc' : '#888',
+              }}
+              onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.color = '#fff'; }}
+              onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.color = isHistoryOpen ? '#ccc' : '#888'; }}
+              title={isHistoryOpen ? 'Close History' : 'Open History'}
+            >
+              <ScrollText size={12} />
+              <span className="text-[11px] uppercase">AI Session</span>
+            </button>
+          ) : (
+            <div className="flex items-center text-[#888]" style={{ gap: 5 }}>
+              <ScrollText size={12} />
+              <span className="text-[11px] uppercase">AI Session</span>
+            </div>
+          )}
+        </div>
         {hasAnySession ? (
           <div className={`rounded p-2 ${currentSessionType === 'claude' ? 'bg-[#2a3a2a] border border-[#3a5a3a]' : 'bg-[#1a2a3a] border border-[#2a4a6a]'}`}>
             <div className="flex items-center gap-2 mb-1">

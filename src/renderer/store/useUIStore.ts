@@ -167,6 +167,10 @@ interface UIStore {
   setHistoryScrollToUuid: (uuid: string | null) => void;
   setHistoryVisibleUuids: (tabId: string, uuids: string[]) => void;
 
+  // Timeline tree mode (per-tab state)
+  timelineTreeModeTabs: Record<string, boolean>;
+  setTimelineTreeMode: (tabId: string, open: boolean) => void;
+
   // Notes Panel Width
 
   notesPanelWidth: number;
@@ -742,6 +746,11 @@ export const useUIStore = create<UIStore>((set, get) => ({
   setHistoryScrollToUuid: (uuid) => set({ historyScrollToUuid: uuid }),
   setHistoryVisibleUuids: (tabId, uuids) => set(state => ({
     historyVisibleUuids: { ...state.historyVisibleUuids, [tabId]: uuids }
+  })),
+
+  timelineTreeModeTabs: {},
+  setTimelineTreeMode: (tabId, open) => set(state => ({
+    timelineTreeModeTabs: { ...state.timelineTreeModeTabs, [tabId]: open }
   })),
   setHistoryPanelWidth: (width) => {
     const clamped = Math.max(280, Math.min(700, width));
