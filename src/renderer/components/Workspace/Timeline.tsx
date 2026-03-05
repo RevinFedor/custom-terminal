@@ -1307,10 +1307,12 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
         {/* Segmented Hit-boxes — in tree mode, expands LEFT as absolute overlay */}
         <div
           ref={scrollRef}
-          className="flex flex-col h-full scrollbar-hide"
+          className="h-full scrollbar-hide"
           style={{
             opacity: isVisible ? 1 : 0,
             overflowY: 'auto',
+            display: 'flex',
+            flexDirection: 'column',
             ...(treeMode ? {
               position: 'absolute' as const,
               top: 0,
@@ -1525,8 +1527,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
                   onDoubleClick={() => handleEntryDoubleClick(entry)}
                   onContextMenu={(e) => handleRightClick(e, entry)}
                   style={{
-                    flex: showAsChild ? '0 0 auto' : '1 0 8px',
-                    minHeight: treeMode ? '18px' : (showAsChild ? '3px' : '8px'),
+                    flex: '0 0 auto',
+                    minHeight: treeMode ? '18px' : (showAsChild ? '5px' : '12px'),
                     justifyContent: treeMode ? 'flex-start' : 'center',
                     paddingLeft: treeMode
                       ? (showAsChild ? '20px' : entryIsSubAgent ? '10px' : '4px')
