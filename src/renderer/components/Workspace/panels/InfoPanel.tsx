@@ -454,10 +454,12 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                     if (activeTabId && currentSessionType === 'claude') {
                       setTabCommandType(activeTabId, 'claude');
                       terminalRegistry.get(activeTabId)?.scrollToBottom();
+                      window.dispatchEvent(new CustomEvent('timeline:scroll-to-bottom', { detail: { tabId: activeTabId } }));
                       ipcRenderer.send('claude:run-command', { tabId: activeTabId, command: 'claude-c', sessionId: claudeSessionId });
                     } else if (activeTabId && currentSessionType === 'gemini') {
                       setTabCommandType(activeTabId, 'gemini');
                       terminalRegistry.get(activeTabId)?.scrollToBottom();
+                      window.dispatchEvent(new CustomEvent('timeline:scroll-to-bottom', { detail: { tabId: activeTabId } }));
                       ipcRenderer.send('gemini:run-command', { tabId: activeTabId, command: 'gemini-c', sessionId: geminiSessionId });
                     }
                   }}

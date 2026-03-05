@@ -47,6 +47,7 @@ Entries используют `flex: '1 0 auto'` с минимальной выс
 - **hasAnyPosition Guard:** Если `computePositions()` не нашёл ни одной позиции (все entries = -1), `checkReachability()` НЕ помечает entries как unreachable. Красный фон активируется только когда хотя бы одна entry имеет валидную позицию (т.е. остальные реально trimmed из scrollback). Это предотвращает полностью красный Timeline при свежем запуске с пустым буфером.
 - **Boundary Gate Fix:** OSC 7777 injection в main.js гейтится на `claudeSpinnerBusy.has(tabId)` (не `bridgeKnownSessions`). См. [`fix-boundary-bridge-race.md`](fix-boundary-bridge-race.md).
 - **Opaque Dots:** Все точки используют непрозрачные (solid) цвета. Это необходимо, чтобы они полностью перекрывали центральную вертикальную линию (Central Axis), исключая визуальный мусор и «просвечивание» полосы сквозь индикаторы.
+- **Transition Policy (No Size Animation):** Точки и маркеры (fork, plan, notes) анимируют только цвет и glow, размеры меняются мгновенно. Пробовали `transition: all 0.2s` — анимация width/height элементов внутри `flex: 1 0 auto` контейнера заставляла Chromium пересчитывать flex-layout на каждом кадре (200ms × 60fps = ~12 reflow), что вызывало визуальное дрожание всех entries при наведении на одну точку.
 
 ### Кастомный скроллбар (In-strip Indicator)
 Для Timeline реализован кастомный индикатор скролла, заменяющий системный скроллбар.
@@ -60,6 +61,10 @@ Entries используют `flex: '1 0 auto'` с минимальной выс
 - **Действие:** Плавный скролл (`behavior: 'smooth'`) scrollRef контейнера до конца.
 - **Детекция:** Встроена в существующий `updateThumb()` scroll handler (без дополнительных event listeners). При `isAtBottom` (scrollTop >= maxScroll - 5) стрелка скрывается.
 - **Motivation:** В длинных сессиях (50+ entries) пользователь может случайно проскроллить вверх и не знать, что ниже есть актуальные (не-красные) данные.
+
+### Auto-Scroll при продолжении сессии
+При нажатии «Продолжить» (claude-c / gemini-c) Timeline автоматически прокручивается к последним entries. Также срабатывает при первой загрузке entries с новым sessionId (запуск приложения). Не sticky-scroll — при периодическом обновлении (каждые 2с) позиция скролла не меняется, чтобы не мешать ручному просмотру истории.
+- **Invisible Intent:** Без auto-scroll пользователь при продолжении длинной сессии видит верх Timeline с красными (unreachable) entries, хотя актуальные записи внизу. SessionId при «Продолжить» не меняется, поэтому обычный watch на sessionId не срабатывает — нужен отдельный сигнал от кнопки.
 
 ### Click-to-Scroll (Deterministic Navigation)
 

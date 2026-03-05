@@ -1,0 +1,2512 @@
+[
+  {
+    "path": "docs/knowledge/fact-terminal-rendering.md",
+    "type": "fact",
+    "explicit": [
+      "terminal rendering",
+      "xterm.js",
+      "TUI jitter",
+      "performance",
+      "font smoothing",
+      "WebGL",
+      "Canvas renderer"
+    ],
+    "implicit": [
+      "ink_tui_render_tearing",
+      "write_buffer_batching",
+      "canvas_renderer_switch",
+      "stale_canvas_refresh",
+      "sigwinch_storm_protection",
+      "visibility_inherit_trap",
+      "sgr7_reverse_video",
+      "persistent_terminal_mounting",
+      "font_smoothing_antialiased",
+      "webgl_context_limit"
+    ],
+    "symptoms": [
+      "Terminal input field jitters or disappears briefly when Claude or Gemini is thinking",
+      "Switching back to a terminal tab shows stale, garbled, or duplicate TUI lines",
+      "Opening more than 16 terminal tabs causes empty screens or crashes due to GPU limits",
+      "Fonts in the terminal look blurry or significantly bolder than in iTerm or VS Code",
+      "Automated commands fail because switching tabs triggers a CLI redraw (SIGWINCH storm)"
+    ],
+    "related_components": [
+      "src/renderer/components/Workspace/Terminal.tsx",
+      "src/renderer/components/Workspace/TerminalArea.tsx",
+      "src/renderer/styles/globals.css"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fix-claude-plan-mode-chain.md",
+    "type": "fix",
+    "explicit": [
+      "Claude Plan Mode",
+      "Session Chain Repair",
+      "Clear Context behavior",
+      "SQLite mapping"
+    ],
+    "implicit": [
+      "jsonl_chain_resolution",
+      "sqlite_persistence_bridge",
+      "pid_reuse_conflict",
+      "timeline_flicker_prevention",
+      "cycle_guard_oscillator",
+      "backtrace_fallback_path",
+      "statusline_bridge_sync",
+      "fs_watch_latency",
+      "parent_uuid_null_handler",
+      "session_links_table"
+    ],
+    "symptoms": [
+      "Session ID and name flicker every second in the sidebar info panel",
+      "Timeline component constantly reloads or points jump during navigation",
+      "Chat history is truncated or suddenly switches branches after Clear Context command",
+      "Interface becomes jerky with infinite re-renders when viewing Claude CLI sessions",
+      "Session mapping is lost after SQLite database is cleared or corrupted"
+    ],
+    "related_components": [
+      "main.js",
+      "src/components/Timeline.tsx",
+      "src/components/InfoPanel.tsx",
+      "src/services/database.js"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fix-environment.md",
+    "type": "fix",
+    "explicit": [
+      "macOS_focus_stealing",
+      "title_bar_drag_events",
+      "vite_transform_error",
+      "gemini_cli_timing",
+      "log_compression"
+    ],
+    "implicit": [
+      "macOS_Sequoia_focus_stealing",
+      "app_setActivationPolicy_regular",
+      "webkit_app_region_drag_conflict",
+      "layered_cake_titlebar_strategy",
+      "vite_dollar_sign_escaping",
+      "gemini_cli_handshake_ansi",
+      "pragmatic_dnd_layout_shift",
+      "log_compression_context_optimization",
+      "bash_command_template_literals",
+      "electron_vite_child_process_window",
+      "raw_mode_paste_delay"
+    ],
+    "symptoms": [
+      "Electron app icon appears in macOS Dock but no window is visible",
+      "Clicking or double-clicking elements in the title bar fails to trigger JavaScript events",
+      "Build fails with Unexpected character '$' in main process code",
+      "Terminal commands sent to Gemini CLI are ignored or corrupted",
+      "Dragging items causes sudden layout shifts or jumping UI components",
+      "AI responses are cut off due to large log files exceeding context limits"
+    ],
+    "related_components": [
+      "main.js",
+      "src/renderer/App.tsx",
+      "src/renderer/styles/globals.css",
+      "src/main/terminal.js"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-export-session.md",
+    "type": "fact",
+    "explicit": [
+      "Claude Code Export",
+      "Session Tree Logic",
+      "Fork Boundaries",
+      "Code Stripping",
+      "Rewind Prompt",
+      "Gemini Copy Range"
+    ],
+    "implicit": [
+      "fs_polling_export_timeout",
+      "claude_txt_extension_forced",
+      "compact_boundary_ignore_logic",
+      "assistant_noise_fork_detection",
+      "markdown_stripping_clean_export",
+      "rewind_prompt_fact_only",
+      "gemini_copy_range_monolith",
+      "jsonl_chain_resolution",
+      "sync_marker_validity",
+      "paste_path_routing",
+      "fork_marker_detection",
+      "handleUpdateDocs_pipeline"
+    ],
+    "symptoms": [
+      "Exported Claude session contains too much tool output or code noise",
+      "Every user message is incorrectly marked as a fork in the history log",
+      "Rewind summary includes AI opinions or future plans instead of technical facts",
+      "Updating documentation fails to pull context from the active Gemini or Claude session",
+      "Session export results in a .txt file despite requesting a .md extension",
+      "Export stops prematurely at a compact boundary instead of the actual fork point"
+    ],
+    "related_components": [
+      "src/main/ipc/claude.js",
+      "src/main/ipc/gemini.js",
+      "src/main/services/SessionExporter.ts",
+      "src/renderer/hooks/useTimeline.ts",
+      "src/main/logic/updateDocs.ts"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fix-rewind-navigation.md",
+    "type": "fix",
+    "explicit": [
+      "Rewind Navigation",
+      "Claude Code TUI",
+      "Visual Search Strategy",
+      "Timeline Restoration",
+      "ANSI RGB Detection"
+    ],
+    "implicit": [
+      "rewind_visual_search_rgb",
+      "tui_virtual_scroll_offset",
+      "lavender_rgb_detection",
+      "compact_gap_recovery",
+      "escape_sequence_safety_guard",
+      "normalization_trim_logic",
+      "skip_duplicates_boundary_awareness",
+      "node_pty_incremental_diff",
+      "timeline_session_fork",
+      "pty_stream_analysis",
+      "silence_detection"
+    ],
+    "symptoms": [
+      "Rewind cursor jumps rapidly but misses the target message in Claude history",
+      "Session incorrectly rolls back to the very first message after a Timeline jump",
+      "Restoring from Timeline fails when the target is outside the current scroll view",
+      "Menu navigation fails to find identical messages after a context compact event",
+      "Timeline restoration gets stuck or selects wrong entry due to TUI padding"
+    ],
+    "related_components": [
+      "src/main/pty/PtyManager.ts",
+      "src/main/services/RewindService.ts",
+      "src/renderer/components/Timeline.tsx",
+      "src/main/parsers/ClaudeTuiParser.ts"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fix-osc7777-escape-carryover.md",
+    "type": "fix",
+    "explicit": [
+      "OSC 7777",
+      "Escape Sequence Carryover",
+      "PTY Chunking",
+      "ANSI Corruption"
+    ],
+    "implicit": [
+      "osc7777_injection_abort",
+      "pty_kernel_chunking",
+      "escape_carryover_buffer",
+      "xtermjs_parser_reset",
+      "truecolor_csi_splitting",
+      "pty_middleware_data_processing",
+      "ansi_sequence_reconstruction",
+      "osc7777_marker_alignment",
+      "main_pty_ipc_bridge",
+      "ink_tui_corruption"
+    ],
+    "symptoms": [
+      "Raw ANSI parameters like 38;2;153;153;153m are visible as text in terminal",
+      "Terminal prompt loses custom colors and reverts to default style",
+      "Random visual artifacts appear at the start of a prompt or command output",
+      "ANSI sequence corruption occurs more frequently under high system load",
+      "Claude Code terminal output displays garbage text characters before the prompt icon"
+    ],
+    "related_components": [
+      "src/main/main.js",
+      "docs/knowledge/fact-timeline.md",
+      "docs/knowledge/fact-terminal-core.md"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-mcp-v2-lifecycle.md",
+    "type": "fact",
+    "explicit": [
+      "sub-agent lifecycle",
+      "mcp task recovery",
+      "claude session persistence",
+      "gemini-claude delegation"
+    ],
+    "implicit": [
+      "mcp_subagent_lifecycle_v2",
+      "list_sub_agents_discovery",
+      "sqlite_tab_persistence",
+      "claude_session_id_fallback",
+      "pty_respawn_self_healing",
+      "stateless_history_backtrace",
+      "gemini_response_injection",
+      "mcp_task_timeout_management",
+      "safePasteAndSubmit_mcp_routing",
+      "jsonl_history_resolution",
+      "handshake_pty_readiness",
+      "mcp_task_cleanup_sync"
+    ],
+    "symptoms": [
+      "Gemini cannot find existing Claude tasks after application restart",
+      "Claude sub-agent terminal process died and needs to be resumed with context",
+      "Task results from sub-agents are missing in the main Gemini chat history",
+      "History retrieval from Claude session returns 404 errors or incomplete JSONL data",
+      "Sub-agent task timeout occurs unexpectedly during long-running background operations"
+    ],
+    "related_components": [
+      "main.js",
+      "src/gemini-data.js",
+      "src/mcp/tools.js",
+      "src/components/SubAgentBar.tsx"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-ux-patterns.md",
+    "type": "fact",
+    "explicit": [
+      "ui_ux_patterns",
+      "ai_engine_branding",
+      "virtualization_strategy",
+      "overlay_lifecycle",
+      "hover_logic",
+      "selection_sync"
+    ],
+    "implicit": [
+      "engine_color_coding",
+      "data_keep_selection",
+      "native_virtualization_css",
+      "contain_intrinsic_size_auto",
+      "interrupted_overlay_persistence",
+      "overlay_dismissed_flag",
+      "manual_bounds_check",
+      "terminal_selection_sync",
+      "anchored_css_transforms",
+      "invisible_bridge_hover",
+      "immediate_injection_session",
+      "react_start_transition_perf",
+      "timeline_double_debounce",
+      "path_live_validation"
+    ],
+    "symptoms": [
+      "UI flickers or shows No Active Session momentarily after a Rollback or Fork",
+      "Multi-selection of tabs resets unexpectedly when clicking elements in the side panel",
+      "Scroll jitter or jumping occurs in long Markdown message lists during upward scrolling",
+      "Hover state remains active on a card after closing a context menu by clicking the backdrop",
+      "Interrupted session overlay keeps reappearing after manual dismissal on page refresh",
+      "Interface freezes or lags when switching between heavy projects or opening new tabs"
+    ],
+    "related_components": [
+      "src/renderer/components/TabBar/TabBar.tsx",
+      "src/renderer/components/Terminal/Terminal.tsx",
+      "src/renderer/components/Workspace/panels/InfoPanel.tsx",
+      "src/renderer/components/Timeline/Timeline.tsx",
+      "src/renderer/store/uiStore.ts"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-notes.md",
+    "type": "fact",
+    "explicit": [
+      "Notes Management",
+      "Markdown Editor",
+      "Project Binding",
+      "Auto-save",
+      "Cmd+E Shortcut"
+    ],
+    "implicit": [
+      "notes_editor_autofocus",
+      "notes_zindex_layering",
+      "project_context_sync",
+      "blur_save_trigger",
+      "codemirror_scroll_fix",
+      "ui_store_notes_toggle",
+      "project_manager_persistence",
+      "zustand_silent_mutation",
+      "layout_depth_sensitivity",
+      "css_visibility_stale_render"
+    ],
+    "symptoms": [
+      "Project notes are not saved after closing the modal with Esc",
+      "The full-screen editor does not automatically focus when opened",
+      "Horizontal scrollbar appears unexpectedly in the Markdown editor",
+      "Notes from a previous project remain visible after switching projects",
+      "Side panel notes do not update after editing in the full-screen modal"
+    ],
+    "related_components": [
+      "src/renderer/components/Workspace/panels/InfoPanel.tsx",
+      "src/renderer/components/Workspace/NotesEditorModal.tsx",
+      "src/renderer/store/useUIStore.ts",
+      "src/main/project-manager.js"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-tabs.md",
+    "type": "fact",
+    "explicit": [
+      "tab_management",
+      "sub_agent_bar",
+      "multi_select_tabs",
+      "smart_restart",
+      "ai_session_tabs",
+      "cross_project_move",
+      "tab_persistence",
+      "browser_tabs"
+    ],
+    "implicit": [
+      "tab_lifecycle_hooks",
+      "smart_restart_zone_onAuxClick",
+      "sub_agent_visibility_logic",
+      "multi_tab_drag_drop_previews",
+      "lru_tab_navigation_stack",
+      "browser_tab_link_interception",
+      "tab_color_auto_naming_persistence",
+      "useWorkspaceStore_tab_sync",
+      "layout_shift_subagent_bar_min_width",
+      "project_favorites_ipc_bridge",
+      "idempotent_resize_sigwinch_protection",
+      "saveTabs_safety_guard_logic",
+      "normalization_empty_parent_id",
+      "middle_click_restart_stop_propagation",
+      "busy_state_pulse_detection"
+    ],
+    "symptoms": [
+      "Sub-agent tabs are missing from the main TabBar or hidden unexpectedly",
+      "Multiple tabs closed with Cmd+W or middle-click without individual confirmation",
+      "The active tab changes to a neighbor instead of the previous one after closing",
+      "Manual tab names are overwritten by AI session commands",
+      "Dragging tabs to another project fails or triggers safety guard errors",
+      "Terminal layout shifts or SIGWINCH floods during tab switching",
+      "Multi-select state doesn't reset when creating a new tab"
+    ],
+    "related_components": [
+      "src/renderer/components/Workspace/TabBar.tsx",
+      "src/renderer/store/useWorkspaceStore.ts",
+      "src/renderer/components/Workspace/Terminal.tsx",
+      "src/renderer/components/Workspace/panels/InfoPanel.tsx",
+      "main.js"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fix-gemini-capture.md",
+    "type": "fix",
+    "explicit": [
+      "Gemini session capture",
+      "Sniper Watcher initialization",
+      "Update Docs automation",
+      "IPC command routing"
+    ],
+    "implicit": [
+      "gemini_spawn_with_watcher",
+      "sniper_watcher_initialization",
+      "update_docs_automation",
+      "terminal_executeCommandAsync_bypass",
+      "gemini_session_uuid_capture",
+      "waiting_for_session_stuck",
+      "fs_watch_lifecycle",
+      "pty_direct_write_side_effect",
+      "actions_panel_logic",
+      "tab_creation_race_condition"
+    ],
+    "symptoms": [
+      "Sidebar displays Waiting for session indefinitely after clicking Update Docs",
+      "Cannot fork or resume a session created via automated documentation flow",
+      "Gemini info panel remains empty even after the terminal finishes generating content",
+      "Automated documentation command finishes but the session is not saved to history"
+    ],
+    "related_components": [
+      "src/renderer/components/ActionsPanel.tsx",
+      "src/renderer/components/Terminal.tsx",
+      "src/main/ipc/gemini.js"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-test-infrastructure.md",
+    "type": "fact",
+    "explicit": [
+      "test_infrastructure",
+      "playwright_electron_integration",
+      "headless_testing",
+      "e2e_testing_strategy"
+    ],
+    "implicit": [
+      "headless_xterm_desync",
+      "osc7777_marker_validation",
+      "bracketed_paste_ink_tui",
+      "zustand_state_assertion",
+      "main_process_log_watching",
+      "gemini_indexing_duplication",
+      "timeline_visibility_o1",
+      "soft_assert_timing",
+      "layout_depth_sensitivity",
+      "event_drop_window",
+      "electron_dev_server_fixture"
+    ],
+    "symptoms": [
+      "Headless tests pass but Electron TUI renders incorrectly in production",
+      "Claude Code Ink TUI ignores automated input during E2E tests",
+      "Race conditions in tests lead to flaky assertions on state updates",
+      "AI messages are truncated or misaligned in the Timeline rendering",
+      "Automation script hangs while waiting for terminal signals or markers",
+      "State changes in Zustand are not being detected by the test runner"
+    ],
+    "related_components": [
+      "auto/core/launcher.js",
+      "auto/core/headless.js",
+      "auto/playwright/electron.js",
+      "src/main.js"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fix-mcp-completion-reliability.md",
+    "type": "fix",
+    "explicit": [
+      "mcp_completion_reliability",
+      "turn_duration_guard",
+      "false_idle_detection",
+      "claude_code_sub_agents",
+      "jsonl_completion_signals"
+    ],
+    "implicit": [
+      "jsonl_guard",
+      "mcp_delegation",
+      "busy_state_detector",
+      "spinner_idle_false_positive",
+      "stale_end_turn_validation",
+      "sub_agent_completion",
+      "dangerous_skip_permissions_logic",
+      "jsonl_sync_lag_buffer",
+      "queue_operation_blocker",
+      "ink_tui_spinner_pauses",
+      "sync_marker_timestamp_validation"
+    ],
+    "symptoms": [
+      "Gemini receives intermediate text instead of final sub-agent results",
+      "Claude sub-agent response takes exactly 120 seconds to appear",
+      "Task finishes early with (No response captured) message",
+      "System detects IDLE while Claude is still performing background tool calls",
+      "Old completion markers from previous turns trigger premature task exit"
+    ],
+    "related_components": [
+      "src/main/mcp/completionGuard.ts",
+      "src/main/claude/jsonlMonitor.ts",
+      "src/renderer/state/claudeStore.ts"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-react-patterns.md",
+    "type": "fact",
+    "explicit": [
+      "react_reconciliation",
+      "portal_event_bubbling",
+      "stale_closures",
+      "zustand_selectors",
+      "stacking_context",
+      "xterm_link_providers",
+      "infinite_loop_traps"
+    ],
+    "implicit": [
+      "reconciliation_index_shift",
+      "portal_event_propagation_stop",
+      "stale_closure_ref_pattern",
+      "deterministic_oscillator_trap",
+      "zustand_primitive_selectors",
+      "zustand_map_fingerprint",
+      "stacking_context_layering",
+      "canvas_ui_event_blocking",
+      "invisible_bridge_hover",
+      "xterm_link_provider_closure",
+      "ipc_state_feedback_loop",
+      "pointer_events_overlay"
+    ],
+    "symptoms": [
+      "Terminals are destroyed and recreated when switching views or tabs",
+      "Button inside a Tooltip or Portal resets its state immediately after clicking",
+      "UI shows outdated entries during selection despite the background data updating",
+      "React app enters an infinite loop of switching session IDs or tab focus",
+      "Maximum update depth exceeded error in components using Zustand selectors",
+      "Hover menu closes prematurely when trying to move the mouse into it",
+      "Terminal links trigger incorrect values or the last found match in the loop"
+    ],
+    "related_components": [
+      "src/renderer/components/Workspace/Workspace.tsx",
+      "src/renderer/components/Timeline/Timeline.tsx",
+      "src/renderer/components/Terminal/Terminal.tsx",
+      "src/renderer/store/useWorkspaceStore.ts"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fix-gemini-timeline-sync.md",
+    "type": "fix",
+    "explicit": [
+      "gemini",
+      "timeline",
+      "history_panel",
+      "uuid",
+      "synchronization",
+      "ipc"
+    ],
+    "implicit": [
+      "gemini_timeline_sync",
+      "deterministic_message_id",
+      "history_scroll_desync",
+      "unfiltered_index_lookup",
+      "stable_uuid_fallback",
+      "gemini_json_persistence",
+      "ipc_message_mapping",
+      "jsonl_chain_resolution",
+      "timeline_dot_highlighting",
+      "ui_state_divergence"
+    ],
+    "symptoms": [
+      "Timeline dots do not highlight as dashes when scrolling through Gemini history",
+      "Gemini history and timeline show mismatched state despite representing the same session",
+      "Message IDs change or regenerate every time the Gemini session is reloaded",
+      "Active message indicator in the side timeline is missing or stuck",
+      "Data inconsistencies between gemini:get-timeline and gemini:get-full-history IPC calls"
+    ],
+    "related_components": [
+      "src/main/main.js",
+      "src/renderer/components/Timeline.tsx",
+      "src/renderer/components/HistoryPanel.tsx"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-backtrace-jsonl.md",
+    "type": "fact",
+    "explicit": [
+      "JSONL Backtrace",
+      "Compact Recovery",
+      "Bridge Following",
+      "Incremental Reader",
+      "Sub-agent Inline Storage"
+    ],
+    "implicit": [
+      "backtrace_jsonl_traversal",
+      "compact_gap_recovery",
+      "incremental_byte_reader",
+      "bridge_loop_prevention",
+      "fork_session_isolation",
+      "subagent_inline_storage",
+      "undo_branch_filtering",
+      "dangling_uuid_resolution",
+      "jsonl_chain_resolution",
+      "session_chain_integrity",
+      "timeline_sync_reactivity",
+      "compact_boundary_lookahead"
+    ],
+    "symptoms": [
+      "Timeline shows duplicate or deleted messages after Undo or Escape keys",
+      "History suddenly ends or becomes inaccessible after a /compact command",
+      "Session ID changes unexpectedly or overwrites after switching from a fork",
+      "Large history files cause the terminal UI to freeze or lag significantly",
+      "Sub-agent thoughts and progress are missing or hidden in the chat history"
+    ],
+    "related_components": [
+      "src/main/services/jsonl/reader.ts",
+      "src/main/services/session/resolver.ts",
+      "src/renderer/features/history/Timeline.tsx",
+      "src/main/ipc/history-provider.js"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-terminal-search.md",
+    "type": "fact",
+    "explicit": [
+      "Terminal Search",
+      "Cmd+F",
+      "xterm.js search addon",
+      "results navigation"
+    ],
+    "implicit": [
+      "xterm_search_addon_registration",
+      "allowProposedApi_xterm_requirement",
+      "onDidChangeResults_event_handling",
+      "search_navigation_enter_shift_enter",
+      "terminal_registry_search_management",
+      "workspace_search_ui_overlay",
+      "tab_scoped_search_state",
+      "canvas_stale_search_highlight",
+      "hotkey_hijack_cmd_f",
+      "layout_depth_sensitivity"
+    ],
+    "symptoms": [
+      "Cmd+F does not open the search panel in the terminal",
+      "Search results counter remains at 0/0 despite visible matches",
+      "Search highlights remain visible after closing the search bar",
+      "Terminal search navigation skips matches or loops incorrectly",
+      "Console error regarding allowProposedApi when using search"
+    ],
+    "related_components": [
+      "src/components/Workspace.tsx",
+      "src/terminal/terminalRegistry.ts",
+      "src/components/Terminal.tsx"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-rendering-styles.md",
+    "type": "fact",
+    "explicit": [
+      "markdown rendering",
+      "hydration errors",
+      "Tailwind v4 integration",
+      "React 19 DOM validation",
+      "CodeMirror editor stability"
+    ],
+    "implicit": [
+      "markdown_p_nesting_fix",
+      "inline_code_v9_logic",
+      "stable_effect_dependencies",
+      "tailwind_v4_electron_vite",
+      "codemirror_focus_reset",
+      "hydration_error_pre_p",
+      "react_19_strict_dom",
+      "vite_tailwind_plugin_hmr",
+      "array_literal_prop_trap",
+      "electron_styles_build_fix"
+    ],
+    "symptoms": [
+      "Hydration failed error in DevTools when AI returns code blocks",
+      "Cursor jumps to start or end of line while typing in Markdown editor",
+      "Tailwind arbitrary value classes like text-[#hex] not working in production",
+      "Inline code fragments rendered as block elements or with broken layout",
+      "Markdown editor flickers or loses focus after every character input"
+    ],
+    "related_components": [
+      "src/components/MarkdownRenderer.tsx",
+      "src/components/MarkdownEditor.tsx",
+      "electron.vite.config.js"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fix-claude-busy-detection.md",
+    "type": "fix",
+    "explicit": [
+      "Claude CLI",
+      "busy state detection",
+      "spinner TUI",
+      "OSC sequences",
+      "PTY lifecycle"
+    ],
+    "implicit": [
+      "claude_busy_indicator_stuck",
+      "osc_stripping_regex",
+      "pty_middleware_stream",
+      "ink_tui_rendering_interference",
+      "spinner_debounce_logic",
+      "pty_exit_cleanup_sync",
+      "window_title_branding_leak",
+      "terminal_kill_handler",
+      "osc7_cwd_filter",
+      "canvas_stale_visibility",
+      "react_effect_ipc_listener",
+      "claude_spinner_chars"
+    ],
+    "symptoms": [
+      "Pulsing dot on tab remains active after Claude finishes response",
+      "Busy indicator flashes immediately upon starting Claude without task",
+      "Closing a Claude tab leaves the UI thinking the agent is still active",
+      "Terminal window title updates cause false positives in activity detection",
+      "Activity detection fails or behaves inconsistently across different terminal themes"
+    ],
+    "related_components": [
+      "src/main/pty/middleware.js",
+      "src/renderer/components/TerminalTab.tsx",
+      "src/main/ipc/terminalManager.ts",
+      "src/shared/utils/ansi-stripper.ts"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-project-home.md",
+    "type": "fact",
+    "explicit": [
+      "Project Home View",
+      "Active Tabs",
+      "Favorites",
+      "History",
+      "Context Menu",
+      "Directory Management"
+    ],
+    "implicit": [
+      "project_home_overlay",
+      "history_archive_refetch",
+      "favorites_metadata_cloning",
+      "immediate_session_injection",
+      "auto_home_redirect",
+      "history_keep_with_notes",
+      "project_path_update_broadcast",
+      "tab_metadata_persistence",
+      "workspace_view_state_sync",
+      "overlay_zindex_collision",
+      "ipc_project_archive_tab",
+      "sqlite_history_schema"
+    ],
+    "symptoms": [
+      "Terminal view automatically switches to a grid overlay when the last tab is closed",
+      "Restored AI tabs show empty InfoPanel because session IDs were not injected immediately",
+      "History list does not refresh or show the sticker badge after a tab is closed",
+      "New terminals use the old root directory after project path was updated in Home View",
+      "Favorites section cards are missing metadata like CWD or specific colors"
+    ],
+    "related_components": [
+      "src/renderer/components/ProjectHome.tsx",
+      "src/renderer/components/Workspace.tsx",
+      "src/renderer/stores/useWorkspaceStore.ts",
+      "src/main/main.js",
+      "src/renderer/components/ProjectToolbar.tsx"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-file-preview-markdown.md",
+    "type": "fact",
+    "explicit": [
+      "markdown_editor",
+      "file_preview",
+      "gt_editor_integration",
+      "clipboard_api",
+      "folding_state"
+    ],
+    "implicit": [
+      "anthropic_markdown_editor_local_path",
+      "gt_editor_build_chain",
+      "electron_native_clipboard_reliability",
+      "fold_state_localstorage_persistence",
+      "codemirror_6_read_only_mode",
+      "research_module_dependency_lock",
+      "file_preview_syntax_highlighting",
+      "collapsible_headers_interaction",
+      "local_package_npm_install_failure",
+      "markdown_theme_consistency_bridge",
+      "react_markdown_conflict_prevention"
+    ],
+    "symptoms": [
+      "Build fails with error about missing @anthropic/markdown-editor package",
+      "File Preview shows raw text instead of rendered Markdown after moving folders",
+      "Research module crashes after deleting react-markdown dependencies",
+      "Clipboard copy from preview fails or behaves inconsistently on Linux/Windows",
+      "Folded sections in Markdown files reset their state after reopening the app",
+      "Syntax highlighting in File Preview is missing or uses old highlight.js styles"
+    ],
+    "related_components": [
+      "src/renderer/components/Workspace/FilePreview.tsx",
+      "src/renderer/components/Research/MarkdownRenderer.tsx",
+      "src/renderer/components/Workspace/NotesEditorModal.tsx",
+      "src/renderer/components/Workspace/panels/InfoPanel.tsx",
+      "package.json"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fix-stale-sync-markers.md",
+    "type": "fix",
+    "explicit": [
+      "sync-markers",
+      "rendering-race-condition",
+      "waitForRender",
+      "bracketed-paste-mode"
+    ],
+    "implicit": [
+      "sync_marker_validity",
+      "waitForRender_15ms_filter",
+      "safePasteAndSubmit_chunking",
+      "ink_tui_rendering_desync",
+      "model_switch_command_loss",
+      "handshake_paste_collision",
+      "rewind_visual_search_sync",
+      "pty_timing_race",
+      "bracketed_paste_mode_logic",
+      "stale_marker_discard_logic",
+      "paste_path_routing"
+    ],
+    "symptoms": [
+      "Terminal command text is mixed with previous input after switching models",
+      "Programmatic paste from Handshake or Rewind fails to execute",
+      "Claude CLI input line is corrupted after a fast UI action",
+      "Logs show STALE sync marker messages during command execution",
+      "Model change commands like /model sonnet disappear without effect"
+    ],
+    "related_components": [
+      "main.js",
+      "src/renderer/hooks/useTerminal.ts",
+      "src/renderer/components/TerminalContainer.tsx"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fix-gemini-delegation-handshake.md",
+    "type": "fix",
+    "explicit": [
+      "gemini_delegation",
+      "prompt_splitting",
+      "handshake_protocol"
+    ],
+    "implicit": [
+      "handshake_atomic_split",
+      "slash_command_concatenation",
+      "prompt_return_wait",
+      "commandType_sync",
+      "subagent_bar_visibility",
+      "safePasteAndSubmit_reliability",
+      "gemini_tui_init_unstable",
+      "bracketed_paste_splitting",
+      "claude_model_parse_error",
+      "zustand_command_type_mutation",
+      "sync_marker_confirmation",
+      "sequential_dispatch_handshake"
+    ],
+    "symptoms": [
+      "Claude returns Model not found error including the whole prompt text",
+      "Gemini sub-agent tab opens but SubAgentBar UI does not appear",
+      "Programmatically sent prompts are ignored by Gemini during initialization",
+      "Slash commands like /model are concatenated with the prompt body in Claude"
+    ],
+    "related_components": [
+      "src/main/ipc/gemini.js",
+      "src/renderer/store/terminalStore.ts",
+      "src/renderer/components/SubAgentBar.tsx",
+      "auto/sandbox/test-gemini-orchestration.js"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-research.md",
+    "type": "fact",
+    "explicit": [
+      "Research Panel",
+      "AI Assistant",
+      "Gemini Integration",
+      "Markdown Rendering",
+      "UI Behavior"
+    ],
+    "implicit": [
+      "research_panel_activation",
+      "gemini_mode_routing",
+      "markdown_inline_rendering",
+      "retry_delete_history_management",
+      "react_virtuoso_scroll",
+      "background_rgb_delimitation_failure",
+      "clipboard_buffer_research",
+      "osc_marker_middleware_transition",
+      "pending_research_loader_sync",
+      "history_tail_truncation",
+      "info_panel_tab_auto_switch",
+      "google_search_tool_activation"
+    ],
+    "symptoms": [
+      "AI panel does not open automatically after Research Selection trigger",
+      "Inline code or markdown blocks are rendered as plain text in the chat",
+      "Need to understand why background RGB detection for terminal messages was abandoned",
+      "AI response loader spins indefinitely or fails to transition to text",
+      "History corruption after deleting an AI message or clicking Retry"
+    ],
+    "related_components": [
+      "src/renderer/components/Research/ChatArea.tsx",
+      "src/renderer/components/Research/MarkdownRenderer.tsx",
+      "src/renderer/store/useResearchStore.ts"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fix-mcp-reliability.md",
+    "type": "fix",
+    "explicit": [
+      "mcp_delegation",
+      "claude_cli",
+      "pty_sub_agents",
+      "cwd_resolution",
+      "ipc_race_conditions",
+      "slash_commands",
+      "jsonl_parsing",
+      "status_sync"
+    ],
+    "implicit": [
+      "mcp_delegation_reliability",
+      "completion_detector_deferral",
+      "cwd_main_process_resolver",
+      "terminal_spawn_retry_loop",
+      "handshake_slash_command_split",
+      "mcp_status_propagation_bridge",
+      "pid_cache_tab_mapping",
+      "jsonl_async_shadow_resolution",
+      "safePasteAndSubmit_model_switch",
+      "sync_marker_early_completion",
+      "ipc_event_drop_window",
+      "bracketed_paste_input_splitting"
+    ],
+    "symptoms": [
+      "Sub-agent task stuck in running status indefinitely after Claude responds",
+      "Claude terminal not found error when Gemini tries to delegate a task",
+      "Slash commands like /model fail or are misinterpreted by the sub-agent",
+      "Sub-agent status chips in UI do not update or show stale data",
+      "Gemini never receives completion data from sub-agent despite task finishing",
+      "Invalid CWD or path errors when launching sub-agents in multi-project setups"
+    ],
+    "related_components": [
+      "main.js",
+      "src/renderer/App.tsx",
+      "src/renderer/components/SubAgentBar.tsx",
+      "src/services/mcp-server.js",
+      "src/store/useTerminalStore.ts"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fix-mcp-multi-instance.md",
+    "type": "fix",
+    "explicit": [
+      "MCP isolation",
+      "PID-based ports",
+      "Process Tree Walking",
+      "Race Condition"
+    ],
+    "implicit": [
+      "mcp_port_isolation",
+      "pid_cleanup_zombie",
+      "process_tree_walking",
+      "node_pty_hierarchy",
+      "mcp_http_server_race",
+      "gemini_cli_delegation",
+      "main_process_blocking_avoidance",
+      "terminal_session_crosstalk",
+      "liveness_fallback_strategy",
+      "mcp_port_mtime_fallback"
+    ],
+    "symptoms": [
+      "Gemini commands execute in the wrong terminal window when multiple app instances are open",
+      "MCP server fails with port file not found error after closing a secondary app window",
+      "Terminal status buttons or result insertions are unresponsive or linked to incorrect sessions",
+      "Race conditions occur when running dev and production builds of the terminal simultaneously"
+    ],
+    "related_components": [
+      "src/main/main.js",
+      "src/main/mcp-server.mjs"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-timeline.md",
+    "type": "fact",
+    "explicit": [
+      "Timeline",
+      "Claude History",
+      "Gemini History",
+      "Sub-Agent Orchestration",
+      "Rewind",
+      "Range Copy"
+    ],
+    "implicit": [
+      "timeline_viewport_dash_logic",
+      "sub_agent_collapsible_groups",
+      "rewind_visual_search_rgb",
+      "osc7777_prompt_injection",
+      "heuristic_search_navigation",
+      "flex_height_absolute_inset_hack",
+      "range_copy_selection_persistence",
+      "tree_mode_absolute_overlay",
+      "terminal_scroll_stabilization",
+      "reachability_guard_logic",
+      "boundary_gate_osc_injection"
+    ],
+    "symptoms": [
+      "Timeline dots appear red or unreachable after buffer clearing",
+      "Clicking a history point does not scroll to the correct terminal line",
+      "Sub-agent responses are cluttering the vertical timeline panel",
+      "Rewind operation fails to select the correct entry in the Claude TUI menu",
+      "Timeline scrollbar conflicts with the sidebar resizer component"
+    ],
+    "related_components": [
+      "src/components/Timeline.tsx",
+      "src/ipc/claude-data.js",
+      "src/ipc/gemini-data.js",
+      "src/terminalRegistry.ts",
+      "src/main.js"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fix-boundary-bridge-race.md",
+    "type": "fix",
+    "explicit": [
+      "boundary_marker_injection",
+      "bridge_race_condition",
+      "timeline_reachability",
+      "claude_spinner_detection"
+    ],
+    "implicit": [
+      "boundary_marker_injection",
+      "bridge_gate_race",
+      "osc_7777_protocol",
+      "claude_spinner_busy_gate",
+      "timeline_unreachable_red_bg",
+      "pid_resolution_delay",
+      "text_search_position_fallback",
+      "sync_marker_validity",
+      "terminal_scrollback_sync",
+      "bridge_known_sessions_gate",
+      "osc_7777_boundary_logic"
+    ],
+    "symptoms": [
+      "Claude timeline entries appear entirely red or unreachable after launch",
+      "Boundary markers are missing from the terminal registry despite active output",
+      "Timeline event dots do not trigger terminal scrolling",
+      "Race condition where Claude output arrives before bridge PID resolution is complete",
+      "Zero boundary markers injected because bridge session state is initially false"
+    ],
+    "related_components": [
+      "src/main/main.js",
+      "src/renderer/components/Workspace/Timeline.tsx",
+      "docs/knowledge/fact-timeline.md",
+      "docs/knowledge/fix-claude-busy-detection.md"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-workspace.md",
+    "type": "fact",
+    "explicit": [
+      "Workspace Management",
+      "Project Tools",
+      "Dashboard UI",
+      "File Explorer",
+      "Process Monitoring"
+    ],
+    "implicit": [
+      "workspace_persistent_mounting",
+      "project_tab_rename",
+      "dashboard_process_cleanup",
+      "file_explorer_portal",
+      "navigation_history_stack",
+      "auto_deletion_empty_project",
+      "sidebar_visibility_lock",
+      "path_validation_ipc",
+      "css_visibility_canvas_stale",
+      "layout_depth_sensitivity",
+      "two_column_layout_stability",
+      "active_process_monitoring_ui"
+    ],
+    "symptoms": [
+      "Terminal layout breaks or shifts when switching to Dashboard and back",
+      "Newly created project disappears after clicking outside the name input",
+      "File Explorer appears behind the terminal or is clipped by the container",
+      "Closing the active project navigates to an unexpected previous project",
+      "Path validation in Project Settings fails to update in real-time",
+      "Active AI processes continue running after a project is closed or renamed"
+    ],
+    "related_components": [
+      "src/renderer/App.tsx",
+      "src/renderer/components/Dashboard/Dashboard.tsx",
+      "src/renderer/components/Workspace/FileExplorer.tsx",
+      "src/main/main.js"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-docs-update.md",
+    "type": "fact",
+    "explicit": [
+      "documentation_update",
+      "claude_gemini_sync",
+      "unified_export_pipeline",
+      "mcp_update_docs_tool",
+      "bracketed_paste_logic",
+      "gemini_cli_interaction",
+      "cors_bypass_mechanism",
+      "token_estimation_formula"
+    ],
+    "implicit": [
+      "gemini_insert_detection_settle",
+      "bracketed_paste_500ms_delay",
+      "cors_bypass_main_fetch",
+      "unified_export_pipeline_precision",
+      "actions_panel_multi_select_persistence",
+      "gemini_cli_resume_session_resume_y",
+      "mcp_tool_update_docs_orchestration",
+      "safe_paste_and_submit_chunking",
+      "temp_file_context_injection_at_prefix",
+      "ipc_docs_settings_sync",
+      "terminal_silence_detection_thinking_idling"
+    ],
+    "symptoms": [
+      "Gemini CLI ignores input or corrupts prompt during Thinking state",
+      "API requests to kiro.cheap fail with CORS error in renderer",
+      "Pasted multi-line prompt is interpreted as multiple commands in terminal",
+      "Gemini treats file path as plain text instead of reading file content",
+      "Multi-selected tabs are deselected when clicking UI buttons in panel",
+      "Claude API session export returns stale or incomplete data"
+    ],
+    "related_components": [
+      "src/renderer/components/Workspace/panels/ActionsPanel.tsx",
+      "src/main/ipc/docs.js",
+      "src/mcp-server.mjs",
+      "src/main/main.js"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-session-capture.md",
+    "type": "fact",
+    "explicit": [
+      "AI Session Capture",
+      "Sniper Watcher",
+      "Claude CLI Session ID",
+      "Gemini Session Detection",
+      "InfoPanel UI States",
+      "Filesystem Monitoring"
+    ],
+    "implicit": [
+      "sniper_watcher_fs_watch",
+      "gemini_slug_hashing",
+      "infopanel_waiting_pulse",
+      "session_id_snapshot_defense",
+      "dual_method_polling_fallback",
+      "claude_jsonl_validation",
+      "uuid_pattern_matching",
+      "session_item_border_swap",
+      "workspace_store_session_sync",
+      "macos_fsevents_lag",
+      "gemini_lazy_creation",
+      "session_validation_debounce"
+    ],
+    "symptoms": [
+      "InfoPanel shows Waiting for session with a yellow pulse indefinitely after starting AI",
+      "Fork and Resume features are disabled because the session ID was not captured",
+      "Starting Gemini CLI does not update the active session status in the sidebar",
+      "Manual session ID input shows a red border despite the file existing on disk",
+      "Clicking a session item in the list does not highlight it with a border"
+    ],
+    "related_components": [
+      "main.js",
+      "src/components/InfoPanel.tsx",
+      "src/store/useWorkspaceStore.ts",
+      "src/components/SessionItem.tsx"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fix-mcp-v2-lifecycle-stability.md",
+    "type": "fix",
+    "explicit": [
+      "MCP stability",
+      "Claude CLI lifecycle",
+      "PTY respawn",
+      "OSC 133 protocol"
+    ],
+    "implicit": [
+      "claudeCliActive_map",
+      "osc133d_shell_race",
+      "handshake_guard_clause",
+      "continue_claude_autoresume",
+      "ppidToGeminiTab_cache",
+      "mcp_respawn_sub_agent_pty",
+      "lazy_init_respawn_collision",
+      "terminal_create_lock",
+      "ipc_event_drop_respawn",
+      "hidden_tab_lazy_init_bypass"
+    ],
+    "symptoms": [
+      "Claude sub-agent indicator turns gray immediately after starting",
+      "Gemini cannot find previously created sub-agents in the list",
+      "Sub-agent PTY is dead and does not restart because the tab is hidden",
+      "Commands are accidentally typed into zsh/bash instead of Claude CLI",
+      "Sub-agent status becomes 'false' right after shell initialization"
+    ],
+    "related_components": [
+      "main.js",
+      "src/App.tsx",
+      "src/store/useTerminalStore.ts",
+      "src/mcp/tools.ts"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-bookmarks.md",
+    "type": "fact",
+    "explicit": [
+      "bookmarks",
+      "reserved_directories",
+      "genie_tooltip",
+      "project_instancing"
+    ],
+    "implicit": [
+      "bookmark_sqlite_crud",
+      "project_duplication_suffix",
+      "genie_origin_scaling",
+      "dashboard_directory_selection",
+      "bookmarks_store_zustand",
+      "bookmark_card_hover_overlay",
+      "layout_bounds_check",
+      "genie_tooltip_viewport_collision",
+      "sqlite_bookmarks_table",
+      "dashboard_project_instance_creation"
+    ],
+    "symptoms": [
+      "Project list on Dashboard does not refresh after adding a new directory",
+      "Tooltip for directory description appears off-screen or is clipped",
+      "New project instance fails to create a unique name suffix when opening a bookmark twice",
+      "Hovering over a bookmark card does not trigger the green action overlay",
+      "Bookmark data disappears or resets after application restart"
+    ],
+    "related_components": [
+      "src/renderer/components/Dashboard/BookmarkCard.tsx",
+      "src/renderer/store/useBookmarksStore.ts",
+      "src/main/database.js"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-ai-sessions.md",
+    "type": "fact",
+    "explicit": [
+      "ai_sessions",
+      "claude_vs_gemini",
+      "sniper_watcher",
+      "process_monitor",
+      "fork_logic",
+      "time_machine",
+      "pending_action",
+      "orchestration"
+    ],
+    "implicit": [
+      "sniper_watcher_fs_polling",
+      "pending_action_queue",
+      "ppid_mapping_detection",
+      "interrupted_session_overlay",
+      "true_fork_json_clone",
+      "resume_uuid_cloning",
+      "gemini_orchestration_capture",
+      "dashboard_batch_kill",
+      "mcp_delegation_pty",
+      "jsonl_chain_resolution",
+      "layout_depth_sensitivity",
+      "sync_marker_validity"
+    ],
+    "symptoms": [
+      "Interrupted session recovery overlay does not appear in Terminal view",
+      "External AI processes are not correctly identified in the Dashboard",
+      "Claude session ID is not captured after agent initialization",
+      "Gemini fork operation fails to clone local history snapshots",
+      "PendingAction commands execute before the shell handshake completes",
+      "Dashboard batch kill fails to terminate ghost AI sub-processes"
+    ],
+    "related_components": [
+      "src/main/ai/SniperWatcher.js",
+      "src/renderer/store/useSessionStore.ts",
+      "src/renderer/components/Dashboard/ProcessMonitor.tsx",
+      "src/main/pty/SessionManager.js"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-css-layout.md",
+    "type": "fact",
+    "explicit": [
+      "CSS layout",
+      "font loading race",
+      "flexbox nesting",
+      "UI flickering",
+      "z-index",
+      "event isolation",
+      "terminal grid metrics"
+    ],
+    "implicit": [
+      "font_loading_race_xterm",
+      "flex_depth_height_collapse",
+      "notes_panel_width_clipping",
+      "timeline_resizer_event_conflict",
+      "toast_macos_traffic_lights_offset",
+      "hover_inline_style_flicker",
+      "important_specificity_tab_leak",
+      "sequential_ui_disappearance_shift",
+      "layout_depth_sensitivity",
+      "css_visibility_canvas_stale",
+      "terminal_grid_recalculation",
+      "pointer_event_isolation"
+    ],
+    "symptoms": [
+      "Terminal characters overlap or have fractional widths in grid",
+      "Markdown editor scrollbar is missing in deep UI panels like InfoPanel",
+      "Right sidebar content is clipped or hidden when Timeline is active",
+      "Clicking near the Timeline scrollbar triggers sidebar resizing",
+      "Toast notifications overlap macOS window control buttons",
+      "UI elements disappear sequentially rather than instantly on navigation"
+    ],
+    "related_components": [
+      "src/renderer/components/Terminal/TerminalTab.tsx",
+      "src/renderer/components/UI/Toast.tsx",
+      "src/renderer/components/Panels/InfoPanel.tsx",
+      "src/renderer/components/Layout/Workspace.tsx",
+      "src/renderer/components/UI/Tabs.tsx"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-gemini-automation.md",
+    "type": "fact",
+    "explicit": [
+      "Smart Gemini Resume",
+      "Sniper Watcher",
+      "Handshake Strategy",
+      "Rewind Flow Synchronization",
+      "Thinking Guard",
+      "Session Forking",
+      "Direct Checkpoint Injection",
+      "Braille Spinner Detection"
+    ],
+    "implicit": [
+      "smart_gemini_resume_detection",
+      "sniper_dynamic_resolving",
+      "gemini_command_queue_main",
+      "rewind_deterministic_wait",
+      "alternate_screen_buffer_heuristics",
+      "braille_spinner_thinking_state",
+      "gemini_true_fork_patching",
+      "direct_json_checkpoint_injection",
+      "compact_empty_info_pattern",
+      "colorterm_truecolor_pty",
+      "thinking_guard_input_blocking",
+      "gemini_active_tabs_lifecycle",
+      "commandType_subagent_bar_trigger"
+    ],
+    "symptoms": [
+      "AI commands are ignored or lost during Gemini CLI startup",
+      "Terminal colors look washed out or limited to 16 colors in AI tools",
+      "Gemini session history becomes corrupted when using multiple tabs",
+      "The AI toolbar (SubAgentBar) fails to appear after automated Gemini launch",
+      "Automated navigation in Gemini rewind menu is flaky or hangs indefinitely",
+      "UI indicators do not show Gemini is thinking after a session restore"
+    ],
+    "related_components": [
+      "src/main/main.js",
+      "src/renderer/components/Terminal.tsx",
+      "src/renderer/components/Timeline.tsx",
+      "src/main/gemini/watcher.js"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fix-gemini-v30-migration.md",
+    "type": "fix",
+    "explicit": [
+      "Gemini CLI v0.30 migration",
+      "project slug resolution",
+      "projects.json mapping",
+      "SHA256 fallback"
+    ],
+    "implicit": [
+      "gemini_slug_resolution",
+      "sha256_legacy_hash",
+      "projects_json_indexing",
+      "sniper_watcher_reinit",
+      "session_cross_version_compatibility",
+      "timeline_chat_discovery",
+      "external_cli_config_sync",
+      "chats_directory_lookup",
+      "jsonl_chain_path_resolution",
+      "sync_marker_path_validity",
+      "fs_watch_chats_dir"
+    ],
+    "symptoms": [
+      "Sniper auto-capture fails to track sessions after updating Gemini CLI",
+      "Timeline history is empty for newly created projects",
+      "Chat logs are not found in ~/.gemini/tmp/ folders",
+      "Session manager cannot map current directory to an existing AI chat history",
+      "Broken file system watcher on chat directory changes"
+    ],
+    "related_components": [
+      "src/main/main.js",
+      "docs/knowledge/fact-gemini-automation.md"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-claude-sessions.md",
+    "type": "fact",
+    "explicit": [
+      "Claude Session Management",
+      "StatusLine Bridge",
+      "PTY Handshake",
+      "TUI Control",
+      "Ctrl-C Protection",
+      "History Panel",
+      "Session Forking",
+      "Plan Mode Chaining"
+    ],
+    "implicit": [
+      "claude_statusline_bridge",
+      "handshake_wait_prompt",
+      "ctrl_c_exit_protection",
+      "tui_navigation_think_mode",
+      "history_panel_native_scroll",
+      "session_fork_chaining",
+      "bracketed_paste_delivery",
+      "pty_regex_uuid_capture",
+      "interrupted_recovery_overlay",
+      "plan_mode_id_persistence",
+      "sync_marker_handshake",
+      "ipc_pty_listener_sync",
+      "css_visibility_scroll_stability"
+    ],
+    "symptoms": [
+      "Terminal shows Claude prompt but the auto-prompt is never injected",
+      "Claude process kills itself unexpectedly when user presses Ctrl+C to clear input",
+      "Yellow 'Waiting for session...' indicator persists even after Claude has started",
+      "History panel jitters or feels heavy when scrolling through long AI conversations",
+      "New session ID is not detected after using 'Clear Context' or 'Plan Mode' in Claude"
+    ],
+    "related_components": [
+      "src/renderer/components/Workspace/HistoryPanel.tsx",
+      "src/renderer/components/Workspace/Terminal.tsx",
+      "src/renderer/components/Workspace/TerminalArea.tsx",
+      "src/main/main.js",
+      "src/renderer/store/useWorkspaceStore.ts"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fix-zustand-silent-mutation.md",
+    "type": "fix",
+    "explicit": [
+      "zustand_silent_mutation",
+      "set_guard_pattern",
+      "ui_stale_data"
+    ],
+    "implicit": [
+      "zustand_silent_mutation",
+      "bridge_polling_guard",
+      "workspace_tab_reactivity",
+      "timeline_render_inconsistency",
+      "claude_session_sync_issue",
+      "gemini_session_sync_issue",
+      "saveTabs_side_effect",
+      "infopanel_polling_workaround",
+      "state_notify_bypass",
+      "tab_notes_reactivity",
+      "terminal_render_stability_hack"
+    ],
+    "symptoms": [
+      "UI shows stale data after store update",
+      "Timeline displays wrong session after tab switch or AI interaction",
+      "Component does not re-render after state change in Zustand",
+      "Information panel shows updated ID but main workspace view remains outdated",
+      "State changes are visible in memory but not reflected in the React tree"
+    ],
+    "related_components": [
+      "src/renderer/store/useWorkspaceStore.ts",
+      "src/renderer/components/Workspace/Workspace.tsx",
+      "src/renderer/components/Workspace/Timeline.tsx",
+      "src/renderer/components/Workspace/panels/InfoPanel.tsx"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fix-mcp-timeout-stability.md",
+    "type": "fix",
+    "explicit": [
+      "Claude Sub-Agent",
+      "Timeout Stability",
+      "Accumulation Trap",
+      "SQLite Atomic Update"
+    ],
+    "implicit": [
+      "mcp_timer_cleanup_leak",
+      "sqlite_direct_update_vs_debounce",
+      "claude_subagent_task_id_binding",
+      "gemini_claude_delegation_loop",
+      "pty_exit_cleanup_logic",
+      "zustand_debounce_desync",
+      "jsonl_fork_contamination",
+      "ipc_listener_registration_order",
+      "mcp_task_started_at_persistence",
+      "delegate_to_claude_reset"
+    ],
+    "symptoms": [
+      "Claude sub-agent terminates with timeout error shortly after starting even if limit is high",
+      "Long sessions with multiple sub-agent calls fail unexpectedly after 30 minutes",
+      "Task status shows running but agent is killed by an invisible background timer",
+      "Database updates for task start time are missing due to saveTabs debounce delay",
+      "Sub-agent is killed by a stale timer inherited from a previous delegation call"
+    ],
+    "related_components": [
+      "src/main/mcp/delegateToClaude.js",
+      "src/main/db/tabs.js",
+      "src/store/tabsStore.ts",
+      "main.js"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fix-research-activation.md",
+    "type": "fix",
+    "explicit": [
+      "Gemini Search",
+      "Research Activation",
+      "Zustand State Management",
+      "Google Search Grounding",
+      "Tool Compatibility"
+    ],
+    "implicit": [
+      "gemini_search_grounding_activation",
+      "cold_start_unmounted_listener_fix",
+      "google_search_tool_compatibility_400",
+      "zustand_pending_research_flag",
+      "custom_event_dispatch_reliability_issue",
+      "gemini_model_feature_parity_matrix",
+      "terminal_context_menu_research_trigger",
+      "reactive_panel_mounting_race_condition",
+      "useEffect_ipc_event_drop_window",
+      "state_driven_ui_synchronization"
+    ],
+    "symptoms": [
+      "Gemini panel opens but does not start searching on first click",
+      "AI model responds without internet access despite Google Search being enabled",
+      "Search only triggers on the second click from terminal context menu",
+      "API returns 400 Bad Request when enabling grounding for specific Gemini models",
+      "Research trigger event is lost because the panel component was not yet mounted"
+    ],
+    "related_components": [
+      "src/components/GeminiPanel.tsx",
+      "src/store/useResearchStore.ts",
+      "src/main.js"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-time-machine.md",
+    "type": "fact",
+    "explicit": [
+      "time_machine",
+      "rollback",
+      "gemini_snapshots",
+      "history_restoration"
+    ],
+    "implicit": [
+      "gemini_history_watcher",
+      "turn_snapshot_persistence",
+      "rollback_cleanup_logic",
+      "session_restart_lifecycle",
+      "info_panel_history_list",
+      "gemini_cli_restore_flag",
+      "linear_history_enforcement",
+      "ipc_terminal_recreation_flow",
+      "jsonl_turn_counting",
+      "fs_watcher_race_prevention"
+    ],
+    "symptoms": [
+      "Gemini conversation needs to be reverted to an earlier state",
+      "Future messages disappear after performing a history rollback",
+      "Terminal session restarts automatically when selecting a previous turn",
+      "Locating turn-XXX.json files in the local filesystem",
+      "Information panel displays truncated message previews for session history"
+    ],
+    "related_components": [
+      "src/main/main.js",
+      "src/renderer/components/Workspace/panels/InfoPanel.tsx"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-terminal-core.md",
+    "type": "fact",
+    "explicit": [
+      "Shell Integration",
+      "PTY Buffer Management",
+      "Process Monitoring",
+      "Terminal Selection Sync",
+      "OSC Sequences",
+      "TTYHOG Limits"
+    ],
+    "implicit": [
+      "osc7_cwd_tracking",
+      "osc133_shell_integration",
+      "osc7777_prompt_injection",
+      "two_tier_paste_routing",
+      "ttyhog_chunking_logic",
+      "safePasteAndSubmit_sync_markers",
+      "terminal_registry_selection_sync",
+      "process_status_event_driven",
+      "pty_env_truecolor_utf8",
+      "terminal_resize_safefit",
+      "sync_marker_15ms_filter",
+      "ipc_listener_event_drop_window",
+      "css_visibility_canvas_stale",
+      "ttyhog_macos_1024_limit",
+      "terminal_instance_registry_lifecycle"
+    ],
+    "symptoms": [
+      "High CPU usage by sysmond process during terminal activity",
+      "Terminal input is truncated or corrupted when pasting large blocks of text",
+      "Terminal colors look dull or UTF-8 characters like Cyrillic are broken",
+      "Timeline markers or command boundaries in Claude Code are misaligned",
+      "UI tab indicators for running processes are frozen or delayed",
+      "Paste into terminal causes long timeouts or double bracket artifacts",
+      "Terminal resizing leads to incorrect character width or layout glitches"
+    ],
+    "related_components": [
+      "src/main/main.js",
+      "src/renderer/utils/terminalRegistry.ts",
+      "src/renderer/store/useWorkspaceStore.ts",
+      "src/renderer/components/Workspace/TabBar.tsx",
+      "src/renderer/components/Dashboard/Dashboard.tsx"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fix-claude-visual-glitches.md",
+    "type": "fix",
+    "explicit": [
+      "OSC 8 hyperlinks",
+      "UUID colorization",
+      "Timeline reachability",
+      "Image placeholders",
+      "Claude Code TUI"
+    ],
+    "implicit": [
+      "osc8_hyperlink_masking",
+      "colorizeUUIDs_character_stream_parsing",
+      "xterm_ansi_osc_collision",
+      "timeline_reachability_fallback",
+      "osc7777_marker_navigation",
+      "jsonl_terminal_desync",
+      "image_placeholder_matching",
+      "ink_tui_corruption",
+      "ansi_escape_sequence_interruption",
+      "layout_depth_sensitivity"
+    ],
+    "symptoms": [
+      "Long purple file paths visible in Claude terminal instead of hidden links",
+      "Terminal text overlaps or breaks when displaying file references",
+      "Timeline messages containing images show a red background indicating they are unreachable",
+      "Scroll highlight bar skips messages that only contain image placeholders",
+      "Claude Code session history shows different text than what is visible in the terminal buffer"
+    ],
+    "related_components": [
+      "src/main/claude-data.js",
+      "src/renderer/components/Timeline.tsx",
+      "src/main/utils/uuid-colors.js"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-mcp-delegation.md",
+    "type": "fact",
+    "explicit": [
+      "gemini_claude_delegation",
+      "mcp_orchestration_architecture",
+      "sub_agent_lifecycle",
+      "response_queue_management",
+      "sub_agent_bar_ux"
+    ],
+    "implicit": [
+      "mcp_delegate_to_claude",
+      "mcp_continue_claude",
+      "mcp_jsonl_turn_duration_guard",
+      "subagent_tab_isolation",
+      "interceptor_rearm_disarmed_state",
+      "response_queue_injection_safePaste",
+      "spinner_idle_500ms_detection",
+      "pid_discovery_mcp_port",
+      "sequential_dispatch_handshake",
+      "subagent_parent_child_linking",
+      "visibility_defense_algorythm",
+      "project_association_isolation",
+      "immediate_injection_resume"
+    ],
+    "symptoms": [
+      "Gemini sub-agent response is stuck in the queue and not pasting",
+      "Claude sub-agent tab is missing from the main TabBar after start",
+      "Sub-agent fails to switch models or loses the first prompt on launch",
+      "Multiple Electron instances are conflicting with MCP port discovery",
+      "UI shows the wrong project context for a delegated Claude session",
+      "Interceptor prevents automatic response delivery after manual user input"
+    ],
+    "related_components": [
+      "src/main/mcp/mcp-server.mjs",
+      "src/renderer/components/SubAgentBar.tsx",
+      "src/main/pty/terminal.js",
+      "src/renderer/store/useTabStore.ts",
+      "src/main/ipc/mcp-handlers.js"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-clipboard-tools.md",
+    "type": "fact",
+    "explicit": [
+      "clipboard tools",
+      "pasted blocks",
+      "AI research",
+      "log compression",
+      "global copy settings",
+      "timeline range copy",
+      "unified formatting"
+    ],
+    "implicit": [
+      "pasted_block_syntax",
+      "log_compression_toast",
+      "timeline_range_backtrace",
+      "formatToolAction_main_process",
+      "useUIStore_copy_persistence",
+      "collapsible_pasted_component",
+      "markdown_pre_parsing_interception",
+      "clipboard_indicator_dots",
+      "paste_path_routing",
+      "Zustand_silent_mutation",
+      "layout_depth_sensitivity"
+    ],
+    "symptoms": [
+      "Copied session content lacks expected file diffs or tool results",
+      "Large text dumps in chat are not collapsing by default",
+      "Timeline range copy returns truncated data instead of full tool results",
+      "Clipboard status dots in sidebar do not match the current copy settings",
+      "Log compression button does not provide feedback on data reduction percentage"
+    ],
+    "related_components": [
+      "GeminiPanel.tsx",
+      "MarkdownRenderer.tsx",
+      "CollapsiblePastedBlock.tsx",
+      "main.js",
+      "ProjectToolbar.tsx",
+      "useUIStore.ts"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fix-save-tabs-data-loss.md",
+    "type": "fix",
+    "explicit": [
+      "saveTabs",
+      "data loss",
+      "SQLite",
+      "tabs management",
+      "database integrity"
+    ],
+    "implicit": [
+      "saveTabs_destructive_delete",
+      "database_sync_integrity",
+      "ipc_race_condition_sync",
+      "safety_guard_threshold",
+      "forceCleanup_override",
+      "zustand_persistence_bridge",
+      "sqlite_orphan_prevention",
+      "mcp_session_persistence",
+      "batch_tab_operations",
+      "in_memory_map_desync"
+    ],
+    "symptoms": [
+      "Tabs disappear from the sidebar after app restart",
+      "Only the most recently active tabs are preserved while others vanish",
+      "Significant tab loss occurring after using MCP sub-agents or automation",
+      "Database cleanup deletes valid tabs during partial state updates",
+      "Project workspace loses session data without manual deletion"
+    ],
+    "related_components": [
+      "src/main/database.js",
+      "src/main/project-manager.js",
+      "src/renderer/store/useWorkspaceStore.ts"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fix-packaged-app-logs.md",
+    "type": "fix",
+    "explicit": [
+      "production logs",
+      "asar read-only filesystem",
+      "app.getPath logs",
+      "electron build configuration"
+    ],
+    "implicit": [
+      "asar_readonly_trap",
+      "silent_log_failure",
+      "app_getPath_logs_resolution",
+      "isDev_path_divergence",
+      "package_json_files_filter",
+      "mac_library_logs_path",
+      "electron_main_fs_write",
+      "asar_bundle_exclusion",
+      "node_path_join_asar_break",
+      "main_process_logging_path"
+    ],
+    "symptoms": [
+      "Logs are generated in development but missing in the packaged production app",
+      "Logger stream closes silently without error messages in the UI",
+      "Application bundle size is bloated with development logs after build",
+      "File system write operations fail when using paths relative to __dirname in production",
+      "Logs directory is not found in the standard User Library on macOS"
+    ],
+    "related_components": [
+      "main.js",
+      "package.json"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-ops-guide.md",
+    "type": "fact",
+    "explicit": [
+      "infrastructure",
+      "dev_build_cycle",
+      "data_storage_paths",
+      "debugging_logs",
+      "testing_methodology"
+    ],
+    "implicit": [
+      "node_pty_rebuild_logic",
+      "electron_builder_dist_macos",
+      "sqlite_persistence_path",
+      "claude_bridge_session_json",
+      "gemini_time_machine_history",
+      "localstorage_debug_filters",
+      "xterm_headless_tui_unit",
+      "playwright_integration_verification",
+      "packaged_app_log_routing",
+      "sniper_watcher_debug_logs",
+      "true_fork_recovery_debug",
+      "osc_marker_parser_testing"
+    ],
+    "symptoms": [
+      "Developer needs to find production logs or database files on macOS",
+      "Terminal fails to launch due to node-pty native module mismatch after update",
+      "AI interaction logs are missing from the standard console output",
+      "Deciding whether to write a Headless TUI test or a Playwright integration test",
+      "Application packaging fails during dmg or app creation process",
+      "Need to enable verbose logging for Claude or Gemini subsystems"
+    ],
+    "related_components": [
+      "main.js",
+      "package.json",
+      "auto/run.sh",
+      "debug-60s.js",
+      "debug-claude-cli.js"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-interceptor-rearm.md",
+    "type": "fact",
+    "explicit": [
+      "interceptor",
+      "sub-agent",
+      "mcp-delegation",
+      "state-machine"
+    ],
+    "implicit": [
+      "interceptor_state_machine",
+      "mcp_delegation_flow",
+      "subagent_lifecycle",
+      "interceptor_badge_ui",
+      "manual_intervention_logic",
+      "response_delivery_bridge",
+      "subagent_idle_handler",
+      "zustand_ipc_state_sync",
+      "ipc_listener_event_drop",
+      "terminal_area_overlay_depth"
+    ],
+    "symptoms": [
+      "Claude sub-agent result is not delivered to Gemini after manual intervention",
+      "Need to manually trigger the delivery of the last Claude response to Gemini",
+      "Sub-agent status indicator purple or red pulse is missing while Claude is busy",
+      "Gemini receives interrupted by user message unexpectedly during delegation",
+      "User wants to prevent a specific sub-agent response from returning to the main agent"
+    ],
+    "related_components": [
+      "src/main/main.js",
+      "src/renderer/store/useWorkspaceStore.ts",
+      "src/renderer/components/Workspace/SubAgentBar.tsx",
+      "src/renderer/components/Workspace/TerminalArea.tsx",
+      "src/renderer/App.tsx"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-gemini-sessions.md",
+    "type": "fact",
+    "explicit": [
+      "gemini_session_management",
+      "true_fork_branching",
+      "session_capture_watcher",
+      "short_id_resolution",
+      "gemini_cli_integration"
+    ],
+    "implicit": [
+      "gemini_sniper_watcher",
+      "short_id_hex_expansion",
+      "true_fork_json_patching",
+      "bareResume_mtime_sort",
+      "gemini_exclusive_session_lock",
+      "spawn_with_watcher_handler",
+      "info_panel_id_validation",
+      "session_json_lifecycle",
+      "yesMode_prefilled_automation",
+      "gemini_state_sync_lag",
+      "info_panel_tooltip_clipping"
+    ],
+    "symptoms": [
+      "Forked terminal writes data into the original session file instead of a new branch",
+      "Gemini session ID input stays red when using the 8-character hash from a filename",
+      "Warning message appears in terminal stating only one AI session can be active",
+      "Gemini sniper fails to detect the session file after the first command is sent",
+      "Resuming the 'latest' session selects an outdated file instead of the most recent one"
+    ],
+    "related_components": [
+      "src/main/main.js",
+      "src/renderer/components/Workspace/panels/InfoPanel.tsx",
+      "src/renderer/components/Workspace/Terminal.tsx",
+      "src/renderer/store/useWorkspaceStore.ts"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-claude-agent-orchestration.md",
+    "type": "fact",
+    "explicit": [
+      "claude_agent_orchestration",
+      "gemini_to_claude_bridge",
+      "pattern_trigger_logic"
+    ],
+    "implicit": [
+      "geminiWatchers_guard",
+      "ink_spinner_logic_reset",
+      "detector_arming_mechanism",
+      "user_input_suppression_cooldown",
+      "compact_buffer_4kb",
+      "claude_agent_sdk_v2",
+      "safePasteAndSubmit_output_routing",
+      "session_persistence_tab_id",
+      "Ink_TUI_re-render_corruption",
+      "PTY_echo_input_race",
+      "async_import_race_condition",
+      "terminal_input_cooldown_leak"
+    ],
+    "symptoms": [
+      "Gemini output triggers multiple simultaneous Claude agent instances",
+      "Pasting text with :::claude markers causes unintended agent activation",
+      "Old history in terminal re-triggers Claude agent on tab restoration",
+      "Claude agent does not start because the Ink TUI spinner is resetting the detector buffer",
+      "Claude session metadata is missing after switching between terminal tabs"
+    ],
+    "related_components": [
+      "src/main/geminiWatcher.ts",
+      "src/main/claudeAgentManager.ts",
+      "src/renderer/TerminalTab.tsx",
+      "src/main/ptyManager.ts"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-session-detection.md",
+    "type": "fact",
+    "explicit": [
+      "Claude Code CLI",
+      "Session ID detection",
+      "PID mapping",
+      "jsonl parsing",
+      "Sniper Watcher",
+      "StatusLine Bridge"
+    ],
+    "implicit": [
+      "session_pid_binding",
+      "jsonl_bridge_filtering",
+      "sniper_watcher_polling",
+      "statusline_bridge_v3",
+      "parallel_cwd_collision",
+      "claude_clear_context_fork",
+      "hooks_session_start",
+      "mtime_fallback_race",
+      "retroactive_session_link",
+      "jsonl_chain_resolution"
+    ],
+    "symptoms": [
+      "InfoPanel displays session history from a different project",
+      "Resume button attempts to launch the wrong conversation branch",
+      "Terminal session ID does not match the file being indexed in the background",
+      "Multiple Claude instances in one folder cause timeline data corruption",
+      "Session detection fails for idle terminals older than 5 minutes"
+    ],
+    "related_components": [
+      "src/main/main.js",
+      "src/renderer/components/InfoPanel.tsx"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fix-gemini-response-queue.md",
+    "type": "fix",
+    "explicit": [
+      "gemini",
+      "response_queue",
+      "input_detection",
+      "ipc_main_process",
+      "character_counting"
+    ],
+    "implicit": [
+      "gemini_input_char_count",
+      "terminal_input_interceptor",
+      "pty_input_backspace_tracking",
+      "ink_tui_buffer_instability",
+      "gemini_idle_delivery_trigger",
+      "force_flush_logic",
+      "invisible_bridge_hover",
+      "alternate_screen_buffer_collision",
+      "paste_path_routing",
+      "sigwinch_ink_corruption",
+      "control_sequence_injection"
+    ],
+    "symptoms": [
+      "AI responses from sub-agents overwrite user text in Gemini input",
+      "Multiple AI responses collide or scramble terminal output",
+      "Gemini queue does not deliver even after clearing input manually",
+      "Tooltip or menu closes immediately when moving mouse to click it",
+      "Garbled text appears in Gemini TUI after background agent finishes task"
+    ],
+    "related_components": [
+      "main.js",
+      "src/main/pty-handler.js",
+      "src/components/terminal/GeminiQueueTooltip.tsx",
+      "src/store/useTerminalStore.ts"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-data-persistence.md",
+    "type": "fact",
+    "explicit": [
+      "Data Persistence",
+      "Project Management",
+      "SQLite Persistence",
+      "Xterm.js Serialization",
+      "Tab Metadata",
+      "Multi-selection Model",
+      "Drag-and-Drop Logic",
+      "Tailwind Dynamic Classes"
+    ],
+    "implicit": [
+      "tab_persistence_color_utility",
+      "tailwind_dynamic_inline_style",
+      "debounced_ipc_persistence",
+      "saveTabs_atomic_transaction",
+      "project_uuid_instance_collision",
+      "xterm_serialize_buffer_unmount",
+      "pty_data_loss_unmount",
+      "multi_tab_selection_range",
+      "drag_and_drop_batch_move",
+      "xterm_scroll_bottom_reset",
+      "favorites_sqlite_schema",
+      "tab_history_lru_navigation",
+      "zustand_debounce_stale_sync",
+      "xterm_visibility_scroll_reset",
+      "ipc_listener_unmount_gap"
+    ],
+    "symptoms": [
+      "Tabs lose custom colors or robot icons after app restart",
+      "Terminal text disappears when switching between Dashboard and Workspace",
+      "UI feels laggy or has micro-freezes during tab switches due to IPC pressure",
+      "Terminal scrollbar jumps to the top automatically when new data arrives in a background tab",
+      "Dynamic Tailwind border or background colors are not rendering in the build",
+      "Creating a second project with the same folder path overwrites the first one",
+      "AI terminal tabs are renamed back to default names after reloading the project"
+    ],
+    "related_components": [
+      "src/renderer/store/useWorkspaceStore.ts",
+      "src/renderer/components/Workspace/Terminal.tsx",
+      "src/main/services/project-manager.js",
+      "src/renderer/components/Workspace/TabBar.tsx"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fix-compact-logic.md",
+    "type": "fix",
+    "explicit": [
+      "compact logic",
+      "false fork detection",
+      "Claude summary extraction",
+      "Gemini compression detection"
+    ],
+    "implicit": [
+      "compact_boundary_fork_shield",
+      "claude_context_overflow_session_id",
+      "look_ahead_compact_summary",
+      "gemini_empty_info_compact",
+      "system_reminder_cleaning",
+      "jsonl_chain_resolution",
+      "compact_gap_recovery",
+      "fork_contamination",
+      "timeline_visual_clutter",
+      "activeBranch_traversal",
+      "sync_marker_validity"
+    ],
+    "symptoms": [
+      "Blue FORK label appears unexpectedly in HistoryPanel after a COMPACTED boundary",
+      "Compacted block in history is missing summary text despite being present in logs",
+      "Gemini CLI session compression is not reflected in the timeline or history",
+      "Summary text contains unstripped system tags like <system-reminder>",
+      "Claude automatic session restarts are misidentified as manual user forks"
+    ],
+    "related_components": [
+      "src/renderer/components/HistoryPanel.tsx",
+      "src/main/parser/jsonl-processor.ts",
+      "src/renderer/store/useHistoryStore.ts"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fix-claude-ctrlc-exit.md",
+    "type": "fix",
+    "explicit": [
+      "claude-cli",
+      "ctrl-c",
+      "danger-zone",
+      "process-exit",
+      "model-switching"
+    ],
+    "implicit": [
+      "claude_ctrlc_danger_zone",
+      "ctrlCFirst_strategy",
+      "again_to_exit_marker",
+      "ink_tui_cursor_stripping",
+      "minimum_hold_protection",
+      "ttl_fallback_logic",
+      "model_switch_exit_race",
+      "pty_stream_interception",
+      "claude_command_bypass",
+      "think_mode_toggle_safety",
+      "ipc_sync_danger_zone",
+      "stripVTControlCharacters_bypass"
+    ],
+    "symptoms": [
+      "Claude terminal closes immediately after switching models or toggling Think mode",
+      "Terminal process exits unexpectedly after a UI button click in the sidebar",
+      "The message 'Press Ctrl-C again to exit' appears in the PTY just before the session ends",
+      "Model switches or commands sent via UI buttons don't execute and the terminal crashes",
+      "Quick successive button clicks cause Claude CLI to terminate instead of processing the command"
+    ],
+    "related_components": [
+      "src/main/main.js",
+      "auto/stable/test-ctrlc-danger-zone.js"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-input-events.md",
+    "type": "fact",
+    "explicit": [
+      "UI Input",
+      "Event Handling",
+      "Terminal Commands",
+      "Clipboard API",
+      "Electron IPC",
+      "Focus Management"
+    ],
+    "implicit": [
+      "handshake_enter_delay",
+      "bracketed_paste_mode",
+      "writeToPtySafe_chunking",
+      "main_execSync_lockout",
+      "zoom_font_sync",
+      "xterm_mouse_capture",
+      "electron_native_clipboard",
+      "custom_prompt_modal",
+      "ipc_event_loop_starvation",
+      "terminal_focus_area",
+      "layout_depth_sensitivity",
+      "event_drop_window"
+    ],
+    "symptoms": [
+      "Automation commands like /chat save appear in terminal but do not execute",
+      "Large text pastes or long AI prompts are truncated or broken in the terminal",
+      "UI freezes for several seconds when switching tabs or closing projects",
+      "Hotkeys like Cmd+T create a new project instead of a new tab after clicking terminal",
+      "Copy to clipboard fails intermittently or only works when the window is perfectly focused",
+      "Application crashes with an error stating prompt or alert is not supported"
+    ],
+    "related_components": [
+      "main.js",
+      "src/renderer/App.tsx",
+      "src/renderer/components/Workspace.tsx",
+      "src/renderer/components/Timeline.tsx"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fix-tab-persistence.md",
+    "type": "fix",
+    "explicit": [
+      "tab_identity_persistence",
+      "sub_agent_links",
+      "tab_id_regeneration",
+      "closure_trap_fix"
+    ],
+    "implicit": [
+      "tab_identity_regeneration",
+      "broken_parent_child_links",
+      "sqlite_persistence_mapping",
+      "closure_trap_activation",
+      "mcp_task_id_tracking",
+      "tab_counter_collision",
+      "sub_agent_visibility_logic",
+      "jsonl_history_stateless_restore"
+    ],
+    "symptoms": [
+      "SubAgentBar is empty after application restart",
+      "Claude sub-agents appear in main tab list instead of under Gemini",
+      "Clicking a task ID in terminal does nothing or uses wrong ID",
+      "Tab IDs change unexpectedly after closing and reopening project",
+      "Custom sub-agent names reset to default 'claude-sub' after restart"
+    ],
+    "related_components": [
+      "src/main/database.js",
+      "src/renderer/store/useWorkspaceStore.ts",
+      "src/renderer/components/Workspace/Terminal.tsx",
+      "src/renderer/components/SubAgentBar/SubAgentBar.tsx"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-settings.md",
+    "type": "fact",
+    "explicit": [
+      "settings modal",
+      "prompt management",
+      "ui configuration",
+      "persistence",
+      "ai settings"
+    ],
+    "implicit": [
+      "settings_modal_autosave",
+      "prompt_editor_sidepanel",
+      "ui_store_reactivity_sync",
+      "sqlite_persistence_settings",
+      "modal_width_transition",
+      "stale_state_protection",
+      "thinking_level_configuration",
+      "prompt_visual_feedback_green_flash",
+      "last_tab_persistence",
+      "onblur_save_trigger",
+      "independent_column_scroll"
+    ],
+    "symptoms": [
+      "Prompt edits are lost if the modal is closed via keyboard shortcuts",
+      "The AI settings tab looks cramped or columns overlap",
+      "Thinking level settings (NONE to HIGH) are not persisting between sessions",
+      "Green border flash animation is missing after editing a prompt field",
+      "Application returns to General tab instead of AI tab after reopening settings",
+      "Race condition occurs when rapidly typing in the prompt editor while saving to SQLite"
+    ],
+    "related_components": [
+      "src/renderer/components/SettingsModal.tsx",
+      "src/renderer/store/useUIStore.ts",
+      "src/main/database.js"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fix-performance-lags.md",
+    "type": "fix",
+    "explicit": [
+      "performance_optimization",
+      "main_thread_blocking",
+      "zustand_selectors",
+      "jsonl_parsing_efficiency"
+    ],
+    "implicit": [
+      "jsonl_incremental_reader",
+      "zustand_map_reference_trap",
+      "main_thread_io_blocking",
+      "fingerprint_selector_optimization",
+      "startup_session_restoration_batching",
+      "safety_guard_db_locking",
+      "jsonl_chain_resolution_latency",
+      "react_terminal_remount_storm",
+      "mtime_size_metadata_caching",
+      "leftover_buffer_fragmentation"
+    ],
+    "symptoms": [
+      "UI freezes for several seconds during periodic timeline polling",
+      "High CPU usage and fan noise immediately after application startup",
+      "Switching between terminal tabs feels laggy or delayed by up to 1 second",
+      "Logs show Safety Guard errors blocking saveTabs operations in SQLite",
+      "Terminal components re-mount and blink unexpectedly on unrelated state changes"
+    ],
+    "related_components": [
+      "src/main/sessions/reader.js",
+      "src/renderer/store/useTerminalStore.ts",
+      "src/renderer/components/TerminalArea.tsx",
+      "src/main/persistence/sqlite.js"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fix-tailwind-dynamic-runtime.md",
+    "type": "fix",
+    "explicit": [
+      "tailwind_v4",
+      "dynamic_styles",
+      "css_compilation"
+    ],
+    "implicit": [
+      "tailwind_static_analysis",
+      "runtime_hex_injection",
+      "inline_style_override",
+      "safelist_limitations",
+      "tab_color_rendering",
+      "ui_stale_theme",
+      "template_literal_css_failure",
+      "react_dynamic_props",
+      "database_color_sync",
+      "css_jit_exclusion"
+    ],
+    "symptoms": [
+      "UI components display default colors instead of custom values from the database",
+      "Dynamic background colors or panel widths do not update visually even when the store changes",
+      "Tailwind classes using template literals like bg-[${color}] fail to apply styles in runtime",
+      "Element remains unstyled or keeps default theme despite valid HEX/RGB data in the state",
+      "Customizing UI theme colors results in no visual feedback on specific interface elements"
+    ],
+    "related_components": [
+      "src/components/Tabs.tsx",
+      "src/components/Sidebar.tsx",
+      "src/store/useStore.ts"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-claude-tui-control.md",
+    "type": "fact",
+    "explicit": [
+      "Claude Code TUI control",
+      "bracketed paste mode",
+      "safePasteAndSubmit",
+      "sync markers",
+      "model switching",
+      "rewind automation",
+      "think mode toggle",
+      "handshake"
+    ],
+    "implicit": [
+      "handshake_prompt_injection",
+      "safePasteAndSubmit_chunking",
+      "sync_marker_verification",
+      "macos_ttyhog_limit",
+      "ink_react_tui_parsing",
+      "rewind_history_navigation",
+      "think_mode_toggle_reactive",
+      "bracketed_paste_mode",
+      "cursor_forward_parsing",
+      "sync_marker_validity",
+      "paste_path_routing",
+      "react_batching_race"
+    ],
+    "symptoms": [
+      "Text in Claude TUI is displayed without spaces or looks squashed",
+      "Large programmatic pastes are truncated or broken on macOS",
+      "The /model or /compact command is typed but not submitted automatically",
+      "Thinking mode toggle fails to navigate the TUI picker menu",
+      "Rewind fails because the history navigation cursor misses the target entry"
+    ],
+    "related_components": [
+      "src/main/main.js",
+      "src/renderer/components/Workspace/panels/InfoPanel.tsx"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-claude-code-internals.md",
+    "type": "fact",
+    "explicit": [
+      "Claude Code CLI internals",
+      "JSONL session format",
+      "Session forking mechanism",
+      "Plan mode architecture"
+    ],
+    "implicit": [
+      "claude_code_jsonl_parser",
+      "fork_session_uuid_mapping",
+      "compact_boundary_dangling_parent",
+      "system_turn_duration_telemetry",
+      "jsonl_chain_resolution_logic",
+      "bridge_entry_v2_migration",
+      "bash_progress_incremental_output",
+      "keychain_credential_retrieval",
+      "statsig_feature_gate_detection",
+      "session_fork_contamination_prevention",
+      "claude_cli_binary_architecture",
+      "logicalParentUuid_resolution"
+    ],
+    "symptoms": [
+      "Timeline displays empty history after forking a session in the UI",
+      "Multiple independent dialogues are merged into a single timeline stream without dividers",
+      "JSONL parsing fails due to unexpected system subtypes or missing parent UUIDs",
+      "Session duration or token usage metrics are missing or zero in the Timeline view",
+      "Claude Code session cannot resume from a specific message ID after a bridge entry"
+    ],
+    "related_components": [
+      "src/main/claude/jsonl-parser.ts",
+      "src/renderer/components/Timeline/Timeline.tsx",
+      "src/main/services/SessionManager.ts"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-claude-tui-mechanics.md",
+    "type": "fact",
+    "explicit": [
+      "Claude Code TUI",
+      "Ink Engine behavior",
+      "Sync Markers",
+      "Bracketed Paste Mode",
+      "Spinner Detection",
+      "Session ID Interception"
+    ],
+    "implicit": [
+      "lavender_marker_rgb",
+      "ink_sync_marker_race",
+      "safePasteAndSubmit_chunking",
+      "ttyhog_macos_limit",
+      "bracketed_paste_mode",
+      "rewind_visual_search_rgb",
+      "spinner_debounce_logic",
+      "terminal_input_collapsing",
+      "osc_stripping_guard",
+      "status_line_bridge_validation",
+      "exit_confirmation_parsing",
+      "drain_pause_timing"
+    ],
+    "symptoms": [
+      "Claude Code ignores programmatic input or fails to submit prompts",
+      "Terminal Busy indicator flickers or stays active after the command ends",
+      "Large text blocks are fragmented into multiple paste events in the TUI",
+      "Automated Enter key presses are lost during rapid command execution",
+      "Rewind history navigation fails to locate the highlighted selection"
+    ],
+    "related_components": [
+      "src/main/pty.js",
+      "src/main/ipc/terminal.js",
+      "src/renderer/store/terminalStore.ts",
+      "src/renderer/hooks/useTerminalBusy.ts"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-console-interceptor.md",
+    "type": "fact",
+    "explicit": [
+      "console_interceptor",
+      "log_filtering",
+      "window_logs_api",
+      "dev_tools_performance"
+    ],
+    "implicit": [
+      "console_log_interceptor",
+      "tag_based_filtering",
+      "window_logs_runtime_api",
+      "workspace_render_flood",
+      "devtools_performance_optimization",
+      "devtools_ui_freeze_prevention",
+      "global_side_effect_interceptor",
+      "render_loop_noise_reduction",
+      "runtime_log_management",
+      "silent_log_suppression",
+      "log_tag_hierarchy",
+      "renderer_main_bootstrap"
+    ],
+    "symptoms": [
+      "DevTools console is flooded with repetitive workspace render messages",
+      "UI freezes or lags specifically when the developer console is open",
+      "Expected console.log output is missing despite code execution",
+      "Need to dynamically enable or disable specific subsystem logs at runtime",
+      "Critical errors are buried under diagnostic noise in the renderer process"
+    ],
+    "related_components": [
+      "src/renderer/main.tsx"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-scripts.md",
+    "type": "fact",
+    "explicit": [
+      "Terminal Scripts",
+      "npm run scripts",
+      "package.json integration",
+      "RestartZone",
+      "Process management"
+    ],
+    "implicit": [
+      "scripts_dynamic_reading",
+      "devserver_auto_detection",
+      "restart_zone_middle_click",
+      "native_terminal_menu_sync",
+      "osc_133_hanging_state",
+      "tab_command_type_sync",
+      "package_json_ipc_read",
+      "ctrl_c_injection_logic",
+      "dual_context_menu_desync",
+      "terminal_getCwd_ipc_bridge",
+      "private_script_filtering"
+    ],
+    "symptoms": [
+      "Scripts menu is missing specific npm commands from package.json",
+      "Tab does not turn green or show restart icon after starting a dev server",
+      "Middle-click on the restart icon closes the tab instead of stopping the process",
+      "Terminal context menu shows 'Stop process' but Tab menu does not, or vice versa",
+      "OSC 133 command-finished marker is never received for long-running scripts",
+      "Scripts starting with underscore are missing from the UI menu"
+    ],
+    "related_components": [
+      "src/renderer/components/Workspace/TabBar.tsx",
+      "src/main/main.js"
+    ]
+  }
+]
