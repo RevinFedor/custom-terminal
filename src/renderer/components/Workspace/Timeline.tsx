@@ -1454,14 +1454,15 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
 
             return (
               <React.Fragment key={entry.uuid}>
-                {/* Phase 2: Expanded group toggle bar (separate from entry) */}
+                {/* Phase 2: Expanded group toggle bar (collapse control) */}
                 {isExpandedHeader && (
                   <div
-                    className="relative w-full flex items-center justify-center"
+                    className="relative w-full flex items-center"
                     style={{
                       flex: '0 0 auto',
-                      height: '6px',
+                      height: '14px',
                       cursor: 'pointer',
+                      justifyContent: 'center',
                     }}
                     onClick={(e) => {
                       e.stopPropagation();
@@ -1472,19 +1473,30 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
                       });
                     }}
                   >
+                    {/* Left line */}
                     <div style={{
-                      width: '10px',
+                      flex: 1,
                       height: '1px',
-                      backgroundColor: 'rgba(129, 140, 248, 0.4)',
+                      backgroundColor: 'rgba(129, 140, 248, 0.2)',
+                      marginRight: '3px',
                     }} />
-                    {treeMode && (
-                      <span className="ml-1 truncate pointer-events-none select-none" style={{
-                        fontSize: '8px',
-                        color: 'rgba(129, 140, 248, 0.4)',
-                      }}>
-                        ▾ {groupInfo!.agentName} ×{groupInfo!.groupSize}
-                      </span>
-                    )}
+                    {/* Badge */}
+                    <span className="pointer-events-none select-none shrink-0" style={{
+                      fontSize: '9px',
+                      lineHeight: '1',
+                      color: 'rgba(129, 140, 248, 0.9)',
+                      fontFamily: 'monospace',
+                      fontWeight: 600,
+                    }}>
+                      ×{groupInfo!.groupSize}
+                    </span>
+                    {/* Right line */}
+                    <div style={{
+                      flex: 1,
+                      height: '1px',
+                      backgroundColor: 'rgba(129, 140, 248, 0.2)',
+                      marginLeft: '3px',
+                    }} />
                   </div>
                 )}
                 <div
@@ -1549,9 +1561,9 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
                         right: '2px',
                         top: '50%',
                         transform: 'translateY(-50%)',
-                        fontSize: '7px',
+                        fontSize: '9px',
                         lineHeight: '1',
-                        color: 'rgba(129, 140, 248, 0.7)',
+                        color: 'rgba(129, 140, 248, 0.9)',
                         fontWeight: 600,
                         fontFamily: 'monospace',
                       }}
