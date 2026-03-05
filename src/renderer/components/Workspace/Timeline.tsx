@@ -230,11 +230,9 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
   const scrollRef = useRef<HTMLDivElement>(null);
   const segmentRefs = useRef<(HTMLDivElement | null)[]>([]);
 
-  // Custom scroll indicator state (overlays the Resizer bar)
-  const [scrollThumb, setScrollThumb] = useState<{ top: number; height: number } | null>(null);
-
-  // "Scroll to bottom" arrow — shown when reachable (non-red) entries exist below visible area
-  const [showScrollDown, setShowScrollDown] = useState(false);
+  // Custom scroll indicator + scroll-down arrow — DOM refs for direct update (no re-render on scroll)
+  const thumbRef = useRef<HTMLDivElement>(null);
+  const arrowRef = useRef<HTMLDivElement>(null);
 
   // CMD key state for tooltip activation
   const [isCmdHeld, setIsCmdHeld] = useState(false);
@@ -261,40 +259,44 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
   }, [groupMap]);
 
   // Custom scroll indicator: track scroll position on the scrollable div
+  // Custom scroll indicator: direct DOM updates (no React re-render on scroll)
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
     const updateThumb = () => {
       const { scrollTop, scrollHeight, clientHeight } = el;
+      const thumb = thumbRef.current;
+      const arrow = arrowRef.current;
       if (scrollHeight <= clientHeight) {
-        setScrollThumb(null);
-        setShowScrollDown(false);
+        if (thumb) thumb.style.display = 'none';
+        if (arrow) arrow.style.display = 'none';
         return;
       }
       const ratio = clientHeight / scrollHeight;
       const thumbH = Math.max(ratio * clientHeight, 20); // min 20px
       const maxScroll = scrollHeight - clientHeight;
       const thumbTop = (scrollTop / maxScroll) * (clientHeight - thumbH);
-      setScrollThumb({ top: thumbTop, height: thumbH });
+      if (thumb) {
+        thumb.style.display = '';
+        thumb.style.top = `${thumbTop}px`;
+        thumb.style.height = `${thumbH}px`;
+      }
 
       // "Scroll down" arrow: check if reachable entries exist below visible area
       const isAtBottom = scrollTop >= maxScroll - 5;
-      if (isAtBottom) {
-        setShowScrollDown(false);
-      } else {
-        // Find the last visible child index based on scroll position
+      let showArrow = false;
+      if (!isAtBottom) {
         const visibleBottom = scrollTop + clientHeight;
-        let hasReachableBelow = false;
         const children = el.children;
         for (let i = children.length - 1; i >= 0; i--) {
           const child = children[i] as HTMLElement;
           if (child.offsetTop >= visibleBottom && !child.dataset.unreachable) {
-            hasReachableBelow = true;
+            showArrow = true;
             break;
           }
         }
-        setShowScrollDown(hasReachableBelow);
       }
+      if (arrow) arrow.style.display = showArrow ? '' : 'none';
     };
     updateThumb();
     el.addEventListener('scroll', updateThumb, { passive: true });
@@ -437,6 +439,23 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
     loadTimeline();
   }, [loadTimeline]);
 
+  // Auto-scroll timeline to bottom on initial load (when sessionId changes)
+  // This ensures the user sees the latest (reachable) entries, not old red ones at the top
+  const prevSessionRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (sessionId && sessionId !== prevSessionRef.current && entries.length > 0) {
+      prevSessionRef.current = sessionId;
+      const el = scrollRef.current;
+      console.warn(`[Timeline:AutoScroll] sessionId=${sessionId.substring(0,8)} entries=${entries.length} scrollRef=${!!el} scrollHeight=${el?.scrollHeight} clientHeight=${el?.clientHeight} scrollTop=${el?.scrollTop}`);
+      requestAnimationFrame(() => {
+        if (scrollRef.current) {
+          scrollRef.current.scrollTo({ top: scrollRef.current.scrollHeight });
+          console.warn(`[Timeline:AutoScroll] DONE scrollTo=${scrollRef.current.scrollHeight} newScrollTop=${scrollRef.current.scrollTop}`);
+        }
+      });
+    }
+  }, [sessionId, entries.length]);
+
   // Refresh timeline periodically (only when visible)
   useEffect(() => {
     if (!sessionId || !isVisible) return;
@@ -456,6 +475,20 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
     window.addEventListener('timeline:force-refresh', handler);
     return () => window.removeEventListener('timeline:force-refresh', handler);
   }, [tabId, loadTimeline]);
+
+  // Listen for scroll-to-bottom requests (e.g., when "Continue" is pressed)
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent).detail;
+      if (detail?.tabId === tabId) {
+        requestAnimationFrame(() => {
+          scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
+        });
+      }
+    };
+    window.addEventListener('timeline:scroll-to-bottom', handler);
+    return () => window.removeEventListener('timeline:scroll-to-bottom', handler);
+  }, [tabId]);
 
   // Bind timeline entries to prompt boundary markers (OSC 7777 from main.js).
   // Entry N (user message) maps to prompt boundary N (the prompt shown after response N,
@@ -547,7 +580,17 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
         });
         if (searchData.length > 0) {
           const rows = terminalRegistry.buildPositionIndex(tabId, searchData);
-          searchData.forEach((sd, i) => { pos[sd.entryIndex] = rows[i]; });
+          searchData.forEach((sd, i) => {
+            pos[sd.entryIndex] = rows[i];
+            if (rows[i] < 0) {
+              console.warn(`[Timeline:GeminiDiag] MISS entry#${sd.entryIndex} type=${entries[sd.entryIndex].type} searchLines=${JSON.stringify(sd.searchLines)}`);
+            }
+          });
+          const found = rows.filter(r => r >= 0).length;
+          const missed = rows.filter(r => r < 0).length;
+          if (missed > 0) {
+            console.warn(`[Timeline:GeminiDiag] positions: ${found} found, ${missed} missed, total=${searchData.length}, lastBoundaryIdx=${lastBoundaryIdx}`);
+          }
         }
       } else {
         // Claude: map entries to prompt boundary positions.
@@ -682,6 +725,14 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
           break;
         }
       });
+
+      if (isGemini && newUnreachable.size > 0) {
+        console.warn(`[Timeline:GeminiDiag] unreachable=[${[...newUnreachable].join(',')}] hasAnyPosition=${hasAnyPosition} lastBoundaryIdx=${lastBoundaryIdx} entries=${entries.length}`);
+        [...newUnreachable].forEach(idx => {
+          const e = entries[idx];
+          console.warn(`[Timeline:GeminiDiag]   #${idx} type=${e.type} isPlan=${e.isPlan} content=${JSON.stringify(e.content?.substring(0, 60))}`);
+        });
+      }
 
       setUnreachableIndices(prev => {
         if (prev.size === newUnreachable.size && [...prev].every(i => newUnreachable.has(i))) return prev;
@@ -1438,7 +1489,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
                   borderRadius: '1px',
                   backgroundColor: visibleEntryIndices.has(0) ? '#5eada3' : '#48968c',
                   boxShadow: visibleEntryIndices.has(0) ? '0 0 6px rgba(72, 150, 140, 0.25)' : 'none',
-                  transition: 'all 0.2s',
+                  transition: 'background-color 0.2s, box-shadow 0.2s',
                 }}
               />
             </div>
@@ -1457,7 +1508,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
                   borderRadius: '1px',
                   backgroundColor: visibleEntryIndices.has(0) ? '#60a5fa' : '#3b82f6',
                   boxShadow: visibleEntryIndices.has(0) ? '0 0 6px rgba(59, 130, 246, 0.25)' : 'none',
-                  transition: 'all 0.2s',
+                  transition: 'background-color 0.2s, box-shadow 0.2s',
                 }}
               />
             </div>
@@ -1626,7 +1677,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
                           borderRadius: '1px',
                           backgroundColor: noteHovered ? '#c084fc' : '#9333ea',
                           boxShadow: noteHovered ? '0 0 8px rgba(168, 85, 247, 0.5)' : 'none',
-                          transition: 'all 0.2s',
+                          transition: 'background-color 0.2s, box-shadow 0.2s',
                         }}
                       />
                     </div>
@@ -1677,13 +1728,14 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
 
                   {/* Dot */}
                   <div
-                    className="transition-all duration-200 pointer-events-none shrink-0"
+                    className="pointer-events-none shrink-0"
                     style={{
                       width: dotWidth,
                       height: dotHeight,
                       borderRadius: dotRadius,
                       backgroundColor: dotColor,
                       boxShadow: dotGlow,
+                      transition: 'background-color 0.2s, box-shadow 0.2s',
                     }}
                   />
 
@@ -1773,7 +1825,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
                         borderRadius: '1px',
                         backgroundColor: isInViewport ? '#60a5fa' : '#3b82f6',
                         boxShadow: isInViewport ? '0 0 6px rgba(59, 130, 246, 0.25)' : 'none',
-                        transition: 'all 0.2s',
+                        transition: 'background-color 0.2s, box-shadow 0.2s',
                       }}
                     />
                   </div>
@@ -1792,7 +1844,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
                         borderRadius: '1px',
                         backgroundColor: isInViewport ? '#5eada3' : '#48968c',
                         boxShadow: isInViewport ? '0 0 6px rgba(72, 150, 140, 0.25)' : 'none',
-                        transition: 'all 0.2s',
+                        transition: 'background-color 0.2s, box-shadow 0.2s',
                       }}
                     />
                   </div>
@@ -2263,13 +2315,15 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
           </div>
         )}
 
-        {/* Scroll-to-bottom arrow — shown when reachable entries exist below visible area */}
-        {isVisible && showScrollDown && (
+        {/* Scroll-to-bottom arrow — always mounted, visibility toggled via ref (no re-render on scroll) */}
+        {isVisible && (
           <div
-            className="absolute left-1/2 -translate-x-1/2 cursor-pointer z-50 flex items-center justify-center transition-all"
+            ref={arrowRef}
+            className="absolute left-1/2 -translate-x-1/2 cursor-pointer z-50 flex items-center justify-center"
             onClick={() => scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' })}
             title="Scroll to bottom"
             style={{
+              display: 'none',
               bottom: '9px',
               width: '24px',
               height: '24px',
@@ -2283,18 +2337,17 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
           </div>
         )}
 
-        {/* Custom scroll indicator — right edge of Timeline strip (compact) or tree overlay */}
-        {isVisible && scrollThumb && (
+        {/* Custom scroll indicator — always mounted, position updated via ref (no re-render on scroll) */}
+        {isVisible && (
           <div
+            ref={thumbRef}
             className="absolute pointer-events-none"
             style={{
+              display: 'none',
               right: '0px',
               width: '3px',
-              top: scrollThumb.top,
-              height: scrollThumb.height,
               backgroundColor: 'rgba(255, 255, 255, 0.4)',
               borderRadius: '1.5px',
-              transition: 'top 0.05s ease-out',
               zIndex: 55,
             }}
           />
