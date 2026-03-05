@@ -1,4 +1,4 @@
-import React, { useEffect, useLayoutEffect, useState, useCallback, useRef } from 'react';
+import React, { useEffect, useLayoutEffect, useState, useCallback, useRef, useMemo } from 'react';
 import { createPortal } from 'react-dom';
 import { Maximize2, Copy, Minimize2 } from 'lucide-react';
 import { terminalRegistry } from '../../utils/terminalRegistry';
@@ -23,6 +23,20 @@ interface TimelineEntry {
   hasImage?: boolean;
   sessionId?: string;
   isPlan?: boolean;
+  isSubAgent?: boolean;
+  isSubAgentTimeout?: boolean;
+  subAgentName?: string;
+  subAgentTaskId?: string;
+}
+
+interface GroupInfo {
+  isGroupHeader: boolean;
+  isGroupChild: boolean;
+  groupId: string;
+  groupSize: number;
+  agentName: string;
+  hasTimeout: boolean;
+  startIndex: number; // first entry index in the group
 }
 
 interface SessionBoundary {
@@ -157,6 +171,67 @@ function matchesInGeminiBuffer(bufferText: string, searchLines: string[]): boole
   return geminiLineMatch(bufferLines, firstLine, isStrictShort, isIsolatedShort);
 }
 
+// Build grouping map: consecutive sub-agent entries with same taskId/name → collapsed group
+function computeGroups(entries: TimelineEntry[]): Map<number, GroupInfo> {
+  const groups = new Map<number, GroupInfo>();
+  let i = 0;
+  let groupCounter = 0;
+
+  while (i < entries.length) {
+    const entry = entries[i];
+    if (!entry.isSubAgent && !entry.isSubAgentTimeout) {
+      i++;
+      continue;
+    }
+
+    const groupKey = entry.subAgentTaskId || entry.subAgentName || null;
+    const startIdx = i;
+    let j = i + 1;
+
+    // Group consecutive sub-agent entries with the same key
+    if (groupKey) {
+      while (j < entries.length && (entries[j].isSubAgent || entries[j].isSubAgentTimeout)) {
+        const nextKey = entries[j].subAgentTaskId || entries[j].subAgentName || null;
+        if (nextKey !== groupKey) break;
+        j++;
+      }
+    }
+
+    const size = j - startIdx;
+    const groupId = `group-${groupCounter++}`;
+    const hasTimeout = entries.slice(startIdx, j).some(e => e.isSubAgentTimeout);
+    const agentName = entry.subAgentName || 'Claude';
+
+    // Header (always visible)
+    groups.set(startIdx, {
+      isGroupHeader: size > 1,
+      isGroupChild: false,
+      groupId,
+      groupSize: size,
+      agentName,
+      hasTimeout,
+      startIndex: startIdx,
+    });
+
+    // Children (hidden when collapsed)
+    for (let k = startIdx + 1; k < j; k++) {
+      groups.set(k, {
+        isGroupHeader: false,
+        isGroupChild: true,
+        groupId,
+        groupSize: size,
+        agentName,
+        hasTimeout,
+        startIndex: startIdx,
+      });
+    }
+
+    i = j;
+  }
+
+  return groups;
+}
+
 function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, toolType = 'claude' }: TimelineProps) {
   const isGemini = toolType === 'gemini';
   const [entries, setEntries] = useState<TimelineEntry[]>([]);
@@ -172,9 +247,15 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
   const [copyingRange, setCopyingRange] = useState<{ startIndex: number, endIndex: number } | null>(null);
   const [copiedRange, setCopiedRange] = useState<{ startIndex: number, endIndex: number } | null>(null);
   const [visibleEntryIndices, setVisibleEntryIndices] = useState<Set<number>>(new Set());
+  const [responseOnlyIndices, setResponseOnlyIndices] = useState<Set<number>>(new Set());
   const [unreachableIndices, setUnreachableIndices] = useState<Set<number>>(new Set());
   const [clickedState, setClickedState] = useState<{ index: number; status: 'loading' | 'failed' } | null>(null);
   const [rewindState, setRewindState] = useState<{ index: number; phase: 'compacting' | 'rewinding' | 'pasting' | 'done' } | null>(null);
+
+  // Phase 2: Collapsible groups
+  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
+  // Phase 3: Tree view
+  const [treeMode, setTreeMode] = useState(false);
 
   const notesPanelWidth = useUIStore(state => state.notesPanelWidth);
   const copyIncludeEditing = useUIStore(state => state.copyIncludeEditing);
@@ -189,6 +270,16 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
   const [isCmdHeld, setIsCmdHeld] = useState(false);
   const isCmdHeldRef = useRef(false);
   const chainResolvedRef = useRef<string | null>(null); // prevents A→B→A→B feedback loop
+
+  // Compute group map for sub-agent entries (Phase 2)
+  const groupMap = useMemo(() => computeGroups(entries), [entries]);
+  // Count visible nodes (entries minus hidden group children)
+  const hasSubAgentGroups = useMemo(() => {
+    for (const [, g] of groupMap) {
+      if (g.isGroupHeader) return true;
+    }
+    return false;
+  }, [groupMap]);
 
   // Adjust segmentRefs length
   useEffect(() => {
@@ -351,6 +442,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
   useEffect(() => {
     if (!isVisible || entries.length === 0) {
       setVisibleEntryIndices(prev => prev.size === 0 ? prev : new Set());
+      setResponseOnlyIndices(prev => prev.size === 0 ? prev : new Set());
       setUnreachableIndices(prev => prev.size === 0 ? prev : new Set());
       return;
     }
@@ -358,6 +450,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
     // History panel open — UUID-based visibility, no unreachable zone
     if (isHistoryOpen) {
       setUnreachableIndices(prev => prev.size === 0 ? prev : new Set());
+      setResponseOnlyIndices(prev => prev.size === 0 ? prev : new Set());
 
       const uuidSet = historyVisibleUuids ? new Set(historyVisibleUuids) : new Set<string>();
       const newVisible = new Set<number>();
@@ -374,11 +467,15 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
     // Find the last compact/plan-mode boundary.
     // Entries before this index are cleared from terminal — always unreachable, never visible.
     // Note: 'continued' (fork) and sessionId changes do NOT clear terminal — only compact and plan-mode do.
+    // Gemini exception: compact does NOT clear the terminal buffer — history stays visible.
+    // Only Claude uses compact as a boundary. Plan-mode is Claude-only too.
     let lastBoundaryIdx = -1;
-    for (let i = 0; i < entries.length; i++) {
-      const e = entries[i];
-      if (e.type === 'compact' || e.isPlan) {
-        lastBoundaryIdx = i;
+    if (!isGemini) {
+      for (let i = 0; i < entries.length; i++) {
+        const e = entries[i];
+        if (e.type === 'compact' || e.isPlan) {
+          lastBoundaryIdx = i;
+        }
       }
     }
 
@@ -419,11 +516,17 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
         });
         // First entry after boundary usually has no marker (typed at initial prompt).
         // Treat it as position 0 so its range covers the start of the buffer.
+        // But ONLY if other entries have markers (= Claude content is in the buffer).
+        // Without this guard, an empty terminal (Claude not running) would make
+        // the first entry falsely reachable at pos=0.
         const firstRealIdx = entries.findIndex((e, i) =>
           i > lastBoundaryIdx && e.type !== 'compact' && e.type !== 'continued'
         );
         if (firstRealIdx >= 0 && pos[firstRealIdx] < 0) {
-          pos[firstRealIdx] = 0;
+          const hasOtherMarkers = pos.some((p, i) => i > firstRealIdx && p >= 0);
+          if (hasOtherMarkers) {
+            pos[firstRealIdx] = 0;
+          }
         }
       }
 
@@ -437,6 +540,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
       const viewport = terminalRegistry.getViewportState(tabId);
       if (!viewport) {
         setVisibleEntryIndices(prev => prev.size === 0 ? prev : new Set());
+        setResponseOnlyIndices(prev => prev.size === 0 ? prev : new Set());
         return;
       }
 
@@ -448,6 +552,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
       sorted.sort((a, b) => a.row - b.row);
 
       const newVisible = new Set<number>();
+      const newResponseOnly = new Set<number>();
       for (let i = 0; i < sorted.length; i++) {
         const blockStart = sorted[i].row;
         const blockEnd = i + 1 < sorted.length ? sorted[i + 1].row : Infinity;
@@ -455,12 +560,20 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
         // Overlap: block [blockStart, blockEnd) ∩ viewport [top, bottom)
         if (blockStart < viewport.bottom && blockEnd > viewport.top) {
           newVisible.add(sorted[i].index);
+          // Prompt row NOT in viewport → we only see the AI response part
+          if (blockStart < viewport.top) {
+            newResponseOnly.add(sorted[i].index);
+          }
         }
       }
 
       setVisibleEntryIndices(prev => {
         if (prev.size === newVisible.size && [...prev].every(i => newVisible.has(i))) return prev;
         return newVisible;
+      });
+      setResponseOnlyIndices(prev => {
+        if (prev.size === newResponseOnly.size && [...prev].every(i => newResponseOnly.has(i))) return prev;
+        return newResponseOnly;
       });
     };
 
@@ -499,7 +612,6 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
             newUnreachable.add(index);
             return;
           }
-          if (entry.hasImage) return;
           if (positions[index] < 0) {
             newUnreachable.add(index);
           }
@@ -1129,20 +1241,35 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
         data-timeline
         className="relative flex flex-col group"
         style={{
-          width: '24px',
+          width: treeMode ? '160px' : '24px',
           backgroundColor: 'rgba(0, 0, 0, 0.2)',
           backdropFilter: 'blur(4px)',
           borderLeft: '1px solid rgba(255, 255, 255, 0.05)',
           height: '100%',
           zIndex: 40,
           visibility: isVisible ? 'inherit' : 'hidden',
+          transition: 'width 0.3s ease',
         }}
       >
-        {/* Central Axis Line */}
-        <div className="absolute left-1/2 top-0 bottom-0 w-[1px] bg-white/10 -translate-x-1/2 pointer-events-none" />
+        {/* Central Axis Line (hidden in tree mode) */}
+        {!treeMode && (
+          <div className="absolute left-1/2 top-0 bottom-0 w-[1px] bg-white/10 -translate-x-1/2 pointer-events-none" />
+        )}
+
+        {/* Tree mode toggle (visible on hover when sub-agent groups exist) */}
+        {isGemini && hasSubAgentGroups && (
+          <div
+            className="absolute top-0 left-0 right-0 h-[14px] flex items-center justify-center z-10 cursor-pointer opacity-0 group-hover:opacity-100 transition-opacity"
+            style={{ backgroundColor: 'rgba(0,0,0,0.6)' }}
+            onClick={() => setTreeMode(prev => !prev)}
+            title={treeMode ? 'Compact view' : 'Tree view'}
+          >
+            <span className="text-[8px] text-white/50">{treeMode ? '◀' : '▶'}</span>
+          </div>
+        )}
 
         {/* Segmented Hit-boxes */}
-        <div className="flex flex-col h-full w-full" style={{ opacity: isVisible ? 1 : 0 }}>
+        <div className="flex flex-col h-full w-full" style={{ opacity: isVisible ? 1 : 0, overflowY: 'auto' }}>
           {/* Plan mode marker at the very beginning (first entry is from a child session — chain started before visible entries) */}
           {entries.length > 0 && entries[0].sessionId && sessionBoundaries.length > 0 &&
             sessionBoundaries.some(b => b.childSessionId === entries[0].sessionId) &&
@@ -1213,6 +1340,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
             })();
 
             const isInViewport = visibleEntryIndices.has(index);
+            const isResponseOnly = responseOnlyIndices.has(index);
             const isUnreachable = unreachableIndices.has(index);
             const isContinued = entry.type === 'continued';
             const isPlan = !!entry.isPlan;
@@ -1249,10 +1377,10 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
                           ? '#f59e0b'
                           : isPlan
                             ? '#48968c'
-                            : (active ? '#3b82f6' : (hoveredIndex === index || activeTooltipIndex === index ? 'white' : (isInViewport ? 'rgba(255,255,255,0.75)' : 'rgba(255,255,255,0.3)'))),
+                            : (active ? '#3b82f6' : (hoveredIndex === index || activeTooltipIndex === index ? 'white' : (isInViewport ? (isResponseOnly ? 'rgba(255,255,255,0.35)' : 'rgba(255,255,255,0.75)') : 'rgba(255,255,255,0.3)'))),
                       boxShadow: (hoveredIndex === index || activeTooltipIndex === index)
                         ? (isContinued ? '0 0 8px rgba(245, 158, 11, 0.4)' : isPlan ? '0 0 8px rgba(72, 150, 140, 0.4)' : '0 0 8px rgba(255,255,255,0.4)')
-                        : (isInViewport ? (isCompacted ? '0 0 6px rgba(245, 158, 11, 0.25)' : '0 0 6px rgba(255,255,255,0.25)') : 'none'),
+                        : (isInViewport ? (isCompacted ? '0 0 6px rgba(245, 158, 11, 0.25)' : (isResponseOnly ? 'none' : '0 0 6px rgba(255,255,255,0.25)')) : 'none'),
                     }}
                   />
                   {/* Loading spinner — instant feedback on click */}
