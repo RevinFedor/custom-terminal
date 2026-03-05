@@ -906,11 +906,11 @@ class DatabaseManager {
   /**
    * Get parent session (where this session was forked from)
    * @param {string} sessionId - Session UUID
-   * @returns {{source_session_id: string, message_uuid: string} | null}
+   * @returns {{source_session_id: string} | null}
    */
   getParentSession(sessionId) {
     return this.db.prepare(`
-      SELECT source_session_id, message_uuid
+      SELECT source_session_id
       FROM fork_markers
       WHERE forked_to_session_id = ?
     `).get(sessionId) || null;
