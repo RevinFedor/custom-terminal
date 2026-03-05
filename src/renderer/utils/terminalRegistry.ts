@@ -466,6 +466,16 @@ export const terminalRegistry = {
     return promptBoundaries.get(tabId)?.size ?? 0;
   },
 
+  // Get sorted line positions of all live prompt boundaries for a tab.
+  // Used by Timeline to map entries to buffer positions when entry markers don't exist.
+  getPromptBoundaryLines(tabId: string): number[] {
+    const tabBoundaries = promptBoundaries.get(tabId);
+    if (!tabBoundaries || tabBoundaries.size === 0) return [];
+    return [...tabBoundaries.entries()]
+      .sort((a, b) => a[0] - b[0])
+      .map(([_, m]) => m.line);
+  },
+
   // Get buffer row position from an entry's marker (Claude only).
   // Returns -1 if marker doesn't exist or has been disposed.
   getMarkerRow(tabId: string, uuid: string): number {
