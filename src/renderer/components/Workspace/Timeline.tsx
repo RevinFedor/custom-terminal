@@ -1558,7 +1558,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
                     <div
                       className="absolute pointer-events-none"
                       style={{
-                        right: '2px',
+                        right: '5px',
                         top: '50%',
                         transform: 'translateY(-50%)',
                         fontSize: '9px',
