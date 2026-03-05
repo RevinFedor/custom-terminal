@@ -803,7 +803,9 @@ export const terminalRegistry = {
         // Truncation fallback: Gemini TUI truncates long user messages in display.
         // If first line (up to 50 chars) is found but remaining lines are absent
         // from the buffer entirely, accept first-line-only match when it's long enough.
-        if (!allMatch && firstLine.length >= 15) {
+        // ONLY for single-line entries — multi-line entries (e.g. [Claude Sub-Agent Response])
+        // have unique L2/L3 lines, and accepting first-line-only would cause false positives.
+        if (!allMatch && firstLine.length >= 15 && contentLines.length <= 1) {
           allMatch = true;
         }
       }
@@ -937,8 +939,9 @@ export const terminalRegistry = {
         }
 
         // Truncation fallback: Gemini TUI truncates long user messages in display.
-        // Accept first-line-only match when it's long enough (>= 30 chars).
-        if (!allMatch && firstLine.length >= 15) {
+        // Accept first-line-only match when it's long enough (>= 15 chars).
+        // ONLY for single-line entries — multi-line entries have unique L2/L3 lines.
+        if (!allMatch && firstLine.length >= 15 && contentLines.length <= 1) {
           allMatch = true;
         }
       }

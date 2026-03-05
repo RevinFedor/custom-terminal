@@ -198,6 +198,74 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
     });
   };
 
+  // Wait for Gemini to settle after initial [INSERT].
+  // With `-y -r` (resume + yes mode), Gemini may auto-process prefilled content or
+  // stray input can trigger a THINKING phase. This function:
+  // 1. Waits a grace period (2s) to see if THINKING starts
+  // 2. If THINKING detected, waits for IDLE (response complete)
+  // 3. Then waits for the next [INSERT] (truly ready for input)
+  // 4. If no THINKING within grace period — Gemini is already settled
+  const waitForGeminiSettled = (tabId: string, timeoutMs: number = 120000): Promise<boolean> => {
+    return new Promise((resolve) => {
+      const startTime = Date.now();
+      let phase: 'grace' | 'wait-idle' | 'wait-insert' = 'grace';
+      let graceTimer: ReturnType<typeof setTimeout> | null = null;
+
+      const timeout = setTimeout(() => {
+        cleanup();
+        console.warn(`[UpdateDocs] waitForGeminiSettled TIMEOUT in phase=${phase} after ${timeoutMs}ms`);
+        resolve(false);
+      }, timeoutMs);
+
+      const busyHandler = (_event: any, { tabId: busyTabId, busy }: { tabId: string; busy: boolean }) => {
+        if (busyTabId !== tabId) return;
+
+        if (phase === 'grace' && busy) {
+          // THINKING started during grace period — need to wait for IDLE + [INSERT]
+          if (graceTimer) { clearTimeout(graceTimer); graceTimer = null; }
+          phase = 'wait-idle';
+          console.warn(`[UpdateDocs] Gemini entered THINKING during grace period (+${Date.now() - startTime}ms) — waiting for IDLE`);
+        } else if (phase === 'wait-idle' && !busy) {
+          // IDLE — now wait for [INSERT] to confirm ready state
+          phase = 'wait-insert';
+          console.warn(`[UpdateDocs] Gemini went IDLE (+${Date.now() - startTime}ms) — waiting for [INSERT]`);
+        }
+      };
+
+      let dataBuffer = '';
+      const dataHandler = (_event: any, { tabId: dataTabId, data }: { tabId: string; data: string }) => {
+        if (dataTabId !== tabId || phase !== 'wait-insert') return;
+
+        dataBuffer += data;
+        const clean = dataBuffer.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').replace(/\x1b\].*?\x07/g, '');
+        if (clean.includes('[INSERT]') || clean.includes('type your message')) {
+          console.warn(`[UpdateDocs] Gemini settled — [INSERT] detected after IDLE (+${Date.now() - startTime}ms)`);
+          cleanup();
+          resolve(true);
+        }
+      };
+
+      const cleanup = () => {
+        clearTimeout(timeout);
+        if (graceTimer) clearTimeout(graceTimer);
+        ipcRenderer.removeListener('gemini:busy-state', busyHandler);
+        ipcRenderer.removeListener('terminal:data', dataHandler);
+      };
+
+      ipcRenderer.on('gemini:busy-state', busyHandler);
+      ipcRenderer.on('terminal:data', dataHandler);
+
+      // Grace period: if no THINKING within 2s, Gemini is already settled
+      graceTimer = setTimeout(() => {
+        if (phase === 'grace') {
+          console.warn(`[UpdateDocs] No THINKING during grace period — Gemini already settled (+${Date.now() - startTime}ms)`);
+          cleanup();
+          resolve(true);
+        }
+      }, 2000);
+    });
+  };
+
   // ── Shared helpers for docs export pipeline ──
 
   /** Export session content from selected tabs (Claude or Gemini) */
@@ -573,15 +641,22 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
       // Session file already exists, so Gemini loads full context from JSON directly
       ipcRenderer.send('gemini:spawn-with-watcher', { tabId: newTabId, cwd: workingDir, resumeSessionId: prefilledResult.sessionId, yesMode: true });
 
+      console.warn('[UpdateDocs] Waiting for Gemini [INSERT]...');
       const geminiReady = await waitForGeminiReady(newTabId, 30000);
       if (cancelledRef.current) return;
       if (!geminiReady) throw new Error('Timeout waiting for Gemini to start');
+      console.warn('[UpdateDocs] Initial [INSERT] detected — entering settle phase');
 
-      // Gemini resumes with user message in context — send Enter to trigger response
+      // With -y -r, Gemini may auto-process prefilled content (or stray input can trigger THINKING).
+      // Wait for any THINKING→IDLE cycle to complete before sending our prompt.
+      const settled = await waitForGeminiSettled(newTabId, 120000);
+      if (cancelledRef.current) return;
+      if (!settled) throw new Error('Timeout waiting for Gemini to settle after first response');
+
       await new Promise(resolve => setTimeout(resolve, 500));
       if (cancelledRef.current) return;
 
-      console.warn('[UpdateDocs] Sending Enter to trigger Gemini response');
+      console.warn('[UpdateDocs] Sending prompt to trigger Gemini response');
       await ipcRenderer.invoke('terminal:paste', {
         tabId: newTabId,
         content: 'Ответь на промпт выше.',

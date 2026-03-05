@@ -3644,7 +3644,13 @@ ipcMain.on('terminal:input', async (event, tabId, data) => {
     const endsWithR = data.endsWith('\r');
     const endsWithN = data.endsWith('\n');
     const hasNewline = data.includes('\r') || data.includes('\n');
-    console.log(`[terminal:input] tabId=${tabId} len=${data.length} endsWithR=${endsWithR} endsWithN=${endsWithN} hasNewline=${hasNewline}`);
+    // Sanitize content for logging: show printable chars, hex for control codes
+    var inputPreview = '';
+    for (var ci = 0; ci < Math.min(data.length, 60); ci++) {
+      var cc = data.charCodeAt(ci);
+      inputPreview += cc < 32 || cc === 127 ? '\\x' + cc.toString(16).padStart(2, '0') : data[ci];
+    }
+    console.log(`[terminal:input] tabId=${tabId} len=${data.length} endsWithR=${endsWithR} endsWithN=${endsWithN} hasNewline=${hasNewline} content="${inputPreview}"${data.length > 60 ? '...' : ''}`);
   }
 
   // ========== GEMINI INPUT STATE TRACKING ==========
