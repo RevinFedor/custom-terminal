@@ -17,18 +17,22 @@ if [ -z "$PROMPT" ] || ! echo "$PROMPT" | grep -qE '\?\?\?|&&&'; then
   exit 0
 fi
 
-# Detect context mode: +full, +N, + (bare=1), or none
+# Detect context mode: +N-full, +full, +N, + (bare=1), or none
 CONTEXT_MODE=""
-if echo "$PROMPT" | grep -qE '(\?\?\?|&&&)\+full'; then
+CONTEXT_COUNT="1"
+if echo "$PROMPT" | grep -qE '(\?\?\?|&&&)\+([0-9]+-)?full'; then
   CONTEXT_MODE="full"
+  CTX_NUM=$(echo "$PROMPT" | grep -oE '(\?\?\?|&&&)\+[0-9]*-\?full' | head -1 | grep -oE '[0-9]+' | head -1)
+  if [ -n "$CTX_NUM" ]; then CONTEXT_COUNT="$CTX_NUM"; fi
 elif echo "$PROMPT" | grep -qE '(\?\?\?|&&&)\+[0-9]'; then
-  CONTEXT_MODE=$(echo "$PROMPT" | grep -oE '(\?\?\?|&&&)\+[0-9]+' | head -1 | grep -oE '[0-9]+')
+  CONTEXT_MODE="text"
+  CONTEXT_COUNT=$(echo "$PROMPT" | grep -oE '(\?\?\?|&&&)\+[0-9]+' | head -1 | grep -oE '[0-9]+')
 elif echo "$PROMPT" | grep -qE '(\?\?\?|&&&)\+'; then
-  CONTEXT_MODE="1"
+  CONTEXT_MODE="text"
 fi
 
 # Strip all trigger variants from prompt
-CLEAN_PROMPT=$(echo "$PROMPT" | sed -E 's/[[:space:]]*((\?\?\?|&&&)\+?(full|[0-9]+)?)[[:space:]]*/ /g' | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')
+CLEAN_PROMPT=$(echo "$PROMPT" | sed -E 's/[[:space:]]*((\?\?\?|&&&)\+?(([0-9]+-)?full|[0-9]+)?)[[:space:]]*/ /g' | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')
 
 PROJECT_DIR="${CLAUDE_PROJECT_DIR:-.}"
 INDEX_FILE="$PROJECT_DIR/.semantic-index.json"
@@ -39,27 +43,34 @@ if [ -n "$CONTEXT_MODE" ]; then
   JSONL_PATH=$(echo "$INPUT" | jq -r '.transcript_path // empty' 2>/dev/null)
   if [ -n "$JSONL_PATH" ] && [ -f "$JSONL_PATH" ]; then
     if [ "$CONTEXT_MODE" = "full" ]; then
-      # Full session context: thinking + edits + commands + text (skip file reads)
-      LAST_RESPONSE=$(tail -500 "$JSONL_PATH" | jq -r '
-        if .type == "user" and (.message.content | type) == "string" then
-          "Human: " + (.message.content | tostring | .[0:500])
-        elif .type == "assistant" and .message.content[0].type == "text" then
-          "Assistant: " + (.message.content[0].text | .[0:1000])
-        elif .type == "assistant" and .message.content[0].type == "thinking" then
-          "Thinking: " + (.message.content[0].thinking | .[0:300]) + "..."
-        elif .type == "assistant" and .message.content[0].type == "tool_use" then
-          (if .message.content[0].name == "Edit" then
-            "✏️ Edit: " + (.message.content[0].input.file_path // "?")
-          elif .message.content[0].name == "Write" then
-            "✏️ Write: " + (.message.content[0].input.file_path // "?")
-          elif .message.content[0].name == "Bash" then
-            "🖥 Cmd: " + ((.message.content[0].input.command // "?") | .[0:200])
-          else empty end)
-        else empty end
+      # Full detail: last N turns with thinking + edits + commands (skip file reads)
+      LAST_RESPONSE=$(tail -500 "$JSONL_PATH" | jq -rs --argjson n "$CONTEXT_COUNT" '
+        [to_entries[] | select(.value.type == "user" and .value.message and (.value.message.content | type) == "string") | .key] as $b
+        | ($b | length) as $bl
+        | (if $bl >= $n then $b[$bl - $n] else 0 end) as $start
+        | [.[$start:][] | select(.message) |
+          if .type == "user" and (.message.content | type) == "string" then
+            "Human: " + (.message.content | tostring | .[0:500])
+          elif .type == "assistant" and (.message.content | type) == "array" and (.message.content | length) > 0 then
+            (if .message.content[0].type == "text" then
+              "Assistant: " + (.message.content[0].text | .[0:1000])
+            elif .message.content[0].type == "thinking" then
+              "Thinking: " + (.message.content[0].thinking | .[0:300]) + "..."
+            elif .message.content[0].type == "tool_use" then
+              (if .message.content[0].name == "Edit" then
+                "✏️ Edit: " + (.message.content[0].input.file_path // "?")
+              elif .message.content[0].name == "Write" then
+                "✏️ Write: " + (.message.content[0].input.file_path // "?")
+              elif .message.content[0].name == "Bash" then
+                "🖥 Cmd: " + ((.message.content[0].input.command // "?") | .[0:200])
+              else empty end)
+            else empty end)
+          else empty end
+        ] | join("\n")
       ' 2>/dev/null | head -c 8000)
     else
-      # Numeric mode: last N assistant text blocks (chronological order)
-      COUNT="$CONTEXT_MODE"
+      # Text-only: last N assistant text blocks (chronological order)
+      COUNT="$CONTEXT_COUNT"
       LAST_RESPONSE=$(tail -500 "$JSONL_PATH" | tail -r | {
         found=0
         result=""
@@ -158,7 +169,8 @@ Respond ONLY with a valid JSON array of paths. No markdown, no explanations, no 
 Example: ["docs/knowledge/fact-terminal-core.md", "docs/knowledge/fix-zustand-silent-mutation.md", "docs/knowledge/fact-css-layout.md"]'
 
 if [ -n "$CONTEXT_MODE" ] && [ -n "$LAST_RESPONSE" ]; then
-  USER_MSG=$(printf 'User request: %s\n\nPrevious Claude context (mode: %s):\n%s\n\nAvailable index:\n%s' "$CLEAN_PROMPT" "$CONTEXT_MODE" "$LAST_RESPONSE" "$INDEX_COMPACT")
+  CTX_DESC="$CONTEXT_COUNT"; if [ "$CONTEXT_MODE" = "full" ]; then CTX_DESC="${CONTEXT_COUNT}-full"; fi
+  USER_MSG=$(printf 'User request: %s\n\nPrevious Claude context (%s):\n%s\n\nAvailable index:\n%s' "$CLEAN_PROMPT" "$CTX_DESC" "$LAST_RESPONSE" "$INDEX_COMPACT")
 else
   USER_MSG=$(printf 'User request: %s\n\nAvailable index:\n%s' "$CLEAN_PROMPT" "$INDEX_COMPACT")
 fi
@@ -194,7 +206,10 @@ fi
 # Log selected files
 FILE_NAMES=$(echo "$FILE_LIST" | xargs -I{} basename {} | tr '\n' ', ' | sed 's/,$//')
 
-CTX_LABEL=""; if [ -n "$CONTEXT_MODE" ]; then CTX_LABEL=" [+$CONTEXT_MODE]"; fi
+CTX_LABEL=""
+if [ "$CONTEXT_MODE" = "full" ]; then CTX_LABEL=" [+${CONTEXT_COUNT}-full]"
+elif [ -n "$CONTEXT_MODE" ]; then CTX_LABEL=" [+${CONTEXT_COUNT}]"
+fi
 echo "[$(date '+%H:%M:%S')]${CTX_LABEL} Selected: $FILE_NAMES" >> "$ROUTER_LOG"
 echo "[$(date '+%H:%M:%S')]${CTX_LABEL} Prompt: $(echo "$CLEAN_PROMPT" | head -c 80)..." >> "$ROUTER_LOG"
 

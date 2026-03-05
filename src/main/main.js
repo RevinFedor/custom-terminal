@@ -2057,14 +2057,17 @@ async function getClaudeHistory(sessionId, cwd, options = {}) {
 }
 
 // Format sub-agent response for Gemini paste
-function formatSubAgentResponse(result, meta, taskId, tabName) {
+function formatSubAgentResponse(result, meta, taskId, tabName, { userInitiated } = {}) {
+  const tag = userInitiated
+    ? '[Claude Sub-Agent Response — user-initiated after manual input]'
+    : '[Claude Sub-Agent Response]';
   const parts = [];
   if (tabName) parts.push('Tab: ' + tabName);
   if (taskId) parts.push('Task ID: ' + taskId);
   if (meta && meta.model && meta.model !== 'unknown') parts.push('Model: ' + meta.model);
   if (meta && meta.contextPct > 0) parts.push('Context: ' + meta.contextPct + '%');
   const footer = parts.length > 0 ? '\n---\n' + parts.join(' | ') : '';
-  return '[Claude Sub-Agent Response]\n' + result + footer + '\n[/Claude Sub-Agent Response]';
+  return tag + '\n' + result + footer + '\n[/Claude Sub-Agent Response]';
 }
 
 // Deliver result back to Gemini PTY via command queue.
@@ -2487,9 +2490,9 @@ async function handleReArmedDelivery(claudeTabId) {
   const meta = bridgeMetadata.get(claudeTabId) || null;
   const taskName = task ? task.tabName : null;
   const taskId = task ? task._taskId : null;
-  const formatted = formatSubAgentResponse(result, meta, taskId, taskName);
+  const formatted = formatSubAgentResponse(result, meta, taskId, taskName, { userInitiated: true });
 
-  console.log('[MCP:ReArm] Delivering re-armed response (' + formatted.length + ' chars) to Gemini tab ' + geminiTabId);
+  console.log('[MCP:ReArm] Delivering user-initiated response (' + formatted.length + ' chars) to Gemini tab ' + geminiTabId);
   deliverResultToGemini(geminiTabId, formatted, taskId, taskName);
 
   // Reset interceptor to disarmed after delivery
@@ -2570,9 +2573,9 @@ ipcMain.handle('mcp:deliver-last-response', async (event, claudeTabId) => {
   const meta = bridgeMetadata.get(claudeTabId) || null;
   const taskName = task ? task.tabName : null;
   const taskId = task ? task._taskId : null;
-  const formatted = formatSubAgentResponse(result, meta, taskId, taskName);
+  const formatted = formatSubAgentResponse(result, meta, taskId, taskName, { userInitiated: true });
 
-  console.log('[MCP:ManualDeliver] Delivering ' + formatted.length + ' chars to Gemini tab ' + geminiTabId);
+  console.log('[MCP:ManualDeliver] Delivering user-initiated ' + formatted.length + ' chars to Gemini tab ' + geminiTabId);
   deliverResultToGemini(geminiTabId, formatted, taskId, taskName);
 
   // Reset interceptor to disarmed after manual delivery
