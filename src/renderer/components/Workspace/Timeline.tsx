@@ -553,25 +553,33 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
           searchData.forEach((sd, i) => { pos[sd.entryIndex] = rows[i]; });
         }
       } else {
-        // Claude: read marker positions (O(1) per entry)
+        // Claude: map entries to prompt boundary positions.
+        // PTY middleware injects OSC 7777 prompt:<seq> at each BUSY→IDLE transition.
+        // Entry 0 was typed at the initial prompt (pos 0).
+        // Entry N was typed at the prompt shown after Entry N-1's response = boundary N-1.
+        // For forked sessions: only the most recent entries have boundaries in this terminal.
+        // We map from the END so that the newest entries match the newest boundaries.
+        const boundaryLines = terminalRegistry.getPromptBoundaryLines(tabId);
+
+        // Collect indices of "real" entries (non-compact, non-continued) after lastBoundaryIdx
+        const realIndices: number[] = [];
         entries.forEach((entry, index) => {
           if (index <= lastBoundaryIdx) return;
           if (entry.type === 'compact' || entry.type === 'continued') return;
-          const row = terminalRegistry.getMarkerRow(tabId, entry.uuid);
-          if (row >= 0) pos[index] = row;
+          realIndices.push(index);
         });
-        // First entry after boundary usually has no marker (typed at initial prompt).
-        // Treat it as position 0 so its range covers the start of the buffer.
-        // But ONLY if other entries have markers (= Claude content is in the buffer).
-        // Without this guard, an empty terminal (Claude not running) would make
-        // the first entry falsely reachable at pos=0.
-        const firstRealIdx = entries.findIndex((e, i) =>
-          i > lastBoundaryIdx && e.type !== 'compact' && e.type !== 'continued'
-        );
-        if (firstRealIdx >= 0 && pos[firstRealIdx] < 0) {
-          const hasOtherMarkers = pos.some((p, i) => i > firstRealIdx && p >= 0);
-          if (hasOtherMarkers) {
-            pos[firstRealIdx] = 0;
+
+        if (boundaryLines.length > 0 && realIndices.length > 0) {
+          // K prompt boundaries → last K+1 real entries get positions
+          const positionable = boundaryLines.length + 1;
+          const startFrom = Math.max(0, realIndices.length - positionable);
+
+          // First positionable entry → position 0 (typed at initial prompt)
+          pos[realIndices[startFrom]] = 0;
+
+          // Subsequent entries → prompt boundary lines in order
+          for (let i = 1; i < positionable && (startFrom + i) < realIndices.length; i++) {
+            pos[realIndices[startFrom + i]] = boundaryLines[i - 1];
           }
         }
       }
@@ -651,7 +659,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
           }
         });
       } else {
-        // Claude: marker-based reachability (markers auto-dispose when scrollback trimmed)
+        // Claude: position-based reachability (prompt boundaries dispose when scrollback trimmed)
         entries.forEach((entry, index) => {
           if (entry.type === 'compact' || entry.type === 'continued' || entry.isPlan) return;
           if (index <= lastBoundaryIdx) {
@@ -836,30 +844,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
     // Instant visual feedback — loader appears immediately
     setClickedState({ index, status: 'loading' });
 
-    // ALWAYS DIAGNOSE CLICK (Temporary Debug)
-    // if (unreachableIndices.has(index)) {
-         console.warn(`[Timeline] Clicking entry #${index}. Diagnosing...`);
-         const fullText = terminalRegistry.getFullBufferText(tabId);
-         if (isGemini) {
-           const lines = getSearchLines(entry.content);
-           if (fullText && lines.length > 0) {
-             const found = matchesInGeminiBuffer(fullText, lines);
-             if (found) console.log(`[Timeline] Diagnosis: Entry IS reachable (found=${found}). Red status might be stale.`);
-             else console.log(`[Timeline] Diagnosis: Entry UNREACHABLE (found=${found}).`);
-           } else {
-             console.log(`[Timeline] Diagnosis failed: fullText=${!!fullText}, lines=${lines.length}`);
-           }
-         } else {
-           const key = getEntryKey(entry);
-           if (fullText && key) {
-               const found = matchesAtUserPrompt(fullText, key, true); // Force debug logs
-               if (found) console.log(`[Timeline] Diagnosis: Entry IS reachable (found=${found}). Red status might be stale.`);
-               else console.log(`[Timeline] Diagnosis: Entry UNREACHABLE (found=${found}).`);
-           } else {
-               console.log(`[Timeline] Diagnosis failed: fullText=${!!fullText}, key=${!!key}`);
-           }
-         }
-    // }
+    // Diagnose click (debug)
+    console.warn(`[Timeline] Clicking entry #${index}. isUnreachable=${unreachableIndices.has(index)}`);
 
     clickTimerRef.current = setTimeout(() => {
       clickTimerRef.current = null;
@@ -1287,7 +1273,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
         data-timeline
         className="relative flex flex-col group"
         style={{
-          width: '24px',
+          width: '32px',
           backgroundColor: 'rgba(0, 0, 0, 0.2)',
           backdropFilter: 'blur(4px)',
           borderLeft: '1px solid rgba(255, 255, 255, 0.05)',
@@ -1307,25 +1293,23 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
         {/* Segmented Hit-boxes — in tree mode, expands LEFT as absolute overlay */}
         <div
           ref={scrollRef}
-          className="h-full scrollbar-hide"
+          className="scrollbar-hide"
           style={{
+            position: 'absolute' as const,
+            top: 0,
+            bottom: 0,
+            right: 0,
+            width: treeMode ? '160px' : '100%',
             opacity: isVisible ? 1 : 0,
             overflowY: 'auto',
             display: 'flex',
             flexDirection: 'column',
             ...(treeMode ? {
-              position: 'absolute' as const,
-              top: 0,
-              bottom: 0,
-              right: 0,
-              width: '160px',
               backgroundColor: 'rgba(0, 0, 0, 0.88)',
               backdropFilter: 'blur(8px)',
               borderLeft: '1px solid rgba(129, 140, 248, 0.15)',
               zIndex: 50,
-            } : {
-              width: '100%',
-            }),
+            } : {}),
           }}
         >
           {/* Tree mode: left axis line */}
@@ -1425,44 +1409,44 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
             let dotColor: string;
             let dotGlow: string;
 
-            if (isCompacted) {
-              dotColor = isInViewport ? '#fbbf24' : '#f59e0b';
-              dotGlow = isHovered ? '0 0 8px rgba(245, 158, 11, 0.4)' : (isInViewport ? '0 0 6px rgba(245, 158, 11, 0.25)' : 'none');
-            } else if (isContinued) {
-              dotColor = '#f59e0b';
-              dotGlow = isHovered ? '0 0 8px rgba(245, 158, 11, 0.4)' : 'none';
-            } else if (isPlan) {
-              dotColor = isHovered ? '#5eada3' : '#48968c';
-              dotGlow = isHovered ? '0 0 8px rgba(72, 150, 140, 0.4)' : 'none';
-            } else if (active) {
-              dotColor = '#3b82f6';
+            if (isUnreachable && !isHovered) {
+              // Unreachable entries: muted red/gray, overrides everything
+              dotColor = '#6b3333';
               dotGlow = 'none';
-            } else if (isHovered) {
-              if (entryIsTimeout) { dotColor = '#ef4444'; dotGlow = '0 0 8px rgba(239, 68, 68, 0.4)'; }
-              else if (entryIsSubAgent) { dotColor = '#818cf8'; dotGlow = '0 0 8px rgba(129, 140, 248, 0.4)'; }
-              else { dotColor = 'white'; dotGlow = '0 0 8px rgba(255,255,255,0.4)'; }
+            } else if (isCompacted) {
+              dotColor = isHovered ? '#fbbf24' : '#a67c1a';
+              dotGlow = isHovered ? '0 0 10px rgba(251, 191, 36, 0.5)' : 'none';
+            } else if (isContinued) {
+              dotColor = isHovered ? '#f59e0b' : '#a67c1a';
+              dotGlow = isHovered ? '0 0 10px rgba(245, 158, 11, 0.5)' : 'none';
+            } else if (isPlan) {
+              dotColor = isHovered ? '#5eada3' : '#3d7a72';
+              dotGlow = isHovered ? '0 0 10px rgba(94, 173, 163, 0.5)' : 'none';
+            } else if (active) {
+              dotColor = '#60a5fa';
+              dotGlow = '0 0 6px rgba(96, 165, 250, 0.3)';
             } else if (entryIsTimeout) {
-              dotColor = isInViewport ? 'rgba(239, 68, 68, 0.7)' : 'rgba(239, 68, 68, 0.35)';
-              dotGlow = isInViewport ? '0 0 6px rgba(239, 68, 68, 0.25)' : 'none';
+              dotColor = isHovered ? '#ef4444' : (isResponseOnly ? '#7a3333' : '#b33');
+              dotGlow = isHovered ? '0 0 10px rgba(239, 68, 68, 0.5)' : 'none';
             } else if (entryIsSubAgent) {
-              dotColor = isInViewport ? (isResponseOnly ? 'rgba(129, 140, 248, 0.35)' : 'rgba(129, 140, 248, 0.8)') : 'rgba(129, 140, 248, 0.3)';
-              dotGlow = isInViewport ? (isResponseOnly ? 'none' : '0 0 6px rgba(129, 140, 248, 0.25)') : 'none';
+              dotColor = isHovered ? '#818cf8' : (isResponseOnly ? '#4a4d80' : '#5c63b8');
+              dotGlow = isHovered ? '0 0 10px rgba(129, 140, 248, 0.5)' : 'none';
             } else {
-              dotColor = isInViewport ? (isResponseOnly ? 'rgba(255,255,255,0.35)' : 'rgba(255,255,255,0.75)') : 'rgba(255,255,255,0.3)';
-              dotGlow = isInViewport ? (isResponseOnly ? 'none' : '0 0 6px rgba(255,255,255,0.25)') : 'none';
+              dotColor = isHovered ? '#fff' : (isResponseOnly ? '#666' : '#999');
+              dotGlow = isHovered ? '0 0 10px rgba(255, 255, 255, 0.5)' : 'none';
             }
 
             // ── Dot size ──
             const dotWidth = isCompacted
-              ? (isInViewport ? '10px' : '12px')
+              ? (isInViewport ? '12px' : '14px')
               : showAsChild
-                ? (isHovered ? '6px' : (isInViewport ? '8px' : '3px'))
-                : (isHovered ? '8px' : (isInViewport ? '10px' : '4px'));
+                ? (isHovered ? '8px' : (isInViewport ? '8px' : '4px'))
+                : (isHovered ? '10px' : (isInViewport ? '10px' : '5px'));
             const dotHeight = isCompacted
-              ? (isInViewport ? '3px' : '2px')
+              ? (isInViewport ? '4px' : '3px')
               : showAsChild
-                ? (isHovered ? '6px' : (isInViewport ? '2px' : '3px'))
-                : (isHovered ? '8px' : (isInViewport ? '3px' : '4px'));
+                ? (isHovered ? '8px' : (isInViewport ? '3px' : '4px'))
+                : (isHovered ? '10px' : (isInViewport ? '3px' : '5px'));
             const dotRadius = (isCompacted || (isInViewport && !isHovered)) ? '1px' : '50%';
 
             // Expanded group header: render toggle bar THEN the entry as child
@@ -1476,7 +1460,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
                     className="relative w-full flex items-center justify-center"
                     style={{
                       flex: '0 0 auto',
-                      minHeight: '10px',
+                      height: '6px',
                       cursor: 'pointer',
                     }}
                     onClick={(e) => {
@@ -1488,12 +1472,10 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
                       });
                     }}
                   >
-                    {/* Collapse indicator: small horizontal line */}
                     <div style={{
-                      width: '8px',
-                      height: '2px',
-                      borderRadius: '1px',
-                      backgroundColor: 'rgba(129, 140, 248, 0.5)',
+                      width: '10px',
+                      height: '1px',
+                      backgroundColor: 'rgba(129, 140, 248, 0.4)',
                     }} />
                     {treeMode && (
                       <span className="ml-1 truncate pointer-events-none select-none" style={{
@@ -1508,7 +1490,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
                 <div
                   ref={el => segmentRefs.current[index] = el}
                   data-segment
-                  className="relative w-full flex items-center transition-colors"
+                  className="relative w-full flex items-center"
                   onMouseEnter={() => handleMouseEnterSegment(index)}
                   onMouseLeave={(e) => handleMouseLeaveSegment(e)}
                   onClick={(e) => {
@@ -1528,14 +1510,14 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
                   onContextMenu={(e) => handleRightClick(e, entry)}
                   style={{
                     flex: '0 0 auto',
-                    minHeight: treeMode ? '18px' : (showAsChild ? '5px' : '12px'),
+                    minHeight: treeMode ? '22px' : (showAsChild ? '14px' : '20px'),
                     justifyContent: treeMode ? 'flex-start' : 'center',
                     paddingLeft: treeMode
                       ? (showAsChild ? '20px' : entryIsSubAgent ? '10px' : '4px')
                       : (showAsChild ? '4px' : undefined),
                     backgroundColor: active
                       ? 'rgba(59, 130, 246, 0.15)'
-                      : (isUnreachable ? 'rgba(239, 68, 68, 0.06)' : 'transparent'),
+                      : (isUnreachable ? 'rgba(239, 68, 68, 0.12)' : 'transparent'),
                     cursor: isContinued ? 'default' : 'pointer',
                   }}
                 >
@@ -1748,7 +1730,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
               onMouseLeave={handleMouseLeaveTooltipArea}
               style={{
                 position: 'fixed',
-                right: `${notesPanelWidth + (treeMode ? 160 : 24) - 8}px`,
+                right: `${notesPanelWidth + (treeMode ? 160 : 32) - 8}px`,
                 top: `${tooltipPos.wTop}px`,
                 height: `${tooltipPos.wH}px`,
                 zIndex: 10000,
