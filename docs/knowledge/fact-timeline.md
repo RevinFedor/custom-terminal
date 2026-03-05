@@ -28,11 +28,11 @@
 - **Auto-Refresh:** Timeline обновляется автоматически каждые **2 секунды**, чтобы отражать актуальное состояние сессии. Обновление загружает только данные из JSONL/JSON — поиск по буферу терминала для обновления самих точек не выполняется.
     - **Performance Guard (`isVisible`):** Поллинг данных и запросы к SQLite выполняются только тогда, когда Timeline реально виден пользователю. Это предотвращает лишнюю нагрузку на диск и БД.
 
-### Sizing & Scrolling (Compact Mode)
-В отличие от ранних версий, где Timeline пытался уместить все точки в доступную высоту экрана, текущая реализация использует **принудительный скролл**.
-- **Проблема:** В длинных сессиях (50+ сообщений) точки «схлопывались» до высоты 4px, превращаясь в нечитаемую серую линию.
-- **Решение:** Внедрена минимальная высота шага (20px для обычных сообщений, 8px для дочерних агентов). 
-- **Эффект:** Если количество сообщений превышает вместимость экрана, Timeline начинает скроллиться. Это сохраняет кликабельность и визуальную разницу между типами сообщений независимо от длины диалога.
+### Sizing & Scrolling
+Entries используют `flex: '1 0 auto'` с минимальной высотой (20px обычные, 14px дочерние агенты, 22px tree mode).
+- **Мало entries:** Растягиваются равномерно на всю высоту контейнера (flex-grow: 1).
+- **Много entries:** minHeight сохраняется, контейнер начинает скроллиться.
+- **Разделители** (fork/plan markers): `flex-shrink: 0`, фиксированная высота 8px — не растягиваются.
 
 ### Layout Constraints (The Flex-Height Trap)
 Для корректной работы скролла внутри сложной flex-сетки воркспейса используется специальный CSS-хак.
@@ -84,6 +84,15 @@
 - Предварительного кеширования позиций (marker binding) нет — поиск выполняется по требованию при клике.
 - Используется таймер 250ms для различения одинарного и двойного клика.
 - **Search Robustness (Viewport Matching):** Для поиска используется только первые **50 символов** сообщения (вместо 80). Это гарантирует, что ключ поиска не пересечет границу переноса строки (line wrap), который в Ink TUI часто случается раньше из-за отступов. Из поискового запроса удаляются специальные символы.
+
+### Fork & Plan Mode Markers (визуальные разделители)
+Тонкие (8px) полоски между entries, обозначающие границы сессий.
+- **Fork marker** (синий `#3b82f6`): Появляется после entry, которая является последней в snapshot'е форка. Означает: «здесь сессия была разветвлена».
+- **Plan mode marker** (бирюзовый `#48968c`): Появляется между entries с разными `sessionId`. Означает: «здесь был Clear Context / Plan Mode».
+- **Взаимоисключающие:** Если entry имеет fork marker, plan mode boundary не рендерится (и наоборот).
+- **Beginning markers:** Если fork/plan произошёл до первой entry (пустой snapshot), маркер рендерится в самом верху Timeline.
+- **Viewport Dash:** Маркеры реагируют на viewport — при пересечении вьюпорта с диапазоном entry, dash становится шире (10px vs 12px).
+- **Без красного фона:** Маркеры-разделители не имеют собственного unreachable-фона — красный показывается только на segment-div'ах entries выше и ниже.
 
 ### Smart Tooltip
 - При наведении на точку появляется превью сообщения с кнопкой "Expand" и "Copy".
@@ -184,7 +193,12 @@
 ## Code Map
 - `Timeline.tsx`: UI компонент (полоса, точки, портал для тултипов, range copy, sub-agent groups, tree view, scroll-down arrow).
 - `Timeline.tsx` → `computePositions()`: Claude: OSC 7777 prompt boundaries → text fallback (`buildPositionIndex`). Gemini: text search.
-- `Timeline.tsx` → `checkReachability()`: position < 0 → unreachable (red). Guard: `hasAnyPosition`.
+- `Timeline.tsx` → `checkReachability()`: Двухпроходная система:
+  1. **Regular entries** (`user`): unreachable если `index <= lastBoundaryIdx` ИЛИ `position < 0` (при `hasAnyPosition`).
+  2. **Special entries** (`compact`, `continued`, `plan`): наследуют unreachable от следующей regular entry.
+  - **`lastBoundaryIdx`**: Индекс последнего `compact`/`plan` entry. Compact и Plan Mode **стирают терминал** Claude — все entries до них гарантированно unreachable.
+  - **Guard:** `hasAnyPosition` — если ни одна entry не имеет позиции, ничего не помечается красным (предотвращает полностью красный Timeline при пустом буфере).
+  - **Fork/Plan marker strips** (8px разделители между entries): НЕ имеют собственного красного фона — unreachable индикация только на segment-div'ах entries.
 - `gemini-data.js` (`gemini:get-timeline`): Парсинг Gemini JSON + `parseSubAgentMeta()` для извлечения метаданных агентов.
 - `ipc/claude-data.js` (`claude:get-timeline`): Парсинг и фильтрация JSONL. Детекция типа `continued`.
 - `main.js` (~line 3190): OSC 7777 boundary injection state machine. Gate: `claudeSpinnerBusy.has(tabId)`.

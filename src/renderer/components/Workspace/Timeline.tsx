@@ -1428,7 +1428,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
             !forkMarkers.some(m => !m.entry_uuids || m.entry_uuids.length === 0) && (
             <div
               className="flex-shrink-0 w-full flex items-center justify-center"
-              style={{ height: '8px', backgroundColor: unreachableIndices.has(0) ? 'rgba(239, 68, 68, 0.06)' : 'transparent' }}
+              style={{ height: '8px' }}
               title="Plan mode - context was cleared here"
             >
               <div
@@ -1447,7 +1447,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
           {forkMarkers.some(m => !m.entry_uuids || m.entry_uuids.length === 0) && entries.length > 0 && (
             <div
               className="flex-shrink-0 w-full flex items-center justify-center"
-              style={{ height: '8px', backgroundColor: unreachableIndices.has(0) ? 'rgba(239, 68, 68, 0.06)' : 'transparent' }}
+              style={{ height: '8px' }}
               title="Fork point - this session was forked from here"
             >
               <div
@@ -1515,6 +1515,10 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
             let dotColor: string;
             let dotGlow: string;
 
+            // isInViewport && !isResponseOnly = prompt visible in viewport (bright)
+            // isResponseOnly = response visible but prompt above viewport (same as normal)
+            const isPromptVisible = isInViewport && !isResponseOnly;
+
             if (isUnreachable && !isHovered) {
               // Unreachable entries: muted red/gray, overrides everything
               dotColor = '#6b3333';
@@ -1532,14 +1536,14 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
               dotColor = '#60a5fa';
               dotGlow = '0 0 6px rgba(96, 165, 250, 0.3)';
             } else if (entryIsTimeout) {
-              dotColor = isHovered ? '#ef4444' : (isResponseOnly ? '#7a3333' : '#b33');
-              dotGlow = isHovered ? '0 0 10px rgba(239, 68, 68, 0.5)' : 'none';
+              dotColor = isHovered ? '#ef4444' : (isPromptVisible ? '#e84040' : '#b33');
+              dotGlow = isHovered ? '0 0 10px rgba(239, 68, 68, 0.5)' : (isPromptVisible ? '0 0 6px rgba(239, 68, 68, 0.2)' : 'none');
             } else if (entryIsSubAgent) {
-              dotColor = isHovered ? '#818cf8' : (isResponseOnly ? '#4a4d80' : '#5c63b8');
-              dotGlow = isHovered ? '0 0 10px rgba(129, 140, 248, 0.5)' : 'none';
+              dotColor = isHovered ? '#818cf8' : (isPromptVisible ? '#7c86f0' : '#5c63b8');
+              dotGlow = isHovered ? '0 0 10px rgba(129, 140, 248, 0.5)' : (isPromptVisible ? '0 0 6px rgba(129, 140, 248, 0.2)' : 'none');
             } else {
-              dotColor = isHovered ? '#fff' : (isResponseOnly ? '#666' : '#999');
-              dotGlow = isHovered ? '0 0 10px rgba(255, 255, 255, 0.5)' : 'none';
+              dotColor = isHovered ? '#fff' : (isPromptVisible ? '#ccc' : '#999');
+              dotGlow = isHovered ? '0 0 10px rgba(255, 255, 255, 0.5)' : (isPromptVisible ? '0 0 6px rgba(255, 255, 255, 0.15)' : 'none');
             }
 
             // ── Dot size ──
@@ -1651,7 +1655,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
                   onDoubleClick={() => handleEntryDoubleClick(entry)}
                   onContextMenu={(e) => handleRightClick(e, entry)}
                   style={{
-                    flex: '0 0 auto',
+                    flex: '1 0 auto',
                     minHeight: treeMode ? '22px' : (showAsChild ? '14px' : '20px'),
                     justifyContent: treeMode ? 'flex-start' : 'center',
                     paddingLeft: treeMode
@@ -1759,7 +1763,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
                 {forkMarker && (
                   <div
                     className="flex-shrink-0 w-full flex items-center justify-center"
-                    style={{ height: '8px', backgroundColor: isUnreachable ? 'rgba(239, 68, 68, 0.06)' : 'transparent' }}
+                    style={{ height: '8px' }}
                     title="Fork point - this session was forked from here"
                   >
                     <div
@@ -1778,7 +1782,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
                 {isPlanModeBoundary && (
                   <div
                     className="flex-shrink-0 w-full flex items-center justify-center"
-                    style={{ height: '8px', backgroundColor: isUnreachable ? 'rgba(239, 68, 68, 0.06)' : 'transparent' }}
+                    style={{ height: '8px' }}
                     title="Plan mode - context was cleared here"
                   >
                     <div
