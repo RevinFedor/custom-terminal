@@ -466,6 +466,16 @@ export const terminalRegistry = {
     return promptBoundaries.get(tabId)?.size ?? 0;
   },
 
+  // Get buffer row position from an entry's marker (Claude only).
+  // Returns -1 if marker doesn't exist or has been disposed.
+  getMarkerRow(tabId: string, uuid: string): number {
+    const tabMarkers = entryMarkers.get(tabId);
+    if (!tabMarkers) return -1;
+    const tracked = tabMarkers.get(uuid);
+    if (!tracked?.marker || tracked.marker.isDisposed) return -1;
+    return tracked.marker.line;
+  },
+
   // Get visible text in the current terminal viewport (for Timeline visibility check)
   getVisibleText(tabId: string): string {
     const terminal = terminals.get(tabId);
@@ -500,6 +510,150 @@ export const terminalRegistry = {
       parts.push(line.translateToString(!nextLine?.isWrapped));
     }
     return parts.join('');
+  },
+
+  // Build position index for multiple entries in a single buffer pass (Gemini).
+  // Entries must be in chronological order. Uses anchored search: each entry
+  // is found after the previous one's position, avoiding false duplicates.
+  // Returns array of buffer rows (-1 if not found).
+  buildPositionIndex(tabId: string, searchEntries: { searchLines: string[] }[]): number[] {
+    const terminal = terminals.get(tabId);
+    if (!terminal) return searchEntries.map(() => -1);
+
+    const buf = terminal.buffer.active;
+
+    // Build logical lines once (handles Ink TUI wrapping)
+    const logicalLines: { text: string; bufRow: number }[] = [];
+    let currentText = '';
+    let currentStartRow = 0;
+    for (let i = 0; i < buf.length; i++) {
+      const line = buf.getLine(i);
+      if (!line) continue;
+      if (i > 0 && !line.isWrapped) {
+        logicalLines.push({ text: currentText, bufRow: currentStartRow });
+        currentText = '';
+        currentStartRow = i;
+      }
+      const nextLine = (i + 1 < buf.length) ? buf.getLine(i + 1) : null;
+      currentText += line.translateToString(!nextLine?.isWrapped);
+    }
+    if (currentText) logicalLines.push({ text: currentText, bufRow: currentStartRow });
+    if (logicalLines.length === 0) return searchEntries.map(() => -1);
+
+    // Line matcher (same logic as scrollToTextInBuffer/findTextBufferRow)
+    const nonAlphaRe = /[a-zA-Z0-9\u0400-\u04FF\u0600-\u06FF\u4E00-\u9FFF\u3040-\u309F\u30A0-\u30FF]/;
+    const matchLine = (haystack: string, needle: string, strict: boolean, isolated: boolean): boolean => {
+      if (strict) {
+        const trimmed = haystack.trim();
+        if (trimmed === needle) return true;
+        if (trimmed.length > needle.length + 4) return false;
+        const pos = trimmed.indexOf(needle);
+        if (pos < 0) return false;
+        if (pos === 0) return true;
+        return !nonAlphaRe.test(trimmed.slice(0, pos));
+      }
+      if (isolated) {
+        const trimmed = haystack.trim();
+        if (trimmed.length > needle.length + 25) return false;
+        const pos = trimmed.indexOf(needle);
+        if (pos < 0) return false;
+        if (pos === 0) return true;
+        return !nonAlphaRe.test(trimmed.slice(0, pos));
+      }
+      if (needle.length >= 5) return haystack.includes(needle);
+      let from = 0;
+      while (true) {
+        const pos = haystack.indexOf(needle, from);
+        if (pos === -1) return false;
+        const before = pos > 0 ? haystack[pos - 1] : ' ';
+        const after = pos + needle.length < haystack.length ? haystack[pos + needle.length] : ' ';
+        const boundaryRe = /[\s\.,;:!?\-—–()\[\]{}<>\/\\|"'`~@#$%^&*+=]/;
+        if ((pos === 0 || boundaryRe.test(before)) && (pos + needle.length === haystack.length || boundaryRe.test(after))) {
+          return true;
+        }
+        from = pos + 1;
+      }
+    };
+
+    const results: number[] = [];
+    let searchFromIdx = 0;
+
+    for (const { searchLines } of searchEntries) {
+      if (searchLines.length === 0) { results.push(-1); continue; }
+
+      const firstLine = searchLines[0];
+      const isStrict = searchLines.length === 1 && firstLine.length < 5;
+      const isIsolated = searchLines.length === 1 && firstLine.length < 30;
+
+      let found = -1;
+      for (let i = searchFromIdx; i < logicalLines.length; i++) {
+        if (!matchLine(logicalLines[i].text, firstLine, isStrict, isIsolated)) continue;
+
+        let allMatch = true;
+        if (searchLines.length > 1) {
+          let bufIdx = i + 1;
+          for (let j = 1; j < searchLines.length; j++) {
+            let lineFound = false;
+            for (let gap = 0; gap < 5 && bufIdx < logicalLines.length; gap++, bufIdx++) {
+              if (matchLine(logicalLines[bufIdx].text, searchLines[j], false, false)) {
+                lineFound = true; bufIdx++; break;
+              }
+            }
+            if (!lineFound) { allMatch = false; break; }
+          }
+          if (!allMatch) {
+            allMatch = searchLines.slice(1).every(cl => logicalLines[i].text.includes(cl));
+          }
+          // Truncation fallback: only for single-line entries.
+          // Multi-line entries (e.g. "[Claude Sub-Agent Response]\nUnique text...")
+          // MUST match on line 2+ to disambiguate identical first lines.
+          if (!allMatch && firstLine.length >= 15 && searchLines.length <= 1) allMatch = true;
+        }
+
+        if (allMatch) {
+          found = logicalLines[i].bufRow;
+          searchFromIdx = i + 1;
+          break;
+        }
+      }
+
+      // Fallback: if anchored search failed, retry from beginning.
+      // Anchoring can miss entries when a false positive in an AI response
+      // advances searchFromIdx past the actual user message position.
+      if (found < 0 && searchFromIdx > 0) {
+        for (let i = 0; i < searchFromIdx; i++) {
+          if (!matchLine(logicalLines[i].text, firstLine, isStrict, isIsolated)) continue;
+
+          let allMatch = true;
+          if (searchLines.length > 1) {
+            let bufIdx = i + 1;
+            for (let j = 1; j < searchLines.length; j++) {
+              let lineFound = false;
+              for (let gap = 0; gap < 5 && bufIdx < logicalLines.length; gap++, bufIdx++) {
+                if (matchLine(logicalLines[bufIdx].text, searchLines[j], false, false)) {
+                  lineFound = true; bufIdx++; break;
+                }
+              }
+              if (!lineFound) { allMatch = false; break; }
+            }
+            if (!allMatch) {
+              allMatch = searchLines.slice(1).every(cl => logicalLines[i].text.includes(cl));
+            }
+            if (!allMatch && firstLine.length >= 15 && searchLines.length <= 1) allMatch = true;
+          }
+
+          if (allMatch) {
+            found = logicalLines[i].bufRow;
+            // Don't advance searchFromIdx — preserve ordering for subsequent entries
+            break;
+          }
+        }
+      }
+
+      results.push(found);
+    }
+
+    return results;
   },
 
   // Buffer-text based search + scroll. Used for Gemini where xterm search addon

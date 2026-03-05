@@ -347,58 +347,6 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
     }
   }, [entries, tabId, isGemini]);
 
-  // Extract first line of content, max 80 chars — the only part that reliably
-  // matches 1:1 in the terminal buffer
-  const getEntryKey = useCallback((entry: TimelineEntry): string | null => {
-    if (entry.type === 'compact') return null;
-    return getSearchText(entry.content) || null;
-  }, []);
-
-  // Check if key exists at a user prompt position in buffer text.
-  // For Claude only — Gemini uses matchesInGeminiBuffer() with line-level matching.
-  const matchesAtUserPrompt = useCallback((bufferText: string, key: string, debug = false): boolean => {
-    // Gemini: delegate to line-level matcher (this path shouldn't be hit for
-    // visibility/reachability, but kept as safety fallback for diagnosis etc.)
-    if (isGemini) {
-      return matchesInGeminiBuffer(bufferText, [key]);
-    }
-
-    let searchFrom = 0;
-    while (true) {
-      const pos = bufferText.indexOf(key, searchFrom);
-      if (pos === -1) {
-        return false;
-      }
-
-      // Find start of the line containing this match
-      const lineStart = bufferText.lastIndexOf('\n', pos - 1) + 1;
-
-      // Check first few chars of the line for prompt markers OR valid indent
-      // Increased to 50 chars to handle very long indents
-      const lineHead = bufferText.slice(lineStart, Math.min(lineStart + 50, pos));
-
-      // 1. Strict prompt check (standard case)
-      // Only ❯ (U+276F) and ⏵ (U+23F5) — NOT '>' which matches markdown blockquotes
-      // in Claude responses, causing false positives in reachability checks
-      const hasPrompt = lineHead.includes('\u276F') || lineHead.includes('\u23F5');
-
-      // 2. Relaxed check for pasted text/code/lists (indentation or bullets)
-      // If the prefix is just whitespace, stars, dashes, or dots, assume it's a valid user entry
-      // that was pasted or formatted without a visible prompt on the same line.
-      const isValidIndent = /^[\s*·\-\.]*$/.test(lineHead);
-
-      if (hasPrompt || isValidIndent) return true;
-
-      if (debug) {
-          // Keep debug log only if explicitly requested by checkReachability diagnosis
-          console.log(`[Timeline:Reachability] Key found at ${pos} but invalid prefix: "${lineHead.replace(/\n/g, '\\n')}"`);
-      }
-
-      // Try next occurrence
-      searchFrom = pos + 1;
-    }
-  }, [isGemini]);
-
   // Viewport visibility + buffer reachability tracking
   useEffect(() => {
     if (!isVisible || entries.length === 0) {
@@ -434,36 +382,81 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
       }
     }
 
-    // Viewport visibility — which entries are currently on screen
+    // === Range-based visibility ===
+    // Instead of searching for prompt TEXT in the viewport, we resolve each entry's
+    // buffer row position (from OSC markers for Claude, text search for Gemini).
+    // Each entry "owns" a range from its position to the next entry's position.
+    // Visibility = viewport overlaps with the entry's range.
+    // This eliminates false positives from duplicate text (e.g. "> [Claude Sub-Agent Response]")
+    // and ensures the timeline always shows activity even when scrolling through AI responses.
+
+    // Resolve entry → buffer row positions
+    const computePositions = (): number[] => {
+      const pos = new Array(entries.length).fill(-1);
+
+      if (isGemini) {
+        // Gemini: single-pass anchored buffer scan
+        const searchData: { searchLines: string[]; entryIndex: number }[] = [];
+        entries.forEach((entry, index) => {
+          if (index <= lastBoundaryIdx) return;
+          if (entry.type === 'compact' || entry.type === 'continued') return;
+          const lines = getSearchLines(entry.content);
+          if (lines.length > 0) {
+            searchData.push({ searchLines: lines, entryIndex: index });
+          }
+        });
+        if (searchData.length > 0) {
+          const rows = terminalRegistry.buildPositionIndex(tabId, searchData);
+          searchData.forEach((sd, i) => { pos[sd.entryIndex] = rows[i]; });
+        }
+      } else {
+        // Claude: read marker positions (O(1) per entry)
+        entries.forEach((entry, index) => {
+          if (index <= lastBoundaryIdx) return;
+          if (entry.type === 'compact' || entry.type === 'continued') return;
+          const row = terminalRegistry.getMarkerRow(tabId, entry.uuid);
+          if (row >= 0) pos[index] = row;
+        });
+        // First entry after boundary usually has no marker (typed at initial prompt).
+        // Treat it as position 0 so its range covers the start of the buffer.
+        const firstRealIdx = entries.findIndex((e, i) =>
+          i > lastBoundaryIdx && e.type !== 'compact' && e.type !== 'continued'
+        );
+        if (firstRealIdx >= 0 && pos[firstRealIdx] < 0) {
+          pos[firstRealIdx] = 0;
+        }
+      }
+
+      return pos;
+    };
+
+    let positions = computePositions();
+
+    // Viewport visibility — range overlap check (no text scanning)
     const checkVisibility = () => {
-      const visibleText = terminalRegistry.getVisibleText(tabId);
-      if (!visibleText) {
+      const viewport = terminalRegistry.getViewportState(tabId);
+      if (!viewport) {
         setVisibleEntryIndices(prev => prev.size === 0 ? prev : new Set());
         return;
       }
 
+      // Build sorted list of entries with valid positions
+      const sorted: { index: number; row: number }[] = [];
+      for (let i = 0; i < positions.length; i++) {
+        if (positions[i] >= 0) sorted.push({ index: i, row: positions[i] });
+      }
+      sorted.sort((a, b) => a.row - b.row);
+
       const newVisible = new Set<number>();
-      entries.forEach((entry, index) => {
-        // Entries before boundary can't be in viewport (cleared from terminal)
-        if (index <= lastBoundaryIdx) return;
-        if (isGemini) {
-          // Gemini: line-level matching with strict short-text handling
-          if (entry.type === 'compact') return;
-          const lines = getSearchLines(entry.content);
-          if (lines.length > 0 && matchesInGeminiBuffer(visibleText, lines)) {
-            newVisible.add(index);
-          }
-        } else {
-          const key = getEntryKey(entry);
-          const hasKey = key && matchesAtUserPrompt(visibleText, key);
-          // Image fallback: Claude TUI shows [Image #N] instead of text
-          const hasImageFilter = entry.hasImage && visibleText.includes('[Image #');
-          
-          if (hasKey || hasImageFilter) {
-            newVisible.add(index);
-          }
+      for (let i = 0; i < sorted.length; i++) {
+        const blockStart = sorted[i].row;
+        const blockEnd = i + 1 < sorted.length ? sorted[i + 1].row : Infinity;
+
+        // Overlap: block [blockStart, blockEnd) ∩ viewport [top, bottom)
+        if (blockStart < viewport.bottom && blockEnd > viewport.top) {
+          newVisible.add(sorted[i].index);
         }
-      });
+      }
 
       setVisibleEntryIndices(prev => {
         if (prev.size === newVisible.size && [...prev].every(i => newVisible.has(i))) return prev;
@@ -471,49 +464,51 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
       });
     };
 
-    // Buffer reachability — which entries exist anywhere in the scrollback
+    // Buffer reachability — does the entry's text exist somewhere in the buffer?
+    // Uses text-based search (not positions) for robustness: anchored position search
+    // can miss entries due to false positive cascading, but text search is independent per entry.
     const checkReachability = () => {
-      const fullText = terminalRegistry.getFullBufferText(tabId);
-      if (!fullText) {
-        setUnreachableIndices(prev => prev.size === 0 ? prev : new Set());
-        return;
-      }
+      // Also recompute positions for visibility
+      positions = computePositions();
 
       const newUnreachable = new Set<number>();
-      entries.forEach((entry, index) => {
-        if (entry.type === 'compact' || entry.type === 'continued' || entry.isPlan) return;
-        // Entries before boundary are always unreachable (cleared from terminal)
-        if (index <= lastBoundaryIdx) {
-          newUnreachable.add(index);
+
+      if (isGemini) {
+        // Gemini: text-based reachability (search full buffer independently per entry)
+        const fullText = terminalRegistry.getFullBufferText(tabId);
+        if (!fullText) {
+          setUnreachableIndices(prev => prev.size === 0 ? prev : new Set());
           return;
         }
-        // Image messages: Claude TUI shows [Image #N] at prompt, not the user's text.
-        // Text search would fail, but OSC 7777 markers guarantee click-to-scroll works.
-        if (entry.hasImage) return;
-        if (isGemini) {
-          // Gemini: line-level matching with strict short-text handling
+        entries.forEach((entry, index) => {
+          if (entry.type === 'compact' || entry.type === 'continued' || entry.isPlan) return;
+          if (index <= lastBoundaryIdx) {
+            newUnreachable.add(index);
+            return;
+          }
           const lines = getSearchLines(entry.content);
-          if (lines.length > 0) {
-            const isReachable = matchesInGeminiBuffer(fullText, lines);
-            if (!isReachable) {
-              newUnreachable.add(index);
-            }
+          if (lines.length > 0 && !matchesInGeminiBuffer(fullText, lines)) {
+            newUnreachable.add(index);
           }
-        } else {
-          const key = getEntryKey(entry);
-          if (key) {
-               const isReachable = matchesAtUserPrompt(fullText, key, false);
-               if (!isReachable) {
-                   newUnreachable.add(index);
-               }
+        });
+      } else {
+        // Claude: marker-based reachability (markers auto-dispose when scrollback trimmed)
+        entries.forEach((entry, index) => {
+          if (entry.type === 'compact' || entry.type === 'continued' || entry.isPlan) return;
+          if (index <= lastBoundaryIdx) {
+            newUnreachable.add(index);
+            return;
           }
-        }
-      });
+          if (entry.hasImage) return;
+          if (positions[index] < 0) {
+            newUnreachable.add(index);
+          }
+        });
+      }
 
       // Inherit unreachable for compact/continued/plan entries from next regular entry
       entries.forEach((entry, index) => {
         if (entry.type !== 'compact' && entry.type !== 'continued' && !entry.isPlan) return;
-        // Boundary entries themselves and everything before — always unreachable
         if (index <= lastBoundaryIdx) {
           newUnreachable.add(index);
           return;
@@ -530,6 +525,9 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
         if (prev.size === newUnreachable.size && [...prev].every(i => newUnreachable.has(i))) return prev;
         return newUnreachable;
       });
+
+      // Re-check visibility with updated positions
+      checkVisibility();
     };
 
     // Run both on mount / entries change
@@ -537,8 +535,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
     checkReachability();
 
     // On viewport change (scroll + buffer writes via onWriteParsed):
-    // - checkVisibility: 100ms debounce (lightweight, viewport text only)
-    // - checkReachability: 500ms debounce (heavier, full buffer scan)
+    // - checkVisibility: 100ms debounce (just reads cached positions + viewport state)
+    // - checkReachability: 500ms debounce (recomputes positions from buffer)
     let visTimer: ReturnType<typeof setTimeout> | null = null;
     let reachTimer: ReturnType<typeof setTimeout> | null = null;
     terminalRegistry.onViewportChange(tabId, () => {
@@ -553,7 +551,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
       if (reachTimer) clearTimeout(reachTimer);
       terminalRegistry.offViewportChange(tabId);
     };
-  }, [tabId, entries, isVisible, isGemini, getEntryKey, matchesAtUserPrompt, isHistoryOpen, historyVisibleUuids]);
+  }, [tabId, entries, isVisible, isGemini, isHistoryOpen, historyVisibleUuids]);
 
   // Refs
   const tooltipRef = useRef<HTMLDivElement>(null);

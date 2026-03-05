@@ -230,8 +230,6 @@ export default function SubAgentBar({ projectId }: SubAgentBarProps) {
               statusText = 'error';
             } else if (taskCount > 0) {
               statusText = taskCount === 1 ? '1 task' : `${taskCount} tasks`;
-            } else if (isDone && !alive) {
-              statusText = 'done';
             }
 
             // Tooltip with full context
