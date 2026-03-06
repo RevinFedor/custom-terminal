@@ -42,8 +42,8 @@ if (claudeSpinnerBusy.has(tabId)) {   // ← мгновенно
 ### Text-based Fallback (Timeline.tsx, computePositions)
 Для случаев когда boundaries всё же отсутствуют (HMR, первый mount до взаимодействия), добавлен fallback через `buildPositionIndex()` — тот же текстовый поиск что используется для Gemini.
 
-### hasAnyPosition Guard (Timeline.tsx, checkReachability)
-Если ни одна entry не получила позицию (пустой буфер, свежий запуск), entries НЕ помечаются как unreachable. Красный фон активируется только когда есть хотя бы одна позиционированная entry (значит остальные реально вытеснены из scrollback).
+### Reachability Guard (Timeline.tsx, checkReachability)
+**Обновлено:** Прежний guard `hasAnyPosition` (красить только если >= 1 entry нашла позицию) заменён на `canDetermineReachability = !!terminalRegistry.get(tabId)`. Старый guard блокировал покраснение при закрытом Gemini (0 found из 106 → guard false → timeline не красный, хотя все entries unreachable). Новый guard: нет терминала (startup, HMR) → не красить; терминал есть → `pos < 0` = unreachable.
 
 ## Диагностика
 Для воспроизведения бага добавлялось временное логирование:

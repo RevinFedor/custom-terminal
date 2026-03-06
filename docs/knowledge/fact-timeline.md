@@ -44,7 +44,7 @@ Entries используют `flex: '1 0 auto'` с минимальной выс
 - **Error Handling:** Если текст сообщения не найден в буфере (например, из-за очистки истории), на месте точки на 1.2с появляется красный крестик.
 - **Tooltip Sync:** Тултип отображается вплотную к левому краю таймлайна с мягким белым свечением (`shadow-white`) для лучшей читаемости.
 - **Auto-Refresh & Debounce:** Обновление данных происходит каждые 2с. Проверка видимости во вьюпорте (трансформация в черточку) выполняется при скролле с дебаунсом 100мс. Проверка доступности в полном буфере (красный фон) — с дебаунсом 500мс.
-- **hasAnyPosition Guard:** Если `computePositions()` не нашёл ни одной позиции (все entries = -1), `checkReachability()` НЕ помечает entries как unreachable. Красный фон активируется только когда хотя бы одна entry имеет валидную позицию (т.е. остальные реально trimmed из scrollback). Это предотвращает полностью красный Timeline при свежем запуске с пустым буфером.
+- **Reachability Guard (`canDetermineReachability`):** `checkReachability()` помечает entries как unreachable (`pos < 0`) только если терминал существует в `terminalRegistry`. Если терминала нет (startup до монтирования, HMR) — ничего не красится. Когда терминал есть, но текст entries отсутствует в буфере (процесс закрыт, буфер пуст) — все entries корректно становятся красными. Прежний guard `hasAnyPosition` (красить только если хоть одна entry найдена) ошибочно блокировал покраснение при закрытом Gemini (0 из 106 found → guard = false → ничего не красное).
 - **Boundary Gate Fix:** OSC 7777 injection в main.js гейтится на `claudeSpinnerBusy.has(tabId)` (не `bridgeKnownSessions`). См. [`fix-boundary-bridge-race.md`](fix-boundary-bridge-race.md).
 - **Opaque Dots:** Все точки используют непрозрачные (solid) цвета. Это необходимо, чтобы они полностью перекрывали центральную вертикальную линию (Central Axis), исключая визуальный мусор и «просвечивание» полосы сквозь индикаторы.
 - **Transition Policy (No Size Animation):** Точки и маркеры (fork, plan, notes) анимируют только цвет и glow, размеры меняются мгновенно. Пробовали `transition: all 0.2s` — анимация width/height элементов внутри `flex: 1 0 auto` контейнера заставляла Chromium пересчитывать flex-layout на каждом кадре (200ms × 60fps = ~12 reflow), что вызывало визуальное дрожание всех entries при наведении на одну точку.
@@ -54,6 +54,7 @@ Entries используют `flex: '1 0 auto'` с минимальной выс
 - **Почему не нативный:** Нативный скроллбар браузера (даже стилизованный через webkit) конфликтовал с расположенным рядом `Resizer`. Клик по скроллбару часто интерпретировался системой как начало ресайза боковой панели.
 - **Реализация:** Тонкий (3px) ярко-белый индикатор внутри 32px-полосы Timeline.
 - **Изоляция:** Индикатор имеет `pointer-events: none`. Пользователь скроллит Timeline вращением колеса мыши над его областью, а физические клики «пролетают» сквозь индикатор, не мешая работе соседнего ресайзера.
+- **Direct DOM Update (No Re-render):** Позиция индикатора и видимость Scroll-to-Bottom Arrow обновляются через `ref.style` напрямую в scroll handler, без React state (`useState`). Прежний подход (`setScrollThumb()`, `setShowScrollDown()` на каждый scroll event) вызывал полный re-render тяжёлого Timeline компонента (~2300 строк JSX) на каждый тик колёсика — контент скроллился рывками, обновляясь только при остановке мыши.
 
 ### Scroll-to-Bottom Arrow
 Фиолетовая стрелка (`ChevronDown`, цвет `#a78bfa`) в нижней части Timeline.
@@ -199,13 +200,14 @@ Entries используют `flex: '1 0 auto'` с минимальной выс
 - `Timeline.tsx`: UI компонент (полоса, точки, портал для тултипов, range copy, sub-agent groups, tree view, scroll-down arrow).
 - `Timeline.tsx` → `computePositions()`: Claude: OSC 7777 prompt boundaries → text fallback (`buildPositionIndex`). Gemini: text search.
 - `Timeline.tsx` → `checkReachability()`: Двухпроходная система:
-  1. **Regular entries** (`user`): unreachable если `index <= lastBoundaryIdx` ИЛИ `position < 0` (при `hasAnyPosition`).
+  1. **Regular entries** (`user`): unreachable если `index <= lastBoundaryIdx` ИЛИ `position < 0` (при `canDetermineReachability`).
   2. **Special entries** (`compact`, `continued`, `plan`): наследуют unreachable от следующей regular entry.
   - **`lastBoundaryIdx`**: Индекс последнего `compact`/`plan` entry. Compact и Plan Mode **стирают терминал** Claude — все entries до них гарантированно unreachable.
-  - **Guard:** `hasAnyPosition` — если ни одна entry не имеет позиции, ничего не помечается красным (предотвращает полностью красный Timeline при пустом буфере).
+  - **Guard:** `canDetermineReachability = !!terminalRegistry.get(tabId)` — если терминал не существует (startup, HMR), ничего не красится. Если терминал есть — `pos < 0` → unreachable.
   - **Fork/Plan marker strips** (8px разделители между entries): НЕ имеют собственного красного фона — unreachable индикация только на segment-div'ах entries.
 - `gemini-data.js` (`gemini:get-timeline`): Парсинг Gemini JSON + `parseSubAgentMeta()` для извлечения метаданных агентов.
 - `ipc/claude-data.js` (`claude:get-timeline`): Парсинг и фильтрация JSONL. Детекция типа `continued`.
 - `main.js` (~line 3190): OSC 7777 boundary injection state machine. Gate: `claudeSpinnerBusy.has(tabId)`.
 - `terminalRegistry.ts`: Методы `searchAndScroll`, `getVisibleText` (чтение вьюпорта), `getPromptBoundaryLines`, `buildPositionIndex`.
+- **Gemini Truncation Fallback:** Gemini TUI обрезает длинные сообщения пользователя (~137 символов). `getSearchLines()` извлекает до 3 строк из полного контента JSONL, но 2-я/3-я строки могут отсутствовать в буфере. `buildPositionIndex` и `scrollToTextInBuffer` используют truncation fallback: если первая строка >= 30 chars и найдена в буфере — match принимается даже без подтверждения остальных строк. Порог 30 chars гарантирует уникальность (для коротких первых строк вроде `[Claude Sub-Agent Response]` по-прежнему требуется multi-line match).
 

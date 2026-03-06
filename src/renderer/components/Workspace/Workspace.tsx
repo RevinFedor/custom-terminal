@@ -65,6 +65,31 @@ export default function Workspace() {
   const setProjectView = useWorkspaceStore((s) => s.setProjectView);
   const viewingSubAgentTabId = useWorkspaceStore((s) => s.getActiveProject()?.viewingSubAgentTabId ?? null);
   const setViewingSubAgentTabId = useWorkspaceStore((s) => s.setViewingSubAgent);
+
+  // Fine-grained selectors for session IDs — return primitives so Zustand detects changes
+  // after in-place tab mutation + set({}). Without these, Workspace never re-renders on session change
+  // because all other selectors return stable references (functions, same strings).
+  const effectiveClaudeSessionId = useWorkspaceStore((s) => {
+    const p = s.openProjects.get(s.activeProjectId!);
+    if (!p) return null;
+    const tabId = p.viewingSubAgentTabId || p.activeTabId;
+    const tab = tabId ? p.tabs.get(tabId) : null;
+    return tab?.claudeSessionId || null;
+  });
+  const effectiveGeminiSessionId = useWorkspaceStore((s) => {
+    const p = s.openProjects.get(s.activeProjectId!);
+    if (!p) return null;
+    const tabId = p.viewingSubAgentTabId || p.activeTabId;
+    const tab = tabId ? p.tabs.get(tabId) : null;
+    return tab?.geminiSessionId || null;
+  });
+  const effectiveCommandType = useWorkspaceStore((s) => {
+    const p = s.openProjects.get(s.activeProjectId!);
+    if (!p) return null;
+    const tabId = p.viewingSubAgentTabId || p.activeTabId;
+    const tab = tabId ? p.tabs.get(tabId) : null;
+    return tab?.commandType || null;
+  });
   const [showSearch, setShowSearch] = useState(false);
   const [searchText, setSearchText] = useState('');
   const [searchResults, setSearchResults] = useState({ resultIndex: 0, resultCount: 0 });
@@ -216,8 +241,8 @@ export default function Workspace() {
       const isBackslash = e.code === 'Backslash' || e.key === '\\' || e.code === 'IntlBackslash';
       if (e.metaKey && isBackslash && effectiveTab?.id) {
         const hasSession =
-          (effectiveTab.commandType === 'claude' && effectiveTab.claudeSessionId) ||
-          (effectiveTab.commandType === 'gemini' && effectiveTab.geminiSessionId);
+          (effectiveCommandType === 'claude' && effectiveClaudeSessionId) ||
+          (effectiveCommandType === 'gemini' && effectiveGeminiSessionId);
         if (hasSession) {
           e.preventDefault();
           const currentOpen = useUIStore.getState().historyPanelOpenTabs[effectiveTab.id] ?? false;
@@ -227,7 +252,7 @@ export default function Workspace() {
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [workspaceView, effectiveTab?.id, effectiveTab?.claudeSessionId, effectiveTab?.geminiSessionId, effectiveTab?.commandType, setHistoryPanelOpen]);
+  }, [workspaceView, effectiveTab?.id, effectiveClaudeSessionId, effectiveGeminiSessionId, effectiveCommandType, setHistoryPanelOpen]);
 
   // CMD+F hotkey for terminal search
   useEffect(() => {
@@ -329,18 +354,14 @@ export default function Workspace() {
   // Get current tab's cwd for FileExplorer (fallback to project path)
   const explorerPath = effectiveTab?.cwd || (currentProject.path?.startsWith('__unset__') ? '' : currentProject.path);
 
-  // Get session IDs for Timeline
-  const claudeSessionId = effectiveTab?.claudeSessionId || null;
-  const geminiSessionId = effectiveTab?.geminiSessionId || null;
-
-  // Show Timeline when tab has Claude or Gemini session
-  // Timeline stays visible even when AI is not running (dimmed background)
+  // Session IDs come from fine-grained selectors (top of component) — not effectiveTab.
+  // This ensures Workspace re-renders when Bridge updates session ID via set({}).
   const showTimeline = !filePreview && (
-    (claudeSessionId && effectiveTab?.commandType === 'claude') ||
-    (geminiSessionId && effectiveTab?.commandType === 'gemini')
+    (effectiveClaudeSessionId && effectiveCommandType === 'claude') ||
+    (effectiveGeminiSessionId && effectiveCommandType === 'gemini')
   );
-  const timelineSessionId = effectiveTab?.commandType === 'gemini' ? geminiSessionId : claudeSessionId;
-  const timelineToolType = (effectiveTab?.commandType === 'gemini' ? 'gemini' : 'claude') as 'claude' | 'gemini';
+  const timelineSessionId = effectiveCommandType === 'gemini' ? effectiveGeminiSessionId : effectiveClaudeSessionId;
+  const timelineToolType = (effectiveCommandType === 'gemini' ? 'gemini' : 'claude') as 'claude' | 'gemini';
 
   // DEBUG: Uncomment to debug Timeline visibility
   // console.log('[Timeline Debug] showTimeline:', showTimeline, 'claudeSessionId:', claudeSessionId, 'commandType:', activeTab?.commandType, 'isRunning:', isCommandRunning);
