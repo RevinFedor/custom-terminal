@@ -52,11 +52,13 @@ const isDev = !app.isPackaged;
 
   function initLogStream() {
     try {
-      // Rotate if too large
-      if (fs.existsSync(LOG_PATH) && fs.statSync(LOG_PATH).size > MAX_SIZE) {
-        const bak = LOG_PATH + '.old';
-        try { fs.unlinkSync(bak); } catch {}
-        fs.renameSync(LOG_PATH, bak);
+      // Clear if too large OR older than 7 days
+      if (fs.existsSync(LOG_PATH)) {
+        const stat = fs.statSync(LOG_PATH);
+        const ageDays = (Date.now() - stat.mtimeMs) / (1000 * 60 * 60 * 24);
+        if (stat.size > MAX_SIZE || ageDays > 7) {
+          try { fs.unlinkSync(LOG_PATH); } catch {}
+        }
       }
       _logStream = fs.createWriteStream(LOG_PATH, { flags: 'a' });
       _logStream.on('error', () => { _logStream = null; });
@@ -3238,6 +3240,16 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
         var hasContentSpinner = CONTENT_SPINNER_RE.test(contentStripped);
 
         if (hasContentSpinner) {
+          // Diagnostic: log what triggered spinner when BoundarySM is already idle
+          var _bsmState = promptBoundaryState.get(tabId) || 'idle';
+          if (_bsmState === 'idle') {
+            var _match = contentStripped.match(/[\u2722\u2733\u2736\u273B\u273D]/);
+            if (_match) {
+              var _idx = contentStripped.indexOf(_match[0]);
+              var _ctx = contentStripped.slice(Math.max(0, _idx - 25), _idx + 26).replace(/\n/g, '\\n');
+              console.log('[Spinner:DIAG] Tab ' + tabId.slice(-8) + ' BoundarySM=idle but spinner char U+' + _match[0].charCodeAt(0).toString(16).toUpperCase() + ' at pos ' + _idx + '/' + contentStripped.length + ' ctx="' + _ctx + '"');
+            }
+          }
           // Spinner in content → BUSY, reset idle timer
           clearTimeout(claudeSpinnerIdleTimer.get(tabId));
           claudeSpinnerIdleTimer.delete(tabId);

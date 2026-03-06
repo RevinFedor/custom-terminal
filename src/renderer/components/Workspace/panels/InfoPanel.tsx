@@ -382,8 +382,8 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
       <div className="overflow-y-auto min-h-0 shrink">
       <div className="mb-4">
         <div className="flex items-center mb-2" style={{ gap: 6 }}>
-          {/* Tree mode toggle — only for Gemini sessions */}
-          {hasAnySession && activeTabId && currentSessionType === 'gemini' && (
+          {/* Tree mode toggle — for any AI session with timeline */}
+          {hasAnySession && activeTabId && (
             <button
               onClick={() => setTimelineTreeMode(activeTabId, !isTreeMode)}
               className="cursor-pointer"

@@ -692,11 +692,11 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
       // Recompute positions (one buffer scan — serves both visibility and reachability)
       positions = computePositions();
 
-      // If NO entry got a valid position, we have zero positioning data
-      // (fresh start, no boundaries, text search found nothing).
-      // Don't mark anything unreachable — red state only makes sense when
-      // some entries ARE positioned and others have been trimmed from scrollback.
-      const hasAnyPosition = positions.some(p => p >= 0);
+      // Check if the terminal exists and has buffer content.
+      // If terminal doesn't exist yet (startup, HMR), don't mark anything red — no data.
+      // If terminal exists (even with empty buffer), trust position results: pos < 0 → unreachable.
+      const terminal = terminalRegistry.get(tabId);
+      const canDetermineReachability = !!terminal;
 
       const newUnreachable = new Set<number>();
 
@@ -706,7 +706,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
           newUnreachable.add(index);
           return;
         }
-        if (hasAnyPosition && positions[index] < 0) {
+        if (canDetermineReachability && positions[index] < 0) {
           newUnreachable.add(index);
         }
       });
@@ -727,7 +727,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
       });
 
       if (isGemini && newUnreachable.size > 0) {
-        console.warn(`[Timeline:GeminiDiag] unreachable=[${[...newUnreachable].join(',')}] hasAnyPosition=${hasAnyPosition} lastBoundaryIdx=${lastBoundaryIdx} entries=${entries.length}`);
+        console.warn(`[Timeline:GeminiDiag] unreachable=[${[...newUnreachable].join(',')}] terminal=${canDetermineReachability} lastBoundaryIdx=${lastBoundaryIdx} entries=${entries.length}`);
         [...newUnreachable].forEach(idx => {
           const e = entries[idx];
           console.warn(`[Timeline:GeminiDiag]   #${idx} type=${e.type} isPlan=${e.isPlan} content=${JSON.stringify(e.content?.substring(0, 60))}`);
@@ -1570,7 +1570,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
             // isResponseOnly = response visible but prompt above viewport (same as normal)
             const isPromptVisible = isInViewport && !isResponseOnly;
 
-            if (isUnreachable && !isHovered) {
+            if (isUnreachable && !isHovered && !isGroupCollapsed) {
               // Unreachable entries: muted red/gray, overrides everything
               dotColor = '#6b3333';
               dotGlow = 'none';
@@ -1612,6 +1612,12 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
 
             // Expanded group header: render toggle bar THEN the entry as child
             const isExpandedHeader = !!(groupInfo?.isGroupHeader && isGroupExpanded);
+            // Group headers (×N meta markers) — always bright, never dimmed
+            const isGroupMeta = isGroupCollapsed || isExpandedHeader;
+            if (isGroupMeta) {
+              dotColor = isHovered ? '#818cf8' : '#7c86f0';
+              dotGlow = isHovered ? '0 0 10px rgba(129, 140, 248, 0.5)' : '0 0 6px rgba(129, 140, 248, 0.2)';
+            }
 
             return (
               <React.Fragment key={entry.uuid}>
@@ -1714,7 +1720,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
                       : (showAsChild ? '4px' : undefined),
                     backgroundColor: active
                       ? 'rgba(59, 130, 246, 0.15)'
-                      : (isUnreachable ? 'rgba(239, 68, 68, 0.12)' : 'transparent'),
+                      : (isUnreachable && !isGroupMeta ? 'rgba(239, 68, 68, 0.12)' : 'transparent'),
                     cursor: isContinued ? 'default' : 'pointer',
                   }}
                 >
@@ -1773,7 +1779,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
                       }}
                     >
                       {isGroupCollapsed
-                        ? `${groupInfo!.agentName} ×${groupInfo!.groupSize}`
+                        ? <>{groupInfo!.agentName} <span style={{ color: 'rgba(129, 140, 248, 0.9)' }}>×{groupInfo!.groupSize}</span></>
                         : entryIsTimeout
                           ? 'timeout'
                           : entryIsSubAgent
