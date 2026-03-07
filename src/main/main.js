@@ -6016,6 +6016,13 @@ ipcMain.on('claude:run-command', (event, { tabId, command, sessionId, forkSessio
         console.log('[Claude Runner] Continuing session:', sessionId);
         // Enable thinking mode detection (will send Tab when '>' prompt appears)
         claudeState.set(tabId, 'WAITING_PROMPT');
+
+        // If prompt provided (e.g. Update API: /model haiku + trigger), queue it for handshake
+        if (prompt && prompt.trim()) {
+          claudePendingPrompt.set(tabId, prompt.trim());
+          console.log('[Claude Runner] Resume prompt queued, will send after prompt detected');
+        }
+
         term.write(`claude --dangerously-skip-permissions --resume ${sessionId}\r`);
 
         // Signal that command started (for Timeline visibility)
