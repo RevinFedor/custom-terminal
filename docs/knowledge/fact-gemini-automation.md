@@ -16,7 +16,29 @@
 
 ---
 
-## 2. Sniper Watcher (Auto-Capture)
+## 2. Headless Mode: `gemini -p` (Update API)
+Использование `gemini -p` в фоновом режиме (stdin) для API-запросов к Gemini без открытия интерактивного терминала.
+
+### Motivation
+- **System Prompt Access:** Headless mode имеет доступ к полному 11K-токенному системному промпту из `GEMINI.md`, чего нет в стандартном Gemini API.
+- **Context Inclusion:** Полная интеграция с документацией проекта (`docs/knowledge/*.md`).
+- **Process Model:** Stdin-based вместо CLI arguments обходит ограничения длины shell.
+
+### Implementation
+```bash
+echo -e "Your prompt text\nfor gemini" | gemini -p
+```
+
+Система передает полный контекст + инструкцию через stdin. Gemini обрабатывает и выводит результат в stdout, который перехватывается.
+
+### Invisible Intent (Почему mejor than API)
+1. **Системный промпт:** API Gemini использует урезанный промпт без файла `GEMINI.md`. Headless получает полный 11K.
+2. **Качество ответов:** Эквивалентно CLI-качеству для сложных задач анализа.
+3. **Надежность:** Нет зависимостей от API версионирования. Используется локальная установка.
+
+---
+
+## 3. Sniper Watcher (Auto-Capture)
 Sniper — фоновый процесс, следящий за активностью Gemini CLI.
 
 ### Динамический резолвинг (v0.30+)

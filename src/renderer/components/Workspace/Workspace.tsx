@@ -62,6 +62,8 @@ export default function Workspace() {
   const historyPanelOpenTabs = useUIStore((s) => s.historyPanelOpenTabs);
   const historyPanelWidth = useUIStore((s) => s.historyPanelWidth);
   const setHistoryPanelOpen = useUIStore((s) => s.setHistoryPanelOpen);
+  const timelinePanelOpenTabs = useUIStore((s) => s.timelinePanelOpenTabs);
+  const setTimelinePanelOpen = useUIStore((s) => s.setTimelinePanelOpen);
   const setProjectView = useWorkspaceStore((s) => s.setProjectView);
   const viewingSubAgentTabId = useWorkspaceStore((s) => s.getActiveProject()?.viewingSubAgentTabId ?? null);
   const setViewingSubAgentTabId = useWorkspaceStore((s) => s.setViewingSubAgent);
@@ -246,13 +248,34 @@ export default function Workspace() {
         if (hasSession) {
           e.preventDefault();
           const currentOpen = useUIStore.getState().historyPanelOpenTabs[effectiveTab.id] ?? false;
+          if (!currentOpen) setTimelinePanelOpen(effectiveTab.id, false); // close timeline when opening history
           setHistoryPanelOpen(effectiveTab.id, !currentOpen);
         }
       }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [workspaceView, effectiveTab?.id, effectiveClaudeSessionId, effectiveGeminiSessionId, effectiveCommandType, setHistoryPanelOpen]);
+  }, [workspaceView, effectiveTab?.id, effectiveClaudeSessionId, effectiveGeminiSessionId, effectiveCommandType, setHistoryPanelOpen, setTimelinePanelOpen]);
+
+  // CMD+] hotkey to toggle timeline panel
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (workspaceView !== 'workspace') return;
+      if (e.metaKey && e.code === 'BracketRight' && effectiveTab?.id) {
+        const hasSession =
+          (effectiveCommandType === 'claude' && effectiveClaudeSessionId) ||
+          (effectiveCommandType === 'gemini' && effectiveGeminiSessionId);
+        if (hasSession) {
+          e.preventDefault();
+          const currentOpen = useUIStore.getState().timelinePanelOpenTabs[effectiveTab.id] ?? true;
+          if (!currentOpen) setHistoryPanelOpen(effectiveTab.id, false); // close history when opening timeline
+          setTimelinePanelOpen(effectiveTab.id, !currentOpen);
+        }
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [workspaceView, effectiveTab?.id, effectiveClaudeSessionId, effectiveGeminiSessionId, effectiveCommandType, setTimelinePanelOpen, setHistoryPanelOpen]);
 
   // CMD+F hotkey for terminal search
   useEffect(() => {
@@ -365,6 +388,9 @@ export default function Workspace() {
 
   // DEBUG: Uncomment to debug Timeline visibility
   // console.log('[Timeline Debug] showTimeline:', showTimeline, 'claudeSessionId:', claudeSessionId, 'commandType:', activeTab?.commandType, 'isRunning:', isCommandRunning);
+
+  // Per-tab timeline panel state (default: open)
+  const isTimelineOpen = effectiveTab?.id ? (timelinePanelOpenTabs[effectiveTab.id] ?? true) : true;
 
   // Per-tab history panel state
   const isHistoryOpen = effectiveTab?.id ? (historyPanelOpenTabs[effectiveTab.id] ?? false) : false;
@@ -503,6 +529,7 @@ export default function Workspace() {
               cwd={effectiveTab.cwd || currentProject.path}
               isActive={isCommandRunning}
               isVisible={workspaceView === 'workspace' && currentView === 'terminal'}
+              isOpen={isTimelineOpen}
               toolType={timelineToolType}
             />
           )}

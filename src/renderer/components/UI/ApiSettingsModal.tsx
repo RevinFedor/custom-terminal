@@ -19,7 +19,7 @@ const THINKING_LEVELS: { id: ThinkingLevel; label: string }[] = [
 ];
 
 export default function ApiSettingsModal() {
-  const { apiSettingsOpen, closeApiSettings, apiSettings, setApiClaudeModel, setApiGeminiModel, setApiGeminiThinking } = useUIStore();
+  const { apiSettingsOpen, closeApiSettings, apiSettings, setApiClaudeModel, setApiClaudeThinking, setApiGeminiModel, setApiGeminiThinking } = useUIStore();
 
   if (!apiSettingsOpen) return null;
 
@@ -83,28 +83,61 @@ export default function ApiSettingsModal() {
               <span style={{ fontSize: '11px', fontWeight: 600, color: '#DA7756', textTransform: 'uppercase', letterSpacing: '0.5px' }}>Claude</span>
               <div style={{ flex: 1, height: '1px', backgroundColor: '#333' }} />
             </div>
-            <div style={{ display: 'flex', gap: '6px' }}>
-              {CLAUDE_MODELS.map((m) => (
-                <button
-                  key={m.id}
-                  onClick={() => setApiClaudeModel(m.id)}
-                  style={{
-                    flex: 1,
-                    padding: '6px 10px',
-                    fontSize: '11px',
-                    fontWeight: 500,
-                    border: '1px solid',
-                    borderColor: apiSettings.claudeModel === m.id ? '#DA7756' : '#333',
-                    borderRadius: '6px',
-                    backgroundColor: apiSettings.claudeModel === m.id ? 'rgba(218, 119, 86, 0.15)' : 'transparent',
-                    color: apiSettings.claudeModel === m.id ? '#DA7756' : '#888',
-                    cursor: 'pointer',
-                    transition: 'all 0.15s ease',
-                  }}
-                >
-                  {m.label}
-                </button>
-              ))}
+
+            {/* Model */}
+            <div style={{ marginBottom: '10px' }}>
+              <div style={{ fontSize: '10px', color: '#666', marginBottom: '6px' }}>Model</div>
+              <div style={{ display: 'flex', gap: '6px' }}>
+                {CLAUDE_MODELS.map((m) => (
+                  <button
+                    key={m.id}
+                    onClick={() => setApiClaudeModel(m.id)}
+                    style={{
+                      flex: 1,
+                      padding: '6px 10px',
+                      fontSize: '11px',
+                      fontWeight: 500,
+                      border: '1px solid',
+                      borderColor: apiSettings.claudeModel === m.id ? '#DA7756' : '#333',
+                      borderRadius: '6px',
+                      backgroundColor: apiSettings.claudeModel === m.id ? 'rgba(218, 119, 86, 0.15)' : 'transparent',
+                      color: apiSettings.claudeModel === m.id ? '#DA7756' : '#888',
+                      cursor: 'pointer',
+                      transition: 'all 0.15s ease',
+                    }}
+                  >
+                    {m.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Thinking */}
+            <div>
+              <div style={{ fontSize: '10px', color: '#666', marginBottom: '6px' }}>Thinking</div>
+              <div style={{ display: 'flex', gap: '4px' }}>
+                {THINKING_LEVELS.map((t) => (
+                  <button
+                    key={t.id}
+                    onClick={() => setApiClaudeThinking(t.id)}
+                    style={{
+                      flex: 1,
+                      padding: '5px 6px',
+                      fontSize: '10px',
+                      fontWeight: 500,
+                      border: '1px solid',
+                      borderColor: apiSettings.claudeThinking === t.id ? '#DA7756' : '#333',
+                      borderRadius: '6px',
+                      backgroundColor: apiSettings.claudeThinking === t.id ? 'rgba(218, 119, 86, 0.15)' : 'transparent',
+                      color: apiSettings.claudeThinking === t.id ? '#DA7756' : '#888',
+                      cursor: 'pointer',
+                      transition: 'all 0.15s ease',
+                    }}
+                  >
+                    {t.label}
+                  </button>
+                ))}
+              </div>
             </div>
           </div>
 

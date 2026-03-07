@@ -102,7 +102,7 @@ interface WorkspaceStore {
 
   // Tab management
   createTab: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; tabType?: TabType; url?: string; background?: boolean }) => Promise<string>;
-  createTabAfterCurrent: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; tabType?: TabType; url?: string; afterTabId?: string }) => Promise<string>;
+  createTabAfterCurrent: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; tabType?: TabType; url?: string; afterTabId?: string; nameSetManually?: boolean }) => Promise<string>;
   closeTab: (projectId: string, tabId: string, options?: { skipProcessCheck?: boolean; forceCleanup?: boolean }) => Promise<void>;
   switchTab: (projectId: string, tabId: string) => void;
   renameTab: (projectId: string, tabId: string, newName: string) => void;
@@ -723,6 +723,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       notes: options?.notes,
       tabType: options?.tabType || 'terminal',
       url: options?.url,
+      nameSetManually: (options as any)?.nameSetManually,
       createdAt: (options as any)?.createdAt || Math.floor(Date.now() / 1000)
     };
 

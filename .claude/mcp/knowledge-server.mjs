@@ -11,6 +11,7 @@ import { readFileSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { createInterface } from 'readline';
+import { execFile } from 'child_process';
 
 // Resolve project root: server is at PROJECT/.claude/mcp/knowledge-server.mjs
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -114,6 +115,45 @@ function searchKnowledge(query) {
 }
 
 // ---------------------------------------------------------------------------
+// Reindex
+// ---------------------------------------------------------------------------
+
+function reindex(parallel = 5) {
+  return new Promise((resolve) => {
+    const script = join(PROJECT_DIR, 'scripts', 'ai', 'build-index.sh');
+    const env = { ...process.env };
+    delete env.CLAUDECODE;
+    delete env.CLAUDE_CODE_ENTRYPOINT;
+
+    process.stderr.write(`[knowledge-server] Reindexing with --parallel ${parallel}...\n`);
+
+    execFile('bash', [script, '--parallel', String(parallel)], {
+      cwd: PROJECT_DIR,
+      env,
+      timeout: 10 * 60 * 1000,
+      maxBuffer: 10 * 1024 * 1024,
+    }, (error, stdout, stderr) => {
+      if (error) {
+        process.stderr.write(`[knowledge-server] Reindex error: ${error.message}\n`);
+        resolve({ success: false, error: error.message, stdout: stdout?.slice(-2000), stderr: stderr?.slice(-2000) });
+        return;
+      }
+
+      try {
+        index = JSON.parse(readFileSync(INDEX_PATH, 'utf8'));
+        process.stderr.write(`[knowledge-server] Reindex done. Reloaded ${index.length} entries.\n`);
+      } catch (e) {
+        process.stderr.write(`[knowledge-server] Reindex done but failed to reload: ${e.message}\n`);
+      }
+
+      const lines = stdout.trim().split('\n');
+      const summary = lines.slice(-15).join('\n');
+      resolve({ success: true, summary, entries: index.length });
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
 // MCP Protocol (JSON-RPC 2.0 over stdio, newline-delimited)
 // ---------------------------------------------------------------------------
 
@@ -133,6 +173,23 @@ const TOOL_DEF = {
       }
     },
     required: ['query']
+  }
+};
+
+const REINDEX_DEF = {
+  name: 'docs_reindex',
+  description:
+    'Rebuild the semantic index (.semantic-index.json) by running build-index.sh. ' +
+    'Uses Haiku to generate tags and symptoms for each docs/knowledge/ file. ' +
+    'Run after adding or significantly changing knowledge files. Takes 2-5 minutes.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      parallel: {
+        type: 'number',
+        description: 'Number of parallel Haiku workers (default: 5)'
+      }
+    }
   }
 };
 
@@ -159,7 +216,7 @@ function handleMessage(msg) {
 
   // List tools
   if (method === 'tools/list') {
-    return { jsonrpc: '2.0', id, result: { tools: [TOOL_DEF] } };
+    return { jsonrpc: '2.0', id, result: { tools: [TOOL_DEF, REINDEX_DEF] } };
   }
 
   // Call tool
@@ -174,6 +231,20 @@ function handleMessage(msg) {
           content: [{ type: 'text', text: JSON.stringify(result, null, 2) }]
         }
       };
+    }
+    if (name === 'docs_reindex') {
+      // Async — need to respond after completion
+      reindex(args.parallel || 5).then((result) => {
+        const response = {
+          jsonrpc: '2.0',
+          id,
+          result: {
+            content: [{ type: 'text', text: JSON.stringify(result, null, 2) }]
+          }
+        };
+        process.stdout.write(JSON.stringify(response) + '\n');
+      });
+      return '__async__';
     }
     return {
       jsonrpc: '2.0',
@@ -205,7 +276,7 @@ rl.on('line', (line) => {
   try {
     const msg = JSON.parse(line);
     const response = handleMessage(msg);
-    if (response !== null) {
+    if (response !== null && response !== '__async__') {
       process.stdout.write(JSON.stringify(response) + '\n');
     }
   } catch (e) {

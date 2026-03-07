@@ -1353,7 +1353,7 @@ function startMcpHttpServer() {
               if (useProvider === 'gemini') {
                 apiResult = await docsModule.callGeminiApi(systemPrompt, userText, config.apiSettings.geminiModel, config.apiSettings.geminiThinking);
               } else {
-                apiResult = await docsModule.callClaudeApi(systemPrompt, userText, config.apiSettings.claudeModel);
+                apiResult = await docsModule.callClaudeApi(systemPrompt, userText, config.apiSettings.claudeModel, config.apiSettings.claudeThinking);
               }
 
               if (apiResult.success) {

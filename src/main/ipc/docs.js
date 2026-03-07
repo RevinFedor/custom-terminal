@@ -1,4 +1,5 @@
 const { ipcMain } = require('electron');
+const { execFile } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 
@@ -11,6 +12,7 @@ let docsConfig = {
   },
   apiSettings: {
     claudeModel: 'claude-sonnet-4.5',
+    claudeThinking: 'HIGH',
     geminiModel: 'gemini-3-flash-preview',
     geminiThinking: 'HIGH'
   }
@@ -22,9 +24,9 @@ function getDocsConfig() {
 
 // ── Reusable API call functions (used by IPC handlers AND MCP HTTP endpoint) ──
 
-async function callClaudeApi(system, prompt, model = 'claude-opus-4.6') {
+async function callClaudeApi(system, prompt, model = 'claude-opus-4.6', thinking = 'HIGH') {
   try {
-    console.log('[docs:claude-api] Sending ' + Math.round(prompt.length / 1024) + 'KB to Claude API, model=' + model);
+    console.log('[docs:claude-api] Sending ' + Math.round(prompt.length / 1024) + 'KB to Claude API, model=' + model + ' thinking=' + thinking);
     const body = {
       model,
       max_tokens: 16000,
@@ -32,12 +34,23 @@ async function callClaudeApi(system, prompt, model = 'claude-opus-4.6') {
     };
     if (system) body.system = system;
 
+    // Extended thinking support
+    if (thinking && thinking !== 'NONE') {
+      const budgetMap = { LOW: 5000, MEDIUM: 16000, HIGH: 50000 };
+      const budgetTokens = budgetMap[thinking] || 50000;
+      body.thinking = { type: 'enabled', budget_tokens: budgetTokens };
+      // max_tokens must be > budget_tokens
+      if (body.max_tokens <= budgetTokens) {
+        body.max_tokens = budgetTokens + 16000;
+      }
+    }
+
     const response = await fetch('https://api.kiro.cheap/v1/messages', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'x-api-key': 'sk-aw-57742ca44f8b04d8fdd587f8289c7fb1',
-        'anthropic-version': '2023-06-01',
+        'anthropic-version': '2025-04-15',
       },
       body: JSON.stringify(body),
     });
@@ -114,6 +127,71 @@ async function callGeminiApi(system, prompt, model = 'gemini-3-flash-preview', t
   }
 }
 
+/**
+ * Call Gemini CLI in headless mode (-p flag).
+ * Uses the full CLI system prompt + GEMINI.md context → better quality than raw API.
+ * Prompt is passed via stdin to avoid shell escaping issues.
+ */
+async function callGeminiCli(system, prompt, model = 'gemini-3-flash-preview', cwd) {
+  try {
+    const fullPrompt = system ? system + '\n\n' + prompt : prompt;
+    console.log('[docs:gemini-cli] Sending ' + Math.round(fullPrompt.length / 1024) + 'KB via CLI, model=' + model);
+
+    // Write prompt to temp file (avoids shell arg length limits)
+    const tmpFile = path.join(require('os').tmpdir(), 'gemini-cli-prompt-' + Date.now() + '.txt');
+    fs.writeFileSync(tmpFile, fullPrompt, 'utf-8');
+
+    return new Promise((resolve) => {
+      const args = ['-p', '', '-m', model, '-o', 'json', '--approval-mode', 'plan'];
+      const child = execFile('gemini', args, {
+        cwd: cwd || process.cwd(),
+        maxBuffer: 50 * 1024 * 1024, // 50MB
+        timeout: 5 * 60 * 1000, // 5 min
+        env: { ...process.env },
+      }, (error, stdout, stderr) => {
+        // Cleanup temp file
+        try { fs.unlinkSync(tmpFile); } catch (_) {}
+
+        if (error) {
+          console.error('[docs:gemini-cli] Error:', error.message);
+          return resolve({ success: false, error: error.message });
+        }
+
+        try {
+          // stdout may have MCP warnings before JSON — find the JSON object
+          const jsonStart = stdout.indexOf('{');
+          if (jsonStart === -1) {
+            return resolve({ success: false, error: 'No JSON in CLI output' });
+          }
+          const data = JSON.parse(stdout.substring(jsonStart));
+          const responseText = data.response || '';
+          if (!responseText) {
+            return resolve({ success: false, error: 'Empty response from Gemini CLI' });
+          }
+
+          const stats = data.stats?.models?.[model]?.tokens || {};
+          console.log('[docs:gemini-cli] Response: ' + Math.round(responseText.length / 1024) + 'KB, input: ' + stats.input + ' output: ' + stats.candidates);
+          return resolve({
+            success: true,
+            text: responseText,
+            usage: { input_tokens: stats.input, output_tokens: stats.candidates }
+          });
+        } catch (parseErr) {
+          console.error('[docs:gemini-cli] Parse error:', parseErr.message);
+          return resolve({ success: false, error: 'Failed to parse CLI output: ' + parseErr.message });
+        }
+      });
+
+      // Feed prompt via stdin
+      child.stdin.write(fullPrompt);
+      child.stdin.end();
+    });
+  } catch (error) {
+    console.error('[docs:gemini-cli] Error:', error);
+    return { success: false, error: error.message };
+  }
+}
+
 /** Read doc prompt from synced settings (file or inline) */
 async function readDocPrompt() {
   const { docPrompt } = docsConfig;
@@ -134,7 +212,29 @@ async function readDocPrompt() {
   return { success: false, error: 'No documentation prompt configured' };
 }
 
+/** Read all docs/knowledge/*.md files and return concatenated content */
+function readKnowledgeBase(cwd) {
+  const knowledgeDir = path.join(cwd, 'docs', 'knowledge');
+  if (!fs.existsSync(knowledgeDir)) return { files: 0, content: '' };
+  const files = fs.readdirSync(knowledgeDir).filter(f => f.endsWith('.md')).sort();
+  const parts = [];
+  for (const file of files) {
+    try {
+      const text = fs.readFileSync(path.join(knowledgeDir, file), 'utf-8');
+      parts.push('=== ' + file + ' ===\n' + text);
+    } catch (_) { /* skip */ }
+  }
+  const content = parts.join('\n\n');
+  console.log('[docs:readKB] ' + parts.length + ' files, ' + Math.round(content.length / 1024) + 'KB from ' + knowledgeDir);
+  return { files: parts.length, content };
+}
+
 function register() {
+  // Read knowledge base (docs/knowledge/*.md) for API handlers
+  ipcMain.handle('docs:read-knowledge-base', async (event, { cwd }) => {
+    return readKnowledgeBase(cwd);
+  });
+
   // Save combined prompt to /tmp/ for Gemini to read via @filepath
   ipcMain.handle('docs:save-temp', async (event, { content, projectPath }) => {
     try {
@@ -171,9 +271,16 @@ function register() {
 
   // Claude API proxy (avoids CORS — renderer can't call api.kiro.cheap directly)
   // Uses synced model from apiSettings if available
-  ipcMain.handle('docs:api-request', async (event, { system, prompt, model }) => {
+  ipcMain.handle('docs:api-request', async (event, { system, prompt, model, thinking }) => {
     const useModel = model || docsConfig.apiSettings.claudeModel || 'claude-opus-4.6';
-    return callClaudeApi(system, prompt, useModel);
+    const useThinking = thinking || docsConfig.apiSettings.claudeThinking || 'HIGH';
+    return callClaudeApi(system, prompt, useModel, useThinking);
+  });
+
+  // Gemini CLI headless mode (better quality than raw API — uses CLI system prompt + GEMINI.md)
+  ipcMain.handle('docs:gemini-cli-request', async (event, { system, prompt, model, cwd }) => {
+    const useModel = model || docsConfig.apiSettings.geminiModel || 'gemini-3-flash-preview';
+    return callGeminiCli(system, prompt, useModel, cwd);
   });
 
   // Sync settings from renderer (apiSettings + docPrompt)
@@ -187,4 +294,4 @@ function register() {
   });
 }
 
-module.exports = { register, callClaudeApi, callGeminiApi, readDocPrompt, getDocsConfig };
+module.exports = { register, callClaudeApi, callGeminiApi, callGeminiCli, readDocPrompt, getDocsConfig };

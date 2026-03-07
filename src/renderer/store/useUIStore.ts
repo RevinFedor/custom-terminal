@@ -5,6 +5,7 @@ interface Toast {
   message: string;
   type: 'success' | 'error' | 'info' | 'warning';
   persistent?: boolean;
+  copyText?: string;
 }
 
 interface FilePreview {
@@ -22,6 +23,7 @@ export type ApiClaudeModel = 'claude-opus-4.6' | 'claude-sonnet-4.5';
 
 export interface ApiSettings {
   claudeModel: ApiClaudeModel;
+  claudeThinking: ThinkingLevel;
   geminiModel: ApiGeminiModel;
   geminiThinking: ThinkingLevel;
 }
@@ -151,7 +153,7 @@ interface UIStore {
 
   toasts: Toast[];
 
-  showToast: (message: string, type?: 'success' | 'error' | 'info' | 'warning', duration?: number, persistent?: boolean) => void;
+  showToast: (message: string, type?: 'success' | 'error' | 'info' | 'warning', duration?: number, persistent?: boolean, copyText?: string) => void;
 
   removeToast: (id: string) => void;
 
@@ -166,6 +168,10 @@ interface UIStore {
   setHistoryPanelWidth: (width: number) => void;
   setHistoryScrollToUuid: (uuid: string | null) => void;
   setHistoryVisibleUuids: (tabId: string, uuids: string[]) => void;
+
+  // Timeline panel visibility (per-tab state, default open)
+  timelinePanelOpenTabs: Record<string, boolean>;
+  setTimelinePanelOpen: (tabId: string, open: boolean) => void;
 
   // Timeline tree mode (per-tab state)
   timelineTreeModeTabs: Record<string, boolean>;
@@ -248,7 +254,12 @@ interface UIStore {
   apiSettings: ApiSettings;
   setApiClaudeModel: (model: ApiClaudeModel) => void;
   setApiGeminiModel: (model: ApiGeminiModel) => void;
+  setApiClaudeThinking: (level: ThinkingLevel) => void;
   setApiGeminiThinking: (level: ThinkingLevel) => void;
+
+  // Auto-apply toggle (Update API → Haiku auto-submits confirmation)
+  autoApplyDocs: boolean;
+  setAutoApplyDocs: (on: boolean) => void;
 
 }
 
@@ -542,6 +553,7 @@ const loadApiSettings = (): ApiSettings => {
       const parsed = JSON.parse(saved);
       return {
         claudeModel: parsed.claudeModel || 'claude-sonnet-4.5',
+        claudeThinking: parsed.claudeThinking || 'HIGH',
         geminiModel: parsed.geminiModel || 'gemini-3-flash-preview',
         geminiThinking: parsed.geminiThinking || 'HIGH',
       };
@@ -549,7 +561,7 @@ const loadApiSettings = (): ApiSettings => {
   } catch (e) {
     console.error('Failed to load API settings:', e);
   }
-  return { claudeModel: 'claude-sonnet-4.5', geminiModel: 'gemini-3-flash-preview', geminiThinking: 'HIGH' };
+  return { claudeModel: 'claude-sonnet-4.5', claudeThinking: 'HIGH', geminiModel: 'gemini-3-flash-preview', geminiThinking: 'HIGH' };
 };
 
 const saveApiSettings = (settings: ApiSettings) => {
@@ -714,10 +726,10 @@ export const useUIStore = create<UIStore>((set, get) => ({
 
   // Toast Notifications
   toasts: [],
-  showToast: (message, type = 'success', duration = 2500, persistent = false) => {
+  showToast: (message, type = 'success', duration = 2500, persistent = false, copyText) => {
     const id = `toast-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
     set((state) => ({
-      toasts: [...state.toasts, { id, message, type, persistent }]
+      toasts: [...state.toasts, { id, message, type, persistent, copyText }]
     }));
 
     if (!persistent) {
@@ -746,6 +758,11 @@ export const useUIStore = create<UIStore>((set, get) => ({
   setHistoryScrollToUuid: (uuid) => set({ historyScrollToUuid: uuid }),
   setHistoryVisibleUuids: (tabId, uuids) => set(state => ({
     historyVisibleUuids: { ...state.historyVisibleUuids, [tabId]: uuids }
+  })),
+
+  timelinePanelOpenTabs: {},
+  setTimelinePanelOpen: (tabId, open) => set(state => ({
+    timelinePanelOpenTabs: { ...state.timelinePanelOpenTabs, [tabId]: open }
   })),
 
   timelineTreeModeTabs: {},
@@ -909,6 +926,12 @@ export const useUIStore = create<UIStore>((set, get) => ({
     set({ apiSettings: updated });
     saveApiSettings(updated);
   },
+  setApiClaudeThinking: (level) => {
+    const current = get().apiSettings;
+    const updated = { ...current, claudeThinking: level };
+    set({ apiSettings: updated });
+    saveApiSettings(updated);
+  },
   setApiGeminiModel: (model) => {
     const current = get().apiSettings;
     const updated = { ...current, geminiModel: model };
@@ -920,6 +943,13 @@ export const useUIStore = create<UIStore>((set, get) => ({
     const updated = { ...current, geminiThinking: level };
     set({ apiSettings: updated });
     saveApiSettings(updated);
+  },
+
+  // Auto-apply docs toggle
+  autoApplyDocs: localStorage.getItem('noted-terminal-auto-apply-docs') === 'true',
+  setAutoApplyDocs: (on) => {
+    set({ autoApplyDocs: on });
+    localStorage.setItem('noted-terminal-auto-apply-docs', String(on));
   },
 
   // Focus Area
