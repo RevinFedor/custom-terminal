@@ -623,28 +623,42 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
 
       if (apiCancelledRef.current) { showToast('API запрос отменён', 'info'); return; }
 
-      // 4. Create new Claude tab
+      // 4. Create prefilled Claude JSONL session (user intro + assistant analysis)
       const tabCwd = await ipcRenderer.invoke('terminal:getCwd', activeTabId);
       const workingDir = tabCwd || activeProject.projectPath;
 
-      const existingApiTabs = Array.from(activeProject.tabs.values())
-        .filter(t => t.name.startsWith('docs-api-')).length;
-      const tabName = `docs-api-${String(existingApiTabs + 1).padStart(2, '0')}`;
+      const prefilledResult = await ipcRenderer.invoke('claude:create-prefilled-session', {
+        content: responseText,
+        cwd: workingDir
+      });
+      if (!prefilledResult.success) throw new Error('Failed to create prefilled session: ' + prefilledResult.error);
+      console.warn('[UpdateApi] Prefilled session: ' + prefilledResult.sessionId + ' (' + prefilledResult.totalChars + ' chars)');
+
+      if (apiCancelledRef.current) { showToast('API запрос отменён', 'info'); return; }
+
+      // 5. Create new Claude tab (docs-XX, shared counter with Gemini docs tabs)
+      const existingDocsTabs = Array.from(activeProject.tabs.values())
+        .filter(t => t.name.startsWith('docs-')).length;
+      const tabName = `docs-${String(existingDocsTabs + 1).padStart(2, '0')}`;
 
       const newTabId = await createTabAfterCurrent(activeProjectId, tabName, workingDir, { color: 'claude', isUtility: false });
       if (!newTabId) throw new Error('Failed to create tab');
       useWorkspaceStore.getState().setTabCommandType(newTabId, 'claude');
 
-      // 5. Launch Claude with /model haiku + API response as prompt
-      const prompt = '/model haiku\nНиже результат анализа сессии от внешнего AI-агента. Примени указанные изменения по файлам.\n\n' + responseText;
-      ipcRenderer.send('claude:run-command', { tabId: newTabId, command: 'claude', prompt });
+      // 6. Launch Claude --resume prefilled session; handshake sends /model haiku + trigger
+      ipcRenderer.send('claude:run-command', {
+        tabId: newTabId,
+        command: 'claude-c',
+        sessionId: prefilledResult.sessionId,
+        prompt: '/model haiku'
+      });
 
-      showToast('Claude Haiku tab created', 'success');
+      showToast('Claude Haiku tab created (' + Math.round(prefilledResult.totalChars / 1024) + 'KB)', 'success');
 
     } catch (error: any) {
       if (apiCancelledRef.current) return;
       console.error('[UpdateApi] Error:', error);
-      showToast(error.message || 'Update API failed', 'error');
+      showToast(error.message || 'Update API → Haiku failed', 'error');
     } finally {
       setIsApiLoading(false);
     }
@@ -721,8 +735,8 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
 
       // 4. Create Gemini tab (insert after current tab, or after last selected if multi-select)
       const existingDocsTabs = Array.from(activeProject.tabs.values())
-        .filter(t => t.name.startsWith('docs-gemini-')).length;
-      const tabName = `docs-gemini-${String(existingDocsTabs + 1).padStart(2, '0')}`;
+        .filter(t => t.name.startsWith('docs-')).length;
+      const tabName = `docs-${String(existingDocsTabs + 1).padStart(2, '0')}`;
 
       // For multi-select: find the rightmost selected tab by position in tab list
       let afterTabId: string | undefined;
@@ -1129,7 +1143,7 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
                   <div className="text-[10px] mt-0.5 flex items-center gap-1.5">
                     {isUpdatingDocs ? <span className="text-blue-600">Processing...</span> : (
                       <>
-                        {/* Update API split button — hover shows claude / gemini provider choice */}
+                        {/* Update API → Haiku split button — hover shows claude / gemini provider choice */}
                         <span
                           className="api-split-btn inline-flex items-center rounded"
                           style={{ height: '18px', position: 'relative' }}
@@ -1145,9 +1159,9 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
                                   border: '1.5px solid #DA7756', borderTopColor: 'transparent',
                                   borderRadius: '50%', animation: 'spin 0.8s linear infinite',
                                 }} />
-                                Update API
+                                Update API → Haiku
                               </span>
-                            ) : 'update api → haiku'}
+                            ) : 'Update API → Haiku'}
                           </code>
                           {/* Popup — absolute, appears on hover of .api-split-btn */}
                           {!isApiLoading && (

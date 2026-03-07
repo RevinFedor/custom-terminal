@@ -603,6 +603,64 @@ function register({ projectManager, formatToolAction }) {
     }
   });
 
+  // Create a pre-filled Claude JSONL session (user question + assistant analysis)
+  // Used by Update API: API response is embedded as assistant message, then Claude --resume shows it
+  ipcMain.handle('claude:create-prefilled-session', async (event, { content, cwd }) => {
+    try {
+      const sessionId = crypto.randomUUID();
+      const uuid1 = crypto.randomUUID();
+      const uuid2 = crypto.randomUUID();
+      const now = new Date().toISOString();
+
+      const projectSlug = cwd.replace(/\//g, '-');
+      const projectDir = path.join(os.homedir(), '.claude', 'projects', projectSlug);
+      if (!fs.existsSync(projectDir)) fs.mkdirSync(projectDir, { recursive: true });
+
+      // Entry 1: user message with FULL API response (visible in Claude TUI)
+      const userEntry = {
+        parentUuid: null,
+        isSidechain: false,
+        userType: 'external',
+        cwd,
+        sessionId,
+        version: '1.0.0',
+        type: 'user',
+        message: { role: 'user', content: 'Результат анализа сессии внешним AI-агентом:\n\n' + content },
+        uuid: uuid1,
+        timestamp: now
+      };
+
+      // Entry 2: short assistant ack (completes the turn so Claude shows prompt on resume)
+      const assistantEntry = {
+        parentUuid: uuid1,
+        isSidechain: false,
+        userType: 'external',
+        cwd,
+        sessionId,
+        version: '1.0.0',
+        type: 'assistant',
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'Принял. Готов применить изменения из анализа выше. Подтвердите командой.' }],
+          model: 'external-api',
+          stop_reason: 'end_turn',
+          stop_sequence: null
+        },
+        uuid: uuid2,
+        timestamp: new Date(Date.now() + 1000).toISOString()
+      };
+
+      const filePath = path.join(projectDir, sessionId + '.jsonl');
+      fs.writeFileSync(filePath, JSON.stringify(userEntry) + '\n' + JSON.stringify(assistantEntry) + '\n', 'utf-8');
+
+      console.log('[Claude Prefilled] Created: ' + filePath + ' (' + content.length + ' chars)');
+      return { success: true, sessionId, filePath, totalChars: content.length };
+    } catch (error) {
+      console.error('[Claude Prefilled] Error:', error);
+      return { success: false, error: error.message };
+    }
+  });
+
   // Fork Claude session file: copy .jsonl with new UUID
   // Searches ALL project directories under ~/.claude/projects/ to find the session file
   ipcMain.handle('claude:fork-session-file', async (event, { sourceSessionId, cwd }) => {
