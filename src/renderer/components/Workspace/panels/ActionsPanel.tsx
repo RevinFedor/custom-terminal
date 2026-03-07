@@ -22,7 +22,7 @@ interface ActionsPanelProps {
 
 export default function ActionsPanel({ activeTabId, embedded = false }: ActionsPanelProps) {
   const {
-    showToast, docPrompt, terminalSelection,
+    showToast, docPrompt, terminalSelection, autoApplyDocs, setAutoApplyDocs,
     copyIncludeEditing: includeEditing, setCopyIncludeEditing: setIncludeEditing,
     copyIncludeReading: includeReading, setCopyIncludeReading: setIncludeReading,
     copyFromStart: fromStart, setCopyFromStart: setFromStart,
@@ -718,12 +718,15 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
       if (!newTabId) throw new Error('Failed to create tab');
       useWorkspaceStore.getState().setTabCommandType(newTabId, 'claude');
 
-      // 6. Launch Claude --resume prefilled session; handshake sends /model haiku + trigger
+      // 6. Launch Claude --resume prefilled session; handshake sends /model haiku (+ auto-confirm if toggle ON)
+      const handshakePrompt = autoApplyDocs
+        ? '/model haiku\nОтветь на промпт выше.'
+        : '/model haiku';
       ipcRenderer.send('claude:run-command', {
         tabId: newTabId,
         command: 'claude-c',
         sessionId: prefilledResult.sessionId,
-        prompt: '/model haiku'
+        prompt: handshakePrompt
       });
 
       showToast('Claude Haiku tab created (' + Math.round(prefilledResult.totalChars / 1024) + 'KB)', 'success');
@@ -1031,19 +1034,16 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
               className="cursor-pointer select-none"
               style={{
                 width: '22px', height: '12px', borderRadius: '6px',
-                backgroundColor: useUIStore.getState().autoApplyDocs ? '#22c55e' : '#333',
+                backgroundColor: autoApplyDocs ? '#22c55e' : '#333',
                 position: 'relative', display: 'inline-block', transition: 'background-color 0.2s',
                 flexShrink: 0,
               }}
-              onClick={() => {
-                const store = useUIStore.getState();
-                store.setAutoApplyDocs(!store.autoApplyDocs);
-              }}
-              title={useUIStore.getState().autoApplyDocs ? 'Auto-apply: ON' : 'Auto-apply: OFF'}
+              onClick={() => setAutoApplyDocs(!autoApplyDocs)}
+              title={autoApplyDocs ? 'Auto-apply: ON — Haiku автоматически применит изменения' : 'Auto-apply: OFF — ручное подтверждение'}
             >
               <span style={{
                 position: 'absolute', top: '2px',
-                left: useUIStore.getState().autoApplyDocs ? '12px' : '2px',
+                left: autoApplyDocs ? '12px' : '2px',
                 width: '8px', height: '8px', borderRadius: '50%',
                 backgroundColor: '#fff', transition: 'left 0.2s',
               }} />
