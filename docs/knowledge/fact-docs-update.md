@@ -87,7 +87,9 @@ Gemini-оркестратор может вызвать `update_docs` как MCP
 
 **Knowledge Inclusion:** Все три метода включают содержимое `docs/knowledge/*.md` через IPC `docs:read-knowledge-base`, достигая точности интерактивных сессий.
 
-**Motivation:** Целевой гибрид между скоростью API и полнотой контекста. Headless `gemini -p` дает доступ к 11K-токенному системному промпту GEMINI.md, чего нет в обычном API.
+**Auto-apply Toggle:** Мини-тогл рядом с иконкой настроек (⚙) в секции System. Когда включен (`autoApplyDocs: true`), handshake отправляет `/model haiku\nОтветь на промпт выше.` вместо просто `/model haiku`. Это заставляет Haiku автоматически начать применение изменений без ручного подтверждения. Состояние хранится в `localStorage('noted-terminal-auto-apply-docs')`, по умолчанию OFF.
+
+**Motivation:** Целевой гибрид между скоростью API и полнотой контекста. Все три метода теперь включают knowledge base, поэтому качество ответов эквивалентно. Headless `gemini -p` сохраняется как альтернативный канал (не зависит от API-ключей, дополнительный GEMINI.md контекст).
 
 ## Code Map
 - **UI & Logic:** `src/renderer/components/Workspace/panels/ActionsPanel.tsx` -> `handleUpdateDocs`.

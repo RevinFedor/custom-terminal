@@ -19,22 +19,25 @@
 ## 2. Headless Mode: `gemini -p` (Update API)
 Использование `gemini -p` в фоновом режиме (stdin) для API-запросов к Gemini без открытия интерактивного терминала.
 
-### Motivation
-- **System Prompt Access:** Headless mode имеет доступ к полному 11K-токенному системному промпту из `GEMINI.md`, чего нет в стандартном Gemini API.
-- **Context Inclusion:** Полная интеграция с документацией проекта (`docs/knowledge/*.md`).
-- **Process Model:** Stdin-based вместо CLI arguments обходит ограничения длины shell.
+### Motivation (уточнение)
+Изначально предполагалось, что headless mode дает лучшее качество ответов за счёт 11K-токенного системного промпта GEMINI.md. **На практике разница оказалась незначительной** — реальная проблема качества была в отсутствии `docs/knowledge/` файлов в промпте API-хендлеров. После добавления `docs:read-knowledge-base` во все три метода (claude-api, gemini-api, gemini -p) качество выровнялось.
+
+Текущие причины сохранения `gemini -p` как опции:
+- **Альтернативный канал:** Не зависит от API-ключей и rate limits Gemini HTTP API
+- **GEMINI.md контекст:** Дополнительные инструкции из проектного GEMINI.md (помимо knowledge base)
+- **Stdin-based:** Обходит ограничения длины shell arguments
 
 ### Implementation
 ```bash
-echo -e "Your prompt text\nfor gemini" | gemini -p
+echo "prompt" | gemini -p "" -m gemini-3-flash-preview -o json --approval-mode plan
 ```
 
-Система передает полный контекст + инструкцию через stdin. Gemini обрабатывает и выводит результат в stdout, который перехватывается.
+Промпт передается через stdin. Флаг `-o json` возвращает структурированный ответ с метриками. `--approval-mode plan` — read-only (без изменения файлов).
 
-### Invisible Intent (Почему mejor than API)
-1. **Системный промпт:** API Gemini использует урезанный промпт без файла `GEMINI.md`. Headless получает полный 11K.
-2. **Качество ответов:** Эквивалентно CLI-качеству для сложных задач анализа.
-3. **Надежность:** Нет зависимостей от API версионирования. Используется локальная установка.
+### Реализация в коде
+- **IPC:** `docs:gemini-cli-request` в `ipc/docs.js`
+- **Функция:** `callGeminiCli(system, prompt, model, cwd)` — записывает промпт во временный файл, запускает `execFile('gemini', ...)`, парсит JSON stdout
+- **Timeout:** 5 минут, maxBuffer 50MB
 
 ---
 

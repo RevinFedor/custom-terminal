@@ -63,6 +63,7 @@ MCP-инструмент `docs_search` доступен для поиска по
 
 ## AI Features
 - **Update API (Haiku pipeline):** Двухэтапный пайплайн для обновления документации. Анализ через Claude/Gemini API (или headless `gemini -p`), затем открытие Claude в табе `docs-XX` с моделью Haiku для применения правок.
+- **Auto-apply Toggle:** Мини-тогл рядом с ⚙ в секции System. Когда ON — Haiku автоматически начинает применение изменений (handshake добавляет `Ответь на промпт выше.`). По умолчанию OFF.
 - **Claude Extended Thinking:** Поддержка режима размышления для API Claude (версия 2025-04-15) с уровнями Low/Med/High (бюджет до 50к токенов).
 
 ## Ключевые решения (Knowledge Base)

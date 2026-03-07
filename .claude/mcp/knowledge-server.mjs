@@ -13,9 +13,12 @@ import { fileURLToPath } from 'url';
 import { createInterface } from 'readline';
 import { execFile } from 'child_process';
 
-// Resolve project root: server is at PROJECT/.claude/mcp/knowledge-server.mjs
+// Resolve project root: --project /path, or CLAUDE_PROJECT_DIR, or cwd, or relative to script
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const PROJECT_DIR = process.env.CLAUDE_PROJECT_DIR || join(__dirname, '..', '..');
+const projectArgIdx = process.argv.indexOf('--project');
+const PROJECT_DIR = (projectArgIdx !== -1 && process.argv[projectArgIdx + 1])
+  ? process.argv[projectArgIdx + 1]
+  : process.env.CLAUDE_PROJECT_DIR || process.cwd();
 const INDEX_PATH = join(PROJECT_DIR, '.semantic-index.json');
 
 const MAX_FILE_CHARS = 12000;
