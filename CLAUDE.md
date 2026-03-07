@@ -61,6 +61,10 @@ MCP-инструмент `docs_search` доступен для поиска по
 - **Playwright-тесты:** `auto/` — запуск: `node auto/stable/test-name.js`
 - **Observability:** В Main-процессе реализовано логирование `[GeminiSpinner] THINKING/IDLE` и `[Spinner] BUSY/IDLE` для E2E тестов.
 
+## AI Features
+- **Update API (Haiku pipeline):** Двухэтапный пайплайн для обновления документации. Анализ через Claude/Gemini API (или headless `gemini -p`), затем открытие Claude в табе `docs-XX` с моделью Haiku для применения правок.
+- **Claude Extended Thinking:** Поддержка режима размышления для API Claude (версия 2025-04-15) с уровнями Low/Med/High (бюджет до 50к токенов).
+
 ## Ключевые решения (Knowledge Base)
 ### AI Orchestration
 - **Performance Lags:** [`fix-performance-lags.md`](docs/knowledge/fix-performance-lags.md) — устранение фризов через инкрементальное чтение и оптимизацию селекторов.
@@ -77,6 +81,8 @@ MCP-инструмент `docs_search` доступен для поиска по
 - **Multi-instance Isolation:** [`fix-mcp-multi-instance.md`](docs/knowledge/fix-mcp-multi-instance.md) — изоляция портов через PID.
 - **Interceptor Re-arm:** [`fact-interceptor-rearm.md`](docs/knowledge/fact-interceptor-rearm.md) — ручное вмешательство и управление перехватом ответов субагентов.
 - **Lifecycle Management:** [`fact-mcp-v2-lifecycle.md`](docs/knowledge/fact-mcp-v2-lifecycle.md) — закрытие суб-агентов через `close_sub_agent`.
+- **Documentation Updates:** [`fact-docs-update.md`](docs/knowledge/fact-docs-update.md) — пайплайн Update API с Haiku, выбор провайдера (Claude/Gemini API, Gemini CLI headless), интеграция базы знаний.
+- **Docs Sessions:** [`fact-claude-sessions.md`](docs/knowledge/fact-claude-sessions.md) — управление prefilled JSONL для Claude в контексте обновления документации.
 
 ### Infrastructure & Data Layer
 - **Production Logs:** [`fix-packaged-app-logs.md`](docs/knowledge/fix-packaged-app-logs.md) — почему нельзя писать логи в `app.asar`.

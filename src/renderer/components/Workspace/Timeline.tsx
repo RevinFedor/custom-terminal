@@ -50,6 +50,7 @@ interface TimelineProps {
   cwd: string;
   isActive?: boolean; // Claude/Gemini is currently running
   isVisible?: boolean; // New prop to control visibility from parent
+  isOpen?: boolean; // CMD+] toggle — controls slide in/out
   toolType?: 'claude' | 'gemini'; // Which AI tool this timeline is for
 }
 
@@ -194,8 +195,21 @@ function computeGroups(entries: TimelineEntry[]): Map<number, GroupInfo> {
   return groups;
 }
 
-function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, toolType = 'claude' }: TimelineProps) {
+function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, isOpen = true, toolType = 'claude' }: TimelineProps) {
   const isGemini = toolType === 'gemini';
+
+  // Slide animation (matches HistoryPanel pattern)
+  const [slideIn, setSlideIn] = useState(isOpen);
+  useEffect(() => {
+    if (isOpen) {
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => setSlideIn(true));
+      });
+    } else {
+      setSlideIn(false);
+    }
+  }, [isOpen]);
+
   const [entries, setEntries] = useState<TimelineEntry[]>([]);
   const [forkMarkers, setForkMarkers] = useState<ForkMarker[]>([]);
   const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
@@ -1430,14 +1444,15 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
         data-timeline
         className="relative flex flex-col group"
         style={{
-          width: '32px',
+          width: slideIn ? '32px' : '0px',
           backgroundColor: 'rgba(0, 0, 0, 0.2)',
           backdropFilter: 'blur(4px)',
-          borderLeft: '1px solid rgba(255, 255, 255, 0.05)',
+          borderLeft: slideIn ? '1px solid rgba(255, 255, 255, 0.05)' : 'none',
           height: '100%',
           zIndex: 40,
           visibility: isVisible ? 'inherit' : 'hidden',
-          overflow: 'visible',
+          overflow: slideIn ? 'visible' : 'hidden',
+          transition: 'width 50ms ease-out',
         }}
       >
         {/* Central Axis Line (compact mode only) */}
@@ -1712,7 +1727,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
                   onDoubleClick={() => handleEntryDoubleClick(entry)}
                   onContextMenu={(e) => handleRightClick(e, entry)}
                   style={{
-                    flex: '1 0 auto',
+                    flex: `1 0 ${treeMode ? '22px' : (showAsChild ? '14px' : '20px')}`,
                     minHeight: treeMode ? '22px' : (showAsChild ? '14px' : '20px'),
                     justifyContent: treeMode ? 'flex-start' : 'center',
                     paddingLeft: treeMode
@@ -1741,7 +1756,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, to
                       borderRadius: dotRadius,
                       backgroundColor: dotColor,
                       boxShadow: dotGlow,
-                      transition: 'background-color 0.2s, box-shadow 0.2s',
+                      transition: 'width 0.15s, height 0.15s, border-radius 0.15s, background-color 0.2s, box-shadow 0.2s',
                     }}
                   />
 

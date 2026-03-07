@@ -57,6 +57,27 @@ Thinking mode при запуске обеспечивается `alwaysThinking
 - **Feedback:** Статус блокировки транслируется в Renderer через IPC `claude:ctrlc-danger-zone`.
 - **Подробнее:** См. `knowledge/fix-claude-ctrlc-exit.md`.
 
+## Prefilled Sessions (Documentation Update Flow)
+Механизм создания Claude сессии «извне» с предзаполненными сообщениями для Update API → Haiku пайплайна.
+
+### JSONL Structure
+При создании prefilled сессии в JSONL записываются 2 записи:
+
+```jsonl
+{"uuid":"...", "role":"user", "sessionId":"...", "parentUuid":null, "content":"Анализ API:\n...", "metadata":{...}}
+{"uuid":"...", "role":"assistant", "sessionId":"...", "parentUuid":"...", "content":"Готово для редактирования.", ...}
+```
+
+### Invisible Intent: Why User Message for Analysis?
+- **Видимость в TUI:** Когда Claude загружает сессию, пользователь сразу видит анализ в истории. Если анализ был в Assistant, он находился бы "перед" промптом, что запутало бы интерфейс.
+- **Завершение turn:** Assistant сообщение (короткое подтверждение) гарантирует, что turn завершился (`end_turn`). Claude вернет промпт `❯`, позволяя пользователю редактировать или отправлять уточнения.
+- **Stateless API:** Никакого серверного состояния. JSONL — это полный снимок сессии.
+
+### Resume Handshake (Model Switching)
+После открытия prefilled сессии система может отправить `/model haiku` через `claude-c` (continue) для немедленного переключения на Haiku:
+- `resumeSessionId` передается в IPC при создании таба
+- Prompt `\n/model haiku\r` вставляется после детекции готовности Claude
+
 ## Behavior Specs
 - **Claude Process Monitor:** Виджет на Dashboard для отслеживания всех запущенных в системе процессов Claude CLI.
     - **In-App:** Процессы, запущенные из терминалов приложения. Отображаются с указанием "Имя Проекта / Имя Таба".

@@ -69,11 +69,33 @@ Gemini-оркестратор может вызвать `update_docs` как MCP
 - **HTTP endpoint:** `POST /update-docs` в MCP HTTP bridge (main.js). Timeout: до 5 минут (зависит от числа сессий и размера).
 - **API функции:** `callClaudeApi()` и `callGeminiApi()` вынесены как переиспользуемые exports из `ipc/docs.js`. Используются и IPC хендлером `docs:api-request`, и HTTP endpoint.
 
+### Update API → Haiku Pipeline (Direct Method)
+**Новый метод (2026-03)** для обновления документации без необходимости открытия интерактивной сессии Gemini.
+
+**Кнопка:** Оранжевая кнопка "Update API" в ActionsPanel (рядом с кнопкой Gemini).
+
+**Пайплайн:**
+1. **Provider Selection:** Popup меню выбора провайдера:
+   - `claude-api` — Direct Claude API call
+   - `gemini-api` — Direct Gemini API call
+   - `gemini -p` — Gemini CLI headless mode (stdin)
+2. **Analysis:** API анализирует экспортированную сессию + полную папку `docs/knowledge/` (~170K токенов) + систему промптов
+3. **Prefilled Claude Session:** Результат оборачивается в JSONL с 2 записями:
+   - User: анализ + инструкция (видно в TUI Claude)
+   - Assistant: короткий ответ подтверждения (для завершения turn)
+4. **Haiku Tab:** Открывается новый таб `docs-XX` с Claude + моделью Haiku, где пользователь может применить или уточнить правки
+
+**Knowledge Inclusion:** Все три метода включают содержимое `docs/knowledge/*.md` через IPC `docs:read-knowledge-base`, достигая точности интерактивных сессий.
+
+**Motivation:** Целевой гибрид между скоростью API и полнотой контекста. Headless `gemini -p` дает доступ к 11K-токенному системному промпту GEMINI.md, чего нет в обычном API.
+
 ## Code Map
 - **UI & Logic:** `src/renderer/components/Workspace/panels/ActionsPanel.tsx` -> `handleUpdateDocs`.
 - **Main Process:** `docs:save-temp` — сохранение данных сессии в `<projectPath>/tmp/`. Промпт отправляется через `terminal:paste` → `safePasteAndSubmit(fast=true)` (Bracketed Paste Mode, chunked < 900B, 500ms delay before Enter).
+- **API Integration:** `src/main/ipc/docs.js` — `callClaudeApi()`, `callGeminiApi()`, headless `gemini -p` execution.
 - **Styles:** Анимация вращающегося кольца при загрузке.
 - **Fixes:**
     - `knowledge/fact-export-session.md` — детали унифицированного экспорта.
     - `knowledge/fact-ux-patterns.md` — механизм удержания выделения табов.
     - `knowledge/fact-claude-tui-mechanics.md` — как работает вставка больших промптов.
+    - `knowledge/fact-claude-sessions.md` — Prefilled Sessions для обновления документации.
