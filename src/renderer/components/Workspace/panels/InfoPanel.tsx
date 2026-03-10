@@ -70,6 +70,19 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
   const timelineTreeModeTabs = useUIStore((s) => s.timelineTreeModeTabs);
   const setTimelineTreeMode = useUIStore((s) => s.setTimelineTreeMode);
   const isTreeMode = activeTabId ? (timelineTreeModeTabs[activeTabId] ?? false) : false;
+  const [historyLoading, setHistoryLoading] = useState(false);
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const { tabId, loading } = (e as CustomEvent).detail;
+      if (tabId === activeTabId) setHistoryLoading(loading);
+    };
+    window.addEventListener('history-panel:loading', handler);
+    return () => window.removeEventListener('history-panel:loading', handler);
+  }, [activeTabId]);
+  // Reset when history closes
+  useEffect(() => {
+    if (!isHistoryOpen) setHistoryLoading(false);
+  }, [isHistoryOpen]);
   const { getPromptById } = usePromptsStore();
   const wordWrap = useUIStore((s) => s.wordWrap);
   const tabNotesFontSize = useUIStore((s) => s.tabNotesFontSize);
@@ -385,7 +398,11 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
           {/* Tree mode toggle — for any AI session with timeline */}
           {hasAnySession && activeTabId && (
             <button
-              onClick={() => setTimelineTreeMode(activeTabId, !isTreeMode)}
+              onClick={() => {
+                const next = !isTreeMode;
+                if (next) setHistoryPanelOpen(activeTabId, false); // mutual exclusion
+                setTimelineTreeMode(activeTabId, next);
+              }}
               className="cursor-pointer"
               style={{
                 background: 'none',
@@ -395,7 +412,7 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
               }}
               onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.color = isTreeMode ? '#a5b4fc' : '#888'; }}
               onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.color = isTreeMode ? '#818cf8' : '#555'; }}
-              title={isTreeMode ? 'Close tree view' : 'Open tree view'}
+              title={isTreeMode ? 'Close tree view (⌘])' : 'Open tree view (⌘])'}
             >
               <GitBranch size={12} />
             </button>
@@ -403,20 +420,30 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
           {/* AI Session button */}
           {hasAnySession && activeTabId ? (
             <button
-              onClick={() => setHistoryPanelOpen(activeTabId, !isHistoryOpen)}
+              onClick={() => {
+                const next = !isHistoryOpen;
+                if (next) setTimelineTreeMode(activeTabId, false); // mutual exclusion
+                setHistoryPanelOpen(activeTabId, next);
+              }}
               className="flex items-center cursor-pointer"
               style={{
                 gap: 5,
                 background: 'none',
                 border: 'none',
                 padding: 0,
-                color: isHistoryOpen ? '#ccc' : '#888',
+                color: isHistoryOpen ? '#818cf8' : '#555',
               }}
-              onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.color = '#fff'; }}
-              onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.color = isHistoryOpen ? '#ccc' : '#888'; }}
-              title={isHistoryOpen ? 'Close History' : 'Open History'}
+              onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.color = isHistoryOpen ? '#a5b4fc' : '#888'; }}
+              onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.color = isHistoryOpen ? '#818cf8' : '#555'; }}
+              title={isHistoryOpen ? 'Close History (⌘\\)' : 'Open History (⌘\\)'}
             >
-              <ScrollText size={12} />
+              {isHistoryOpen && historyLoading ? (
+                <svg width="12" height="12" viewBox="0 0 16 16" style={{ animation: 'spinner-rotate 1s linear infinite', flexShrink: 0 }}>
+                  <circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" strokeWidth="2" strokeDasharray="28" strokeDashoffset="8" strokeLinecap="round" />
+                </svg>
+              ) : (
+                <ScrollText size={12} />
+              )}
               <span className="text-[11px] uppercase">AI Session</span>
             </button>
           ) : (

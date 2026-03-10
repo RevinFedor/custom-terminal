@@ -480,6 +480,11 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
     }
   }, [sessionId, cwd, scrollToBottom, toolType]);
 
+  // Broadcast loading state to InfoPanel button
+  useEffect(() => {
+    window.dispatchEvent(new CustomEvent('history-panel:loading', { detail: { tabId, loading } }));
+  }, [loading, tabId]);
+
   // Initial load on mount / session change / tool type switch
   useEffect(() => {
     setLoading(true);
@@ -713,7 +718,10 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
       {/* Content */}
       <div style={{ flex: 1, overflow: 'hidden' }}>
         {loading ? (
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: '#666', fontSize: 13 }}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: '#818cf8', fontSize: 13, gap: 8 }}>
+            <svg width="16" height="16" viewBox="0 0 16 16" style={{ animation: 'spinner-rotate 1s linear infinite' }}>
+              <circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" strokeWidth="2" strokeDasharray="28" strokeDashoffset="8" strokeLinecap="round" />
+            </svg>
             Loading...
           </div>
         ) : entries.length === 0 ? (

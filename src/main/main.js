@@ -3250,23 +3250,13 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
               console.log('[Spinner:DIAG] Tab ' + tabId.slice(-8) + ' BoundarySM=idle but spinner char U+' + _match[0].charCodeAt(0).toString(16).toUpperCase() + ' at pos ' + _idx + '/' + contentStripped.length + ' ctx="' + _ctx + '"');
             }
           }
-          // Spinner in content → BUSY, reset idle timer
+          // Spinner in content → BUSY, restart idle countdown.
+          // FIX: Always restart the 500ms timer (not just clear it).
+          // If PTY goes silent after this chunk (e.g. "✻ Churned for 2m" is the last output),
+          // the timer fires on its own. Previously we cleared+deleted the timer here,
+          // relying on a FUTURE no-spinner chunk to start debounce — but if no chunk came,
+          // spinner stayed BUSY forever until user switched tabs (triggering Ink re-render).
           clearTimeout(claudeSpinnerIdleTimer.get(tabId));
-          claudeSpinnerIdleTimer.delete(tabId);
-          // Cancel deferred completion re-check — Claude is working again
-          if (subAgentDeferredCheck.has(tabId)) {
-            clearTimeout(subAgentDeferredCheck.get(tabId));
-            subAgentDeferredCheck.delete(tabId);
-          }
-          if (!claudeSpinnerBusy.get(tabId)) {
-            claudeSpinnerBusy.set(tabId, true);
-            console.log('[Spinner] Tab ' + tabId + ': BUSY');
-            if (mainWindow && !mainWindow.isDestroyed()) {
-              mainWindow.webContents.send('claude:busy-state', { tabId, busy: true });
-            }
-          }
-        } else if (claudeSpinnerBusy.get(tabId) && !claudeSpinnerIdleTimer.has(tabId)) {
-          // Was busy, no spinner in this chunk → start 500ms debounce
           claudeSpinnerIdleTimer.set(tabId, setTimeout(function() {
             claudeSpinnerBusy.set(tabId, false);
             claudeSpinnerIdleTimer.delete(tabId);
@@ -3297,6 +3287,18 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
               }
             }
           }, 500));
+          // Cancel deferred completion re-check — Claude is working again
+          if (subAgentDeferredCheck.has(tabId)) {
+            clearTimeout(subAgentDeferredCheck.get(tabId));
+            subAgentDeferredCheck.delete(tabId);
+          }
+          if (!claudeSpinnerBusy.get(tabId)) {
+            claudeSpinnerBusy.set(tabId, true);
+            console.log('[Spinner] Tab ' + tabId + ': BUSY');
+            if (mainWindow && !mainWindow.isDestroyed()) {
+              mainWindow.webContents.send('claude:busy-state', { tabId, busy: true });
+            }
+          }
         }
       }
       // ========== END CLAUDE BUSY DETECTION ==========
