@@ -35,6 +35,10 @@
     font-style: normal;
   }
 
+  @keyframes spinner-rotate {
+    to { transform: rotate(360deg); }
+  }
+
   @keyframes slideIn {
     from {
       opacity: 0;

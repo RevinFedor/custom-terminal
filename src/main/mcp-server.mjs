@@ -281,7 +281,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           content: [
             {
               type: 'text',
-              text: 'Task accepted. ID: ' + result.taskId + (args.session_id ? ' (resuming session ' + args.session_id.substring(0, 8) + '...)' : '') + '\nClaude is now working in a terminal tab. The result will be AUTOMATICALLY injected into your conversation when done — no need to poll or check status. Just continue with your other work.',
+              text: 'Task accepted. ID: ' + result.taskId + (args.session_id ? ' (resuming session ' + args.session_id.substring(0, 8) + '...)' : '') + '\nClaude is now working in a terminal tab. The result will be AUTOMATICALLY injected into your conversation when done — no need to poll or check status.' + '\n\nIMPORTANT: Do NOT fabricate or predict Claude\'s response. Do NOT generate [claude sub-agent response] tags. Say a brief confirmation and STOP generating.',
             },
           ],
         };
@@ -298,7 +298,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           content: [
             {
               type: 'text',
-              text: 'Follow-up sent to agent ' + args.taskId + '. The result will be AUTOMATICALLY injected into your conversation when done — no need to poll or check status.',
+              text: 'Follow-up sent to agent ' + args.taskId + '. The result will be AUTOMATICALLY injected into your conversation when done — no need to poll or check status.' + '\n\nIMPORTANT: Do NOT fabricate or predict the response. Say a brief confirmation and STOP generating. Wait for the real [Claude Sub-Agent Response].',
             },
           ],
         };

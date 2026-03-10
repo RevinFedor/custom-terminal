@@ -62,8 +62,8 @@ export default function Workspace() {
   const historyPanelOpenTabs = useUIStore((s) => s.historyPanelOpenTabs);
   const historyPanelWidth = useUIStore((s) => s.historyPanelWidth);
   const setHistoryPanelOpen = useUIStore((s) => s.setHistoryPanelOpen);
-  const timelinePanelOpenTabs = useUIStore((s) => s.timelinePanelOpenTabs);
-  const setTimelinePanelOpen = useUIStore((s) => s.setTimelinePanelOpen);
+  const timelineTreeModeTabs = useUIStore((s) => s.timelineTreeModeTabs);
+  const setTimelineTreeMode = useUIStore((s) => s.setTimelineTreeMode);
   const setProjectView = useWorkspaceStore((s) => s.setProjectView);
   const viewingSubAgentTabId = useWorkspaceStore((s) => s.getActiveProject()?.viewingSubAgentTabId ?? null);
   const setViewingSubAgentTabId = useWorkspaceStore((s) => s.setViewingSubAgent);
@@ -248,16 +248,16 @@ export default function Workspace() {
         if (hasSession) {
           e.preventDefault();
           const currentOpen = useUIStore.getState().historyPanelOpenTabs[effectiveTab.id] ?? false;
-          if (!currentOpen) setTimelinePanelOpen(effectiveTab.id, false); // close timeline when opening history
+          if (!currentOpen) setTimelineTreeMode(effectiveTab.id, false); // close tree mode when opening history
           setHistoryPanelOpen(effectiveTab.id, !currentOpen);
         }
       }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [workspaceView, effectiveTab?.id, effectiveClaudeSessionId, effectiveGeminiSessionId, effectiveCommandType, setHistoryPanelOpen, setTimelinePanelOpen]);
+  }, [workspaceView, effectiveTab?.id, effectiveClaudeSessionId, effectiveGeminiSessionId, effectiveCommandType, setHistoryPanelOpen, setTimelineTreeMode]);
 
-  // CMD+] hotkey to toggle timeline panel
+  // CMD+] hotkey to toggle timeline tree mode
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (workspaceView !== 'workspace') return;
@@ -267,15 +267,15 @@ export default function Workspace() {
           (effectiveCommandType === 'gemini' && effectiveGeminiSessionId);
         if (hasSession) {
           e.preventDefault();
-          const currentOpen = useUIStore.getState().timelinePanelOpenTabs[effectiveTab.id] ?? true;
-          if (!currentOpen) setHistoryPanelOpen(effectiveTab.id, false); // close history when opening timeline
-          setTimelinePanelOpen(effectiveTab.id, !currentOpen);
+          const current = useUIStore.getState().timelineTreeModeTabs[effectiveTab.id] ?? false;
+          if (!current) setHistoryPanelOpen(effectiveTab.id, false); // close history when opening tree mode
+          setTimelineTreeMode(effectiveTab.id, !current);
         }
       }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [workspaceView, effectiveTab?.id, effectiveClaudeSessionId, effectiveGeminiSessionId, effectiveCommandType, setTimelinePanelOpen, setHistoryPanelOpen]);
+  }, [workspaceView, effectiveTab?.id, effectiveClaudeSessionId, effectiveGeminiSessionId, effectiveCommandType, setTimelineTreeMode, setHistoryPanelOpen]);
 
   // CMD+F hotkey for terminal search
   useEffect(() => {
@@ -388,9 +388,6 @@ export default function Workspace() {
 
   // DEBUG: Uncomment to debug Timeline visibility
   // console.log('[Timeline Debug] showTimeline:', showTimeline, 'claudeSessionId:', claudeSessionId, 'commandType:', activeTab?.commandType, 'isRunning:', isCommandRunning);
-
-  // Per-tab timeline panel state (default: open)
-  const isTimelineOpen = effectiveTab?.id ? (timelinePanelOpenTabs[effectiveTab.id] ?? true) : true;
 
   // Per-tab history panel state
   const isHistoryOpen = effectiveTab?.id ? (historyPanelOpenTabs[effectiveTab.id] ?? false) : false;
@@ -529,7 +526,7 @@ export default function Workspace() {
               cwd={effectiveTab.cwd || currentProject.path}
               isActive={isCommandRunning}
               isVisible={workspaceView === 'workspace' && currentView === 'terminal'}
-              isOpen={isTimelineOpen}
+              isOpen={true}
               toolType={timelineToolType}
             />
           )}
