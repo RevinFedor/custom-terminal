@@ -140,6 +140,22 @@ export default function SubAgentBar({ projectId }: SubAgentBarProps) {
     return () => { ipcRenderer.removeListener('sub-agent-context-menu-command', handler); };
   }, [setViewingSubAgent]);
 
+  // ========== LISTEN FOR ADOPT STATUS UPDATES ==========
+  useEffect(() => {
+    const handler = (_: any, data: { claudeTabId: string; geminiTabId: string; status: string }) => {
+      const state = useWorkspaceStore.getState();
+      // Update tab status based on adoption phase
+      if (data.status === 'summarizing') {
+        state.setTabParent(data.claudeTabId, data.geminiTabId);
+        state.setClaudeAgentStatus(data.claudeTabId, 'summarizing');
+      } else if (data.status === 'ready') {
+        state.setClaudeAgentStatus(data.claudeTabId, 'done');
+      }
+    };
+    ipcRenderer.on('mcp:agent-adopted', handler);
+    return () => { ipcRenderer.removeListener('mcp:agent-adopted', handler); };
+  }, []);
+
   const handleLabelClick = useCallback(() => {
     if (viewingSubAgentTabId) setViewingSubAgent(null);
   }, [viewingSubAgentTabId, setViewingSubAgent]);
@@ -207,6 +223,7 @@ export default function SubAgentBar({ projectId }: SubAgentBarProps) {
             const isRunning = tab.claudeAgentStatus === 'running';
             const isDone = tab.claudeAgentStatus === 'done';
             const isError = tab.claudeAgentStatus === 'error';
+            const isSummarizing = tab.claudeAgentStatus === 'summarizing';
             const alive = tab.claudeActive !== false; // undefined (pre-existing tabs) treated as alive
             const taskCount = tab.claudeTaskCount || 0;
             const isBusy = tab.claudeBusy === true;
@@ -215,7 +232,10 @@ export default function SubAgentBar({ projectId }: SubAgentBarProps) {
             // Indicator color: interceptor state shown via color, busy via spinner
             let dotColor: string;
             let dotSpinning = false;
-            if (!alive) {
+            if (isSummarizing) {
+              dotColor = '#6366f1'; // indigo spinner during API summarization
+              dotSpinning = true;
+            } else if (!alive) {
               dotColor = 'rgba(255,255,255,0.25)'; // gray = dead
             } else if (isBusy) {
               dotColor = '#a6e3a1'; // green spinner when busy
@@ -226,7 +246,9 @@ export default function SubAgentBar({ projectId }: SubAgentBarProps) {
 
             // Status text after name (running state shown by pulsing ● only)
             let statusText = '';
-            if (isError && alive) {
+            if (isSummarizing) {
+              statusText = 'summarizing...';
+            } else if (isError && alive) {
               statusText = 'error';
             } else if (taskCount > 0) {
               statusText = taskCount === 1 ? '1 task' : `${taskCount} tasks`;
@@ -259,7 +281,7 @@ export default function SubAgentBar({ projectId }: SubAgentBarProps) {
                 }}
                 title={tooltipParts.join('\n')}
               >
-                {/* Process indicator: spinner when busy, dot when idle */}
+                {/* Process indicator: spinner when busy/summarizing, dot when idle */}
                 {dotSpinning ? (
                   <span
                     style={{
@@ -267,8 +289,8 @@ export default function SubAgentBar({ projectId }: SubAgentBarProps) {
                       width: '8px',
                       height: '8px',
                       borderRadius: '50%',
-                      border: '1.5px solid rgba(166, 227, 161, 0.2)',
-                      borderTopColor: '#a6e3a1',
+                      border: `1.5px solid ${isSummarizing ? 'rgba(99, 102, 241, 0.2)' : 'rgba(166, 227, 161, 0.2)'}`,
+                      borderTopColor: dotColor,
                       boxSizing: 'border-box',
                       animation: 'tab-dot-spin 0.8s linear infinite',
                       verticalAlign: 'middle',
@@ -285,12 +307,12 @@ export default function SubAgentBar({ projectId }: SubAgentBarProps) {
                     {alive ? '\u25CF' : '\u25CC'}
                   </span>
                 )}
-                <span>Claude #{i + 1}</span>
+                <span>{tab.name || ('Claude #' + (i + 1))}</span>
                 {statusText && (
                   <span style={{
-                    color: isError ? '#f38ba8' : isRunning ? '#DA7756' : 'rgba(255,255,255,0.4)',
+                    color: isSummarizing ? '#6366f1' : isError ? '#f38ba8' : isRunning ? '#DA7756' : 'rgba(255,255,255,0.4)',
                     fontSize: '10px',
-                    fontStyle: isRunning ? 'italic' : 'normal',
+                    fontStyle: (isRunning || isSummarizing) ? 'italic' : 'normal',
                   }}>
                     {isError ? '\u2717 ' : ''}{statusText}
                   </span>

@@ -17,6 +17,7 @@ class DatabaseManager {
     this.createDefaultPrompts();
     this.seedDefaultAIPrompts();
     this.ensureRewindPrompt();
+    this.ensureAdoptPrompt();
   }
 
   initTables() {
@@ -770,6 +771,17 @@ class DatabaseManager {
         is_built_in: 1,
         show_in_context_menu: 0,
         position: 2
+      },
+      {
+        id: 'adopt',
+        name: 'Adopt Summary',
+        content: 'Ниже — сессия разработки Claude Code. Ответь СТРОГО в формате:\nTASK: [что делал агент, 1 предложение]\nSTATUS: [done | in_progress | blocked]\nFILES: [затронутые файлы, до 10]\nDONE: [что сделано, 2-3 предложения]\nPROBLEMS: [нерешённые проблемы]\nNEXT: [что делать дальше]\n',
+        model: 'gemini-3-flash-preview',
+        thinking_level: 'NONE',
+        color: '#6366f1',
+        is_built_in: 1,
+        show_in_context_menu: 0,
+        position: 4
       }
     ];
 
@@ -805,7 +817,29 @@ class DatabaseManager {
     }
   }
 
-  // ========== AI SESSIONS ========== 
+  // Ensure built-in 'adopt' prompt exists (migration for existing DBs)
+  ensureAdoptPrompt() {
+    const exists = this.db.prepare('SELECT id FROM ai_prompts WHERE id = ?').get('adopt');
+    if (!exists) {
+      this.db.prepare(`
+        INSERT INTO ai_prompts (id, name, content, model, thinking_level, color, is_built_in, show_in_context_menu, position)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        'adopt',
+        'Adopt Summary',
+        'Ниже — сессия разработки Claude Code. Ответь СТРОГО в формате:\nTASK: [что делал агент, 1 предложение]\nSTATUS: [done | in_progress | blocked]\nFILES: [затронутые файлы, до 10]\nDONE: [что сделано, 2-3 предложения]\nPROBLEMS: [нерешённые проблемы]\nNEXT: [что делать дальше]\n',
+        'gemini-3-flash-preview',
+        'NONE',
+        '#6366f1',
+        1,
+        0,
+        4
+      );
+      console.log('[DB] Migrated: added adopt prompt');
+    }
+  }
+
+  // ========== AI SESSIONS ==========
 
   saveAISession(projectId, toolType, sessionKey, contentBlob, originalCwd, originalHash = null) {
     const existing = this.db.prepare('SELECT id FROM ai_sessions WHERE project_id = ? AND tool_type = ? AND session_key = ?').get(projectId, toolType, sessionKey);

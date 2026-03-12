@@ -438,7 +438,7 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
               title={isHistoryOpen ? 'Close History (⌘\\)' : 'Open History (⌘\\)'}
             >
               {isHistoryOpen && historyLoading ? (
-                <svg width="12" height="12" viewBox="0 0 16 16" style={{ animation: 'spinner-rotate 1s linear infinite', flexShrink: 0 }}>
+                <svg width="12" height="12" viewBox="0 0 16 16" style={{ animation: 'spinner-rotate 1s linear infinite', willChange: 'transform', flexShrink: 0 }}>
                   <circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" strokeWidth="2" strokeDasharray="28" strokeDashoffset="8" strokeLinecap="round" />
                 </svg>
               ) : (
