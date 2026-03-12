@@ -46,7 +46,7 @@ interface Tab {
   notes?: string; // Tab-specific notes
   isCollapsed?: boolean; // Collapsed tab — icon-only, for archiving completed sessions
   claudeAgentSessionId?: string; // Claude Agent SDK session ID (for @claude:...@end orchestration)
-  claudeAgentStatus?: 'idle' | 'running' | 'done' | 'error'; // Claude Agent current status
+  claudeAgentStatus?: 'idle' | 'running' | 'done' | 'error' | 'summarizing'; // Claude Agent current status
   claudeActive?: boolean; // True if Claude CLI is running inside PTY (not just shell alive)
   claudeBusy?: boolean; // True if Claude CLI spinner is active (from claude:busy-state)
   claudeTaskCount?: number; // Number of completed MCP tasks (delegate/continue)
@@ -141,7 +141,7 @@ interface WorkspaceStore {
   getGeminiSessionId: (tabId: string) => string | null;
 
   // Claude Agent orchestration
-  setClaudeAgentStatus: (tabId: string, status: 'idle' | 'running' | 'done' | 'error', sessionId?: string) => void;
+  setClaudeAgentStatus: (tabId: string, status: 'idle' | 'running' | 'done' | 'error' | 'summarizing', sessionId?: string) => void;
   setClaudeActive: (tabId: string, alive: boolean) => void;
   setClaudeBusy: (tabId: string, busy: boolean) => void;
   setInterceptorState: (tabId: string, state: 'armed' | 'disarmed' | null) => void;

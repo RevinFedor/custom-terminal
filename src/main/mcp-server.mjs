@@ -258,6 +258,20 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ['taskId'],
       },
     },
+    {
+      name: 'adopt_agent',
+      description: 'Adopt an existing Claude Code tab as your sub-agent. The session will be summarized via API and the context will be automatically injected into your conversation. Use this to attach already-running Claude tabs to your orchestration. The summary will appear as [Adopted Agent Context] — read it and continue working.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          tabId: {
+            type: 'string',
+            description: 'The tab ID of the existing Claude tab to adopt. Use list_sub_agents or check the terminal UI for available tabs.',
+          },
+        },
+        required: ['tabId'],
+      },
+    },
   ],
 }));
 
@@ -419,6 +433,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             {
               type: 'text',
               text: 'Sub-agent closed. Tab ' + (result.claudeTabId || args.taskId) + ' has been removed.',
+            },
+          ],
+        };
+      }
+
+      case 'adopt_agent': {
+        const result = await httpPost('/adopt', {
+          tabId: args.tabId,
+          ppid,
+        });
+        return {
+          content: [
+            {
+              type: 'text',
+              text: 'Adopting tab ' + args.tabId + ' as sub-agent. Task ID: ' + result.taskId + '\nThe session is being summarized via API. The context will be AUTOMATICALLY injected into your conversation when ready.\n\nIMPORTANT: Do NOT fabricate the summary. Wait for the real [Adopted Agent Context] to appear.',
             },
           ],
         };

@@ -261,6 +261,21 @@ const TabItem = memo(({
   const ref = useRef<HTMLDivElement>(null);
   const [closestEdge, setClosestEdge] = useState<Edge | null>(null);
   const [isDragging, setIsDragging] = useState(false);
+  const [isAdoptTarget, setIsAdoptTarget] = useState(false);
+
+  // Check if a drag source is a Claude tab eligible for adoption onto this Gemini tab
+  const isAdoptDrop = useCallback((sourceData: DragData) => {
+    if (commandType !== 'gemini') return false;
+    const sourceTabId = sourceData.id;
+    const state = useWorkspaceStore.getState();
+    for (const [, ws] of state.openProjects) {
+      const sourceTab = ws.tabs.get(sourceTabId);
+      if (sourceTab) {
+        return sourceTab.commandType === 'claude' && !sourceTab.parentTabId;
+      }
+    }
+    return false;
+  }, [commandType]);
 
   useEffect(() => {
     const element = ref.current;
@@ -323,21 +338,33 @@ const TabItem = memo(({
         onDragEnter: ({ source, self }) => {
           const sourceData = source.data as DragData;
           if (sourceData.id === tab.id) return;
-          setClosestEdge(extractClosestEdge(self.data));
+          if (isAdoptDrop(sourceData)) {
+            setIsAdoptTarget(true);
+            setClosestEdge(null);
+          } else {
+            setClosestEdge(extractClosestEdge(self.data));
+          }
         },
         onDrag: ({ source, self }) => {
           const sourceData = source.data as DragData;
           if (sourceData.id === tab.id) {
             setClosestEdge(null);
+            setIsAdoptTarget(false);
             return;
           }
-          setClosestEdge(extractClosestEdge(self.data));
+          if (isAdoptDrop(sourceData)) {
+            setIsAdoptTarget(true);
+            setClosestEdge(null);
+          } else {
+            setIsAdoptTarget(false);
+            setClosestEdge(extractClosestEdge(self.data));
+          }
         },
-        onDragLeave: () => setClosestEdge(null),
-        onDrop: () => setClosestEdge(null),
+        onDragLeave: () => { setClosestEdge(null); setIsAdoptTarget(false); },
+        onDrop: () => { setClosestEdge(null); setIsAdoptTarget(false); },
       })
     );
-  }, [tab.id, zone, index, projectId]);
+  }, [tab.id, zone, index, projectId, isAdoptDrop]);
 
   const isHorizontal = zone === 'main';
   const [isHovered, setIsHovered] = useState(false);
@@ -451,6 +478,10 @@ const TabItem = memo(({
     opacity: isDragging ? 0.5 : (draggingGroupIds.includes(tab.id) && !isDragging ? 0.5 : (isCollapsed && !isActive ? 0.6 : 1)),
     transition: 'color 0.15s ease, background-color 0.15s ease',
     borderRight: isViewingSubAgent ? '2px solid rgba(168, 85, 247, 0.6)' : 'none',
+    ...(isAdoptTarget ? {
+      boxShadow: 'inset 0 0 0 1.5px rgba(99, 102, 241, 0.7)',
+      backgroundColor: 'rgba(99, 102, 241, 0.15)',
+    } : {}),
   };
 
   return (
@@ -936,6 +967,21 @@ function TabBar({ projectId }: TabBarProps) {
 
         // Dropped on another tab
         if (targetData.type === 'TAB') {
+          // ===== ADOPT: Claude tab dropped on Gemini tab → adopt as sub-agent =====
+          const targetTabId = targetData.id as string;
+          const sourceTabId = sourceData.id;
+          const currentWs = useWorkspaceStore.getState().openProjects.get(projectId);
+          if (currentWs) {
+            const sourceTab = currentWs.tabs.get(sourceTabId);
+            const targetTab = currentWs.tabs.get(targetTabId);
+            if (sourceTab?.commandType === 'claude' && !sourceTab.parentTabId &&
+                targetTab?.commandType === 'gemini') {
+              const { ipcRenderer } = window.require('electron');
+              ipcRenderer.invoke('mcp:adopt-agent', { claudeTabId: sourceTabId, geminiTabId: targetTabId });
+              return; // Don't reorder
+            }
+          }
+
           const edge = extractClosestEdge(targetData);
           const targetZone = targetData.zone as 'main' | 'utility';
           const targetIndex = targetData.index as number;

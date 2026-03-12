@@ -1459,6 +1459,42 @@ function startMcpHttpServer() {
         }
       });
 
+    } else if (req.method === 'POST' && req.url === '/adopt') {
+      // Adopt an existing Claude tab as a sub-agent (with API summarization)
+      let body = '';
+      req.on('data', chunk => { body += chunk; });
+      req.on('end', async () => {
+        try {
+          const { tabId, ppid } = JSON.parse(body);
+          if (!tabId) {
+            res.writeHead(400);
+            res.end(JSON.stringify({ error: 'tabId is required' }));
+            return;
+          }
+
+          const geminiTabId = ppid ? await findTabByChildPidCached(ppid) : null;
+          if (!geminiTabId) {
+            res.writeHead(400);
+            res.end(JSON.stringify({ error: 'Could not resolve Gemini tab from ppid' }));
+            return;
+          }
+
+          const taskId = crypto.randomUUID();
+          console.log('[MCP:HTTP] POST /adopt tabId=' + tabId + ' geminiTabId=' + geminiTabId + ' taskId=' + taskId);
+
+          // Fire-and-forget: adopt and summarize async
+          adoptClaudeAgent(taskId, tabId, geminiTabId).catch(err => {
+            console.error('[MCP:Adopt] Error:', err.message);
+          });
+
+          res.writeHead(200);
+          res.end(JSON.stringify({ taskId, status: 'accepted' }));
+        } catch (e) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: 'Invalid JSON: ' + e.message }));
+        }
+      });
+
     } else {
       res.writeHead(404);
       res.end(JSON.stringify({ error: 'Not found' }));
@@ -1500,6 +1536,156 @@ function stopMcpHttpServer() {
   }
   try { fs.unlinkSync(MCP_PORT_FILE); } catch {}
   console.log('[MCP:HTTP] Server stopped, port file removed');
+}
+
+// Adopt an existing Claude tab as a sub-agent: set parent, summarize via API, deliver context to Gemini
+async function adoptClaudeAgent(taskId, claudeTabId, geminiTabId) {
+  console.log('[MCP:Adopt] Starting adoption: claude=' + claudeTabId + ' gemini=' + geminiTabId + ' taskId=' + taskId);
+
+  // 1. Check that tab exists and is not already a sub-agent
+  const existingParent = subAgentParentTab.get(claudeTabId);
+  if (existingParent) {
+    console.log('[MCP:Adopt] Tab already a sub-agent of ' + existingParent + ', skipping');
+    return;
+  }
+
+  // 2. Resolve tab name and session ID early (needed for mcpTasks entry)
+  let tabName = null;
+  let sessionId = bridgeKnownSessions.get(claudeTabId) || null;
+  try {
+    const row = projectManager.db.db.prepare(
+      'SELECT name, claude_session_id FROM tabs WHERE tab_id = ? LIMIT 1'
+    ).get(claudeTabId);
+    if (row) {
+      tabName = row.name;
+      if (!sessionId && row.claude_session_id) sessionId = row.claude_session_id;
+    }
+  } catch {}
+
+  // 3. Set parent relationship (memory + DB)
+  subAgentParentTab.set(claudeTabId, geminiTabId);
+  mcpTasks.set(taskId, {
+    status: 'summarizing',
+    prompt: '(adopted)',
+    geminiTabId,
+    claudeTabId,
+    tabName,
+    createdAt: Date.now(),
+    _taskId: taskId,
+  });
+
+  // Update DB: set parent_tab_id and mcp_task_id
+  try {
+    projectManager.db.db.prepare(
+      'UPDATE tabs SET parent_tab_id = ?, mcp_task_id = ? WHERE tab_id = ?'
+    ).run(geminiTabId, taskId, claudeTabId);
+  } catch (e) {
+    console.error('[MCP:Adopt] DB update failed:', e.message);
+  }
+
+  // 4. Notify renderer about adoption (status: summarizing)
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('mcp:agent-adopted', {
+      taskId,
+      claudeTabId,
+      geminiTabId,
+      status: 'summarizing',
+    });
+  }
+
+  // 5. API summarization
+  let summaryText = '(No session data available for summarization)';
+  if (sessionId) {
+    try {
+      // Resolve CWD with multiple fallbacks (adopted tabs may lack OSC 7 tracking)
+      let cwd = terminalProjects.get(claudeTabId) || null;
+      if (!cwd) {
+        try {
+          const cwdRow = projectManager.db.db.prepare(
+            'SELECT cwd FROM tabs WHERE tab_id = ? AND cwd IS NOT NULL LIMIT 1'
+          ).get(claudeTabId);
+          if (cwdRow) cwd = cwdRow.cwd;
+        } catch {}
+      }
+      if (!cwd) {
+        try {
+          const projRow = projectManager.db.db.prepare(
+            'SELECT p.path FROM tabs t JOIN projects p ON t.project_id = p.id WHERE t.tab_id = ? LIMIT 1'
+          ).get(claudeTabId);
+          if (projRow) cwd = projRow.path;
+        } catch {}
+      }
+      if (!cwd) cwd = process.cwd();
+      const { text: sessionContent } = await getClaudeHistory(sessionId, cwd, { detail: 'with_code' });
+
+      // Read adopt prompt from DB
+      let adoptPromptContent = 'Summarize the following Claude Code session briefly: what was done, current status, files changed.';
+      let adoptModel = 'gemini-3-flash-preview';
+      try {
+        const promptRow = projectManager.db.db.prepare(
+          'SELECT content, model FROM ai_prompts WHERE id = ?'
+        ).get('adopt');
+        if (promptRow) {
+          adoptPromptContent = promptRow.content;
+          adoptModel = promptRow.model || adoptModel;
+        }
+      } catch {}
+
+      const userText = '<session_log>\n' + sessionContent + '\n</session_log>';
+
+      console.log('[MCP:Adopt] Calling API for summarization: model=' + adoptModel + ' content=' + Math.round(sessionContent.length / 1024) + 'KB');
+
+      const docsModule = require(path.join(srcMainDir, 'ipc', 'docs'));
+      let apiResult;
+      if (adoptModel.includes('claude')) {
+        apiResult = await docsModule.callClaudeApi(adoptPromptContent, userText, adoptModel, 'NONE');
+      } else {
+        apiResult = await docsModule.callGeminiApi(adoptPromptContent, userText, adoptModel, 'NONE');
+      }
+
+      if (apiResult.success) {
+        summaryText = apiResult.text;
+        console.log('[MCP:Adopt] Summary received: ' + summaryText.length + ' chars');
+      } else {
+        summaryText = '(API summarization failed: ' + apiResult.error + ')';
+        console.error('[MCP:Adopt] API error:', apiResult.error);
+      }
+    } catch (e) {
+      summaryText = '(Summarization error: ' + e.message + ')';
+      console.error('[MCP:Adopt] Summarization failed:', e.message);
+    }
+  }
+
+  // 7. Format and deliver to Gemini via response queue
+  const formatted = '[Adopted Agent Context]\n' +
+    '(This is informational context about an adopted agent. Read and remember it. Do NOT respond to this message — wait for the next user command.)\n' +
+    (tabName ? 'Tab: ' + tabName + '\n' : '') +
+    'Task ID: ' + taskId + '\n' +
+    (sessionId ? 'Session: ' + sessionId.substring(0, 8) + '...\n' : '') +
+    '---\n' +
+    summaryText +
+    '\n[/Adopted Agent Context]';
+
+  deliverResultToGemini(geminiTabId, formatted, taskId, tabName || 'adopted');
+
+  // 8. Update task status
+  const task = mcpTasks.get(taskId);
+  if (task) {
+    task.status = 'completed';
+    task.result = summaryText;
+  }
+
+  // 9. Notify renderer: adoption complete
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('mcp:agent-adopted', {
+      taskId,
+      claudeTabId,
+      geminiTabId,
+      status: 'ready',
+    });
+  }
+
+  console.log('[MCP:Adopt] Adoption complete: claude=' + claudeTabId + ' taskId=' + taskId);
 }
 
 // Main delegation logic: create Claude sub-agent tab, run prompt, return result
@@ -1648,24 +1834,48 @@ async function continueClaudeSubAgent(taskId, prompt, ppid) {
       }
     } catch {}
 
-    // Fallback: find sub-agent by parent tab relationship
+    // Try resolving synthetic 'restored-<tabId>' format (from list_sub_agents)
+    if (!claudeTabId && taskId.startsWith('restored-')) {
+      const candidateTabId = taskId.substring('restored-'.length);
+      try {
+        const row = projectManager.db.db.prepare(
+          'SELECT tab_id, parent_tab_id FROM tabs WHERE tab_id = ? LIMIT 1'
+        ).get(candidateTabId);
+        if (row) {
+          claudeTabId = row.tab_id;
+          geminiTabId = row.parent_tab_id;
+          console.log('[MCP:Continue] Resolved synthetic restored- ID: claudeTabId=' + claudeTabId);
+        }
+      } catch {}
+    }
+
+    // Fallback: find sub-agent by parent tab relationship (only when single agent)
     if (!claudeTabId) {
       console.log('[MCP:Continue] Task not in memory, searching by parent tab...');
       geminiTabId = ppid ? await findTabByChildPidCached(ppid) : null;
       if (geminiTabId) {
-        // Look in subAgentParentTab map first (live sub-agents)
+        // Look in subAgentParentTab map (live sub-agents) — only use if exactly one match
+        const liveMatches = [];
         for (const [cId, gId] of subAgentParentTab) {
-          if (gId === geminiTabId) { claudeTabId = cId; break; }
+          if (gId === geminiTabId) liveMatches.push(cId);
+        }
+        if (liveMatches.length === 1) {
+          claudeTabId = liveMatches[0];
+          console.log('[MCP:Continue] Single live sub-agent found: ' + claudeTabId);
+        } else if (liveMatches.length > 1) {
+          console.log('[MCP:Continue] Multiple live sub-agents (' + liveMatches.length + '), cannot resolve by parent alone');
         }
         // If not found in live map, search SQLite for persisted sub-agent tabs
         if (!claudeTabId) {
           try {
             const rows = projectManager.db.db.prepare(
-              'SELECT tab_id FROM tabs WHERE parent_tab_id = ? ORDER BY created_at DESC LIMIT 1'
+              'SELECT tab_id FROM tabs WHERE parent_tab_id = ? ORDER BY created_at DESC'
             ).all(geminiTabId);
-            if (rows.length > 0 && rows[0].tab_id) {
+            if (rows.length === 1) {
               claudeTabId = rows[0].tab_id;
-              console.log('[MCP:Continue] Found persisted sub-agent tab from DB: ' + claudeTabId);
+              console.log('[MCP:Continue] Single persisted sub-agent found: ' + claudeTabId);
+            } else if (rows.length > 1) {
+              console.log('[MCP:Continue] Multiple persisted sub-agents (' + rows.length + '), cannot resolve by parent alone');
             }
           } catch (e) {
             console.error('[MCP:Continue] DB query error:', e.message);
@@ -2587,6 +2797,27 @@ ipcMain.handle('mcp:deliver-last-response', async (event, claudeTabId) => {
   }
 
   return { success: true };
+});
+
+// Adopt agent via IPC (drag-and-drop from renderer)
+ipcMain.handle('mcp:adopt-agent', async (event, { claudeTabId, geminiTabId }) => {
+  if (!claudeTabId || !geminiTabId) {
+    return { success: false, error: 'claudeTabId and geminiTabId are required' };
+  }
+
+  // Check if already a sub-agent
+  if (subAgentParentTab.has(claudeTabId)) {
+    return { success: false, error: 'Tab is already a sub-agent' };
+  }
+
+  const taskId = crypto.randomUUID();
+  console.log('[MCP:Adopt:IPC] Adopting claude=' + claudeTabId + ' under gemini=' + geminiTabId + ' taskId=' + taskId);
+
+  adoptClaudeAgent(taskId, claudeTabId, geminiTabId).catch(err => {
+    console.error('[MCP:Adopt:IPC] Error:', err.message);
+  });
+
+  return { success: true, taskId };
 });
 
 app.whenReady().then(() => {

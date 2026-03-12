@@ -73,6 +73,17 @@ const FALLBACK_PROMPTS: AIPrompt[] = [
     isBuiltIn: true,
     showInContextMenu: false,
     position: 2
+  },
+  {
+    id: 'adopt',
+    name: 'Adopt Summary',
+    content: 'Ниже — сессия разработки Claude Code. Ответь СТРОГО в формате:\nTASK: [что делал агент, 1 предложение]\nSTATUS: [done | in_progress | blocked]\nFILES: [затронутые файлы, до 10]\nDONE: [что сделано, 2-3 предложения]\nPROBLEMS: [нерешённые проблемы]\nNEXT: [что делать дальше]\n',
+    model: 'gemini-3-flash-preview',
+    thinkingLevel: 'NONE',
+    color: '#6366f1',
+    isBuiltIn: true,
+    showInContextMenu: false,
+    position: 4
   }
 ];
 

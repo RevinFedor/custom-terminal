@@ -1,4 +1,4 @@
-import React, { useEffect, useLayoutEffect, useState, useRef, useCallback, memo } from 'react';
+import React, { useEffect, useLayoutEffect, useState, useRef, useCallback, memo, startTransition } from 'react';
 import { X, ChevronDown, ChevronRight } from 'lucide-react';
 import { useUIStore } from '../../store/useUIStore';
 import MarkdownRenderer from '../Research/MarkdownRenderer';
@@ -459,8 +459,12 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
 
         if (!isRefresh) {
           console.warn(`[HP] initial load: ${newEntries.length} entries`);
-          setEntries(newEntries);
-          setLoading(false);
+          // startTransition: React 19 yields to browser between chunks,
+          // keeping spinner animation smooth during heavy DOM renders
+          startTransition(() => {
+            setEntries(newEntries);
+            setLoading(false);
+          });
           // Starts at the top by default (no scrollToBottom on initial load)
         } else {
           // Refresh: only update if count changed
@@ -719,7 +723,7 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
       <div style={{ flex: 1, overflow: 'hidden' }}>
         {loading ? (
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: '#818cf8', fontSize: 13, gap: 8 }}>
-            <svg width="16" height="16" viewBox="0 0 16 16" style={{ animation: 'spinner-rotate 1s linear infinite' }}>
+            <svg width="16" height="16" viewBox="0 0 16 16" style={{ animation: 'spinner-rotate 1s linear infinite', willChange: 'transform' }}>
               <circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" strokeWidth="2" strokeDasharray="28" strokeDashoffset="8" strokeLinecap="round" />
             </svg>
             Loading...
