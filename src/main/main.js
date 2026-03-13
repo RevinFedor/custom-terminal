@@ -1658,7 +1658,7 @@ async function adoptClaudeAgent(taskId, claudeTabId, geminiTabId) {
 
   // 7. Format and deliver to Gemini via response queue
   const formatted = '[Adopted Agent Context]\n' +
-    '(This is informational context about an adopted agent. Read and remember it. Do NOT respond to this message — wait for the next user command.)\n' +
+    'INSTRUCTIONS: This is informational context about an adopted agent. Read and remember it. Do NOT respond, do NOT call any tools (no update_docs, no list_sub_agents, no continue_claude). Say NOTHING. Wait silently for the next user message.\n' +
     (tabName ? 'Tab: ' + tabName + '\n' : '') +
     'Task ID: ' + taskId + '\n' +
     (sessionId ? 'Session: ' + sessionId.substring(0, 8) + '...\n' : '') +
