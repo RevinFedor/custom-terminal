@@ -87,6 +87,7 @@ MCP-инструмент `docs_search` доступен для поиска по
 
 ### Infrastructure & Data Layer
 - **Production Logs:** [`fix-packaged-app-logs.md`](docs/knowledge/fix-packaged-app-logs.md) — почему нельзя писать логи в `app.asar`.
+- **AI Audit:** [`fact-ai-audit.md`](docs/knowledge/fact-ai-audit.md) — аудит-лог разовых API-операций (adopt, update_docs).
 - **Sessions & History:** [`fact-data-persistence.md`](docs/knowledge/fact-data-persistence.md) — общая логика SQLite.
 - **Tab Identity:** [`fix-tab-persistence.md`](docs/knowledge/fix-tab-persistence.md) — использование `tab_id` для сохранения связей суб-агентов.
 - **Safe Tab Persistence:** [`fix-save-tabs-data-loss.md`](docs/knowledge/fix-save-tabs-data-loss.md) — замена деструктивного `DELETE ALL + re-INSERT` на targeted DELETE с safety guard.

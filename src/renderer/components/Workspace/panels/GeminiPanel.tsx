@@ -32,6 +32,7 @@ export default function GeminiPanel({ projectPath, geminiPrompt }: GeminiPanelPr
   const [expandedItem, setExpandedItem] = useState<HistoryItem | null>(null);
   const [apiCalls, setApiCalls] = useState<any[]>([]);
   const [expandedApiCallId, setExpandedApiCallId] = useState<number | null>(null);
+  const [pendingAdopts, setPendingAdopts] = useState<string[]>([]); // taskIds in progress
 
   // Ref to store handleResearch for event listener (with chatType parameter)
   const handleResearchRef = useRef<(chatType: ChatType) => void>(() => {});
@@ -44,6 +45,24 @@ export default function GeminiPanel({ projectPath, geminiPrompt }: GeminiPanelPr
       loadFromDB(activeProjectId, projectPath);
     }
   }, [projectPath, activeProjectId]);
+
+  // Track adopt lifecycle: summarizing → ready
+  useEffect(() => {
+    const handler = (_: any, data: { taskId: string; status: string }) => {
+      if (data.status === 'summarizing') {
+        setPendingAdopts(prev => [...prev, data.taskId]);
+      } else if (data.status === 'ready') {
+        setPendingAdopts(prev => prev.filter(id => id !== data.taskId));
+        setTimeout(loadApiCalls, 500);
+      }
+    };
+    ipcRenderer.on('mcp:agent-adopted', handler);
+    const interval = setInterval(loadApiCalls, 30000);
+    return () => {
+      ipcRenderer.removeListener('mcp:agent-adopted', handler);
+      clearInterval(interval);
+    };
+  }, []);
 
   // Check for pending research from store (survives panel mount/unmount)
   useEffect(() => {
@@ -556,11 +575,27 @@ export default function GeminiPanel({ projectPath, geminiPrompt }: GeminiPanelPr
         )}
 
         {/* API Call Log */}
-        {apiCalls.length > 0 && (
+        {(apiCalls.length > 0 || pendingAdopts.length > 0) && (
           <div style={{ marginTop: '12px', paddingTop: '8px', borderTop: '1px solid #333' }}>
             <div className="text-[10px] text-[#666] mb-2 px-1" style={{ fontWeight: 600 }}>
-              API Calls ({apiCalls.length})
+              API Calls ({apiCalls.length + pendingAdopts.length})
             </div>
+
+            {/* Pending adopt loaders */}
+            {pendingAdopts.map((taskId) => (
+              <div key={taskId} className="bg-[#2a2a2a] rounded mb-1 flex items-center gap-2 p-1.5 px-2">
+                <span style={{ fontSize: '9px', color: '#6366f1', backgroundColor: 'rgba(99,102,241,0.12)', padding: '1px 5px', borderRadius: '3px', fontWeight: 600 }}>
+                  adopt
+                </span>
+                <span style={{
+                  display: 'inline-block', width: '8px', height: '8px', borderRadius: '50%',
+                  border: '1.5px solid rgba(99,102,241,0.2)', borderTopColor: '#6366f1',
+                  boxSizing: 'border-box', animation: 'tab-dot-spin 0.8s linear infinite',
+                }} />
+                <span className="text-[10px] text-[#666] italic">summarizing...</span>
+              </div>
+            ))}
+
             {apiCalls.map((call: any) => {
               const isExpanded = expandedApiCallId === call.id;
               const typeColors: Record<string, string> = { adopt: '#6366f1', update_docs: '#f59e0b', research: '#0ea5e9' };

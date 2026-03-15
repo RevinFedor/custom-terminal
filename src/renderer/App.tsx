@@ -324,6 +324,7 @@ function App() {
   const isRestoring = useWorkspaceStore((s) => s.isRestoring);
   // Functions are stable references in Zustand — selecting them individually avoids re-renders
   const showDashboard = useWorkspaceStore((s) => s.showDashboard);
+  const showWorkspace = useWorkspaceStore((s) => s.showWorkspace);
   const openProject = useWorkspaceStore((s) => s.openProject);
   const closeProject = useWorkspaceStore((s) => s.closeProject);
   const createTab = useWorkspaceStore((s) => s.createTab);
@@ -1167,7 +1168,7 @@ function App() {
               }}
               onMouseEnter={(e) => { if (view !== 'dashboard') e.currentTarget.style.color = '#c084fc'; }}
               onMouseLeave={(e) => { if (view !== 'dashboard') e.currentTarget.style.color = '#9b59b6'; }}
-              onClick={() => showDashboard()}
+              onClick={() => view === 'dashboard' && activeProjectId ? showWorkspace(activeProjectId) : showDashboard()}
               title="Development Mode - Dashboard"
             >
               {view === 'dashboard' && (
@@ -1183,7 +1184,7 @@ function App() {
                   : 'text-gray-400 hover:text-white'
               }`}
               style={{ fontSize: `${projectTabsFontSize}px` }}
-              onClick={() => showDashboard()}
+              onClick={() => view === 'dashboard' && activeProjectId ? showWorkspace(activeProjectId) : showDashboard()}
               title="Dashboard"
             >
               {view === 'dashboard' && (

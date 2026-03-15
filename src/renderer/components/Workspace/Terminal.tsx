@@ -263,8 +263,14 @@ function getCurrentCommand(term: XTerminal): string {
 const { ipcRenderer } = window.require('electron');
 
 // Write buffer constants to prevent Ink/TUI render tearing
-const FLUSH_DELAY = 32; // ms - 2 frames at 60fps, batches Ink differential renderer updates
-const MAX_BUFFER_SIZE = 4096; // safety valve
+const FLUSH_DELAY = 16; // ms - one frame at 60fps
+const MAX_BUFFER_SIZE = 65536; // 64KB safety valve (large enough for sync frames)
+// Synchronized Output (DEC mode 2026): Ink differential renderer wraps each frame
+// in \x1b[?2026h ... \x1b[?2026l. xterm.js 5.x doesn't support this natively,
+// so we buffer writes until the sync frame closes, preventing mid-frame jitter.
+const SYNC_START = '\x1b[?2026h';
+const SYNC_END = '\x1b[?2026l';
+const SYNC_SAFETY_TIMEOUT = 200; // ms - force flush if sync frame never closes
 
 interface TerminalProps {
   tabId: string;
@@ -385,6 +391,7 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
   // Write buffer refs to batch PTY output and prevent jitter
   const writeBufferRef = useRef<string>('');
   const pendingWriteRef = useRef<NodeJS.Timeout | null>(null);
+  const syncSafetyRef = useRef<NodeJS.Timeout | null>(null); // Safety timeout for stuck sync frames
 
   const safeFit = () => {
     if (!isMounted.current) return;
@@ -452,22 +459,55 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
       // Accumulate data in buffer
       writeBufferRef.current += payload.data;
 
-      // Schedule flush if not already pending
-      if (!pendingWriteRef.current) {
-        pendingWriteRef.current = setTimeout(() => {
-          if (xtermInstance.current && writeBufferRef.current) {
-            xtermInstance.current.write(writeBufferRef.current);
-            writeBufferRef.current = '';
-          }
+      // Synchronized Output detection: hold writes while inside a sync frame
+      // so xterm.js never sees intermediate cursor movements from Ink's differential renderer
+      const buf = writeBufferRef.current;
+      const lastOpen = buf.lastIndexOf(SYNC_START);
+      const lastClose = buf.lastIndexOf(SYNC_END);
+      const insideSyncFrame = lastOpen !== -1 && lastOpen > lastClose;
+
+      if (insideSyncFrame) {
+        // Inside incomplete sync frame — cancel any pending flush, wait for close marker
+        if (pendingWriteRef.current) {
+          clearTimeout(pendingWriteRef.current);
           pendingWriteRef.current = null;
-        }, FLUSH_DELAY);
+        }
+        // Safety: force flush if sync frame never closes (prevents frozen terminal)
+        if (!syncSafetyRef.current) {
+          syncSafetyRef.current = setTimeout(() => {
+            syncSafetyRef.current = null;
+            if (xtermInstance.current && writeBufferRef.current) {
+              xtermInstance.current.write(writeBufferRef.current);
+              writeBufferRef.current = '';
+            }
+          }, SYNC_SAFETY_TIMEOUT);
+        }
+      } else {
+        // Not in sync frame (or frame just closed) — schedule normal flush
+        if (syncSafetyRef.current) {
+          clearTimeout(syncSafetyRef.current);
+          syncSafetyRef.current = null;
+        }
+        if (!pendingWriteRef.current) {
+          pendingWriteRef.current = setTimeout(() => {
+            if (xtermInstance.current && writeBufferRef.current) {
+              xtermInstance.current.write(writeBufferRef.current);
+              writeBufferRef.current = '';
+            }
+            pendingWriteRef.current = null;
+          }, FLUSH_DELAY);
+        }
       }
 
-      // Flush immediately if buffer too large (safety valve)
+      // Flush immediately if buffer too large (safety valve — prevents memory issues)
       if (writeBufferRef.current.length > MAX_BUFFER_SIZE) {
         if (pendingWriteRef.current) {
           clearTimeout(pendingWriteRef.current);
           pendingWriteRef.current = null;
+        }
+        if (syncSafetyRef.current) {
+          clearTimeout(syncSafetyRef.current);
+          syncSafetyRef.current = null;
         }
         if (xtermInstance.current) {
           xtermInstance.current.write(writeBufferRef.current);
