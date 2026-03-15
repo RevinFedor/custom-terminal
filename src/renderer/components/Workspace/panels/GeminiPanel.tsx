@@ -65,6 +65,25 @@ export default function GeminiPanel({ projectPath, geminiPrompt }: GeminiPanelPr
     }
   };
 
+  const loadApiCalls = async () => {
+    try {
+      const result = await ipcRenderer.invoke('api-calls:list', { limit: 30 });
+      if (result.success && result.data) {
+        setApiCalls(result.data);
+      }
+    } catch (err) {
+      console.error('[GeminiPanel] Error loading API calls:', err);
+    }
+  };
+
+  const getTimeAgo = (timestamp: number) => {
+    const seconds = Math.floor((Date.now() - timestamp * 1000) / 1000);
+    if (seconds < 60) return 'just now';
+    if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+    if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
+    return `${Math.floor(seconds / 86400)}d ago`;
+  };
+
   const handleResearch = async (chatType: ChatType = 'research') => {
     console.log('[Research] Starting, type:', chatType);
     console.log('[Research] Selection:', terminalSelection ? `"${terminalSelection.slice(0, 50)}..."` : 'EMPTY');
@@ -531,6 +550,46 @@ export default function GeminiPanel({ projectPath, geminiPrompt }: GeminiPanelPr
                   <span className="text-[#555]">{getConversationChars(conv)} симв.</span>
                 </div>
               </div>
+              );
+            })}
+          </div>
+        )}
+
+        {/* API Call Log */}
+        {apiCalls.length > 0 && (
+          <div style={{ marginTop: '12px', paddingTop: '8px', borderTop: '1px solid #333' }}>
+            <div className="text-[10px] text-[#666] mb-2 px-1" style={{ fontWeight: 600 }}>
+              API Calls ({apiCalls.length})
+            </div>
+            {apiCalls.map((call: any) => {
+              const isExpanded = expandedApiCallId === call.id;
+              const typeColors: Record<string, string> = { adopt: '#6366f1', update_docs: '#f59e0b', research: '#0ea5e9' };
+              const color = typeColors[call.call_type] || '#888';
+              const tokensIn = call.input_tokens > 1000 ? (call.input_tokens / 1000).toFixed(1) + 'K' : String(call.input_tokens);
+              const tokensOut = call.output_tokens > 1000 ? (call.output_tokens / 1000).toFixed(1) + 'K' : String(call.output_tokens);
+              const payloadKB = call.payload_size > 0 ? Math.round(call.payload_size / 1024) + 'KB' : null;
+
+              return (
+                <div
+                  key={call.id}
+                  className="bg-[#2a2a2a] rounded cursor-pointer hover:bg-[#333] transition-colors mb-1"
+                  onClick={() => setExpandedApiCallId(isExpanded ? null : call.id)}
+                >
+                  <div className="flex items-center gap-2 p-1.5 px-2">
+                    <span style={{ fontSize: '9px', color, backgroundColor: color + '20', padding: '1px 5px', borderRadius: '3px', fontWeight: 600 }}>
+                      {call.call_type}
+                    </span>
+                    <span className="text-[10px] text-[#888] flex-1 truncate">{call.model || '—'}</span>
+                    <span className="text-[10px] text-[#666]">{tokensIn}/{tokensOut}</span>
+                    <span className="text-[10px] text-[#555]">{getTimeAgo(call.created_at)}</span>
+                  </div>
+                  {isExpanded && call.result_text && (
+                    <div style={{ padding: '6px 8px', borderTop: '1px solid #333', fontSize: '10px', color: '#aaa', maxHeight: '200px', overflow: 'auto', whiteSpace: 'pre-wrap', lineHeight: 1.4 }}>
+                      {payloadKB && <div style={{ color: '#666', marginBottom: '4px' }}>Payload: {payloadKB} | Tokens: {tokensIn} in / {tokensOut} out</div>}
+                      {call.result_text}
+                    </div>
+                  )}
+                </div>
               );
             })}
           </div>

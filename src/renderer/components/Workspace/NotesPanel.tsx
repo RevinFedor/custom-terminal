@@ -43,7 +43,7 @@ export default function NotesPanel({ projectId, project }: NotesPanelProps) {
 
   const tabs: { id: TabType; label: string }[] = [
     { id: 'info', label: 'Info' },
-    { id: 'ai', label: 'AI' },
+    { id: 'ai', label: 'AI Sessions' },
     { id: 'sessions', label: 'Sessions' }
   ];
 

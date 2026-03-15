@@ -668,7 +668,7 @@ export const terminalRegistry = {
         for (let i = 0; i < logicalLines.length; i++) {
           if (logicalLines[i].text.includes(shortNeedle)) { hasPartial = true; break; }
         }
-        console.warn(`[buildPositionIndex:MISS] needle=${JSON.stringify(firstLine.slice(0, 50))} partial(15)=${hasPartial}`);
+        // MISS logged silently — check dev.log if debugging timeline positioning
       }
 
       results.push(found);
