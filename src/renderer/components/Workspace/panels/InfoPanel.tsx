@@ -183,6 +183,7 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
           return;
         }
       }
+      console.warn('[InfoPanel:Poll] Tab NOT FOUND in any project: tabId=' + activeTabId + ' → sessions nulled');
       setClaudeSessionId(null);
       setGeminiSessionId(null);
       setActiveCommandType(null);
@@ -195,6 +196,15 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
   const hasClaudeSession = !!claudeSessionId;
   const hasGeminiSession = !!geminiSessionId;
   const hasAnySession = hasClaudeSession || hasGeminiSession;
+
+  // Track hasAnySession transitions for debugging
+  const prevHasAnySessionRef = useRef(hasAnySession);
+  useEffect(() => {
+    if (prevHasAnySessionRef.current !== hasAnySession) {
+      console.warn('[InfoPanel:State] hasAnySession: ' + prevHasAnySessionRef.current + ' → ' + hasAnySession + ' | tabId=' + (activeTabId || 'null') + ' claude=' + (claudeSessionId ? claudeSessionId.substring(0, 8) : 'null') + ' gemini=' + (geminiSessionId ? geminiSessionId.substring(0, 8) : 'null') + ' cmdType=' + activeCommandType);
+      prevHasAnySessionRef.current = hasAnySession;
+    }
+  });
   const currentSessionType = hasClaudeSession ? 'claude' : hasGeminiSession ? 'gemini' : null;
   const sessionId = currentSessionType === 'claude' ? claudeSessionId : geminiSessionId;
 
@@ -400,6 +410,7 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
             <button
               onClick={() => {
                 const next = !isTreeMode;
+                console.warn('[InfoPanel:Click] TreeMode toggle: tabId=' + activeTabId!.substring(activeTabId!.length - 8) + ' ' + isTreeMode + ' → ' + next + ' hasAnySession=' + hasAnySession);
                 if (next) setHistoryPanelOpen(activeTabId, false); // mutual exclusion
                 setTimelineTreeMode(activeTabId, next);
               }}
@@ -422,6 +433,7 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
             <button
               onClick={() => {
                 const next = !isHistoryOpen;
+                console.warn('[InfoPanel:Click] History toggle: tabId=' + activeTabId!.substring(activeTabId!.length - 8) + ' ' + isHistoryOpen + ' → ' + next + ' hasAnySession=' + hasAnySession);
                 if (next) setTimelineTreeMode(activeTabId, false); // mutual exclusion
                 setHistoryPanelOpen(activeTabId, next);
               }}
