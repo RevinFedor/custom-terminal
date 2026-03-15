@@ -1585,8 +1585,9 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
             // isResponseOnly = response visible but prompt above viewport (same as normal)
             const isPromptVisible = isInViewport && !isResponseOnly;
 
-            if (isUnreachable && !isHovered && !isGroupCollapsed) {
+            if (isUnreachable && !isHovered && !isGroupCollapsed && !isCompacted) {
               // Unreachable entries: muted red/gray, overrides everything
+              // Compact bars (strips) keep their own colors — they are structural markers, not messages
               dotColor = '#6b3333';
               dotGlow = 'none';
             } else if (isCompacted) {
@@ -1735,7 +1736,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                       : (showAsChild ? '4px' : undefined),
                     backgroundColor: active
                       ? 'rgba(59, 130, 246, 0.15)'
-                      : (isUnreachable && !isGroupMeta ? 'rgba(239, 68, 68, 0.12)' : 'transparent'),
+                      : (isUnreachable && !isGroupMeta && !isCompacted ? 'rgba(239, 68, 68, 0.12)' : 'transparent'),
                     cursor: isContinued ? 'default' : 'pointer',
                   }}
                 >

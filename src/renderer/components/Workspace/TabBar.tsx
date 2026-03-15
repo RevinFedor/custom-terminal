@@ -951,6 +951,15 @@ function TabBar({ projectId }: TabBarProps) {
         const currentWorkspace = useWorkspaceStore.getState().openProjects.get(projectId);
         if (!currentWorkspace) return;
 
+        // ===== DETACH: sub-agent chip dropped back to TabBar → detach from parent =====
+        const sourceTab = currentWorkspace.tabs.get(sourceData.id);
+        if (sourceTab?.parentTabId) {
+          const store = useWorkspaceStore.getState();
+          store.setTabParent(sourceData.id, undefined as any);
+          store.setViewingSubAgent(null);
+          return;
+        }
+
         const allTabsNow = Array.from(currentWorkspace.tabs.values());
         const visibleTabsNow = allTabsNow.filter(t => !t.parentTabId);
         const mainTabsNow = visibleTabsNow.filter(t => !t.isUtility);

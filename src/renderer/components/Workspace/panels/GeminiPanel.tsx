@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useUIStore } from '../../../store/useUIStore';
-import { usePromptsStore } from '../../../store/usePromptsStore';
+import { usePromptsStore, type AIPrompt } from '../../../store/usePromptsStore';
 import MarkdownRenderer from '../../Research/MarkdownRenderer';
 import { useResearchStore, ChatType } from '../../../store/useResearchStore';
 import { useWorkspaceStore } from '../../../store/useWorkspaceStore';
@@ -30,12 +30,15 @@ export default function GeminiPanel({ projectPath, geminiPrompt }: GeminiPanelPr
   const currentActiveConvId = activeProjectId ? activeConversationId[activeProjectId] : null;
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [expandedItem, setExpandedItem] = useState<HistoryItem | null>(null);
+  const [apiCalls, setApiCalls] = useState<any[]>([]);
+  const [expandedApiCallId, setExpandedApiCallId] = useState<number | null>(null);
 
   // Ref to store handleResearch for event listener (with chatType parameter)
   const handleResearchRef = useRef<(chatType: ChatType) => void>(() => {});
 
   useEffect(() => {
     loadHistory();
+    loadApiCalls();
     // Load full conversations from DB for this project
     if (activeProjectId && projectPath) {
       loadFromDB(activeProjectId, projectPath);

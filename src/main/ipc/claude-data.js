@@ -200,7 +200,8 @@ async function resolveSessionChain(sessionId, cwd, maxDepth = 10) {
     } else {
       // No JSONL bridge — check SQLite for session link (Clear Context without bridge entry)
       try {
-        const parentId = _projectManager.db.getSessionParent(currentSessionId);
+        const parentId = _projectManager?.db?.getSessionParent(currentSessionId);
+        console.log('[SessionChain] SQLite check for', currentSessionId.substring(0, 8) + ':', parentId ? parentId.substring(0, 8) : 'null', '_projectManager=' + !!_projectManager, 'db=' + !!_projectManager?.db);
         if (parentId) {
           console.log('[SessionChain] SQLite link:', currentSessionId.substring(0, 8) + '...', '→ parent:', parentId.substring(0, 8) + '...');
           sessionBoundaries.push({
@@ -211,7 +212,9 @@ async function resolveSessionChain(sessionId, cwd, maxDepth = 10) {
           depth++;
           continue;
         }
-      } catch (e) {}
+      } catch (e) {
+        console.error('[SessionChain] SQLite check FAILED for', currentSessionId.substring(0, 8) + ':', e.message);
+      }
       break;
     }
 
@@ -751,14 +754,19 @@ function register({ projectManager, formatToolAction }) {
       const { mergedMap: recordMap, lastRecord, sessionBoundaries } = await resolveSessionChain(sessionId, cwd);
 
       if (!lastRecord) {
+        console.log('[Timeline:Backtrace] No lastRecord for session:', sessionId.substring(0, 8));
         return { success: true, entries: [] };
       }
+
+      console.log('[Timeline:Backtrace] session=' + sessionId.substring(0, 8) + ' recordMap.size=' + recordMap.size + ' lastRecord=' + lastRecord.uuid.substring(0, 8) + ' type=' + lastRecord.type + ' boundaries=' + sessionBoundaries.length);
 
       // BACKTRACE: Walk backwards from the last record following parentUuid
       // Now works across file boundaries thanks to merged recordMap
       const activeBranch = [];
       let currentUuid = lastRecord.uuid;
       const seen = new Set();
+      let _compactRecoveryCount = 0;
+      let _bridgeFollowCount = 0;
 
       while (currentUuid && !seen.has(currentUuid)) {
         seen.add(currentUuid);
@@ -775,6 +783,8 @@ function register({ projectManager, formatToolAction }) {
               if (lastAdded.parentUuid && recordMap.has(lastAdded.parentUuid) && !seen.has(lastAdded.parentUuid)) {
                 currentUuid = lastAdded.parentUuid;
                 recovered = true;
+                _compactRecoveryCount++;
+                console.log('[Timeline:Backtrace] Compact gap recovery L1: logicalParent=' + lastAdded.logicalParentUuid.substring(0, 8) + ' → parentUuid=' + lastAdded.parentUuid.substring(0, 8));
               } else {
                 // Option 2: find physical predecessor in the same JSONL file
                 let bestPred = null;
@@ -790,9 +800,17 @@ function register({ projectManager, formatToolAction }) {
                 if (bestPred) {
                   currentUuid = bestPred.uuid;
                   recovered = true;
+                  _compactRecoveryCount++;
+                  console.log('[Timeline:Backtrace] Compact gap recovery L2: physicalPred=' + bestPred.uuid.substring(0, 8) + ' fileIndex=' + bestPred._fileIndex);
+                } else {
+                  console.log('[Timeline:Backtrace] Compact gap recovery FAILED: logicalParent=' + currentUuid.substring(0, 8) + ' parentUuid=' + (lastAdded.parentUuid || 'null') + ' _fromFile=' + lastAdded._fromFile?.substring(0, 8));
                 }
               }
+            } else {
+              console.log('[Timeline:Backtrace] BREAK: uuid=' + currentUuid.substring(0, 8) + ' not in recordMap. lastAdded.type=' + lastAdded.type + ' subtype=' + (lastAdded.subtype || 'none'));
             }
+          } else {
+            console.log('[Timeline:Backtrace] BREAK: uuid=' + currentUuid.substring(0, 8) + ' not in recordMap (activeBranch empty)');
           }
           if (recovered) continue;
           break;
@@ -813,6 +831,8 @@ function register({ projectManager, formatToolAction }) {
             if (entry._isBridge && entry.parentUuid && entry.sessionId !== record.sessionId &&
                 !seen.has(entry.parentUuid)) {
               nextUuid = entry.parentUuid;
+              _bridgeFollowCount++;
+              console.log('[Timeline:Backtrace] Bridge follow: ' + record.sessionId.substring(0, 8) + ' → bridge.parentUuid=' + entry.parentUuid.substring(0, 8) + ' bridge.sessionId=' + entry.sessionId.substring(0, 8));
               break;
             }
           }
@@ -834,7 +854,8 @@ function register({ projectManager, formatToolAction }) {
               }
               if (parentLastRecord) {
                 nextUuid = parentLastRecord.uuid;
-                console.log('[Backtrace] SQLite bridge:', record.sessionId.substring(0, 8), '→ parent last record:', parentLastRecord.uuid.substring(0, 8));
+                _bridgeFollowCount++;
+                console.log('[Timeline:Backtrace] SQLite bridge: ' + record.sessionId.substring(0, 8) + ' → parent last record: ' + parentLastRecord.uuid.substring(0, 8));
               }
             }
           }
@@ -842,6 +863,8 @@ function register({ projectManager, formatToolAction }) {
 
         currentUuid = nextUuid;
       }
+
+      console.log('[Timeline:Backtrace] DONE session=' + sessionId.substring(0, 8) + ' activeBranch=' + activeBranch.length + ' compactRecoveries=' + _compactRecoveryCount + ' bridgeFollows=' + _bridgeFollowCount + ' root=' + (activeBranch.length > 0 ? activeBranch[0].uuid.substring(0, 8) + '/' + activeBranch[0].type : 'empty'));
 
       // Now filter the active branch for Timeline display
       const entries = [];
@@ -946,6 +969,8 @@ function register({ projectManager, formatToolAction }) {
           });
         }
       }
+
+      console.log('[Timeline:Backtrace] session=' + sessionId.substring(0, 8) + ' entries=' + entries.length + ' skipped: sidechain=' + skippedSidechain + ' toolResult=' + skippedToolResult + ' noContent=' + skippedNoContent + ' system=' + skippedSystem + ' summary=' + skippedSummary);
 
       // Resolve the latest session ID in the chain (tip)
       // This helps the renderer detect if claudeSessionId needs updating

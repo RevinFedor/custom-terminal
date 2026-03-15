@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Pin } from 'lucide-react';
+import { draggable } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 
 const { ipcRenderer } = window.require('electron');
@@ -10,11 +11,32 @@ interface QueueItem {
   promptPreview: string;
 }
 
-interface SubAgentBarProps {
+// Draggable chip wrapper — allows dragging sub-agent chips back to TabBar to detach
+function DraggableChip({ tabId, projectId, children, ...props }: {
+  tabId: string;
   projectId: string;
+  children: React.ReactNode;
+} & React.HTMLAttributes<HTMLDivElement>) {
+  const chipRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const el = chipRef.current;
+    if (!el) return;
+    return draggable({
+      element: el,
+      getInitialData: () => ({ type: 'TAB' as const, id: tabId, zone: 'main' as const, index: -1, projectId }),
+    });
+  }, [tabId, projectId]);
+
+  return <div ref={chipRef} {...props}>{children}</div>;
 }
 
-export default function SubAgentBar({ projectId }: SubAgentBarProps) {
+interface SubAgentBarProps {
+  projectId: string;
+  adoptDragOver?: boolean;
+}
+
+export default function SubAgentBar({ projectId, adoptDragOver }: SubAgentBarProps) {
   const viewingSubAgentTabId = useWorkspaceStore((s) => s.openProjects.get(projectId)?.viewingSubAgentTabId ?? null);
   const setViewingSubAgent = useWorkspaceStore((s) => s.setViewingSubAgent);
   // Reactive primitives: re-renders when activeTabId or tabs.size changes
@@ -173,8 +195,8 @@ export default function SubAgentBar({ projectId }: SubAgentBarProps) {
   const hasSubAgents = subAgentTabs.length > 0;
   const hasQueue = queueItems.length > 0;
 
-  // Show bar if we have sub-agents OR queued responses
-  if (!hasSubAgents && !hasQueue) return null;
+  // Show bar if we have sub-agents, queued responses, or adopt drag is active
+  if (!hasSubAgents && !hasQueue && !adoptDragOver) return null;
 
   // Active processes: sub-agents working with armed interceptor
   const activeProcesses = subAgentTabs.filter((t: any) =>
@@ -193,10 +215,18 @@ export default function SubAgentBar({ projectId }: SubAgentBarProps) {
       className="flex items-center gap-1.5 px-2 border-b border-border-main"
       style={{
         height: '28px',
-        backgroundColor: 'rgba(30, 30, 30, 0.95)',
+        backgroundColor: adoptDragOver ? 'rgba(99, 102, 241, 0.15)' : 'rgba(30, 30, 30, 0.95)',
         fontSize: '11px',
+        borderColor: adoptDragOver ? 'rgba(99, 102, 241, 0.5)' : undefined,
+        transition: 'background-color 0.15s, border-color 0.15s',
       }}
     >
+      {/* Drop hint when dragging Claude tab */}
+      {adoptDragOver && !hasSubAgents && (
+        <span style={{ color: 'rgba(99, 102, 241, 0.8)', fontSize: '10px' }}>
+          Drop to adopt as sub-agent
+        </span>
+      )}
       {/* Left side: Sub-agents label and chips */}
       {hasSubAgents && (
         <>
@@ -266,17 +296,19 @@ export default function SubAgentBar({ projectId }: SubAgentBarProps) {
             ].filter(Boolean);
 
             return (
-              <button
+              <DraggableChip
                 key={tab.id}
+                tabId={tab.id}
+                projectId={projectId}
                 onClick={() => handleChipClick(tab.id)}
-                onAuxClick={(e) => handleChipMiddleClick(e, tab.id)}
-                onContextMenu={(e) => handleContextMenu(e, tab)}
+                onAuxClick={(e: React.MouseEvent) => handleChipMiddleClick(e, tab.id)}
+                onContextMenu={(e: React.MouseEvent) => handleContextMenu(e, tab)}
                 className="flex items-center gap-1.5 px-2 py-0.5 rounded transition-colors shrink-0"
                 style={{
                   backgroundColor: isViewing ? 'rgba(204, 120, 50, 0.3)' : 'rgba(255,255,255,0.06)',
                   border: isViewing ? '1px solid rgba(204, 120, 50, 0.5)' : '1px solid transparent',
                   color: isViewing ? '#cc7832' : 'rgba(255,255,255,0.7)',
-                  cursor: 'pointer',
+                  cursor: 'grab',
                   opacity: alive ? 1 : 0.6,
                 }}
                 title={tooltipParts.join('\n')}
@@ -317,7 +349,7 @@ export default function SubAgentBar({ projectId }: SubAgentBarProps) {
                     {isError ? '\u2717 ' : ''}{statusText}
                   </span>
                 )}
-              </button>
+              </DraggableChip>
             );
           })}
           </div>

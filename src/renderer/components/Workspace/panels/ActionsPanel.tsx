@@ -1,7 +1,8 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { createPortal } from 'react-dom';
-import { useUIStore } from '../../../store/useUIStore';
+import { useUIStore, ApiClaudeModel, ApiGeminiModel, ThinkingLevel } from '../../../store/useUIStore';
 import { useWorkspaceStore } from '../../../store/useWorkspaceStore';
+import { useCmdKey } from '../../../hooks/useCmdHoverPopover';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -57,6 +58,12 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
   const docsTitleRef = useRef<HTMLDivElement>(null);
   const copyTitleRef = useRef<HTMLDivElement>(null);
   const docsBlockRef = useRef<HTMLDivElement>(null);
+  const settingsGearRef = useRef<HTMLSpanElement>(null);
+  const isCmdPressed = useCmdKey();
+  const [gearHovered, setGearHovered] = useState(false);
+  const [gearPanelHovered, setGearPanelHovered] = useState(false);
+  const showGearSettings = (isCmdPressed && gearHovered) || gearPanelHovered;
+  const { apiSettings, setApiClaudeModel, setApiClaudeThinking, setApiGeminiModel, setApiGeminiThinking } = useUIStore();
 
   const selectedTabs = activeProjectId ? getSelectedTabs(activeProjectId) : [];
 
@@ -1018,17 +1025,23 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
         {/* System Tools Section */}
         <div className="mb-4">
           <div className="flex items-center gap-2 mb-2 px-1">
-            <span className="text-[9px] uppercase font-semibold text-blue-500">System</span>
             <span
+              ref={settingsGearRef}
               className="cursor-pointer select-none"
-              style={{ fontSize: '10px', color: '#555', transition: 'color 0.15s' }}
-              onMouseEnter={(e) => { e.currentTarget.style.color = '#999'; }}
-              onMouseLeave={(e) => { e.currentTarget.style.color = '#555'; }}
+              style={{ fontSize: '10px', color: (isCmdPressed || showGearSettings) ? '#999' : '#555', transition: 'color 0.15s' }}
+              onMouseEnter={() => setGearHovered(true)}
+              onMouseLeave={(e) => {
+                const rect = e.currentTarget.getBoundingClientRect();
+                if (e.clientX >= rect.left) {
+                  setGearHovered(false);
+                }
+              }}
               onClick={() => useUIStore.getState().openApiSettings()}
-              title="API Settings"
+              title="API Settings (⌘+наведение)"
             >
               &#9881;
             </span>
+            <span className="text-[9px] uppercase font-semibold text-blue-500">System</span>
             {/* Auto-apply toggle */}
             <span
               className="cursor-pointer select-none"
@@ -1645,8 +1658,116 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
       </div>
   );
 
+  // Cmd+hover API settings floating panel
+  const renderApiSettingsPopover = () => {
+    if (!showGearSettings || !settingsGearRef.current) return null;
+    const rect = settingsGearRef.current.getBoundingClientRect();
+
+    const CLAUDE_MODELS: { id: ApiClaudeModel; label: string }[] = [
+      { id: 'claude-sonnet-4.5', label: 'Sonnet 4.5' },
+      { id: 'claude-opus-4.6', label: 'Opus 4.6' },
+    ];
+    const GEMINI_MODELS: { id: ApiGeminiModel; label: string }[] = [
+      { id: 'gemini-3-flash-preview', label: 'Flash' },
+      { id: 'gemini-3-pro-preview', label: 'Pro' },
+    ];
+    const THINKING: { id: ThinkingLevel; label: string }[] = [
+      { id: 'NONE', label: 'Off' },
+      { id: 'LOW', label: 'Low' },
+      { id: 'MEDIUM', label: 'Med' },
+      { id: 'HIGH', label: 'High' },
+    ];
+
+    return (
+      <SettingsPortal>
+        <div
+          style={{
+            position: 'fixed',
+            left: rect.left - 3,
+            top: rect.top + rect.height / 2,
+            transform: 'translate(-100%, -50%)',
+            zIndex: 10000,
+          }}
+          onMouseEnter={() => setGearPanelHovered(true)}
+          onMouseLeave={() => { setGearPanelHovered(false); setGearHovered(false); }}
+        >
+          <div style={{
+            backgroundColor: 'rgba(26, 26, 26, 0.98)',
+            border: '1px solid #333',
+            borderRadius: '8px',
+            padding: '10px 12px',
+            fontSize: '10px',
+            minWidth: '200px',
+            backdropFilter: 'blur(12px)',
+            boxShadow: '0 8px 24px rgba(0,0,0,0.5)',
+          }}>
+            {/* Claude */}
+            <div style={{ marginBottom: '10px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '6px' }}>
+                <span style={{ fontSize: '9px', fontWeight: 600, color: '#DA7756', textTransform: 'uppercase' }}>Claude</span>
+                <div style={{ flex: 1, height: '1px', backgroundColor: '#333' }} />
+              </div>
+              <div style={{ display: 'flex', gap: '3px', marginBottom: '4px' }}>
+                {CLAUDE_MODELS.map((m) => (
+                  <button key={m.id} onClick={() => setApiClaudeModel(m.id)} style={{
+                    flex: 1, padding: '3px 6px', fontSize: '9px', fontWeight: 500,
+                    border: '1px solid', borderRadius: '4px', cursor: 'pointer',
+                    borderColor: apiSettings.claudeModel === m.id ? '#DA7756' : '#333',
+                    backgroundColor: apiSettings.claudeModel === m.id ? 'rgba(218,119,86,0.15)' : 'transparent',
+                    color: apiSettings.claudeModel === m.id ? '#DA7756' : '#888',
+                  }}>{m.label}</button>
+                ))}
+              </div>
+              <div style={{ display: 'flex', gap: '2px' }}>
+                {THINKING.map((t) => (
+                  <button key={t.id} onClick={() => setApiClaudeThinking(t.id)} style={{
+                    flex: 1, padding: '2px 4px', fontSize: '8px', fontWeight: 500,
+                    border: '1px solid', borderRadius: '3px', cursor: 'pointer',
+                    borderColor: apiSettings.claudeThinking === t.id ? '#DA7756' : '#333',
+                    backgroundColor: apiSettings.claudeThinking === t.id ? 'rgba(218,119,86,0.15)' : 'transparent',
+                    color: apiSettings.claudeThinking === t.id ? '#DA7756' : '#666',
+                  }}>{t.label}</button>
+                ))}
+              </div>
+            </div>
+
+            {/* Gemini */}
+            <div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '6px' }}>
+                <span style={{ fontSize: '9px', fontWeight: 600, color: '#4E86F8', textTransform: 'uppercase' }}>Gemini</span>
+                <div style={{ flex: 1, height: '1px', backgroundColor: '#333' }} />
+              </div>
+              <div style={{ display: 'flex', gap: '3px', marginBottom: '4px' }}>
+                {GEMINI_MODELS.map((m) => (
+                  <button key={m.id} onClick={() => setApiGeminiModel(m.id)} style={{
+                    flex: 1, padding: '3px 6px', fontSize: '9px', fontWeight: 500,
+                    border: '1px solid', borderRadius: '4px', cursor: 'pointer',
+                    borderColor: apiSettings.geminiModel === m.id ? '#4E86F8' : '#333',
+                    backgroundColor: apiSettings.geminiModel === m.id ? 'rgba(78,134,248,0.15)' : 'transparent',
+                    color: apiSettings.geminiModel === m.id ? '#4E86F8' : '#888',
+                  }}>{m.label}</button>
+                ))}
+              </div>
+              <div style={{ display: 'flex', gap: '2px' }}>
+                {THINKING.map((t) => (
+                  <button key={t.id} onClick={() => setApiGeminiThinking(t.id)} style={{
+                    flex: 1, padding: '2px 4px', fontSize: '8px', fontWeight: 500,
+                    border: '1px solid', borderRadius: '3px', cursor: 'pointer',
+                    borderColor: apiSettings.geminiThinking === t.id ? '#4E86F8' : '#333',
+                    backgroundColor: apiSettings.geminiThinking === t.id ? 'rgba(78,134,248,0.15)' : 'transparent',
+                    color: apiSettings.geminiThinking === t.id ? '#4E86F8' : '#666',
+                  }}>{t.label}</button>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+      </SettingsPortal>
+    );
+  };
+
   if (embedded) {
-    return content;
+    return <>{content}{renderApiSettingsPopover()}</>;
   }
 
   return (
@@ -1657,6 +1778,7 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
       <div className="flex-1 overflow-y-auto p-2">
         {content}
       </div>
+      {renderApiSettingsPopover()}
     </div>
   );
 }

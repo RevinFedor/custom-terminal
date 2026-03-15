@@ -77,7 +77,7 @@ const FALLBACK_PROMPTS: AIPrompt[] = [
   {
     id: 'adopt',
     name: 'Adopt Summary',
-    content: 'Ниже — сессия разработки Claude Code. Ответь СТРОГО в формате:\nTASK: [что делал агент, 1 предложение]\nSTATUS: [done | in_progress | blocked]\nFILES: [затронутые файлы, до 10]\nDONE: [что сделано, 2-3 предложения]\nPROBLEMS: [нерешённые проблемы]\nNEXT: [что делать дальше]\n',
+    content: 'Ниже — сессия разработки Claude Code. Опиши конкретно что агент делал и на чём остановился (3-7 предложений). Какие файлы менял, какие действия выполнил, что осталось незавершённым. Только факты — без оценок и рекомендаций.\n',
     model: 'gemini-3-flash-preview',
     thinkingLevel: 'NONE',
     color: '#6366f1',

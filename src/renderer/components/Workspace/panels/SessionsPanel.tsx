@@ -13,6 +13,19 @@ interface Session {
   locations?: string[];  // All folders where session is available
 }
 
+interface ApiCallEntry {
+  id: number;
+  call_type: string;
+  model: string | null;
+  input_tokens: number;
+  output_tokens: number;
+  result_text: string | null;
+  source_tab_id: string | null;
+  target_tab_id: string | null;
+  payload_size: number;
+  created_at: number;
+}
+
 interface SessionsPanelProps {
   projectPath: string;
   activeTabId: string | null;
@@ -26,9 +39,12 @@ export default function SessionsPanel({ projectPath, activeTabId }: SessionsPane
   const [selectedClaude, setSelectedClaude] = useState<Session | null>(null);
   const getClaudeSessionId = useWorkspaceStore((state) => state.getClaudeSessionId);
   const [expandedSessionId, setExpandedSessionId] = useState<number | null>(null);
+  const [apiCalls, setApiCalls] = useState<ApiCallEntry[]>([]);
+  const [expandedApiCallId, setExpandedApiCallId] = useState<number | null>(null);
 
   useEffect(() => {
     loadSessions();
+    loadApiCalls();
   }, [projectPath]);
 
   const loadSessions = async () => {
@@ -46,6 +62,18 @@ export default function SessionsPanel({ projectPath, activeTabId }: SessionsPane
       }
     } catch (err) {
       console.error('[Sessions] Error loading:', err);
+    }
+  };
+
+  const loadApiCalls = async () => {
+    try {
+      const result = await ipcRenderer.invoke('api-calls:list', { limit: 30 });
+      console.warn('[Sessions] API calls result:', result?.success, 'count:', result?.data?.length);
+      if (result.success && result.data) {
+        setApiCalls(result.data);
+      }
+    } catch (err) {
+      console.error('[Sessions] Error loading API calls:', err);
     }
   };
 
@@ -762,6 +790,78 @@ export default function SessionsPanel({ projectPath, activeTabId }: SessionsPane
             )}
           </div>
         </div>
+
+        {/* API Call Log */}
+        {apiCalls.length > 0 && (
+          <div style={{ padding: '4px 0', borderTop: '1px solid #333', marginTop: '8px' }}>
+          <div className="text-xs text-[#888] mb-2" style={{ fontWeight: 600 }}>
+            API Calls ({apiCalls.length})
+          </div>
+          <div className="flex flex-col gap-1">
+            {apiCalls.map((call) => {
+              const isExpanded = expandedApiCallId === call.id;
+              const typeColors: Record<string, string> = {
+                adopt: '#6366f1',
+                update_docs: '#f59e0b',
+                research: '#0ea5e9',
+              };
+              const color = typeColors[call.call_type] || '#888';
+              const tokensIn = call.input_tokens > 1000 ? (call.input_tokens / 1000).toFixed(1) + 'K' : call.input_tokens;
+              const tokensOut = call.output_tokens > 1000 ? (call.output_tokens / 1000).toFixed(1) + 'K' : call.output_tokens;
+              const payloadKB = call.payload_size > 0 ? Math.round(call.payload_size / 1024) + 'KB' : null;
+
+              return (
+                <div
+                  key={call.id}
+                  className="bg-[#2a2a2a] rounded cursor-pointer hover:bg-[#333] transition-colors"
+                  onClick={() => setExpandedApiCallId(isExpanded ? null : call.id)}
+                >
+                  <div className="flex items-center gap-2 p-2">
+                    <span style={{
+                      fontSize: '9px',
+                      color,
+                      backgroundColor: color + '20',
+                      padding: '1px 5px',
+                      borderRadius: '3px',
+                      fontWeight: 600,
+                    }}>
+                      {call.call_type}
+                    </span>
+                    <span className="text-[10px] text-[#888] flex-1 truncate">
+                      {call.model || '—'}
+                    </span>
+                    <span className="text-[10px] text-[#666]">
+                      {tokensIn}/{tokensOut}
+                    </span>
+                    <span className="text-[10px] text-[#555]">
+                      {getTimeAgo(call.created_at)}
+                    </span>
+                  </div>
+                  {isExpanded && call.result_text && (
+                    <div style={{
+                      padding: '6px 8px',
+                      borderTop: '1px solid #333',
+                      fontSize: '10px',
+                      color: '#aaa',
+                      maxHeight: '200px',
+                      overflow: 'auto',
+                      whiteSpace: 'pre-wrap',
+                      lineHeight: 1.4,
+                    }}>
+                      {payloadKB && (
+                        <div style={{ color: '#666', marginBottom: '4px' }}>
+                          Payload: {payloadKB} | Tokens: {tokensIn} in / {tokensOut} out
+                        </div>
+                      )}
+                      {call.result_text}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

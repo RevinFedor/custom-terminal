@@ -154,6 +154,25 @@ class DatabaseManager {
       )
     `);
 
+    // API Call Log table (adopt, update_docs, research — one-off API calls)
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS api_call_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id TEXT,
+        call_type TEXT NOT NULL,
+        model TEXT,
+        input_tokens INTEGER DEFAULT 0,
+        output_tokens INTEGER DEFAULT 0,
+        result_text TEXT,
+        source_tab_id TEXT,
+        source_session_id TEXT,
+        target_tab_id TEXT,
+        payload_size INTEGER DEFAULT 0,
+        created_at INTEGER DEFAULT (strftime('%s', 'now')),
+        FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+      )
+    `);
+
     // Create indexes
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_quick_actions_project ON quick_actions(project_id);
@@ -161,6 +180,8 @@ class DatabaseManager {
       CREATE INDEX IF NOT EXISTS idx_gemini_history_project ON gemini_history(project_id);
       CREATE INDEX IF NOT EXISTS idx_gemini_history_timestamp ON gemini_history(timestamp DESC);
       CREATE INDEX IF NOT EXISTS idx_ai_sessions_project ON ai_sessions(project_id);
+      CREATE INDEX IF NOT EXISTS idx_api_call_log_project ON api_call_log(project_id);
+      CREATE INDEX IF NOT EXISTS idx_api_call_log_type ON api_call_log(call_type);
     `);
 
     // Research Conversations table
@@ -775,7 +796,7 @@ class DatabaseManager {
       {
         id: 'adopt',
         name: 'Adopt Summary',
-        content: 'Ниже — сессия разработки Claude Code. Ответь СТРОГО в формате:\nTASK: [что делал агент, 1 предложение]\nSTATUS: [done | in_progress | blocked]\nFILES: [затронутые файлы, до 10]\nDONE: [что сделано, 2-3 предложения]\nPROBLEMS: [нерешённые проблемы]\nNEXT: [что делать дальше]\n',
+        content: 'Ниже — сессия разработки Claude Code. Опиши конкретно что агент делал и на чём остановился (3-7 предложений). Какие файлы менял, какие действия выполнил, что осталось незавершённым. Только факты — без оценок и рекомендаций.\n',
         model: 'gemini-3-flash-preview',
         thinking_level: 'NONE',
         color: '#6366f1',
@@ -827,7 +848,7 @@ class DatabaseManager {
       `).run(
         'adopt',
         'Adopt Summary',
-        'Ниже — сессия разработки Claude Code. Ответь СТРОГО в формате:\nTASK: [что делал агент, 1 предложение]\nSTATUS: [done | in_progress | blocked]\nFILES: [затронутые файлы, до 10]\nDONE: [что сделано, 2-3 предложения]\nPROBLEMS: [нерешённые проблемы]\nNEXT: [что делать дальше]\n',
+        'Ниже — сессия разработки Claude Code. Опиши конкретно что агент делал и на чём остановился (3-7 предложений). Какие файлы менял, какие действия выполнил, что осталось незавершённым. Только факты — без оценок и рекомендаций.\n',
         'gemini-3-flash-preview',
         'NONE',
         '#6366f1',
@@ -856,7 +877,23 @@ class DatabaseManager {
     return this.db.prepare('SELECT * FROM ai_sessions WHERE project_id = ? ORDER BY updated_at DESC').all(projectId);
   }
 
-  // ========== BOOKMARKS ========== 
+  // ========== API CALL LOG ==========
+
+  saveApiCallLog({ projectId, callType, model, inputTokens, outputTokens, resultText, sourceTabId, sourceSessionId, targetTabId, payloadSize }) {
+    return this.db.prepare(`
+      INSERT INTO api_call_log (project_id, call_type, model, input_tokens, output_tokens, result_text, source_tab_id, source_session_id, target_tab_id, payload_size)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(projectId || null, callType, model || null, inputTokens || 0, outputTokens || 0, resultText || null, sourceTabId || null, sourceSessionId || null, targetTabId || null, payloadSize || 0).lastInsertRowid;
+  }
+
+  getApiCallLog(projectId = null, limit = 50) {
+    if (projectId) {
+      return this.db.prepare('SELECT * FROM api_call_log WHERE project_id = ? ORDER BY created_at DESC LIMIT ?').all(projectId, limit);
+    }
+    return this.db.prepare('SELECT * FROM api_call_log ORDER BY created_at DESC LIMIT ?').all(limit);
+  }
+
+  // ========== BOOKMARKS ==========
 
   getAllBookmarks() { return this.db.prepare('SELECT * FROM bookmarks ORDER BY position').all(); }
   createBookmark(dirPath, name, description = '') {
@@ -975,6 +1012,66 @@ class DatabaseManager {
   getSessionChild(parentId) {
     const row = this.db.prepare('SELECT child_session_id FROM session_links WHERE parent_session_id = ?').get(parentId);
     return row ? row.child_session_id : null;
+  }
+
+  /**
+   * Copy session_links chain for a given session from the other DB (prod↔dev).
+   * Walks backwards from sessionId, copying all parent links found in the other DB
+   * but missing in the current one.
+   */
+  importSessionLinksFromOtherDb(sessionId) {
+    const userDataPath = app.getPath('userData');
+    const otherDbName = app.isPackaged ? 'noted-terminal-dev.db' : 'noted-terminal.db';
+    const otherDbPath = path.join(userDataPath, otherDbName);
+
+    if (!require('fs').existsSync(otherDbPath)) return 0;
+
+    let otherDb;
+    try {
+      otherDb = new Database(otherDbPath, { readonly: true });
+    } catch (e) {
+      console.error('[DB] Cannot open other DB:', e.message);
+      return 0;
+    }
+
+    let imported = 0;
+    try {
+      // Collect all session IDs to check: walk fork_markers to find originals
+      const idsToCheck = new Set();
+      let walkId = sessionId;
+      const walkVisited = new Set();
+      while (walkId && !walkVisited.has(walkId)) {
+        walkVisited.add(walkId);
+        idsToCheck.add(walkId);
+        const parent = this.getParentSession(walkId);
+        walkId = parent ? parent.source_session_id : null;
+      }
+
+      for (const checkId of idsToCheck) {
+        let currentId = checkId;
+        const visited = new Set();
+        while (currentId && !visited.has(currentId)) {
+          visited.add(currentId);
+          // Skip if link already exists in current DB
+          if (this.getSessionParent(currentId)) {
+            currentId = this.getSessionParent(currentId);
+            continue;
+          }
+          // Check other DB
+          const row = otherDb.prepare('SELECT parent_session_id FROM session_links WHERE child_session_id = ?').get(currentId);
+          if (!row) break;
+          this.saveSessionLink(row.parent_session_id, currentId);
+          console.log('[DB] Imported session link from other DB:', row.parent_session_id.substring(0, 8), '→', currentId.substring(0, 8));
+          imported++;
+          currentId = row.parent_session_id;
+        }
+      }
+    } catch (e) {
+      console.error('[DB] importSessionLinks error:', e.message);
+    } finally {
+      try { otherDb.close(); } catch {}
+    }
+    return imported;
   }
 
   // ========== TIMELINE NOTES ==========
