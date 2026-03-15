@@ -3,6 +3,7 @@ import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import { useUIStore } from '../../store/useUIStore';
 import { terminalRegistry } from '../../utils/terminalRegistry';
+import { dropTargetForElements } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
 import TabBar from './TabBar';
 import ProjectToolbar from './ProjectToolbar';
 import ProjectHome from './ProjectHome';
@@ -97,6 +98,8 @@ export default function Workspace() {
   const [searchResults, setSearchResults] = useState({ resultIndex: 0, resultCount: 0 });
   const [isCommandRunning, setIsCommandRunning] = useState(false);
   const searchInputRef = useRef<HTMLInputElement>(null);
+  const adoptDropRef = useRef<HTMLDivElement>(null);
+  const [adoptDragOver, setAdoptDragOver] = useState(false);
 
   const activeProject = getActiveProject();
   const currentProject = activeProjectId ? projects[activeProjectId] : null;
@@ -127,6 +130,36 @@ export default function Workspace() {
       setViewingSubAgentTabId(null);
     }
   }, [viewingSubAgentTabId, viewedTabParentId, activeProject?.tabs.size]);
+
+  // ========== ADOPT DROP ZONE: drag Claude tab onto Gemini terminal area ==========
+  const activeTabCommandType = activeTab?.commandType;
+  const activeTabId = activeProject?.activeTabId;
+  useEffect(() => {
+    const el = adoptDropRef.current;
+    if (!el || activeTabCommandType !== 'gemini' || !activeTabId) return;
+
+    return dropTargetForElements({
+      element: el,
+      canDrop: ({ source }) => {
+        if (source.data.type !== 'TAB') return false;
+        const state = useWorkspaceStore.getState();
+        for (const [, ws] of state.openProjects) {
+          const tab = ws.tabs.get(source.data.id as string);
+          if (tab) return tab.commandType === 'claude' && !tab.parentTabId;
+        }
+        return false;
+      },
+      onDragEnter: () => setAdoptDragOver(true),
+      onDragLeave: () => setAdoptDragOver(false),
+      onDrop: ({ source }) => {
+        setAdoptDragOver(false);
+        ipcRenderer.invoke('mcp:adopt-agent', {
+          claudeTabId: source.data.id as string,
+          geminiTabId: activeTabId,
+        });
+      },
+    });
+  }, [activeTabCommandType, activeTabId]);
 
   // effectiveTab: when viewing a sub-agent, resolve to that tab; otherwise fallback to activeTab
   const effectiveTab = useMemo(() => {
@@ -415,13 +448,28 @@ export default function Workspace() {
           <TabBar projectId={activeProjectId} />
         </div>
 
-        {/* Sub-agent bar (visible when Gemini tab has Claude sub-agents) */}
-        {activeProjectId && (
-          <SubAgentBar projectId={activeProjectId} />
-        )}
+        {/* Sub-agent bar + Terminal Area wrapped in adopt drop zone */}
+        <div ref={adoptDropRef} className="flex-1 flex flex-col min-w-0 relative">
+          {/* Sub-agent bar (visible when Gemini tab has Claude sub-agents) */}
+          {activeProjectId && (
+            <SubAgentBar projectId={activeProjectId} adoptDragOver={adoptDragOver} />
+          )}
 
-        {/* Terminal Area — Timeline + HistoryPanel are constrained to this height */}
-        <div className="flex-1 flex min-w-0 relative">
+          {/* Adopt drop overlay */}
+          {adoptDragOver && (
+            <div style={{
+              position: 'absolute',
+              inset: 0,
+              border: '2px solid rgba(99, 102, 241, 0.5)',
+              borderRadius: '4px',
+              pointerEvents: 'none',
+              zIndex: 50,
+              background: 'rgba(99, 102, 241, 0.05)',
+            }} />
+          )}
+
+          {/* Terminal Area — Timeline + HistoryPanel are constrained to this height */}
+          <div className="flex-1 flex min-w-0 relative">
           {/* Terminal content — overflow hidden clips HistoryPanel slide animation */}
           <div className="flex-1 relative min-w-0 overflow-hidden">
             <TerminalArea projectId={activeProjectId} />
@@ -531,6 +579,9 @@ export default function Workspace() {
             />
           )}
         </div>
+
+        </div>
+        {/* /adoptDropRef wrapper */}
 
         {/* Project Home - Overlay AFTER TabBar+TerminalArea to keep children indices stable */}
         {/* Uses absolute positioning so visual order is unaffected */}

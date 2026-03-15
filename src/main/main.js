@@ -1361,6 +1361,26 @@ function startMcpHttpServer() {
               } else {
                 results.push({ taskId, success: false, error: apiResult.error });
               }
+
+              // Log API call
+              try {
+                const projId = projectManager.db.db.prepare('SELECT project_id FROM tabs WHERE tab_id = ? LIMIT 1').get(claudeTabId)?.project_id;
+                const geminiTabId = ppid ? await findTabByChildPidCached(ppid) : null;
+                projectManager.db.saveApiCallLog({
+                  projectId: projId,
+                  callType: 'update_docs',
+                  model: useProvider === 'gemini' ? config.apiSettings.geminiModel : config.apiSettings.claudeModel,
+                  inputTokens: apiResult.usage?.input_tokens || apiResult.usage?.promptTokenCount || 0,
+                  outputTokens: apiResult.usage?.output_tokens || apiResult.usage?.candidatesTokenCount || 0,
+                  resultText: apiResult.success ? apiResult.text : ('ERROR: ' + apiResult.error),
+                  sourceTabId: claudeTabId,
+                  sourceSessionId: sessionId,
+                  targetTabId: geminiTabId,
+                  payloadSize: sessionContent.length,
+                });
+              } catch (logErr) {
+                console.error('[MCP:UpdateDocs] Failed to log API call:', logErr.message);
+              }
             } catch (e) {
               console.error('[MCP:UpdateDocs] Error processing taskId=' + taskId + ':', e.message);
               results.push({ taskId, success: false, error: e.message });
@@ -1650,15 +1670,34 @@ async function adoptClaudeAgent(taskId, claudeTabId, geminiTabId) {
         summaryText = '(API summarization failed: ' + apiResult.error + ')';
         console.error('[MCP:Adopt] API error:', apiResult.error);
       }
+
+      // Log API call
+      try {
+        const projId = projectManager.db.db.prepare('SELECT project_id FROM tabs WHERE tab_id = ? LIMIT 1').get(claudeTabId)?.project_id;
+        projectManager.db.saveApiCallLog({
+          projectId: projId,
+          callType: 'adopt',
+          model: adoptModel,
+          inputTokens: apiResult.usage?.input_tokens || 0,
+          outputTokens: apiResult.usage?.output_tokens || 0,
+          resultText: summaryText,
+          sourceTabId: claudeTabId,
+          sourceSessionId: sessionId,
+          targetTabId: geminiTabId,
+          payloadSize: sessionContent.length,
+        });
+      } catch (logErr) {
+        console.error('[MCP:Adopt] Failed to log API call:', logErr.message);
+      }
     } catch (e) {
       summaryText = '(Summarization error: ' + e.message + ')';
       console.error('[MCP:Adopt] Summarization failed:', e.message);
     }
   }
 
-  // 7. Format and deliver to Gemini via response queue
+  // 6. Format and deliver to Gemini via response queue
   const formatted = '[Adopted Agent Context]\n' +
-    'INSTRUCTIONS: This is informational context about an adopted agent. Read and remember it. Do NOT respond, do NOT call any tools (no update_docs, no list_sub_agents, no continue_claude). Say NOTHING. Wait silently for the next user message.\n' +
+    'Context about an adopted agent. Do NOT fabricate agent responses.\n' +
     (tabName ? 'Tab: ' + tabName + '\n' : '') +
     'Task ID: ' + taskId + '\n' +
     (sessionId ? 'Session: ' + sessionId.substring(0, 8) + '...\n' : '') +
@@ -6308,8 +6347,11 @@ ipcMain.on('claude:run-command', (event, { tabId, command, sessionId, forkSessio
 
         if (sourcePath && sourceDir) {
           const newSessionId = crypto.randomUUID();
-          // Copy to the SAME directory where source was found
-          const destPath = path.join(sourceDir, `${newSessionId}.jsonl`);
+          // Copy to CWD-based directory so claude --resume can find it
+          if (!fs.existsSync(primaryDir)) {
+            fs.mkdirSync(primaryDir, { recursive: true });
+          }
+          const destPath = path.join(primaryDir, `${newSessionId}.jsonl`);
 
           // Get Timeline UUIDs snapshot using Backtrace algorithm
           const entryUuids = parseTimelineUuids(sourcePath);
@@ -6320,12 +6362,23 @@ ipcMain.on('claude:run-command', (event, { tabId, command, sessionId, forkSessio
           console.log('[Claude Runner] From:', sourcePath);
           console.log('[Claude Runner] To:', destPath);
 
+
           // Save fork marker with UUIDs snapshot (always save, even if empty — marks fork at beginning)
           try {
             projectManager.db.saveForkMarker(forkSessionId, newSessionId, entryUuids);
             console.log('[Claude Runner] Fork marker saved with', entryUuids.length, 'UUIDs');
           } catch (e) {
             console.warn('[Claude Runner] Could not save fork marker:', e.message);
+          }
+
+          // Import session_links from other DB (prod↔dev) for the source session chain
+          try {
+            const imported = projectManager.db.importSessionLinksFromOtherDb(forkSessionId);
+            if (imported > 0) {
+              console.log('[Claude Runner] Imported', imported, 'session links from other DB');
+            }
+          } catch (e) {
+            console.warn('[Claude Runner] Could not import session links:', e.message);
           }
 
           // Run claude --resume in CURRENT terminal (not new tab!)

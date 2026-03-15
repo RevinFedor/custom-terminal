@@ -401,7 +401,76 @@ Timeline должен отслеживать видимость сообщени
 ## Примеры реализации
 - `docs/knowledge/fact-timeline.md`: Превью сообщений.
 - `docs/knowledge/fix-gemini-response-queue.md`: Очередь ответов (SubAgentBar).
-- `src/renderer/components/Workspace/panels/ActionsPanel.tsx`: Меню настроек копирования (📋).
+- `src/renderer/components/Workspace/panels/ActionsPanel.tsx`: Меню настроек копирования (📋), API Settings (⚙).
 
 ## Когда применять
 Всегда, когда пользователю нужно взаимодействовать с контентом всплывающего окна, которое открывается по hover.
+
+---
+
+## Cmd+Hover Settings Panel (Конкретный шаблон)
+
+### Концепция
+Плавающая панель настроек, которая появляется при зажатом Cmd и наведении на триггер (иконку). Панель позиционируется слева от триггера через Portal и остаётся открытой при перемещении курсора внутрь неё — даже после отпускания Cmd.
+
+### Почему не таймеры и не pinned-стейт
+Пробовали `setTimeout` + `isPinned` + `gearCloseTimer` — лишнее усложнение. Directional Closing + реактивное вычисление видимости решает все кейсы без таймеров.
+
+### Реактивная видимость (ключевое отличие от обычного hover)
+Обычный hover (`onMouseEnter` → show) не работает, когда курсор уже на месте и пользователь нажимает/отпускает Cmd. `onMouseEnter` не стреляет повторно. Решение — **разделить hover-стейт и видимость**:
+
+```tsx
+const [gearHovered, setGearHovered] = useState(false);       // мышь над триггером
+const [gearPanelHovered, setGearPanelHovered] = useState(false); // мышь внутри панели
+
+// Видимость — derived state, не отдельный useState
+const showPanel = (isCmdPressed && gearHovered) || gearPanelHovered;
+```
+
+`isCmdPressed` — из хука `useCmdKey()`. При нажатии/отпускании Cmd React делает ре-рендер → `showPanel` пересчитывается → панель появляется/исчезает без участия mouse events.
+
+### Триггер (иконка ⚙)
+```tsx
+onMouseEnter={() => setGearHovered(true)}
+onMouseLeave={(e) => {
+  // Directional: закрыть только если мышь ушла НЕ в сторону панели
+  const rect = e.currentTarget.getBoundingClientRect();
+  if (e.clientX >= rect.left) {  // панель слева → пропускаем уход влево
+    setGearHovered(false);
+  }
+}}
+```
+
+### Portal-панель
+```tsx
+onMouseEnter={() => setGearPanelHovered(true)}
+onMouseLeave={() => { setGearPanelHovered(false); setGearHovered(false); }}
+```
+При входе в панель — pin (через `gearPanelHovered`). При выходе — полный сброс.
+
+### Позиционирование
+```tsx
+style={{
+  position: 'fixed',
+  left: rect.left - 3,
+  top: rect.top + rect.height / 2,
+  transform: 'translate(-100%, -50%)',  // панель слева, вертикально по центру
+  zIndex: 10000,
+}}
+```
+Паттерн Anchored CSS Transforms — правый край панели всегда встык к триггеру, независимо от ширины контента.
+
+### Матрица состояний
+
+| Действие | `isCmdPressed && gearHovered` | `gearPanelHovered` | Панель |
+|---|---|---|---|
+| Курсор на ⚙, нажал Cmd | true | false | видна |
+| Курсор на ⚙, отпустил Cmd | false | false | скрыта |
+| Переместил курсор в панель | — | true | видна |
+| Отпустил Cmd в панели | false | true | видна |
+| Ушёл из панели | — | false | скрыта |
+
+### Применение
+- `ActionsPanel.tsx`: ⚙ API Settings (модель/thinking для Update Docs)
+- `ActionsPanel.tsx`: 📋 Copy Settings (Чтение, Редактирование, От fork) — использует упрощённый вариант без Cmd (обычный hover + directional)
+- `TabBar.tsx`, `ProjectHome.tsx`, `Dashboard.tsx`: `useCmdHoverPopover` хук — обобщённая версия этого паттерна для списков элементов

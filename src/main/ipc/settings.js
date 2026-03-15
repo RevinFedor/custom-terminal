@@ -108,6 +108,21 @@ function register({ projectManager }) {
       return { success: false, error: error.message };
     }
   });
+
+  // API Call Log
+  ipcMain.handle('api-calls:list', async (event, args) => {
+    try {
+      const projectId = args?.projectId || null;
+      const limit = args?.limit || 50;
+      console.log('[ApiCallLog] Listing API calls, projectId=' + (projectId || 'all') + ' limit=' + limit);
+      const data = projectManager.db.getApiCallLog(projectId, limit);
+      console.log('[ApiCallLog] Found ' + data.length + ' entries');
+      return { success: true, data };
+    } catch (error) {
+      console.error('[ApiCallLog] Error listing API calls:', error);
+      return { success: false, error: error.message };
+    }
+  });
 }
 
 module.exports = { register };

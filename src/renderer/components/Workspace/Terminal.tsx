@@ -263,7 +263,7 @@ function getCurrentCommand(term: XTerminal): string {
 const { ipcRenderer } = window.require('electron');
 
 // Write buffer constants to prevent Ink/TUI render tearing
-const FLUSH_DELAY = 10; // ms - aligns with 60fps
+const FLUSH_DELAY = 32; // ms - 2 frames at 60fps, batches Ink differential renderer updates
 const MAX_BUFFER_SIZE = 4096; // safety valve
 
 interface TerminalProps {
@@ -356,6 +356,16 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
     setShowScrollButton(false);
   }, []);
 
+  // rAF-debounced scroll check: collapses N onWriteParsed calls per frame into one
+  const pendingScrollCheckRef = useRef<number | null>(null);
+  const rafCheckScroll = useCallback(() => {
+    if (pendingScrollCheckRef.current !== null) return;
+    pendingScrollCheckRef.current = requestAnimationFrame(() => {
+      pendingScrollCheckRef.current = null;
+      checkScrollPosition();
+    });
+  }, [checkScrollPosition]);
+
   // Attach scroll listeners - called AFTER term.open() when DOM is guaranteed to exist
   const attachScrollListeners = useCallback((term: XTerminal, container: HTMLDivElement) => {
     // 1. Native scroll (mouse wheel, trackpad, scrollbar drag)
@@ -368,8 +378,9 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
     term.onScroll(checkScrollPosition);
 
     // 3. When data is written (terminal auto-scrolls down on output)
-    term.onWriteParsed(checkScrollPosition);
-  }, [checkScrollPosition]);
+    // rAF-debounced: Ink differential renderer fires many small writes per frame
+    term.onWriteParsed(rafCheckScroll);
+  }, [checkScrollPosition, rafCheckScroll]);
 
   // Write buffer refs to batch PTY output and prevent jitter
   const writeBufferRef = useRef<string>('');
@@ -481,18 +492,12 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
       getSetClaudeSessionId()(tabId, data.sessionId);
     };
 
-    // Toast when /status reveals Session ID (visual confirmation)
+    // /status interception: update session ID if not yet captured (no toast)
     const handleStatusSessionDetected = (_: any, data: { tabId: string; sessionId: string }) => {
       if (data.tabId !== tabId) return;
       const currentId = getClaudeSessionId(tabId);
-      const short = data.sessionId.substring(0, 8);
       if (!currentId) {
         getSetClaudeSessionId()(tabId, data.sessionId);
-        useUIStore.getState().showToast('Session: ' + short + '...', 'success', 1000);
-      } else if (currentId !== data.sessionId) {
-        useUIStore.getState().showToast('/status: ' + short + '... \u2260 stored: ' + currentId.substring(0, 8) + '...', 'warning', 2000);
-      } else {
-        useUIStore.getState().showToast('Session: ' + short + '...', 'success', 1000);
       }
     };
 
