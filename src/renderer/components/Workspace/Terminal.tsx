@@ -488,6 +488,7 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
           syncSafetyRef.current = setTimeout(() => {
             syncSafetyRef.current = null;
             if (xtermInstance.current && writeBufferRef.current) {
+              // DIAG: console.warn(`[WriteBuffer:SYNC_SAFETY] forced flush ${writeBufferRef.current.length}B`);
               xtermInstance.current.write(writeBufferRef.current);
               writeBufferRef.current = '';
             }
@@ -502,6 +503,8 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
         if (!pendingWriteRef.current) {
           pendingWriteRef.current = setTimeout(() => {
             if (xtermInstance.current && writeBufferRef.current) {
+              // DIAG: uncomment to trace flush sizes
+              // console.warn(`[WriteBuffer:FLUSH] ${writeBufferRef.current.length}B sync=${writeBufferRef.current.includes(SYNC_START)}`);
               xtermInstance.current.write(writeBufferRef.current);
               writeBufferRef.current = '';
             }
@@ -510,17 +513,15 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
         }
       }
 
-      // Flush immediately if buffer too large (safety valve — prevents memory issues)
-      if (writeBufferRef.current.length > MAX_BUFFER_SIZE) {
+      // Flush immediately if buffer too large — but NEVER inside a sync frame
+      // (breaking a sync frame mid-write causes 1000+px viewport jumps from cursor repositioning)
+      if (!insideSyncFrame && writeBufferRef.current.length > MAX_BUFFER_SIZE) {
         if (pendingWriteRef.current) {
           clearTimeout(pendingWriteRef.current);
           pendingWriteRef.current = null;
         }
-        if (syncSafetyRef.current) {
-          clearTimeout(syncSafetyRef.current);
-          syncSafetyRef.current = null;
-        }
         if (xtermInstance.current) {
+          // DIAG: console.warn(`[WriteBuffer:MAX_SIZE] flush ${writeBufferRef.current.length}B`);
           xtermInstance.current.write(writeBufferRef.current);
           writeBufferRef.current = '';
         }

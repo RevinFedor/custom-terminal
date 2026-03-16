@@ -12,7 +12,8 @@
 ### Solution: New 3-stage approach
 1. **Stage 1: Detect Current State**: Use `serializeAddon` to check if Gemini prompt `>` is already visible.
 2. **Stage 2: Wait for Ready State**: If starting, wait up to 15s for "Type your message" pattern.
-3. **Stage 3: Smart Execution**: Only send `gemini` if needed, then send `/chat resume`.
+3. **Stage 4: Deterministic TUI Readiness (HIDE CURSOR)**: ANSI-последовательность `HIDE CURSOR` (`\x1b[?25l`) — самый быстрый и точный сигнал готовности Ink-интерфейса Gemini. Она отправляется ровно один раз в конце инициализации.
+4. **Stage 5: Smart Execution**: Only send `gemini` if needed, then send `/chat resume`.
 
 ### Deterministic TUI Readiness: HIDE CURSOR Signal
 При холодном запуске Gemini (или перезапуске приложения) система должна дождаться полной инициализации интерфейса перед вставкой текста. **Единственный надежный сигнал готовности** — ANSI-последовательность `HIDE CURSOR` (`\x1b[?25l`), которую Gemini CLI отправляет в конце инициализации Ink-интерфейса.
@@ -165,6 +166,24 @@ Gemini CLI doesn't have an internal registry; it just scans `~/.gemini/tmp/<SHA2
 2. **Robustness:** Braille-символы крайне редко встречаются в обычном выводе кода или текста, поэтому они сами по себе являются надежным сигналом.
 
 ---
+
+## 10. Spurious Cycles Scar (The False IDLE)
+
+### Симптомы
+В автоматизированных сценариях (Update Docs) второй промпт (Post-check) вставлялся мгновенно, не дожидаясь реального ответа от первого промпта, либо вставлялся прямо поверх генерируемого текста.
+
+### Причина
+Gemini CLI ведет себя нелинейно при получении инпута:
+1. **Input Acceptance:** При нажатии Enter спиннер может мелькнуть на 0.5-0.9с (авто-обработка), после чего Gemini уходит в IDLE. Это **не ответ**, а просто подтверждение приема команды.
+2. **Heavy Processing:** При загрузке большого контекста (MCP, файлы) спиннер может замирать на экране на 2-10с, пока PTY-поток полностью молчит. Стандартные детекторы тишины (silence detection) ошибочно считали это концом ответа.
+
+### Решение: Buffer Inspection
+Отказ от анализа только PTY-потока в пользу проверки физического состояния экрана через `terminalRegistry.hasSpinnerOnScreen(tabId)`.
+- **Логика:** Если `gemini:busy-state` перешел в IDLE, система проверяет последние 5 строк буфера xterm.js на наличие Braille-символов.
+- **Результат:** Если спиннер виден на экране (даже если он замер и PTY молчит), сессия считается **BUSY**. Это единственный 100% надежный способ дождаться окончания генерации в Ink TUI.
+
+---
+
 
 ## 5. Поддержка Truecolor (24-bit) в терминале
 
