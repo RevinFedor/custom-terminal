@@ -24,8 +24,9 @@ Claude re-renders the prompt symbol (`⏵`) **immediately** after displaying the
 - **Trap:** A simple "ON when marker seen, OFF when prompt seen" logic fails because both arrive within milliseconds. The Danger Zone is cleared before it can protect anything.
 - **Solution:** A **3-second Minimum Hold**. The Danger Zone flag is only eligible for removal after 3 seconds have passed since the marker was detected.
 
-## Protection Logic: Skip ctrlCFirst
+## Protection Logic: Multiple Layers
 
+### Layer 1: PTY-level Detection & Hold
 When the Danger Zone is active, the first Ctrl+C **already cleared the input line**. Sending another `\x03` via `ctrlCFirst` would exit Claude. So the strategy is:
 
 1. **Detection:** When `"again to exit"` is seen in PTY → `claudeCtrlCDangerZone` flag is set (ON).
@@ -36,6 +37,18 @@ When the Danger Zone is active, the first Ctrl+C **already cleared the input lin
    - If flag is ON → **Wait** for DZ to expire (toggle uses Escape, not Ctrl+C, so it's safe to wait).
    - If flag is OFF → Proceed normally.
 4. **TTL Fallback (4s):** If no prompt is detected after 3s hold, DZ auto-clears to prevent permanent lock.
+
+### Layer 2: UI-level Prevention (Command Guard)
+В дополнение к PTY-уровню защиты, интерфейс **физически блокирует** кнопки управления (Model, Effort, Think) на время выполнения команды через флаг `isCommandRunning`.
+
+**Процесс:**
+1. Пользователь кликает кнопку Model/Effort/Think.
+2. UI устанавливает `isCommandRunning = true` → кнопки становятся disabled.
+3. Отправляется синхронный IPC-вызов `ipcRenderer.invoke('claude:send-command')`.
+4. Main process выполняет `safePasteAndSubmit` и дожидается завершения `term.write()`.
+5. IPC возвращает контроль → UI устанавливает `isCommandRunning = false` → кнопки вновь enabled.
+
+**Мотивация:** Это исключает человеческий фактор — невозможно нажать кнопку дважды за 100ms, даже если пользователь быстро кликает. Вместе с PTY-уровнем защитой это обеспечивает надежную защиту от двойного Ctrl+C.
 
 ## Production Safety
 - **TTL Fallback:** If no prompt is detected, the Danger Zone automatically clears after 4 seconds to prevent permanent locking of UI buttons.
