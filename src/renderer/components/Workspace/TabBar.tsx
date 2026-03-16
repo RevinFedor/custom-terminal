@@ -818,6 +818,10 @@ function TabBar({ projectId }: TabBarProps) {
       toggleTabSelection(projectId, tabId, true);
     } else {
       console.warn('[TabBar:click] switchTab tabId=' + tabId + ' ts=' + Date.now());
+      // If clicking the already-active Gemini tab while viewing a sub-agent → return to Gemini
+      if (tabId === workspace?.activeTabId && viewingSubAgentTabId) {
+        useWorkspaceStore.getState().setViewingSubAgent(null);
+      }
       switchTab(projectId, tabId);
       // Always switch to terminal view when clicking a tab
       // (fixes: clicking tab from Home view didn't switch currentView from 'home' to 'terminal')

@@ -69,6 +69,14 @@ MCP-инструмент `docs_search` доступен для поиска по
 - **Auto-apply Toggle:** Мини-тогл рядом с ⚙ в секции System. Когда ON — Haiku автоматически начинает применение изменений (handshake добавляет `Ответь на промпт выше.`). По умолчанию OFF.
 - **Claude Extended Thinking:** Поддержка режима размышления для API Claude (версия 2025-04-15) с уровнями Low/Med/High (бюджет до 50к токенов).
 
+## Claude TUI Management
+- **Model Switching:** `/model default|sonnet|opus|haiku` — переключение модели из UI. Поддерживается `default` (Opus) и явный выбор `opus`.
+- **Effort Level:** `/effort low|medium|high` — контроль интенсивности размышлений (5K/16K/50K токенов). Локальный трекинг (не подтверждается bridge).
+- **Think Mode:** `meta+t` (Esc+t) или UI-кнопка — переключение режима размышления. При запуске управляется `alwaysThinkingEnabled` в `~/.claude/settings.json`.
+- **Rewind:** `/rewind` или UI-контекстное меню — откат к выбранному сообщению с сжатием контекста.
+- **Command Guard:** Во время отправки команд кнопки управления (Model/Effort/Think) блокируются через `isCommandRunning` для предотвращения двойных операций.
+- **Синхронизация:** Все команды отправляются через синхронный IPC `invoke('claude:send-command')` для гарантии порядка выполнения. Используется `safePasteAndSubmit` с чанками < 1024 байт и sync marker verification.
+
 ## Ключевые решения (Knowledge Base)
 ### AI Orchestration
 - **Performance Lags:** [`fix-performance-lags.md`](docs/knowledge/fix-performance-lags.md) — устранение фризов через инкрементальное чтение и оптимизацию селекторов.
