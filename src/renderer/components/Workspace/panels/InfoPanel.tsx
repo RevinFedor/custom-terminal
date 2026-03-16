@@ -52,6 +52,7 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
   const [sessionCopied, setSessionCopied] = useState(false);
   const [isGeneratingDesc, setIsGeneratingDesc] = useState(false);
   const [thinkFlash, setThinkFlash] = useState<string | null>(null);
+  const [effortLevel, setEffortLevel] = useState<Record<string, string>>({});
   const bridgeCacheRef = useRef<Map<string, { model: string; contextPct: number }>>(new Map());
   const cached = activeTabId ? bridgeCacheRef.current.get(activeTabId) : undefined;
   const [claudeModel, setClaudeModel] = useState<string | null>(cached?.model ?? null);
@@ -595,13 +596,19 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
             <div className="flex items-center gap-1">
               <span className="text-[10px] text-[#666] w-12 flex-shrink-0">Model</span>
               <div className="flex gap-1 flex-1">
-                {(['sonnet', 'opus', 'haiku'] as const).map((model) => {
-                  const isActive = claudeModel?.toLowerCase().includes(model);
+                {(['default', 'sonnet', 'opus', 'haiku'] as const).map((model) => {
+                  const lm = claudeModel?.toLowerCase() || '';
+                  const isActive = model === 'default'
+                    ? lm.includes('1m context')
+                    : model === 'opus'
+                      ? lm.includes('opus') && !lm.includes('1m context')
+                      : lm.includes(model);
                   return (
                     <button
                       key={model}
-                      className={`flex-1 text-[10px] px-1.5 py-1 rounded cursor-pointer ${isActive ? 'bg-[#DA7756] text-white font-medium' : 'bg-[#2d2d2d] text-[#888] hover:text-white hover:bg-[#3d3d3d]'}`}
-                      onClick={() => { console.warn('[InfoPanel:ModelSwitch] clicked=' + model + ' tabId=' + activeTabId + ' ts=' + Date.now()); ipcRenderer.send('claude:send-command', activeTabId, '/model ' + model); }}
+                      className={`flex-1 text-[10px] px-1.5 py-1 rounded ${isCommandRunning ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'} ${isActive ? 'bg-[#DA7756] text-white font-medium' : 'bg-[#2d2d2d] text-[#888] hover:text-white hover:bg-[#3d3d3d]'}`}
+                      disabled={isCommandRunning}
+                      onClick={async () => { if (isCommandRunning) return; setIsCommandRunning(true); console.warn('[InfoPanel:ModelSwitch] clicked=' + model + ' tabId=' + activeTabId + ' ts=' + Date.now()); try { await ipcRenderer.invoke('claude:send-command', activeTabId, '/model ' + model); } finally { setIsCommandRunning(false); } }}
                       title={'Switch to ' + model}
                     >
                       {model}
@@ -611,12 +618,42 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
               </div>
             </div>
             <div className="flex items-center gap-1">
+              <span className="text-[10px] text-[#666] w-12 flex-shrink-0">Effort</span>
+              <div className="flex gap-1 flex-1">
+                {(['auto', 'low', 'medium', 'high', 'max'] as const).map((level) => {
+                  const currentEffort = activeTabId ? effortLevel[activeTabId] : undefined;
+                  const isActive = currentEffort === level;
+                  return (
+                    <button
+                      key={level}
+                      className={`flex-1 text-[10px] px-1.5 py-1 rounded ${isCommandRunning ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'} ${isActive ? 'bg-[#DA7756]/20 text-white font-medium' : 'bg-[#2d2d2d] text-[#888] hover:text-white hover:bg-[#3d3d3d]'}`}
+                      disabled={isCommandRunning}
+                      onClick={async () => {
+                        if (isCommandRunning) return;
+                        setIsCommandRunning(true);
+                        if (activeTabId) setEffortLevel(prev => ({ ...prev, [activeTabId]: level }));
+                        try { await ipcRenderer.invoke('claude:send-command', activeTabId, '/effort ' + level); } finally { setIsCommandRunning(false); }
+                      }}
+                      title={'Set effort to ' + level}
+                    >
+                      {level === 'medium' ? 'med' : level}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+            <div className="flex items-center gap-1">
               <span className="text-[10px] text-[#666] w-12 flex-shrink-0">Think</span>
               <button
-                className={`flex-1 text-[10px] px-1.5 py-1 rounded cursor-pointer bg-[#2d2d2d] ${thinkFlash ? 'text-[#b4b9f9]' : 'text-[#888] hover:text-white hover:bg-[#3d3d3d]'}`}
+                disabled={isCommandRunning}
+                className={`flex-1 text-[10px] px-1.5 py-1 rounded ${isCommandRunning ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'} bg-[#2d2d2d] ${thinkFlash ? 'text-[#b4b9f9]' : 'text-[#888] hover:text-white hover:bg-[#3d3d3d]'}`}
                 onClick={async () => {
-                  const result = await ipcRenderer.invoke('claude:toggle-thinking', activeTabId);
-                  if (result.success) { setThinkFlash(result.thinking ? 'think on' : 'think off'); setTimeout(() => setThinkFlash(null), 3000); }
+                  if (isCommandRunning) return;
+                  setIsCommandRunning(true);
+                  try {
+                    const result = await ipcRenderer.invoke('claude:toggle-thinking', activeTabId);
+                    if (result.success) { setThinkFlash(result.thinking ? 'think on' : 'think off'); setTimeout(() => setThinkFlash(null), 3000); }
+                  } finally { setIsCommandRunning(false); }
                 }}
                 title="Toggle thinking mode (meta+t)"
               >

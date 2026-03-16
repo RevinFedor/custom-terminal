@@ -40,6 +40,7 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
   const [isCopyingDocs, setIsCopyingDocs] = useState(false);
   const [isApiLoading, setIsApiLoading] = useState(false);
   const apiCancelledRef = useRef(false);
+  const [clipboardMode, setClipboardMode] = useState(false);
 
   // Update Docs expandable prompt
   const [docsExpanded, setDocsExpanded] = useState(false);
@@ -342,12 +343,25 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
   const handleCancelUpdateDocs = useCallback(() => {
     cancelledRef.current = true;
     if (docsGeminiTabIdRef.current && activeProjectId) {
-      closeTab(activeProjectId, docsGeminiTabIdRef.current);
+      closeTab(activeProjectId, docsGeminiTabIdRef.current, { skipProcessCheck: true });
       docsGeminiTabIdRef.current = null;
     }
     setIsUpdatingDocs(false);
     showToast('Отменено', 'info');
   }, [activeProjectId, closeTab, showToast]);
+
+  // Resolve content: clipboard (if toggle on) or session export
+  const resolveDocsContent = async (activeProject: any): Promise<string | null> => {
+    if (clipboardMode) {
+      try {
+        const text = await navigator.clipboard.readText();
+        if (!text?.trim()) { showToast('Буфер обмена пуст', 'warning'); return null; }
+        showToast('Using clipboard content...', 'info');
+        return text;
+      } catch { showToast('Не удалось прочитать буфер обмена', 'error'); return null; }
+    }
+    return exportSessionContent(activeProject);
+  };
 
   // Copy Docs to Clipboard — same logic as Update Docs but copies assembled prompt to clipboard
   const handleCopyDocsToClipboard = async () => {
@@ -364,8 +378,8 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
 
     setIsCopyingDocs(true);
     try {
-      // 1. Export session content
-      const content = await exportSessionContent(activeProject);
+      // 1. Export session content (or clipboard if toggle on)
+      const content = await resolveDocsContent(activeProject);
       if (!content) { setIsCopyingDocs(false); return; }
 
       // 2. Get documentation prompt
@@ -409,8 +423,8 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
     apiCancelledRef.current = false;
 
     try {
-      // 1. Export session content
-      const content = await exportSessionContent(activeProject);
+      // 1. Export session content (or clipboard if toggle on)
+      const content = await resolveDocsContent(activeProject);
       if (!content) { setIsApiLoading(false); return; }
 
       // 2. Get documentation prompt + knowledge base
@@ -475,8 +489,8 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
     apiCancelledRef.current = false;
 
     try {
-      // 1. Export session content
-      const content = await exportSessionContent(activeProject);
+      // 1. Export session content (or clipboard if toggle on)
+      const content = await resolveDocsContent(activeProject);
       if (!content) { setIsApiLoading(false); return; }
 
       // 2. Get documentation prompt + knowledge base
@@ -573,7 +587,7 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
     apiCancelledRef.current = false;
 
     try {
-      const content = await exportSessionContent(activeProject);
+      const content = await resolveDocsContent(activeProject);
       if (!content) { setIsApiLoading(false); return; }
 
       const systemPrompt = await getDocumentationPrompt();
@@ -631,8 +645,8 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
     apiCancelledRef.current = false;
 
     try {
-      // 1. Export session content
-      const content = await exportSessionContent(activeProject);
+      // 1. Export session content (or clipboard if toggle on)
+      const content = await resolveDocsContent(activeProject);
       if (!content) { setIsApiLoading(false); return; }
 
       // 2. Get documentation prompt + knowledge base
@@ -721,13 +735,13 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
         .filter(t => t.name.startsWith('docs-')).length;
       const tabName = `docs-${String(existingDocsTabs + 1).padStart(2, '0')}`;
 
-      const newTabId = await createTabAfterCurrent(activeProjectId, tabName, workingDir, { color: 'claude', isUtility: false, nameSetManually: true });
+      const newTabId = await createTabAfterCurrent(activeProjectId, tabName, workingDir, { color: 'claude', isUtility: false, nameSetManually: true, background: true });
       if (!newTabId) throw new Error('Failed to create tab');
       useWorkspaceStore.getState().setTabCommandType(newTabId, 'claude');
 
       // 6. Launch Claude --resume prefilled session; handshake sends /model haiku (+ auto-confirm if toggle ON)
       const handshakePrompt = autoApplyDocs
-        ? '/model haiku\nОтветь на промпт выше.'
+        ? '/model haiku\nПодтверждаю.'
         : '/model haiku';
       ipcRenderer.send('claude:run-command', {
         tabId: newTabId,
@@ -775,13 +789,14 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
       const tabCwd = await ipcRenderer.invoke('terminal:getCwd', activeTabId);
       const workingDir = tabCwd || activeProject.projectPath;
 
-      // 1. Get content based on source
+      // 1. Get content based on source (clipboardMode overrides session → clipboard)
+      const effectiveSource = (source === 'session' && clipboardMode) ? 'clipboard' : source;
       let content: string;
 
-      if (source === 'selection') {
+      if (effectiveSource === 'selection') {
         content = terminalSelection!;
         showToast('Using terminal selection...', 'info');
-      } else if (source === 'clipboard') {
+      } else if (effectiveSource === 'clipboard') {
         try {
           content = await navigator.clipboard.readText();
           if (!content?.trim()) { showToast('Буфер обмена пуст', 'warning'); return; }
@@ -835,7 +850,7 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
         }
       }
 
-      const newTabId = await createTabAfterCurrent(activeProjectId, tabName, workingDir, { color: 'gemini', isUtility: false, afterTabId, nameSetManually: true });
+      const newTabId = await createTabAfterCurrent(activeProjectId, tabName, workingDir, { color: 'gemini', isUtility: false, afterTabId, nameSetManually: true, background: true });
       if (!newTabId) throw new Error('Failed to create tab');
       docsGeminiTabIdRef.current = newTabId;
       useWorkspaceStore.getState().setTabCommandType(newTabId, 'gemini');
@@ -1067,10 +1082,16 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
           <div className="flex flex-col gap-1">
               <div
                 ref={docsBlockRef}
-                className={`w-full bg-blue-900/30 border border-blue-700/30 text-blue-400 p-3 text-left rounded-lg text-xs flex items-center gap-2 ${
+                className={`w-full p-3 text-left rounded-lg text-xs flex items-center gap-2 border ${
                   isUpdatingDocs ? 'opacity-50 cursor-not-allowed' : ''
                 }`}
-                style={{ cursor: isUpdatingDocs ? 'not-allowed' : 'default' }}
+                style={{
+                  cursor: isUpdatingDocs ? 'not-allowed' : 'default',
+                  backgroundColor: clipboardMode ? 'rgba(124, 58, 237, 0.15)' : 'rgba(30, 58, 138, 0.3)',
+                  borderColor: clipboardMode ? 'rgba(167, 139, 250, 0.4)' : 'rgba(29, 78, 216, 0.3)',
+                  color: clipboardMode ? '#c4b5fd' : '#60a5fa',
+                  transition: 'background-color 0.3s ease, border-color 0.3s ease, color 0.3s ease',
+                }}
               >
                 <span className="text-base">📚</span>
                 <div className="flex-1">
@@ -1401,16 +1422,20 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
                     <span className="font-medium">{terminalSelection.length}</span>
                   </div>
                 )}
-                {/* Clipboard button - use content from clipboard (hidden during multi-select) */}
+                {/* Clipboard toggle - when ON, all buttons use clipboard instead of session */}
                 {!isUpdatingDocs && !isMultiSelect && (
                   <div
                     className="relative z-10 text-white text-[9px] px-2 py-1.5 rounded flex items-center gap-1 cursor-pointer select-none"
-                    style={{ backgroundColor: '#7c3aed' }}
-                    onMouseEnter={(e) => e.currentTarget.style.backgroundColor = '#8b5cf6'}
-                    onMouseLeave={(e) => e.currentTarget.style.backgroundColor = '#7c3aed'}
-                    onClick={(e) => handleUpdateDocs('clipboard', e)}
+                    style={{
+                      backgroundColor: clipboardMode ? '#7c3aed' : 'rgba(124, 58, 237, 0.2)',
+                      border: clipboardMode ? '1px solid #a78bfa' : '1px solid transparent',
+                      transition: 'all 0.15s ease',
+                    }}
+                    onMouseEnter={(e) => { if (!clipboardMode) e.currentTarget.style.backgroundColor = 'rgba(124, 58, 237, 0.35)'; }}
+                    onMouseLeave={(e) => { if (!clipboardMode) e.currentTarget.style.backgroundColor = 'rgba(124, 58, 237, 0.2)'; }}
+                    onClick={(e) => { e.stopPropagation(); setClipboardMode(!clipboardMode); }}
                     onMouseDown={(e) => e.stopPropagation()}
-                    title="Use clipboard content"
+                    title={clipboardMode ? 'Clipboard mode ON — click to disable' : 'Clipboard mode OFF — click to enable'}
                     role="button"
                     tabIndex={0}
                   >

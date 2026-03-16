@@ -290,9 +290,7 @@ export default function Workspace() {
       if (workspaceView !== 'workspace') return;
       const isBackslash = e.code === 'Backslash' || e.key === '\\' || e.code === 'IntlBackslash';
       if (e.metaKey && isBackslash) {
-        const hasSession =
-          (effectiveCommandType === 'claude' && effectiveClaudeSessionId) ||
-          (effectiveCommandType === 'gemini' && effectiveGeminiSessionId);
+        const hasSession = effectiveClaudeSessionId || effectiveGeminiSessionId;
         if (!effectiveTab?.id || !hasSession) {
           console.warn('[Workspace:Hotkey] CMD+\\ BLOCKED: effectiveTab=' + (effectiveTab?.id || 'null') + ' cmdType=' + effectiveCommandType + ' claudeSession=' + (effectiveClaudeSessionId ? effectiveClaudeSessionId.substring(0, 8) : 'null') + ' geminiSession=' + (effectiveGeminiSessionId ? effectiveGeminiSessionId.substring(0, 8) : 'null'));
           return;
@@ -314,8 +312,7 @@ export default function Workspace() {
       if (workspaceView !== 'workspace') return;
       if (e.metaKey && e.code === 'BracketRight') {
         const hasSession =
-          (effectiveCommandType === 'claude' && effectiveClaudeSessionId) ||
-          (effectiveCommandType === 'gemini' && effectiveGeminiSessionId);
+          effectiveClaudeSessionId || effectiveGeminiSessionId;
         if (!effectiveTab?.id || !hasSession) {
           console.warn('[Workspace:Hotkey] CMD+] BLOCKED: effectiveTab=' + (effectiveTab?.id || 'null') + ' cmdType=' + effectiveCommandType + ' claudeSession=' + (effectiveClaudeSessionId ? effectiveClaudeSessionId.substring(0, 8) : 'null') + ' geminiSession=' + (effectiveGeminiSessionId ? effectiveGeminiSessionId.substring(0, 8) : 'null'));
           return;
@@ -433,12 +430,13 @@ export default function Workspace() {
 
   // Session IDs come from fine-grained selectors (top of component) — not effectiveTab.
   // This ensures Workspace re-renders when Bridge updates session ID via set({}).
-  const showTimeline = !filePreview && (
-    (effectiveClaudeSessionId && effectiveCommandType === 'claude') ||
-    (effectiveGeminiSessionId && effectiveCommandType === 'gemini')
-  );
-  const timelineSessionId = effectiveCommandType === 'gemini' ? effectiveGeminiSessionId : effectiveClaudeSessionId;
-  const timelineToolType = (effectiveCommandType === 'gemini' ? 'gemini' : 'claude') as 'claude' | 'gemini';
+  // Show timeline if ANY session exists — don't gate on commandType match.
+  // effectiveCommandType and effectiveClaudeSessionId/effectiveGeminiSessionId come from different
+  // Zustand selectors that can temporarily desync (e.g. when viewingSubAgentTabId changes).
+  // Requiring cmdType match caused timeline to permanently disappear.
+  const showTimeline = !filePreview && (effectiveClaudeSessionId || effectiveGeminiSessionId);
+  const timelineSessionId = effectiveGeminiSessionId && effectiveCommandType === 'gemini' ? effectiveGeminiSessionId : effectiveClaudeSessionId;
+  const timelineToolType = (effectiveGeminiSessionId && effectiveCommandType === 'gemini' ? 'gemini' : 'claude') as 'claude' | 'gemini';
 
   // DEBUG: Uncomment to debug Timeline visibility
   // console.log('[Timeline Debug] showTimeline:', showTimeline, 'claudeSessionId:', claudeSessionId, 'commandType:', activeTab?.commandType, 'isRunning:', isCommandRunning);

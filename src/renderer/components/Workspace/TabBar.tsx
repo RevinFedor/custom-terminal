@@ -957,6 +957,8 @@ function TabBar({ projectId }: TabBarProps) {
           const store = useWorkspaceStore.getState();
           store.setTabParent(sourceData.id, undefined as any);
           store.setViewingSubAgent(null);
+          // Switch to detached tab — user dragged it to TabBar, they want to see it
+          store.switchTab(projectId, sourceData.id);
           return;
         }
 
@@ -987,6 +989,10 @@ function TabBar({ projectId }: TabBarProps) {
                 targetTab?.commandType === 'gemini') {
               const { ipcRenderer } = window.require('electron');
               ipcRenderer.invoke('mcp:adopt-agent', { claudeTabId: sourceTabId, geminiTabId: targetTabId });
+              // Switch to Gemini tab (adopted tab will vanish from TabBar)
+              if (currentWs.activeTabId === sourceTabId) {
+                useWorkspaceStore.getState().switchTab(projectId, targetTabId);
+              }
               return; // Don't reorder
             }
           }

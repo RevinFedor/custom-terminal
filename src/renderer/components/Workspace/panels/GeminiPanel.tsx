@@ -599,10 +599,14 @@ export default function GeminiPanel({ projectPath, geminiPrompt }: GeminiPanelPr
             {apiCalls.map((call: any) => {
               const isExpanded = expandedApiCallId === call.id;
               const typeColors: Record<string, string> = { adopt: '#6366f1', update_docs: '#f59e0b', research: '#0ea5e9' };
-              const color = typeColors[call.call_type] || '#888';
+              const color = typeColors[call.call_type] || '#888888';
               const tokensIn = call.input_tokens > 1000 ? (call.input_tokens / 1000).toFixed(1) + 'K' : String(call.input_tokens);
               const tokensOut = call.output_tokens > 1000 ? (call.output_tokens / 1000).toFixed(1) + 'K' : String(call.output_tokens);
               const payloadKB = call.payload_size > 0 ? Math.round(call.payload_size / 1024) + 'KB' : null;
+
+              // Parse session meta for mini-timeline
+              let meta: { turns?: number; compacts?: number; planModes?: number; forks?: number; segments?: { type: string; count: number }[] } | null = null;
+              try { if (call.session_meta) meta = JSON.parse(call.session_meta); } catch {}
 
               return (
                 <div
@@ -618,6 +622,36 @@ export default function GeminiPanel({ projectPath, geminiPrompt }: GeminiPanelPr
                     <span className="text-[10px] text-[#666]">{tokensIn}/{tokensOut}</span>
                     <span className="text-[10px] text-[#555]">{getTimeAgo(call.created_at)}</span>
                   </div>
+                  {/* Mini-timeline: [N msg] for turns, thin markers for compact/plan/fork */}
+                  {meta?.segments && meta.segments.length > 0 && (
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '2px', padding: '0 8px 4px' }}>
+                      {meta.segments.map((seg, si) => {
+                        if (seg.type === 'turns') {
+                          return <span key={si} style={{
+                            fontSize: '9px', color: color,
+                            backgroundColor: color + '12',
+                            padding: '0 4px', borderRadius: '2px', border: `1px solid ${color}33`,
+                          }}>{seg.count} msg</span>;
+                        } else if (seg.type === 'compact') {
+                          return <div key={si} style={{
+                            width: '2px', height: '10px', borderRadius: '1px',
+                            backgroundColor: '#a67c1a',
+                          }} title="compact" />;
+                        } else if (seg.type === 'plan') {
+                          return <div key={si} style={{
+                            width: '2px', height: '10px', borderRadius: '1px',
+                            backgroundColor: '#3d7a72',
+                          }} title="plan mode" />;
+                        } else if (seg.type === 'fork') {
+                          return <div key={si} style={{
+                            width: '2px', height: '10px', borderRadius: '1px',
+                            backgroundColor: '#3b82f6',
+                          }} title="fork point" />;
+                        }
+                        return null;
+                      })}
+                    </div>
+                  )}
                   {isExpanded && call.result_text && (
                     <div style={{ padding: '6px 8px', borderTop: '1px solid #333', fontSize: '10px', color: '#aaa', maxHeight: '200px', overflow: 'auto', whiteSpace: 'pre-wrap', lineHeight: 1.4 }}>
                       {payloadKB && <div style={{ color: '#666', marginBottom: '4px' }}>Payload: {payloadKB} | Tokens: {tokensIn} in / {tokensOut} out</div>}
