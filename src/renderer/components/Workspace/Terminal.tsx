@@ -337,15 +337,23 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
   }, [effectiveActive]);
 
   // Check if terminal is scrolled up (not at bottom)
+  // ALL callers go through rAF debounce — never call this synchronously during term.write()
+  const lastScrollButtonState = useRef(false);
   const checkScrollPosition = useCallback(() => {
     const term = xtermInstance.current;
     if (!term) return;
 
     const buffer = term.buffer.active;
     const isAtBottom = buffer.viewportY >= buffer.baseY;
-    setShowScrollButton(!isAtBottom);
+    const shouldShow = !isAtBottom;
 
-    // Sync viewport position with registry for Timeline
+    // Only trigger React re-render when state actually changes
+    if (shouldShow !== lastScrollButtonState.current) {
+      lastScrollButtonState.current = shouldShow;
+      setShowScrollButton(shouldShow);
+    }
+
+    // Sync viewport position with registry for Timeline (no React overhead)
     terminalRegistry.updateViewport(
       tabId,
       buffer.viewportY,
@@ -359,13 +367,14 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
     const term = xtermInstance.current;
     if (!term) return;
     term.scrollToBottom();
+    lastScrollButtonState.current = false;
     setShowScrollButton(false);
   }, []);
 
-  // rAF-debounced scroll check: collapses N onWriteParsed calls per frame into one
+  // Single rAF gate for ALL scroll sources — collapses N events per frame into one check
   const pendingScrollCheckRef = useRef<number | null>(null);
   const rafCheckScroll = useCallback(() => {
-    if (pendingScrollCheckRef.current !== null) return;
+    if (pendingScrollCheckRef.current !== null) return; // already scheduled
     pendingScrollCheckRef.current = requestAnimationFrame(() => {
       pendingScrollCheckRef.current = null;
       checkScrollPosition();
@@ -374,19 +383,21 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
 
   // Attach scroll listeners - called AFTER term.open() when DOM is guaranteed to exist
   const attachScrollListeners = useCallback((term: XTerminal, container: HTMLDivElement) => {
+    // ALL listeners use rAF debounce — prevents synchronous React setState during term.write()
+    // Without this: term.onScroll fires DURING write() for every \n → setState → re-render → jitter
+
     // 1. Native scroll (mouse wheel, trackpad, scrollbar drag)
     const viewport = container.querySelector('.xterm-viewport');
     if (viewport) {
-      viewport.addEventListener('scroll', checkScrollPosition);
+      viewport.addEventListener('scroll', rafCheckScroll);
     }
 
     // 2. Xterm scroll (programmatic scroll, buffer changes)
-    term.onScroll(checkScrollPosition);
+    term.onScroll(rafCheckScroll);
 
     // 3. When data is written (terminal auto-scrolls down on output)
-    // rAF-debounced: Ink differential renderer fires many small writes per frame
     term.onWriteParsed(rafCheckScroll);
-  }, [checkScrollPosition, rafCheckScroll]);
+  }, [rafCheckScroll]);
 
   // Write buffer refs to batch PTY output and prevent jitter
   const writeBufferRef = useRef<string>('');

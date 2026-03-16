@@ -166,6 +166,8 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
   const [editingClaude, setEditingClaude] = useState(false);
   const [editingPromptId, setEditingPromptId] = useState<string | null>(null); // AI prompt being edited
   const [editingDocPrompt, setEditingDocPrompt] = useState(false);
+  const [editingPostCheck, setEditingPostCheck] = useState(false);
+  const [localPostCheckContent, setLocalPostCheckContent] = useState('');
   const [editingPrompt, setEditingPrompt] = useState<number | null>(null); // text insertion prompt being edited
 
   // Local copies of AI prompt fields for editing
@@ -181,6 +183,7 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
   // Refs for editing containers (to check if blur target is inside)
   const claudeEditRef = useRef<HTMLDivElement>(null);
   const docEditRef = useRef<HTMLDivElement>(null);
+  const postCheckEditRef = useRef<HTMLDivElement>(null);
   const promptEditRefs = useRef<Map<number, HTMLDivElement>>(new Map());
 
   // Track tab changes
@@ -205,6 +208,7 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
       // Load doc prompt local state
       setLocalDocFilePath(docPrompt.filePath);
       setLocalDocInlineContent(docPrompt.inlineContent);
+      setLocalPostCheckContent(useUIStore.getState().postCheckPrompt);
 
       // Load user prompts (text insertion snippets)
       ipcRenderer.invoke('prompts:get').then((result: { success: boolean; data?: Prompt[] }) => {
@@ -219,6 +223,7 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
       setEditingClaude(false);
       setEditingPromptId(null);
       setEditingDocPrompt(false);
+      setEditingPostCheck(false);
       setEditingPrompt(null);
     }
   }, [isOpen, docPrompt]);
@@ -775,6 +780,46 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                       </div>
                       <div style={{ fontSize: '11px', color: '#666', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                         {docPrompt.useFile ? localDocFilePath : (localDocInlineContent || 'Не задан')}
+                      </div>
+                    </>
+                  )}
+                </div>
+
+                {/* Post-check Prompt */}
+                <div
+                  ref={postCheckEditRef}
+                  onClick={() => !editingPostCheck && setEditingPostCheck(true)}
+                  style={{
+                    padding: '12px',
+                    backgroundColor: editingPostCheck ? '#252525' : '#222',
+                    border: editingPostCheck ? '2px solid #a78bfa' : '2px solid #a78bfa33',
+                    borderRadius: '10px',
+                    cursor: editingPostCheck ? 'default' : 'pointer'
+                  }}
+                >
+                  {editingPostCheck ? (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                      <span style={{ fontSize: '11px', color: '#a78bfa', fontWeight: '500' }}>Post-check</span>
+                      <textarea
+                        value={localPostCheckContent}
+                        onChange={(e) => setLocalPostCheckContent(e.target.value)}
+                        onBlur={(e) => {
+                          if (isBlurInsideContainer(e, postCheckEditRef)) return;
+                          useUIStore.getState().setPostCheckPrompt(localPostCheckContent);
+                          setEditingPostCheck(false);
+                        }}
+                        rows={4}
+                        autoFocus
+                        style={{ width: '100%', padding: '8px', backgroundColor: '#1a1a1a', border: '1px solid #444', borderRadius: '6px', color: '#aaa', fontSize: '11px', fontFamily: 'monospace', outline: 'none', resize: 'none', boxSizing: 'border-box' as const }}
+                      />
+                    </div>
+                  ) : (
+                    <>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '4px' }}>
+                        <span style={{ fontSize: '13px', color: '#a78bfa', fontWeight: '500' }}>Post-check</span>
+                      </div>
+                      <div style={{ fontSize: '11px', color: '#666', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {localPostCheckContent || 'Не задан'}
                       </div>
                     </>
                   )}
