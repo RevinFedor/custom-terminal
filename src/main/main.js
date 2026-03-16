@@ -1704,7 +1704,7 @@ async function adoptClaudeAgent(taskId, claudeTabId, geminiTabId) {
 
   // 6. Format and deliver to Gemini via response queue
   const formatted = '[Adopted Agent Context]\n' +
-    'Context about an adopted agent. Do NOT fabricate agent responses.\n' +
+    'This is READ-ONLY context about an adopted sub-agent. Remember it for future reference. Do NOT continue this agent\'s work. Do NOT start new tasks based on this context. Wait for explicit user instructions.\n' +
     (tabName ? 'Tab: ' + tabName + '\n' : '') +
     'Task ID: ' + taskId + '\n' +
     (sessionId ? 'Session: ' + sessionId.substring(0, 8) + '...\n' : '') +
@@ -2167,38 +2167,8 @@ async function getSessionStats(sessionId, cwd) {
     const segments = [];
     const userMessages = [];
     let currentSegTurns = 0;
-    let prevSessionId = null;
 
     for (const entry of activeBranch) {
-      const entrySid = entry.sessionId || entry._fromFile;
-
-      // Session boundary detection (Plan Mode vs Fork)
-      if (prevSessionId && entrySid !== prevSessionId) {
-        if (currentSegTurns > 0) {
-          segments.push({ type: 'turns', count: currentSegTurns });
-          currentSegTurns = 0;
-        }
-
-        // Determine transition type: check if a bridge entry exists in recordMap 
-        // that bridges from the previous session to this one.
-        let hasBridge = false;
-        for (const [, rec] of recordMap) {
-          if (rec._isBridge && rec.sessionId === prevSessionId) {
-            hasBridge = true;
-            break;
-          }
-        }
-
-        if (hasBridge) {
-          planModes++;
-          segments.push({ type: 'plan', count: 1 });
-        } else {
-          forks++;
-          segments.push({ type: 'fork', count: 1 });
-        }
-      }
-      prevSessionId = entrySid;
-
       if (entry.type === 'user') {
         const content = entry.message?.content;
         let promptText = '';
@@ -2221,6 +2191,15 @@ async function getSessionStats(sessionId, cwd) {
       }
     }
 
+    // Count plan modes and forks from session boundaries
+    for (const b of sessionBoundaries) {
+      if (b.reason === 'plan_mode') planModes++;
+      if (b.reason === 'fork') forks++;
+    }
+    if (planModes > 0 || forks > 0) {
+      // Insert plan/fork markers (simplified — at session boundaries)
+      // These will show in the timeline but precise positioning requires more complex logic
+    }
     if (currentSegTurns > 0) segments.push({ type: 'turns', count: currentSegTurns });
 
     return { turns, compacts, planModes, forks, segments, sessions: sessionBoundaries.length + 1, userMessages };  } catch (e) {

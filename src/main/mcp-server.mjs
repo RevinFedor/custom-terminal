@@ -447,7 +447,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           content: [
             {
               type: 'text',
-              text: 'Adopting tab ' + args.tabId + ' as sub-agent. Task ID: ' + result.taskId + '\nThe session is being summarized via API. The context will be AUTOMATICALLY injected into your conversation when ready.\n\nIMPORTANT: Do NOT fabricate the summary. Do NOT call any other tools. Say a brief confirmation and STOP generating. Wait for the real [Adopted Agent Context] to appear.',
+              text: 'Adopting tab ' + args.tabId + ' as sub-agent. Task ID: ' + result.taskId + '\nThe session summary will be AUTOMATICALLY injected as READ-ONLY context. When it arrives, just remember it — do NOT start working on it. Wait for the user to tell you what to do.\n\nIMPORTANT: Do NOT fabricate the summary. Say a brief confirmation and STOP.',
             },
           ],
         };

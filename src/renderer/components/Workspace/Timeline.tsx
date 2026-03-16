@@ -1488,6 +1488,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
           {treeMode && (
             <div className="absolute top-0 bottom-0 w-px pointer-events-none" style={{ left: '4px', backgroundColor: 'rgba(255, 255, 255, 0.08)' }} />
           )}
+          {/* Inner relative wrapper so absolute overlays (selection, rewind) scroll with content */}
+          <div className="relative flex flex-col flex-1">
           {/* Plan mode marker at the very beginning (first entry is from a child session — chain started before visible entries) */}
           {entries.length > 0 && entries[0].sessionId && sessionBoundaries.length > 0 &&
             sessionBoundaries.some(b => b.childSessionId === entries[0].sessionId) &&
@@ -1940,6 +1942,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
             }}
           />
         )}
+
+          </div>{/* end inner relative wrapper */}
 
         {/* Tooltip Portal with CSS Bridge */}
         {isVisible && activeTooltipIndex !== null && currentActiveEntry && tooltipPos && (
