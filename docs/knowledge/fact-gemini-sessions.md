@@ -36,8 +36,3 @@
 ### 5. Ограничения
 - **Exclusive Session:** В одной вкладке может быть активна только одна AI-сессия (либо Claude, либо Gemini). Запуск второй блокируется с выводом предупреждения в терминал.
 
-## Code Map
-- **Main Logic:** `src/main/main.js` — хендлеры `gemini:spawn-with-watcher` и `gemini:run-command`.
-- **Renderer UI:** `src/renderer/components/Workspace/panels/InfoPanel.tsx` — переключатель режимов и кнопки управления.
-- **Interception:** `src/renderer/components/Workspace/Terminal.tsx` — перехват ввода команд `gemini`, `gemini-c`.
-- **State:** `src/renderer/store/useWorkspaceStore.ts` — хранение `geminiSessionId`.

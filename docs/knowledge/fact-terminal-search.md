@@ -15,7 +15,3 @@
 - **Proposed API:** Для корректной работы события `onDidChangeResults` используется Proposed API xterm.js (`allowProposedApi: true`).
 - **Persistence:** Состояние поиска (текст, результаты) уникально для каждого таба и сбрасывается при закрытии панели.
 
-## Code Map
-- `Workspace.tsx`: UI панели поиска и управление хоткеями.
-- `terminalRegistry.ts`: Централизованное управление `SearchAddon` для каждого таба (`findNext`, `findPrevious`).
-- `Terminal.tsx`: Инициализация и регистрация аддона.

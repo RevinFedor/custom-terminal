@@ -6,6 +6,10 @@ import { useCmdKey } from '../../../hooks/useCmdHoverPopover';
 
 const { ipcRenderer } = window.require('electron');
 
+const POST_CHECK_PROMPT = `Проверь свой план по двум критериям:
+1. Есть ли в сессии места где разработчик получил 0 результатов / пустой ответ / ошибку парсинга данных, и потом выяснил что формат данных отличался от ожидаемого? Если да — это шрам формата данных, запиши.
+2. Предлагаешь ли ты изменения в CLAUDE.md? Если да — проверь: это guard rail / anti-pattern / инфраструктурная инструкция? Если нет — убери, knowledge-файлы находятся через семантический поиск.`;
+
 // Portal for settings menu to escape overflow and z-index issues
 const SettingsPortal: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   return createPortal(children, document.body);
@@ -23,7 +27,7 @@ interface ActionsPanelProps {
 
 export default function ActionsPanel({ activeTabId, embedded = false }: ActionsPanelProps) {
   const {
-    showToast, docPrompt, terminalSelection, autoApplyDocs, setAutoApplyDocs,
+    showToast, docPrompt, terminalSelection, autoApplyDocs, setAutoApplyDocs, postCheckDocs, setPostCheckDocs,
     copyIncludeEditing: includeEditing, setCopyIncludeEditing: setIncludeEditing,
     copyIncludeReading: includeReading, setCopyIncludeReading: setIncludeReading,
     copyFromStart: fromStart, setCopyFromStart: setFromStart,
@@ -209,10 +213,66 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
   // Wait for Gemini to settle after initial [INSERT].
   // With `-y -r` (resume + yes mode), Gemini may auto-process prefilled content or
   // stray input can trigger a THINKING phase. This function:
-  // 1. Waits a grace period (2s) to see if THINKING starts
-  // 2. If THINKING detected, waits for IDLE (response complete)
-  // 3. Then waits for the next [INSERT] (truly ready for input)
-  // 4. If no THINKING within grace period — Gemini is already settled
+  // Waits for Gemini to complete a response using "sustained IDLE" approach.
+  // Gemini spinner flickers during processing (gaps > 1.5s between Braille chars → IDLE emitted).
+  // TabBar works because React batches rapid false→true state updates, but raw IPC listeners see every flicker.
+  // Fix: after IDLE, wait sustainedMs of silence. If THINKING restarts, reset timer.
+  const waitForGeminiResponse = (tabId: string, timeoutMs: number = 180000, sustainedMs: number = 8000): Promise<boolean> => {
+    return new Promise((resolve) => {
+      const startTime = Date.now();
+      let sawBusy = false;
+      let idleTimer: ReturnType<typeof setTimeout> | null = null;
+
+      const timeout = setTimeout(() => {
+        cleanup();
+        console.warn(`[UpdateDocs] waitForGeminiResponse TIMEOUT after ${timeoutMs}ms`);
+        resolve(false);
+      }, timeoutMs);
+
+      // Grace: if never busy within 5s, already settled
+      const graceTimer = setTimeout(() => {
+        if (!sawBusy) {
+          console.warn(`[UpdateDocs] No THINKING within 5s — already settled (+${Date.now() - startTime}ms)`);
+          cleanup();
+          resolve(true);
+        }
+      }, 5000);
+
+      const handler = (_: any, { tabId: tid, busy }: { tabId: string; busy: boolean }) => {
+        if (tid !== tabId) return;
+
+        if (busy) {
+          if (!sawBusy) {
+            sawBusy = true;
+            clearTimeout(graceTimer);
+            console.warn(`[UpdateDocs] THINKING started (+${Date.now() - startTime}ms)`);
+          }
+          // Cancel any pending sustained-idle timer — spinner restarted
+          if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+        } else if (sawBusy) {
+          // IDLE — start sustained timer (resolve only if silence holds for sustainedMs)
+          console.warn(`[UpdateDocs] IDLE detected, waiting ${sustainedMs}ms sustained silence (+${Date.now() - startTime}ms)`);
+          idleTimer = setTimeout(() => {
+            console.warn(`[UpdateDocs] Response complete — sustained IDLE for ${sustainedMs}ms (+${Date.now() - startTime}ms)`);
+            cleanup();
+            resolve(true);
+          }, sustainedMs);
+        }
+      };
+
+      const cleanup = () => {
+        clearTimeout(timeout);
+        clearTimeout(graceTimer);
+        if (idleTimer) clearTimeout(idleTimer);
+        ipcRenderer.removeListener('gemini:busy-state', handler);
+      };
+
+      ipcRenderer.on('gemini:busy-state', handler);
+    });
+  };
+
+  // Settle phase for -y -r auto-processing: grace-based, uses [INSERT] detection.
+  // Different from waitForGeminiResponse — designed for initial load, not prompt responses.
   const waitForGeminiSettled = (tabId: string, timeoutMs: number = 120000): Promise<boolean> => {
     return new Promise((resolve) => {
       const startTime = Date.now();
@@ -229,12 +289,10 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
         if (busyTabId !== tabId) return;
 
         if (phase === 'grace' && busy) {
-          // THINKING started during grace period — need to wait for IDLE + [INSERT]
           if (graceTimer) { clearTimeout(graceTimer); graceTimer = null; }
           phase = 'wait-idle';
           console.warn(`[UpdateDocs] Gemini entered THINKING during grace period (+${Date.now() - startTime}ms) — waiting for IDLE`);
         } else if (phase === 'wait-idle' && !busy) {
-          // IDLE — now wait for [INSERT] to confirm ready state
           phase = 'wait-insert';
           console.warn(`[UpdateDocs] Gemini went IDLE (+${Date.now() - startTime}ms) — waiting for [INSERT]`);
         }
@@ -263,7 +321,6 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
       ipcRenderer.on('gemini:busy-state', busyHandler);
       ipcRenderer.on('terminal:data', dataHandler);
 
-      // Grace period: if no THINKING within 2s, Gemini is already settled
       graceTimer = setTimeout(() => {
         if (phase === 'grace') {
           console.warn(`[UpdateDocs] No THINKING during grace period — Gemini already settled (+${Date.now() - startTime}ms)`);
@@ -718,6 +775,41 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
 
       if (apiCancelledRef.current) { showToast('API запрос отменён', 'info'); return; }
 
+      // 3.5. Post-check: lightweight verification of the plan
+      const { postCheckDocs: postCheckEnabled } = useUIStore.getState();
+      if (postCheckEnabled) {
+        showToast('Post-check...', 'info');
+        const checkPrompt = `Вот план обновления документации:\n\n${responseText}\n\n${POST_CHECK_PROMPT}`;
+
+        let checkResponse: string;
+        if (provider === 'gemini' || provider === 'gemini-cli') {
+          const { apiSettings: as2 } = useUIStore.getState();
+          const reqBody: any = {
+            contents: [{ role: 'user', parts: [{ text: checkPrompt }] }],
+          };
+          if (as2.geminiModel.includes('gemini-3') && as2.geminiThinking !== 'NONE') {
+            reqBody.generationConfig = { thinkingConfig: { thinkingLevel: 'LOW' } };
+          }
+          const checkResp = await fetch(
+            `https://generativelanguage.googleapis.com/v1beta/models/${as2.geminiModel}:generateContent?key=REDACTED_GEMINI_KEY`,
+            { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(reqBody) }
+          );
+          const checkData = await checkResp.json();
+          const textP = checkData.candidates?.[0]?.content?.parts?.filter((p: any) => !p.thought) || [];
+          checkResponse = textP.map((p: any) => p.text).join('');
+        } else {
+          const checkResult = await ipcRenderer.invoke('docs:api-request', { system: '', prompt: checkPrompt });
+          if (!checkResult.success) throw new Error(checkResult.error || 'Post-check failed');
+          checkResponse = checkResult.text;
+        }
+
+        if (apiCancelledRef.current) { showToast('API запрос отменён', 'info'); return; }
+        if (checkResponse?.trim()) {
+          responseText += '\n\n---\n## Post-check (автоматическая верификация)\n' + checkResponse;
+          console.warn('[UpdateApi] Post-check appended (' + checkResponse.length + ' chars)');
+        }
+      }
+
       // 4. Create prefilled Claude JSONL session (user intro + assistant analysis)
       const workingDir = cwdU;
 
@@ -876,12 +968,40 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
       await new Promise(resolve => setTimeout(resolve, 500));
       if (cancelledRef.current) return;
 
+      // Register settle listener BEFORE paste to capture busy:true transition
+      // (Gemini emits busy:true within ms of receiving input — after paste resolves, it's too late)
+      const { postCheckDocs: postCheckOn } = useUIStore.getState();
+      const mainSettlePromise = postCheckOn ? waitForGeminiResponse(newTabId, 180000) : null;
+
       console.warn('[UpdateDocs] Sending prompt to trigger Gemini response');
       await ipcRenderer.invoke('terminal:paste', {
         tabId: newTabId,
         content: 'Ответь на промпт выше.',
         submit: true
       });
+
+      // Post-check: wait for Gemini to finish main response, then send verification prompt
+      if (mainSettlePromise) {
+        console.warn('[UpdateDocs] Post-check enabled — waiting for Gemini to finish main response...');
+        const postSettled = await mainSettlePromise;
+        if (cancelledRef.current) return;
+        if (!postSettled) {
+          console.warn('[UpdateDocs] Post-check skipped — timeout waiting for main response');
+        } else {
+          await new Promise(resolve => setTimeout(resolve, 500));
+          if (cancelledRef.current) return;
+
+          // Same pattern: register listener before paste
+          const checkSettlePromise = waitForGeminiResponse(newTabId, 180000);
+          console.warn('[UpdateDocs] Sending post-check prompt');
+          await ipcRenderer.invoke('terminal:paste', {
+            tabId: newTabId,
+            content: POST_CHECK_PROMPT,
+            submit: true
+          });
+          await checkSettlePromise;
+        }
+      }
 
       docsGeminiTabIdRef.current = null;
       showToast('Gemini started with full context (' + Math.round(prefilledResult.totalChars / 1024) + 'KB)', 'success');
@@ -1051,31 +1171,30 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
                   setGearHovered(false);
                 }
               }}
-              onClick={() => useUIStore.getState().openApiSettings()}
               title="API Settings (⌘+наведение)"
             >
               &#9881;
             </span>
             <span className="text-[9px] uppercase font-semibold text-blue-500">System</span>
-            {/* Auto-apply toggle */}
+            {/* Toggle indicators (managed in ⌘+hover settings) */}
             <span
-              className="cursor-pointer select-none"
               style={{
-                width: '22px', height: '12px', borderRadius: '6px',
-                backgroundColor: autoApplyDocs ? '#22c55e' : '#333',
-                position: 'relative', display: 'inline-block', transition: 'background-color 0.2s',
-                flexShrink: 0,
+                width: '6px', height: '6px', borderRadius: '50%',
+                backgroundColor: autoApplyDocs ? '#22c55e' : '#555',
+                display: 'inline-block', flexShrink: 0,
+                transition: 'background-color 0.2s',
               }}
-              onClick={() => setAutoApplyDocs(!autoApplyDocs)}
-              title={autoApplyDocs ? 'Auto-apply: ON — Haiku автоматически применит изменения' : 'Auto-apply: OFF — ручное подтверждение'}
-            >
-              <span style={{
-                position: 'absolute', top: '2px',
-                left: autoApplyDocs ? '12px' : '2px',
-                width: '8px', height: '8px', borderRadius: '50%',
-                backgroundColor: '#fff', transition: 'left 0.2s',
-              }} />
-            </span>
+              title={autoApplyDocs ? 'Auto-apply: ON' : 'Auto-apply: OFF'}
+            />
+            <span
+              style={{
+                width: '6px', height: '6px', borderRadius: '50%',
+                backgroundColor: postCheckDocs ? '#a78bfa' : '#555',
+                display: 'inline-block', flexShrink: 0,
+                transition: 'background-color 0.2s',
+              }}
+              title={postCheckDocs ? 'Post-check: ON' : 'Post-check: OFF'}
+            />
             <div className="flex-1 h-px bg-[#333]" />
           </div>
 
@@ -1757,7 +1876,7 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
             </div>
 
             {/* Gemini */}
-            <div>
+            <div style={{ marginBottom: '10px' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '6px' }}>
                 <span style={{ fontSize: '9px', fontWeight: 600, color: '#4E86F8', textTransform: 'uppercase' }}>Gemini</span>
                 <div style={{ flex: 1, height: '1px', backgroundColor: '#333' }} />
@@ -1783,6 +1902,56 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
                     color: apiSettings.geminiThinking === t.id ? '#4E86F8' : '#666',
                   }}>{t.label}</button>
                 ))}
+              </div>
+            </div>
+
+            {/* Toggles */}
+            <div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '8px' }}>
+                <span style={{ fontSize: '9px', fontWeight: 600, color: '#888', textTransform: 'uppercase' }}>Toggles</span>
+                <div style={{ flex: 1, height: '1px', backgroundColor: '#333' }} />
+              </div>
+              <div
+                style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer', marginBottom: '6px' }}
+                onClick={() => setAutoApplyDocs(!autoApplyDocs)}
+              >
+                <span style={{
+                  width: '22px', height: '12px', borderRadius: '6px',
+                  backgroundColor: autoApplyDocs ? '#22c55e' : '#333',
+                  position: 'relative', display: 'inline-block', transition: 'background-color 0.2s',
+                  flexShrink: 0,
+                }}>
+                  <span style={{
+                    position: 'absolute', top: '2px',
+                    left: autoApplyDocs ? '12px' : '2px',
+                    width: '8px', height: '8px', borderRadius: '50%',
+                    backgroundColor: '#fff', transition: 'left 0.2s',
+                  }} />
+                </span>
+                <span style={{ fontSize: '9px', color: autoApplyDocs ? '#22c55e' : '#666' }}>
+                  Auto-apply — Haiku автоприменение
+                </span>
+              </div>
+              <div
+                style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}
+                onClick={() => setPostCheckDocs(!postCheckDocs)}
+              >
+                <span style={{
+                  width: '22px', height: '12px', borderRadius: '6px',
+                  backgroundColor: postCheckDocs ? '#a78bfa' : '#333',
+                  position: 'relative', display: 'inline-block', transition: 'background-color 0.2s',
+                  flexShrink: 0,
+                }}>
+                  <span style={{
+                    position: 'absolute', top: '2px',
+                    left: postCheckDocs ? '12px' : '2px',
+                    width: '8px', height: '8px', borderRadius: '50%',
+                    backgroundColor: '#fff', transition: 'left 0.2s',
+                  }} />
+                </span>
+                <span style={{ fontSize: '9px', color: postCheckDocs ? '#a78bfa' : '#666' }}>
+                  Post-check — верификация плана
+                </span>
               </div>
             </div>
           </div>

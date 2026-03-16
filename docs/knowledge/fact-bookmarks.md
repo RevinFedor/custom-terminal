@@ -17,7 +17,3 @@
 - **Manual Bounds Check:** Предотвращение «залипания» фокуса при взаимодействии с меню. См. `knowledge/fact-react-patterns.md`.
 - **Sync:** Закладки хранятся в таблице `bookmarks` SQLite.
 
-## Code Map
-- `BookmarkCard.tsx`: Компонент карточки с логикой hover и создания проекта.
-- `useBookmarksStore.ts`: Управление состоянием закладок.
-- `database.js`: SQL запросы для CRUD закладок.

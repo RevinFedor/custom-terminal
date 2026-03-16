@@ -1892,69 +1892,81 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         </div>
 
         {/* Selection Range Indicator (active selection) */}
-        {isVisible && selectionStartId && hoveredIndex !== null && (
-          <div
-            className="absolute left-0 right-0 pointer-events-none"
-            style={{
-              top: `${Math.min(entries.findIndex(e => e.uuid === selectionStartId), hoveredIndex) / entries.length * 100}%`,
-              height: `${Math.abs(entries.findIndex(e => e.uuid === selectionStartId) - hoveredIndex + 1) / entries.length * 100}%`,
-              backgroundColor: 'rgba(59, 130, 246, 0.1)',
-              borderTop: '1px solid rgba(59, 130, 246, 0.3)',
-              borderBottom: '1px solid rgba(59, 130, 246, 0.3)',
-            }}
-          />
-        )}
+        {isVisible && selectionStartId && hoveredIndex !== null && (() => {
+          const startIdx = entries.findIndex(e => e.uuid === selectionStartId);
+          const rect = getOverlayRect(Math.min(startIdx, hoveredIndex), Math.max(startIdx, hoveredIndex));
+          return rect && (
+            <div
+              className="absolute left-0 right-0 pointer-events-none"
+              style={{
+                top: rect.top,
+                height: rect.height,
+                backgroundColor: 'rgba(59, 130, 246, 0.1)',
+                borderTop: '1px solid rgba(59, 130, 246, 0.3)',
+                borderBottom: '1px solid rgba(59, 130, 246, 0.3)',
+              }}
+            />
+          );
+        })()}
 
         {/* Loading Range Indicator (blinking blue while IPC runs) */}
-        {isVisible && copyingRange && (
-          <div
-            className="absolute left-0 right-0 pointer-events-none animate-pulse"
-            style={{
-              top: `${copyingRange.startIndex / entries.length * 100}%`,
-              height: `${(copyingRange.endIndex - copyingRange.startIndex + 1) / entries.length * 100}%`,
-              backgroundColor: 'rgba(59, 130, 246, 0.15)',
-              borderTop: '1px solid rgba(59, 130, 246, 0.5)',
-              borderBottom: '1px solid rgba(59, 130, 246, 0.5)',
-              boxShadow: '0 0 12px rgba(59, 130, 246, 0.3)',
-            }}
-          />
-        )}
+        {isVisible && copyingRange && (() => {
+          const rect = getOverlayRect(copyingRange.startIndex, copyingRange.endIndex);
+          return rect && (
+            <div
+              className="absolute left-0 right-0 pointer-events-none animate-pulse"
+              style={{
+                top: rect.top,
+                height: rect.height,
+                backgroundColor: 'rgba(59, 130, 246, 0.15)',
+                borderTop: '1px solid rgba(59, 130, 246, 0.5)',
+                borderBottom: '1px solid rgba(59, 130, 246, 0.5)',
+                boxShadow: '0 0 12px rgba(59, 130, 246, 0.3)',
+              }}
+            />
+          );
+        })()}
 
         {/* Copied Range Animation (green success flash) */}
-        {isVisible && copiedRange && (
-          <div
-            className="absolute left-0 right-0 pointer-events-none"
-            style={{
-              top: `${copiedRange.startIndex / entries.length * 100}%`,
-              height: `${(copiedRange.endIndex - copiedRange.startIndex + 1) / entries.length * 100}%`,
-              backgroundColor: 'rgba(34, 197, 94, 0.25)',
-              borderTop: '1px solid rgba(34, 197, 94, 0.6)',
-              borderBottom: '1px solid rgba(34, 197, 94, 0.6)',
-              boxShadow: '0 0 20px rgba(34, 197, 94, 0.4)',
-            }}
-          />
-        )}
+        {isVisible && copiedRange && (() => {
+          const rect = getOverlayRect(copiedRange.startIndex, copiedRange.endIndex);
+          return rect && (
+            <div
+              className="absolute left-0 right-0 pointer-events-none"
+              style={{
+                top: rect.top,
+                height: rect.height,
+                backgroundColor: 'rgba(34, 197, 94, 0.25)',
+                borderTop: '1px solid rgba(34, 197, 94, 0.6)',
+                borderBottom: '1px solid rgba(34, 197, 94, 0.6)',
+                boxShadow: '0 0 20px rgba(34, 197, 94, 0.4)',
+              }}
+            />
+          );
+        })()}
 
         {/* Rewind Progress Indicator */}
-        {isVisible && rewindState && entries.length > 0 && (
-          <div
-            className="absolute left-0 right-0 pointer-events-none animate-pulse"
-            style={{
-              top: `${rewindState.index / entries.length * 100}%`,
-              height: rewindState.phase === 'compacting'
-                ? `${(entries.length - rewindState.index) / entries.length * 100}%`
-                : `${Math.max(1, 100 / entries.length)}%`,
-              backgroundColor: rewindState.phase === 'done'
-                ? 'rgba(34, 197, 94, 0.25)'
-                : rewindState.phase === 'compacting'
-                  ? 'rgba(245, 158, 11, 0.15)'
-                  : 'rgba(168, 85, 247, 0.15)',
-              borderTop: `1px solid ${rewindState.phase === 'done' ? 'rgba(34, 197, 94, 0.6)' : rewindState.phase === 'compacting' ? 'rgba(245, 158, 11, 0.5)' : 'rgba(168, 85, 247, 0.5)'}`,
-              borderBottom: `1px solid ${rewindState.phase === 'done' ? 'rgba(34, 197, 94, 0.6)' : rewindState.phase === 'compacting' ? 'rgba(245, 158, 11, 0.5)' : 'rgba(168, 85, 247, 0.5)'}`,
-              boxShadow: `0 0 12px ${rewindState.phase === 'done' ? 'rgba(34, 197, 94, 0.4)' : rewindState.phase === 'compacting' ? 'rgba(245, 158, 11, 0.3)' : 'rgba(168, 85, 247, 0.3)'}`,
-            }}
-          />
-        )}
+        {isVisible && rewindState && entries.length > 0 && (() => {
+          const endIdx = rewindState.phase === 'compacting' ? entries.length - 1 : rewindState.index;
+          const rect = getOverlayRect(rewindState.index, endIdx);
+          return rect && (
+            <div
+              className="absolute left-0 right-0 pointer-events-none animate-pulse"
+              style={{
+                top: rect.top,
+                height: rect.height,
+                backgroundColor: rewindState.phase === 'done'
+                  ? 'rgba(34, 197, 94, 0.25)'
+                  : rewindState.phase === 'compacting'
+                    ? 'rgba(245, 158, 11, 0.15)'
+                    : 'rgba(168, 85, 247, 0.15)',
+                borderTop: `1px solid ${rewindState.phase === 'done' ? 'rgba(34, 197, 94, 0.6)' : rewindState.phase === 'compacting' ? 'rgba(245, 158, 11, 0.5)' : 'rgba(168, 85, 247, 0.5)'}`,
+                borderBottom: `1px solid ${rewindState.phase === 'done' ? 'rgba(34, 197, 94, 0.6)' : rewindState.phase === 'compacting' ? 'rgba(245, 158, 11, 0.5)' : 'rgba(168, 85, 247, 0.5)'}`,
+                boxShadow: `0 0 12px ${rewindState.phase === 'done' ? 'rgba(34, 197, 94, 0.4)' : rewindState.phase === 'compacting' ? 'rgba(245, 158, 11, 0.3)' : 'rgba(168, 85, 247, 0.3)'}`,
+              }}
+            />
+          );
+        })()}
 
           </div>{/* end inner relative wrapper */}
 

@@ -58,8 +58,3 @@ claude_session_id, gemini_session_id
 - **Visuals:** Карточки имеют размер 150x50px и окрашиваются в цвет вкладки. На карточке отображается имя таба и текущая директория (CWD).
 - **History Refetch:** История автоматически обновляется при изменении `tabs.length` (закрытие таба → refetch).
 
-## Code Map
-- `ProjectHome.tsx`: Рендеринг сетки карточек (Active, Favorites, History), логика сворачивания истории, анимации и контекстных меню.
-- `Workspace.tsx`: Управление состоянием `currentView` и автоматический редирект через `useEffect`.
-- `useWorkspaceStore.ts`: Хранение текущего вида (`currentView`) для каждого проекта.
-- `main.js`: IPC-хендлеры `project:add-favorite`, `project:get-favorites`, `project:delete-favorite`, а также хендлеры архивации истории.

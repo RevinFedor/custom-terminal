@@ -10,8 +10,6 @@ import ToastContainer from './components/UI/Toast';
 import EditProjectModal from './components/UI/EditProjectModal';
 import SessionInputModal from './components/UI/SessionInputModal';
 import SettingsModal from './components/UI/SettingsModal';
-import ApiSettingsModal from './components/UI/ApiSettingsModal';
-
 // Drag and drop
 import { draggable, dropTargetForElements, monitorForElements } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
 import { attachClosestEdge, extractClosestEdge, type Edge } from '@atlaskit/pragmatic-drag-and-drop-hitbox/closest-edge';
@@ -1346,7 +1344,6 @@ function App() {
       <EditProjectModal />
       <SessionInputModal />
       <SettingsModal isOpen={settingsOpen} onClose={() => setSettingsOpen(false)} />
-      <ApiSettingsModal />
 
       {/* Project Context Menu */}
       {projectContextMenu && (
