@@ -242,7 +242,20 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   const historyVisibleUuids = useUIStore(state => state.historyVisibleUuids[tabId]);
   const containerRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const innerWrapperRef = useRef<HTMLDivElement>(null);
   const segmentRefs = useRef<(HTMLDivElement | null)[]>([]);
+
+  // Compute overlay position from DOM refs instead of % (handles flex-grow, markers, collapsed groups)
+  const getOverlayRect = (startIdx: number, endIdx: number): { top: number; height: number } | null => {
+    const wrapper = innerWrapperRef.current;
+    const startEl = segmentRefs.current[startIdx];
+    const endEl = segmentRefs.current[endIdx];
+    if (!wrapper || !startEl || !endEl) return null;
+    const wrapperTop = wrapper.offsetTop;
+    const top = startEl.offsetTop - wrapperTop;
+    const bottom = endEl.offsetTop - wrapperTop + endEl.offsetHeight;
+    return { top, height: bottom - top };
+  };
 
   // Custom scroll indicator + scroll-down arrow — DOM refs for direct update (no re-render on scroll)
   const thumbRef = useRef<HTMLDivElement>(null);
@@ -1489,7 +1502,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
             <div className="absolute top-0 bottom-0 w-px pointer-events-none" style={{ left: '4px', backgroundColor: 'rgba(255, 255, 255, 0.08)' }} />
           )}
           {/* Inner relative wrapper so absolute overlays (selection, rewind) scroll with content */}
-          <div className="relative flex flex-col flex-1">
+          <div ref={innerWrapperRef} className="relative flex flex-col flex-1">
           {/* Plan mode marker at the very beginning (first entry is from a child session — chain started before visible entries) */}
           {entries.length > 0 && entries[0].sessionId && sessionBoundaries.length > 0 &&
             sessionBoundaries.some(b => b.childSessionId === entries[0].sessionId) &&

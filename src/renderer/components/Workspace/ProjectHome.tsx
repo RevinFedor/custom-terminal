@@ -120,7 +120,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
   const [syncName, setSyncName] = useState<string | null>(null);
   const [history, setHistory] = useState<TabHistoryEntry[]>([]);
   const [favorites, setFavorites] = useState<FavoriteEntry[]>([]);
-  const [historyExpanded, setHistoryExpanded] = useState(false);
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set(['This Month', 'Older']));
   const [homeContextMenu, setHomeContextMenu] = useState<ContextMenuState>(null);
 
   // Draft mode detection — check if this project was just created
@@ -771,141 +771,137 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
         </div>
       )}
 
-      {/* History Section — collapsed by default */}
+      {/* History — flat groups, no wrapper */}
       {history.length > 0 && (
-        <div className="mt-6" style={{ position: 'relative' }}>
-          {/* History Header — always visible */}
-          <div className="flex items-center justify-between mb-3">
-            {/* Left: toggle (inline, only text clickable) */}
-            <div
-              className="flex items-center gap-2 cursor-pointer"
-              style={{ display: 'inline-flex' }}
-              onClick={() => {
-                console.warn('[ProjectHome] toggle history, was:', historyExpanded);
-                setHistoryExpanded(prev => !prev);
-              }}
-            >
-              {historyExpanded ? (
-                <ChevronDown size={14} className="text-[#888]" />
-              ) : (
-                <ChevronRight size={14} className="text-[#888]" />
-              )}
-              <Clock size={14} className="text-[#888]" />
-              <h2 className="text-sm text-[#888]">History ({history.length})</h2>
-            </div>
-            {/* Right: Clear + Keep with notes */}
-            <div
-              className="flex items-center gap-2"
-              onMouseEnter={() => {
-                console.warn('[ProjectHome] Clear hover enter, hasNotes:', history.some(h => h.notes));
-                setShowKeepNotes(true);
-              }}
-              onMouseLeave={() => {
-                console.warn('[ProjectHome] Clear hover leave');
-                setShowKeepNotes(false);
-              }}
-            >
-              {showKeepNotes && history.some(h => h.notes) && (
-                <button
-                  onClick={handleClearExceptNotes}
-                  className="flex items-center gap-1 text-[11px] text-[#DA7756] hover:text-[#e89070] cursor-pointer transition-all"
-                >
-                  Keep with notes
-                </button>
-              )}
-              <button
-                onClick={(e) => {
-                  console.warn('[ProjectHome] Clear clicked');
-                  handleClearHistory();
-                }}
-                className="flex items-center gap-1 text-[11px] text-[#666] hover:text-[#999] cursor-pointer transition-colors"
-              >
-                <Trash2 size={12} />
-                Clear
-              </button>
-            </div>
-          </div>
+        <>
+          {Array.from(groupedHistory.entries()).map(([group, entries], groupIndex) => {
+            const alwaysOpen = group === 'Today' || group === 'Yesterday' || group === 'This Week';
+            const isCollapsed = !alwaysOpen && collapsedGroups.has(group);
 
-          {/* History Content — animated expand/collapse */}
-          <div
-            style={{
-              maxHeight: historyExpanded ? '2000px' : '0',
-              opacity: historyExpanded ? 1 : 0,
-              overflow: 'hidden',
-              transition: 'max-height 0.3s ease, opacity 0.2s ease',
-            }}
-          >
-            {Array.from(groupedHistory.entries()).map(([group, entries]) => (
-              <div key={group} className="mb-4">
-                <div className="text-[10px] text-[#555] uppercase tracking-wider mb-2">{group}</div>
-                <div className="flex flex-wrap gap-2">
-                  {entries.map((entry) => {
-                    const color = (entry.color || 'default') as TabColor;
-                    const colorConfig = TAB_COLORS[color];
-
-                    return (
-                      <div
-                        key={entry.id}
-                        className="relative"
-                        {...historyPopover.triggerProps(entry.id)}
-                        onContextMenu={(e) => handleCardContextMenu(e, 'history', entry.id)}
-                      >
-                        <div
-                          className="transition-all duration-150 cursor-pointer hover:opacity-70"
-                          onClick={() => restoreTab(entry)}
-                          onAuxClick={(e) => {
-                            if (e.button === 1) {
-                              e.preventDefault();
-                              restoreTabBackground(entry);
-                            }
-                          }}
-                          style={{
-                            maxWidth: '140px',
-                            minWidth: '90px',
-                            padding: '6px 10px',
-                            backgroundColor: colorConfig.bgColor,
-                            borderRadius: '5px',
-                            borderLeft: `2px solid ${colorConfig.borderColor}`,
-                            opacity: 0.5,
-                            display: 'flex',
-                            flexDirection: 'column',
-                            gap: '1px',
-                          }}
+            return (
+              <div key={group} className="mt-6">
+                <div className="flex items-center justify-between mb-3">
+                  {alwaysOpen ? (
+                    <div className="flex items-center gap-2">
+                      <Clock size={14} className="text-[#888]" />
+                      <h2 className="text-sm text-[#888]">{group} ({entries.length})</h2>
+                    </div>
+                  ) : (
+                    <div
+                      className="flex items-center gap-2 cursor-pointer"
+                      style={{ display: 'inline-flex' }}
+                      onClick={() => setCollapsedGroups(prev => {
+                        const next = new Set(prev);
+                        if (next.has(group)) next.delete(group); else next.add(group);
+                        return next;
+                      })}
+                    >
+                      {isCollapsed ? <ChevronRight size={14} className="text-[#888]" /> : <ChevronDown size={14} className="text-[#888]" />}
+                      <Clock size={14} className="text-[#888]" />
+                      <h2 className="text-sm text-[#888]">{group} ({entries.length})</h2>
+                    </div>
+                  )}
+                  {!alwaysOpen && (
+                    <div
+                      className="flex items-center gap-2"
+                      onMouseEnter={() => setShowKeepNotes(true)}
+                      onMouseLeave={() => setShowKeepNotes(false)}
+                    >
+                      {showKeepNotes && history.some(h => h.notes) && (
+                        <button
+                          onClick={handleClearExceptNotes}
+                          className="flex items-center gap-1 text-[11px] text-[#DA7756] hover:text-[#e89070] cursor-pointer transition-all"
                         >
-                          <span
-                            className="text-[12px] text-white truncate"
-                            style={{ maxWidth: '120px' }}
-                          >
-                            {entry.name}
-                          </span>
-                          <span className="text-[9px] text-[#666] truncate">
-                            {getFolderName(entry.cwd)}
-                          </span>
-                        </div>
+                          Keep with notes
+                        </button>
+                      )}
+                      <button
+                        onClick={() => handleClearHistory()}
+                        className="flex items-center gap-1 text-[11px] text-[#666] hover:text-[#999] cursor-pointer transition-colors"
+                      >
+                        <Trash2 size={12} />
+                        Clear
+                      </button>
+                    </div>
+                  )}
+                </div>
+                <div
+                  style={{
+                    maxHeight: isCollapsed ? '0' : 'none',
+                    opacity: isCollapsed ? 0 : 1,
+                    overflow: 'hidden',
+                    transition: 'max-height 0.2s ease, opacity 0.15s ease',
+                  }}
+                >
+                  <div className="flex flex-wrap gap-2">
+                    {entries.map((entry) => {
+                      const color = (entry.color || 'default') as TabColor;
+                      const colorConfig = TAB_COLORS[color];
 
-                        {/* CMD indicator: notes exist */}
-                        {isCmdPressed && entry.notes && (
-                          <span
-                            style={{
-                              position: 'absolute',
-                              top: '6px',
-                              right: '6px',
-                              width: '5px',
-                              height: '5px',
-                              borderRadius: '50%',
-                              backgroundColor: '#DA7756',
-                              zIndex: 10,
+                      return (
+                        <div
+                          key={entry.id}
+                          className="relative"
+                          {...historyPopover.triggerProps(entry.id)}
+                          onContextMenu={(e) => handleCardContextMenu(e, 'history', entry.id)}
+                        >
+                          <div
+                            className="transition-all duration-150 cursor-pointer hover:opacity-70"
+                            onClick={() => restoreTab(entry)}
+                            onAuxClick={(e) => {
+                              if (e.button === 1) {
+                                e.preventDefault();
+                                restoreTabBackground(entry);
+                              }
                             }}
-                          />
-                        )}
-                      </div>
-                    );
-                  })}
+                            style={{
+                              maxWidth: '140px',
+                              minWidth: '90px',
+                              padding: '6px 10px',
+                              backgroundColor: colorConfig.bgColor,
+                              borderRadius: '5px',
+                              borderLeft: `2px solid ${colorConfig.borderColor}`,
+                              opacity: 0.5,
+                              display: 'flex',
+                              flexDirection: 'column',
+                              gap: '1px',
+                            }}
+                          >
+                            <span
+                              className="text-[12px] text-white truncate"
+                              style={{ maxWidth: '120px' }}
+                            >
+                              {entry.name}
+                            </span>
+                            <span className="text-[9px] text-[#666] truncate">
+                              {getFolderName(entry.cwd)}
+                            </span>
+                          </div>
+
+                          {/* CMD indicator: notes exist */}
+                          {isCmdPressed && entry.notes && (
+                            <span
+                              style={{
+                                position: 'absolute',
+                                top: '6px',
+                                right: '6px',
+                                width: '5px',
+                                height: '5px',
+                                borderRadius: '50%',
+                                backgroundColor: '#DA7756',
+                                zIndex: 10,
+                              }}
+                            />
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
                 </div>
               </div>
-            ))}
-          </div>
-        </div>
+            );
+          })}
+        </>
       )}
 
       {/* Context Menu (fixed, pattern from TabBar) */}

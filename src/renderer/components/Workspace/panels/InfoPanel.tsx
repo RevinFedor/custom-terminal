@@ -58,6 +58,7 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
   const [claudeModel, setClaudeModel] = useState<string | null>(cached?.model ?? null);
   const [contextPct, setContextPct] = useState(cached?.contextPct ?? 0);
   const [isCommandRunning, setIsCommandRunning] = useState(false);
+  const [isControlBusy, setIsControlBusy] = useState(false);
   const [sessionInputMode, setSessionInputMode] = useState<'claude' | 'gemini' | null>(null);
   const [manualSessionId, setManualSessionId] = useState('');
   const sessionInputRef = useRef<HTMLInputElement>(null);
@@ -606,9 +607,9 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                   return (
                     <button
                       key={model}
-                      className={`flex-1 text-[10px] px-1.5 py-1 rounded ${isCommandRunning ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'} ${isActive ? 'bg-[#DA7756] text-white font-medium' : 'bg-[#2d2d2d] text-[#888] hover:text-white hover:bg-[#3d3d3d]'}`}
-                      disabled={isCommandRunning}
-                      onClick={async () => { if (isCommandRunning) return; setIsCommandRunning(true); console.warn('[InfoPanel:ModelSwitch] clicked=' + model + ' tabId=' + activeTabId + ' ts=' + Date.now()); try { await ipcRenderer.invoke('claude:send-command', activeTabId, '/model ' + model); } finally { setIsCommandRunning(false); } }}
+                      className={`flex-1 text-[10px] px-1.5 py-1 rounded ${isControlBusy ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'} ${isActive ? 'bg-[#DA7756] text-white font-medium' : 'bg-[#2d2d2d] text-[#888] hover:text-white hover:bg-[#3d3d3d]'}`}
+                      disabled={isControlBusy}
+                      onClick={async () => { if (isControlBusy) return; setIsControlBusy(true); console.warn('[InfoPanel:ModelSwitch] clicked=' + model + ' tabId=' + activeTabId + ' ts=' + Date.now()); try { await ipcRenderer.invoke('claude:send-command', activeTabId, '/model ' + model); } finally { setIsControlBusy(false); } }}
                       title={'Switch to ' + model}
                     >
                       {model}
@@ -626,13 +627,13 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                   return (
                     <button
                       key={level}
-                      className={`flex-1 text-[10px] px-1.5 py-1 rounded ${isCommandRunning ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'} ${isActive ? 'bg-[#DA7756]/20 text-white font-medium' : 'bg-[#2d2d2d] text-[#888] hover:text-white hover:bg-[#3d3d3d]'}`}
-                      disabled={isCommandRunning}
+                      className={`flex-1 text-[10px] px-1.5 py-1 rounded ${isControlBusy ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'} ${isActive ? 'bg-[#DA7756]/20 text-white font-medium' : 'bg-[#2d2d2d] text-[#888] hover:text-white hover:bg-[#3d3d3d]'}`}
+                      disabled={isControlBusy}
                       onClick={async () => {
-                        if (isCommandRunning) return;
-                        setIsCommandRunning(true);
+                        if (isControlBusy) return;
+                        setIsControlBusy(true);
                         if (activeTabId) setEffortLevel(prev => ({ ...prev, [activeTabId]: level }));
-                        try { await ipcRenderer.invoke('claude:send-command', activeTabId, '/effort ' + level); } finally { setIsCommandRunning(false); }
+                        try { await ipcRenderer.invoke('claude:send-command', activeTabId, '/effort ' + level); } finally { setIsControlBusy(false); }
                       }}
                       title={'Set effort to ' + level}
                     >
@@ -645,15 +646,15 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
             <div className="flex items-center gap-1">
               <span className="text-[10px] text-[#666] w-12 flex-shrink-0">Think</span>
               <button
-                disabled={isCommandRunning}
-                className={`flex-1 text-[10px] px-1.5 py-1 rounded ${isCommandRunning ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'} bg-[#2d2d2d] ${thinkFlash ? 'text-[#b4b9f9]' : 'text-[#888] hover:text-white hover:bg-[#3d3d3d]'}`}
+                disabled={isControlBusy}
+                className={`flex-1 text-[10px] px-1.5 py-1 rounded ${isControlBusy ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'} bg-[#2d2d2d] ${thinkFlash ? 'text-[#b4b9f9]' : 'text-[#888] hover:text-white hover:bg-[#3d3d3d]'}`}
                 onClick={async () => {
-                  if (isCommandRunning) return;
-                  setIsCommandRunning(true);
+                  if (isControlBusy) return;
+                  setIsControlBusy(true);
                   try {
                     const result = await ipcRenderer.invoke('claude:toggle-thinking', activeTabId);
                     if (result.success) { setThinkFlash(result.thinking ? 'think on' : 'think off'); setTimeout(() => setThinkFlash(null), 3000); }
-                  } finally { setIsCommandRunning(false); }
+                  } finally { setIsControlBusy(false); }
                 }}
                 title="Toggle thinking mode (meta+t)"
               >
