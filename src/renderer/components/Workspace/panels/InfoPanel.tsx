@@ -545,10 +545,12 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                     const storeId = currentSessionType === 'claude' ? tab.claudeSessionId : tab.geminiSessionId;
                     console.warn('[InfoPanel:Fork] activeTabId:', activeTabId, 'closureSessionId:', sessionId, 'storeSessionId:', storeId, 'match:', sessionId === storeId);
                     const currentCwd = tab.cwd || project?.path || '';
-                    await state.createTabAfterCurrent(projectId, undefined, currentCwd, {
-                      pendingAction: { type: currentSessionType === 'claude' ? 'claude-fork' : 'gemini-fork', sessionId: sessionId }
+                    const forkName = tab.name ? `${tab.name}_fork` : undefined;
+                    await state.createTabAfterCurrent(projectId, forkName, currentCwd, {
+                      pendingAction: { type: currentSessionType === 'claude' ? 'claude-fork' : 'gemini-fork', sessionId: sessionId },
+                      nameSetManually: !!forkName,
                     });
-                    showToast(`Fork ${currentSessionType === 'claude' ? 'Claude' : 'Gemini'} → новая вкладка`, 'success');
+                    showToast(`Fork ${currentSessionType === 'claude' ? 'Claude' : 'Gemini'} → ${forkName || 'новая вкладка'}`, 'success');
                     break;
                   }
                 }

@@ -204,11 +204,3 @@ Thinking mode при запуске **не отправляется** через
 - **TAB_SENT / DEBOUNCE_TAB** — отправка `\t` для thinking mode. Стало ненужным с `alwaysThinkingEnabled: true`
 - Было 4 состояния, стало 2
 
-## Code Map
-- **Main (send command):** `src/main/main.js` — IPC `claude:send-command`
-- **Main (history menu / rewind):** `src/main/main.js` — IPC `claude:open-history-menu`
-- **Main (think toggle):** `src/main/main.js` — IPC `claude:toggle-thinking` (handle)
-- **Main (handshake):** `src/main/main.js` — стейт-машина `claudeState` в `ptyProcess.onData`
-- **Renderer (UI):** `src/renderer/components/Workspace/panels/InfoPanel.tsx` — кнопки модели + think toggle
-- **Bridge script:** `~/.claude/statusline-bridge.sh` — источник данных о текущей модели
-- **Settings:** `~/.claude/settings.json` — `alwaysThinkingEnabled`, `statusLine`

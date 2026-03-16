@@ -261,6 +261,10 @@ interface UIStore {
   autoApplyDocs: boolean;
   setAutoApplyDocs: (on: boolean) => void;
 
+  // Post-check toggle (lightweight verification after main analysis)
+  postCheckDocs: boolean;
+  setPostCheckDocs: (on: boolean) => void;
+
 }
 
 
@@ -950,6 +954,13 @@ export const useUIStore = create<UIStore>((set, get) => ({
   setAutoApplyDocs: (on) => {
     set({ autoApplyDocs: on });
     localStorage.setItem('noted-terminal-auto-apply-docs', String(on));
+  },
+
+  // Post-check docs toggle
+  postCheckDocs: localStorage.getItem('noted-terminal-post-check-docs') === 'true',
+  setPostCheckDocs: (on) => {
+    set({ postCheckDocs: on });
+    localStorage.setItem('noted-terminal-post-check-docs', String(on));
   },
 
   // Focus Area

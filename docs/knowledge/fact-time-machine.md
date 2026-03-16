@@ -23,7 +23,3 @@
 - Таймстемп.
 - Кнопка ↺ для инициации отката.
 
-## Code Map
-- **Backend:** `src/main/main.js` — функции `saveGeminiHistorySnapshot`, `gemini:rollback`.
-- **Watcher:** `src/main/main.js` — `gemini:start-history-watcher` отслеживает изменения в реальном времени.
-- **UI:** `src/renderer/components/Workspace/panels/InfoPanel.tsx` — рендеринг списка тернов и логика вызова отката.

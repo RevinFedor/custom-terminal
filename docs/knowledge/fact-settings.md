@@ -38,7 +38,20 @@
 - **Персистентность:** `localStorage('noted-terminal-auto-apply-docs')`
 - **Store:** `useUIStore.autoApplyDocs` / `setAutoApplyDocs()`
 
-## Code Map
-- `SettingsModal.tsx`: Главный компонент модального окна.
-- `useUIStore.ts`: Хранение настроек `chatSettings`, `docPrompt` и пользовательских промптов.
-- `database.js`: Синхронизация `app_state` (например, `claudeDefaultPrompt`) с SQLite.
+## Post-check Toggle
+Второй тогл в поповере настроек (⌘+hover на ⚙). Лёгкая верификация плана после основного анализа — 3-строчный промпт, ловящий два слепых пятна:
+
+1. **Шрамы формата данных:** Места в сессии где разработчик получил пустой ответ / ошибку парсинга, а потом выяснил, что формат данных отличался от ожидаемого.
+2. **Засорение CLAUDE.md:** Проверяет, не предлагает ли план изменения в CLAUDE.md, которые не являются guard rail / anti-pattern / инфраструктурной инструкцией (фичи находятся через семантический поиск knowledge-файлов).
+
+### Поведение по режимам
+- **API режим (claude-api, gemini-api, gemini-cli):** Два последовательных API-запроса. Второй запрос содержит план из первого + промпт верификации. Результат post-check дописывается к основному ответу.
+- **Gemini CLI режим:** После основного ответа `waitForGeminiSettled` ждёт IDLE, затем `terminal:paste` вставляет промпт верификации.
+
+### Race Condition Fix (Listen-Before-Paste)
+`waitForGeminiSettled` слушает `gemini:busy-state` IPC-событие (emit на STATE TRANSITIONS, не continuously). Если listener зарегистрирован **после** `terminal:paste`, событие `busy:true` может быть уже пропущено → grace period (2с) истекает → resolve мгновенный.
+- **Решение:** Promise от `waitForGeminiSettled` создаётся **до** вызова `terminal:paste`. Listener ловит `busy:true` в реальном времени.
+- **Персистентность:** `localStorage('noted-terminal-post-check-docs')`
+- **Store:** `useUIStore.postCheckDocs` / `setPostCheckDocs()`
+- **Индикатор:** Фиолетовая точка (6px) в хедере System рядом с зелёной точкой auto-apply.
+

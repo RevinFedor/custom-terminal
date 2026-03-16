@@ -37,7 +37,3 @@
 
 **Решение:** Переход на архитектуру [PTY Middleware и OSC-маркеры](fact-terminal-core.md) для Claude и событийное ожидание текста для Gemini.
 
-## Code Map
-- **UI:** `src/renderer/components/Research/ChatArea.tsx` — кнопки Retry/Delete.
-- **Rendering:** `src/renderer/components/Research/MarkdownRenderer.tsx` — фикс inline-кода.
-- **Store:** `src/renderer/store/useResearchStore.ts` — флаг `pendingResearch`.
