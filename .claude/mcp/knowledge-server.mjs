@@ -34,7 +34,7 @@ try {
 // ---------------------------------------------------------------------------
 
 const ROUTER_PROMPT = `You are a Semantic Router for a software project.
-Task: select 2-5 files from the index that are ACTUALLY needed to solve the developer request.
+Task: select ALL files from the index that are ACTUALLY needed to solve the developer request. No limit on count — if the request touches 10 topics, return 10 files.
 
 SELECTION ALGORITHM:
 
@@ -60,7 +60,8 @@ g) Vite escaping — escape sequences "broken" after build → fix-environment.m
 STEP 5 — Scan implicit tags across ALL entries.
 
 RULES:
-- Select 2-5 files. Better 4 correct than 2 obvious.
+- Select as many files as needed to cover ALL aspects of the request. No upper limit.
+- Do NOT artificially limit to 2-5 files. If the query covers multiple topics, include files for EACH topic.
 - All docs in docs/knowledge/ (flat structure: fix-* and fact-*).
 
 Respond ONLY with a valid JSON array of paths. No markdown, no explanations.
@@ -90,12 +91,13 @@ function searchKnowledge(query) {
     ], {
       cwd: PROJECT_DIR,
       env,
-      timeout: 30000,
+      timeout: 60000,
       maxBuffer: 5 * 1024 * 1024,
-    }, (error, stdout) => {
+    }, (error, stdout, stderr) => {
       if (error) {
         process.stderr.write(`[knowledge-server] Haiku error: ${error.message}\n`);
-        resolve({ found: 0, error: error.message, files: [] });
+        if (stderr) process.stderr.write(`[knowledge-server] Haiku stderr: ${stderr.slice(0, 500)}\n`);
+        resolve({ found: 0, error: error.message, stderr: stderr?.slice(0, 300), files: [] });
         return;
       }
 
@@ -117,21 +119,23 @@ function searchKnowledge(query) {
         return;
       }
 
-      // Read matched files
-      const files = [];
-      for (const relPath of filePaths) {
-        const fullPath = join(PROJECT_DIR, relPath);
-        let content = '';
-        try {
-          content = readFileSync(fullPath, 'utf8');
-        } catch {
-          content = `[Error reading file: ${relPath}]`;
-        }
-        files.push({ path: relPath, content });
-      }
+      // Return paths + symptoms (no content — Claude reads via Read tool)
+      const files = filePaths.map(relPath => {
+        const entry = index.find(e => e.path === relPath);
+        return {
+          path: relPath,
+          fullPath: join(PROJECT_DIR, relPath),
+          symptoms: entry?.symptoms || []
+        };
+      });
 
       process.stderr.write(`[knowledge-server] Haiku selected ${files.length} files: ${filePaths.map(p => p.split('/').pop()).join(', ')}\n`);
-      resolve({ found: files.length, query, files });
+      resolve({
+        found: files.length,
+        query,
+        instruction: 'Use the Read tool to read these files before proceeding.',
+        files
+      });
     });
 
     // Send query via stdin

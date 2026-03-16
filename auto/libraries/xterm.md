@@ -57,6 +57,35 @@ await page.keyboard.press('Meta+t')
 await page.waitForTimeout(1500)  // ожидание PTY spawn + shell init
 ```
 
+## Поиск активного viewport (ловушка visibility)
+
+`visibility: hidden` элементы имеют **ненулевой** `getBoundingClientRect()`. При поиске viewport активного терминала нельзя полагаться только на размеры:
+
+```javascript
+// ПЛОХО — поймает скрытый терминал из другого таба:
+for (const vp of document.querySelectorAll('.xterm-viewport')) {
+  if (vp.getBoundingClientRect().height > 50) { ... }
+}
+
+// ХОРОШО — проверяем computed visibility:
+for (const vp of document.querySelectorAll('.xterm-viewport')) {
+  if (window.getComputedStyle(vp).visibility !== 'hidden' &&
+      vp.getBoundingClientRect().height > 50) { ... }
+}
+```
+
+## Скролл в тестах
+
+Синтетический `WheelEvent` не работает — xterm.js его игнорирует. Для программного скролла ставить `scrollTop` напрямую:
+
+```javascript
+// ПЛОХО — xterm игнорирует:
+el.dispatchEvent(new WheelEvent('wheel', { deltaY: -200, bubbles: true }))
+
+// ХОРОШО — прямая установка:
+viewport.scrollTop = Math.max(0, viewport.scrollTop - 200)
+```
+
 ## OSC 133 — Command Lifecycle
 
 Приложение отслеживает команды через OSC 133 escape-последовательности:

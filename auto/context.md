@@ -388,3 +388,6 @@ node auto/sandbox/test-orchestration-full.js 2>&1 | tee /tmp/test-orchestration-
 | `terminal:input` для Claude Code | Ink TUI не обрабатывает raw text, нужен bracketed paste | Используй `terminal:paste` (через `safePasteAndSubmit`) |
 | Эндпоинт `/history/` вместо `/claude-history/` | 404, `totalTurns: undefined` | MCP HTTP: `/claude-history/{taskId}`, `/status/{taskId}`, `/continue`, `/delegate` |
 | JSONL guard ждёт `turn_duration` для суб-агентов | 120s таймаут (40×3s) — суб-агенты не пишут `turn_duration` | Фикс: fallback на `stop_reason=end_turn` в `checkJsonlActivity` |
+| `waitForMainProcessLog` после повторного Spinner | Ловит старый BUSY/IDLE от инициализации, тест проходит без реальной работы | Трекать `mainProcessLogs.length` и искать только новые записи. См. `playwright/basics.md` |
+| `getBoundingClientRect()` для поиска активного viewport | Скрытые табы (`visibility:hidden`) имеют ненулевые размеры | Проверять `getComputedStyle(el).visibility`. См. `libraries/xterm.md` |
+| `WheelEvent` для скролла xterm | xterm.js игнорирует синтетические wheel events | Устанавливать `viewport.scrollTop` напрямую. См. `libraries/xterm.md` |

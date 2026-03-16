@@ -48,9 +48,11 @@
 - **API режим (claude-api, gemini-api, gemini-cli):** Два последовательных API-запроса. Второй запрос содержит план из первого + промпт верификации. Результат post-check дописывается к основному ответу.
 - **Gemini CLI режим:** После основного ответа `waitForGeminiSettled` ждёт IDLE, затем `terminal:paste` вставляет промпт верификации.
 
-### Race Condition Fix (Listen-Before-Paste)
-`waitForGeminiSettled` слушает `gemini:busy-state` IPC-событие (emit на STATE TRANSITIONS, не continuously). Если listener зарегистрирован **после** `terminal:paste`, событие `busy:true` может быть уже пропущено → grace period (2с) истекает → resolve мгновенный.
-- **Решение:** Promise от `waitForGeminiSettled` создаётся **до** вызова `terminal:paste`. Listener ловит `busy:true` в реальном времени.
+### Gemini CLI Response Detection (Buffer Inspection)
+Для Post-check в режиме Gemini CLI используется `waitForGeminiResponse` с инспекцией буфера xterm.js.
+- **Проблема:** Дебаунс PTY-потока (тишины) ненадежен, так как Gemini может мелькать спиннером на <1с или замирать на 5-10с при тяжелых расчетах.
+- **Решение:** При получении события IDLE от Main-процесса, Renderer проверяет физическое наличие спиннера (Braille-символов) на экране через `terminalRegistry.hasSpinnerOnScreen(tabId)`.
+- **Логика:** Если спиннер виден — ответ продолжается, система переходит в режим поллинга буфера (каждые 2с) до его полного исчезновения. Только после этого вставляется Post-check промпт.
 - **Персистентность:** `localStorage('noted-terminal-post-check-docs')`
 - **Store:** `useUIStore.postCheckDocs` / `setPostCheckDocs()`
 - **Индикатор:** Фиолетовая точка (6px) в хедере System рядом с зелёной точкой auto-apply.

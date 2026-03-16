@@ -345,9 +345,10 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
 
     const buffer = term.buffer.active;
     const isAtBottom = buffer.viewportY >= buffer.baseY;
-    const shouldShow = !isAtBottom;
 
-    // Only trigger React re-render when state actually changes
+    // Note: scroll enforcement is handled by safeWrite's rAF loop, not here
+
+    const shouldShow = !isAtBottom;
     if (shouldShow !== lastScrollButtonState.current) {
       lastScrollButtonState.current = shouldShow;
       setShowScrollButton(shouldShow);
@@ -403,6 +404,111 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
   const writeBufferRef = useRef<string>('');
   const pendingWriteRef = useRef<NodeJS.Timeout | null>(null);
   const syncSafetyRef = useRef<NodeJS.Timeout | null>(null); // Safety timeout for stuck sync frames
+
+  // Scroll-safe write with rAF enforcement loop.
+  // When user is scrolled up: rAF loop continuously holds scrollTop.
+  // Wheel events: skip 1 frame, capture new position, resume enforcement.
+  // safeWrite only calls term.write() — loop handles all scroll restoration.
+  const scrollSaveRef = useRef<{
+    active: boolean;
+    savedTop: number;
+    wasAtBottom: boolean;
+    wheelPending: boolean;
+    viewport: HTMLElement | null;
+    frameId: number | null;
+    settleTimer: NodeJS.Timeout | null;
+  }>({ active: false, savedTop: 0, wasAtBottom: true, wheelPending: false, viewport: null, frameId: null, settleTimer: null });
+
+  // Expose for E2E tests — allows test to update savedTop after programmatic scroll
+  (window as any).__scrollSave = scrollSaveRef.current;
+
+  const safeWrite = useCallback((data: string) => {
+    const term = xtermInstance.current;
+    if (!term) return;
+    const save = scrollSaveRef.current;
+
+    // Start enforcement loop on first write when scrolled up
+    if (!save.active) {
+      const viewport = term.element?.querySelector('.xterm-viewport') as HTMLElement | null;
+      if (!viewport) { term.write(data); return; }
+
+      // Use DOM scrollTop for "at bottom" check — xterm's viewportY can be corrupted to 0
+      const isAtBottom = viewport.scrollTop + viewport.clientHeight >= viewport.scrollHeight - 5;
+      save.wasAtBottom = isAtBottom;
+
+      if (isAtBottom) {
+        // At bottom — write normally, no enforcement needed
+        term.write(data);
+        return;
+      }
+
+      // User is scrolled up — activate enforcement
+      save.active = true;
+      save.savedTop = viewport.scrollTop;
+      save.viewport = viewport;
+      save.wheelPending = false;
+
+      // Wheel handler: flag that user is scrolling, loop will capture new position
+      term.attachCustomWheelEventHandler(() => {
+        save.wheelPending = true;
+        save.wasAtBottom = false; // user actively scrolled — don't auto-scroll on settle
+        return true;
+      });
+
+      // rAF enforcement loop
+      const enforce = () => {
+        if (!save.active || !save.viewport) return;
+
+        if (save.wheelPending) {
+          // User just scrolled — skip this frame, capture position next frame
+          save.wheelPending = false;
+          save.frameId = requestAnimationFrame(() => {
+            if (save.active && save.viewport) {
+              save.savedTop = save.viewport.scrollTop;
+              // Check if user scrolled to bottom
+              const t = xtermInstance.current;
+              if (t && t.buffer.active.viewportY >= t.buffer.active.baseY) {
+                save.wasAtBottom = true;
+              }
+            }
+            save.frameId = requestAnimationFrame(enforce);
+          });
+          return;
+        }
+
+        // Enforce saved position — log every correction for diagnostics
+        const drift = save.viewport.scrollTop - save.savedTop;
+        if (Math.abs(drift) > 1) {
+          save.viewport.scrollTop = save.savedTop;
+          // Record jitter event: what xterm tried vs what we restored
+          const w = (window as any);
+          if (!w.__scrollJitter) w.__scrollJitter = [];
+          w.__scrollJitter.push({
+            t: Date.now(),
+            xtermWanted: Math.round(save.viewport.scrollTop + drift), // what xterm set
+            weRestored: Math.round(save.savedTop),                    // what we set back
+            drift: Math.round(drift)                                  // amplitude
+          });
+          if (w.__scrollJitter.length > 500) w.__scrollJitter = w.__scrollJitter.slice(-300);
+        }
+        save.frameId = requestAnimationFrame(enforce);
+      };
+      save.frameId = requestAnimationFrame(enforce);
+    }
+
+    // Reset settle timer — stop loop after 500ms of no writes (covers tool call pauses)
+    // No scrollToBottom — xterm auto-scrolls if user is at bottom on next write
+    if (save.settleTimer) clearTimeout(save.settleTimer);
+    save.settleTimer = setTimeout(() => {
+      save.active = false;
+      if (save.frameId) cancelAnimationFrame(save.frameId);
+      save.frameId = null;
+      save.settleTimer = null;
+      save.viewport = null;
+    }, 500);
+
+    term.write(data);
+  }, []);
 
   const safeFit = () => {
     if (!isMounted.current) return;
@@ -487,9 +593,8 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
         if (!syncSafetyRef.current) {
           syncSafetyRef.current = setTimeout(() => {
             syncSafetyRef.current = null;
-            if (xtermInstance.current && writeBufferRef.current) {
-              // DIAG: console.warn(`[WriteBuffer:SYNC_SAFETY] forced flush ${writeBufferRef.current.length}B`);
-              xtermInstance.current.write(writeBufferRef.current);
+            if (writeBufferRef.current) {
+              safeWrite(writeBufferRef.current);
               writeBufferRef.current = '';
             }
           }, SYNC_SAFETY_TIMEOUT);
@@ -502,10 +607,8 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
         }
         if (!pendingWriteRef.current) {
           pendingWriteRef.current = setTimeout(() => {
-            if (xtermInstance.current && writeBufferRef.current) {
-              // DIAG: uncomment to trace flush sizes
-              // console.warn(`[WriteBuffer:FLUSH] ${writeBufferRef.current.length}B sync=${writeBufferRef.current.includes(SYNC_START)}`);
-              xtermInstance.current.write(writeBufferRef.current);
+            if (writeBufferRef.current) {
+              safeWrite(writeBufferRef.current);
               writeBufferRef.current = '';
             }
             pendingWriteRef.current = null;
@@ -514,15 +617,13 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
       }
 
       // Flush immediately if buffer too large — but NEVER inside a sync frame
-      // (breaking a sync frame mid-write causes 1000+px viewport jumps from cursor repositioning)
       if (!insideSyncFrame && writeBufferRef.current.length > MAX_BUFFER_SIZE) {
         if (pendingWriteRef.current) {
           clearTimeout(pendingWriteRef.current);
           pendingWriteRef.current = null;
         }
-        if (xtermInstance.current) {
-          // DIAG: console.warn(`[WriteBuffer:MAX_SIZE] flush ${writeBufferRef.current.length}B`);
-          xtermInstance.current.write(writeBufferRef.current);
+        if (writeBufferRef.current) {
+          safeWrite(writeBufferRef.current);
           writeBufferRef.current = '';
         }
       }
@@ -1092,12 +1193,7 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
       }
       writeBufferRef.current = '';
 
-      // Dispose WebGL addon BEFORE terminal to avoid errors
-      try {
-        webglAddonRef.current?.dispose();
-      } catch (e) {
-        // Ignore WebGL dispose errors
-      }
+      try { webglAddonRef.current?.dispose(); } catch {}
 
       const termToDispose = xtermInstance.current;
       xtermInstance.current = null;

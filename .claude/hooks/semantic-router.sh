@@ -117,7 +117,7 @@ if [ -z "$INDEX_COMPACT" ]; then
 fi
 
 SYSTEM_PROMPT='You are a Semantic Router for Noted Terminal (Electron + React 19 + xterm.js + Claude/Gemini AI).
-Task: select 2-5 files from the index that are ACTUALLY needed to solve the developer request.
+Task: select ALL files from the index that are ACTUALLY needed to solve the developer request. No limit on count — if the request touches 10 topics, return 10 files.
 
 ARCHITECTURE (remember for routing):
 - Main process (main.js) ↔ Renderer (React) via IPC
@@ -161,7 +161,7 @@ Do NOT limit yourself to files whose NAME contains a keyword from the request.
 
 RULES:
 - All docs are in docs/knowledge/ (flat structure: fix-* and fact-*). No hierarchy.
-- Select 2-5 files. Better 4 correct than 2 obvious.
+- Select as many files as needed to cover ALL aspects of the request. No artificial limit.
 - For bugs — MUST include at least one knowledge/ file with root cause (fix-*, fact-*).
 - For features — include knowledge/ files with traps and workarounds related to that area.
 
