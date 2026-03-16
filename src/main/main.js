@@ -1638,6 +1638,12 @@ async function adoptClaudeAgent(taskId, claudeTabId, geminiTabId) {
       if (!cwd) cwd = process.cwd();
       const { text: sessionContent } = await getClaudeHistory(sessionId, cwd, { detail: 'with_code' });
 
+      // Extract session stats for mini-timeline
+      const sessionStats = await getSessionStats(sessionId, cwd);
+      if (sessionStats) {
+        console.log('[MCP:Adopt] Session stats: turns=' + sessionStats.turns + ' compacts=' + sessionStats.compacts + ' plans=' + sessionStats.planModes);
+      }
+
       // Read adopt prompt from DB
       let adoptPromptContent = 'Summarize the following Claude Code session briefly: what was done, current status, files changed.';
       let adoptModel = 'gemini-3-flash-preview';
@@ -1685,6 +1691,7 @@ async function adoptClaudeAgent(taskId, claudeTabId, geminiTabId) {
           sourceSessionId: sessionId,
           targetTabId: geminiTabId,
           payloadSize: sessionContent.length,
+          sessionMeta: sessionStats,
         });
       } catch (logErr) {
         console.error('[MCP:Adopt] Failed to log API call:', logErr.message);
@@ -1705,7 +1712,31 @@ async function adoptClaudeAgent(taskId, claudeTabId, geminiTabId) {
     summaryText +
     '\n[/Adopted Agent Context]';
 
-  deliverResultToGemini(geminiTabId, formatted, taskId, tabName || 'adopted');
+  // Auto-launch Gemini CLI if not running (OSC 133 = deterministic process state)
+  const geminiProcessRunning = terminalCommandState.get(geminiTabId)?.isRunning || false;
+  if (!geminiProcessRunning) {
+    if (terminals.get(geminiTabId) && mainWindow && !mainWindow.isDestroyed()) {
+      const geminiCwd = terminalProjects.get(geminiTabId) || process.cwd();
+      console.log('[MCP:Adopt] Gemini CLI not running (OSC 133), launching via spawn-with-watcher');
+
+      // Force-queue response BEFORE launch (Gemini TUI not ready yet)
+      const queue = geminiResponseQueue.get(geminiTabId) || [];
+      queue.push({ formatted, taskId, tabName: tabName || 'adopted', promptPreview: formatted.substring(0, 120) });
+      geminiResponseQueue.set(geminiTabId, queue);
+      notifyQueueUpdate(geminiTabId);
+
+      // Launch Gemini via spawn-with-watcher (sets up Sniper, session detection, spinner)
+      // Emit to renderer which will relay back as proper IPC
+      mainWindow.webContents.send('gemini:auto-spawn', {
+        tabId: geminiTabId,
+        cwd: geminiCwd,
+        yesMode: true,
+      });
+    }
+  } else {
+    // Gemini already running — deliver normally
+    deliverResultToGemini(geminiTabId, formatted, taskId, tabName || 'adopted');
+  }
 
   // 8. Update task status
   const task = mcpTasks.get(taskId);
@@ -2108,6 +2139,94 @@ async function readLatestAssistantMessage(sessionId, cwd) {
   }
   console.log('[MCP:Response] Walk exhausted after ' + walkSteps + ' steps. No assistant with text found.');
   return null;
+}
+
+// Extract lightweight session stats (turns, compacts, plan modes, forks) without building full text
+async function getSessionStats(sessionId, cwd) {
+  try {
+    const latestSessionId = resolveLatestSessionInChain(sessionId, cwd);
+    const { mergedMap: recordMap, lastRecord, sessionBoundaries } = await resolveSessionChain(latestSessionId, cwd);
+    if (!lastRecord) return null;
+
+    // Walk active branch
+    const activeBranch = [];
+    let currentUuid = lastRecord.uuid;
+    const seen = new Set();
+    while (currentUuid && !seen.has(currentUuid)) {
+      seen.add(currentUuid);
+      const record = recordMap.get(currentUuid);
+      if (!record) break;
+      activeBranch.unshift(record);
+      currentUuid = record.logicalParentUuid || record.parentUuid;
+    }
+
+    let turns = 0;
+    let compacts = 0;
+    let planModes = 0;
+    let forks = 0;
+    const segments = [];
+    const userMessages = [];
+    let currentSegTurns = 0;
+    let prevSessionId = null;
+
+    for (const entry of activeBranch) {
+      const entrySid = entry.sessionId || entry._fromFile;
+
+      // Session boundary detection (Plan Mode vs Fork)
+      if (prevSessionId && entrySid !== prevSessionId) {
+        if (currentSegTurns > 0) {
+          segments.push({ type: 'turns', count: currentSegTurns });
+          currentSegTurns = 0;
+        }
+
+        // Determine transition type: check if a bridge entry exists in recordMap 
+        // that bridges from the previous session to this one.
+        let hasBridge = false;
+        for (const [, rec] of recordMap) {
+          if (rec._isBridge && rec.sessionId === prevSessionId) {
+            hasBridge = true;
+            break;
+          }
+        }
+
+        if (hasBridge) {
+          planModes++;
+          segments.push({ type: 'plan', count: 1 });
+        } else {
+          forks++;
+          segments.push({ type: 'fork', count: 1 });
+        }
+      }
+      prevSessionId = entrySid;
+
+      if (entry.type === 'user') {
+        const content = entry.message?.content;
+        let promptText = '';
+        if (typeof content === 'string') {
+          promptText = content.trim();
+        } else if (Array.isArray(content)) {
+          promptText = content.filter(b => b.type === 'text' && b.text).map(b => b.text).join('\n').trim();
+        }
+        const onlyToolResult = Array.isArray(content) &&
+          content.every(b => b.type === 'tool_result' || (b.type === 'text' && !b.text?.trim()));
+        if (promptText && !onlyToolResult) {
+          turns++;
+          currentSegTurns++;
+          userMessages.push(promptText.length > 200 ? promptText.substring(0, 200) + '...' : promptText);
+        }
+      } else if (entry.type === 'system' && entry.subtype === 'compact_boundary') {
+        compacts++;
+        if (currentSegTurns > 0) { segments.push({ type: 'turns', count: currentSegTurns }); currentSegTurns = 0; }
+        segments.push({ type: 'compact', count: 1 });
+      }
+    }
+
+    if (currentSegTurns > 0) segments.push({ type: 'turns', count: currentSegTurns });
+
+    return { turns, compacts, planModes, forks, segments, sessions: sessionBoundaries.length + 1, userMessages };  } catch (e) {
+    console.error('[SessionStats] Error:', e.message);
+    return null;
+  }
 }
 
 // Get formatted Claude session history for MCP read_claude_history tool
@@ -4002,37 +4121,35 @@ ipcMain.handle('terminal:paste', async (event, { tabId, content, submit = true, 
   }
 });
 // Send a slash command to Claude's Ink TUI (chunked paste + echo verification)
-ipcMain.on('claude:send-command', (event, tabId, command) => {
+ipcMain.handle('claude:send-command', async (event, tabId, command) => {
   console.log('[send-command] 📩 Received: tabId=' + tabId + ' command="' + command + '" ts=' + Date.now());
   const term = terminals.get(tabId);
   if (!term) { console.log('[send-command] ❌ Terminal not found for tabId=' + tabId); return; }
-  (async () => {
-    // If in danger zone ("Press Ctrl-C again to exit" is active):
-    // Skip ctrlCFirst — input is already cleared by the first Ctrl+C.
-    // Sending another \x03 would EXIT Claude.
-    const dz = claudeCtrlCDangerZone.get(tabId);
-    if (dz) {
-      console.log('[send-command] Tab ' + tabId + ': ⚠️ Danger zone — skipping ctrlCFirst, sending command directly');
-      // Clear DZ since we're about to send a command (which cancels the warning)
-      clearTimeout(dz.timer);
-      claudeCtrlCDangerZone.delete(tabId);
-      dz.resolve();
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('claude:ctrlc-danger-zone', { tabId, active: false });
-      }
-      await safePasteAndSubmit(term, command, {
-        submit: true,
-        ctrlCFirst: false,
-        logPrefix: '[send-command:' + tabId + ']'
-      });
-    } else {
-      await safePasteAndSubmit(term, command, {
-        submit: true,
-        ctrlCFirst: true,
-        logPrefix: '[send-command:' + tabId + ']'
-      });
+  // If in danger zone ("Press Ctrl-C again to exit" is active):
+  // Skip ctrlCFirst — input is already cleared by the first Ctrl+C.
+  // Sending another \x03 would EXIT Claude.
+  const dz = claudeCtrlCDangerZone.get(tabId);
+  if (dz) {
+    console.log('[send-command] Tab ' + tabId + ': ⚠️ Danger zone — skipping ctrlCFirst, sending command directly');
+    // Clear DZ since we're about to send a command (which cancels the warning)
+    clearTimeout(dz.timer);
+    claudeCtrlCDangerZone.delete(tabId);
+    dz.resolve();
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('claude:ctrlc-danger-zone', { tabId, active: false });
     }
-  })();
+    await safePasteAndSubmit(term, command, {
+      submit: true,
+      ctrlCFirst: false,
+      logPrefix: '[send-command:' + tabId + ']'
+    });
+  } else {
+    await safePasteAndSubmit(term, command, {
+      submit: true,
+      ctrlCFirst: true,
+      logPrefix: '[send-command:' + tabId + ']'
+    });
+  }
 });
 
 // Toggle thinking mode reactively: open picker → detect state → navigate → confirm
@@ -4892,6 +5009,12 @@ ipcMain.handle('project:save-actions', (event, { projectId, actions }) => {
 ipcMain.handle('project:save-tabs', (event, { projectId, tabs, forceCleanup }) => {
   projectManager.saveProjectTabs(projectId, tabs, forceCleanup);
   return { success: true };
+});
+
+// Synchronous version for beforeunload (pkill-safe)
+ipcMain.on('project:save-tabs-sync', (event, { projectId, tabs, forceCleanup }) => {
+  projectManager.saveProjectTabs(projectId, tabs, forceCleanup);
+  event.returnValue = { success: true };
 });
 
 ipcMain.handle('project:save-metadata', (event, { projectId, metadata }) => {

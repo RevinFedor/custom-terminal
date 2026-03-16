@@ -184,6 +184,10 @@ class DatabaseManager {
       CREATE INDEX IF NOT EXISTS idx_api_call_log_type ON api_call_log(call_type);
     `);
 
+    // Migration: add session_meta and input_payload to api_call_log
+    try { this.db.exec('ALTER TABLE api_call_log ADD COLUMN session_meta TEXT'); } catch {}
+    try { this.db.exec('ALTER TABLE api_call_log ADD COLUMN input_payload TEXT'); } catch {}
+
     // Research Conversations table
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS research_conversations (
@@ -838,25 +842,20 @@ class DatabaseManager {
     }
   }
 
-  // Ensure built-in 'adopt' prompt exists (migration for existing DBs)
+  // Ensure built-in 'adopt' prompt exists and is up-to-date (migration for existing DBs)
   ensureAdoptPrompt() {
-    const exists = this.db.prepare('SELECT id FROM ai_prompts WHERE id = ?').get('adopt');
+    const adoptContent = 'Ниже — сессия разработки Claude Code. Опиши конкретно что агент делал и на чём остановился (3-7 предложений). Какие файлы менял, какие действия выполнил, что осталось незавершённым. Только факты — без оценок и рекомендаций.\n';
+    const exists = this.db.prepare('SELECT id, content FROM ai_prompts WHERE id = ?').get('adopt');
     if (!exists) {
       this.db.prepare(`
         INSERT INTO ai_prompts (id, name, content, model, thinking_level, color, is_built_in, show_in_context_menu, position)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        'adopt',
-        'Adopt Summary',
-        'Ниже — сессия разработки Claude Code. Опиши конкретно что агент делал и на чём остановился (3-7 предложений). Какие файлы менял, какие действия выполнил, что осталось незавершённым. Только факты — без оценок и рекомендаций.\n',
-        'gemini-3-flash-preview',
-        'NONE',
-        '#6366f1',
-        1,
-        0,
-        4
-      );
+      `).run('adopt', 'Adopt Summary', adoptContent, 'gemini-3-flash-preview', 'NONE', '#6366f1', 1, 0, 4);
       console.log('[DB] Migrated: added adopt prompt');
+    } else if (exists.content !== adoptContent) {
+      // Update content if it changed (built-in prompt evolution)
+      this.db.prepare('UPDATE ai_prompts SET content = ? WHERE id = ? AND is_built_in = 1').run(adoptContent, 'adopt');
+      console.log('[DB] Migrated: updated adopt prompt content');
     }
   }
 
@@ -879,11 +878,11 @@ class DatabaseManager {
 
   // ========== API CALL LOG ==========
 
-  saveApiCallLog({ projectId, callType, model, inputTokens, outputTokens, resultText, sourceTabId, sourceSessionId, targetTabId, payloadSize }) {
+  saveApiCallLog({ projectId, callType, model, inputTokens, outputTokens, resultText, sourceTabId, sourceSessionId, targetTabId, payloadSize, sessionMeta, inputPayload }) {
     return this.db.prepare(`
-      INSERT INTO api_call_log (project_id, call_type, model, input_tokens, output_tokens, result_text, source_tab_id, source_session_id, target_tab_id, payload_size)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(projectId || null, callType, model || null, inputTokens || 0, outputTokens || 0, resultText || null, sourceTabId || null, sourceSessionId || null, targetTabId || null, payloadSize || 0).lastInsertRowid;
+      INSERT INTO api_call_log (project_id, call_type, model, input_tokens, output_tokens, result_text, source_tab_id, source_session_id, target_tab_id, payload_size, session_meta, input_payload)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(projectId || null, callType, model || null, inputTokens || 0, outputTokens || 0, resultText || null, sourceTabId || null, sourceSessionId || null, targetTabId || null, payloadSize || 0, sessionMeta ? JSON.stringify(sessionMeta) : null, inputPayload || null).lastInsertRowid;
   }
 
   getApiCallLog(projectId = null, limit = 50) {

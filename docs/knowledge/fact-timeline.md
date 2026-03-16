@@ -27,6 +27,7 @@
 - **Backtrace Filtering:** Отображение только активной ветки диалога. Сообщения, отменённые через Escape или Undo, скрываются из Timeline автоматически.
 - **Auto-Refresh:** Timeline обновляется автоматически каждые **2 секунды**, чтобы отражать актуальное состояние сессии. Обновление загружает только данные из JSONL/JSON — поиск по буферу терминала для обновления самих точек не выполняется.
     - **Performance Guard (`isVisible`):** Поллинг данных и запросы к SQLite выполняются только тогда, когда Timeline реально виден пользователю. Это предотвращает лишнюю нагрузку на диск и БД.
+  - **rAF-debounced Scroll Check (Feb 2026):** Функция `checkScrollPosition` (обновляющая кнопку "scroll down" и viewport rect в registry) вызывается только один раз за кадр анимации (requestAnimationFrame). Ink differential renderer генерирует множество `onWriteParsed` событий в секунду — без дебаунса каждое событие вызывает пересчет Timeline и React re-render. rAF-дебаунс коллапсирует N событий в одно, предотвращая рывки при прокрутке длинных ответов.
 
 ### Sizing & Scrolling
 Entries используют `flex: '1 0 auto'` с минимальной высотой (20px обычные, 14px дочерние агенты, 22px tree mode).
@@ -47,7 +48,7 @@ Entries используют `flex: '1 0 auto'` с минимальной выс
 - **Reachability Guard (`canDetermineReachability`):** `checkReachability()` помечает entries как unreachable (`pos < 0`) только если терминал существует в `terminalRegistry`. Если терминала нет (startup до монтирования, HMR) — ничего не красится. Когда терминал есть, но текст entries отсутствует в буфере (процесс закрыт, буфер пуст) — все entries корректно становятся красными. Прежний guard `hasAnyPosition` (красить только если хоть одна entry найдена) ошибочно блокировал покраснение при закрытом Gemini (0 из 106 found → guard = false → ничего не красное).
 - **Boundary Gate Fix:** OSC 7777 injection в main.js гейтится на `claudeSpinnerBusy.has(tabId)` (не `bridgeKnownSessions`). См. [`fix-boundary-bridge-race.md`](fix-boundary-bridge-race.md).
 - **Opaque Dots:** Все точки используют непрозрачные (solid) цвета. Это необходимо, чтобы они полностью перекрывали центральную вертикальную линию (Central Axis), исключая визуальный мусор и «просвечивание» полосы сквозь индикаторы.
-- **Transition Policy (No Size Animation):** Точки и маркеры (fork, plan, notes) анимируют только цвет и glow, размеры меняются мгновенно. Пробовали `transition: all 0.2s` — анимация width/height элементов внутри `flex: 1 0 auto` контейнера заставляла Chromium пересчитывать flex-layout на каждом кадре (200ms × 60fps = ~12 reflow), что вызывало визуальное дрожание всех entries при наведении на одну точку.
+- **Transition Policy (Targeted, Not `all`):** Точки анимируют width, height, border-radius (0.15s), цвет и glow (0.2s). Это безопасно: максимальный размер точки (10px) всегда меньше `minHeight` сегмента (20px/14px), поэтому flex reflow не происходит. **Нельзя** использовать `transition: all` — это захватит свойства сегмента (padding, margin) и заставит Chromium пересчитывать flex-layout при наведении, вызывая дрожание всех entries.
 
 ### Кастомный скроллбар (In-strip Indicator)
 Для Timeline реализован кастомный индикатор скролла, заменяющий системный скроллбар.

@@ -2,8 +2,8 @@
 
 ---
 
-## 1. Ink/TUI Render Tearing (Input Jitter)
-**Файл-источник:** `fix-ink-tui-render-tearing.md`
+## 1. Ink/TUI Render Tearing & Synchronized Output (Input Jitter)
+**Файл-источник:** `fix-ink-tui-render-tearing.md`, `fix-terminal-jitter.md`
 
 ### Problem
 When running CLI tools built with Ink framework (e.g., Claude Code CLI, Gemini CLI), the input bar at the bottom of the terminal jitters/flickers during typing or when the tool is "thinking".
@@ -13,8 +13,10 @@ When running CLI tools built with Ink framework (e.g., Claude Code CLI, Gemini C
 - Text briefly disappears and reappears
 - Cursor position seems unstable
 - Problem is specific to Ink-based CLIs, not regular commands
+- **NEW (Feb 2026):** Viewport "drifts" or entire screen jumps mid-write due to uncontrolled sync frame rendering
 
 ### Root Cause
+#### Traditional Ink Issue
 Ink framework updates the terminal UI at very high frequency (~100 writes/sec, 9ms gaps between updates). Each update sends a sequence:
 1. `ESC[2K` - Erase line
 2. `ESC[1A` - Move cursor up
@@ -26,8 +28,19 @@ When xterm.js processes these as separate frames:
 
 The human eye perceives the empty frame as a "flash" or "jitter".
 
+#### Modern Synchronized Output (DEC 2026)
+Claude Code CLI (Feb 2026+) uses **DEC mode 2026 (Synchronized Output)** to wrap each differential frame:
+- `\x1b[?2026h` marks frame start
+- Multiple intermediate updates occur (cursor moves, line erases)
+- `\x1b[?2026l` marks frame end
+- **xterm.js 5.5.0 does NOT natively buffer these frames** — renders each escape sequence immediately
+- Result: viewport "jitters" as intermediate cursor positions become visible, causing cascading redraws
+
 ### Solution
-Implement a **Write Buffer** that batches PTY output before sending to xterm.
+Implement a **Sync Frame-Aware Write Buffer** that:
+1. **Detects DEC 2026 markers** in PTY output
+2. **Batches writes** across complete sync frames (from `\x1b[?2026h` to `\x1b[?2026l`)
+3. **Flushes atomically** ensuring xterm.js never renders intermediate states
 
 #### Key Code (renderer.js)
 ```javascript
@@ -56,11 +69,15 @@ ipcRenderer.on('terminal:data', (event, tabId, data) => {
 });
 ```
 
-#### Why FLUSH_DELAY = 10ms?
+#### Why FLUSH_DELAY = 16ms (Updated Feb 2026)?
 - 60fps = 16.67ms per frame
-- 10ms ensures we batch multiple Ink updates into single frame
-- Lower values (5ms) may still cause tearing
-- Higher values (20ms+) may feel laggy
+- Originally 10ms, increased to 16ms to align exactly with one frame
+- 16ms ensures we batch multiple Ink updates into single frame
+- Works in tandem with **Synchronized Output (DEC 2026)** protocol:
+  - Claude Code wraps each differential frame in `\x1b[?2026h` ... `\x1b[?2026l`
+  - Write buffer holds data until sync frame closes, preventing intermediate renders
+  - 16ms then flushes the complete, atomic frame to xterm.js
+- For details on sync frame awareness, see [`fix-terminal-jitter.md`](fix-terminal-jitter.md)
 
 ---
 

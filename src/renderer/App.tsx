@@ -752,6 +752,18 @@ function App() {
       ipcRenderer.invoke('terminal:create', { tabId: data.tabId, cwd: data.cwd, rows: 32, cols: 96 });
     };
 
+    // Gemini auto-spawn: main process requests Gemini launch (adopt flow)
+    const handleGeminiAutoSpawn = (_: any, data: { tabId: string; cwd: string; yesMode: boolean }) => {
+      console.warn('[Adopt:AutoSpawn] Launching Gemini for tab:', data.tabId);
+      const store = useWorkspaceStore.getState();
+      store.setTabCommandType(data.tabId, 'gemini');
+      ipcRenderer.send('gemini:spawn-with-watcher', {
+        tabId: data.tabId,
+        cwd: data.cwd,
+        yesMode: data.yesMode,
+      });
+    };
+
     ipcRenderer.on('terminal:command-started', handleCommandStarted);
     ipcRenderer.on('terminal:command-finished', handleCommandFinished);
     ipcRenderer.on('mcp:create-sub-agent-tab', handleMcpCreateSubAgent);
@@ -763,6 +775,7 @@ function App() {
     ipcRenderer.on('mcp:interceptor-state', handleInterceptorState);
     ipcRenderer.on('mcp:close-sub-agent-tab', handleMcpCloseSubAgent);
     ipcRenderer.on('mcp:respawn-sub-agent-pty', handleRespawnSubAgentPty);
+    ipcRenderer.on('gemini:auto-spawn', handleGeminiAutoSpawn);
 
     return () => {
       ipcRenderer.removeListener('terminal:command-started', handleCommandStarted);
@@ -776,6 +789,7 @@ function App() {
       ipcRenderer.removeListener('mcp:interceptor-state', handleInterceptorState);
       ipcRenderer.removeListener('mcp:close-sub-agent-tab', handleMcpCloseSubAgent);
       ipcRenderer.removeListener('mcp:respawn-sub-agent-pty', handleRespawnSubAgentPty);
+      ipcRenderer.removeListener('gemini:auto-spawn', handleGeminiAutoSpawn);
     };
   }, [openProjects.size]); // Re-init when projects change
 

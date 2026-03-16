@@ -102,7 +102,7 @@ interface WorkspaceStore {
 
   // Tab management
   createTab: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; tabType?: TabType; url?: string; background?: boolean }) => Promise<string>;
-  createTabAfterCurrent: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; tabType?: TabType; url?: string; afterTabId?: string; nameSetManually?: boolean }) => Promise<string>;
+  createTabAfterCurrent: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; tabType?: TabType; url?: string; afterTabId?: string; nameSetManually?: boolean; background?: boolean }) => Promise<string>;
   closeTab: (projectId: string, tabId: string, options?: { skipProcessCheck?: boolean; forceCleanup?: boolean }) => Promise<void>;
   switchTab: (projectId: string, tabId: string) => void;
   renameTab: (projectId: string, tabId: string, newName: string) => void;
@@ -784,9 +784,11 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     tabsArray.splice(insertIndex, 0, [tabId, newTab]);
     workspace.tabs = new Map(tabsArray);
 
-    workspace.activeTabId = tabId;
-    // Push to tab history (LRU, max 20)
-    workspace.tabHistory = [...workspace.tabHistory.filter(id => id !== tabId), tabId].slice(-20);
+    if (!options?.background) {
+      workspace.activeTabId = tabId;
+      // Push to tab history (LRU, max 20)
+      workspace.tabHistory = [...workspace.tabHistory.filter(id => id !== tabId), tabId].slice(-20);
+    }
 
     set({ openProjects: new Map(openProjects) });
 
@@ -1553,6 +1555,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   },
 
   // Mark all tabs with active AI sessions as interrupted (called on shutdown)
+  // Uses SYNCHRONOUS IPC (sendSync) to guarantee save completes before process dies (pkill-safe)
   markAllSessionsInterrupted: () => {
     const { openProjects } = get();
     let anyChanged = false;
@@ -1570,8 +1573,18 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         }
       }
       if (changed) {
-        // Save immediately (shutdown scenario)
-        saveTabs(workspace.projectId, workspace.tabs);
+        // Save synchronously — saveTabs uses async invoke() which won't complete during pkill
+        const tabsArray = Array.from(workspace.tabs.values()).map((tab) => ({
+          name: tab.name, cwd: tab.cwd, color: tab.color, isUtility: tab.isUtility,
+          commandType: tab.commandType, claudeSessionId: tab.claudeSessionId,
+          geminiSessionId: tab.geminiSessionId, wasInterrupted: tab.wasInterrupted,
+          overlayDismissed: tab.overlayDismissed, notes: tab.notes, tabType: tab.tabType,
+          url: tab.url, terminalId: tab.terminalId, terminalName: tab.terminalName,
+          activeView: tab.activeView, createdAt: tab.createdAt, isCollapsed: tab.isCollapsed,
+          nameSetManually: tab.nameSetManually, parentTabId: tab.parentTabId,
+          mcpTaskId: tab.mcpTaskId, claudeTaskCount: tab.claudeTaskCount || 0, tabId: tab.id
+        }));
+        ipcRenderer.sendSync('project:save-tabs-sync', { projectId: workspace.projectId, tabs: tabsArray });
       }
     }
     // Notify subscribers (future-proof: currently called at shutdown, but may be used elsewhere)
