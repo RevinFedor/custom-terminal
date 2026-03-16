@@ -3,12 +3,11 @@ import { createPortal } from 'react-dom';
 import { useUIStore, ApiClaudeModel, ApiGeminiModel, ThinkingLevel } from '../../../store/useUIStore';
 import { useWorkspaceStore } from '../../../store/useWorkspaceStore';
 import { useCmdKey } from '../../../hooks/useCmdHoverPopover';
+import { terminalRegistry } from '../../../utils/terminalRegistry';
 
 const { ipcRenderer } = window.require('electron');
 
-const POST_CHECK_PROMPT = `Проверь свой план по двум критериям:
-1. Есть ли в сессии места где разработчик получил 0 результатов / пустой ответ / ошибку парсинга данных, и потом выяснил что формат данных отличался от ожидаемого? Если да — это шрам формата данных, запиши.
-2. Предлагаешь ли ты изменения в CLAUDE.md? Если да — проверь: это guard rail / anti-pattern / инфраструктурная инструкция? Если нет — убери, knowledge-файлы находятся через семантический поиск.`;
+// useUIStore.getState().postCheckPrompt is now stored in useUIStore.postCheckPrompt (editable in Settings → AI)
 
 // Portal for settings menu to escape overflow and z-index issues
 const SettingsPortal: React.FC<{ children: React.ReactNode }> = ({ children }) => {
@@ -36,6 +35,7 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
   } = useUIStore();
   const { activeProjectId, createTabAfterCurrent, closeTab, getActiveProject, switchTab, getSelectedTabs, clearSelection } = useWorkspaceStore();
   const [isUpdatingDocs, setIsUpdatingDocs] = useState(false);
+  const [docsStatus, setDocsStatus] = useState('');
   const cancelledRef = useRef(false);
   const docsGeminiTabIdRef = useRef<string | null>(null);
   const [actions, setActions] = useState<Action[]>([]); // Kept for potential future use, loaded from global_commands DB table
@@ -213,15 +213,15 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
   // Wait for Gemini to settle after initial [INSERT].
   // With `-y -r` (resume + yes mode), Gemini may auto-process prefilled content or
   // stray input can trigger a THINKING phase. This function:
-  // Waits for Gemini to complete a response using "sustained IDLE" approach.
-  // Gemini spinner flickers during processing (gaps > 1.5s between Braille chars → IDLE emitted).
-  // TabBar works because React batches rapid false→true state updates, but raw IPC listeners see every flicker.
-  // Fix: after IDLE, wait sustainedMs of silence. If THINKING restarts, reset timer.
-  const waitForGeminiResponse = (tabId: string, timeoutMs: number = 180000, sustainedMs: number = 8000): Promise<boolean> => {
+  // Waits for Gemini to complete a response by checking terminal BUFFER for spinner.
+  // Spinner (Braille chars) stays on screen even when frozen — only disappears when Gemini finishes.
+  // On each IDLE event from main.js, verify: if spinner still on screen → keep waiting.
+  // If IDLE + no spinner on screen → truly done. No arbitrary timeouts needed.
+  const waitForGeminiResponse = (tabId: string, timeoutMs: number = 180000): Promise<boolean> => {
     return new Promise((resolve) => {
       const startTime = Date.now();
       let sawBusy = false;
-      let idleTimer: ReturnType<typeof setTimeout> | null = null;
+      let checkInterval: ReturnType<typeof setInterval> | null = null;
 
       const timeout = setTimeout(() => {
         cleanup();
@@ -238,6 +238,14 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
         }
       }, 5000);
 
+      const tryResolve = () => {
+        if (!terminalRegistry.hasSpinnerOnScreen(tabId)) {
+          console.warn(`[UpdateDocs] Response complete — no spinner on screen (+${Date.now() - startTime}ms)`);
+          cleanup();
+          resolve(true);
+        }
+      };
+
       const handler = (_: any, { tabId: tid, busy }: { tabId: string; busy: boolean }) => {
         if (tid !== tabId) return;
 
@@ -247,23 +255,30 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
             clearTimeout(graceTimer);
             console.warn(`[UpdateDocs] THINKING started (+${Date.now() - startTime}ms)`);
           }
-          // Cancel any pending sustained-idle timer — spinner restarted
-          if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+          // Spinner active — stop any pending buffer checks
+          if (checkInterval) { clearInterval(checkInterval); checkInterval = null; }
         } else if (sawBusy) {
-          // IDLE — start sustained timer (resolve only if silence holds for sustainedMs)
-          console.warn(`[UpdateDocs] IDLE detected, waiting ${sustainedMs}ms sustained silence (+${Date.now() - startTime}ms)`);
-          idleTimer = setTimeout(() => {
-            console.warn(`[UpdateDocs] Response complete — sustained IDLE for ${sustainedMs}ms (+${Date.now() - startTime}ms)`);
+          // main.js says IDLE — verify by checking terminal buffer
+          console.warn(`[UpdateDocs] IDLE event — checking buffer for spinner (+${Date.now() - startTime}ms)`);
+          if (!terminalRegistry.hasSpinnerOnScreen(tabId)) {
+            // Spinner truly gone from screen
+            console.warn(`[UpdateDocs] Response complete — no spinner on screen (+${Date.now() - startTime}ms)`);
             cleanup();
             resolve(true);
-          }, sustainedMs);
+          } else {
+            // Spinner still on screen (frozen) — poll buffer every 2s until it's gone
+            console.warn(`[UpdateDocs] Spinner still on screen (frozen) — polling buffer (+${Date.now() - startTime}ms)`);
+            if (!checkInterval) {
+              checkInterval = setInterval(tryResolve, 2000);
+            }
+          }
         }
       };
 
       const cleanup = () => {
         clearTimeout(timeout);
         clearTimeout(graceTimer);
-        if (idleTimer) clearTimeout(idleTimer);
+        if (checkInterval) clearInterval(checkInterval);
         ipcRenderer.removeListener('gemini:busy-state', handler);
       };
 
@@ -699,12 +714,13 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
     }
 
     setIsApiLoading(true);
+    setDocsStatus('Экспорт сессии...');
     apiCancelledRef.current = false;
 
     try {
       // 1. Export session content (or clipboard if toggle on)
       const content = await resolveDocsContent(activeProject);
-      if (!content) { setIsApiLoading(false); return; }
+      if (!content) { setIsApiLoading(false); setDocsStatus(''); return; }
 
       // 2. Get documentation prompt + knowledge base
       const systemPrompt = await getDocumentationPrompt();
@@ -715,6 +731,7 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
       const totalChars = systemPrompt.length + userText.length;
       const estTokens = Math.round(totalChars / 3.5);
       const estK = estTokens >= 1000 ? (estTokens / 1000).toFixed(1) + 'K' : String(estTokens);
+      setDocsStatus(`API ${provider} ~${estK}t...`);
       showToast(`${provider} API ~${estK} tokens...`, 'info');
 
       let responseText: string;
@@ -778,8 +795,9 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
       // 3.5. Post-check: lightweight verification of the plan
       const { postCheckDocs: postCheckEnabled } = useUIStore.getState();
       if (postCheckEnabled) {
+        setDocsStatus('Post-check...');
         showToast('Post-check...', 'info');
-        const checkPrompt = `Вот план обновления документации:\n\n${responseText}\n\n${POST_CHECK_PROMPT}`;
+        const checkPrompt = `Вот план обновления документации:\n\n${responseText}\n\n${useUIStore.getState().postCheckPrompt}`;
 
         let checkResponse: string;
         if (provider === 'gemini' || provider === 'gemini-cli') {
@@ -811,6 +829,7 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
       }
 
       // 4. Create prefilled Claude JSONL session (user intro + assistant analysis)
+      setDocsStatus('Открытие Haiku...');
       const workingDir = cwdU;
 
       const prefilledResult = await ipcRenderer.invoke('claude:create-prefilled-session', {
@@ -850,6 +869,7 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
       showToast(error.message || 'Update API → Haiku failed', 'error');
     } finally {
       setIsApiLoading(false);
+      setDocsStatus('');
     }
   };
 
@@ -876,6 +896,7 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
     cancelledRef.current = false;
     docsGeminiTabIdRef.current = null;
     setIsUpdatingDocs(true);
+    setDocsStatus('Экспорт сессии...');
 
     try {
       const tabCwd = await ipcRenderer.invoke('terminal:getCwd', activeTabId);
@@ -920,6 +941,7 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
       });
       if (!prefilledResult.success) throw new Error('Failed to create prefilled session: ' + prefilledResult.error);
       console.warn('[UpdateDocs] Prefilled session created: ' + prefilledResult.sessionId + ' (' + prefilledResult.totalChars + ' chars)');
+      setDocsStatus('Запуск Gemini...');
 
       if (cancelledRef.current) return;
 
@@ -973,6 +995,7 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
       const { postCheckDocs: postCheckOn } = useUIStore.getState();
       const mainSettlePromise = postCheckOn ? waitForGeminiResponse(newTabId, 180000) : null;
 
+      setDocsStatus('Промпт отправлен');
       console.warn('[UpdateDocs] Sending prompt to trigger Gemini response');
       await ipcRenderer.invoke('terminal:paste', {
         tabId: newTabId,
@@ -982,6 +1005,7 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
 
       // Post-check: wait for Gemini to finish main response, then send verification prompt
       if (mainSettlePromise) {
+        setDocsStatus('Ожидание ответа...');
         console.warn('[UpdateDocs] Post-check enabled — waiting for Gemini to finish main response...');
         const postSettled = await mainSettlePromise;
         if (cancelledRef.current) return;
@@ -991,14 +1015,16 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
           await new Promise(resolve => setTimeout(resolve, 500));
           if (cancelledRef.current) return;
 
+          setDocsStatus('Post-check...');
           // Same pattern: register listener before paste
           const checkSettlePromise = waitForGeminiResponse(newTabId, 180000);
           console.warn('[UpdateDocs] Sending post-check prompt');
           await ipcRenderer.invoke('terminal:paste', {
             tabId: newTabId,
-            content: POST_CHECK_PROMPT,
+            content: useUIStore.getState().postCheckPrompt,
             submit: true
           });
+          setDocsStatus('Ожидание post-check...');
           await checkSettlePromise;
         }
       }
@@ -1011,7 +1037,7 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
       console.error('[UpdateDocs] Error:', error);
       showToast(error.message || 'Update docs failed', 'error');
     } finally {
-      if (!cancelledRef.current) setIsUpdatingDocs(false);
+      if (!cancelledRef.current) { setIsUpdatingDocs(false); setDocsStatus(''); }
     }
   };
 
@@ -1409,7 +1435,16 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
                   )}
                   {showDocsInfo && renderInfoPanel(docsBlockRef, 'blue')}
                   <div className="text-[10px] mt-0.5 flex items-center gap-1.5">
-                    {isUpdatingDocs ? <span className="text-blue-600">Processing...</span> : (
+                    {isUpdatingDocs ? (
+                      <span style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', color: '#60a5fa', fontSize: '10px' }}>
+                        <span style={{
+                          display: 'inline-block', width: '6px', height: '6px',
+                          border: '1.5px solid #60a5fa', borderTopColor: 'transparent',
+                          borderRadius: '50%', animation: 'spin 0.8s linear infinite',
+                        }} />
+                        {docsStatus || 'Processing...'}
+                      </span>
+                    ) : (
                       <>
                         {/* Update API → Haiku split button — hover shows claude / gemini provider choice */}
                         <span

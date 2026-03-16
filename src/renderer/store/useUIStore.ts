@@ -265,6 +265,10 @@ interface UIStore {
   postCheckDocs: boolean;
   setPostCheckDocs: (on: boolean) => void;
 
+  // Post-check prompt text
+  postCheckPrompt: string;
+  setPostCheckPrompt: (text: string) => void;
+
 }
 
 
@@ -961,6 +965,13 @@ export const useUIStore = create<UIStore>((set, get) => ({
   setPostCheckDocs: (on) => {
     set({ postCheckDocs: on });
     localStorage.setItem('noted-terminal-post-check-docs', String(on));
+  },
+
+  // Post-check prompt text
+  postCheckPrompt: localStorage.getItem('noted-terminal-post-check-prompt') || `Проверь свой план по двум критериям:\n1. Есть ли в сессии места где разработчик получил 0 результатов / пустой ответ / ошибку парсинга данных, и потом выяснил что формат данных отличался от ожидаемого? Если да — это шрам формата данных, запиши.\n2. Предлагаешь ли ты изменения в CLAUDE.md? Если да — проверь: это guard rail / anti-pattern / инфраструктурная инструкция? Если нет — убери, knowledge-файлы находятся через семантический поиск.`,
+  setPostCheckPrompt: (text) => {
+    set({ postCheckPrompt: text });
+    localStorage.setItem('noted-terminal-post-check-prompt', text);
   },
 
   // Focus Area
