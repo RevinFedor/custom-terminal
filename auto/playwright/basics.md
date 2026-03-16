@@ -134,6 +134,57 @@ async function sendCtrlC(page, tabId) {
 }
 ```
 
+## waitForMainProcessLog: ловушка повторного вызова
+
+`waitForMainProcessLog` начинает поиск с индекса 0 при каждом вызове. Если Spinner уже был BUSY→IDLE при инициализации Claude, повторный вызов для ожидания BUSY после промпта мгновенно найдёт старый лог.
+
+```javascript
+// ПЛОХО — поймает BUSY от инициализации:
+await waitForMainProcessLog(mainProcessLogs, /Spinner.*BUSY/, 30000)
+
+// ХОРОШО — искать только новые логи:
+const logMark = mainProcessLogs.length
+// ... отправить промпт ...
+const found = await new Promise((resolve) => {
+  const start = Date.now()
+  const iv = setInterval(() => {
+    for (let i = logMark; i < mainProcessLogs.length; i++) {
+      if (/\[Spinner\].*BUSY/.test(mainProcessLogs[i])) { clearInterval(iv); resolve(true); return }
+    }
+    if (Date.now() - start > 30000) { clearInterval(iv); resolve(false) }
+  }, 150)
+})
+```
+
+## Recovery Modal (после рестарта)
+
+Если предыдущий тест убил приложение пока Claude был активен, при рестарте появится модалка восстановления (`div.absolute.inset-0.z-50`). Она блокирует все клики по терминалу.
+
+```javascript
+const modalBtn = page.locator('div.absolute.inset-0.z-50 button').first()
+if (await modalBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
+  await modalBtn.click()
+  await page.waitForTimeout(1500)
+}
+```
+
+## Паттерн Fork + Cleanup (длинные сессии)
+
+Для тестов, требующих длинную историю (scrollback, context), форкать исходную сессию перед тестом и удалять после:
+
+```javascript
+const fs = require('fs'), crypto = require('crypto')
+const forkId = crypto.randomUUID()
+const src = path.join(SESSIONS_DIR, `${SOURCE_SESSION}.jsonl`)
+const dst = path.join(SESSIONS_DIR, `${forkId}.jsonl`)
+fs.copyFileSync(src, dst)
+
+// ... launch claude -r ${forkId} ...
+
+// В finally:
+fs.unlinkSync(dst) // не занимает место на диске
+```
+
 ## Hover: эффект телепортации
 
 Playwright перемещает курсор мгновенно. Узкие триггеры (Timeline) могут не зафиксировать пересечение границы.

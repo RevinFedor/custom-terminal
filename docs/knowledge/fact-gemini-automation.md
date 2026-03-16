@@ -9,11 +9,11 @@
 1. **Commands sent when Gemini already running**: Redundant `gemini` command breaks session restore.
 2. **Commands sent before Gemini ready**: Gemini takes 2-5s to load; immediate commands are lost.
 
-### Solution: New 3-stage approach
+### Solution: New 4-stage approach
 1. **Stage 1: Detect Current State**: Use `serializeAddon` to check if Gemini prompt `>` is already visible.
 2. **Stage 2: Wait for Ready State**: If starting, wait up to 15s for "Type your message" pattern.
-3. **Stage 4: Deterministic TUI Readiness (HIDE CURSOR)**: ANSI-последовательность `HIDE CURSOR` (`\x1b[?25l`) — самый быстрый и точный сигнал готовности Ink-интерфейса Gemini. Она отправляется ровно один раз в конце инициализации.
-4. **Stage 5: Smart Execution**: Only send `gemini` if needed, then send `/chat resume`.
+3. **Stage 3: Deterministic TUI Readiness (HIDE CURSOR)**: ANSI-последовательность `HIDE CURSOR` (`\x1b[?25l`) — самый быстрый и точный сигнал готовности Ink-интерфейса Gemini. Она отправляется ровно один раз в конце инициализации.
+4. **Stage 4: Smart Execution**: Only send `gemini` if needed, then send `/chat resume`.
 
 ### Deterministic TUI Readiness: HIDE CURSOR Signal
 При холодном запуске Gemini (или перезапуске приложения) система должна дождаться полной инициализации интерфейса перед вставкой текста. **Единственный надежный сигнал готовности** — ANSI-последовательность `HIDE CURSOR` (`\x1b[?25l`), которую Gemini CLI отправляет в конце инициализации Ink-интерфейса.
