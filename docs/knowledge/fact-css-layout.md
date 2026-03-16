@@ -173,3 +173,48 @@ style={{
 }}
 ```
 Файл: `src/renderer/components/UI/Toast.tsx`.
+
+---
+
+## 16. Scrollable Absolute Overlays (Timeline Rewind Pulsations)
+
+### Проблема
+При откате в Timeline (Rewind) оверлеи анимаций (жёлтая пульсация выбранного диапазона, фиолетовая пульсация активной точки) должны были двигаться вместе с контентом при скролле. Вместо этого они "залипали" в viewport — оставались на месте, даже когда пользователь скроллил Timeline вверх/вниз.
+
+### Корневая причина
+Оверлеи использовали `position: absolute` напрямую внутри `overflow-y: auto` контейнера. По CSS-спецификации:
+- `position: absolute` внутри скролл-контейнера привязывается к viewport (экран), а не к содержимому.
+- Даже если родитель имеет `overflow: auto`, абсолютно позиционированный child останется прикреплен к экранным координатам.
+
+### Решение: Relative Wrapper
+Для привязки оверлеев к контенту (а не к экрану) требуется промежуточный контейнер с `position: relative`:
+
+```tsx
+// Скролл-контейнер с entries
+<div style={{ overflow: 'auto', height: '100%' }}>
+  {/* Relative wrapper охватывает весь скроллируемый контент */}
+  <div style={{ position: 'relative' }}>
+    {/* Entries (div'ы) */}
+    {entries.map(entry => (
+      <div key={entry.id} {...props}>
+        {/* Оверлей — теперь привязан к relative wrapper */}
+        <span style={{
+          position: 'absolute',
+          top: 0,
+          left: 0,
+          className: 'animate-pulse' // пульсация
+        }} />
+        {entry.content}
+      </div>
+    ))}
+  </div>
+</div>
+```
+
+### Invisible Intent
+Relative wrapper **не изменяет размеры** — он просто служит якорем для абсолютного позиционирования. Размеры и overflow поведение контролируются скролл-контейнером и flex-слоем entries.
+
+### Практическое применение
+- **Timeline.tsx:** Все анимационные span'ы (range pulse, entry pulse) теперь находятся внутри relative wrapper.
+- **Rewind Animations:** Желтая (`bg-yellow-400`) и фиолетовая (`bg-purple-400`) пульсации корректно движутся при скролле.
+- **Fallback:** Если wrapper не нужен (оверлей не должен скроллиться), используйте `position: fixed` для привязки к экрану.
