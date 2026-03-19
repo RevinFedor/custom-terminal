@@ -544,6 +544,9 @@ function parseOSC133AndEmit(tabId, data) {
     switch (type) {
       case 'A': // Prompt start - shell is waiting for input
         console.log(`[OSC 133] Tab ${tabId}: Prompt ready (A)`);
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('terminal:prompt-ready', tabId);
+        }
         break;
 
       case 'B': // Command start - user pressed Enter
@@ -4100,6 +4103,10 @@ ipcMain.handle('terminal:paste', async (event, { tabId, content, submit = true, 
   }
 });
 // Send a slash command to Claude's Ink TUI (chunked paste + echo verification)
+ipcMain.handle('claude:is-active', (event, tabId) => {
+  return !!claudeCliActive.get(tabId);
+});
+
 ipcMain.handle('claude:send-command', async (event, tabId, command) => {
   console.log('[send-command] 📩 Received: tabId=' + tabId + ' command="' + command + '" ts=' + Date.now());
   const term = terminals.get(tabId);

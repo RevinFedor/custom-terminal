@@ -175,6 +175,7 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
   const savedInsertionTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [draggingTextIndex, setDraggingTextIndex] = useState<number | null>(null);
   const [textDropTarget, setTextDropTarget] = useState<number | null>(null);
+  const [dragTransitionsReady, setDragTransitionsReady] = useState(false);
   const textListRef = useRef<HTMLDivElement>(null);
   const floatingCloneRef = useRef<HTMLDivElement | null>(null);
   const dragCardHeight = useRef(0);
@@ -202,6 +203,16 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
       lastActiveTab = activeTab;
     }
   }, [activeTab, isOpen]);
+
+  // Enable drag transitions after first render (so initial gap replaces hidden card instantly)
+  useEffect(() => {
+    if (draggingTextIndex !== null) {
+      const id = requestAnimationFrame(() => setDragTransitionsReady(true));
+      return () => cancelAnimationFrame(id);
+    } else {
+      setDragTransitionsReady(false);
+    }
+  }, [draggingTextIndex]);
 
   // Load all data on open
   useEffect(() => {
@@ -397,6 +408,7 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
         floatingCloneRef.current.remove();
         floatingCloneRef.current = null;
       }
+      setDragTransitionsReady(false);
       setDraggingTextIndex((fromIdx) => {
         setTextDropTarget((toPos) => {
           if (fromIdx !== null && toPos !== null) {
@@ -1133,27 +1145,28 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                       <button onClick={addPrompt} style={{ padding: '4px 10px', backgroundColor: '#8b5cf6', color: '#fff', border: 'none', borderRadius: '4px', fontSize: '10px', cursor: 'pointer' }}>+ Добавить</button>
                     </div>
 
-                    <div ref={textListRef} style={{ display: 'flex', flexDirection: 'column', gap: '8px', overflowY: 'auto', flex: 1, minHeight: 0 }}>
+                    <div ref={textListRef} style={{ display: 'flex', flexDirection: 'column', overflowY: 'auto', flex: 1, minHeight: 0 }}>
                       {prompts.length === 0 ? (
                         <div style={{ padding: '24px', textAlign: 'center', color: '#555', fontSize: '12px', border: '2px dashed #333', borderRadius: '10px' }}>Пока нет промптов</div>
                       ) : (
                         prompts.map((prompt, index) => {
                           const isSelected = editingInsertionIndex === index;
                           const isDragged = draggingTextIndex === index;
-                          const showGapBefore = draggingTextIndex !== null && textDropTarget === index;
-                          const isLast = index === prompts.length - 1;
-                          const showGapAfter = isLast && draggingTextIndex !== null && textDropTarget === prompts.length;
+                          const isGapHere = draggingTextIndex !== null && textDropTarget === index;
+                          const gapH = dragCardHeight.current;
+                          const gapTransition = dragTransitionsReady ? 'height 0.12s ease-out, margin-bottom 0.12s ease-out' : 'none';
                           return (
                             <React.Fragment key={index}>
-                              {showGapBefore && (
-                                <div style={{ height: `${dragCardHeight.current}px`, borderRadius: '10px', border: '2px dashed #8b5cf640', backgroundColor: '#8b5cf608', boxSizing: 'border-box' as const, animation: 'settingsGapIn 0.1s ease-out' }} />
-                              )}
+                              {/* Gap slot — always rendered, height animates */}
+                              <div style={{ height: isGapHere ? `${gapH}px` : '0px', marginBottom: isGapHere ? '8px' : '0px', overflow: 'hidden', transition: gapTransition, boxSizing: 'border-box' as const }}>
+                                <div style={{ height: `${gapH}px`, borderRadius: '10px', border: '2px dashed #8b5cf640', backgroundColor: '#8b5cf608', boxSizing: 'border-box' as const }} />
+                              </div>
                               <div
                                 data-text-card
                                 data-hidden={isDragged || undefined}
                                 data-orig-index={index}
                                 onClick={() => !isDragged && startEditingInsertion(index)}
-                                style={{ padding: '10px 12px', backgroundColor: isSelected ? '#252525' : '#222', border: isSelected ? '2px solid #8b5cf6' : '2px solid #333', borderRadius: '10px', cursor: 'pointer', display: isDragged ? 'none' : 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px' }}
+                                style={{ padding: '10px 12px', marginBottom: '8px', backgroundColor: isSelected ? '#252525' : '#222', border: isSelected ? '2px solid #8b5cf6' : '2px solid #333', borderRadius: '10px', cursor: 'pointer', display: isDragged ? 'none' : 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px' }}
                               >
                                 <span style={{ fontSize: '13px', color: isSelected ? '#8b5cf6' : '#fff', fontWeight: '500', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{prompt.title}</span>
                                 <div
@@ -1164,12 +1177,15 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                                   {[...Array(6)].map((_, i) => <div key={i} style={{ width: '3px', height: '3px', borderRadius: '50%', backgroundColor: '#555' }} />)}
                                 </div>
                               </div>
-                              {showGapAfter && (
-                                <div style={{ height: `${dragCardHeight.current}px`, borderRadius: '10px', border: '2px dashed #8b5cf640', backgroundColor: '#8b5cf608', boxSizing: 'border-box' as const, animation: 'settingsGapIn 0.1s ease-out' }} />
-                              )}
                             </React.Fragment>
                           );
                         })
+                      )}
+                      {/* Gap slot after last item */}
+                      {prompts.length > 0 && (
+                        <div style={{ height: (draggingTextIndex !== null && textDropTarget === prompts.length) ? `${dragCardHeight.current}px` : '0px', overflow: 'hidden', transition: dragTransitionsReady ? 'height 0.12s ease-out' : 'none', boxSizing: 'border-box' as const }}>
+                          <div style={{ height: `${dragCardHeight.current}px`, borderRadius: '10px', border: '2px dashed #8b5cf640', backgroundColor: '#8b5cf608', boxSizing: 'border-box' as const }} />
+                        </div>
                       )}
                     </div>
                   </>

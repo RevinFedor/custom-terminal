@@ -258,11 +258,49 @@ await waitForMainProcessLog(mainProcessLogs, /BoundaryMarker.*prompt #\d/, 30000
 await waitForMainProcessLog(mainProcessLogs, 'Prompt ready (A)', 5000)
 ```
 
+### Детерминированные сигналы процесса Claude
+
+Claude CLI lifecycle отслеживается через OSC 133 и IPC-события. **Используй их вместо таймаутов:**
+
+| Сигнал | IPC / Лог | Когда использовать |
+|--------|-----------|-------------------|
+| Shell prompt ready | `terminal:prompt-ready` (IPC event, OSC 133 A) | После выхода из Claude CLI (Ctrl+C) — ждать перед отправкой следующей команды |
+| Claude CLI exited | `claudeCliActive.delete()` (OSC 133 D) / `claude:is-active` (IPC handle) | Проверить что Claude действительно вышел, а не просто отменил операцию |
+| Claude busy | `claude:busy-state` (IPC event) / `[Spinner].*BUSY` (main log) | Ждать начала обработки запроса |
+| Claude idle | `claude:busy-state` busy=false / `[Spinner].*IDLE` (main log) | Ждать завершения ответа |
+| Session ID captured | `waitForClaudeSessionId(page)` (Zustand poll) | Ждать привязки сессии к табу |
+
+**Паттерн: выход из Claude CLI и перезапуск:**
+```javascript
+// 1. Ctrl+C × 2 (exit Claude)
+ipcRenderer.send('terminal:input', tabId, '\x03')
+await sleep(500)
+ipcRenderer.send('terminal:input', tabId, '\x03')
+
+// 2. Ждать shell prompt (детерминированно, не таймаут)
+await waitForIPCEvent('terminal:prompt-ready', tabId, 5000)
+
+// 3. Теперь безопасно отправлять команду в shell
+ipcRenderer.send('claude:run-command', { tabId, command: 'claude-c', sessionId })
+```
+
+### Скриншоты в E2E тестах (обязательно)
+
+**Каждый E2E тест ДОЛЖЕН делать скриншоты** после критических шагов. Без них диагностика провалов невозможна — логи не показывают состояние терминала.
+
+```javascript
+await page.screenshot({ path: '/tmp/test-name-step-N.png' })
+log.info('Screenshot: /tmp/test-name-step-N.png')
+```
+
+Минимум: после открытия UI-элемента, после apply/submit, финальное состояние.
+
 ### Допустимые фиксированные задержки
 
 Только когда нет сигнала для ожидания:
 - `100ms` между набором и Enter (keyboard simulation)
 - `300ms` для анимации контекстного меню
+- `1000ms` после создания таба (shell init, до первого OSC 133 A)
 - `8000ms` retry после падения Electron
 
 ---
@@ -391,3 +429,8 @@ node auto/sandbox/test-orchestration-full.js 2>&1 | tee /tmp/test-orchestration-
 | `waitForMainProcessLog` после повторного Spinner | Ловит старый BUSY/IDLE от инициализации, тест проходит без реальной работы | Трекать `mainProcessLogs.length` и искать только новые записи. См. `playwright/basics.md` |
 | `getBoundingClientRect()` для поиска активного viewport | Скрытые табы (`visibility:hidden`) имеют ненулевые размеры | Проверять `getComputedStyle(el).visibility`. См. `libraries/xterm.md` |
 | `WheelEvent` для скролла xterm | xterm.js игнорирует синтетические wheel events | Устанавливать `viewport.scrollTop` напрямую. См. `libraries/xterm.md` |
+| `terminal:input` с объектом `{ tabId, data }` | Ctrl+C не доходит — сигнатура `(event, tabId, data)` принимает 2 отдельных аргумента | `ipcRenderer.send('terminal:input', tabId, data)` — не объект |
+| `terminal:kill` перед `claude:run-command` | PTY удаляется из `terminals` Map, `run-command` не находит терминал | Не убивать PTY. Отправить Ctrl+C × 2, дождаться `terminal:prompt-ready` (OSC 133 A), затем `claude:run-command` |
+| `focusWindow` сразу после `launch()` | Execution context destroyed — Electron перезагружает окно при restore | Оборачивать `focusWindow` в retry (3 попытки, 1с пауза) |
+| `typeCommand` когда shell не готов | Первые символы (`cd `) поглощаются shell-инициализацией, набирается только путь → `permission denied` | Ждать 1с после создания таба или дождаться OSC 133 A перед набором |
+| Скриншоты отсутствуют в тесте | Невозможно диагностировать состояние терминала при падении | **Обязательно** делать `page.screenshot()` после каждого критического шага (панель открыта, apply, финал) |
