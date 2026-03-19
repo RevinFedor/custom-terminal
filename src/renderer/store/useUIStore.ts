@@ -183,6 +183,10 @@ interface UIStore {
 
   setNotesPanelWidth: (width: number) => void;
 
+  // Edit Range Panel Size
+  editRangePanelSize: { width: number; height: number };
+  setEditRangePanelSize: (size: { width: number; height: number }) => void;
+
   // Drag Area Width (title bar window drag handle)
   dragAreaWidth: number;
   setDragAreaWidth: (width: number) => void;
@@ -786,6 +790,10 @@ export const useUIStore = create<UIStore>((set, get) => ({
   // Notes Panel Width
   notesPanelWidth: 300,
   setNotesPanelWidth: (width) => set({ notesPanelWidth: Math.max(150, Math.min(600, width)) }),
+
+  // Edit Range Panel Size (clamping done in component based on viewport)
+  editRangePanelSize: { width: 380, height: 420 },
+  setEditRangePanelSize: (size) => set({ editRangePanelSize: size }),
 
   // Drag Area Width
   dragAreaWidth: initialDragAreaWidth,

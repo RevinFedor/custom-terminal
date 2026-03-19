@@ -728,6 +728,170 @@ function register({ projectManager, formatToolAction }) {
     }
   });
 
+  // Edit range: remove entries from JSONL and insert compact summary
+  // Flow: read file → backtrace → remove range → insert compact entry → relink → write atomically
+  ipcMain.handle('claude:edit-range', async (event, { sessionId, cwd, startUuid, endUuid, compactText }) => {
+    console.log('[EditRange] ========================================');
+    console.log('[EditRange] Session:', sessionId, 'Range:', startUuid?.slice(0, 8), '→', endUuid?.slice(0, 8));
+
+    try {
+      const found = findSessionFile(sessionId, cwd);
+      if (!found) return { success: false, error: 'Session file not found' };
+
+      const filePath = found.filePath;
+      const content = await fs.promises.readFile(filePath, 'utf-8');
+      const lines = content.split('\n').filter(l => l.trim());
+
+      // Parse all records
+      const allRecords = [];
+      const recordMap = new Map();
+      for (const line of lines) {
+        try {
+          const entry = JSON.parse(line);
+          allRecords.push(entry);
+          if (entry.uuid) recordMap.set(entry.uuid, entry);
+        } catch { allRecords.push(null); }
+      }
+
+      // Build backtrace chain (active branch) to identify the range
+      const lastRecord = allRecords.filter(r => r?.uuid).pop();
+      if (!lastRecord) return { success: false, error: 'No records in file' };
+
+      const activeBranch = [];
+      let cur = lastRecord.uuid;
+      const seen = new Set();
+      while (cur && !seen.has(cur)) {
+        seen.add(cur);
+        const rec = recordMap.get(cur);
+        if (!rec) break;
+        activeBranch.unshift(rec);
+        cur = rec.logicalParentUuid || rec.parentUuid;
+      }
+
+      // Find range indices in active branch
+      const startIdx = activeBranch.findIndex(e => e.uuid === startUuid);
+      const endIdx = activeBranch.findIndex(e => e.uuid === endUuid);
+      if (startIdx === -1 || endIdx === -1) {
+        return { success: false, error: 'Range UUIDs not found in active branch' };
+      }
+      const rangeStart = Math.min(startIdx, endIdx);
+      const rangeEnd = Math.max(startIdx, endIdx);
+
+      // Expand range to complete turns (include assistant after each user, user after each assistant)
+      let expandedStart = rangeStart;
+      let expandedEnd = rangeEnd;
+      // Expand backwards: if first entry is assistant with tool_result user before it
+      while (expandedStart > 0) {
+        const prev = activeBranch[expandedStart - 1];
+        const curr = activeBranch[expandedStart];
+        if (curr.type === 'user' && curr.message?.content &&
+            Array.isArray(curr.message.content) &&
+            curr.message.content.some(b => b.type === 'tool_result')) {
+          expandedStart--;
+        } else break;
+      }
+      // Expand forwards: if last entry is assistant with tool_use, include following tool_result user
+      while (expandedEnd < activeBranch.length - 1) {
+        const curr = activeBranch[expandedEnd];
+        const next = activeBranch[expandedEnd + 1];
+        if (curr.type === 'assistant' && next.type === 'user' &&
+            next.message?.content && Array.isArray(next.message.content) &&
+            next.message.content.some(b => b.type === 'tool_result')) {
+          expandedEnd++;
+        } else break;
+      }
+
+      console.log('[EditRange] Range:', rangeStart, '→', rangeEnd, 'Expanded:', expandedStart, '→', expandedEnd,
+        'of', activeBranch.length, 'active entries');
+
+      // Collect UUIDs to remove
+      const removeUuids = new Set();
+      for (let i = expandedStart; i <= expandedEnd; i++) {
+        removeUuids.add(activeBranch[i].uuid);
+      }
+
+      // Also remove progress entries linked to removed tool_use blocks
+      for (const rec of allRecords) {
+        if (!rec) continue;
+        if (rec.type === 'progress' && rec.parentToolUseID) {
+          // Check if the parent tool_use is in a removed assistant entry
+          for (let i = expandedStart; i <= expandedEnd; i++) {
+            const entry = activeBranch[i];
+            if (entry.type === 'assistant' && entry.message?.content) {
+              const blocks = Array.isArray(entry.message.content) ? entry.message.content : [];
+              if (blocks.some(b => b.type === 'tool_use' && b.id === rec.parentToolUseID)) {
+                removeUuids.add(rec.uuid);
+              }
+            }
+          }
+        }
+      }
+
+      console.log('[EditRange] Removing', removeUuids.size, 'records (incl progress)');
+
+      // Create compact replacement entry
+      const entryBefore = expandedStart > 0 ? activeBranch[expandedStart - 1] : null;
+      const entryAfter = expandedEnd < activeBranch.length - 1 ? activeBranch[expandedEnd + 1] : null;
+      const compactUuid = crypto.randomUUID();
+
+      const compactEntry = {
+        parentUuid: entryBefore?.uuid || null,
+        isSidechain: false,
+        userType: 'external',
+        cwd: cwd || '',
+        sessionId: sessionId,
+        version: '1.0.0',
+        type: 'user',
+        message: { role: 'user', content: compactText },
+        uuid: compactUuid,
+        timestamp: new Date().toISOString()
+      };
+
+      // Build output: filter removed, relink entry after range, append compact
+      const outputLines = [];
+      for (const rec of allRecords) {
+        if (!rec) continue;
+        if (removeUuids.has(rec.uuid)) continue;
+
+        // Relink: entry after range points to compact entry instead of last removed
+        if (entryAfter && rec.uuid === entryAfter.uuid) {
+          rec.parentUuid = compactUuid;
+        }
+
+        outputLines.push(JSON.stringify(rec));
+      }
+
+      // Insert compact entry (before the entry-after-range for logical order)
+      if (entryAfter) {
+        const afterIdx = outputLines.findIndex(l => {
+          try { return JSON.parse(l).uuid === entryAfter.uuid; } catch { return false; }
+        });
+        if (afterIdx !== -1) {
+          outputLines.splice(afterIdx, 0, JSON.stringify(compactEntry));
+        } else {
+          outputLines.push(JSON.stringify(compactEntry));
+        }
+      } else {
+        outputLines.push(JSON.stringify(compactEntry));
+      }
+
+      // Write atomically: tmp file → rename
+      const tmpPath = filePath + '.edit-tmp';
+      await fs.promises.writeFile(tmpPath, outputLines.join('\n') + '\n', 'utf-8');
+      await fs.promises.rename(tmpPath, filePath);
+
+      // Invalidate cache
+      _jsonlCache.delete(filePath);
+
+      console.log('[EditRange] Written', outputLines.length, 'records to', filePath);
+      return { success: true, removedCount: removeUuids.size, compactUuid };
+
+    } catch (error) {
+      console.error('[EditRange] Error:', error);
+      return { success: false, error: error.message };
+    }
+  });
+
   // Get fork markers for a session (for Timeline blue lines)
   ipcMain.handle('claude:get-fork-markers', async (event, { sessionId }) => {
     if (!sessionId) return { success: false, error: 'No session ID', markers: [] };

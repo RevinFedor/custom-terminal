@@ -5,6 +5,7 @@ import { terminalRegistry } from '../../utils/terminalRegistry';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { usePromptsStore } from '../../store/usePromptsStore';
+import EditRangePanel from './EditRangePanel';
 
 const { ipcRenderer, clipboard } = window.require('electron');
 
@@ -228,6 +229,20 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   const [clickedState, setClickedState] = useState<{ index: number; status: 'loading' | 'failed' } | null>(null);
   const [rewindState, setRewindState] = useState<{ index: number; phase: 'compacting' | 'rewinding' | 'pasting' | 'done' } | null>(null);
 
+  // Edit Range state
+  const [editRangeState, setEditRangeState] = useState<{
+    range: { startIndex: number; endIndex: number };
+    phase: 'loading' | 'ready' | 'applying';
+    sourceContent: string;
+    compactText: string;
+  } | null>(null);
+  // Range action menu — appears after second click to choose Copy or Edit
+  const [rangeActionMenu, setRangeActionMenu] = useState<{
+    x: number; y: number;
+    range: { startIndex: number; endIndex: number };
+    startUuid: string; endUuid: string;
+  } | null>(null);
+
   // Phase 2: Collapsible groups
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
   // Phase 3: Tree view (per-tab, persisted in UIStore)
@@ -274,6 +289,19 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   const noteTextareaRef = useRef<HTMLTextAreaElement>(null);
   const noteTooltipRef = useRef<HTMLDivElement>(null);
   const [hoveredNoteIndex, setHoveredNoteIndex] = useState<number | null>(null);
+
+  // Lock timeline scroll when edit range panel is open
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el || !editRangeState) return;
+    const prevent = (e: Event) => e.preventDefault();
+    el.addEventListener('wheel', prevent, { passive: false });
+    el.addEventListener('touchmove', prevent, { passive: false });
+    return () => {
+      el.removeEventListener('wheel', prevent);
+      el.removeEventListener('touchmove', prevent);
+    };
+  }, [!!editRangeState]);
 
   // Compute group map for sub-agent entries (Phase 2)
   const groupMap = useMemo(() => computeGroups(entries), [entries]);
@@ -882,16 +910,44 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
 
   const clickTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const handleEntryClick = (entry: TimelineEntry) => {
-    // Если режим копирования активен — реагируем сразу (без задержки)
+  const justSetRangeMenuRef = useRef(false);
+
+  const handleEntryClick = (entry: TimelineEntry, e?: React.MouseEvent) => {
+    // Если режим выделения активен — показываем меню выбора действия
     if (selectionStartIdRef.current) {
       if (selectionStartIdRef.current === entry.uuid) {
         // Клик по той же точке → отменить выделение
         selectionStartIdRef.current = null;
         setSelectionStartId(null);
       } else {
-        // Клик по другой точке → копировать
-        finishRangeSelection(entry);
+        // Клик по другой точке → показать popup "Копировать / Редактировать"
+        const startId = selectionStartIdRef.current;
+        const startIndex = entries.findIndex(e => e.uuid === startId);
+        const endIndex = entries.findIndex(e => e.uuid === entry.uuid);
+        const range = {
+          startIndex: Math.min(startIndex, endIndex),
+          endIndex: Math.max(startIndex, endIndex),
+        };
+
+        // Get click position from the entry's DOM element
+        const el = segmentRefs.current[Math.max(startIndex, endIndex)];
+        const containerRect = containerRef.current?.getBoundingClientRect();
+        let x = containerRect ? containerRect.left - 170 : 100;
+        let y = el ? el.getBoundingClientRect().top : 100;
+
+        // Clamp to viewport
+        if (x < 10) x = 10;
+        if (y + 80 > window.innerHeight) y = window.innerHeight - 90;
+
+        // Prevent handleClickOutside from immediately clearing the menu
+        justSetRangeMenuRef.current = true;
+        if (e) e.stopPropagation();
+
+        setRangeActionMenu({
+          x, y, range,
+          startUuid: entries[range.startIndex].uuid,
+          endUuid: entries[range.endIndex].uuid,
+        });
       }
       return;
     }
@@ -1038,7 +1094,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
 
     // Context menu dimensions (approximate)
     const menuWidth = 160;
-    const menuHeight = selectionStartIdRef.current ? 40 : 148;
+    const menuHeight = selectionStartIdRef.current ? 40 : 90;
 
     // Position: right-center of cursor
     let x = e.pageX + 4;
@@ -1068,40 +1124,106 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     setContextMenu(null);
   };
 
-  const finishRangeSelection = async (endEntry: TimelineEntry) => {
-    const startId = selectionStartIdRef.current;
-    if (!startId || !sessionId) return;
+  const executeRangeAction = async (mode: 'copy' | 'edit', range: { startIndex: number; endIndex: number }, startUuid: string, endUuid: string) => {
+    if (!sessionId) return;
 
-    const startIndex = entries.findIndex(e => e.uuid === startId);
-    const endIndex = entries.findIndex(e => e.uuid === endEntry.uuid);
-    const range = {
-      startIndex: Math.min(startIndex, endIndex),
-      endIndex: Math.max(startIndex, endIndex),
-    };
-
-    // Clear selection, show blinking blue (loading state)
+    // Clear selection
     selectionStartIdRef.current = null;
     setSelectionStartId(null);
-    setContextMenu(null);
+    setRangeActionMenu(null);
+
+    if (mode === 'edit') {
+      // Edit mode: fetch range content → send to Gemini for compact → open panel
+      setEditRangeState({ range, phase: 'loading', sourceContent: '', compactText: '' });
+
+      try {
+        const result = await ipcRenderer.invoke('claude:copy-range', {
+          sessionId,
+          cwd,
+          startUuid,
+          endUuid,
+          includeEditing: true,
+          includeReading: false,
+        });
+
+        if (!result.success) {
+          setEditRangeState(null);
+          return;
+        }
+
+        const sourceContent = result.content;
+
+        // Send to Gemini API with rewind prompt
+        const { getPromptById, rewindPromptId } = usePromptsStore.getState();
+        const promptConfig = getPromptById(rewindPromptId);
+
+        if (!promptConfig) {
+          console.warn('[EditRange] No rewind prompt configured');
+          setEditRangeState(null);
+          return;
+        }
+
+        const apiKey = process.env.GEMINI_API_KEY || 'REDACTED_GEMINI_KEY';
+        const model = promptConfig.model;
+        const fullPrompt = promptConfig.content + sourceContent;
+
+        const requestBody: any = {
+          contents: [{ parts: [{ text: fullPrompt }] }],
+        };
+
+        if (model.includes('gemini-3') && promptConfig.thinkingLevel !== 'NONE') {
+          requestBody.generationConfig = {
+            thinkingConfig: { thinkingLevel: promptConfig.thinkingLevel }
+          };
+        }
+
+        console.warn('[EditRange] Sending to Gemini, model:', model);
+        const response = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(requestBody),
+          }
+        );
+
+        const data = await response.json();
+        const compactText = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+
+        if (!compactText) {
+          console.error('[EditRange] Gemini returned empty response');
+          setEditRangeState(null);
+          return;
+        }
+
+        console.warn('[EditRange] Compact ready, length:', compactText.length);
+        setEditRangeState({ range, phase: 'ready', sourceContent, compactText });
+
+      } catch (err: any) {
+        console.error('[EditRange] Failed:', err);
+        setEditRangeState(null);
+      }
+      return;
+    }
+
+    // Copy mode
     setCopyingRange(range);
 
     try {
       const result = await ipcRenderer.invoke('claude:copy-range', {
         sessionId,
         cwd,
-        startUuid: startId,
-        endUuid: endEntry.uuid,
+        startUuid,
+        endUuid,
         includeEditing: copyIncludeEditing,
         includeReading: copyIncludeReading,
       });
 
-      // Loading done — hide blinking blue
       setCopyingRange(null);
 
       if (result.success) {
         clipboard.writeText(result.content);
 
-        // Show green success flash
         setCopiedRange(range);
         setTimeout(() => {
           setCopiedRange(null);
@@ -1137,6 +1259,12 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       if (isNoteEditing) {
         setIsNoteEditing(false);
         setActiveNoteIndex(null);
+      }
+      // Close range action menu on outside click (skip if just opened)
+      if (justSetRangeMenuRef.current) {
+        justSetRangeMenuRef.current = false;
+      } else {
+        setRangeActionMenu(null);
       }
       // Cancel range selection if clicking outside timeline
       if (selectionStartIdRef.current && containerRef.current && !containerRef.current.contains(e.target as Node)) {
@@ -1737,7 +1865,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                         return next;
                       });
                     } else {
-                      handleEntryClick(entry);
+                      handleEntryClick(entry, e);
                     }
                   }}
                   onDoubleClick={() => handleEntryDoubleClick(entry)}
@@ -1891,8 +2019,26 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
           })}
         </div>
 
-        {/* Selection Range Indicator (active selection) */}
-        {isVisible && selectionStartId && hoveredIndex !== null && (() => {
+        {/* Selected Range Indicator (static, when action menu is open) */}
+        {isVisible && rangeActionMenu && (() => {
+          const rect = getOverlayRect(rangeActionMenu.range.startIndex, rangeActionMenu.range.endIndex);
+          return rect && (
+            <div
+              className="absolute left-0 right-0 pointer-events-none"
+              style={{
+                top: rect.top,
+                height: rect.height,
+                backgroundColor: 'rgba(59, 130, 246, 0.15)',
+                borderTop: '1px solid rgba(59, 130, 246, 0.4)',
+                borderBottom: '1px solid rgba(59, 130, 246, 0.4)',
+                boxShadow: '0 0 8px rgba(59, 130, 246, 0.2)',
+              }}
+            />
+          );
+        })()}
+
+        {/* Selection Range Indicator (hover preview during selection) */}
+        {isVisible && selectionStartId && !rangeActionMenu && hoveredIndex !== null && (() => {
           const startIdx = entries.findIndex(e => e.uuid === selectionStartId);
           const rect = getOverlayRect(Math.min(startIdx, hoveredIndex), Math.max(startIdx, hoveredIndex));
           return rect && (
@@ -1968,7 +2114,90 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
           );
         })()}
 
+        {/* Edit Range Overlay */}
+        {isVisible && editRangeState && (() => {
+          const rect = getOverlayRect(editRangeState.range.startIndex, editRangeState.range.endIndex);
+          const isLoading = editRangeState.phase === 'loading';
+          const isReady = editRangeState.phase === 'ready';
+          return rect && (
+            <div
+              className={`absolute left-0 right-0 pointer-events-none ${isLoading ? 'animate-pulse' : ''}`}
+              style={{
+                top: rect.top,
+                height: rect.height,
+                backgroundColor: isReady
+                  ? 'rgba(34, 197, 94, 0.15)'
+                  : 'rgba(236, 72, 153, 0.15)',
+                borderTop: `1px solid ${isReady ? 'rgba(34, 197, 94, 0.5)' : 'rgba(236, 72, 153, 0.5)'}`,
+                borderBottom: `1px solid ${isReady ? 'rgba(34, 197, 94, 0.5)' : 'rgba(236, 72, 153, 0.5)'}`,
+                boxShadow: `0 0 12px ${isReady ? 'rgba(34, 197, 94, 0.3)' : 'rgba(236, 72, 153, 0.3)'}`,
+              }}
+            />
+          );
+        })()}
+
           </div>{/* end inner relative wrapper */}
+
+        {/* Edit Range Panel (portal) */}
+        {editRangeState && editRangeState.phase === 'ready' && (() => {
+          // Use getBoundingClientRect for viewport-accurate coordinates (not content-space)
+          const startEl = segmentRefs.current[editRangeState.range.startIndex];
+          const endEl = segmentRefs.current[editRangeState.range.endIndex];
+          if (!startEl || !endEl || !containerRef.current) return null;
+          const startRect = startEl.getBoundingClientRect();
+          const endRect = endEl.getBoundingClientRect();
+          const anchorTop = startRect.top;
+          const anchorHeight = endRect.bottom - startRect.top;
+          const containerRect = containerRef.current.getBoundingClientRect();
+          const rightOffset = window.innerWidth - containerRect.left + 8;
+          return (
+            <EditRangePanel
+              sourceContent={editRangeState.sourceContent}
+              initialCompact={editRangeState.compactText}
+              anchorTop={anchorTop}
+              anchorHeight={anchorHeight}
+              rightOffset={rightOffset}
+              onApply={async (compactText) => {
+                console.warn('[EditRange] Applying, compact length:', compactText.length);
+                setEditRangeState(prev => prev ? { ...prev, phase: 'applying' } : null);
+
+                const range = editRangeState!.range;
+                const startUuid = entries[range.startIndex].uuid;
+                const endUuid = entries[range.endIndex].uuid;
+
+                // Step 1: Kill Claude if running
+                if (isActive) {
+                  console.warn('[EditRange] Killing Claude process...');
+                  ipcRenderer.send('terminal:kill', tabId);
+                  await new Promise(resolve => setTimeout(resolve, 500));
+                }
+
+                // Step 2: Edit JSONL
+                console.warn('[EditRange] Editing JSONL...');
+                const result = await ipcRenderer.invoke('claude:edit-range', {
+                  sessionId, cwd, startUuid, endUuid, compactText,
+                });
+
+                if (!result.success) {
+                  throw new Error(result.error);
+                }
+
+                console.warn('[EditRange] Removed', result.removedCount, 'records');
+
+                // Step 3: Restart Claude with -c (continue)
+                console.warn('[EditRange] Restarting Claude...');
+                ipcRenderer.send('claude:run-command', {
+                  tabId,
+                  command: 'claude-c',
+                  sessionId,
+                });
+
+                return { removedCount: result.removedCount };
+              }}
+              onClose={() => setEditRangeState(null)}
+            />
+          );
+        })()}
 
         {/* Tooltip Portal with CSS Bridge */}
         {isVisible && activeTooltipIndex !== null && currentActiveEntry && tooltipPos && (
@@ -2167,25 +2396,6 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
             >
               {!selectionStartId ? (
                 <>
-                  {/* Range copy — Claude only */}
-                  {!isGemini && (
-                    <button
-                      className="w-full text-left px-3 py-2 text-xs text-white hover:bg-blue-600 rounded transition-colors cursor-pointer"
-                      onClick={(e) => { e.stopPropagation(); startRangeSelection(contextMenu.entry); }}
-                    >
-                      Начать копирование
-                    </button>
-                  )}
-                  <button
-                    className="w-full text-left px-3 py-2 text-xs text-white/60 hover:bg-white/5 rounded transition-colors cursor-pointer"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      clipboard.writeText(contextMenu.entry.content);
-                      setContextMenu(null);
-                    }}
-                  >
-                    Копировать текст сообщения
-                  </button>
                   <button
                     className="w-full text-left px-3 py-2 text-xs text-purple-400 hover:bg-purple-600/20 rounded transition-colors cursor-pointer flex items-center gap-2"
                     onClick={(e) => {
@@ -2216,11 +2426,82 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                     e.stopPropagation();
                     selectionStartIdRef.current = null;
                     setSelectionStartId(null);
+                    setRangeActionMenu(null);
                     setContextMenu(null);
                   }}
                 >
-                  Отменить копирование
+                  Отменить выделение
                 </button>
+              )}
+            </div>
+          </TooltipPortal>
+        )}
+
+        {/* Range Action Menu — appears after selecting range (double-click start + click end) */}
+        {isVisible && rangeActionMenu && (
+          <TooltipPortal>
+            <div
+              onMouseLeave={() => {
+                setRangeActionMenu(null);
+                selectionStartIdRef.current = null;
+                setSelectionStartId(null);
+              }}
+              onClick={(e) => e.stopPropagation()}
+              style={{
+                position: 'fixed',
+                left: rangeActionMenu.x,
+                top: rangeActionMenu.y,
+                backgroundColor: '#1a1a1a',
+                border: '1px solid #333',
+                borderRadius: '6px',
+                padding: '4px',
+                zIndex: 10001,
+                minWidth: '170px',
+                boxShadow: '0 4px 16px rgba(0,0,0,0.6)',
+              }}
+            >
+              <button
+                className="w-full text-left px-3 py-2 text-xs text-white hover:bg-blue-600/80 rounded transition-colors cursor-pointer"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  executeRangeAction('copy', rangeActionMenu.range, rangeActionMenu.startUuid, rangeActionMenu.endUuid);
+                }}
+              >
+                Копировать ({rangeActionMenu.range.endIndex - rangeActionMenu.range.startIndex + 1})
+              </button>
+              {!isGemini && (
+                <div className="flex rounded overflow-hidden">
+                  <button
+                    className="flex-1 text-left px-3 py-2 text-xs text-pink-400 hover:bg-pink-600/20 transition-colors cursor-pointer"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      executeRangeAction('edit', rangeActionMenu.range, rangeActionMenu.startUuid, rangeActionMenu.endUuid);
+                    }}
+                  >
+                    Редактировать
+                  </button>
+                  <button
+                    className="px-2 py-2 text-xs text-pink-400/60 hover:bg-pink-600/30 hover:text-pink-300 transition-colors cursor-pointer border-l border-white/10"
+                    title="Открыть панель (тест)"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      e.preventDefault();
+                      // Instant open with stub content — skip Gemini API
+                      const { range, startUuid, endUuid } = rangeActionMenu;
+                      selectionStartIdRef.current = null;
+                      setSelectionStartId(null);
+                      setRangeActionMenu(null);
+                      setEditRangeState({
+                        range,
+                        phase: 'ready',
+                        sourceContent: `[Test source — ${range.endIndex - range.startIndex + 1} entries from ${startUuid.slice(0,8)} to ${endUuid.slice(0,8)}]`,
+                        compactText: '## Тестовая сводка\n\n1. Пункт один\n2. Пункт два\n3. Пункт три\n\nФайлы: `src/main.js`, `src/renderer/App.tsx`\n\nСтатус: всё работает.',
+                      });
+                    }}
+                  >
+                    ▶
+                  </button>
+                </div>
               )}
             </div>
           </TooltipPortal>
