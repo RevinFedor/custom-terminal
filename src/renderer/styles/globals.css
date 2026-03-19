@@ -218,3 +218,9 @@
 
 /* API split button: hover shows absolute popup with claude | gemini */
 .api-split-btn:hover .api-split-popup { display: inline-flex !important; }
+
+/* Settings drag-and-drop gap animation */
+@keyframes settingsGapIn {
+  from { height: 0; opacity: 0; }
+  to { opacity: 1; }
+}

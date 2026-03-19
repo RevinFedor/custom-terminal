@@ -20,7 +20,7 @@ const DEFAULT_DOC_FILE_PATH = '/Users/fedor/Global-Templates/🧩 Code-Patterns/
 
 // Track if settings was opened at least once (for default tab)
 let hasOpenedBefore = false;
-let lastActiveTab: SettingsTab = 'shortcuts';
+let lastActiveTab: SettingsTab = 'ai';
 
 // Shortcuts data
 const SHORTCUTS = [
@@ -134,7 +134,7 @@ function FontSizeSlider({
 export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
   // Use last active tab if opened before, otherwise default to shortcuts
   const [activeTab, setActiveTab] = useState<SettingsTab>(() => {
-    return hasOpenedBefore ? lastActiveTab : 'shortcuts';
+    return hasOpenedBefore ? lastActiveTab : 'ai';
   });
 
   const terminalFontSize = useUIStore((s) => s.terminalFontSize);
@@ -168,7 +168,16 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
   const [editingDocPrompt, setEditingDocPrompt] = useState(false);
   const [editingPostCheck, setEditingPostCheck] = useState(false);
   const [localPostCheckContent, setLocalPostCheckContent] = useState('');
-  const [editingPrompt, setEditingPrompt] = useState<number | null>(null); // text insertion prompt being edited
+  const [editingInsertionIndex, setEditingInsertionIndex] = useState<number | null>(null);
+  const [localInsertionTitle, setLocalInsertionTitle] = useState('');
+  const [localInsertionContent, setLocalInsertionContent] = useState('');
+  const [savedInsertionFlash, setSavedInsertionFlash] = useState<'title' | 'content' | null>(null);
+  const savedInsertionTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [draggingTextIndex, setDraggingTextIndex] = useState<number | null>(null);
+  const [textDropTarget, setTextDropTarget] = useState<number | null>(null);
+  const textListRef = useRef<HTMLDivElement>(null);
+  const floatingCloneRef = useRef<HTMLDivElement | null>(null);
+  const dragCardHeight = useRef(0);
 
   // Local copies of AI prompt fields for editing
   const [localPromptContent, setLocalPromptContent] = useState('');
@@ -184,7 +193,7 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
   const claudeEditRef = useRef<HTMLDivElement>(null);
   const docEditRef = useRef<HTMLDivElement>(null);
   const postCheckEditRef = useRef<HTMLDivElement>(null);
-  const promptEditRefs = useRef<Map<number, HTMLDivElement>>(new Map());
+
 
   // Track tab changes
   useEffect(() => {
@@ -224,7 +233,7 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
       setEditingPromptId(null);
       setEditingDocPrompt(false);
       setEditingPostCheck(false);
-      setEditingPrompt(null);
+      setEditingInsertionIndex(null);
     }
   }, [isOpen, docPrompt]);
 
@@ -287,6 +296,132 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
     setEditingPromptId(null);
   };
 
+  // Save current text insertion from local state
+  const saveCurrentInsertion = () => {
+    if (editingInsertionIndex !== null && prompts[editingInsertionIndex]) {
+      const newPrompts = [...prompts];
+      newPrompts[editingInsertionIndex] = { title: localInsertionTitle, content: localInsertionContent };
+      setPrompts(newPrompts);
+      savePromptsImmediate(newPrompts);
+    }
+  };
+
+  const startEditingInsertion = (index: number) => {
+    if (index === editingInsertionIndex) return;
+    saveCurrentInsertion();
+    saveCurrentAIPrompt();
+    setEditingPromptId(null);
+    setEditingInsertionIndex(index);
+    setLocalInsertionTitle(prompts[index].title);
+    setLocalInsertionContent(prompts[index].content);
+  };
+
+  const closeInsertionEditor = () => {
+    saveCurrentInsertion();
+    setEditingInsertionIndex(null);
+  };
+
+  // Classic drag-and-drop: floating clone follows cursor, gap shows target
+  const handleGripPointerDown = (origIndex: number) => (e: React.PointerEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+
+    const card = (e.target as HTMLElement).closest('[data-text-card]') as HTMLElement | null;
+    if (!card) return;
+    const cardRect = card.getBoundingClientRect();
+    const offsetY = e.clientY - cardRect.top;
+    const offsetX = e.clientX - cardRect.left;
+    dragCardHeight.current = cardRect.height;
+
+    // Create floating clone with pickup animation
+    const clone = card.cloneNode(true) as HTMLDivElement;
+    clone.style.position = 'fixed';
+    clone.style.left = `${cardRect.left}px`;
+    clone.style.top = `${cardRect.top}px`;
+    clone.style.width = `${cardRect.width}px`;
+    clone.style.zIndex = '9999';
+    clone.style.pointerEvents = 'none';
+    clone.style.boxShadow = '0 2px 4px rgba(0,0,0,0.2)';
+    clone.style.border = '2px solid #8b5cf6';
+    clone.style.opacity = '0.9';
+    clone.style.cursor = 'grabbing';
+    clone.style.transform = 'scale(1)';
+    clone.style.transition = 'box-shadow 0.15s ease, transform 0.15s ease, opacity 0.15s ease';
+    document.body.appendChild(clone);
+    // Trigger pickup effect next frame
+    requestAnimationFrame(() => {
+      clone.style.boxShadow = '0 8px 24px rgba(139,92,246,0.25)';
+      clone.style.transform = 'scale(1.02)';
+      clone.style.opacity = '1';
+    });
+    floatingCloneRef.current = clone;
+
+    setDraggingTextIndex(origIndex);
+    setTextDropTarget(origIndex);
+
+    // Static midpoints captured once (after React hides dragged card) — prevents jitter
+    let statics: { origIdx: number; midY: number }[] | null = null;
+    let firstMove = true;
+
+    const onMove = (ev: PointerEvent) => {
+      if (floatingCloneRef.current) {
+        if (firstMove) { floatingCloneRef.current.style.transition = 'none'; firstMove = false; }
+        floatingCloneRef.current.style.left = `${ev.clientX - offsetX}px`;
+        floatingCloneRef.current.style.top = `${ev.clientY - offsetY}px`;
+      }
+      // Capture midpoints once (after dragged card is hidden)
+      if (!statics) {
+        const listEl = textListRef.current;
+        if (!listEl) return;
+        statics = [];
+        const cards = Array.from(listEl.querySelectorAll('[data-text-card]')) as HTMLElement[];
+        for (const c of cards) {
+          if (c.dataset.hidden === 'true') continue;
+          const idx = Number(c.dataset.origIndex);
+          const r = c.getBoundingClientRect();
+          statics.push({ origIdx: idx, midY: r.top + r.height / 2 });
+        }
+      }
+      // Find insertion point using static positions (original array index)
+      let target = prompts.length;
+      for (const s of statics) {
+        if (ev.clientY < s.midY) { target = s.origIdx; break; }
+      }
+      setTextDropTarget(target);
+    };
+
+    const onUp = () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      if (floatingCloneRef.current) {
+        floatingCloneRef.current.remove();
+        floatingCloneRef.current = null;
+      }
+      setDraggingTextIndex((fromIdx) => {
+        setTextDropTarget((toPos) => {
+          if (fromIdx !== null && toPos !== null) {
+            // Convert original-array target to splice index (after removal)
+            const adjustedTo = toPos > fromIdx ? toPos - 1 : toPos;
+            if (fromIdx !== adjustedTo) {
+              const np = [...prompts];
+              const editItem = editingInsertionIndex !== null ? np[editingInsertionIndex] : null;
+              const [moved] = np.splice(fromIdx, 1);
+              np.splice(adjustedTo, 0, moved);
+              setPrompts(np);
+              savePromptsImmediate(np);
+              if (editItem !== null) setEditingInsertionIndex(np.indexOf(editItem));
+            }
+          }
+          return null;
+        });
+        return null;
+      });
+    };
+
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+  };
+
   const handleDocBlur = (e: React.FocusEvent) => {
     if (isBlurInsideContainer(e, docEditRef)) return;
     if (docPrompt.useFile) {
@@ -297,20 +432,14 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
     setEditingDocPrompt(false);
   };
 
-  const handlePromptBlur = (e: React.FocusEvent, index: number) => {
-    const ref = promptEditRefs.current.get(index);
-    if (ref) {
-      const relatedTarget = e.relatedTarget as Node | null;
-      if (relatedTarget && ref.contains(relatedTarget)) return;
-    }
-    savePromptsImmediate(prompts);
-    setEditingPrompt(null);
-  };
+
 
   // Start editing an AI prompt (auto-saves current before switching)
   const startEditingAIPrompt = (prompt: AIPrompt) => {
-    if (prompt.id === editingPromptId) return; // Already editing this prompt
-    saveCurrentAIPrompt(); // no flash on auto-save switch
+    if (prompt.id === editingPromptId) return;
+    saveCurrentAIPrompt();
+    saveCurrentInsertion();
+    setEditingInsertionIndex(null);
     setEditingPromptId(prompt.id);
     setLocalPromptContent(prompt.content);
     setLocalPromptName(prompt.name);
@@ -339,18 +468,17 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
     startEditingAIPrompt(newPrompt);
   };
 
-  // User prompts management (text insertion snippets)
   const addPrompt = () => {
+    saveCurrentInsertion();
+    saveCurrentAIPrompt();
+    setEditingPromptId(null);
     const newPrompts = [...prompts, { title: `Prompt ${prompts.length + 1}`, content: '' }];
     setPrompts(newPrompts);
     savePromptsImmediate(newPrompts);
-    setEditingPrompt(newPrompts.length - 1);
-  };
-
-  const updatePrompt = (index: number, field: 'title' | 'content', value: string) => {
-    const newPrompts = [...prompts];
-    newPrompts[index][field] = value;
-    setPrompts(newPrompts);
+    const idx = newPrompts.length - 1;
+    setEditingInsertionIndex(idx);
+    setLocalInsertionTitle(newPrompts[idx].title);
+    setLocalInsertionContent('');
   };
 
   const deletePrompt = async (index: number) => {
@@ -358,7 +486,7 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
     setPrompts(newPrompts);
     await savePromptsImmediate(newPrompts);
     showToast('Deleted', 'success');
-    setEditingPrompt(null);
+    setEditingInsertionIndex(null);
   };
 
   const resetDoc = () => {
@@ -449,10 +577,10 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
           flexShrink: 0
         }}>
           {([
+            { id: 'ai', label: 'AI' },
             { id: 'shortcuts', label: 'Горячие клавиши' },
             { id: 'fonts', label: 'Шрифты' },
-            { id: 'colors', label: 'Цвета' },
-            { id: 'ai', label: 'AI' }
+            { id: 'colors', label: 'Цвета' }
           ] as { id: SettingsTab; label: string }[]).map((tab) => (
             <button
               key={tab.id}
@@ -624,18 +752,32 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
 
           {activeTab === 'ai' && (
             <div style={{ display: 'flex', gap: '24px', height: 'calc(85vh - 130px)' }}>
-              {/* Left Column - AI Prompts (always compact, scrollable) */}
+              {/* Left Column */}
               <div style={{ flex: 1, minWidth: 0, overflowY: 'auto', paddingRight: '4px' }}>
+                {editingInsertionIndex !== null ? (() => {
+                  const ins = prompts[editingInsertionIndex];
+                  if (!ins) return null;
+                  return (
+                    <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '12px', flexShrink: 0 }}>
+                        <input type="text" value={localInsertionTitle} onChange={(e) => setLocalInsertionTitle(e.target.value)} onBlur={() => { saveCurrentInsertion(); setSavedInsertionFlash('title'); if (savedInsertionTimer.current) clearTimeout(savedInsertionTimer.current); savedInsertionTimer.current = setTimeout(() => setSavedInsertionFlash(null), 400); }} placeholder="Название..." autoFocus style={{ flex: 1, padding: '8px', backgroundColor: '#1a1a1a', border: savedInsertionFlash === 'title' ? '1px solid #22c55e' : '1px solid #444', borderRadius: '6px', color: '#fff', fontSize: '13px', outline: 'none', boxSizing: 'border-box' as const, transition: 'border-color 0.15s ease' }} />
+                        <div style={{ width: '1px', height: '20px', backgroundColor: '#333', flexShrink: 0 }} />
+                        <button onClick={(e) => { e.stopPropagation(); closeInsertionEditor(); }} style={{ background: '#2a2a2a', border: '1px solid #393939', borderRadius: '4px', color: '#888', fontSize: '14px', cursor: 'pointer', padding: '1px 7px', lineHeight: 1 }}>✕</button>
+                      </div>
+                      <textarea value={localInsertionContent} onChange={(e) => setLocalInsertionContent(e.target.value)} onBlur={() => { saveCurrentInsertion(); setSavedInsertionFlash('content'); if (savedInsertionTimer.current) clearTimeout(savedInsertionTimer.current); savedInsertionTimer.current = setTimeout(() => setSavedInsertionFlash(null), 400); }} placeholder="Содержимое..." style={{ flex: 1, padding: '10px', backgroundColor: '#1a1a1a', border: savedInsertionFlash === 'content' ? '1px solid #22c55e' : '1px solid #444', borderRadius: '6px', color: '#aaa', fontSize: '11px', fontFamily: 'monospace', outline: 'none', resize: 'none', boxSizing: 'border-box' as const, minHeight: 0, transition: 'border-color 0.15s ease' }} />
+                      <div style={{ marginTop: '8px', flexShrink: 0 }}>
+                        <button onClick={(e) => { e.stopPropagation(); deletePrompt(editingInsertionIndex); }} style={{ padding: '4px 8px', backgroundColor: 'transparent', color: '#ef4444', border: 'none', fontSize: '10px', cursor: 'pointer' }}>Удалить</button>
+                      </div>
+                    </div>
+                  );
+                })() : (<>
                 <div style={{ fontSize: '11px', fontWeight: '600', color: '#666', marginBottom: '12px', textTransform: 'uppercase' }}>
                   AI промпты (Gemini)
                 </div>
 
-                {/* Dynamic AI Prompts — always compact, selected reads from local state */}
                 {aiPrompts.map((aiPrompt) => {
                   const isSelected = editingPromptId === aiPrompt.id;
-                  // For selected prompt, read live from local state; otherwise from store
                   const displayName = isSelected ? localPromptName : aiPrompt.name;
-                  const displayContent = isSelected ? localPromptContent : aiPrompt.content;
                   const displayColor = isSelected ? localPromptColor : aiPrompt.color;
                   const displayModel = isSelected ? localPromptModel : aiPrompt.model;
                   const displayThinking = isSelected ? localPromptThinkingLevel : aiPrompt.thinkingLevel;
@@ -654,23 +796,20 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                         marginBottom: '10px'
                       }}
                     >
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '4px' }}>
-                        <span style={{ fontSize: '13px', color: displayColor, fontWeight: '500' }}>{displayName}</span>
-                        <span style={{ fontSize: '9px', padding: '1px 4px', backgroundColor: `${displayColor}22`, color: displayColor, borderRadius: '3px' }}>
-                          {displayModel.includes('pro') ? 'PRO' : 'FLASH'}
-                        </span>
-                        {displayThinking !== 'HIGH' && (
-                          <span style={{ fontSize: '9px', padding: '1px 4px', backgroundColor: '#ffffff11', color: '#888', borderRadius: '3px' }}>
-                            {displayThinking}
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                          <span style={{ fontSize: '13px', color: displayColor, fontWeight: '500' }}>{displayName}</span>
+                          <span style={{ fontSize: '9px', padding: '1px 4px', backgroundColor: `${displayColor}22`, color: displayColor, borderRadius: '3px' }}>
+                            {displayModel.includes('pro') ? 'PRO' : 'FLASH'}
                           </span>
-                        )}
-                        {displayMenu && (
-                          <span style={{ fontSize: '9px', padding: '1px 4px', backgroundColor: '#ffffff11', color: '#666', borderRadius: '3px' }}>ПКМ</span>
-                        )}
-                      </div>
-                      <div style={{ fontSize: '11px', color: '#666', overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' as const }}>
-                        {displayContent}
-                      </div>
+                          {displayThinking !== 'HIGH' && (
+                            <span style={{ fontSize: '9px', padding: '1px 4px', backgroundColor: '#ffffff11', color: '#888', borderRadius: '3px' }}>
+                              {displayThinking}
+                            </span>
+                          )}
+                          {displayMenu && (
+                            <span style={{ fontSize: '9px', padding: '1px 4px', backgroundColor: '#ffffff11', color: '#666', borderRadius: '3px' }}>ПКМ</span>
+                          )}
+                        </div>
                     </div>
                   );
                 })}
@@ -824,9 +963,10 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                     </>
                   )}
                 </div>
+                </>)}
               </div>
 
-              {/* Right Column - Editor Panel or Text Insertions */}
+              {/* Right Column */}
               <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column' }}>
                 {editingPromptId !== null ? (
                   (() => {
@@ -859,11 +999,12 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                             placeholder="Название..."
                             style={{ flex: 1, padding: '8px', backgroundColor: '#1a1a1a', border: savedFlashField === 'name' ? '1px solid #22c55e' : '1px solid #444', borderRadius: '6px', color: '#fff', fontSize: '13px', outline: 'none', boxSizing: 'border-box' as const, transition: 'border-color 0.15s ease' }}
                           />
+                          <div style={{ width: '1px', height: '20px', backgroundColor: '#333', flexShrink: 0 }} />
                           <button
                             onClick={(e) => { e.stopPropagation(); closeAIPromptEditor(); }}
-                            style={{ background: 'none', border: 'none', color: '#666', fontSize: '18px', cursor: 'pointer', padding: '4px 8px', lineHeight: 1 }}
+                            style={{ background: '#2a2a2a', border: '1px solid #393939', borderRadius: '4px', color: '#888', fontSize: '14px', cursor: 'pointer', padding: '1px 7px', lineHeight: 1 }}
                           >
-                            &times;
+                            ✕
                           </button>
                         </div>
 
@@ -984,7 +1125,6 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                     );
                   })()
                 ) : (
-                  /* Text Insertions (existing UI) */
                   <>
                     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '12px', flexShrink: 0 }}>
                       <div style={{ fontSize: '11px', fontWeight: '600', color: '#666', textTransform: 'uppercase' }}>
@@ -993,33 +1133,43 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                       <button onClick={addPrompt} style={{ padding: '4px 10px', backgroundColor: '#8b5cf6', color: '#fff', border: 'none', borderRadius: '4px', fontSize: '10px', cursor: 'pointer' }}>+ Добавить</button>
                     </div>
 
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', overflowY: 'auto', flex: 1, minHeight: 0 }}>
+                    <div ref={textListRef} style={{ display: 'flex', flexDirection: 'column', gap: '8px', overflowY: 'auto', flex: 1, minHeight: 0 }}>
                       {prompts.length === 0 ? (
                         <div style={{ padding: '24px', textAlign: 'center', color: '#555', fontSize: '12px', border: '2px dashed #333', borderRadius: '10px' }}>Пока нет промптов</div>
                       ) : (
-                        prompts.map((prompt, index) => (
-                          <div
-                            key={index}
-                            ref={(el) => { if (el) promptEditRefs.current.set(index, el); }}
-                            onClick={() => editingPrompt !== index && setEditingPrompt(index)}
-                            style={{ padding: '12px', backgroundColor: editingPrompt === index ? '#252525' : '#222', border: editingPrompt === index ? '2px solid #8b5cf6' : '2px solid #333', borderRadius: '10px', cursor: editingPrompt === index ? 'default' : 'pointer' }}
-                          >
-                            {editingPrompt === index ? (
-                              <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                                <input type="text" value={prompt.title} onChange={(e) => updatePrompt(index, 'title', e.target.value)} onBlur={(e) => handlePromptBlur(e, index)} placeholder="Название" autoFocus style={{ width: '100%', padding: '8px', backgroundColor: '#1a1a1a', border: '1px solid #444', borderRadius: '6px', color: '#fff', fontSize: '12px', outline: 'none', boxSizing: 'border-box' as const }} />
-                                <textarea value={prompt.content} onChange={(e) => updatePrompt(index, 'content', e.target.value)} onBlur={(e) => handlePromptBlur(e, index)} placeholder="Содержимое..." rows={2} style={{ width: '100%', padding: '8px', backgroundColor: '#1a1a1a', border: '1px solid #444', borderRadius: '6px', color: '#aaa', fontSize: '11px', fontFamily: 'monospace', outline: 'none', resize: 'none', boxSizing: 'border-box' as const }} />
-                                <button onClick={(e) => { e.stopPropagation(); deletePrompt(index); }} style={{ alignSelf: 'flex-start', padding: '4px 8px', backgroundColor: 'transparent', color: '#ef4444', border: 'none', fontSize: '10px', cursor: 'pointer' }}>Удалить</button>
+                        prompts.map((prompt, index) => {
+                          const isSelected = editingInsertionIndex === index;
+                          const isDragged = draggingTextIndex === index;
+                          const showGapBefore = draggingTextIndex !== null && textDropTarget === index;
+                          const isLast = index === prompts.length - 1;
+                          const showGapAfter = isLast && draggingTextIndex !== null && textDropTarget === prompts.length;
+                          return (
+                            <React.Fragment key={index}>
+                              {showGapBefore && (
+                                <div style={{ height: `${dragCardHeight.current}px`, borderRadius: '10px', border: '2px dashed #8b5cf640', backgroundColor: '#8b5cf608', boxSizing: 'border-box' as const, animation: 'settingsGapIn 0.1s ease-out' }} />
+                              )}
+                              <div
+                                data-text-card
+                                data-hidden={isDragged || undefined}
+                                data-orig-index={index}
+                                onClick={() => !isDragged && startEditingInsertion(index)}
+                                style={{ padding: '10px 12px', backgroundColor: isSelected ? '#252525' : '#222', border: isSelected ? '2px solid #8b5cf6' : '2px solid #333', borderRadius: '10px', cursor: 'pointer', display: isDragged ? 'none' : 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px' }}
+                              >
+                                <span style={{ fontSize: '13px', color: isSelected ? '#8b5cf6' : '#fff', fontWeight: '500', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{prompt.title}</span>
+                                <div
+                                  onPointerDown={handleGripPointerDown(index)}
+                                  onClick={(e) => e.stopPropagation()}
+                                  style={{ display: 'grid', gridTemplateColumns: '3px 3px', gap: '2px', padding: '4px 2px', cursor: 'grab', flexShrink: 0, touchAction: 'none' }}
+                                >
+                                  {[...Array(6)].map((_, i) => <div key={i} style={{ width: '3px', height: '3px', borderRadius: '50%', backgroundColor: '#555' }} />)}
+                                </div>
                               </div>
-                            ) : (
-                              <>
-                                <div style={{ fontSize: '13px', color: '#fff', fontWeight: '500', marginBottom: '2px' }}>{prompt.title}</div>
-                                {prompt.content && (
-                                  <div style={{ fontSize: '11px', color: '#666', overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' as const }}>{prompt.content}</div>
-                                )}
-                              </>
-                            )}
-                          </div>
-                        ))
+                              {showGapAfter && (
+                                <div style={{ height: `${dragCardHeight.current}px`, borderRadius: '10px', border: '2px dashed #8b5cf640', backgroundColor: '#8b5cf608', boxSizing: 'border-box' as const, animation: 'settingsGapIn 0.1s ease-out' }} />
+                              )}
+                            </React.Fragment>
+                          );
+                        })
                       )}
                     </div>
                   </>
