@@ -129,6 +129,17 @@ async function main() {
     log.info('Response 2: ' + (resp2 ? 'received' : 'timeout'))
     await page.waitForTimeout(1000)
 
+    // Send third message
+    await page.keyboard.type('say thanks', { delay: 30 })
+    await page.keyboard.press('Enter')
+    log.info('Sent: "say thanks"')
+
+    const resp3 = await waitForMainProcessLog(mainProcessLogs, /\[Spinner\].*IDLE|BoundaryMarker/, 45000)
+    log.info('Response 3: ' + (resp3 ? 'received' : 'timeout'))
+
+    // Wait for timeline to refresh (polls every 2s)
+    await page.waitForTimeout(4000)
+
     // Check timeline has entries
     log.step('8. Checking timeline entries...')
     const timelineEntries = await page.evaluate(() => {
@@ -199,6 +210,10 @@ async function main() {
     assert(testButton, 'Found and clicked ▶ test button')
     await page.waitForTimeout(500)
 
+    // Screenshot: panel opened
+    await page.screenshot({ path: '/tmp/edit-range-panel-open.png' })
+    log.info('Screenshot saved: /tmp/edit-range-panel-open.png')
+
     // Check EditRangePanel appeared
     log.step('12. Checking EditRangePanel is visible...')
     const panelCheck = await page.evaluate(() => {
@@ -247,13 +262,17 @@ async function main() {
     const killLog = await waitForMainProcessLog(mainProcessLogs, '[EditRange]', 10000)
     log.info('EditRange log: ' + (killLog || 'none'))
 
-    // Wait for done state (green "Готово")
+    // Screenshot: after apply started
+    await page.screenshot({ path: '/tmp/edit-range-applying.png' })
+    log.info('Screenshot saved: /tmp/edit-range-applying.png')
+
+    // Wait for done state (green "Готово") — fast polling, panel auto-closes after 3s
     log.step('15. Waiting for "Готово" state...')
     let doneVisible = false
-    for (let i = 0; i < 20; i++) {
+    for (let i = 0; i < 60; i++) {
       doneVisible = await page.evaluate(() => document.body.innerText.includes('Готово'))
       if (doneVisible) break
-      await page.waitForTimeout(500)
+      await page.waitForTimeout(100) // 100ms polling — need to catch before 3s auto-close
     }
     assert(doneVisible, '"Готово" screen appeared')
 
@@ -280,6 +299,12 @@ async function main() {
     const restartLogs = findInLogs(mainProcessLogs, 'Continuing session')
     log.info(`Claude restart logs: ${restartLogs.length}`)
 
+    // Screenshot: done state
+    if (doneVisible) {
+      await page.screenshot({ path: '/tmp/edit-range-done.png' })
+      log.info('Screenshot saved: /tmp/edit-range-done.png')
+    }
+
     // Wait for panel to auto-close (3s) or close manually
     await page.waitForTimeout(3500)
 
@@ -287,6 +312,10 @@ async function main() {
       return !document.body.innerText.includes('Готово')
     })
     log.info('Panel auto-closed: ' + panelGone)
+
+    // Final screenshot
+    await page.screenshot({ path: '/tmp/edit-range-final.png' })
+    log.info('Screenshot saved: /tmp/edit-range-final.png')
 
     // Summary
     console.log(`\n${'='.repeat(50)}`)

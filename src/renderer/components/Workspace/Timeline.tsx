@@ -232,9 +232,10 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   // Edit Range state
   const [editRangeState, setEditRangeState] = useState<{
     range: { startIndex: number; endIndex: number };
-    phase: 'loading' | 'ready' | 'applying';
+    phase: 'loading' | 'ready' | 'applying' | 'done';
     sourceContent: string;
     compactText: string;
+    compactUuid?: string; // UUID of the inserted compact entry (after apply)
   } | null>(null);
   // Range action menu — appears after second click to choose Copy or Edit
   const [rangeActionMenu, setRangeActionMenu] = useState<{
@@ -2116,21 +2117,37 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
 
         {/* Edit Range Overlay */}
         {isVisible && editRangeState && (() => {
-          const rect = getOverlayRect(editRangeState.range.startIndex, editRangeState.range.endIndex);
+          let rect: { top: number; height: number } | null = null;
+
+          if (editRangeState.compactUuid && (editRangeState.phase === 'applying' || editRangeState.phase === 'done')) {
+            // After apply: highlight only the compact entry
+            const compactIdx = entries.findIndex(e => e.uuid === editRangeState.compactUuid);
+            if (compactIdx !== -1) rect = getOverlayRect(compactIdx, compactIdx);
+          } else {
+            // Before apply: highlight the selected range
+            rect = getOverlayRect(editRangeState.range.startIndex, editRangeState.range.endIndex);
+          }
+
           const isLoading = editRangeState.phase === 'loading';
+          const isApplying = editRangeState.phase === 'applying';
+          const isDone = editRangeState.phase === 'done';
           const isReady = editRangeState.phase === 'ready';
+
+          const color = isDone ? 'rgba(34, 197, 94'
+            : isReady ? 'rgba(34, 197, 94'
+            : isApplying ? 'rgba(168, 85, 247'
+            : 'rgba(236, 72, 153';
+
           return rect && (
             <div
-              className={`absolute left-0 right-0 pointer-events-none ${isLoading ? 'animate-pulse' : ''}`}
+              className={`absolute left-0 right-0 pointer-events-none ${isLoading || isApplying ? 'animate-pulse' : ''}`}
               style={{
                 top: rect.top,
                 height: rect.height,
-                backgroundColor: isReady
-                  ? 'rgba(34, 197, 94, 0.15)'
-                  : 'rgba(236, 72, 153, 0.15)',
-                borderTop: `1px solid ${isReady ? 'rgba(34, 197, 94, 0.5)' : 'rgba(236, 72, 153, 0.5)'}`,
-                borderBottom: `1px solid ${isReady ? 'rgba(34, 197, 94, 0.5)' : 'rgba(236, 72, 153, 0.5)'}`,
-                boxShadow: `0 0 12px ${isReady ? 'rgba(34, 197, 94, 0.3)' : 'rgba(236, 72, 153, 0.3)'}`,
+                backgroundColor: `${color}, ${isDone ? 0.25 : 0.15})`,
+                borderTop: `1px solid ${color}, 0.5)`,
+                borderBottom: `1px solid ${color}, 0.5)`,
+                boxShadow: `0 0 12px ${color}, 0.3)`,
               }}
             />
           );
@@ -2138,16 +2155,43 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
 
           </div>{/* end inner relative wrapper */}
 
-        {/* Edit Range Panel (portal) */}
-        {editRangeState && editRangeState.phase === 'ready' && (() => {
-          // Use getBoundingClientRect for viewport-accurate coordinates (not content-space)
-          const startEl = segmentRefs.current[editRangeState.range.startIndex];
-          const endEl = segmentRefs.current[editRangeState.range.endIndex];
-          if (!startEl || !endEl || !containerRef.current) return null;
-          const startRect = startEl.getBoundingClientRect();
-          const endRect = endEl.getBoundingClientRect();
-          const anchorTop = startRect.top;
-          const anchorHeight = endRect.bottom - startRect.top;
+        {/* Edit Range Panel (portal) — visible during ready, applying, done */}
+        {editRangeState && (editRangeState.phase === 'ready' || editRangeState.phase === 'applying' || editRangeState.phase === 'done') && (() => {
+          // After apply, anchor to the compact entry by UUID; before — use range
+          let anchorTop: number;
+          let anchorHeight: number;
+
+          if (editRangeState.compactUuid && (editRangeState.phase === 'applying' || editRangeState.phase === 'done')) {
+            // Find compact entry in current entries
+            const compactIdx = entries.findIndex(e => e.uuid === editRangeState.compactUuid);
+            const compactEl = compactIdx !== -1 ? segmentRefs.current[compactIdx] : null;
+            if (compactEl) {
+              const r = compactEl.getBoundingClientRect();
+              anchorTop = r.top;
+              anchorHeight = r.height;
+            } else {
+              // Compact not in timeline yet (refresh pending) — use container center
+              const cr = containerRef.current?.getBoundingClientRect();
+              anchorTop = cr ? cr.top + cr.height / 2 - 20 : 200;
+              anchorHeight = 40;
+            }
+          } else {
+            // Pre-apply: use original range
+            const startEl = segmentRefs.current[editRangeState.range.startIndex];
+            const endEl = segmentRefs.current[editRangeState.range.endIndex];
+            if (!startEl || !endEl) {
+              const cr = containerRef.current?.getBoundingClientRect();
+              anchorTop = cr ? cr.top + cr.height / 2 - 20 : 200;
+              anchorHeight = 40;
+            } else {
+              const startRect = startEl.getBoundingClientRect();
+              const endRect = endEl.getBoundingClientRect();
+              anchorTop = startRect.top;
+              anchorHeight = endRect.bottom - startRect.top;
+            }
+          }
+
+          if (!containerRef.current) return null;
           const containerRect = containerRef.current.getBoundingClientRect();
           const rightOffset = window.innerWidth - containerRect.left + 8;
           return (
@@ -2165,11 +2209,30 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                 const startUuid = entries[range.startIndex].uuid;
                 const endUuid = entries[range.endIndex].uuid;
 
-                // Step 1: Kill Claude if running
+                // Step 1: Exit Claude CLI (Ctrl+C twice) and wait for shell prompt
                 if (isActive) {
-                  console.warn('[EditRange] Killing Claude process...');
-                  ipcRenderer.send('terminal:kill', tabId);
+                  console.warn('[EditRange] Exiting Claude CLI (Ctrl+C)...');
+                  ipcRenderer.send('terminal:input', tabId, '\x03'); // Ctrl+C
                   await new Promise(resolve => setTimeout(resolve, 500));
+                  ipcRenderer.send('terminal:input', tabId, '\x03'); // Ctrl+C again (confirm exit)
+
+                  // Wait for shell prompt (OSC 133 A) — deterministic, no blind timeout
+                  await new Promise<void>((resolve) => {
+                    const timeout = setTimeout(() => {
+                      console.warn('[EditRange] Shell prompt timeout, proceeding');
+                      ipcRenderer.removeListener('terminal:prompt-ready', handler);
+                      resolve();
+                    }, 5000);
+                    const handler = (_e: any, readyTabId: string) => {
+                      if (readyTabId === tabId) {
+                        clearTimeout(timeout);
+                        ipcRenderer.removeListener('terminal:prompt-ready', handler);
+                        console.warn('[EditRange] Shell prompt ready');
+                        resolve();
+                      }
+                    };
+                    ipcRenderer.on('terminal:prompt-ready', handler);
+                  });
                 }
 
                 // Step 2: Edit JSONL
@@ -2182,9 +2245,12 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                   throw new Error(result.error);
                 }
 
-                console.warn('[EditRange] Removed', result.removedCount, 'records');
+                console.warn('[EditRange] Removed', result.removedCount, 'compactUuid:', result.compactUuid);
 
-                // Step 3: Restart Claude with -c (continue)
+                // Save compactUuid so overlay can anchor to it after timeline refresh
+                setEditRangeState(prev => prev ? { ...prev, compactUuid: result.compactUuid } : null);
+
+                // Step 3: Restart Claude with --resume (uses existing PTY/shell)
                 console.warn('[EditRange] Restarting Claude...');
                 ipcRenderer.send('claude:run-command', {
                   tabId,

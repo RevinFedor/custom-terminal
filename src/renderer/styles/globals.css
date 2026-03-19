@@ -221,6 +221,6 @@
 
 /* Settings drag-and-drop gap animation */
 @keyframes settingsGapIn {
-  from { height: 0; opacity: 0; }
-  to { opacity: 1; }
+  from { opacity: 0; transform: scaleY(0.85); }
+  to { opacity: 1; transform: scaleY(1); }
 }

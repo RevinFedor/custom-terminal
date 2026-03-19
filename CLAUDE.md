@@ -50,6 +50,8 @@ MCP-инструмент `docs_search` доступен для поиска по
 - **Не используй `navigator.clipboard`** в renderer — используй `window.require('electron').clipboard`
 - **TUI Logic Testing:** Для низкоуровневой логики парсинга терминала (маркеры, поиск в буфере) предпочитай **Headless Unit-тесты** (node + @xterm/headless). Playwright-тесты используй только для UI и IPC сценариев.
 - **Dynamic List Overlays:** Запрещено использовать процентное позиционирование (`top: %`) для оверлеев в списках, где элементы имеют динамическую высоту (например, через `flex-grow` или условные маркеры). Это приводит к визуальному рассинхрону. Используй только реальные DOM-координаты (`offsetTop`/`offsetHeight`) через `refs`.
+- **Mirror Editing:** Паттерн двухколонного редактирования, где форма заменяет соседнюю колонку, сохраняя баланс и контекст. См. [`docs/knowledge/fact-ux-patterns.md`](docs/knowledge/fact-ux-patterns.md).
+- **Pointer-based DnD:** Сложные перетаскивания (с live-preview или клонами) реализуются через Pointer Events со статическими координатами (`midY`) для фиксации джиттера. См. [`docs/knowledge/fact-settings.md`](docs/knowledge/fact-settings.md).
 
 ## Окружение и Конфигурация (Infrastructure)
 - **Claude Models:** Для использования модели по умолчанию с расширенным контекстом (1M) через переменную окружения `ANTHROPIC_MODEL` необходимо использовать значение `opus[1m]`. Использование строки `default` ломает отображение в TUI.
