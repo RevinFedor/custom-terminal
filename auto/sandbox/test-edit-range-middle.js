@@ -165,22 +165,29 @@ async function main() {
     const entry3 = timelineData.entries[3]
     log.info(`Will remove entries 2-3: "${entry2?.content}" and "${entry3?.content}"`)
 
-    // Exit Claude first
+    // Exit Claude — DangerZone pattern
     log.step('10. Exiting Claude (Ctrl+C)...')
     await page.evaluate((tid) => {
       const { ipcRenderer } = window.require('electron')
       ipcRenderer.send('terminal:input', tid, '\x03')
     }, tabId)
-    await page.waitForTimeout(500)
+    log.info('Ctrl+C #1 sent, waiting for DangerZone...')
+    const dz = await waitForMainProcessLog(mainProcessLogs, /DangerZone|again to exit|ctrlc-danger/, 3000)
+    log.info('DangerZone: ' + (dz ? 'detected' : 'timeout'))
     await page.evaluate((tid) => {
       const { ipcRenderer } = window.require('electron')
       ipcRenderer.send('terminal:input', tid, '\x03')
     }, tabId)
+    log.info('Ctrl+C #2 sent')
 
-    // Wait for shell prompt
-    const promptLog = await waitForMainProcessLog(mainProcessLogs, /Prompt ready \(A\)/, 5000)
-    log.info('Shell prompt: ' + (promptLog ? 'ready' : 'timeout'))
-    await page.waitForTimeout(500)
+    // Wait for isRunning=false (OSC 133 D)
+    for (let i = 0; i < 30; i++) {
+      await page.waitForTimeout(300)
+      const state = await page.evaluate((tid) => {
+        const { ipcRenderer } = window.require('electron'); return ipcRenderer.invoke('terminal:getCommandState', tid)
+      }, tabId)
+      if (!state?.isRunning) { log.info('isRunning=false at poll ' + i); break }
+    }
 
     // Call edit-range IPC directly
     log.step('11. Calling claude:edit-range IPC...')
@@ -199,8 +206,11 @@ async function main() {
     assert(editResult.success, 'edit-range succeeded')
     log.info('Removed: ' + editResult.removedCount + ', compactUuid: ' + editResult.compactUuid?.slice(0, 8))
 
-    // Restart Claude
-    log.step('12. Restarting Claude (--resume)...')
+    // Wait for shell prompt before restarting
+    log.step('12. Waiting for prompt-ready, then restarting Claude...')
+    await waitForMainProcessLog(mainProcessLogs, /\[OSC 133\].*Prompt ready/, 10000)
+    log.pass('Prompt ready')
+
     await page.evaluate(({ tid, sid }) => {
       const { ipcRenderer } = window.require('electron')
       ipcRenderer.send('claude:run-command', { tabId: tid, command: 'claude-c', sessionId: sid })

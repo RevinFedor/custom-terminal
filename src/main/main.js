@@ -6360,7 +6360,7 @@ ipcMain.on('claude:fork-session', async (event, { tabId, existingSessionId, cwd 
 // ========== CLAUDE COMMAND RUNNER (from UI buttons) ========== 
 // This handles claude commands triggered from InfoPanel buttons
 // bypassing the terminal input interception (which only works for keyboard Enter)
-ipcMain.on('claude:run-command', async (event, { tabId, command, sessionId, forkSessionId, prompt }) => {
+ipcMain.on('claude:run-command', (event, { tabId, command, sessionId, forkSessionId, prompt }) => {
   console.log('[Claude Runner] Command:', command, 'Tab:', tabId, 'Prompt:', prompt ? `${prompt.slice(0, 50)}...` : 'none');
 
   const term = terminals.get(tabId);
@@ -6469,62 +6469,30 @@ ipcMain.on('claude:run-command', async (event, { tabId, command, sessionId, fork
           }
           const destPath = path.join(primaryDir, `${newSessionId}.jsonl`);
 
-          // Full chain copy: resolve chain, copy ALL files with rewritten sessionIds
-          // Merge ALL chain files into ONE fork file with all sessionIds rewritten to newSessionId
-          // This eliminates multi-file chain, bridge entries, and fake bridge issues
-          const { sessionBoundaries: chainBounds } = await resolveSessionChain(forkSessionId, cwd);
-          const parentMap = new Map();
-          for (const b of chainBounds) parentMap.set(b.childSessionId, b.parentSessionId);
-          const chainIds = [forkSessionId];
-          let walkId = forkSessionId;
-          const walkVisited = new Set();
-          while (parentMap.has(walkId)) {
-            walkId = parentMap.get(walkId);
-            if (walkVisited.has(walkId)) break;
-            walkVisited.add(walkId);
-            chainIds.unshift(walkId);
-          }
-
-          // Read all files in chain order (root first), merge into single array
-          const allLines = [];
-          for (const oldId of chainIds) {
-            const ff = findSessionFile(oldId, cwd);
-            if (!ff) continue;
-            const content = fs.readFileSync(ff.filePath, 'utf-8');
-            for (const line of content.split('\n')) {
-              if (!line.trim()) continue;
-              allLines.push(line);
-            }
-          }
-
-          // Map each unique sessionId to new UUID, tip → newSessionId
-          // Preserves plan mode transitions (different sessionIds between segments)
-          const sidMap = new Map();
-          sidMap.set(forkSessionId, newSessionId);
-          for (const line of allLines) {
-            try { const e = JSON.parse(line); if (e.sessionId && !sidMap.has(e.sessionId)) sidMap.set(e.sessionId, crypto.randomUUID()); }
-            catch {}
-          }
-          sidMap.set(forkSessionId, newSessionId); // ensure tip
-
-          const rewritten = allLines.map(line => {
-            try {
-              const e = JSON.parse(line);
-              if (e.sessionId && sidMap.has(e.sessionId)) e.sessionId = sidMap.get(e.sessionId);
-              return JSON.stringify(e);
-            } catch { return line; }
-          }).join('\n') + '\n';
-
-          fs.writeFileSync(destPath, rewritten);
-          console.log('[Claude Runner] Merged', chainIds.length, 'chain files into', destPath, '(' + allLines.length + ' lines)');
-
-          const entryUuids = parseTimelineUuids(destPath);
+          // Get Timeline UUIDs snapshot using Backtrace algorithm
+          const entryUuids = parseTimelineUuids(sourcePath);
           console.log('[Claude Runner] Timeline entries:', entryUuids.length);
 
+          fs.copyFileSync(sourcePath, destPath);
+          console.log('[Claude Runner] Copied session file, new ID:', newSessionId);
+          console.log('[Claude Runner] From:', sourcePath);
+          console.log('[Claude Runner] To:', destPath);
+
+          // Save fork marker with UUIDs snapshot (always save, even if empty — marks fork at beginning)
           try {
             projectManager.db.saveForkMarker(forkSessionId, newSessionId, entryUuids);
+            console.log('[Claude Runner] Fork marker saved with', entryUuids.length, 'UUIDs');
           } catch (e) { console.warn('[Claude Runner] Fork marker error:', e.message); }
-          // No session_links needed — single file, no chain
+
+          // Import session_links from other DB (prod↔dev) for the source session chain
+          try {
+            const imported = projectManager.db.importSessionLinksFromOtherDb(forkSessionId);
+            if (imported > 0) {
+              console.log('[Claude Runner] Imported', imported, 'session links from other DB');
+            }
+          } catch (e) {
+            console.warn('[Claude Runner] Could not import session links:', e.message);
+          }
 
           // Run claude --resume in CURRENT terminal (not new tab!)
           // This is for claude-f <uuid> - resuming external session

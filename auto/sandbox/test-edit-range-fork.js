@@ -76,7 +76,7 @@ async function main() {
     const deltaEntry = before.entries[3]
     log.info(`Removing: [2] "${gammaEntry?.content?.slice(0,20)}" [3] "${deltaEntry?.content?.slice(0,20)}"`)
 
-    // Exit Claude — use terminal:getCommandState (same as sidebar green border)
+    // Exit Claude — DangerZone pattern (same as onApply in Timeline.tsx)
     log.step('5. Exiting Claude...')
     const cmdState = await page.evaluate((tid) => {
       const { ipcRenderer } = window.require('electron'); return ipcRenderer.invoke('terminal:getCommandState', tid)
@@ -84,12 +84,23 @@ async function main() {
     log.info('commandState: ' + JSON.stringify(cmdState))
 
     if (cmdState?.isRunning) {
-      // Two Ctrl+C with NO delay — Ink re-renders prompt between them if delayed
+      // Ctrl+C #1
       await page.evaluate((tid) => {
         const { ipcRenderer } = window.require('electron')
         ipcRenderer.send('terminal:input', tid, '\x03')
+      }, tabId)
+      log.info('Ctrl+C #1 sent, waiting for DangerZone...')
+
+      // Wait for "again to exit" via main process log
+      const dz = await waitForMainProcessLog(mainProcessLogs, /DangerZone|again to exit|ctrlc-danger/, 3000)
+      log.info('DangerZone: ' + (dz ? 'detected' : 'timeout'))
+
+      // Ctrl+C #2
+      await page.evaluate((tid) => {
+        const { ipcRenderer } = window.require('electron')
         ipcRenderer.send('terminal:input', tid, '\x03')
       }, tabId)
+      log.info('Ctrl+C #2 sent')
 
       // Wait for isRunning=false (OSC 133 D)
       for (let i = 0; i < 30; i++) {
@@ -97,16 +108,13 @@ async function main() {
         const state = await page.evaluate((tid) => {
           const { ipcRenderer } = window.require('electron'); return ipcRenderer.invoke('terminal:getCommandState', tid)
         }, tabId)
-        log.info('isRunning poll ' + i + ': ' + state?.isRunning)
-        if (!state?.isRunning) break
+        if (!state?.isRunning) { log.info('isRunning=false at poll ' + i); break }
       }
-      await page.waitForTimeout(500)
     } else {
       log.warn('isRunning=false — Claude not detected as running!')
     }
 
     await page.screenshot({ path: '/tmp/fork-after-exit.png' })
-    log.info('Screenshot: /tmp/fork-after-exit.png')
 
     // Edit range
     log.step('6. Calling edit-range...')
@@ -121,9 +129,12 @@ async function main() {
     log.info('Result: ' + JSON.stringify(editResult))
     assert(editResult.success, 'edit-range success')
 
-    // Restart Claude with fileSessionId (original session, not fork)
+    // Wait for shell prompt (OSC 133 A) before restarting Claude
     const resumeId = editResult.fileSessionId || sessionId
-    log.step('7. Restarting Claude with session: ' + resumeId?.slice(0, 8))
+    log.step('7. Waiting for prompt-ready, then restarting Claude: ' + resumeId?.slice(0, 8))
+    await waitForMainProcessLog(mainProcessLogs, /\[OSC 133\].*Prompt ready/, 10000)
+    log.pass('Prompt ready')
+
     await page.evaluate(({ tid, sid }) => {
       const { ipcRenderer } = window.require('electron')
       ipcRenderer.send('claude:run-command', { tabId: tid, command: 'claude-c', sessionId: sid })

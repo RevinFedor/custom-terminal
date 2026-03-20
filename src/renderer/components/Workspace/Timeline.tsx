@@ -475,7 +475,6 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         }
         if (markersResult.success) {
           const markers = markersResult.markers || [];
-          console.warn('[Timeline] Fork markers for session', sessionId, ':', markers.length, markers.length > 0 ? JSON.stringify(markers.map((m: ForkMarker) => ({ source: m.source_session_id?.substring(0, 8), uuids: m.entry_uuids?.length }))) : '(empty)');
           setForkMarkers(markers);
         }
       }
@@ -1149,6 +1148,21 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     setRangeActionMenu(null);
 
     if (mode === 'edit') {
+      // Check: range must not cross plan mode boundaries or contain compact entries
+      const rangeEntries = entries.slice(range.startIndex, range.endIndex + 1);
+      const hasCompact = rangeEntries.some(e => e.type === 'compact');
+      const sessionIds = new Set(rangeEntries.map(e => e.sessionId).filter(Boolean));
+      const crossesPlanMode = sessionIds.size > 1;
+      if (hasCompact || crossesPlanMode) {
+        useUIStore.getState().showToast(
+          hasCompact
+            ? 'Нельзя редактировать диапазон с compact boundary'
+            : 'Нельзя редактировать через план мод — только текущий сегмент',
+          'error', 3000
+        );
+        return;
+      }
+
       // Edit mode: fetch range content → send to Gemini for compact → open panel
       setEditRangeState({ range, phase: 'loading', sourceContent: '', compactText: '' });
 
@@ -1703,34 +1717,16 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
               if (!m.entry_uuids || m.entry_uuids.length === 0) return false;
               const snapshotUuids = new Set(m.entry_uuids);
               if (!snapshotUuids.has(entry.uuid)) return false;
-              if (isLastEntry) {
-                if (index === 0 || !forkMarkers._loggedPosition) {
-                  console.warn('[Timeline] Fork marker at LAST entry', index, '/', entries.length, entry.uuid?.substring(0, 8));
-                  (forkMarkers as any)._loggedPosition = true;
-                }
-                return true;
-              }
+              if (isLastEntry) return true;
               const nextEntry = entries[index + 1];
-              const isEnd = nextEntry && !snapshotUuids.has(nextEntry.uuid);
-              if (isEnd) {
-                console.warn('[Timeline] Fork marker at index', index, '/', entries.length, entry.uuid?.substring(0, 8), 'next:', nextEntry.uuid?.substring(0, 8));
-              }
-              return isEnd;
+              return nextEntry && !snapshotUuids.has(nextEntry.uuid);
             });
 
-            // Plan mode boundary = sessionId changes AND this transition is a known bridge (clear-context)
-            // If the transition has no bridge in sessionBoundaries, it's a fork — show fork marker instead
             const isPlanModeBoundary = (() => {
-              if (isLastEntry) return false;
+              if (isLastEntry || forkMarker) return false;
               const nextEntry = entries[index + 1];
               if (!nextEntry || !entry.sessionId || !nextEntry.sessionId) return false;
-              if (entry.sessionId === nextEntry.sessionId) return false;
-              // Check if this sessionId transition is a known bridge (clear-context)
-              // sessionBoundaries: { childSessionId, parentSessionId } = child bridged from parent
-              const isBridged = sessionBoundaries.some(b =>
-                b.parentSessionId === entry.sessionId && b.childSessionId === nextEntry.sessionId
-              );
-              return isBridged;
+              return entry.sessionId !== nextEntry.sessionId;
             })();
 
             // Phase 2: Group state
@@ -2010,8 +2006,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                     </div>
                   )}
                 </div>
-                {/* Fork marker — only if not a plan-mode (bridged) boundary */}
-                {forkMarker && !isPlanModeBoundary && (
+                {/* Fork marker */}
+                {forkMarker && (
                   <div
                     className="flex-shrink-0 w-full flex items-center justify-center"
                     style={{ height: '8px' }}
@@ -2298,11 +2294,24 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                 // Save compactUuid so overlay can anchor to it after timeline refresh
                 setEditRangeState(prev => prev ? { ...prev, compactUuid: result.compactUuid } : null);
 
-                // Wait for shell to be fully ready before sending command
-                // (OSC 133 A may fire before shell input buffer is flushed)
-                await new Promise(resolve => setTimeout(resolve, 300));
+                // Step 3: Wait for shell prompt (OSC 133 A) then restart Claude
+                console.warn('[EditRange] Waiting for prompt-ready...');
+                await new Promise<void>((resolve) => {
+                  const timeout = setTimeout(() => {
+                    console.warn('[EditRange] prompt-ready timeout, proceeding anyway');
+                    ipcRenderer.removeListener('terminal:prompt-ready', handler);
+                    resolve();
+                  }, 5000);
+                  const handler = (_e: any, readyTabId: string) => {
+                    if (readyTabId === tabId) {
+                      clearTimeout(timeout);
+                      ipcRenderer.removeListener('terminal:prompt-ready', handler);
+                      resolve();
+                    }
+                  };
+                  ipcRenderer.on('terminal:prompt-ready', handler);
+                });
 
-                // Step 3: Restart Claude with --resume using tab's sessionId (fork or original)
                 console.warn('[EditRange] Restarting Claude with session:', sessionId?.slice(0, 8));
                 ipcRenderer.send('claude:run-command', {
                   tabId,
