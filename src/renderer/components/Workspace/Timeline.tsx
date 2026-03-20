@@ -925,9 +925,24 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         const startId = selectionStartIdRef.current;
         const startIndex = entries.findIndex(e => e.uuid === startId);
         const endIndex = entries.findIndex(e => e.uuid === entry.uuid);
+        let rangeStartIdx = Math.min(startIndex, endIndex);
+        const rangeEndIdx = Math.max(startIndex, endIndex);
+
+        // Auto-expand to plan mode boundary: if startIndex is inside a plan mode segment,
+        // expand to the beginning of that segment (previous plan/compact boundary or start of session)
+        if (rangeStartIdx > 0) {
+          const startSessionId = entries[rangeStartIdx].sessionId;
+          for (let i = rangeStartIdx - 1; i >= 0; i--) {
+            if (entries[i].isPlan || entries[i].type === 'compact' || entries[i].sessionId !== startSessionId) {
+              break; // Found boundary — stop here
+            }
+            rangeStartIdx = i; // Expand to include this entry
+          }
+        }
+
         const range = {
-          startIndex: Math.min(startIndex, endIndex),
-          endIndex: Math.max(startIndex, endIndex),
+          startIndex: rangeStartIdx,
+          endIndex: rangeEndIdx,
         };
 
         // Get click position from the entry's DOM element
@@ -1143,8 +1158,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
           cwd,
           startUuid,
           endUuid,
-          includeEditing: true,
-          includeReading: false,
+          includeEditing: copyIncludeEditing,
+          includeReading: copyIncludeReading,
         });
 
         if (!result.success) {
@@ -1693,11 +1708,19 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
               return nextEntry && !snapshotUuids.has(nextEntry.uuid);
             });
 
+            // Plan mode boundary = sessionId changes AND this transition is a known bridge (clear-context)
+            // If the transition has no bridge in sessionBoundaries, it's a fork — show fork marker instead
             const isPlanModeBoundary = (() => {
-              if (isLastEntry || forkMarker) return false;
+              if (isLastEntry) return false;
               const nextEntry = entries[index + 1];
               if (!nextEntry || !entry.sessionId || !nextEntry.sessionId) return false;
-              return entry.sessionId !== nextEntry.sessionId;
+              if (entry.sessionId === nextEntry.sessionId) return false;
+              // Check if this sessionId transition is a known bridge (clear-context)
+              // sessionBoundaries: { childSessionId, parentSessionId } = child bridged from parent
+              const isBridged = sessionBoundaries.some(b =>
+                b.parentSessionId === entry.sessionId && b.childSessionId === nextEntry.sessionId
+              );
+              return isBridged;
             })();
 
             // Phase 2: Group state
@@ -1977,8 +2000,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                     </div>
                   )}
                 </div>
-                {/* Fork marker */}
-                {forkMarker && (
+                {/* Fork marker — only if not a plan-mode (bridged) boundary */}
+                {forkMarker && !isPlanModeBoundary && (
                   <div
                     className="flex-shrink-0 w-full flex items-center justify-center"
                     style={{ height: '8px' }}
@@ -2209,30 +2232,45 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                 const startUuid = entries[range.startIndex].uuid;
                 const endUuid = entries[range.endIndex].uuid;
 
-                // Step 1: Exit Claude CLI (Ctrl+C twice) and wait for shell prompt
-                if (isActive) {
-                  console.warn('[EditRange] Exiting Claude CLI (Ctrl+C)...');
-                  ipcRenderer.send('terminal:input', tabId, '\x03'); // Ctrl+C
-                  await new Promise(resolve => setTimeout(resolve, 500));
-                  ipcRenderer.send('terminal:input', tabId, '\x03'); // Ctrl+C again (confirm exit)
+                // Step 1: Exit Claude if command is running (same check as sidebar green border)
+                const cmdState = await ipcRenderer.invoke('terminal:getCommandState', tabId);
+                console.warn('[EditRange] commandState:', JSON.stringify(cmdState));
 
-                  // Wait for shell prompt (OSC 133 A) — deterministic, no blind timeout
+                if (cmdState?.isRunning) {
+                  console.warn('[EditRange] Sending Ctrl+C #1, waiting for DangerZone...');
+                  ipcRenderer.send('terminal:input', tabId, '\x03');
+
+                  // Wait for "again to exit" detection (deterministic, no blind timeout)
                   await new Promise<void>((resolve) => {
                     const timeout = setTimeout(() => {
-                      console.warn('[EditRange] Shell prompt timeout, proceeding');
-                      ipcRenderer.removeListener('terminal:prompt-ready', handler);
+                      console.warn('[EditRange] DangerZone timeout, sending Ctrl+C #2 anyway');
+                      ipcRenderer.removeListener('claude:ctrlc-danger-zone', handler);
                       resolve();
-                    }, 5000);
-                    const handler = (_e: any, readyTabId: string) => {
-                      if (readyTabId === tabId) {
+                    }, 3000);
+                    const handler = (_e: any, data: { tabId: string; active: boolean }) => {
+                      if (data.tabId === tabId && data.active) {
                         clearTimeout(timeout);
-                        ipcRenderer.removeListener('terminal:prompt-ready', handler);
-                        console.warn('[EditRange] Shell prompt ready');
+                        ipcRenderer.removeListener('claude:ctrlc-danger-zone', handler);
+                        console.warn('[EditRange] DangerZone detected, sending Ctrl+C #2');
                         resolve();
                       }
                     };
-                    ipcRenderer.on('terminal:prompt-ready', handler);
+                    ipcRenderer.on('claude:ctrlc-danger-zone', handler);
                   });
+
+                  ipcRenderer.send('terminal:input', tabId, '\x03');
+
+                  // Wait for isRunning=false (OSC 133 D = command finished)
+                  for (let i = 0; i < 30; i++) {
+                    await new Promise(resolve => setTimeout(resolve, 300));
+                    const state = await ipcRenderer.invoke('terminal:getCommandState', tabId);
+                    if (!state?.isRunning) {
+                      console.warn('[EditRange] Command finished (OSC 133 D)');
+                      break;
+                    }
+                    if (i === 29) console.warn('[EditRange] Exit timeout');
+                  }
+                  await new Promise(resolve => setTimeout(resolve, 300));
                 }
 
                 // Step 2: Edit JSONL
@@ -2250,15 +2288,30 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                 // Save compactUuid so overlay can anchor to it after timeline refresh
                 setEditRangeState(prev => prev ? { ...prev, compactUuid: result.compactUuid } : null);
 
-                // Step 3: Restart Claude with --resume (uses existing PTY/shell)
-                console.warn('[EditRange] Restarting Claude...');
+                // Wait for shell to be fully ready before sending command
+                // (OSC 133 A may fire before shell input buffer is flushed)
+                await new Promise(resolve => setTimeout(resolve, 300));
+
+                // Step 3: Restart Claude with --resume using tab's sessionId (fork or original)
+                console.warn('[EditRange] Restarting Claude with session:', sessionId?.slice(0, 8));
                 ipcRenderer.send('claude:run-command', {
                   tabId,
                   command: 'claude-c',
                   sessionId,
                 });
 
-                return { removedCount: result.removedCount };
+                // Wait for Claude to start (isRunning = true = command running = sidebar green)
+                for (let i = 0; i < 30; i++) {
+                  await new Promise(resolve => setTimeout(resolve, 300));
+                  const state = await ipcRenderer.invoke('terminal:getCommandState', tabId);
+                  if (state?.isRunning) {
+                    console.warn('[EditRange] Claude running (sidebar green)');
+                    break;
+                  }
+                  if (i === 29) console.warn('[EditRange] Claude start timeout');
+                }
+
+                return { removedCount: result.removedCount, removedUsers: result.removedUsers };
               }}
               onClose={() => setEditRangeState(null)}
             />
@@ -2278,7 +2331,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                 right: `${notesPanelWidth + (treeMode ? 160 : 32) - 8}px`,
                 top: `${tooltipPos.wTop}px`,
                 height: `${tooltipPos.wH}px`,
-                zIndex: 10000,
+                zIndex: 10010,
                 display: 'flex',
                 flexDirection: 'row',
                 alignItems: tooltipPos.vAlign,

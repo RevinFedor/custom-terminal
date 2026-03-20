@@ -164,10 +164,12 @@ interface UIStore {
   historyPanelWidth: number;
   historyScrollToUuid: string | null;
   historyVisibleUuids: Record<string, string[]>;
+  historyScrollPositions: Record<string, number>;
   setHistoryPanelOpen: (tabId: string, open: boolean) => void;
   setHistoryPanelWidth: (width: number) => void;
   setHistoryScrollToUuid: (uuid: string | null) => void;
   setHistoryVisibleUuids: (tabId: string, uuids: string[]) => void;
+  setHistoryScrollPosition: (tabId: string, scrollTop: number) => void;
 
   // Timeline panel visibility (per-tab state, default open)
   timelinePanelOpenTabs: Record<string, boolean>;
@@ -759,17 +761,21 @@ export const useUIStore = create<UIStore>((set, get) => ({
   historyPanelWidth: (() => {
     try {
       const saved = localStorage.getItem('noted-terminal-history-panel-width');
-      return saved ? Math.max(280, Math.min(700, parseInt(saved, 10))) : 580;
+      return saved ? Math.max(280, parseInt(saved, 10)) : 580;
     } catch { return 580; }
   })(),
   historyScrollToUuid: null,
   historyVisibleUuids: {},
+  historyScrollPositions: {},
   setHistoryPanelOpen: (tabId, open) => set(state => ({
     historyPanelOpenTabs: { ...state.historyPanelOpenTabs, [tabId]: open }
   })),
   setHistoryScrollToUuid: (uuid) => set({ historyScrollToUuid: uuid }),
   setHistoryVisibleUuids: (tabId, uuids) => set(state => ({
     historyVisibleUuids: { ...state.historyVisibleUuids, [tabId]: uuids }
+  })),
+  setHistoryScrollPosition: (tabId, scrollTop) => set(state => ({
+    historyScrollPositions: { ...state.historyScrollPositions, [tabId]: scrollTop }
   })),
 
   timelinePanelOpenTabs: {},
@@ -782,7 +788,7 @@ export const useUIStore = create<UIStore>((set, get) => ({
     timelineTreeModeTabs: { ...state.timelineTreeModeTabs, [tabId]: open }
   })),
   setHistoryPanelWidth: (width) => {
-    const clamped = Math.max(280, Math.min(700, width));
+    const clamped = Math.max(280, width);
     set({ historyPanelWidth: clamped });
     localStorage.setItem('noted-terminal-history-panel-width', String(clamped));
   },

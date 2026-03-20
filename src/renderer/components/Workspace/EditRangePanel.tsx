@@ -34,8 +34,7 @@ interface EditRangePanelProps {
   anchorTop: number;
   anchorHeight: number;
   rightOffset: number;
-  /** Called to execute the full apply flow. Returns removedCount or throws. */
-  onApply: (compactText: string) => Promise<{ removedCount: number }>;
+  onApply: (compactText: string) => Promise<{ removedCount: number; removedUsers?: number; removedAssistants?: number }>;
   onClose: () => void;
 }
 
@@ -68,8 +67,9 @@ export default function EditRangePanel({
   // Apply flow state
   const [applyPhase, setApplyPhase] = useState<'idle' | 'running' | 'done'>('idle');
   const [applySteps, setApplySteps] = useState<ApplyStep[]>([]);
-  const [applyResult, setApplyResult] = useState<{ removedCount: number } | null>(null);
-  const autoCloseTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [applyResult, setApplyResult] = useState<{ removedCount: number; removedUsers?: number; removedAssistants?: number } | null>(null);
+  // Frozen position — captured when "Применить" is clicked, used for running/done
+  const [frozenPos, setFrozenPos] = useState<{ top: number; right: number } | null>(null);
 
   // Prompt settings (model, thinking)
   const promptConfig = getPromptById(rewindPromptId);
@@ -108,13 +108,16 @@ export default function EditRangePanel({
     return () => window.removeEventListener('keydown', handler);
   }, [onClose, applyPhase]);
 
-  // Auto-close after done
-  useEffect(() => {
-    return () => { if (autoCloseTimer.current) clearTimeout(autoCloseTimer.current); };
-  }, []);
 
   const handleApply = useCallback(async () => {
     if (!lastAssistant || isLoading || applyPhase !== 'idle') return;
+
+    // Freeze position from current panel rect
+    const panelRect = panelRef.current?.getBoundingClientRect();
+    if (panelRect) {
+      const centerY = panelRect.top + panelRect.height / 2;
+      setFrozenPos({ top: centerY - 50, right: rightOffset });
+    }
 
     setApplyPhase('running');
     setApplySteps([
@@ -129,9 +132,6 @@ export default function EditRangePanel({
 
       setApplyResult(result);
       setApplyPhase('done');
-
-      // Auto-close after 3s
-      autoCloseTimer.current = setTimeout(() => onClose(), 3000);
     } catch (err: any) {
       console.error('[EditRange] Apply failed:', err);
       setApplyPhase('idle');
@@ -286,12 +286,28 @@ export default function EditRangePanel({
   const vw = window.innerWidth;
   const maxW = vw - rightOffset - MARGIN;
   const maxH = vh - MARGIN * 2;
-  const w = Math.max(MIN_USABLE_W, Math.min(panelSize.width, maxW));
-  const h = Math.max(MIN_USABLE_H, Math.min(panelSize.height, maxH));
-  let top = anchorCenterY - h / 2;
-  // Clamp: don't go above or below viewport
-  if (top < MARGIN) top = MARGIN;
-  if (top + h > vh - MARGIN) top = vh - h - MARGIN;
+  const isCompact = applyPhase === 'running' || applyPhase === 'done';
+
+  let w: number;
+  let h: number | undefined;
+  let top: number;
+  let right: number;
+
+  if (isCompact && frozenPos) {
+    // Fixed compact widget at frozen position
+    w = 180;
+    h = undefined; // auto height
+    top = Math.max(MARGIN, Math.min(frozenPos.top, vh - 120));
+    right = frozenPos.right;
+  } else {
+    // Full chat panel — dynamic from anchor
+    w = Math.max(MIN_USABLE_W, Math.min(panelSize.width, maxW));
+    h = Math.max(MIN_USABLE_H, Math.min(panelSize.height, maxH));
+    top = anchorCenterY - h / 2;
+    right = rightOffset;
+    if (top < MARGIN) top = MARGIN;
+    if (top + h > vh - MARGIN) top = vh - h - MARGIN;
+  }
 
   return createPortal(
     <div
@@ -299,9 +315,9 @@ export default function EditRangePanel({
       style={{
         position: 'fixed',
         top: top,
-        right: rightOffset,
+        right: right,
         width: w,
-        height: h,
+        ...(h ? { height: h } : {}),
         zIndex: 10003,
         display: 'flex',
         flexDirection: 'column',
@@ -317,22 +333,12 @@ export default function EditRangePanel({
         if (applyPhase === 'done') onClose();
       }}
     >
-      {/* Resize handles */}
-      {/* Top */}
-      <div
-        onMouseDown={(e) => handleResizeStart('top', e)}
-        style={{ position: 'absolute', top: -3, left: 8, right: 8, height: 6, cursor: 'ns-resize', zIndex: 1 }}
-      />
-      {/* Bottom */}
-      <div
-        onMouseDown={(e) => handleResizeStart('bottom', e)}
-        style={{ position: 'absolute', bottom: -3, left: 8, right: 8, height: 6, cursor: 'ns-resize', zIndex: 1 }}
-      />
-      {/* Left */}
-      <div
-        onMouseDown={(e) => handleResizeStart('left', e)}
-        style={{ position: 'absolute', top: 8, bottom: 8, left: -3, width: 6, cursor: 'ew-resize', zIndex: 1 }}
-      />
+      {/* Resize handles — only in idle (chat) mode */}
+      {applyPhase === 'idle' && <>
+        <div onMouseDown={(e) => handleResizeStart('top', e)} style={{ position: 'absolute', top: -3, left: 8, right: 8, height: 6, cursor: 'ns-resize', zIndex: 1 }} />
+        <div onMouseDown={(e) => handleResizeStart('bottom', e)} style={{ position: 'absolute', bottom: -3, left: 8, right: 8, height: 6, cursor: 'ns-resize', zIndex: 1 }} />
+        <div onMouseDown={(e) => handleResizeStart('left', e)} style={{ position: 'absolute', top: 8, bottom: 8, left: -3, width: 6, cursor: 'ew-resize', zIndex: 1 }} />
+      </>}
       {/* === DONE STATE === */}
       {applyPhase === 'done' && (
         <div style={{
@@ -349,15 +355,20 @@ export default function EditRangePanel({
         }}
           onClick={(e) => { e.stopPropagation(); onClose(); }}
         >
-          <Check size={32} color="#4ade80" />
+          <Check size={28} color="#4ade80" />
           <span style={{ fontSize: '14px', fontWeight: 600, color: '#4ade80' }}>Готово</span>
           {applyResult && (
-            <span style={{ fontSize: '11px', color: '#888' }}>
-              Обработано {applyResult.removedCount} записей
-            </span>
+            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '4px' }}>
+              <span style={{ fontSize: '12px', color: '#ddd' }}>
+                Сокращено {applyResult.removedUsers || 0} сообщений
+              </span>
+              <span style={{ fontSize: '10px', color: '#666' }}>
+                {applyResult.removedCount} записей всего
+              </span>
+            </div>
           )}
-          <span style={{ fontSize: '10px', color: '#555', marginTop: '8px' }}>
-            Клик или закроется через 3 сек
+          <span style={{ fontSize: '10px', color: '#666', marginTop: '4px' }}>
+            Клик чтобы закрыть
           </span>
         </div>
       )}

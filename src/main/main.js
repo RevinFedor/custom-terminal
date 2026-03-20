@@ -4104,7 +4104,11 @@ ipcMain.handle('terminal:paste', async (event, { tabId, content, submit = true, 
 });
 // Send a slash command to Claude's Ink TUI (chunked paste + echo verification)
 ipcMain.handle('claude:is-active', (event, tabId) => {
-  return !!claudeCliActive.get(tabId);
+  const active = !!claudeCliActive.get(tabId);
+  const hasTerm = terminals.has(tabId);
+  const hasState = claudeState.has(tabId);
+  console.log('[claude:is-active] tab=' + tabId?.slice(-4) + ' active=' + active + ' hasTerm=' + hasTerm + ' hasState=' + hasState);
+  return active;
 });
 
 ipcMain.handle('claude:send-command', async (event, tabId, command) => {
@@ -6388,6 +6392,7 @@ ipcMain.on('claude:run-command', (event, { tabId, command, sessionId, forkSessio
 
       // Always launch claude without prompt (prompt will be sent after Tab)
       term.write('claude --dangerously-skip-permissions\r');
+      claudeCliActive.set(tabId, true);
       break;
     }
 
@@ -6405,6 +6410,8 @@ ipcMain.on('claude:run-command', (event, { tabId, command, sessionId, forkSessio
         }
 
         term.write(`claude --dangerously-skip-permissions --resume ${sessionId}\r`);
+        claudeCliActive.set(tabId, true);
+        console.log('[Claude Runner] claudeCliActive SET for tab', tabId, '(claude-c)');
 
         // Signal that command started (for Timeline visibility)
         if (mainWindow && !mainWindow.isDestroyed()) {
@@ -6495,6 +6502,8 @@ ipcMain.on('claude:run-command', (event, { tabId, command, sessionId, forkSessio
           // Enable thinking mode detection (will send Tab when '>' prompt appears)
           claudeState.set(tabId, 'WAITING_PROMPT');
           term.write(`claude --dangerously-skip-permissions --resume ${newSessionId}\r`);
+          claudeCliActive.set(tabId, true);
+          console.log('[Claude Runner] claudeCliActive SET for tab', tabId);
 
           // Notify renderer about new session ID
           event.sender.send('claude:session-detected', { tabId, sessionId: newSessionId });
