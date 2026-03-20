@@ -191,29 +191,38 @@ async function resolveSessionChain(sessionId, cwd, maxDepth = 10) {
 
     // SessionChain load logged silently (use [Claude Export] logs for debug)
 
-    if (bridgeSessionId) {
+    // Guard: fork files have "fake" bridges (all entries have different sessionId than filename)
+    const isFork = _projectManager?.db?.getParentSession?.(currentSessionId);
+
+    if (bridgeSessionId && !isFork) {
       sessionBoundaries.push({
         childSessionId: currentSessionId,
         parentSessionId: bridgeSessionId,
       });
       currentSessionId = bridgeSessionId;
+    } else if (bridgeSessionId && isFork) {
+      console.log('[SessionChain] Skipping fake bridge for fork', currentSessionId.substring(0, 8));
+      // Don't follow bridge — it's from copied parent chain, not real plan mode
+      break;
     } else {
       // No JSONL bridge — check SQLite for session link (Clear Context without bridge entry)
-      try {
-        const parentId = _projectManager?.db?.getSessionParent(currentSessionId);
-        console.log('[SessionChain] SQLite check for', currentSessionId.substring(0, 8) + ':', parentId ? parentId.substring(0, 8) : 'null', '_projectManager=' + !!_projectManager, 'db=' + !!_projectManager?.db);
-        if (parentId) {
-          console.log('[SessionChain] SQLite link:', currentSessionId.substring(0, 8) + '...', '→ parent:', parentId.substring(0, 8) + '...');
-          sessionBoundaries.push({
-            childSessionId: currentSessionId,
-            parentSessionId: parentId,
-          });
-          currentSessionId = parentId;
-          depth++;
-          continue;
+      if (!isFork) {
+        try {
+          const parentId = _projectManager?.db?.getSessionParent(currentSessionId);
+          console.log('[SessionChain] SQLite check for', currentSessionId.substring(0, 8) + ':', parentId ? parentId.substring(0, 8) : 'null', '_projectManager=' + !!_projectManager, 'db=' + !!_projectManager?.db);
+          if (parentId) {
+            console.log('[SessionChain] SQLite link:', currentSessionId.substring(0, 8) + '...', '→ parent:', parentId.substring(0, 8) + '...');
+            sessionBoundaries.push({
+              childSessionId: currentSessionId,
+              parentSessionId: parentId,
+            });
+            currentSessionId = parentId;
+            depth++;
+            continue;
+          }
+        } catch (e) {
+          console.error('[SessionChain] SQLite check FAILED for', currentSessionId.substring(0, 8) + ':', e.message);
         }
-      } catch (e) {
-        console.error('[SessionChain] SQLite check FAILED for', currentSessionId.substring(0, 8) + ':', e.message);
       }
       break;
     }
@@ -881,7 +890,8 @@ function register({ projectManager, formatToolAction }) {
 
       // Compact entry — sessionId from file entries, timestamp BEFORE entryAfter
       // (Claude resume picks newest leaf by timestamp — compact must be older than entries after it)
-      const fileSessionId = (entryBefore || entryAfter || activeBranch[0])?.sessionId || sessionId;
+      // If editing from start, use the target sessionId (filename) to avoid a fake bridge at the top
+      const fileSessionId = rangeStart === 0 ? sessionId : (entryBefore || entryAfter || activeBranch[0])?.sessionId || sessionId;
       const compactTs = entryAfter?.timestamp
         ? new Date(new Date(entryAfter.timestamp).getTime() - 1).toISOString()
         : entryBefore?.timestamp || new Date().toISOString();
@@ -1247,41 +1257,28 @@ function register({ projectManager, formatToolAction }) {
       // This helps the renderer detect if claudeSessionId needs updating
       const latestSessionId = resolveLatestSessionInChain(sessionId, cwd);
 
-      // Augment sessionBoundaries by scanning entries (active branch) for sessionId changes.
-      // Each change = potential plan mode boundary.
-      // Skip transitions that match fork_markers (those are fork points, not plan mode).
+      // Augment sessionBoundaries by scanning entries for sessionId changes.
+      // In merged fork files, ALL sessionId transitions = plan mode boundaries.
+      // resolveSessionChain returns 0 boundaries for single-file sessions,
+      // so augmentation catches transitions within the merged file.
       {
         const boundarySet = new Set(sessionBoundaries.map(b => b.parentSessionId + ':' + b.childSessionId));
-        // Get fork marker UUIDs to identify fork transitions
-        let forkUuids = new Set();
-        try {
-          const markers = _projectManager?.db?.getForkMarkers?.(sessionId) || [];
-          for (const m of markers) {
-            if (m.entry_uuids) {
-              const uuids = typeof m.entry_uuids === 'string' ? JSON.parse(m.entry_uuids) : m.entry_uuids;
-              for (const u of uuids) forkUuids.add(u);
-            }
-          }
-        } catch {}
-
         let prevSid = null;
-        let prevEntry = null;
+        let augmentCount = 0;
         for (const entry of entries) {
           if (!entry.sessionId) continue;
           if (prevSid && entry.sessionId !== prevSid) {
-            // Check: is this transition at a fork point?
-            const isForkTransition = prevEntry && forkUuids.has(prevEntry.uuid);
-            if (!isForkTransition) {
-              const key = prevSid + ':' + entry.sessionId;
-              if (!boundarySet.has(key)) {
-                sessionBoundaries.push({ parentSessionId: prevSid, childSessionId: entry.sessionId });
-                boundarySet.add(key);
-              }
+            const key = prevSid + ':' + entry.sessionId;
+            if (!boundarySet.has(key)) {
+              sessionBoundaries.push({ parentSessionId: prevSid, childSessionId: entry.sessionId });
+              boundarySet.add(key);
+              augmentCount++;
             }
           }
           prevSid = entry.sessionId;
-          prevEntry = entry;
         }
+        const uniqueSids = new Set(entries.map(e => e.sessionId).filter(Boolean));
+        console.log('[Timeline:Augment] sids=' + uniqueSids.size + ' added=' + augmentCount + ' total=' + sessionBoundaries.length, Array.from(uniqueSids).map(s => s.substring(0, 8)).join(','));
       }
 
       return { success: true, entries, latestSessionId, sessionBoundaries };

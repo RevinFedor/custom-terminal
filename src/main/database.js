@@ -956,18 +956,19 @@ class DatabaseManager {
    * @returns {Array<{source_session_id: string, entry_uuids: string[]}>}
    */
   getForkMarkers(sessionId) {
-    // Search by forked_to_session_id - we want to show the fork point on the CHILD session
+    // Search by both source and destination to show markers in both sessions
     const rows = this.db.prepare(`
-      SELECT source_session_id, entry_uuids_json, created_at
+      SELECT source_session_id, forked_to_session_id, entry_uuids_json, created_at
       FROM fork_markers
-      WHERE forked_to_session_id = ?
+      WHERE source_session_id = ? OR forked_to_session_id = ?
       ORDER BY created_at
-    `).all(sessionId);
+    `).all(sessionId, sessionId);
 
     console.log('[DB] getForkMarkers(' + sessionId?.slice(0, 8) + '...):', rows.length, 'rows');
 
     return rows.map(row => ({
       source_session_id: row.source_session_id,
+      fork_session_id: row.forked_to_session_id,
       entry_uuids: JSON.parse(row.entry_uuids_json || '[]'),
       created_at: row.created_at
     }));

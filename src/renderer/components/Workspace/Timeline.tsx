@@ -475,7 +475,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         }
         if (markersResult.success) {
           const markers = markersResult.markers || [];
-          console.log('[Timeline] Fork markers for session', sessionId, ':', markers.length, markers.length > 0 ? JSON.stringify(markers.map((m: ForkMarker) => m.source_session_id)) : '(empty)');
+          console.warn('[Timeline] Fork markers for session', sessionId, ':', markers.length, markers.length > 0 ? JSON.stringify(markers.map((m: ForkMarker) => ({ source: m.source_session_id?.substring(0, 8), uuids: m.entry_uuids?.length }))) : '(empty)');
           setForkMarkers(markers);
         }
       }
@@ -1703,9 +1703,19 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
               if (!m.entry_uuids || m.entry_uuids.length === 0) return false;
               const snapshotUuids = new Set(m.entry_uuids);
               if (!snapshotUuids.has(entry.uuid)) return false;
-              if (isLastEntry) return true;
+              if (isLastEntry) {
+                if (index === 0 || !forkMarkers._loggedPosition) {
+                  console.warn('[Timeline] Fork marker at LAST entry', index, '/', entries.length, entry.uuid?.substring(0, 8));
+                  (forkMarkers as any)._loggedPosition = true;
+                }
+                return true;
+              }
               const nextEntry = entries[index + 1];
-              return nextEntry && !snapshotUuids.has(nextEntry.uuid);
+              const isEnd = nextEntry && !snapshotUuids.has(nextEntry.uuid);
+              if (isEnd) {
+                console.warn('[Timeline] Fork marker at index', index, '/', entries.length, entry.uuid?.substring(0, 8), 'next:', nextEntry.uuid?.substring(0, 8));
+              }
+              return isEnd;
             });
 
             // Plan mode boundary = sessionId changes AND this transition is a known bridge (clear-context)
