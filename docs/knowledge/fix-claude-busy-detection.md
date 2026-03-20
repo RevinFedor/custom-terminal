@@ -48,7 +48,26 @@ Claude Code устанавливает заголовок терминала (ч
 
 Аналогичный cleanup для Gemini (`geminiSpinnerBusy.delete`) уже существовал — Claude был пропущен.
 
-## 4. Верификация
+## 4. DangerZone Ctrl+C (детерминированный выход из Claude)
+
+### Симптомы
+Программный выход из Claude CLI (для edit-range, rewind) ненадёжен: Claude не закрывается или команда после выхода теряется.
+
+### Отброшенные подходы
+- **0ms delay (два Ctrl+C подряд):** Ink merges два события в одно — Claude не выходит.
+- **500ms delay:** Ink успевает перерисовать prompt между Ctrl+C. Второй Ctrl+C воспринимается как НОВЫЙ первый → Claude снова показывает "Press Ctrl+C again to exit" вместо выхода.
+- **setTimeout для ожидания shell:** Ненадёжно, время варьируется.
+
+### Решение: Event-driven через DangerZone IPC
+1. Отправить Ctrl+C #1.
+2. Ждать IPC `claude:ctrlc-danger-zone` (PTY stream содержит "Press Ctrl-C again to exit" → main process детектирует → отправляет IPC).
+3. Отправить Ctrl+C #2.
+4. Poll `terminal:getCommandState` до `isRunning: false` (OSC 133 D).
+5. Ждать `terminal:prompt-ready` (OSC 133 A) перед отправкой следующей команды.
+
+Шаг 5 критичен: без ожидания OSC 133 A команда пишется в PTY до готовности shell — текст теряется или появляется в неправильном месте.
+
+## 5. Верификация
 Логика проверена на разных версиях Claude Code (v2.0 - v2.1.32+). Статус `busy` теперь корректно синхронизируется с реальным состоянием "размышления" агента.
 
 **Связанные факты:**

@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, Menu, dialog } = require('electron');
+const { app, BrowserWindow, ipcMain, Menu, dialog, shell } = require('electron');
 const path = require('path');
 const pty = require('node-pty');
 const fs = require('fs');
@@ -664,6 +664,22 @@ function createWindow() {
 
   mainWindow.webContents.on('did-fail-load', (event, errorCode, errorDescription) => {
     console.error('[Window] did-fail-load:', errorCode, errorDescription);
+  });
+
+  // Prevent the main window from navigating away (kills the renderer)
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    console.log('[Window] Blocked navigation to:', url);
+    event.preventDefault();
+    shell.openExternal(url);
+  });
+
+  // Intercept new window requests (target="_blank", window.open) → open in default browser
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    console.log('[Window] Intercepted new-window request:', url);
+    if (url.startsWith('http://') || url.startsWith('https://')) {
+      shell.openExternal(url);
+    }
+    return { action: 'deny' };
   });
 }
 
