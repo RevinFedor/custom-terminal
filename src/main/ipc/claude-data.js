@@ -191,38 +191,29 @@ async function resolveSessionChain(sessionId, cwd, maxDepth = 10) {
 
     // SessionChain load logged silently (use [Claude Export] logs for debug)
 
-    // Guard: fork files have "fake" bridges (all entries have different sessionId than filename)
-    const isFork = _projectManager?.db?.getParentSession?.(currentSessionId);
-
-    if (bridgeSessionId && !isFork) {
+    if (bridgeSessionId) {
       sessionBoundaries.push({
         childSessionId: currentSessionId,
         parentSessionId: bridgeSessionId,
       });
       currentSessionId = bridgeSessionId;
-    } else if (bridgeSessionId && isFork) {
-      console.log('[SessionChain] Skipping fake bridge for fork', currentSessionId.substring(0, 8));
-      // Don't follow bridge — it's from copied parent chain, not real plan mode
-      break;
     } else {
       // No JSONL bridge — check SQLite for session link (Clear Context without bridge entry)
-      if (!isFork) {
-        try {
-          const parentId = _projectManager?.db?.getSessionParent(currentSessionId);
-          console.log('[SessionChain] SQLite check for', currentSessionId.substring(0, 8) + ':', parentId ? parentId.substring(0, 8) : 'null', '_projectManager=' + !!_projectManager, 'db=' + !!_projectManager?.db);
-          if (parentId) {
-            console.log('[SessionChain] SQLite link:', currentSessionId.substring(0, 8) + '...', '→ parent:', parentId.substring(0, 8) + '...');
-            sessionBoundaries.push({
-              childSessionId: currentSessionId,
-              parentSessionId: parentId,
-            });
-            currentSessionId = parentId;
-            depth++;
-            continue;
-          }
-        } catch (e) {
-          console.error('[SessionChain] SQLite check FAILED for', currentSessionId.substring(0, 8) + ':', e.message);
+      try {
+        const parentId = _projectManager?.db?.getSessionParent(currentSessionId);
+        console.log('[SessionChain] SQLite check for', currentSessionId.substring(0, 8) + ':', parentId ? parentId.substring(0, 8) : 'null', '_projectManager=' + !!_projectManager, 'db=' + !!_projectManager?.db);
+        if (parentId) {
+          console.log('[SessionChain] SQLite link:', currentSessionId.substring(0, 8) + '...', '→ parent:', parentId.substring(0, 8) + '...');
+          sessionBoundaries.push({
+            childSessionId: currentSessionId,
+            parentSessionId: parentId,
+          });
+          currentSessionId = parentId;
+          depth++;
+          continue;
         }
+      } catch (e) {
+        console.error('[SessionChain] SQLite check FAILED for', currentSessionId.substring(0, 8) + ':', e.message);
       }
       break;
     }
@@ -705,80 +696,29 @@ function register({ projectManager, formatToolAction }) {
         return { success: false, error: 'Source session is empty' };
       }
 
-      // Generate new UUID for the main (tip) file
+      // Generate new UUID
       const newSessionId = crypto.randomUUID();
       console.log('[Claude Fork] New session ID:', newSessionId);
 
-      // Resolve full session chain to find ALL files
-      const { sessionBoundaries } = await resolveSessionChain(resolvedSourceId, cwd);
-
-      // Build ordered list of session files: [root, ..., parent, current]
-      const chainFiles = [];
-      let curId = resolvedSourceId;
-      const chainVisited = new Set();
-      // Walk backwards through boundaries to find all parent sessions
-      const parentMap = new Map(); // childId → parentId
-      for (const b of sessionBoundaries) {
-        parentMap.set(b.childSessionId, b.parentSessionId);
-      }
-      // Build chain from current to root
-      const chainIds = [curId];
-      while (parentMap.has(curId)) {
-        curId = parentMap.get(curId);
-        if (chainVisited.has(curId)) break;
-        chainVisited.add(curId);
-        chainIds.unshift(curId); // prepend parent
-      }
-
-      // Merge ALL chain files into ONE fork file
-      // Read all files in chain order (root first)
-      const allLines = [];
-      for (const oldId of chainIds) {
-        const fileFound = findSessionFile(oldId, cwd);
-        if (!fileFound) {
-          console.warn('[Claude Fork] Chain file not found:', oldId.slice(0, 8));
-          continue;
-        }
-        const content = fs.readFileSync(fileFound.filePath, 'utf-8');
-        for (const line of content.split('\n')) {
-          if (line.trim()) allLines.push(line);
-        }
-      }
-
-      // Map each unique sessionId to new UUID, tip → newSessionId
-      const sidMap = new Map();
-      sidMap.set(resolvedSourceId, newSessionId);
-      for (const line of allLines) {
-        try { const e = JSON.parse(line); if (e.sessionId && !sidMap.has(e.sessionId)) sidMap.set(e.sessionId, crypto.randomUUID()); }
-        catch {}
-      }
-      sidMap.set(resolvedSourceId, newSessionId);
-
       const destPath = path.join(projectDir, `${newSessionId}.jsonl`);
-      const rewritten = allLines.map(line => {
-        try {
-          const entry = JSON.parse(line);
-          if (entry.sessionId && sidMap.has(entry.sessionId)) entry.sessionId = sidMap.get(entry.sessionId);
-          return JSON.stringify(entry);
-        } catch { return line; }
-      }).join('\n') + '\n';
-      fs.writeFileSync(destPath, rewritten);
 
-      console.log('[Claude Fork] Merged', chainIds.length, 'chain files into 1 (' + allLines.length + ' lines)');
-
-      // Get Timeline UUIDs snapshot
-      const entryUuids = parseTimelineUuids(destPath);
+      // Get Timeline UUIDs snapshot using Backtrace algorithm (same as Timeline UI)
+      const entryUuids = parseTimelineUuids(sourcePath);
       console.log('[Claude Fork] Timeline entries:', entryUuids.length);
 
-      // Save fork marker
+      // Copy the file
+      fs.copyFileSync(sourcePath, destPath);
+      console.log('[Claude Fork] Copied:', sourcePath, '->', destPath);
+
+      // Save fork marker with UUIDs snapshot (always save, even if empty — marks fork at beginning)
       try {
         projectManager.db.saveForkMarker(resolvedSourceId, newSessionId, entryUuids);
         console.log('[Claude Fork] Fork marker saved with', entryUuids.length, 'UUIDs');
       } catch (e) {
         console.warn('[Claude Fork] Could not save fork marker:', e.message);
       }
-      // No session_links needed — single file, no chain
 
+      // Wait for Claude to index the new file
       await new Promise(resolve => setTimeout(resolve, 500));
 
       return { success: true, newSessionId, forkEntryCount: entryUuids.length };
@@ -1256,30 +1196,6 @@ function register({ projectManager, formatToolAction }) {
       // Resolve the latest session ID in the chain (tip)
       // This helps the renderer detect if claudeSessionId needs updating
       const latestSessionId = resolveLatestSessionInChain(sessionId, cwd);
-
-      // Augment sessionBoundaries by scanning entries for sessionId changes.
-      // In merged fork files, ALL sessionId transitions = plan mode boundaries.
-      // resolveSessionChain returns 0 boundaries for single-file sessions,
-      // so augmentation catches transitions within the merged file.
-      {
-        const boundarySet = new Set(sessionBoundaries.map(b => b.parentSessionId + ':' + b.childSessionId));
-        let prevSid = null;
-        let augmentCount = 0;
-        for (const entry of entries) {
-          if (!entry.sessionId) continue;
-          if (prevSid && entry.sessionId !== prevSid) {
-            const key = prevSid + ':' + entry.sessionId;
-            if (!boundarySet.has(key)) {
-              sessionBoundaries.push({ parentSessionId: prevSid, childSessionId: entry.sessionId });
-              boundarySet.add(key);
-              augmentCount++;
-            }
-          }
-          prevSid = entry.sessionId;
-        }
-        const uniqueSids = new Set(entries.map(e => e.sessionId).filter(Boolean));
-        console.log('[Timeline:Augment] sids=' + uniqueSids.size + ' added=' + augmentCount + ' total=' + sessionBoundaries.length, Array.from(uniqueSids).map(s => s.substring(0, 8)).join(','));
-      }
 
       return { success: true, entries, latestSessionId, sessionBoundaries };
 
