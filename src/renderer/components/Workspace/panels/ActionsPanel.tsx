@@ -1767,6 +1767,11 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
                             <div className={`absolute top-0.5 w-3 h-3 bg-white rounded-full ${includeSubagentHistory ? 'left-[14px]' : 'left-0.5'}`} />
                           </div>
                         </label>
+
+                        <div className="h-px bg-[#333] my-1" />
+                        <div className="px-1 text-[8px] text-[#555] leading-tight">
+                          Копирование · Обновление docs · Сокращение сессии
+                        </div>
                       </div>
                     </div>
                   </SettingsPortal>

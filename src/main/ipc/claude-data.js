@@ -753,7 +753,7 @@ function register({ projectManager, formatToolAction }) {
         } catch { allRecords.push(null); }
       }
 
-      // Build backtrace chain (active branch) to identify the range
+      // Build backtrace chain (active branch)
       const lastRecord = allRecords.filter(r => r?.uuid).pop();
       if (!lastRecord) return { success: false, error: 'No records in file' };
 
@@ -768,7 +768,7 @@ function register({ projectManager, formatToolAction }) {
         cur = rec.logicalParentUuid || rec.parentUuid;
       }
 
-      // Find range indices in active branch
+      // Find range in active branch by UUID
       const startIdx = activeBranch.findIndex(e => e.uuid === startUuid);
       const endIdx = activeBranch.findIndex(e => e.uuid === endUuid);
       if (startIdx === -1 || endIdx === -1) {
@@ -777,83 +777,117 @@ function register({ projectManager, formatToolAction }) {
       const rangeStart = Math.min(startIdx, endIdx);
       const rangeEnd = Math.max(startIdx, endIdx);
 
-      // Expand range to complete turns (include assistant after each user, user after each assistant)
-      let expandedStart = rangeStart;
-      let expandedEnd = rangeEnd;
-      // Expand backwards: if first entry is assistant with tool_result user before it
-      while (expandedStart > 0) {
-        const prev = activeBranch[expandedStart - 1];
-        const curr = activeBranch[expandedStart];
-        if (curr.type === 'user' && curr.message?.content &&
-            Array.isArray(curr.message.content) &&
-            curr.message.content.some(b => b.type === 'tool_result')) {
-          expandedStart--;
-        } else break;
-      }
-      // Expand forwards: if last entry is assistant with tool_use, include following tool_result user
-      while (expandedEnd < activeBranch.length - 1) {
-        const curr = activeBranch[expandedEnd];
-        const next = activeBranch[expandedEnd + 1];
-        if (curr.type === 'assistant' && next.type === 'user' &&
-            next.message?.content && Array.isArray(next.message.content) &&
-            next.message.content.some(b => b.type === 'tool_result')) {
-          expandedEnd++;
-        } else break;
-      }
-
-      console.log('[EditRange] Range:', rangeStart, '→', rangeEnd, 'Expanded:', expandedStart, '→', expandedEnd,
-        'of', activeBranch.length, 'active entries');
-
-      // Collect UUIDs to remove
+      // Remove everything from startUuid to endUuid inclusive.
+      // If endUuid is a user entry, also remove the SINGLE assistant response right after it
+      // (but NOT system entries like turn_duration — they may belong to entries outside the range).
       const removeUuids = new Set();
-      for (let i = expandedStart; i <= expandedEnd; i++) {
+      for (let i = rangeStart; i <= rangeEnd; i++) {
         removeUuids.add(activeBranch[i].uuid);
       }
-
-      // Also remove progress entries linked to removed tool_use blocks
-      for (const rec of allRecords) {
-        if (!rec) continue;
-        if (rec.type === 'progress' && rec.parentToolUseID) {
-          // Check if the parent tool_use is in a removed assistant entry
-          for (let i = expandedStart; i <= expandedEnd; i++) {
-            const entry = activeBranch[i];
-            if (entry.type === 'assistant' && entry.message?.content) {
-              const blocks = Array.isArray(entry.message.content) ? entry.message.content : [];
-              if (blocks.some(b => b.type === 'tool_use' && b.id === rec.parentToolUseID)) {
-                removeUuids.add(rec.uuid);
-              }
-            }
+      // If last entry in range is user, include its direct assistant response(s)
+      if (activeBranch[rangeEnd].type === 'user') {
+        for (let i = rangeEnd + 1; i < activeBranch.length; i++) {
+          const entry = activeBranch[i];
+          if (entry.type === 'assistant') {
+            removeUuids.add(entry.uuid);
+          } else {
+            break; // system or next user — stop
           }
         }
       }
 
-      console.log('[EditRange] Removing', removeUuids.size, 'records (incl progress)');
+      // Also remove progress entries linked to removed entries
+      for (const rec of allRecords) {
+        if (!rec || !rec.parentToolUseID) continue;
+        if (rec.type !== 'progress') continue;
+        for (const uuid of removeUuids) {
+          const entry = recordMap.get(uuid);
+          if (entry?.type === 'assistant' && Array.isArray(entry.message?.content) &&
+              entry.message.content.some(b => b.type === 'tool_use' && b.id === rec.parentToolUseID)) {
+            removeUuids.add(rec.uuid);
+            break;
+          }
+        }
+      }
+
+      // Find actual last removed index in activeBranch (after forward expand)
+      let actualEnd = rangeEnd;
+      for (let i = rangeEnd + 1; i < activeBranch.length; i++) {
+        if (removeUuids.has(activeBranch[i].uuid)) actualEnd = i;
+        else break;
+      }
 
       // Create compact replacement entry
-      const entryBefore = expandedStart > 0 ? activeBranch[expandedStart - 1] : null;
-      const entryAfter = expandedEnd < activeBranch.length - 1 ? activeBranch[expandedEnd + 1] : null;
+      const entryBefore = rangeStart > 0 ? activeBranch[rangeStart - 1] : null;
+      const entryAfter = actualEnd < activeBranch.length - 1 ? activeBranch[actualEnd + 1] : null;
+
+      console.log('[EditRange] Range:', rangeStart, '→', rangeEnd, '→ actualEnd:', actualEnd,
+        'of', activeBranch.length, 'active. Removing', removeUuids.size, 'records');
+      console.log('[EditRange] Active branch:', activeBranch.map((e, i) => `${i}:${e.type}(${e.uuid?.slice(0,6)})`).join(' '));
+      console.log('[EditRange] entryBefore:', entryBefore?.uuid?.slice(0,8), entryBefore?.type, '| entryAfter:', entryAfter?.uuid?.slice(0,8), entryAfter?.type);
+      console.log('[EditRange] File records:', allRecords.filter(r => r).length, '→ Keeping:', allRecords.filter(r => r && !removeUuids.has(r.uuid)).length);
       const compactUuid = crypto.randomUUID();
 
+      // Compact entry — sessionId from file entries, timestamp BEFORE entryAfter
+      // (Claude resume picks newest leaf by timestamp — compact must be older than entries after it)
+      const fileSessionId = (entryBefore || entryAfter || activeBranch[0])?.sessionId || sessionId;
+      const compactTs = entryAfter?.timestamp
+        ? new Date(new Date(entryAfter.timestamp).getTime() - 1).toISOString()
+        : entryBefore?.timestamp || new Date().toISOString();
+      console.log('[EditRange] Compact: sid=' + fileSessionId?.slice(0, 8) + ' ts=' + compactTs?.slice(0, 19) + ' uuid=' + compactUuid?.slice(0, 8));
       const compactEntry = {
         parentUuid: entryBefore?.uuid || null,
         isSidechain: false,
         userType: 'external',
         cwd: cwd || '',
-        sessionId: sessionId,
+        sessionId: fileSessionId,
         version: '1.0.0',
         type: 'user',
         message: { role: 'user', content: compactText },
         uuid: compactUuid,
-        timestamp: new Date().toISOString()
+        timestamp: compactTs
       };
 
-      // Build output: filter removed, relink entry after range, append compact
+      // Clean up: if the VERY LAST entry in active chain is [Request interrupted],
+      // remove it — it was created by our Ctrl+C when exiting Claude.
+      // Only remove ONE (the last). If user had their own interrupted before — leave it.
+      const lastEntry = activeBranch[activeBranch.length - 1];
+      if (lastEntry && !removeUuids.has(lastEntry.uuid)) {
+        const lastContent = lastEntry.message?.content;
+        if (typeof lastContent === 'string' && lastContent.startsWith('[Request interrupted')) {
+          removeUuids.add(lastEntry.uuid);
+          console.log('[EditRange] Removing Ctrl+C interrupted:', lastEntry.uuid?.slice(0, 8));
+        }
+      }
+
+      // If editing from start (rangeStart=0), remove ALL records that are not
+      // in the active branch AFTER the deleted range. This cleans bridge entries,
+      // dead branches, last-prompt markers from parent sessions, etc.
+      if (rangeStart === 0) {
+        const keepUuids = new Set();
+        // Keep: entries after range in active branch
+        for (let i = (entryAfter ? activeBranch.indexOf(entryAfter) : activeBranch.length); i < activeBranch.length; i++) {
+          if (i >= 0) keepUuids.add(activeBranch[i].uuid);
+        }
+        // Mark everything else for removal
+        for (const rec of allRecords) {
+          if (!rec) continue;
+          if (rec.uuid && !keepUuids.has(rec.uuid) && !removeUuids.has(rec.uuid)) {
+            removeUuids.add(rec.uuid);
+          }
+        }
+        console.log('[EditRange] rangeStart=0: keeping', keepUuids.size, 'post-range entries, total removing', removeUuids.size);
+      }
+
+      // Build output: filter removed + remove orphan last-prompt/non-uuid entries
       const outputLines = [];
       for (const rec of allRecords) {
         if (!rec) continue;
-        if (removeUuids.has(rec.uuid)) continue;
+        if (rec.uuid && removeUuids.has(rec.uuid)) continue;
+        // Remove last-prompt entries when editing from start (clean slate)
+        if (rangeStart === 0 && rec.type === 'last-prompt') continue;
 
-        // Relink: entry after range points to compact entry instead of last removed
+        // Relink: entry after range points to compact instead of last removed
         if (entryAfter && rec.uuid === entryAfter.uuid) {
           rec.parentUuid = compactUuid;
         }
@@ -861,7 +895,7 @@ function register({ projectManager, formatToolAction }) {
         outputLines.push(JSON.stringify(rec));
       }
 
-      // Insert compact entry (before the entry-after-range for logical order)
+      // Insert compact + ack entries (before the entry-after-range for logical order)
       if (entryAfter) {
         const afterIdx = outputLines.findIndex(l => {
           try { return JSON.parse(l).uuid === entryAfter.uuid; } catch { return false; }
@@ -883,8 +917,30 @@ function register({ projectManager, formatToolAction }) {
       // Invalidate cache
       _jsonlCache.delete(filePath);
 
-      console.log('[EditRange] Written', outputLines.length, 'records to', filePath);
-      return { success: true, removedCount: removeUuids.size, compactUuid };
+      // If range started from beginning (bridge removed), clean session_links
+      // so resolveSessionChain doesn't re-attach parent session
+      if (rangeStart === 0 && projectManager?.db) {
+        try {
+          projectManager.db.db.prepare('DELETE FROM session_links WHERE child_session_id = ?').run(fileSessionId);
+          console.log('[EditRange] Cleaned session_links for', fileSessionId?.slice(0, 8));
+        } catch (e) {
+          console.warn('[EditRange] Could not clean session_links:', e.message);
+        }
+      }
+
+      // Count removed by type
+      let removedUsers = 0, removedAssistants = 0, removedOther = 0;
+      for (const uuid of removeUuids) {
+        const rec = recordMap.get(uuid);
+        if (!rec) continue;
+        if (rec.type === 'user') removedUsers++;
+        else if (rec.type === 'assistant') removedAssistants++;
+        else removedOther++;
+      }
+
+      console.log('[EditRange] Written', outputLines.length, 'records. Removed:', removeUuids.size,
+        `(${removedUsers} user, ${removedAssistants} assistant, ${removedOther} other)`);
+      return { success: true, removedCount: removeUuids.size, removedUsers, removedAssistants, compactUuid, fileSessionId };
 
     } catch (error) {
       console.error('[EditRange] Error:', error);
@@ -1139,6 +1195,28 @@ function register({ projectManager, formatToolAction }) {
       // Resolve the latest session ID in the chain (tip)
       // This helps the renderer detect if claudeSessionId needs updating
       const latestSessionId = resolveLatestSessionInChain(sessionId, cwd);
+
+      // Augment sessionBoundaries with bridge entries from recordMap.
+      // resolveSessionChain only adds file-level boundaries. In forked files,
+      // copied bridge entries represent original clear-context transitions that
+      // are missing from sessionBoundaries (see fact-backtrace-jsonl.md §3.1).
+      const boundarySet = new Set(sessionBoundaries.map(b => b.parentSessionId + ':' + b.childSessionId));
+      for (const [, rec] of recordMap) {
+        if (!rec._isBridge || !rec.sessionId) continue;
+        const parentSid = rec.sessionId;
+        const fileSid = rec._fromFile;
+        // Find child sessionId: any entry in the same file with a different sessionId
+        for (const [, other] of recordMap) {
+          if (other._fromFile !== fileSid) continue;
+          if (!other.sessionId || other.sessionId === parentSid) continue;
+          const key = parentSid + ':' + other.sessionId;
+          if (!boundarySet.has(key)) {
+            sessionBoundaries.push({ parentSessionId: parentSid, childSessionId: other.sessionId });
+            boundarySet.add(key);
+          }
+          break;
+        }
+      }
 
       return { success: true, entries, latestSessionId, sessionBoundaries };
 
@@ -1758,35 +1836,14 @@ function register({ projectManager, formatToolAction }) {
         }
       };
 
-      // Fork markers
-      const forkBoundaryUuids = new Set();
+      // Fork-at-beginning detection (empty snapshot = fork before any entries)
       let hasForkAtBeginning = false;
       try {
         const forkMarkers = projectManager.db.getForkMarkers(sessionId);
         for (const marker of forkMarkers) {
-          const snapshotSet = new Set(marker.entry_uuids || []);
-          if (snapshotSet.size === 0) {
+          if ((marker.entry_uuids || []).length === 0) {
             hasForkAtBeginning = true;
-            continue;
-          }
-          const isTimelineEntry = (rec) => {
-            if (rec.type === 'system' && rec.subtype === 'compact_boundary') return true;
-            if (rec.type !== 'user') return false;
-            if (rec.isSidechain || rec.isMeta) return false;
-            const content = rec.message?.content;
-            if (Array.isArray(content) && content.some(item => item.type === 'tool_result')) return false;
-            return true;
-          };
-          for (let idx = 0; idx < activeBranch.length; idx++) {
-            const rec = activeBranch[idx];
-            if (!snapshotSet.has(rec.uuid)) continue;
-            let nextTE = null;
-            for (let j = idx + 1; j < activeBranch.length; j++) {
-              if (isTimelineEntry(activeBranch[j])) { nextTE = activeBranch[j]; break; }
-            }
-            if (!nextTE || !snapshotSet.has(nextTE.uuid)) {
-              forkBoundaryUuids.add(rec.uuid);
-            }
+            break;
           }
         }
       } catch (e) {
@@ -1949,17 +2006,9 @@ function register({ projectManager, formatToolAction }) {
           });
         }
 
-        // Fork boundary after entry (skip compact entries — compact IS the boundary)
-        if (forkBoundaryUuids.has(entry.uuid) &&
-            !(entry.type === 'system' && entry.subtype === 'compact_boundary')) {
-          entries.push({
-            uuid: 'fork-after-' + entry.uuid,
-            role: 'fork',
-            timestamp: '',
-            content: 'FORK',
-            sessionId: entrySid
-          });
-        }
+        // Fork boundary markers (forkBoundaryUuids) are NOT inserted here —
+        // session boundary detection (sessionId change check above) already handles fork separators.
+        // Adding them here caused duplicate FORK labels due to inherited markers accumulating.
       }
 
       const latestSessionId = resolveLatestSessionInChain(sessionId, cwd);

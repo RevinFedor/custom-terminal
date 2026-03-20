@@ -1,5 +1,5 @@
-import React, { useEffect, useLayoutEffect, useState, useRef, useCallback, memo, startTransition } from 'react';
-import { X, ChevronDown, ChevronRight } from 'lucide-react';
+import React, { useEffect, useLayoutEffect, useState, useRef, useCallback, useMemo, memo, startTransition } from 'react';
+import { X, ChevronDown, ChevronRight, Search, ArrowUp, ArrowDown } from 'lucide-react';
 import { useUIStore } from '../../store/useUIStore';
 import MarkdownRenderer from '../Research/MarkdownRenderer';
 
@@ -394,7 +394,7 @@ const HistoryEntry = memo(({ entry, toolType }: { entry: FullHistoryEntry; toolT
   );
 });
 
-// Flash highlight keyframes (injected once)
+// Flash highlight + search highlight keyframes (injected once)
 if (!document.getElementById('hp-flash-style')) {
   const style = document.createElement('style');
   style.id = 'hp-flash-style';
@@ -402,6 +402,14 @@ if (!document.getElementById('hp-flash-style')) {
   0%   { background-color: transparent; }
   20%  { background-color: rgba(91, 156, 245, 0.2); }
   100% { background-color: transparent; }
+}
+::highlight(hp-search) {
+  background-color: rgba(234, 179, 8, 0.35);
+  color: inherit;
+}
+::highlight(hp-search-current) {
+  background-color: rgba(234, 179, 8, 0.8);
+  color: #000;
 }`;
   document.head.appendChild(style);
 }
@@ -420,7 +428,20 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
   const historyScrollToUuid = useUIStore((s) => s.historyScrollToUuid);
   const setHistoryScrollToUuid = useUIStore((s) => s.setHistoryScrollToUuid);
   const setHistoryVisibleUuids = useUIStore((s) => s.setHistoryVisibleUuids);
+  const setHistoryScrollPosition = useUIStore((s) => s.setHistoryScrollPosition);
   const closePanel = useCallback(() => setHistoryPanelOpen(tabId, false), [tabId, setHistoryPanelOpen]);
+
+  // Save scroll position + clean up CSS highlights on unmount
+  useEffect(() => {
+    return () => {
+      const el = scrollRef.current;
+      if (el) setHistoryScrollPosition(tabId, el.scrollTop);
+      if (scrollSaveTimerRef.current) clearTimeout(scrollSaveTimerRef.current);
+      const CSS_HL = (CSS as any).highlights;
+      CSS_HL?.delete('hp-search');
+      CSS_HL?.delete('hp-search-current');
+    };
+  }, [tabId, setHistoryScrollPosition]);
 
   // Slide animation state
   const [slideIn, setSlideIn] = useState(false);
@@ -440,6 +461,184 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
   const isResizing = useRef(false);
   const isAtBottomRef = useRef(true);
   const prevVisibleUuidsRef = useRef('');
+  const scrollSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // ========== SEARCH ==========
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [currentMatchIdx, setCurrentMatchIdx] = useState(0);
+  const searchInputRef = useRef<HTMLInputElement>(null);
+
+  // Build flat list of match positions: { entryIdx, entryUuid, offset }
+  const matchPositions = useMemo(() => {
+    if (!searchQuery || searchQuery.length < 2) return [];
+    const q = searchQuery.toLowerCase();
+    const positions: Array<{ entryIdx: number; entryUuid: string; offset: number }> = [];
+    for (let i = 0; i < entries.length; i++) {
+      const text = (entries[i].content || '').toLowerCase();
+      let idx = text.indexOf(q);
+      while (idx !== -1) {
+        positions.push({ entryIdx: i, entryUuid: entries[i].uuid, offset: idx });
+        idx = text.indexOf(q, idx + 1);
+      }
+    }
+    return positions;
+  }, [entries, searchQuery]);
+
+  // Reset current match when query changes and scroll to first match
+  useEffect(() => {
+    if (matchPositions.length > 0) {
+      setCurrentMatchIdx(0);
+      // Scroll to first match
+      const match = matchPositions[0];
+      const el = scrollRef.current;
+      if (el) {
+        const entryEl = el.querySelector(`[data-uuid="${match.entryUuid}"]`) as HTMLElement;
+        if (entryEl) entryEl.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      }
+    }
+  }, [searchQuery]);
+
+  // Navigate to current match entry
+  const scrollToMatch = useCallback((idx: number) => {
+    if (idx < 0 || idx >= matchPositions.length) return;
+    const match = matchPositions[idx];
+    const el = scrollRef.current;
+    if (!el) return;
+    const entryEl = el.querySelector(`[data-uuid="${match.entryUuid}"]`) as HTMLElement;
+    if (entryEl) {
+      entryEl.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    }
+  }, [matchPositions]);
+
+  const goNextMatch = useCallback(() => {
+    if (matchPositions.length === 0) return;
+    const next = (currentMatchIdx + 1) % matchPositions.length;
+    setCurrentMatchIdx(next);
+    scrollToMatch(next);
+  }, [currentMatchIdx, matchPositions.length, scrollToMatch]);
+
+  const goPrevMatch = useCallback(() => {
+    if (matchPositions.length === 0) return;
+    const prev = (currentMatchIdx - 1 + matchPositions.length) % matchPositions.length;
+    setCurrentMatchIdx(prev);
+    scrollToMatch(prev);
+  }, [currentMatchIdx, matchPositions.length, scrollToMatch]);
+
+  // CSS Highlight API — apply highlights after render
+  useEffect(() => {
+    const CSS_HL = (CSS as any).highlights;
+    if (!CSS_HL || !scrollRef.current) {
+      CSS_HL?.delete('hp-search');
+      CSS_HL?.delete('hp-search-current');
+      return;
+    }
+    if (!searchQuery || searchQuery.length < 2 || matchPositions.length === 0) {
+      CSS_HL.delete('hp-search');
+      CSS_HL.delete('hp-search-current');
+      return;
+    }
+
+    // Debounce DOM traversal slightly
+    const timer = setTimeout(() => {
+      const q = searchQuery.toLowerCase();
+      const qLen = searchQuery.length;
+      const allRanges: Range[] = [];
+      const currentRanges: Range[] = [];
+      const currentMatch = matchPositions[currentMatchIdx];
+
+      // Walk all text nodes in scroll container
+      const walker = document.createTreeWalker(scrollRef.current!, NodeFilter.SHOW_TEXT);
+      // Track which data-uuid entry we're inside + occurrence index per entry
+      const entryOccurrences = new Map<string, number>();
+
+      while (walker.nextNode()) {
+        const node = walker.currentNode as Text;
+        const text = node.textContent?.toLowerCase();
+        if (!text) continue;
+
+        // Find which entry this node belongs to
+        let entryUuid = '';
+        let parent = node.parentElement;
+        while (parent && parent !== scrollRef.current) {
+          if (parent.dataset?.uuid) { entryUuid = parent.dataset.uuid; break; }
+          parent = parent.parentElement;
+        }
+
+        let idx = text.indexOf(q);
+        while (idx !== -1) {
+          try {
+            const range = new Range();
+            range.setStart(node, idx);
+            range.setEnd(node, idx + qLen);
+            allRanges.push(range);
+
+            // Check if this is the current match
+            if (currentMatch && entryUuid === currentMatch.entryUuid) {
+              const occ = entryOccurrences.get(entryUuid) || 0;
+              // Find how many matches exist for this entry before currentMatchIdx
+              const entryMatches = matchPositions.filter(m => m.entryUuid === entryUuid);
+              const localIdx = entryMatches.findIndex(m => m === currentMatch);
+              if (occ === localIdx) {
+                currentRanges.push(range);
+              }
+              entryOccurrences.set(entryUuid, occ + 1);
+            }
+          } catch {}
+          idx = text.indexOf(q, idx + 1);
+        }
+      }
+
+      if (allRanges.length > 0) {
+        CSS_HL.set('hp-search', new (window as any).Highlight(...allRanges));
+      } else {
+        CSS_HL.delete('hp-search');
+      }
+      if (currentRanges.length > 0) {
+        CSS_HL.set('hp-search-current', new (window as any).Highlight(...currentRanges));
+      } else {
+        CSS_HL.delete('hp-search-current');
+      }
+    }, 50);
+
+    return () => {
+      clearTimeout(timer);
+      CSS_HL?.delete('hp-search');
+      CSS_HL?.delete('hp-search-current');
+    };
+  }, [searchQuery, matchPositions, currentMatchIdx, entries]);
+
+  // Ctrl+F handler — scoped to history panel
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (!isOpen) return;
+      if (e.metaKey && e.key === 'f') {
+        e.preventDefault();
+        e.stopPropagation();
+        setSearchOpen(true);
+        setTimeout(() => searchInputRef.current?.focus(), 50);
+      }
+      if (e.key === 'Escape' && searchOpen) {
+        e.stopPropagation();
+        setSearchOpen(false);
+        setSearchQuery('');
+        setCurrentMatchIdx(0);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown, true); // capture phase
+    return () => window.removeEventListener('keydown', handleKeyDown, true);
+  }, [isOpen, searchOpen]);
+
+  const openSearch = useCallback(() => {
+    setSearchOpen(true);
+    setTimeout(() => searchInputRef.current?.focus(), 50);
+  }, []);
+
+  const closeSearch = useCallback(() => {
+    setSearchOpen(false);
+    setSearchQuery('');
+    setCurrentMatchIdx(0);
+  }, []);
 
   // Scroll to bottom helper
   const scrollToBottom = useCallback((smooth = false) => {
@@ -490,11 +689,33 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
   }, [loading, tabId]);
 
   // Initial load on mount / session change / tool type switch
+  const initialLoadDoneRef = useRef(false);
   useEffect(() => {
+    initialLoadDoneRef.current = false;
     setLoading(true);
     setEntries([]);
     loadHistory(false);
   }, [sessionId, toolType]);
+
+  // Restore saved scroll position after initial load completes
+  useEffect(() => {
+    if (loading || initialLoadDoneRef.current) return;
+    initialLoadDoneRef.current = true;
+    const savedPos = useUIStore.getState().historyScrollPositions[tabId];
+    if (savedPos && savedPos > 0) {
+      // Wait for DOM to render entries, then restore scroll
+      requestAnimationFrame(() => {
+        const el = scrollRef.current;
+        if (el) {
+          el.scrollTop = savedPos;
+          // contentVisibility:auto may cause layout shifts — retry once
+          requestAnimationFrame(() => {
+            if (el) el.scrollTop = savedPos;
+          });
+        }
+      });
+    }
+  }, [loading, tabId]);
 
   // Incremental refresh every 3s
   useEffect(() => {
@@ -541,7 +762,7 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
     return () => { cancelled = true; };
   }, [historyScrollToUuid, loading, entries]);
 
-  // Native scroll handler — at-bottom detection + scroll direction tracking
+  // Native scroll handler — at-bottom detection + scroll direction tracking + position save
   const lastScrollTopRef = useRef(0);
   const scrollDirectionRef = useRef<'down' | 'up'>('down');
   const handleScroll = useCallback(() => {
@@ -551,7 +772,12 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
     isAtBottomRef.current = distFromBottom < 150;
     scrollDirectionRef.current = el.scrollTop >= lastScrollTopRef.current ? 'down' : 'up';
     lastScrollTopRef.current = el.scrollTop;
-  }, []);
+    // Debounced save of scroll position per-tab
+    if (scrollSaveTimerRef.current) clearTimeout(scrollSaveTimerRef.current);
+    scrollSaveTimerRef.current = setTimeout(() => {
+      setHistoryScrollPosition(tabId, el.scrollTop);
+    }, 150);
+  }, [tabId, setHistoryScrollPosition]);
 
   // Keep entries ref fresh for observer closure (avoids stale data if entries update with same length)
   const entriesRef = useRef(entries);
@@ -646,7 +872,7 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
       if (!isResizing.current) return;
       const rightEdge = document.body.clientWidth - notesPanelWidth;
       const newWidth = rightEdge - e.clientX;
-      if (newWidth >= 280 && newWidth <= 700) {
+      if (newWidth >= 280) {
         setHistoryPanelWidth(newWidth);
       }
     };
@@ -701,16 +927,68 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
       {/* Header */}
       <div
         style={{
-          height: 30, display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-          padding: '0 12px', borderBottom: '1px solid #333', flexShrink: 0,
+          display: 'flex', alignItems: 'center', height: 30,
+          padding: '0 8px 0 12px', borderBottom: '1px solid #333', flexShrink: 0, gap: 6,
         }}
       >
-        <span style={{ fontSize: 12, color: '#999', fontWeight: 500 }}>History</span>
+        <span style={{ fontSize: 12, color: '#999', fontWeight: 500, flexShrink: 0 }}>History</span>
+        <button
+          onClick={openSearch}
+          title="Search (Cmd+F)"
+          style={{
+            background: 'none', border: 'none', color: searchOpen ? '#e0e0e0' : '#666',
+            cursor: 'pointer', padding: 2, display: 'flex', alignItems: 'center', flexShrink: 0,
+          }}
+          onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.color = '#fff'; }}
+          onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.color = searchOpen ? '#e0e0e0' : '#666'; }}
+        >
+          <Search size={13} />
+        </button>
+        {searchOpen && (
+          <>
+            <input
+              ref={searchInputRef}
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); goNextMatch(); }
+                if (e.key === 'Enter' && e.shiftKey) { e.preventDefault(); goPrevMatch(); }
+                if (e.key === 'Escape') { e.preventDefault(); closeSearch(); }
+                // Only stop propagation for keys the input handles — let modifiers (Meta, Shift, etc.) through
+                if (e.key === 'Enter' || e.key === 'Escape') e.stopPropagation();
+              }}
+              placeholder="Search..."
+              style={{
+                flex: 1, minWidth: 0, height: 20, fontSize: 12,
+                backgroundColor: '#2a2a2a', border: '1px solid #444', borderRadius: 3,
+                color: '#e0e0e0', padding: '0 6px', outline: 'none',
+              }}
+              onFocus={(e) => { (e.currentTarget as HTMLInputElement).style.borderColor = '#5b9cf5'; }}
+              onBlur={(e) => { (e.currentTarget as HTMLInputElement).style.borderColor = '#444'; }}
+            />
+            <button onClick={goPrevMatch} title="Previous (Shift+Enter)" style={{ background: 'none', border: 'none', color: '#888', cursor: 'pointer', padding: 1, display: 'flex' }}
+              onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.color = '#fff'; }}
+              onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.color = '#888'; }}
+            ><ArrowUp size={14} /></button>
+            <button onClick={goNextMatch} title="Next (Enter)" style={{ background: 'none', border: 'none', color: '#888', cursor: 'pointer', padding: 1, display: 'flex' }}
+              onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.color = '#fff'; }}
+              onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.color = '#888'; }}
+            ><ArrowDown size={14} /></button>
+            <span style={{ fontSize: 11, color: '#666', flexShrink: 0, minWidth: 35, textAlign: 'right' }}>
+              {matchPositions.length > 0 ? `${currentMatchIdx + 1}/${matchPositions.length}` : searchQuery.length >= 2 ? '0' : ''}
+            </span>
+            <button onClick={closeSearch} title="Close search (Esc)" style={{ background: 'none', border: 'none', color: '#666', cursor: 'pointer', padding: 1, display: 'flex', flexShrink: 0 }}
+              onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.color = '#fff'; }}
+              onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.color = '#666'; }}
+            ><X size={13} /></button>
+          </>
+        )}
+        {!searchOpen && <div style={{ flex: 1 }} />}
         <button
           onClick={closePanel}
           style={{
             background: 'none', border: 'none', color: '#666',
-            cursor: 'pointer', padding: 2, display: 'flex', alignItems: 'center',
+            cursor: 'pointer', padding: 2, display: 'flex', alignItems: 'center', flexShrink: 0,
           }}
           onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.color = '#fff'; }}
           onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.color = '#666'; }}
