@@ -226,6 +226,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   const [visibleEntryIndices, setVisibleEntryIndices] = useState<Set<number>>(new Set());
   const [responseOnlyIndices, setResponseOnlyIndices] = useState<Set<number>>(new Set());
   const [unreachableIndices, setUnreachableIndices] = useState<Set<number>>(new Set());
+  // Index of the last compact/plan-mode boundary — entries at or before this are "old history"
+  const [lastBoundaryIndex, setLastBoundaryIndex] = useState(-1);
   const [clickedState, setClickedState] = useState<{ index: number; status: 'loading' | 'failed' } | null>(null);
   const [rewindState, setRewindState] = useState<{ index: number; phase: 'compacting' | 'rewinding' | 'pasting' | 'done' } | null>(null);
 
@@ -474,7 +476,11 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
           }
         }
         if (markersResult.success) {
-          const markers = markersResult.markers || [];
+          // Only show markers where THIS session is the source (forks FROM here).
+          // Markers where forked_to === sessionId are inherited and should NOT show blue lines.
+          const markers = (markersResult.markers || []).filter(
+            (m: ForkMarker) => m.source_session_id === sessionId
+          );
           setForkMarkers(markers);
         }
       }
@@ -793,6 +799,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         if (prev.size === newUnreachable.size && [...prev].every(i => newUnreachable.has(i))) return prev;
         return newUnreachable;
       });
+      setLastBoundaryIndex(lastBoundaryIdx);
 
       // Re-check visibility with updated positions
       checkVisibility();
@@ -924,24 +931,9 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         const startId = selectionStartIdRef.current;
         const startIndex = entries.findIndex(e => e.uuid === startId);
         const endIndex = entries.findIndex(e => e.uuid === entry.uuid);
-        let rangeStartIdx = Math.min(startIndex, endIndex);
-        const rangeEndIdx = Math.max(startIndex, endIndex);
-
-        // Auto-expand to plan mode boundary: if startIndex is inside a plan mode segment,
-        // expand to the beginning of that segment (previous plan/compact boundary or start of session)
-        if (rangeStartIdx > 0) {
-          const startSessionId = entries[rangeStartIdx].sessionId;
-          for (let i = rangeStartIdx - 1; i >= 0; i--) {
-            if (entries[i].isPlan || entries[i].type === 'compact' || entries[i].sessionId !== startSessionId) {
-              break; // Found boundary — stop here
-            }
-            rangeStartIdx = i; // Expand to include this entry
-          }
-        }
-
         const range = {
-          startIndex: rangeStartIdx,
-          endIndex: rangeEndIdx,
+          startIndex: Math.min(startIndex, endIndex),
+          endIndex: Math.max(startIndex, endIndex),
         };
 
         // Get click position from the entry's DOM element
@@ -1757,11 +1749,14 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
             // isInViewport && !isResponseOnly = prompt visible in viewport (bright)
             // isResponseOnly = response visible but prompt above viewport (same as normal)
             const isPromptVisible = isInViewport && !isResponseOnly;
+            // Old history = before last compact/plan boundary (not part of current dialog)
+            const isOldHistory = lastBoundaryIndex >= 0 && index <= lastBoundaryIndex;
+            // Not in buffer = unreachable in current segment (scrollback trimmed or process closed)
+            const isNotInBuffer = isUnreachable && !isOldHistory;
 
-            if (isUnreachable && !isHovered && !isGroupCollapsed && !isCompacted) {
-              // Unreachable entries: muted red/gray, overrides everything
-              // Compact bars (strips) keep their own colors — they are structural markers, not messages
-              dotColor = '#6b3333';
+            if (isOldHistory && !isHovered && !isGroupCollapsed && !isCompacted) {
+              // Old history: semi-transparent white dots over red bg zone
+              dotColor = 'rgba(255, 255, 255, 0.25)';
               dotGlow = 'none';
             } else if (isCompacted) {
               dotColor = isHovered ? '#fbbf24' : '#a67c1a';
@@ -1909,8 +1904,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                       : (showAsChild ? '4px' : undefined),
                     backgroundColor: active
                       ? 'rgba(59, 130, 246, 0.15)'
-                      : (isUnreachable && !isGroupMeta && !isCompacted ? 'rgba(239, 68, 68, 0.12)' : 'transparent'),
-                    cursor: isContinued ? 'default' : 'pointer',
+                      : (isOldHistory && !isGroupMeta && !isCompacted ? 'rgba(239, 68, 68, 0.12)' : 'transparent'),
+                    cursor: (isContinued || isOldHistory) ? 'default' : 'pointer',
                   }}
                 >
                   {/* Tree mode: vertical connector lines */}
@@ -1922,14 +1917,17 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                   )}
 
                   {/* Dot */}
+                  {/* Dot: hollow ring if not in buffer (current segment), filled otherwise */}
                   <div
                     className="pointer-events-none shrink-0"
                     style={{
                       width: dotWidth,
                       height: dotHeight,
                       borderRadius: dotRadius,
-                      backgroundColor: dotColor,
+                      backgroundColor: isNotInBuffer && !isHovered && !isCompacted ? 'transparent' : dotColor,
+                      border: isNotInBuffer && !isHovered && !isCompacted ? '1px solid #666' : 'none',
                       boxShadow: dotGlow,
+                      boxSizing: 'border-box',
                       transition: 'width 0.15s, height 0.15s, border-radius 0.15s, background-color 0.2s, box-shadow 0.2s',
                     }}
                   />
@@ -2006,8 +2004,24 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                     </div>
                   )}
                 </div>
-                {/* Fork marker */}
-                {forkMarker && (
+                {/* Last boundary separator — full-width unified line between old history and current dialog */}
+                {index === lastBoundaryIndex && (
+                  <div
+                    className="flex-shrink-0 w-full flex items-center justify-center"
+                    style={{ height: '8px' }}
+                    title="Current session starts below"
+                  >
+                    <div
+                      style={{
+                        width: '100%',
+                        height: '1px',
+                        backgroundColor: 'rgba(255, 255, 255, 0.2)',
+                      }}
+                    />
+                  </div>
+                )}
+                {/* Fork marker (only outside old history zone — inside it's redundant) */}
+                {forkMarker && !isOldHistory && (
                   <div
                     className="flex-shrink-0 w-full flex items-center justify-center"
                     style={{ height: '8px' }}
@@ -2025,8 +2039,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                     />
                   </div>
                 )}
-                {/* Plan mode marker */}
-                {isPlanModeBoundary && (
+                {/* Plan mode marker (only outside old history zone) */}
+                {isPlanModeBoundary && !isOldHistory && (
                   <div
                     className="flex-shrink-0 w-full flex items-center justify-center"
                     style={{ height: '8px' }}
