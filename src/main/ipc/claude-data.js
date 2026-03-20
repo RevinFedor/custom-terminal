@@ -696,29 +696,80 @@ function register({ projectManager, formatToolAction }) {
         return { success: false, error: 'Source session is empty' };
       }
 
-      // Generate new UUID
+      // Generate new UUID for the main (tip) file
       const newSessionId = crypto.randomUUID();
       console.log('[Claude Fork] New session ID:', newSessionId);
 
-      const destPath = path.join(projectDir, `${newSessionId}.jsonl`);
+      // Resolve full session chain to find ALL files
+      const { sessionBoundaries } = await resolveSessionChain(resolvedSourceId, cwd);
 
-      // Get Timeline UUIDs snapshot using Backtrace algorithm (same as Timeline UI)
-      const entryUuids = parseTimelineUuids(sourcePath);
+      // Build ordered list of session files: [root, ..., parent, current]
+      const chainFiles = [];
+      let curId = resolvedSourceId;
+      const chainVisited = new Set();
+      // Walk backwards through boundaries to find all parent sessions
+      const parentMap = new Map(); // childId → parentId
+      for (const b of sessionBoundaries) {
+        parentMap.set(b.childSessionId, b.parentSessionId);
+      }
+      // Build chain from current to root
+      const chainIds = [curId];
+      while (parentMap.has(curId)) {
+        curId = parentMap.get(curId);
+        if (chainVisited.has(curId)) break;
+        chainVisited.add(curId);
+        chainIds.unshift(curId); // prepend parent
+      }
+
+      // Merge ALL chain files into ONE fork file
+      // Read all files in chain order (root first)
+      const allLines = [];
+      for (const oldId of chainIds) {
+        const fileFound = findSessionFile(oldId, cwd);
+        if (!fileFound) {
+          console.warn('[Claude Fork] Chain file not found:', oldId.slice(0, 8));
+          continue;
+        }
+        const content = fs.readFileSync(fileFound.filePath, 'utf-8');
+        for (const line of content.split('\n')) {
+          if (line.trim()) allLines.push(line);
+        }
+      }
+
+      // Map each unique sessionId to new UUID, tip → newSessionId
+      const sidMap = new Map();
+      sidMap.set(resolvedSourceId, newSessionId);
+      for (const line of allLines) {
+        try { const e = JSON.parse(line); if (e.sessionId && !sidMap.has(e.sessionId)) sidMap.set(e.sessionId, crypto.randomUUID()); }
+        catch {}
+      }
+      sidMap.set(resolvedSourceId, newSessionId);
+
+      const destPath = path.join(projectDir, `${newSessionId}.jsonl`);
+      const rewritten = allLines.map(line => {
+        try {
+          const entry = JSON.parse(line);
+          if (entry.sessionId && sidMap.has(entry.sessionId)) entry.sessionId = sidMap.get(entry.sessionId);
+          return JSON.stringify(entry);
+        } catch { return line; }
+      }).join('\n') + '\n';
+      fs.writeFileSync(destPath, rewritten);
+
+      console.log('[Claude Fork] Merged', chainIds.length, 'chain files into 1 (' + allLines.length + ' lines)');
+
+      // Get Timeline UUIDs snapshot
+      const entryUuids = parseTimelineUuids(destPath);
       console.log('[Claude Fork] Timeline entries:', entryUuids.length);
 
-      // Copy the file
-      fs.copyFileSync(sourcePath, destPath);
-      console.log('[Claude Fork] Copied:', sourcePath, '->', destPath);
-
-      // Save fork marker with UUIDs snapshot (always save, even if empty — marks fork at beginning)
+      // Save fork marker
       try {
         projectManager.db.saveForkMarker(resolvedSourceId, newSessionId, entryUuids);
         console.log('[Claude Fork] Fork marker saved with', entryUuids.length, 'UUIDs');
       } catch (e) {
         console.warn('[Claude Fork] Could not save fork marker:', e.message);
       }
+      // No session_links needed — single file, no chain
 
-      // Wait for Claude to index the new file
       await new Promise(resolve => setTimeout(resolve, 500));
 
       return { success: true, newSessionId, forkEntryCount: entryUuids.length };
@@ -1196,25 +1247,40 @@ function register({ projectManager, formatToolAction }) {
       // This helps the renderer detect if claudeSessionId needs updating
       const latestSessionId = resolveLatestSessionInChain(sessionId, cwd);
 
-      // Augment sessionBoundaries with bridge entries from recordMap.
-      // resolveSessionChain only adds file-level boundaries. In forked files,
-      // copied bridge entries represent original clear-context transitions that
-      // are missing from sessionBoundaries (see fact-backtrace-jsonl.md §3.1).
-      const boundarySet = new Set(sessionBoundaries.map(b => b.parentSessionId + ':' + b.childSessionId));
-      for (const [, rec] of recordMap) {
-        if (!rec._isBridge || !rec.sessionId) continue;
-        const parentSid = rec.sessionId;
-        const fileSid = rec._fromFile;
-        // Find child sessionId: any entry in the same file with a different sessionId
-        for (const [, other] of recordMap) {
-          if (other._fromFile !== fileSid) continue;
-          if (!other.sessionId || other.sessionId === parentSid) continue;
-          const key = parentSid + ':' + other.sessionId;
-          if (!boundarySet.has(key)) {
-            sessionBoundaries.push({ parentSessionId: parentSid, childSessionId: other.sessionId });
-            boundarySet.add(key);
+      // Augment sessionBoundaries by scanning entries (active branch) for sessionId changes.
+      // Each change = potential plan mode boundary.
+      // Skip transitions that match fork_markers (those are fork points, not plan mode).
+      {
+        const boundarySet = new Set(sessionBoundaries.map(b => b.parentSessionId + ':' + b.childSessionId));
+        // Get fork marker UUIDs to identify fork transitions
+        let forkUuids = new Set();
+        try {
+          const markers = _projectManager?.db?.getForkMarkers?.(sessionId) || [];
+          for (const m of markers) {
+            if (m.entry_uuids) {
+              const uuids = typeof m.entry_uuids === 'string' ? JSON.parse(m.entry_uuids) : m.entry_uuids;
+              for (const u of uuids) forkUuids.add(u);
+            }
           }
-          break;
+        } catch {}
+
+        let prevSid = null;
+        let prevEntry = null;
+        for (const entry of entries) {
+          if (!entry.sessionId) continue;
+          if (prevSid && entry.sessionId !== prevSid) {
+            // Check: is this transition at a fork point?
+            const isForkTransition = prevEntry && forkUuids.has(prevEntry.uuid);
+            if (!isForkTransition) {
+              const key = prevSid + ':' + entry.sessionId;
+              if (!boundarySet.has(key)) {
+                sessionBoundaries.push({ parentSessionId: prevSid, childSessionId: entry.sessionId });
+                boundarySet.add(key);
+              }
+            }
+          }
+          prevSid = entry.sessionId;
+          prevEntry = entry;
         }
       }
 
