@@ -147,16 +147,33 @@ async function main() {
 
     await page.screenshot({ path: '/tmp/scroll-diag-3-scrolled-up.png' })
 
-    // Start continuous viewportY tracker — catches creep that snapshot assertions miss
-    await page.evaluate((tid) => {
+    // Start continuous tracker: viewportY + first visible line content
+    const anchorContent = await page.evaluate((tid) => {
       window.__testScrollHistory = []
       const registry = window.terminalRegistry || window.__terminalRegistry
       const term = registry?.get?.(tid)
-      if (!term) return
+      if (!term) return null
+      // Save anchor: first visible line text
+      const buf = term.buffer.active
+      const line = buf.getLine(buf.viewportY)
+      const text = line ? line.translateToString(true).trim() : ''
+      window.__testAnchorLine = text
+      window.__testAnchorY = buf.viewportY
+      // Track viewportY + first line content every 16ms
       window.__testScrollTracker = setInterval(() => {
-        window.__testScrollHistory.push(term.buffer.active.viewportY)
-      }, 16) // sample every frame (60fps)
+        const b = term.buffer.active
+        const l = b.getLine(b.viewportY)
+        const t = l ? l.translateToString(true).trim() : ''
+        window.__testScrollHistory.push({
+          y: b.viewportY,
+          line: t,
+          match: t === window.__testAnchorLine
+        })
+      }, 16)
+      return text
     }, tabId)
+    log.info(`Anchor line: "${anchorContent?.substring(0, 80)}"`)
+
 
     // Wait 5s — Claude is writing, check if scroll holds
     log.step('Waiting 5s with scroll up...')
@@ -254,22 +271,33 @@ async function main() {
       log.info(`ScrollFix logs: ${scrollFixLogs.length} total, ${badDrifts.length} bad drifts`)
     }
 
-    // 3. Continuous viewportY tracker — catches creep that log-based checks miss.
-    //    The scroll handler can "launder" drift by overwriting userScrollTopRef
-    //    between writes, making Δ=0 in logs while content visually creeps.
-    //    This tracker samples viewportY every 100ms and checks max-min spread.
+    // 3. Continuous tracker — checks BOTH viewportY number AND content stability.
+    //    viewportY can be stable while content shifts (reflow, trimStart).
+    //    Content check catches this: if first visible line text changes, test fails.
     const trackerResult = await page.evaluate(() => {
       clearInterval(window.__testScrollTracker)
       const h = window.__testScrollHistory || []
       if (h.length === 0) return null
-      const min = Math.min(...h)
-      const max = Math.max(...h)
-      return { samples: h.length, min, max, spread: max - min, first: h[0], last: h[h.length - 1] }
+      const ys = h.map(e => e.y)
+      const min = Math.min(...ys)
+      const max = Math.max(...ys)
+      const mismatches = h.filter(e => !e.match).length
+      const firstMismatch = h.find(e => !e.match)
+      return {
+        samples: h.length, min, max, spread: max - min,
+        mismatches, firstMismatchLine: firstMismatch?.line?.substring(0, 80) || null,
+        anchorLine: window.__testAnchorLine?.substring(0, 80) || null
+      }
     })
     if (trackerResult) {
-      log.info(`Tracker: ${trackerResult.samples} samples, range [${trackerResult.min}..${trackerResult.max}], spread=${trackerResult.spread}`)
-      // Allow spread of 2 (rounding/timing jitter), but no progressive creep
-      assert(trackerResult.spread <= 2, `viewportY stable over 15s (spread=${trackerResult.spread}: ${trackerResult.min}..${trackerResult.max})`)
+      log.info(`Tracker: ${trackerResult.samples} samples, viewportY [${trackerResult.min}..${trackerResult.max}], spread=${trackerResult.spread}`)
+      log.info(`Content: ${trackerResult.mismatches} mismatches out of ${trackerResult.samples} samples`)
+      if (trackerResult.mismatches > 0) {
+        log.info(`  Anchor: "${trackerResult.anchorLine}"`)
+        log.info(`  First mismatch: "${trackerResult.firstMismatchLine}"`)
+      }
+      assert(trackerResult.spread <= 2, `viewportY stable (spread=${trackerResult.spread})`)
+      assert(trackerResult.mismatches === 0, `Content stable — first line unchanged (${trackerResult.mismatches} mismatches)`)
     }
 
     // Summary
