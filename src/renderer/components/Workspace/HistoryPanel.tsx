@@ -971,7 +971,6 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
                 if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); goNextMatch(); }
                 if (e.key === 'Enter' && e.shiftKey) { e.preventDefault(); goPrevMatch(); }
                 if (e.key === 'Escape') { e.preventDefault(); closeSearch(); }
-                // Only stop propagation for keys the input handles — let modifiers (Meta, Shift, etc.) through
                 if (e.key === 'Enter' || e.key === 'Escape') e.stopPropagation();
               }}
               placeholder="Search..."

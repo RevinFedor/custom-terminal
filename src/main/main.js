@@ -5069,6 +5069,20 @@ ipcMain.handle('project:archive-tab', (event, { projectId, tab }) => {
     }
   }
   projectManager.db.archiveTab(projectId, tab);
+
+  // Background: index session for semantic search (fire-and-forget)
+  if (tab.claudeSessionId && tab.cwd) {
+    const projectSlug = tab.cwd.replace(/\//g, '-');
+    const sessionPath = path.join(os.homedir(), '.claude', 'projects', projectSlug, `${tab.claudeSessionId}.jsonl`);
+    if (fs.existsSync(sessionPath)) {
+      const semanticSearch = require(path.join(srcMainDir, 'ipc', 'semantic-search'));
+      // Fire-and-forget — don't block tab close
+      semanticSearch.indexSessionFile?.(projectManager.db.db, sessionPath, tab.claudeSessionId, projectSlug)
+        ?.then(r => console.log(`[SemanticSearch] Auto-indexed ${tab.claudeSessionId?.slice(0, 8)}: ${r.chunked} chunks`))
+        ?.catch(e => console.error('[SemanticSearch] Auto-index failed:', e.message));
+    }
+  }
+
   return { success: true };
 });
 
@@ -5397,6 +5411,9 @@ require(path.join(srcMainDir, 'ipc', 'settings')).register({ projectManager });
 
 // docs:save-temp, docs:read-prompt-file, docs:api-request → ipc/docs.js
 require(path.join(srcMainDir, 'ipc', 'docs')).register();
+
+// search:query, search:index-session, search:index-all, search:stats → ipc/semantic-search.js
+require(path.join(srcMainDir, 'ipc', 'semantic-search')).register({ projectManager, mainWindow });
 
 // claude:copy-range, claude:fork-session-file, claude:get-fork-markers,
 // claude:get-timeline, claude:export-clean-session, claude:get-full-history → ipc/claude-data.js

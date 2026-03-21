@@ -110,4 +110,5 @@ MCP-инструмент `docs_search` доступен для поиска по
 - **Sessions & History:** [`fact-data-persistence.md`](docs/knowledge/fact-data-persistence.md) — общая логика SQLite.
 - **Tab Identity:** [`fix-tab-persistence.md`](docs/knowledge/fix-tab-persistence.md) — использование `tab_id` для сохранения связей суб-агентов.
 - **Safe Tab Persistence:** [`fix-save-tabs-data-loss.md`](docs/knowledge/fix-save-tabs-data-loss.md) — замена деструктивного `DELETE ALL + re-INSERT` на targeted DELETE с safety guard.
+- **Semantic Search:** [`fact-semantic-search.md`](docs/knowledge/fact-semantic-search.md) — поиск по истории сессий через Gemini Embedding + cosine similarity, FTS5 fallback, дедупликация по hash.
 - **Project Instances:** [`fact-data-persistence.md`](docs/knowledge/fact-data-persistence.md) — почему проекты стали UUID-сущностями.

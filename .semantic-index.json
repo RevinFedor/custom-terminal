@@ -2402,42 +2402,45 @@
     "path": "docs/knowledge/fix-terminal-jitter.md",
     "type": "fix",
     "explicit": [
-      "Terminal scroll jitter prevention",
-      "Ink TUI synchronization",
-      "CSI escape sequences",
-      "xterm.js buffer management",
-      "DEC 2026 synchronized output",
-      "Scrollback preservation"
+      "Terminal scroll position reset",
+      "CSI 3J clear scrollback",
+      "DEC Mode 2026 Synchronized Output",
+      "BSU/ESU sync frame buffering",
+      "xterm.js 5.x scroll preservation",
+      "Ink TUI renderer",
+      "scrollback trimming",
+      "viewport scrollTop clamping"
     ],
     "implicit": [
-      "sync_frame_write_atomicity",
-      "csi3j_strip_scroll_protection",
-      "overflow_hidden_clamp_guard",
-      "echo_detection_restore_filter",
-      "trim_count_compensation",
-      "scroll_position_reference_tracking",
-      "ink_sync_mode_2026_handling",
-      "chromium_scrolltop_clamping_fix",
-      "xterm_buffer_trim_events",
-      "fitaddon_resize_observer_block",
-      "word_wrap_prevention_during_sync",
-      "viewport_position_stability_ydisp",
-      "scrollback_circular_buffer_bounded",
-      "normal_write_append_bottom_native"
+      "syncFrameBufferRef_bsu_esu_accumulation",
+      "insideSyncBlockRef_stateful_tracking",
+      "csi3j_conditional_strip_userscroll_gate",
+      "overflow_hidden_sync_write_protection",
+      "isFitBlockedRef_fitAddon_block",
+      "scrollToLine_rAF_position_restore",
+      "lastRestoredYRef_parasitic_scroll_filter",
+      "userScrollTopRef_position_tracking",
+      "onTrim_callback_baseY_compensation",
+      "isPushedToBottom_false_positive_guard",
+      "ybase_ydisp_buffer_level_tracking",
+      "sync_marker_validity_buffer_gates",
+      "css_visibility_canvas_reflow_fitAddon"
     ],
     "symptoms": [
-      "Terminal scrollbar jumps thousands of pixels when Claude Code generates output",
-      "Scroll position resets or changes unexpectedly when terminal renders new content",
-      "Content drifts or shifts on screen despite user not actively scrolling",
-      "User cannot maintain scroll position while viewing long file reads or tool outputs",
-      "Visible text jumps during terminal updates, making it difficult to read Claude output"
+      "Terminal viewport jumps to top (viewportY=0) when Claude Code produces output during sync frame write",
+      "Scroll position resets to beginning when user scrolls up to read previous history entries",
+      "Scrollbar thumb jitters or oscillates every time Claude produces new terminal output",
+      "Content drifts downward 2-5 lines when scrolling less than viewport height (overlap with Ink active area)",
+      "scrollback buffer grows unbounded and scrollbar position becomes unstable during rapid terminal writes"
     ],
     "related_components": [
       "src/components/Terminal.tsx",
       "src/hooks/useTerminalScroll.ts",
-      "src/hooks/usePtyController.ts"
+      "src/services/ptyTerminal.ts",
+      "src/utils/xterm-sync-frame-buffer.ts",
+      "main/terminalScroll.js"
     ],
-    "hash": "6215eb7bdcfa443bbda4a8be735525f17cb8f3868a2d428fe67682b63020a0f2"
+    "hash": "020852957d89c68fbbf634076e870a2021c01d9b2fd0faad2c03b5bbf56b34a2"
   },
   {
     "path": "docs/knowledge/fact-gemini-sessions.md",
