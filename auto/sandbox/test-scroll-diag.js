@@ -13,7 +13,7 @@ const crypto = require('crypto')
 const { launch, waitForTerminal, typeCommand, waitForClaudeSessionId, waitForMainProcessLog, findInLogs } = require('../core/launcher')
 const electron = require('../core/electron')
 
-const SOURCE_SESSION = '2fa76efe-b5e0-4dfe-8110-d5fd6739039d'
+const SOURCE_SESSION = 'e3dab764-73af-482f-befb-5ef5eaa3dad5'
 const PROJECT_SLUG = '-Users-fedor-Desktop-custom-terminal'
 const SESSIONS_DIR = path.join(process.env.HOME, '.claude', 'projects', PROJECT_SLUG)
 const PROJECT_DIR = '/Users/fedor/Desktop/custom-terminal'
@@ -97,6 +97,16 @@ async function main() {
 
     await page.screenshot({ path: '/tmp/scroll-diag-1-before-prompt.png' })
 
+    // Switch to haiku + disable think for faster responses
+    log.step('Switching to haiku model...')
+    await typeCommand(page, '/model haiku')
+    await page.waitForTimeout(2000)
+    log.step('Toggling think off...')
+    await page.keyboard.press('Escape')
+    await page.waitForTimeout(200)
+    await page.keyboard.press('t')
+    await page.waitForTimeout(1000)
+
     // Send prompt via keyboard
     log.step('Typing prompt...')
     await page.keyboard.type(PROMPT, { delay: 10 })
@@ -136,6 +146,17 @@ async function main() {
     }
 
     await page.screenshot({ path: '/tmp/scroll-diag-3-scrolled-up.png' })
+
+    // Start continuous viewportY tracker — catches creep that snapshot assertions miss
+    await page.evaluate((tid) => {
+      window.__testScrollHistory = []
+      const registry = window.terminalRegistry || window.__terminalRegistry
+      const term = registry?.get?.(tid)
+      if (!term) return
+      window.__testScrollTracker = setInterval(() => {
+        window.__testScrollHistory.push(term.buffer.active.viewportY)
+      }, 16) // sample every frame (60fps)
+    }, tabId)
 
     // Wait 5s — Claude is writing, check if scroll holds
     log.step('Waiting 5s with scroll up...')
@@ -182,8 +203,11 @@ async function main() {
       assert(after15s.viewportY > 0, `viewportY > 0 after 15s (got ${after15s.viewportY})`)
     }
 
-    // Check ScrollDiag logs: no large jumps after user scroll-up (catches oscillation)
+    // ── Log-based assertions (continuous, not snapshot) ──
+
     const allLogs = [...mainProcessLogs, ...consoleLogs]
+
+    // 1. No large jumps after user scroll-up (catches oscillation)
     const scrollDiagLogs = allLogs.filter(l => l.includes('ScrollDiag') && l.includes('isAtBottom=false'))
     if (scrollDiagLogs.length > 0) {
       const bigJumps = scrollDiagLogs.filter(l => {
@@ -196,6 +220,56 @@ async function main() {
       }
     } else {
       log.warn('No isAtBottom=false ScrollDiag logs found')
+    }
+
+    // 2. No drift in protectedWrite restores (catches 1-line-per-message creep).
+    //    Every [ScrollFix] log with Δ != 0 means the scroll position drifted.
+    //    Only exception: Δ < 0 when baseAfter < savedLine (buffer temporarily too small).
+    const scrollFixLogs = allLogs.filter(l => l.includes('ScrollFix') && l.includes('Δ'))
+    const badDrifts = scrollFixLogs.filter(l => {
+      const m = l.match(/Δ([+-]?\d+)/)
+      if (!m) return false
+      const delta = parseInt(m[1])
+      if (delta === 0) return false
+      // Allow negative drift only when buffer shrunk below savedLine (clamped case)
+      if (delta < 0) {
+        const baseMatch = l.match(/base:\d+→(\d+)/)
+        const restoreMatch = l.match(/restore:\d+→(\d+)/)
+        if (baseMatch && restoreMatch && parseInt(restoreMatch[1]) === parseInt(baseMatch[1])) {
+          return false // clamped to baseAfter — expected when buffer shrinks
+        }
+      }
+      return true // genuine drift
+    })
+    assert(badDrifts.length === 0, `No scroll drift in protectedWrite (found ${badDrifts.length})`)
+    if (badDrifts.length > 0) {
+      badDrifts.slice(0, 5).forEach(l => {
+        const short = l.replace(/.*\[ScrollFix\] /, '')
+        log.info(`  ${short}`)
+      })
+    }
+    if (scrollFixLogs.length === 0) {
+      log.info('No ScrollFix drift logs (all writes had Δ=0)')
+    } else {
+      log.info(`ScrollFix logs: ${scrollFixLogs.length} total, ${badDrifts.length} bad drifts`)
+    }
+
+    // 3. Continuous viewportY tracker — catches creep that log-based checks miss.
+    //    The scroll handler can "launder" drift by overwriting userScrollTopRef
+    //    between writes, making Δ=0 in logs while content visually creeps.
+    //    This tracker samples viewportY every 100ms and checks max-min spread.
+    const trackerResult = await page.evaluate(() => {
+      clearInterval(window.__testScrollTracker)
+      const h = window.__testScrollHistory || []
+      if (h.length === 0) return null
+      const min = Math.min(...h)
+      const max = Math.max(...h)
+      return { samples: h.length, min, max, spread: max - min, first: h[0], last: h[h.length - 1] }
+    })
+    if (trackerResult) {
+      log.info(`Tracker: ${trackerResult.samples} samples, range [${trackerResult.min}..${trackerResult.max}], spread=${trackerResult.spread}`)
+      // Allow spread of 2 (rounding/timing jitter), but no progressive creep
+      assert(trackerResult.spread <= 2, `viewportY stable over 15s (spread=${trackerResult.spread}: ${trackerResult.min}..${trackerResult.max})`)
     }
 
     // Summary
