@@ -1,64 +1,124 @@
 ---
-name: Terminal Scroll Jitter Fix (Ink Cursor-Up Clamping)
-description: Scroll snap-to-top during Claude Code output caused by Ink renderer cursor-up exceeding viewport height. Fix clamps CSI A sequences on PTY input. Graveyard of failed xterm-level approaches.
+name: Terminal Scroll Jitter Fix (Sync Frame Protection + Conditional CSI 3J)
+description: Scroll position jumps and content drift during Claude Code output. Root cause: Ink's CSI 3J destroys scrollback, CSI 2J causes buffer shrink. Fix uses BSU/ESU sync frame buffering, conditional CSI 3J stripping, overflow:hidden, and echo detection.
 type: fix
 ---
 
-# Terminal Scroll Fix: Ink Cursor-Up Clamping
+# Terminal Scroll Fix: Sync Frame Protection
 
 ## Симптомы
-- При работе Claude Code терминал **прыгает на самый верх scrollback** (scrollTop=0)
-- Особенно при file reads, tool calls, любом обновлении Ink TUI
-- Если пользователь скроллит вверх на ~70px чтобы читать историю — позиция сбрасывается наверх и застревает
-- Проблема появилась после обновления Claude Code ~февраль 2026 (Ink differential renderer)
-- Затрагивает **ВСЕ терминалы**: iTerm2, Terminal.app, VS Code, Windows Terminal, tmux, Kitty
+- При работе Claude Code терминал **прыгает** при скролле вверх
+- Scrollbar дёргается на тысячи пикселей при каждом ответе Claude
+- Контент "ползёт" (drift) — viewportY стабилен, но видимые строки меняются
+- Особенно при file reads, tool calls, обновлениях Ink TUI
+- Проблема затрагивает **все терминалы** — upstream issue
 
 ## Root Cause
-Ink renderer (`eraseLines()`) генерирует N cursor-up (`\x1b[{N}A`) последовательностей, где **N = количество ранее отрендеренных строк**. Когда N > высоты viewport, терминал следует за курсором выше видимой области и прыгает на начало scrollback.
 
-Это происходит внутри synchronized output блоков (DEC 2026), поэтому даже терминалы с поддержкой DEC 2026 не защищены — они следуют за **финальной позицией курсора** после flush.
+Ink renderer (React для CLI) использует DEC Mode 2026 (Synchronized Output) для обновления UI:
 
-Upstream: `anthropics/claude-code#34503`, `microsoft/terminal#14774`
+1. `\x1b[?2026h` (BSU) — Begin Synchronized Update
+2. `\x1b[2J` (CSI 2J, ED2) — Clear visible area (cells in-place, NO line deletion)
+3. Redraw content
+4. `\x1b[3J` (CSI 3J, ED3) — Clear scrollback (`trimStart(scrollBackSize)`, destroys ALL history)
+5. `\x1b[?2026l` (ESU) — End Synchronized Update
 
-## Решение: Clamp Cursor-Up на входе
+**CSI 3J** — главная причина scroll jumps. Вызывает `trimStart()`, удаляя весь scrollback. viewportY прыгает от сотен к нулю.
 
-Одна функция `clampCursorUp()` в `Terminal.tsx` — regex замена `\x1b[{n}A` с бюджетом = `term.rows` на каждый write-вызов. Применяется **до передачи данных в xterm**, на уровне PTY-данных.
+**CSI 2J** — временно "сжимает" буфер (очищает видимые ячейки). Chromium кламмпит scrollTop к новому scrollHeight. Если не защитить, viewport уезжает.
 
-Ключевой инсайт: **фикс на входе (1 regex на PTY data) vs. сложная машинерия scroll-restore на выходе (xterm internals)**. Не нужно сохранять/восстанавливать scrollTop, перехватывать rAF, патчить xterm — достаточно не давать курсору уходить выше viewport.
+xterm.js 5.x игнорирует DEC 2026 (поддержка только в 6.x), поэтому BSU/ESU обрабатываются как no-op.
 
-Подход взят из `anthropics/claude-code#35683` (scroll-fix plugin) — тот же clamp, но реализованный как `process.stdout.write` interceptor внутри Node.js. У нас — на уровне терминала-потребителя.
+## Решение: 5 слоёв защиты
 
-### Альтернативный workaround
-`SK6=500` env variable при запуске Claude — тротлит Ink render с 16ms до 500ms. Текст приходит чанками, но скролл не дёргается. Грубый, но рабочий.
+### 1. Sync Frame Buffering (BSU → ESU)
+Данные между BSU и ESU накапливаются в `syncFrameBufferRef` и пишутся одним `term.write()`. CSI 2J + redraw обрабатываются **атомарно** — промежуточные состояния не видны.
+
+```typescript
+// Data pipeline splits at BSU/ESU boundaries
+const BSU = '\x1b[?2026h';
+const ESU = '\x1b[?2026l';
+// Normal data → writeBufferRef (flushed every 16ms)
+// Sync data → syncFrameBufferRef (flushed on ESU, atomically)
+```
+
+### 2. Conditional CSI 3J Strip
+CSI 3J стрипается **только когда пользователь скроллен вверх** (`userScrollTopRef !== null`).
+
+- **Scrolled up**: strip CSI 3J → защита позиции, буфер растёт временно
+- **At bottom**: CSI 3J проходит → буфер bounded, нет scrollbar jumps
+- **Self-heal**: когда пользователь возвращается вниз, следующий frame's CSI 3J убирает накопленные строки
+
+```typescript
+const cleaned = savedLine !== null
+  ? data.replace(/\x1b\[3J/g, '')
+  : data;
+```
+
+### 3. overflow:hidden + overflowLocks
+Для sync frames: `overflow: hidden` на `.xterm-viewport` предотвращает Chromium от clamp'а scrollTop при buffer shrink от CSI 2J.
+
+`overflowLocksRef` (счётчик) предотвращает race condition при наложении нескольких sync frames.
+
+`isFitBlockedRef` блокирует `ResizeObserver → fitAddon.fit()` пока overflow hidden — иначе scrollbar исчезает → ширина меняется → word wrap recalculation → reflow.
+
+### 4. Echo Detection (lastRestoredYRef)
+После `scrollToLine(X)`, браузер стреляет паразитный scroll event с `viewportY ≈ X`. Без фильтрации это "лаундерит" позицию — scroll handler захватывает echo и перезаписывает ref.
+
+```typescript
+if (lastRestoredYRef.current !== null) {
+  const echoDistance = Math.abs(buf.viewportY - lastRestoredYRef.current);
+  if (echoDistance <= 1) { lastRestoredYRef.current = null; return; }
+  lastRestoredYRef.current = null;
+}
+```
+
+### 5. Normal Writes без защиты
+Данные вне sync frames (normal writes) пишутся через голый `t.write(data)`. xterm.js нативно сохраняет scroll position при append-at-bottom. Никаких флагов, overflow, scrollToLine. Это убирает jitter при пользовательском скролле.
+
+### 6. Buffer Trim Compensation
+Когда scrollback заполняется (>10000 строк), xterm.js декрементирует `ybase` и `ydisp`. `userScrollTopRef` становится stale. onTrim handler компенсирует:
+
+```typescript
+coreBuf.lines.onTrim((amount: number) => {
+  trimCountRef.current += amount;
+  if (userScrollTopRef.current !== null) {
+    userScrollTopRef.current = Math.max(0, userScrollTopRef.current - amount);
+  }
+});
+```
+
+## Тестовые метрики (E2E, 15 секунд Claude output)
+- **viewportY spread**: 0 (930 samples, 16ms interval)
+- **Content mismatches**: 0 (first 5 visible lines checked)
+- **scrollTop spread**: 2px
+- **Buffer trims**: 0 (CSI 3J stripped while scrolled up)
+- **ScrollFix drift logs**: 0 (all Δ=0)
+- **Screenshots**: anchor, 5s, 15s — визуально идентичны
 
 ## Кладбище подходов (>10 итераций)
 
-Все подходы ниже **боролись с последствиями** (xterm уже получил cursor-up, уже сломал ydisp/scrollTop) вместо причины (cursor-up не должен был приходить):
+1. **Cursor-up clamp (scroll-fix.cjs)** — Regex на `\x1b[{n}A`, бюджет = rows. Работает для iTerm/Terminal.app, но не решает CSI 3J проблему в xterm.js
+2. **Strip ALL CSI 2J + CSI 3J** — Текст рисуется поверх старого, scrollback растёт неконтролируемо. "Лекарство хуже болезни"
+3. **Always strip CSI 3J** — Защищает scroll, но буфер растёт неограниченно (920→7000 за 15с). Scrollbar прыгает на тысячи пикселей
+4. **Offset-from-bottom tracking** — Каждый normal write увеличивает baseY на 1, offset пересчитывается → viewportY сдвигается на 1 строку за сообщение
+5. **Time Shield (50ms isRestoring)** — Writes каждые 16ms, shield 50ms = shield никогда не сбрасывается. Scroll trap — пользователь не может скроллить
+6. **"Upward only" scroll tracking** — Пользователь не может скроллить ВНИЗ. Fatal UX
+7. **xterm 6.0 upgrade** — Canvas renderer убран, `.xterm-viewport.scrollTop` always 0 (ScrollableElement). Откат
+8. **defineProperty патч `_innerRefresh`** — Ломает пользовательский скролл
+9. **rAF scroll restore** — Race condition с xterm's rAF
+10. **SK6=500 env throttle** — Грубый workaround, текст чанками
 
-1. **Sync frame buffering** — буферизация между `\x1b[?2026h` / `\x1b[?2026l`. Убирала мелкий jitter от intermediate states, но не решала scroll-to-top (cursor-up внутри sync frame всё равно > viewport)
-2. **defineProperty патч `_innerRefresh`** — перехват xterm Viewport через `Object.defineProperty`. scrollTop переставал обновляться, но и пользовательский скролл ломался
-3. **rAF scroll restore** — сохранять scrollTop → записать → восстановить через requestAnimationFrame. Race condition: xterm свой rAF стреляет после нашего, перезаписывая значение. Double-rAF → 2-frame flicker
-4. **Offset-from-bottom** — запоминать расстояние от низа вместо абсолютного scrollTop. Контент скроллился ВВЕРХ, потому что мы компенсировали рост буфера в неправильном направлении
-5. **Settle timer** — 200-500ms пауза после Claude tool calls для "стабилизации" скролла. scrollToBottom срабатывал между вызовами инструментов
-6. **isAtBottom на viewportY** — xterm `viewportY=0` (corrupted Ink-ом) → проверка всегда врала
-7. **xterm 6.0 upgrade** — Canvas renderer убран в 6.x → garbled text. `.xterm-viewport.scrollTop` не работает. Откат
-8. **xterm 5.5.0 fork (DI injection)** — добавление `@ICoreService` в конструктор Viewport сломало DI parameter ordering → wrong services injected → скролл полностью мёртв
-9. **xterm 5.5.0 fork (globalThis)** — `globalThis.__xtermSyncOutput` guard на `syncScrollArea`. Vite pre-bundling + browser HTTP caching сделали отладку невозможной. Скролл сломан в dev mode
-10. **attachCustomWheelEventHandler + pauseFrames** — перехват wheel для паузы rAF enforcement. Wheel events fire ДО того как браузер применяет scroll → невозможно корректно обработать
+## Ключевые инсайты
 
-## Методологический урок: глубокое чтение upstream PR
-
-Решение было найдено в **PR #35683** на `anthropics/claude-code`, который был в результатах поиска с самого начала. Ошибка: PR был найден, но прочитан поверхностно — только заголовок и описание, без полного диалога в комментариях и diff-а.
-
-**Правило:** При поиске решений для проблем, связанных с upstream-зависимостями (Claude Code, xterm.js, Electron):
-- Читать **полный диалог** PR/issue, не только описание — решение часто в комментариях, в обсуждении отброшенных подходов
-- Читать **diff целиком** — один файл на 87 строк (scroll-fix.cjs) содержал полное решение
-- Искать **связанные issues** — #34503 агрегировал 8+ дубликатов, каждый с дополнительным контекстом
-- **Не бросаться писать свой фикс**, пока не исчерпан поиск существующих решений. Час чтения PR экономит дни патчинга xterm internals
-
-Это особенно критично для проблем, затрагивающих все терминалы — если баг воспроизводится везде, решение почти наверняка уже обсуждается upstream.
+- **CSI 2J** в xterm.js 5.x очищает ячейки in-place, НЕ удаляет строки. ybase не меняется.
+- **CSI 3J** вызывает `trimStart(scrollBackSize)` — удаляет ВСЁ из scrollback. Это корень проблемы.
+- **CircularList.push() trim**: когда буфер полон, каждая новая строка сдвигает `_startIndex` и файрит `onTrimEmitter(1)`.
+- **overflow:hidden** убирает scrollbar → ширина меняется → ResizeObserver → fit() → word wrap reflow. Блокируем fit через `isFitBlockedRef`.
+- **Normal writes** не нужно защищать — xterm нативно держит позицию при append-at-bottom.
+- **Sync frame = atomic**: BSU...ESU буферизуется целиком, один term.write(). Промежуточные CSI 2J + redraw невидимы.
 
 ## Related
-- `fact-terminal-rendering.md` — архитектура рендеринга терминала
-- `anthropics/claude-code#35683` — scroll-fix plugin (upstream)
+- `anthropics/claude-code#35683` — scroll-fix plugin (cursor-up clamping, upstream)
 - `anthropics/claude-code#34503` — meta-issue со всеми дубликатами
+- `microsoft/terminal#14774` — Terminal scroll issue
