@@ -147,6 +147,23 @@ async function main() {
 
     await page.screenshot({ path: '/tmp/scroll-diag-3-scrolled-up.png' })
 
+    // Hook into buffer.lines.onTrim to detect line index shifts
+    await page.evaluate((tid) => {
+      window.__testTrimCount = 0
+      const registry = window.terminalRegistry || window.__terminalRegistry
+      const term = registry?.get?.(tid)
+      if (!term || !term._core) return
+      const buf = term._core.buffer
+      if (buf?.lines?.onTrim) {
+        buf.lines.onTrim((amount) => {
+          window.__testTrimCount += amount
+          if (window.__testTrimCount <= 5 || window.__testTrimCount % 100 === 0) {
+            console.warn(`[ScrollTest] TRIM: ${amount} lines removed (total: ${window.__testTrimCount})`)
+          }
+        })
+      }
+    }, tabId)
+
     // Start continuous tracker: viewportY + first visible line content
     const anchorContent = await page.evaluate((tid) => {
       window.__testScrollHistory = []
