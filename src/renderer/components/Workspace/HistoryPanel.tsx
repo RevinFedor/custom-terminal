@@ -458,6 +458,7 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
   const [entries, setEntries] = useState<FullHistoryEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const scrollArrowRef = useRef<HTMLDivElement>(null);
   const isResizing = useRef(false);
   const isAtBottomRef = useRef(true);
   const prevVisibleUuidsRef = useRef('');
@@ -723,6 +724,18 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
     return () => clearInterval(interval);
   }, [loadHistory]);
 
+  // Listen for scroll-to-bottom from Timeline arrow button
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent).detail;
+      if (detail?.tabId === tabId) {
+        scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
+      }
+    };
+    window.addEventListener('history-panel:scroll-to-bottom', handler);
+    return () => window.removeEventListener('history-panel:scroll-to-bottom', handler);
+  }, [tabId]);
+
   // Scroll to entry when Timeline click sets historyScrollToUuid
   // Uses instant scroll + retry: contentVisibility:auto causes layout shifts on first scroll,
   // so we scroll twice to land accurately regardless of session length.
@@ -770,6 +783,10 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
     if (!el) return;
     const distFromBottom = el.scrollHeight - (el.scrollTop + el.clientHeight);
     isAtBottomRef.current = distFromBottom < 150;
+    // Toggle scroll-to-bottom arrow
+    if (scrollArrowRef.current) {
+      scrollArrowRef.current.style.display = distFromBottom > 150 ? '' : 'none';
+    }
     scrollDirectionRef.current = el.scrollTop >= lastScrollTopRef.current ? 'down' : 'up';
     lastScrollTopRef.current = el.scrollTop;
     // Debounced save of scroll position per-tab
@@ -998,7 +1015,7 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
       </div>
 
       {/* Content */}
-      <div style={{ flex: 1, overflow: 'hidden' }}>
+      <div style={{ flex: 1, overflow: 'hidden', position: 'relative' }}>
         {loading ? (
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: '#818cf8', fontSize: 13, gap: 8 }}>
             <svg width="16" height="16" viewBox="0 0 16 16" style={{ animation: 'spinner-rotate 1s linear infinite', willChange: 'transform' }}>
@@ -1030,6 +1047,34 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
             ))}
           </div>
         )}
+        {/* Scroll-to-bottom arrow — visibility toggled via ref in handleScroll */}
+        <div
+          ref={scrollArrowRef}
+          className="flex items-center justify-center"
+          onClick={() => {
+            const el = scrollRef.current;
+            if (!el) return;
+            // Instant jump — smooth scroll can't reach the end on very long lists
+            el.scrollTop = el.scrollHeight;
+          }}
+          style={{
+            display: 'none',
+            position: 'absolute',
+            bottom: 12,
+            right: 12,
+            width: 28,
+            height: 28,
+            borderRadius: 6,
+            backgroundColor: '#323237',
+            border: '1px solid rgba(167, 139, 250, 0.3)',
+            boxShadow: '0 2px 8px rgba(0, 0, 0, 0.5)',
+            cursor: 'pointer',
+            zIndex: 10,
+          }}
+          title="Scroll to bottom"
+        >
+          <ChevronDown size={16} color="#a78bfa" strokeWidth={2.5} />
+        </div>
       </div>
     </div>
   );

@@ -266,6 +266,12 @@ const { ipcRenderer } = window.require('electron');
 const FLUSH_DELAY = 16; // ms - one frame at 60fps
 const MAX_BUFFER_SIZE = 65536; // 64KB safety valve
 
+// DEC 2026 sync block markers
+const BSU = '\x1b[?2026h';
+const ESU = '\x1b[?2026l';
+
+
+
 interface TerminalProps {
   tabId: string;
   cwd: string;
@@ -333,6 +339,7 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
   // Check if terminal is scrolled up (not at bottom)
   // ALL callers go through rAF debounce — never call this synchronously during term.write()
   const lastScrollButtonState = useRef(false);
+  const lastViewportY = useRef<number>(-1);
   const checkScrollPosition = useCallback(() => {
     const term = xtermInstance.current;
     if (!term) return;
@@ -340,6 +347,15 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
     const buffer = term.buffer.active;
     const isAtBottom = buffer.viewportY >= buffer.baseY;
 
+    // Diagnostic: detect scroll jumps
+    const prevY = lastViewportY.current;
+    if (prevY !== -1) {
+      const delta = Math.abs(buffer.viewportY - prevY);
+      if (delta > 5) {
+        console.warn(`[ScrollDiag] JUMP viewportY: ${prevY} → ${buffer.viewportY} (delta=${delta}) baseY=${buffer.baseY} isAtBottom=${isAtBottom}`);
+      }
+    }
+    lastViewportY.current = buffer.viewportY;
 
     const shouldShow = !isAtBottom;
     if (shouldShow !== lastScrollButtonState.current) {
@@ -363,6 +379,7 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
     term.scrollToBottom();
     lastScrollButtonState.current = false;
     setShowScrollButton(false);
+    userScrollTopRef.current = null;
   }, []);
 
   // Single rAF gate for ALL scroll sources — collapses N events per frame into one check
@@ -381,9 +398,35 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
     // Without this: term.onScroll fires DURING write() for every \n → setState → re-render → jitter
 
     // 1. Native scroll (mouse wheel, trackpad, scrollbar drag)
-    const viewport = container.querySelector('.xterm-viewport');
+    // This is the ONLY event that fires on user scroll — term.onScroll does NOT (xterm.js #3201).
+    // Track user scroll position here, guarded by isWritingRef to ignore programmatic scroll.
+    const viewport = container.querySelector('.xterm-viewport') as HTMLElement | null;
     if (viewport) {
-      viewport.addEventListener('scroll', rafCheckScroll);
+      let clearRefTimer: NodeJS.Timeout | null = null;
+      viewport.addEventListener('scroll', () => {
+        rafCheckScroll();
+        // Only track user scroll — skip during write and rAF restore
+        if (!isWritingRef.current && !isRestoringRef.current) {
+          const buf = term.buffer.active;
+          if (buf.viewportY >= buf.baseY) {
+            // User at bottom — schedule ref clear after 1s
+            if (!clearRefTimer && userScrollTopRef.current !== null) {
+              clearRefTimer = setTimeout(() => {
+                clearRefTimer = null;
+                const b = term.buffer.active;
+                if (b.viewportY >= b.baseY) {
+                  console.warn(`[ScrollDiag] REF CLEARED: stable isAtBottom for 1s`);
+                  userScrollTopRef.current = null;
+                }
+              }, 1000);
+            }
+          } else if (buf.viewportY > 0) {
+            // User scrolled — save position (any direction), cancel pending clear
+            if (clearRefTimer) { clearTimeout(clearRefTimer); clearRefTimer = null; }
+            userScrollTopRef.current = buf.viewportY;
+          }
+        }
+      });
     }
 
     // 2. Xterm scroll (programmatic scroll, buffer changes)
@@ -394,8 +437,13 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
   }, [rafCheckScroll]);
 
   // Write buffer refs to batch PTY output and prevent jitter
-  const writeBufferRef = useRef<string>('');
+  const writeBufferRef = useRef<string>(''); // normal (non-sync) data, flushed every 16ms
   const pendingWriteRef = useRef<NodeJS.Timeout | null>(null);
+  const syncFrameBufferRef = useRef<string>(''); // DEC 2026 sync frame, flushed atomically on ESU
+  const insideSyncBlockRef = useRef(false); // tracks BSU/ESU state across PTY data chunks
+  const isWritingRef = useRef(false); // true during sync frame term.write() — blocks scroll handler
+  const isRestoringRef = useRef(false); // true during rAF restore — blocks scroll handler
+  const userScrollTopRef = useRef<number | null>(null); // saved viewportY line number
 
   const safeFit = () => {
     if (!isMounted.current) return;
@@ -460,29 +508,147 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
         return;
       }
 
-      // Accumulate data in write buffer, flush after FLUSH_DELAY
-      // DEC 2026 sync output is handled internally by patched xterm.js
-      writeBufferRef.current += payload.data;
+      // ── Sync-frame-aware write pipeline ──────────────────────────────
+      // Ink (Claude Code TUI) wraps each render frame in DEC 2026 sync markers:
+      //   BSU (\x1b[?2026h) … frame data (includes CSI 2J + redraw) … ESU (\x1b[?2026l)
+      //
+      // Problem: xterm.js 5.x ignores DEC 2026, so CSI 2J inside the frame deletes
+      // buffer lines mid-render, causing ybase to shrink. Chromium clamps scrollTop,
+      // xterm reads clamped value → viewport jumps to top.
+      //
+      // Solution: buffer ALL data inside a sync block. When ESU arrives, write the
+      // ENTIRE frame in one term.write() call with overflow:hidden on the viewport.
+      // xterm processes clear+redraw atomically — buffer shrinks then grows back
+      // within the same call. Browser never sees intermediate state.
+      //
+      // Data outside sync blocks is written normally (batched 16ms).
 
-      if (!pendingWriteRef.current) {
+      const term = xtermInstance.current;
+
+      // Protected write: overflow:hidden + offset-from-bottom restore.
+      // Used for ALL writes when user has scrolled up.
+      //
+      // Saves scroll position as distance from bottom (baseY - viewportY).
+      // This compensates for scrollback trimming: when xterm deletes old lines
+      // from the top (scrollback limit = 10000), absolute viewportY shifts down
+      // but offset from bottom remains stable.
+      //
+      // isSyncFrame=true adds diagnostic logging for sync block writes.
+      const protectedWrite = (t: XTerminal, data: string, isSyncFrame: boolean) => {
+        const savedLine = userScrollTopRef.current;
+        if (savedLine === null) {
+          // User at bottom — write without protection
+          t.write(data);
+          return;
+        }
+
+        const baseBefore = t.buffer.active.baseY;
+        const offsetFromBottom = baseBefore - savedLine;
+
+        const vpEl = t.element?.querySelector('.xterm-viewport') as HTMLElement | null;
+        if (vpEl) vpEl.style.overflow = 'hidden';
+
+        isWritingRef.current = true;
+        t.write(data, () => {
+          isRestoringRef.current = true;
+          isWritingRef.current = false;
+
+          const baseAfter = t.buffer.active.baseY;
+          const restoredLine = Math.max(0, baseAfter - offsetFromBottom);
+
+          if (vpEl) vpEl.style.overflow = '';
+          t.scrollToLine(restoredLine);
+          userScrollTopRef.current = restoredLine;
+
+          // Diagnostic: log sync frame events with compensation info
+          if (isSyncFrame) {
+            const drift = restoredLine - savedLine;
+            if (drift !== 0) {
+              console.warn(`[ScrollFix] FRAME base:${baseBefore}→${baseAfter} restore:${savedLine}→${restoredLine} (Δ${drift > 0 ? '+' : ''}${drift})`);
+            }
+          }
+
+          requestAnimationFrame(() => {
+            if (userScrollTopRef.current !== null) {
+              t.scrollToLine(userScrollTopRef.current);
+            }
+            isRestoringRef.current = false;
+          });
+        });
+      };
+
+      // Flush any pending normal data immediately (preserves write order before sync frame)
+      const flushNormalBuffer = () => {
+        if (pendingWriteRef.current) {
+          clearTimeout(pendingWriteRef.current);
+          pendingWriteRef.current = null;
+        }
+        if (term && writeBufferRef.current) {
+          protectedWrite(term, writeBufferRef.current, false);
+          writeBufferRef.current = '';
+        }
+      };
+
+      // ── Split incoming data at BSU/ESU boundaries ──
+      const raw = payload.data;
+      let pos = 0;
+      while (pos < raw.length) {
+        if (!insideSyncBlockRef.current) {
+          const bsuIdx = raw.indexOf(BSU, pos);
+          if (bsuIdx === -1) {
+            // All remaining data is normal
+            writeBufferRef.current += raw.slice(pos);
+            break;
+          }
+          // Normal data before BSU
+          writeBufferRef.current += raw.slice(pos, bsuIdx);
+          // Enter sync block
+          insideSyncBlockRef.current = true;
+          syncFrameBufferRef.current = BSU;
+          pos = bsuIdx + BSU.length;
+        } else {
+          const esuIdx = raw.indexOf(ESU, pos);
+          if (esuIdx === -1) {
+            // Still inside sync block — accumulate
+            syncFrameBufferRef.current += raw.slice(pos);
+            break;
+          }
+          // Frame complete (BSU … data … ESU)
+          syncFrameBufferRef.current += raw.slice(pos, esuIdx + ESU.length);
+          insideSyncBlockRef.current = false;
+          pos = esuIdx + ESU.length;
+
+          // Flush: normal data first (order matters), then sync frame atomically
+          flushNormalBuffer();
+          if (term) {
+            protectedWrite(term, syncFrameBufferRef.current, true);
+          }
+          syncFrameBufferRef.current = '';
+        }
+      }
+
+      // Schedule normal flush for remaining writeBuffer data
+      if (writeBufferRef.current && !pendingWriteRef.current) {
         pendingWriteRef.current = setTimeout(() => {
           if (xtermInstance.current && writeBufferRef.current) {
-            xtermInstance.current.write(writeBufferRef.current);
+            protectedWrite(xtermInstance.current, writeBufferRef.current, false);
             writeBufferRef.current = '';
           }
           pendingWriteRef.current = null;
         }, FLUSH_DELAY);
       }
 
-      // Safety valve: flush immediately if buffer too large
+      // Safety valve: flush writeBuffer if too large
       if (writeBufferRef.current.length > MAX_BUFFER_SIZE) {
-        if (pendingWriteRef.current) {
-          clearTimeout(pendingWriteRef.current);
-          pendingWriteRef.current = null;
-        }
-        if (xtermInstance.current) {
-          xtermInstance.current.write(writeBufferRef.current);
-          writeBufferRef.current = '';
+        flushNormalBuffer();
+      }
+
+      // Safety valve: flush sync frame buffer if too large (prevent unbounded growth)
+      if (syncFrameBufferRef.current.length > MAX_BUFFER_SIZE * 4) {
+        if (term) {
+          protectedWrite(term, syncFrameBufferRef.current, true);
+          syncFrameBufferRef.current = '';
+          insideSyncBlockRef.current = false;
         }
       }
     };
@@ -670,8 +836,6 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
       });
 
       term.open(containerRef);
-
-      // Scroll jitter: handled by patched xterm.js (DEC 2026 syncScrollArea guard)
 
       // OSC 7 handler - shell reports current working directory
       // Format: file://hostname/path or just /path

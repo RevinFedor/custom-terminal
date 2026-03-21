@@ -3222,7 +3222,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
       LANG: process.env.LANG || 'en_US.UTF-8',
       LC_ALL: process.env.LC_ALL || 'en_US.UTF-8',
       TERM_PROGRAM: 'CustomTerminal',
-      TERM_PROGRAM_VERSION: '1.0.0'
+      TERM_PROGRAM_VERSION: '1.0.0',
     };
 
     // Zsh: use ZDOTDIR to load our integration

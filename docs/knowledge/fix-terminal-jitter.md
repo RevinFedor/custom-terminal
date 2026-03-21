@@ -1,120 +1,64 @@
 ---
-name: Terminal Jitter Fix (Synchronized Output DEC 2026)
-description: Solution for viewport jitter in xterm.js when Claude Code uses differential rendering with DEC mode 2026 sync frames
+name: Terminal Scroll Jitter Fix (Ink Cursor-Up Clamping)
+description: Scroll snap-to-top during Claude Code output caused by Ink renderer cursor-up exceeding viewport height. Fix clamps CSI A sequences on PTY input. Graveyard of failed xterm-level approaches.
 type: fix
 ---
 
-# Terminal Jitter Fix: Synchronized Output (DEC 2026) Support
+# Terminal Scroll Fix: Ink Cursor-Up Clamping
 
-## Problem
-Terminal viewport "jitters" or "twitches" when Claude Code CLI writes output, especially during file reads or spinner transitions. Visual symptom: prompt line visually "jumps" or cursor position becomes unstable mid-frame.
+## Симптомы
+- При работе Claude Code терминал **прыгает на самый верх scrollback** (scrollTop=0)
+- Особенно при file reads, tool calls, любом обновлении Ink TUI
+- Если пользователь скроллит вверх на ~70px чтобы читать историю — позиция сбрасывается наверх и застревает
+- Проблема появилась после обновления Claude Code ~февраль 2026 (Ink differential renderer)
+- Затрагивает **ВСЕ терминалы**: iTerm2, Terminal.app, VS Code, Windows Terminal, tmux, Kitty
 
 ## Root Cause
-Claude Code (as of Feb 2026) uses **Synchronized Output** protocol (DEC mode 2026):
-- Wraps each "frame" of differential updates in `\x1b[?2026h` (SYNC_START) and `\x1b[?2026l` (SYNC_END) escape sequences
-- Between these markers, multiple intermediate cursor movements and partial line redraws occur
-- **xterm.js 5.5.0 does NOT natively buffer these frames** — it renders each escape sequence immediately
-- Result: xterm renders intermediate states (empty lines, cursor jumps), causing visual tearing
+Ink renderer (`eraseLines()`) генерирует N cursor-up (`\x1b[{N}A`) последовательностей, где **N = количество ранее отрендеренных строк**. Когда N > высоты viewport, терминал следует за курсором выше видимой области и прыгает на начало scrollback.
 
-Example problematic sequence:
-```
-\x1b[?2026h
-\x1b[2K           <- Erase line
-\x1b[1A           <- Cursor up
-\x1b[2K           <- Erase next line
-<new content>
-\x1b[?2026l       <- SYNC_END
-```
+Это происходит внутри synchronized output блоков (DEC 2026), поэтому даже терминалы с поддержкой DEC 2026 не защищены — они следуют за **финальной позицией курсора** после flush.
 
-Without buffering, xterm shows intermediate frames: **empty line → cursor up → empty line again → content**. This reads as "jitter" to the eye.
+Upstream: `anthropics/claude-code#34503`, `microsoft/terminal#14774`
 
-## Solution: Sync Frame Aware Write Buffer
+## Решение: Clamp Cursor-Up на входе
 
-Implement **manual buffering** in the renderer that:
-1. **Detects sync markers** in incoming PTY data
-2. **Holds writes** while inside an incomplete sync frame (`lastIndexOf(SYNC_START) > lastIndexOf(SYNC_END)`)
-3. **Flushes atomically** when sync frame closes (or safety timeout fires)
+Одна функция `clampCursorUp()` в `Terminal.tsx` — regex замена `\x1b[{n}A` с бюджетом = `term.rows` на каждый write-вызов. Применяется **до передачи данных в xterm**, на уровне PTY-данных.
 
-### Implementation (Terminal.tsx)
+Ключевой инсайт: **фикс на входе (1 regex на PTY data) vs. сложная машинерия scroll-restore на выходе (xterm internals)**. Не нужно сохранять/восстанавливать scrollTop, перехватывать rAF, патчить xterm — достаточно не давать курсору уходить выше viewport.
 
-```typescript
-// Constants
-const FLUSH_DELAY = 16;              // ms - one 60fps frame
-const MAX_BUFFER_SIZE = 65536;       // 64KB safety valve
-const SYNC_START = '\x1b[?2026h';
-const SYNC_END = '\x1b[?2026l';
-const SYNC_SAFETY_TIMEOUT = 200;     // ms - force flush if sync never closes
+Подход взят из `anthropics/claude-code#35683` (scroll-fix plugin) — тот же clamp, но реализованный как `process.stdout.write` interceptor внутри Node.js. У нас — на уровне терминала-потребителя.
 
-// In component:
-const writeBufferRef = useRef<string>('');
-const pendingWriteRef = useRef<NodeJS.Timeout | null>(null);
-const syncSafetyRef = useRef<NodeJS.Timeout | null>(null);
+### Альтернативный workaround
+`SK6=500` env variable при запуске Claude — тротлит Ink render с 16ms до 500ms. Текст приходит чанками, но скролл не дёргается. Грубый, но рабочий.
 
-// In handleData:
-writeBufferRef.current += payload.data;
+## Кладбище подходов (>10 итераций)
 
-// Detect if we're inside an incomplete sync frame
-const buf = writeBufferRef.current;
-const lastOpen = buf.lastIndexOf(SYNC_START);
-const lastClose = buf.lastIndexOf(SYNC_END);
-const insideSyncFrame = lastOpen !== -1 && lastOpen > lastClose;
+Все подходы ниже **боролись с последствиями** (xterm уже получил cursor-up, уже сломал ydisp/scrollTop) вместо причины (cursor-up не должен был приходить):
 
-if (insideSyncFrame) {
-  // Cancel any scheduled flush, set safety timeout
-  clearTimeout(pendingWriteRef.current);
-  pendingWriteRef.current = null;
+1. **Sync frame buffering** — буферизация между `\x1b[?2026h` / `\x1b[?2026l`. Убирала мелкий jitter от intermediate states, но не решала scroll-to-top (cursor-up внутри sync frame всё равно > viewport)
+2. **defineProperty патч `_innerRefresh`** — перехват xterm Viewport через `Object.defineProperty`. scrollTop переставал обновляться, но и пользовательский скролл ломался
+3. **rAF scroll restore** — сохранять scrollTop → записать → восстановить через requestAnimationFrame. Race condition: xterm свой rAF стреляет после нашего, перезаписывая значение. Double-rAF → 2-frame flicker
+4. **Offset-from-bottom** — запоминать расстояние от низа вместо абсолютного scrollTop. Контент скроллился ВВЕРХ, потому что мы компенсировали рост буфера в неправильном направлении
+5. **Settle timer** — 200-500ms пауза после Claude tool calls для "стабилизации" скролла. scrollToBottom срабатывал между вызовами инструментов
+6. **isAtBottom на viewportY** — xterm `viewportY=0` (corrupted Ink-ом) → проверка всегда врала
+7. **xterm 6.0 upgrade** — Canvas renderer убран в 6.x → garbled text. `.xterm-viewport.scrollTop` не работает. Откат
+8. **xterm 5.5.0 fork (DI injection)** — добавление `@ICoreService` в конструктор Viewport сломало DI parameter ordering → wrong services injected → скролл полностью мёртв
+9. **xterm 5.5.0 fork (globalThis)** — `globalThis.__xtermSyncOutput` guard на `syncScrollArea`. Vite pre-bundling + browser HTTP caching сделали отладку невозможной. Скролл сломан в dev mode
+10. **attachCustomWheelEventHandler + pauseFrames** — перехват wheel для паузы rAF enforcement. Wheel events fire ДО того как браузер применяет scroll → невозможно корректно обработать
 
-  if (!syncSafetyRef.current) {
-    syncSafetyRef.current = setTimeout(() => {
-      syncSafetyRef.current = null;
-      xtermInstance.current?.write(writeBufferRef.current);
-      writeBufferRef.current = '';
-    }, SYNC_SAFETY_TIMEOUT);
-  }
-} else {
-  // Not in sync frame — schedule normal flush
-  clearTimeout(syncSafetyRef.current);
-  syncSafetyRef.current = null;
+## Методологический урок: глубокое чтение upstream PR
 
-  if (!pendingWriteRef.current) {
-    pendingWriteRef.current = setTimeout(() => {
-      xtermInstance.current?.write(writeBufferRef.current);
-      writeBufferRef.current = '';
-      pendingWriteRef.current = null;
-    }, FLUSH_DELAY);
-  }
-}
+Решение было найдено в **PR #35683** на `anthropics/claude-code`, который был в результатах поиска с самого начала. Ошибка: PR был найден, но прочитан поверхностно — только заголовок и описание, без полного диалога в комментариях и diff-а.
 
-// Safety valve: flush if buffer grows too large
-if (writeBufferRef.current.length > MAX_BUFFER_SIZE) {
-  xtermInstance.current?.write(writeBufferRef.current);
-  writeBufferRef.current = '';
-}
-```
+**Правило:** При поиске решений для проблем, связанных с upstream-зависимостями (Claude Code, xterm.js, Electron):
+- Читать **полный диалог** PR/issue, не только описание — решение часто в комментариях, в обсуждении отброшенных подходов
+- Читать **diff целиком** — один файл на 87 строк (scroll-fix.cjs) содержал полное решение
+- Искать **связанные issues** — #34503 агрегировал 8+ дубликатов, каждый с дополнительным контекстом
+- **Не бросаться писать свой фикс**, пока не исчерпан поиск существующих решений. Час чтения PR экономит дни патчинга xterm internals
 
-## Key Parameters
-
-### FLUSH_DELAY = 16ms
-- **Why 16ms:** One frame at 60fps = 16.67ms. Batching multiple Ink updates into a single frame eliminates intermediate rendering.
-- **Too low (5-10ms):** May still render intermediate states, causing tearing.
-- **Too high (20ms+):** May feel sluggish, defeats purpose of differential rendering.
-
-### SYNC_SAFETY_TIMEOUT = 200ms
-- **Invisible Intent (UX Psychology):** If Claude Code sends a malformed or stuck sync frame (never sends SYNC_END), we cannot freeze the terminal indefinitely.
-- **200ms threshold:** Long enough to complete any realistic differential update batch, short enough that user won't notice a pause if something goes wrong.
-- **Fallback:** Force flush and continue. Better to show one frame of jitter than to freeze the terminal.
-
-### MAX_BUFFER_SIZE = 65536 (64KB)
-- **Why 64KB:** Claude's differential renderer can emit heavyweight frames (large diffs, multiple redraws). 64KB accommodates these without premature flushing mid-frame.
-- **Safety valve:** If buffer exceeds this despite buffering, flush immediately to prevent memory exhaustion.
-
-## Result
-- Smooth terminal rendering during Claude Code execution
-- No viewport "jitter" or "jump" artifacts
-- Maintains semantic correctness of differential rendering (xterm never sees broken intermediate states)
-- Graceful fallback if sync protocol breaks (200ms timeout prevents freezing)
+Это особенно критично для проблем, затрагивающих все терминалы — если баг воспроизводится везде, решение почти наверняка уже обсуждается upstream.
 
 ## Related
-- `fact-terminal-rendering.md` — General terminal rendering architecture
-- `Terminal.tsx:266-273` — Constants and write buffer refs
-- `Terminal.tsx:436-517` — `handleData` implementation with sync frame detection
+- `fact-terminal-rendering.md` — архитектура рендеринга терминала
+- `anthropics/claude-code#35683` — scroll-fix plugin (upstream)
+- `anthropics/claude-code#34503` — meta-issue со всеми дубликатами
