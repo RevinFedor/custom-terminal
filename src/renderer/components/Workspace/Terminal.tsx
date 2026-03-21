@@ -351,7 +351,7 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
     const prevY = lastViewportY.current;
     if (prevY !== -1) {
       const delta = Math.abs(buffer.viewportY - prevY);
-      if (delta > 5) {
+      if (delta > 50) {
         console.warn(`[ScrollDiag] JUMP viewportY: ${prevY} → ${buffer.viewportY} (delta=${delta}) baseY=${buffer.baseY} isAtBottom=${isAtBottom}`);
       }
     }
@@ -405,26 +405,46 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
       let clearRefTimer: NodeJS.Timeout | null = null;
       viewport.addEventListener('scroll', () => {
         rafCheckScroll();
-        // Only track user scroll — skip during write and rAF restore
-        if (!isWritingRef.current && !isRestoringRef.current) {
-          const buf = term.buffer.active;
-          if (buf.viewportY >= buf.baseY) {
-            // User at bottom — schedule ref clear after 1s
-            if (!clearRefTimer && userScrollTopRef.current !== null) {
-              clearRefTimer = setTimeout(() => {
-                clearRefTimer = null;
-                const b = term.buffer.active;
-                if (b.viewportY >= b.baseY) {
+        // Skip during sync frame write/restore (isWritingRef only set for sync frames)
+        if (isWritingRef.current || isRestoringRef.current) return;
+
+        const buf = term.buffer.active;
+
+        // Echo detection: after scrollToLine(X), browser fires a parasitic scroll event
+        // with viewportY ≈ X. Ignore it — it's not user input.
+        // Real user scroll produces values far from lastRestoredY.
+        if (lastRestoredYRef.current !== null) {
+          const echoDistance = Math.abs(buf.viewportY - lastRestoredYRef.current);
+          if (echoDistance <= 1) {
+            // This is echo from our scrollToLine — consume and ignore
+            lastRestoredYRef.current = null;
+            return;
+          }
+          // Large distance = real user scroll, fall through to update ref
+          lastRestoredYRef.current = null;
+        }
+
+        if (buf.viewportY >= buf.baseY) {
+          // User at bottom — schedule ref clear after 1s.
+          const savedPos = userScrollTopRef.current;
+          const isPushedToBottom = savedPos !== null && savedPos > buf.baseY;
+          if (!clearRefTimer && savedPos !== null && !isPushedToBottom) {
+            clearRefTimer = setTimeout(() => {
+              clearRefTimer = null;
+              const b = term.buffer.active;
+              if (b.viewportY >= b.baseY) {
+                const stillPushed = userScrollTopRef.current !== null && userScrollTopRef.current > b.baseY;
+                if (!stillPushed) {
                   console.warn(`[ScrollDiag] REF CLEARED: stable isAtBottom for 1s`);
                   userScrollTopRef.current = null;
                 }
-              }, 1000);
-            }
-          } else if (buf.viewportY > 0) {
-            // User scrolled — save position (any direction), cancel pending clear
-            if (clearRefTimer) { clearTimeout(clearRefTimer); clearRefTimer = null; }
-            userScrollTopRef.current = buf.viewportY;
+              }
+            }, 1000);
           }
+        } else if (buf.viewportY > 0) {
+          // User scrolled — save position, cancel pending clear
+          if (clearRefTimer) { clearTimeout(clearRefTimer); clearRefTimer = null; }
+          userScrollTopRef.current = buf.viewportY;
         }
       });
     }
@@ -441,12 +461,15 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
   const pendingWriteRef = useRef<NodeJS.Timeout | null>(null);
   const syncFrameBufferRef = useRef<string>(''); // DEC 2026 sync frame, flushed atomically on ESU
   const insideSyncBlockRef = useRef(false); // tracks BSU/ESU state across PTY data chunks
-  const isWritingRef = useRef(false); // true during sync frame term.write() — blocks scroll handler
+  const isWritingRef = useRef(false); // true during term.write() — blocks scroll handler
   const isRestoringRef = useRef(false); // true during rAF restore — blocks scroll handler
   const userScrollTopRef = useRef<number | null>(null); // saved viewportY line number
+  const lastRestoredYRef = useRef<number | null>(null); // echo detection: last scrollToLine target
+  const overflowLocksRef = useRef(0); // sync frame overflow:hidden lock counter
+  const isFitBlockedRef = useRef(false); // blocks safeFit during overflow:hidden to prevent reflow
 
   const safeFit = () => {
-    if (!isMounted.current) return;
+    if (!isMounted.current || isFitBlockedRef.current) return;
     try {
       const term = xtermInstance.current;
       const fit = fitAddonRef.current;
@@ -525,28 +548,42 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
 
       const term = xtermInstance.current;
 
-      // Protected write: overflow:hidden + offset-from-bottom restore.
-      // Used for ALL writes when user has scrolled up.
+      // Write pipeline with two modes:
       //
-      // Saves scroll position as distance from bottom (baseY - viewportY).
-      // This compensates for scrollback trimming: when xterm deletes old lines
-      // from the top (scrollback limit = 10000), absolute viewportY shifts down
-      // but offset from bottom remains stable.
+      // Normal writes (isSyncFrame=false): just t.write(data).
+      //   xterm.js natively preserves scroll position when user is scrolled up
+      //   and new content is appended at the bottom. No protection needed.
+      //   No flags, no scrollToLine, no overflow tricks. User scroll works perfectly.
       //
-      // isSyncFrame=true adds diagnostic logging for sync block writes.
+      // Sync frame writes (isSyncFrame=true): full protection.
+      //   CSI 2J inside sync frames shrinks buffer temporarily.
+      //   overflow:hidden prevents Chromium from clamping scrollTop.
+      //   isFitBlockedRef prevents ResizeObserver → fitAddon.fit() → reflow
+      //   (scrollbar disappear/appear changes width → word wrap recalculation).
+      //   scrollToLine restores position after atomic clear+redraw.
       const protectedWrite = (t: XTerminal, data: string, isSyncFrame: boolean) => {
+        if (!isSyncFrame) {
+          // Normal write: xterm handles scroll position natively
+          t.write(data);
+          return;
+        }
+
+        // ── Sync frame: full protection ──
         const savedLine = userScrollTopRef.current;
         if (savedLine === null) {
-          // User at bottom — write without protection
           t.write(data);
           return;
         }
 
         const baseBefore = t.buffer.active.baseY;
-        const offsetFromBottom = baseBefore - savedLine;
-
         const vpEl = t.element?.querySelector('.xterm-viewport') as HTMLElement | null;
-        if (vpEl) vpEl.style.overflow = 'hidden';
+
+        // Lock overflow + block fit to prevent reflow from scrollbar width change
+        if (vpEl) {
+          overflowLocksRef.current++;
+          isFitBlockedRef.current = true;
+          vpEl.style.overflow = 'hidden';
+        }
 
         isWritingRef.current = true;
         t.write(data, () => {
@@ -554,23 +591,34 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
           isWritingRef.current = false;
 
           const baseAfter = t.buffer.active.baseY;
-          const restoredLine = Math.max(0, baseAfter - offsetFromBottom);
+          const restoredLine = Math.min(savedLine, baseAfter);
 
-          if (vpEl) vpEl.style.overflow = '';
-          t.scrollToLine(restoredLine);
-          userScrollTopRef.current = restoredLine;
-
-          // Diagnostic: log sync frame events with compensation info
-          if (isSyncFrame) {
-            const drift = restoredLine - savedLine;
-            if (drift !== 0) {
-              console.warn(`[ScrollFix] FRAME base:${baseBefore}→${baseAfter} restore:${savedLine}→${restoredLine} (Δ${drift > 0 ? '+' : ''}${drift})`);
+          // Unlock overflow only when ALL sync frames are done
+          if (vpEl) {
+            overflowLocksRef.current--;
+            if (overflowLocksRef.current === 0) {
+              vpEl.style.overflow = '';
+              requestAnimationFrame(() => { isFitBlockedRef.current = false; });
             }
+          }
+
+          t.scrollToLine(restoredLine);
+          lastRestoredYRef.current = restoredLine;
+
+          if (restoredLine >= savedLine) {
+            userScrollTopRef.current = restoredLine;
+          }
+
+          // Diagnostic
+          const drift = restoredLine - savedLine;
+          if (drift !== 0) {
+            console.warn(`[ScrollFix] FRAME base:${baseBefore}→${baseAfter} restore:${savedLine}→${restoredLine} (Δ${drift > 0 ? '+' : ''}${drift})`);
           }
 
           requestAnimationFrame(() => {
             if (userScrollTopRef.current !== null) {
               t.scrollToLine(userScrollTopRef.current);
+              lastRestoredYRef.current = userScrollTopRef.current;
             }
             isRestoringRef.current = false;
           });
