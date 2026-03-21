@@ -12,7 +12,9 @@
     "build:i": "npm run build:install",
     "_rebuild": "electron-rebuild -f -w node-pty",
     "_test:e2e": "cd runtime-tests && npx playwright test",
-    "_test:e2e:headed": "cd runtime-tests && npx playwright test --headed"
+    "_test:e2e:headed": "cd runtime-tests && npx playwright test --headed",
+    "index": "bash scripts/ai/build-index.sh",
+    "index:force": "bash scripts/ai/build-index.sh --force"
   },
   "build": {
     "appId": "com.noted.terminal",

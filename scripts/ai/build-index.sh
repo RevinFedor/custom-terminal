@@ -8,6 +8,7 @@
 # Опции: -g            — использовать Gemini 3 Flash (результат → clipboard, индекс не меняется)
 #         --with-src    — также индексировать src/ (компоненты и сторы)
 #         --parallel N  — количество параллельных запросов (по умолчанию 10)
+#         --force / -f  — переиндексировать все файлы (игнорировать кеш хешей)
 #
 # CLAUDE.md переименовывается автоматически (mv → .bak) и восстанавливается при выходе
 #
@@ -31,10 +32,12 @@ NC='\033[0m'
 # Парсим аргументы
 WITH_SRC=false
 USE_GEMINI=false
+FORCE_REINDEX=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -g|--gemini) USE_GEMINI=true; shift ;;
     --with-src) WITH_SRC=true; shift ;;
+    --force|-f) FORCE_REINDEX=true; shift ;;
     --parallel) MAX_PARALLEL="$2"; shift 2 ;;
     [0-9]*) MAX_PARALLEL="$1"; shift ;;
     *) shift ;;
@@ -88,6 +91,8 @@ cleanup() {
     echo -e "\n${GREEN}CLAUDE.md.bak → CLAUDE.md (восстановлен)${NC}"
   fi
   rm -rf "$RESULTS_DIR" 2>/dev/null
+  rm -f "${HASH_MAP_FILE:-/dev/null}" 2>/dev/null
+  rm -f "${EXISTING_PATHS:-/dev/null}" 2>/dev/null
 }
 trap cleanup EXIT
 
@@ -172,19 +177,35 @@ if [ "$WITH_SRC" = true ]; then
 fi
 
 TOTAL=${#FILES[@]}
-echo -e "${GREEN}Found $TOTAL files to index${NC}"
-echo -e "${YELLOW}Parallel: $MAX_PARALLEL workers${NC}"
-echo ""
 
 if [ "$TOTAL" -eq 0 ]; then
   echo -e "${RED}No files found. Check project structure.${NC}"
   exit 1
 fi
 
+# ===== Инкрементальная индексация: загружаем существующие хеши =====
+HASH_MAP_FILE=""
+if [ "$FORCE_REINDEX" = false ] && [ -f "$INDEX_FILE" ] && [ "$USE_GEMINI" = false ]; then
+  HASH_MAP_FILE=$(mktemp /tmp/indexer-hashmap-XXXXXXXX)
+  jq -r '.[] | "\(.path)\t\(.hash // "")"' "$INDEX_FILE" > "$HASH_MAP_FILE" 2>/dev/null || true
+  EXISTING_PATHS=$(mktemp /tmp/indexer-paths-XXXXXXXX)
+  jq -r '.[].path' "$INDEX_FILE" > "$EXISTING_PATHS" 2>/dev/null || true
+  echo -e "${GREEN}Found $TOTAL files to index (incremental mode)${NC}"
+else
+  if [ "$FORCE_REINDEX" = true ]; then
+    echo -e "${GREEN}Found $TOTAL files to index (force reindex)${NC}"
+  else
+    echo -e "${GREEN}Found $TOTAL files to index${NC}"
+  fi
+fi
+echo -e "${YELLOW}Parallel: $MAX_PARALLEL workers${NC}"
+echo ""
+
 # ===== Функция обработки одного файла (запускается как background job) =====
 process_file() {
   local FILE="$1"
   local IDX="$2"
+  local FILE_HASH="$3"
   local REL_PATH="${FILE#$PROJECT_DIR/}"
   local RESULT_FILE="$RESULTS_DIR/$IDX.json"
   local FILE_START=$(date +%s)
@@ -305,10 +326,11 @@ process_file() {
   local FILE_ELAPSED=$((FILE_END - FILE_START))
 
   if [ -z "$PARSED" ] || [ "$PARSED" = "null" ]; then
-    PARSED=$(jq -n --arg path "$REL_PATH" --arg raw "$TEXT" \
-      '{path: $path, type: "unknown", explicit: [], implicit: [], related_components: [], raw_response: $raw}') || true
+    PARSED=$(jq -n --arg path "$REL_PATH" --arg raw "$TEXT" --arg hash "$FILE_HASH" \
+      '{path: $path, hash: $hash, type: "unknown", explicit: [], implicit: [], related_components: [], raw_response: $raw}') || true
     echo "WARN:${FILE_ELAPSED}s" > "$RESULT_FILE.status"
   else
+    PARSED=$(echo "$PARSED" | jq --arg hash "$FILE_HASH" '. + {hash: $hash}') || true
     echo "OK:${FILE_ELAPSED}s" > "$RESULT_FILE.status"
   fi
 
@@ -318,13 +340,30 @@ process_file() {
 # ===== Параллельный запуск =====
 START_TIME=$(date +%s)
 RUNNING=0
+CACHED=0
 
 for i in "${!FILES[@]}"; do
   FILE="${FILES[$i]}"
   REL_PATH="${FILE#$PROJECT_DIR/}"
 
+  # Считаем хеш файла
+  FILE_HASH=$(shasum -a 256 "$FILE" | cut -d' ' -f1)
+
+  # Проверяем кеш: если хеш совпадает — пропускаем
+  if [ -n "$HASH_MAP_FILE" ] && [ -f "$HASH_MAP_FILE" ]; then
+    EXISTING_HASH=$(grep "^${REL_PATH}	" "$HASH_MAP_FILE" | cut -f2)
+    if [ "$EXISTING_HASH" = "$FILE_HASH" ] && [ -n "$EXISTING_HASH" ]; then
+      # Копируем существующую запись из индекса
+      jq --arg path "$REL_PATH" '.[] | select(.path == $path)' "$INDEX_FILE" > "$RESULTS_DIR/$i.json" 2>/dev/null
+      echo "CACHED:0s" > "$RESULTS_DIR/$i.json.status"
+      CACHED=$((CACHED + 1))
+      echo -e "  ${GREEN}cached${NC} $REL_PATH"
+      continue
+    fi
+  fi
+
   # Запускаем в фоне
-  process_file "$FILE" "$i" &
+  process_file "$FILE" "$i" "$FILE_HASH" &
   RUNNING=$((RUNNING + 1))
 
   echo -e "${BLUE}[launched $((i+1))/$TOTAL]${NC} $REL_PATH"
@@ -382,7 +421,10 @@ for i in "${!FILES[@]}"; do
   fi
   TIME_STR=$(echo "$STATUS" | cut -d: -f2)
 
-  if echo "$STATUS" | grep -q "^WARN"; then
+  if echo "$STATUS" | grep -q "^CACHED"; then
+    # уже залогировано при пропуске
+    true
+  elif echo "$STATUS" | grep -q "^WARN"; then
     echo -e "  ${YELLOW}wrapped${NC} $REL_PATH [${TIME_STR}]"
     WARNINGS=$((WARNINGS + 1))
   else
@@ -421,7 +463,7 @@ if [ "$USE_GEMINI" = true ]; then
 else
   echo -e "${GREEN}Index built: $INDEX_FILE${NC}"
 fi
-echo -e "${GREEN}Files indexed: $INDEXED/$TOTAL (skip: $SKIPPED, warn: $WARNINGS, err: $ERRORS)${NC}"
+echo -e "${GREEN}Files indexed: $INDEXED/$TOTAL (cached: $CACHED, skip: $SKIPPED, warn: $WARNINGS, err: $ERRORS)${NC}"
 echo -e "${GREEN}Time: ${ELAPSED}s (parallel: $MAX_PARALLEL)${NC}"
 
 # Суммируем токены Gemini и считаем стоимость
