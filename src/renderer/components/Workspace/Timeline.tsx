@@ -72,6 +72,7 @@ const truncateText = (text: string | unknown, maxLength: number = 120): string =
 
 interface ForkMarker {
   source_session_id: string;
+  fork_session_id: string;
   entry_uuids: string[];  // Snapshot of all entry UUIDs at fork time
 }
 
@@ -345,9 +346,9 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       let showArrow = false;
       if (!isAtBottom) {
         const visibleBottom = scrollTop + clientHeight;
-        const children = el.children;
-        for (let i = children.length - 1; i >= 0; i--) {
-          const child = children[i] as HTMLElement;
+        const segments = el.querySelectorAll('[data-segment]');
+        for (let i = segments.length - 1; i >= 0; i--) {
+          const child = segments[i] as HTMLElement;
           if (child.offsetTop >= visibleBottom && !child.dataset.unreachable) {
             showArrow = true;
             break;
@@ -476,11 +477,20 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
           }
         }
         if (markersResult.success) {
-          // Only show markers where THIS session is the source (forks FROM here).
-          // Markers where forked_to === sessionId are inherited and should NOT show blue lines.
-          const markers = (markersResult.markers || []).filter(
-            (m: ForkMarker) => m.source_session_id === sessionId
-          );
+          // Keep: source === sessionId (forks FROM me)
+          // Keep: ONE marker where forked_to === sessionId with most entry_uuids (direct parent fork point)
+          // Hide: other inherited markers where forked_to === sessionId
+          const all = markersResult.markers || [];
+          const fromMe = all.filter((m: ForkMarker) => m.source_session_id === sessionId);
+          // Find the direct parent marker (largest snapshot = most recent fork)
+          const toMe = all.filter((m: ForkMarker) => m.fork_session_id === sessionId);
+          let directParent: ForkMarker | null = null;
+          for (const m of toMe) {
+            if (!directParent || (m.entry_uuids?.length || 0) > (directParent.entry_uuids?.length || 0)) {
+              directParent = m;
+            }
+          }
+          const markers = directParent ? [...fromMe, directParent] : fromMe;
           setForkMarkers(markers);
         }
       }
@@ -968,6 +978,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     }
 
     const index = entries.findIndex(e => e.uuid === entry.uuid);
+    const clickIsOldHistory = lastBoundaryIndex >= 0 && index <= lastBoundaryIndex;
 
     // If history panel is open — scroll to entry in history only, skip terminal scroll
     // This includes compact/continued entries which have no terminal position but DO exist in history panel
@@ -975,6 +986,9 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       setHistoryScrollToUuid(entry.uuid);
       return;
     }
+
+    // Old history entries are not in terminal buffer — ignore click
+    if (clickIsOldHistory) return;
 
     // Compact/continued entries have no terminal position — skip terminal scroll
     if (entry.type === 'compact' || entry.type === 'continued') return;
@@ -1751,14 +1765,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
             const isPromptVisible = isInViewport && !isResponseOnly;
             // Old history = before last compact/plan boundary (not part of current dialog)
             const isOldHistory = lastBoundaryIndex >= 0 && index <= lastBoundaryIndex;
-            // Not in buffer = unreachable in current segment (scrollback trimmed or process closed)
-            const isNotInBuffer = isUnreachable && !isOldHistory;
 
-            if (isOldHistory && !isHovered && !isGroupCollapsed && !isCompacted) {
-              // Old history: semi-transparent white dots over red bg zone
-              dotColor = 'rgba(255, 255, 255, 0.25)';
-              dotGlow = 'none';
-            } else if (isCompacted) {
+            if (isCompacted) {
               dotColor = isHovered ? '#fbbf24' : '#a67c1a';
               dotGlow = isHovered ? '0 0 10px rgba(251, 191, 36, 0.5)' : 'none';
             } else if (isContinued) {
@@ -1904,7 +1912,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                       : (showAsChild ? '4px' : undefined),
                     backgroundColor: active
                       ? 'rgba(59, 130, 246, 0.15)'
-                      : (isOldHistory && !isGroupMeta && !isCompacted ? 'rgba(239, 68, 68, 0.12)' : 'transparent'),
+                      : (isOldHistory && !isGroupMeta && !isCompacted ? 'rgba(239, 68, 68, 0.06)' : 'transparent'),
                     cursor: (isContinued || isOldHistory) ? 'default' : 'pointer',
                   }}
                 >
@@ -1924,8 +1932,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                       width: dotWidth,
                       height: dotHeight,
                       borderRadius: dotRadius,
-                      backgroundColor: isNotInBuffer && !isHovered && !isCompacted ? 'transparent' : dotColor,
-                      border: isNotInBuffer && !isHovered && !isCompacted ? '1px solid #666' : 'none',
+                      backgroundColor: isUnreachable && !isHovered && !isCompacted ? 'transparent' : dotColor,
+                      border: isUnreachable && !isHovered && !isCompacted ? '1px solid #666' : 'none',
                       boxShadow: dotGlow,
                       boxSizing: 'border-box',
                       transition: 'width 0.15s, height 0.15s, border-radius 0.15s, background-color 0.2s, box-shadow 0.2s',
@@ -2804,7 +2812,13 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
           <div
             ref={arrowRef}
             className="absolute left-1/2 -translate-x-1/2 cursor-pointer z-50 flex items-center justify-center"
-            onClick={() => scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' })}
+            onClick={() => {
+              if (isHistoryOpen) {
+                // History panel is open — scroll history to bottom instead of timeline
+                window.dispatchEvent(new CustomEvent('history-panel:scroll-to-bottom', { detail: { tabId } }));
+              }
+              scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
+            }}
             title="Scroll to bottom"
             style={{
               display: 'none',

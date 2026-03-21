@@ -784,15 +784,22 @@ function register({ projectManager, formatToolAction }) {
       for (let i = rangeStart; i <= rangeEnd; i++) {
         removeUuids.add(activeBranch[i].uuid);
       }
-      // If last entry in range is user, include its direct assistant response(s)
-      if (activeBranch[rangeEnd].type === 'user') {
-        for (let i = rangeEnd + 1; i < activeBranch.length; i++) {
-          const entry = activeBranch[i];
-          if (entry.type === 'assistant') {
+      // Forward-expand: remove the ENTIRE response chain after the range
+      // (assistant → tool_result → assistant → ... until next REAL user message)
+      for (let i = rangeEnd + 1; i < activeBranch.length; i++) {
+        const entry = activeBranch[i];
+        if (entry.type === 'assistant') {
+          removeUuids.add(entry.uuid);
+        } else if (entry.type === 'user') {
+          const content = entry.message?.content;
+          const isToolResult = Array.isArray(content) && content.some(b => b.type === 'tool_result');
+          if (isToolResult) {
             removeUuids.add(entry.uuid);
           } else {
-            break; // system or next user — stop
+            break; // Real user message — stop
           }
+        } else {
+          break; // system or other — stop
         }
       }
 
@@ -828,10 +835,11 @@ function register({ projectManager, formatToolAction }) {
       console.log('[EditRange] File records:', allRecords.filter(r => r).length, '→ Keeping:', allRecords.filter(r => r && !removeUuids.has(r.uuid)).length);
       const compactUuid = crypto.randomUUID();
 
-      // Compact entry — sessionId from file entries, timestamp BEFORE entryAfter
-      // (Claude resume picks newest leaf by timestamp — compact must be older than entries after it)
-      // If editing from start, use the target sessionId (filename) to avoid a fake bridge at the top
-      const fileSessionId = rangeStart === 0 ? sessionId : (entryBefore || entryAfter || activeBranch[0])?.sessionId || sessionId;
+      // Compact entry — sessionId MUST match what Claude will use on resume.
+      // Always use the IPC sessionId (tab's claudeSessionId) — this is what Claude --resume uses.
+      // Using file entries' sessionId (e.g. original 2fa76efe in a fork) causes a DAG fork:
+      // compact(sid=2fa76efe) and Claude's new entry(sid=e713a1a9) both point to same parent.
+      const fileSessionId = sessionId;
       const compactTs = entryAfter?.timestamp
         ? new Date(new Date(entryAfter.timestamp).getTime() - 1).toISOString()
         : entryBefore?.timestamp || new Date().toISOString();

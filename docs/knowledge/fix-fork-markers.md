@@ -20,11 +20,19 @@
 - **Augmentation entries** (сканирование sessionId transitions): Блокировалось forkUuids (все UUID в snapshot), все transitions считались fork transitions.
 
 ## Решение
-Фильтр в renderer при загрузке маркеров:
+Двойной фильтр в renderer при загрузке маркеров:
 ```javascript
-markers.filter(m => m.source_session_id === sessionId)
+// 1. Форки ОТ меня (показать где я был форкнут)
+fromMe = markers.filter(m => m.source_session_id === sessionId)
+// 2. ОДИН прямой родитель (показать fork point + подавить ложный plan mode)
+toMe = markers.filter(m => m.fork_session_id === sessionId)
+directParent = toMe с максимальным entry_uuids.length
+markers = [...fromMe, directParent]
 ```
-Показывать только маркеры где текущая сессия — **source** (форки ОТ меня). Маркеры где сессия — **forked_to** (я сам форк) — прятать.
+
+**Почему нужен directParent:** В форке entries имеют `sessionId` оригинала (`2fa76efe`), а compact/новые entries — `sessionId` форка (`79fb8d32`). Без fork marker на границе `isPlanModeBoundary` видит смену sessionId и рисует бирюзовую полоску (plan mode). Fork marker подавляет это (`if (forkMarker) return false` в `isPlanModeBoundary`).
+
+**Почему только ОДИН:** Inherited маркеры (от дедушек) имеют snapshot из других сессий — показывают синие полоски в неправильных местах. Direct parent = самый большой snapshot = самый свежий.
 
 **Связанные факты:**
 - [`fact-timeline.md`](fact-timeline.md) — Fork & Plan Mode Markers (визуальные разделители)
