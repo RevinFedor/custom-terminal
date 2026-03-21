@@ -95,16 +95,18 @@ async function main() {
     try { await waitForMainProcessLog(mainProcessLogs, /\[Spinner\].*IDLE/, 45000); log.pass('Claude prompt ready') }
     catch { log.warn('Spinner IDLE timeout') }
 
-    await page.screenshot({ path: '/tmp/scroll-diag-1-before-prompt.png' })
+    // screenshot 1 removed — only keep anchor, 5s, 15s
 
     // Switch to haiku + disable think for faster responses
     log.step('Switching to haiku model...')
     await typeCommand(page, '/model haiku')
     await page.waitForTimeout(2000)
     log.step('Toggling think off...')
-    await page.keyboard.press('Escape')
-    await page.waitForTimeout(200)
-    await page.keyboard.press('t')
+    const thinkResult = await page.evaluate((tid) => {
+      const { ipcRenderer } = window.require('electron')
+      return ipcRenderer.invoke('claude:toggle-thinking', tid)
+    }, tabId)
+    log.info(`Think toggle: ${JSON.stringify(thinkResult)}`)
     await page.waitForTimeout(1000)
 
     // Send prompt via keyboard
@@ -121,7 +123,7 @@ async function main() {
 
     // Wait for some output
     await page.waitForTimeout(3000)
-    await page.screenshot({ path: '/tmp/scroll-diag-2-before-scroll.png' })
+    // screenshot 2 removed
 
     // === KEY: Scroll up using mouse.wheel — triggers real DOM scroll event ===
     // term.scrollLines() does NOT trigger DOM scroll event (xterm.js #3201),
@@ -129,7 +131,7 @@ async function main() {
     log.step('Scrolling up via mouse.wheel...')
     const termScreen = page.locator('.xterm-screen').last()
     await termScreen.hover()
-    await page.mouse.wheel(0, -500) // scroll up ~500px (~30 rows)
+    await page.mouse.wheel(0, -1500) // scroll up ~1500px (~100 rows, fully above active area)
     await page.waitForTimeout(300) // let scroll events + rAF fire
 
     // Verify we actually scrolled up
@@ -138,14 +140,16 @@ async function main() {
       const term = registry?.get?.(tid)
       if (!term) return null
       const buf = term.buffer.active
-      return { viewportY: buf.viewportY, baseY: buf.baseY, isAtBottom: buf.viewportY >= buf.baseY }
+      const lines = term._core?.buffer?.lines?.length || -1
+      const maxLen = term._core?.buffer?.lines?.maxLength || -1
+      return { viewportY: buf.viewportY, baseY: buf.baseY, isAtBottom: buf.viewportY >= buf.baseY, lines, maxLen }
     }, tabId)
     log.info(`After scroll: ${JSON.stringify(afterScroll)}`)
     if (afterScroll) {
       assert(!afterScroll.isAtBottom, `User scrolled up: viewportY=${afterScroll.viewportY} baseY=${afterScroll.baseY}`)
     }
 
-    await page.screenshot({ path: '/tmp/scroll-diag-3-scrolled-up.png' })
+    await page.screenshot({ path: 'tmp/scroll-anchor.png', clip: { x: 0, y: 100, width: 900, height: 600 } })
 
     // Hook into buffer.lines.onTrim to detect line index shifts
     await page.evaluate((tid) => {
@@ -174,20 +178,104 @@ async function main() {
       const buf = term.buffer.active
       const line = buf.getLine(buf.viewportY)
       const text = line ? line.translateToString(true).trim() : ''
-      window.__testAnchorLine = text
+      // Save first 5 lines as anchor
+      window.__testTabId = tid
+      window.__testAnchorLines = []
+      for (let i = 0; i < 5; i++) {
+        const l = buf.getLine(buf.viewportY + i)
+        window.__testAnchorLines.push(l ? l.translateToString(true).trim() : '')
+      }
       window.__testAnchorY = buf.viewportY
-      // Track viewportY + first line content every 16ms
+
+      // === Comprehensive scrollbar monitor ===
+      // thumbRatio = scrollTop / maxScroll — the VISUAL position of the scrollbar thumb
+      // This is what the user sees. scrollTop can be stable while thumbRatio jumps
+      // because scrollHeight changes (CSI 3J clear / Ink redraw cycle).
+      window.__testScrollBarHistory = []
+      window.__testThumbJumps = [] // large ratio changes between samples
+
+      // 1. rAF poll: viewportY + content + thumbRatio
+      let lastThumbRatio = -1
       window.__testScrollTracker = setInterval(() => {
         const b = term.buffer.active
-        const l = b.getLine(b.viewportY)
-        const t = l ? l.translateToString(true).trim() : ''
+        let allMatch = true
+        for (let i = 0; i < 5; i++) {
+          const l = b.getLine(b.viewportY + i)
+          const t = l ? l.translateToString(true).trim() : ''
+          if (t !== window.__testAnchorLines[i]) { allMatch = false; break }
+        }
         window.__testScrollHistory.push({
           y: b.viewportY,
-          line: t,
-          match: t === window.__testAnchorLine
+          match: allMatch
         })
+
+        // Scrollbar thumb ratio tracking
+        const vp = term.element?.querySelector('.xterm-viewport')
+        if (vp) {
+          const maxScroll = vp.scrollHeight - vp.clientHeight
+          const thumbRatio = maxScroll > 0 ? vp.scrollTop / maxScroll : 0
+          const entry = {
+            scrollTop: Math.round(vp.scrollTop),
+            scrollHeight: Math.round(vp.scrollHeight),
+            clientHeight: Math.round(vp.clientHeight),
+            baseY: b.baseY,
+            thumbRatio: Math.round(thumbRatio * 10000) / 10000
+          }
+          window.__testScrollBarHistory.push(entry)
+
+          // Detect thumb jumps (>5% ratio change between samples)
+          if (lastThumbRatio >= 0) {
+            const ratioDelta = Math.abs(thumbRatio - lastThumbRatio)
+            if (ratioDelta > 0.05) {
+              window.__testThumbJumps.push({
+                from: Math.round(lastThumbRatio * 10000) / 10000,
+                to: entry.thumbRatio,
+                delta: Math.round(ratioDelta * 10000) / 10000,
+                scrollTop: entry.scrollTop,
+                scrollHeight: entry.scrollHeight
+              })
+            }
+          }
+          lastThumbRatio = thumbRatio
+        }
       }, 16)
-      return text
+
+      // 2. Scroll event listener (catches every browser scroll event)
+      window.__testScrollEvents = []
+      const vpEl = term.element?.querySelector('.xterm-viewport')
+      if (vpEl) {
+        vpEl.addEventListener('scroll', () => {
+          const maxScroll = vpEl.scrollHeight - vpEl.clientHeight
+          const ratio = maxScroll > 0 ? vpEl.scrollTop / maxScroll : 0
+          window.__testScrollEvents.push({
+            t: performance.now(),
+            scrollTop: Math.round(vpEl.scrollTop),
+            scrollHeight: Math.round(vpEl.scrollHeight),
+            thumbRatio: Math.round(ratio * 10000) / 10000
+          })
+        }, { passive: true })
+      }
+
+      // 3. MutationObserver on .xterm-scroll-area (xterm changes its height to control scrollbar)
+      window.__testHeightChanges = []
+      const scrollArea = vpEl?.querySelector('.xterm-scroll-area')
+      if (scrollArea) {
+        const obs = new MutationObserver((muts) => {
+          for (const m of muts) {
+            if (m.attributeName === 'style') {
+              window.__testHeightChanges.push({
+                t: performance.now(),
+                height: scrollArea.style.height,
+                scrollHeight: Math.round(vpEl.scrollHeight),
+                scrollTop: Math.round(vpEl.scrollTop)
+              })
+            }
+          }
+        })
+        obs.observe(scrollArea, { attributes: true, attributeFilter: ['style'] })
+      }
+
+      return window.__testAnchorLines[0]
     }, tabId)
     log.info(`Anchor line: "${anchorContent?.substring(0, 80)}"`)
 
@@ -210,7 +298,7 @@ async function main() {
       }
     }, tabId)
     log.info(`After 5s: ${JSON.stringify(after5s)}`)
-    await page.screenshot({ path: '/tmp/scroll-diag-4-after-5s.png' })
+    await page.screenshot({ path: 'tmp/scroll-5s.png', clip: { x: 0, y: 100, width: 900, height: 600 } })
 
     if (after5s && afterScroll) {
       assert(after5s.viewportY > 0, `viewportY > 0 (got ${after5s.viewportY})`)
@@ -231,7 +319,7 @@ async function main() {
       return { viewportY: buf.viewportY, baseY: buf.baseY, isAtBottom: buf.viewportY >= buf.baseY }
     }, tabId)
     log.info(`After 15s: ${JSON.stringify(after15s)}`)
-    await page.screenshot({ path: '/tmp/scroll-diag-5-after-15s.png' })
+    await page.screenshot({ path: 'tmp/scroll-15s.png', clip: { x: 0, y: 100, width: 900, height: 600 } })
 
     if (after15s) {
       assert(after15s.viewportY > 0, `viewportY > 0 after 15s (got ${after15s.viewportY})`)
@@ -299,22 +387,92 @@ async function main() {
       const min = Math.min(...ys)
       const max = Math.max(...ys)
       const mismatches = h.filter(e => !e.match).length
-      const firstMismatch = h.find(e => !e.match)
+      // Get current state of anchor lines for comparison
+      const registry = window.terminalRegistry || window.__terminalRegistry
+      const term = registry?.get?.(window.__testTabId)
+      let currentLines = []
+      if (term) {
+        const buf = term.buffer.active
+        for (let i = 0; i < 5; i++) {
+          const l = buf.getLine(buf.viewportY + i)
+          currentLines.push(l ? l.translateToString(true).trim() : '')
+        }
+      }
       return {
         samples: h.length, min, max, spread: max - min,
-        mismatches, firstMismatchLine: firstMismatch?.line?.substring(0, 80) || null,
-        anchorLine: window.__testAnchorLine?.substring(0, 80) || null
+        mismatches,
+        anchorLines: window.__testAnchorLines?.map(l => l.substring(0, 60)) || [],
+        currentLines: currentLines.map(l => l.substring(0, 60))
       }
     })
     if (trackerResult) {
       log.info(`Tracker: ${trackerResult.samples} samples, viewportY [${trackerResult.min}..${trackerResult.max}], spread=${trackerResult.spread}`)
-      log.info(`Content: ${trackerResult.mismatches} mismatches out of ${trackerResult.samples} samples`)
+      log.info(`Content: ${trackerResult.mismatches} mismatches out of ${trackerResult.samples} (checking 5 lines)`)
       if (trackerResult.mismatches > 0) {
-        log.info(`  Anchor: "${trackerResult.anchorLine}"`)
-        log.info(`  First mismatch: "${trackerResult.firstMismatchLine}"`)
+        log.info(`  Anchor lines:`)
+        trackerResult.anchorLines.forEach((l, i) => log.info(`    [${i}] "${l}"`))
+        log.info(`  Current lines:`)
+        trackerResult.currentLines.forEach((l, i) => log.info(`    [${i}] "${l}"`))
       }
+      // Also report trim count
+      const trimCount = await page.evaluate(() => window.__testTrimCount || 0)
+      log.info(`Buffer trims: ${trimCount} lines removed during test`)
       assert(trackerResult.spread <= 2, `viewportY stable (spread=${trackerResult.spread})`)
       assert(trackerResult.mismatches === 0, `Content stable — first line unchanged (${trackerResult.mismatches} mismatches)`)
+    }
+
+    // 4. Scrollbar THUMB position (the visual indicator the user sees)
+    //    thumbRatio = scrollTop / (scrollHeight - clientHeight)
+    //    0.0 = thumb at top, 1.0 = thumb at bottom
+    //    Even if scrollTop is stable, scrollHeight changes move the thumb.
+    const thumbResult = await page.evaluate(() => {
+      const h = window.__testScrollBarHistory || []
+      if (h.length === 0) return null
+      const ratios = h.map(e => e.thumbRatio)
+      const scrollTops = h.map(e => e.scrollTop)
+      const scrollHeights = h.map(e => e.scrollHeight)
+      const baseYs = h.map(e => e.baseY)
+      const jumps = window.__testThumbJumps || []
+      const scrollEvents = window.__testScrollEvents || []
+      const heightChanges = window.__testHeightChanges || []
+      return {
+        samples: h.length,
+        thumbRatio: {
+          min: Math.round(Math.min(...ratios) * 10000) / 10000,
+          max: Math.round(Math.max(...ratios) * 10000) / 10000,
+          first: ratios[0],
+          last: ratios[ratios.length - 1]
+        },
+        scrollTop: { min: Math.min(...scrollTops), max: Math.max(...scrollTops) },
+        scrollHeight: { min: Math.min(...scrollHeights), max: Math.max(...scrollHeights) },
+        baseY: { min: Math.min(...baseYs), max: Math.max(...baseYs), first: baseYs[0], last: baseYs[baseYs.length - 1] },
+        thumbJumps: jumps.length,
+        thumbJumpSamples: jumps.slice(0, 10),
+        scrollEventCount: scrollEvents.length,
+        heightChangeCount: heightChanges.length,
+        lastHeightChanges: heightChanges.slice(-5).map(h => ({ height: h.height, scrollH: h.scrollHeight, scrollT: h.scrollTop }))
+      }
+    })
+    if (thumbResult) {
+      const tr = thumbResult.thumbRatio
+      const ratioSpread = Math.round((tr.max - tr.min) * 10000) / 10000
+      log.info(`Thumb ratio: [${tr.min}..${tr.max}] spread=${ratioSpread} (0=top, 1=bottom)`)
+      log.info(`  scrollTop: [${thumbResult.scrollTop.min}..${thumbResult.scrollTop.max}]`)
+      log.info(`  scrollHeight: [${thumbResult.scrollHeight.min}..${thumbResult.scrollHeight.max}]`)
+      log.info(`  baseY: [${thumbResult.baseY.min}..${thumbResult.baseY.max}] growth=${thumbResult.baseY.last - thumbResult.baseY.first}`)
+      log.info(`  Scroll events: ${thumbResult.scrollEventCount}, Height mutations: ${thumbResult.heightChangeCount}`)
+      log.info(`  Thumb jumps (>5% ratio change): ${thumbResult.thumbJumps}`)
+      if (thumbResult.thumbJumps > 0) {
+        thumbResult.thumbJumpSamples.forEach((j, i) =>
+          log.warn(`    Jump ${i+1}: ratio ${j.from}→${j.to} (Δ${j.delta}) scrollTop=${j.scrollTop} scrollH=${j.scrollHeight}`)
+        )
+      }
+      if (thumbResult.lastHeightChanges.length > 0) {
+        log.info(`  Last height changes:`)
+        thumbResult.lastHeightChanges.forEach(h => log.info(`    height=${h.height} scrollH=${h.scrollH} scrollT=${h.scrollT}`))
+      }
+      assert(thumbResult.thumbJumps === 0, `No scrollbar thumb jumps (found ${thumbResult.thumbJumps})`)
+      assert(ratioSpread < 0.1, `Thumb ratio stable (spread=${ratioSpread})`)
     }
 
     // Summary

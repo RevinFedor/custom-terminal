@@ -376,6 +376,13 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
   const scrollToBottom = useCallback(() => {
     const term = xtermInstance.current;
     if (!term) return;
+    // Disconnect scroll-area height lock before scrolling
+    if (scrollAreaObserverRef.current) {
+      scrollAreaObserverRef.current.disconnect();
+      scrollAreaObserverRef.current = null;
+      lockedScrollHeightRef.current = null;
+      lockedScrollTopRef.current = null;
+    }
     term.scrollToBottom();
     lastScrollButtonState.current = false;
     setShowScrollButton(false);
@@ -437,14 +444,44 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
                 if (!stillPushed) {
                   console.warn(`[ScrollDiag] REF CLEARED: stable isAtBottom for 1s`);
                   userScrollTopRef.current = null;
+                  // Unlock scroll-area height — let xterm.js manage scrollbar normally
+                  if (scrollAreaObserverRef.current) {
+                    scrollAreaObserverRef.current.disconnect();
+                    scrollAreaObserverRef.current = null;
+                    lockedScrollHeightRef.current = null;
+                    lockedScrollTopRef.current = null;
+                  }
                 }
               }
             }, 1000);
           }
         } else if (buf.viewportY > 0) {
-          // User scrolled — save position, cancel pending clear
+          // User scrolled up — save position, cancel pending clear
           if (clearRefTimer) { clearTimeout(clearRefTimer); clearRefTimer = null; }
           userScrollTopRef.current = buf.viewportY;
+          // Lock scroll-area height to freeze scrollbar position
+          if (!scrollAreaObserverRef.current) {
+            const scrollArea = viewport.querySelector('.xterm-scroll-area') as HTMLElement | null;
+            if (scrollArea) {
+              lockedScrollHeightRef.current = scrollArea.style.height;
+              lockedScrollTopRef.current = viewport.scrollTop;
+              const observer = new MutationObserver(() => {
+                // Reset height to locked value (before browser paints)
+                if (lockedScrollHeightRef.current !== null) {
+                  scrollArea.style.height = lockedScrollHeightRef.current;
+                }
+                // Restore scrollTop (xterm may have changed it)
+                if (lockedScrollTopRef.current !== null) {
+                  viewport.scrollTop = lockedScrollTopRef.current;
+                }
+              });
+              observer.observe(scrollArea, { attributes: true, attributeFilter: ['style'] });
+              scrollAreaObserverRef.current = observer;
+            }
+          } else {
+            // Update locked scrollTop when user scrolls to a new position
+            lockedScrollTopRef.current = viewport.scrollTop;
+          }
         }
       });
     }
@@ -454,6 +491,19 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
 
     // 3. When data is written (terminal auto-scrolls down on output)
     term.onWriteParsed(rafCheckScroll);
+
+    // 4. Buffer trim compensation.
+    //    When scrollback is full, xterm.js decrements ybase and ydisp by trim amount.
+    //    Our saved userScrollTopRef becomes stale — adjust it to match.
+    const coreBuf = (term as any)._core?.buffer;
+    if (coreBuf?.lines?.onTrim) {
+      coreBuf.lines.onTrim((amount: number) => {
+        trimCountRef.current += amount;
+        if (userScrollTopRef.current !== null) {
+          userScrollTopRef.current = Math.max(0, userScrollTopRef.current - amount);
+        }
+      });
+    }
   }, [rafCheckScroll]);
 
   // Write buffer refs to batch PTY output and prevent jitter
@@ -467,6 +517,10 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
   const lastRestoredYRef = useRef<number | null>(null); // echo detection: last scrollToLine target
   const overflowLocksRef = useRef(0); // sync frame overflow:hidden lock counter
   const isFitBlockedRef = useRef(false); // blocks safeFit during overflow:hidden to prevent reflow
+  const trimCountRef = useRef(0); // total lines trimmed from buffer (monotonically increasing)
+  const scrollAreaObserverRef = useRef<MutationObserver | null>(null); // locks scroll-area height
+  const lockedScrollHeightRef = useRef<string | null>(null); // frozen scroll-area height CSS value
+  const lockedScrollTopRef = useRef<number | null>(null); // frozen scrollTop value
 
   const safeFit = () => {
     if (!isMounted.current || isFitBlockedRef.current) return;
@@ -563,18 +617,22 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
       //   scrollToLine restores position after atomic clear+redraw.
       const protectedWrite = (t: XTerminal, data: string, isSyncFrame: boolean) => {
         if (!isSyncFrame) {
-          // Normal write: xterm handles scroll position natively
+          // Normal write: xterm handles scroll position natively.
           t.write(data);
           return;
         }
 
-        // ── Sync frame: full protection ──
+        // ── Sync frame ──
         const savedLine = userScrollTopRef.current;
+
         if (savedLine === null) {
+          // User at bottom — allow CSI 3J through (keeps buffer bounded).
+          // No scroll protection needed.
           t.write(data);
           return;
         }
 
+        // ── User is scrolled up: full protection ──
         const baseBefore = t.buffer.active.baseY;
         const vpEl = t.element?.querySelector('.xterm-viewport') as HTMLElement | null;
 
@@ -585,8 +643,14 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
           vpEl.style.overflow = 'hidden';
         }
 
+        // Strip CSI 3J (ED3 — clear scrollback) ONLY when scrolled up.
+        // Ink sends ED3 every frame, destroying all scrollback.
+        // When user scrolls back to bottom, savedLine becomes null →
+        // next frame's CSI 3J passes through → buffer self-heals.
+        const cleaned = data.replace(/\x1b\[3J/g, '');
+
         isWritingRef.current = true;
-        t.write(data, () => {
+        t.write(cleaned, () => {
           isRestoringRef.current = true;
           isWritingRef.current = false;
 
@@ -604,21 +668,27 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
 
           t.scrollToLine(restoredLine);
           lastRestoredYRef.current = restoredLine;
+          userScrollTopRef.current = restoredLine;
 
-          if (restoredLine >= savedLine) {
-            userScrollTopRef.current = restoredLine;
+          // Update locked scrollTop for MutationObserver
+          if (lockedScrollTopRef.current !== null && vpEl) {
+            lockedScrollTopRef.current = vpEl.scrollTop;
           }
 
           // Diagnostic
           const drift = restoredLine - savedLine;
           if (drift !== 0) {
-            console.warn(`[ScrollFix] FRAME base:${baseBefore}→${baseAfter} restore:${savedLine}→${restoredLine} (Δ${drift > 0 ? '+' : ''}${drift})`);
+            console.warn(`[ScrollFix] FRAME base:${baseBefore}→${baseAfter} saved:${savedLine}→restored:${restoredLine} Δ${drift}`);
           }
 
           requestAnimationFrame(() => {
             if (userScrollTopRef.current !== null) {
               t.scrollToLine(userScrollTopRef.current);
               lastRestoredYRef.current = userScrollTopRef.current;
+              // Keep locked scrollTop in sync
+              if (lockedScrollTopRef.current !== null && vpEl) {
+                lockedScrollTopRef.current = vpEl.scrollTop;
+              }
             }
             isRestoringRef.current = false;
           });
@@ -1347,7 +1417,7 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
           cursorStyle: 'block',
           allowTransparency: false,
           allowProposedApi: true, // Required for SearchAddon
-          scrollback: 50000
+          scrollback: 10000
         });
 
         const fitAddon = new FitAddon();
