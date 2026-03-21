@@ -58,4 +58,6 @@ claude_session_id, gemini_session_id
 - **Auto-Redirect:** Если в проекте не осталось вкладок, система автоматически переключает вид на Home.
 - **Visuals:** Карточки имеют размер 150x50px и окрашиваются в цвет вкладки. На карточке отображается имя таба и текущая директория (CWD).
 - **History Refetch:** История автоматически обновляется при изменении `tabs.length` (закрытие таба → refetch).
+- **Session Search:** Collapsible секция ниже History — семантический поиск по всем сессиям Claude через embeddings. Фильтры: дата, проект. Настраиваемый лимит индексации. См. [`fact-semantic-search.md`](fact-semantic-search.md).
+- **Scroll:** Контейнер ProjectHome использует `h-full overflow-y-auto` (не `flex-1`) — обязательно для скролла внутри `absolute inset-0` обёртки в Workspace.
 

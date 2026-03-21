@@ -5,6 +5,7 @@ import { useUIStore } from '../../store/useUIStore';
 import { useCmdKey, useCmdHoverPopover, CmdHoverPopover } from '../../hooks/useCmdHoverPopover';
 import { Terminal, FolderOpen, Plus, Clock, Trash2, Pencil, Star, ChevronDown, ChevronRight } from 'lucide-react';
 import { MarkdownEditor } from '@anthropic/markdown-editor';
+import SemanticSearchSection from './SemanticSearch';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -492,7 +493,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
   };
 
   return (
-    <div className="flex-1 bg-bg-main p-6 overflow-y-auto overflow-x-hidden" style={{ position: 'relative' }}>
+    <div className="h-full bg-bg-main p-6 overflow-y-auto overflow-x-hidden" style={{ position: 'relative' }}>
       {/* Project Header */}
       <div className="mb-6">
         {isDraft ? (
@@ -903,6 +904,9 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
           })}
         </>
       )}
+
+      {/* Semantic Search */}
+      <SemanticSearchSection projectPath={project?.path || ''} />
 
       {/* Context Menu (fixed, pattern from TabBar) */}
       {homeContextMenu && (
