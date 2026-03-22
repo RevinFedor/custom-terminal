@@ -1,6 +1,6 @@
 import React, { useEffect, useLayoutEffect, useState, useCallback, useRef, useMemo } from 'react';
 import { createPortal } from 'react-dom';
-import { Maximize2, Copy, Minimize2, Pencil, Trash2, StickyNote, ChevronDown } from 'lucide-react';
+import { Maximize2, Copy, Minimize2, Pencil, Trash2, StickyNote, ChevronDown, Check } from 'lucide-react';
 import { terminalRegistry } from '../../utils/terminalRegistry';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
@@ -218,6 +218,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
   const [activeTooltipIndex, setActiveTooltipIndex] = useState<number | null>(null);
   const [isExpanded, setIsExpanded] = useState(false);
+  const [tooltipCopied, setTooltipCopied] = useState(false);
   const [selectionStartId, setSelectionStartId] = useState<string | null>(null);
   const selectionStartIdRef = useRef<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
@@ -255,6 +256,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   const setTimelineTreeMode = useUIStore(state => state.setTimelineTreeMode);
 
   const notesPanelWidth = useUIStore(state => state.notesPanelWidth);
+  const timelineTooltipWidth = useUIStore(state => state.timelineTooltipWidth);
+  const setTimelineTooltipWidth = useUIStore(state => state.setTimelineTooltipWidth);
   const copyIncludeEditing = useUIStore(state => state.copyIncludeEditing);
   const copyIncludeReading = useUIStore(state => state.copyIncludeReading);
   const setHistoryScrollToUuid = useUIStore(state => state.setHistoryScrollToUuid);
@@ -382,9 +385,10 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     return rect.top + rect.height / 2;
   };
 
-  // Reset expansion when tooltip target changes
+  // Reset expansion and copy state when tooltip target changes
   useEffect(() => {
     setIsExpanded(false);
+    setTooltipCopied(false);
   }, [activeTooltipIndex]);
 
   // CMD key tracking — tooltip only appears when CMD is held
@@ -420,7 +424,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   useEffect(() => {
     if (isCmdHeld && hoveredIndex !== null) {
       setActiveTooltipIndex(hoveredIndex);
-    } else if (!isCmdHeld && !isExpanded && !isMouseInTooltipRef.current) {
+    } else if (!isCmdHeld && !isExpanded && !isMouseInTooltipRef.current && !isResizingTooltipRef.current) {
       setActiveTooltipIndex(null);
     }
   }, [isCmdHeld, hoveredIndex, isExpanded]);
@@ -846,6 +850,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   const tooltipRef = useRef<HTMLDivElement>(null);
   const tooltipContentRef = useRef<HTMLDivElement>(null);
   const isMouseInTooltipRef = useRef(false);
+  const isResizingTooltipRef = useRef(false);
   const isMouseInNoteTooltipRef = useRef(false);
   const tooltipMeasuredRef = useRef(0);
   const [tooltipMeasuredH, setTooltipMeasuredH] = useState(0);
@@ -923,7 +928,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
 
   // Simple hover close - CSS bridge handles the gap, no complex JS needed
   const handleMouseLeaveTooltipArea = () => {
-    if (!isExpanded) {
+    if (!isExpanded && !isResizingTooltipRef.current) {
       setHoveredIndex(null);
       setActiveTooltipIndex(null);
     }
@@ -2441,37 +2446,82 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                   padding: '10px 14px',
                   fontSize: '12px',
                   color: 'white',
-                  minWidth: '240px',
-                  maxWidth: '320px',
+                  width: `${timelineTooltipWidth}px`,
                   maxHeight: isExpanded ? '60vh' : '200px',
                   boxShadow: '-8px 8px 30px rgba(255,255,255,0.08), -2px 2px 8px rgba(255,255,255,0.05)',
                   display: 'flex',
                   flexDirection: 'column',
                   gap: '8px',
                   transition: 'max-height 0.2s ease-in-out',
-                  overflow: 'hidden'
+                  overflow: 'hidden',
+                  position: 'relative',
                 }}
               >
+                {/* Resize handle — left edge (inside bounds to avoid tooltip close) */}
+                <div
+                  style={{
+                    position: 'absolute',
+                    top: 0,
+                    bottom: 0,
+                    left: 0,
+                    width: 6,
+                    cursor: 'ew-resize',
+                    zIndex: 1,
+                  }}
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    isResizingTooltipRef.current = true;
+                    const startX = e.clientX;
+                    const startW = timelineTooltipWidth;
+                    const onMove = (ev: MouseEvent) => {
+                      const delta = startX - ev.clientX;
+                      setTimelineTooltipWidth(startW + delta);
+                    };
+                    const onUp = (ev: MouseEvent) => {
+                      document.removeEventListener('mousemove', onMove);
+                      document.removeEventListener('mouseup', onUp);
+                      isResizingTooltipRef.current = false;
+                      // Check if mouse ended up inside tooltip (with 5px left buffer)
+                      requestAnimationFrame(() => {
+                        if (tooltipRef.current) {
+                          const rect = tooltipRef.current.getBoundingClientRect();
+                          const inside = ev.clientX >= rect.left - 5 && ev.clientX <= rect.right &&
+                                         ev.clientY >= rect.top && ev.clientY <= rect.bottom;
+                          if (inside) {
+                            isMouseInTooltipRef.current = true;
+                          } else {
+                            isMouseInTooltipRef.current = false;
+                            handleMouseLeaveTooltipArea();
+                          }
+                        }
+                      });
+                    };
+                    document.addEventListener('mousemove', onMove);
+                    document.addEventListener('mouseup', onUp);
+                  }}
+                />
                 {currentActiveEntry.type === 'compact' ? (
                   <span className="text-amber-400 font-medium">History Compacted ({currentActiveEntry.preTokens ? `${Math.round(currentActiveEntry.preTokens/1000)}k` : '?'} tokens)</span>
                 ) : currentActiveEntry.type === 'continued' ? (
                   <>
-                    <span className="text-amber-400 font-medium">Context Overflow Recovery</span>
-                    <div
-                      className={`text-white/70 leading-snug font-mono text-[11px] ${isExpanded ? 'overflow-y-auto' : 'line-clamp-4'}`}
-                      style={{ whiteSpace: 'pre-wrap' }}
-                    >
-                      {isExpanded ? currentActiveEntry.content : truncateText(currentActiveEntry.content, 200)}
+                    <span className="text-amber-400 font-medium shrink-0">Context Overflow Recovery</span>
+                    <div className="text-white/70 leading-snug font-mono text-[11px] scrollbar-thin" style={{ maxHeight: isExpanded ? 'calc(60vh - 80px)' : '120px', overflowY: 'auto', overflowX: 'hidden', whiteSpace: 'pre-wrap' }}>
+                      {currentActiveEntry.content}
                     </div>
-                    {(currentActiveEntry.content.length > 200 || isExpanded) && (
-                      <button
-                        onClick={(e) => { e.stopPropagation(); setIsExpanded(!isExpanded); }}
-                        className="p-1.5 rounded hover:bg-white/10 text-white/40 hover:text-white transition-colors cursor-pointer shrink-0 self-end"
-                        title={isExpanded ? "Свернуть" : "Развернуть полностью"}
-                      >
-                        {isExpanded ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
-                      </button>
-                    )}
+                    <div className="flex items-center mt-1 pt-2 border-t border-white/5 shrink-0">
+                      <span className="text-[10px] text-white/30">{new Date(currentActiveEntry.timestamp).toLocaleTimeString()}</span>
+                      <div className="flex-1" />
+                      {(currentActiveEntry.content.length > 200 || isExpanded) && (
+                        <button
+                          onClick={(e) => { e.stopPropagation(); setIsExpanded(!isExpanded); }}
+                          className="p-1 rounded hover:bg-white/10 text-white/40 hover:text-white transition-colors cursor-pointer shrink-0"
+                          title={isExpanded ? "Свернуть" : "Развернуть полностью"}
+                        >
+                          {isExpanded ? <Minimize2 size={12} /> : <Maximize2 size={12} />}
+                        </button>
+                      )}
+                    </div>
                   </>
                 ) : currentActiveEntry.type === 'docs_edit' ? (
                   <>
@@ -2508,92 +2558,108 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                       }
                       return null;
                     })()}
-                    <div
-                      className={`text-white/70 leading-snug font-mono text-[11px] ${isExpanded ? 'overflow-y-auto' : 'line-clamp-4'}`}
-                      style={{ whiteSpace: 'pre-wrap' }}
-                    >
-                      {isExpanded ? currentActiveEntry.content : truncateText(currentActiveEntry.content, 200)}
+                    <div className="text-white/70 leading-snug font-mono text-[11px] scrollbar-thin" style={{ maxHeight: isExpanded ? 'calc(60vh - 80px)' : '120px', overflowY: 'auto', overflowX: 'hidden', whiteSpace: 'pre-wrap' }}>
+                      {currentActiveEntry.content}
                     </div>
-                    <div className="flex justify-between items-center mt-1 pt-2 border-t border-white/5">
+                    <div className="flex items-center mt-1 pt-2 border-t border-white/5 shrink-0">
                       <span className="text-[10px] text-white/30">{new Date(currentActiveEntry.timestamp).toLocaleTimeString()}</span>
+                      <div className="flex-1" />
                       <button
-                        onClick={(e) => { e.stopPropagation(); clipboard.writeText(currentActiveEntry.content); }}
-                        className="flex items-center gap-1.5 px-2 py-1 rounded bg-white/5 hover:bg-white/10 text-[10px] text-white/60 hover:text-white transition-colors cursor-pointer"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          clipboard.writeText(currentActiveEntry.content);
+                          setTooltipCopied(true);
+                          setTimeout(() => setTooltipCopied(false), 1200);
+                        }}
+                        className="flex items-center gap-1.5 px-2 py-1 rounded bg-white/5 hover:bg-white/10 text-[10px] transition-colors cursor-pointer"
+                        style={{ color: tooltipCopied ? '#4ade80' : 'rgba(255,255,255,0.6)' }}
                       >
-                        <Copy size={12} />
-                        Copy
+                        {tooltipCopied ? <Check size={12} /> : <Copy size={12} />}
+                        {tooltipCopied ? 'Скопировано' : 'Copy'}
                       </button>
+                      {(currentActiveEntry.content.length > 200 || isExpanded) && (
+                        <button
+                          onClick={(e) => { e.stopPropagation(); setIsExpanded(!isExpanded); }}
+                          className="p-1 rounded hover:bg-white/10 text-white/40 hover:text-white transition-colors cursor-pointer shrink-0 ml-1"
+                          title={isExpanded ? "Свернуть" : "Развернуть полностью"}
+                        >
+                          {isExpanded ? <Minimize2 size={12} /> : <Maximize2 size={12} />}
+                        </button>
+                      )}
                     </div>
                   </>
                 ) : currentActiveEntry.isPlan ? (
                   <>
-                    <span style={{ color: '#48968c' }} className="font-medium">Plan Mode (auto-submitted)</span>
-                    <div
-                      className={`text-white/70 leading-snug font-mono text-[11px] ${isExpanded ? 'overflow-y-auto' : 'line-clamp-4'}`}
-                      style={{ whiteSpace: 'pre-wrap' }}
-                    >
-                      {isExpanded ? currentActiveEntry.content : truncateText(currentActiveEntry.content, 200)}
+                    <span style={{ color: '#48968c' }} className="font-medium shrink-0">Plan Mode (auto-submitted)</span>
+                    <div className="text-white/70 leading-snug font-mono text-[11px] scrollbar-thin" style={{ maxHeight: isExpanded ? 'calc(60vh - 80px)' : '120px', overflowY: 'auto', overflowX: 'hidden', whiteSpace: 'pre-wrap' }}>
+                      {currentActiveEntry.content}
                     </div>
-                    <div className="flex justify-between items-center mt-1 pt-2 border-t border-white/5">
+                    <div className="flex items-center mt-1 pt-2 border-t border-white/5 shrink-0">
                       <span className="text-[10px] text-white/30">{new Date(currentActiveEntry.timestamp).toLocaleTimeString()}</span>
-                      <div className="flex items-center gap-1">
-                        {(currentActiveEntry.content.length > 200 || isExpanded) && (
-                          <button
-                            onClick={(e) => { e.stopPropagation(); setIsExpanded(!isExpanded); }}
-                            className="p-1.5 rounded hover:bg-white/10 text-white/40 hover:text-white transition-colors cursor-pointer shrink-0"
-                            title={isExpanded ? "Свернуть" : "Развернуть полностью"}
-                          >
-                            {isExpanded ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
-                          </button>
-                        )}
+                      <div className="flex-1" />
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          clipboard.writeText(currentActiveEntry.content);
+                          setTooltipCopied(true);
+                          setTimeout(() => setTooltipCopied(false), 1200);
+                        }}
+                        className="flex items-center gap-1.5 px-2 py-1 rounded bg-white/5 hover:bg-white/10 text-[10px] transition-colors cursor-pointer"
+                        style={{ color: tooltipCopied ? '#4ade80' : 'rgba(255,255,255,0.6)' }}
+                      >
+                        {tooltipCopied ? <Check size={12} /> : <Copy size={12} />}
+                        {tooltipCopied ? 'Скопировано' : 'Копировать'}
+                      </button>
+                      {(currentActiveEntry.content.length > 200 || isExpanded) && (
                         <button
-                          onClick={(e) => { e.stopPropagation(); clipboard.writeText(currentActiveEntry.content); }}
-                          className="flex items-center gap-1.5 px-2 py-1 rounded bg-white/5 hover:bg-white/10 text-[10px] text-white/60 hover:text-white transition-colors cursor-pointer"
+                          onClick={(e) => { e.stopPropagation(); setIsExpanded(!isExpanded); }}
+                          className="p-1 rounded hover:bg-white/10 text-white/40 hover:text-white transition-colors cursor-pointer shrink-0 ml-1"
+                          title={isExpanded ? "Свернуть" : "Развернуть полностью"}
                         >
-                          <Copy size={12} />
-                          Копировать
+                          {isExpanded ? <Minimize2 size={12} /> : <Maximize2 size={12} />}
                         </button>
-                      </div>
+                      )}
                     </div>
                   </>
                 ) : (
                   <>
                     {/* Inline note preview when note is on dot */}
                     {notes[currentActiveEntry.uuid] && (notePositions[currentActiveEntry.uuid] || 'before') === 'dot' && (
-                      <div className="flex items-start gap-1.5 pb-1.5 mb-1.5 border-b border-purple-500/15">
+                      <div className="flex items-start gap-1.5 pb-1.5 mb-1.5 border-b border-purple-500/15 shrink-0">
                         <StickyNote size={10} className="shrink-0 mt-0.5" style={{ color: '#9333ea' }} />
                         <div className="text-purple-300/80 leading-snug font-mono text-[10px] line-clamp-2" style={{ whiteSpace: 'pre-wrap' }}>
                           {notes[currentActiveEntry.uuid]}
                         </div>
                       </div>
                     )}
-                    <div className="flex justify-between items-start gap-4">
-                      <div
-                        className={`text-white/90 leading-snug flex-1 font-mono ${isExpanded ? 'overflow-y-auto' : 'line-clamp-6'}`}
-                        style={{ whiteSpace: 'pre-wrap' }}
+                    <div className="text-white/90 leading-snug font-mono scrollbar-thin" style={{ maxHeight: isExpanded ? 'calc(60vh - 80px)' : '120px', overflowY: 'auto', overflowX: 'hidden', whiteSpace: 'pre-wrap' }}>
+                      {currentActiveEntry.content}
+                    </div>
+                    <div className="flex items-center mt-1 pt-2 border-t border-white/5 shrink-0">
+                      <span className="text-[10px] text-white/30">{new Date(currentActiveEntry.timestamp).toLocaleTimeString()}</span>
+                      <div className="flex-1" />
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          clipboard.writeText(currentActiveEntry.content);
+                          setTooltipCopied(true);
+                          setTimeout(() => setTooltipCopied(false), 1200);
+                        }}
+                        className="flex items-center gap-1.5 px-2 py-1 rounded bg-white/5 hover:bg-white/10 text-[10px] transition-colors cursor-pointer"
+                        style={{ color: tooltipCopied ? '#4ade80' : 'rgba(255,255,255,0.6)' }}
                       >
-                        {isExpanded ? currentActiveEntry.content : truncateText(currentActiveEntry.content, 200)}
-                      </div>
-                      {/* Show expand button only if content is truncated */}
+                        {tooltipCopied ? <Check size={12} /> : <Copy size={12} />}
+                        {tooltipCopied ? 'Скопировано' : 'Копировать'}
+                      </button>
                       {(currentActiveEntry.content.length > 200 || isExpanded) && (
                         <button
                           onClick={(e) => { e.stopPropagation(); setIsExpanded(!isExpanded); }}
-                          className="p-1.5 rounded hover:bg-white/10 text-white/40 hover:text-white transition-colors cursor-pointer shrink-0"
+                          className="p-1 rounded hover:bg-white/10 text-white/40 hover:text-white transition-colors cursor-pointer shrink-0 ml-1"
                           title={isExpanded ? "Свернуть" : "Развернуть полностью"}
                         >
-                          {isExpanded ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
+                          {isExpanded ? <Minimize2 size={12} /> : <Maximize2 size={12} />}
                         </button>
                       )}
-                    </div>
-                    <div className="flex justify-between items-center mt-1 pt-2 border-t border-white/5">
-                      <span className="text-[10px] text-white/30">{new Date(currentActiveEntry.timestamp).toLocaleTimeString()}</span>
-                      <button
-                        onClick={(e) => { e.stopPropagation(); clipboard.writeText(currentActiveEntry.content); }}
-                        className="flex items-center gap-1.5 px-2 py-1 rounded bg-white/5 hover:bg-white/10 text-[10px] text-white/60 hover:text-white transition-colors cursor-pointer"
-                      >
-                        <Copy size={12} />
-                        Копировать
-                      </button>
                     </div>
                   </>
                 )}

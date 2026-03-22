@@ -189,6 +189,9 @@ interface UIStore {
   editRangePanelSize: { width: number; height: number };
   setEditRangePanelSize: (size: { width: number; height: number }) => void;
 
+  timelineTooltipWidth: number;
+  setTimelineTooltipWidth: (width: number) => void;
+
   // Drag Area Width (title bar window drag handle)
   dragAreaWidth: number;
   setDragAreaWidth: (width: number) => void;
@@ -800,6 +803,10 @@ export const useUIStore = create<UIStore>((set, get) => ({
   // Edit Range Panel Size (clamping done in component based on viewport)
   editRangePanelSize: { width: 380, height: 420 },
   setEditRangePanelSize: (size) => set({ editRangePanelSize: size }),
+
+  // Timeline tooltip width
+  timelineTooltipWidth: 300,
+  setTimelineTooltipWidth: (width) => set({ timelineTooltipWidth: Math.max(200, Math.min(600, width)) }),
 
   // Drag Area Width
   dragAreaWidth: initialDragAreaWidth,
