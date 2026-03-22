@@ -16,7 +16,7 @@ const TooltipPortal: React.FC<{ children: React.ReactNode }> = ({ children }) =>
 
 interface TimelineEntry {
   uuid: string;
-  type: 'user' | 'compact' | 'continued';
+  type: 'user' | 'compact' | 'continued' | 'docs_edit';
   timestamp: string;
   content: string;
   isCompactSummary?: boolean;
@@ -28,6 +28,7 @@ interface TimelineEntry {
   isSubAgentTimeout?: boolean;
   subAgentName?: string;
   subAgentTaskId?: string;
+  docsEdited?: string[];
 }
 
 interface GroupInfo {
@@ -287,9 +288,11 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
 
   // Timeline notes state
   const [notes, setNotes] = useState<Record<string, string>>({});
+  const [notePositions, setNotePositions] = useState<Record<string, 'dot' | 'before' | 'after'>>({});
   const [activeNoteIndex, setActiveNoteIndex] = useState<number | null>(null);
   const [isNoteEditing, setIsNoteEditing] = useState(false);
   const [noteEditText, setNoteEditText] = useState('');
+  const [noteEditPosition, setNoteEditPosition] = useState<'dot' | 'before' | 'after'>('before');
   const noteTextareaRef = useRef<HTMLTextAreaElement>(null);
   const noteTooltipRef = useRef<HTMLDivElement>(null);
   const [hoveredNoteIndex, setHoveredNoteIndex] = useState<number | null>(null);
@@ -498,6 +501,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       const notesResult = await ipcRenderer.invoke('timeline:get-notes', { sessionId });
       if (notesResult.success) {
         setNotes(notesResult.notes || {});
+        setNotePositions(notesResult.positions || {});
       }
     } catch (error) {
       console.error('[Timeline] Error loading timeline:', error);
@@ -570,10 +574,10 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     const boundaryCount = terminalRegistry.getPromptBoundaryCount(tabId);
     if (boundaryCount === 0) return;
 
-    // User-type entries only (skip compact, continued)
+    // User-type entries only (skip compact, continued, docs_edit)
     let promptSeq = 0;
     for (const entry of entries) {
-      if (entry.type === 'compact' || entry.type === 'continued') continue;
+      if (entry.type === 'compact' || entry.type === 'continued' || entry.type === 'docs_edit') continue;
       // Try to bind this entry to the next available prompt boundary
       // Boundary 0 = prompt after first response → where second message was typed
       // For entry 0 (first message), there's no boundary (it was typed at the initial prompt)
@@ -643,7 +647,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         const searchData: { searchLines: string[]; entryIndex: number }[] = [];
         entries.forEach((entry, index) => {
           if (index <= lastBoundaryIdx) return;
-          if (entry.type === 'compact' || entry.type === 'continued') return;
+          if (entry.type === 'compact' || entry.type === 'continued' || entry.type === 'docs_edit') return;
           const lines = getSearchLines(entry.content);
           if (lines.length > 0) {
             searchData.push({ searchLines: lines, entryIndex: index });
@@ -672,11 +676,11 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         // We map from the END so that the newest entries match the newest boundaries.
         const boundaryLines = terminalRegistry.getPromptBoundaryLines(tabId);
 
-        // Collect indices of "real" entries (non-compact, non-continued) after lastBoundaryIdx
+        // Collect indices of "real" entries (non-compact, non-continued, non-docs_edit) after lastBoundaryIdx
         const realIndices: number[] = [];
         entries.forEach((entry, index) => {
           if (index <= lastBoundaryIdx) return;
-          if (entry.type === 'compact' || entry.type === 'continued') return;
+          if (entry.type === 'compact' || entry.type === 'continued' || entry.type === 'docs_edit') return;
           realIndices.push(index);
         });
 
@@ -772,7 +776,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       const newUnreachable = new Set<number>();
 
       entries.forEach((entry, index) => {
-        if (entry.type === 'compact' || entry.type === 'continued' || entry.isPlan) return;
+        if (entry.type === 'compact' || entry.type === 'continued' || entry.type === 'docs_edit' || entry.isPlan) return;
         if (index <= lastBoundaryIdx) {
           newUnreachable.add(index);
           return;
@@ -782,16 +786,16 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         }
       });
 
-      // Inherit unreachable for compact/continued/plan entries from next regular entry
+      // Inherit unreachable for compact/continued/plan/docs_edit entries from next regular entry
       entries.forEach((entry, index) => {
-        if (entry.type !== 'compact' && entry.type !== 'continued' && !entry.isPlan) return;
+        if (entry.type !== 'compact' && entry.type !== 'continued' && entry.type !== 'docs_edit' && !entry.isPlan) return;
         if (index <= lastBoundaryIdx) {
           newUnreachable.add(index);
           return;
         }
         for (let j = index + 1; j < entries.length; j++) {
           const next = entries[j];
-          if (next.type === 'compact' || next.type === 'continued' || next.isPlan) continue;
+          if (next.type === 'compact' || next.type === 'continued' || next.type === 'docs_edit' || next.isPlan) continue;
           if (newUnreachable.has(j)) newUnreachable.add(index);
           break;
         }
@@ -990,8 +994,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     // Old history entries are not in terminal buffer — ignore click
     if (clickIsOldHistory) return;
 
-    // Compact/continued entries have no terminal position — skip terminal scroll
-    if (entry.type === 'compact' || entry.type === 'continued') return;
+    // Compact/continued/docs_edit entries have no terminal position — skip terminal scroll
+    if (entry.type === 'compact' || entry.type === 'continued' || entry.type === 'docs_edit') return;
 
     // History panel NOT open — scroll in terminal only
     // Instant visual feedback — loader appears immediately
@@ -1477,6 +1481,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   const handleAddNote = (entry: TimelineEntry) => {
     setContextMenu(null);
     setNoteEditText(notes[entry.uuid] || '');
+    setNoteEditPosition(notePositions[entry.uuid] || 'before');
     setIsNoteEditing(true);
     const idx = entries.findIndex(e => e.uuid === entry.uuid);
     setActiveNoteIndex(idx);
@@ -1487,6 +1492,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
 
   const handleEditNote = (entry: TimelineEntry) => {
     setNoteEditText(notes[entry.uuid] || '');
+    setNoteEditPosition(notePositions[entry.uuid] || 'before');
     setIsNoteEditing(true);
     setTimeout(() => noteTextareaRef.current?.focus(), 50);
   };
@@ -1503,8 +1509,10 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       sessionId,
       tabId,
       content: text,
+      position: noteEditPosition,
     });
     setNotes(prev => ({ ...prev, [entry.uuid]: text }));
+    setNotePositions(prev => ({ ...prev, [entry.uuid]: noteEditPosition }));
     setIsNoteEditing(false);
   };
 
@@ -1607,7 +1615,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   const activeNoteEntry = activeNoteIndex !== null ? entries[activeNoteIndex] : null;
   const noteTooltipPos = activeNoteIndex !== null ? (() => {
     const eCenterY = getElementCenterY(activeNoteIndex);
-    const h = isNoteEditing ? 200 : 120;
+    const h = isNoteEditing ? 230 : 120;
     let clampedTop = Math.max(40, Math.min(eCenterY - h / 2, window.innerHeight - h - 10));
     const wTop = Math.min(clampedTop, eCenterY - 20);
     const wBottom = Math.min(Math.max(clampedTop + h, eCenterY + 20), window.innerHeight);
@@ -1749,6 +1757,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
             const isUnreachable = unreachableIndices.has(index);
             const isContinued = entry.type === 'continued';
             const isPlan = !!entry.isPlan;
+            const isDocsEdit = entry.type === 'docs_edit';
             const dotClickState = clickedState?.index === index ? clickedState.status : null;
 
             // Entry type flags
@@ -1772,6 +1781,9 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
             } else if (isContinued) {
               dotColor = isHovered ? '#f59e0b' : '#a67c1a';
               dotGlow = isHovered ? '0 0 10px rgba(245, 158, 11, 0.5)' : 'none';
+            } else if (isDocsEdit) {
+              dotColor = isHovered ? '#4ade80' : (isPromptVisible ? '#3cc46e' : '#2a8a4e');
+              dotGlow = isHovered ? '0 0 10px rgba(74, 222, 128, 0.5)' : (isPromptVisible ? '0 0 6px rgba(74, 222, 128, 0.2)' : 'none');
             } else if (isPlan) {
               dotColor = isHovered ? '#5eada3' : '#3d7a72';
               dotGlow = isHovered ? '0 0 10px rgba(94, 173, 163, 0.5)' : 'none';
@@ -1809,6 +1821,16 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
             if (isGroupMeta) {
               dotColor = isHovered ? '#818cf8' : '#7c86f0';
               dotGlow = isHovered ? '0 0 10px rgba(129, 140, 248, 0.5)' : '0 0 6px rgba(129, 140, 248, 0.2)';
+            }
+
+            // Note position — use editing position when actively editing this entry
+            const isEditingThis = activeNoteIndex === index && isNoteEditing;
+            const hasNote = !!notes[entry.uuid] || isEditingThis;
+            const notePos = isEditingThis ? noteEditPosition : (notePositions[entry.uuid] || 'before');
+            // Note on dot: override color to purple
+            if (hasNote && notePos === 'dot') {
+              dotColor = isHovered ? '#c084fc' : '#9333ea';
+              dotGlow = isHovered ? '0 0 10px rgba(168, 85, 247, 0.5)' : '0 0 6px rgba(168, 85, 247, 0.25)';
             }
 
             return (
@@ -1858,8 +1880,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                     }} />
                   </div>
                 )}
-                {/* Note indicator strip — shown above the dot */}
-                {(notes[entry.uuid] || (activeNoteIndex === index && isNoteEditing)) && (() => {
+                {/* Note indicator strip — before dot */}
+                {hasNote && notePos === 'before' && (() => {
                   const noteHovered = hoveredNoteIndex === index || activeNoteIndex === index;
                   return (
                     <div
@@ -1913,7 +1935,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                     backgroundColor: active
                       ? 'rgba(59, 130, 246, 0.15)'
                       : (isOldHistory && !isGroupMeta && !isCompacted ? 'rgba(239, 68, 68, 0.06)' : 'transparent'),
-                    cursor: (isContinued || isOldHistory) ? 'default' : 'pointer',
+                    cursor: (isContinued || isDocsEdit || isOldHistory) ? 'default' : 'pointer',
                   }}
                 >
                   {/* Tree mode: vertical connector lines */}
@@ -1933,7 +1955,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                       height: dotHeight,
                       borderRadius: dotRadius,
                       backgroundColor: isUnreachable && !isHovered && !isCompacted ? 'transparent' : dotColor,
-                      border: isUnreachable && !isHovered && !isCompacted ? '1px solid #666' : 'none',
+                      border: isUnreachable && !isHovered && !isCompacted ? `1px solid ${hasNote && notePos === 'dot' ? '#9333ea' : '#666'}` : 'none',
                       boxShadow: dotGlow,
                       boxSizing: 'border-box',
                       transition: 'width 0.15s, height 0.15s, border-radius 0.15s, background-color 0.2s, box-shadow 0.2s',
@@ -1970,7 +1992,9 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                           ? 'rgba(239, 68, 68, 0.5)'
                           : entryIsSubAgent
                             ? 'rgba(129, 140, 248, 0.5)'
-                            : 'rgba(255, 255, 255, 0.4)',
+                            : isDocsEdit
+                              ? 'rgba(74, 222, 128, 0.5)'
+                              : 'rgba(255, 255, 255, 0.4)',
                       }}
                     >
                       {isGroupCollapsed
@@ -1979,9 +2003,11 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                           ? 'timeout'
                           : entryIsSubAgent
                             ? (entry.subAgentName || 'Claude')
-                            : isCompacted
-                              ? 'compact'
-                              : truncateText(entry.content, 60)
+                            : isDocsEdit
+                              ? truncateText(entry.content, 60)
+                              : isCompacted
+                                ? 'compact'
+                                : truncateText(entry.content, 60)
                       }
                     </span>
                   )}
@@ -2012,6 +2038,29 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                     </div>
                   )}
                 </div>
+                {/* Note indicator strip — after dot */}
+                {hasNote && notePos === 'after' && (() => {
+                  const noteHovered = hoveredNoteIndex === index || activeNoteIndex === index;
+                  return (
+                    <div
+                      className="flex-shrink-0 w-full flex items-center justify-center"
+                      style={{ height: '6px', cursor: 'pointer' }}
+                      onMouseEnter={() => handleNoteStripEnter(index)}
+                      onMouseLeave={handleNoteStripLeave}
+                    >
+                      <div
+                        style={{
+                          width: noteHovered ? '18px' : '14px',
+                          height: noteHovered ? '3px' : '2px',
+                          borderRadius: '1px',
+                          backgroundColor: noteHovered ? '#c084fc' : '#9333ea',
+                          boxShadow: noteHovered ? '0 0 8px rgba(168, 85, 247, 0.5)' : 'none',
+                          transition: 'background-color 0.2s, box-shadow 0.2s',
+                        }}
+                      />
+                    </div>
+                  );
+                })()}
                 {/* Last boundary separator — full-width unified line between old history and current dialog */}
                 {index === lastBoundaryIndex && (
                   <div
@@ -2424,6 +2473,22 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                       </button>
                     )}
                   </>
+                ) : currentActiveEntry.type === 'docs_edit' ? (
+                  <>
+                    <div className="flex items-center gap-2">
+                      <div style={{ width: '6px', height: '6px', borderRadius: '50%', backgroundColor: '#4ade80', flexShrink: 0 }} />
+                      <span style={{ color: '#4ade80' }} className="font-medium text-[11px]">Docs Updated</span>
+                    </div>
+                    <div className="text-white/70 leading-snug font-mono text-[11px]" style={{ whiteSpace: 'pre-wrap' }}>
+                      {(currentActiveEntry.docsEdited || [currentActiveEntry.content]).map((f: string, i: number) => (
+                        <div key={i} className="flex items-center gap-1.5 py-0.5">
+                          <Pencil size={10} className="shrink-0" style={{ color: 'rgba(74, 222, 128, 0.5)' }} />
+                          <span>{f}</span>
+                        </div>
+                      ))}
+                    </div>
+                    <span className="text-[10px] text-white/30">{new Date(currentActiveEntry.timestamp).toLocaleTimeString()}</span>
+                  </>
                 ) : (currentActiveEntry.isSubAgent || currentActiveEntry.isSubAgentTimeout) ? (
                   <>
                     <div className="flex items-center gap-2">
@@ -2493,6 +2558,15 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                   </>
                 ) : (
                   <>
+                    {/* Inline note preview when note is on dot */}
+                    {notes[currentActiveEntry.uuid] && (notePositions[currentActiveEntry.uuid] || 'before') === 'dot' && (
+                      <div className="flex items-start gap-1.5 pb-1.5 mb-1.5 border-b border-purple-500/15">
+                        <StickyNote size={10} className="shrink-0 mt-0.5" style={{ color: '#9333ea' }} />
+                        <div className="text-purple-300/80 leading-snug font-mono text-[10px] line-clamp-2" style={{ whiteSpace: 'pre-wrap' }}>
+                          {notes[currentActiveEntry.uuid]}
+                        </div>
+                      </div>
+                    )}
                     <div className="flex justify-between items-start gap-4">
                       <div
                         className={`text-white/90 leading-snug flex-1 font-mono ${isExpanded ? 'overflow-y-auto' : 'line-clamp-6'}`}
@@ -2707,7 +2781,44 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
               >
                 {isNoteEditing ? (
                   <>
-                    <span className="text-purple-400 font-medium text-[11px]">Заметка</span>
+                    <div className="flex items-center justify-between">
+                      <span className="text-purple-400 font-medium text-[11px]">Заметка</span>
+                      {/* Position selector */}
+                      <div className="flex items-center gap-0.5 bg-white/5 rounded p-0.5">
+                        {([
+                          { value: 'before' as const, title: 'До точки', icon: (
+                            <svg width="14" height="14" viewBox="0 0 14 14">
+                              <rect x="4" y="2" width="6" height="2" rx="0.5" fill="currentColor" />
+                              <circle cx="7" cy="9" r="2.5" fill="currentColor" opacity="0.4" />
+                            </svg>
+                          )},
+                          { value: 'dot' as const, title: 'На точке', icon: (
+                            <svg width="14" height="14" viewBox="0 0 14 14">
+                              <circle cx="7" cy="7" r="3" fill="currentColor" />
+                            </svg>
+                          )},
+                          { value: 'after' as const, title: 'После точки', icon: (
+                            <svg width="14" height="14" viewBox="0 0 14 14">
+                              <circle cx="7" cy="5" r="2.5" fill="currentColor" opacity="0.4" />
+                              <rect x="4" y="10" width="6" height="2" rx="0.5" fill="currentColor" />
+                            </svg>
+                          )},
+                        ]).map(opt => (
+                          <button
+                            key={opt.value}
+                            onClick={(e) => { e.stopPropagation(); setNoteEditPosition(opt.value); }}
+                            title={opt.title}
+                            className="p-1 rounded transition-colors cursor-pointer"
+                            style={{
+                              color: noteEditPosition === opt.value ? '#c084fc' : 'rgba(255,255,255,0.3)',
+                              backgroundColor: noteEditPosition === opt.value ? 'rgba(168, 85, 247, 0.15)' : 'transparent',
+                            }}
+                          >
+                            {opt.icon}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
                     <textarea
                       ref={noteTextareaRef}
                       value={noteEditText}
@@ -2769,6 +2880,12 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                   </>
                 ) : (
                   <>
+                    {/* When note is on dot — show original entry content too */}
+                    {(notePositions[activeNoteEntry.uuid] || 'before') === 'dot' && (
+                      <div className="text-white/50 leading-snug font-mono text-[11px] line-clamp-2 pb-1 mb-1 border-b border-white/5" style={{ whiteSpace: 'pre-wrap' }}>
+                        {truncateText(activeNoteEntry.content, 120)}
+                      </div>
+                    )}
                     <div className="flex justify-between items-start gap-2">
                       <div className="text-white/80 leading-snug font-mono text-[11px] flex-1" style={{ whiteSpace: 'pre-wrap' }}>
                         {notes[activeNoteEntry.uuid]}
