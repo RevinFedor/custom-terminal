@@ -290,6 +290,9 @@ class DatabaseManager {
     // Migration: add message_count to tab_history
     try { this.db.exec(`ALTER TABLE tab_history ADD COLUMN message_count INTEGER DEFAULT NULL`); } catch (e) {}
 
+    // Migration: add position to timeline_notes
+    try { this.db.exec(`ALTER TABLE timeline_notes ADD COLUMN position TEXT DEFAULT 'before'`); } catch (e) {}
+
     // AI Prompts table (dynamic AI prompts for Research/Compact/Description/Custom)
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS ai_prompts (
@@ -1077,15 +1080,15 @@ class DatabaseManager {
   // ========== TIMELINE NOTES ==========
 
   getTimelineNotes(sessionId) {
-    return this.db.prepare('SELECT entry_uuid, content FROM timeline_notes WHERE session_id = ?').all(sessionId);
+    return this.db.prepare('SELECT entry_uuid, content, position FROM timeline_notes WHERE session_id = ?').all(sessionId);
   }
 
-  saveTimelineNote(entryUuid, sessionId, tabId, content) {
+  saveTimelineNote(entryUuid, sessionId, tabId, content, position) {
     this.db.prepare(`
-      INSERT INTO timeline_notes (entry_uuid, session_id, tab_id, content, updated_at)
-      VALUES (?, ?, ?, ?, strftime('%s', 'now'))
-      ON CONFLICT(entry_uuid, session_id) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at
-    `).run(entryUuid, sessionId, tabId, content);
+      INSERT INTO timeline_notes (entry_uuid, session_id, tab_id, content, position, updated_at)
+      VALUES (?, ?, ?, ?, ?, strftime('%s', 'now'))
+      ON CONFLICT(entry_uuid, session_id) DO UPDATE SET content = excluded.content, position = excluded.position, updated_at = excluded.updated_at
+    `).run(entryUuid, sessionId, tabId, content, position || 'before');
   }
 
   deleteTimelineNote(entryUuid, sessionId) {

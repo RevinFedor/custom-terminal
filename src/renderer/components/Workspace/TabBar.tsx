@@ -782,6 +782,7 @@ function TabBar({ projectId }: TabBarProps) {
   const [editValue, setEditValue] = useState('');
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; tabId: string } | null>(null);
   const [contextScripts, setContextScripts] = useState<string[]>([]);
+  const [contextFavoriteId, setContextFavoriteId] = useState<number | null>(null);
   const [utilityExpanded, setUtilityExpanded] = useState(false);
   const [utilityOpenedManually, setUtilityOpenedManually] = useState(false); // Track if opened by click vs hover
   const utilityHoverTimeoutRef = useRef<NodeJS.Timeout | null>(null);
@@ -1171,6 +1172,19 @@ function TabBar({ projectId }: TabBarProps) {
       } catch {
         setContextScripts([]);
       }
+    })();
+
+    // Check if tab is already in favorites
+    setContextFavoriteId(null);
+    (async () => {
+      try {
+        const favorites = await ipcRenderer.invoke('project:get-favorites', { projectId });
+        const tab = workspace.tabs.get(tabId);
+        if (tab && favorites) {
+          const match = favorites.find((f: any) => f.name === tab.name && f.cwd === tab.cwd && f.tab_type === (tab.tabType || 'terminal'));
+          setContextFavoriteId(match ? match.id : null);
+        }
+      } catch { /* ignore */ }
     })();
   };
 
@@ -1867,36 +1881,44 @@ function TabBar({ projectId }: TabBarProps) {
             {isMultiSelect ? `Copy ${selectedTabIds.length} Sessions` : 'Copy ID/Path'}
           </button>
 
-          {/* Add to Favorites */}
+          {/* Add / Remove Favorites */}
           {!isMultiSelect && (
             <button
               className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2"
-              onClick={(e) => {
+              onClick={async (e) => {
                 e.stopPropagation();
                 if (contextMenu) {
-                  const tab = workspace.tabs.get(contextMenu.tabId);
-                  if (tab) {
-                    ipcRenderer.invoke('project:add-favorite', {
-                      projectId,
-                      tab: {
-                        name: tab.name,
-                        cwd: tab.cwd,
-                        color: tab.color || null,
-                        notes: tab.notes || null,
-                        commandType: tab.commandType || null,
-                        tabType: tab.tabType || 'terminal',
-                        url: tab.url || null,
-                        claudeSessionId: tab.claudeSessionId || null,
-                        geminiSessionId: tab.geminiSessionId || null,
-                      }
-                    });
-                    showToast(`"${tab.name}" added to favorites`, 'success');
+                  if (contextFavoriteId) {
+                    // Remove from favorites
+                    await ipcRenderer.invoke('project:delete-favorite', { id: contextFavoriteId });
+                    const tab = workspace.tabs.get(contextMenu.tabId);
+                    showToast(`"${tab?.name || 'Tab'}" removed from favorites`, 'success');
+                  } else {
+                    // Add to favorites
+                    const tab = workspace.tabs.get(contextMenu.tabId);
+                    if (tab) {
+                      await ipcRenderer.invoke('project:add-favorite', {
+                        projectId,
+                        tab: {
+                          name: tab.name,
+                          cwd: tab.cwd,
+                          color: tab.color || null,
+                          notes: tab.notes || null,
+                          commandType: tab.commandType || null,
+                          tabType: tab.tabType || 'terminal',
+                          url: tab.url || null,
+                          claudeSessionId: tab.claudeSessionId || null,
+                          geminiSessionId: tab.geminiSessionId || null,
+                        }
+                      });
+                      showToast(`"${tab.name}" added to favorites`, 'success');
+                    }
                   }
                 }
                 setContextMenu(null);
               }}
             >
-              Add to Favorites
+              {contextFavoriteId ? 'Remove from Favorites' : 'Add to Favorites'}
             </button>
           )}
         </div>

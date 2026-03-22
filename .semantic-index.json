@@ -937,6 +937,50 @@
     "hash": "794b1b2ff2f9b6d33e6036106c7bf4b5a51e131d5e60268c7cfc9964c6aec1e0"
   },
   {
+    "path": "docs/knowledge/fact-semantic-search.md",
+    "type": "fact",
+    "explicit": [
+      "semantic search",
+      "embedding models",
+      "Gemini API integration",
+      "SQLite indexing",
+      "JSONL session parsing",
+      "chunking strategy",
+      "FTS5 fallback",
+      "cosine similarity ranking",
+      "rate limiting",
+      "Matryoshka embeddings"
+    ],
+    "implicit": [
+      "jsonl_claude_session_parser",
+      "qa_chunk_pairing_sublength_split",
+      "gemini_embedding_batch_contents",
+      "embedding_001_dimensionality_768",
+      "sqlite_session_chunks_blob",
+      "fts5_bm25_keyword_fallback",
+      "tab_history_session_join",
+      "gemini_free_tier_rate_limit",
+      "hash_null_embedding_guard",
+      "fork_parent_chunk_duplication",
+      "projecthome_h_full_scroll_css",
+      "cosine_similarity_topn_search"
+    ],
+    "symptoms": [
+      "Search query returns 0 results but database shows chunks exist in session_chunks table",
+      "Identical snippets appear multiple times in search results from different forked sessions",
+      "Indexing operation hangs or times out when processing 50+ sessions",
+      "Search results section in ProjectHome cannot be scrolled (content is cut off at bottom)",
+      "Re-indexing after embedding model change still returns stale vectors"
+    ],
+    "related_components": [
+      "src/components/ProjectHome.tsx",
+      "src/db/schema.ts",
+      "main.js (JSONL indexing handlers)",
+      "src/api/gemini.ts"
+    ],
+    "hash": "1c2acbf9900e7048d9cd37c4ee9f4d097bcf268d7bebf3e2d2e54aca84907309"
+  },
+  {
     "path": "docs/knowledge/fact-ai-audit.md",
     "type": "fact",
     "explicit": [
@@ -987,52 +1031,49 @@
     "path": "docs/knowledge/fact-project-home.md",
     "type": "fact",
     "explicit": [
-      "Project Home View",
-      "Active Tabs",
-      "Favorites",
-      "History/Closed Tabs",
-      "Context Menu",
-      "Directory Management",
-      "Tab Restoration",
-      "SQLite Archive",
-      "Real-time Sync"
+      "Project Home View central management screen",
+      "Active Tabs section with current terminals",
+      "Favorites bookmarked tab configurations",
+      "History closed tabs grouped by time periods",
+      "Context menus and right-click actions",
+      "Directory management and project path editing",
+      "Session restoration with immediate injection pattern",
+      "SQLite persistence for tabs history and favorites",
+      "Semantic session search with embeddings",
+      "Real-time project name synchronization"
     ],
     "implicit": [
-      "home_card_restore_immediate_injection",
-      "sessionid_restoration_from_history",
-      "history_group_time_calculation",
-      "context_menu_card_type_routing",
-      "tab_color_visual_inheritance",
-      "directory_picker_project_root",
-      "tab_archive_ipc_sqlite",
-      "project_home_overlay_zindex_tabbar",
-      "auto_redirect_empty_tab_state",
-      "history_refetch_trigger_tabs_length",
-      "info_panel_immediate_sessionid_visibility",
-      "real_time_project_name_sync",
-      "favorites_nondestructive_tab_creation",
-      "hover_popover_history_details",
-      "zustand_project_name_sync_mutation",
-      "ipc_listener_tab_archive_routing"
+      "home_button_toggle",
+      "project_home_overlay_z50",
+      "favorites_persist_sqlite",
+      "history_archive_tab_ipc",
+      "history_group_collapse",
+      "history_restore_session_injection",
+      "project_path_directory_edit",
+      "session_search_semantic",
+      "real_time_sync_project_name",
+      "auto_redirect_no_tabs",
+      "card_color_visual_cwd",
+      "history_refetch_tabs_length",
+      "scroll_container_layout_depth",
+      "zustand_tabs_reactivity",
+      "session_chain_resolution_restore"
     ],
     "symptoms": [
-      "Restoring a closed AI session loses claudeSessionId or geminiSessionId, showing empty Info Panel",
-      "Closing a tab does not refresh the Project Home history list automatically",
-      "Clicking a Favorite card fails to create a tab or tab appears frozen",
-      "History entry displays correct working directory but clicking it does not navigate there",
-      "Project Home overlay is clipped or hidden behind the TabBar when viewed",
-      "Project name edited in tab header but Project Home title remains outdated",
-      "Restoring a session causes Info Panel to display empty, wrong, or stale sessionId"
+      "Home overlay doesn't appear when Home button is clicked",
+      "Closed tabs not visible in History section or History list shows empty",
+      "Restored AI session shows empty InfoPanel without loading messages",
+      "Project directory change doesn't update CWD for new terminals",
+      "Adding many history entries breaks scroll layout or clips card content"
     ],
     "related_components": [
-      "src/components/ProjectHome.tsx",
-      "src/components/ProjectToolbar.tsx",
-      "src/hooks/useTabManagement.ts",
-      "src/stores/projectStore.ts",
-      "src/stores/tabStore.ts",
-      "main.js (IPC handlers: project:archive-tab, project:name-sync)"
+      "src/renderer/components/ProjectHome.tsx",
+      "src/renderer/components/ProjectToolbar.tsx",
+      "src/main/main.js",
+      "docs/knowledge/fact-react-patterns.md",
+      "docs/knowledge/fact-semantic-search.md"
     ],
-    "hash": "480f86797b72d94811dd17e676d26aa72059c979ea96f6007658130573ec30c5"
+    "hash": "ecd20bb593f0e7ec03e181c2aaf94669664bba4af5ed8deab3582d3c5d58a91e"
   },
   {
     "path": "docs/knowledge/fact-file-preview-markdown.md",

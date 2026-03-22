@@ -1196,6 +1196,37 @@ function register({ projectManager, formatToolAction }) {
             preTokens: entry.compactMetadata?.preTokens,
             sessionId: entry.sessionId || entry._fromFile
           });
+        } else if (entry.type === 'assistant') {
+          // Detect docs/CLAUDE.md edits from tool_use blocks
+          const contentBlocks = entry.message?.content;
+          if (Array.isArray(contentBlocks)) {
+            const docFiles = [];
+            for (const block of contentBlocks) {
+              if (block.type === 'tool_use' && (block.name === 'Edit' || block.name === 'Write')) {
+                const fp = block.input?.file_path || '';
+                if (fp.includes('/docs/') || fp.endsWith('/CLAUDE.md') || fp === 'CLAUDE.md') {
+                  // Extract short name: last 2 path segments
+                  const segments = fp.split('/');
+                  const shortName = segments.length >= 2
+                    ? segments.slice(-2).join('/')
+                    : segments[segments.length - 1];
+                  if (!docFiles.includes(shortName)) {
+                    docFiles.push(shortName);
+                  }
+                }
+              }
+            }
+            if (docFiles.length > 0) {
+              entries.push({
+                uuid: entry.uuid,
+                type: 'docs_edit',
+                timestamp: entry.timestamp,
+                content: docFiles.join(', '),
+                docsEdited: docFiles,
+                sessionId: entry.sessionId || entry._fromFile
+              });
+            }
+          }
         }
       }
 
@@ -2014,20 +2045,22 @@ function register({ projectManager, formatToolAction }) {
       const db = projectManager.db;
       const rows = db.getTimelineNotes(sessionId);
       const notesMap = {};
+      const positionsMap = {};
       for (const row of rows) {
         notesMap[row.entry_uuid] = row.content;
+        positionsMap[row.entry_uuid] = row.position || 'before';
       }
-      return { success: true, notes: notesMap };
+      return { success: true, notes: notesMap, positions: positionsMap };
     } catch (error) {
       console.error('[TimelineNotes] get-notes error:', error);
       return { success: false, error: error.message };
     }
   });
 
-  ipcMain.handle('timeline:save-note', async (event, { entryUuid, sessionId, tabId, content }) => {
+  ipcMain.handle('timeline:save-note', async (event, { entryUuid, sessionId, tabId, content, position }) => {
     try {
       const db = projectManager.db;
-      db.saveTimelineNote(entryUuid, sessionId, tabId, content);
+      db.saveTimelineNote(entryUuid, sessionId, tabId, content, position || 'before');
       return { success: true };
     } catch (error) {
       console.error('[TimelineNotes] save-note error:', error);

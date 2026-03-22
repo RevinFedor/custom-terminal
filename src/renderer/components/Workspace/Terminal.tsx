@@ -961,6 +961,10 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
       // IPC: Send input to PTY
       term.onData((data) => {
         ipcRenderer.send('terminal:input', tabId, data);
+        // User is typing — clear scroll protection so xterm can auto-scroll to bottom
+        if (userScrollTopRef.current !== null) {
+          userScrollTopRef.current = null;
+        }
       });
 
       // Track selection changes and update global state
@@ -1442,6 +1446,9 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
         // Setup handlers
         term.onData((data) => {
           ipcRenderer.send('terminal:input', tabId, data);
+          if (userScrollTopRef.current !== null) {
+            userScrollTopRef.current = null;
+          }
         });
         term.onSelectionChange(() => {
           const selection = term.getSelection() || '';
