@@ -3,10 +3,10 @@
 ```
 auto/
 ├── context.md                        # ТЫ ЗДЕСЬ. Читай первым.
-├── playwright/                       # Справка: Playwright + Electron
-│   ├── basics.md                     # Шаблоны, селекторы, event-driven ожидания
-│   └── electron.md                   # Electron: env, clipboard, IPC, build sync
-├── libraries/                        # Справка: особенности тестируемых библиотек
+├── methodology.md                    # Мета-правила: КАК думать/действовать при тестировании
+├── libraries/                        # Справка: Playwright, Electron, библиотеки
+│   ├── playwright.md                 # Шаблоны, селекторы, event-driven ожидания
+│   ├── electron.md                   # Electron: env, clipboard, IPC, build sync
 │   ├── xterm.md                      # xterm.js: DOM, readiness, ввод, OSC 133
 │   ├── zustand-store.md              # Zustand: чтение state, поля таба
 │   └── browser-tab.md                # BrowserTab: activeView, webview focus
@@ -14,7 +14,7 @@ auto/
 │   ├── launcher.js                   # E2E: запуск Electron, log capture, хелперы
 │   ├── electron.js                   # E2E: clipboard, focus, webContents
 │   └── headless.js                   # Headless: assert, log, writeAndWait, createMiddleware
-├── fixtures/                         # Фикстуры (golden sessions, mock data)
+├── mock-data/                        # Фикстуры (golden sessions, mock data)
 │   └── gemini-rewind-session.json    # Gemini: 13 сообщений для rewind-тестов
 ├── stable/                           # Рабочие тесты (регрессия)
 │   ├── test-osc-boundary-markers.js  # [Headless] OSC 7777 state machine + xterm markers
@@ -39,50 +39,17 @@ auto/
 
 Метки тестов:
 - **[Headless]** — чистый Node.js, без Electron. < 1 сек, 100% детерминированный.
-- **[E2E+Fixture]** — Electron + golden session из `fixtures/`. Не требует реального AI.
+- **[E2E+Fixture]** — Electron + golden session из `mock-data/`. Не требует реального AI.
 - **[E2E+Claude]** — Electron + живой Claude. Требует CLI `claude` и ~30-60 сек.
 - **[E2E+Gemini+Claude]** — Electron + живой Gemini CLI + Claude Code. ~3-5 мин (после JSONL guard fix). Hard kill: 720с.
 
 ---
 
-## Reliability & Troubleshooting (Критично)
+## Reliability & Troubleshooting
 
-**ПРАВИЛО НУЛЕВОГО ДЕЙСТВИЯ:** Прежде чем писать тест или менять код, **перечитай эту секцию**. Каждый пункт — результат реального бага, который стоил 30+ минут отладки.
+**Все поведенческие правила и ловушки** (event-driven ожидания, скриншоты, build sync, state isolation, tee, timeouts) — в [`methodology.md`](methodology.md). Прочитай перед написанием первого теста.
 
-Если тест падает с **Exit code 1** или "зависает" без вывода — проверь следующие пункты:
-
-### 1. Проблема "Пустого вывода" (Empty Output)
-Bash tool в Claude Code буферизирует stdout. Electron + Playwright через pipe теряют вывод при раннем crash'е.
-**ОБЯЗАТЕЛЬНО:** Всегда запускай тесты через `tee`:
-```bash
-node auto/stable/test-name.js 2>&1 | tee /tmp/test-name.log
-```
-Без `tee` ты получишь пустой вывод и exit code 1 без какой-либо диагностики. Потом читай лог: `cat /tmp/test-name.log`.
-
-### 2. State Isolation (Грязное состояние БД)
-При запуске `launch()` приложение восстанавливает последнее состояние рабочей среды (табы, сессии) из SQLite.
-**ЛОВУШКА:** Если активным табом при старте оказался остаток от прошлого теста (например, `claude-sub`), попытка запустить в нём другую команду (например, `gemini`) может не сработать.
-**ПРАВИЛО:** В начале E2E тестов, если тебе нужна чистая среда, **создавай новый таб** (`await page.keyboard.press('Meta+t')`), дождись его появления, и только потом начинай работу. Не полагайся на дефолтный `activeTabId`.
-
-### 3. Build Sync & Dev Server (Рассинхрон)
-E2E тесты запускают приложение, используя `dist/main/main.js` и запущенный Dev Server (порт 5182).
-**ПРАВИЛО (Build-Before-Test):**
-- При **ЛЮБОМ** изменении файлов в `src/main/` — **сначала** `npx electron-vite build`, **потом** запуск теста. Без этого тест запустит старый код и ты будешь отлаживать несуществующий баг.
-- При изменении `src/renderer/`, убедись, что запущен `npm run dev`.
-- **Проверка:** Сравни timestamp `dist/main/main.js` с `src/main/main.js`. Если dist старше — нужен build.
-
-### 4. Live Feedback & Logging
-Тесты НЕ должны молчать. Пользователь/AI должен видеть прогресс в реальном времени.
-- Используй `log.step()` **ДО** вызова `launch()` или `waitForTerminal()`.
-- Если операция может занять >5 сек, выводи "Heartbeat" (точки или сообщения) через `setInterval`.
-- Стриминг логов Main-процесса (`mainProcessLogs`) должен быть отфильтрованным, чтобы не забивать stdout.
-
-### 5. Global Timeouts & Safety
-Любой асинхронный вызов в тесте — потенциальная точка зависания.
-- **withTimeout:** Оборачивай каждый `page.waitFor...` или `httpRequest` в хелпер `withTimeout(promise, ms, label)`.
-- **Hard Kill:** Всегда ставь `const globalTimer = setTimeout(...)` в начале `main()`, который принудительно завершит процесс через 150-180 секунд.
-
-### 6. Conflict: Port & SQLite
+### Infrastructure: Port & SQLite
 - **MCP Port:** Тестовый инстанс перезаписывает `~/.noted-terminal/mcp-port`.
 - **SQLite Lock:** Приложение использует `better-sqlite3` в WAL-режиме. При параллельном запуске возможны задержки.
 
@@ -212,7 +179,7 @@ main().catch(err => { console.error(err.message); process.exit(1) })
 
 - **Новый тест → `sandbox/`** пока отлаживаешь
 - **Тест стабильно проходит → переместить в `stable/`**
-- **Тест использует golden session → положить fixture в `fixtures/`**
+- **Тест использует golden session → положить fixture в `mock-data/`**
 
 ---
 
@@ -284,25 +251,6 @@ await waitForIPCEvent('terminal:prompt-ready', tabId, 5000)
 ipcRenderer.send('claude:run-command', { tabId, command: 'claude-c', sessionId })
 ```
 
-### Скриншоты в E2E тестах (обязательно)
-
-**Каждый E2E тест ДОЛЖЕН делать скриншоты** после критических шагов. Без них диагностика провалов невозможна — логи не показывают состояние терминала.
-
-```javascript
-await page.screenshot({ path: '/tmp/test-name-step-N.png' })
-log.info('Screenshot: /tmp/test-name-step-N.png')
-```
-
-Минимум: после открытия UI-элемента, после apply/submit, финальное состояние.
-
-### Допустимые фиксированные задержки
-
-Только когда нет сигнала для ожидания:
-- `100ms` между набором и Enter (keyboard simulation)
-- `300ms` для анимации контекстного меню
-- `1000ms` после создания таба (shell init, до первого OSC 133 A)
-- `8000ms` retry после падения Electron
-
 ---
 
 ## Специфика подсистем
@@ -324,7 +272,7 @@ log.info('Screenshot: /tmp/test-name-step-N.png')
 
 ### Golden Session Pattern
 Для Gemini тестов без реального AI:
-1. Файл из `fixtures/` копируется в `~/.gemini/tmp/`
+1. Файл из `mock-data/` копируется в `~/.gemini/tmp/`
 2. Тест получает заполненный таймлайн мгновенно
 3. Не зависит от AI-ответов и сети
 
@@ -416,21 +364,11 @@ node auto/sandbox/test-orchestration-full.js 2>&1 | tee /tmp/test-orchestration-
 
 ### Типичные ошибки при написании тестов (шрамы)
 
+Полный список поведенческих правил и ловушек — в [`methodology.md`](methodology.md).
+
+Инфраструктурные шрамы (эндпоинты, IPC-контракты):
+
 | Ошибка | Последствие | Как избежать |
 |--------|-------------|--------------|
-| Не создать свежий таб в начале теста | `gemini:spawn-with-watcher` идёт в claude-таб, `commandType` остаётся `claude` | См. §2 State Isolation |
-| Не сделать `npx electron-vite build` после правки `src/main/` | Тест запускает старый код, баги "невоспроизводимы" | См. §3 Build Sync |
-| Запустить тест без `\| tee /tmp/file.log` | Пустой вывод, нет диагностики | См. §1 Empty Output |
-| `assert(condition \|\| true, ...)` | Assert всегда PASS, баг скрыт | Code review: никогда `\|\| true` в assert |
-| `logMainProcess: false` в `launch()` | Нет логов Main-процесса для отладки | Всегда `logMainProcess: true` для [E2E+Claude] и [E2E+Gemini+Claude] |
-| `terminal:input` для Claude Code | Ink TUI не обрабатывает raw text, нужен bracketed paste | Используй `terminal:paste` (через `safePasteAndSubmit`) |
 | Эндпоинт `/history/` вместо `/claude-history/` | 404, `totalTurns: undefined` | MCP HTTP: `/claude-history/{taskId}`, `/status/{taskId}`, `/continue`, `/delegate` |
-| JSONL guard ждёт `turn_duration` для суб-агентов | 120s таймаут (40×3s) — суб-агенты не пишут `turn_duration` | Фикс: fallback на `stop_reason=end_turn` в `checkJsonlActivity` |
-| `waitForMainProcessLog` после повторного Spinner | Ловит старый BUSY/IDLE от инициализации, тест проходит без реальной работы | Трекать `mainProcessLogs.length` и искать только новые записи. См. `playwright/basics.md` |
-| `getBoundingClientRect()` для поиска активного viewport | Скрытые табы (`visibility:hidden`) имеют ненулевые размеры | Проверять `getComputedStyle(el).visibility`. См. `libraries/xterm.md` |
-| `WheelEvent` для скролла xterm | xterm.js игнорирует синтетические wheel events | Устанавливать `viewport.scrollTop` напрямую. См. `libraries/xterm.md` |
-| `terminal:input` с объектом `{ tabId, data }` | Ctrl+C не доходит — сигнатура `(event, tabId, data)` принимает 2 отдельных аргумента | `ipcRenderer.send('terminal:input', tabId, data)` — не объект |
-| `terminal:kill` перед `claude:run-command` | PTY удаляется из `terminals` Map, `run-command` не находит терминал | Не убивать PTY. Отправить Ctrl+C × 2, дождаться `terminal:prompt-ready` (OSC 133 A), затем `claude:run-command` |
-| `focusWindow` сразу после `launch()` | Execution context destroyed — Electron перезагружает окно при restore | Оборачивать `focusWindow` в retry (3 попытки, 1с пауза) |
-| `typeCommand` когда shell не готов | Первые символы (`cd `) поглощаются shell-инициализацией, набирается только путь → `permission denied` | Ждать 1с после создания таба или дождаться OSC 133 A перед набором |
-| Скриншоты отсутствуют в тесте | Невозможно диагностировать состояние терминала при падении | **Обязательно** делать `page.screenshot()` после каждого критического шага (панель открыта, apply, финал) |
+| JSONL guard ждёт `turn_duration` для суб-агентов | 120s таймаут (40x3s) — суб-агенты не пишут `turn_duration` | Фикс: fallback на `stop_reason=end_turn` в `checkJsonlActivity` |

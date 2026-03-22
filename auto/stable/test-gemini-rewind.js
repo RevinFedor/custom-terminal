@@ -10,7 +10,7 @@
  * 5. Duplicate prefix detection (skipDuplicates)
  * 6. gemini:open-history-menu IPC accepts correct params
  *
- * Golden session: auto/fixtures/gemini-rewind-session.json
+ * Golden session: auto/mock-data/gemini-rewind-session.json
  * Copied to ~/.gemini/tmp/custom-terminal/chats/ before test.
  *
  * Run: node auto/stable/test-gemini-rewind.js

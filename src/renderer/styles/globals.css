@@ -189,6 +189,10 @@
 .font-jetbrains { font-family: 'JetBrains Mono', 'JetBrainsMono NF', monospace; }
 .scrollbar-hide { -ms-overflow-style: none; scrollbar-width: none; }
 .scrollbar-hide::-webkit-scrollbar { display: none; }
+.scrollbar-thin::-webkit-scrollbar { width: 3px; }
+.scrollbar-thin::-webkit-scrollbar-track { background: transparent; }
+.scrollbar-thin::-webkit-scrollbar-thumb { background: #555; border-radius: 2px; }
+.scrollbar-thin::-webkit-scrollbar-thumb:hover { background: #777; }
 
 
 /* Custom Layers from input.css */
