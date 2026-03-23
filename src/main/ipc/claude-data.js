@@ -1230,13 +1230,29 @@ function register({ projectManager, formatToolAction }) {
         }
       }
 
-      console.log('[Timeline:Backtrace] session=' + sessionId.substring(0, 8) + ' entries=' + entries.length + ' skipped: sidechain=' + skippedSidechain + ' toolResult=' + skippedToolResult + ' noContent=' + skippedNoContent + ' system=' + skippedSystem + ' summary=' + skippedSummary);
+      // Merge consecutive docs_edit entries into one
+      const mergedEntries = [];
+      for (const entry of entries) {
+        if (entry.type === 'docs_edit' && mergedEntries.length > 0 && mergedEntries[mergedEntries.length - 1].type === 'docs_edit') {
+          const prev = mergedEntries[mergedEntries.length - 1];
+          for (const f of entry.docsEdited) {
+            if (!prev.docsEdited.includes(f)) {
+              prev.docsEdited.push(f);
+            }
+          }
+          prev.content = prev.docsEdited.join(', ');
+        } else {
+          mergedEntries.push(entry);
+        }
+      }
+
+      console.log('[Timeline:Backtrace] session=' + sessionId.substring(0, 8) + ' entries=' + mergedEntries.length + ' skipped: sidechain=' + skippedSidechain + ' toolResult=' + skippedToolResult + ' noContent=' + skippedNoContent + ' system=' + skippedSystem + ' summary=' + skippedSummary);
 
       // Resolve the latest session ID in the chain (tip)
       // This helps the renderer detect if claudeSessionId needs updating
       const latestSessionId = resolveLatestSessionInChain(sessionId, cwd);
 
-      return { success: true, entries, latestSessionId, sessionBoundaries };
+      return { success: true, entries: mergedEntries, latestSessionId, sessionBoundaries };
 
     } catch (error) {
       console.error('[Claude Timeline] Error:', error);

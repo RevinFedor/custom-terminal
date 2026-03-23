@@ -1,15 +1,16 @@
 # Feature: Terminal Scripts
 
 ## 1. Intro + User Flow
-Запуск npm-скриптов из `package.json` через контекстное меню таба (ПКМ → Scripts).
+Запуск npm-скриптов из `package.json` и `.sh`-файлов из корня CWD через контекстное меню таба (ПКМ → Scripts).
 
 **Flow:**
-ПКМ по табу → Подменю "Scripts" (подгружается из `package.json` CWD этого таба) → Клик по скрипту → В терминал отправляется `npm run [name]`.
+ПКМ по табу → Подменю "Scripts" (подгружается из `package.json` + `.sh` файлы CWD этого таба) → Клик по скрипту → В терминал отправляется `npm run [name]` или `./script.sh`.
 
 ## 2. Behavior Specs
 - **Динамическое считывание:** Список скриптов загружается при открытии контекстного меню (запрашивается актуальный CWD через `terminal:getCwd`).
 - **Фильтрация приватных команд:** Скрипты с подчёркиванием (`_rebuild`) скрываются из UI.
 - **Dev-Server Auto-Detection:** При запуске скрипта, имя которого начинается с `dev`, `start`, `serve` или `watch` (regex: `/^(dev|start|serve|watch)/i`), автоматически вызывается `setTabCommandType(tabId, 'devServer')`. Это делает таб зелёным и активирует кнопку перезагрузки (RestartZone).
+- **Shell-скрипты (.sh):** Помимо npm, парсятся `.sh` файлы в корне CWD (скрытые `.`-файлы исключаются). Отображаются как `./script.sh`. Если есть и npm, и sh — между ними разделительная черта. Dev-Server Auto-Detection работает и для sh (например, `watch.sh` → devServer).
 - **Подменю с отступом:** Scripts отображаются как подменю контекстного меню (CSS `group-hover/scripts`), открывающееся вправо.
 
 ## 3. Stop Running Process

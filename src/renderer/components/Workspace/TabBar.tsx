@@ -782,6 +782,7 @@ function TabBar({ projectId }: TabBarProps) {
   const [editValue, setEditValue] = useState('');
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; tabId: string } | null>(null);
   const [contextScripts, setContextScripts] = useState<string[]>([]);
+  const [contextShScripts, setContextShScripts] = useState<string[]>([]);
   const [contextFavoriteId, setContextFavoriteId] = useState<number | null>(null);
   const [utilityExpanded, setUtilityExpanded] = useState(false);
   const [utilityOpenedManually, setUtilityOpenedManually] = useState(false); // Track if opened by click vs hover
@@ -1154,23 +1155,40 @@ function TabBar({ projectId }: TabBarProps) {
     setContextMenuPos({ x: e.clientX, y: e.clientY });
     setContextMenu({ x: e.clientX, y: e.clientY, tabId });
 
-    // Load scripts for this tab's CWD
+    // Load scripts for this tab's CWD (npm + sh)
     (async () => {
       try {
         const cwd = await ipcRenderer.invoke('terminal:getCwd', tabId);
         const tabCwd = cwd || workspace.tabs.get(tabId)?.cwd || '';
-        if (!tabCwd) { setContextScripts([]); return; }
-        const result = await ipcRenderer.invoke('file:read', `${tabCwd}/package.json`);
-        if (result?.success && result.content) {
-          const pkg = JSON.parse(result.content);
-          if (pkg.scripts) {
-            setContextScripts(Object.keys(pkg.scripts).filter(name => !name.startsWith('_')));
-            return;
+        if (!tabCwd) { setContextScripts([]); setContextShScripts([]); return; }
+
+        // npm scripts
+        try {
+          const result = await ipcRenderer.invoke('file:read', `${tabCwd}/package.json`);
+          if (result?.success && result.content) {
+            const pkg = JSON.parse(result.content);
+            if (pkg.scripts) {
+              setContextScripts(Object.keys(pkg.scripts).filter(name => !name.startsWith('_')));
+            } else {
+              setContextScripts([]);
+            }
+          } else {
+            setContextScripts([]);
           }
+        } catch {
+          setContextScripts([]);
         }
-        setContextScripts([]);
+
+        // .sh scripts
+        try {
+          const shResult = await ipcRenderer.invoke('file:list-sh-scripts', tabCwd);
+          setContextShScripts(shResult?.success ? shResult.files : []);
+        } catch {
+          setContextShScripts([]);
+        }
       } catch {
         setContextScripts([]);
+        setContextShScripts([]);
       }
     })();
 
@@ -1788,7 +1806,7 @@ function TabBar({ projectId }: TabBarProps) {
           )}
 
           {/* Scripts - submenu */}
-          {!isMultiSelect && (contextScripts.length > 0 || (contextMenu && processStatus.get(contextMenu.tabId) && workspace.tabs.get(contextMenu.tabId)?.commandType === 'devServer')) && (
+          {!isMultiSelect && (contextScripts.length > 0 || contextShScripts.length > 0 || (contextMenu && processStatus.get(contextMenu.tabId) && workspace.tabs.get(contextMenu.tabId)?.commandType === 'devServer')) && (
             <div className="relative group/scripts">
               <button
                 className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center justify-between"
@@ -1796,7 +1814,7 @@ function TabBar({ projectId }: TabBarProps) {
                 <span className="flex items-center gap-2">
                   <Play size={12} className="text-[#666]" />
                   Scripts
-                  {contextScripts.length > 0 && <span className="text-[10px] text-[#555]">{contextScripts.length}</span>}
+                  {(contextScripts.length + contextShScripts.length) > 0 && <span className="text-[10px] text-[#555]">{contextScripts.length + contextShScripts.length}</span>}
                 </span>
                 <span className="text-[#666]">{'\u203A'}</span>
               </button>
@@ -1816,7 +1834,7 @@ function TabBar({ projectId }: TabBarProps) {
                         <div className="w-1.5 h-1.5 rounded-full bg-[#4ade80] animate-pulse" />
                         <span className="truncate">Stop: {workspace.tabs.get(contextMenu.tabId)?.name}</span>
                       </button>
-                      {contextScripts.length > 0 && <div className="my-1 border-t border-[#444]" />}
+                      {(contextScripts.length > 0 || contextShScripts.length > 0) && <div className="my-1 border-t border-[#444]" />}
                     </>
                   )}
                   {contextScripts.map((script) => (
@@ -1838,6 +1856,30 @@ function TabBar({ projectId }: TabBarProps) {
                     >
                       <div className="w-1 h-1 rounded-full bg-[#555]" />
                       <span className="truncate">{script}</span>
+                    </button>
+                  ))}
+                  {/* Separator between npm and sh scripts */}
+                  {contextScripts.length > 0 && contextShScripts.length > 0 && (
+                    <div className="my-1 border-t border-[#444]" />
+                  )}
+                  {contextShScripts.map((file) => (
+                    <button
+                      key={file}
+                      className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if (contextMenu) {
+                          ipcRenderer.send('terminal:input', contextMenu.tabId, `./${file}\r`);
+                          const isDevScript = /^(dev|start|serve|watch)/i.test(file);
+                          if (isDevScript) {
+                            useWorkspaceStore.getState().setTabCommandType(contextMenu.tabId, 'devServer');
+                          }
+                        }
+                        setContextMenu(null);
+                      }}
+                    >
+                      <div className="w-1 h-1 rounded-full bg-[#555]" />
+                      <span className="truncate">./{file}</span>
                     </button>
                   ))}
                 </div>
