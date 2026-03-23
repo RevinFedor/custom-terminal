@@ -767,6 +767,9 @@ ipcMain.on('show-terminal-context-menu', async (event, { hasSelection, prompts, 
 
       // 2. .sh files in CWD
       const shFiles = fs.readdirSync(cwd).filter(f => f.endsWith('.sh') && !f.startsWith('.'));
+      if (shFiles.length > 0 && scripts.length > 0) {
+        scripts.push({ type: 'separator' });
+      }
       shFiles.forEach(file => {
         scripts.push({
           label: `./${file}`,
@@ -5390,6 +5393,17 @@ ipcMain.handle('terminal:executeCommandAsync', async (event, tabId, command) => 
   console.log('[main] ⏰ 100ms after Enter, returning at', Date.now() - startTime, 'ms');
 
   return { success: true };
+});
+
+// List .sh scripts in directory
+ipcMain.handle('file:list-sh-scripts', async (event, dirPath) => {
+  try {
+    const fs = require('fs');
+    const files = fs.readdirSync(dirPath).filter(f => f.endsWith('.sh') && !f.startsWith('.'));
+    return { success: true, files };
+  } catch {
+    return { success: true, files: [] };
+  }
 });
 
 // Read file for preview

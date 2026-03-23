@@ -256,13 +256,16 @@ type DragData = {
 
 ---
 
-## 6. Favorites Persistence
-**Файл-источник:** Сессия 2026-02-11
+### Favorites Persistence
+Введена таблица `favorites` для сохранения конфигураций вкладок. См. схему ниже.
 
-### Суть
-Введена таблица `favorites` для сохранения конфигураций вкладок, которые пользователь хочет закрепить для быстрого доступа.
+### Timeline Notes Schema
+Таблица `timeline_notes` хранит пользовательские аннотации к сообщениям Claude/Gemini.
+- **Columns:** `id`, `entry_uuid`, `session_id`, `tab_id`, `content`, `position`, `created_at`, `updated_at`.
+- **Position Column:** Добавлена в марте 2026 (`ALTER TABLE`). Принимает значения `before` (над точкой), `dot` (на самой точке), `after` (под точкой). По умолчанию `before`.
+- **Unique Constraint:** `UNIQUE(entry_uuid, session_id)` — гарантирует одну заметку на сообщение в рамках сессии.
 
-### Схема таблицы
+### Схема таблицы favorites
 ```sql
 CREATE TABLE favorites (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

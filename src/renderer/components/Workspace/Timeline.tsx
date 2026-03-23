@@ -856,7 +856,9 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   const [tooltipMeasuredH, setTooltipMeasuredH] = useState(0);
 
   // Measure actual tooltip height (before paint) to size wrapper precisely
+  // Skip during resize and briefly after — width changes cause text reflow → height change → wrapper repositions → mouse "falls out"
   useLayoutEffect(() => {
+    if (isResizingTooltipRef.current) return;
     if (tooltipContentRef.current && activeTooltipIndex !== null) {
       const h = tooltipContentRef.current.getBoundingClientRect().height;
       if (Math.abs(h - tooltipMeasuredRef.current) > 1) {
@@ -867,7 +869,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       tooltipMeasuredRef.current = 0;
       setTooltipMeasuredH(0);
     }
-  }, [activeTooltipIndex, isExpanded]);
+  }, [activeTooltipIndex, isExpanded, timelineTooltipWidth]);
 
   // Dismiss tooltip on any mousedown outside tooltip content
   // Handles: dead zone clicks, scrollbar grabs, clicks elsewhere
@@ -919,7 +921,6 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         if (mouseY < wrapperRect.top || mouseY > wrapperRect.bottom) {
           setActiveTooltipIndex(null);
         }
-        // else: mouse is at tooltip height — keep open so user can reach it
       }
     } else if (!wentLeft && !isExpanded) {
       setActiveTooltipIndex(null);
@@ -1295,8 +1296,10 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
       setContextMenu(null);
-      // Close expanded tooltip on outside click
-      if (isExpanded) {
+      // Close expanded tooltip on outside click (skip if resize just ended)
+      if (isExpanded && !isResizingTooltipRef.current) {
+        // Skip if click target is inside tooltip (resize handle click → drag → mouseup → click)
+        if (tooltipContentRef.current?.contains(e.target as Node)) return;
         setIsExpanded(false);
         setActiveTooltipIndex(null);
       }
@@ -1585,8 +1588,11 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   const tooltipPos = activeTooltipIndex !== null ? (() => {
     const eCenterY = getElementCenterY(activeTooltipIndex);
     const approxH = isExpanded ? 400 : 200;
-    // Use measured height when available, fallback to estimate
-    const h = tooltipMeasuredH > 0 ? tooltipMeasuredH : approxH;
+    // Expanded: use fixed 60vh (matches maxHeight) — avoids measurement-based jumps during resize
+    // Collapsed: use measured height for precise positioning
+    const h = isExpanded
+      ? Math.round(window.innerHeight * 0.6)
+      : (tooltipMeasuredH > 0 ? tooltipMeasuredH : approxH);
 
     // Determine alignment based on estimate (stable — doesn't flicker with measurement)
     const idealTop = eCenterY - approxH / 2;
@@ -2420,7 +2426,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
             <div
               ref={tooltipRef}
               onMouseEnter={() => { isMouseInTooltipRef.current = true; }}
-              onMouseLeave={(e) => { isMouseInTooltipRef.current = false; handleMouseLeaveTooltipArea(); }}
+              onMouseLeave={(e) => { if (!isResizingTooltipRef.current) { isMouseInTooltipRef.current = false; handleMouseLeaveTooltipArea(); } }}
               style={{
                 position: 'fixed',
                 right: `${notesPanelWidth + (treeMode ? 160 : 32) - 8}px`,
@@ -2452,7 +2458,6 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                   display: 'flex',
                   flexDirection: 'column',
                   gap: '8px',
-                  transition: 'max-height 0.2s ease-in-out',
                   overflow: 'hidden',
                   position: 'relative',
                 }}
@@ -2482,20 +2487,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                       document.removeEventListener('mousemove', onMove);
                       document.removeEventListener('mouseup', onUp);
                       isResizingTooltipRef.current = false;
-                      // Check if mouse ended up inside tooltip (with 5px left buffer)
-                      requestAnimationFrame(() => {
-                        if (tooltipRef.current) {
-                          const rect = tooltipRef.current.getBoundingClientRect();
-                          const inside = ev.clientX >= rect.left - 5 && ev.clientX <= rect.right &&
-                                         ev.clientY >= rect.top && ev.clientY <= rect.bottom;
-                          if (inside) {
-                            isMouseInTooltipRef.current = true;
-                          } else {
-                            isMouseInTooltipRef.current = false;
-                            handleMouseLeaveTooltipArea();
-                          }
-                        }
-                      });
+                      isMouseInTooltipRef.current = true;
                     };
                     document.addEventListener('mousemove', onMove);
                     document.addEventListener('mouseup', onUp);
