@@ -20,19 +20,21 @@
 - **Augmentation entries** (сканирование sessionId transitions): Блокировалось forkUuids (все UUID в snapshot), все transitions считались fork transitions.
 
 ## Решение
-Двойной фильтр в renderer при загрузке маркеров:
+Только `directParent` маркер в renderer — показывается **только в дочерней сессии**:
 ```javascript
-// 1. Форки ОТ меня (показать где я был форкнут)
-fromMe = markers.filter(m => m.source_session_id === sessionId)
-// 2. ОДИН прямой родитель (показать fork point + подавить ложный plan mode)
+// Только маркер "я дочерняя сессия" (forked_to === sessionId)
+// fromMe (source === sessionId) убран — в родителе не нужны синие полоски,
+// fork point уже виден в дочерней сессии через её directParent маркер.
 toMe = markers.filter(m => m.fork_session_id === sessionId)
 directParent = toMe с максимальным entry_uuids.length
-markers = [...fromMe, directParent]
+markers = directParent ? [directParent] : []
 ```
 
 **Почему нужен directParent:** В форке entries имеют `sessionId` оригинала (`2fa76efe`), а compact/новые entries — `sessionId` форка (`79fb8d32`). Без fork marker на границе `isPlanModeBoundary` видит смену sessionId и рисует бирюзовую полоску (plan mode). Fork marker подавляет это (`if (forkMarker) return false` в `isPlanModeBoundary`).
 
 **Почему только ОДИН:** Inherited маркеры (от дедушек) имеют snapshot из других сессий — показывают синие полоски в неправильных местах. Direct parent = самый большой snapshot = самый свежий.
+
+**Почему fromMe убран:** При форке из сессии A→B, маркер `A→B` (fromMe) показывал синюю полоску в Timeline родителя A. Пользователь видел лишние синие полоски в сессии, из которой он форкал. Fork point уже виден в дочерней сессии B (через directParent `A→B`), дублирование в родителе не нужно.
 
 **Связанные факты:**
 - [`fact-timeline.md`](fact-timeline.md) — Fork & Plan Mode Markers (визуальные разделители)

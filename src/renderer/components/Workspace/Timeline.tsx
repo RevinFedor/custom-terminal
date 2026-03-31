@@ -484,12 +484,10 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
           }
         }
         if (markersResult.success) {
-          // Keep: source === sessionId (forks FROM me)
-          // Keep: ONE marker where forked_to === sessionId with most entry_uuids (direct parent fork point)
-          // Hide: other inherited markers where forked_to === sessionId
+          // Only keep directParent marker (forked_to === sessionId) — shows fork point in CHILD sessions.
+          // fromMe markers (source === sessionId) are NOT shown in parent — fork point is
+          // already visible in the child's timeline via its own directParent marker.
           const all = markersResult.markers || [];
-          const fromMe = all.filter((m: ForkMarker) => m.source_session_id === sessionId);
-          // Find the direct parent marker (largest snapshot = most recent fork)
           const toMe = all.filter((m: ForkMarker) => m.fork_session_id === sessionId);
           let directParent: ForkMarker | null = null;
           for (const m of toMe) {
@@ -497,8 +495,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
               directParent = m;
             }
           }
-          const markers = directParent ? [...fromMe, directParent] : fromMe;
-          setForkMarkers(markers);
+          setForkMarkers(directParent ? [directParent] : []);
         }
       }
       // Load notes for this session (works for both Claude and Gemini)
