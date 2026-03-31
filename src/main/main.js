@@ -3224,7 +3224,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
       COLORTERM: 'truecolor',  // Enable 24-bit colors for Ink-based CLIs (gemini, claude)
       LANG: process.env.LANG || 'en_US.UTF-8',
       LC_ALL: process.env.LC_ALL || 'en_US.UTF-8',
-      TERM_PROGRAM: 'CustomTerminal',
+      TERM_PROGRAM: 'vscode',  // Triggers xterm.js-optimized rendering in Claude Code's Ink
       TERM_PROGRAM_VERSION: '1.0.0',
     };
 

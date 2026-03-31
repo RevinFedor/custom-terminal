@@ -40,3 +40,5 @@ build-resources/.DS_Store
 # Native modules
 prebuilds/
 /src/pty-proxy
+/packages/claw-code
+/packages
