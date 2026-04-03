@@ -92,6 +92,27 @@ startTransition(() => {
 - **`will-change: transform`**: Информирует браузер, что элемент будет часто трансформироваться, и он должен создать отдельный compositing layer для этого элемента.
 - **Результат:** Вращение спиннера обрабатывается на GPU и не зависит от Main Thread JavaScript. Даже если JS занят парсингом и рендером 200+ DOM-элементов, спиннер продолжает крутиться.
 
+## Startup Black Screen: Batch Restore
+
+**Симптом:** После `build:install` приложение запускается с чёрным экраном на 2-5 секунд, модалка "Сессия прервана" мелькает.
+
+**Причина:** `restoreSession` вызывал `openProject()` в цикле (по одному на проект). Каждый `openProject` → `set({ openProjects: new Map() })` → Workspace ремаунтится. 5 проектов = 5 ремаунтов за 150ms. Между ремаунтами `activeTabId=undefined` → `EARLY_RETURN: Empty workspace` → чёрный экран.
+
+**Решение:** `restoreSession` загружает ВСЕ проекты inline (мутация Map напрямую без `set()`), `createTab` пропускает `set()` при `isRestoring=true` (уже было). Один финальный `set()` со всеми проектами, табами, `activeProjectId` и `view`.
+
+## Auto-Resume: React Batching Trap
+
+**Симптом:** Auto-resume не срабатывает после restore — прерванные сессии показывают модалку вместо автозапуска.
+
+**Отброшенные подходы:**
+1. `setTimeout(3000)` — костыль, не детерминированно, PTY может не быть готов за 3с.
+2. `useEffect([isRestoring])` — React batch'ит `set({isRestoring:true})` и `set({isRestoring:false})` из одного async `restoreSession()` → компонент **никогда не видит** промежуточное `true`. useEffect получает только `false → false`.
+3. `useEffect` + `sawRestoringTrue` ref — тот же batching, ref никогда не ставится в `true`.
+
+**Решение:** `useWorkspaceStore.subscribe()` — синхронный callback, вызывается на КАЖДОМ `set()`, не зависит от React render cycle. Ловит оба перехода: `isRestoring: false→true` (запомнить) и `true→false` (запустить auto-resume).
+
+**Правило:** Для детекции state transitions в Zustand из async code, где промежуточные состояния могут быть batch'ены React'ом — использовать `subscribe()`, не `useEffect`.
+
 ## См. также
 - [`fact-backtrace-jsonl.md`](fact-backtrace-jsonl.md) — детали инкрементального чтения.
 - [`fact-react-patterns.md`](fact-react-patterns.md) — паттерн гранулярных селекторов.

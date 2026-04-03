@@ -290,3 +290,15 @@ return createPortal(
 
 ## Когда применять
 Всегда, когда пользователю нужно взаимодействовать с контентом всплывающего окна, которое открывается по hover.
+
+---
+
+## Zustand subscribe() vs useEffect для state transitions
+
+**Проблема:** `useEffect([zustandValue])` не ловит промежуточные state transitions когда несколько `set()` вызываются из одного async function. React 18 batch'ит все `set()` из одного async контекста → компонент видит только финальное значение, промежуточные пропущены.
+
+**Пример:** `restoreSession()` делает `set({isRestoring: true})` → async загрузка → `set({isRestoring: false})`. `useEffect([isRestoring])` видит только `false → false` (batched). Компонент никогда не видит `true`.
+
+**Решение:** `useWorkspaceStore.subscribe((state, prev) => { ... })` — синхронный callback на КАЖДОМ `set()`, не зависит от React render cycle. Ловит все промежуточные transitions.
+
+**Когда использовать:** Для детекции state transitions (A→B→C) в Zustand, особенно из async code, где промежуточное состояние B может быть batch'ено React'ом. Типичный случай: "подождать пока async операция завершится" (isRestoring, isLoading, etc.).

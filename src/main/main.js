@@ -728,14 +728,35 @@ ipcMain.on('show-terminal-context-menu', async (event, { hasSelection, prompts, 
 
   template.push({ type: 'separator' });
 
-  // Add Insert Prompt submenu
+  // Add Insert Prompt submenu (with group support)
   if (prompts && prompts.length > 0) {
-    const promptsSubmenu = prompts.map(prompt => ({
-      label: prompt.title,
-      click: () => {
-        event.sender.send('context-menu-command', 'insert-prompt', prompt.content);
-      }
-    }));
+    let promptGroups = [];
+    try { promptGroups = projectManager.getPromptGroups(); } catch (e) {}
+
+    const promptsSubmenu = [];
+
+    // Groups first (same order as settings), then ungrouped
+    promptGroups.forEach(group => {
+      const groupPrompts = prompts.filter(p => p.group_id === group.id);
+      promptsSubmenu.push({
+        label: group.name,
+        submenu: groupPrompts.length > 0
+          ? groupPrompts.map(p => ({
+              label: p.title,
+              click: () => { event.sender.send('context-menu-command', 'insert-prompt', p.content); }
+            }))
+          : [{ label: '(empty)', enabled: false }]
+      });
+    });
+
+    const ungrouped = prompts.filter(p => !p.group_id);
+    if (promptGroups.length > 0 && ungrouped.length > 0) promptsSubmenu.push({ type: 'separator' });
+    ungrouped.forEach(prompt => {
+      promptsSubmenu.push({
+        label: prompt.title,
+        click: () => { event.sender.send('context-menu-command', 'insert-prompt', prompt.content); }
+      });
+    });
 
     template.push({
       label: 'Insert Prompt',

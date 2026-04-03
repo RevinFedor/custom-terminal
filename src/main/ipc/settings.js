@@ -77,6 +77,28 @@ function register({ projectManager }) {
     }
   });
 
+  // ── Prompt Groups ──
+
+  ipcMain.handle('prompt-groups:get', async () => {
+    try {
+      const groups = projectManager.getPromptGroups();
+      return { success: true, data: groups };
+    } catch (error) {
+      console.error('[main] Error getting prompt groups:', error);
+      return { success: false, error: error.message };
+    }
+  });
+
+  ipcMain.handle('prompt-groups:save', async (event, groups) => {
+    try {
+      projectManager.savePromptGroups(groups);
+      return { success: true };
+    } catch (error) {
+      console.error('[main] Error saving prompt groups:', error);
+      return { success: false, error: error.message };
+    }
+  });
+
   // ── AI Prompts (Dynamic System Prompts) ──
 
   ipcMain.handle('ai-prompts:get', async () => {

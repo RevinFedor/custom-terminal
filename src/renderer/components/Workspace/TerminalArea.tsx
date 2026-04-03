@@ -245,7 +245,8 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
     return ws.tabs.get(ws.activeTabId)?.claudeSessionId ?? null;
   });
   const activeTabIdForOverlay = activeTabId;
-  const showInterruptedOverlay = activeTabWasInterrupted && activeTabSessionId && currentView === 'terminal';
+  const isRestoring = useWorkspaceStore((s) => s.isRestoring);
+  const showInterruptedOverlay = activeTabWasInterrupted && activeTabSessionId && currentView === 'terminal' && !isRestoring;
 
   
   // Handle continuing interrupted Claude session (use fresh state from getState)
