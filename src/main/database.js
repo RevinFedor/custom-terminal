@@ -56,6 +56,22 @@ class DatabaseManager {
       )
     `);
 
+    // Prompt groups table (for grouping context menu prompts)
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS prompt_groups (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        position INTEGER DEFAULT 0
+      )
+    `);
+
+    // Migrations: prompt_groups
+    try { this.db.exec(`ALTER TABLE prompt_groups ADD COLUMN description TEXT DEFAULT ''`); } catch (e) {}
+    try { this.db.exec(`ALTER TABLE prompt_groups ADD COLUMN is_collapsed INTEGER DEFAULT 0`); } catch (e) {}
+
+    // Migration: add group_id to prompts
+    try { this.db.exec(`ALTER TABLE prompts ADD COLUMN group_id INTEGER DEFAULT NULL`); } catch (e) {}
+
     // Quick actions table
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS quick_actions (
@@ -696,7 +712,7 @@ class DatabaseManager {
     transaction(commands);
   }
 
-  getPrompts() { return this.db.prepare('SELECT * FROM prompts ORDER BY position').all(); }
+  getPrompts() { return this.db.prepare('SELECT * FROM prompts ORDER BY group_id NULLS LAST, position').all(); }
   savePrompts(prompts) {
     if (!Array.isArray(prompts)) return;
     const existingCount = this.db.prepare('SELECT COUNT(*) as cnt FROM prompts').get()?.cnt || 0;
@@ -706,8 +722,8 @@ class DatabaseManager {
     }
     const transaction = this.db.transaction((list) => {
       this.db.prepare('DELETE FROM prompts').run();
-      const insert = this.db.prepare('INSERT INTO prompts (title, content, position) VALUES (?, ?, ?)');
-      list.forEach((p, index) => insert.run(p.title, p.content, index));
+      const insert = this.db.prepare('INSERT INTO prompts (title, content, position, group_id) VALUES (?, ?, ?, ?)');
+      list.forEach((p, index) => insert.run(p.title, p.content, index, p.group_id ?? null));
     });
     transaction(prompts);
   }
@@ -715,6 +731,25 @@ class DatabaseManager {
   createDefaultPrompts() {
     if (this.db.prepare('SELECT COUNT(*) as count FROM prompts').get().count > 0) return;
     this.savePrompts([{ title: 'Fix Error', content: 'Analyze this error:' }, { title: 'Explain', content: 'Explain this:' }, { title: 'Optimize', content: 'Optimize this:' }]);
+  }
+
+  // ========== PROMPT GROUPS ==========
+
+  getPromptGroups() {
+    return this.db.prepare('SELECT * FROM prompt_groups ORDER BY position').all().map(row => ({
+      id: row.id, name: row.name, position: row.position,
+      description: row.description || '',
+      is_collapsed: row.is_collapsed === 1
+    }));
+  }
+  savePromptGroups(groups) {
+    if (!Array.isArray(groups)) return;
+    const transaction = this.db.transaction((list) => {
+      this.db.prepare('DELETE FROM prompt_groups').run();
+      const insert = this.db.prepare('INSERT INTO prompt_groups (id, name, position, description, is_collapsed) VALUES (?, ?, ?, ?, ?)');
+      list.forEach((g, index) => insert.run(g.id, g.name, index, g.description || '', g.is_collapsed ? 1 : 0));
+    });
+    transaction(groups);
   }
 
   // ========== AI PROMPTS (Dynamic System Prompts) ==========

@@ -845,42 +845,54 @@ function App() {
     return () => window.removeEventListener('beforeunload', handleBeforeUnload);
   }, []);
 
-  // Auto-resume interrupted sessions on startup (if enabled in settings)
+  // Auto-resume interrupted sessions — Zustand subscribe instead of useEffect.
+  // Problem: React batches set({isRestoring:true}) + set({isRestoring:false}) from
+  // restoreSession() into one update — useEffect never sees isRestoring=true.
+  // subscribe() fires synchronously on each set(), catching both transitions.
   useEffect(() => {
-    const timer = setTimeout(async () => {
-      try {
-        const autoResume = await ipcRenderer.invoke('app:getState', 'auto_resume_sessions');
-        if (autoResume !== true && autoResume !== 'true') return;
-
-        const state = useWorkspaceStore.getState();
-        const interruptedTabs: { projectId: string; tabId: string; sessionId: string }[] = [];
-
-        for (const [projectId, workspace] of state.openProjects) {
-          for (const [tabId, tab] of workspace.tabs) {
-            // Only auto-resume Claude tabs (not devServer, gemini, or other types that happen to have old sessionId)
-            if (tab.wasInterrupted && tab.claudeSessionId && !tab.overlayDismissed &&
-                (tab.commandType === 'claude' || tab.color === 'claude')) {
-              interruptedTabs.push({ projectId, tabId, sessionId: tab.claudeSessionId });
-            }
-          }
-        }
-
-        if (interruptedTabs.length === 0) return;
-        console.log('[AutoResume] Resuming', interruptedTabs.length, 'interrupted sessions');
-
-        for (const { tabId, sessionId } of interruptedTabs) {
-          state.clearInterruptedState(tabId);
-          state.setTabCommandType(tabId, 'claude');
-          const cmd = 'claude --dangerously-skip-permissions --resume ' + sessionId + '\r';
-          ipcRenderer.send('terminal:input', tabId, cmd);
-          ipcRenderer.send('terminal:force-command-started', { tabId });
-          console.warn('[AutoResume] Resumed tab', tabId, 'session', sessionId.substring(0, 8));
-        }
-      } catch (e: any) {
-        console.warn('[AutoResume] Error:', e?.message || String(e));
+    let sawTrue = false;
+    let triggered = false;
+    const unsub = useWorkspaceStore.subscribe((state, prev) => {
+      if (state.isRestoring && !prev.isRestoring) {
+        sawTrue = true;
+        console.warn('[AutoResume] isRestoring → true');
       }
-    }, 3000); // Wait 3s for PTY shells to initialize
-    return () => clearTimeout(timer);
+      if (sawTrue && !state.isRestoring && prev.isRestoring && !triggered) {
+        triggered = true;
+        console.warn('[AutoResume] isRestoring → false, triggering');
+        (async () => {
+          try {
+            const autoResume = await ipcRenderer.invoke('app:getState', 'auto_resume_sessions');
+            if (autoResume !== true && autoResume !== 'true') {
+              console.warn('[AutoResume] Disabled in settings');
+              return;
+            }
+            const s = useWorkspaceStore.getState();
+            const tabs: { tabId: string; sessionId: string }[] = [];
+            for (const [, ws] of s.openProjects) {
+              for (const [tabId, tab] of ws.tabs) {
+                if (tab.wasInterrupted && tab.claudeSessionId && !tab.overlayDismissed &&
+                    (tab.commandType === 'claude' || tab.color === 'claude')) {
+                  tabs.push({ tabId, sessionId: tab.claudeSessionId });
+                }
+              }
+            }
+            if (tabs.length === 0) { console.warn('[AutoResume] No interrupted tabs'); return; }
+            console.warn('[AutoResume] Resuming', tabs.length, 'sessions');
+            for (const { tabId, sessionId } of tabs) {
+              s.clearInterruptedState(tabId);
+              s.setTabCommandType(tabId, 'claude');
+              ipcRenderer.send('terminal:input', tabId, 'claude --dangerously-skip-permissions --resume ' + sessionId + '\r');
+              ipcRenderer.send('terminal:force-command-started', { tabId });
+              console.warn('[AutoResume] Resumed', tabId, sessionId.substring(0, 8));
+            }
+          } catch (e: any) {
+            console.warn('[AutoResume] Error:', e?.message || String(e));
+          }
+        })();
+      }
+    });
+    return () => unsub();
   }, []);
 
   // Monitor drag-and-drop for project tabs reordering

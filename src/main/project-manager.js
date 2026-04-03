@@ -103,6 +103,15 @@ class ProjectManager {
     this.db.savePrompts(prompts);
   }
 
+  // Prompt Groups methods
+  getPromptGroups() {
+    return this.db.getPromptGroups();
+  }
+
+  savePromptGroups(groups) {
+    this.db.savePromptGroups(groups);
+  }
+
   // Project lookup by path
   getProject(projectPath) {
     return this.db.getProject(projectPath);
