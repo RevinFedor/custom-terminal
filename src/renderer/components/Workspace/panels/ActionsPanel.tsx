@@ -77,7 +77,8 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
   const isCmdPressed = useCmdKey();
   const [gearHovered, setGearHovered] = useState(false);
   const [gearPanelHovered, setGearPanelHovered] = useState(false);
-  const showGearSettings = (isCmdPressed && gearHovered) || gearPanelHovered;
+  const [gearClicked, setGearClicked] = useState(false);
+  const showGearSettings = (isCmdPressed && gearHovered) || gearPanelHovered || gearClicked;
   const { apiSettings, setApiClaudeModel, setApiClaudeThinking, setApiGeminiModel, setApiGeminiThinking } = useUIStore();
 
   const selectedTabs = activeProjectId ? getSelectedTabs(activeProjectId) : [];
@@ -1201,13 +1202,12 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
               className="cursor-pointer select-none"
               style={{ fontSize: '10px', color: (isCmdPressed || showGearSettings) ? '#999' : '#555', transition: 'color 0.15s' }}
               onMouseEnter={() => setGearHovered(true)}
-              onMouseLeave={(e) => {
-                const rect = e.currentTarget.getBoundingClientRect();
-                if (e.clientX >= rect.left) {
-                  setGearHovered(false);
-                }
+              onMouseLeave={() => setGearHovered(false)}
+              onClick={(e) => {
+                e.stopPropagation();
+                setGearClicked(prev => !prev);
               }}
-              title="API Settings (⌘+наведение)"
+              title="API Settings (клик или ⌘+наведение)"
             >
               &#9881;
             </span>
@@ -1884,7 +1884,7 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
             zIndex: 10000,
           }}
           onMouseEnter={() => setGearPanelHovered(true)}
-          onMouseLeave={() => { setGearPanelHovered(false); setGearHovered(false); }}
+          onMouseLeave={() => { setGearPanelHovered(false); setGearHovered(false); setGearClicked(false); }}
         >
           <div style={{
             backgroundColor: 'rgba(26, 26, 26, 0.98)',
