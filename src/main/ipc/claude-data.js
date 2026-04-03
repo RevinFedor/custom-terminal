@@ -1026,6 +1026,14 @@ function register({ projectManager, formatToolAction }) {
 
       console.log('[EditRange] Written', outputLines.length, 'records. Removed:', removeUuids.size,
         `(${removedUsers} user, ${removedAssistants} assistant, ${removedOther} other)`);
+
+      // Save rewind marker to DB — pink dot on Timeline
+      try {
+        projectManager.db.saveRewindMarker(compactUuid, sessionId);
+      } catch (e) {
+        console.error('[EditRange] Failed to save rewind marker:', e.message);
+      }
+
       return { success: true, removedCount: removeUuids.size, removedUsers, removedAssistants, compactUuid, fileSessionId };
 
     } catch (error) {
@@ -2190,6 +2198,19 @@ function register({ projectManager, formatToolAction }) {
       return { success: true };
     } catch (error) {
       console.error('[TimelineNotes] delete-note error:', error);
+      return { success: false, error: error.message };
+    }
+  });
+
+  // ========== REWIND MARKERS ==========
+
+  ipcMain.handle('timeline:get-rewind-markers', async (event, { sessionId }) => {
+    try {
+      const db = projectManager.db;
+      const rows = db.getRewindMarkers(sessionId);
+      return { success: true, markers: rows.map(r => r.entry_uuid) };
+    } catch (error) {
+      console.error('[RewindMarkers] get error:', error);
       return { success: false, error: error.message };
     }
   });

@@ -43,7 +43,7 @@ const isDev = !app.isPackaged;
     : path.join(app.getPath('logs'));
   try { fs.mkdirSync(LOG_DIR, { recursive: true }); } catch {}
   const LOG_PATH = path.join(LOG_DIR, isDev ? 'dev.log' : 'production.log');
-  const MAX_SIZE = 5 * 1024 * 1024; // 5MB — rotate
+  // No size limit — logs can grow large during active sessions. Rotate only by age (7 days).
   const TAG_RE = /^\[/; // Only log messages starting with [Tag]
 
   let _lastLine = '';
@@ -52,12 +52,13 @@ const isDev = !app.isPackaged;
 
   function initLogStream() {
     try {
-      // Clear if too large OR older than 7 days
+      // Rotate only if older than 7 days — no size limit
       if (fs.existsSync(LOG_PATH)) {
         const stat = fs.statSync(LOG_PATH);
         const ageDays = (Date.now() - stat.mtimeMs) / (1000 * 60 * 60 * 24);
-        if (stat.size > MAX_SIZE || ageDays > 7) {
-          try { fs.unlinkSync(LOG_PATH); } catch {}
+        if (ageDays > 7) {
+          const oldPath = LOG_PATH + '.old';
+          try { fs.renameSync(LOG_PATH, oldPath); } catch {}
         }
       }
       _logStream = fs.createWriteStream(LOG_PATH, { flags: 'a' });

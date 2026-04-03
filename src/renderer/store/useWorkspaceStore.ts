@@ -309,52 +309,100 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     }
 
     try {
-      const { openProject } = get();
+      const { openProjects, createTab } = get();
 
       set({ isRestoring: true });
 
-      // Restore all open projects
+      // Load ALL projects and their tabs WITHOUT calling set() per project.
+      // Old approach: openProject() in a loop → each call does set({openProjects: new Map()})
+      // → 5 projects = 5 set() calls = 5 Workspace remounts = black screen flicker.
+      // New approach: load data inline, mutate openProjects map directly, single set() at end.
       for (const proj of sessionState.openProjects) {
-        await openProject(proj.projectId, proj.projectPath);
+        if (openProjects.has(proj.projectId)) continue;
 
-        // Set active tab by index
-        const workspace = get().openProjects.get(proj.projectId);
-        if (workspace && proj.activeTabIndex >= 0) {
-          const tabsArray = Array.from(workspace.tabs.keys());
+        const projectData = await ipcRenderer.invoke('project:getById', proj.projectId);
+        const savedTabs = projectData?.tabs || [];
+
+        const newWorkspace: ProjectWorkspace = {
+          projectId: proj.projectId,
+          projectPath: proj.projectPath,
+          tabs: new Map(),
+          activeTabId: null,
+          selectedTabIds: [],
+          tabHistory: [],
+          tabCounter: 0,
+          sidebarOpen: projectData?.sidebarOpen || false,
+          openFilePath: projectData?.openFilePath || null,
+          currentView: 'terminal',
+          viewingSubAgentTabId: null
+        };
+        openProjects.set(proj.projectId, newWorkspace);
+
+        if (savedTabs.length > 0) {
+          let maxTabNum = savedTabs.length;
+          for (const st of savedTabs) {
+            if (st.tabId) {
+              const m = st.tabId.match(/-tab-(\d+)$/);
+              if (m) maxTabNum = Math.max(maxTabNum, parseInt(m[1]) + 1);
+            }
+          }
+          newWorkspace.tabCounter = maxTabNum;
+          for (const savedTab of savedTabs) {
+            await createTab(proj.projectId, savedTab.name, savedTab.cwd, {
+              color: savedTab.color,
+              isUtility: savedTab.isUtility,
+              commandType: savedTab.commandType,
+              claudeSessionId: savedTab.claudeSessionId,
+              geminiSessionId: savedTab.geminiSessionId,
+              wasInterrupted: savedTab.wasInterrupted,
+              overlayDismissed: savedTab.overlayDismissed,
+              notes: savedTab.notes,
+              tabType: savedTab.tabType,
+              url: savedTab.url,
+              createdAt: savedTab.createdAt,
+              isCollapsed: savedTab.isCollapsed,
+              nameSetManually: savedTab.nameSetManually,
+              parentTabId: savedTab.parentTabId,
+              mcpTaskId: savedTab.mcpTaskId,
+              claudeTaskCount: savedTab.claudeTaskCount || 0,
+              restoreId: savedTab.tabId
+            } as any);
+          }
+          for (const [, tab] of newWorkspace.tabs) {
+            if (tab.parentTabId) {
+              tab.claudeAgentStatus = 'done';
+              tab.claudeActive = false;
+            }
+          }
+        } else {
+          await createTab(proj.projectId, 'Terminal 1', proj.projectPath);
+        }
+
+        // Set active tab by saved index
+        if (proj.activeTabIndex >= 0) {
+          const tabsArray = Array.from(newWorkspace.tabs.keys());
           if (tabsArray[proj.activeTabIndex]) {
-            workspace.activeTabId = tabsArray[proj.activeTabIndex];
+            newWorkspace.activeTabId = tabsArray[proj.activeTabIndex];
           }
         }
       }
 
-      // Set active project and view (also trigger re-render with updated openProjects to reflect activeTabId changes)
+      // SINGLE set() for all projects — one Workspace mount instead of N
       const savedView = sessionState.view || 'dashboard';
-      const currentOpenProjects = get().openProjects;
       const restoredHistory = sessionState.projectHistory || [];
-
-      // Restore activeProjectId if the project is still open (works for both workspace and dashboard views)
-      const restoredActiveId = sessionState.activeProjectId && currentOpenProjects.has(sessionState.activeProjectId)
+      const restoredActiveId = sessionState.activeProjectId && openProjects.has(sessionState.activeProjectId)
         ? sessionState.activeProjectId
         : null;
 
-      if (savedView === 'workspace' && restoredActiveId) {
-        set({
-          activeProjectId: restoredActiveId,
-          view: 'workspace',
-          isRestoring: false,
-          openProjects: new Map(currentOpenProjects),
-          projectHistory: restoredHistory
-        });
-      } else {
-        // Stay on dashboard — keep activeProjectId so Workspace stays ready (terminals preserved)
-        set({
-          view: 'dashboard',
-          activeProjectId: restoredActiveId,
-          isRestoring: false,
-          openProjects: new Map(currentOpenProjects),
-          projectHistory: restoredHistory
-        });
-      }
+      set({
+        activeProjectId: restoredActiveId,
+        view: savedView === 'workspace' && restoredActiveId ? 'workspace' : 'dashboard',
+        isRestoring: false,
+        openProjects: new Map(openProjects),
+        projectHistory: restoredHistory
+      });
+
+      get().saveSession();
     } catch (e) {
       console.error('[Session] Failed to restore:', e);
       set({ isRestoring: false });

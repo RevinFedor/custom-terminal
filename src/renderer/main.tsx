@@ -2,6 +2,7 @@ import React from 'react';
 import ReactDOM from 'react-dom/client';
 import App from './App';
 import './styles/globals.css';
+import('react-grab').catch(() => {});
 
 // === TAG-BASED CONSOLE FILTER ===
 const _origLog = console.log.bind(console);

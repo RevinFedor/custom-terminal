@@ -277,6 +277,12 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     range: { startIndex: number; endIndex: number };
     startUuid: string; endUuid: string;
   } | null>(null);
+  const [postPromptMode, setPostPromptMode] = useState(false);
+  const [postPromptText, setPostPromptText] = useState('');
+  const postPromptRef = useRef<HTMLTextAreaElement>(null);
+  const [rewindPostPromptMode, setRewindPostPromptMode] = useState(false);
+  const [rewindPostPromptText, setRewindPostPromptText] = useState('');
+  const rewindPostPromptRef = useRef<HTMLTextAreaElement>(null);
 
   // Phase 2: Collapsible groups
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
@@ -321,6 +327,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   // Timeline notes state
   const [notes, setNotes] = useState<Record<string, string>>({});
   const [notePositions, setNotePositions] = useState<Record<string, 'dot' | 'before' | 'after'>>({});
+  const [rewindMarkers, setRewindMarkers] = useState<Set<string>>(new Set());
   const [activeNoteIndex, setActiveNoteIndex] = useState<number | null>(null);
   const [isNoteEditing, setIsNoteEditing] = useState(false);
   const [noteEditText, setNoteEditText] = useState('');
@@ -538,6 +545,11 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         setNotes(notesResult.notes || {});
         setNotePositions(notesResult.positions || {});
       }
+      // Load rewind markers (pink dots)
+      const markersResult = await ipcRenderer.invoke('timeline:get-rewind-markers', { sessionId });
+      if (markersResult.success && markersResult.markers?.length) {
+        setRewindMarkers(new Set(markersResult.markers));
+      }
     } catch (error) {
       console.error('[Timeline] Error loading timeline:', error);
     } finally {
@@ -603,6 +615,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         setClickedState(null);
         setActiveTooltipIndex(null);
         setHoveredIndex(null);
+        setPostPromptMode(false);
+        setRewindPostPromptMode(false);
         setUnreachableIndices(new Set());
         setVisibleEntryIndices(new Set());
         setResponseOnlyIndices(new Set());
@@ -1263,9 +1277,9 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   // Guard: checks sessionId hasn't changed after fetch (prevents cross-tab state write).
   // expectedSessionId is REQUIRED — prevents cross-tab state writes when abort fails.
   // Uses sessionIdRef.current (always fresh) instead of sessionId closure (stale after tab switch).
-  const fetchEditRangeCompact = async (range: { startIndex: number; endIndex: number }, sourceContent: string, expectedSessionId: string) => {
+  const fetchEditRangeCompact = async (range: { startIndex: number; endIndex: number }, sourceContent: string, expectedSessionId: string, additionalPrompt?: string) => {
     const currentSid = sessionIdRef.current;
-    console.warn('[EditRange:Fetch] START range=[' + range.startIndex + ',' + range.endIndex + '] sourceLen=' + sourceContent.length + ' expected=' + expectedSessionId.substring(0, 8) + ' currentRef=' + (currentSid?.substring(0, 8) || 'null'));
+    console.warn('[EditRange:Fetch] START range=[' + range.startIndex + ',' + range.endIndex + '] sourceLen=' + sourceContent.length + ' expected=' + expectedSessionId.substring(0, 8) + ' currentRef=' + (currentSid?.substring(0, 8) || 'null') + (additionalPrompt ? ' +postPrompt=' + additionalPrompt.length : ''));
     const { getPromptById, rewindPromptId } = usePromptsStore.getState();
     const promptConfig = getPromptById(rewindPromptId);
     if (!promptConfig) {
@@ -1276,7 +1290,11 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     console.warn('[EditRange:Fetch] Prompt found: model=' + promptConfig.model + ' contentLen=' + promptConfig.content?.length);
     const apiKey = process.env.GEMINI_API_KEY || 'REDACTED_GEMINI_KEY';
     const model = promptConfig.model;
-    const fullPrompt = promptConfig.content + sourceContent;
+    // If additionalPrompt provided, prepend it as higher-priority instruction
+    const promptPrefix = additionalPrompt
+      ? `ПРИОРИТЕТНАЯ ИНСТРУКЦИЯ (выполнить в первую очередь):\n${additionalPrompt}\n\n---\nОСНОВНОЙ ПРОМПТ:\n`
+      : '';
+    const fullPrompt = promptPrefix + promptConfig.content + sourceContent;
     const requestBody: any = { contents: [{ parts: [{ text: fullPrompt }] }] };
     if (model.includes('gemini-3') && promptConfig.thinkingLevel !== 'NONE') {
       requestBody.generationConfig = { thinkingConfig: { thinkingLevel: promptConfig.thinkingLevel } };
@@ -1351,13 +1369,14 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     }
   };
 
-  const executeRangeAction = async (mode: 'copy' | 'edit', range: { startIndex: number; endIndex: number }, startUuid: string, endUuid: string) => {
+  const executeRangeAction = async (mode: 'copy' | 'edit', range: { startIndex: number; endIndex: number }, startUuid: string, endUuid: string, additionalPrompt?: string) => {
     if (!sessionId) return;
 
     // Clear selection
     selectionStartIdRef.current = null;
     setSelectionStartId(null);
     setRangeActionMenu(null);
+    setPostPromptMode(false);
 
     if (mode === 'edit') {
       // Check: range must not cross plan mode boundaries or contain compact entries
@@ -1396,7 +1415,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         const sourceContent = result.content;
         // Update state with sourceContent so tab-switch save has the data for re-fetch
         setEditRangeState({ range, phase: 'loading', sourceContent, compactText: '' });
-        await fetchEditRangeCompact(range, sourceContent, sessionId);
+        await fetchEditRangeCompact(range, sourceContent, sessionId, additionalPrompt);
       } catch (err: any) {
         console.error('[EditRange] Failed to get source content:', err);
         setEditRangeState(null);
@@ -1476,8 +1495,9 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     return () => window.removeEventListener('click', handleClickOutside);
   }, [isExpanded, isNoteEditing]);
 
-  const handleRewind = async (entry: TimelineEntry) => {
+  const handleRewind = async (entry: TimelineEntry, additionalPrompt?: string) => {
     setContextMenu(null);
+    setRewindPostPromptMode(false);
     if (!sessionId) return;
 
     const entryIndex = entries.findIndex(e => e.uuid === entry.uuid);
@@ -1543,7 +1563,10 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         if (promptConfig) {
           const apiKey = (typeof process !== 'undefined' && process.env?.GEMINI_API_KEY) || 'REDACTED_GEMINI_KEY';
           const model = promptConfig.model;
-          const fullPrompt = promptConfig.content + rangeResult.content;
+          const promptPrefix = additionalPrompt
+            ? `ПРИОРИТЕТНАЯ ИНСТРУКЦИЯ (выполнить в первую очередь):\n${additionalPrompt}\n\n---\nОСНОВНОЙ ПРОМПТ:\n`
+            : '';
+          const fullPrompt = promptPrefix + promptConfig.content + rangeResult.content;
 
           const requestBody: any = {
             contents: [{ parts: [{ text: fullPrompt }] }],
@@ -2002,6 +2025,11 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
               dotColor = isHovered ? '#c084fc' : '#9333ea';
               dotGlow = isHovered ? '0 0 10px rgba(168, 85, 247, 0.5)' : '0 0 6px rgba(168, 85, 247, 0.25)';
             }
+            // Rewind marker: override color to pink
+            if (rewindMarkers.has(entry.uuid)) {
+              dotColor = isHovered ? '#f472b6' : '#ec4899';
+              dotGlow = isHovered ? '0 0 10px rgba(236, 72, 153, 0.5)' : '0 0 6px rgba(236, 72, 153, 0.25)';
+            }
 
             return (
               <React.Fragment key={entry.uuid}>
@@ -2125,7 +2153,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                       height: dotHeight,
                       borderRadius: dotRadius,
                       backgroundColor: isUnreachable && !isHovered && !isCompacted ? 'transparent' : dotColor,
-                      border: isUnreachable && !isHovered && !isCompacted ? `1px solid ${hasNote && notePos === 'dot' ? '#9333ea' : '#666'}` : 'none',
+                      border: isUnreachable && !isHovered && !isCompacted ? `1px solid ${rewindMarkers.has(entry.uuid) ? '#ec4899' : hasNote && notePos === 'dot' ? '#9333ea' : '#666'}` : 'none',
                       boxShadow: dotGlow,
                       boxSizing: 'border-box',
                       transition: 'width 0.15s, height 0.15s, border-radius 0.15s, background-color 0.2s, box-shadow 0.2s',
@@ -2911,16 +2939,85 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                   </button>
                   {/* Rewind — Claude & Gemini */}
                   <div className="border-t border-white/10 my-1" />
-                  <button
-                    className={`w-full text-left px-3 py-2 text-xs rounded transition-colors ${isActive && !rewindState ? 'text-amber-400 hover:bg-amber-600/20 cursor-pointer' : 'text-white/20 cursor-not-allowed'}`}
-                    disabled={!isActive || !!rewindState}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      if (isActive && !rewindState) handleRewind(contextMenu.entry);
-                    }}
-                  >
-                    {rewindState ? (rewindState.phase === 'compacting' ? 'Компакт...' : rewindState.phase === 'rewinding' ? 'Откат...' : 'Вставка...') : 'Откатиться'}
-                  </button>
+                  {!rewindPostPromptMode ? (
+                    <div className="flex rounded overflow-hidden">
+                      <button
+                        className={`flex-1 text-left px-3 py-2 text-xs rounded-l transition-colors ${isActive && !rewindState ? 'text-amber-400 hover:bg-amber-600/20 cursor-pointer' : 'text-white/20 cursor-not-allowed'}`}
+                        disabled={!isActive || !!rewindState}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          if (isActive && !rewindState) handleRewind(contextMenu.entry);
+                        }}
+                      >
+                        {rewindState ? (rewindState.phase === 'compacting' ? 'Компакт...' : rewindState.phase === 'rewinding' ? 'Откат...' : 'Вставка...') : 'Откатиться'}
+                      </button>
+                      {isActive && !rewindState && (
+                        <button
+                          className="px-2 py-2 text-xs text-amber-400/60 hover:bg-amber-600/30 hover:text-amber-300 transition-colors cursor-pointer border-l border-white/10"
+                          title="Откатиться с инструкцией"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setRewindPostPromptMode(true);
+                            setRewindPostPromptText('');
+                            setTimeout(() => rewindPostPromptRef.current?.focus(), 50);
+                          }}
+                        >
+                          ▶
+                        </button>
+                      )}
+                    </div>
+                  ) : (
+                    <div className="p-1">
+                      <textarea
+                        ref={rewindPostPromptRef}
+                        value={rewindPostPromptText}
+                        onChange={(e) => setRewindPostPromptText(e.target.value)}
+                        placeholder="Инструкция для Gemini при откате..."
+                        className="w-full bg-[#252525] border border-[#444] rounded px-2 py-1.5 text-[11px] text-white/90 font-mono resize-none focus:outline-none focus:border-amber-500/50 placeholder:text-[#555]"
+                        style={{ minHeight: '28px', maxHeight: '110px', lineHeight: '1.4' }}
+                        rows={1}
+                        onInput={(e) => {
+                          const el = e.currentTarget;
+                          el.style.height = 'auto';
+                          el.style.height = Math.min(el.scrollHeight, 110) + 'px';
+                        }}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter' && e.metaKey && rewindPostPromptText.trim()) {
+                            e.preventDefault();
+                            const prompt = rewindPostPromptText.trim();
+                            setRewindPostPromptMode(false);
+                            setRewindPostPromptText('');
+                            handleRewind(contextMenu.entry, prompt);
+                          } else if (e.key === 'Escape') {
+                            e.preventDefault();
+                            setRewindPostPromptMode(false);
+                            setRewindPostPromptText('');
+                          }
+                        }}
+                      />
+                      <div className="flex items-center justify-between mt-1">
+                        <span className="text-[9px] text-[#555]">⌘+Enter • Esc отмена</span>
+                        <button
+                          className="p-1 rounded transition-colors cursor-pointer"
+                          style={{
+                            color: rewindPostPromptText.trim() ? '#f59e0b' : '#555',
+                            backgroundColor: rewindPostPromptText.trim() ? 'rgba(245, 158, 11, 0.1)' : 'transparent',
+                          }}
+                          disabled={!rewindPostPromptText.trim()}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            if (!rewindPostPromptText.trim()) return;
+                            const prompt = rewindPostPromptText.trim();
+                            setRewindPostPromptMode(false);
+                            setRewindPostPromptText('');
+                            handleRewind(contextMenu.entry, prompt);
+                          }}
+                        >
+                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+                        </button>
+                      </div>
+                    </div>
+                  )}
                 </>
               ) : (
                 <button
@@ -2945,9 +3042,11 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
           <TooltipPortal>
             <div
               onMouseLeave={() => {
-                setRangeActionMenu(null);
-                selectionStartIdRef.current = null;
-                setSelectionStartId(null);
+                if (!postPromptMode) {
+                  setRangeActionMenu(null);
+                  selectionStartIdRef.current = null;
+                  setSelectionStartId(null);
+                }
               }}
               onClick={(e) => e.stopPropagation()}
               style={{
@@ -2955,55 +3054,103 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                 left: rangeActionMenu.x,
                 top: rangeActionMenu.y,
                 backgroundColor: '#1a1a1a',
-                border: '1px solid #333',
+                border: `1px solid ${postPromptMode ? '#ec4899' : '#333'}`,
                 borderRadius: '6px',
                 padding: '4px',
                 zIndex: 10001,
-                minWidth: '170px',
-                boxShadow: '0 4px 16px rgba(0,0,0,0.6)',
+                minWidth: postPromptMode ? '320px' : '170px',
+                maxWidth: postPromptMode ? '400px' : undefined,
+                boxShadow: postPromptMode ? '0 4px 20px rgba(236, 72, 153, 0.15)' : '0 4px 16px rgba(0,0,0,0.6)',
+                transition: 'min-width 0.15s, border-color 0.15s, box-shadow 0.15s',
               }}
             >
-              <button
-                className="w-full text-left px-3 py-2 text-xs text-white hover:bg-blue-600/80 rounded transition-colors cursor-pointer"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  executeRangeAction('copy', rangeActionMenu.range, rangeActionMenu.startUuid, rangeActionMenu.endUuid);
-                }}
-              >
-                Копировать ({rangeActionMenu.range.endIndex - rangeActionMenu.range.startIndex + 1})
-              </button>
-              {!isGemini && (
-                <div className="flex rounded overflow-hidden">
+              {!postPromptMode ? (
+                <>
                   <button
-                    className="flex-1 text-left px-3 py-2 text-xs text-pink-400 hover:bg-pink-600/20 transition-colors cursor-pointer"
+                    className="w-full text-left px-3 py-2 text-xs text-white hover:bg-blue-600/80 rounded transition-colors cursor-pointer"
                     onClick={(e) => {
                       e.stopPropagation();
-                      executeRangeAction('edit', rangeActionMenu.range, rangeActionMenu.startUuid, rangeActionMenu.endUuid);
+                      executeRangeAction('copy', rangeActionMenu.range, rangeActionMenu.startUuid, rangeActionMenu.endUuid);
                     }}
                   >
-                    Редактировать
+                    Копировать ({rangeActionMenu.range.endIndex - rangeActionMenu.range.startIndex + 1})
                   </button>
-                  <button
-                    className="px-2 py-2 text-xs text-pink-400/60 hover:bg-pink-600/30 hover:text-pink-300 transition-colors cursor-pointer border-l border-white/10"
-                    title="Открыть панель (тест)"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      e.preventDefault();
-                      // Instant open with stub content — skip Gemini API
-                      const { range, startUuid, endUuid } = rangeActionMenu;
-                      selectionStartIdRef.current = null;
-                      setSelectionStartId(null);
-                      setRangeActionMenu(null);
-                      setEditRangeState({
-                        range,
-                        phase: 'ready',
-                        sourceContent: `[Test source — ${range.endIndex - range.startIndex + 1} entries from ${startUuid.slice(0,8)} to ${endUuid.slice(0,8)}]`,
-                        compactText: '## Тестовая сводка\n\n1. Пункт один\n2. Пункт два\n3. Пункт три\n\nФайлы: `src/main.js`, `src/renderer/App.tsx`\n\nСтатус: всё работает.',
-                      });
+                  {!isGemini && (
+                    <div className="flex rounded overflow-hidden">
+                      <button
+                        className="flex-1 text-left px-3 py-2 text-xs text-pink-400 hover:bg-pink-600/20 transition-colors cursor-pointer"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          executeRangeAction('edit', rangeActionMenu.range, rangeActionMenu.startUuid, rangeActionMenu.endUuid);
+                        }}
+                      >
+                        Редактировать
+                      </button>
+                      <button
+                        className="px-2 py-2 text-xs text-pink-400/60 hover:bg-pink-600/30 hover:text-pink-300 transition-colors cursor-pointer border-l border-white/10"
+                        title="Добавить инструкцию к промпту"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setPostPromptMode(true);
+                          setPostPromptText('');
+                          setTimeout(() => postPromptRef.current?.focus(), 50);
+                        }}
+                      >
+                        ▶
+                      </button>
+                    </div>
+                  )}
+                </>
+              ) : (
+                <div className="p-1">
+                  <textarea
+                    ref={postPromptRef}
+                    value={postPromptText}
+                    onChange={(e) => setPostPromptText(e.target.value)}
+                    placeholder="Дополнительная инструкция для Gemini..."
+                    className="w-full bg-[#252525] border border-[#444] rounded px-2 py-1.5 text-[11px] text-white/90 font-mono resize-none focus:outline-none focus:border-pink-500/50 placeholder:text-[#555]"
+                    style={{ minHeight: '28px', maxHeight: '110px', lineHeight: '1.4' }}
+                    rows={1}
+                    onInput={(e) => {
+                      const el = e.currentTarget;
+                      el.style.height = 'auto';
+                      el.style.height = Math.min(el.scrollHeight, 110) + 'px';
                     }}
-                  >
-                    ▶
-                  </button>
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' && e.metaKey && postPromptText.trim()) {
+                        e.preventDefault();
+                        const prompt = postPromptText.trim();
+                        setPostPromptMode(false);
+                        setPostPromptText('');
+                        executeRangeAction('edit', rangeActionMenu.range, rangeActionMenu.startUuid, rangeActionMenu.endUuid, prompt);
+                      } else if (e.key === 'Escape') {
+                        e.preventDefault();
+                        setPostPromptMode(false);
+                        setPostPromptText('');
+                      }
+                    }}
+                  />
+                  <div className="flex items-center justify-between mt-1">
+                    <span className="text-[9px] text-[#555]">⌘+Enter • Esc отмена</span>
+                    <button
+                      className="p-1 rounded transition-colors cursor-pointer"
+                      style={{
+                        color: postPromptText.trim() ? '#ec4899' : '#555',
+                        backgroundColor: postPromptText.trim() ? 'rgba(236, 72, 153, 0.1)' : 'transparent',
+                      }}
+                      disabled={!postPromptText.trim()}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if (!postPromptText.trim()) return;
+                        const prompt = postPromptText.trim();
+                        setPostPromptMode(false);
+                        setPostPromptText('');
+                        executeRangeAction('edit', rangeActionMenu.range, rangeActionMenu.startUuid, rangeActionMenu.endUuid, prompt);
+                      }}
+                    >
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+                    </button>
+                  </div>
                 </div>
               )}
             </div>

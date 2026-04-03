@@ -351,6 +351,17 @@ class DatabaseManager {
       )
     `);
 
+    // Rewind markers — pink dots on Timeline for edit-range compact entries
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS timeline_rewind_markers (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        entry_uuid TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        created_at INTEGER DEFAULT (strftime('%s', 'now')),
+        UNIQUE(entry_uuid, session_id)
+      )
+    `);
+
   }
 
   // ========== APP STATE ==========
@@ -1093,6 +1104,18 @@ class DatabaseManager {
 
   deleteTimelineNote(entryUuid, sessionId) {
     this.db.prepare('DELETE FROM timeline_notes WHERE entry_uuid = ? AND session_id = ?').run(entryUuid, sessionId);
+  }
+
+  // Rewind markers
+  getRewindMarkers(sessionId) {
+    return this.db.prepare('SELECT entry_uuid FROM timeline_rewind_markers WHERE session_id = ?').all(sessionId);
+  }
+
+  saveRewindMarker(entryUuid, sessionId) {
+    this.db.prepare(`
+      INSERT OR IGNORE INTO timeline_rewind_markers (entry_uuid, session_id)
+      VALUES (?, ?)
+    `).run(entryUuid, sessionId);
   }
 
   close() { this.db.close(); }
