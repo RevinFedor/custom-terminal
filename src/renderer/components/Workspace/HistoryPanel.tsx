@@ -48,15 +48,18 @@ interface HistoryPanelProps {
   toolType?: 'claude' | 'gemini';
 }
 
-// Thinking block — collapsible
+// Thinking block — blue collapsible, collapsed by default
 const ThinkingBlock = memo(({ text }: { text: string }) => {
   const [open, setOpen] = useState(false);
   return (
     <div
       style={{
-        marginTop: 6,
-        borderLeft: '2px solid #444',
+        marginTop: 8,
+        borderLeft: '3px solid #60a5fa',
         paddingLeft: 8,
+        backgroundColor: 'rgba(96, 165, 250, 0.06)',
+        borderRadius: '0 4px 4px 0',
+        padding: '4px 8px 4px 8px',
       }}
     >
       <button
@@ -64,21 +67,25 @@ const ThinkingBlock = memo(({ text }: { text: string }) => {
         style={{
           background: 'none',
           border: 'none',
-          color: '#777',
+          color: '#60a5fa',
           cursor: 'pointer',
           fontSize: 11,
           display: 'flex',
           alignItems: 'center',
           gap: 4,
           padding: 0,
+          fontWeight: 500,
         }}
       >
         {open ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
-        thinking
+        Thinking
       </button>
       {open && (
-        <div style={{ fontSize: 12, color: '#888', fontStyle: 'italic', marginTop: 4, whiteSpace: 'pre-wrap' }}>
-          {text}
+        <div style={{
+          fontSize: 12, color: '#b0c4de', marginTop: 6, whiteSpace: 'pre-wrap',
+          lineHeight: 1.5, maxHeight: 400, overflowY: 'auto',
+        }}>
+          <MarkdownRenderer content={text} />
         </div>
       )}
     </div>
@@ -317,6 +324,11 @@ const HistoryEntry = memo(({ entry, toolType }: { entry: FullHistoryEntry; toolT
               {new Date(entry.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
             </span>
           )}
+          {entry.uuid && (
+            <span style={{ marginLeft: 8, opacity: 0.5, fontFamily: 'monospace', fontSize: 9 }}>
+              {entry.uuid.slice(0, 8)}
+            </span>
+          )}
         </div>
         <div style={{ fontSize: 13, color: '#e0e0e0', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
           {entry.content}
@@ -335,15 +347,20 @@ const HistoryEntry = memo(({ entry, toolType }: { entry: FullHistoryEntry; toolT
             {new Date(entry.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
           </span>
         )}
+        {entry.uuid && (
+          <span style={{ marginLeft: 8, opacity: 0.5, fontFamily: 'monospace', fontSize: 9 }}>
+            {entry.uuid.slice(0, 8)}
+          </span>
+        )}
       </div>
+
+      {entry.thinking && <ThinkingBlock text={entry.thinking} />}
 
       {entry.content && (
         <div style={{ fontSize: 13 }}>
           <MarkdownRenderer content={entry.content} />
         </div>
       )}
-
-      {entry.thinking && <ThinkingBlock text={entry.thinking} />}
 
       {entry.actions && entry.actions.length > 0 && (() => {
         const editWriteActions: FileAction[] = [];

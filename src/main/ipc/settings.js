@@ -91,6 +91,7 @@ function register({ projectManager }) {
 
   ipcMain.handle('ai-prompts:save', async (event, prompt) => {
     try {
+      console.log('[AIPrompts] Saving:', prompt.id, 'thinkingLevel=' + prompt.thinkingLevel, 'model=' + prompt.model);
       projectManager.saveAIPrompt(prompt);
       return { success: true };
     } catch (error) {

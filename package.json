@@ -8,7 +8,7 @@
     "dev:d": "cd design-lab && npm run dev",
     "build:editor": "cd ../gt-editor/packages/markdown-editor && npm run build",
     "build": "npm run build:editor && electron-vite build && electron-builder",
-    "build:install": "pkill -f 'Noted Terminal' || true && npm run build:editor && electron-vite build && electron-builder && rm -rf /Applications/Noted\\ Terminal.app && cp -R release/mac-arm64/Noted\\ Terminal.app /Applications/ && open /Applications/Noted\\ Terminal.app",
+    "build:install": "pkill -f 'Noted Terminal' || true && npm run build:editor && electron-vite build && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder && rm -rf /Applications/Noted\\ Terminal.app && cp -R release/mac-arm64/Noted\\ Terminal.app /Applications/ && open /Applications/Noted\\ Terminal.app",
     "build:i": "npm run build:install",
     "_rebuild": "electron-rebuild -f -w node-pty",
     "_test:e2e": "cd runtime-tests && npx playwright test",

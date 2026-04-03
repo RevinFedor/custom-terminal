@@ -44,6 +44,7 @@ interface ProjectTabItemProps {
   forceRightIndicator?: boolean;
   activeProcessCount?: number; // Count of running processes in project
   interruptedCount?: number; // Count of interrupted (paused) sessions in project
+  isProjectBusy?: boolean; // Any tab in project has Claude/Gemini thinking
   isEditing: boolean;
   editValue: string;
   onEditChange: (val: string) => void;
@@ -55,6 +56,7 @@ interface ProjectTabItemProps {
   onDoubleClick: () => void;
   onTabDrop?: (tabId: string, sourceProjectId: string, selectedTabIds?: string[]) => void; // For dropping terminal tabs
   isAreaActive?: boolean;
+  isProjectLoading?: boolean; // API request in progress (Update API, Research, etc.)
 }
 
 const ProjectTabItem = memo(({
@@ -76,7 +78,9 @@ const ProjectTabItem = memo(({
   onMiddleClick,
   onDoubleClick,
   onTabDrop,
-  isAreaActive
+  isAreaActive,
+  isProjectBusy = false,
+  isProjectLoading = false
 }: ProjectTabItemProps) => {
   const ref = useRef<HTMLButtonElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -214,15 +218,26 @@ const ProjectTabItem = memo(({
         )}
         {activeProcessCount > 0 && !isEditing && (
           <span
-            className="flex items-center justify-center text-[10px] font-medium rounded-full"
+            className="relative flex items-center justify-center text-[10px] font-medium rounded-full"
             style={{
               minWidth: '16px',
               height: '16px',
               padding: '0 4px',
               backgroundColor: isActive ? 'rgba(74, 222, 128, 0.3)' : 'rgba(74, 222, 128, 0.2)',
               color: isActive ? '#166534' : '#4ade80',
+              boxSizing: 'border-box',
             }}
           >
+            {(isProjectBusy || isProjectLoading) && (
+              <span
+                className="absolute inset-0 rounded-full"
+                style={{
+                  border: '1.5px solid rgba(74, 222, 128, 0.15)',
+                  borderTopColor: '#4ade80',
+                  animation: 'tab-dot-spin 0.8s linear infinite',
+                }}
+              />
+            )}
             {activeProcessCount}
           </span>
         )}
@@ -346,6 +361,23 @@ function App() {
   const [projectContextMenu, setProjectContextMenu] = useState<{ projectId: string; x: number; y: number } | null>(null);
   const [projectEmptyZoneHovered, setProjectEmptyZoneHovered] = useState(false);
   const [processStatus, setProcessStatus] = useState<Map<string, boolean>>(new Map()); // tabId -> isRunning
+  const [busyTabs, setBusyTabs] = useState<Map<string, boolean>>(new Map()); // tabId -> isBusy (Claude/Gemini thinking)
+  const [apiLoadingProjects, setApiLoadingProjects] = useState<Set<string>>(new Set()); // projectIds with active API requests
+
+  // Listen for project API loading events from ActionsPanel
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const { projectId, loading } = (e as CustomEvent).detail;
+      setApiLoadingProjects(prev => {
+        const next = new Set(prev);
+        if (loading) next.add(projectId);
+        else next.delete(projectId);
+        return next;
+      });
+    };
+    window.addEventListener('project:api-loading', handler);
+    return () => window.removeEventListener('project:api-loading', handler);
+  }, []);
 
   // Drag area resize
   const isResizingDragArea = useRef(false);
@@ -721,10 +753,11 @@ function App() {
       state.setClaudeActive(data.tabId, data.active);
     };
 
-    // Claude CLI spinner busy/idle → track on sub-agent tab
+    // Claude CLI spinner busy/idle → track on sub-agent tab + project badge
     const handleClaudeBusyState = (_: any, data: { tabId: string; busy: boolean }) => {
       const state = useWorkspaceStore.getState();
       state.setClaudeBusy(data.tabId, data.busy);
+      setBusyTabs(prev => { const n = new Map(prev); if (data.busy) n.set(data.tabId, true); else n.delete(data.tabId); return n; });
     };
 
     // Interceptor state (armed/disarmed) for sub-agent response delivery
@@ -775,6 +808,12 @@ function App() {
     ipcRenderer.on('mcp:respawn-sub-agent-pty', handleRespawnSubAgentPty);
     ipcRenderer.on('gemini:auto-spawn', handleGeminiAutoSpawn);
 
+    // Gemini busy state → project badge spinner
+    const handleGeminiBusy = (_: any, { tabId, busy }: { tabId: string; busy: boolean }) => {
+      setBusyTabs(prev => { const n = new Map(prev); if (busy) n.set(tabId, true); else n.delete(tabId); return n; });
+    };
+    ipcRenderer.on('gemini:busy-state', handleGeminiBusy);
+
     return () => {
       ipcRenderer.removeListener('terminal:command-started', handleCommandStarted);
       ipcRenderer.removeListener('terminal:command-finished', handleCommandFinished);
@@ -788,6 +827,7 @@ function App() {
       ipcRenderer.removeListener('mcp:close-sub-agent-tab', handleMcpCloseSubAgent);
       ipcRenderer.removeListener('mcp:respawn-sub-agent-pty', handleRespawnSubAgentPty);
       ipcRenderer.removeListener('gemini:auto-spawn', handleGeminiAutoSpawn);
+      ipcRenderer.removeListener('gemini:busy-state', handleGeminiBusy);
     };
   }, [openProjects.size]); // Re-init when projects change
 
@@ -796,13 +836,51 @@ function App() {
     const handleBeforeUnload = () => {
       const state = useWorkspaceStore.getState();
       // Save session immediately (without debounce)
+      // NOTE: interrupted state is NOT managed here — main process will-quit handler
+      // sets wasInterrupted AFTER this save completes, avoiding race conditions.
       state.saveSessionImmediate();
-      // Mark active Claude sessions as interrupted
-      state.markAllSessionsInterrupted();
     };
 
     window.addEventListener('beforeunload', handleBeforeUnload);
     return () => window.removeEventListener('beforeunload', handleBeforeUnload);
+  }, []);
+
+  // Auto-resume interrupted sessions on startup (if enabled in settings)
+  useEffect(() => {
+    const timer = setTimeout(async () => {
+      try {
+        const autoResume = await ipcRenderer.invoke('app:getState', 'auto_resume_sessions');
+        if (autoResume !== true && autoResume !== 'true') return;
+
+        const state = useWorkspaceStore.getState();
+        const interruptedTabs: { projectId: string; tabId: string; sessionId: string }[] = [];
+
+        for (const [projectId, workspace] of state.openProjects) {
+          for (const [tabId, tab] of workspace.tabs) {
+            // Only auto-resume Claude tabs (not devServer, gemini, or other types that happen to have old sessionId)
+            if (tab.wasInterrupted && tab.claudeSessionId && !tab.overlayDismissed &&
+                (tab.commandType === 'claude' || tab.color === 'claude')) {
+              interruptedTabs.push({ projectId, tabId, sessionId: tab.claudeSessionId });
+            }
+          }
+        }
+
+        if (interruptedTabs.length === 0) return;
+        console.log('[AutoResume] Resuming', interruptedTabs.length, 'interrupted sessions');
+
+        for (const { tabId, sessionId } of interruptedTabs) {
+          state.clearInterruptedState(tabId);
+          state.setTabCommandType(tabId, 'claude');
+          const cmd = 'claude --dangerously-skip-permissions --resume ' + sessionId + '\r';
+          ipcRenderer.send('terminal:input', tabId, cmd);
+          ipcRenderer.send('terminal:force-command-started', { tabId });
+          console.warn('[AutoResume] Resumed tab', tabId, 'session', sessionId.substring(0, 8));
+        }
+      } catch (e: any) {
+        console.warn('[AutoResume] Error:', e?.message || String(e));
+      }
+    }, 3000); // Wait 3s for PTY shells to initialize
+    return () => clearTimeout(timer);
   }, []);
 
   // Monitor drag-and-drop for project tabs reordering
@@ -1222,10 +1300,12 @@ function App() {
             const isActive = view === 'workspace' && activeProjectId === projectId;
             const isLast = index === openProjectsList.length - 1;
 
-            // Count active processes in this project
+            // Count active processes and busy tabs in this project
             let activeCount = 0;
+            let hasBusyTab = false;
             workspace.tabs.forEach((_, tabId) => {
               if (processStatus.get(tabId)) activeCount++;
+              if (busyTabs.get(tabId)) hasBusyTab = true;
             });
 
             // Count interrupted (paused) sessions
@@ -1246,12 +1326,14 @@ function App() {
                 forceRightIndicator={isLast && projectEmptyZoneHovered}
                 activeProcessCount={activeCount}
                 interruptedCount={interruptedCount}
+                isProjectBusy={hasBusyTab || apiLoadingProjects.has(projectId)}
                 isEditing={editingProjectId === projectId}
                 editValue={projectEditValue}
                 onEditChange={setProjectEditValue}
                 onEditSubmit={handleSubmitProjectRename}
                 onEditCancel={handleCancelProjectRename}
                 isAreaActive={activeArea === 'projects'}
+                isProjectLoading={apiLoadingProjects.has(projectId)}
                 onClick={() => {
                   openProject(projectId, project.path);
                 }}

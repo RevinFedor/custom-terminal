@@ -1554,8 +1554,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     }
   },
 
-  // Mark all tabs with active AI sessions as interrupted (called on shutdown)
-  // Uses SYNCHRONOUS IPC (sendSync) to guarantee save completes before process dies (pkill-safe)
+  // Clear stale interrupted states on shutdown (called via beforeunload).
+  // ONLY clears — never marks. Marking is done by main process before-quit
+  // which has access to claudeCliActive (actual running processes).
+  // Renderer doesn't know which tabs are actively running vs just having commandType='claude'.
   markAllSessionsInterrupted: () => {
     const { openProjects } = get();
     let anyChanged = false;
@@ -1563,13 +1565,11 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     for (const [projectId, workspace] of openProjects) {
       let changed = false;
       for (const [tabId, tab] of workspace.tabs) {
-        // Check both Claude and Gemini sessions
-        // Skip if user already dismissed the overlay (don't show again)
-        if ((tab.claudeSessionId || tab.geminiSessionId) && !tab.wasInterrupted && !tab.overlayDismissed) {
-          tab.wasInterrupted = true;
+        if (tab.wasInterrupted && !tab.overlayDismissed) {
+          // CLEAR stale: was in "blue mode", user never clicked Continue
+          tab.wasInterrupted = false;
           changed = true;
           anyChanged = true;
-          console.log('[Store] Marking tab as interrupted:', tabId, 'claude:', tab.claudeSessionId, 'gemini:', tab.geminiSessionId);
         }
       }
       if (changed) {

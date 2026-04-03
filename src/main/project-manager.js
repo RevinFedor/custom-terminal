@@ -103,6 +103,24 @@ class ProjectManager {
     this.db.savePrompts(prompts);
   }
 
+  // Project lookup by path
+  getProject(projectPath) {
+    return this.db.getProject(projectPath);
+  }
+
+  // AI Prompts methods
+  getAIPrompts() {
+    return this.db.getAIPrompts();
+  }
+
+  saveAIPrompt(prompt) {
+    this.db.saveAIPrompt(prompt);
+  }
+
+  deleteAIPrompt(id) {
+    this.db.deleteAIPrompt(id);
+  }
+
   // Tab history methods
   archiveTab(projectId, tab) {
     this.db.archiveTab(projectId, tab);

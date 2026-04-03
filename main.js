@@ -578,17 +578,15 @@ function parseOSC133AndEmit(tabId, data) {
             exitCode: state.lastExitCode
           });
         }
-        // Clear bridge + claudeCliActive when command finishes (shell regained control = Claude not running)
-        // Guard: handshake only — shell fires D during init BEFORE Claude starts
-        if (!claudeState.has(tabId) && !claudePendingPrompt.has(tabId)) {
-          if (claudeCliActive.has(tabId)) {
-            claudeCliActive.delete(tabId);
-            if (mainWindow && !mainWindow.isDestroyed()) {
-              mainWindow.webContents.send('mcp:claude-cli-active', { tabId, active: false });
-            }
-          }
-          if (bridgeKnownSessions.has(tabId)) {
-            clearBridgeTab(tabId);
+        // Bug 1 fix: if Claude CLI was running in this PTY, it just exited back to shell
+        // Guard: don't clear during handshake — shell fires D during init BEFORE Claude starts
+        // Same guard pattern as sub-agent completion check (line ~2273)
+        if (claudeCliActive.has(tabId) && !claudeState.has(tabId) && !claudePendingPrompt.has(tabId)) {
+          console.log('[MCP:ClaudeExit] Tab ' + tabId + ': Claude CLI exited (OSC 133 D), clearing claudeCliActive');
+          claudeCliActive.delete(tabId);
+          clearBridgeTab(tabId);
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send('mcp:claude-cli-active', { tabId, active: false });
           }
         }
         break;

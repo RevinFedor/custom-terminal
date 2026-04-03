@@ -42,6 +42,7 @@
 2. **Byte Offset:** Если файл вырос, ридер открывает его и переходит сразу к последнему известному смещению (`lastOffset`).
 3. **Leftover Buffer:** Если последний чанк закончился на середине строки (разрыв JSON), остаток сохраняется в `leftover` и склеивается с началом следующего чтения.
 4. **Async Parsing:** Чтение выполняется асинхронно через `fs.promises`, предотвращая блокировку Event Loop.
+5. **Concurrent Access Safety:** Все поля кэша (`size`, `leftover`, `fileIndex`, `bridgeSessionId`) снимаются в локальные переменные **до** первого `await`. Это защищает от race condition между параллельными `loadJsonlRecords` вызовами для одного файла. Без снэпшота конкурентный вызов может обновить `cached.size` между await'ами, и `fd.read` начнёт чтение с нового offset'а — записи между старым и новым смещением **пропускаются навсегда**. См. [`fix-incremental-reader-race.md`](fix-incremental-reader-race.md).
 
 ---
 

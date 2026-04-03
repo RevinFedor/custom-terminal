@@ -28,6 +28,7 @@ export default function Dashboard() {
 
   const [killTooltip, setKillTooltip] = useState<'claude' | 'gemini' | null>(null);
   const [historyCounts, setHistoryCounts] = useState<Map<string, number>>(new Map());
+  const [autoResume, setAutoResume] = useState(false);
 
   // CMD+hover popover (unified hook)
   const isCmdPressed = useCmdKey();
@@ -46,6 +47,10 @@ export default function Dashboard() {
   useEffect(() => {
     loadProjects();
     loadBookmarks();
+    // Load auto-resume setting
+    ipcRenderer.invoke('app:getState', 'auto_resume_sessions').then((val: any) => {
+      if (val === true || val === 'true') setAutoResume(true);
+    }).catch(() => {});
   }, []);
 
   // Fetch history counts for all projects
@@ -252,6 +257,30 @@ export default function Dashboard() {
             </div>
           </div>
         )}
+
+        {/* Settings */}
+        <div className="flex items-center gap-3 mb-4 px-1">
+          <label className="flex items-center gap-2 cursor-pointer select-none" title="Автоматически возобновлять прерванные Claude сессии при запуске приложения">
+            <div
+              className="relative w-8 h-4 rounded-full transition-colors"
+              style={{ backgroundColor: autoResume ? 'rgba(74, 222, 128, 0.4)' : 'rgba(255,255,255,0.1)' }}
+              onClick={() => {
+                const next = !autoResume;
+                setAutoResume(next);
+                ipcRenderer.invoke('app:setState', { key: 'auto_resume_sessions', value: next });
+              }}
+            >
+              <div
+                className="absolute top-0.5 w-3 h-3 rounded-full transition-all"
+                style={{
+                  left: autoResume ? '18px' : '2px',
+                  backgroundColor: autoResume ? '#4ade80' : '#666',
+                }}
+              />
+            </div>
+            <span className="text-xs text-[#888]">Auto-resume sessions</span>
+          </label>
+        </div>
 
         {/* Bookmarks Section */}
         <div>

@@ -72,6 +72,7 @@ Gemini-оркестратор может вызвать `update_docs` как MCP
 - **Settings Sync:** `docs:sync-settings` IPC — renderer пушит `apiSettings` + `docPrompt` в main process при mount и при изменениях. Main хранит в памяти (`docsConfig` в `ipc/docs.js`).
 - **HTTP endpoint:** `POST /update-docs` в MCP HTTP bridge (main.js). Timeout: до 5 минут (зависит от числа сессий и размера).
 - **API функции:** `callClaudeApi()` и `callGeminiApi()` вынесены как переиспользуемые exports из `ipc/docs.js`. Используются и IPC хендлером `docs:api-request`, и HTTP endpoint.
+- **API Cancel (AbortController):** Обе API-функции используют глобальный `_activeAbortController`. При клике Cancel в ActionsPanel вызывается `docs:cancel-request` IPC → `controller.abort()` → fetch бросает AbortError. Раньше cancel был ref-flag — HTTP запрос продолжал выполнять в фоне, тратя токены.
 
 ### Update API → Haiku Pipeline (Direct Method)
 **Новый метод (2026-03)** для обновления документации без необходимости открытия интерактивной сессии Gemini.

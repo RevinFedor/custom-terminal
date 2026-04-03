@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect, useMemo, useCallback } from 'react';
 import { createPortal } from 'react-dom';
-import { Sparkles, ChevronRight, X, Check } from 'lucide-react';
+import { Sparkles, ChevronRight, X, Check, Pencil, Copy } from 'lucide-react';
 import MarkdownRenderer from '../Research/MarkdownRenderer';
 import { usePromptsStore } from '../../store/usePromptsStore';
 import { useUIStore, ThinkingLevel, AIModel } from '../../store/useUIStore';
@@ -63,6 +63,9 @@ export default function EditRangePanel({
   const [isLoading, setIsLoading] = useState(false);
   const [abortController, setAbortController] = useState<AbortController | null>(null);
   const [sourceExpanded, setSourceExpanded] = useState(false);
+  const [editingMsgId, setEditingMsgId] = useState<string | null>(null);
+  const [editingText, setEditingText] = useState('');
+  const editTextareaRef = useRef<HTMLTextAreaElement>(null);
 
   // Apply flow state
   const [applyPhase, setApplyPhase] = useState<'idle' | 'running' | 'done'>('idle');
@@ -230,39 +233,63 @@ export default function EditRangePanel({
   const MIN_USABLE_H = 180; // header + input + one message
   const MIN_USABLE_W = 220;
 
-  // Center of the selected range — panel is always centered on this Y
+  // Center of the selected range — initial anchor for panel position
   const anchorCenterY = anchorTop + anchorHeight / 2;
 
-  // Resize: symmetric from center (top/bottom), left-only for width
+  // Top override: null = use anchor centering, number = explicit top position (after resize)
+  const [topOverride, setTopOverride] = useState<number | null>(null);
+
+  // Independent edge resize: top moves top edge only, bottom moves bottom edge only
   const dragRef = useRef<{
     edge: 'top' | 'bottom' | 'left';
     startY: number; startX: number;
     startH: number; startW: number;
+    startTop: number;
   } | null>(null);
 
   const handleResizeStart = useCallback((edge: 'top' | 'bottom' | 'left', e: React.MouseEvent) => {
     e.preventDefault();
     e.stopPropagation();
+
+    // Compute current resolved top to use as starting point
+    const vh = window.innerHeight;
+    const curH = Math.max(MIN_USABLE_H, Math.min(panelSize.height, vh - MARGIN * 2));
+    let curTop: number;
+    if (topOverride !== null) {
+      curTop = topOverride;
+    } else {
+      curTop = anchorCenterY - curH / 2;
+      if (curTop < MARGIN) curTop = MARGIN;
+      if (curTop + curH > vh - MARGIN) curTop = vh - curH - MARGIN;
+    }
+
     dragRef.current = {
       edge,
       startY: e.clientY, startX: e.clientX,
       startH: panelSize.height, startW: panelSize.width,
+      startTop: curTop,
     };
 
     const handleMove = (ev: MouseEvent) => {
       const d = dragRef.current;
       if (!d) return;
-      const vh = window.innerHeight;
+      const vh2 = window.innerHeight;
       const vw = window.innerWidth;
       const dy = ev.clientY - d.startY;
       const dx = ev.clientX - d.startX;
 
-      if (d.edge === 'top' || d.edge === 'bottom') {
-        // Symmetric resize from center: drag = half the total delta
-        const sign = d.edge === 'bottom' ? 1 : -1;
-        const delta = sign * dy * 2; // *2 because symmetric
-        const maxH = Math.min(vh - MARGIN * 2, (anchorCenterY - MARGIN) * 2, (vh - anchorCenterY - MARGIN) * 2);
-        const newH = Math.max(MIN_USABLE_H, Math.min(maxH, d.startH + delta));
+      if (d.edge === 'top') {
+        // Top edge moves up/down — height changes inversely, bottom stays
+        const bottomEdge = d.startTop + d.startH;
+        const newTop = Math.max(MARGIN, Math.min(bottomEdge - MIN_USABLE_H, d.startTop + dy));
+        const newH = bottomEdge - newTop;
+        setTopOverride(newTop);
+        setPanelSize({ width: panelSize.width, height: newH });
+      } else if (d.edge === 'bottom') {
+        // Bottom edge moves down/up — top stays
+        const maxBottom = vh2 - MARGIN;
+        const newH = Math.max(MIN_USABLE_H, Math.min(maxBottom - d.startTop, d.startH + dy));
+        setTopOverride(d.startTop); // Lock top position
         setPanelSize({ width: panelSize.width, height: newH });
       } else if (d.edge === 'left') {
         const maxW = vw - rightOffset - MARGIN;
@@ -279,7 +306,7 @@ export default function EditRangePanel({
 
     window.addEventListener('mousemove', handleMove);
     window.addEventListener('mouseup', handleUp);
-  }, [panelSize, setPanelSize, rightOffset, anchorCenterY]);
+  }, [panelSize, setPanelSize, rightOffset, anchorCenterY, topOverride]);
 
   // Compute final position: always centered on anchorCenterY, clamped to viewport
   const vh = window.innerHeight;
@@ -300,13 +327,17 @@ export default function EditRangePanel({
     top = Math.max(MARGIN, Math.min(frozenPos.top, vh - 120));
     right = frozenPos.right;
   } else {
-    // Full chat panel — dynamic from anchor
+    // Full chat panel — use topOverride if set by resize, otherwise anchor-centered
     w = Math.max(MIN_USABLE_W, Math.min(panelSize.width, maxW));
     h = Math.max(MIN_USABLE_H, Math.min(panelSize.height, maxH));
-    top = anchorCenterY - h / 2;
+    if (topOverride !== null) {
+      top = Math.max(MARGIN, Math.min(topOverride, vh - h - MARGIN));
+    } else {
+      top = anchorCenterY - h / 2;
+      if (top < MARGIN) top = MARGIN;
+      if (top + h > vh - MARGIN) top = vh - h - MARGIN;
+    }
     right = rightOffset;
-    if (top < MARGIN) top = MARGIN;
-    if (top + h > vh - MARGIN) top = vh - h - MARGIN;
   }
 
   return createPortal(
@@ -547,19 +578,90 @@ export default function EditRangePanel({
                 <div style={{ marginTop: '4px', whiteSpace: 'pre-wrap' }}>{msg.content}</div>
               </div>
             ) : (
-              <div style={{
-                padding: '8px 10px',
-                backgroundColor: '#1e1e1e',
-                borderRadius: '6px',
-                border: '1px solid rgba(168, 199, 250, 0.15)',
-              }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '4px', marginBottom: '4px' }}>
-                  <Sparkles size={10} color="#a8c7fa" />
-                  <span style={{ fontSize: '10px', color: '#a8c7fa', fontWeight: 600 }}>Gemini</span>
+              <div>
+                <div style={{
+                  padding: '8px 10px',
+                  backgroundColor: '#1e1e1e',
+                  borderRadius: '6px',
+                  border: '1px solid rgba(168, 199, 250, 0.15)',
+                }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '4px', marginBottom: '4px' }}>
+                    <Sparkles size={10} color="#a8c7fa" />
+                    <span style={{ fontSize: '10px', color: '#a8c7fa', fontWeight: 600 }}>Gemini</span>
+                  </div>
+                  {editingMsgId === msg.id ? (
+                    <div>
+                      <textarea
+                        ref={editTextareaRef}
+                        value={editingText}
+                        onChange={(e) => setEditingText(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Escape') { setEditingMsgId(null); }
+                        }}
+                        style={{
+                          width: '100%',
+                          minHeight: '80px',
+                          backgroundColor: '#252525',
+                          border: '1px solid #444',
+                          borderRadius: '4px',
+                          padding: '6px 8px',
+                          fontSize: '12px',
+                          color: '#ddd',
+                          lineHeight: 1.5,
+                          resize: 'vertical',
+                          fontFamily: 'monospace',
+                          outline: 'none',
+                        }}
+                      />
+                      <div style={{ display: 'flex', gap: '4px', marginTop: '4px', justifyContent: 'flex-end' }}>
+                        <button
+                          onClick={() => setEditingMsgId(null)}
+                          style={{ padding: '2px 8px', fontSize: '10px', backgroundColor: '#333', border: '1px solid #444', borderRadius: '3px', color: '#aaa', cursor: 'pointer' }}
+                        >Отмена</button>
+                        <button
+                          onClick={() => {
+                            setMessages(prev => prev.map(m => m.id === msg.id ? { ...m, content: editingText } : m));
+                            setEditingMsgId(null);
+                          }}
+                          style={{ padding: '2px 8px', fontSize: '10px', backgroundColor: 'rgba(168, 199, 250, 0.15)', border: '1px solid rgba(168, 199, 250, 0.3)', borderRadius: '3px', color: '#a8c7fa', cursor: 'pointer' }}
+                        >Сохранить</button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div style={{ fontSize: '12px', color: '#ddd', lineHeight: 1.5 }}>
+                      {msg.content ? <MarkdownRenderer content={msg.content} /> : <span style={{ color: '#555', fontStyle: 'italic' }}>Пустой ответ — нажмите ✏ чтобы написать свой текст</span>}
+                    </div>
+                  )}
                 </div>
-                <div style={{ fontSize: '12px', color: '#ddd', lineHeight: 1.5 }}>
-                  <MarkdownRenderer content={msg.content} />
-                </div>
+                {/* Edit/Copy buttons under Gemini response */}
+                {editingMsgId !== msg.id && (
+                  <div style={{ display: 'flex', gap: '4px', justifyContent: 'flex-end', marginTop: '3px' }}>
+                    <button
+                      onClick={() => {
+                        const { clipboard } = window.require('electron');
+                        clipboard.writeText(msg.content);
+                        showToast('Скопировано', 'info', 1500);
+                      }}
+                      style={{ padding: '2px 6px', display: 'flex', alignItems: 'center', gap: '3px', fontSize: '10px', color: '#666', background: 'none', border: 'none', cursor: 'pointer', borderRadius: '3px' }}
+                      title="Копировать"
+                      className="hover:bg-white/5 hover:text-white/60"
+                    >
+                      <Copy size={10} />
+                    </button>
+                    <button
+                      onClick={() => {
+                        setEditingMsgId(msg.id);
+                        setEditingText(msg.content);
+                        setTimeout(() => editTextareaRef.current?.focus(), 50);
+                      }}
+                      style={{ padding: '2px 6px', display: 'flex', alignItems: 'center', gap: '3px', fontSize: '10px', color: '#666', background: 'none', border: 'none', cursor: 'pointer', borderRadius: '3px' }}
+                      title="Редактировать ответ"
+                      className="hover:bg-white/5 hover:text-white/60"
+                    >
+                      <Pencil size={10} />
+                    </button>
+                  </div>
+                )}
               </div>
             )}
           </div>

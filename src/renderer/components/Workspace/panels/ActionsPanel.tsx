@@ -42,8 +42,18 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
   const [isScissorsHovered, setIsScissorsHovered] = useState(false);
   const [isDocsHovered, setIsDocsHovered] = useState(false);
   const [isCopyingDocs, setIsCopyingDocs] = useState(false);
-  const [isApiLoading, setIsApiLoading] = useState(false);
+  const [isApiLoading, _setIsApiLoading] = useState(false);
   const apiCancelledRef = useRef(false);
+
+  // Wrapper: dispatch project loading event so project tab badge shows spinner
+  const setIsApiLoading = useCallback((loading: boolean) => {
+    _setIsApiLoading(loading);
+    if (activeProjectId) {
+      window.dispatchEvent(new CustomEvent('project:api-loading', {
+        detail: { projectId: activeProjectId, loading }
+      }));
+    }
+  }, [activeProjectId]);
   const [clipboardMode, setClipboardMode] = useState(false);
 
   // Update Docs expandable prompt
@@ -1460,6 +1470,7 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
                               if (isApiLoading) {
                                 apiCancelledRef.current = true;
                                 setIsApiLoading(false);
+                                ipcRenderer.invoke('docs:cancel-request');
                                 showToast('API запрос отменён', 'info');
                               }
                             }}

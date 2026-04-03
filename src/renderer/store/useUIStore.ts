@@ -3,9 +3,11 @@ import { create } from 'zustand';
 interface Toast {
   id: string;
   message: string;
-  type: 'success' | 'error' | 'info' | 'warning';
+  type: 'success' | 'error' | 'info' | 'warning' | 'pink';
   persistent?: boolean;
   copyText?: string;
+  actionLabel?: string;
+  onAction?: () => void;
 }
 
 interface FilePreview {
@@ -153,7 +155,7 @@ interface UIStore {
 
   toasts: Toast[];
 
-  showToast: (message: string, type?: 'success' | 'error' | 'info' | 'warning', duration?: number, persistent?: boolean, copyText?: string) => void;
+  showToast: (message: string, type?: Toast['type'], duration?: number, persistent?: boolean, copyText?: string, actionLabel?: string, onAction?: () => void) => void;
 
   removeToast: (id: string) => void;
 
@@ -743,10 +745,10 @@ export const useUIStore = create<UIStore>((set, get) => ({
 
   // Toast Notifications
   toasts: [],
-  showToast: (message, type = 'success', duration = 2500, persistent = false, copyText) => {
+  showToast: (message, type = 'success', duration = 2500, persistent = false, copyText, actionLabel, onAction) => {
     const id = `toast-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
     set((state) => ({
-      toasts: [...state.toasts, { id, message, type, persistent, copyText }]
+      toasts: [...state.toasts, { id, message, type, persistent, copyText, actionLabel, onAction }]
     }));
 
     if (!persistent) {

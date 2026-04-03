@@ -1,6 +1,6 @@
 import React, { useEffect, useLayoutEffect, useState, useCallback, useRef, useMemo } from 'react';
 import { createPortal } from 'react-dom';
-import { Maximize2, Copy, Minimize2, Pencil, Trash2, StickyNote, ChevronDown, Check } from 'lucide-react';
+import { Maximize2, Copy, Minimize2, Pencil, Trash2, StickyNote, ChevronDown, Check, Scissors, X } from 'lucide-react';
 import { terminalRegistry } from '../../utils/terminalRegistry';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
@@ -198,6 +198,10 @@ function computeGroups(entries: TimelineEntry[]): Map<number, GroupInfo> {
   return groups;
 }
 
+// Module-level: survives component remount (project switch destroys Timeline instance)
+const _savedEditRangeMap = new Map<string, any>();
+const SAVED_MAP_MAX = 20;
+
 function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, isOpen = true, toolType = 'claude' }: TimelineProps) {
   const isGemini = toolType === 'gemini';
 
@@ -235,13 +239,38 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   const [rewindState, setRewindState] = useState<{ index: number; phase: 'compacting' | 'rewinding' | 'pasting' | 'done' } | null>(null);
 
   // Edit Range state
-  const [editRangeState, setEditRangeState] = useState<{
+  const [editRangeState, _setEditRangeState] = useState<{
     range: { startIndex: number; endIndex: number };
     phase: 'loading' | 'ready' | 'applying' | 'done';
     sourceContent: string;
     compactText: string;
     compactUuid?: string; // UUID of the inserted compact entry (after apply)
   } | null>(null);
+  // Ref mirror — always current, used by useEffect cleanup (closures capture stale state)
+  const editRangeStateRef = useRef(editRangeState);
+  // Wrapper with logging to trace phantom resets
+  const setEditRangeState: typeof _setEditRangeState = (val) => {
+    if (val === null) {
+      console.warn('[EditRange:State] → null', new Error().stack?.split('\n')[2]?.trim());
+    } else if (typeof val === 'function') {
+      _setEditRangeState((prev) => {
+        const next = (val as any)(prev);
+        if (next === null) console.warn('[EditRange:State] fn→null', new Error().stack?.split('\n')[2]?.trim());
+        else if (next) console.warn('[EditRange:State] fn→' + next.phase);
+        editRangeStateRef.current = next;
+        return next;
+      });
+      return;
+    } else {
+      console.warn('[EditRange:State] →' + val.phase + ' range=[' + val.range.startIndex + ',' + val.range.endIndex + ']');
+    }
+    _setEditRangeState(val);
+    editRangeStateRef.current = typeof val === 'function' ? null : val; // fn case handled above
+  };
+  // AbortController for edit-range Gemini API call
+  const editRangeAbortRef = useRef<AbortController | null>(null);
+  // Context menu for edit-range loading overlay (Interrupt / Cancel)
+  const [editRangeLoadingMenu, setEditRangeLoadingMenu] = useState<{ x: number; y: number } | null>(null);
   // Range action menu — appears after second click to choose Copy or Edit
   const [rangeActionMenu, setRangeActionMenu] = useState<{
     x: number; y: number;
@@ -315,6 +344,11 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
 
   // Compute group map for sub-agent entries (Phase 2)
   const groupMap = useMemo(() => computeGroups(entries), [entries]);
+  // Precompute fork snapshot UUID Sets for suppressing inherited plan mode boundaries
+  const forkSnapshotSets = useMemo(() =>
+    forkMarkers.filter(m => m.entry_uuids && m.entry_uuids.length > 0).map(m => new Set(m.entry_uuids)),
+    [forkMarkers]
+  );
   // Count visible nodes (entries minus hidden group children)
   const hasSubAgentGroups = useMemo(() => {
     for (const [, g] of groupMap) {
@@ -514,6 +548,78 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   useEffect(() => {
     loadTimeline();
   }, [loadTimeline]);
+
+  // Tab switch: save editRangeState (ready/done only), reset everything else.
+  // What's saved: editRangeState when phase=ready or done (user has Gemini response in panel).
+  // What's NOT saved: loading (fetch aborted), applying (runs in background), all other overlays.
+  // Why not save loading: abort → re-fetch created infinite loops and "plan mode" errors
+  //   from stale entries. User re-selects range instead.
+  const prevSessionForCleanup = useRef<string | null>(null);
+  // Always-current sessionId ref — closures in async fetchEditRangeCompact capture stale prop
+  const sessionIdRef = useRef(sessionId);
+  sessionIdRef.current = sessionId;
+  useEffect(() => {
+    if (sessionId !== prevSessionForCleanup.current) {
+      const prevSid = prevSessionForCleanup.current;
+      // Always run save/restore — even when prevSid is null (tab without session in between).
+      // Without this, switching through a no-session tab (sessionId=null) breaks the chain:
+      // A(saved) → null(skip because prevSid=null) → A(no restore because prevSid was null)
+      {
+        // DON'T abort in-flight fetch on tab switch — let it complete in background.
+        // Aborting + re-fetching on every switch wastes Gemini API calls and makes loading
+        // take 30-40s instead of 5s (each switch restarts the ~5s fetch from scratch).
+        // Guard in fetchEditRangeCompact will save result to _savedEditRangeMap when done.
+        const hadFetch = !!editRangeAbortRef.current;
+        console.warn('[EditRange:TabSwitch] LEAVE ' + (prevSid?.substring(0, 8) || 'null') + ' → ' + (sessionId?.substring(0, 8) || 'null') + ' editPhase=' + (editRangeState?.phase || 'null') + ' abortedFetch=' + hadFetch + ' savedMapSize=' + _savedEditRangeMap.size);
+        // Save editRangeState (loading/ready/done — not applying). Skip if prevSid is null (no session to save for)
+        if (prevSid && editRangeState && editRangeState.phase !== 'applying') {
+          _savedEditRangeMap.set(prevSid, editRangeState);
+          if (_savedEditRangeMap.size > SAVED_MAP_MAX) {
+            const first = _savedEditRangeMap.keys().next().value;
+            if (first) _savedEditRangeMap.delete(first);
+          }
+          console.warn('[EditRange:TabSwitch] Saved phase=' + editRangeState.phase + ' range=[' + editRangeState.range.startIndex + ',' + editRangeState.range.endIndex + '] sourceLen=' + (editRangeState.sourceContent?.length || 0) + ' for ' + (prevSid?.substring(0, 8) || 'null'));
+        }
+        // Restore or reset editRangeState
+        const saved = sessionId ? _savedEditRangeMap.get(sessionId) : null;
+        if (saved) {
+          setEditRangeState(saved);
+          _savedEditRangeMap.delete(sessionId);
+          console.warn('[EditRange:TabSwitch] Restored phase=' + saved.phase + ' range=[' + saved.range.startIndex + ',' + saved.range.endIndex + '] sourceLen=' + (saved.sourceContent?.length || 0) + ' for ' + sessionId.substring(0, 8));
+          // If loading: fetch continues in background, no re-fetch needed.
+          // When fetch completes, guard saves result to _savedEditRangeMap → next restore picks it up.
+        } else {
+          console.warn('[EditRange:TabSwitch] No saved state for ' + sessionId?.substring(0, 8) + ' → null');
+          setEditRangeState(null);
+        }
+        // Always reset everything else
+        setEditRangeLoadingMenu(null);
+        setRewindState(null);
+        setCopyingRange(null);
+        setCopiedRange(null);
+        setSelectionStartId(null);
+        selectionStartIdRef.current = null;
+        setContextMenu(null);
+        setClickedState(null);
+        setActiveTooltipIndex(null);
+        setHoveredIndex(null);
+        setUnreachableIndices(new Set());
+        setVisibleEntryIndices(new Set());
+        setResponseOnlyIndices(new Set());
+      }
+      prevSessionForCleanup.current = sessionId;
+    }
+    // Cleanup on unmount (project switch or conditional unrender when showTimeline=null)
+    return () => {
+      const sid = prevSessionForCleanup.current;
+      const state = editRangeStateRef.current; // ref always current, closure would be stale
+      if (sid && state && state.phase !== 'applying') {
+        _savedEditRangeMap.set(sid, state);
+        console.warn('[EditRange:Unmount] Saved phase=' + state.phase + ' for ' + sid.substring(0, 8));
+      }
+      // DON'T abort fetch here — let it complete in background and save to _savedEditRangeMap
+    };
+  }, [sessionId]);
 
   // Auto-scroll timeline to bottom on initial load (when sessionId changes)
   // This ensures the user sees the latest (reachable) entries, not old red ones at the top
@@ -1152,6 +1258,99 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     setContextMenu(null);
   };
 
+  // Standalone Gemini fetch for edit-range. Used by both executeRangeAction (initial)
+  // and tab-switch restore (re-fetch after abort). Does NOT touch selection state.
+  // Guard: checks sessionId hasn't changed after fetch (prevents cross-tab state write).
+  // expectedSessionId is REQUIRED — prevents cross-tab state writes when abort fails.
+  // Uses sessionIdRef.current (always fresh) instead of sessionId closure (stale after tab switch).
+  const fetchEditRangeCompact = async (range: { startIndex: number; endIndex: number }, sourceContent: string, expectedSessionId: string) => {
+    const currentSid = sessionIdRef.current;
+    console.warn('[EditRange:Fetch] START range=[' + range.startIndex + ',' + range.endIndex + '] sourceLen=' + sourceContent.length + ' expected=' + expectedSessionId.substring(0, 8) + ' currentRef=' + (currentSid?.substring(0, 8) || 'null'));
+    const { getPromptById, rewindPromptId } = usePromptsStore.getState();
+    const promptConfig = getPromptById(rewindPromptId);
+    if (!promptConfig) {
+      console.warn('[EditRange:Fetch] ABORT: No rewind prompt configured (rewindPromptId=' + rewindPromptId + ')');
+      if (sessionIdRef.current === expectedSessionId) setEditRangeState(null);
+      return;
+    }
+    console.warn('[EditRange:Fetch] Prompt found: model=' + promptConfig.model + ' contentLen=' + promptConfig.content?.length);
+    const apiKey = process.env.GEMINI_API_KEY || 'REDACTED_GEMINI_KEY';
+    const model = promptConfig.model;
+    const fullPrompt = promptConfig.content + sourceContent;
+    const requestBody: any = { contents: [{ parts: [{ text: fullPrompt }] }] };
+    if (model.includes('gemini-3') && promptConfig.thinkingLevel !== 'NONE') {
+      requestBody.generationConfig = { thinkingConfig: { thinkingLevel: promptConfig.thinkingLevel } };
+    }
+    try {
+      console.warn('[EditRange:Fetch] Sending to Gemini, model:', model, 'promptLen:', fullPrompt.length);
+      editRangeAbortRef.current = new AbortController();
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
+        { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(requestBody), signal: editRangeAbortRef.current.signal }
+      );
+      editRangeAbortRef.current = null;
+      // GUARD: sessionIdRef.current is always fresh (not stale closure).
+      // If abort failed (race condition), this catches cross-tab writes.
+      const nowSid = sessionIdRef.current;
+      console.warn('[EditRange:Fetch] Response received, status:', response.status, 'expected=' + expectedSessionId.substring(0, 8) + ' currentRef=' + (nowSid?.substring(0, 8) || 'null'));
+      if (nowSid !== expectedSessionId) {
+        // Tab switched during fetch — save result to map for later restore
+        const data = await response.json();
+        const compactText = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+        if (compactText) {
+          const readyState = { range, phase: 'ready' as const, sourceContent, compactText };
+          _savedEditRangeMap.set(expectedSessionId, readyState);
+          console.warn('[EditRange:Fetch] CROSS-TAB: saved to map for ' + expectedSessionId.substring(0, 8) + ' len=' + compactText.length);
+          // Find tab name and projectId for clickable toast
+          const targetTabId = tabId; // captured from component prop closure
+          let targetTabName = 'вкладку';
+          let targetProjectId = '';
+          for (const [pid, ws] of useWorkspaceStore.getState().openProjects) {
+            const tab = ws.tabs.get(targetTabId);
+            if (tab) { targetTabName = tab.name; targetProjectId = pid; break; }
+          }
+          useUIStore.getState().showToast(
+            'Rewind готов — ',
+            'pink',
+            5000,
+            false,
+            undefined,
+            targetTabName,
+            () => {
+              const store = useWorkspaceStore.getState();
+              if (targetProjectId && targetProjectId !== store.activeProjectId) {
+                store.showWorkspace(targetProjectId);
+              }
+              if (targetProjectId) {
+                store.switchTab(targetProjectId, targetTabId);
+              }
+            }
+          );
+        } else {
+          console.warn('[EditRange:Fetch] CROSS-TAB: empty response, discarded');
+        }
+        return;
+      }
+      const data = await response.json();
+      const compactText = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      if (!compactText) {
+        console.warn('[EditRange:Fetch] EMPTY response from Gemini. data.error:', JSON.stringify(data.error || 'none').substring(0, 200));
+        setEditRangeState(null);
+        return;
+      }
+      console.warn('[EditRange:Fetch] Compact ready, length:', compactText.length);
+      setEditRangeState({ range, phase: 'ready' as const, sourceContent, compactText });
+    } catch (err: any) {
+      editRangeAbortRef.current = null;
+      if (err.name === 'AbortError') {
+        console.warn('[EditRange:Fetch] AbortError (tab switch or user cancel)');
+        return;
+      }
+      console.warn('[EditRange:Fetch] ERROR:', err.message || String(err));
+      if (sessionIdRef.current === expectedSessionId) setEditRangeState(null);
+    }
+  };
+
   const executeRangeAction = async (mode: 'copy' | 'edit', range: { startIndex: number; endIndex: number }, startUuid: string, endUuid: string) => {
     if (!sessionId) return;
 
@@ -1195,55 +1394,11 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         }
 
         const sourceContent = result.content;
-
-        // Send to Gemini API with rewind prompt
-        const { getPromptById, rewindPromptId } = usePromptsStore.getState();
-        const promptConfig = getPromptById(rewindPromptId);
-
-        if (!promptConfig) {
-          console.warn('[EditRange] No rewind prompt configured');
-          setEditRangeState(null);
-          return;
-        }
-
-        const apiKey = process.env.GEMINI_API_KEY || 'REDACTED_GEMINI_KEY';
-        const model = promptConfig.model;
-        const fullPrompt = promptConfig.content + sourceContent;
-
-        const requestBody: any = {
-          contents: [{ parts: [{ text: fullPrompt }] }],
-        };
-
-        if (model.includes('gemini-3') && promptConfig.thinkingLevel !== 'NONE') {
-          requestBody.generationConfig = {
-            thinkingConfig: { thinkingLevel: promptConfig.thinkingLevel }
-          };
-        }
-
-        console.warn('[EditRange] Sending to Gemini, model:', model);
-        const response = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
-          {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(requestBody),
-          }
-        );
-
-        const data = await response.json();
-        const compactText = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-
-        if (!compactText) {
-          console.error('[EditRange] Gemini returned empty response');
-          setEditRangeState(null);
-          return;
-        }
-
-        console.warn('[EditRange] Compact ready, length:', compactText.length);
-        setEditRangeState({ range, phase: 'ready', sourceContent, compactText });
-
+        // Update state with sourceContent so tab-switch save has the data for re-fetch
+        setEditRangeState({ range, phase: 'loading', sourceContent, compactText: '' });
+        await fetchEditRangeCompact(range, sourceContent, sessionId);
       } catch (err: any) {
-        console.error('[EditRange] Failed:', err);
+        console.error('[EditRange] Failed to get source content:', err);
         setEditRangeState(null);
       }
       return;
@@ -1748,7 +1903,14 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
               if (isLastEntry || forkMarker) return false;
               const nextEntry = entries[index + 1];
               if (!nextEntry || !entry.sessionId || !nextEntry.sessionId) return false;
-              return entry.sessionId !== nextEntry.sessionId;
+              if (entry.sessionId === nextEntry.sessionId) return false;
+              // Suppress inherited session boundaries from parent chains in forked sessions.
+              // If BOTH entries are in a fork snapshot, this boundary is from the parent chain —
+              // not a plan mode transition in the current session.
+              for (const snap of forkSnapshotSets) {
+                if (snap.has(entry.uuid) && snap.has(nextEntry.uuid)) return false;
+              }
+              return true;
             })();
 
             // Phase 2: Group state
@@ -2248,7 +2410,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
 
           return rect && (
             <div
-              className={`absolute left-0 right-0 pointer-events-none ${isLoading || isApplying ? 'animate-pulse' : ''}`}
+              className={`absolute left-0 right-0 ${isLoading ? 'cursor-pointer' : 'pointer-events-none'} ${isLoading || isApplying ? 'animate-pulse' : ''}`}
               style={{
                 top: rect.top,
                 height: rect.height,
@@ -2257,6 +2419,11 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                 borderBottom: `1px solid ${color}, 0.5)`,
                 boxShadow: `0 0 12px ${color}, 0.3)`,
               }}
+              onContextMenu={isLoading ? (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                setEditRangeLoadingMenu({ x: e.clientX, y: e.clientY });
+              } : undefined}
             />
           );
         })()}
@@ -2661,6 +2828,53 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                   // background: 'rgba(255,0,0,0.15)', // Uncomment for debug
                 }}
               />
+            </div>
+          </TooltipPortal>
+        )}
+
+        {/* Edit Range Loading Context Menu (right-click on pink overlay) */}
+        {editRangeLoadingMenu && editRangeState?.phase === 'loading' && (
+          <TooltipPortal>
+            <div
+              onMouseLeave={() => setEditRangeLoadingMenu(null)}
+              style={{
+                position: 'fixed',
+                left: editRangeLoadingMenu.x,
+                top: editRangeLoadingMenu.y,
+                backgroundColor: '#1a1a1a',
+                border: '1px solid #333',
+                borderRadius: '4px',
+                padding: '4px',
+                zIndex: 10001,
+                minWidth: '140px',
+                boxShadow: '0 4px 12px rgba(0,0,0,0.5)'
+              }}
+            >
+              <button
+                className="w-full text-left px-3 py-2 text-xs text-amber-400 hover:bg-amber-600/20 rounded transition-colors cursor-pointer flex items-center gap-2"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setEditRangeLoadingMenu(null);
+                  // Abort fetch and open panel with empty text
+                  if (editRangeAbortRef.current) editRangeAbortRef.current.abort();
+                  setEditRangeState(prev => prev ? { ...prev, phase: 'ready', compactText: '' } : null);
+                }}
+              >
+                <Scissors size={12} />
+                Прервать
+              </button>
+              <button
+                className="w-full text-left px-3 py-2 text-xs text-red-400 hover:bg-red-600/20 rounded transition-colors cursor-pointer flex items-center gap-2"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setEditRangeLoadingMenu(null);
+                  if (editRangeAbortRef.current) editRangeAbortRef.current.abort();
+                  setEditRangeState(null);
+                }}
+              >
+                <X size={12} />
+                Отмена
+              </button>
             </div>
           </TooltipPortal>
         )}
