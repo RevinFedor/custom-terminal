@@ -795,22 +795,30 @@ function register({ projectManager, formatToolAction }) {
       for (let i = rangeStart; i <= rangeEnd; i++) {
         removeUuids.add(activeBranch[i].uuid);
       }
-      // Forward-expand: remove the ENTIRE response chain after the range
-      // (assistant → tool_result → assistant → ... until next REAL user message)
+      // Forward-expand: remove the ENTIRE response chain after the range until
+      // the next REAL human-typed user message. Includes:
+      //   - assistant entries (tool_use, thinking, text responses)
+      //   - user entries with tool_result content (API tool responses)
+      //   - user entries with <task-notification> (sub-agent automation)
+      //   - system entries (turn_duration metadata between turns)
+      //   - progress entries (streaming progress)
+      // Stops ONLY at a real user text message (human-typed prompt).
       for (let i = rangeEnd + 1; i < activeBranch.length; i++) {
         const entry = activeBranch[i];
-        if (entry.type === 'assistant') {
+        if (entry.type === 'assistant' || entry.type === 'system' || entry.type === 'progress') {
           removeUuids.add(entry.uuid);
         } else if (entry.type === 'user') {
           const content = entry.message?.content;
           const isToolResult = Array.isArray(content) && content.some(b => b.type === 'tool_result');
-          if (isToolResult) {
+          const contentStr = typeof content === 'string' ? content : '';
+          const isTaskNotification = contentStr.startsWith('<task-notification>');
+          if (isToolResult || isTaskNotification) {
             removeUuids.add(entry.uuid);
           } else {
             break; // Real user message — stop
           }
         } else {
-          break; // system or other — stop
+          removeUuids.add(entry.uuid); // unknown type — include in removal
         }
       }
 
@@ -999,13 +1007,20 @@ function register({ projectManager, formatToolAction }) {
         }
       }
 
-      // Count removed by type
+      // Count removed by type. removedUsers = only REAL human-typed messages
+      // (not tool_result, not <task-notification>)
       let removedUsers = 0, removedAssistants = 0, removedOther = 0;
       for (const uuid of removeUuids) {
         const rec = recordMap.get(uuid);
         if (!rec) continue;
-        if (rec.type === 'user') removedUsers++;
-        else if (rec.type === 'assistant') removedAssistants++;
+        if (rec.type === 'user') {
+          const content = rec.message?.content;
+          const isToolResult = Array.isArray(content) && content.some(b => b.type === 'tool_result');
+          const contentStr = typeof content === 'string' ? content : '';
+          const isTaskNotification = contentStr.startsWith('<task-notification>');
+          if (!isToolResult && !isTaskNotification) removedUsers++;
+          else removedOther++;
+        } else if (rec.type === 'assistant') removedAssistants++;
         else removedOther++;
       }
 
