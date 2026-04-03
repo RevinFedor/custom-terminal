@@ -36,5 +36,19 @@ markers = directParent ? [directParent] : []
 
 **Почему fromMe убран:** При форке из сессии A→B, маркер `A→B` (fromMe) показывал синюю полоску в Timeline родителя A. Пользователь видел лишние синие полоски в сессии, из которой он форкал. Fork point уже виден в дочерней сессии B (через directParent `A→B`), дублирование в родителе не нужно.
 
+## Наследованные plan mode границы в форках
+
+### Проблема
+`isPlanModeBoundary` проверяет `entry.sessionId !== nextEntry.sessionId`. В форке, если родительская цепочка имела plan mode transitions (A→B→C), ВСЕ эти session boundaries наследуются в форкнутый Timeline. Fork marker (`if (forkMarker) return false`) подавляет только одну точку — сам fork boundary. Но границы A→B и B→C внутри snapshot'а показываются как ложные бирюзовые plan mode полоски.
+
+### Пробовали и отбросили
+- Фильтрация по `sessionBoundaries` из chain resolution: ненадёжна для fork copies (мосты скопированы из оригинала).
+
+### Решение
+Предвычисленные `forkSnapshotSets` (useMemo) — массив Set'ов из `entry_uuids` всех fork markers. В `isPlanModeBoundary`: если **обе** записи (current и next) находятся в одном snapshot → граница из родительской цепочки → подавить. Порядок проверок:
+1. `forkMarker` (точка форка) → false (существующая логика)
+2. `forkSnapshotSets` (обе записи в snapshot) → false (новая логика)
+3. Иначе → true (реальный plan mode)
+
 **Связанные факты:**
 - [`fact-timeline.md`](fact-timeline.md) — Fork & Plan Mode Markers (визуальные разделители)

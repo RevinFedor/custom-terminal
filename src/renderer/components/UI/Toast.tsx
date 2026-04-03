@@ -27,13 +27,14 @@ export default function ToastContainer() {
             toast.type === 'success' ? 'bg-[#22c55e]/90 text-white' :
             toast.type === 'error' ? 'bg-[#ef4444]/90 text-white' :
             toast.type === 'warning' ? 'bg-[#f59e0b]/90 text-white' :
+            toast.type === 'pink' ? 'bg-[#ec4899]/90 text-white' :
             'bg-[#3b82f6]/90 text-white'
           }`}
           style={toast.persistent ? {
             borderLeft: '3px solid rgba(255,255,255,0.5)',
             paddingRight: '8px',
           } : undefined}
-          onClick={() => !toast.persistent && removeToast(toast.id)}
+          onClick={() => !toast.persistent && !toast.onAction && removeToast(toast.id)}
         >
           {/* ✕ close button — left side for persistent toasts */}
           {toast.persistent && (
@@ -50,9 +51,24 @@ export default function ToastContainer() {
           <span className="text-sm shrink-0">
             {toast.type === 'success' ? '✓' :
              toast.type === 'error' ? '✗' :
-             toast.type === 'warning' ? '⚠' : 'ℹ'}
+             toast.type === 'warning' ? '⚠' :
+             toast.type === 'pink' ? '✦' : 'ℹ'}
           </span>
-          <span className="text-xs font-medium flex-1">{toast.message}</span>
+          <span className="text-xs font-medium flex-1">
+            {toast.message}
+            {toast.actionLabel && (
+              <span
+                className="cursor-pointer underline decoration-white/50 hover:decoration-white ml-1"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  if (toast.onAction) toast.onAction();
+                  removeToast(toast.id);
+                }}
+              >
+                {toast.actionLabel}
+              </span>
+            )}
+          </span>
           {/* Copy button — right side, only if toast has copyText */}
           {toast.copyText && (
             <span

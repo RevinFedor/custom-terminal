@@ -425,24 +425,15 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
         }
 
         if (buf.viewportY >= buf.baseY) {
-          // User at bottom — schedule ref clear after 1s.
-          const savedPos = userScrollTopRef.current;
-          const isPushedToBottom = savedPos !== null && savedPos > buf.baseY;
-          if (!clearRefTimer && savedPos !== null && !isPushedToBottom) {
-            clearRefTimer = setTimeout(() => {
-              clearRefTimer = null;
-              const b = term.buffer.active;
-              if (b.viewportY >= b.baseY) {
-                const stillPushed = userScrollTopRef.current !== null && userScrollTopRef.current > b.baseY;
-                if (!stillPushed) {
-                  console.warn(`[ScrollDiag] REF CLEARED: stable isAtBottom for 1s`);
-                  userScrollTopRef.current = null;
-                }
-              }
-            }, 1000);
+          // User scrolled to bottom — clear ref immediately, no debounce.
+          // This lets protectedWrite pass data through without scrollToLine snap-back.
+          if (clearRefTimer) { clearTimeout(clearRefTimer); clearRefTimer = null; }
+          if (userScrollTopRef.current !== null) {
+            userScrollTopRef.current = null;
           }
         } else if (buf.viewportY > 0) {
-          // User scrolled — save position, cancel pending clear
+          // User scrolled up or down (but not to bottom) — update ref immediately.
+          // Next protectedWrite will use this updated position.
           if (clearRefTimer) { clearTimeout(clearRefTimer); clearRefTimer = null; }
           userScrollTopRef.current = buf.viewportY;
         }

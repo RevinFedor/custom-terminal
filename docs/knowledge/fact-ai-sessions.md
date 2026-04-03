@@ -20,7 +20,7 @@ Noted Terminal обеспечивает глубокую интеграцию с
 
 ## Общие механизмы
 - **Sniper Watcher:** Фоновое наблюдение за файловой системой для захвата идентификаторов сессий.
-- **Interrupted Sessions:** Детекция некорректного завершения и предложение восстановления через Overlay. Покажется только если `currentView === 'terminal'`, чтобы не мешать на вкладке Home.
+- **Interrupted Sessions:** Детекция некорректного завершения и предложение восстановления через Overlay. Покажется только если `currentView === 'terminal'`, чтобы не мешать на вкладке Home. State management — исключительно в main process (`will-quit`). Renderer НЕ трогает `wasInterrupted`. Подробности о гонке lifecycle и выборе сигнала (`bridgeKnownSessions` vs `claudeCliActive`) — см. [`fix-interrupted-session-lifecycle.md`](fix-interrupted-session-lifecycle.md).
 - **Process Monitor (Dashboard):** Глобальный экран мониторинга всех запущенных в системе AI-агентов. Разделен на две колонки (Claude и Gemini).
     - **Ownership:** Приложение автоматически определяет, какие процессы запущены внутри него (In-App), а какие во внешних терминалах (External) через PPID mapping.
     - **Batch Kill:** Возможность остановки любого процесса прямо из Dashboard.

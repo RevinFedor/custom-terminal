@@ -409,12 +409,16 @@ function stopSessionBridge() {
 }
 
 function clearBridgeTab(tabId) {
+  const had = bridgeKnownSessions.has(tabId);
   bridgeKnownSessions.delete(tabId);
   promptBoundaryState.delete(tabId);
   promptBoundarySeq.delete(tabId);
   escapeCarryover.delete(tabId);
   for (const [pid, tid] of bridgePidCache) {
     if (tid === tabId) bridgePidCache.delete(pid);
+  }
+  if (had) {
+    console.log('[Bridge:Clear] Tab ' + tabId.slice(-12) + ' removed from bridgeKnownSessions (remaining=' + bridgeKnownSessions.size + ')');
   }
 }
 
@@ -574,14 +578,17 @@ function parseOSC133AndEmit(tabId, data) {
             exitCode: state.lastExitCode
           });
         }
-        // Bug 1 fix: if Claude CLI was running in this PTY, it just exited back to shell
-        // Guard: don't clear during handshake — shell fires D during init BEFORE Claude starts
-        // Same guard pattern as sub-agent completion check (line ~2273)
-        if (claudeCliActive.has(tabId) && !claudeState.has(tabId) && !claudePendingPrompt.has(tabId)) {
-          console.log('[MCP:ClaudeExit] Tab ' + tabId + ': Claude CLI exited (OSC 133 D), clearing claudeCliActive');
-          claudeCliActive.delete(tabId);
-          if (mainWindow && !mainWindow.isDestroyed()) {
-            mainWindow.webContents.send('mcp:claude-cli-active', { tabId, active: false });
+        // Clear bridge + claudeCliActive when command finishes (shell regained control = Claude not running)
+        // Guard: handshake only — shell fires D during init BEFORE Claude starts
+        if (!claudeState.has(tabId) && !claudePendingPrompt.has(tabId)) {
+          if (claudeCliActive.has(tabId)) {
+            claudeCliActive.delete(tabId);
+            if (mainWindow && !mainWindow.isDestroyed()) {
+              mainWindow.webContents.send('mcp:claude-cli-active', { tabId, active: false });
+            }
+          }
+          if (bridgeKnownSessions.has(tabId)) {
+            clearBridgeTab(tabId);
           }
         }
         break;
@@ -3057,6 +3064,59 @@ app.whenReady().then(() => {
   console.log('[Startup] createWindow() returned');
 });
 
+// Interrupted session management: SINGLE source of truth in main process.
+// Renderer's beforeunload ONLY saves UI state — never touches wasInterrupted.
+//
+// Uses bridgeKnownSessions (NOT claudeCliActive) to detect Claude presence.
+// claudeCliActive = "currently processing" (empty when idle at prompt)
+// bridgeKnownSessions = "CLI alive in this tab" (persists until terminal killed)
+//
+// before-quit: safety net — runs first, marks known sessions.
+// will-quit: definitive — runs AFTER beforeunload, clears stale + marks active.
+app.on('before-quit', () => {
+  try {
+    if (projectManager?.db?.db) {
+      let marked = 0;
+      const markStmt = projectManager.db.db.prepare(
+        'UPDATE tabs SET was_interrupted = 1, overlay_dismissed = 0 WHERE tab_id = ?'
+      );
+      for (const [tabId] of bridgeKnownSessions) {
+        marked += markStmt.run(tabId).changes;
+      }
+      console.log('[Shutdown:before-quit] bridge=' + bridgeKnownSessions.size + ' marked=' + marked +
+        ' ids=[' + Array.from(bridgeKnownSessions.keys()).map(k => k.slice(-7)).join(',') + ']');
+    }
+  } catch (e) {
+    console.error('[Shutdown] before-quit error:', e.message);
+  }
+});
+
+app.on('will-quit', () => {
+  try {
+    if (projectManager?.db?.db) {
+      // Step 1: Clear ALL stale interrupted states
+      const cleared = projectManager.db.db.prepare(
+        'UPDATE tabs SET was_interrupted = 0 WHERE was_interrupted = 1 AND overlay_dismissed = 0'
+      ).run();
+
+      // Step 2: Mark tabs with known Claude sessions (bridge-detected, alive until terminal kill)
+      let marked = 0;
+      const markStmt = projectManager.db.db.prepare(
+        'UPDATE tabs SET was_interrupted = 1, overlay_dismissed = 0 WHERE tab_id = ?'
+      );
+      for (const [tabId] of bridgeKnownSessions) {
+        marked += markStmt.run(tabId).changes;
+      }
+
+      console.log('[Shutdown:will-quit] cleared=' + cleared.changes + ' marked=' + marked +
+        ' bridge=' + bridgeKnownSessions.size +
+        ' ids=[' + Array.from(bridgeKnownSessions.keys()).map(k => k.slice(-7)).join(',') + ']');
+    }
+  } catch (e) {
+    console.error('[Shutdown] will-quit error:', e.message);
+  }
+});
+
 app.on('window-all-closed', () => {
   // Persist response queue before killing terminals
   try {
@@ -3711,6 +3771,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
       terminalProjects.delete(tabId);
       terminalCommandState.delete(tabId);
       claudeCliActive.delete(tabId);
+      clearBridgeTab(tabId);
       claudeAgentManager.cleanup(tabId);
       claudeAgentBuffer.delete(tabId);
       claudeAgentArmed.delete(tabId);
@@ -4603,6 +4664,7 @@ ipcMain.on('terminal:kill', (event, tabId) => {
     term.kill();
     terminals.delete(tabId);
   }
+  clearBridgeTab(tabId);
   claudeAgentManager.cleanup(tabId);
   claudeAgentBuffer.delete(tabId);
   claudeAgentArmed.delete(tabId);

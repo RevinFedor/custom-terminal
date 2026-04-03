@@ -98,37 +98,48 @@ async function loadJsonlRecords(filePath) {
 
   // ── Case 2: File grew (normal for active sessions) → read ONLY new bytes ──
   if (cached && stat.size > cached.size) {
+    // CRITICAL: Snapshot cache state BEFORE any await — concurrent loadJsonlRecords
+    // calls for the same file can mutate cached.size/leftover between await points,
+    // causing the read offset to jump forward and SKIP records permanently.
+    const prevSize = cached.size;
+    const prevLeftover = cached.leftover || '';
+    const prevBridgeSessionId = cached.bridgeSessionId;
+    const prevFileIndex = cached.fileIndex;
+
     const fd = await fs.promises.open(filePath, 'r');
     let newContent = '';
     try {
-      const newByteCount = stat.size - cached.size;
+      const newByteCount = stat.size - prevSize;
       const buf = Buffer.allocUnsafe(newByteCount);
-      await fd.read(buf, 0, newByteCount, cached.size);
+      await fd.read(buf, 0, newByteCount, prevSize);
       newContent = buf.toString('utf-8');
     } finally {
       await fd.close();
     }
 
     // The first "line" may be a partial line from the previous read — prepend leftover
-    const content = (cached.leftover || '') + newContent;
+    const content = prevLeftover + newContent;
     const lines = content.split('\n');
     // Last element may be incomplete (file written mid-line) — save as leftover
     const leftover = lines.pop();
 
     const { lastRecord, bridgeSessionId, fileIndex } = _parseJsonlLines(
       lines, sessionId, cached.recordMap, cached.progressEntries,
-      cached.fileIndex, cached.bridgeSessionId
+      prevFileIndex, prevBridgeSessionId
     );
 
     const newLastRecord = lastRecord || cached.lastRecord;
     const newBridgeId = bridgeSessionId !== undefined ? bridgeSessionId : cached.bridgeSessionId;
 
-    _jsonlCache.set(filePath, {
-      size: stat.size, mtimeMs: stat.mtimeMs, leftover: leftover || '',
-      recordMap: cached.recordMap, lastRecord: newLastRecord,
-      bridgeSessionId: newBridgeId, progressEntries: cached.progressEntries,
-      fileIndex
-    });
+    // Only advance cache if we're ahead — prevents concurrent call from reverting state
+    if (stat.size >= cached.size) {
+      _jsonlCache.set(filePath, {
+        size: stat.size, mtimeMs: stat.mtimeMs, leftover: leftover || '',
+        recordMap: cached.recordMap, lastRecord: newLastRecord,
+        bridgeSessionId: newBridgeId, progressEntries: cached.progressEntries,
+        fileIndex
+      });
+    }
 
     return { recordMap: cached.recordMap, lastRecord: newLastRecord, bridgeSessionId: newBridgeId, progressEntries: cached.progressEntries };
   }
@@ -840,9 +851,12 @@ function register({ projectManager, formatToolAction }) {
       // Using file entries' sessionId (e.g. original 2fa76efe in a fork) causes a DAG fork:
       // compact(sid=2fa76efe) and Claude's new entry(sid=e713a1a9) both point to same parent.
       const fileSessionId = sessionId;
+      // Timestamp: if compact is in the MIDDLE (entryAfter exists), must be older than entryAfter.
+      // If compact is at the END (no entryAfter), use NOW — must be newest leaf for Claude DAG.
+      // Bug: using entryBefore.timestamp creates identical timestamps → Claude can't pick newest leaf.
       const compactTs = entryAfter?.timestamp
         ? new Date(new Date(entryAfter.timestamp).getTime() - 1).toISOString()
-        : entryBefore?.timestamp || new Date().toISOString();
+        : new Date().toISOString();
       console.log('[EditRange] Compact: sid=' + fileSessionId?.slice(0, 8) + ' ts=' + compactTs?.slice(0, 19) + ' uuid=' + compactUuid?.slice(0, 8));
       const compactEntry = {
         parentUuid: entryBefore?.uuid || null,
@@ -888,6 +902,46 @@ function register({ projectManager, formatToolAction }) {
         console.log('[EditRange] rangeStart=0: keeping', keepUuids.size, 'post-range entries, total removing', removeUuids.size);
       }
 
+      // CRITICAL: Relink entryAfter BEFORE orphan cleanup.
+      // Without this, entryAfter's parentUuid still points to a deleted entry →
+      // orphan cleanup cascades through ALL entries after the range, destroying the
+      // entire conversation after the edit point. Bug found: user edited 4 entries
+      // (115-118), lost 1481 records including 40+ real user conversations.
+      if (entryAfter) {
+        entryAfter.parentUuid = compactUuid;
+        console.log('[EditRange] Relinked entryAfter ' + entryAfter.uuid?.slice(0, 8) + ' → compact ' + compactUuid?.slice(0, 8));
+      }
+
+      // Orphan cleanup: remove entries whose parentUuid points to a deleted record.
+      // After edit-range removes part of active branch, tool_result entries from dead
+      // rewind branches may survive with dangling parentUuid → they become newest leaves
+      // in Claude's DAG → Claude resumes from an empty branch (0% context).
+      let orphanPass = 0;
+      let orphanCleaned = 0;
+      const survivingUuids = new Set();
+      survivingUuids.add(compactUuid); // compact entry is not in allRecords yet but will survive
+      for (const rec of allRecords) {
+        if (rec?.uuid && !removeUuids.has(rec.uuid)) survivingUuids.add(rec.uuid);
+      }
+      let foundOrphans = true;
+      while (foundOrphans) {
+        foundOrphans = false;
+        orphanPass++;
+        for (const rec of allRecords) {
+          if (!rec?.uuid || removeUuids.has(rec.uuid)) continue;
+          const parent = rec.parentUuid;
+          if (parent && !survivingUuids.has(parent)) {
+            removeUuids.add(rec.uuid);
+            survivingUuids.delete(rec.uuid);
+            orphanCleaned++;
+            foundOrphans = true;
+          }
+        }
+      }
+      if (orphanCleaned > 0) {
+        console.log('[EditRange] Orphan cleanup: removed ' + orphanCleaned + ' entries in ' + orphanPass + ' passes');
+      }
+
       // Build output: filter removed + remove orphan last-prompt/non-uuid entries
       const outputLines = [];
       for (const rec of allRecords) {
@@ -896,9 +950,17 @@ function register({ projectManager, formatToolAction }) {
         // Remove last-prompt entries when editing from start (clean slate)
         if (rangeStart === 0 && rec.type === 'last-prompt') continue;
 
-        // Relink: entry after range points to compact instead of last removed
-        if (entryAfter && rec.uuid === entryAfter.uuid) {
+        // Relink safety net (already done before orphan cleanup, but verify)
+        if (entryAfter && rec.uuid === entryAfter.uuid && rec.parentUuid !== compactUuid) {
+          console.log('[EditRange] WARN: entryAfter relink missed, fixing in output loop');
           rec.parentUuid = compactUuid;
+        }
+
+        // Strip userType:'external' from surviving entries — Claude CLI skips external
+        // entries when loading context, causing 4% instead of 25%. Only OUR compact
+        // entry should have userType:'external', not the original conversation records.
+        if (rec.userType === 'external') {
+          delete rec.userType;
         }
 
         outputLines.push(JSON.stringify(rec));
@@ -980,7 +1042,7 @@ function register({ projectManager, formatToolAction }) {
 
     try {
       // Resolve the full session chain (follows bridge entries across "Clear Context" boundaries)
-      const { mergedMap: recordMap, lastRecord, sessionBoundaries } = await resolveSessionChain(sessionId, cwd);
+      let { mergedMap: recordMap, lastRecord, sessionBoundaries } = await resolveSessionChain(sessionId, cwd);
 
       if (!lastRecord) {
         console.log('[Timeline:Backtrace] No lastRecord for session:', sessionId.substring(0, 8));
@@ -991,6 +1053,7 @@ function register({ projectManager, formatToolAction }) {
 
       // BACKTRACE: Walk backwards from the last record following parentUuid
       // Now works across file boundaries thanks to merged recordMap
+      let _cacheInvalidated = false; // Track if we already retried with fresh cache
       const activeBranch = [];
       let currentUuid = lastRecord.uuid;
       const seen = new Set();
@@ -1036,6 +1099,27 @@ function register({ projectManager, formatToolAction }) {
                 }
               }
             } else {
+              // Recovery: cache race condition may have skipped records during concurrent
+              // incremental reads. Invalidate ALL JSONL caches and retry with full re-read (once).
+              if (!_cacheInvalidated) {
+                _cacheInvalidated = true;
+                console.log('[Timeline:Backtrace] BREAK at uuid=' + currentUuid.substring(0, 8) + ' — invalidating JSONL cache and retrying');
+                _jsonlCache.clear();
+                const fresh = await resolveSessionChain(sessionId, cwd);
+                if (fresh.mergedMap.has(currentUuid)) {
+                  recordMap = fresh.mergedMap;
+                  lastRecord = fresh.lastRecord;
+                  sessionBoundaries = fresh.sessionBoundaries;
+                  activeBranch.length = 0;
+                  seen.clear();
+                  currentUuid = lastRecord.uuid;
+                  _compactRecoveryCount = 0;
+                  _bridgeFollowCount = 0;
+                  console.log('[Timeline:Backtrace] Cache recovery SUCCESS — restarting from ' + lastRecord.uuid.substring(0, 8) + ' mergedMap.size=' + recordMap.size);
+                  continue;
+                }
+                console.log('[Timeline:Backtrace] Cache recovery FAILED — uuid=' + currentUuid.substring(0, 8) + ' still missing after full re-read');
+              }
               console.log('[Timeline:Backtrace] BREAK: uuid=' + currentUuid.substring(0, 8) + ' not in recordMap. lastAdded.type=' + lastAdded.type + ' subtype=' + (lastAdded.subtype || 'none'));
             }
           } else {
@@ -1954,7 +2038,7 @@ function register({ projectManager, formatToolAction }) {
           if (!msgContent) continue;
 
           let textContent = '';
-          let thinking = '';
+          const thinkingParts = [];
           const actions = [];
 
           if (typeof msgContent === 'string') {
@@ -1963,7 +2047,7 @@ function register({ projectManager, formatToolAction }) {
             const textParts = [];
             for (const block of msgContent) {
               if (block.type === 'thinking' && block.thinking) {
-                thinking = block.thinking;
+                thinkingParts.push(block.thinking);
               }
               if (block.type === 'text' && block.text) {
                 textParts.push(block.text);
@@ -2006,7 +2090,7 @@ function register({ projectManager, formatToolAction }) {
               role: 'assistant',
               timestamp: entry.timestamp || '',
               content: textContent.trim(),
-              thinking: thinking || undefined,
+              thinking: thinkingParts.length > 0 ? thinkingParts.join('\n\n---\n\n') : undefined,
               actions: actions.length > 0 ? actions : undefined,
               sessionId: entrySid
             });

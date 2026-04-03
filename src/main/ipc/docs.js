@@ -22,6 +22,19 @@ function getDocsConfig() {
   return docsConfig;
 }
 
+// ── Active request cancellation ──
+let _activeAbortController = null;
+
+function cancelActiveRequest() {
+  if (_activeAbortController) {
+    _activeAbortController.abort();
+    _activeAbortController = null;
+    console.log('[docs] Active API request cancelled');
+    return true;
+  }
+  return false;
+}
+
 // ── Reusable API call functions (used by IPC handlers AND MCP HTTP endpoint) ──
 
 async function callClaudeApi(system, prompt, model = 'claude-opus-4.6', thinking = 'HIGH') {
@@ -45,6 +58,7 @@ async function callClaudeApi(system, prompt, model = 'claude-opus-4.6', thinking
       }
     }
 
+    _activeAbortController = new AbortController();
     const response = await fetch('https://api.kiro.cheap/v1/messages', {
       method: 'POST',
       headers: {
@@ -53,6 +67,7 @@ async function callClaudeApi(system, prompt, model = 'claude-opus-4.6', thinking
         'anthropic-version': '2025-04-15',
       },
       body: JSON.stringify(body),
+      signal: _activeAbortController.signal,
     });
 
     if (!response.ok) {
@@ -67,10 +82,16 @@ async function callClaudeApi(system, prompt, model = 'claude-opus-4.6', thinking
       return { success: false, error: 'No text block in API response' };
     }
 
+    _activeAbortController = null;
     const usage = data.usage || {};
     console.log('[docs:claude-api] Response: ' + Math.round(textBlock.text.length / 1024) + 'KB, input: ' + usage.input_tokens + ' output: ' + usage.output_tokens);
     return { success: true, text: textBlock.text, usage };
   } catch (error) {
+    _activeAbortController = null;
+    if (error.name === 'AbortError') {
+      console.log('[docs:claude-api] Request aborted');
+      return { success: false, error: 'cancelled', cancelled: true };
+    }
     console.error('[docs:claude-api] Error:', error);
     return { success: false, error: error.message };
   }
@@ -92,12 +113,14 @@ async function callGeminiApi(system, prompt, model = 'gemini-3-flash-preview', t
     }
 
     const apiKey = 'REDACTED_GEMINI_KEY';
+    _activeAbortController = new AbortController();
     const response = await fetch(
       'https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent?key=' + apiKey,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(requestBody),
+        signal: _activeAbortController.signal,
       }
     );
 
@@ -114,6 +137,7 @@ async function callGeminiApi(system, prompt, model = 'gemini-3-flash-preview', t
     const textParts = data.candidates[0].content.parts.filter(p => !p.thought);
     const responseText = textParts.map(p => p.text).join('');
 
+    _activeAbortController = null;
     const usage = data.usageMetadata || {};
     console.log('[docs:gemini-api] Response: ' + Math.round(responseText.length / 1024) + 'KB, input: ' + usage.promptTokenCount + ' output: ' + usage.candidatesTokenCount);
     return {
@@ -122,6 +146,11 @@ async function callGeminiApi(system, prompt, model = 'gemini-3-flash-preview', t
       usage: { input_tokens: usage.promptTokenCount, output_tokens: usage.candidatesTokenCount }
     };
   } catch (error) {
+    _activeAbortController = null;
+    if (error.name === 'AbortError') {
+      console.log('[docs:gemini-api] Request aborted');
+      return { success: false, error: 'cancelled', cancelled: true };
+    }
     console.error('[docs:gemini-api] Error:', error);
     return { success: false, error: error.message };
   }
@@ -281,6 +310,12 @@ function register() {
   ipcMain.handle('docs:gemini-cli-request', async (event, { system, prompt, model, cwd }) => {
     const useModel = model || docsConfig.apiSettings.geminiModel || 'gemini-3-flash-preview';
     return callGeminiCli(system, prompt, useModel, cwd);
+  });
+
+  // Cancel active API request (AbortController)
+  ipcMain.handle('docs:cancel-request', async () => {
+    const cancelled = cancelActiveRequest();
+    return { success: true, cancelled };
   });
 
   // Sync settings from renderer (apiSettings + docPrompt)
