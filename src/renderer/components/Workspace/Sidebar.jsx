@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import PragmaticFileTree from './PragmaticFileTree/PragmaticFileTree'
 import { flattenTree } from './PragmaticFileTree/utils'
 import IconCropper from './IconCropper'
-import { getValue, setValue } from '../utils/storage'
+import { getValue, setValue } from '../../utils/storage'
 
 // --- Sort Comparator ---
 
@@ -1107,10 +1107,10 @@ function Sidebar({
           y={contextMenu.y}
           node={contextMenu.node}
           onClose={() => setContextMenu(null)}
-          onCopyPath={(p) => navigator.clipboard.writeText(p)}
+          onCopyPath={(p) => window.require('electron').clipboard.writeText(p)}
           onCopyContent={async (p) => {
             const content = await window.electronAPI.readFile(p)
-            if (content !== null) navigator.clipboard.writeText(content)
+            if (content !== null) window.require('electron').clipboard.writeText(content)
           }}
           onRename={(node) => setEditingId(node.id)}
           onChooseIcon={setIconPickerNode}
