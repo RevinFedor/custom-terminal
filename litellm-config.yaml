@@ -1,31 +1,20 @@
+litellm_settings:
+  cache: false
+  
 model_list:
-  # OpenAI GPT-4o
   - model_name: gpt-4o
     litellm_params:
       model: openai/gpt-4o
       api_key: os.environ/OPENAI_API_KEY
-
-  # OpenAI GPT-4.1
   - model_name: gpt-4.1
     litellm_params:
       model: openai/gpt-4.1
       api_key: os.environ/OPENAI_API_KEY
-
-  # OpenAI GPT-4.1 mini
   - model_name: gpt-4.1-mini
     litellm_params:
       model: openai/gpt-4.1-mini
       api_key: os.environ/OPENAI_API_KEY
-
-  # OpenAI GPT-4o mini (дешёвая)
   - model_name: gpt-4o-mini
     litellm_params:
       model: openai/gpt-4o-mini
       api_key: os.environ/OPENAI_API_KEY
-
-  # Kimi K2.5 (когда пополнишь баланс)
-  # - model_name: kimi-k2.5
-  #   litellm_params:
-  #     model: openai/kimi-k2.5
-  #     api_key: os.environ/MOONSHOT_API_KEY
-  #     api_base: https://api.moonshot.ai/v1

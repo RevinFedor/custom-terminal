@@ -40,5 +40,12 @@ build-resources/.DS_Store
 # Native modules
 prebuilds/
 /src/pty-proxy
-/packages/claw-code
-/packages
+
+# Packages (leaked source code, forks)
+/packages/
+
+# Database
+*.db
+
+# Test sandbox
+auto/sandbox/

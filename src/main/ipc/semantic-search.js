@@ -6,7 +6,7 @@ const crypto = require('crypto');
 
 // ========== GEMINI EMBEDDING PROVIDER ==========
 
-const GEMINI_API_KEY = 'REDACTED_GEMINI_KEY';
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_EMBED_MODEL = 'gemini-embedding-001';
 const GEMINI_EMBED_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_EMBED_MODEL}:batchEmbedContents?key=${GEMINI_API_KEY}`;
 const EMBEDDING_DIMS = 768; // gemini-embedding-001 truncated to 768 (default 3072 too large for SQLite)

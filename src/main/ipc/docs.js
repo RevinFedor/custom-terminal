@@ -112,7 +112,7 @@ async function callGeminiApi(system, prompt, model = 'gemini-3-flash-preview', t
       };
     }
 
-    const apiKey = 'REDACTED_GEMINI_KEY';
+    const apiKey = process.env.GEMINI_API_KEY;
     _activeAbortController = new AbortController();
     const response = await fetch(
       'https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent?key=' + apiKey,

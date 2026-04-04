@@ -59,6 +59,7 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
   const [contextPct, setContextPct] = useState(cached?.contextPct ?? 0);
   const [isCommandRunning, setIsCommandRunning] = useState(false);
   const [isControlBusy, setIsControlBusy] = useState(false);
+  const [providerState, setProviderState] = useState<{ type: string; model?: string }>({ type: 'anthropic' });
   const [sessionInputMode, setSessionInputMode] = useState<'claude' | 'gemini' | null>(null);
   const [manualSessionId, setManualSessionId] = useState('');
   const sessionInputRef = useRef<HTMLInputElement>(null);
@@ -164,6 +165,14 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
     ipcRenderer.on('claude:bridge-update', handler);
     return () => { ipcRenderer.removeListener('claude:bridge-update', handler); };
   }, [activeTabId]);
+
+  // Provider state: load initial + listen for changes
+  useEffect(() => {
+    ipcRenderer.invoke('provider:get-status').then((s: any) => setProviderState(s));
+    const handler = (_: any, state: { type: string; model?: string }) => setProviderState(state);
+    ipcRenderer.on('provider:state-changed', handler);
+    return () => { ipcRenderer.removeListener('provider:state-changed', handler); };
+  }, []);
 
   useEffect(() => {
     const checkSession = () => {
@@ -291,7 +300,7 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
       const descModel = descPrompt?.model || 'gemini-3-flash-preview';
       const descThinking = descPrompt?.thinkingLevel || 'NONE';
       const fullPrompt = descContent + exportResult.content;
-      const apiKey = process.env.GEMINI_API_KEY || 'REDACTED_GEMINI_KEY';
+      const apiKey = process.env.GEMINI_API_KEY;
       const requestBody: any = {
         contents: [{ role: 'user', parts: [{ text: fullPrompt }] }],
         systemInstruction: { parts: [{ text: '1-2 предложения. Без маркдауна.' }] }
@@ -615,6 +624,39 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                       title={'Switch to ' + model}
                     >
                       {model}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+            <div className="flex items-center gap-1">
+              <span className="text-[10px] text-[#666] w-12 flex-shrink-0">LLM</span>
+              <div className="flex gap-1 flex-1">
+                {([
+                  { id: 'claude', label: 'Claude', state: { type: 'anthropic' } },
+                  { id: 'gpt-4o', label: 'GPT-4o', state: { type: 'litellm', model: 'gpt-4o' } },
+                  { id: 'gpt-4.1', label: '4.1', state: { type: 'litellm', model: 'gpt-4.1' } },
+                  { id: 'kimi', label: 'Kimi', state: { type: 'litellm', model: 'kimi-k2.5' } },
+                ] as const).map((provider) => {
+                  const isActive = provider.id === 'claude'
+                    ? providerState.type === 'anthropic'
+                    : providerState.type === 'litellm' && providerState.model === provider.state.model;
+                  return (
+                    <button
+                      key={provider.id}
+                      className={`flex-1 text-[10px] px-1 py-1 rounded ${isControlBusy ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'} ${isActive ? 'bg-[#6B8AFF] text-white font-medium' : 'bg-[#2d2d2d] text-[#888] hover:text-white hover:bg-[#3d3d3d]'}`}
+                      disabled={isControlBusy}
+                      onClick={async () => {
+                        if (isControlBusy) return;
+                        setIsControlBusy(true);
+                        try {
+                          const result = await ipcRenderer.invoke('provider:switch', provider.state);
+                          setProviderState(result);
+                        } finally { setIsControlBusy(false); }
+                      }}
+                      title={provider.id === 'claude' ? 'Anthropic subscription (direct)' : 'Via LiteLLM proxy → ' + provider.state.model}
+                    >
+                      {provider.label}
                     </button>
                   );
                 })}

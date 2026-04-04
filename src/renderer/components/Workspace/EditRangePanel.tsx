@@ -155,7 +155,7 @@ export default function EditRangePanel({
     setAbortController(controller);
 
     try {
-      const apiKey = process.env.GEMINI_API_KEY || 'REDACTED_GEMINI_KEY';
+      const apiKey = process.env.GEMINI_API_KEY;
 
       // Build conversation history for API
       const contents = [...messages, userMsg].map(msg => ({

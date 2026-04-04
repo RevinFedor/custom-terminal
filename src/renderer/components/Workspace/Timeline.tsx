@@ -1309,7 +1309,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       return;
     }
     console.warn('[EditRange:Fetch] Prompt found: model=' + promptConfig.model + ' contentLen=' + promptConfig.content?.length);
-    const apiKey = process.env.GEMINI_API_KEY || 'REDACTED_GEMINI_KEY';
+    const apiKey = process.env.GEMINI_API_KEY;
     const model = promptConfig.model;
     // If additionalPrompt provided, prepend it as higher-priority instruction
     const promptPrefix = additionalPrompt
@@ -1582,7 +1582,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         const promptConfig = getPromptById(rewindPromptId);
 
         if (promptConfig) {
-          const apiKey = (typeof process !== 'undefined' && process.env?.GEMINI_API_KEY) || 'REDACTED_GEMINI_KEY';
+          const apiKey = process.env.GEMINI_API_KEY;
           const model = promptConfig.model;
           const promptPrefix = additionalPrompt
             ? `ПРИОРИТЕТНАЯ ИНСТРУКЦИЯ (выполнить в первую очередь):\n${additionalPrompt}\n\n---\nОСНОВНОЙ ПРОМПТ:\n`
