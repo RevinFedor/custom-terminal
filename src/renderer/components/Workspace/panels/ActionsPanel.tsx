@@ -591,7 +591,7 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
       const { apiSettings } = useUIStore.getState();
       const model = apiSettings.geminiModel;
       const thinking = apiSettings.geminiThinking;
-      const apiKey = 'REDACTED_GEMINI_KEY';
+      const apiKey = process.env.GEMINI_API_KEY;
 
       // 5. Build Gemini request
       const requestBody: any = {
@@ -752,7 +752,7 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
         const { apiSettings } = useUIStore.getState();
         const geminiModel = apiSettings.geminiModel;
         const thinking = apiSettings.geminiThinking;
-        const apiKey = 'REDACTED_GEMINI_KEY';
+        const apiKey = process.env.GEMINI_API_KEY;
 
         const requestBody: any = {
           contents: [{ role: 'user', parts: [{ text: userText }] }],
@@ -820,7 +820,7 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
             reqBody.generationConfig = { thinkingConfig: { thinkingLevel: 'LOW' } };
           }
           const checkResp = await fetch(
-            `https://generativelanguage.googleapis.com/v1beta/models/${as2.geminiModel}:generateContent?key=REDACTED_GEMINI_KEY`,
+            `https://generativelanguage.googleapis.com/v1beta/models/${as2.geminiModel}:generateContent?key=${process.env.GEMINI_API_KEY}`,
             { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(reqBody) }
           );
           const checkData = await checkResp.json();

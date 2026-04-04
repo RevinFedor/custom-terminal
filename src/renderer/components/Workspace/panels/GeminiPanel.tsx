@@ -141,7 +141,7 @@ export default function GeminiPanel({ projectPath, geminiPrompt }: GeminiPanelPr
     setLoading(true);
 
     // Get API key from environment
-    const apiKey = process.env.GEMINI_API_KEY || 'REDACTED_GEMINI_KEY';
+    const apiKey = process.env.GEMINI_API_KEY;
     console.log('[Research] API Key:', apiKey ? `${apiKey.slice(0, 10)}...` : 'MISSING');
 
     const fullPrompt = prompt + selectedText;
@@ -270,7 +270,7 @@ export default function GeminiPanel({ projectPath, geminiPrompt }: GeminiPanelPr
 
       setLoading(true);
 
-      const apiKey = process.env.GEMINI_API_KEY || 'REDACTED_GEMINI_KEY';
+      const apiKey = process.env.GEMINI_API_KEY;
       const fullPrompt = prompt + clipboardText;
 
       const controller = new AbortController();

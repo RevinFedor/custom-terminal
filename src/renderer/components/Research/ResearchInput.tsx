@@ -47,7 +47,7 @@ export default function ResearchInput({ projectId, projectPath, inputRef, chatTy
     setAbortController(controller);
 
     try {
-      const apiKey = process.env.GEMINI_API_KEY || 'REDACTED_GEMINI_KEY';
+      const apiKey = process.env.GEMINI_API_KEY;
 
       // Build conversation history
       const currentConv = getActiveConversation(projectId);

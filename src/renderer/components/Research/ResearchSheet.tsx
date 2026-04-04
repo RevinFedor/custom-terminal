@@ -110,7 +110,7 @@ export default function ResearchSheet({ projectId, projectPath }: ResearchSheetP
     setAbortController(controller);
 
     try {
-      const apiKey = process.env.GEMINI_API_KEY || 'REDACTED_GEMINI_KEY';
+      const apiKey = process.env.GEMINI_API_KEY;
 
       // Build conversation history
       const contents = conv.messages.map(msg => ({
