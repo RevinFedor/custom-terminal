@@ -636,12 +636,14 @@ export default function Workspace() {
       {(() => {
         const { sidebarOpen } = getSidebarState(activeProjectId);
         if (!sidebarOpen || !explorerPath) return null;
+        const sidebarWidth = useUIStore.getState().sidebarWidth || 280;
         return ReactDOM.createPortal(
-          <div style={{ position: 'fixed', left: 0, top: 36, bottom: 0, width: 280, zIndex: 99999, backgroundColor: '#1e1e1e', borderRight: '1px solid #333', boxShadow: '4px 0 20px rgba(0,0,0,0.5)', display: 'flex', flexDirection: 'column' }}>
+          <div style={{ position: 'fixed', left: 0, top: 36, bottom: 0, width: sidebarWidth, zIndex: 99999, borderRight: '1px solid #333', boxShadow: '4px 0 20px rgba(0,0,0,0.5)' }}>
             <Sidebar
               folderPath={explorerPath}
-              width={280}
+              width={sidebarWidth}
               fontSize={useUIStore.getState().sidebarFontSize || 13}
+              onFocus={() => {}}
               onFileSelect={(filePath: string, isDir: boolean) => {
                 if (!isDir) {
                   const ipc = window.require('electron').ipcRenderer;
@@ -653,6 +655,30 @@ export default function Workspace() {
                   });
                 }
               }}
+            />
+            {/* Resize handle */}
+            <div
+              style={{ position: 'absolute', right: -3, top: 0, bottom: 0, width: 6, cursor: 'col-resize', zIndex: 1 }}
+              onMouseDown={(e) => {
+                e.preventDefault();
+                const startX = e.clientX;
+                const startW = sidebarWidth;
+                const onMove = (ev: MouseEvent) => {
+                  const newW = Math.max(180, Math.min(500, startW + ev.clientX - startX));
+                  const container = (e.target as HTMLElement).parentElement;
+                  if (container) container.style.width = newW + 'px';
+                };
+                const onUp = (ev: MouseEvent) => {
+                  const finalW = Math.max(180, Math.min(500, startW + ev.clientX - startX));
+                  useUIStore.getState().setSidebarWidth(finalW);
+                  document.removeEventListener('mousemove', onMove);
+                  document.removeEventListener('mouseup', onUp);
+                };
+                document.addEventListener('mousemove', onMove);
+                document.addEventListener('mouseup', onUp);
+              }}
+              onMouseEnter={(e) => { (e.target as HTMLElement).style.background = 'rgba(99,102,241,0.4)'; }}
+              onMouseLeave={(e) => { (e.target as HTMLElement).style.background = ''; }}
             />
           </div>,
           document.body
