@@ -6,6 +6,10 @@
   </p>
 </p>
 
+<p align="center">
+  <img src="assets/hero.png" alt="Noted Terminal" width="800"/>
+</p>
+
 ---
 
 ## Проблема
