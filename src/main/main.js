@@ -735,27 +735,30 @@ ipcMain.on('show-terminal-context-menu', async (event, { hasSelection, prompts, 
 
     const promptsSubmenu = [];
 
-    // Groups first (same order as settings), then ungrouped
-    promptGroups.forEach(group => {
-      const groupPrompts = prompts.filter(p => p.group_id === group.id);
-      promptsSubmenu.push({
-        label: group.name,
-        submenu: groupPrompts.length > 0
-          ? groupPrompts.map(p => ({
-              label: p.title,
-              click: () => { event.sender.send('context-menu-command', 'insert-prompt', p.content); }
-            }))
-          : [{ label: '(empty)', enabled: false }]
-      });
-    });
+    // Build flat order: groups and ungrouped prompts interleaved by position
+    const flatItems = [];
+    promptGroups.forEach(g => flatItems.push({ type: 'group', group: g, pos: g.position }));
+    prompts.filter(p => !p.group_id).forEach(p => flatItems.push({ type: 'prompt', prompt: p, pos: p.position }));
+    flatItems.sort((a, b) => a.pos - b.pos);
 
-    const ungrouped = prompts.filter(p => !p.group_id);
-    if (promptGroups.length > 0 && ungrouped.length > 0) promptsSubmenu.push({ type: 'separator' });
-    ungrouped.forEach(prompt => {
-      promptsSubmenu.push({
-        label: prompt.title,
-        click: () => { event.sender.send('context-menu-command', 'insert-prompt', prompt.content); }
-      });
+    flatItems.forEach(item => {
+      if (item.type === 'group') {
+        const groupPrompts = prompts.filter(p => p.group_id === item.group.id);
+        promptsSubmenu.push({
+          label: item.group.name,
+          submenu: groupPrompts.length > 0
+            ? groupPrompts.map(p => ({
+                label: p.title,
+                click: () => { event.sender.send('context-menu-command', 'insert-prompt', p.content); }
+              }))
+            : [{ label: '(empty)', enabled: false }]
+        });
+      } else {
+        promptsSubmenu.push({
+          label: item.prompt.title,
+          click: () => { event.sender.send('context-menu-command', 'insert-prompt', item.prompt.content); }
+        });
+      }
     });
 
     template.push({

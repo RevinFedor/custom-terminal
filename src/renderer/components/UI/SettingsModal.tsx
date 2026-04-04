@@ -21,6 +21,7 @@ interface Prompt {
   title: string;
   content: string;
   group_id?: number | null;
+  position?: number;
 }
 
 type SettingsTab = 'shortcuts' | 'fonts' | 'colors' | 'ai';
@@ -178,11 +179,11 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
   const savedGroupTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [dragOverGroupId, setDragOverGroupId] = useState<number | 'ungrouped' | null>(null);
   const dragOverGroupRef = useRef<number | 'ungrouped' | null>(null);
-  const [draggingGroupIndex, setDraggingGroupIndex] = useState<number | null>(null);
-  const [groupDropTarget, setGroupDropTarget] = useState<number | null>(null);
-  const [groupDragTransitionsReady, setGroupDragTransitionsReady] = useState(false);
-  const floatingGroupCloneRef = useRef<HTMLDivElement | null>(null);
-  const dragGroupCardHeight = useRef(0);
+  const [draggingFlatIdx, setDraggingFlatIdx] = useState<number | null>(null);
+  const [flatDropTarget, setFlatDropTarget] = useState<number | null>(null);
+  const [flatDragReady, setFlatDragReady] = useState(false);
+  const floatingFlatCloneRef = useRef<HTMLDivElement | null>(null);
+  const dragFlatItemHeight = useRef(0);
 
   // Editing states
   const [editingClaude, setEditingClaude] = useState(false);
@@ -390,12 +391,42 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
     setEditingGroupId(null);
   };
 
-  // Group DnD (reorder groups) — mirrors prompt DnD pattern from fact-settings.md
-  const handleGroupGripPointerDown = (origIndex: number) => (e: React.PointerEvent) => {
+  // Build flat items: groups and ungrouped prompts interleaved by position
+  const buildFlatItems = () => {
+    const items: Array<{ type: 'group'; group: PromptGroup } | { type: 'prompt'; origIdx: number; prompt: Prompt }> = [];
+    promptGroups.forEach(g => items.push({ type: 'group', group: g }));
+    prompts.forEach((p, i) => { if (!p.group_id) items.push({ type: 'prompt', origIdx: i, prompt: p }); });
+    items.sort((a, b) => {
+      const posA = a.type === 'group' ? a.group.position : (a.prompt.position ?? 0);
+      const posB = b.type === 'group' ? b.group.position : (b.prompt.position ?? 0);
+      return posA - posB;
+    });
+    return items;
+  };
+
+  // Save flat order: assign sequential positions to all flat items
+  const saveFlatOrder = (newFlatItems: ReturnType<typeof buildFlatItems>) => {
+    const newGroups = [...promptGroups];
+    const newPrompts = [...prompts];
+    newFlatItems.forEach((item, pos) => {
+      if (item.type === 'group') {
+        const gIdx = newGroups.findIndex(g => g.id === item.group.id);
+        if (gIdx >= 0) newGroups[gIdx] = { ...newGroups[gIdx], position: pos };
+      } else {
+        newPrompts[item.origIdx] = { ...newPrompts[item.origIdx], position: pos };
+      }
+    });
+    setPromptGroups(newGroups);
+    setPrompts(newPrompts);
+    ipcRenderer.invoke('prompt-groups:save', newGroups);
+    savePromptsImmediate(newPrompts);
+  };
+
+  // Unified flat DnD for groups + ungrouped prompts
+  const handleFlatItemDrag = (flatIdx: number) => (e: React.PointerEvent) => {
     e.preventDefault();
     e.stopPropagation();
 
-    // Clear all editing states so no stale selection remains
     saveCurrentGroup();
     saveCurrentInsertion();
     saveCurrentAIPrompt();
@@ -403,18 +434,16 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
     setEditingInsertionIndex(null);
     setEditingPromptId(null);
 
-    const card = (e.target as HTMLElement).closest('[data-group-header]') as HTMLElement | null;
+    const card = (e.target as HTMLElement).closest('[data-flat-card]') as HTMLElement | null;
     if (!card) return;
-    // Measure the full group container (header + child prompts) for gap height
-    const groupContainer = card.closest('[data-group-drop]') as HTMLElement | null;
-    const containerRect = groupContainer ? groupContainer.getBoundingClientRect() : card.getBoundingClientRect();
-    dragGroupCardHeight.current = containerRect.height;
+    const fullEl = card.closest('[data-flat-container]') as HTMLElement | null;
+    const fullRect = fullEl ? fullEl.getBoundingClientRect() : card.getBoundingClientRect();
+    dragFlatItemHeight.current = fullRect.height;
 
     const cardRect = card.getBoundingClientRect();
     const offsetY = e.clientY - cardRect.top;
     const offsetX = e.clientX - cardRect.left;
 
-    // Floating clone shows only the header (not child prompts)
     const clone = card.cloneNode(true) as HTMLDivElement;
     clone.style.position = 'fixed';
     clone.style.left = `${cardRect.left}px`;
@@ -433,61 +462,112 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
       clone.style.transform = 'scale(1.02)';
       clone.style.opacity = '1';
     });
-    floatingGroupCloneRef.current = clone;
+    floatingFlatCloneRef.current = clone;
 
-    setDraggingGroupIndex(origIndex);
-    setGroupDropTarget(origIndex);
+    setDraggingFlatIdx(flatIdx);
+    setFlatDropTarget(flatIdx);
 
-    // Static midpoints captured once (after React hides dragged group)
     let statics: { idx: number; midY: number }[] | null = null;
     let firstMove = true;
+    const flatItems = buildFlatItems();
+    console.warn('[FlatDnD] START flatIdx=', flatIdx, 'flatItems=', flatItems.map((it, i) => `${i}:${it.type}${it.type === 'group' ? '(g' + it.group.id + ')' : '(p' + it.origIdx + ')'}`));
+
+    // Track if the dragged item is a prompt (can be dropped into a group)
+    const draggedItem = flatItems[flatIdx];
+    const isPromptDrag = draggedItem?.type === 'prompt';
 
     const onMove = (ev: PointerEvent) => {
-      if (floatingGroupCloneRef.current) {
+      if (floatingFlatCloneRef.current) {
         if (firstMove) {
-          floatingGroupCloneRef.current.style.transition = 'none';
+          floatingFlatCloneRef.current.style.transition = 'none';
           firstMove = false;
-          // Enable gap transitions after first frame
-          requestAnimationFrame(() => setGroupDragTransitionsReady(true));
+          requestAnimationFrame(() => setFlatDragReady(true));
         }
-        floatingGroupCloneRef.current.style.left = `${ev.clientX - offsetX}px`;
-        floatingGroupCloneRef.current.style.top = `${ev.clientY - offsetY}px`;
+        floatingFlatCloneRef.current.style.left = `${ev.clientX - offsetX}px`;
+        floatingFlatCloneRef.current.style.top = `${ev.clientY - offsetY}px`;
       }
-      // Capture midpoints once (after dragged group is hidden in DOM)
+
+      // Detect group drop zones (for moving prompts into groups)
+      if (isPromptDrag) {
+        const groupEls = document.querySelectorAll('[data-group-drop]');
+        let foundGroup: number | 'ungrouped' | null = null;
+        groupEls.forEach(el => {
+          const r = el.getBoundingClientRect();
+          if (ev.clientY >= r.top && ev.clientY <= r.bottom && ev.clientX >= r.left && ev.clientX <= r.right) {
+            const val = el.getAttribute('data-group-drop');
+            foundGroup = val === 'ungrouped' ? 'ungrouped' : Number(val);
+          }
+        });
+        if (foundGroup !== dragOverGroupRef.current) console.warn('[FlatDnD] groupZone changed:', dragOverGroupRef.current, '->', foundGroup);
+        dragOverGroupRef.current = foundGroup;
+        setDragOverGroupId(foundGroup);
+      }
+
       if (!statics) {
         const listEl = textListRef.current;
         if (!listEl) return;
         statics = [];
-        const headers = Array.from(listEl.querySelectorAll('[data-group-header]')) as HTMLElement[];
-        for (const h of headers) {
-          if (h.dataset.hidden === 'true') continue;
-          const idx = Number(h.dataset.groupIdx);
-          const r = h.getBoundingClientRect();
+        const cards = Array.from(listEl.querySelectorAll('[data-flat-card]')) as HTMLElement[];
+        for (const c of cards) {
+          if (c.dataset.hidden === 'true') continue;
+          const idx = Number(c.dataset.flatIdx);
+          const r = c.getBoundingClientRect();
           statics.push({ idx, midY: r.top + r.height / 2 });
         }
       }
-      let target = promptGroups.length;
+      let target = flatItems.length;
       for (const s of statics) {
         if (ev.clientY < s.midY) { target = s.idx; break; }
       }
-      setGroupDropTarget(target);
+      setFlatDropTarget(target);
     };
 
     const onUp = () => {
       window.removeEventListener('pointermove', onMove);
       window.removeEventListener('pointerup', onUp);
-      if (floatingGroupCloneRef.current) { floatingGroupCloneRef.current.remove(); floatingGroupCloneRef.current = null; }
-      setGroupDragTransitionsReady(false);
-      setDraggingGroupIndex((fromIdx) => {
-        setGroupDropTarget((toPos) => {
+      if (floatingFlatCloneRef.current) { floatingFlatCloneRef.current.remove(); floatingFlatCloneRef.current = null; }
+
+      const targetGroup = isPromptDrag ? dragOverGroupRef.current : null;
+      console.warn('[FlatDnD] DROP isPromptDrag=', isPromptDrag, 'targetGroup=', targetGroup);
+      dragOverGroupRef.current = null;
+      setDragOverGroupId(null);
+
+      setFlatDragReady(false);
+      setDraggingFlatIdx((fromIdx) => {
+        setFlatDropTarget((toPos) => {
+          console.warn('[FlatDnD] RESOLVE fromIdx=', fromIdx, 'toPos=', toPos, 'targetGroup=', targetGroup);
           if (fromIdx !== null && toPos !== null) {
-            const adjustedTo = toPos > fromIdx ? toPos - 1 : toPos;
-            if (fromIdx !== adjustedTo) {
-              const ng = [...promptGroups];
-              const [moved] = ng.splice(fromIdx, 1);
-              ng.splice(adjustedTo, 0, moved);
-              setPromptGroups(ng);
-              ipcRenderer.invoke('prompt-groups:save', ng);
+            // If an ungrouped prompt was dropped on a group zone → move into group
+            if (isPromptDrag && targetGroup !== null && targetGroup !== 'ungrouped' && draggedItem.type === 'prompt') {
+              console.warn('[FlatDnD] MOVE TO GROUP origIdx=', draggedItem.origIdx, '→ group', targetGroup);
+              // Single atomic update: change group_id + reassign flat positions for remaining items
+              const newPrompts = [...prompts];
+              newPrompts[draggedItem.origIdx] = { ...newPrompts[draggedItem.origIdx], group_id: targetGroup, position: undefined };
+              // Reassign flat positions for remaining ungrouped prompts + groups
+              const remainingFlat = flatItems.filter((_, i) => i !== fromIdx);
+              const newGroups = [...promptGroups];
+              remainingFlat.forEach((item, pos) => {
+                if (item.type === 'group') {
+                  const gIdx = newGroups.findIndex(g => g.id === item.group.id);
+                  if (gIdx >= 0) newGroups[gIdx] = { ...newGroups[gIdx], position: pos };
+                } else {
+                  newPrompts[item.origIdx] = { ...newPrompts[item.origIdx], position: pos };
+                }
+              });
+              setPrompts(newPrompts);
+              setPromptGroups(newGroups);
+              savePromptsImmediate(newPrompts);
+              ipcRenderer.invoke('prompt-groups:save', newGroups);
+            } else {
+              // Normal flat reorder
+              const adjustedTo = toPos > fromIdx ? toPos - 1 : toPos;
+              console.warn('[FlatDnD] REORDER from=', fromIdx, 'adjustedTo=', adjustedTo, fromIdx === adjustedTo ? '(no-op)' : '(apply)');
+              if (fromIdx !== adjustedTo) {
+                const items = [...flatItems];
+                const [moved] = items.splice(fromIdx, 1);
+                items.splice(adjustedTo, 0, moved);
+                saveFlatOrder(items);
+              }
             }
           }
           return null;
@@ -553,6 +633,9 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
 
     // Static midpoints captured once (after React hides dragged card) — prevents jitter
     let statics: { origIdx: number; midY: number }[] | null = null;
+    // Flat midpoints for "exit group" preview
+    let flatStatics: { idx: number; midY: number }[] | null = null;
+    const currentFlatItems = buildFlatItems();
     let firstMove = true;
 
     const onMove = (ev: PointerEvent) => {
@@ -574,6 +657,35 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
       });
       dragOverGroupRef.current = foundGroup;
       setDragOverGroupId(foundGroup);
+
+      // When over ungrouped zone: compute flat insertion position for preview
+      if (foundGroup === 'ungrouped') {
+        if (!flatStatics) {
+          const listEl = textListRef.current;
+          if (listEl) {
+            flatStatics = [];
+            const flatCards = Array.from(listEl.querySelectorAll('[data-flat-card]')) as HTMLElement[];
+            for (const c of flatCards) {
+              if (c.dataset.hidden === 'true') continue;
+              const idx = Number(c.dataset.flatIdx);
+              const r = c.getBoundingClientRect();
+              flatStatics.push({ idx, midY: r.top + r.height / 2 });
+            }
+          }
+        }
+        if (flatStatics) {
+          let flatTarget = currentFlatItems.length;
+          for (const s of flatStatics) {
+            if (ev.clientY < s.midY) { flatTarget = s.idx; break; }
+          }
+          dragFlatItemHeight.current = dragCardHeight.current;
+          setDraggingFlatIdx(-1); // sentinel: "grouped prompt exiting to flat"
+          setFlatDropTarget(flatTarget);
+        }
+      } else {
+        setDraggingFlatIdx(null);
+        setFlatDropTarget(null);
+      }
 
       // Capture midpoints once (after dragged card is hidden)
       if (!statics) {
@@ -605,24 +717,49 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
       }
 
       const targetGroup = dragOverGroupRef.current;
+      const flatTargetAtDrop = flatDropTarget;
       dragOverGroupRef.current = null;
       setDragOverGroupId(null);
+      setDraggingFlatIdx(null);
+      setFlatDropTarget(null);
 
       setDragTransitionsReady(false);
       setDraggingTextIndex((fromIdx) => {
         setTextDropTarget((toPos) => {
           if (fromIdx !== null && toPos !== null) {
-            // Convert original-array target to splice index (after removal)
-            const adjustedTo = toPos > fromIdx ? toPos - 1 : toPos;
             const np = [...prompts];
             const editItem = editingInsertionIndex !== null ? np[editingInsertionIndex] : null;
 
-            // Apply group change if dropped on a different group zone
-            if (targetGroup !== null) {
-              const newGroupId = targetGroup === 'ungrouped' ? null : targetGroup;
-              np[fromIdx] = { ...np[fromIdx], group_id: newGroupId };
+            console.warn('[GroupedDnD] DROP fromIdx=', fromIdx, 'targetGroup=', targetGroup, 'flatTarget=', flatTargetAtDrop);
+            if (targetGroup === 'ungrouped') {
+              // Moving from group to ungrouped: insert at flat position based on cursor
+              np[fromIdx] = { ...np[fromIdx], group_id: null, position: undefined };
+              // Insert into flat list at the position where the user dropped
+              const newFlatItems = [...currentFlatItems];
+              const insertAt = flatTargetAtDrop ?? currentFlatItems.length;
+              newFlatItems.splice(insertAt, 0, { type: 'prompt', origIdx: fromIdx, prompt: np[fromIdx] });
+              // Reassign positions
+              const newGroups = [...promptGroups];
+              newFlatItems.forEach((item, pos) => {
+                if (item.type === 'group') {
+                  const gIdx = newGroups.findIndex(g => g.id === item.group.id);
+                  if (gIdx >= 0) newGroups[gIdx] = { ...newGroups[gIdx], position: pos };
+                } else {
+                  np[item.origIdx] = { ...np[item.origIdx], position: pos };
+                }
+              });
+              setPrompts(np);
+              setPromptGroups(newGroups);
+              savePromptsImmediate(np);
+              ipcRenderer.invoke('prompt-groups:save', newGroups);
+              if (editItem !== null) setEditingInsertionIndex(np.indexOf(editItem));
+              return null;
+            } else if (targetGroup !== null) {
+              np[fromIdx] = { ...np[fromIdx], group_id: targetGroup, position: undefined };
             }
 
+            // Within-group reorder or cross-group
+            const adjustedTo = toPos > fromIdx ? toPos - 1 : toPos;
             if (fromIdx !== adjustedTo) {
               const [moved] = np.splice(fromIdx, 1);
               np.splice(adjustedTo, 0, moved);
@@ -688,11 +825,19 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
     startEditingAIPrompt(newPrompt);
   };
 
+  // Compute max flat position across groups and ungrouped prompts
+  const getNextFlatPosition = () => {
+    const maxGroupPos = promptGroups.reduce((max, g) => Math.max(max, g.position), -1);
+    const maxPromptPos = prompts.filter(p => !p.group_id).reduce((max, p) => Math.max(max, p.position ?? 0), -1);
+    return Math.max(maxGroupPos, maxPromptPos) + 1;
+  };
+
   const addPrompt = (groupId?: number | null) => {
     saveCurrentInsertion();
     saveCurrentAIPrompt();
     setEditingPromptId(null);
-    const newPrompts = [...prompts, { title: `Prompt ${prompts.length + 1}`, content: '', group_id: groupId ?? null }];
+    const pos = groupId ? undefined : getNextFlatPosition();
+    const newPrompts = [...prompts, { title: `Prompt ${prompts.length + 1}`, content: '', group_id: groupId ?? null, position: pos }];
     setPrompts(newPrompts);
     savePromptsImmediate(newPrompts);
     const idx = newPrompts.length - 1;
@@ -703,7 +848,7 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
 
   const addPromptGroup = async () => {
     const maxId = promptGroups.reduce((max, g) => Math.max(max, g.id), 0);
-    const newGroup: PromptGroup = { id: maxId + 1, name: `Group ${promptGroups.length + 1}`, description: '', position: promptGroups.length, is_collapsed: false };
+    const newGroup: PromptGroup = { id: maxId + 1, name: `Group ${promptGroups.length + 1}`, description: '', position: getNextFlatPosition(), is_collapsed: false };
     const newGroups = [...promptGroups, newGroup];
     setPromptGroups(newGroups);
     await ipcRenderer.invoke('prompt-groups:save', newGroups);
@@ -774,7 +919,8 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
         justifyContent: 'center',
         zIndex: 1000
       }}
-      onClick={onClose}
+      onMouseDown={(e) => { if (e.target === e.currentTarget) (e.currentTarget as HTMLElement).dataset.mouseDownOnOverlay = 'true'; }}
+      onClick={(e) => { if (e.target === e.currentTarget && (e.currentTarget as HTMLElement).dataset.mouseDownOnOverlay === 'true') onClose(); (e.currentTarget as HTMLElement).dataset.mouseDownOnOverlay = ''; }}
     >
       <div
         style={{
@@ -1410,162 +1556,135 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                       </div>
                     </div>
 
-                    <div ref={textListRef} style={{ display: 'flex', flexDirection: 'column', overflowY: 'auto', flex: 1, minHeight: 0 }}>
+                    <div ref={textListRef} data-group-drop="ungrouped" style={{ display: 'flex', flexDirection: 'column', overflowY: 'auto', flex: 1, minHeight: 0 }}>
                       {prompts.length === 0 && promptGroups.length === 0 ? (
                         <div style={{ padding: '24px', textAlign: 'center', color: '#555', fontSize: '12px', border: '2px dashed #333', borderRadius: '10px' }}>Пока нет промптов</div>
-                      ) : (<>
-                        {/* Groups */}
-                        {promptGroups.map((group, groupIdx) => {
-                          const groupPrompts = prompts.map((p, i) => ({ ...p, _idx: i })).filter(p => p.group_id === group.id);
-                          const isCollapsed = group.is_collapsed;
-                          const isDropTarget = draggingTextIndex !== null && dragOverGroupId === group.id;
-                          const isGroupSelected = editingGroupId === group.id;
-                          const isGroupDragged = draggingGroupIndex === groupIdx;
-                          const isGroupGapHere = draggingGroupIndex !== null && groupDropTarget === groupIdx;
-                          const groupGapH = dragGroupCardHeight.current;
-                          const groupGapTransition = groupDragTransitionsReady ? 'height 0.12s ease-out, margin-bottom 0.12s ease-out' : 'none';
-
-                          return (
-                            <React.Fragment key={`g-${group.id}`}>
-                              {/* Gap slot before this group */}
-                              <div style={{ height: isGroupGapHere ? `${groupGapH + 8}px` : '0px', marginBottom: isGroupGapHere ? '4px' : '0px', overflow: 'hidden', transition: groupGapTransition, boxSizing: 'border-box' as const }}>
-                                <div style={{ height: `${groupGapH + 8}px`, borderRadius: '10px', border: '2px dashed #8b5cf640', backgroundColor: '#8b5cf608', boxSizing: 'border-box' as const }} />
-                              </div>
-                              <div
-                                data-group-drop={group.id}
-                                style={{ marginBottom: '4px', borderRadius: '8px', border: isDropTarget ? '2px solid #8b5cf6' : '2px solid transparent', transition: 'border-color 0.15s ease', display: isGroupDragged ? 'none' : undefined }}
-                              >
-                                {/* Group header */}
-                                <div
-                                  data-group-header
-                                  data-group-idx={groupIdx}
-                                  data-hidden={isGroupDragged || undefined}
-                                  style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '11px 12px', marginBottom: '4px', backgroundColor: isGroupSelected ? '#252525' : '#222', border: isGroupSelected ? '2px solid #8b5cf6' : '2px solid #333', borderRadius: '10px', cursor: 'pointer', userSelect: 'none' }}
-                                  onClick={() => { if (isGroupSelected) { toggleGroupCollapsed(group.id); } else { startEditingGroup(group.id); } }}
-                                >
-                                  <div
-                                    onClick={(e) => { e.stopPropagation(); toggleGroupCollapsed(group.id); }}
-                                    onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.backgroundColor = '#3a3a3a'; }}
-                                    onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.backgroundColor = 'transparent'; }}
-                                    style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', width: '20px', height: '20px', borderRadius: '4px', flexShrink: 0, transition: 'background-color 0.1s' }}
-                                  >
-                                    <span style={{ fontSize: '10px', color: '#888' }}>{isCollapsed ? '\u25B6' : '\u25BC'}</span>
+                      ) : (() => {
+                        const flatItems = buildFlatItems();
+                        const flatGapH = dragFlatItemHeight.current;
+                        const flatGapTransition = flatDragReady ? 'height 0.12s ease-out, margin-bottom 0.12s ease-out' : 'none';
+                        return (<>
+                          {flatItems.map((item, flatIdx) => {
+                            // Suppress gap slot when hovering over a group zone (prompt will move INTO group, not reorder)
+                            const isOverGroupZone = dragOverGroupId !== null && dragOverGroupId !== 'ungrouped';
+                            const isFlatGapHere = draggingFlatIdx !== null && flatDropTarget === flatIdx && !isOverGroupZone;
+                            if (item.type === 'group') {
+                              const group = item.group;
+                              const groupPrompts = prompts.map((p, i) => ({ ...p, _idx: i })).filter(p => p.group_id === group.id);
+                              const isCollapsed = group.is_collapsed;
+                              const isDropTarget = (draggingTextIndex !== null || draggingFlatIdx !== null) && dragOverGroupId === group.id;
+                              const isGroupSelected = editingGroupId === group.id;
+                              const isFlatDragged = draggingFlatIdx === flatIdx;
+                              return (
+                                <React.Fragment key={`g-${group.id}`}>
+                                  <div style={{ height: isFlatGapHere ? `${flatGapH + 8}px` : '0px', marginBottom: isFlatGapHere ? '4px' : '0px', overflow: 'hidden', transition: flatGapTransition, boxSizing: 'border-box' as const }}>
+                                    <div style={{ height: `${flatGapH + 8}px`, borderRadius: '10px', border: '2px dashed #8b5cf640', backgroundColor: '#8b5cf608', boxSizing: 'border-box' as const }} />
                                   </div>
-                                  <span style={{ flex: 1, fontSize: '14px', color: isGroupSelected ? '#8b5cf6' : '#fff', fontWeight: '500', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{group.name}</span>
                                   <div
-                                    onPointerDown={handleGroupGripPointerDown(groupIdx)}
-                                    onClick={(e) => e.stopPropagation()}
-                                    style={{ display: 'grid', gridTemplateColumns: '3px 3px', gap: '2px', padding: '4px 2px', cursor: 'grab', flexShrink: 0, touchAction: 'none' }}
+                                    data-flat-container
+                                    data-group-drop={group.id}
+                                    style={{ marginBottom: '4px', borderRadius: '8px', border: isDropTarget ? '2px solid #8b5cf6' : '2px solid transparent', transition: 'border-color 0.15s ease', display: isFlatDragged ? 'none' : undefined }}
                                   >
-                                    {[...Array(6)].map((_, i) => <div key={i} style={{ width: '3px', height: '3px', borderRadius: '50%', backgroundColor: '#555' }} />)}
-                                  </div>
-                                </div>
-
-                              {/* Group prompts */}
-                              {!isCollapsed && (
-                                <div style={{ paddingLeft: '10px' }}>
-                                  {groupPrompts.length === 0 ? (
-                                    <div style={{ padding: '8px', textAlign: 'center', color: '#444', fontSize: '10px', border: '1px dashed #333', borderRadius: '8px', marginBottom: '4px' }}>
-                                      Перетащите сюда
-                                    </div>
-                                  ) : (
-                                    groupPrompts.map(prompt => {
-                                      const index = prompt._idx;
-                                      const isSelected = editingInsertionIndex === index;
-                                      const isDragged = draggingTextIndex === index;
-                                      const isGapHere = draggingTextIndex !== null && textDropTarget === index;
-                                      const gapH = dragCardHeight.current;
-                                      const gapTransition = dragTransitionsReady ? 'height 0.12s ease-out, margin-bottom 0.12s ease-out' : 'none';
-                                      return (
-                                        <React.Fragment key={index}>
-                                          <div style={{ height: isGapHere ? `${gapH}px` : '0px', marginBottom: isGapHere ? '4px' : '0px', overflow: 'hidden', transition: gapTransition, boxSizing: 'border-box' as const }}>
-                                            <div style={{ height: `${gapH}px`, borderRadius: '8px', border: '2px dashed #8b5cf640', backgroundColor: '#8b5cf608', boxSizing: 'border-box' as const }} />
-                                          </div>
-                                          <div
-                                            data-text-card
-                                            data-hidden={isDragged || undefined}
-                                            data-orig-index={index}
-                                            onClick={() => !isDragged && startEditingInsertion(index)}
-                                            style={{ padding: '9px 10px', marginBottom: '4px', backgroundColor: isSelected ? '#252525' : '#222', border: isSelected ? '2px solid #8b5cf6' : '2px solid #333', borderRadius: '8px', cursor: 'pointer', display: isDragged ? 'none' : 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px' }}
-                                          >
-                                            <span style={{ fontSize: '13px', color: isSelected ? '#8b5cf6' : '#fff', fontWeight: '500', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{prompt.title}</span>
-                                            <div
-                                              onPointerDown={handleGripPointerDown(index)}
-                                              onClick={(e) => e.stopPropagation()}
-                                              style={{ display: 'grid', gridTemplateColumns: '3px 3px', gap: '2px', padding: '4px 2px', cursor: 'grab', flexShrink: 0, touchAction: 'none' }}
-                                            >
-                                              {[...Array(6)].map((_, i) => <div key={i} style={{ width: '3px', height: '3px', borderRadius: '50%', backgroundColor: '#555' }} />)}
-                                            </div>
-                                          </div>
-                                        </React.Fragment>
-                                      );
-                                    })
-                                  )}
-                                </div>
-                              )}
-                            </div>
-                          </React.Fragment>
-                          );
-                        })}
-                        {/* Gap slot after last group */}
-                        {promptGroups.length > 0 && (
-                          <div style={{ height: (draggingGroupIndex !== null && groupDropTarget === promptGroups.length) ? `${dragGroupCardHeight.current + 8}px` : '0px', overflow: 'hidden', transition: groupDragTransitionsReady ? 'height 0.12s ease-out' : 'none', boxSizing: 'border-box' as const }}>
-                            <div style={{ height: `${dragGroupCardHeight.current + 8}px`, borderRadius: '10px', border: '2px dashed #8b5cf640', backgroundColor: '#8b5cf608', boxSizing: 'border-box' as const }} />
-                          </div>
-                        )}
-
-                        {/* Ungrouped prompts */}
-                        {(() => {
-                          const ungrouped = prompts.map((p, i) => ({ ...p, _idx: i })).filter(p => !p.group_id);
-                          const isDropTarget = draggingTextIndex !== null && dragOverGroupId === 'ungrouped';
-
-                          return (
-                            <div
-                              data-group-drop="ungrouped"
-                              style={{ borderRadius: '8px', border: isDropTarget ? '2px solid #8b5cf6' : '2px solid transparent', transition: 'border-color 0.15s ease', ...(promptGroups.length > 0 && ungrouped.length > 0 ? { marginTop: '4px' } : {}) }}
-                            >
-                              {ungrouped.map(prompt => {
-                                const index = prompt._idx;
-                                const isSelected = editingInsertionIndex === index;
-                                const isDragged = draggingTextIndex === index;
-                                const isGapHere = draggingTextIndex !== null && textDropTarget === index;
-                                const gapH = dragCardHeight.current;
-                                const gapTransition = dragTransitionsReady ? 'height 0.12s ease-out, margin-bottom 0.12s ease-out' : 'none';
-                                return (
-                                  <React.Fragment key={index}>
-                                    <div style={{ height: isGapHere ? `${gapH}px` : '0px', marginBottom: isGapHere ? '8px' : '0px', overflow: 'hidden', transition: gapTransition, boxSizing: 'border-box' as const }}>
-                                      <div style={{ height: `${gapH}px`, borderRadius: '10px', border: '2px dashed #8b5cf640', backgroundColor: '#8b5cf608', boxSizing: 'border-box' as const }} />
-                                    </div>
                                     <div
-                                      data-text-card
-                                      data-hidden={isDragged || undefined}
-                                      data-orig-index={index}
-                                      onClick={() => !isDragged && startEditingInsertion(index)}
-                                      style={{ padding: '9px 12px', marginBottom: '8px', backgroundColor: isSelected ? '#252525' : '#222', border: isSelected ? '2px solid #8b5cf6' : '2px solid #333', borderRadius: '10px', cursor: 'pointer', display: isDragged ? 'none' : 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px' }}
+                                      data-flat-card
+                                      data-flat-idx={flatIdx}
+                                      data-hidden={isFlatDragged || undefined}
+                                      style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '11px 12px', marginBottom: '4px', backgroundColor: isGroupSelected ? '#252525' : '#222', border: isGroupSelected ? '2px solid #8b5cf6' : '2px solid #333', borderRadius: '10px', cursor: 'pointer', userSelect: 'none' }}
+                                      onClick={() => { if (isGroupSelected) { toggleGroupCollapsed(group.id); } else { startEditingGroup(group.id); } }}
                                     >
-                                      <span style={{ fontSize: '13px', color: isSelected ? '#8b5cf6' : '#fff', fontWeight: '500', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{prompt.title}</span>
                                       <div
-                                        onPointerDown={handleGripPointerDown(index)}
+                                        onClick={(e) => { e.stopPropagation(); toggleGroupCollapsed(group.id); }}
+                                        onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.backgroundColor = '#3a3a3a'; }}
+                                        onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.backgroundColor = 'transparent'; }}
+                                        style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', width: '20px', height: '20px', borderRadius: '4px', flexShrink: 0, transition: 'background-color 0.1s' }}
+                                      >
+                                        <span style={{ fontSize: '10px', color: '#888' }}>{isCollapsed ? '\u25B6' : '\u25BC'}</span>
+                                      </div>
+                                      <span style={{ flex: 1, fontSize: '14px', color: isGroupSelected ? '#8b5cf6' : '#fff', fontWeight: '500', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{group.name}</span>
+                                      <div
+                                        onPointerDown={handleFlatItemDrag(flatIdx)}
                                         onClick={(e) => e.stopPropagation()}
                                         style={{ display: 'grid', gridTemplateColumns: '3px 3px', gap: '2px', padding: '4px 2px', cursor: 'grab', flexShrink: 0, touchAction: 'none' }}
                                       >
                                         {[...Array(6)].map((_, i) => <div key={i} style={{ width: '3px', height: '3px', borderRadius: '50%', backgroundColor: '#555' }} />)}
                                       </div>
                                     </div>
-                                  </React.Fragment>
-                                );
-                              })}
-                            </div>
-                          );
-                        })()}
-
-                        {/* Gap slot after last item */}
-                        {prompts.length > 0 && (
-                          <div style={{ height: (draggingTextIndex !== null && textDropTarget === prompts.length) ? `${dragCardHeight.current}px` : '0px', overflow: 'hidden', transition: dragTransitionsReady ? 'height 0.12s ease-out' : 'none', boxSizing: 'border-box' as const }}>
-                            <div style={{ height: `${dragCardHeight.current}px`, borderRadius: '10px', border: '2px dashed #8b5cf640', backgroundColor: '#8b5cf608', boxSizing: 'border-box' as const }} />
+                                    {!isCollapsed && (
+                                      <div style={{ paddingLeft: '10px' }}>
+                                        {groupPrompts.length === 0 ? (
+                                          <div style={{ padding: '8px', textAlign: 'center', color: '#444', fontSize: '10px', border: '1px dashed #333', borderRadius: '8px', marginBottom: '4px' }}>
+                                            Перетащите сюда
+                                          </div>
+                                        ) : groupPrompts.map(prompt => {
+                                          const index = prompt._idx;
+                                          const isSelected = editingInsertionIndex === index;
+                                          const isDragged = draggingTextIndex === index;
+                                          const isGapHere = draggingTextIndex !== null && textDropTarget === index;
+                                          const gapH = dragCardHeight.current;
+                                          const gapTransition = dragTransitionsReady ? 'height 0.12s ease-out, margin-bottom 0.12s ease-out' : 'none';
+                                          return (
+                                            <React.Fragment key={index}>
+                                              <div style={{ height: isGapHere ? `${gapH}px` : '0px', marginBottom: isGapHere ? '4px' : '0px', overflow: 'hidden', transition: gapTransition, boxSizing: 'border-box' as const }}>
+                                                <div style={{ height: `${gapH}px`, borderRadius: '8px', border: '2px dashed #8b5cf640', backgroundColor: '#8b5cf608', boxSizing: 'border-box' as const }} />
+                                              </div>
+                                              <div
+                                                data-text-card
+                                                data-hidden={isDragged || undefined}
+                                                data-orig-index={index}
+                                                onClick={() => !isDragged && startEditingInsertion(index)}
+                                                style={{ padding: '9px 10px', marginBottom: '4px', backgroundColor: isSelected ? '#252525' : '#222', border: isSelected ? '2px solid #8b5cf6' : '2px solid #333', borderRadius: '8px', cursor: 'pointer', display: isDragged ? 'none' : 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px' }}
+                                              >
+                                                <span style={{ fontSize: '13px', color: isSelected ? '#8b5cf6' : '#fff', fontWeight: '500', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{prompt.title}</span>
+                                                <div onPointerDown={handleGripPointerDown(index)} onClick={(e) => e.stopPropagation()} style={{ display: 'grid', gridTemplateColumns: '3px 3px', gap: '2px', padding: '4px 2px', cursor: 'grab', flexShrink: 0, touchAction: 'none' }}>
+                                                  {[...Array(6)].map((_, i) => <div key={i} style={{ width: '3px', height: '3px', borderRadius: '50%', backgroundColor: '#555' }} />)}
+                                                </div>
+                                              </div>
+                                            </React.Fragment>
+                                          );
+                                        })}
+                                      </div>
+                                    )}
+                                  </div>
+                                </React.Fragment>
+                              );
+                            } else {
+                              // Ungrouped prompt as flat item
+                              const index = item.origIdx;
+                              const prompt = item.prompt;
+                              const isSelected = editingInsertionIndex === index;
+                              const isDragged = draggingTextIndex === index;
+                              const isFlatDragged = draggingFlatIdx === flatIdx;
+                              const isHidden = isDragged || isFlatDragged;
+                              return (
+                                <React.Fragment key={`p-${index}`}>
+                                  <div style={{ height: isFlatGapHere ? `${flatGapH + 8}px` : '0px', marginBottom: isFlatGapHere ? '4px' : '0px', overflow: 'hidden', transition: flatGapTransition, boxSizing: 'border-box' as const }}>
+                                    <div style={{ height: `${flatGapH + 8}px`, borderRadius: '10px', border: '2px dashed #8b5cf640', backgroundColor: '#8b5cf608', boxSizing: 'border-box' as const }} />
+                                  </div>
+                                  <div
+                                    data-flat-container
+                                    data-flat-card
+                                    data-flat-idx={flatIdx}
+                                    data-hidden={isHidden || undefined}
+                                    data-text-card
+                                    data-orig-index={index}
+                                    onClick={() => !isHidden && startEditingInsertion(index)}
+                                    style={{ padding: '9px 12px', marginBottom: '8px', backgroundColor: isSelected ? '#252525' : '#222', border: isSelected ? '2px solid #8b5cf6' : '2px solid #333', borderRadius: '10px', cursor: 'pointer', display: isHidden ? 'none' : 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px' }}
+                                  >
+                                    <span style={{ fontSize: '13px', color: isSelected ? '#8b5cf6' : '#fff', fontWeight: '500', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{prompt.title}</span>
+                                    <div onPointerDown={handleFlatItemDrag(flatIdx)} onClick={(e) => e.stopPropagation()} style={{ display: 'grid', gridTemplateColumns: '3px 3px', gap: '2px', padding: '4px 2px', cursor: 'grab', flexShrink: 0, touchAction: 'none' }}>
+                                      {[...Array(6)].map((_, i) => <div key={i} style={{ width: '3px', height: '3px', borderRadius: '50%', backgroundColor: '#555' }} />)}
+                                    </div>
+                                  </div>
+                                </React.Fragment>
+                              );
+                            }
+                          })}
+                          {/* Gap slot after last flat item */}
+                          <div style={{ height: (draggingFlatIdx !== null && flatDropTarget === flatItems.length && !(dragOverGroupId !== null && dragOverGroupId !== 'ungrouped')) ? `${flatGapH + 8}px` : '0px', overflow: 'hidden', transition: flatGapTransition, boxSizing: 'border-box' as const }}>
+                            <div style={{ height: `${flatGapH + 8}px`, borderRadius: '10px', border: '2px dashed #8b5cf640', backgroundColor: '#8b5cf608', boxSizing: 'border-box' as const }} />
                           </div>
-                        )}
-                      </>)}
+                        </>);
+                      })()}
                     </div>
                   </>
                 )}

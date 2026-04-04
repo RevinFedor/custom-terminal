@@ -854,11 +854,15 @@ function register({ projectManager, formatToolAction }) {
       console.log('[EditRange] File records:', allRecords.filter(r => r).length, '→ Keeping:', allRecords.filter(r => r && !removeUuids.has(r.uuid)).length);
       const compactUuid = crypto.randomUUID();
 
-      // Compact entry — sessionId MUST match what Claude will use on resume.
-      // Always use the IPC sessionId (tab's claudeSessionId) — this is what Claude --resume uses.
-      // Using file entries' sessionId (e.g. original 2fa76efe in a fork) causes a DAG fork:
-      // compact(sid=2fa76efe) and Claude's new entry(sid=e713a1a9) both point to same parent.
-      const fileSessionId = sessionId;
+      // Compact entry sessionId logic:
+      // - If compact is in the MIDDLE (entryAfter exists): use entryAfter's sessionId.
+      //   Entries around the compact may have a different sessionId than the tab's chain root
+      //   (after clear context / plan mode). Mismatched sessionId → Timeline shows false
+      //   "Clear Context" boundary between compact and entryAfter.
+      // - If compact is at the END (no entryAfter): use tab's sessionId (IPC parameter).
+      //   Claude --resume picks the newest leaf by timestamp; sessionId must match what
+      //   Claude expects. Using a stale file sessionId causes DAG fork.
+      const fileSessionId = entryAfter?.sessionId || sessionId;
       // Timestamp: if compact is in the MIDDLE (entryAfter exists), must be older than entryAfter.
       // If compact is at the END (no entryAfter), use NOW — must be newest leaf for Claude DAG.
       // Bug: using entryBefore.timestamp creates identical timestamps → Claude can't pick newest leaf.
@@ -1284,6 +1288,18 @@ function register({ projectManager, formatToolAction }) {
           // Detect "continued session" summary (context overflow recovery)
           const isContinued = cleanContent.startsWith('This session is being continued from a previous conversation');
 
+          // Look ahead: sum output_tokens across ALL assistant entries for this turn
+          let responseTokens = 0;
+          const entryIdx = activeBranch.indexOf(entry);
+          for (let j = entryIdx + 1; j < activeBranch.length; j++) {
+            const next = activeBranch[j];
+            if (next.type === 'assistant' && next.message?.usage) {
+              responseTokens += (next.message.usage.output_tokens || 0);
+            }
+            if (next.type === 'user' && !next.isSidechain) break;
+          }
+          if (!responseTokens) responseTokens = undefined;
+
           entries.push({
             uuid: entry.uuid,
             type: isContinued ? 'continued' : 'user',
@@ -1292,7 +1308,8 @@ function register({ projectManager, formatToolAction }) {
             hasImage: hasImage || undefined,
             isCompactSummary: entry.isCompactSummary || false,
             sessionId: entry.sessionId || entry._fromFile,
-            isPlan: !!entry.planContent
+            isPlan: !!entry.planContent,
+            responseTokens
           });
         } else if (entry.type === 'system' && entry.subtype === 'compact_boundary') {
           entries.push({
@@ -2211,6 +2228,19 @@ function register({ projectManager, formatToolAction }) {
       return { success: true, markers: rows.map(r => r.entry_uuid) };
     } catch (error) {
       console.error('[RewindMarkers] get error:', error);
+      return { success: false, error: error.message };
+    }
+  });
+
+  ipcMain.handle('timeline:delete-fork-marker', async (event, { sourceSessionId, forkSessionId }) => {
+    try {
+      const db = projectManager.db;
+      db.db.prepare('UPDATE fork_markers SET hidden = 1 WHERE source_session_id = ? AND forked_to_session_id = ?')
+        .run(sourceSessionId, forkSessionId);
+      console.log('[ForkMarker] Hidden:', sourceSessionId?.slice(0, 8), '→', forkSessionId?.slice(0, 8));
+      return { success: true };
+    } catch (error) {
+      console.error('[ForkMarker] delete error:', error);
       return { success: false, error: error.message };
     }
   });

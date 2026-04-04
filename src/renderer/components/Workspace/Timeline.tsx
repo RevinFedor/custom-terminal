@@ -1,6 +1,6 @@
 import React, { useEffect, useLayoutEffect, useState, useCallback, useRef, useMemo } from 'react';
 import { createPortal } from 'react-dom';
-import { Maximize2, Copy, Minimize2, Pencil, Trash2, StickyNote, ChevronDown, Check, Scissors, X } from 'lucide-react';
+import { Maximize2, Copy, Minimize2, Pencil, Trash2, StickyNote, ChevronDown, Check, Scissors, X, Zap } from 'lucide-react';
 import { terminalRegistry } from '../../utils/terminalRegistry';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
@@ -29,6 +29,7 @@ interface TimelineEntry {
   subAgentName?: string;
   subAgentTaskId?: string;
   docsEdited?: string[];
+  responseTokens?: number;
 }
 
 interface GroupInfo {
@@ -57,6 +58,10 @@ interface TimelineProps {
 }
 
 // Truncate text for tooltip display
+const formatTokenCount = (count: number): string => {
+  return `${(count / 1000).toFixed(1)}K`;
+};
+
 const truncateText = (text: string | unknown, maxLength: number = 120): string => {
   if (typeof text !== 'string') {
     if (Array.isArray(text)) {
@@ -75,6 +80,7 @@ interface ForkMarker {
   source_session_id: string;
   fork_session_id: string;
   entry_uuids: string[];  // Snapshot of all entry UUIDs at fork time
+  hidden?: boolean;        // Soft-deleted: stripe hidden but snapshot kept for boundary suppression
 }
 
 // Extract search text from entry content for terminal buffer search.
@@ -323,6 +329,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   const [isCmdHeld, setIsCmdHeld] = useState(false);
   const isCmdHeldRef = useRef(false);
   const chainResolvedRef = useRef<string | null>(null); // prevents A→B→A→B feedback loop
+  // hoveredForkIndex removed — replaced by hoveredForkMarkerIndex + activeForkMarkerIndex (CMD pattern)
 
   // Timeline notes state
   const [notes, setNotes] = useState<Record<string, string>>({});
@@ -479,6 +486,18 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       setActiveNoteIndex(null);
     }
   }, [isCmdHeld, hoveredNoteIndex, isNoteEditing, activeNoteIndex]);
+
+  // Fork marker tooltip: sync with CMD key — same pattern as notes
+  const [hoveredForkMarkerIndex, setHoveredForkMarkerIndex] = useState<number | null>(null);
+  const [activeForkMarkerIndex, setActiveForkMarkerIndex] = useState<number | null>(null);
+  useEffect(() => {
+    if (isCmdHeld && hoveredForkMarkerIndex !== null) {
+      setActiveForkMarkerIndex(hoveredForkMarkerIndex);
+      setActiveTooltipIndex(null); // hide entry tooltip
+    } else if (!isCmdHeld && activeForkMarkerIndex !== null && !isMouseInForkTooltipRef.current) {
+      setActiveForkMarkerIndex(null);
+    }
+  }, [isCmdHeld, hoveredForkMarkerIndex, activeForkMarkerIndex]);
 
   // Load timeline and fork markers when sessionId changes
   const loadTimeline = useCallback(async () => {
@@ -969,6 +988,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   const isMouseInTooltipRef = useRef(false);
   const isResizingTooltipRef = useRef(false);
   const isMouseInNoteTooltipRef = useRef(false);
+  const isMouseInForkTooltipRef = useRef(false);
+  const forkTooltipRef = useRef<HTMLDivElement>(null);
   const tooltipMeasuredRef = useRef(0);
   const [tooltipMeasuredH, setTooltipMeasuredH] = useState(0);
 
@@ -1799,6 +1820,37 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
 
   // Note tooltip position (same logic, simpler — smaller tooltip)
   const activeNoteEntry = activeNoteIndex !== null ? entries[activeNoteIndex] : null;
+  // Fork marker tooltip position (same pattern as notes)
+  const activeForkMarker = activeForkMarkerIndex !== null ? forkMarkers.find(m => {
+    if (m.hidden) return false; // hidden markers don't show tooltip
+    if (!m.entry_uuids || m.entry_uuids.length === 0) return false;
+    const snap = new Set(m.entry_uuids);
+    const e = entries[activeForkMarkerIndex];
+    if (!e || !snap.has(e.uuid)) return false;
+    const next = entries[activeForkMarkerIndex + 1];
+    return activeForkMarkerIndex === entries.length - 1 || (next && !snap.has(next.uuid));
+  }) : null;
+
+  const forkTooltipPos = activeForkMarkerIndex !== null ? (() => {
+    // Position at the fork STRIP level (between entry N and entry N+1), not at entry N's dot
+    const el = segmentRefs.current[activeForkMarkerIndex];
+    const nextEl = segmentRefs.current[activeForkMarkerIndex + 1];
+    if (!el) return null;
+    const rect = el.getBoundingClientRect();
+    let eCenterY: number;
+    if (nextEl) {
+      const nextRect = nextEl.getBoundingClientRect();
+      eCenterY = (rect.bottom + nextRect.top) / 2; // midpoint = strip center
+    } else {
+      eCenterY = rect.bottom + 10; // last entry — strip is below
+    }
+    const h = 60;
+    let clampedTop = Math.max(40, Math.min(eCenterY - h / 2, window.innerHeight - h - 10));
+    const wTop = Math.min(clampedTop, eCenterY - 20);
+    const wBottom = Math.min(Math.max(clampedTop + h, eCenterY + 20), window.innerHeight);
+    return { clampedTop, wTop, wH: wBottom - wTop, offset: clampedTop - wTop };
+  })() : null;
+
   const noteTooltipPos = activeNoteIndex !== null ? (() => {
     const eCenterY = getElementCenterY(activeNoteIndex);
     const h = isNoteEditing ? 230 : 120;
@@ -1864,7 +1916,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
           {/* Plan mode marker at the very beginning (first entry is from a child session — chain started before visible entries) */}
           {entries.length > 0 && entries[0].sessionId && sessionBoundaries.length > 0 &&
             sessionBoundaries.some(b => b.childSessionId === entries[0].sessionId) &&
-            !forkMarkers.some(m => !m.entry_uuids || m.entry_uuids.length === 0) && (
+            !forkMarkers.some(m => !m.entry_uuids || m.entry_uuids.length === 0) && (  /* any fork marker (even hidden) suppresses this */
             <div
               className="flex-shrink-0 w-full flex items-center justify-center"
               style={{ height: '8px' }}
@@ -1883,7 +1935,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
             </div>
           )}
           {/* Fork marker at the very beginning (empty snapshot = fork before any entries) */}
-          {forkMarkers.some(m => !m.entry_uuids || m.entry_uuids.length === 0) && entries.length > 0 && (
+          {forkMarkers.some(m => !m.hidden && (!m.entry_uuids || m.entry_uuids.length === 0)) && entries.length > 0 && (
             <div
               className="flex-shrink-0 w-full flex items-center justify-center"
               style={{ height: '8px' }}
@@ -1913,7 +1965,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
             const active = isSelected(entry, index);
             const isCompacted = entry.type === 'compact';
             const isLastEntry = index === entries.length - 1;
-            const forkMarker = forkMarkers.find(m => {
+            // Find ANY fork marker at this boundary (including hidden) for boundary suppression
+            const forkMarkerAny = forkMarkers.find(m => {
               if (!m.entry_uuids || m.entry_uuids.length === 0) return false;
               const snapshotUuids = new Set(m.entry_uuids);
               if (!snapshotUuids.has(entry.uuid)) return false;
@@ -1921,9 +1974,11 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
               const nextEntry = entries[index + 1];
               return nextEntry && !snapshotUuids.has(nextEntry.uuid);
             });
+            // Only non-hidden markers render the blue stripe
+            const forkMarker = forkMarkerAny && !forkMarkerAny.hidden ? forkMarkerAny : null;
 
             const isPlanModeBoundary = (() => {
-              if (isLastEntry || forkMarker) return false;
+              if (isLastEntry || forkMarkerAny) return false; // ANY fork marker (even hidden) suppresses boundary
               const nextEntry = entries[index + 1];
               if (!nextEntry || !entry.sessionId || !nextEntry.sessionId) return false;
               if (entry.sessionId === nextEntry.sessionId) return false;
@@ -2153,7 +2208,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                       height: dotHeight,
                       borderRadius: dotRadius,
                       backgroundColor: isUnreachable && !isHovered && !isCompacted ? 'transparent' : dotColor,
-                      border: isUnreachable && !isHovered && !isCompacted ? `1px solid ${rewindMarkers.has(entry.uuid) ? '#ec4899' : hasNote && notePos === 'dot' ? '#9333ea' : '#666'}` : 'none',
+                      border: isUnreachable && !isHovered && !isCompacted ? `1px solid ${rewindMarkers.has(entry.uuid) ? '#ec4899' : hasNote && notePos === 'dot' ? '#9333ea' : dotColor}` : 'none',
                       boxShadow: dotGlow,
                       boxSizing: 'border-box',
                       transition: 'width 0.15s, height 0.15s, border-radius 0.15s, background-color 0.2s, box-shadow 0.2s',
@@ -2279,17 +2334,43 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                 {forkMarker && !isOldHistory && (
                   <div
                     className="flex-shrink-0 w-full flex items-center justify-center"
-                    style={{ height: '8px' }}
-                    title="Fork point - this session was forked from here"
+                    style={{ height: '8px', cursor: isCmdHeld ? 'pointer' : 'default', padding: '6px 0', boxSizing: 'content-box' }}
+                    onMouseEnter={() => {
+                      setHoveredForkMarkerIndex(index);
+                      if (isCmdHeldRef.current) {
+                        setActiveForkMarkerIndex(index);
+                        setActiveTooltipIndex(null);
+                      }
+                    }}
+                    onMouseLeave={(e) => {
+                      setHoveredForkMarkerIndex(null);
+                      if (activeForkMarkerIndex !== index) return;
+                      // Same pattern as notes: check if mouse went left toward tooltip
+                      if (forkTooltipRef.current && e.relatedTarget instanceof Node && forkTooltipRef.current.contains(e.relatedTarget)) {
+                        return;
+                      }
+                      const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+                      const mouseX = e.clientX;
+                      const mouseY = e.clientY;
+                      const wentLeft = mouseX <= rect.left + 5;
+                      if (wentLeft && forkTooltipRef.current) {
+                        const wrapperRect = forkTooltipRef.current.getBoundingClientRect();
+                        if (mouseY < wrapperRect.top || mouseY > wrapperRect.bottom) {
+                          setActiveForkMarkerIndex(null);
+                        }
+                      } else if (!wentLeft) {
+                        setActiveForkMarkerIndex(null);
+                      }
+                    }}
                   >
                     <div
                       style={{
-                        width: isInViewport ? '10px' : '12px',
-                        height: isInViewport ? '3px' : '2px',
+                        width: activeForkMarkerIndex === index ? '14px' : isInViewport ? '10px' : '12px',
+                        height: activeForkMarkerIndex === index ? '4px' : isInViewport ? '3px' : '2px',
                         borderRadius: '1px',
-                        backgroundColor: isInViewport ? '#60a5fa' : '#3b82f6',
-                        boxShadow: isInViewport ? '0 0 6px rgba(59, 130, 246, 0.25)' : 'none',
-                        transition: 'background-color 0.2s, box-shadow 0.2s',
+                        backgroundColor: activeForkMarkerIndex === index ? '#93c5fd' : isInViewport ? '#60a5fa' : '#3b82f6',
+                        boxShadow: activeForkMarkerIndex === index ? '0 0 8px rgba(59, 130, 246, 0.5)' : isInViewport ? '0 0 6px rgba(59, 130, 246, 0.25)' : 'none',
+                        transition: 'all 0.2s',
                       }}
                     />
                   </div>
@@ -2604,6 +2685,9 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                   if (i === 29) console.warn('[EditRange] Claude start timeout');
                 }
 
+                // Show toast on success
+                useUIStore.getState().showToast('Rewind завершён', 'success', 1500);
+
                 return { removedCount: result.removedCount, removedUsers: result.removedUsers };
               }}
               onClose={() => setEditRangeState(null)}
@@ -2747,6 +2831,13 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                     </div>
                     <div className="flex items-center mt-1 pt-2 border-t border-white/5 shrink-0">
                       <span className="text-[10px] text-white/30">{new Date(currentActiveEntry.timestamp).toLocaleTimeString()}</span>
+                      {isCmdHeld && (
+                        <span className="flex items-center gap-1 ml-2 text-[10px]" style={{ color: '#e8a955' }}>
+                          <Zap size={10} />
+                          <span>↑{formatTokenCount(Math.ceil(currentActiveEntry.content.length / 3.5))}</span>
+                          {currentActiveEntry.responseTokens && <span>↓{formatTokenCount(currentActiveEntry.responseTokens)}</span>}
+                        </span>
+                      )}
                       <div className="flex-1" />
                       <button
                         onClick={(e) => {
@@ -2780,6 +2871,13 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                     </div>
                     <div className="flex items-center mt-1 pt-2 border-t border-white/5 shrink-0">
                       <span className="text-[10px] text-white/30">{new Date(currentActiveEntry.timestamp).toLocaleTimeString()}</span>
+                      {isCmdHeld && (
+                        <span className="flex items-center gap-1 ml-2 text-[10px]" style={{ color: '#e8a955' }}>
+                          <Zap size={10} />
+                          <span>↑{formatTokenCount(Math.ceil(currentActiveEntry.content.length / 3.5))}</span>
+                          {currentActiveEntry.responseTokens && <span>↓{formatTokenCount(currentActiveEntry.responseTokens)}</span>}
+                        </span>
+                      )}
                       <div className="flex-1" />
                       <button
                         onClick={(e) => {
@@ -2821,6 +2919,13 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                     </div>
                     <div className="flex items-center mt-1 pt-2 border-t border-white/5 shrink-0">
                       <span className="text-[10px] text-white/30">{new Date(currentActiveEntry.timestamp).toLocaleTimeString()}</span>
+                      {isCmdHeld && (
+                        <span className="flex items-center gap-1 ml-2 text-[10px]" style={{ color: '#e8a955' }}>
+                          <Zap size={10} />
+                          <span>↑{formatTokenCount(Math.ceil(currentActiveEntry.content.length / 3.5))}</span>
+                          {currentActiveEntry.responseTokens && <span>↓{formatTokenCount(currentActiveEntry.responseTokens)}</span>}
+                        </span>
+                      )}
                       <div className="flex-1" />
                       <button
                         onClick={(e) => {
@@ -3066,6 +3171,22 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
             >
               {!postPromptMode ? (
                 <>
+                  {/* Token summary for selected range */}
+                  {(() => {
+                    const { startIndex, endIndex } = rangeActionMenu.range;
+                    let upTotal = 0, downTotal = 0;
+                    for (let i = startIndex; i <= endIndex && i < entries.length; i++) {
+                      upTotal += Math.ceil(entries[i].content.length / 3.5);
+                      downTotal += (entries[i].responseTokens || 0);
+                    }
+                    return (upTotal > 0 || downTotal > 0) ? (
+                      <div className="flex items-center gap-1.5 px-3 py-1.5 text-[10px] border-b border-white/5" style={{ color: '#e8a955' }}>
+                        <Zap size={10} />
+                        <span>↑{formatTokenCount(upTotal)}</span>
+                        {downTotal > 0 && <span>↓{formatTokenCount(downTotal)}</span>}
+                      </div>
+                    ) : null;
+                  })()}
                   <button
                     className="w-full text-left px-3 py-2 text-xs text-white hover:bg-blue-600/80 rounded transition-colors cursor-pointer"
                     onClick={(e) => {
@@ -3153,6 +3274,75 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                   </div>
                 </div>
               )}
+            </div>
+          </TooltipPortal>
+        )}
+
+        {/* Fork Marker Tooltip Portal */}
+        {isVisible && activeForkMarkerIndex !== null && activeForkMarker && forkTooltipPos && (
+          <TooltipPortal>
+            <div
+              ref={forkTooltipRef}
+              onClick={(e) => e.stopPropagation()}
+              onMouseEnter={() => { isMouseInForkTooltipRef.current = true; }}
+              onMouseLeave={() => {
+                isMouseInForkTooltipRef.current = false;
+                setActiveForkMarkerIndex(null);
+                setHoveredForkMarkerIndex(null);
+              }}
+              style={{
+                position: 'fixed',
+                right: `${notesPanelWidth + (treeMode ? 160 : 32) - 8}px`,
+                top: `${forkTooltipPos.wTop}px`,
+                height: `${forkTooltipPos.wH}px`,
+                zIndex: 10002,
+                display: 'flex',
+                flexDirection: 'row',
+                alignItems: 'center',
+              }}
+            >
+              <div
+                style={{
+                  marginTop: `${forkTooltipPos.offset}px`,
+                  outline: 'none',
+                  backgroundColor: 'rgba(25, 25, 25, 0.98)',
+                  backdropFilter: 'blur(12px)',
+                  border: '1px solid rgba(59, 130, 246, 0.3)',
+                  borderRadius: '6px 0 0 6px',
+                  padding: '8px 12px',
+                  fontSize: '12px',
+                  color: 'white',
+                  minWidth: '180px',
+                  boxShadow: '-8px 8px 30px rgba(59,130,246,0.12), -2px 2px 8px rgba(59,130,246,0.08)',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: '6px',
+                }}
+              >
+                <div className="text-[10px] text-blue-300/80">
+                  Fork от <span className="text-blue-200 font-mono">{activeForkMarker.source_session_id?.slice(0, 8)}</span>
+                </div>
+                <button
+                  className="text-[10px] text-red-400 hover:text-red-300 hover:bg-red-500/10 rounded px-1.5 py-0.5 transition-colors self-start"
+                  onClick={async (e) => {
+                    e.stopPropagation();
+                    await ipcRenderer.invoke('timeline:delete-fork-marker', {
+                      sourceSessionId: activeForkMarker.source_session_id,
+                      forkSessionId: activeForkMarker.fork_session_id,
+                    });
+                    setForkMarkers(prev => prev.map(m =>
+                      m.source_session_id === activeForkMarker.source_session_id &&
+                      m.fork_session_id === activeForkMarker.fork_session_id
+                        ? { ...m, hidden: true }
+                        : m
+                    ));
+                    setActiveForkMarkerIndex(null);
+                    setHoveredForkMarkerIndex(null);
+                  }}
+                >
+                  Удалить маркер
+                </button>
+              </div>
             </div>
           </TooltipPortal>
         )}
