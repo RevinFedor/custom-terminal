@@ -5800,16 +5800,145 @@ ipcMain.handle('file:list-sh-scripts', async (event, dirPath) => {
   }
 });
 
-// Read file for preview
+// ========== FILE OPERATIONS (Sidebar) ==========
+
 ipcMain.handle('file:read', async (event, filePath) => {
   try {
-    const fs = require('fs');
     const content = fs.readFileSync(filePath, 'utf-8');
     return { success: true, content };
   } catch (error) {
-    console.error('[main] Error reading file:', error);
+    console.error('[FileOps] Error reading file:', error);
     return { success: false, error: error.message };
   }
+});
+
+ipcMain.handle('file:read-directory', async (event, dirPath) => {
+  try {
+    const items = fs.readdirSync(dirPath, { withFileTypes: true });
+    const result = [];
+    for (const item of items) {
+      if (item.name.startsWith('.')) continue;
+      const fullPath = path.join(dirPath, item.name);
+      let mtime = 0, birthtime = 0;
+      try { const s = fs.statSync(fullPath); mtime = s.mtimeMs; birthtime = s.birthtimeMs; } catch {}
+      const entry = { name: item.name, path: fullPath, isDirectory: item.isDirectory(), mtime, birthtime };
+      if (item.isDirectory()) entry.children = [];
+      result.push(entry);
+    }
+    result.sort((a, b) => {
+      if (a.isDirectory && !b.isDirectory) return -1;
+      if (!a.isDirectory && b.isDirectory) return 1;
+      return a.name.localeCompare(b.name);
+    });
+    return result;
+  } catch (err) {
+    console.error('[FileOps] Error reading directory:', err);
+    return [];
+  }
+});
+
+ipcMain.handle('file:rename', async (event, oldPath, newPath) => {
+  try { fs.renameSync(oldPath, newPath); console.log('[FileOps] Renamed:', oldPath, '→', newPath); return true; }
+  catch (err) { console.error('[FileOps] Rename error:', err); return false; }
+});
+
+ipcMain.handle('file:create', async (event, filePath) => {
+  try { fs.writeFileSync(filePath, '', 'utf-8'); console.log('[FileOps] Created:', filePath); return true; }
+  catch (err) { console.error('[FileOps] Create error:', err); return false; }
+});
+
+ipcMain.handle('file:create-folder', async (event, folderPath) => {
+  try { fs.mkdirSync(folderPath); console.log('[FileOps] Created folder:', folderPath); return true; }
+  catch (err) { console.error('[FileOps] Mkdir error:', err); return false; }
+});
+
+ipcMain.handle('file:delete', async (event, targetPath) => {
+  try { await shell.trashItem(targetPath); console.log('[FileOps] Trashed:', targetPath); return true; }
+  catch (err) { console.error('[FileOps] Delete error:', err); return false; }
+});
+
+ipcMain.handle('file:move-item', async (event, srcPath, destDir) => {
+  try {
+    const name = path.basename(srcPath);
+    const dest = path.join(destDir, name);
+    fs.renameSync(srcPath, dest);
+    console.log('[FileOps] Moved:', srcPath, '→', dest);
+    return true;
+  } catch (err) { console.error('[FileOps] Move error:', err); return false; }
+});
+
+ipcMain.handle('file:read-for-undo', async (event, targetPath) => {
+  try {
+    const stats = fs.statSync(targetPath);
+    if (stats.isDirectory()) {
+      const files = [];
+      const walk = (dir) => {
+        for (const item of fs.readdirSync(dir, { withFileTypes: true })) {
+          const fp = path.join(dir, item.name);
+          if (item.isDirectory()) { files.push({ path: fp, isDirectory: true, content: null }); walk(fp); }
+          else { files.push({ path: fp, isDirectory: false, content: fs.readFileSync(fp, 'utf-8') }); }
+        }
+      };
+      walk(targetPath);
+      return { path: targetPath, isDirectory: true, files };
+    }
+    return { path: targetPath, isDirectory: false, content: fs.readFileSync(targetPath, 'utf-8') };
+  } catch (err) { console.error('[FileOps] ReadForUndo error:', err); return null; }
+});
+
+ipcMain.handle('file:restore-from-undo', async (event, undoData) => {
+  try {
+    if (undoData.isDirectory) {
+      fs.mkdirSync(undoData.path, { recursive: true });
+      for (const f of undoData.files) {
+        if (f.isDirectory) fs.mkdirSync(f.path, { recursive: true });
+        else { fs.mkdirSync(path.dirname(f.path), { recursive: true }); fs.writeFileSync(f.path, f.content, 'utf-8'); }
+      }
+    } else {
+      fs.mkdirSync(path.dirname(undoData.path), { recursive: true });
+      fs.writeFileSync(undoData.path, undoData.content, 'utf-8');
+    }
+    console.log('[FileOps] Restored:', undoData.path);
+    return true;
+  } catch (err) { console.error('[FileOps] Restore error:', err); return false; }
+});
+
+// File watching
+let _folderWatcher = null;
+const _watchDebounce = new Map();
+
+ipcMain.handle('file:watch-folder', async (event, folderPath) => {
+  if (_folderWatcher) { _folderWatcher.close(); _folderWatcher = null; }
+  if (!folderPath) return false;
+  try {
+    const watchers = [];
+    const addWatch = (dir) => {
+      try {
+        const w = fs.watch(dir, { persistent: true }, (evType, filename) => {
+          if (!filename || filename.startsWith('.')) return;
+          const fp = path.join(dir, filename);
+          const key = fp + evType;
+          if (_watchDebounce.has(key)) return;
+          _watchDebounce.set(key, true);
+          setTimeout(() => _watchDebounce.delete(key), 500);
+          if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('fs:change', { eventType: evType, path: fp, directory: dir });
+        });
+        watchers.push(w);
+        for (const item of fs.readdirSync(dir, { withFileTypes: true })) {
+          if (item.isDirectory() && !item.name.startsWith('.') && item.name !== 'node_modules') addWatch(path.join(dir, item.name));
+        }
+      } catch {}
+    };
+    addWatch(folderPath);
+    _folderWatcher = { close: () => watchers.forEach(w => w.close()) };
+    console.log('[FileWatcher] Started:', folderPath);
+    return true;
+  } catch (err) { console.error('[FileWatcher] Error:', err); return false; }
+});
+
+ipcMain.handle('file:unwatch-folder', async () => {
+  if (_folderWatcher) { _folderWatcher.close(); _folderWatcher = null; console.log('[FileWatcher] Stopped'); }
+  return true;
 });
 
 // research:*, commands:*, prompts:*, ai-prompts:* → ipc/settings.js
