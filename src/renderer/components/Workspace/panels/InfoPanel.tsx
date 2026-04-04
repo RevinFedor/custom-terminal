@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { MarkdownEditor } from '@anthropic/markdown-editor';
-import '@anthropic/markdown-editor/styles.css';
+import { MarkdownEditor } from '@gt-editor/markdown-editor';
+import '@gt-editor/markdown-editor/styles.css';
 import { useWorkspaceStore } from '../../../store/useWorkspaceStore';
 import { useUIStore } from '../../../store/useUIStore';
 import { usePromptsStore } from '../../../store/usePromptsStore';

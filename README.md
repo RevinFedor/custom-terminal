@@ -143,7 +143,17 @@ Gemini CLI в одном табе управляет Claude-агентами в 
 ## Getting Started
 
 ```bash
-# TODO: инструкции по установке и запуску
+git clone https://github.com/RevinFedor/custom-terminal.git
+cd custom-terminal
+cp .env.example .env        # вписать GEMINI_API_KEY
+npm install
+npm run dev                  # dev mode с hot-reload
+```
+
+**Production build (macOS):**
+
+```bash
+npm run build:i              # собирает, копирует в /Applications, запускает
 ```
 
 ## Tech Stack

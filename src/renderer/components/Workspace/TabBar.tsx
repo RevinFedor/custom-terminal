@@ -3,8 +3,8 @@ import { useWorkspaceStore, TabColor, isTabInterrupted } from '../../store/useWo
 import { useProjectsStore } from '../../store/useProjectsStore';
 import { useUIStore } from '../../store/useUIStore';
 import { useCmdKey, useCmdHoverPopover, CmdHoverPopover } from '../../hooks/useCmdHoverPopover';
-import { MarkdownEditor } from '@anthropic/markdown-editor';
-import '@anthropic/markdown-editor/styles.css';
+import { MarkdownEditor } from '@gt-editor/markdown-editor';
+import '@gt-editor/markdown-editor/styles.css';
 // Removed: framer-motion import - was causing lag on project switch
 import { draggable, dropTargetForElements, monitorForElements } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
 import { attachClosestEdge, extractClosestEdge, type Edge } from '@atlaskit/pragmatic-drag-and-drop-hitbox/closest-edge';

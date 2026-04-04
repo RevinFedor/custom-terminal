@@ -4,7 +4,7 @@ import { useProjectsStore } from '../../store/useProjectsStore';
 import { useUIStore } from '../../store/useUIStore';
 import { useCmdKey, useCmdHoverPopover, CmdHoverPopover } from '../../hooks/useCmdHoverPopover';
 import { Terminal, FolderOpen, Plus, Clock, Trash2, Pencil, Star, ChevronDown, ChevronRight } from 'lucide-react';
-import { MarkdownEditor } from '@anthropic/markdown-editor';
+import { MarkdownEditor } from '@gt-editor/markdown-editor';
 import SemanticSearchSection from './SemanticSearch';
 
 const { ipcRenderer } = window.require('electron');
