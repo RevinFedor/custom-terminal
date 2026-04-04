@@ -3,8 +3,8 @@ import { createPortal } from 'react-dom';
 import { motion } from 'framer-motion';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
-import { MarkdownEditor } from '@anthropic/markdown-editor';
-import '@anthropic/markdown-editor/styles.css';
+import { MarkdownEditor } from '@gt-editor/markdown-editor';
+import '@gt-editor/markdown-editor/styles.css';
 
 export default function FilePreview() {
   const { filePreview, closeFilePreview, showToast } = useUIStore();
