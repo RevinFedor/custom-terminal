@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState, useRef } from 'react';
+import ReactDOM from 'react-dom';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import { useUIStore } from '../../store/useUIStore';
@@ -10,7 +11,8 @@ import ProjectHome from './ProjectHome';
 import TerminalArea from './TerminalArea';
 import Timeline from './Timeline';
 import NotesPanel from './NotesPanel';
-import FileExplorer from './FileExplorer';
+import '../../utils/sidebarBridge'; // Init window.electronAPI bridge
+import Sidebar from './Sidebar';
 import FilePreview from './FilePreview';
 import Resizer from './Resizer';
 import ResearchSheet from '../Research/ResearchSheet';
@@ -630,8 +632,32 @@ export default function Workspace() {
       </div>
 
       {/* Global Overlays */}
-      {/* File Explorer - opens in current terminal's directory */}
-      <FileExplorer projectPath={explorerPath} projectId={activeProjectId} />
+      {/* Sidebar File Explorer - opens in current terminal's directory */}
+      {(() => {
+        const { sidebarOpen } = getSidebarState(activeProjectId);
+        if (!sidebarOpen || !explorerPath) return null;
+        return ReactDOM.createPortal(
+          <div style={{ position: 'fixed', left: 0, top: 36, bottom: 0, width: 280, zIndex: 99999, backgroundColor: '#1e1e1e', borderRight: '1px solid #333', boxShadow: '4px 0 20px rgba(0,0,0,0.5)', display: 'flex', flexDirection: 'column' }}>
+            <Sidebar
+              folderPath={explorerPath}
+              width={280}
+              fontSize={useUIStore.getState().sidebarFontSize || 13}
+              onFileSelect={(filePath: string, isDir: boolean) => {
+                if (!isDir) {
+                  const ipc = window.require('electron').ipcRenderer;
+                  ipc.invoke('file:read', filePath).then((result: any) => {
+                    if (result?.success) {
+                      const ext = filePath.split('.').pop()?.toLowerCase() || '';
+                      openFilePreview({ path: filePath, content: result.content, language: ext });
+                    }
+                  });
+                }
+              }}
+            />
+          </div>,
+          document.body
+        );
+      })()}
 
       {/* Notes Editor Modal */}
       <NotesEditorModal />
