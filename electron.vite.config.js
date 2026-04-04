@@ -2,6 +2,10 @@ import { defineConfig } from 'electron-vite';
 import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
 import { resolve } from 'path';
+import { config } from 'dotenv';
+
+// Load .env so renderer can access env vars at build time
+const env = config({ path: resolve(__dirname, '.env') }).parsed || {};
 
 export default defineConfig({
   main: {
@@ -45,6 +49,9 @@ renderer: {
       }
     },
     plugins: [react(), tailwindcss()],
+    define: {
+      'process.env.GEMINI_API_KEY': JSON.stringify(env.GEMINI_API_KEY || ''),
+    },
     resolve: {
       alias: [
         { find: '@', replacement: resolve(__dirname, 'src/renderer') },

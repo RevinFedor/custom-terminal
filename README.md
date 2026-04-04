@@ -146,6 +146,8 @@ Gemini CLI в одном табе управляет Claude-агентами в 
 
 ## Getting Started
 
+> **macOS only.** Приложение использует `node-pty` и shell integration, заточенные под macOS. Windows/Linux не тестировались.
+
 ```bash
 git clone https://github.com/RevinFedor/custom-terminal.git
 cd custom-terminal
@@ -154,7 +156,7 @@ npm install
 npm run dev                  # dev mode с hot-reload
 ```
 
-**Production build (macOS):**
+**Production build:**
 
 ```bash
 npm run build:i              # собирает, копирует в /Applications, запускает
