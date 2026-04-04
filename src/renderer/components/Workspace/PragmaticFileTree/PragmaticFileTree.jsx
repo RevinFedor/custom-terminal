@@ -167,18 +167,14 @@ const PragmaticFileTree = ({
         // 1. Determine Destination
         if (targetData.isRoot) {
            destinationFolder = folderPath;
-        } else if (closestEdge) {
-           // If we are dropping on top/bottom of any item -> we move it to the SAME folder as that item
-           destinationFolder = targetData.parentId || folderPath;
-           console.log('[dnd]',`[Monitor] Decision: Move to sibling folder -> ${destinationFolder}`);
         } else if (targetData.isDirectory) {
            // Dropped INTO a folder (center zone)
            destinationFolder = targetData.id;
            console.log('[dnd]',`[Monitor] Decision: Move INTO folder -> ${destinationFolder}`);
         } else {
-           // Dropped on a file (middle area, but files don't have middle zone in our logic usually)
-           destinationFolder = targetData.parentId || folderPath;
-           console.log('[dnd]',`[Monitor] Decision: Fallback to parent -> ${destinationFolder}`);
+           // Dropped on a file — ignore (only folders accept drops)
+           console.log('[dnd]',`[Monitor] Decision: Drop on file ignored`);
+           return;
         }
 
         // 2. Execute Move (multi-select: move all selected items)

@@ -54,7 +54,9 @@ interface UIStore {
   projectTabsFontSize: number; // Project chips in Title Bar
 
   sidebarFontSize: number;     // File explorer sidebar
+  sidebarWidth: number;        // File explorer width (px)
 
+  setSidebarWidth: (width: number) => void;
   setTerminalFontSize: (size: number) => void;
 
   setTabsFontSize: (size: number) => void;
@@ -599,6 +601,12 @@ export const useUIStore = create<UIStore>((set, get) => ({
   tabsFontSize: initialFontSettings.tabsFontSize,
   projectTabsFontSize: initialFontSettings.projectTabsFontSize,
   sidebarFontSize: initialFontSettings.sidebarFontSize,
+  sidebarWidth: (() => { try { const v = localStorage.getItem('sidebarWidth'); return v ? Number(v) : 280; } catch { return 280; } })(),
+
+  setSidebarWidth: (width) => {
+    set({ sidebarWidth: width });
+    try { localStorage.setItem('sidebarWidth', String(width)); } catch {}
+  },
 
   // Editor Settings (from gt-editor)
   wordWrap: initialEditorSettings.wordWrap,

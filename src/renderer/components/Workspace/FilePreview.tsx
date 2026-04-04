@@ -1,6 +1,5 @@
 import React, { useState } from 'react';
 import { createPortal } from 'react-dom';
-import { motion } from 'framer-motion';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { MarkdownEditor } from '@gt-editor/markdown-editor';
@@ -35,14 +34,11 @@ export default function FilePreview() {
   if (!filePreview) return null;
 
   return createPortal(
-    <motion.div
-      initial={{ opacity: 0, scale: 0.98 }}
-      animate={{ opacity: 1, scale: 1 }}
-      transition={{ duration: 0.1, ease: 'easeOut' }}
+    <div
       style={{
         position: 'fixed',
         top: 36,
-        left: sidebarOpen ? 250 : 0,
+        left: sidebarOpen ? (useUIStore.getState().sidebarWidth || 280) : 0,
         right: 0,
         bottom: 0,
         zIndex: 100000,
@@ -90,7 +86,7 @@ export default function FilePreview() {
           foldStateKey={`file-preview:${filePreview.path}`}
         />
       </div>
-    </motion.div>,
+    </div>,
     document.body
   );
 }

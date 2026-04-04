@@ -222,7 +222,7 @@ const FileRow = memo(({
         ${isDropAfter ? 'drop-after' : ''}
       `}
       style={{ paddingLeft: `${paddingLeft}px`, position: 'relative' }}
-      onPointerDown={handleClick}
+      onClick={handleClick}
       onDoubleClick={handleDoubleClick}
       onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); onContextMenu(e, node); }}
     >
@@ -242,7 +242,7 @@ const FileRow = memo(({
         />
       ))}
 
-      <span className="arborist-chevron" onPointerDown={handleToggle}>
+      <span className="arborist-chevron" onClick={handleToggle}>
          {node.isDirectory && (
           <svg 
             width="12" 
