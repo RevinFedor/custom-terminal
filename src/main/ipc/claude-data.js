@@ -717,9 +717,21 @@ function register({ projectManager, formatToolAction }) {
       const entryUuids = parseTimelineUuids(sourcePath);
       console.log('[Claude Fork] Timeline entries:', entryUuids.length);
 
-      // Copy the file
+      // Copy the file and rewrite all sessionIds to newSessionId
+      // This prevents a false "Clear Context" boundary in Timeline
+      // (old entries had source sessionId, new ones get forked sessionId)
       fs.copyFileSync(sourcePath, destPath);
-      console.log('[Claude Fork] Copied:', sourcePath, '->', destPath);
+      const rawLines = fs.readFileSync(destPath, 'utf-8').split('\n');
+      const rewritten = rawLines.map(line => {
+        if (!line.trim()) return line;
+        try {
+          const rec = JSON.parse(line);
+          if (rec.sessionId) rec.sessionId = newSessionId;
+          return JSON.stringify(rec);
+        } catch { return line; }
+      });
+      fs.writeFileSync(destPath, rewritten.join('\n'));
+      console.log('[Claude Fork] Copied and rewrote sessionIds:', sourcePath, '->', destPath);
 
       // Save fork marker with UUIDs snapshot (always save, even if empty — marks fork at beginning)
       try {

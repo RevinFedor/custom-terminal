@@ -1,54 +1,35 @@
-# Fix: Ложные синие полоски (Fork Markers) в родительской сессии
+# Fix: Fork Markers — ложные полоски и удаление
 
 ### Симптомы
-После форка в родительской сессии появляется синяя полоска в самом конце таймлайна, хотя это родитель — разветвление произошло от НЕГО, а не К нему.
+- После форка в родительской сессии появляется синяя полоска в самом конце таймлайна
+- Удаление fork маркера (синей полоски) приводит к появлению ложного зелёного "Clear Context" маркера
+- В каскадных форках (форк из форка) ложная синяя полоска от деда-сессии появляется вместо правильной
 
-## Причина
+## Эволюция решений (хронология)
 
-`saveForkMarker(source, forkedTo, uuids)` при создании форка A→B **наследует** маркеры от A. Если A сам был форком от Z, в DB есть маркер `Z → A`. При наследовании создаётся `Z → B`.
+### Этап 1: directParent фильтр (ранний фикс)
+**Проблема:** `getForkMarkers(sessionId)` возвращает маркеры в обе стороны (`WHERE source = ? OR forked_to = ?`). В родителе A после форка A→B появлялась лишняя синяя полоска.
 
-`getForkMarkers(sessionId)` ищет `WHERE source = ? OR forked_to = ?` — возвращает маркеры в обе стороны.
+**Решение:** В renderer показывается **только** маркер `forked_to === sessionId` (дочерний). В родителе не нужны синие полоски — fork point виден в дочерней сессии.
 
-Для сессии A результат:
-- `A → B` — **правильный** (форк ОТ меня, показать где)
-- `Z → A` — **лишний** (я сам форк ОТ Z, не показывать)
+### Этап 2: forkSnapshotSets (подавление наследованных границ)
+**Проблема:** `isPlanModeBoundary` проверяет `entry.sessionId !== nextEntry.sessionId`. В форке наследованные plan mode transitions (A→B→C) показывались как ложные бирюзовые полоски.
 
-Лишние маркеры имеют snapshot со ВСЕМИ uuid из A (snapshot делался при создании A из Z). Все entries в snapshot → синяя полоска на последнем entry (`isLastEntry = true`).
+**Решение:** `forkSnapshotSets` (useMemo) — если **обе** записи в одном snapshot → граница из родительской цепочки → подавить. Остаётся как safety net.
 
-## Отброшенные подходы
-- **Merge всех chain files в один файл при форке** (remap sessionIds): Ломало plan mode маркеры, augmentation, resolveSessionChain. Откачено.
-- **Augmentation entries** (сканирование sessionId transitions): Блокировалось forkUuids (все UUID в snapshot), все transitions считались fork transitions.
+### Этап 3: SessionId Rewrite при форке (текущее решение)
 
-## Решение
-Только `directParent` маркер в renderer — показывается **только в дочерней сессии**:
-```javascript
-// Только маркер "я дочерняя сессия" (forked_to === sessionId)
-// fromMe (source === sessionId) убран — в родителе не нужны синие полоски,
-// fork point уже виден в дочерней сессии через её directParent маркер.
-toMe = markers.filter(m => m.fork_session_id === sessionId)
-directParent = toMe с максимальным entry_uuids.length
-markers = directParent ? [directParent] : []
-```
+**Проблема:** При копировании JSONL все entries сохраняли sessionId оригинала. Новые entries от Claude CLI получали sessionId форка. Timeline видел разные sessionId → ложный "Clear Context" маркер. Fork marker подавлял это, но удаление маркера оголяло ложную границу.
 
-**Почему нужен directParent:** В форке entries имеют `sessionId` оригинала (`2fa76efe`), а compact/новые entries — `sessionId` форка (`79fb8d32`). Без fork marker на границе `isPlanModeBoundary` видит смену sessionId и рисует бирюзовую полоску (plan mode). Fork marker подавляет это (`if (forkMarker) return false` в `isPlanModeBoundary`).
+**Ранее отброшено:** "Merge всех chain files + remap sessionIds" — ломало plan mode маркеры, augmentation, resolveSessionChain.
 
-**Почему только ОДИН:** Inherited маркеры (от дедушек) имеют snapshot из других сессий — показывают синие полоски в неправильных местах. Direct parent = самый большой snapshot = самый свежий.
+**Почему сейчас работает:** Не мержим файлы — просто переписываем sessionId в копии. Все entries в форке получают единый sessionId. Нет смены sessionId → нет ложных границ → fork marker нужен только как визуальный индикатор (синяя полоска), а не для подавления.
 
-**Почему fromMe убран:** При форке из сессии A→B, маркер `A→B` (fromMe) показывал синюю полоску в Timeline родителя A. Пользователь видел лишние синие полоски в сессии, из которой он форкал. Fork point уже виден в дочерней сессии B (через directParent `A→B`), дублирование в родителе не нужно.
-
-## Наследованные plan mode границы в форках
-
-### Проблема
-`isPlanModeBoundary` проверяет `entry.sessionId !== nextEntry.sessionId`. В форке, если родительская цепочка имела plan mode transitions (A→B→C), ВСЕ эти session boundaries наследуются в форкнутый Timeline. Fork marker (`if (forkMarker) return false`) подавляет только одну точку — сам fork boundary. Но границы A→B и B→C внутри snapshot'а показываются как ложные бирюзовые plan mode полоски.
-
-### Пробовали и отбросили
-- Фильтрация по `sessionBoundaries` из chain resolution: ненадёжна для fork copies (мосты скопированы из оригинала).
-
-### Решение
-Предвычисленные `forkSnapshotSets` (useMemo) — массив Set'ов из `entry_uuids` всех fork markers. В `isPlanModeBoundary`: если **обе** записи (current и next) находятся в одном snapshot → граница из родительской цепочки → подавить. Порядок проверок:
-1. `forkMarker` (точка форка) → false (существующая логика)
-2. `forkSnapshotSets` (обе записи в snapshot) → false (новая логика)
-3. Иначе → true (реальный plan mode)
+**Следствия:**
+- **Наследование маркеров убрано** — `saveForkMarker` больше не копирует маркеры от родителя. Наследованные маркеры от дедушек имели БОЛЬШИЙ snapshot чем direct parent → `directParent` selection выбирала деда вместо реального родителя, создавая ложную полоску.
+- **Soft-delete** — удаление маркера ставит `hidden=1` (колонка `fork_markers.hidden`). Hidden маркеры не рендерят полоску, но snapshot'ы сохраняются для `forkSnapshotSets` (safety net на случай старых форков без sessionId rewrite).
+- **Bridge isolation** — `loadJsonlRecords` определяет bridge по `entry.sessionId !== fileName`. После rewrite все entries имеют sessionId = fileName → `bridgeSessionId = null` → fork-копия не может быть ошибочно «склеена» с parent chain.
 
 **Связанные факты:**
 - [`fact-timeline.md`](fact-timeline.md) — Fork & Plan Mode Markers (визуальные разделители)
+- [`fact-backtrace-jsonl.md`](fact-backtrace-jsonl.md) — Section 3: Fork vs Bridge isolation

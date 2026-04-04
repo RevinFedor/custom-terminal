@@ -134,6 +134,8 @@ Entries используют `flex: '1 0 auto'` с минимальной выс
 - **Beginning markers:** Если fork/plan произошёл до первой entry (пустой snapshot), маркер рендерится в самом верху Timeline.
 - **Viewport Dash:** Маркеры реагируют на viewport — при пересечении вьюпорта с диапазоном entry, dash становится шире (10px vs 12px).
 - **Без красного фона:** Маркеры-разделители не имеют собственного unreachable-фона — красный показывается только на segment-div'ах entries выше и ниже.
+- **Soft-delete:** Удаление fork marker через UI ставит `hidden=1` в БД. Hidden маркеры не рендерят полоску, но snapshot'ы остаются для `forkSnapshotSets` (подавление ложных plan mode границ в старых форках).
+- **CMD+hover tooltip:** Fork marker поддерживает CMD+наведение (паттерн заметок). Показывает session ID источника + кнопку "Удалить маркер". Позиционирование: midpoint между `segmentRefs[N].bottom` и `segmentRefs[N+1].top` (fork strip рендерится МЕЖДУ entries, а не на entry).
 
 ### Smart Tooltip
 - При наведении на точку появляется превью сообщения.
