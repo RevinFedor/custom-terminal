@@ -974,18 +974,10 @@ class DatabaseManager {
    */
   saveForkMarker(sourceSessionId, forkedToSessionId, entryUuids) {
     try {
-      // First, copy all inherited markers from parent session
-      const parentMarkers = this.getForkMarkers(sourceSessionId);
-      for (const marker of parentMarkers) {
-        const inheritedJson = JSON.stringify(marker.entry_uuids || []);
-        this.db.prepare(`
-          INSERT OR IGNORE INTO fork_markers (source_session_id, forked_to_session_id, entry_uuids_json)
-          VALUES (?, ?, ?)
-        `).run(marker.source_session_id, forkedToSessionId, inheritedJson);
-        console.log('[DB] Inherited fork marker copied:', marker.source_session_id, '->', forkedToSessionId);
-      }
+      // No inheritance needed: fork now rewrites all sessionIds in the copied JSONL,
+      // eliminating false boundaries. Inherited markers would only cause wrong blue stripes.
 
-      // Then add the new fork marker
+      // Add the new fork marker
       const entryUuidsJson = JSON.stringify(entryUuids || []);
       this.db.prepare(`
         INSERT OR REPLACE INTO fork_markers (source_session_id, forked_to_session_id, entry_uuids_json)

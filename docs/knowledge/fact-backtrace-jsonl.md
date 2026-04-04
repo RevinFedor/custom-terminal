@@ -76,26 +76,15 @@ Claude только добавляет запись типа `compact_boundary`,
 При поиске моста в алгоритме Backtrace введена проверка: `!seen.has(entry.parentUuid)`.
 Мы следуем только по тем мостам, чья родительская запись еще не была обработана. Это гарантирует строго направленное движение к корню цепочки (root session).
 
-### Invisible Intent: Internal ID Static (Fork vs Bridge)
-Наш механизм форка (`copyFileSync`) просто копирует JSONL-файл целиком. В отличие от нативного форка Claude CLI, который перезаписывает `sessionId` внутри записей, в наших копиях **все старые записи сохраняют оригинальный ID**.
-- **Следствие:** Любой файл-форк выглядит для алгоритма как «Bridge-ребенок» родительской сессии, так как его первая запись ссылается на старый ID.
-- **Решение:** В логику `resolveLatestSessionInChain` добавлена проверка через `getParentSession(fId)`. Если файл обнаружен в базе данных форков (`fork_markers`), он **пропускается** как потенциальный мост Plan Mode. Это предотвращает ложное «склеивание» веток диалога, которые были намеренно разделены пользователем через Fork.
+### Invisible Intent: Fork vs Bridge Isolation
+При форке сессии приложение копирует JSONL-файл и **переписывает все sessionId** в копии на sessionId форка. Это устраняет проблему «склеивания» fork-копии с parent chain:
+- `loadJsonlRecords` определяет bridge по `entry.sessionId !== fileName`. После rewrite все entries имеют sessionId = fileName → `bridgeSessionId = null` → fork изолирован.
+- `resolveLatestSessionInChain` не найдёт fork-копию как bridge child (первый entry имеет sessionId форка, не родителя).
+- **Safety net:** Проверка `getParentSession(fId)` в `resolveLatestSessionInChain` остаётся — пропускает файлы, зарегистрированные в `fork_markers`, на случай старых форков без sessionId rewrite.
 
----
+**Историческая ловушка (до rewrite):** Без перезаписи sessionId fork-копия выглядела как Bridge-ребенок родительской сессии. Скопированные bridge-записи внутри копии могли увести `resolveSessionChain` в оригинальную chain, пропуская промежуточные сессии. SessionId rewrite полностью устраняет эту проблему — скопированные bridges становятся обычными entries (их sessionId совпадает с файлом).
 
-## 3.1. Fork Copies Bridges (Ловушка при форке)
-
-### Проблема
-При форке сессии приложение **копирует JSONL-файл** целиком. Внутри копии сохраняются все bridge-записи (`_isBridge`) от оригинальной цепи. Когда `resolveSessionChain` обрабатывает форкнутый файл, он следует по этим скопированным мостам и попадает в оригинальную цепь, **пропуская промежуточные сессии**.
-
-### Пример
-Оригинальная цепь: `A → B(plan mode) → C(plan mode)`.
-Форк из `C` → создаёт `D.jsonl` (копия `C.jsonl`).
-В `D.jsonl` есть bridge к `B` (из оригинала).
-`resolveSessionChain(D)` строит цепь: `D → B → A`. Сессия `C` пропущена.
-
-### Следствие для UI
-`sessionBoundaries` из `resolveSessionChain` НЕ содержит всех plan mode переходов. Записи внутри `entries` при этом СОДЕРЖАТ правильные `sessionId` (из оригинальных данных).
+См. [`fix-fork-markers.md`](fix-fork-markers.md) — эволюция решений.
 
 ## 3.2. Sub-agents (Task tool) Inline Storage
 
