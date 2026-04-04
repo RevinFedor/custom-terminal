@@ -253,6 +253,8 @@ class DatabaseManager {
     `);
     // Migration: add entry_uuids_json column if not exists
     try { this.db.exec(`ALTER TABLE fork_markers ADD COLUMN entry_uuids_json TEXT NOT NULL DEFAULT '[]'`); } catch (e) {}
+    // Migration: add hidden column for soft-delete (keeps snapshot data for boundary suppression)
+    try { this.db.exec(`ALTER TABLE fork_markers ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0`); } catch (e) {}
 
     // Tab history table - closed tabs archive
     this.db.exec(`
@@ -723,7 +725,7 @@ class DatabaseManager {
     const transaction = this.db.transaction((list) => {
       this.db.prepare('DELETE FROM prompts').run();
       const insert = this.db.prepare('INSERT INTO prompts (title, content, position, group_id) VALUES (?, ?, ?, ?)');
-      list.forEach((p, index) => insert.run(p.title, p.content, index, p.group_id ?? null));
+      list.forEach((p, index) => insert.run(p.title, p.content, p.position != null ? p.position : index, p.group_id ?? null));
     });
     transaction(prompts);
   }
@@ -747,7 +749,7 @@ class DatabaseManager {
     const transaction = this.db.transaction((list) => {
       this.db.prepare('DELETE FROM prompt_groups').run();
       const insert = this.db.prepare('INSERT INTO prompt_groups (id, name, position, description, is_collapsed) VALUES (?, ?, ?, ?, ?)');
-      list.forEach((g, index) => insert.run(g.id, g.name, index, g.description || '', g.is_collapsed ? 1 : 0));
+      list.forEach((g, index) => insert.run(g.id, g.name, g.position != null ? g.position : index, g.description || '', g.is_collapsed ? 1 : 0));
     });
     transaction(groups);
   }
@@ -1007,7 +1009,7 @@ class DatabaseManager {
   getForkMarkers(sessionId) {
     // Search by both source and destination to show markers in both sessions
     const rows = this.db.prepare(`
-      SELECT source_session_id, forked_to_session_id, entry_uuids_json, created_at
+      SELECT source_session_id, forked_to_session_id, entry_uuids_json, created_at, hidden
       FROM fork_markers
       WHERE source_session_id = ? OR forked_to_session_id = ?
       ORDER BY created_at
@@ -1019,7 +1021,8 @@ class DatabaseManager {
       source_session_id: row.source_session_id,
       fork_session_id: row.forked_to_session_id,
       entry_uuids: JSON.parse(row.entry_uuids_json || '[]'),
-      created_at: row.created_at
+      created_at: row.created_at,
+      hidden: !!row.hidden
     }));
   }
 

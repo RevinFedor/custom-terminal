@@ -93,7 +93,7 @@ Fork делает `fs.copyFile` всего JSONL + перезаписывает 
 | `progress` | отдельный тип | Стриминг Bash с incremental output |
 | `retryAttempt` | system.api_error | Retry статус в реальном времени |
 | `thinkingMetadata.level` | user entries | high/none — thinking mode status |
-| `message.usage` | assistant entries | Токены input/output для каждого ответа |
+| `message.usage` | assistant entries | Токены. **Внимание:** `input_tokens` — только uncached часть; полный контекст = `input_tokens + cache_read_input_tokens + cache_creation_input_tokens`. Один ход Claude генерирует **несколько** assistant entries (thinking, tool_use, text) — `output_tokens` нужно суммировать |
 
 ## Скрытые env vars
 
