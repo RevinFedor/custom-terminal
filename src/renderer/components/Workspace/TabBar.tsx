@@ -869,6 +869,7 @@ function TabBar({ projectId }: TabBarProps) {
     };
 
     const handleClaudeBusy = (_: any, { tabId, busy }: { tabId: string; busy: boolean }) => {
+      console.warn('[TabBar:BusyState] tabId=' + tabId.slice(-8) + ' busy=' + busy);
       setClaudeBusyMap(prev => {
         if (prev.get(tabId) === busy) return prev;
         const next = new Map(prev);

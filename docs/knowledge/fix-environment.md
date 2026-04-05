@@ -231,6 +231,35 @@ const cmd = 'lsof -p ' + pid + ' | grep cwd | awk \'{print ' + '\$' + '9}\'';
 - **Проблема:** Быстрая отправка текста воспринимается как вставка (paste) и не триггерит выполнение команды.
 - **Решение:** Всегда делать задержку 150мс перед отправкой `\r` (Enter).
 
+# Fix: process.env в Renderer = undefined после production build
+
+## Симптомы
+- API calls возвращают `key=undefined` в production (packaged app)
+- В dev mode (npm run dev) всё работает
+- Gemini API возвращает 400 "API key not valid"
+
+## Причина
+Vite заменяет `process.env.X` в renderer-коде на **литерал при сборке**. Если env var не определён в build-time контексте — подставляется `undefined`. Main process (`src/main/`) работает с настоящим `process.env` (Node.js runtime), а renderer — с замороженным снапшотом.
+
+## Решение
+`define` в `electron.vite.config.js` с предварительной загрузкой `.env` через `dotenv`:
+```javascript
+import { config } from 'dotenv';
+const env = config({ path: resolve(__dirname, '.env') }).parsed || {};
+
+// В секции renderer:
+define: {
+  'process.env.GEMINI_API_KEY': JSON.stringify(env.GEMINI_API_KEY || ''),
+},
+```
+
+## Почему не другие подходы
+- `VITE_` prefix (`import.meta.env.VITE_GEMINI_API_KEY`) — требует переписать все 11 мест в renderer, ломает единообразие с main process
+- IPC handler для получения ключа — оверинжиниринг для статического значения
+- `.env` loader в main.js — работает только для main process, renderer бандлится отдельно
+
+---
+
 # Fact: Pragmatic Drag-and-Drop (PDND)
 
 - Библиотека от Atlassian (`@atlaskit/pragmatic-drag-and-drop`).
