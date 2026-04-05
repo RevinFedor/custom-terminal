@@ -755,6 +755,7 @@ function App() {
 
     // Claude CLI spinner busy/idle → track on sub-agent tab + project badge
     const handleClaudeBusyState = (_: any, data: { tabId: string; busy: boolean }) => {
+      console.warn('[App:BusyState] tabId=' + data.tabId.slice(-8) + ' busy=' + data.busy);
       const state = useWorkspaceStore.getState();
       state.setClaudeBusy(data.tabId, data.busy);
       setBusyTabs(prev => { const n = new Map(prev); if (data.busy) n.set(data.tabId, true); else n.delete(data.tabId); return n; });

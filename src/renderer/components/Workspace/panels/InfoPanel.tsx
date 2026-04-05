@@ -634,13 +634,12 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
               <div className="flex gap-1 flex-1">
                 {([
                   { id: 'claude', label: 'Claude', state: { type: 'anthropic' } },
-                  { id: 'gpt-4o', label: 'GPT-4o', state: { type: 'litellm', model: 'gpt-4o' } },
-                  { id: 'gpt-4.1', label: '4.1', state: { type: 'litellm', model: 'gpt-4.1' } },
-                  { id: 'kimi', label: 'Kimi', state: { type: 'litellm', model: 'kimi-k2.5' } },
+                  { id: 'mm25', label: 'MM2.5', state: { type: 'zen', model: 'minimax-m2.5' } },
+                  { id: 'mm27', label: 'MM2.7', state: { type: 'zen', model: 'minimax-m2.7' } },
                 ] as const).map((provider) => {
                   const isActive = provider.id === 'claude'
                     ? providerState.type === 'anthropic'
-                    : providerState.type === 'litellm' && providerState.model === provider.state.model;
+                    : providerState.type === 'zen' && providerState.model === provider.state.model;
                   return (
                     <button
                       key={provider.id}
@@ -654,7 +653,7 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                           setProviderState(result);
                         } finally { setIsControlBusy(false); }
                       }}
-                      title={provider.id === 'claude' ? 'Anthropic subscription (direct)' : 'Via LiteLLM proxy → ' + provider.state.model}
+                      title={provider.id === 'claude' ? 'Anthropic subscription (direct)' : 'OpenCode Zen → ' + provider.state.model}
                     >
                       {provider.label}
                     </button>

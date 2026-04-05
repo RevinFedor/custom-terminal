@@ -304,259 +304,90 @@ function detectIncompleteEscapeTail(data) {
 }
 
 // ========== LLM PROVIDER PROXY ==========
-// Embedded HTTP proxy that lets Claude Code talk to alternative providers (OpenAI, Kimi, etc.)
-// via LiteLLM. Claude starts with ANTHROPIC_BASE_URL=http://127.0.0.1:<PROXY_PORT>.
-// In "anthropic" mode: passthrough to api.anthropic.com (subscription auth preserved).
-// In "litellm" mode: forward to LiteLLM on localhost:4000, rewrite model name.
+// Embedded HTTP proxy that lets Claude Code talk to alternative providers.
+// Claude starts with ANTHROPIC_BASE_URL=http://127.0.0.1:<PROXY_PORT>.
+// "anthropic" mode: passthrough to api.anthropic.com (subscription auth).
+// "zen" mode: passthrough to opencode.ai/zen (Anthropic-compatible, Kimi/MiniMax/GLM).
 let PROVIDER_PROXY_PORT = 4001;
-const LITELLM_PORT = 4000;
-let providerState = { type: 'anthropic' }; // or { type: 'litellm', model: 'gpt-4o' }
+let providerState = { type: 'anthropic' }; // or { type: 'zen', model: 'kimi-k2.5' }
+const ZEN_API_KEY = process.env.OPENCODE_ZEN_KEY || 'sk-64KGnfrqj6hK5WTfRG2efBdaHKlvdUVHXSzYZ4PfuiC7dz12QEdUECHkV8dewtrV';
 
 const providerProxy = http.createServer((req, res) => {
-  res.on('error', (e) => console.error('[ProviderProxy] CLIENT_DISCONNECT: ' + e.message));
-  res.on('close', () => { if (!res.writableEnded) console.log('[ProviderProxy] CLIENT_CLOSED before stream end'); });
   const chunks = [];
   req.on('data', (chunk) => chunks.push(chunk));
   req.on('end', () => {
     let body = Buffer.concat(chunks);
-    const incomingContentLength = parseInt(req.headers['content-length'] || '0', 10);
-    if (incomingContentLength && incomingContentLength !== body.length) {
-      console.error('[ProviderProxy] BODY_MISMATCH: content-length=' + incomingContentLength + ' actual=' + body.length);
-    }
-    // Log request overview
-    let reqModel = '', reqMaxTokens = '', reqStream = '', reqMsgCount = '', reqHasThinking = '', reqHasOutputConfig = '';
-    try {
-      const p = JSON.parse(body.toString());
-      reqModel = p.model || '';
-      reqMaxTokens = '' + (p.max_tokens || '');
-      reqStream = '' + !!p.stream;
-      reqMsgCount = '' + (p.messages?.length || 0);
-      reqHasThinking = '' + !!p.thinking;
-      reqHasOutputConfig = '' + !!p.output_config;
-    } catch {}
-    console.log('[ProviderProxy] ' + req.method + ' ' + req.url + ' → ' + providerState.type + (providerState.model ? ':' + providerState.model : '') + ' | model=' + reqModel + ' max_tokens=' + reqMaxTokens + ' stream=' + reqStream + ' msgs=' + reqMsgCount + ' thinking=' + reqHasThinking + ' output_config=' + reqHasOutputConfig);
+    const mode = providerState.type;
+    const targetModel = providerState.model || '';
 
-    if (providerState.type === 'anthropic') {
-      // Passthrough to Anthropic — preserve all headers (subscription OAuth token)
-      const options = {
-        hostname: 'api.anthropic.com',
-        port: 443,
-        path: req.url,
-        method: req.method,
-        headers: { ...req.headers, host: 'api.anthropic.com' },
-      };
-      delete options.headers['content-length']; // recalculate
-      const proxyReq = https.request(options, (proxyRes) => {
-        console.log('[ProviderProxy] Anthropic responded: ' + proxyRes.statusCode);
-        res.writeHead(proxyRes.statusCode, proxyRes.headers);
-        proxyRes.pipe(res); // Stream SSE directly
-      });
-      proxyReq.on('error', (e) => {
-        console.error('[ProviderProxy] Anthropic forward error:', e.message);
-        res.writeHead(502, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: { message: 'Proxy: upstream error — ' + e.message } }));
-      });
-      proxyReq.write(body);
-      proxyReq.end();
-    } else {
-      // LiteLLM mode — rewrite model name, strip Anthropic-only params, forward to LiteLLM
-      // Full list from Claude Code source (claude.ts:1699-1728):
-      //   output_config (effort, task_budget, format)
-      //   thinking (adaptive/budget)
-      //   speed (fast mode)
-      //   betas (beta header list)
-      //   context_management
-      //   metadata (Anthropic-specific)
-      //   tool_choice (may differ in format)
-      let originalModel = '';
+    // Determine target host
+    let targetHost, targetPort, targetPath, authHeaders;
+    if (mode === 'zen') {
+      // OpenCode Zen — Anthropic-compatible, direct passthrough with model rewrite
+      targetHost = 'opencode.ai';
+      targetPort = 443;
+      targetPath = '/zen/go' + req.url;
+      // Rewrite model name in body
       try {
         const parsed = JSON.parse(body.toString());
-        originalModel = parsed.model || '';
-        parsed.model = providerState.model; // e.g. 'gpt-4o'
-        // OpenAI requires max_tokens >= 16; Claude sends 1 for health checks
-        if (parsed.max_tokens && parsed.max_tokens < 16) parsed.max_tokens = 16;
-        // Cap max_tokens to model limits (gpt-4o max output = 16384)
-        if (parsed.max_tokens && parsed.max_tokens > 16384) parsed.max_tokens = 16384;
-        // Strip Anthropic-only parameters (GitHub Issue #22963)
-        delete parsed.output_config;
-        delete parsed.thinking;
-        delete parsed.speed;
-        delete parsed.betas;
-        delete parsed.context_management;
-        delete parsed.metadata;
-        // Strip tool_choice if it's Anthropic-format (e.g. {type:"auto"} vs OpenAI "auto")
-        if (parsed.tool_choice && typeof parsed.tool_choice === 'object') {
-          parsed.tool_choice = parsed.tool_choice.type || 'auto';
-        }
-        // Sanitize messages for OpenAI compatibility (Issue #19061)
+        const origModel = parsed.model;
+        parsed.model = targetModel;
+        body = Buffer.from(JSON.stringify(parsed));
+        console.log('[ProviderProxy] Zen: ' + origModel + ' → ' + targetModel + ' msgs=' + (parsed.messages?.length || 0));
+      } catch {}
+      authHeaders = { 'x-api-key': ZEN_API_KEY };
+    } else {
+      // Anthropic — passthrough, but strip foreign thinking blocks (MiniMax adds them with invalid signatures)
+      targetHost = 'api.anthropic.com';
+      targetPort = 443;
+      targetPath = req.url;
+      authHeaders = {};
+      try {
+        const parsed = JSON.parse(body.toString());
+        let cleaned = false;
         if (Array.isArray(parsed.messages)) {
-          // 1. Collect all tool_use IDs and tool_result IDs
-          const toolUseIds = new Set();
-          const toolResultIds = new Set();
           for (const msg of parsed.messages) {
             if (Array.isArray(msg.content)) {
-              for (const b of msg.content) {
-                if (b.type === 'tool_use' && b.id) toolUseIds.add(b.id);
-                if (b.type === 'tool_result' && b.tool_use_id) toolResultIds.add(b.tool_use_id);
-              }
-            }
-          }
-          // 2. Find dangling tool_use (no matching tool_result)
-          const danglingIds = new Set([...toolUseIds].filter(id => !toolResultIds.has(id)));
-          if (danglingIds.size > 0) {
-            console.log('[ProviderProxy] Fixing ' + danglingIds.size + ' dangling tool_use IDs: ' + [...danglingIds].join(', '));
-          }
-          // 3. Process each message
-          for (let i = 0; i < parsed.messages.length; i++) {
-            const msg = parsed.messages[i];
-            if (Array.isArray(msg.content)) {
-              // Strip cache_control, remove thinking/redacted_thinking blocks
-              msg.content = msg.content
-                .filter(b => b.type !== 'thinking' && b.type !== 'redacted_thinking')
-                .map(b => {
-                  const { cache_control, ...rest } = b;
-                  return rest;
-                });
-              // Remove dangling tool_use blocks (no matching result)
-              msg.content = msg.content.filter(b => {
-                if (b.type === 'tool_use' && danglingIds.has(b.id)) return false;
-                return true;
-              });
-              // Remove orphaned tool_result blocks (no matching tool_use)
-              msg.content = msg.content.filter(b => {
-                if (b.type === 'tool_result' && !toolUseIds.has(b.tool_use_id)) return false;
-                return true;
-              });
-              // Remove empty text blocks (OpenAI rejects them)
-              msg.content = msg.content.filter(b => {
-                if (b.type === 'text' && (!b.text || !b.text.trim())) return false;
-                return true;
-              });
-              // If content is now empty, set to a placeholder
-              if (msg.content.length === 0) {
-                msg.content = [{ type: 'text', text: '.' }];
-              }
-            } else if (typeof msg.content === 'string' && !msg.content.trim()) {
-              msg.content = '.';
+              const before = msg.content.length;
+              msg.content = msg.content.filter(b => b.type !== 'thinking' && b.type !== 'redacted_thinking');
+              if (msg.content.length === 0) msg.content = [{ type: 'text', text: '.' }];
+              if (msg.content.length !== before) cleaned = true;
             }
           }
         }
-        // Log cleaned body details
-        const msgSummary = (parsed.messages || []).map((m, i) => {
-          const role = m.role || '?';
-          if (typeof m.content === 'string') return i + ':' + role + '(str:' + m.content.length + ')';
-          if (Array.isArray(m.content)) {
-            const types = m.content.map(b => b.type + (b.type === 'text' ? ':' + (b.text?.length || 0) : '') + (b.type === 'tool_use' ? ':' + b.name?.slice(0, 20) : '') + (b.type === 'tool_result' ? ':' + b.tool_use_id?.slice(0, 12) : ''));
-            return i + ':' + role + '[' + types.join(',') + ']';
-          }
-          return i + ':' + role + '(?)';
-        }).join(' | ');
-        console.log('[ProviderProxy] CleanedBody: max_tokens=' + parsed.max_tokens + ' tools=' + (parsed.tools?.length || 0) + ' msgs=' + (parsed.messages?.length || 0));
-        console.log('[ProviderProxy] MsgDump: ' + msgSummary);
-        // Dump full cleaned body to file for debugging empty responses
-        try {
-          const dumpPath = require('path').join(require('os').tmpdir(), 'provider-proxy-last-request.json');
-          require('fs').writeFileSync(dumpPath, JSON.stringify(parsed, null, 2));
-        } catch {}
-        // Strip cache_control from system prompt and messages
-        if (Array.isArray(parsed.system)) {
-          parsed.system = parsed.system.map(b => { const { cache_control, ...rest } = b; return rest; });
+        if (cleaned) {
+          body = Buffer.from(JSON.stringify(parsed));
+          console.log('[ProviderProxy] Anthropic: stripped foreign thinking blocks');
         }
-        body = Buffer.from(JSON.stringify(parsed));
-        console.log('[ProviderProxy] Rewrite: ' + originalModel + ' → ' + providerState.model + ' bodyLen=' + body.length);
-      } catch { /* non-JSON body, forward as-is */ }
-
-      const litellmKey = process.env.LITELLM_MASTER_KEY;
-      // Strip ?beta=true from URL, add cache-bust
-      const cleanPath = req.url.replace(/[?&]beta=true/g, '').replace(/\?$/, '') + '?_t=' + Date.now();
-      const fwdHeaders = { ...req.headers };
-      // Send ONLY clean headers to LiteLLM — strip everything Claude Code adds
-      const options = {
-        hostname: '127.0.0.1',
-        port: LITELLM_PORT,
-        path: cleanPath,
-        method: req.method,
-        headers: {
-          'content-type': 'application/json',
-          'accept': 'text/event-stream',
-          'connection': 'close',
-          host: '127.0.0.1:' + LITELLM_PORT,
-          'x-api-key': litellmKey,
-          'content-length': Buffer.byteLength(body),
-        },
-      };
-
-      // Use fetch — each request gets fresh connection via signal abort after completion
-      const litellmUrl = 'http://127.0.0.1:' + LITELLM_PORT + cleanPath;
-      console.log('[ProviderProxy] Sending to LiteLLM: ' + litellmUrl + ' bodyLen=' + body.length);
-      fetch(litellmUrl, {
-        keepalive: false,
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          'x-api-key': litellmKey,
-        },
-        body: body,
-      }).then((fetchRes) => {
-        console.log('[ProviderProxy] LiteLLM responded: ' + fetchRes.status + ' ' + (fetchRes.headers.get('content-type') || ''));
-        // Forward status and headers
-        const headers = {};
-        fetchRes.headers.forEach((v, k) => { headers[k] = v; });
-        res.writeHead(fetchRes.status, headers);
-
-        if (fetchRes.status >= 400) {
-          fetchRes.text().then((errText) => {
-            console.error('[ProviderProxy] LiteLLM error: ' + errText.slice(0, 500));
-            res.end(errText);
-          });
-          return;
-        }
-
-        // Stream response with model name rewrite
-        const rewriteModel = originalModel && providerState.model;
-        let chunkCount = 0, totalBytes = 0, hasContentDelta = false, hasMessageStop = false, allChunksForDebug = '', stopReason = '';
-        const reader = fetchRes.body.getReader();
-        const decoder = new TextDecoder();
-
-        function pump() {
-          reader.read().then(({ done, value }) => {
-            if (done) {
-              console.log('[ProviderProxy] STREAM_END: chunks=' + chunkCount + ' bytes=' + totalBytes + ' stop=' + stopReason + ' hasContent=' + hasContentDelta + ' msgStop=' + hasMessageStop);
-              if (!hasContentDelta) {
-                console.error('[ProviderProxy] EMPTY_RESPONSE — dump:');
-                console.error('[ProviderProxy] ' + allChunksForDebug.replace(/\n/g, '\\n'));
-              }
-              res.end();
-              return;
-            }
-            const str = decoder.decode(value, { stream: true });
-            chunkCount++;
-            totalBytes += str.length;
-            allChunksForDebug += str;
-            if (str.includes('content_block_delta')) hasContentDelta = true;
-            if (str.includes('message_stop')) hasMessageStop = true;
-            const stopMatch = str.match(/"stop_reason":\s*"([^"]+)"/);
-            if (stopMatch) stopReason = stopMatch[1];
-            if (chunkCount === 1) console.log('[ProviderProxy] STREAM_START: ' + str.slice(0, 400).replace(/\n/g, '\\n'));
-
-            let patched = str;
-            if (rewriteModel) {
-              patched = str.replaceAll('"model": "' + providerState.model + '"', '"model": "' + originalModel + '"');
-            }
-            res.write(patched);
-            pump();
-          }).catch((e) => {
-            console.error('[ProviderProxy] STREAM_READ_ERROR: ' + e.message);
-            res.end();
-          });
-        }
-        pump();
-      }).catch((e) => {
-        console.error('[ProviderProxy] LiteLLM fetch error: ' + e.message);
-        res.writeHead(502, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: { message: 'Proxy: LiteLLM not running — ' + e.message } }));
-      });
+      } catch {}
+      console.log('[ProviderProxy] Anthropic passthrough: ' + req.url);
     }
+
+    const fwdHeaders = { ...req.headers, host: targetHost, ...authHeaders };
+    if (mode === 'zen') {
+      // Replace Claude's auth with Zen key
+      delete fwdHeaders['authorization'];
+    }
+    delete fwdHeaders['content-length'];
+
+    const proxyReq = https.request({
+      hostname: targetHost,
+      port: targetPort,
+      path: targetPath,
+      method: req.method,
+      headers: fwdHeaders,
+    }, (proxyRes) => {
+      console.log('[ProviderProxy] ' + (mode === 'zen' ? 'Zen' : 'Anthropic') + ' responded: ' + proxyRes.statusCode);
+      res.writeHead(proxyRes.statusCode, proxyRes.headers);
+      proxyRes.pipe(res);
+    });
+    proxyReq.on('error', (e) => {
+      console.error('[ProviderProxy] Forward error: ' + e.message);
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: 'Proxy error: ' + e.message } }));
+    });
+    proxyReq.write(body);
+    proxyReq.end();
   });
 });
 

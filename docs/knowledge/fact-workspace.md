@@ -14,8 +14,10 @@
 3. **Dashboard:** Отображает все проекты из БД.
    - **Compact Paths:** В карточках отображаются только последние две папки пути (например, `vs-code/my-app`).
    - **Instant Tooltip:** При наведении на сокращенный путь мгновенно всплывает полный адрес.
-3. **Файлы:** Пользователь открывает File Explorer (`Cmd+B`). 
+3. **Файлы:** Пользователь открывает Sidebar (`Cmd+B`) — полноценный file explorer из gt-editor.
    - Проводник открывается поверх терминала через [React Portal](knowledge/fact-react-patterns.md).
+   - Поддержка: drag-and-drop файлов (Atlaskit), rename, create, delete (в корзину с undo), context menu, multi-select (Cmd/Shift+Click).
+   - Ширина sidebar ресайзится drag handle (min 180px, max 500px), сохраняется в localStorage глобально.
    - Пользователь делает `Cmd+Click` по пути файла в терминале -> файл открывается в **File Preview**.
 4. **Заметки:** Пользователь записывает мысли в InfoPanel или разворачивает полноэкранный редактор. Подробнее: [`knowledge/fact-notes.md`](notes.md).
 
@@ -30,7 +32,10 @@
     - Если пользователь отменяет ввод (`Esc`, клик мимо) или оставляет имя дефолтным — проект **автоматически удаляется** из БД и закрывается.
     - Система запоминает `previousProjectId` и возвращает пользователя назад при отмене.
 - **Project Tabs UI:** Высота 40px, шрифт регулируется в настройках. Убраны лишние отступы и скругления для строгого вида.
-- **Explorer:** Анимация 150мс. Автоматически открывается в CWD активного терминала. См. `knowledge/fact-fact-terminal-core.md`.
+- **Explorer (Sidebar):** Автоматически открывается в CWD активного терминала. Портирован из gt-editor (PragmaticFileTree + Sidebar.jsx). Ключевые адаптации при портировании:
+    - `onPointerDown` → `onClick` для file selection — иначе drag (Atlaskit) вызывает open file. Браузер отменяет `click` при pointer movement > 3px (drag threshold), что естественно разделяет click и drag.
+    - Drop на файл отключён (`return` вместо "fallback to parent") — gt-editor перемещал файл в родительскую папку при drop на файл, что приводило к неожиданным перемещениям. Оставлен только drop на папку.
+    - `window.electronAPI` bridge создаётся в renderer (nodeIntegration: true) вместо preload, т.к. custom-terminal не использует contextIsolation.
 - **Empty State:** Если в проекте нет вкладок, отображаются быстрые кнопки (Claude, Gemini, New Tab).
 
 ## User Flow: Dashboard
