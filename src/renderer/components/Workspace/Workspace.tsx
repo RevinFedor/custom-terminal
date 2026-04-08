@@ -52,6 +52,14 @@ export default function Workspace() {
   const activeProjectId = useWorkspaceStore((s) => s.activeProjectId);
   const getActiveProject = useWorkspaceStore((s) => s.getActiveProject);
   const getSidebarState = useWorkspaceStore((s) => s.getSidebarState);
+  const setSidebarOpen = useWorkspaceStore((s) => s.setSidebarOpen);
+  const setSidebarExpandedDirs = useWorkspaceStore((s) => s.setSidebarExpandedDirs);
+  const setOpenFilePath = useWorkspaceStore((s) => s.setOpenFilePath);
+  // Subscribe to sidebarOpen so Workspace re-renders when sidebar toggles
+  const sidebarOpenForRender = useWorkspaceStore((s) => {
+    const p = s.activeProjectId ? s.openProjects.get(s.activeProjectId) : null;
+    return p?.sidebarOpen ?? false;
+  });
   const workspaceView = useWorkspaceStore((s) => s.view);
   const projects = useProjectsStore((s) => s.projects);
 
@@ -204,18 +212,22 @@ export default function Workspace() {
     return () => { ipcRenderer.removeListener('mcp:switch-to-sub-agent', handler); };
   }, []);
 
-  // Restore file preview when switching projects
+  // Sync file preview with sidebar state (project switch + sidebar open/close)
   useEffect(() => {
     if (!activeProjectId) return;
 
     const { openFilePath } = getSidebarState(activeProjectId);
 
-    // Close current file preview when switching projects
+    if (!sidebarOpenForRender) {
+      // Sidebar closed — hide file preview but keep openFilePath in store/DB
+      if (filePreview) closeFilePreview();
+      return;
+    }
+
+    // Sidebar open — restore saved file if needed
     if (filePreview && filePreview.path !== openFilePath) {
       closeFilePreview();
     }
-
-    // If project has saved open file, restore it
     if (openFilePath && (!filePreview || filePreview.path !== openFilePath)) {
       (async () => {
         try {
@@ -223,18 +235,14 @@ export default function Workspace() {
           if (result.success) {
             const ext = path.extname(openFilePath).toLowerCase();
             const language = detectLanguage(ext);
-            openFilePreview({
-              path: openFilePath,
-              content: result.content,
-              language
-            });
+            openFilePreview({ path: openFilePath, content: result.content, language });
           }
         } catch (e) {
           console.error('[Workspace] Failed to restore file preview:', e);
         }
       })();
     }
-  }, [activeProjectId]);
+  }, [activeProjectId, sidebarOpenForRender]);
 
   // Listen for OSC 133 command lifecycle events (Shell Integration)
   useEffect(() => {
@@ -271,20 +279,21 @@ export default function Workspace() {
     // Terminal will auto-refit via ResizeObserver
   }, []);
 
-  // CMD+E hotkey to open notes editor
+  // CMD+E hotkey to toggle file explorer (moved from Cmd+B)
+  // Notes editor now opened only via button in "ЗАМЕТКИ ВКЛАДКИ" section
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      // Guard: don't fire when Workspace is hidden behind Dashboard
       if (workspaceView !== 'workspace') return;
-      if (e.metaKey && e.key === 'e' && !notesEditorOpen && activeProjectId) {
+      if (e.metaKey && (e.key === 'e' || e.key === '/') && activeProjectId) {
         e.preventDefault();
-        openNotesEditor(activeProjectId);
+        const { sidebarOpen } = getSidebarState(activeProjectId);
+        setSidebarOpen(activeProjectId, !sidebarOpen);
       }
     };
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [activeProjectId, notesEditorOpen, openNotesEditor, workspaceView]);
+  }, [activeProjectId, workspaceView]);
 
   // CMD+\ hotkey to toggle history panel
   useEffect(() => {
@@ -634,8 +643,8 @@ export default function Workspace() {
       {/* Global Overlays */}
       {/* Sidebar File Explorer - opens in current terminal's directory */}
       {(() => {
-        const { sidebarOpen } = getSidebarState(activeProjectId);
-        if (!sidebarOpen || !explorerPath) return null;
+        if (!sidebarOpenForRender || !explorerPath) return null;
+        const { sidebarExpandedDirs } = getSidebarState(activeProjectId);
         const sidebarWidth = useUIStore.getState().sidebarWidth || 280;
         return ReactDOM.createPortal(
           <div style={{ position: 'fixed', left: 0, top: 36, bottom: 0, width: sidebarWidth, zIndex: 99999, borderRight: '1px solid #333', boxShadow: '4px 0 20px rgba(0,0,0,0.5)' }}>
@@ -644,15 +653,25 @@ export default function Workspace() {
               width={sidebarWidth}
               fontSize={useUIStore.getState().sidebarFontSize || 13}
               onFocus={() => {}}
+              onCollapse={() => setSidebarOpen(activeProjectId, false)}
+              activeFilePath={filePreview?.path || null}
+              initialExpandedDirs={sidebarExpandedDirs}
+              onExpandedDirsChange={(expandedDirs: Record<string, boolean>) => setSidebarExpandedDirs(activeProjectId, expandedDirs)}
               onFileSelect={(filePath: string, isDir: boolean) => {
                 if (!isDir) {
-                  const ipc = window.require('electron').ipcRenderer;
-                  ipc.invoke('file:read', filePath).then((result: any) => {
-                    if (result?.success) {
-                      const ext = filePath.split('.').pop()?.toLowerCase() || '';
-                      openFilePreview({ path: filePath, content: result.content, language: ext });
-                    }
-                  });
+                  if (filePreview?.path === filePath) {
+                    useUIStore.getState().closeFilePreview();
+                    setOpenFilePath(activeProjectId, null);
+                  } else {
+                    const ipc = window.require('electron').ipcRenderer;
+                    ipc.invoke('file:read', filePath).then((result: any) => {
+                      if (result?.success) {
+                        const ext = filePath.split('.').pop()?.toLowerCase() || '';
+                        openFilePreview({ path: filePath, content: result.content, language: ext });
+                        setOpenFilePath(activeProjectId, filePath);
+                      }
+                    });
+                  }
                 }
               }}
             />

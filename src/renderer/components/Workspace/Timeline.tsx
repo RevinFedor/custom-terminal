@@ -277,6 +277,30 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   const editRangeAbortRef = useRef<AbortController | null>(null);
   // Context menu for edit-range loading overlay (Interrupt / Cancel)
   const [editRangeLoadingMenu, setEditRangeLoadingMenu] = useState<{ x: number; y: number } | null>(null);
+  // Auto-dismiss "done" overlay: 1s after cursor moves in terminal, unless hovering overlay/panel
+  const editRangeDoneHovered = useRef(false);
+  const editRangeDoneTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    if (editRangeState?.phase !== 'done') {
+      editRangeDoneHovered.current = false;
+      if (editRangeDoneTimer.current) { clearTimeout(editRangeDoneTimer.current); editRangeDoneTimer.current = null; }
+      return;
+    }
+    const onMove = () => {
+      if (editRangeDoneHovered.current || editRangeDoneTimer.current) return;
+      editRangeDoneTimer.current = setTimeout(() => {
+        if (!editRangeDoneHovered.current) {
+          setEditRangeState(null);
+        }
+        editRangeDoneTimer.current = null;
+      }, 1000);
+    };
+    window.addEventListener('mousemove', onMove);
+    return () => {
+      window.removeEventListener('mousemove', onMove);
+      if (editRangeDoneTimer.current) { clearTimeout(editRangeDoneTimer.current); editRangeDoneTimer.current = null; }
+    };
+  }, [editRangeState?.phase]);
   // Range action menu — appears after second click to choose Copy or Edit
   const [rangeActionMenu, setRangeActionMenu] = useState<{
     x: number; y: number;
@@ -1140,6 +1164,15 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
 
     // Compact/continued/docs_edit entries have no terminal position — skip terminal scroll
     if (entry.type === 'compact' || entry.type === 'continued' || entry.type === 'docs_edit') return;
+
+    // SDK tabs: no xterm buffer — dispatch event for React chat scroll
+    const sdkTab = (() => { const s = useWorkspaceStore.getState(); for (const [,ws] of s.openProjects) { const t = ws.tabs.get(tabId); if (t) return t.tabType === 'claude-sdk'; } return false; })();
+    if (sdkTab) {
+      window.dispatchEvent(new CustomEvent('claude-sdk:scroll-to-entry', { detail: { tabId, uuid: entry.uuid, content: entry.content } }));
+      setClickedState({ index, status: 'loading' });
+      setTimeout(() => setClickedState(null), 300);
+      return;
+    }
 
     // History panel NOT open — scroll in terminal only
     // Instant visual feedback — loader appears immediately
@@ -2519,7 +2552,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
 
           return rect && (
             <div
-              className={`absolute left-0 right-0 ${isLoading ? 'cursor-pointer' : 'pointer-events-none'} ${isLoading || isApplying ? 'animate-pulse' : ''}`}
+              className={`absolute left-0 right-0 ${isLoading || isDone ? 'cursor-pointer' : 'pointer-events-none'} ${isLoading || isApplying ? 'animate-pulse' : ''}`}
               style={{
                 top: rect.top,
                 height: rect.height,
@@ -2528,6 +2561,15 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                 borderBottom: `1px solid ${color}, 0.5)`,
                 boxShadow: `0 0 12px ${color}, 0.3)`,
               }}
+              onMouseEnter={isDone ? () => {
+                editRangeDoneHovered.current = true;
+                if (editRangeDoneTimer.current) { clearTimeout(editRangeDoneTimer.current); editRangeDoneTimer.current = null; }
+              } : undefined}
+              onMouseLeave={isDone ? () => {
+                editRangeDoneHovered.current = false;
+                setEditRangeState(null); // instant close on leave
+              } : undefined}
+              onClick={isDone ? () => setEditRangeState(null) : undefined}
               onContextMenu={isLoading ? (e) => {
                 e.preventDefault();
                 e.stopPropagation();
@@ -2578,7 +2620,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
           if (!containerRef.current) return null;
           const containerRect = containerRef.current.getBoundingClientRect();
           const rightOffset = window.innerWidth - containerRect.left + 8;
-          return (
+          const panelEl = (
             <EditRangePanel
               sourceContent={editRangeState.sourceContent}
               initialCompact={editRangeState.compactText}
@@ -2693,6 +2735,24 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
               onClose={() => setEditRangeState(null)}
             />
           );
+          // Wrap panel with hover handlers for done phase auto-dismiss
+          if (editRangeState.phase === 'done') {
+            return (
+              <div
+                onMouseEnter={() => {
+                  editRangeDoneHovered.current = true;
+                  if (editRangeDoneTimer.current) { clearTimeout(editRangeDoneTimer.current); editRangeDoneTimer.current = null; }
+                }}
+                onMouseLeave={() => {
+                  editRangeDoneHovered.current = false;
+                  setEditRangeState(null);
+                }}
+              >
+                {panelEl}
+              </div>
+            );
+          }
+          return panelEl;
         })()}
 
         {/* Tooltip Portal with CSS Bridge */}

@@ -36,6 +36,7 @@
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.2.59",
+    "@assistant-ui/react": "^0.12.24",
     "@atlaskit/pragmatic-drag-and-drop": "^1.7.7",
     "@atlaskit/pragmatic-drag-and-drop-auto-scroll": "^2.1.5",
     "@atlaskit/pragmatic-drag-and-drop-hitbox": "^1.1.0",
@@ -43,6 +44,7 @@
     "@gt-editor/markdown-editor": "^0.1.1",
     "@modelcontextprotocol/sdk": "^1.27.1",
     "@radix-ui/react-dialog": "^1.1.15",
+    "@tailwindcss/typography": "^0.5.19",
     "@types/react-syntax-highlighter": "^15.5.13",
     "@xterm/addon-fit": "^0.10.0",
     "@xterm/addon-search": "^0.16.0",

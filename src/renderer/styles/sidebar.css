@@ -74,6 +74,16 @@
   color: var(--accent);
 }
 
+.sidebar-collapse-btn {
+  margin-left: auto;
+  opacity: 0.4;
+  transition: opacity 0.15s;
+}
+
+.sidebar-collapse-btn:hover {
+  opacity: 1;
+}
+
 .sidebar.focused .file-tree {
   outline: 1px solid rgba(255, 255, 255, 0.2);
   outline-offset: -1px;

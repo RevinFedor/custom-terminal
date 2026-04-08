@@ -8,7 +8,7 @@ export type TabColor = 'default' | 'red' | 'yellow' | 'green' | 'blue' | 'purple
 
 export type CommandType = 'generic' | 'devServer' | 'claude' | 'gemini';
 
-export type TabType = 'terminal' | 'browser';
+export type TabType = 'terminal' | 'browser' | 'claude-sdk';
 
 // Helper: Check if tab has an interrupted AI session that can be resumed
 export const isTabInterrupted = (tab: { wasInterrupted?: boolean; claudeSessionId?: string; geminiSessionId?: string }): boolean => {
@@ -53,6 +53,12 @@ interface Tab {
   parentTabId?: string; // If this is a MCP sub-agent tab, points to parent (Gemini) tab
   mcpTaskId?: string; // MCP task UUID assigned when delegate_to_claude created this sub-agent
   interceptorState?: 'armed' | 'disarmed' | null; // Interceptor state for MCP response delivery
+  // Claude SDK tab state
+  sdkState?: 'idle' | 'thinking' | 'tool_use' | 'error'; // Current SDK session state
+  sdkMessages?: Array<{ role: string; type: string; content: string; timestamp: number; toolName?: string; toolStatus?: string }>; // In-memory messages for chat UI
+  sdkModel?: string; // Model for next SDK query
+  sdkEffort?: string; // Effort level for next SDK query
+  sdkThinking?: boolean; // Thinking enabled for next SDK query
 }
 
 interface ProjectWorkspace {
@@ -65,6 +71,7 @@ interface ProjectWorkspace {
   tabCounter: number;
   sidebarOpen: boolean;
   openFilePath: string | null;
+  sidebarExpandedDirs: Record<string, boolean> | null;
   currentView: 'terminal' | 'home'; // Per-project view state (Home vs Terminal)
   viewingSubAgentTabId: string | null; // When viewing a sub-agent, points to the Claude sub-agent tab
 }
@@ -172,6 +179,11 @@ interface WorkspaceStore {
   updateTabUrl: (tabId: string, url: string) => void;
   setBrowserActiveView: (tabId: string, view: 'browser' | 'terminal') => void;
 
+  // Claude SDK tabs
+  createSDKTab: (projectId: string) => Promise<string>;
+  convertToSDKTab: (tabId: string) => void;
+  updateSDKState: (tabId: string, state: Partial<Pick<Tab, 'sdkState' | 'sdkMessages' | 'claudeSessionId' | 'sdkModel' | 'sdkEffort' | 'sdkThinking'>>) => void;
+
   // Helpers
   getActiveTab: (projectId: string) => Tab | null;
   getActiveProject: () => ProjectWorkspace | null;
@@ -182,7 +194,8 @@ interface WorkspaceStore {
   // Sidebar state (per-project)
   setSidebarOpen: (projectId: string, open: boolean) => void;
   setOpenFilePath: (projectId: string, filePath: string | null) => void;
-  getSidebarState: (projectId: string) => { sidebarOpen: boolean; openFilePath: string | null };
+  setSidebarExpandedDirs: (projectId: string, expandedDirs: Record<string, boolean>) => void;
+  getSidebarState: (projectId: string) => { sidebarOpen: boolean; openFilePath: string | null; sidebarExpandedDirs: Record<string, boolean> | null };
 }
 
 const SESSION_KEY = 'workspace-session';
@@ -333,6 +346,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           tabCounter: 0,
           sidebarOpen: projectData?.sidebarOpen || false,
           openFilePath: projectData?.openFilePath || null,
+          sidebarExpandedDirs: projectData?.sidebarExpandedDirs || null,
           currentView: 'terminal',
           viewingSubAgentTabId: null
         };
@@ -528,6 +542,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         tabCounter: 0, // Start from 0 for new projects
         sidebarOpen: projectData?.sidebarOpen || false,
         openFilePath: projectData?.openFilePath || null,
+        sidebarExpandedDirs: projectData?.sidebarExpandedDirs || null,
         currentView: draft ? 'home' : 'terminal',
         viewingSubAgentTabId: null
       };
@@ -702,22 +717,27 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       claudeTaskCount: (options as any)?.claudeTaskCount || 0
     };
 
-    console.log('[Store] createTab: Creating PTY terminal for:', tabId, 'cwd:', newTab.cwd);
-    // Only pass initialCommand for shell-command type, not for internal commands
-    const initialCommand = options?.pendingAction?.type === 'shell-command'
-      ? options.pendingAction.command
-      : undefined;
+    // Claude SDK tabs don't need a PTY process
+    if (newTab.tabType === 'claude-sdk') {
+      console.log('[Store] createTab: SDK tab, skipping PTY for:', tabId);
+    } else {
+      console.log('[Store] createTab: Creating PTY terminal for:', tabId, 'cwd:', newTab.cwd);
+      // Only pass initialCommand for shell-command type, not for internal commands
+      const initialCommand = options?.pendingAction?.type === 'shell-command'
+        ? options.pendingAction.command
+        : undefined;
 
-    const { pid } = await ipcRenderer.invoke('terminal:create', {
-      tabId,
-      cwd: newTab.cwd,
-      rows: 24,
-      cols: 80,
-      initialCommand
-    });
+      const { pid } = await ipcRenderer.invoke('terminal:create', {
+        tabId,
+        cwd: newTab.cwd,
+        rows: 24,
+        cols: 80,
+        initialCommand
+      });
 
-    console.log('[Store] createTab: PTY created with pid:', pid);
-    newTab.pid = pid;
+      console.log('[Store] createTab: PTY created with pid:', pid);
+      newTab.pid = pid;
+    }
     workspace.tabs.set(tabId, newTab);
 
     // Don't switch activeTabId during session restore or background creation
@@ -855,7 +875,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     const tab = workspace.tabs.get(tabId);
     const skipProcessCheck = options?.skipProcessCheck || false;
 
-    if (!skipProcessCheck) {
+    if (!skipProcessCheck && tab?.tabType !== 'claude-sdk') {
       // Check if terminal has running process via OSC 133 state (fast, no syscalls)
       const commandState = await ipcRenderer.invoke('terminal:getCommandState', tabId);
 
@@ -877,7 +897,15 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       }
     }
 
-    ipcRenderer.send('terminal:kill', tabId);
+    // Stop SDK session if this is a claude-sdk tab + clear busy state
+    if (tab?.tabType === 'claude-sdk') {
+      ipcRenderer.invoke('claude-sdk:stop', { tabId }).catch(() => {});
+      ipcRenderer.send('claude-sdk:busy-state', { tabId, busy: false });
+    }
+
+    if (tab?.tabType !== 'claude-sdk') {
+      ipcRenderer.send('terminal:kill', tabId);
+    }
     clearTerminalBuffer(tabId); // Clean up serialized buffer
 
     // Archive tab to history (fire-and-forget)
@@ -1548,6 +1576,60 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     }
   },
 
+  // Claude SDK tabs
+  createSDKTab: async (projectId) => {
+    const { openProjects, createTab } = get();
+    const workspace = openProjects.get(projectId);
+    const projectPath = workspace?.projectPath;
+    const cwd = (projectPath && !projectPath.startsWith('__unset__')) ? projectPath : (process.env.HOME || '~');
+    return createTab(projectId, 'Claude SDK', cwd, {
+      tabType: 'claude-sdk',
+      color: 'claude',
+      commandType: 'claude',
+    });
+  },
+
+  convertToSDKTab: (tabId) => {
+    const { openProjects } = get();
+    for (const [, workspace] of openProjects) {
+      const tab = workspace.tabs.get(tabId);
+      if (tab) {
+        // Kill PTY
+        ipcRenderer.send('terminal:kill', tabId);
+        // Convert
+        tab.tabType = 'claude-sdk';
+        tab.color = 'claude';
+        tab.name = 'Claude SDK';
+        tab.nameSetManually = true;
+        tab.sdkState = 'idle';
+        set({ openProjects: new Map(openProjects) });
+        saveTabs(workspace.projectId, workspace.tabs);
+        return;
+      }
+    }
+  },
+
+  updateSDKState: (tabId, state) => {
+    const { openProjects } = get();
+    for (const [, workspace] of openProjects) {
+      const tab = workspace.tabs.get(tabId);
+      if (tab) {
+        // Guard: skip if all values unchanged (prevents polling spam re-renders)
+        let changed = false;
+        for (const key of Object.keys(state) as (keyof typeof state)[]) {
+          if ((tab as any)[key] !== state[key]) { changed = true; break; }
+        }
+        if (!changed) return;
+
+        console.warn('[Store:updateSDKState] tabId=' + tabId + ' keys=' + Object.keys(state).join(',') + ' claudeSessionId=' + (state as any).claudeSessionId);
+        Object.assign(tab, state);
+        set({}); // Trigger Zustand notify — primitive selectors detect change
+        return;
+      }
+    }
+    console.warn('[Store:updateSDKState] TAB NOT FOUND tabId=' + tabId);
+  },
+
   getActiveTab: (projectId) => {
     const { openProjects } = get();
     const workspace = openProjects.get(projectId);
@@ -1706,16 +1788,29 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     }
   },
 
+  setSidebarExpandedDirs: (projectId, expandedDirs) => {
+    const { openProjects } = get();
+    const workspace = openProjects.get(projectId);
+    if (workspace) {
+      workspace.sidebarExpandedDirs = expandedDirs;
+      ipcRenderer.invoke('project:save-sidebar-expanded-dirs', {
+        projectId,
+        expandedDirs
+      });
+    }
+  },
+
   getSidebarState: (projectId) => {
     const { openProjects } = get();
     const workspace = openProjects.get(projectId);
     if (workspace) {
       return {
         sidebarOpen: workspace.sidebarOpen,
-        openFilePath: workspace.openFilePath
+        openFilePath: workspace.openFilePath,
+        sidebarExpandedDirs: workspace.sidebarExpandedDirs
       };
     }
-    return { sidebarOpen: false, openFilePath: null };
+    return { sidebarOpen: false, openFilePath: null, sidebarExpandedDirs: null };
   }
 }));
 

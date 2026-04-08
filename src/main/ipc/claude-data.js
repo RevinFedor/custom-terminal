@@ -677,16 +677,20 @@ function register({ projectManager, formatToolAction }) {
 
   // Fork Claude session file: copy .jsonl with new UUID
   // Searches ALL project directories under ~/.claude/projects/ to find the session file
-  ipcMain.handle('claude:fork-session-file', async (event, { sourceSessionId, cwd }) => {
+  ipcMain.handle('claude:fork-session-file', async (event, { sourceSessionId, cwd, skipChainResolve }) => {
     console.log('[Claude Fork] ========================================');
-    console.log('[Claude Fork] Requested source session:', sourceSessionId);
+    console.log('[Claude Fork] Requested source session:', sourceSessionId, 'skipChainResolve:', !!skipChainResolve);
     console.log('[Claude Fork] Current cwd:', cwd);
 
     try {
       // Resolve the LATEST session in the chain (in case "Clear Context" created child sessions)
-      const resolvedSourceId = resolveLatestSessionInChain(sourceSessionId, cwd);
-      if (resolvedSourceId !== sourceSessionId) {
-        console.log('[Claude Fork] Chain resolved: ', sourceSessionId, '→', resolvedSourceId);
+      // Skip for SDK forks — user explicitly chose which session to fork
+      let resolvedSourceId = sourceSessionId;
+      if (!skipChainResolve) {
+        resolvedSourceId = resolveLatestSessionInChain(sourceSessionId, cwd);
+        if (resolvedSourceId !== sourceSessionId) {
+          console.log('[Claude Fork] Chain resolved: ', sourceSessionId, '→', resolvedSourceId);
+        }
       }
 
       // Find the resolved source file
