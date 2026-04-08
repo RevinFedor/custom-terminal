@@ -174,9 +174,16 @@ const FileRow = memo(({
     }
   };
 
+  const lastClickRef = useRef(0);
   const handleClick = (e) => {
     if (e.button !== 0) return; // Only left click
     e.stopPropagation();
+    const now = Date.now();
+    // Suppress second click of a double-click on files (prevents toggle-close)
+    if (!node.isDirectory && isSelected && now - lastClickRef.current < 400) {
+      return;
+    }
+    lastClickRef.current = now;
     const modifiers = { metaKey: e.metaKey || e.ctrlKey, shiftKey: e.shiftKey }
     // Don't toggle folder on Cmd+Click or Shift+Click (multi-select mode)
     if (!modifiers.metaKey && !modifiers.shiftKey && node.isDirectory) {
@@ -187,9 +194,6 @@ const FileRow = memo(({
 
   const handleDoubleClick = (e) => {
     e.stopPropagation();
-    if (!node.isDirectory) {
-        onSelect(node);
-    }
   };
 
   // Styles

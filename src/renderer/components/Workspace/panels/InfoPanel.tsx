@@ -40,6 +40,7 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
   const [claudeSessionId, setClaudeSessionId] = useState<string | null>(null);
   const [geminiSessionId, setGeminiSessionId] = useState<string | null>(null);
   const [activeCommandType, setActiveCommandType] = useState<string | null>(null);
+  const [isSDKTab, setIsSDKTab] = useState(false);
   // aiMode removed — start buttons now show both claude & gemini inline
   const [showTooltip, setShowTooltip] = useState(false);
   const [historyTurns, setHistoryTurns] = useState<HistoryTurn[]>([]);
@@ -180,6 +181,7 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
         setClaudeSessionId(null);
         setGeminiSessionId(null);
         setActiveCommandType(null);
+        setIsSDKTab(false);
         return;
       }
       const state = useWorkspaceStore.getState();
@@ -191,6 +193,7 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
           setClaudeSessionId(prev => prev !== newClaudeId ? newClaudeId : prev);
           setGeminiSessionId(prev => prev !== newGeminiId ? newGeminiId : prev);
           setActiveCommandType(tab.commandType || null);
+          setIsSDKTab(tab.tabType === 'claude-sdk');
           return;
         }
       }
@@ -198,6 +201,7 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
       setClaudeSessionId(null);
       setGeminiSessionId(null);
       setActiveCommandType(null);
+      setIsSDKTab(false);
     };
     checkSession();
     const interval = setInterval(checkSession, 500);
@@ -526,6 +530,15 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                   title="Refresh timeline"
                 >↻</button>
               )}
+              {isSDKTab && activeTabId && (
+                <button
+                  className="text-[10px] px-1.5 py-0.5 rounded cursor-pointer text-[#444] hover:text-[#aaa] hover:bg-[#ffffff08]"
+                  onClick={() => {
+                    window.dispatchEvent(new CustomEvent('claude-sdk:reload', { detail: { tabId: activeTabId } }));
+                  }}
+                  title="Reload SDK chat"
+                >⟳</button>
+              )}
               {activeTabId && (
                 <button
                   className={`text-[10px] px-1.5 py-0.5 rounded cursor-pointer ${
@@ -564,10 +577,42 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                   }
                 }
               }}
-              title="Fork session to new tab"
+              title="Fork session to new tab (ПКМ → Open in SDK)"
+              onContextMenu={(e) => {
+                e.preventDefault();
+                if (!activeTabId || !sessionId) return;
+                if (isSDKTab) return; // already SDK
+                const { convertToSDKTab } = useWorkspaceStore.getState();
+                convertToSDKTab(activeTabId);
+                showToast('Converted to SDK tab', 'success');
+              }}
             >
               ⑂ Fork в новую вкладку
             </button>
+            {currentSessionType === 'claude' && sessionId && (
+              <button
+                className="mt-1 w-full text-[10px] px-2 py-1 rounded text-[#DA7756] hover:text-white bg-[#333] hover:bg-[#444] cursor-pointer"
+                onClick={async () => {
+                  if (!sessionId || !activeTabId) return;
+                  const state = useWorkspaceStore.getState();
+                  for (const [projectId, workspace] of state.openProjects) {
+                    const tab = workspace.tabs.get(activeTabId);
+                    if (tab) {
+                      const currentCwd = tab.cwd || project?.path || '';
+                      const forkResult = await ipcRenderer.invoke('claude:fork-session-file', { sourceSessionId: sessionId, cwd: currentCwd, skipChainResolve: true });
+                      if (!forkResult.success) { showToast('Fork failed: ' + forkResult.error, 'error'); return; }
+                      const sdkTabId = await state.createSDKTab(projectId);
+                      state.updateSDKState(sdkTabId, { claudeSessionId: forkResult.newSessionId });
+                      showToast('SDK fork ← ' + sessionId.slice(0, 8), 'success');
+                      break;
+                    }
+                  }
+                }}
+                title="Fork current session into SDK tab"
+              >
+                ⑂ Fork → SDK
+              </button>
+            )}
           </div>
         ) : (activeCommandType === 'claude' || activeCommandType === 'gemini') ? (
           <div className="bg-[#2a2a2a] border border-[#3a3a3a] rounded p-2">
@@ -601,7 +646,7 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
         )}
       </div>
 
-      {hasClaudeSession && activeTabId && (
+      {(hasClaudeSession || isSDKTab) && activeTabId && (
         <div className="mb-4">
           <div className="text-[11px] uppercase text-[#888] mb-2">Контроль</div>
           <div className="space-y-2">
@@ -609,18 +654,38 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
               <span className="text-[10px] text-[#666] w-12 flex-shrink-0">Model</span>
               <div className="flex gap-1 flex-1">
                 {(['default', 'sonnet', 'opus', 'haiku'] as const).map((model) => {
-                  const lm = claudeModel?.toLowerCase() || '';
-                  const isActive = model === 'default'
-                    ? lm.includes('1m context')
-                    : model === 'opus'
-                      ? lm.includes('opus') && !lm.includes('1m context')
-                      : lm.includes(model);
+                  let isActive: boolean;
+                  if (isSDKTab) {
+                    // SDK: read from tab store
+                    const state = useWorkspaceStore.getState();
+                    let sdkModel = 'default';
+                    for (const [, ws] of state.openProjects) { const t = ws.tabs.get(activeTabId); if (t) { sdkModel = t.sdkModel || 'default'; break; } }
+                    isActive = sdkModel === model;
+                  } else {
+                    const lm = claudeModel?.toLowerCase() || '';
+                    isActive = model === 'default'
+                      ? lm.includes('1m context')
+                      : model === 'opus'
+                        ? lm.includes('opus') && !lm.includes('1m context')
+                        : lm.includes(model);
+                  }
                   return (
                     <button
                       key={model}
-                      className={`flex-1 text-[10px] px-1.5 py-1 rounded ${isControlBusy ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'} ${isActive ? 'bg-[#DA7756] text-white font-medium' : 'bg-[#2d2d2d] text-[#888] hover:text-white hover:bg-[#3d3d3d]'}`}
-                      disabled={isControlBusy}
-                      onClick={async () => { if (isControlBusy) return; setIsControlBusy(true); console.warn('[InfoPanel:ModelSwitch] clicked=' + model + ' tabId=' + activeTabId + ' ts=' + Date.now()); try { await ipcRenderer.invoke('claude:send-command', activeTabId, '/model ' + model); } finally { setIsControlBusy(false); } }}
+                      className={`flex-1 text-[10px] px-1.5 py-1 rounded cursor-pointer ${isActive ? 'bg-[#DA7756] text-white font-medium' : 'bg-[#2d2d2d] text-[#888] hover:text-white hover:bg-[#3d3d3d]'}`}
+                      onClick={async () => {
+                        if (isSDKTab) {
+                          // SDK: store locally — applied on next query
+                          const { updateSDKState } = useWorkspaceStore.getState();
+                          const modelMap: Record<string, string | undefined> = { default: undefined, sonnet: 'claude-sonnet-4-6', opus: 'claude-opus-4-6', haiku: 'claude-haiku-4-5-20251001' };
+                          updateSDKState(activeTabId, { sdkModel: model });
+                          setThinkFlash(model); setTimeout(() => setThinkFlash(null), 1500);
+                        } else {
+                          if (isControlBusy) return;
+                          setIsControlBusy(true);
+                          try { await ipcRenderer.invoke('claude:send-command', activeTabId, '/model ' + model); } finally { setIsControlBusy(false); }
+                        }
+                      }}
                       title={'Switch to ' + model}
                     >
                       {model}
@@ -629,6 +694,8 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                 })}
               </div>
             </div>
+            {/* LLM row — only for PTY tabs */}
+            {!isSDKTab && (
             <div className="flex items-center gap-1">
               <span className="text-[10px] text-[#666] w-12 flex-shrink-0">LLM</span>
               <div className="flex gap-1 flex-1">
@@ -661,22 +728,36 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                 })}
               </div>
             </div>
+            )}
             <div className="flex items-center gap-1">
               <span className="text-[10px] text-[#666] w-12 flex-shrink-0">Effort</span>
               <div className="flex gap-1 flex-1">
                 {(['auto', 'low', 'medium', 'high', 'max'] as const).map((level) => {
-                  const currentEffort = activeTabId ? effortLevel[activeTabId] : undefined;
-                  const isActive = currentEffort === level;
+                  let isActive: boolean;
+                  if (isSDKTab) {
+                    const state = useWorkspaceStore.getState();
+                    let sdkEffort = 'high';
+                    for (const [, ws] of state.openProjects) { const t = ws.tabs.get(activeTabId); if (t) { sdkEffort = t.sdkEffort || 'high'; break; } }
+                    isActive = sdkEffort === level;
+                  } else {
+                    const currentEffort = activeTabId ? effortLevel[activeTabId] : undefined;
+                    isActive = currentEffort === level;
+                  }
                   return (
                     <button
                       key={level}
-                      className={`flex-1 text-[10px] px-1.5 py-1 rounded ${isControlBusy ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'} ${isActive ? 'bg-[#DA7756]/20 text-white font-medium' : 'bg-[#2d2d2d] text-[#888] hover:text-white hover:bg-[#3d3d3d]'}`}
-                      disabled={isControlBusy}
+                      className={`flex-1 text-[10px] px-1.5 py-1 rounded cursor-pointer ${isActive ? 'bg-[#DA7756]/20 text-white font-medium' : 'bg-[#2d2d2d] text-[#888] hover:text-white hover:bg-[#3d3d3d]'}`}
                       onClick={async () => {
-                        if (isControlBusy) return;
-                        setIsControlBusy(true);
-                        if (activeTabId) setEffortLevel(prev => ({ ...prev, [activeTabId]: level }));
-                        try { await ipcRenderer.invoke('claude:send-command', activeTabId, '/effort ' + level); } finally { setIsControlBusy(false); }
+                        if (isSDKTab) {
+                          const { updateSDKState } = useWorkspaceStore.getState();
+                          updateSDKState(activeTabId, { sdkEffort: level });
+                          setEffortLevel(prev => ({ ...prev, [activeTabId]: level }));
+                        } else {
+                          if (isControlBusy) return;
+                          setIsControlBusy(true);
+                          if (activeTabId) setEffortLevel(prev => ({ ...prev, [activeTabId]: level }));
+                          try { await ipcRenderer.invoke('claude:send-command', activeTabId, '/effort ' + level); } finally { setIsControlBusy(false); }
+                        }
                       }}
                       title={'Set effort to ' + level}
                     >
@@ -689,17 +770,26 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
             <div className="flex items-center gap-1">
               <span className="text-[10px] text-[#666] w-12 flex-shrink-0">Think</span>
               <button
-                disabled={isControlBusy}
-                className={`flex-1 text-[10px] px-1.5 py-1 rounded ${isControlBusy ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'} bg-[#2d2d2d] ${thinkFlash ? 'text-[#b4b9f9]' : 'text-[#888] hover:text-white hover:bg-[#3d3d3d]'}`}
+                className={`flex-1 text-[10px] px-1.5 py-1 rounded cursor-pointer bg-[#2d2d2d] ${thinkFlash ? 'text-[#b4b9f9]' : 'text-[#888] hover:text-white hover:bg-[#3d3d3d]'}`}
                 onClick={async () => {
-                  if (isControlBusy) return;
-                  setIsControlBusy(true);
-                  try {
-                    const result = await ipcRenderer.invoke('claude:toggle-thinking', activeTabId);
-                    if (result.success) { setThinkFlash(result.thinking ? 'think on' : 'think off'); setTimeout(() => setThinkFlash(null), 3000); }
-                  } finally { setIsControlBusy(false); }
+                  if (isSDKTab) {
+                    const state = useWorkspaceStore.getState();
+                    let currentThinking = false;
+                    for (const [, ws] of state.openProjects) { const t = ws.tabs.get(activeTabId); if (t) { currentThinking = !!t.sdkThinking; break; } }
+                    const { updateSDKState } = useWorkspaceStore.getState();
+                    updateSDKState(activeTabId, { sdkThinking: !currentThinking });
+                    setThinkFlash(!currentThinking ? 'think on' : 'think off');
+                    setTimeout(() => setThinkFlash(null), 3000);
+                  } else {
+                    if (isControlBusy) return;
+                    setIsControlBusy(true);
+                    try {
+                      const result = await ipcRenderer.invoke('claude:toggle-thinking', activeTabId);
+                      if (result.success) { setThinkFlash(result.thinking ? 'think on' : 'think off'); setTimeout(() => setThinkFlash(null), 3000); }
+                    } finally { setIsControlBusy(false); }
+                  }
                 }}
-                title="Toggle thinking mode (meta+t)"
+                title="Toggle thinking mode"
               >
                 {thinkFlash || 'toggle'}
               </button>
@@ -774,6 +864,16 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                       onClick={() => { if (!activeTabId) { showToast('Нет активного таба', 'error'); return; } const effectiveDefault = claudeDefaultPromptEnabled ? claudeDefaultPrompt : ''; const finalPrompt = [effectiveDefault, claudeExtraPrompt].filter(Boolean).join('\n\n'); setTabCommandType(activeTabId, 'claude'); ipcRenderer.send('claude:run-command', { tabId: activeTabId, command: 'claude', prompt: finalPrompt || undefined }); setClaudeExpanded(false); setClaudeExtraPrompt(''); }}
                     >claude</code>
                     <code
+                      className="text-xs cursor-pointer hover:underline px-1.5 py-0.5 bg-[#1a1a1a] border-l border-[#333]"
+                      style={{ color: '#DA7756' }}
+                      onClick={() => {
+                        if (!activeTabId) { showToast('Нет активного таба', 'error'); return; }
+                        const { convertToSDKTab } = useWorkspaceStore.getState();
+                        convertToSDKTab(activeTabId);
+                      }}
+                      title="Запустить Claude SDK в текущем табе"
+                    >sdk</code>
+                    <code
                       className="text-xs cursor-pointer hover:underline px-1.5 py-0.5 bg-[#1a1a1a] rounded-r border-l border-[#333]"
                       style={{ color: '#4E86F8' }}
                       onClick={() => { if (!activeTabId) { showToast('Нет активного таба', 'error'); return; } setTabCommandType(activeTabId, 'gemini'); ipcRenderer.send('gemini:spawn-with-watcher', { tabId: activeTabId, cwd: getCurrentCwd(), yesMode: true }); }}
@@ -816,8 +916,59 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                         else showToast('В буфере нет UUID', 'warning');
                       } catch (err) { showToast('Не удалось прочитать буфер', 'error'); }
                     }}
-                    title="Fork Claude по UUID из буфера"
+                    title="Fork Claude по UUID из буфера (ПКМ → Open in SDK)"
+                    onContextMenu={async (e) => {
+                      e.preventDefault();
+                      if (!activeTabId) { showToast('Нет активного таба', 'error'); return; }
+                      try {
+                        const clipboardText = await navigator.clipboard.readText();
+                        const match = clipboardText.match(UUID_EXTRACT_REGEX);
+                        const targetSessionId = match ? match[0] : null;
+                        if (!targetSessionId) { showToast('В буфере нет UUID', 'warning'); return; }
+                        const state = useWorkspaceStore.getState();
+                        for (const [projectId, workspace] of state.openProjects) {
+                          const tab = workspace.tabs.get(activeTabId);
+                          if (tab) {
+                            const currentCwd = tab.cwd || project?.path || '';
+                            const forkResult = await ipcRenderer.invoke('claude:fork-session-file', { sourceSessionId: targetSessionId, cwd: currentCwd, skipChainResolve: true });
+                            if (!forkResult.success) { showToast('Fork failed: ' + forkResult.error, 'error'); return; }
+                            const sdkTabId = await state.createSDKTab(projectId);
+                            console.warn('[InfoPanel:SDK-Fork] created sdkTabId=' + sdkTabId + ' forked ' + targetSessionId.slice(0, 8) + ' → ' + forkResult.newSessionId.slice(0, 8));
+                            state.updateSDKState(sdkTabId, { claudeSessionId: forkResult.newSessionId });
+                            showToast('SDK fork ← ' + targetSessionId.slice(0, 8), 'success');
+                            break;
+                          }
+                        }
+                      } catch (err) { showToast('Ошибка: ' + (err as Error).message, 'error'); }
+                    }}
                   >claude-f</code>
+                  <code
+                    className="text-xs cursor-pointer hover:underline px-1.5 py-0.5 bg-[#1a1a1a] border-l border-[#333]"
+                    style={{ color: '#DA7756' }}
+                    onClick={async () => {
+                      if (!activeTabId) { showToast('Нет активного таба', 'error'); return; }
+                      try {
+                        const clipboardText = await navigator.clipboard.readText();
+                        const match = clipboardText.match(UUID_EXTRACT_REGEX);
+                        const targetSessionId = match ? match[0] : null;
+                        if (!targetSessionId) { showToast('В буфере нет UUID', 'warning'); return; }
+                        const state = useWorkspaceStore.getState();
+                        for (const [projectId, workspace] of state.openProjects) {
+                          const tab = workspace.tabs.get(activeTabId);
+                          if (tab) {
+                            const currentCwd = tab.cwd || project?.path || '';
+                            const forkResult = await ipcRenderer.invoke('claude:fork-session-file', { sourceSessionId: targetSessionId, cwd: currentCwd, skipChainResolve: true });
+                            if (!forkResult.success) { showToast('Fork failed: ' + forkResult.error, 'error'); return; }
+                            const sdkTabId = await state.createSDKTab(projectId);
+                            state.updateSDKState(sdkTabId, { claudeSessionId: forkResult.newSessionId });
+                            showToast('SDK fork ← ' + targetSessionId.slice(0, 8), 'success');
+                            break;
+                          }
+                        }
+                      } catch (err) { showToast('Ошибка: ' + (err as Error).message, 'error'); }
+                    }}
+                    title="Fork UUID from clipboard into SDK tab"
+                  >sdk</code>
                   <code
                     className="text-xs cursor-pointer hover:underline px-1.5 py-0.5 bg-[#1a1a1a] rounded-r border-l border-[#333]"
                     style={{ color: '#4E86F8' }}
@@ -883,6 +1034,18 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
           <span className="text-[11px] uppercase text-[#888]">Заметки вкладки</span>
           {activeTabId && (
             <button className={`text-[10px] px-1.5 py-0.5 rounded cursor-pointer ${isGeneratingDesc ? 'text-[#f59e0b] bg-[#f59e0b]/10 animate-pulse' : 'text-[#666] hover:text-[#f59e0b] hover:bg-[#f59e0b]/10'}`} onClick={handleGenerateDescription} disabled={isGeneratingDesc} title="Generate AI description">{isGeneratingDesc ? '...' : '\u2726'}</button>
+          )}
+          <div className="flex-1" />
+          {activeTabId && (
+            <button
+              className="text-[10px] px-1.5 py-0.5 rounded cursor-pointer text-[#666] hover:text-white hover:bg-[#ffffff10]"
+              onClick={() => {
+                const { openNotesEditor } = useUIStore.getState();
+                const store = useWorkspaceStore.getState();
+                if (store.activeProjectId) openNotesEditor(store.activeProjectId);
+              }}
+              title="Open notes editor"
+            >⤢</button>
           )}
         </div>
         {activeTabId ? (

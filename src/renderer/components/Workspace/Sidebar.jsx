@@ -346,7 +346,10 @@ function Sidebar({
   sidebarFocused = false,
   onFocus,
   registerPendingOperation = () => {}, // Callback для игнорирования FileWatcher
-  disableDrag = false // New prop to disable internal DnD
+  disableDrag = false, // New prop to disable internal DnD
+  onCollapse,
+  initialExpandedDirs,
+  onExpandedDirsChange,
 }) {
   const [treeData, setTreeData] = useState([])
   const [contextMenu, setContextMenu] = useState(null)
@@ -354,7 +357,6 @@ function Sidebar({
   const [iconPickerNode, setIconPickerNode] = useState(null)
   const [editingId, setEditingId] = useState(null) // ID of node being edited
   const [dirDropdownOpen, setDirDropdownOpen] = useState(false)
-  const [sortDropdownOpen, setSortDropdownOpen] = useState(false)
   const [sortMode, setSortMode] = useState('name-asc')
   const [autoReveal, setAutoReveal] = useState(true)
   const openStatesMapRef = useRef({}) // Per-directory expanded state
@@ -363,7 +365,7 @@ function Sidebar({
   const [multiSelected, setMultiSelected] = useState(new Set()) // Multi-selection (Cmd+Click, Shift+Click)
   const lastClickedRef = useRef(null) // Anchor for Shift+Click range selection
   const undoStackRef = useRef([]) // Undo stack for delete operations
-  const openStateRef = useRef({}) // Store expanded state
+  const openStateRef = useRef(initialExpandedDirs || {}) // Store expanded state
   const [expandedSnapshot, setExpandedSnapshot] = useState({}) // Triggers PragmaticFileTree update
 
   // macOS Finder style: Enter on selected file → rename mode
@@ -420,7 +422,12 @@ function Sidebar({
       openStatesMapRef.current[prevFolderPathRef.current] = { ...openStateRef.current }
     }
     setTreeData([])
-    openStateRef.current = openStatesMapRef.current[folderPath] || {}
+    // On first mount, use initialExpandedDirs if available and no in-memory state
+    if (!prevFolderPathRef.current && initialExpandedDirs && !openStatesMapRef.current[folderPath]) {
+      openStateRef.current = { ...initialExpandedDirs }
+    } else {
+      openStateRef.current = openStatesMapRef.current[folderPath] || {}
+    }
     prevFolderPathRef.current = folderPath
   }, [folderPath]);
 
@@ -500,6 +507,16 @@ function Sidebar({
     return () => document.removeEventListener('keydown', handleKeyDown, true)
   }, [sidebarFocused, handleUndo])
 
+  // Debounced save of expanded dirs to DB
+  const saveExpandedTimerRef = useRef(null)
+  const saveExpandedDirs = useCallback((state) => {
+    if (!onExpandedDirsChange) return
+    if (saveExpandedTimerRef.current) clearTimeout(saveExpandedTimerRef.current)
+    saveExpandedTimerRef.current = setTimeout(() => {
+      onExpandedDirsChange(state)
+    }, 500)
+  }, [onExpandedDirsChange])
+
   // 1. Initial Load (when folderPath changes or hard refresh requested)
   useEffect(() => {
     if (!folderPath) return
@@ -510,6 +527,25 @@ function Sidebar({
       try {
         const nodes = await loadTreeRecursive(folderPath, openStateRef.current)
         console.log('[sidebar]','Tree loaded, root items:', nodes.length)
+        // Clean stale entries: keep only paths that exist in the loaded tree
+        const allDirPaths = new Set()
+        const collectDirs = (items) => {
+          for (const n of items) {
+            if (n.isDirectory) {
+              allDirPaths.add(n.id)
+              if (n.children) collectDirs(n.children)
+            }
+          }
+        }
+        collectDirs(nodes)
+        let cleaned = false
+        for (const key of Object.keys(openStateRef.current)) {
+          if (!allDirPaths.has(key)) {
+            delete openStateRef.current[key]
+            cleaned = true
+          }
+        }
+        if (cleaned) saveExpandedDirs(openStateRef.current)
         setTreeData(nodes)
         setExpandedSnapshot({ ...openStateRef.current })
       } catch (err) {
@@ -518,12 +554,13 @@ function Sidebar({
     }
 
     loadTree()
-  }, [folderPath, externalRefreshTrigger, loadTreeRecursive])
+  }, [folderPath, externalRefreshTrigger, loadTreeRecursive, saveExpandedDirs])
 
   // Sync expansion state from PragmaticFileTree
   const handleExpandChange = useCallback((newExpandedState) => {
       openStateRef.current = newExpandedState;
-  }, []);
+      saveExpandedDirs(newExpandedState);
+  }, [saveExpandedDirs]);
 
   // Auto-reveal: раскрываем parent-папки когда activeFilePath меняется
   useEffect(() => {
@@ -554,6 +591,7 @@ function Sidebar({
     loadTreeRecursive(folderPath, openStateRef.current).then(nodes => {
       setTreeData(nodes)
       setExpandedSnapshot({ ...openStateRef.current }) // Новая ссылка → PragmaticFileTree обновит expandedIds
+      saveExpandedDirs(openStateRef.current)
     }).catch(err => {
       console.log('[sidebar]','Error revealing file in tree:', err)
     })
@@ -941,31 +979,18 @@ function Sidebar({
     await setValue('gt-dir-settings', allSettings)
   }, [folderPath])
 
-  const handleSortChange = useCallback(async (mode) => {
-    console.log('[sidebar] Sort change:', mode)
-    setSortMode(mode)
-    sortModeRef.current = mode
-    setSortDropdownOpen(false)
-    await saveDirSetting('sortMode', mode)
-    // Reload tree with new sort
-    if (folderPath) {
-      const nodes = await loadTreeRecursive(folderPath, openStateRef.current)
-      console.log('[sidebar] Sort reload done, first 3:', nodes.slice(0, 3).map(n => n.name))
-      setTreeData(nodes)
-      setExpandedSnapshot({ ...openStateRef.current })
-    }
-  }, [folderPath, loadTreeRecursive, saveDirSetting])
 
   const handleCollapseAll = useCallback(() => {
     openStateRef.current = {}
     setExpandedSnapshot({})
+    saveExpandedDirs({})
     // Reload tree without any open folders
     if (folderPath) {
       loadTreeRecursive(folderPath, {}).then(nodes => {
         setTreeData(nodes)
       })
     }
-  }, [folderPath, loadTreeRecursive])
+  }, [folderPath, loadTreeRecursive, saveExpandedDirs])
 
   const handleToggleAutoReveal = useCallback(async () => {
     const next = !autoReveal
@@ -1006,7 +1031,7 @@ function Sidebar({
       <div className="sidebar-header">
         <div
           className={`sidebar-title ${dirDropdownOpen ? 'open' : ''}`}
-          onClick={() => { setDirDropdownOpen(!dirDropdownOpen); setSortDropdownOpen(false) }}
+          onClick={() => { setDirDropdownOpen(!dirDropdownOpen) }}
         >
           <span>{folderPath?.split('/').pop()}</span>
           <svg width="10" height="10" viewBox="0 0 10 10" className="sidebar-title-chevron">
@@ -1021,14 +1046,16 @@ function Sidebar({
         <button className="sidebar-toolbar-btn" onClick={() => handleNewFolder(getTargetParentNode())} title="New folder">
           <svg width="16" height="16" viewBox="0 0 16 16"><path d="M2 3.5h4.5l1.5 1.5H14v8H2z" stroke="currentColor" strokeWidth="1.2" fill="none" strokeLinejoin="round"/><path d="M8 7.5v3M6.5 9h3" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/></svg>
         </button>
-        {/* Sort */}
-        <button className={`sidebar-toolbar-btn ${sortMode !== 'name-asc' ? 'active' : ''}`} onClick={() => { setSortDropdownOpen(!sortDropdownOpen); setDirDropdownOpen(false) }} title="Sort order">
-          <svg width="16" height="16" viewBox="0 0 16 16"><path d="M3 4h10M3 8h7M3 12h4" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/></svg>
-        </button>
         {/* Add directory */}
         <button className="sidebar-toolbar-btn" onClick={onAddDirectory} title="Add directory">
           <svg width="16" height="16" viewBox="0 0 16 16">
             <path d="M8 2v12M2 8h12" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+          </svg>
+        </button>
+        {/* Collapse sidebar */}
+        <button className="sidebar-toolbar-btn sidebar-collapse-btn" onClick={onCollapse} title="Collapse sidebar">
+          <svg width="16" height="16" viewBox="0 0 16 16">
+            <path d="M2 2v12M6 4l-3 4 3 4M7 2h7v12H7" stroke="currentColor" strokeWidth="1.2" fill="none" strokeLinecap="round" strokeLinejoin="round"/>
           </svg>
         </button>
 
@@ -1055,24 +1082,11 @@ function Sidebar({
           </div>
         )}
 
-        {sortDropdownOpen && (
-          <div className="directory-dropdown sort-dropdown">
-            {SORT_MODES.map(m => (
-              <div
-                key={m.id}
-                className={`directory-item ${m.id === sortMode ? 'active' : ''}`}
-                onClick={() => handleSortChange(m.id)}
-              >
-                <span className="directory-item-name">{m.id === sortMode ? '\u2713 ' : '   '}{m.label}</span>
-              </div>
-            ))}
-          </div>
-        )}
       </div>
 
       <div
         className="file-tree"
-        onPointerDown={(e) => { onFocus(e); setFocusedId(null); setMultiSelected(new Set()); setDirDropdownOpen(false); setSortDropdownOpen(false) }}
+        onPointerDown={(e) => { onFocus(e); setFocusedId(null); setMultiSelected(new Set()); setDirDropdownOpen(false) }}
         onContextMenu={(e) => { e.preventDefault(); setFocusedId(null); setMultiSelected(new Set()); setContextMenu({ x: e.clientX, y: e.clientY, node: null }) }}
       >
         {treeData.length > 0 && (

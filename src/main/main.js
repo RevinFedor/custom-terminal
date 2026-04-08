@@ -4369,7 +4369,7 @@ ipcMain.handle('claude:send-command', async (event, tabId, command) => {
 
 // ========== LLM Provider Switching ==========
 ipcMain.handle('provider:switch', (event, opts) => {
-  // opts: { type: 'anthropic' } or { type: 'litellm', model: 'gpt-4o' }
+  // opts: { type: 'anthropic' } or { type: 'zen', model: 'minimax-m2.5' }
   const prev = providerState.type + (providerState.model ? ':' + providerState.model : '');
   providerState = opts;
   const curr = providerState.type + (providerState.model ? ':' + providerState.model : '');
@@ -5258,6 +5258,11 @@ ipcMain.handle('project:save-metadata', (event, { projectId, metadata }) => {
 
 ipcMain.handle('project:save-sidebar-state', (event, { projectId, sidebarOpen, openFilePath }) => {
   projectManager.db.updateProjectSidebarState(projectId, sidebarOpen, openFilePath);
+  return { success: true };
+});
+
+ipcMain.handle('project:save-sidebar-expanded-dirs', (event, { projectId, expandedDirs }) => {
+  projectManager.db.updateProjectSidebarExpandedDirs(projectId, expandedDirs);
   return { success: true };
 });
 
@@ -6920,4 +6925,151 @@ ipcMain.on('claude:run-command', (event, { tabId, command, sessionId, forkSessio
     default:
       console.error('[Claude Runner] Unknown command:', command);
   }
+});
+
+// ====================== CLAUDE SDK ======================
+// Manages Claude Agent SDK sessions (headless, no PTY)
+// SDK writes its own JSONL — Timeline reads it via existing claude:get-timeline
+
+const sdkSessions = new Map(); // tabId → { query, abortController, sessionId, cwd }
+
+// Shared function: start SDK query and stream results to renderer
+async function sdkStartQuery(tabId, cwd, prompt, resumeSessionId, model, effort) {
+  // Close existing query if still running (prevents dual streaming loops)
+  const existing = sdkSessions.get(tabId);
+  if (existing?.query) {
+    try { existing.query.close(); } catch {}
+    sdkSessions.delete(tabId);
+  }
+
+  const { query } = await import('@anthropic-ai/claude-agent-sdk');
+
+  const abortController = new AbortController();
+  const options = {
+    abortController,
+    cwd: cwd || process.cwd(),
+    permissionMode: 'bypassPermissions',
+    model: model || undefined,
+    effort: effort || 'high',
+  };
+  if (resumeSessionId) {
+    options.resume = resumeSessionId;
+  }
+
+  const q = query({ prompt, options });
+  const session = { query: q, abortController, sessionId: resumeSessionId || null, cwd: cwd || process.cwd() };
+  sdkSessions.set(tabId, session);
+
+  console.log('[ClaudeSDK] query started tabId=' + tabId + (resumeSessionId ? ' resume=' + resumeSessionId : ' new'));
+
+  // Stream messages to renderer (fire-and-forget)
+  (async () => {
+    try {
+      for await (const message of q) {
+        const win = BrowserWindow.getAllWindows()[0];
+        if (!win || win.isDestroyed()) break;
+
+        // Capture sessionId from first message that has it
+        if (message.session_id && !session.sessionId) {
+          session.sessionId = message.session_id;
+          console.log('[ClaudeSDK] sessionId captured: ' + session.sessionId);
+        }
+
+        win.webContents.send('claude-sdk:message', { tabId, message, sessionId: session.sessionId || message.session_id });
+      }
+    } catch (err) {
+      if (err.name !== 'AbortError') {
+        console.error('[ClaudeSDK] stream error:', err.message);
+        const win = BrowserWindow.getAllWindows()[0];
+        if (win && !win.isDestroyed()) {
+          win.webContents.send('claude-sdk:message', {
+            tabId,
+            sessionId: session.sessionId,
+            message: { type: 'result', subtype: 'error', result: String(err.message || err), is_error: true }
+          });
+        }
+      }
+    } finally {
+      sdkSessions.delete(tabId);
+      const win = BrowserWindow.getAllWindows()[0];
+      if (win && !win.isDestroyed()) {
+        win.webContents.send('claude-sdk:done', { tabId, sessionId: session.sessionId });
+      }
+      console.log('[ClaudeSDK] stream ended tabId=' + tabId);
+    }
+  })();
+
+  return session;
+}
+
+ipcMain.handle('claude-sdk:create-session', async (event, { tabId, cwd, prompt, model, effort }) => {
+  console.log('[ClaudeSDK] create-session tabId=' + tabId + ' cwd=' + cwd);
+  try {
+    await sdkStartQuery(tabId, cwd, prompt, null, model, effort);
+    return { success: true };
+  } catch (err) {
+    console.error('[ClaudeSDK] create-session failed:', err.message);
+    return { success: false, error: String(err.message || err) };
+  }
+});
+
+ipcMain.handle('claude-sdk:send-message', async (event, { tabId, cwd, prompt, model, effort }) => {
+  console.log('[ClaudeSDK] send-message tabId=' + tabId);
+  const existingSession = sdkSessions.get(tabId);
+
+  try {
+    if (!existingSession || !existingSession.sessionId) {
+      // No active session — start fresh
+      await sdkStartQuery(tabId, cwd, prompt, null, model, effort);
+    } else {
+      // Resume existing session
+      await sdkStartQuery(tabId, existingSession.cwd, prompt, existingSession.sessionId, model, effort);
+    }
+    return { success: true };
+  } catch (err) {
+    console.error('[ClaudeSDK] send-message failed:', err.message);
+    return { success: false, error: String(err.message || err) };
+  }
+});
+
+// Forward SDK busy state to TabBar via existing claude:busy-state channel
+ipcMain.on('claude-sdk:busy-state', (event, { tabId, busy }) => {
+  const win = BrowserWindow.getAllWindows()[0];
+  if (win && !win.isDestroyed()) {
+    win.webContents.send('claude:busy-state', { tabId, busy });
+  }
+});
+
+// Load session history from JSONL (for converted/restored SDK tabs)
+ipcMain.handle('claude-sdk:load-history', async (event, { sessionId, cwd }) => {
+  console.log('[ClaudeSDK] load-history sessionId=' + sessionId + ' cwd=' + cwd);
+  try {
+    const { getSessionMessages } = await import('@anthropic-ai/claude-agent-sdk');
+    // Try with dir first, then without (searches all projects)
+    let msgs = await getSessionMessages(sessionId, { dir: cwd || undefined });
+    if (msgs.length === 0 && cwd) {
+      console.log('[ClaudeSDK] load-history: 0 with dir, retrying without dir...');
+      msgs = await getSessionMessages(sessionId);
+    }
+    console.log('[ClaudeSDK] loaded ' + msgs.length + ' messages for ' + sessionId.slice(0, 8));
+    return { success: true, messages: msgs };
+  } catch (err) {
+    console.error('[ClaudeSDK] load-history failed:', err.message);
+    return { success: false, error: String(err.message || err), messages: [] };
+  }
+});
+
+ipcMain.handle('claude-sdk:stop', async (event, { tabId }) => {
+  console.log('[ClaudeSDK] stop tabId=' + tabId);
+  const session = sdkSessions.get(tabId);
+  if (session) {
+    try {
+      session.query.close();
+    } catch (err) {
+      console.error('[ClaudeSDK] stop error:', err.message);
+    }
+    sdkSessions.delete(tabId);
+    return { success: true };
+  }
+  return { success: false, error: 'no active session' };
 });
