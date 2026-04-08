@@ -165,8 +165,8 @@ function NotesEditorModal() {
         e.preventDefault();
         saveNotes();
       }
-      // Escape or CMD+E to close (and save)
-      if (e.key === 'Escape' || (e.metaKey && e.key === 'e')) {
+      // Escape to close (and save). Cmd+E now toggles file explorer.
+      if (e.key === 'Escape') {
         e.preventDefault();
         handleClose();
       }

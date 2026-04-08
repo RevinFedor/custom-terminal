@@ -3,6 +3,7 @@ import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import Terminal from './Terminal';
 import BrowserTab from './BrowserTab';
+import ClaudeSDKTab from './ClaudeSDK/ClaudeSDKTab';
 import { motion, AnimatePresence } from 'framer-motion';
 import { terminalRegistry } from '../../utils/terminalRegistry';
 
@@ -237,6 +238,8 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
     const ws = s.openProjects.get(projectId);
     if (!ws?.activeTabId) return false;
     const tab = ws.tabs.get(ws.activeTabId);
+    // SDK tabs handle resume via claude-sdk:send-message, not PTY overlay
+    if (tab?.tabType === 'claude-sdk') return false;
     return !!tab?.wasInterrupted && !!tab?.claudeSessionId && !tab?.claudeActive;
   });
   const activeTabSessionId = useWorkspaceStore((s) => {
@@ -317,7 +320,17 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
             }
           }
         }
-        if (tab.tabType === 'browser') {
+        if (tab.tabType === 'claude-sdk') {
+          result.push(
+            <ClaudeSDKTab
+              key={tab.id}
+              tabId={tab.id}
+              active={isActive}
+              isActiveProject={isActiveProject}
+              cwd={tab.cwd}
+            />
+          );
+        } else if (tab.tabType === 'browser') {
           result.push(
             <BrowserTab
               key={tab.id}

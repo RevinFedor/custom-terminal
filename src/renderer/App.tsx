@@ -970,23 +970,17 @@ function App() {
         return;
       }
 
-      // Cmd+B - Toggle file explorer (also close file preview if open)
+      // Cmd+B - Toggle file explorer (legacy, also available via Cmd+E in Workspace)
       const isCmdB = e.code === 'KeyB';
       if (e.metaKey && isCmdB) {
-        console.log('[Hotkey] FileExplorer toggle triggered, view:', view);
         e.preventDefault();
         if (view === 'workspace' && activeProjectId) {
-          // Close file preview if open
           if (filePreview) {
             closeFilePreview();
             setOpenFilePath(activeProjectId, null);
           }
-          // Toggle per-project sidebar state
           const { sidebarOpen } = getSidebarState(activeProjectId);
-          console.log('[Hotkey] Toggling sidebar for project:', activeProjectId, 'current:', sidebarOpen);
           setSidebarOpen(activeProjectId, !sidebarOpen);
-        } else {
-          console.log('[Hotkey] Not in workspace view or no active project, skipping');
         }
         return;
       }
@@ -996,6 +990,9 @@ function App() {
         if (filePreview) {
           e.preventDefault();
           closeFilePreview();
+          if (activeProjectId) {
+            setOpenFilePath(activeProjectId, null);
+          }
           return;
         }
         if (activeArea === 'projects') {

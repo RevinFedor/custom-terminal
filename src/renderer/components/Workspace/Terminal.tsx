@@ -47,6 +47,10 @@ const handleLinkActivation = (event: MouseEvent, uri: string) => {
           content: result.content,
           language: languageMap[ext] || null
         });
+        const { activeProjectId } = useWorkspaceStore.getState();
+        if (activeProjectId) {
+          useWorkspaceStore.getState().setOpenFilePath(activeProjectId, uri);
+        }
       }
     }).catch((err: any) => {
       console.error('[Link] Failed to read file:', err);

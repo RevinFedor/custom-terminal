@@ -140,6 +140,9 @@ class DatabaseManager {
     try {
       this.db.exec(`ALTER TABLE projects ADD COLUMN open_file_path TEXT DEFAULT NULL`);
     } catch (e) { /* column already exists */ }
+    try {
+      this.db.exec(`ALTER TABLE projects ADD COLUMN sidebar_expanded_dirs TEXT DEFAULT NULL`);
+    } catch (e) { /* column already exists */ }
 
     // Gemini history table
     this.db.exec(`
@@ -425,6 +428,7 @@ class DatabaseManager {
       notesGlobal: project.notes_global || '',
       sidebarOpen: project.sidebar_open === 1,
       openFilePath: project.open_file_path || null,
+      sidebarExpandedDirs: project.sidebar_expanded_dirs ? JSON.parse(project.sidebar_expanded_dirs) : null,
       createdAt: project.created_at,
       updatedAt: project.updated_at,
       quickActions: globalCommands.map(gc => ({ name: gc.name, command: gc.command })),
@@ -538,6 +542,11 @@ class DatabaseManager {
 
   updateProjectSidebarState(projectId, sidebarOpen, openFilePath) {
     this.db.prepare('UPDATE projects SET sidebar_open = ?, open_file_path = ? WHERE id = ?').run(sidebarOpen ? 1 : 0, openFilePath || null, projectId);
+  }
+
+  updateProjectSidebarExpandedDirs(projectId, expandedDirs) {
+    const json = expandedDirs ? JSON.stringify(expandedDirs) : null;
+    this.db.prepare('UPDATE projects SET sidebar_expanded_dirs = ? WHERE id = ?').run(json, projectId);
   }
 
   deleteProject(projectId) {

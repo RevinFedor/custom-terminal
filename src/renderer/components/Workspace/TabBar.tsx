@@ -11,7 +11,7 @@ import { attachClosestEdge, extractClosestEdge, type Edge } from '@atlaskit/prag
 import { combine } from '@atlaskit/pragmatic-drag-and-drop/combine';
 import { autoScrollForElements } from '@atlaskit/pragmatic-drag-and-drop-auto-scroll/element';
 import { setCustomNativeDragPreview } from '@atlaskit/pragmatic-drag-and-drop/element/set-custom-native-drag-preview';
-import { ChevronDown, Globe, Bot, Play, Minimize2, Maximize2 } from 'lucide-react';
+import { ChevronDown, Globe, Bot, Play, Minimize2, Maximize2, PanelLeft } from 'lucide-react';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -517,8 +517,8 @@ const TabItem = memo(({
         <Bot size={14} style={{ color: getCollapsedIconColor(), flexShrink: 0 }} />
       ) : (
         <>
-          {/* Restart zone - left part of tab (not for browser tabs) */}
-          {tab.tabType !== 'browser' && (
+          {/* Restart zone - left part of tab (not for browser or SDK tabs) */}
+          {tab.tabType !== 'browser' && tab.tabType !== 'claude-sdk' && (
             <RestartZone
               hasProcess={hasProcess}
               hasColor={!!hasColor}
@@ -528,6 +528,16 @@ const TabItem = memo(({
               onRestart={() => onRestart && onRestart(tab.id)}
               onStop={() => onStop && onStop(tab.id)}
             />
+          )}
+          {/* SDK tab indicator — green dot or spinner */}
+          {tab.tabType === 'claude-sdk' && (
+            <div className="flex items-center justify-center w-4 h-full shrink-0">
+              {isBusy ? (
+                <span style={{ width: '6px', height: '6px', borderRadius: '50%', border: '1.5px solid transparent', borderTopColor: '#DA7756', animation: 'spin 0.8s linear infinite', display: 'block' }} />
+              ) : hasSession ? (
+                <span style={{ width: '6px', height: '6px', borderRadius: '50%', backgroundColor: '#4ade80', display: 'block' }} />
+              ) : null}
+            </div>
           )}
 
           {isEditing ? (
@@ -611,11 +621,12 @@ const ZoneDropTarget = memo(({
 });
 
 // Empty area drop zone - for dropping at the end of tabs (works for both reorder and move from utility)
-const EmptyDropZone = memo(({ onDropMain, onDropFromUtility, onHoverChange, onDoubleClick }: {
+const EmptyDropZone = memo(({ onDropMain, onDropFromUtility, onHoverChange, onDoubleClick, onContextMenu }: {
   onDropMain: (tabId: string) => void;
   onDropFromUtility: (tabId: string) => void;
   onHoverChange: (isOver: boolean) => void;
   onDoubleClick?: () => void;
+  onContextMenu?: (e: React.MouseEvent) => void;
 }) => {
   const ref = useRef<HTMLDivElement>(null);
   const [isOver, setIsOver] = useState(false);
@@ -654,6 +665,7 @@ const EmptyDropZone = memo(({ onDropMain, onDropFromUtility, onHoverChange, onDo
       ref={ref}
       className={`h-full flex-1 min-w-[30px] transition-colors ${isOver ? 'bg-white/10' : ''}`}
       onDoubleClick={onDoubleClick}
+      onContextMenu={onContextMenu}
     />
   );
 });
@@ -772,6 +784,9 @@ function TabBar({ projectId }: TabBarProps) {
   
   const { projects } = useProjectsStore();
   const setProjectView = useWorkspaceStore((state) => state.setProjectView);
+  const setSidebarOpen = useWorkspaceStore((state) => state.setSidebarOpen);
+  const getSidebarState = useWorkspaceStore((state) => state.getSidebarState);
+  const createSDKTab = useWorkspaceStore((state) => state.createSDKTab);
   const tabsFontSize = useUIStore((state) => state.tabsFontSize);
   const showToast = useUIStore((state) => state.showToast);
   const tabNotesFontSize = useUIStore((state) => state.tabNotesFontSize);
@@ -781,6 +796,7 @@ function TabBar({ projectId }: TabBarProps) {
   const [editingTabId, setEditingTabId] = useState<string | null>(null);
   const [editValue, setEditValue] = useState('');
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; tabId: string } | null>(null);
+  const [emptyContextMenu, setEmptyContextMenu] = useState<{ x: number; y: number } | null>(null);
   const [contextScripts, setContextScripts] = useState<string[]>([]);
   const [contextShScripts, setContextShScripts] = useState<string[]>([]);
   const [contextFavoriteId, setContextFavoriteId] = useState<number | null>(null);
@@ -1050,16 +1066,17 @@ function TabBar({ projectId }: TabBarProps) {
   }, [editingTabId]);
 
   useEffect(() => {
-    if (!contextMenu) return;
+    if (!contextMenu && !emptyContextMenu) return;
     const handleClose = (e: MouseEvent) => {
       // Don't close if clicking inside the context menu itself
       if ((e.target as HTMLElement).closest('[data-tab-context-menu]')) return;
       setContextMenu(null);
+      setEmptyContextMenu(null);
     };
     // Use mousedown instead of click — xterm.js canvas swallows click events
     document.addEventListener('mousedown', handleClose);
     return () => document.removeEventListener('mousedown', handleClose);
-  }, [contextMenu]);
+  }, [contextMenu, emptyContextMenu]);
 
   // Clamp context menu position to viewport (same pattern as Timeline tooltip)
   useLayoutEffect(() => {
@@ -1337,7 +1354,7 @@ function TabBar({ projectId }: TabBarProps) {
       if ((e.target as HTMLElement).closest('[data-keep-selection]')) return;
       console.log('[TabBar] clearSelection triggered by mousedown outside TabBar', {
         target: (e.target as HTMLElement).tagName,
-        className: (e.target as HTMLElement).className?.slice(0, 80),
+        className: String((e.target as HTMLElement).className || '').slice(0, 80),
         selectedCount: selectedTabIds.length
       });
       clearSelection(projectId);
@@ -1461,6 +1478,18 @@ function TabBar({ projectId }: TabBarProps) {
         onMouseEnter={() => setIsMouseInTabBar(true)}
         onMouseLeave={() => setIsMouseInTabBar(false)}
       >
+        {/* Sidebar toggle */}
+        <button
+          onClick={() => {
+            const { sidebarOpen } = getSidebarState(projectId);
+            setSidebarOpen(projectId, !sidebarOpen);
+          }}
+          className="h-full flex items-center px-2 text-[#666] hover:text-white hover:bg-[rgba(255,255,255,0.05)] transition-all duration-150"
+          title="Toggle sidebar"
+        >
+          <PanelLeft size={16} />
+        </button>
+
         {/* Utility Zone - Left side */}
         <div
           className="relative flex items-center h-full"
@@ -1682,6 +1711,11 @@ function TabBar({ projectId }: TabBarProps) {
               }}
               onHoverChange={setEmptyZoneHovered}
               onDoubleClick={handleNewTabAtEnd}
+              onContextMenu={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                setEmptyContextMenu({ x: e.clientX, y: e.clientY });
+              }}
             />
           )}
         </div>
@@ -1964,6 +1998,38 @@ function TabBar({ projectId }: TabBarProps) {
               {contextFavoriteId ? 'Remove from Favorites' : 'Add to Favorites'}
             </button>
           )}
+        </div>
+      )}
+
+      {/* Empty space context menu — Create SDK tab */}
+      {emptyContextMenu && (
+        <div
+          className="fixed bg-[#2a2a2a] border border-[#444] shadow-2xl min-w-[180px] z-[100] rounded-md overflow-hidden"
+          style={{ left: emptyContextMenu.x, top: emptyContextMenu.y }}
+          onClick={(e) => e.stopPropagation()}
+          onMouseDown={(e) => e.stopPropagation()}
+        >
+          <button
+            className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2"
+            onClick={() => {
+              createSDKTab(projectId);
+              setProjectView(projectId, 'terminal');
+              setEmptyContextMenu(null);
+            }}
+          >
+            <span style={{ color: '#DA7756' }}>◆</span>
+            Create Claude SDK tab
+          </button>
+          <button
+            className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2"
+            onClick={() => {
+              handleNewTabAtEnd();
+              setEmptyContextMenu(null);
+            }}
+          >
+            <span style={{ color: '#888' }}>+</span>
+            New Terminal tab
+          </button>
         </div>
       )}
 
