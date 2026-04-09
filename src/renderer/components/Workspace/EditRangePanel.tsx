@@ -670,14 +670,17 @@ export default function EditRangePanel({
         {/* Loading */}
         {isLoading && (
           <div style={{
-            padding: '8px 10px',
+            padding: '10px 12px',
             display: 'flex',
             alignItems: 'center',
-            gap: '6px',
+            gap: '8px',
+            backgroundColor: 'rgba(59, 130, 246, 0.05)',
+            borderTop: '1px solid rgba(59, 130, 246, 0.1)',
+            borderBottom: '1px solid rgba(59, 130, 246, 0.1)',
           }}>
-            <Sparkles size={12} color="#a8c7fa" className="animate-pulse" />
-            <span style={{ fontSize: '11px', color: '#a8c7fa' }}>Thinking...</span>
-            <div style={{ display: 'flex', gap: '3px' }}>
+            <div className="w-2.5 h-2.5 rounded-full bg-blue-500 animate-glow-blue" />
+            <span style={{ fontSize: '11px', color: '#a8c7fa', fontWeight: 'bold', letterSpacing: '0.05em' }}>THINKING...</span>
+            <div style={{ display: 'flex', gap: '3px', marginLeft: 'auto' }}>
               <div style={{ width: 4, height: 4, borderRadius: '50%', backgroundColor: '#a8c7fa', animation: 'bounce 1s infinite', animationDelay: '-0.3s' }} />
               <div style={{ width: 4, height: 4, borderRadius: '50%', backgroundColor: '#a8c7fa', animation: 'bounce 1s infinite', animationDelay: '-0.15s' }} />
               <div style={{ width: 4, height: 4, borderRadius: '50%', backgroundColor: '#a8c7fa', animation: 'bounce 1s infinite' }} />

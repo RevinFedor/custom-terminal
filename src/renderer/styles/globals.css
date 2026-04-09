@@ -36,11 +36,6 @@
     font-style: normal;
   }
 
-  @keyframes spinner-rotate {
-    from { transform: rotate(0deg); }
-    to { transform: rotate(360deg); }
-  }
-
   @keyframes slideIn {
     from {
       opacity: 0;
@@ -138,21 +133,45 @@
   to { opacity: 1; transform: translateX(0); }
 }
 
+/* AI-detectable smooth color transitions (high variance, better aesthetics) */
+@keyframes glow-yellow {
+  0%, 100% { background-color: #d97706; box-shadow: 0 0 4px #d97706; } /* amber-600 */
+  50% { background-color: #451a03; box-shadow: 0 0 10px #d97706; }    /* dark amber */
+}
+
+@keyframes glow-purple {
+  0%, 100% { background-color: #9333ea; box-shadow: 0 0 4px #9333ea; }
+  50% { background-color: #3b0764; box-shadow: 0 0 10px #9333ea; }
+}
+
+@keyframes glow-green {
+  0%, 100% { background-color: #16a34a; box-shadow: 0 0 4px #16a34a; }
+  50% { background-color: #052e16; box-shadow: 0 0 10px #16a34a; }
+}
+
+@keyframes glow-indigo {
+  0%, 100% { background-color: #4f46e5; box-shadow: 0 0 4px #4f46e5; }
+  50% { background-color: #1e1b4b; box-shadow: 0 0 10px #4f46e5; }
+}
+
+@keyframes glow-blue {
+  0%, 100% { background-color: #2563eb; box-shadow: 0 0 4px #2563eb; }
+  50% { background-color: #172554; box-shadow: 0 0 10px #2563eb; }
+}
+
+@keyframes glow-red {
+  0%, 100% { background-color: #dc2626; box-shadow: 0 0 4px #dc2626; }
+  50% { background-color: #450a0a; box-shadow: 0 0 10px #dc2626; }
+}
+
+.animate-glow-yellow { animation: glow-yellow 1.8s ease-in-out infinite; }
+.animate-glow-purple { animation: glow-purple 1.8s ease-in-out infinite; }
+.animate-glow-green { animation: glow-green 1.8s ease-in-out infinite; }
+.animate-glow-indigo { animation: glow-indigo 1.8s ease-in-out infinite; }
+.animate-glow-blue { animation: glow-blue 1.8s ease-in-out infinite; }
+.animate-glow-red { animation: glow-red 1.8s ease-in-out infinite; }
+
 .animate-slide-in { animation: slide-in 0.3s ease-out forwards; }
-
-@keyframes tab-dot-pulse {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.3; }
-}
-
-@keyframes tab-dot-spin {
-  to { transform: rotate(360deg); }
-}
-
-@keyframes project-badge-pulse {
-  0%, 100% { box-shadow: 0 0 0 1.5px rgba(74, 222, 128, 0.15), 0 0 6px rgba(74, 222, 128, 0.3); }
-  50% { box-shadow: 0 0 0 2.5px rgba(74, 222, 128, 0.35), 0 0 10px rgba(74, 222, 128, 0.5); }
-}
 
 @keyframes fadeIn {
   from { opacity: 0; transform: translateY(-4px); }

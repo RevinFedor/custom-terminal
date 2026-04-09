@@ -618,8 +618,8 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
           <div className="bg-[#2a2a2a] border border-[#3a3a3a] rounded p-2">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
-                <span className="w-2 h-2 rounded-full bg-yellow-500 animate-pulse"></span>
-                <span className="text-yellow-500/80 text-xs">Ожидание сессии...</span>
+                <span className="w-2.5 h-2.5 rounded-full bg-yellow-600 animate-glow-yellow shadow-[0_0_8px_rgba(217,119,6,0.4)]"></span>
+                <span className="text-white/70 font-bold text-[10px] tracking-widest uppercase">WAITING FOR SESSION...</span>
               </div>
               <button className="text-[10px] text-[#666] hover:text-[#aaa] cursor-pointer" onClick={() => { if (activeTabId) { setTabCommandType(activeTabId, 'generic'); setActiveCommandType(null); } }} title="Отменить ожидание">✕</button>
             </div>
@@ -1033,7 +1033,7 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
         <div className="flex items-center gap-2 mb-2">
           <span className="text-[11px] uppercase text-[#888]">Заметки вкладки</span>
           {activeTabId && (
-            <button className={`text-[10px] px-1.5 py-0.5 rounded cursor-pointer ${isGeneratingDesc ? 'text-[#f59e0b] bg-[#f59e0b]/10 animate-pulse' : 'text-[#666] hover:text-[#f59e0b] hover:bg-[#f59e0b]/10'}`} onClick={handleGenerateDescription} disabled={isGeneratingDesc} title="Generate AI description">{isGeneratingDesc ? '...' : '\u2726'}</button>
+            <button className={`text-[10px] px-1.5 py-0.5 rounded cursor-pointer ${isGeneratingDesc ? 'text-white bg-amber-600 animate-glow-yellow font-bold' : 'text-[#666] hover:text-[#f59e0b] hover:bg-[#f59e0b]/10'}`} onClick={handleGenerateDescription} disabled={isGeneratingDesc} title="Generate AI description">{isGeneratingDesc ? 'GENERATING...' : '\u2726'}</button>
           )}
           <div className="flex-1" />
           {activeTabId && (

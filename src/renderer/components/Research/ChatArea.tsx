@@ -186,7 +186,8 @@ function LoadingIndicator() {
     <div className="px-6 py-8 border-b border-transparent">
       <div className="flex gap-6 max-w-5xl mx-auto">
         <div className="shrink-0 w-8 h-8 rounded-full bg-[#a8c7fa]/10 border border-[#a8c7fa]/20 flex items-center justify-center text-[#a8c7fa]">
-          <Sparkles size={16} className="animate-pulse" />
+          <Sparkles size={16} className="text-blue-400 animate-glow-blue" />
+          <span className="text-blue-400 font-bold uppercase tracking-widest">AI is thinking...</span>
         </div>
         <div className="flex-1 py-1">
           <div className="flex items-center gap-3 h-6">
