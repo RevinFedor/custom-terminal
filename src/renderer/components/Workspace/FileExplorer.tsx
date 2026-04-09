@@ -109,7 +109,10 @@ function FileTreeItem({ item, level, onFileClick, fontSize }: FileTreeItemProps)
       {expanded && item.isDirectory && (
         <div className="tree-folder-children">
           {loading ? (
-            <div className="text-[10px] text-[#666] pl-8 py-1">Loading...</div>
+            <div className="flex items-center gap-2 pl-8 py-1">
+              <div className="w-1.5 h-1.5 rounded-full bg-[#666] animate-glow-indigo" />
+              <span className="text-[9px] text-[#666] font-bold tracking-widest uppercase">LOADING...</span>
+            </div>
           ) : (
             children.map((child) => (
               <FileTreeItem

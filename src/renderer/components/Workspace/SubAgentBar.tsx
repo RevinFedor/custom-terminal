@@ -313,19 +313,18 @@ export default function SubAgentBar({ projectId, adoptDragOver }: SubAgentBarPro
                 }}
                 title={tooltipParts.join('\n')}
               >
-                {/* Process indicator: spinner when busy/summarizing, dot when idle */}
+                {/* Process indicator: blinking when busy/summarizing, dot when idle */}
                 {dotSpinning ? (
                   <span
+                    className={isSummarizing ? 'animate-glow-indigo' : 'animate-glow-green'}
                     style={{
                       display: 'inline-block',
                       width: '8px',
                       height: '8px',
                       borderRadius: '50%',
-                      border: `1.5px solid ${isSummarizing ? 'rgba(99, 102, 241, 0.2)' : 'rgba(166, 227, 161, 0.2)'}`,
-                      borderTopColor: dotColor,
-                      boxSizing: 'border-box',
-                      animation: 'tab-dot-spin 0.8s linear infinite',
+                      backgroundColor: dotColor,
                       verticalAlign: 'middle',
+                      boxShadow: `0 0 8px ${dotColor}80`
                     }}
                   />
                 ) : (
@@ -342,11 +341,12 @@ export default function SubAgentBar({ projectId, adoptDragOver }: SubAgentBarPro
                 <span>{tab.name || ('Claude #' + (i + 1))}</span>
                 {statusText && (
                   <span style={{
-                    color: isSummarizing ? '#6366f1' : isError ? '#f38ba8' : isRunning ? '#DA7756' : 'rgba(255,255,255,0.4)',
-                    fontSize: '10px',
-                    fontStyle: (isRunning || isSummarizing) ? 'italic' : 'normal',
+                    color: isSummarizing ? '#818cf8' : isError ? '#f87171' : isRunning ? '#cc7832' : 'rgba(255,255,255,0.6)',
+                    fontSize: '9px',
+                    fontWeight: (isRunning || isSummarizing || isError) ? 'bold' : 'normal',
+                    letterSpacing: '0.02em',
                   }}>
-                    {isError ? '\u2717 ' : ''}{statusText}
+                    {isError ? '\u2717 ' : ''}{statusText.toUpperCase()}
                   </span>
                 )}
               </DraggableChip>
@@ -473,13 +473,15 @@ export default function SubAgentBar({ projectId, adoptDragOver }: SubAgentBarPro
                   onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.backgroundColor = 'rgba(255,255,255,0.06)'; }}
                   onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.backgroundColor = 'transparent'; }}
                 >
-                  <span style={{
-                    fontSize: '9px',
-                    color: '#b4a0ff',
-                    animation: 'tab-dot-pulse 1.5s ease-in-out infinite',
-                  }}>{'\u25CF'}</span>
-                  <span style={{ color: '#b4a0ff' }}>{tab.name || 'claude-sub'}</span>
-                  <span style={{ color: 'rgba(255,255,255,0.35)', fontStyle: 'italic' }}>awaiting response</span>
+                  <span
+                    className="w-1.5 h-1.5 rounded-full bg-purple-500 animate-glow-purple"
+                    style={{
+                      display: 'inline-block',
+                      boxShadow: '0 0 6px #a855f780',
+                    }}
+                  />
+                  <span style={{ color: '#b4a0ff', fontWeight: 'bold' }}>{tab.name || 'claude-sub'}</span>
+                  <span style={{ color: 'rgba(255,255,255,0.5)', fontStyle: 'italic', letterSpacing: '0.02em' }}>AWAITING RESPONSE...</span>
                 </div>
               ))}
 

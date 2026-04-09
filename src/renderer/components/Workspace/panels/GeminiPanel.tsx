@@ -587,12 +587,15 @@ export default function GeminiPanel({ projectPath, geminiPrompt }: GeminiPanelPr
                 <span style={{ fontSize: '9px', color: '#6366f1', backgroundColor: 'rgba(99,102,241,0.12)', padding: '1px 5px', borderRadius: '3px', fontWeight: 600 }}>
                   adopt
                 </span>
-                <span style={{
-                  display: 'inline-block', width: '8px', height: '8px', borderRadius: '50%',
-                  border: '1.5px solid rgba(99,102,241,0.2)', borderTopColor: '#6366f1',
-                  boxSizing: 'border-box', animation: 'tab-dot-spin 0.8s linear infinite',
-                }} />
-                <span className="text-[10px] text-[#666] italic">summarizing...</span>
+                <span
+                  className="animate-glow-indigo"
+                  style={{
+                    display: 'inline-block', width: '8px', height: '8px', borderRadius: '50%',
+                    backgroundColor: '#6366f1',
+                    boxShadow: '0 0 6px rgba(99,102,241,0.5)',
+                  }}
+                />
+                <span className="text-[10px] text-indigo-400 font-bold uppercase tracking-widest">SUMMARIZING...</span>
               </div>
             ))}
 

@@ -160,15 +160,14 @@ const RestartZone = memo(({ hasProcess, hasColor, commandType, hasSession, isBus
           // Claude/Gemini tabs show spinning arc when busy
           ((commandType === 'claude' || commandType === 'gemini') && isBusy) ? (
             <span
+              className="animate-glow-green"
               style={{
                 display: 'block',
                 width: '8px',
                 height: '8px',
                 borderRadius: '50%',
-                border: '1.5px solid rgba(74, 222, 128, 0.2)',
-                borderTopColor: '#4ade80',
-                boxSizing: 'border-box',
-                animation: 'tab-dot-spin 0.8s linear infinite',
+                backgroundColor: '#4ade80',
+                boxShadow: '0 0 8px #22c55e80',
               }}
             />
           ) : (
@@ -1866,7 +1865,7 @@ function TabBar({ projectId }: TabBarProps) {
                           setContextMenu(null);
                         }}
                       >
-                        <div className="w-1.5 h-1.5 rounded-full bg-[#4ade80] animate-pulse" />
+                        <div className="w-2 h-2 rounded-full bg-[#4ade80] animate-glow-green shadow-[0_0_8px_#22c55e80]" />
                         <span className="truncate">Stop: {workspace.tabs.get(contextMenu.tabId)?.name}</span>
                       </button>
                       {(contextScripts.length > 0 || contextShScripts.length > 0) && <div className="my-1 border-t border-[#444]" />}

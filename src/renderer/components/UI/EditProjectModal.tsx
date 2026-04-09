@@ -225,7 +225,7 @@ export default function EditProjectModal() {
 
         <div className="mt-8 pt-4 border-t border-white/5 flex items-center justify-between">
           <div className="flex items-center gap-2 text-gray-600">
-            <div className="w-1.5 h-1.5 bg-green-500/50 rounded-full animate-pulse" />
+            <div className="w-2 h-2 bg-green-500 rounded-full animate-glow-green" />
             <span className="text-[10px] uppercase font-bold tracking-tighter">Auto-saving enabled</span>
           </div>
           <span className="text-[10px] text-gray-700 font-mono italic">ESC to close</span>

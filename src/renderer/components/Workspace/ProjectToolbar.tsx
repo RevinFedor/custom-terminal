@@ -144,7 +144,7 @@ export default function ProjectToolbar() {
         title="Сжать логи из буфера обмена"
         disabled={isCompressing}
       >
-        <Minimize2 size={14} className={isCompressing ? 'animate-pulse' : ''} />
+        <Minimize2 size={14} className={isCompressing ? 'text-indigo-400 animate-glow-indigo' : ''} />
       </button>
 
       {/* Browser Tab Button */}

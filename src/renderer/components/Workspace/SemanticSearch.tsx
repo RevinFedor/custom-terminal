@@ -183,12 +183,12 @@ export default memo(function SemanticSearchSection({ projectPath }: SemanticSear
             title={indexStats ? `${indexStats.fileCount} files, ${indexStats.chunkCount} chunks indexed` : 'Build search index'}
           >
             {indexing ? (
-              <Loader2 size={12} className="text-[#818cf8]" style={{ animation: 'spinner-rotate 1s linear infinite' }} />
+              <div className="w-2 h-2 rounded-full bg-[#818cf8] animate-glow-indigo shadow-[0_0_8px_rgba(129,140,248,0.5)]" />
             ) : (
               <Database size={12} />
             )}
             {indexing
-              ? (indexProgress ? `${indexProgress.current}/${indexProgress.total}` : 'Indexing...')
+              ? (indexProgress ? `${indexProgress.current}/${indexProgress.total}` : 'INDEXING...')
               : `Index (${sessionLimit || 'all'})`
             }
           </button>

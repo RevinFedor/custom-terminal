@@ -230,11 +230,10 @@ const ProjectTabItem = memo(({
           >
             {(isProjectBusy || isProjectLoading) && (
               <span
-                className="absolute inset-0 rounded-full"
+                className="absolute inset-0 rounded-full animate-glow-green"
                 style={{
-                  border: '1.5px solid rgba(74, 222, 128, 0.15)',
-                  borderTopColor: '#4ade80',
-                  animation: 'tab-dot-spin 0.8s linear infinite',
+                  border: '2px solid #22c55e',
+                  boxShadow: '0 0 6px #22c55e',
                 }}
               />
             )}
