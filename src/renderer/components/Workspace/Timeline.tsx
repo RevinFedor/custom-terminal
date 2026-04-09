@@ -14,6 +14,39 @@ const TooltipPortal: React.FC<{ children: React.ReactNode }> = ({ children }) =>
   return createPortal(children, document.body);
 };
 
+// Portal for status labels (Rewinding, Copying) to stay on top of all panels
+const StatusLabelPortal: React.FC<{
+  label: string;
+  top: number;
+  rightOffset: number;
+  color: string;
+  className?: string;
+}> = ({ label, top, rightOffset, color }) => {
+  return createPortal(
+    <div
+      className="fixed pointer-events-none transition-all duration-300"
+      style={{
+        top,
+        right: rightOffset,
+        zIndex: 9999,
+        backgroundColor: '#1a1a1a', // Dark theme background
+        padding: '3px 8px',
+        borderRadius: '4px',
+        border: '1px solid #444',
+        boxShadow: '0 2px 8px rgba(0,0,0,0.5)',
+        transform: 'translateY(-50%)',
+      }}
+    >
+      <span
+        className="text-[10px] font-bold tracking-widest uppercase text-white/90"
+      >
+        {label}
+      </span>
+    </div>,
+    document.body
+  );
+};
+
 interface TimelineEntry {
   uuid: string;
   type: 'user' | 'compact' | 'continued' | 'docs_edit';
@@ -2302,15 +2335,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                   {dotClickState === 'loading' && (
                     <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
                       <div
-                        className="animate-spin"
-                        style={{
-                          width: '14px',
-                          height: '14px',
-                          borderRadius: '50%',
-                          border: '1.5px solid transparent',
-                          borderTopColor: 'rgba(255, 255, 255, 0.6)',
-                          borderRightColor: 'rgba(255, 255, 255, 0.2)',
-                        }}
+                        className="w-2 h-2 rounded-full bg-blue-400 animate-glow-blue shadow-[0_0_8px_rgba(96,165,250,0.6)]"
                       />
                     </div>
                   )}
@@ -2471,36 +2496,63 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         {/* Loading Range Indicator (blinking blue while IPC runs) */}
         {isVisible && copyingRange && (() => {
           const rect = getOverlayRect(copyingRange.startIndex, copyingRange.endIndex);
-          return rect && (
-            <div
-              className="absolute left-0 right-0 pointer-events-none animate-pulse"
-              style={{
-                top: rect.top,
-                height: rect.height,
-                backgroundColor: 'rgba(59, 130, 246, 0.15)',
-                borderTop: '1px solid rgba(59, 130, 246, 0.5)',
-                borderBottom: '1px solid rgba(59, 130, 246, 0.5)',
-                boxShadow: '0 0 12px rgba(59, 130, 246, 0.3)',
-              }}
-            />
+          if (!rect || !innerWrapperRef.current) return null;
+          const wrapperRect = innerWrapperRef.current.getBoundingClientRect();
+          const fixedTop = wrapperRect.top + rect.top + 10;
+          const rightOffset = window.innerWidth - wrapperRect.right + 12;
+
+          return (
+            <>
+              <div
+                className="absolute left-0 right-0 pointer-events-none animate-glow-blue"
+                style={{
+                  top: rect.top,
+                  height: rect.height,
+                  borderTop: '1px solid rgba(59, 130, 246, 0.8)',
+                  borderBottom: '1px solid rgba(59, 130, 246, 0.8)',
+                  boxShadow: '0 0 20px rgba(59, 130, 246, 0.5)',
+                  zIndex: 50,
+                }}
+              />
+              <StatusLabelPortal
+                label="COPYING..."
+                top={fixedTop}
+                rightOffset={rightOffset}
+                color="#3b82f6"
+              />
+            </>
           );
         })()}
 
         {/* Copied Range Animation (green success flash) */}
         {isVisible && copiedRange && (() => {
           const rect = getOverlayRect(copiedRange.startIndex, copiedRange.endIndex);
-          return rect && (
-            <div
-              className="absolute left-0 right-0 pointer-events-none"
-              style={{
-                top: rect.top,
-                height: rect.height,
-                backgroundColor: 'rgba(34, 197, 94, 0.25)',
-                borderTop: '1px solid rgba(34, 197, 94, 0.6)',
-                borderBottom: '1px solid rgba(34, 197, 94, 0.6)',
-                boxShadow: '0 0 20px rgba(34, 197, 94, 0.4)',
-              }}
-            />
+          if (!rect || !innerWrapperRef.current) return null;
+          const wrapperRect = innerWrapperRef.current.getBoundingClientRect();
+          const fixedTop = wrapperRect.top + rect.top + 10;
+          const rightOffset = window.innerWidth - wrapperRect.right + 12;
+
+          return (
+            <>
+              <div
+                className="absolute left-0 right-0 pointer-events-none"
+                style={{
+                  top: rect.top,
+                  height: rect.height,
+                  backgroundColor: 'rgba(34, 197, 94, 0.6)',
+                  borderTop: '1px solid rgba(34, 197, 94, 1)',
+                  borderBottom: '1px solid rgba(34, 197, 94, 1)',
+                  boxShadow: '0 0 30px rgba(34, 197, 94, 0.6)',
+                  zIndex: 50,
+                }}
+              />
+              <StatusLabelPortal
+                label="DONE"
+                top={fixedTop}
+                rightOffset={rightOffset}
+                color="#22c55e"
+              />
+            </>
           );
         })()}
 
@@ -2508,22 +2560,38 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         {isVisible && rewindState && entries.length > 0 && (() => {
           const endIdx = rewindState.phase === 'compacting' ? entries.length - 1 : rewindState.index;
           const rect = getOverlayRect(rewindState.index, endIdx);
-          return rect && (
-            <div
-              className="absolute left-0 right-0 pointer-events-none animate-pulse"
-              style={{
-                top: rect.top,
-                height: rect.height,
-                backgroundColor: rewindState.phase === 'done'
-                  ? 'rgba(34, 197, 94, 0.25)'
-                  : rewindState.phase === 'compacting'
-                    ? 'rgba(245, 158, 11, 0.15)'
-                    : 'rgba(168, 85, 247, 0.15)',
-                borderTop: `1px solid ${rewindState.phase === 'done' ? 'rgba(34, 197, 94, 0.6)' : rewindState.phase === 'compacting' ? 'rgba(245, 158, 11, 0.5)' : 'rgba(168, 85, 247, 0.5)'}`,
-                borderBottom: `1px solid ${rewindState.phase === 'done' ? 'rgba(34, 197, 94, 0.6)' : rewindState.phase === 'compacting' ? 'rgba(245, 158, 11, 0.5)' : 'rgba(168, 85, 247, 0.5)'}`,
-                boxShadow: `0 0 12px ${rewindState.phase === 'done' ? 'rgba(34, 197, 94, 0.4)' : rewindState.phase === 'compacting' ? 'rgba(245, 158, 11, 0.3)' : 'rgba(168, 85, 247, 0.3)'}`,
-              }}
-            />
+          if (!rect || !innerWrapperRef.current) return null;
+          const phase = rewindState.phase;
+          const label = phase === 'done' ? 'DONE' : phase === 'compacting' ? 'COMPACTING...' : 'REWINDING...';
+          const blinkClass = phase === 'compacting' ? 'animate-glow-yellow' : phase === 'done' ? '' : 'animate-glow-purple';
+          const staticBg = phase === 'done' ? 'rgba(34, 197, 94, 0.4)' : '';
+          const color = phase === 'done' ? '#22c55e' : phase === 'compacting' ? '#f59e0b' : '#a855f7';
+          
+          const wrapperRect = innerWrapperRef.current.getBoundingClientRect();
+          const fixedTop = wrapperRect.top + rect.top + 10;
+          const rightOffset = window.innerWidth - wrapperRect.right + 12;
+
+          return (
+            <>
+              <div
+                className={`absolute left-0 right-0 pointer-events-none ${blinkClass}`}
+                style={{
+                  top: rect.top,
+                  height: rect.height,
+                  backgroundColor: staticBg,
+                  borderTop: `2px solid ${color}`,
+                  borderBottom: `2px solid ${color}`,
+                  boxShadow: `0 0 20px ${color}80`,
+                  zIndex: 50,
+                }}
+              />
+              <StatusLabelPortal
+                label={label}
+                top={fixedTop}
+                rightOffset={rightOffset}
+                color={color}
+              />
+            </>
           );
         })()}
 
@@ -2540,42 +2608,62 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
             rect = getOverlayRect(editRangeState.range.startIndex, editRangeState.range.endIndex);
           }
 
+          if (!rect || !innerWrapperRef.current) return null;
+
           const isLoading = editRangeState.phase === 'loading';
           const isApplying = editRangeState.phase === 'applying';
           const isDone = editRangeState.phase === 'done';
           const isReady = editRangeState.phase === 'ready';
 
-          const color = isDone ? 'rgba(34, 197, 94'
-            : isReady ? 'rgba(34, 197, 94'
-            : isApplying ? 'rgba(168, 85, 247'
-            : 'rgba(236, 72, 153';
+          const color = isDone ? '#22c55e'
+            : isReady ? '#22c55e'
+            : isApplying ? '#a855f7'
+            : '#ec4899';
 
-          return rect && (
-            <div
-              className={`absolute left-0 right-0 ${isLoading || isDone ? 'cursor-pointer' : 'pointer-events-none'} ${isLoading || isApplying ? 'animate-pulse' : ''}`}
-              style={{
-                top: rect.top,
-                height: rect.height,
-                backgroundColor: `${color}, ${isDone ? 0.25 : 0.15})`,
-                borderTop: `1px solid ${color}, 0.5)`,
-                borderBottom: `1px solid ${color}, 0.5)`,
-                boxShadow: `0 0 12px ${color}, 0.3)`,
-              }}
-              onMouseEnter={isDone ? () => {
-                editRangeDoneHovered.current = true;
-                if (editRangeDoneTimer.current) { clearTimeout(editRangeDoneTimer.current); editRangeDoneTimer.current = null; }
-              } : undefined}
-              onMouseLeave={isDone ? () => {
-                editRangeDoneHovered.current = false;
-                setEditRangeState(null); // instant close on leave
-              } : undefined}
-              onClick={isDone ? () => setEditRangeState(null) : undefined}
-              onContextMenu={isLoading ? (e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                setEditRangeLoadingMenu({ x: e.clientX, y: e.clientY });
-              } : undefined}
-            />
+          const blinkClass = isLoading ? 'animate-glow-yellow' : isApplying ? 'animate-glow-purple' : '';
+          const label = isApplying ? 'APPLYING...' : isLoading ? 'LOADING...' : isDone ? 'READY' : '';
+
+          const wrapperRect = innerWrapperRef.current.getBoundingClientRect();
+          const fixedTop = wrapperRect.top + rect.top + 10;
+          const rightOffset = window.innerWidth - wrapperRect.right + 12;
+
+          return (
+            <>
+              <div
+                className={`absolute left-0 right-0 ${isLoading || isDone ? 'cursor-pointer' : 'pointer-events-none'} ${blinkClass}`}
+                style={{
+                  top: rect.top,
+                  height: rect.height,
+                  backgroundColor: isDone || isReady ? 'rgba(34, 197, 94, 0.15)' : '',
+                  borderTop: `2px solid ${color}`,
+                  borderBottom: `2px solid ${color}`,
+                  boxShadow: `0 0 15px ${color}80`,
+                  zIndex: 50,
+                }}
+                onMouseEnter={isDone ? () => {
+                  editRangeDoneHovered.current = true;
+                  if (editRangeDoneTimer.current) { clearTimeout(editRangeDoneTimer.current); editRangeDoneTimer.current = null; }
+                } : undefined}
+                onMouseLeave={isDone ? () => {
+                  editRangeDoneHovered.current = false;
+                  setEditRangeState(null); // instant close on leave
+                } : undefined}
+                onClick={isDone ? () => setEditRangeState(null) : undefined}
+                onContextMenu={isLoading ? (e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  setEditRangeLoadingMenu({ x: e.clientX, y: e.clientY });
+                } : undefined}
+              />
+              {label && (
+                <StatusLabelPortal
+                  label={label}
+                  top={fixedTop}
+                  rightOffset={rightOffset}
+                  color={color}
+                />
+              )}
+            </>
           );
         })()}
 

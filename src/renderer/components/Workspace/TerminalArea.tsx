@@ -21,45 +21,38 @@ function InterceptorBadge({ claudeTabId, interceptorState, busy }: {
   if (!busy || !interceptorState) return null;
 
   const isArmed = interceptorState === 'armed';
-  const bgColor = isArmed ? 'rgba(180, 160, 255, 0.15)' : 'rgba(243, 139, 168, 0.15)';
-  const borderColor = isArmed ? 'rgba(180, 160, 255, 0.4)' : 'rgba(243, 139, 168, 0.4)';
-  const textColor = isArmed ? '#b4a0ff' : '#f38ba8';
-  const label = isArmed ? 'Interceptor ON' : 'Interceptor OFF';
   const actionHint = isArmed ? 'Click to disarm' : 'Click to arm';
-
-  const handleClick = (e: React.MouseEvent) => {
-    e.stopPropagation();
-    ipcRenderer.invoke('mcp:toggle-interceptor', claudeTabId);
-  };
+  const label = isArmed ? 'INTERCEPTOR: ON' : 'INTERCEPTOR: OFF';
+  const blinkClass = isArmed ? 'animate-glow-purple' : 'animate-glow-red';
 
   return (
     <button
       onClick={handleClick}
-      className="flex items-center gap-1.5 rounded transition-all"
+      className="flex items-center gap-1.5 rounded transition-all shadow-[0_0_15px_rgba(0,0,0,0.4)]"
       style={{
         position: 'absolute',
         top: '8px',
         right: '12px',
         zIndex: 100,
-        backgroundColor: bgColor,
-        border: `1px solid ${borderColor}`,
-        color: textColor,
-        padding: '4px 10px',
+        backgroundColor: isArmed ? 'rgba(180, 160, 255, 0.25)' : 'rgba(243, 139, 168, 0.25)',
+        border: `2px solid ${isArmed ? '#a855f7' : '#ef4444'}`,
+        color: '#ffffff',
+        padding: '6px 12px',
         fontSize: '11px',
+        fontWeight: 'bold',
         cursor: 'pointer',
-        backdropFilter: 'blur(8px)',
+        backdropFilter: 'blur(12px)',
+        letterSpacing: '0.05em',
       }}
       title={`${label}\n${actionHint}`}
     >
       <span
+        className={`w-2 h-2 rounded-full ${blinkClass}`}
         style={{
-          fontSize: '8px',
-          lineHeight: 1,
-          animation: 'tab-dot-pulse 1.5s ease-in-out infinite',
+          display: 'inline-block',
+          boxShadow: `0 0 8px ${isArmed ? '#a855f7' : '#ef4444'}`,
         }}
-      >
-        {'\u25CF'}
-      </span>
+      />
       <span>{label}</span>
     </button>
   );
@@ -158,11 +151,16 @@ const InterruptedSessionOverlay = memo(({ tabId, sessionId, onContinue, onDismis
 
         {/* Continue button */}
         <button
-          className="w-full bg-accent hover:bg-accent/80 disabled:bg-accent/50 disabled:cursor-not-allowed text-white py-2.5 px-4 rounded-lg font-medium text-sm transition-colors"
+          className="w-full bg-accent hover:bg-accent/80 disabled:bg-accent/50 disabled:cursor-not-allowed text-white py-2.5 px-4 rounded-lg font-bold text-sm transition-colors flex items-center justify-center gap-2"
           onClick={handleContinueClick}
           disabled={isLoading}
         >
-          {isLoading ? '⏳ Загрузка...' : '⏵ Продолжить сессию'}
+          {isLoading ? (
+            <>
+              <div className="w-2.5 h-2.5 rounded-full bg-white animate-glow-blue" />
+              <span className="tracking-widest">LOADING...</span>
+            </>
+          ) : '⏵ ПРОДОЛЖИТЬ СЕССИЮ'}
         </button>
 
         {/* Hint */}
