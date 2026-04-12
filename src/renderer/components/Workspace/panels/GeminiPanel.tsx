@@ -126,6 +126,18 @@ export default function GeminiPanel({ projectPath, geminiPrompt }: GeminiPanelPr
     console.log('[Research] Type:', chatType, 'Model:', selectedModel, 'Thinking:', thinkingLevel);
     console.log('[Research] Prompt:', `"${prompt.slice(0, 50)}..."`);
 
+    // Load attached file contents
+    let fileContentsBlock = '';
+    const filePaths = promptConfig?.filePaths || [];
+    if (filePaths.length > 0) {
+      const filesResult = await ipcRenderer.invoke('ai-prompts:read-files', filePaths);
+      if (filesResult.success && filesResult.data.length > 0) {
+        fileContentsBlock = '\n\n' + filesResult.data.map((f: { path: string; content: string }) =>
+          `--- File: ${f.path} ---\n${f.content}`
+        ).join('\n\n');
+      }
+    }
+
     // Wrap in pasted block (same as handleClipboardResearch)
     const displayText = `:::pasted\n${selectedText}\n:::`;
 
@@ -144,7 +156,7 @@ export default function GeminiPanel({ projectPath, geminiPrompt }: GeminiPanelPr
     const apiKey = process.env.GEMINI_API_KEY;
     console.log('[Research] API Key:', apiKey ? `${apiKey.slice(0, 10)}...` : 'MISSING');
 
-    const fullPrompt = prompt + selectedText;
+    const fullPrompt = prompt + fileContentsBlock + selectedText;
     console.log('[Research] Full prompt length:', fullPrompt.length);
     console.log('[Research] Sending request to Gemini API...');
 
@@ -257,6 +269,18 @@ export default function GeminiPanel({ projectPath, geminiPrompt }: GeminiPanelPr
       // Use project prompt for research if available
       const prompt = (chatType === 'research' && geminiPrompt) ? geminiPrompt : systemPrompt;
 
+      // Load attached file contents
+      let fileContentsBlock = '';
+      const filePaths = promptConfig?.filePaths || [];
+      if (filePaths.length > 0) {
+        const filesResult = await ipcRenderer.invoke('ai-prompts:read-files', filePaths);
+        if (filesResult.success && filesResult.data.length > 0) {
+          fileContentsBlock = '\n\n' + filesResult.data.map((f: { path: string; content: string }) =>
+            `--- File: ${f.path} ---\n${f.content}`
+          ).join('\n\n');
+        }
+      }
+
       // Wrap clipboard content in special pasted block (using ::: syntax to avoid markdown conflicts)
       const wrappedContent = `:::pasted\n${clipboardText}\n:::`;
 
@@ -271,7 +295,7 @@ export default function GeminiPanel({ projectPath, geminiPrompt }: GeminiPanelPr
       setLoading(true);
 
       const apiKey = process.env.GEMINI_API_KEY;
-      const fullPrompt = prompt + clipboardText;
+      const fullPrompt = prompt + fileContentsBlock + clipboardText;
 
       const controller = new AbortController();
       setAbortController(controller);

@@ -13,6 +13,7 @@ export interface AIPrompt {
   isBuiltIn: boolean;      // true для Research/Compact/Description — нельзя удалить
   showInContextMenu: boolean;
   position: number;        // Порядок сортировки
+  filePaths: string[];     // Абсолютные пути к прикреплённым файлам
 }
 
 const { ipcRenderer } = window.require('electron');
@@ -39,7 +40,8 @@ const FALLBACK_PROMPTS: AIPrompt[] = [
     color: '#0ea5e9',
     isBuiltIn: true,
     showInContextMenu: true,
-    position: 0
+    position: 0,
+    filePaths: []
   },
   {
     id: 'compact',
@@ -50,7 +52,8 @@ const FALLBACK_PROMPTS: AIPrompt[] = [
     color: '#a855f7',
     isBuiltIn: true,
     showInContextMenu: true,
-    position: 1
+    position: 1,
+    filePaths: []
   },
   {
     id: 'rewind',
@@ -61,7 +64,8 @@ const FALLBACK_PROMPTS: AIPrompt[] = [
     color: '#ec4899',
     isBuiltIn: true,
     showInContextMenu: false,
-    position: 3
+    position: 3,
+    filePaths: []
   },
   {
     id: 'description',
@@ -72,7 +76,8 @@ const FALLBACK_PROMPTS: AIPrompt[] = [
     color: '#f59e0b',
     isBuiltIn: true,
     showInContextMenu: false,
-    position: 2
+    position: 2,
+    filePaths: []
   },
   {
     id: 'adopt',
@@ -83,7 +88,8 @@ const FALLBACK_PROMPTS: AIPrompt[] = [
     color: '#6366f1',
     isBuiltIn: true,
     showInContextMenu: false,
-    position: 4
+    position: 4,
+    filePaths: []
   }
 ];
 

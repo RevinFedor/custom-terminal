@@ -1375,13 +1375,24 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       return;
     }
     console.warn('[EditRange:Fetch] Prompt found: model=' + promptConfig.model + ' contentLen=' + promptConfig.content?.length);
+    // Load attached file contents
+    let fileContentsBlock = '';
+    const filePaths = promptConfig.filePaths || [];
+    if (filePaths.length > 0) {
+      const filesResult = await ipcRenderer.invoke('ai-prompts:read-files', filePaths);
+      if (filesResult.success && filesResult.data.length > 0) {
+        fileContentsBlock = '\n\n' + filesResult.data.map((f: { path: string; content: string }) =>
+          `--- File: ${f.path} ---\n${f.content}`
+        ).join('\n\n');
+      }
+    }
     const apiKey = process.env.GEMINI_API_KEY;
     const model = promptConfig.model;
     // If additionalPrompt provided, prepend it as higher-priority instruction
     const promptPrefix = additionalPrompt
       ? `ПРИОРИТЕТНАЯ ИНСТРУКЦИЯ (выполнить в первую очередь):\n${additionalPrompt}\n\n---\nОСНОВНОЙ ПРОМПТ:\n`
       : '';
-    const fullPrompt = promptPrefix + promptConfig.content + sourceContent;
+    const fullPrompt = promptPrefix + promptConfig.content + fileContentsBlock + sourceContent;
     const requestBody: any = { contents: [{ parts: [{ text: fullPrompt }] }] };
     if (model.includes('gemini-3') && promptConfig.thinkingLevel !== 'NONE') {
       requestBody.generationConfig = { thinkingConfig: { thinkingLevel: promptConfig.thinkingLevel } };
@@ -1648,12 +1659,23 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         const promptConfig = getPromptById(rewindPromptId);
 
         if (promptConfig) {
+          // Load attached file contents
+          let fileContentsBlock = '';
+          const fpaths = promptConfig.filePaths || [];
+          if (fpaths.length > 0) {
+            const filesResult = await ipcRenderer.invoke('ai-prompts:read-files', fpaths);
+            if (filesResult.success && filesResult.data.length > 0) {
+              fileContentsBlock = '\n\n' + filesResult.data.map((f: { path: string; content: string }) =>
+                `--- File: ${f.path} ---\n${f.content}`
+              ).join('\n\n');
+            }
+          }
           const apiKey = process.env.GEMINI_API_KEY;
           const model = promptConfig.model;
           const promptPrefix = additionalPrompt
             ? `ПРИОРИТЕТНАЯ ИНСТРУКЦИЯ (выполнить в первую очередь):\n${additionalPrompt}\n\n---\nОСНОВНОЙ ПРОМПТ:\n`
             : '';
-          const fullPrompt = promptPrefix + promptConfig.content + rangeResult.content;
+          const fullPrompt = promptPrefix + promptConfig.content + fileContentsBlock + rangeResult.content;
 
           const requestBody: any = {
             contents: [{ parts: [{ text: fullPrompt }] }],

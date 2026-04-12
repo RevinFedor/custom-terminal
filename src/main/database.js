@@ -72,6 +72,9 @@ class DatabaseManager {
     // Migration: add group_id to prompts
     try { this.db.exec(`ALTER TABLE prompts ADD COLUMN group_id INTEGER DEFAULT NULL`); } catch (e) {}
 
+    // Migration: add file_paths to prompts (JSON array of absolute file paths)
+    try { this.db.exec(`ALTER TABLE prompts ADD COLUMN file_paths TEXT DEFAULT NULL`); } catch (e) {}
+
     // Quick actions table
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS quick_actions (
@@ -313,6 +316,9 @@ class DatabaseManager {
 
     // Migration: add position to timeline_notes
     try { this.db.exec(`ALTER TABLE timeline_notes ADD COLUMN position TEXT DEFAULT 'before'`); } catch (e) {}
+
+    // Migration: add file_paths to ai_prompts (JSON array of absolute file paths)
+    try { this.db.exec(`ALTER TABLE ai_prompts ADD COLUMN file_paths TEXT DEFAULT NULL`); } catch (e) {}
 
     // AI Prompts table (dynamic AI prompts for Research/Compact/Description/Custom)
     this.db.exec(`
@@ -723,7 +729,12 @@ class DatabaseManager {
     transaction(commands);
   }
 
-  getPrompts() { return this.db.prepare('SELECT * FROM prompts ORDER BY group_id NULLS LAST, position').all(); }
+  getPrompts() {
+    return this.db.prepare('SELECT * FROM prompts ORDER BY group_id NULLS LAST, position').all().map(row => ({
+      ...row,
+      file_paths: row.file_paths ? JSON.parse(row.file_paths) : []
+    }));
+  }
   savePrompts(prompts) {
     if (!Array.isArray(prompts)) return;
     const existingCount = this.db.prepare('SELECT COUNT(*) as cnt FROM prompts').get()?.cnt || 0;
@@ -733,8 +744,8 @@ class DatabaseManager {
     }
     const transaction = this.db.transaction((list) => {
       this.db.prepare('DELETE FROM prompts').run();
-      const insert = this.db.prepare('INSERT INTO prompts (title, content, position, group_id) VALUES (?, ?, ?, ?)');
-      list.forEach((p, index) => insert.run(p.title, p.content, p.position != null ? p.position : index, p.group_id ?? null));
+      const insert = this.db.prepare('INSERT INTO prompts (title, content, position, group_id, file_paths) VALUES (?, ?, ?, ?, ?)');
+      list.forEach((p, index) => insert.run(p.title, p.content, p.position != null ? p.position : index, p.group_id ?? null, p.file_paths && p.file_paths.length > 0 ? JSON.stringify(p.file_paths) : null));
     });
     transaction(prompts);
   }
@@ -775,14 +786,15 @@ class DatabaseManager {
       color: row.color,
       isBuiltIn: row.is_built_in === 1,
       showInContextMenu: row.show_in_context_menu === 1,
-      position: row.position
+      position: row.position,
+      filePaths: row.file_paths ? JSON.parse(row.file_paths) : []
     }));
   }
 
   saveAIPrompt(prompt) {
     this.db.prepare(`
-      INSERT INTO ai_prompts (id, name, content, model, thinking_level, color, is_built_in, show_in_context_menu, position)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO ai_prompts (id, name, content, model, thinking_level, color, is_built_in, show_in_context_menu, position, file_paths)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         name = excluded.name,
         content = excluded.content,
@@ -790,7 +802,8 @@ class DatabaseManager {
         thinking_level = excluded.thinking_level,
         color = excluded.color,
         show_in_context_menu = excluded.show_in_context_menu,
-        position = excluded.position
+        position = excluded.position,
+        file_paths = excluded.file_paths
     `).run(
       prompt.id,
       prompt.name,
@@ -800,7 +813,8 @@ class DatabaseManager {
       prompt.color || '#0ea5e9',
       prompt.isBuiltIn ? 1 : 0,
       prompt.showInContextMenu !== false ? 1 : 0,
-      prompt.position ?? 0
+      prompt.position ?? 0,
+      prompt.filePaths && prompt.filePaths.length > 0 ? JSON.stringify(prompt.filePaths) : null
     );
   }
 
