@@ -859,6 +859,21 @@ ipcMain.on('show-terminal-context-menu', async (event, { hasSelection, prompts, 
     prompts.filter(p => !p.group_id).forEach(p => flatItems.push({ type: 'prompt', prompt: p, pos: p.position }));
     flatItems.sort((a, b) => a.pos - b.pos);
 
+    const buildInsertContent = (p) => {
+      let text = p.content;
+      if (p.file_paths && p.file_paths.length > 0) {
+        const fs = require('fs');
+        for (const fp of p.file_paths) {
+          try {
+            let fc = fs.readFileSync(fp, 'utf-8');
+            fc = fc.replace(/<!--\s*@ai:[\s\S]*?-->/g, '');
+            text += '\n\n--- File: ' + fp + ' ---\n' + fc;
+          } catch (e) { console.error('[InsertPrompt] Failed to read:', fp); }
+        }
+      }
+      return text;
+    };
+
     flatItems.forEach(item => {
       if (item.type === 'group') {
         const groupPrompts = prompts.filter(p => p.group_id === item.group.id);
@@ -867,14 +882,14 @@ ipcMain.on('show-terminal-context-menu', async (event, { hasSelection, prompts, 
           submenu: groupPrompts.length > 0
             ? groupPrompts.map(p => ({
                 label: p.title,
-                click: () => { event.sender.send('context-menu-command', 'insert-prompt', p.content); }
+                click: () => { event.sender.send('context-menu-command', 'insert-prompt', buildInsertContent(p)); }
               }))
             : [{ label: '(empty)', enabled: false }]
         });
       } else {
         promptsSubmenu.push({
           label: item.prompt.title,
-          click: () => { event.sender.send('context-menu-command', 'insert-prompt', item.prompt.content); }
+          click: () => { event.sender.send('context-menu-command', 'insert-prompt', buildInsertContent(item.prompt)); }
         });
       }
     });

@@ -1,4 +1,5 @@
-const { ipcMain } = require('electron');
+const { ipcMain, dialog, BrowserWindow } = require('electron');
+const fs = require('fs');
 
 function register({ projectManager }) {
   // ── Research Conversations ──
@@ -128,6 +129,50 @@ function register({ projectManager }) {
       return { success: true };
     } catch (error) {
       console.error('[main] Error deleting AI prompt:', error);
+      return { success: false, error: error.message };
+    }
+  });
+
+  // ── AI Prompt File Attachments ──
+
+  ipcMain.handle('ai-prompts:select-file', async () => {
+    try {
+      const win = BrowserWindow.getFocusedWindow();
+      const result = await dialog.showOpenDialog(win, {
+        properties: ['openFile']
+      });
+      if (result.canceled || result.filePaths.length === 0) return { success: true, data: null };
+      return { success: true, data: result.filePaths[0] };
+    } catch (error) {
+      console.error('[AIPrompts] Error selecting file:', error);
+      return { success: false, error: error.message };
+    }
+  });
+
+  ipcMain.handle('ai-prompts:check-file', async (event, filePath) => {
+    try {
+      const exists = fs.existsSync(filePath);
+      return { success: true, exists };
+    } catch (error) {
+      return { success: true, exists: false };
+    }
+  });
+
+  ipcMain.handle('ai-prompts:read-files', async (event, filePaths) => {
+    try {
+      const results = [];
+      for (const fp of filePaths) {
+        try {
+          let content = fs.readFileSync(fp, 'utf-8');
+          // Strip <!-- @ai: ... --> blocks (AI-only instructions, not for prompt content)
+          content = content.replace(/<!--\s*@ai:[\s\S]*?-->/g, '');
+          results.push({ path: fp, content });
+        } catch (e) {
+          console.error('[AIPrompts] Failed to read file:', fp, e.message);
+        }
+      }
+      return { success: true, data: results };
+    } catch (error) {
       return { success: false, error: error.message };
     }
   });

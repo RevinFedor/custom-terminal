@@ -22,6 +22,7 @@ interface Prompt {
   content: string;
   group_id?: number | null;
   position?: number;
+  file_paths?: string[];
 }
 
 type SettingsTab = 'shortcuts' | 'fonts' | 'colors' | 'ai';
@@ -194,6 +195,8 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
   const [editingInsertionIndex, setEditingInsertionIndex] = useState<number | null>(null);
   const [localInsertionTitle, setLocalInsertionTitle] = useState('');
   const [localInsertionContent, setLocalInsertionContent] = useState('');
+  const [localInsertionFilePaths, setLocalInsertionFilePaths] = useState<string[]>([]);
+  const [insertionFileInputs, setInsertionFileInputs] = useState<{ value: string; valid: boolean | null }[]>([]);
   const [savedInsertionFlash, setSavedInsertionFlash] = useState<'title' | 'content' | null>(null);
   const savedInsertionTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [draggingTextIndex, setDraggingTextIndex] = useState<number | null>(null);
@@ -210,6 +213,8 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
   const [localPromptShowInMenu, setLocalPromptShowInMenu] = useState(true);
   const [localPromptModel, setLocalPromptModel] = useState<AIModel>('gemini-3-flash-preview');
   const [localPromptThinkingLevel, setLocalPromptThinkingLevel] = useState<ThinkingLevel>('HIGH');
+  const [localPromptFilePaths, setLocalPromptFilePaths] = useState<string[]>([]);
+  const [filePathInputs, setFilePathInputs] = useState<{ value: string; valid: boolean | null }[]>([]);
   const [savedFlashField, setSavedFlashField] = useState<'name' | 'content' | null>(null);
   const savedFlashTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -321,7 +326,8 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
           color: localPromptColor,
           showInContextMenu: localPromptShowInMenu,
           model: localPromptModel,
-          thinkingLevel: localPromptThinkingLevel
+          thinkingLevel: localPromptThinkingLevel,
+          filePaths: localPromptFilePaths
         });
         if (flashField) {
           if (savedFlashTimer.current) clearTimeout(savedFlashTimer.current);
@@ -338,10 +344,10 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
   };
 
   // Save current text insertion from local state
-  const saveCurrentInsertion = () => {
+  const saveCurrentInsertion = (overrideFilePaths?: string[]) => {
     if (editingInsertionIndex !== null && prompts[editingInsertionIndex]) {
       const newPrompts = [...prompts];
-      newPrompts[editingInsertionIndex] = { ...newPrompts[editingInsertionIndex], title: localInsertionTitle, content: localInsertionContent };
+      newPrompts[editingInsertionIndex] = { ...newPrompts[editingInsertionIndex], title: localInsertionTitle, content: localInsertionContent, file_paths: overrideFilePaths ?? localInsertionFilePaths };
       setPrompts(newPrompts);
       savePromptsImmediate(newPrompts);
     }
@@ -357,6 +363,8 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
     setEditingInsertionIndex(index);
     setLocalInsertionTitle(prompts[index].title);
     setLocalInsertionContent(prompts[index].content);
+    setLocalInsertionFilePaths(prompts[index].file_paths || []);
+    setInsertionFileInputs([]);
   };
 
   // Group editing in left panel
@@ -804,6 +812,8 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
     setLocalPromptShowInMenu(prompt.showInContextMenu);
     setLocalPromptModel(prompt.model);
     setLocalPromptThinkingLevel(prompt.thinkingLevel);
+    setLocalPromptFilePaths(prompt.filePaths || []);
+    setFilePathInputs([]);
   };
 
   // Add new custom AI prompt
@@ -819,7 +829,8 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
       color: '#6366f1',
       isBuiltIn: false,
       showInContextMenu: true,
-      position: maxPos + 1
+      position: maxPos + 1,
+      filePaths: []
     };
     saveAIPrompt(newPrompt);
     startEditingAIPrompt(newPrompt);
@@ -1185,6 +1196,56 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                         <button onClick={(e) => { e.stopPropagation(); closeInsertionEditor(); }} style={{ background: '#2a2a2a', border: '1px solid #393939', borderRadius: '4px', color: '#888', fontSize: '14px', cursor: 'pointer', padding: '1px 7px', lineHeight: 1 }}>✕</button>
                       </div>
                       <textarea value={localInsertionContent} onChange={(e) => setLocalInsertionContent(e.target.value)} onBlur={() => { saveCurrentInsertion(); setSavedInsertionFlash('content'); if (savedInsertionTimer.current) clearTimeout(savedInsertionTimer.current); savedInsertionTimer.current = setTimeout(() => setSavedInsertionFlash(null), 400); }} placeholder="Содержимое..." style={{ flex: 1, padding: '10px', backgroundColor: '#1a1a1a', border: savedInsertionFlash === 'content' ? '1px solid #22c55e' : '1px solid #444', borderRadius: '6px', color: '#aaa', fontSize: '11px', fontFamily: 'monospace', outline: 'none', resize: 'none', boxSizing: 'border-box' as const, minHeight: 0, transition: 'border-color 0.15s ease' }} />
+                      {/* File attachments */}
+                      <div style={{ marginTop: '8px', flexShrink: 0, display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                        {localInsertionFilePaths.map((fp, idx) => (
+                          <div key={idx} style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                            <span style={{ fontSize: '10px', color: '#666', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, direction: 'rtl', textAlign: 'left' }}>{fp}</span>
+                            <button onClick={(e) => {
+                              e.stopPropagation();
+                              const updated = localInsertionFilePaths.filter((_, i) => i !== idx);
+                              setLocalInsertionFilePaths(updated);
+                              saveCurrentInsertion(updated);
+                            }} style={{ background: 'none', border: 'none', color: '#666', fontSize: '12px', cursor: 'pointer', padding: '0 2px', flexShrink: 0 }}>✕</button>
+                          </div>
+                        ))}
+                        {insertionFileInputs.map((input, idx) => (
+                          <div key={`input-${idx}`} style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                            <input type="text" autoFocus value={input.value}
+                              onChange={(e) => { const u = [...insertionFileInputs]; u[idx] = { value: e.target.value, valid: null }; setInsertionFileInputs(u); }}
+                              onBlur={async () => {
+                                const val = insertionFileInputs[idx]?.value?.trim();
+                                if (!val) { setInsertionFileInputs(prev => prev.filter((_, i) => i !== idx)); return; }
+                                const result = await ipcRenderer.invoke('ai-prompts:check-file', val);
+                                if (result.exists) {
+                                  const updated = [...localInsertionFilePaths, val];
+                                  setLocalInsertionFilePaths(updated);
+                                  setInsertionFileInputs(prev => prev.filter((_, i) => i !== idx));
+                                  saveCurrentInsertion(updated);
+                                } else {
+                                  const u = [...insertionFileInputs]; u[idx] = { ...u[idx], valid: false }; setInsertionFileInputs(u);
+                                }
+                              }}
+                              onKeyDown={(e) => { if (e.key === 'Escape') setInsertionFileInputs(prev => prev.filter((_, i) => i !== idx)); }}
+                              placeholder="/Users/..."
+                              style={{ flex: 1, padding: '3px 6px', backgroundColor: '#1a1a1a', border: `1px solid ${input.valid === false ? '#ef4444' : '#444'}`, borderRadius: '4px', color: '#aaa', fontSize: '10px', fontFamily: 'monospace', outline: 'none' }}
+                            />
+                            <button onClick={(e) => { e.stopPropagation(); setInsertionFileInputs(prev => prev.filter((_, i) => i !== idx)); }} style={{ background: 'none', border: 'none', color: '#666', fontSize: '12px', cursor: 'pointer', padding: '0 2px', flexShrink: 0 }}>✕</button>
+                          </div>
+                        ))}
+                        <div style={{ display: 'flex', gap: '4px' }}>
+                          <button onClick={(e) => { e.stopPropagation(); setInsertionFileInputs(prev => [...prev, { value: '', valid: null }]); }} style={{ padding: '2px 6px', backgroundColor: 'transparent', color: '#666', border: '1px solid #333', borderRadius: '4px', fontSize: '10px', cursor: 'pointer' }}>+ путь</button>
+                          <button onClick={async (e) => {
+                            e.stopPropagation();
+                            const result = await ipcRenderer.invoke('ai-prompts:select-file');
+                            if (result.success && result.data) {
+                              const updated = [...localInsertionFilePaths, result.data];
+                              setLocalInsertionFilePaths(updated);
+                              saveCurrentInsertion(updated);
+                            }
+                          }} style={{ padding: '2px 6px', backgroundColor: 'transparent', color: '#666', border: '1px solid #333', borderRadius: '4px', fontSize: '10px', cursor: 'pointer' }}>+ файл</button>
+                        </div>
+                      </div>
                       <div style={{ marginTop: '8px', flexShrink: 0 }}>
                         <button onClick={(e) => { e.stopPropagation(); deletePrompt(editingInsertionIndex); }} style={{ padding: '4px 8px', backgroundColor: 'transparent', color: '#ef4444', border: 'none', fontSize: '10px', cursor: 'pointer' }}>Удалить</button>
                       </div>
@@ -1403,6 +1464,7 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                         showInContextMenu: localPromptShowInMenu,
                         model: localPromptModel,
                         thinkingLevel: localPromptThinkingLevel,
+                        filePaths: localPromptFilePaths,
                         ...overrides
                       });
                     };
@@ -1529,6 +1591,105 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                             minHeight: 0
                           }}
                         />
+
+                        {/* File attachments */}
+                        <div style={{ marginTop: '8px', flexShrink: 0, display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                          {/* Existing file paths */}
+                          {localPromptFilePaths.map((fp, idx) => (
+                            <div key={idx} style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                              <span style={{ fontSize: '10px', color: '#666', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, direction: 'rtl', textAlign: 'left' }}>
+                                {fp}
+                              </span>
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  const updated = localPromptFilePaths.filter((_, i) => i !== idx);
+                                  setLocalPromptFilePaths(updated);
+                                  saveField({ filePaths: updated });
+                                }}
+                                style={{ background: 'none', border: 'none', color: '#666', fontSize: '12px', cursor: 'pointer', padding: '0 2px', flexShrink: 0 }}
+                              >
+                                ✕
+                              </button>
+                            </div>
+                          ))}
+                          {/* Pending file path inputs */}
+                          {filePathInputs.map((input, idx) => (
+                            <div key={`input-${idx}`} style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                              <input
+                                type="text"
+                                autoFocus
+                                value={input.value}
+                                onChange={(e) => {
+                                  const updated = [...filePathInputs];
+                                  updated[idx] = { value: e.target.value, valid: null };
+                                  setFilePathInputs(updated);
+                                }}
+                                onBlur={async () => {
+                                  const val = filePathInputs[idx]?.value?.trim();
+                                  if (!val) {
+                                    setFilePathInputs(prev => prev.filter((_, i) => i !== idx));
+                                    return;
+                                  }
+                                  const result = await ipcRenderer.invoke('ai-prompts:check-file', val);
+                                  if (result.exists) {
+                                    const updated = [...localPromptFilePaths, val];
+                                    setLocalPromptFilePaths(updated);
+                                    setFilePathInputs(prev => prev.filter((_, i) => i !== idx));
+                                    saveField({ filePaths: updated });
+                                  } else {
+                                    const upd = [...filePathInputs];
+                                    upd[idx] = { ...upd[idx], valid: false };
+                                    setFilePathInputs(upd);
+                                  }
+                                }}
+                                onKeyDown={(e) => {
+                                  if (e.key === 'Escape') {
+                                    setFilePathInputs(prev => prev.filter((_, i) => i !== idx));
+                                  }
+                                }}
+                                placeholder="/Users/..."
+                                style={{
+                                  flex: 1, padding: '3px 6px', backgroundColor: '#1a1a1a',
+                                  border: `1px solid ${input.valid === false ? '#ef4444' : '#444'}`,
+                                  borderRadius: '4px', color: '#aaa', fontSize: '10px', fontFamily: 'monospace', outline: 'none'
+                                }}
+                              />
+                              <button
+                                onClick={(e) => { e.stopPropagation(); setFilePathInputs(prev => prev.filter((_, i) => i !== idx)); }}
+                                style={{ background: 'none', border: 'none', color: '#666', fontSize: '12px', cursor: 'pointer', padding: '0 2px', flexShrink: 0 }}
+                              >
+                                ✕
+                              </button>
+                            </div>
+                          ))}
+                          {/* Add file buttons */}
+                          <div style={{ display: 'flex', gap: '4px' }}>
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setFilePathInputs(prev => [...prev, { value: '', valid: null }]);
+                              }}
+                              style={{ padding: '2px 6px', backgroundColor: 'transparent', color: '#666', border: '1px solid #333', borderRadius: '4px', fontSize: '10px', cursor: 'pointer' }}
+                            >
+                              + путь
+                            </button>
+                            <button
+                              onClick={async (e) => {
+                                e.stopPropagation();
+                                const result = await ipcRenderer.invoke('ai-prompts:select-file');
+                                if (result.success && result.data) {
+                                  const updated = [...localPromptFilePaths, result.data];
+                                  setLocalPromptFilePaths(updated);
+                                  saveField({ filePaths: updated });
+                                }
+                              }}
+                              style={{ padding: '2px 6px', backgroundColor: 'transparent', color: '#666', border: '1px solid #333', borderRadius: '4px', fontSize: '10px', cursor: 'pointer' }}
+                            >
+                              + файл
+                            </button>
+                          </div>
+                        </div>
 
                         {/* Footer: Delete button (non-builtIn only) */}
                         {!editingAIPrompt.isBuiltIn && (
