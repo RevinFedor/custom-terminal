@@ -341,10 +341,15 @@ function parseTimelineUuids(sourcePath) {
       seen.add(currentUuid);
       const record = recordMap.get(currentUuid);
       if (!record) {
-        // Recovery: dangling logicalParentUuid from compact_boundary
+        // Recovery: parentUuid points to a record not in this file.
+        // Causes: (1) compact_boundary with dangling logicalParentUuid,
+        //         (2) proxy crash mid-stream — assistant response never written to JSONL,
+        //             api_error/next entries reference the lost in-flight record.
         let recovered = false;
         if (activeBranch.length > 0) {
           const lastAdded = activeBranch[0];
+
+          // Case 1: compact_boundary recovery (existing)
           if (lastAdded.type === 'system' && lastAdded.subtype === 'compact_boundary' &&
               lastAdded.logicalParentUuid === currentUuid) {
             if (lastAdded.parentUuid && recordMap.has(lastAdded.parentUuid) && !seen.has(lastAdded.parentUuid)) {
@@ -364,6 +369,25 @@ function parseTimelineUuids(sourcePath) {
                 currentUuid = bestPred.uuid;
                 recovered = true;
               }
+            }
+          }
+
+          // Case 2: generic broken chain (proxy crash, missing record).
+          // Find the record with the highest _fileIndex that's before lastAdded and not yet visited.
+          if (!recovered) {
+            let bestPred = null;
+            for (const [uuid, entry] of recordMap) {
+              if (seen.has(uuid)) continue;
+              if (entry._fileIndex < lastAdded._fileIndex) {
+                if (!bestPred || entry._fileIndex > bestPred._fileIndex) {
+                  bestPred = entry;
+                }
+              }
+            }
+            if (bestPred) {
+              console.log('[Timeline:Backtrace] CHAIN BREAK recovery: ' + currentUuid?.slice(0, 8) + ' missing, jumping to ' + bestPred.uuid?.slice(0, 8) + ' (fileIdx ' + bestPred._fileIndex + ', type=' + bestPred.type + ')');
+              currentUuid = bestPred.uuid;
+              recovered = true;
             }
           }
         }
@@ -784,13 +808,34 @@ function register({ projectManager, formatToolAction }) {
       const lastRecord = allRecords.filter(r => r?.uuid).pop();
       if (!lastRecord) return { success: false, error: 'No records in file' };
 
+      // Build fileIndex map for recovery (proxy crash can leave broken parentUuid)
+      const fileIndexMap = new Map();
+      allRecords.forEach((r, i) => { if (r?.uuid) fileIndexMap.set(r.uuid, i); });
+
       const activeBranch = [];
       let cur = lastRecord.uuid;
       const seen = new Set();
       while (cur && !seen.has(cur)) {
         seen.add(cur);
         const rec = recordMap.get(cur);
-        if (!rec) break;
+        if (!rec) {
+          // Broken chain: find nearest predecessor by file position
+          if (activeBranch.length > 0) {
+            const lastAddedIdx = fileIndexMap.get(activeBranch[0].uuid) || 0;
+            let bestIdx = -1, bestUuid = null;
+            for (const [uuid, idx] of fileIndexMap) {
+              if (!seen.has(uuid) && idx < lastAddedIdx && idx > bestIdx) {
+                bestIdx = idx; bestUuid = uuid;
+              }
+            }
+            if (bestUuid) {
+              console.log('[EditRange:Backtrace] CHAIN BREAK recovery: ' + cur?.slice(0, 8) + ' missing, jumping to ' + bestUuid?.slice(0, 8));
+              cur = bestUuid;
+              continue;
+            }
+          }
+          break;
+        }
         activeBranch.unshift(rec);
         cur = rec.logicalParentUuid || rec.parentUuid;
       }
@@ -1341,6 +1386,7 @@ function register({ projectManager, formatToolAction }) {
           const contentBlocks = entry.message?.content;
           if (Array.isArray(contentBlocks)) {
             const docFiles = [];
+            const docsSearchQueries = [];
             for (const block of contentBlocks) {
               if (block.type === 'tool_use' && (block.name === 'Edit' || block.name === 'Write')) {
                 const fp = block.input?.file_path || '';
@@ -1355,6 +1401,13 @@ function register({ projectManager, formatToolAction }) {
                   }
                 }
               }
+              // Detect MCP docs_search calls
+              if (block.type === 'tool_use' && block.name === 'mcp__knowledge__docs_search') {
+                const query = block.input?.query || '';
+                if (query && !docsSearchQueries.includes(query)) {
+                  docsSearchQueries.push(query);
+                }
+              }
             }
             if (docFiles.length > 0) {
               entries.push({
@@ -1366,11 +1419,21 @@ function register({ projectManager, formatToolAction }) {
                 sessionId: entry.sessionId || entry._fromFile
               });
             }
+            if (docsSearchQueries.length > 0) {
+              entries.push({
+                uuid: entry.uuid + '_ds',
+                type: 'docs_search',
+                timestamp: entry.timestamp,
+                content: docsSearchQueries.join('; '),
+                docsSearchQueries: docsSearchQueries,
+                sessionId: entry.sessionId || entry._fromFile
+              });
+            }
           }
         }
       }
 
-      // Merge consecutive docs_edit entries into one
+      // Merge consecutive docs_edit and docs_search entries into one
       const mergedEntries = [];
       for (const entry of entries) {
         if (entry.type === 'docs_edit' && mergedEntries.length > 0 && mergedEntries[mergedEntries.length - 1].type === 'docs_edit') {
@@ -1381,6 +1444,14 @@ function register({ projectManager, formatToolAction }) {
             }
           }
           prev.content = prev.docsEdited.join(', ');
+        } else if (entry.type === 'docs_search' && mergedEntries.length > 0 && mergedEntries[mergedEntries.length - 1].type === 'docs_search') {
+          const prev = mergedEntries[mergedEntries.length - 1];
+          for (const q of entry.docsSearchQueries) {
+            if (!prev.docsSearchQueries.includes(q)) {
+              prev.docsSearchQueries.push(q);
+            }
+          }
+          prev.content = prev.docsSearchQueries.join('; ');
         } else {
           mergedEntries.push(entry);
         }

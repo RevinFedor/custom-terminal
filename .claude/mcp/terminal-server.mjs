@@ -101,7 +101,7 @@ const TOOLS = [
   },
   {
     name: 'restart_process',
-    description: 'Restart a terminal process. Kills the current PTY and re-creates it with the same working directory and initial command. Use this after changing code that requires a full process restart (e.g. main.js changes in Electron, backend server changes).',
+    description: 'Restart a terminal process. Sends Ctrl+C to stop the current command, waits for it to finish, then re-runs the command. The shell stays alive — only the running process is restarted. Use this after changing code that requires a full process restart (e.g. main.js changes in Electron, backend server changes).',
     inputSchema: {
       type: 'object',
       properties: {

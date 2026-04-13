@@ -315,7 +315,19 @@ let PROVIDER_PROXY_PORT = 4001;
 let providerState = { type: 'anthropic' }; // or { type: 'zen', model: 'kimi-k2.5' }
 const ZEN_API_KEY = process.env.OPENCODE_ZEN_KEY || 'sk-64KGnfrqj6hK5WTfRG2efBdaHKlvdUVHXSzYZ4PfuiC7dz12QEdUECHkV8dewtrV';
 
+// Keep-alive agents: reuse TCP+TLS connections instead of handshake per request (~200-500ms saving)
+const anthropicAgent = new https.Agent({ keepAlive: true, keepAliveMsecs: 60000, maxSockets: 10, maxFreeSockets: 5 });
+const zenAgent = new https.Agent({ keepAlive: true, keepAliveMsecs: 60000, maxSockets: 5, maxFreeSockets: 3 });
+
+// Track active proxy connections for graceful shutdown
+const proxyActiveConnections = new Set();
+
 const providerProxy = http.createServer((req, res) => {
+  // Track connection for graceful shutdown
+  const socket = req.socket;
+  proxyActiveConnections.add(socket);
+  socket.once('close', () => proxyActiveConnections.delete(socket));
+
   const chunks = [];
   req.on('data', (chunk) => chunks.push(chunk));
   req.on('end', () => {
@@ -324,12 +336,13 @@ const providerProxy = http.createServer((req, res) => {
     const targetModel = providerState.model || '';
 
     // Determine target host
-    let targetHost, targetPort, targetPath, authHeaders;
+    let targetHost, targetPort, targetPath, authHeaders, agent;
     if (mode === 'zen') {
       // OpenCode Zen — Anthropic-compatible, direct passthrough with model rewrite
       targetHost = 'opencode.ai';
       targetPort = 443;
       targetPath = '/zen/go' + req.url;
+      agent = zenAgent;
       // Rewrite model name in body
       try {
         const parsed = JSON.parse(body.toString());
@@ -340,38 +353,43 @@ const providerProxy = http.createServer((req, res) => {
       } catch {}
       authHeaders = { 'x-api-key': ZEN_API_KEY };
     } else {
-      // Anthropic — passthrough, but strip foreign thinking blocks (MiniMax adds them with invalid signatures)
+      // Anthropic passthrough
       targetHost = 'api.anthropic.com';
       targetPort = 443;
       targetPath = req.url;
+      agent = anthropicAgent;
       authHeaders = {};
-      try {
-        const parsed = JSON.parse(body.toString());
-        let cleaned = false;
-        if (Array.isArray(parsed.messages)) {
-          for (const msg of parsed.messages) {
-            if (Array.isArray(msg.content)) {
-              const before = msg.content.length;
-              msg.content = msg.content.filter(b => b.type !== 'thinking' && b.type !== 'redacted_thinking');
-              if (msg.content.length === 0) msg.content = [{ type: 'text', text: '.' }];
-              if (msg.content.length !== before) cleaned = true;
+      // Fast path: skip JSON parse if no thinking blocks to strip (preserves exact body bytes → cache key intact)
+      const bodyStr = body.toString();
+      if (bodyStr.includes('"thinking"') || bodyStr.includes('"redacted_thinking"')) {
+        try {
+          const parsed = JSON.parse(bodyStr);
+          let cleaned = false;
+          if (Array.isArray(parsed.messages)) {
+            for (const msg of parsed.messages) {
+              if (Array.isArray(msg.content)) {
+                const before = msg.content.length;
+                msg.content = msg.content.filter(b => b.type !== 'thinking' && b.type !== 'redacted_thinking');
+                if (msg.content.length === 0) msg.content = [{ type: 'text', text: '.' }];
+                if (msg.content.length !== before) cleaned = true;
+              }
             }
           }
-        }
-        if (cleaned) {
-          body = Buffer.from(JSON.stringify(parsed));
-          console.log('[ProviderProxy] Anthropic: stripped foreign thinking blocks');
-        }
-      } catch {}
+          if (cleaned) {
+            body = Buffer.from(JSON.stringify(parsed));
+            console.log('[ProviderProxy] Anthropic: stripped foreign thinking blocks');
+          }
+        } catch {}
+      }
       console.log('[ProviderProxy] Anthropic passthrough: ' + req.url);
     }
 
     const fwdHeaders = { ...req.headers, host: targetHost, ...authHeaders };
     if (mode === 'zen') {
-      // Replace Claude's auth with Zen key
       delete fwdHeaders['authorization'];
     }
-    delete fwdHeaders['content-length'];
+    // Recalculate content-length for correct body size (may have changed after thinking strip)
+    fwdHeaders['content-length'] = Buffer.byteLength(body);
 
     const proxyReq = https.request({
       hostname: targetHost,
@@ -379,14 +397,50 @@ const providerProxy = http.createServer((req, res) => {
       path: targetPath,
       method: req.method,
       headers: fwdHeaders,
+      agent,
     }, (proxyRes) => {
       console.log('[ProviderProxy] ' + (mode === 'zen' ? 'Zen' : 'Anthropic') + ' responded: ' + proxyRes.statusCode);
-      res.writeHead(proxyRes.statusCode, proxyRes.headers);
-      proxyRes.pipe(res);
+
+      // Log cache stats from streaming response (first SSE message_start event)
+      if (mode === 'anthropic' && proxyRes.headers['content-type']?.includes('event-stream')) {
+        let firstChunkParsed = false;
+        const origPipe = proxyRes.pipe.bind(proxyRes);
+        const { PassThrough } = require('stream');
+        const tap = new PassThrough();
+        let sseBuffer = '';
+        tap.on('data', (chunk) => {
+          if (firstChunkParsed) return;
+          sseBuffer += chunk.toString();
+          // Look for message_start event in SSE stream
+          const msgMatch = sseBuffer.match(/event:\s*message_start\ndata:\s*(\{[^\n]+)/);
+          if (msgMatch) {
+            firstChunkParsed = true;
+            try {
+              const evt = JSON.parse(msgMatch[1]);
+              const u = evt.message?.usage;
+              if (u) {
+                const cacheRead = u.cache_read_input_tokens || 0;
+                const cacheCreate = u.cache_creation_input_tokens || 0;
+                const input = u.input_tokens || 0;
+                console.log('[ProviderProxy] Cache: read=' + cacheRead + ' create=' + cacheCreate + ' input=' + input +
+                  (cacheRead > 0 ? ' HIT' : cacheCreate > 0 ? ' MISS(new)' : ' NONE'));
+              }
+            } catch {}
+          }
+        });
+        res.writeHead(proxyRes.statusCode, proxyRes.headers);
+        proxyRes.pipe(tap);
+        proxyRes.pipe(res);
+      } else {
+        res.writeHead(proxyRes.statusCode, proxyRes.headers);
+        proxyRes.pipe(res);
+      }
     });
     proxyReq.on('error', (e) => {
       console.error('[ProviderProxy] Forward error: ' + e.message);
-      res.writeHead(502, { 'Content-Type': 'application/json' });
+      if (!res.headersSent) {
+        res.writeHead(502, { 'Content-Type': 'application/json' });
+      }
       res.end(JSON.stringify({ error: { message: 'Proxy error: ' + e.message } }));
     });
     proxyReq.write(body);
@@ -394,11 +448,26 @@ const providerProxy = http.createServer((req, res) => {
   });
 });
 
+// Graceful shutdown: drain active connections before killing proxy
+async function proxyGracefulShutdown() {
+  if (proxyActiveConnections.size === 0) return;
+  console.log('[ProviderProxy] Graceful shutdown: ' + proxyActiveConnections.size + ' active connections, draining...');
+  providerProxy.close(); // stop accepting new connections
+  const deadline = Date.now() + 15000; // 15s max wait
+  while (proxyActiveConnections.size > 0 && Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, 200));
+  }
+  if (proxyActiveConnections.size > 0) {
+    console.log('[ProviderProxy] Force-closing ' + proxyActiveConnections.size + ' connections after timeout');
+    for (const socket of proxyActiveConnections) socket.destroy();
+  }
+}
+
 // Try port 4001, fallback to 4002-4010 if busy (e.g. dev + test running simultaneously)
 function startProxyOnPort(port) {
   providerProxy.listen(port, '127.0.0.1', () => {
     PROVIDER_PROXY_PORT = port;
-    console.log('[ProviderProxy] Started on http://127.0.0.1:' + port + ' → ' + providerState.type);
+    console.log('[ProviderProxy] Started on http://127.0.0.1:' + port + ' (keepAlive=true) → ' + providerState.type);
   });
   providerProxy.on('error', (e) => {
     if (e.code === 'EADDRINUSE' && port < 4010) {
@@ -862,19 +931,8 @@ ipcMain.on('show-terminal-context-menu', async (event, { hasSelection, prompts, 
     prompts.filter(p => !p.group_id).forEach(p => flatItems.push({ type: 'prompt', prompt: p, pos: p.position }));
     flatItems.sort((a, b) => a.pos - b.pos);
 
-    const buildInsertContent = (p) => {
-      let text = p.content;
-      if (p.file_paths && p.file_paths.length > 0) {
-        const fs = require('fs');
-        for (const fp of p.file_paths) {
-          try {
-            let fc = fs.readFileSync(fp, 'utf-8');
-            fc = fc.replace(/<!--\s*@ai:[\s\S]*?-->/g, '');
-            text += '\n\n--- File: ' + fp + ' ---\n' + fc;
-          } catch (e) { console.error('[InsertPrompt] Failed to read:', fp); }
-        }
-      }
-      return text;
+    const buildInsertData = (p) => {
+      return { content: p.content, filePaths: (p.file_paths && p.file_paths.length > 0) ? p.file_paths : [] };
     };
 
     flatItems.forEach(item => {
@@ -885,14 +943,14 @@ ipcMain.on('show-terminal-context-menu', async (event, { hasSelection, prompts, 
           submenu: groupPrompts.length > 0
             ? groupPrompts.map(p => ({
                 label: p.title,
-                click: () => { event.sender.send('context-menu-command', 'insert-prompt', buildInsertContent(p)); }
+                click: () => { event.sender.send('context-menu-command', 'insert-prompt', buildInsertData(p)); }
               }))
             : [{ label: '(empty)', enabled: false }]
         });
       } else {
         promptsSubmenu.push({
           label: item.prompt.title,
-          click: () => { event.sender.send('context-menu-command', 'insert-prompt', buildInsertContent(item.prompt)); }
+          click: () => { event.sender.send('context-menu-command', 'insert-prompt', buildInsertData(item.prompt)); }
         });
       }
     });
@@ -1770,7 +1828,8 @@ function startMcpHttpServer() {
       })();
 
     } else if (req.method === 'POST' && req.url === '/terminal/restart') {
-      // Restart a terminal process: kill PTY, wait for exit, re-create with same cwd + initialCommand
+      // Soft restart: Ctrl+C → wait for prompt return (OSC 133;A) → re-run command
+      // Same approach as UI restart button in TabBar.tsx. Shell stays alive.
       let body = '';
       req.on('data', chunk => { body += chunk; });
       req.on('end', async () => {
@@ -1782,34 +1841,54 @@ function startMcpHttpServer() {
             return;
           }
 
-          const pty = terminals.get(tabId);
-          const cwd = terminalProjects.get(tabId);
-          const savedCommand = command || terminalInitialCommand.get(tabId);
+          const term = terminals.get(tabId);
+          if (!term) {
+            res.writeHead(404);
+            res.end(JSON.stringify({ error: 'Terminal not alive for tab ' + tabId }));
+            return;
+          }
 
-          console.log('[MCP:Terminal] POST /terminal/restart tabId=' + tabId + ' cmd=' + (savedCommand || '(none)'));
+          const restartCmd = command || terminalInitialCommand.get(tabId);
+          if (!restartCmd) {
+            res.writeHead(400);
+            res.end(JSON.stringify({ error: 'No saved command for this tab. Pass "command" parameter explicitly.' }));
+            return;
+          }
 
-          if (pty) {
-            // Kill existing PTY and wait for exit
+          console.log('[MCP:Terminal] POST /terminal/restart tabId=' + tabId + ' cmd=' + restartCmd);
+
+          const cmdState = terminalCommandState.get(tabId);
+          const wasRunning = cmdState && cmdState.isRunning;
+
+          // Step 1: Ctrl+C to stop current process (harmless if nothing running)
+          term.write('\x03');
+
+          if (wasRunning) {
+            // Step 2: Wait for prompt return — OSC 133;D (command finished) then 133;A (prompt ready)
+            // This is deterministic: no fixed timeouts for process shutdown.
+            // Electron/Vite may take seconds to gracefully stop — we wait for the shell.
             await new Promise((resolve) => {
-              const onExit = () => resolve();
-              pty.onExit(onExit);
-              pty.kill();
-              // Safety timeout
-              setTimeout(resolve, 3000);
+              let done = false;
+              const check = setInterval(() => {
+                const state = terminalCommandState.get(tabId);
+                if (!state || !state.isRunning) {
+                  clearInterval(check);
+                  if (!done) { done = true; resolve(); }
+                }
+              }, 200);
+              // Safety: 30s for very slow shutdowns (Electron graceful exit)
+              setTimeout(() => { clearInterval(check); if (!done) { done = true; resolve(); } }, 30000);
             });
+
+            // Small delay for shell prompt to fully render
+            await new Promise(r => setTimeout(r, 300));
           }
 
-          // Tell renderer to re-create the terminal
-          if (mainWindow && !mainWindow.isDestroyed()) {
-            mainWindow.webContents.send('terminal:mcp-restart', {
-              tabId,
-              cwd: cwd || process.env.HOME,
-              initialCommand: savedCommand || null,
-            });
-          }
+          // Step 3: Re-run command
+          term.write(restartCmd + '\r');
 
           res.writeHead(200);
-          res.end(JSON.stringify({ status: 'restarting', tabId }));
+          res.end(JSON.stringify({ status: 'restarted', tabId, command: restartCmd }));
         } catch (e) {
           res.writeHead(500);
           res.end(JSON.stringify({ error: e.message }));
@@ -1953,27 +2032,30 @@ function startMcpHttpServer() {
 
                 results.push({ step: step.action, tabId: step.tabId, status: 'completed' });
               } else if (step.action === 'restart') {
-                const pty = terminals.get(step.tabId);
-                const cwd = terminalProjects.get(step.tabId);
+                const term = terminals.get(step.tabId);
+                if (!term) throw new Error('Terminal not alive: ' + step.tabId);
                 const cmd = step.command || terminalInitialCommand.get(step.tabId);
+                if (!cmd) throw new Error('No saved command for tab ' + step.tabId + '. Pass "command" in step.');
 
-                if (pty) {
+                const cmdState = terminalCommandState.get(step.tabId);
+                term.write('\x03');
+                if (cmdState && cmdState.isRunning) {
                   await new Promise((resolve) => {
-                    pty.onExit(() => resolve());
-                    pty.kill();
-                    setTimeout(resolve, 3000);
+                    let done = false;
+                    const check = setInterval(() => {
+                      const state = terminalCommandState.get(step.tabId);
+                      if (!state || !state.isRunning) {
+                        clearInterval(check);
+                        if (!done) { done = true; resolve(); }
+                      }
+                    }, 200);
+                    setTimeout(() => { clearInterval(check); if (!done) { done = true; resolve(); } }, 30000);
                   });
+                  await new Promise(r => setTimeout(r, 300));
                 }
+                term.write(cmd + '\r');
 
-                if (mainWindow && !mainWindow.isDestroyed()) {
-                  mainWindow.webContents.send('terminal:mcp-restart', {
-                    tabId: step.tabId,
-                    cwd: cwd || process.env.HOME,
-                    initialCommand: cmd || null,
-                  });
-                }
-
-                results.push({ step: step.action, tabId: step.tabId, status: 'restarting' });
+                results.push({ step: step.action, tabId: step.tabId, status: 'restarted' });
               } else if (step.action === 'kill') {
                 const pty = terminals.get(step.tabId);
                 if (pty) pty.kill();
@@ -3555,7 +3637,10 @@ app.whenReady().then(() => {
 //
 // before-quit: safety net — runs first, marks known sessions.
 // will-quit: definitive — runs AFTER beforeunload, clears stale + marks active.
-app.on('before-quit', () => {
+app.on('before-quit', async () => {
+  // Drain active proxy connections before killing terminals
+  await proxyGracefulShutdown();
+
   try {
     if (projectManager?.db?.db) {
       let marked = 0;

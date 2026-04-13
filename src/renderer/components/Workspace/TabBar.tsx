@@ -160,14 +160,15 @@ const RestartZone = memo(({ hasProcess, hasColor, commandType, hasSession, isBus
           // Claude/Gemini tabs show spinning arc when busy
           ((commandType === 'claude' || commandType === 'gemini') && isBusy) ? (
             <span
-              className="animate-glow-green"
               style={{
                 display: 'block',
                 width: '8px',
                 height: '8px',
                 borderRadius: '50%',
-                backgroundColor: '#4ade80',
-                boxShadow: '0 0 8px #22c55e80',
+                border: '1.5px solid rgba(74, 222, 128, 0.2)',
+                borderTopColor: '#4ade80',
+                boxSizing: 'border-box',
+                animation: 'tab-dot-spin 0.8s linear infinite',
               }}
             />
           ) : (
