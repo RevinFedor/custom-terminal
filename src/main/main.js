@@ -136,6 +136,9 @@ let mainWindow;
 const terminals = new Map(); // tabId -> ptyProcess
 const terminalProjects = new Map(); // tabId -> cwd path
 const terminalCommandState = new Map(); // tabId -> { isRunning: boolean, lastExitCode: number }
+const terminalInitialCommand = new Map(); // tabId -> initialCommand string (for restart)
+const terminalOutputBuffer = new Map();  // tabId -> { lines: string[], maxLines: 500 }
+const TERMINAL_OUTPUT_MAX_LINES = 500;
 // Claude Handshake: prompt injection with debounce (thinking handled by alwaysThinkingEnabled)
 // States: 'WAITING_PROMPT' -> 'DEBOUNCE_PROMPT' -> send prompt -> done
 const claudeState = new Map(); // tabId -> state string | null
@@ -1701,6 +1704,327 @@ function startMcpHttpServer() {
           res.end(JSON.stringify({ error: 'Invalid JSON: ' + e.message }));
         }
       });
+
+    // ========== TERMINAL MANAGEMENT ENDPOINTS ==========
+    } else if (req.method === 'GET' && req.url?.startsWith('/terminal/tabs')) {
+      // List terminal tabs for a project (by cwd path)
+      (async () => {
+        try {
+          const urlObj = new URL(req.url, 'http://localhost');
+          const projectPath = urlObj.searchParams.get('cwd') || '';
+          const colorFilter = urlObj.searchParams.get('color') || '';
+
+          if (!projectPath) {
+            res.writeHead(400);
+            res.end(JSON.stringify({ error: 'cwd parameter is required' }));
+            return;
+          }
+
+          // Find project by path in DB
+          const project = projectManager.db.db.prepare(
+            'SELECT * FROM projects WHERE path = ? ORDER BY updated_at DESC LIMIT 1'
+          ).get(projectPath);
+
+          if (!project) {
+            res.writeHead(200);
+            res.end(JSON.stringify({ tabs: [] }));
+            return;
+          }
+
+          // Get tabs from DB
+          const dbTabs = projectManager.db.db.prepare(
+            'SELECT * FROM tabs WHERE project_id = ? ORDER BY position'
+          ).all(project.id);
+
+          const tabs = [];
+          for (const t of dbTabs) {
+            const tabId = t.tab_id;
+            if (!tabId) continue;
+
+            // Filter by color if requested
+            if (colorFilter && t.color !== colorFilter) continue;
+
+            const pty = terminals.get(tabId);
+            const cmdState = terminalCommandState.get(tabId);
+
+            tabs.push({
+              tabId,
+              name: t.name,
+              color: t.color || 'default',
+              commandType: t.command_type || 'generic',
+              cwd: terminalProjects.get(tabId) || t.cwd,
+              isAlive: !!pty,
+              pid: pty ? pty.pid : null,
+              isRunning: cmdState ? cmdState.isRunning : false,
+              initialCommand: terminalInitialCommand.get(tabId) || null,
+            });
+          }
+
+          console.log('[MCP:HTTP] GET /terminal/tabs project=' + projectPath + ' color=' + colorFilter + ' found=' + tabs.length);
+          res.writeHead(200);
+          res.end(JSON.stringify({ tabs }));
+        } catch (e) {
+          res.writeHead(500);
+          res.end(JSON.stringify({ error: e.message }));
+        }
+      })();
+
+    } else if (req.method === 'POST' && req.url === '/terminal/restart') {
+      // Restart a terminal process: kill PTY, wait for exit, re-create with same cwd + initialCommand
+      let body = '';
+      req.on('data', chunk => { body += chunk; });
+      req.on('end', async () => {
+        try {
+          const { tabId, command } = JSON.parse(body);
+          if (!tabId) {
+            res.writeHead(400);
+            res.end(JSON.stringify({ error: 'tabId is required' }));
+            return;
+          }
+
+          const pty = terminals.get(tabId);
+          const cwd = terminalProjects.get(tabId);
+          const savedCommand = command || terminalInitialCommand.get(tabId);
+
+          console.log('[MCP:Terminal] POST /terminal/restart tabId=' + tabId + ' cmd=' + (savedCommand || '(none)'));
+
+          if (pty) {
+            // Kill existing PTY and wait for exit
+            await new Promise((resolve) => {
+              const onExit = () => resolve();
+              pty.onExit(onExit);
+              pty.kill();
+              // Safety timeout
+              setTimeout(resolve, 3000);
+            });
+          }
+
+          // Tell renderer to re-create the terminal
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send('terminal:mcp-restart', {
+              tabId,
+              cwd: cwd || process.env.HOME,
+              initialCommand: savedCommand || null,
+            });
+          }
+
+          res.writeHead(200);
+          res.end(JSON.stringify({ status: 'restarting', tabId }));
+        } catch (e) {
+          res.writeHead(500);
+          res.end(JSON.stringify({ error: e.message }));
+        }
+      });
+
+    } else if (req.method === 'POST' && req.url === '/terminal/run') {
+      // Run a command in an existing terminal tab
+      let body = '';
+      req.on('data', chunk => { body += chunk; });
+      req.on('end', async () => {
+        try {
+          const { tabId, command } = JSON.parse(body);
+          if (!tabId || !command) {
+            res.writeHead(400);
+            res.end(JSON.stringify({ error: 'tabId and command are required' }));
+            return;
+          }
+
+          const pty = terminals.get(tabId);
+          if (!pty) {
+            res.writeHead(404);
+            res.end(JSON.stringify({ error: 'Terminal not alive for tab ' + tabId }));
+            return;
+          }
+
+          console.log('[MCP:Terminal] POST /terminal/run tabId=' + tabId + ' cmd="' + command.substring(0, 80) + '"');
+
+          // Send command + Enter to PTY
+          pty.write(command + '\r');
+
+          res.writeHead(200);
+          res.end(JSON.stringify({ status: 'sent', tabId }));
+        } catch (e) {
+          res.writeHead(500);
+          res.end(JSON.stringify({ error: e.message }));
+        }
+      });
+
+    } else if (req.method === 'POST' && req.url === '/terminal/create') {
+      // Create a new terminal tab with optional command
+      let body = '';
+      req.on('data', chunk => { body += chunk; });
+      req.on('end', async () => {
+        try {
+          const { name, cwd, command, color } = JSON.parse(body);
+          if (!cwd) {
+            res.writeHead(400);
+            res.end(JSON.stringify({ error: 'cwd is required' }));
+            return;
+          }
+
+          console.log('[MCP:Terminal] POST /terminal/create name=' + (name || 'auto') + ' cwd=' + cwd + ' cmd=' + (command || '(none)'));
+
+          // Tell renderer to create a new tab
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send('terminal:mcp-create', {
+              name: name || undefined,
+              cwd,
+              command: command || undefined,
+              color: color || undefined,
+            });
+          }
+
+          res.writeHead(200);
+          res.end(JSON.stringify({ status: 'creating' }));
+        } catch (e) {
+          res.writeHead(500);
+          res.end(JSON.stringify({ error: e.message }));
+        }
+      });
+
+    } else if (req.method === 'POST' && req.url === '/terminal/kill') {
+      // Kill a terminal process
+      let body = '';
+      req.on('data', chunk => { body += chunk; });
+      req.on('end', async () => {
+        try {
+          const { tabId } = JSON.parse(body);
+          if (!tabId) {
+            res.writeHead(400);
+            res.end(JSON.stringify({ error: 'tabId is required' }));
+            return;
+          }
+
+          const pty = terminals.get(tabId);
+          if (!pty) {
+            res.writeHead(404);
+            res.end(JSON.stringify({ error: 'Terminal not alive for tab ' + tabId }));
+            return;
+          }
+
+          console.log('[MCP:Terminal] POST /terminal/kill tabId=' + tabId);
+          pty.kill();
+
+          res.writeHead(200);
+          res.end(JSON.stringify({ status: 'killed', tabId }));
+        } catch (e) {
+          res.writeHead(500);
+          res.end(JSON.stringify({ error: e.message }));
+        }
+      });
+
+    } else if (req.method === 'POST' && req.url === '/terminal/chain') {
+      // Run a chain of sequential steps (e.g. build → restart)
+      let body = '';
+      req.on('data', chunk => { body += chunk; });
+      req.on('end', async () => {
+        try {
+          const { steps } = JSON.parse(body);
+          if (!steps || !Array.isArray(steps) || steps.length === 0) {
+            res.writeHead(400);
+            res.end(JSON.stringify({ error: 'steps array is required' }));
+            return;
+          }
+
+          console.log('[MCP:Terminal] POST /terminal/chain steps=' + steps.length);
+          const results = [];
+
+          for (const step of steps) {
+            try {
+              if (step.action === 'run') {
+                const pty = terminals.get(step.tabId);
+                if (!pty) throw new Error('Terminal not alive: ' + step.tabId);
+                pty.write(step.command + '\r');
+
+                // Wait for command to finish (poll commandState)
+                if (step.waitForCompletion !== false) {
+                  await new Promise((resolve) => {
+                    const checkInterval = setInterval(() => {
+                      const state = terminalCommandState.get(step.tabId);
+                      if (state && !state.isRunning) {
+                        clearInterval(checkInterval);
+                        resolve();
+                      }
+                    }, 500);
+                    // Safety timeout: 5 min
+                    setTimeout(() => { clearInterval(checkInterval); resolve(); }, 300000);
+                  });
+                }
+
+                results.push({ step: step.action, tabId: step.tabId, status: 'completed' });
+              } else if (step.action === 'restart') {
+                const pty = terminals.get(step.tabId);
+                const cwd = terminalProjects.get(step.tabId);
+                const cmd = step.command || terminalInitialCommand.get(step.tabId);
+
+                if (pty) {
+                  await new Promise((resolve) => {
+                    pty.onExit(() => resolve());
+                    pty.kill();
+                    setTimeout(resolve, 3000);
+                  });
+                }
+
+                if (mainWindow && !mainWindow.isDestroyed()) {
+                  mainWindow.webContents.send('terminal:mcp-restart', {
+                    tabId: step.tabId,
+                    cwd: cwd || process.env.HOME,
+                    initialCommand: cmd || null,
+                  });
+                }
+
+                results.push({ step: step.action, tabId: step.tabId, status: 'restarting' });
+              } else if (step.action === 'kill') {
+                const pty = terminals.get(step.tabId);
+                if (pty) pty.kill();
+                results.push({ step: step.action, tabId: step.tabId, status: 'killed' });
+              } else {
+                results.push({ step: step.action, status: 'unknown_action' });
+              }
+            } catch (stepErr) {
+              results.push({ step: step.action, tabId: step.tabId, status: 'error', error: stepErr.message });
+            }
+          }
+
+          res.writeHead(200);
+          res.end(JSON.stringify({ status: 'completed', results }));
+        } catch (e) {
+          res.writeHead(500);
+          res.end(JSON.stringify({ error: e.message }));
+        }
+      });
+
+    } else if (req.method === 'GET' && req.url?.startsWith('/terminal/output')) {
+      // Read last N lines of terminal output
+      (async () => {
+        try {
+          const urlObj = new URL(req.url, 'http://localhost');
+          const tabId = urlObj.searchParams.get('tabId');
+          const lines = parseInt(urlObj.searchParams.get('lines') || '50');
+
+          if (!tabId) {
+            res.writeHead(400);
+            res.end(JSON.stringify({ error: 'tabId parameter is required' }));
+            return;
+          }
+
+          const buf = terminalOutputBuffer.get(tabId);
+          if (!buf) {
+            res.writeHead(404);
+            res.end(JSON.stringify({ error: 'No output buffer for tab ' + tabId }));
+            return;
+          }
+
+          const output = buf.lines.slice(-lines).join('\n');
+          console.log('[MCP:Terminal] GET /terminal/output tabId=' + tabId + ' lines=' + lines + ' chars=' + output.length);
+
+          res.writeHead(200);
+          res.end(JSON.stringify({ tabId, lines: Math.min(lines, buf.lines.length), output }));
+        } catch (e) {
+          res.writeHead(500);
+          res.end(JSON.stringify({ error: e.message }));
+        }
+      })();
 
     } else {
       res.writeHead(404);
@@ -3491,8 +3815,20 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
     terminals.set(tabId, ptyProcess);
     terminalProjects.set(tabId, workingDir);
     terminalCommandState.set(tabId, { isRunning: false, lastExitCode: 0 });
+    if (initialCommand) terminalInitialCommand.set(tabId, initialCommand);
+    terminalOutputBuffer.set(tabId, { lines: [], maxLines: TERMINAL_OUTPUT_MAX_LINES });
 
     ptyProcess.onData((data) => {
+      // Capture output into ring buffer for MCP read_output
+      const buf = terminalOutputBuffer.get(tabId);
+      if (buf) {
+        const newLines = data.split('\n');
+        buf.lines.push(...newLines);
+        if (buf.lines.length > buf.maxLines) {
+          buf.lines.splice(0, buf.lines.length - buf.maxLines);
+        }
+      }
+
       // Parse OSC 133 for command lifecycle events (just spy, don't modify)
       parseOSC133AndEmit(tabId, data);
 
@@ -3930,6 +4266,8 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
       terminals.delete(tabId);
       terminalProjects.delete(tabId);
       terminalCommandState.delete(tabId);
+      terminalInitialCommand.delete(tabId);
+      terminalOutputBuffer.delete(tabId);
       claudeCliActive.delete(tabId);
       clearBridgeTab(tabId);
       claudeAgentManager.cleanup(tabId);
