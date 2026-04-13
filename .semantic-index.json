@@ -1,5 +1,48 @@
 [
   {
+    "path": "docs/knowledge/fact-provider-proxy.md",
+    "type": "fact",
+    "explicit": [
+      "LLM Provider Proxy",
+      "HTTP proxy architecture",
+      "Anthropic API passthrough",
+      "Zen mode provider switching",
+      "Connection pooling",
+      "Prompt cache key preservation",
+      "Cache stats logging",
+      "OAuth token handling",
+      "Graceful shutdown",
+      "Billing sentinel (cch=)"
+    ],
+    "implicit": [
+      "provider_proxy_keepalive_pooling",
+      "json_reserialization_cache_break",
+      "thinking_strip_cache_miss",
+      "cch_billing_sentinel_mutation",
+      "proxy_crash_chain_break",
+      "zen_model_rewrite_and_auth",
+      "anthropic_oauth_token_passthrough",
+      "graceful_shutdown_sse_drain",
+      "sse_message_start_cache_interception",
+      "content_length_recalculation",
+      "fast_path_json_skip",
+      "cache_hit_rate_monitoring"
+    ],
+    "symptoms": [
+      "Prompt cache stops working (0% hit rate) immediately after switching from Zen to Anthropic or vice versa",
+      "Session chain breaks when Electron crashes mid-response, with assistant data lost in memory but not persisted to disk",
+      "Tool result text containing 'cch=' becomes corrupted and changes on each request cycle in the same session",
+      "First API request to a provider takes 500ms+ longer than subsequent identical requests due to missing connection reuse",
+      "Thinking blocks remaining from previous Zen mode session cause Anthropic API to reject the request"
+    ],
+    "related_components": [
+      "src/main.js",
+      "docs/knowledge/fact-backtrace-jsonl.md",
+      "docs/knowledge/fact-claude-sessions.md"
+    ],
+    "hash": "93e97f80a85d3ffa865cad38b10ba68c04429aadfb0258097088bbf5cdb4add0"
+  },
+  {
     "path": "docs/knowledge/fact-terminal-rendering.md",
     "type": "fact",
     "explicit": [
@@ -704,48 +747,44 @@
     "path": "docs/knowledge/fact-backtrace-jsonl.md",
     "type": "fact",
     "explicit": [
-      "JSONL backtrace traversal algorithm",
-      "compact gap recovery",
-      "bridge following",
-      "session chain resolution",
-      "incremental reader performance",
-      "fork isolation via sessionId rewrite",
-      "sub-agent inline storage"
+      "JSONL backtrace algorithm",
+      "Session chain resolution and bridges",
+      "Compact gap recovery with dangling references",
+      "Bridge following and cycle prevention",
+      "Incremental reader optimization",
+      "Fork session isolation"
     ],
     "implicit": [
-      "backtrace_jsonl_traversal",
-      "compact_gap_recovery",
-      "bridge_session_following",
-      "incremental_reader_race_condition",
-      "fork_sessionid_rewrite",
-      "merge_map_consolidation",
-      "parentuuid_chain_resolution",
-      "compact_boundary_marker",
-      "dangling_reference_fallback",
-      "fork_marker_isolation",
-      "subagent_progress_inline_storage",
-      "physical_predecessor_lookup",
-      "jsonl_chain_bridge_cycles",
-      "sync_marker_backtrace_validity"
+      "backtrace_parentuuid_traversal",
+      "compact_gap_dangling_reference",
+      "bridge_following_cycle_prevention",
+      "incremental_reader_byte_offset",
+      "fork_rewrite_sessionid_isolation",
+      "physical_predecessor_fallback",
+      "compact_summary_lookahead",
+      "recordmap_indexing_efficiency",
+      "fileindex_ordering_linear",
+      "concurrent_access_snapshot",
+      "dangling_uuid_proxy_crash",
+      "zustand_timeline_state_reactivity",
+      "react_effect_ipc_timeline_window"
     ],
     "symptoms": [
-      "Timeline displays duplicate messages mixed with undone operations (after Escape key)",
-      "History stream breaks mid-conversation after /compact command, older messages inaccessible",
-      "Session ID switches to fork ID after closing fork tab and returning to parent, causing /status mismatch",
-      "Large JSONL file reads skip entries due to concurrent incremental reader race condition",
-      "Bridge entries incorrectly merge fork-copy records into parent session timeline"
+      "Timeline displays messages that user cancelled with Escape/Undo mixed together with new replies",
+      "History stream suddenly ends mid-conversation after /compact command, old messages become inaccessible",
+      "Session ID in app changes to fork ID after closing forked tab; /status terminal command shows different ID than renderer",
+      "Incremental reader blocks Main Thread for 3+ seconds on first Timeline load with large (>100MB) session files",
+      "Timeline search or restore cannot locate messages that physically exist in JSONL before /compact boundary"
     ],
     "related_components": [
-      "main.js:findSessionFile()",
-      "main.js:loadJsonlRecords()",
-      "main.js:resolveSessionChain()",
-      "main.js:resolveLatestSessionInChain()",
-      "main.js:claude:get-timeline",
-      "main.js:claude:fork-session-file",
-      "main.js:gemini:open-history-menu",
-      "main.js:gemini:copy-range"
+      "src/main.js (resolveSessionChain, resolveLatestSessionInChain, loadJsonlRecords functions)",
+      "src/main.js (claude:get-timeline handler, claude:fork-session-file handler)",
+      "src/components/Timeline.tsx",
+      "docs/knowledge/fix-incremental-reader-race.md",
+      "docs/knowledge/fix-fork-markers.md",
+      "docs/knowledge/fix-compact-logic.md"
     ],
-    "hash": "9af961a0d1a89f21bc58c06d0fe5fd97a77d9e247a5728342129533234b60ae7"
+    "hash": "d66a8c42afc4449b303120c18b7e03c06eb9cb6792413f3da333d7f7b5a27049"
   },
   {
     "path": "docs/knowledge/fix-fork-markers.md",
@@ -1013,6 +1052,51 @@
       "docs/knowledge/fact-claude-sessions.md"
     ],
     "hash": "22ca83b9c65b2f4af019259d6c8d5f7dfaf6d4f301d65f3dc0cd6b4a70d2aead"
+  },
+  {
+    "path": "docs/knowledge/fact-terminal-mcp.md",
+    "type": "fact",
+    "explicit": [
+      "Terminal MCP Server",
+      "Tab management",
+      "Soft restart mechanism",
+      "Output ring buffer",
+      "MCP delegation",
+      "PTY process lifecycle",
+      "HTTP backend communication",
+      "SQLite tab persistence"
+    ],
+    "implicit": [
+      "mcp_server_delegation_two_servers",
+      "tab_data_sqlite_live_state_maps",
+      "soft_restart_ctrl_c_osc133d_pattern",
+      "terminal_output_ring_buffer_500lines",
+      "mcp_port_discovery_pid_file",
+      "terminalCommandState_isRunning_tracking",
+      "pty_graceful_shutdown_30s_timeout",
+      "sigint_handler_safety_trap_edge_case",
+      "terminal_tab_sync_renderer_sqlite",
+      "command_finished_detection_osc133d",
+      "http_backend_localhost_routing",
+      "project_detection_cwd_sqlite_lookup",
+      "sync_marker_bridge_osc133d_soft_restart",
+      "ipc_lifecycle_terminal_restart_choreography"
+    ],
+    "symptoms": [
+      "Agent can't list, restart, or read output from terminal tabs",
+      "Soft restart hangs indefinitely (OSC 133;D marker never arrives from shell)",
+      "Tab restart shows '[Process completed]' and xterm becomes unresponsive to input",
+      "Output buffer returns empty or 404 error after process restart",
+      "Ctrl+C command doesn't stop a process that catches SIGINT",
+      "MCP server fails to discover port via ~/.noted-terminal/mcp-port file"
+    ],
+    "related_components": [
+      "src/main/mcp-server.mjs",
+      ".claude/mcp/terminal-server.mjs",
+      "src/renderer/TabBar.tsx",
+      "docs/knowledge/fact-mcp-delegation.md"
+    ],
+    "hash": "f65b22c751b0ec18a5a32228861cad8317f0b0f406ab2e6dc9a7706a3e1108ba"
   },
   {
     "path": "docs/knowledge/fact-project-home.md",
@@ -1323,44 +1407,72 @@
     "path": "docs/knowledge/fact-timeline.md",
     "type": "fact",
     "explicit": [
-      "Timeline visibility and reachability indicators",
-      "Fork and plan mode boundary markers",
-      "Range selection, copy, and edit operations",
-      "Rewind with Claude TUI navigation",
-      "Claude OSC 7777 boundary markers",
-      "Gemini text search and truncation fallback",
-      "Sub-agent orchestration grouping and tree view"
+      "Timeline feature overview",
+      "Claude History UI",
+      "Session navigation",
+      "Entry visualization",
+      "Reachability detection",
+      "Range copy and edit",
+      "Rewind automation",
+      "Gemini sub-agent orchestration",
+      "Tree mode view",
+      "Fork and Plan markers"
     ],
     "implicit": [
-      "rewind_visual_search_rgb",
-      "safePasteAndSubmit_chunking",
-      "osc7777_spinner_gate",
-      "compact_unreachable_inherit",
-      "context_menu_portal_propagation",
-      "backtrace_parentuuid_fork",
-      "flex_absolute_scroll_inset",
-      "edit_range_orphan_cascade",
-      "gemini_truncation_fallback",
-      "timeline_editrange_persistence_map",
-      "tree_mode_backdrop_blur",
-      "sync_marker_bracketed_paste"
+      "viewport_dash_indicator",
+      "response_only_gray_indicator",
+      "compact_boundary_shield_logic",
+      "old_history_zone_unreachable_red",
+      "hollow_ring_reachability_indicator",
+      "edit_range_sessionid_dependency",
+      "edit_range_orphan_cascade_cleanup",
+      "compact_timestamp_newest_leaf",
+      "rewind_rgb_visual_search_navigation",
+      "safePasteAndSubmit_sync_marker_verification",
+      "scroll_stabilization_relative_wrapper_overlay",
+      "gemini_truncation_fallback_first_line",
+      "sub_agent_group_collapse_orchestration",
+      "tree_mode_absolute_positioning_stability",
+      "termminal_registry_scrollToEntry_deterministic",
+      "zustand_timeline_entries_refresh_2sec",
+      "raf_debounced_checkScrollPosition",
+      "ipc_listener_subscription_remount_trap",
+      "sessionIdRef_guard_tab_switch_abort",
+      "editRangeState_module_level_map_persistence",
+      "tooltips_cmd_hover_token_count_estimation",
+      "fork_snapshot_soft_delete_hidden_flag",
+      "range_copy_three_phase_visual_feedback"
     ],
     "symptoms": [
-      "Timeline shows wrong entry position after user scrolls a long AI response",
-      "Rewind navigation fails to find target message in TUI or selects wrong entry",
-      "Compact and continued entries render red instead of white on Timeline",
-      "Edit range selection state disappears when switching between terminal tabs",
-      "Sub-agent groups collapse or tree view causes layout shift in terminal"
+      "Timeline shows stale data after switching between Claude and Gemini sessions",
+      "Red background appears on entire timeline after context overflow or plan mode clear",
+      "Clicking on timeline points doesn't scroll to expected message location in terminal",
+      "Edit range operation produces orphaned entries or breaks subsequent message parentUuid chain",
+      "Rewind menu navigation selects wrong message or fails to find text in TUI",
+      "Sub-agent responses appear as multiple timeline dots instead of grouped into single round",
+      "Scroll stabilization causes timeline overs to visually 'stick' to screen position during rewind",
+      "Timeline overlay (yellow pulse for range selection, purple pulse for active point) remains visible after tab switch",
+      "Hollow rings (unreachable entries) show incorrectly red when terminal buffer is cleared or terminal registry missing",
+      "Session ID mismatch causes edit-range compact entry to have wrong sessionId, breaking Claude resume navigation"
     ],
     "related_components": [
-      "src/renderer/Timeline.tsx",
+      "src/renderer/components/Timeline.tsx",
       "src/renderer/components/EditRangePanel.tsx",
+      "src/renderer/stores/uiStore.ts",
+      "src/renderer/stores/terminalRegistry.ts",
       "src/main/ipc/claude-data.js",
       "src/main/ipc/gemini-data.js",
-      "src/main/terminalRegistry.ts",
-      "src/main/main.js"
+      "src/main/main.js (OSC 7777 boundary marker injection ~line 3190)",
+      "docs/knowledge/fix-compact-logic.md",
+      "docs/knowledge/fix-boundary-bridge-race.md",
+      "docs/knowledge/fix-timeline-tooltip-stability.md",
+      "docs/knowledge/fix-osc7777-escape-carryover.md",
+      "docs/knowledge/fix-rewind-navigation.md",
+      "docs/knowledge/fact-react-patterns.md",
+      "docs/knowledge/fact-terminal-core.md",
+      "docs/knowledge/fact-settings.md"
     ],
-    "hash": "ab58965625517075edbd5f098f173cac8f54d7e22862cd72d4bdad7b7d973b83"
+    "hash": "516fb4a365e3460467163fe548c90aa9a8c21d7232a84d13c623e8a13d5d3164"
   },
   {
     "path": "docs/knowledge/fix-boundary-bridge-race.md",

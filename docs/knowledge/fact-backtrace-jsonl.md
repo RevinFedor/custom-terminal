@@ -67,6 +67,24 @@ Claude только добавляет запись типа `compact_boundary`,
 
 ---
 
+## 2.2. Generic Chain Break Recovery (Proxy Crash, Lost Records)
+
+### Проблема
+Compact — не единственная причина «дыр» в цепочке parentUuid. Когда Provider Proxy (или сеть) рвётся **mid-stream**, Claude Code создаёт `api_error` запись с parentUuid, указывающим на assistant-ответ, который был в памяти, но **не успел записаться в JSONL**. Результат: backtrace упирается в несуществующий UUID и останавливается, отрезая всю предшествующую историю (в реальном кейсе: 2839 записей стали недоступны из-за 2 таких разрывов).
+
+### Решение: Physical Predecessor Fallback (Generic)
+Если `recordMap.get(uuid)` возвращает `null` и это **не** compact_boundary (т.е. Level 1/2 recovery не применимы), алгоритм применяет универсальный fallback:
+1. Берёт `_fileIndex` последней добавленной в `activeBranch` записи.
+2. Ищет в `recordMap` запись с максимальным `_fileIndex`, строго меньшим текущего и не посещённую (`!seen`).
+3. Продолжает backtrace от найденного предшественника.
+
+Лог: `[Timeline:Backtrace] CHAIN BREAK recovery: <missing> missing, jumping to <found>`.
+
+### Invisible Intent
+Этот recovery покрывает любые причины «дыр»: proxy crash, потеря данных при записи, corrupt JSONL. В отличие от Compact Recovery (Level 1/2), который привязан к `compact_boundary` subtype, generic recovery срабатывает для **любого** типа записи с отсутствующим parentUuid. Аналогичная логика добавлена в backtrace внутри `claude:edit-range` handler (использует inline `fileIndexMap`).
+
+---
+
 ## 3. Bridge Following: Защита от циклов
 
 ### Проблема

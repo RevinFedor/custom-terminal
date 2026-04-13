@@ -230,10 +230,12 @@ const ProjectTabItem = memo(({
           >
             {(isProjectBusy || isProjectLoading) && (
               <span
-                className="absolute inset-0 rounded-full animate-glow-green"
+                className="absolute inset-0 rounded-full"
                 style={{
-                  border: '2px solid #22c55e',
-                  boxShadow: '0 0 6px #22c55e',
+                  border: '2px solid rgba(74, 222, 128, 0.2)',
+                  borderTopColor: '#4ade80',
+                  boxSizing: 'border-box',
+                  animation: 'tab-dot-spin 0.8s linear infinite',
                 }}
               />
             )}
@@ -1206,11 +1208,24 @@ function App() {
           showToast('Select text in terminal first', 'error');
         }
       } else if (cmd === 'insert-prompt') {
-        // Insert prompt text into effective terminal (sub-agent aware)
+        // Insert prompt text + file attachments into effective terminal (sub-agent aware)
         const effectiveId = getEffectiveTabId();
-        console.warn('[ContextMenu] insert-prompt: tabId=' + effectiveId + ' len=' + (data?.length || 0) + ' endsR=' + data?.endsWith('\r') + ' first30=' + JSON.stringify(data?.slice(0, 30)));
+        const { content, filePaths } = data as { content: string; filePaths: string[] };
+        console.warn('[ContextMenu] insert-prompt: tabId=' + effectiveId + ' contentLen=' + (content?.length || 0) + ' files=' + (filePaths?.length || 0));
         if (effectiveId) {
-          ipcRenderer.send('terminal:input', effectiveId, data);
+          // 1. Prompt text — typed as keyboard input
+          ipcRenderer.send('terminal:input', effectiveId, content);
+          // 2. File contents — pasted via bracketed paste (shows as [Pasted text #N] in Claude TUI)
+          if (filePaths && filePaths.length > 0) {
+            (async () => {
+              const filesResult = await ipcRenderer.invoke('ai-prompts:read-files', filePaths);
+              if (filesResult.success) {
+                for (const f of filesResult.data) {
+                  await ipcRenderer.invoke('terminal:paste', { tabId: effectiveId, content: f.content, submit: false });
+                }
+              }
+            })();
+          }
         }
       } else if (cmd === 'add-to-favorites-from-terminal') {
         const { tabId: favTabId, projectId: favProjectId } = data || {};
