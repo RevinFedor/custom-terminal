@@ -1,6 +1,6 @@
 import React, { useEffect, useLayoutEffect, useState, useCallback, useRef, useMemo } from 'react';
 import { createPortal } from 'react-dom';
-import { Maximize2, Copy, Minimize2, Pencil, Trash2, StickyNote, ChevronDown, Check, Scissors, X, Zap } from 'lucide-react';
+import { Maximize2, Copy, Minimize2, Pencil, Search, Trash2, StickyNote, ChevronDown, Check, Scissors, X, Zap } from 'lucide-react';
 import { terminalRegistry } from '../../utils/terminalRegistry';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
@@ -49,7 +49,7 @@ const StatusLabelPortal: React.FC<{
 
 interface TimelineEntry {
   uuid: string;
-  type: 'user' | 'compact' | 'continued' | 'docs_edit';
+  type: 'user' | 'compact' | 'continued' | 'docs_edit' | 'docs_search';
   timestamp: string;
   content: string;
   isCompactSummary?: boolean;
@@ -62,6 +62,7 @@ interface TimelineEntry {
   subAgentName?: string;
   subAgentTaskId?: string;
   docsEdited?: string[];
+  docsSearchQueries?: string[];
   responseTokens?: number;
 }
 
@@ -771,10 +772,10 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     const boundaryCount = terminalRegistry.getPromptBoundaryCount(tabId);
     if (boundaryCount === 0) return;
 
-    // User-type entries only (skip compact, continued, docs_edit)
+    // User-type entries only (skip compact, continued, docs_edit, docs_search)
     let promptSeq = 0;
     for (const entry of entries) {
-      if (entry.type === 'compact' || entry.type === 'continued' || entry.type === 'docs_edit') continue;
+      if (entry.type === 'compact' || entry.type === 'continued' || entry.type === 'docs_edit' || entry.type === 'docs_search') continue;
       // Try to bind this entry to the next available prompt boundary
       // Boundary 0 = prompt after first response → where second message was typed
       // For entry 0 (first message), there's no boundary (it was typed at the initial prompt)
@@ -844,7 +845,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         const searchData: { searchLines: string[]; entryIndex: number }[] = [];
         entries.forEach((entry, index) => {
           if (index <= lastBoundaryIdx) return;
-          if (entry.type === 'compact' || entry.type === 'continued' || entry.type === 'docs_edit') return;
+          if (entry.type === 'compact' || entry.type === 'continued' || entry.type === 'docs_edit' || entry.type === 'docs_search') return;
           const lines = getSearchLines(entry.content);
           if (lines.length > 0) {
             searchData.push({ searchLines: lines, entryIndex: index });
@@ -873,11 +874,11 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         // We map from the END so that the newest entries match the newest boundaries.
         const boundaryLines = terminalRegistry.getPromptBoundaryLines(tabId);
 
-        // Collect indices of "real" entries (non-compact, non-continued, non-docs_edit) after lastBoundaryIdx
+        // Collect indices of "real" entries (non-compact, non-continued, non-docs_edit, non-docs_search) after lastBoundaryIdx
         const realIndices: number[] = [];
         entries.forEach((entry, index) => {
           if (index <= lastBoundaryIdx) return;
-          if (entry.type === 'compact' || entry.type === 'continued' || entry.type === 'docs_edit') return;
+          if (entry.type === 'compact' || entry.type === 'continued' || entry.type === 'docs_edit' || entry.type === 'docs_search') return;
           realIndices.push(index);
         });
 
@@ -973,7 +974,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       const newUnreachable = new Set<number>();
 
       entries.forEach((entry, index) => {
-        if (entry.type === 'compact' || entry.type === 'continued' || entry.type === 'docs_edit' || entry.isPlan) return;
+        if (entry.type === 'compact' || entry.type === 'continued' || entry.type === 'docs_edit' || entry.type === 'docs_search' || entry.isPlan) return;
         if (index <= lastBoundaryIdx) {
           newUnreachable.add(index);
           return;
@@ -983,16 +984,16 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         }
       });
 
-      // Inherit unreachable for compact/continued/plan/docs_edit entries from next regular entry
+      // Inherit unreachable for compact/continued/plan/docs_edit/docs_search entries from next regular entry
       entries.forEach((entry, index) => {
-        if (entry.type !== 'compact' && entry.type !== 'continued' && entry.type !== 'docs_edit' && !entry.isPlan) return;
+        if (entry.type !== 'compact' && entry.type !== 'continued' && entry.type !== 'docs_edit' && entry.type !== 'docs_search' && !entry.isPlan) return;
         if (index <= lastBoundaryIdx) {
           newUnreachable.add(index);
           return;
         }
         for (let j = index + 1; j < entries.length; j++) {
           const next = entries[j];
-          if (next.type === 'compact' || next.type === 'continued' || next.type === 'docs_edit' || next.isPlan) continue;
+          if (next.type === 'compact' || next.type === 'continued' || next.type === 'docs_edit' || next.type === 'docs_search' || next.isPlan) continue;
           if (newUnreachable.has(j)) newUnreachable.add(index);
           break;
         }
@@ -1195,8 +1196,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     // Old history entries are not in terminal buffer — ignore click
     if (clickIsOldHistory) return;
 
-    // Compact/continued/docs_edit entries have no terminal position — skip terminal scroll
-    if (entry.type === 'compact' || entry.type === 'continued' || entry.type === 'docs_edit') return;
+    // Compact/continued/docs_edit/docs_search entries have no terminal position — skip terminal scroll
+    if (entry.type === 'compact' || entry.type === 'continued' || entry.type === 'docs_edit' || entry.type === 'docs_search') return;
 
     // SDK tabs: no xterm buffer — dispatch event for React chat scroll
     const sdkTab = (() => { const s = useWorkspaceStore.getState(); for (const [,ws] of s.openProjects) { const t = ws.tabs.get(tabId); if (t) return t.tabType === 'claude-sdk'; } return false; })();
@@ -2094,6 +2095,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
             const isContinued = entry.type === 'continued';
             const isPlan = !!entry.isPlan;
             const isDocsEdit = entry.type === 'docs_edit';
+            const isDocsSearch = entry.type === 'docs_search';
             const dotClickState = clickedState?.index === index ? clickedState.status : null;
 
             // Entry type flags
@@ -2120,6 +2122,9 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
             } else if (isDocsEdit) {
               dotColor = isHovered ? '#4ade80' : (isPromptVisible ? '#3cc46e' : '#2a8a4e');
               dotGlow = isHovered ? '0 0 10px rgba(74, 222, 128, 0.5)' : (isPromptVisible ? '0 0 6px rgba(74, 222, 128, 0.2)' : 'none');
+            } else if (isDocsSearch) {
+              dotColor = isHovered ? '#bef264' : (isPromptVisible ? '#8cb82a' : '#6a8f1e');
+              dotGlow = isHovered ? '0 0 10px rgba(190, 242, 100, 0.5)' : (isPromptVisible ? '0 0 6px rgba(190, 242, 100, 0.2)' : 'none');
             } else if (isPlan) {
               dotColor = isHovered ? '#5eada3' : '#3d7a72';
               dotGlow = isHovered ? '0 0 10px rgba(94, 173, 163, 0.5)' : 'none';
@@ -2276,7 +2281,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                     backgroundColor: active
                       ? 'rgba(59, 130, 246, 0.15)'
                       : (isOldHistory && !isGroupMeta && !isCompacted ? 'rgba(239, 68, 68, 0.06)' : 'transparent'),
-                    cursor: (isContinued || isDocsEdit || isOldHistory) ? 'default' : 'pointer',
+                    cursor: (isContinued || isDocsEdit || isDocsSearch || isOldHistory) ? 'default' : 'pointer',
                   }}
                 >
                   {/* Tree mode: vertical connector lines */}
@@ -2335,7 +2340,9 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                             ? 'rgba(129, 140, 248, 0.5)'
                             : isDocsEdit
                               ? 'rgba(74, 222, 128, 0.5)'
-                              : 'rgba(255, 255, 255, 0.4)',
+                              : isDocsSearch
+                                ? 'rgba(190, 242, 100, 0.5)'
+                                : 'rgba(255, 255, 255, 0.4)',
                       }}
                     >
                       {isGroupCollapsed
@@ -2346,7 +2353,9 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                             ? (entry.subAgentName || 'Claude')
                             : isDocsEdit
                               ? truncateText(entry.content, 60)
-                              : isCompacted
+                              : isDocsSearch
+                                ? truncateText(entry.content, 60)
+                                : isCompacted
                                 ? 'compact'
                                 : truncateText(entry.content, 60)
                       }
@@ -2972,6 +2981,22 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                         <div key={i} className="flex items-center gap-1.5 py-0.5">
                           <Pencil size={10} className="shrink-0" style={{ color: 'rgba(74, 222, 128, 0.5)' }} />
                           <span>{f}</span>
+                        </div>
+                      ))}
+                    </div>
+                    <span className="text-[10px] text-white/30">{new Date(currentActiveEntry.timestamp).toLocaleTimeString()}</span>
+                  </>
+                ) : currentActiveEntry.type === 'docs_search' ? (
+                  <>
+                    <div className="flex items-center gap-2">
+                      <div style={{ width: '6px', height: '6px', borderRadius: '50%', backgroundColor: '#bef264', flexShrink: 0 }} />
+                      <span style={{ color: '#bef264' }} className="font-medium text-[11px]">Docs Search</span>
+                    </div>
+                    <div className="text-white/70 leading-snug font-mono text-[11px]" style={{ whiteSpace: 'pre-wrap' }}>
+                      {(currentActiveEntry.docsSearchQueries || [currentActiveEntry.content]).map((q: string, i: number) => (
+                        <div key={i} className="flex items-center gap-1.5 py-0.5">
+                          <Search size={10} className="shrink-0" style={{ color: 'rgba(190, 242, 100, 0.5)' }} />
+                          <span>{q}</span>
                         </div>
                       ))}
                     </div>

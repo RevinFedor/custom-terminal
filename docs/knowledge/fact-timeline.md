@@ -35,6 +35,9 @@
     - **Logic:** Система сканирует записи `assistant` в JSONL на наличие вызовов инструментов `Edit`/`Write` для файлов в `docs/` или `CLAUDE.md`.
     - **Grouping:** Несколько правок из одного ответа ассистента группируются в одну зелёную точку.
     - **Visual:** Зелёный цвет (`#4ade80`). Не имеют позиции в терминале (как компакт-записи).
+- **Docs Search (Лаймовые точки):** Маркеры вызовов MCP `docs_search` (`mcp__knowledge__docs_search`).
+    - **Logic:** Детекция `tool_use` блоков с именем `mcp__knowledge__docs_search`. Consecutive вызовы мержатся.
+    - **Visual:** Лайм (`#bef264`), отличается от зелёного docs_edit. Тултип — search queries с иконкой лупы.
 - **Note-on-Dot Integration:** При выборе позиции заметки «на самой точке» (`position: 'dot'`) визуальная полоска-индикатор скрывается.
     - **Consolidation:** Содержимое заметки встраивается инлайном в верхнюю часть основного тултипа промпта (фиолетовый блок с иконкой `StickyNote`). Это устраняет необходимость в отдельном Cmd-ховере для просмотра заметки.
 - **Edit-Range Persistence on Tab Switch:** При смене `sessionId` editRangeState (ready/done/loading) сохраняется в module-level Map (`_savedEditRangeMap`), остальные overlay-состояния (rewind, copying, tooltip, contextMenu, unreachableIndices) сбрасываются. Module-level Map (не useRef) — переживает unmount компонента при смене проекта или showTimeline=null.
