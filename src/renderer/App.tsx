@@ -795,6 +795,37 @@ function App() {
       });
     };
 
+    // Terminal MCP: restart a terminal (re-create PTY with same tabId)
+    const handleMcpRestart = (_: any, data: { tabId: string; cwd: string; initialCommand?: string }) => {
+      console.warn('[MCP:Terminal] Restarting PTY for tab:', data.tabId, 'cmd:', data.initialCommand || '(shell)');
+      ipcRenderer.invoke('terminal:create', {
+        tabId: data.tabId,
+        cwd: data.cwd,
+        rows: 24,
+        cols: 80,
+        initialCommand: data.initialCommand || undefined,
+      });
+    };
+
+    // Terminal MCP: create a new tab with optional command
+    const handleMcpCreate = async (_: any, data: { name?: string; cwd: string; command?: string; color?: string }) => {
+      console.warn('[MCP:Terminal] Creating new tab:', data.name || 'auto', 'cwd:', data.cwd);
+      const state = useWorkspaceStore.getState();
+      const { activeProjectId } = state;
+      if (!activeProjectId) return;
+
+      const pendingAction = data.command ? { type: 'shell-command' as const, command: data.command } : undefined;
+      await state.createTab(activeProjectId, data.name, data.cwd, {
+        commandType: data.command ? 'devServer' : undefined,
+        color: (data.color || (data.command ? 'green' : undefined)) as any,
+        pendingAction,
+        nameSetManually: !!data.name,
+      } as any);
+    };
+
+    ipcRenderer.on('terminal:mcp-restart', handleMcpRestart);
+    ipcRenderer.on('terminal:mcp-create', handleMcpCreate);
+
     ipcRenderer.on('terminal:command-started', handleCommandStarted);
     ipcRenderer.on('terminal:command-finished', handleCommandFinished);
     ipcRenderer.on('mcp:create-sub-agent-tab', handleMcpCreateSubAgent);
@@ -815,6 +846,8 @@ function App() {
     ipcRenderer.on('gemini:busy-state', handleGeminiBusy);
 
     return () => {
+      ipcRenderer.removeListener('terminal:mcp-restart', handleMcpRestart);
+      ipcRenderer.removeListener('terminal:mcp-create', handleMcpCreate);
       ipcRenderer.removeListener('terminal:command-started', handleCommandStarted);
       ipcRenderer.removeListener('terminal:command-finished', handleCommandFinished);
       ipcRenderer.removeListener('mcp:create-sub-agent-tab', handleMcpCreateSubAgent);

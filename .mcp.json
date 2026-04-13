@@ -4,6 +4,11 @@
       "type": "stdio",
       "command": "node",
       "args": [".claude/mcp/knowledge-server.mjs"]
+    },
+    "terminal": {
+      "type": "stdio",
+      "command": "node",
+      "args": [".claude/mcp/terminal-server.mjs"]
     }
   }
 }

@@ -1,5 +1,5 @@
 {
-  "enabledMcpjsonServers": ["knowledge"],
+  "enabledMcpjsonServers": ["knowledge", "terminal"],
   "hooks": {
     "UserPromptSubmit": [
       {
