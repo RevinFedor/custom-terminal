@@ -49,3 +49,6 @@ prebuilds/
 
 # Test sandbox
 auto/sandbox/
+
+# Video analysis scripts (contain API keys)
+scripts/video/
