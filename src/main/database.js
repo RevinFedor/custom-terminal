@@ -1008,41 +1008,11 @@ class DatabaseManager {
       `).run(sourceSessionId, forkedToSessionId, entryUuidsJson);
       console.log('[DB] Fork marker saved:', { sourceSessionId, forkedToSessionId, entryCount: entryUuids?.length || 0 });
 
-      // Invalidate cache for both sides so Timeline picks up the new marker.
-      this.invalidateForkMarkerCache(sourceSessionId);
-      this.invalidateForkMarkerCache(forkedToSessionId);
+      // Debug: dump all fork_markers in DB
+      const allMarkers = this.db.prepare('SELECT source_session_id, forked_to_session_id FROM fork_markers').all();
+      console.log('[DB] ALL fork_markers after save:', JSON.stringify(allMarkers));
     } catch (e) {
       console.error('[DB] Failed to save fork marker:', e);
-    }
-  }
-
-  /**
-   * In-memory cache for getForkMarkers. Fork markers change infrequently (only when
-   * the user forks a session or hides a marker), so Timeline's 2s poll was doing
-   * ~137K redundant SQLite reads per day (see 2026-04-19 audit).
-   *
-   * Cache shape: Map<sessionId, { markers, ts }>. TTL is effectively infinite;
-   * entries are invalidated explicitly by saveForkMarker / hideForkMarker / etc.
-   * Regression signal: if [DB] getForkMarkers MISS fires > once per real fork
-   * operation for the same session, cache invalidation is wrong.
-   */
-  _forkMarkerCache = new Map();
-  _forkMarkerCacheStats = { hit: 0, miss: 0, invalidate: 0 };
-
-  invalidateForkMarkerCache(sessionId) {
-    if (!sessionId) return;
-    if (this._forkMarkerCache.has(sessionId)) {
-      this._forkMarkerCache.delete(sessionId);
-      this._forkMarkerCacheStats.invalidate++;
-      console.log('[DB:ForkCache] INVALIDATE ' + sessionId.slice(0, 8));
-    }
-    // Also invalidate any cached entry whose rows reference this session as the
-    // opposite endpoint (both source and destination look up the same marker).
-    for (const [key, val] of this._forkMarkerCache) {
-      if (val.markers.some(m => m.source_session_id === sessionId || m.fork_session_id === sessionId)) {
-        this._forkMarkerCache.delete(key);
-        this._forkMarkerCacheStats.invalidate++;
-      }
     }
   }
 
@@ -1052,21 +1022,6 @@ class DatabaseManager {
    * @returns {Array<{source_session_id: string, entry_uuids: string[]}>}
    */
   getForkMarkers(sessionId) {
-    if (!sessionId) return [];
-
-    const cached = this._forkMarkerCache.get(sessionId);
-    if (cached) {
-      this._forkMarkerCacheStats.hit++;
-      // Log every 1000 hits to keep file size sane but still prove cache works.
-      if (this._forkMarkerCacheStats.hit % 1000 === 0) {
-        console.log('[DB:ForkCache] stats hit=' + this._forkMarkerCacheStats.hit +
-                    ' miss=' + this._forkMarkerCacheStats.miss +
-                    ' invalidate=' + this._forkMarkerCacheStats.invalidate +
-                    ' size=' + this._forkMarkerCache.size);
-      }
-      return cached.markers;
-    }
-
     // Search by both source and destination to show markers in both sessions
     const rows = this.db.prepare(`
       SELECT source_session_id, forked_to_session_id, entry_uuids_json, created_at, hidden
@@ -1075,19 +1030,15 @@ class DatabaseManager {
       ORDER BY created_at
     `).all(sessionId, sessionId);
 
-    this._forkMarkerCacheStats.miss++;
-    console.log('[DB] getForkMarkers(' + sessionId?.slice(0, 8) + '...):', rows.length, 'rows [MISS]');
+    console.log('[DB] getForkMarkers(' + sessionId?.slice(0, 8) + '...):', rows.length, 'rows');
 
-    const markers = rows.map(row => ({
+    return rows.map(row => ({
       source_session_id: row.source_session_id,
       fork_session_id: row.forked_to_session_id,
       entry_uuids: JSON.parse(row.entry_uuids_json || '[]'),
       created_at: row.created_at,
       hidden: !!row.hidden
     }));
-
-    this._forkMarkerCache.set(sessionId, { markers, ts: Date.now() });
-    return markers;
   }
 
   /**

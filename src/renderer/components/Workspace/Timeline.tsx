@@ -729,49 +729,12 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     }
   }, [sessionId, entries.length]);
 
-  // Refresh timeline periodically (only when visible AND window is foregrounded).
-  // PERF: pausing on document.visibilityState=hidden stops needless IPC round-trips
-  // (SessionChain, getForkMarkers, incremental JSONL reads) while the app is in
-  // the background. Each visible Timeline runs its own 2s timer.
-  // Regression signal: [Timeline:PollPaused]/[Timeline:PollResumed] in the log
-  // should match window focus/blur transitions 1:1.
+  // Refresh timeline periodically (only when visible)
   useEffect(() => {
     if (!sessionId || !isVisible) return;
-
-    let interval: ReturnType<typeof setInterval> | null = null;
-    const start = () => {
-      if (interval) return;
-      interval = setInterval(loadTimeline, 2000);
-    };
-    const stop = (reason: string) => {
-      if (!interval) return;
-      clearInterval(interval);
-      interval = null;
-      console.warn(`[Timeline:PollPaused] sessionId=${sessionId.substring(0,8)} reason=${reason}`);
-    };
-
-    if (document.visibilityState === 'visible') {
-      start();
-    } else {
-      console.warn(`[Timeline:PollPaused] sessionId=${sessionId.substring(0,8)} reason=hidden-on-mount`);
-    }
-
-    const onVis = () => {
-      if (document.visibilityState === 'visible') {
-        console.warn(`[Timeline:PollResumed] sessionId=${sessionId.substring(0,8)}`);
-        // Run once immediately so user sees fresh data without waiting 2s
-        loadTimeline();
-        start();
-      } else {
-        stop('visibility-hidden');
-      }
-    };
-    document.addEventListener('visibilitychange', onVis);
-
-    return () => {
-      document.removeEventListener('visibilitychange', onVis);
-      if (interval) clearInterval(interval);
-    };
+    // Refresh every 2 seconds to catch Escape/Undo changes quickly
+    const interval = setInterval(loadTimeline, 2000);
+    return () => clearInterval(interval);
   }, [sessionId, loadTimeline, isVisible]);
 
   // Listen for manual refresh requests from InfoPanel

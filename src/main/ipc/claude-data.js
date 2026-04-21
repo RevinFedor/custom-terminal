@@ -2324,9 +2324,6 @@ function register({ projectManager, formatToolAction }) {
       const db = projectManager.db;
       db.db.prepare('UPDATE fork_markers SET hidden = 1 WHERE source_session_id = ? AND forked_to_session_id = ?')
         .run(sourceSessionId, forkSessionId);
-      // Invalidate cache so Timeline sees the hidden flag without waiting for restart.
-      db.invalidateForkMarkerCache(sourceSessionId);
-      db.invalidateForkMarkerCache(forkSessionId);
       console.log('[ForkMarker] Hidden:', sourceSessionId?.slice(0, 8), '→', forkSessionId?.slice(0, 8));
       return { success: true };
     } catch (error) {
