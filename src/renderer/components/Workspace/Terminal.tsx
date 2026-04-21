@@ -279,39 +279,13 @@ const ESU = '\x1b[?2026l';
 interface TerminalProps {
   tabId: string;
   cwd: string;
-  // PERF: active/isActiveProject are now derived from the store by default, so TerminalArea's
-  // useMemo no longer needs activeTabId in its fingerprint. Pass these props explicitly only
-  // when the caller owns the flag (e.g., BrowserTab wraps Terminal with a forced state).
-  // See docs/knowledge/fix-performance-lags.md (Zustand Map Reference Trap).
-  active?: boolean;
+  active: boolean;
   isActiveProject?: boolean; // For lazy init optimization
   onLinkClick?: (url: string) => void; // Override link handler (used by BrowserTab)
 }
 
-function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActiveProjectProp, onLinkClick }: TerminalProps) {
-  // PERF: when props are not provided, subscribe to the store directly with targeted
-  // primitive selectors. Each terminal re-renders only when ITS active state flips —
-  // not when any other tab/project changes state.
-  // Regression canary: [TerminalArea:useMemo] RECALCULATING should fire only on
-  // tab add/remove/type-change, not on every project switch.
-  const activeFromStore = useWorkspaceStore((state) => {
-    for (const [, workspace] of state.openProjects) {
-      if (workspace.tabs.has(tabId)) {
-        return workspace.activeTabId === tabId;
-      }
-    }
-    return false;
-  });
-  const isActiveProjectFromStore = useWorkspaceStore((state) => {
-    for (const [projId, workspace] of state.openProjects) {
-      if (workspace.tabs.has(tabId)) {
-        return state.activeProjectId === projId;
-      }
-    }
-    return false;
-  });
-  const active = activeProp !== undefined ? activeProp : activeFromStore;
-  const isActiveProject = isActiveProjectProp !== undefined ? isActiveProjectProp : isActiveProjectFromStore;
+function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: TerminalProps) {
+  // Removed: excessive render log
 
   const terminalRef = useRef<HTMLDivElement>(null);
   const xtermInstance = useRef<XTerminal | null>(null);
