@@ -6,8 +6,9 @@ import Terminal from './Terminal';
 interface BrowserTabProps {
   tabId: string;
   url: string;
-  active: boolean;
-  isActiveProject: boolean;
+  // PERF: active/isActiveProject derived from the store by default; see Terminal.tsx.
+  active?: boolean;
+  isActiveProject?: boolean;
   terminalId?: string;
   terminalName?: string;
   activeView?: 'browser' | 'terminal';
@@ -16,7 +17,21 @@ interface BrowserTabProps {
 
 const { ipcRenderer } = window.require('electron');
 
-function BrowserTab({ tabId, url, active, isActiveProject, terminalId, terminalName, activeView = 'browser', cwd }: BrowserTabProps) {
+function BrowserTab({ tabId, url, active: activeProp, isActiveProject: isActiveProjectProp, terminalId, terminalName, activeView = 'browser', cwd }: BrowserTabProps) {
+  const activeFromStore = useWorkspaceStore((state) => {
+    for (const [, ws] of state.openProjects) {
+      if (ws.tabs.has(tabId)) return ws.activeTabId === tabId;
+    }
+    return false;
+  });
+  const isActiveProjectFromStore = useWorkspaceStore((state) => {
+    for (const [projId, ws] of state.openProjects) {
+      if (ws.tabs.has(tabId)) return state.activeProjectId === projId;
+    }
+    return false;
+  });
+  const active = activeProp !== undefined ? activeProp : activeFromStore;
+  const isActiveProject = isActiveProjectProp !== undefined ? isActiveProjectProp : isActiveProjectFromStore;
   const webviewRef = useRef<any>(null);
   const initialUrl = url || 'http://localhost:3000';
   const [addressValue, setAddressValue] = useState(initialUrl);

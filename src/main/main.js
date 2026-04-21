@@ -4271,14 +4271,20 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
         var hasContentSpinner = CONTENT_SPINNER_RE.test(contentStripped);
 
         if (hasContentSpinner) {
-          // Diagnostic: log what triggered spinner when BoundarySM is already idle
-          var _bsmState = promptBoundaryState.get(tabId) || 'idle';
-          if (_bsmState === 'idle') {
-            var _match = contentStripped.match(/[\u2722\u2733\u2736\u273B\u273D]/);
-            if (_match) {
-              var _idx = contentStripped.indexOf(_match[0]);
-              var _ctx = contentStripped.slice(Math.max(0, _idx - 25), _idx + 26).replace(/\n/g, '\\n');
-              console.log('[Spinner:DIAG] Tab ' + tabId.slice(-8) + ' BoundarySM=idle but spinner char U+' + _match[0].charCodeAt(0).toString(16).toUpperCase() + ' at pos ' + _idx + '/' + contentStripped.length + ' ctx="' + _ctx + '"');
+          // Diagnostic: log what triggered spinner when BoundarySM is already idle.
+          // PERF: hot path — this log fires hundreds of times per second per active Claude
+          // TUI. It was responsible for ~142K log lines per session (see tab-switch
+          // performance audit 2026-04-19). Dev-only; enable in prod via DEBUG_SPINNER=1
+          // when investigating busy-detection regressions.
+          if (isDev || process.env.DEBUG_SPINNER === '1') {
+            var _bsmState = promptBoundaryState.get(tabId) || 'idle';
+            if (_bsmState === 'idle') {
+              var _match = contentStripped.match(/[\u2722\u2733\u2736\u273B\u273D]/);
+              if (_match) {
+                var _idx = contentStripped.indexOf(_match[0]);
+                var _ctx = contentStripped.slice(Math.max(0, _idx - 25), _idx + 26).replace(/\n/g, '\\n');
+                console.log('[Spinner:DIAG] Tab ' + tabId.slice(-8) + ' BoundarySM=idle but spinner char U+' + _match[0].charCodeAt(0).toString(16).toUpperCase() + ' at pos ' + _idx + '/' + contentStripped.length + ' ctx="' + _ctx + '"');
+              }
             }
           }
           // Spinner in content → BUSY, restart idle countdown.
