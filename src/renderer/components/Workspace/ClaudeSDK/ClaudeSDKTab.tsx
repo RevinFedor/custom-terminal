@@ -92,15 +92,33 @@ const TOOL_ICON: Record<string, React.ReactNode> = {
 // ============================================================
 interface ClaudeSDKTabProps {
   tabId: string;
-  active: boolean;
-  isActiveProject: boolean;
+  // PERF (2026-04-21): active/isActiveProject derived from the store by default.
+  // See Terminal.tsx for the correctness note.
+  active?: boolean;
+  isActiveProject?: boolean;
   cwd: string;
 }
 
 // ============================================================
 // Main component
 // ============================================================
-function ClaudeSDKTab({ tabId, active, isActiveProject, cwd }: ClaudeSDKTabProps) {
+function ClaudeSDKTab({ tabId, active: activeProp, isActiveProject: isActiveProjectProp, cwd }: ClaudeSDKTabProps) {
+  const activeFromStore = useWorkspaceStore((state) => {
+    for (const [projId, ws] of state.openProjects) {
+      if (ws.tabs.has(tabId)) {
+        return state.activeProjectId === projId && ws.activeTabId === tabId;
+      }
+    }
+    return false;
+  });
+  const isActiveProjectFromStore = useWorkspaceStore((state) => {
+    for (const [projId, ws] of state.openProjects) {
+      if (ws.tabs.has(tabId)) return state.activeProjectId === projId;
+    }
+    return false;
+  });
+  const active = activeProp !== undefined ? activeProp : activeFromStore;
+  const isActiveProject = isActiveProjectProp !== undefined ? isActiveProjectProp : isActiveProjectFromStore;
   const [messages, setMessages] = useState<SDKChatMessage[]>([]);
   const [isRunning, setIsRunning] = useState(false);
   const [sessionId, setSessionId] = useState<string | null>(null);

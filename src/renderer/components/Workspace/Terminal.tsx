@@ -274,18 +274,80 @@ const MAX_BUFFER_SIZE = 65536; // 64KB safety valve
 const BSU = '\x1b[?2026h';
 const ESU = '\x1b[?2026l';
 
-
+// ============================================================================
+// DIAG (2026-04-21): visible-set invariant tracking.
+//
+// Invariant: at most 1 Terminal should have effectiveActive=true at any time.
+// When multiple claim effectiveActive=true, their outer divs all get zIndex:1
+// and the first-mounted in DOM wins — user sees a "frozen" terminal even
+// though input routes correctly. This Set + rAF-debounced log catches the
+// violation loudly.
+//
+// Filter in prod log: `grep [Terminal:VisibleSetInvariant]`.
+// Expected baseline: each transition → exactly one line with count=1 (or 0
+// briefly during project switch mid-transition).
+// Regression: count>=2 sustained for >1 rAF tick.
+// ============================================================================
+const _visibleTerminals = new Set<string>();
+let _invariantCheckQueued = false;
+function _scheduleInvariantCheck() {
+  if (_invariantCheckQueued) return;
+  _invariantCheckQueued = true;
+  requestAnimationFrame(() => {
+    _invariantCheckQueued = false;
+    const n = _visibleTerminals.size;
+    if (n === 1) {
+      // happy path — don't log to avoid noise
+      return;
+    }
+    const list = Array.from(_visibleTerminals).map(id => id.slice(-12)).join(',');
+    console.warn(`[Terminal:VisibleSetInvariant] count=${n} tabs=[${list}] ` +
+      (n === 0 ? '(all hidden — expected briefly during project switch)' : '(VIOLATION — z-index fight, user sees wrong terminal)'));
+  });
+}
 
 interface TerminalProps {
   tabId: string;
   cwd: string;
-  active: boolean;
+  // PERF (2026-04-21): active/isActiveProject derived from the store by default.
+  // TerminalArea.useMemo no longer passes them, so it doesn't need activeTabId in
+  // its fingerprint → cross-project switches don't rebuild the element list.
+  // Callers that OWN the flag (e.g. BrowserTab wrapping embedded Terminal) still
+  // pass explicit values.
+  //
+  // CORRECTNESS NOTE: both selectors must agree on "what is the active project".
+  // An earlier version of this code (reverted 2026-04-21) checked only
+  // `workspace.activeTabId === tabId`, which made every open project's last-used
+  // tab claim active=true simultaneously. All of them then got zIndex:1 +
+  // visibility:visible, and the first-mounted terminal "froze" on top. The fix
+  // is the activeProjectId check inside activeFromStore.
+  active?: boolean;
   isActiveProject?: boolean; // For lazy init optimization
   onLinkClick?: (url: string) => void; // Override link handler (used by BrowserTab)
 }
 
-function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: TerminalProps) {
-  // Removed: excessive render log
+function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActiveProjectProp, onLinkClick }: TerminalProps) {
+  // PERF: subscribe to store directly when props are not provided.
+  // Each terminal re-renders only when ITS active state flips.
+  // MUST check activeProjectId to avoid the "frozen initial terminal" regression.
+  const activeFromStore = useWorkspaceStore((state) => {
+    for (const [projId, workspace] of state.openProjects) {
+      if (workspace.tabs.has(tabId)) {
+        return state.activeProjectId === projId && workspace.activeTabId === tabId;
+      }
+    }
+    return false;
+  });
+  const isActiveProjectFromStore = useWorkspaceStore((state) => {
+    for (const [projId, workspace] of state.openProjects) {
+      if (workspace.tabs.has(tabId)) {
+        return state.activeProjectId === projId;
+      }
+    }
+    return false;
+  });
+  const active = activeProp !== undefined ? activeProp : activeFromStore;
+  const isActiveProject = isActiveProjectProp !== undefined ? isActiveProjectProp : isActiveProjectFromStore;
 
   const terminalRef = useRef<HTMLDivElement>(null);
   const xtermInstance = useRef<XTerminal | null>(null);
@@ -335,10 +397,37 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
   // This prevents focus/fit/repaint when terminals are hidden behind Dashboard or ProjectHome
   const effectiveActive = active && projectCurrentView === 'terminal' && workspaceView === 'workspace';
 
+  // DIAG (2026-04-21): log state transitions per-terminal so regressions like
+  // "multiple active at once" or "stuck hidden" are trivially greppable.
+  // Rate-limited by ref diff — one line per real transition, not per render.
+  // Filter: `grep [Terminal:StateTransition]` in prod log.
+  const lastStateSnapshotRef = useRef<string>('');
+  const snap = `active=${active} isActiveProject=${isActiveProject} effectiveActive=${effectiveActive} pcv=${projectCurrentView} wv=${workspaceView}`;
+  if (snap !== lastStateSnapshotRef.current) {
+    const prev = lastStateSnapshotRef.current || '(initial)';
+    lastStateSnapshotRef.current = snap;
+    console.warn(`[Terminal:StateTransition] tabId=${tabId.slice(-12)} PREV={${prev}} NEW={${snap}}`);
+  }
+
   // Keep activeRef in sync for ResizeObserver closure
   useEffect(() => {
     activeRef.current = effectiveActive;
   }, [effectiveActive]);
+
+  // DIAG: maintain the visible-set for the invariant checker.
+  useEffect(() => {
+    if (effectiveActive) {
+      _visibleTerminals.add(tabId);
+    } else {
+      _visibleTerminals.delete(tabId);
+    }
+    _scheduleInvariantCheck();
+    return () => {
+      // Unmount: ensure we don't leak a phantom entry.
+      _visibleTerminals.delete(tabId);
+      _scheduleInvariantCheck();
+    };
+  }, [effectiveActive, tabId]);
 
   // Check if terminal is scrolled up (not at bottom)
   // ALL callers go through rAF debounce — never call this synchronously during term.write()

@@ -769,6 +769,26 @@ function register({ projectManager, formatToolAction }) {
         console.warn('[Claude Fork] Could not save fork marker:', e.message);
       }
 
+      // Carry timeline notes (purple stickers) and rewind markers (pink dots) over to
+      // the fork. They're keyed on (entry_uuid, session_id) — fork rewrote sessionIds
+      // so without an explicit copy they wouldn't show up on the new tab's Timeline.
+      try {
+        const allUuids = [];
+        for (const line of rewritten) {
+          if (!line.trim()) continue;
+          try {
+            const r = JSON.parse(line);
+            if (r.uuid) allUuids.push(r.uuid);
+          } catch {}
+        }
+        const copied = projectManager.db.copyTimelineMetadataForFork(newSessionId, allUuids, null);
+        if (copied.notes > 0 || copied.rewindMarkers > 0) {
+          console.log('[Claude Fork] Copied timeline metadata: notes=' + copied.notes + ' rewindMarkers=' + copied.rewindMarkers);
+        }
+      } catch (e) {
+        console.warn('[Claude Fork] Could not copy timeline metadata:', e.message);
+      }
+
       // Wait for Claude to index the new file
       await new Promise(resolve => setTimeout(resolve, 500));
 
@@ -1107,6 +1127,304 @@ function register({ projectManager, formatToolAction }) {
     }
   });
 
+  // Delete range: remove entries from JSONL WITHOUT inserting a compact replacement.
+  // Used by Timeline "Удалить историю" button. If the resulting file is empty (or only
+  // non-uuid entries remain), the file is deleted entirely and session_links is cleaned
+  // so resolveSessionChain doesn't re-attach a parent session.
+  ipcMain.handle('claude:delete-range', async (event, { sessionId, cwd, startUuid, endUuid }) => {
+    console.log('[DeleteRange] ========================================');
+    console.log('[DeleteRange] Session:', sessionId, 'Range:', startUuid?.slice(0, 8), '→', endUuid?.slice(0, 8));
+
+    try {
+      const found = findSessionFile(sessionId, cwd);
+      if (!found) return { success: false, error: 'Session file not found' };
+
+      const filePath = found.filePath;
+      const content = await fs.promises.readFile(filePath, 'utf-8');
+      const lines = content.split('\n').filter(l => l.trim());
+
+      const allRecords = [];
+      const recordMap = new Map();
+      for (const line of lines) {
+        try {
+          const entry = JSON.parse(line);
+          allRecords.push(entry);
+          if (entry.uuid) recordMap.set(entry.uuid, entry);
+        } catch { allRecords.push(null); }
+      }
+
+      const lastRecord = allRecords.filter(r => r?.uuid).pop();
+      if (!lastRecord) return { success: false, error: 'No records in file' };
+
+      const fileIndexMap = new Map();
+      allRecords.forEach((r, i) => { if (r?.uuid) fileIndexMap.set(r.uuid, i); });
+
+      // Build active branch via backtrace
+      const activeBranch = [];
+      let cur = lastRecord.uuid;
+      const seen = new Set();
+      while (cur && !seen.has(cur)) {
+        seen.add(cur);
+        const rec = recordMap.get(cur);
+        if (!rec) {
+          if (activeBranch.length > 0) {
+            const lastAddedIdx = fileIndexMap.get(activeBranch[0].uuid) || 0;
+            let bestIdx = -1, bestUuid = null;
+            for (const [uuid, idx] of fileIndexMap) {
+              if (!seen.has(uuid) && idx < lastAddedIdx && idx > bestIdx) {
+                bestIdx = idx; bestUuid = uuid;
+              }
+            }
+            if (bestUuid) {
+              console.log('[DeleteRange:Backtrace] CHAIN BREAK recovery: ' + cur?.slice(0, 8) + ' missing, jumping to ' + bestUuid?.slice(0, 8));
+              cur = bestUuid;
+              continue;
+            }
+          }
+          break;
+        }
+        activeBranch.unshift(rec);
+        cur = rec.logicalParentUuid || rec.parentUuid;
+      }
+
+      const startIdx = activeBranch.findIndex(e => e.uuid === startUuid);
+      const endIdx = activeBranch.findIndex(e => e.uuid === endUuid);
+      if (startIdx === -1 || endIdx === -1) {
+        return { success: false, error: 'Range UUIDs not found in active branch' };
+      }
+      const rangeStart = Math.min(startIdx, endIdx);
+      const rangeEnd = Math.max(startIdx, endIdx);
+
+      const removeUuids = new Set();
+      for (let i = rangeStart; i <= rangeEnd; i++) {
+        removeUuids.add(activeBranch[i].uuid);
+      }
+
+      // Forward-expand: remove the entire response chain after the range until the next
+      // real human-typed user message (same logic as edit-range — without it, orphan
+      // tool_result entries become newest leaves and break Claude --resume).
+      for (let i = rangeEnd + 1; i < activeBranch.length; i++) {
+        const entry = activeBranch[i];
+        if (entry.type === 'assistant' || entry.type === 'system' || entry.type === 'progress') {
+          removeUuids.add(entry.uuid);
+        } else if (entry.type === 'user') {
+          const c = entry.message?.content;
+          const isToolResult = Array.isArray(c) && c.some(b => b.type === 'tool_result');
+          const cs = typeof c === 'string' ? c : '';
+          const isTaskNotification = cs.startsWith('<task-notification>');
+          if (isToolResult || isTaskNotification) {
+            removeUuids.add(entry.uuid);
+          } else {
+            break;
+          }
+        } else {
+          removeUuids.add(entry.uuid);
+        }
+      }
+
+      // Drop progress entries linked to removed assistant tool_use blocks
+      for (const rec of allRecords) {
+        if (!rec || !rec.parentToolUseID) continue;
+        if (rec.type !== 'progress') continue;
+        for (const uuid of removeUuids) {
+          const entry = recordMap.get(uuid);
+          if (entry?.type === 'assistant' && Array.isArray(entry.message?.content) &&
+              entry.message.content.some(b => b.type === 'tool_use' && b.id === rec.parentToolUseID)) {
+            removeUuids.add(rec.uuid);
+            break;
+          }
+        }
+      }
+
+      let actualEnd = rangeEnd;
+      for (let i = rangeEnd + 1; i < activeBranch.length; i++) {
+        if (removeUuids.has(activeBranch[i].uuid)) actualEnd = i;
+        else break;
+      }
+
+      const entryBefore = rangeStart > 0 ? activeBranch[rangeStart - 1] : null;
+      const entryAfter = actualEnd < activeBranch.length - 1 ? activeBranch[actualEnd + 1] : null;
+
+      console.log('[DeleteRange] Range:', rangeStart, '→', rangeEnd, '→ actualEnd:', actualEnd,
+        'of', activeBranch.length, 'active. Removing', removeUuids.size, 'records');
+
+      // Clean up trailing [Request interrupted] left by our Ctrl+C
+      const lastEntry = activeBranch[activeBranch.length - 1];
+      if (lastEntry && !removeUuids.has(lastEntry.uuid)) {
+        const lc = lastEntry.message?.content;
+        if (typeof lc === 'string' && lc.startsWith('[Request interrupted')) {
+          removeUuids.add(lastEntry.uuid);
+        }
+      }
+
+      // Clean slate when deleting from start: drop everything that's not in the active
+      // branch after the range (bridge entries, dead branches, last-prompt markers).
+      if (rangeStart === 0) {
+        const keepUuids = new Set();
+        for (let i = (entryAfter ? activeBranch.indexOf(entryAfter) : activeBranch.length); i < activeBranch.length; i++) {
+          if (i >= 0) keepUuids.add(activeBranch[i].uuid);
+        }
+        for (const rec of allRecords) {
+          if (!rec) continue;
+          if (rec.uuid && !keepUuids.has(rec.uuid) && !removeUuids.has(rec.uuid)) {
+            removeUuids.add(rec.uuid);
+          }
+        }
+      }
+
+      // Relink entryAfter directly to entryBefore (or null) — no compact entry inserted.
+      // Must happen BEFORE orphan cleanup: otherwise entryAfter's parentUuid still points
+      // at a deleted record → cascade through everything that follows.
+      if (entryAfter) {
+        entryAfter.parentUuid = entryBefore ? entryBefore.uuid : null;
+        console.log('[DeleteRange] Relinked entryAfter ' + entryAfter.uuid?.slice(0, 8) + ' → ' + (entryBefore?.uuid?.slice(0, 8) || 'null'));
+      }
+
+      // If the relink straddles a sessionId boundary (entryBefore.sid !== entryAfter.sid),
+      // Timeline would render a false Plan Mode / Clear Context teal stripe right at the
+      // delete point — even though no real Plan Mode exit happened (the original boundary
+      // sat inside the deleted range, not between entryBefore and entryAfter). Fix: rewrite
+      // sessionId on the older side (entryBefore and all its ancestors in the active
+      // branch) to entryAfter's sessionId. We rewrite the OLDER side because Claude
+      // --resume keys on the newest leaf's sessionId — touching entryAfter or its chain
+      // could break --resume; ancestors are display-only at this point.
+      if (entryBefore && entryAfter && entryBefore.sessionId && entryAfter.sessionId &&
+          entryBefore.sessionId !== entryAfter.sessionId) {
+        const targetSid = entryAfter.sessionId;
+        const oldSid = entryBefore.sessionId;
+        const ancestorUuids = new Set();
+        // Walk back from entryBefore through parentUuid in activeBranch
+        for (let i = activeBranch.indexOf(entryBefore); i >= 0; i--) {
+          ancestorUuids.add(activeBranch[i].uuid);
+        }
+        let rewritten = 0;
+        for (const rec of allRecords) {
+          if (!rec?.uuid) continue;
+          if (removeUuids.has(rec.uuid)) continue;
+          if (!ancestorUuids.has(rec.uuid)) continue;
+          if (rec.sessionId === targetSid) continue;
+          rec.sessionId = targetSid;
+          rewritten++;
+        }
+        console.log('[DeleteRange] Rewrote sessionId ' + oldSid.slice(0, 8) + '→' + targetSid.slice(0, 8) + ' on ' + rewritten + ' ancestor entries to suppress false Plan Mode boundary');
+      }
+
+      // Orphan cleanup
+      let orphanPass = 0;
+      let orphanCleaned = 0;
+      const survivingUuids = new Set();
+      for (const rec of allRecords) {
+        if (rec?.uuid && !removeUuids.has(rec.uuid)) survivingUuids.add(rec.uuid);
+      }
+      let foundOrphans = true;
+      while (foundOrphans) {
+        foundOrphans = false;
+        orphanPass++;
+        for (const rec of allRecords) {
+          if (!rec?.uuid || removeUuids.has(rec.uuid)) continue;
+          const parent = rec.parentUuid;
+          if (parent && !survivingUuids.has(parent)) {
+            removeUuids.add(rec.uuid);
+            survivingUuids.delete(rec.uuid);
+            orphanCleaned++;
+            foundOrphans = true;
+          }
+        }
+      }
+      if (orphanCleaned > 0) {
+        console.log('[DeleteRange] Orphan cleanup: removed ' + orphanCleaned + ' entries in ' + orphanPass + ' passes');
+      }
+
+      const outputLines = [];
+      for (const rec of allRecords) {
+        if (!rec) continue;
+        if (rec.uuid && removeUuids.has(rec.uuid)) continue;
+        if (rangeStart === 0 && rec.type === 'last-prompt') continue;
+        if (rec.userType === 'external') delete rec.userType;
+        outputLines.push(JSON.stringify(rec));
+      }
+
+      const survivingUuidCount = outputLines.reduce((n, l) => {
+        try { return n + (JSON.parse(l).uuid ? 1 : 0); } catch { return n; }
+      }, 0);
+
+      let fileDeleted = false;
+
+      if (survivingUuidCount === 0) {
+        // Whole active history wiped out — remove the file entirely. Claude --resume on
+        // this sessionId will fail, so the renderer must clear claudeSessionId on the tab.
+        try {
+          await fs.promises.unlink(filePath);
+          fileDeleted = true;
+          console.log('[DeleteRange] File unlinked:', filePath);
+        } catch (e) {
+          console.error('[DeleteRange] Failed to unlink file:', e.message);
+          return { success: false, error: 'Failed to unlink file: ' + e.message };
+        }
+
+        // Clean SQLite session_links so resolveSessionChain stops walking to a parent
+        // (otherwise Timeline pulls the parent session back in on next refresh)
+        if (projectManager?.db) {
+          try {
+            projectManager.db.db.prepare('DELETE FROM session_links WHERE child_session_id = ?').run(sessionId);
+            projectManager.db.db.prepare('DELETE FROM session_links WHERE parent_session_id = ?').run(sessionId);
+            console.log('[DeleteRange] Cleaned session_links for', sessionId?.slice(0, 8));
+          } catch (e) {
+            console.warn('[DeleteRange] session_links cleanup failed:', e.message);
+          }
+        }
+      } else {
+        // Atomic write
+        const tmpPath = filePath + '.delete-tmp';
+        await fs.promises.writeFile(tmpPath, outputLines.join('\n') + '\n', 'utf-8');
+        await fs.promises.rename(tmpPath, filePath);
+
+        // If we cut from the very beginning, drop session_links pointing to a parent
+        // (the bridge to the previous session no longer exists in this file).
+        if (rangeStart === 0 && projectManager?.db) {
+          try {
+            projectManager.db.db.prepare('DELETE FROM session_links WHERE child_session_id = ?').run(sessionId);
+          } catch (e) {
+            console.warn('[DeleteRange] session_links cleanup failed:', e.message);
+          }
+        }
+      }
+
+      _jsonlCache.delete(filePath);
+
+      // Count removed by type for the toast message
+      let removedUsers = 0, removedAssistants = 0, removedOther = 0;
+      for (const uuid of removeUuids) {
+        const rec = recordMap.get(uuid);
+        if (!rec) continue;
+        if (rec.type === 'user') {
+          const c = rec.message?.content;
+          const isToolResult = Array.isArray(c) && c.some(b => b.type === 'tool_result');
+          const cs = typeof c === 'string' ? c : '';
+          const isTaskNotification = cs.startsWith('<task-notification>');
+          if (!isToolResult && !isTaskNotification) removedUsers++;
+          else removedOther++;
+        } else if (rec.type === 'assistant') removedAssistants++;
+        else removedOther++;
+      }
+
+      console.log('[DeleteRange] Done. fileDeleted=' + fileDeleted + ' removed=' + removeUuids.size +
+        ` (${removedUsers} user, ${removedAssistants} assistant, ${removedOther} other)`);
+
+      return {
+        success: true,
+        removedCount: removeUuids.size,
+        removedUsers,
+        removedAssistants,
+        fileDeleted,
+      };
+
+    } catch (error) {
+      console.error('[DeleteRange] Error:', error);
+      return { success: false, error: error.message };
+    }
+  });
+
   // Get fork markers for a session (for Timeline blue lines)
   ipcMain.handle('claude:get-fork-markers', async (event, { sessionId }) => {
     if (!sessionId) return { success: false, error: 'No session ID', markers: [] };
@@ -1349,13 +1667,23 @@ function register({ projectManager, formatToolAction }) {
           // Detect "continued session" summary (context overflow recovery)
           const isContinued = cleanContent.startsWith('This session is being continued from a previous conversation');
 
-          // Look ahead: sum output_tokens across ALL assistant entries for this turn
+          // Look ahead: sum output_tokens AND capture provider model + thinking flag across this turn's assistants.
+          // Model = last non-synthetic assistant.message.model (after tool_use chain it usually stays the same provider).
+          // hasThinking = any assistant entry contains a content block with type==='thinking'.
           let responseTokens = 0;
+          let responseModel;
+          let responseHasThinking = false;
           const entryIdx = activeBranch.indexOf(entry);
           for (let j = entryIdx + 1; j < activeBranch.length; j++) {
             const next = activeBranch[j];
             if (next.type === 'assistant' && next.message?.usage) {
               responseTokens += (next.message.usage.output_tokens || 0);
+              const mdl = next.message.model;
+              if (mdl && mdl !== '<synthetic>') responseModel = mdl;
+              const content = next.message.content;
+              if (Array.isArray(content) && content.some(c => c && c.type === 'thinking')) {
+                responseHasThinking = true;
+              }
             }
             if (next.type === 'user' && !next.isSidechain) break;
           }
@@ -1370,7 +1698,9 @@ function register({ projectManager, formatToolAction }) {
             isCompactSummary: entry.isCompactSummary || false,
             sessionId: entry.sessionId || entry._fromFile,
             isPlan: !!entry.planContent,
-            responseTokens
+            responseTokens,
+            responseModel,
+            responseHasThinking: responseHasThinking || undefined
           });
         } else if (entry.type === 'system' && entry.subtype === 'compact_boundary') {
           entries.push({
@@ -2324,6 +2654,9 @@ function register({ projectManager, formatToolAction }) {
       const db = projectManager.db;
       db.db.prepare('UPDATE fork_markers SET hidden = 1 WHERE source_session_id = ? AND forked_to_session_id = ?')
         .run(sourceSessionId, forkSessionId);
+      // Invalidate cache so Timeline picks up hidden=1 without restart.
+      db.invalidateForkMarkerCache(sourceSessionId);
+      db.invalidateForkMarkerCache(forkSessionId);
       console.log('[ForkMarker] Hidden:', sourceSessionId?.slice(0, 8), '→', forkSessionId?.slice(0, 8));
       return { success: true };
     } catch (error) {

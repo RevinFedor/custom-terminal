@@ -55,6 +55,7 @@ interface UIStore {
 
   sidebarFontSize: number;     // File explorer sidebar
   sidebarWidth: number;        // File explorer width (px)
+  filePreviewFontSize: number; // FilePreview readOnly editor
 
   setSidebarWidth: (width: number) => void;
   setTerminalFontSize: (size: number) => void;
@@ -64,6 +65,8 @@ interface UIStore {
   setProjectTabsFontSize: (size: number) => void;
 
   setSidebarFontSize: (size: number) => void;
+
+  setFilePreviewFontSize: (size: number) => void;
 
   incrementTerminalFontSize: () => void;
 
@@ -235,6 +238,12 @@ interface UIStore {
   closeSessionModal: (value: string | null) => void;
 
   // Copy Settings (shared between ActionsPanel and Timeline)
+  // Sidebar (file explorer) behavior toggles
+  sidebarPersistFile: boolean;
+  sidebarOverlayCloseOnClickOutside: boolean;
+  setSidebarPersistFile: (v: boolean) => void;
+  setSidebarOverlayCloseOnClickOutside: (v: boolean) => void;
+
   copyIncludeEditing: boolean;
   copyIncludeReading: boolean;
   copyFromStart: boolean;
@@ -498,6 +507,14 @@ const saveFontSettings = (settings: { terminalFontSize: number; tabsFontSize: nu
 };
 
 const initialFontSettings = loadFontSettings();
+
+const loadFilePreviewFontSize = (): number => {
+  try {
+    const v = localStorage.getItem('noted-terminal-file-preview-font-size');
+    if (v) return Math.max(10, Math.min(24, Number(v) || 13));
+  } catch {}
+  return 13;
+};
 const initialEditorSettings = loadEditorSettings();
 const initialModel = loadSelectedModel();
 const initialThinkingLevel = loadThinkingLevel();
@@ -552,6 +569,27 @@ const saveCopySettings = (settings: { copyIncludeEditing: boolean; copyIncludeRe
 
 const initialCopySettings = loadCopySettings();
 
+const loadSidebarBehavior = (): { sidebarPersistFile: boolean; sidebarOverlayCloseOnClickOutside: boolean } => {
+  try {
+    const saved = localStorage.getItem('noted-terminal-sidebar-behavior');
+    if (saved) {
+      const p = JSON.parse(saved);
+      return {
+        sidebarPersistFile: p.sidebarPersistFile ?? false,
+        sidebarOverlayCloseOnClickOutside: p.sidebarOverlayCloseOnClickOutside ?? true,
+      };
+    }
+  } catch {}
+  // Defaults match the user's stated preferences:
+  //  - sidebar reopen should NOT restore previously open file (persist=false)
+  //  - sidebar acts as an overlay, click outside closes it
+  return { sidebarPersistFile: false, sidebarOverlayCloseOnClickOutside: true };
+};
+const saveSidebarBehavior = (s: { sidebarPersistFile: boolean; sidebarOverlayCloseOnClickOutside: boolean }) => {
+  try { localStorage.setItem('noted-terminal-sidebar-behavior', JSON.stringify(s)); } catch {}
+};
+const initialSidebarBehavior = loadSidebarBehavior();
+
 const loadDragAreaWidth = (): number => {
   try {
     const saved = localStorage.getItem('noted-terminal-drag-area-width');
@@ -602,10 +640,17 @@ export const useUIStore = create<UIStore>((set, get) => ({
   projectTabsFontSize: initialFontSettings.projectTabsFontSize,
   sidebarFontSize: initialFontSettings.sidebarFontSize,
   sidebarWidth: (() => { try { const v = localStorage.getItem('sidebarWidth'); return v ? Number(v) : 280; } catch { return 280; } })(),
+  filePreviewFontSize: loadFilePreviewFontSize(),
 
   setSidebarWidth: (width) => {
     set({ sidebarWidth: width });
     try { localStorage.setItem('sidebarWidth', String(width)); } catch {}
+  },
+
+  setFilePreviewFontSize: (size: number) => {
+    const clamped = Math.max(10, Math.min(24, size));
+    set({ filePreviewFontSize: clamped });
+    try { localStorage.setItem('noted-terminal-file-preview-font-size', String(clamped)); } catch {}
   },
 
   // Editor Settings (from gt-editor)
@@ -879,6 +924,20 @@ export const useUIStore = create<UIStore>((set, get) => ({
         resolve: null
       }
     });
+  },
+
+  // Sidebar behavior
+  sidebarPersistFile: initialSidebarBehavior.sidebarPersistFile,
+  sidebarOverlayCloseOnClickOutside: initialSidebarBehavior.sidebarOverlayCloseOnClickOutside,
+  setSidebarPersistFile: (v) => {
+    set({ sidebarPersistFile: v });
+    const { sidebarOverlayCloseOnClickOutside } = get();
+    saveSidebarBehavior({ sidebarPersistFile: v, sidebarOverlayCloseOnClickOutside });
+  },
+  setSidebarOverlayCloseOnClickOutside: (v) => {
+    set({ sidebarOverlayCloseOnClickOutside: v });
+    const { sidebarPersistFile } = get();
+    saveSidebarBehavior({ sidebarPersistFile, sidebarOverlayCloseOnClickOutside: v });
   },
 
   // Copy Settings

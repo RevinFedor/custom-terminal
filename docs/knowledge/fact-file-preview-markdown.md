@@ -58,7 +58,19 @@ clipboard.writeText(filePreview.content);
 
 См. также: `docs/knowledge/fact-input-events.md` (раздел про Clipboard).
 
-### 5. FoldStateKey — персистентное состояние фолдинга
+### 5. Shared font-size (header stepper ↔ Settings)
+
+`fontSize` берётся из `useUIStore.filePreviewFontSize`, который имеет два независимых UI-контрола:
+1. Inline stepper `[−] 13px [+]` в header'е FilePreview (рядом с Copy All / ×).
+2. Контрол «Превью файла» в Settings → Шрифты.
+
+Оба меняют **одно поле** в UIStore + один ключ `localStorage('noted-terminal-file-preview-font-size')`. Изменение в любом месте мгновенно отражается во втором — реактивно через Zustand-селектор.
+
+**Почему shared, а не два разных поля:** при двух полях получили бы рассинхрон между разными окнами/табами или между inline-stepper'ом и модалкой. Inline-stepper нужен для быстрого «ткнул и читаешь дальше», модалка — для редкой централизованной настройки; обе семантики управляют одним и тем же визуалом, поэтому одно поле.
+
+**Диапазон 10..24px** — задан и в `setFilePreviewFontSize` (clamp при записи), и в кнопках UI (`disabled` на границах). Одно место границ было бы лучше, но clamp в setter защищает от неконсистентного состояния если кто-то запишет в localStorage ручную нужное значение.
+
+### 6. FoldStateKey — персистентное состояние фолдинга
 
 ```ts
 foldStateKey={`file-preview:${filePreview.path}`}
@@ -87,7 +99,7 @@ foldStateKey={`file-preview:${filePreview.path}`}
   content={filePreview.content}
   onChange={() => {}} // noop
   readOnly
-  fontSize={13}
+  fontSize={filePreviewFontSize}  // shared with SettingsModal stepper
   wordWrap
   showLineNumbers
   foldStateKey={`file-preview:${filePreview.path}`}

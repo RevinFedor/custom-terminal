@@ -1,8 +1,11 @@
 #!/bin/bash
 # =============================================================================
 # Semantic Indexer — Phase 1 (Parallel)
-# Сканирует docs/knowledge/ (fix-* и fact-*), отправляет в Haiku 4.5
-# через `claude -p`, получает "семантический паспорт" и складывает в .semantic-index.json
+# Сканирует всю docs/ (knowledge/, methodology/, product/, meta/, ux-patterns/, и т.д.)
+# исключая tmp/ и _intro.md, отправляет в Haiku 4.5 через `claude -p`,
+# получает "семантический паспорт" и складывает в .semantic-index.json.
+# Haiku-роутер сам отфильтрует по симптомам — маркетинговые тексты не подтянутся
+# при отладке кода и наоборот.
 #
 # Запуск: bash scripts/ai/build-index.sh
 # Опции: -g            — использовать Gemini 3 Flash (результат → clipboard, индекс не меняется)
@@ -167,7 +170,7 @@ FILES=()
 
 while IFS= read -r -d '' f; do
   FILES+=("$f")
-done < <(find "$PROJECT_DIR/docs/knowledge" -name '*.md' -print0 2>/dev/null)
+done < <(find "$PROJECT_DIR/docs" -type f -name '*.md' \! -path '*/tmp/*' \! -name '_intro.md' -print0 2>/dev/null)
 
 if [ "$WITH_SRC" = true ]; then
   echo -e "${YELLOW}Including src/ components and stores...${NC}"

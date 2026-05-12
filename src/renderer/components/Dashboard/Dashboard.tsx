@@ -20,10 +20,23 @@ interface AIProcess {
   mem: string;
 }
 
+interface MCPProcess {
+  pid: number;
+  ppid: number;
+  cpu: string;
+  mem: string;
+  startTime: string;
+  command: string;
+  name: string;
+  isAlive: boolean; // ppid belongs to live PTY/CLI
+}
+
 export default function Dashboard() {
   const [processStatus, setProcessStatus] = useState<Map<string, boolean>>(new Map());
   const [claudeProcesses, setClaudeProcesses] = useState<AIProcess[]>([]);
   const [geminiProcesses, setGeminiProcesses] = useState<AIProcess[]>([]);
+  const [mcpProcesses, setMcpProcesses] = useState<MCPProcess[]>([]);
+  const [mcpExpanded, setMcpExpanded] = useState(false);
   const [isProcessesLoading, setIsProcessesLoading] = useState(true);
 
   const [killTooltip, setKillTooltip] = useState<'claude' | 'gemini' | null>(null);
@@ -129,15 +142,18 @@ export default function Dashboard() {
     let isFirst = true;
     const fetchProcesses = async () => {
       try {
-        const [claude, gemini] = await Promise.all([
+        const [claude, gemini, mcp] = await Promise.all([
           ipcRenderer.invoke('system:get-claude-processes'),
           ipcRenderer.invoke('system:get-gemini-processes'),
+          ipcRenderer.invoke('system:get-mcp-processes'),
         ]);
         setClaudeProcesses(claude || []);
         setGeminiProcesses(gemini || []);
+        setMcpProcesses(mcp || []);
       } catch {
         setClaudeProcesses([]);
         setGeminiProcesses([]);
+        setMcpProcesses([]);
       }
       if (isFirst) {
         setIsProcessesLoading(false);
@@ -322,18 +338,29 @@ export default function Dashboard() {
             return proc.cwd.split('/').filter(Boolean).pop() || proc.cwd;
           };
 
-          const handleKill = async (pid: number) => {
-            await ipcRenderer.invoke('system:kill-process', pid);
-            setTimeout(async () => {
-              try {
-                const [claude, gemini] = await Promise.all([
-                  ipcRenderer.invoke('system:get-claude-processes'),
-                  ipcRenderer.invoke('system:get-gemini-processes'),
-                ]);
-                setClaudeProcesses(claude || []);
-                setGeminiProcesses(gemini || []);
-              } catch { /* ignore */ }
-            }, 500);
+          const refetchAll = async () => {
+            try {
+              const [claude, gemini, mcp] = await Promise.all([
+                ipcRenderer.invoke('system:get-claude-processes'),
+                ipcRenderer.invoke('system:get-gemini-processes'),
+                ipcRenderer.invoke('system:get-mcp-processes'),
+              ]);
+              setClaudeProcesses(claude || []);
+              setGeminiProcesses(gemini || []);
+              setMcpProcesses(mcp || []);
+            } catch { /* ignore */ }
+          };
+
+          const handleKill = async (proc: AIProcess) => {
+            // Protect In-App processes: route through normal close path so PTY cleanup runs
+            if (proc.tabId) {
+              const ok = window.confirm('Это активная сессия в табе. Закрыть?');
+              if (!ok) return;
+              ipcRenderer.send('terminal:kill', proc.tabId);
+            } else {
+              await ipcRenderer.invoke('system:kill-process', proc.pid);
+            }
+            setTimeout(refetchAll, 500);
           };
 
           const renderProcessCard = (proc: AIProcess, accentColor: string) => {
@@ -354,7 +381,7 @@ export default function Dashboard() {
                 {/* Circle → Square on card hover */}
                 <button
                   className="flex-shrink-0 flex items-center justify-center w-4 h-4"
-                  onClick={() => handleKill(proc.pid)}
+                  onClick={() => handleKill(proc)}
                 >
                   <span
                     className="w-2 h-2 rounded-full group-hover:hidden"
@@ -410,21 +437,24 @@ export default function Dashboard() {
             await Promise.all(
               external.map(p => ipcRenderer.invoke('system:kill-process', p.pid))
             );
-            // Refetch
-            setTimeout(async () => {
-              try {
-                const [claude, gemini] = await Promise.all([
-                  ipcRenderer.invoke('system:get-claude-processes'),
-                  ipcRenderer.invoke('system:get-gemini-processes'),
-                ]);
-                setClaudeProcesses(claude || []);
-                setGeminiProcesses(gemini || []);
-              } catch { /* ignore */ }
-            }, 500);
+            setTimeout(refetchAll, 500);
+          };
+
+          const handleKillAllOrphanMcp = async () => {
+            const orphans = mcpProcesses.filter(p => !p.isAlive);
+            if (orphans.length === 0) return;
+            await Promise.all(orphans.map(p => ipcRenderer.invoke('system:kill-process', p.pid)));
+            setTimeout(refetchAll, 500);
+          };
+
+          const handleKillMcp = async (pid: number) => {
+            await ipcRenderer.invoke('system:kill-process', pid);
+            setTimeout(refetchAll, 500);
           };
 
           const claudeExternal = claudeProcesses.filter(p => !p.tabId);
           const geminiExternal = geminiProcesses.filter(p => !p.tabId);
+          const mcpOrphans = mcpProcesses.filter(p => !p.isAlive);
 
           return (
             <div className="mt-8">
@@ -511,6 +541,65 @@ export default function Dashboard() {
                       )}
                     </div>
                   </div>
+                </div>
+              )}
+
+              {/* MCP processes — collapsed by default, shown as count + dropdown */}
+              {!isProcessesLoading && mcpProcesses.length > 0 && (
+                <div className="mt-4 pt-3 border-t border-[#222]">
+                  <button
+                    className="flex items-center gap-2 text-xs text-[#888] hover:text-[#ccc] transition-colors"
+                    onClick={() => setMcpExpanded(v => !v)}
+                  >
+                    <span>{mcpExpanded ? '▾' : '▸'}</span>
+                    <span>MCP servers</span>
+                    <span className="text-[#555]">{mcpProcesses.length}</span>
+                    {mcpOrphans.length > 0 && (
+                      <span className="text-[#666]">({mcpOrphans.length} orphan)</span>
+                    )}
+                    {mcpOrphans.length > 0 && (
+                      <span
+                        className="ml-1 text-[#555] hover:text-red-400 transition-colors cursor-pointer"
+                        onClick={(e) => { e.stopPropagation(); handleKillAllOrphanMcp(); }}
+                        title={`Kill ${mcpOrphans.length} orphan MCP processes`}
+                      >
+                        <X size={12} />
+                      </span>
+                    )}
+                  </button>
+                  {mcpExpanded && (
+                    <div className="mt-2 max-h-64 overflow-y-auto flex flex-col gap-1">
+                      {mcpProcesses.map(p => (
+                        <div
+                          key={p.pid}
+                          className={`group flex items-center gap-2 px-2 py-1 rounded text-xs ${
+                            p.isAlive ? 'text-[#aaa]' : 'text-[#666]'
+                          }`}
+                        >
+                          <button
+                            className="flex-shrink-0 flex items-center justify-center w-4 h-4"
+                            onClick={() => handleKillMcp(p.pid)}
+                            title="Kill process"
+                          >
+                            <span
+                              className="w-2 h-2 rounded-full group-hover:hidden"
+                              style={{ backgroundColor: p.isAlive ? '#888' : '#444' }}
+                            />
+                            <Square
+                              size={11}
+                              fill="currentColor"
+                              stroke="none"
+                              className="hidden group-hover:block text-red-500/50 hover:text-red-400 cursor-pointer"
+                            />
+                          </button>
+                          <span className="flex-1 truncate" title={p.command}>{p.name}</span>
+                          <span className="text-[#555]">pid {p.pid}</span>
+                          <span className="text-[#555]">{p.startTime}</span>
+                          {!p.isAlive && <span className="text-[#666]">orphan</span>}
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </div>
               )}
             </div>

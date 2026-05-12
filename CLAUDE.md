@@ -8,23 +8,7 @@
     - Если результат пустой/0/unexpected — проверь данные ПЕРВЫМ, не код
     - Используй `docs_search` для поиска шрамов и фактов по подсистеме
   </step>
-  <step index="2">
-    RED TEAM свой план. Назови минимум 3 constraints:
-    - Назови ТОЧНУЮ функцию/переменную которая сломается
-    - Опиши влияние на существующие данные (миграции, обратная совместимость)
-    - Если не можешь назвать функцию — читай глубже
-  </step>
-  <step index="3">
-    Когда пользователь СОМНЕВАЕТСЯ ("это костыль?", "а если...", "правильно ли"):
-    - НЕ защищай текущее решение. Предложи альтернативу.
-    - Сравни trade-offs явно.
-  </step>
-  <step index="4">
-    Начни ответ с:
-    1. "Я проверил: [что проверил]"
-    2. "⚠️ Constraints:" и список из step 2
-    3. Затем план реализации.
-  </step>
+  
 </instructions>
 <!-- @deploy-end -->
 
@@ -50,8 +34,8 @@ Noted Terminal — кастомный эмулятор терминала на �
 - **Home Button Toggle:** Кнопка 🏠 (Home) работает как переключатель. При нахождении на Dashboard повторный клик по 🏠 возвращает пользователя в контекст последнего активного проекта вместо перезагрузки Dashboard. Это сокращает время на навигацию при частом переходе между Dashboard и проектами.
 
 ## Методологии
-- **Дизайн**: `docs/methodology/design.md` — читай при UI-работе
-- **Тесты**: `auto/methodology.md` — читай при написании тестов
+- **Дизайн & UX паттерны**: [`fact-ux-patterns.md`](docs/knowledge/fact-ux-patterns.md) — читай при UI-работе
+- **Тесты**: [`~/Desktop/electron-mcp/methodology/01-custom-terminal.md`](../electron-mcp/methodology/01-custom-terminal.md) — методология E2E через MCP; сценарии в [`~/Desktop/electron-mcp/scenarios/`](../electron-mcp/scenarios/). Бывшая папка `auto/` удалена; бэкап `/tmp/custom-terminal-auto-backup-*.tar.gz`.
 
 ## Документация
 Вся документация в `docs/knowledge/` — единая плоская структура:
@@ -75,6 +59,8 @@ MCP-инструмент `docs_search` — вызови перед работо�
 - **Не используй `execSync`** в main process — фризит весь UI
 - **Не используй polling и таймауты для ожидания состояний:** Проект event-driven — для каждого состояния уже есть сигнал (OSC 133, `geminiSpinnerBusy` → `processGeminiQueue`, `geminiResponseQueue`, IPC events). Перед написанием `setTimeout`/`setInterval` для ожидания — найди существующий event-driven механизм в кодовой базе. `setTimeout` допустим только для debounce, не для "подождать пока X будет готов". **Это также относится к ожиданию готовности PTY-интерфейсов (например, Gemini CLI TUI)** — используй детерминированные PTY-события вместо фиксированных таймаутов. Пример: ожидание ANSI-сигнала `HIDE CURSOR` (`\x1b[?25l`) гарантирует, что терминал полностью инициализирован перед вставкой данных.
 - **IPC коммуникация:** При добавлении main↔renderer коммуникации проверь существующие хендлеры: `grep 'ipcMain.handle\|ipcMain.on' src/main/main.js`. Конвенция: `модуль:действие` (terminal:paste, claude:spawn-with-watcher). `handle` для request-response, `on` для fire-and-forget.
+- **Не дублируй `ipcMain.handle('X')`:** Electron throws на втором `handle` для того же канала (`Attempted to register a second handler`). Throw обрывает текущий `registerHandlers()` блок — **все handler'ы после throw молча не регистрируются**, их симптом потом мигрирует в "кнопка не работает" без ошибок в renderer. Перед добавлением handler'а grep'ни по всему `src/main/`, не только по одному файлу.
+- **Активность компонента в Zustand-селекторе:** При локальной подписке на active-флаг проверяй И `state.activeProjectId === projId`, И `workspace.activeTabId === tabId`. Без `activeProjectId` каждый проект "claim'ит" свой last-active таб → несколько компонентов одновременно в visible-state → z-index race. См. [`fix-performance-lags.md`](docs/knowledge/fix-performance-lags.md) Section 5.
 - **Экранируй `$`** в bash-командах в main.js — Vite трансформирует их при сборке
 - **Не используй `navigator.clipboard`** в renderer — используй `window.require('electron').clipboard`
 - **TUI Logic Testing:** Для низкоуровневой логики парсинга терминала (маркеры, поиск в буфере) предпочитай **Headless Unit-тесты** (node + @xterm/headless). Playwright-тесты используй только для UI и IPC сценариев.
@@ -95,7 +81,7 @@ MCP-инструмент `docs_search` — вызови перед работо�
 - **Claude Models:** Для использования модели по умолчанию с расширенным контекстом (1M) через переменную окружения `ANTHROPIC_MODEL` необходимо использовать значение `opus[1m]`. Использование строки `default` ломает отображение в TUI.
 - **Effort Persistence:** Уровень `max` для Claude не является персистентным и сбрасывается CLI при перезапуске. Максимально допустимое значение для сохранения в `settings.json` — `high`.
 - **Claude Code Source:** Декомпилированные исходники Claude Code (из утечки source map v2.1.88) — `packages/claude-code-src/`. Рядом форки: `packages/claw-code/`, `packages/openclaw/`.
-- **Provider Proxy:** Весь трафик Claude Code проходит через встроенный HTTP proxy (порт 4001+, keepAlive). В anthropic mode body не парсится (fast path) для сохранения prompt cache key. Cache stats логируются из SSE `message_start`. При shutdown — graceful drain активных соединений. Подробнее: [`fact-provider-proxy.md`](docs/knowledge/fact-provider-proxy.md).
+- **Provider Proxy:** Весь трафик Claude Code проходит через встроенный HTTP proxy (порт 4001+, keepAlive). Три режима: `anthropic` (passthrough), `zen` (opencode.ai/zen), `deepseek` (api.deepseek.com/anthropic — официальный Anthropic-совместимый endpoint). **Per-tab routing**: `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>/t/<encoded-tabId>` — каждая вкладка имеет независимый provider state, переключение в одной не затрагивает другие. В anthropic mode body не парсится (fast path) для сохранения prompt cache key. Cache stats логируются из SSE `message_start`. При shutdown — graceful drain активных соединений. Подробнее: [`fact-provider-proxy.md`](docs/knowledge/fact-provider-proxy.md).
 
 ## Логирование (обязательно к соблюдению)
 - **Глобальный интерсептор:** В main process `console.log/error/warn` перехватываются автоматически. Никаких специальных импортов или функций не нужно.
@@ -107,10 +93,10 @@ MCP-инструмент `docs_search` — вызови перед работо�
 - **НЕ создавай** отдельные логгеры, файлы логов или `fs.appendFile` для логирования. Всё идёт через единый `console.log('[Tag]')` перехватчик.
 
 ## Тестирование
-- **Полная документация:** [`auto/context.md`](auto/context.md) — entry point, шаблоны, troubleshooting, event-driven паттерны.
-- **Философия:** [`fact-test-infrastructure.md`](docs/knowledge/fact-test-infrastructure.md) — два уровня (Headless + E2E), структура папок.
-- **Playwright-тесты:** `auto/` — запуск: `node auto/stable/test-name.js`
-- **Observability:** В Main-процессе реализовано логирование `[GeminiSpinner] THINKING/IDLE` и `[Spinner] BUSY/IDLE` для E2E тестов.
+- **Методология:** [`~/Desktop/electron-mcp/methodology/01-custom-terminal.md`](../electron-mcp/methodology/01-custom-terminal.md) — как тестировать через MCP `electron_connect({port: 9224})`. Базовый файл: [`00-base.md`](../electron-mcp/methodology/00-base.md).
+- **Сценарии:** [`~/Desktop/electron-mcp/scenarios/`](../electron-mcp/scenarios/) — пошаговые markdown-сценарии (fork, edit-range, delete-range, timeline UI, claude resume), агент исполняет их живьём.
+- **Observability:** В Main-процессе реализовано логирование `[GeminiSpinner] THINKING/IDLE`, `[Spinner] BUSY/IDLE`, `[Claude Runner]`, `[Claude Handshake]` в `logs/dev.log` — стримится через MCP `Monitor` + `tail -F | grep`.
+- **Бывшая `auto/` (Playwright)**: удалена 2026-05-12; бэкап `/tmp/custom-terminal-auto-backup-1778539841.tar.gz` (86 файлов).
 
 ## AI Features
 - **Update API (Haiku pipeline):** Двухэтапный пайплайн для обновления документации. Анализ через Claude/Gemini API (или headless `gemini -p`), затем открытие Claude в табе `docs-XX` с моделью Haiku для применения правок.

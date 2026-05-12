@@ -23,6 +23,43 @@ interface HistoryTurn {
 // UUID v4 regex pattern (without anchors to extract from text)
 const UUID_EXTRACT_REGEX = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
 
+// Two-tier provider→model catalog for Контроль panel.
+// Provider row selects backend; Model row lists that provider's models.
+// `cmd` = true means clicking the model sends `/model <name>` to the live Claude TUI
+// (only meaningful for anthropic — Claude doesn't know about Zen/DeepSeek models).
+type ProviderId = 'anthropic' | 'zen' | 'deepseek';
+const PROVIDER_CATALOG: { id: ProviderId; label: string; title: string; models: { id: string; label: string; cmd?: boolean }[] }[] = [
+  {
+    id: 'anthropic',
+    label: 'Claude',
+    title: 'Anthropic subscription (direct)',
+    models: [
+      { id: 'default', label: 'default', cmd: true },
+      { id: 'sonnet', label: 'sonnet', cmd: true },
+      { id: 'opus', label: 'opus', cmd: true },
+      { id: 'haiku', label: 'haiku', cmd: true },
+    ],
+  },
+  {
+    id: 'deepseek',
+    label: 'DeepSeek',
+    title: 'DeepSeek (Anthropic-compatible at /anthropic)',
+    models: [
+      { id: 'deepseek-v4-flash', label: 'V4F' },
+      { id: 'deepseek-v4-pro[1m]', label: 'V4P' },
+    ],
+  },
+  {
+    id: 'zen',
+    label: 'Zen',
+    title: 'OpenCode Zen (Anthropic-compatible)',
+    models: [
+      { id: 'minimax-m2.5', label: 'MM2.5' },
+      { id: 'minimax-m2.7', label: 'MM2.7' },
+    ],
+  },
+];
+
 interface Project {
   id: string;
   path: string;
@@ -61,6 +98,9 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
   const [isCommandRunning, setIsCommandRunning] = useState(false);
   const [isControlBusy, setIsControlBusy] = useState(false);
   const [providerState, setProviderState] = useState<{ type: string; model?: string }>({ type: 'anthropic' });
+  // Remembers last-selected model per provider so switching back restores prior choice.
+  // Anthropic entry is null because its current model is read from live bridge data (claudeModel) — not stored locally.
+  const providerMemoryRef = useRef<Record<string, string | null>>({ anthropic: null, zen: 'minimax-m2.7', deepseek: 'deepseek-v4-flash' });
   const [sessionInputMode, setSessionInputMode] = useState<'claude' | 'gemini' | null>(null);
   const [manualSessionId, setManualSessionId] = useState('');
   const sessionInputRef = useRef<HTMLInputElement>(null);
@@ -167,13 +207,16 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
     return () => { ipcRenderer.removeListener('claude:bridge-update', handler); };
   }, [activeTabId]);
 
-  // Provider state: load initial + listen for changes
+  // Provider state is per-tab. Reload when activeTabId changes; only apply broadcast updates targeting this tab.
   useEffect(() => {
-    ipcRenderer.invoke('provider:get-status').then((s: any) => setProviderState(s));
-    const handler = (_: any, state: { type: string; model?: string }) => setProviderState(state);
+    if (!activeTabId) { setProviderState({ type: 'anthropic' }); return; }
+    ipcRenderer.invoke('provider:get-status', { tabId: activeTabId }).then((s: any) => setProviderState(s));
+    const handler = (_: any, payload: { tabId: string; state: { type: string; model?: string } }) => {
+      if (payload?.tabId === activeTabId) setProviderState(payload.state);
+    };
     ipcRenderer.on('provider:state-changed', handler);
     return () => { ipcRenderer.removeListener('provider:state-changed', handler); };
-  }, []);
+  }, [activeTabId]);
 
   useEffect(() => {
     const checkSession = () => {
@@ -650,150 +693,212 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
         <div className="mb-4">
           <div className="text-[11px] uppercase text-[#888] mb-2">Контроль</div>
           <div className="space-y-2">
+            {/* SDK tab: keep legacy single Model row (no provider switching) */}
+            {isSDKTab && (
             <div className="flex items-center gap-1">
               <span className="text-[10px] text-[#666] w-12 flex-shrink-0">Model</span>
               <div className="flex gap-1 flex-1">
                 {(['default', 'sonnet', 'opus', 'haiku'] as const).map((model) => {
-                  let isActive: boolean;
-                  if (isSDKTab) {
-                    // SDK: read from tab store
-                    const state = useWorkspaceStore.getState();
-                    let sdkModel = 'default';
-                    for (const [, ws] of state.openProjects) { const t = ws.tabs.get(activeTabId); if (t) { sdkModel = t.sdkModel || 'default'; break; } }
-                    isActive = sdkModel === model;
-                  } else {
-                    const lm = claudeModel?.toLowerCase() || '';
-                    isActive = model === 'default'
-                      ? lm.includes('1m context')
-                      : model === 'opus'
-                        ? lm.includes('opus') && !lm.includes('1m context')
-                        : lm.includes(model);
-                  }
+                  const state = useWorkspaceStore.getState();
+                  let sdkModel = 'default';
+                  for (const [, ws] of state.openProjects) { const t = ws.tabs.get(activeTabId); if (t) { sdkModel = t.sdkModel || 'default'; break; } }
+                  const isActive = sdkModel === model;
                   return (
                     <button
                       key={model}
                       className={`flex-1 text-[10px] px-1.5 py-1 rounded cursor-pointer ${isActive ? 'bg-[#DA7756] text-white font-medium' : 'bg-[#2d2d2d] text-[#888] hover:text-white hover:bg-[#3d3d3d]'}`}
-                      onClick={async () => {
-                        if (isSDKTab) {
-                          // SDK: store locally — applied on next query
-                          const { updateSDKState } = useWorkspaceStore.getState();
-                          const modelMap: Record<string, string | undefined> = { default: undefined, sonnet: 'claude-sonnet-4-6', opus: 'claude-opus-4-6', haiku: 'claude-haiku-4-5-20251001' };
-                          updateSDKState(activeTabId, { sdkModel: model });
-                          setThinkFlash(model); setTimeout(() => setThinkFlash(null), 1500);
-                        } else {
-                          if (isControlBusy) return;
-                          setIsControlBusy(true);
-                          try { await ipcRenderer.invoke('claude:send-command', activeTabId, '/model ' + model); } finally { setIsControlBusy(false); }
-                        }
+                      onClick={() => {
+                        const { updateSDKState } = useWorkspaceStore.getState();
+                        updateSDKState(activeTabId, { sdkModel: model });
+                        setThinkFlash(model); setTimeout(() => setThinkFlash(null), 1500);
                       }}
                       title={'Switch to ' + model}
-                    >
-                      {model}
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-            {/* LLM row — only for PTY tabs */}
-            {!isSDKTab && (
-            <div className="flex items-center gap-1">
-              <span className="text-[10px] text-[#666] w-12 flex-shrink-0">LLM</span>
-              <div className="flex gap-1 flex-1">
-                {([
-                  { id: 'claude', label: 'Claude', state: { type: 'anthropic' } },
-                  { id: 'mm25', label: 'MM2.5', state: { type: 'zen', model: 'minimax-m2.5' } },
-                  { id: 'mm27', label: 'MM2.7', state: { type: 'zen', model: 'minimax-m2.7' } },
-                ] as const).map((provider) => {
-                  const isActive = provider.id === 'claude'
-                    ? providerState.type === 'anthropic'
-                    : providerState.type === 'zen' && providerState.model === provider.state.model;
-                  return (
-                    <button
-                      key={provider.id}
-                      className={`flex-1 text-[10px] px-1 py-1 rounded ${isControlBusy ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'} ${isActive ? 'bg-[#6B8AFF] text-white font-medium' : 'bg-[#2d2d2d] text-[#888] hover:text-white hover:bg-[#3d3d3d]'}`}
-                      disabled={isControlBusy}
-                      onClick={async () => {
-                        if (isControlBusy) return;
-                        setIsControlBusy(true);
-                        try {
-                          const result = await ipcRenderer.invoke('provider:switch', provider.state);
-                          setProviderState(result);
-                        } finally { setIsControlBusy(false); }
-                      }}
-                      title={provider.id === 'claude' ? 'Anthropic subscription (direct)' : 'OpenCode Zen → ' + provider.state.model}
-                    >
-                      {provider.label}
-                    </button>
+                    >{model}</button>
                   );
                 })}
               </div>
             </div>
             )}
-            <div className="flex items-center gap-1">
-              <span className="text-[10px] text-[#666] w-12 flex-shrink-0">Effort</span>
-              <div className="flex gap-1 flex-1">
-                {(['auto', 'low', 'medium', 'high', 'max'] as const).map((level) => {
-                  let isActive: boolean;
-                  if (isSDKTab) {
-                    const state = useWorkspaceStore.getState();
-                    let sdkEffort = 'high';
-                    for (const [, ws] of state.openProjects) { const t = ws.tabs.get(activeTabId); if (t) { sdkEffort = t.sdkEffort || 'high'; break; } }
-                    isActive = sdkEffort === level;
+
+            {/* PTY tab: two-tier Provider → Model selector */}
+            {!isSDKTab && (() => {
+              const activeProvider = PROVIDER_CATALOG.find(p => p.id === providerState.type) || PROVIDER_CATALOG[0];
+              const lm = claudeModel?.toLowerCase() || '';
+              const isModelActive = (mid: string): boolean => {
+                if (activeProvider.id === 'anthropic') {
+                  // Anthropic model active state derives from live bridge data, not local state
+                  return mid === 'default' ? lm.includes('1m context')
+                    : mid === 'opus' ? (lm.includes('opus') && !lm.includes('1m context'))
+                    : lm.includes(mid);
+                }
+                return providerState.model === mid;
+              };
+              const switchProvider = async (id: ProviderId) => {
+                if (isControlBusy || id === providerState.type) return;
+                setIsControlBusy(true);
+                try {
+                  if (id === 'anthropic') {
+                    const result = await ipcRenderer.invoke('provider:switch', { tabId: activeTabId, type: 'anthropic' });
+                    setProviderState(result);
                   } else {
-                    const currentEffort = activeTabId ? effortLevel[activeTabId] : undefined;
-                    isActive = currentEffort === level;
+                    const remembered = providerMemoryRef.current[id] || PROVIDER_CATALOG.find(p => p.id === id)?.models[0]?.id;
+                    const result = await ipcRenderer.invoke('provider:switch', { tabId: activeTabId, type: id, model: remembered });
+                    setProviderState(result);
                   }
-                  return (
-                    <button
-                      key={level}
-                      className={`flex-1 text-[10px] px-1.5 py-1 rounded cursor-pointer ${isActive ? 'bg-[#DA7756]/20 text-white font-medium' : 'bg-[#2d2d2d] text-[#888] hover:text-white hover:bg-[#3d3d3d]'}`}
-                      onClick={async () => {
-                        if (isSDKTab) {
-                          const { updateSDKState } = useWorkspaceStore.getState();
-                          updateSDKState(activeTabId, { sdkEffort: level });
-                          setEffortLevel(prev => ({ ...prev, [activeTabId]: level }));
-                        } else {
-                          if (isControlBusy) return;
-                          setIsControlBusy(true);
-                          if (activeTabId) setEffortLevel(prev => ({ ...prev, [activeTabId]: level }));
-                          try { await ipcRenderer.invoke('claude:send-command', activeTabId, '/effort ' + level); } finally { setIsControlBusy(false); }
-                        }
-                      }}
-                      title={'Set effort to ' + level}
-                    >
-                      {level === 'medium' ? 'med' : level}
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-            <div className="flex items-center gap-1">
-              <span className="text-[10px] text-[#666] w-12 flex-shrink-0">Think</span>
-              <button
-                className={`flex-1 text-[10px] px-1.5 py-1 rounded cursor-pointer bg-[#2d2d2d] ${thinkFlash ? 'text-[#b4b9f9]' : 'text-[#888] hover:text-white hover:bg-[#3d3d3d]'}`}
-                onClick={async () => {
-                  if (isSDKTab) {
-                    const state = useWorkspaceStore.getState();
-                    let currentThinking = false;
-                    for (const [, ws] of state.openProjects) { const t = ws.tabs.get(activeTabId); if (t) { currentThinking = !!t.sdkThinking; break; } }
-                    const { updateSDKState } = useWorkspaceStore.getState();
-                    updateSDKState(activeTabId, { sdkThinking: !currentThinking });
-                    setThinkFlash(!currentThinking ? 'think on' : 'think off');
-                    setTimeout(() => setThinkFlash(null), 3000);
-                  } else {
-                    if (isControlBusy) return;
-                    setIsControlBusy(true);
-                    try {
-                      const result = await ipcRenderer.invoke('claude:toggle-thinking', activeTabId);
-                      if (result.success) { setThinkFlash(result.thinking ? 'think on' : 'think off'); setTimeout(() => setThinkFlash(null), 3000); }
-                    } finally { setIsControlBusy(false); }
-                  }
-                }}
-                title="Toggle thinking mode"
-              >
-                {thinkFlash || 'toggle'}
-              </button>
-            </div>
+                } finally { setIsControlBusy(false); }
+              };
+              const switchModel = async (mid: string, isCmd: boolean) => {
+                if (isControlBusy) return;
+                if (activeProvider.id === 'anthropic' && isCmd) {
+                  // Anthropic: send /model command into live Claude TUI
+                  setIsControlBusy(true);
+                  try { await ipcRenderer.invoke('claude:send-command', activeTabId, '/model ' + mid); } finally { setIsControlBusy(false); }
+                } else if (activeProvider.id !== 'anthropic') {
+                  // Zen/DeepSeek: update proxy model field and remember choice
+                  setIsControlBusy(true);
+                  providerMemoryRef.current[activeProvider.id] = mid;
+                  try {
+                    const result = await ipcRenderer.invoke('provider:switch', { tabId: activeTabId, type: activeProvider.id, model: mid });
+                    setProviderState(result);
+                  } finally { setIsControlBusy(false); }
+                }
+              };
+              return (
+                <>
+                  <div className="flex items-center gap-1">
+                    <span className="text-[10px] text-[#666] w-12 flex-shrink-0">Provider</span>
+                    <div className="flex gap-1 flex-1">
+                      {PROVIDER_CATALOG.map((p) => {
+                        const isActive = providerState.type === p.id;
+                        return (
+                          <button
+                            key={p.id}
+                            className={`flex-1 text-[10px] px-1 py-1 rounded ${isControlBusy ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'} ${isActive ? 'bg-[#6B8AFF] text-white font-medium' : 'bg-[#2d2d2d] text-[#888] hover:text-white hover:bg-[#3d3d3d]'}`}
+                            disabled={isControlBusy}
+                            onClick={() => switchProvider(p.id)}
+                            title={p.title}
+                          >{p.label}</button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-1">
+                    <span className="text-[10px] text-[#666] w-12 flex-shrink-0">Model</span>
+                    <div className="flex gap-1 flex-1">
+                      {activeProvider.models.map((m) => {
+                        const isActive = isModelActive(m.id);
+                        return (
+                          <button
+                            key={m.id}
+                            className={`flex-1 text-[10px] px-1.5 py-1 rounded ${isControlBusy ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'} ${isActive ? 'bg-[#DA7756] text-white font-medium' : 'bg-[#2d2d2d] text-[#888] hover:text-white hover:bg-[#3d3d3d]'}`}
+                            disabled={isControlBusy}
+                            onClick={() => switchModel(m.id, !!m.cmd)}
+                            title={activeProvider.id === 'anthropic' ? ('Switch to ' + m.id) : ('Use ' + m.id + ' via ' + activeProvider.label)}
+                          >{m.label}</button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </>
+              );
+            })()}
+            {/* Effort and Think apply to Anthropic (via Claude TUI /effort and meta+t) AND DeepSeek (via proxy body injection).
+                Zen has no documented analog → dim only for Zen.
+                DeepSeek special: API rejects thinking.disabled + output_config.effort together, so we merge Think into Effort
+                row as a single 4-state selector: [off][low][medium][high]. The separate Think row is hidden for DeepSeek. */}
+            {(() => {
+              const isAnthropic = isSDKTab || providerState.type === 'anthropic';
+              const isDeepSeek = !isSDKTab && providerState.type === 'deepseek';
+              const supportsKnobs = isAnthropic || isDeepSeek;
+              const dimClass = supportsKnobs ? '' : 'opacity-40 pointer-events-none';
+              const titleSuffix = supportsKnobs ? '' : ' (not supported by ' + providerState.type + ')';
+              // DeepSeek levels: 'off' means thinking disabled. low/medium/high enable thinking with corresponding effort.
+              // Anthropic: auto/low/medium/high/max (unchanged).
+              const effortLevels = isDeepSeek ? (['off','low','medium','high'] as const) : (['auto','low','medium','high','max'] as const);
+              // Effort active-state: for DeepSeek derived from providerState.effort (server-confirmed); for Anthropic read local tab map.
+              const dsEffort = (providerState as { effort?: string }).effort || 'medium';
+              return (
+              <>
+                <div className={`flex items-center gap-1 ${dimClass}`}>
+                  <span className="text-[10px] text-[#666] w-12 flex-shrink-0">Effort</span>
+                  <div className="flex gap-1 flex-1">
+                    {effortLevels.map((level) => {
+                      let isActive: boolean;
+                      if (isSDKTab) {
+                        const state = useWorkspaceStore.getState();
+                        let sdkEffort = 'high';
+                        for (const [, ws] of state.openProjects) { const t = ws.tabs.get(activeTabId); if (t) { sdkEffort = t.sdkEffort || 'high'; break; } }
+                        isActive = sdkEffort === level;
+                      } else if (isDeepSeek) {
+                        isActive = dsEffort === level;
+                      } else {
+                        const currentEffort = activeTabId ? effortLevel[activeTabId] : undefined;
+                        isActive = currentEffort === level;
+                      }
+                      return (
+                        <button
+                          key={level}
+                          className={`flex-1 text-[10px] px-1.5 py-1 rounded cursor-pointer ${isActive ? 'bg-[#DA7756]/20 text-white font-medium' : 'bg-[#2d2d2d] text-[#888] hover:text-white hover:bg-[#3d3d3d]'}`}
+                          onClick={async () => {
+                            if (isSDKTab) {
+                              const { updateSDKState } = useWorkspaceStore.getState();
+                              updateSDKState(activeTabId, { sdkEffort: level });
+                              setEffortLevel(prev => ({ ...prev, [activeTabId]: level }));
+                            } else if (isDeepSeek) {
+                              if (isControlBusy) return;
+                              setIsControlBusy(true);
+                              try {
+                                const result = await ipcRenderer.invoke('provider:set-options', { tabId: activeTabId, effort: level });
+                                setProviderState(result);
+                              } finally { setIsControlBusy(false); }
+                            } else {
+                              if (isControlBusy) return;
+                              setIsControlBusy(true);
+                              if (activeTabId) setEffortLevel(prev => ({ ...prev, [activeTabId]: level }));
+                              try { await ipcRenderer.invoke('claude:send-command', activeTabId, '/effort ' + level); } finally { setIsControlBusy(false); }
+                            }
+                          }}
+                          title={'Set effort to ' + level + titleSuffix}
+                        >
+                          {level === 'medium' ? 'med' : level}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+                {/* DeepSeek: Think is folded into Effort row (off ↔ low/medium/high). Hide separate row. */}
+                {!isDeepSeek && (
+                <div className={`flex items-center gap-1 ${dimClass}`}>
+                  <span className="text-[10px] text-[#666] w-12 flex-shrink-0">Think</span>
+                  <button
+                    className={`flex-1 text-[10px] px-1.5 py-1 rounded cursor-pointer bg-[#2d2d2d] ${thinkFlash ? 'text-[#b4b9f9]' : 'text-[#888] hover:text-white hover:bg-[#3d3d3d]'}`}
+                    onClick={async () => {
+                      if (isSDKTab) {
+                        const state = useWorkspaceStore.getState();
+                        let currentThinking = false;
+                        for (const [, ws] of state.openProjects) { const t = ws.tabs.get(activeTabId); if (t) { currentThinking = !!t.sdkThinking; break; } }
+                        const { updateSDKState } = useWorkspaceStore.getState();
+                        updateSDKState(activeTabId, { sdkThinking: !currentThinking });
+                        setThinkFlash(!currentThinking ? 'think on' : 'think off');
+                        setTimeout(() => setThinkFlash(null), 3000);
+                      } else {
+                        if (isControlBusy) return;
+                        setIsControlBusy(true);
+                        try {
+                          const result = await ipcRenderer.invoke('claude:toggle-thinking', activeTabId);
+                          if (result.success) { setThinkFlash(result.thinking ? 'think on' : 'think off'); setTimeout(() => setThinkFlash(null), 3000); }
+                        } finally { setIsControlBusy(false); }
+                      }
+                    }}
+                    title={'Toggle thinking mode' + titleSuffix}
+                  >
+                    {thinkFlash || 'toggle'}
+                  </button>
+                </div>
+                )}
+              </>
+              );
+            })()}
             {contextPct > 0 && (
               <div className="flex items-center gap-1">
                 <span className="text-[10px] text-[#666] w-12 flex-shrink-0">Ctx</span>

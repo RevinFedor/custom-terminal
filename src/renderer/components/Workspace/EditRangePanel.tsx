@@ -34,6 +34,7 @@ interface EditRangePanelProps {
   anchorTop: number;
   anchorHeight: number;
   rightOffset: number;
+  autoEditInitial?: boolean;
   onApply: (compactText: string) => Promise<{ removedCount: number; removedUsers?: number; removedAssistants?: number }>;
   onClose: () => void;
 }
@@ -44,6 +45,7 @@ export default function EditRangePanel({
   anchorTop,
   anchorHeight,
   rightOffset,
+  autoEditInitial,
   onApply,
   onClose,
 }: EditRangePanelProps) {
@@ -63,9 +65,17 @@ export default function EditRangePanel({
   const [isLoading, setIsLoading] = useState(false);
   const [abortController, setAbortController] = useState<AbortController | null>(null);
   const [sourceExpanded, setSourceExpanded] = useState(false);
-  const [editingMsgId, setEditingMsgId] = useState<string | null>(null);
+  const [editingMsgId, setEditingMsgId] = useState<string | null>(autoEditInitial ? 'initial' : null);
   const [editingText, setEditingText] = useState('');
   const editTextareaRef = useRef<HTMLTextAreaElement>(null);
+
+  // Auto-focus the edit textarea when opened in manual mode (autoEditInitial)
+  useEffect(() => {
+    if (autoEditInitial) {
+      setTimeout(() => editTextareaRef.current?.focus(), 50);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Apply flow state
   const [applyPhase, setApplyPhase] = useState<'idle' | 'running' | 'done'>('idle');
