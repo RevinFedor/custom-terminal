@@ -217,14 +217,24 @@ export default function Workspace() {
     if (!activeProjectId) return;
 
     const { openFilePath } = getSidebarState(activeProjectId);
+    const { sidebarPersistFile } = useUIStore.getState();
 
     if (!sidebarOpenForRender) {
-      // Sidebar closed — hide file preview but keep openFilePath in store/DB
+      // Sidebar closed — hide file preview. When persist=false, also drop the saved
+      // path so the next sidebar open starts clean (just the tree, no file).
       if (filePreview) closeFilePreview();
+      if (!sidebarPersistFile && openFilePath) {
+        setOpenFilePath(activeProjectId, null);
+      }
       return;
     }
 
-    // Sidebar open — restore saved file if needed
+    // Sidebar open — restore saved file only if persist toggle is on. Otherwise
+    // we want a clean tree on every reopen.
+    if (!sidebarPersistFile) {
+      if (filePreview) closeFilePreview();
+      return;
+    }
     if (filePreview && filePreview.path !== openFilePath) {
       closeFilePreview();
     }
@@ -243,6 +253,28 @@ export default function Workspace() {
       })();
     }
   }, [activeProjectId, sidebarOpenForRender]);
+
+  // Click outside the sidebar closes it (when toggle is on). Captures mousedown
+  // on window so we don't fight terminal canvas pointer-events; check whether the
+  // event target lives inside [data-sidebar-portal]. We also let clicks inside the
+  // file preview (it sits next to the sidebar) propagate through and close the
+  // sidebar, since user wants the sidebar to behave as an overlay.
+  useEffect(() => {
+    if (!sidebarOpenForRender || !activeProjectId) return;
+    const onDown = (e: MouseEvent) => {
+      const { sidebarOverlayCloseOnClickOutside } = useUIStore.getState();
+      if (!sidebarOverlayCloseOnClickOutside) return;
+      const target = e.target as HTMLElement | null;
+      if (!target) return;
+      // Inside the sidebar itself — keep open.
+      if (target.closest('[data-sidebar-portal]')) return;
+      // Inside the file preview — also keep open (sidebar+preview are "linked").
+      if (target.closest('[data-file-preview-root]')) return;
+      setSidebarOpen(activeProjectId, false);
+    };
+    window.addEventListener('mousedown', onDown, true);
+    return () => window.removeEventListener('mousedown', onDown, true);
+  }, [sidebarOpenForRender, activeProjectId]);
 
   // Listen for OSC 133 command lifecycle events (Shell Integration)
   useEffect(() => {
@@ -647,7 +679,7 @@ export default function Workspace() {
         const { sidebarExpandedDirs } = getSidebarState(activeProjectId);
         const sidebarWidth = useUIStore.getState().sidebarWidth || 280;
         return ReactDOM.createPortal(
-          <div style={{ position: 'fixed', left: 0, top: 36, bottom: 0, width: sidebarWidth, zIndex: 99999, borderRight: '1px solid #333', boxShadow: '4px 0 20px rgba(0,0,0,0.5)' }}>
+          <div data-sidebar-portal style={{ position: 'fixed', left: 0, top: 36, bottom: 0, width: sidebarWidth, zIndex: 99999, borderRight: '1px solid #333', boxShadow: '4px 0 20px rgba(0,0,0,0.5)' }}>
             <Sidebar
               folderPath={explorerPath}
               width={sidebarWidth}

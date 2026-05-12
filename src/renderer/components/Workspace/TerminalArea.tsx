@@ -283,11 +283,34 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
     }
   };
 
-  // Stable string selector — only changes when tab IDs are added/removed (not on every state mutation)
+  // PERF (2026-04-21): Structural fingerprint.
+  //
+  // The fingerprint intentionally does NOT include `activeTabId` of any project.
+  // Each child (Terminal/BrowserTab/ClaudeSDKTab) subscribes to its own active
+  // state from the store, so when a user clicks another tab — in ANY project —
+  // only the two affected terminals re-render via their Zustand subscriptions.
+  // The useMemo below rebuilds only when tabs are added/removed/retyped or when
+  // a sub-agent override needs a fresh pass.
+  //
+  // HISTORY: an earlier version of this fingerprint included `workspace.activeTabId`
+  // (format `projId:activeTabId`). That triggered a useMemo recalc on every tab
+  // switch in any project — full 48-element React elements list, 13+ useEffects.
+  // The original shipped behavior (still in `git log`) keeps that form because
+  // it ALSO passed `active` as a prop, which fed the zIndex/visibility pipeline.
+  // We moved `active` into the child — so the fingerprint shrank.
+  //
+  // REGRESSION SIGNAL: if `[TerminalArea:useMemo] RECALCULATING` fires on every
+  // cross-project switch again, something put per-other-project state back into
+  // the fingerprint. See docs/knowledge/fix-performance-lags.md § Zustand Map Trap.
   const terminalFingerprint = useWorkspaceStore((s) => {
+    const hostWs = s.openProjects.get(projectId);
+    // Include host activeTabId ONLY when sub-agent override is armed. Otherwise
+    // switching tabs inside the host project should NOT rebuild the element list.
+    const hostSubAgent = hostWs?.viewingSubAgentTabId;
+    const hostActivePart = hostSubAgent ? `#${hostWs?.activeTabId}` : '';
     const parts: string[] = [];
     s.openProjects.forEach((workspace, projId) => {
-      parts.push(`${projId}:${workspace.activeTabId}`);
+      parts.push(projId === projectId ? `${projId}${hostActivePart}` : projId);
       workspace.tabs.forEach((tab) => {
         parts.push(`${tab.id}:${tab.tabType || 'terminal'}`);
       });
@@ -296,36 +319,42 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
   });
 
   const terminals = useMemo(() => {
-    console.warn('[TerminalArea:useMemo] RECALCULATING terminals. fingerprint:', terminalFingerprint, 'projectId:', projectId);
+    const _t0 = performance.now();
     const result: React.ReactNode[] = [];
     const currentOpenProjects = useWorkspaceStore.getState().openProjects;
+    let terminalCount = 0;
+
+    // Sub-agent override is only relevant inside the CURRENTLY rendered project.
+    // It pins one tab (the sub-agent) active and forces the parent Gemini tab inactive.
+    // We cannot express this as a pure per-tab store subscription, so we override
+    // props explicitly for exactly those two tab IDs.
+    const hostProject = currentOpenProjects.get(projectId);
+    const hostActiveTabId = hostProject?.activeTabId ?? null;
+    const viewedSubAgent = viewingSubAgentTabId ? hostProject?.tabs.get(viewingSubAgentTabId) : null;
+    const subAgentOverrideActive =
+      !!viewingSubAgentTabId && !!viewedSubAgent && viewedSubAgent.parentTabId === hostActiveTabId;
 
     currentOpenProjects.forEach((workspace, projId) => {
-      const isActiveProject = projId === projectId;
+      const isHostProject = projId === projectId;
 
       workspace.tabs.forEach((tab) => {
-        // NOTE: currentView check moved INTO Terminal component to avoid useMemo recalculation on view switch
-        // MCP sub-agent viewport: when viewingSubAgentTabId is set, show that tab instead of the active Gemini tab
-        let isActive = isActiveProject && workspace.activeTabId === tab.id;
-        if (isActiveProject && viewingSubAgentTabId) {
-          const viewedTab = workspace.tabs.get(viewingSubAgentTabId);
-          // Only apply sub-agent override when active tab IS the parent Gemini tab
-          if (viewedTab && viewedTab.parentTabId === workspace.activeTabId) {
-            if (tab.id === viewingSubAgentTabId) {
-              isActive = true;
-            } else if (tab.id === workspace.activeTabId) {
-              isActive = false; // Hide the Gemini tab, show sub-agent instead
-            }
-          }
+        terminalCount++;
+
+        // Default path: child subscribes to its own active/isActiveProject.
+        // Override path: sub-agent viewport (only in host project).
+        let activeOverride: boolean | undefined;
+        if (isHostProject && subAgentOverrideActive) {
+          if (tab.id === viewingSubAgentTabId) activeOverride = true;
+          else if (tab.id === hostActiveTabId) activeOverride = false;
         }
+
         if (tab.tabType === 'claude-sdk') {
           result.push(
             <ClaudeSDKTab
               key={tab.id}
               tabId={tab.id}
-              active={isActive}
-              isActiveProject={isActiveProject}
               cwd={tab.cwd}
+              {...(activeOverride !== undefined ? { active: activeOverride } : {})}
             />
           );
         } else if (tab.tabType === 'browser') {
@@ -334,12 +363,11 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
               key={tab.id}
               tabId={tab.id}
               url={tab.url || 'http://localhost:3000'}
-              active={isActive}
-              isActiveProject={isActiveProject}
               terminalId={tab.terminalId || tab.id}
               terminalName={tab.terminalName}
               activeView={tab.activeView || 'browser'}
               cwd={tab.cwd}
+              {...(activeOverride !== undefined ? { active: activeOverride } : {})}
             />
           );
         } else {
@@ -348,14 +376,15 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
               key={tab.id}
               tabId={tab.id}
               cwd={tab.cwd}
-              active={isActive}
-              isActiveProject={isActiveProject}
+              {...(activeOverride !== undefined ? { active: activeOverride } : {})}
             />
           );
         }
       });
     });
 
+    const _dur = (performance.now() - _t0).toFixed(1);
+    console.warn(`[TerminalArea:useMemo] RECALCULATING count=${terminalCount} projectId=${projectId.slice(-12)} durMs=${_dur} (structural: add/remove/type/sub-agent)`);
     return result;
   }, [terminalFingerprint, projectId, viewingSubAgentTabId]);
 

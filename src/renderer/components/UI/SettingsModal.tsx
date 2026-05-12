@@ -44,7 +44,10 @@ const SHORTCUTS = [
   { keys: '⌘ + ⇧ + R', description: 'Перезагрузить приложение' },
 ];
 
-// Font size slider component
+// Compact font-size stepper. The previous slider variant ate vertical space (each
+// row took 90px) and the slider track was meaningless for ±1px font tweaks — users
+// always end up clicking +/- to nudge a single px anyway. New row: label + small
+// stepper on the right, ~36px tall, fits two columns at 900px width.
 function FontSizeSlider({
   label,
   description,
@@ -60,84 +63,119 @@ function FontSizeSlider({
   min: number;
   max: number;
 }) {
+  const btnStyle: React.CSSProperties = {
+    width: '24px',
+    height: '24px',
+    borderRadius: '6px',
+    border: '1px solid #3a3a3a',
+    backgroundColor: '#262626',
+    color: '#ccc',
+    cursor: 'pointer',
+    fontSize: '14px',
+    lineHeight: 1,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    userSelect: 'none',
+  };
   return (
     <div style={{
-      padding: '14px',
-      backgroundColor: '#222',
-      border: '1px solid #333',
-      borderRadius: '10px',
-      marginBottom: '12px'
+      padding: '8px 12px',
+      backgroundColor: '#1f1f1f',
+      border: '1px solid #2a2a2a',
+      borderRadius: '8px',
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      gap: '12px',
     }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
-        <div>
-          <div style={{ fontSize: '14px', color: '#fff', fontWeight: '500' }}>{label}</div>
-          <div style={{ fontSize: '12px', color: '#666' }}>{description}</div>
-        </div>
-        <div style={{
-          fontSize: '14px',
-          color: '#fff',
-          backgroundColor: '#333',
-          padding: '4px 12px',
-          borderRadius: '6px',
-          minWidth: '50px',
-          textAlign: 'center'
-        }}>
-          {value}px
-        </div>
+      <div style={{ minWidth: 0 }}>
+        <div style={{ fontSize: '13px', color: '#eaeaea', fontWeight: 500 }}>{label}</div>
+        <div style={{ fontSize: '11px', color: '#666', marginTop: '1px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{description}</div>
       </div>
-      <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: '4px', flexShrink: 0 }}>
         <button
+          aria-label="-"
+          style={btnStyle}
+          disabled={value <= min}
           onClick={() => onChange(Math.max(min, value - 1))}
-          style={{
-            width: '28px',
-            height: '28px',
-            borderRadius: '6px',
-            border: '1px solid #444',
-            backgroundColor: '#333',
-            color: '#fff',
-            cursor: 'pointer',
-            fontSize: '16px',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center'
-          }}
-        >
-          -
-        </button>
-        <input
-          type="range"
-          min={min}
-          max={max}
-          value={value}
-          onChange={(e) => onChange(Number(e.target.value))}
-          style={{
-            flex: 1,
-            height: '4px',
-            borderRadius: '2px',
-            appearance: 'none',
-            background: `linear-gradient(to right, #666 0%, #666 ${((value - min) / (max - min)) * 100}%, #333 ${((value - min) / (max - min)) * 100}%, #333 100%)`,
-            cursor: 'pointer'
-          }}
-        />
+        >−</button>
+        <div style={{
+          minWidth: '46px',
+          textAlign: 'center',
+          fontSize: '12px',
+          color: '#fff',
+          fontVariantNumeric: 'tabular-nums',
+          padding: '2px 6px',
+          backgroundColor: '#262626',
+          border: '1px solid #2a2a2a',
+          borderRadius: '6px',
+          fontFamily: 'monospace',
+        }}>{value}px</div>
         <button
+          aria-label="+"
+          style={btnStyle}
+          disabled={value >= max}
           onClick={() => onChange(Math.min(max, value + 1))}
-          style={{
-            width: '28px',
-            height: '28px',
-            borderRadius: '6px',
-            border: '1px solid #444',
-            backgroundColor: '#333',
-            color: '#fff',
-            cursor: 'pointer',
-            fontSize: '16px',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center'
-          }}
-        >
-          +
-        </button>
+        >+</button>
       </div>
+    </div>
+  );
+}
+
+// Sidebar behavior toggles (Cmd+/ persistence + click-outside-close).
+// Extracted to its own component so the hooks live at top level (not inside an IIFE
+// inside the main render — that would conditionally call hooks per render branch).
+function SidebarBehaviorSettings() {
+  const sidebarPersistFile = useUIStore((s) => s.sidebarPersistFile);
+  const setSidebarPersistFile = useUIStore((s) => s.setSidebarPersistFile);
+  const sidebarOverlayCloseOnClickOutside = useUIStore((s) => s.sidebarOverlayCloseOnClickOutside);
+  const setSidebarOverlayCloseOnClickOutside = useUIStore((s) => s.setSidebarOverlayCloseOnClickOutside);
+
+  return (
+    <div style={{ marginTop: '16px', paddingTop: '16px', borderTop: '1px solid #333' }}>
+      <div style={{ fontSize: '11px', fontWeight: '600', color: '#666', marginBottom: '12px', textTransform: 'uppercase' }}>
+        Сайдбар (Cmd+/)
+      </div>
+      <label className="flex items-start gap-3 cursor-pointer select-none mb-3" title="Если ВКЛ — при повторном открытии сайдбара восстанавливается ранее открытый файл. Если ВЫКЛ — открывается только дерево.">
+        <div
+          className="relative w-8 h-4 rounded-full transition-colors mt-0.5 shrink-0"
+          style={{ backgroundColor: sidebarPersistFile ? 'rgba(74, 222, 128, 0.4)' : 'rgba(255,255,255,0.1)' }}
+          onClick={() => setSidebarPersistFile(!sidebarPersistFile)}
+        >
+          <div
+            className="absolute top-0.5 w-3 h-3 rounded-full transition-all"
+            style={{
+              left: sidebarPersistFile ? '18px' : '2px',
+              backgroundColor: sidebarPersistFile ? '#4ade80' : '#666',
+            }}
+          />
+        </div>
+        <div>
+          <div style={{ fontSize: '13px', color: '#ccc' }}>Восстанавливать файл при открытии</div>
+          <div style={{ fontSize: '11px', color: '#666' }}>Если выкл — Cmd+/ всегда показывает только дерево</div>
+        </div>
+      </label>
+
+      <label className="flex items-start gap-3 cursor-pointer select-none" title="Закрывать сайдбар при клике вне его (по терминалу или другому месту).">
+        <div
+          className="relative w-8 h-4 rounded-full transition-colors mt-0.5 shrink-0"
+          style={{ backgroundColor: sidebarOverlayCloseOnClickOutside ? 'rgba(74, 222, 128, 0.4)' : 'rgba(255,255,255,0.1)' }}
+          onClick={() => setSidebarOverlayCloseOnClickOutside(!sidebarOverlayCloseOnClickOutside)}
+        >
+          <div
+            className="absolute top-0.5 w-3 h-3 rounded-full transition-all"
+            style={{
+              left: sidebarOverlayCloseOnClickOutside ? '18px' : '2px',
+              backgroundColor: sidebarOverlayCloseOnClickOutside ? '#4ade80' : '#666',
+            }}
+          />
+        </div>
+        <div>
+          <div style={{ fontSize: '13px', color: '#ccc' }}>Закрывать кликом вне</div>
+          <div style={{ fontSize: '11px', color: '#666' }}>Сайдбар работает как overlay поверх терминала</div>
+        </div>
+      </label>
     </div>
   );
 }
@@ -151,9 +189,13 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
   const terminalFontSize = useUIStore((s) => s.terminalFontSize);
   const tabsFontSize = useUIStore((s) => s.tabsFontSize);
   const projectTabsFontSize = useUIStore((s) => s.projectTabsFontSize);
+  const sidebarFontSize = useUIStore((s) => s.sidebarFontSize);
+  const filePreviewFontSize = useUIStore((s) => s.filePreviewFontSize);
   const setTerminalFontSize = useUIStore((s) => s.setTerminalFontSize);
   const setTabsFontSize = useUIStore((s) => s.setTabsFontSize);
   const setProjectTabsFontSize = useUIStore((s) => s.setProjectTabsFontSize);
+  const setSidebarFontSize = useUIStore((s) => s.setSidebarFontSize);
+  const setFilePreviewFontSize = useUIStore((s) => s.setFilePreviewFontSize);
   const tabNotesFontSize = useUIStore((s) => s.tabNotesFontSize);
   const setTabNotesFontSize = useUIStore((s) => s.setTabNotesFontSize);
   const tabNotesPaddingX = useUIStore((s) => s.tabNotesPaddingX);
@@ -938,12 +980,15 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
           backgroundColor: '#1a1a1a',
           borderRadius: '16px',
           border: '1px solid #333',
-          width: activeTab === 'ai' ? '900px' : '560px',
-          maxHeight: '85vh',
+          // Static dimensions across all tabs — switching tabs no longer reflows the
+          // window. AI tab needed 900px historically; we keep that as the universal
+          // width so the lighter tabs (Шрифты/Цвета/Горячие клавиши) get more room
+          // for compact controls instead of one-column slider stacks.
+          width: '900px',
+          height: '85vh',
           overflow: 'hidden',
           display: 'flex',
-          flexDirection: 'column',
-          transition: 'width 0.2s ease'
+          flexDirection: 'column'
         }}
         onClick={(e) => e.stopPropagation()}
       >
@@ -983,9 +1028,9 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
         }}>
           {([
             { id: 'ai', label: 'AI' },
-            { id: 'shortcuts', label: 'Горячие клавиши' },
             { id: 'fonts', label: 'Шрифты' },
-            { id: 'colors', label: 'Цвета' }
+            { id: 'colors', label: 'Цвета' },
+            { id: 'shortcuts', label: 'Горячие клавиши' }
           ] as { id: SettingsTab; label: string }[]).map((tab) => (
             <button
               key={tab.id}
@@ -1063,61 +1108,35 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
 
           {activeTab === 'fonts' && (
             <>
-              <FontSizeSlider
-                label="Терминал"
-                description="Cmd+/- для быстрой настройки"
-                value={terminalFontSize}
-                onChange={setTerminalFontSize}
-                min={8}
-                max={24}
-              />
-              <FontSizeSlider
-                label="Табы"
-                description="Табы воркспейса"
-                value={tabsFontSize}
-                onChange={setTabsFontSize}
-                min={10}
-                max={20}
-              />
-              <FontSizeSlider
-                label="Проекты"
-                description="Чипы проектов"
-                value={projectTabsFontSize}
-                onChange={setProjectTabsFontSize}
-                min={10}
-                max={16}
-              />
+              {/* Шрифты — 2-column grid: at 900px modal width, single-column rows
+                  left ~660px of empty space; two columns gives ~410px per row, plenty
+                  for label + stepper without text wrap. */}
+              <div style={{ fontSize: '11px', fontWeight: 600, color: '#666', marginBottom: '10px', textTransform: 'uppercase' }}>
+                Шрифты интерфейса
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
+                <FontSizeSlider label="Терминал" description="Cmd+/- для быстрой настройки" value={terminalFontSize} onChange={setTerminalFontSize} min={8} max={24} />
+                <FontSizeSlider label="Сайдбар" description="Дерево файлов и Cmd+/" value={sidebarFontSize} onChange={setSidebarFontSize} min={10} max={20} />
+                <FontSizeSlider label="Табы" description="Табы воркспейса" value={tabsFontSize} onChange={setTabsFontSize} min={10} max={20} />
+                <FontSizeSlider label="Проекты" description="Чипы проектов" value={projectTabsFontSize} onChange={setProjectTabsFontSize} min={10} max={16} />
+                <FontSizeSlider label="Превью файла" description="Чтение файла в сайдбаре" value={filePreviewFontSize} onChange={setFilePreviewFontSize} min={10} max={24} />
+              </div>
 
-              {/* Tab Notes section */}
-              <div style={{ marginTop: '16px', paddingTop: '16px', borderTop: '1px solid #333' }}>
-                <div style={{ fontSize: '11px', fontWeight: '600', color: '#666', marginBottom: '12px', textTransform: 'uppercase' }}>
+              <div style={{ marginTop: '20px', paddingTop: '14px', borderTop: '1px solid #2a2a2a' }}>
+                <div style={{ fontSize: '11px', fontWeight: 600, color: '#666', marginBottom: '10px', textTransform: 'uppercase' }}>
                   Описание вкладки
                 </div>
-                <FontSizeSlider
-                  label="Заметки вкладки"
-                  description="Превью и редактор описания"
-                  value={tabNotesFontSize}
-                  onChange={setTabNotesFontSize}
-                  min={10}
-                  max={20}
-                />
-                <FontSizeSlider
-                  label="Padding X"
-                  description="Горизонтальный отступ"
-                  value={tabNotesPaddingX}
-                  onChange={setTabNotesPaddingX}
-                  min={0}
-                  max={32}
-                />
-                <FontSizeSlider
-                  label="Padding Y"
-                  description="Вертикальный отступ"
-                  value={tabNotesPaddingY}
-                  onChange={setTabNotesPaddingY}
-                  min={0}
-                  max={32}
-                />
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
+                  <FontSizeSlider label="Заметки вкладки" description="Превью и редактор описания" value={tabNotesFontSize} onChange={setTabNotesFontSize} min={10} max={20} />
+                  <div /> {/* visual gap so paddings group together below */}
+                  <FontSizeSlider label="Padding X" description="Горизонтальный отступ" value={tabNotesPaddingX} onChange={setTabNotesPaddingX} min={0} max={32} />
+                  <FontSizeSlider label="Padding Y" description="Вертикальный отступ" value={tabNotesPaddingY} onChange={setTabNotesPaddingY} min={0} max={32} />
+                </div>
               </div>
+
+              {/* Sidebar behavior toggles — keep full-width because the labels are
+                  longer and 2-column would crop them. */}
+              <SidebarBehaviorSettings />
             </>
           )}
 

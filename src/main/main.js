@@ -35,6 +35,13 @@ if (process.env.NOTED_E2E_TEST === 'true') {
 // Disable HTTP cache to ensure fresh code after updates
 app.commandLine.appendSwitch('disable-http-cache');
 
+// CDP только в dev — нужен для автотестов через node /tmp/cdp.js (port 9224
+// уникален для этого проекта: sc-desktop=9223, gt-editor=9222). В prod не
+// открываем сокет, чтобы не давать сторонним процессам доступ к Electron.
+if (process.env.NODE_ENV === 'development' || !app.isPackaged) {
+  app.commandLine.appendSwitch('remote-debugging-port', '9224');
+}
+
 // Load modules from src/main (works for both dev and production)
 const srcMainDir = path.join(__dirname, '..', '..', 'src', 'main');
 const projectManager = require(path.join(srcMainDir, 'project-manager'));
@@ -308,32 +315,70 @@ function detectIncompleteEscapeTail(data) {
 
 // ========== LLM PROVIDER PROXY ==========
 // Embedded HTTP proxy that lets Claude Code talk to alternative providers.
-// Claude starts with ANTHROPIC_BASE_URL=http://127.0.0.1:<PROXY_PORT>.
-// "anthropic" mode: passthrough to api.anthropic.com (subscription auth).
-// "zen" mode: passthrough to opencode.ai/zen (Anthropic-compatible, Kimi/MiniMax/GLM).
+// Per-tab routing: each Claude is spawned with
+//   ANTHROPIC_BASE_URL=http://127.0.0.1:<PROXY_PORT>/t/<encoded-tabId>
+// so the proxy can dispatch each request to that tab's own provider state
+// independently of other tabs.
+// Modes:
+//   "anthropic" — passthrough to api.anthropic.com (subscription auth)
+//   "zen"       — passthrough to opencode.ai/zen (Anthropic-compatible, Kimi/MiniMax/GLM)
+//   "deepseek"  — api.deepseek.com/anthropic (V4 Flash/Pro), supports thinking + output_config.effort
 let PROVIDER_PROXY_PORT = 4001;
-let providerState = { type: 'anthropic' }; // or { type: 'zen', model: 'kimi-k2.5' }
+// providerStates: tabId → { type, model?, thinking?, effort? }
+// 'global' is a fallback bucket for requests that didn't carry a /t/<id> prefix
+// (e.g. external Claude started outside spawn-with-watcher).
+const providerStates = new Map();
+const PROVIDER_DEFAULT = Object.freeze({ type: 'anthropic' });
+function getProviderState(tabId) {
+  if (!tabId) return providerStates.get('global') || PROVIDER_DEFAULT;
+  return providerStates.get(tabId) || providerStates.get('global') || PROVIDER_DEFAULT;
+}
+function setProviderState(tabId, state) {
+  providerStates.set(tabId || 'global', state);
+}
+
 const ZEN_API_KEY = process.env.OPENCODE_ZEN_KEY || '';
+const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || '';
 
 // Keep-alive agents: reuse TCP+TLS connections instead of handshake per request (~200-500ms saving)
 const anthropicAgent = new https.Agent({ keepAlive: true, keepAliveMsecs: 60000, maxSockets: 10, maxFreeSockets: 5 });
 const zenAgent = new https.Agent({ keepAlive: true, keepAliveMsecs: 60000, maxSockets: 5, maxFreeSockets: 3 });
+const deepseekAgent = new https.Agent({ keepAlive: true, keepAliveMsecs: 60000, maxSockets: 5, maxFreeSockets: 3 });
 
 // Track active proxy connections for graceful shutdown
 const proxyActiveConnections = new Set();
 
 const providerProxy = http.createServer((req, res) => {
-  // Track connection for graceful shutdown
+  // Track connection for graceful shutdown.
+  // FIX (2026-04-25): with keep-alive enabled, one TCP socket serves MANY HTTP
+  // requests. Previously each request unconditionally added its own
+  // `socket.once('close', ...)` listener — after 11 requests on the same socket
+  // Node printed `MaxListenersExceededWarning: 11 close listeners added`.
+  // Guard: only attach the close listener (and set membership) the FIRST time
+  // we see a socket. Subsequent requests on the same keep-alive socket skip both.
   const socket = req.socket;
-  proxyActiveConnections.add(socket);
-  socket.once('close', () => proxyActiveConnections.delete(socket));
+  if (!proxyActiveConnections.has(socket)) {
+    proxyActiveConnections.add(socket);
+    socket.once('close', () => proxyActiveConnections.delete(socket));
+  }
+
+  // Parse /t/<encoded-tabId>/... prefix to determine which tab's state to use.
+  // If absent, fall back to 'global' bucket (external Claude or legacy spawns).
+  let tabId = null;
+  let forwardUrl = req.url;
+  const tabMatch = req.url.match(/^\/t\/([^/?]+)(\/.*|\?.*|$)/);
+  if (tabMatch) {
+    try { tabId = decodeURIComponent(tabMatch[1]); } catch { tabId = tabMatch[1]; }
+    forwardUrl = tabMatch[2] || '/';
+  }
+  const reqState = getProviderState(tabId);
 
   const chunks = [];
   req.on('data', (chunk) => chunks.push(chunk));
   req.on('end', () => {
     let body = Buffer.concat(chunks);
-    const mode = providerState.type;
-    const targetModel = providerState.model || '';
+    const mode = reqState.type;
+    const targetModel = reqState.model || '';
 
     // Determine target host
     let targetHost, targetPort, targetPath, authHeaders, agent;
@@ -341,7 +386,7 @@ const providerProxy = http.createServer((req, res) => {
       // OpenCode Zen — Anthropic-compatible, direct passthrough with model rewrite
       targetHost = 'opencode.ai';
       targetPort = 443;
-      targetPath = '/zen/go' + req.url;
+      targetPath = '/zen/go' + forwardUrl;
       agent = zenAgent;
       // Rewrite model name in body
       try {
@@ -352,11 +397,47 @@ const providerProxy = http.createServer((req, res) => {
         console.log('[ProviderProxy] Zen: ' + origModel + ' → ' + targetModel + ' msgs=' + (parsed.messages?.length || 0));
       } catch {}
       authHeaders = { 'x-api-key': ZEN_API_KEY };
+    } else if (mode === 'deepseek') {
+      // DeepSeek — official Anthropic-compatible endpoint at /anthropic/v1/messages.
+      // Same Anthropic Messages format; rewrite model name; auth via DEEPSEEK_API_KEY.
+      // DeepSeek-specific extensions injected into body (from UI state):
+      //   thinking.type: 'enabled' | 'disabled'  (DeepSeek ignores budget_tokens)
+      //   output_config.effort: 'low' | 'medium' | 'high'  (controls reasoning depth)
+      // DeepSeek ignores cache_control, so SSE message_start cache stats will always be 0 — expected.
+      targetHost = 'api.deepseek.com';
+      targetPort = 443;
+      targetPath = '/anthropic' + forwardUrl;
+      agent = deepseekAgent;
+      try {
+        const parsed = JSON.parse(body.toString());
+        const origModel = parsed.model;
+        parsed.model = targetModel;
+        // DeepSeek API constraint: thinking.type:'disabled' cannot coexist with output_config.effort.
+        // Unified UI state: reqState.effort in {'off','low','medium','high'} (default 'medium').
+        //   'off' → thinking disabled, no output_config
+        //   low/medium/high → thinking enabled + output_config.effort:<level>
+        // We deliberately ignore reqState.thinking here — it's redundant for DeepSeek (the effort 'off' value carries that signal).
+        const reqEffort = reqState.effort || 'medium';
+        let logEffort;
+        if (reqEffort === 'off') {
+          parsed.thinking = { type: 'disabled' };
+          delete parsed.output_config;
+          logEffort = 'off';
+        } else {
+          const lvl = ['low','medium','high'].includes(reqEffort) ? reqEffort : 'medium';
+          parsed.thinking = { type: 'enabled' };
+          parsed.output_config = { effort: lvl };
+          logEffort = lvl;
+        }
+        body = Buffer.from(JSON.stringify(parsed));
+        console.log('[ProviderProxy] DeepSeek[' + (tabId ? tabId.slice(-12) : 'global') + ']: ' + origModel + ' → ' + targetModel + ' msgs=' + (parsed.messages?.length || 0) + ' effort=' + logEffort);
+      } catch {}
+      authHeaders = { 'x-api-key': DEEPSEEK_API_KEY };
     } else {
       // Anthropic passthrough
       targetHost = 'api.anthropic.com';
       targetPort = 443;
-      targetPath = req.url;
+      targetPath = forwardUrl;
       agent = anthropicAgent;
       authHeaders = {};
       // Fast path: skip JSON parse if no thinking blocks to strip (preserves exact body bytes → cache key intact)
@@ -381,11 +462,12 @@ const providerProxy = http.createServer((req, res) => {
           }
         } catch {}
       }
-      console.log('[ProviderProxy] Anthropic passthrough: ' + req.url);
+      console.log('[ProviderProxy] Anthropic[' + (tabId ? tabId.slice(-12) : 'global') + '] passthrough: ' + forwardUrl);
     }
 
     const fwdHeaders = { ...req.headers, host: targetHost, ...authHeaders };
-    if (mode === 'zen') {
+    if (mode === 'zen' || mode === 'deepseek') {
+      // Strip Claude OAuth (we authenticate to the third-party provider via x-api-key instead)
       delete fwdHeaders['authorization'];
     }
     // Recalculate content-length for correct body size (may have changed after thinking strip)
@@ -399,7 +481,8 @@ const providerProxy = http.createServer((req, res) => {
       headers: fwdHeaders,
       agent,
     }, (proxyRes) => {
-      console.log('[ProviderProxy] ' + (mode === 'zen' ? 'Zen' : 'Anthropic') + ' responded: ' + proxyRes.statusCode);
+      const modeLabel = mode === 'zen' ? 'Zen' : mode === 'deepseek' ? 'DeepSeek' : 'Anthropic';
+      console.log('[ProviderProxy] ' + modeLabel + ' responded: ' + proxyRes.statusCode);
 
       // Log cache stats from streaming response (first SSE message_start event)
       if (mode === 'anthropic' && proxyRes.headers['content-type']?.includes('event-stream')) {
@@ -467,7 +550,7 @@ async function proxyGracefulShutdown() {
 function startProxyOnPort(port) {
   providerProxy.listen(port, '127.0.0.1', () => {
     PROVIDER_PROXY_PORT = port;
-    console.log('[ProviderProxy] Started on http://127.0.0.1:' + port + ' (keepAlive=true) → ' + providerState.type);
+    console.log('[ProviderProxy] Started on http://127.0.0.1:' + port + ' (keepAlive=true, per-tab routing)');
   });
   providerProxy.on('error', (e) => {
     if (e.code === 'EADDRINUSE' && port < 4010) {
@@ -524,6 +607,19 @@ function startSessionBridge() {
       }
 
       if (!tabId) return; // Not our process
+
+      // CWD guard: don't overwrite tab session if the detected session belongs to a different cwd.
+      // Happens when user runs `claude --resume <foreignId>` in tab "X" — Claude finds the session
+      // file in OTHER project's slug, but PID resolves to tab "X" → bridge would slap foreign sessionId
+      // on the wrong tab. Compare bridge.cwd to tab's PTY cwd; mismatch = wrong-project resume.
+      const tabCwd = terminalProjects.get(tabId);
+      if (data.cwd && tabCwd && data.cwd !== tabCwd) {
+        const known = bridgeKnownSessions.get(tabId);
+        if (known !== data.session_id) {
+          console.warn('[Bridge:CwdGuard] Skip overwrite: tab cwd=' + tabCwd + ' but bridge cwd=' + data.cwd + ' (sid=' + data.session_id.substring(0, 8) + '...)');
+        }
+        return;
+      }
 
       // Debug: log PID chain resolution for session detection
       const knownForTab = bridgeKnownSessions.get(tabId);
@@ -3853,8 +3949,9 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
       LC_ALL: process.env.LC_ALL || 'en_US.UTF-8',
       TERM_PROGRAM: 'vscode',  // Triggers xterm.js-optimized rendering in Claude Code's Ink
       TERM_PROGRAM_VERSION: '1.0.0',
-      // Route Claude Code through our local proxy for dynamic provider switching
-      ANTHROPIC_BASE_URL: 'http://127.0.0.1:' + PROVIDER_PROXY_PORT,
+      // Route Claude Code through our local proxy for dynamic provider switching.
+      // Per-tab prefix /t/<tabId> lets the proxy keep independent provider state per tab.
+      ANTHROPIC_BASE_URL: 'http://127.0.0.1:' + PROVIDER_PROXY_PORT + '/t/' + encodeURIComponent(tabId),
     };
 
     // Zsh: use ZDOTDIR to load our integration
@@ -4271,9 +4368,12 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
         var hasContentSpinner = CONTENT_SPINNER_RE.test(contentStripped);
 
         if (hasContentSpinner) {
-          // Diagnostic: log what triggered spinner when BoundarySM is already idle
+          // Diagnostic: log what triggered spinner when BoundarySM is already idle.
+          // PERF (2026-04-21): hot path — this log fires hundreds of times per second
+          // per active Claude TUI (~142K log lines per session). Dev-only; enable in
+          // prod via DEBUG_SPINNER=1 when investigating busy-detection regressions.
           var _bsmState = promptBoundaryState.get(tabId) || 'idle';
-          if (_bsmState === 'idle') {
+          if ((isDev || process.env.DEBUG_SPINNER === '1') && _bsmState === 'idle') {
             var _match = contentStripped.match(/[\u2722\u2733\u2736\u273B\u273D]/);
             if (_match) {
               var _idx = contentStripped.indexOf(_match[0]);
@@ -4805,22 +4905,52 @@ ipcMain.handle('claude:send-command', async (event, tabId, command) => {
   }
 });
 
-// ========== LLM Provider Switching ==========
-ipcMain.handle('provider:switch', (event, opts) => {
-  // opts: { type: 'anthropic' } or { type: 'zen', model: 'minimax-m2.5' }
-  const prev = providerState.type + (providerState.model ? ':' + providerState.model : '');
-  providerState = opts;
-  const curr = providerState.type + (providerState.model ? ':' + providerState.model : '');
-  console.log('[ProviderProxy] Switched: ' + prev + ' → ' + curr);
-  // Broadcast to all renderer windows
+// ========== LLM Provider Switching (per-tab) ==========
+// All three handlers accept (event, { tabId, ... }). tabId is required so that
+// switching the provider in one tab does NOT affect any other tab.
+// For backward compatibility (legacy call shape without tabId) the change
+// applies to the 'global' bucket — used by external Claude spawned without
+// /t/<tabId> prefix.
+function broadcastProviderState(tabId, state) {
   if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send('provider:state-changed', providerState);
+    mainWindow.webContents.send('provider:state-changed', { tabId: tabId || 'global', state });
   }
-  return providerState;
+}
+
+ipcMain.handle('provider:switch', (event, opts) => {
+  // opts: { tabId, type, model? }
+  const tabId = opts?.tabId || null;
+  const prev = JSON.stringify(getProviderState(tabId));
+  const next = { type: opts.type };
+  if (opts.model) next.model = opts.model;
+  // Preserve thinking/effort across model switches inside same provider; reset on provider change.
+  const oldState = getProviderState(tabId);
+  if (oldState.type === next.type) {
+    if (oldState.thinking) next.thinking = oldState.thinking;
+    if (oldState.effort) next.effort = oldState.effort;
+  }
+  setProviderState(tabId, next);
+  console.log('[ProviderProxy] Switched[' + (tabId ? tabId.slice(-12) : 'global') + ']: ' + prev + ' → ' + JSON.stringify(next));
+  broadcastProviderState(tabId, next);
+  return next;
 });
 
-ipcMain.handle('provider:get-status', () => {
-  return providerState;
+ipcMain.handle('provider:get-status', (event, opts) => {
+  // opts: { tabId } | undefined (legacy → global)
+  const tabId = opts?.tabId || null;
+  return getProviderState(tabId);
+});
+
+// Update DeepSeek-specific knobs (thinking, effort) for one tab without touching provider/model.
+ipcMain.handle('provider:set-options', (event, opts) => {
+  const tabId = opts?.tabId || null;
+  const cur = { ...getProviderState(tabId) };
+  if (typeof opts?.thinking === 'string') cur.thinking = opts.thinking;
+  if (typeof opts?.effort === 'string') cur.effort = opts.effort;
+  setProviderState(tabId, cur);
+  console.log('[ProviderProxy] Options[' + (tabId ? tabId.slice(-12) : 'global') + ']: ' + JSON.stringify(cur));
+  broadcastProviderState(tabId, cur);
+  return cur;
 });
 
 // Toggle thinking mode reactively: open picker → detect state → navigate → confirm
@@ -5987,6 +6117,60 @@ ipcMain.handle('system:get-gemini-processes', async () => {
       }
     }
 
+    return processes;
+  } catch {
+    return [];
+  }
+});
+
+ipcMain.handle('system:get-mcp-processes', async () => {
+  try {
+    // MCP servers run as `node /path/to/mcp-server.js` spawned by Claude/Gemini CLIs.
+    // Filter by command containing "mcp" or known MCP paths to avoid catching unrelated node processes.
+    const psOutput = await execAsync(
+      'ps -eo pid,ppid,pcpu,pmem,lstart,command | grep -E "mcp|terminal-server\\.mjs|knowledge-server\\.mjs|gemini-mcp|yougile-mcp|playwright-mcp|chrome-devtools|extension-mcp" | grep -v grep | grep -v Electron',
+      3000
+    );
+    if (!psOutput) return [];
+
+    // Build alive PIDs set: our PTY shells + their CLI children (claude, gemini)
+    const aliveCliPids = new Set();
+    for (const [, ptyProcess] of terminals) aliveCliPids.add(ptyProcess.pid);
+    // Also collect direct claude/gemini PIDs whose ppid is in our shells
+    try {
+      const cliPs = await execAsync('ps -eo pid,ppid,command | grep -E "claude|gemini" | grep -v grep', 2000);
+      for (const line of (cliPs || '').split('\n').filter(Boolean)) {
+        const m = line.trim().match(/^\s*(\d+)\s+(\d+)\s+(.+)/);
+        if (!m) continue;
+        const pid = Number(m[1]); const ppid = Number(m[2]); const cmd = m[3];
+        if (cmd.includes('Electron') || cmd.includes('electron')) continue;
+        if (aliveCliPids.has(ppid)) aliveCliPids.add(pid);
+      }
+    } catch {}
+
+    const lines = psOutput.split('\n').filter(Boolean);
+    const processes = [];
+    for (const line of lines) {
+      const match = line.trim().match(/^\s*(\d+)\s+(\d+)\s+([\d.]+)\s+([\d.]+)\s+\w+\s+\w+\s+\d+\s+(\d+:\d+:\d+)\s+\d+\s+(.+)/);
+      if (!match) continue;
+      const pid = Number(match[1]);
+      const ppid = Number(match[2]);
+      const cpu = match[3];
+      const mem = match[4];
+      const startTime = match[5].substring(0, 5);
+      const command = match[6].trim();
+      if (command.includes('Electron') || command.includes('electron')) continue;
+
+      // Extract short name: last path component or args[0]
+      let name = 'mcp';
+      const m1 = command.match(/([\w.-]+(?:-mcp|mcp-server|server\.mjs|extension-mcp\/index\.js))/i);
+      if (m1) name = m1[1].replace(/^.*\//, '');
+      else { const parts = command.split(/\s+/); name = (parts[1] || parts[0] || 'mcp').split('/').pop() || 'mcp'; }
+
+      // Alive = ppid is one of our PTY shells OR one of CLI children of them
+      const isAlive = aliveCliPids.has(ppid);
+      processes.push({ pid, ppid, cpu, mem, startTime, command, name, isAlive });
+    }
     return processes;
   } catch {
     return [];
@@ -7327,6 +7511,27 @@ ipcMain.on('claude:run-command', (event, { tabId, command, sessionId, forkSessio
             projectManager.db.saveForkMarker(forkSessionId, newSessionId, entryUuids);
             console.log('[Claude Runner] Fork marker saved with', entryUuids.length, 'UUIDs');
           } catch (e) { console.warn('[Claude Runner] Fork marker error:', e.message); }
+
+          // Carry purple notes and pink rewind markers over to the fork's sessionId.
+          // Notes/markers are keyed on (entry_uuid, session_id); fork creates a new
+          // session_id for the same UUIDs, so we explicitly rebind them.
+          try {
+            const allUuids = [];
+            const raw = fs.readFileSync(destPath, 'utf-8');
+            for (const line of raw.split('\n')) {
+              if (!line.trim()) continue;
+              try {
+                const r = JSON.parse(line);
+                if (r.uuid) allUuids.push(r.uuid);
+              } catch {}
+            }
+            const copied = projectManager.db.copyTimelineMetadataForFork(newSessionId, allUuids, tabId);
+            if (copied.notes > 0 || copied.rewindMarkers > 0) {
+              console.log('[Claude Runner] Copied timeline metadata: notes=' + copied.notes + ' rewindMarkers=' + copied.rewindMarkers);
+            }
+          } catch (e) {
+            console.warn('[Claude Runner] Could not copy timeline metadata:', e.message);
+          }
 
           // Import session_links from other DB (prod↔dev) for the source session chain
           try {

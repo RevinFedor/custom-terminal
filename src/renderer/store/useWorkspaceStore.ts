@@ -619,10 +619,21 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
 
       saveSession();
     } else if (!background) {
+      // PERF (2026-04-21): instrument the hot switch path. Time-to-next-frame tells
+      // us how long React takes to paint after we flip activeProjectId.
+      // Target after the Apr refactor: <50ms. Regression signal: durMs > 200.
+      const prevActiveId = get().activeProjectId;
+      const _t0 = performance.now();
       set({
         activeProjectId: projectId,
         view: 'workspace',
         projectHistory: newHistory
+      });
+      requestAnimationFrame(() => {
+        const durMs = (performance.now() - _t0).toFixed(1);
+        const tabCount = Array.from(get().openProjects.values())
+          .reduce((acc, ws) => acc + ws.tabs.size, 0);
+        console.warn(`[Perf:ProjectSwitch] from=${String(prevActiveId).slice(-12)} to=${projectId.slice(-12)} durMs=${durMs} totalTabs=${tabCount}`);
       });
       saveSession();
     }
@@ -966,6 +977,13 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     const workspace = openProjects.get(projectId);
 
     if (workspace && workspace.tabs.has(tabId)) {
+      // PERF (2026-04-21): instrument within-project tab switch. After the Apr
+      // refactor the TerminalArea useMemo should NOT recalculate here — child
+      // Terminals flip active state via their own store subscription.
+      // Regression: durMs > 150 or [TerminalArea:useMemo RECALCULATING] on a
+      // within-project switch means fingerprint regressed.
+      const _t0 = performance.now();
+      const prevActiveId = workspace.activeTabId;
       workspace.activeTabId = tabId;
       // Don't reset viewingSubAgentTabId here — it persists across tab switches.
       // User dismisses it explicitly via SubAgentBar "← Back" button or clicking the active chip.
@@ -975,6 +993,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       // Use startTransition to prevent UI blocking during re-render
       startTransition(() => {
         set({ openProjects: new Map(openProjects) });
+      });
+      requestAnimationFrame(() => {
+        const durMs = (performance.now() - _t0).toFixed(1);
+        console.warn(`[Perf:TabSwitch] project=${projectId.slice(-12)} from=${String(prevActiveId).slice(-12)} to=${tabId.slice(-12)} durMs=${durMs}`);
       });
       saveSession();
     }

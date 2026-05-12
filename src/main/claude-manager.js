@@ -336,119 +336,14 @@ class ClaudeManager {
       return null;
     });
 
-    // Fork Claude session file: copy .jsonl with new UUID
-    ipcMain.handle('claude:fork-session-file', async (event, { sourceSessionId, cwd }) => {
-      console.log('[Claude Fork] ========================================');
-      console.log('[Claude Fork] Copying session:', sourceSessionId);
-      console.log('[Claude Fork] Current cwd:', cwd);
-
-      try {
-        const claudeProjectsDir = path.join(os.homedir(), '.claude', 'projects');
-        console.log('[Claude Fork] Claude projects dir:', claudeProjectsDir);
-
-        // Find session file across ALL project directories
-        let sourcePath = null;
-        let projectDir = null;
-
-        // First, try the cwd-based path (most likely)
-        const projectSlug = cwd.replace(/\//g, '-');
-        const primaryDir = path.join(claudeProjectsDir, projectSlug);
-        const primaryPath = path.join(primaryDir, `${sourceSessionId}.jsonl`);
-
-        if (fs.existsSync(primaryPath)) {
-          sourcePath = primaryPath;
-          projectDir = primaryDir;
-          console.log('[Claude Fork] Found in primary location:', sourcePath);
-        } else {
-          // Search all project directories
-          console.log('[Claude Fork] Not in primary location, searching ALL projects...');
-          if (fs.existsSync(claudeProjectsDir)) {
-            const projectDirs = fs.readdirSync(claudeProjectsDir, { withFileTypes: true })
-              .filter(dirent => dirent.isDirectory())
-              .map(dirent => dirent.name);
-
-            for (const dir of projectDirs) {
-              const checkPath = path.join(claudeProjectsDir, dir, `${sourceSessionId}.jsonl`);
-              const exists = fs.existsSync(checkPath);
-              if (exists) {
-                sourcePath = checkPath;
-                projectDir = path.join(claudeProjectsDir, dir);
-                console.log('[Claude Fork] ✓ FOUND in:', sourcePath);
-                break;
-              }
-            }
-          } else {
-            console.log('[Claude Fork] ERROR: Claude projects dir does not exist!');
-          }
-        }
-
-        if (!sourcePath) {
-          console.error('[Claude Fork] ✗ Source file not found in ANY project directory');
-          return { success: false, error: 'Session file not found: ' + sourceSessionId };
-        }
-
-        // Generate new UUID
-        const newSessionId = crypto.randomUUID();
-        console.log('[Claude Fork] New session ID:', newSessionId);
-
-        const destPath = path.join(projectDir, `${newSessionId}.jsonl`);
-
-        if (!fs.existsSync(sourcePath)) {
-          return { success: false, error: 'Session file not found: ' + sourceSessionId };
-        }
-
-        // Check source file is not empty
-        const stats = fs.statSync(sourcePath);
-        if (stats.size === 0) {
-          return { success: false, error: 'Source session is empty' };
-        }
-
-        // Copy the file
-        fs.copyFileSync(sourcePath, destPath);
-        console.log('[Claude Fork] Copied:', sourcePath, '->', destPath);
-
-        // Wait for Claude to index the new file
-        await new Promise(resolve => setTimeout(resolve, 500));
-
-        return { success: true, newSessionId };
-      } catch (error) {
-        console.error('[Claude Fork] Error:', error);
-        return { success: false, error: error.message };
-      }
-    });
-
-    // Legacy fork handler (for new tab creation)
-    ipcMain.on('claude:fork-session', async (event, { tabId, existingSessionId, cwd }) => {
-      console.log('[Claude Fork] Starting fork for tab:', tabId);
-      try {
-        const newSessionId = crypto.randomUUID();
-        const projectSlug = cwd.replace(/\//g, '-');
-        const projectDir = path.join(os.homedir(), '.claude', 'projects', projectSlug);
-
-        if (existingSessionId) {
-          const oldPath = path.join(projectDir, `${existingSessionId}.jsonl`);
-          const newPath = path.join(projectDir, `${newSessionId}.jsonl`);
-
-          if (fs.existsSync(oldPath)) {
-            fs.copyFileSync(oldPath, newPath);
-            console.log('[Claude Fork] Copied session file:', oldPath, '->', newPath);
-          }
-        }
-
-        event.sender.send('claude:fork-complete', {
-          success: true,
-          newSessionId,
-          cwd
-        });
-      } catch (error) {
-        console.error('[Claude Fork] Error:', error);
-        event.sender.send('claude:fork-complete', {
-          success: false,
-          error: error.message
-        });
-      }
-    });
-
+    // NOTE (2026-04-25): two legacy fork handlers were removed from here.
+    //   - `claude:fork-session-file` is now registered by src/main/ipc/claude-data.js
+    //     (canonical version with sessionChain resolution + skipChainResolve option).
+    //   - `claude:fork-session` is now registered by src/main/main.js (~line 7163).
+    // The previous duplicate registrations made ipcMain.handle() throw at startup
+    // ("Attempted to register a second handler"), which aborted registerHandlers()
+    // on the FIRST throw — silently skipping any handlers below this point.
+    // Keep this block empty so new handlers can be appended safely.
   }
 }
 

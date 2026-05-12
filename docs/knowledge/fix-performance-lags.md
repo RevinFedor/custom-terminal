@@ -113,6 +113,124 @@ startTransition(() => {
 
 **Правило:** Для детекции state transitions в Zustand из async code, где промежуточные состояния могут быть batch'ены React'ом — использовать `subscribe()`, не `useEffect`.
 
+## 5. Frozen Terminal: Z-index Race у "локальных" селекторов активности
+
+### Симптом
+- При переключении табов между проектами **Timeline обновляется корректно**, но содержимое xterm в правой части не меняется.
+- Команды отправляются в правильный таб (PTY работает), но визуально пользователь видит **первый из табов, открытых при старте приложения** — он "заморожен" поверх.
+- При прокрутке мышью скроллится именно он, не активный.
+
+### Root Cause: каждый проект "claim" один таб
+Чтобы убрать `activeTabId` из fingerprint в `TerminalArea` (см. секцию 6) и не пересчитывать список 40+ терминалов при каждом переключении, селектор активности был перенесён **внутрь** `Terminal`/`BrowserTab`/`ClaudeSDKTab`. Первая (сломанная) версия:
+
+```tsx
+const activeFromStore = useWorkspaceStore((state) => {
+  for (const [, workspace] of state.openProjects) {
+    if (workspace.tabs.has(tabId)) {
+      return workspace.activeTabId === tabId;  // ❌ нет проверки активного проекта
+    }
+  }
+  return false;
+});
+```
+
+При 7 открытых проектах **каждый** проект имеет свой `activeTabId` (последний посещённый таб). Селектор возвращал `true` для всех 7 терминалов одновременно. Все 7 получали `zIndex: 1`, `visibility: visible` — и **первый в порядке DOM** перекрывал остальных.
+
+### Решение
+```tsx
+return state.activeProjectId === projId && workspace.activeTabId === tabId;
+```
+
+Селектор обязан проверять **И** projectId, **И** tabId. Невидимый контекст: AI без этого комментария может в рефакторинге убрать `state.activeProjectId === projId &&` как "избыточный" — оба компонента и так подписаны на свой `tabId`.
+
+### Регрессия-сигнал
+В каждом Terminal в useEffect ведётся регистрация в модульный `_visibleTerminals: Set<string>`. После каждого изменения rAF-debounce проверяет инвариант "ровно 1 терминал visible":
+```
+[Terminal:VisibleSetInvariant] count=2 tabs=[...] (VIOLATION — z-index fight, user sees wrong terminal)
+```
+- `count=1` — норма (логи не пишутся).
+- `count=0` — нормально briefly во время transition.
+- `count>=2` устойчиво ≥1 rAF — регрессия. Селектор сломан.
+
+---
+
+## 6. TerminalArea Fingerprint: Structural Only
+
+### Проблема
+До рефакторинга 2026-04-21 fingerprint содержал `${projId}:${workspace.activeTabId}` для **каждого** проекта. Любая смена `activeTabId` в **любом** проекте триггерила пересчёт `useMemo`, который создавал React-элементы для всех 40+ табов всех проектов. На каждый таб шёл `useEffect([effectiveActive])` → `[Terminal:deactivate]` × 13. Переключение проектов лагало.
+
+### Решение
+Каждый Terminal/BrowserTab/ClaudeSDKTab сам подписывается на свой active-флаг (см. секцию 5). Fingerprint в `TerminalArea` стал **структурным**:
+```tsx
+parts.push(projId === projectId ? `${projId}${hostActivePart}` : projId);
+parts.push(`${tab.id}:${tab.tabType || 'terminal'}`);
+```
+- `projId` других проектов — без `activeTabId`. Переключение там не задевает host.
+- `tab.id` + `tabType` — для add/remove/retype. Если таб сменил тип `terminal → browser`, useMemo пересоберёт элементы (другой компонент).
+
+### Исключение: Sub-agent Override
+`activeTabId` host-проекта попадает в fingerprint **только** когда `viewingSubAgentTabId` armed. Тогда useMemo вынужден пересчитать `activeOverride` для двух tab IDs (sub-agent → активен, parent Gemini → неактивен). В норме это редкий случай.
+
+### Регрессия-сигнал
+```
+[TerminalArea:useMemo] RECALCULATING count=N projectId=... durMs=... (structural: add/remove/type/sub-agent)
+```
+- На переключение **между проектами** или **между табами одного проекта** — НЕ должно появляться.
+- Должно появляться только при: создании/закрытии таба, смене tabType, активации/деактивации sub-agent override.
+- Если появляется на каждом TabBar:click — кто-то вернул `activeTabId` других проектов в fingerprint.
+
+---
+
+## 7. Observability Toolkit (для будущих регрессий)
+
+После рефакторинга 2026-04-21 в коде расставлены лог-теги, которые **не должны** появляться часто в нормальной работе. Каждый из них — сигнал конкретной регрессии.
+
+| Тег | Норма | Регрессия |
+|---|---|---|
+| `[Perf:ProjectSwitch] durMs=N` | <50ms | >200ms = что-то синхронно блокирует main thread |
+| `[Perf:TabSwitch] durMs=N` | <50ms | >150ms = TerminalArea пересчитывает useMemo |
+| `[Terminal:VisibleSetInvariant] count=N` | не появляется (count=1 silent) | `count>=2 VIOLATION` = z-index fight (см. секцию 5) |
+| `[TerminalArea:useMemo RECALCULATING]` | редко — add/remove/type | на каждый switch = fingerprint регрессировал |
+| `[Timeline:PollPaused] reason=...` / `[Timeline:PollResumed]` | 1:1 пары при visibility-changes | rогда poll не паузится при свёрнутом окне → 99% IPC впустую |
+| `[DB:ForkCache] stats hit=X miss=Y` | hit:miss ≥ 100:1 | низкий ratio = cache invalidation слишком агрессивная или вызовы с разными sessionId |
+| `[Spinner:DIAG]` | 0 в prod | если появилось в `~/Library/Logs/...` — gate за `isDev` сломан |
+| `[Terminal:StateTransition]` | один на реальное изменение состояния | rate-limit ref-diff; если каждый рендер — диф сломан |
+
+### Команды для быстрой диагностики
+```bash
+# "Замороженный" терминал?
+grep "Terminal:VisibleSetInvariant" ~/Library/Logs/noted-terminal/production.log | grep VIOLATION | tail -5
+
+# Тормозит переключение?
+grep -E "Perf:(Project|Tab)Switch" ~/Library/Logs/noted-terminal/production.log | \
+  awk -F'durMs=' '{print $2}' | awk '{print $1}' | sort -rn | head -10
+
+# Cache не работает?
+grep "DB:ForkCache" ~/Library/Logs/noted-terminal/production.log | tail -3
+```
+
+---
+
+## 8. Кумулятивная CPU-нагрузка при 6+ Claude-сессиях (апрель 2026)
+
+### Симптомы
+- `kernel_task` 200%+ CPU, `mDNSResponder` под 65%, несколько `node` процессов по 60% каждый.
+- Нагрузка не спадает даже после остановки всех Claude-процессов (thermal throttling уже включился, нужно остыть).
+- Проблема появилась после добавления Terminal MCP (output buffer в onData).
+
+### Корневая причина: соломинка, сломавшая верблюда
+6 сессий × backtrace каждые 2с × ~1700 records с `unshift()` = O(n²) на каждый poll. Плюс новый `terminalOutputBuffer` добавил `data.split('\n') + Array.splice(0, excess)` в onData для всех 15+ табов (~750 операций/сек). Кумулятивная нагрузка перевела CPU в thermal throttling — `kernel_task` забирает себе фантомные циклы чтобы замедлить остальных.
+
+### Решения
+
+**Timeline Backtrace Cache (`_timelineCache`):** Если `lastRecord.uuid` и `recordMap.size` не изменились — возвращается кешированный результат. При idle (Claude не пишет) — 0 пересчётов вместо 30/мин на сессию. Инвалидируется при cache recovery (`_jsonlCache.clear()`).
+
+**O(n) сборка backtrace:** `activeBranch.unshift()` (O(n) на каждую вставку × n элементов = O(n²)) заменён на `push()` + финальный `reverse()` (O(n) суммарно). Применено только в `claude:get-timeline` (горячий путь). Остальные 4 handler'а (fork, export, edit-range, full-history) вызываются по действию пользователя — O(n²) для них некритичен.
+
+**Circular buffer для Terminal MCP:** `push() + splice(0, excess)` заменён на ring buffer с O(1) записью на строку. Подробнее: [`fact-terminal-mcp.md`](fact-terminal-mcp.md).
+
+---
+
 ## См. также
 - [`fact-backtrace-jsonl.md`](fact-backtrace-jsonl.md) — детали инкрементального чтения.
 - [`fact-react-patterns.md`](fact-react-patterns.md) — паттерн гранулярных селекторов.

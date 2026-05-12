@@ -47,7 +47,9 @@ Shell остаётся живым. Output buffer не теряется. PTY pid 
 - **Ctrl+C trap**: Некоторые процессы ловят SIGINT. 30s safety timeout покрывает, но в теории возможны две копии процесса если timeout сработает до реального завершения
 
 ## Output Ring Buffer
-`terminalOutputBuffer` — Map<tabId, {lines: string[], maxLines: 500}>. Заполняется синхронно в `ptyProcess.onData`. Не использует await (anti-pattern: async onData race). Удаляется в `onExit`.
+`terminalOutputBuffer` — Map<tabId, {ring: Array(500), head, count, maxLines}>. Circular buffer с O(1) записью на строку. Заполняется синхронно в `ptyProcess.onData` (без await — anti-pattern: async onData race). Удаляется в `onExit`.
+
+**Ловушка (апрель 2026):** Первая реализация была `{lines: string[]}` с `push() + splice(0, excess)` — O(n) splice на каждом onData чанке. При 15+ табах с активными Claude это давало ~750 splice/сек в main event loop, что вместе с Timeline backtrace polling вызывало thermal throttling (kernel_task до 200%). Симптом: macOS становится медленным даже после остановки всех Claude-процессов — память под давлением, page-out, kernel жонглирует страницами.
 
 ## Развёртывание
 Сервер копируется в каждый проект как `.claude/mcp/terminal-server.mjs`. Регистрация: `.mcp.json` (Claude) + `.claude/settings.json` (auto-approval) + `~/.gemini/settings.json` (глобальный для Gemini).

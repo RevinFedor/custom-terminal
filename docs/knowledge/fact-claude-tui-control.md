@@ -200,6 +200,46 @@ wasEnabled  = |checkIdx - enabledIdx| < |checkIdx - disabledIdx|
 ### UI отображение
 Кнопка "toggle" в InfoPanel. После переключения показывает "think on" / "think off" фиолетовым цветом (#b4b9f9) на 3 секунды.
 
+## Per-provider behavior: Model, Effort, Think
+
+InfoPanel содержит **две зависимые строки** — Provider row и Model row — плюс Effort и Think. Принцип двухуровневого селектора (Provider → Model) описан в `methodology/design.md::Two-tier hierarchical selectors`. Здесь — конкретика поведения и **разные backend'ы для одинаковых UI-контролов** в зависимости от выбранного провайдера.
+
+### Model row vs реальный target запроса
+
+Model row для **Anthropic** показывает Claude TUI выбор модели (default/sonnet/opus/haiku), который читается из `bridge.sh`. При смене провайдера на Zen/DeepSeek **bridge продолжает показывать Claude-модель** — это не правда о реальной цели запроса. Реальный target — в Provider row + бейдж в Timeline footer (см. `fact-provider-proxy.md::Bridge врёт про active provider` и `fact-timeline.md::Provider badge`).
+
+Соответственно клик по модели имеет разный эффект:
+- **Anthropic:** отправляет `/model haiku` через `claude:send-command` в PTY — Claude TUI переключает модель внутри своей сессии
+- **Zen / DeepSeek:** обновляет `providerState.model` через `provider:switch` IPC. Claude TUI про это ничего не знает, его собственная модель остаётся прежней (но в реальных запросах model переписывается в proxy)
+
+### Effort: три пути за одним UI
+
+Одна и та же Effort row рассылает команды в **разные backend'ы** в зависимости от Provider'а текущего таба:
+
+| Provider | Backend | Механизм | Уровни |
+|---|---|---|---|
+| Anthropic | Claude TUI | `/effort high` через `claude:send-command` (PTY) | `auto/low/medium/high/max` |
+| DeepSeek | Proxy body inject | IPC `provider:set-options { effort }` → proxy дописывает `output_config.effort` | `off/low/medium/high` |
+| Zen | (не поддерживается) | UI dim, кнопки `disabled` | — |
+
+**Почему такой mapping:** Anthropic effort — это поведение **внутри** Claude (как долго думать), управляется через TUI команду. DeepSeek effort — это поле в **request body** к их API. PTY-команда `/effort high` для DeepSeek-режима бессмысленна, потому что её эффект не доходит до DeepSeek API (proxy перехватит body раньше). Zen в текущей версии API не описывает аналога.
+
+### DeepSeek: Think folded into Effort
+
+Думаешь, что Think и Effort — независимые контролы? Для DeepSeek это **не так**. API DeepSeek возвращает HTTP 400 если в body одновременно `thinking:{type:'disabled'}` и `output_config.effort`. См. constraint в `fact-provider-proxy.md::DeepSeek режим`.
+
+**Решение в UI:** для DeepSeek Effort row становится 4-значным селектором `[off][low][medium][high]`:
+- `off` — proxy шлёт `thinking:{type:'disabled'}` БЕЗ `output_config`
+- low/medium/high — `thinking:{type:'enabled'}` + соответствующий `output_config.effort`
+
+**Think row для DeepSeek скрыта целиком** — её включает/выключает значение `off` в Effort. Дублирующий toggle = source of conflicts.
+
+### Per-tab state vs локальный effortLevel
+
+Для **Anthropic** effort хранится в `effortLevel: Record<tabId, string>` в InfoPanel local state — потому что bridge не транслирует обратно (Claude не подтверждает что принял `/effort high`). Это локальный «invisible intent».
+
+Для **DeepSeek** effort живёт в `providerStates: Map<tabId, state>` в main process (`fact-provider-proxy.md::Per-tab routing`) и каждый запрос proxy читает оттуда. Backend подтверждает применение фактом успешного ответа.
+
 ## Handshake (Prompt Injection при запуске)
 
 ### Текущая версия (упрощённая)

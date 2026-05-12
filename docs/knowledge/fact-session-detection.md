@@ -95,3 +95,20 @@ Claude Code CLI **не предоставляет** прямого механи�
 - Если Anthropic реализует lock-файл (#19364) — читать `{session}.lock`
 - Если добавят env var (#17188) — читать через `ps eww` (но только для env на момент запуска)
 - Hooks как альтернатива Sniper: прописать один раз в settings.json, hook пишет `.active-session.json` — Detect читает его
+
+## Fix: Bridge CWD Guard (Foreign Resume Overwrites Tab)
+
+### Симптомы
+- Пользователь вводит `claude --resume <foreignId>` в табе проекта A — sessionId таба молча меняется на чужую сессию из проекта B
+- В табе hh-tool появляется sessionId сессии из удалённого проекта cli-tools — настоящая сессия про hh-tool errors затирается
+- Re-run `claude --resume` каждый раз пере-присваивает чужой sid вместо того что прописан в БД таба
+
+### Природа бага
+StatusLine Bridge определяет `tabId` через PID tree: `bridge.ppid (Claude PID) → parent shell PID → match to PTY`. PID-резолв даёт точную привязку к табу, но **не сверяет cwd**. Если Claude всё-таки запустился (нашёл JSONL в slug соответствующем cwd сессии, не текущему cwd таба) — bridge получит `data.session_id = <foreign>` и `data.cwd = <other-project>`, но tabId резолвится по PID правильный → `setClaudeSessionId(tabId, foreign)` → перезапись.
+
+### Решение
+В `processFile()` сразу после tabId resolve: если `data.cwd && tabCwd && data.cwd !== tabCwd` — `return` без emit `claude:session-detected`. Лог `[Bridge:CwdGuard] Skip overwrite: tab cwd=X but bridge cwd=Y`.
+
+### Edge cases
+- Пользователь делает `cd /other-project && claude` в табе → PTY cwd обновляется через OSC 7 → `terminalProjects.set(tabId, newCwd)` → bridge.cwd = новый cwd → match → sessionId записывается. Работает.
+- Конфликт: таб привязан к hh-tool, юзер делает `cd /tmp && claude --resume <hh-toolSid>` — bridge.cwd = `/Desktop/hh-tool` (cwd сессии), tabCwd = `/tmp` → mismatch → guard блокирует. Это сознательный выбор — sessionId привязывается к cwd, не к табу.

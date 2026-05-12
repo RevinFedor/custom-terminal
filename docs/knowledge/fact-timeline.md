@@ -45,6 +45,7 @@
     - **sessionIdRef Guard:** Async fetch (`fetchEditRangeCompact`) захватывает `sessionId` prop через closure на момент вызова. После tab switch closure видит СТАРЫЙ sessionId, но `setEditRangeState` обновляет state текущего (нового) таба. AbortController ненадёжен — HTTP response может быть буферизирован до abort signal (race condition, подтверждено логами: response приходил через 4с после abort). Решение: `sessionIdRef` (ref-зеркало prop, обновляется на каждом рендере) + обязательный `expectedSessionId` параметр. Guard проверяет `sessionIdRef.current !== expectedSessionId` после await — даже если abort не сработал, state не запишется на wrong tab, а сохранится в Map для правильного таба.
     - **Cleanup closure trap:** useEffect cleanup захватывает `editRangeState` из момента создания effect (stale). Ref-зеркало `editRangeStateRef` обновляется через wrapper `setEditRangeState` — cleanup читает ref (всегда актуальный).
     - **Unreachable reset:** При смене sessionId unreachableIndices/visibleEntryIndices/responseOnlyIndices сбрасываются в пустой Set — stale индексы от предыдущего таба + терминал нового таба = всё unreachable = красный Timeline.
+    - **Tail Cleanup при rewind «до конца»:** Между расчётом range и записью JSONL (~2-3с: Ctrl+C → Gemini API → Ctrl+C confirm) Claude может допилить streaming и **дописать 1-3 записи в конец файла**. Forward-expand останавливается на первом real user message → новые assistant-записи переживают rewind как orphan tail → пользователь видит "phantom message" после compact. Решение: если `actualEnd >= activeBranch.length - 3` (rewind у tip активной ветки) — добавляем все оставшиеся записи в `removeUuids` независимо от типа. Порог 3 покрывает типичный race window (user prompt + assistant streaming + system turn_duration).
 - **Backtrace Filtering:** Отображение только активной ветки диалога. Сообщения, отменённые через Escape или Undo, скрываются из Timeline автоматически.
 - **Auto-Refresh:** Timeline обновляется автоматически каждые **2 секунды**, чтобы отражать актуальное состояние сессии. Обновление загружает только данные из JSONL/JSON — поиск по буферу терминала для обновления самих точек не выполняется.
     - **Performance Guard (`isVisible`):** Поллинг данных и запросы к SQLite выполняются только тогда, когда Timeline реально виден пользователю. Это предотвращает лишнюю нагрузку на диск и БД.
@@ -94,6 +95,30 @@ Entries используют `flex: '1 0 auto'` с минимальной выс
 - **Ловушка: несколько assistant entries за ход.** Claude пишет отдельный assistant entry на каждый шаг (thinking → tool_use → text). Каждый имеет свой `message.usage`. Нужно **суммировать** `output_tokens` по всем assistant entries до следующего user.
 - **Ловушка: `input_tokens` ≠ размер сообщения.** Поле `input_tokens` в usage — только uncached часть контекста. Полный контекст = `input_tokens + cache_read_input_tokens + cache_creation_input_tokens` (может быть 50K+ для длинных сессий). Поэтому для ↑ используется эвристика от длины текста, а не API-данные.
 
+### Provider+Model+think badge в footer assistant tooltip
+
+Под основной строкой футера (time / tokens / Копировать) рендерится **отдельный** ряд с post-factum индикацией реального провайдера: `DeepSeek · V4F · think` (зелёный), `Anthropic · Opus · think` (оранжевый), `Zen · MM2.7` (синий).
+
+**Источник правды — `message.model` из JSONL**, не локальный UI-state. Это поле Claude Code пишет из SSE `message_start` событий, которые приходят от **реального** upstream (DeepSeek/Zen возвращают свой model в формате Anthropic SSE). Бейдж в Timeline — единственное место в UI где видно правду пост-фактум, потому что bridge.sh и Model row показывают Claude TUI выбор, не реальный target (см. `fact-provider-proxy.md::Bridge врёт`).
+
+Принцип «индикация что реально произошло — из server response» см. `methodology/design.md::Truth from server response`.
+
+**Pipeline (в `claude:get-timeline`):** для каждого user-entry'а — look-ahead по `activeBranch` до следующего user. Собирается:
+- `responseModel` = последний non-`<synthetic>` `message.model` (после tool_use chain провайдер обычно один)
+- `responseHasThinking` = был ли хотя бы один content block с `type === 'thinking'` (true для DeepSeek effort≥low и Anthropic с thinking-режимом)
+
+**Почему look-ahead, а не первый assistant:** один user-turn может породить N assistants (thinking → tool_use → text → еще tool_use → text). Если брать первый — для tool-heavy turns пропустится модель финального ответа. Берём последний.
+
+**`<synthetic>` model = API error:** когда proxy вернул не Anthropic-SSE (или Anthropic вернул ошибку до streaming), Claude Code пишет placeholder с `msg.model: '<synthetic>'`, `msg.id: UUID-v4` (не Anthropic msg_), `usage` все нули, `stop_reason: 'stop_sequence'`. В тексте — `"API Error: ..."`. Бейдж для таких записей **не показывается** (helper `describeModel` возвращает null).
+
+**Color map:**
+- Anthropic — `#DA7756` (Claude orange)
+- DeepSeek — `#4ade80` (green)
+- Zen / minimax / kimi / glm — `#6B8AFF` (blue)
+- Прочие unknown model — `#a78bfa` (purple) с прямым raw model string
+
+**Почему отдельной строкой, а не inline:** в одной строке (time + tokens + бейдж + Копировать) при узком tooltip'е бейдж рвался на две визуальных строки рядом с кнопкой («DeepSeek ·» на одной, «V4F think» на второй у самой кнопки). Отдельный ряд под основным footer держит layout стабильным.
+
 ### Auto-Scroll при продолжении сессии
 При нажатии «Продолжить» (claude-c / gemini-c) Timeline автоматически прокручивается к последним entries. Также срабатывает при первой загрузке entries с новым sessionId (запуск приложения). Не sticky-scroll — при периодическом обновлении (каждые 2с) позиция скролла не меняется, чтобы не мешать ручному просмотру истории.
 - **Invisible Intent:** Без auto-scroll пользователь при продолжении длинной сессии видит верх Timeline с красными (unreachable) entries, хотя актуальные записи внизу. SessionId при «Продолжить» не меняется, поэтому обычный watch на sessionId не срабатывает — нужен отдельный сигнал от кнопки.
@@ -112,6 +137,7 @@ Entries используют `flex: '1 0 auto'` с минимальной выс
 
 - **Проблема:** Стандартный `position: absolute` внутри контейнера с `overflow: auto` привязывается к экранным координатам (вьюпорту), а не к скроллируемому содержимому. При прокрутке оверлеи «залипают» на месте.
 - **Решение:** Все оверлеи обернуты в **inner relative wrapper** — промежуточный контейнер с `position: relative`, который охватывает весь список записей. Это делает оверлеи частью скроллируемого слоя, обеспечивая их стабильное положение относительно точек при любом уровне прокрутки.
+- **Что пробовали и почему убрали (graveyard):** В `editRangeState` стоял `wheel`/`touchmove` `preventDefault` на scrollRef, чтобы при скролле оверлей не «отрывался» от entries. После переезда оверлеев в `innerWrapperRef` они скроллятся вместе с контентом, lock потерял смысл — но **активно вредил**: при возврате на таб со скроллом не у активной зоны пользователь не мог проскроллить к мигающему оверлею. Удалён, восстанавливать нельзя.
 
 #### Gemini CLI (Heuristic Search)
 Поскольку Gemini работает в Alternate Buffer, маркеры xterm.js там не работают. Навигация использует многострочный поиск по тексту с алгоритмами повышения устойчивости:
@@ -158,11 +184,12 @@ Entries используют `flex: '1 0 auto'` с минимальной выс
 
 **Работа в режиме выделения:**
 - При наведении на другие точки — синий индикатор показывает выбранный диапазон.
-- **Одинарный клик по другой точке** → popup-меню с выбором: "Копировать" или "Редактировать".
+- **Одинарный клик по другой точке** → popup-меню с выбором: "Копировать", "Редактировать" или "Удалить историю".
 - **Одинарный клик по начальной точке** → отменяет выделение.
 - **Клик вне таймлайна** → отменяет выделение.
 - **ПКМ в режиме выделения** → "Отменить копирование".
 - **Selection Persistence:** Выделение не пропадает при наведении на контекстное меню (Portal), благодаря использованию `selectionStartIdRef` и блокировке сброса `hoveredIndex` в режиме выбора.
+- **Якорь popup = entry второго клика, не `Math.max(start, end)`.** При выделении снизу-вверх popup раньше уезжал к нижней точке и был неудобен. Сейчас он центрируется по высоте entry под курсором. Размер popup `260×180` — намеренный safe-default под все режимы (обычный / postPrompt / deleteConfirm), используется как константа для clamp на 4 стороны viewport. Без 4-side clamp popup обрезался у верха/низа экрана, у близких к краю кликов.
 ### Edit Range (компактирование диапазона)
 Полный пайплайн: выделение → Gemini compact → JSONL edit → Claude restart.
 
@@ -194,6 +221,22 @@ Entries используют `flex: '1 0 auto'` с минимальной выс
 - **Orphan cleanup при edit-range:** Rewind создаёт мёртвые ветки (entries с parentUuid → удалённые записи). Edit-range удаляет часть active branch, но orphan'ы от rewind'ов оставались. Orphan'ы c newer timestamp → Claude resume подбирает orphan (chain=1) → 0% context. Решение: cascade-удаление orphan entries перед записью файла. Проходит несколько итераций (дети orphan'ов тоже orphan'ы). **КРИТИЧНО: entryAfter.parentUuid ОБЯЗАН быть перелинкован на compact entry ДО orphan cleanup.** Без этого entryAfter указывает на удалённую запись → orphan cleanup помечает его orphaned → cascade через ВСЮ оставшуюся цепочку → удаляет все entries после edit range. Подтверждено в production: пользователь выделил 4 записи, потерял 1481 (включая ~40 реальных разговоров). Также `compactUuid` должен быть добавлен в `survivingUuids` до orphan cleanup (compact entry ещё не в allRecords, но на него уже ссылается entryAfter).
 - **Forward-expand ловушка (tool_result + system + task-notification):** После user-сообщения Claude отвечает цепочкой `assistant → tool_use → tool_result(type:user) → assistant → ...`. Forward-expand обязан проходить через: tool_result entries (`type: 'user'`, `content[].type === 'tool_result'`), system entries (turn_duration и другие metadata между turns), task-notification entries (`type: 'user'`, content начинается с `<task-notification>` — автоматические сообщения от sub-agent'ов). Без прохода через system/task-notification: forward-expand останавливается на system boundary, оставляя "призраков" — ответы Claude на task-notification от фоновых агентов, которые пользователь видит как мусор между compact и своим следующим сообщением (подтверждено: 13 ghost entries в production). Останавливаться ТОЛЬКО на настоящем user-сообщении (текстовый content, не tool_result, не `<task-notification>`).
 - **`userType: 'external'` убивает контекст Claude CLI.** Claude CLI при `--resume` НЕ загружает в контекст записи с `userType: 'external'` — считает их "чужими". Если файл был создан через fork (copyFileSync) от сессии где записи имели эту метку (например prefilled session), а потом edit-range перезаписал файл — ВСЕ записи сохраняют `userType: 'external'` → Claude загружает 4% вместо 25%. Фикс: edit-range при перезаписи удаляет `userType: 'external'` со всех surviving entries. Метка нужна только на нашем compact entry.
+
+### Delete Range (удаление диапазона)
+Третий режим popup-меню (рядом с Copy / Edit). В отличие от edit-range — **никакой compact entry не вставляется**, никакой розовой точки. Просто вырезка из JSONL.
+
+**Auto-extend на границу: всё или ничего.** Если в выделение попадает `compact` entry или entries с разными `sessionId` (Plan Mode / Clear Context), `range.startIndex` авто-расширяется в `0`. Edit и Copy в popup скрываются — остаётся только красная кнопка с предупреждением «удаление сотрёт всю историю до начала». Мотивация: попытка вырезать «среднюю» часть через файл-граничный bridge сломала бы parentUuid цепочку между файлами и `resolveSessionChain` (см. `fix-claude-plan-mode-chain.md`). Политика «или весь префикс, или ничего» убирает эту категорию багов целиком.
+
+**Inline confirm.** Подтверждение «Удалить N записей? Действие необратимо.» встроено в тот же popup (по аналогии с `postPromptMode`). Не закрывается на mouseLeave/click-outside — нужен явный выбор. Без этого случайное движение мыши после auto-extend могло снести 2000+ записей.
+
+**Что отличается от edit-range на уровне JSONL:**
+- Не создаётся compact entry, `entryAfter.parentUuid` указывает напрямую на `entryBefore.uuid` (или `null` если `rangeStart === 0`).
+- Не вызывается `saveRewindMarker` — никакой розовой точки на месте удалённого.
+- При `rangeStart === 0` дополнительно: clean slate для всего что не в активной ветке после диапазона (bridge entries, dead branches, last-prompt) + `DELETE FROM session_links WHERE child_session_id = ? OR parent_session_id = ?`. **Bidirectional cleanup критичен:** если оставить только child-side, родительская сессия будет тянуть удалённую через session_links. Если только parent-side — наоборот.
+
+**Пустой файл → unlink.** Когда после всех удалений и orphan cleanup `outputLines` содержит 0 записей с UUID — `fs.unlinkSync(filePath)`. Renderer получает `fileDeleted: true` и вызывает `setClaudeSessionId(tabId, '')`. Таб освобождается — кнопка «Продолжить» запустит свежий claude (без `--resume`). Файл вернуть нельзя; защита — confirm-режим.
+
+**Невидимый контекст: почему не пытаемся править claude --resume семантику.** Можно было бы оставить файл с одним dummy-entry чтобы `--resume <id>` не падал. Отбросили: пользователь явно сказал «удалить всё», dummy-entry в Timeline — мусор; проще принять что после полного удаления sessionId стал недействительным.
 
 ### Rewind (Откатиться)
 Автоматизация процесса возврата к выбранному сообщению через TUI-меню истории Claude Code.

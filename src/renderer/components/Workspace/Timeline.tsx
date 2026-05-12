@@ -64,6 +64,8 @@ interface TimelineEntry {
   docsEdited?: string[];
   docsSearchQueries?: string[];
   responseTokens?: number;
+  responseModel?: string;          // last assistant.message.model for this turn (e.g. 'deepseek-v4-flash', 'claude-opus-4-7')
+  responseHasThinking?: boolean;   // any assistant content block of type 'thinking' in this turn
 }
 
 interface GroupInfo {
@@ -95,6 +97,31 @@ interface TimelineProps {
 const formatTokenCount = (count: number): string => {
   return `${(count / 1000).toFixed(1)}K`;
 };
+
+// Map raw model id from JSONL message.model to (Provider label, Short model label, color)
+// Sources: anthropic SDK (`claude-opus-4-7`, `claude-haiku-4-5-...`), DeepSeek (`deepseek-v4-flash`),
+// OpenCode Zen (`minimax-m2.7`, `kimi-...`). Unknown → fall back to the raw string.
+function describeModel(rawModel?: string): { provider: string; short: string; color: string } | null {
+  if (!rawModel || rawModel === '<synthetic>') return null;
+  const m = rawModel.toLowerCase();
+  if (m.startsWith('claude-')) {
+    let short = 'Claude';
+    if (m.includes('opus')) short = 'Opus';
+    else if (m.includes('sonnet')) short = 'Sonnet';
+    else if (m.includes('haiku')) short = 'Haiku';
+    return { provider: 'Anthropic', short, color: '#DA7756' };
+  }
+  if (m.startsWith('deepseek-')) {
+    let short = 'DeepSeek';
+    if (m.includes('v4-flash')) short = 'V4F';
+    else if (m.includes('v4-pro')) short = 'V4P';
+    return { provider: 'DeepSeek', short, color: '#4ade80' };
+  }
+  if (m.startsWith('minimax-') || m.startsWith('kimi-') || m.startsWith('glm-')) {
+    return { provider: 'Zen', short: rawModel, color: '#6B8AFF' };
+  }
+  return { provider: 'Custom', short: rawModel, color: '#a78bfa' };
+}
 
 const truncateText = (text: string | unknown, maxLength: number = 120): string => {
   if (typeof text !== 'string') {
@@ -285,6 +312,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     sourceContent: string;
     compactText: string;
     compactUuid?: string; // UUID of the inserted compact entry (after apply)
+    autoEditInitial?: boolean; // open with first Gemini-message in inline-edit mode
   } | null>(null);
   // Ref mirror — always current, used by useEffect cleanup (closures capture stale state)
   const editRangeStateRef = useRef(editRangeState);
@@ -335,15 +363,25 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       if (editRangeDoneTimer.current) { clearTimeout(editRangeDoneTimer.current); editRangeDoneTimer.current = null; }
     };
   }, [editRangeState?.phase]);
-  // Range action menu — appears after second click to choose Copy or Edit
+  // Range action menu — appears after second click to choose Copy / Edit / Delete
   const [rangeActionMenu, setRangeActionMenu] = useState<{
     x: number; y: number;
     range: { startIndex: number; endIndex: number };
     startUuid: string; endUuid: string;
+    crossesBoundary: boolean;  // range hit a compact or plan-mode boundary → auto-extended to start
   } | null>(null);
   const [postPromptMode, setPostPromptMode] = useState(false);
   const [postPromptText, setPostPromptText] = useState('');
   const postPromptRef = useRef<HTMLTextAreaElement>(null);
+  // Inline confirm for "Удалить историю" inside rangeActionMenu (no side panel)
+  const [deleteConfirmMode, setDeleteConfirmMode] = useState(false);
+  // Animation state while delete IPC is running (red overlay over the range)
+  const [deletingRange, setDeletingRange] = useState<{ startIndex: number; endIndex: number } | null>(null);
+  // Reset confirm mode whenever rangeActionMenu closes — otherwise the next popup opens
+  // already in confirm state.
+  useEffect(() => {
+    if (!rangeActionMenu) setDeleteConfirmMode(false);
+  }, [rangeActionMenu]);
   const [rewindPostPromptMode, setRewindPostPromptMode] = useState(false);
   const [rewindPostPromptText, setRewindPostPromptText] = useState('');
   const rewindPostPromptRef = useRef<HTMLTextAreaElement>(null);
@@ -401,18 +439,12 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   const noteTooltipRef = useRef<HTMLDivElement>(null);
   const [hoveredNoteIndex, setHoveredNoteIndex] = useState<number | null>(null);
 
-  // Lock timeline scroll when edit range panel is open
-  useEffect(() => {
-    const el = scrollRef.current;
-    if (!el || !editRangeState) return;
-    const prevent = (e: Event) => e.preventDefault();
-    el.addEventListener('wheel', prevent, { passive: false });
-    el.addEventListener('touchmove', prevent, { passive: false });
-    return () => {
-      el.removeEventListener('wheel', prevent);
-      el.removeEventListener('touchmove', prevent);
-    };
-  }, [!!editRangeState]);
+  // Note: previously this effect locked Timeline scroll while editRangeState was active.
+  // The lock was a leftover from when overlays were positioned in viewport coordinates
+  // and detached from the scroll content visually. Overlays now live inside
+  // innerWrapperRef (which scrolls with entries), so they stay aligned automatically —
+  // and locking scroll only made it impossible for the user to navigate to the active
+  // overlay when returning to a tab where the scroll was elsewhere.
 
   // Compute group map for sub-agent entries (Phase 2)
   const groupMap = useMemo(() => computeGroups(entries), [entries]);
@@ -421,6 +453,25 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     forkMarkers.filter(m => m.entry_uuids && m.entry_uuids.length > 0).map(m => new Set(m.entry_uuids)),
     [forkMarkers]
   );
+  // Per-marker, the index of the LAST entry whose UUID is in the snapshot.
+  // The blue stripe is drawn only after that one entry — not after every snapshot↔
+  // non-snapshot edge. If the parent session ran rewind / edit-range / delete-range
+  // between forks, the snapshot becomes a sparse set of survivors instead of a prefix,
+  // and a naive "snapshot edge" detector drew dozens of false stripes.
+  const forkMarkerLastSnapIndex = useMemo(() => {
+    const arr: number[] = [];
+    for (const m of forkMarkers) {
+      const snap = m.entry_uuids;
+      if (!snap || snap.length === 0) { arr.push(-1); continue; }
+      const set = new Set(snap);
+      let lastIdx = -1;
+      for (let i = 0; i < entries.length; i++) {
+        if (set.has(entries[i].uuid)) lastIdx = i;
+      }
+      arr.push(lastIdx);
+    }
+    return arr;
+  }, [forkMarkers, entries]);
   // Count visible nodes (entries minus hidden group children)
   const hasSubAgentGroups = useMemo(() => {
     for (const [, g] of groupMap) {
@@ -729,12 +780,47 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     }
   }, [sessionId, entries.length]);
 
-  // Refresh timeline periodically (only when visible)
+  // Refresh timeline periodically (only when visible AND window foregrounded).
+  // PERF (2026-04-21): pausing on document.visibilityState=hidden eliminates needless
+  // IPC round-trips (SessionChain, getForkMarkers, incremental JSONL reads) while the
+  // app is in the background. Regression signal: [Timeline:PollPaused] / [Timeline:PollResumed]
+  // should match window focus/blur transitions 1:1.
   useEffect(() => {
     if (!sessionId || !isVisible) return;
-    // Refresh every 2 seconds to catch Escape/Undo changes quickly
-    const interval = setInterval(loadTimeline, 2000);
-    return () => clearInterval(interval);
+
+    let interval: ReturnType<typeof setInterval> | null = null;
+    const start = () => {
+      if (interval) return;
+      interval = setInterval(loadTimeline, 2000);
+    };
+    const stop = (reason: string) => {
+      if (!interval) return;
+      clearInterval(interval);
+      interval = null;
+      console.warn(`[Timeline:PollPaused] sessionId=${sessionId.substring(0,8)} reason=${reason}`);
+    };
+
+    if (document.visibilityState === 'visible') {
+      start();
+    } else {
+      console.warn(`[Timeline:PollPaused] sessionId=${sessionId.substring(0,8)} reason=hidden-on-mount`);
+    }
+
+    const onVis = () => {
+      if (document.visibilityState === 'visible') {
+        console.warn(`[Timeline:PollResumed] sessionId=${sessionId.substring(0,8)}`);
+        loadTimeline(); // refresh immediately so user sees fresh data on return
+        start();
+      } else {
+        stop('visibility-hidden');
+      }
+    };
+    document.addEventListener('visibilitychange', onVis);
+
+    return () => {
+      document.removeEventListener('visibilitychange', onVis);
+      if (interval) clearInterval(interval);
+    };
   }, [sessionId, loadTimeline, isVisible]);
 
   // Listen for manual refresh requests from InfoPanel
@@ -1143,7 +1229,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         selectionStartIdRef.current = null;
         setSelectionStartId(null);
       } else {
-        // Клик по другой точке → показать popup "Копировать / Редактировать"
+        // Клик по другой точке → показать popup "Копировать / Редактировать / Удалить"
         const startId = selectionStartIdRef.current;
         const startIndex = entries.findIndex(e => e.uuid === startId);
         const endIndex = entries.findIndex(e => e.uuid === entry.uuid);
@@ -1152,15 +1238,36 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
           endIndex: Math.max(startIndex, endIndex),
         };
 
-        // Get click position from the entry's DOM element
-        const el = segmentRefs.current[Math.max(startIndex, endIndex)];
-        const containerRect = containerRef.current?.getBoundingClientRect();
-        let x = containerRect ? containerRect.left - 170 : 100;
-        let y = el ? el.getBoundingClientRect().top : 100;
+        // Auto-extend to the very beginning of Timeline when the range hits a boundary
+        // (compact entry or different sessionIds — Plan Mode/Clear Context). Editing
+        // across boundaries is not supported (different JSONL files), so for Delete we
+        // always operate on a contiguous prefix instead of trying to splice across files.
+        const sliced = entries.slice(range.startIndex, range.endIndex + 1);
+        const hasCompactInRange = sliced.some(en => en.type === 'compact');
+        const sids = new Set(sliced.map(en => en.sessionId).filter(Boolean));
+        const crossesBoundary = hasCompactInRange || sids.size > 1;
+        if (crossesBoundary) range.startIndex = 0;
 
-        // Clamp to viewport
-        if (x < 10) x = 10;
-        if (y + 80 > window.innerHeight) y = window.innerHeight - 90;
+        // Position popup near the SECOND click (the entry the user just clicked on),
+        // not Math.max(start, end) which always picks the lower-index point regardless
+        // of click order. Center vertically on the clicked entry so it doesn't depend on
+        // entry height (group expansion makes some segments tall).
+        const POPUP_W = 260;
+        const POPUP_H = 180;
+        const targetEl = segmentRefs.current[endIndex];
+        const containerRect = containerRef.current?.getBoundingClientRect();
+        const targetRect = targetEl?.getBoundingClientRect();
+        let x = containerRect ? containerRect.left - POPUP_W - 12 : 100;
+        let y = targetRect
+          ? targetRect.top + targetRect.height / 2 - POPUP_H / 2
+          : 100;
+
+        // Clamp to viewport on all four sides — avoids cut-off near top/bottom edges.
+        const MARGIN = 10;
+        if (x < MARGIN) x = MARGIN;
+        if (x + POPUP_W > window.innerWidth - MARGIN) x = window.innerWidth - POPUP_W - MARGIN;
+        if (y < MARGIN) y = MARGIN;
+        if (y + POPUP_H > window.innerHeight - MARGIN) y = window.innerHeight - POPUP_H - MARGIN;
 
         // Prevent handleClickOutside from immediately clearing the menu
         justSetRangeMenuRef.current = true;
@@ -1170,6 +1277,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
           x, y, range,
           startUuid: entries[range.startIndex].uuid,
           endUuid: entries[range.endIndex].uuid,
+          crossesBoundary,
         });
       }
       return;
@@ -1410,10 +1518,17 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       // If abort failed (race condition), this catches cross-tab writes.
       const nowSid = sessionIdRef.current;
       console.warn('[EditRange:Fetch] Response received, status:', response.status, 'expected=' + expectedSessionId.substring(0, 8) + ' currentRef=' + (nowSid?.substring(0, 8) || 'null'));
+      const data = await response.json();
+      const compactText = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      // Build error message once — shared by cross-tab and same-tab paths
+      const errMsg = !compactText
+        ? (response.status >= 400
+            ? `Gemini ${response.status}: ${data.error?.message?.substring(0, 120) || data.error?.status || 'ошибка'}`
+            : 'Gemini вернул пустой ответ')
+        : null;
+
       if (nowSid !== expectedSessionId) {
         // Tab switched during fetch — save result to map for later restore
-        const data = await response.json();
-        const compactText = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
         if (compactText) {
           const readyState = { range, phase: 'ready' as const, sourceContent, compactText };
           _savedEditRangeMap.set(expectedSessionId, readyState);
@@ -1444,14 +1559,16 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
             }
           );
         } else {
-          console.warn('[EditRange:Fetch] CROSS-TAB: empty response, discarded');
+          // CRITICAL: clear saved loading state, otherwise loader is infinite on tab return
+          _savedEditRangeMap.delete(expectedSessionId);
+          console.warn('[EditRange:Fetch] CROSS-TAB: empty/error, cleared saved map for ' + expectedSessionId.substring(0, 8) + ' (' + errMsg + ')');
+          useUIStore.getState().showToast(errMsg!, 'error', 4000);
         }
         return;
       }
-      const data = await response.json();
-      const compactText = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
       if (!compactText) {
-        console.warn('[EditRange:Fetch] EMPTY response from Gemini. data.error:', JSON.stringify(data.error || 'none').substring(0, 200));
+        console.warn('[EditRange:Fetch] EMPTY response from Gemini. status:', response.status, 'data.error:', JSON.stringify(data.error || 'none').substring(0, 200));
+        useUIStore.getState().showToast(errMsg!, 'error', 4000);
         setEditRangeState(null);
         return;
       }
@@ -1551,6 +1668,64 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     }
   };
 
+  // Удаление диапазона без вставки compact-entry. Используется кнопкой "Удалить историю".
+  // Если выделение пересекало границу (compact / Clear Context), range.startIndex = 0.
+  // При пустом файле бэкенд удалит JSONL полностью и вернёт fileDeleted=true → таб
+  // освобождается (claudeSessionId сбрасывается).
+  const executeDeleteRange = async (range: { startIndex: number; endIndex: number }, startUuid: string, endUuid: string) => {
+    if (!sessionId) return;
+    if (isGemini) return; // Gemini не поддерживается этим путём — JSON-формат другой
+
+    // Очистка selection и popup
+    selectionStartIdRef.current = null;
+    setSelectionStartId(null);
+    setRangeActionMenu(null);
+    setDeleteConfirmMode(false);
+    setDeletingRange(range);
+
+    try {
+      const result = await ipcRenderer.invoke('claude:delete-range', {
+        sessionId,
+        cwd,
+        startUuid,
+        endUuid,
+      });
+
+      setDeletingRange(null);
+
+      if (!result.success) {
+        useUIStore.getState().showToast(
+          'Удаление не удалось: ' + (result.error || 'unknown'),
+          'error', 4000
+        );
+        return;
+      }
+
+      const removedTotal = result.removedCount || 0;
+      const removedHuman = result.removedUsers || 0;
+      useUIStore.getState().showToast(
+        `Удалено ${removedHuman} сообщений (${removedTotal} записей)`,
+        'success', 2500
+      );
+
+      if (result.fileDeleted) {
+        // Файл стёрт — освобождаем таб от сессии. Кнопка "Продолжить" запустит claude
+        // как новую сессию (без --resume), а Timeline опустеет на следующем рефреше.
+        const ws = useWorkspaceStore.getState();
+        ws.setClaudeSessionId(tabId, '');
+      } else {
+        loadTimeline();
+      }
+    } catch (err: any) {
+      console.error('[Timeline] Delete range failed:', err);
+      setDeletingRange(null);
+      useUIStore.getState().showToast(
+        'Удаление не удалось: ' + (err?.message || String(err)),
+        'error', 4000
+      );
+    }
+  };
+
   const isSelected = (entry: TimelineEntry, index: number) => {
     if (!selectionStartId) return false;
     const startIndex = entries.findIndex(e => e.uuid === selectionStartId);
@@ -1578,10 +1753,11 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         setIsNoteEditing(false);
         setActiveNoteIndex(null);
       }
-      // Close range action menu on outside click (skip if just opened)
+      // Close range action menu on outside click (skip if just opened OR
+      // if confirm/postPrompt mode is active — those need explicit user action).
       if (justSetRangeMenuRef.current) {
         justSetRangeMenuRef.current = false;
-      } else {
+      } else if (!deleteConfirmMode && !postPromptMode) {
         setRangeActionMenu(null);
       }
       // Cancel range selection if clicking outside timeline
@@ -1592,7 +1768,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     };
     window.addEventListener('click', handleClickOutside);
     return () => window.removeEventListener('click', handleClickOutside);
-  }, [isExpanded, isNoteEditing]);
+  }, [isExpanded, isNoteEditing, deleteConfirmMode, postPromptMode]);
 
   const handleRewind = async (entry: TimelineEntry, additionalPrompt?: string) => {
     setContextMenu(null);
@@ -2054,15 +2230,13 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
             const active = isSelected(entry, index);
             const isCompacted = entry.type === 'compact';
             const isLastEntry = index === entries.length - 1;
-            // Find ANY fork marker at this boundary (including hidden) for boundary suppression
-            const forkMarkerAny = forkMarkers.find(m => {
-              if (!m.entry_uuids || m.entry_uuids.length === 0) return false;
-              const snapshotUuids = new Set(m.entry_uuids);
-              if (!snapshotUuids.has(entry.uuid)) return false;
-              if (isLastEntry) return true;
-              const nextEntry = entries[index + 1];
-              return nextEntry && !snapshotUuids.has(nextEntry.uuid);
-            });
+            // Fork marker at this position — only the SINGLE last snapshot UUID renders
+            // the blue stripe (forkMarkerLastSnapIndex). Previously this used edge
+            // detection (entry ∈ snap, next ∉ snap), which fired on every gap when the
+            // parent's active branch was modified after the fork (rewind / edit-range /
+            // delete-range punch holes through the snapshot) → many false stripes.
+            const markerHitIdx = forkMarkerLastSnapIndex.findIndex(idx => idx === index);
+            const forkMarkerAny = markerHitIdx >= 0 ? forkMarkers[markerHitIdx] : null;
             // Only non-hidden markers render the blue stripe
             const forkMarker = forkMarkerAny && !forkMarkerAny.hidden ? forkMarkerAny : null;
 
@@ -2555,6 +2729,37 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
           );
         })()}
 
+        {/* Deleting Range Indicator (blinking red while delete IPC runs) */}
+        {isVisible && deletingRange && (() => {
+          const rect = getOverlayRect(deletingRange.startIndex, deletingRange.endIndex);
+          if (!rect || !innerWrapperRef.current) return null;
+          const wrapperRect = innerWrapperRef.current.getBoundingClientRect();
+          const fixedTop = wrapperRect.top + rect.top + 10;
+          const rightOffset = window.innerWidth - wrapperRect.right + 12;
+
+          return (
+            <>
+              <div
+                className="absolute left-0 right-0 pointer-events-none animate-glow-red"
+                style={{
+                  top: rect.top,
+                  height: rect.height,
+                  borderTop: '1px solid rgba(239, 68, 68, 0.85)',
+                  borderBottom: '1px solid rgba(239, 68, 68, 0.85)',
+                  boxShadow: '0 0 20px rgba(239, 68, 68, 0.55)',
+                  zIndex: 50,
+                }}
+              />
+              <StatusLabelPortal
+                label="DELETING..."
+                top={fixedTop}
+                rightOffset={rightOffset}
+                color="#ef4444"
+              />
+            </>
+          );
+        })()}
+
         {/* Copied Range Animation (green success flash) */}
         {isVisible && copiedRange && (() => {
           const rect = getOverlayRect(copiedRange.startIndex, copiedRange.endIndex);
@@ -2746,6 +2951,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
               anchorTop={anchorTop}
               anchorHeight={anchorHeight}
               rightOffset={rightOffset}
+              autoEditInitial={editRangeState.autoEditInitial}
               onApply={async (compactText) => {
                 console.warn('[EditRange] Applying, compact length:', compactText.length);
                 setEditRangeState(prev => prev ? { ...prev, phase: 'applying' } : null);
@@ -3097,6 +3303,16 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                         </button>
                       )}
                     </div>
+                    {(() => {
+                      const md = describeModel(currentActiveEntry.responseModel);
+                      if (!md) return null;
+                      return (
+                        <div className="flex items-center mt-0.5 text-[10px] shrink-0" title={'Provider: ' + md.provider + ' · Model: ' + currentActiveEntry.responseModel + (currentActiveEntry.responseHasThinking ? ' · thinking' : '')}>
+                          <span style={{ color: md.color }}>{md.provider} · {md.short}</span>
+                          {currentActiveEntry.responseHasThinking && <span className="ml-1.5" style={{ color: '#b4b9f9' }}>· think</span>}
+                        </div>
+                      );
+                    })()}
                   </>
                 ) : (
                   <>
@@ -3145,6 +3361,16 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                         </button>
                       )}
                     </div>
+                    {(() => {
+                      const md = describeModel(currentActiveEntry.responseModel);
+                      if (!md) return null;
+                      return (
+                        <div className="flex items-center mt-0.5 text-[10px] shrink-0" title={'Provider: ' + md.provider + ' · Model: ' + currentActiveEntry.responseModel + (currentActiveEntry.responseHasThinking ? ' · thinking' : '')}>
+                          <span style={{ color: md.color }}>{md.provider} · {md.short}</span>
+                          {currentActiveEntry.responseHasThinking && <span className="ml-1.5" style={{ color: '#b4b9f9' }}>· think</span>}
+                        </div>
+                      );
+                    })()}
                   </>
                 )}
               </div>
@@ -3342,7 +3568,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
           <TooltipPortal>
             <div
               onMouseLeave={() => {
-                if (!postPromptMode) {
+                if (!postPromptMode && !deleteConfirmMode) {
                   setRangeActionMenu(null);
                   selectionStartIdRef.current = null;
                   setSelectionStartId(null);
@@ -3354,17 +3580,53 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                 left: rangeActionMenu.x,
                 top: rangeActionMenu.y,
                 backgroundColor: '#1a1a1a',
-                border: `1px solid ${postPromptMode ? '#ec4899' : '#333'}`,
+                border: `1px solid ${deleteConfirmMode ? '#ef4444' : postPromptMode ? '#ec4899' : '#333'}`,
                 borderRadius: '6px',
                 padding: '4px',
                 zIndex: 10001,
-                minWidth: postPromptMode ? '320px' : '170px',
+                minWidth: deleteConfirmMode ? '260px' : postPromptMode ? '320px' : '180px',
                 maxWidth: postPromptMode ? '400px' : undefined,
-                boxShadow: postPromptMode ? '0 4px 20px rgba(236, 72, 153, 0.15)' : '0 4px 16px rgba(0,0,0,0.6)',
+                boxShadow: deleteConfirmMode
+                  ? '0 4px 20px rgba(239, 68, 68, 0.18)'
+                  : postPromptMode
+                    ? '0 4px 20px rgba(236, 72, 153, 0.15)'
+                    : '0 4px 16px rgba(0,0,0,0.6)',
                 transition: 'min-width 0.15s, border-color 0.15s, box-shadow 0.15s',
               }}
             >
-              {!postPromptMode ? (
+              {deleteConfirmMode ? (
+                <div className="p-2 flex flex-col gap-2">
+                  <div className="text-[11px] text-red-300 leading-snug">
+                    {rangeActionMenu.crossesBoundary ? (
+                      <>Удалить <span className="font-semibold">{rangeActionMenu.range.endIndex - rangeActionMenu.range.startIndex + 1}</span> записей до самого начала?<br/>
+                      <span className="text-[10px] text-red-400/70">Действие необратимо.</span></>
+                    ) : (
+                      <>Удалить <span className="font-semibold">{rangeActionMenu.range.endIndex - rangeActionMenu.range.startIndex + 1}</span> записей? <span className="text-red-400/70">Действие необратимо.</span></>
+                    )}
+                  </div>
+                  <div className="flex gap-1.5">
+                    <button
+                      className="flex-1 px-3 py-1.5 text-xs text-white/70 hover:text-white hover:bg-white/5 rounded transition-colors cursor-pointer"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setDeleteConfirmMode(false);
+                      }}
+                    >
+                      Отмена
+                    </button>
+                    <button
+                      className="flex-1 px-3 py-1.5 text-xs text-white bg-red-600/80 hover:bg-red-600 rounded transition-colors cursor-pointer flex items-center justify-center gap-1.5"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        executeDeleteRange(rangeActionMenu.range, rangeActionMenu.startUuid, rangeActionMenu.endUuid);
+                      }}
+                    >
+                      <Trash2 size={12} />
+                      Удалить
+                    </button>
+                  </div>
+                </div>
+              ) : !postPromptMode ? (
                 <>
                   {/* Token summary for selected range */}
                   {(() => {
@@ -3382,16 +3644,23 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                       </div>
                     ) : null;
                   })()}
-                  <button
-                    className="w-full text-left px-3 py-2 text-xs text-white hover:bg-blue-600/80 rounded transition-colors cursor-pointer"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      executeRangeAction('copy', rangeActionMenu.range, rangeActionMenu.startUuid, rangeActionMenu.endUuid);
-                    }}
-                  >
-                    Копировать ({rangeActionMenu.range.endIndex - rangeActionMenu.range.startIndex + 1})
-                  </button>
-                  {!isGemini && (
+                  {rangeActionMenu.crossesBoundary && (
+                    <div className="px-3 py-1.5 text-[10px] text-red-300/80 border-b border-red-500/20 bg-red-500/5">
+                      В выделении граница (compact / Plan Mode) — удаление сотрёт всю историю до начала.
+                    </div>
+                  )}
+                  {!rangeActionMenu.crossesBoundary && (
+                    <button
+                      className="w-full text-left px-3 py-2 text-xs text-white hover:bg-blue-600/80 rounded transition-colors cursor-pointer"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        executeRangeAction('copy', rangeActionMenu.range, rangeActionMenu.startUuid, rangeActionMenu.endUuid);
+                      }}
+                    >
+                      Копировать ({rangeActionMenu.range.endIndex - rangeActionMenu.range.startIndex + 1})
+                    </button>
+                  )}
+                  {!isGemini && !rangeActionMenu.crossesBoundary && (
                     <div className="flex rounded overflow-hidden">
                       <button
                         className="flex-1 text-left px-3 py-2 text-xs text-pink-400 hover:bg-pink-600/20 transition-colors cursor-pointer"
@@ -3414,7 +3683,64 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                       >
                         ▶
                       </button>
+                      <button
+                        className="px-2 py-2 text-xs text-pink-400/60 hover:bg-pink-600/30 hover:text-pink-300 transition-colors cursor-pointer border-l border-white/10 flex items-center justify-center"
+                        title="Открыть пустой чат (без Gemini)"
+                        onClick={async (e) => {
+                          e.stopPropagation();
+                          const { range, startUuid, endUuid } = rangeActionMenu;
+                          // Validate same as edit mode
+                          const rangeEntries = entries.slice(range.startIndex, range.endIndex + 1);
+                          const hasCompact = rangeEntries.some(en => en.type === 'compact');
+                          const sessionIds = new Set(rangeEntries.map(en => en.sessionId).filter(Boolean));
+                          if (hasCompact || sessionIds.size > 1) {
+                            useUIStore.getState().showToast(
+                              hasCompact
+                                ? 'Нельзя редактировать диапазон с compact boundary'
+                                : 'Нельзя редактировать через план мод — только текущий сегмент',
+                              'error', 3000
+                            );
+                            return;
+                          }
+                          // Clear selection (mirror executeRangeAction)
+                          selectionStartIdRef.current = null;
+                          setSelectionStartId(null);
+                          setRangeActionMenu(null);
+                          setPostPromptMode(false);
+                          // Open panel immediately with empty compactText — user types own prompt
+                          if (!sessionId) return;
+                          try {
+                            const result = await ipcRenderer.invoke('claude:copy-range', {
+                              sessionId, cwd, startUuid, endUuid,
+                              includeEditing: copyIncludeEditing,
+                              includeReading: copyIncludeReading,
+                            });
+                            if (result.success) {
+                              setEditRangeState({ range, phase: 'ready', sourceContent: result.content, compactText: '', autoEditInitial: true });
+                            } else {
+                              useUIStore.getState().showToast('Не удалось собрать диапазон', 'error', 3000);
+                            }
+                          } catch (err: any) {
+                            console.error('[EditRange:ManualOpen] Failed:', err);
+                            useUIStore.getState().showToast('Ошибка: ' + (err.message || err), 'error', 3000);
+                          }
+                        }}
+                      >
+                        <Pencil size={11} />
+                      </button>
                     </div>
+                  )}
+                  {!isGemini && (
+                    <button
+                      className="w-full text-left px-3 py-2 text-xs text-red-400 hover:bg-red-600/20 rounded transition-colors cursor-pointer flex items-center gap-2"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setDeleteConfirmMode(true);
+                      }}
+                    >
+                      <Trash2 size={12} />
+                      Удалить историю ({rangeActionMenu.range.endIndex - rangeActionMenu.range.startIndex + 1})
+                    </button>
                   )}
                 </>
               ) : (

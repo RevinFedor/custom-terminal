@@ -990,7 +990,6 @@ class DatabaseManager {
 
   /**
    * Save a fork marker when a session is forked
-   * Also copies inherited markers from parent session (for cascading forks)
    * @param {string} sourceSessionId - Original session UUID
    * @param {string} forkedToSessionId - New session UUID
    * @param {string[]} entryUuids - Array of all entry UUIDs at fork time (snapshot)
@@ -1008,11 +1007,41 @@ class DatabaseManager {
       `).run(sourceSessionId, forkedToSessionId, entryUuidsJson);
       console.log('[DB] Fork marker saved:', { sourceSessionId, forkedToSessionId, entryCount: entryUuids?.length || 0 });
 
-      // Debug: dump all fork_markers in DB
-      const allMarkers = this.db.prepare('SELECT source_session_id, forked_to_session_id FROM fork_markers').all();
-      console.log('[DB] ALL fork_markers after save:', JSON.stringify(allMarkers));
+      // Invalidate cache for both endpoints so the next Timeline read sees the new marker.
+      this.invalidateForkMarkerCache(sourceSessionId);
+      this.invalidateForkMarkerCache(forkedToSessionId);
     } catch (e) {
       console.error('[DB] Failed to save fork marker:', e);
+    }
+  }
+
+  /**
+   * In-memory cache for getForkMarkers. Fork markers change infrequently (only when
+   * the user forks or hides a marker), so Timeline's 2s poll previously issued ~137K
+   * redundant SQLite reads per session (see 2026-04-19 audit).
+   *
+   * Cache shape: Map<sessionId, { markers, ts }>. TTL is effectively infinite —
+   * entries are invalidated explicitly by saveForkMarker / timeline:delete-fork-marker.
+   * Regression signal: [DB:ForkCache] MISS firing > once per real fork operation
+   * for the same session means invalidation is too aggressive or cache never populates.
+   */
+  _forkMarkerCache = new Map();
+  _forkMarkerCacheStats = { hit: 0, miss: 0, invalidate: 0 };
+
+  invalidateForkMarkerCache(sessionId) {
+    if (!sessionId) return;
+    if (this._forkMarkerCache.has(sessionId)) {
+      this._forkMarkerCache.delete(sessionId);
+      this._forkMarkerCacheStats.invalidate++;
+      console.log('[DB:ForkCache] INVALIDATE ' + sessionId.slice(0, 8));
+    }
+    // Also invalidate any cached entry whose markers reference this session as the
+    // opposite endpoint (both source and destination look up the same marker).
+    for (const [key, val] of this._forkMarkerCache) {
+      if (val.markers.some(m => m.source_session_id === sessionId || m.fork_session_id === sessionId)) {
+        this._forkMarkerCache.delete(key);
+        this._forkMarkerCacheStats.invalidate++;
+      }
     }
   }
 
@@ -1022,6 +1051,21 @@ class DatabaseManager {
    * @returns {Array<{source_session_id: string, entry_uuids: string[]}>}
    */
   getForkMarkers(sessionId) {
+    if (!sessionId) return [];
+
+    const cached = this._forkMarkerCache.get(sessionId);
+    if (cached) {
+      this._forkMarkerCacheStats.hit++;
+      // Log every 1000 hits to keep file size sane but still prove cache works.
+      if (this._forkMarkerCacheStats.hit % 1000 === 0) {
+        console.log('[DB:ForkCache] stats hit=' + this._forkMarkerCacheStats.hit +
+                    ' miss=' + this._forkMarkerCacheStats.miss +
+                    ' invalidate=' + this._forkMarkerCacheStats.invalidate +
+                    ' size=' + this._forkMarkerCache.size);
+      }
+      return cached.markers;
+    }
+
     // Search by both source and destination to show markers in both sessions
     const rows = this.db.prepare(`
       SELECT source_session_id, forked_to_session_id, entry_uuids_json, created_at, hidden
@@ -1030,15 +1074,19 @@ class DatabaseManager {
       ORDER BY created_at
     `).all(sessionId, sessionId);
 
-    console.log('[DB] getForkMarkers(' + sessionId?.slice(0, 8) + '...):', rows.length, 'rows');
+    this._forkMarkerCacheStats.miss++;
+    console.log('[DB] getForkMarkers(' + sessionId?.slice(0, 8) + '...):', rows.length, 'rows [MISS]');
 
-    return rows.map(row => ({
+    const markers = rows.map(row => ({
       source_session_id: row.source_session_id,
       fork_session_id: row.forked_to_session_id,
       entry_uuids: JSON.parse(row.entry_uuids_json || '[]'),
       created_at: row.created_at,
       hidden: !!row.hidden
     }));
+
+    this._forkMarkerCache.set(sessionId, { markers, ts: Date.now() });
+    return markers;
   }
 
   /**
@@ -1169,6 +1217,84 @@ class DatabaseManager {
       INSERT OR IGNORE INTO timeline_rewind_markers (entry_uuid, session_id)
       VALUES (?, ?)
     `).run(entryUuid, sessionId);
+  }
+
+  /**
+   * Copy timeline_notes and timeline_rewind_markers from source rows to a new sessionId.
+   * Used by fork: the JSONL file is duplicated and sessionIds rewritten to the new fork
+   * id, but notes/rewind rows still carry the old sessionId — without this copy they
+   * disappear from the fork's Timeline.
+   *
+   * Match by UUID set (entries that exist in the forked JSONL) instead of by old
+   * sessionId, because a single forked file can contain entries from several sessionIds
+   * (Plan Mode / Clear Context within the parent chain). Any matching note attaches to
+   * the new fork sessionId — duplicate UUIDs across sessions just collapse to one row.
+   *
+   * @param {string} newSessionId - Fork's sessionId
+   * @param {string[]} entryUuids - All UUIDs present in the forked JSONL
+   * @param {string|null} forkTabId - Tab id for the new fork (notes need a tab_id)
+   * @returns {{notes: number, rewindMarkers: number}}
+   */
+  copyTimelineMetadataForFork(newSessionId, entryUuids, forkTabId) {
+    if (!Array.isArray(entryUuids) || entryUuids.length === 0) {
+      return { notes: 0, rewindMarkers: 0 };
+    }
+
+    // SQLite has a default param limit of 999; chunk to be safe.
+    const CHUNK = 800;
+    let notesCopied = 0;
+    let rewindCopied = 0;
+
+    const insertNote = this.db.prepare(`
+      INSERT OR IGNORE INTO timeline_notes (entry_uuid, session_id, tab_id, content, position, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, strftime('%s','now'), strftime('%s','now'))
+    `);
+    const insertRewind = this.db.prepare(`
+      INSERT OR IGNORE INTO timeline_rewind_markers (entry_uuid, session_id)
+      VALUES (?, ?)
+    `);
+
+    const tx = this.db.transaction((uuids) => {
+      // Notes — pick the most recently updated row per uuid (in case the same UUID
+      // appears in several sessionIds in the parent chain).
+      const notesQuery = `
+        SELECT entry_uuid, content, position, MAX(updated_at) AS u
+        FROM timeline_notes
+        WHERE entry_uuid IN (${uuids.map(() => '?').join(',')})
+          AND session_id != ?
+        GROUP BY entry_uuid
+      `;
+      const noteRows = this.db.prepare(notesQuery).all(...uuids, newSessionId);
+      for (const r of noteRows) {
+        const result = insertNote.run(
+          r.entry_uuid,
+          newSessionId,
+          forkTabId || '',
+          r.content || '',
+          r.position || 'before'
+        );
+        if (result.changes > 0) notesCopied++;
+      }
+
+      // Rewind markers — same idea, dedupe by uuid.
+      const rewindQuery = `
+        SELECT DISTINCT entry_uuid
+        FROM timeline_rewind_markers
+        WHERE entry_uuid IN (${uuids.map(() => '?').join(',')})
+          AND session_id != ?
+      `;
+      const rewindRows = this.db.prepare(rewindQuery).all(...uuids, newSessionId);
+      for (const r of rewindRows) {
+        const result = insertRewind.run(r.entry_uuid, newSessionId);
+        if (result.changes > 0) rewindCopied++;
+      }
+    });
+
+    for (let i = 0; i < entryUuids.length; i += CHUNK) {
+      tx(entryUuids.slice(i, i + CHUNK));
+    }
+
+    return { notes: notesCopied, rewindMarkers: rewindCopied };
   }
 
   close() { this.db.close(); }

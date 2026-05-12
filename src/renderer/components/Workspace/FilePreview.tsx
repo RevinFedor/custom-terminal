@@ -7,6 +7,8 @@ import '@gt-editor/markdown-editor/styles.css';
 
 export default function FilePreview() {
   const { filePreview, closeFilePreview, showToast } = useUIStore();
+  const filePreviewFontSize = useUIStore((s) => s.filePreviewFontSize);
+  const setFilePreviewFontSize = useUIStore((s) => s.setFilePreviewFontSize);
   const { activeProjectId, getSidebarState, setOpenFilePath } = useWorkspaceStore();
   const { sidebarOpen } = activeProjectId ? getSidebarState(activeProjectId) : { sidebarOpen: false };
   const [copied, setCopied] = useState(false);
@@ -35,6 +37,7 @@ export default function FilePreview() {
 
   return createPortal(
     <div
+      data-file-preview-root
       style={{
         position: 'fixed',
         top: 36,
@@ -55,6 +58,24 @@ export default function FilePreview() {
           <span className="text-[10px] text-[#555] truncate">{filePreview.path}</span>
         </div>
         <div className="flex items-center gap-2">
+          {/* Inline font-size stepper. Mirrors the SettingsModal stepper so the user
+              can adjust font size without leaving the preview; both edit the same
+              filePreviewFontSize key in UIStore (persisted to localStorage). */}
+          <div className="flex items-center gap-1 mr-1">
+            <button
+              className="w-6 h-6 flex items-center justify-center rounded text-[#888] hover:text-white hover:bg-white/10 disabled:opacity-30 disabled:cursor-not-allowed"
+              disabled={filePreviewFontSize <= 10}
+              onClick={() => setFilePreviewFontSize(filePreviewFontSize - 1)}
+              title="Уменьшить шрифт"
+            >−</button>
+            <span className="text-[10px] text-[#888] font-mono tabular-nums min-w-[26px] text-center">{filePreviewFontSize}px</span>
+            <button
+              className="w-6 h-6 flex items-center justify-center rounded text-[#888] hover:text-white hover:bg-white/10 disabled:opacity-30 disabled:cursor-not-allowed"
+              disabled={filePreviewFontSize >= 24}
+              onClick={() => setFilePreviewFontSize(filePreviewFontSize + 1)}
+              title="Увеличить шрифт"
+            >+</button>
+          </div>
           <button
             className={`text-xs px-2 py-1 rounded transition-colors ${
               copied
@@ -80,7 +101,7 @@ export default function FilePreview() {
           content={filePreview.content}
           onChange={() => {}}
           readOnly
-          fontSize={13}
+          fontSize={filePreviewFontSize}
           wordWrap
           showLineNumbers
           foldStateKey={`file-preview:${filePreview.path}`}
