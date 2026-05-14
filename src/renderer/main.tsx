@@ -1,5 +1,13 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
+// Hydrate localStorage from SQLite + install setItem mirror BEFORE any store
+// module loads. Zustand store factories read `localStorage.getItem(...)` at
+// import time — if SQLite has fresher values (typical on dev when vite picks a
+// new port and origin-bound localStorage is empty), they need to land in
+// localStorage before the factory runs.
+import { bootstrapPersistedStorage } from './utils/persistedStorage';
+bootstrapPersistedStorage();
+
 import App from './App';
 import './styles/globals.css';
 import './styles/sidebar.css';
@@ -110,17 +118,30 @@ class ErrorBoundary extends React.Component<
           }}>
             {this.state.error.message}
           </pre>
-          <button
-            onClick={() => this.setState({ error: null })}
-            style={{
-              padding: '8px 20px', fontSize: '13px',
-              backgroundColor: '#333', color: '#fff',
-              border: '1px solid #555', borderRadius: '6px',
-              cursor: 'pointer',
-            }}
-          >
-            Try Again
-          </button>
+          <div style={{ display: 'flex', gap: 10 }}>
+            <button
+              onClick={() => this.setState({ error: null })}
+              style={{
+                padding: '8px 20px', fontSize: '13px',
+                backgroundColor: '#333', color: '#fff',
+                border: '1px solid #555', borderRadius: '6px',
+                cursor: 'pointer',
+              }}
+            >
+              Try Again
+            </button>
+            <button
+              onClick={() => location.reload()}
+              style={{
+                padding: '8px 20px', fontSize: '13px',
+                backgroundColor: '#DA7756', color: 'white',
+                border: 'none', borderRadius: '6px',
+                cursor: 'pointer',
+              }}
+            >
+              Reload
+            </button>
+          </div>
         </div>
       );
     }

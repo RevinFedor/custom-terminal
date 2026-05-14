@@ -704,7 +704,6 @@ export default function SessionsPanel({ projectPath, activeTabId }: SessionsPane
                       <button
                         className="text-[#888] hover:text-red-500 text-xs"
                         onClick={(e) => { e.stopPropagation(); deleteSession(session.id); }}
-                        title="Delete from all locations"
                       >
                         🗑️
                       </button>
@@ -718,13 +717,12 @@ export default function SessionsPanel({ projectPath, activeTabId }: SessionsPane
                             key={i}
                             className="flex items-center justify-between text-[10px] text-[#888] hover:text-white px-2 py-1 hover:bg-[#333] rounded"
                           >
-                            <span className="truncate flex-1" title={loc}>
+                            <span className="truncate flex-1">
                               📁 {loc?.split('/').pop() || '?'}
                             </span>
                             <button
                               className="text-[#666] hover:text-red-500 ml-2"
                               onClick={() => deleteDeployment(session.id, session.session_key, loc)}
-                              title={`Remove from ${loc}`}
                             >
                               ✕
                             </button>

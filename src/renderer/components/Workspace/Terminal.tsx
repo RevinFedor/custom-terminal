@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState, memo, useCallback } from 'react';
 import { Terminal as XTerminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
+import Tooltip from '../UI/Tooltip';
 import { WebglAddon } from '@xterm/addon-webgl';
 import { WebLinksAddon } from '@xterm/addon-web-links';
 
@@ -61,6 +62,7 @@ import { SerializeAddon } from '@xterm/addon-serialize';
 import { SearchAddon } from '@xterm/addon-search';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore, type PendingAction } from '../../store/useWorkspaceStore';
+import { PromptQueueOverlay } from './PromptQueueOverlay';
 import { terminalRegistry } from '../../utils/terminalRegistry';
 import { log } from '../../utils/logger';
 
@@ -274,80 +276,16 @@ const MAX_BUFFER_SIZE = 65536; // 64KB safety valve
 const BSU = '\x1b[?2026h';
 const ESU = '\x1b[?2026l';
 
-// ============================================================================
-// DIAG (2026-04-21): visible-set invariant tracking.
-//
-// Invariant: at most 1 Terminal should have effectiveActive=true at any time.
-// When multiple claim effectiveActive=true, their outer divs all get zIndex:1
-// and the first-mounted in DOM wins — user sees a "frozen" terminal even
-// though input routes correctly. This Set + rAF-debounced log catches the
-// violation loudly.
-//
-// Filter in prod log: `grep [Terminal:VisibleSetInvariant]`.
-// Expected baseline: each transition → exactly one line with count=1 (or 0
-// briefly during project switch mid-transition).
-// Regression: count>=2 sustained for >1 rAF tick.
-// ============================================================================
-const _visibleTerminals = new Set<string>();
-let _invariantCheckQueued = false;
-function _scheduleInvariantCheck() {
-  if (_invariantCheckQueued) return;
-  _invariantCheckQueued = true;
-  requestAnimationFrame(() => {
-    _invariantCheckQueued = false;
-    const n = _visibleTerminals.size;
-    if (n === 1) {
-      // happy path — don't log to avoid noise
-      return;
-    }
-    const list = Array.from(_visibleTerminals).map(id => id.slice(-12)).join(',');
-    console.warn(`[Terminal:VisibleSetInvariant] count=${n} tabs=[${list}] ` +
-      (n === 0 ? '(all hidden — expected briefly during project switch)' : '(VIOLATION — z-index fight, user sees wrong terminal)'));
-  });
-}
 
 interface TerminalProps {
   tabId: string;
   cwd: string;
-  // PERF (2026-04-21): active/isActiveProject derived from the store by default.
-  // TerminalArea.useMemo no longer passes them, so it doesn't need activeTabId in
-  // its fingerprint → cross-project switches don't rebuild the element list.
-  // Callers that OWN the flag (e.g. BrowserTab wrapping embedded Terminal) still
-  // pass explicit values.
-  //
-  // CORRECTNESS NOTE: both selectors must agree on "what is the active project".
-  // An earlier version of this code (reverted 2026-04-21) checked only
-  // `workspace.activeTabId === tabId`, which made every open project's last-used
-  // tab claim active=true simultaneously. All of them then got zIndex:1 +
-  // visibility:visible, and the first-mounted terminal "froze" on top. The fix
-  // is the activeProjectId check inside activeFromStore.
-  active?: boolean;
+  active: boolean;
   isActiveProject?: boolean; // For lazy init optimization
   onLinkClick?: (url: string) => void; // Override link handler (used by BrowserTab)
 }
 
-function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActiveProjectProp, onLinkClick }: TerminalProps) {
-  // PERF: subscribe to store directly when props are not provided.
-  // Each terminal re-renders only when ITS active state flips.
-  // MUST check activeProjectId to avoid the "frozen initial terminal" regression.
-  const activeFromStore = useWorkspaceStore((state) => {
-    for (const [projId, workspace] of state.openProjects) {
-      if (workspace.tabs.has(tabId)) {
-        return state.activeProjectId === projId && workspace.activeTabId === tabId;
-      }
-    }
-    return false;
-  });
-  const isActiveProjectFromStore = useWorkspaceStore((state) => {
-    for (const [projId, workspace] of state.openProjects) {
-      if (workspace.tabs.has(tabId)) {
-        return state.activeProjectId === projId;
-      }
-    }
-    return false;
-  });
-  const active = activeProp !== undefined ? activeProp : activeFromStore;
-  const isActiveProject = isActiveProjectProp !== undefined ? isActiveProjectProp : isActiveProjectFromStore;
+function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: TerminalProps) {
 
   const terminalRef = useRef<HTMLDivElement>(null);
   const xtermInstance = useRef<XTerminal | null>(null);
@@ -383,6 +321,54 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
     return undefined;
   });
 
+  // Prompt-queue overlay needs to know two things:
+  //  - is this a Claude tab? (so we only show overlay there)
+  //  - is Claude busy? (so the Run-queue UI can wait correctly).
+  // Granular selectors per `fix-performance-lags.md` — never subscribe to whole openProjects Map.
+  const isClaudeTab = useWorkspaceStore((state) => {
+    for (const [, workspace] of state.openProjects) {
+      const tab = workspace.tabs.get(tabId);
+      if (tab) return tab.commandType === 'claude';
+    }
+    return false;
+  });
+  const claudeBusy = useWorkspaceStore((state) => {
+    for (const [, workspace] of state.openProjects) {
+      const tab = workspace.tabs.get(tabId);
+      if (tab) return !!tab.claudeBusy;
+    }
+    return false;
+  });
+  // Only show prompt-queue overlay when there's a real Claude session running in the tab.
+  // sessionId alone isn't enough — it persists after Claude exits (we keep it for /resume).
+  // Combine with live process status from OSC 133 command-started/finished events.
+  const hasClaudeSession = useWorkspaceStore((state) => {
+    for (const [, workspace] of state.openProjects) {
+      const tab = workspace.tabs.get(tabId);
+      if (tab) return !!tab.claudeSessionId;
+    }
+    return false;
+  });
+  const [claudeProcessAlive, setClaudeProcessAlive] = useState(false);
+  useEffect(() => {
+    const onStarted = (_: any, data: { tabId: string }) => {
+      if (data.tabId === tabId) setClaudeProcessAlive(true);
+    };
+    const onFinished = (_: any, data: { tabId: string }) => {
+      if (data.tabId === tabId) setClaudeProcessAlive(false);
+    };
+    ipcRenderer.on('terminal:command-started', onStarted);
+    ipcRenderer.on('terminal:command-finished', onFinished);
+    // Initial sync — main keeps per-tab state we can poll once.
+    ipcRenderer.invoke('terminal:getCommandState', tabId).then((s: any) => {
+      if (s?.isRunning) setClaudeProcessAlive(true);
+    }).catch(() => {});
+    return () => {
+      ipcRenderer.removeListener('terminal:command-started', onStarted);
+      ipcRenderer.removeListener('terminal:command-finished', onFinished);
+    };
+  }, [tabId]);
+
   // Per-project currentView: find which project owns this tab and read its currentView
   const projectCurrentView = useWorkspaceStore((state) => {
     for (const [, workspace] of state.openProjects) {
@@ -397,37 +383,10 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
   // This prevents focus/fit/repaint when terminals are hidden behind Dashboard or ProjectHome
   const effectiveActive = active && projectCurrentView === 'terminal' && workspaceView === 'workspace';
 
-  // DIAG (2026-04-21): log state transitions per-terminal so regressions like
-  // "multiple active at once" or "stuck hidden" are trivially greppable.
-  // Rate-limited by ref diff — one line per real transition, not per render.
-  // Filter: `grep [Terminal:StateTransition]` in prod log.
-  const lastStateSnapshotRef = useRef<string>('');
-  const snap = `active=${active} isActiveProject=${isActiveProject} effectiveActive=${effectiveActive} pcv=${projectCurrentView} wv=${workspaceView}`;
-  if (snap !== lastStateSnapshotRef.current) {
-    const prev = lastStateSnapshotRef.current || '(initial)';
-    lastStateSnapshotRef.current = snap;
-    console.warn(`[Terminal:StateTransition] tabId=${tabId.slice(-12)} PREV={${prev}} NEW={${snap}}`);
-  }
-
   // Keep activeRef in sync for ResizeObserver closure
   useEffect(() => {
     activeRef.current = effectiveActive;
   }, [effectiveActive]);
-
-  // DIAG: maintain the visible-set for the invariant checker.
-  useEffect(() => {
-    if (effectiveActive) {
-      _visibleTerminals.add(tabId);
-    } else {
-      _visibleTerminals.delete(tabId);
-    }
-    _scheduleInvariantCheck();
-    return () => {
-      // Unmount: ensure we don't leak a phantom entry.
-      _visibleTerminals.delete(tabId);
-      _scheduleInvariantCheck();
-    };
-  }, [effectiveActive, tabId]);
 
   // Check if terminal is scrolled up (not at bottom)
   // ALL callers go through rAF debounce — never call this synchronously during term.write()
@@ -496,16 +455,28 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
     const viewport = container.querySelector('.xterm-viewport') as HTMLElement | null;
     if (viewport) {
       let clearRefTimer: NodeJS.Timeout | null = null;
+      // DIAG: log raw wheel events with deltaY so we can correlate user-scroll
+      // attempts to scrollToLine snap-backs in protectedWrite.
+      viewport.addEventListener('wheel', (e: Event) => {
+        const we = e as WheelEvent;
+        console.warn(`[ScrollDiag:WHEEL] deltaY=${we.deltaY.toFixed(1)} scrollTop=${viewport.scrollTop.toFixed(0)} userRef=${userScrollTopRef.current} baseY=${term.buffer.active.baseY} viewportY=${term.buffer.active.viewportY}`);
+      }, { passive: true });
+
       viewport.addEventListener('scroll', () => {
         rafCheckScroll();
-        // Skip during sync frame write/restore (isWritingRef only set for sync frames)
-        if (isWritingRef.current || isRestoringRef.current) return;
 
         const buf = term.buffer.active;
 
         // Echo detection: after scrollToLine(X), browser fires a parasitic scroll event
         // with viewportY ≈ X. Ignore it — it's not user input.
         // Real user scroll produces values far from lastRestoredY.
+        //
+        // Note: we do NOT guard on `isWritingRef` here. During Claude streaming,
+        // sync-frames fire every ~16ms; if we skipped scroll updates while writing,
+        // a user scrolling down would have their position constantly snapped back
+        // to a stale `userScrollTopRef` by protectedWrite. Echo detection below is
+        // sufficient — it filters our own scrollToLine echoes (distance ≤ 1 line),
+        // and real user scrolls (delta >> 1 line) fall through and update the ref.
         if (lastRestoredYRef.current !== null) {
           const echoDistance = Math.abs(buf.viewportY - lastRestoredYRef.current);
           if (echoDistance <= 1) {
@@ -517,16 +488,48 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
           lastRestoredYRef.current = null;
         }
 
-        if (buf.viewportY >= buf.baseY) {
-          // User scrolled to bottom — clear ref immediately, no debounce.
-          // This lets protectedWrite pass data through without scrollToLine snap-back.
-          if (clearRefTimer) { clearTimeout(clearRefTimer); clearRefTimer = null; }
-          if (userScrollTopRef.current !== null) {
-            userScrollTopRef.current = null;
+        // "At bottom" = the Ink input bar is visible.
+        //
+        // We do NOT use strict `viewportY >= baseY` because Ink/Claude TUI keeps
+        // the cursor INSIDE the viewport (not at the absolute last row): typically
+        // the bottom 4-6 rows are reserved for prompt, hint text ("? for shortcuts",
+        // "bypass permissions on"), and trailing blank lines. So `cursorY` lands
+        // around `rows - 5` in idle Claude state, not `rows - 1`.
+        //
+        // Per xterm.js maintainer (#4842): cursor lives only inside the mutable
+        // viewport region (bottom `rows` lines). `cursorY` is in VIEWPORT-LOCAL
+        // coords and tells us "where is the cursor on screen". If it lands in
+        // the bottom INPUT_ZONE rows, the user is seeing the input bar — that IS
+        // "at bottom" semantically, regardless of the baseY/viewportY gap.
+        //
+        // INPUT_ZONE = 6 covers Claude (cursor ~ rows-5), Gemini (cursor ~ rows-3),
+        // and plain shells (cursor on last row). It also accidentally treats a
+        // user scrolled up by ≤5 rows as "at bottom" — acceptable, since 5 rows
+        // is visually indistinguishable from bottom on a 44-row viewport.
+        const INPUT_ZONE = 6;
+        const inputBarVisible = buf.cursorY >= term.rows - INPUT_ZONE;
+        const atBottom = inputBarVisible || buf.viewportY >= buf.baseY;
+        if (atBottom) {
+          // Schedule ref clear after 1s — debounce filters transient
+          // sync-frame buffer shrinks (CSI 2J inside DEC 2026 momentarily
+          // makes viewportY > baseY without user actually being at bottom).
+          const savedPos = userScrollTopRef.current;
+          const isPushedToBottom = savedPos !== null && savedPos > buf.baseY;
+          if (!clearRefTimer && savedPos !== null && !isPushedToBottom) {
+            clearRefTimer = setTimeout(() => {
+              clearRefTimer = null;
+              const b = term.buffer.active;
+              const stillAtBottom = b.cursorY >= term.rows - INPUT_ZONE || b.viewportY >= b.baseY;
+              if (stillAtBottom) {
+                const stillPushed = userScrollTopRef.current !== null && userScrollTopRef.current > b.baseY;
+                if (!stillPushed) {
+                  userScrollTopRef.current = null;
+                }
+              }
+            }, 1000);
           }
         } else if (buf.viewportY > 0) {
-          // User scrolled up or down (but not to bottom) — update ref immediately.
-          // Next protectedWrite will use this updated position.
+          // User scrolled — save position, cancel pending clear
           if (clearRefTimer) { clearTimeout(clearRefTimer); clearRefTimer = null; }
           userScrollTopRef.current = buf.viewportY;
         }
@@ -686,7 +689,11 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
             }
           }
 
+          // DIAG: log every scrollToLine snap-back
+          const vpStBefore = vpEl?.scrollTop ?? -1;
           t.scrollToLine(restoredLine);
+          const vpStAfter = vpEl?.scrollTop ?? -1;
+          console.warn(`[ScrollDiag:SNAP] scrollToLine(${restoredLine}) DOM.scrollTop ${vpStBefore.toFixed(0)}→${vpStAfter.toFixed(0)} savedLine=${savedLine} baseY=${baseAfter} cursorY=${t.buffer.active.cursorY} rows=${t.rows}`);
           lastRestoredYRef.current = restoredLine;
 
           if (restoredLine >= savedLine) {
@@ -801,6 +808,25 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
       getSetClaudeSessionId()(tabId, data.sessionId);
     };
 
+    // Fresh Claude process started for this tab (new PID seen in bridge cache).
+    // Fires once per real spawn — unlike session-detected which re-syncs on every
+    // bridge update of the same session. Right place to auto-inject /effort.
+    const handleProcessStarted = (_: any, data: { tabId: string; sessionId: string; claudePid: number }) => {
+      if (data.tabId !== tabId) return;
+      const eff = useUIStore.getState().defaultClaudeEffort;
+      console.log('[Terminal:EffortInject] tab=' + tabId.slice(-12) + ' pid=' + data.claudePid + ' default=' + eff);
+      if (!eff || eff === 'none') return;
+      // No setTimeout: safePasteAndSubmit is fully event-driven — it sends Ctrl+S → waits
+      // for Ink's sync marker → bracketed-paste → waits again → Enter. Sync marker arrives
+      // only when Ink has actually rendered the prompt input. If Claude isn't ready yet,
+      // we wait *inside* that function rather than blindly stalling 800ms here.
+      // The /effort dialog auto-confirmer in main handles the "Change effort level?"
+      // prompt that may appear on a fresh directory.
+      ipcRenderer.invoke('claude:send-command', tabId, '/effort ' + eff).catch((e: unknown) => {
+        console.error('[Terminal:EffortInject] failed', e);
+      });
+    };
+
     // /status interception: update session ID if not yet captured (no toast)
     const handleStatusSessionDetected = (_: any, data: { tabId: string; sessionId: string }) => {
       if (data.tabId !== tabId) return;
@@ -839,6 +865,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
     ipcRenderer.on('terminal:data', handleData);
     ipcRenderer.on('terminal:exit', handleExit);
     ipcRenderer.on('claude:session-detected', handleSessionDetected);
+    ipcRenderer.on('claude:process-started', handleProcessStarted);
     ipcRenderer.on('claude:status-session-detected', handleStatusSessionDetected);
     ipcRenderer.on('gemini:session-detected', handleGeminiSessionDetected);
     ipcRenderer.on('claude-agent:status', handleClaudeAgentStatus);
@@ -1042,10 +1069,18 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
         // It now waits for first PTY output (= shell ready) instead of arbitrary timeout
       }, 100);
 
-      // IPC: Send input to PTY
+      // IPC: Send input to PTY.
+      //
+      // User typing = explicit intent to interact with the input bar at the
+      // bottom. Clear scroll-protection so xterm's built-in `scrollOnUserInput`
+      // can pin the viewport down and so the next Ink sync-frame is not
+      // re-snapped to a stale `userScrollTopRef` by protectedWrite.
+      //
+      // This only fires on user keystrokes (term.onData), NEVER on streaming
+      // PTY output — so it doesn't break scroll protection during Claude's
+      // response rendering.
       term.onData((data) => {
         ipcRenderer.send('terminal:input', tabId, data);
-        // User is typing — clear scroll protection so xterm can auto-scroll to bottom
         if (userScrollTopRef.current !== null) {
           userScrollTopRef.current = null;
         }
@@ -1063,6 +1098,15 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
       // Intercept Enter key to replace claude/claude-c/claude-f with explicit --resume
       // Commands: claude (new), claude-c (continue), claude-f (fork)
       term.attachCustomKeyEventHandler((event) => {
+        // Cmd+ArrowDown — scroll terminal to the most recent output. Handled here
+        // (not in the global window listener) so xterm.js consumes the event and
+        // doesn't pass the Down-arrow byte to the PTY (which would feed it as
+        // history navigation in zsh/Claude TUI).
+        if (event.metaKey && event.type === 'keydown' && event.key === 'ArrowDown') {
+          event.preventDefault();
+          scrollToBottom();
+          return false;
+        }
         // Skip xterm.js processing for app-level Meta (Cmd) shortcuts.
         // Prevents Cmd+, (Settings), Cmd+T (new tab), etc. from leaking characters to PTY.
         // Preserve: Cmd+C (copy/SIGINT), Cmd+V (paste), Cmd+A (selectAll), Cmd+X (cut)
@@ -1328,6 +1372,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
       ipcRenderer.removeListener('terminal:data', handleData);
       ipcRenderer.removeListener('terminal:exit', handleExit);
       ipcRenderer.removeListener('claude:session-detected', handleSessionDetected);
+      ipcRenderer.removeListener('claude:process-started', handleProcessStarted);
       ipcRenderer.removeListener('claude:status-session-detected', handleStatusSessionDetected);
       ipcRenderer.removeListener('gemini:session-detected', handleGeminiSessionDetected);
       ipcRenderer.removeListener('claude-agent:status', handleClaudeAgentStatus);
@@ -1528,6 +1573,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
         }
 
         // Setup handlers
+        // User typing — clear scroll-protection (see longer comment at primary onData above)
         term.onData((data) => {
           ipcRenderer.send('terminal:input', tabId, data);
           if (userScrollTopRef.current !== null) {
@@ -1541,6 +1587,12 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
 
         // === INPUT INTERCEPTION for Claude Commands (same as initTerminal) ===
         term.attachCustomKeyEventHandler((event) => {
+          // Cmd+ArrowDown — scroll-to-bottom (mirrors the primary handler above).
+          if (event.metaKey && event.type === 'keydown' && event.key === 'ArrowDown') {
+            event.preventDefault();
+            scrollToBottom();
+            return false;
+          }
           // Skip xterm.js processing for app-level Meta (Cmd) shortcuts.
           // Prevents Cmd+, (Settings), Cmd+T (new tab), etc. from leaking characters to PTY.
           // Preserve: Cmd+C (copy/SIGINT), Cmd+V (paste), Cmd+A (selectAll), Cmd+X (cut)
@@ -1920,15 +1972,22 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
           onContextMenu={handleContextMenu}
         />
 
+        {/* Prompt Queue overlay — only for Claude tabs with a live process.
+            hasClaudeSession (sessionId set) AND claudeProcessAlive (OSC 133 says Claude is
+            actually running). When Claude exits, process-finished fires → overlay disappears. */}
+        {effectiveActive && isClaudeTab && hasClaudeSession && claudeProcessAlive && (
+          <PromptQueueOverlay tabId={tabId} claudeBusy={claudeBusy} />
+        )}
+
       </div>
 
       {/* Scroll-to-bottom button — OUTSIDE isolation:isolate wrapper so its z-index
           participates in root stacking context (above Timeline tooltip portal z:10000) */}
       {active && showScrollButton && (
+        <Tooltip content="Scroll to bottom">
         <button
           onClick={scrollToBottom}
           className="pointer-events-auto flex items-center justify-center cursor-pointer transition-all duration-200 ease-out hover:scale-105"
-          title="Scroll to bottom"
           style={{
             position: 'absolute',
             bottom: '16px',
@@ -1957,6 +2016,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
         >
           ↓
         </button>
+        </Tooltip>
       )}
     </>
   );

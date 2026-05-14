@@ -1,6 +1,7 @@
 import React, { useState, useMemo } from 'react';
 import { Home, Minimize2, RotateCcw, Globe } from 'lucide-react';
 import { useUIStore } from '../../store/useUIStore';
+import Tooltip from '../UI/Tooltip';
 import { useWorkspaceStore, isTabInterrupted } from '../../store/useWorkspaceStore';
 import { compressLogs } from '../../utils/compressLogs';
 
@@ -124,30 +125,33 @@ export default function ProjectToolbar() {
       className="h-[30px] w-full bg-panel flex items-stretch"
     >
       {/* Home Button */}
+      <Tooltip content="Project Home">
       <button
         onClick={() => activeProjectId && setProjectView(activeProjectId, isHomeActive ? 'terminal' : 'home')}
         style={buttonStyle(isHomeActive)}
         onMouseEnter={(e) => handleMouseEnter(e, isHomeActive)}
         onMouseLeave={(e) => handleMouseLeave(e, isHomeActive)}
-        title="Project Home"
       >
         <Home size={14} />
         <span>Home</span>
       </button>
+      </Tooltip>
 
       {/* Compress Logs Button */}
+      <Tooltip content="Сжать логи из буфера обмена">
       <button
         onClick={handleCompressLogs}
         style={buttonStyle(false)}
         onMouseEnter={(e) => handleMouseEnter(e, false)}
         onMouseLeave={(e) => handleMouseLeave(e, false)}
-        title="Сжать логи из буфера обмена"
         disabled={isCompressing}
       >
         <Minimize2 size={14} className={isCompressing ? 'text-indigo-400 animate-glow-indigo' : ''} />
       </button>
+      </Tooltip>
 
       {/* Browser Tab Button */}
+      <Tooltip content="Open browser tab">
       <button
         onClick={() => {
           if (activeProjectId) {
@@ -158,19 +162,19 @@ export default function ProjectToolbar() {
         style={buttonStyle(false)}
         onMouseEnter={(e) => handleMouseEnter(e, false)}
         onMouseLeave={(e) => handleMouseLeave(e, false)}
-        title="Open browser tab"
       >
         <Globe size={14} />
       </button>
+      </Tooltip>
 
       {/* Resume All Interrupted Sessions Button - only shows when there are interrupted tabs */}
       {interruptedTabs.length > 0 && (
+        <Tooltip content={`Resume all ${interruptedTabs.length} interrupted session(s)`}>
         <button
           onClick={handleResumeAll}
           style={buttonStyle(false)}
           onMouseEnter={(e) => handleMouseEnter(e, false)}
           onMouseLeave={(e) => handleMouseLeave(e, false)}
-          title={`Resume all ${interruptedTabs.length} interrupted session(s)`}
         >
           <RotateCcw size={14} />
           <span
@@ -185,6 +189,7 @@ export default function ProjectToolbar() {
             {interruptedTabs.length}
           </span>
         </button>
+        </Tooltip>
       )}
     </div>
   );

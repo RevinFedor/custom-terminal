@@ -434,7 +434,16 @@ function register({ projectManager, formatToolAction }) {
   _projectManager = projectManager;
 
   // Export a range of messages from Claude session
-  ipcMain.handle('claude:copy-range', async (event, { sessionId, cwd, startUuid, endUuid, includeEditing = false, includeReading = false, includeSubagentResult = false, includeSubagentHistory = false }) => {
+  ipcMain.handle('claude:copy-range', async (event, {
+    sessionId, cwd, startUuid, endUuid,
+    includeEditing = false, includeReading = false,
+    includeSubagentResult = false, includeSubagentHistory = false,
+    // Hierarchical copy settings (P-tab → see fact-clipboard-tools.md).
+    // Defaults preserve old behavior when caller doesn't pass them.
+    includeUser = true, includeClaude = true,
+    includeText = true, includeThinking = true,
+    includeBash = false, includeTools = false,
+  }) => {
     console.log('[Claude Export] Exporting range from', startUuid, 'to', endUuid);
 
     if (!sessionId) return { success: false, error: 'No session ID' };
@@ -547,6 +556,19 @@ function register({ projectManager, formatToolAction }) {
 
       const range = activeHistory.slice(minIdx, maxIdx + 1);
 
+      // Group-based filtering flags forwarded to formatToolAction.
+      // reading/editing keep their legacy meaning, bash/tools are new.
+      const groupFlags = {
+        reading: !!includeReading,
+        editing: !!includeEditing,
+        bash: !!includeBash,
+        tools: !!includeTools,
+      };
+      // Used to decide whether ANY action label is worth attaching to a Claude turn.
+      // Without this guard a turn that contains only a filtered-out tool_use would still
+      // emit an empty "## Claude" block with the user prefix.
+      const claudeHasActionAppetite = includeReading || includeEditing || includeBash || includeTools || includeSubagentResult || includeSubagentHistory;
+
       // Format the range
       let output = `# Claude Session Export (Range)\nSession: ${sessionId}\n\n---\n\n`;
 
@@ -555,6 +577,7 @@ function register({ projectManager, formatToolAction }) {
         if (entry.isSidechain || entry.type === 'summary') continue;
 
         if (entry.type === 'user') {
+          if (!includeUser) continue;
           let rawContent = entry.message?.content;
           if (Array.isArray(rawContent)) {
             if (rawContent.some(item => item.type === 'tool_result')) continue;
@@ -573,6 +596,7 @@ function register({ projectManager, formatToolAction }) {
           output += '## User\n' + rawContent.replace(/\[200~/g, '').replace(/~\]/g, '').trim() + '\n\n';
         }
         else if (entry.type === 'assistant') {
+          if (!includeClaude) continue;
           const msgContent = entry.message?.content;
           if (!msgContent) continue;
 
@@ -580,35 +604,49 @@ function register({ projectManager, formatToolAction }) {
           const toolActions = [];
 
           if (typeof msgContent === 'string') {
-            textContent = msgContent;
+            if (includeText) textContent = msgContent;
           } else if (Array.isArray(msgContent)) {
             const textParts = [];
             for (const block of msgContent) {
-              if (block.type === 'thinking' && block.thinking) {
+              if (block.type === 'thinking' && block.thinking && includeThinking) {
                 textParts.push('<thinking>\n' + block.thinking + '\n</thinking>');
               }
-              if (block.type === 'text' && block.text) {
+              if (block.type === 'text' && block.text && includeText) {
                 textParts.push(block.text);
               }
               if (block.type === 'tool_use') {
+                // Pre-filter by group: tool_use is suppressed entirely if its group is off
+                // (no label, no result). Subagent (Task) handled by includeSubagent* below.
+                const group = (() => {
+                  if (block.name === 'Read' || block.name === 'NotebookRead') return 'reading';
+                  if (block.name === 'Edit' || block.name === 'Write' || block.name === 'NotebookEdit') return 'editing';
+                  // Grep/Glob are shell-flavoured search — group with Bash/Monitor, not reading.
+                  if (block.name === 'Bash' || block.name === 'Monitor' || block.name === 'Grep' || block.name === 'Glob') return 'bash';
+                  if (block.name === 'Task') return 'subagent';
+                  return 'tools';
+                })();
+                const groupOn = (group === 'reading' && groupFlags.reading)
+                  || (group === 'editing' && groupFlags.editing)
+                  || (group === 'bash' && groupFlags.bash)
+                  || (group === 'tools' && groupFlags.tools)
+                  || (group === 'subagent' && (includeSubagentResult || includeSubagentHistory));
+                if (!groupOn) continue;
+
                 // Find matching tool_result in subsequent range records
                 let toolResult = null;
-                const needResult = includeEditing || includeReading || (block.name === 'Task' && includeSubagentResult);
-                if (needResult) {
-                  for (let j = i + 1; j < range.length; j++) {
-                    const nextEntry = range[j];
-                    if (nextEntry.type === 'user' && Array.isArray(nextEntry.message?.content)) {
-                      const res = nextEntry.message.content.find(c => c.type === 'tool_result' && c.tool_use_id === block.id);
-                      if (res) {
-                        toolResult = res;
-                        break;
-                      }
+                for (let j = i + 1; j < range.length; j++) {
+                  const nextEntry = range[j];
+                  if (nextEntry.type === 'user' && Array.isArray(nextEntry.message?.content)) {
+                    const res = nextEntry.message.content.find(c => c.type === 'tool_result' && c.tool_use_id === block.id);
+                    if (res) {
+                      toolResult = res;
+                      break;
                     }
                   }
                 }
                 const taskProgress = block.name === 'Task' && block.id ? (progressByToolUseId.get(block.id) || []) : [];
                 const action = formatToolAction(block.name, block.input || {}, toolResult, includeEditing, includeReading, {
-                  includeSubagentResult, includeSubagentHistory, progressEntries: taskProgress
+                  includeSubagentResult, includeSubagentHistory, progressEntries: taskProgress, flags: groupFlags,
                 });
                 if (action) toolActions.push(action);
               }
@@ -620,7 +658,7 @@ function register({ projectManager, formatToolAction }) {
             output += '## Claude\n';
             if (textContent.trim()) output += textContent + '\n';
             if (toolActions.length > 0) {
-              if (includeEditing || includeReading) {
+              if (claudeHasActionAppetite) {
                 output += '\n**Actions:**\n' + toolActions.join('\n\n') + '\n';
               } else {
                 output += '   [Действия: ' + toolActions.join(', ') + ']\n';
@@ -630,7 +668,31 @@ function register({ projectManager, formatToolAction }) {
           }
         }
         else if (entry.type === 'system' && entry.subtype === 'compact_boundary') {
-          output += '\n═══ HISTORY COMPACTED ═══\n\n';
+          // Look ahead in the full activeHistory (not just range) for the
+          // isCompactSummary user entry — it holds the actual summary text.
+          let compactSummary = '';
+          const compactIdxInHistory = activeHistory.findIndex(e => e.uuid === entry.uuid);
+          if (compactIdxInHistory >= 0) {
+            for (let j = compactIdxInHistory + 1; j < activeHistory.length; j++) {
+              const next = activeHistory[j];
+              if (next.isCompactSummary && next.type === 'user') {
+                const raw = typeof next.message?.content === 'string'
+                  ? next.message.content
+                  : Array.isArray(next.message?.content)
+                    ? (next.message.content.find(c => c.type === 'text')?.text || '')
+                    : '';
+                compactSummary = raw
+                  .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '')
+                  .replace(/\[200~/g, '').replace(/~\]/g, '').trim();
+                break;
+              }
+              // Stop at first non-summary user — summary lives right after compact_boundary
+              if (next.type === 'user' && !next.isSidechain) break;
+            }
+          }
+          output += '\n═══ HISTORY COMPACTED ═══\n';
+          if (compactSummary) output += '\n' + compactSummary + '\n';
+          output += '\n';
         }
       }
 
@@ -1670,9 +1732,13 @@ function register({ projectManager, formatToolAction }) {
           // Look ahead: sum output_tokens AND capture provider model + thinking flag across this turn's assistants.
           // Model = last non-synthetic assistant.message.model (after tool_use chain it usually stays the same provider).
           // hasThinking = any assistant entry contains a content block with type==='thinking'.
+          // Also collect docs_edit / docs_search markers from assistant tool_use blocks in this turn,
+          // so they attach to the originating user entry (no separate timeline dots).
           let responseTokens = 0;
           let responseModel;
           let responseHasThinking = false;
+          const docsEditedSet = new Set();
+          const docsSearchQueriesSet = new Set();
           const entryIdx = activeBranch.indexOf(entry);
           for (let j = entryIdx + 1; j < activeBranch.length; j++) {
             const next = activeBranch[j];
@@ -1681,8 +1747,23 @@ function register({ projectManager, formatToolAction }) {
               const mdl = next.message.model;
               if (mdl && mdl !== '<synthetic>') responseModel = mdl;
               const content = next.message.content;
-              if (Array.isArray(content) && content.some(c => c && c.type === 'thinking')) {
-                responseHasThinking = true;
+              if (Array.isArray(content)) {
+                if (content.some(c => c && c.type === 'thinking')) responseHasThinking = true;
+                for (const block of content) {
+                  if (block.type !== 'tool_use') continue;
+                  if ((block.name === 'Edit' || block.name === 'Write')) {
+                    const fp = block.input?.file_path || '';
+                    if (fp.includes('/docs/') || fp.endsWith('/CLAUDE.md') || fp === 'CLAUDE.md') {
+                      const segs = fp.split('/');
+                      const shortName = segs.length >= 2 ? segs.slice(-2).join('/') : segs[segs.length - 1];
+                      docsEditedSet.add(shortName);
+                    }
+                  }
+                  if (block.name === 'mcp__knowledge__docs_search') {
+                    const q = block.input?.query || '';
+                    if (q) docsSearchQueriesSet.add(q);
+                  }
+                }
               }
             }
             if (next.type === 'user' && !next.isSidechain) break;
@@ -1700,7 +1781,11 @@ function register({ projectManager, formatToolAction }) {
             isPlan: !!entry.planContent,
             responseTokens,
             responseModel,
-            responseHasThinking: responseHasThinking || undefined
+            responseHasThinking: responseHasThinking || undefined,
+            // Attached to user-entry so timeline shows a single dot per prompt instead of
+            // separate docs_edit/docs_search dots. Empty arrays omitted to keep entry shape clean.
+            docsEdited: docsEditedSet.size > 0 ? Array.from(docsEditedSet) : undefined,
+            docsSearchQueries: docsSearchQueriesSet.size > 0 ? Array.from(docsSearchQueriesSet) : undefined,
           });
         } else if (entry.type === 'system' && entry.subtype === 'compact_boundary') {
           entries.push({
@@ -1711,89 +1796,20 @@ function register({ projectManager, formatToolAction }) {
             preTokens: entry.compactMetadata?.preTokens,
             sessionId: entry.sessionId || entry._fromFile
           });
-        } else if (entry.type === 'assistant') {
-          // Detect docs/CLAUDE.md edits from tool_use blocks
-          const contentBlocks = entry.message?.content;
-          if (Array.isArray(contentBlocks)) {
-            const docFiles = [];
-            const docsSearchQueries = [];
-            for (const block of contentBlocks) {
-              if (block.type === 'tool_use' && (block.name === 'Edit' || block.name === 'Write')) {
-                const fp = block.input?.file_path || '';
-                if (fp.includes('/docs/') || fp.endsWith('/CLAUDE.md') || fp === 'CLAUDE.md') {
-                  // Extract short name: last 2 path segments
-                  const segments = fp.split('/');
-                  const shortName = segments.length >= 2
-                    ? segments.slice(-2).join('/')
-                    : segments[segments.length - 1];
-                  if (!docFiles.includes(shortName)) {
-                    docFiles.push(shortName);
-                  }
-                }
-              }
-              // Detect MCP docs_search calls
-              if (block.type === 'tool_use' && block.name === 'mcp__knowledge__docs_search') {
-                const query = block.input?.query || '';
-                if (query && !docsSearchQueries.includes(query)) {
-                  docsSearchQueries.push(query);
-                }
-              }
-            }
-            if (docFiles.length > 0) {
-              entries.push({
-                uuid: entry.uuid,
-                type: 'docs_edit',
-                timestamp: entry.timestamp,
-                content: docFiles.join(', '),
-                docsEdited: docFiles,
-                sessionId: entry.sessionId || entry._fromFile
-              });
-            }
-            if (docsSearchQueries.length > 0) {
-              entries.push({
-                uuid: entry.uuid + '_ds',
-                type: 'docs_search',
-                timestamp: entry.timestamp,
-                content: docsSearchQueries.join('; '),
-                docsSearchQueries: docsSearchQueries,
-                sessionId: entry.sessionId || entry._fromFile
-              });
-            }
-          }
         }
+        // Note: docs_edit / docs_search markers are no longer emitted as separate entries —
+        // they're collected in the user-entry look-ahead loop above and stored as
+        // `docsEdited[]` / `docsSearchQueries[]` fields on the originating user prompt.
+        // Frontend recolors user dot and renders inline tooltip block instead of separate dots.
       }
 
-      // Merge consecutive docs_edit and docs_search entries into one
-      const mergedEntries = [];
-      for (const entry of entries) {
-        if (entry.type === 'docs_edit' && mergedEntries.length > 0 && mergedEntries[mergedEntries.length - 1].type === 'docs_edit') {
-          const prev = mergedEntries[mergedEntries.length - 1];
-          for (const f of entry.docsEdited) {
-            if (!prev.docsEdited.includes(f)) {
-              prev.docsEdited.push(f);
-            }
-          }
-          prev.content = prev.docsEdited.join(', ');
-        } else if (entry.type === 'docs_search' && mergedEntries.length > 0 && mergedEntries[mergedEntries.length - 1].type === 'docs_search') {
-          const prev = mergedEntries[mergedEntries.length - 1];
-          for (const q of entry.docsSearchQueries) {
-            if (!prev.docsSearchQueries.includes(q)) {
-              prev.docsSearchQueries.push(q);
-            }
-          }
-          prev.content = prev.docsSearchQueries.join('; ');
-        } else {
-          mergedEntries.push(entry);
-        }
-      }
-
-      console.log('[Timeline:Backtrace] session=' + sessionId.substring(0, 8) + ' entries=' + mergedEntries.length + ' skipped: sidechain=' + skippedSidechain + ' toolResult=' + skippedToolResult + ' noContent=' + skippedNoContent + ' system=' + skippedSystem + ' summary=' + skippedSummary);
+      console.log('[Timeline:Backtrace] session=' + sessionId.substring(0, 8) + ' entries=' + entries.length + ' skipped: sidechain=' + skippedSidechain + ' toolResult=' + skippedToolResult + ' noContent=' + skippedNoContent + ' system=' + skippedSystem + ' summary=' + skippedSummary);
 
       // Resolve the latest session ID in the chain (tip)
       // This helps the renderer detect if claudeSessionId needs updating
       const latestSessionId = resolveLatestSessionInChain(sessionId, cwd);
 
-      return { success: true, entries: mergedEntries, latestSessionId, sessionBoundaries };
+      return { success: true, entries: entries, latestSessionId, sessionBoundaries };
 
     } catch (error) {
       console.error('[Claude Timeline] Error:', error);
@@ -1802,7 +1818,16 @@ function register({ projectManager, formatToolAction }) {
   });
 
   // Export Claude session as clean text (with options and backtrace)
-  ipcMain.handle('claude:export-clean-session', async (event, { sessionId, cwd, includeEditing = false, includeReading = false, includeCode, fromStart = true, includeSubagentResult = false, includeSubagentHistory = false }) => {
+  ipcMain.handle('claude:export-clean-session', async (event, {
+    sessionId, cwd,
+    includeEditing = false, includeReading = false,
+    includeCode, fromStart = true,
+    includeSubagentResult = false, includeSubagentHistory = false,
+    // Hierarchical copy settings — see fact-clipboard-tools.md::Hierarchical groups.
+    includeUser = true, includeClaude = true,
+    includeText = true, includeThinking = true,
+    includeBash = false, includeTools = false,
+  }) => {
     // Backward compat: old callers may pass includeCode
     if (includeCode !== undefined && includeEditing === undefined) {
       includeEditing = includeCode;
@@ -2117,11 +2142,19 @@ function register({ projectManager, formatToolAction }) {
         progressByToolUseId.get(key).push(pe);
       }
 
+      const groupFlags = {
+        reading: !!includeReading,
+        editing: !!includeEditing,
+        bash: !!includeBash,
+        tools: !!includeTools,
+      };
+      const claudeHasActionAppetite = includeReading || includeEditing || includeBash || includeTools || includeSubagentResult || includeSubagentHistory;
+
       // Delegate to shared formatToolAction with current session's settings
       const formatTool = (toolName, input, toolResult = null, toolUseId = null) => {
         const taskProgress = toolName === 'Task' && toolUseId ? (progressByToolUseId.get(toolUseId) || []) : [];
         return formatToolAction(toolName, input, toolResult, includeEditing, includeReading, {
-          includeSubagentResult, includeSubagentHistory, progressEntries: taskProgress
+          includeSubagentResult, includeSubagentHistory, progressEntries: taskProgress, flags: groupFlags,
         });
       };
 
@@ -2132,6 +2165,7 @@ function register({ projectManager, formatToolAction }) {
         if (entry.isSidechain || entry.type === 'summary') continue;
 
         if (entry.type === 'user') {
+          if (!includeUser) continue;
           let rawContent = entry.message?.content;
 
           // tool_result entries are stored as user messages in JSONL
@@ -2166,6 +2200,7 @@ function register({ projectManager, formatToolAction }) {
         }
 
         else if (entry.type === 'assistant') {
+          if (!includeClaude) continue;
           const msgContent = entry.message?.content;
           if (!msgContent) continue;
 
@@ -2173,29 +2208,42 @@ function register({ projectManager, formatToolAction }) {
           const toolActions = [];
 
           if (typeof msgContent === 'string') {
-            textContent = msgContent;
+            if (includeText) textContent = msgContent;
           } else if (Array.isArray(msgContent)) {
             const textParts = [];
             for (const block of msgContent) {
-              if (block.type === 'thinking' && block.thinking) {
+              if (block.type === 'thinking' && block.thinking && includeThinking) {
                 textParts.push(`<thinking>\n${block.thinking}\n</thinking>`);
               }
-              if (block.type === 'text' && block.text) {
+              if (block.type === 'text' && block.text && includeText) {
                 textParts.push(block.text);
               }
               if (block.type === 'tool_use') {
+                // Pre-filter by group (mirrors copy-range)
+                const group = (() => {
+                  if (block.name === 'Read' || block.name === 'NotebookRead') return 'reading';
+                  if (block.name === 'Edit' || block.name === 'Write' || block.name === 'NotebookEdit') return 'editing';
+                  // Grep/Glob → shell search, grouped with Bash.
+                  if (block.name === 'Bash' || block.name === 'Monitor' || block.name === 'Grep' || block.name === 'Glob') return 'bash';
+                  if (block.name === 'Task') return 'subagent';
+                  return 'tools';
+                })();
+                const groupOn = (group === 'reading' && groupFlags.reading)
+                  || (group === 'editing' && groupFlags.editing)
+                  || (group === 'bash' && groupFlags.bash)
+                  || (group === 'tools' && groupFlags.tools)
+                  || (group === 'subagent' && (includeSubagentResult || includeSubagentHistory));
+                if (!groupOn) continue;
+
                 // Find matching tool_result in subsequent records
                 let toolResult = null;
-                const needResult = includeEditing || includeReading || (block.name === 'Task' && includeSubagentResult);
-                if (needResult) {
-                  for (let j = i + 1; j < activeBranch.length; j++) {
-                    const nextEntry = activeBranch[j];
-                    if (nextEntry.type === 'user' && Array.isArray(nextEntry.message?.content)) {
-                      const res = nextEntry.message.content.find(c => c.type === 'tool_result' && c.tool_use_id === block.id);
-                      if (res) {
-                        toolResult = res;
-                        break;
-                      }
+                for (let j = i + 1; j < activeBranch.length; j++) {
+                  const nextEntry = activeBranch[j];
+                  if (nextEntry.type === 'user' && Array.isArray(nextEntry.message?.content)) {
+                    const res = nextEntry.message.content.find(c => c.type === 'tool_result' && c.tool_use_id === block.id);
+                    if (res) {
+                      toolResult = res;
+                      break;
                     }
                   }
                 }
@@ -2210,7 +2258,7 @@ function register({ projectManager, formatToolAction }) {
             outputParts.push('\uD83E\uDD16 CLAUDE:');
             if (textContent.trim()) outputParts.push(textContent);
             if (toolActions.length > 0) {
-              if (includeEditing || includeReading) {
+              if (claudeHasActionAppetite) {
                 outputParts.push('\n**Actions:**\n' + toolActions.join('\n\n'));
               } else {
                 outputParts.push(`   [\u0414\u0435\u0439\u0441\u0442\u0432\u0438\u044F: ${toolActions.join(', ')}]`);

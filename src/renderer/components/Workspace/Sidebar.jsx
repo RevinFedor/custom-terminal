@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import PragmaticFileTree from './PragmaticFileTree/PragmaticFileTree'
 import { flattenTree } from './PragmaticFileTree/utils'
+import Tooltip from '../UI/Tooltip'
 import IconCropper from './IconCropper'
 import { getValue, setValue } from '../../utils/storage'
 
@@ -220,15 +221,15 @@ function IconPicker({ item, onSelect, onClose, onReset, onResetToVsc, existingIc
         {recentIcons.length > 0 && (
           <div className="icon-picker-grid">
             {recentIcons.map((img, i) => (
+              <Tooltip key={i} content="Reuse icon">
               <button
-                key={i}
                 className="icon-picker-item"
                 onClick={() => onSelect(img)}
-                title="Reuse icon"
                 style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}
               >
                 <img src={img} width={20} height={20} alt="" style={{ borderRadius: 3, objectFit: 'cover' }} />
               </button>
+              </Tooltip>
             ))}
           </div>
         )}
@@ -1039,25 +1040,33 @@ function Sidebar({
           </svg>
         </div>
         {/* New File */}
-        <button className="sidebar-toolbar-btn" onClick={() => handleNewFile(getTargetParentNode())} title="New file">
+        <Tooltip content="New file">
+        <button className="sidebar-toolbar-btn" onClick={() => handleNewFile(getTargetParentNode())}>
           <svg width="16" height="16" viewBox="0 0 16 16"><path d="M9.5 1H4a1 1 0 00-1 1v12a1 1 0 001 1h8a1 1 0 001-1V4.5L9.5 1z" stroke="currentColor" strokeWidth="1.2" fill="none"/><path d="M9 1v4h4" stroke="currentColor" strokeWidth="1.2" fill="none"/><path d="M8 7v4M6 9h4" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/></svg>
         </button>
+        </Tooltip>
         {/* New Folder */}
-        <button className="sidebar-toolbar-btn" onClick={() => handleNewFolder(getTargetParentNode())} title="New folder">
+        <Tooltip content="New folder">
+        <button className="sidebar-toolbar-btn" onClick={() => handleNewFolder(getTargetParentNode())}>
           <svg width="16" height="16" viewBox="0 0 16 16"><path d="M2 3.5h4.5l1.5 1.5H14v8H2z" stroke="currentColor" strokeWidth="1.2" fill="none" strokeLinejoin="round"/><path d="M8 7.5v3M6.5 9h3" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/></svg>
         </button>
+        </Tooltip>
         {/* Add directory */}
-        <button className="sidebar-toolbar-btn" onClick={onAddDirectory} title="Add directory">
+        <Tooltip content="Add directory">
+        <button className="sidebar-toolbar-btn" onClick={onAddDirectory}>
           <svg width="16" height="16" viewBox="0 0 16 16">
             <path d="M8 2v12M2 8h12" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
           </svg>
         </button>
+        </Tooltip>
         {/* Collapse sidebar */}
-        <button className="sidebar-toolbar-btn sidebar-collapse-btn" onClick={onCollapse} title="Collapse sidebar">
+        <Tooltip content="Collapse sidebar">
+        <button className="sidebar-toolbar-btn sidebar-collapse-btn" onClick={onCollapse}>
           <svg width="16" height="16" viewBox="0 0 16 16">
             <path d="M2 2v12M6 4l-3 4 3 4M7 2h7v12H7" stroke="currentColor" strokeWidth="1.2" fill="none" strokeLinecap="round" strokeLinejoin="round"/>
           </svg>
         </button>
+        </Tooltip>
 
         {dirDropdownOpen && (
           <div className="directory-dropdown">
@@ -1068,15 +1077,16 @@ function Sidebar({
                 onClick={() => { onSwitchDirectory(dir); setDirDropdownOpen(false) }}
               >
                 <span className="directory-item-name">{dir.split('/').pop()}</span>
+                <Tooltip content="Remove">
                 <button
                   className="directory-item-remove"
                   onClick={(e) => { e.stopPropagation(); onRemoveDirectory(dir) }}
-                  title="Remove"
                 >
                   <svg width="12" height="12" viewBox="0 0 12 12">
                     <path d="M3 3l6 6M9 3l-6 6" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
                   </svg>
                 </button>
+                </Tooltip>
               </div>
           ))}
           </div>

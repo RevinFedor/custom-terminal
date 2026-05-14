@@ -2,6 +2,7 @@ import React, { useState, useRef } from 'react';
 import { Bookmark } from '../../store/useBookmarksStore';
 import { HelpCircle, Settings, Plus } from 'lucide-react';
 import SmartPopover from '../UI/SmartPopover';
+import Tooltip from '../UI/Tooltip';
 
 interface BookmarkCardProps {
   bookmark: Bookmark;
@@ -43,14 +44,15 @@ export default function BookmarkCard({
         onClick={() => onCreateProject(bookmark)}
       >
         {/* Content */}
-        <div
-          className="flex-1 min-w-0 px-2.5 py-1.5 transition-opacity duration-150"
-          style={{ opacity: showAddOverlay ? 0 : 1 }}
-          title={bookmark.path}
-        >
-          <div className="text-sm text-white truncate font-medium">{bookmark.name}</div>
-          <div className="text-[10px] text-[#666] truncate">{shortPath}</div>
-        </div>
+        <Tooltip content={bookmark.path}>
+          <div
+            className="flex-1 min-w-0 px-2.5 py-1.5 transition-opacity duration-150"
+            style={{ opacity: showAddOverlay ? 0 : 1 }}
+          >
+            <div className="text-sm text-white truncate font-medium">{bookmark.name}</div>
+            <div className="text-[10px] text-[#666] truncate">{shortPath}</div>
+          </div>
+        </Tooltip>
 
         {/* Add Project overlay text */}
         {showAddOverlay && (
@@ -71,16 +73,17 @@ export default function BookmarkCard({
           onClick={(e) => e.stopPropagation()}
         >
           {/* Settings Button (Top) */}
-          <button
-            className="flex-1 flex items-center justify-center text-[#555] hover:text-white hover:bg-white/5 transition-all cursor-pointer border-b border-[#333] rounded-tr-lg"
-            onClick={(e) => {
-              e.stopPropagation();
-              onEdit(bookmark);
-            }}
-            title="Edit Bookmark"
-          >
-            <Settings size={13} />
-          </button>
+          <Tooltip content="Edit Bookmark">
+            <button
+              className="flex-1 flex items-center justify-center text-[#555] hover:text-white hover:bg-white/5 transition-all cursor-pointer border-b border-[#333] rounded-tr-lg"
+              onClick={(e) => {
+                e.stopPropagation();
+                onEdit(bookmark);
+              }}
+            >
+              <Settings size={13} />
+            </button>
+          </Tooltip>
 
           {/* Help Button (Bottom) */}
           <div className="flex-1 flex items-center justify-center">

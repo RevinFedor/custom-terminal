@@ -2,6 +2,7 @@ import React, { useState, useRef } from 'react';
 import { Virtuoso, VirtuosoHandle } from 'react-virtuoso';
 import { useResearchStore, Message } from '../../store/useResearchStore';
 import MarkdownRenderer from './MarkdownRenderer';
+import Tooltip from '../UI/Tooltip';
 import { User, Sparkles, Pencil, Copy, Check, ArrowDown, RotateCcw, RefreshCw, Trash2 } from 'lucide-react';
 import { useUIStore } from '../../store/useUIStore';
 
@@ -82,13 +83,14 @@ function MessageBubble({
             
             {/* User Edit Action (Top Right) */}
             {isUser && (
-              <button 
-                onClick={() => setIsEditing(true)}
-                className="p-1.5 text-gray-500 hover:text-white hover:bg-[#333] rounded transition-colors opacity-0 group-hover:opacity-100"
-                title="Edit & Resend"
-              >
-                <Pencil size={14} />
-              </button>
+              <Tooltip content="Edit & Resend">
+                <button
+                  onClick={() => setIsEditing(true)}
+                  className="p-1.5 text-gray-500 hover:text-white hover:bg-[#333] rounded transition-colors opacity-0 group-hover:opacity-100"
+                >
+                  <Pencil size={14} />
+                </button>
+              </Tooltip>
             )}
           </div>
           
@@ -119,33 +121,36 @@ function MessageBubble({
             <div className="relative">
               {/* Sticky Actions - правый верхний угол */}
               <div className="sticky top-4 float-right ml-4 z-10 flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity bg-[#1a1a1a] border border-[#333] rounded-lg p-1">
-                <button
-                  onClick={handleCopy}
-                  className="p-1.5 text-gray-500 hover:text-white hover:bg-[#333] rounded transition-colors cursor-pointer"
-                  title="Copy"
-                >
-                  {copied ? <Check size={14} className="text-green-400" /> : <Copy size={14} />}
-                </button>
+                <Tooltip content="Copy">
+                  <button
+                    onClick={handleCopy}
+                    className="p-1.5 text-gray-500 hover:text-white hover:bg-[#333] rounded transition-colors cursor-pointer"
+                  >
+                    {copied ? <Check size={14} className="text-green-400" /> : <Copy size={14} />}
+                  </button>
+                </Tooltip>
 
                 {/* Retry - только для assistant */}
                 {!isUser && (
-                  <button
-                    onClick={() => onRetry(message.id)}
-                    className="p-1.5 text-gray-500 hover:text-[#a8c7fa] hover:bg-[#333] rounded transition-colors cursor-pointer"
-                    title="Retry (regenerate from this point)"
-                  >
-                    <RefreshCw size={14} />
-                  </button>
+                  <Tooltip content="Retry (regenerate from this point)">
+                    <button
+                      onClick={() => onRetry(message.id)}
+                      className="p-1.5 text-gray-500 hover:text-[#a8c7fa] hover:bg-[#333] rounded transition-colors cursor-pointer"
+                    >
+                      <RefreshCw size={14} />
+                    </button>
+                  </Tooltip>
                 )}
 
                 {/* Delete */}
-                <button
-                  onClick={() => onDelete(message.id)}
-                  className="p-1.5 text-gray-500 hover:text-red-400 hover:bg-[#333] rounded transition-colors cursor-pointer"
-                  title="Delete message"
-                >
-                  <Trash2 size={14} />
-                </button>
+                <Tooltip content="Delete message">
+                  <button
+                    onClick={() => onDelete(message.id)}
+                    className="p-1.5 text-gray-500 hover:text-red-400 hover:bg-[#333] rounded transition-colors cursor-pointer"
+                  >
+                    <Trash2 size={14} />
+                  </button>
+                </Tooltip>
               </div>
 
               <MarkdownRenderer content={message.content} />

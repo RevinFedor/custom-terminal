@@ -6,6 +6,7 @@ import { useBookmarksStore, Bookmark } from '../../store/useBookmarksStore';
 import { useCmdKey, useCmdHoverPopover } from '../../hooks/useCmdHoverPopover';
 import ProjectCard from './ProjectCard';
 import BookmarkCard from './BookmarkCard';
+import Tooltip from '../UI/Tooltip';
 import { Plus, Square, X } from 'lucide-react';
 
 const { ipcRenderer } = window.require('electron');
@@ -276,26 +277,28 @@ export default function Dashboard() {
 
         {/* Settings */}
         <div className="flex items-center gap-3 mb-4 px-1">
-          <label className="flex items-center gap-2 cursor-pointer select-none" title="Автоматически возобновлять прерванные Claude сессии при запуске приложения">
-            <div
-              className="relative w-8 h-4 rounded-full transition-colors"
-              style={{ backgroundColor: autoResume ? 'rgba(74, 222, 128, 0.4)' : 'rgba(255,255,255,0.1)' }}
-              onClick={() => {
-                const next = !autoResume;
-                setAutoResume(next);
-                ipcRenderer.invoke('app:setState', { key: 'auto_resume_sessions', value: next });
-              }}
-            >
+          <Tooltip content="Автоматически возобновлять прерванные Claude сессии при запуске приложения">
+            <label className="flex items-center gap-2 cursor-pointer select-none">
               <div
-                className="absolute top-0.5 w-3 h-3 rounded-full transition-all"
-                style={{
-                  left: autoResume ? '18px' : '2px',
-                  backgroundColor: autoResume ? '#4ade80' : '#666',
+                className="relative w-8 h-4 rounded-full transition-colors"
+                style={{ backgroundColor: autoResume ? 'rgba(74, 222, 128, 0.4)' : 'rgba(255,255,255,0.1)' }}
+                onClick={() => {
+                  const next = !autoResume;
+                  setAutoResume(next);
+                  ipcRenderer.invoke('app:setState', { key: 'auto_resume_sessions', value: next });
                 }}
-              />
-            </div>
-            <span className="text-xs text-[#888]">Auto-resume sessions</span>
-          </label>
+              >
+                <div
+                  className="absolute top-0.5 w-3 h-3 rounded-full transition-all"
+                  style={{
+                    left: autoResume ? '18px' : '2px',
+                    backgroundColor: autoResume ? '#4ade80' : '#666',
+                  }}
+                />
+              </div>
+              <span className="text-xs text-[#888]">Auto-resume sessions</span>
+            </label>
+          </Tooltip>
         </div>
 
         {/* Bookmarks Section */}
@@ -421,7 +424,9 @@ export default function Dashboard() {
                       <div className="text-[10px] text-[#888] space-y-0.5 select-text cursor-text">
                         <div>PID: <span className="text-[#ccc]">{proc.pid}</span></div>
                         <div>CPU: <span className="text-[#ccc]">{proc.cpu}%</span>  MEM: <span className="text-[#ccc]">{proc.mem}%</span></div>
-                        <div className="truncate" title={proc.cwd}>CWD: <span className="text-[#ccc]">{proc.cwd}</span></div>
+                        <Tooltip content={proc.cwd}>
+                          <div className="truncate">CWD: <span className="text-[#ccc]">{proc.cwd}</span></div>
+                        </Tooltip>
                         <div>{isInApp ? 'In-App' : 'External'}</div>
                       </div>
                     </div>
@@ -558,13 +563,14 @@ export default function Dashboard() {
                       <span className="text-[#666]">({mcpOrphans.length} orphan)</span>
                     )}
                     {mcpOrphans.length > 0 && (
-                      <span
-                        className="ml-1 text-[#555] hover:text-red-400 transition-colors cursor-pointer"
-                        onClick={(e) => { e.stopPropagation(); handleKillAllOrphanMcp(); }}
-                        title={`Kill ${mcpOrphans.length} orphan MCP processes`}
-                      >
-                        <X size={12} />
-                      </span>
+                      <Tooltip content={`Kill ${mcpOrphans.length} orphan MCP processes`}>
+                        <span
+                          className="ml-1 text-[#555] hover:text-red-400 transition-colors cursor-pointer"
+                          onClick={(e) => { e.stopPropagation(); handleKillAllOrphanMcp(); }}
+                        >
+                          <X size={12} />
+                        </span>
+                      </Tooltip>
                     )}
                   </button>
                   {mcpExpanded && (
@@ -576,23 +582,26 @@ export default function Dashboard() {
                             p.isAlive ? 'text-[#aaa]' : 'text-[#666]'
                           }`}
                         >
-                          <button
-                            className="flex-shrink-0 flex items-center justify-center w-4 h-4"
-                            onClick={() => handleKillMcp(p.pid)}
-                            title="Kill process"
-                          >
-                            <span
-                              className="w-2 h-2 rounded-full group-hover:hidden"
-                              style={{ backgroundColor: p.isAlive ? '#888' : '#444' }}
-                            />
-                            <Square
-                              size={11}
-                              fill="currentColor"
-                              stroke="none"
-                              className="hidden group-hover:block text-red-500/50 hover:text-red-400 cursor-pointer"
-                            />
-                          </button>
-                          <span className="flex-1 truncate" title={p.command}>{p.name}</span>
+                          <Tooltip content="Kill process">
+                            <button
+                              className="flex-shrink-0 flex items-center justify-center w-4 h-4"
+                              onClick={() => handleKillMcp(p.pid)}
+                            >
+                              <span
+                                className="w-2 h-2 rounded-full group-hover:hidden"
+                                style={{ backgroundColor: p.isAlive ? '#888' : '#444' }}
+                              />
+                              <Square
+                                size={11}
+                                fill="currentColor"
+                                stroke="none"
+                                className="hidden group-hover:block text-red-500/50 hover:text-red-400 cursor-pointer"
+                              />
+                            </button>
+                          </Tooltip>
+                          <Tooltip content={p.command}>
+                            <span className="flex-1 truncate">{p.name}</span>
+                          </Tooltip>
                           <span className="text-[#555]">pid {p.pid}</span>
                           <span className="text-[#555]">{p.startTime}</span>
                           {!p.isAlive && <span className="text-[#666]">orphan</span>}

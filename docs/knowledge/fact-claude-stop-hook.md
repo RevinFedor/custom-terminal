@@ -1,0 +1,130 @@
+# Факт: Claude Code Stop hook → Unix socket → main process
+
+## Проблема
+Нужен **детерминированный** сигнал конца turn'а Claude Code (CLI). Эвристики на PTY (исчезновение спиннера `✢`, появление `╰` в инпут-боксе) ненадёжны: внутри одного turn Claude может думать → вывести текст → снова думать → вызвать tool → снова думать → финальный текст. Spinner gone после первой thinking-фазы ≠ конец turn'а.
+
+## Решение
+**Stop hook** Claude Code — единственный officially-документированный сигнал, fired ровно один раз на полный turn (после всех tool rounds). Источник в декомпиле: `packages/claude-code-src/query.ts:1062` — `handleStopHooks` вызывается только когда `!needsFollowUp` (model API call вернул без новых `tool_use` блоков).
+
+### Архитектура
+
+```
+[Claude turn ends inside query.ts loop]
+       ↓ fork() child process
+[node ~/.claude/hooks/noted-turn-event.js]
+       ↓ читает JSON со stdin
+       ↓ Unix socket connect
+[/tmp/noted-terminal-claude-hook.sock — net.Server в Electron main]
+       ↓ парсит JSON, lookup session_id → tabId
+       ↓ через bridgeKnownSessions (обратный поиск)
+[mainWindow.webContents.send('claude:turn-state', ...)]
+       ↓
+[Renderer InfoPanel / Loader]
+```
+
+### Зарегистрированные события
+
+В `~/.claude/settings.json`:
+
+```json
+"hooks": {
+  "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "node ~/.claude/hooks/noted-turn-event.js" }] }],
+  "Stop":             [{ "hooks": [{ "type": "command", "command": "node ~/.claude/hooks/noted-turn-event.js" }] }],
+  "StopFailure":      [{ "hooks": [{ "type": "command", "command": "node ~/.claude/hooks/noted-turn-event.js" }] }]
+}
+```
+
+- **UserPromptSubmit** → `busy: true` (turn начался)
+- **Stop** → `busy: false, success: true` (turn завершился успешно)
+- **StopFailure** → `busy: false, success: false` (turn упал на API error: rate_limit / auth / server_error)
+
+### IPC payload в renderer
+
+```ts
+ipcRenderer.on('claude:turn-state', (_, data: {
+  tabId: string;
+  sessionId: string;
+  event: 'UserPromptSubmit' | 'Stop' | 'StopFailure';
+  busy: boolean;
+  success: boolean;
+  lastAssistantMessage: string | null;  // финальный текст ответа Claude (с v2.1.47)
+}) => { ... });
+```
+
+## Детерминизм — эмпирическая проверка
+
+Headless test через `claude -p "Read 3 files and summarize"`:
+- 1 user prompt → 3 tool_use rounds (Read) → 1 финальный summary text
+- В логе ровно **2 события**: UserPromptSubmit + Stop. Никаких промежуточных Stop между tool calls.
+- Latency Stop hook → нашему сокету: < 5ms (Unix socket на localhost).
+
+## Маппинг session_id → tabId
+
+Использует существующий `bridgeKnownSessions: Map<tabId, sessionId>` из StatusLine bridge'а. Если сессия не в Map (юзер запустил `claude` напрямую в системном терминале, MCP-агент в другом проекте) — событие тихо игнорится с логом `(no tab match)`. Это корректное поведение: чужие Claude не должны влиять на наш UI.
+
+## Известные ограничения (по версии 2.1.x, май 2026)
+
+1. **Silent tool stop** (bug #29881 до Feb 2026): turn заканчивается без assistant text → Stop hook мог не fire. По репортам фикснут в v2.1.x, но изредка ловится в edge-кейсах. **Mitigation:** watchdog в renderer — если N сек после `UserPromptSubmit` нет ни Stop ни PostToolUse → принудительно `busy: false`.
+2. **JSONL writes стопаются после auto-update mid-session** (#16, open). Не affects hook (hook fires из самого процесса), но affects JSONL fallback.
+3. **`stop_reason: null` в JSONL** (#27361) — поле всегда null, нельзя tail'ить JSONL по нему. Hook — единственный надёжный канал.
+4. **CLAUDE_CODE_NO_FLICKER=1** (с v2.1.89) — fullscreen mode, ломает ANSI-эвристики типа «появление `╰` в нижней строке». Stop hook этим не задет.
+
+## Hook script (`~/.claude/hooks/noted-turn-event.js`)
+
+Минимальный node-скрипт: читает JSON со stdin, отправляет envelope в socket, exits с timeout 200ms. Fail-silent — если main не запущен (socket файла нет), всё равно exit 0 (Claude должен продолжить).
+
+## Re-entrancy guard `stop_hook_active`
+
+В payload приходит `stop_hook_active: true` когда Stop hook уже исполняется. Наш скрипт не возвращает `{"decision": "block"}` — то есть никогда не заставляет Claude continue, поэтому re-entrancy не происходит. Поле просто пропускается в envelope.
+
+## Интеграция в claude:busy-state
+
+Hook теперь **authoritative source** для loader'а. Поток:
+
+```
+UserPromptSubmit → claudeSpinnerBusy.set(tabId, true) + emit claude:busy-state busy=true
+              ↓
+Stop / StopFailure → cancel pending spinner-idle-timer
+                  → claudeSpinnerBusy.set(tabId, false) + emit claude:busy-state busy=false
+```
+
+**Спиннер-детектор подавлен пока turn активен:**
+- `claudeSpinnerBusy IDLE timer` проверяет `if (claudeTurnBusy.get(tabId) === true) return;` — не shipит false-IDLE между thinking phases.
+- Это убирает классический баг "loader выключился после первой фазы".
+
+**Watchdog 60 минут:** safety net на silent-tool-stop (#29881), упавший hook script, killed claude процесс. На happy path не срабатывает; на failure path тише убивает busy.
+
+## Fresh-process detection — `claude:process-started`
+
+`claude:session-detected` fires **на каждом bridge re-sync** (statusline-script у Claude дёргается раз в 1-2 секунды). Для одноразовых side effects типа auto `/effort` это плохо: session_id остаётся прежним при перезапуске Claude (`claude --resume <id>`), guard `if (currentId !== data.sessionId)` всегда `false` для перезапущенной сессии. Эффект — `/effort` инжектится только при первом запуске Claude в жизни таба, при перезапуске молча пропускается.
+
+**Решение:** отдельный event `claude:process-started` fires когда `bridgePidCache` видит **новый Claude PID** для tab'а — это происходит ровно один раз на каждый реальный spawn процесса. PID меняется при каждом запуске binary, даже если sessionId тот же.
+
+Renderer:
+```ts
+ipcRenderer.on('claude:process-started', (_, { tabId, sessionId, claudePid }) => {
+  // Одноразовые side effects: auto-inject /effort, /think и т.п.
+});
+```
+
+Использовать для всего что должно случиться **один раз на спавн**: `/effort max` инжекция, welcome-toast, регистрация в аналитике. **Не использовать** для отслеживания sessionId (для этого session-detected).
+
+## Prompt Queue — grab-input flow
+
+`Ctrl+G` в Claude TUI → действие `chat:externalEditor` → Claude execSync'ом запускает `$EDITOR <tempfile>`. Мы инжектим `EDITOR=~/.claude/hooks/noted-code-grab.js` в env PTY-процесса.
+
+Helper script:
+1. Читает содержимое tempfile (с раскрытыми pasted-text refs)
+2. Через тот же сокет шлёт `{event:'GrabInput', ppid, text}`
+3. Truncate'ит tempfile в пустую строку
+4. exit 0
+
+Claude после нашего exit'а перечитывает файл → видит пустой input → инпут очищается.
+
+**Маппинг ppid → tabId:** через `bridgePidCache` (заполняется SessionBridge'ем, Claude PID → tabId).
+
+**Caveats:**
+- Image attachments дропаются — Claude передаёт через editor только `[Image #N]` placeholder'ы, binary остаётся в его React state и сбрасывается после empty re-read. Мы считаем плейсхолдеры и показываем 📎N на чипе.
+- Имя скрипта **должно начинаться с "code"** (`noted-code-grab`) — Claude classifies basename: если содержит `code|cursor|windsurf|codium|subl|atom`, GUI-path (silent), иначе alt-screen flash. См. `editor.ts:20-30` в декомпиле.
+- `getExternalEditor` в Claude **memoize'ан** — EDITOR должен быть установлен ДО spawn'а Claude. Существующие табы запущенные до изменения env не получат фичу до рестарта Claude процесса.
+- `getExternalEditor` проверяет `VISUAL` ПЕРЕД `EDITOR` — мы инжектим оба для надёжности.

@@ -43,10 +43,49 @@ ipcRenderer.invoke('claude:send-command', tabId, '/model sonnet');
 ### Блокировка кнопок (isControlBusy)
 Когда пользователь отправляет команду (смена модели, effort, think toggle), система устанавливает флаг `isControlBusy = true`. Это **блокирует** все кнопки управления в секции «Контроль» до завершения операции.
 
-**Мотивация (Invisible Intent):** Это предотвращает критическую ошибку «Double Ctrl+C». Кнопки используют механизм `ctrlCFirst` для очистки строки ввода. Если пользователь кликнет две кнопки быстро, Claude получит два Ctrl+C подряд, увидит маркер `again to exit` и завершит процесс. Блокировка гарантирует, что следующая команда уйдет только после подтверждения выполнения предыдущей.
+**Мотивация (Invisible Intent):** Изначально guard защищал от «двойного Ctrl+C exit» (двойной клик → два `\x03` подряд → Claude видит `again to exit` → процесс умирает). После перехода на Stash flow (Ctrl+S вместо Ctrl+C) этот риск исчез, но guard остался важным: предохраняет от ситуации когда второй клик отправляет Ctrl+S **после** первого paste но **до** Enter первого сабмита — второй Ctrl+S попнул бы первую команду (Claude в этом state видит `input=/model X, stash=user_prompt` → Ctrl+S сначала запихнул бы команду в stash поверх user_prompt) → user prompt теряется навсегда.
 
 **Синхронный IPC (`claude:send-command`):**
 Команда отправляется через `ipcRenderer.invoke()` (синхронный вызов), что позволяет интерфейсу дождаться завершения `term.write()` и только после этого разблокировать кнопки.
+
+## Stash Flow для slash-команд (Ctrl+S вместо Ctrl+C)
+
+### Симптом (что видел пользователь)
+В обновлённом Claude Code (2026-Q2) клик по кнопке Model/Effort в InfoPanel приводил к двум проблемам:
+1. Команда (`/model sonnet`) появлялась в инпуте, но **Enter не сабмитил** — нужно нажать пробел или любой символ, чтобы команда «активировалась».
+2. Если в инпуте уже был user prompt, он **терялся** при клике (Ctrl+C стирал).
+
+### Решение: Ctrl+S (Claude stash) вместо Ctrl+C
+`Ctrl+S` (0x13) в Claude TUI = chat:stash binding (см. `packages/claude-code-src/keybindings/defaultBindings.ts`). Пушит текущий ввод в `stashedPrompt` state, чистит инпут. После сабмита **slash-команды** stash сохраняется (REPL.tsx особый кейс для slash-cmd); на **следующем** обычном сабмите — Claude автоматически восстанавливает stash в инпут.
+
+Flow в `safePasteAndSubmit` опцией `stashFirst: true`:
+1. `\x13` (Ctrl+S) → push stash, clear input
+2. `drainPtyData(20)` — даём Ink проглотить байт до прихода нашего paste
+3. bracketed paste команды (`\x1b[200~` + cmd + `\x1b[201~`)
+4. `waitForRender` ловит sync marker (типично 8-30ms)
+5. `drainPtyData(50)` — settle для tail re-renders
+6. `\r` — submit
+
+**Корнер-кейс:** если инпут пуст И в Claude уже есть stash, Ctrl+S **попнет** stash обратно в инпут (`handleStash` в PromptInput.tsx::1357 двунаправленный). Наша команда тогда дописывается к восстановленному тексту. На практике это происходит редко (только сразу после нашего же предыдущего slash-cmd, до того как user успел отправить что-то своё) и сабмит всё равно работает — slash-команда уйдёт как обычный prompt. Альтернатива — детект через PTY-buffer строки `Stashed (auto-restores after submit)` — добавляет 200-300ms; не стоит.
+
+### Кладбище идей: Esc после paste
+**Попытка №1** — в flow добавили `\x1b` (Esc) перед Enter, чтобы закрыть slash-autocomplete dropdown. Логика: при пасте `/model haiku` сначала появляется autocomplete, и `PromptInput.onSubmit` имеет early-return guard на `suggestionsState.suggestions.length > 0` (PromptInput.tsx::1074). Без закрытия dropdown — `\r` молча игнорируется.
+
+**Почему не нужно:** в живой проверке (PTY-trace через `terminal:data` IPC) обнаружено, что для команд **с аргументом** (`/model haiku`, `/effort low`) autocomplete закрывается **сам** в момент paste — после пробела+аргумента нет префиксного матча со списком команд (PromptInput.tsx::980-1075). К моменту нашего `\r` `suggestions.length === 0`. Симптом «нужно нажать пробел» был не от dropdown'а, а от **stale sync marker** (см. ниже).
+
+Побочка Esc: Claude рендерил под инпутом текст «Esc again to clear» и съедал ~130ms на drain после Esc. Удалено.
+
+### Stale sync marker — главная причина задержки (фикс)
+В первой реализации `safePasteAndSubmit` ждал sync marker до 8 секунд (`safetyTimeoutMs`), потому что **наш же** marker от paste прилетал за 8-12ms и попадал в 15ms stale-окно `waitForRender` → отбрасывался → ждали timeout. Подробности — `fix-stale-sync-markers.md::markWriteTime`.
+
+После фикса (`markWriteTime()` сбрасывает baseline ПОСЛЕ `term.write()`, threshold снижен до 3ms) sync marker от paste проходит cleanly за 8-30ms.
+
+### Измеренные тайминги (через electron-mcp + dev.log)
+- `/effort low`, `/model sonnet`, `/model haiku`, `/model opus`, `/model default` — стабильно **400-450ms** total на коротких командах (11-14 байт).
+- Внутри: ~20ms drain после Ctrl+S, ~250ms ожидание sync marker от paste, ~50ms tail drain, ~5ms Enter.
+- До фиксов: 8-9 секунд (timeout race).
+
+См. также `methodology/design.md::Воспринимаемая задержка UI-команд` — пустой инпут ощущается «лагающим» на тех же 80ms, на которых заполненный инпут визуально «мгновенный»; именно поэтому drain'ы свели до минимума event-driven путём.
 
 ## Управление Effort Level
 
@@ -67,6 +106,7 @@ Effort Level (уровень интенсивности размышлений) 
 1. **`ANTHROPIC_MODEL="default"` в env:** Установка этого значения в переменных окружения (`.zshrc`) приводит к повреждению отображения в TUI (показывается `[default] 0%`). Для использования модели по умолчанию с 1M контекстом через env-переменные необходимо использовать формат `opus[1m]`.
 2. **`effortLevel: "max"` в settings.json:** Попытка прописать уровень `max` напрямую в файл настроек приводит к его **тихому сбросу** (null) при следующем запуске Claude. Уровень `max` не является персистентным; максимальное значение, которое сохраняет CLI между сессиями — `high`.
 3. **`1m context` маркер:** Единственный надежный способ отличить модель `default` от явно выбранной `opus` в потоке данных — наличие подстроки `(1M context)` в имени модели.
+4. **Список effort-уровней меняется между релизами Claude.** В мае 2026 `auto` был удалён, добавлен `xhigh` между `high` и `max`. Хардкод массивов `['auto','low','medium','high','max']` рассыпан по 4 файлам не пережил апдейт — UI показывал несуществующий `auto`, новый `xhigh` отсутствовал. Решение: **один canonical-файл** `src/renderer/constants/claudeLevels.ts` экспортирует `CLAUDE_EFFORT_LEVELS`, `CLAUDE_EFFORT_TOGGLE_OFF`, `CLAUDE_MODELS`. Все use sites импортируют оттуда. Legacy migration `'auto' → 'low'` для persisted values. Принцип переносимый — см. `methodology/design.md::Single source of truth для third-party shipping values`.
 
 ## Реактивное управление TUI через синхронизацию
 
@@ -136,6 +176,25 @@ Effort Level (уровень интенсивности размышлений) 
 - **send-command:** `/model sonnet`, `/compact` и др. из UI.
 - **Rewind:** Вставка compact-резюме после отката.
 
+## Think row — две кнопки: Think + Compact
+
+В ряду «Think» (InfoPanel секция КОНТРОЛЬ) сидят две равных по ширине кнопки вместо одной `toggle`.
+
+| Кнопка | Что делает | Стиль |
+|---|---|---|
+| **Think** | Локальный тогл `thinkActive[tabId]`. Дефолт `undefined ⇒ true` (orange-tinted активный вид), потому что Claude стартует с `alwaysThinkingEnabled: true` в `~/.claude/settings.json`. Параллельно вызывает `claude:toggle-thinking` (meta+t picker в PTY) — при успехе reconcile из его `result.thinking`. | Активный = `bg-[#DA7756]/20 text-white font-medium` (та же приглушённая индикация что и Effort — local invisible intent, не подтверждённый bridge'ом). Неактивный = `bg-[#2d2d2d] text-[#888]`. |
+| **Compact** | Отправляет `/compact` через `claude:send-command` (тот же Stash flow что Model/Effort: Ctrl+S → bracketed paste → Enter, ~400ms). Никакого матчинга TUI-вывода — `/compact` встроенная slash-команда Claude, ввести+Enter достаточно. | Всегда нейтральный (нет «активного» состояния, разовое действие). |
+
+**Дефолт «Think всегда ON при перезапуске» (важная invariant):**
+- `thinkActive` хранится в `useState<Record<string, boolean>>({})` в InfoPanel.
+- Когда `thinkActive[tabId]` === `undefined` → UI рендерит как активный.
+- Хендлер `terminal:command-finished` (OSC 133 D, на любой shell-exit) **удаляет ключ** `tabId` из map → следующий запуск Claude снова покажет Think tinted. Это совпадает с реальным поведением `alwaysThinkingEnabled` — он применяется при каждом старте.
+- Корнер-кейс: если юзер выключил Think через TUI вручную (`meta+t` напрямую в терминале) — наш UI этого не узнает (bridge не транслирует). При перезапуске опять покажем ON, и это совпадёт с реальностью. Рассинхрон mid-session — invisible intent, см. секцию про Effort.
+
+**Почему Compact не использует `claude:toggle-thinking`-style picker:** `/compact` не открывает выбор — он просто сжимает контекст и продолжает разговор. Поэтому достаточно `safePasteAndSubmit` со стандартным `stashFirst: true` (защищает user prompt в инпуте).
+
+**Почему обе кнопки блокируются `isControlBusy`:** Та же мотивация что у Model/Effort — пока `safePasteAndSubmit` или `toggle-thinking` идёт, второй клик может попасть между `Ctrl+S` и `\r`, что **попнет stash** и затрёт сохранённый prompt. См. секцию «Stash Flow» выше.
+
 **Почему не Text Echo:** Ink коллапсирует большие вставки в строку вида `[Pasted text #N +M lines]`, поэтому проверять наличие самого текста в выводе невозможно. Только sync markers гарантируют успех.
 
 ## Управление Effort Level
@@ -158,6 +217,60 @@ ipcRenderer.send('claude:send-command', tabId, '/effort medium');
 
 ### Защита от двойного срабатывания (Command Guard)
 Как и при переключении модели, Effort отправляется через `safePasteAndSubmit`. Во время отправки команды кнопки Effort, Model и Think **блокируются** флагом `isCommandRunning`. Это предотвращает отправку нескольких команд подряд.
+
+### Auto-confirm «Change effort level?» dialog
+В **новой директории** (нет сохранённого разрешения) после `/effort N` Claude TUI показывает 2-pos меню:
+```
+Change effort level?
+Your next response will be slower and use more tokens
+
+This conversation is cached for the current effort level. Switching to <X> means
+the full history gets re-read on your next message.
+
+❯ 1. Yes, switch to <X>
+  2. No, go back
+```
+Дефолт стоит на «Yes» — Enter подтверждает. Симптом: юзер нажимает «Effort → max» в UI, ничего не происходит, в терминале висит этот диалог; следующий ввод Enter в инпуте уходит в TUI и интерпретируется как подтверждение/отказ непредсказуемо.
+
+**Решение** (`main.js::ptyProcess.onData` после Session ID detection): отдельный детектор смотрит на `stripVTControlCharacters(data).includes('Change effort level')` → через 120мс шлёт `\r` в PTY. Cooldown `claudeEffortDialogCooldown` 2с защищает от двойного срабатывания при Ink re-render. Cleanup при `ptyProcess.onExit`.
+
+**Шрам: текст в Ink-меню рендерится без литеральных пробелов.** Первая версия матча была `'Change effort level' && 'Yes, switch'`. Падала: Ink TUI заменяет пробелы внутри строки меню на `\x1b[1C` (cursor-forward) — после `stripVTControlCharacters` получается `Yes,switchtolow`. Плюс диалог приходит в **3-5 отдельных PTY-чанках** (заголовок жёлтый, описание серое, опции синие — каждый блок отдельным write), поэтому матч из двух подстрок в пределах одного chunk вообще не имеет шансов. Финальный матч — только на уникальном `Change effort level` (это всегда самостоятельный chunk с жёлтым `[1m...[22m`).
+
+**Задержка 120мс перед `\r`:** ранее было 80 — Ink не успевал дорисовать остаток меню до прихода Enter, и Enter иногда попадал в неопределённое состояние (то срабатывал, то «съедал» prompt). 120мс — детерминированно после полного render.
+
+**Принцип:** см. `methodology/design.md::Ink TUI: пробелы как ANSI-команды, текст разорван по чанкам`. Любой будущий парсер TUI-вывода для Claude должен матчить **минимальные уникальные подстроки** (одно слово или короткая фраза), не комбинацию из двух — Ink почти гарантированно разнесёт их по чанкам.
+
+### Auto-inject `/effort` при запуске Claude
+
+В StatusBar справа — pill `Effort: max` (default per-app, не per-tab). При каждом запуске Claude процесса значение шлётся как `/effort <level>` через event-chain:
+
+```
+bridge видит новый PID → claude:process-started fires
+→ Terminal.tsx handler читает useUIStore.getState().defaultClaudeEffort
+→ если ≠ 'none' → ipcRenderer.invoke('claude:send-command', tabId, '/effort max')
+```
+
+**Почему `claude:process-started`, а не `claude:session-detected`:** session-detected fires на каждом bridge re-sync (раз в 1-2 секунды); session_id остаётся прежним при `claude --resume`, guard всегда false → /effort инжектится только однажды на жизнь таба. Process-started fires ровно один раз на спавн binary (новый PID). См. `fact-claude-stop-hook.md::Fresh-process detection`.
+
+**Почему без setTimeout:** `safePasteAndSubmit` сам ждёт sync-marker `\x1b[?2026l` от Ink. Если инпут ещё не готов — ждёт **внутри** функции (event-driven). Возвращается за 8-30ms на happy path. Раньше был paranoid `setTimeout(800ms)` обёртка — это "timeout как safety net вместо причины", антипаттерн (см. `methodology/design.md::Воспринимаемая задержка UI-команд`).
+
+**`max` нельзя задать в settings.json:** Claude CLI silently downgrades `effortLevel: "max"` до null при первом запуске. Максимум что settings.json держит — `high`. Из-за этого инжекция через `/effort max` — **единственный** способ стартовать сессию в max effort.
+
+**Persistence — SQLite, не localStorage.** `defaultClaudeEffort` сохраняется через `app:setState` IPC. Раньше был localStorage — но vite-dev меняет порт (5181 → 5182 → 5183) когда есть orphan Electron'ы, и каждый порт это **отдельный origin** → отдельное localStorage хранилище. Юзер видел "max сбрасывается после рестарта", думал что не сохраняется — на самом деле сохранялось, но на другом origin'е. См. `fix-environment.md::localStorage origin trap`.
+
+### Click-toggle-off на effort кнопке
+
+Повторный клик на уже-активный effort → выбор сбрасывается на `auto` (DeepSeek: `off`). Это **переносимый UX-принцип** (см. `methodology/design.md::Click-toggle-off на single-select`) — для filter pills, tag selectors, любых toggle-эквивалентных кнопок.
+
+Реализация: `const targetLevel = isActive ? (isDeepSeek ? 'off' : 'auto') : level;` — один тернарник в onClick, остальная логика без изменений. Tooltip меняется на `Click again to deselect (→ auto)` когда `isActive`.
+
+## Stop button — SIGTERM по PID, не keystroke в TUI
+
+InfoPanel `SessionActionChip` hover → "Stop" → клик. Реализация **должна** вызывать `terminal:stop-ai-process` (SIGTERM по PID Claude process), **не** слать `\x03` (Ctrl+C) в PTY.
+
+**Почему Ctrl+C не работает:** Claude TUI обрабатывает одиночный Ctrl+C как **"clear input"** (если в input есть текст) или **"взвести danger zone"** (Press Ctrl-C again to exit). Юзер кликает Stop → Claude не умирает, никаких ошибок → недоумение.
+
+**SIGTERM по PID детерминированный:** `terminal:stop-ai-process` находит дочерний PID через `ps -eo pid,ppid,command | grep claude` где `ppid === ptyProcess.pid`, шлёт `SIGTERM` через `process.kill`. Через 800ms escalate в `SIGKILL` если процесс не умер. Тот же IPC использует split-button "Stop Claude" в TabBar — если split-button работает, InfoPanel Stop должна работать так же.
 
 ## Реактивное управление Think Mode
 

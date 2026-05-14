@@ -7,6 +7,7 @@ const { stripVTControlCharacters } = require('node:util');
 const crypto = require('crypto');
 const http = require('http');
 const https = require('https');
+const net = require('net');
 
 // Load .env file (works in both dev and packaged builds)
 try {
@@ -152,6 +153,7 @@ const claudeState = new Map(); // tabId -> state string | null
 const claudePendingPrompt = new Map(); // tabId -> prompt string
 const claudeDebounceTimers = new Map(); // tabId -> debounce timer ID
 const claudeCtrlCDangerZone = new Map(); // tabId -> { resolve, promise, timer } (event-driven clear on prompt return)
+const claudeEffortDialogCooldown = new Map(); // tabId -> lastFireTs (ms). Prevents double-Enter on echo re-render.
 let sessionManager; // Initialized after projectManager is ready
 let claudeManager; // Initialized with terminals map
 const claudeAgentManager = new ClaudeAgentManager();
@@ -594,6 +596,7 @@ function startSessionBridge() {
       let tabId = bridgePidCache.get(data.ppid);
       let pidSource = tabId ? 'cache' : 'resolve';
 
+      let isFreshProcess = false;
       if (!tabId) {
         // Resolve Claude PID → parent (shell PID) → match to our PTY
         try {
@@ -602,23 +605,52 @@ function startSessionBridge() {
           for (const [tid, pty] of terminals) {
             if (pty.pid === shellPid) { tabId = tid; break; }
           }
-          if (tabId) bridgePidCache.set(data.ppid, tabId);
+          if (tabId) {
+            bridgePidCache.set(data.ppid, tabId);
+            // First time we see this Claude PID — it's a freshly started process.
+            // Use this signal (NOT session-detected) to fire one-shot side effects
+            // like auto /effort injection, which must trigger only on real spawn,
+            // not on every bridge re-sync of the same session id.
+            isFreshProcess = true;
+          }
         } catch {}
       }
 
       if (!tabId) return; // Not our process
 
+      // Notify renderer once per fresh Claude process. Lands BEFORE session-detected
+      // so handlers can correlate "new PID + same/different sessionId".
+      if (isFreshProcess && mainWindow && !mainWindow.isDestroyed()) {
+        console.log('[Bridge:Fresh] tab=' + tabId.slice(-12) + ' claudePid=' + data.ppid + ' session=' + data.session_id.slice(0, 8));
+        mainWindow.webContents.send('claude:process-started', {
+          tabId, sessionId: data.session_id, claudePid: data.ppid,
+        });
+      }
+
       // CWD guard: don't overwrite tab session if the detected session belongs to a different cwd.
       // Happens when user runs `claude --resume <foreignId>` in tab "X" — Claude finds the session
       // file in OTHER project's slug, but PID resolves to tab "X" → bridge would slap foreign sessionId
       // on the wrong tab. Compare bridge.cwd to tab's PTY cwd; mismatch = wrong-project resume.
+      //
+      // Path-prefix tolerance: user may `cd` inside the shell (up to a parent dir, or down into a
+      // subdir) before running `claude`. Bridge cwd then differs from tab cwd, but it's still the
+      // same filesystem branch — not a foreign project. Allow if one path is ancestor of the other.
       const tabCwd = terminalProjects.get(tabId);
       if (data.cwd && tabCwd && data.cwd !== tabCwd) {
-        const known = bridgeKnownSessions.get(tabId);
-        if (known !== data.session_id) {
-          console.warn('[Bridge:CwdGuard] Skip overwrite: tab cwd=' + tabCwd + ' but bridge cwd=' + data.cwd + ' (sid=' + data.session_id.substring(0, 8) + '...)');
+        const a = data.cwd.endsWith('/') ? data.cwd : data.cwd + '/';
+        const b = tabCwd.endsWith('/') ? tabCwd : tabCwd + '/';
+        const isRelated = a.startsWith(b) || b.startsWith(a);
+        if (!isRelated) {
+          const known = bridgeKnownSessions.get(tabId);
+          if (known !== data.session_id) {
+            console.warn('[Bridge:CwdGuard] Skip overwrite: tab cwd=' + tabCwd + ' but bridge cwd=' + data.cwd + ' (sid=' + data.session_id.substring(0, 8) + '...) — paths unrelated');
+          }
+          return;
         }
-        return;
+        // Related path (cd up/down within same branch) — proceed and update terminalProjects so
+        // future bridge updates use the bridge cwd as truth.
+        console.log('[Bridge:CwdGuard] Path drift OK (tab=' + tabCwd + ' bridge=' + data.cwd + ') — accepting and updating terminalProjects');
+        terminalProjects.set(tabId, data.cwd);
       }
 
       // Debug: log PID chain resolution for session detection
@@ -704,9 +736,157 @@ function clearBridgeTab(tabId) {
   for (const [pid, tid] of bridgePidCache) {
     if (tid === tabId) bridgePidCache.delete(pid);
   }
+  // Drop stale turn state for this tab so a reused tabId doesn't inherit "busy"
+  claudeTurnBusy.delete(tabId);
+  clearTimeout(claudeTurnWatchdog.get(tabId));
+  claudeTurnWatchdog.delete(tabId);
+  // Any in-flight grab-input request gets a clean rejection rather than dangling forever.
+  const pendingGrab = grabInputPending.get(tabId);
+  if (pendingGrab) {
+    clearTimeout(pendingGrab.timer);
+    pendingGrab.resolve({ success: false, error: 'tab cleared' });
+    grabInputPending.delete(tabId);
+  }
   if (had) {
     console.log('[Bridge:Clear] Tab ' + tabId.slice(-12) + ' removed from bridgeKnownSessions (remaining=' + bridgeKnownSessions.size + ')');
   }
+}
+
+// ========== Claude Turn Event Bridge ==========
+// Deterministic end-of-turn signal sourced from Claude Code's Stop hook.
+// Hook script writes one JSON line per event into this socket; we look up the
+// tab by session_id (using bridgeKnownSessions as the source of truth) and
+// broadcast 'claude:turn-state' to the renderer.
+const CLAUDE_HOOK_SOCK = '/tmp/noted-terminal-claude-hook.sock';
+const claudeTurnBusy = new Map(); // tabId → boolean (true = turn in flight)
+const claudeTurnWatchdog = new Map(); // tabId → timeout ID (silent-tool-stop safety)
+const CLAUDE_TURN_WATCHDOG_MS = 60 * 60 * 1000; // 60min — safety net against silent-tool-stop (#29881) and hook-script crashes; only fires when Stop legitimately never arrives
+let claudeHookServer = null;
+
+// PromptQueue grab-input correlator: noted-code-grab.js sends { event:'GrabInput', ppid, text }.
+// ppid is the helper script's parent = Claude process pid. We resolve it to tabId via bridgePidCache
+// (Claude PID → tabId, populated by SessionBridge).
+const grabInputPending = new Map(); // tabId → { resolve, timer }
+
+function findTabIdBySession(sessionId) {
+  if (!sessionId) return null;
+  for (const [tabId, sid] of bridgeKnownSessions) {
+    if (sid === sessionId) return tabId;
+  }
+  return null;
+}
+
+function startClaudeHookServer() {
+  try { fs.unlinkSync(CLAUDE_HOOK_SOCK); } catch {}
+  claudeHookServer = net.createServer((sock) => {
+    let buf = '';
+    sock.setEncoding('utf8');
+    sock.on('data', (chunk) => {
+      buf += chunk;
+      let nl;
+      while ((nl = buf.indexOf('\n')) !== -1) {
+        const line = buf.slice(0, nl);
+        buf = buf.slice(nl + 1);
+        if (!line.trim()) continue;
+        let msg;
+        try { msg = JSON.parse(line); } catch (e) {
+          console.warn('[ClaudeHook] Bad JSON:', e.message);
+          continue;
+        }
+        const { event, session_id, last_assistant_message, ts } = msg;
+
+        // ─── GrabInput: payload from noted-code-grab.js helper (no session_id, has ppid) ───
+        // Helper is invoked by Claude's external-editor flow. We map ppid → tabId via the
+        // Claude-PID cache populated by SessionBridge. `mode` is 'grab' or 'copy' depending
+        // on which IPC the user triggered.
+        if (event === 'GrabInput') {
+          const claudePid = Number(msg.ppid);
+          const tabId = bridgePidCache.get(claudePid)
+            || (() => { for (const [pid, tid] of bridgePidCache) { if (pid === claudePid) return tid; } return null; })();
+          if (!tabId) {
+            console.warn('[ClaudeHook] GrabInput ppid=' + claudePid + ' — no tab match (bridgePidCache.size=' + bridgePidCache.size + ')');
+            continue;
+          }
+          const pending = grabInputPending.get(tabId);
+          const text = typeof msg.text === 'string' ? msg.text : '';
+          const mode = msg.mode || pending?.mode || 'grab';
+          console.log('[ClaudeHook] GrabInput tab=' + tabId.slice(-12) + ' mode=' + mode + ' bytes=' + text.length + (pending ? '' : ' (no pending — unsolicited?)'));
+          if (pending) {
+            clearTimeout(pending.timer);
+            grabInputPending.delete(tabId);
+            const images = (text.match(/\[Image(?:\s+#?\d+)?\]/g) || []).length;
+            pending.resolve({ success: true, text, images, mode });
+          }
+          continue;
+        }
+
+        const tabId = findTabIdBySession(session_id);
+        if (!tabId) {
+          // Session not in our tab map — could be a stray claude process outside our terminal.
+          console.log('[ClaudeHook] ' + event + ' session=' + (session_id || '').slice(0, 8) + ' (no tab match)');
+          continue;
+        }
+        const busy = event === 'UserPromptSubmit';
+        const prev = claudeTurnBusy.get(tabId);
+        claudeTurnBusy.set(tabId, busy);
+        const latency = ts ? (Date.now() - ts) : null;
+        console.log('[ClaudeHook] ' + event + ' tab=' + tabId.slice(-12) + ' session=' + session_id.slice(0, 8) + ' busy=' + busy + (prev === busy ? ' (no change)' : '') + (latency !== null ? ' latency=' + latency + 'ms' : ''));
+
+        // ----- Reuse existing claude:busy-state pipeline -----
+        // Stop/StopFailure must force loader off, even if spinner glyph still pulses one last frame.
+        // UserPromptSubmit forces it on instantly, before the first spinner frame arrives.
+        // Cancel any pending spinner IDLE timer so it can't override our authoritative state.
+        clearTimeout(claudeSpinnerIdleTimer.get(tabId));
+        claudeSpinnerIdleTimer.delete(tabId);
+        const prevSpinner = claudeSpinnerBusy.get(tabId);
+        claudeSpinnerBusy.set(tabId, busy);
+        if (prevSpinner !== busy && mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('claude:busy-state', { tabId, busy });
+        }
+
+        // Watchdog — if Stop never fires (silent tool stop bug #29881, hook script crash, etc.)
+        // fall back to busy=false after CLAUDE_TURN_WATCHDOG_MS so the loader doesn't hang forever.
+        clearTimeout(claudeTurnWatchdog.get(tabId));
+        claudeTurnWatchdog.delete(tabId);
+        if (busy) {
+          claudeTurnWatchdog.set(tabId, setTimeout(() => {
+            console.warn('[ClaudeHook] Watchdog fired for tab ' + tabId.slice(-12) + ' (Stop never arrived)');
+            claudeTurnBusy.set(tabId, false);
+            claudeSpinnerBusy.set(tabId, false);
+            claudeTurnWatchdog.delete(tabId);
+            if (mainWindow && !mainWindow.isDestroyed()) {
+              mainWindow.webContents.send('claude:busy-state', { tabId, busy: false });
+            }
+          }, CLAUDE_TURN_WATCHDOG_MS));
+        }
+
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('claude:turn-state', {
+            tabId,
+            sessionId: session_id,
+            event,
+            busy,
+            success: event !== 'StopFailure',
+            lastAssistantMessage: last_assistant_message || null,
+          });
+        }
+      }
+    });
+    sock.on('error', (e) => { if (e.code !== 'EPIPE') console.warn('[ClaudeHook] sock err:', e.message); });
+  });
+  claudeHookServer.on('error', (e) => { console.error('[ClaudeHook] server err:', e.message); });
+  claudeHookServer.listen(CLAUDE_HOOK_SOCK, () => {
+    try { fs.chmodSync(CLAUDE_HOOK_SOCK, 0o600); } catch {}
+    console.log('[ClaudeHook] Listening on ' + CLAUDE_HOOK_SOCK);
+  });
+}
+
+function stopClaudeHookServer() {
+  if (claudeHookServer) {
+    try { claudeHookServer.close(); } catch {}
+    claudeHookServer = null;
+  }
+  try { fs.unlinkSync(CLAUDE_HOOK_SOCK); } catch {}
 }
 
 // Shell integration directory (for OSC 7 cwd reporting + OSC 133 command lifecycle)
@@ -724,10 +904,33 @@ function setupShellIntegration() {
   const zshIntegration = `# Noted Terminal Shell Integration
 # This file is auto-generated - do not edit
 
+# Capture our injected EDITOR/VISUAL BEFORE sourcing user's .zshrc — many user
+# configs unconditionally export EDITOR=subl/vim/code, which would clobber the
+# editor we wired up for Claude's chat:externalEditor (Prompt Queue grab feature).
+__ct_injected_editor="$EDITOR"
+__ct_injected_visual="$VISUAL"
+
 # Load user's original .zshrc
 if [[ -f "$HOME/.zshrc" ]]; then
   ZDOTDIR="$HOME" source "$HOME/.zshrc"
 fi
+
+# Capture user's real EDITOR (after their zshrc runs) so our helper can passthrough
+# when no lock-file is set (user pressed Ctrl+G manually expecting their editor).
+# Only do this if the user's zshrc actually set something non-trivial.
+if [[ -n "$EDITOR" && "$EDITOR" != *noted-code-grab* ]]; then
+  export NOTED_ORIGINAL_EDITOR="$EDITOR"
+fi
+
+# Restore our editor injection if the user's .zshrc clobbered it.
+# Only override when we actually injected something AND the path points at our hook helper.
+if [[ -n "$__ct_injected_editor" && "$__ct_injected_editor" == *noted-code-grab* ]]; then
+  export EDITOR="$__ct_injected_editor"
+fi
+if [[ -n "$__ct_injected_visual" && "$__ct_injected_visual" == *noted-code-grab* ]]; then
+  export VISUAL="$__ct_injected_visual"
+fi
+unset __ct_injected_editor __ct_injected_visual
 
 # OSC 7 - Report current directory to terminal
 __ct_osc7() {
@@ -770,10 +973,23 @@ printf "\\033]133;A\\007"
   const bashIntegration = `# Noted Terminal Shell Integration
 # This file is auto-generated - do not edit
 
+# Capture our injected EDITOR/VISUAL before user's bashrc clobbers them
+__ct_injected_editor="$EDITOR"
+__ct_injected_visual="$VISUAL"
+
 # Load user's original .bashrc
 if [[ -f "$HOME/.bashrc" ]]; then
   source "$HOME/.bashrc"
 fi
+
+# Restore our editor injection
+if [[ -n "$__ct_injected_editor" && "$__ct_injected_editor" == *noted-code-grab* ]]; then
+  export EDITOR="$__ct_injected_editor"
+fi
+if [[ -n "$__ct_injected_visual" && "$__ct_injected_visual" == *noted-code-grab* ]]; then
+  export VISUAL="$__ct_injected_visual"
+fi
+unset __ct_injected_editor __ct_injected_visual
 
 __ct_in_command=0
 
@@ -3689,6 +3905,15 @@ app.whenReady().then(() => {
     console.error('[Startup] SessionBridge ERROR:', e.message);
   }
 
+  // Initialize Claude Hook Bridge (Stop/UserPromptSubmit deterministic turn signal)
+  console.log('[Startup] Starting ClaudeHookBridge...');
+  try {
+    startClaudeHookServer();
+    console.log('[Startup] ClaudeHookBridge OK');
+  } catch (e) {
+    console.error('[Startup] ClaudeHookBridge ERROR:', e.message);
+  }
+
   // ========== MCP HTTP SERVER ==========
   console.log('[Startup] Starting MCP HTTP server...');
   try {
@@ -3832,8 +4057,25 @@ app.on('activate', () => {
 });
 
 // Shared helper: format tool_use block for clean export
+// Maps a Claude Code tool name to its semantic group used by copy-settings.
+// 'reading'  → file/code inspection (Read, Grep, Glob, NotebookRead)
+// 'editing'  → file mutation (Edit, Write, NotebookEdit)
+// 'bash'    → shell execution + long-running shell streams (Bash, Monitor)
+// 'subagent' → Task (sub-agent invocation — separate toggle pair Result/History)
+// 'tools'   → everything else: MCP, WebFetch/Search, Skill, Cron*, Agent, planning, notifications, …
+// New tools default to 'tools' — safe bucket that's always included if user keeps Claude+Tools on.
+function getToolGroup(toolName) {
+  if (toolName === 'Read' || toolName === 'Grep' || toolName === 'Glob' || toolName === 'NotebookRead') return 'reading';
+  if (toolName === 'Edit' || toolName === 'Write' || toolName === 'NotebookEdit') return 'editing';
+  if (toolName === 'Bash' || toolName === 'Monitor') return 'bash';
+  if (toolName === 'Task') return 'subagent';
+  return 'tools';
+}
+
+// `opts.flags` (optional) — granular group flags from useUIStore. When absent (legacy callers),
+// falls back to old includeEditing/includeReading boolean pair so MCP/get-history keeps working.
 function formatToolAction(toolName, input, toolResult = null, includeEditing = false, includeReading = false, opts = {}) {
-  const { includeSubagentResult = false, includeSubagentHistory = false, progressEntries = [] } = opts;
+  const { includeSubagentResult = false, includeSubagentHistory = false, progressEntries = [], flags = null } = opts;
   let label = '';
   switch (toolName) {
     case 'Read': label = '📄 Чтение (' + (input.file_path || '?') + ')'; break;
@@ -3842,6 +4084,11 @@ function formatToolAction(toolName, input, toolResult = null, includeEditing = f
     case 'Bash': {
       const cmd = (input.command || '').substring(0, 50);
       label = '🖥 Команда ("' + cmd + (input.command?.length > 50 ? '...' : '') + '")';
+      break;
+    }
+    case 'Monitor': {
+      const cmd = (input.command || '').substring(0, 50);
+      label = '🖥 Monitor ("' + cmd + (input.command?.length > 50 ? '...' : '') + '")';
       break;
     }
     case 'Glob': label = '🔍 Поиск файлов (' + (input.pattern || '?') + ')'; break;
@@ -3854,10 +4101,23 @@ function formatToolAction(toolName, input, toolResult = null, includeEditing = f
     default: label = '⚙️ ' + toolName;
   }
 
-  const shouldInclude =
-    ((toolName === 'Edit' || toolName === 'Write' || toolName === 'Bash') && includeEditing) ||
-    (toolName === 'Read' && includeReading) ||
-    (toolName === 'Task' && (includeSubagentResult || includeSubagentHistory));
+  // Compute group-based inclusion. When granular flags passed — use them. Otherwise fall back to
+  // legacy semantics: includeEditing covered Edit/Write/Bash, includeReading covered Read.
+  // Legacy default keeps existing callers (MCP get-history) producing the same output.
+  const group = getToolGroup(toolName);
+  let shouldInclude;
+  if (flags) {
+    if (group === 'reading') shouldInclude = !!flags.reading;
+    else if (group === 'editing') shouldInclude = !!flags.editing;
+    else if (group === 'bash') shouldInclude = !!flags.bash;
+    else if (group === 'tools') shouldInclude = !!flags.tools;
+    else if (group === 'subagent') shouldInclude = !!(includeSubagentResult || includeSubagentHistory);
+  } else {
+    shouldInclude =
+      ((toolName === 'Edit' || toolName === 'Write' || toolName === 'Bash') && includeEditing) ||
+      (toolName === 'Read' && includeReading) ||
+      (toolName === 'Task' && (includeSubagentResult || includeSubagentHistory));
+  }
 
   if (!shouldInclude) return label;
 
@@ -3952,6 +4212,17 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
       // Route Claude Code through our local proxy for dynamic provider switching.
       // Per-tab prefix /t/<tabId> lets the proxy keep independent provider state per tab.
       ANTHROPIC_BASE_URL: 'http://127.0.0.1:' + PROVIDER_PROXY_PORT + '/t/' + encodeURIComponent(tabId),
+      // PromptQueue: Claude's chat:externalEditor (Ctrl+G) launches $EDITOR with the current
+      // input as a tempfile. Our helper script reads the file → sends to our hook socket →
+      // truncates → exits. Basename starts with "code" so promptEditor.ts classifies us
+      // as GUI editor and skips the alt-screen flash. See fact-prompt-queue.md.
+      //
+      // NOTED_ORIGINAL_EDITOR carries the user's real $EDITOR (Sublime/vim/code/...) so the
+      // helper can passthrough to it when no lock-file is set (user manually pressed Ctrl+G
+      // expecting their normal editor to open).
+      EDITOR: path.join(os.homedir(), '.claude', 'hooks', 'noted-code-grab.js'),
+      VISUAL: path.join(os.homedir(), '.claude', 'hooks', 'noted-code-grab.js'),
+      NOTED_ORIGINAL_EDITOR: process.env.EDITOR || process.env.VISUAL || '',
     };
 
     // Zsh: use ZDOTDIR to load our integration
@@ -4164,6 +4435,40 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
         const m = sc.match(/Session\s*ID[:\s]*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
         if (m && bridgeKnownSessions.has(tabId) && mainWindow && !mainWindow.isDestroyed()) {
           mainWindow.webContents.send('claude:status-session-detected', { tabId, sessionId: m[1] });
+        }
+      }
+
+      // ========== AUTO-CONFIRM EFFORT-CHANGE DIALOG ==========
+      // After /effort N, Claude shows in new cwds (no saved permission):
+      //   Change effort level?
+      //   ❯ 1. Yes, switch to <X>
+      //     2. No, go back
+      // Default highlight is on "Yes" — pressing Enter confirms. We auto-press Enter so the user
+      // doesn't have to touch the terminal after clicking the effort button in UI.
+      // Match only "Change effort level" — Ink TUI splits the menu into multiple PTY chunks,
+      // and inside each line spaces are encoded as ANSI cursor-forward sequences (`[1C`) instead
+      // of literal spaces, so "Yes, switch to low" after strip becomes "Yes,switchtolow".
+      // The unique "Change effort level" string is enough to confirm the dialog. Cooldown 2s
+      // prevents double-fire on Ink re-renders.
+      {
+        const sc = stripVTControlCharacters(data);
+        if (sc.includes('Change effort level')) {
+          const now = Date.now();
+          const lastFire = claudeEffortDialogCooldown.get(tabId) || 0;
+          if (now - lastFire > 2000) {
+            claudeEffortDialogCooldown.set(tabId, now);
+            console.log('[EffortDialog] Tab ' + tabId + ': detected, sending Enter in 120ms');
+            // Delay to let Ink finish rendering the full menu before we press Enter.
+            // 80ms was too short — Ink still painted dialog when Enter arrived and Enter went
+            // into an undefined state (sometimes worked, sometimes ate the prompt).
+            setTimeout(() => {
+              const t = terminals.get(tabId);
+              if (t) {
+                console.log('[EffortDialog] Tab ' + tabId + ': writing \\r');
+                t.write('\r');
+              }
+            }, 120);
+          }
         }
       }
 
@@ -4389,6 +4694,13 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
           // spinner stayed BUSY forever until user switched tabs (triggering Ink re-render).
           clearTimeout(claudeSpinnerIdleTimer.get(tabId));
           claudeSpinnerIdleTimer.set(tabId, setTimeout(function() {
+            // If Stop hook is authoritative for this tab (turn currently in flight per UserPromptSubmit),
+            // spinner-absence is NOT end-of-turn — Claude is just between thinking phases.
+            // Drop this IDLE event; the hook will fire the real Stop later.
+            if (claudeTurnBusy.get(tabId) === true) {
+              claudeSpinnerIdleTimer.delete(tabId);
+              return;
+            }
             claudeSpinnerBusy.set(tabId, false);
             claudeSpinnerIdleTimer.delete(tabId);
             console.log('[Spinner] Tab ' + tabId + ': IDLE');
@@ -4477,6 +4789,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
       }
       claudeSpinnerBusy.delete(tabId);
       claudeSpinnerIdleTimer.delete(tabId);
+      claudeEffortDialogCooldown.delete(tabId);
       subAgentInterceptor.delete(tabId);
 
       // MCP: Handle sub-agent PTY exit (Claude crash)
@@ -4530,38 +4843,39 @@ const PASTE_END = '\x1b[201~';
 // WHY NOT text echo: Ink collapses long pastes into "[Pasted text #N +M lines]",
 // so the actual pasted text never appears verbatim in PTY output.
 function waitForRender(term, timeoutMs, logPrefix) {
-  return new Promise((resolve) => {
-    let buf = '';
-    let resolved = false;
-    let staleCount = 0;
-    const subscribeTime = Date.now();
-
-    const cleanup = () => {
+  let baseTime = Date.now(); // Initial subscription time, replaced by markWriteTime()
+  let resolved = false;
+  let buf = '';
+  let staleCount = 0;
+  let cleanup, sub, timer;
+  const result = new Promise((resolve) => {
+    cleanup = () => {
       if (!resolved) {
         resolved = true;
         clearTimeout(timer);
         sub.dispose();
       }
     };
-
-    const timer = setTimeout(() => {
+    timer = setTimeout(() => {
       console.log(logPrefix + ' ⏱️ TIMEOUT (' + timeoutMs + 'ms), buf=' + buf.length + 'B, staleSkipped=' + staleCount);
       cleanup();
       resolve({ timedOut: true });
     }, timeoutMs);
-
-    const sub = term.onData((data) => {
+    sub = term.onData((data) => {
       if (resolved) return;
       buf += data;
       if (buf.includes('\x1b[?2026l')) {
-        const elapsed = Date.now() - subscribeTime;
-        const isStale = elapsed < 15;
+        const elapsed = Date.now() - baseTime;
+        // 3ms threshold: anything that arrives within this window is a marker
+        // ALREADY in the kernel buffer from a previous Ink render (Ctrl+S stash,
+        // resize, periodic update) — our write hasn't propagated yet. baseTime
+        // is reset by markWriteTime() right after term.write(), so a real
+        // marker from our paste arriving in 5-20ms passes cleanly.
+        const isStale = elapsed < 3;
         if (isStale) {
-          // Stale marker from previous Ink render (resize, periodic update, etc.)
-          // Discard and wait for the REAL marker from our write
           staleCount++;
           console.log(logPrefix + ' ⚠️ STALE sync marker at +' + elapsed + 'ms — discarding, waiting for real marker (stale #' + staleCount + ')');
-          buf = ''; // Reset buffer, keep listening
+          buf = '';
           return;
         }
         console.log(logPrefix + ' ✅ sync marker at +' + elapsed + 'ms' + (staleCount > 0 ? ' (skipped ' + staleCount + ' stale)' : ''));
@@ -4570,6 +4884,12 @@ function waitForRender(term, timeoutMs, logPrefix) {
       }
     });
   });
+  // Caller must call this AFTER term.write() so the stale-threshold is measured
+  // from when bytes actually leave us, not from subscription time. Without this,
+  // markers that arrive faster than 15ms after subscription (but actually FROM
+  // our write) get falsely tagged as stale.
+  result.markWriteTime = () => { baseTime = Date.now(); buf = ''; };
+  return result;
 }
 
 // Helper: drain any pending PTY data (wait for silence)
@@ -4615,8 +4935,11 @@ async function safePasteAndSubmit(term, content, options = {}) {
   const {
     submit = true,
     ctrlCFirst = false,
+    stashFirst = false, // Send Ctrl+S to stash current user input (Claude restores after slash-cmd submit)
+    dismissAutocomplete = false, // Send Esc after paste to close slash-cmd autocomplete dropdown
     logPrefix = '[safePaste]',
     safetyTimeoutMs = 8000,
+    chunkRenderTimeoutMs = null, // Override per-chunk waitForRender timeout. Null = use safetyTimeoutMs.
     fast = false // Turbo mode for Gemini/Bash (skip render waits)
   } = options;
 
@@ -4635,14 +4958,38 @@ async function safePasteAndSubmit(term, content, options = {}) {
   }
 
   const t0 = Date.now();
-  console.log(logPrefix + ' 🚀 Start: "' + content.substring(0, 40) + '" (' + content.length + ' chars → ' + chunks.length + ' chunk(s), fast=' + fast + ', ctrlCFirst=' + ctrlCFirst + ')');
+  console.log(logPrefix + ' 🚀 Start: "' + content.substring(0, 40) + '" (' + content.length + ' chars → ' + chunks.length + ' chunk(s), fast=' + fast + ', ctrlCFirst=' + ctrlCFirst + ', stashFirst=' + stashFirst + ')');
+
+  // Optional: Ctrl+S to stash any user input — Claude pushes it to stash and
+  // clears the prompt; after our slash-cmd submits, Claude auto-restores stash.
+  // No Ctrl+C needed → no danger-zone, no double-Ctrl+C exit risk.
+  // Side effect: if input was empty AND a stash already existed, Ctrl+S pops
+  // the stash back into the prompt. Our bracketed paste then prepends the
+  // command — Esc + Enter still submits cleanly because slash-cmd takes the
+  // whole input verbatim.
+  if (stashFirst) {
+    console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] Sending Ctrl+S (stash)...');
+    term.write('\x13');
+    if (!fast) {
+      // 20ms drain just to let Ink ingest \x13 before our paste lands. If
+      // input had text, Ink renders "Stashed (auto-restores after submit)"
+      // ~40ms later — paste arrives after that render starts but Ink
+      // processes our bytes in order regardless. Larger drain hurts the
+      // empty-input case (Ctrl+S = no-op, no data, drain waits in vain).
+      await drainPtyData(term, 20);
+    } else {
+      await new Promise(r => setTimeout(r, 10));
+    }
+  }
 
   // Optional: Ctrl+C to clear input
   if (ctrlCFirst) {
     console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] Sending Ctrl+C...');
+    const ctrlCPromise = !fast ? waitForRender(term, 2000, logPrefix + ':ctrl-c') : null;
     term.write('\x03');
+    if (ctrlCPromise && ctrlCPromise.markWriteTime) ctrlCPromise.markWriteTime();
     if (!fast) {
-      const ctrlCResult = await waitForRender(term, 2000, logPrefix + ':ctrl-c');
+      const ctrlCResult = await ctrlCPromise;
       console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] Ctrl+C render: timedOut=' + ctrlCResult.timedOut + ' stale=' + (ctrlCResult.isStale || false) + ' elapsed=' + (ctrlCResult.elapsedMs || 'n/a') + 'ms');
       await new Promise(r => setTimeout(r, 50));
     } else {
@@ -4688,10 +5035,17 @@ async function safePasteAndSubmit(term, content, options = {}) {
     let renderPromise = null;
 
     if (!fast) {
-       renderPromise = waitForRender(term, safetyTimeoutMs, logPrefix + ':chunk' + (i + 1));
+       renderPromise = waitForRender(term, chunkRenderTimeoutMs || safetyTimeoutMs, logPrefix + ':chunk' + (i + 1));
     }
 
     term.write(payload);
+    if (renderPromise && renderPromise.markWriteTime) {
+      // Reset stale-threshold baseline so markers from THIS write are not
+      // discarded as "<15ms after subscription". Ink can render a short paste
+      // (<20 bytes) in 5-17ms — our paste marker arrives faster than the
+      // stale threshold catches it.
+      renderPromise.markWriteTime();
+    }
 
     if (!fast && renderPromise) {
       const chunkResult = await renderPromise;
@@ -4705,15 +5059,30 @@ async function safePasteAndSubmit(term, content, options = {}) {
   }
 
   if (submit) {
+    // Optional: Esc to dismiss Claude's slash-cmd autocomplete dropdown.
+    // Without this, the next Enter hits an early-return in PromptInput.onSubmit
+    // (suggestions.length > 0 guard) — user has to press any key to break the
+    // prefix match before Enter works. With Esc → autocomplete:dismiss fires →
+    // clearSuggestions() → next Enter submits cleanly.
+    if (dismissAutocomplete) {
+      console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] Sending Esc (dismiss autocomplete)...');
+      term.write('\x1b');
+      if (!fast) {
+        await drainPtyData(term, 50);
+      } else {
+        await new Promise(r => setTimeout(r, 10));
+      }
+    }
     if (fast) {
       // Fast mode: fixed delay (Gemini/bash don't use Ink sync)
       console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] Waiting 500ms before Enter (fast mode)...');
       await new Promise(r => setTimeout(r, 500));
     } else {
-      // Slow mode: wait for PTY silence (render fully settled)
-      // Catches secondary React renders, re-layouts after paste
+      // Slow mode: short drain for secondary React renders / re-layouts.
+      // 50ms is enough because waitForRender already confirmed the primary
+      // sync marker — this is just settling tail re-renders.
       console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] Draining PTY before Enter (slow mode)...');
-      await drainPtyData(term, 150);
+      await drainPtyData(term, 50);
     }
     term.write('\r');
     console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] ✅ Sent Enter (total: ' + (Date.now() - t0) + 'ms)');
@@ -4874,35 +5243,150 @@ ipcMain.handle('claude:is-active', (event, tabId) => {
   return active;
 });
 
+// PromptQueue: grab the current Claude input via the chat:externalEditor flow.
+//
+// Flow:
+//  1. Renderer calls this IPC.
+//  2. We send Ctrl+G (0x07) to Claude's PTY → triggers chat:externalEditor binding.
+//  3. Claude writes the current input to a tempfile and execSync-launches our EDITOR
+//     (env-injected to noted-code-grab.js). Claude waits synchronously.
+//  4. noted-code-grab reads the file, posts JSON {event:'GrabInput', ppid, text} to our socket,
+//     truncates the file, exits.
+//  5. Claude reads the now-empty file → sets input to empty (clears).
+//  6. Socket handler resolves grabInputPending[tabId] with the text we captured.
+//
+// Caveats (from research):
+//  - Image attachments are dropped — only [Image #N] placeholder tokens survive (counted, not carried).
+//  - Brief "Save and close editor…" hint may flash in TUI for ~50ms.
+//  - If Claude is currently busy (no draft input), Ctrl+G is a no-op and we time out.
+// Resolve tabId → claude-process PID via bridgePidCache (Claude PID → tabId).
+// O(N) scan but bridgePidCache rarely has >5 entries; not a hot path.
+function findClaudePidByTab(tabId) {
+  for (const [pid, tid] of bridgePidCache) {
+    if (tid === tabId) return pid;
+  }
+  return null;
+}
+
+// Read the EDITOR env of a running process via `ps -wwwE`. Returns null if process
+// is gone or ps doesn't expose env (different user, sandboxed, etc).
+async function readProcessEditor(pid) {
+  try {
+    const { execSync } = require('child_process');
+    const out = execSync('ps -p ' + pid + ' -wwwE -o command=', { timeout: 1000, encoding: 'utf8' });
+    const m = out.match(/(?:^|\s)EDITOR=([^\s]+(?:\s+[^=\s][^=]*)?)/);
+    return m ? m[1] : null;
+  } catch {
+    return null;
+  }
+}
+
+// Shared by claude:grab-input and claude:copy-input — both fire Ctrl+G after writing
+// a lock-file telling the helper which mode (clear input vs preserve) to run in.
+async function captureClaudeInput(tabId, mode) {
+  const term = terminals.get(tabId);
+  if (!term) return { success: false, error: 'no_terminal' };
+
+  if (!bridgeKnownSessions.has(tabId)) {
+    console.log('[capture-input:' + mode + '] Tab ' + tabId.slice(-12) + ': no active Claude session');
+    return { success: false, error: 'no_claude_session' };
+  }
+
+  const claudePid = findClaudePidByTab(tabId);
+  if (claudePid) {
+    const editor = await readProcessEditor(claudePid);
+    if (editor && !editor.includes('noted-code-grab')) {
+      console.warn('[capture-input:' + mode + '] Tab ' + tabId.slice(-12) + ': wrong EDITOR=' + editor + ' — restart Claude in this tab');
+      return { success: false, error: 'wrong_editor', editor };
+    }
+  }
+
+  if (grabInputPending.has(tabId)) return { success: false, error: 'already_in_progress' };
+  if (claudeTurnBusy.get(tabId) === true) return { success: false, error: 'claude_busy' };
+
+  // Write the lock-file that tells the helper which side-effect to apply.
+  // Helper consumes (unlinks) it on read, so a stale lock can't fire next time.
+  if (claudePid) {
+    try {
+      fs.writeFileSync('/tmp/noted-grab-' + claudePid + '.json', JSON.stringify({ mode, ts: Date.now() }));
+    } catch (e) {
+      console.warn('[capture-input:' + mode + '] lock write failed:', e.message);
+      return { success: false, error: 'lock_write_failed' };
+    }
+  } else {
+    console.warn('[capture-input:' + mode + '] Tab ' + tabId.slice(-12) + ': no claude PID — cannot write lock');
+    return { success: false, error: 'no_claude_pid' };
+  }
+
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      grabInputPending.delete(tabId);
+      // Clean up the lock if helper never ran (e.g. PTY broken)
+      try { fs.unlinkSync('/tmp/noted-grab-' + claudePid + '.json'); } catch {}
+      console.warn('[capture-input:' + mode + '] Tab ' + tabId.slice(-12) + ': timeout');
+      resolve({ success: false, error: 'editor_not_wired' });
+    }, 3000);
+    grabInputPending.set(tabId, { resolve, timer, mode });
+    console.log('[capture-input:' + mode + '] Tab ' + tabId.slice(-12) + ': sending Ctrl+G');
+    term.write('\x07'); // Ctrl+G → chat:externalEditor
+  });
+}
+
+ipcMain.handle('claude:grab-input', async (event, tabId) => captureClaudeInput(tabId, 'grab'));
+ipcMain.handle('claude:copy-input', async (event, tabId) => captureClaudeInput(tabId, 'copy'));
+
+// Clear current Claude input WITHOUT going through the queue. Same external-editor
+// hijack, but helper truncates the tempfile and exits — no socket callback.
+// Fire-and-forget: we return immediately after sending Ctrl+G; the input clears ~50ms later
+// as Claude re-reads the empty tempfile.
+ipcMain.handle('claude:clear-input', async (event, tabId) => {
+  const term = terminals.get(tabId);
+  if (!term) return { success: false, error: 'no_terminal' };
+  if (!bridgeKnownSessions.has(tabId)) return { success: false, error: 'no_claude_session' };
+  if (claudeTurnBusy.get(tabId) === true) return { success: false, error: 'claude_busy' };
+  const claudePid = findClaudePidByTab(tabId);
+  if (!claudePid) return { success: false, error: 'no_claude_pid' };
+  try {
+    fs.writeFileSync('/tmp/noted-grab-' + claudePid + '.json', JSON.stringify({ mode: 'clear', ts: Date.now() }));
+  } catch (e) {
+    return { success: false, error: 'lock_write_failed' };
+  }
+  console.log('[clear-input] Tab ' + tabId.slice(-12) + ': sending Ctrl+G (mode=clear)');
+  term.write('\x07');
+  return { success: true };
+});
+
 ipcMain.handle('claude:send-command', async (event, tabId, command) => {
   console.log('[send-command] 📩 Received: tabId=' + tabId + ' command="' + command + '" ts=' + Date.now());
   const term = terminals.get(tabId);
   if (!term) { console.log('[send-command] ❌ Terminal not found for tabId=' + tabId); return; }
-  // If in danger zone ("Press Ctrl-C again to exit" is active):
-  // Skip ctrlCFirst — input is already cleared by the first Ctrl+C.
-  // Sending another \x03 would EXIT Claude.
+  // Stash flow: Ctrl+S clears current input by pushing it to Claude's stash;
+  // after our slash-cmd submits, Claude auto-restores the user's prompt.
+  // Bracketed-paste short commands (<800 chars) open Claude's slash autocomplete
+  // dropdown — Esc dismisses it so the following Enter actually submits
+  // (otherwise hits PromptInput.onSubmit early-return guard on suggestions.length).
+  // Danger zone (Press Ctrl-C again to exit) is no longer reachable since we
+  // never send Ctrl+C from this path, but we still clear any stale DZ state.
   const dz = claudeCtrlCDangerZone.get(tabId);
   if (dz) {
-    console.log('[send-command] Tab ' + tabId + ': ⚠️ Danger zone — skipping ctrlCFirst, sending command directly');
-    // Clear DZ since we're about to send a command (which cancels the warning)
+    console.log('[send-command] Tab ' + tabId + ': clearing stale danger zone');
     clearTimeout(dz.timer);
     claudeCtrlCDangerZone.delete(tabId);
     dz.resolve();
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('claude:ctrlc-danger-zone', { tabId, active: false });
     }
-    await safePasteAndSubmit(term, command, {
-      submit: true,
-      ctrlCFirst: false,
-      logPrefix: '[send-command:' + tabId + ']'
-    });
-  } else {
-    await safePasteAndSubmit(term, command, {
-      submit: true,
-      ctrlCFirst: true,
-      logPrefix: '[send-command:' + tabId + ']'
-    });
   }
+  await safePasteAndSubmit(term, command, {
+    submit: true,
+    stashFirst: true,
+    // dismissAutocomplete intentionally OFF: slash-cmds with arguments (/model haiku,
+    // /effort low) don't match any prefix beyond the slash — autocomplete is empty
+    // by the time we send Enter, so PromptInput.onSubmit guard passes. Sending Esc
+    // here triggers Claude's "Esc again to clear" hint, visible briefly under input.
+    chunkRenderTimeoutMs: 1000,
+    logPrefix: '[send-command:' + tabId + ']'
+  });
 });
 
 // ========== LLM Provider Switching (per-tab) ==========
@@ -5798,6 +6282,36 @@ ipcMain.on('app:setStateSync', (event, { key, value }) => {
   event.returnValue = { success: true };
 });
 
+// Bulk synchronous hydrate. Called once at renderer boot — BEFORE Zustand store
+// initialisers run — so localStorage already contains the latest SQLite values
+// when synchronous `localStorage.getItem(...)` calls fire inside store factories.
+// Returns Map<key, raw string value>. Filter by optional prefix (e.g. "noted-terminal-").
+ipcMain.on('app:hydrateLocalStorageSync', (event, { prefix } = {}) => {
+  try {
+    event.returnValue = projectManager.db.getAllAppStateRaw(prefix);
+  } catch (e) {
+    console.warn('[app:hydrateLocalStorageSync] failed:', e);
+    event.returnValue = {};
+  }
+});
+
+// Sync mirror of localStorage.setItem — fires from the renderer's monkey-patched
+// localStorage.setItem hook. Sync because setItem itself is sync; the renderer
+// expects writes to be durable by the time setItem returns. Cheap (single INSERT).
+ipcMain.on('app:mirrorLocalStorageSync', (event, { key, value }) => {
+  try {
+    if (value === null || value === undefined) {
+      projectManager.db.deleteAppState(key);
+    } else {
+      projectManager.db.setAppState(key, String(value));
+    }
+    event.returnValue = { success: true };
+  } catch (e) {
+    console.warn('[app:mirrorLocalStorageSync] failed:', e);
+    event.returnValue = { success: false };
+  }
+});
+
 ipcMain.handle('project:save-note', (event, { projectId, content }) => {
   projectManager.saveProjectNote(projectId, content);
   return { success: true };
@@ -6190,6 +6704,209 @@ ipcMain.handle('system:kill-process', async (event, pid) => {
       return { success: false };
     }
   }
+});
+
+// ========== Project port detector + killer ==========
+// Detect declared ports from common config files in a project, then `lsof | kill`.
+// Designed for the "free ports before start" toggle: solves the "address in use"
+// case where a previous run crashed/Electron force-quit left the port held.
+//
+// Detection sources (in priority order):
+// 1. vite.config.{ts,js,mjs} — server.port
+// 2. .env / .env.local — PORT=, BACKEND_PORT=, FRONTEND_PORT=, *_PORT=
+// 3. NestJS main.ts — `app.listen(process.env.PORT || NNNN)` fallback literal
+// 4. package.json — `notedTerminal.ports: [3000, 5173]` (manual override)
+//
+// Recursive: scans `cwd` AND immediate subfolders (for monorepos like uav/agrofield_back).
+// Cached for 30s per cwd so repeated start→stop→start cycles don't re-grep.
+const projectPortsCache = new Map(); // cwd → { ports: number[], ts: number }
+const PROJECT_PORTS_CACHE_TTL = 30_000;
+
+function extractPortsFromText(text) {
+  const ports = new Set();
+  // vite.config: server: { port: 5181 } / port: 5181
+  for (const m of text.matchAll(/\bport\s*:\s*(\d{2,5})\b/gi)) {
+    const p = Number(m[1]); if (p >= 1024 && p <= 65535) ports.add(p);
+  }
+  // .env: PORT=3000, FRONTEND_PORT=5173, BACKEND_PORT=3001
+  for (const m of text.matchAll(/^[A-Z][A-Z0-9_]*PORT\s*=\s*(\d{2,5})\b/gm)) {
+    const p = Number(m[1]); if (p >= 1024 && p <= 65535) ports.add(p);
+  }
+  // NestJS: app.listen(process.env.PORT || 3001) / app.listen(3001)
+  for (const m of text.matchAll(/\.listen\s*\(\s*(?:process\.env\.[A-Z_]+\s*\|\|\s*)?(\d{2,5})\b/g)) {
+    const p = Number(m[1]); if (p >= 1024 && p <= 65535) ports.add(p);
+  }
+  return Array.from(ports);
+}
+
+function scanProjectPorts(rootCwd, depth = 0) {
+  const found = new Set();
+  if (depth > 1) return found; // only direct subfolders, not deep recursion
+  let entries = [];
+  try { entries = fs.readdirSync(rootCwd, { withFileTypes: true }); } catch { return found; }
+
+  // 1. package.json — notedTerminal.ports override
+  if (depth === 0) {
+    try {
+      const pkgPath = path.join(rootCwd, 'package.json');
+      if (fs.existsSync(pkgPath)) {
+        const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+        if (Array.isArray(pkg?.notedTerminal?.ports)) {
+          for (const p of pkg.notedTerminal.ports) {
+            if (Number.isInteger(p) && p >= 1024 && p <= 65535) found.add(p);
+          }
+        }
+      }
+    } catch {}
+  }
+
+  // 2. Config files in this directory
+  const configFiles = [
+    'vite.config.ts', 'vite.config.js', 'vite.config.mjs',
+    'electron.vite.config.ts', 'electron.vite.config.js', 'electron.vite.config.mjs',
+    '.env', '.env.local', '.env.development',
+  ];
+  for (const f of configFiles) {
+    try {
+      const p = path.join(rootCwd, f);
+      if (fs.existsSync(p)) {
+        const txt = fs.readFileSync(p, 'utf8');
+        for (const port of extractPortsFromText(txt)) found.add(port);
+      }
+    } catch {}
+  }
+
+  // 3. NestJS main.ts pattern — `src/main.ts` if exists
+  try {
+    const mainTs = path.join(rootCwd, 'src', 'main.ts');
+    if (fs.existsSync(mainTs)) {
+      const txt = fs.readFileSync(mainTs, 'utf8');
+      for (const port of extractPortsFromText(txt)) found.add(port);
+    }
+  } catch {}
+
+  // 4. Recurse into immediate subfolders that look like monorepo apps
+  //    (skip node_modules, .git, dist, build, .next, etc.)
+  if (depth === 0) {
+    const skip = new Set(['node_modules', '.git', 'dist', 'build', '.next', '.vite', 'release', 'out', '.cache', 'coverage']);
+    for (const ent of entries) {
+      if (!ent.isDirectory() || skip.has(ent.name) || ent.name.startsWith('.')) continue;
+      const sub = path.join(rootCwd, ent.name);
+      for (const p of scanProjectPorts(sub, depth + 1)) found.add(p);
+    }
+  }
+
+  return found;
+}
+
+ipcMain.handle('system:detect-project-ports', async (event, cwd) => {
+  if (!cwd) return { ports: [] };
+  const cached = projectPortsCache.get(cwd);
+  if (cached && (Date.now() - cached.ts) < PROJECT_PORTS_CACHE_TTL) {
+    return { ports: cached.ports, cached: true };
+  }
+  const ports = Array.from(scanProjectPorts(cwd)).sort((a, b) => a - b);
+  projectPortsCache.set(cwd, { ports, ts: Date.now() });
+  console.log('[free-ports] Detected for ' + cwd + ': [' + ports.join(', ') + ']');
+  return { ports, cached: false };
+});
+
+// Kill whatever holds the given ports. Returns per-port outcome.
+// Used by the "free ports" toggle before npm-script start/restart/stop.
+ipcMain.handle('system:free-project-ports', async (event, cwd) => {
+  if (!cwd) return { success: false, error: 'no cwd', killed: [] };
+  const cached = projectPortsCache.get(cwd);
+  let ports;
+  if (cached && (Date.now() - cached.ts) < PROJECT_PORTS_CACHE_TTL) {
+    ports = cached.ports;
+  } else {
+    ports = Array.from(scanProjectPorts(cwd)).sort((a, b) => a - b);
+    projectPortsCache.set(cwd, { ports, ts: Date.now() });
+  }
+  if (ports.length === 0) return { success: true, killed: [], skipped: true };
+  const results = [];
+  for (const port of ports) {
+    try {
+      const pidsOut = await execAsync('lsof -ti:' + port, 1500).catch(() => '');
+      const pids = (pidsOut || '').trim().split(/\s+/).filter(Boolean);
+      if (pids.length === 0) { results.push({ port, killed: 0 }); continue; }
+      // SIGKILL right away — anything holding a port we're about to need is going down hard.
+      // No grace period: free-ports semantics is "make the port available NOW", not "ask politely".
+      await execAsync('kill -9 ' + pids.join(' '), 1500).catch(() => {});
+      results.push({ port, killed: pids.length, pids: pids.map(Number) });
+    } catch (e) {
+      results.push({ port, error: String(e?.message || e) });
+    }
+  }
+  const totalKilled = results.reduce((s, r) => s + (r.killed || 0), 0);
+  console.log('[free-ports] cwd=' + cwd + ' results=' + JSON.stringify(results) + ' totalKilled=' + totalKilled);
+  return { success: true, killed: results, totalKilled };
+});
+
+// Stop AI process (Claude/Gemini) in a tab WITHOUT closing the tab.
+// SIGTERM → 800ms grace → SIGKILL fallback. Shell stays alive.
+// Why not Ctrl+C in PTY: TUI state-dependent (dropdown/picker/danger-zone all
+// behave differently), and double Ctrl+C requires guessing prompt text "again
+// to exit". SIGTERM is independent of Ink state — kernel delivers it directly.
+ipcMain.handle('terminal:stop-ai-process', async (event, tabId) => {
+  const term = terminals.get(tabId);
+  if (!term) return { success: false, error: 'tab not found' };
+
+  // BFS one level: find direct claude/gemini child of our shell PID.
+  // We do NOT walk deeper — nested shells inside Claude (bash tool, mcp procs)
+  // should NOT be killed; killing the parent CLI cascades cleanup naturally.
+  let childPid = null;
+  let processName = null;
+  try {
+    const psOut = await execAsync('ps -eo pid,ppid,command | grep -E " (claude|gemini)( |$)" | grep -v grep', 2000);
+    for (const line of (psOut || '').split('\n').filter(Boolean)) {
+      const m = line.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/);
+      if (!m) continue;
+      const [, pid, ppid, cmd] = m;
+      if (cmd.includes('Electron') || cmd.includes('electron')) continue;
+      if (Number(ppid) === term.pid) {
+        childPid = Number(pid);
+        processName = cmd.includes('claude') ? 'claude' : 'gemini';
+        break;
+      }
+    }
+  } catch (err) {
+    console.log('[StopAI] ps lookup failed for tab ' + tabId + ': ' + err.message);
+  }
+
+  if (!childPid) {
+    return { success: false, error: 'no AI process found' };
+  }
+
+  console.log('[StopAI] Tab ' + tabId + ': SIGTERM → pid=' + childPid + ' (' + processName + ')');
+  try {
+    process.kill(childPid, 'SIGTERM');
+  } catch (err) {
+    console.log('[StopAI] SIGTERM failed: ' + err.message);
+    return { success: false, error: err.message };
+  }
+
+  // Verify exit within 800ms. If still alive, SIGKILL.
+  return new Promise((resolve) => {
+    const start = Date.now();
+    const check = () => {
+      try {
+        process.kill(childPid, 0); // signal 0 = alive check
+        if (Date.now() - start >= 800) {
+          console.log('[StopAI] Tab ' + tabId + ': SIGTERM stalled, SIGKILL pid=' + childPid);
+          try { process.kill(childPid, 'SIGKILL'); } catch {}
+          resolve({ success: true, processName, escalated: true });
+          return;
+        }
+        setTimeout(check, 80);
+      } catch {
+        // ESRCH = process gone
+        console.log('[StopAI] Tab ' + tabId + ': ' + processName + ' exited cleanly in ' + (Date.now() - start) + 'ms');
+        resolve({ success: true, processName, escalated: false });
+      }
+    };
+    setTimeout(check, 80);
+  });
 });
 
 // Execute quick action command in terminal (fire-and-forget version)

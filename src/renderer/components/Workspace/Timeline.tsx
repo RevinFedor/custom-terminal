@@ -1,11 +1,13 @@
 import React, { useEffect, useLayoutEffect, useState, useCallback, useRef, useMemo } from 'react';
 import { createPortal } from 'react-dom';
 import { Maximize2, Copy, Minimize2, Pencil, Search, Trash2, StickyNote, ChevronDown, Check, Scissors, X, Zap } from 'lucide-react';
+import Tooltip from '../UI/Tooltip';
 import { terminalRegistry } from '../../utils/terminalRegistry';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { usePromptsStore } from '../../store/usePromptsStore';
 import EditRangePanel from './EditRangePanel';
+import HoverBridgeDebug from '../HoverBridgeDebug';
 
 const { ipcRenderer, clipboard } = window.require('electron');
 
@@ -382,6 +384,40 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   useEffect(() => {
     if (!rangeActionMenu) setDeleteConfirmMode(false);
   }, [rangeActionMenu]);
+
+  // Ref to context-menu root so we can measure its rect for the hover-bridge test.
+  const contextMenuRef = useRef<HTMLDivElement>(null);
+
+  // Auto-close context menu when cursor leaves the Timeline + menu + the implicit
+  // "bridge" area between them. Uses geometric hit-test (rectangles) instead of
+  // elementFromPoint — the gap between Timeline and the menu is empty space where
+  // elementFromPoint returns the terminal panel underneath, falsely triggering close.
+  useEffect(() => {
+    if (!contextMenu) return;
+    const onMove = (e: MouseEvent) => {
+      const tlEl = containerRef.current;
+      const menuEl = contextMenuRef.current;
+      if (!tlEl || !menuEl) return;
+      const tlRect = tlEl.getBoundingClientRect();
+      const menuRect = menuEl.getBoundingClientRect();
+      const { clientX: x, clientY: y } = e;
+
+      const inTimeline = x >= tlRect.left && x <= tlRect.right && y >= tlRect.top && y <= tlRect.bottom;
+      const inMenu = x >= menuRect.left && x <= menuRect.right && y >= menuRect.top && y <= menuRect.bottom;
+      // Bridge: horizontal corridor between menu.right and tlRect.left at the menu's
+      // vertical range (with a small Y padding so it's forgiving on top/bottom edges).
+      const bridgePad = 8;
+      const inBridge =
+        x >= menuRect.right &&
+        x <= tlRect.left &&
+        y >= Math.min(menuRect.top, tlRect.top) - bridgePad &&
+        y <= Math.max(menuRect.bottom, tlRect.bottom) + bridgePad;
+
+      if (!inTimeline && !inMenu && !inBridge) setContextMenu(null);
+    };
+    document.addEventListener('mousemove', onMove);
+    return () => document.removeEventListener('mousemove', onMove);
+  }, [contextMenu]);
   const [rewindPostPromptMode, setRewindPostPromptMode] = useState(false);
   const [rewindPostPromptText, setRewindPostPromptText] = useState('');
   const rewindPostPromptRef = useRef<HTMLTextAreaElement>(null);
@@ -395,8 +431,38 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   const notesPanelWidth = useUIStore(state => state.notesPanelWidth);
   const timelineTooltipWidth = useUIStore(state => state.timelineTooltipWidth);
   const setTimelineTooltipWidth = useUIStore(state => state.setTimelineTooltipWidth);
+  // Measured CSS `right:` value (px) that anchors popups to Timeline's left edge.
+  // Computed from real DOM rect — robust to HistoryPanel open/close, treeMode, window resize.
+  // Previously hardcoded as `notesPanelWidth + (treeMode ? 160 : 32) - 8` — incorrectly subtracted
+  // notesPanelWidth even when HistoryPanel was closed, causing 300px gap between popup and Timeline.
+  const [popupRightPx, setPopupRightPx] = useState<number>(40);
   const copyIncludeEditing = useUIStore(state => state.copyIncludeEditing);
   const copyIncludeReading = useUIStore(state => state.copyIncludeReading);
+  const copyIncludeUser = useUIStore(state => state.copyIncludeUser);
+  const copyIncludeClaude = useUIStore(state => state.copyIncludeClaude);
+  const copyIncludeText = useUIStore(state => state.copyIncludeText);
+  const copyIncludeThinking = useUIStore(state => state.copyIncludeThinking);
+  const copyIncludeBash = useUIStore(state => state.copyIncludeBash);
+  const copyIncludeTools = useUIStore(state => state.copyIncludeTools);
+  const copyIncludeSubagentResult = useUIStore(state => state.copyIncludeSubagentResult);
+  const copyIncludeSubagentHistory = useUIStore(state => state.copyIncludeSubagentHistory);
+  const debugHoverBridges = useUIStore(state => state.debugHoverBridges);
+
+  // All copy settings as a single object — spread into IPC invoke calls (range-copy, single-copy,
+  // edit-range source fetch, rewind compact). Centralises forwarding so adding a future flag
+  // doesn't require touching every callsite.
+  const copyFlags = {
+    includeEditing: copyIncludeEditing,
+    includeReading: copyIncludeReading,
+    includeUser: copyIncludeUser,
+    includeClaude: copyIncludeClaude,
+    includeText: copyIncludeText,
+    includeThinking: copyIncludeThinking,
+    includeBash: copyIncludeBash,
+    includeTools: copyIncludeTools,
+    includeSubagentResult: copyIncludeSubagentResult,
+    includeSubagentHistory: copyIncludeSubagentHistory,
+  };
   const setHistoryScrollToUuid = useUIStore(state => state.setHistoryScrollToUuid);
   const isHistoryOpen = useUIStore(state => state.historyPanelOpenTabs[tabId] ?? false);
   const historyVisibleUuids = useUIStore(state => state.historyVisibleUuids[tabId]);
@@ -547,6 +613,31 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     setIsExpanded(false);
     setTooltipCopied(false);
   }, [activeTooltipIndex]);
+
+  // Track Timeline's real left edge in viewport coords — derives the CSS `right:` value used by
+  // every popup that anchors to Timeline (context menu, range action, edit-range loading, note,
+  // fork tooltip). ResizeObserver fires when HistoryPanel toggles, treeMode flips, window resizes,
+  // sidebar reflows — all the cases where the hardcoded formula drifted.
+  useEffect(() => {
+    if (!isVisible) return;
+    const el = containerRef.current;
+    if (!el) return;
+    const measure = () => {
+      const rect = el.getBoundingClientRect();
+      // 8px overlap so popup border kisses Timeline left edge — matches old hardcoded `- 8`.
+      const next = Math.max(0, Math.round(window.innerWidth - rect.left + 8));
+      setPopupRightPx(prev => prev === next ? prev : next);
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    // ResizeObserver fires on element size changes, but Timeline's `left` can change when an
+    // adjacent panel resizes without our element changing size. Observe document.body too —
+    // it covers the window-resize and sibling-reflow cases.
+    if (document.body) ro.observe(document.body);
+    window.addEventListener('resize', measure);
+    return () => { ro.disconnect(); window.removeEventListener('resize', measure); };
+  }, [isVisible, isHistoryOpen, treeMode, notesPanelWidth]);
 
   // CMD key tracking — tooltip only appears when CMD is held
   useEffect(() => {
@@ -1248,24 +1339,19 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         const crossesBoundary = hasCompactInRange || sids.size > 1;
         if (crossesBoundary) range.startIndex = 0;
 
-        // Position popup near the SECOND click (the entry the user just clicked on),
-        // not Math.max(start, end) which always picks the lower-index point regardless
-        // of click order. Center vertically on the clicked entry so it doesn't depend on
-        // entry height (group expansion makes some segments tall).
-        const POPUP_W = 260;
+        // Position popup vertically centred on the SECOND click (the entry the user just
+        // clicked on). Horizontal anchor is `right:` CSS at render time (popup hugs Timeline
+        // left edge), so we no longer compute x from containerRect — that math drifted when
+        // Timeline was on the right side of a wide viewport.
         const POPUP_H = 180;
         const targetEl = segmentRefs.current[endIndex];
-        const containerRect = containerRef.current?.getBoundingClientRect();
         const targetRect = targetEl?.getBoundingClientRect();
-        let x = containerRect ? containerRect.left - POPUP_W - 12 : 100;
         let y = targetRect
           ? targetRect.top + targetRect.height / 2 - POPUP_H / 2
           : 100;
 
-        // Clamp to viewport on all four sides — avoids cut-off near top/bottom edges.
+        // Clamp vertically — top/bottom only, horizontal handled by `right:` CSS.
         const MARGIN = 10;
-        if (x < MARGIN) x = MARGIN;
-        if (x + POPUP_W > window.innerWidth - MARGIN) x = window.innerWidth - POPUP_W - MARGIN;
         if (y < MARGIN) y = MARGIN;
         if (y + POPUP_H > window.innerHeight - MARGIN) y = window.innerHeight - POPUP_H - MARGIN;
 
@@ -1274,7 +1360,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         if (e) e.stopPropagation();
 
         setRangeActionMenu({
-          x, y, range,
+          x: 0, y, range,
           startUuid: entries[range.startIndex].uuid,
           endUuid: entries[range.endIndex].uuid,
           crossesBoundary,
@@ -1436,30 +1522,22 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   const handleRightClick = (e: React.MouseEvent, entry: TimelineEntry) => {
     e.preventDefault();
 
-    // Context menu dimensions (approximate)
-    const menuWidth = 160;
+    // Position: anchor popup's RIGHT edge to Timeline's LEFT edge (mirrors note tooltip).
+    // X is no longer derived from cursor — vertical position follows the dot, horizontal is
+    // pinned. Without this popup drifted into the centre of the screen when user clicked the
+    // right half of the 32px-wide dot. We store x=0 and rely on `right:` CSS at render time
+    // (see context-menu Portal); y is centred on the clicked dot.
     const menuHeight = selectionStartIdRef.current ? 40 : 90;
+    const targetEl = segmentRefs.current[entries.findIndex(en => en.uuid === entry.uuid)];
+    const targetRect = targetEl?.getBoundingClientRect();
+    let y = targetRect ? targetRect.top + targetRect.height / 2 - menuHeight / 2 : e.pageY - menuHeight / 2;
 
-    // Position: right-center of cursor
-    let x = e.pageX + 4;
-    let y = e.pageY - menuHeight / 2;
+    // Clamp to viewport top/bottom
+    if (y + menuHeight > window.innerHeight - 10) y = window.innerHeight - menuHeight - 10;
+    if (y < 10) y = 10;
 
-    // Check right boundary
-    if (x + menuWidth > window.innerWidth) {
-      x = e.pageX - menuWidth - 8;
-    }
-
-    // Check bottom boundary
-    if (y + menuHeight > window.innerHeight) {
-      y = window.innerHeight - menuHeight - 10;
-    }
-
-    // Check top boundary
-    if (y < 10) {
-      y = 10;
-    }
-
-    setContextMenu({ x, y, entry });
+    // x stays 0 — render layer reads `right` from notesPanelWidth + timeline width.
+    setContextMenu({ x: 0, y, entry });
   };
 
   const startRangeSelection = (entry: TimelineEntry) => {
@@ -1619,8 +1697,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
           cwd,
           startUuid,
           endUuid,
-          includeEditing: copyIncludeEditing,
-          includeReading: copyIncludeReading,
+          ...copyFlags,
         });
 
         if (!result.success) {
@@ -1648,8 +1725,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         cwd,
         startUuid,
         endUuid,
-        includeEditing: copyIncludeEditing,
-        includeReading: copyIncludeReading,
+        ...copyFlags,
       });
 
       setCopyingRange(null);
@@ -1753,12 +1829,23 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         setIsNoteEditing(false);
         setActiveNoteIndex(null);
       }
-      // Close range action menu on outside click (skip if just opened OR
-      // if confirm/postPrompt mode is active — those need explicit user action).
+      // Close range action menu on outside click.
+      // Earlier we skipped this for deleteConfirmMode/postPromptMode "to avoid mouse-move dismiss"
+      // — but mouseLeave already does that job (it's the disabled handler, not click-outside).
+      // Confirm/postPrompt blocked outside-click meant user had no escape if the popup was in the
+      // way; only path was hitting Cancel inside the popup. Restoring outside-click as a global
+      // dismiss matches every other Timeline popup and matches user expectation.
+      // Popup buttons stop propagation via e.stopPropagation() (see popup render), so clicking
+      // inside the popup never reaches this handler.
       if (justSetRangeMenuRef.current) {
         justSetRangeMenuRef.current = false;
-      } else if (!deleteConfirmMode && !postPromptMode) {
-        setRangeActionMenu(null);
+      } else {
+        if (rangeActionMenu) {
+          setRangeActionMenu(null);
+          setDeleteConfirmMode(false);
+          setPostPromptMode(false);
+          setPostPromptText('');
+        }
       }
       // Cancel range selection if clicking outside timeline
       if (selectionStartIdRef.current && containerRef.current && !containerRef.current.contains(e.target as Node)) {
@@ -1947,6 +2034,35 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
 
   // ── Note handlers ──
 
+  // Copy a single entry: prompt + all assistant responses up to next user/compact.
+  // For compact entry — backend embeds compactSummary from the next isCompactSummary user.
+  const handleCopySingleEntry = async (entry: TimelineEntry) => {
+    if (!sessionId) return;
+    setContextMenu(null);
+    const channel = isGemini ? 'gemini:copy-range' : 'claude:copy-range';
+    try {
+      const result = await ipcRenderer.invoke(channel, {
+        sessionId,
+        cwd,
+        startUuid: entry.uuid,
+        endUuid: entry.uuid,
+        ...copyFlags,
+      });
+      if (result.success && result.content) {
+        clipboard.writeText(result.content);
+        useUIStore.getState().showToast('Скопировано', 'success', 1500);
+      } else {
+        useUIStore.getState().showToast(
+          'Не удалось скопировать: ' + (result.error || 'unknown'),
+          'error', 3000
+        );
+      }
+    } catch (err: any) {
+      console.error('[Timeline] Single copy failed:', err);
+      useUIStore.getState().showToast('Ошибка копирования', 'error', 3000);
+    }
+  };
+
   const handleAddNote = (entry: TimelineEntry) => {
     setContextMenu(null);
     setNoteEditText(notes[entry.uuid] || '');
@@ -1983,6 +2099,92 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     setNotes(prev => ({ ...prev, [entry.uuid]: text }));
     setNotePositions(prev => ({ ...prev, [entry.uuid]: noteEditPosition }));
     setIsNoteEditing(false);
+  };
+
+  // Move note one visual position up or down on the timeline.
+  // direction=-1 → move up (visually closer to top of timeline).
+  // direction=+1 → move down. Flips before↔after / re-anchors to neighbour as needed.
+  // Skips entries that already have a note (avoids overwriting via UNIQUE(entry_uuid, session_id)).
+  const moveNote = async (entry: TimelineEntry, direction: -1 | 1) => {
+    const text = (noteEditText.trim() || notes[entry.uuid] || '').trim();
+    if (!text) return;
+    const currentPos = notePositions[entry.uuid] || 'before';
+    if (currentPos === 'dot') return; // dot notes don't move
+    const currentIdx = entries.findIndex(e => e.uuid === entry.uuid);
+    if (currentIdx < 0) return;
+
+    // Compute next anchor + position
+    let nextAnchorUuid: string | null = null;
+    let nextPosition: 'before' | 'after' = currentPos;
+
+    if (direction === -1) {
+      // Moving up
+      if (currentPos === 'after') {
+        // "after X" → "before X" (visually flips above the dot)
+        nextAnchorUuid = entry.uuid;
+        nextPosition = 'before';
+      } else {
+        // "before X" → "after X-1", or X-2, ... (skip entries that already have a note)
+        for (let i = currentIdx - 1; i >= 0; i--) {
+          const cand = entries[i];
+          if (cand.uuid === entry.uuid) continue;
+          if (notes[cand.uuid]) continue;
+          nextAnchorUuid = cand.uuid;
+          nextPosition = 'after';
+          break;
+        }
+      }
+    } else {
+      // Moving down
+      if (currentPos === 'before') {
+        nextAnchorUuid = entry.uuid;
+        nextPosition = 'after';
+      } else {
+        for (let i = currentIdx + 1; i < entries.length; i++) {
+          const cand = entries[i];
+          if (cand.uuid === entry.uuid) continue;
+          if (notes[cand.uuid]) continue;
+          nextAnchorUuid = cand.uuid;
+          nextPosition = 'before';
+          break;
+        }
+      }
+    }
+
+    if (!nextAnchorUuid) return; // can't move further in this direction
+
+    // If anchor doesn't change (just position flip on same entry), do a single save.
+    // Otherwise: delete old, save under new anchor.
+    if (nextAnchorUuid === entry.uuid) {
+      await ipcRenderer.invoke('timeline:save-note', {
+        entryUuid: entry.uuid, sessionId, tabId, content: text, position: nextPosition,
+      });
+      setNotePositions(prev => ({ ...prev, [entry.uuid]: nextPosition }));
+      // Keep notes[uuid] in sync if user was actively editing
+      if (noteEditText.trim()) setNotes(prev => ({ ...prev, [entry.uuid]: text }));
+    } else {
+      await ipcRenderer.invoke('timeline:delete-note', { entryUuid: entry.uuid, sessionId });
+      await ipcRenderer.invoke('timeline:save-note', {
+        entryUuid: nextAnchorUuid, sessionId, tabId, content: text, position: nextPosition,
+      });
+      setNotes(prev => {
+        const next = { ...prev };
+        delete next[entry.uuid];
+        next[nextAnchorUuid!] = text;
+        return next;
+      });
+      setNotePositions(prev => {
+        const next = { ...prev };
+        delete next[entry.uuid];
+        next[nextAnchorUuid!] = nextPosition;
+        return next;
+      });
+      // Update active index so tooltip follows the note to its new anchor
+      const newIdx = entries.findIndex(e => e.uuid === nextAnchorUuid);
+      if (newIdx >= 0) setActiveNoteIndex(newIdx);
+    }
+    // Stay in edit mode so user can continue moving without re-opening
+    setNoteEditPosition(nextPosition);
   };
 
   const handleDeleteNote = async (entry: TimelineEntry) => {
@@ -2182,10 +2384,10 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
           {entries.length > 0 && entries[0].sessionId && sessionBoundaries.length > 0 &&
             sessionBoundaries.some(b => b.childSessionId === entries[0].sessionId) &&
             !forkMarkers.some(m => !m.entry_uuids || m.entry_uuids.length === 0) && (  /* any fork marker (even hidden) suppresses this */
+            <Tooltip content="Plan mode - context was cleared here">
             <div
               className="flex-shrink-0 w-full flex items-center justify-center"
               style={{ height: '8px' }}
-              title="Plan mode - context was cleared here"
             >
               <div
                 style={{
@@ -2198,13 +2400,14 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                 }}
               />
             </div>
+            </Tooltip>
           )}
           {/* Fork marker at the very beginning (empty snapshot = fork before any entries) */}
           {forkMarkers.some(m => !m.hidden && (!m.entry_uuids || m.entry_uuids.length === 0)) && entries.length > 0 && (
+            <Tooltip content="Fork point - this session was forked from here">
             <div
               className="flex-shrink-0 w-full flex items-center justify-center"
               style={{ height: '8px' }}
-              title="Fork point - this session was forked from here"
             >
               <div
                 style={{
@@ -2217,6 +2420,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                 }}
               />
             </div>
+            </Tooltip>
           )}
           {entries.map((entry, index) => {
             const groupInfo = groupMap.get(index);
@@ -2311,6 +2515,16 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
             } else if (entryIsSubAgent) {
               dotColor = isHovered ? '#818cf8' : (isPromptVisible ? '#7c86f0' : '#5c63b8');
               dotGlow = isHovered ? '0 0 10px rgba(129, 140, 248, 0.5)' : (isPromptVisible ? '0 0 6px rgba(129, 140, 248, 0.2)' : 'none');
+            } else if (entry.docsEdited && entry.docsEdited.length > 0) {
+              // User turn that resulted in docs/CLAUDE.md edits — colour the user dot green
+              // instead of emitting a separate docs_edit dot. Edit takes precedence over search:
+              // editing is a "stronger" signal (file actually changed) than reading.
+              dotColor = isHovered ? '#4ade80' : (isPromptVisible ? '#3cc46e' : '#2a8a4e');
+              dotGlow = isHovered ? '0 0 10px rgba(74, 222, 128, 0.5)' : (isPromptVisible ? '0 0 6px rgba(74, 222, 128, 0.25)' : 'none');
+            } else if (entry.docsSearchQueries && entry.docsSearchQueries.length > 0) {
+              // User turn that triggered docs_search but no edits — lime tone
+              dotColor = isHovered ? '#bef264' : (isPromptVisible ? '#8cb82a' : '#6a8f1e');
+              dotGlow = isHovered ? '0 0 10px rgba(190, 242, 100, 0.5)' : (isPromptVisible ? '0 0 6px rgba(190, 242, 100, 0.25)' : 'none');
             } else {
               dotColor = isHovered ? '#fff' : (isPromptVisible ? '#ccc' : '#999');
               dotGlow = isHovered ? '0 0 10px rgba(255, 255, 255, 0.5)' : (isPromptVisible ? '0 0 6px rgba(255, 255, 255, 0.15)' : 'none');
@@ -2579,10 +2793,10 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                 })()}
                 {/* Last boundary separator — full-width unified line between old history and current dialog */}
                 {index === lastBoundaryIndex && (
+                  <Tooltip content="Current session starts below">
                   <div
                     className="flex-shrink-0 w-full flex items-center justify-center"
                     style={{ height: '8px' }}
-                    title="Current session starts below"
                   >
                     <div
                       style={{
@@ -2592,6 +2806,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                       }}
                     />
                   </div>
+                  </Tooltip>
                 )}
                 {/* Fork marker (only outside old history zone — inside it's redundant) */}
                 {forkMarker && !isOldHistory && (
@@ -2640,10 +2855,10 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                 )}
                 {/* Plan mode marker (only outside old history zone) */}
                 {isPlanModeBoundary && !isOldHistory && (
+                  <Tooltip content="Plan mode - context was cleared here">
                   <div
                     className="flex-shrink-0 w-full flex items-center justify-center"
                     style={{ height: '8px' }}
-                    title="Plan mode - context was cleared here"
                   >
                     <div
                       style={{
@@ -2656,6 +2871,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                       }}
                     />
                   </div>
+                  </Tooltip>
                 )}
               </React.Fragment>
             );
@@ -2888,7 +3104,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                 onContextMenu={isLoading ? (e) => {
                   e.preventDefault();
                   e.stopPropagation();
-                  setEditRangeLoadingMenu({ x: e.clientX, y: e.clientY });
+                  // y from cursor (popup follows vertical click point), x ignored (right-anchored).
+                  setEditRangeLoadingMenu({ x: 0, y: e.clientY });
                 } : undefined}
               />
               {label && (
@@ -3083,19 +3300,24 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         {/* Tooltip Portal with CSS Bridge */}
         {isVisible && activeTooltipIndex !== null && currentActiveEntry && tooltipPos && (
           <TooltipPortal>
-            {/* Outer wrapper — explicit height ensures bridge connects tooltip to entry */}
+            {/* Outer wrapper — explicit height ensures bridge connects tooltip to entry.
+                In debug mode, the wrapper itself is tinted red so the user can SEE the
+                hover-corridor (the wrapper IS the bridge here — it sits between the
+                visible tooltip content and the Timeline strip on the right). */}
             <div
               ref={tooltipRef}
               onMouseEnter={() => { isMouseInTooltipRef.current = true; }}
               onMouseLeave={(e) => { if (!isResizingTooltipRef.current) { isMouseInTooltipRef.current = false; handleMouseLeaveTooltipArea(); } }}
               style={{
                 position: 'fixed',
-                right: `${notesPanelWidth + (treeMode ? 160 : 32) - 8}px`,
+                right: `${popupRightPx}px`,
                 top: `${tooltipPos.wTop}px`,
                 height: `${tooltipPos.wH}px`,
                 zIndex: 10010,
                 display: 'flex',
                 flexDirection: 'row',
+                backgroundColor: debugHoverBridges ? 'rgba(239, 68, 68, 0.30)' : undefined,
+                outline: debugHoverBridges ? '1px dashed rgba(239, 68, 68, 0.8)' : undefined,
                 alignItems: tooltipPos.vAlign,
               }}
             >
@@ -3166,13 +3388,14 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                       <span className="text-[10px] text-white/30">{new Date(currentActiveEntry.timestamp).toLocaleTimeString()}</span>
                       <div className="flex-1" />
                       {(currentActiveEntry.content.length > 200 || isExpanded) && (
+                        <Tooltip content={isExpanded ? "Свернуть" : "Развернуть полностью"}>
                         <button
                           onClick={(e) => { e.stopPropagation(); setIsExpanded(!isExpanded); }}
                           className="p-1 rounded hover:bg-white/10 text-white/40 hover:text-white transition-colors cursor-pointer shrink-0"
-                          title={isExpanded ? "Свернуть" : "Развернуть полностью"}
                         >
                           {isExpanded ? <Minimize2 size={12} /> : <Maximize2 size={12} />}
                         </button>
+                        </Tooltip>
                       )}
                     </div>
                   </>
@@ -3254,13 +3477,14 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                         {tooltipCopied ? 'Скопировано' : 'Copy'}
                       </button>
                       {(currentActiveEntry.content.length > 200 || isExpanded) && (
+                        <Tooltip content={isExpanded ? "Свернуть" : "Развернуть полностью"}>
                         <button
                           onClick={(e) => { e.stopPropagation(); setIsExpanded(!isExpanded); }}
                           className="p-1 rounded hover:bg-white/10 text-white/40 hover:text-white transition-colors cursor-pointer shrink-0 ml-1"
-                          title={isExpanded ? "Свернуть" : "Развернуть полностью"}
                         >
                           {isExpanded ? <Minimize2 size={12} /> : <Maximize2 size={12} />}
                         </button>
+                        </Tooltip>
                       )}
                     </div>
                   </>
@@ -3294,23 +3518,26 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                         {tooltipCopied ? 'Скопировано' : 'Копировать'}
                       </button>
                       {(currentActiveEntry.content.length > 200 || isExpanded) && (
+                        <Tooltip content={isExpanded ? "Свернуть" : "Развернуть полностью"}>
                         <button
                           onClick={(e) => { e.stopPropagation(); setIsExpanded(!isExpanded); }}
                           className="p-1 rounded hover:bg-white/10 text-white/40 hover:text-white transition-colors cursor-pointer shrink-0 ml-1"
-                          title={isExpanded ? "Свернуть" : "Развернуть полностью"}
                         >
                           {isExpanded ? <Minimize2 size={12} /> : <Maximize2 size={12} />}
                         </button>
+                        </Tooltip>
                       )}
                     </div>
                     {(() => {
                       const md = describeModel(currentActiveEntry.responseModel);
                       if (!md) return null;
                       return (
-                        <div className="flex items-center mt-0.5 text-[10px] shrink-0" title={'Provider: ' + md.provider + ' · Model: ' + currentActiveEntry.responseModel + (currentActiveEntry.responseHasThinking ? ' · thinking' : '')}>
+                        <Tooltip content={'Provider: ' + md.provider + ' · Model: ' + currentActiveEntry.responseModel + (currentActiveEntry.responseHasThinking ? ' · thinking' : '')}>
+                        <div className="flex items-center mt-0.5 text-[10px] shrink-0">
                           <span style={{ color: md.color }}>{md.provider} · {md.short}</span>
                           {currentActiveEntry.responseHasThinking && <span className="ml-1.5" style={{ color: '#b4b9f9' }}>· think</span>}
                         </div>
+                        </Tooltip>
                       );
                     })()}
                   </>
@@ -3320,8 +3547,44 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                     {notes[currentActiveEntry.uuid] && (notePositions[currentActiveEntry.uuid] || 'before') === 'dot' && (
                       <div className="flex items-start gap-1.5 pb-1.5 mb-1.5 border-b border-purple-500/15 shrink-0">
                         <StickyNote size={10} className="shrink-0 mt-0.5" style={{ color: '#9333ea' }} />
-                        <div className="text-purple-300/80 leading-snug font-mono text-[10px] line-clamp-2" style={{ whiteSpace: 'pre-wrap' }}>
+                        <div className="text-purple-300/80 leading-snug font-mono text-[10px] line-clamp-2 flex-1" style={{ whiteSpace: 'pre-wrap' }}>
                           {notes[currentActiveEntry.uuid]}
+                        </div>
+                        <Tooltip content="Редактировать заметку">
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleAddNote(currentActiveEntry);
+                          }}
+                          className="p-0.5 rounded hover:bg-purple-500/20 text-purple-400/60 hover:text-purple-300 transition-colors cursor-pointer shrink-0"
+                        >
+                          <Pencil size={10} />
+                        </button>
+                        </Tooltip>
+                      </div>
+                    )}
+                    {/* Docs-edit / docs-search inline preview — attached to user-entry that triggered them.
+                        Previously rendered as separate green dots on timeline; consolidated here so each
+                        prompt has at most one dot, with docs-info surfaced on hover. */}
+                    {currentActiveEntry.docsEdited && currentActiveEntry.docsEdited.length > 0 && (
+                      <div className="flex items-start gap-1.5 pb-1.5 mb-1.5 border-b border-green-500/15 shrink-0">
+                        <Pencil size={10} className="shrink-0 mt-0.5" style={{ color: '#4ade80' }} />
+                        <div className="leading-snug font-mono text-[10px] flex-1" style={{ color: 'rgba(74, 222, 128, 0.85)' }}>
+                          <div className="font-medium mb-0.5">Docs updated</div>
+                          {currentActiveEntry.docsEdited.map((f: string, i: number) => (
+                            <div key={i} style={{ opacity: 0.85 }}>{f}</div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                    {currentActiveEntry.docsSearchQueries && currentActiveEntry.docsSearchQueries.length > 0 && (
+                      <div className="flex items-start gap-1.5 pb-1.5 mb-1.5 border-b border-lime-500/15 shrink-0">
+                        <Search size={10} className="shrink-0 mt-0.5" style={{ color: '#bef264' }} />
+                        <div className="leading-snug font-mono text-[10px] flex-1" style={{ color: 'rgba(190, 242, 100, 0.85)' }}>
+                          <div className="font-medium mb-0.5">Docs search</div>
+                          {currentActiveEntry.docsSearchQueries.map((q: string, i: number) => (
+                            <div key={i} style={{ opacity: 0.85 }}>«{q}»</div>
+                          ))}
                         </div>
                       </div>
                     )}
@@ -3352,23 +3615,26 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                         {tooltipCopied ? 'Скопировано' : 'Копировать'}
                       </button>
                       {(currentActiveEntry.content.length > 200 || isExpanded) && (
+                        <Tooltip content={isExpanded ? "Свернуть" : "Развернуть полностью"}>
                         <button
                           onClick={(e) => { e.stopPropagation(); setIsExpanded(!isExpanded); }}
                           className="p-1 rounded hover:bg-white/10 text-white/40 hover:text-white transition-colors cursor-pointer shrink-0 ml-1"
-                          title={isExpanded ? "Свернуть" : "Развернуть полностью"}
                         >
                           {isExpanded ? <Minimize2 size={12} /> : <Maximize2 size={12} />}
                         </button>
+                        </Tooltip>
                       )}
                     </div>
                     {(() => {
                       const md = describeModel(currentActiveEntry.responseModel);
                       if (!md) return null;
                       return (
-                        <div className="flex items-center mt-0.5 text-[10px] shrink-0" title={'Provider: ' + md.provider + ' · Model: ' + currentActiveEntry.responseModel + (currentActiveEntry.responseHasThinking ? ' · thinking' : '')}>
+                        <Tooltip content={'Provider: ' + md.provider + ' · Model: ' + currentActiveEntry.responseModel + (currentActiveEntry.responseHasThinking ? ' · thinking' : '')}>
+                        <div className="flex items-center mt-0.5 text-[10px] shrink-0">
                           <span style={{ color: md.color }}>{md.provider} · {md.short}</span>
                           {currentActiveEntry.responseHasThinking && <span className="ml-1.5" style={{ color: '#b4b9f9' }}>· think</span>}
                         </div>
+                        </Tooltip>
                       );
                     })()}
                   </>
@@ -3393,7 +3659,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
               onMouseLeave={() => setEditRangeLoadingMenu(null)}
               style={{
                 position: 'fixed',
-                left: editRangeLoadingMenu.x,
+                // Right-anchor: same formula as note tooltip / context menu / range action menu.
+                right: `${popupRightPx}px`,
                 top: editRangeLoadingMenu.y,
                 backgroundColor: '#1a1a1a',
                 border: '1px solid #333',
@@ -3437,10 +3704,13 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         {isVisible && contextMenu && (
           <TooltipPortal>
             <div
-              onMouseLeave={() => setContextMenu(null)}
+              ref={contextMenuRef}
+              data-timeline-context-menu
               style={{
                 position: 'fixed',
-                left: contextMenu.x,
+                // Right edge of menu pinned to left edge of Timeline (-8px overlap, matches note tooltip).
+                // Same anchor regardless of where cursor clicked inside the 32px-wide dot.
+                right: `${popupRightPx}px`,
                 top: contextMenu.y,
                 backgroundColor: '#1a1a1a',
                 border: '1px solid #333',
@@ -3453,6 +3723,23 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
             >
               {!selectionStartId ? (
                 <>
+                  {/* Copy single entry — for user (prompt + responses) or compact (with summary).
+                      Skipped for docs_edit/docs_search/continued — those have no copyable content. */}
+                  {(contextMenu.entry.type === 'user' || contextMenu.entry.type === 'compact') && (
+                    <>
+                      <button
+                        className="w-full text-left px-3 py-2 text-xs text-white hover:bg-blue-600/80 rounded transition-colors cursor-pointer flex items-center gap-2"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleCopySingleEntry(contextMenu.entry);
+                        }}
+                      >
+                        <Copy size={12} />
+                        {contextMenu.entry.type === 'compact' ? 'Копировать compact' : 'Копировать'}
+                      </button>
+                      <div className="border-t border-white/10 my-1" />
+                    </>
+                  )}
                   <button
                     className="w-full text-left px-3 py-2 text-xs text-purple-400 hover:bg-purple-600/20 rounded transition-colors cursor-pointer flex items-center gap-2"
                     onClick={(e) => {
@@ -3478,9 +3765,9 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                         {rewindState ? (rewindState.phase === 'compacting' ? 'Компакт...' : rewindState.phase === 'rewinding' ? 'Откат...' : 'Вставка...') : 'Откатиться'}
                       </button>
                       {isActive && !rewindState && (
+                        <Tooltip content="Откатиться с инструкцией">
                         <button
                           className="px-2 py-2 text-xs text-amber-400/60 hover:bg-amber-600/30 hover:text-amber-300 transition-colors cursor-pointer border-l border-white/10"
-                          title="Откатиться с инструкцией"
                           onClick={(e) => {
                             e.stopPropagation();
                             setRewindPostPromptMode(true);
@@ -3490,6 +3777,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                         >
                           ▶
                         </button>
+                        </Tooltip>
                       )}
                     </div>
                   ) : (
@@ -3560,6 +3848,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                 </button>
               )}
             </div>
+            <HoverBridgeDebug menuRef={contextMenuRef} containerRef={containerRef} />
           </TooltipPortal>
         )}
 
@@ -3577,13 +3866,17 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
               onClick={(e) => e.stopPropagation()}
               style={{
                 position: 'fixed',
-                left: rangeActionMenu.x,
+                // Right-anchor: same formula as note tooltip / context menu — popup hugs Timeline's
+                // left edge regardless of where range selection ended. Previous left-based math
+                // (containerRect.left - POPUP_W - 12) drifted when Timeline was at the right edge
+                // of a wide viewport, putting the popup mid-terminal.
+                right: `${popupRightPx}px`,
                 top: rangeActionMenu.y,
                 backgroundColor: '#1a1a1a',
                 border: `1px solid ${deleteConfirmMode ? '#ef4444' : postPromptMode ? '#ec4899' : '#333'}`,
                 borderRadius: '6px',
                 padding: '4px',
-                zIndex: 10001,
+                zIndex: 10020,
                 minWidth: deleteConfirmMode ? '260px' : postPromptMode ? '320px' : '180px',
                 maxWidth: postPromptMode ? '400px' : undefined,
                 boxShadow: deleteConfirmMode
@@ -3671,9 +3964,9 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                       >
                         Редактировать
                       </button>
+                      <Tooltip content="Добавить инструкцию к промпту">
                       <button
                         className="px-2 py-2 text-xs text-pink-400/60 hover:bg-pink-600/30 hover:text-pink-300 transition-colors cursor-pointer border-l border-white/10"
-                        title="Добавить инструкцию к промпту"
                         onClick={(e) => {
                           e.stopPropagation();
                           setPostPromptMode(true);
@@ -3683,9 +3976,10 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                       >
                         ▶
                       </button>
+                      </Tooltip>
+                      <Tooltip content="Открыть пустой чат (без Gemini)">
                       <button
                         className="px-2 py-2 text-xs text-pink-400/60 hover:bg-pink-600/30 hover:text-pink-300 transition-colors cursor-pointer border-l border-white/10 flex items-center justify-center"
-                        title="Открыть пустой чат (без Gemini)"
                         onClick={async (e) => {
                           e.stopPropagation();
                           const { range, startUuid, endUuid } = rangeActionMenu;
@@ -3712,8 +4006,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                           try {
                             const result = await ipcRenderer.invoke('claude:copy-range', {
                               sessionId, cwd, startUuid, endUuid,
-                              includeEditing: copyIncludeEditing,
-                              includeReading: copyIncludeReading,
+                              ...copyFlags,
                             });
                             if (result.success) {
                               setEditRangeState({ range, phase: 'ready', sourceContent: result.content, compactText: '', autoEditInitial: true });
@@ -3728,6 +4021,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                       >
                         <Pencil size={11} />
                       </button>
+                      </Tooltip>
                     </div>
                   )}
                   {!isGemini && (
@@ -3813,13 +4107,15 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
               }}
               style={{
                 position: 'fixed',
-                right: `${notesPanelWidth + (treeMode ? 160 : 32) - 8}px`,
+                right: `${popupRightPx}px`,
                 top: `${forkTooltipPos.wTop}px`,
                 height: `${forkTooltipPos.wH}px`,
                 zIndex: 10002,
                 display: 'flex',
                 flexDirection: 'row',
                 alignItems: 'center',
+                backgroundColor: debugHoverBridges ? 'rgba(239, 68, 68, 0.30)' : undefined,
+                outline: debugHoverBridges ? '1px dashed rgba(239, 68, 68, 0.8)' : undefined,
               }}
             >
               <div
@@ -3878,13 +4174,15 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
               onMouseLeave={(e) => { isMouseInNoteTooltipRef.current = false; handleMouseLeaveNoteTooltip(); }}
               style={{
                 position: 'fixed',
-                right: `${notesPanelWidth + (treeMode ? 160 : 32) - 8}px`,
+                right: `${popupRightPx}px`,
                 top: `${noteTooltipPos.wTop}px`,
                 height: `${noteTooltipPos.wH}px`,
                 zIndex: 10002,
                 display: 'flex',
                 flexDirection: 'row',
                 alignItems: 'center',
+                backgroundColor: debugHoverBridges ? 'rgba(239, 68, 68, 0.30)' : undefined,
+                outline: debugHoverBridges ? '1px dashed rgba(239, 68, 68, 0.8)' : undefined,
               }}
             >
               <div
@@ -3910,41 +4208,98 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                   <>
                     <div className="flex items-center justify-between">
                       <span className="text-purple-400 font-medium text-[11px]">Заметка</span>
-                      {/* Position selector */}
-                      <div className="flex items-center gap-0.5 bg-white/5 rounded p-0.5">
-                        {([
-                          { value: 'before' as const, title: 'До точки', icon: (
-                            <svg width="14" height="14" viewBox="0 0 14 14">
-                              <rect x="4" y="2" width="6" height="2" rx="0.5" fill="currentColor" />
-                              <circle cx="7" cy="9" r="2.5" fill="currentColor" opacity="0.4" />
-                            </svg>
-                          )},
-                          { value: 'dot' as const, title: 'На точке', icon: (
-                            <svg width="14" height="14" viewBox="0 0 14 14">
-                              <circle cx="7" cy="7" r="3" fill="currentColor" />
-                            </svg>
-                          )},
-                          { value: 'after' as const, title: 'После точки', icon: (
-                            <svg width="14" height="14" viewBox="0 0 14 14">
-                              <circle cx="7" cy="5" r="2.5" fill="currentColor" opacity="0.4" />
-                              <rect x="4" y="10" width="6" height="2" rx="0.5" fill="currentColor" />
-                            </svg>
-                          )},
-                        ]).map(opt => (
-                          <button
-                            key={opt.value}
-                            onClick={(e) => { e.stopPropagation(); setNoteEditPosition(opt.value); }}
-                            title={opt.title}
-                            className="p-1 rounded transition-colors cursor-pointer"
-                            style={{
-                              color: noteEditPosition === opt.value ? '#c084fc' : 'rgba(255,255,255,0.3)',
-                              backgroundColor: noteEditPosition === opt.value ? 'rgba(168, 85, 247, 0.15)' : 'transparent',
-                            }}
-                          >
-                            {opt.icon}
-                          </button>
-                        ))}
-                      </div>
+                      {(() => {
+                        const hasExisting = !!notes[activeNoteEntry.uuid];
+                        const savedPos = notePositions[activeNoteEntry.uuid] || 'before';
+                        // For existing notes that aren't on the dot → show ↑/↓ arrows that reposition the note
+                        if (hasExisting && savedPos !== 'dot') {
+                          const idx = entries.findIndex(e => e.uuid === activeNoteEntry.uuid);
+                          // Compute whether arrows are enabled (mirrors moveNote search logic)
+                          const canUp = (() => {
+                            if (savedPos === 'after') return true;
+                            for (let i = idx - 1; i >= 0; i--) {
+                              if (entries[i].uuid !== activeNoteEntry.uuid && !notes[entries[i].uuid]) return true;
+                            }
+                            return false;
+                          })();
+                          const canDown = (() => {
+                            if (savedPos === 'before') return true;
+                            for (let i = idx + 1; i < entries.length; i++) {
+                              if (entries[i].uuid !== activeNoteEntry.uuid && !notes[entries[i].uuid]) return true;
+                            }
+                            return false;
+                          })();
+                          return (
+                            <div className="flex items-center gap-0.5 bg-white/5 rounded p-0.5">
+                              <Tooltip content="Переместить выше">
+                              <button
+                                onClick={(e) => { e.stopPropagation(); if (canUp) moveNote(activeNoteEntry, -1); }}
+                                disabled={!canUp}
+                                className="p-1 rounded transition-colors cursor-pointer disabled:cursor-not-allowed"
+                                style={{
+                                  color: canUp ? '#c084fc' : 'rgba(255,255,255,0.15)',
+                                }}
+                              >
+                                <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                                  <path d="M7 11V3M3.5 6.5L7 3l3.5 3.5"/>
+                                </svg>
+                              </button>
+                              </Tooltip>
+                              <Tooltip content="Переместить ниже">
+                              <button
+                                onClick={(e) => { e.stopPropagation(); if (canDown) moveNote(activeNoteEntry, 1); }}
+                                disabled={!canDown}
+                                className="p-1 rounded transition-colors cursor-pointer disabled:cursor-not-allowed"
+                                style={{
+                                  color: canDown ? '#c084fc' : 'rgba(255,255,255,0.15)',
+                                }}
+                              >
+                                <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                                  <path d="M7 3v8M3.5 7.5L7 11l3.5-3.5"/>
+                                </svg>
+                              </button>
+                              </Tooltip>
+                            </div>
+                          );
+                        }
+                        // New note OR existing dot-note → keep 3-button position selector
+                        return (
+                          <div className="flex items-center gap-0.5 bg-white/5 rounded p-0.5">
+                            {([
+                              { value: 'before' as const, title: 'До точки', icon: (
+                                <svg width="14" height="14" viewBox="0 0 14 14">
+                                  <rect x="4" y="2" width="6" height="2" rx="0.5" fill="currentColor" />
+                                  <circle cx="7" cy="9" r="2.5" fill="currentColor" opacity="0.4" />
+                                </svg>
+                              )},
+                              { value: 'dot' as const, title: 'На точке', icon: (
+                                <svg width="14" height="14" viewBox="0 0 14 14">
+                                  <circle cx="7" cy="7" r="3" fill="currentColor" />
+                                </svg>
+                              )},
+                              { value: 'after' as const, title: 'После точки', icon: (
+                                <svg width="14" height="14" viewBox="0 0 14 14">
+                                  <circle cx="7" cy="5" r="2.5" fill="currentColor" opacity="0.4" />
+                                  <rect x="4" y="10" width="6" height="2" rx="0.5" fill="currentColor" />
+                                </svg>
+                              )},
+                            ]).map(opt => (
+                              <Tooltip key={opt.value} content={opt.title}>
+                              <button
+                                onClick={(e) => { e.stopPropagation(); setNoteEditPosition(opt.value); }}
+                                className="p-1 rounded transition-colors cursor-pointer"
+                                style={{
+                                  color: noteEditPosition === opt.value ? '#c084fc' : 'rgba(255,255,255,0.3)',
+                                  backgroundColor: noteEditPosition === opt.value ? 'rgba(168, 85, 247, 0.15)' : 'transparent',
+                                }}
+                              >
+                                {opt.icon}
+                              </button>
+                              </Tooltip>
+                            ))}
+                          </div>
+                        );
+                      })()}
                     </div>
                     <textarea
                       ref={noteTextareaRef}
@@ -3988,13 +4343,14 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                       </button>
                       <div className="flex gap-1">
                         {notes[activeNoteEntry.uuid] && (
+                          <Tooltip content="Удалить заметку">
                           <button
                             onClick={(e) => { e.stopPropagation(); handleDeleteNote(activeNoteEntry); }}
                             className="p-1 rounded hover:bg-red-600/20 text-red-400/60 hover:text-red-400 transition-colors cursor-pointer"
-                            title="Удалить заметку"
                           >
                             <Trash2 size={12} />
                           </button>
+                          </Tooltip>
                         )}
                         <button
                           onClick={(e) => { e.stopPropagation(); handleSaveNote(activeNoteEntry); }}
@@ -4017,23 +4373,25 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                       <div className="text-white/80 leading-snug font-mono text-[11px] flex-1" style={{ whiteSpace: 'pre-wrap' }}>
                         {notes[activeNoteEntry.uuid]}
                       </div>
+                      <Tooltip content="Редактировать">
                       <button
                         onClick={(e) => { e.stopPropagation(); handleEditNote(activeNoteEntry); }}
                         className="p-1.5 rounded hover:bg-white/10 text-purple-400/60 hover:text-purple-300 transition-colors cursor-pointer shrink-0"
-                        title="Редактировать"
                       >
                         <Pencil size={12} />
                       </button>
+                      </Tooltip>
                     </div>
                     <div className="flex justify-between items-center pt-1 border-t border-white/5">
                       <span className="text-[10px] text-purple-400/40">Заметка</span>
+                      <Tooltip content="Удалить">
                       <button
                         onClick={(e) => { e.stopPropagation(); handleDeleteNote(activeNoteEntry); }}
                         className="p-1 rounded hover:bg-red-600/20 text-white/30 hover:text-red-400 transition-colors cursor-pointer"
-                        title="Удалить"
                       >
                         <Trash2 size={12} />
                       </button>
+                      </Tooltip>
                     </div>
                   </>
                 )}
@@ -4053,6 +4411,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
 
         {/* Scroll-to-bottom arrow — always mounted, visibility toggled via ref (no re-render on scroll) */}
         {isVisible && (
+          <Tooltip content="Scroll to bottom">
           <div
             ref={arrowRef}
             className="absolute left-1/2 -translate-x-1/2 cursor-pointer z-50 flex items-center justify-center"
@@ -4063,7 +4422,6 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
               }
               scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
             }}
-            title="Scroll to bottom"
             style={{
               display: 'none',
               bottom: '9px',
@@ -4077,6 +4435,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
           >
             <ChevronDown size={16} color="#a78bfa" strokeWidth={2.5} />
           </div>
+          </Tooltip>
         )}
 
         {/* Custom scroll indicator — always mounted, position updated via ref (no re-render on scroll) */}

@@ -408,6 +408,22 @@ class DatabaseManager {
     `).run(key, jsonValue);
   }
 
+  // Bulk-read all rows whose key starts with prefix (or every row when no prefix).
+  // Values are returned verbatim — this is the raw mirror of localStorage strings,
+  // so we DON'T re-parse JSON here (the renderer will use the result as plain strings).
+  getAllAppStateRaw(prefix) {
+    const rows = prefix
+      ? this.db.prepare('SELECT key, value FROM app_state WHERE key LIKE ?').all(prefix + '%')
+      : this.db.prepare('SELECT key, value FROM app_state').all();
+    const out = {};
+    for (const r of rows) out[r.key] = r.value;
+    return out;
+  }
+
+  deleteAppState(key) {
+    this.db.prepare('DELETE FROM app_state WHERE key = ?').run(key);
+  }
+
   // ========== PROJECTS ========== 
 
   // Legacy helper - should be avoided in favor of getProjectById

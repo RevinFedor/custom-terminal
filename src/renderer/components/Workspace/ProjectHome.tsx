@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useWorkspaceStore, TabColor, TabType, PendingAction } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
+import Tooltip from '../UI/Tooltip';
 import { useUIStore } from '../../store/useUIStore';
 import { useCmdKey, useCmdHoverPopover, CmdHoverPopover } from '../../hooks/useCmdHoverPopover';
 import { Terminal, FolderOpen, Plus, Clock, Trash2, Pencil, Star, ChevronDown, ChevronRight } from 'lucide-react';
@@ -517,6 +518,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
             <div className="flex items-center gap-2 text-[#666] text-sm mt-1">
               <FolderOpen size={14} />
               <span className="text-[#555] italic">No directory selected</span>
+              <Tooltip content="Select project directory">
               <button
                 onMouseDown={(e) => {
                   e.preventDefault(); // Prevent blur on input
@@ -524,10 +526,10 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
                 }}
                 onClick={handleDraftDirectoryClick}
                 className="text-accent hover:text-white cursor-pointer transition-colors p-1 rounded hover:bg-accent/10"
-                title="Select project directory"
               >
                 <FolderOpen size={14} />
               </button>
+              </Tooltip>
             </div>
           </>
         ) : isEditingName ? (
@@ -572,13 +574,14 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
             <div className="flex items-center gap-2 text-[#666] text-sm mt-1">
               <FolderOpen size={14} />
               <span>{project.path.startsWith('__unset__') ? 'No path' : project.path}</span>
+              <Tooltip content="Change project directory">
               <button
                 onClick={handleChangeDirectory}
                 className="text-[#666] hover:text-[#999] cursor-pointer transition-colors p-0.5"
-                title="Change project directory"
               >
                 <Pencil size={12} />
               </button>
+              </Tooltip>
             </div>
           </>
         ) : (
@@ -586,6 +589,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
           <>
             <div className="flex items-center gap-2 mb-1">
               <h1 className="text-xl text-white font-medium">{displayName}</h1>
+              <Tooltip content="Rename project">
               <button
                 onClick={() => {
                   setDraftName(project.name);
@@ -596,21 +600,22 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
                   }));
                 }}
                 className="text-[#555] hover:text-[#999] cursor-pointer transition-colors p-0.5"
-                title="Rename project"
               >
                 <Pencil size={12} />
               </button>
+              </Tooltip>
             </div>
             <div className="flex items-center gap-2 text-[#666] text-sm">
               <FolderOpen size={14} />
               <span>{project.path.startsWith('__unset__') ? 'No path' : project.path}</span>
+              <Tooltip content="Change project directory">
               <button
                 onClick={handleChangeDirectory}
                 className="text-[#666] hover:text-[#999] cursor-pointer transition-colors p-0.5"
-                title="Change project directory"
               >
                 <Pencil size={12} />
               </button>
+              </Tooltip>
             </div>
           </>
         )}
@@ -1109,7 +1114,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
               <div className="text-[10px] text-[#888] space-y-0.5">
                 <div>Created: {formatTimestamp(entry.created_at)}</div>
                 <div>Closed: {formatTimestamp(entry.closed_at)}</div>
-                <div className="truncate" title={entry.cwd}>Path: {entry.cwd}</div>
+                <Tooltip content={entry.cwd}><div className="truncate">Path: {entry.cwd}</div></Tooltip>
                 {entry.command_type && (
                   <div>Type: {entry.command_type}</div>
                 )}

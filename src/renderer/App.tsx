@@ -6,10 +6,12 @@ import { useResearchStore } from './store/useResearchStore';
 import { usePromptsStore } from './store/usePromptsStore';
 import Dashboard from './components/Dashboard/Dashboard';
 import Workspace from './components/Workspace/Workspace';
+import StatusBar from './components/StatusBar';
 import ToastContainer from './components/UI/Toast';
 import EditProjectModal from './components/UI/EditProjectModal';
 import SessionInputModal from './components/UI/SessionInputModal';
 import SettingsModal from './components/UI/SettingsModal';
+import Tooltip from './components/UI/Tooltip';
 // Drag and drop
 import { draggable, dropTargetForElements, monitorForElements } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
 import { attachClosestEdge, extractClosestEdge, type Edge } from '@atlaskit/pragmatic-drag-and-drop-hitbox/closest-edge';
@@ -17,6 +19,7 @@ import { combine } from '@atlaskit/pragmatic-drag-and-drop/combine';
 
 // Initialize debug logger (exposes `debug` helper in console)
 import './utils/logger';
+import { usePromptQueueRunner } from './hooks/usePromptQueueRunner';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -243,19 +246,20 @@ const ProjectTabItem = memo(({
           </span>
         )}
         {interruptedCount > 0 && !isEditing && (
-          <span
-            className="flex items-center justify-center text-[10px] font-medium rounded-full"
-            style={{
-              minWidth: '16px',
-              height: '16px',
-              padding: '0 4px',
-              backgroundColor: isActive ? 'rgba(59, 130, 246, 0.3)' : 'rgba(59, 130, 246, 0.2)',
-              color: isActive ? '#1e40af' : '#3b82f6',
-            }}
-            title="Interrupted sessions - click tab to resume"
-          >
-            {interruptedCount}
-          </span>
+          <Tooltip content="Interrupted sessions - click tab to resume">
+            <span
+              className="flex items-center justify-center text-[10px] font-medium rounded-full"
+              style={{
+                minWidth: '16px',
+                height: '16px',
+                padding: '0 4px',
+                backgroundColor: isActive ? 'rgba(59, 130, 246, 0.3)' : 'rgba(59, 130, 246, 0.2)',
+                color: isActive ? '#1e40af' : '#3b82f6',
+              }}
+            >
+              {interruptedCount}
+            </span>
+          </Tooltip>
         )}
       </span>
       {closestEdge && <ProjectDropIndicator edge={closestEdge as 'left' | 'right'} />}
@@ -331,6 +335,13 @@ const RestoreLoader = memo(() => (
 ));
 
 function App() {
+  // Mount the prompt-queue auto-runner at app root. It's a tab-independent listener
+  // for claude:busy-state IPC + queue-state subscription, so it survives the user
+  // switching away from the Claude tab (which would otherwise unmount the overlay
+  // and kill the runner). See hooks/usePromptQueueRunner.ts comment for the bug
+  // it fixes (auto-run silently breaking the moment user goes to another tab).
+  usePromptQueueRunner();
+
   // Individual selectors — only re-render when specific values change (not on every store mutation)
   const view = useWorkspaceStore((s) => s.view);
   const activeProjectId = useWorkspaceStore((s) => s.activeProjectId);
@@ -359,6 +370,30 @@ function App() {
   const projectTabsFontSize = useUIStore((s) => s.projectTabsFontSize);
 
   const [settingsOpen, setSettingsOpen] = useState(false);
+
+  // Auto-close markdown-editor overlays (Cmd+/ palette, AI-paste indicator) on
+  // mousedown outside their DOM. The editor's own listener uses 'click' on
+  // `document`, but xterm canvas swallows pointer events before they bubble.
+  // We use CAPTURE phase on `window` — fires before any DOM target eats it.
+  useEffect(() => {
+    const onDown = (e: MouseEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (!target) return;
+      const palette = document.querySelector('[data-command-palette]');
+      const ctxMenu = document.querySelector('[data-context-menu]');
+      const aiPaste = document.querySelector('[data-ai-paste-indicator]');
+      if (palette && !palette.contains(target)) palette.remove();
+      if (ctxMenu && !ctxMenu.contains(target)) ctxMenu.remove();
+      if (aiPaste && !aiPaste.contains(target)) {
+        const cancel = aiPaste.querySelector('.cm-ai-paste-cancel') as HTMLElement | null;
+        if (cancel) cancel.click();
+        else aiPaste.remove();
+      }
+    };
+    window.addEventListener('mousedown', onDown, true);
+    return () => window.removeEventListener('mousedown', onDown, true);
+  }, []);
+
   const [projectContextMenu, setProjectContextMenu] = useState<{ projectId: string; x: number; y: number } | null>(null);
   const [projectEmptyZoneHovered, setProjectEmptyZoneHovered] = useState(false);
   const [processStatus, setProcessStatus] = useState<Map<string, boolean>>(new Map()); // tabId -> isRunning
@@ -1147,7 +1182,12 @@ function App() {
       // Cmd+, - Toggle Settings Modal
       if (e.metaKey && e.code === 'Comma') {
         e.preventDefault();
-        setSettingsOpen(prev => !prev);
+        setSettingsOpen(prev => {
+          // Broadcast open transitions so listeners (e.g. TabNotesSlideout) can
+          // dismiss themselves — the modal would otherwise overlap them.
+          if (!prev) window.dispatchEvent(new CustomEvent('settings:opened'));
+          return !prev;
+        });
         return;
       }
 
@@ -1251,11 +1291,29 @@ function App() {
           }
         }
       } else if (cmd === 'run-script') {
-        // Run npm script or .sh file from terminal context menu
+        // Run npm script or .sh file from terminal context menu.
+        // Same kill-ports prefix logic as TabBar's tab-context-menu path —
+        // if "kill dev-ports" toggle is on, prepend `lsof | kill -9; ` to the line.
         const { tabId, command } = data || {};
-        if (tabId && command) {
-          ipcRenderer.send('terminal:input', tabId, command);
-        }
+        if (!tabId || !command) return;
+        const runIt = (prefix: string) => {
+          ipcRenderer.send('terminal:input', tabId, `${prefix}${command}`);
+        };
+        if (useUIStore.getState().freePortsBeforeStart) {
+          // Look up tab cwd in workspace store to scan project ports.
+          let cwd: string | undefined;
+          for (const [, ws] of useWorkspaceStore.getState().openProjects) {
+            const t = ws.tabs.get(tabId);
+            if (t) { cwd = t.cwd; break; }
+          }
+          if (cwd) {
+            ipcRenderer.invoke('system:detect-project-ports', cwd).then((res: any) => {
+              const ports: number[] = res?.ports || [];
+              const prefix = ports.length ? `lsof -ti:${ports.join(',')} 2>/dev/null | xargs -r kill -9 2>/dev/null; ` : '';
+              runIt(prefix);
+            }).catch(() => runIt(''));
+          } else runIt('');
+        } else runIt('');
       }
     };
 
@@ -1307,38 +1365,40 @@ function App() {
         >
           {/* Home / DEV indicator */}
           {window.location.hostname === 'localhost' ? (
-            <button
-              className="relative px-4 py-1.5 text-sm font-bold cursor-pointer transition-colors"
-              style={{
-                fontSize: `${projectTabsFontSize}px`,
-                color: view === 'dashboard' ? '#fff' : '#9b59b6'
-              }}
-              onMouseEnter={(e) => { if (view !== 'dashboard') e.currentTarget.style.color = '#c084fc'; }}
-              onMouseLeave={(e) => { if (view !== 'dashboard') e.currentTarget.style.color = '#9b59b6'; }}
-              onClick={() => view === 'dashboard' && activeProjectId ? showWorkspace(activeProjectId) : showDashboard()}
-              title="Development Mode - Dashboard"
-            >
-              {view === 'dashboard' && (
-                <div className="absolute inset-0 rounded" style={{ backgroundColor: '#9b59b6' }} />
-              )}
-              <span className="relative z-10">[DEV]</span>
-            </button>
+            <Tooltip content="Development Mode - Dashboard">
+              <button
+                className="relative px-4 py-1.5 text-sm font-bold cursor-pointer transition-colors"
+                style={{
+                  fontSize: `${projectTabsFontSize}px`,
+                  color: view === 'dashboard' ? '#fff' : '#9b59b6'
+                }}
+                onMouseEnter={(e) => { if (view !== 'dashboard') e.currentTarget.style.color = '#c084fc'; }}
+                onMouseLeave={(e) => { if (view !== 'dashboard') e.currentTarget.style.color = '#9b59b6'; }}
+                onClick={() => view === 'dashboard' && activeProjectId ? showWorkspace(activeProjectId) : showDashboard()}
+              >
+                {view === 'dashboard' && (
+                  <div className="absolute inset-0 rounded" style={{ backgroundColor: '#9b59b6' }} />
+                )}
+                <span className="relative z-10">[DEV]</span>
+              </button>
+            </Tooltip>
           ) : (
-            <button
-              className={`relative px-3 py-1.5 text-sm font-medium cursor-pointer transition-colors ${
-                view === 'dashboard'
-                  ? 'text-black'
-                  : 'text-gray-400 hover:text-white'
-              }`}
-              style={{ fontSize: `${projectTabsFontSize}px` }}
-              onClick={() => view === 'dashboard' && activeProjectId ? showWorkspace(activeProjectId) : showDashboard()}
-              title="Dashboard"
-            >
-              {view === 'dashboard' && (
-                <div className="absolute inset-0 bg-white rounded" />
-              )}
-              <span className="relative z-10">🏠</span>
-            </button>
+            <Tooltip content="Dashboard">
+              <button
+                className={`relative px-3 py-1.5 text-sm font-medium cursor-pointer transition-colors ${
+                  view === 'dashboard'
+                    ? 'text-black'
+                    : 'text-gray-400 hover:text-white'
+                }`}
+                style={{ fontSize: `${projectTabsFontSize}px` }}
+                onClick={() => view === 'dashboard' && activeProjectId ? showWorkspace(activeProjectId) : showDashboard()}
+              >
+                {view === 'dashboard' && (
+                  <div className="absolute inset-0 bg-white rounded" />
+                )}
+                <span className="relative z-10">🏠</span>
+              </button>
+            </Tooltip>
           )}
 
           {/* Separator */}
@@ -1446,12 +1506,13 @@ function App() {
               onMouseDown={handleDragAreaResizeStart}
             />
             {/* Drag area */}
-            <div
-              className="flex-1 h-full cursor-default bg-white/[0.01] hover:bg-white/[0.03] transition-colors border-l border-white/5"
-              style={{ WebkitAppRegion: 'drag' } as any}
-              onMouseDown={() => setActiveArea('projects')}
-              title="Drag window"
-            />
+            <Tooltip content="Drag window">
+              <div
+                className="flex-1 h-full cursor-default bg-white/[0.01] hover:bg-white/[0.03] transition-colors border-l border-white/5"
+                style={{ WebkitAppRegion: 'drag' } as any}
+                onMouseDown={() => setActiveArea('projects')}
+              />
+            </Tooltip>
           </div>
         </div>
       </div>
@@ -1477,6 +1538,9 @@ function App() {
           <Workspace />
         </div>
       </div>
+
+      {/* VSCode-style status bar — full width across terminal + sidebar */}
+      <StatusBar />
 
       {/* Global UI Components */}
       <ToastContainer />

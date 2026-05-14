@@ -35,7 +35,7 @@ Noted Terminal — кастомный эмулятор терминала на �
 
 ## Методологии
 - **Дизайн & UX паттерны**: [`fact-ux-patterns.md`](docs/knowledge/fact-ux-patterns.md) — читай при UI-работе
-- **Тесты**: [`~/Desktop/electron-mcp/methodology/01-custom-terminal.md`](../electron-mcp/methodology/01-custom-terminal.md) — методология E2E через MCP; сценарии в [`~/Desktop/electron-mcp/scenarios/`](../electron-mcp/scenarios/). Бывшая папка `auto/` удалена; бэкап `/tmp/custom-terminal-auto-backup-*.tar.gz`.
+- **Тесты**: глобальный skill `electron-e2e-testing` (`~/.claude/skills/electron-e2e-testing/`) — методология E2E через MCP, активируется по запросам о тестировании Electron. Custom-terminal-specific quirks (CDP-порт 9224, JSONL-side, TUI-side, IPC cookbook) — в `references/custom-terminal.md` этого skill'а. Сценарии (исполняемый код) — `~/Desktop/electron-mcp/scenarios/custom-terminal/`. Бывшая папка `auto/` удалена; бэкап `/tmp/custom-terminal-auto-backup-*.tar.gz`.
 
 ## Документация
 Вся документация в `docs/knowledge/` — единая плоская структура:
@@ -84,6 +84,27 @@ MCP-инструмент `docs_search` — вызови перед работо�
 - **Provider Proxy:** Весь трафик Claude Code проходит через встроенный HTTP proxy (порт 4001+, keepAlive). Три режима: `anthropic` (passthrough), `zen` (opencode.ai/zen), `deepseek` (api.deepseek.com/anthropic — официальный Anthropic-совместимый endpoint). **Per-tab routing**: `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>/t/<encoded-tabId>` — каждая вкладка имеет независимый provider state, переключение в одной не затрагивает другие. В anthropic mode body не парсится (fast path) для сохранения prompt cache key. Cache stats логируются из SSE `message_start`. При shutdown — graceful drain активных соединений. Подробнее: [`fact-provider-proxy.md`](docs/knowledge/fact-provider-proxy.md).
 
 ## Логирование (обязательно к соблюдению)
+
+### ⚠️ КРИТИЧНО: Timestamps в логах = UTC, не локальное время
+
+`logs/dev.log` и `~/Library/Logs/noted-terminal/production.log` пишут timestamp **в UTC**. Локальное московское время (MSK = UTC+3) от записанного в логе **отличается на 3 часа**.
+
+**Что это означает на практике:**
+- Юзер говорит «баг был в 20:23 по Москве» → искать в логе нужно строки начинающиеся с **`17:23`**, не `20:23`.
+- `awk '$1 >= "20:23:00"'` по dev.log при MSK-времени 20:23 вернёт **пустоту** — потому что лог содержит максимум `17:23:xx`.
+- `date +%H:%M:%S` возвращает локальное (MSK). Перед поиском в логе **вычитай 3 часа** (или используй `date -u +%H:%M:%S`).
+
+**Правильный паттерн поиска:**
+```bash
+# Юзер репортит «баг в 20:23 MSK» — конвертируем:
+LOCAL_HHMM="20:23"
+UTC_HHMM=$(date -j -f "%H:%M" "$LOCAL_HHMM" -v-3H +"%H:%M")  # → 17:23
+awk -v t="$UTC_HHMM" '$1 >= t":00" && $1 <= t":59"' logs/dev.log | grep ...
+```
+
+**Сценарий-ловушка (горел 2026-05-13):** юзер описал scroll-jitter «прямо сейчас, в 20:23», агент трижды утверждал «в логах ничего нет», искав по `20:23`. На самом деле было 60+ строк `[ScrollDiag:SNAP]` в `17:23` UTC — они точно описывали баг. Урок: **если юзер говорит «только что произошло» а в логе пусто — пересчитай в UTC прежде чем заявлять что данных нет**.
+
+### Базовые правила
 - **Глобальный интерсептор:** В main process `console.log/error/warn` перехватываются автоматически. Никаких специальных импортов или функций не нужно.
   - **Dev:** `logs/dev.log` (в корне проекта)
   - **Production (packaged):** `~/Library/Logs/noted-terminal/production.log` (через `app.getPath('logs')`). См. [`fix-packaged-app-logs.md`](docs/knowledge/fix-packaged-app-logs.md).
@@ -93,8 +114,8 @@ MCP-инструмент `docs_search` — вызови перед работо�
 - **НЕ создавай** отдельные логгеры, файлы логов или `fs.appendFile` для логирования. Всё идёт через единый `console.log('[Tag]')` перехватчик.
 
 ## Тестирование
-- **Методология:** [`~/Desktop/electron-mcp/methodology/01-custom-terminal.md`](../electron-mcp/methodology/01-custom-terminal.md) — как тестировать через MCP `electron_connect({port: 9224})`. Базовый файл: [`00-base.md`](../electron-mcp/methodology/00-base.md).
-- **Сценарии:** [`~/Desktop/electron-mcp/scenarios/`](../electron-mcp/scenarios/) — пошаговые markdown-сценарии (fork, edit-range, delete-range, timeline UI, claude resume), агент исполняет их живьём.
+- **Методология:** глобальный skill `electron-e2e-testing` (`~/.claude/skills/electron-e2e-testing/SKILL.md`) — базовые правила. Custom-terminal-specific (CDP 9224, JSONL-side, TUI-side, `terminal:input` IPC, native `dialog.showMessageBox` quirks) — `references/custom-terminal.md` этого skill'а.
+- **Сценарии:** [`~/Desktop/electron-mcp/scenarios/`](../electron-mcp/scenarios/) — пошаговые markdown-сценарии (fork, edit-range, delete-range, timeline UI, claude resume), агент исполняет их живьём. Это **исполняемый код**, не документация.
 - **Observability:** В Main-процессе реализовано логирование `[GeminiSpinner] THINKING/IDLE`, `[Spinner] BUSY/IDLE`, `[Claude Runner]`, `[Claude Handshake]` в `logs/dev.log` — стримится через MCP `Monitor` + `tail -F | grep`.
 - **Бывшая `auto/` (Playwright)**: удалена 2026-05-12; бэкап `/tmp/custom-terminal-auto-backup-1778539841.tar.gz` (86 файлов).
 
@@ -105,9 +126,12 @@ MCP-инструмент `docs_search` — вызови перед работо�
 
 ## Claude TUI Management
 - **Model Switching:** `/model default|sonnet|opus|haiku` — переключение модели из UI. Поддерживается `default` (Opus) и явный выбор `opus`.
-- **Effort Level:** `/effort low|medium|high` — контроль интенсивности размышлений (5K/16K/50K токенов). Локальный трекинг (не подтверждается bridge).
+- **Effort Level:** `/effort low|medium|high|xhigh|max` — контроль интенсивности размышлений. Список уровней shipping'ается Claude'ом (`auto` удалён в мае 2026, `xhigh` добавлен) — single source of truth в `src/renderer/constants/claudeLevels.ts`. Все use sites импортируют оттуда; при следующем Claude-апдейте — один edit. Локальный трекинг (не подтверждается bridge).
 - **Think Mode:** `meta+t` (Esc+t) или UI-кнопка — переключение режима размышления. При запуске управляется `alwaysThinkingEnabled` в `~/.claude/settings.json`.
 - **Rewind:** `/rewind` или UI-контекстное меню — откат к выбранному сообщению с сжатием контекста.
 - **Command Guard:** Во время отправки команд кнопки управления (Model/Effort/Think) блокируются через `isCommandRunning` для предотвращения двойных операций.
-- **Синхронизация:** Все команды отправляются через синхронный IPC `invoke('claude:send-command')` для гарантии порядка выполнения. Используется `safePasteAndSubmit` с чанками < 1024 байт и sync marker verification.
+- **Stop hook (детерминированный конец turn'а):** `~/.claude/settings.json` → `UserPromptSubmit`/`Stop`/`StopFailure` хуки → Unix socket → main process. Authoritative source для `claude:busy-state` loader'а. Spinner-эвристики подавлены пока `claudeTurnBusy === true`. См. [`fact-claude-stop-hook.md`](docs/knowledge/fact-claude-stop-hook.md).
+- **Auto-inject `/effort`:** при запуске Claude (event `claude:process-started` fires на новый PID, не на session re-sync) шлётся `/effort <defaultClaudeEffort>` из StatusBar. `max` нельзя через settings.json (Claude downgrade'ит) — только через runtime injection.
+- **Prompt Queue overlay:** sticky-панель в Claude-табах справа-вверху. Очередь промптов с auto-run после каждого turn-end, drag-and-drop reorder, Stop-after toggle (SIGTERM после следующего ответа). Текущий ввод Claude забирается через external-editor hijack (Ctrl+G → `EDITOR=noted-code-grab.js` → lock-file dispatcher grab/copy/clear/passthrough). См. [`fact-prompt-queue.md`](docs/knowledge/fact-prompt-queue.md).
+- **Синхронизация:** Все команды отправляются через синхронный IPC `invoke('claude:send-command')` для гарантии порядка выполнения. Используется `safePasteAndSubmit` со **Stash flow** (Ctrl+S вместо Ctrl+C) — user prompt не теряется, Claude сам восстанавливает его после сабмита slash-команды. Время выполнения ~400ms. См. [`fact-claude-tui-control.md`](docs/knowledge/fact-claude-tui-control.md) секция Stash Flow и [`fix-stale-sync-markers.md`](docs/knowledge/fix-stale-sync-markers.md) о фиксе детекции маркеров.
 

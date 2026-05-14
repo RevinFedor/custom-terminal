@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { createPortal } from 'react-dom';
 import { useUIStore } from '../../store/useUIStore';
+import Tooltip from '../UI/Tooltip';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { MarkdownEditor } from '@gt-editor/markdown-editor';
 import '@gt-editor/markdown-editor/styles.css';
@@ -62,19 +63,21 @@ export default function FilePreview() {
               can adjust font size without leaving the preview; both edit the same
               filePreviewFontSize key in UIStore (persisted to localStorage). */}
           <div className="flex items-center gap-1 mr-1">
+            <Tooltip content="Уменьшить шрифт">
             <button
               className="w-6 h-6 flex items-center justify-center rounded text-[#888] hover:text-white hover:bg-white/10 disabled:opacity-30 disabled:cursor-not-allowed"
               disabled={filePreviewFontSize <= 10}
               onClick={() => setFilePreviewFontSize(filePreviewFontSize - 1)}
-              title="Уменьшить шрифт"
             >−</button>
+            </Tooltip>
             <span className="text-[10px] text-[#888] font-mono tabular-nums min-w-[26px] text-center">{filePreviewFontSize}px</span>
+            <Tooltip content="Увеличить шрифт">
             <button
               className="w-6 h-6 flex items-center justify-center rounded text-[#888] hover:text-white hover:bg-white/10 disabled:opacity-30 disabled:cursor-not-allowed"
               disabled={filePreviewFontSize >= 24}
               onClick={() => setFilePreviewFontSize(filePreviewFontSize + 1)}
-              title="Увеличить шрифт"
             >+</button>
+            </Tooltip>
           </div>
           <button
             className={`text-xs px-2 py-1 rounded transition-colors ${

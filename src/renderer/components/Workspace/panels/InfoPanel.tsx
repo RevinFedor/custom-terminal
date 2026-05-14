@@ -4,9 +4,16 @@ import '@gt-editor/markdown-editor/styles.css';
 import { useWorkspaceStore } from '../../../store/useWorkspaceStore';
 import { useUIStore } from '../../../store/useUIStore';
 import { usePromptsStore } from '../../../store/usePromptsStore';
-import { RotateCcw, Clock, ChevronDown, ChevronRight, ScrollText, GitBranch } from 'lucide-react';
+import { RotateCcw, Clock, ChevronDown, ChevronRight, ChevronLeft, ScrollText, GitBranch, User as UserIcon } from 'lucide-react';
 import ActionsPanel from './ActionsPanel';
+import CopySessionButton, { ClaudeSparkle } from '../CopySessionButton';
+import { DeepSeekIcon, ZenIcon } from '../../icons/ProviderIcons';
 import { terminalRegistry } from '../../../utils/terminalRegistry';
+import {
+  CLAUDE_EFFORT_LEVELS,
+  CLAUDE_EFFORT_TOGGLE_OFF,
+  DEEPSEEK_EFFORT_LEVELS,
+} from '../../../constants/claudeLevels';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -24,15 +31,32 @@ interface HistoryTurn {
 const UUID_EXTRACT_REGEX = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
 
 // Two-tier provider→model catalog for Контроль panel.
-// Provider row selects backend; Model row lists that provider's models.
-// `cmd` = true means clicking the model sends `/model <name>` to the live Claude TUI
-// (only meaningful for anthropic — Claude doesn't know about Zen/DeepSeek models).
+// Provider toggle (inside КОНТРОЛЬ header, right side) selects backend; Model row
+// lists that provider's models. `cmd` = true means clicking the model sends
+// `/model <name>` to the live Claude TUI (only meaningful for anthropic — Claude
+// doesn't know about Zen/DeepSeek models).
+//
+// `tint` — official brand color used when the provider is active. Inactive state
+// uses neutral grey so non-selected providers recede visually; active one pops
+// in its brand color.
+//
+// `Icon` — inline SVG glyph rendered before the label inside the pill (~11px).
 type ProviderId = 'anthropic' | 'zen' | 'deepseek';
-const PROVIDER_CATALOG: { id: ProviderId; label: string; title: string; models: { id: string; label: string; cmd?: boolean }[] }[] = [
+type ProviderEntry = {
+  id: ProviderId;
+  label: string;
+  title: string;
+  tint: string;
+  Icon: React.FC<{ size?: number; color?: string }>;
+  models: { id: string; label: string; cmd?: boolean }[];
+};
+const PROVIDER_CATALOG: ProviderEntry[] = [
   {
     id: 'anthropic',
     label: 'Claude',
     title: 'Anthropic subscription (direct)',
+    tint: '#DA7756',
+    Icon: ClaudeSparkle,
     models: [
       { id: 'default', label: 'default', cmd: true },
       { id: 'sonnet', label: 'sonnet', cmd: true },
@@ -44,6 +68,8 @@ const PROVIDER_CATALOG: { id: ProviderId; label: string; title: string; models: 
     id: 'deepseek',
     label: 'DeepSeek',
     title: 'DeepSeek (Anthropic-compatible at /anthropic)',
+    tint: '#4D6BFE',
+    Icon: DeepSeekIcon,
     models: [
       { id: 'deepseek-v4-flash', label: 'V4F' },
       { id: 'deepseek-v4-pro[1m]', label: 'V4P' },
@@ -53,6 +79,8 @@ const PROVIDER_CATALOG: { id: ProviderId; label: string; title: string; models: 
     id: 'zen',
     label: 'Zen',
     title: 'OpenCode Zen (Anthropic-compatible)',
+    tint: '#a78bfa',
+    Icon: ZenIcon,
     models: [
       { id: 'minimax-m2.5', label: 'MM2.5' },
       { id: 'minimax-m2.7', label: 'MM2.7' },
@@ -73,24 +101,110 @@ interface InfoPanelProps {
 }
 
 
+// Fixed-width tri-state chip that replaces the "Claude/Gemini · continue" pair.
+// Idle:                 shows "Claude" / "Gemini" (the tab's AI label)
+// Hover, no process:    shows "Continue"  → resume session
+// Hover, process alive: shows "Stop"      → send Ctrl+C
+// Click: invokes Continue/Stop. The default label is also clickable — copies
+// the session ID (preserves old behaviour where clicking "Claude" copied the UUID).
+// The session ID tooltip floats above the chip on hover.
+function SessionActionChip({
+  sessionType, sessionId, isCommandRunning, hasAnySession,
+  onContinue, onStop, onCopyId,
+}: {
+  sessionType: 'claude' | 'gemini' | null;
+  sessionId: string | null;
+  isCommandRunning: boolean;
+  hasAnySession: boolean;
+  onContinue: () => void;
+  onStop: () => void;
+  onCopyId: () => void;
+}) {
+  const [hover, setHover] = React.useState(false);
+  const accent = sessionType === 'claude' ? '#DA7756' : '#4E86F8';
+  // Brighter accent for the hover state — pops against the dark hover bg.
+  const accentBright = sessionType === 'claude' ? '#FF9466' : '#7BA3FF';
+  const defaultLabel = sessionType === 'claude' ? 'Claude' : 'Gemini';
+  const hoverLabel = isCommandRunning ? 'Stop' : 'Continue';
+  // Continue: brighter accent on dark bg. Stop: red text + faint red bg (danger).
+  const hoverColor = isCommandRunning ? '#ef4444' : accentBright;
+  const showHoverState = hover && hasAnySession;
+  const label = showHoverState ? hoverLabel : defaultLabel;
+  const color = showHoverState ? hoverColor : accent;
+  // Dark almost-black hover bg restores the old "Continue chip" look — the previous
+  // translucent-accent tint bled into the green session-card background and looked muddy.
+  const hoverBg = isCommandRunning ? 'rgba(239, 68, 68, 0.18)' : 'rgba(0, 0, 0, 0.55)';
+
+  const handleClick = () => {
+    if (!hasAnySession) { onCopyId(); return; }
+    if (isCommandRunning) onStop();
+    else onContinue();
+  };
+
+  // Tooltip carries the session UUID — Cmd-only by default, same gating as everything
+  // else. The chip's own visible label (Continue / Stop) communicates intent without
+  // any popup, so a non-Cmd hover stays quiet.
+  // Permanent dark bg (matches ⎘ / ↻ siblings). Hover only changes text colour;
+  // Stop adds a faint red wash because it's a destructive action.
+  const baseBg = 'rgba(0,0,0,0.55)';
+  const stopHoverBg = isCommandRunning && showHoverState ? 'rgba(239, 68, 68, 0.18)' : baseBg;
+  return (
+    <span
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      onClick={handleClick}
+      className="text-xs font-medium cursor-pointer relative inline-flex items-center justify-center"
+      style={{
+        color,
+        width: 64,
+        height: 18,
+        backgroundColor: stopHoverBg,
+        transition: 'background-color 0.12s, color 0.12s',
+        userSelect: 'none',
+      }}
+    >
+      {label}
+    </span>
+  );
+}
+
 export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
   const [claudeSessionId, setClaudeSessionId] = useState<string | null>(null);
   const [geminiSessionId, setGeminiSessionId] = useState<string | null>(null);
   const [activeCommandType, setActiveCommandType] = useState<string | null>(null);
   const [isSDKTab, setIsSDKTab] = useState(false);
   // aiMode removed — start buttons now show both claude & gemini inline
-  const [showTooltip, setShowTooltip] = useState(false);
+  // КОМАНДЫ section starts collapsed — its contents (fork-from-clipboard codes) are
+  // rarely needed and only confused users when permanently visible. Click the header
+  // to toggle.
+  const [commandsExpanded, setCommandsExpanded] = useState(false);
   const [historyTurns, setHistoryTurns] = useState<HistoryTurn[]>([]);
   const [historyExpanded, setHistoryExpanded] = useState(false);
   const [isRollingBack, setIsRollingBack] = useState(false);
   const [claudeExpanded, setClaudeExpanded] = useState(false);
   const [claudeExtraPrompt, setClaudeExtraPrompt] = useState('');
   const [claudeDefaultPrompt, setClaudeDefaultPrompt] = useState('');
+  // Local mirror exists ONLY so the textarea has a controlled value. Real source
+  // of truth lives in useWorkspaceStore.tabs[id].notes — slide-out + sidebar
+  // editor both write there. The selector below keeps this mirror reactive.
   const [tabNotes, setTabNotes] = useState('');
   const [sessionCopied, setSessionCopied] = useState(false);
   const [isGeneratingDesc, setIsGeneratingDesc] = useState(false);
   const [thinkFlash, setThinkFlash] = useState<string | null>(null);
   const [effortLevel, setEffortLevel] = useState<Record<string, string>>({});
+  // Think active state per tab. undefined → treated as ON (default at Claude startup
+  // due to alwaysThinkingEnabled in settings.json). Cleared on OSC 133 D so a fresh
+  // Claude run begins with implicit-ON again.
+  const [thinkActive, setThinkActive] = useState<Record<string, boolean>>({});
+
+  // Return focus to the Claude/Gemini terminal after a control button (Model/Effort/Think)
+  // is clicked. Without this the focus stays on the button — Enter triggers it again
+  // instead of submitting the input.
+  const focusActiveTerminal = (tabId: string | null) => {
+    if (!tabId) return;
+    // Wait one tick so React doesn't immediately re-render and steal focus back.
+    requestAnimationFrame(() => terminalRegistry.get(tabId)?.focus());
+  };
   const bridgeCacheRef = useRef<Map<string, { model: string; contextPct: number }>>(new Map());
   const cached = activeTabId ? bridgeCacheRef.current.get(activeTabId) : undefined;
   const [claudeModel, setClaudeModel] = useState<string | null>(cached?.model ?? null);
@@ -108,6 +222,34 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
   const [isValidating, setIsValidating] = useState(false);
   const validationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const { showToast, claudeDefaultPromptEnabled } = useUIStore();
+  // Live copy-flags — reactive so the markers row updates when user toggles in the popup.
+  const includeUser = useUIStore((s) => s.copyIncludeUser);
+  const includeClaude = useUIStore((s) => s.copyIncludeClaude);
+  const includeText = useUIStore((s) => s.copyIncludeText);
+  const includeThinking = useUIStore((s) => s.copyIncludeThinking);
+  const includeReading = useUIStore((s) => s.copyIncludeReading);
+  const includeEditing = useUIStore((s) => s.copyIncludeEditing);
+  const includeBash = useUIStore((s) => s.copyIncludeBash);
+  const includeTools = useUIStore((s) => s.copyIncludeTools);
+  const includeSubagentResult = useUIStore((s) => s.copyIncludeSubagentResult);
+  const includeSubagentHistory = useUIStore((s) => s.copyIncludeSubagentHistory);
+  const setCopyIncludeUser = useUIStore((s) => s.setCopyIncludeUser);
+  const setCopyIncludeClaude = useUIStore((s) => s.setCopyIncludeClaude);
+  const setCopyIncludeText = useUIStore((s) => s.setCopyIncludeText);
+  const setCopyIncludeThinking = useUIStore((s) => s.setCopyIncludeThinking);
+  const setCopyIncludeReading = useUIStore((s) => s.setCopyIncludeReading);
+  const setCopyIncludeEditing = useUIStore((s) => s.setCopyIncludeEditing);
+  const setCopyIncludeBash = useUIStore((s) => s.setCopyIncludeBash);
+  const setCopyIncludeTools = useUIStore((s) => s.setCopyIncludeTools);
+  const setCopyIncludeSubagentResult = useUIStore((s) => s.setCopyIncludeSubagentResult);
+  const setCopyIncludeSubagentHistory = useUIStore((s) => s.setCopyIncludeSubagentHistory);
+  const fromStart = useUIStore((s) => s.copyFromStart);
+  const setCopyFromStart = useUIStore((s) => s.setCopyFromStart);
+  // Sub-pill preferred mode — what the right-half displays when subagents are OFF.
+  // Lets the right-half stay clickable independently of the left ("sub-") toggle,
+  // so user can pre-select "full" before turning subagents on. When subagents are
+  // ON, the displayed label is derived from real flags, not this state.
+  const [subPreferred, setSubPreferred] = useState<'result' | 'full'>('result');
   const historyPanelOpenTabs = useUIStore((s) => s.historyPanelOpenTabs);
   const setHistoryPanelOpen = useUIStore((s) => s.setHistoryPanelOpen);
   const isHistoryOpen = activeTabId ? (historyPanelOpenTabs[activeTabId] ?? false) : false;
@@ -132,13 +274,22 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
   const tabNotesFontSize = useUIStore((s) => s.tabNotesFontSize);
   const tabNotesPaddingX = useUIStore((s) => s.tabNotesPaddingX);
   const tabNotesPaddingY = useUIStore((s) => s.tabNotesPaddingY);
-  const { setTabCommandType, closeTab, setTabNotes: setTabNotesStore, getTabNotes } = useWorkspaceStore();
+  const { setTabCommandType, closeTab, setTabNotes: setTabNotesStore } = useWorkspaceStore();
   const claudeTextareaRef = useRef<HTMLTextAreaElement>(null);
 
+  // Reactive subscription to the live tab.notes — fires when slide-out (or any
+  // other consumer) writes via setTabNotesStore. Keeps our local mirror in sync.
+  const liveTabNotes = useWorkspaceStore((s) => {
+    if (!activeTabId) return '';
+    for (const [, workspace] of s.openProjects) {
+      const tab = workspace.tabs.get(activeTabId);
+      if (tab) return tab.notes || '';
+    }
+    return '';
+  });
   useEffect(() => {
-    if (activeTabId) setTabNotes(getTabNotes(activeTabId));
-    else setTabNotes('');
-  }, [activeTabId, getTabNotes]);
+    setTabNotes(liveTabNotes);
+  }, [liveTabNotes]);
 
   useEffect(() => {
     ipcRenderer.invoke('app:getState', 'claudeDefaultPrompt').then((value: string | null) => {
@@ -194,6 +345,48 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
       ipcRenderer.removeListener('terminal:command-finished', handleFinished);
     };
   }, [activeTabId]);
+
+  // Reset Anthropic effort when shell exit fires for any tab (listens for OSC 133 D event).
+  // Anthropic effort is Claude TUI state — Claude CLI loses it on exit, but local effortLevel map
+  // kept the stale value, suggesting an effort that no longer applies. Guard `data.tabId in prev`
+  // skips re-render for tabs that never had effort set (bash/zsh tabs, sub-agents that didn't get effort).
+  // DeepSeek effort lives in main process providerStates and is intentionally NOT reset — it's a
+  // per-tab UI config, persists across Claude exits and only clears when the tab itself closes.
+  useEffect(() => {
+    const handleAnyFinished = (_: any, data: { tabId: string }) => {
+      setEffortLevel(prev => {
+        if (!(data.tabId in prev)) return prev;
+        const next = { ...prev };
+        delete next[data.tabId];
+        return next;
+      });
+      // Same reset semantics for Think — Claude restart re-applies alwaysThinkingEnabled
+      // from settings.json (default ON), so any local toggle from the previous run is moot.
+      setThinkActive(prev => {
+        if (!(data.tabId in prev)) return prev;
+        const next = { ...prev };
+        delete next[data.tabId];
+        return next;
+      });
+    };
+    ipcRenderer.on('terminal:command-finished', handleAnyFinished);
+    return () => { ipcRenderer.removeListener('terminal:command-finished', handleAnyFinished); };
+  }, []);
+
+  // Sync local effortLevel UI state with auto-injected /effort at Claude startup.
+  // Terminal.tsx fires claude:send-command with /effort <defaultClaudeEffort> on
+  // claude:process-started — but that only updates the PTY process, not this local
+  // Map. Without this listener the Effort pills would show the default as active even
+  // though Claude is actually running at 'max'.
+  useEffect(() => {
+    const handleProcessStarted = (_: any, data: { tabId: string; sessionId: string; claudePid: number }) => {
+      const eff = useUIStore.getState().defaultClaudeEffort;
+      if (!eff || eff === 'none') return;
+      setEffortLevel(prev => ({ ...prev, [data.tabId]: eff }));
+    };
+    ipcRenderer.on('claude:process-started', handleProcessStarted);
+    return () => { ipcRenderer.removeListener('claude:process-started', handleProcessStarted); };
+  }, []);
 
   useEffect(() => {
     const handler = (_: any, data: { tabId: string; model: string; contextPct: number }) => {
@@ -415,12 +608,12 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
     if (!validationResult) return null;
     const parts: React.ReactNode[] = [];
     if (validationResult.claude?.status === 'found') {
-      parts.push(<span key="c" className="text-green-400" title={validationResult.claude.preview || ''}>C: {validationResult.claude.fullId?.substring(0, 8)}</span>);
+      parts.push(<span key="c" className="text-green-400">C: {validationResult.claude.fullId?.substring(0, 8)}</span>);
     } else if (validationResult.claude?.status === 'not-found') {
       parts.push(<span key="c" className="text-red-400/60">C: not found</span>);
     }
     if (validationResult.gemini?.status === 'found') {
-      parts.push(<span key="g" className="text-green-400" title={validationResult.gemini.preview || ''}>G: {validationResult.gemini.fullId?.substring(0, 8)}</span>);
+      parts.push(<span key="g" className="text-green-400">G: {validationResult.gemini.fullId?.substring(0, 8)}</span>);
     } else if (validationResult.gemini?.status === 'not-found') {
       parts.push(<span key="g" className="text-red-400/60">G: not found</span>);
     }
@@ -461,7 +654,10 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
     <div className="h-full flex flex-col p-3">
       {/* Upper sections — scrollable independently */}
       <div className="overflow-y-auto min-h-0 shrink">
-      <div className="mb-4">
+      {/* mb-2 (8px) — leaves room before the standalone divider rule.
+          Total gap to PROVIDER = mb-2 (8) + rule (0) + provider mt-2 (8) = 16px,
+          with the line sitting exactly at the midpoint. No padding stacking. */}
+      <div className="mb-2">
         <div className="flex items-center mb-2" style={{ gap: 6 }}>
           {/* Tree mode toggle — for any AI session with timeline */}
           {hasAnySession && activeTabId && (
@@ -481,7 +677,6 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
               }}
               onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.color = isTreeMode ? '#a5b4fc' : '#888'; }}
               onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.color = isTreeMode ? '#818cf8' : '#555'; }}
-              title={isTreeMode ? 'Close tree view (⌘])' : 'Open tree view (⌘])'}
             >
               <GitBranch size={12} />
             </button>
@@ -505,7 +700,6 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
               }}
               onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.color = isHistoryOpen ? '#a5b4fc' : '#888'; }}
               onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.color = isHistoryOpen ? '#818cf8' : '#555'; }}
-              title={isHistoryOpen ? 'Close History (⌘\\)' : 'Open History (⌘\\)'}
             >
               {isHistoryOpen && historyLoading ? (
                 <svg width="12" height="12" viewBox="0 0 16 16" style={{ animation: 'spinner-rotate 1s linear infinite', willChange: 'transform', flexShrink: 0 }}>
@@ -524,139 +718,444 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
           )}
         </div>
         {hasAnySession ? (
+          <>
           <div className={`rounded p-2 ${currentSessionType === 'claude' ? 'bg-[#2a3a2a] border border-[#3a5a3a]' : 'bg-[#1a2a3a] border border-[#2a4a6a]'}`}>
-            <div className="flex items-center gap-2 mb-1">
-              <span
-                className="cursor-pointer flex-shrink-0 leading-none"
-                style={{ color: sessionCopied ? '#4ade80' : '#888', fontSize: '14px' }}
-                onClick={() => {
-                  if (sessionId) {
-                    navigator.clipboard.writeText(sessionId);
-                    setSessionCopied(true);
-                    setTimeout(() => setSessionCopied(false), 1000);
-                  }
-                }}
-                title="Copy session ID"
-              >
-                {sessionCopied ? '✓' : '⎘'}
-              </span>
-              <span className={`text-xs font-medium ${currentSessionType === 'claude' ? 'text-[#DA7756]' : 'text-[#4E86F8]'}`}>
-                {currentSessionType === 'claude' ? 'Claude' : 'Gemini'}
-              </span>
-              {hasAnySession && activeTabId && !isCommandRunning && (
-                <code
-                  className="text-xs cursor-pointer hover:underline px-1.5 py-0.5 bg-[#1a1a1a] rounded"
-                  style={{ color: currentSessionType === 'claude' ? '#DA7756' : '#4E86F8' }}
+            <div className="flex items-center gap-1.5">
+              {/* Triplet: ⎘ — Claude — ↻. All three share a permanent dark bg
+                  (rgba(0,0,0,0.55)); they sit flush via gap-0 and segmented
+                  rounding (left / none / right). Hover swaps text colour only —
+                  no bg change, no layout shift. */}
+              <div className="inline-flex items-center" style={{ gap: 0 }}>
+                <span
+                  className="cursor-pointer flex-shrink-0 inline-flex items-center justify-center"
+                  style={{
+                    color: sessionCopied ? '#4ade80' : '#888',
+                    fontSize: 13,
+                    lineHeight: 1,
+                    width: 22,
+                    height: 18,
+                    backgroundColor: 'rgba(0,0,0,0.55)',
+                    borderTopLeftRadius: 4,
+                    borderBottomLeftRadius: 4,
+                    transition: 'color 0.12s',
+                    userSelect: 'none',
+                  }}
+                  onMouseEnter={(e) => {
+                    if (sessionCopied) return;
+                    (e.currentTarget as HTMLSpanElement).style.color = '#ddd';
+                  }}
+                  onMouseLeave={(e) => {
+                    if (sessionCopied) return;
+                    (e.currentTarget as HTMLSpanElement).style.color = '#888';
+                  }}
                   onClick={() => {
-                    if (activeTabId && currentSessionType === 'claude') {
+                    if (sessionId) {
+                      navigator.clipboard.writeText(sessionId);
+                      setSessionCopied(true);
+                      setTimeout(() => setSessionCopied(false), 1000);
+                    }
+                  }}
+                >
+                  {sessionCopied ? '✓' : '⎘'}
+                </span>
+                <SessionActionChip
+                  sessionType={currentSessionType}
+                  sessionId={sessionId}
+                  isCommandRunning={isCommandRunning}
+                  hasAnySession={hasAnySession}
+                  onContinue={() => {
+                    if (!activeTabId) return;
+                    if (currentSessionType === 'claude') {
                       setTabCommandType(activeTabId, 'claude');
                       terminalRegistry.get(activeTabId)?.scrollToBottom();
                       window.dispatchEvent(new CustomEvent('timeline:scroll-to-bottom', { detail: { tabId: activeTabId } }));
                       ipcRenderer.send('claude:run-command', { tabId: activeTabId, command: 'claude-c', sessionId: claudeSessionId });
-                    } else if (activeTabId && currentSessionType === 'gemini') {
+                    } else if (currentSessionType === 'gemini') {
                       setTabCommandType(activeTabId, 'gemini');
                       terminalRegistry.get(activeTabId)?.scrollToBottom();
                       window.dispatchEvent(new CustomEvent('timeline:scroll-to-bottom', { detail: { tabId: activeTabId } }));
                       ipcRenderer.send('gemini:run-command', { tabId: activeTabId, command: 'gemini-c', sessionId: geminiSessionId });
                     }
                   }}
-                  title={currentSessionType === 'claude' ? 'Продолжить (claude --resume)' : 'Продолжить (gemini --resume)'}
-                >Продолжить</code>
-              )}
-              <div className="flex-1" />
-              {activeTabId && (
-                <button
-                  className="text-[10px] px-1.5 py-0.5 rounded cursor-pointer text-[#444] hover:text-[#aaa] hover:bg-[#ffffff08]"
-                  onClick={() => {
-                    window.dispatchEvent(new CustomEvent('timeline:force-refresh', { detail: { tabId: activeTabId } }));
+                  onStop={async () => {
+                    if (!activeTabId) return;
+                    try {
+                      const res = await ipcRenderer.invoke('terminal:stop-ai-process', activeTabId);
+                      if (!res?.success) console.warn('[SessionStop] failed:', res?.error);
+                    } catch (e: any) { console.error('[SessionStop] error', e); }
                   }}
-                  title="Refresh timeline"
-                >↻</button>
-              )}
+                  onCopyId={() => {
+                    if (sessionId) {
+                      navigator.clipboard.writeText(sessionId);
+                      setSessionCopied(true);
+                      setTimeout(() => setSessionCopied(false), 1000);
+                    }
+                  }}
+                />
+                {activeTabId && (
+                  <button
+                    className="flex-shrink-0 inline-flex items-center justify-center cursor-pointer"
+                    style={{
+                      color: '#888',
+                      fontSize: 13,
+                      lineHeight: 1,
+                      width: 22,
+                      height: 18,
+                      padding: 0,
+                      background: 'rgba(0,0,0,0.55)',
+                      border: 'none',
+                      borderTopRightRadius: 4,
+                      borderBottomRightRadius: 4,
+                      transition: 'color 0.12s',
+                      userSelect: 'none',
+                    }}
+                    onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.color = '#ddd'; }}
+                    onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.color = '#888'; }}
+                    onClick={() => {
+                      window.dispatchEvent(new CustomEvent('timeline:force-refresh', { detail: { tabId: activeTabId } }));
+                    }}
+                  >↻</button>
+                )}
+              </div>
+              <div className="flex-1" />
               {isSDKTab && activeTabId && (
                 <button
                   className="text-[10px] px-1.5 py-0.5 rounded cursor-pointer text-[#444] hover:text-[#aaa] hover:bg-[#ffffff08]"
                   onClick={() => {
                     window.dispatchEvent(new CustomEvent('claude-sdk:reload', { detail: { tabId: activeTabId } }));
                   }}
-                  title="Reload SDK chat"
                 >⟳</button>
               )}
-              {activeTabId && (
-                <button
-                  className={`text-[10px] px-1.5 py-0.5 rounded cursor-pointer ${
-                    sessionInputMode ? 'text-[#aaa] bg-[#ffffff10]' : 'text-[#444] hover:text-[#aaa] hover:bg-[#ffffff08]'
-                  }`}
-                  onClick={() => {
-                    if (sessionInputMode) { setSessionInputMode(null); setManualSessionId(''); setValidationResult(null); }
-                    else { setSessionInputMode('claude'); setManualSessionId(''); setTimeout(() => sessionInputRef.current?.focus(), 50); }
-                  }}
-                  title="Replace session ID"
-                >✎</button>
-              )}
-            </div>
-            <code className="text-[10px] text-[#aaa] break-all block">{sessionId}</code>
-
-            {sessionInputMode && renderSessionInput()}
-
-            <button
-              className="mt-2 w-full text-[10px] px-2 py-1 rounded text-[#888] hover:text-white bg-[#333] hover:bg-[#444] cursor-pointer"
-              onClick={async () => {
-                if (!sessionId || !activeTabId || !currentSessionType) return;
-                const state = useWorkspaceStore.getState();
-                for (const [projectId, workspace] of state.openProjects) {
-                  const tab = workspace.tabs.get(activeTabId);
-                  if (tab) {
-                    const storeId = currentSessionType === 'claude' ? tab.claudeSessionId : tab.geminiSessionId;
-                    console.warn('[InfoPanel:Fork] activeTabId:', activeTabId, 'closureSessionId:', sessionId, 'storeSessionId:', storeId, 'match:', sessionId === storeId);
-                    const currentCwd = tab.cwd || project?.path || '';
-                    const forkName = tab.name ? `${tab.name}_fork` : undefined;
-                    await state.createTabAfterCurrent(projectId, forkName, currentCwd, {
-                      pendingAction: { type: currentSessionType === 'claude' ? 'claude-fork' : 'gemini-fork', sessionId: sessionId },
-                      nameSetManually: !!forkName,
-                    });
-                    showToast(`Fork ${currentSessionType === 'claude' ? 'Claude' : 'Gemini'} → ${forkName || 'новая вкладка'}`, 'success');
-                    break;
-                  }
-                }
-              }}
-              title="Fork session to new tab (ПКМ → Open in SDK)"
-              onContextMenu={(e) => {
-                e.preventDefault();
-                if (!activeTabId || !sessionId) return;
-                if (isSDKTab) return; // already SDK
-                const { convertToSDKTab } = useWorkspaceStore.getState();
-                convertToSDKTab(activeTabId);
-                showToast('Converted to SDK tab', 'success');
-              }}
-            >
-              ⑂ Fork в новую вкладку
-            </button>
-            {currentSessionType === 'claude' && sessionId && (
+              {/* «Заменить сессию» (✎ Replace) — функционал пока не работает корректно, кнопка временно убрана. */}
               <button
-                className="mt-1 w-full text-[10px] px-2 py-1 rounded text-[#DA7756] hover:text-white bg-[#333] hover:bg-[#444] cursor-pointer"
+                className="text-[10px] px-1.5 py-0.5 rounded text-[#888] hover:text-white bg-[#333] hover:bg-[#444] cursor-pointer leading-none flex items-center gap-0.5"
                 onClick={async () => {
-                  if (!sessionId || !activeTabId) return;
+                  if (!sessionId || !activeTabId || !currentSessionType) return;
                   const state = useWorkspaceStore.getState();
                   for (const [projectId, workspace] of state.openProjects) {
                     const tab = workspace.tabs.get(activeTabId);
                     if (tab) {
                       const currentCwd = tab.cwd || project?.path || '';
-                      const forkResult = await ipcRenderer.invoke('claude:fork-session-file', { sourceSessionId: sessionId, cwd: currentCwd, skipChainResolve: true });
-                      if (!forkResult.success) { showToast('Fork failed: ' + forkResult.error, 'error'); return; }
-                      const sdkTabId = await state.createSDKTab(projectId);
-                      state.updateSDKState(sdkTabId, { claudeSessionId: forkResult.newSessionId });
-                      showToast('SDK fork ← ' + sessionId.slice(0, 8), 'success');
+                      const forkName = tab.name ? `${tab.name}_fork` : undefined;
+                      await state.createTabAfterCurrent(projectId, forkName, currentCwd, {
+                        pendingAction: { type: currentSessionType === 'claude' ? 'claude-fork' : 'gemini-fork', sessionId: sessionId },
+                        nameSetManually: !!forkName,
+                      });
+                      showToast(`Fork ${currentSessionType === 'claude' ? 'Claude' : 'Gemini'} → ${forkName || 'новая вкладка'}`, 'success');
                       break;
                     }
                   }
                 }}
-                title="Fork current session into SDK tab"
-              >
-                ⑂ Fork → SDK
-              </button>
-            )}
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  if (!activeTabId || !sessionId) return;
+                  if (isSDKTab) return;
+                  const { convertToSDKTab } = useWorkspaceStore.getState();
+                  convertToSDKTab(activeTabId);
+                  showToast('Converted to SDK tab', 'success');
+                }}
+              >⑂→<span style={{ fontSize: '11px' }}>▭</span></button>
+              {currentSessionType === 'claude' && sessionId && (
+                <button
+                  className="text-[10px] px-1.5 py-0.5 rounded text-[#DA7756] hover:text-white bg-[#333] hover:bg-[#444] cursor-pointer leading-none"
+                  onClick={async () => {
+                    if (!sessionId || !activeTabId) return;
+                    const state = useWorkspaceStore.getState();
+                    for (const [projectId, workspace] of state.openProjects) {
+                      const tab = workspace.tabs.get(activeTabId);
+                      if (tab) {
+                        const currentCwd = tab.cwd || project?.path || '';
+                        const forkResult = await ipcRenderer.invoke('claude:fork-session-file', { sourceSessionId: sessionId, cwd: currentCwd, skipChainResolve: true });
+                        if (!forkResult.success) { showToast('Fork failed: ' + forkResult.error, 'error'); return; }
+                        const sdkTabId = await state.createSDKTab(projectId);
+                        state.updateSDKState(sdkTabId, { claudeSessionId: forkResult.newSessionId });
+                        showToast('SDK fork ← ' + sessionId.slice(0, 8), 'success');
+                        break;
+                      }
+                    }
+                  }}
+                >⑂→SDK</button>
+              )}
+            </div>
+
+            {sessionInputMode && renderSessionInput()}
           </div>
+          <div className="mt-1.5 flex justify-between items-center gap-2">
+            <CopySessionButton activeTabId={activeTabId} sessionType={currentSessionType} />
+            {currentSessionType === 'claude' && activeTabId && (() => {
+              // Shared copy step. `clear` flag chains a separate IPC to wipe Claude's input.
+              const handleCopyPrompt = async (clearAfter: boolean) => {
+                try {
+                  const res = await ipcRenderer.invoke('claude:copy-input', activeTabId);
+                  if (res?.success && typeof res.text === 'string') {
+                    const t = res.text;
+                    if (!t.trim()) { showToast('Claude input is empty', 'warning'); return; }
+                    const { clipboard } = window.require('electron');
+                    const annotated = res.images > 0 ? t + `\n\n[note: ${res.images} image(s) not copied]` : t;
+                    clipboard.writeText(annotated);
+                    const oneLine = t.replace(/\s+/g, ' ').trim();
+                    const preview = oneLine.length > 20 ? oneLine.slice(0, 20) + '…' : oneLine;
+                    const verb = clearAfter ? 'Copied + cleared' : 'Copied';
+                    showToast(`${verb}: "${preview}"${res.images ? ` · ${res.images} 📎` : ''}`, 'success', 1800);
+                    if (clearAfter) {
+                      // Refocus terminal so Ink's render loop is hot — otherwise the alt-screen
+                      // "Save and close editor..." flash plays back when the user later focuses.
+                      focusActiveTerminal(activeTabId);
+                      ipcRenderer.invoke('claude:clear-input', activeTabId).catch(() => {});
+                    }
+                  } else {
+                    const code = res?.error || 'timeout';
+                    const msgs: Record<string, string> = {
+                      no_claude_session: 'No Claude session',
+                      claude_busy: 'Claude is busy — wait for response',
+                      wrong_editor: 'Restart Claude in this tab (editor not wired)',
+                      editor_not_wired: 'Helper not reachable',
+                    };
+                    showToast(msgs[code] || `Copy failed: ${code}`, 'error');
+                  }
+                } catch (e: any) {
+                  showToast(`Copy failed: ${e?.message || e}`, 'error');
+                }
+              };
+              // Split-pill — neutral light palette (white-ish text, subtle dark bg).
+              // Claude-orange was too loud next to CopySessionButton; this is a quieter
+              // utility action — visually recedes until hover.
+              return (
+                <div
+                  className="inline-flex items-stretch rounded select-none overflow-hidden"
+                  style={{
+                    height: 26,
+                    border: '1px solid rgba(255,255,255,0.12)',
+                    backgroundColor: 'rgba(255,255,255,0.03)',
+                    color: '#bbb',
+                    fontSize: 11,
+                  }}
+                >
+                  {/* Left half: ⎘ prompt (copy only) */}
+                  <button
+                    onClick={() => handleCopyPrompt(false)}
+                    className="inline-flex items-center gap-1.5 cursor-pointer hover:bg-[rgba(255,255,255,0.06)] hover:text-white transition-colors"
+                    style={{ padding: '0 10px', background: 'transparent', border: 'none', color: 'inherit' }}
+                  >
+                    <span style={{ fontSize: 13, lineHeight: 1 }}>⎘</span>
+                    <span>prompt</span>
+                  </button>
+                  {/* Divider — matches outer border tone */}
+                  <span style={{ width: 1, alignSelf: 'center', height: '70%', backgroundColor: 'rgba(255,255,255,0.12)' }} />
+                  {/* Right half: + clear (copy + wipe input) */}
+                  <button
+                    onClick={() => handleCopyPrompt(true)}
+                    className="inline-flex items-center gap-1 cursor-pointer hover:bg-[rgba(255,255,255,0.06)] hover:text-white transition-colors"
+                    style={{ padding: '0 10px', background: 'transparent', border: 'none', color: 'inherit' }}
+                  >
+                    <span style={{ fontSize: 13, lineHeight: 1 }}>+</span>
+                    <span>clear</span>
+                  </button>
+                </div>
+              );
+            })()}
+          </div>
+          {/* Markers row — sits in the gap before the next section. Replaces the unreadable
+              corner-dots that used to live on the 📋 icon. Each chip reflects a copyInclude*
+              flag: enabled = orange (Claude brand), disabled = dim grey. Clicking toggles —
+              bidirectional with the popup, so users see what's in the clipboard at a glance
+              and can flip flags without opening settings. */}
+          {currentSessionType === 'claude' && (() => {
+            const ON = '#DA7756';
+            const OFF = '#555';
+            const ChipText = ({ active, children, onClick, title, italic = false }:
+              { active: boolean; children: React.ReactNode; onClick: () => void; title: string; italic?: boolean }) => (
+              <button
+                onClick={onClick}
+                className="cursor-pointer hover:opacity-80 transition-opacity"
+                style={{
+                  background: 'transparent', border: 'none', padding: 0,
+                  color: active ? ON : OFF,
+                  fontSize: 9.5,
+                  fontFamily: 'ui-monospace, SFMono-Regular, monospace',
+                  fontStyle: italic ? 'italic' : 'normal',
+                  lineHeight: 1.2,
+                  letterSpacing: '-0.01em',
+                }}
+              >{children}</button>
+            );
+            const dot = <span style={{ color: '#333', fontSize: 10, lineHeight: 1.2 }}>·</span>;
+            return (
+              <div
+                className="mt-1.5 flex items-center flex-wrap select-none"
+                style={{
+                  gap: '2px 4px',
+                  // Reserve space for up to 2 wrapped rows so toggling chips (e.g. enabling
+                  // subagents, switching fork mode) cannot shift КОНТРОЛЬ below.
+                  minHeight: 26,
+                  alignContent: 'flex-start',
+                }}
+              >
+                {/* User chip — Lucide icon, tinted same way as Claude's sparkle. Emoji
+                    👤 had its own Apple-blue colour and broke the orange/grey palette. */}
+                <button
+                  onClick={() => setCopyIncludeUser(!includeUser)}
+                  className="cursor-pointer hover:opacity-80 transition-opacity inline-flex items-center"
+                  style={{ background: 'transparent', border: 'none', padding: 0, lineHeight: 1, color: includeUser ? ON : OFF }}
+                >
+                  <UserIcon size={11} strokeWidth={2} />
+                </button>
+                {dot}
+                {/* Claude chip — brand sparkle, tinted */}
+                <button
+                  onClick={() => setCopyIncludeClaude(!includeClaude)}
+                  className="cursor-pointer hover:opacity-80 transition-opacity inline-flex items-center"
+                  style={{ background: 'transparent', border: 'none', padding: 0, lineHeight: 1 }}
+                >
+                  <ClaudeSparkle size={11} color={includeClaude ? ON : OFF} />
+                </button>
+                {dot}
+                {/* Sub-chips — clicking turns parent (includeClaude) on automatically if
+                    it was off. Without this, sub-chips appear disabled and clicks do
+                    nothing — surprising behaviour when user wants e.g. "only thinking". */}
+                <ChipText
+                  italic
+                  active={includeClaude && includeText}
+                  onClick={() => { if (!includeClaude) setCopyIncludeClaude(true); setCopyIncludeText(!(includeClaude && includeText)); }}
+                  title="«text» — финальные ответы Claude"
+                >text</ChipText>
+                {dot}
+                <ChipText
+                  italic
+                  active={includeClaude && includeThinking}
+                  onClick={() => { if (!includeClaude) setCopyIncludeClaude(true); setCopyIncludeThinking(!(includeClaude && includeThinking)); }}
+                  title="«thinking» — extended thinking blocks"
+                >thinking</ChipText>
+                {dot}
+                <ChipText
+                  active={includeClaude && includeReading}
+                  onClick={() => { if (!includeClaude) setCopyIncludeClaude(true); setCopyIncludeReading(!(includeClaude && includeReading)); }}
+                  title="read_file — Read tool"
+                >read</ChipText>
+                {dot}
+                <ChipText
+                  active={includeClaude && includeEditing}
+                  onClick={() => { if (!includeClaude) setCopyIncludeClaude(true); setCopyIncludeEditing(!(includeClaude && includeEditing)); }}
+                  title="edit, write"
+                >edit</ChipText>
+                {dot}
+                <ChipText
+                  active={includeClaude && includeBash}
+                  onClick={() => { if (!includeClaude) setCopyIncludeClaude(true); setCopyIncludeBash(!(includeClaude && includeBash)); }}
+                  title="bash, monitor, grep, glob — shell-команды"
+                >bash</ChipText>
+                {dot}
+                <ChipText
+                  active={includeClaude && includeTools}
+                  onClick={() => { if (!includeClaude) setCopyIncludeClaude(true); setCopyIncludeTools(!(includeClaude && includeTools)); }}
+                  title="mcp__*, web_search"
+                >mcp</ChipText>
+                {/* Fork chip — always rendered to reserve space. Blue when fromStart=false
+                    (copy starts at the fork point, not session start); grey otherwise.
+                    Click toggles. Lives left of the sub-chip. */}
+                {dot}
+                <button
+                  onClick={() => setCopyFromStart(!fromStart)}
+                  className="cursor-pointer hover:opacity-80 transition-opacity inline-flex items-center"
+                  style={{
+                    background: 'transparent', border: 'none', padding: 0,
+                    color: !fromStart ? '#3b82f6' : OFF,
+                    fontSize: 9.5,
+                    fontFamily: 'ui-monospace, SFMono-Regular, monospace',
+                    lineHeight: 1.2,
+                    gap: 3,
+                  }}
+                >
+                  <span style={{ fontSize: 10, lineHeight: 1 }}>⑂</span>
+                  <span>fork</span>
+                </button>
+                {/* Subagent split-pill — always rendered (reserves height so toggling
+                    sub-flags doesn't push КОНТРОЛЬ down).
+                    Left half "sub-": click toggles whole subagent off / on (defaults to result).
+                                       hover greys the whole pill (preview of "click → off").
+                    Right half "result" | "full": click switches between result-only and full-history.
+                                       hover swaps the label so user sees what click would change to.
+                    State logic: off (both false) | result (result=true) | full (history=true, result=false). */}
+                {dot}
+                {(() => {
+                  const subOn = includeSubagentResult || includeSubagentHistory;
+                  const isFull = includeSubagentHistory;
+                  // Each half is independent. Left ("sub-") toggles ON/OFF in the
+                  // preferred mode. Right ("result"/"full") swaps the mode — even when
+                  // subagents are OFF: it changes the preferred future-mode without
+                  // turning anything on (deterministic — click does only one thing).
+                  // When ON, displayed label tracks the real flag; when OFF, it tracks
+                  // subPreferred so the user can pre-select before flipping the left half.
+                  const sideColor = subOn ? ON : OFF;
+                  const rightLabel = subOn ? (isFull ? 'full' : 'result') : subPreferred;
+                  return (
+                    <span
+                      className="inline-flex items-center select-none"
+                      style={{
+                        fontSize: 9.5,
+                        fontFamily: 'ui-monospace, SFMono-Regular, monospace',
+                        lineHeight: 1.2,
+                      }}
+                    >
+                      <button
+                        onClick={() => {
+                          if (subOn) {
+                            // Turn both off — preferred mode is remembered for next time.
+                            setCopyIncludeSubagentResult(false);
+                            setCopyIncludeSubagentHistory(false);
+                          } else {
+                            // Turn ON in whichever mode the right-half currently shows.
+                            if (subPreferred === 'full') {
+                              setCopyIncludeSubagentHistory(true);
+                              setCopyIncludeSubagentResult(false);
+                            } else {
+                              setCopyIncludeSubagentResult(true);
+                              setCopyIncludeSubagentHistory(false);
+                            }
+                          }
+                        }}
+                        className="cursor-pointer hover:opacity-80 transition-opacity"
+                        style={{
+                          background: 'transparent', border: 'none', padding: 0,
+                          color: sideColor,
+                          fontSize: 9.5,
+                          fontFamily: 'inherit',
+                          lineHeight: 1.2,
+                        }}
+                      >sub-</button>
+                      <button
+                        onClick={() => {
+                          // Deterministic: this half ONLY swaps mode. Never turns
+                          // subagents on/off — that's the left half's job.
+                          if (!subOn) {
+                            // Swap the displayed (preferred) mode; flags stay false.
+                            setSubPreferred(subPreferred === 'result' ? 'full' : 'result');
+                          } else if (isFull) {
+                            setCopyIncludeSubagentHistory(false);
+                            setCopyIncludeSubagentResult(true);
+                            setSubPreferred('result');
+                          } else {
+                            setCopyIncludeSubagentResult(false);
+                            setCopyIncludeSubagentHistory(true);
+                            setSubPreferred('full');
+                          }
+                        }}
+                        className="cursor-pointer hover:opacity-80 transition-opacity"
+                        style={{
+                          background: 'transparent', border: 'none', padding: 0,
+                          color: sideColor,
+                          fontSize: 9.5,
+                          fontFamily: 'inherit',
+                          lineHeight: 1.2,
+                        }}
+                      >{rightLabel}</button>
+                    </span>
+                  );
+                })()}
+              </div>
+            );
+          })()}
+          </>
         ) : (activeCommandType === 'claude' || activeCommandType === 'gemini') ? (
           <div className="bg-[#2a2a2a] border border-[#3a3a3a] rounded p-2">
             <div className="flex items-center justify-between">
@@ -664,34 +1163,132 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                 <span className="w-2.5 h-2.5 rounded-full bg-yellow-600 animate-glow-yellow shadow-[0_0_8px_rgba(217,119,6,0.4)]"></span>
                 <span className="text-white/70 font-bold text-[10px] tracking-widest uppercase">WAITING FOR SESSION...</span>
               </div>
-              <button className="text-[10px] text-[#666] hover:text-[#aaa] cursor-pointer" onClick={() => { if (activeTabId) { setTabCommandType(activeTabId, 'generic'); setActiveCommandType(null); } }} title="Отменить ожидание">✕</button>
+              <button className="text-[10px] text-[#666] hover:text-[#aaa] cursor-pointer" onClick={() => { if (activeTabId) { setTabCommandType(activeTabId, 'generic'); setActiveCommandType(null); } }}>✕</button>
             </div>
           </div>
         ) : (
           <div className="bg-[#2a2a2a] border border-[#3a3a3a] rounded p-2">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <span className="w-2 h-2 rounded-full bg-[#666]"></span>
-                <span className="text-[#888] text-xs">Нет активной сессии</span>
-              </div>
+            {/* No-session state — same chip triplet as the КОМАНДЫ row below, kept
+                visually consistent. The "Нет активной сессии" text label was redundant
+                with the grey dot — removed. Chips sit left so they fall in the natural
+                scan path; clicking spawns the corresponding session into this tab. */}
+            <div className="flex items-center gap-2">
+              <span className="w-2 h-2 rounded-full bg-[#666] flex-shrink-0" />
               {activeTabId && (
-                <button
-                  className={`text-[10px] cursor-pointer ${sessionInputMode ? 'text-[#aaa]' : 'text-[#555] hover:text-[#aaa]'}`}
-                  onClick={() => {
-                    if (sessionInputMode) { setSessionInputMode(null); setManualSessionId(''); setValidationResult(null); }
-                    else { setSessionInputMode('claude'); setManualSessionId(''); setTimeout(() => sessionInputRef.current?.focus(), 50); }
+                <div className="flex">
+                  <code
+                    className="text-xs cursor-pointer hover:underline px-1.5 py-0.5 bg-[#1a1a1a] rounded-l"
+                    style={{ color: '#DA7756' }}
+                    onClick={() => {
+                      if (!activeTabId) { showToast('Нет активного таба', 'error'); return; }
+                      const effectiveDefault = claudeDefaultPromptEnabled ? claudeDefaultPrompt : '';
+                      const finalPrompt = [effectiveDefault, claudeExtraPrompt].filter(Boolean).join('\n\n');
+                      setTabCommandType(activeTabId, 'claude');
+                      ipcRenderer.send('claude:run-command', { tabId: activeTabId, command: 'claude', prompt: finalPrompt || undefined });
+                    }}
+                  >claude</code>
+                  <code
+                    className="text-xs cursor-pointer hover:underline px-1.5 py-0.5 bg-[#1a1a1a] border-l border-[#333]"
+                    style={{ color: '#DA7756' }}
+                    onClick={() => {
+                      if (!activeTabId) { showToast('Нет активного таба', 'error'); return; }
+                      const { convertToSDKTab } = useWorkspaceStore.getState();
+                      convertToSDKTab(activeTabId);
+                    }}
+                  >sdk</code>
+                  <code
+                    className="text-xs cursor-pointer hover:underline px-1.5 py-0.5 bg-[#1a1a1a] rounded-r border-l border-[#333]"
+                    style={{ color: '#4E86F8' }}
+                    onClick={() => {
+                      if (!activeTabId) { showToast('Нет активного таба', 'error'); return; }
+                      setTabCommandType(activeTabId, 'gemini');
+                      ipcRenderer.send('gemini:spawn-with-watcher', { tabId: activeTabId, cwd: getCurrentCwd(), yesMode: true });
+                    }}
+                  >gemini</code>
+                </div>
+              )}
+              {/* Default-prompt sticker — replaces the old "Default" pill + "С промптом"
+                  caption. Visible only when a default prompt is configured AND enabled.
+                  Sparkle icon hints "this Claude run is seeded with a stored prompt";
+                  Cmd-hover surfaces the full prompt text via Tooltip. */}
+              {claudeDefaultPrompt && claudeDefaultPromptEnabled && (
+                <span
+                  className="inline-flex items-center justify-center rounded select-none"
+                  style={{
+                    color: '#DA7756',
+                    width: 18,
+                    height: 18,
+                    backgroundColor: 'rgba(218,119,86,0.12)',
+                    cursor: 'help',
+                    lineHeight: 1,
                   }}
-                >Set ID</button>
+                >
+                  <ClaudeSparkle size={11} color="#DA7756" />
+                </span>
               )}
             </div>
-            {sessionInputMode && activeTabId && renderSessionInput()}
           </div>
         )}
       </div>
 
+      {(hasClaudeSession || isSDKTab) && (
+        // Standalone divider — zero-height <hr> with border-top, sits between sections.
+        // mb-2 above + this rule (0px) + mt-2 below on PROVIDER = 16px total, line in the middle.
+        <hr className="border-0 border-t border-[#2a2a2a] my-0" />
+      )}
       {(hasClaudeSession || isSDKTab) && activeTabId && (
-        <div className="mb-4">
-          <div className="text-[11px] uppercase text-[#888] mb-2">Контроль</div>
+        // mt-2 (8px) = bottom half of the 16px gap to the AI SESSION block above.
+        // No internal padding — the divider <hr> handles spacing externally.
+        <div className="mb-4 mt-2">
+          {/* Header row: "PROVIDER" label left, provider pills right (PTY tabs only).
+              Pills carry brand icon + brand color when active. Layout collapses the
+              old standalone "Provider" row inside Контроль into the header itself —
+              one row, denser, brand-tinted instead of generic blue. */}
+          <div className="flex items-center justify-between mb-2 gap-2">
+            <span className="text-[11px] uppercase text-[#888]">PROVIDER</span>
+            {!isSDKTab && (
+              <div className="flex items-center gap-1">
+                {PROVIDER_CATALOG.map((p) => {
+                  const isActive = providerState.type === p.id;
+                  const onClick = async () => {
+                    if (isControlBusy || isActive) return;
+                    setIsControlBusy(true);
+                    try {
+                      if (p.id === 'anthropic') {
+                        const result = await ipcRenderer.invoke('provider:switch', { tabId: activeTabId, type: 'anthropic' });
+                        setProviderState(result);
+                      } else {
+                        const remembered = providerMemoryRef.current[p.id] || PROVIDER_CATALOG.find(c => c.id === p.id)?.models[0]?.id;
+                        const result = await ipcRenderer.invoke('provider:switch', { tabId: activeTabId, type: p.id, model: remembered });
+                        setProviderState(result);
+                      }
+                    } finally { setIsControlBusy(false); }
+                  };
+                  return (
+                    <button
+                      key={p.id}
+                      onClick={onClick}
+                      disabled={isControlBusy}
+                      className={`inline-flex items-center gap-1 rounded ${isControlBusy ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'}`}
+                      style={{
+                        height: 18,
+                        padding: '0 6px',
+                        fontSize: 10,
+                        fontWeight: isActive ? 500 : 400,
+                        color: isActive ? p.tint : '#888',
+                        backgroundColor: isActive ? `${p.tint}1F` : 'transparent',
+                        border: `1px solid ${isActive ? `${p.tint}66` : 'rgba(255,255,255,0.08)'}`,
+                        transition: 'background-color 0.12s, color 0.12s, border-color 0.12s',
+                      }}
+                    >
+                      <p.Icon size={11} color={isActive ? p.tint : '#888'} />
+                      <span>{p.label}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </div>
           <div className="space-y-2">
             {/* SDK tab: keep legacy single Model row (no provider switching) */}
             {isSDKTab && (
@@ -712,7 +1309,6 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                         updateSDKState(activeTabId, { sdkModel: model });
                         setThinkFlash(model); setTimeout(() => setThinkFlash(null), 1500);
                       }}
-                      title={'Switch to ' + model}
                     >{model}</button>
                   );
                 })}
@@ -733,26 +1329,15 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                 }
                 return providerState.model === mid;
               };
-              const switchProvider = async (id: ProviderId) => {
-                if (isControlBusy || id === providerState.type) return;
-                setIsControlBusy(true);
-                try {
-                  if (id === 'anthropic') {
-                    const result = await ipcRenderer.invoke('provider:switch', { tabId: activeTabId, type: 'anthropic' });
-                    setProviderState(result);
-                  } else {
-                    const remembered = providerMemoryRef.current[id] || PROVIDER_CATALOG.find(p => p.id === id)?.models[0]?.id;
-                    const result = await ipcRenderer.invoke('provider:switch', { tabId: activeTabId, type: id, model: remembered });
-                    setProviderState(result);
-                  }
-                } finally { setIsControlBusy(false); }
-              };
+              // switchProvider was inlined into the PROVIDER header pills above —
+              // each pill builds its own onClick with the right `p` in closure.
               const switchModel = async (mid: string, isCmd: boolean) => {
                 if (isControlBusy) return;
                 if (activeProvider.id === 'anthropic' && isCmd) {
                   // Anthropic: send /model command into live Claude TUI
                   setIsControlBusy(true);
-                  try { await ipcRenderer.invoke('claude:send-command', activeTabId, '/model ' + mid); } finally { setIsControlBusy(false); }
+                  try { await ipcRenderer.invoke('claude:send-command', activeTabId, '/model ' + mid); }
+                  finally { setIsControlBusy(false); focusActiveTerminal(activeTabId); }
                 } else if (activeProvider.id !== 'anthropic') {
                   // Zen/DeepSeek: update proxy model field and remember choice
                   setIsControlBusy(true);
@@ -760,28 +1345,14 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                   try {
                     const result = await ipcRenderer.invoke('provider:switch', { tabId: activeTabId, type: activeProvider.id, model: mid });
                     setProviderState(result);
-                  } finally { setIsControlBusy(false); }
+                  } finally { setIsControlBusy(false); focusActiveTerminal(activeTabId); }
                 }
               };
               return (
                 <>
-                  <div className="flex items-center gap-1">
-                    <span className="text-[10px] text-[#666] w-12 flex-shrink-0">Provider</span>
-                    <div className="flex gap-1 flex-1">
-                      {PROVIDER_CATALOG.map((p) => {
-                        const isActive = providerState.type === p.id;
-                        return (
-                          <button
-                            key={p.id}
-                            className={`flex-1 text-[10px] px-1 py-1 rounded ${isControlBusy ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'} ${isActive ? 'bg-[#6B8AFF] text-white font-medium' : 'bg-[#2d2d2d] text-[#888] hover:text-white hover:bg-[#3d3d3d]'}`}
-                            disabled={isControlBusy}
-                            onClick={() => switchProvider(p.id)}
-                            title={p.title}
-                          >{p.label}</button>
-                        );
-                      })}
-                    </div>
-                  </div>
+                  {/* Provider row moved into PROVIDER header above. switchProvider closure
+                      kept (still used? no — header has its own inline onClick). Below is
+                      Model row only. */}
                   <div className="flex items-center gap-1">
                     <span className="text-[10px] text-[#666] w-12 flex-shrink-0">Model</span>
                     <div className="flex gap-1 flex-1">
@@ -793,7 +1364,6 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                             className={`flex-1 text-[10px] px-1.5 py-1 rounded ${isControlBusy ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'} ${isActive ? 'bg-[#DA7756] text-white font-medium' : 'bg-[#2d2d2d] text-[#888] hover:text-white hover:bg-[#3d3d3d]'}`}
                             disabled={isControlBusy}
                             onClick={() => switchModel(m.id, !!m.cmd)}
-                            title={activeProvider.id === 'anthropic' ? ('Switch to ' + m.id) : ('Use ' + m.id + ' via ' + activeProvider.label)}
                           >{m.label}</button>
                         );
                       })}
@@ -813,8 +1383,8 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
               const dimClass = supportsKnobs ? '' : 'opacity-40 pointer-events-none';
               const titleSuffix = supportsKnobs ? '' : ' (not supported by ' + providerState.type + ')';
               // DeepSeek levels: 'off' means thinking disabled. low/medium/high enable thinking with corresponding effort.
-              // Anthropic: auto/low/medium/high/max (unchanged).
-              const effortLevels = isDeepSeek ? (['off','low','medium','high'] as const) : (['auto','low','medium','high','max'] as const);
+              // Anthropic: canonical list from constants/claudeLevels.ts (low/medium/high/xhigh/max as of May 2026).
+              const effortLevels = isDeepSeek ? DEEPSEEK_EFFORT_LEVELS : CLAUDE_EFFORT_LEVELS;
               // Effort active-state: for DeepSeek derived from providerState.effort (server-confirmed); for Anthropic read local tab map.
               const dsEffort = (providerState as { effort?: string }).effort || 'medium';
               return (
@@ -840,62 +1410,104 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                           key={level}
                           className={`flex-1 text-[10px] px-1.5 py-1 rounded cursor-pointer ${isActive ? 'bg-[#DA7756]/20 text-white font-medium' : 'bg-[#2d2d2d] text-[#888] hover:text-white hover:bg-[#3d3d3d]'}`}
                           onClick={async () => {
+                            // Toggle-off: clicking the currently active level deselects.
+                            // For Anthropic this means the lowest level ('low') — Claude no longer
+                            // supports 'auto' since May 2026. For DeepSeek the explicit 'off' state.
+                            const targetLevel = isActive
+                              ? (isDeepSeek ? 'off' : CLAUDE_EFFORT_TOGGLE_OFF)
+                              : level;
                             if (isSDKTab) {
                               const { updateSDKState } = useWorkspaceStore.getState();
-                              updateSDKState(activeTabId, { sdkEffort: level });
-                              setEffortLevel(prev => ({ ...prev, [activeTabId]: level }));
+                              updateSDKState(activeTabId, { sdkEffort: targetLevel });
+                              setEffortLevel(prev => ({ ...prev, [activeTabId]: targetLevel }));
+                              focusActiveTerminal(activeTabId);
                             } else if (isDeepSeek) {
                               if (isControlBusy) return;
                               setIsControlBusy(true);
                               try {
-                                const result = await ipcRenderer.invoke('provider:set-options', { tabId: activeTabId, effort: level });
+                                const result = await ipcRenderer.invoke('provider:set-options', { tabId: activeTabId, effort: targetLevel });
                                 setProviderState(result);
-                              } finally { setIsControlBusy(false); }
+                              } finally { setIsControlBusy(false); focusActiveTerminal(activeTabId); }
                             } else {
                               if (isControlBusy) return;
                               setIsControlBusy(true);
-                              if (activeTabId) setEffortLevel(prev => ({ ...prev, [activeTabId]: level }));
-                              try { await ipcRenderer.invoke('claude:send-command', activeTabId, '/effort ' + level); } finally { setIsControlBusy(false); }
+                              if (activeTabId) setEffortLevel(prev => ({ ...prev, [activeTabId]: targetLevel }));
+                              try { await ipcRenderer.invoke('claude:send-command', activeTabId, '/effort ' + targetLevel); }
+                              finally { setIsControlBusy(false); focusActiveTerminal(activeTabId); }
                             }
                           }}
-                          title={'Set effort to ' + level + titleSuffix}
                         >
-                          {level === 'medium' ? 'med' : level}
+                          {level === 'medium' ? 'med' : level === 'xhigh' ? 'xhi' : level}
                         </button>
                       );
                     })}
                   </div>
                 </div>
                 {/* DeepSeek: Think is folded into Effort row (off ↔ low/medium/high). Hide separate row. */}
-                {!isDeepSeek && (
+                {!isDeepSeek && (() => {
+                  // Think active-state: undefined ⇒ ON (Claude starts with alwaysThinkingEnabled by default).
+                  // First click flips to OFF. Reset back to undefined on Claude exit (OSC 133 D handler above).
+                  let isThinkActive: boolean;
+                  if (isSDKTab) {
+                    const state = useWorkspaceStore.getState();
+                    let sdkThinking = true;
+                    for (const [, ws] of state.openProjects) { const t = ws.tabs.get(activeTabId); if (t) { sdkThinking = t.sdkThinking !== false; break; } }
+                    isThinkActive = sdkThinking;
+                  } else {
+                    isThinkActive = activeTabId ? (thinkActive[activeTabId] ?? true) : true;
+                  }
+                  return (
                 <div className={`flex items-center gap-1 ${dimClass}`}>
                   <span className="text-[10px] text-[#666] w-12 flex-shrink-0">Think</span>
-                  <button
-                    className={`flex-1 text-[10px] px-1.5 py-1 rounded cursor-pointer bg-[#2d2d2d] ${thinkFlash ? 'text-[#b4b9f9]' : 'text-[#888] hover:text-white hover:bg-[#3d3d3d]'}`}
-                    onClick={async () => {
-                      if (isSDKTab) {
-                        const state = useWorkspaceStore.getState();
-                        let currentThinking = false;
-                        for (const [, ws] of state.openProjects) { const t = ws.tabs.get(activeTabId); if (t) { currentThinking = !!t.sdkThinking; break; } }
-                        const { updateSDKState } = useWorkspaceStore.getState();
-                        updateSDKState(activeTabId, { sdkThinking: !currentThinking });
-                        setThinkFlash(!currentThinking ? 'think on' : 'think off');
-                        setTimeout(() => setThinkFlash(null), 3000);
-                      } else {
+                  <div className="flex gap-1 flex-1">
+                    <button
+                      className={`flex-1 text-[10px] px-1.5 py-1 rounded ${isControlBusy ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'} ${isThinkActive ? 'bg-[#DA7756]/20 text-white font-medium' : 'bg-[#2d2d2d] text-[#888] hover:text-white hover:bg-[#3d3d3d]'}`}
+                      disabled={isControlBusy}
+                      onClick={async () => {
+                        if (isSDKTab) {
+                          const state = useWorkspaceStore.getState();
+                          let currentThinking = true;
+                          for (const [, ws] of state.openProjects) { const t = ws.tabs.get(activeTabId); if (t) { currentThinking = t.sdkThinking !== false; break; } }
+                          const { updateSDKState } = useWorkspaceStore.getState();
+                          updateSDKState(activeTabId, { sdkThinking: !currentThinking });
+                          focusActiveTerminal(activeTabId);
+                        } else {
+                          if (isControlBusy) return;
+                          setIsControlBusy(true);
+                          const next = !isThinkActive;
+                          if (activeTabId) setThinkActive(prev => ({ ...prev, [activeTabId]: next }));
+                          try {
+                            const result = await ipcRenderer.invoke('claude:toggle-thinking', activeTabId);
+                            if (result?.success && typeof result.thinking === 'boolean' && activeTabId) {
+                              setThinkActive(prev => ({ ...prev, [activeTabId]: result.thinking }));
+                            }
+                          } finally { setIsControlBusy(false); focusActiveTerminal(activeTabId); }
+                        }
+                      }}
+                    >
+                      Think
+                    </button>
+                    <button
+                      className={`flex-1 text-[10px] px-1.5 py-1 rounded ${isControlBusy ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'} bg-[#2d2d2d] text-[#888] hover:text-white hover:bg-[#3d3d3d]`}
+                      disabled={isControlBusy}
+                      onClick={async () => {
+                        if (isSDKTab) {
+                          // SDK tab has no /compact analog; ignore.
+                          focusActiveTerminal(activeTabId);
+                          return;
+                        }
                         if (isControlBusy) return;
                         setIsControlBusy(true);
-                        try {
-                          const result = await ipcRenderer.invoke('claude:toggle-thinking', activeTabId);
-                          if (result.success) { setThinkFlash(result.thinking ? 'think on' : 'think off'); setTimeout(() => setThinkFlash(null), 3000); }
-                        } finally { setIsControlBusy(false); }
-                      }
-                    }}
-                    title={'Toggle thinking mode' + titleSuffix}
-                  >
-                    {thinkFlash || 'toggle'}
-                  </button>
+                        try { await ipcRenderer.invoke('claude:send-command', activeTabId, '/compact'); }
+                        finally { setIsControlBusy(false); focusActiveTerminal(activeTabId); }
+                      }}
+                    >
+                      Compact
+                    </button>
+                  </div>
                 </div>
-                )}
+                  );
+                })()}
               </>
               );
             })()}
@@ -914,7 +1526,9 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
 
       {hasGeminiSession && activeTabId && (
         <div className="mb-4">
-          <div className="text-[11px] uppercase text-[#888] mb-2">Контроль</div>
+          {/* Gemini section doesn't have provider switching (no proxy paths) —
+              just renames Контроль → PROVIDER for consistency with Claude section above. */}
+          <div className="text-[11px] uppercase text-[#888] mb-2">PROVIDER</div>
           <div className="space-y-2">
             <div className="flex items-center gap-1">
               <span className="text-[10px] text-[#666] w-12 flex-shrink-0">Model</span>
@@ -926,7 +1540,6 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                     onClick={() => {
                       ipcRenderer.send('gemini:send-command', activeTabId, '/model set ' + model);
                     }}
-                    title={'Switch to ' + model}
                   >
                     {model}
                   </button>
@@ -937,174 +1550,124 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
         </div>
       )}
 
-      <div className="mb-4">
-        <div className="flex items-center justify-between mb-2">
-          <div className="flex items-center gap-1">
-            <span className="text-[11px] uppercase text-[#888]">Команды</span>
-            <div className="relative">
-              <span className="text-[10px] text-[#555] cursor-help hover:text-[#888]" onMouseEnter={() => setShowTooltip(true)} onMouseLeave={() => setShowTooltip(false)}>?</span>
-              {showTooltip && (
-                <div className="absolute left-0 top-4 z-50 p-2 bg-[#1a1a1a] border border-[#333] rounded text-[10px] text-[#aaa] shadow-lg whitespace-nowrap">
-                  <div className="mb-1"><b style={{color:'#DA7756'}}>-c</b> — продолжить сессию по ID этого таба</div>
-                  <div><b style={{color:'#4E86F8'}}>-f</b> — создать ФОРК (копию) с новым ID</div>
-                </div>
-              )}
+      {/* Clipboard-fork card — always visible (when no session yet). Sits between
+          AI SESSION and КОМАНДЫ; provides quick claude-f / sdk-f / gemini-f buttons
+          that pull a UUID from the clipboard. Not part of the collapsible КОМАНДЫ
+          section because it's the most-used path to spawn a forked session. */}
+      {!hasAnySession && (
+        <div className="mb-3">
+          <div className="bg-[#2d2d2d] rounded p-2">
+            <div className="flex items-center justify-between">
+              <div className="flex">
+                <code
+                  className="text-xs cursor-pointer hover:underline px-1.5 py-0.5 bg-[#1a1a1a] rounded-l"
+                  style={{ color: '#DA7756' }}
+                  onClick={async () => {
+                    if (!activeTabId) { showToast('Нет активного таба', 'error'); return; }
+                    try {
+                      const clipboardText = await navigator.clipboard.readText();
+                      const match = clipboardText.match(UUID_EXTRACT_REGEX);
+                      if (match) { setTabCommandType(activeTabId, 'claude'); ipcRenderer.send('claude:run-command', { tabId: activeTabId, command: 'claude-f', forkSessionId: match[0] }); }
+                      else showToast('В буфере нет UUID', 'warning');
+                    } catch (err) { showToast('Не удалось прочитать буфер', 'error'); }
+                  }}
+                  onContextMenu={async (e) => {
+                    e.preventDefault();
+                    if (!activeTabId) { showToast('Нет активного таба', 'error'); return; }
+                    try {
+                      const clipboardText = await navigator.clipboard.readText();
+                      const match = clipboardText.match(UUID_EXTRACT_REGEX);
+                      const targetSessionId = match ? match[0] : null;
+                      if (!targetSessionId) { showToast('В буфере нет UUID', 'warning'); return; }
+                      const state = useWorkspaceStore.getState();
+                      for (const [projectId, workspace] of state.openProjects) {
+                        const tab = workspace.tabs.get(activeTabId);
+                        if (tab) {
+                          const currentCwd = tab.cwd || project?.path || '';
+                          const forkResult = await ipcRenderer.invoke('claude:fork-session-file', { sourceSessionId: targetSessionId, cwd: currentCwd, skipChainResolve: true });
+                          if (!forkResult.success) { showToast('Fork failed: ' + forkResult.error, 'error'); return; }
+                          const sdkTabId = await state.createSDKTab(projectId);
+                          console.warn('[InfoPanel:SDK-Fork] created sdkTabId=' + sdkTabId + ' forked ' + targetSessionId.slice(0, 8) + ' → ' + forkResult.newSessionId.slice(0, 8));
+                          state.updateSDKState(sdkTabId, { claudeSessionId: forkResult.newSessionId });
+                          showToast('SDK fork ← ' + targetSessionId.slice(0, 8), 'success');
+                          break;
+                        }
+                      }
+                    } catch (err) { showToast('Ошибка: ' + (err as Error).message, 'error'); }
+                  }}
+                >claude-f</code>
+                <code
+                  className="text-xs cursor-pointer hover:underline px-1.5 py-0.5 bg-[#1a1a1a] border-l border-[#333]"
+                  style={{ color: '#DA7756' }}
+                  onClick={async () => {
+                    if (!activeTabId) { showToast('Нет активного таба', 'error'); return; }
+                    try {
+                      const clipboardText = await navigator.clipboard.readText();
+                      const match = clipboardText.match(UUID_EXTRACT_REGEX);
+                      const targetSessionId = match ? match[0] : null;
+                      if (!targetSessionId) { showToast('В буфере нет UUID', 'warning'); return; }
+                      const state = useWorkspaceStore.getState();
+                      for (const [projectId, workspace] of state.openProjects) {
+                        const tab = workspace.tabs.get(activeTabId);
+                        if (tab) {
+                          const currentCwd = tab.cwd || project?.path || '';
+                          const forkResult = await ipcRenderer.invoke('claude:fork-session-file', { sourceSessionId: targetSessionId, cwd: currentCwd, skipChainResolve: true });
+                          if (!forkResult.success) { showToast('Fork failed: ' + forkResult.error, 'error'); return; }
+                          const sdkTabId = await state.createSDKTab(projectId);
+                          state.updateSDKState(sdkTabId, { claudeSessionId: forkResult.newSessionId });
+                          showToast('SDK fork ← ' + targetSessionId.slice(0, 8), 'success');
+                          break;
+                        }
+                      }
+                    } catch (err) { showToast('Ошибка: ' + (err as Error).message, 'error'); }
+                  }}
+                >sdk-f</code>
+                <code
+                  className="text-xs cursor-pointer hover:underline px-1.5 py-0.5 bg-[#1a1a1a] rounded-r border-l border-[#333]"
+                  style={{ color: '#4E86F8' }}
+                  onClick={async () => {
+                    if (!activeTabId) { showToast('Нет активного таба', 'error'); return; }
+                    try {
+                      const clipboardText = await navigator.clipboard.readText();
+                      const match = clipboardText.match(UUID_EXTRACT_REGEX);
+                      if (match) {
+                        const state = useWorkspaceStore.getState();
+                        for (const [projectId, workspace] of state.openProjects) {
+                          const tab = workspace.tabs.get(activeTabId);
+                          if (tab) {
+                            const currentCwd = tab.cwd || project?.path || '';
+                            await state.createTabAfterCurrent(projectId, undefined, currentCwd, { pendingAction: { type: 'gemini-fork', sessionId: match[0] } });
+                            showToast('Fork Gemini → новая вкладка', 'success');
+                            break;
+                          }
+                        }
+                      } else showToast('В буфере нет UUID', 'warning');
+                    } catch (err) { showToast('Не удалось прочитать буфер', 'error'); }
+                  }}
+                >gemini-f</code>
+              </div>
+              <span className="text-[10px] text-[#666]">clipboard</span>
             </div>
+            <p className="text-[10px] text-[#666] mt-1">Fork из буфера</p>
           </div>
-          {hasAnySession && (
-            <span className="text-[9px] font-medium px-2 h-4 rounded-full flex items-center" style={{ backgroundColor: currentSessionType === 'claude' ? '#DA7756' : '#4E86F8', color: 'white' }}>{currentSessionType === 'claude' ? 'Claude' : 'Gemini'}</span>
-          )}
         </div>
+      )}
 
-        <div className="space-y-2">
-          {!hasAnySession && (
-            <div className="rounded p-2 bg-[#2d2d2d]">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-1">
-                  <button onClick={() => { setClaudeExpanded(!claudeExpanded); if (!claudeExpanded) setTimeout(() => claudeTextareaRef.current?.focus(), 50); }} className="p-0.5 rounded text-[#666] hover:text-[#DA7756] hover:bg-[#333]">{claudeExpanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}</button>
-                  <div className="flex">
-                    <code
-                      className="text-xs cursor-pointer hover:underline px-1.5 py-0.5 bg-[#1a1a1a] rounded-l"
-                      style={{ color: '#DA7756' }}
-                      onClick={() => { if (!activeTabId) { showToast('Нет активного таба', 'error'); return; } const effectiveDefault = claudeDefaultPromptEnabled ? claudeDefaultPrompt : ''; const finalPrompt = [effectiveDefault, claudeExtraPrompt].filter(Boolean).join('\n\n'); setTabCommandType(activeTabId, 'claude'); ipcRenderer.send('claude:run-command', { tabId: activeTabId, command: 'claude', prompt: finalPrompt || undefined }); setClaudeExpanded(false); setClaudeExtraPrompt(''); }}
-                    >claude</code>
-                    <code
-                      className="text-xs cursor-pointer hover:underline px-1.5 py-0.5 bg-[#1a1a1a] border-l border-[#333]"
-                      style={{ color: '#DA7756' }}
-                      onClick={() => {
-                        if (!activeTabId) { showToast('Нет активного таба', 'error'); return; }
-                        const { convertToSDKTab } = useWorkspaceStore.getState();
-                        convertToSDKTab(activeTabId);
-                      }}
-                      title="Запустить Claude SDK в текущем табе"
-                    >sdk</code>
-                    <code
-                      className="text-xs cursor-pointer hover:underline px-1.5 py-0.5 bg-[#1a1a1a] rounded-r border-l border-[#333]"
-                      style={{ color: '#4E86F8' }}
-                      onClick={() => { if (!activeTabId) { showToast('Нет активного таба', 'error'); return; } setTabCommandType(activeTabId, 'gemini'); ipcRenderer.send('gemini:spawn-with-watcher', { tabId: activeTabId, cwd: getCurrentCwd(), yesMode: true }); }}
-                      title="Новая Gemini сессия"
-                    >gemini</code>
-                  </div>
-                </div>
-                <div className="flex items-center gap-2">
-                  {claudeDefaultPrompt && claudeDefaultPromptEnabled && (
-                    <div className="relative group">
-                      <span className="text-[9px] px-1.5 py-0.5 bg-[#DA7756]/20 text-[#DA7756] rounded cursor-default">Default</span>
-                      <div className="absolute right-0 top-full mt-1 z-50 hidden group-hover:block"><div className="p-2 bg-[#1a1a1a] border border-[#444] rounded shadow-lg max-w-[200px] text-[10px] text-[#888] font-mono whitespace-pre-wrap">{claudeDefaultPrompt}</div></div>
-                    </div>
-                  )}
-                  <span className="text-[10px] text-green-400">готово</span>
-                </div>
-              </div>
-              <p className="text-[10px] text-[#666] mt-1">{claudeDefaultPrompt && claudeDefaultPromptEnabled ? 'С промптом (Claude)' : 'Новая сессия'}</p>
-              {claudeExpanded && (
-                <div className="mt-2 pt-2 border-t border-[#333]">
-                  <textarea ref={claudeTextareaRef} value={claudeExtraPrompt} onChange={(e) => setClaudeExtraPrompt(e.target.value)} placeholder="Дополнительный текст (Claude)..." className="w-full min-h-[40px] p-2 bg-[#1a1a1a] border border-[#333] rounded text-[11px] text-[#888] font-mono resize-none focus:outline-none focus:border-[#DA7756] placeholder:text-[#555]" onKeyDown={(e) => { if (e.key === 'Enter' && e.metaKey) { e.preventDefault(); if (!activeTabId) return; const effectiveDefault = claudeDefaultPromptEnabled ? claudeDefaultPrompt : ''; const finalPrompt = [effectiveDefault, claudeExtraPrompt].filter(Boolean).join('\n\n'); setTabCommandType(activeTabId, 'claude'); ipcRenderer.send('claude:run-command', { tabId: activeTabId, command: 'claude', prompt: finalPrompt || undefined }); setClaudeExpanded(false); setClaudeExtraPrompt(''); } }} />
-                </div>
-              )}
-            </div>
-          )}
-
-          {!hasAnySession && (
-            <div className="bg-[#2d2d2d] rounded p-2">
-              <div className="flex items-center justify-between">
-                <div className="flex">
-                  <code
-                    className="text-xs cursor-pointer hover:underline px-1.5 py-0.5 bg-[#1a1a1a] rounded-l"
-                    style={{ color: '#DA7756' }}
-                    onClick={async () => {
-                      if (!activeTabId) { showToast('Нет активного таба', 'error'); return; }
-                      try {
-                        const clipboardText = await navigator.clipboard.readText();
-                        const match = clipboardText.match(UUID_EXTRACT_REGEX);
-                        if (match) { setTabCommandType(activeTabId, 'claude'); ipcRenderer.send('claude:run-command', { tabId: activeTabId, command: 'claude-f', forkSessionId: match[0] }); }
-                        else showToast('В буфере нет UUID', 'warning');
-                      } catch (err) { showToast('Не удалось прочитать буфер', 'error'); }
-                    }}
-                    title="Fork Claude по UUID из буфера (ПКМ → Open in SDK)"
-                    onContextMenu={async (e) => {
-                      e.preventDefault();
-                      if (!activeTabId) { showToast('Нет активного таба', 'error'); return; }
-                      try {
-                        const clipboardText = await navigator.clipboard.readText();
-                        const match = clipboardText.match(UUID_EXTRACT_REGEX);
-                        const targetSessionId = match ? match[0] : null;
-                        if (!targetSessionId) { showToast('В буфере нет UUID', 'warning'); return; }
-                        const state = useWorkspaceStore.getState();
-                        for (const [projectId, workspace] of state.openProjects) {
-                          const tab = workspace.tabs.get(activeTabId);
-                          if (tab) {
-                            const currentCwd = tab.cwd || project?.path || '';
-                            const forkResult = await ipcRenderer.invoke('claude:fork-session-file', { sourceSessionId: targetSessionId, cwd: currentCwd, skipChainResolve: true });
-                            if (!forkResult.success) { showToast('Fork failed: ' + forkResult.error, 'error'); return; }
-                            const sdkTabId = await state.createSDKTab(projectId);
-                            console.warn('[InfoPanel:SDK-Fork] created sdkTabId=' + sdkTabId + ' forked ' + targetSessionId.slice(0, 8) + ' → ' + forkResult.newSessionId.slice(0, 8));
-                            state.updateSDKState(sdkTabId, { claudeSessionId: forkResult.newSessionId });
-                            showToast('SDK fork ← ' + targetSessionId.slice(0, 8), 'success');
-                            break;
-                          }
-                        }
-                      } catch (err) { showToast('Ошибка: ' + (err as Error).message, 'error'); }
-                    }}
-                  >claude-f</code>
-                  <code
-                    className="text-xs cursor-pointer hover:underline px-1.5 py-0.5 bg-[#1a1a1a] border-l border-[#333]"
-                    style={{ color: '#DA7756' }}
-                    onClick={async () => {
-                      if (!activeTabId) { showToast('Нет активного таба', 'error'); return; }
-                      try {
-                        const clipboardText = await navigator.clipboard.readText();
-                        const match = clipboardText.match(UUID_EXTRACT_REGEX);
-                        const targetSessionId = match ? match[0] : null;
-                        if (!targetSessionId) { showToast('В буфере нет UUID', 'warning'); return; }
-                        const state = useWorkspaceStore.getState();
-                        for (const [projectId, workspace] of state.openProjects) {
-                          const tab = workspace.tabs.get(activeTabId);
-                          if (tab) {
-                            const currentCwd = tab.cwd || project?.path || '';
-                            const forkResult = await ipcRenderer.invoke('claude:fork-session-file', { sourceSessionId: targetSessionId, cwd: currentCwd, skipChainResolve: true });
-                            if (!forkResult.success) { showToast('Fork failed: ' + forkResult.error, 'error'); return; }
-                            const sdkTabId = await state.createSDKTab(projectId);
-                            state.updateSDKState(sdkTabId, { claudeSessionId: forkResult.newSessionId });
-                            showToast('SDK fork ← ' + targetSessionId.slice(0, 8), 'success');
-                            break;
-                          }
-                        }
-                      } catch (err) { showToast('Ошибка: ' + (err as Error).message, 'error'); }
-                    }}
-                    title="Fork UUID from clipboard into SDK tab"
-                  >sdk</code>
-                  <code
-                    className="text-xs cursor-pointer hover:underline px-1.5 py-0.5 bg-[#1a1a1a] rounded-r border-l border-[#333]"
-                    style={{ color: '#4E86F8' }}
-                    onClick={async () => {
-                      if (!activeTabId) { showToast('Нет активного таба', 'error'); return; }
-                      try {
-                        const clipboardText = await navigator.clipboard.readText();
-                        const match = clipboardText.match(UUID_EXTRACT_REGEX);
-                        if (match) {
-                          const state = useWorkspaceStore.getState();
-                          for (const [projectId, workspace] of state.openProjects) {
-                            const tab = workspace.tabs.get(activeTabId);
-                            if (tab) {
-                              const currentCwd = tab.cwd || project?.path || '';
-                              await state.createTabAfterCurrent(projectId, undefined, currentCwd, { pendingAction: { type: 'gemini-fork', sessionId: match[0] } });
-                              showToast('Fork Gemini → новая вкладка', 'success');
-                              break;
-                            }
-                          }
-                        } else showToast('В буфере нет UUID', 'warning');
-                      } catch (err) { showToast('Не удалось прочитать буфер', 'error'); }
-                    }}
-                    title="Fork Gemini по UUID из буфера"
-                  >gemini-f</code>
-                </div>
-                <span className="text-[10px] text-[#666]">clipboard</span>
-              </div>
-              <p className="text-[10px] text-[#666] mt-1">Fork из буфера</p>
-            </div>
-          )}
-        </div>
+      {/* КОМАНДЫ — collapsible. Holds the Update Docs / Update API → Haiku pipeline
+          (rendered by ActionsPanel). Default collapsed since these are rare actions. */}
+      <div className="mb-4">
+        <button
+          type="button"
+          onClick={() => setCommandsExpanded((v) => !v)}
+          className="flex items-center w-full text-left cursor-pointer mb-2 select-none"
+          style={{ background: 'transparent', border: 'none', padding: 0, color: '#888' }}
+        >
+          {commandsExpanded ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
+          <span className="text-[11px] uppercase ml-1">Команды</span>
+        </button>
+        {commandsExpanded && (
+          <ActionsPanel activeTabId={activeTabId} embedded />
+        )}
       </div>
 
       {hasGeminiSession && historyTurns.length > 0 && (
@@ -1118,9 +1681,9 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
               {historyTurns.map((turn, idx) => (
                 <div key={turn.file} className={`group flex items-start gap-2 p-2 rounded ${idx === historyTurns.length - 1 ? 'bg-[#1a2a3a] border border-[#2a4a6a]' : 'bg-[#252525] hover:bg-[#2d2d2d]'}`}>
                   <span className="text-[10px] text-[#4E86F8] font-mono w-4 flex-shrink-0">{turn.turnNumber}</span>
-                  <div className="flex-1 min-w-0"><p className="text-[10px] text-[#aaa] truncate" title={turn.preview}>{turn.preview}</p><p className="text-[9px] text-[#555]">{new Date(turn.timestamp).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })}</p></div>
+                  <div className="flex-1 min-w-0"><p className="text-[10px] text-[#aaa] truncate">{turn.preview}</p><p className="text-[9px] text-[#555]">{new Date(turn.timestamp).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })}</p></div>
                   {idx < historyTurns.length - 1 && (
-                    <button onClick={(e) => { e.stopPropagation(); handleRollback(turn.turnNumber); }} disabled={isRollingBack} className="opacity-0 group-hover:opacity-100 p-1 rounded text-[#666] hover:text-[#4E86F8] hover:bg-[#333] disabled:opacity-50" title={`Откатить до сообщения ${turn.turnNumber}`}><RotateCcw size={12} /></button>
+                    <button onClick={(e) => { e.stopPropagation(); handleRollback(turn.turnNumber); }} disabled={isRollingBack} className="opacity-0 group-hover:opacity-100 p-1 rounded text-[#666] hover:text-[#4E86F8] hover:bg-[#333] disabled:opacity-50"><RotateCcw size={12} /></button>
                   )}
                   {idx === historyTurns.length - 1 && <span className="text-[9px] text-green-500">текущее</span>}
                 </div>
@@ -1131,27 +1694,54 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
         </div>
       )}
 
-      <div className="mb-3"><ActionsPanel activeTabId={activeTabId} embedded /></div>
       </div>
 
-      <div className="flex-1 flex flex-col min-h-0 border-t border-border-main pt-3">
+      {/* Заметки вкладки — fixed 250px panel pinned to the bottom. Height bounded
+          so it never eats the upper sections; scroll inside the editor handles
+          longer notes. min-h-0 + h-[250px] avoid flexbox content-min-size bugs. */}
+      <div className="flex flex-col h-[250px] flex-shrink-0 border-t border-border-main pt-3 mt-auto">
         <div className="flex items-center gap-2 mb-2">
-          <span className="text-[11px] uppercase text-[#888]">Заметки вкладки</span>
-          {activeTabId && (
-            <button className={`text-[10px] px-1.5 py-0.5 rounded cursor-pointer ${isGeneratingDesc ? 'text-white bg-amber-600 animate-glow-yellow font-bold' : 'text-[#666] hover:text-[#f59e0b] hover:bg-[#f59e0b]/10'}`} onClick={handleGenerateDescription} disabled={isGeneratingDesc} title="Generate AI description">{isGeneratingDesc ? 'GENERATING...' : '\u2726'}</button>
-          )}
-          <div className="flex-1" />
+          {/* "← Open" toggles the per-tab slide-out notes panel anchored to the
+              left edge of this sidebar. Permanent purple-tinted bg matches the
+              slide-out's editor background (`#1e1e2e`) so users see the visual
+              link between trigger and target. The data-attr marks this so the
+              panel's outside-click handler can skip it (otherwise click-to-close
+              would fire before our toggle does, re-opening it instantly). */}
           {activeTabId && (
             <button
-              className="text-[10px] px-1.5 py-0.5 rounded cursor-pointer text-[#666] hover:text-white hover:bg-[#ffffff10]"
-              onClick={() => {
-                const { openNotesEditor } = useUIStore.getState();
-                const store = useWorkspaceStore.getState();
-                if (store.activeProjectId) openNotesEditor(store.activeProjectId);
+              data-tab-notes-open-trigger
+              className="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded cursor-pointer transition-colors focus:outline-none"
+              style={{
+                backgroundColor: '#1e1e2e',
+                color: '#a5b4fc',
+                border: '1px solid rgba(99,102,241,0.25)',
+                outline: 'none',
               }}
-              title="Open notes editor"
-            >⤢</button>
+              onMouseEnter={(e) => {
+                (e.currentTarget as HTMLButtonElement).style.backgroundColor = '#2a2a3e';
+                (e.currentTarget as HTMLButtonElement).style.color = '#c7d2fe';
+              }}
+              onMouseLeave={(e) => {
+                (e.currentTarget as HTMLButtonElement).style.backgroundColor = '#1e1e2e';
+                (e.currentTarget as HTMLButtonElement).style.color = '#a5b4fc';
+              }}
+              onClick={(e) => {
+                const isOpen = useUIStore.getState().notesPanelOpenTabs[activeTabId] ?? false;
+                useUIStore.getState().setNotesPanelOpen(activeTabId, !isOpen);
+                // Immediately blur so the browser's focus-ring (visible after the
+                // panel closes via Escape) doesn't paint a white outline.
+                (e.currentTarget as HTMLButtonElement).blur();
+              }}
+            >
+              <ChevronLeft size={11} />
+              <span>Open</span>
+            </button>
           )}
+          <span className="text-[11px] uppercase text-[#888]">Заметки вкладки</span>
+          {activeTabId && (
+            <button className={`text-[10px] px-1.5 py-0.5 rounded cursor-pointer ${isGeneratingDesc ? 'text-white bg-amber-600 animate-glow-yellow font-bold' : 'text-[#666] hover:text-[#f59e0b] hover:bg-[#f59e0b]/10'}`} onClick={handleGenerateDescription} disabled={isGeneratingDesc}>{isGeneratingDesc ? 'GENERATING...' : '\u2726'}</button>
+          )}
+          <div className="flex-1" />
         </div>
         {activeTabId ? (
           <div style={{ flex: 1, minHeight: 0, position: 'relative' }}>
