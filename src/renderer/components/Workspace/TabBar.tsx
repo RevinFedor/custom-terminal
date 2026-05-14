@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect, useLayoutEffect, memo, useCallback } from 'react';
 import { useWorkspaceStore, TabColor, isTabInterrupted } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
+import Tooltip from '../UI/Tooltip';
 import { useUIStore } from '../../store/useUIStore';
 import { useCmdKey, useCmdHoverPopover, CmdHoverPopover } from '../../hooks/useCmdHoverPopover';
 import { MarkdownEditor } from '@gt-editor/markdown-editor';
@@ -137,6 +138,7 @@ const RestartZone = memo(({ hasProcess, hasColor, commandType, hasSession, isBus
       {hasProcess ? (
         isHovered && showRestart ? (
           // Restart button when hovered (only for devServer)
+          <Tooltip content="Restart (Ctrl+C → !! → Enter)">
           <div
             style={{
               display: 'flex',
@@ -151,10 +153,10 @@ const RestartZone = memo(({ hasProcess, hasColor, commandType, hasSession, isBus
               fontSize: '14px',
               transition: 'all 0.15s',
             }}
-            title="Restart (Ctrl+C → !! → Enter)"
           >
             ↻
           </div>
+          </Tooltip>
         ) : (
           // Green dot (process running) or red dot (claude without saved session)
           // Claude/Gemini tabs show spinning arc when busy
@@ -1225,18 +1227,60 @@ function TabBar({ projectId }: TabBarProps) {
   };
 
   // Restart process: Ctrl+C → delay → !! (repeat last command)
-  const handleRestart = (tabId: string) => {
-    // Ctrl+C to stop current process
+  // When "kill dev-ports" toggle is on, prepend `lsof | kill -9` command in the SAME
+  // shell session before the actual npm-script line. Wrapping into one composite line:
+  //   `lsof -ti:5181 -ti:3000 2>/dev/null | xargs kill -9 2>/dev/null; npm run dev`
+  // ...is the right pattern because:
+  //   1. Visible in scrollback — user sees what got freed
+  //   2. Sequential by shell semantics, not by setTimeout race — `;` guarantees kill
+  //      finishes before `npm run dev` starts (kernel TIME_WAIT freed in same tick)
+  //   3. Lands in shell history, so re-up arrow gives same kill+run combo
+  // Returns the prefix string to prepend (`...; ` ready to concat), or '' if disabled / no ports.
+  const buildKillPortsPrefix = async (tabId: string): Promise<string> => {
+    if (!useUIStore.getState().freePortsBeforeStart) return '';
+    const tab = workspace.tabs.get(tabId);
+    const cwd = tab?.cwd;
+    if (!cwd) return '';
+    try {
+      const res = await ipcRenderer.invoke('system:detect-project-ports', cwd);
+      const ports: number[] = res?.ports || [];
+      if (ports.length === 0) return '';
+      // -ti collapses multiple -ti flags? No — must be `lsof -ti:port` per port separated by space-style.
+      // Cleanest portable form: `lsof -ti:5181,3000` (comma list — supported by lsof on macOS/Linux).
+      const lsofArg = ports.join(',');
+      return `lsof -ti:${lsofArg} 2>/dev/null | xargs -r kill -9 2>/dev/null; `;
+    } catch (e) {
+      console.warn('[TabBar] detect-ports failed for', tabId, e);
+      return '';
+    }
+  };
+
+  const handleRestart = async (tabId: string) => {
+    // Ctrl+C first — shell prompt returns, then we can type the composite kill+!! line.
+    // Compositing kill into a single visible shell line (instead of fire-and-forget IPC)
+    // lets the user see what ports were freed and removes setTimeout race vs port release.
     ipcRenderer.send('terminal:input', tabId, '\x03');
-    // Wait for process to stop, then use !! to repeat last command
+    const killPrefix = await buildKillPortsPrefix(tabId);
     setTimeout(() => {
-      ipcRenderer.send('terminal:input', tabId, '!!\r');
+      // `lsof -ti:... | xargs kill -9; !!` — shell semicolon guarantees kill finishes
+      // before `!!` re-runs the previous command. No timing assumption.
+      ipcRenderer.send('terminal:input', tabId, `${killPrefix}!!\r`);
     }, 300);
   };
 
-  // Stop process: Ctrl+C only (no restart)
-  const handleStop = (tabId: string) => {
+  // Stop process: Ctrl+C, then optionally kill leaked ports as a separate visible line.
+  // User often hits Stop because the process is stuck holding the port; the explicit
+  // kill line confirms what was freed in the scrollback.
+  const handleStop = async (tabId: string) => {
     ipcRenderer.send('terminal:input', tabId, '\x03');
+    const killPrefix = await buildKillPortsPrefix(tabId);
+    if (killPrefix) {
+      // Strip the trailing `; ` to make it a standalone line (without a pending `!!`).
+      const standalone = killPrefix.replace(/;\s*$/, '');
+      setTimeout(() => {
+        ipcRenderer.send('terminal:input', tabId, `${standalone}\r`);
+      }, 300);
+    }
   };
 
   const handleRenameSubmit = () => {
@@ -1479,16 +1523,17 @@ function TabBar({ projectId }: TabBarProps) {
         onMouseLeave={() => setIsMouseInTabBar(false)}
       >
         {/* Sidebar toggle */}
+        <Tooltip content="Toggle sidebar">
         <button
           onClick={() => {
             const { sidebarOpen } = getSidebarState(projectId);
             setSidebarOpen(projectId, !sidebarOpen);
           }}
           className="h-full flex items-center px-2 text-[#666] hover:text-white hover:bg-[rgba(255,255,255,0.05)] transition-all duration-150"
-          title="Toggle sidebar"
         >
           <PanelLeft size={16} />
         </button>
+        </Tooltip>
 
         {/* Utility Zone - Left side */}
         <div
@@ -1731,12 +1776,56 @@ function TabBar({ projectId }: TabBarProps) {
           onClick={(e) => e.stopPropagation()}
           onMouseDown={(e) => e.stopPropagation()}
         >
-          {/* Close Tab(s) */}
-          <button
-            className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2"
-            onClick={async () => {
+          {/* Close Tab(s) + optional Stop split. Stop visible only when at
+              least one tab in selection has a running Claude or Gemini
+              process. shell/dev-server are out of scope \u2014 dev-server uses
+              middle-click Stop in RestartZone, bash has no graceful stop hook. */}
+          {(() => {
+            // Canonical AI tints used elsewhere in the app:
+            // Claude #DA7756 = Provider row primary (InfoPanel)
+            // Gemini  #4E86F8 = TAB_COLORS.gemini, ApiSettingsModal, ActionsPanel copy accent
+            const CLAUDE_TINT = '#DA7756';
+            const GEMINI_TINT = '#4E86F8';
+
+            // Tabs targeted by Stop = either the single right-clicked tab, or
+            // all selected tabs when right-click happened on a selected one
+            // (isMultiSelect already gates this). We count Claude/Gemini
+            // separately so the badge can show majority+minority split.
+            const targetTabIds = isMultiSelect ? selectedTabIds : (contextMenu ? [contextMenu.tabId] : []);
+            let claudeCount = 0;
+            let geminiCount = 0;
+            let scriptCount = 0; // devServer / shell-command tabs with a live PID
+            for (const id of targetTabIds) {
+              if (!processStatus.get(id)) continue; // skip tabs with no live process
+              const cmd = workspace.tabs.get(id)?.commandType;
+              if (cmd === 'claude') claudeCount++;
+              else if (cmd === 'gemini') geminiCount++;
+              else scriptCount++; // bash, devServer, shell-script — everything else with live process
+            }
+            const totalAI = claudeCount + geminiCount;
+            const showStopAI = totalAI > 0;
+            // Script-stop branch — same split-button layout but green tint (process indicator color),
+            // and Ctrl+C path instead of SIGTERM (zsh/bash handles SIGINT, no danger zone like Claude TUI).
+            const showStopScript = !showStopAI && scriptCount > 0;
+            const SCRIPT_TINT = '#4ade80'; // running indicator green, matches the dot next to tab name
+
+            // Majority decides base color. Ties go to Claude (project default).
+            // Minority is rendered as small "+N" badge in the OTHER tint, so the
+            // user can see at a glance "mostly Claude, also 1 Gemini in there".
+            const claudeIsMajor = claudeCount >= geminiCount;
+            const baseTint = claudeIsMajor ? CLAUDE_TINT : GEMINI_TINT;
+            const minorityTint = claudeIsMajor ? GEMINI_TINT : CLAUDE_TINT;
+            const majorCount = claudeIsMajor ? claudeCount : geminiCount;
+            const minorCount = claudeIsMajor ? geminiCount : claudeCount;
+
+            // Label: single tab keeps full name, multi just shows count under the icon
+            const singleTab = totalAI === 1 && targetTabIds.length === 1;
+            const stopLabel = singleTab
+              ? (claudeIsMajor ? 'Stop Claude' : 'Stop Gemini')
+              : `Stop ${majorCount}`;
+
+            const handleClose = async () => {
               if (isMultiSelect) {
-                // Collect running processes for batch confirmation
                 const running: { id: string; name: string }[] = [];
                 for (const id of selectedTabIds) {
                   const state = await ipcRenderer.invoke('terminal:getCommandState', id);
@@ -1745,7 +1834,6 @@ function TabBar({ projectId }: TabBarProps) {
                     running.push({ id, name: processName || 'unknown' });
                   }
                 }
-
                 let confirmed = true;
                 if (running.length > 0) {
                   confirmed = window.confirm(
@@ -1754,7 +1842,6 @@ function TabBar({ projectId }: TabBarProps) {
                 } else {
                   confirmed = window.confirm(`Close ${selectedTabIds.length} tabs?`);
                 }
-
                 if (confirmed) {
                   for (const id of selectedTabIds) {
                     await closeTab(projectId, id, { skipProcessCheck: true, forceCleanup: true });
@@ -1764,10 +1851,102 @@ function TabBar({ projectId }: TabBarProps) {
                 handleContextClose();
               }
               setContextMenu(null);
-            }}
-          >
-            {isMultiSelect ? `Close ${selectedTabIds.length} Tabs` : 'Close Tab'}
-          </button>
+            };
+
+            const handleStopAI = async (e: React.MouseEvent) => {
+              e.stopPropagation();
+              setContextMenu(null);
+              // Fire all SIGTERMs in parallel \u2014 main handles its own grace + escalation per PID
+              await Promise.all(targetTabIds.map(id => {
+                const cmd = workspace.tabs.get(id)?.commandType;
+                if (cmd !== 'claude' && cmd !== 'gemini') return null;
+                if (!processStatus.get(id)) return null;
+                return ipcRenderer.invoke('terminal:stop-ai-process', id);
+              }).filter(Boolean));
+            };
+
+            // Script stop \u2014 send Ctrl+C via terminal:input. zsh/bash forwards SIGINT to foreground
+            // process group, which is the running npm/script. Tab stays alive (only the foreground
+            // process dies), so user can re-run from history or close manually.
+            // If "free ports" toggle is on \u2014 also SIGKILL anything still holding the project's
+            // declared ports, in case Ctrl+C only killed the visible wrapper and left a leaked child.
+            const handleStopScript = async (e: React.MouseEvent) => {
+              e.stopPropagation();
+              setContextMenu(null);
+              for (const id of targetTabIds) {
+                if (!processStatus.get(id)) continue;
+                const cmd = workspace.tabs.get(id)?.commandType;
+                if (cmd === 'claude' || cmd === 'gemini') continue;
+                // Ctrl+C first, then visible kill-ports line if toggle is on.
+                // Same pattern as handleStop — single source of behavior.
+                ipcRenderer.send('terminal:input', id, '\x03');
+                const killPrefix = await buildKillPortsPrefix(id);
+                if (killPrefix) {
+                  const standalone = killPrefix.replace(/;\s*$/, '');
+                  setTimeout(() => {
+                    ipcRenderer.send('terminal:input', id, `${standalone}\r`);
+                  }, 300);
+                }
+              }
+            };
+
+            const scriptLabel = (() => {
+              if (scriptCount === 1 && targetTabIds.length === 1) {
+                const t = workspace.tabs.get(targetTabIds[0]);
+                const name = t?.name || 'script';
+                // Truncate long names so the pill doesn't push Close Tab off the menu.
+                return name.length > 18 ? 'Stop ' + name.slice(0, 18) + '\u2026' : 'Stop ' + name;
+              }
+              return `Stop ${scriptCount}`;
+            })();
+
+            const tooltipParts = [];
+            if (claudeCount > 0) tooltipParts.push(`${claudeCount} Claude`);
+            if (geminiCount > 0) tooltipParts.push(`${geminiCount} Gemini`);
+            const tooltipText = `SIGTERM to ${tooltipParts.join(' + ')} (SIGKILL after 800ms if any hangs)`;
+
+            return (
+              <div className="flex items-stretch w-full">
+                <button
+                  className="flex-1 text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2"
+                  onClick={handleClose}
+                >
+                  {isMultiSelect ? `Close ${selectedTabIds.length} Tabs` : 'Close Tab'}
+                </button>
+                {showStopAI && (
+                  <Tooltip content={tooltipText}>
+                  <button
+                    className="px-3 py-1.5 text-[12px] cursor-pointer flex items-center gap-1.5 border-l border-[#444]"
+                    style={{ color: baseTint, backgroundColor: baseTint + '14' }}
+                    onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = baseTint + '33'; }}
+                    onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = baseTint + '14'; }}
+                    onClick={handleStopAI}
+                  >
+                    <span style={{ width: 8, height: 8, borderRadius: 2, backgroundColor: baseTint, display: 'inline-block' }} />
+                    {stopLabel}
+                    {minorCount > 0 && (
+                      <span style={{ color: minorityTint, fontWeight: 600 }}>+{minorCount}</span>
+                    )}
+                  </button>
+                  </Tooltip>
+                )}
+                {showStopScript && (
+                  <Tooltip content={`Send Ctrl+C to ${scriptCount} running script(s) — tab stays open`}>
+                  <button
+                    className="px-3 py-1.5 text-[12px] cursor-pointer flex items-center gap-1.5 border-l border-[#444]"
+                    style={{ color: SCRIPT_TINT, backgroundColor: SCRIPT_TINT + '14' }}
+                    onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = SCRIPT_TINT + '33'; }}
+                    onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = SCRIPT_TINT + '14'; }}
+                    onClick={handleStopScript}
+                  >
+                    <span style={{ width: 8, height: 8, borderRadius: '50%', backgroundColor: SCRIPT_TINT, display: 'inline-block', boxShadow: `0 0 6px ${SCRIPT_TINT}80` }} />
+                    {scriptLabel}
+                  </button>
+                  </Tooltip>
+                )}
+              </div>
+            );
+          })()}
 
           {!isMultiSelect && (
             <>
@@ -1855,35 +2034,26 @@ function TabBar({ projectId }: TabBarProps) {
               </button>
               <div className="absolute left-full top-0 -ml-2 pl-2 hidden group-hover/scripts:block">
                 <div className="bg-[#2a2a2a] border border-[#444] rounded-xl shadow-2xl py-1 min-w-[160px] max-h-[300px] overflow-y-auto">
-                  {/* Active process — stop button */}
-                  {contextMenu && processStatus.get(contextMenu.tabId) && workspace.tabs.get(contextMenu.tabId)?.commandType === 'devServer' && (
-                    <>
-                      <button
-                        className="w-full text-left px-4 py-1.5 text-[13px] text-[#f87171] hover:bg-white/10 cursor-pointer flex items-center gap-2"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          handleStop(contextMenu.tabId);
-                          setContextMenu(null);
-                        }}
-                      >
-                        <div className="w-2 h-2 rounded-full bg-[#4ade80] animate-glow-green shadow-[0_0_8px_#22c55e80]" />
-                        <span className="truncate">Stop: {workspace.tabs.get(contextMenu.tabId)?.name}</span>
-                      </button>
-                      {(contextScripts.length > 0 || contextShScripts.length > 0) && <div className="my-1 border-t border-[#444]" />}
-                    </>
-                  )}
+                  {/* Stop: <name> moved to the top-level Close+Stop split-pill (mirrors Stop Claude UX).
+                      Kept here only as a fallback dropdown action if for some reason the split isn't
+                      visible (e.g. process is detected late after menu opened) — but currently the
+                      split handles all cases, so no entry is rendered. */}
                   {contextScripts.map((script) => (
                     <button
                       key={script}
                       className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2"
-                      onClick={(e) => {
+                      onClick={async (e) => {
                         e.stopPropagation();
                         if (contextMenu) {
-                          ipcRenderer.send('terminal:input', contextMenu.tabId, `npm run ${script}\r`);
+                          const tabId = contextMenu.tabId;
+                          // Composite into a single shell line: `kill ports; npm run X`
+                          // Visible in scrollback, atomic via `;` semantic — no race.
+                          const killPrefix = await buildKillPortsPrefix(tabId);
+                          ipcRenderer.send('terminal:input', tabId, `${killPrefix}npm run ${script}\r`);
                           // Detect dev-like scripts for auto-rename and green color
                           const isDevScript = /^(dev|start|serve|watch)/i.test(script);
                           if (isDevScript) {
-                            useWorkspaceStore.getState().setTabCommandType(contextMenu.tabId, 'devServer');
+                            useWorkspaceStore.getState().setTabCommandType(tabId, 'devServer');
                           }
                         }
                         setContextMenu(null);

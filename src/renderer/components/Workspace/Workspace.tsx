@@ -16,7 +16,7 @@ import Sidebar from './Sidebar';
 import FilePreview from './FilePreview';
 import Resizer from './Resizer';
 import ResearchSheet from '../Research/ResearchSheet';
-import NotesEditorModal from './NotesEditorModal';
+import TabNotesSlideout from './TabNotesSlideout';
 import HistoryPanel from './HistoryPanel';
 import SubAgentBar from './SubAgentBar';
 
@@ -67,8 +67,6 @@ export default function Workspace() {
   const filePreview = useUIStore((s) => s.filePreview);
   const openFilePreview = useUIStore((s) => s.openFilePreview);
   const closeFilePreview = useUIStore((s) => s.closeFilePreview);
-  const openNotesEditor = useUIStore((s) => s.openNotesEditor);
-  const notesEditorOpen = useUIStore((s) => s.notesEditorOpen);
   const notesPanelWidth = useUIStore((s) => s.notesPanelWidth);
   const historyPanelOpenTabs = useUIStore((s) => s.historyPanelOpenTabs);
   const historyPanelWidth = useUIStore((s) => s.historyPanelWidth);
@@ -311,12 +309,13 @@ export default function Workspace() {
     // Terminal will auto-refit via ResizeObserver
   }, []);
 
-  // CMD+E hotkey to toggle file explorer (moved from Cmd+B)
-  // Notes editor now opened only via button in "ЗАМЕТКИ ВКЛАДКИ" section
+  // CMD+E toggles the file-explorer sidebar. Cmd+/ used to do the same but
+  // collided with the markdown editor's slash-command popover — Cmd+B already
+  // covers the same toggle, so Cmd+/ is freed for editor use.
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (workspaceView !== 'workspace') return;
-      if (e.metaKey && (e.key === 'e' || e.key === '/') && activeProjectId) {
+      if (e.metaKey && e.key === 'e' && activeProjectId) {
         e.preventDefault();
         const { sidebarOpen } = getSidebarState(activeProjectId);
         setSidebarOpen(activeProjectId, !sidebarOpen);
@@ -736,8 +735,8 @@ export default function Workspace() {
         );
       })()}
 
-      {/* Notes Editor Modal */}
-      <NotesEditorModal />
+      {/* Per-tab Notes slide-out (resizable, anchored to InfoPanel left edge) */}
+      <TabNotesSlideout activeTabId={activeTabId || null} />
 
     </div>
   );

@@ -1,6 +1,7 @@
 import React, { useEffect, useState, useRef, useCallback } from 'react';
 import { useUIStore } from '../../store/useUIStore';
 import { usePromptsStore, AIPrompt, AIModel, ThinkingLevel } from '../../store/usePromptsStore';
+import Tooltip from './Tooltip';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -137,45 +138,49 @@ function SidebarBehaviorSettings() {
       <div style={{ fontSize: '11px', fontWeight: '600', color: '#666', marginBottom: '12px', textTransform: 'uppercase' }}>
         Сайдбар (Cmd+/)
       </div>
-      <label className="flex items-start gap-3 cursor-pointer select-none mb-3" title="Если ВКЛ — при повторном открытии сайдбара восстанавливается ранее открытый файл. Если ВЫКЛ — открывается только дерево.">
-        <div
-          className="relative w-8 h-4 rounded-full transition-colors mt-0.5 shrink-0"
-          style={{ backgroundColor: sidebarPersistFile ? 'rgba(74, 222, 128, 0.4)' : 'rgba(255,255,255,0.1)' }}
-          onClick={() => setSidebarPersistFile(!sidebarPersistFile)}
-        >
+      <Tooltip content="Если ВКЛ — при повторном открытии сайдбара восстанавливается ранее открытый файл. Если ВЫКЛ — открывается только дерево.">
+        <label className="flex items-start gap-3 cursor-pointer select-none mb-3">
           <div
-            className="absolute top-0.5 w-3 h-3 rounded-full transition-all"
-            style={{
-              left: sidebarPersistFile ? '18px' : '2px',
-              backgroundColor: sidebarPersistFile ? '#4ade80' : '#666',
-            }}
-          />
-        </div>
-        <div>
-          <div style={{ fontSize: '13px', color: '#ccc' }}>Восстанавливать файл при открытии</div>
-          <div style={{ fontSize: '11px', color: '#666' }}>Если выкл — Cmd+/ всегда показывает только дерево</div>
-        </div>
-      </label>
+            className="relative w-8 h-4 rounded-full transition-colors mt-0.5 shrink-0"
+            style={{ backgroundColor: sidebarPersistFile ? 'rgba(74, 222, 128, 0.4)' : 'rgba(255,255,255,0.1)' }}
+            onClick={() => setSidebarPersistFile(!sidebarPersistFile)}
+          >
+            <div
+              className="absolute top-0.5 w-3 h-3 rounded-full transition-all"
+              style={{
+                left: sidebarPersistFile ? '18px' : '2px',
+                backgroundColor: sidebarPersistFile ? '#4ade80' : '#666',
+              }}
+            />
+          </div>
+          <div>
+            <div style={{ fontSize: '13px', color: '#ccc' }}>Восстанавливать файл при открытии</div>
+            <div style={{ fontSize: '11px', color: '#666' }}>Если выкл — Cmd+/ всегда показывает только дерево</div>
+          </div>
+        </label>
+      </Tooltip>
 
-      <label className="flex items-start gap-3 cursor-pointer select-none" title="Закрывать сайдбар при клике вне его (по терминалу или другому месту).">
-        <div
-          className="relative w-8 h-4 rounded-full transition-colors mt-0.5 shrink-0"
-          style={{ backgroundColor: sidebarOverlayCloseOnClickOutside ? 'rgba(74, 222, 128, 0.4)' : 'rgba(255,255,255,0.1)' }}
-          onClick={() => setSidebarOverlayCloseOnClickOutside(!sidebarOverlayCloseOnClickOutside)}
-        >
+      <Tooltip content="Закрывать сайдбар при клике вне его (по терминалу или другому месту).">
+        <label className="flex items-start gap-3 cursor-pointer select-none">
           <div
-            className="absolute top-0.5 w-3 h-3 rounded-full transition-all"
-            style={{
-              left: sidebarOverlayCloseOnClickOutside ? '18px' : '2px',
-              backgroundColor: sidebarOverlayCloseOnClickOutside ? '#4ade80' : '#666',
-            }}
-          />
-        </div>
-        <div>
-          <div style={{ fontSize: '13px', color: '#ccc' }}>Закрывать кликом вне</div>
-          <div style={{ fontSize: '11px', color: '#666' }}>Сайдбар работает как overlay поверх терминала</div>
-        </div>
-      </label>
+            className="relative w-8 h-4 rounded-full transition-colors mt-0.5 shrink-0"
+            style={{ backgroundColor: sidebarOverlayCloseOnClickOutside ? 'rgba(74, 222, 128, 0.4)' : 'rgba(255,255,255,0.1)' }}
+            onClick={() => setSidebarOverlayCloseOnClickOutside(!sidebarOverlayCloseOnClickOutside)}
+          >
+            <div
+              className="absolute top-0.5 w-3 h-3 rounded-full transition-all"
+              style={{
+                left: sidebarOverlayCloseOnClickOutside ? '18px' : '2px',
+                backgroundColor: sidebarOverlayCloseOnClickOutside ? '#4ade80' : '#666',
+              }}
+            />
+          </div>
+          <div>
+            <div style={{ fontSize: '13px', color: '#ccc' }}>Закрывать кликом вне</div>
+            <div style={{ fontSize: '11px', color: '#666' }}>Сайдбар работает как overlay поверх терминала</div>
+          </div>
+        </label>
+      </Tooltip>
     </div>
   );
 }
@@ -202,6 +207,12 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
   const setTabNotesPaddingX = useUIStore((s) => s.setTabNotesPaddingX);
   const tabNotesPaddingY = useUIStore((s) => s.tabNotesPaddingY);
   const setTabNotesPaddingY = useUIStore((s) => s.setTabNotesPaddingY);
+  const notesEditorFontSize = useUIStore((s) => s.notesEditorFontSize);
+  const setNotesEditorFontSize = useUIStore((s) => s.setNotesEditorFontSize);
+  const notesEditorPaddingX = useUIStore((s) => s.notesEditorPaddingX);
+  const setNotesEditorPaddingX = useUIStore((s) => s.setNotesEditorPaddingX);
+  const notesEditorPaddingY = useUIStore((s) => s.notesEditorPaddingY);
+  const setNotesEditorPaddingY = useUIStore((s) => s.setNotesEditorPaddingY);
   const { showToast, docPrompt, setDocPromptUseFile, setDocPromptFilePath, setDocPromptInlineContent, claudeDefaultPromptEnabled, setClaudeDefaultPromptEnabled } = useUIStore();
   const { prompts: aiPrompts, loadPrompts: loadAIPrompts, savePrompt: saveAIPrompt, deletePrompt: deleteAIPrompt, rewindPromptId, setRewindPromptId } = usePromptsStore();
 
@@ -1122,15 +1133,30 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                 <FontSizeSlider label="Превью файла" description="Чтение файла в сайдбаре" value={filePreviewFontSize} onChange={setFilePreviewFontSize} min={10} max={24} />
               </div>
 
+              {/* Two distinct surfaces with two distinct sizing knobs:
+                  • Превью — the inline notes box at the bottom of the InfoPanel.
+                  • Редактор — the resizable slide-out (Open button next to "ЗАМЕТКИ ВКЛАДКИ"). */}
               <div style={{ marginTop: '20px', paddingTop: '14px', borderTop: '1px solid #2a2a2a' }}>
                 <div style={{ fontSize: '11px', fontWeight: 600, color: '#666', marginBottom: '10px', textTransform: 'uppercase' }}>
-                  Описание вкладки
+                  Превью заметок (в сайдбаре)
                 </div>
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
-                  <FontSizeSlider label="Заметки вкладки" description="Превью и редактор описания" value={tabNotesFontSize} onChange={setTabNotesFontSize} min={10} max={20} />
-                  <div /> {/* visual gap so paddings group together below */}
+                  <FontSizeSlider label="Шрифт" description="Размер текста в превью" value={tabNotesFontSize} onChange={setTabNotesFontSize} min={10} max={20} />
+                  <div />
                   <FontSizeSlider label="Padding X" description="Горизонтальный отступ" value={tabNotesPaddingX} onChange={setTabNotesPaddingX} min={0} max={32} />
                   <FontSizeSlider label="Padding Y" description="Вертикальный отступ" value={tabNotesPaddingY} onChange={setTabNotesPaddingY} min={0} max={32} />
+                </div>
+              </div>
+
+              <div style={{ marginTop: '20px', paddingTop: '14px', borderTop: '1px solid #2a2a2a' }}>
+                <div style={{ fontSize: '11px', fontWeight: 600, color: '#666', marginBottom: '10px', textTransform: 'uppercase' }}>
+                  Редактор заметок (slide-out)
+                </div>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
+                  <FontSizeSlider label="Шрифт" description="Размер текста в slide-out" value={notesEditorFontSize} onChange={setNotesEditorFontSize} min={10} max={28} />
+                  <div />
+                  <FontSizeSlider label="Padding X" description="Горизонтальный отступ" value={notesEditorPaddingX} onChange={setNotesEditorPaddingX} min={0} max={48} />
+                  <FontSizeSlider label="Padding Y" description="Вертикальный отступ" value={notesEditorPaddingY} onChange={setNotesEditorPaddingY} min={0} max={48} />
                 </div>
               </div>
 

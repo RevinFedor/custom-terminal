@@ -5,6 +5,7 @@ import { useUIStore, ThinkingLevel, AIModel } from '../../store/useUIStore';
 import { usePromptsStore } from '../../store/usePromptsStore';
 import ChatArea from './ChatArea';
 import ResearchInput from './ResearchInput';
+import Tooltip from '../UI/Tooltip';
 
 interface ResearchSheetProps {
   projectId: string;
@@ -312,37 +313,38 @@ export default function ResearchSheet({ projectId, projectPath }: ResearchSheetP
               <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                 {/* Copy last response button */}
                 {lastAssistantResponse && (
-                  <button
-                    onClick={copyLastResponse}
-                    style={{
-                      fontSize: '11px',
-                      color: '#4ade80',
-                      background: 'rgba(34,197,94,0.1)',
-                      border: '1px solid rgba(34,197,94,0.3)',
-                      borderRadius: '6px',
-                      padding: '4px 10px',
-                      cursor: 'pointer',
-                      display: 'flex',
-                      alignItems: 'center',
-                      gap: '4px',
-                      transition: 'all 0.15s ease'
-                    }}
-                    onMouseEnter={(e) => {
-                      e.currentTarget.style.background = 'rgba(34,197,94,0.2)';
-                      e.currentTarget.style.borderColor = 'rgba(34,197,94,0.5)';
-                    }}
-                    onMouseLeave={(e) => {
-                      e.currentTarget.style.background = 'rgba(34,197,94,0.1)';
-                      e.currentTarget.style.borderColor = 'rgba(34,197,94,0.3)';
-                    }}
-                    title="Скопировать последний ответ"
-                  >
-                    <svg width="12" height="12" viewBox="0 0 16 16" fill="none">
-                      <rect x="5" y="5" width="9" height="9" rx="1" stroke="currentColor" strokeWidth="1.5"/>
-                      <path d="M11 5V3C11 2.44772 10.5523 2 10 2H3C2.44772 2 2 2.44772 2 3V10C2 10.5523 2.44772 11 3 11H5" stroke="currentColor" strokeWidth="1.5"/>
-                    </svg>
-                    Copy
-                  </button>
+                  <Tooltip content="Скопировать последний ответ">
+                    <button
+                      onClick={copyLastResponse}
+                      style={{
+                        fontSize: '11px',
+                        color: '#4ade80',
+                        background: 'rgba(34,197,94,0.1)',
+                        border: '1px solid rgba(34,197,94,0.3)',
+                        borderRadius: '6px',
+                        padding: '4px 10px',
+                        cursor: 'pointer',
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '4px',
+                        transition: 'all 0.15s ease'
+                      }}
+                      onMouseEnter={(e) => {
+                        e.currentTarget.style.background = 'rgba(34,197,94,0.2)';
+                        e.currentTarget.style.borderColor = 'rgba(34,197,94,0.5)';
+                      }}
+                      onMouseLeave={(e) => {
+                        e.currentTarget.style.background = 'rgba(34,197,94,0.1)';
+                        e.currentTarget.style.borderColor = 'rgba(34,197,94,0.3)';
+                      }}
+                    >
+                      <svg width="12" height="12" viewBox="0 0 16 16" fill="none">
+                        <rect x="5" y="5" width="9" height="9" rx="1" stroke="currentColor" strokeWidth="1.5"/>
+                        <path d="M11 5V3C11 2.44772 10.5523 2 10 2H3C2.44772 2 2 2.44772 2 3V10C2 10.5523 2.44772 11 3 11H5" stroke="currentColor" strokeWidth="1.5"/>
+                      </svg>
+                      Copy
+                    </button>
+                  </Tooltip>
                 )}
                 {conversation && (
                   <button

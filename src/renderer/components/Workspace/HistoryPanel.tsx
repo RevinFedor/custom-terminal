@@ -1,6 +1,7 @@
 import React, { useEffect, useLayoutEffect, useState, useRef, useCallback, useMemo, memo, startTransition } from 'react';
 import { X, ChevronDown, ChevronRight, Search, ArrowUp, ArrowDown } from 'lucide-react';
 import { useUIStore } from '../../store/useUIStore';
+import Tooltip from '../UI/Tooltip';
 import MarkdownRenderer from '../Research/MarkdownRenderer';
 
 const { ipcRenderer } = window.require('electron');
@@ -966,9 +967,9 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
         }}
       >
         <span style={{ fontSize: 12, color: '#999', fontWeight: 500, flexShrink: 0 }}>History</span>
+        <Tooltip content="Search (Cmd+F)">
         <button
           onClick={openSearch}
-          title="Search (Cmd+F)"
           style={{
             background: 'none', border: 'none', color: searchOpen ? '#e0e0e0' : '#666',
             cursor: 'pointer', padding: 2, display: 'flex', alignItems: 'center', flexShrink: 0,
@@ -978,6 +979,7 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
         >
           <Search size={13} />
         </button>
+        </Tooltip>
         {searchOpen && (
           <>
             <input
@@ -999,21 +1001,27 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
               onFocus={(e) => { (e.currentTarget as HTMLInputElement).style.borderColor = '#5b9cf5'; }}
               onBlur={(e) => { (e.currentTarget as HTMLInputElement).style.borderColor = '#444'; }}
             />
-            <button onClick={goPrevMatch} title="Previous (Shift+Enter)" style={{ background: 'none', border: 'none', color: '#888', cursor: 'pointer', padding: 1, display: 'flex' }}
+            <Tooltip content="Previous (Shift+Enter)">
+            <button onClick={goPrevMatch} style={{ background: 'none', border: 'none', color: '#888', cursor: 'pointer', padding: 1, display: 'flex' }}
               onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.color = '#fff'; }}
               onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.color = '#888'; }}
             ><ArrowUp size={14} /></button>
-            <button onClick={goNextMatch} title="Next (Enter)" style={{ background: 'none', border: 'none', color: '#888', cursor: 'pointer', padding: 1, display: 'flex' }}
+            </Tooltip>
+            <Tooltip content="Next (Enter)">
+            <button onClick={goNextMatch} style={{ background: 'none', border: 'none', color: '#888', cursor: 'pointer', padding: 1, display: 'flex' }}
               onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.color = '#fff'; }}
               onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.color = '#888'; }}
             ><ArrowDown size={14} /></button>
+            </Tooltip>
             <span style={{ fontSize: 11, color: '#666', flexShrink: 0, minWidth: 35, textAlign: 'right' }}>
               {matchPositions.length > 0 ? `${currentMatchIdx + 1}/${matchPositions.length}` : searchQuery.length >= 2 ? '0' : ''}
             </span>
-            <button onClick={closeSearch} title="Close search (Esc)" style={{ background: 'none', border: 'none', color: '#666', cursor: 'pointer', padding: 1, display: 'flex', flexShrink: 0 }}
+            <Tooltip content="Close search (Esc)">
+            <button onClick={closeSearch} style={{ background: 'none', border: 'none', color: '#666', cursor: 'pointer', padding: 1, display: 'flex', flexShrink: 0 }}
               onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.color = '#fff'; }}
               onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.color = '#666'; }}
             ><X size={13} /></button>
+            </Tooltip>
           </>
         )}
         {!searchOpen && <div style={{ flex: 1 }} />}
@@ -1064,6 +1072,7 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
           </div>
         )}
         {/* Scroll-to-bottom arrow — visibility toggled via ref in handleScroll */}
+        <Tooltip content="Scroll to bottom">
         <div
           ref={scrollArrowRef}
           className="flex items-center justify-center"
@@ -1087,10 +1096,10 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
             cursor: 'pointer',
             zIndex: 10,
           }}
-          title="Scroll to bottom"
         >
           <ChevronDown size={16} color="#a78bfa" strokeWidth={2.5} />
         </div>
+        </Tooltip>
       </div>
     </div>
   );

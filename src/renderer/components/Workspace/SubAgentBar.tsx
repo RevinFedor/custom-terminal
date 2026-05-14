@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Pin } from 'lucide-react';
 import { draggable } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
+import Tooltip from '../UI/Tooltip';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 
 const { ipcRenderer } = window.require('electron');
@@ -411,6 +412,7 @@ export default function SubAgentBar({ projectId, adoptDragOver }: SubAgentBarPro
 
           {/* Send now button (only when queue has items) */}
           {hasQueue && (
+            <Tooltip content="Force deliver next response (clears input)">
             <button
               onClick={handleForceFlush}
               className="flex items-center gap-1 px-2 py-0.5 rounded transition-colors"
@@ -421,10 +423,10 @@ export default function SubAgentBar({ projectId, adoptDragOver }: SubAgentBarPro
                 fontSize: '10px',
                 cursor: 'pointer',
               }}
-              title="Force deliver next response (clears input)"
             >
               Send now
             </button>
+            </Tooltip>
           )}
 
           {/* Dropdown */}

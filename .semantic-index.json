@@ -2662,10 +2662,17 @@
       "Scroll position resets when user scrolls up to read history",
       "Scrollbar jerks or snaps back during Claude response rendering",
       "User scrolls down to active output area but viewport snaps back up",
-      "Scroll position becomes unstable with rapid ANSI escape sequence updates"
+      "Scroll position becomes unstable with rapid ANSI escape sequence updates",
+      "New TUI response renders but viewport does not auto-follow to bottom — new content scrolls off-screen",
+      "Bottom ~20 lines (Ink input area) render in new position while scrollback above stays stale",
+      "Rapid tab switching causes layout breakage: borders shift, two terminals visible simultaneously, viewport mismatch",
+      "Typing during streaming clears scroll protection and causes viewport jump"
     ],
     "related_components": [
       "src/renderer/components/Terminal.tsx",
+      "src/renderer/components/Workspace/TerminalArea.tsx",
+      "src/renderer/components/Workspace/BrowserTab.tsx",
+      "src/renderer/components/Workspace/ClaudeSDK/ClaudeSDKTab.tsx",
       "packages/claude-code-src/ink/terminal.ts",
       "packages/claude-code-src/ink/render-node-to-output.ts",
       "main.js"

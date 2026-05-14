@@ -481,7 +481,6 @@ export default function GeminiPanel({ projectPath, geminiPrompt }: GeminiPanelPr
                   ? 'bg-accent/20 text-accent'
                   : 'text-[#888] hover:text-white hover:bg-[#444]'
               }`}
-              title="Применить из буфера"
             >
               <ClipboardPaste size={12} />
               <span>Буфер</span>
@@ -663,12 +662,12 @@ export default function GeminiPanel({ projectPath, geminiPrompt }: GeminiPanelPr
                           return <div key={si} style={{
                             width: '2px', height: '10px', borderRadius: '1px',
                             backgroundColor: '#a67c1a',
-                          }} title="compact" />;
+                          }} />;
                         } else if (seg.type === 'plan') {
                           return <div key={si} style={{
                             width: '2px', height: '10px', borderRadius: '1px',
                             backgroundColor: '#3d7a72',
-                          }} title="plan mode" />;
+                          }} />;
                         }
                         return null;
                       })}

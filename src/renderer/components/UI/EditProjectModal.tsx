@@ -5,6 +5,7 @@ import { useBookmarksStore } from '../../store/useBookmarksStore';
 import { Folder, CheckCircle2, AlertCircle, Trash2, HelpCircle } from 'lucide-react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import SmartPopover from './SmartPopover';
+import Tooltip from './Tooltip';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -131,13 +132,14 @@ export default function EditProjectModal() {
       >
         {/* Top Right Controls */}
         <div className="absolute top-4 right-4 flex items-center gap-2">
-          <button
-            className="p-1.5 text-gray-500 hover:text-red-400 hover:bg-red-500/10 rounded-full transition-all cursor-pointer"
-            onClick={handleDelete}
-            title="Delete"
-          >
-            <Trash2 size={16} />
-          </button>
+          <Tooltip content="Delete">
+            <button
+              className="p-1.5 text-gray-500 hover:text-red-400 hover:bg-red-500/10 rounded-full transition-all cursor-pointer"
+              onClick={handleDelete}
+            >
+              <Trash2 size={16} />
+            </button>
+          </Tooltip>
           <button
             className="w-8 h-8 flex items-center justify-center text-gray-500 hover:text-white rounded-full hover:bg-white/5 transition-all text-xl"
             onClick={closeEditModal}

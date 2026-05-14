@@ -1,0 +1,469 @@
+# Design Bugs — типовые ошибки UI разработки
+
+Каталог багов, которые повторно возникают при разработке интерфейсов. Не «как должно быть» (это `design.md`), а **«что обычно ломается и как это починить»**. Открывай перед проектированием нового компонента — большинство «новых» багов здесь уже описаны.
+
+Группы:
+1. [Геометрия и обрезка](#1-геометрия-и-обрезка)
+2. [Hover-bridge: popup закрывается при движении к нему](#2-hover-bridge-popup-закрывается-при-движении-к-нему)
+3. [CMD/Ctrl-hover edge cases](#3-cmdctrl-hover-edge-cases)
+4. [Click-outside и пути к escape'у](#4-click-outside-и-пути-к-escape)
+5. [Рассинхрон видимости и состояния](#5-рассинхрон-видимости-и-состояния)
+6. [Z-index конфликты](#6-z-index-конфликты)
+7. [Hover affordance: непонятно, что кликабельно](#7-hover-affordance-непонятно-что-кликабельно)
+8. [Auto-focus и фокус-ловушки](#8-auto-focus-и-фокус-ловушки)
+9. [Динамический layout и измерение в момент рендера](#9-динамический-layout-и-измерение-в-момент-рендера)
+10. [Portal и обрезка overflow](#10-portal-и-обрезка-overflow)
+11. [Минимализм popup'ов: single-control = `<input>`, не «модалка»](#11-минимализм-popupов-single-control--input-не-модалка)
+12. [Tri-state кнопка действия: idle / continue / stop](#12-tri-state-кнопка-действия-idle--continue--stop)
+13. [Чек-лист перед мержем UI-фичи](#13-чек-лист-перед-мержем-ui-фичи)
+
+---
+
+## 1. Геометрия и обрезка
+
+### 1.1. Popup уезжает за правый/нижний край
+
+**Симптом.** Popup частично за границей viewport либо за сайдбаром. Пользователь не видит правый/нижний край.
+
+**Причины.**
+- Позиционирование по `left` или `top` фиксированной формулой (`left: chipRect.left`), но триггер близко к правому краю.
+- Width у popup'а статическая (`minWidth: 320`), свободного места осталось 150.
+- `position: fixed` от `body` не знает про сайдбар (Timeline strip, file explorer) — статика не учитывает что справа физически занято 32–160px.
+
+**Фиксы.**
+
+```tsx
+// ПЛОХО — улетает вправо
+style={{ left: chipRect.left, top: chipRect.bottom + 4 }}
+
+// ХОРОШО — right-anchor (для триггеров в правой части UI)
+style={{ right: window.innerWidth - chipRect.right, top: chipRect.bottom + 4 }}
+```
+
+Для popup'ов с большим контентом — **динамическая ширина** через `useLayoutEffect`:
+```tsx
+const sidebar = document.querySelector('[data-timeline]') as HTMLElement | null;
+const sidebarLeft = sidebar ? sidebar.getBoundingClientRect().left : window.innerWidth;
+const rightLimit = Math.min(sidebarLeft, window.innerWidth) - 8;
+setWidth(Math.max(MIN_WIDTH, rightLimit - anchorRect.left));
+```
+Перемеряй на `window.resize`. Источник правды о границе сайдбара — стабильный `data-attr`, не магические числа.
+
+### 1.2. Smart-flip ниже/выше
+
+Если popup ниже триггера обрезается по нижнему краю — переключайся выше:
+```ts
+const spaceBelow = window.innerHeight - rect.bottom;
+const showAbove = spaceBelow < 160;
+```
+См. `useCmdHoverPopover::getPopoverPosition`.
+
+### 1.3. Popup в status bar всегда раскрывается вверх
+
+Status bar в самом низу. Использовать `bottom: window.innerHeight - chipRect.top + 4`, не `top: chipRect.bottom + …`. Детерминировано — smart-flip не нужен.
+
+---
+
+## 2. Hover-bridge: popup закрывается при движении к нему
+
+### 2.1. Симптом и причина
+
+Пользователь видит popup, движет курсор к нему, но при пересечении gap'а popup пропадает. **Причина:** `onMouseLeave` срабатывает в gap'е, потому что между двумя DOM-элементами курсор «нигде».
+
+Никакая логика типа «проверь, не идёт ли курсор в сторону popup'а» не работает надёжно. Нужен **хитбокс**, покрывающий gap.
+
+### 2.2. Три фикса по убыванию простоты
+
+**(а) CSS-bridge через wrapper с явной высотой.** Popup — не `position: fixed` на голом контенте, а wrapper, занимающий gap, с видимым контентом внутри:
+```tsx
+const wTop = Math.min(clampedTop, eCenterY - 20);
+const wH = Math.max(...) - wTop;
+return { clampedTop, wTop, wH, offset: clampedTop - wTop };
+```
+Wrapper — `top: wTop, height: wH`. Видимый popup внутри сдвинут через `marginTop: offset`. `onMouseLeave` теперь на wrapper'е — курсор должен выйти из всей совокупной области.
+
+**(б) Bridge через padding (для коротких popup'ов).** Внешний div с `paddingTop: GAP`:
+```tsx
+<div style={{ position: 'fixed', top: trigger.bottom + 4, paddingTop: 4 }}>
+  <input … />
+</div>
+```
+Визуально 4px gap, но hit-area от триггера.
+
+**(в) Geometric hit-test (если расстояние большое, два независимых Portal'а).** Document-level `mousemove` + rect-математика:
+```tsx
+useEffect(() => {
+  if (!popupOpen) return;
+  const onMove = (e: MouseEvent) => {
+    const t = triggerRef.current?.getBoundingClientRect();
+    const p = popupRef.current?.getBoundingClientRect();
+    if (!t || !p) return;
+    const { clientX: x, clientY: y } = e;
+    const inT = x >= t.left && x <= t.right && y >= t.top && y <= t.bottom;
+    const inP = x >= p.left && x <= p.right && y >= p.top && y <= p.bottom;
+    const inBridge =                                    // popup СЛЕВА от триггера
+      x >= p.right && x <= t.left &&
+      y >= Math.min(p.top, t.top) - 8 &&
+      y <= Math.max(p.bottom, t.bottom) + 8;
+    if (!inT && !inP && !inBridge) setPopupOpen(false);
+  };
+  document.addEventListener('mousemove', onMove);
+  return () => document.removeEventListener('mousemove', onMove);
+}, [popupOpen]);
+```
+
+Direction варьируется: popup слева от триггера → bridge между `p.right` и `t.left`; popup сверху → между `p.bottom` и `t.top`.
+
+### 2.3. Особый случай: wrapper смещён вниз от триггера
+
+**Реальный баг (Copy session popup).** Popup ниже кнопки на 4px. Wrapper позиционирован `top: button.bottom + 4`, внутри `paddingTop: 4`. Снаружи — `position: fixed` на этих 4px ничего не лежит.
+
+```tsx
+// ПЛОХО — 4px gap снаружи wrapper'а — мёртвая зона:
+<div style={{ position: 'fixed', top: button.bottom + 4, paddingTop: 4 }}>
+  <input … />
+</div>
+```
+
+Курсор едет от кнопки вниз → пересекает эти 4px → `onMouseLeave` кнопки уже отработал, в wrapper ещё не вошли → popup закрывается. `paddingTop` внутри wrapper'а **не** помогает — он начинается **после** offset'а сверху.
+
+```tsx
+// ХОРОШО — wrapper вплотную к кнопке, gap создаётся padding'ом ВНУТРИ:
+<div style={{ position: 'fixed', top: button.bottom, paddingTop: 4 }}>
+  <input … />
+</div>
+```
+Теперь зона hover'а wrapper'а смыкается с зоной hover'а кнопки. Курсор пересекает gap, оставаясь в `paddingTop` wrapper'а. Это и есть «invisible CSS-bridge» в правильной форме.
+
+**Правило.** `top` wrapper'а = координата границы триггера (никаких +N). Визуальный gap = padding **внутрь** wrapper'а в нужную сторону. Применимо в обе стороны: popup сверху → `bottom: window.innerHeight - trigger.top` + `paddingBottom: GAP`.
+
+### 2.4. Антипаттерн: elementFromPoint
+
+В gap'е `elementFromPoint` возвращает то что **под** wrapper'ом и popup'ом (terminal, body). Поэтому `el.closest('[data-bridge]')` фейлит, popup закрывается. **Координатный hit-test (вариант в) — единственно надёжный**, если работаешь не с DOM-обёрткой.
+
+### 2.5. Debug-визуализация bridge'ов
+
+В режиме разработки удобно видеть невидимые bridge'ы. Хранится в `useUIStore.debugHoverBridges` (тогглер в `StatusBar`). Компонент `HoverBridgeDebug` рисует красный прозрачный rect поверх bridge-области с `pointer-events: none`. Если в проде popup закрывается «непонятно когда» — включи флаг и увидишь, что курсор реально вышел из всех зон.
+
+Файл: `src/renderer/components/HoverBridgeDebug.tsx`.
+
+---
+
+## 3. CMD/Ctrl-hover edge cases
+
+### 3.1. Popup пропадает при отпускании CMD
+
+**Симптом.** Зажал CMD, навёлся, popup появился. Отпустил CMD — popup исчез, хотя курсор всё ещё на нём.
+
+**Фикс.** `visible = isCmdPressed || isPinned`. Курсор зашёл на popup — `isPinned = true`. См. `useCmdHoverPopover::popoverProps`.
+
+### 3.2. Залипание popup'а после window blur
+
+**Симптом.** Зажал CMD, переключился через Cmd+Tab в другое приложение, CMD отпустил **в чужом окне** — `keyup` не приходит. Возвращается — popup залип, потому что флаг pressed остался `true`.
+
+**Фикс.** `window.addEventListener('blur', () => setPressed(false))`. См. `useCmdKey`.
+
+### 3.3. Случайные popup'ы при дрейфе курсора с зажатым CMD
+
+**Симптом.** Юзер двигает курсор по экрану с CMD (готовится к hotkey) — над каждым элементом мигают popup'ы.
+
+**Фикс.** Bridge-timeout — popup появляется не мгновенно, а после 100–150мс непрерывного hover'а с CMD. См. `useCmdHoverPopover(bridgeTimeout = 150)`.
+
+### 3.4. Synthetic keydown с metaKey не работает в Electron 27+
+
+**Симптом.** `dispatchEvent(new KeyboardEvent('keydown', { metaKey: true }))` приходит к слушателю с `e.metaKey === false`.
+
+**Фикс.** На уровне приложения — полагайся на реальные нажатия. В автоматизации (тесты, MCP) — используй CDP-debugger или `mcp__electron__electron_keyboard` с `action:'down'`, а не synthetic events.
+
+---
+
+## 4. Click-outside и пути к escape'у
+
+### 4.1. Принцип
+
+В любом «модальном» режиме popup'а пользователь должен мочь закрыть его кликом мимо. Это **более фундаментальный** жест, чем mouse-leave.
+
+### 4.2. Ловушка: confirm-режим заперт
+
+**Симптом.** Popup в режиме `deleteConfirm` или `postPrompt` — `mouseLeave` отключён (защита от случайного hover-выхода). Но **и** click-outside выключен, чтобы случайный клик не отменил подтверждение. Юзер заперт.
+
+**Фикс.** Отключай **только** `mouseLeave` в опасных режимах, **никогда** не выключай click-outside.
+
+### 4.3. e.stopPropagation на root popup'а
+
+Если document-listener на `mousedown` (capture или bubble) — у внутренних кликов popup'а должен быть `e.stopPropagation()` ИЛИ listener должен проверять `if (popupRef.contains(e.target)) return`. Выбери один путь и держи единый стиль во всём проекте, не миксуй.
+
+### 4.4. Esc обязателен дополнительно
+
+Click-outside и Esc — два независимых пути. Esc нужен для ситуаций когда мыши под рукой нет, или когда click-outside случайно перехватывается (например, popup занимает весь viewport).
+
+См. `design.md::Click-outside как universal escape, mouse-leave опционален`.
+
+---
+
+## 5. Рассинхрон видимости и состояния
+
+### 5.1. UI показывает X, но данные — Y
+
+**Симптом.** Пользователь переключил backend → UI обновился → ответ пришёл от **старого** backend (запрос ушёл до переключения). Badge в UI новый, контент старый.
+
+**Фикс.** Источник правды для post-factum индикации — **ответ сервера**, не локальный UI-флаг. Каждое сообщение в истории помечается метаданными из response (`message.model`, `provider`, `region`). Live-индикатор «куда сейчас отправляется» — отдельный (можно из UI-state), не путать с post-factum badge.
+
+См. `design.md::Truth from server response, not local UI flag`.
+
+### 5.2. Множественный hover из-за неполного селектора активности
+
+**Симптом.** Несколько компонентов одновременно в состоянии «активный» (одинаковый z-index, glow), потому что каждый проверял только `activeTabId === tabId` и не учитывал `activeProjectId`.
+
+**Фикс.** В Zustand-селекторе для local-active проверяй **и** `state.activeProjectId === projId` **и** `workspace.activeTabId === tabId`. См. `knowledge/fix-performance-lags.md` Section 5.
+
+### 5.3. Стайл одного элемента «прыгает» когда монтируется другой
+
+**Симптом.** Открыл sidebar — координаты popup'а в соседнем компоненте сместились на 300px, popup улетел в стену.
+
+**Причина.** Popup кэширует `getBoundingClientRect()` один раз при показе. Sidebar открывается — основная разметка сжимается — popup продолжает считать что anchor там же.
+
+**Фикс.** ResizeObserver на body (или на container) + перемеряй. Не кэшируй геометрию между ре-рендерами родительского layout'а.
+
+---
+
+## 6. Z-index конфликты
+
+### 6.1. Таблица слоёв проекта
+
+| Слой | z-index | Кто |
+|---|---|---|
+| Page content | 0–40 | Terminal, sidebar, regular UI |
+| Resize-handle | 50 | Тянем границу панели |
+| Tooltip (hover на dot) | 10010 | Timeline tooltip wrapper |
+| Range action menu | 10020 | ПКМ-выделение → Копировать/Удалить |
+| Context menu (ПКМ) | 10001 | Single-entry copy/note/rewind |
+| Settings popup | 10000 | Copy session settings, API settings |
+| Bridge debug overlay | 99999 | Поверх всего, `pointer-events: none` |
+
+**Правило.** Если новый popup появляется поверх старого — у нового z-index выше. **Симптом нарушения:** видишь panel, но не можешь кликнуть — её перекрывает невидимая (или прозрачная) другая. Использовать DevTools → Layers, чтобы понять что сверху.
+
+### 6.2. Bridge debug всегда выше всего
+
+`HoverBridgeDebug` рендерит overlay с `z-index: 99999, pointer-events: none`. Это безопасно — он не блокирует клики, но всегда видим. Не понижай его «чтобы не мешал» — он специально такой.
+
+См. `knowledge/fact-timeline.md::Z-index и геометрия popup`.
+
+---
+
+## 7. Hover affordance: непонятно, что кликабельно
+
+### 7.1. Симптом
+
+Пользователь видит кнопку, но не понимает что она делает / что кликабельно / есть ли скрытые зоны. Меняется только `cursor: pointer` — этого недостаточно.
+
+### 7.2. Что добавлять
+
+- Фон меняется на hover (минимум 0.08 → 0.28 alpha от accent-цвета). Это **обязательно**, а не nice-to-have.
+- Текст на hover — становится белым / полужирным, если фон тёмный (фон+цвет — это две разные подсказки в одно нажатие).
+- Не используй чистую `animate-pulse` (opacity) для индикаторов на тёмном фоне — H.264 codec её съедает (см. CLAUDE.md AI-Optimized UI). Используй `background-color` glow.
+
+**Реальный симптом из живой сессии:** *«непонятно что значит копировать, то есть должен как-то бэкграунд меняться. Меняемся только лишь курсор пойнтера»* — pointer без фона юзер не воспринимает как affordance. Курсор-only — не affordance.
+
+### 7.3. Сегментированные кнопки: независимые hover-зоны
+
+Если кнопка разделена на две (или больше) функциональные зоны (например, `📋-settings | Copy session-label`), каждая зона должна иметь **собственный** hover-state. Outer container прозрачный, каждая половина — свой `backgroundColor` на hover, разделённые 1px divider'ом. Юзер видит, **куда именно** сейчас попадёт клик.
+
+**Антипаттерн.** Outer-container получает hover-фон всей кнопки целиком → обе половины подсвечиваются одновременно → непонятно, на какую зону наведён курсор и что произойдёт по клику.
+
+**Реализация.**
+```tsx
+<div className="inline-flex items-center rounded overflow-hidden" style={{ border: 'accent' }}>
+  <span onMouseEnter={() => setIconHovered(true)} onMouseLeave={() => setIconHovered(false)}
+        style={{ backgroundColor: iconHovered ? 'accent/0.28' : 'transparent' }}>
+    📋
+  </span>
+  <span style={{ width: 1, height: '70%', backgroundColor: 'accent/0.25' }} />  {/* divider */}
+  <span onMouseEnter={() => setLabelHovered(true)} onMouseLeave={() => setLabelHovered(false)}
+        style={{ backgroundColor: labelHovered ? 'accent/0.28' : 'transparent' }}>
+    Copy session
+  </span>
+</div>
+```
+
+Outer container остаётся прозрачным (`backgroundColor: accent/0.08` максимум), весь видимый hover-эффект — на половинах.
+
+### 7.4. Размер не меньше 16x16
+
+Кликабельные иконки в плотных UI — минимум 16x16px hit area (даже если visual size 12x12 — добавь padding). Иначе пользователю придётся целиться.
+
+См. `knowledge/fact-ux-patterns.md::Edit affordance`, `knowledge/fact-clipboard-tools.md::Copy Session: размещение и UX`.
+
+---
+
+## 8. Auto-focus и фокус-ловушки
+
+### 8.1. Открыл modal — focus уехал в случайное место
+
+**Фикс.** При монтировании modal — `setTimeout(() => inputRef.current?.focus(), 30)`. Без setTimeout React не успевает завершить commit, и фокус не закрепляется.
+
+### 8.2. Запертый фокус в modal
+
+**Симптом.** Юзер в modal'е, нажал Tab — фокус ушёл в задний фон (на основное окно). Tab loop сломан.
+
+**Фикс.** Либо react-focus-lock, либо `onKeyDown` на root modal'а: ловишь Tab, проверяешь focusable элементы внутри, циклишь.
+
+### 8.3. Закрыл modal — фокус не вернулся туда, где был
+
+**Фикс.** Перед открытием modal'а — `previousFocus.current = document.activeElement`. На unmount — `previousFocus.current?.focus()`.
+
+### 8.4. Open != focus
+
+Modal открыт, но input не сфокусирован — типичный баг. **Каждый** modal с input'ом должен сфокусировать его сам, не полагаясь что юзер кликнет.
+
+См. `design.md::Auto-focus при открытии`.
+
+---
+
+## 9. Динамический layout и измерение в момент рендера
+
+### 9.1. Hard-coded размеры в формуле позиционирования
+
+**Симптом.** `right: notesPanelWidth + (treeMode ? 160 : 32) - 8` — формула «по дизайну». Меняется один из элементов, popup съезжает.
+
+**Фикс.** Измеряй через `ResizeObserver` + `getBoundingClientRect`:
+```tsx
+useLayoutEffect(() => {
+  const measure = () => {
+    if (!containerRef.current) return;
+    const rect = containerRef.current.getBoundingClientRect();
+    setRightPx(window.innerWidth - rect.left + 8);
+  };
+  measure();
+  const ro = new ResizeObserver(measure);
+  ro.observe(document.body);
+  if (containerRef.current) ro.observe(containerRef.current);
+  window.addEventListener('resize', measure);
+  return () => { ro.disconnect(); window.removeEventListener('resize', measure); };
+}, []);
+```
+Формула умирает — измерение живёт.
+
+См. `design.md::Геометрия popup — от измерения, не от формулы`.
+
+### 9.2. Процентное позиционирование в списках с динамической высотой
+
+**Симптом.** `top: 65%` в списке где элементы имеют `flex-grow` или условные маркеры — overlay визуально рассинхронизирован с целевой строкой.
+
+**Фикс.** Используй `offsetTop` / `offsetHeight` целевого элемента через ref. См. `CLAUDE.md::Dynamic List Overlays`.
+
+---
+
+## 10. Portal и обрезка overflow
+
+### 10.1. Симптом
+
+Popup рендерится внутри родителя с `overflow: hidden` (scroll-area, sidebar) — обрезается по границе родителя.
+
+### 10.2. Фикс
+
+`createPortal(<popup/>, document.body)` — popup рендерится в `body`, escape'ит `overflow: hidden`. См. `SettingsPortal`, `TooltipPortal` в проекте.
+
+### 10.3. Event handlers и Portal
+
+`onClick` внутри Portal **продолжает** bubble'ить вверх по React virtual tree (не по DOM tree!). Поэтому document-listener на `mousedown` всё равно ловит клики в Portal. Если popup в Portal — это **не означает** что click-outside автоматически работает. Проверяй явно через `popupRef.contains(e.target)`.
+
+---
+
+## 11. Минимализм popup'ов: single-control = `<input>`, не «модалка»
+
+### 11.1. Симптом
+
+Popup, который имеет **один** основной интерактивный элемент (одна textarea / один input / одна кнопка действия), оформлен как полноценная модалка: заголовок («Custom session ID», «Введите путь к файлу»), описание-подсказка («⌘+Enter — copy · Esc — close»), footer-кнопка действия.
+
+**Признак ошибки.** Юзер говорит *«не должно быть модалки полноценной, должен быть просто input»* — единственный реальный control (input) утоплен в чрезмерной chrome.
+
+### 11.2. Правило
+
+Если popup содержит **один** input/textarea и одно действие — **отрисуй только сам control**. Никаких заголовков (label уже виден через placeholder), никаких описаний (`Enter/Esc` — общеизвестно), никакой кнопки Copy (Enter копирует, тогда зачем кнопка).
+
+**ДО (модалка):**
+```tsx
+<div className="modal">
+  <h4>Custom session ID</h4>
+  <textarea placeholder="Введите UUID..." />
+  <div className="footer">
+    <span>⌘+Enter — copy · Esc — close</span>
+    <button>Copy</button>
+  </div>
+</div>
+```
+
+**ПОСЛЕ (просто input):**
+```tsx
+<input type="text" placeholder="Session ID или текст с cwd: /path…"
+       onKeyDown={(e) => { if (e.key === 'Enter' && val) onCopy(); }} />
+```
+
+### 11.3. Когда полноценная модалка оправдана
+
+- Несколько входных полей (форма, не одиночный ввод).
+- Деструктивное действие (требует confirm-кнопку с явным текстом).
+- Контент-просмотр (нужен заголовок чтобы юзер понимал, что смотрит).
+
+### 11.4. Не подменять минимализм визуальным «уплощением»
+
+Если убрал заголовок/описание, но оставил `padding: 20px; minHeight: 200px` — это всё ещё «модалка», просто без текста. Минимализм = реальная экономия места **и** контента. Высота popup'а должна быть как у самого control'а (input 26px → wrapper 26px+4px padding-bridge, не 50px+).
+
+---
+
+## 12. Tri-state кнопка действия: idle / continue / stop
+
+### 12.1. Симптом
+
+Кнопка управления процессом (Continue, Stop, Resume) — отдельный chip справа от label'а («Claude  Continue» / «Gemini  Stop»). Когда состояние процесса меняется (запустился / остановился), кнопка появляется/исчезает или меняется на соседнюю — layout прыгает, элементы правее сдвигаются.
+
+### 12.2. Правило
+
+Объединяй label + действие в **одну** fixed-width кнопку с tri-state поведением:
+
+| Состояние | Hover-label | Click action |
+|---|---|---|
+| idle (нет hover) | `Claude` / `Gemini` (тип сессии) | Копировать sessionId (fallback) |
+| hover + сессия есть + процесс **не** запущен | `Continue` | resume сессии |
+| hover + процесс **запущен** | `Stop` (красный) | прервать процесс (Ctrl+C, не kill) |
+
+Ширина **фиксирована** (e.g. 64px) — иначе при смене label'а с `Claude` (44px) на `Continue` (60px) на `Stop` (32px) кнопка прыгает, соседние элементы дёргаются.
+
+### 12.3. Цвет = семантика, не симметрия
+
+Stop — **красный** (`#ef4444`), даже если accent проекта оранжевый. Цвет несёт смысл (опасно/прерывает), не следует общей палитре.
+
+### 12.4. Stop = Ctrl+C, не kill
+
+Семантически «остановить процесс» ≠ «убить таб». Stop посылает `\x03` через `terminal:input` (Ctrl+C → SIGINT процессу внутри PTY). Процесс умирает, PTY и таб живут. `terminal:kill` оставь для отдельной кнопки **закрыть таб**.
+
+### 12.5. Сигнал «нужен tri-state» из диалога
+
+Если пользователь говорит «*кнопку X сделай в N состояниях, при наведении меняется на Y*» — он сам уже сформировал паттерн и просит его зафиксировать. Это самый сильный сигнал methodology — он называет паттерн до того как ты его назовёшь. Не пропускай. См. также `design.md` про обратный self-check «не родился ли methodology-принцип?».
+
+См. `knowledge/fact-ai-sessions.md::SessionActionChip` для конкретной реализации в Claude/Gemini-чипе.
+
+---
+
+## 13. Чек-лист перед мержем UI-фичи
+
+Прогоняй перед PR'ом для каждого нового popup/modal/dropdown/tooltip:
+
+- [ ] **Position.** Не уезжает за viewport справа/снизу при разных размерах окна?
+- [ ] **Sidebar awareness.** Если справа есть Timeline / file explorer — popup не заходит за него?
+- [ ] **Width.** Динамическая? Если статическая — точно ли влезет в 800x600?
+- [ ] **CSS-bridge.** Если popup на расстоянии от триггера — есть ли механизм «доехать» курсором без потери hover?
+- [ ] **Bridge debug.** Невидимый bridge подсвечивается при `debugHoverBridges`?
+- [ ] **Click-outside.** Закрывается кликом мимо? Работает в **любом** под-режиме (включая confirm/post-prompt)?
+- [ ] **Esc.** Закрывается клавишей Esc?
+- [ ] **CMD-hover** (если применимо). После отпускания CMD не пропадает, если курсор на popup'е?
+- [ ] **Window blur reset.** Если есть key-tracker — на `window.blur` сбрасывается?
+- [ ] **Z-index.** Не перекрывается соседями? Не перекрывает то, что должно быть кликабельно сверху?
+- [ ] **Portal.** Рендерится через `createPortal(…, document.body)` — иначе overflow-hidden родителя обрежет?
+- [ ] **Hover affordance.** Кнопки/кликабельные зоны меняют фон/текст на hover (не только курсор)?
+- [ ] **Auto-focus.** Input в modal сфокусирован при открытии?
+- [ ] **Focus restore.** После закрытия modal'а фокус вернулся туда, где был?
+- [ ] **Activity selector.** Если есть «активный» state — проверяется И `projectId`, И `tabId`?
+- [ ] **Динамика layout.** Popup перепозиционируется при resize окна / открытии sidebar?
+- [ ] **Truth from server.** Post-factum badge (модель/провайдер/регион) рендерится из ответа сервера, не из локального UI-флага?

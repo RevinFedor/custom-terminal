@@ -49,6 +49,7 @@ export default function NotesPanel({ projectId, project }: NotesPanelProps) {
 
   return (
     <div
+      data-info-aside
       className="bg-notes border-l border-border-main flex flex-col min-w-[150px] w-full h-full"
     >
       {/* Tabs */}

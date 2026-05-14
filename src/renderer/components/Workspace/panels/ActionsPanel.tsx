@@ -24,6 +24,65 @@ interface ActionsPanelProps {
   embedded?: boolean; // When true, renders without header/wrapper (for embedding in InfoPanel)
 }
 
+// Reusable toggle row for the hierarchical copy-settings panel.
+// `indent` enables tree-line rendering (├─ / └─), `isLastChild` switches to └.
+// `label` may be a string (top-level rows) or a ReactNode (allows mixing monospace
+// tool-names with plain Russian hints in child rows).
+function ToggleRow({ label, active, color, onToggle, disabled = false, indent = false, isLastChild = false }: {
+  label: React.ReactNode;
+  active: boolean;
+  color: string;
+  onToggle: () => void;
+  disabled?: boolean;
+  indent?: boolean;
+  isLastChild?: boolean;
+}) {
+  return (
+    <label
+      className={`flex items-center justify-between gap-3 group/label ${disabled ? 'opacity-40 cursor-not-allowed' : 'cursor-pointer'}`}
+      style={{ position: 'relative', paddingLeft: indent ? '20px' : '2px', paddingRight: '2px', paddingTop: 3, paddingBottom: 3 }}
+    >
+      {/* Tree connector — vertical guide + horizontal stub. Last child stops vertical at row centre */}
+      {indent && (
+        <>
+          <span aria-hidden style={{ position: 'absolute', left: 8, top: 0, bottom: isLastChild ? '50%' : 0, width: 1, backgroundColor: '#333' }} />
+          <span aria-hidden style={{ position: 'absolute', left: 8, top: '50%', width: 8, height: 1, backgroundColor: '#333' }} />
+        </>
+      )}
+      <span className="group-hover/label:text-white min-w-0 flex-1" style={{ fontSize: indent ? '11px' : '12px', color: '#bbb', fontWeight: indent ? 400 : 500, lineHeight: 1.3 }}>
+        {label}
+      </span>
+      <div
+        className={`relative ${disabled ? 'cursor-not-allowed' : 'cursor-pointer'} ${active && !disabled ? color : 'bg-[#3a3a3a]'} shrink-0`}
+        style={{ width: 28, height: 16, borderRadius: 8, transition: 'background-color 0.15s' }}
+        onClick={(e) => { e.stopPropagation(); if (!disabled) onToggle(); }}
+      >
+        <div
+          className="absolute bg-white rounded-full"
+          style={{ top: 2, left: active ? 14 : 2, width: 12, height: 12, transition: 'left 0.15s', boxShadow: '0 1px 2px rgba(0,0,0,0.3)' }}
+        />
+      </div>
+    </label>
+  );
+}
+
+// Helper: render a tool group child label as `<code>name1</code> · <code>name2</code>`
+// followed by an optional hint in muted grey. Mono font helps user recognise actual tool
+// names from JSONL (Read, Bash, mcp__*) instead of generic Russian categories.
+function ToolGroupLabel({ tools, hint }: { tools: string[]; hint?: string }) {
+  return (
+    <span style={{ display: 'inline-flex', alignItems: 'baseline', flexWrap: 'wrap', gap: '4px' }}>
+      {tools.map((t, i) => (
+        <React.Fragment key={t}>
+          {i > 0 && <span style={{ color: '#555' }}>·</span>}
+          <code style={{ fontFamily: 'ui-monospace, monospace', fontSize: '10.5px', color: '#d4d4d4', background: 'rgba(255,255,255,0.04)', padding: '1px 4px', borderRadius: 3 }}>{t}</code>
+        </React.Fragment>
+      ))}
+      {hint && <span style={{ color: '#666', fontSize: '10px', marginLeft: 2 }}>{hint}</span>}
+    </span>
+  );
+}
+
 export default function ActionsPanel({ activeTabId, embedded = false }: ActionsPanelProps) {
   const {
     showToast, docPrompt, terminalSelection, autoApplyDocs, setAutoApplyDocs, postCheckDocs, setPostCheckDocs,
@@ -32,6 +91,12 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
     copyFromStart: fromStart, setCopyFromStart: setFromStart,
     copyIncludeSubagentResult: includeSubagentResult, setCopyIncludeSubagentResult: setIncludeSubagentResult,
     copyIncludeSubagentHistory: includeSubagentHistory, setCopyIncludeSubagentHistory: setIncludeSubagentHistory,
+    copyIncludeUser: includeUser, setCopyIncludeUser: setIncludeUser,
+    copyIncludeClaude: includeClaude, setCopyIncludeClaude: setIncludeClaude,
+    copyIncludeText: includeText, setCopyIncludeText: setIncludeText,
+    copyIncludeThinking: includeThinking, setCopyIncludeThinking: setIncludeThinking,
+    copyIncludeBash: includeBash, setCopyIncludeBash: setIncludeBash,
+    copyIncludeTools: includeTools, setCopyIncludeTools: setIncludeTools,
   } = useUIStore();
   const { activeProjectId, createTabAfterCurrent, closeTab, getActiveProject, switchTab, getSelectedTabs, clearSelection } = useWorkspaceStore();
   const [isUpdatingDocs, setIsUpdatingDocs] = useState(false);
@@ -60,18 +125,10 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
   const [docsExpanded, setDocsExpanded] = useState(false);
   const [additionalPrompt, setAdditionalPrompt] = useState('');
 
-  // Copy Session state
-  const [copySessionExpanded, setCopySessionExpanded] = useState(false);
-  const [copySessionInput, setCopySessionInput] = useState('');
-  const [isCopying, setIsCopying] = useState(false);
-  
-  const [showCopySettings, setShowCopySettings] = useState(false);
+  // Copy Session state moved to CopySessionButton (used by InfoPanel).
+  // Remaining state below is for the Update Docs flow which still lives here.
   const [showDocsInfo, setShowDocsInfo] = useState(false);
-  const [showCopyInfo, setShowCopyInfo] = useState(false);
-  const copyIconRef = useRef<HTMLSpanElement>(null);
-  const copyContainerRef = useRef<HTMLDivElement>(null);
   const docsTitleRef = useRef<HTMLDivElement>(null);
-  const copyTitleRef = useRef<HTMLDivElement>(null);
   const docsBlockRef = useRef<HTMLDivElement>(null);
   const settingsGearRef = useRef<HTMLSpanElement>(null);
   const isCmdPressed = useCmdKey();
@@ -83,38 +140,6 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
 
   const selectedTabs = activeProjectId ? getSelectedTabs(activeProjectId) : [];
 
-  // Detect active tab session type for Copy Session color/label
-  const activeTab = (() => {
-    if (!activeTabId || !activeProjectId) return null;
-    const proj = getActiveProject();
-    return proj?.tabs.get(activeTabId) || null;
-  })();
-  const activeSessionType: 'claude' | 'gemini' | null = activeTab?.claudeSessionId ? 'claude' : activeTab?.geminiSessionId ? 'gemini' : null;
-  const isGeminiCopy = activeSessionType === 'gemini';
-  const copyAccentColor = isGeminiCopy ? '#4E86F8' : '#DA7756';
-  const copyAccentRgba = isGeminiCopy ? 'rgba(78, 134, 248,' : 'rgba(218, 119, 86,';
-
-  // DEBUG: native event listener to bypass React delegation
-  useEffect(() => {
-    const el = copyContainerRef.current;
-    if (!el) return;
-    const onDown = (e: MouseEvent) => {
-      console.log('[CopySession] NATIVE mousedown!', (e.target as HTMLElement).textContent?.slice(0, 30));
-    };
-    const onUp = (e: MouseEvent) => {
-      console.log('[CopySession] NATIVE click!', (e.target as HTMLElement).textContent?.slice(0, 30));
-    };
-    el.addEventListener('mousedown', onDown, true); // capture phase
-    el.addEventListener('click', onUp, true);
-    return () => {
-      el.removeEventListener('mousedown', onDown, true);
-      el.removeEventListener('click', onUp, true);
-    };
-  }, []);
-
-  const handleMouseLeaveSettingsArea = useCallback(() => {
-    setShowCopySettings(false);
-  }, []);
   // Info panel helper — read-only reference showing current parameters
   // Uses block ref for horizontal alignment (flush with block left edge)
   const renderInfoPanel = (blockRef: React.RefObject<HTMLDivElement | null>, color: 'blue' | 'orange') => {
@@ -144,11 +169,17 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
           }}>
             <div style={{ color: headerColor, fontWeight: 600, marginBottom: 4, fontSize: 9, textTransform: 'uppercase' }}>Параметры</div>
             {[
-              { label: 'Чтение', active: includeReading },
-              { label: 'Редактирование', active: includeEditing },
+              { label: '👤 User', active: includeUser },
+              { label: '🤖 Claude', active: includeClaude },
+              { label: '  ├ Text', active: includeClaude && includeText },
+              { label: '  ├ Thinking', active: includeClaude && includeThinking },
+              { label: '  ├ Reading', active: includeClaude && includeReading },
+              { label: '  ├ Editing', active: includeClaude && includeEditing },
+              { label: '  ├ Bash', active: includeClaude && includeBash },
+              { label: '  └ Tools', active: includeClaude && includeTools },
+              { label: '🧵 Финальный результат', active: includeSubagentResult },
+              { label: '🧵 Вся история', active: includeSubagentHistory },
               { label: 'От fork', active: !fromStart },
-              { label: 'Результат 🧵', active: includeSubagentResult },
-              { label: 'История 🧵', active: includeSubagentHistory },
             ].map(({ label, active }) => (
               <div key={label} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '1px 0', color: '#999' }}>
                 <span>{label}</span>
@@ -380,7 +411,8 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
         });
       } else {
         result = await ipcRenderer.invoke('claude:export-clean-session', {
-          sessionId: tab.claudeSessionId, cwd, includeEditing, includeReading, fromStart, includeSubagentResult, includeSubagentHistory
+          sessionId: tab.claudeSessionId, cwd, includeEditing, includeReading, fromStart, includeSubagentResult, includeSubagentHistory,
+          includeUser, includeClaude, includeText, includeThinking, includeBash, includeTools,
         });
       }
       if (result.success) results.push(result.content);
@@ -1051,189 +1083,11 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
       if (!cancelledRef.current) { setIsUpdatingDocs(false); setDocsStatus(''); }
     }
   };
-
-  // Copy Claude session to clipboard (with options and multi-tab support)
-  const handleCopySession = async (sessionIdOverride?: string) => {
-    console.log('[CopySession] Starting copy session...', {
-      sessionIdOverride,
-      isMultiSelect,
-      selectedTabsCount: selectedTabs.length,
-      activeTabId,
-      includeEditing,
-      includeReading,
-      fromStart
-    });
-
-    const activeProject = getActiveProject();
-    if (!activeProject) {
-      console.warn('[CopySession] No active project');
-      showToast('No active project', 'error');
-      return;
-    }
-
-    // Determine tabs to copy
-    const tabsToCopy = isMultiSelect ? selectedTabs : (activeTabId ? [activeProject.tabs.get(activeTabId)] : []);
-    console.log('[CopySession] Tabs to copy:', tabsToCopy.map(t => t && { id: t.id, name: t.name, claudeSessionId: t.claudeSessionId }));
-
-    const validTabsToCopy = tabsToCopy.filter(t => t && (t.claudeSessionId || t.geminiSessionId || sessionIdOverride || copySessionInput.trim()));
-    console.log('[CopySession] Valid tabs to copy:', validTabsToCopy.length);
-
-    if (validTabsToCopy.length === 0) {
-      console.warn('[CopySession] No valid sessions to copy');
-      showToast('Нет сессий для копирования', 'warning');
-      return;
-    }
-
-    setIsCopying(true);
-    try {
-      const allResults: string[] = [];
-
-      for (const tab of validTabsToCopy) {
-        if (!tab) continue;
-
-        let targetSessionId = '';
-        let parsedCwd = '';
-        let sessionType: 'claude' | 'gemini' = 'claude';
-
-        if (sessionIdOverride || copySessionInput.trim()) {
-          const inputText = sessionIdOverride || copySessionInput.trim();
-          const uuidPattern = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
-          const cwdPattern = /cwd:\s*(\/[^\s\n]+)/i;
-
-          const uuidMatch = inputText.match(uuidPattern);
-          if (uuidMatch) targetSessionId = uuidMatch[0];
-
-          const cwdMatch = inputText.match(cwdPattern);
-          if (cwdMatch) parsedCwd = cwdMatch[1];
-
-          // For manual input, detect type from tab
-          sessionType = tab.geminiSessionId ? 'gemini' : 'claude';
-        }
-
-        if (!targetSessionId) {
-          // Prefer Claude, fallback to Gemini
-          if (tab.claudeSessionId) {
-            targetSessionId = tab.claudeSessionId;
-            sessionType = 'claude';
-          } else if (tab.geminiSessionId) {
-            targetSessionId = tab.geminiSessionId;
-            sessionType = 'gemini';
-          }
-        }
-
-        if (!targetSessionId) {
-          console.log('[CopySession] Skipping tab without session ID:', tab.name);
-          continue;
-        }
-
-        const tabCwd = await ipcRenderer.invoke('terminal:getCwd', tab.id).catch(() => null);
-        const cwd = parsedCwd || tabCwd || tab.cwd || activeProject.projectPath;
-
-        console.log('[CopySession] Exporting session:', {
-          tabName: tab.name,
-          sessionId: targetSessionId,
-          sessionType,
-          cwd,
-          includeEditing,
-          includeReading,
-          fromStart
-        });
-
-        let result;
-        if (sessionType === 'gemini') {
-          result = await ipcRenderer.invoke('gemini:copy-range', {
-            sessionId: targetSessionId,
-            cwd,
-            startUuid: null,
-            endUuid: null
-          });
-        } else {
-          result = await ipcRenderer.invoke('claude:export-clean-session', {
-            sessionId: targetSessionId,
-            cwd,
-            includeEditing,
-            includeReading,
-            fromStart,
-            includeSubagentResult,
-            includeSubagentHistory
-          });
-        }
-
-        if (result.success) {
-          console.log('[CopySession] Success for tab:', tab.name, 'Content length:', result.content?.length);
-          allResults.push(result.content);
-        } else {
-          console.warn(`[CopySession] Failed for tab ${tab.name}:`, result.error);
-        }
-      }
-
-      if (allResults.length > 0) {
-        const finalContent = allResults.join('\n\n' + '='.repeat(40) + '\n\n');
-        await navigator.clipboard.writeText(finalContent);
-        const sizeKB = Math.round(finalContent.length / 1024);
-        console.log('[CopySession] Copied to clipboard:', {
-          sessionsCount: validTabsToCopy.length,
-          totalSize: finalContent.length,
-          sizeKB
-        });
-        showToast(`Скопировано ${validTabsToCopy.length} сессий (${sizeKB}KB)`, 'success');
-
-        // Clear selection after successful multi-copy
-        if (isMultiSelect) clearSelection(activeProject.projectId);
-      } else {
-        console.warn('[CopySession] No results to copy');
-        showToast('Не удалось скопировать ни одной сессии', 'error');
-      }
-    } catch (e: any) {
-      console.error('[CopySession] Error:', e);
-      showToast(`Ошибка: ${e.message}`, 'error');
-    } finally {
-      setIsCopying(false);
-    }
-  };
-
   const content = (
       <div data-keep-selection>
-        {/* System Tools Section */}
+        {/* System Tools Section — header row (gear + "SYSTEM" + toggle dots) removed;
+            settings popover still triggers via ⌘+hover on the Update Docs block below. */}
         <div className="mb-4">
-          <div className="flex items-center gap-2 mb-2 px-1">
-            <span
-              ref={settingsGearRef}
-              className="cursor-pointer select-none"
-              style={{ fontSize: '10px', color: (isCmdPressed || showGearSettings) ? '#999' : '#555', transition: 'color 0.15s' }}
-              onMouseEnter={() => setGearHovered(true)}
-              onMouseLeave={() => setGearHovered(false)}
-              onClick={(e) => {
-                e.stopPropagation();
-                setGearClicked(prev => !prev);
-              }}
-              title="API Settings (клик или ⌘+наведение)"
-            >
-              &#9881;
-            </span>
-            <span className="text-[9px] uppercase font-semibold text-blue-500">System</span>
-            {/* Toggle indicators (managed in ⌘+hover settings) */}
-            <span
-              style={{
-                width: '6px', height: '6px', borderRadius: '50%',
-                backgroundColor: autoApplyDocs ? '#22c55e' : '#555',
-                display: 'inline-block', flexShrink: 0,
-                transition: 'background-color 0.2s',
-              }}
-              title={autoApplyDocs ? 'Auto-apply: ON' : 'Auto-apply: OFF'}
-            />
-            <span
-              style={{
-                width: '6px', height: '6px', borderRadius: '50%',
-                backgroundColor: postCheckDocs ? '#a78bfa' : '#555',
-                display: 'inline-block', flexShrink: 0,
-                transition: 'background-color 0.2s',
-              }}
-              title={postCheckDocs ? 'Post-check: ON' : 'Post-check: OFF'}
-            />
-            <div className="flex-1 h-px bg-[#333]" />
-          </div>
-
           <div className="flex flex-col gap-1">
               <div
                 ref={docsBlockRef}
@@ -1247,6 +1101,8 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
                   color: clipboardMode ? '#c4b5fd' : '#60a5fa',
                   transition: 'background-color 0.3s ease, border-color 0.3s ease, color 0.3s ease',
                 }}
+                onMouseEnter={() => setGearHovered(true)}
+                onMouseLeave={() => setGearHovered(false)}
               >
                 <span className="text-base">📚</span>
                 <div className="flex-1">
@@ -1284,7 +1140,6 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
                       onMouseLeave={(e) => { e.currentTarget.style.backgroundColor = 'rgba(96, 165, 250, 0.1)'; e.currentTarget.style.color = '#7cacf0'; }}
                       onMouseDown={(e) => e.stopPropagation()}
                       onClick={(e) => { e.stopPropagation(); if (!isCopyingDocs) handleCopyDocsToClipboard(); }}
-                      title="Копировать промпт + сессии в буфер"
                     >
                       📄
                     </span>
@@ -1320,7 +1175,6 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
                             setIsApiLoading(false);
                             showToast('API запрос отменён', 'info');
                           }}
-                          title="Клик для отмены"
                         >
                           <span style={{ display: 'inline-flex', alignItems: 'center', gap: '3px' }}>
                             <span style={{
@@ -1393,7 +1247,6 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
                                 onMouseLeave={(e) => { e.currentTarget.style.backgroundColor = 'rgba(218, 119, 86, 0.12)'; }}
                                 onMouseDown={(e) => e.stopPropagation()}
                                 onClick={(e) => { e.stopPropagation(); handleApiDocsRequest(); }}
-                                title="Claude API → ответ в буфер"
                               >
                                 claude-api
                               </span>
@@ -1413,7 +1266,6 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
                                 onMouseLeave={(e) => { e.currentTarget.style.backgroundColor = 'rgba(78, 134, 248, 0.12)'; }}
                                 onMouseDown={(e) => e.stopPropagation()}
                                 onClick={(e) => { e.stopPropagation(); handleGeminiApiDocsRequest(); }}
-                                title="Gemini API → ответ в буфер"
                               >
                                 gemini-api
                               </span>
@@ -1433,7 +1285,6 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
                                 onMouseLeave={(e) => { e.currentTarget.style.backgroundColor = 'rgba(107, 201, 111, 0.12)'; }}
                                 onMouseDown={(e) => e.stopPropagation()}
                                 onClick={(e) => { e.stopPropagation(); handleGeminiCliDocsRequest(); }}
-                                title="Gemini CLI headless → ответ в буфер"
                               >
                                 gemini -p
                               </span>
@@ -1514,7 +1365,6 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
                                   onMouseLeave={(e) => { e.currentTarget.style.backgroundColor = 'rgba(218, 119, 86, 0.12)'; }}
                                   onMouseDown={(e) => e.stopPropagation()}
                                   onClick={(e) => { e.stopPropagation(); handleUpdateApi('claude'); }}
-                                  title="Claude API → анализ → Claude Haiku"
                                 >
                                   claude-api
                                 </span>
@@ -1530,7 +1380,6 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
                                   onMouseLeave={(e) => { e.currentTarget.style.backgroundColor = 'rgba(78, 134, 248, 0.12)'; }}
                                   onMouseDown={(e) => e.stopPropagation()}
                                   onClick={(e) => { e.stopPropagation(); handleUpdateApi('gemini'); }}
-                                  title="Gemini API → анализ → Claude Haiku"
                                 >
                                   gemini-api
                                 </span>
@@ -1546,7 +1395,6 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
                                   onMouseLeave={(e) => { e.currentTarget.style.backgroundColor = 'rgba(78, 134, 248, 0.12)'; }}
                                   onMouseDown={(e) => e.stopPropagation()}
                                   onClick={(e) => { e.stopPropagation(); handleUpdateApi('gemini-cli'); }}
-                                  title="Gemini CLI headless → анализ → Claude Haiku"
                                 >
                                   gemini -p
                                 </span>
@@ -1579,7 +1427,6 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
                     onMouseDown={(e) => e.stopPropagation()}
                     onMouseEnter={() => setIsScissorsHovered(true)}
                     onMouseLeave={() => setIsScissorsHovered(false)}
-                    title={`Use selection (${terminalSelection.length} chars)`}
                     role="button"
                     tabIndex={0}
                   >
@@ -1600,7 +1447,6 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
                     onMouseLeave={(e) => { if (!clipboardMode) e.currentTarget.style.backgroundColor = 'rgba(124, 58, 237, 0.2)'; }}
                     onClick={(e) => { e.stopPropagation(); setClipboardMode(!clipboardMode); }}
                     onMouseDown={(e) => e.stopPropagation()}
-                    title={clipboardMode ? 'Clipboard mode ON — click to disable' : 'Clipboard mode OFF — click to enable'}
                     role="button"
                     tabIndex={0}
                   >
@@ -1657,206 +1503,16 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
             </div>
           </div>
 
-          {/* Copy Session - export Claude/Gemini session */}
-          <div className="mt-2">
-            <div
-              ref={copyContainerRef}
-              data-copy-session
-              className={`w-full p-3 text-left rounded-lg text-xs flex items-center gap-2 ${
-                isCopying ? 'opacity-50' : ''
-              }`}
-              style={{
-                color: copyAccentColor,
-                backgroundColor: `${copyAccentRgba} 0.1)`,
-                border: `1px solid ${copyAccentRgba} 0.15)`
-              }}
-              onMouseEnter={(e) => {
-                e.currentTarget.style.backgroundColor = `${copyAccentRgba} 0.18)`;
-                e.currentTarget.style.borderColor = `${copyAccentRgba} 0.25)`;
-              }}
-              onMouseLeave={(e) => {
-                e.currentTarget.style.backgroundColor = `${copyAccentRgba} 0.1)`;
-                e.currentTarget.style.borderColor = `${copyAccentRgba} 0.15)`;
-              }}
-            >
-              {/* Settings icon — inside the orange block */}
-              <div
-                ref={copyIconRef}
-                className={`relative w-6 h-6 flex items-center justify-center cursor-pointer rounded shrink-0 ${showCopySettings ? 'bg-white/15' : 'hover:bg-white/10'}`}
-                onMouseEnter={() => setShowCopySettings(true)}
-                onMouseLeave={(e) => {
-                  // Keep open only if mouse went LEFT (towards the settings menu portal)
-                  const rect = e.currentTarget.getBoundingClientRect();
-                  if (e.clientX >= rect.left) {
-                    setShowCopySettings(false);
-                  }
-                }}
-              >
-                <span className="text-base">📋</span>
-                {/* Indicators — Claude-specific settings, hidden for Gemini */}
-                <div className="absolute -bottom-1 -right-1 flex gap-0.5 pointer-events-none">
-                  {!isGeminiCopy && includeReading && <div className="w-1.5 h-1.5 rounded-full bg-amber-400 border border-[#1a1a1a]" title="Чтение" />}
-                  {!isGeminiCopy && includeEditing && <div className="w-1.5 h-1.5 rounded-full bg-purple-400 border border-[#1a1a1a]" title="Редактирование" />}
-                  {!isGeminiCopy && !fromStart && <div className="w-1.5 h-1.5 rounded-full bg-blue-500 border border-[#1a1a1a]" title="С последнего форка" />}
-                  {!isGeminiCopy && includeSubagentResult && <div className="w-1.5 h-1.5 rounded-full bg-orange-400 border border-[#1a1a1a]" title="Результат субагента" />}
-                  {!isGeminiCopy && includeSubagentHistory && <div className="w-1.5 h-1.5 rounded-full bg-green-400 border border-[#1a1a1a]" title="История субагента" />}
-                </div>
-              </div>
-
-              {/* Settings Menu Portal — positioned LEFT of the block, vertically centered */}
-              {showCopySettings && !isGeminiCopy && (() => {
-                const bRect = copyContainerRef.current?.getBoundingClientRect();
-                if (!bRect) return null;
-                return (
-                  <SettingsPortal>
-                    <div
-                      onMouseLeave={handleMouseLeaveSettingsArea}
-                      style={{
-                        position: 'fixed',
-                        left: bRect.left - 3,
-                        top: bRect.top + bRect.height / 2,
-                        transform: 'translate(-100%, -50%)',
-                        zIndex: 10000,
-                        display: 'flex',
-                        flexDirection: 'row',
-                      }}
-                    >
-                      <div
-                        className="bg-[#1a1a1a] border border-[#444] rounded-lg shadow-2xl p-2 min-w-[150px] flex flex-col gap-2"
-                        style={{ backdropFilter: 'blur(12px)', boxShadow: '0 15px 35px rgba(0,0,0,0.6)' }}
-                      >
-                        <div className="px-1 py-0.5 text-[9px] uppercase font-bold text-[#666] border-b border-[#333] mb-1">Настройки</div>
-
-                        <label className="flex items-center justify-between gap-3 cursor-pointer group/label px-1">
-                          <span className="text-[10px] text-[#aaa] group-hover/label:text-white">Чтение</span>
-                          <div
-                            className={`w-7 h-4 rounded-full relative cursor-pointer ${includeReading ? 'bg-[#DA7756]' : 'bg-[#444]'}`}
-                            onClick={(e) => { e.stopPropagation(); setIncludeReading(!includeReading); }}
-                          >
-                            <div className={`absolute top-0.5 w-3 h-3 bg-white rounded-full ${includeReading ? 'left-[14px]' : 'left-0.5'}`} />
-                          </div>
-                        </label>
-
-                        <label className="flex items-center justify-between gap-3 cursor-pointer group/label px-1">
-                          <span className="text-[10px] text-[#aaa] group-hover/label:text-white">Редактирование</span>
-                          <div
-                            className={`w-7 h-4 rounded-full relative cursor-pointer ${includeEditing ? 'bg-[#DA7756]' : 'bg-[#444]'}`}
-                            onClick={(e) => { e.stopPropagation(); setIncludeEditing(!includeEditing); }}
-                          >
-                            <div className={`absolute top-0.5 w-3 h-3 bg-white rounded-full ${includeEditing ? 'left-[14px]' : 'left-0.5'}`} />
-                          </div>
-                        </label>
-
-                        <label className="flex items-center justify-between gap-3 cursor-pointer group/label px-1">
-                          <span className="text-[10px] text-[#aaa] group-hover/label:text-white">От fork</span>
-                          <div
-                            className={`w-7 h-4 rounded-full relative cursor-pointer ${!fromStart ? 'bg-[#DA7756]' : 'bg-[#444]'}`}
-                            onClick={(e) => { e.stopPropagation(); setFromStart(!fromStart); }}
-                          >
-                            <div className={`absolute top-0.5 w-3 h-3 bg-white rounded-full ${!fromStart ? 'left-[14px]' : 'left-0.5'}`} />
-                          </div>
-                        </label>
-
-                        <div className="h-px bg-[#333] my-1" />
-
-                        <label className="flex items-center justify-between gap-3 cursor-pointer group/label px-1">
-                          <span className="text-[10px] text-[#aaa] group-hover/label:text-white">Результат 🧵</span>
-                          <div
-                            className={`w-7 h-4 rounded-full relative cursor-pointer ${includeSubagentResult ? 'bg-orange-500' : 'bg-[#444]'}`}
-                            onClick={(e) => { e.stopPropagation(); setIncludeSubagentResult(!includeSubagentResult); }}
-                          >
-                            <div className={`absolute top-0.5 w-3 h-3 bg-white rounded-full ${includeSubagentResult ? 'left-[14px]' : 'left-0.5'}`} />
-                          </div>
-                        </label>
-
-                        <label className="flex items-center justify-between gap-3 cursor-pointer group/label px-1">
-                          <span className="text-[10px] text-[#aaa] group-hover/label:text-white">История 🧵</span>
-                          <div
-                            className={`w-7 h-4 rounded-full relative cursor-pointer ${includeSubagentHistory ? 'bg-green-500' : 'bg-[#444]'}`}
-                            onClick={(e) => { e.stopPropagation(); setIncludeSubagentHistory(!includeSubagentHistory); }}
-                          >
-                            <div className={`absolute top-0.5 w-3 h-3 bg-white rounded-full ${includeSubagentHistory ? 'left-[14px]' : 'left-0.5'}`} />
-                          </div>
-                        </label>
-
-                        <div className="h-px bg-[#333] my-1" />
-                        <div className="px-1 text-[8px] text-[#555] leading-tight">
-                          Копирование · Обновление docs · Сокращение сессии
-                        </div>
-                      </div>
-                    </div>
-                  </SettingsPortal>
-                );
-              })()}
-
-              <div className="flex-1">
-                {/* Clickable title - copies current session(s) */}
-                <code
-                  ref={copyTitleRef}
-                  className="text-xs cursor-pointer hover:underline px-1.5 py-0.5 bg-[#1a1a1a] rounded"
-                  style={{ color: copyAccentColor }}
-                  onMouseDown={(e) => e.stopPropagation()}
-                  onMouseEnter={() => setShowCopyInfo(true)}
-                  onMouseLeave={() => setShowCopyInfo(false)}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    if (!isCopying) handleCopySession();
-                  }}
-                  title={isMultiSelect ? `Копировать ${selectedTabs.length} сессий` : copySessionInput.trim() ? `Копировать: ${copySessionInput.trim().slice(0, 40)}...` : "Копировать текущую сессию"}
-                >
-                  {isMultiSelect ? `Copy ${selectedTabs.length} Sessions` : copySessionInput.trim() ? 'Copy Custom Session' : 'Copy Session'}
-                </code>
-                {showCopyInfo && !isGeminiCopy && renderInfoPanel(copyContainerRef, 'orange')}
-                <div
-                  className="text-[10px] mt-0.5 cursor-pointer"
-                  style={{ color: `${copyAccentRgba} 0.7)` }}
-                  onClick={() => !isCopying && setCopySessionExpanded(!copySessionExpanded)}
-                >
-                  {isCopying ? 'Копирование...' :
-                    isMultiSelect ? `Экспорт ${selectedTabs.length} сессий в буфер` : copySessionInput.trim() ? `ID: ${copySessionInput.trim().slice(0, 30)}` : isGeminiCopy ? 'Gemini JSON → clipboard' : 'Claude JSONL → clipboard'}
-                </div>
-              </div>
-              {!isMultiSelect && (
-                <span
-                  className="text-[10px] cursor-pointer px-1"
-                  style={{ color: `${copyAccentRgba} 0.5)` }}
-                  onMouseEnter={(e) => { e.currentTarget.style.color = copyAccentColor; }}
-                  onMouseLeave={(e) => { e.currentTarget.style.color = `${copyAccentRgba} 0.5)`; }}
-                  onClick={() => !isCopying && setCopySessionExpanded(!copySessionExpanded)}
-                >
-                  {copySessionExpanded ? '▼' : '▶'}
-                </span>
-              )}
-            </div>
-
-            {/* Expanded area with textarea (only show for single select) */}
-            {copySessionExpanded && !isMultiSelect && (
-              <div className="mt-2 p-2 bg-[#1a1a1a] rounded-lg" style={{ border: `1px solid ${copyAccentRgba} 0.3)` }}>
-                <textarea
-                  value={copySessionInput}
-                  onChange={(e) => setCopySessionInput(e.target.value)}
-                  placeholder="Вставьте текст с Session ID и cwd..."
-                  className="w-full min-h-[40px] p-2 bg-[#252525] border border-[#333] rounded text-[10px] text-[#aaa] font-mono resize-none focus:outline-none focus:border-[#DA7756] placeholder:text-[#555]"
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter' && e.metaKey && copySessionInput.trim()) {
-                      e.preventDefault();
-                      handleCopySession();
-                    }
-                  }}
-                />
-                <div className="mt-1.5">
-                  <span className="text-[9px] text-[#555]">⌘+Enter для копирования</span>
-                </div>
-              </div>
-            )}
-          </div>
       </div>
   );
 
-  // Cmd+hover API settings floating panel
+  // Cmd+hover API settings floating panel. After removing the SYSTEM header row,
+  // the popover now anchors to the Update Docs block (docsBlockRef) — that's the
+  // only remaining handle inside this section, and matches what triggers ⌘+hover.
   const renderApiSettingsPopover = () => {
-    if (!showGearSettings || !settingsGearRef.current) return null;
-    const rect = settingsGearRef.current.getBoundingClientRect();
+    const anchor = settingsGearRef.current || docsBlockRef.current;
+    if (!showGearSettings || !anchor) return null;
+    const rect = anchor.getBoundingClientRect();
 
     const CLAUDE_MODELS: { id: ApiClaudeModel; label: string }[] = [
       { id: 'claude-sonnet-4.5', label: 'Sonnet 4.5' },

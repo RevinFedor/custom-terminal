@@ -1,14 +1,13 @@
 import React, { useRef, useState, useEffect, useCallback, memo } from 'react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { RotateCcw, ArrowLeft, ArrowRight, Globe, TerminalSquare, AlertTriangle } from 'lucide-react';
+import Tooltip from '../UI/Tooltip';
 import Terminal from './Terminal';
 
 interface BrowserTabProps {
   tabId: string;
   url: string;
-  // PERF (2026-04-21): active/isActiveProject derived from the store by default.
-  // See Terminal.tsx for the correctness note — both must agree on activeProjectId.
-  active?: boolean;
+  active: boolean;
   isActiveProject?: boolean;
   terminalId?: string;
   terminalName?: string;
@@ -18,23 +17,7 @@ interface BrowserTabProps {
 
 const { ipcRenderer } = window.require('electron');
 
-function BrowserTab({ tabId, url, active: activeProp, isActiveProject: isActiveProjectProp, terminalId, terminalName, activeView = 'browser', cwd }: BrowserTabProps) {
-  const activeFromStore = useWorkspaceStore((state) => {
-    for (const [projId, ws] of state.openProjects) {
-      if (ws.tabs.has(tabId)) {
-        return state.activeProjectId === projId && ws.activeTabId === tabId;
-      }
-    }
-    return false;
-  });
-  const isActiveProjectFromStore = useWorkspaceStore((state) => {
-    for (const [projId, ws] of state.openProjects) {
-      if (ws.tabs.has(tabId)) return state.activeProjectId === projId;
-    }
-    return false;
-  });
-  const active = activeProp !== undefined ? activeProp : activeFromStore;
-  const isActiveProject = isActiveProjectProp !== undefined ? isActiveProjectProp : isActiveProjectFromStore;
+function BrowserTab({ tabId, url, active, isActiveProject = true, terminalId, terminalName, activeView = 'browser', cwd }: BrowserTabProps) {
   const webviewRef = useRef<any>(null);
   const initialUrl = url || 'http://localhost:3000';
   const [addressValue, setAddressValue] = useState(initialUrl);
@@ -221,27 +204,30 @@ function BrowserTab({ tabId, url, active: activeProp, isActiveProject: isActiveP
           borderBottom: '1px solid #333',
         }}
       >
+        <Tooltip content="Back">
         <button
           onClick={handleGoBack}
           style={{ background: 'none', border: 'none', color: '#888', cursor: 'pointer', padding: '2px', display: 'flex', alignItems: 'center' }}
-          title="Back"
         >
           <ArrowLeft size={14} />
         </button>
+        </Tooltip>
+        <Tooltip content="Forward">
         <button
           onClick={handleGoForward}
           style={{ background: 'none', border: 'none', color: '#888', cursor: 'pointer', padding: '2px', display: 'flex', alignItems: 'center' }}
-          title="Forward"
         >
           <ArrowRight size={14} />
         </button>
+        </Tooltip>
+        <Tooltip content="Refresh">
         <button
           onClick={handleRefresh}
           style={{ background: 'none', border: 'none', color: '#888', cursor: 'pointer', padding: '2px', display: 'flex', alignItems: 'center' }}
-          title="Refresh"
         >
           <RotateCcw size={14} className={isLoading ? 'animate-spin' : ''} />
         </button>
+        </Tooltip>
 
         <form onSubmit={handleAddressSubmit} style={{ flex: 1 }}>
           <input
@@ -265,6 +251,7 @@ function BrowserTab({ tabId, url, active: activeProp, isActiveProject: isActiveP
         </form>
 
         <div style={{ display: 'flex', gap: '2px', marginLeft: '4px' }}>
+          <Tooltip content="Browser view">
           <button
             onClick={handleSwitchToBrowser}
             style={{
@@ -273,11 +260,12 @@ function BrowserTab({ tabId, url, active: activeProp, isActiveProject: isActiveP
               backgroundColor: isBrowserView ? 'rgba(255,255,255,0.15)' : 'transparent',
               color: isBrowserView ? '#fff' : '#888', transition: 'all 0.15s',
             }}
-            title="Browser view"
           >
             <Globe size={12} />
             <span>Browser</span>
           </button>
+          </Tooltip>
+          <Tooltip content="Terminal view">
           <button
             onClick={handleSwitchToTerminal}
             style={{
@@ -286,7 +274,6 @@ function BrowserTab({ tabId, url, active: activeProp, isActiveProject: isActiveP
               backgroundColor: isTerminalView ? 'rgba(255,255,255,0.15)' : 'transparent',
               color: isTerminalView ? '#fff' : '#888', transition: 'all 0.15s',
             }}
-            title="Terminal view"
           >
             {hasProcess && (
               <span
@@ -304,6 +291,7 @@ function BrowserTab({ tabId, url, active: activeProp, isActiveProject: isActiveP
             <TerminalSquare size={12} />
             <span>Term</span>
           </button>
+          </Tooltip>
         </div>
       </div>
 

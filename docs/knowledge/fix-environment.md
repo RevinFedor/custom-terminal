@@ -286,3 +286,49 @@ define: {
 ## 3. Общие правила
 - **Результат:** После нажатия кнопки "Logs", объем текста в буфере обмена уменьшается на 60-90%.
 - **Feedback:** Система всегда сообщает пользователю исходный и финальный размер (например, "Сжато: 5000 -> 800 символов").
+
+# localStorage origin trap при vite dev port shift
+
+## Симптом
+Юзер выставил настройку в UI (например `defaultClaudeEffort: max`) → закрыл приложение → запустил `npm run dev` снова → настройка **исчезла**, показывает дефолт. Юзер думает что persistence не работает / БД сломалась.
+
+## Причина
+`localStorage` привязан к **origin** (scheme+host+port). Vite dev-server поднимается на 5181, но если порт занят — берёт 5182, 5183, ... Это случается часто когда:
+- Предыдущий `npm run dev` оставил orphan Electron (см. `electron-e2e-testing/references/custom-terminal.md::Dev workflow discipline`)
+- Юзер запустил два инстанса параллельно
+
+Каждый порт — отдельный origin → отдельное localStorage хранилище. Настройка **была** сохранена, но на `http://localhost:5181`. Сейчас Electron открыл `http://localhost:5182` → новое пустое хранилище.
+
+В **prod** Electron использует `file://` или фиксированный internal URL → origin стабильный → localStorage переживает рестарты. Проблема только в dev.
+
+## Решение — переход на SQLite через `app:setState`
+
+```ts
+// Сохранение:
+ipcRenderer.invoke('app:setState', { key: 'defaultClaudeEffort', value: v });
+// Загрузка:
+const v = await ipcRenderer.invoke('app:getState', 'defaultClaudeEffort');
+```
+
+SQLite в main process — origin-independent (хранится в `app.getPath('userData')`, который один на app, не на vite-port). Выживает любой port shift.
+
+**Migration pattern** (без потери данных у существующих юзеров):
+1. `loadInit()` сначала читает localStorage (синхронный, для initial state)
+2. После init — async IIFE загружает из SQLite (authoritative) и `useStore.setState(...)` если значения отличаются
+3. Каждый `saveX()` пишет в **оба места** — localStorage (mirror для следующего sync init) + SQLite (truth)
+4. localStorage становится non-authoritative кэшем, можно удалить через год
+
+## Когда использовать localStorage vs SQLite
+
+| | localStorage | SQLite (`app:setState`) |
+|---|---|---|
+| Скорость init | синхронно (нужно для initial Zustand) | async (требует await IPC) |
+| Origin-stability | привязан к origin (vite port в dev) | один на app |
+| Стабильность в dev | ломается при port shift | надёжно |
+| Размер | 5-10MB на origin | unbounded |
+
+**Правило:** UI-эфемерное (open/closed состояние модалок, hover preferences) — localStorage. Persistence value которое юзер ожидает видеть после рестарта (выбранный effort, выбранная модель, customизация workspace) — SQLite.
+
+## Что пробовали и почему отбросили
+- **electron-store** — лишняя зависимость, тот же IPC pattern + дополнительный код для миграций. SQLite в main уже есть через `projectManager.db`, переиспользуем.
+- **Файл в `app.getPath('userData')/settings.json`** — race на одновременной записи нескольких настроек, нужен debounce + queue. SQLite + better-sqlite3 даёт сериализуемость из коробки.

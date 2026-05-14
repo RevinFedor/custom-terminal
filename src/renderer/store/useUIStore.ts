@@ -23,6 +23,13 @@ export type ThinkingLevel = 'NONE' | 'LOW' | 'MEDIUM' | 'HIGH';
 export type ApiGeminiModel = 'gemini-3-flash-preview' | 'gemini-3-pro-preview';
 export type ApiClaudeModel = 'claude-opus-4.6' | 'claude-sonnet-4.5';
 
+// Re-export from canonical source. Older code imports DefaultClaudeEffort from useUIStore
+// because the type used to be defined here; we keep the alias so we don't touch dozens
+// of call sites. The list itself lives in constants/claudeLevels.ts.
+export type { DefaultClaudeEffort } from '../constants/claudeLevels';
+import type { DefaultClaudeEffort } from '../constants/claudeLevels';
+import { CLAUDE_EFFORT_LEVELS_WITH_NONE } from '../constants/claudeLevels';
+
 export interface ApiSettings {
   claudeModel: ApiClaudeModel;
   claudeThinking: ThinkingLevel;
@@ -249,17 +256,48 @@ interface UIStore {
   copyFromStart: boolean;
   copyIncludeSubagentResult: boolean;
   copyIncludeSubagentHistory: boolean;
+  copyIncludeUser: boolean;
+  copyIncludeClaude: boolean;
+  copyIncludeText: boolean;
+  copyIncludeThinking: boolean;
+  copyIncludeBash: boolean;
+  copyIncludeTools: boolean;
   setCopyIncludeEditing: (v: boolean) => void;
   setCopyIncludeReading: (v: boolean) => void;
   setCopyFromStart: (v: boolean) => void;
   setCopyIncludeSubagentResult: (v: boolean) => void;
   setCopyIncludeSubagentHistory: (v: boolean) => void;
+  setCopyIncludeUser: (v: boolean) => void;
+  setCopyIncludeClaude: (v: boolean) => void;
+  setCopyIncludeText: (v: boolean) => void;
+  setCopyIncludeThinking: (v: boolean) => void;
+  setCopyIncludeBash: (v: boolean) => void;
+  setCopyIncludeTools: (v: boolean) => void;
 
-  // Notes Editor Modal
-  notesEditorOpen: boolean;
-  notesEditorProjectId: string | null;
-  openNotesEditor: (projectId: string) => void;
-  closeNotesEditor: () => void;
+  // Status bar debug toggles
+  debugHoverBridges: boolean;
+  setDebugHoverBridges: (v: boolean) => void;
+
+  // Free-ports toggle. When ON, every npm-script start / restart / stop from a
+  // devServer-tab first calls `system:free-project-ports` for the tab's cwd —
+  // resolves project's declared ports (vite.config, .env PORT, NestJS main.ts)
+  // and kills whatever holds them. Solves "address in use" after a previous run
+  // crashed without releasing the port (common after Electron force-quit).
+  freePortsBeforeStart: boolean;
+  setFreePortsBeforeStart: (v: boolean) => void;
+
+  // Default Claude effort applied to new sessions (status-bar selector).
+  // 'none' means "do not apply any default" — current session keeps whatever was last picked.
+  defaultClaudeEffort: DefaultClaudeEffort;
+  setDefaultClaudeEffort: (v: DefaultClaudeEffort) => void;
+
+  // Notes Panel — per-tab slide-in. `notesPanelOpenTabs` holds tab IDs for
+  // which the panel is currently expanded. Size is shared across tabs and
+  // persists via SQLite (so it survives dev-port shuffles).
+  notesPanelOpenTabs: Record<string, boolean>;
+  setNotesPanelOpen: (tabId: string, open: boolean) => void;
+  notesPanelSize: { width: number; height: number };
+  setNotesPanelSize: (size: { width: number; height: number }) => void;
 
   // Tab Notes Font Size & Padding
   tabNotesFontSize: number;
@@ -268,6 +306,14 @@ interface UIStore {
   setTabNotesPaddingX: (px: number) => void;
   tabNotesPaddingY: number;
   setTabNotesPaddingY: (px: number) => void;
+
+  // Notes Editor Modal (fullscreen) — separate sizing knobs.
+  notesEditorFontSize: number;
+  setNotesEditorFontSize: (size: number) => void;
+  notesEditorPaddingX: number;
+  setNotesEditorPaddingX: (px: number) => void;
+  notesEditorPaddingY: number;
+  setNotesEditorPaddingY: (px: number) => void;
 
   // API Settings Modal
   apiSettingsOpen: boolean;
@@ -540,7 +586,25 @@ const saveClaudeDefaultPromptEnabled = (enabled: boolean) => {
 
 const initialClaudeDefaultPromptEnabled = loadClaudeDefaultPromptEnabled();
 
-const loadCopySettings = (): { copyIncludeEditing: boolean; copyIncludeReading: boolean; copyFromStart: boolean; copyIncludeSubagentResult: boolean; copyIncludeSubagentHistory: boolean } => {
+// Copy settings — flat shape kept for backwards compatibility with existing callsites.
+// New hierarchical fields (copyIncludeUser/Claude/Text/Thinking/Bash/Tools) added in v2.
+// Defaults preserve old behavior: everything user did before remains visible; new groups
+// (Bash/Tools) default OFF so power users don't suddenly get 200KB Bash logs in their paste.
+type CopySettings = {
+  copyIncludeEditing: boolean;
+  copyIncludeReading: boolean;
+  copyFromStart: boolean;
+  copyIncludeSubagentResult: boolean;
+  copyIncludeSubagentHistory: boolean;
+  copyIncludeUser: boolean;
+  copyIncludeClaude: boolean;
+  copyIncludeText: boolean;
+  copyIncludeThinking: boolean;
+  copyIncludeBash: boolean;
+  copyIncludeTools: boolean;
+};
+
+const loadCopySettings = (): CopySettings => {
   try {
     const saved = localStorage.getItem('noted-terminal-copy-settings');
     if (saved) {
@@ -551,15 +615,27 @@ const loadCopySettings = (): { copyIncludeEditing: boolean; copyIncludeReading: 
         copyFromStart: parsed.copyFromStart ?? true,
         copyIncludeSubagentResult: parsed.copyIncludeSubagentResult ?? false,
         copyIncludeSubagentHistory: parsed.copyIncludeSubagentHistory ?? false,
+        copyIncludeUser: parsed.copyIncludeUser ?? true,
+        copyIncludeClaude: parsed.copyIncludeClaude ?? true,
+        copyIncludeText: parsed.copyIncludeText ?? true,
+        copyIncludeThinking: parsed.copyIncludeThinking ?? true,
+        copyIncludeBash: parsed.copyIncludeBash ?? false,
+        copyIncludeTools: parsed.copyIncludeTools ?? false,
       };
     }
   } catch (e) {
     console.error('Failed to load copy settings:', e);
   }
-  return { copyIncludeEditing: true, copyIncludeReading: false, copyFromStart: true, copyIncludeSubagentResult: false, copyIncludeSubagentHistory: false };
+  return {
+    copyIncludeEditing: true, copyIncludeReading: false, copyFromStart: true,
+    copyIncludeSubagentResult: false, copyIncludeSubagentHistory: false,
+    copyIncludeUser: true, copyIncludeClaude: true,
+    copyIncludeText: true, copyIncludeThinking: true,
+    copyIncludeBash: false, copyIncludeTools: false,
+  };
 };
 
-const saveCopySettings = (settings: { copyIncludeEditing: boolean; copyIncludeReading: boolean; copyFromStart: boolean; copyIncludeSubagentResult: boolean; copyIncludeSubagentHistory: boolean }) => {
+const saveCopySettings = (settings: CopySettings) => {
   try {
     localStorage.setItem('noted-terminal-copy-settings', JSON.stringify(settings));
   } catch (e) {
@@ -568,6 +644,137 @@ const saveCopySettings = (settings: { copyIncludeEditing: boolean; copyIncludeRe
 };
 
 const initialCopySettings = loadCopySettings();
+
+// Status-bar toggles (persisted)
+const loadDebugHoverBridges = (): boolean => {
+  try { return localStorage.getItem('noted-terminal-debug-hover-bridges') === 'true'; }
+  catch { return false; }
+};
+const saveDebugHoverBridges = (v: boolean) => {
+  try { localStorage.setItem('noted-terminal-debug-hover-bridges', String(v)); } catch {}
+};
+const initialDebugHoverBridges = loadDebugHoverBridges();
+
+// freePortsBeforeStart — SQLite-backed (vite-port-stable). Same migration pattern as
+// defaultClaudeEffort (localStorage initial → async SQLite override).
+const APP_STATE_KEY_FREE_PORTS = 'freePortsBeforeStart';
+const loadFreePortsBeforeStart = (): boolean => {
+  try { return localStorage.getItem('noted-terminal-free-ports') === 'true'; }
+  catch { return false; }
+};
+const saveFreePortsBeforeStart = (v: boolean) => {
+  try { localStorage.setItem('noted-terminal-free-ports', String(v)); } catch {}
+  try {
+    const { ipcRenderer } = window.require('electron');
+    ipcRenderer.invoke('app:setState', { key: APP_STATE_KEY_FREE_PORTS, value: v ? '1' : '0' }).catch(() => {});
+  } catch {}
+};
+const initialFreePortsBeforeStart = loadFreePortsBeforeStart();
+(async () => {
+  try {
+    const { ipcRenderer } = window.require('electron');
+    const v = await ipcRenderer.invoke('app:getState', APP_STATE_KEY_FREE_PORTS);
+    if (v !== null && v !== undefined) {
+      const bool = v === '1' || v === 'true' || v === true;
+      if (useUIStore.getState().freePortsBeforeStart !== bool) {
+        useUIStore.setState({ freePortsBeforeStart: bool });
+        try { localStorage.setItem('noted-terminal-free-ports', String(bool)); } catch {}
+      }
+    }
+  } catch {}
+})();
+
+// localStorage is bound to vite dev-server origin (http://localhost:5181 vs 5182…).
+// When orphan Electron instances push vite to a different port, the new origin has
+// empty localStorage — user sees "max disappeared". Move persistence to SQLite via
+// app:setState so it survives across origins and restarts unconditionally.
+const APP_STATE_KEY_EFFORT = 'defaultClaudeEffort';
+const loadDefaultClaudeEffort = (): DefaultClaudeEffort => {
+  // Fallback to localStorage so existing users don't lose their setting on first load;
+  // we'll migrate it into SQLite on the first set. Async load below overrides this.
+  try {
+    let saved = localStorage.getItem('noted-terminal-default-claude-effort');
+    // Legacy migration: Claude removed 'auto' in May 2026 and added 'xhigh'.
+    // Old persisted values: map 'auto' → 'low' (the new toggle-off-equivalent).
+    if (saved === 'auto') saved = 'low';
+    if (saved && (CLAUDE_EFFORT_LEVELS_WITH_NONE as readonly string[]).includes(saved)) return saved as DefaultClaudeEffort;
+  } catch {}
+  return 'none';
+};
+const saveDefaultClaudeEffort = (v: DefaultClaudeEffort) => {
+  try { localStorage.setItem('noted-terminal-default-claude-effort', v); } catch {}
+  // Authoritative: SQLite (origin-independent, survives any vite port reshuffle).
+  try {
+    const { ipcRenderer } = window.require('electron');
+    ipcRenderer.invoke('app:setState', { key: APP_STATE_KEY_EFFORT, value: v }).catch(() => {});
+  } catch {}
+};
+const initialDefaultClaudeEffort = loadDefaultClaudeEffort();
+// Async upgrade: pull authoritative value from SQLite on startup and overwrite the
+// localStorage-derived initial value if they differ.
+(async () => {
+  try {
+    const { ipcRenderer } = window.require('electron');
+    let v = await ipcRenderer.invoke('app:getState', APP_STATE_KEY_EFFORT);
+    if (v === 'auto') v = 'low'; // legacy migration — Claude dropped 'auto' May 2026
+    if (v && (CLAUDE_EFFORT_LEVELS_WITH_NONE as readonly string[]).includes(v)) {
+      // Use the store's setter so the change propagates to all subscribers.
+      // Importing here would be circular; reach into the store after it's defined below
+      // — useUIStore.setState exists by the time this IIFE awaits.
+      const s = useUIStore.getState();
+      if (s.defaultClaudeEffort !== v) {
+        // Bypass save (we just read from SQLite) — write only to localStorage mirror.
+        useUIStore.setState({ defaultClaudeEffort: v as DefaultClaudeEffort });
+        try { localStorage.setItem('noted-terminal-default-claude-effort', v); } catch {}
+      }
+    }
+  } catch {}
+})();
+
+// Hydrate the Notes-Editor-Modal sizing knobs from SQLite — same pattern as effort
+// above. localStorage gives the synchronous boot value; SQLite is the authoritative
+// store that survives dev-port shuffles (each vite port is a separate origin and
+// gets its own localStorage bucket).
+(async () => {
+  try {
+    const { ipcRenderer } = window.require('electron');
+    const [fontSize, padX, padY] = await Promise.all([
+      ipcRenderer.invoke('app:getState', 'notesEditorFontSize'),
+      ipcRenderer.invoke('app:getState', 'notesEditorPaddingX'),
+      ipcRenderer.invoke('app:getState', 'notesEditorPaddingY'),
+    ]);
+    const patch: Partial<{ notesEditorFontSize: number; notesEditorPaddingX: number; notesEditorPaddingY: number }> = {};
+    const fs = Number(fontSize);
+    const px = Number(padX);
+    const py = Number(padY);
+    if (Number.isFinite(fs) && fs >= 10 && fs <= 28) patch.notesEditorFontSize = fs;
+    if (Number.isFinite(px) && px >= 0 && px <= 48) patch.notesEditorPaddingX = px;
+    if (Number.isFinite(py) && py >= 0 && py <= 48) patch.notesEditorPaddingY = py;
+    if (Object.keys(patch).length > 0) {
+      useUIStore.setState(patch);
+      if (patch.notesEditorFontSize != null) localStorage.setItem('noted-terminal-notes-editor-font-size', String(patch.notesEditorFontSize));
+      if (patch.notesEditorPaddingX != null) localStorage.setItem('noted-terminal-notes-editor-padding-x', String(patch.notesEditorPaddingX));
+      if (patch.notesEditorPaddingY != null) localStorage.setItem('noted-terminal-notes-editor-padding-y', String(patch.notesEditorPaddingY));
+    }
+  } catch {}
+})();
+
+// Hydrate Notes Panel size (slide-in resizable panel) from SQLite.
+(async () => {
+  try {
+    const { ipcRenderer } = window.require('electron');
+    const v = await ipcRenderer.invoke('app:getState', 'notesPanelSize');
+    if (v && typeof v === 'object' && Number.isFinite(Number(v.width)) && Number.isFinite(Number(v.height))) {
+      const w = Math.max(240, Math.min(1200, Number(v.width)));
+      const h = Math.max(180, Math.min(900, Number(v.height)));
+      const cur = useUIStore.getState().notesPanelSize;
+      if (cur.width !== w || cur.height !== h) {
+        useUIStore.setState({ notesPanelSize: { width: w, height: h } });
+        try { localStorage.setItem('noted-terminal-notes-panel-size', JSON.stringify({ width: w, height: h })); } catch {}
+      }
+    }
+  } catch {}
+})();
 
 const loadSidebarBehavior = (): { sidebarPersistFile: boolean; sidebarOverlayCloseOnClickOutside: boolean } => {
   try {
@@ -946,37 +1153,178 @@ export const useUIStore = create<UIStore>((set, get) => ({
   copyFromStart: initialCopySettings.copyFromStart,
   copyIncludeSubagentResult: initialCopySettings.copyIncludeSubagentResult,
   copyIncludeSubagentHistory: initialCopySettings.copyIncludeSubagentHistory,
+  copyIncludeUser: initialCopySettings.copyIncludeUser,
+  copyIncludeClaude: initialCopySettings.copyIncludeClaude,
+  copyIncludeText: initialCopySettings.copyIncludeText,
+  copyIncludeThinking: initialCopySettings.copyIncludeThinking,
+  copyIncludeBash: initialCopySettings.copyIncludeBash,
+  copyIncludeTools: initialCopySettings.copyIncludeTools,
+  // Single helper avoids the 11-field re-destructure pattern previously copy-pasted in each setter.
+  // Reading get() snapshot AFTER set() ensures we persist the merged state including v.
   setCopyIncludeEditing: (v) => {
     set({ copyIncludeEditing: v });
-    const { copyIncludeReading, copyFromStart, copyIncludeSubagentResult, copyIncludeSubagentHistory } = get();
-    saveCopySettings({ copyIncludeEditing: v, copyIncludeReading, copyFromStart, copyIncludeSubagentResult, copyIncludeSubagentHistory });
+    const s = get(); saveCopySettings({
+      copyIncludeEditing: s.copyIncludeEditing, copyIncludeReading: s.copyIncludeReading, copyFromStart: s.copyFromStart,
+      copyIncludeSubagentResult: s.copyIncludeSubagentResult, copyIncludeSubagentHistory: s.copyIncludeSubagentHistory,
+      copyIncludeUser: s.copyIncludeUser, copyIncludeClaude: s.copyIncludeClaude,
+      copyIncludeText: s.copyIncludeText, copyIncludeThinking: s.copyIncludeThinking,
+      copyIncludeBash: s.copyIncludeBash, copyIncludeTools: s.copyIncludeTools,
+    });
   },
   setCopyIncludeReading: (v) => {
     set({ copyIncludeReading: v });
-    const { copyIncludeEditing, copyFromStart, copyIncludeSubagentResult, copyIncludeSubagentHistory } = get();
-    saveCopySettings({ copyIncludeEditing, copyIncludeReading: v, copyFromStart, copyIncludeSubagentResult, copyIncludeSubagentHistory });
+    const s = get(); saveCopySettings({
+      copyIncludeEditing: s.copyIncludeEditing, copyIncludeReading: s.copyIncludeReading, copyFromStart: s.copyFromStart,
+      copyIncludeSubagentResult: s.copyIncludeSubagentResult, copyIncludeSubagentHistory: s.copyIncludeSubagentHistory,
+      copyIncludeUser: s.copyIncludeUser, copyIncludeClaude: s.copyIncludeClaude,
+      copyIncludeText: s.copyIncludeText, copyIncludeThinking: s.copyIncludeThinking,
+      copyIncludeBash: s.copyIncludeBash, copyIncludeTools: s.copyIncludeTools,
+    });
   },
   setCopyFromStart: (v) => {
     set({ copyFromStart: v });
-    const { copyIncludeEditing, copyIncludeReading, copyIncludeSubagentResult, copyIncludeSubagentHistory } = get();
-    saveCopySettings({ copyIncludeEditing, copyIncludeReading, copyFromStart: v, copyIncludeSubagentResult, copyIncludeSubagentHistory });
+    const s = get(); saveCopySettings({
+      copyIncludeEditing: s.copyIncludeEditing, copyIncludeReading: s.copyIncludeReading, copyFromStart: s.copyFromStart,
+      copyIncludeSubagentResult: s.copyIncludeSubagentResult, copyIncludeSubagentHistory: s.copyIncludeSubagentHistory,
+      copyIncludeUser: s.copyIncludeUser, copyIncludeClaude: s.copyIncludeClaude,
+      copyIncludeText: s.copyIncludeText, copyIncludeThinking: s.copyIncludeThinking,
+      copyIncludeBash: s.copyIncludeBash, copyIncludeTools: s.copyIncludeTools,
+    });
   },
   setCopyIncludeSubagentResult: (v) => {
-    set({ copyIncludeSubagentResult: v });
-    const { copyIncludeEditing, copyIncludeReading, copyFromStart, copyIncludeSubagentHistory } = get();
-    saveCopySettings({ copyIncludeEditing, copyIncludeReading, copyFromStart, copyIncludeSubagentResult: v, copyIncludeSubagentHistory });
+    // Sub-agent History → Result is incremental: turning Result OFF must turn History OFF too,
+    // otherwise the history block has nowhere to anchor in the export.
+    set((state) => ({
+      copyIncludeSubagentResult: v,
+      copyIncludeSubagentHistory: v ? state.copyIncludeSubagentHistory : false,
+    }));
+    const s = get(); saveCopySettings({
+      copyIncludeEditing: s.copyIncludeEditing, copyIncludeReading: s.copyIncludeReading, copyFromStart: s.copyFromStart,
+      copyIncludeSubagentResult: s.copyIncludeSubagentResult, copyIncludeSubagentHistory: s.copyIncludeSubagentHistory,
+      copyIncludeUser: s.copyIncludeUser, copyIncludeClaude: s.copyIncludeClaude,
+      copyIncludeText: s.copyIncludeText, copyIncludeThinking: s.copyIncludeThinking,
+      copyIncludeBash: s.copyIncludeBash, copyIncludeTools: s.copyIncludeTools,
+    });
   },
   setCopyIncludeSubagentHistory: (v) => {
-    set({ copyIncludeSubagentHistory: v });
-    const { copyIncludeEditing, copyIncludeReading, copyFromStart, copyIncludeSubagentResult } = get();
-    saveCopySettings({ copyIncludeEditing, copyIncludeReading, copyFromStart, copyIncludeSubagentResult, copyIncludeSubagentHistory: v });
+    // History ON implies Result ON (incremental).
+    set((state) => ({
+      copyIncludeSubagentHistory: v,
+      copyIncludeSubagentResult: v ? true : state.copyIncludeSubagentResult,
+    }));
+    const s = get(); saveCopySettings({
+      copyIncludeEditing: s.copyIncludeEditing, copyIncludeReading: s.copyIncludeReading, copyFromStart: s.copyFromStart,
+      copyIncludeSubagentResult: s.copyIncludeSubagentResult, copyIncludeSubagentHistory: s.copyIncludeSubagentHistory,
+      copyIncludeUser: s.copyIncludeUser, copyIncludeClaude: s.copyIncludeClaude,
+      copyIncludeText: s.copyIncludeText, copyIncludeThinking: s.copyIncludeThinking,
+      copyIncludeBash: s.copyIncludeBash, copyIncludeTools: s.copyIncludeTools,
+    });
+  },
+  setCopyIncludeUser: (v) => {
+    set({ copyIncludeUser: v });
+    const s = get(); saveCopySettings({
+      copyIncludeEditing: s.copyIncludeEditing, copyIncludeReading: s.copyIncludeReading, copyFromStart: s.copyFromStart,
+      copyIncludeSubagentResult: s.copyIncludeSubagentResult, copyIncludeSubagentHistory: s.copyIncludeSubagentHistory,
+      copyIncludeUser: s.copyIncludeUser, copyIncludeClaude: s.copyIncludeClaude,
+      copyIncludeText: s.copyIncludeText, copyIncludeThinking: s.copyIncludeThinking,
+      copyIncludeBash: s.copyIncludeBash, copyIncludeTools: s.copyIncludeTools,
+    });
+  },
+  setCopyIncludeClaude: (v) => {
+    set({ copyIncludeClaude: v });
+    const s = get(); saveCopySettings({
+      copyIncludeEditing: s.copyIncludeEditing, copyIncludeReading: s.copyIncludeReading, copyFromStart: s.copyFromStart,
+      copyIncludeSubagentResult: s.copyIncludeSubagentResult, copyIncludeSubagentHistory: s.copyIncludeSubagentHistory,
+      copyIncludeUser: s.copyIncludeUser, copyIncludeClaude: s.copyIncludeClaude,
+      copyIncludeText: s.copyIncludeText, copyIncludeThinking: s.copyIncludeThinking,
+      copyIncludeBash: s.copyIncludeBash, copyIncludeTools: s.copyIncludeTools,
+    });
+  },
+  setCopyIncludeText: (v) => {
+    set({ copyIncludeText: v });
+    const s = get(); saveCopySettings({
+      copyIncludeEditing: s.copyIncludeEditing, copyIncludeReading: s.copyIncludeReading, copyFromStart: s.copyFromStart,
+      copyIncludeSubagentResult: s.copyIncludeSubagentResult, copyIncludeSubagentHistory: s.copyIncludeSubagentHistory,
+      copyIncludeUser: s.copyIncludeUser, copyIncludeClaude: s.copyIncludeClaude,
+      copyIncludeText: s.copyIncludeText, copyIncludeThinking: s.copyIncludeThinking,
+      copyIncludeBash: s.copyIncludeBash, copyIncludeTools: s.copyIncludeTools,
+    });
+  },
+  setCopyIncludeThinking: (v) => {
+    set({ copyIncludeThinking: v });
+    const s = get(); saveCopySettings({
+      copyIncludeEditing: s.copyIncludeEditing, copyIncludeReading: s.copyIncludeReading, copyFromStart: s.copyFromStart,
+      copyIncludeSubagentResult: s.copyIncludeSubagentResult, copyIncludeSubagentHistory: s.copyIncludeSubagentHistory,
+      copyIncludeUser: s.copyIncludeUser, copyIncludeClaude: s.copyIncludeClaude,
+      copyIncludeText: s.copyIncludeText, copyIncludeThinking: s.copyIncludeThinking,
+      copyIncludeBash: s.copyIncludeBash, copyIncludeTools: s.copyIncludeTools,
+    });
+  },
+  setCopyIncludeBash: (v) => {
+    set({ copyIncludeBash: v });
+    const s = get(); saveCopySettings({
+      copyIncludeEditing: s.copyIncludeEditing, copyIncludeReading: s.copyIncludeReading, copyFromStart: s.copyFromStart,
+      copyIncludeSubagentResult: s.copyIncludeSubagentResult, copyIncludeSubagentHistory: s.copyIncludeSubagentHistory,
+      copyIncludeUser: s.copyIncludeUser, copyIncludeClaude: s.copyIncludeClaude,
+      copyIncludeText: s.copyIncludeText, copyIncludeThinking: s.copyIncludeThinking,
+      copyIncludeBash: s.copyIncludeBash, copyIncludeTools: s.copyIncludeTools,
+    });
+  },
+  setCopyIncludeTools: (v) => {
+    set({ copyIncludeTools: v });
+    const s = get(); saveCopySettings({
+      copyIncludeEditing: s.copyIncludeEditing, copyIncludeReading: s.copyIncludeReading, copyFromStart: s.copyFromStart,
+      copyIncludeSubagentResult: s.copyIncludeSubagentResult, copyIncludeSubagentHistory: s.copyIncludeSubagentHistory,
+      copyIncludeUser: s.copyIncludeUser, copyIncludeClaude: s.copyIncludeClaude,
+      copyIncludeText: s.copyIncludeText, copyIncludeThinking: s.copyIncludeThinking,
+      copyIncludeBash: s.copyIncludeBash, copyIncludeTools: s.copyIncludeTools,
+    });
   },
 
-  // Notes Editor Modal
-  notesEditorOpen: false,
-  notesEditorProjectId: null,
-  openNotesEditor: (projectId) => set({ notesEditorOpen: true, notesEditorProjectId: projectId }),
-  closeNotesEditor: () => set({ notesEditorOpen: false, notesEditorProjectId: null }),
+  // Status bar debug toggles
+  debugHoverBridges: initialDebugHoverBridges,
+  setDebugHoverBridges: (v) => { set({ debugHoverBridges: v }); saveDebugHoverBridges(v); },
+
+  freePortsBeforeStart: initialFreePortsBeforeStart,
+  setFreePortsBeforeStart: (v) => { set({ freePortsBeforeStart: v }); saveFreePortsBeforeStart(v); },
+
+  // Default Claude effort (status-bar selector)
+  defaultClaudeEffort: initialDefaultClaudeEffort,
+  setDefaultClaudeEffort: (v) => { set({ defaultClaudeEffort: v }); saveDefaultClaudeEffort(v); },
+
+  // Notes Panel — per-tab open state + SQLite-persisted shared size.
+  notesPanelOpenTabs: {},
+  setNotesPanelOpen: (tabId, open) => {
+    const cur = get().notesPanelOpenTabs;
+    if ((cur[tabId] ?? false) === open) return;
+    const next = { ...cur };
+    if (open) next[tabId] = true;
+    else delete next[tabId];
+    set({ notesPanelOpenTabs: next });
+  },
+  notesPanelSize: (() => {
+    try {
+      const saved = localStorage.getItem('noted-terminal-notes-panel-size');
+      if (saved) {
+        const p = JSON.parse(saved);
+        const w = Number(p.width);
+        const h = Number(p.height);
+        if (Number.isFinite(w) && Number.isFinite(h)) return { width: w, height: h };
+      }
+    } catch {}
+    return { width: 400, height: 300 };
+  })(),
+  setNotesPanelSize: (size) => {
+    const w = Math.max(240, Math.min(1200, size.width));
+    const h = Math.max(180, Math.min(900, size.height));
+    const next = { width: w, height: h };
+    set({ notesPanelSize: next });
+    try { localStorage.setItem('noted-terminal-notes-panel-size', JSON.stringify(next)); } catch {}
+    try {
+      const { ipcRenderer } = window.require('electron');
+      ipcRenderer.invoke('app:setState', { key: 'notesPanelSize', value: next }).catch(() => {});
+    } catch {}
+  },
 
   // Tab Notes Font Size & Padding
   tabNotesFontSize: (() => {
@@ -1011,6 +1359,57 @@ export const useUIStore = create<UIStore>((set, get) => ({
     const clamped = Math.max(0, Math.min(32, px));
     set({ tabNotesPaddingY: clamped });
     localStorage.setItem('noted-terminal-tab-notes-padding-y', String(clamped));
+  },
+
+  // Notes Editor Modal (separate from inline tab-notes). Same persistence
+  // pattern: localStorage for synchronous boot reads, app:setState mirror to
+  // SQLite so the value survives vite port shuffles (different ports = different
+  // origins = separate localStorage buckets). Defaults bigger because the modal
+  // is fullscreen and users want more readable text there.
+  notesEditorFontSize: (() => {
+    try {
+      const saved = localStorage.getItem('noted-terminal-notes-editor-font-size');
+      return saved ? parseInt(saved, 10) : 14;
+    } catch { return 14; }
+  })(),
+  setNotesEditorFontSize: (size) => {
+    const clamped = Math.max(10, Math.min(28, size));
+    set({ notesEditorFontSize: clamped });
+    try { localStorage.setItem('noted-terminal-notes-editor-font-size', String(clamped)); } catch {}
+    try {
+      const { ipcRenderer } = window.require('electron');
+      ipcRenderer.invoke('app:setState', { key: 'notesEditorFontSize', value: clamped }).catch(() => {});
+    } catch {}
+  },
+  notesEditorPaddingX: (() => {
+    try {
+      const saved = localStorage.getItem('noted-terminal-notes-editor-padding-x');
+      return saved ? parseInt(saved, 10) : 12;
+    } catch { return 12; }
+  })(),
+  setNotesEditorPaddingX: (px) => {
+    const clamped = Math.max(0, Math.min(48, px));
+    set({ notesEditorPaddingX: clamped });
+    try { localStorage.setItem('noted-terminal-notes-editor-padding-x', String(clamped)); } catch {}
+    try {
+      const { ipcRenderer } = window.require('electron');
+      ipcRenderer.invoke('app:setState', { key: 'notesEditorPaddingX', value: clamped }).catch(() => {});
+    } catch {}
+  },
+  notesEditorPaddingY: (() => {
+    try {
+      const saved = localStorage.getItem('noted-terminal-notes-editor-padding-y');
+      return saved ? parseInt(saved, 10) : 12;
+    } catch { return 12; }
+  })(),
+  setNotesEditorPaddingY: (px) => {
+    const clamped = Math.max(0, Math.min(48, px));
+    set({ notesEditorPaddingY: clamped });
+    try { localStorage.setItem('noted-terminal-notes-editor-padding-y', String(clamped)); } catch {}
+    try {
+      const { ipcRenderer } = window.require('electron');
+      ipcRenderer.invoke('app:setState', { key: 'notesEditorPaddingY', value: clamped }).catch(() => {});
+    } catch {}
   },
 
   // API Settings Modal

@@ -15,6 +15,7 @@ import remarkGfm from 'remark-gfm';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import { Loader2, FileEdit, Terminal as TerminalIcon, FolderSearch, Search, FileText, Globe } from 'lucide-react';
+import Tooltip from '../../UI/Tooltip';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -92,9 +93,7 @@ const TOOL_ICON: Record<string, React.ReactNode> = {
 // ============================================================
 interface ClaudeSDKTabProps {
   tabId: string;
-  // PERF (2026-04-21): active/isActiveProject derived from the store by default.
-  // See Terminal.tsx for the correctness note.
-  active?: boolean;
+  active: boolean;
   isActiveProject?: boolean;
   cwd: string;
 }
@@ -102,23 +101,7 @@ interface ClaudeSDKTabProps {
 // ============================================================
 // Main component
 // ============================================================
-function ClaudeSDKTab({ tabId, active: activeProp, isActiveProject: isActiveProjectProp, cwd }: ClaudeSDKTabProps) {
-  const activeFromStore = useWorkspaceStore((state) => {
-    for (const [projId, ws] of state.openProjects) {
-      if (ws.tabs.has(tabId)) {
-        return state.activeProjectId === projId && ws.activeTabId === tabId;
-      }
-    }
-    return false;
-  });
-  const isActiveProjectFromStore = useWorkspaceStore((state) => {
-    for (const [projId, ws] of state.openProjects) {
-      if (ws.tabs.has(tabId)) return state.activeProjectId === projId;
-    }
-    return false;
-  });
-  const active = activeProp !== undefined ? activeProp : activeFromStore;
-  const isActiveProject = isActiveProjectProp !== undefined ? isActiveProjectProp : isActiveProjectFromStore;
+function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKTabProps) {
   const [messages, setMessages] = useState<SDKChatMessage[]>([]);
   const [isRunning, setIsRunning] = useState(false);
   const [sessionId, setSessionId] = useState<string | null>(null);
@@ -544,14 +527,15 @@ function ClaudeSDKTab({ tabId, active: activeProp, isActiveProject: isActiveProj
 
           {/* Scroll-to-bottom button */}
           {showScrollDown && (
+            <Tooltip content="Scroll to bottom">
             <button
               onClick={scrollToBottom}
               className="absolute z-10 flex items-center justify-center w-8 h-8 rounded-full bg-[#2a2a2a] border border-[#444] text-[#888] hover:text-white hover:bg-[#3a3a3a] transition-all cursor-pointer shadow-lg"
               style={{ bottom: '70px', right: '52px' }}
-              title="Scroll to bottom"
             >
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="6 9 12 15 18 9" /></svg>
             </button>
+            </Tooltip>
           )}
         </ThreadPrimitive.Root>
       </AssistantProviderBase>
@@ -799,11 +783,10 @@ function SDKComposer({ isRunning, sessionId }: { isRunning: boolean; sessionId: 
       {chips.length > 0 && (
         <div className="flex flex-wrap gap-1.5 px-4 pb-1.5">
           {chips.map(chip => (
+            <Tooltip key={chip.id} content="Click to preview">
             <span
-              key={chip.id}
               className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] bg-[#6B8AFF]/15 text-[#8ba4ff] border border-[#6B8AFF]/20 cursor-pointer hover:bg-[#6B8AFF]/25 max-w-[200px]"
               onClick={() => setPreviewChip(previewChip?.id === chip.id ? null : chip)}
-              title="Click to preview"
             >
               <span className="truncate">{chip.preview}</span>
               <span
@@ -811,6 +794,7 @@ function SDKComposer({ isRunning, sessionId }: { isRunning: boolean; sessionId: 
                 onClick={(e) => { e.stopPropagation(); removeChip(chip.id); }}
               >×</span>
             </span>
+            </Tooltip>
           ))}
         </div>
       )}

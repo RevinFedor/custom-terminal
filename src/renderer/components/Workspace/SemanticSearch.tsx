@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback, memo } from 'react';
 import { Search, Database, Loader2, X, ChevronDown, ChevronRight, Settings } from 'lucide-react';
+import Tooltip from '../UI/Tooltip';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -167,20 +168,21 @@ export default memo(function SemanticSearchSection({ projectPath }: SemanticSear
         {/* Index controls */}
         <div className="flex items-center gap-1 relative" ref={settingsRef}>
           {/* Settings gear */}
+          <Tooltip content="Index settings">
           <button
             onClick={(e) => { e.stopPropagation(); setShowIndexSettings(!showIndexSettings); }}
             className="flex items-center p-1 text-[#555] hover:text-[#999] cursor-pointer transition-colors"
-            title="Index settings"
           >
             <Settings size={12} />
           </button>
+          </Tooltip>
 
           {/* Index button */}
+          <Tooltip content={indexStats ? `${indexStats.fileCount} files, ${indexStats.chunkCount} chunks indexed` : 'Build search index'}>
           <button
             onClick={(e) => { e.stopPropagation(); handleIndexAll(sessionLimit); }}
             disabled={indexing}
             className="flex items-center gap-1 text-[11px] text-[#666] hover:text-[#999] cursor-pointer transition-colors"
-            title={indexStats ? `${indexStats.fileCount} files, ${indexStats.chunkCount} chunks indexed` : 'Build search index'}
           >
             {indexing ? (
               <div className="w-2 h-2 rounded-full bg-[#818cf8] animate-glow-indigo shadow-[0_0_8px_rgba(129,140,248,0.5)]" />
@@ -192,6 +194,7 @@ export default memo(function SemanticSearchSection({ projectPath }: SemanticSear
               : `Index (${sessionLimit || 'all'})`
             }
           </button>
+          </Tooltip>
 
           {/* Settings dropdown */}
           {showIndexSettings && (

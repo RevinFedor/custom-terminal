@@ -155,6 +155,15 @@ setActiveCommandType(tab.commandType || null);
 ### Результат
 Пользователь всегда видит корректный статус: AI запущен, но ID ещё не захвачен — жёлтый индикатор с пульсом.
 
+### CwdGuard ловушка: «Ожидание сессии» при `cd` внутри шелла
+Sniper полагается на StatusLine Bridge (`~/.claude/bridge/<sid>.json`), который Claude пишет после каждого ответа. В main.js (`startSessionBridge`) есть CwdGuard, отбрасывающий bridge-файл если `data.cwd !== terminalProjects.get(tabId)`. Защита нужна для случая «запустил `claude --resume <foreignId>` в табе X — bridge приходит из чужого проекта, не клеим его на X».
+
+**Шрам:** старая версия делала строгое сравнение `===`. Симптом: юзер стартанул таб в `/Users/fedor/Desktop/custom-terminal`, в шелле сделал `cd ..`, запустил `claude` — bridge пишет `cwd=/Users/fedor/Desktop`, а `terminalProjects` зафиксирован один раз при создании PTY (см. `main.js:terminalProjects.set(tabId, workingDir)` — обновляется только на старте) → guard skip → sessionId не доходит до renderer → жёлтый pulse навсегда, хотя в логах виден `sid=a5abf565...`.
+
+**Фикс:** path-prefix tolerance. Если `bridge.cwd` — это **префикс** `tab.cwd` ИЛИ наоборот (один — родитель/потомок другого по файлсистеме), считаем, что это естественный `cd` в той же ветке, не чужой проект. Тогда: bridge пропускается **и** `terminalProjects.set(tabId, data.cwd)` обновляется — все будущие bridge-апдейты сразу проходят без guard'а. Только полностью несвязанные пути (`/A/proj1` vs `/A/proj2`) реально skip'аются.
+
+**Почему `===` был исходно:** автор боялся, что path-prefix позволит чужому проекту проникнуть. На практике: путь к другому проекту НЕ может быть префиксом текущего, кроме случая когда оба лежат в одной директории (`/Users/fedor/Desktop/projA` vs `/Users/fedor/Desktop` — да, второе префикс первого, но это родитель → нормальный случай `cd ..`). Сценарий "юзер из `/Users/fedor/Desktop/projA` сделал `cd ../projB && claude --resume <projA-sid>`" даст `bridge.cwd=/projB`, `tab.cwd=/projA` — не префикс друг друга → guard продолжит работать. Принцип: см. `methodology/design.md::Path-prefix tolerance для cwd-сравнений`.
+
 ---
 
 ## 5. Интерактивная Валидация ID (UI Feedback)
