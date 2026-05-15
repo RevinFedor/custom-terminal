@@ -256,7 +256,7 @@ bridge видит новый PID → claude:process-started fires
 
 **`max` нельзя задать в settings.json:** Claude CLI silently downgrades `effortLevel: "max"` до null при первом запуске. Максимум что settings.json держит — `high`. Из-за этого инжекция через `/effort max` — **единственный** способ стартовать сессию в max effort.
 
-**Persistence — SQLite, не localStorage.** `defaultClaudeEffort` сохраняется через `app:setState` IPC. Раньше был localStorage — но vite-dev меняет порт (5181 → 5182 → 5183) когда есть orphan Electron'ы, и каждый порт это **отдельный origin** → отдельное localStorage хранилище. Юзер видел "max сбрасывается после рестарта", думал что не сохраняется — на самом деле сохранялось, но на другом origin'е. См. `fix-environment.md::localStorage origin trap`.
+**Persistence — SQLite, не localStorage.** `defaultClaudeEffort` сохраняется через `app:setState` IPC. Раньше был localStorage — но vite-dev меняет порт (5181 → 5182 → 5183) когда есть orphan Electron'ы, и каждый порт это **отдельный origin** → отдельное localStorage хранилище. Юзер видел "max сбрасывается после рестарта", думал что не сохраняется — на самом деле сохранялось, но на другом origin'е. См. `fix-localstorage-origin.md`.
 
 ### Click-toggle-off на effort кнопке
 

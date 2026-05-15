@@ -187,7 +187,7 @@ Entries используют `flex: '1 0 auto'` с минимальной выс
 - **Scrolling:** Текст промпта имеет собственный скролл-контейнер с `scrollbar-thin` (3px). Сообщения не обрезаются (`line-clamp` удалён), полный текст всегда доступен через скролл даже в свёрнутом виде.
 - **Copy Animation:** Кнопка копирования меняет текст на «Скопировано» и иконку на галочку при успехе (на 1.2с).
 - **Resize:** Пользователь может изменять ширину тултипа, потянув за левую границу. Ширина сохраняется в рамках сессии. См. [`fix-timeline-tooltip-stability.md`](fix-timeline-tooltip-stability.md).
-- Использует "Invisible Bridge" для плавного наведения (см. `knowledge/fact-react-patterns.md`).
+- Использует "Invisible Bridge" для плавного наведения (см. `../methodology/react.md`).
 - Для сообщений типа `continued` тултип показывает статус "Context Overflow Recovery".
 
 ### Range Copy & Edit Range (копирование и редактирование диапазона)
@@ -303,7 +303,7 @@ Entries используют `flex: '1 0 auto'` с минимальной выс
 ### Context Menu (ПКМ)
 - **Позиционирование:** Конкретное меню открывается справа-посередине от курсора (`x = cursor + 4px`, `y = cursor - height/2`). Высота меню вычисляется динамически на основе количества кнопок.
 - **Auto-close:** Меню автоматически закрывается при уходе курсора с его области (`onMouseLeave`).
-- **Portal Rule:** Кнопки в контекстном меню (Portal) обязательно используют `e.stopPropagation()` — см. `knowledge/fact-react-patterns.md`.
+- **Portal Rule:** Кнопки в контекстном меню (Portal) обязательно используют `e.stopPropagation()` — см. `../methodology/react.md`.
 - **Button Status:** Во время отката кнопка "Откатиться" заменяется на статус выполнения ("Компакт...", "Откат...", "Вставка...") и блокируется.
 - **Копировать одиночную точку:** ПКМ по одной точке показывает «Копировать» (или «Копировать compact» для оранжевой точки) сразу — без необходимости выделять диапазон ≥2 элементов. Использует `claude:copy-range` с `startUuid = endUuid = entry.uuid`; backend forward-expand'ит до следующего user/compact (включает prompt + все ответы Claude). Скрыто для `continued`/`docs_edit`/`docs_search` (нет копируемого контента).
 - **Compact entry в `claude:copy-range`: подтягивается compactSummary, не заглушка.** Для `compact_boundary` записи backend ищет в полной активной ветке (`activeHistory`, не в обрезанном range) следующий entry с `isCompactSummary === true && type === 'user'` и вставляет его текст после заголовка `═══ HISTORY COMPACTED ═══`. Раньше выводилась только заглушка, потому что forward-expand range останавливается на user → summary entry никогда не попадал в range. Lookup ведётся по `activeHistory` напрямую, не по `range[]`.

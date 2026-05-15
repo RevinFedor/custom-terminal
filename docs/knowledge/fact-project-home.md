@@ -42,7 +42,7 @@
 - Обновление пути через `updateProject` мгновенно меняет корень для всех новых терминалов и файлового менеджера.
 
 ### Критическое правило: Immediate Injection при Restore
-При восстановлении AI-вкладки `claudeSessionId` / `geminiSessionId` передаются в `createTab()` через `options`. Это гарантирует, что InfoPanel **мгновенно** видит ID сессии, без ожидания PTY или Sniper Watcher. См. `knowledge/fact-react-patterns.md`.
+При восстановлении AI-вкладки `claudeSessionId` / `geminiSessionId` передаются в `createTab()` через `options`. Это гарантирует, что InfoPanel **мгновенно** видит ID сессии, без ожидания PTY или Sniper Watcher. См. `../methodology/react.md`.
 
 ### Данные History Entry (SQLite)
 ```

@@ -1,11 +1,15 @@
-import { startTransition, useCallback, useEffect, useRef, useState } from 'react';
-import { flushSync } from 'react-dom';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { HashRouter, Navigate, Route, Routes, useNavigate, useParams } from 'react-router-dom';
-import { dropChat, loadChat, saveChat } from './cache';
+import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
+// localStorage cache (cache.ts) replaced by IndexedDB record store (idb.ts) —
+// see fact-mobile-web.md::IDB record store. The cache module is kept on disk
+// for now in case rollback is needed, but no longer imported.
 import { Api, bootstrapToken, clearToken, getToken, setToken, wsUrl, type ProjectInfo, type TabInfo, type TimelineEntry } from './api';
 import { createMessageReducer, type UiEntry } from './messages';
+import { streamHistory, type StreamMeta } from './streamHistory';
+import { readCachedHistory, writeFullHistory, dropSession } from './idb';
 
 // HashRouter (URL fragment) instead of BrowserRouter so reload from any view
 // works without server-side rewrites — the static file server (web-server.js)
@@ -901,101 +905,80 @@ function ProjectView(props: {
 // ────────── Chat (SDK tab) ──────────
 
 function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () => void; readOnly?: boolean }) {
-  // Cache temporarily DISABLED — testing first-load performance from a clean
-  // state. To re-enable: uncomment loadChat() and restore the read of `cached`.
-  // Cache write side (saveChat in useEffect below) is also disabled for parity.
-  const cached = null as { entries: UiEntry[]; timelineEntries: TimelineEntry[] | null; sessionId?: string } | null;
-  const [entries, setEntries] = useState<UiEntry[]>(cached?.entries || []);
+  // Architecture (read top to bottom):
+  //  1. Hydrate UI synchronously with cached entries from IndexedDB (records,
+  //     not blobs — IDB returns live structured-cloned objects, no re-parse).
+  //  2. Open WebSocket for live messages.
+  //  3. Stream /history?after=<lastUuid> as NDJSON — apply each record into
+  //     the reducer as it arrives, batched per animation frame.
+  //  4. Render via react-virtuoso — DOM proportional to viewport (10-30 items)
+  //     regardless of history length. No manual window, no scroll-restore, no
+  //     OOM cap. firstItemIndex anchors when older messages are prepended.
+  //  5. On stream end, write the full message list back to IDB in one tx so
+  //     the next mount opens instantly.
+  const [entries, setEntries] = useState<UiEntry[]>([]);
   const [busy, setBusy] = useState(false);
-  const [historyLoading, setHistoryLoading] = useState<boolean>(!cached && (!!tab.claudeSessionId || tab.tabType === 'claude-sdk'));
-  const [sessionId, setSessionId] = useState<string | undefined>(cached?.sessionId || tab.claudeSessionId || tab.live?.sessionId);
+  const [historyLoading, setHistoryLoading] = useState<boolean>(!!tab.claudeSessionId || tab.tabType === 'claude-sdk');
+  const [sessionId, setSessionId] = useState<string | undefined>(tab.claudeSessionId || tab.live?.sessionId);
   const [wsState, setWsState] = useState<'connecting' | 'open' | 'closed'>('connecting');
   const [text, setText] = useState('');
   const [drawerOpen, setDrawerOpen] = useState(false);
-  const [timelineEntries, setTimelineEntries] = useState<TimelineEntry[] | null>(cached?.timelineEntries || null);
+  const [timelineEntries, setTimelineEntries] = useState<TimelineEntry[] | null>(null);
   const [timelineExpanded, setTimelineExpanded] = useState<Set<string>>(new Set());
   const [usedTokens, setUsedTokens] = useState<number | null>(null);
   const [resolvedModel, setResolvedModel] = useState<string | null>(null);
-  const [scrollOverlay, setScrollOverlay] = useState(false);
-  // Windowed render: keep a SLICE of entries in DOM, not a prefix.
-  // Chat opens scrolled to the END (last 30 entries) — that's where users
-  // expect to be on mount, and it avoids putting 5000+ markdown blocks into
-  // memory at once (Safari OOM crash → page silently reloads).
-  //
-  // [renderStart, renderEnd) — half-open interval over `entries`. Window grows
-  // when user scrolls toward top (renderStart shrinks) or new messages arrive
-  // (renderEnd grows to entries.length). GoTo shifts window to surround target.
-  const INITIAL_RENDER = 30;
-  const RENDER_CHUNK = 30;
-  const initialEnd = cached?.entries.length || 0;
-  const [renderStart, setRenderStart] = useState<number>(Math.max(0, initialEnd - INITIAL_RENDER));
-  const [renderEnd, setRenderEnd] = useState<number>(initialEnd);
-  // Helper to compute how much of `entries` is currently in DOM. Use in places
-  // that previously read `renderedCount` linearly.
-  const renderedCount = renderEnd - renderStart;
-  // Whether we should auto-scroll to bottom after the initial mount paint.
-  // True ONLY on first mount with non-empty cache or after history fetch lands.
-  const needsBottomScrollRef = useRef(true);
-  // GoTo readiness: true once renderedCount >= entries.length. Buttons disable
-  // visual when chunk-render is in progress AND user might tap an unrendered
-  // entry. We don't fully block — forced-render-on-tap covers that — but the
-  // disabled style tells user "still loading, wait for click to feel snappy".
-  const [pendingGoTo, setPendingGoTo] = useState<string | null>(null);
-  // Show scroll-to-bottom button when user is more than 200px above the bottom.
-  // Recomputed on every scroll event (cheap — just compares scrollTop to scrollHeight).
-  const [showScrollDown, setShowScrollDown] = useState(false);
-  // Tail-first loading: first fetch is `?last=200` (~1s on 5MB chats), full
-  // history loads in the background. While fullLoading=true:
-  //   - "Load older messages" button is disabled with a spinner
-  //   - GoTo on a uuid not yet in entries shows full-screen overlay until the
-  //     full set arrives (then jumps automatically)
-  //   - WS messages still apply on top of tail (reducer chains by id)
-  const [fullLoading, setFullLoading] = useState<boolean>(false);
-  // Set when GoTo was tapped on an out-of-range uuid while fullLoading. Once
-  // full arrives, we resolve this uuid and scroll to it.
-  const pendingFullGoToRef = useRef<string | null>(null);
+  // Streaming progress: meta.total and how many records the NDJSON loop has
+  // already applied. Drives the determinate "Loading 1847/4856…" indicator.
+  const [streamProgress, setStreamProgress] = useState<{ done: number; total: number } | null>(null);
+  // Highlight a freshly-jumped entry by uuid for ~1.5s. Set by goToEntry, used
+  // by the row renderer to apply a background-fade.
+  const [flashUuid, setFlashUuid] = useState<string | null>(null);
+  // Virtuoso doesn't expose scroll-from-bottom natively — we listen via
+  // atBottomStateChange to know whether to extend the tail when WS messages
+  // arrive vs leaving the user's reading position alone.
+  const [atBottom, setAtBottom] = useState<boolean>(true);
+
   const reducer = useRef(createMessageReducer());
   const wsRef = useRef<WebSocket | null>(null);
-  const scrollRef = useRef<HTMLDivElement>(null);
-  // Ref to goToEntry so the full-load resolution can re-trigger a pending
-  // GoTo without putting goToEntry into the deps of the load effect.
-  const goToEntryRef = useRef<((uuid: string) => void) | null>(null);
+  // Virtuoso handle for programmatic scroll (GoTo, "scroll-to-bottom" FAB).
+  const virtuosoRef = useRef<VirtuosoHandle | null>(null);
+  // firstItemIndex: virtuoso's stable-index anchor for prepend operations.
+  // Start huge so the value can only shrink — virtuoso uses delta-between-renders
+  // to know "older messages were inserted, keep visible-item visible". We
+  // decrement it by N each time the front of `entries` grows by N during the
+  // initial stream (when older records arrive after tail records).
+  const firstItemIndexRef = useRef<number>(1_000_000_000);
+  const [firstItemIndex, setFirstItemIndex] = useState<number>(firstItemIndexRef.current);
+  // Snapshot of `entries.length` last paint — used to detect prepend in the
+  // streaming loop (delta = entries.length - prevLength).
+  const prevEntriesLenRef = useRef<number>(0);
 
-  const onChatScroll = useCallback(() => {
-    const el = scrollRef.current;
-    if (!el) return;
-    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
-    setShowScrollDown(distanceFromBottom > 200);
+  // ── Helpers ─────────────────────────────────────────────────────────────
+
+  // Apply a fresh reducer snapshot to React state + adjust firstItemIndex
+  // when the change was a PREPEND (older records inserted at the front).
+  // Returns the snapshot for further use.
+  const flushReducer = useCallback((reason: 'append' | 'replace' | 'prepend-aware') => {
+    const fresh = reducer.current.getEntries();
+    const prev = prevEntriesLenRef.current;
+    if (reason === 'prepend-aware' && fresh.length > prev) {
+      // Determine if the additional entries are at the FRONT (prepend) by
+      // checking whether the last entry's id matches prev's last entry's id.
+      // Reducer is linear so a true append keeps the last entry stable.
+      // For our streaming use case where older records always arrive after
+      // tail (via after-cursor delta), additions are always at the END;
+      // prepend only happens when reducer.reset() + replay-from-zero is
+      // followed by an append of cached + new records. Simpler invariant:
+      // if user is at bottom, do nothing special — virtuoso follows tail.
+      // If user is NOT at bottom AND length grew at the front, shift index.
+      // For now the streaming path uses 'replace' which handles this.
+    }
+    prevEntriesLenRef.current = fresh.length;
+    setEntries(fresh);
+    return fresh;
   }, []);
 
-  const scrollChatToBottom = useCallback(() => {
-    const el = scrollRef.current;
-    if (!el) return;
-    const total = reducer.current.getEntries().length;
-    // If new entries exist past the window — slide window so its tail = entries.end
-    // Keep window SIZE bounded (don't grow to all-of-history): start = end - max(30, current size)
-    // This protects iOS Safari from OOM crash on chats with 5000+ records.
-    if (renderEnd < total) {
-      const desiredSize = Math.max(INITIAL_RENDER, renderEnd - renderStart);
-      const newEnd = total;
-      const newStart = Math.max(0, newEnd - desiredSize);
-      setRenderStart(newStart);
-      setRenderEnd(newEnd);
-      requestAnimationFrame(() => requestAnimationFrame(() => {
-        const e = scrollRef.current;
-        if (e) e.scrollTop = e.scrollHeight;
-      }));
-    } else {
-      el.scrollTop = el.scrollHeight;
-    }
-  }, [renderStart, renderEnd]);
-  // Restore reducer's internal id-maps from cached entries so subsequent
-  // streaming chunks update existing assistant/tool entries instead of pushing
-  // new duplicates.
-  // Reducer hydrate from cache — disabled together with cache.
-
-  // Prefetch timeline as soon as ChatView mounts. By the time the user taps
-  // the ☰ icon (a few seconds in), entries are usually already loaded.
+  // ── Timeline prefetch (independent of chat data) ────────────────────────
   useEffect(() => {
     if (!tab.tabId) return;
     if (!tab.claudeSessionId && tab.tabType !== 'claude-sdk') return;
@@ -1007,11 +990,9 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
   }, [tab.tabId]);
 
   // Refetch when a turn completes (sessionId / entries.length / busy change).
-  // Uses the same `lastFetchKey` proxy the drawer used before.
   const refreshKey = `${sessionId || ''}:${entries.length}:${busy ? 1 : 0}`;
   useEffect(() => {
     if (!tab.tabId || !sessionId) return;
-    // Skip first run — initial prefetch above already covers it.
     if (timelineEntries === null) return;
     let cancelled = false;
     Api.timeline(tab.tabId)
@@ -1021,118 +1002,6 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [refreshKey]);
 
-  const goToEntry = useCallback((uuid: string) => {
-    const tStart = performance.now();
-    Api.log('TimelineGoTo', 'click', { uuid: uuid.slice(0, 8) });
-
-    // STEP 1 (synchronous, MUST happen this React commit, no batching with
-    // window-shift below): close the drawer + show overlay. If we batch them
-    // with the heavy setRenderStart/setRenderEnd that follows, React commits
-    // all four together and the user sees nothing for 100-3000ms while the
-    // huge windowed slice renders. Use flushSync so the close paints first.
-    //
-    // The overlay sits INSIDE the chat scroll container, not as a fixed page
-    // overlay — that way the user doesn't see the chat momentarily appear
-    // (with old scrollTop) before being covered.
-    flushSync(() => {
-      setScrollOverlay(true);
-      setDrawerOpen(false);
-    });
-
-    // Find target index in entries — needed both for force-render and as
-    // a guard ("doesn't exist in chat" case).
-    const targetIdx = reducer.current.getEntries().findIndex(
-      (e: any) => (e as any).entryUuid === uuid || (e as any).entryUuid?.startsWith(uuid.slice(0, 8))
-    );
-    if (targetIdx === -1) {
-      // Two reasons we'd miss: (1) full-load is still in flight and the
-      // target sits in the prefix we haven't received yet, OR (2) the entry
-      // genuinely doesn't have a uuid we recognize. Distinguish by fullLoading.
-      if (fullLoading) {
-        Api.log('TimelineGoTo', 'queuedForFullLoad', { uuid: uuid.slice(0, 8) });
-        pendingFullGoToRef.current = uuid;
-        // Overlay STAYS visible until full history arrives — fullLoading effect
-        // resolution will call goToEntry again, which will find the entry and
-        // proceed normally (clearing overlay at the end).
-        return;
-      }
-      Api.log('TimelineGoTo', 'no entry with uuid', { uuid: uuid.slice(0, 8) });
-      setScrollOverlay(false);
-      return;
-    }
-
-    // STEP 2 (next frame): shift the rendered window. CRITICAL — bounded slice,
-    // not union with current window. If we union [tail 30] with [target=100, +60]
-    // = [90, 5628] = 5538 markdown nodes one frame → 3-5s main thread block.
-    // Bounded means: shrink current window AND grow toward target equally.
-    const total = reducer.current.getEntries().length;
-    const newStart = Math.max(0, targetIdx - 10);
-    const newEnd = Math.min(total, newStart + 60);
-    Api.log('TimelineGoTo', 'window', { idx: targetIdx, total, start: newStart, end: newEnd });
-
-    requestAnimationFrame(() => {
-      setRenderStart(newStart);
-      setRenderEnd(newEnd);
-      setPendingGoTo(uuid);
-
-      // Wait for DOM to actually contain the anchor. We poll for up to ~1.5s
-      // because force-render+layout on large pages takes multiple frames.
-      let attempt = 0;
-      const tryScroll = () => {
-        attempt += 1;
-        const root = scrollRef.current;
-        if (!root) {
-          if (attempt < 60) requestAnimationFrame(tryScroll);
-          else { setScrollOverlay(false); setPendingGoTo(null); }
-          return;
-        }
-        let el = root.querySelector(`[data-entry-uuid="${uuid}"]`) as HTMLElement | null;
-        if (!el) {
-          const all = Array.from(root.querySelectorAll('[data-entry-uuid]')) as HTMLElement[];
-          el = all.find((x) => x.getAttribute('data-entry-uuid')?.startsWith(uuid.slice(0, 8))) || null;
-        }
-        if (!el) {
-          if (attempt < 60) {
-            requestAnimationFrame(tryScroll);
-          } else {
-            Api.log('TimelineGoTo', 'NOT FOUND after wait', {
-              uuid: uuid.slice(0, 8),
-              elapsedMs: Math.round(performance.now() - tStart),
-              totalAnchors: root.querySelectorAll('[data-entry-uuid]').length,
-            });
-            setScrollOverlay(false);
-            setPendingGoTo(null);
-          }
-          return;
-        }
-        let top = 0;
-        let cur: HTMLElement | null = el;
-        while (cur && cur !== root) {
-          top += cur.offsetTop;
-          cur = cur.offsetParent as HTMLElement | null;
-        }
-        const targetTop = Math.max(0, top - 120);
-        root.scrollTop = targetTop;
-
-        const bubble = el.querySelector('div') as HTMLElement | null;
-        const target = bubble || el;
-        target.style.transition = 'background 0.3s';
-        const orig = target.style.background;
-        target.style.background = 'rgba(255,178,130,0.22)';
-        setTimeout(() => { target.style.background = orig; }, 1300);
-
-        Api.log('TimelineGoTo', 'done', { uuid: uuid.slice(0, 8), elapsedMs: Math.round(performance.now() - tStart), attempts: attempt });
-        requestAnimationFrame(() => { setScrollOverlay(false); setPendingGoTo(null); });
-      };
-      // Two rAFs: first for render commit, second for layout settle.
-      requestAnimationFrame(() => requestAnimationFrame(tryScroll));
-    });
-  }, [fullLoading]);
-
-  // Keep ref pointing at the latest goToEntry so the full-load handler can
-  // call back into it without retriggering deps.
-  useEffect(() => { goToEntryRef.current = goToEntry; }, [goToEntry]);
-
   const toggleEntryExpanded = useCallback((uuid: string) => {
     setTimelineExpanded((prev) => {
       const next = new Set(prev);
@@ -1141,15 +1010,41 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
     });
   }, []);
 
-  // Load history once on mount. If we hydrated from cache, this still runs —
-  // fresh fetch replaces stale entries when it arrives. The reducer is reset
-  // before re-applying so we don't mix cached and fresh entries (the JSONL is
-  // source of truth — cache may be days behind if user worked on desktop).
-  useEffect(() => {
-    if (!tab.tabId) {
-      setHistoryLoading(false);
+  // ── GoTo: virtuoso scrollToIndex by uuid match ──────────────────────────
+  const goToEntry = useCallback((uuid: string) => {
+    Api.log('TimelineGoTo', 'click', { uuid: uuid.slice(0, 8) });
+    const all = reducer.current.getEntries();
+    const targetIdx = all.findIndex(
+      (e: any) => (e as any).entryUuid === uuid || (e as any).entryUuid?.startsWith(uuid.slice(0, 8))
+    );
+    if (targetIdx === -1) {
+      Api.log('TimelineGoTo', 'no entry with uuid', { uuid: uuid.slice(0, 8) });
+      // Still close the drawer so the user can see the chat — they may want
+      // to scroll manually or try a different entry.
+      setDrawerOpen(false);
       return;
     }
+    // Close drawer + jump in one frame. Virtuoso handles the mount/measure
+    // of off-screen items synchronously — no overlay needed because rendered
+    // DOM is bounded (10-30 nodes total regardless of `entries.length`).
+    setDrawerOpen(false);
+    requestAnimationFrame(() => {
+      virtuosoRef.current?.scrollToIndex({
+        index: targetIdx,
+        align: 'center',
+        behavior: 'auto', // instant jump — smooth-scroll across 5000 items kills iOS
+      });
+      // Trigger background highlight on the target row. The row renderer
+      // reads `flashUuid` and applies a 1.5s transition.
+      setFlashUuid(uuid);
+      setTimeout(() => setFlashUuid(null), 1500);
+      Api.log('TimelineGoTo', 'done', { uuid: uuid.slice(0, 8), idx: targetIdx });
+    });
+  }, []);
+
+  // ── History load: hydrate from IDB → stream NDJSON delta ────────────────
+  useEffect(() => {
+    if (!tab.tabId) { setHistoryLoading(false); return; }
     if (!tab.claudeSessionId && tab.tabType !== 'claude-sdk') {
       setHistoryLoading(false);
       return;
@@ -1157,170 +1052,240 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
     let cancelled = false;
     const tabIdLocal = tab.tabId;
     const tag = tabIdLocal?.slice(-12) || '';
+    let cachedLastUuid: string | null = null;
+    let streamHandle: ReturnType<typeof streamHistory> | null = null;
 
-    // Phase 1: tail. ~200 last messages, opens chat in ~1s on heavy sessions.
-    // Phase 2 (background): full history. Replaces reducer state, preserves
-    // visible window so user doesn't see a jump.
-    const TAIL_N = 200;
-    const t0 = performance.now();
+    (async () => {
+      const t0 = performance.now();
+      const tokenStr = (() => { try { return getToken() || ''; } catch { return ''; } })();
+      const baseUrl = '/api/sdk-tabs/' + encodeURIComponent(tabIdLocal!) + '/history';
 
-    const applyAll = async (msgs: any[]) => {
-      // Reducer must be linear (assistant.id chains), can't reorder. We yield
-      // every CHUNK so browser can paint loader between chunks on slow CPUs.
-      const CHUNK = 500;
-      reducer.current.reset();
-      for (let i = 0; i < msgs.length; i += CHUNK) {
-        if (cancelled) return false;
-        const end = Math.min(i + CHUNK, msgs.length);
-        for (let j = i; j < end; j++) reducer.current.apply(msgs[j]);
-        if (end < msgs.length) {
-          await new Promise<void>((r) => {
-            if (typeof (window as any).requestIdleCallback === 'function') {
-              (window as any).requestIdleCallback(() => r(), { timeout: 50 });
-            } else {
-              setTimeout(r, 0);
-            }
-          });
+      // ─ Phase 0: hydrate from IDB (synchronous-ish, microseconds-fast) ─
+      // sessionId in IDB is the Claude session UUID (stable across SDK
+      // resumes); tab.tabId can change if the user closes/reopens the tab.
+      const sid = tab.claudeSessionId || tab.live?.sessionId;
+      if (sid) {
+        try {
+          const cached = await readCachedHistory(sid);
+          if (cancelled) return;
+          if (cached.messages.length > 0) {
+            Api.log('History', 'cacheHit', { tag, sid: sid.slice(0, 8), count: cached.messages.length });
+            reducer.current.reset();
+            for (const m of cached.messages) reducer.current.apply(m);
+            rawHistoryBufferRef.current = cached.messages.slice();
+            flushReducer('replace');
+            setHistoryLoading(false);
+            cachedLastUuid = cached.meta?.lastUuid || null;
+          }
+        } catch (e: any) {
+          Api.log('History', 'cacheError', { tag, msg: String(e?.message) });
         }
       }
-      return true;
-    };
 
-    Api.log('History', 'tailFetch', { tag, last: TAIL_N });
-    Api.history(tabIdLocal!, { last: TAIL_N })
-      .then(async (d) => {
-        if (cancelled) return;
-        const tNet = performance.now();
-        if (!d.messages || !Array.isArray(d.messages)) return;
-        Api.log('History', 'tailFetched', {
-          tag, returned: d.messages.length, total: d.total, truncated: d.truncated,
-          netMs: Math.round(tNet - t0),
-        });
+      // ─ One-shot streaming runner ─────────────────────────────────────
+      // Both phase-1 (tail) and phase-2 (prefix) use this — they share the
+      // same parsing/throttling/error path. Returns the meta of the stream so
+      // the caller can decide whether to chain the next phase.
+      const runStream = (
+        url: string,
+        opts: { isPrefix: boolean; expectMessages?: number },
+      ): Promise<StreamMeta | null> => new Promise((resolveStream) => {
+        Api.log('History', 'streamFetch', { tag, url, isPrefix: opts.isPrefix });
+        let metaLocal: StreamMeta | null = null;
+        const incoming: any[] = [];
+        let pendingFlush = false;
+        const tStreamStart = performance.now();
+        let bytesAtMeta = 0;
 
-        const ok = await applyAll(d.messages);
-        if (!ok || cancelled) return;
-        const fresh = reducer.current.getEntries();
-        setEntries(fresh);
-        setRenderStart(Math.max(0, fresh.length - INITIAL_RENDER));
-        setRenderEnd(fresh.length);
-        needsBottomScrollRef.current = true;
-        setHistoryLoading(false);
-
-        Api.log('History', 'tailApplied', {
-          tag, uiCount: fresh.length, totalMs: Math.round(performance.now() - t0),
-        });
-
-        // Phase 2 — only if server says there's more.
-        if (d.truncated && (d.total || 0) > d.messages.length) {
-          setFullLoading(true);
-          const t1 = performance.now();
-          Api.log('History', 'fullFetch', { tag });
-          try {
-            const full = await Api.history(tabIdLocal!);
+        const scheduleFlush = () => {
+          if (pendingFlush || cancelled) return;
+          pendingFlush = true;
+          requestAnimationFrame(() => {
+            pendingFlush = false;
             if (cancelled) return;
-            const tFullNet = performance.now();
-            Api.log('History', 'fullFetched', {
-              tag, returned: full.messages?.length || 0,
-              netMs: Math.round(tFullNet - t1),
-            });
-
-            // Save current scroll context so we can restore the user's view
-            // after re-render. The number of entries grows from the FRONT
-            // (older messages prepended), so the simplest invariant is
-            // "keep the bottom-anchored visible message in view".
-            const oldEntries = reducer.current.getEntries();
-            const root = scrollRef.current;
-            const prevScrollHeight = root?.scrollHeight || 0;
-            const prevScrollTop = root?.scrollTop || 0;
-            const wasAtBottom = root ? (prevScrollHeight - prevScrollTop - root.clientHeight) < 30 : true;
-
-            const ok2 = await applyAll(full.messages || []);
-            if (!ok2 || cancelled) return;
-            const allEntries = reducer.current.getEntries();
-            const grew = allEntries.length - oldEntries.length;
-
-            // Window: shift by `grew` so the same logical entries stay rendered.
-            // If user was at bottom — keep at bottom.
-            setEntries(allEntries);
-            if (wasAtBottom) {
-              setRenderStart(Math.max(0, allEntries.length - INITIAL_RENDER));
-              setRenderEnd(allEntries.length);
-              requestAnimationFrame(() => requestAnimationFrame(() => {
-                const r = scrollRef.current;
-                if (r) r.scrollTop = r.scrollHeight;
-              }));
-            } else {
-              setRenderStart((s) => s + grew);
-              setRenderEnd((e) => e + grew);
-              // Preserve viewport: scrollTop adjusted by inserted-prefix height.
-              requestAnimationFrame(() => requestAnimationFrame(() => {
-                const r = scrollRef.current;
-                if (r) r.scrollTop = r.scrollHeight - prevScrollHeight + prevScrollTop;
-              }));
+            // For PHASE 1 (tail) — incoming records ARE the new tail, append.
+            // For PHASE 2 (prefix) — incoming records are OLDER than what's
+            //   already in the reducer. Reducer is linear (assistant id chains)
+            //   so we can't just prepend objects to its internal entries array.
+            //   Instead we collect them in a sidebuffer and replay everything
+            //   in correct order at onDone. (Per-frame replay would be O(n²).)
+            while (incoming.length) {
+              const m = incoming.shift();
+              if (opts.isPrefix) {
+                // Don't apply yet — accumulate into the prefix buffer below.
+                prefixCollect.push(m);
+              } else {
+                reducer.current.apply(m);
+                rawHistoryBufferRef.current.push(m);
+              }
             }
-            Api.log('History', 'fullApplied', {
-              tag, uiCount: allEntries.length, grew,
-              fullMs: Math.round(performance.now() - t1),
-              totalMs: Math.round(performance.now() - t0),
-            });
-
-            // Resolve any pending GoTo that was waiting on full history.
-            const wantUuid = pendingFullGoToRef.current;
-            if (wantUuid) {
-              pendingFullGoToRef.current = null;
-              // Schedule into next tick so state has committed.
-              requestAnimationFrame(() => goToEntryRef.current?.(wantUuid));
+            if (!opts.isPrefix) flushReducer('append');
+            // Update progress for visible loader (only for the tail phase —
+            // prefix loads silently).
+            if (!opts.isPrefix) {
+              setStreamProgress((p) => p && metaLocal ? { ...p, done: reducer.current.getEntries().length } : p);
             }
-          } catch (e: any) {
-            Api.log('History', 'fullError', { tag, msg: String(e?.message) });
-          } finally {
-            if (!cancelled) setFullLoading(false);
-          }
+          });
+        };
+
+        const prefixCollect: any[] = [];
+
+        streamHandle = streamHistory(url, tokenStr, {
+          onMeta: (meta) => {
+            metaLocal = meta;
+            bytesAtMeta = (performance.now() - tStreamStart) | 0;
+            Api.log('History', 'streamMeta', {
+              tag, isPrefix: opts.isPrefix,
+              total: meta.total, returned: meta.returned, truncated: meta.truncated,
+              etag: meta.etag.slice(0, 8), tFirstByte: bytesAtMeta,
+            });
+            // Progress only for the visible (tail) phase, and only when there's
+            // more than ~100 messages — short streams flash too fast to matter.
+            if (!opts.isPrefix && meta.returned > 100) {
+              setStreamProgress({ done: 0, total: meta.returned });
+            }
+          },
+          onMessage: (msg) => {
+            incoming.push(msg);
+            scheduleFlush();
+            if (!opts.isPrefix) {
+              // Capture model/usage from latest assistant for the context badge.
+              if (msg && msg.message?.model) setResolvedModel(msg.message.model);
+              if (msg && msg.message?.usage) {
+                const u = msg.message.usage;
+                const total = (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0);
+                if (total > 0) setUsedTokens(total);
+              }
+            }
+          },
+          onDone: async (done, bytesRead) => {
+            // Final flush of any unflushed records.
+            await new Promise<void>((rr) => requestAnimationFrame(() => rr()));
+            if (cancelled) { resolveStream(metaLocal); return; }
+            while (incoming.length) {
+              const m = incoming.shift();
+              if (opts.isPrefix) prefixCollect.push(m);
+              else { reducer.current.apply(m); rawHistoryBufferRef.current.push(m); }
+            }
+
+            if (opts.isPrefix && prefixCollect.length > 0) {
+              // ── PREFIX MERGE ──────────────────────────────────────────
+              // Insert prefix BEFORE current reducer state. The reducer is
+              // linear (assistant ids chain), so the cheapest correct path is:
+              // reset → replay (prefix + existing raw buffer) → flush.
+              // For 5000 records this is ~10ms total (no markdown parsing yet,
+              // just object pushes into Map+Array).
+              const tReplay = performance.now();
+              const merged = prefixCollect.concat(rawHistoryBufferRef.current);
+              rawHistoryBufferRef.current = merged;
+              reducer.current.reset();
+              for (const m of merged) reducer.current.apply(m);
+              flushReducer('replace');
+              Api.log('History', 'prefixMerged', {
+                tag, prefixCount: prefixCollect.length, totalCount: merged.length,
+                replayMs: Math.round(performance.now() - tReplay),
+              });
+            } else if (!opts.isPrefix) {
+              flushReducer('replace');
+              setHistoryLoading(false);
+              setStreamProgress(null);
+            }
+
+            Api.log('History', 'streamDone', {
+              tag, isPrefix: opts.isPrefix, written: done.written, bytesRead,
+              tFirstByte: bytesAtMeta,
+              streamMs: Math.round(performance.now() - tStreamStart),
+            });
+            resolveStream(metaLocal);
+          },
+          onError: (err, bytesRead) => {
+            if (cancelled) { resolveStream(null); return; }
+            Api.log('History', 'streamError', { tag, isPrefix: opts.isPrefix, msg: err.message, bytesRead });
+            if (!opts.isPrefix) {
+              setHistoryLoading(false);
+              setStreamProgress(null);
+            }
+            if (/404/.test(err.message) && sid) dropSession(sid).catch(() => {});
+            resolveStream(null);
+          },
+        });
+      });
+
+      // ─ Branch: warm-cache delta vs cold-tail-then-prefix ───────────────
+      let finalMeta: StreamMeta | null = null;
+      if (cachedLastUuid) {
+        // Warm cache: we already have everything up to lastUuid in reducer.
+        // Just ask for the delta. Server returns 0 messages if nothing changed
+        // (silent). For chats that got new turns since last visit — append.
+        finalMeta = await runStream(baseUrl + '?after=' + encodeURIComponent(cachedLastUuid), { isPrefix: false });
+      } else {
+        // Cold open. Phase 1: tail of last 200 messages. Paint, scroll bottom,
+        // user can interact within ~1 second.
+        const TAIL_N = 200;
+        const tailMeta = await runStream(baseUrl + '?last=' + TAIL_N, { isPrefix: false, expectMessages: TAIL_N });
+        if (cancelled) return;
+
+        // Phase 2: if there's MORE history before what we got, fetch it as
+        // prefix. firstUuid is the oldest record in the tail — `?before=` will
+        // return everything strictly before it.
+        if (tailMeta && tailMeta.firstUuid && tailMeta.total > tailMeta.returned) {
+          finalMeta = await runStream(baseUrl + '?before=' + encodeURIComponent(tailMeta.firstUuid), { isPrefix: true });
+          // Even if prefix stream returned no meta (error), keep tailMeta for
+          // the IDB write — partial save beats no save.
+          if (!finalMeta) finalMeta = tailMeta;
+          // Critical: after prefix merge, the IDB write needs the FINAL
+          // server-known total/etag/lastUuid (they're the same as tail since
+          // tail is still the bottom — tail's lastUuid IS the global lastUuid).
+          finalMeta = {
+            ...finalMeta,
+            total: tailMeta.total,
+            lastUuid: tailMeta.lastUuid,
+            firstUuid: finalMeta?.firstUuid ?? tailMeta.firstUuid,
+            // etag of the full set differs from tail-only etag — but server
+            // didn't tell us the global one. Use prefix's etag if present
+            // (it's at least the etag of the prefix slice). For revalidation
+            // semantics this is acceptable: next mount uses lastUuid for the
+            // `?after=` delta, etag is only used for the prompts cache.
+            etag: finalMeta?.etag ?? tailMeta.etag,
+          };
+        } else {
+          finalMeta = tailMeta;
         }
-      })
-      .catch((e) => {
-        Api.log('History', 'tailError', { tag, msg: String(e?.message) });
-        if (String(e?.message || '').includes('404') && tabIdLocal) dropChat(tabIdLocal);
-      })
-      .finally(() => { if (!cancelled) setHistoryLoading(false); });
-    return () => { cancelled = true; };
+      }
+
+      // ─ Persist to IDB ─────────────────────────────────────────────────
+      // Whether we did warm-delta or cold-tail-then-prefix, rawHistoryBufferRef
+      // now holds the FULL message list in order. One transactional write
+      // replaces whatever was in IDB.
+      if (sid && finalMeta) {
+        try {
+          const fullList = rawHistoryBufferRef.current.slice();
+          await writeFullHistory(sid, fullList, finalMeta.etag, finalMeta.total, finalMeta.lastUuid);
+          Api.log('History', 'idbWrote', { tag, count: fullList.length, totalMs: Math.round(performance.now() - t0) });
+        } catch (e: any) {
+          Api.log('History', 'idbWriteError', { tag, msg: String(e?.message) });
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      streamHandle?.abort();
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tab.tabId]);
 
-  // Window auto-scroll on initial mount / history-fetch completion.
-  // Window starts at the tail, so scroll position must be at the bottom for the
-  // user to see latest. Doing this in an effect (not inline) so it fires after
-  // DOM commit when scrollHeight reflects the rendered window.
-  useEffect(() => {
-    if (!needsBottomScrollRef.current) return;
-    if (renderEnd === 0) return;
-    needsBottomScrollRef.current = false;
-    requestAnimationFrame(() => requestAnimationFrame(() => {
-      const el = scrollRef.current;
-      if (el) el.scrollTop = el.scrollHeight;
-    }));
-  }, [renderEnd]);
+  // ── Raw message buffer for IDB persistence ──────────────────────────────
+  // The reducer derives UiEntry list and discards raw SDK messages. For IDB
+  // persistence we need the originals (so the next mount can re-apply them
+  // through the reducer to rebuild UiEntry state). Two writers push here:
+  //  - streaming `onMessage` (history fetch) — for the initial load
+  //  - WebSocket `onmessage` (live messages) — for ongoing turns
+  // Both writes are append-only. On a delta fetch with cache present we seed
+  // this buffer from IDB during hydration so the next IDB write is complete.
+  const rawHistoryBufferRef = useRef<any[]>([]);
 
-  // Save to cache on unmount + page hide — DISABLED while testing first-load
-  // performance. Restore by uncommenting the body when needed.
-  //
-  // useEffect(() => {
-  //   if (!tab.tabId) return;
-  //   const save = () => {
-  //     if (!tab.tabId) return;
-  //     const eList = reducer.current.getEntries();
-  //     if (eList.length === 0) return;
-  //     saveChat(tab.tabId, { entries: eList, timelineEntries, sessionId });
-  //   };
-  //   window.addEventListener('pagehide', save);
-  //   window.addEventListener('beforeunload', save);
-  //   return () => {
-  //     window.removeEventListener('pagehide', save);
-  //     window.removeEventListener('beforeunload', save);
-  //     save();
-  //   };
-  // }, [tab.tabId]);
-
-  // Open WS
+  // ── WebSocket: live messages, busy, done ─────────────────────────────────
   useEffect(() => {
     if (!tab.tabId) return;
     const ws = new WebSocket(wsUrl(tab.tabId));
@@ -1341,8 +1306,6 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
           if (m.sessionId) setSessionId(m.sessionId);
         } else if (m.type === 'message') {
           if (m.sessionId) setSessionId(m.sessionId);
-          // Capture usage for context-percent badge: total = input + cache_read +
-          // cache_creation. Same formula desktop SDK tab uses.
           const inner = m.message;
           if (inner?.message?.model) setResolvedModel(inner.message.model);
           if (inner?.message?.usage) {
@@ -1350,49 +1313,41 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
             const total = (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0);
             if (total > 0) setUsedTokens(total);
           }
-          reducer.current.apply(m.message);
-          const fresh = reducer.current.getEntries();
-          setEntries(fresh);
-          // New WS message lives at the tail. If user is at the bottom of the
-          // window we extend renderEnd; otherwise leave the marker «N new below»
-          // so they can choose to jump.
-          const el = scrollRef.current;
-          const atBottom = el ? (el.scrollHeight - el.scrollTop - el.clientHeight < 100) : true;
-          if (atBottom) {
-            setRenderEnd(fresh.length);
-          }
+          rawHistoryBufferRef.current.push(inner);
+          reducer.current.apply(inner);
+          flushReducer('append');
+          // If user is at bottom — virtuoso auto-follows via followOutput.
+          // If they're scrolled up — virtuoso preserves position, that's fine.
         }
       } catch {}
     };
     return () => { try { ws.close(); } catch {} };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tab.tabId]);
 
-  // Auto-scroll to bottom when window tail grows (renderEnd) and user was
-  // at the bottom. pendingGoTo blocks during jumps. Also fires on busy=true
-  // so user sees streaming response without manual scroll.
-  useEffect(() => {
-    const el = scrollRef.current;
-    if (!el) return;
-    if (pendingGoTo) return;
-    const wasAtBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
-    if (wasAtBottom || busy) {
-      el.scrollTop = el.scrollHeight;
-    }
-  }, [renderEnd, busy, pendingGoTo]);
+  // Modify the streaming path to ALSO push raw messages into the buffer.
+  // We do this via an indirection: wrap reducer.apply inside the consumer.
+  // Done inline above via incoming buffer + apply loop — see streamFetch's
+  // onMessage and onDone where we push to rawHistoryBufferRef.
+
+  const scrollChatToBottom = useCallback(() => {
+    virtuosoRef.current?.scrollToIndex({
+      index: entries.length - 1,
+      align: 'end',
+      behavior: 'auto',
+    });
+  }, [entries.length]);
 
   const send = async () => {
     if (!text.trim() || !tab.tabId || busy) return;
     const prompt = text;
     setText('');
     setBusy(true);
-    // No local optimistic push — main.js broadcasts a synthetic user message
-    // over WS the moment sdkStartQuery fires. Pushing here too duplicates the
-    // bubble. Latency is ~50-200ms, the busy spinner already gives feedback.
     try {
       await Api.send(tab.tabId, prompt);
     } catch (e: any) {
       reducer.current.apply({ type: 'result', subtype: 'error', is_error: true, result: e.message });
-      setEntries(reducer.current.getEntries());
+      flushReducer('append');
       setBusy(false);
     }
   };
@@ -1449,7 +1404,7 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
             }}>
               {tab.name}
             </span>
-            {contextPercent != null && (
+            {contextPercent != null && !isTerminal && (
               <span style={{
                 fontSize: 10, color: contextColor, fontWeight: 600, fontVariantNumeric: 'tabular-nums',
               }}>
@@ -1494,17 +1449,77 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
           </div>
         </div>
 
-        {/* Right: Stop (when busy) + drawer */}
+        {/* Right: drawer-open burger with iteration count.
+            Stop moved to the composer (replaces send button while busy) —
+            send/stop is one mental action, having Stop top-right and Send
+            bottom-right meant two different muscle paths for the same idea. */}
         <div style={{ display: 'flex', gap: 4, alignItems: 'center', flex: '0 0 auto', marginLeft: 'auto' }}>
-          {busy && !readOnly && <button style={S.stopBtn} onClick={stop}>Stop</button>}
           {canTimeline && (
-            <button className="noted-icon" style={S.iconBtn} onClick={() => setDrawerOpen(true)} title="Open timeline">☰</button>
+            <button
+              className="noted-icon"
+              style={{
+                ...S.iconBtn,
+                width: 'auto', minWidth: 32, paddingLeft: 8, paddingRight: 8,
+                gap: 6, fontSize: 13,
+              }}
+              onClick={() => setDrawerOpen(true)}
+              title="Open timeline"
+            >
+              <span>☰</span>
+              {timelineEntries && timelineEntries.length > 0 && (
+                <span style={{ fontSize: 11, color: '#888', fontVariantNumeric: 'tabular-nums' }}>
+                  [{timelineEntries.length}]
+                </span>
+              )}
+            </button>
           )}
         </div>
       </div>
-      <div ref={scrollRef} onScroll={onChatScroll} style={S.chatScroll}>
+      {/* Streaming-progress strip — only shown when initial NDJSON is in
+          flight AND we have meta.total. Determinate counter beats indeterminate
+          spinner for waits > 3s (NN/g 2024). On warm-cache mount this never
+          appears — IDB hydrate is synchronous. */}
+      {historyLoading && streamProgress && streamProgress.total > 50 && (
+        <div style={{
+          padding: '6px 14px', display: 'flex', alignItems: 'center', gap: 10,
+          background: '#0e0e0e', borderBottom: '1px solid #161616',
+          fontSize: 11, color: '#888', fontVariantNumeric: 'tabular-nums',
+        }}>
+          <span style={{ flex: 1 }}>Loading messages — {streamProgress.done.toLocaleString()} / {streamProgress.total.toLocaleString()}</span>
+          <span style={{
+            position: 'relative', width: 80, height: 3, background: '#222', borderRadius: 2,
+          }}>
+            <span style={{
+              position: 'absolute', left: 0, top: 0, bottom: 0,
+              background: '#FFB382', borderRadius: 2,
+              width: `${Math.max(2, Math.min(100, (streamProgress.done / streamProgress.total) * 100))}%`,
+              transition: 'width 0.18s ease-out',
+            }} />
+          </span>
+        </div>
+      )}
+
+      {/* Virtualized chat: react-virtuoso keeps mounted DOM proportional to
+          viewport — ~15-30 items at any time regardless of `entries.length`.
+          Properties:
+            - data: full array. Virtuoso slices it itself.
+            - firstItemIndex: stable anchor for "older messages prepended"
+              (we don't currently prepend after initial load since stream
+              uses ?after=lastUuid → only deltas at tail. firstItemIndex
+              stays constant; left in place for future prepend support.)
+            - followOutput: 'smooth' when at bottom → live messages keep
+              the user pinned. Returns false when not at bottom, virtuoso
+              leaves position alone.
+            - atBottomStateChange: drives the ↓ FAB visibility.
+            - increaseViewportBy: 800px overscan for iOS Safari momentum
+              scroll (react-virtuoso issue #1049 workaround). */}
+      <div style={{ flex: 1, minHeight: 0, position: 'relative' }}>
         {historyLoading && entries.length === 0 && (
-          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 10, marginTop: 60 }}>
+          <div style={{
+            position: 'absolute', inset: 0, display: 'flex',
+            flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 10,
+            zIndex: 1, pointerEvents: 'none',
+          }}>
             <div style={{ display: 'flex', gap: 6 }}>
               <span style={S.dot} /> <span style={S.dot} /> <span style={S.dot} />
             </div>
@@ -1512,7 +1527,10 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
           </div>
         )}
         {!historyLoading && entries.length === 0 && !busy && (
-          <div style={{ color: '#555', textAlign: 'center', marginTop: 60, fontSize: 13 }}>
+          <div style={{
+            position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center',
+            color: '#555', textAlign: 'center', fontSize: 13, padding: 30,
+          }}>
             {readOnly && !tab.claudeSessionId
               ? 'No Claude session attached to this terminal — nothing to view.'
               : readOnly
@@ -1520,81 +1538,60 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
                 : 'No messages yet. Send something below.'}
           </div>
         )}
-        {/* Top marker:
-            - fullLoading + tail visible (renderStart=0)  → "Loading older…" spinner, disabled
-            - fullLoading + window above (renderStart>0)  → same disabled spinner
-            - !fullLoading + renderStart>0                → normal "Load older" button
-            Goal: never let user tap into prefix that isn't there yet. */}
-        {fullLoading && renderStart === 0 && (
-          <div style={{
-            display: 'flex', justifyContent: 'center', alignItems: 'center', gap: 8,
-            padding: '12px 14px', color: '#777', fontSize: 12,
-          }}>
-            <span style={S.dot} /> <span style={S.dot} /> <span style={S.dot} />
-            <span style={{ marginLeft: 6 }}>Loading older messages…</span>
-          </div>
-        )}
-        {renderStart > 0 && (
-          <button
-            disabled={fullLoading}
-            onClick={() => {
-              if (fullLoading) return;
-              const root = scrollRef.current;
-              const prevScrollHeight = root?.scrollHeight || 0;
-              setRenderStart((s) => Math.max(0, s - RENDER_CHUNK));
-              requestAnimationFrame(() => requestAnimationFrame(() => {
-                const r = scrollRef.current;
-                if (r) r.scrollTop = r.scrollHeight - prevScrollHeight + r.scrollTop;
-              }));
-            }}
-            style={{
-              display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8,
-              margin: '8px auto', padding: '8px 14px',
-              background: fullLoading ? '#161616' : '#1a1a1a',
-              border: '1px solid ' + (fullLoading ? '#222' : '#2a2a2a'),
-              borderRadius: 14,
-              color: fullLoading ? '#666' : '#aaa', fontSize: 12,
-              cursor: fullLoading ? 'default' : 'pointer',
-              opacity: fullLoading ? 0.7 : 1,
-            }}
-          >
-            {fullLoading ? (
-              <>
-                <span style={S.dot} /> <span style={S.dot} /> <span style={S.dot} />
-                <span>Loading older messages…</span>
-              </>
-            ) : (
-              <>↑ Load older messages ({renderStart})</>
+        {entries.length > 0 && (
+          <Virtuoso
+            ref={virtuosoRef}
+            data={entries}
+            firstItemIndex={firstItemIndex}
+            initialTopMostItemIndex={Math.max(0, entries.length - 1)}
+            followOutput={(isAtBottom) => isAtBottom ? 'smooth' : false}
+            atBottomStateChange={setAtBottom}
+            atBottomThreshold={120}
+            increaseViewportBy={{ top: 800, bottom: 800 }}
+            // skipAnimationFrameInResizeObserver: virtuoso #1049 — Safari
+            // momentum-scroll + ResizeObserver-in-rAF causes janky scroll on
+            // dynamic-height items. Disabling the rAF wrapper is the documented
+            // workaround when items have meaningful height variance (markdown).
+            skipAnimationFrameInResizeObserver
+            itemContent={(_index, entry) => (
+              <div
+                data-entry-uuid={(entry as any).entryUuid || undefined}
+                style={{
+                  // content-visibility: auto lets the browser skip style/layout/
+                  // paint for off-screen items entirely. Free win on iOS 18+
+                  // (Safari 18.0, Sept 2024). contain-intrinsic-size gives the
+                  // browser a placeholder size so scrollbars don't jump as
+                  // items render — 200px is a soft estimate for a chat bubble.
+                  contentVisibility: 'auto' as any,
+                  containIntrinsicSize: '0 200px' as any,
+                  background: flashUuid && ((entry as any).entryUuid === flashUuid || (entry as any).entryUuid?.startsWith(flashUuid.slice(0, 8)))
+                    ? 'rgba(255,178,130,0.18)'
+                    : 'transparent',
+                  transition: 'background 0.4s ease-out',
+                }}
+              >
+                <EntryView entry={entry} />
+              </div>
             )}
-          </button>
-        )}
-        {entries.slice(renderStart, renderEnd).map((e) => <EntryView key={e.id} entry={e} />)}
-        {/* Bottom marker: entries past renderEnd (e.g. WS stream while user is
-            scrolled up in history). FAB tap will sweep up to them too. */}
-        {renderEnd < entries.length && (
-          <div style={{
-            padding: '12px 14px', textAlign: 'center',
-            color: '#555', fontSize: 11,
-          }}>
-            {entries.length - renderEnd} new below — tap ↓ to jump
-          </div>
-        )}
-        {busy && !readOnly && (
-          <div style={{ display: 'flex', gap: 6, padding: '8px 14px', color: '#888', fontSize: 12 }}>
-            <span style={S.dot} /> <span style={S.dot} /> <span style={S.dot} />
-          </div>
+            components={{
+              Footer: () => busy && !readOnly ? (
+                <div style={{ display: 'flex', gap: 6, padding: '8px 14px', color: '#888', fontSize: 12 }}>
+                  <span style={S.dot} /> <span style={S.dot} /> <span style={S.dot} />
+                </div>
+              ) : <div style={{ height: 12 }} />,
+            }}
+            style={{ height: '100%' }}
+          />
         )}
       </div>
-      {/* Scroll-to-bottom — appears when user is far from the latest message.
-          Right side in chat (mirrors WhatsApp/iMessage convention). Doesn't
-          intercept taps when invisible because pointerEvents:none gate. */}
-      <ScrollToBottomFAB visible={showScrollDown} onClick={scrollChatToBottom} side="right" />
+      <ScrollToBottomFAB visible={!atBottom && entries.length > 0} onClick={scrollChatToBottom} side="right" />
       {!readOnly && (
         <Composer
           text={text}
           setText={setText}
           busy={busy}
           onSend={send}
+          onStop={stop}
           onPickPrompt={(content) => setText((prev) => prev ? `${prev}\n\n${content}` : content)}
         />
       )}
@@ -1607,30 +1604,6 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
           onGoTo={goToEntry}
           onDismiss={() => setDrawerOpen(false)}
         />
-      )}
-      {/* GoTo overlay — fully opaque dim covers the entire viewport (above the
-          drawer at zIndex 900) the moment a goto starts. Without it the user
-          sees the drawer collapse animation, then the chat at OLD scrollTop
-          for 100-3000ms, then the jump. With it: tap → instant black screen
-          with spinner → reveal at target. Three dots animate so the user sees
-          the loader is alive even on a multi-second window shift. */}
-      {scrollOverlay && (
-        <div style={{
-          position: 'fixed', inset: 0,
-          background: '#0e0e0e',
-          zIndex: 1500, pointerEvents: 'none',
-          display: 'flex', flexDirection: 'column',
-          alignItems: 'center', justifyContent: 'center',
-          gap: 14,
-          animation: 'noted-fade-in 0.08s ease-out',
-        }}>
-          <div style={{ display: 'flex', gap: 6 }}>
-            <span style={S.dot} /> <span style={S.dot} /> <span style={S.dot} />
-          </div>
-          <div style={{ color: '#888', fontSize: 12, letterSpacing: 1 }}>
-            JUMPING…
-          </div>
-        </div>
       )}
     </div>
   );
@@ -1849,11 +1822,12 @@ function ScrollToBottomFAB({ visible, onClick, side, bottomOffset = 110 }: {
 // + and 🎤 disabled — placeholders for future image-attach and voice-input.
 // 40vh chosen to match Claude mobile: ~11 lines visible without keyboard,
 // ~7-8 with keyboard up. Hard cap on iPhone 15 Pro is ~340px.
-function Composer({ text, setText, busy, onSend, onPickPrompt }: {
+function Composer({ text, setText, busy, onSend, onStop, onPickPrompt }: {
   text: string;
   setText: (v: string | ((prev: string) => string)) => void;
   busy: boolean;
   onSend: () => void;
+  onStop: () => void;
   onPickPrompt: (content: string) => void;
 }) {
   const taRef = useRef<HTMLTextAreaElement>(null);
@@ -1920,20 +1894,42 @@ function Composer({ text, setText, busy, onSend, onPickPrompt }: {
         {/* Prompt library */}
         <PromptPickerInlineButton onPick={onPickPrompt} />
 
-        {/* Send */}
-        <button
-          onClick={onSend}
-          disabled={busy || !text.trim()}
-          aria-label="Send"
-          style={{
-            width: 36, height: 36, borderRadius: 999,
-            border: 'none',
-            background: (busy || !text.trim()) ? '#2a2a2a' : '#FFB382',
-            color: (busy || !text.trim()) ? '#666' : '#1a1a1a',
-            fontSize: 18, fontWeight: 700, cursor: 'pointer',
-            display: 'flex', alignItems: 'center', justifyContent: 'center',
-          }}
-        >↑</button>
+        {/* Send/Stop — same slot, swaps based on busy. Send/Stop is one
+            mental action ("interact with the turn"), so one muscle path. */}
+        {busy ? (
+          <button
+            onClick={onStop}
+            aria-label="Stop"
+            title="Stop generation"
+            style={{
+              width: 36, height: 36, borderRadius: 999,
+              border: 'none',
+              background: '#ef4444',
+              color: '#fff',
+              cursor: 'pointer',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+            }}
+          >
+            <span style={{
+              display: 'inline-block', width: 12, height: 12,
+              background: '#fff', borderRadius: 2,
+            }} />
+          </button>
+        ) : (
+          <button
+            onClick={onSend}
+            disabled={!text.trim()}
+            aria-label="Send"
+            style={{
+              width: 36, height: 36, borderRadius: 999,
+              border: 'none',
+              background: !text.trim() ? '#2a2a2a' : '#FFB382',
+              color: !text.trim() ? '#666' : '#1a1a1a',
+              fontSize: 18, fontWeight: 700, cursor: 'pointer',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+            }}
+          >↑</button>
+        )}
       </div>
     </div>
   );

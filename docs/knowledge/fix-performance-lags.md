@@ -233,5 +233,5 @@ grep "DB:ForkCache" ~/Library/Logs/noted-terminal/production.log | tail -3
 
 ## См. также
 - [`fact-backtrace-jsonl.md`](fact-backtrace-jsonl.md) — детали инкрементального чтения.
-- [`fact-react-patterns.md`](fact-react-patterns.md) — паттерн гранулярных селекторов.
+- [`../methodology/react.md`](../methodology/react.md) — паттерн гранулярных селекторов.
 - [`fact-timeline.md`](fact-timeline.md) — оптимизация поллинга.
