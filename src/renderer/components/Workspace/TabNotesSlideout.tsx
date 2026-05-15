@@ -5,6 +5,7 @@ import { MarkdownEditor } from '@gt-editor/markdown-editor';
 import '@gt-editor/markdown-editor/styles.css';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
+import { generateAITitle } from '../../utils/generateAITitle';
 
 interface TabNotesSlideoutProps {
   // Per-tab open state — derived from useUIStore.notesPanelOpenTabs[activeTabId].
@@ -32,6 +33,8 @@ export default function TabNotesSlideout({ activeTabId }: TabNotesSlideoutProps)
   const setNotesPanelOpen = useUIStore((s) => s.setNotesPanelOpen);
   const notesPanelSize = useUIStore((s) => s.notesPanelSize);
   const setNotesPanelSize = useUIStore((s) => s.setNotesPanelSize);
+  const notesPanelOffsetY = useUIStore((s) => s.notesPanelOffsetY);
+  const setNotesPanelOffsetY = useUIStore((s) => s.setNotesPanelOffsetY);
   const wordWrap = useUIStore((s) => s.wordWrap);
   const notesEditorFontSize = useUIStore((s) => s.notesEditorFontSize);
   const notesEditorPaddingX = useUIStore((s) => s.notesEditorPaddingX);
@@ -53,6 +56,7 @@ export default function TabNotesSlideout({ activeTabId }: TabNotesSlideoutProps)
   });
 
   const handleChange = useCallback((next: string) => {
+    console.warn('[TabNotesSlideout:onChange]', { tabId: activeTabId?.slice(-12), newLen: next.length });
     if (activeTabId) setTabNotes(activeTabId, next);
   }, [activeTabId, setTabNotes]);
 
@@ -85,93 +89,107 @@ export default function TabNotesSlideout({ activeTabId }: TabNotesSlideoutProps)
     };
   }, [isOpen]);
 
-  // topOverride: null = vertically centred relative to viewport. After user drags
-  // the right-edge vertical handle, this becomes the locked top coord. Reset on
-  // window resize when the locked top would push the panel out of the viewport.
-  const [topOverride, setTopOverride] = useState<number | null>(null);
+  // Anchor по нижнему краю модалки — экранная Y нижней кромки кнопки `[data-tab-notes-open-trigger]`.
+  // При vertical resize окна (тянем верхний край) кнопка Open остаётся на месте (она в нижней части
+  // правой InfoPanel'и, которая flex'ом укорачивается сверху). Значит и нижний край модалки
+  // привязанный к Open будет на месте.
+  const [anchorBottomY, setAnchorBottomY] = useState<number | null>(null);
+  useEffect(() => {
+    if (!isOpen) return;
+    const measure = () => {
+      const btn = document.querySelector('[data-tab-notes-open-trigger]') as HTMLElement | null;
+      if (!btn) { setAnchorBottomY(null); return; }
+      const r = btn.getBoundingClientRect();
+      setAnchorBottomY(r.bottom);
+    };
+    measure();
+    window.addEventListener('resize', measure);
+    // Только кнопка — не `document.body`. Body-observer стрелял на любое движение
+    // модалки (она в Portal внутри body) → measure → setState → re-render → drag handler
+    // получал новые координаты под собой → дёрганый drag. Кнопки достаточно: её
+    // bounding rect меняется при window resize и при ресайзе соседних панелей.
+    const ro = new ResizeObserver(measure);
+    const btn = document.querySelector('[data-tab-notes-open-trigger]');
+    if (btn) ro.observe(btn);
+    return () => {
+      window.removeEventListener('resize', measure);
+      ro.disconnect();
+    };
+  }, [isOpen]);
 
-  // Resize drag — separate edges:
-  //   left   → width (right edge stays anchored to InfoPanel)
-  //   top    → height grows upward, bottom stays where it is
-  //   bottom → height grows downward, top stays where it is
-  //   right  → vertical-only position drag (the "tail" handle on the right edge)
-  // All listeners live on window so motion outside the handle still tracks.
+  // Live preview state — drag пишет сюда, store обновляется один раз на mouseup.
+  // Раньше каждый mousemove делал setNotesPanelSize / setNotesPanelOffsetY → запись в
+  // localStorage + IPC `app:setState` → SQLite на каждом кадре. 60 sync writes/sec вызывали
+  // дёрганый drag. Теперь store-флушинг происходит при отпускании мыши.
+  const [dragPreview, setDragPreview] = useState<{ w: number; h: number; offsetY: number } | null>(null);
+
   type ResizeEdge = 'left' | 'top' | 'bottom' | 'right-move' | 'corner-bl' | 'corner-br';
   const dragRef = useRef<null | {
     edge: ResizeEdge;
     startX: number; startY: number;
     startW: number; startH: number;
     startTop: number;
+    startOffsetY: number;
   }>(null);
   const startResize = useCallback((edge: ResizeEdge, e: React.MouseEvent) => {
     e.preventDefault();
     e.stopPropagation();
     const panelRect = (e.currentTarget as HTMLElement).closest('[data-tab-notes-slideout]')?.getBoundingClientRect();
-    const curTop = panelRect ? panelRect.top : (window.innerHeight - notesPanelSize.height) / 2;
+    const curTop = panelRect ? panelRect.top : 0;
     dragRef.current = {
       edge,
       startX: e.clientX, startY: e.clientY,
       startW: notesPanelSize.width, startH: notesPanelSize.height,
       startTop: curTop,
+      startOffsetY: notesPanelOffsetY,
     };
-
-    // Symmetric vertical resize: drag delta `dy` expands BOTH top and bottom
-    // simultaneously, anchored to the panel's current centre. Bottom edge → +dy
-    // grows down + up. Top edge → -dy grows up + down. Effective height changes
-    // by 2*dy in the direction the user is pulling.
-    const applySymmetricHeight = (dy: number, d: NonNullable<typeof dragRef.current>, bottomDir: boolean) => {
-      const vh = window.innerHeight;
-      const startCentre = d.startTop + d.startH / 2;
-      // bottomDir=true: drag down → newH = startH + 2*dy
-      // bottomDir=false (top edge): drag up means dy<0 → newH = startH - 2*dy
-      const rawDelta = bottomDir ? 2 * dy : -2 * dy;
-      // Constrain so neither top nor bottom escapes the viewport.
-      const maxFromTop = (startCentre - MARGIN) * 2;
-      const maxFromBottom = (vh - MARGIN - startCentre) * 2;
-      const maxH = Math.min(MAX_H, maxFromTop, maxFromBottom);
-      const newH = Math.max(MIN_H, Math.min(maxH, d.startH + rawDelta));
-      const newTop = startCentre - newH / 2;
-      setTopOverride(newTop);
-      return newH;
-    };
+    // Инициализируем preview текущими значениями.
+    setDragPreview({ w: notesPanelSize.width, h: notesPanelSize.height, offsetY: notesPanelOffsetY });
 
     const onMove = (ev: MouseEvent) => {
       const d = dragRef.current;
       if (!d) return;
       const dx = ev.clientX - d.startX;
       const dy = ev.clientY - d.startY;
-      const vh = window.innerHeight;
+
+      let nextW = d.startW;
+      let nextH = d.startH;
+      let nextOffsetY = d.startOffsetY;
 
       if (d.edge === 'left') {
-        const newW = Math.max(MIN_W, Math.min(MAX_W, d.startW - dx));
-        setNotesPanelSize({ width: newW, height: notesPanelSize.height });
+        nextW = Math.max(MIN_W, Math.min(MAX_W, d.startW - dx));
       } else if (d.edge === 'top') {
-        const newH = applySymmetricHeight(dy, d, false);
-        setNotesPanelSize({ width: notesPanelSize.width, height: newH });
+        nextH = Math.max(MIN_H, Math.min(MAX_H, d.startH - dy));
       } else if (d.edge === 'bottom') {
-        const newH = applySymmetricHeight(dy, d, true);
-        setNotesPanelSize({ width: notesPanelSize.width, height: newH });
+        nextH = Math.max(MIN_H, Math.min(MAX_H, d.startH + dy));
       } else if (d.edge === 'right-move') {
-        const newTop = Math.max(MARGIN, Math.min(vh - d.startH - MARGIN, d.startTop + dy));
-        setTopOverride(newTop);
+        nextOffsetY = d.startOffsetY + dy;
       } else if (d.edge === 'corner-bl' || d.edge === 'corner-br') {
-        // Corners: height grows symmetrically (same as bottom-edge math) AND
-        // width grows when cursor moves LEFT (right edge is anchored to InfoPanel,
-        // so width can only expand leftward). Both corners use the same dx rule
-        // because the right edge is fixed — pulling left is the only way to grow.
-        const newH = applySymmetricHeight(dy, d, true);
-        const newW = Math.max(MIN_W, Math.min(MAX_W, d.startW - dx));
-        setNotesPanelSize({ width: newW, height: newH });
+        nextH = Math.max(MIN_H, Math.min(MAX_H, d.startH + dy));
+        nextW = Math.max(MIN_W, Math.min(MAX_W, d.startW - dx));
       }
+      setDragPreview({ w: nextW, h: nextH, offsetY: nextOffsetY });
     };
     const onUp = () => {
+      // Финальный flush в store (localStorage + SQLite). Один раз, на отпускании.
+      setDragPreview((prev) => {
+        if (prev) {
+          if (prev.w !== notesPanelSize.width || prev.h !== notesPanelSize.height) {
+            setNotesPanelSize({ width: prev.w, height: prev.h });
+          }
+          if (prev.offsetY !== notesPanelOffsetY) {
+            setNotesPanelOffsetY(prev.offsetY);
+          }
+        }
+        return null;
+      });
       dragRef.current = null;
       window.removeEventListener('mousemove', onMove);
       window.removeEventListener('mouseup', onUp);
     };
     window.addEventListener('mousemove', onMove);
     window.addEventListener('mouseup', onUp);
-  }, [notesPanelSize, setNotesPanelSize]);
+  }, [notesPanelSize, setNotesPanelSize, notesPanelOffsetY, setNotesPanelOffsetY]);
 
   // Esc closes. Click-outside also closes — but only if the click is OUTSIDE
   // both the panel itself and the Open trigger button (the trigger has its own
@@ -207,22 +225,30 @@ export default function TabNotesSlideout({ activeTabId }: TabNotesSlideoutProps)
 
   if (!activeTabId) return null;
 
+  // Во время drag'а читаем из live preview, иначе — из store. Без preview флушинг store на
+  // каждый mousemove делал drag дёрганым (см. dragPreview comment выше).
+  const effectiveW = dragPreview ? dragPreview.w : notesPanelSize.width;
+  const effectiveH = dragPreview ? dragPreview.h : notesPanelSize.height;
+  const effectiveOffsetY = dragPreview ? dragPreview.offsetY : notesPanelOffsetY;
+
   // Clamp size to viewport every render so a previously-saved-bigger size
   // doesn't bleed past the screen when the window shrinks.
   const vw = window.innerWidth;
   const vh = window.innerHeight;
   const availableW = Math.max(MIN_W, vw - anchorRight - MARGIN);
-  const w = Math.min(notesPanelSize.width, availableW);
-  const h = Math.min(notesPanelSize.height, vh - MARGIN * 2);
-  // Vertical position: user-locked override OR centred. Always clamped to viewport.
+  const w = Math.min(effectiveW, availableW);
+  const h = Math.min(effectiveH, vh - MARGIN * 2);
+  // Vertical position: anchored to bottom edge of the Open trigger button, then shifted
+  // by `effectiveOffsetY` (user drag of the right-edge handle). Низ модалки = anchorBottomY + offsetY.
   let top: number;
-  if (topOverride !== null) {
-    top = Math.max(MARGIN, Math.min(topOverride, vh - h - MARGIN));
+  if (anchorBottomY !== null) {
+    top = anchorBottomY - h + effectiveOffsetY;
   } else {
-    top = (vh - h) / 2;
-    if (top < MARGIN) top = MARGIN;
-    if (top + h > vh - MARGIN) top = vh - h - MARGIN;
+    top = (vh - h) / 2 + effectiveOffsetY;
   }
+  // Clamp в viewport — модалка не должна вылезать за края экрана.
+  if (top < MARGIN) top = MARGIN;
+  if (top + h > vh - MARGIN) top = vh - h - MARGIN;
 
   return createPortal(
     <AnimatePresence>
@@ -273,9 +299,9 @@ export default function TabNotesSlideout({ activeTabId }: TabNotesSlideoutProps)
             onMouseEnter={(e) => { (e.currentTarget as HTMLDivElement).style.backgroundColor = 'rgba(99,102,241,0.4)'; }}
             onMouseLeave={(e) => { (e.currentTarget as HTMLDivElement).style.backgroundColor = ''; }}
           />
-          {/* Right edge — vertical-only reposition. dx ignored, dy moves the
-              whole panel up/down. The cursor stays `ns-resize` so users feel the
-              vertical-only affordance. Sits flush with the InfoPanel left edge. */}
+          {/* Right edge — vertical drag handle. dx игнорируем, dy меняет offsetY (смещение
+              всей модалки от anchor'а Open). offsetY персистится в SQLite, позиция сохраняется
+              между запусками приложения. */}
           <div
             onMouseDown={(e) => startResize('right-move', e)}
             style={{ position: 'absolute', top: 12, bottom: 12, right: -3, width: 6, cursor: 'ns-resize', zIndex: 2 }}
@@ -307,6 +333,7 @@ export default function TabNotesSlideout({ activeTabId }: TabNotesSlideoutProps)
               <MarkdownEditor
                 content={content}
                 onChange={handleChange}
+                onGenerateTitle={generateAITitle}
                 fontSize={notesEditorFontSize}
                 contentPaddingX={notesEditorPaddingX}
                 contentPaddingY={notesEditorPaddingY}

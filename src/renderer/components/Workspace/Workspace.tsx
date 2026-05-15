@@ -309,22 +309,21 @@ export default function Workspace() {
     // Terminal will auto-refit via ResizeObserver
   }, []);
 
-  // CMD+E toggles the file-explorer sidebar. Cmd+/ used to do the same but
-  // collided with the markdown editor's slash-command popover — Cmd+B already
-  // covers the same toggle, so Cmd+/ is freed for editor use.
+  // CMD+E toggles the per-tab notes slide-out (the "Open" button next to
+  // "ЗАМЕТКИ ВКЛАДКИ"). File-explorer sidebar is handled by Cmd+B separately.
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (workspaceView !== 'workspace') return;
-      if (e.metaKey && e.key === 'e' && activeProjectId) {
+      if (e.metaKey && e.key === 'e' && activeTabId) {
         e.preventDefault();
-        const { sidebarOpen } = getSidebarState(activeProjectId);
-        setSidebarOpen(activeProjectId, !sidebarOpen);
+        const cur = useUIStore.getState().notesPanelOpenTabs[activeTabId] ?? false;
+        useUIStore.getState().setNotesPanelOpen(activeTabId, !cur);
       }
     };
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [activeProjectId, workspaceView]);
+  }, [activeTabId, workspaceView]);
 
   // CMD+\ hotkey to toggle history panel
   useEffect(() => {

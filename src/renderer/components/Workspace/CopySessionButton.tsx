@@ -122,28 +122,19 @@ export default function CopySessionButton({ activeTabId, sessionType }: CopySess
   const inputRef = useRef<HTMLInputElement>(null);
   const settingsPopupRef = useRef<HTMLDivElement>(null);
 
-  // Settings popup auto-close: geometric hit-test so that the gap between 📋 and the
-  // popup (which lives to the LEFT) is treated as a hover-bridge instead of triggering close.
+  // Settings popup теперь открывается КЛИКОМ по 📋, не hover'ом. Закрывается: повторный
+  // клик по 📋 (toggle), Esc, либо клик по backdrop-overlay (см. рендер popup'а ниже).
+  // Hover-логика и hover-bridge удалены — пользователь явно открывает/закрывает.
   useEffect(() => {
     if (!showSettings) return;
-    const onMove = (e: MouseEvent) => {
-      const btn = iconRef.current;
-      const pop = settingsPopupRef.current;
-      if (!btn || !pop) return;
-      const b = btn.getBoundingClientRect();
-      const p = pop.getBoundingClientRect();
-      const { clientX: x, clientY: y } = e;
-      const pad = 8;
-      const inBtn = x >= b.left && x <= b.right && y >= b.top && y <= b.bottom;
-      const inPop = x >= p.left && x <= p.right && y >= p.top && y <= p.bottom;
-      const inBridge =
-        x >= p.right && x <= b.left &&
-        y >= Math.min(p.top, b.top) - pad &&
-        y <= Math.max(p.bottom, b.bottom) + pad;
-      if (!inBtn && !inPop && !inBridge) setShowSettings(false);
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        setShowSettings(false);
+      }
     };
-    document.addEventListener('mousemove', onMove);
-    return () => document.removeEventListener('mousemove', onMove);
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
   }, [showSettings]);
 
   const showInputPopup = (isCmdPressed && buttonHovered) || inputPopupHovered;
@@ -239,15 +230,18 @@ export default function CopySessionButton({ activeTabId, sessionType }: CopySess
           backgroundColor: `${accentRgba} 0.08)`,
         }}
       >
-        {/* 📋 settings half — opens settings popup on hover; also acts as a visual handle */}
+        {/* 📋 settings half — открывает popup настроек по КЛИКУ (toggle). Hover больше не
+            триггерит появление: hover-popup мешал пользователю работать рядом, поэтому
+            переведено на explicit click. Visual hover-state на самой иконке остаётся для
+            affordance — она выглядит кликабельной. */}
         <span
           ref={iconRef}
           data-settings-icon
-          onMouseEnter={() => { setIconHovered(true); setShowSettings(true); }}
-          onMouseLeave={(e) => {
-            setIconHovered(false);
-            const rect = (e.currentTarget as HTMLSpanElement).getBoundingClientRect();
-            if (e.clientX >= rect.left) setShowSettings(false);
+          onMouseEnter={() => setIconHovered(true)}
+          onMouseLeave={() => setIconHovered(false)}
+          onClick={(e) => {
+            e.stopPropagation();
+            setShowSettings(prev => !prev);
           }}
           style={{
             position: 'relative',
@@ -256,14 +250,12 @@ export default function CopySessionButton({ activeTabId, sessionType }: CopySess
             padding: '0 6px',
             height: '100%',
             cursor: 'pointer',
-            backgroundColor: iconHovered ? `${accentRgba} 0.28)` : 'transparent',
+            backgroundColor: (showSettings || iconHovered) ? `${accentRgba} 0.28)` : 'transparent',
             transition: 'background-color 0.12s',
           }}
           className="inline-flex items-center justify-center"
         >
           📋
-          {/* Enabled-flag chips moved to a dedicated row below the button (see InfoPanel) —
-              the old corner dots were ~4 px, overlapped by the divider, and unreadable. */}
         </span>
         {/* Divider — accent-tinted vertical line between the 📋 (settings) half and the
             "Copy session" half. Fork-toggle indication has moved to a dedicated chip in
@@ -291,13 +283,26 @@ export default function CopySessionButton({ activeTabId, sessionType }: CopySess
         </span>
       </div>
 
-      {/* Settings panel — slides in to the LEFT of the button */}
+      {/* Settings panel — slides in to the LEFT of the button.
+          Открывается кликом по 📋. Закрывается: повторный клик по 📋, Esc, клик по backdrop. */}
       {showSettings && !isGemini && buttonRef.current && (() => {
         const bRect = buttonRef.current.getBoundingClientRect();
         return (
           <SettingsPortal>
+            {/* Full-viewport backdrop — ловит клики вне popup'а и закрывает его. Прозрачный,
+                чтобы не затемнять остальной UI; нужен только для capture-фазы события. */}
+            <div
+              onClick={() => setShowSettings(false)}
+              style={{
+                position: 'fixed',
+                inset: 0,
+                zIndex: 9999,
+                background: 'transparent',
+              }}
+            />
             <div
               ref={settingsPopupRef}
+              onClick={(e) => e.stopPropagation()}
               style={{
                 position: 'fixed',
                 left: bRect.left - 3,
@@ -347,7 +352,6 @@ export default function CopySessionButton({ activeTabId, sessionType }: CopySess
                 <ToggleRow label="От fork" active={!fromStart} color="bg-[#DA7756]" onToggle={() => setFromStart(!fromStart)} />
               </div>
             </div>
-            <HoverBridgeDebug containerRef={iconRef} menuRef={settingsPopupRef} direction="left" />
           </SettingsPortal>
         );
       })()}

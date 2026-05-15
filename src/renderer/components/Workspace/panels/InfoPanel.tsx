@@ -3,6 +3,7 @@ import { MarkdownEditor } from '@gt-editor/markdown-editor';
 import '@gt-editor/markdown-editor/styles.css';
 import { useWorkspaceStore } from '../../../store/useWorkspaceStore';
 import { useUIStore } from '../../../store/useUIStore';
+import { generateAITitle } from '../../../utils/generateAITitle';
 import { usePromptsStore } from '../../../store/usePromptsStore';
 import { RotateCcw, Clock, ChevronDown, ChevronRight, ChevronLeft, ScrollText, GitBranch, User as UserIcon } from 'lucide-react';
 import ActionsPanel from './ActionsPanel';
@@ -125,15 +126,16 @@ function SessionActionChip({
   // Brighter accent for the hover state — pops against the dark hover bg.
   const accentBright = sessionType === 'claude' ? '#FF9466' : '#7BA3FF';
   const defaultLabel = sessionType === 'claude' ? 'Claude' : 'Gemini';
-  const hoverLabel = isCommandRunning ? 'Stop' : 'Continue';
-  // Continue: brighter accent on dark bg. Stop: red text + faint red bg (danger).
-  const hoverColor = isCommandRunning ? '#ef4444' : accentBright;
-  const showHoverState = hover && hasAnySession;
-  const label = showHoverState ? hoverLabel : defaultLabel;
-  const color = showHoverState ? hoverColor : accent;
-  // Dark almost-black hover bg restores the old "Continue chip" look — the previous
-  // translucent-accent tint bled into the green session-card background and looked muddy.
-  const hoverBg = isCommandRunning ? 'rgba(239, 68, 68, 0.18)' : 'rgba(0, 0, 0, 0.55)';
+  // Когда сессия неактивна (есть sessionId, но процесс не запущен) — `Continue` показывается
+  // ВСЕГДА, без hover'а. Юзер хочет видеть affordance «можно продолжить» сразу, а не
+  // обнаруживать её через hover. Hover в этом случае добавляет только выделение фона.
+  // Если сессия активна — лейбл `Claude/Gemini`, на hover'е → `Stop` (destructive, красный).
+  const sessionIdle = hasAnySession && !isCommandRunning;
+  const showStopOnHover = hover && isCommandRunning;
+  const label = sessionIdle ? 'Continue' : (showStopOnHover ? 'Stop' : defaultLabel);
+  // Continue: brighter accent на idle всегда; brighter на hover тоже (одинаково, чтобы
+  // не было микро-«моргания» цвета при hover). Stop: красный текст на hover.
+  const color = showStopOnHover ? '#ef4444' : (sessionIdle ? accentBright : accent);
 
   const handleClick = () => {
     if (!hasAnySession) { onCopyId(); return; }
@@ -141,13 +143,12 @@ function SessionActionChip({
     else onContinue();
   };
 
-  // Tooltip carries the session UUID — Cmd-only by default, same gating as everything
-  // else. The chip's own visible label (Continue / Stop) communicates intent without
-  // any popup, so a non-Cmd hover stays quiet.
-  // Permanent dark bg (matches ⎘ / ↻ siblings). Hover only changes text colour;
-  // Stop adds a faint red wash because it's a destructive action.
+  // Background: idle Continue получает «приподнятый» dark bg всегда — это сигнализирует
+  // о доступности действия даже без курсора. Stop при hover'е (=activeCmd + hover) даёт
+  // красный wash как предупреждение о destructive-действии.
   const baseBg = 'rgba(0,0,0,0.55)';
-  const stopHoverBg = isCommandRunning && showHoverState ? 'rgba(239, 68, 68, 0.18)' : baseBg;
+  const idleBg = sessionIdle ? baseBg : 'transparent';
+  const bg = showStopOnHover ? 'rgba(239, 68, 68, 0.18)' : (hover && !sessionIdle ? baseBg : idleBg);
   return (
     <span
       onMouseEnter={() => setHover(true)}
@@ -158,7 +159,7 @@ function SessionActionChip({
         color,
         width: 64,
         height: 18,
-        backgroundColor: stopHoverBg,
+        backgroundColor: bg,
         transition: 'background-color 0.12s, color 0.12s',
         userSelect: 'none',
       }}
@@ -190,6 +191,9 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
   const [tabNotes, setTabNotes] = useState('');
   const [sessionCopied, setSessionCopied] = useState(false);
   const [isGeneratingDesc, setIsGeneratingDesc] = useState(false);
+  // Hover state шапки «Заметки вкладки» — теперь весь header-блок hover-able и кликабелен,
+  // не только сама кнопка Open. Этот флаг управляет визуальным состоянием Open-чипа.
+  const [notesHeaderHover, setNotesHeaderHover] = useState(false);
   const [thinkFlash, setThinkFlash] = useState<string | null>(null);
   const [effortLevel, setEffortLevel] = useState<Record<string, string>>({});
   // Think active state per tab. undefined → treated as ON (default at Claude startup
@@ -659,7 +663,9 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
           with the line sitting exactly at the midpoint. No padding stacking. */}
       <div className="mb-2">
         <div className="flex items-center mb-2" style={{ gap: 6 }}>
-          {/* Tree mode toggle — for any AI session with timeline */}
+          {/* Tree mode toggle — for any AI session with timeline.
+              Idle color = бывший hover (#888) для лучшей видимости. Hover теперь даёт
+              белый текст + лёгкий тинт фона. Активное состояние — индиго, как раньше. */}
           {hasAnySession && activeTabId && (
             <button
               onClick={() => {
@@ -668,20 +674,28 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                 if (next) setHistoryPanelOpen(activeTabId, false); // mutual exclusion
                 setTimelineTreeMode(activeTabId, next);
               }}
-              className="cursor-pointer"
+              className="cursor-pointer rounded transition-colors"
               style={{
-                background: 'none',
+                background: 'transparent',
                 border: 'none',
-                padding: 0,
-                color: isTreeMode ? '#818cf8' : '#555',
+                padding: '2px 4px',
+                color: isTreeMode ? '#a5b4fc' : '#aaa',
               }}
-              onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.color = isTreeMode ? '#a5b4fc' : '#888'; }}
-              onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.color = isTreeMode ? '#818cf8' : '#555'; }}
+              onMouseEnter={(e) => {
+                const el = e.currentTarget as HTMLButtonElement;
+                el.style.color = isTreeMode ? '#c7d2fe' : '#fff';
+                el.style.background = isTreeMode ? 'rgba(129,140,248,0.15)' : 'rgba(255,255,255,0.08)';
+              }}
+              onMouseLeave={(e) => {
+                const el = e.currentTarget as HTMLButtonElement;
+                el.style.color = isTreeMode ? '#a5b4fc' : '#aaa';
+                el.style.background = 'transparent';
+              }}
             >
               <GitBranch size={12} />
             </button>
           )}
-          {/* AI Session button */}
+          {/* AI Session button — тот же яркий-by-default паттерн. */}
           {hasAnySession && activeTabId ? (
             <button
               onClick={() => {
@@ -690,16 +704,24 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                 if (next) setTimelineTreeMode(activeTabId, false); // mutual exclusion
                 setHistoryPanelOpen(activeTabId, next);
               }}
-              className="flex items-center cursor-pointer"
+              className="flex items-center cursor-pointer rounded transition-colors"
               style={{
                 gap: 5,
-                background: 'none',
+                background: 'transparent',
                 border: 'none',
-                padding: 0,
-                color: isHistoryOpen ? '#818cf8' : '#555',
+                padding: '2px 4px',
+                color: isHistoryOpen ? '#a5b4fc' : '#aaa',
               }}
-              onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.color = isHistoryOpen ? '#a5b4fc' : '#888'; }}
-              onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.color = isHistoryOpen ? '#818cf8' : '#555'; }}
+              onMouseEnter={(e) => {
+                const el = e.currentTarget as HTMLButtonElement;
+                el.style.color = isHistoryOpen ? '#c7d2fe' : '#fff';
+                el.style.background = isHistoryOpen ? 'rgba(129,140,248,0.15)' : 'rgba(255,255,255,0.08)';
+              }}
+              onMouseLeave={(e) => {
+                const el = e.currentTarget as HTMLButtonElement;
+                el.style.color = isHistoryOpen ? '#a5b4fc' : '#aaa';
+                el.style.background = 'transparent';
+              }}
             >
               {isHistoryOpen && historyLoading ? (
                 <svg width="12" height="12" viewBox="0 0 16 16" style={{ animation: 'spinner-rotate 1s linear infinite', willChange: 'transform', flexShrink: 0 }}>
@@ -828,7 +850,13 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
               )}
               {/* «Заменить сессию» (✎ Replace) — функционал пока не работает корректно, кнопка временно убрана. */}
               <button
-                className="text-[10px] px-1.5 py-0.5 rounded text-[#888] hover:text-white bg-[#333] hover:bg-[#444] cursor-pointer leading-none flex items-center gap-0.5"
+                className="text-[10px] px-1.5 py-0.5 rounded text-[#999] hover:text-white cursor-pointer leading-none flex items-center gap-0.5 transition-colors"
+                style={{
+                  backgroundColor: 'transparent',
+                  border: '1px solid rgba(255,255,255,0.10)',
+                }}
+                onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'rgba(255,255,255,0.06)'; }}
+                onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'transparent'; }}
                 onClick={async () => {
                   if (!sessionId || !activeTabId || !currentSessionType) return;
                   const state = useWorkspaceStore.getState();
@@ -857,7 +885,14 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
               >⑂→<span style={{ fontSize: '11px' }}>▭</span></button>
               {currentSessionType === 'claude' && sessionId && (
                 <button
-                  className="text-[10px] px-1.5 py-0.5 rounded text-[#DA7756] hover:text-white bg-[#333] hover:bg-[#444] cursor-pointer leading-none"
+                  className="text-[10px] px-1.5 py-0.5 rounded cursor-pointer leading-none transition-colors"
+                  style={{
+                    color: '#DA7756',
+                    backgroundColor: 'transparent',
+                    border: '1px solid rgba(218,119,86,0.30)',
+                  }}
+                  onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'rgba(218,119,86,0.15)'; (e.currentTarget as HTMLButtonElement).style.color = '#FF9466'; }}
+                  onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'transparent'; (e.currentTarget as HTMLButtonElement).style.color = '#DA7756'; }}
                   onClick={async () => {
                     if (!sessionId || !activeTabId) return;
                     const state = useWorkspaceStore.getState();
@@ -1700,53 +1735,54 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
           so it never eats the upper sections; scroll inside the editor handles
           longer notes. min-h-0 + h-[250px] avoid flexbox content-min-size bugs. */}
       <div className="flex flex-col h-[250px] flex-shrink-0 border-t border-border-main pt-3 mt-auto">
-        <div className="flex items-center gap-2 mb-2">
-          {/* "← Open" toggles the per-tab slide-out notes panel anchored to the
-              left edge of this sidebar. Permanent purple-tinted bg matches the
-              slide-out's editor background (`#1e1e2e`) so users see the visual
-              link between trigger and target. The data-attr marks this so the
-              panel's outside-click handler can skip it (otherwise click-to-close
-              would fire before our toggle does, re-opening it instantly). */}
+        {/* Весь header-блок кликабельный: hover/click на любой свободной области (label, spacer)
+            триггерит то же что и сама кнопка Open. ✦ (generate description) — отдельная кнопка
+            со своим click handler'ом, `e.stopPropagation()` не пропускает её клик в контейнер.
+            Открытие slideout'а — `setNotesPanelOpen(tabId, !isOpen)` через useUIStore. */}
+        <div
+          className={`flex items-center gap-2 mb-2 ${activeTabId ? 'cursor-pointer' : ''}`}
+          data-tab-notes-open-trigger
+          onMouseEnter={() => activeTabId && setNotesHeaderHover(true)}
+          onMouseLeave={() => activeTabId && setNotesHeaderHover(false)}
+          onClick={(e) => {
+            if (!activeTabId) return;
+            const target = e.target as HTMLElement;
+            if (target.closest('[data-notes-header-interactive]')) return;
+            const isOpen = useUIStore.getState().notesPanelOpenTabs[activeTabId] ?? false;
+            useUIStore.getState().setNotesPanelOpen(activeTabId, !isOpen);
+          }}
+        >
+          {/* "← Open" — визуальный индикатор: цвет привязан к hover-state контейнера,
+              click обрабатывает контейнер. Permanent purple-tinted bg сохранён для
+              визуальной связи со slideout'ом. */}
           {activeTabId && (
-            <button
-              data-tab-notes-open-trigger
-              className="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded cursor-pointer transition-colors focus:outline-none"
+            <span
+              className="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded transition-colors pointer-events-none"
               style={{
-                backgroundColor: '#1e1e2e',
-                color: '#a5b4fc',
+                backgroundColor: notesHeaderHover ? '#2a2a3e' : '#1e1e2e',
+                color: notesHeaderHover ? '#c7d2fe' : '#a5b4fc',
                 border: '1px solid rgba(99,102,241,0.25)',
-                outline: 'none',
-              }}
-              onMouseEnter={(e) => {
-                (e.currentTarget as HTMLButtonElement).style.backgroundColor = '#2a2a3e';
-                (e.currentTarget as HTMLButtonElement).style.color = '#c7d2fe';
-              }}
-              onMouseLeave={(e) => {
-                (e.currentTarget as HTMLButtonElement).style.backgroundColor = '#1e1e2e';
-                (e.currentTarget as HTMLButtonElement).style.color = '#a5b4fc';
-              }}
-              onClick={(e) => {
-                const isOpen = useUIStore.getState().notesPanelOpenTabs[activeTabId] ?? false;
-                useUIStore.getState().setNotesPanelOpen(activeTabId, !isOpen);
-                // Immediately blur so the browser's focus-ring (visible after the
-                // panel closes via Escape) doesn't paint a white outline.
-                (e.currentTarget as HTMLButtonElement).blur();
               }}
             >
               <ChevronLeft size={11} />
               <span>Open</span>
-            </button>
+            </span>
           )}
           <span className="text-[11px] uppercase text-[#888]">Заметки вкладки</span>
           {activeTabId && (
-            <button className={`text-[10px] px-1.5 py-0.5 rounded cursor-pointer ${isGeneratingDesc ? 'text-white bg-amber-600 animate-glow-yellow font-bold' : 'text-[#666] hover:text-[#f59e0b] hover:bg-[#f59e0b]/10'}`} onClick={handleGenerateDescription} disabled={isGeneratingDesc}>{isGeneratingDesc ? 'GENERATING...' : '\u2726'}</button>
+            <button
+              data-notes-header-interactive
+              className={`text-[10px] px-1.5 py-0.5 rounded cursor-pointer ${isGeneratingDesc ? 'text-white bg-amber-600 animate-glow-yellow font-bold' : 'text-[#666] hover:text-[#f59e0b] hover:bg-[#f59e0b]/10'}`}
+              onClick={(e) => { e.stopPropagation(); handleGenerateDescription(); }}
+              disabled={isGeneratingDesc}
+            >{isGeneratingDesc ? 'GENERATING...' : '\u2726'}</button>
           )}
           <div className="flex-1" />
         </div>
         {activeTabId ? (
           <div style={{ flex: 1, minHeight: 0, position: 'relative' }}>
             <div style={{ position: 'absolute', inset: 0 }}>
-              <MarkdownEditor content={tabNotes} onChange={(newContent: string) => { setTabNotes(newContent); if (activeTabId) setTabNotesStore(activeTabId, newContent); }} fontSize={tabNotesFontSize} contentPaddingX={tabNotesPaddingX} contentPaddingY={tabNotesPaddingY} wordWrap={wordWrap} showLineNumbers={false} compact foldStateKey={`tab-notes:${activeTabId}`} />
+              <MarkdownEditor content={tabNotes} onChange={(newContent: string) => { console.warn('[InfoPanel:notes:onChange]', { tabId: activeTabId?.slice(-12), newLen: newContent.length }); setTabNotes(newContent); if (activeTabId) setTabNotesStore(activeTabId, newContent); }} onGenerateTitle={generateAITitle} fontSize={tabNotesFontSize} contentPaddingX={tabNotesPaddingX} contentPaddingY={tabNotesPaddingY} wordWrap={wordWrap} showLineNumbers={false} compact foldStateKey={`tab-notes:${activeTabId}`} />
             </div>
           </div>
         ) : (

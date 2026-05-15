@@ -298,6 +298,12 @@ interface UIStore {
   setNotesPanelOpen: (tabId: string, open: boolean) => void;
   notesPanelSize: { width: number; height: number };
   setNotesPanelSize: (size: { width: number; height: number }) => void;
+  // Vertical offset from the default anchor (bottom of the Open trigger button).
+  // 0 = модалка сидит низом ровно на нижней кромке кнопки Open. Отрицательные значения
+  // двигают модалку вверх, положительные — вниз. Сохраняется в localStorage + SQLite
+  // (тем же путём, что и notesPanelSize), чтобы position переживала перезапуски.
+  notesPanelOffsetY: number;
+  setNotesPanelOffsetY: (offset: number) => void;
 
   // Tab Notes Font Size & Padding
   tabNotesFontSize: number;
@@ -771,6 +777,22 @@ const initialDefaultClaudeEffort = loadDefaultClaudeEffort();
       if (cur.width !== w || cur.height !== h) {
         useUIStore.setState({ notesPanelSize: { width: w, height: h } });
         try { localStorage.setItem('noted-terminal-notes-panel-size', JSON.stringify({ width: w, height: h })); } catch {}
+      }
+    }
+  } catch {}
+})();
+
+// Hydrate Notes Panel vertical offset (drag-along-Y from Open anchor) from SQLite.
+(async () => {
+  try {
+    const { ipcRenderer } = window.require('electron');
+    const v = await ipcRenderer.invoke('app:getState', 'notesPanelOffsetY');
+    const n = Number(v);
+    if (Number.isFinite(n)) {
+      const cur = useUIStore.getState().notesPanelOffsetY;
+      if (cur !== n) {
+        useUIStore.setState({ notesPanelOffsetY: n });
+        try { localStorage.setItem('noted-terminal-notes-panel-offset-y', String(n)); } catch {}
       }
     }
   } catch {}
@@ -1323,6 +1345,25 @@ export const useUIStore = create<UIStore>((set, get) => ({
     try {
       const { ipcRenderer } = window.require('electron');
       ipcRenderer.invoke('app:setState', { key: 'notesPanelSize', value: next }).catch(() => {});
+    } catch {}
+  },
+  notesPanelOffsetY: (() => {
+    try {
+      const saved = localStorage.getItem('noted-terminal-notes-panel-offset-y');
+      if (saved !== null) {
+        const n = Number(saved);
+        if (Number.isFinite(n)) return n;
+      }
+    } catch {}
+    return 0;
+  })(),
+  setNotesPanelOffsetY: (offset) => {
+    const v = Number.isFinite(offset) ? offset : 0;
+    set({ notesPanelOffsetY: v });
+    try { localStorage.setItem('noted-terminal-notes-panel-offset-y', String(v)); } catch {}
+    try {
+      const { ipcRenderer } = window.require('electron');
+      ipcRenderer.invoke('app:setState', { key: 'notesPanelOffsetY', value: v }).catch(() => {});
     } catch {}
   },
 
