@@ -761,6 +761,19 @@ const CLAUDE_HOOK_SOCK = '/tmp/noted-terminal-claude-hook.sock';
 const claudeTurnBusy = new Map(); // tabId → boolean (true = turn in flight)
 const claudeTurnWatchdog = new Map(); // tabId → timeout ID (silent-tool-stop safety)
 const CLAUDE_TURN_WATCHDOG_MS = 60 * 60 * 1000; // 60min — safety net against silent-tool-stop (#29881) and hook-script crashes; only fires when Stop legitimately never arrives
+
+// Interrupt watchdog — separate, short-fuse fallback for the case Claude's
+// decompiled query.ts does NOT call stopHooks: user-initiated interrupts (Esc /
+// Ctrl+C during streaming). Claude returns `{ reason: 'aborted_streaming' }`
+// without firing Stop or StopFailure. The loader would hang on busy=true for an
+// hour until CLAUDE_TURN_WATCHDOG_MS expires.
+//
+// Mechanism: when we detect Esc / Ctrl+C in `terminal:input` for a tab that's
+// currently busy according to claudeTurnBusy, schedule a 2s timer. If Stop hook
+// fires before the timer expires → cancel. If not → user really interrupted,
+// force busy=false. 2s covers PTY buffering + Ink final-frame render after Esc.
+const claudeInterruptWatchdog = new Map(); // tabId → timeout ID
+const CLAUDE_INTERRUPT_WATCHDOG_MS = 2000;
 let claudeHookServer = null;
 
 // PromptQueue grab-input correlator: noted-code-grab.js sends { event:'GrabInput', ppid, text }.
@@ -830,7 +843,10 @@ function startClaudeHookServer() {
         const prev = claudeTurnBusy.get(tabId);
         claudeTurnBusy.set(tabId, busy);
         const latency = ts ? (Date.now() - ts) : null;
-        console.log('[ClaudeHook] ' + event + ' tab=' + tabId.slice(-12) + ' session=' + session_id.slice(0, 8) + ' busy=' + busy + (prev === busy ? ' (no change)' : '') + (latency !== null ? ' latency=' + latency + 'ms' : ''));
+        // Detailed log for hung-loader diagnosis: include `prev` explicitly so
+        // we can spot "UserPromptSubmit while prev=true" (Claude's submit-interrupt
+        // path which skips stopHooks) without re-parsing line context.
+        console.log('[ClaudeHook] ' + event + ' tab=' + tabId.slice(-12) + ' session=' + session_id.slice(0, 8) + ' prev=' + (prev === undefined ? 'undef' : prev) + ' busy=' + busy + (prev === busy ? ' (no change)' : '') + (latency !== null ? ' latency=' + latency + 'ms' : ''));
 
         // ----- Reuse existing claude:busy-state pipeline -----
         // Stop/StopFailure must force loader off, even if spinner glyph still pulses one last frame.
@@ -848,6 +864,10 @@ function startClaudeHookServer() {
         // fall back to busy=false after CLAUDE_TURN_WATCHDOG_MS so the loader doesn't hang forever.
         clearTimeout(claudeTurnWatchdog.get(tabId));
         claudeTurnWatchdog.delete(tabId);
+        // Interrupt-watchdog: a real Stop hook arrived → cancel any pending interrupt
+        // fallback so we don't double-fire busy=false.
+        clearTimeout(claudeInterruptWatchdog.get(tabId));
+        claudeInterruptWatchdog.delete(tabId);
         if (busy) {
           claudeTurnWatchdog.set(tabId, setTimeout(() => {
             console.warn('[ClaudeHook] Watchdog fired for tab ' + tabId.slice(-12) + ' (Stop never arrived)');
@@ -5158,6 +5178,39 @@ ipcMain.on('terminal:input', async (event, tabId, data) => {
     console.log('[ClaudeAgent:Arm] Tab ' + tabId + ': Armed (first user input)');
   }
 
+  // Interrupt watchdog — see comment on claudeInterruptWatchdog declaration.
+  // When user sends Esc (\x1b) or Ctrl+C (\x03) to a tab whose Claude turn is
+  // currently in flight (per Stop hook), arm a 2s fallback timer to force
+  // busy=false. If a real Stop hook arrives before the timer fires it cancels
+  // the timer (via Stop hook handler below clearing claudeInterruptWatchdog).
+  if ((data === '\x1b' || data === '\x03' || data.includes('\x1b') || data.includes('\x03'))
+      && claudeTurnBusy.get(tabId) === true
+      && !claudeInterruptWatchdog.has(tabId)) {
+    const t = setTimeout(() => {
+      claudeInterruptWatchdog.delete(tabId);
+      // Re-check: if Stop hook arrived during the 2s wait, claudeTurnBusy was
+      // already flipped to false. Don't re-emit busy=false redundantly.
+      if (claudeTurnBusy.get(tabId) !== true) return;
+      console.warn('[ClaudeInterrupt] tab=' + tabId.slice(-12) + ': no Stop hook within ' + CLAUDE_INTERRUPT_WATCHDOG_MS + 'ms after Esc/Ctrl+C — forcing busy=false');
+      claudeTurnBusy.set(tabId, false);
+      claudeSpinnerBusy.set(tabId, false);
+      clearTimeout(claudeTurnWatchdog.get(tabId));
+      claudeTurnWatchdog.delete(tabId);
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('claude:busy-state', { tabId, busy: false });
+        // Synthesize a Stop event so renderer-side consumers (PromptQueueRunner)
+        // see a turn-end edge transition and trigger queue logic / stopAfter.
+        mainWindow.webContents.send('claude:turn-state', {
+          tabId, sessionId: bridgeKnownSessions.get(tabId) || null,
+          event: 'InterruptStop', busy: false, success: false,
+          lastAssistantMessage: null,
+        });
+      }
+    }, CLAUDE_INTERRUPT_WATCHDOG_MS);
+    claudeInterruptWatchdog.set(tabId, t);
+    console.log('[ClaudeInterrupt] tab=' + tabId.slice(-12) + ': Esc/Ctrl+C detected mid-turn, watchdog armed (' + CLAUDE_INTERRUPT_WATCHDOG_MS + 'ms)');
+  }
+
   // User paste (Cmd+V) — direct passthrough, no chunking needed.
   if (data.length > 1) {
     const endsWithR = data.endsWith('\r');
@@ -6798,6 +6851,44 @@ function scanProjectPorts(rootCwd, depth = 0) {
 
   return found;
 }
+
+// Diagnostic dump for hung-loader cases. Renderer can invoke this when busy-state
+// is stuck and developer wants a snapshot of all per-tab state mainprocess holds.
+// Returns plain JSON: tabId → { claudeTurnBusy, claudeSpinnerBusy, bridgeKnownSessions,
+// bridgePidCache (reversed), watchdog status, claude PID alive }. Safe to call anytime.
+ipcMain.handle('system:dump-claude-state', async () => {
+  const pidByTab = new Map();
+  for (const [pid, tid] of bridgePidCache) pidByTab.set(tid, pid);
+  const allTabs = new Set([
+    ...claudeTurnBusy.keys(),
+    ...claudeSpinnerBusy.keys(),
+    ...bridgeKnownSessions.keys(),
+    ...pidByTab.keys(),
+    ...claudeTurnWatchdog.keys(),
+    ...claudeInterruptWatchdog.keys(),
+  ]);
+  const dump = {};
+  const { execSync } = require('child_process');
+  for (const tabId of allTabs) {
+    const pid = pidByTab.get(tabId);
+    let pidAlive = null;
+    if (pid) {
+      try { execSync('kill -0 ' + pid + ' 2>/dev/null'); pidAlive = true; }
+      catch { pidAlive = false; }
+    }
+    dump[tabId] = {
+      claudeTurnBusy: claudeTurnBusy.get(tabId),
+      claudeSpinnerBusy: claudeSpinnerBusy.get(tabId),
+      sessionId: bridgeKnownSessions.get(tabId) || null,
+      claudePid: pid || null,
+      pidAlive,
+      turnWatchdog: claudeTurnWatchdog.has(tabId),
+      interruptWatchdog: claudeInterruptWatchdog.has(tabId),
+    };
+  }
+  console.log('[Diag:Dump] ' + JSON.stringify(dump));
+  return dump;
+});
 
 ipcMain.handle('system:detect-project-ports', async (event, cwd) => {
   if (!cwd) return { ports: [] };

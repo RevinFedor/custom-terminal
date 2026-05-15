@@ -9,6 +9,7 @@
     "build": "electron-vite build && electron-builder",
     "build:install": "pkill -f 'Noted Terminal' || true && electron-vite build && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder && rm -rf /Applications/Noted\\ Terminal.app && cp -R release/mac-arm64/Noted\\ Terminal.app /Applications/ && open /Applications/Noted\\ Terminal.app",
     "build:i": "npm run build:install",
+    "build:markdown": "cd ../gt-editor/packages/markdown-editor && npm run build && rsync -a --delete dist/ ../../../custom-terminal/node_modules/@gt-editor/markdown-editor/dist/ && rm -rf ../../../custom-terminal/node_modules/.vite && echo '[build:markdown] gt-editor → custom-terminal node_modules synced, vite cache cleared'",
     "_rebuild": "electron-rebuild -f -w node-pty",
     "_test:e2e": "cd runtime-tests && npx playwright test",
     "_test:e2e:headed": "cd runtime-tests && npx playwright test --headed",

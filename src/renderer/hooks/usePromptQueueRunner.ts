@@ -13,7 +13,7 @@ const { ipcRenderer } = window.require('electron');
 //   && claudeProcessAlive`. effectiveActive flips to false the moment the user
 //   switches to any other tab. Overlay unmounts → useEffect cleanup runs →
 //   prevBusyRef goes away → on remount prevBusyRef.current = current busy, so
-#   the busy=true→false transition that ALREADY happened in the background is
+//   the busy=true→false transition that ALREADY happened in the background is
 //   missed. Net effect: user arms Run after, switches to a Gemini tab to work,
 //   Claude finishes its turn — next queued prompt never fires until they come
 //   back to the Claude tab. Contradicts the entire purpose of the feature.

@@ -11,6 +11,18 @@ import HoverBridgeDebug from '../HoverBridgeDebug';
 
 const { ipcRenderer, clipboard } = window.require('electron');
 
+// ════════════════════════════════════════════════════════════
+// SECTION: HELPERS — module-level pure functions, types, module state
+// ════════════════════════════════════════════════════════════
+
+// True when an entry is NOT a regular user prompt — currently 'compact', 'continued',
+// 'docs_edit', 'docs_search'. Used widely to skip non-user entries in nav/copy/visibility.
+// If a new attribute-style entry type is ever added, update this ONE place.
+function isAttributeEntry(entry: { type?: string }): boolean {
+  return entry.type === 'compact' || entry.type === 'continued'
+    || entry.type === 'docs_edit' || entry.type === 'docs_search';
+}
+
 // Portal for tooltip to escape overflow:hidden
 const TooltipPortal: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   return createPortal(children, document.body);
@@ -271,11 +283,15 @@ function computeGroups(entries: TimelineEntry[]): Map<number, GroupInfo> {
 const _savedEditRangeMap = new Map<string, any>();
 const SAVED_MAP_MAX = 20;
 
+// ════════════════════════════════════════════════════════════
+// SECTION: COMPONENT SETUP — props, UIStore subscriptions, state, ref declarations
+// ════════════════════════════════════════════════════════════
 function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, isOpen = true, toolType = 'claude' }: TimelineProps) {
   const isGemini = toolType === 'gemini';
 
   // Slide animation (matches HistoryPanel pattern)
   const [slideIn, setSlideIn] = useState(isOpen);
+  // effect: isOpen → setSlideIn after 2 RAFs (slide-in transition); false → reset immediately
   useEffect(() => {
     if (isOpen) {
       requestAnimationFrame(() => {
@@ -295,7 +311,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   const [selectionStartId, setSelectionStartId] = useState<string | null>(null);
   const selectionStartIdRef = useRef<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
-  const [contextMenu, setContextMenu] = useState<{ x: number, y: number, entry: TimelineEntry } | null>(null);
+  const [contextMenu, setContextMenu] = useState<{ x: number, y: number, entry: TimelineEntry, source?: 'dot' | 'segment' } | null>(null);
   const [sessionBoundaries, setSessionBoundaries] = useState<SessionBoundary[]>([]);
   const [copyingRange, setCopyingRange] = useState<{ startIndex: number, endIndex: number } | null>(null);
   const [copiedRange, setCopiedRange] = useState<{ startIndex: number, endIndex: number } | null>(null);
@@ -344,6 +360,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   // Auto-dismiss "done" overlay: 1s after cursor moves in terminal, unless hovering overlay/panel
   const editRangeDoneHovered = useRef(false);
   const editRangeDoneTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // effect: editRangeState.phase==='done' → 1s mousemove timer clears editRangeState (unless hovered)
   useEffect(() => {
     if (editRangeState?.phase !== 'done') {
       editRangeDoneHovered.current = false;
@@ -379,8 +396,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   const [deleteConfirmMode, setDeleteConfirmMode] = useState(false);
   // Animation state while delete IPC is running (red overlay over the range)
   const [deletingRange, setDeletingRange] = useState<{ startIndex: number; endIndex: number } | null>(null);
-  // Reset confirm mode whenever rangeActionMenu closes — otherwise the next popup opens
-  // already in confirm state.
+  // effect: rangeActionMenu closes → reset deleteConfirmMode (prevents next popup opening in confirm state)
   useEffect(() => {
     if (!rangeActionMenu) setDeleteConfirmMode(false);
   }, [rangeActionMenu]);
@@ -388,10 +404,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   // Ref to context-menu root so we can measure its rect for the hover-bridge test.
   const contextMenuRef = useRef<HTMLDivElement>(null);
 
-  // Auto-close context menu when cursor leaves the Timeline + menu + the implicit
-  // "bridge" area between them. Uses geometric hit-test (rectangles) instead of
-  // elementFromPoint — the gap between Timeline and the menu is empty space where
-  // elementFromPoint returns the terminal panel underneath, falsely triggering close.
+  // effect: contextMenu open → mousemove listener closes menu when cursor leaves Timeline+menu+bridge rect (uses geometric hit-test instead of elementFromPoint)
   useEffect(() => {
     if (!contextMenu) return;
     const onMove = (e: MouseEvent) => {
@@ -465,6 +478,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   };
   const setHistoryScrollToUuid = useUIStore(state => state.setHistoryScrollToUuid);
   const isHistoryOpen = useUIStore(state => state.historyPanelOpenTabs[tabId] ?? false);
+  const setHistoryPanelOpen = useUIStore(state => state.setHistoryPanelOpen);
   const historyVisibleUuids = useUIStore(state => state.historyVisibleUuids[tabId]);
   const containerRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -512,6 +526,10 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   // and locking scroll only made it impossible for the user to navigate to the active
   // overlay when returning to a tab where the scroll was elsewhere.
 
+  // ════════════════════════════════════════════════════════════
+  // SECTION: DERIVATIONS — useMemo'd derivations from entries/forkMarkers
+  // ════════════════════════════════════════════════════════════
+
   // Compute group map for sub-agent entries (Phase 2)
   const groupMap = useMemo(() => computeGroups(entries), [entries]);
   // Precompute fork snapshot UUID Sets for suppressing inherited plan mode boundaries
@@ -546,8 +564,11 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     return false;
   }, [groupMap]);
 
-  // Custom scroll indicator: track scroll position on the scrollable div
-  // Custom scroll indicator: direct DOM updates (no React re-render on scroll)
+  // ════════════════════════════════════════════════════════════
+  // SECTION: CUSTOM SCROLLBAR — thumbRef/arrowRef direct DOM updates (avoid re-render on scroll)
+  // ════════════════════════════════════════════════════════════
+
+  // effect: scrollRef + entries/treeMode → scroll/resize listeners drive thumb position + scroll-down arrow visibility via direct DOM style writes
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
@@ -596,7 +617,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     };
   }, [entries, treeMode]); // recalc when entries change or tree mode toggles
 
-  // Adjust segmentRefs length
+  // effect: entries change → trim segmentRefs array length to match (prevents stale refs)
   useEffect(() => {
     segmentRefs.current = segmentRefs.current.slice(0, entries.length);
   }, [entries]);
@@ -608,16 +629,17 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     return rect.top + rect.height / 2;
   };
 
-  // Reset expansion and copy state when tooltip target changes
+  // effect: activeTooltipIndex changes → reset isExpanded + tooltipCopied (each new tooltip starts collapsed/un-copied)
   useEffect(() => {
     setIsExpanded(false);
     setTooltipCopied(false);
   }, [activeTooltipIndex]);
 
-  // Track Timeline's real left edge in viewport coords — derives the CSS `right:` value used by
-  // every popup that anchors to Timeline (context menu, range action, edit-range loading, note,
-  // fork tooltip). ResizeObserver fires when HistoryPanel toggles, treeMode flips, window resizes,
-  // sidebar reflows — all the cases where the hardcoded formula drifted.
+  // ════════════════════════════════════════════════════════════
+  // SECTION: POPUPRIGHTPX MEASUREMENT — derives CSS `right:` for every Timeline-anchored popup
+  // ════════════════════════════════════════════════════════════
+
+  // effect: isVisible/isHistoryOpen/treeMode/notesPanelWidth → ResizeObserver on containerRef+body + window resize → setPopupRightPx (CSS `right:` for all popups anchored to Timeline left edge)
   useEffect(() => {
     if (!isVisible) return;
     const el = containerRef.current;
@@ -639,7 +661,11 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     return () => { ro.disconnect(); window.removeEventListener('resize', measure); };
   }, [isVisible, isHistoryOpen, treeMode, notesPanelWidth]);
 
-  // CMD key tracking — tooltip only appears when CMD is held
+  // ════════════════════════════════════════════════════════════
+  // SECTION: CMD-HOLD SYNC — global keydown/keyup tracks Meta; tooltip/note/fork tooltip visibility derives from isCmdHeld+hover state
+  // ════════════════════════════════════════════════════════════
+
+  // effect: window keydown/keyup/blur for Meta → isCmdHeld + isCmdHeldRef (tooltip only opens while CMD held)
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Meta') {
@@ -667,8 +693,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     };
   }, []);
 
-  // Sync tooltip with CMD key state: show when CMD pressed during hover, hide when released
-  // Do NOT close if cursor is inside the tooltip (user is interacting with buttons)
+  // effect: isCmdHeld/hoveredIndex/isExpanded → setActiveTooltipIndex (CMD+hover opens; release closes unless expanded/cursor-in-tooltip/resizing)
   useEffect(() => {
     if (isCmdHeld && hoveredIndex !== null) {
       setActiveTooltipIndex(hoveredIndex);
@@ -677,7 +702,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     }
   }, [isCmdHeld, hoveredIndex, isExpanded]);
 
-  // Note tooltip: sync with CMD key — open when CMD pressed while hovering strip, close when released
+  // effect: isCmdHeld/hoveredNoteIndex/isNoteEditing/activeNoteIndex → setActiveNoteIndex (CMD+hover opens note tooltip + hides entry tooltip; release closes unless editing/cursor-in-tooltip)
   useEffect(() => {
     if (isCmdHeld && hoveredNoteIndex !== null) {
       setActiveNoteIndex(hoveredNoteIndex);
@@ -690,6 +715,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   // Fork marker tooltip: sync with CMD key — same pattern as notes
   const [hoveredForkMarkerIndex, setHoveredForkMarkerIndex] = useState<number | null>(null);
   const [activeForkMarkerIndex, setActiveForkMarkerIndex] = useState<number | null>(null);
+  // effect: isCmdHeld/hoveredForkMarkerIndex/activeForkMarkerIndex → setActiveForkMarkerIndex (CMD+hover opens fork tooltip + hides entry tooltip; release closes unless cursor-in-tooltip)
   useEffect(() => {
     if (isCmdHeld && hoveredForkMarkerIndex !== null) {
       setActiveForkMarkerIndex(hoveredForkMarkerIndex);
@@ -698,6 +724,10 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       setActiveForkMarkerIndex(null);
     }
   }, [isCmdHeld, hoveredForkMarkerIndex, activeForkMarkerIndex]);
+
+  // ════════════════════════════════════════════════════════════
+  // SECTION: TIMELINE DATA LOAD — loadTimeline IPC, 2s poll, session-switch cleanup, _savedEditRangeMap save/restore
+  // ════════════════════════════════════════════════════════════
 
   // Load timeline and fork markers when sessionId changes
   const loadTimeline = useCallback(async () => {
@@ -776,6 +806,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     }
   }, [sessionId, cwd, tabId, isGemini]);
 
+  // effect: loadTimeline callback identity changes (sessionId/cwd/tabId/isGemini) → trigger initial timeline load
   useEffect(() => {
     loadTimeline();
   }, [loadTimeline]);
@@ -789,6 +820,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   // Always-current sessionId ref — closures in async fetchEditRangeCompact capture stale prop
   const sessionIdRef = useRef(sessionId);
   sessionIdRef.current = sessionId;
+  // effect: sessionId changes → save/restore editRangeState via _savedEditRangeMap + reset all overlay/selection/tooltip state; unmount cleanup also saves state
   useEffect(() => {
     if (sessionId !== prevSessionForCleanup.current) {
       const prevSid = prevSessionForCleanup.current;
@@ -857,6 +889,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   // Auto-scroll timeline to bottom on initial load (when sessionId changes)
   // This ensures the user sees the latest (reachable) entries, not old red ones at the top
   const prevSessionRef = useRef<string | null>(null);
+  // effect: sessionId changes + entries loaded → scrollRef.scrollTo bottom (so user sees latest reachable entries on session-switch / initial mount)
   useEffect(() => {
     if (sessionId && sessionId !== prevSessionRef.current && entries.length > 0) {
       prevSessionRef.current = sessionId;
@@ -871,11 +904,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     }
   }, [sessionId, entries.length]);
 
-  // Refresh timeline periodically (only when visible AND window foregrounded).
-  // PERF (2026-04-21): pausing on document.visibilityState=hidden eliminates needless
-  // IPC round-trips (SessionChain, getForkMarkers, incremental JSONL reads) while the
-  // app is in the background. Regression signal: [Timeline:PollPaused] / [Timeline:PollResumed]
-  // should match window focus/blur transitions 1:1.
+  // effect: sessionId/loadTimeline/isVisible + document.visibilitychange → 2s setInterval(loadTimeline) (paused while tab hidden; PERF: avoids IPC round-trips in background — Timeline:PollPaused/Resumed logs)
   useEffect(() => {
     if (!sessionId || !isVisible) return;
 
@@ -914,7 +943,11 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     };
   }, [sessionId, loadTimeline, isVisible]);
 
-  // Listen for manual refresh requests from InfoPanel
+  // ════════════════════════════════════════════════════════════
+  // SECTION: NOTES + REWIND MARKERS + CONTINUE — window event listeners for cross-component triggers
+  // ════════════════════════════════════════════════════════════
+
+  // effect: window 'timeline:force-refresh' (for this tabId) → loadTimeline (manual refresh from InfoPanel)
   useEffect(() => {
     const handler = (e: Event) => {
       const detail = (e as CustomEvent).detail;
@@ -926,7 +959,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     return () => window.removeEventListener('timeline:force-refresh', handler);
   }, [tabId, loadTimeline]);
 
-  // Listen for scroll-to-bottom requests (e.g., when "Continue" is pressed)
+  // effect: window 'timeline:scroll-to-bottom' (for this tabId) → scrollRef.scrollTo bottom (triggered by Continue button)
   useEffect(() => {
     const handler = (e: Event) => {
       const detail = (e as CustomEvent).detail;
@@ -940,10 +973,11 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     return () => window.removeEventListener('timeline:scroll-to-bottom', handler);
   }, [tabId]);
 
-  // Bind timeline entries to prompt boundary markers (OSC 7777 from main.js).
-  // Entry N (user message) maps to prompt boundary N (the prompt shown after response N,
-  // where the next message will be typed). Sequence 0 = after first response.
-  // Entries without markers will fall back to SearchAddon navigation.
+  // ════════════════════════════════════════════════════════════
+  // SECTION: PROMPT BOUNDARY BINDING — map JSONL entries to OSC 7777 markers (Claude only)
+  // ════════════════════════════════════════════════════════════
+
+  // effect: entries/tabId/isGemini → terminalRegistry.bindEntryToPromptBoundary for each user entry (skips attribute entries; OSC 7777 markers anchor scrollToEntry; entries without markers fall back to SearchAddon)
   useEffect(() => {
     if (isGemini || entries.length === 0) return;
     const boundaryCount = terminalRegistry.getPromptBoundaryCount(tabId);
@@ -952,7 +986,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     // User-type entries only (skip compact, continued, docs_edit, docs_search)
     let promptSeq = 0;
     for (const entry of entries) {
-      if (entry.type === 'compact' || entry.type === 'continued' || entry.type === 'docs_edit' || entry.type === 'docs_search') continue;
+      if (isAttributeEntry(entry)) continue;
       // Try to bind this entry to the next available prompt boundary
       // Boundary 0 = prompt after first response → where second message was typed
       // For entry 0 (first message), there's no boundary (it was typed at the initial prompt)
@@ -964,7 +998,11 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     }
   }, [entries, tabId, isGemini]);
 
-  // Viewport visibility + buffer reachability tracking
+  // ════════════════════════════════════════════════════════════
+  // SECTION: VISIBILITY + REACHABILITY — computePositions/checkVisibility/checkReachability tied to terminal viewport
+  // ════════════════════════════════════════════════════════════
+
+  // effect: tabId/entries/isVisible/isGemini/isHistoryOpen/historyVisibleUuids → setVisibleEntryIndices, setResponseOnlyIndices, setUnreachableIndices, setLastBoundaryIndex (history-panel mode uses UUID set; non-history runs computePositions/checkVisibility/checkReachability + terminalRegistry.onViewportChange debounced 100/500ms)
   useEffect(() => {
     if (!isVisible || entries.length === 0) {
       setVisibleEntryIndices(prev => prev.size === 0 ? prev : new Set());
@@ -1022,7 +1060,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         const searchData: { searchLines: string[]; entryIndex: number }[] = [];
         entries.forEach((entry, index) => {
           if (index <= lastBoundaryIdx) return;
-          if (entry.type === 'compact' || entry.type === 'continued' || entry.type === 'docs_edit' || entry.type === 'docs_search') return;
+          if (isAttributeEntry(entry)) return;
           const lines = getSearchLines(entry.content);
           if (lines.length > 0) {
             searchData.push({ searchLines: lines, entryIndex: index });
@@ -1055,7 +1093,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         const realIndices: number[] = [];
         entries.forEach((entry, index) => {
           if (index <= lastBoundaryIdx) return;
-          if (entry.type === 'compact' || entry.type === 'continued' || entry.type === 'docs_edit' || entry.type === 'docs_search') return;
+          if (isAttributeEntry(entry)) return;
           realIndices.push(index);
         });
 
@@ -1151,7 +1189,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       const newUnreachable = new Set<number>();
 
       entries.forEach((entry, index) => {
-        if (entry.type === 'compact' || entry.type === 'continued' || entry.type === 'docs_edit' || entry.type === 'docs_search' || entry.isPlan) return;
+        if (isAttributeEntry(entry) || entry.isPlan) return;
         if (index <= lastBoundaryIdx) {
           newUnreachable.add(index);
           return;
@@ -1170,7 +1208,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         }
         for (let j = index + 1; j < entries.length; j++) {
           const next = entries[j];
-          if (next.type === 'compact' || next.type === 'continued' || next.type === 'docs_edit' || next.type === 'docs_search' || next.isPlan) continue;
+          if (isAttributeEntry(next) || next.isPlan) continue;
           if (newUnreachable.has(j)) newUnreachable.add(index);
           break;
         }
@@ -1228,8 +1266,11 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   const tooltipMeasuredRef = useRef(0);
   const [tooltipMeasuredH, setTooltipMeasuredH] = useState(0);
 
-  // Measure actual tooltip height (before paint) to size wrapper precisely
-  // Skip during resize and briefly after — width changes cause text reflow → height change → wrapper repositions → mouse "falls out"
+  // ════════════════════════════════════════════════════════════
+  // SECTION: TOOLTIP HANDLERS — measurement, dismiss-on-mousedown, enter/leave for entry tooltip + tooltip area
+  // ════════════════════════════════════════════════════════════
+
+  // effect: activeTooltipIndex/isExpanded/timelineTooltipWidth → measure tooltipContentRef height before paint → setTooltipMeasuredH (skipped during resize so wrapper doesn't reposition under cursor)
   useLayoutEffect(() => {
     if (isResizingTooltipRef.current) return;
     if (tooltipContentRef.current && activeTooltipIndex !== null) {
@@ -1244,8 +1285,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     }
   }, [activeTooltipIndex, isExpanded, timelineTooltipWidth]);
 
-  // Dismiss tooltip on any mousedown outside tooltip content
-  // Handles: dead zone clicks, scrollbar grabs, clicks elsewhere
+  // effect: activeTooltipIndex open → window mousedown listener closes tooltip when click is outside tooltipContentRef (handles dead-zone clicks, scrollbar grabs)
   useEffect(() => {
     if (activeTooltipIndex === null) return;
     const handleGlobalMouseDown = (e: MouseEvent) => {
@@ -1311,6 +1351,10 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   const clickTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const justSetRangeMenuRef = useRef(false);
+
+  // ════════════════════════════════════════════════════════════
+  // SECTION: CLICK DISPATCH — single/double/right-click + range-selection start; routes to terminal scroll, history-panel scroll, or range action menu
+  // ════════════════════════════════════════════════════════════
 
   const handleEntryClick = (entry: TimelineEntry, e?: React.MouseEvent) => {
     // Если режим выделения активен — показываем меню выбора действия
@@ -1380,6 +1424,17 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     const index = entries.findIndex(e => e.uuid === entry.uuid);
     const clickIsOldHistory = lastBoundaryIndex >= 0 && index <= lastBoundaryIndex;
 
+    // Cmd+Click (macOS) / Ctrl+Click (other) → принудительно открыть History Panel и
+    // проскроллить к этой записи. Обычный клик скроллит в терминале. Mental model
+    // пользователя: «обычный клик → видеть промпт в терминале; Cmd+клик → видеть его
+    // в полной истории». Если панель уже открыта — поведение совпадает с обычным
+    // кликом при isHistoryOpen (scroll-in-history), Cmd просто гарантирует открытие.
+    if (e && (e.metaKey || e.ctrlKey)) {
+      if (!isHistoryOpen) setHistoryPanelOpen(tabId, true);
+      setHistoryScrollToUuid(entry.uuid);
+      return;
+    }
+
     // If history panel is open — scroll to entry in history only, skip terminal scroll
     // This includes compact/continued entries which have no terminal position but DO exist in history panel
     if (isHistoryOpen) {
@@ -1391,7 +1446,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     if (clickIsOldHistory) return;
 
     // Compact/continued/docs_edit/docs_search entries have no terminal position — skip terminal scroll
-    if (entry.type === 'compact' || entry.type === 'continued' || entry.type === 'docs_edit' || entry.type === 'docs_search') return;
+    if (isAttributeEntry(entry)) return;
 
     // SDK tabs: no xterm buffer — dispatch event for React chat scroll
     const sdkTab = (() => { const s = useWorkspaceStore.getState(); for (const [,ws] of s.openProjects) { const t = ws.tabs.get(tabId); if (t) return t.tabType === 'claude-sdk'; } return false; })();
@@ -1519,8 +1574,9 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     setSelectionStartId(entry.uuid);
   };
 
-  const handleRightClick = (e: React.MouseEvent, entry: TimelineEntry) => {
+  const handleRightClick = (e: React.MouseEvent, entry: TimelineEntry, _source?: 'dot' | 'segment') => {
     e.preventDefault();
+    e.stopPropagation();
 
     // Position: anchor popup's RIGHT edge to Timeline's LEFT edge (mirrors note tooltip).
     // X is no longer derived from cursor — vertical position follows the dot, horizontal is
@@ -1545,6 +1601,10 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     setSelectionStartId(entry.uuid);
     setContextMenu(null);
   };
+
+  // ════════════════════════════════════════════════════════════
+  // SECTION: EDIT-RANGE PIPELINE — Gemini compact fetch, executeRangeAction (copy/edit), executeDeleteRange
+  // ════════════════════════════════════════════════════════════
 
   // Standalone Gemini fetch for edit-range. Used by both executeRangeAction (initial)
   // and tab-switch restore (re-fetch after abort). Does NOT touch selection state.
@@ -1814,6 +1874,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     return currentIndex >= min && currentIndex <= max;
   };
 
+  // effect: isExpanded/isNoteEditing/deleteConfirmMode/postPromptMode → window click listener dismisses contextMenu, expanded tooltip, note editor, rangeActionMenu and selection range on outside click
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
       setContextMenu(null);
@@ -1856,6 +1917,10 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     window.addEventListener('click', handleClickOutside);
     return () => window.removeEventListener('click', handleClickOutside);
   }, [isExpanded, isNoteEditing, deleteConfirmMode, postPromptMode]);
+
+  // ════════════════════════════════════════════════════════════
+  // SECTION: REWIND PIPELINE — handleRewind (Gemini-compact via API → TUI menu + paste → scroll stabilization)
+  // ════════════════════════════════════════════════════════════
 
   const handleRewind = async (entry: TimelineEntry, additionalPrompt?: string) => {
     setContextMenu(null);
@@ -2032,7 +2097,9 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     }
   };
 
-  // ── Note handlers ──
+  // ════════════════════════════════════════════════════════════
+  // SECTION: NOTES UI — handleAddNote / handleSaveNote / moveNote / handleEditNote / handleDeleteNote + note strip hover; also handleCopySingleEntry
+  // ════════════════════════════════════════════════════════════
 
   // Copy a single entry: prompt + all assistant responses up to next user/compact.
   // For compact entry — backend embeds compactSummary from the next isCompactSummary user.
@@ -2245,6 +2312,10 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
 
   if (!sessionId) return null;
 
+  // ════════════════════════════════════════════════════════════
+  // SECTION: RENDER GEOMETRY — derive current tooltip/note/fork-tooltip positions from segmentRefs before JSX
+  // ════════════════════════════════════════════════════════════
+
   const currentActiveEntry = activeTooltipIndex !== null ? entries[activeTooltipIndex] : null;
 
   // Compute tooltip wrapper position — uses measured height for precision
@@ -2327,8 +2398,13 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     return { clampedTop, wTop, wH: wBottom - wTop, offset: clampedTop - wTop };
   })() : null;
 
+  // ════════════════════════════════════════════════════════════
+  // SECTION: JSX RENDER — Timeline container, scroll layer, segment loop, overlays, portals
+  // ════════════════════════════════════════════════════════════
+
   return (
     <>
+      {/* ──── CONTAINER (Timeline outer wrapper, 32px wide, slide-animated) ──── */}
       <div
         ref={containerRef}
         data-timeline
@@ -2352,6 +2428,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
 
         {/* Tree mode toggle removed — now controlled from InfoPanel sidebar */}
 
+        {/* ──── SCROLL LAYER (scrollRef — vertical scroll, expands to 160px in tree mode) ──── */}
         {/* Segmented Hit-boxes — in tree mode, expands LEFT as absolute overlay */}
         <div
           ref={scrollRef}
@@ -2374,10 +2451,12 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
             } : {}),
           }}
         >
+          {/* ──── TREE-MODE CHROME (left axis line, only when treeMode true) ──── */}
           {/* Tree mode: left axis line */}
           {treeMode && (
             <div className="absolute top-0 bottom-0 w-px pointer-events-none" style={{ left: '4px', backgroundColor: 'rgba(255, 255, 255, 0.08)' }} />
           )}
+          {/* ──── INNER-RELATIVE WRAPPER (innerWrapperRef — hosts segments + scroll-following overlays) ──── */}
           {/* Inner relative wrapper so absolute overlays (selection, rewind) scroll with content */}
           <div ref={innerWrapperRef} className="relative flex flex-col flex-1">
           {/* Plan mode marker at the very beginning (first entry is from a child session — chain started before visible entries) */}
@@ -2422,6 +2501,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
             </div>
             </Tooltip>
           )}
+          {/* ──── SEGMENT LOOP (entries.map → per-entry dot, note strips, fork stripes, plan-mode boundaries) ──── */}
           {entries.map((entry, index) => {
             const groupInfo = groupMap.get(index);
 
@@ -2682,6 +2762,9 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
 
                   {/* Dot */}
                   {/* Dot: hollow ring if not in buffer (current segment), filled otherwise */}
+                  {/* pointer-events: auto so ПКМ на сам кружок ловится отдельно от полосы —
+                      это позволяет показывать "Копировать compact" только когда клик был
+                      именно по кружку (а не по сегменту-полоске). */}
                   <div
                     className="pointer-events-none shrink-0"
                     style={{
@@ -2692,6 +2775,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                       border: isUnreachable && !isHovered && !isCompacted ? `1px solid ${rewindMarkers.has(entry.uuid) ? '#ec4899' : hasNote && notePos === 'dot' ? '#9333ea' : dotColor}` : 'none',
                       boxShadow: dotGlow,
                       boxSizing: 'border-box',
+                      pointerEvents: 'auto',
                       transition: 'width 0.15s, height 0.15s, border-radius 0.15s, background-color 0.2s, box-shadow 0.2s',
                     }}
                   />
@@ -2878,6 +2962,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
           })}
         </div>
 
+        {/* ──── INNER-WRAPPER OVERLAYS (rangeActionMenu indicator, selection preview, copy/delete/rewind/edit-range pulses with StatusLabelPortal) ──── */}
         {/* Selected Range Indicator (static, when action menu is open) */}
         {isVisible && rangeActionMenu && (() => {
           const rect = getOverlayRect(rangeActionMenu.range.startIndex, rangeActionMenu.range.endIndex);
@@ -3122,6 +3207,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
 
           </div>{/* end inner relative wrapper */}
 
+        {/* ──── EDIT-RANGE PANEL PORTAL (EditRangePanel — Gemini compact display + apply/cancel) ──── */}
         {/* Edit Range Panel (portal) — visible during ready, applying, done */}
         {editRangeState && (editRangeState.phase === 'ready' || editRangeState.phase === 'applying' || editRangeState.phase === 'done') && (() => {
           // After apply, anchor to the compact entry by UUID; before — use range
@@ -3297,6 +3383,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
           return panelEl;
         })()}
 
+        {/* ──── TOOLTIP PORTAL (entry tooltip + CSS hover-bridge to Timeline strip) ──── */}
         {/* Tooltip Portal with CSS Bridge */}
         {isVisible && activeTooltipIndex !== null && currentActiveEntry && tooltipPos && (
           <TooltipPortal>
@@ -3652,6 +3739,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
           </TooltipPortal>
         )}
 
+        {/* ──── EDIT-RANGE LOADING MENU PORTAL (right-click on pink loading overlay → Interrupt/Cancel) ──── */}
         {/* Edit Range Loading Context Menu (right-click on pink overlay) */}
         {editRangeLoadingMenu && editRangeState?.phase === 'loading' && (
           <TooltipPortal>
@@ -3700,6 +3788,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
           </TooltipPortal>
         )}
 
+        {/* ──── CONTEXT MENU PORTAL (right-click on dot → Copy/Note/Rewind/cancel-selection) ──── */}
         {/* Context Menu */}
         {isVisible && contextMenu && (
           <TooltipPortal>
@@ -3723,9 +3812,10 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
             >
               {!selectionStartId ? (
                 <>
-                  {/* Copy single entry — for user (prompt + responses) or compact (with summary).
-                      Skipped for docs_edit/docs_search/continued — those have no copyable content. */}
-                  {(contextMenu.entry.type === 'user' || contextMenu.entry.type === 'compact') && (
+                  {/* "Копировать" — все entries с копируемым контентом:
+                      user (промпт + ответы), compact (summary), continued (Context Overflow Recovery — содержит bridge text).
+                      Цвета дотов: compact=янтарь #fbbf24, continued=янтарь #f59e0b — оба оранжевые. */}
+                  {(contextMenu.entry.type === 'user' || contextMenu.entry.type === 'compact' || contextMenu.entry.type === 'continued') && (
                     <>
                       <button
                         className="w-full text-left px-3 py-2 text-xs text-white hover:bg-blue-600/80 rounded transition-colors cursor-pointer flex items-center gap-2"
@@ -3735,7 +3825,11 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                         }}
                       >
                         <Copy size={12} />
-                        {contextMenu.entry.type === 'compact' ? 'Копировать compact' : 'Копировать'}
+                        {contextMenu.entry.type === 'compact'
+                          ? 'Копировать compact'
+                          : contextMenu.entry.type === 'continued'
+                            ? 'Копировать continued'
+                            : 'Копировать'}
                       </button>
                       <div className="border-t border-white/10 my-1" />
                     </>
@@ -3852,6 +3946,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
           </TooltipPortal>
         )}
 
+        {/* ──── RANGE ACTION MENU PORTAL (Copy/Edit/Delete after range selection; inline delete-confirm + post-prompt textarea) ──── */}
         {/* Range Action Menu — appears after selecting range (double-click start + click end) */}
         {isVisible && rangeActionMenu && (
           <TooltipPortal>
@@ -4093,6 +4188,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
           </TooltipPortal>
         )}
 
+        {/* ──── FORK-MARKER TOOLTIP PORTAL (blue fork stripe → source session + delete-marker button) ──── */}
         {/* Fork Marker Tooltip Portal */}
         {isVisible && activeForkMarkerIndex !== null && activeForkMarker && forkTooltipPos && (
           <TooltipPortal>
@@ -4164,6 +4260,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
           </TooltipPortal>
         )}
 
+        {/* ──── NOTE TOOLTIP PORTAL (purple note tooltip with edit/move/delete + position selector) ──── */}
         {/* Note Tooltip Portal */}
         {isVisible && activeNoteIndex !== null && activeNoteEntry && noteTooltipPos && (
           <TooltipPortal>
@@ -4402,6 +4499,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
           </TooltipPortal>
         )}
 
+        {/* ──── LOADING PLACEHOLDER (centred ping while initial load empty) ──── */}
         {/* Loading */}
         {isVisible && isLoading && entries.length === 0 && (
           <div className="absolute inset-0 flex items-center justify-center bg-black/20">
@@ -4409,6 +4507,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
           </div>
         )}
 
+        {/* ──── SCROLL-TO-BOTTOM ARROW (purple chevron; visibility toggled via ref to avoid re-render) ──── */}
         {/* Scroll-to-bottom arrow — always mounted, visibility toggled via ref (no re-render on scroll) */}
         {isVisible && (
           <Tooltip content="Scroll to bottom">
@@ -4438,6 +4537,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
           </Tooltip>
         )}
 
+        {/* ──── CUSTOM SCROLLBAR THUMB (thumbRef — position/height updated via ref by scroll listener) ──── */}
         {/* Custom scroll indicator — always mounted, position updated via ref (no re-render on scroll) */}
         {isVisible && (
           <div

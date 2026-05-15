@@ -356,6 +356,22 @@ useEffect(() => {
 
 **Ключевая ловушка:** `ResizeObserver` на якорный элемент **не** срабатывает в сценарии «соседняя панель схлопнулась, мой размер не изменился, но мой `left` сдвинулся». Лекарство — наблюдать ещё и за `document.body`: любое изменение flow-layout вызовет resize body, что переизмерит позицию. Не идеально (избыточные обновления при scroll'е), но дешевле чем подписываться на конкретные эвенты каждого соседа.
 
+### Подводный камень: body-observer для Portal-child элементов
+
+Совет «наблюдай `document.body`» работает только пока **сам измеряющий компонент не живёт в body**. Если измеряющий компонент рендерится через `createPortal(content, document.body)` и при этом сам может двигаться (drag-resize, drag-reposition, animation) — получаем feedback-loop:
+
+1. Drag перемещает Portal-child → меняется DOM-layout внутри body.
+2. `ResizeObserver(document.body)` re-fire.
+3. Measure вызывает `setState` (новые координаты anchor'а).
+4. Re-render Portal-child с новыми координатами → новое движение в body.
+5. GOTO 2.
+
+**Симптом:** дёрганый drag, ползающие позиции при анимациях, лагающий resize Portal-модалок. На уровне отдельного кадра всё работает «правильно», но визуально движение порвано.
+
+**Лекарство для Portal-child:** наблюдать **только конкретные anchor-элементы** через `ro.observe(anchorEl)`, плюс `window.addEventListener('resize', measure)` для window-resize fallback. `document.body` не подписывается. Если у тебя несколько anchor'ов — подпишись на каждый явно, не на body.
+
+В custom-terminal: `knowledge/fact-notes.md::Tab Notes Slideout` — модалка в Portal к body, при drag'е по правому хендлу старый код наблюдал body → feedback loop с drag handler'ом → jitter. Фикс — убрали body-observer, оставили только `ResizeObserver(openButton) + window.resize`.
+
 **Когда формула приемлема:** только если **все** компоненты в формуле — постоянно отрисованные fixed-width элементы без условного рендеринга и без resize. Это редкий случай. В сомнении — измеряй.
 
 В custom-terminal: см. `knowledge/fact-timeline.md::Z-index и геометрия popup` (6 popup'ов используют единый `popupRightPx` state из ResizeObserver на containerRef + document.body; кладбище формулы `notesPanelWidth + (treeMode ? 160 : 32) - 8`, которая безусловно вычитала notesPanelWidth даже при закрытой HistoryPanel).
@@ -584,3 +600,87 @@ lsof -ti:5181,3000 2>/dev/null | xargs -r kill -9 2>/dev/null; npm run dev
 **Когда divider должен быть частью блока:** если разделитель **семантически принадлежит** одному из блоков (например, нижняя граница карточки внутри `Card` компонента). Тогда `border-bottom` на верхнем блоке окей. Но если разделитель **между равными секциями** — standalone лучше.
 
 В custom-terminal: `InfoPanel.tsx` AI SESSION / PROVIDER divider — `<hr/>` standalone, симметрия 8+0+8.
+
+## Singleton listener для global events, не в conditionally-rendered компонентах
+
+Когда компонент слушает **global event** (IPC от main, WebSocket, BroadcastChannel, document-level keystrokes, OS-level signals) и реагирует **side-effect'ом которому всё равно показан ли компонент на экране** (отправить следующий промпт в очереди, разлогинить юзера, обновить badge) — listener **не должен** жить в этом компоненте. Должен быть singleton hook на корне приложения.
+
+**Симптом нарушения:** PromptQueueOverlay первой версии содержал `useEffect` с `prevBusyRef` для отслеживания `claude:busy-state` edge transitions. Когда юзер переключался на другой таб → overlay рендерился по gate `effectiveActive` → React unmount → effect cleanup → ref пропал → следующий `busy: false` событие в фоне **никем не обрабатывалось** → авто-отправка очереди молча сломалась. Юзер: *"армил Run after, ушёл работать в gemini, вернулся — ничего не отправилось"*.
+
+**Правило:**
+- Если listener обрабатывает события которые **могут происходить когда компонент скрыт** → singleton hook
+- Если listener обрабатывает **UI-state компонента который сам видим** (hover, focus, scroll) → внутри компонента OK
+- Test: *"Это событие может прийти когда юзер на другом screen'е? Должно ли оно тогда обработаться?"* — Да на оба → singleton.
+
+**Реализация:**
+- Hook монтируется один раз на App root: `function App() { useGlobalRunner(); ... }`
+- Внутри держит state в `useRef<Map<key, value>>` — per-entity tracking без React state churn
+- Subscribes на IPC / WebSocket / store при mount, unsubscribes только при app unmount
+
+**Что выглядит как этот anti-pattern, но им не является:**
+- `useEffect` с `addEventListener` в leaf-компонентах — OK если listener связан **с DOM этого компонента** (focus, mousedown на элементе, IntersectionObserver на элементе). Снос компонента = снос его DOM = listener не нужен.
+- `useEffect` слушающий **per-entity** state (например `claudeSessionId` конкретного таба) — OK, потому что entity-id = scope этого компонента.
+
+**В custom-terminal:** `hooks/usePromptQueueRunner.ts` слушает `claude:busy-state` IPC + Zustand store subscription, fires send-command / stop-ai-process независимо от того какая вкладка показана. Конкретика — `fact-prompt-queue.md::Auto-runner — singleton hook, не в overlay`.
+
+## Drag-state буфер: store-flush на mouseup, не на mousemove
+
+**Принцип:** drag/resize-gesture пишет в **local React state** (или ref). В shared store (Zustand/Redux) и persistent storage (localStorage / IPC / SQLite) флушит **один раз на `mouseup`** / end-of-gesture. Не на каждое mousemove-событие.
+
+**Симптом нарушения:** *«движение какое-то дёрганное при drag'е»*, *«ползунок мигает»*, *«resize lagging»*. Drag-handle вроде следует за курсором, но визуально движение порвано на кадры — будто браузер не успевает.
+
+**Почему наивный подход (`setStore` на каждом mousemove) ломается:**
+- 60 mousemove/sec → 60 синхронных записей. Каждая = `setState` в Zustand → re-render всех подписчиков.
+- Если store-setter побочно делает `localStorage.setItem` + IPC `invoke('app:setState', ...)` → ещё synchronous I/O в main process на каждом кадре.
+- Если рядом стоит `ResizeObserver` на каком-то из родителей — каждый re-render может re-trigger measure (особенно если измеряемый элемент сам движется — см. `::Подводный камень: body-observer для Portal-child элементов`). Получаем re-render → measure → setState → re-render. Feedback loop.
+- Drag handler читает `getBoundingClientRect()` из closure → каждый re-render обновляет closure → handler видит уже сдвинутый rect → расчёт нового положения сдвигается → jitter.
+
+**Решение:**
+```jsx
+const [dragPreview, setDragPreview] = useState(null);
+const startDrag = (e) => {
+  const start = { x: e.clientX, y: e.clientY, val: store.value };
+  setDragPreview(start.val);
+  const onMove = (ev) => {
+    const next = start.val + (ev.clientY - start.y);
+    setDragPreview(next); // ← только local state
+  };
+  const onUp = () => {
+    setDragPreview(curr => {
+      if (curr !== null && curr !== store.value) store.set(curr); // ← один flush
+      return null;
+    });
+    window.removeEventListener('mousemove', onMove);
+    window.removeEventListener('mouseup', onUp);
+  };
+  window.addEventListener('mousemove', onMove);
+  window.addEventListener('mouseup', onUp);
+};
+// Рендер читает live preview во время drag'а, store — вне drag'а:
+const effectiveValue = dragPreview !== null ? dragPreview : store.value;
+```
+
+**Когда применять:** **всегда** при drag/resize UI-контролов, где значения копятся в shared store с persist'ом. Volume slider, color picker, drag-resize панелей, перетаскивание элементов с координатами, любой gesture где промежуточные значения не нужны другим компонентам приложения — preview-state остаётся локальным.
+
+**Что пробовали и почему не сработало (graveyard):**
+- **throttle/debounce store-writes** (~16ms throttle) — спасает persistent-storage от 60Hz записи, но **не от re-render'ов**: throttled write всё равно вызовет `setState` → подписчики re-render'ят → drag handler читает stale rect / новые координаты → jitter возвращается. Только разделение preview-state и store-state даёт стабильность.
+- **`useRef` вместо `useState` для drag-preview** — работает для значения, но рендер не обновится, потому что ref не триггерит re-render. UI замораживается на стартовой позиции до mouseup. Нужно именно `useState` для preview.
+
+**В custom-terminal:** см. `knowledge/fact-notes.md::Tab Notes Slideout::Drag-preview буфер` (`notesPanelSize` + `notesPanelOffsetY` копятся в `dragPreview` local state, flush в Zustand + localStorage + SQLite только на mouseup).
+
+## Hit-area > visual button: расширяй кликабельную зону за пределы видимой кнопки
+
+**Принцип:** если на блоке есть один доминирующий action и видимая кнопка занимает малую долю площади блока (header секции, breadcrumb row, card title), оборачивай **весь блок** в кликабельный контейнер. Саму кнопку оставляй визуальным индикатором — `<span>` или `<div>` с `pointer-events-none`, цвет привязывай к hover-state **контейнера**, а не self-hover. Любая интерактивная дочерняя кнопка (✦ generate, ⚙ settings) получает `e.stopPropagation()` и марк-атрибут (например `data-..-interactive`), чтобы контейнерный onClick игнорировал клики по ней через `target.closest('[data-..-interactive]')`.
+
+**Симптом нарушения:** *«я мажу мимо крошечной кнопки Open»*, *«здесь же видно что это про заметки — почему клик в шапку ничего не делает?»*. Пользователь работает с **смыслом** блока (header = «заметки вкладки»), а не с пикселями кнопки. Каждый промах = трение.
+
+**Когда применять:**
+- Один доминирующий action на блоке. *Если на блоке две независимые кнопки (Save и Delete), оборачивание ломает выбор — каждая кнопка остаётся самостоятельной.*
+- Видимая кнопка — индикатор/affordance, не носитель smart-state. *Tooltip, badge, disabled-state на кнопке остаются понятными — они теперь привязаны к hover-state контейнера.*
+- Внутри блока нет других кликабельных элементов с противоречащим action'ом. Если есть — закрывай их `data-..-interactive` + `stopPropagation`.
+
+**Что пробовали и почему не сработало (graveyard):**
+- **Оставить кнопку как есть, добавить onClick на родителя.** При наведении кнопка меняла цвет (свой `:hover`), а контейнер — нет, либо наоборот. Hover desync — пользователь не понимает где «активная зона». Решение: один источник hover-state (родитель), кнопка читает его как prop.
+- **Делать кнопку растянутой на всю ширину header'а (`flex: 1`)**. Визуально ломает иерархию — кнопка перестаёт выглядеть как кнопка, label рядом теряется. Подходит для «toolbar row», не для «секционного header'а с лейблом».
+
+**В custom-terminal:** `knowledge/fact-notes.md::Tab Notes Slideout::Header hit-area` — весь header «Заметки вкладки» в InfoPanel'и кликабелен, Open-чип внутри стал `<span pointer-events-none>`, ✦ generate-description button имеет `data-notes-header-interactive` + `stopPropagation`.
