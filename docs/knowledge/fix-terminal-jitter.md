@@ -1,6 +1,6 @@
 ---
-name: Terminal Scroll Fix (TERM_PROGRAM + Sync Frame Protection)
-description: Scroll position resets during Claude Code output. Two-part fix — TERM_PROGRAM=vscode triggers Ink's xterm.js-optimized rendering (eliminates most jitter), protectedWrite handles remaining CSI 3J/2J edge cases. 40+ failed approaches documented.
+name: Terminal Scroll Fix (TERM_PROGRAM)
+description: Scroll position resets, viewport jitter, character salad in subagent streams. Single-layer fix — TERM_PROGRAM=vscode triggers Ink's xterm.js-optimized rendering. Claude Code v2.1.101 fixed remaining issues upstream; protectedWrite/sync-frame splitter removed (was causing its own bugs). 40+ failed approaches documented.
 type: fix
 ---
 
@@ -25,9 +25,9 @@ Ink renderer (React для CLI) имеет **разные rendering paths** в �
 
 Обнаружено через анализ исходников Claude Code (`packages/claude-code-src/ink/terminal.ts`): функция `isXtermJs()` проверяет `TERM_PROGRAM === 'vscode'`.
 
-## Решение: два слоя
+## Решение: один слой
 
-### Слой 1: TERM_PROGRAM=vscode (main.js)
+### TERM_PROGRAM=vscode (main.js)
 Одна строка в `shellEnv` при создании PTY:
 ```javascript
 TERM_PROGRAM: 'vscode', // Triggers xterm.js-optimized rendering in Claude Code's Ink
@@ -36,17 +36,10 @@ TERM_PROGRAM: 'vscode', // Triggers xterm.js-optimized rendering in Claude Code'
 
 **Почему vscode**: Ink проверяет `TERM_PROGRAM === 'vscode'` для определения xterm.js. Наш терминал — xterm.js 5.5.0, поведение идентично VS Code terminal.
 
-### Слой 2: protectedWrite (Terminal.tsx, commit c6553c0)
-Для оставшихся edge cases (sync frames с CSI 2J/3J):
+### Layer 2 (protectedWrite) → удалён 2026-05-13
+Существовал для оставшихся edge cases (sync frames с CSI 2J/3J). После upstream-fix Claude Code v2.1.101 стал избыточен и **сам начал генерировать баги** (каша символов у субагентов из-за разреза BSU/ESU между PTY-чанками). Удалён вместе с серией подпорок (cursor-based check, INPUT_ZONE=6, onData→ref clear, снятие isWritingRef guard). Подробности — секция «Upstream fix» ниже. Историческое описание Layer 2 и подпорок сохранено в «Кладбище подходов» и «Cursor-based bottom detection» для защиты от повторного изобретения.
 
-1. **Sync Frame Buffering** — BSU/ESU данные накапливаются и пишутся атомарно
-2. **Conditional CSI 3J Strip** — стрипается только при `userScrollTopRef !== null` (scrolled up). При bottom — проходит, буфер self-heals
-3. **overflow:hidden** — на viewport во время sync frame write, предотвращает Chromium scrollTop clamp
-4. **scrollToLine + Echo Detection** — restore позиции в callback. `lastRestoredYRef` фильтрует паразитные scroll events
-5. **Immediate ref clear on scroll-down** — когда пользователь скроллит вниз до bottom, ref очищается сразу (без debounce), protectedWrite перестаёт snap'ить
-
-## Оставшийся баг
-При скролле вниз к active area во время активного output Claude — лёгкое дёрганье. Причина: protectedWrite snap'ит к сохранённой позиции пока ref не обновлён. Фикс: scroll handler обновляет ref немедленно при скролле вниз, очищает при достижении bottom.
+См. также `methodology/design.md::Удаляй workaround сразу после upstream-fix`.
 
 ## Cursor-based bottom detection (2026-05-13)
 
@@ -175,17 +168,21 @@ E2E тест проверял snapshot viewportY. При oscillation snapshot п
 ### Не ломать работающее ради косметики
 commit `c6553c0` решал проблему. 40+ итераций пытались убрать drift 2-5 строк. Каждая ломала базовый функционал.
 
-## Upstream fix: Claude Code v2.1.101 (2026-04-10)
+## Upstream fix: Claude Code v2.1.101 (2026-04-10) → удалён весь Layer 2
 
 [anthropics/claude-code#35403](https://github.com/anthropics/claude-code/issues/35403) — `ashwin-ant` (Anthropic):
 > "Fixed in v2.1.101 — Stopped emitting ERASE_SCROLLBACK (CSI 3J) on full resets in non-fullscreen mode, so terminal scrollback is preserved instead of being wiped during streaming."
 
-Что это означает для нашего кода:
-- **Layer 1 (`TERM_PROGRAM=vscode`)** — всё ещё нужен, переключает Ink на xterm.js-оптимизированный render path.
-- **Layer 2 (CSI 3J strip в `protectedWrite`)** — стал **избыточен для Claude Code ≥ 2.1.101** в non-fullscreen. Anthropic перестал слать этот код. Оставляем как defence-in-depth для:
-  - Старых версий Claude Code до 2.1.101
-  - Gemini CLI (свой Ink, не патчен Anthropic'ом)
-  - Fullscreen режима (alt-screen всё ещё может отправлять CSI 3J)
+**Удалено в 2026-05-13:** весь sync-frame splitter + `protectedWrite` + связанные refs (`writeBufferRef`, `syncFrameBufferRef`, `insideSyncBlockRef`, `isWritingRef`, `isRestoringRef`, `overflowLocksRef`, `isFitBlockedRef`, `lastRestoredYRef`, `userScrollTopRef`, `pendingWriteRef`). Также сняты cursor-based bottom check и `onData → ref clear` — они существовали только чтобы `protectedWrite` правильно решал когда снапить.
+
+**Почему удалили:**
+1. Изначально splitter ловил BSU/ESU маркеры Ink'a и накапливал sync-frame целиком, чтобы `CSI 3J` внутри кадра не уничтожил scrollback. После v2.1.101 Anthropic не шлёт `CSI 3J` → splitter защищает от того чего нет.
+2. **Хуже того, splitter ломался при разрезе BSU/ESU между PTY-чанками.** node-pty доставляет output произвольными фрагментами; `raw.indexOf('\x1b[?2026h')` ищет полную 7-байтовую строку в одном payload. Если BSU попадал на границу двух chunks, splitter промахивался → frame data с `CSI 2J` шёл в xterm как «normal data» → каша символов на экране. **Чаще всего проявлялось при субагентах** (Task tool stream шлёт много мелких быстрых чанков → высокая вероятность разреза). Симптом юзера: «при запуске субагентов терминал везде ругается и меняется, символы склеиваются в кашу».
+3. Cursor-based bottom check / `INPUT_ZONE=6` / `onData → ref clear` / снятие `isWritingRef` guard — всё это была серия фиксов **для проблем которые создал сам `protectedWrite scrollToLine`**: он каждые ~50ms снапил viewport, провоцируя дрожание. Без `protectedWrite` эти фиксы не нужны — xterm сам корректно ведёт viewport на user input (`scrollOnUserInput: true` дефолт) и follow output (auto-scroll при write если на дне).
+
+**Что осталось:**
+- **Layer 1 (`TERM_PROGRAM=vscode`)** — единственный нужный слой. Переключает Ink на xterm.js-оптимизированный render path (адаптивный scroll drain, без агрессивного CSI 3J).
+- `handleData` теперь просто: `term.write(payload.data)`. Без накопления, без markers, без snap-back'а.
 
 Связанные релизные фиксы Claude Code (без действий с нашей стороны):
 - v2.1.105 — scrollback duplication при resize

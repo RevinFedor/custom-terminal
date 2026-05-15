@@ -863,6 +863,158 @@ function App() {
     ipcRenderer.on('terminal:mcp-restart', handleMcpRestart);
     ipcRenderer.on('terminal:mcp-create', handleMcpCreate);
 
+    // Mobile-web bridge: main process asks renderer to perform UI-state actions
+    // (create SDK tab, send message via the renderer's selected model/effort,
+    // load session history). Reply with same requestId so the HTTP handler in
+    // web-server.js can resolve its bridgeRequest promise.
+    const handleWebBridge = async (_: any, { requestId, action, payload }: { requestId: string; action: string; payload: any }) => {
+      const reply = (ok: boolean, data?: any, error?: string) => {
+        ipcRenderer.send('web:bridge-reply', { requestId, ok, data, error });
+      };
+      try {
+        const state = useWorkspaceStore.getState();
+        if (action === 'getOpenProjectIds') {
+          // Live snapshot of which projects are currently open in the desktop UI.
+          // Used by /api/projects to split the mobile list into Active vs Other.
+          return reply(true, { ids: Array.from(state.openProjects.keys()), activeProjectId: state.activeProjectId || null });
+        }
+        if (action === 'createSDKTab') {
+          const { projectId } = payload || {};
+          if (!projectId) return reply(false, null, 'projectId required');
+          const tabId = await state.createSDKTab(projectId);
+          // Find the actual tab to return its full descriptor
+          const ws = state.openProjects.get(projectId);
+          const tab = ws?.tabs.get(tabId);
+          return reply(true, { tabId, name: tab?.name, cwd: tab?.cwd, projectId });
+        }
+        if (action === 'sendSDKMessage') {
+          const { tabId, prompt, model, effort, thinking, cwd } = payload || {};
+          if (!tabId || !prompt) return reply(false, null, 'tabId+prompt required');
+          // Find the tab to pull defaults if caller didn't supply them
+          let tab: any = null;
+          for (const ws of state.openProjects.values()) {
+            const t = ws.tabs.get(tabId);
+            if (t) { tab = t; break; }
+          }
+          const sendCwd = cwd || tab?.cwd;
+          const sendModel = model ?? tab?.sdkModel;
+          const sendEffort = effort ?? tab?.sdkEffort ?? 'high';
+          const sendThinking = thinking ?? (tab?.sdkThinking === false ? 'disabled' : 'adaptive');
+          // Tell the SDK tab UI a prompt is incoming from outside so it pushes
+          // its own user-bubble (the SDK doesn't always echo the user-message
+          // back through claude-sdk:message immediately, and onNew is only
+          // invoked when the LOCAL composer is the source of the prompt).
+          window.dispatchEvent(new CustomEvent('claude-sdk:external-prompt', {
+            detail: { tabId, text: prompt, source: 'web' },
+          }));
+          const result = await ipcRenderer.invoke('claude-sdk:send-message', {
+            tabId, cwd: sendCwd, prompt, model: sendModel, effort: sendEffort, thinking: sendThinking,
+          });
+          return reply(!!result?.success, result, result?.error);
+        }
+        if (action === 'renameTab') {
+          const { tabId, name } = payload || {};
+          if (!tabId || !name) return reply(false, null, 'tabId+name required');
+          for (const [projectId, ws] of state.openProjects) {
+            if (ws.tabs.has(tabId)) {
+              state.renameTab(projectId, tabId, name);
+              return reply(true, { tabId, name });
+            }
+          }
+          return reply(false, null, 'tab not in any open project');
+        }
+        if (action === 'getSDKParams') {
+          const { tabId } = payload || {};
+          if (!tabId) return reply(false, null, 'tabId required');
+          for (const ws of state.openProjects.values()) {
+            const t = ws.tabs.get(tabId);
+            if (t) return reply(true, {
+              tabId,
+              model: t.sdkModel || 'default',
+              effort: t.sdkEffort || 'high',
+              thinking: t.sdkThinking === false ? 'disabled' : 'adaptive',
+            });
+          }
+          return reply(false, null, 'tab not open');
+        }
+        if (action === 'setSDKParams') {
+          const { tabId, model, effort, thinking } = payload || {};
+          if (!tabId) return reply(false, null, 'tabId required');
+          const partial: any = {};
+          if (model !== undefined) partial.sdkModel = model;
+          if (effort !== undefined) partial.sdkEffort = effort;
+          if (thinking !== undefined) partial.sdkThinking = thinking !== 'disabled';
+          state.updateSDKState(tabId, partial);
+          return reply(true, { tabId, ...partial });
+        }
+        if (action === 'getTabSessionInfo') {
+          const { tabId } = payload || {};
+          if (!tabId) return reply(false, null, 'tabId required');
+          for (const ws of state.openProjects.values()) {
+            const t = ws.tabs.get(tabId);
+            if (t) return reply(true, { tabId, claudeSessionId: t.claudeSessionId, cwd: t.cwd });
+          }
+          return reply(true, { tabId, claudeSessionId: null, cwd: null });
+        }
+        if (action === 'forkToSDK') {
+          const { tabId: srcTabId } = payload || {};
+          if (!srcTabId) return reply(false, null, 'tabId required');
+          // Find source tab
+          let srcTab: any = null;
+          let projectId: string | null = null;
+          for (const [pid, ws] of state.openProjects) {
+            const t = ws.tabs.get(srcTabId);
+            if (t) { srcTab = t; projectId = pid; break; }
+          }
+          if (!srcTab || !projectId) return reply(false, null, 'source tab not open');
+          if (!srcTab.claudeSessionId) return reply(false, null, 'source tab has no Claude session');
+          // Fork the JSONL into a new sessionId, then point a fresh SDK tab at it.
+          const fork = await ipcRenderer.invoke('claude-sdk:fork-from-session', {
+            sessionId: srcTab.claudeSessionId, cwd: srcTab.cwd,
+          });
+          if (!fork?.success) return reply(false, null, fork?.error || 'fork failed');
+          const newTabId = await state.createSDKTab(projectId);
+          state.updateSDKState(newTabId, { claudeSessionId: fork.newSessionId });
+          return reply(true, { tabId: newTabId, sessionId: fork.newSessionId, projectId });
+        }
+        if (action === 'closeTab') {
+          const { tabId } = payload || {};
+          if (!tabId) return reply(false, null, 'tabId required');
+          for (const [projectId, ws] of state.openProjects) {
+            if (ws.tabs.has(tabId)) {
+              // skipProcessCheck so phone-driven close doesn't trigger desktop confirm dialog
+              await state.closeTab(projectId, tabId, { skipProcessCheck: true });
+              return reply(true, { tabId, closed: true });
+            }
+          }
+          return reply(false, null, 'tab not open');
+        }
+        if (action === 'loadSDKHistory') {
+          const { tabId } = payload || {};
+          if (!tabId) return reply(false, null, 'tabId required');
+          let tab: any = null;
+          for (const ws of state.openProjects.values()) {
+            const t = ws.tabs.get(tabId);
+            if (t) { tab = t; break; }
+          }
+          if (!tab?.claudeSessionId) return reply(true, { messages: [] });
+          // Use active-branch handler — uuids align with timeline (so GoTo
+          // anchors work), AND it returns ALL types (user/assistant/tool_use/
+          // tool_result) which the mobile reducer needs to compose tool cards
+          // with statuses. Anthropic SDK's getSessionMessages skips records
+          // outside its idea of "the session" and reuses different uuids.
+          const result = await ipcRenderer.invoke('claude-sdk:active-branch-messages', {
+            sessionId: tab.claudeSessionId, cwd: tab.cwd,
+          });
+          return reply(true, result);
+        }
+        return reply(false, null, 'unknown action: ' + action);
+      } catch (err: any) {
+        return reply(false, null, String(err?.message || err));
+      }
+    };
+    ipcRenderer.on('web:bridge-request', handleWebBridge);
+
     ipcRenderer.on('terminal:command-started', handleCommandStarted);
     ipcRenderer.on('terminal:command-finished', handleCommandFinished);
     ipcRenderer.on('mcp:create-sub-agent-tab', handleMcpCreateSubAgent);
@@ -885,6 +1037,7 @@ function App() {
     return () => {
       ipcRenderer.removeListener('terminal:mcp-restart', handleMcpRestart);
       ipcRenderer.removeListener('terminal:mcp-create', handleMcpCreate);
+      ipcRenderer.removeListener('web:bridge-request', handleWebBridge);
       ipcRenderer.removeListener('terminal:command-started', handleCommandStarted);
       ipcRenderer.removeListener('terminal:command-finished', handleCommandFinished);
       ipcRenderer.removeListener('mcp:create-sub-agent-tab', handleMcpCreateSubAgent);
@@ -965,6 +1118,50 @@ function App() {
     return () => unsub();
   }, []);
 
+  // Semantic index watchers — start/stop per open project.
+  // Subscribe to openProjects keys (not full Map ref) so we only react to add/remove,
+  // not to internal tab mutations.
+  useEffect(() => {
+    const tracked = new Set<string>();
+
+    const sync = () => {
+      const state = useWorkspaceStore.getState();
+      const { projects: projectsMap } = useProjectsStore.getState();
+      const currentIds = new Set(state.openProjects.keys());
+
+      // Start watching newly opened projects
+      for (const projectId of currentIds) {
+        if (tracked.has(projectId)) continue;
+        const proj = projectsMap[projectId];
+        if (!proj?.path) continue;
+        ipcRenderer.invoke('semantic-index:watch', { projectId, projectPath: proj.path }).catch(() => {});
+        tracked.add(projectId);
+      }
+
+      // Stop watching closed projects
+      for (const projectId of Array.from(tracked)) {
+        if (!currentIds.has(projectId)) {
+          ipcRenderer.invoke('semantic-index:unwatch', { projectId }).catch(() => {});
+          tracked.delete(projectId);
+        }
+      }
+    };
+
+    // Initial run (after project list loads)
+    sync();
+
+    const unsubWs = useWorkspaceStore.subscribe(sync);
+    const unsubProj = useProjectsStore.subscribe(sync);
+
+    return () => {
+      unsubWs();
+      unsubProj();
+      for (const projectId of tracked) {
+        ipcRenderer.invoke('semantic-index:unwatch', { projectId }).catch(() => {});
+      }
+    };
+  }, []);
+
   // Monitor drag-and-drop for project tabs reordering
   useEffect(() => {
     return monitorForElements({
@@ -1023,20 +1220,6 @@ function App() {
       // Debug: log all Cmd+key combinations
       if (e.metaKey) {
         console.log('[Hotkey] Cmd +', e.code, e.key, 'view:', view);
-      }
-
-      // Cmd+. - Open VS Code in current terminal's CWD
-      if (e.metaKey && e.key === '.') {
-        e.preventDefault();
-        const activeProject = getActiveProject();
-        const currentProject = projects[activeProjectId!];
-        const effectiveId = getEffectiveTabId();
-        const currentTab = effectiveId && activeProject ? activeProject.tabs.get(effectiveId) : null;
-        const cwd = currentTab?.cwd || currentProject?.path || process.env.HOME;
-        console.log('[Hotkey] Opening VS Code in:', cwd);
-        const { exec } = window.require('child_process');
-        exec('code .', { cwd });
-        return;
       }
 
       // Cmd+B - Toggle file explorer (legacy, also available via Cmd+E in Workspace)

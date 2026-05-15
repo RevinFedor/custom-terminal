@@ -50,7 +50,13 @@ const SessionManager = require(path.join(srcMainDir, 'session-manager'));
 const ClaudeManager = require(path.join(srcMainDir, 'claude-manager'));
 const { resolveGeminiProjectDir, findGeminiSessionFile, invalidateProjectsJsonCache, getGeminiProjectsJson, calculateGeminiHash } = require(path.join(srcMainDir, 'gemini-utils'));
 const ClaudeAgentManager = require(path.join(srcMainDir, 'claude-agent'));
-const { findSessionFile, loadJsonlRecords, resolveSessionChain, resolveLatestSessionInChain, parseTimelineUuids } = require(path.join(srcMainDir, 'ipc', 'claude-data'));
+const { findSessionFile, loadJsonlRecords, resolveSessionChain, resolveLatestSessionInChain, parseTimelineUuids, parseTimelineEntries } = require(path.join(srcMainDir, 'ipc', 'claude-data'));
+
+// SDK session registry — declared early so the mobile-web server can receive
+// the same Map by reference at startup (web-server.start({sdkSessions})).
+// Populated by sdkStartQuery; the actual SDK code lives in the CLAUDE SDK
+// section near the end of this file.
+const sdkSessions = new Map(); // tabId → { query, abortController, sessionId, cwd }
 
 const isDev = !app.isPackaged;
 
@@ -1375,6 +1381,67 @@ ipcMain.on('show-terminal-context-menu', async (event, { hasSelection, prompts, 
 
   template.push({ role: 'copy' });
   template.push({ role: 'paste' });
+  template.push({ type: 'separator' });
+  template.push({ role: 'selectAll' });
+
+  const menu = Menu.buildFromTemplate(template);
+  menu.popup(BrowserWindow.fromWebContents(event.sender));
+});
+
+// SDK tab context menu — slim version, no Scripts / no Research / no Compact.
+// Three sections only: Copy + Paste (system roles), separator, Insert Prompt
+// submenu (same prompt-store data as the terminal menu uses). The "insert-prompt"
+// command travels back through the existing `context-menu-command` channel —
+// ClaudeSDKTab listens and routes the payload into its composer textarea.
+ipcMain.on('show-sdk-context-menu', (event, { tabId, hasSelection } = {}) => {
+  let prompts = [];
+  let promptGroups = [];
+  try { prompts = projectManager.getPrompts(); } catch {}
+  try { promptGroups = projectManager.getPromptGroups(); } catch {}
+
+  const template = [];
+  template.push({ role: 'copy', enabled: !!hasSelection });
+  template.push({ role: 'paste' });
+
+  if (prompts && prompts.length > 0) {
+    template.push({ type: 'separator' });
+
+    const promptsSubmenu = [];
+    const flatItems = [];
+    promptGroups.forEach(g => flatItems.push({ type: 'group', group: g, pos: g.position }));
+    prompts.filter(p => !p.group_id).forEach(p => flatItems.push({ type: 'prompt', prompt: p, pos: p.position }));
+    flatItems.sort((a, b) => a.pos - b.pos);
+
+    const buildInsertData = (p) => ({
+      content: p.content,
+      filePaths: (p.file_paths && p.file_paths.length > 0) ? p.file_paths : [],
+      tabId,
+      sdk: true, // marker so renderer can route to SDK composer instead of PTY
+    });
+
+    flatItems.forEach(item => {
+      if (item.type === 'group') {
+        const groupPrompts = prompts.filter(p => p.group_id === item.group.id);
+        promptsSubmenu.push({
+          label: item.group.name,
+          submenu: groupPrompts.length > 0
+            ? groupPrompts.map(p => ({
+                label: p.title,
+                click: () => { event.sender.send('context-menu-command', 'insert-prompt', buildInsertData(p)); },
+              }))
+            : [{ label: '(empty)', enabled: false }],
+        });
+      } else {
+        promptsSubmenu.push({
+          label: item.prompt.title,
+          click: () => { event.sender.send('context-menu-command', 'insert-prompt', buildInsertData(item.prompt)); },
+        });
+      }
+    });
+
+    template.push({ label: 'Insert Prompt', submenu: promptsSubmenu });
+  }
+
   template.push({ type: 'separator' });
   template.push({ role: 'selectAll' });
 
@@ -3941,6 +4008,53 @@ app.whenReady().then(() => {
     console.log('[Startup] MCP HTTP server OK');
   } catch (e) {
     console.error('[Startup] MCP HTTP server ERROR:', e.message);
+  }
+
+  // Renderer-driven hard reload. Direct location.reload() in Electron sometimes
+  // routes through the OS default URL handler (file:// → Yandex/whatever) when
+  // the page lives at a custom protocol; bouncing through main + webContents.reload()
+  // stays inside the current BrowserWindow regardless.
+  ipcMain.on('app:reload', (event) => {
+    try {
+      const win = BrowserWindow.fromWebContents(event.sender);
+      if (win && !win.isDestroyed()) win.webContents.reload();
+    } catch (e) {
+      console.error('[app:reload] error', e.message);
+    }
+  });
+
+  // ========== MOBILE WEB SERVER (HTTP+WS for phone access) ==========
+  console.log('[Startup] Starting Mobile WebServer...');
+  try {
+    // Load from src/main, not dist/main — electron-vite only bundles main.js,
+    // sibling modules live as raw .js files (same pattern as claude-agent etc).
+    const webServer = require(path.join(srcMainDir, 'web-server'));
+    webServer.start({ sdkSessions });
+    console.log('[Startup] Mobile WebServer OK');
+
+    // Expose connection info to the renderer's StatusBar chip.
+    ipcMain.handle('web:get-info', () => {
+      try {
+        return webServer.getInfo();
+      } catch (e) {
+        return { running: false, error: String(e.message) };
+      }
+    });
+    // Open the LAN URL in the user's default browser (the StatusBar chip uses
+    // this so a single click works without the user having to copy+paste).
+    ipcMain.handle('web:open-in-browser', () => {
+      try {
+        const info = webServer.getInfo();
+        if (!info.running) return { ok: false, error: 'web-server not running' };
+        const url = `http://${info.lanIp}:${info.port}/?token=${encodeURIComponent(info.token)}`;
+        require('electron').shell.openExternal(url);
+        return { ok: true };
+      } catch (e) {
+        return { ok: false, error: String(e.message) };
+      }
+    });
+  } catch (e) {
+    console.error('[Startup] Mobile WebServer ERROR:', e.message);
   }
 
   // Restore persisted response queue from previous session
@@ -7222,6 +7336,9 @@ require(path.join(srcMainDir, 'ipc', 'semantic-search')).register({ projectManag
 // claude:get-timeline, claude:export-clean-session, claude:get-full-history → ipc/claude-data.js
 require(path.join(srcMainDir, 'ipc', 'claude-data')).register({ projectManager, formatToolAction });
 
+// semantic-index:watch, semantic-index:rebuild, semantic-index:status → ipc/semantic-index-status.js
+require(path.join(srcMainDir, 'ipc', 'semantic-index-status')).register({ getMainWindow: () => mainWindow });
+
 
 
 // ========== SESSION PERSISTENCE ==========
@@ -8381,11 +8498,94 @@ ipcMain.on('claude:run-command', (event, { tabId, command, sessionId, forkSessio
 // ====================== CLAUDE SDK ======================
 // Manages Claude Agent SDK sessions (headless, no PTY)
 // SDK writes its own JSONL — Timeline reads it via existing claude:get-timeline
+// (mcpServers forwarding from ~/.claude.json — added below)
 
-const sdkSessions = new Map(); // tabId → { query, abortController, sessionId, cwd }
+// (sdkSessions declared early at top-of-file so web-server can receive the Map by reference)
+
+// SDK does NOT inherit the user's ~/.claude.json mcpServers automatically (Claude Code CLI does,
+// but the agent SDK is conservative — empty mcpServers by default). We load the global config
+// once at first use, cache it for the life of the Electron main process, then forward it into
+// every query() options object. Each SDK session spawns its OWN set of stdio MCP processes
+// (one set per active tab — they exit when session.query.close() runs). Singletons like the
+// browser-mcp bridge handle multiple per-session clients on their own.
+// Authoritative source for "which effort levels does model X support" — SDK
+// ships a manifest via query.supportedModels() returning ModelInfo[] with
+// supportedEffortLevels. We can't hard-code the table (Anthropic ships new
+// generations independent of our release cycle); we call SDK once at first
+// need, cache for the life of the Electron main process. Restart picks up
+// new SDK versions automatically.
+//
+// Why a streaming query just to read metadata: supportedModels() is a Query
+// method, not a top-level export. We open a minimal streaming query, call the
+// method, close the query — net cost is a few hundred ms once per launch.
+let _sdkModelCapsCache = null;
+let _sdkModelCapsPromise = null;
+async function loadSdkModelCapabilities() {
+  if (_sdkModelCapsCache) return _sdkModelCapsCache;
+  if (_sdkModelCapsPromise) return _sdkModelCapsPromise;
+  _sdkModelCapsPromise = (async () => {
+    try {
+      const { query } = await import('@anthropic-ai/claude-agent-sdk');
+      // Streaming input mode is required for control-request methods. We feed
+      // an async iterable that never yields — the query stays parked waiting
+      // for input, which is fine because we only need control methods.
+      const neverEnding = (async function*() {
+        // eslint-disable-next-line no-constant-condition
+        while (true) {
+          await new Promise(r => setTimeout(r, 60000));
+          yield { type: 'user', message: { role: 'user', content: '' } };
+        }
+      })();
+      // SDK 0.3.x requires `allowDangerouslySkipPermissions: true` alongside
+      // `permissionMode: 'bypassPermissions'` — without it the CLI process
+      // refuses to start (safety gate against accidentally inheriting bypass).
+      const q = query({ prompt: neverEnding, options: { permissionMode: 'bypassPermissions', allowDangerouslySkipPermissions: true } });
+      const models = await q.supportedModels();
+      try { q.close(); } catch {}
+      const map = {};
+      for (const m of models) {
+        if (m?.value && Array.isArray(m.supportedEffortLevels)) {
+          map[m.value] = m.supportedEffortLevels;
+        }
+      }
+      console.log('[ClaudeSDK] model capabilities loaded: ' + Object.keys(map).length + ' models');
+      _sdkModelCapsCache = map;
+      return map;
+    } catch (err) {
+      console.warn('[ClaudeSDK] failed to read model capabilities:', err.message);
+      _sdkModelCapsCache = {};
+      return _sdkModelCapsCache;
+    } finally {
+      _sdkModelCapsPromise = null;
+    }
+  })();
+  return _sdkModelCapsPromise;
+}
+
+let _sdkMcpServersCache = null;
+function loadGlobalMcpServers() {
+  if (_sdkMcpServersCache !== null) return _sdkMcpServersCache;
+  try {
+    const cfgPath = require('path').join(require('os').homedir(), '.claude.json');
+    const raw = require('fs').readFileSync(cfgPath, 'utf8');
+    const cfg = JSON.parse(raw);
+    _sdkMcpServersCache = (cfg && cfg.mcpServers) ? cfg.mcpServers : {};
+    console.log('[ClaudeSDK] mcpServers loaded from ~/.claude.json: ' + Object.keys(_sdkMcpServersCache).join(','));
+  } catch (err) {
+    console.warn('[ClaudeSDK] failed to read ~/.claude.json mcpServers, running without MCP:', err.message);
+    _sdkMcpServersCache = {};
+  }
+  return _sdkMcpServersCache;
+}
+
+// Best-effort handle to web-server (lazy require — survives if module missing).
+// Same path resolution as the startup load — must use srcMainDir, not relative.
+function _webBroadcast(tabId, payload) {
+  try { require(path.join(srcMainDir, 'web-server')).webBroadcast(tabId, payload); } catch {}
+}
 
 // Shared function: start SDK query and stream results to renderer
-async function sdkStartQuery(tabId, cwd, prompt, resumeSessionId, model, effort) {
+async function sdkStartQuery(tabId, cwd, prompt, resumeSessionId, model, effort, thinking) {
   // Close existing query if still running (prevents dual streaming loops)
   const existing = sdkSessions.get(tabId);
   if (existing?.query) {
@@ -8396,12 +8596,21 @@ async function sdkStartQuery(tabId, cwd, prompt, resumeSessionId, model, effort)
   const { query } = await import('@anthropic-ai/claude-agent-sdk');
 
   const abortController = new AbortController();
+  const mcpServers = loadGlobalMcpServers();
+  // thinking: 'adaptive' (default — Opus 4.7+, effort drives thinking depth) or 'disabled'.
+  // We always set it explicitly so toggling the UI Think pill is observable in JSONL.
+  const thinkingMode = thinking === 'disabled' ? 'disabled' : 'adaptive';
   const options = {
     abortController,
     cwd: cwd || process.cwd(),
     permissionMode: 'bypassPermissions',
+    // SDK 0.3.x explicit safety gate — must be true together with
+    // bypassPermissions or the CLI rejects the request at handshake.
+    allowDangerouslySkipPermissions: true,
     model: model || undefined,
     effort: effort || 'high',
+    thinking: { type: thinkingMode },
+    mcpServers,
   };
   if (resumeSessionId) {
     options.resume = resumeSessionId;
@@ -8412,6 +8621,19 @@ async function sdkStartQuery(tabId, cwd, prompt, resumeSessionId, model, effort)
   sdkSessions.set(tabId, session);
 
   console.log('[ClaudeSDK] query started tabId=' + tabId + (resumeSessionId ? ' resume=' + resumeSessionId : ' new'));
+  // Mirror busy state and the user's prompt to phone clients (they need to
+  // render the user-message bubble too — local renderer does it from its own
+  // state, but the phone has no such state without help).
+  _webBroadcast(tabId, { type: 'busy', busy: true });
+  _webBroadcast(tabId, {
+    type: 'message',
+    sessionId: resumeSessionId || null,
+    message: {
+      type: 'user',
+      message: { role: 'user', content: [{ type: 'text', text: typeof prompt === 'string' ? prompt : '' }] },
+      __webSynthetic: true,
+    },
+  });
 
   // Stream messages to renderer (fire-and-forget)
   (async () => {
@@ -8427,18 +8649,17 @@ async function sdkStartQuery(tabId, cwd, prompt, resumeSessionId, model, effort)
         }
 
         win.webContents.send('claude-sdk:message', { tabId, message, sessionId: session.sessionId || message.session_id });
+        _webBroadcast(tabId, { type: 'message', message, sessionId: session.sessionId || message.session_id });
       }
     } catch (err) {
       if (err.name !== 'AbortError') {
         console.error('[ClaudeSDK] stream error:', err.message);
         const win = BrowserWindow.getAllWindows()[0];
+        const errorMsg = { type: 'result', subtype: 'error', result: String(err.message || err), is_error: true };
         if (win && !win.isDestroyed()) {
-          win.webContents.send('claude-sdk:message', {
-            tabId,
-            sessionId: session.sessionId,
-            message: { type: 'result', subtype: 'error', result: String(err.message || err), is_error: true }
-          });
+          win.webContents.send('claude-sdk:message', { tabId, sessionId: session.sessionId, message: errorMsg });
         }
+        _webBroadcast(tabId, { type: 'message', sessionId: session.sessionId, message: errorMsg });
       }
     } finally {
       sdkSessions.delete(tabId);
@@ -8446,6 +8667,8 @@ async function sdkStartQuery(tabId, cwd, prompt, resumeSessionId, model, effort)
       if (win && !win.isDestroyed()) {
         win.webContents.send('claude-sdk:done', { tabId, sessionId: session.sessionId });
       }
+      _webBroadcast(tabId, { type: 'busy', busy: false });
+      _webBroadcast(tabId, { type: 'done', sessionId: session.sessionId });
       console.log('[ClaudeSDK] stream ended tabId=' + tabId);
     }
   })();
@@ -8453,10 +8676,10 @@ async function sdkStartQuery(tabId, cwd, prompt, resumeSessionId, model, effort)
   return session;
 }
 
-ipcMain.handle('claude-sdk:create-session', async (event, { tabId, cwd, prompt, model, effort }) => {
-  console.log('[ClaudeSDK] create-session tabId=' + tabId + ' cwd=' + cwd);
+ipcMain.handle('claude-sdk:create-session', async (event, { tabId, cwd, prompt, model, effort, thinking }) => {
+  console.log('[ClaudeSDK] create-session tabId=' + tabId + ' cwd=' + cwd + ' effort=' + effort + ' thinking=' + thinking);
   try {
-    await sdkStartQuery(tabId, cwd, prompt, null, model, effort);
+    await sdkStartQuery(tabId, cwd, prompt, null, model, effort, thinking);
     return { success: true };
   } catch (err) {
     console.error('[ClaudeSDK] create-session failed:', err.message);
@@ -8464,17 +8687,17 @@ ipcMain.handle('claude-sdk:create-session', async (event, { tabId, cwd, prompt, 
   }
 });
 
-ipcMain.handle('claude-sdk:send-message', async (event, { tabId, cwd, prompt, model, effort }) => {
-  console.log('[ClaudeSDK] send-message tabId=' + tabId);
+ipcMain.handle('claude-sdk:send-message', async (event, { tabId, cwd, prompt, model, effort, thinking }) => {
+  console.log('[ClaudeSDK] send-message tabId=' + tabId + ' effort=' + effort + ' thinking=' + thinking);
   const existingSession = sdkSessions.get(tabId);
 
   try {
     if (!existingSession || !existingSession.sessionId) {
       // No active session — start fresh
-      await sdkStartQuery(tabId, cwd, prompt, null, model, effort);
+      await sdkStartQuery(tabId, cwd, prompt, null, model, effort, thinking);
     } else {
       // Resume existing session
-      await sdkStartQuery(tabId, existingSession.cwd, prompt, existingSession.sessionId, model, effort);
+      await sdkStartQuery(tabId, existingSession.cwd, prompt, existingSession.sessionId, model, effort, thinking);
     }
     return { success: true };
   } catch (err) {
@@ -8510,6 +8733,14 @@ ipcMain.handle('claude-sdk:load-history', async (event, { sessionId, cwd }) => {
   }
 });
 
+// Exposes SDK-shipped model capability table to renderer. Returns
+// { [modelId]: ['low','medium','high','xhigh','max'][] }. Renderer uses this
+// to gate effort pills per active model and auto-downgrade unsupported pairs.
+ipcMain.handle('claude-sdk:get-model-caps', async () => {
+  const caps = await loadSdkModelCapabilities();
+  return { success: true, caps };
+});
+
 ipcMain.handle('claude-sdk:stop', async (event, { tabId }) => {
   console.log('[ClaudeSDK] stop tabId=' + tabId);
   const session = sdkSessions.get(tabId);
@@ -8523,4 +8754,226 @@ ipcMain.handle('claude-sdk:stop', async (event, { tabId }) => {
     return { success: true };
   }
   return { success: false, error: 'no active session' };
+});
+
+// Truncate session JSONL: drop everything from `targetUuid` to the end of the
+// active branch. Used by Edit/Repeat in ClaudeSDKTab — both buttons rewrite
+// history so the next message becomes the new branch tip. No compact entry,
+// no relinking: the surviving prefix is the new chain root, last surviving
+// record is the new tip (its UUID becomes the parent for the next message that
+// `claude-sdk:send-message` writes via `--resume <sessionId>`).
+//
+// Parent-chain backtrace = same algorithm as Timeline / edit-range. We walk
+// from the file's last record up via parentUuid, then cut the active branch at
+// targetUuid (inclusive) and drop everything at-or-after that index, plus any
+// records *not* in the active prefix (dead branches, stale bridges) so they
+// can't beat the new tip on timestamp during `--resume`.
+ipcMain.handle('claude-sdk:truncate-history', async (event, { sessionId, cwd, targetUuid }) => {
+  console.log('[ClaudeSDK] truncate-history sid=' + sessionId?.slice(0, 8) + ' target=' + targetUuid?.slice(0, 8));
+  if (!sessionId || !targetUuid) return { success: false, error: 'sessionId + targetUuid required' };
+
+  try {
+    const found = findSessionFile(sessionId, cwd);
+    if (!found) return { success: false, error: 'Session file not found' };
+    const filePath = found.filePath;
+
+    const content = await fs.promises.readFile(filePath, 'utf-8');
+    const lines = content.split('\n').filter(l => l.trim());
+
+    // Parse all records keeping originals so we can write back unchanged ones.
+    const allRecords = [];
+    const recordMap = new Map();
+    for (const line of lines) {
+      try {
+        const entry = JSON.parse(line);
+        allRecords.push({ entry, raw: line });
+        if (entry.uuid) recordMap.set(entry.uuid, entry);
+      } catch {
+        // Preserve unparseable lines (proxy crashes can leave half-written records);
+        // they'll be carried through unless they happen to come after targetUuid in
+        // the file order, in which case we treat them as junk and drop them.
+        allRecords.push({ entry: null, raw: line });
+      }
+    }
+
+    if (!recordMap.has(targetUuid)) {
+      return { success: false, error: 'targetUuid not in session file' };
+    }
+
+    // Build the active branch by walking parentUuid back from the last entry.
+    const lastParseable = allRecords.filter(r => r.entry?.uuid).pop();
+    if (!lastParseable) return { success: false, error: 'No parseable records' };
+
+    const activeBranch = []; // entries from root → tip
+    {
+      let cur = lastParseable.entry.uuid;
+      const seen = new Set();
+      while (cur && !seen.has(cur)) {
+        seen.add(cur);
+        const rec = recordMap.get(cur);
+        if (!rec) break;
+        activeBranch.unshift(rec);
+        cur = rec.logicalParentUuid || rec.parentUuid;
+      }
+    }
+
+    const targetIdx = activeBranch.findIndex(e => e.uuid === targetUuid);
+    if (targetIdx === -1) {
+      return { success: false, error: 'targetUuid not in active branch (probably belongs to a dead fork)' };
+    }
+
+    // Surviving prefix: active branch entries strictly BEFORE targetUuid.
+    const survivingUuids = new Set();
+    for (let i = 0; i < targetIdx; i++) survivingUuids.add(activeBranch[i].uuid);
+
+    // Cascade-drop orphans: any surviving record whose parent is no longer in the
+    // surviving set must also go. Without this, a leftover dead-branch entry can
+    // out-timestamp the new tip when Claude does `--resume`. Iterate to fixed point.
+    const allKeptInitially = new Set(survivingUuids);
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const r of allRecords) {
+        if (!r.entry?.uuid) continue;
+        if (!allKeptInitially.has(r.entry.uuid)) continue;
+        const parent = r.entry.logicalParentUuid || r.entry.parentUuid;
+        if (parent && !allKeptInitially.has(parent)) {
+          allKeptInitially.delete(r.entry.uuid);
+          changed = true;
+        }
+      }
+    }
+
+    const removedCount = allRecords.filter(r => r.entry?.uuid && !allKeptInitially.has(r.entry.uuid)).length;
+
+    // Write back: keep records in original file order (stable), drop unwanted ones.
+    // Header records without UUIDs (permission-mode, ai-title) survive — they're
+    // file-level metadata, not part of the conversation chain.
+    const outputLines = [];
+    for (const r of allRecords) {
+      if (!r.entry) continue; // skip junk lines unconditionally
+      if (!r.entry.uuid) {
+        outputLines.push(r.raw); // metadata header
+        continue;
+      }
+      if (allKeptInitially.has(r.entry.uuid)) outputLines.push(r.raw);
+    }
+
+    // Atomic write — temp file + rename so a crash mid-write can't corrupt JSONL.
+    const tmpPath = filePath + '.tmp-' + Date.now();
+    await fs.promises.writeFile(tmpPath, outputLines.join('\n') + '\n', 'utf-8');
+    await fs.promises.rename(tmpPath, filePath);
+
+    console.log('[ClaudeSDK] truncate-history removed=' + removedCount + ' kept=' + outputLines.length);
+    return { success: true, removed: removedCount };
+  } catch (err) {
+    console.error('[ClaudeSDK] truncate-history failed:', err.message);
+    return { success: false, error: String(err.message || err) };
+  }
+});
+
+// Mobile chat history loader. We can't reuse `getSessionMessages` from the
+// Anthropic SDK because it returns a DIFFERENT set than parseTimelineEntries
+// — the uuids don't intersect, so GoTo (which uses timeline uuids as anchors)
+// never finds a match in the rendered chat. This handler reads the JSONL,
+// walks the active branch via parentUuid (same algorithm as Timeline), and
+// returns the records in chain order — user-prompts, assistant replies,
+// tool_use blocks, AND tool_result entries (the latter are needed so the
+// reducer can resolve tool statuses). Anchors then line up perfectly.
+ipcMain.handle('claude-sdk:active-branch-messages', async (event, { sessionId, cwd }) => {
+  if (!sessionId) return { success: false, error: 'sessionId required', messages: [] };
+  try {
+    const found = findSessionFile(sessionId, cwd);
+    if (!found) return { success: false, error: 'session file not found', messages: [] };
+    const content = require('fs').readFileSync(found.filePath, 'utf-8');
+    const lines = content.trim().split('\n').filter(l => l.trim());
+    const recordMap = new Map();
+    let last = null;
+    for (const line of lines) {
+      try {
+        const e = JSON.parse(line);
+        if (e.uuid) { recordMap.set(e.uuid, e); last = e; }
+      } catch {}
+    }
+    if (!last) return { success: true, messages: [] };
+    // Active branch = walk back from last via parentUuid, then reverse.
+    const branch = [];
+    let cur = last.uuid;
+    const seen = new Set();
+    while (cur && !seen.has(cur)) {
+      seen.add(cur);
+      const rec = recordMap.get(cur);
+      if (!rec) break;
+      branch.unshift(rec);
+      cur = rec.logicalParentUuid || rec.parentUuid;
+    }
+    return { success: true, messages: branch };
+  } catch (err) {
+    console.error('[ClaudeSDK] active-branch-messages failed:', err.message);
+    return { success: false, error: String(err.message || err), messages: [] };
+  }
+});
+
+// Mobile-web Timeline view. Returns active-branch entries with previews,
+// full text, color band, and tool calls. Wraps parseTimelineEntries —
+// shared with the desktop Timeline (single source of truth for the JSONL
+// backtrace algorithm).
+ipcMain.handle('claude-sdk:timeline-entries', async (event, { sessionId, cwd }) => {
+  if (!sessionId) return { success: false, error: 'sessionId required', entries: [] };
+  try {
+    const found = findSessionFile(sessionId, cwd);
+    if (!found) return { success: false, error: 'session file not found', entries: [] };
+    const entries = parseTimelineEntries(found.filePath);
+    return { success: true, entries, sessionId, filePath: found.filePath };
+  } catch (err) {
+    console.error('[ClaudeSDK] timeline-entries failed:', err.message);
+    return { success: false, error: String(err.message || err), entries: [] };
+  }
+});
+
+// Fork an existing Claude session JSONL into a new sessionId WITHOUT spawning
+// Claude. Used by mobile: long-press on a PTY claude tab → "Fork into SDK"
+// makes a copy of the session and points a new SDK tab at it. The actual SDK
+// run starts later when the user (or mobile) sends the first prompt — Claude
+// CLI's --resume <newSessionId> picks up the copied JSONL on disk.
+ipcMain.handle('claude-sdk:fork-from-session', async (event, { sessionId, cwd }) => {
+  console.log('[ClaudeSDK] fork-from-session sid=' + sessionId?.slice(0, 8));
+  if (!sessionId) return { success: false, error: 'sessionId required' };
+  try {
+    const claudeProjectsDir = path.join(os.homedir(), '.claude', 'projects');
+    const projectSlug = (cwd || process.cwd()).replace(/\//g, '-');
+    const primaryDir = path.join(claudeProjectsDir, projectSlug);
+    const primaryPath = path.join(primaryDir, `${sessionId}.jsonl`);
+
+    let sourcePath = null;
+    if (fs.existsSync(primaryPath)) {
+      sourcePath = primaryPath;
+    } else if (fs.existsSync(claudeProjectsDir)) {
+      // Search every project dir
+      const dirs = fs.readdirSync(claudeProjectsDir, { withFileTypes: true })
+        .filter(d => d.isDirectory()).map(d => d.name);
+      for (const dir of dirs) {
+        const p = path.join(claudeProjectsDir, dir, `${sessionId}.jsonl`);
+        if (fs.existsSync(p)) { sourcePath = p; break; }
+      }
+    }
+    if (!sourcePath) return { success: false, error: 'source JSONL not found for ' + sessionId };
+
+    const newSessionId = crypto.randomUUID();
+    if (!fs.existsSync(primaryDir)) fs.mkdirSync(primaryDir, { recursive: true });
+    const destPath = path.join(primaryDir, `${newSessionId}.jsonl`);
+    fs.copyFileSync(sourcePath, destPath);
+
+    // Mark the fork in DB so Timeline can show the boundary in both sessions
+    try {
+      const entryUuids = parseTimelineUuids(sourcePath);
+      projectManager.db.saveForkMarker(sessionId, newSessionId, entryUuids);
+    } catch (e) { console.warn('[ClaudeSDK] fork marker save error:', e.message); }
+
+    console.log('[ClaudeSDK] forked ' + sessionId.slice(0, 8) + ' → ' + newSessionId.slice(0, 8));
+    return { success: true, newSessionId, cwd: cwd || process.cwd() };
+  } catch (err) {
+    console.error('[ClaudeSDK] fork-from-session failed:', err.message);
+    return { success: false, error: String(err.message || err) };
+  }
 });

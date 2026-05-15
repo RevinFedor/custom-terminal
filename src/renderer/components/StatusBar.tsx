@@ -29,7 +29,9 @@ export default function StatusBar() {
         fontSize: 12,
       }}
     >
-      <div className="flex items-center gap-3" />
+      <div className="flex items-center gap-3">
+        <WebServerChip />
+      </div>
       <div className="flex items-center gap-2">
         <EffortSelector value={defaultClaudeEffort} onChange={setDefaultClaudeEffort} />
         <StatusToggle
@@ -187,7 +189,7 @@ function EffortPopup({ chipRect, popupRef, value, onSelect, onPopupEnter, onPopu
           return (
             <Tooltip key={level} content={'Set default effort to ' + level}>
               <button
-                onClick={() => onSelect(level)}
+                onClick={() => onSelect(isActive ? 'none' : level)}
                 className={`text-[10px] px-1.5 py-1 rounded cursor-pointer ${
                   isActive
                     ? 'bg-[#DA7756]/20 text-white font-medium'
@@ -202,6 +204,84 @@ function EffortPopup({ chipRect, popupRef, value, onSelect, onPopupEnter, onPopu
         })}
       </div>
     </div>
+  );
+}
+
+// Mobile-web access chip. Pulls live info from main (web-server.js) on mount,
+// shows the LAN URL as a clickable pill: click → opens in default OS browser
+// (so you can scan the address visually then scribe it onto your phone). Long-
+// press / right-click would be ideal for "copy to clipboard" but that's noise
+// for the common case — single click to open is enough. Tooltip exposes the
+// full URL with token so you can read it off-screen if needed.
+function WebServerChip() {
+  const [info, setInfo] = useState<{ running: boolean; lanIp?: string; port?: number; token?: string } | null>(null);
+  const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const { ipcRenderer } = window.require('electron');
+        const data = await ipcRenderer.invoke('web:get-info');
+        if (!cancelled) setInfo(data);
+      } catch {
+        if (!cancelled) setInfo({ running: false });
+      }
+    };
+    load();
+    // Re-poll occasionally so a late server start gets picked up without reload
+    const t = setInterval(load, 5000);
+    return () => { cancelled = true; clearInterval(t); };
+  }, []);
+
+  if (!info) return null;
+  if (!info.running) {
+    return (
+      <Tooltip content="Mobile web server is not running — check main process logs.">
+        <span style={{ color: '#666', fontSize: 11 }}>web: off</span>
+      </Tooltip>
+    );
+  }
+
+  const fullUrl = `http://${info.lanIp}:${info.port}/?token=${info.token}`;
+  const shortUrl = `${info.lanIp}:${info.port}`;
+
+  const handleClick = () => {
+    try {
+      const { ipcRenderer } = window.require('electron');
+      ipcRenderer.invoke('web:open-in-browser');
+    } catch {}
+  };
+  const handleRightClick = async (e: React.MouseEvent) => {
+    e.preventDefault();
+    try {
+      const { clipboard } = window.require('electron');
+      clipboard.writeText(fullUrl);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {}
+  };
+
+  return (
+    <Tooltip content={`Open mobile-web in browser. Right-click to copy URL with token.\n\n${fullUrl}`}>
+      <button
+        onClick={handleClick}
+        onContextMenu={handleRightClick}
+        className="inline-flex items-center gap-1 cursor-pointer hover:bg-white/5 rounded"
+        style={{ padding: '1px 6px', height: 18 }}
+      >
+        <span
+          style={{
+            width: 8, height: 8, borderRadius: 4,
+            backgroundColor: '#FFB382',
+            boxShadow: '0 0 6px rgba(255, 178, 130, 0.5)',
+          }}
+        />
+        <span style={{ color: copied ? '#a6e3a1' : '#ddd' }}>
+          {copied ? 'copied!' : shortUrl}
+        </span>
+      </button>
+    </Tooltip>
   );
 }
 

@@ -413,6 +413,70 @@ useEffect(() => {
 
 В custom-terminal: см. `knowledge/fact-timeline.md::Docs-индикаторы как атрибут user-entry` (раньше docs_edit / docs_search были отдельными dot-entries → длинные docs-update сессии теряли структуру; теперь backend look-ahead собирает их в `entry.docsEdited[]` / `entry.docsSearchQueries[]`, цвет user-точки меняется, inline-блок в self-tooltip показывает детали).
 
+## Attribution-блок свёрнут по дефолту, expand on demand
+
+**Принцип:** когда parent-сущность (см. `1 prompt — 1 dot` выше) получает атрибуты в hover-tooltip / preview-card (метаданные, child-events, related-items), эти атрибуты **рендерятся в свёрнутом виде** (заголовок + счётчик в скобках) и раскрываются только по явному действию пользователя (click). По умолчанию — **primary content (текст самого parent'а) виден целиком**, attribution-блок занимает 1 строку.
+
+**Симптом, что принцип нарушен:** пользователь наводит на entity, открывается tooltip, но самое главное — текст/имя/основной content — **не видно**, потому что вверху раскинуты 5-10 строк attribution-метаданных (списки файлов, теги, related links). Скролл tooltip'а не спасает: пользователь сначала ищет где основной content, потом крутит — это нарушает «контент за один взгляд». Дословная формулировка из живой сессии: *«я не вижу типа сообщение юзера, которое должно показываться»*.
+
+**Тест: разверни tooltip mentally — видна ли primary-сущность БЕЗ скролла?** Если для длинных значений атрибутов нужен скролл чтобы добраться до primary content → принцип нарушен.
+
+**Что не помогает (отброшенные итерации):**
+1. **Полный список с переносом строк:** если атрибутов 5+, занимает ту же высоту что primary content. Парадокс — атрибуты по семантике вторичны, но визуально равны или больше.
+2. **Inline через запятую (`Label (N) — item, item, item`):** при длинных именах элементов (полные пути, длинные теги) одна строка превращается в 2-3 после wrap. Экономия мнимая — длина зависит от данных, не от количества.
+3. **Truncation с ellipsis (`Label (N) — item, item, item, …`):** обрывает информацию, юзер не знает что в скрытом — нужен скролл/expand всё равно. Хуже: если truncate в середине имени, не понятно что это за элемент.
+
+**Что работает:** **только счётчик в свёрнутом виде** + click → expand под заголовком (полные значения, по строке на элемент, индентация под иконку). Один клик = полное раскрытие, повторный = свернуть. State per-entry (`Set<id>`), сбрасывается при unmount tooltip'а.
+
+**Структура свёрнутого вида:**
+```
+✏ Docs updated (6)             ← свёрнуто (1 строка)
+
+✏ Docs updated (6)             ← раскрыто
+   knowledge/fix-codemirror...
+   knowledge/fix-vite-prebundle...
+   methodology/design.md
+   ...
+```
+
+**Edge case: один элемент.** Если N=1, можно показать его inline (`✏ Docs updated — design.md`) — одна строка всё равно, click-expand не нужен. Но реализационно проще единое поведение: всегда `(N)`, всегда expand-on-click. Лишний click на N=1 — приемлемая цена за консистентность.
+
+**Связь с `## 1 prompt — 1 dot`:** тот принцип про **группировку** (child-events → attributes родителя). Этот про **layout-приоритет** (attributes ≤ primary content). Два разных решения, второй применим и к non-grouped attribution (теги, метаданные, reactions).
+
+В custom-terminal: см. `knowledge/fact-timeline.md::Inline preview в self-tooltip` — финальная реализация прошла три итерации (полный список → inline-запятая → только счётчик). Применимо к hover-cards над постами (reactions свёрнуть до счётчика), GitHub PR-preview (CI checks свернуть до `(N passing)`), любым details-on-demand UI.
+
+**Generalisation: collapse только когда scroll невозможен.** Принцип «preview + toggle на full» работает не везде — он осмыслен **только если у контейнера нет своего max-h + overflow-y: auto**. Если контейнер уже скроллится (как code-блок в SyntaxHighlighter с `maxHeight: '480px', overflow: 'auto'`), второй toggle `Раскрыть полностью` — **дублирующий жест**: и scroll, и expand делают одно и то же (показывают что ниже). Лишний click без новой информации = anti-pattern. Поэтому:
+
+- **Collapse оправдан** для контента, который **раскладывается вниз растягивая parent**: user-сообщение в чате (нет max-h, длинный текст займёт три экрана треда), attribution-блок в tooltip'е (длинный список вытеснит primary content), inline-комментарий в timeline. У них нет своего scroll-окна — collapse единственный способ удержать layout.
+- **Collapse избыточен** для контента, у которого **уже есть max-h + overflow-y: auto**: code-блок Read'а, diff Edit'а, output bash-команды, response API request. Скрол сам делает работу. Не плодить toggle где он не нужен.
+
+Truncate ellipsis'ом — отдельный антипаттерн: убивает информационную плотность (три записи с одинаковым префиксом выглядят как дубли). Используется ТОЛЬКО для одно-строчных лейблов в zoomed-out видах (плитки, таблицы со фиксированной шириной колонки). В chat-UI / tool cards / любом details-view контенте — никогда.
+
+В custom-terminal: `CollapsibleText` для user-prompt'ов в SDK-табе (порог 600, preview 400) — оправдан, текст растягивает thread. `Read`-карточка и `DiffLines` — content в max-h-480px scroll-блоке, **без** toggle. Bash output — также scroll внутри SyntaxHighlighter. Везде где есть scroll — нет collapse.
+
+## Destructive action ≠ цвет status-indicator
+
+**Принцип:** цвет, который в системе закреплён за **статус-индикатором** «процесс/сущность активна» (зелёный = running, online, alive), **не должен** использоваться для **кнопки**, которая этот статус прерывает (Stop, Disconnect, Cancel, Kill). Иначе action и индикатор сливаются в одну зону внимания, и destructive-кнопка читается как продолжение/подтверждение «всё хорошо», а не как «прервать».
+
+**Симптом, что принцип нарушен:** в context menu таба running-индикатор слева — зелёная пульсирующая точка (`процесс жив`). Рядом — кнопка `Stop <process>` тоже зелёная (`#4ade80`, тот же цвет, та же палитра). Пользователь тянется кликнуть «прервать» — глаз видит две одинаково-зелёные сущности и колеблется. *«Это что, кнопка „продолжай“?»*. Дословный фидбек: *«сделай тут вишнево-красную кнопку, а не зеленую»* — пользователь сам сформулировал решение раньше, чем смог объяснить почему.
+
+**Что считается «цветом статус-индикатора»:** любой цвет, ассоциированный с positive ongoing state в этом UI:
+- Зелёный → online, running, healthy, passing CI, active session
+- Синий → connected, syncing, processing
+- Жёлтый/оранжевый → warning ongoing, pending, queued (хуже всего — destructive в этих цветах часто читается как «продолжай разбираться», а не «отмени»)
+
+**Что использовать для destructive:**
+- **Cherry-red `#dc2626`** или **rose `#e11d48`** — однозначно «остановить/уничтожить» в большинстве UI-конвенций (web, OS, hardware). Не путать с **brand-red** (Netflix, YouTube) — там красный = identity, не destructive.
+- **Brand-tint текущего процесса** допустим, если в проекте есть отдельный визуальный язык для destructive (Claude orange / Gemini blue — `Stop Claude` / `Stop Gemini`): destructive-семантика тогда идёт через **лейбл** `Stop` + явную **форму** (квадратная точка как stop-icon, отделяет от круглого running-dot). Цвет в этом случае работает как «к какому процессу адресован Stop», но это работает **только** если в UI уже устоялся бренд-tint per-engine. Default — cherry-red.
+
+**Когда исключение:** если в системе **зелёный = positive action** (Confirm, Save, Apply) и destructive — **не зелёный по дефолту**. Тогда зелёный для Stop будет дезориентировать ровно так же, как красный для Save. Принцип общий — destructive ни в коем случае не повторяет цвет позитивного индикатора/действия в этой же области UI.
+
+**Тест:** прикрой ладонью лейбл кнопки. Цвет один, без слов — это «продолжай»/«ок» или «отмена/уничтожение»? Если без лейбла читается как первое — палитра выбрана неправильно для destructive.
+
+**Антипаттерн (живой пример из custom-terminal):** SCRIPT_TINT в TabBar context-menu был `#4ade80` (тот же green что у running-dot слева от имени таба) с обоснованием *«зрительная связь — это тот процесс который сейчас горит зелёным»*. Логично на бумаге, провально на практике: пользователь читал кнопку как «индикатор», не как «action», и колебался при клике. Сменили на cherry-red `#dc2626` — двусмысленность ушла.
+
+В custom-terminal: см. `knowledge/fact-tabs.md::Split Close+Stop для script-табов`. Stop Claude / Stop Gemini сохранили brand-tints (orange/blue) — там destructive-семантика передаётся через лейбл + квадратную форму точки vs круглую у running-dot. Для script-Stop квадратная-vs-круглая дифференциация была недостаточна (квадратная точка маленькая, не считывалась) — потребовалась цветовая дифференциация.
+
 ## Inline icon-buttons в title row — не отдельная строка
 
 LLM-предложенный дефолт для панелей: первая строка — заголовок, вторая — главная кнопка действия на всю ширину. Это правильно для **широких** кнопок («Save changes», «Run analysis») с явным лейблом — занимает место заслуженно, считывается с расстояния.
@@ -500,6 +564,23 @@ onClick(() => setSelection(targetLevel));
 **Антипаттерн:** toast без превью (`Copied to clipboard`) для programmatic copy. Юзер не понимает что именно скопировалось — клавиатурный paste в другое окно может показать совсем не то что ожидалось.
 
 В custom-terminal: `PromptQueueOverlay.tsx::grabCurrent`, `InfoPanel.tsx::Copy prompt` — оба показывают `verb: "first 20 chars…"`. Применимо к любым clipboard buttons, API-result toasts, queue-add operations.
+
+## Несовместимость параметров — гасить в точке выбора, не в момент отправки
+
+Когда есть **известная клиентски** таблица совместимости параметров (LLM effort × model, payment method × region, image-format × resolution, любой `X × Y → boolean`) — UI обязан **запрещать** невалидный выбор там, где пользователь его делает. Не показывать toast «не сработает» при отправке. Не отправлять и ловить downgrade от сервера. Запрет в момент клика — единственно правильное место.
+
+**Принцип:** «отложить уведомление до конца действия» — антипаттерн. Юзер уже сделал mental commit на выбор: «я выбрал max, я ожидаю работу на max». Toast спустя 3 секунды отправки разрушает контракт: он только что выбрал, ничего не изменилось видимо в UI, действие ушло — но оказалось это не то действие. *«Откладывать это на потом, чтобы это появлялось когда-нибудь потом, очень плохая идея»* — юзер должен **сразу** видеть что эта комбинация невозможна.
+
+**Реализация — два слоя:**
+
+1. **Visual disabled на несовместимых опциях.** Пилюлю с `max` на Haiku-модели рисуем серой, `cursor: not-allowed`, hover-tooltip *«не поддерживается моделью haiku»*. Клик не срабатывает. Юзер видит границы выбора, не натыкается на них через ошибку.
+2. **Auto-downgrade при смене первого параметра.** Юзер был на `(opus, max)`, переключил модель на `haiku` → текущий `max` для haiku невалиден. UI **немедленно** даунгрейдит effort до ближайшего поддерживаемого (`high`) + показывает короткий info-toast *«effort: max → high (haiku не поддерживает max)»*. Состояние всегда консистентно с возможностями.
+
+**Источник таблицы — provider, не наш код.** Хардкод *«max работает только на Opus и Sonnet»* устаревает с каждым релизом Anthropic. Когда SDK/API выдаёт metadata (например `query.supportedModels()` возвращает `supportedEffortLevels[]` для каждой модели) — читаем оттуда при старте, кэшируем на сессию, обновляется по апгрейду пакета. Хардкод допустим **только** если provider не выдаёт метаданные (тогда писать однострочный комментарий *«источник — официальные доки на дату X»* и быть готовым к рассинхрону).
+
+**Что остаётся для toast'а после downgrade'а в точке выбора:** runtime mismatch когда **server** молча подменил параметр (не доверять только своей таблице — server-side capacity issues, retired models — реально подменяют). Сравнивать `requested.model` с `response.model` на первом ответе, показывать warning **один раз на turn**. Это safety net, не основной сигнал.
+
+В custom-terminal: `ClaudeSDKTab.tsx::SDK_MODEL_CAPS` грузится из `query.supportedModels()` (main process IPC), `InfoPanel.tsx` использует caps для greying пилюль и auto-downgrade при смене модели. Конкретика — `fact-claude-sdk-tab.md::Effort gating + auto-downgrade`.
 
 ## Secondary action: нейтральная палитра, не конкурирует с primary tint
 
@@ -684,3 +765,535 @@ const effectiveValue = dragPreview !== null ? dragPreview : store.value;
 - **Делать кнопку растянутой на всю ширину header'а (`flex: 1`)**. Визуально ломает иерархию — кнопка перестаёт выглядеть как кнопка, label рядом теряется. Подходит для «toolbar row», не для «секционного header'а с лейблом».
 
 **В custom-terminal:** `knowledge/fact-notes.md::Tab Notes Slideout::Header hit-area` — весь header «Заметки вкладки» в InfoPanel'и кликабелен, Open-чип внутри стал `<span pointer-events-none>`, ✦ generate-description button имеет `data-notes-header-interactive` + `stopPropagation`.
+
+## Controlled editor: пометь свои dispatch'и аннотацией
+
+Когда два UI экземпляра делят один store-source через reactive selector и каждый отдаёт обратно через `onChange` — программный sync должен быть **отличим** от пользовательского ввода. Иначе echo превращается в бесконечный pingpong.
+
+**Симптом:** при печати в одном из двух editor'ов которые подписаны на одно поле — крах с `Position N is out of range`, `RangeError`, или просто видимый «прыжок» текста между состояниями.
+
+**Правило:** программный `view.dispatch` (CodeMirror), `editor.replaceRange` (Monaco), `setSelection` (contenteditable) — всегда **помечается** через transaction annotation / metadata / `userEvent`. Listener эту метку видит и **не** вызывает `onChange` callback наверх.
+
+**Контринтуитивная часть:** clamp selection перед dispatch'ем (`safeAnchor = min(anchor, newLen)`) — корректный шаг **внутри одного диспатча**, но не лечит источник. Echo onChange запустит новый цикл из другого instance, и краш произойдёт не в твоём dispatch'е, а во внутреннем CodeMirror state update который уже работает с устаревшим pending selection.
+
+**Тест-симптом для будущего AI:** если видишь в логах одну и ту же длину content'а 4-5 раз за 30ms через alternating sources (`tab-notes` ↔ `tab-notes-slideout`) — это ping-pong, ищи echo onChange.
+
+**В custom-terminal:** `knowledge/fix-codemirror-controlled-editor.md` — конкретное решение через `Transaction.userEvent: 'external-sync'` для пары InfoPanel inline + TabNotesSlideout.
+
+## Opt-in affordances через модификатор-клавишу: noise floor
+
+Большинство кнопок UI не нуждаются в tooltip'е. Иконка + контекст → action понятен. Tooltip на **каждой** кнопке — это шум, который пользователь начинает воспринимать как баг («почему всё подсвечивается?»).
+
+**Правило:** explanation overlay (tooltip, help popover, keyboard-shortcut hint) **по умолчанию скрыт**. Появляется только при зажатой модификатор-клавише (`Cmd`/`Alt`/`Ctrl`). Опт-аут — флаг `always` для критичных мест где подсказка обязательна.
+
+Реализация на уровне global state:
+- Module-level subscription set + один pair keydown/keyup listener.
+- Все Tooltip instance читают одно `cmdHeld` state через subscriber-pattern (не каждый со своим хуком — 100+ listeners на странице).
+- При зажатии Cmd над уже-hover'енной кнопкой — tooltip появляется мгновенно. Отпустил — мгновенно исчезает.
+
+**Симптом из живой сессии:** *«тултипы — пиздец, везде шумят»*. Юзер начал отключать tooltip'ы вручную в каждом файле через субагента до того как был сформулирован принцип «по умолчанию off, opt-in через Cmd».
+
+**В custom-terminal:** `src/renderer/components/UI/Tooltip.tsx` с props `delay`, `disabled`, `always` (default false). Global cmd state через module-level `Set<(v: boolean) => void>` подписчиков.
+
+## Mouse-armed pattern для list popovers (Cmd+P / Cmd+/)
+
+Команда-палитра, открытая клавишей при **стоящем** курсоре, не должна активировать item под курсором — это **кража фокуса**, пользователь не двигал мышью, не ждёт hover-эффекта.
+
+**Симптом:** юзер нажимает Cmd+/, курсор случайно оказался над пунктом «Bold» — palette открывается с уже выделенным Bold вместо первого item (или вместо `activeIndex=0` который выставил код).
+
+**Правило:** CSS `:hover` подсветка работает **только после** первого `mousemove` внутри popup'а. До этого активный item определяется только стрелками / клавиатурой / `activeIndex` от open-логики.
+
+Реализация:
+```css
+/* No effect until JS adds .mouse-armed class on first mousemove */
+.cm-command-palette.mouse-armed .cm-command-palette-item:hover {
+  background: ...;
+  color: ...;
+}
+```
+```typescript
+const armMouse = () => {
+  palette.classList.add('mouse-armed')
+  palette.removeEventListener('mousemove', armMouse)
+}
+palette.addEventListener('mousemove', armMouse)
+```
+
+**Симптом из живой сессии:** дважды повторённое юзером — *«у нас есть фича в Cmd+P которая ждёт move курсора. То же самое нужно для Cmd+/. Если курсор уже стоял — у меня этот элемент выделяется»*. Самосформулированный принцип — записываем.
+
+**В custom-terminal:** `gt-editor/packages/markdown-editor/src/plugins/contextMenu.ts::showCommandPalette` + CSS-правило в `editor.css`. Mac-style: тот же паттерн в VSCode Cmd+P, Sublime Cmd+P, любой keyboard-first launcher.
+
+## Сегментированная капсула: persistent bg, hover = только цвет
+
+Когда 3+ связанных action'а читаются как «один контрольный элемент» (`copy session ID / Claude Stop / refresh timeline` → один блок управления текущей сессией), все три должны:
+
+1. **Иметь общий фон всегда**, не на hover. Hover-bg создаёт ощущение что элемент «прыгает», ломает читаемость элемента как монолитной капсулы.
+2. **Hover меняет только цвет текста/иконки** — affordance что «кнопка под курсором кликабельна», без изменения геометрии или fill.
+3. **Сидеть вплотную друг к другу**, через сегментированные углы (`rounded-l` / no radius / `rounded-r`). Не через `gap` — gap делает их визуально независимыми.
+
+**Симптом из живой сессии:** прямое возмущение — *«у всех трёх кнопок должен быть бэкграунд, ёбаный в рот»*. Юзер чувствует визуальную разрозненность когда фон появляется на hover вместо постоянного. Это не вкусовщина — это нарушение перцептивной целостности «единого контрольного элемента».
+
+**Контраст:** одиночная утилитарная кнопка (cancel ✕, settings ⚙) — может иметь прозрачный фон с появлением bg на hover. Это нормально, она не часть капсулы.
+
+**В custom-terminal:** `panels/InfoPanel.tsx::SessionActionChip` — Stop/Continue chip в triplet'е с ⎘ (copy ID) и ↻ (refresh) имеет `backgroundColor: 'rgba(0,0,0,0.55)'` всегда, на hover меняет только `color`. Stop добавляет faint red wash (`rgba(239,68,68,0.18)`) потому что это destructive action — единственное исключение из «hover не меняет bg».
+
+## Один клик = одно изменение, без «логичных» побочных эффектов
+
+Когда у компонента есть несколько сегментов с разной семантикой (split-button, segmented toggle с двумя half'ами, multi-action menu) — клик по сегменту меняет **только** то что этот сегмент представляет. «Удобные» автоматические side effects вида *«логично же включить родителя если кликнул на дочерний»* — запрещены.
+
+**Симптом из живой сессии (спокойно сформулированный):** *«у нас должно быть по философии всё детерминировано. Если суб-агенты выключены и я кликаю на правую часть — у меня меняется правая часть, при этом сам суб-агент не включается»*. Это не возмущение, это формулировка принципа — самый сильный сигнал для methodology.
+
+**Правило:**
+- Левая половина split-чипа (`sub-`) → toggle on/off родителя.
+- Правая половина (`result` / `full`) → меняет только preferred mode, **независимо** от того включён родитель или нет.
+- Если родитель выключен, и юзер кликает по правой — preferred mode меняется в state, видимый label обновляется, **родитель остаётся off**. Когда юзер решит включить через левую — родитель активируется в текущем preferred режиме.
+
+**Почему так:** «помог юзеру одним кликом сделать два изменения» — это **предсказание намерения**. Если предсказание неверное (юзер хотел сначала переключить режим, потом подумать включать или нет) — он не может «откатить только половину», ему придётся кликать обратно дважды. Детерминированный one-click = one-change всегда обратим одним же кликом.
+
+**Контраст:** для **обычных** кнопок (одна семантика — один action) это правило вырождается в тривиальное. Принцип критичен именно для multi-segment контролов где у юзера может быть mental model *«я меняю эту конкретную часть»*.
+
+**В custom-terminal:** `panels/InfoPanel.tsx::sub-pill` — split `sub-` + `result`/`full`, состояние `subPreferred` хранит preferred mode независимо от `includeSubagentResult`/`includeSubagentHistory` флагов.
+
+## State display = текущее состояние, не предсказание клика
+
+Связанная с предыдущим, но отдельная: **что показано на элементе сейчас = его реальное состояние**, а не «что станет после следующего клика». Любой hover-эффект, который меняет **label** (а не цвет/тень/курсор) — нарушение.
+
+**Симптом из живой сессии:** *«Если у меня написано "sub full", то при наведении почему-то меняется на "result" и происходит непонятное дёрганье. Убери эту хуйню — должно меняться только при клике»*. Юзер не может прочитать текущее состояние, потому что hover мерцает его на предсказание.
+
+**Правило:** hover может менять:
+- ✅ цвет фона / текста (affordance что кликабельно)
+- ✅ курсор (`pointer`, `ns-resize`)
+- ✅ тень / border / иконка-вспышка (фокус)
+- ❌ **никогда** — текстовый label, иконку которая обозначает state, цифру счётчика, выделение в multi-select pill
+
+**Почему:** разница между «текущее» и «предсказание» должна быть в **modal-affordance** (отдельный tooltip с *«Click to switch to full»*), не в **самом контроле**. Иначе юзер при наведении видит state X, при уводе — state Y, и теряет ориентацию: *«а что у меня сейчас выбрано?»*.
+
+**В custom-terminal:** `panels/InfoPanel.tsx::sub-pill` — `rightLabel = isFull ? 'full' : 'result'` всегда показывает реальный mode, hover не подменяет.
+
+## Dropdown ≠ modal: не блокируй UI под собой, click-outside закрывает
+
+Плавающий resizable панель/popover должен быть **dropdown** (как Rewind menu, как Cmd+P), не **modal** (как Settings, как Edit Project). Различие:
+
+| | Dropdown | Modal |
+|---|---|---|
+| Backdrop | Нет, либо invisible click-trap | Есть, dims everything below |
+| UI ниже | Виден и читаем | Затемнён до нечитаемости |
+| Click-outside | Закрывает | Закрывает (или ignore — зависит от настроек) |
+| Mental model | «Временная подсказка/панель» | «Самостоятельный диалог» |
+| z-index | Среди UI слоёв | Поверх всего, выше навигации |
+
+**Симптом из живой сессии (спокойно):** *«у нас не должно меняться прозрачность фона, это не модалка, это именно выпадающее меню. Как в случае с Rewind»*. Юзер прямо назвал mental model и эталон.
+
+**Правило:** если панель **сосуществует** с основным UI (юзер продолжает видеть и читать контекст под ней) — это dropdown, никакого backdrop'а. Если панель **требует решения** перед продолжением работы (settings, confirm, primary task entry) — modal с scrim.
+
+**Тест:** если в этой панели юзер может **смотреть** на что-то снаружи и сверять (например читать терминал пока пишет заметку) — dropdown. Если действие в панели **завершает текущую задачу** (сохранить настройки и вернуться) — modal.
+
+**В custom-terminal:** `TabNotesSlideout` — dropdown без backdrop'а, click-outside закрывает. `SettingsModal` — modal с backdrop'ом. Различие визуально подсказывает юзеру какая mental model применима.
+
+## Persistence-class для dev settings: SQLite, не localStorage
+
+Любая UI-настройка которая должна **переживать смену dev environment** (vite-порт меняется → новый origin → localStorage обнуляется) — обязана идти в SQLite или эквивалент source-agnostic persistence, не в origin-bound storage.
+
+**Симптом из живой сессии (спокойно):** *«размеры сохраняются в базу данных, то есть размеры будут единые»*. Юзер сразу указал хранилище — это требование, не догадка.
+
+**Корневая причина:** в dev-режиме vite picks случайный порт (5181 / 5182 / 5183), у каждого свой origin → свой localStorage bucket. Юзер настроил высоту панели на одном порту, перезапустил — порт другой — настройки нет. На production порт не меняется (file:// origin), баг невидим. Но dev-workflow страдает каждый перезапуск.
+
+**Решение:** universal mirror на этапе boot до Zustand initializer'ов:
+1. Synchronous IPC `app:hydrateLocalStorageSync` тянет все `noted-terminal-*` ключи из SQLite → пишет в localStorage **до** того как Zustand factories читают (factories синхронны при модуль-import).
+2. Monkey-patch `Storage.prototype.setItem` / `removeItem` фильтрует по префиксу → synchronous IPC `app:mirrorLocalStorageSync` → SQLite.
+
+После этого никакая Zustand-factory не нуждается в правке: legacy `localStorage.setItem(key, value)` автоматически зеркалится.
+
+**Тест-симптом для будущего:** *«настройки сбрасываются после перезапуска dev»* — origin-shift, не баг store. Лекарство — proxy через SQLite.
+
+**В custom-terminal:** `src/renderer/utils/persistedStorage.ts::bootstrapPersistedStorage()` + IPC `app:hydrateLocalStorageSync` / `app:mirrorLocalStorageSync` в `src/main/main.js`.
+
+## Layout reservation для toggle-able children: высота = max, не current
+
+Если внутри контейнера есть children которые могут включаться/выключаться (toggle pills, conditional badges, dynamic list with single item visible) — высота контейнера должна быть **зарезервирована под максимум**, не под текущее состояние. Иначе toggle двигает соседние секции, и юзер при клике видит layout shift.
+
+**Симптом из живой сессии:** *«сделай ограничение по высоте чтобы не было такого что при включении subagents у меня менялась высота сайдбара»*. Юзер не возмущается — просто перечисляет требование. Это **тоже сигнал methodology** — спокойная формулировка инженерного правила.
+
+**Правило:** для row/grid c flex-wrap и conditional children — `min-height` = высота под максимально возможный набор, `align-content: flex-start`. Контейнер занимает свою максимальную высоту всегда; toggle меняет только видимость chip'а внутри, не реально-занятое пространство.
+
+**Контр-аргумент «лишнее пустое место»:** да, если выключены все conditional children — внизу пустота на 26px. Это **приемлемая цена** за стабильность layout. Альтернатива (collapse под current) ломает muscle memory: юзер целится в кнопку под секцией, она прыгает на 26px вверх в момент клика, юзер промахивается.
+
+**Когда `min-height` не нужен:** если conditional children не редактируются юзером **внутри** этого UI flow (например, badge «unread N» который растёт асинхронно от server-push), а компонент сам редко в фокусе — допустимо позволить layout shift. Правило критично для **interactive** UI где юзер активно манипулирует toggle'ами в этой же области.
+
+**В custom-terminal:** `panels/InfoPanel.tsx::markers-row` под Copy Session — `minHeight: 26` для двух wrapped рядов chip'ов, чтобы включение subagent/fork chips не сжимало КОНТРОЛЬ секцию ниже.
+
+## Hover-isolation для split-button: подсвечивается то на чём курсор, не весь блок
+
+Split-button / segmented control с несколькими интерактивными половинами должен подсвечивать **только ту половину** над которой стоит курсор, **не весь** блок целиком. Каждая половина — независимая hover-зона со своим affordance.
+
+**Симптом из живой сессии (эмоциональный):** *«у меня должно выделяться левая часть, не пропадать всё выделение. Так же, как у остальных элементов — просто выделение, ховер-эффект, смена цвета. И разделение на левую и правую часть»*. Юзер навёл курсор на левую половину sub-pill, ожидал увидеть подсветку левой части — увидел исчезновение подсветки **на обеих** половинах. Хуже чем неинформативный UI: misleading hover.
+
+**Правило:**
+- Каждая половина split-button — отдельный `<button>` с собственным `:hover` / `onMouseEnter`/`Leave`. Не **один** parent-handler который менеджит подсветку через state.
+- Если есть «preview off» эффект (hover слева → весь блок гаснет, обозначая «click → off») — это **специальный case** который должен быть **отключён по умолчанию** и явно опт-инен. Юзер ожидает локальный hover, не cross-segment предсказание.
+- Hover-feedback изолированный по сегментам = mental model «кнопка под курсором кликабельна». Cross-segment dimming ломает эту модель.
+
+**Контр-аргумент «hover left = preview off — это полезный hint»:** false economy. Юзеру удобнее иметь явный tooltip «sub off» при hover на левую часть, чем поведение «обе половины тускнеют без объяснения». Tooltip — модальная affordance, dimming — нелокальное состояние.
+
+**В custom-terminal:** `panels/InfoPanel.tsx::sub-pill` — две `<button>` (`sub-` + `result`/`full`), у каждой свой `hover:opacity-80`. Cross-segment preview-dimming убран после возмущения юзера.
+
+## Координация overlays: primary modal открывается → secondary dismissable панели закрываются
+
+Когда в UI могут одновременно жить **modal** и **dropdown-style панели** (slideout, popover, persistent panel), и юзер открывает modal — secondary панели должны **сами** дисмиссить себя. Не «остаться висеть позади backdrop'а», не «остаться поверх modal'и и блокировать его».
+
+**Симптом из живой сессии (нейтральный):** *«при открытии настроек у меня автоматически должна эта модалка закрываться»*. Юзер не возмущается — формулирует требование. Это сигнал methodology.
+
+**Правило:** primary modal **эмитит событие** при открытии (`window.dispatchEvent(new CustomEvent('settings:opened'))`). Secondary панели **слушают** это событие в своих `useEffect`-listener'ах и закрывают себя:
+
+```ts
+useEffect(() => {
+  if (!isOpen) return;
+  const onSettingsOpened = () => handleClose();
+  window.addEventListener('settings:opened', onSettingsOpened);
+  return () => window.removeEventListener('settings:opened', onSettingsOpened);
+}, [isOpen, handleClose]);
+```
+
+**Почему через event, а не через store:** modal'и обычно managed как local React state (`useState`), не через глобальный store. Перенос в store ради этого паттерна — over-engineering. Event-bus легче и не размывает ownership state.
+
+**Контр-вариант «secondary поверх modal'и»:** допустим только для **связанных** контролов (tooltip над modal-кнопкой, autocomplete над modal-input'ом). Для **независимых** панелей (notes slideout vs settings modal) — закрывать secondary.
+
+**В custom-terminal:** `App.tsx::setSettingsOpen` эмитит `settings:opened` при transition false→true; `TabNotesSlideout` подписан и закрывает себя. Без этого backdrop SettingsModal накрывал slideout наполовину (slideout справа, modal по центру → визуальная грязь).
+
+## Удаляй workaround сразу после upstream-fix
+
+**Принцип:** локальный workaround вокруг чужого бага (npm библиотека, OS API, browser engine, downstream сервис) **имеет цену** — поверхность для собственных edge cases. После того как upstream устранил root cause, оставлять workaround «как defence-in-depth» **категорически нельзя**: он перестаёт защищать от чего-либо реального и продолжает копить свои баги на новых input patterns.
+
+**Симптом нарушения:** код, который раньше работал стабильно несколько месяцев, начинает падать в новых сценариях — обычно когда что-то меняет паттерн входных данных (новый протокол, новый размер чанков, новая частота вызовов). Это **не регрессия workaround'а**, это его **изначальная хрупкость**, которая не проявлялась пока root cause был на месте. Конкретно: наш sync-frame splitter работал стабильно, пока Claude Code v2.1.101 не починил CSI 3J upstream; через несколько недель появились субагенты (Task tool) → мелкие быстрые PTY-чанки → BSU/ESU разрезались между чанками → splitter промахивался → каша символов на экране у юзера.
+
+**Реализация:** при появлении upstream-fix → удалить **всю** локальную обвязку, даже если кажется что «может пригодится». Удаление цепное: workaround обычно тянет за собой подпорки (refs, флаги, scroll-snap, race-condition guards) — все они существуют только потому что workaround сам создаёт побочные эффекты. После удаления workaround'а подпорки тоже снимаются.
+
+В custom-terminal: см. `knowledge/fix-terminal-jitter.md::Upstream fix v2.1.101` — sync-frame splitter + protectedWrite + 10 refs + cursor-based check + INPUT_ZONE=6 + onData→ref clear удалены каскадом после Anthropic ashwin-ant'а закрывающего комментария «Fixed in v2.1.101».
+
+## Tool call = карточка, не сообщение. Шапка одной grid-линией
+
+**Принцип:** в AI-чатах tool calls (Bash, Read, Edit, Glob, MCP-вызовы) **семантически — не часть assistant-сообщения**, а **отдельные карточки** со своим жизненным циклом (running → done/error), своим collapse-состоянием и своими affordances. Стилизовать их как inline-сообщение — терять различие между «модель думает/говорит» и «модель выполнила действие».
+
+**Шапка карточки — одна линия flex'ом, не stack из абзацев.** Элементы шапки (chevron-toggle, status-dot, tool-icon, UPPERCASE label, badge со счётчиками типа `+5 −2`) выравниваются `flex items-center gap-2` в одной строке с фиксированной `min-h`. **Путь / команда / query идёт ОТДЕЛЬНОЙ строкой ниже**, моноширинно, во всю ширину карточки, может wrap'аться — но никогда не truncate'ится. Разделение «label-row + detail-row» нужно потому что:
+1. Шапка остаётся стабильной по высоте (28px) независимо от длины пути → click-baseline не плывёт.
+2. `mt-[2px]` / `mt-[3px]` под каждый элемент чтобы выровнять «по верху иконки» — типичный антипаттерн, который через релиз перестаёт выравнивать (изменился размер шрифта → magic offset устарел).
+
+**Тест:** прочитай две соседние карточки разной длины пути (короткий `package.json` vs `src/renderer/components/Workspace/ClaudeSDK/ClaudeSDKTab.tsx`). Иконки/chevron/dot между ними **должны быть на одной горизонтальной линии**, не плавать на ±2-3 пикселя. Если плавают — magic-offset bug, переходи на grid-row.
+
+**Антипаттерн:** truncate команды/пути в шапке (`truncate max-w-[300px]`). У пользователя единственный реальный вопрос «какой именно файл / какая именно команда» — обрезать ответ это сломать осмысленность всей карточки. Если содержимое не вмещается — выноси в отдельную строку с wrap, не truncate.
+
+В custom-terminal: `ToolCard` каркас + `BashCard` / `ReadCard` / `EditCard` / `GenericToolCard` в `knowledge/fact-claude-sdk-tab.md::Tool-call rendering`. Применимо в любом chat-UI поверх tool-use API (assistant-ui / AI SDK / langchain).
+
+## Composer внутри scroll-flow, не sticky overlay
+
+**Принцип:** input в chat-UI — это **последняя строка scroll-flow**, не плавающий overlay над контентом. `position: sticky` / `position: fixed` для composer'а создаёт визуальный конфликт: при скролле вверх composer **остаётся на экране** и **накрывает контент** (последние сообщения, footer'ы, кнопки expand). Пользователь не может «уйти» от input'а, он всегда в кадре, превращается в визуальный шум.
+
+**Правило:** composer-блок — **child** scroll-контейнера с `flex-shrink: 0` (не сжимается при overflow). Перед ним messages-div с `flex: 1` (растягивается на свободную высоту). При коротком чате `flex: 1` пушит composer к низу → визуально прижат. При длинном чате composer уходит за viewport вместе со scroll'ом — пользователь не видит его пока не доскроллит до конца. Это **то же поведение, что в Claude Code TUI**: input — буквально последняя строка терминала, не оверлей.
+
+**Тест:** прокрути чат вверх до середины. Composer должен **уехать вверх с экрана**, а не «прилипнуть к низу окна». Если прилипает — где-то sticky/fixed, сними.
+
+**Антипаттерн:** `sticky bottom-0` на composer внутри `overflow: auto` контейнера — выглядит «правильно» для коротких чатов, но при длинном чате создаёт overlay-конфликт. **И не пытайся вытащить composer наружу scroll-контейнера**, если фреймворк (assistant-ui, langchain-UI) требует чтобы input был внутри Viewport-context — primitive выдаст runtime error при mount'е («must be used within ThreadPrimitive.Viewport»).
+
+В custom-terminal: см. `knowledge/fact-claude-sdk-tab.md::Composer in-flow + assistant-ui constraint` — какие подходы пробовались (sticky bottom-0 → накрывал контент при скролле; hoist наружу Viewport → runtime crash) и какой работает.
+
+## flushSync + sync layout-read для стабильного scroll при collapse
+
+**Принцип:** когда программно раскрываешь/сворачиваешь блок выше текущего viewport'а — содержимое во viewport'е сдвигается на дельту высоты, и **глаз ловит дёрг между двумя кадрами**: первый кадр paint'ит «новое состояние без компенсации», второй кадр paint'ит «новое состояние со скорректированным scroll'ом». Решение — компенсация в **том же frame'е** что и paint.
+
+**Workflow:**
+1. **До** state-mutation: запомнить `anchor.getBoundingClientRect().top` + флаг `wasAtBottom = scrollHeight - scrollTop - clientHeight <= 4px`.
+2. `flushSync(() => setState(...))` — синхронно commit'нуть React-update + recalc layout. Браузер ещё **не paint'ил**.
+3. В том же tick'е: прочитать новый `anchor.getBoundingClientRect().top`, посчитать `delta = newTop - oldTop`, скорректировать `scroller.scrollTop += delta`. Браузер paint'ит **один кадр** с финальным состоянием.
+
+**Почему не `requestAnimationFrame × 2`:** между первым и вторым rAF браузер **успевает paint'нуть** промежуточный кадр (state применён, scroll не скорректирован). Один frame = ~16ms → отчётливо видимый дёрг.
+
+**Почему не `useLayoutEffect`:** работает только если хук имеет свой state, на изменении которого можно повесить layout-effect. Generic toggle-хук, который принимает callback от owner-компонента, **не знает** когда state изменится — flushSync даёт ту же гарантию (sync-commit перед paint'ом) изнутри click-handler'а.
+
+**wasAtBottom rule:** если до клика пользователь был у самого низа (4px tolerance) — после expand'а **scroll догнать новый низ**, не держать anchor стабильным. Иначе composer/последнее сообщение уходят за viewport и пользователю надо ручками скроллить. 4px — типичный размер «случайного» offset'а (scroll inertia, partial pixels). Больше — выходит из «у самого низа», меньше — флапает на pixel-rounding.
+
+**Тест:** раскрой длинный thinking-блок наверху чата при scroll'е в середине. Контент под кликом должен **остаться под курсором** (anchor стабилен), без миллисекундного «прыжка вверх → возврата вниз». Если прыжок виден — где-то rAF вместо flushSync.
+
+В custom-terminal: `useStableCollapseToggle` в `ClaudeSDKTab.tsx`, применён ко всем collapse-toggle'ам (Thinking, ToolCard, FullContentToggle, DiffLines, CollapsibleText).
+
+## Smart cancel: outcome зависит от того, что streaming уже произвёл
+
+**Принцип:** «отмена» async/streaming-операции — **не один сценарий, а два**, и выбор делается по факту наличия частичного результата:
+- **Streaming произвёл контент** (хоть какой-то text/thinking/tool_call) → **сохранить как есть**, input/композер очистить (turn закрыт). Юзер может потом нажать `Edit/Repeat` на своём сообщении если хочет переделать.
+- **Streaming не произвёл ничего** (отмена в первые мс, до первого assistant-чанка) → **сделать вид что turn не было**: удалить user-сообщение из истории, **вернуть его текст обратно в input** (готовый к редактированию), откатить запись в журнале/JSONL если она уже легла.
+
+**Тест:** нажми cancel **сразу** после отправки (до первого видимого ответа). Текст должен **вернуться в input как-будто ничего не происходило**, история чата не должна содержать «зависший» user-message без ответа. Нажми cancel **после того как пришёл хоть один токен**. Сообщение и частичный ответ должны **остаться в истории** как обычный завершённый turn (с возможностью Edit/Repeat).
+
+**Антипаттерн «всё в историю»:** оставлять user-сообщение без ответа в истории при мгновенной отмене — превращает чат в кладбище незавершённых turn'ов. Юзер не помнит «я нажал отправить или отменил», и видит свой prompt висящим без ответа → начинает гадать, не упало ли сразу.
+
+**Антипаттерн «всё откатить»:** удалять user-сообщение даже когда ответ уже частично пришёл — теряем работу assistant'а (думал, искал, начал писать). Лучше «незавершённый turn в истории» чем «слил 5 секунд compute и я даже не могу вспомнить о чём был запрос».
+
+**Почему граница — «хоть какой-то контент»:** это самый дешёвый детектируемый сигнал. `streaming-placeholder.text || .thinking || .toolCalls.length` — три байта проверок, и точно отражает «турн начался физически». Альтернативы (timeout-based, токен-based) лгут на медленных моделях.
+
+В custom-terminal: см. `knowledge/fact-claude-sdk-tab.md::Smart Cancel`.
+
+## Reasoning/thinking: italic + outlined, не dim grey block
+
+**Принцип:** AI thinking/reasoning рендерится как **outlined-контейнер с italic body-size текстом**, не как «приглушённый grey блок». Italic — главный семантический сигнал «это не финальный ответ, это process». Border + лёгкий tinted-bg — визуальное отделение от prose. Dim-grey текст на dim-background **сливается** на тёмной теме: пользователь не видит блок и думает «модель не думала», хотя думала.
+
+**Конкретика, к которой сошлись Vercel AI Elements, Zed Agent Panel, assistant-ui Chain of Thought:**
+- Контейнер: `rounded-md border border-white/10 bg-white/[0.02]` (тёмная тема), или `border-zinc-200 bg-zinc-50/50` (светлая).
+- Trigger-кнопка: clickable header с brain-иконкой, label «thinking / Thought for Ns» (статичный после end).
+- Раскрытый body: `text-sm italic`, цвет `text-muted-foreground` но **с body-size**, не XS. Italic делает работу, не размер.
+- Авто-collapse через 1s после streaming end (опционально) — чтобы законченный reasoning не съедал внимание у финального ответа.
+
+**Тест:** на тёмном фоне закрой глаза, открой через 0.5 секунды. Thinking-блок должен **сразу зацепить взгляд** как «нечто отдельное от prose» — за счёт italic и рамки, не за счёт яркости (яркий — это статус-индикатор, не reasoning).
+
+**Антипаттерн:** `<details><summary>thinking</summary><pre class="text-gray-500 text-xs">...</pre></details>`. Серый XS текст в `<pre>` на чёрном — сливается, читается как комментарий к коду, не как процесс мышления. Удалить XS, оставить sm+italic.
+
+В custom-terminal: см. `knowledge/fact-claude-sdk-tab.md::Reasoning rendering`.
+
+## Hover-action-bar снаружи bubble, якорь к edge bubble (не к viewport)
+
+**Принцип:** hover-affordances над user-сообщением в чате (`Edit`, `Repeat`, `Copy`, `Reply`) — рендерятся **снаружи bubble**, **прижато к его краю**. Якорь — **bubble's own edge** (`right: 100%` относительно bubble), не **viewport-absolute** (`top-right` относительно окна).
+
+**Почему снаружи:** action-bar внутри bubble (`absolute bottom-2 right-2`) **накладывается на текст**. При длинном сообщении с переносом строк последняя строка частично перекрыта кнопками → ухудшение читаемости, пользователь должен «прокручивать глазами вокруг кнопок». Снаружи — bubble остаётся чистым контентом, кнопки в whitespace.
+
+**Почему якорь к bubble:** если якорь к viewport (`top-right` окна), action-bar **отрывается** от своего сообщения визуально — при широком чате он плавает где-то справа, не связан с конкретным bubble. Якорь к **right-edge bubble** (`right: 100%` для right-aligned user-сообщений, `left: 100%` для left-aligned assistant) держит affordance **в зоне внимания** того сообщения, к которому относится.
+
+**Тест:** наведи на user-сообщение в середине широкого окна. Кнопки должны появиться **впритык к левому краю bubble** (для right-aligned bubble). Если они в правом верхнем углу окна — якорь поломан.
+
+**Антипаттерн в Slack/Discord старых версиях:** floating action-bar в правом верхнем углу сообщения, прибит к viewport. На широких экранах глаз теряет связь между bubble и его действиями — пользователь не понимает к какому сообщению относится `Edit`.
+
+В custom-terminal: см. `knowledge/fact-claude-sdk-tab.md::Edit/Repeat anchor`.
+
+## Action-карточки уже prose: отступ справа = scroll-зона + визуальное разделение
+
+**Принцип:** карточки действий (tool calls, thinking-блоки, attachment cards, expandable artifacts) — **уже** по ширине чем окружающая prose ассистента, на 50-80px справа. Не заполняют полную ширину message-bubble.
+
+**Зачем 50-80px справа:**
+1. **Scroll-зона для мыши.** Внутри карточки есть свои scroll-области (code-блок, diff, output). Если карточка fill-width, scroll-event на right-edge либо ловится внутренним scroll'ом, либо main scroll'ом — непредсказуемо. Зазор справа — гарантированная зона для main scroll'а: курсор справа от карточки всегда крутит thread, не внутренности карточки.
+2. **Визуальная грамматика.** Prose ассистента занимает полную ширину сообщения. Action-карточки — нет. Глаз мгновенно различает «это речь» vs «это действие/артефакт» по контуру — без необходимости читать содержимое.
+3. **Hierarchy reading.** Action-карточка по семантике **вложена** в ответ ассистента (часть его работы). Уже ширина = «отступ-вложенность», как indent в коде. Полная ширина читалась бы как «равный по статусу элемент», что неверно.
+
+**Конкретика custom-terminal:** `mr-[60px]` на root `ToolCard` и `ReasoningPart`. На 60px — потому что:
+- < 40px — глаз не успевает зафиксировать разницу.
+- > 80px — карточки выглядят «брошенно слева», теряется горизонтальный ритм с prose.
+- 60 — sweet spot, хорошо читается на ширинах 700-1400px (типичный диапазон chat-области).
+
+**Применимо к:** tool call cards в Cursor/AI-чатах, attachment-blocks в Slack/Discord (file preview, inline media), expandable artifacts в Claude.ai (Artifact-панели), code-cards в ChatGPT (canvas-mode mini-cards). Везде где есть **семантическое различие** «prose vs action/artifact» — physical narrower-than-prose делает работу.
+
+**Антипаттерн:** все блоки fill-width «для использования места по максимуму». Места становится больше, но **читаемость структуры падает**: action-карточки сливаются с prose в одну плоскость, глаз должен парсить содержимое (есть chevron — карточка, нет — текст), вместо парсинга по contour.
+
+## UI-тематический font-size наследуется от пользовательской настройки, em для всех потомков
+
+**Принцип:** когда у приложения есть глобальная настройка «размер шрифта терминала / редактора / чата» — все вложенные UI должны **наследовать** её через единственную точку (root `style={{ fontSize: ${px}px }}`). Все вложенные размеры — **em**, не px. Cmd+/− на тулбаре меняет одну переменную, всё дерево пересчитывается само.
+
+**Почему em, не hardcoded px:** если в коде разбросано `text-[13px]`, `text-[11px]`, `text-[12px]` — каждый раз когда пользователь меняет настройку, ничего не меняется (хардкод побеждает наследование). Перевод `text-[Npx]` → `text-[N/13em]` (где 13 — base) делает всё дерево пропорционально-чувствительным к настройке. Cmd+ увеличивает шрифт на 1px → label на 0.85em увеличится тоже на ~1px, не сломав визуальные пропорции.
+
+**Что не работает:**
+1. **CSS variable `--base-size` + `font-size: var(--base-size)`** — работает но требует `var()` в каждом утилитарном классе, Tailwind 4 не дружит с этим (или JIT не подхватывает динамику).
+2. **Контекст React + provider** — лишний re-render всего дерева при изменении настройки. Не нужен, browser сам каскадит font-size.
+3. **JS-перерасчёт всех `text-[Npx]` на render** — невозможно (Tailwind компилит в статические классы).
+
+**Что работает:** один `<div style={{ fontSize: px }}>` на корне области + `text-[Nem]` везде. Browser-нативный наследование делает работу.
+
+**Тест:** Cmd+ в настройках на 5 нажатий. Карточки tool calls, кнопки, labels — всё должно увеличиться **пропорционально**, не «label остался, padding и иконки увеличились». Если пропорции поломались — где-то остался hardcoded px.
+
+**Подводный камень — inline styles библиотек:** SyntaxHighlighter / react-markdown / CodeMirror принимают `customStyle={{ fontSize: '12px' }}`. Это **не Tailwind**, em там тоже работает: `fontSize: '0.92em'` подцепит base из родителя через CSS-каскад. Не забыть **переписать и эти inline-styles**, иначе code-блоки не масштабируются.
+
+В custom-terminal: см. `knowledge/fact-claude-sdk-tab.md::Font-size inheritance`. SDK-таб наследует `useUIStore.terminalFontSize` через root style, все `text-[Npx]` → `text-[Nem]` (42 замены), `customStyle.fontSize` → `'0.92em'`.
+
+## UI vocabulary ≠ API vocabulary: говори в терминах пользователя
+
+**Принцип:** лейблы в UI должны быть на словаре пользователя, не на жаргоне API. Технические термины SDK / провайдера (`adaptive`, `async`, `idempotent`, `cache_creation_input_tokens`) попадают в UI один раз — когда разработчик скопировал из docs — и потом висят там годами, заставляя пользователя гуглить что они значат.
+
+**Симптом, что принцип нарушен:** юзер говорит «у нас нет режима как `adaptive`, у нас effort — это и есть режим thinking. Сделай переключатель on/off». Юзер не различает adaptive vs effort — для него это **один концепт «модель думает или нет»**. API даёт две независимые ручки (`effort: high` + `thinking: {type: 'adaptive'}`), но в UI юзеру нужна **одна** — on/off — а effort живёт в своей пилюле как «depth».
+
+**Реализация:**
+- Перед добавлением API-параметра в UI: спроси «как пользователь это **назвал бы**?», не копируй имя поля.
+- Если два API-параметра отвечают одной mental model пользователя — слепи их в один UI-контрол (toggle / pill) и преобразуй на отправку.
+- Внутренние enum'ы хранятся как пришли из SDK (`adaptive`/`disabled`) — это **transport-layer**. UI-state живёт отдельно: `thinking: boolean` для toggle, преобразование в момент сериализации.
+
+**Антипаттерн (UI как зеркало API):**
+```
+[ Thinking: adaptive | enabled | disabled ]  ← юзер: «adaptive это enabled или нет?»
+```
+
+**Правильно:**
+```
+[ Thinking: on | off ]    ← одна ручка под пользователя
+```
+
+В custom-terminal: см. `knowledge/fact-mobile-web.md::Params header pill` — `params.thinking === 'disabled'` (SDK transport) → отображается `off` в позиции effort-пилюли, не отдельная пилюля «adaptive».
+
+## Status indicator: signal-on-change, не permanent label
+
+**Принцип:** в любой карточке с lifecycle (running → done/error) status-индикатор существует **только** для не-default-состояний. Default success — implied отсутствием badge. Permanent `done` лейбл — visual noise: юзер уже не сомневается что прошло когда видит result.
+
+**Симптом, что принцип нарушен:** в шапке tool card три состояния — `running`, `error`, `done`. Юзер: «мой MCP в конце отображается done, какой-то done блять нахуй нужен, занимает место по ширине непонятно для чего». **Done badge не несёт информации** — все три источника (зелёная точка, отсутствие spinner'а, наличие result-блока) уже говорят «успех».
+
+**Реализация:**
+- Только `running` / `error` рендерятся как явные badges. Success — отсутствие.
+- Цвет status-dot уже несёт информацию (red/orange/green). Не нужно дублировать в текст.
+- Тест: убери badge → пропадёт ли необходимая информация? Если нет — badge был visual noise.
+
+**Связано:** см. `Brand identity = icon + color, не текст` — та же экономия — информация одним каналом, не тремя.
+
+## No redundant dismiss control: backdrop уже закрывает
+
+**Принцип:** в ActionSheet / bottom-sheet / popup с backdrop'ом отдельная кнопка «Cancel» внизу избыточна. Backdrop-tap — универсальный escape, который пользователь моторно ожидает; явная кнопка занимает место и затрудняет восприятие основного списка опций.
+
+**Симптом, что принцип нарушен:** юзер: «у нас уже оверлей есть, клик по оверлею так и так закрывает меню — Cancel убери». Каждая ActionSheet с Cancel внизу заставляет глаз сканировать на один пункт больше (что важно когда у списка 3-4 опции, а Cancel становится 5-м).
+
+**Реализация:**
+- Backdrop click → dismiss.
+- Drag-handle (если sheet swipeable) → drag-down dismiss.
+- Esc (на desktop) или swipe (на mobile) → dismiss.
+- Явная Cancel **только** когда: (a) backdrop не закрывает по дизайну (destructive confirm), либо (b) внутри sheet идёт асинхронная операция и нужна одна точка остановки.
+
+**Связано:** `Click-outside как universal escape` — там общий принцип, здесь конкретное следствие для action-sheet'ов.
+
+## Visible disabled > hidden для roadmap-кнопок
+
+**Принцип:** placeholder-кнопки будущих фич рендерятся как **disabled visible** (полупрозрачные, не клик), не скрытые до релиза. Visible disabled — это коммуникация «эта возможность планируется» без open ETA.
+
+**Симптом, что принцип нарушен:** юзер запросил composer-row [+] [🎤] [📚] [↑]. Первые две — image attach и voice input, ещё не реализованы. Hidden — пользователь не знает что фича вообще существует в roadmap, спросит спустя месяц «а можно добавить голос?». Disabled — сразу видит «оно будет», не пишет лишний feature request.
+
+**Реализация:**
+- Disabled state: `opacity: 0.4`, цвет иконки `#3a3a3a` (на тёмном) или `#bbb` (на светлом), `cursor: not-allowed`, no `:active` reaction.
+- Опционально tooltip «coming soon», если место в UI позволяет — но не обязательно: иконка сама говорит «что это будет».
+- НЕ ставить ярких индикаторов «soon!» или badge'ей — это уже agressive marketing, а disabled — нейтральный roadmap hint.
+
+**Антипаттерн «вернёмся когда зарелизим»:** скрыть кнопки до релиза. Спрятанная фича не существует для пользователя — момент когда она появится будет surprise, без mental preparation.
+
+**Когда не применимо:** если placeholder загромождает UI (10+ disabled кнопок будущего меню) — лучше show через `«More features ↓»` или roadmap-страницу.
+
+## Display labels тоже single-source-of-truth
+
+**Дополнение к секции `Single source of truth для third-party shipping values`.** Тот же принцип распространяется на **визуальное представление** значения, не только на машинно-читаемый список.
+
+**Симптом:** юзер видит в picker'е `default · opus-4.7 [1M]`, в header'е `default [1M]`, в notification `Opus 1M`. Один и тот же выбор называется тремя способами — пользователь не уверен, всё ли совпадает. Жалоба формы: *«не default 1m, а opus-4.7 [1M]. Напиши полное название, точно так же как в Model picker'е».*
+
+**Реализация:**
+- Каждое значение имеет **canonical display label** в том же constants-файле что и сам value.
+- Каждое UI-место рендерит через один и тот же mapping (`HEADER_MODEL_LABEL[value]` / `MODEL_LABELS[value]`), не свой `.toUpperCase()` / `.replace(...)` / собственное украшение.
+- Если в одном месте нужна сокращённая форма (header-pill), а в другом полная (picker) — оба варианта живут как именованные exports в constants, не один inline в JSX.
+
+**Тест:** запрети `if/switch` в JSX по value → label. Все mapping'и из constants. Если 3 места используют 3 разных свича — рассинхрон обеспечен.
+
+## Active expanded, archive collapsed
+
+**Принцип:** длинный список с двумя классами сущностей по активности — активные показываются развёрнуто с богатыми карточками, остальные сворачиваются под `▾ All (N)` и раскрываются по тапу. Активность определяется реальным флагом (открыт сейчас, выполняется, recent), не датой.
+
+**Симптом, что принцип нарушен:** mobile-список 16 проектов с одной карточкой на каждый, все одинакового размера. Юзер должен скроллить чтобы найти текущий открытый. *«Текущие активные сверху развёрнуто, остальные в свёрнутом списке».*
+
+**Реализация:**
+- Top section `Active` — карточки с full info, accent-цветом, dynamic state (live indicator, % progress).
+- Bottom section `▾ All (N)` — collapsed button. По тапу разворачивается в plain список (имя + path, без accent'а).
+- В collapsed-section элементы маленькие — это «архив, доступный, но не доминирующий».
+- Sort внутри active: активный сверху (звёздочка ★), остальные active по recency.
+- Empty active section: вместо «ничего» рендери placeholder *«No projects open in desktop right now»* — даёт hint как наполнить.
+
+**Когда не применимо:** если список < 10 элементов всего — деление излишне. Single flat list.
+
+См. `knowledge/fact-mobile-web.md::Endpoint map` (`isOpen` поле в `/api/projects`).
+
+## Animation duration cap для navigation
+
+**Принцип:** анимация перехода/scroll/dismiss длится **≤200ms** для коротких дистанций, **≤300ms** для full-screen transitions. Native `behavior: 'smooth'` без cap'а зависит от distance — на длинных списках = 1-3 секунды = ощущается как баг.
+
+**Симптом, что принцип нарушен:** юзер: «анимация скролла должна быть меньше 300ms, желательно 200ms. Причём как у мобилки так и у десктопа». 800ms scroll-to-bottom после команды — юзер успевает потерять фокус и нажать дважды.
+
+**Реализация:**
+- Свой rAF-animator с фиксированной длительностью независимо от distance.
+- ease-out cubic (быстрый старт, плавный конец) — feels snappier чем linear или ease-in-out.
+- Для длинных дистанций где даже custom animator jankaет (200+ DOM-нод) — instant jump + dim overlay на 1-2 кадра (см. `methodology/design-mobile.md::Jump scroll + dim overlay`).
+- Native browser smooth-scroll использовать только для коротких перемещений внутри короткой страницы; везде где список > 50 элементов — свой animator.
+
+**Тест:** замерь scroll-to-bottom на чате с 200 entries. Если занимает > 250ms — переходи на jump+overlay.
+
+См. `methodology/design-mobile.md::Jump scroll + dim overlay`.
+
+## Assistant text — column, не bubble
+
+**Принцип:** в AI-чатах сообщения **ассистента** не должны выглядеть как chat-bubble с правым отступом «как от собеседника». Ответ AI на длинный prompt — это **document**, не реплика. User-message — bubble (короткие, выровнены вправо). Assistant — full-width column (потенциально длинные, выровнены к prose-flow).
+
+**Симптом, что принцип нарушен:** на мобильном экране ответ AI занимает 85% ширины внутри «bubble» — правые 15% постоянно пусты, а ниже идёт tool-card на 100% ширины. Визуальный конфликт: assistant с margin'ом, его же tool — без. Юзер: «нет смысла особо заморачиваться, растяни на всю ширину».
+
+**Реализация:**
+- User message: bubble background `#1f3a5f`, `max-width: 85%`, `justify-content: flex-end`.
+- Assistant message: no bubble, `color: #cccccc`, full-width до padding'а контейнера, `lineHeight: 1.5`. Markdown body использует тот же поток.
+- Tool cards: full-width, без bubble (`Tool call = карточка`).
+- Thinking: full-width outlined контейнер с italic body.
+
+**Mental model:** user — реплика в диалоге (bubble), assistant — статья/документ (column). Tool call — структурированный лог (card). Три разные грамматики, не одна.
+
+В custom-terminal: см. mobile-web `EntryView` — assistant без `S.bubble`, full-width column. Desktop SDK-таб исторически использует bubble, но переход на column в roadmap.
+
+## Success ≠ exit code: валидация по содержимому, не по факту завершения
+
+**Принцип:** когда UI триггерит фоновую команду и показывает пользователю исход (тост «успешно» / «ошибка»), нельзя считать её успешной по `exit code === 0`. Многие скрипты завершаются ноль-кодом даже если внутренне провалили половину файлов / шагов / запросов — выход 0 значит «скрипт дошёл до своего конца», не «задача выполнена». Если показать «успешно» по факту exit'а — UI лжёт пользователю, и юзер обнаружит провал только когда столкнётся с последствием (устаревший индекс, недописанный артефакт, частичный backup).
+
+**Симптом из живой сессии (спокойно):** *«если вылезет какая-то ошибка, чтобы всё откатилось, вылезет тост-уведомление. То есть не будет такого, что у меня лоадер прошёл успешно, а на самом деле там возникло на каком-то этапе какая-то ошибка»*. Юзер сформулировал требование к детерминированности **до** того как баг проявился.
+
+**Реализация:** парсить stdout фоновой команды детерминированными regex-ами, собирать набор позитивных и негативных сигналов, и считать `success = AND(все позитивные)`:
+- exit code 0 И не убит сигналом — необходимое, но не достаточное условие.
+- Видели summary-строку (`Files indexed: X/Y (cached: ..., err: N)`). Её отсутствие = скрипт прервался посреди процесса, артефакт может быть невалидным.
+- Поля `err`/`warn`/`fail` в summary == 0.
+- Подсчитанные per-event ошибки (`error <file>`, `missing <file>`, `wrapped <file>`) == 0. Двойная страховка против случая, когда summary врёт о своих собственных полях.
+
+Тост получает **конкретный список причин** (`exit code 0; summary missing; 2 file error(s): wrapped:docs/...`) — пользователь не должен читать stderr. Детали идут в лог.
+
+**В custom-terminal:** `src/main/ipc/semantic-index-status.js::rebuildIndex` — успех rebuild'а индекса собирается из 6 сигналов: `code===0 && !signal && sawSummary && summaryErrors===0 && summaryWarnings===0 && perFileBad===0`. См. также `knowledge/fact-project-toolbar.md::Rebuild validation`.
+
+## Прогресс-индикатор показывает active work, не total volume
+
+**Принцип:** при фоновом процессе, где большинство шагов пролетают за миллисекунды через кэш / no-op / skip, счётчик прогресса (`N / M`) должен описывать **реально работающие** шаги, не общий объём. Иначе восприятие искажается: `5 / 90` создаёт иллюзию «осталось много», хотя 85 из них уже за кадром cached, и пользователю действительно ждать 5.
+
+**Симптом из живой сессии (спокойно):** *«у нас не отображается то, сколько всего проиндексировано, а сколько сразу осталось проиндексировать»*. Юзер сам сформулировал mental model и попросил подогнать счётчик под неё, не наоборот.
+
+**Граница:** работает для процессов где есть **наблюдаемая разница** между «реально работаю» и «пропускаю». В индексаторе видно по двум разным маркерам в stdout (`[launched ...]` vs `cached`). Для процесса где все шаги равноценны — счётчик честно по всем.
+
+**Тест:** если 90% шагов завершатся за первые 0.5 секунды, и пользователь увидит `81/90` мгновенно, а потом несколько минут зависание на `81-86/90` — счётчик неинформативен. Хорошее число для running-индикатора начинается с того, что **уже занимает время и осталось** (`1/5`, не `86/90`).
+
+**В custom-terminal:** `src/main/ipc/semantic-index-status.js` — `outdatedTotal` собирается из `[launched N/TOTAL]` строк (только файлы, у которых не совпал hash), `outdatedCompleted` инкрементируется при `ok|wrapped|error` для launched-файлов; `cached` события игнорируются. Цвет индикатора во время rebuild'а — амбер (`#d97706`), не индиго: индикатор сигнализирует «есть работа», а не «всё хорошо». См. `knowledge/fact-project-toolbar.md::SemanticIndex visual language`.
+
+## Local infra > cloud для single-user dev-tool
+
+**Принцип:** для инструмента с одним пользователем (личный CLI, локальная dev-utility, single-developer mobile remote) **не** разворачивать cloud-инфру (туннели, домены, OAuth, certificate management). Простой local HTTP/WS на 0.0.0.0 + bearer token в файле + ручной copy на устройства — достаточно и быстрее в setup'е.
+
+**Симптом, что принцип нарушен:** разработчик предлагает Cloudflare Tunnel + Access policies + Google OAuth для «production-ready» доступа с телефона. Пользователь: *«пошёл ты нахуй, какой сука туннель, какой домен блять, я не буду этого делать, возвращай токен»*. Cloud-инфра — overkill когда ПК и телефон в одной Wi-Fi.
+
+**Реализация:**
+- HTTP+WS на `0.0.0.0:<port>`, доступен через LAN IP.
+- Bearer token генерируется при первом старте, лежит в `~/.<app>/web-token.txt` (mode 0o600).
+- Token копируется на устройства через clipboard / AirDrop / QR (one-time setup).
+- URL формы `http://<lan-ip>:<port>/?token=<hex>` — token из query stripping'ается в localStorage при первом mount'е.
+- Trade-off: ПК должен быть on + в той же сети. Не недостаток для dev-tool — он у тебя и так включён когда работаешь.
+
+**Когда нужна cloud-инфра:** multi-user продукт, пользователь не может быть в той же сети что host. Для single-developer remote control — никогда.
+
+См. `knowledge/fact-mobile-web.md::Token & paths` и `methodology/design-mobile.md::Bridge для UI-state-needing actions`.
+
+## Toggle для expanded long content — наверху и внизу
+
+**Принцип:** когда длинный inline-блок (>1 экрана) сворачивается через toggle — в **expanded** состоянии toggle обязан жить и **сверху**, и снизу. Один toggle снизу заставляет пользователя скроллить через весь контент чтобы свернуть, что превращает «свернуть» в «забить и проскроллить мимо».
+
+**Симптом, что принцип нарушен:** пользователь раскрыл блок на 800+ символов / 50+ строк, прочитал начало, понял что не нужно — и теперь не может его свернуть, потому что кнопка `Свернуть` под текстом, а текст занимает три экрана. Жалоба формы *«нужно скроллить в самый низ приложения чтобы свернуть, это крайне неудобно»*.
+
+**Реализация:**
+- В collapsed состоянии — toggle **только снизу** (после превью). Это естественное продолжение текста.
+- В expanded состоянии — toggle и сверху (`mb-1` под верхом блока), и снизу. Один и тот же handler.
+- Anchor для viewport-preserve (rAF + scroll-restore при сворачивании) общий — оборачивай весь блок одним `<div ref={anchorRef}>`, оба `<button>` внутри.
+
+**Когда не нужен top-toggle:** когда expanded-контент короче ~2 экранов и заведомо помещается без скролла (тогда нижняя кнопка видна сразу).
+
+**В custom-terminal:** `CollapsibleText` в `ClaudeSDKTab.tsx` — desktop user-bubble. См. `knowledge/fact-claude-sdk-tab.md::Сворачивание длинных user-сообщений`.
+
+## position:fixed × ancestor transform — containing-block ловушка
+
+**Принцип:** CSS-spec: любой `transform`, `filter`, `perspective`, `will-change`, `backdrop-filter` на ancestor'е делает его **containing block для `position:fixed` потомков**. После этого `position:fixed; inset:0` рендерится не относительно viewport'а, а относительно этого ancestor'а — обычно крошечного.
+
+**Симптом, что принцип нарушен:** sheet/modal/overlay с `position:fixed; bottom:0` (должен прилипать к низу экрана) внезапно «улетает вверх», прилипает к низу маленького контейнера в шапке. Пользователь: *«окошко вообще не там где должно быть, въебенях где-то вверху появляется»*.
+
+**Реализация:**
+- Если центрируешь header-элемент абсолютно — **не используй `transform: translate(-50%, -50%)`**. Замени на overlay-pattern: `position:absolute; left:0; right:0; top:0; bottom:0; display:flex; justify-content:center; align-items:center;` с `pointer-events:none` на overlay и `pointer-events:auto` на content.
+- Если transform нужен (анимация, scale): рендери `position:fixed` потомков **через React Portal** в `document.body` — Portal вытаскивает их из transform'нутого ancestor'а.
+
+**Тест:** перед коммитом UI-кода — для каждого ancestor'а с `transform/filter/will-change` проверь что внутри нет `position:fixed` который должен быть viewport-relative. Если есть — Portal или замена ancestor-стиля.
+

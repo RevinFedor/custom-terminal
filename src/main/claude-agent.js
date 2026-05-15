@@ -81,31 +81,30 @@ class ClaudeAgentManager {
     if (onStatus) onStatus('running');
 
     try {
-      // Create or resume session
-      let session = tab.session;
-      if (!session) {
-        if (tab.sessionId) {
-          console.log('[ClaudeAgent] Tab ' + tabId + ': Resuming session ' + tab.sessionId);
-          session = sdk.unstable_v2_resumeSession(tab.sessionId, {
-            model,
-            cwd,
-            permissionMode: 'acceptEdits',
-            abortController: tab.abortController,
-          });
-        } else {
-          console.log('[ClaudeAgent] Tab ' + tabId + ': Creating new session (cwd=' + cwd + ')');
-          session = sdk.unstable_v2_createSession({
-            model,
-            cwd,
-            permissionMode: 'acceptEdits',
-            abortController: tab.abortController,
-          });
-        }
-        tab.session = session;
+      // SDK 0.3.x: the `unstable_v2_*` session API has been REMOVED. The only
+      // streaming entry point is `query({ prompt, options })`. To continue an
+      // existing conversation, pass `options.resume = <sessionId>` — SDK
+      // re-hydrates state from JSONL on disk; we don't need to cache a
+      // long-lived `session` object on `tab.session` any more. We keep the
+      // `tab.session` field for `close()` compatibility (so cancel still has
+      // a handle), but rebuild the iterator on every turn.
+      const queryOptions = {
+        model,
+        cwd,
+        permissionMode: 'acceptEdits',
+        // Not strictly needed for acceptEdits, but cheap to set in case the
+        // permission mode is bumped later. SDK ignores the flag when mode != bypass.
+        abortController: tab.abortController,
+      };
+      if (tab.sessionId) {
+        queryOptions.resume = tab.sessionId;
+        console.log('[ClaudeAgent] Tab ' + tabId + ': Resuming session ' + tab.sessionId);
+      } else {
+        console.log('[ClaudeAgent] Tab ' + tabId + ': Creating new session (cwd=' + cwd + ')');
       }
 
-      // Send prompt
-      await session.send(prompt);
+      const q = sdk.query({ prompt, options: queryOptions });
+      tab.session = q;
 
       // Collect response
       let resultText = '';
@@ -114,7 +113,7 @@ class ClaudeAgentManager {
       let inputTokens = 0;
       let outputTokens = 0;
 
-      for await (const msg of session.stream()) {
+      for await (const msg of q) {
         // Capture session ID from init message
         if (msg.type === 'system' && msg.subtype === 'init' && msg.session_id) {
           tab.sessionId = msg.session_id;

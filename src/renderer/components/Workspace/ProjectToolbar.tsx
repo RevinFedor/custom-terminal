@@ -1,15 +1,19 @@
 import React, { useState, useMemo } from 'react';
 import { Home, Minimize2, RotateCcw, Globe } from 'lucide-react';
+import { VscVscode } from 'react-icons/vsc';
 import { useUIStore } from '../../store/useUIStore';
 import Tooltip from '../UI/Tooltip';
 import { useWorkspaceStore, isTabInterrupted } from '../../store/useWorkspaceStore';
+import { useProjectsStore } from '../../store/useProjectsStore';
 import { compressLogs } from '../../utils/compressLogs';
+import SemanticIndexButton from './SemanticIndexButton';
 
 const { ipcRenderer } = window.require('electron');
 
 export default function ProjectToolbar() {
   const { showToast } = useUIStore();
-  const { activeProjectId, openProjects, clearInterruptedState, setTabCommandType, createBrowserTab, setProjectView } = useWorkspaceStore();
+  const { activeProjectId, openProjects, clearInterruptedState, setTabCommandType, createBrowserTab, setProjectView, getEffectiveTabId } = useWorkspaceStore();
+  const { projects } = useProjectsStore();
 
   const [isCompressing, setIsCompressing] = useState(false);
 
@@ -65,6 +69,25 @@ export default function ProjectToolbar() {
     });
 
     showToast(`Resumed ${interruptedTabs.length} session(s)`, 'success');
+  };
+
+  const handleOpenVSCode = () => {
+    if (!activeProjectId) return;
+    const workspace = openProjects.get(activeProjectId);
+    const currentProject = projects[activeProjectId];
+    const effectiveId = getEffectiveTabId();
+    const currentTab = effectiveId && workspace ? workspace.tabs.get(effectiveId) : null;
+    const cwd = currentTab?.cwd || currentProject?.path;
+    if (!cwd) {
+      showToast('Не удалось определить директорию проекта', 'error');
+      return;
+    }
+    const { exec } = window.require('child_process');
+    exec('code .', { cwd }, (err: Error | null) => {
+      if (err) {
+        showToast('Не удалось открыть VS Code (нужен `code` в PATH)', 'error');
+      }
+    });
   };
 
   const handleCompressLogs = async () => {
@@ -166,6 +189,21 @@ export default function ProjectToolbar() {
         <Globe size={14} />
       </button>
       </Tooltip>
+
+      {/* Open in VS Code Button */}
+      <Tooltip content="Открыть проект в VS Code">
+      <button
+        onClick={handleOpenVSCode}
+        style={buttonStyle(false)}
+        onMouseEnter={(e) => handleMouseEnter(e, false)}
+        onMouseLeave={(e) => handleMouseLeave(e, false)}
+      >
+        <VscVscode size={14} />
+      </button>
+      </Tooltip>
+
+      {/* Semantic Index Status */}
+      <SemanticIndexButton />
 
       {/* Resume All Interrupted Sessions Button - only shows when there are interrupted tabs */}
       {interruptedTabs.length > 0 && (

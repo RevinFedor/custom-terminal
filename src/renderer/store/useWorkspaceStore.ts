@@ -1604,10 +1604,16 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     const workspace = openProjects.get(projectId);
     const projectPath = workspace?.projectPath;
     const cwd = (projectPath && !projectPath.startsWith('__unset__')) ? projectPath : (process.env.HOME || '~');
-    return createTab(projectId, 'Claude SDK', cwd, {
+    // Use the same naming scheme as PTY claude tabs ("claude", "claude-02", ...)
+    // so SDK tabs are visually indistinguishable by name from regular ones; the
+    // visual differentiation is the peach colour + missing RestartZone.
+    const existingNames = workspace ? Array.from(workspace.tabs.values()).map(t => t.name) : [];
+    const tabName = getNextAvailableName('claude', existingNames);
+    return createTab(projectId, tabName, cwd, {
       tabType: 'claude-sdk',
       color: 'claude',
       commandType: 'claude',
+      nameSetManually: true, // lock the auto-rename loop in setTabCommandType
     });
   },
 
@@ -1618,10 +1624,11 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       if (tab) {
         // Kill PTY
         ipcRenderer.send('terminal:kill', tabId);
-        // Convert
+        // Convert — keep the tab's existing name (it's already "claude" or "claude-02"
+        // for PTY claude tabs; renaming it to "Claude SDK" creates an inconsistent
+        // visual that fights the peach-tint differentiation). Only flip the type/color.
         tab.tabType = 'claude-sdk';
         tab.color = 'claude';
-        tab.name = 'Claude SDK';
         tab.nameSetManually = true;
         tab.sdkState = 'idle';
         set({ openProjects: new Map(openProjects) });

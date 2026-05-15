@@ -308,6 +308,10 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   const [activeTooltipIndex, setActiveTooltipIndex] = useState<number | null>(null);
   const [isExpanded, setIsExpanded] = useState(false);
   const [tooltipCopied, setTooltipCopied] = useState(false);
+  // Per-entry collapsed/expanded state for docs blocks in tooltip. Key = entry uuid.
+  // Default collapsed (compact one-liner) — click on the line to expand and see full paths/queries.
+  const [expandedDocsEdit, setExpandedDocsEdit] = useState<Set<string>>(new Set());
+  const [expandedDocsSearch, setExpandedDocsSearch] = useState<Set<string>>(new Set());
   const [selectionStartId, setSelectionStartId] = useState<string | null>(null);
   const selectionStartIdRef = useRef<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
@@ -3652,29 +3656,76 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                     )}
                     {/* Docs-edit / docs-search inline preview — attached to user-entry that triggered them.
                         Previously rendered as separate green dots on timeline; consolidated here so each
-                        prompt has at most one dot, with docs-info surfaced on hover. */}
-                    {currentActiveEntry.docsEdited && currentActiveEntry.docsEdited.length > 0 && (
-                      <div className="flex items-start gap-1.5 pb-1.5 mb-1.5 border-b border-green-500/15 shrink-0">
-                        <Pencil size={10} className="shrink-0 mt-0.5" style={{ color: '#4ade80' }} />
-                        <div className="leading-snug font-mono text-[10px] flex-1" style={{ color: 'rgba(74, 222, 128, 0.85)' }}>
-                          <div className="font-medium mb-0.5">Docs updated</div>
-                          {currentActiveEntry.docsEdited.map((f: string, i: number) => (
-                            <div key={i} style={{ opacity: 0.85 }}>{f}</div>
-                          ))}
+                        prompt has at most one dot, with docs-info surfaced on hover.
+                        Default: compact one-liner "Docs updated (N) — basename, basename, …".
+                        Click on the line: expand to show full paths / full queries on separate rows.
+                        Keeps tooltip body short so prompt text below is visible without scrolling. */}
+                    {currentActiveEntry.docsEdited && currentActiveEntry.docsEdited.length > 0 && (() => {
+                      const uuid = currentActiveEntry.uuid;
+                      const open = expandedDocsEdit.has(uuid);
+                      const files = currentActiveEntry.docsEdited;
+                      return (
+                        <div className="pb-1.5 mb-1.5 border-b border-green-500/15 shrink-0">
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setExpandedDocsEdit(prev => {
+                                const next = new Set(prev);
+                                if (next.has(uuid)) next.delete(uuid); else next.add(uuid);
+                                return next;
+                              });
+                            }}
+                            className="w-full text-left flex items-center gap-1.5 hover:bg-green-500/5 rounded px-0.5 py-0.5 cursor-pointer"
+                            style={{ color: 'rgba(74, 222, 128, 0.9)' }}
+                          >
+                            <Pencil size={10} className="shrink-0" style={{ color: '#4ade80' }} />
+                            <span className="leading-snug font-mono text-[10px] flex-1 font-medium">
+                              Docs updated ({files.length})
+                            </span>
+                          </button>
+                          {open && (
+                            <div className="mt-1 ml-4 leading-snug font-mono text-[10px]" style={{ color: 'rgba(74, 222, 128, 0.85)' }}>
+                              {files.map((f: string, i: number) => (
+                                <div key={i} className="break-all" style={{ opacity: 0.85 }}>{f}</div>
+                              ))}
+                            </div>
+                          )}
                         </div>
-                      </div>
-                    )}
-                    {currentActiveEntry.docsSearchQueries && currentActiveEntry.docsSearchQueries.length > 0 && (
-                      <div className="flex items-start gap-1.5 pb-1.5 mb-1.5 border-b border-lime-500/15 shrink-0">
-                        <Search size={10} className="shrink-0 mt-0.5" style={{ color: '#bef264' }} />
-                        <div className="leading-snug font-mono text-[10px] flex-1" style={{ color: 'rgba(190, 242, 100, 0.85)' }}>
-                          <div className="font-medium mb-0.5">Docs search</div>
-                          {currentActiveEntry.docsSearchQueries.map((q: string, i: number) => (
-                            <div key={i} style={{ opacity: 0.85 }}>«{q}»</div>
-                          ))}
+                      );
+                    })()}
+                    {currentActiveEntry.docsSearchQueries && currentActiveEntry.docsSearchQueries.length > 0 && (() => {
+                      const uuid = currentActiveEntry.uuid;
+                      const open = expandedDocsSearch.has(uuid);
+                      const queries = currentActiveEntry.docsSearchQueries;
+                      return (
+                        <div className="pb-1.5 mb-1.5 border-b border-lime-500/15 shrink-0">
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setExpandedDocsSearch(prev => {
+                                const next = new Set(prev);
+                                if (next.has(uuid)) next.delete(uuid); else next.add(uuid);
+                                return next;
+                              });
+                            }}
+                            className="w-full text-left flex items-start gap-1.5 hover:bg-lime-500/5 rounded px-0.5 py-0.5 cursor-pointer"
+                            style={{ color: 'rgba(190, 242, 100, 0.9)' }}
+                          >
+                            <Search size={10} className="shrink-0 mt-0.5" style={{ color: '#bef264' }} />
+                            <span className="leading-snug font-mono text-[10px] flex-1">
+                              <span className="font-medium">Docs search ({queries.length})</span>
+                            </span>
+                          </button>
+                          {open && (
+                            <div className="mt-1 ml-4 leading-snug font-mono text-[10px]" style={{ color: 'rgba(190, 242, 100, 0.85)' }}>
+                              {queries.map((q: string, i: number) => (
+                                <div key={i} className="break-words" style={{ opacity: 0.85 }}>«{q}»</div>
+                              ))}
+                            </div>
+                          )}
                         </div>
-                      </div>
-                    )}
+                      );
+                    })()}
                     <div className="text-white/90 leading-snug font-mono scrollbar-thin" style={{ maxHeight: isExpanded ? 'calc(60vh - 80px)' : '120px', overflowY: 'auto', overflowX: 'hidden', whiteSpace: 'pre-wrap' }}>
                       {currentActiveEntry.content}
                     </div>

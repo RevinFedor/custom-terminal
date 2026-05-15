@@ -332,3 +332,26 @@ SQLite в main process — origin-independent (хранится в `app.getPath(
 ## Что пробовали и почему отбросили
 - **electron-store** — лишняя зависимость, тот же IPC pattern + дополнительный код для миграций. SQLite в main уже есть через `projectManager.db`, переиспользуем.
 - **Файл в `app.getPath('userData')/settings.json`** — race на одновременной записи нескольких настроек, нужен debounce + queue. SQLite + better-sqlite3 даёт сериализуемость из коробки.
+
+## location.reload() открывает default OS browser вместо перезагрузки окна
+
+**Симптом:** в ErrorBoundary кнопка Reload вместо перезагрузки renderer'а открывает default OS browser (Yandex/Chrome) и грузит туда `file://...` или `app://...` URL текущей страницы.
+
+**Причина:** при custom-protocol page `window.location.reload()` иногда роутится через OS protocol handler, а не через Electron renderer reload. Воспроизводится после ошибок в renderer + некоторых path resolution edge-cases.
+
+**Решение:** не использовать `location.reload()` напрямую. IPC в main:
+```js
+// main.js
+ipcMain.on('app:reload', (event) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  if (win && !win.isDestroyed()) win.webContents.reload();
+});
+
+// renderer
+try {
+  window.require('electron').ipcRenderer.send('app:reload');
+} catch {
+  location.reload(); // fallback для не-Electron окружения (mobile-web в браузере)
+}
+```
+`webContents.reload()` всегда стейс внутри той же BrowserWindow независимо от protocol.
