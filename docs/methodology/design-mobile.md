@@ -1,0 +1,218 @@
+# Mobile Design Methodology
+
+Переносимые принципы UX/архитектуры для **мобильных веб-клиентов**, которые подключаются к локальному серверу (десктопное приложение раздаёт mini-SPA для управления с телефона). Параллельный файл к `design.md` — там общие принципы, здесь специфика touch + ограниченный экран + нестабильный network.
+
+## Long-press: row не должен быть click-target
+
+**Принцип:** в скроллируемом списке с long-press жестом для контекстного меню — сама строка **не имеет onClick**. Все интерактивные действия выносятся в явные кнопки внутри строки. Иначе iOS дебаунсит каждый touchstart, пытаясь отличить tap от scroll, и вертикальный скролл «залипает».
+
+**Симптом, что принцип нарушен:** пользователь скроллит длинный список, скролл идёт рывками — палец «застревает» на каждой строке на 100-300ms, потом отпускает. Иногда на ту же запись срабатывает long-press при попытке проскроллить вверх. Жалоба формы *«скролл работает то срабатывает, то нет, прямо нормально вообще практически не работает»*.
+
+**Реализация:**
+- Внешний `<div>` строки — без `onClick`.
+- Действия через явные кнопки с background, чтобы читались как кнопки (chevron `▶` для toggle, стрелка `↗` для goto).
+- Long-press навешивается на внешний div через PointerEvents, **но с проверкой движения** — если палец сдвинулся >12px, отменяем long-press detection (это скролл, не нажатие).
+- На контейнере scroll: `touch-action: pan-y` (Safari сразу commit'ит вертикаль) + `WebkitOverflowScrolling: touch` (smooth momentum).
+
+## Tap feedback: мгновенный, не от React
+
+**Принцип:** видимая реакция на тап должна происходить **в момент касания**, не после React re-render. На длинном rendering-pipeline (большой DOM, тяжёлая модалка) задержка в 100-300ms между tap и UI-реакцией ощущается как «ничего не нажалось».
+
+**Симптом:** пользователь тапает на back-кнопку, экран не меняется ~200ms, тапает снова — теперь сработало два раза подряд (двойная навигация). Жалоба формы *«непонятно: я нажал кнопку или нет»*.
+
+**Реализация:**
+- На каждой кнопке — `touch-action: manipulation` (убивает iOS 300ms double-tap-zoom delay).
+- CSS `:active { transform: scale(0.94); opacity: 0.55; background: <darker> }` — **браузер сам** меняет стиль на pointerdown, без re-render. Юзер видит «нажал» в течение 16ms независимо от того, насколько медленный onClick.
+- Inline-style с `transform` иногда перебивается каскадом — для безопасности добавить отдельный класс `.btn-flash:active { background: !important }`.
+
+## Full-screen drawer == «отдельный экран»
+
+**Принцип:** на узком экране телефона drawer-меню шире 70vw обычно лучше делать **на всю ширину viewport**. Это не «открывшаяся панель», это **смена экрана**. Перестаёшь думать о нём как о floating UI — думаешь как о навигационной странице с кнопкой назад.
+
+**Симптом, что принцип нарушен:** drawer 60-70vw — за ним видно «обрезок» основного экрана, юзер пытается тапнуть туда чтобы закрыть → попадает мимо backdrop'а на саму кнопку чата → действие срабатывает дважды; либо пытается скроллить chat сквозь drawer.
+
+**Реализация:**
+- `width: 100vw`, без borderLeft.
+- Закрытие — только явная ✕ кнопка вверху + tap по backdrop'у (если есть).
+- Не делать swipe-to-close по горизонтали — конкурирует с вертикальным скроллом контента.
+
+## display:none > unmount для preserved state
+
+**Принцип:** если у компонента есть «значимое внутреннее состояние браузера» (scrollTop, текстовое выделение, форма, виртуализатор), и он скрывается/показывается часто — **не unmount'и его**, скрой через `display: none`. Браузер сохраняет всё native, без manual save/restore.
+
+**Симптом:** drawer с длинным списком — каждый раз открывается с самого верха, пользователь теряет контекст. Виртуализатор кеши теряются, listу нужно 200-500ms на rerender при каждом открытии.
+
+**Реализация:**
+- `{open ? <Drawer /> : null}` ❌ — unmount при close → state теряется
+- `<Drawer style={{ display: open ? 'block' : 'none' }} />` ✅ — DOM остаётся, scrollTop живёт, virtualization кэшируется
+- Trade-off: keepAlive стоит памяти. Допустимо для одного-двух drawer'ов, не для каждой страницы.
+
+## Jump scroll + dim overlay > smooth scroll на длинных DOM
+
+**Принцип:** на длинных списках (200+ DOM-нод) `scrollTo({behavior:'smooth'})` или собственный rAF-animator одинаково jankaют — браузер не успевает рендерить промежуточные кадры. Лучше: **мгновенный** `scrollTop = X` + **краткий полупрозрачный overlay** на 1-2 кадра, чтобы скрыть discontinuous frame.
+
+**Симптом, что принцип нарушен:** GoTo с одной части списка в другую — скролл идёт рывками 1-3 секунды, кадры «прыгают», ощущение что приложение зависло. Юзер тапает GoTo второй раз → сработало два раза.
+
+**Реализация:**
+```ts
+setScrollOverlay(true);
+requestAnimationFrame(() => requestAnimationFrame(() => {
+  el.scrollTop = targetTop;             // instant
+  requestAnimationFrame(() => setScrollOverlay(false));
+}));
+// JSX:
+{scrollOverlay && <div style={{ background:'rgba(0,0,0,0.85)', zIndex:1500 }}>jumping…</div>}
+```
+
+**Не делай blur(...)** на overlay — blur динамического DOM (длинный chat скроллится под ним) убивает iOS frame budget. Solid dim — да, blur — нет.
+
+**Custom rAF animator уместен** только на коротких дистанциях (< 50 entries) и **с фиксированной длительностью** (200ms независимо от расстояния), не от distance. Native `behavior:'smooth'` зависит от distance — на длинных листах = боль.
+
+## Optimistic local push — только если сервер не бродкастит этот же event
+
+**Принцип:** в любой архитектуре где **сервер сам бродкастит** результат действия (WS, server-sent events, push), local optimistic push **дублирует** UI-элемент. Выбирать одно из двух: либо local-push + suppress server event, либо ждать server event без local-push.
+
+**Симптом, что принцип нарушен:** mobile отправляет prompt → видит свой bubble дважды (один раз локально через optimistic, второй раз когда WS broadcast прилетит).
+
+**Реализация:** для mobile-веба, где сервер обязательно шлёт synthetic user broadcast — убрать local optimistic push, положиться на WS (50-200ms задержка, busy-spinner даёт feedback что отправилось). См. `knowledge/fact-mobile-web.md::Synthetic broadcast`.
+
+**Когда local-push оправдан:** сервер не бродкастит твоё же сообщение обратно (HTTP request/response, нет WS) — без local-push UI зависнет до ответа.
+
+## Header layout: центр для primary state, edges для navigation
+
+**Принцип:** на узком хедере (≤ 60px высоты) центр — самое широкое и заметное место. Туда выносится **primary state** того экрана, не имя. Имя — caption под back-кнопкой слева. Справа — secondary actions (Stop, Menu).
+
+**Симптом, что принцип нарушен:** в чате юзер не понимает к какой модели сейчас обращается — имя таба «claude-04» в центре, а модель/effort где-то мелкими буквами справа.
+
+**Реализация для AI-чата:**
+- Слева: **back + имя как ОДНА кнопка** (Fitts: target ~120px вместо 32px → промахов почти нет на phone). Имя — caption, не отдельный элемент.
+- Левый дополнительный слот: `12%` context remaining (мелкий, цвет = прогресс)
+- Центр: `model · effort ▾` (clickable, открывает params sheet) — primary state экрана. Центрируется **относительно viewport'а**, не флекс-остатка между left/right (group widths разные → центр сместится). Правильный паттерн — absolute overlay `inset:0; pointer-events:none; flex center` с `pointer-events:auto` на content.
+- Справа: `[Stop?] [☰]` (secondary actions)
+
+**Не используй `transform: translate(-50%, -50%)`** для центрирования — становишься containing block для `position:fixed` потомков (например ParamsSheet). Sheet «улетит вверх» в крошечный header-блок. См. `methodology/design.md::position:fixed × ancestor transform — containing-block ловушка`.
+
+**Тест:** прочитай хедер вслух. То что в центре — должно отвечать на вопрос «с кем/чем сейчас взаимодействую?». Если отвечает на «где я?» — это для слева, не для центра.
+
+## Lift state to parent для async-prefetch UI
+
+**Принцип:** если у sub-компонента (drawer, modal, panel) есть тяжёлая загрузка данных и он часто открывается-закрывается — **state должен жить в родителе**, не в самом компоненте. Родитель префетчит данные сразу при mount'е страницы, sub-компонент получает их через props.
+
+**Симптом, что принцип нарушен:** юзер тапает «открыть таймлайн» — каждый раз видит спиннер на 500-1500ms, хотя данные уже могли быть подгружены пока он читал чат.
+
+**Реализация:**
+- В `ChatView` (родитель): `useState<TimelineEntry[]|null>` + `useEffect` фетчит сразу при mount.
+- `<TimelineDrawer entries={timelineEntries} ... />` принимает данные как props.
+- При rerender drawer'а данных не теряет (state в родителе переживает).
+- Refresh entries triggered through prop change (`refreshKey: \`${sessionId}:${entries.length}:${busy}\``).
+
+## Bridge для UI-state-needing actions
+
+**Принцип:** в гибридной архитектуре «main process отдаёт REST + WS, renderer держит UI store» нужен явный механизм: какие endpoints обращаются к store, какие нет. **Никогда** не дублируй store в main как «cached копию» — синхронизация даст рассинхрон.
+
+**Реализация:** request/reply IPC bridge с `requestId` + единый listener в renderer. Каждый action явно описан, timeout по умолчанию (5s) → 409 Conflict если store недоступен. Operations без store-зависимости (read из SQLite, parse файлов на диске) идут напрямую без bridge — быстрее и работают даже без mounted renderer.
+
+См. `knowledge/fact-mobile-web.md::Bridge pattern` для конкретики проекта.
+
+## Main thread responsive during initial load
+
+**Принцип:** на mobile initial-render тяжёлой страницы (history с 100+ markdown-сообщений) **не должен блокировать main thread** на больше ~500ms. Иначе кнопки UI «нажимаются молча» — события идут в очередь, но React не обрабатывает их пока не отрендерит весь DOM.
+
+**Симптом, что принцип нарушен:** юзер: «при первой подгрузке чата на 120 сообщений 20 секунд, в это время я не могу кликать кнопки. Они нажимаются, но ничего не происходит». Главный убийца — `react-markdown` парсит каждый длинный assistant-bubble синхронно; ×120 = 10-15 секунд main thread'а.
+
+**Реализация:**
+- Initial render — фиксированный мелкий chunk (30 entries). Достаточно для первого экрана + кэширования виртуализатора, остальные ждут.
+- Дальше — `startTransition(() => setRenderedCount(n + chunk))` внутри `requestAnimationFrame`. Каждый кадр — +30 entries, между кадрами браузер успевает обработать события.
+- GoTo target за пределами `renderedCount` → **сначала** `setRenderedCount(targetIdx + 10)`, ждать 2-3 rAF (commit + layout), потом scroll.
+- Auto-scroll-to-bottom учитывает `pendingGoTo` — не yank'ать viewport во время прыжка.
+- Маркер «rendering N more…» внизу: даёт юзеру понять что список ещё растёт, не блокирует scroll.
+
+**Тест:** замерить «время от mount'а до первого ответа на тап». Должно быть < 200ms даже на 500-entries чате. Если больше — chunked render не работает / chunk слишком большой.
+
+См. `knowledge/fact-mobile-web.md::Chunked render` и `knowledge/fix-mobile-history-uuid-mismatch.md` (история отладки).
+
+## No persistent info banners on mobile
+
+**Принцип:** info-баннер «вы в read-only / эта вкладка особенная / устаревшая версия / etc» **не должен висеть постоянно** в mobile-viewport'е. Mobile viewport tight, каждые 30-40px высоты — это один потерянный message в чате.
+
+**Симптом, что принцип нарушен:** юзер: *«это сообщение нужно убрать, нахуй оно лишнее пространство по высоте занимает»*. Любой persistent yellow/grey banner отжимает chat и виден всегда — а информация в нём релевантна один раз при заходе.
+
+**Реализация:**
+- Однократная информация (read-only mode, deprecated tab, ...) переносится в **subtitle хедера** мелким шрифтом (10-11px) — занимает 0px дополнительно, всегда видна тем кто смотрит на header.
+- Если subtitle не вмещает — passive UI hint в виде disabled-composer (юзер сам поймёт «отсюда не отправляется») вместо явного объяснения.
+- Транзиентные нотификации (toast / snackbar) на 3-5 секунд — допустимы (auto-dismiss).
+- Persistent action-required баннеры (account suspended) — допустимы только если действие реально блокирует продолжение работы. Если можно работать дальше — banner внизу мелким текстом или вообще не показывать.
+
+См. `knowledge/fact-mobile-web.md::Read-only view` (banner был убран, info переехало в header subtitle).
+
+## Tail-first loading: показывай хвост сразу, prefix в фоне
+
+**Принцип:** mobile открывает heavy collection (чат с 5000+ сообщений, лента, лог) — **первый запрос отдаёт только хвост** (последние ~200 элементов). Остальная история подгружается **в фоне** после первого paint'а, не блокируя UI. Это применимо везде где «свежее интереснее старого».
+
+**Симптом, что принцип нарушен:** *«у меня хз сколько грузится, секунд 10 ждать»*. Server отдаёт быстро (190ms), но pipe от server до first-paint включает: WiFi transfer 7-20MB → JSON.parse → reducer → React render. Из них network — самая жирная и непреодолимая часть на mobile.
+
+**Реализация:**
+- **Server**: `?last=N` query param. Возвращает `{ messages, total, truncated, dropped }` — клиент знает сколько ещё ждёт в prefix'е.
+- **Client phase 1**: fetch с `last=200`, paint, `historyLoading=false` сразу. Чат интерактивен через ~1 сек.
+- **Client phase 2**: если `truncated` — fire-and-forget fetch без `last`. Ставим `fullLoading=true`. Когда придёт — `reducer.reset() + apply(full)`, preserve viewport (scrollHeight delta для bottom-anchored, или auto-scroll-bottom если был at-bottom).
+- **WS messages во время phase 2** — продолжают применяться к tail (reducer chain работает по id). После full-replace состояние корректное (ничего не теряется, потому что full перезаписывает tail).
+
+**Gating UI-actions которые нуждаются в prefix:**
+- *Goto на out-of-range entry*: drawer закрывается мгновенно, overlay висит до прихода full → автоматический jump. Двойной тап невозможен (overlay блокирует).
+- *«Load older messages»*: пока `fullLoading` — кнопка disabled с loading-точками. Тап игнорируется (можно убрать в `if (fullLoading) return`).
+- *Поиск/jump-to*: должны явно показывать «ищем в полной истории...» если фильтр пустой при tail-only.
+
+**Тест:** открой чат с 5000+ сообщений. Первый paint должен быть < 1.5 сек. Тап на старую entry в timeline drawer'е во время phase 2 → drawer мгновенно закрывается, loader висит, через пару секунд auto-jump.
+
+См. `knowledge/fix-mobile-history-bottleneck.md` (история отладки 15→5→1 сек: gzip, инструментирование, tail-first).
+
+## Bounded window: replace, never union
+
+**Принцип:** в windowed-render'е (slice `[renderStart, renderEnd)` над массивом) при **shift-action** (jump к target, scroll-anchor, search-result navigation) окно нужно **заменить** bounded slice'ом вокруг target, а **не объединить** с текущим окном. Union кажется консервативнее («сохраним то что уже отрендерили»), но взрывает DOM до full-history при первом же jump'е.
+
+**Симптом, что принцип нарушен:** windowed list работает быстро на 30 entries, но при jump на старую запись зависает на 3-5 сек. Профайлер показывает синхронный layout/paint на 5000+ нодах. Юзер: *«нажимаю переход и зависает на несколько секунд»*.
+
+**Анатомия бага:** chat hangs at tail `[5598, 5628]`, jump на idx=100 даёт `newStart=90, newEnd=150`. Union: `Math.min(5598, 90)=90, Math.max(5628, 150)=5628` → window становится `[90, 5628]` = 5538 markdown-нод одним кадром.
+
+**Реализация:**
+```ts
+// Wrong:
+setRenderStart((s) => Math.min(s, newStart));
+setRenderEnd((e) => Math.max(e, newEnd));
+// Right:
+setRenderStart(newStart);
+setRenderEnd(newEnd);
+```
+
+Если нужно сохранить старое окно (для back-navigation) — храни **отдельно** в стеке, не миксуй с текущим. Stack-based history дешевле чем union'нутое мега-окно.
+
+**Тест:** на каждом shift-action логируй `window: { start, end }` и проверяй что `end - start <= MAX_WINDOW_SIZE` (60-100 для markdown). Если больше — где-то union просочился.
+
+## ETag revalidation для read-mostly справочных данных
+
+**Принцип:** для данных которые **редко меняются** (каталог настроек, пресеты, библиотека промптов, теги, словари) — на mobile хочется *«открывается мгновенно»*. Паттерн: localStorage cache **forever** + server-side etag check на каждом запуске. Server отвечает либо `{etag, unchanged: true}` (~50 байт), либо новые данные с новым etag.
+
+**Симптом, что принцип нарушен:** sheet/drawer с библиотекой пресетов показывает loader каждый раз при открытии 200-500ms. Данные не менялись месяц, юзер видит spinner 50 раз в день. Жалоба: *«сделай чтобы мгновенно открывалось»*.
+
+**Реализация:**
+- **Client**: synchronous hydrate из localStorage в первый render (`useState(() => loadCache())`). UI отрисовался — параллельно fire `Api.endpoint(cachedEtag)`. Если `unchanged: true` — silent (UI уже корректен). Если новый etag — `setState(fresh) + saveCache({etag, data})`.
+- **Server**: hash от canonical JSON (sha-1 → hex slice 16 chars, 10^19 keys — переколлизий не будет). Если `?etag=X` совпал — возвращай `{etag, unchanged: true}`. Иначе full body с новым etag.
+- **Network failure** при наличии cache → silent fallback на cache (юзер не страдает). Без cache → ошибка.
+
+**Когда НЕ применять:** данные меняются чаще раз в минуту (live-state, прогресс задач, активные сессии). Etag не выиграет ничего — каждый раз mismatch.
+
+**Версионирование ключа:** `'noted-prompts-cache:v1'`. Бампать **только** при backwards-incompatible изменении схемы — etag сам отлавливает контентные изменения, не нужно трогать ключ.
+
+## Deep-link routing: HashRouter + reload-fallback
+
+**Принцип:** SPA на mobile должна **переживать reload** без потери контекста. Юзер открыл чат → отвлёкся → вернулся через час → перезагрузил вкладку → должен вернуться **в тот же чат**, не на главную.
+
+**Симптом, что принцип нарушен:** *«ебал перезагружаю страницу, у меня открывается главная страница постоянно»*. Любая навигация хранится только в React state — reload сбрасывает.
+
+**Реализация:**
+- **HashRouter, не BrowserRouter** — потому что local static-server обычно не имеет SPA-fallback'а на любые pathnames. Hash (`#/projects/.../chat/...`) на сервер не уходит → файл всегда `/index.html`, React Router читает hash client-side.
+- **Routes по реальной иерархии** (`/projects/:id/chat/:tabId?ro=1`) — не плоский `?view=chat&tab=X`. Семантика URL = семантика приложения, share-link читаем глазами.
+- **Reload-fallback в leaf route**: если деплинк прилетел (`navigate(...)` без `state`), нет TabInfo в `history.state` — пали `Api.listTabs(projectId)`, найди по tabId. Если нет — вежливая ошибка с кнопкой «back to project».
+- **State прокидывается** через `navigate(url, { state: { tab } })` для intra-app navigation — экономит лишний fetch при обычных переходах, при deep-link'е работает fallback.
+
+**Когда HashRouter не нужен:** server имеет SPA-fallback (Vercel, Netlify, nginx with `try_files`), все unknown paths → index.html. Тогда BrowserRouter норм. Для самописного node-static на Electron — почти никогда не настроен → HashRouter надёжнее.

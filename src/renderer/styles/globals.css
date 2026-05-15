@@ -223,6 +223,28 @@
 .scrollbar-thin::-webkit-scrollbar-thumb { background: #555; border-radius: 2px; }
 .scrollbar-thin::-webkit-scrollbar-thumb:hover { background: #777; }
 
+/* SDK-tab chat scroll: 5px wide, transparent track, ghost thumb that only
+   appears once content overflows. `scrollbar-gutter: stable` reserves the gutter
+   even when no thumb is visible — prevents layout shift the moment the chat
+   first overflows. Thumb stays nearly invisible until hover so it doesn't
+   compete with the message content visually. */
+.sdk-chat-scroll {
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.08) transparent;
+}
+.sdk-chat-scroll::-webkit-scrollbar { width: 5px; height: 5px; }
+.sdk-chat-scroll::-webkit-scrollbar-track { background: transparent; }
+.sdk-chat-scroll::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.07);
+  border-radius: 999px;
+  transition: background 0.15s ease;
+}
+.sdk-chat-scroll:hover::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.18); }
+.sdk-chat-scroll::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.32); }
+/* `overflow-y: auto` already hides the thumb when content fits; nothing extra
+   needed for the "show only on overflow" behaviour. */
+
 
 /* Custom Layers from input.css */
 @layer components {

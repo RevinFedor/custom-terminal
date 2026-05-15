@@ -1,24 +1,22 @@
-# Feature: Notes Management
+# Feature: Tab Notes (per-tab)
 
 ## Intro
-Система ведения заметок проекта, интегрированная непосредственно в рабочий процесс терминала. Позволяет быстро фиксировать мысли в боковой панели или разворачивать полноэкранный Markdown-редактор для глубокой работы.
+Система заметок, привязанных к **каждой вкладке** (`tab.notes`), а не к проекту целиком. Project-level fullscreen modal (`NotesEditorModal.tsx`) удалён в пользу per-tab slideout — глобальные project notes больше не существуют как сущность в UI. У каждой вкладки своя независимая заметка.
 
 ## User Flow
-1. **Быстрая фиксация:** Пользователь вводит текст в поле "Заметки проекта" на боковой панели (вкладка Info). Сохранение происходит автоматически при потере фокуса (Blur) или нажатии `Cmd+Enter`.
-2. **Развертывание редактора:**
-   - Пользователь нажимает иконку "Maximize" в заголовке заметок или нажимает `Cmd+E`.
-   - Открывается "floating sheet" с полноценным Markdown-редактором.
-3. **Редактирование и сохранение:**
-   - **Autofocus:** При открытии курсор автоматически устанавливается в редактор, позволяя сразу начать печатать. Реализовано через `onEditorView` callback из `MarkdownEditor`.
-   - Пользователь пишет текст с поддержкой Markdown.
-   - Изменения сохраняются автоматически при закрытии редактора (`Esc` или `Cmd+E`) или вручную через `Cmd+S`.
-   - При сохранении состояние синхронизируется между всеми компонентами UI (боковая панель мгновенно обновляется).
+1. **Inline preview** в нижней части `InfoPanel` — Markdown editor c content из `tab.notes`. Кликнул, печатаешь, сохранение автоматическое (через store update).
+2. **Slideout-режим** — нажимаешь header «← Open Заметки вкладки» (или `Cmd+E`), открывается ресайзаб­ельная панель слева от sidebar'а с тем же контентом. Закрывается клик-outside, Esc или повторный `Cmd+E`.
+3. **AI Paste** (`Cmd+/` → `📋 AI Paste` → `Cmd+V`):
+   - В editor вставляется `^^ ⏳` placeholder и сворачивается.
+   - Параллельно `onGenerateTitle(text)` уходит в Gemini (см. секцию AI Paste ниже).
+   - Когда title возвращается — `⏳` заменяется на него.
 
-## 2. Behavior Specs
-- **Project Binding:** Заметки привязаны к `projectId`. При переключении проектов редактор автоматически сохраняет изменения и загружает контент нового проекта.
-- **Full-screen Mode:** Переключается через `Cmd+E`. Использует `z-index: 50` для наложения поверх терминала.
-- **Auto-save:** Сохранение происходит при закрытии редактора, переключении проекта или нажатии `Cmd+S`.
-- **Improved Scroll:** Редактор использует `min-h-0` в flex-контейнере и `overflow-x: hidden` для CodeMirror, обеспечивая корректный вертикальный скролл без горизонтального дребезга.
+## Behavior
+- **Per-tab persistence:** `tab.notes` хранится в `useWorkspaceStore.openProjects[].tabs[].notes`. Save через `setTabNotes(tabId, content)`. Сохраняется в SQLite через стандартный tab-persist pipeline.
+- **Per-tab open state:** `useUIStore.notesPanelOpenTabs: Record<tabId, boolean>` — каждая вкладка имеет независимое состояние «открыт slideout или нет».
+- **Cmd+E:** toggle slideout текущей вкладки. Раньше Cmd+E открывал fullscreen modal — теперь только slideout.
+- **Cmd+B:** toggle file-explorer sidebar (Cmd+E больше за это не отвечает).
+- **Improved Scroll:** редактор использует `min-h-0` в flex-контейнере и `overflow-x: hidden` для CodeMirror.
 
 ## Tab Notes Slideout (per-tab панель)
 
@@ -47,6 +45,28 @@ Drag-handle на правом крае модалки (cursor `ns-resize`). dx �
 Триггер открытия — **весь** header-блок `«← Open  Заметки вкладки  ✦»`, не только кнопка. Атрибут `data-tab-notes-open-trigger` мигрировал с `<button>` Open на родительский `<div>`-header. Open-чип внутри — теперь `<span pointer-events-none>`, его цвет управляется `notesHeaderHover` state'ом контейнера. ✦-кнопка (generate description) помечена `data-notes-header-interactive` + `e.stopPropagation()` на её onClick — иначе клик по ней через bubbling попадал бы в header-onClick и открывал/закрывал slideout. `TabNotesSlideout`-ный outside-click-guard ищет `target.closest('[data-tab-notes-open-trigger]')` — после миграции атрибута на `<div>` работает без изменений.
 
 Принцип переносимый — см. `methodology/design.md::Hit-area > visual button`.
+
+### Single source of truth: оба editor'а на одном `tab.notes`
+Inline editor в `InfoPanel` и slideout-editor `TabNotesSlideout` подписаны на **одно** поле `tab.notes` через reactive Zustand selector. Локальных mirror'ов нет — единственный источник истины это `tab.notes`. Любая правка идёт через `setTabNotes(tabId, content)`.
+
+Без правильной обработки это вызывает ping-pong: dispatch в одном editor → react reactive → другой editor видит новый prop → его внутренний replaceAll dispatch → его CodeMirror updateListener вызывает onChange echo → ещё запись в store → бесконечный цикл, кончающийся `Position N is out of range`. См. `fix-codemirror-controlled-editor.md` про root cause и фикс через `userEvent: 'external-sync'` annotation.
+
+Принцип переносимый — см. `methodology/design.md::Controlled editor: пометь свои dispatch'и`.
+
+### AI Paste: onGenerateTitle через Gemini Flash
+`MarkdownEditor` принимает callback `onGenerateTitle(text): Promise<string>`. При AI Paste (`Cmd+/` → `📋 AI Paste` → `Cmd+V`) editor вставляет `^^ ⏳` placeholder, асинхронно вызывает callback, потом заменяет `⏳` на returned title.
+
+В custom-terminal callback живёт в `src/renderer/utils/generateAITitle.ts` и подключён в InfoPanel inline editor + TabNotesSlideout. Использует Gemini API через `process.env.GEMINI_API_KEY` со списком fallback-моделей:
+
+```
+gemini-2.0-flash-lite → gemini-2.0-flash-exp → gemini-1.5-flash-latest → gemini-2.0-flash
+```
+
+Каждая следующая модель пробуется только на quota error (`429 Resource exhausted`). На non-quota error (400, network) — цепочка останавливается, чтобы не спамить ключ.
+
+**Char-count `[N]` суффикс — только в fallback.** Если AI вернул title — `[N]` **не** добавляется, title несёт смысл сам. Если все модели в quota → fallback `paste text [N]` с char-count'ом (чтобы юзер хотя бы видел размер вставки).
+
+ProjectHome MarkdownEditor — `readOnly` preview, AI Paste не нужен, callback не передаётся.
 
 ### Что пробовали и почему не сработало (graveyard)
 - **`ro.observe(document.body)` для anchor measure.** Модалка рендерится в Portal к `document.body`. Любое её движение (drag, resize) — body mutation — ResizeObserver re-fire — `setAnchorBottomY(...)` — re-render — drag handler читает свежий anchorRect → новый top → перерисовка → ещё mutation. Feedback loop, видимый симптом — дёрганый drag. Лекарство: наблюдать только саму кнопку Open + `window.resize`. Body не нужен — при ресайзе окна сама Open кнопка меняет позицию, ResizeObserver на ней это ловит.

@@ -1766,7 +1766,18 @@ function register({ projectManager, formatToolAction }) {
                 }
               }
             }
-            if (next.type === 'user' && !next.isSidechain) break;
+            // Stop only on the next REAL user prompt — skip tool_result entries (they have
+            // type:'user' too) and <task-notification> auto-messages from sub-agents.
+            // Without this guard, look-ahead breaks at the first tool_result and Edit/Write
+            // blocks from later assistants in the same turn are missed (green dot stays grey).
+            // Same forward-expand trap as edit-range — see fact-timeline.md::Forward-expand ловушка.
+            if (next.type === 'user' && !next.isSidechain) {
+              const nc = next.message?.content;
+              const isToolResult = Array.isArray(nc) && nc.some(b => b && b.type === 'tool_result');
+              const ncStr = typeof nc === 'string' ? nc : '';
+              const isTaskNotif = ncStr.startsWith('<task-notification>');
+              if (!isToolResult && !isTaskNotif) break;
+            }
           }
           if (!responseTokens) responseTokens = undefined;
 
@@ -2714,4 +2725,113 @@ function register({ projectManager, formatToolAction }) {
   });
 }
 
-module.exports = { register, findSessionFile, loadJsonlRecords, resolveSessionChain, resolveLatestSessionInChain, parseTimelineUuids };
+// Mobile-web Timeline view: same active-branch backtrace as parseTimelineUuids,
+// but returns rich objects (preview text, full text, color band, tools list).
+// The mobile drawer uses this directly. The 'color' field follows Timeline's
+// desktop palette: green=user prompt, purple=compact, blue=note hint (we surface
+// the placeholder; notes themselves are stored separately in DB and not joined
+// here yet — same as desktop's first-pass render).
+function parseTimelineEntries(sourcePath) {
+  try {
+    const content = fs.readFileSync(sourcePath, 'utf-8');
+    const lines = content.trim().split('\n').filter(l => l.trim());
+    const recordMap = new Map();
+    let lastRecord = null;
+    let fileIndex = 0;
+    for (const line of lines) {
+      try {
+        const e = JSON.parse(line);
+        if (e.uuid) {
+          e._fileIndex = fileIndex++;
+          recordMap.set(e.uuid, e);
+          lastRecord = e;
+        }
+      } catch {}
+    }
+    if (!lastRecord) return [];
+
+    // Backtrace — identical algorithm to parseTimelineUuids minus the recovery
+    // edge cases (those handle proxy crashes; mobile timeline showing nothing
+    // for an in-flight crashed session is acceptable).
+    const branch = [];
+    let cur = lastRecord.uuid;
+    const seen = new Set();
+    while (cur && !seen.has(cur)) {
+      seen.add(cur);
+      const rec = recordMap.get(cur);
+      if (!rec) break;
+      branch.unshift(rec);
+      cur = rec.logicalParentUuid || rec.parentUuid;
+    }
+
+    // Pass 1: collect tool_use_id → result map (tool_result lives in user-type
+    // entries — same trick as fact-claude-sdk-tab.md::Tool-call rendering).
+    const toolResults = new Map();
+    for (const entry of branch) {
+      if (entry.type !== 'user') continue;
+      const c = entry.message?.content;
+      if (!Array.isArray(c)) continue;
+      for (const block of c) {
+        if (block?.type === 'tool_result' && block.tool_use_id) {
+          const txt = typeof block.content === 'string' ? block.content
+            : Array.isArray(block.content) ? block.content.map(x => x?.text || '').join('\n') : '';
+          toolResults.set(block.tool_use_id, { result: txt, isError: !!block.is_error });
+        }
+      }
+    }
+
+    const out = [];
+    for (const entry of branch) {
+      if (entry.isSidechain || entry.type === 'summary') continue;
+
+      if (entry.type === 'user') {
+        let raw = entry.message?.content;
+        if (Array.isArray(raw)) {
+          if (raw.some(i => i.type === 'tool_result')) continue; // tool result, not a prompt
+          const tb = raw.find(i => i.type === 'text' && i.text);
+          raw = tb?.text || null;
+        }
+        if (!raw || typeof raw !== 'string') continue;
+        if (entry.isMeta) continue;
+        // Same noise filter the desktop Timeline uses, plus local-command-stdout
+        // and local-command-stderr (slash-command output that the user doesn't
+        // think of as a "message").
+        if (raw.includes('<command-name>') || raw.includes('<system-reminder>') ||
+            raw.includes('<task-notification>') || raw.includes('<local-command-stdout>') ||
+            raw.includes('<local-command-stderr>') ||
+            raw.startsWith('[Request interrupted')) continue;
+        out.push({
+          uuid: entry.uuid,
+          kind: 'user',
+          color: '#a6e3a1',
+          preview: raw.slice(0, 220),
+          full: raw,
+          truncated: raw.length > 220,
+          ts: entry.timestamp || null,
+          tools: [],
+        });
+      } else if (entry.type === 'system' && entry.subtype === 'compact_boundary') {
+        out.push({
+          uuid: entry.uuid,
+          kind: 'compact',
+          color: '#cba6f7',
+          preview: entry.summary || 'Conversation compacted',
+          full: entry.summary || 'Conversation compacted',
+          truncated: false,
+          ts: entry.timestamp || null,
+          tools: [],
+        });
+      }
+      // Assistant blocks are intentionally NOT emitted — desktop Timeline
+      // shows only user-authored entries (prompts, compact boundaries, notes).
+      // Assistant replies are visible in the chat scroll itself; doubling them
+      // in the drawer would just duplicate the whole conversation.
+    }
+    return out;
+  } catch (e) {
+    console.error('[parseTimelineEntries] Error:', e.message);
+    return [];
+  }
+}
+
+module.exports = { register, findSessionFile, loadJsonlRecords, resolveSessionChain, resolveLatestSessionInChain, parseTimelineUuids, parseTimelineEntries };

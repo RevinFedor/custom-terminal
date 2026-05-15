@@ -131,7 +131,17 @@ class ErrorBoundary extends React.Component<
               Try Again
             </button>
             <button
-              onClick={() => location.reload()}
+              onClick={() => {
+                // location.reload() in Electron with custom protocols can be
+                // intercepted by the OS default browser. Bounce through main
+                // so reload stays inside the BrowserWindow.
+                try {
+                  const { ipcRenderer } = window.require('electron');
+                  ipcRenderer.send('app:reload');
+                } catch {
+                  location.reload();
+                }
+              }}
               style={{
                 padding: '8px 20px', fontSize: '13px',
                 backgroundColor: '#DA7756', color: 'white',

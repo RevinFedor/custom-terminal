@@ -51,6 +51,30 @@ type ProviderEntry = {
   Icon: React.FC<{ size?: number; color?: string }>;
   models: { id: string; label: string; cmd?: boolean }[];
 };
+// SDK alias → real model id. Mirrors `SDK_MODEL_MAP` in ClaudeSDKTab.tsx —
+// kept in sync manually (one file edit per Anthropic generation). We can't
+// import the other file directly because it's a tab component, not a constants
+// module; the alternative would be lifting both into a shared constants file,
+// but that's churn for two short objects that change together.
+const SDK_ALIAS_TO_MODEL_ID: Record<string, string | null> = {
+  default: null, // SDK picks; we don't know which model gating applies to
+  sonnet: 'claude-sonnet-4-6',
+  opus: 'claude-opus-4-7',
+  haiku: 'claude-haiku-4-5-20251001',
+};
+
+// Given the active SDK model alias and the caps map loaded from the SDK,
+// return the set of effort levels we know the model accepts. Returns null when
+// gating cannot be applied (alias='default' OR caps not loaded yet OR specific
+// model id not in caps). Null = "fall open" — show all pills enabled.
+function getSupportedEffortsForAlias(alias: string | undefined, caps: Record<string, string[]>): Set<string> | null {
+  const modelId = SDK_ALIAS_TO_MODEL_ID[alias || 'default'];
+  if (!modelId) return null;
+  const list = caps[modelId];
+  if (!Array.isArray(list) || list.length === 0) return null;
+  return new Set(list);
+}
+
 const PROVIDER_CATALOG: ProviderEntry[] = [
   {
     id: 'anthropic',
@@ -143,12 +167,15 @@ function SessionActionChip({
     else onContinue();
   };
 
-  // Background: idle Continue получает «приподнятый» dark bg всегда — это сигнализирует
-  // о доступности действия даже без курсора. Stop при hover'е (=activeCmd + hover) даёт
-  // красный wash как предупреждение о destructive-действии.
-  const baseBg = 'rgba(0,0,0,0.55)';
-  const idleBg = sessionIdle ? baseBg : 'transparent';
-  const bg = showStopOnHover ? 'rgba(239, 68, 68, 0.18)' : (hover && !sessionIdle ? baseBg : idleBg);
+  // Background: чип всегда прозрачный, чтобы жить внутри triplet-обёртки с тонкой рамкой
+  // (родитель уже подсвечивает группу). Idle Continue получает оранжевый/синий accent-tint —
+  // сигнал «доступно для запуска». Stop при hover (activeCmd + hover) → красный wash.
+  const idleTint = sessionType === 'claude' ? 'rgba(218,119,86,0.12)' : 'rgba(78,134,248,0.12)';
+  const hoverTint = sessionType === 'claude' ? 'rgba(218,119,86,0.20)' : 'rgba(78,134,248,0.20)';
+  const bg = showStopOnHover
+    ? 'rgba(239, 68, 68, 0.18)'
+    : sessionIdle ? (hover ? hoverTint : idleTint)
+      : (hover ? 'rgba(255,255,255,0.08)' : 'transparent');
   return (
     <span
       onMouseEnter={() => setHover(true)}
@@ -174,6 +201,11 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
   const [geminiSessionId, setGeminiSessionId] = useState<string | null>(null);
   const [activeCommandType, setActiveCommandType] = useState<string | null>(null);
   const [isSDKTab, setIsSDKTab] = useState(false);
+  // Map of `modelId -> supportedEffortLevels[]` from `query.supportedModels()`.
+  // Loaded once per Electron-main process and cached there; renderer fetches on
+  // first SDK-tab render. Used to grey-out/disable effort pills that the SDK
+  // would silently downgrade, and to auto-downgrade when the model changes.
+  const [sdkModelCaps, setSdkModelCaps] = useState<Record<string, string[]>>({});
   // aiMode removed — start buttons now show both claude & gemini inline
   // КОМАНДЫ section starts collapsed — its contents (fork-from-clipboard codes) are
   // rarely needed and only confused users when permanently visible. Click the header
@@ -269,6 +301,18 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
     window.addEventListener('history-panel:loading', handler);
     return () => window.removeEventListener('history-panel:loading', handler);
   }, [activeTabId]);
+
+  // Load SDK model capabilities once when the panel sees an SDK tab. Main
+  // process caches the result for the rest of the Electron session, so repeat
+  // calls are cheap; we still gate by `isSDKTab` to avoid waking the SDK for
+  // pure-PTY users who never open an SDK tab.
+  useEffect(() => {
+    if (!isSDKTab) return;
+    if (Object.keys(sdkModelCaps).length > 0) return;
+    ipcRenderer.invoke('claude-sdk:get-model-caps').then((r: any) => {
+      if (r?.success && r.caps) setSdkModelCaps(r.caps);
+    }).catch(() => { /* ignore — gating falls open, runtime mismatch toast still catches */ });
+  }, [isSDKTab, sdkModelCaps]);
   // Reset when history closes
   useEffect(() => {
     if (!isHistoryOpen) setHistoryLoading(false);
@@ -339,14 +383,22 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
     const handleFinished = (_: any, data: { tabId: string }) => {
       if (data.tabId === activeTabId) setIsCommandRunning(false);
     };
+    // SDK tabs don't fire terminal:command-* (no PTY). They emit busy state via
+    // claude:busy-state (forwarded from claude-sdk:busy-state in main). Subscribe
+    // here so SessionActionChip can flip Continue→Stop while the SDK is streaming.
+    const handleBusyState = (_: any, data: { tabId: string; busy: boolean }) => {
+      if (data.tabId === activeTabId) setIsCommandRunning(data.busy);
+    };
     ipcRenderer.on('terminal:command-started', handleStarted);
     ipcRenderer.on('terminal:command-finished', handleFinished);
+    ipcRenderer.on('claude:busy-state', handleBusyState);
     ipcRenderer.invoke('terminal:getCommandState', activeTabId).then((state: any) => {
       setIsCommandRunning(state?.isRunning || false);
     });
     return () => {
       ipcRenderer.removeListener('terminal:command-started', handleStarted);
       ipcRenderer.removeListener('terminal:command-finished', handleFinished);
+      ipcRenderer.removeListener('claude:busy-state', handleBusyState);
     };
   }, [activeTabId]);
 
@@ -743,32 +795,39 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
           <>
           <div className={`rounded p-2 ${currentSessionType === 'claude' ? 'bg-[#2a3a2a] border border-[#3a5a3a]' : 'bg-[#1a2a3a] border border-[#2a4a6a]'}`}>
             <div className="flex items-center gap-1.5">
-              {/* Triplet: ⎘ — Claude — ↻. All three share a permanent dark bg
-                  (rgba(0,0,0,0.55)); they sit flush via gap-0 and segmented
-                  rounding (left / none / right). Hover swaps text colour only —
-                  no bg change, no layout shift. */}
-              <div className="inline-flex items-center" style={{ gap: 0 }}>
+              {/* Triplet: ⎘ — Claude — ↻. Прозрачный фон + лёгкая рамка по периметру —
+                  чтобы триплет визуально жил в зелёной/синей карточке-родителе, не
+                  выделялся как «дырка с тёмным фоном». Hover — лёгкий тинт. Continue
+                  внутри (SessionActionChip) уже имеет idle-bg только когда сессия неактивна. */}
+              <div
+                className="inline-flex items-center rounded overflow-hidden"
+                style={{
+                  gap: 0,
+                  border: '1px solid rgba(255,255,255,0.10)',
+                }}
+              >
                 <span
-                  className="cursor-pointer flex-shrink-0 inline-flex items-center justify-center"
+                  className="cursor-pointer flex-shrink-0 inline-flex items-center justify-center transition-colors"
                   style={{
-                    color: sessionCopied ? '#4ade80' : '#888',
+                    color: sessionCopied ? '#4ade80' : '#aaa',
                     fontSize: 13,
                     lineHeight: 1,
                     width: 22,
                     height: 18,
-                    backgroundColor: 'rgba(0,0,0,0.55)',
-                    borderTopLeftRadius: 4,
-                    borderBottomLeftRadius: 4,
-                    transition: 'color 0.12s',
+                    backgroundColor: 'transparent',
                     userSelect: 'none',
                   }}
                   onMouseEnter={(e) => {
                     if (sessionCopied) return;
-                    (e.currentTarget as HTMLSpanElement).style.color = '#ddd';
+                    const el = e.currentTarget as HTMLSpanElement;
+                    el.style.color = '#fff';
+                    el.style.backgroundColor = 'rgba(255,255,255,0.08)';
                   }}
                   onMouseLeave={(e) => {
                     if (sessionCopied) return;
-                    (e.currentTarget as HTMLSpanElement).style.color = '#888';
+                    const el = e.currentTarget as HTMLSpanElement;
+                    el.style.color = '#aaa';
+                    el.style.backgroundColor = 'transparent';
                   }}
                   onClick={() => {
                     if (sessionId) {
@@ -787,6 +846,14 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                   hasAnySession={hasAnySession}
                   onContinue={() => {
                     if (!activeTabId) return;
+                    // SDK tabs: there's no `--resume` PTY command; the session is
+                    // already loaded in the React component. "Continue" here means
+                    // "give the composer focus so the user can type the next msg".
+                    // The window event is consumed by ClaudeSDKTab → focuses input.
+                    if (isSDKTab) {
+                      window.dispatchEvent(new CustomEvent('claude-sdk:focus-composer', { detail: { tabId: activeTabId } }));
+                      return;
+                    }
                     if (currentSessionType === 'claude') {
                       setTabCommandType(activeTabId, 'claude');
                       terminalRegistry.get(activeTabId)?.scrollToBottom();
@@ -801,6 +868,19 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                   }}
                   onStop={async () => {
                     if (!activeTabId) return;
+                    // SDK and PTY use different stop channels — SDK kills the in-process
+                    // AbortController via claude-sdk:stop, PTY sends SIGTERM via
+                    // terminal:stop-ai-process.
+                    if (isSDKTab) {
+                      try {
+                        await ipcRenderer.invoke('claude-sdk:stop', { tabId: activeTabId });
+                        // Tell the SDK component to surface the Resume affordance.
+                        // The component can't tell apart a natural finish from a user
+                        // Stop on its own (both end with claude-sdk:done).
+                        window.dispatchEvent(new CustomEvent('claude-sdk:was-stopped', { detail: { tabId: activeTabId } }));
+                      } catch (e: any) { console.error('[SDKStop] error', e); }
+                      return;
+                    }
                     try {
                       const res = await ipcRenderer.invoke('terminal:stop-ai-process', activeTabId);
                       if (!res?.success) console.warn('[SessionStop] failed:', res?.error);
@@ -816,23 +896,28 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                 />
                 {activeTabId && (
                   <button
-                    className="flex-shrink-0 inline-flex items-center justify-center cursor-pointer"
+                    className="flex-shrink-0 inline-flex items-center justify-center cursor-pointer transition-colors"
                     style={{
-                      color: '#888',
+                      color: '#aaa',
                       fontSize: 13,
                       lineHeight: 1,
                       width: 22,
                       height: 18,
                       padding: 0,
-                      background: 'rgba(0,0,0,0.55)',
+                      background: 'transparent',
                       border: 'none',
-                      borderTopRightRadius: 4,
-                      borderBottomRightRadius: 4,
-                      transition: 'color 0.12s',
                       userSelect: 'none',
                     }}
-                    onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.color = '#ddd'; }}
-                    onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.color = '#888'; }}
+                    onMouseEnter={(e) => {
+                      const el = e.currentTarget as HTMLButtonElement;
+                      el.style.color = '#fff';
+                      el.style.background = 'rgba(255,255,255,0.08)';
+                    }}
+                    onMouseLeave={(e) => {
+                      const el = e.currentTarget as HTMLButtonElement;
+                      el.style.color = '#aaa';
+                      el.style.background = 'transparent';
+                    }}
                     onClick={() => {
                       window.dispatchEvent(new CustomEvent('timeline:force-refresh', { detail: { tabId: activeTabId } }));
                     }}
@@ -1222,15 +1307,63 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                       ipcRenderer.send('claude:run-command', { tabId: activeTabId, command: 'claude', prompt: finalPrompt || undefined });
                     }}
                   >claude</code>
+                  {/* `sdk` — spawns a NEW SDK tab named claude-NN (mirrors the
+                      `claude` button next to it). The previous behaviour of
+                      converting the *current* generic tab in-place is preserved
+                      via Cmd/Ctrl+click as an escape hatch. */}
                   <code
                     className="text-xs cursor-pointer hover:underline px-1.5 py-0.5 bg-[#1a1a1a] border-l border-[#333]"
-                    style={{ color: '#DA7756' }}
-                    onClick={() => {
+                    style={{ color: '#FFB382' }}
+                    title="Создать новый Claude SDK таб (Cmd/Ctrl+click — конвертировать текущий)"
+                    onClick={async (e) => {
                       if (!activeTabId) { showToast('Нет активного таба', 'error'); return; }
-                      const { convertToSDKTab } = useWorkspaceStore.getState();
-                      convertToSDKTab(activeTabId);
+                      const state = useWorkspaceStore.getState();
+                      if (e.metaKey || e.ctrlKey) {
+                        state.convertToSDKTab(activeTabId);
+                        return;
+                      }
+                      for (const [projectId, workspace] of state.openProjects) {
+                        if (workspace.tabs.has(activeTabId)) {
+                          await state.createSDKTab(projectId);
+                          break;
+                        }
+                      }
                     }}
                   >sdk</code>
+                  {/* `sdk-f` — fork CURRENT claude session into a fresh SDK tab.
+                      Only meaningful when the active tab has a Claude session;
+                      otherwise the button stays muted and is a no-op. */}
+                  <code
+                    className="text-xs px-1.5 py-0.5 bg-[#1a1a1a] border-l border-[#333]"
+                    style={{
+                      color: hasClaudeSession ? '#FFB382' : '#555',
+                      cursor: hasClaudeSession ? 'pointer' : 'default',
+                      textDecoration: 'none',
+                    }}
+                    title={hasClaudeSession ? 'Форкнуть текущую Claude-сессию в новый SDK-таб' : 'Нет активной Claude-сессии для форка'}
+                    onMouseEnter={(e) => { if (hasClaudeSession) (e.currentTarget as HTMLElement).style.textDecoration = 'underline'; }}
+                    onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.textDecoration = 'none'; }}
+                    onClick={async () => {
+                      if (!hasClaudeSession || !sessionId || !activeTabId) return;
+                      const state = useWorkspaceStore.getState();
+                      for (const [projectId, workspace] of state.openProjects) {
+                        const tab = workspace.tabs.get(activeTabId);
+                        if (!tab) continue;
+                        const currentCwd = tab.cwd || project?.path || '';
+                        const forkResult = await ipcRenderer.invoke('claude:fork-session-file', {
+                          sourceSessionId: sessionId, cwd: currentCwd, skipChainResolve: true,
+                        });
+                        if (!forkResult.success) {
+                          showToast('Fork failed: ' + forkResult.error, 'error');
+                          return;
+                        }
+                        const sdkTabId = await state.createSDKTab(projectId);
+                        state.updateSDKState(sdkTabId, { claudeSessionId: forkResult.newSessionId });
+                        showToast('SDK fork ← ' + sessionId.slice(0, 8), 'success');
+                        break;
+                      }
+                    }}
+                  >sdk-f</code>
                   <code
                     className="text-xs cursor-pointer hover:underline px-1.5 py-0.5 bg-[#1a1a1a] rounded-r border-l border-[#333]"
                     style={{ color: '#4E86F8' }}
@@ -1280,7 +1413,7 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
               old standalone "Provider" row inside Контроль into the header itself —
               one row, denser, brand-tinted instead of generic blue. */}
           <div className="flex items-center justify-between mb-2 gap-2">
-            <span className="text-[11px] uppercase text-[#888]">PROVIDER</span>
+            <span className="text-[11px] uppercase text-[#888]">{isSDKTab ? 'CLAUDE' : 'PROVIDER'}</span>
             {!isSDKTab && (
               <div className="flex items-center gap-1">
                 {PROVIDER_CATALOG.map((p) => {
@@ -1340,9 +1473,26 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                       key={model}
                       className={`flex-1 text-[10px] px-1.5 py-1 rounded cursor-pointer ${isActive ? 'bg-[#DA7756] text-white font-medium' : 'bg-[#2d2d2d] text-[#888] hover:text-white hover:bg-[#3d3d3d]'}`}
                       onClick={() => {
-                        const { updateSDKState } = useWorkspaceStore.getState();
+                        const store = useWorkspaceStore.getState();
+                        const { updateSDKState } = store;
                         updateSDKState(activeTabId, { sdkModel: model });
                         setThinkFlash(model); setTimeout(() => setThinkFlash(null), 1500);
+                        // Auto-downgrade effort if the new model doesn't support it.
+                        // Read current effort, look up supported list for the new model,
+                        // pick the highest still-supported pill, write back. info-toast
+                        // tells the user *what changed* — silent mutation of an unrelated
+                        // setting feels broken even when correct.
+                        let currentEffort = 'high';
+                        for (const [, ws] of store.openProjects) { const t = ws.tabs.get(activeTabId); if (t) { currentEffort = t.sdkEffort || 'high'; break; } }
+                        const supported = getSupportedEffortsForAlias(model, sdkModelCaps);
+                        if (supported && !supported.has(currentEffort)) {
+                          // Priority list reflects "less aggressive but still useful".
+                          const fallbackOrder = ['xhigh', 'high', 'medium', 'low'];
+                          const nextEffort = fallbackOrder.find(e => supported.has(e)) || 'high';
+                          updateSDKState(activeTabId, { sdkEffort: nextEffort });
+                          setEffortLevel(prev => ({ ...prev, [activeTabId]: nextEffort }));
+                          showToast(`effort: ${currentEffort} → ${nextEffort} (${model} не поддерживает ${currentEffort})`, 'info', 4000);
+                        }
                       }}
                     >{model}</button>
                   );
@@ -1418,8 +1568,21 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
               const dimClass = supportsKnobs ? '' : 'opacity-40 pointer-events-none';
               const titleSuffix = supportsKnobs ? '' : ' (not supported by ' + providerState.type + ')';
               // DeepSeek levels: 'off' means thinking disabled. low/medium/high enable thinking with corresponding effort.
-              // Anthropic: canonical list from constants/claudeLevels.ts (low/medium/high/xhigh/max as of May 2026).
+              // Anthropic: full list (low/medium/high/xhigh/max). For SDK tab we know the actual
+              // model id and gate per-model via SDK-shipped capabilities (see `sdkModelCaps`):
+              // unsupported pills render disabled with a hover-tooltip. PTY tab keeps all five
+              // pills always enabled because the user can switch model via /model slash from
+              // the same panel and we don't want to flicker pills mid-edit.
               const effortLevels = isDeepSeek ? DEEPSEEK_EFFORT_LEVELS : CLAUDE_EFFORT_LEVELS;
+              // For SDK tab compute the supported set from the active model.
+              // Null = "no gating" (default alias OR caps still loading) — pills fall open.
+              const sdkActiveAlias = (() => {
+                if (!isSDKTab || !activeTabId) return undefined;
+                const s = useWorkspaceStore.getState();
+                for (const [, ws] of s.openProjects) { const t = ws.tabs.get(activeTabId); if (t) return t.sdkModel || 'default'; }
+                return undefined;
+              })();
+              const sdkSupportedEfforts = isSDKTab ? getSupportedEffortsForAlias(sdkActiveAlias, sdkModelCaps) : null;
               // Effort active-state: for DeepSeek derived from providerState.effort (server-confirmed); for Anthropic read local tab map.
               const dsEffort = (providerState as { effort?: string }).effort || 'medium';
               return (
@@ -1440,16 +1603,27 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                         const currentEffort = activeTabId ? effortLevel[activeTabId] : undefined;
                         isActive = currentEffort === level;
                       }
+                      // SDK-only: gate by current-model capabilities. Null = no gating
+                      // (caps unknown / default alias / DeepSeek). Has + missing = disabled.
+                      const isUnsupported = isSDKTab && sdkSupportedEfforts != null && !sdkSupportedEfforts.has(level);
+                      const disabledClasses = isUnsupported
+                        ? 'opacity-30 cursor-not-allowed bg-[#222] text-[#555]'
+                        : isActive ? 'bg-[#DA7756]/20 text-white font-medium' : 'bg-[#2d2d2d] text-[#888] hover:text-white hover:bg-[#3d3d3d]';
                       return (
                         <button
                           key={level}
-                          className={`flex-1 text-[10px] px-1.5 py-1 rounded cursor-pointer ${isActive ? 'bg-[#DA7756]/20 text-white font-medium' : 'bg-[#2d2d2d] text-[#888] hover:text-white hover:bg-[#3d3d3d]'}`}
+                          title={isUnsupported ? `${level} не поддерживается моделью ${sdkActiveAlias}` : undefined}
+                          disabled={isUnsupported}
+                          className={`flex-1 text-[10px] px-1.5 py-1 rounded ${isUnsupported ? '' : 'cursor-pointer'} ${disabledClasses}`}
                           onClick={async () => {
-                            // Toggle-off: clicking the currently active level deselects.
-                            // For Anthropic this means the lowest level ('low') — Claude no longer
-                            // supports 'auto' since May 2026. For DeepSeek the explicit 'off' state.
+                            // Second click on the active level is a no-op — Anthropic effort row
+                            // has no neutral fallback (Claude removed 'auto' in May 2026), so
+                            // toggle-off would silently switch the user from `max` to `low`,
+                            // which felt like the picker mis-fired. DeepSeek `off` toggle stays
+                            // because `off` is a real semantic state (thinking disabled).
+                            if (isActive && !isDeepSeek) return;
                             const targetLevel = isActive
-                              ? (isDeepSeek ? 'off' : CLAUDE_EFFORT_TOGGLE_OFF)
+                              ? 'off'
                               : level;
                             if (isSDKTab) {
                               const { updateSDKState } = useWorkspaceStore.getState();
@@ -1478,7 +1652,10 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                     })}
                   </div>
                 </div>
-                {/* DeepSeek: Think is folded into Effort row (off ↔ low/medium/high). Hide separate row. */}
+                {/* DeepSeek: Think is folded into Effort row (off ↔ low/medium/high). Hide separate row.
+                    SDK + Anthropic: Think toggle maps to thinking: {type:'adaptive'|'disabled'} in
+                    the SDK options (adaptive when ON, disabled when OFF). New models (Opus 4.7+)
+                    default to adaptive. */}
                 {!isDeepSeek && (() => {
                   // Think active-state: undefined ⇒ ON (Claude starts with alwaysThinkingEnabled by default).
                   // First click flips to OFF. Reset back to undefined on Claude exit (OSC 133 D handler above).

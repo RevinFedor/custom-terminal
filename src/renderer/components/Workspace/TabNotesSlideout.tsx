@@ -209,6 +209,12 @@ export default function TabNotesSlideout({ activeTabId }: TabNotesSlideoutProps)
       if (target.closest('[data-tab-notes-slideout]')) return;
       // On the Open trigger button? let its own onClick handle the toggle.
       if (target.closest('[data-tab-notes-open-trigger]')) return;
+      // Inside a markdown-editor overlay (Cmd+/ palette, context menu, AI Paste
+      // indicator)? They can spill OUTSIDE the panel rect but logically belong
+      // to it — don't close the slide-out when the user clicks an item there.
+      if (target.closest('[data-command-palette]')) return;
+      if (target.closest('[data-context-menu]')) return;
+      if (target.closest('[data-ai-paste-indicator]')) return;
       handleClose();
     };
     // Close when the Settings modal opens — it would otherwise overlap us.

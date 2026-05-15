@@ -372,7 +372,15 @@ const TabItem = memo(({
   const [isHovered, setIsHovered] = useState(false);
 
   // Get color config
-  const colorConfig = TAB_COLORS.find(c => c.color === tab.color) || TAB_COLORS[0];
+  // SDK tabs share `color: 'claude'` with PTY claude tabs (so existing palette
+  // logic — copy buttons, sticky-note tints, etc — keeps working) but the *tab
+  // chrome* needs a distinct peach hue to signal "this is the headless SDK
+  // surface, not the live TUI". Override only the bg+border at the chrome
+  // layer; everything else continues to read from `colorConfig`.
+  const baseColorConfig = TAB_COLORS.find(c => c.color === tab.color) || TAB_COLORS[0];
+  const colorConfig = tab.tabType === 'claude-sdk' && tab.color === 'claude'
+    ? { ...baseColorConfig, bgColor: 'rgba(255, 178, 130, 0.14)', borderColor: '#FFB382' }
+    : baseColorConfig;
 
 
   // Determine background color
@@ -466,8 +474,15 @@ const TabItem = memo(({
     padding: isCollapsed
       ? '0'
       : (tab.tabType === 'browser'
-        ? (isHorizontal ? '0 16px' : '0 12px')
-        : (isHorizontal ? '0 16px 0 32px' : '0 12px 0 32px')),
+        // Browser tabs: no left gutter at all.
+        ? (isHorizontal ? '0 12px' : '0 12px')
+        // SDK tabs: left gutter 32px (matches PTY claude — keeps the green dot
+        // the same distance from the left edge so adjacent PTY+SDK tabs align
+        // perfectly). Right padding 12px (kept tight, since SDK has no chunky
+        // right-side affordances). Same widths in horizontal/vertical zones.
+        : (tab.tabType === 'claude-sdk'
+          ? (isHorizontal ? '0 12px 0 32px' : '0 12px 0 32px')
+          : (isHorizontal ? '0 16px 0 32px' : '0 12px 0 32px'))),
     fontSize: `${fontSize}px`,
     height: '30px',
     width: isCollapsed ? '28px' : undefined,
@@ -531,17 +546,68 @@ const TabItem = memo(({
               onStop={() => onStop && onStop(tab.id)}
             />
           )}
-          {/* SDK tab indicator — green dot or spinner */}
+          {/* SDK status zone - left side, status-only (no restart action). Click
+              forwards to onStop when busy so it mirrors PTY claude middle-click
+              Stop. Three states: BUSY = peach spinner, has session (idle) = green
+              dot, fresh tab = nothing. */}
           {tab.tabType === 'claude-sdk' && (
-            <div className="flex items-center justify-center w-4 h-full shrink-0">
+            <div
+              style={{
+                position: 'absolute',
+                left: 0,
+                top: 0,
+                bottom: 0,
+                width: '32px',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                zIndex: 10,
+                cursor: isBusy ? 'pointer' : 'default',
+              }}
+              onClick={(e) => {
+                if (isBusy) {
+                  e.stopPropagation();
+                  onStop && onStop(tab.id);
+                }
+              }}
+              onAuxClick={(e) => {
+                // Middle-click Stop, same gesture as PTY claude RestartZone.
+                if (e.button === 1 && isBusy) {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  onStop && onStop(tab.id);
+                }
+              }}
+              title={isBusy ? 'Stop SDK query' : (hasSession ? 'Claude SDK session active' : '')}
+            >
               {isBusy ? (
-                <span style={{ width: '6px', height: '6px', borderRadius: '50%', border: '1.5px solid transparent', borderTopColor: '#DA7756', animation: 'spin 0.8s linear infinite', display: 'block' }} />
+                <span
+                  style={{
+                    display: 'block',
+                    width: '8px',
+                    height: '8px',
+                    borderRadius: '50%',
+                    border: '1.5px solid rgba(255, 178, 130, 0.25)',
+                    borderTopColor: '#FFB382',
+                    boxSizing: 'border-box',
+                    animation: 'tab-dot-spin 0.8s linear infinite',
+                  }}
+                />
               ) : hasSession ? (
-                <span style={{ width: '6px', height: '6px', borderRadius: '50%', backgroundColor: '#4ade80', display: 'block' }} />
+                <span
+                  style={{
+                    display: 'block',
+                    width: '6px',
+                    height: '6px',
+                    borderRadius: '50%',
+                    backgroundColor: '#4ade80',
+                    boxShadow: '0 0 4px rgba(74, 222, 128, 0.5)',
+                    opacity: 0.9,
+                  }}
+                />
               ) : null}
             </div>
           )}
-
           {isEditing ? (
             <input
               ref={inputRef}
@@ -1272,6 +1338,19 @@ function TabBar({ projectId }: TabBarProps) {
   // User often hits Stop because the process is stuck holding the port; the explicit
   // kill line confirms what was freed in the scrollback.
   const handleStop = async (tabId: string) => {
+    // SDK tabs have no PTY — cancel the in-process query instead of writing Ctrl+C
+    // into a non-existent terminal. claude-sdk:stop closes the AbortController which
+    // makes the streaming for-await loop bail; ClaudeSDKTab's :done handler then
+    // flips isRunning=false so the loader pill clears.
+    const tab = workspace.tabs.get(tabId);
+    if (tab?.tabType === 'claude-sdk') {
+      try {
+        await ipcRenderer.invoke('claude-sdk:stop', { tabId });
+        // Surface the Resume affordance in the composer (history kept intact).
+        window.dispatchEvent(new CustomEvent('claude-sdk:was-stopped', { detail: { tabId } }));
+      } catch (e: any) { console.error('[TabBar:SDKStop] error', e); }
+      return;
+    }
     ipcRenderer.send('terminal:input', tabId, '\x03');
     const killPrefix = await buildKillPortsPrefix(tabId);
     if (killPrefix) {
@@ -1796,8 +1875,14 @@ function TabBar({ projectId }: TabBarProps) {
             let geminiCount = 0;
             let scriptCount = 0; // devServer / shell-command tabs with a live PID
             for (const id of targetTabIds) {
-              if (!processStatus.get(id)) continue; // skip tabs with no live process
-              const cmd = workspace.tabs.get(id)?.commandType;
+              const tab = workspace.tabs.get(id);
+              // SDK tabs have NO PTY (so processStatus is always false), but they
+              // do have an in-process query that can be cancelled. Treat an SDK tab
+              // as a Stop-target whenever its busy flag is true (claude:busy-state
+              // mirrors claude-sdk:busy-state).
+              const isSDKBusy = tab?.tabType === 'claude-sdk' && claudeBusyMap.get(id);
+              if (!processStatus.get(id) && !isSDKBusy) continue;
+              const cmd = tab?.commandType;
               if (cmd === 'claude') claudeCount++;
               else if (cmd === 'gemini') geminiCount++;
               else scriptCount++; // bash, devServer, shell-script — everything else with live process
@@ -1807,7 +1892,7 @@ function TabBar({ projectId }: TabBarProps) {
             // Script-stop branch — same split-button layout but green tint (process indicator color),
             // and Ctrl+C path instead of SIGTERM (zsh/bash handles SIGINT, no danger zone like Claude TUI).
             const showStopScript = !showStopAI && scriptCount > 0;
-            const SCRIPT_TINT = '#4ade80'; // running indicator green, matches the dot next to tab name
+            const SCRIPT_TINT = '#dc2626'; // cherry-red — distinguish from green "running" dot; AI buttons keep their own tints
 
             // Majority decides base color. Ties go to Claude (project default).
             // Minority is rendered as small "+N" badge in the OTHER tint, so the
@@ -1858,7 +1943,15 @@ function TabBar({ projectId }: TabBarProps) {
               setContextMenu(null);
               // Fire all SIGTERMs in parallel \u2014 main handles its own grace + escalation per PID
               await Promise.all(targetTabIds.map(id => {
-                const cmd = workspace.tabs.get(id)?.commandType;
+                const tab = workspace.tabs.get(id);
+                const cmd = tab?.commandType;
+                // SDK route: cancel the in-process query (claude-sdk:stop). No PTY.
+                if (tab?.tabType === 'claude-sdk') {
+                  if (!claudeBusyMap.get(id)) return null;
+                  // Same Resume-affordance signal as the chip + tab dot use.
+                  window.dispatchEvent(new CustomEvent('claude-sdk:was-stopped', { detail: { tabId: id } }));
+                  return ipcRenderer.invoke('claude-sdk:stop', { tabId: id });
+                }
                 if (cmd !== 'claude' && cmd !== 'gemini') return null;
                 if (!processStatus.get(id)) return null;
                 return ipcRenderer.invoke('terminal:stop-ai-process', id);

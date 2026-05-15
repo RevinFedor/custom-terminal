@@ -114,20 +114,28 @@ foldStateKey={`file-preview:${filePreview.path}`}
 
 ## Build Process
 
-При сборке Noted Terminal автоматически билдится gt-editor:
+Custom-terminal зависит от `@gt-editor/markdown-editor` через npm `file:`-зависимость (локальный alias `@anthropic/markdown-editor`). При правке исходников пакета **трёх шагов** нужно сделать:
 
 ```json
-"build:editor": "cd ../gt-editor/packages/markdown-editor && npm run build"
+"build:markdown": "cd ../gt-editor/packages/markdown-editor && npm run build && rsync -a --delete dist/ ../../../custom-terminal/node_modules/@gt-editor/markdown-editor/dist/ && rm -rf ../../../custom-terminal/node_modules/.vite"
 ```
 
-Это происходит **перед** основной сборкой (см. package.json scripts).
+1. **Build** в gt-editor packages → обновляет `dist/index.cjs`.
+2. **Rsync** в `node_modules/@gt-editor/markdown-editor/dist/` — потому что npm `file:`-install скопировал dist при первом install, дальше копии живут независимо.
+3. **`rm -rf node_modules/.vite`** — Vite prebundle cache не инвалидируется при изменении `dist/` локально-разрабатываемого пакета. Без удаления кеша Vite на следующем `dev` start читает старый prebundle, и правки не подхватываются.
+
+После — обязателен перезапуск `npm run dev` (HMR **не** перебирает prebundle).
+
+См. `fix-vite-prebundle-cache.md` про root cause и попытки решить иначе.
 
 ## Связанные файлы
 
-- `src/renderer/components/Workspace/FilePreview.tsx` — использует MarkdownEditor для просмотра файлов
-- `src/renderer/components/Workspace/NotesEditorModal.tsx` — использует MarkdownEditor для редактирования заметок
-- `src/renderer/components/Workspace/panels/InfoPanel.tsx` — использует MarkdownEditor для inline-заметок
-- `src/renderer/config/theme/markdown.ts` — цветовая схема gt-editor (используется везде)
+- `src/renderer/components/Workspace/FilePreview.tsx` — использует MarkdownEditor для просмотра файлов (readOnly).
+- `src/renderer/components/Workspace/TabNotesSlideout.tsx` — slideout per-tab notes editor с AI Paste.
+- `src/renderer/components/Workspace/panels/InfoPanel.tsx` — inline tab-notes editor.
+- `src/renderer/components/Workspace/ProjectHome.tsx` — readOnly preview popovers с notes.
+- `src/renderer/utils/generateAITitle.ts` — callback для AI Paste с Gemini fallback chain.
+- `src/renderer/config/theme/markdown.ts` — цветовая схема gt-editor (используется везде).
 
 ## Что МОЖНО удалить в будущем
 
