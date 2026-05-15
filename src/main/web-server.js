@@ -59,7 +59,10 @@ try {
   WebSocketServer = null;
 }
 
-const PORT = 7878;
+// Port can be overridden via env (NOTED_WEB_PORT) so a `npm run dev` instance
+// can run alongside the installed production app on a different port. Default
+// 7878 keeps the installed app's URL stable. Typical dev override: 7979.
+const PORT = parseInt(process.env.NOTED_WEB_PORT || '', 10) || 7878;
 const TOKEN_PATH = path.join(require('os').homedir(), '.noted-terminal', 'web-token.txt');
 
 let httpServer = null;
@@ -455,35 +458,145 @@ async function handleApi(req, res, parsed, sdkSessions) {
     }
   }
 
-  // Load JSONL session history. Supports ?last=N to return only the tail —
-  // mobile uses this for fast initial paint (5s → 1s on heavy chats), then
-  // re-fetches without `last` in the background to fill the prefix.
+  // Load JSONL session history.
+  // - Default: JSON `{ messages, total, truncated, dropped, etag }` (legacy clients)
+  // - With `Accept: application/x-ndjson` OR `?ndjson=1`: STREAMING NDJSON.
+  //     Line 1: `{"type":"meta", total, sessionId, etag, returned, lastUuid}`
+  //     Lines 2..N+1: one message JSON per line
+  //     Compressed via Brotli (quality 4) when client accepts `br`, piped
+  //     directly to the response — first message bytes reach the phone in
+  //     ~50ms instead of the ~4s buffered-and-compress wait.
+  // - `?after=<uuid>` returns ONLY messages strictly after that uuid (delta sync).
+  // - `?before=<uuid>` returns ONLY messages strictly before that uuid (prefix
+  //    backfill). Combined with phase 1 `?last=200` → phase 2 `?before=<firstTailUuid>`,
+  //    the cold-open paint flow is: tail in 1s, prefix streams in behind it.
+  // - `?last=N` returns the last N messages.
   m = parsed.pathname.match(/^\/api\/sdk-tabs\/([^/]+)\/history$/);
   if (m && req.method === 'GET') {
     const tabId = m[1];
     const t0 = Date.now();
     const lastRaw = parsed.query.last;
     const lastN = lastRaw != null ? Math.max(1, Math.min(20000, parseInt(String(lastRaw), 10) || 0)) : null;
-    console.log(`[WebTiming] /history START tabId=${tabId.slice(0, 24)} last=${lastN || 'all'}`);
+    const afterUuid = typeof parsed.query.after === 'string' ? parsed.query.after : null;
+    const beforeUuid = typeof parsed.query.before === 'string' ? parsed.query.before : null;
+    const wantNdjson = /\bapplication\/x-ndjson\b/.test(req.headers['accept'] || '') || parsed.query.ndjson === '1';
+    console.log(`[WebTiming] /history START tabId=${tabId.slice(0, 24)} last=${lastN || 'all'} after=${afterUuid ? afterUuid.slice(0, 8) : 'none'} before=${beforeUuid ? beforeUuid.slice(0, 8) : 'none'} ndjson=${wantNdjson}`);
     try {
       const data = await bridgeRequest('loadSDKHistory', { tabId });
       const allMsgs = data?.messages || [];
       const total = allMsgs.length;
+
+      // Apply filters in order: after-cursor → before-cursor → last-tail.
       let messages = allMsgs;
-      let truncated = false;
       let dropped = 0;
-      if (lastN && total > lastN) {
-        messages = allMsgs.slice(total - lastN);
-        truncated = true;
-        dropped = total - lastN;
+      if (afterUuid) {
+        const idx = messages.findIndex((m) => m && m.uuid === afterUuid);
+        if (idx >= 0) messages = messages.slice(idx + 1);
+        else messages = []; // unknown uuid → empty delta
       }
-      console.log(`[WebTiming] /history DONE total=${total} returned=${messages.length} dropped=${dropped} ms=${Date.now()-t0}`);
-      // Shape: existing clients still get { messages }. New `total`/`truncated`
-      // fields let mobile decide whether to background-fetch the full set.
-      return sendJson(res, 200, { ...data, messages, total, truncated, dropped });
+      if (beforeUuid) {
+        const idx = messages.findIndex((m) => m && m.uuid === beforeUuid);
+        // Found → return the prefix (everything strictly before it).
+        // Not found → safer to return empty than to dump everything; client
+        // would think this IS the prefix and skip phase 2 entirely.
+        if (idx >= 0) messages = messages.slice(0, idx);
+        else messages = [];
+      }
+      if (lastN && messages.length > lastN) {
+        dropped = messages.length - lastN;
+        messages = messages.slice(messages.length - lastN);
+      }
+      const truncated = dropped > 0;
+      const lastUuid = messages.length ? (messages[messages.length - 1]?.uuid || null) : null;
+      // Cheap content fingerprint over uuids — client uses this as a cache key.
+      // Hashing uuids only (not bodies) is enough: any backend mutation creates
+      // a new uuid via Anthropic SDK, so uuid-set uniquely identifies content.
+      const etagSrc = messages.map((m) => m?.uuid || '').join('|');
+      const etag = crypto.createHash('sha1').update(etagSrc).digest('hex').slice(0, 16);
+
+      const firstUuid = messages.length ? (messages[0]?.uuid || null) : null;
+
+      if (!wantNdjson) {
+        console.log(`[WebTiming] /history DONE total=${total} returned=${messages.length} dropped=${dropped} ms=${Date.now()-t0} mode=json`);
+        return sendJson(res, 200, { ...data, messages, total, truncated, dropped, etag, lastUuid, firstUuid });
+      }
+
+      // ─── NDJSON streaming path ────────────────────────────────────────
+      // Pipe: write() lines → Brotli transform (if accepted) → response.
+      const accept = req.headers['accept-encoding'] || '';
+      const useBrotli = /\bbr\b/.test(accept);
+      const useGzip = !useBrotli && /\bgzip\b/.test(accept);
+
+      res.writeHead(200, {
+        'Content-Type': 'application/x-ndjson; charset=utf-8',
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Headers': 'Authorization, Content-Type, Accept',
+        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+        'Vary': 'Accept-Encoding, Accept',
+        ...(useBrotli ? { 'Content-Encoding': 'br' } : useGzip ? { 'Content-Encoding': 'gzip' } : {}),
+        // Tell intermediaries (and clients) we want chunked-transfer, not
+        // wait-for-full-length. Critical for streaming perception.
+        'Transfer-Encoding': 'chunked',
+        'Cache-Control': 'no-cache',
+      });
+
+      let sink = res;
+      if (useBrotli) {
+        // Quality 4 = balanced ratio/speed for live encoding (~20-40 MB/s).
+        // Higher quality (11 default) is 100x slower for tiny ratio win.
+        const br = zlib.createBrotliCompress({
+          params: {
+            [zlib.constants.BROTLI_PARAM_QUALITY]: 4,
+            [zlib.constants.BROTLI_PARAM_MODE]: zlib.constants.BROTLI_MODE_TEXT,
+          },
+        });
+        br.pipe(res);
+        sink = br;
+      } else if (useGzip) {
+        const gz = zlib.createGzip({ level: 4 });
+        gz.pipe(res);
+        sink = gz;
+      }
+
+      const writeLine = (obj) => sink.write(JSON.stringify(obj) + '\n');
+
+      // Meta first — client uses `total` for the progress bar, `etag` for cache key.
+      // `firstUuid` enables phase-2 prefix backfill (`?before=<firstUuid>`).
+      writeLine({
+        type: 'meta',
+        total,
+        returned: messages.length,
+        truncated,
+        dropped,
+        sessionId: data?.sessionId,
+        etag,
+        lastUuid,
+        firstUuid,
+      });
+
+      // Yield to event loop every 200 messages so we don't synchronously block
+      // when a single client requests a 5000-message dump. The lighter pulse
+      // keeps the HTTP server responsive to other requests during a big stream.
+      const FLUSH_EVERY = 200;
+      let written = 0;
+      for (const msg of messages) {
+        writeLine(msg);
+        written += 1;
+        if (written % FLUSH_EVERY === 0) {
+          await new Promise((r) => setImmediate(r));
+        }
+      }
+      // End sentinel — client can rely on `done` to know stream completed
+      // cleanly vs was cut off mid-flight.
+      writeLine({ type: 'done', written });
+      sink.end();
+      console.log(`[WebTiming] /history DONE total=${total} returned=${messages.length} dropped=${dropped} ms=${Date.now()-t0} mode=ndjson enc=${useBrotli ? 'br' : useGzip ? 'gz' : 'plain'}`);
+      return;
     } catch (e) {
       console.log(`[WebTiming] /history ERROR ${String(e.message)} total=${Date.now()-t0}ms`);
-      return sendJson(res, 500, { error: String(e.message) });
+      if (!res.headersSent) return sendJson(res, 500, { error: String(e.message) });
+      try { res.end(); } catch {}
+      return;
     }
   }
 

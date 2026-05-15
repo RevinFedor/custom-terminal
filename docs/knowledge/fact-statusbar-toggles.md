@@ -50,7 +50,7 @@ Cache `projectPortsCache` per-cwd, TTL 30s — иначе grep на каждый
 - Terminal native context menu → run-script (через `App.tsx::run-script` handler — отдельная цепочка, та же логика kill-prefix)
 
 ### Persistence — SQLite через app:setState
-Toggle хранится в SQLite, не в localStorage. Та же причина что у `defaultClaudeEffort` (см. `fix-environment.md::localStorage origin trap`): vite-port в dev меняется → разный origin → разный localStorage. SQLite в main process origin-independent, выдерживает port shifts.
+Toggle хранится в SQLite, не в localStorage. Та же причина что у `defaultClaudeEffort` (см. `fix-localstorage-origin.md`): vite-port в dev меняется → разный origin → разный localStorage. SQLite в main process origin-independent, выдерживает port shifts.
 
 Legacy mirror в localStorage сохраняется (для синхронного init), но **authoritative source — SQLite**.
 
@@ -68,6 +68,6 @@ Legacy mirror в localStorage сохраняется (для синхронно�
 
 ## Связанные подсистемы
 
-- `fix-environment.md::localStorage origin trap` — почему SQLite, не localStorage
+- `fix-localstorage-origin.md` — почему SQLite, не localStorage
 - `fact-claude-tui-control.md::Auto-inject /effort` — EffortSelector в той же StatusBar
 - `methodology/design.md::Visible side effect > silent IPC` — переносимый принцип

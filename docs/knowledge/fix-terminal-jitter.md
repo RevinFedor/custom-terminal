@@ -196,3 +196,47 @@ commit `c6553c0` решал проблему. 40+ итераций пытали�
 - [anthropics/claude-code#35683](https://github.com/anthropics/claude-code/pull/35683) — community scroll-fix plugin (unmerged, obsolete after v2.1.101)
 - [anthropics/claude-code#34503](https://github.com/anthropics/claude-code/issues/34503) — meta-issue scroll-to-top (closed v2.1.81)
 - [anthropics/claude-code#35403](https://github.com/anthropics/claude-code/issues/35403) — закрывающий комментарий с указанием v2.1.101
+
+---
+
+## Hidden tab: `viewportY` сбрасывается в 0 при write в скрытый терминал
+
+### Симптом
+При переключении между табами терминала, если в **скрытом** табе продолжают поступать данные (Claude пишет), при возврате на этот таб происходит «дёргание» — терминал показывает верх буфера вместо ожидаемой позиции.
+
+### Root cause — xterm.js bug
+Запись данных в терминал с `visibility: hidden` или unmounted ref'ом сбрасывает `viewportY` в 0, **хотя `baseY`** (размер буфера) продолжает расти:
+
+```
+viewportY=466 baseY=466 isAtBottom=true   ← до записи
+viewportY=0   baseY=471 isAtBottom=false  ← после записи в скрытый терминал
+```
+
+Полагаться на `viewportY` после возврата на таб нельзя.
+
+### Решение — сохранять флаг `wasAtBottom`, не позицию
+```ts
+const savedScroll = useRef<number | null>(null);
+const wasAtBottom = useRef(true);
+
+// При деактивации таба:
+savedScroll.current = currentViewportY;
+wasAtBottom.current = currentViewportY >= currentBaseY;
+
+// При активации таба:
+if (wasAtBottom.current) {
+  term.scrollToBottom();          // игнорируем сброшенный viewportY
+} else {
+  term.scrollToLine(savedScroll.current); // юзер был проскроллен вверх
+}
+```
+
+### Критическое правило
+При восстановлении scroll position после переключения табов **нельзя полагаться на текущий `viewportY`** — он может быть сброшен из-за бага xterm.js. Используй сохранённый флаг `wasAtBottom` для решения «scroll to bottom» vs «restore specific line».
+
+### Открытая проблема — потеря PTY-данных при unmount
+Когда юзер переходит на другой экран, компонент Terminal **размонтируется** → буфер сериализуется через `serializeAddon`, listener `terminal:data` удаляется. Но **PTY в Main процессе продолжает работать**. Если Claude в этот момент выдаёт текст — данные **теряются**, при возврате на таб видна «дыра» в истории.
+
+Концептуальное решение: глобальный listener `terminal:data` на уровне `App.tsx` или Store + аккумуляция в `Map<tabId, string>` для неактивных табов + конкатенация сериализованного буфера и «пропущенных» данных при mount.
+
+Не реализовано — issue открыт, отложен до следующего цикла рефакторинга.
