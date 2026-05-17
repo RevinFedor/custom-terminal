@@ -35,6 +35,8 @@ _webBroadcast(tabId, {
 
 **Edge case:** когда отправка пришла **с phone**, десктоп `onNew` не вызвался. Renderer-bridge handler перед `claude-sdk:send-message` диспатчит CustomEvent `claude-sdk:external-prompt` — ClaudeSDKTab слушает и пушит свой user-bubble в локальный `setMessages`. Без этого десктоп показывал ответ Claude но не сам запрос.
 
+**Mobile-side guard:** phone reducer **игнорирует** `__webSynthetic: true` входящие messages — иначе на phone был бы дубль user-bubble (synthetic + real-record когда дойдёт). Phone получает мгновенный feedback через **локальный optimistic push** в `send()` — `reducer.apply({type:'user', message:..., __pendingLocal: true})` сразу. Когда real-record прилетит из WS, dedupe-функция `adoptOrPush` в reducer находит последний user-bubble без uuid с тем же текстом и **adopt'ит** real uuid в существующую entry, не создаёт новую.
+
 ## History loader: НЕ getSessionMessages
 
 `getSessionMessages` из Anthropic SDK возвращает **другой набор записей** чем `parseTimelineEntries` — uuids не пересекаются. Если history грузить через SDK-helper, GoTo из timeline (использует timeline uuids как anchors) никогда не находит цель. См. [`fix-mobile-history-uuid-mismatch.md`](fix-mobile-history-uuid-mismatch.md).
@@ -54,7 +56,10 @@ POST /api/sdk-tabs/:tabId/close                → closeTab (через bridge)
 POST /api/sdk-tabs/:tabId/rename               → renameTab (через bridge)
 POST /api/sdk-tabs/:tabId/fork-to-sdk          → forkToSDK (через bridge → fork-from-session)
 POST /api/tabs/:tabId/fork-to-sdk              → ↑ alias для terminal табов
-GET  /api/sdk-tabs/:tabId/history[?last=N]     → active-branch-messages; with ?last → tail-only + { total, truncated, dropped }
+GET  /api/sdk-tabs/:tabId/history              → JSON or NDJSON (Accept-driven)
+                                               → query params: ?last=N (tail), ?after=<uuid> (delta sync), ?before=<uuid> (prefix backfill)
+                                               → Accept: application/x-ndjson → streamed line-by-line, Brotli-4
+POST /api/sdk-tabs/:tabId/truncate              → drop everything ≥ targetUuid (Edit/Repeat)
 GET  /api/sdk-tabs/:tabId/timeline             → parseTimelineEntries
 GET  /api/sdk-tabs/:tabId/params               → getSDKParams
 POST /api/sdk-tabs/:tabId/params               → setSDKParams
@@ -106,17 +111,79 @@ const webServer = require(path.join(srcMainDir, 'web-server'));
 
 URL-схема: `#/projects/:projectId/chat/:tabId[?ro=1]`. HashRouter а не BrowserRouter — node-static в `web-server.js` не имеет SPA-fallback'а на произвольные pathnames; hash на сервер не уходит, фрагмент читается клиентом. Reload на любой странице → попадаешь обратно туда же. Deep-link (нет `state.tab` в `history.state`) → `Api.listTabs(projectId)` ищет TabInfo по `tabId`, либо показывает «Tab not found» с кнопкой назад. См. `methodology/design-mobile.md::Deep-link routing`.
 
-## Tail-first history flow (две фазы)
+## History pipeline (NDJSON streaming + IDB delta sync + virtuoso)
 
-Phase 1 (~1 сек): `Api.history(tabId, { last: 200 })` → reducer + paint, `historyLoading=false`. Чат интерактивен.
+**Архитектура (заменила window-render + JSON two-phase в мае 2026):**
 
-Phase 2 (~5 сек, в фоне): если server вернул `truncated: true` — fire `Api.history(tabId)` без `last`. State `fullLoading=true`. Когда придёт — `reducer.reset() + apply(full)` через chunked `requestIdleCallback` (CHUNK=500), preserve viewport: если был at-bottom → остаёмся at-bottom; иначе scroll-restore по `scrollHeight delta`.
+```
+Mount ChatView
+  ↓
+[Phase 0] readCachedHistory(sid) → IDB hit?
+   yes → reducer.reset + apply ALL cached → paint immediately, historyLoading=false
+   no  → continue
+  ↓
+[Phase 1] streamHistory(?last=200) — NDJSON over Brotli-4
+   meta {total, returned, firstUuid, lastUuid, etag}
+   message...message...message  (one JSON per \n)
+   done {written}
+   ↓ each message: reducer.apply, scheduleFlush per rAF
+  ↓
+[Phase 2 — only if cold and total > returned] streamHistory(?before=<firstTailUuid>)
+   ↓ collect into prefixBuffer
+   ↓ on done: prefixMergeLockRef = true
+   ↓        reducer.reset → apply(prefix + tail) → drain wsDeferredQueue
+   ↓        prefixMergeLockRef = false
+   ↓        flush
+  ↓
+[Persist] writeFullHistory(sid, rawHistoryBufferRef, etag, total, lastUuid)
+```
 
-UI gating пока `fullLoading=true`:
-- GoTo на uuid не найденный в reducer → `pendingFullGoToRef.current = uuid`, drawer закрывается, **overlay висит** до прихода full → `goToEntryRef.current?.(uuid)` ретриггерит автоматически.
-- «↑ Load older messages» — disabled, рендерит loading-точки с лейблом `Loading older messages…`.
+Warm-cache путь: только одна фаза `?after=<cachedLastUuid>` — сервер вернёт пустой стрим (silent revalidation) или дельту с момента последнего mount'а.
 
-См. `methodology/design-mobile.md::Tail-first loading` и `knowledge/fix-mobile-history-bottleneck.md`.
+**NDJSON wire format:**
+- `Accept: application/x-ndjson` → server отвечает `Content-Type: application/x-ndjson`, `Content-Encoding: br` (если accepted)
+- Line 1: `{"type":"meta", total, returned, truncated, dropped, sessionId, etag, firstUuid, lastUuid}`
+- Lines 2..N+1: один SDK-message JSON на строку
+- Last line: `{"type":"done", written}` — sentinel для clean stream end vs cut-off
+
+Клиент-парсер: ручной `response.body.getReader()` (Safari нет async-iterable bodies до 26.x), `TextDecoder({stream: true})` для multi-byte chars across chunks, split по `\n` с carry-over remainder.
+
+**Virtuoso вместо window-slice:** DOM bounded ~15-30 items независимо от total. **Удалили:** `renderStart/renderEnd`, "Load older" кнопку, full-screen GoTo overlay, `fullLoading` state, "N new below" marker, ручной scroll-restore. GoTo через `virtuosoRef.scrollToIndex({index, align:'center'})` — instant, без force-render.
+
+**IDB record store** (idb 8.x):
+- `meta` store keyed by `sessionId`: `{lastUuid, etag, total, updatedAt}`
+- `messages` store keyed by `[sessionId, ord]`: одна запись на сообщение, secondary index `by-uuid`
+- Read returns structured-cloned live objects — **нет JSON.parse на хот-пути** (vs 30ms parse 20MB blob каждый mount)
+- Delta sync: meta.lastUuid → server `?after=<lastUuid>` → дописываем appendDelta. Полный rewrite только когда нет cache.
+
+**Race protection (prefix-merge lock):** между `reducer.reset()` и `apply(merged)` в phase-2 могут прийти WS messages. Раньше они применялись в `reset → empty → WS apply (без context) → merge replace` → live message терялся. Теперь:
+- `prefixMergeLockRef.current = true` перед reset
+- WS handler: `if (prefixMergeLockRef.current) wsDeferredQueueRef.push(msg); return`
+- После apply(merged): drain wsDeferredQueue → reducer.apply каждый → flush → release lock
+
+**WS auto-reconnect с backoff:** Safari закрывает WS в фоновых табах через ~30 сек. `connect()` цикл с backoff 1s → 2s → 5s → 10s → 30s (cap), reset на onopen. Без этого юзер возвращается в чат через час и видит молчаливо мёртвый WS.
+
+**Stream idle watchdog:** 30s без bytes → abort + onError. Без этого Electron-crash mid-stream → phone forever pending без сигнала.
+
+**Synthetic broadcast skip on mobile:** main.js шлёт `__webSynthetic: true` user message через WS чтобы desktop рендер показал bubble на mobile-prompt'ах. Phone reducer **игнорирует** synthetic — иначе phone получит дубль (synthetic + real-record). Mobile получает мгновенный feedback через **локальный optimistic push** в `send()`, real-record adopt'ит свой uuid в существующую entry (dedupe by text).
+
+См. `methodology/design-mobile.md::Tail-first loading`, `knowledge/fix-mobile-history-bottleneck.md` (история отладки до streaming), `knowledge/fix-mobile-scroll-jitter-virtuoso.md` (CV+virtuoso антипаттерн).
+
+## Expanded state map (across virtuoso re-mount)
+
+`_entryExpanded: Map<entryId, boolean>` в module scope `mobile-web/src/App.tsx`. Hook `useEntryExpanded(id, defaultOpen)` подписывается на per-id version counter. Используется в ThinkingCard и ToolCard. Cleanup в `clearEntryExpandedForIds` срабатывает на ChatView unmount — иначе Map течёт по entry.id'ам всех когда-либо открытых чатов.
+
+См. `methodology/design-mobile.md::Persistent expanded state across virtual list re-mount`.
+
+## Dev-port isolation (parallel production)
+
+Production app (installed `/Applications/Noted Terminal.app`) слушает 7878. `npm run dev` устанавливает `NOTED_WEB_PORT=7979` через npm script — поднимает свой web-server на 7979, оба работают параллельно. Phone подключается на нужный порт (production URL стабильный, dev URL = тестовая копия).
+
+**Port-walk fallback при EADDRINUSE.** Если preferred port (7878 или явный `NOTED_WEB_PORT`) занят — server инкрементирует и пробует следующий, до `PREFERRED + 20`. Раньше второй инстанс просто молча умирал с `EADDRINUSE` через `console.error`, mobile-web был доступен ровно у первого запустившегося. Теперь оба живые на разных портах. Реальный bound порт пишется в `~/.noted-terminal/web-server-<pid>.json` (`{port, pid, lanIp, updatedAt}`) — discovery для StatusBar mobile-chip'а и любого внешнего инспектора. `getInfo()` отдаёт `resolvedPort`, не const — без этого QR-код и copy-URL показывали 7878 на инстансе который реально на 7879.
+
+Mobile-web Vite dev (`cd mobile-web && npm run dev`) — `host: '0.0.0.0'`, port 5180. Proxy `/api` и `/ws` на :7878. Используется когда нужен HMR на phone при правках `mobile-web/src/*.tsx`.
+
+Token общий — `~/.noted-terminal/web-token.txt` читается обоими инстансами.
 
 ## Prompt cache (etag-revalidation)
 
@@ -128,7 +195,9 @@ UI gating пока `fullLoading=true`:
 
 Server: `[WebTiming]` теги — каждый `/timeline`, `/history` пишет `bridge=Xms find=Yms parse=Zms total=Wms`, `[WebGzip] origB → gzipB (N%) in Tms` для крупных payloads (>64KB).
 
-Client: `[History] tailFetch / tailFetched / tailApplied / fullFetch / fullFetched / fullApplied` через `Api.log()` → `POST /api/log/client` → `console.log` → `dev.log`. Каждый шаг с `*Ms` для blame'а. `[TimelineGoTo] click / window / done / queuedForFullLoad / NOT FOUND` для timeline-навигации. Без этих логов причину slow-load'а с phone не диагностировать (см. `fix-mobile-history-bottleneck.md` — 15 секунд оказались network transfer'ом, не reducer'ом).
+Client: `[History] streamFetch / streamMeta / streamDone / prefixMerged / idbWrote / cacheHit` через `Api.log()` → `POST /api/log/client` → `console.log` → `dev.log`. Каждый шаг с `*Ms` для blame'а. `[TimelineGoTo] click / done / NOT FOUND` для timeline-навигации. `[WS] open / close` с code/reason/backoffMs для reconnect диагностики. `[ScrollDiag] flushReducer / followOutput / atBottomStateChange / isScrolling / scroll {delta:N}` — для отладки scroll-jitter (см. `fix-mobile-scroll-jitter-virtuoso.md`).
+
+**Архивные теги (устарели):** `tailFetch / tailFetched / fullFetch / fullFetched / fullApplied` использовались в JSON two-phase архитектуре, удалены вместе с ней.
 
 ## gzip threshold
 

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { HashRouter, Navigate, Route, Routes, useNavigate, useParams } from 'react-router-dom';
@@ -762,8 +762,16 @@ function ProjectView(props: {
   const create = async () => {
     setCreating(true);
     try {
-      await Api.createSDKTab(project.id);
+      // Backend returns { tabId, name, cwd, projectId } — use it to navigate
+      // straight into the new tab. Mobile UX: every "create" is followed by
+      // "now I want to talk to it", so the extra tap on the project list was
+      // pure friction. Refresh tabs list AFTER navigation so when user comes
+      // back via Back button the list is fresh.
+      const r = await Api.createSDKTab(project.id);
       await onCreated();
+      const fresh = await Api.listTabs(project.id);
+      const newTab = fresh.tabs.find(x => x.tabId === r.tabId);
+      if (newTab) onOpenChat(newTab);
     } catch (e: any) {
       alert('Create failed: ' + e.message);
     } finally {
@@ -905,6 +913,28 @@ function ProjectView(props: {
 // ────────── Chat (SDK tab) ──────────
 
 function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () => void; readOnly?: boolean }) {
+  // For Fork-to-SDK button (terminal tabs only) — push the user into the
+  // newly-created SDK tab without making them go back to project list.
+  const navigate = useNavigate();
+  const [forking, setForking] = useState(false);
+  const onForkToSDK = useCallback(async () => {
+    if (!tab.tabId || forking) return;
+    setForking(true);
+    try {
+      const r = await Api.forkToSDK(tab.tabId);
+      // Find the parent project of this tab and navigate to the new SDK chat.
+      // Backend returns { tabId, sessionId, projectId } — projectId is enough.
+      if (r.projectId && r.tabId) {
+        // Pre-fetch fresh tabs so deep-link landing has its TabInfo ready.
+        try { await Api.listTabs(r.projectId); } catch {}
+        navigate('/projects/' + encodeURIComponent(r.projectId) + '/chat/' + encodeURIComponent(r.tabId));
+      }
+    } catch (e: any) {
+      alert('Fork failed: ' + (e?.message || e));
+    } finally {
+      setForking(false);
+    }
+  }, [tab.tabId, forking, navigate]);
   // Architecture (read top to bottom):
   //  1. Hydrate UI synchronously with cached entries from IndexedDB (records,
   //     not blobs — IDB returns live structured-cloned objects, no re-parse).
@@ -942,6 +972,18 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
   const wsRef = useRef<WebSocket | null>(null);
   // Virtuoso handle for programmatic scroll (GoTo, "scroll-to-bottom" FAB).
   const virtuosoRef = useRef<VirtuosoHandle | null>(null);
+  // Last seen scrollTop — for jitter telemetry (compute delta on each scroll).
+  const lastScrollTopRef = useRef<number>(0);
+  // True until we've performed the one-time "scroll to last message" after
+  // the initial history load. Subsequent re-renders (WS updates, scrolls)
+  // don't re-trigger — virtuoso handles them via followOutput / preserve.
+  const didInitialScrollRef = useRef<boolean>(false);
+  // Lock + queue for the phase-2 prefix-merge race. While the lock is held,
+  // any WS message that arrives goes into the deferred queue rather than into
+  // reducer (because reducer.reset() is about to be called and would clobber
+  // any apply done between reset and the post-reset merged-replay).
+  const prefixMergeLockRef = useRef<boolean>(false);
+  const wsDeferredQueueRef = useRef<any[]>([]);
   // firstItemIndex: virtuoso's stable-index anchor for prepend operations.
   // Start huge so the value can only shrink — virtuoso uses delta-between-renders
   // to know "older messages were inserted, keep visible-item visible". We
@@ -955,12 +997,34 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
 
   // ── Helpers ─────────────────────────────────────────────────────────────
 
+  // ── Scroll-jitter instrumentation ────────────────────────────────────────
+  // Every time React state of `entries` changes, virtuoso may reflow → may
+  // bump scrollTop → user perceives "jerk back". We log:
+  //   - flushReducer: WHO triggered it, prev/new length
+  //   - followOutput: what we told virtuoso (smooth/false), at what state
+  //   - atBottomStateChange: when virtuoso reports bottom-state flip
+  //   - WS message arrival during scroll: tag the offending event
+  // Read in dev.log via `[ScrollDiag]` grep.
+  const lastScrollDiagAtRef = useRef<number>(0);
+  const scrollDiag = useCallback((tag: string, data?: any) => {
+    // Throttle to one log per ~80ms so we don't spam during streams. Critical
+    // events (flush during scroll) bypass the throttle by setting force=true.
+    const now = performance.now();
+    const force = data?.force;
+    if (!force && now - lastScrollDiagAtRef.current < 80) return;
+    lastScrollDiagAtRef.current = now;
+    Api.log('ScrollDiag', tag, data);
+  }, []);
+
   // Apply a fresh reducer snapshot to React state + adjust firstItemIndex
   // when the change was a PREPEND (older records inserted at the front).
   // Returns the snapshot for further use.
   const flushReducer = useCallback((reason: 'append' | 'replace' | 'prepend-aware') => {
     const fresh = reducer.current.getEntries();
     const prev = prevEntriesLenRef.current;
+    if (fresh.length !== prev) {
+      scrollDiag('flushReducer', { reason, prev, next: fresh.length, force: true });
+    }
     if (reason === 'prepend-aware' && fresh.length > prev) {
       // Determine if the additional entries are at the FRONT (prepend) by
       // checking whether the last entry's id matches prev's last entry's id.
@@ -1009,6 +1073,20 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
       return next;
     });
   }, []);
+
+  // Clear module-level expanded-state Map when leaving the chat. Without this
+  // the Maps accumulate every entry-id ever rendered across all chats — by
+  // ~50K keys JS heap noticeably bloats. The trade-off: re-opening this same
+  // chat resets thinking/tool-card open state to defaults. Acceptable for
+  // mobile (sessions are short) and matches what users expect from a "fresh
+  // open" anyway.
+  useEffect(() => {
+    return () => {
+      const ids = reducer.current.getEntries().map((e) => e.id);
+      clearEntryExpandedForIds(ids);
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab.tabId]);
 
   // ── GoTo: virtuoso scrollToIndex by uuid match ──────────────────────────
   const goToEntry = useCallback((uuid: string) => {
@@ -1175,14 +1253,29 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
               // reset → replay (prefix + existing raw buffer) → flush.
               // For 5000 records this is ~10ms total (no markdown parsing yet,
               // just object pushes into Map+Array).
+              //
+              // RACE GUARD: hold prefixMergeLockRef during reset+replay so any
+              // WS message that arrives during this window goes into a queue
+              // (see WS onmessage). Drain the queue after merge completes so
+              // the message survives.
+              prefixMergeLockRef.current = true;
               const tReplay = performance.now();
               const merged = prefixCollect.concat(rawHistoryBufferRef.current);
               rawHistoryBufferRef.current = merged;
               reducer.current.reset();
               for (const m of merged) reducer.current.apply(m);
+              // Drain any WS messages that arrived during the lock window.
+              const deferred = wsDeferredQueueRef.current;
+              wsDeferredQueueRef.current = [];
+              for (const m of deferred) {
+                rawHistoryBufferRef.current.push(m);
+                reducer.current.apply(m);
+              }
+              prefixMergeLockRef.current = false;
               flushReducer('replace');
               Api.log('History', 'prefixMerged', {
                 tag, prefixCount: prefixCollect.length, totalCount: merged.length,
+                deferredApplied: deferred.length,
                 replayMs: Math.round(performance.now() - tReplay),
               });
             } else if (!opts.isPrefix) {
@@ -1285,43 +1378,126 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
   // this buffer from IDB during hydration so the next IDB write is complete.
   const rawHistoryBufferRef = useRef<any[]>([]);
 
+  // ── One-time scroll-to-bottom on initial load ───────────────────────────
+  // Virtuoso's `initialTopMostItemIndex` is set ONCE on first render. At that
+  // moment entries=[] (history hasn't streamed yet) → it locks index=0. When
+  // entries fill in (~1-3 sec later) Virtuoso doesn't auto-scroll. So we do
+  // it explicitly the FIRST time entries.length > 0 after mount. After that —
+  // Virtuoso's followOutput handles new tail messages, scrolls preserve.
+  useEffect(() => {
+    if (didInitialScrollRef.current) return;
+    if (entries.length === 0) return;
+    didInitialScrollRef.current = true;
+    // Two rAFs: first lets virtuoso commit the entries-grew render, second
+    // lets it finish layout/measure of the newly-mounted last item.
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      virtuosoRef.current?.scrollToIndex({
+        index: entries.length - 1,
+        align: 'end',
+        behavior: 'auto',
+      });
+    }));
+  }, [entries.length]);
+
   // ── WebSocket: live messages, busy, done ─────────────────────────────────
+  // Auto-reconnect with backoff. Safari aggressively closes WS in background
+  // tabs (~30s) and on any network blip. Without reconnect the user comes
+  // back from their pocket and sees a dead chat — no spinner, no error, just
+  // silence — until they full-reload the page. Backoff: 1s → 2s → 5s → 10s
+  // → 30s, capped. Reset to 1s on successful onopen.
   useEffect(() => {
     if (!tab.tabId) return;
-    const ws = new WebSocket(wsUrl(tab.tabId));
-    wsRef.current = ws;
-    ws.onopen = () => setWsState('open');
-    ws.onclose = () => setWsState('closed');
-    ws.onerror = () => setWsState('closed');
-    ws.onmessage = (ev) => {
-      try {
-        const m = JSON.parse(ev.data);
-        if (m.type === 'snapshot') {
-          if (m.sessionId) setSessionId(m.sessionId);
-          setBusy(!!m.busy);
-        } else if (m.type === 'busy') {
-          setBusy(!!m.busy);
-        } else if (m.type === 'done') {
-          setBusy(false);
-          if (m.sessionId) setSessionId(m.sessionId);
-        } else if (m.type === 'message') {
-          if (m.sessionId) setSessionId(m.sessionId);
-          const inner = m.message;
-          if (inner?.message?.model) setResolvedModel(inner.message.model);
-          if (inner?.message?.usage) {
-            const u = inner.message.usage;
-            const total = (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0);
-            if (total > 0) setUsedTokens(total);
+    const tabIdLocal = tab.tabId;
+    let cancelled = false;
+    let backoffMs = 1000;
+    let reconnectTimer: any = null;
+
+    const connect = () => {
+      if (cancelled) return;
+      const ws = new WebSocket(wsUrl(tabIdLocal));
+      wsRef.current = ws;
+      ws.onopen = () => {
+        if (cancelled) { try { ws.close(); } catch {} return; }
+        setWsState('open');
+        backoffMs = 1000; // reset
+        Api.log('WS', 'open', { tag: tabIdLocal.slice(-12) });
+      };
+      ws.onclose = (ev) => {
+        if (cancelled) return;
+        setWsState('closed');
+        Api.log('WS', 'close', { tag: tabIdLocal.slice(-12), code: ev.code, reason: ev.reason || '', clean: ev.wasClean, backoffMs });
+        // Schedule reconnect
+        clearTimeout(reconnectTimer);
+        reconnectTimer = setTimeout(connect, backoffMs);
+        backoffMs = Math.min(30000, Math.round(backoffMs * 1.8));
+      };
+      ws.onerror = () => {
+        if (cancelled) return;
+        setWsState('closed');
+        // onerror is followed by onclose — don't double-schedule reconnect.
+      };
+      ws.onmessage = (ev) => {
+        try {
+          const m = JSON.parse(ev.data);
+          if (m.type === 'snapshot') {
+            if (m.sessionId) setSessionId(m.sessionId);
+            setBusy(!!m.busy);
+          } else if (m.type === 'busy') {
+            setBusy(!!m.busy);
+          } else if (m.type === 'done') {
+            setBusy(false);
+            if (m.sessionId) setSessionId(m.sessionId);
+            // Turn ended naturally — clear in-flight refs so a later stop()
+            // (no-op at this point) doesn't try to restore an old prompt.
+            pendingPromptRef.current = null;
+            assistantStartedThisTurnRef.current = false;
+          } else if (m.type === 'message') {
+            if (m.sessionId) setSessionId(m.sessionId);
+            const inner = m.message;
+            if (inner?.message?.model) setResolvedModel(inner.message.model);
+            if (inner?.message?.usage) {
+              const u = inner.message.usage;
+              const total = (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0);
+              if (total > 0) setUsedTokens(total);
+            }
+            // Track whether the assistant has produced VISIBLE content for
+            // the in-flight turn (text/thinking/tool_use). The synthetic user
+            // bubble that main broadcasts at sdkStartQuery doesn't count —
+            // only assistant-typed content. Used by stop() to decide whether
+            // to restore the prompt to the composer.
+            if (inner?.type === 'assistant' && Array.isArray(inner?.message?.content)) {
+              const hasContent = inner.message.content.some((b: any) =>
+                (b?.type === 'text' && b?.text?.length > 0) ||
+                (b?.type === 'thinking' && b?.thinking?.length > 0) ||
+                b?.type === 'tool_use'
+              );
+              if (hasContent) assistantStartedThisTurnRef.current = true;
+            }
+            // RACE GUARD: if a phase-2 prefix-merge is in flight, defer this
+            // WS message — applying it now would race with reducer.reset().
+            // Either the merge completes and processes the queue, or the
+            // tab unmounts before that and the message is dropped (next mount
+            // will re-fetch via IDB delta).
+            if (prefixMergeLockRef.current) {
+              wsDeferredQueueRef.current.push(inner);
+              return;
+            }
+            rawHistoryBufferRef.current.push(inner);
+            reducer.current.apply(inner);
+            flushReducer('append');
+            // If user is at bottom — virtuoso auto-follows via followOutput.
+            // If they're scrolled up — virtuoso preserves position, that's fine.
           }
-          rawHistoryBufferRef.current.push(inner);
-          reducer.current.apply(inner);
-          flushReducer('append');
-          // If user is at bottom — virtuoso auto-follows via followOutput.
-          // If they're scrolled up — virtuoso preserves position, that's fine.
-        }
-      } catch {}
+        } catch {}
+      };
     };
-    return () => { try { ws.close(); } catch {} };
+    connect();
+
+    return () => {
+      cancelled = true;
+      clearTimeout(reconnectTimer);
+      try { wsRef.current?.close(); } catch {}
+    };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tab.tabId]);
 
@@ -1338,24 +1514,57 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
     });
   }, [entries.length]);
 
+  // Track the prompt that's currently in flight + whether the assistant has
+  // emitted any content for it yet. `pendingPromptRef` is set on send, cleared
+  // when the assistant produces visible output (text/thinking/tool_use). On
+  // stop: if cleared → assistant already started → keep partial; if still set
+  // → assistant produced nothing → restore prompt to composer.
+  const pendingPromptRef = useRef<string | null>(null);
+  const assistantStartedThisTurnRef = useRef<boolean>(false);
+
   const send = async () => {
     if (!text.trim() || !tab.tabId || busy) return;
     const prompt = text;
+    pendingPromptRef.current = prompt;
+    assistantStartedThisTurnRef.current = false;
     setText('');
     setBusy(true);
+    // Local optimistic push — instant feedback. Real JSONL record arrives via
+    // WS in 100-500ms with the SAME text + a uuid, but reducer dedupes by
+    // matching: if the last entry is a user-bubble with identical text and
+    // no entryUuid yet, the real record's apply() sets the uuid on it
+    // instead of pushing a duplicate. Synthetic broadcast from main is
+    // dropped at the reducer level (see messages.ts::__webSynthetic skip).
+    reducer.current.apply({ type: 'user', message: { role: 'user', content: prompt }, __pendingLocal: true });
+    flushReducer('append');
     try {
       await Api.send(tab.tabId, prompt);
     } catch (e: any) {
       reducer.current.apply({ type: 'result', subtype: 'error', is_error: true, result: e.message });
       flushReducer('append');
       setBusy(false);
+      pendingPromptRef.current = null;
     }
   };
 
   const stop = async () => {
     if (!tab.tabId) return;
+    // Snapshot the "did assistant produce anything" decision BEFORE we await —
+    // by the time stop completes, more chunks could have arrived.
+    const earlyStop = !assistantStartedThisTurnRef.current && !!pendingPromptRef.current;
+    const promptToRestore = pendingPromptRef.current;
     try { await Api.stop(tab.tabId); } catch {}
     setBusy(false);
+    if (earlyStop && promptToRestore) {
+      // Restore the prompt to composer so user can edit + resubmit. Same UX
+      // as desktop ClaudeSDKTab.onCancel "(B) assistant emitted nothing".
+      // setText accepts a value or updater — use updater so a partial typing
+      // by the user (rare race: typed something between stop tap and now)
+      // is preserved as a prefix.
+      setText((prev) => prev ? promptToRestore + '\n\n' + prev : promptToRestore);
+    }
+    pendingPromptRef.current = null;
+    assistantStartedThisTurnRef.current = false;
   };
 
   const isTerminal = tab.tabType !== 'claude-sdk';
@@ -1365,11 +1574,19 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
   // Context window per model: 1M for opus-4-7, 200K otherwise. Pulled from
   // the model id the API actually returned (not the user-selected alias) so
   // silent downgrades show the correct window.
+  //
+  // Show USED %, not remaining. Old formula (100 - used/window*100) showed
+  // 92% at start of chat = "92% remaining" — but users read "92%" as "92%
+  // full" and got confused. New formula matches mental model: 8% near start,
+  // 92% near end. Color escalates with usage:
+  //   < 75% → muted grey (plenty of room)
+  //   75-90% → amber (consider /compact)
+  //   > 90% → red (about to overflow)
   const contextWindow = (resolvedModel || '').includes('opus-4-7') ? 1_000_000 : 200_000;
-  const contextPercent = usedTokens != null ? Math.max(0, Math.min(100, 100 - (usedTokens / contextWindow) * 100)) : null;
+  const contextPercent = usedTokens != null ? Math.max(0, Math.min(100, (usedTokens / contextWindow) * 100)) : null;
   const contextColor = contextPercent == null ? '#666'
-    : contextPercent < 10 ? '#ef4444'
-    : contextPercent < 25 ? '#f59e0b'
+    : contextPercent > 90 ? '#ef4444'
+    : contextPercent > 75 ? '#f59e0b'
     : '#7a7a7a';
 
   return (
@@ -1544,8 +1761,39 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
             data={entries}
             firstItemIndex={firstItemIndex}
             initialTopMostItemIndex={Math.max(0, entries.length - 1)}
-            followOutput={(isAtBottom) => isAtBottom ? 'smooth' : false}
-            atBottomStateChange={setAtBottom}
+            followOutput={(isAtBottom) => {
+              // Telemetry: did virtuoso decide to autofollow on this update?
+              // 'smooth' value here causes a programmatic scroll which IS the
+              // backward-jerk if isAtBottom is true at a moment when the user
+              // is actually scrolling up (race: atBottomStateChange hasn't
+              // fired yet for the new position).
+              scrollDiag('followOutput', { isAtBottom, returned: isAtBottom ? 'smooth' : false, len: entries.length });
+              return isAtBottom ? 'smooth' : false;
+            }}
+            atBottomStateChange={(b) => {
+              scrollDiag('atBottomStateChange', { atBottom: b });
+              setAtBottom(b);
+            }}
+            isScrolling={(s) => {
+              // Snap a marker every time scroll-state flips. If we then see a
+              // [ScrollDiag] flushReducer immediately after `isScrolling=true`,
+              // the React state-update is the suspect.
+              scrollDiag('isScrolling', { isScrolling: s });
+            }}
+            // Track raw scrollTop on every onScroll — needed to detect
+            // backward jumps. We log the delta vs last seen position; large
+            // negative deltas == "got jerked back".
+            onScroll={(ev) => {
+              const target = ev.target as HTMLElement;
+              const top = target?.scrollTop ?? 0;
+              const last = (lastScrollTopRef.current ?? top);
+              const delta = top - last;
+              lastScrollTopRef.current = top;
+              // Log only meaningful deltas (>10px). Backward jumps tagged.
+              if (Math.abs(delta) > 10) {
+                scrollDiag('scroll', { top, delta, height: target?.scrollHeight, force: delta < -20 });
+              }
+            }}
             atBottomThreshold={120}
             increaseViewportBy={{ top: 800, bottom: 800 }}
             // skipAnimationFrameInResizeObserver: virtuoso #1049 — Safari
@@ -1557,13 +1805,16 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
               <div
                 data-entry-uuid={(entry as any).entryUuid || undefined}
                 style={{
-                  // content-visibility: auto lets the browser skip style/layout/
-                  // paint for off-screen items entirely. Free win on iOS 18+
-                  // (Safari 18.0, Sept 2024). contain-intrinsic-size gives the
-                  // browser a placeholder size so scrollbars don't jump as
-                  // items render — 200px is a soft estimate for a chat bubble.
-                  contentVisibility: 'auto' as any,
-                  containIntrinsicSize: '0 200px' as any,
+                  // NO content-visibility:auto here — incompatible with virtuoso.
+                  // Virtuoso uses ResizeObserver to learn each item's real
+                  // height and cache it. content-visibility:auto reports the
+                  // FAKE contain-intrinsic-size (200px) for off-screen items,
+                  // so when the user scrolls up and a previously-off-screen
+                  // 600px assistant text "wakes up", virtuoso suddenly learns
+                  // the real height → recomputes total list size → bumps
+                  // scrollTop → user sees the chat jerk backward as they scroll.
+                  // Virtuoso already keeps DOM bounded; content-visibility is
+                  // pure overhead here that breaks measurements.
                   background: flashUuid && ((entry as any).entryUuid === flashUuid || (entry as any).entryUuid?.startsWith(flashUuid.slice(0, 8)))
                     ? 'rgba(255,178,130,0.18)'
                     : 'transparent',
@@ -1594,6 +1845,37 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
           onStop={stop}
           onPickPrompt={(content) => setText((prev) => prev ? `${prev}\n\n${content}` : content)}
         />
+      )}
+      {readOnly && tab.claudeSessionId && tab.tabType !== 'claude-sdk' && (
+        <div style={{
+          borderTop: '1px solid #1f1f1f',
+          background: '#0e0e0e',
+          padding: '10px 14px max(10px, env(safe-area-inset-bottom)) 14px',
+        }}>
+          <button
+            onClick={onForkToSDK}
+            disabled={forking}
+            style={{
+              width: '100%', padding: '14px 18px',
+              borderRadius: 14, border: 'none',
+              background: forking ? '#2a2a2a' : '#DA7756',
+              color: forking ? '#666' : '#1a1a1a',
+              fontSize: 15, fontWeight: 600, cursor: forking ? 'default' : 'pointer',
+              display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8,
+              touchAction: 'manipulation',
+            }}
+            title="Fork this Claude session into a new SDK chat"
+          >
+            {forking ? (
+              <>
+                <span style={S.dot} /> <span style={S.dot} /> <span style={S.dot} />
+                <span>Forking…</span>
+              </>
+            ) : (
+              <>↗ Fork to SDK chat</>
+            )}
+          </button>
+        </div>
       )}
       {tab.tabId && (
         <TimelineDrawer
@@ -1831,6 +2113,11 @@ function Composer({ text, setText, busy, onSend, onStop, onPickPrompt }: {
   onPickPrompt: (content: string) => void;
 }) {
   const taRef = useRef<HTMLTextAreaElement>(null);
+  // True only when textarea content overflows the 40vh cap. Used to toggle
+  // overflowY: hidden|auto so a single-line input never shows a scrollbar
+  // (visual noise), but a multi-line dump gets an explicit orange scroll
+  // track that the user can grab. Separate from the chat-history scrollbar.
+  const [hasScroll, setHasScroll] = useState(false);
 
   // Autogrow: set height = scrollHeight, capped at 40vh. Resets to single-row
   // baseline when text is empty (otherwise textarea sticks at last grown size).
@@ -1839,8 +2126,10 @@ function Composer({ text, setText, busy, onSend, onStop, onPickPrompt }: {
     if (!ta) return;
     ta.style.height = 'auto';
     const max = Math.round(window.innerHeight * 0.4);
-    const next = Math.min(ta.scrollHeight, max);
+    const sh = ta.scrollHeight;
+    const next = Math.min(sh, max);
     ta.style.height = next + 'px';
+    setHasScroll(sh > max);
   }, [text]);
 
   return (
@@ -1856,15 +2145,23 @@ function Composer({ text, setText, busy, onSend, onStop, onPickPrompt }: {
         onChange={(e) => setText(e.target.value)}
         placeholder={busy ? 'Claude is replying…' : 'Message Claude…'}
         rows={1}
+        className={hasScroll ? 'composer-textarea composer-textarea--scroll' : 'composer-textarea'}
         style={{
           width: '100%', minHeight: 36,
           background: '#1a1a1a',
-          border: '1px solid #2a2a2a',
+          // Permanent orange ring — user reads "this is THE input, type here"
+          // at a glance, no matter where the focus currently lives (history
+          // selection, off-screen, blurred by iOS keyboard close, etc.).
+          // Box-shadow gives a subtle outer glow so the field reads as the
+          // primary affordance without screaming.
+          border: '1px solid #FFB382',
+          boxShadow: '0 0 0 1px rgba(255,178,130,0.25)',
           borderRadius: 14,
           padding: '10px 14px',
           fontSize: 15, lineHeight: 1.4,
           color: '#e0e0e0', outline: 'none',
           resize: 'none',
+          overflowY: hasScroll ? 'auto' : 'hidden',
         }}
         onKeyDown={(e) => {
           if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
@@ -2198,16 +2495,14 @@ function TimelineDrawer({ open, entries, expanded, onToggle, onGoTo, onDismiss }
   onGoTo: (uuid: string) => void;
   onDismiss: () => void;
 }) {
-  const drawerScrollRef = useRef<HTMLDivElement>(null);
-  const [showDrawerDown, setShowDrawerDown] = useState(false);
-  const onDrawerScroll = () => {
-    const el = drawerScrollRef.current;
-    if (!el) return;
-    setShowDrawerDown(el.scrollHeight - el.scrollTop - el.clientHeight > 200);
-  };
+  // Virtualize via Virtuoso — same reason as the chat list. On a session with
+  // 5000 timeline entries the previous `entries.map(...)` rendered 5000 DOM
+  // nodes synchronously, killed Safari with OOM. Virtuoso keeps ~30 mounted.
+  const virtuosoRef = useRef<VirtuosoHandle | null>(null);
+  const [drawerAtBottom, setDrawerAtBottom] = useState<boolean>(true);
   const drawerScrollDown = () => {
-    const el = drawerScrollRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
+    if (!entries || entries.length === 0) return;
+    virtuosoRef.current?.scrollToIndex({ index: entries.length - 1, align: 'end', behavior: 'auto' });
   };
 
   return (
@@ -2244,34 +2539,38 @@ function TimelineDrawer({ open, entries, expanded, onToggle, onGoTo, onDismiss }
           </div>
           <button onClick={onDismiss} className="noted-icon" style={S.iconBtn}>✕</button>
         </div>
-        <div
-          ref={drawerScrollRef}
-          onScroll={onDrawerScroll}
-          style={{
-          flex: 1, overflowY: 'auto', padding: '8px 0',
-          // Tell iOS this is a vertical-scroll surface so it commits to pan
-          // immediately on touch instead of waiting to disambiguate from tap.
-          touchAction: 'pan-y',
-          WebkitOverflowScrolling: 'touch' as any,
-          position: 'relative',
-        }}>
+        <div style={{ flex: 1, minHeight: 0, position: 'relative' }}>
           {entries == null && (
             <div style={{ padding: 32, color: '#666', fontSize: 12, textAlign: 'center' }}>Loading timeline…</div>
           )}
           {entries && entries.length === 0 && (
             <div style={{ padding: 16, color: '#555', fontSize: 12, textAlign: 'center' }}>Empty timeline.</div>
           )}
-          {entries?.map((e) => (
-            <TimelineEntryRow
-              key={e.uuid}
-              entry={e}
-              expanded={expanded.has(e.uuid)}
-              onToggle={() => onToggle(e.uuid)}
-              onGoTo={() => onGoTo(e.uuid)}
+          {entries && entries.length > 0 && (
+            <Virtuoso
+              ref={virtuosoRef}
+              data={entries}
+              atBottomStateChange={setDrawerAtBottom}
+              atBottomThreshold={200}
+              increaseViewportBy={{ top: 600, bottom: 600 }}
+              skipAnimationFrameInResizeObserver
+              computeItemKey={(_index, e) => e.uuid}
+              itemContent={(_index, e) => (
+                // No content-visibility — same incompatibility with virtuoso
+                // as in the chat list. Timeline rows have variable expanded
+                // height; cv:auto would clobber virtuoso's measurements.
+                <TimelineEntryRow
+                  entry={e}
+                  expanded={expanded.has(e.uuid)}
+                  onToggle={() => onToggle(e.uuid)}
+                  onGoTo={() => onGoTo(e.uuid)}
+                />
+              )}
+              style={{ height: '100%' }}
             />
-          ))}
+          )}
         </div>
-        <ScrollToBottomFAB visible={showDrawerDown} onClick={drawerScrollDown} side="left" bottomOffset={20} />
+        <ScrollToBottomFAB visible={!drawerAtBottom && !!entries && entries.length > 0} onClick={drawerScrollDown} side="left" bottomOffset={20} />
       </div>
     </div>
   );
@@ -2391,6 +2690,59 @@ function Empty({ children }: { children: any }) {
 // outlined-italic container with brain icon. User text > 600 chars collapses
 // to 400 with "Раскрыть полностью". Nothing truncates with ellipsis — it
 // collapses with toggle, so info density isn't lost.
+//
+// MODULE-LEVEL EXPANDED STATE — survives virtuoso re-mounts.
+// react-virtuoso unmounts items that scroll out of viewport. Local useState
+// inside ThinkingCard/ToolCard would reset every time the user scrolled away
+// and back, undoing their collapse/expand action. Storing per-id in a module
+// Map keeps the user choice across mounts. Default value is computed lazily
+// at first render of each entry; subsequent renders read from the Map.
+// Cleared automatically when ChatView unmounts (via clearEntryExpanded).
+const _entryExpanded: Map<string, boolean> = new Map();
+function getEntryExpanded(id: string, defaultOpen: boolean): boolean {
+  const v = _entryExpanded.get(id);
+  if (v === undefined) {
+    _entryExpanded.set(id, defaultOpen);
+    return defaultOpen;
+  }
+  return v;
+}
+function setEntryExpanded(id: string, v: boolean) { _entryExpanded.set(id, v); }
+// Drop entries no longer in the active view. Called from ChatView unmount —
+// without this the maps grow forever (10 chats × 5000 entries × N opens =
+// ~50K keys after a few days of use). Keys for OTHER tabs that the user might
+// re-open are intentionally kept; we only drop the entry-ids for the current
+// chat's entries since those will get fresh defaults next mount anyway.
+function clearEntryExpandedForIds(ids: Iterable<string>) {
+  for (const id of ids) {
+    _entryExpanded.delete(id);
+    _entryToggleVersion.delete(id);
+    _entryToggleListeners.delete(id);
+  }
+}
+// Force a hook-driven re-read so toggles trigger re-render. Each card uses
+// a thin wrapper hook that subscribes to a per-id counter — bumping it forces
+// React to re-evaluate. This is simpler than a Zustand store for one-off
+// toggle state and doesn't pull in any extra deps.
+const _entryToggleVersion: Map<string, number> = new Map();
+const _entryToggleListeners: Map<string, Set<() => void>> = new Map();
+function useEntryExpanded(id: string, defaultOpen: boolean): [boolean, (v: boolean) => void] {
+  const [, force] = useState(0);
+  useEffect(() => {
+    const listeners = _entryToggleListeners.get(id) ?? new Set();
+    const cb = () => force((n) => n + 1);
+    listeners.add(cb);
+    _entryToggleListeners.set(id, listeners);
+    return () => { listeners.delete(cb); };
+  }, [id]);
+  const open = getEntryExpanded(id, defaultOpen);
+  const set = useCallback((v: boolean) => {
+    setEntryExpanded(id, v);
+    _entryToggleVersion.set(id, (_entryToggleVersion.get(id) ?? 0) + 1);
+    _entryToggleListeners.get(id)?.forEach((cb) => cb());
+  }, [id]);
+  return [open, set];
+}
 
 function EntryView({ entry }: { entry: UiEntry }) {
   if (entry.kind === 'user') {
@@ -2413,7 +2765,7 @@ function EntryView({ entry }: { entry: UiEntry }) {
     );
   }
   if (entry.kind === 'thinking') {
-    return <ThinkingCard text={entry.text} />;
+    return <ThinkingCard id={entry.id} text={entry.text} />;
   }
   if (entry.kind === 'assistant') {
     // Assistant fills the full chat width — no bubble cap. Tools/MCP do too,
@@ -2435,6 +2787,36 @@ function EntryView({ entry }: { entry: UiEntry }) {
   if (entry.kind === 'tool') {
     return <ToolCard entry={entry} />;
   }
+  if (entry.kind === 'slash') {
+    // Violet chip — right-aligned like a user prompt but compact and one-line.
+    // Mirror of desktop UserMsg isSlashCommand branch (rgba(129,140,248,*)).
+    // Distinct color from user-bubble's blue/orange so it reads as "system
+    // action, not regular prompt".
+    return (
+      <div
+        data-entry-uuid={entry.entryUuid}
+        style={{ display: 'flex', justifyContent: 'flex-end', padding: '4px 12px' }}
+      >
+        <div style={{
+          display: 'inline-flex', alignItems: 'center',
+          padding: '4px 10px', borderRadius: 8,
+          background: 'rgba(129, 140, 248, 0.10)',
+          color: '#a5b4fc',
+          border: '1px solid rgba(129, 140, 248, 0.28)',
+          fontSize: 13,
+          fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+          userSelect: 'none',
+          maxWidth: '85%',
+          wordBreak: 'break-all',
+        }}>
+          {entry.text}
+        </div>
+      </div>
+    );
+  }
+  if (entry.kind === 'compact-summary') {
+    return <CompactSummaryCard entry={entry} />;
+  }
   if (entry.kind === 'error') {
     return (
       <div style={{ padding: '4px 12px' }}>
@@ -2443,6 +2825,71 @@ function EntryView({ entry }: { entry: UiEntry }) {
     );
   }
   return null;
+}
+
+// Compact-summary card — orange "Compact summary" header + collapsible long
+// body. Mirrors desktop CompactSummaryMsg layout but mobile-tuned (smaller
+// font, no JetBrainsMono — system body text). 600-char preview matches the
+// desktop COMPACT_COLLAPSED_CHARS.
+const COMPACT_PREVIEW_CHARS = 600;
+function CompactSummaryCard({ entry }: { entry: UiEntry & { kind: 'compact-summary' } }) {
+  const [open, setOpen] = useEntryExpanded(entry.id, false);
+  const text = entry.text || '';
+  const metrics = entry.metrics;
+  const needsCollapse = text.length > COMPACT_PREVIEW_CHARS;
+  const preview = text.slice(0, COMPACT_PREVIEW_CHARS).trimEnd();
+  const k = (n: number) => n >= 1000 ? (n / 1000).toFixed(1) + 'K' : String(n);
+  const s = metrics ? Math.round(metrics.durationMs / 1000) : 0;
+  const toggle = needsCollapse ? (
+    <button
+      onClick={() => setOpen(!open)}
+      style={{
+        background: 'transparent', border: 'none', cursor: 'pointer',
+        color: '#FFB382', fontSize: 12, padding: 0,
+        textAlign: 'left', marginTop: 6,
+      }}
+    >
+      {open ? 'Свернуть' : `Раскрыть полностью (${text.length.toLocaleString()} символов)`}
+    </button>
+  ) : null;
+  return (
+    <div data-entry-uuid={entry.entryUuid} style={{ padding: '6px 12px' }}>
+      <div style={{
+        background: 'rgba(218, 119, 86, 0.06)',
+        border: '1px solid rgba(218, 119, 86, 0.30)',
+        borderRadius: 12,
+        padding: '10px 12px',
+      }}>
+        <div style={{
+          display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10,
+          marginBottom: 8,
+        }}>
+          <span style={{
+            fontSize: 11, fontWeight: 700, letterSpacing: 0.5,
+            color: '#DA7756', textTransform: 'uppercase',
+          }}>
+            Compact summary
+          </span>
+          {metrics && (
+            <span style={{
+              fontSize: 10, color: '#a87356',
+              fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+            }}>
+              {k(metrics.preTokens)} → {k(metrics.postTokens)} · {s}s
+            </span>
+          )}
+        </div>
+        <div style={{
+          color: '#d4d4d4',
+          fontSize: 13, lineHeight: 1.45,
+          whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+        }}>
+          {needsCollapse && !open ? preview + '…' : text}
+        </div>
+        {toggle}
+      </div>
+    </div>
+  );
 }
 
 // CollapsibleText — preview + toggle, never ellipsis. Same pattern as
@@ -2462,7 +2909,7 @@ function CollapsibleText({ text, threshold, previewSize }: { text: string; thres
           color: '#FFB382', fontSize: 11, padding: 0,
         }}
       >
-        {open ? 'Свернуть' : `Раскрыть полностью (${text.length} символов)`}
+        {open ? 'Свернуть' : `Раскрыть полностью (${text.split('\n').length} строк)`}
       </button>
     </>
   );
@@ -2486,8 +2933,11 @@ function Markdown({ text }: { text: string }) {
 // Header is the click target (chevron toggle); body is italic muted text.
 // Default open while there's no body yet (streaming) — collapses easily once
 // the user has read it.
-function ThinkingCard({ text }: { text: string }) {
-  const [open, setOpen] = useState(true);
+function ThinkingCard({ id, text }: { id: string; text: string }) {
+  // Default COLLAPSED to match desktop. Expanded state stored in module-level
+  // map keyed by entry id, so virtuoso re-mounts (scroll-out → scroll-back)
+  // preserve the user's choice. See useEntryExpanded comment block above.
+  const [open, setOpen] = useEntryExpanded(id, false);
   return (
     <div style={{ padding: '4px 12px' }}>
       <div style={{
@@ -2533,7 +2983,9 @@ function ThinkingCard({ text }: { text: string }) {
 function ToolCard({ entry }: { entry: UiEntry & { kind: 'tool' } }) {
   const isPending = entry.result === undefined;
   const isError = entry.isError;
-  const [open, setOpen] = useState(true);
+  // Default OPEN only for errors / pending. After completion → COLLAPSED.
+  // State persists across virtuoso re-mounts via module-level Map.
+  const [open, setOpen] = useEntryExpanded(entry.id, isError || isPending);
   const statusColor = isError ? '#f38ba8' : isPending ? '#FFB382' : '#a6e3a1';
   const tool = entry.tool;
   const input = entry.input || {};
@@ -2865,6 +3317,30 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
 .md-body th, .md-body td { border: 1px solid #2a2a2a; padding: 4px 8px; }
 .md-body th { background: #1a1a1a; color: #cdd6f4; }
 ::-webkit-scrollbar { width: 0; height: 0; }
+
+/* Composer textarea — orange scrollbar appears ONLY when content exceeds the
+   40vh cap (class added in JS). Default state: zero-width scrollbar so a
+   one-line input has no visual noise. Override the global ::-webkit-scrollbar
+   {width:0} rule above for this specific element. */
+.composer-textarea--scroll::-webkit-scrollbar {
+  width: 6px;
+}
+.composer-textarea--scroll::-webkit-scrollbar-track {
+  background: transparent;
+  margin: 4px 0;
+}
+.composer-textarea--scroll::-webkit-scrollbar-thumb {
+  background: #FFB382;
+  border-radius: 3px;
+}
+.composer-textarea--scroll::-webkit-scrollbar-thumb:hover {
+  background: #ffc59a;
+}
+/* Firefox */
+.composer-textarea--scroll {
+  scrollbar-width: thin;
+  scrollbar-color: #FFB382 transparent;
+}
 `;
   document.head.appendChild(style);
 }

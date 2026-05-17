@@ -173,6 +173,18 @@
 
 .animate-slide-in { animation: slide-in 0.3s ease-out forwards; }
 
+/* Reopen-tab pulse: subtle TabBar background flash fired synchronously on
+   Shift+Cmd+T keydown. Two ~300ms cycles, base color matches TabBar bg so the
+   flash is "lighter than baseline" rather than a colour swap — reads as a
+   gentle indicator, not an alert. Uses background-color (not opacity) per the
+   project's AI-Optimized UI rule — opacity-only animations are eaten by
+   H.264/JPEG codecs on screen recordings. */
+@keyframes reopen-pulse {
+  0%, 100% { background-color: rgba(255, 255, 255, 0); }
+  50%      { background-color: rgba(255, 255, 255, 0.05); }
+}
+.animate-reopen-pulse { animation: reopen-pulse 0.3s ease-in-out 2; }
+
 @keyframes tab-dot-spin {
   to { transform: rotate(360deg); }
 }
@@ -180,6 +192,21 @@
 @keyframes fadeIn {
   from { opacity: 0; transform: translateY(-4px); }
   to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes sdk-compact-bar {
+  0%   { left: -40%; }
+  100% { left: 100%; }
+}
+
+@keyframes sdk-cold-loader-fade {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
 }
 
 .terminal-wrapper {

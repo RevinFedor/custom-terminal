@@ -346,7 +346,6 @@ export default function TabNotesSlideout({ activeTabId }: TabNotesSlideoutProps)
                 wordWrap={wordWrap}
                 showLineNumbers={false}
                 compact
-                foldStateKey={`tab-notes-slideout:${activeTabId}`}
               />
             </div>
           </div>

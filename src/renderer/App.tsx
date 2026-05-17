@@ -12,6 +12,7 @@ import EditProjectModal from './components/UI/EditProjectModal';
 import SessionInputModal from './components/UI/SessionInputModal';
 import SettingsModal from './components/UI/SettingsModal';
 import Tooltip from './components/UI/Tooltip';
+import PromptPickerOverlay from './components/Workspace/PromptPickerOverlay';
 // Drag and drop
 import { draggable, dropTargetForElements, monitorForElements } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
 import { attachClosestEdge, extractClosestEdge, type Edge } from '@atlaskit/pragmatic-drag-and-drop-hitbox/closest-edge';
@@ -20,6 +21,7 @@ import { combine } from '@atlaskit/pragmatic-drag-and-drop/combine';
 // Initialize debug logger (exposes `debug` helper in console)
 import './utils/logger';
 import { usePromptQueueRunner } from './hooks/usePromptQueueRunner';
+import { hydratePromptQueueStore } from './store/usePromptQueueStore';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -341,6 +343,11 @@ function App() {
   // and kill the runner). See hooks/usePromptQueueRunner.ts comment for the bug
   // it fixes (auto-run silently breaking the moment user goes to another tab).
   usePromptQueueRunner();
+
+  // Hydrate persisted queues from SQLite once at boot. Fire-and-forget — the
+  // runner above tolerates queue items appearing after mount (subscribes to
+  // store deltas), so this doesn't need to block render.
+  useEffect(() => { hydratePromptQueueStore(); }, []);
 
   // Individual selectors — only re-render when specific values change (not on every store mutation)
   const view = useWorkspaceStore((s) => s.view);
@@ -814,10 +821,26 @@ function App() {
       }
     };
 
+    // Resolve projectId by walking openProjects.tabs.has(tabId). Used by
+    // PTY-respawn paths that only have tabId+cwd (no projectId hint).
+    const findProjectIdByTabId = (tabId: string): string | null => {
+      const state = useWorkspaceStore.getState();
+      for (const [pid, ws] of state.openProjects) {
+        if (ws.tabs.has(tabId)) return pid;
+      }
+      return null;
+    };
+
     // MCP respawn PTY for dead sub-agent (continue_claude needs a live PTY)
     const handleRespawnSubAgentPty = (_: any, data: { tabId: string; cwd: string }) => {
       console.warn('[MCP:Respawn] Creating PTY for dead sub-agent tab:', data.tabId);
-      ipcRenderer.invoke('terminal:create', { tabId: data.tabId, cwd: data.cwd, rows: 32, cols: 96 });
+      ipcRenderer.invoke('terminal:create', {
+        tabId: data.tabId,
+        projectId: findProjectIdByTabId(data.tabId),
+        cwd: data.cwd,
+        rows: 32,
+        cols: 96,
+      });
     };
 
     // Gemini auto-spawn: main process requests Gemini launch (adopt flow)
@@ -837,6 +860,7 @@ function App() {
       console.warn('[MCP:Terminal] Restarting PTY for tab:', data.tabId, 'cmd:', data.initialCommand || '(shell)');
       ipcRenderer.invoke('terminal:create', {
         tabId: data.tabId,
+        projectId: findProjectIdByTabId(data.tabId),
         cwd: data.cwd,
         rows: 24,
         cols: 80,
@@ -845,14 +869,52 @@ function App() {
     };
 
     // Terminal MCP: create a new tab with optional command
-    const handleMcpCreate = async (_: any, data: { name?: string; cwd: string; command?: string; color?: string }) => {
-      console.warn('[MCP:Terminal] Creating new tab:', data.name || 'auto', 'cwd:', data.cwd);
+    //
+    // Routing priority:
+    //   1. data.parentProjectId — authoritative project id propagated from
+    //      Claude's PTY env (NOTED_PARENT_PROJECT_ID). Wins unconditionally.
+    //   2. cwd longest-prefix match against open projects' projectPath. Old
+    //      cwd-based fallback for callers without parent id.
+    //   3. activeProjectId fallback only when nothing else owns the cwd —
+    //      covers helper scripts/cwds outside any open project.
+    // Без (1) сценарий: юзер смотрит на проект A, Claude бежит в B (внутри
+    // того же инстанса), MCP create_tab отправляется → таб уходит в A (по
+    // activeProjectId) или вообще в Default, потому что cwd может совпадать.
+    const handleMcpCreate = async (_: any, data: { name?: string; cwd: string; command?: string; color?: string; parentProjectId?: string }) => {
+      console.warn('[MCP:Terminal] Creating new tab:', data.name || 'auto', 'cwd:', data.cwd, 'parentProjectId:', data.parentProjectId || '-');
       const state = useWorkspaceStore.getState();
-      const { activeProjectId } = state;
-      if (!activeProjectId) return;
+      let targetProjectId: string | null = null;
+
+      if (data.parentProjectId) {
+        if (state.openProjects.has(data.parentProjectId)) {
+          targetProjectId = data.parentProjectId;
+        } else {
+          console.warn('[MCP:Terminal] parentProjectId=' + data.parentProjectId + ' not in openProjects, falling back to cwd routing');
+        }
+      }
+
+      if (!targetProjectId) {
+        let bestMatchLen = -1;
+        for (const [pid, ws] of state.openProjects) {
+          const p = (ws as any).projectPath;
+          if (typeof p !== 'string' || !p || p.startsWith('__unset__')) continue;
+          // exact or prefix match (data.cwd inside this open project)
+          if (data.cwd === p || data.cwd.startsWith(p + '/')) {
+            if (p.length > bestMatchLen) {
+              bestMatchLen = p.length;
+              targetProjectId = pid;
+            }
+          }
+        }
+      }
+
+      // Fallback to activeProjectId only when no open project owns this cwd —
+      // covers free-form cwds (helper scripts, /tmp work) that don't belong to any tab.
+      if (!targetProjectId) targetProjectId = state.activeProjectId;
+      if (!targetProjectId) return;
 
       const pendingAction = data.command ? { type: 'shell-command' as const, command: data.command } : undefined;
-      await state.createTab(activeProjectId, data.name, data.cwd, {
+      await state.createTab(targetProjectId, data.name, data.cwd, {
         commandType: data.command ? 'devServer' : undefined,
         color: (data.color || (data.command ? 'green' : undefined)) as any,
         pendingAction,
@@ -907,8 +969,13 @@ function App() {
           window.dispatchEvent(new CustomEvent('claude-sdk:external-prompt', {
             detail: { tabId, text: prompt, source: 'web' },
           }));
+          // resumeSessionId from the store — without this main reads its
+          // in-memory sdkSessions Map which is wiped between turns, every
+          // mobile prompt would start a fresh sessionId and lose all context.
+          // See knowledge/fix-sdk-session-amnesia.md.
           const result = await ipcRenderer.invoke('claude-sdk:send-message', {
             tabId, cwd: sendCwd, prompt, model: sendModel, effort: sendEffort, thinking: sendThinking,
+            resumeSessionId: tab?.claudeSessionId || null,
           });
           return reply(!!result?.success, result, result?.error);
         }
@@ -956,6 +1023,20 @@ function App() {
           }
           return reply(true, { tabId, claudeSessionId: null, cwd: null });
         }
+        if (action === 'truncateHistory') {
+          const { tabId, targetUuid } = payload || {};
+          if (!tabId || !targetUuid) return reply(false, null, 'tabId+targetUuid required');
+          let sid: string | undefined, tabCwd: string | undefined;
+          for (const ws of state.openProjects.values()) {
+            const t = ws.tabs.get(tabId);
+            if (t) { sid = t.claudeSessionId; tabCwd = t.cwd; break; }
+          }
+          if (!sid) return reply(false, null, 'no session for tab');
+          const result = await ipcRenderer.invoke('claude-sdk:truncate-history', {
+            sessionId: sid, cwd: tabCwd, targetUuid,
+          });
+          return reply(!!result?.success, result, result?.error);
+        }
         if (action === 'forkToSDK') {
           const { tabId: srcTabId } = payload || {};
           if (!srcTabId) return reply(false, null, 'tabId required');
@@ -975,7 +1056,14 @@ function App() {
           if (!fork?.success) return reply(false, null, fork?.error || 'fork failed');
           const newTabId = await state.createSDKTab(projectId);
           state.updateSDKState(newTabId, { claudeSessionId: fork.newSessionId });
-          return reply(true, { tabId: newTabId, sessionId: fork.newSessionId, projectId });
+          // Carry source tab name → new SDK tab. User explicitly asked: "fork
+          // creates same name, only background indicates SDK". The 'CLAUDE'
+          // pill on the row already signals SDK-ness; copying the name keeps
+          // mental continuity ("same convo, just SDK now").
+          if (srcTab?.name && typeof srcTab.name === 'string') {
+            try { await state.renameTab(projectId, newTabId, srcTab.name); } catch {}
+          }
+          return reply(true, { tabId: newTabId, sessionId: fork.newSessionId, projectId, name: srcTab?.name });
         }
         if (action === 'closeTab') {
           const { tabId } = payload || {};
@@ -1160,6 +1248,49 @@ function App() {
         ipcRenderer.invoke('semantic-index:unwatch', { projectId }).catch(() => {});
       }
     };
+  }, []);
+
+  // Tell main process which projects are currently open in this instance so the
+  // standalone MCP server (terminal-server.mjs) can route requests by parentProjectId
+  // (preferred) or CLAUDE_PROJECT_DIR (fallback) to the right instance. Without this,
+  // dev + prod copies both write port files and MCP picks whichever was modified last —
+  // calls land in the wrong window.
+  useEffect(() => {
+    const collect = () => {
+      const seenPaths = new Set<string>();
+      const paths: string[] = [];
+      const projects: Array<{ id: string; path: string; name: string }> = [];
+      const projectsStore = useProjectsStore.getState();
+      for (const [pid, ws] of useWorkspaceStore.getState().openProjects) {
+        const p = (ws as any).projectPath;
+        if (typeof p === 'string' && p && !p.startsWith('__unset__') && !seenPaths.has(p)) {
+          seenPaths.add(p);
+          paths.push(p);
+        }
+        // Always include the project entry by id+path even if path is placeholder.
+        // MCP needs id-routing for projects that exist but have no real cwd.
+        const proj = (projectsStore.projects as any)[pid];
+        projects.push({
+          id: pid,
+          path: typeof p === 'string' ? p : '',
+          name: proj?.name || '',
+        });
+      }
+      return { paths, projects };
+    };
+    let lastKey = '';
+    const push = () => {
+      const { paths, projects } = collect();
+      const key = paths.join('|') + '#' + projects.map(p => p.id + ':' + p.path).join('|');
+      if (key === lastKey) return;
+      lastKey = key;
+      // Legacy receiver expects array; new receiver reads { paths, projects } from second arg.
+      ipcRenderer.send('mcp:open-project-paths', paths, { projects });
+    };
+    push();
+    const unsubA = useWorkspaceStore.subscribe(push);
+    const unsubB = useProjectsStore.subscribe(push);
+    return () => { unsubA(); unsubB(); };
   }, []);
 
   // Monitor drag-and-drop for project tabs reordering
@@ -1396,9 +1527,58 @@ function App() {
         }
         return;
       }
+
     };
 
     window.addEventListener('keydown', handleKeyDown);
+
+    // Opt+V (primary) and Cmd+E (alias) — open the custom prompt picker
+    // (two-column flyout). Layout-agnostic via e.code, so works on Cyrillic /
+    // QWERTY / Dvorak. Registered as CAPTURE so it fires before xterm's
+    // customKeyEventHandler and before assistant-ui's composer textarea (both
+    // of which see Opt+V first and would otherwise emit `√` on Mac, or
+    // Cmd+E would otherwise still trigger any leftover textarea behaviour).
+    const handlePickerOpenCapture = (e: KeyboardEvent) => {
+      if (view !== 'workspace') return;
+      const isOptV = e.altKey && !e.metaKey && !e.ctrlKey && !e.shiftKey && e.code === 'KeyV';
+      const isCmdE = e.metaKey && !e.altKey && !e.ctrlKey && !e.shiftKey && e.code === 'KeyE';
+      if (!isOptV && !isCmdE) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const cur = useUIStore.getState().promptPickerOpen;
+      useUIStore.getState().setPromptPickerOpen(!cur);
+    };
+    window.addEventListener('keydown', handlePickerOpenCapture, true);
+
+    // Shift+Cmd+T — reopen last closed tab in active project (VS Code-style).
+    // Same capture-phase pattern as Opt+V: layout-agnostic via e.code, so the
+    // shortcut works on Cyrillic / QWERTY / Dvorak; stops propagation before
+    // xterm's customKeyEventHandler sees it (otherwise the literal `T` would
+    // land in the active terminal's PTY).
+    const handleReopenLastClosedCapture = (e: KeyboardEvent) => {
+      if (view !== 'workspace') return;
+      if (!(e.metaKey && e.shiftKey && !e.altKey && !e.ctrlKey && e.code === 'KeyT')) return;
+      e.preventDefault();
+      e.stopPropagation();
+      if (typeof (e as any).stopImmediatePropagation === 'function') {
+        (e as any).stopImmediatePropagation();
+      }
+      const ws = useWorkspaceStore.getState();
+      const activeProjectId = ws.activeProjectId;
+      if (!activeProjectId) return;
+      // Fire pulse SYNCHRONOUSLY before IPC — the user sees TabBar flash within
+      // the same frame as the keypress, even though createTab + claude-c resume
+      // can take 300-800ms. Without this, the hotkey feels deaf during the gap.
+      useUIStore.getState().triggerReopenPulse();
+      ws.reopenLastClosedTab(activeProjectId).then((res) => {
+        if (!res.tabId && res.reason === 'empty') {
+          showToast('Нет закрытых вкладок', 'info');
+        }
+      }).catch((err) => {
+        console.warn('[Reopen] failed:', err);
+      });
+    };
+    window.addEventListener('keydown', handleReopenLastClosedCapture, true);
 
     // Handle Context Menu commands from main process
     const handleContextMenuCommand = (_: any, cmd: string, data?: any) => {
@@ -1505,6 +1685,8 @@ function App() {
     return () => {
       window.removeEventListener('openProject', handleOpenProject);
       window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('keydown', handlePickerOpenCapture, true);
+      window.removeEventListener('keydown', handleReopenLastClosedCapture, true);
       ipcRenderer.removeListener('context-menu-command', handleContextMenuCommand);
     };
   }, [view, activeProjectId, filePreview, incrementAllFontSizes, decrementAllFontSizes, toggleResearch, activeArea, openProjects, setActiveArea]);
@@ -1723,13 +1905,14 @@ function App() {
       </div>
 
       {/* VSCode-style status bar — full width across terminal + sidebar */}
-      <StatusBar />
+      <StatusBar onOpenSettings={() => setSettingsOpen(true)} />
 
       {/* Global UI Components */}
       <ToastContainer />
       <EditProjectModal />
       <SessionInputModal />
       <SettingsModal isOpen={settingsOpen} onClose={() => setSettingsOpen(false)} />
+      <PromptPickerOverlay />
 
       {/* Project Context Menu */}
       {projectContextMenu && (

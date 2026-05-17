@@ -391,7 +391,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     x: number; y: number;
     range: { startIndex: number; endIndex: number };
     startUuid: string; endUuid: string;
-    crossesBoundary: boolean;  // range hit a compact or plan-mode boundary → auto-extended to start
+    crossesBoundary: boolean;  // range hit a compact or plan-mode boundary; popup keeps visual range and only Delete confirm auto-extends to 0
   } | null>(null);
   const [postPromptMode, setPostPromptMode] = useState(false);
   const [postPromptText, setPostPromptText] = useState('');
@@ -400,6 +400,12 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   const [deleteConfirmMode, setDeleteConfirmMode] = useState(false);
   // Animation state while delete IPC is running (red overlay over the range)
   const [deletingRange, setDeletingRange] = useState<{ startIndex: number; endIndex: number } | null>(null);
+  // Inline confirm for "Удалить запрос" inside contextMenu (single user-entry delete)
+  const [deleteEntryConfirmMode, setDeleteEntryConfirmMode] = useState(false);
+  // effect: contextMenu closes → reset entry-delete confirm (prevents reopening in confirm state)
+  useEffect(() => {
+    if (!contextMenu) setDeleteEntryConfirmMode(false);
+  }, [contextMenu]);
   // effect: rangeActionMenu closes → reset deleteConfirmMode (prevents next popup opening in confirm state)
   useEffect(() => {
     if (!rangeActionMenu) setDeleteConfirmMode(false);
@@ -407,6 +413,11 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
 
   // Ref to context-menu root so we can measure its rect for the hover-bridge test.
   const contextMenuRef = useRef<HTMLDivElement>(null);
+  // Refs to the other two fixed popups so we can re-clamp them post-mount when
+  // the cursor was near the bottom of the screen (otherwise their bottom edge
+  // slips below the viewport — same issue we fixed for contextMenu).
+  const editRangeLoadingMenuRef = useRef<HTMLDivElement>(null);
+  const rangeActionMenuRef = useRef<HTMLDivElement>(null);
 
   // effect: contextMenu open → mousemove listener closes menu when cursor leaves Timeline+menu+bridge rect (uses geometric hit-test instead of elementFromPoint)
   useEffect(() => {
@@ -435,6 +446,71 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     document.addEventListener('mousemove', onMove);
     return () => document.removeEventListener('mousemove', onMove);
   }, [contextMenu]);
+
+  // Re-clamp the context menu top using the menu's REAL post-render height.
+  // The initial position (setContextMenu in openContextMenu) uses a hardcoded
+  // `menuHeight` guess (40 or 90 px). That's wrong when the menu has more rows
+  // — e.g. note-editor open, or selection-mode buttons, etc — and the bottom
+  // edge then slips below the viewport. After mount we measure the real rect
+  // and shift `top` up if needed.
+  useLayoutEffect(() => {
+    if (!contextMenu) return;
+    const el = contextMenuRef.current;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    const margin = 10;
+    let desired = contextMenu.y;
+    if (r.top + r.height > window.innerHeight - margin) {
+      desired = window.innerHeight - r.height - margin;
+    }
+    if (desired < margin) desired = margin;
+    if (desired !== contextMenu.y) {
+      setContextMenu({ ...contextMenu, y: desired });
+    }
+    // contextMenu.y intentionally not a dep — would loop.
+  }, [contextMenu?.entry?.uuid, selectionStartId, deleteEntryConfirmMode]);
+
+  // Same clamp for the edit-range loading popup ("Прервать / Отмена").
+  // Set from `e.clientY` raw, no height guess. When cursor was near the very
+  // bottom of Timeline the two buttons get clipped by the viewport edge.
+  // Dep is `!!editRangeLoadingMenu` so the effect fires once per open/close
+  // toggle, not on every `y` update — the inner check prevents looping.
+  useLayoutEffect(() => {
+    if (!editRangeLoadingMenu) return;
+    const el = editRangeLoadingMenuRef.current;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    const margin = 10;
+    let desired = editRangeLoadingMenu.y;
+    if (r.top + r.height > window.innerHeight - margin) {
+      desired = window.innerHeight - r.height - margin;
+    }
+    if (desired < margin) desired = margin;
+    if (desired !== editRangeLoadingMenu.y) {
+      setEditRangeLoadingMenu({ ...editRangeLoadingMenu, y: desired });
+    }
+  }, [!!editRangeLoadingMenu]);
+
+  // Same clamp for the range-action popup (Удалить N записей / Копировать /
+  // Откатить). Initial clamp uses a hardcoded POPUP_H estimate; this corrects
+  // it to the real rendered height (deleteConfirmMode swaps the row set and
+  // changes vertical size, so the guess can be off by tens of pixels).
+  useLayoutEffect(() => {
+    if (!rangeActionMenu) return;
+    const el = rangeActionMenuRef.current;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    const margin = 10;
+    let desired = rangeActionMenu.y;
+    if (r.top + r.height > window.innerHeight - margin) {
+      desired = window.innerHeight - r.height - margin;
+    }
+    if (desired < margin) desired = margin;
+    if (desired !== rangeActionMenu.y) {
+      setRangeActionMenu({ ...rangeActionMenu, y: desired });
+    }
+  }, [rangeActionMenu?.range?.startIndex, rangeActionMenu?.range?.endIndex, deleteConfirmMode]);
+
   const [rewindPostPromptMode, setRewindPostPromptMode] = useState(false);
   const [rewindPostPromptText, setRewindPostPromptText] = useState('');
   const rewindPostPromptRef = useRef<HTMLTextAreaElement>(null);
@@ -448,6 +524,14 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   const notesPanelWidth = useUIStore(state => state.notesPanelWidth);
   const timelineTooltipWidth = useUIStore(state => state.timelineTooltipWidth);
   const setTimelineTooltipWidth = useUIStore(state => state.setTimelineTooltipWidth);
+  const timelineWidth = useUIStore(state => state.timelineWidth);
+  const setTimelineWidth = useUIStore(state => state.setTimelineWidth);
+  const timelineFontSize = useUIStore(state => state.timelineFontSize);
+  const timelineLineClamp = useUIStore(state => state.timelineLineClamp);
+  // treeMode IS the expanded layout (chip + preview text). Old 160px tree-with-labels
+  // visualisation is replaced. Width drag-resizable in expanded mode.
+  const isExpandedLayout = treeMode;
+  const effectiveWidth = treeMode ? timelineWidth : 32;
   // Measured CSS `right:` value (px) that anchors popups to Timeline's left edge.
   // Computed from real DOM rect — robust to HistoryPanel open/close, treeMode, window resize.
   // Previously hardcoded as `notesPanelWidth + (treeMode ? 160 : 32) - 8` — incorrectly subtracted
@@ -464,6 +548,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   const copyIncludeSubagentResult = useUIStore(state => state.copyIncludeSubagentResult);
   const copyIncludeSubagentHistory = useUIStore(state => state.copyIncludeSubagentHistory);
   const debugHoverBridges = useUIStore(state => state.debugHoverBridges);
+  const freezeCmdPopups = useUIStore(state => state.freezeCmdPopups);
 
   // All copy settings as a single object — spread into IPC invoke calls (range-copy, single-copy,
   // edit-range source fetch, rewind compact). Centralises forwarding so adding a future flag
@@ -508,6 +593,18 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   // CMD key state for tooltip activation
   const [isCmdHeld, setIsCmdHeld] = useState(false);
   const isCmdHeldRef = useRef(false);
+  // CMD+Shift lock — закрепляет ОТКРЫТЫЙ tooltip (entry / note / fork) на месте,
+  // как `freezeCmdPopups` из StatusBar, но локально и привязано к жесту.
+  // Условия закрытия от ухода курсора/отпускания CMD не срабатывают пока locked=true.
+  // Снимается повторным CMD+Shift или mousedown'ом вне tooltip-обёрток (см. ниже).
+  const [isLockedTooltip, setIsLockedTooltip] = useState(false);
+  const isLockedTooltipRef = useRef(false);
+  useEffect(() => { isLockedTooltipRef.current = isLockedTooltip; }, [isLockedTooltip]);
+  // Refs для индексов: window-handlers читают синхронно, без пересоздания на ховер.
+  const hoveredIndexRef = useRef<number | null>(null);
+  const activeTooltipIndexRef = useRef<number | null>(null);
+  const activeNoteIndexRef = useRef<number | null>(null);
+  const activeForkMarkerIndexRef = useRef<number | null>(null);
   const chainResolvedRef = useRef<string | null>(null); // prevents A→B→A→B feedback loop
   // hoveredForkIndex removed — replaced by hoveredForkMarkerIndex + activeForkMarkerIndex (CMD pattern)
 
@@ -650,8 +747,9 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     if (!el) return;
     const measure = () => {
       const rect = el.getBoundingClientRect();
-      // 8px overlap so popup border kisses Timeline left edge — matches old hardcoded `- 8`.
-      const next = Math.max(0, Math.round(window.innerWidth - rect.left + 8));
+      // Popup's right edge sits exactly at Timeline's left edge (no gap, no overlap).
+      // In expanded mode user wants tight join, in compact mode same — single rule.
+      const next = Math.max(0, Math.round(window.innerWidth - rect.left));
       setPopupRightPx(prev => prev === next ? prev : next);
     };
     measure();
@@ -697,24 +795,24 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     };
   }, []);
 
-  // effect: isCmdHeld/hoveredIndex/isExpanded → setActiveTooltipIndex (CMD+hover opens; release closes unless expanded/cursor-in-tooltip/resizing)
+  // effect: isCmdHeld/hoveredIndex/isExpanded → setActiveTooltipIndex (CMD+hover opens; release closes unless expanded/cursor-in-tooltip/resizing/frozen)
   useEffect(() => {
     if (isCmdHeld && hoveredIndex !== null) {
       setActiveTooltipIndex(hoveredIndex);
-    } else if (!isCmdHeld && !isExpanded && !isMouseInTooltipRef.current && !isResizingTooltipRef.current) {
+    } else if (!freezeCmdPopups && !isLockedTooltip && !isCmdHeld && !isExpanded && !isMouseInTooltipRef.current && !isResizingTooltipRef.current) {
       setActiveTooltipIndex(null);
     }
-  }, [isCmdHeld, hoveredIndex, isExpanded]);
+  }, [isCmdHeld, hoveredIndex, isExpanded, freezeCmdPopups, isLockedTooltip]);
 
-  // effect: isCmdHeld/hoveredNoteIndex/isNoteEditing/activeNoteIndex → setActiveNoteIndex (CMD+hover opens note tooltip + hides entry tooltip; release closes unless editing/cursor-in-tooltip)
+  // effect: isCmdHeld/hoveredNoteIndex/isNoteEditing/activeNoteIndex → setActiveNoteIndex (CMD+hover opens note tooltip + hides entry tooltip; release closes unless editing/cursor-in-tooltip/frozen)
   useEffect(() => {
     if (isCmdHeld && hoveredNoteIndex !== null) {
       setActiveNoteIndex(hoveredNoteIndex);
       setActiveTooltipIndex(null); // hide entry tooltip
-    } else if (!isCmdHeld && !isNoteEditing && activeNoteIndex !== null && !isMouseInNoteTooltipRef.current) {
+    } else if (!freezeCmdPopups && !isLockedTooltip && !isCmdHeld && !isNoteEditing && activeNoteIndex !== null && !isMouseInNoteTooltipRef.current) {
       setActiveNoteIndex(null);
     }
-  }, [isCmdHeld, hoveredNoteIndex, isNoteEditing, activeNoteIndex]);
+  }, [isCmdHeld, hoveredNoteIndex, isNoteEditing, activeNoteIndex, freezeCmdPopups, isLockedTooltip]);
 
   // Fork marker tooltip: sync with CMD key — same pattern as notes
   const [hoveredForkMarkerIndex, setHoveredForkMarkerIndex] = useState<number | null>(null);
@@ -724,10 +822,47 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     if (isCmdHeld && hoveredForkMarkerIndex !== null) {
       setActiveForkMarkerIndex(hoveredForkMarkerIndex);
       setActiveTooltipIndex(null); // hide entry tooltip
-    } else if (!isCmdHeld && activeForkMarkerIndex !== null && !isMouseInForkTooltipRef.current) {
+    } else if (!freezeCmdPopups && !isLockedTooltip && !isCmdHeld && activeForkMarkerIndex !== null && !isMouseInForkTooltipRef.current) {
       setActiveForkMarkerIndex(null);
     }
-  }, [isCmdHeld, hoveredForkMarkerIndex, activeForkMarkerIndex]);
+  }, [isCmdHeld, hoveredForkMarkerIndex, activeForkMarkerIndex, freezeCmdPopups, isLockedTooltip]);
+
+  // effect: зеркалим индексы в refs — нужны для синхронного чтения в keydown/mousedown listener'ах.
+  useEffect(() => { hoveredIndexRef.current = hoveredIndex; }, [hoveredIndex]);
+  useEffect(() => { activeTooltipIndexRef.current = activeTooltipIndex; }, [activeTooltipIndex]);
+  useEffect(() => { activeNoteIndexRef.current = activeNoteIndex; }, [activeNoteIndex]);
+  useEffect(() => { activeForkMarkerIndexRef.current = activeForkMarkerIndex; }, [activeForkMarkerIndex]);
+
+  // effect: CMD+Shift toggle + global mousedown unlock.
+  // Закрепить можно когда любой из tooltip'ов открыт или есть hovered entry/note/fork.
+  // Снимается повторным CMD+Shift или mousedown'ом вне tooltip-обёрток
+  // (метятся атрибутом `data-cmd-hover-popover`).
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Shift' && e.metaKey) {
+        const hasActive = isLockedTooltipRef.current
+          || activeTooltipIndexRef.current !== null
+          || activeNoteIndexRef.current !== null
+          || activeForkMarkerIndexRef.current !== null
+          || hoveredIndexRef.current !== null;
+        if (!hasActive) return;
+        e.preventDefault();
+        setIsLockedTooltip(prev => !prev);
+      }
+    };
+    const onMouseDown = (e: MouseEvent) => {
+      if (!isLockedTooltipRef.current) return;
+      const target = e.target as HTMLElement | null;
+      if (target && target.closest('[data-cmd-hover-popover]')) return;
+      setIsLockedTooltip(false);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('mousedown', onMouseDown, true);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('mousedown', onMouseDown, true);
+    };
+  }, []);
 
   // ════════════════════════════════════════════════════════════
   // SECTION: TIMELINE DATA LOAD — loadTimeline IPC, 2s poll, session-switch cleanup, _savedEditRangeMap save/restore
@@ -1377,15 +1512,17 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
           endIndex: Math.max(startIndex, endIndex),
         };
 
-        // Auto-extend to the very beginning of Timeline when the range hits a boundary
-        // (compact entry or different sessionIds — Plan Mode/Clear Context). Editing
-        // across boundaries is not supported (different JSONL files), so for Delete we
-        // always operate on a contiguous prefix instead of trying to splice across files.
+        // Detect boundary crossing — ONLY real cross-file bridge entries count:
+        //   - `compact` (auto-compact boundary, type 'compact_boundary' in JSONL)
+        //   - `continued` (Context Overflow Recovery bridge — new JSONL, new sessionId, dangling parentUuid)
+        // Mere sessionId difference inside the same JSONL is NOT a bridge: it happens when
+        // Claude CLI resumes a session (claude --resume) — new file inherits the parent
+        // transcript with original sessionIds, then writes new entries with the new sessionId.
+        // The parentUuid chain stays intact within the file, so delete-range relinks safely.
+        // Our claude:fork-session-file rewrites all sessionIds in the copy, so forks don't
+        // create this case in the first place.
         const sliced = entries.slice(range.startIndex, range.endIndex + 1);
-        const hasCompactInRange = sliced.some(en => en.type === 'compact');
-        const sids = new Set(sliced.map(en => en.sessionId).filter(Boolean));
-        const crossesBoundary = hasCompactInRange || sids.size > 1;
-        if (crossesBoundary) range.startIndex = 0;
+        const crossesBoundary = sliced.some(en => en.type === 'compact' || en.type === 'continued');
 
         // Position popup vertically centred on the SECOND click (the entry the user just
         // clicked on). Horizontal anchor is `right:` CSS at render time (popup hugs Timeline
@@ -1737,16 +1874,17 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     setPostPromptMode(false);
 
     if (mode === 'edit') {
-      // Check: range must not cross plan mode boundaries or contain compact entries
+      // Edit-range works inside a single JSONL — block only cross-file bridges
+      // (compact_boundary / Context Overflow continued). SessionId variance within one
+      // file is fine (claude --resume layering, see crossesBoundary detector above).
       const rangeEntries = entries.slice(range.startIndex, range.endIndex + 1);
       const hasCompact = rangeEntries.some(e => e.type === 'compact');
-      const sessionIds = new Set(rangeEntries.map(e => e.sessionId).filter(Boolean));
-      const crossesPlanMode = sessionIds.size > 1;
-      if (hasCompact || crossesPlanMode) {
+      const hasContinued = rangeEntries.some(e => e.type === 'continued');
+      if (hasCompact || hasContinued) {
         useUIStore.getState().showToast(
           hasCompact
             ? 'Нельзя редактировать диапазон с compact boundary'
-            : 'Нельзя редактировать через план мод — только текущий сегмент',
+            : 'Нельзя редактировать через Context Overflow recovery — только текущий сегмент',
           'error', 3000
         );
         return;
@@ -2146,6 +2284,37 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     setTimeout(() => noteTextareaRef.current?.focus(), 50);
   };
 
+  // Delete a single user-prompt entry (irreversible). Keeps assistant response.
+  // Disabled for Gemini (JSON format), for non-user entries, and for the very first
+  // entry of the session (no parentUuid → would orphan its children).
+  const handleDeleteUserEntry = async (entry: TimelineEntry) => {
+    if (!sessionId || isGemini) return;
+    setContextMenu(null);
+    setDeleteEntryConfirmMode(false);
+    try {
+      const result = await ipcRenderer.invoke('claude:delete-user-entry', {
+        sessionId,
+        cwd,
+        uuid: entry.uuid,
+      });
+      if (!result.success) {
+        useUIStore.getState().showToast(
+          'Не удалось удалить: ' + (result.error || 'unknown'),
+          'error', 4000
+        );
+        return;
+      }
+      useUIStore.getState().showToast('Запрос удалён', 'success', 1800);
+      loadTimeline();
+    } catch (err: any) {
+      console.error('[Timeline] Delete user entry failed:', err);
+      useUIStore.getState().showToast(
+        'Ошибка удаления: ' + (err?.message || String(err)),
+        'error', 4000
+      );
+    }
+  };
+
   const handleEditNote = (entry: TimelineEntry) => {
     setNoteEditText(notes[entry.uuid] || '');
     setNoteEditPosition(notePositions[entry.uuid] || 'before');
@@ -2408,23 +2577,85 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
 
   return (
     <>
-      {/* ──── CONTAINER (Timeline outer wrapper, 32px wide, slide-animated) ──── */}
+      {/* ──── OUTER SLOT — reserves 32px in the Workspace flex row regardless of
+            expanded state. In expanded mode the real container overflows LEFT as
+            absolute overlay, so chat/terminal width never changes. ──── */}
+      <div
+        style={{
+          width: slideIn ? '32px' : '0px',
+          height: '100%',
+          flexShrink: 0,
+          position: 'relative',
+          transition: 'width 50ms ease-out',
+        }}
+      >
+      {/* ──── CONTAINER (Timeline outer wrapper, absolute-anchored right) ──── */}
       <div
         ref={containerRef}
         data-timeline
         className="relative flex flex-col group"
         style={{
-          width: slideIn ? '32px' : '0px',
-          backgroundColor: 'rgba(0, 0, 0, 0.2)',
-          backdropFilter: 'blur(4px)',
+          width: slideIn ? `${effectiveWidth}px` : '0px',
+          backgroundColor: isExpandedLayout ? 'rgba(0, 0, 0, 0.85)' : 'rgba(0, 0, 0, 0.2)',
+          backdropFilter: 'blur(8px)',
           borderLeft: slideIn ? '1px solid rgba(255, 255, 255, 0.05)' : 'none',
           height: '100%',
           zIndex: 40,
           visibility: isVisible ? 'inherit' : 'hidden',
           overflow: slideIn ? 'visible' : 'hidden',
+          // Expanded layout overlays content from the right without resizing chat.
+          position: isExpandedLayout ? 'absolute' : 'static',
+          top: isExpandedLayout ? 0 : undefined,
+          right: isExpandedLayout ? 0 : undefined,
+          // Font-size root for em-based descendants (chip + preview text).
+          fontSize: `${timelineFontSize}px`,
           transition: 'width 50ms ease-out',
         }}
       >
+        {/* Drag handle for width — only when expanded layout is on.
+            In collapsed (32px) mode no resize gesture, it'd just confuse.
+            Width persists in localStorage via setTimelineWidth (clamped [32, 600]). */}
+        {slideIn && isExpandedLayout && (
+          <div
+            data-timeline-resize-handle
+            onPointerDown={(e) => {
+              e.preventDefault();
+              const startX = e.clientX;
+              const startW = timelineWidth;
+              const pointerId = e.pointerId;
+              (e.currentTarget as HTMLElement).setPointerCapture(pointerId);
+              const prevCursor = document.body.style.cursor;
+              const prevSelect = document.body.style.userSelect;
+              document.body.style.cursor = 'ew-resize';
+              document.body.style.userSelect = 'none';
+              const onMove = (ev: PointerEvent) => {
+                const delta = startX - ev.clientX; // dragging left grows width
+                setTimelineWidth(startW + delta);
+              };
+              const onUp = () => {
+                window.removeEventListener('pointermove', onMove);
+                window.removeEventListener('pointerup', onUp);
+                document.body.style.cursor = prevCursor;
+                document.body.style.userSelect = prevSelect;
+              };
+              window.addEventListener('pointermove', onMove);
+              window.addEventListener('pointerup', onUp);
+            }}
+            style={{
+              position: 'absolute',
+              left: '-2px',
+              top: 0,
+              bottom: 0,
+              width: '6px',
+              cursor: 'ew-resize',
+              zIndex: 45,
+              // Subtle hover hint — slight bg on hover so user discovers the handle.
+              background: 'transparent',
+            }}
+            onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.background = 'rgba(129, 140, 248, 0.15)'; }}
+            onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.background = 'transparent'; }}
+          />
+        )}
         {/* Central Axis Line (compact mode only) */}
         {!treeMode && (
           <div className="absolute left-1/2 top-0 bottom-0 w-[1px] bg-white/10 -translate-x-1/2 pointer-events-none" />
@@ -2432,8 +2663,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
 
         {/* Tree mode toggle removed — now controlled from InfoPanel sidebar */}
 
-        {/* ──── SCROLL LAYER (scrollRef — vertical scroll, expands to 160px in tree mode) ──── */}
-        {/* Segmented Hit-boxes — in tree mode, expands LEFT as absolute overlay */}
+        {/* ──── SCROLL LAYER (scrollRef — vertical scroll) ──── */}
         <div
           ref={scrollRef}
           className="scrollbar-hide"
@@ -2442,24 +2672,13 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
             top: 0,
             bottom: 0,
             right: 0,
-            width: treeMode ? '160px' : '100%',
+            width: '100%',
             opacity: isVisible ? 1 : 0,
             overflowY: 'auto',
             display: 'flex',
             flexDirection: 'column',
-            ...(treeMode ? {
-              backgroundColor: 'rgba(0, 0, 0, 0.88)',
-              backdropFilter: 'blur(8px)',
-              borderLeft: '1px solid rgba(129, 140, 248, 0.15)',
-              zIndex: 50,
-            } : {}),
           }}
         >
-          {/* ──── TREE-MODE CHROME (left axis line, only when treeMode true) ──── */}
-          {/* Tree mode: left axis line */}
-          {treeMode && (
-            <div className="absolute top-0 bottom-0 w-px pointer-events-none" style={{ left: '4px', backgroundColor: 'rgba(255, 255, 255, 0.08)' }} />
-          )}
           {/* ──── INNER-RELATIVE WRAPPER (innerWrapperRef — hosts segments + scroll-following overlays) ──── */}
           {/* Inner relative wrapper so absolute overlays (selection, rewind) scroll with content */}
           <div ref={innerWrapperRef} className="relative flex flex-col flex-1">
@@ -2744,45 +2963,113 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                   onDoubleClick={() => handleEntryDoubleClick(entry)}
                   onContextMenu={(e) => handleRightClick(e, entry)}
                   style={{
-                    flex: `1 0 ${treeMode ? '22px' : (showAsChild ? '14px' : '20px')}`,
-                    minHeight: treeMode ? '22px' : (showAsChild ? '14px' : '20px'),
-                    justifyContent: treeMode ? 'flex-start' : 'center',
-                    paddingLeft: treeMode
-                      ? (showAsChild ? '20px' : entryIsSubAgent ? '10px' : '4px')
-                      : (showAsChild ? '4px' : undefined),
+                    // expanded: height auto-fits content (no overlap with neighbours).
+                    // dots-only/tree: original flex-grow distribution.
+                    flex: isExpandedLayout
+                      ? '0 0 auto'
+                      : `1 0 ${treeMode ? '22px' : (showAsChild ? '14px' : '20px')}`,
+                    minHeight: isExpandedLayout
+                      ? undefined
+                      : (treeMode ? '22px' : (showAsChild ? '14px' : '20px')),
+                    alignItems: isExpandedLayout ? 'flex-start' : undefined,
+                    justifyContent: isExpandedLayout ? 'flex-start' : (treeMode ? 'flex-start' : 'center'),
+                    paddingLeft: isExpandedLayout
+                      ? '6px'
+                      : (treeMode
+                          ? (showAsChild ? '20px' : entryIsSubAgent ? '10px' : '4px')
+                          : (showAsChild ? '4px' : undefined)),
+                    paddingRight: isExpandedLayout ? '8px' : undefined,
+                    paddingTop: isExpandedLayout ? '6px' : undefined,
+                    paddingBottom: isExpandedLayout ? '6px' : undefined,
+                    gap: isExpandedLayout ? '6px' : undefined,
+                    overflow: isExpandedLayout ? 'hidden' : undefined,
+                    // Perf: skip rendering off-screen entries; refs/hit-boxes still attach.
+                    // intrinsic-size hint ≈ lineHeight(1.3) * lines * fontSize + vertical padding 12.
+                    contentVisibility: isExpandedLayout ? 'auto' : undefined,
+                    containIntrinsicSize: isExpandedLayout
+                      ? `auto ${Math.round(timelineFontSize * 1.3 * timelineLineClamp + 12)}px`
+                      : undefined,
                     backgroundColor: active
                       ? 'rgba(59, 130, 246, 0.15)'
-                      : (isOldHistory && !isGroupMeta && !isCompacted ? 'rgba(239, 68, 68, 0.06)' : 'transparent'),
+                      : isHovered && isExpandedLayout && !isGroupMeta
+                        ? 'rgba(255, 255, 255, 0.04)'
+                        : (isOldHistory && !isGroupMeta && !isCompacted ? 'rgba(239, 68, 68, 0.06)' : 'transparent'),
                     cursor: (isContinued || isDocsEdit || isDocsSearch || isOldHistory) ? 'default' : 'pointer',
-                  }}
+                  } as React.CSSProperties}
                 >
-                  {/* Tree mode: vertical connector lines */}
-                  {treeMode && entryIsSubAgent && !showAsChild && (
-                    <div className="absolute top-0 bottom-0 w-px pointer-events-none" style={{ left: '8px', backgroundColor: 'rgba(129, 140, 248, 0.15)' }} />
-                  )}
-                  {treeMode && showAsChild && (
-                    <div className="absolute top-0 bottom-0 w-px pointer-events-none" style={{ left: '14px', backgroundColor: 'rgba(129, 140, 248, 0.1)' }} />
-                  )}
-
                   {/* Dot */}
                   {/* Dot: hollow ring if not in buffer (current segment), filled otherwise */}
                   {/* pointer-events: auto so ПКМ на сам кружок ловится отдельно от полосы —
                       это позволяет показывать "Копировать compact" только когда клик был
                       именно по кружку (а не по сегменту-полоске). */}
-                  <div
-                    className="pointer-events-none shrink-0"
-                    style={{
-                      width: dotWidth,
-                      height: dotHeight,
-                      borderRadius: dotRadius,
-                      backgroundColor: isUnreachable && !isHovered && !isCompacted ? 'transparent' : dotColor,
-                      border: isUnreachable && !isHovered && !isCompacted ? `1px solid ${rewindMarkers.has(entry.uuid) ? '#ec4899' : hasNote && notePos === 'dot' ? '#9333ea' : dotColor}` : 'none',
-                      boxShadow: dotGlow,
-                      boxSizing: 'border-box',
-                      pointerEvents: 'auto',
-                      transition: 'width 0.15s, height 0.15s, border-radius 0.15s, background-color 0.2s, box-shadow 0.2s',
-                    }}
-                  />
+                  {isExpandedLayout ? (
+                    /* Dot lives in a narrow gutter vertically centred in the entry.
+                       No size growth on hover — row bg changes instead so text doesn't shift. */
+                    (() => {
+                      const expW = isCompacted ? '8px' : (showAsChild ? '6px' : '8px');
+                      const expH = isCompacted ? '3px' : (showAsChild ? '6px' : '8px');
+                      const expR = isCompacted ? '1px' : '50%';
+                      return (
+                        <div
+                          className="flex items-center justify-center shrink-0"
+                          style={{ width: '14px', alignSelf: 'stretch' }}
+                        >
+                          <div
+                            className="pointer-events-none shrink-0"
+                            style={{
+                              width: expW,
+                              height: expH,
+                              borderRadius: expR,
+                              backgroundColor: isUnreachable && !isCompacted ? 'transparent' : dotColor,
+                              border: isUnreachable && !isCompacted ? `1px solid ${rewindMarkers.has(entry.uuid) ? '#ec4899' : hasNote && notePos === 'dot' ? '#9333ea' : dotColor}` : 'none',
+                              boxShadow: dotGlow,
+                              boxSizing: 'border-box',
+                              pointerEvents: 'auto',
+                              transition: 'background-color 0.2s, box-shadow 0.2s',
+                            }}
+                          />
+                        </div>
+                      );
+                    })()
+                  ) : (
+                    <div
+                      className="pointer-events-none shrink-0"
+                      style={{
+                        width: dotWidth,
+                        height: dotHeight,
+                        borderRadius: dotRadius,
+                        backgroundColor: isUnreachable && !isHovered && !isCompacted ? 'transparent' : dotColor,
+                        border: isUnreachable && !isHovered && !isCompacted ? `1px solid ${rewindMarkers.has(entry.uuid) ? '#ec4899' : hasNote && notePos === 'dot' ? '#9333ea' : dotColor}` : 'none',
+                        boxShadow: dotGlow,
+                        boxSizing: 'border-box',
+                        pointerEvents: 'auto',
+                        transition: 'width 0.15s, height 0.15s, border-radius 0.15s, background-color 0.2s, box-shadow 0.2s',
+                      }}
+                    />
+                  )}
+
+                  {/* Expanded layout: N-line preview text only (type is conveyed by dot color) */}
+                  {isExpandedLayout && !isExpandedHeader && (() => {
+                    const previewText = (isCompacted ? 'Conversation compacted' : (entry.content || '')).trim();
+                    if (!previewText) return null;
+                    return (
+                      <div
+                        className="flex-1 min-w-0 pointer-events-none"
+                        style={{
+                          fontSize: '1em',
+                          lineHeight: 1.3,
+                          color: 'rgba(255, 255, 255, 0.85)',
+                          display: '-webkit-box',
+                          WebkitLineClamp: timelineLineClamp,
+                          WebkitBoxOrient: 'vertical',
+                          overflow: 'hidden',
+                          wordBreak: 'break-word',
+                        }}
+                      >
+                        {previewText}
+                      </div>
+                    );
+                  })()}
 
                   {/* Phase 2: Group count badge (collapsed only) */}
                   {groupInfo?.isGroupHeader && !isGroupExpanded && !treeMode && (
@@ -2803,57 +3090,44 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                     </div>
                   )}
 
-                  {/* Phase 3: Tree mode label */}
-                  {treeMode && !isExpandedHeader && (
-                    <span
-                      className="ml-1 truncate pointer-events-none select-none flex-1 min-w-0"
-                      style={{
-                        fontSize: '9px',
-                        lineHeight: '1.2',
-                        color: entryIsTimeout
-                          ? 'rgba(239, 68, 68, 0.5)'
-                          : entryIsSubAgent
-                            ? 'rgba(129, 140, 248, 0.5)'
-                            : isDocsEdit
-                              ? 'rgba(74, 222, 128, 0.5)'
-                              : isDocsSearch
-                                ? 'rgba(190, 242, 100, 0.5)'
-                                : 'rgba(255, 255, 255, 0.4)',
-                      }}
-                    >
-                      {isGroupCollapsed
-                        ? <>{groupInfo!.agentName} <span style={{ color: 'rgba(129, 140, 248, 0.9)' }}>×{groupInfo!.groupSize}</span></>
-                        : entryIsTimeout
-                          ? 'timeout'
-                          : entryIsSubAgent
-                            ? (entry.subAgentName || 'Claude')
-                            : isDocsEdit
-                              ? truncateText(entry.content, 60)
-                              : isDocsSearch
-                                ? truncateText(entry.content, 60)
-                                : isCompacted
-                                ? 'compact'
-                                : truncateText(entry.content, 60)
-                      }
-                    </span>
-                  )}
-
-                  {/* Loading spinner */}
+                  {/* Loading spinner — positioned over the dot, not entry center.
+                      In expanded mode entry is wide, so a full-inset absolute would
+                      land in the text column. Instead anchor to left 14px gutter
+                      (matches dot column width) and center vertically. */}
                   {dotClickState === 'loading' && (
-                    <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                    isExpandedLayout ? (
                       <div
-                        className="w-2 h-2 rounded-full bg-blue-400 animate-glow-blue shadow-[0_0_8px_rgba(96,165,250,0.6)]"
-                      />
-                    </div>
+                        className="absolute top-0 bottom-0 flex items-center justify-center pointer-events-none"
+                        style={{ left: 6, width: 14 }}
+                      >
+                        <div className="w-2 h-2 rounded-full bg-blue-400 animate-glow-blue shadow-[0_0_8px_rgba(96,165,250,0.6)]" />
+                      </div>
+                    ) : (
+                      <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                        <div className="w-2 h-2 rounded-full bg-blue-400 animate-glow-blue shadow-[0_0_8px_rgba(96,165,250,0.6)]" />
+                      </div>
+                    )
                   )}
-                  {/* Failed X */}
+                  {/* Failed X — same anchoring rule as loader. */}
                   {dotClickState === 'failed' && (
-                    <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-                      <svg width="10" height="10" viewBox="0 0 10 10" style={{ opacity: 0.7 }}>
-                        <line x1="2" y1="2" x2="8" y2="8" stroke="#ef4444" strokeWidth="1.5" strokeLinecap="round" />
-                        <line x1="8" y1="2" x2="2" y2="8" stroke="#ef4444" strokeWidth="1.5" strokeLinecap="round" />
-                      </svg>
-                    </div>
+                    isExpandedLayout ? (
+                      <div
+                        className="absolute top-0 bottom-0 flex items-center justify-center pointer-events-none"
+                        style={{ left: 6, width: 14 }}
+                      >
+                        <svg width="10" height="10" viewBox="0 0 10 10" style={{ opacity: 0.7 }}>
+                          <line x1="2" y1="2" x2="8" y2="8" stroke="#ef4444" strokeWidth="1.5" strokeLinecap="round" />
+                          <line x1="8" y1="2" x2="2" y2="8" stroke="#ef4444" strokeWidth="1.5" strokeLinecap="round" />
+                        </svg>
+                      </div>
+                    ) : (
+                      <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                        <svg width="10" height="10" viewBox="0 0 10 10" style={{ opacity: 0.7 }}>
+                          <line x1="2" y1="2" x2="8" y2="8" stroke="#ef4444" strokeWidth="1.5" strokeLinecap="round" />
+                          <line x1="8" y1="2" x2="2" y2="8" stroke="#ef4444" strokeWidth="1.5" strokeLinecap="round" />
+                        </svg>
+                      </div>
+                    )
                   )}
                 </div>
                 {/* Note indicator strip — after dot */}
@@ -2967,19 +3241,28 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         </div>
 
         {/* ──── INNER-WRAPPER OVERLAYS (rangeActionMenu indicator, selection preview, copy/delete/rewind/edit-range pulses with StatusLabelPortal) ──── */}
-        {/* Selected Range Indicator (static, when action menu is open) */}
+        {/* Selected Range Indicator (static, when action menu is open).
+            In deleteConfirmMode + crossesBoundary the overlay extends to index 0 to
+            visualise what will actually be deleted — the popup text says «N записей до
+            самого начала», the highlight must match. Copy/Edit modes keep the visual
+            range the user actually selected. */}
         {isVisible && rangeActionMenu && (() => {
-          const rect = getOverlayRect(rangeActionMenu.range.startIndex, rangeActionMenu.range.endIndex);
+          const effStart = (deleteConfirmMode && rangeActionMenu.crossesBoundary)
+            ? 0
+            : rangeActionMenu.range.startIndex;
+          const rect = getOverlayRect(effStart, rangeActionMenu.range.endIndex);
+          const isExtended = effStart !== rangeActionMenu.range.startIndex;
           return rect && (
             <div
               className="absolute left-0 right-0 pointer-events-none"
               style={{
                 top: rect.top,
                 height: rect.height,
-                backgroundColor: 'rgba(59, 130, 246, 0.15)',
-                borderTop: '1px solid rgba(59, 130, 246, 0.4)',
-                borderBottom: '1px solid rgba(59, 130, 246, 0.4)',
-                boxShadow: '0 0 8px rgba(59, 130, 246, 0.2)',
+                backgroundColor: isExtended ? 'rgba(239, 68, 68, 0.10)' : 'rgba(59, 130, 246, 0.15)',
+                borderTop: '1px solid ' + (isExtended ? 'rgba(239, 68, 68, 0.4)' : 'rgba(59, 130, 246, 0.4)'),
+                borderBottom: '1px solid ' + (isExtended ? 'rgba(239, 68, 68, 0.4)' : 'rgba(59, 130, 246, 0.4)'),
+                boxShadow: isExtended ? '0 0 8px rgba(239, 68, 68, 0.18)' : '0 0 8px rgba(59, 130, 246, 0.2)',
+                transition: 'background-color 0.18s, border-color 0.18s, box-shadow 0.18s',
               }}
             />
           );
@@ -3397,8 +3680,9 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                 visible tooltip content and the Timeline strip on the right). */}
             <div
               ref={tooltipRef}
+              data-cmd-hover-popover
               onMouseEnter={() => { isMouseInTooltipRef.current = true; }}
-              onMouseLeave={(e) => { if (!isResizingTooltipRef.current) { isMouseInTooltipRef.current = false; handleMouseLeaveTooltipArea(); } }}
+              onMouseLeave={(e) => { if (!isResizingTooltipRef.current && !freezeCmdPopups && !isLockedTooltip) { isMouseInTooltipRef.current = false; handleMouseLeaveTooltipArea(); } }}
               style={{
                 position: 'fixed',
                 right: `${popupRightPx}px`,
@@ -3421,17 +3705,17 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                   outline: 'none',
                   backgroundColor: 'rgba(25, 25, 25, 0.98)',
                   backdropFilter: 'blur(12px)',
-                  border: '1px solid rgba(255, 255, 255, 0.1)',
+                  border: isLockedTooltip ? '1px solid #fff' : '1px solid rgba(255, 255, 255, 0.1)',
                   borderRadius: '6px 0 0 6px',
                   padding: '10px 14px',
                   fontSize: '12px',
                   color: 'white',
                   width: `${timelineTooltipWidth}px`,
-                  maxHeight: isExpanded ? '60vh' : '200px',
+                  maxHeight: isExpanded ? '78vh' : '260px',
                   boxShadow: '-8px 8px 30px rgba(255,255,255,0.08), -2px 2px 8px rgba(255,255,255,0.05)',
                   display: 'flex',
                   flexDirection: 'column',
-                  gap: '8px',
+                  gap: '2px',
                   overflow: 'hidden',
                   position: 'relative',
                 }}
@@ -3472,17 +3756,17 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                 ) : currentActiveEntry.type === 'continued' ? (
                   <>
                     <span className="text-amber-400 font-medium shrink-0">Context Overflow Recovery</span>
-                    <div className="text-white/70 leading-snug font-mono text-[11px] scrollbar-thin" style={{ maxHeight: isExpanded ? 'calc(60vh - 80px)' : '120px', overflowY: 'auto', overflowX: 'hidden', whiteSpace: 'pre-wrap' }}>
+                    <div className="text-white/70 leading-snug font-mono text-[11px] scrollbar-thin" style={{ maxHeight: isExpanded ? 'calc(78vh - 80px)' : '160px', overflowY: 'auto', overflowX: 'hidden', whiteSpace: 'pre-wrap' }}>
                       {currentActiveEntry.content}
                     </div>
-                    <div className="flex items-center mt-1 pt-2 border-t border-white/5 shrink-0">
+                    <div className="flex items-center mt-0 pt-1 border-t border-white/5 shrink-0">
                       <span className="text-[10px] text-white/30">{new Date(currentActiveEntry.timestamp).toLocaleTimeString()}</span>
                       <div className="flex-1" />
                       {(currentActiveEntry.content.length > 200 || isExpanded) && (
                         <Tooltip content={isExpanded ? "Свернуть" : "Развернуть полностью"}>
                         <button
                           onClick={(e) => { e.stopPropagation(); setIsExpanded(!isExpanded); }}
-                          className="p-1 rounded hover:bg-white/10 text-white/40 hover:text-white transition-colors cursor-pointer shrink-0"
+                          className="px-1 py-0.5 rounded hover:bg-white/10 text-white/40 hover:text-white transition-colors cursor-pointer shrink-0"
                         >
                           {isExpanded ? <Minimize2 size={12} /> : <Maximize2 size={12} />}
                         </button>
@@ -3541,18 +3825,16 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                       }
                       return null;
                     })()}
-                    <div className="text-white/70 leading-snug font-mono text-[11px] scrollbar-thin" style={{ maxHeight: isExpanded ? 'calc(60vh - 80px)' : '120px', overflowY: 'auto', overflowX: 'hidden', whiteSpace: 'pre-wrap' }}>
+                    <div className="text-white/70 leading-snug font-mono text-[11px] scrollbar-thin" style={{ maxHeight: isExpanded ? 'calc(78vh - 80px)' : '160px', overflowY: 'auto', overflowX: 'hidden', whiteSpace: 'pre-wrap' }}>
                       {currentActiveEntry.content}
                     </div>
-                    <div className="flex items-center mt-1 pt-2 border-t border-white/5 shrink-0">
+                    <div className="flex items-center mt-0 pt-1 border-t border-white/5 shrink-0">
                       <span className="text-[10px] text-white/30">{new Date(currentActiveEntry.timestamp).toLocaleTimeString()}</span>
-                      {isCmdHeld && (
-                        <span className="flex items-center gap-1 ml-2 text-[10px]" style={{ color: '#e8a955' }}>
-                          <Zap size={10} />
-                          <span>↑{formatTokenCount(Math.ceil(currentActiveEntry.content.length / 3.5))}</span>
-                          {currentActiveEntry.responseTokens && <span>↓{formatTokenCount(currentActiveEntry.responseTokens)}</span>}
-                        </span>
-                      )}
+                      <span className="flex items-center gap-1 ml-2 text-[10px]" style={{ color: '#e8a955' }}>
+                        <Zap size={10} />
+                        <span>↑{formatTokenCount(Math.ceil(currentActiveEntry.content.length / 3.5))}</span>
+                        {currentActiveEntry.responseTokens != null && <span>↓{formatTokenCount(currentActiveEntry.responseTokens)}</span>}
+                      </span>
                       <div className="flex-1" />
                       <button
                         onClick={(e) => {
@@ -3561,7 +3843,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                           setTooltipCopied(true);
                           setTimeout(() => setTooltipCopied(false), 1200);
                         }}
-                        className="flex items-center gap-1.5 px-2 py-1 rounded bg-white/5 hover:bg-white/10 text-[10px] transition-colors cursor-pointer"
+                        className="flex items-center gap-1.5 px-2 py-0.5 rounded bg-white/5 hover:bg-white/10 text-[10px] transition-colors cursor-pointer"
                         style={{ color: tooltipCopied ? '#4ade80' : 'rgba(255,255,255,0.6)' }}
                       >
                         {tooltipCopied ? <Check size={12} /> : <Copy size={12} />}
@@ -3582,18 +3864,16 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                 ) : currentActiveEntry.isPlan ? (
                   <>
                     <span style={{ color: '#48968c' }} className="font-medium shrink-0">Plan Mode (auto-submitted)</span>
-                    <div className="text-white/70 leading-snug font-mono text-[11px] scrollbar-thin" style={{ maxHeight: isExpanded ? 'calc(60vh - 80px)' : '120px', overflowY: 'auto', overflowX: 'hidden', whiteSpace: 'pre-wrap' }}>
+                    <div className="text-white/70 leading-snug font-mono text-[11px] scrollbar-thin" style={{ maxHeight: isExpanded ? 'calc(78vh - 80px)' : '160px', overflowY: 'auto', overflowX: 'hidden', whiteSpace: 'pre-wrap' }}>
                       {currentActiveEntry.content}
                     </div>
-                    <div className="flex items-center mt-1 pt-2 border-t border-white/5 shrink-0">
+                    <div className="flex items-center mt-0 pt-1 border-t border-white/5 shrink-0">
                       <span className="text-[10px] text-white/30">{new Date(currentActiveEntry.timestamp).toLocaleTimeString()}</span>
-                      {isCmdHeld && (
-                        <span className="flex items-center gap-1 ml-2 text-[10px]" style={{ color: '#e8a955' }}>
-                          <Zap size={10} />
-                          <span>↑{formatTokenCount(Math.ceil(currentActiveEntry.content.length / 3.5))}</span>
-                          {currentActiveEntry.responseTokens && <span>↓{formatTokenCount(currentActiveEntry.responseTokens)}</span>}
-                        </span>
-                      )}
+                      <span className="flex items-center gap-1 ml-2 text-[10px]" style={{ color: '#e8a955' }}>
+                        <Zap size={10} />
+                        <span>↑{formatTokenCount(Math.ceil(currentActiveEntry.content.length / 3.5))}</span>
+                        {currentActiveEntry.responseTokens != null && <span>↓{formatTokenCount(currentActiveEntry.responseTokens)}</span>}
+                      </span>
                       <div className="flex-1" />
                       <button
                         onClick={(e) => {
@@ -3602,7 +3882,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                           setTooltipCopied(true);
                           setTimeout(() => setTooltipCopied(false), 1200);
                         }}
-                        className="flex items-center gap-1.5 px-2 py-1 rounded bg-white/5 hover:bg-white/10 text-[10px] transition-colors cursor-pointer"
+                        className="flex items-center gap-1.5 px-2 py-0.5 rounded bg-white/5 hover:bg-white/10 text-[10px] transition-colors cursor-pointer"
                         style={{ color: tooltipCopied ? '#4ade80' : 'rgba(255,255,255,0.6)' }}
                       >
                         {tooltipCopied ? <Check size={12} /> : <Copy size={12} />}
@@ -3624,7 +3904,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                       if (!md) return null;
                       return (
                         <Tooltip content={'Provider: ' + md.provider + ' · Model: ' + currentActiveEntry.responseModel + (currentActiveEntry.responseHasThinking ? ' · thinking' : '')}>
-                        <div className="flex items-center mt-0.5 text-[10px] shrink-0">
+                        <div className="flex items-center mt-0 text-[10px] shrink-0">
                           <span style={{ color: md.color }}>{md.provider} · {md.short}</span>
                           {currentActiveEntry.responseHasThinking && <span className="ml-1.5" style={{ color: '#b4b9f9' }}>· think</span>}
                         </div>
@@ -3726,18 +4006,16 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                         </div>
                       );
                     })()}
-                    <div className="text-white/90 leading-snug font-mono scrollbar-thin" style={{ maxHeight: isExpanded ? 'calc(60vh - 80px)' : '120px', overflowY: 'auto', overflowX: 'hidden', whiteSpace: 'pre-wrap' }}>
+                    <div className="text-white/90 leading-snug font-mono scrollbar-thin" style={{ maxHeight: isExpanded ? 'calc(78vh - 80px)' : '160px', overflowY: 'auto', overflowX: 'hidden', whiteSpace: 'pre-wrap' }}>
                       {currentActiveEntry.content}
                     </div>
-                    <div className="flex items-center mt-1 pt-2 border-t border-white/5 shrink-0">
+                    <div className="flex items-center mt-0 pt-1 border-t border-white/5 shrink-0">
                       <span className="text-[10px] text-white/30">{new Date(currentActiveEntry.timestamp).toLocaleTimeString()}</span>
-                      {isCmdHeld && (
-                        <span className="flex items-center gap-1 ml-2 text-[10px]" style={{ color: '#e8a955' }}>
-                          <Zap size={10} />
-                          <span>↑{formatTokenCount(Math.ceil(currentActiveEntry.content.length / 3.5))}</span>
-                          {currentActiveEntry.responseTokens && <span>↓{formatTokenCount(currentActiveEntry.responseTokens)}</span>}
-                        </span>
-                      )}
+                      <span className="flex items-center gap-1 ml-2 text-[10px]" style={{ color: '#e8a955' }}>
+                        <Zap size={10} />
+                        <span>↑{formatTokenCount(Math.ceil(currentActiveEntry.content.length / 3.5))}</span>
+                        {currentActiveEntry.responseTokens != null && <span>↓{formatTokenCount(currentActiveEntry.responseTokens)}</span>}
+                      </span>
                       <div className="flex-1" />
                       <button
                         onClick={(e) => {
@@ -3746,7 +4024,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                           setTooltipCopied(true);
                           setTimeout(() => setTooltipCopied(false), 1200);
                         }}
-                        className="flex items-center gap-1.5 px-2 py-1 rounded bg-white/5 hover:bg-white/10 text-[10px] transition-colors cursor-pointer"
+                        className="flex items-center gap-1.5 px-2 py-0.5 rounded bg-white/5 hover:bg-white/10 text-[10px] transition-colors cursor-pointer"
                         style={{ color: tooltipCopied ? '#4ade80' : 'rgba(255,255,255,0.6)' }}
                       >
                         {tooltipCopied ? <Check size={12} /> : <Copy size={12} />}
@@ -3768,7 +4046,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                       if (!md) return null;
                       return (
                         <Tooltip content={'Provider: ' + md.provider + ' · Model: ' + currentActiveEntry.responseModel + (currentActiveEntry.responseHasThinking ? ' · thinking' : '')}>
-                        <div className="flex items-center mt-0.5 text-[10px] shrink-0">
+                        <div className="flex items-center mt-0 text-[10px] shrink-0">
                           <span style={{ color: md.color }}>{md.provider} · {md.short}</span>
                           {currentActiveEntry.responseHasThinking && <span className="ml-1.5" style={{ color: '#b4b9f9' }}>· think</span>}
                         </div>
@@ -3778,14 +4056,9 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                   </>
                 )}
               </div>
-              {/* CSS Bridge — stretches full wrapper height, connects tooltip to entry */}
-              <div
-                style={{
-                  width: '8px',
-                  alignSelf: 'stretch',
-                  // background: 'rgba(255,0,0,0.15)', // Uncomment for debug
-                }}
-              />
+              {/* CSS Bridge removed — Timeline now docks against the popup at popupRightPx=0,
+                  so the wrapper itself IS contiguous with the strip. An extra 8px child
+                  here was creating a visible gap between tooltip-content and Timeline. */}
             </div>
           </TooltipPortal>
         )}
@@ -3795,6 +4068,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         {editRangeLoadingMenu && editRangeState?.phase === 'loading' && (
           <TooltipPortal>
             <div
+              ref={editRangeLoadingMenuRef}
               onMouseLeave={() => setEditRangeLoadingMenu(null)}
               style={{
                 position: 'fixed',
@@ -3895,6 +4169,38 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                     <StickyNote size={12} />
                     {notes[contextMenu.entry.uuid] ? 'Редактировать заметку' : 'Добавить заметку'}
                   </button>
+                  {/* Удалить запрос — только для Claude user-entries (не compact/continued).
+                      Двухшаговый inline-confirm: первый клик переключает кнопку в красное
+                      «Точно удалить?», второй — вызывает claude:delete-user-entry. */}
+                  {!isGemini && contextMenu.entry.type === 'user' && !contextMenu.entry.isCompactSummary && (
+                    <>
+                      <div className="border-t border-white/10 my-1" />
+                      {!deleteEntryConfirmMode ? (
+                        <button
+                          className="w-full text-left px-3 py-2 text-xs text-red-400 hover:bg-red-600/20 rounded transition-colors cursor-pointer flex items-center gap-2"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setDeleteEntryConfirmMode(true);
+                          }}
+                        >
+                          <Trash2 size={12} />
+                          Удалить user-mess
+                        </button>
+                      ) : (
+                        <button
+                          className="w-full text-left px-3 py-2 text-xs text-white rounded transition-colors cursor-pointer flex items-center gap-2"
+                          style={{ backgroundColor: 'rgba(239, 68, 68, 0.8)' }}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleDeleteUserEntry(contextMenu.entry);
+                          }}
+                        >
+                          <Trash2 size={12} />
+                          Точно удалить?
+                        </button>
+                      )}
+                    </>
+                  )}
                   {/* Rewind — Claude & Gemini */}
                   <div className="border-t border-white/10 my-1" />
                   {!rewindPostPromptMode ? (
@@ -4002,6 +4308,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         {isVisible && rangeActionMenu && (
           <TooltipPortal>
             <div
+              ref={rangeActionMenuRef}
               onMouseLeave={() => {
                 if (!postPromptMode && !deleteConfirmMode) {
                   setRangeActionMenu(null);
@@ -4033,14 +4340,27 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                 transition: 'min-width 0.15s, border-color 0.15s, box-shadow 0.15s',
               }}
             >
-              {deleteConfirmMode ? (
+              {deleteConfirmMode ? (() => {
+                // For Delete: extend range to 0 when it crosses a boundary (compact / Plan
+                // Mode / Clear Context). Splicing across JSONL boundary would corrupt the
+                // parentUuid chain — for delete we always cut a contiguous prefix.
+                // For Copy/Edit this extension is NOT applied — the user keeps the visual
+                // range they actually selected.
+                const effRange = rangeActionMenu.crossesBoundary
+                  ? { startIndex: 0, endIndex: rangeActionMenu.range.endIndex }
+                  : rangeActionMenu.range;
+                const effStartUuid = rangeActionMenu.crossesBoundary
+                  ? entries[0].uuid
+                  : rangeActionMenu.startUuid;
+                const effCount = effRange.endIndex - effRange.startIndex + 1;
+                return (
                 <div className="p-2 flex flex-col gap-2">
                   <div className="text-[11px] text-red-300 leading-snug">
                     {rangeActionMenu.crossesBoundary ? (
-                      <>Удалить <span className="font-semibold">{rangeActionMenu.range.endIndex - rangeActionMenu.range.startIndex + 1}</span> записей до самого начала?<br/>
-                      <span className="text-[10px] text-red-400/70">Действие необратимо.</span></>
+                      <>В выделении мост между файлами (compact / Context Overflow).<br/>
+                      Удалить <span className="font-semibold">{effCount}</span> записей до самого начала? <span className="text-red-400/70">Действие необратимо.</span></>
                     ) : (
-                      <>Удалить <span className="font-semibold">{rangeActionMenu.range.endIndex - rangeActionMenu.range.startIndex + 1}</span> записей? <span className="text-red-400/70">Действие необратимо.</span></>
+                      <>Удалить <span className="font-semibold">{effCount}</span> записей? <span className="text-red-400/70">Действие необратимо.</span></>
                     )}
                   </div>
                   <div className="flex gap-1.5">
@@ -4057,7 +4377,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                       className="flex-1 px-3 py-1.5 text-xs text-white bg-red-600/80 hover:bg-red-600 rounded transition-colors cursor-pointer flex items-center justify-center gap-1.5"
                       onClick={(e) => {
                         e.stopPropagation();
-                        executeDeleteRange(rangeActionMenu.range, rangeActionMenu.startUuid, rangeActionMenu.endUuid);
+                        executeDeleteRange(effRange, effStartUuid, rangeActionMenu.endUuid);
                       }}
                     >
                       <Trash2 size={12} />
@@ -4065,7 +4385,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                     </button>
                   </div>
                 </div>
-              ) : !postPromptMode ? (
+                );
+              })() : !postPromptMode ? (
                 <>
                   {/* Token summary for selected range */}
                   {(() => {
@@ -4083,23 +4404,16 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                       </div>
                     ) : null;
                   })()}
-                  {rangeActionMenu.crossesBoundary && (
-                    <div className="px-3 py-1.5 text-[10px] text-red-300/80 border-b border-red-500/20 bg-red-500/5">
-                      В выделении граница (compact / Plan Mode) — удаление сотрёт всю историю до начала.
-                    </div>
-                  )}
-                  {!rangeActionMenu.crossesBoundary && (
-                    <button
-                      className="w-full text-left px-3 py-2 text-xs text-white hover:bg-blue-600/80 rounded transition-colors cursor-pointer"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        executeRangeAction('copy', rangeActionMenu.range, rangeActionMenu.startUuid, rangeActionMenu.endUuid);
-                      }}
-                    >
-                      Копировать ({rangeActionMenu.range.endIndex - rangeActionMenu.range.startIndex + 1})
-                    </button>
-                  )}
-                  {!isGemini && !rangeActionMenu.crossesBoundary && (
+                  <button
+                    className="w-full text-left px-3 py-2 text-xs text-white hover:bg-blue-600/80 rounded transition-colors cursor-pointer"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      executeRangeAction('copy', rangeActionMenu.range, rangeActionMenu.startUuid, rangeActionMenu.endUuid);
+                    }}
+                  >
+                    Копировать ({rangeActionMenu.range.endIndex - rangeActionMenu.range.startIndex + 1})
+                  </button>
+                  {!isGemini && (
                     <div className="flex rounded overflow-hidden">
                       <button
                         className="flex-1 text-left px-3 py-2 text-xs text-pink-400 hover:bg-pink-600/20 transition-colors cursor-pointer"
@@ -4129,15 +4443,15 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                         onClick={async (e) => {
                           e.stopPropagation();
                           const { range, startUuid, endUuid } = rangeActionMenu;
-                          // Validate same as edit mode
+                          // Validate same as edit mode (cross-file bridges only)
                           const rangeEntries = entries.slice(range.startIndex, range.endIndex + 1);
                           const hasCompact = rangeEntries.some(en => en.type === 'compact');
-                          const sessionIds = new Set(rangeEntries.map(en => en.sessionId).filter(Boolean));
-                          if (hasCompact || sessionIds.size > 1) {
+                          const hasContinued = rangeEntries.some(en => en.type === 'continued');
+                          if (hasCompact || hasContinued) {
                             useUIStore.getState().showToast(
                               hasCompact
                                 ? 'Нельзя редактировать диапазон с compact boundary'
-                                : 'Нельзя редактировать через план мод — только текущий сегмент',
+                                : 'Нельзя редактировать через Context Overflow recovery — только текущий сегмент',
                               'error', 3000
                             );
                             return;
@@ -4245,9 +4559,11 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
           <TooltipPortal>
             <div
               ref={forkTooltipRef}
+              data-cmd-hover-popover
               onClick={(e) => e.stopPropagation()}
               onMouseEnter={() => { isMouseInForkTooltipRef.current = true; }}
               onMouseLeave={() => {
+                if (freezeCmdPopups || isLockedTooltip) return;
                 isMouseInForkTooltipRef.current = false;
                 setActiveForkMarkerIndex(null);
                 setHoveredForkMarkerIndex(null);
@@ -4271,7 +4587,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                   outline: 'none',
                   backgroundColor: 'rgba(25, 25, 25, 0.98)',
                   backdropFilter: 'blur(12px)',
-                  border: '1px solid rgba(59, 130, 246, 0.3)',
+                  border: isLockedTooltip ? '1px solid #fff' : '1px solid rgba(59, 130, 246, 0.3)',
                   borderRadius: '6px 0 0 6px',
                   padding: '8px 12px',
                   fontSize: '12px',
@@ -4317,9 +4633,10 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
           <TooltipPortal>
             <div
               ref={noteTooltipRef}
+              data-cmd-hover-popover
               onClick={(e) => e.stopPropagation()}
               onMouseEnter={() => { isMouseInNoteTooltipRef.current = true; }}
-              onMouseLeave={(e) => { isMouseInNoteTooltipRef.current = false; handleMouseLeaveNoteTooltip(); }}
+              onMouseLeave={(e) => { if (freezeCmdPopups || isLockedTooltip) return; isMouseInNoteTooltipRef.current = false; handleMouseLeaveNoteTooltip(); }}
               style={{
                 position: 'fixed',
                 right: `${popupRightPx}px`,
@@ -4339,7 +4656,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                   outline: 'none',
                   backgroundColor: 'rgba(25, 25, 25, 0.98)',
                   backdropFilter: 'blur(12px)',
-                  border: '1px solid rgba(168, 85, 247, 0.3)',
+                  border: isLockedTooltip ? '1px solid #fff' : '1px solid rgba(168, 85, 247, 0.3)',
                   borderRadius: '6px 0 0 6px',
                   padding: '10px 14px',
                   fontSize: '12px',
@@ -4604,6 +4921,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
             }}
           />
         )}
+      </div>
       </div>
     </>
   );

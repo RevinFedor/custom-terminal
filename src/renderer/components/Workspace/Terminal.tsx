@@ -344,15 +344,22 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
   const [claudeProcessAlive, setClaudeProcessAlive] = useState(false);
   useEffect(() => {
     const onStarted = (_: any, data: { tabId: string }) => {
-      if (data.tabId === tabId) setClaudeProcessAlive(true);
+      if (data.tabId === tabId) {
+        console.warn('[QueueGate:proc] tab=' + tabId.slice(-8) + ' command-started → alive=true');
+        setClaudeProcessAlive(true);
+      }
     };
     const onFinished = (_: any, data: { tabId: string }) => {
-      if (data.tabId === tabId) setClaudeProcessAlive(false);
+      if (data.tabId === tabId) {
+        console.warn('[QueueGate:proc] tab=' + tabId.slice(-8) + ' command-finished → alive=false');
+        setClaudeProcessAlive(false);
+      }
     };
     ipcRenderer.on('terminal:command-started', onStarted);
     ipcRenderer.on('terminal:command-finished', onFinished);
     // Initial sync — main keeps per-tab state we can poll once.
     ipcRenderer.invoke('terminal:getCommandState', tabId).then((s: any) => {
+      console.warn('[QueueGate:proc] tab=' + tabId.slice(-8) + ' initial-sync isRunning=' + !!s?.isRunning);
       if (s?.isRunning) setClaudeProcessAlive(true);
     }).catch(() => {});
     return () => {
@@ -379,6 +386,21 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
   useEffect(() => {
     activeRef.current = effectiveActive;
   }, [effectiveActive]);
+
+  // Diagnostic: log overlay-gate transitions for this Claude tab.
+  // Fires ONLY on transitions (not every render) by tracking prev tuple in a ref.
+  // Order: effectiveActive, isClaudeTab, hasClaudeSession, claudeProcessAlive.
+  // When user reports "overlay disappeared" — grep for this tab's last [QueueGate:flip] line
+  // to see which of the 4 flags flipped to false.
+  const queueGatePrevRef = useRef<string>('');
+  useEffect(() => {
+    if (!isClaudeTab) return; // only Claude tabs are eligible for overlay
+    const tuple = `act=${effectiveActive} cmd=${isClaudeTab} sess=${hasClaudeSession} alive=${claudeProcessAlive}`;
+    if (queueGatePrevRef.current === tuple) return;
+    const all = effectiveActive && isClaudeTab && hasClaudeSession && claudeProcessAlive;
+    console.warn('[QueueGate:flip] tab=' + tabId.slice(-8) + ' ' + tuple + ' → overlay=' + (all ? 'SHOWN' : 'HIDDEN'));
+    queueGatePrevRef.current = tuple;
+  }, [tabId, effectiveActive, isClaudeTab, hasClaudeSession, claudeProcessAlive]);
 
   // Check if terminal is scrolled up (not at bottom)
   // ALL callers go through rAF debounce — never call this synchronously during term.write()
@@ -802,6 +824,29 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
       // IPC: Send input to PTY. xterm's built-in `scrollOnUserInput: true`
       // (дефолт) сам прижимает viewport к низу при keystroke.
       term.onData((data) => {
+        // Paste diagnostics — large input only. Reads xterm's internal
+        // bracketedPasteMode flag so we know whether xterm.js itself wrapped
+        // this paste in \x1b[200~/\x1b[201~ or just passed clipboard raw.
+        // When this flag is false but data is huge, that means Claude TUI
+        // didn't have DEC 2004 active at paste time → single-chip rendering
+        // in Claude depends on whether the kernel keeps the bytes contiguous.
+        if (data.length > 1000) {
+          let bp: any = 'unknown';
+          try {
+            // xterm 5.5 internal path. Wrapped in try/catch in case the
+            // internal shape changes — falls back to 'unknown' which still
+            // shows up in dev.log.
+            bp = (term as any)._core?.coreService?.decPrivateModes?.bracketedPasteMode;
+          } catch {}
+          const startsWithB = data.startsWith('\x1b[200~');
+          const endsWithB = data.endsWith('\x1b[201~');
+          console.warn('[PasteDiag:renderer] tab=' + tabId + ' len=' + data.length
+            + ' bracketedPasteMode=' + bp
+            + ' startsWith200=' + startsWithB
+            + ' endsWith201=' + endsWithB
+            + ' head=' + JSON.stringify(data.substring(0, 30))
+            + ' tail=' + JSON.stringify(data.substring(Math.max(0, data.length - 30))));
+        }
         ipcRenderer.send('terminal:input', tabId, data);
       });
 
@@ -824,6 +869,30 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
         if (event.metaKey && event.type === 'keydown' && event.key === 'ArrowDown') {
           event.preventDefault();
           scrollToBottom();
+          return false;
+        }
+        // Opt+V — global prompt picker. Swallow here so xterm doesn't forward
+        // the Alt-encoded sequence to the PTY (would type ◊/√/etc. into Claude
+        // input). The App-level keydown listener handles the actual open. Match
+        // by event.code so it's keyboard-layout-agnostic.
+        if (event.altKey && !event.metaKey && !event.ctrlKey && !event.shiftKey
+            && event.type === 'keydown' && event.code === 'KeyV') {
+          return false;
+        }
+        // Shift+Cmd+T — reopen last closed tab. Same rationale: xterm would
+        // otherwise emit the literal `T` into Claude TUI input.
+        if (event.metaKey && event.shiftKey && !event.altKey && !event.ctrlKey
+            && event.type === 'keydown' && event.code === 'KeyT') {
+          return false;
+        }
+        // When the picker is open, swallow arrow/Enter/Esc so they navigate
+        // the picker (handled by App-level capture listener) and don't reach
+        // shell history / Claude TUI input.
+        if (event.type === 'keydown'
+            && (event.key === 'ArrowUp' || event.key === 'ArrowDown'
+                || event.key === 'ArrowLeft' || event.key === 'ArrowRight'
+                || event.key === 'Enter' || event.key === 'Escape')
+            && useUIStore.getState().promptPickerOpen) {
           return false;
         }
         // Skip xterm.js processing for app-level Meta (Cmd) shortcuts.
@@ -1301,6 +1370,26 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
             scrollToBottom();
             return false;
           }
+          // Opt+V — global prompt picker. Swallow here so xterm doesn't forward
+          // the Alt-encoded sequence to the PTY. Layout-agnostic via event.code.
+          if (event.altKey && !event.metaKey && !event.ctrlKey && !event.shiftKey
+              && event.type === 'keydown' && event.code === 'KeyV') {
+            return false;
+          }
+          // Shift+Cmd+T — reopen last closed tab (VS Code-style). Layout-agnostic.
+          if (event.metaKey && event.shiftKey && !event.altKey && !event.ctrlKey
+              && event.type === 'keydown' && event.code === 'KeyT') {
+            return false;
+          }
+          // When the picker is open, swallow arrow/Enter/Esc so they navigate
+          // the picker and don't reach shell history / Claude TUI.
+          if (event.type === 'keydown'
+              && (event.key === 'ArrowUp' || event.key === 'ArrowDown'
+                  || event.key === 'ArrowLeft' || event.key === 'ArrowRight'
+                  || event.key === 'Enter' || event.key === 'Escape')
+              && useUIStore.getState().promptPickerOpen) {
+            return false;
+          }
           // Skip xterm.js processing for app-level Meta (Cmd) shortcuts.
           // Prevents Cmd+, (Settings), Cmd+T (new tab), etc. from leaking characters to PTY.
           // Preserve: Cmd+C (copy/SIGINT), Cmd+V (paste), Cmd+A (selectAll), Cmd+X (cut)
@@ -1631,32 +1720,36 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
     }
   };
 
-  // Handle context menu (right click)
-  const handleContextMenu = async (e: React.MouseEvent) => {
-    e.preventDefault();
+  // Open native terminal context menu (used by right-click AND Cmd+J shortcut).
+  // Electron Menu.popup() without explicit coords pops at the current OS cursor
+  // position; positioningItem (passed when focusInsertPrompt=true) puts Insert
+  // Prompt under the cursor so it's keyboard-focused immediately.
+  const openTerminalContextMenu = async (focusInsertPrompt = false) => {
     const hasSelection = xtermInstance.current?.hasSelection() || false;
     const selection = xtermInstance.current?.getSelection() || '';
+    if (selection) getSetTerminalSelection()(selection);
 
-    // Update global selection state immediately
-    if (selection) {
-      getSetTerminalSelection()(selection);
-    }
-
-    // Get prompts for context menu
     const promptsResult = await ipcRenderer.invoke('prompts:get');
     const prompts = promptsResult.success ? promptsResult.data : [];
 
-    // Find projectId for this tab
     let currentProjectId: string | undefined;
     const state = useWorkspaceStore.getState();
     for (const [projId, workspace] of state.openProjects) {
       if (workspace.tabs.has(tabId)) { currentProjectId = projId; break; }
     }
-
-    // Get current CWD for scripts detection
     const termCwd = await ipcRenderer.invoke('terminal:getCwd', tabId);
+    ipcRenderer.send('show-terminal-context-menu', {
+      hasSelection, prompts, tabId,
+      projectId: currentProjectId,
+      cwd: termCwd || cwd,
+      focusInsertPrompt,
+    });
+  };
 
-    ipcRenderer.send('show-terminal-context-menu', { hasSelection, prompts, tabId, projectId: currentProjectId, cwd: termCwd || cwd });
+  // Handle context menu (right click)
+  const handleContextMenu = async (e: React.MouseEvent) => {
+    e.preventDefault();
+    await openTerminalContextMenu(false);
   };
 
   // CSS: visibility:hidden preserves geometry, prevents WebGL context loss

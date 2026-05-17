@@ -13,14 +13,17 @@
        ↓ fork() child process
 [node ~/.claude/hooks/noted-turn-event.js]
        ↓ читает JSON со stdin
+       ↓ resolveSock(): NOTED_MAIN_PID env → cwd-discovery → legacy fallback
        ↓ Unix socket connect
-[/tmp/noted-terminal-claude-hook.sock — net.Server в Electron main]
-       ↓ парсит JSON, lookup session_id → tabId
-       ↓ через bridgeKnownSessions (обратный поиск)
+[/tmp/noted-terminal-claude-hook-<pid>.sock — net.Server в Electron main]
+       ↓ парсит JSON, write "ok\n" обратно (ack)
+       ↓ lookup session_id → tabId через bridgeKnownSessions
 [mainWindow.webContents.send('claude:turn-state', ...)]
        ↓
 [Renderer InfoPanel / Loader]
 ```
+
+Per-PID socket путь означает что каждый main listens на свой `claude-hook-<pid>.sock` и публикует его в `~/.noted-terminal/claude-hook-<pid>.json` discovery (`{sock, pid, openProjectPaths, updatedAt}`). Hook-script читает все живые discovery, выбирает инстанс через priority: env `NOTED_MAIN_PID` (Claude PTY env пишется тем main'ом что spawn'ил Claude) → longest-prefix cwd match → most-recent updatedAt. Legacy `/tmp/noted-terminal-claude-hook.sock` тоже биндится «вторым server'ом» через try-listen + probe-before-unlink, для совместимости со старыми hook-script'ами без discovery-логики. Сервер на каждое envelope пишет `ok\n` обратно — script-side выходит с `acked_<latency>ms` outcome. Latency обычно 0-1ms; `sent_no_ack` за 150ms = read-path сломан, `sock_err` = listener мёртв. См. [`fix-claude-hook-silent-dropouts.md`](fix-claude-hook-silent-dropouts.md).
 
 ### Зарегистрированные события
 
@@ -68,6 +71,8 @@ Headless test через `claude -p "Read 3 files and summarize"`:
 2. **JSONL writes стопаются после auto-update mid-session** (#16, open). Не affects hook (hook fires из самого процесса), но affects JSONL fallback.
 3. **`stop_reason: null` в JSONL** (#27361) — поле всегда null, нельзя tail'ить JSONL по нему. Hook — единственный надёжный канал.
 4. **CLAUDE_CODE_NO_FLICKER=1** (с v2.1.89) — fullscreen mode, ломает ANSI-эвристики типа «появление `╰` в нижней строке». Stop hook этим не задет.
+5. **Aborted streaming не fires hook** — путь `query.ts:1051` для user-initiated interrupt (Esc, Ctrl+C, submit-interrupt новым промптом во время стрима) возвращает `{ reason: 'aborted_streaming' }` **без вызова handleStopHooks**. Это намеренное поведение Claude, не баг (issues #29881, #17466). Watchdog 60 мин это покрывает, но loader залипает на час. **Mitigation:** JSONL interruption watcher — `fs.watch` на сессионный JSONL, ищем запись `type:"user"` с `text:"[Request interrupted by user]"` (или `... for tool use` вариант), которую Claude гарантированно пишет на abort. См. [`fix-claude-aborted-streaming-loader.md`](fix-claude-aborted-streaming-loader.md) и переносимый принцип `methodology/design.md::Authoritative artifact > эвристика на input-side`.
+6. **Multi-instance silent-dropout** — dev + prod одновременно открыли один cwd → hook events из прод-Claude'а попадали в dev silently (cwd routing tie не разрешался). Закрыто через per-PID socket + ack-протокол + `NOTED_MAIN_PID` env. Симптомы и полная цепочка из четырёх слоёв — [`fix-claude-hook-silent-dropouts.md`](fix-claude-hook-silent-dropouts.md).
 
 ## Hook script (`~/.claude/hooks/noted-turn-event.js`)
 

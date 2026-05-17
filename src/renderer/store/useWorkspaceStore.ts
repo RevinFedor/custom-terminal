@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import { startTransition } from 'react';
 import { log } from '../utils/logger';
+import { setPrefetched } from '../utils/sdkHistoryPrefetch';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -54,7 +55,15 @@ interface Tab {
   mcpTaskId?: string; // MCP task UUID assigned when delegate_to_claude created this sub-agent
   interceptorState?: 'armed' | 'disarmed' | null; // Interceptor state for MCP response delivery
   // Claude SDK tab state
-  sdkState?: 'idle' | 'thinking' | 'tool_use' | 'error'; // Current SDK session state
+  // SDK turn-state. Splits the «loader is up» window into deterministic phases:
+  //   fetching   — onNew fired, no SDK event yet (network + warm-up). Юзер видит «Connecting…»
+  //   thinking   — first chunk arrived, no text yet (only thinking / system:init). Лоадер активен.
+  //   typing     — assistant chunk with TEXT received → лоадер УХОДИТ, content streams into bubble.
+  //                Note: typing isn't a "loading" state; we track it so callers can distinguish
+  //                "actively producing tokens" from "idle". UI hides loader for both typing AND idle.
+  //   tool_use   — Claude вызвал tool, ждём result. Лоадер: «Running <name>…»
+  //   error/idle — окончание turn'а.
+  sdkState?: 'idle' | 'fetching' | 'thinking' | 'typing' | 'tool_use' | 'error';
   sdkMessages?: Array<{ role: string; type: string; content: string; timestamp: number; toolName?: string; toolStatus?: string }>; // In-memory messages for chat UI
   sdkModel?: string; // Model for next SDK query
   sdkEffort?: string; // Effort level for next SDK query
@@ -111,6 +120,7 @@ interface WorkspaceStore {
   createTab: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; tabType?: TabType; url?: string; background?: boolean }) => Promise<string>;
   createTabAfterCurrent: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; tabType?: TabType; url?: string; afterTabId?: string; nameSetManually?: boolean; background?: boolean }) => Promise<string>;
   closeTab: (projectId: string, tabId: string, options?: { skipProcessCheck?: boolean; forceCleanup?: boolean }) => Promise<void>;
+  reopenLastClosedTab: (projectId: string) => Promise<{ tabId: string | null; reason?: 'empty' | 'error' }>;
   switchTab: (projectId: string, tabId: string) => void;
   renameTab: (projectId: string, tabId: string, newName: string) => void;
 
@@ -399,6 +409,44 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
             newWorkspace.activeTabId = tabsArray[proj.activeTabIndex];
           }
         }
+      }
+
+      // SDK history pre-fetch: load JSONL for every SDK tab in parallel BEFORE
+      // dropping the RestoreLoader. The 13.6MB session parses in ~80ms server-
+      // side, IPC roundtrip ~150-300ms — running 3-4 in parallel keeps total
+      // wait under 500ms. Without this the loader hides → SDK tabs mount →
+      // each one fires its own loadHistory → user stares at empty chat until
+      // the IPC returns. Prefetch lives in a module-level map; ClaudeSDKTab's
+      // loadHistory drains it on first call, then falls back to fresh IPC.
+      const sdkPrefetchTasks: Array<Promise<void>> = [];
+      const cwdByProject = new Map<string, string>();
+      for (const ws of openProjects.values()) {
+        cwdByProject.set(ws.projectId, ws.projectPath);
+        for (const [, tab] of ws.tabs) {
+          if (tab.tabType === 'claude-sdk' && tab.claudeSessionId) {
+            const sessionId = tab.claudeSessionId;
+            const tabId = tab.id;
+            const cwd = tab.cwd || ws.projectPath;
+            sdkPrefetchTasks.push(
+              ipcRenderer
+                .invoke('claude-sdk:active-branch-messages', { sessionId, cwd })
+                .then((result: any) => {
+                  if (result?.success && Array.isArray(result.messages)) {
+                    setPrefetched(tabId, sessionId, result.messages);
+                  }
+                })
+                .catch((e: any) => {
+                  console.warn('[Restore] SDK prefetch failed for tab=' + tabId.slice(-12), e?.message || e);
+                })
+            );
+          }
+        }
+      }
+      if (sdkPrefetchTasks.length > 0) {
+        console.warn('[Restore] SDK prefetch starting count=' + sdkPrefetchTasks.length);
+        const t0 = Date.now();
+        await Promise.all(sdkPrefetchTasks);
+        console.warn('[Restore] SDK prefetch done count=' + sdkPrefetchTasks.length + ' durMs=' + (Date.now() - t0));
       }
 
       // SINGLE set() for all projects — one Workspace mount instead of N
@@ -740,6 +788,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
 
       const { pid } = await ipcRenderer.invoke('terminal:create', {
         tabId,
+        projectId,
         cwd: newTab.cwd,
         rows: 24,
         cols: 80,
@@ -820,6 +869,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
 
     const { pid } = await ipcRenderer.invoke('terminal:create', {
       tabId,
+      projectId,
       cwd: newTab.cwd,
       rows: 24,
       cols: 80,
@@ -885,10 +935,14 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
 
     const tab = workspace.tabs.get(tabId);
     const skipProcessCheck = options?.skipProcessCheck || false;
+    // OSC 133 process state — captured before potential confirm() dialog so we
+    // can persist whether the tab had a live CLI for Shift+Cmd+T reopen logic.
+    let processWasRunning = false;
 
     if (!skipProcessCheck && tab?.tabType !== 'claude-sdk') {
       // Check if terminal has running process via OSC 133 state (fast, no syscalls)
       const commandState = await ipcRenderer.invoke('terminal:getCommandState', tabId);
+      processWasRunning = !!commandState?.isRunning;
 
       if (commandState.isRunning) {
         // Only call hasRunningProcess to get process name (single syscall, not polling)
@@ -906,7 +960,26 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         );
         if (!confirmed) return;
       }
+    } else if (tab?.tabType !== 'claude-sdk') {
+      // skipProcessCheck path (programmatic close) — still need processWasRunning
+      // for archive, so we read OSC 133 state without prompting.
+      try {
+        const cs = await ipcRenderer.invoke('terminal:getCommandState', tabId);
+        processWasRunning = !!cs?.isRunning;
+      } catch {}
     }
+    // For SDK tabs, "running" means the SDK turn is mid-stream — we infer it
+    // from claudeBusy which is the same signal SessionActionChip watches.
+    if (tab?.tabType === 'claude-sdk') {
+      processWasRunning = !!(tab as any).claudeBusy;
+    }
+
+    // Compute TabBar position at close time (excluding sub-agent / utility
+    // tabs — they don't take a slot in the bar). Used as a placement hint by
+    // reopenLastClosedTab.
+    const orderedMainTabs = Array.from(workspace.tabs.values())
+      .filter(t => !t.parentTabId && !t.isUtility);
+    const closedPosition = orderedMainTabs.findIndex(t => t.id === tabId);
 
     // Stop SDK session if this is a claude-sdk tab + clear busy state
     if (tab?.tabType === 'claude-sdk') {
@@ -933,7 +1006,9 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           url: tab.url,
           createdAt: tab.createdAt,
           claudeSessionId: tab.claudeSessionId,
-          geminiSessionId: tab.geminiSessionId
+          geminiSessionId: tab.geminiSessionId,
+          position: closedPosition >= 0 ? closedPosition : null,
+          processWasRunning,
         }
       }).catch(() => {});
     }
@@ -970,6 +1045,91 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
 
     // Save tabs (forceCleanup when called from batch close)
     saveTabs(workspace.projectId, workspace.tabs, options?.forceCleanup);
+  },
+
+  // Shift+Cmd+T — pop the latest entry from tab_history for this project and
+  // recreate it. Position is restored as a hint (clamped if surrounding tabs
+  // changed). Claude/Gemini sessions auto-continue iff the underlying CLI was
+  // still alive at close time; if the user had already stopped the process
+  // before closing the tab, the restored tab just opens without firing claude-c.
+  reopenLastClosedTab: async (projectId) => {
+    const { openProjects, createTab, switchTab } = get();
+    const workspace = openProjects.get(projectId);
+    if (!workspace) return { tabId: null, reason: 'error' };
+
+    let resp: any;
+    try {
+      resp = await ipcRenderer.invoke('project:reopen-last-closed-tab', { projectId });
+    } catch (err) {
+      console.warn('[Reopen] IPC failed:', err);
+      return { tabId: null, reason: 'error' };
+    }
+    const entry = resp?.entry;
+    if (!entry) return { tabId: null, reason: 'empty' };
+
+    // Decide pendingAction: only auto-continue when the process was actually
+    // alive at close. Otherwise just open the tab in idle state — user can
+    // press Continue manually from InfoPanel if they want to resume.
+    const wasRunning = !!entry.process_was_running;
+    let pendingAction: PendingAction | undefined;
+    if (wasRunning) {
+      if (entry.command_type === 'claude' && entry.claude_session_id) {
+        pendingAction = { type: 'claude-continue', sessionId: entry.claude_session_id };
+      } else if (entry.command_type === 'gemini' && entry.gemini_session_id) {
+        pendingAction = { type: 'gemini-continue', sessionId: entry.gemini_session_id };
+      } else if (entry.command_type === 'claude') {
+        pendingAction = { type: 'claude-new' };
+      } else if (entry.command_type === 'gemini') {
+        pendingAction = { type: 'gemini-new' };
+      }
+    }
+
+    // Compute insertion index using the saved position as a hint. Sub-agent /
+    // utility tabs don't take a TabBar slot, so the index is over main tabs
+    // only — same projection used in closeTab when we recorded the position.
+    const mainTabIds = Array.from(workspace.tabs.values())
+      .filter(t => !t.parentTabId && !t.isUtility)
+      .map(t => t.id);
+    const hinted = typeof entry.position === 'number' ? entry.position : mainTabIds.length;
+    const targetIndex = Math.max(0, Math.min(mainTabIds.length, hinted));
+
+    // createTab appends at the end of main zone — we then shuffle the new tab
+    // into the saved slot by rebuilding the Map in the right order. This avoids
+    // touching createTab itself, which has many call sites.
+    const newTabId = await createTab(projectId, entry.name, entry.cwd, {
+      color: (entry.color || undefined) as TabColor | undefined,
+      notes: entry.notes || undefined,
+      commandType: (entry.command_type || undefined) as CommandType | undefined,
+      tabType: (entry.tab_type || 'terminal') as TabType,
+      url: entry.url || undefined,
+      pendingAction,
+      claudeSessionId: entry.claude_session_id || undefined,
+      geminiSessionId: entry.gemini_session_id || undefined,
+    });
+
+    // Re-order: pull the freshly-created tab out and splice it at targetIndex
+    // inside the main zone (utility tabs always stay after main).
+    const after = openProjects.get(projectId);
+    if (after && newTabId) {
+      const entries = Array.from(after.tabs.entries());
+      const newEntryIdx = entries.findIndex(([id]) => id === newTabId);
+      if (newEntryIdx !== -1) {
+        const newEntry = entries[newEntryIdx];
+        entries.splice(newEntryIdx, 1);
+
+        // Find where the main zone ends (first utility tab) in the
+        // post-removal array to clamp targetIndex inside it.
+        const utilStart = entries.findIndex(([, t]) => t.isUtility);
+        const mainEnd = utilStart === -1 ? entries.length : utilStart;
+        const clamped = Math.min(targetIndex, mainEnd);
+        entries.splice(clamped, 0, newEntry);
+        after.tabs = new Map(entries);
+        set({ openProjects: new Map(openProjects) });
+        saveTabs(after.projectId, after.tabs);
+      }
+      switchTab(projectId, newTabId);
+    }
+    return { tabId: newTabId || null };
   },
 
   switchTab: (projectId, tabId) => {

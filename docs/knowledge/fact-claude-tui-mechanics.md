@@ -44,9 +44,27 @@ ipcRenderer.send('terminal:input', tabId, 'prompt text\r')
 ```
 
 ## 4. Atomic Bracketed Paste
-Из-за лимита ядра **macOS TTYHOG (1024 bytes)**, длинный текст нужно бить на чанки.
-*   **НЕПРАВИЛЬНО:** Оборачивать каждый чанк в `\x1b[200~...`. Это создает N событий вставки (`[Pasted text #1], [Pasted text #2]...`).
-*   **ПРАВИЛЬНО:** Открывать `\x1b[200~` на первом чанке, закрывать `\x1b[201~` на последнем. Ink буферизирует поток и создает **одно** событие вставки.
+
+### Slow-mode (Claude Ink TUI) — single write, без chunking
+
+Один `term.write(\x1b[200~ + content + \x1b[201~)`. node-pty 1.2.0-beta.13 (PR #831) умеет писать >TTYHOG без потерь через `fs.write` + `EAGAIN` retry — TTYHOG больше не диктует разбивку. После записи **один** `waitForRender` (а не per-chunk). Ink эмитит ровно один `\x1b[?2026l`, когда `\x1b[201~` закрывает paste — это deterministic сигнал, что можно жать Enter.
+
+### Fast-mode (Gemini/bash) — chunking по 900 байт без waits
+
+Тот же single bracket pair, но payload бьётся на `CHUNK_MAX=900` и пишется back-to-back с tick'ом каждые 10 чанков. Никаких `waitForRender` — Ink не задействован, marker некому эмитить.
+
+### Что НЕ работает (и почему отказались)
+
+*   **НЕПРАВИЛЬНО:** Оборачивать каждый чанк в `\x1b[200~...\x1b[201~`. Создаёт N `[Pasted text #N]` chip'ов. 49 чанков = 49 chip'ов в UI.
+*   **НЕПРАВИЛЬНО:** Per-chunk `waitForRender` внутри открытого bracketed paste. Раньше slow-mode бил payload на 900-байтные чанки и ждал sync marker после каждого. Гипотеза была: «Ink эмитит `\x1b[?2026` на каждом промежуточном render cycle». **Гипотеза неверна.** Ink батчит все рендеры до `\x1b[201~` и эмитит marker только один раз — в конце. 53 промежуточных чанка ждут полный timeout (1000ms каждый) → 57 секунд тишины перед отправкой большого paste из очереди. См. [`fix-claude-paste-stuck-queue.md`](fix-claude-paste-stuck-queue.md) для repro из prod.
+
+### Гарантия отсутствия регрессий: PasteAudit
+
+После единственного `term.write` нет per-chunk verification. Post-hoc audit через UserPromptSubmit hook: `safePasteAndSubmit` перед Enter записывает `{expectedLen, expectedHash}` в `pendingPasteAudit.set(tabId, ...)`. Hook handler читает `transcript_path` JSONL, извлекает последний user-record, считает sha1, сравнивает. Mismatch → `[PasteAudit:MISMATCH] expectedLen=X actualLen=Y Δ=Z hashes...`. Подробнее в `fix-claude-paste-stuck-queue.md::Защита от регрессий`.
+
+### Параллельная причина N chip'ов на ручной Cmd+V
+
+Claude теряет свой DEC ?2004 при alt-screen toggle → xterm.js шлёт paste raw → TTYHOG режет → Ink делает N chip. См. секцию 9 ниже и [`fix-paste-bracket-mode-loss.md`](fix-paste-bracket-mode-loss.md). Это **другой** root cause тех же визуальных N chip'ов — наш chunking не задействован, дело в потере dec mode.
 
 ## 5. Виртуальный Скролл
 Меню истории Claude использует "ленивый" рендеринг.
@@ -78,4 +96,9 @@ ipcRenderer.send('terminal:input', tabId, 'prompt text\r')
 *   **Цвет:** Ранее использовался фильтр по оранжевому RGB (`215, 119, 87`), но это признано ненадежным из-за изменений в рендеринге Claude Code. Детекция теперь контентная (после стриппинга OSC).
 *   **Событийность:** Состояние `busy` активируется мгновенно при первом появлении символа спиннера. Возврат в `idle` происходит с **500ms дебаунсом** (тишины) после отсутствия спиннеров в потоке.
 *   **Подробнее:** См. [`fix-claude-busy-detection.md`](fix-claude-busy-detection.md).
+
+## 9. Alt-screen ⇄ DEC ?2004 state loss (Claude 2.1.110+)
+Claude Code с версии 2.1.110 (16 апреля 2026) использует fullscreen-renderer на alternate screen по умолчанию. При каждом переключении `\x1b[?1049h/l` Claude теряет свой DEC private mode 2004 (bracketed paste). Без `\x1b[?2004h` xterm.js не оборачивает Cmd+V в `\x1b[200~...\x1b[201~` — текст уходит в PTY как raw stream. Дальше его дробит macOS TTYHOG (~1KB watermark), Ink в Claude получает несколько data-event'ов между render cycle, каждый превращается в отдельный `[Pasted text #N]` chip. Поведение **рандомно меняется между сессиями** — в одной alt-screen toggle случился непосредственно перед paste и DEC ?2004 потерян, в другой нет.
+
+Фикс — env `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1` в PTY shell env (добавлен Anthropic в Claude 2.1.132, май 2026). Возвращает Claude к scrollback-renderer'у, alt-screen toggle перестаёт случаться, DEC ?2004 держится стабильно. Применяется к всем PTY безопасно — не-Claude процессы env игнорируют. См. [`fix-paste-bracket-mode-loss.md`](fix-paste-bracket-mode-loss.md).
 

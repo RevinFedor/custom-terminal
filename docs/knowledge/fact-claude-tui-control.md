@@ -48,6 +48,16 @@ ipcRenderer.invoke('claude:send-command', tabId, '/model sonnet');
 **Синхронный IPC (`claude:send-command`):**
 Команда отправляется через `ipcRenderer.invoke()` (синхронный вызов), что позволяет интерфейсу дождаться завершения `term.write()` и только после этого разблокировать кнопки.
 
+### Двух-уровневая защита: per-term mutex + claude:paste-busy
+
+Локальный `isControlBusy` защищает только от **двойного клика по той же кнопке**. Он не виден другим источникам команд — queue runner, MCP-handlers, /effort auto-inject, кнопки в других панелях. Если параллельно с UI-кликом Compact в InfoPanel запустился queue runner с большим prompt'ом, оба попадали в `safePasteAndSubmit` на одном `ptyProcess` → bytes интерлевились, команды терялись (сессия `bb95e71d`, 16:01 MSK 2026-05-16).
+
+Фикс — двух-уровневый:
+1. **Server-side mutex** в `safePasteAndSubmit` (WeakMap `pasteInflight: term → Promise`). Любой второй caller чейнится на хвост первого через `prev.then(...)`. Покрывает все 14 callsites автоматически.
+2. **Broadcast `claude:paste-busy { tabId, busy }`** main → renderer на enter/exit `safePasteAndSubmit`. InfoPanel слушает и через derived `isControlBusy = isControlBusyLocal || isPasteBusy` отключает кнопки, пока чужой paste идёт. Кнопка не дойдёт до `ipcRenderer.invoke` если ANY caller активен на active tab.
+
+См. [`fix-claude-paste-race.md`](fix-claude-paste-race.md).
+
 ## Stash Flow для slash-команд (Ctrl+S вместо Ctrl+C)
 
 ### Симптом (что видел пользователь)

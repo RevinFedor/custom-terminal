@@ -70,3 +70,14 @@ UI gating пока phase 2 не закончилась:
 Подключай `[WebTiming]` (server) и `Api.log('History', ...)` (client) **до** оптимизации, не после. Половина «оптимизаций» обычных людей чинит не то место.
 
 См. `knowledge/fact-mobile-web.md::Performance instrumentation` для тегов и шаблона диагностики.
+
+## Followup: replaced by NDJSON streaming + IDB (mai 2026)
+
+Описанный выше gzip + tail-first JSON two-phase подход был **переходным**. Финальная архитектура (deep-research отчёт + implementation):
+
+- **Wire**: NDJSON (one JSON per `\n`) поверх Brotli-4 stream — first useful paint падает с 4с до **~250ms** (рендер начинается как только первая строка дошла, не ждёт полного download).
+- **Render**: `react-virtuoso` вместо ручного window-slice — DOM bounded ~30 нод **независимо от total**, удалили `renderStart/renderEnd`/Load-older/full-screen-overlay/`fullLoading`.
+- **Cache**: IndexedDB record-store вместо localStorage 20MB blob (last на iOS вообще capped 2.5MB и тихо вайпается). Per-record key `[sessionId, ord]`. Read = structured-clone, **нет JSON.parse** на хот-пути. Delta sync через `?after=<lastUuid>` — повторный mount чата мгновенный.
+- **Two-phase cold**: `?last=200` (paint) → `?before=<firstTailUuid>` (prefix backfill в фоне). Между ними `prefixMergeLockRef` блокирует WS apply, deferred queue drain'ится после merge — иначе live message теряется.
+
+См. `knowledge/fact-mobile-web.md::History pipeline` для актуального flow.

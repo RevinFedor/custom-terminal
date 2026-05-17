@@ -12,6 +12,10 @@ Per-tab очередь: `Map<tabId, { items: QueuedPrompt[], autoRun: boolean, s
 - `autoRun` — на каждый `claude:busy-state` busy:true→false pop'аем head и шлём `claude:send-command`. После последнего prompt'а **auto-disarm** (`setAutoRun(false)` если очередь стала пустой).
 - `stopAfter` — после следующего turn-end если очередь пуста, вызывает `terminal:stop-ai-process` (SIGTERM по PID). One-shot: disarm после первого срабатывания. Независим от `autoRun` — можно использовать "пиши промпт сам → ответ → авто-стоп".
 
+**SQLite persistence через `app:setState`.** `items` / `autoRun` / `stopAfter` per-tab сохраняются в `app_state` под ключом `promptQueueByTab` (JSON-encoded `Record<tabId, {items, autoRun, stopAfter}>`). Throttle 250мс на каждый mutator — drag-reorder и быстрый ввод не должны писать SQLite 60 раз/сек, но последнее значение перед unmount-ом гарантированно flush'нется. `previewId` (UI-only state) **не** персистится. Cold tabs (пустой queue + autoRun=false + stopAfter=false) при serialize'е дропаются — kv-таблица не пухнет от мёртвых табов. Hydrate один раз через `hydratePromptQueueStore()` в `App.tsx::useEffect([])` — fire-and-forget, runner ниже терпит появление items после mount'а через subscribe-механизм (см. cold-start).
+
+**Auto-arm Run after на первый chip.** Когда `items.length === 0 && autoRun === false` и юзер дергает `+ grab` или `+ add` — `autoArmIfFirst()` ставит `setAutoRun(true)` ДО `addPrompt`. Логика: пустая очередь + добавление = намерение «хочу автозапуск», иначе зачем класть в очередь вместо обычной отправки. Subsequent adds в уже-armed очередь не re-arm (state уже true). Если юзер потом вручную выключил Run after — следующее добавление не reactivate'ит (`items.length > 0` после disarm). Триггер строго на edge `0 → first`.
+
 ### 2. Overlay UI (`PromptQueueOverlay.tsx`)
 Sticky 240px справа-вверху Claude таба. Гейтится тремя условиями:
 - `commandType === 'claude'` (не bash/gemini)
@@ -35,6 +39,8 @@ Claude Code TUI имеет хоткей `Ctrl+G` → `chat:externalEditor` → `
 | `<no lock>` | passthrough на `$NOTED_ORIGINAL_EDITOR` (user's Sublime/vim) | редактор юзера управляет |
 
 **Lock потребляется на чтении** (`unlinkSync`) — стейл не может выстрелить случайно на следующий Ctrl+G.
+
+**Поле `sock` в lock-payload — authoritative routing к owner-main'у.** Lock-файл пишет тот main, который отправил Ctrl+G в PTY и держит `grabInputPending[tabId]` Promise. Helper-script обязан вернуть `GrabInput` envelope именно этому main'у, иначе oригинальный main timeout'ит на 3000ms. Раньше helper резолвил sock через cwd-discovery — это ломалось когда dev+prod open'или один cwd (longest-prefix tie, выбирался arbitrarily). Теперь main кладёт в lock `{mode, ts, sock: CLAUDE_HOOK_SOCK}`, helper читает `sock` и connect'ится ровно туда без discovery. cwd-routing остаётся fallback ТОЛЬКО для passthrough-mode (когда lock'а нет — manual Ctrl+G юзера, ожидающего свой Sublime). См. `fix-claude-hook-silent-dropouts.md::Слой 4`.
 
 **Truncate FIRST в `grab` mode:** перед socket-write. Если socket упадёт — инпут Claude всё равно очистится. Recoverable. В `copy` mode — наоборот, **не** truncate, user должен видеть свой текст обратно.
 
@@ -108,7 +114,12 @@ Overlay рендерится через гейт `effectiveActive && isClaudeTab
 
 Когда юзер добавляет промпт через `+ grab` / `+ add` в **idle** Claude таб — autoRun должен сразу отправить, не ждать первого busy→idle цикла (которого никогда не будет если Claude уже idle).
 
-Реализация: вторая часть hook'а подписывается на `usePromptQueueStore.subscribe` и ловит transition `items.length: 0 → N` для табов где `autoRun=true` и `prevBusyRef.get(tabId) === false`. Re-entrancy guard `firing = true/false` защищает от двойного fire (popNext → state change → ещё один subscribe-callback → потенциальная рекурсия).
+Реализация: вторая часть hook'а подписывается на `usePromptQueueStore.subscribe` и ловит **два независимых edge'а**, любой из которых триггерит fire когда `claude is idle && queue.autoRun && items.length > 0`:
+
+- `items 0 → N` — юзер добавил chip когда autoRun уже армлен.
+- `autoRun false → true` — юзер только что нажал «Run after» когда items уже стояли в очереди (например, Claude закончил отвечать, юзер забыл нажать Run after до отправки промптов, потом вспомнил).
+
+Второй edge — реальный шрам: без него юзер арм-ал Run after поверх готовой очереди и ничего не запускалось до следующего вручную отправленного промпта (которого он не собирался отправлять — для этого и была очередь). Re-entrancy guard `firing = true/false` защищает от двойного fire (popNext → state change → ещё один subscribe-callback → потенциальная рекурсия).
 
 ### Auto-disarm
 
@@ -133,7 +144,7 @@ Overlay рендерится через гейт `effectiveActive && isClaudeTab
 | `~/.claude/hooks/noted-code-grab.js` | Helper script, lock-file dispatcher |
 | `/tmp/noted-grab-<claudePID>.json` | Mode lock-file, consumed on read |
 | `/tmp/noted-terminal-claude-hook.sock` | Unix socket для GrabInput payload |
-| `src/main/main.js::captureClaudeInput` | Shared между `claude:grab-input` и `claude:copy-input` |
+| `src/main/main.js::captureClaudeInput` | Shared между `claude:grab-input` и `claude:copy-input`. Делает `process.kill(claudePid, 0)` alive-probe перед всем — если кэш PID мёртвый, возвращает `stale_pid` сразу, не пишет lock и не шлёт Ctrl+G. См. [`fix-prompt-queue-stale-pid.md`](fix-prompt-queue-stale-pid.md). |
 | `src/main/main.js::claude:clear-input` | Fire-and-forget вариант без socket roundtrip |
 | `src/renderer/store/usePromptQueueStore.ts` | Per-tab queue + autoRun + stopAfter state |
 | `src/renderer/components/Workspace/PromptQueueOverlay.tsx` | UI overlay (gated by active tab) — only renders pills/chips/editor, NO runner logic |
@@ -146,3 +157,6 @@ Overlay рендерится через гейт `effectiveActive && isClaudeTab
 - **Stash flow (Ctrl+S)** — кладёт draft в `stashedPrompt` slot, инпут визуально пуст. Но stash восстанавливается **при следующем обычном submit** — если юзер потом напишет `hello\r`, Claude вернёт `<stashed>` + `hello`. Не работает для нашего случая.
 - **Double Ctrl+S (stash → pop)** — `handleStash` bi-directional, второй Ctrl+S попнет stash **в инпут**, не очистит. Тупик.
 - **Auto-runner внутри PromptQueueOverlay компонента** — первая реализация. Слушал `claudeBusy` prop, делал `wasBusy → !claudeBusy` edge detection через `useRef`. Падало когда юзер переключался на другой таб: overlay unmount'ится по гейту `effectiveActive`, runner с ним умирает, следующий busy→idle transition в фоне не ловится. Переехал в `usePromptQueueRunner` hook на App root. Урок переносимый — любой listener для **глобальных** событий (IPC от main, OS-level signals) не должен жить в gated-by-active-tab компонентах. См. `methodology/design.md::Singleton listener для global events, не в conditionally-rendered компонентах`.
+- **Silent 3s timeout без specific error code** — был один код `editor_not_wired` на ВСЁ что пошло не так после `term.write('\x07')`. Helper не запустился, ppid не сматчился, socket упал — всё превращалось в одинаковый toast «Helper not reachable» через 3 секунды. Юзер не знал что делать. Прод-лог за 13:20-13:21 показал что одинаковый симптом приходил из **двух** разных источников (мёртвый cached PID + слишком ранний клик после spawn) — оба молчали 3 секунды и оба выдавали тот же toast. Фикс: `stale_pid` отдельным кодом с прямой инструкцией «close & reopen this tab». См. [`fix-prompt-queue-stale-pid.md`](fix-prompt-queue-stale-pid.md), общий принцип — `methodology/design.md::Cached external resource: alive-probe перед использованием`.
+- **Per-chunk `waitForRender` на slow-mode paste из очереди** — давал 57с гэп между cold-start `popNext()` и фактическим UserPromptSubmit для 50KB payload (56 чанков × 1000ms timeout). Юзер думал что очередь сломана. Root cause: Ink батчит рендеры до `\x1b[201~`, sync marker эмитит один раз в конце, не на каждом промежуточном чанке. Фикс: single write для slow-mode (chunks.length === 1 by construction), один post-write `waitForRender`. См. [`fix-claude-paste-stuck-queue.md`](fix-claude-paste-stuck-queue.md).
+- **Pre-block grab по `claudeSpinnerBusy`** — первая попытка фикса misleading `editor_not_wired` toast'а во время стрима. Логика: если Claude стримит ответ, Ctrl+G no-op'нется в TUI (`chat:externalEditor` binding неактивен mid-turn) → helper не запустится → timeout → красный toast. Решение «не пускать grab вообще пока spinner busy» казалось правильным. Юзер прямо возразил: *«нет, +grab наоборот должен работать когда стриминг — это и есть его смысл, поставить промпт в очередь пока Claude думает»*. Откатили pre-block, остался только hook-confirmed `claudeTurnBusy === true` (короткое окно когда Stop hook ещё не пришёл). Замена для misleading toast'а — diagnostic-on-timeout: snapshot'им size `/tmp/noted-grab-helper.log` ДО `term.write('\x07')` и после 3с timeout. Если log не вырос — helper не запустился (Ctrl+G ate by TUI) → resolve `claude_busy` toast «Claude is busy…». Если log вырос — helper отработал но не достиг socket → `editor_not_wired` остаётся. См. `methodology/design.md::Action валиден mid-state — не блокировать по чужому busy-флагу` и `methodology/design.md::Diagnose with instrumentation, not guesses`.

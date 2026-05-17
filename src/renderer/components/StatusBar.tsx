@@ -1,17 +1,28 @@
-import React, { useRef, useState, useEffect } from 'react';
+import React, { useRef, useState, useEffect, useMemo } from 'react';
 import { createPortal } from 'react-dom';
+import { Settings } from 'lucide-react';
 import { useUIStore, DefaultClaudeEffort } from '../store/useUIStore';
+import { usePromptsStore } from '../store/usePromptsStore';
 import { CLAUDE_EFFORT_LEVELS_WITH_NONE, CLAUDE_EFFORT_LABELS } from '../constants/claudeLevels';
 import { useCmdKey } from '../hooks/useCmdHoverPopover';
 import Tooltip from './UI/Tooltip';
 
+const { ipcRenderer } = window.require('electron');
+
 // VSCode-style status bar pinned to the bottom of the app.
-// Currently hosts development toggles and a default-effort selector;
-// will grow to include git/branch/lints/etc.
+// Currently hosts development toggles, a default-effort selector,
+// an invalid-paths counter for AI prompt attachments, and a settings cog.
+// Will grow to include git/branch/lints/etc.
 // Right side is reserved for less-frequent toggles (debug, defaults).
-export default function StatusBar() {
+interface StatusBarProps {
+  onOpenSettings?: () => void;
+}
+
+export default function StatusBar({ onOpenSettings }: StatusBarProps) {
   const debugHoverBridges = useUIStore((s) => s.debugHoverBridges);
   const setDebugHoverBridges = useUIStore((s) => s.setDebugHoverBridges);
+  const freezeCmdPopups = useUIStore((s) => s.freezeCmdPopups);
+  const setFreezeCmdPopups = useUIStore((s) => s.setFreezeCmdPopups);
   const freePortsBeforeStart = useUIStore((s) => s.freePortsBeforeStart);
   const setFreePortsBeforeStart = useUIStore((s) => s.setFreePortsBeforeStart);
   const defaultClaudeEffort = useUIStore((s) => s.defaultClaudeEffort);
@@ -21,7 +32,7 @@ export default function StatusBar() {
     <div
       className="flex items-center justify-between select-none border-t border-[#222] bg-[#1a1a1a]"
       style={{
-        height: 22,
+        height: 24,
         flexShrink: 0,
         color: '#888',
         paddingLeft: 6,
@@ -48,8 +59,116 @@ export default function StatusBar() {
           onClick={() => setDebugHoverBridges(!debugHoverBridges)}
           activeColor="#ef4444"
         />
+        <InvalidPathsChip onOpenSettings={onOpenSettings} />
+        <StatusToggle
+          label="freeze tooltips"
+          title="ВКЛ: Cmd-tooltip / note / fork popup'ы НЕ закрываются при уходе курсора и отпускании Cmd — для инспекции их DOM в devtools."
+          active={freezeCmdPopups}
+          onClick={() => setFreezeCmdPopups(!freezeCmdPopups)}
+          activeColor="#fbbf24"
+        />
+        <SettingsButton onClick={onOpenSettings} />
       </div>
     </div>
+  );
+}
+
+// Counter of broken file paths attached to AI prompts (+ doc-prompt file, if it's used).
+// Subscribes to usePromptsStore so it recomputes on save/delete; rechecks disk via
+// `ai-prompts:check-paths` IPC with a 300ms debounce. Click → opens Settings (caller
+// can route to the AI tab; we just open the modal for now).
+function InvalidPathsChip({ onOpenSettings }: { onOpenSettings?: () => void }) {
+  const prompts = usePromptsStore((s) => s.prompts);
+  const isLoaded = usePromptsStore((s) => s.isLoaded);
+  const docPrompt = useUIStore((s) => s.docPrompt);
+  const [missing, setMissing] = useState<string[]>([]);
+
+  // Flat list of every absolute path we care about (prompts × filePaths + docPrompt.filePath
+  // if useFile is on). useMemo with JSON serialization gives a stable string dependency for
+  // useEffect — Zustand returns new array references on every set, but the actual content
+  // changes rarely. This avoids re-running the check on unrelated store mutations.
+  const allPathsKey = useMemo(() => {
+    const paths: string[] = [];
+    for (const p of prompts) {
+      if (Array.isArray(p.filePaths)) {
+        for (const fp of p.filePaths) if (typeof fp === 'string' && fp.trim()) paths.push(fp);
+      }
+    }
+    if (docPrompt?.useFile && docPrompt.filePath?.trim()) paths.push(docPrompt.filePath);
+    return JSON.stringify(paths);
+  }, [prompts, docPrompt]);
+
+  useEffect(() => {
+    if (!isLoaded) return;
+    let cancelled = false;
+    const paths: string[] = JSON.parse(allPathsKey);
+    if (paths.length === 0) { setMissing([]); return; }
+    const t = setTimeout(async () => {
+      try {
+        const res = await ipcRenderer.invoke('ai-prompts:check-paths', paths);
+        if (!cancelled && res?.success) setMissing(res.missing || []);
+      } catch (e) {
+        if (!cancelled) setMissing([]);
+      }
+    }, 300);
+    return () => { cancelled = true; clearTimeout(t); };
+  }, [allPathsKey, isLoaded]);
+
+  if (missing.length === 0) return null;
+
+  // Tooltip shows truncated list of missing files so the user can confirm what's broken
+  // without opening Settings. Limited to first 5 to avoid an unbounded balloon.
+  const preview = missing.slice(0, 5).join('\n') + (missing.length > 5 ? `\n…+${missing.length - 5}` : '');
+  const tooltip = `Невалидные пути в AI-промптах (${missing.length}):\n${preview}\n\nКлик → Настройки.`;
+
+  return (
+    <Tooltip content={tooltip}>
+      <button
+        onClick={onOpenSettings}
+        className="inline-flex items-center cursor-pointer rounded"
+        style={{
+          gap: 4,
+          padding: '0 8px',
+          height: 20,
+          backgroundColor: 'rgba(218, 119, 86, 0.12)',
+          color: '#DA7756',
+          fontVariantNumeric: 'tabular-nums',
+          fontWeight: 600,
+          border: 'none',
+          outline: 'none',
+        }}
+        onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'rgba(218, 119, 86, 0.22)'; }}
+        onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'rgba(218, 119, 86, 0.12)'; }}
+      >
+        <span style={{ fontSize: 13, lineHeight: 1 }}>!</span>
+        <span style={{ fontSize: 12 }}>{missing.length}</span>
+      </button>
+    </Tooltip>
+  );
+}
+
+function SettingsButton({ onClick }: { onClick?: () => void }) {
+  return (
+    <Tooltip content="Открыть настройки">
+      <button
+        onClick={onClick}
+        aria-label="Settings"
+        className="inline-flex items-center justify-center cursor-pointer rounded"
+        style={{
+          width: 22,
+          height: 20,
+          padding: 0,
+          background: 'transparent',
+          color: '#bbb',
+          border: 'none',
+          outline: 'none',
+        }}
+        onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.color = '#fff'; (e.currentTarget as HTMLButtonElement).style.background = 'rgba(255,255,255,0.08)'; }}
+        onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.color = '#bbb'; (e.currentTarget as HTMLButtonElement).style.background = 'transparent'; }}
+      >
+        <Settings size={14} strokeWidth={1.75} />
+      </button>
+    </Tooltip>
   );
 }
 

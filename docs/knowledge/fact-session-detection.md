@@ -112,3 +112,27 @@ StatusLine Bridge определяет `tabId` через PID tree: `bridge.ppid
 ### Edge cases
 - Пользователь делает `cd /other-project && claude` в табе → PTY cwd обновляется через OSC 7 → `terminalProjects.set(tabId, newCwd)` → bridge.cwd = новый cwd → match → sessionId записывается. Работает.
 - Конфликт: таб привязан к hh-tool, юзер делает `cd /tmp && claude --resume <hh-toolSid>` — bridge.cwd = `/Desktop/hh-tool` (cwd сессии), tabCwd = `/tmp` → mismatch → guard блокирует. Это сознательный выбор — sessionId привязывается к cwd, не к табу.
+
+## Fix: Dead session_links + chain resolve trap
+
+### Симптомы
+- Manual ✎ Replace Session ID применился, но через секунду откатывается на другой UUID — ручной ввод не «прилипает».
+- Timeline пустой (0 entries) сразу после того как Bridge захватил свежий sessionId; в логах `[Timeline:ChainResolve] OVERWRITE` тут же сменяет sessionId на UUID без `.jsonl` на диске.
+- В правом сайдбаре после `claude-r <known-good-uuid>` показывается посторонняя сессия, чей UUID существует только как директория `<uuid>/subagents/` без JSONL.
+
+### Природа бага
+Три части собрались в один тихий сценарий. Subagent fork-flow внутри Claude TUI создаёт `~/.claude/projects/<slug>/<uuid>/subagents/` — UUID-папку без JSONL. `saveSessionLink(parent, child)` в `database.js` пишет любую ротацию sessionId которую видит Bridge, не проверяя что у child реальный файл. Со временем таблица `session_links` забивается мёртвыми ссылками. Тогда `resolveLatestSessionInChain` (`claude-data.js`), который вызывается в конце `claude:get-timeline`, идёт через `getSessionChild()` по этой таблице вперёд и возвращает renderer'у dead UUID как `latestSessionId`. Renderer видит расхождение с текущим sessionId и **перезаписывает store** через `setClaudeSessionId(tabId, <dead-uuid>)`. Следующий poll Timeline'а уже грузит несуществующий файл, видит `File not found`, рисует пустоту.
+
+Production-аудит (2026-05-15): в одной БД 45 записей в `session_links`, **44 мёртвых**. ✎ flap воспроизводился стабильно для любой сессии у которой была хоть одна мёртвая ссылка вниз по цепочке.
+
+### Решение
+Liveness-guard на трёх уровнях, общий probe — `findSessionFile(uuid, cwd)` (null если `<uuid>.jsonl` нигде нет):
+
+1. **`saveSessionLink(parent, child)`** в `database.js` — отказывается писать row если у child нет JSONL. Помечает в логе как `SKIPPING dead child ... (no JSONL file — likely subagent directory)`.
+2. **`resolveLatestSessionInChain`** в `claude-data.js` — перед тем как принять `getSessionChild()` результат, проверяет `findSessionFile`. Если null — `break`, цепочка обрывается на последнем живом UUID.
+3. **`resolveSessionChain`** (backward walk) — симметричный guard для `getSessionParent()`. Защита на будущее: если когда-то мёртвая запись попадёт со стороны родителя, цепочка не сломается.
+
+Старая БД чистится разово SQL-скриптом (`DELETE FROM session_links WHERE child_session_id IN (...)` для всех UUID без `.jsonl`). Бэкап создаётся автоматически. См. [`fix-dead-session-link-overwrite.md`](fix-dead-session-link-overwrite.md) для процедуры и точного скрипта.
+
+### Что НЕ ломаем
+`latestSessionId` overwrite остаётся легитимным механизмом для Clear Context chains: parent JSONL заканчивается bridge entry на child, Timeline корректно прыгает вперёд в child, юзеру не нужно вручную менять таб. Guard срабатывает только когда цепочка указывает в пустоту.

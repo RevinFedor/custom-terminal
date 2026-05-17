@@ -5,7 +5,7 @@
 
 ## User Flow
 1. **Inline preview** в нижней части `InfoPanel` — Markdown editor c content из `tab.notes`. Кликнул, печатаешь, сохранение автоматическое (через store update).
-2. **Slideout-режим** — нажимаешь header «← Open Заметки вкладки» (или `Cmd+E`), открывается ресайзаб­ельная панель слева от sidebar'а с тем же контентом. Закрывается клик-outside, Esc или повторный `Cmd+E`.
+2. **Slideout-режим** — нажимаешь header «← Open Заметки вкладки» (или `Cmd+J`), открывается ресайзаб­ельная панель слева от sidebar'а с тем же контентом. Закрывается клик-outside, Esc или повторный `Cmd+J`.
 3. **AI Paste** (`Cmd+/` → `📋 AI Paste` → `Cmd+V`):
    - В editor вставляется `^^ ⏳` placeholder и сворачивается.
    - Параллельно `onGenerateTitle(text)` уходит в Gemini (см. секцию AI Paste ниже).
@@ -14,8 +14,9 @@
 ## Behavior
 - **Per-tab persistence:** `tab.notes` хранится в `useWorkspaceStore.openProjects[].tabs[].notes`. Save через `setTabNotes(tabId, content)`. Сохраняется в SQLite через стандартный tab-persist pipeline.
 - **Per-tab open state:** `useUIStore.notesPanelOpenTabs: Record<tabId, boolean>` — каждая вкладка имеет независимое состояние «открыт slideout или нет».
-- **Cmd+E:** toggle slideout текущей вкладки. Раньше Cmd+E открывал fullscreen modal — теперь только slideout.
-- **Cmd+B:** toggle file-explorer sidebar (Cmd+E больше за это не отвечает).
+- **Cmd+J:** toggle slideout текущей вкладки. Слот раньше занимал `Cmd+E` (когда там жил Insert Prompt в native menu); перенесён, и сейчас `Cmd+E` — алиас на кастомный Opt+V prompt-picker (см. `fact-prompt-picker.md`), не native menu.
+- **Cmd+B:** toggle file-explorer sidebar.
+- **Opt+V (primary) / Cmd+E (alias):** открывают кастомный двухколонный prompt-picker (groups | prompts), keyboard-first, рендерится React Portal. Native macOS Menu.popup больше не используется как клавиатурный путь — он остался только для правого клика (`show-terminal-context-menu` / `show-sdk-context-menu`). Детали — `fact-prompt-picker.md`.
 - **Improved Scroll:** редактор использует `min-h-0` в flex-контейнере и `overflow-x: hidden` для CodeMirror.
 
 ## Tab Notes Slideout (per-tab панель)
@@ -47,9 +48,13 @@ Drag-handle на правом крае модалки (cursor `ns-resize`). dx �
 Принцип переносимый — см. `methodology/design.md::Hit-area > visual button`.
 
 ### Single source of truth: оба editor'а на одном `tab.notes`
-Inline editor в `InfoPanel` и slideout-editor `TabNotesSlideout` подписаны на **одно** поле `tab.notes` через reactive Zustand selector. Локальных mirror'ов нет — единственный источник истины это `tab.notes`. Любая правка идёт через `setTabNotes(tabId, content)`.
+Inline editor в `InfoPanel`, slideout-editor `TabNotesSlideout` и Cmd-hover preview в `TabPreviewPopover` подписаны на **одно** поле `tab.notes` через reactive Zustand selector. Локальных mirror'ов нет — единственный источник истины это `tab.notes`. Любая правка идёт через `setTabNotes(tabId, content)`.
 
-Без правильной обработки это вызывает ping-pong: dispatch в одном editor → react reactive → другой editor видит новый prop → его внутренний replaceAll dispatch → его CodeMirror updateListener вызывает onChange echo → ещё запись в store → бесконечный цикл, кончающийся `Position N is out of range`. См. `fix-codemirror-controlled-editor.md` про root cause и фикс через `userEvent: 'external-sync'` annotation.
+**Шрам:** в InfoPanel один раз mirror возвращался (`useState('') + useEffect(setTabNotes(liveTabNotes))`) — pattern затирал параллельные правки слайдаута во время async-handler'а Generate Description. Удалён повторно, см. `fix-infopanel-tabnotes-mirror.md`.
+
+**Font / padding — те же поля для всех трёх surface'ов.** `notesEditorFontSize` / `notesEditorPaddingX` / `notesEditorPaddingY` — единый набор. Раньше inline+preview и slide-out читали разные поля (`tabNotes*` vs `notesEditor*`) — один контент рендерился с тремя разными шрифтами; см. `fix-notes-font-fragmentation.md`.
+
+Без правильной обработки концепт «один store-source, два editor'а» вызывает ping-pong: dispatch в одном editor → react reactive → другой editor видит новый prop → его внутренний replaceAll dispatch → его CodeMirror updateListener вызывает onChange echo → ещё запись в store → бесконечный цикл, кончающийся `Position N is out of range`. См. `fix-codemirror-controlled-editor.md` про root cause и фикс через `userEvent: 'external-sync'` annotation.
 
 Принцип переносимый — см. `methodology/design.md::Controlled editor: пометь свои dispatch'и`.
 

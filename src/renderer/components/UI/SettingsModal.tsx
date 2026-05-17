@@ -54,7 +54,8 @@ function FontSizeSlider({
   value,
   onChange,
   min,
-  max
+  max,
+  suffix = 'px',
 }: {
   label: string;
   description: string;
@@ -62,6 +63,7 @@ function FontSizeSlider({
   onChange: (v: number) => void;
   min: number;
   max: number;
+  suffix?: string;
 }) {
   const btnStyle: React.CSSProperties = {
     width: '24px',
@@ -111,7 +113,7 @@ function FontSizeSlider({
           border: '1px solid #2a2a2a',
           borderRadius: '6px',
           fontFamily: 'monospace',
-        }}>{value}px</div>
+        }}>{value}{suffix}</div>
         <button
           aria-label="+"
           style={btnStyle}
@@ -195,17 +197,24 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
   const projectTabsFontSize = useUIStore((s) => s.projectTabsFontSize);
   const sidebarFontSize = useUIStore((s) => s.sidebarFontSize);
   const filePreviewFontSize = useUIStore((s) => s.filePreviewFontSize);
+  const promptPickerFontSize = useUIStore((s) => s.promptPickerFontSize);
+  const setPromptPickerFontSize = useUIStore((s) => s.setPromptPickerFontSize);
+  const timelineFontSize = useUIStore((s) => s.timelineFontSize);
+  const timelineLineClamp = useUIStore((s) => s.timelineLineClamp);
+  const setTimelineLineClamp = useUIStore((s) => s.setTimelineLineClamp);
   const setTerminalFontSize = useUIStore((s) => s.setTerminalFontSize);
   const setTabsFontSize = useUIStore((s) => s.setTabsFontSize);
   const setProjectTabsFontSize = useUIStore((s) => s.setProjectTabsFontSize);
   const setSidebarFontSize = useUIStore((s) => s.setSidebarFontSize);
   const setFilePreviewFontSize = useUIStore((s) => s.setFilePreviewFontSize);
-  const tabNotesFontSize = useUIStore((s) => s.tabNotesFontSize);
-  const setTabNotesFontSize = useUIStore((s) => s.setTabNotesFontSize);
-  const tabNotesPaddingX = useUIStore((s) => s.tabNotesPaddingX);
-  const setTabNotesPaddingX = useUIStore((s) => s.setTabNotesPaddingX);
-  const tabNotesPaddingY = useUIStore((s) => s.tabNotesPaddingY);
-  const setTabNotesPaddingY = useUIStore((s) => s.setTabNotesPaddingY);
+  const setTimelineFontSize = useUIStore((s) => s.setTimelineFontSize);
+  // Tab Preview popover (CMD+hover на табах и Home-карточках) — отдельные knobs
+  // для общей ширины и предела высоты notes в строках. Шрифт/padding единые с
+  // inline и slide-out (notesEditor*), задаются в одном месте ниже.
+  const tabPreviewWidth = useUIStore((s) => s.tabPreviewWidth);
+  const setTabPreviewWidth = useUIStore((s) => s.setTabPreviewWidth);
+  const tabPreviewMaxLines = useUIStore((s) => s.tabPreviewMaxLines);
+  const setTabPreviewMaxLines = useUIStore((s) => s.setTabPreviewMaxLines);
   const notesEditorFontSize = useUIStore((s) => s.notesEditorFontSize);
   const setNotesEditorFontSize = useUIStore((s) => s.setNotesEditorFontSize);
   const notesEditorPaddingX = useUIStore((s) => s.notesEditorPaddingX);
@@ -1130,32 +1139,42 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                 <FontSizeSlider label="Табы" description="Табы воркспейса" value={tabsFontSize} onChange={setTabsFontSize} min={10} max={20} />
                 <FontSizeSlider label="Проекты" description="Чипы проектов" value={projectTabsFontSize} onChange={setProjectTabsFontSize} min={10} max={16} />
                 <FontSizeSlider label="Превью файла" description="Чтение файла в сайдбаре" value={filePreviewFontSize} onChange={setFilePreviewFontSize} min={10} max={24} />
+                <FontSizeSlider label="Prompt picker" description="Opt+V — две колонки с промптами" value={promptPickerFontSize} onChange={setPromptPickerFontSize} min={9} max={20} />
+                <FontSizeSlider label="Таймлайн" description="Превью записей" value={timelineFontSize} onChange={setTimelineFontSize} min={10} max={18} />
+                <FontSizeSlider label="Таймлайн — строки" description="Высота превью в развёрнутом" value={timelineLineClamp} onChange={setTimelineLineClamp} min={1} max={10} suffix="" />
               </div>
 
-              {/* Two distinct surfaces with two distinct sizing knobs:
-                  • Превью — the inline notes box at the bottom of the InfoPanel.
-                  • Редактор — the resizable slide-out (Open button next to "ЗАМЕТКИ ВКЛАДКИ"). */}
+              {/* Единые настройки для всех мест, где показывается tab.notes:
+                  inline в сайдбаре, slide-out, CMD+hover preview popover.
+                  Раньше inline/preview и slide-out имели отдельные ползунки →
+                  один контент рендерился с тремя разными шрифтами. */}
               <div style={{ marginTop: '20px', paddingTop: '14px', borderTop: '1px solid #2a2a2a' }}>
                 <div style={{ fontSize: '11px', fontWeight: 600, color: '#666', marginBottom: '10px', textTransform: 'uppercase' }}>
-                  Превью заметок (в сайдбаре)
+                  Заметки вкладки
                 </div>
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
-                  <FontSizeSlider label="Шрифт" description="Размер текста в превью" value={tabNotesFontSize} onChange={setTabNotesFontSize} min={10} max={20} />
-                  <div />
-                  <FontSizeSlider label="Padding X" description="Горизонтальный отступ" value={tabNotesPaddingX} onChange={setTabNotesPaddingX} min={0} max={32} />
-                  <FontSizeSlider label="Padding Y" description="Вертикальный отступ" value={tabNotesPaddingY} onChange={setTabNotesPaddingY} min={0} max={32} />
-                </div>
-              </div>
-
-              <div style={{ marginTop: '20px', paddingTop: '14px', borderTop: '1px solid #2a2a2a' }}>
-                <div style={{ fontSize: '11px', fontWeight: 600, color: '#666', marginBottom: '10px', textTransform: 'uppercase' }}>
-                  Редактор заметок (slide-out)
-                </div>
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
-                  <FontSizeSlider label="Шрифт" description="Размер текста в slide-out" value={notesEditorFontSize} onChange={setNotesEditorFontSize} min={10} max={28} />
+                  <FontSizeSlider label="Шрифт" description="Inline, slide-out и hover preview" value={notesEditorFontSize} onChange={setNotesEditorFontSize} min={10} max={28} />
                   <div />
                   <FontSizeSlider label="Padding X" description="Горизонтальный отступ" value={notesEditorPaddingX} onChange={setNotesEditorPaddingX} min={0} max={48} />
                   <FontSizeSlider label="Padding Y" description="Вертикальный отступ" value={notesEditorPaddingY} onChange={setNotesEditorPaddingY} min={0} max={48} />
+                </div>
+              </div>
+
+              {/* Tab Preview popover (CMD+hover на табах + Home-карточках) —
+                  ширина и предел высоты в строках живут отдельно от шрифта
+                  заметок: у preview свои визуальные пропорции (380px wide,
+                  ~8 строк по умолчанию). Resize handles на самом popover'е
+                  флушат значения в эти же поля. */}
+              <div style={{ marginTop: '20px', paddingTop: '14px', borderTop: '1px solid #2a2a2a' }}>
+                <div style={{ fontSize: '11px', fontWeight: 600, color: '#666', marginBottom: '10px', textTransform: 'uppercase' }}>
+                  Превью таба (Cmd+hover)
+                </div>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
+                  {/* Store держит float (drag даёт 5.487 — рамка не прыгает на flush).
+                      Stepper показывает Math.round + onChange передаёт целое: +/-
+                      работают шагом в 1. */}
+                  <FontSizeSlider label="Ширина" description="Размер окна по горизонтали" value={Math.round(tabPreviewWidth)} onChange={setTabPreviewWidth} min={240} max={900} />
+                  <FontSizeSlider label="Макс. строк" description="Высота notes в строках" value={Math.round(tabPreviewMaxLines)} onChange={setTabPreviewMaxLines} min={2} max={40} suffix="" />
                 </div>
               </div>
 

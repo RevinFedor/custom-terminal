@@ -107,7 +107,6 @@ export default function FilePreview() {
           fontSize={filePreviewFontSize}
           wordWrap
           showLineNumbers
-          foldStateKey={`file-preview:${filePreview.path}`}
         />
       </div>
     </div>,

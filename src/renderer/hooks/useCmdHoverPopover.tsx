@@ -36,6 +36,14 @@ export interface HoveredItem<T> {
 export interface CmdHoverPopoverReturn<T> {
   hoveredItem: HoveredItem<T> | null;
   isVisible: boolean;
+  /**
+   * Закреп: CMD+Shift над trigger'ом → popover становится «прибитым». В locked
+   * состоянии все hover-выходы / переключения на другие триггеры игнорируются.
+   * Снимается повторным CMD+Shift или любым mousedown в приложении вне popover'а
+   * (popover-элемент должен иметь атрибут `data-cmd-hover-popover` чтобы внутренние
+   * клики/drag'и не разлочивали).
+   */
+  isLocked: boolean;
   /** Spread on trigger element: { onMouseEnter, onMouseLeave } */
   triggerProps: (id: T) => {
     onMouseEnter: (e: React.MouseEvent) => void;
@@ -51,6 +59,8 @@ export interface CmdHoverPopoverReturn<T> {
   };
   /** Force close */
   close: () => void;
+  /** Toggle lock (used by external triggers if нужно). */
+  toggleLock: () => void;
 }
 
 export function useCmdHoverPopover<T>(
@@ -59,7 +69,14 @@ export function useCmdHoverPopover<T>(
 ): CmdHoverPopoverReturn<T> {
   const [hoveredItem, setHoveredItem] = useState<HoveredItem<T> | null>(null);
   const [isPinned, setIsPinned] = useState(false);
+  const [isLocked, setIsLocked] = useState(false);
   const closeRef = useRef<NodeJS.Timeout | null>(null);
+  // Зеркала state'а для синхронного чтения в keydown/mousedown слушателях:
+  // window-handlers замыкают первое значение state'а на момент подписки.
+  const isLockedRef = useRef(false);
+  const hoveredItemRef = useRef<HoveredItem<T> | null>(null);
+  useEffect(() => { isLockedRef.current = isLocked; }, [isLocked]);
+  useEffect(() => { hoveredItemRef.current = hoveredItem; }, [hoveredItem]);
 
   // Cleanup on unmount
   useEffect(() => () => {
@@ -74,11 +91,15 @@ export function useCmdHoverPopover<T>(
   }, []);
 
   const setHovered = useCallback((id: T, rect: DOMRect) => {
+    // В locked-режиме игнорируем перенаведение на другие триггеры —
+    // popover остаётся прибитым к исходному элементу.
+    if (isLockedRef.current) return;
     cancelClose();
     setHoveredItem({ id, rect });
   }, [cancelClose]);
 
   const clearHovered = useCallback((id: T) => {
+    if (isLockedRef.current) return;
     closeRef.current = setTimeout(() => {
       setHoveredItem(prev => (prev && prev.id === id ? null : prev));
       closeRef.current = null;
@@ -87,10 +108,12 @@ export function useCmdHoverPopover<T>(
 
   const triggerProps = useCallback((id: T) => ({
     onMouseEnter: (e: React.MouseEvent) => {
+      if (isLockedRef.current) return;
       cancelClose();
       setHoveredItem({ id, rect: e.currentTarget.getBoundingClientRect() });
     },
     onMouseLeave: () => {
+      if (isLockedRef.current) return;
       closeRef.current = setTimeout(() => {
         setHoveredItem(prev => (prev && prev.id === id ? null : prev));
         closeRef.current = null;
@@ -100,10 +123,12 @@ export function useCmdHoverPopover<T>(
 
   const popoverProps = useMemo(() => ({
     onMouseEnter: () => {
+      if (isLockedRef.current) return;
       cancelClose();
       setIsPinned(true);
     },
     onMouseLeave: () => {
+      if (isLockedRef.current) return;
       setHoveredItem(null);
       setIsPinned(false);
       cancelClose();
@@ -113,12 +138,59 @@ export function useCmdHoverPopover<T>(
   const close = useCallback(() => {
     setHoveredItem(null);
     setIsPinned(false);
+    setIsLocked(false);
     cancelClose();
   }, [cancelClose]);
 
-  const isVisible = (isCmdPressed || isPinned) && hoveredItem !== null;
+  const toggleLock = useCallback(() => {
+    // Закреплять можно только когда есть hovered trigger — снаружи бессмысленно.
+    if (!hoveredItemRef.current && !isLockedRef.current) return;
+    setIsLocked(prev => {
+      const next = !prev;
+      // При закрепе popover остаётся видимым даже без CMD — pin сохраняем.
+      // При снятии замка естественный hover-life-cycle продолжится: если
+      // курсор сейчас вне triggers/popover, mouseleave уже зависел от lock,
+      // поэтому даём пользователю шанс уйти штатно — просто снимаем lock,
+      // ничего не закрываем сразу.
+      if (next) setIsPinned(true);
+      return next;
+    });
+  }, []);
 
-  return { hoveredItem, isVisible, triggerProps, setHovered, clearHovered, popoverProps, close };
+  // ─── Глобальные слушатели для lock-режима ──────────────────
+  useEffect(() => {
+    // CMD+Shift toggle. Любое нажатие Shift при зажатом Meta — переключает
+    // закреп. Срабатывает только если есть текущий hovered item ИЛИ popover
+    // уже залочен (чтобы снять).
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Shift' && e.metaKey) {
+        if (!hoveredItemRef.current && !isLockedRef.current) return;
+        e.preventDefault();
+        toggleLock();
+      }
+    };
+    // Mousedown вне popover'а в locked-режиме снимает lock + закрывает.
+    // Popover-обёртки в TabPreviewPopover помечены `data-cmd-hover-popover`
+    // — клики/drag'и внутри них (resize handles, текст) не разлочивают.
+    const onMouseDown = (e: MouseEvent) => {
+      if (!isLockedRef.current) return;
+      const target = e.target as HTMLElement | null;
+      if (target && target.closest('[data-cmd-hover-popover]')) return;
+      setIsLocked(false);
+      setIsPinned(false);
+      setHoveredItem(null);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('mousedown', onMouseDown, true);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('mousedown', onMouseDown, true);
+    };
+  }, [toggleLock]);
+
+  const isVisible = (isCmdPressed || isPinned || isLocked) && hoveredItem !== null;
+
+  return { hoveredItem, isVisible, isLocked, triggerProps, setHovered, clearHovered, popoverProps, close, toggleLock };
 }
 
 // ─── getPopoverPosition ──────────────────────────────────────

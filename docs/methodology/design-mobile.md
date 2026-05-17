@@ -216,3 +216,48 @@ setRenderEnd(newEnd);
 - **State прокидывается** через `navigate(url, { state: { tab } })` для intra-app navigation — экономит лишний fetch при обычных переходах, при deep-link'е работает fallback.
 
 **Когда HashRouter не нужен:** server имеет SPA-fallback (Vercel, Netlify, nginx with `try_files`), все unknown paths → index.html. Тогда BrowserRouter норм. Для самописного node-static на Electron — почти никогда не настроен → HashRouter надёжнее.
+
+## Persistent expanded state across virtual list re-mount
+
+**Принцип:** в виртуализованном списке (`react-virtuoso`, `react-window`, `tanstack/react-virtual`) элементы **unmount'ятся** когда уходят за viewport. Локальный `useState` внутри item'а сбросится при scroll-back. Для toggle-state (collapse/expand, selection, hover) храни **per-id Map в module scope или родительском store**, не в `useState` item-компонента.
+
+**Симптом, что принцип нарушен:** юзер развернул collapsible-блок (thinking, tool card, long-text) → проскроллил вверх → вернулся → блок снова **свёрнут** (default state). Жалоба: *«я свернул, потом промотал, обратно — опять развёрнут, какая хуйня»*.
+
+**Реализация:**
+- Module-level `Map<entryId, boolean>` keyed by stable id (uuid из JSONL, не array index — индексы шифтятся).
+- Hook-обёртка `useEntryExpanded(id, defaultOpen)` подписывается на per-id version counter — bump version при toggle → React re-evaluate вызывающий компонент.
+- Cleanup на unmount **родителя** (ChatView leaves the route) — иначе Map течёт по entry.id'ам всех когда-либо открытых чатов.
+
+**Default value политика:** open для error/pending состояний (юзер хочет сразу видеть что не так / что выполняется), collapsed для success/done (свёрнуто = шум скрыт, header line с tool name + target всё равно говорит что было).
+
+**В custom-terminal:** `_entryExpanded` Map в `mobile-web/src/App.tsx`, `useEntryExpanded(entry.id, defaultOpen)` хук, `clearEntryExpandedForIds` cleanup. См. `knowledge/fact-mobile-web.md::Expanded state map`.
+
+## content-visibility: auto + virtualization = конфликт
+
+**Принцип:** **никогда не сочетай** `content-visibility: auto` с виртуализатором, опирающимся на ResizeObserver или DOM measurements (react-virtuoso, react-window, virtua, tanstack/react-virtual). Эти инструменты **взаимно исключающие**, делают одно и то же разными способами.
+
+**Симптом, что принцип нарушен:** в виртуализованном чате юзер скроллит вверх → курсор резко **отматывается назад вниз** во время движения, скролл «дёргается». Раньше было **редко** на длинных списках, теперь даже на 10-30 items. Жалоба: *«скроллю вверх, и у меня потом резко курсор что-то во время скролла дёргается вниз»*.
+
+**Механизм:** virtuoso измеряет реальную высоту item'а через ResizeObserver и кэширует. `content-visibility: auto` ставит `contain: size layout style paint` на off-screen элементы → ResizeObserver получает **фейковую** высоту = `contain-intrinsic-size`. Когда item приближается к viewport и «оживает», реальная высота резко становится известна → virtuoso пересчитывает позиции → scrollTop bump'ается → юзер видит «дёрг назад».
+
+**Реализация:** убрать `contentVisibility: 'auto'` со всех item-обёрток внутри `<Virtuoso>` / `<FixedSizeList>` / etc. Виртуализатор уже бесплатно даёт «не paint off-screen» — DOM-нодов off-screen нет вообще.
+
+**Когда CV уместен:** не-виртуальный длинный список, где DOM полный (CommonMark articles, Wikipedia-style страницы, log viewer без virtualization). Там CV — реальная экономия paint.
+
+См. `knowledge/fix-mobile-scroll-jitter-virtuoso.md`.
+
+## Initial scroll = once-per-context, не per-focus
+
+**Принцип:** при открытии нового context'а (chat, document, page) — auto-scroll-to-bottom (или to-anchor / to-resume-position). При **возврате** к тому же context'у (focus tab, alt-tab back, bring-to-front) — **сохраняй текущий scroll**, не сбрасывай. Юзер сам выбрал куда смотреть; reset = потеря контекста.
+
+**Симптом, что принцип нарушен:** *«я открыл сессию первый раз — курсор в самом верху, надо мотать вниз. ОК, отскролил до конца. Переключился на другой таб, вернулся — снова в самом верху»* (сброс при focus). Альтернативный симптом: *«scroll position сохраняется, но и в первый раз я вижу историю с самого начала, должен мотать вниз»* (initial scroll отсутствует).
+
+**Реализация:**
+- `didInitialScrollRef = useRef<string | null>(null)` — хранит **id context'а** (sessionId / chatId / documentId), для которого initial scroll уже сделан.
+- На каждом render: если `messages.length > 0 && didInitialScrollRef.current !== currentContextId` → scroll to end + установить ref = currentContextId.
+- При смене сессии (`/rewind`, fork, switch session) ref не совпадает с новой → triggers scroll один раз.
+- При focus tab без смены context'а (та же sessionId) — ref совпадает → noop, scroll сохраняется.
+
+**Не использовать boolean flag** (`didInitialScroll: boolean`) — он не различает «не делал ни разу» от «не делал для ЭТОЙ сессии». При смене сессии boolean останется true → scroll не произойдёт.
+
+**В custom-terminal:** desktop `ClaudeSDKTab` ref keyed by `sessionId`, mobile `ChatView` keyed by mount (новый mount = новый chat — простой случай). См. `knowledge/fact-claude-sdk-tab.md::Initial scroll`.

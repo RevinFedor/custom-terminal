@@ -399,6 +399,7 @@ if (state.isRunning) {
 - `fact-terminal-core.md` - OSC 133 protocol specification
 - `fact-terminal-core.md` - Similar event-driven pattern for CWD tracking
 - `fact-input-events.md` (section 8) - execSync → execAsync migration
+- `fix-mcp-spawn-non-interactive-shell.md` — родственный кейс: спавн с `-c` обёрткой ломает OSC 133 (не только polling, но и неправильный shell-flag убивает event-цепочку индикатора).
 
 ## Критическое правило (см. CLAUDE.md)
 **ЗАПРЕЩЁН polling через `pgrep`/`ps`** для определения статуса процесса. Использовать только:

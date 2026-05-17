@@ -14,6 +14,26 @@
 
 Streaming-путь имеет **ту же ловушку**, но динамическую. SDK выдаёт сообщения через async iterator; когда инструмент завершается, прилетает событие с `msg.type === 'user'` и tool_result-блоками в content. На этом моменте надо обновить статусы tool_call'ов **по всем accumulated assistant-сообщениям** (не только в текущем `streaming-<tabId>`-плейсхолдере), потому что `tool_use_id` мог быть выписан раньше в более раннем чанке.
 
+## Tool-call rendering: ordered `parts[]` для сохранения порядка блоков
+
+Claude JSONL пишет один turn assistant'а как **N отдельных записей**, каждая содержит **один** content-блок (`{type:'thinking'}` ИЛИ `{type:'tool_use'}` ИЛИ `{type:'text'}`). Реальная последовательность в одном turn'е — `thinking → tool → tool → thinking → tool → text`, не сгруппирована по типу. Стриминг-чанки тоже могут содержать любую смесь блоков в произвольном порядке.
+
+**Что было невидимо.** Первая версия парсера на каждой assistant-записи делала три параллельных filter'а — `text`-блоки в `text: string`, `tool_use`-блоки в `toolCalls: []`, `thinking`-блоки в `thinking: string | null`. Информация о порядке между ними **умирала прямо в filter'ах**. `convertMessage` потом всегда выкладывал три стопки в фиксированном порядке `thinking → text → tools` — поэтому все вызовы инструментов сваливались в конец сообщения, разорванный «think → call → reflect → call → reply» ритм Claude'а превращался в стену текста + хвост из карточек тулзов.
+
+**Решение.** `SDKChatMessage.parts: AssistantPart[]` — ordered source of truth для рендера ассистента. Каждый блок (`{type:'thinking'|'text'} | ToolCallPart`) пушится в `parts[]` в том порядке, в котором встретился в JSONL/чанке. `convertMessage` итерирует `parts[]` напрямую и эмитит assistant-ui blocks в той же последовательности. Старые поля `text/thinking/toolCalls` **остались** как derived через helper `assembleMessageFields(parts)` — search snippets, smart cancel `hasContent` check, filter empty assistant, findIndex для timeline scroll-to-entry, всё это читает плоские поля и не должно знать о parts. Все 4 точки которые мутируют сообщение (loadHistory pass-2, streaming reducer assistant-чанк, tool_result reducer, finalize-result safety net + cancel-hasContent branch) обновляют `parts[]` и пересобирают плоские поля одним вызовом.
+
+**Где такой же шаблон не повторился.** Mobile-web parser (`mobile-web/src/messages.ts`) обрабатывает `for (const block of content)` в одном проходе и push'ит entries в `state.entries` в encounter-order — каждый блок становится отдельной UI-entry, порядок сохраняется естественно. **Латентный риск** в `src/main/ipc/claude-data.js:2638-2647` (sub-agent Task history dump для Sessions/Timeline превью): тот же split-by-type `mc.filter(text)` + `mc.filter(tool_use)`. Сейчас это превью-формат (читается человеком в read-only панели), не баг. При попытке отрендерить sub-agent history как полноценный чат — переделать на ordered parts. Принцип — `methodology/design.md::Ordered model output → ordered UI`.
+
+## History prefetch в `restoreSession`
+
+При cold start `useWorkspaceStore.restoreSession` восстанавливает N SDK-табов из персистенции. Каждый `ClaudeSDKTab` вызывает `loadHistory` в `useEffect` после того как `storeSessionId` резолвится из store — но `RestoreLoader` снимается **раньше** чем эти IPC-запросы возвращаются. Юзер видит «Restoring sessions» → blank chat-shell → через 200-500мс прилетает контент. Эффективно две фазы загрузки подряд: первая видимая, вторая невидимая. Принцип — `methodology/design.md::Глобальный startup-loader охватывает готовность контента`.
+
+**Решение.** Module-level Map cache `_prefetchCache: Map<"tabId::sessionId", any[]>` в `src/renderer/utils/sdkHistoryPrefetch.ts`. Внутри `restoreSession` пока `isRestoring=true`, для каждого восстановленного SDK-таба параллельным `Promise.all` запускается `claude-sdk:active-branch-messages` IPC, результат складывается в cache через `setPrefetched(tabId, sessionId, messages)`. Только после `await Promise.all` снимается `isRestoring=false`. `loadHistory` в табе на mount первым делом проверяет cache через `consumePrefetched(tabId, sessionId)` — если хит, синхронно использует rawMessages без IPC, если мисс, идёт по живому пути.
+
+**Single-shot semantics — критично.** `consumePrefetched` **удаляет** значение из Map при чтении. Это значит reload-чип в InfoPanel, fork operation, session-id rotation после `/compact` — все они идут по живому IPC, потому что cache уже опустошён первым `loadHistory`. Без self-delete'а второй `loadHistory` после rotation вернул бы stale messages для нового session-id, потому что ключ-то старый.
+
+**Lazy data в pre-fetch не закидывать.** Timeline entries, search index, file-tree — это контент, который рендерится отложенно, юзер не видит его на первом кадре. Если включить их в `Promise.all` — startup-loader будет висеть лишние 1-2 секунды для данных, которые всё равно не блокируют первый кадр активного контекста.
+
 ## MCP-серверы: SDK не наследует `~/.claude.json`
 
 Claude Code CLI автоматически читает `mcpServers` из `~/.claude.json`. **Agent SDK (`query()`) — нет.** По умолчанию `options.mcpServers` пустой, агент крутится без инструментов. Без явной пробрасывания это легко принять за фичу — «SDK работает», просто без browser/terminal/yougile.
@@ -182,4 +202,181 @@ SDK-таб может управляться не только локальны�
 
 **External-prompt event для desktop.** Когда mobile отправляет prompt через REST → renderer-bridge `sendSDKMessage` action **перед** `claude-sdk:send-message` invoke диспатчит `window.dispatchEvent('claude-sdk:external-prompt', { tabId, text })`. ClaudeSDKTab слушает event и пушит свой user-bubble в локальный `setMessages`. Без этого десктоп показывал ответ Claude но не сам запрос — `onNew` срабатывает только когда **локальный** композер submit'ит.
 
-**History loader для external клиентов — не `getSessionMessages`.** Anthropic SDK helper отдаёт другой набор uuid'ов чем `parseTimelineEntries`, GoTo из mobile timeline никогда не находит anchor. Mobile грузит history через отдельный IPC `claude-sdk:active-branch-messages` (тот же backtrace что в `parseTimelineEntries`, но возвращает все типы записей). См. [`fix-mobile-history-uuid-mismatch.md`](fix-mobile-history-uuid-mismatch.md).
+**History loader для external клиентов — не `getSessionMessages`.** Anthropic SDK helper отдаёт другой набор uuid'ов чем `parseTimelineEntries`, GoTo из mobile timeline никогда не находит anchor. Mobile **И desktop** грузят history через отдельный IPC `claude-sdk:active-branch-messages` (тот же backtrace что в `parseTimelineEntries`, но возвращает все типы записей). См. [`fix-mobile-history-uuid-mismatch.md`](fix-mobile-history-uuid-mismatch.md). Desktop переключился с `getSessionMessages` после того как тот стал возвращать `success:true rawCount:0` для свежеротированных сессий — наш JSONL-parser работает напрямую с диском.
+
+## Resume contract (sessionId rotation handling)
+
+Claude SDK ротирует sessionId на каждом session-loss / fresh-start (отказ resume, `/compact`, JSONL aging). Ловушки которые вылезли в bug-марафоне 2026-05-15 (см. [`fix-sdk-session-amnesia.md`](fix-sdk-session-amnesia.md)):
+
+- **caller передаёт `resumeSessionId` явно**, не полагаясь на in-memory `sdkSessions` Map (она очищается в `finally` каждого turn'а — между turn'ами Map пустой). Renderer кладёт `tab.claudeSessionId` в payload `claude-sdk:send-message`. Mobile bridge handler берёт `tab.claudeSessionId` из Zustand store.
+- **`sessionIdRef.current` всегда обновляется** при `data.sessionId !== sessionIdRef.current` — guard `if (!ref)` фиксировал первый и игнорировал rotation, store оставался со stale uuid → каждый prompt resume'ился на мёртвый id.
+- **Pre-flight `isResumableSession`** через `findSessionFile(sessionUuid, cwd)` — НЕ hand-rolled slug. Hand-rolled `'-' + cwd.replace(/\//g, '-')` давал двойной leading dash для абсолютных путей (`--Users-fedor-...`), `existsSync` всегда false → каждая resume помечалась stale.
+- **Runtime fallback на `No conversation found`**: если SDK всё равно вернул error в iterator (race condition / SDK не знает наш freshly-rotated id), mid-stream detection → silent retry без resume + send `claude-sdk:stale-resume-cleared` event в renderer чтобы tab чистил `claudeSessionId`. Юзер видит обычный ответ от свежей сессии, без error toast.
+
+См. `methodology/design.md::In-memory ephemeral state ≠ persistent identifier source` для общего принципа.
+
+## Context indicator (used %, не remaining)
+
+Header pill и mobile composer показывают **% использования** контекстного окна (filled-bar semantic), не % остатка. Цвета: серый 0-75% / амбер 75-90% / красный 90-100%. Раньше формула была `100 - usedPct` — юзер читал `92%` как «92% полно» хотя это было «92% свободно». См. `methodology/design.md::Прогресс = заполнение, не остаток`.
+
+Для `tabType !== 'claude-sdk'` (terminal табы) индикатор скрыт — формула не имеет смысла для PTY-Claude (нет SDK usage events).
+
+## Initial scroll
+
+`didInitialScrollRef = useRef<string | null>(null)` хранит **sessionId** для которого scroll-to-bottom уже сделан. Один раз на смену сессии (включая после `/rewind` / fork когда меняется uuid), не на focus tab. Без этого юзер при возврате в чат каждый раз скакал в начало истории. См. `methodology/design-mobile.md::Initial scroll = once-per-context`.
+
+## Composer button slot (Send / Stop)
+
+Send (`↑`) и Stop (`■`) жили в **одном** `<button>` slot composer'а, переключались по `busy`. Раньше Stop сидел в header справа от burger'а — два muscle path'а для одного действия. См. `methodology/design.md::Send / Stop = одна muscle path`.
+
+**Обновление май 2026: Send-кнопка удалена целиком.** Composer теперь чистый textarea без кнопки. Enter = submit, Escape/Ctrl+C/Ctrl+[ = cancel. Юзер: «убери кнопку отправки, у нас за остановку будут отвечать клавиши». Это завершение муscle-path стянутого до клавиатуры — для PTY-Claude муscle-path тот же, для SDK теперь identical.
+
+## JSONL shape для compact: camelCase + флаги
+
+Anthropic SDK пишет JSONL поля compactim'а в **camelCase**, а stream-events в SDK iterator — в **snake_case**. Обе формы поддерживаем (`compactMetadata` ?? `compact_metadata`, `preTokens` ?? `pre_tokens`). Authoritative маркер compact-summary записи — флаг **`isCompactSummary: true`**, не `isReplay`/`isSynthetic` (тех на summary НЕ выставляются). Fallback на canonical phrase `"This session is being continued from a previous conversation"` — для старых сессий или edge-cases. Запись также носит `isVisibleInTranscriptOnly: true` — служебный флаг что эту запись CLI отображает в transcript, мы аналогично рендерим (но как orange divider, а не user-bubble).
+
+Записи `<local-command-stdout>Compacted </local-command-stdout>` — это CLI-артефакт завершения `/compact`-команды (CLI пишет `chalk.dim('Compacted ' + summary)` в stdout). В SDK chat не нужен — дропаем целиком. Аналогично `<local-command-caveat>` (служебная обёртка для replay-context).
+
+Что было невидимо: я неделю искал `isReplay`/`isSynthetic` на summary-записях — их там НЕТ. SDK 0.3 поменял shape: только `isCompactSummary` + `isVisibleInTranscriptOnly`. Без вычитки сырого JSONL это невозможно определить — types в `sdk.d.ts` шипят generic `SDKMessage` без полного field-listing'а.
+
+## Compact summary: ride-on-assistant role + id-prefix discrimination
+
+assistant-ui runtime не позволяет добавлять custom `role` — допустимы только `user/assistant/system/data`. Мы храним записи как `SDKChatMessage.role: 'compact-summary'`, в `convertMessage()` маппим в `role: 'assistant'` **+ id-prefix `compact-summary-`**. `AssistantMsg` проверяет prefix первой строкой — если match, делегирует в `CompactSummaryMsg` (orange-bordered bubble с метриками `pre→post tokens · Ns`, collapsible toggle сверху+снизу при >600 char'ов, padding и border в brand-orange tinted).
+
+Метрики не сериализуются через `ThreadMessageLike` (поля кастомные не пропускаются) — храним в module-level `_compactMetricsByMsgId Map<string, Metrics>`, заполняем при `convertMessage`, читаем в `CompactSummaryMsg` через `getCompactMetricsForMsg(id)`. Это **edge-case ID-маркера** — id служит и идентификатором, и discriminator'ом типа. См. `methodology/design.md::Type variant = visual marker, не rename` — здесь та же логика: тип передаётся через id-prefix потому что contract'а custom-role нет.
+
+## Compact summary order swap в loadHistory post-pass
+
+JSONL пишет `compact_boundary` → `isCompactSummary` user-record **раньше** `<command-name>/compact</command-name>` chip-записи. То есть для юзера это «summary появилась, потом юзер ввёл /compact» — наоборот хронологии его действий. Post-pass в `loadHistory` свапает соседние `compact-summary` + `user`-text-`/compact` → chip всегда выше summary. Без этого UX-чтение неправильное: «откуда summary, я ещё не давал команду».
+
+## Compact loader: fake-progress (SDK не отдаёт прогресс через API)
+
+CLI Ink-renderer рисует «5%  ▰▰▱▱▱  Next: H. Documentation» — это **только в Ink**. Agent SDK 0.3 в iterator emit'ит ровно три маркера: `{type:'system', subtype:'status', status:'compacting'}` (start) → 30-60s тишины → `{...status:null, compact_result:'success'}` (end) → `{type:'system', subtype:'compact_boundary', compactMetadata:{...}}` (summary metrics). Никаких процентов / per-step событий. `onCompactProgress` callback из `compact.ts` работает только внутри `ToolUseContext` CLI'а, в SDK не пробрасывается.
+
+Решение: indeterminate progress bar (CSS keyframes `sdk-compact-bar`, gradient slide 1.8s loop) + live elapsed timer. Не врём конкретными процентами. Принцип — `methodology/design.md::Fake progress > врать конкретными цифрами когда API не отдаёт`.
+
+## Slash autocomplete popup
+
+Манифест команд получаем **двумя путями**, merge с приоритетом live:
+
+1. **Live** — из `system:init` сообщения активной сессии (поле `slash_commands`, нормализуем shape). Это AUTHORITATIVE для **этой** сессии: включает `/status`, локальные skills (`/check`, `/loop`), session-specific команды которые зависят от модели/аккаунта.
+2. **Probe-fallback** — `claude-sdk:probe-commands` IPC через throw-away `query()`. Используется пока нет активной сессии (новый таб). Throw-away query спавнится с `async function*() { await new Promise(() => {}); }` — без never-resolving promise SDK мгновенно tear down'ит ProcessTransport и `getContextUsage()` / `mcpServerStatus()` падают с «Query closed before response».
+
+Live перезаписывает probe по имени, probe-only добавляет недостающие → юзер всегда видит максимально полный список.
+
+**Filter**: ranked startsWith > includes по name И aliases. Юзер вводит `/us` → сначала `/usage`, потом `/extra-usage` (раньше plain `includes` смешивал, `/extra-usage` оказывался первым).
+
+**Popup geometry**: `absolute bottom-full mb-1 z-30` НАД composer'ом — не двигает thread, перекрывает items внутри Virtuoso. Композер остаётся на месте. Принцип — `methodology/design.md::Popup поверх контента — absolute`.
+
+**Keydown через refs**: `slashIdxRef` / `filteredCommandsRef` / `showSlashPopupRef` обновляются на каждый render. `handleComposerKeyDown` мемоизирован на `[composerText, writeComposerValue, isRunning, ...]` — без refs ArrowDown/Enter ловят **stale** значения slashIdx/filteredCommands (handler не пересоздаётся на каждый keystroke потому что иначе теряется focus). `e.stopPropagation()` обязателен — assistant-ui ловит Enter глобально и сабмитит.
+
+**Commit = submit, не insert**. Click/Enter в popup → `composerRuntime.send()` сразу (если не isRunning). Раньше различал required (`<>`) vs optional (`[]`) args и блокировал submit для команд с argumentHint — но у Claude SDK почти все hint'ы в `<...>` даже для optional args (`/compact <optional summary>`, `/clear [name]`). Юзер: «если выбрал стрелочками — Enter сразу запускает». Если хочет добавить args — печатает их вместо выбора из popup'а (пробел закрывает popup, далее обычный ввод). Принцип — `methodology/design.md::Selected autocomplete item: Enter = submit`.
+
+**MouseDown preventDefault**: на root popup'а — иначе клик мышкой теряет фокус textarea (blur срабатывает перед click handler'ом).
+
+## Slash command renders as user-chip, не диалоговая реплика
+
+JSONL пишет `<command-name>/compact</command-name>\n<command-args>…</command-args>` как `type:'user'` record. Парсер детектит обёртку, strip'ит leading slashes (CLI sometimes пишет `<command-name>/usage</command-name>`, sometimes `<command-name>usage</command-name>`), реконструирует `text = '/' + name + (args ? ' ' + args : '')`. Role остаётся `'user'`.
+
+В `UserMsg` детект `^/\w[\w-]*(?:\s|$)` без newlines → рендер как фиолетово-синий chip справа (фон `rgba(129,140,248,0.08)`, color `#a5b4fc`, border `rgba(129,140,248,0.25)`). Без edit/repeat hover-кнопок — повтор slash-команды проще через композер.
+
+Раньше chip имел chevron `>` слева. Удалён — chevron в UI означает «раскроется» (см. ReasoningPart, ToolCard), а slash-chip нечего раскрывать. Принцип — `methodology/design.md::Chevron = expand-affordance, не декор`. Также `methodology/design.md::Slash invocation = action-chip` про сам факт визуального отделения служебного от диалогового.
+
+## SlashCommandOverlay для /usage /cost /stats /status /context /insights
+
+Эти команды в CLI открывают полноэкранный Settings panel (LocalJSXCommandCall с `<Settings defaultTab="Usage" />`). React-дерево живёт **только в Ink runtime CLI**, до SDK iterator'а доходит **только текстовый fallback** через `SDKLocalCommandOutputMessage { type:'system', subtype:'local_command_output', content: string }`. Для /usage это `"You are currently using your subscription to power your Claude Code usage"` — больше ничего.
+
+Решение: при отправке info-команды из whitelist (`INFO_SLASH_CMDS`) ставим `activeSlashCmdRef = name` + открываем `SlashCommandOverlay` (500px панель **заменяет** композер). Следующий assistant-message с text-only blocks захватывается в `slashOutput` через ref-guard и **не** падает в thread. На `result` event ref сбрасывается; overlay остаётся открытым пока юзер не закроет (`Escape` / `Ctrl+C` / `Ctrl+[`). В thread остаётся только chip `/usage` как маркер «команда выполнена».
+
+Дополнительно overlay показывает **локальный breakdown** для `/usage /cost /stats`: total cost USD, duration, num turns — кумулятивный трекер по `result.total_cost_usd / duration_ms / num_turns` всех turn'ов сессии. SDK эти значения шипит per-turn, мы суммируем в `cumCostRef`. CLI делает то же самое внутри своего `formatTotalCost()`. Это **70-80%** того что показывает CLI Settings panel; subscription/limits info (`Resets May 20 4am`) не доступны через SDK API surface — это CLI-specific endpoint к биллингу.
+
+## filteredMessages allowlist для compact-summary
+
+Фильтр в `filteredMessages` useMemo раньше: `if (m.role !== 'user' && m.role !== 'assistant' && m.role !== 'system') return false`. **`compact-summary` молча отбрасывался**: записи доходили до `messages` state (6 штук с правильными metrics), но `useExternalStoreRuntime(messages: filteredMessages, ...)` получал отфильтрованный массив без них → assistant-ui store не знал о них → CompactSummaryMsg не рендерился → юзер видел пустоту между `/compact` chip и следующим turn'ом.
+
+Через double-walk fiber memoizedState'а нашёл: `messages.length === 53, compactSummaries=6`, `filteredMessages.length === 35, compactSummaries=0`. Без MCP-инспекции в реальном UI этот тип бага найти **невозможно** — парсер дёргает `console.log`, видишь что summary распарсилась, потом следишь только до выхода loadHistory, дальше теряешь.
+
+**Правило для добавления новых role'ей**: при создании любого нового role'а в SDKChatMessage **обязательно** обновить allowlist в `filteredMessages.filter`. Это hidden gate между data model и render pipeline.
+
+## CompactSummaryMsg: hooks ordering до early return
+
+Изначально была `useMessage` + early `return null` если id null, **затем** `useState/useRef/useStableCollapseToggle`. Это нарушает rules-of-hooks: если на одном render id == null (sync-window) и компонент возвращается null до hooks → на следующем render id != null → React видит больше hooks → mismatch → throw + silent crash. Все hooks должны быть **до** условного early return. Конкретно здесь edge-case всплыл из-за useMessage селектора, который кратко даёт null во время /compact session-rotation — без sync-window'а баг не воспроизводился, поэтому до запуска /compact всё работало нормально.
+
+## useMessage/useAuiState sync-window guard
+
+Во время `/compact` SDK ротирует sessionId → срабатывает `SessionSync` useEffect → `loadHistory(новый)` → `setMessages(...)` полная замена. В этот момент `useExternalStoreRuntime` синкается через useEffect (tick'ом позже), а `useAuiState((s) => s.thread.messages.length)` возвращает **старую** длину. Virtuoso запрашивает `MessageByIndexProvider(index=32)` → store.tapClientLookup throw `Index 32 out of bounds (length: 32)` → ErrorBoundary.
+
+Все наши `useMessage((s) => s.field)` и `useAuiState` selectors обёрнуты в **try/catch внутри selector'а**: `useMessage((s: any) => { try { return s.id; } catch { return null; } })`. Возвращаем null-маркер вместо throw — компонент рендерит `return null`, Virtuoso перерисует следующим кадром с актуальной длиной.
+
+Try/catch **внутри** selector'а, не вокруг hook-call'а: hook-call всегда должен выполняться (rules-of-hooks).
+
+## Stable scroll при collapse-toggle внутри Virtuoso
+
+`useStableCollapseToggle` раньше: `anchorY-before` → `flushSync(toggle)` → `anchorY-after` → `scrollTop += delta`. **Не работает** внутри Virtuoso: virtualizer re-measure'ит item через ResizeObserver, **1+ кадр delay**. На момент `anchorY-after` size ещё старый → `delta === 0`. Дальше Virtuoso перемеряет → items сдвигаются → юзер видит «открылось внизу экрана» вместо «осталось где было».
+
+Решение: **double-rAF** + **scroller-relative offset**. Захватываем `targetOffsetFromScroller = anchorTopBefore - scrollerTopBefore` до toggle. После toggle ждём 2 rAF (React commit → Virtuoso ResizeObserver emit → known-size updated → layout settled). Тогда читаем новый offset, вычисляем delta, компенсируем `scroller.scrollTop`.
+
+Graveyard:
+1. **Single rAF после flushSync** — не помогает, Virtuoso re-measure'ит ещё на следующий кадр.
+2. **`scrollIntoView({block:'start'})` на anchorRef** — работает для top-collapse-кнопки, но фиксирует viewport-Y на 0 (top), а юзер мог быть в middle блока.
+3. **anchor.getBoundingClientRect() сразу после flushSync** — Virtuoso ещё не пересчитал, delta=0.
+
+Принцип в `methodology/design.md::flushSync + sync layout-read для стабильного scroll` остаётся правильный, но для virtualized lists требует double-rAF wait.
+
+## Smart Cancel: hasContent читает parts[] напрямую
+
+Раньше `hasContent = streaming.text.trim() || streaming.thinking?.trim() || streaming.toolCalls.length > 0`. Не покрывало случай когда первый чанк был **только thinking** — `streaming.thinking` ставится через `assembleMessageFields()`, но если запись добралась до setMessages с пустым plain field (rare race), `hasContent === false` → Escape триггерил rollback и удалял юзер-message + partial thinking. Юзер: «получил thinkblock и нажал Escape → удалился thinkblock И мой запрос, должно было остаться оба».
+
+Расширил: `hasContent` дополнительно проверяет `Array.isArray(streaming.parts) && streaming.parts.some(p => ...)` — любой непустой text/thinking/tool блок в ordered parts. parts[] — authoritative source, плоские поля derived. Принцип — `methodology/design.md::Destructive cancel зависит от прогресса`.
+
+## Model footer: SDK_DEFAULT + alias-first + reset on alias-change
+
+Три источника правды смешивались плохо:
+1. `lastResolvedModel` — real model id из `msg.message.model` SSE-чанка (truth).
+2. `tab.sdkModel` alias — что юзер выбрал в InfoPanel (`'default'/'sonnet'/'opus'/'haiku'`).
+3. `resolveSdkModel(alias)` — `SDK_MODEL_MAP[alias]` (для 'default' → `undefined`!).
+
+Старая формула `src = realModel || resolveSdkModel(alias) || alias || ''`. При cold start (нет ни одного assistant-чанка): realModel=null, alias='default', resolveSdkModel→undefined → `src='default'` → `.includes('opus/sonnet/haiku')` все false → return realModel (null) → **footer пуст**.
+
+При смене alias в sidebar: realModel держит старое значение из ПОСЛЕДНЕГО SSE → формула возвращает его → footer показывает Opus пока юзер уже выбрал Sonnet, до первого нового turn'а.
+
+Фикс:
+1. **`SDK_DEFAULT_MODEL_ID = 'claude-opus-4-7'`** — fallback когда alias='default' И realModel=null (cold start). SDK default = whatever Anthropic ships under 'default' parameter; сейчас Opus 4.7. При смене shipping default — обновить константу.
+2. **Alias-first priority при manual selection**: если `alias !== 'default'` И `resolveSdkModel(alias)` returns id — используем его (не realModel). RealModel wins только когда alias='default'.
+3. **Reset `lastResolvedModel = null` через useEffect** на изменение `sdkModelAlias`. Без этого после смены модели формула застревает на старом realModel.
+
+Это **тройной 3-way merge** — обычно избегаем (одна truth), но тут нет: alias = намерение юзера, realModel = факт, default = unknown intent. Все три нужны.
+
+## Phase machine sdkState: fetching / thinking / typing / tool_use
+
+Loader виден только пока **активно ждём**. До этого state был `'thinking' | 'tool_use'` flat — что неинформативно: thinking-фаза включала и network-fetch до первого event'а, и реальное extended thinking, и интервалы между tools.
+
+Расширил Zustand type до `'idle' | 'fetching' | 'thinking' | 'typing' | 'tool_use' | 'error'`:
+- `onNew` → `'fetching'` (отправили IPC, ещё не получили никакого SDK event'а)
+- `system:init` → `'thinking'` (round-trip завершён, ждём первого assistant chunk'а)
+- Assistant chunk c text → `'typing'` (loader **уходит**, content стримится в bubble)
+- Assistant chunk только thinking → `'thinking'` (loader остаётся active)
+- Tool_use без result → `'tool_use'`
+- `result` event → `'idle'` / `'error'`
+
+`'typing'` — это **не** loading-state в UX-смысле; tracking'уется чтобы callers могли отличить «активно отдаёт токены» от «ничего». UI скрывает loader для `typing` AND `idle`. Принцип близок к `methodology/design.md::Status indicator: signal-on-change, не permanent label` — теперь signals дифференцированы.
+
+## Hard gate на Enter во время turn'а + rejectFlash
+
+SDK 0.3 не поддерживает midstream приём нового prompt'а — попытка вызовет race с активной query. У нас уже есть PromptQueue для PTY-Claude (см. `fact-prompt-queue.md`), для SDK будем потом — пока самый безопасный путь блокировать ввод.
+
+Три точки блокировки:
+1. **`handleComposerKeyDown`** — Enter (без Shift) при `isRunning` → `preventDefault` + `triggerRejectFlash()` + early return.
+2. **`onNew`** — guard в начале: `currentlyRunning = isRunning || sdkState in ['thinking','tool_use']` → silently drop. Two sources of truth (local stream-state + Zustand) проверяются OR — один может lag'ать.
+3. **`commitSlash`** — если isRunning, slash-команду set'аем в текстарею, но НЕ дёргаем `composerRuntime.send()`. Юзер сам нажмёт Enter когда turn закончится.
+
+**rejectFlash**: 1-секундный border-red + bg-#2a1414 на composer'е. Юзер: «должно мигать на 1 секунду одно мигание». Без visual signal'а Enter тихо no-op'ится — юзер считает что клавиатура сломалась. Это **destructive-feedback ≥ 1 секунда**, см. `methodology/design.md::Persistent state across UI transitions` — тот же класс UX-проблем.
+
+## Click-handler не крадёт фокус
+
+`handleTabClick` (whitespace-click → focus textarea) раньше: на каждый клик → `textarea.focus()`. Двойной side-effect: re-init caret-blink (визуально мигает на каждый клик в пустой области), потеря active selection (drag-to-select в bubble cancel'ится на mouseup).
+
+Skip-conditions добавлены:
+- `target.closest('[data-msg-role]')` — клик внутри message bubble. Юзер может начинать drag-to-select сразу после mouseup'а; наш focus() сбрасывает selection до того как она устанавливается.
+- `document.activeElement === ta` — textarea уже focused. Повторный focus() рестартует caret-blink из 0 → видимое «мигание».
+- Active live selection — было раньше.
