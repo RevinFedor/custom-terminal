@@ -1985,7 +1985,21 @@ function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKT
       if (!isVisibleRef.current) return;
       const target = e.target as HTMLElement | null;
       if (target?.closest?.('textarea, input, [contenteditable], button, a')) return;
-      const tabRoot = (target as HTMLElement | null)?.closest?.('.absolute.inset-0.flex.flex-col');
+      // Two paths for finding the composer textarea:
+      //   1) Event target is inside an SDK tab → use that tab's textarea.
+      //      Happens on plain click in chat: focus moved to body but the
+      //      keydown's target is still the <p> (closest event target).
+      //   2) Target is body/html (no SDK ancestor) → user is on a "selected
+      //      text" state where mousedown moved focus out of textarea AND
+      //      out of any visual tab descendant. In that case fall back to
+      //      finding the currently-visible SDK tab in the DOM and using its
+      //      textarea. This is the case the user described: "выделил текст,
+      //      нажимаю клавишу — нихуя".
+      let tabRoot = (target as HTMLElement | null)?.closest?.('.absolute.inset-0.flex.flex-col') as HTMLElement | null;
+      if (!tabRoot) {
+        const candidates = Array.from(document.querySelectorAll('.absolute.inset-0.flex.flex-col'));
+        tabRoot = candidates.find((t: any) => t.style?.display === 'flex' && t.querySelector('textarea')) as HTMLElement | null;
+      }
       if (!tabRoot) return;
       const ta = tabRoot.querySelector('textarea') as HTMLTextAreaElement | null;
       if (!ta) return;
@@ -2027,6 +2041,19 @@ function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKT
         ta.setSelectionRange(caret, caret);
       }
       ta.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true, inputType: 'insertText', data: e.key.length === 1 ? e.key : undefined }));
+      // After typing, if focus was on body/non-tab — pull it into the textarea
+      // and clear any leftover document selection. This gives the user the
+      // natural "I started typing → selection is gone, I'm in the input"
+      // experience. WHATWG-correct: typing a character is the explicit signal
+      // to drop the read-only selection state.
+      if (document.activeElement !== ta) {
+        try { window.getSelection()?.removeAllRanges(); } catch {}
+        try {
+          const caretEnd = ta.selectionEnd ?? ta.value.length;
+          ta.focus({ preventScroll: true });
+          ta.setSelectionRange(caretEnd, caretEnd);
+        } catch {}
+      }
       try { ipcRenderer.send('log:renderer', `[SDKGlobalKey] key=${e.key} → composer (target=${target?.tagName?.toLowerCase()})`); } catch {}
     };
     document.addEventListener('keydown', onKeyDown, true);
@@ -2173,6 +2200,7 @@ function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKT
             <Tooltip content="Scroll to bottom">
             <button
               onClick={scrollToBottom}
+              onMouseDown={(e) => e.preventDefault()}
               className="absolute z-10 flex items-center justify-center w-8 h-8 rounded-full bg-[#2a2a2a] border border-[#444] text-[#888] hover:text-white hover:bg-[#3a3a3a] transition-all cursor-pointer shadow-lg"
               style={{ bottom: '70px', right: '52px' }}
             >
@@ -2383,6 +2411,7 @@ const CollapsibleText = ({ text }: { text: string }) => {
     <button
       type="button"
       onClick={onToggle}
+      onMouseDown={(e) => e.preventDefault()}
       className="text-[0.85em] text-[#8ba4ff] hover:text-[#a8b8ff] cursor-pointer select-none"
     >
       {expanded
@@ -2791,6 +2820,7 @@ const CompactSummaryMsg = () => {
     <button
       type="button"
       onClick={onToggle}
+      onMouseDown={(e) => e.preventDefault()}
       className="text-[0.85em] cursor-pointer select-none"
       style={{ color: '#FFB382' }}
     >
@@ -2925,6 +2955,7 @@ const ReasoningPart = ({ text }: { text: string }) => {
       <button
         type="button"
         onClick={onToggle}
+        onMouseDown={(e) => e.preventDefault()}
         className="flex w-full items-center gap-2 px-3 py-2 text-[0.92em] text-[#bdbdbd] hover:text-white hover:bg-white/[0.04] transition-colors cursor-pointer select-none"
       >
         <ChevronRight
