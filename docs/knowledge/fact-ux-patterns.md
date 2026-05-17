@@ -1,6 +1,6 @@
 # UX/UI факты — custom-terminal
 
-Project-specific UI-решения, привязанные к конкретным компонентам (InfoPanel, ActionsPanel, TabBar, BookmarkCard) и брендингу (Claude/Gemini цвета). Переносимые принципы — в `docs/methodology/design.md`, `docs/methodology/ui-patterns.md`, `docs/methodology/react.md`.
+Project-specific UI-решения, привязанные к конкретным компонентам (InfoPanel, ActionsPanel, TabBar, BookmarkCard) и брендингу (Claude/Gemini цвета). Переносимые принципы — в `docs/methodology/design.md` (раздел «UI implementation patterns») и `docs/methodology/design-bugs.md`.
 
 ---
 
@@ -145,7 +145,7 @@ IPC-хендлер `project:validate-path` использует `fs.existsSync`.
 3. Дожидается готовности рендерера терминала.
 4. Только после этого убирает `RestoreLoader` и показывает проект.
 
-Без этого юзер видит мигание пустого workspace перед загрузкой содержимого. Принцип: см. `methodology/ui-patterns.md::Immediate Injection`.
+Без этого юзер видит мигание пустого workspace перед загрузкой содержимого. Принцип: см. `methodology/design.md::Immediate Injection`.
 
 ---
 
@@ -169,7 +169,7 @@ style={{
 - `-100%` (X) — сдвигает панель влево ровно на её текущую ширину. Правый край панели всегда оказывается **точно** в точке привязки, независимо от content size.
 - `-50%` (Y) — идеально центрирует вертикально.
 
-**Логический bridge вместо физических `<div>`-мостиков**: отказались от прозрачных div'ов в пользу проверки в `onMouseLeave` (если мышь идёт влево, к панели → не закрывать). DOM чище, позиционирование независимо от размеров мостика. См. `methodology/ui-patterns.md::Invisible Bridge`.
+**Логический bridge вместо физических `<div>`-мостиков**: отказались от прозрачных div'ов в пользу проверки в `onMouseLeave` (если мышь идёт влево, к панели → не закрывать). DOM чище, позиционирование независимо от размеров мостика. См. `methodology/design.md::Invisible Bridge`.
 
 ### Применение
 - `ActionsPanel.tsx`: ⚙ API Settings, 📋 Copy Settings.
@@ -179,7 +179,7 @@ style={{
 
 ## Связи
 
-- **Переносимые UI-паттерны** (Invisible Bridge, Virtualization, Mirror Editing, Home-toggle, Scroll-to-bottom): `docs/methodology/design.md` + `docs/methodology/ui-patterns.md`.
-- **React/Zustand технические паттерны**: `docs/methodology/react.md`.
+- **Переносимые UI-паттерны** (Invisible Bridge, Virtualization, Mirror Editing, Home-toggle, Scroll-to-bottom): `docs/methodology/design.md` + `docs/methodology/design.md` (раздел «UI implementation patterns»).
+- **React/Zustand технические паттерны**: распределены по `fix-*` файлам по симптомам — Zustand selector loops и Reconciliation Trap в `knowledge/fix-performance-lags.md`, Portal click-outside и Layering поверх canvas в `methodology/design-bugs.md`, stale closure в `knowledge/fix-stale-closure-timeline.md`, inline-компонент trusted click в `knowledge/fix-inline-компонент-click.md`.
 - **Конкретный CodeMirror controlled-editor шрам**: `knowledge/fix-codemirror-controlled-editor.md`.
 - **Performance работы по Zustand Map**: `knowledge/fix-performance-lags.md`.

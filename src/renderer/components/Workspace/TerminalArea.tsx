@@ -298,8 +298,11 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
   });
 
   const terminals = useMemo(() => {
+    const t0 = Date.now();
     const result: React.ReactNode[] = [];
     const currentOpenProjects = useWorkspaceStore.getState().openProjects;
+    let sdkCount = 0;
+    let totalCount = 0;
 
     currentOpenProjects.forEach((workspace, projId) => {
       const isActiveProject = projId === projectId;
@@ -319,6 +322,8 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
         }
 
         if (tab.tabType === 'claude-sdk') {
+          sdkCount++;
+          totalCount++;
           result.push(
             <ClaudeSDKTab
               key={tab.id}
@@ -343,6 +348,7 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
             />
           );
         } else {
+          totalCount++;
           result.push(
             <Terminal
               key={tab.id}
@@ -356,6 +362,8 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
       });
     });
 
+    const durMs = Date.now() - t0;
+    console.warn(`[TerminalArea:useMemo] RECALCULATING projectId=${projectId.slice(-12)} total=${totalCount} sdk=${sdkCount} durMs=${durMs}`);
     return result;
   }, [terminalFingerprint, projectId, viewingSubAgentTabId]);
 

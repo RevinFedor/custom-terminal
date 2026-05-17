@@ -1,5 +1,7 @@
 const Database = require('better-sqlite3');
 const path = require('path');
+const fs = require('fs');
+const os = require('os');
 const { app } = require('electron');
 
 class DatabaseManager {
@@ -313,6 +315,15 @@ class DatabaseManager {
 
     // Migration: add message_count to tab_history
     try { this.db.exec(`ALTER TABLE tab_history ADD COLUMN message_count INTEGER DEFAULT NULL`); } catch (e) {}
+
+    // Migration: add position + process_was_running to tab_history.
+    // - position: index inside TabBar at close time (excluding sub-agent / utility tabs),
+    //   used as a hint by Shift+Cmd+T to put the restored tab back near where it was.
+    // - process_was_running: 1 if the underlying CLI (claude/gemini/script) was alive
+    //   when the tab was closed. Shift+Cmd+T uses this to auto-Continue Claude sessions
+    //   that were killed only by virtue of the tab itself going away.
+    try { this.db.exec(`ALTER TABLE tab_history ADD COLUMN position INTEGER DEFAULT NULL`); } catch (e) {}
+    try { this.db.exec(`ALTER TABLE tab_history ADD COLUMN process_was_running INTEGER DEFAULT 0`); } catch (e) {}
 
     // Migration: add position to timeline_notes
     try { this.db.exec(`ALTER TABLE timeline_notes ADD COLUMN position TEXT DEFAULT 'before'`); } catch (e) {}
@@ -637,9 +648,9 @@ class DatabaseManager {
 
   archiveTab(projectId, tab) {
     const now = Math.floor(Date.now() / 1000);
-    this.db.prepare(`
-      INSERT INTO tab_history (project_id, name, cwd, color, notes, command_type, tab_type, url, created_at, closed_at, claude_session_id, gemini_session_id, message_count)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    const info = this.db.prepare(`
+      INSERT INTO tab_history (project_id, name, cwd, color, notes, command_type, tab_type, url, created_at, closed_at, claude_session_id, gemini_session_id, message_count, position, process_was_running)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       projectId,
       tab.name,
@@ -653,8 +664,22 @@ class DatabaseManager {
       now,
       tab.claudeSessionId || null,
       tab.geminiSessionId || null,
-      tab.messageCount ?? null
+      tab.messageCount ?? null,
+      tab.position ?? null,
+      tab.processWasRunning ? 1 : 0
     );
+    return info.lastInsertRowid;
+  }
+
+  // Pop the most recent tab_history entry for a project (for Shift+Cmd+T reopen).
+  // Returns the row and deletes it atomically so repeated calls walk backwards.
+  popLatestTabHistory(projectId) {
+    const row = this.db.prepare(
+      'SELECT * FROM tab_history WHERE project_id = ? ORDER BY closed_at DESC, id DESC LIMIT 1'
+    ).get(projectId);
+    if (!row) return null;
+    this.db.prepare('DELETE FROM tab_history WHERE id = ?').run(row.id);
+    return row;
   }
 
   getTabHistory(projectId, limit = 200) {
@@ -1129,6 +1154,15 @@ class DatabaseManager {
       console.log('[DB] saveSessionLink: SKIPPING circular link', parentId.substring(0, 8), '→', childId.substring(0, 8), '(reverse exists)');
       return;
     }
+    // Liveness guard: subagent fork-flow creates a directory named `<uuid>/subagents/`
+    // inside the project dir, which Bridge can transiently surface as `session_id`.
+    // Persisting such UUIDs into session_links corrupts the chain — Timeline forward-
+    // resolves to the dead child, overwrites the store, and renders empty.
+    // See fix-dead-session-link-overwrite.md.
+    if (!_sessionUuidHasJsonlFile(childId)) {
+      console.warn('[DB] saveSessionLink: SKIPPING dead child', childId.substring(0, 8), '(no JSONL file — likely subagent directory)');
+      return;
+    }
     this.db.prepare(`
       INSERT OR IGNORE INTO session_links (parent_session_id, child_session_id)
       VALUES (?, ?)
@@ -1314,6 +1348,27 @@ class DatabaseManager {
   }
 
   close() { this.db.close(); }
+}
+
+// Module-level helper for saveSessionLink liveness guard. Avoids requiring
+// claude-data.js (circular dep: claude-data.js → DatabaseManager). Scans
+// ~/.claude/projects/* for a JSONL file named `<uuid>.jsonl`. A bare directory
+// of the same name (subagent fork-flow artifact) does NOT count.
+function _sessionUuidHasJsonlFile(uuid) {
+  if (!uuid || typeof uuid !== 'string') return false;
+  const projectsRoot = path.join(os.homedir(), '.claude', 'projects');
+  if (!fs.existsSync(projectsRoot)) return false;
+  try {
+    const projects = fs.readdirSync(projectsRoot);
+    for (const proj of projects) {
+      const candidate = path.join(projectsRoot, proj, uuid + '.jsonl');
+      try {
+        const st = fs.statSync(candidate);
+        if (st.isFile()) return true;
+      } catch {}
+    }
+  } catch {}
+  return false;
 }
 
 module.exports = DatabaseManager;

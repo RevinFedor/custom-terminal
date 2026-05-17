@@ -132,12 +132,15 @@ export default function Tooltip({
 
   // Defer the hide by one frame's worth so the cursor can cross GAP onto the
   // tip without losing it. The tip's own onPointerEnter will cancel this timer.
+  // 60ms — minimum that reliably covers the 6px gap at typical cursor speeds
+  // while still feeling instant on leave. Higher values produced a "lingering"
+  // tooltip after the cursor was already far from the trigger.
   const hide = useCallback(() => {
     if (hideTimerRef.current) clearTimeout(hideTimerRef.current);
     hideTimerRef.current = setTimeout(() => {
       setHovering(false);
       hideTimerRef.current = null;
-    }, 120);
+    }, 60);
   }, []);
 
   // Extract a plain-text representation of `content` for the Copy button.
@@ -286,7 +289,19 @@ export default function Tooltip({
             if (hideTimerRef.current) { clearTimeout(hideTimerRef.current); hideTimerRef.current = null; }
             setInTip(true);
           }}
-          onPointerLeave={() => setInTip(false)}
+          // When the cursor leaves the tooltip body, force-close. Previously
+          // only `inTip` was reset — but `hovering` could still be `true` from
+          // a trigger→tip transition that cancelled the hide-timer (the timer
+          // never fired, so `setHovering(false)` never ran). With `hovering`
+          // stuck true, the tip stayed visible even though pointer was outside
+          // both elements. Resetting both here makes leave-from-tip terminal;
+          // if the cursor lands back on the trigger, its onPointerEnter will
+          // flip `hovering` back to true and reopen.
+          onPointerLeave={() => {
+            if (hideTimerRef.current) { clearTimeout(hideTimerRef.current); hideTimerRef.current = null; }
+            setInTip(false);
+            setHovering(false);
+          }}
           // Prevent the trigger's onPointerDown from firing while clicks land
           // inside the tooltip body (e.g. clicking the Copy button shouldn't
           // submit the button under the tooltip).

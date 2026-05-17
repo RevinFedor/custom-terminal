@@ -178,6 +178,21 @@ Sniper полагается на StatusLine Bridge (`~/.claude/bridge/<sid>.json
 - **Блокировка действий:** Кнопки **C** (Claude) и **G** (Gemini) заблокированы (`disabled`), пока система не подтвердит наличие соответствующего файла на диске. Это предотвращает установку "битых" ID, которые привели бы к ошибкам при попытке Resume/Fork.
 - **Resolved IDs:** При вводе короткого 8-символьного ID для Gemini, система резолвит его в полный UUID. При нажатии кнопки "Apply", в store записывается именно полный UUID.
 
+### Apply pipeline (cd + stop + resume)
+
+Apply для Claude делает три действия в одном flow, независимо от того, запущен Claude в табе или нет.
+
+**1. Auto-cd до origin-cwd сессии.** `claude --resume <uuid>` ребилдит project slug из `process.cwd()` и ищет `~/.claude/projects/<slug>/<uuid>.jsonl`. Если шелл таба сидит в другом проекте, CLI отвечает *«No conversation found»*. Заранее зная это, renderer перед resume дёргает IPC `claude:resolve-session-cwd` — main читает первую строку JSONL (там Claude всегда пишет `entry.cwd`) и возвращает реальный путь. Команда собирается одной строкой `cd '<path>' && claude --dangerously-skip-permissions --resume <uuid>\r` и пишется в PTY атомарно: юзер не успевает вклиниться между cd и resume. Single-quote escape (`safe = cdTo.replace(/'/g, "'\\''")`) защищает от путей со спецсимволами.
+
+**2. Always-stop, не trust the polled flag.** Renderer **всегда** делает `await ipcRenderer.invoke('terminal:stop-ai-process', tabId)` — без условия на `isCommandRunning`. Локальный флаг — это polled-snapshot store через 500ms-таймер, окно расхождения с реальностью измеряется секундами. Доверять ему как gate'у нельзя: воспроизводилось так — `[InfoPanel:ManualSet]` отработал, `[StopAI]` отсутствует в логах, сразу `[Claude Runner] Continuing session`, а команда `cd … && claude --resume …` уходит в композер живого Claude TUI как user-prompt. Авторитетный источник — main через `ps -eo pid,ppid,command`: если процесса реально нет, IPC возвращает `success:false, error:'no AI process found'` — это **ожидаемый** no-op-код, обрабатываем тихо и сразу переходим к launch. Близкая методология — `methodology/design.md::Cached external resource: alive-probe перед использованием` (probe перед использованием cached external handle — тот же класс «не доверять локальной проекции, спрашивать авторитет»).
+
+**3. Auto-launch когда Claude не запущен.** Тот же `runResume()` вызывается без stop-grace 150ms. Юзеру не нужно второго жеста («набрал UUID → нажал C → нажал Continue»): свежий Claude сразу стартует с правильной сессией в правильном cwd.
+
+**Сигнатура расширена в main:** `claude:run-command` теперь принимает опциональный `cdTo` параметр; в branch `claude-c` пишется `cd '<cdTo>' && claude --resume <sessionId>` если `cdTo` непустой, иначе только `claude --resume`. Этим же путём может пользоваться любой другой UI-сценарий, где нужен resume чужой сессии — Continue-кнопка, Restore tab.
+
+### Anti-flap на dead session_links
+Раньше Apply «откатывался через секунду» — Timeline через `latestSessionId` тащил dead UUID из `session_links` SQLite и перезатёртывал store. Это **другой** баг с другим фиксом — см. [`fix-dead-session-link-overwrite.md`](fix-dead-session-link-overwrite.md) и [`fact-session-detection.md::Dead session_links + chain resolve trap`](fact-session-detection.md). Без liveness-guard'а никакой Apply корректно не работал, потому что polling Timeline'а перетоптывал ручной выбор.
+
 ---
 
 ## 6. Session Item Visual Selection

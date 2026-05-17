@@ -1,6 +1,6 @@
 # Feature: Status Bar
 
-VSCode-style полоса по всей нижней границе окна (поверх terminal + sidebar + Timeline). Высота 22px, шрифт 12px. Реализация в [`StatusBar.tsx`](../../src/renderer/components/StatusBar.tsx), подключён в `App.tsx` между Workspace и Global UI (Toasts).
+VSCode-style полоса по всей нижней границе окна (поверх terminal + sidebar + Timeline). Высота 24px, шрифт 12px. Реализация в [`StatusBar.tsx`](../../src/renderer/components/StatusBar.tsx), подключён в `App.tsx` между Workspace и Global UI (Toasts).
 
 **Зачем существует.** Глобальный хост для индикаторов и переключателей, которые:
 - применимы ко **всему** приложению (не привязаны к конкретному табу/проекту);
@@ -12,9 +12,12 @@ VSCode-style полоса по всей нижней границе окна (п
 | Элемент | Назначение | Persistence |
 |---|---|---|
 | `Effort: <value>` chip + popup | Default Claude effort для будущих сессий (`none / auto / low / med / high / max`) | `localStorage` ключ `noted-terminal-default-claude-effort` |
+| `● kill dev-ports` toggle | Перед каждым запуском npm-скрипта убивать занятые порты проекта | `localStorage` ключ `noted-terminal-free-ports-before-start` |
 | `● bridges` toggle | Подсвечивать невидимые hover-мосты красным (через `HoverBridgeDebug`) | `localStorage` ключ `noted-terminal-debug-hover-bridges` |
+| `! N` оранжевый chip | Счётчик невалидных файловых путей в AI-промптах (рендерится только если N > 0) | derived, не persist |
+| `⚙` Settings button | Открывает `SettingsModal` | — |
 
-Левая зона зарезервирована под будущие git/branch/lints/etc — пока пустая.
+Левая зона зарезервирована под будущие git/branch/lints/etc — пока живёт только `WebServerChip` (LAN IP мобильного web-сервера).
 
 ## EffortSelector: tri-mode trigger
 
@@ -45,11 +48,32 @@ Chip-trigger в status bar открывает popup с 6 кнопками тре
 
 **Зачем юзеру это** — отладка «popup закрывается, когда курсор должен был остаться в hover-зоне». Включил тогл → увидел красный rect → понятно, куда курсор должен идти и где реально мёртвая зона.
 
+## InvalidPathsChip — реактивная валидация путей в AI-промптах
+
+Оранжевый chip `! N` слева от шестерёнки. Назначение — пассивно сигналить юзеру «в твоих AI-промптах N файловых путей указывают в никуда, открой Settings». Цвет `#DA7756` (Claude-orange, согласован со остальной accent-палитрой), фон `rgba(218,119,86,0.12)` идле / `0.22` hover. Клик открывает SettingsModal — без скролла к конкретному промпту (можно добавить позже, не приоритет).
+
+**Источник данных:** `usePromptsStore.prompts` (массив AIPrompt с `filePaths[]`) + `useUIStore.docPrompt` (если `useFile === true`, его `filePath` тоже учитывается). При любом `savePrompt`/`deletePrompt` Zustand триггерит подписчиков — chip пересчитывает без какого-либо polling'а.
+
+**Стабилизация ключа для useEffect.** Zustand возвращает новые ссылки на массивы при каждом `set()`, даже если содержимое не менялось — наивная зависимость `useEffect([prompts, docPrompt])` ловила бы re-run на любой мутации store, даже не связанной с путями. Поэтому через `useMemo` собирается плоский массив **всех путей** и сериализуется в JSON — это стабильная строка-ключ, useEffect срабатывает **только** когда реально появился/исчез/изменился хоть один путь.
+
+**Debounce 300ms перед IPC.** Пользователь редактирует поле пути символ-за-символом → каждое нажатие триггерит save → JSON-key меняется → useEffect cleanup → setTimeout 300ms → IPC. Если за 300ms ещё нажатие — таймер сбрасывается. Без этого редактирование короткого пути из 30 символов даёт 30 IPC-round-trip'ов.
+
+**IPC батч-проверка.** Один вызов `ai-prompts:check-paths` принимает массив путей и возвращает `{ missing: string[] }`. В main (`settings.js`) — простой цикл по `fs.existsSync`. Без батча было бы N round-trip'ов через `ai-prompts:check-file` (отдельный helper на один путь, оставлен для inline-feedback в SettingsModal — там как раз нужна точечная проверка одного значения).
+
+**Render-when-N>0, не «всегда серый 0».** Если все пути валидны — chip **скрыт целиком**, а не показывается серой `! 0` плашкой. Принцип «context-irrelevant indicator = hide, не show as 0/N/A» — см. `methodology/design.md::Context-irrelevant indicator`. Серый zero шумит и тренирует юзера игнорировать индикатор; absence of chip — самый чистый сигнал «всё ок».
+
+**Tooltip.** Содержимое — первые 5 путей с указанием `+N` если больше, и подсказка «Клик → Настройки». Юзер может убедиться какой именно файл сломан, не открывая Settings.
+
+## Settings button (шестерёнка)
+
+Lucide `Settings` size 14, stroke 1.75. Idle — серый `#bbb`, hover — белый + тинт `rgba(255,255,255,0.08)`. Клик открывает `SettingsModal` через prop `onOpenSettings` который пробрасывается из App.tsx. Сейчас это единственный способ открыть Settings из status bar — раньше Settings открывался только через горячую клавишу из Workspace, теперь discoverable.
+
 ## Расширение status bar
 
 При добавлении новых toggle'ов:
 - Используй `<StatusToggle>` (точка-индикатор + лейбл, с glow при ON) для bool-флагов.
 - Для multi-value селекторов — pattern из `EffortSelector` (chip-trigger + popup).
 - Каждый persistent-флаг — отдельный `load/save` helper в `useUIStore.ts` + ключ `noted-terminal-<feature>`. **Не** объединяй несколько toggle'ов в один JSON-объект — следующий разработчик может добавить флаг и забыть про migration.
-- Правая зона — для debug/defaults. Левая — для status-info (git branch, lint counts, тип activeAreas).
+- Правая зона — для debug/defaults + индикаторов проблем. Левая — для status-info (git branch, lint counts, тип activeAreas).
 - Шрифт 12px унаследуется через root style; кнопки внутри popup'ов могут оставлять свой размер (например, Effort-кнопки 10px согласованы с такими же в InfoPanel).
+- Если индикатор показывает «количество проблем» (как InvalidPathsChip) — render-when-N>0, не «серый 0».

@@ -39,6 +39,11 @@ renderer: {
     },
     build: {
       outDir: 'dist/renderer',
+      // Inline source maps so react-grab can symbolicate fiber._debugStack
+      // back into /src/... paths inside the packaged .app. Required for
+      // React 19.2 where _debugSource is gone and react-grab/bippy rely
+      // on stack-based resolution via sourcemaps.
+      sourcemap: 'inline',
       rollupOptions: {
         input: resolve(__dirname, 'index.html')
       },
@@ -51,6 +56,13 @@ renderer: {
     plugins: [react(), tailwindcss()],
     define: {
       'process.env.GEMINI_API_KEY': JSON.stringify(env.GEMINI_API_KEY || ''),
+      // Force React to load its development build even in production builds.
+      // This keeps `console.createTask` / `_debugStack` alive on React 19 so
+      // react-grab can resolve component source paths inside the installed
+      // .app. Build mode itself (minify, tree-shake) is unaffected — only
+      // the React runtime entry switches. Acceptable here because this is
+      // a local-only Electron app, not a redistributable bundle.
+      'process.env.NODE_ENV': JSON.stringify('development'),
     },
     resolve: {
       alias: [

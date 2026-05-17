@@ -4,6 +4,7 @@
 - `npm run dev` — запуск приложения с hot-reload.
 - `npm run dev:css` — watch-режим для Tailwind.
 - `npm run rebuild` — пересборка `node-pty` (выполнять при ошибках модуля).
+- **После `npm install <native-module>`** — `npx electron-rebuild -f -w <module> --only <module>`. Без `--only` падает на других native-deps (`better-sqlite3` не собирается на Xcode 26 из-за `libexpat`), целевой модуль рядом не пересоберётся. См. [`fix-electron-native-rebuild-trap.md`](fix-electron-native-rebuild-trap.md) — там же про restore `.node` из `/Applications/Noted Terminal.app` когда rebuild не вариант.
 
 ## 2. Сборка (Build)
 - `npm run build` — сборка через electron-builder.

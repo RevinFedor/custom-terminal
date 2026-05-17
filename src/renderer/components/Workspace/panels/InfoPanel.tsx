@@ -196,6 +196,34 @@ function SessionActionChip({
   );
 }
 
+// Module-scope so React reuses the DOM node across re-renders. Defining ChipText
+// inline inside the render body made every InfoPanel re-render create a new
+// component type → React allocated a fresh <button> node each time → trusted
+// clicks landed on a node that no longer existed by mouseup, so the synthetic
+// `click` event never fired (verified through MCP: pointerdown/up arrived, but
+// the post-pointerdown elementFromPoint returned a *different* BUTTON instance
+// at the same coords). Only User/Claude chips kept working because they were
+// raw <button> in JSX, not via inline component.
+const CHIP_ON = '#DA7756';
+const CHIP_OFF = '#555';
+const ChipText = ({ active, children, onClick, title, italic = false }:
+  { active: boolean; children: React.ReactNode; onClick: () => void; title: string; italic?: boolean }) => (
+  <button
+    onClick={onClick}
+    title={title}
+    className="cursor-pointer hover:opacity-80 transition-opacity"
+    style={{
+      background: 'transparent', border: 'none', padding: 0,
+      color: active ? CHIP_ON : CHIP_OFF,
+      fontSize: 9.5,
+      fontFamily: 'ui-monospace, SFMono-Regular, monospace',
+      fontStyle: italic ? 'italic' : 'normal',
+      lineHeight: 1.2,
+      letterSpacing: '-0.01em',
+    }}
+  >{children}</button>
+);
+
 export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
   const [claudeSessionId, setClaudeSessionId] = useState<string | null>(null);
   const [geminiSessionId, setGeminiSessionId] = useState<string | null>(null);
@@ -217,10 +245,12 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
   const [claudeExpanded, setClaudeExpanded] = useState(false);
   const [claudeExtraPrompt, setClaudeExtraPrompt] = useState('');
   const [claudeDefaultPrompt, setClaudeDefaultPrompt] = useState('');
-  // Local mirror exists ONLY so the textarea has a controlled value. Real source
-  // of truth lives in useWorkspaceStore.tabs[id].notes — slide-out + sidebar
-  // editor both write there. The selector below keeps this mirror reactive.
-  const [tabNotes, setTabNotes] = useState('');
+  // Источник правды: useWorkspaceStore.tabs[id].notes. Раньше тут жил
+  // useState-mirror + useEffect(setTabNotes(liveTabNotes), [liveTabNotes]) —
+  // одно-кадровый лаг между слайдаутом и InfoPanel плюс stale-чтение
+  // mirror'а в handleGenerateDescription могло затирать concurrent правки
+  // (см. fix-codemirror-controlled-editor.md и fact-notes.md).
+  // Теперь читаем напрямую через reactive selector ниже (liveTabNotes).
   const [sessionCopied, setSessionCopied] = useState(false);
   const [isGeneratingDesc, setIsGeneratingDesc] = useState(false);
   // Hover state шапки «Заметки вкладки» — теперь весь header-блок hover-able и кликабелен,
@@ -246,7 +276,18 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
   const [claudeModel, setClaudeModel] = useState<string | null>(cached?.model ?? null);
   const [contextPct, setContextPct] = useState(cached?.contextPct ?? 0);
   const [isCommandRunning, setIsCommandRunning] = useState(false);
-  const [isControlBusy, setIsControlBusy] = useState(false);
+  const [isControlBusyLocal, setIsControlBusy] = useState(false);
+  // isPasteBusy mirrors main's safePasteAndSubmit lifecycle (claude:paste-busy
+  // IPC event). When ANY caller (queue runner, MCP, /effort auto-inject, this
+  // panel) is mid-paste on the active tab, every control button is disabled.
+  // Belt-and-braces on top of the server-side mutex in safePasteAndSubmit:
+  // the mutex serializes concurrent writes correctly, but a disabled button
+  // gives the user immediate feedback that nothing will happen mid-stream.
+  const [isPasteBusy, setIsPasteBusy] = useState(false);
+  // Derived busy: local "I'm sending this very click" OR main "someone else is
+  // mid-paste right now". Every existing isControlBusy check below picks up
+  // both sources automatically.
+  const isControlBusy = isControlBusyLocal || isPasteBusy;
   const [providerState, setProviderState] = useState<{ type: string; model?: string }>({ type: 'anthropic' });
   // Remembers last-selected model per provider so switching back restores prior choice.
   // Anthropic entry is null because its current model is read from live bridge data (claudeModel) — not stored locally.
@@ -319,15 +360,16 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
   }, [isHistoryOpen]);
   const { getPromptById } = usePromptsStore();
   const wordWrap = useUIStore((s) => s.wordWrap);
-  const tabNotesFontSize = useUIStore((s) => s.tabNotesFontSize);
-  const tabNotesPaddingX = useUIStore((s) => s.tabNotesPaddingX);
-  const tabNotesPaddingY = useUIStore((s) => s.tabNotesPaddingY);
+  const tabNotesFontSize = useUIStore((s) => s.notesEditorFontSize);
+  const tabNotesPaddingX = useUIStore((s) => s.notesEditorPaddingX);
+  const tabNotesPaddingY = useUIStore((s) => s.notesEditorPaddingY);
   const { setTabCommandType, closeTab, setTabNotes: setTabNotesStore } = useWorkspaceStore();
   const claudeTextareaRef = useRef<HTMLTextAreaElement>(null);
 
-  // Reactive subscription to the live tab.notes — fires when slide-out (or any
-  // other consumer) writes via setTabNotesStore. Keeps our local mirror in sync.
-  const liveTabNotes = useWorkspaceStore((s) => {
+  // Reactive subscription to the live tab.notes. Slide-out + sidebar editor
+  // тоже подписаны на это же поле через свои селекторы — все рендерят одну
+  // правду, без локальных копий.
+  const tabNotes = useWorkspaceStore((s) => {
     if (!activeTabId) return '';
     for (const [, workspace] of s.openProjects) {
       const tab = workspace.tabs.get(activeTabId);
@@ -335,9 +377,6 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
     }
     return '';
   });
-  useEffect(() => {
-    setTabNotes(liveTabNotes);
-  }, [liveTabNotes]);
 
   useEffect(() => {
     ipcRenderer.invoke('app:getState', 'claudeDefaultPrompt').then((value: string | null) => {
@@ -386,12 +425,26 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
     // SDK tabs don't fire terminal:command-* (no PTY). They emit busy state via
     // claude:busy-state (forwarded from claude-sdk:busy-state in main). Subscribe
     // here so SessionActionChip can flip Continue→Stop while the SDK is streaming.
+    //
+    // CRITICAL: for PTY-backed Claude tabs the truth source is terminal:command-*
+    // (the PTY is alive == process is running). claude:busy-state mirrors the
+    // spinner-detector / Stop-hook, which flips false in between thinking phases.
+    // Wiring `setIsCommandRunning(busy)` for PTY tabs caused the chip to flip to
+    // "Continue" between phases — the user sees an idle chip while Claude is
+    // still running. So we gate `claude:busy-state` to SDK tabs only.
     const handleBusyState = (_: any, data: { tabId: string; busy: boolean }) => {
-      if (data.tabId === activeTabId) setIsCommandRunning(data.busy);
+      if (data.tabId !== activeTabId) return;
+      if (!isSDKTab) return; // PTY tabs derive isCommandRunning from terminal:command-*
+      setIsCommandRunning(data.busy);
+    };
+    const handlePasteBusy = (_: any, data: { tabId: string; busy: boolean }) => {
+      if (data.tabId !== activeTabId) return;
+      setIsPasteBusy(data.busy);
     };
     ipcRenderer.on('terminal:command-started', handleStarted);
     ipcRenderer.on('terminal:command-finished', handleFinished);
     ipcRenderer.on('claude:busy-state', handleBusyState);
+    ipcRenderer.on('claude:paste-busy', handlePasteBusy);
     ipcRenderer.invoke('terminal:getCommandState', activeTabId).then((state: any) => {
       setIsCommandRunning(state?.isRunning || false);
     });
@@ -399,8 +452,12 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
       ipcRenderer.removeListener('terminal:command-started', handleStarted);
       ipcRenderer.removeListener('terminal:command-finished', handleFinished);
       ipcRenderer.removeListener('claude:busy-state', handleBusyState);
+      ipcRenderer.removeListener('claude:paste-busy', handlePasteBusy);
+      // Tab switch resets paste-busy view; main keeps emitting for the right
+      // tabId, the new tab will receive its own state on the next event.
+      setIsPasteBusy(false);
     };
-  }, [activeTabId]);
+  }, [activeTabId, isSDKTab]);
 
   // Reset Anthropic effort when shell exit fires for any tab (listens for OSC 133 D event).
   // Anthropic effort is Claude TUI state — Claude CLI loses it on exit, but local effortLevel map
@@ -610,19 +667,27 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
       const data = await response.json();
       if (data.error) throw new Error(data.error.message || 'API Error');
       const descriptionText = data.candidates[0].content.parts[0].text.replace(/\n/g, ' ').trim();
-      const lines = tabNotes.split('\n');
+      // Читаем актуальный tab.notes ИЗ STORE на момент завершения await —
+      // не из reactive selector (его значение зафризилось в closure на момент
+      // клика). Если за время Gemini-запроса слайдаут дописал текст —
+      // мы его сохраним, не затрём.
+      let currentNotes = '';
+      for (const [, workspace] of useWorkspaceStore.getState().openProjects) {
+        const tab = workspace.tabs.get(activeTabId);
+        if (tab) { currentNotes = tab.notes || ''; break; }
+      }
+      const lines = currentNotes.split('\n');
       const markedLine = DESC_MARKER + descriptionText;
       if (lines.length > 0 && lines[0].startsWith(DESC_MARKER)) lines[0] = markedLine;
       else lines.unshift(markedLine);
       const newNotes = lines.join('\n');
-      setTabNotes(newNotes);
       setTabNotesStore(activeTabId, newNotes);
       showToast('Description generated', 'success');
     } catch (e: any) { showToast(e.message || 'Failed to generate description', 'error'); }
     finally { setIsGeneratingDesc(false); }
   };
 
-  const handleApplyManualSession = (mode: 'claude' | 'gemini') => {
+  const handleApplyManualSession = async (mode: 'claude' | 'gemini') => {
     if (!activeTabId || !validationResult) return;
     const result = mode === 'claude' ? validationResult.claude : validationResult.gemini;
     if (!result || result.status !== 'found' || !result.fullId) {
@@ -640,14 +705,74 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
     }
     if (mode === 'gemini') {
       useWorkspaceStore.getState().setGeminiSessionId(activeTabId, newId);
-    } else {
-      console.warn('[InfoPanel:ManualSet] MANUAL session set for tab', activeTabId, ':', newId.substring(0, 8));
-      useWorkspaceStore.getState().setClaudeSessionId(activeTabId, newId);
+      showToast(`Gemini session set: ${newId.substring(0, 8)}...`, 'success');
+      setSessionInputMode(null);
+      setManualSessionId('');
+      setValidationResult(null);
+      return;
     }
-    showToast(`${mode === 'gemini' ? 'Gemini' : 'Claude'} session set: ${newId.substring(0, 8)}...`, 'success');
+
+    // Claude: update store + restart PTY process with --resume <newId>.
+    // Without restart only the sidebar/Timeline reflect the new session; the running
+    // Claude CLI inside the terminal keeps talking to the old session.
+    //
+    // Cwd-mismatch: `claude --resume <uuid>` rebuilds the project slug from process.cwd()
+    // and looks up `~/.claude/projects/<slug>/<uuid>.jsonl`. If the tab's shell sits in
+    // a different project than where the session originated, the CLI errors with
+    // "No conversation found". Resolve the JSONL's recorded cwd via main and `cd` into
+    // it as part of the same command line; the renderer never needs to care which
+    // project owns which session.
+    console.warn('[InfoPanel:ManualSet] MANUAL session set for tab', activeTabId, ':', newId.substring(0, 8));
+    useWorkspaceStore.getState().setClaudeSessionId(activeTabId, newId);
     setSessionInputMode(null);
     setManualSessionId('');
     setValidationResult(null);
+
+    let sessionCwd: string | null = null;
+    try {
+      const r = await ipcRenderer.invoke('claude:resolve-session-cwd', { sessionId: newId });
+      if (r?.success && r.sessionCwd) sessionCwd = r.sessionCwd;
+    } catch (e) {
+      console.warn('[InfoPanel:ManualSet] resolve-session-cwd failed:', e);
+    }
+
+    const runResume = () => {
+      setTabCommandType(activeTabId, 'claude');
+      ipcRenderer.send('claude:run-command', {
+        tabId: activeTabId,
+        command: 'claude-c',
+        sessionId: newId,
+        cdTo: sessionCwd || undefined,
+      });
+    };
+
+    // ALWAYS try to stop first, regardless of the renderer's `isCommandRunning` flag.
+    // That flag is a polled snapshot of the store and can lag behind reality — Claude
+    // may be running while UI still believes it isn't. If we trust the stale flag and
+    // skip the stop, the resume command lands inside Claude's prompt composer instead
+    // of the shell, garbling input. The authoritative source is the main process via
+    // PS lookup: `terminal:stop-ai-process` returns success=false with
+    // `error: 'no AI process found'` when nothing is running, which is the legitimate
+    // "no-op" branch — handle it silently and proceed straight to launch.
+    try {
+      showToast(`Restarting Claude → ${newId.substring(0, 8)}...`, 'info');
+      const stopRes = await ipcRenderer.invoke('terminal:stop-ai-process', activeTabId);
+      const isNoProcess = !stopRes?.success && /no AI process/i.test(stopRes?.error || '');
+      if (!stopRes?.success && !isNoProcess) {
+        console.warn('[InfoPanel:ManualSet] stop failed:', stopRes?.error);
+        showToast('Stop failed: ' + (stopRes?.error || 'unknown'), 'error');
+        return;
+      }
+      if (stopRes?.success) {
+        // SIGTERM acknowledged; let the shell prompt redraw before sending resume.
+        await new Promise((r) => setTimeout(r, 150));
+      }
+      runResume();
+      showToast(`Claude resumed: ${newId.substring(0, 8)}...`, 'success');
+    } catch (e: any) {
+      console.error('[InfoPanel:ManualSet] restart error:', e);
+      showToast('Restart error: ' + (e?.message || 'unknown'), 'error');
+    }
   };
 
   const getInputBorderClass = () => {
@@ -933,7 +1058,32 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                   }}
                 >⟳</button>
               )}
-              {/* «Заменить сессию» (✎ Replace) — функционал пока не работает корректно, кнопка временно убрана. */}
+              {/* ✎ Replace session ID — manual rebind of tab.claudeSessionId / geminiSessionId.
+                  Used to flap because Timeline:ChainResolve overwrote the store via dead
+                  session_links rows; fixed in fix-dead-session-link-overwrite.md so manual
+                  edits now persist. Validation lives in renderSessionInput (debounced disk check). */}
+              {(currentSessionType === 'claude' || currentSessionType === 'gemini') && (
+                <button
+                  className="text-[10px] px-1.5 py-0.5 rounded cursor-pointer leading-none transition-colors"
+                  style={{
+                    color: sessionInputMode ? '#fff' : '#999',
+                    backgroundColor: sessionInputMode ? 'rgba(255,255,255,0.10)' : 'transparent',
+                    border: '1px solid rgba(255,255,255,0.10)',
+                  }}
+                  onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'rgba(255,255,255,0.06)'; (e.currentTarget as HTMLButtonElement).style.color = '#fff'; }}
+                  onMouseLeave={(e) => {
+                    const el = e.currentTarget as HTMLButtonElement;
+                    el.style.backgroundColor = sessionInputMode ? 'rgba(255,255,255,0.10)' : 'transparent';
+                    el.style.color = sessionInputMode ? '#fff' : '#999';
+                  }}
+                  title="Заменить ID сессии"
+                  onClick={() => {
+                    setSessionInputMode((prev) => prev ? null : currentSessionType);
+                    setManualSessionId('');
+                    setValidationResult(null);
+                  }}
+                >✎</button>
+              )}
               <button
                 className="text-[10px] px-1.5 py-0.5 rounded text-[#999] hover:text-white cursor-pointer leading-none flex items-center gap-0.5 transition-colors"
                 style={{
@@ -1029,6 +1179,7 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                       no_claude_session: 'No Claude session',
                       claude_busy: 'Claude is busy — wait for response',
                       wrong_editor: 'Restart Claude in this tab (editor not wired)',
+                      stale_pid: 'Claude was restarted in shell — close & reopen this tab',
                       editor_not_wired: 'Helper not reachable',
                     };
                     showToast(msgs[code] || `Copy failed: ${code}`, 'error');
@@ -1081,24 +1232,8 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
               bidirectional with the popup, so users see what's in the clipboard at a glance
               and can flip flags without opening settings. */}
           {currentSessionType === 'claude' && (() => {
-            const ON = '#DA7756';
-            const OFF = '#555';
-            const ChipText = ({ active, children, onClick, title, italic = false }:
-              { active: boolean; children: React.ReactNode; onClick: () => void; title: string; italic?: boolean }) => (
-              <button
-                onClick={onClick}
-                className="cursor-pointer hover:opacity-80 transition-opacity"
-                style={{
-                  background: 'transparent', border: 'none', padding: 0,
-                  color: active ? ON : OFF,
-                  fontSize: 9.5,
-                  fontFamily: 'ui-monospace, SFMono-Regular, monospace',
-                  fontStyle: italic ? 'italic' : 'normal',
-                  lineHeight: 1.2,
-                  letterSpacing: '-0.01em',
-                }}
-              >{children}</button>
-            );
+            const ON = CHIP_ON;
+            const OFF = CHIP_OFF;
             const dot = <span style={{ color: '#333', fontSize: 10, lineHeight: 1.2 }}>·</span>;
             return (
               <div
@@ -1959,7 +2094,7 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
         {activeTabId ? (
           <div style={{ flex: 1, minHeight: 0, position: 'relative' }}>
             <div style={{ position: 'absolute', inset: 0 }}>
-              <MarkdownEditor content={tabNotes} onChange={(newContent: string) => { console.warn('[InfoPanel:notes:onChange]', { tabId: activeTabId?.slice(-12), newLen: newContent.length }); setTabNotes(newContent); if (activeTabId) setTabNotesStore(activeTabId, newContent); }} onGenerateTitle={generateAITitle} fontSize={tabNotesFontSize} contentPaddingX={tabNotesPaddingX} contentPaddingY={tabNotesPaddingY} wordWrap={wordWrap} showLineNumbers={false} compact foldStateKey={`tab-notes:${activeTabId}`} />
+              <MarkdownEditor content={tabNotes} onChange={(newContent: string) => { console.warn('[InfoPanel:notes:onChange]', { tabId: activeTabId?.slice(-12), newLen: newContent.length }); if (activeTabId) setTabNotesStore(activeTabId, newContent); }} onGenerateTitle={generateAITitle} fontSize={tabNotesFontSize} contentPaddingX={tabNotesPaddingX} contentPaddingY={tabNotesPaddingY} wordWrap={wordWrap} showLineNumbers={false} compact />
             </div>
           </div>
         ) : (

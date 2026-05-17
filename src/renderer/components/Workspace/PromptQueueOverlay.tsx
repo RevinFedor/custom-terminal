@@ -1,8 +1,7 @@
-import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
-import { usePromptQueueStore, QueuedPrompt } from '../../store/usePromptQueueStore';
+import { useEffect, useRef, useState, useCallback } from 'react';
+import { usePromptQueueStore } from '../../store/usePromptQueueStore';
 import { useUIStore } from '../../store/useUIStore';
 import { terminalRegistry } from '../../utils/terminalRegistry';
-import Tooltip from '../UI/Tooltip';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -14,6 +13,7 @@ const GRAB_ERROR_TOASTS: Record<string, string> = {
   claude_busy: 'Claude is busy — wait for the response to finish',
   already_in_progress: 'Grab already in progress',
   wrong_editor: 'Restart Claude in this tab — grab needs our editor helper, current $EDITOR is wrong',
+  stale_pid: 'Claude was restarted outside our control — close & reopen this tab',
   editor_not_wired: 'Helper never reported back — check ~/.claude/hooks/noted-code-grab.js',
   tab_cleared: 'Tab was closed before grab finished',
   timeout: 'Grab timed out',
@@ -51,17 +51,15 @@ export function PromptQueueOverlay({ tabId, claudeBusy }: Props) {
   const items = queue?.items ?? [];
   const autoRun = queue?.autoRun ?? false;
   const stopAfter = queue?.stopAfter ?? false;
-  const previewId = queue?.previewId ?? null;
   const {
     addPrompt, removePrompt, updatePromptText, reorderPrompt,
-    setAutoRun, setStopAfter, setPreviewId,
+    setAutoRun, setStopAfter,
     // popNext is consumed by hooks/usePromptQueueRunner.ts — not referenced here.
   } = usePromptQueueStore.getState();
 
   const [editorOpen, setEditorOpen] = useState(false);
   const [editorText, setEditorText] = useState('');
   const [editingId, setEditingId] = useState<string | null>(null);
-  const [cmdDown, setCmdDown] = useState(false);
   const [dragId, setDragId] = useState<string | null>(null);
   const [dragOverIdx, setDragOverIdx] = useState<number | null>(null);
   const [armedFlash, setArmedFlash] = useState(false);
@@ -69,21 +67,6 @@ export function PromptQueueOverlay({ tabId, claudeBusy }: Props) {
   // and its top edge to this rect's top edge. null = anchor to the whole panel's top-right corner.
   const [editorAnchor, setEditorAnchor] = useState<{ top: number; right: number } | null>(null);
   const panelRef = useRef<HTMLDivElement>(null);
-
-  // Track ⌘ for the "Cmd-hold opens preview" UX (matches existing pattern in the project)
-  useEffect(() => {
-    const dn = (e: KeyboardEvent) => { if (e.metaKey) setCmdDown(true); };
-    const up = (e: KeyboardEvent) => { if (!e.metaKey) setCmdDown(false); };
-    const blur = () => setCmdDown(false);
-    window.addEventListener('keydown', dn);
-    window.addEventListener('keyup', up);
-    window.addEventListener('blur', blur);
-    return () => {
-      window.removeEventListener('keydown', dn);
-      window.removeEventListener('keyup', up);
-      window.removeEventListener('blur', blur);
-    };
-  }, []);
 
   // Toast handle — single getState() at top so both grabCurrent and the auto-runner share it
   // without re-declaring (which TS catches as duplicate identifier).
@@ -115,15 +98,29 @@ export function PromptQueueOverlay({ tabId, claudeBusy }: Props) {
       setEditorText('');
       setEditingId(null);
     }
+    // Same clamp as preview: prevent the editor from being pushed below the
+    // viewport when the anchored chip is near the bottom of the queue.
+    const margin = 8;
+    const maxTop = window.innerHeight - PREVIEW_MAX_HEIGHT - margin;
+    anchorTop = Math.max(margin, Math.min(anchorTop, maxTop));
     setEditorAnchor({ top: anchorTop, right: anchorRight });
     setEditorOpen(true);
   }, [items]);
 
+  // Auto-arm was removed — adding a chip no longer flips Run after on.
+  // The user is the sole arbiter of when the queue starts firing (one toggle).
+  // History: earlier we auto-armed on the first chip ("queued something = wants
+  // auto"), but that fought with the new firstDelay countdown which only makes
+  // sense when the user explicitly hits Run with delay configured.
+
   const commitEditor = useCallback(() => {
     const t = editorText.trim();
     if (!t) { setEditorOpen(false); return; }
-    if (editingId) updatePromptText(tabId, editingId, t);
-    else addPrompt(tabId, t);
+    if (editingId) {
+      updatePromptText(tabId, editingId, t);
+    } else {
+      addPrompt(tabId, t);
+    }
     setEditorOpen(false);
     setEditorText('');
     setEditingId(null);
@@ -168,8 +165,15 @@ export function PromptQueueOverlay({ tabId, claudeBusy }: Props) {
 
   // Copy moved to InfoPanel — see Copy prompt button next to Copy Session.
 
+  // Toggle Run-after. If user disarms while a first-delay countdown is running,
+  // freeze the remaining seconds back into firstDelaySeconds via the store so
+  // the input shows "what's left" (not the original value).
   const toggleAutoRun = useCallback(() => {
     const next = !autoRun;
+    const q = usePromptQueueStore.getState().getQueue(tabId);
+    if (!next && q.firstDelayCountdownAt !== null) {
+      usePromptQueueStore.getState().cancelFirstDelayCountdown(tabId);
+    }
     setAutoRun(tabId, next);
     if (next) {
       setArmedFlash(true);
@@ -197,13 +201,9 @@ export function PromptQueueOverlay({ tabId, claudeBusy }: Props) {
   };
   const onDragEnd = () => { setDragId(null); setDragOverIdx(null); };
 
-  // ─── preview slideout positioning ────────────────────────────────────────
+  // chipRefs is still used: openEditor() needs each chip's top coordinate to
+  // anchor the editor slideout next to the clicked chip.
   const chipRefs = useRef<Map<string, HTMLDivElement>>(new Map());
-  const previewItem: QueuedPrompt | null = useMemo(
-    () => items.find((i) => i.id === previewId) ?? null,
-    [items, previewId],
-  );
-  const previewTop = previewItem ? (chipRefs.current.get(previewItem.id)?.getBoundingClientRect().top ?? 0) : 0;
 
   // ─── render ──────────────────────────────────────────────────────────────
   return (
@@ -227,17 +227,24 @@ export function PromptQueueOverlay({ tabId, claudeBusy }: Props) {
           overflow: 'hidden',
         }}
       >
-        {/* Header row: title left, two pill toggles right.
-            "Run after" — auto-send next queued prompt after each Claude turn ends.
-            "Stop after" — SIGTERM claude after the next turn ends (works without queue too).
-            Both pills are independent; the dot inside Run pulses while claude is busy. */}
+        {/* Header row: first-delay timer input on left, Run/Stop pills on right.
+            The title "Очередь" was removed — context is obvious from the panel.
+            Timer input doubles as a countdown display when armed:
+              idle  → shows configured firstDelaySeconds, editable.
+              armed → shows live remaining seconds, read-only.
+            "Run after" toggles autoRun. Arming with delay > 0 starts the countdown.
+            Disarming mid-countdown freezes the remaining seconds back into the input.
+            "Stop after" — SIGTERM claude after the next turn ends (independent). */}
         <div style={{ padding: '6px 8px', display: 'flex', alignItems: 'center', gap: 6, borderBottom: `1px solid ${BORDER}` }}>
-          <span style={{ color: '#ccc', fontSize: 11, fontWeight: 500, flex: 1, userSelect: 'none' }}>
-            Очередь {items.length > 0 && <span style={{ color: TEXT_DIM, fontWeight: 400 }}>· {items.length}</span>}
-          </span>
+          <FirstDelayInput tabId={tabId} autoRun={autoRun} />
+
+          {items.length > 0 && (
+            <span style={{ color: TEXT_DIM, fontSize: 10, userSelect: 'none' }}>· {items.length}</span>
+          )}
+
+          <span style={{ flex: 1 }} />
 
           {/* Run-after pill */}
-          <Tooltip content={autoRun ? (claudeBusy ? 'Active — queue runs after Claude responds' : 'Active — next prompt sends when Claude is idle') : 'Auto-send queued prompts after each turn'}>
           <button
             onClick={toggleAutoRun}
             style={{
@@ -261,10 +268,8 @@ export function PromptQueueOverlay({ tabId, claudeBusy }: Props) {
             />
             Run after
           </button>
-          </Tooltip>
 
           {/* Stop-after pill (independent, single-shot) */}
-          <Tooltip content={stopAfter ? 'Armed — Claude will be stopped after the next turn ends' : 'Stop Claude after the next response (one-shot)'}>
           <button
             onClick={() => setStopAfter(tabId, !stopAfter)}
             style={{
@@ -281,18 +286,15 @@ export function PromptQueueOverlay({ tabId, claudeBusy }: Props) {
             <span style={{ fontSize: 11, lineHeight: 1 }}>×</span>
             Stop after
           </button>
-          </Tooltip>
         </div>
 
         {/* Clear-all row — only when queue has items */}
         {items.length > 0 && (
           <div style={{ padding: '2px 8px 4px', borderBottom: `1px solid ${BORDER}`, display: 'flex', justifyContent: 'flex-end' }}>
-            <Tooltip content="Remove all queued prompts">
             <button
               onClick={() => items.forEach((i) => removePrompt(tabId, i.id))}
               style={{ background: 'transparent', border: 'none', color: TEXT_DIM, cursor: 'pointer', fontSize: 9, padding: 0 }}
             >clear all</button>
-            </Tooltip>
           </div>
         )}
 
@@ -305,26 +307,23 @@ export function PromptQueueOverlay({ tabId, claudeBusy }: Props) {
           )}
           {items.map((it, idx) => {
             const { head, tail } = chipParts(it.text);
-            const isPreview = previewId === it.id;
+            const isEditing = editorOpen && editingId === it.id;
             const isDragOver = dragOverIdx === idx;
             return (
-              <Tooltip key={it.id} content={cmdDown ? 'Клик: редактировать' : 'Клик: превью · ⌘+Клик: редактировать · Drag: переупорядочить'}>
               <div
+                key={it.id}
                 ref={(el) => { if (el) chipRefs.current.set(it.id, el); else chipRefs.current.delete(it.id); }}
                 draggable
                 onDragStart={onDragStart(it.id)}
                 onDragOver={onDragOver(idx)}
                 onDrop={onDrop(idx)}
                 onDragEnd={onDragEnd}
-                onClick={() => {
-                  if (cmdDown) { openEditor(it.id); return; }
-                  setPreviewId(tabId, isPreview ? null : it.id);
-                }}
+                onClick={() => openEditor(it.id)}
                 style={{
                   padding: '6px 8px',
                   borderBottom: `1px solid ${BORDER}`,
-                  background: isPreview ? `${TINT}1a` : (isDragOver ? `${PULSE}22` : 'transparent'),
-                  cursor: cmdDown ? 'text' : 'grab',
+                  background: isEditing ? `${TINT}1a` : (isDragOver ? `${PULSE}22` : 'transparent'),
+                  cursor: 'pointer',
                   display: 'flex', alignItems: 'center', gap: 6,
                   transition: 'background 0.15s',
                 }}
@@ -332,15 +331,12 @@ export function PromptQueueOverlay({ tabId, claudeBusy }: Props) {
                 <span style={{ color: TEXT_DIM, fontSize: 9, lineHeight: 1, userSelect: 'none' }}>⋮⋮</span>
                 <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 11 }}>{head}</span>
                 {tail && <span style={{ color: TEXT_DIM, fontSize: 9 }}>{tail}</span>}
-                {it.images > 0 && <Tooltip content={`${it.images} image(s) detached`}><span style={{ color: TINT, fontSize: 9 }}>📎{it.images}</span></Tooltip>}
-                <Tooltip content="Удалить">
+                {it.images > 0 && <span style={{ color: TINT, fontSize: 9 }}>📎{it.images}</span>}
                 <button
                   onClick={(e) => { e.stopPropagation(); removePrompt(tabId, it.id); }}
                   style={{ background: 'transparent', border: 'none', color: TEXT_DIM, cursor: 'pointer', padding: 0, lineHeight: 1, fontSize: 12 }}
                 >×</button>
-                </Tooltip>
               </div>
-              </Tooltip>
             );
           })}
         </div>
@@ -348,61 +344,16 @@ export function PromptQueueOverlay({ tabId, claudeBusy }: Props) {
         {/* Footer — grab + add. "Copy prompt" lives in InfoPanel next to Copy Session
             (single canonical location for clipboard ops, avoids duplicate buttons). */}
         <div style={{ display: 'flex', borderTop: `1px solid ${BORDER}` }}>
-          <Tooltip content="Grab the current Claude input into the queue (clears the input)">
           <button
             onClick={grabCurrent}
             style={{ flex: 1, padding: '6px 4px', background: 'transparent', border: 'none', borderRight: `1px solid ${BORDER}`, color: '#aaa', cursor: 'pointer', fontSize: 10 }}
           >+ grab</button>
-          </Tooltip>
-          <Tooltip content="Open editor for a new prompt">
           <button
             onClick={() => openEditor()}
             style={{ flex: 1, padding: '6px 4px', background: 'transparent', border: 'none', color: '#aaa', cursor: 'pointer', fontSize: 10 }}
           >+ add</button>
-          </Tooltip>
         </div>
       </div>
-
-      {/* Preview slideout — to the LEFT of the panel, top edge aligned with chip top edge */}
-      {previewItem && (
-        <div
-          style={{
-            position: 'fixed',
-            top: previewTop,
-            right: PANEL_WIDTH + 16,
-            width: PREVIEW_WIDTH,
-            maxHeight: PREVIEW_MAX_HEIGHT,
-            background: PANEL_BG,
-            border: `1px solid ${BORDER}`,
-            borderRadius: 6,
-            zIndex: 51,
-            backdropFilter: 'blur(8px)',
-            fontSize: 12,
-            color: '#ddd',
-            display: 'flex', flexDirection: 'column',
-            overflow: 'hidden',
-          }}
-        >
-          <div style={{ padding: '6px 8px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: `1px solid ${BORDER}` }}>
-            <span style={{ color: TEXT_MUTED, fontSize: 10 }}>{previewItem.text.length} chars{previewItem.images ? ` · ${previewItem.images} 📎` : ''}</span>
-            <div style={{ display: 'flex', gap: 6 }}>
-              <Tooltip content="Edit">
-              <button
-                onClick={() => openEditor(previewItem.id)}
-                style={{ background: 'transparent', border: `1px solid ${BORDER}`, color: '#aaa', cursor: 'pointer', fontSize: 10, padding: '2px 6px', borderRadius: 3 }}
-              >edit</button>
-              </Tooltip>
-              <button
-                onClick={() => setPreviewId(tabId, null)}
-                style={{ background: 'transparent', border: 'none', color: TEXT_DIM, cursor: 'pointer', fontSize: 14, padding: 0, lineHeight: 1 }}
-              >×</button>
-            </div>
-          </div>
-          <div style={{ padding: 10, overflowY: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 11, lineHeight: 1.5 }}>
-            {previewItem.text}
-          </div>
-        </div>
-      )}
 
       {/* Editor slideout — docked to the LEFT of the queue panel, no scrim.
           Anchored by editorAnchor: top aligned to chip top (edit) or panel top (new). */}
@@ -463,5 +414,110 @@ export function PromptQueueOverlay({ tabId, claudeBusy }: Props) {
         }
       `}</style>
     </>
+  );
+}
+
+// ─── FirstDelayInput ────────────────────────────────────────────────────────
+// Replaces the old "Очередь" header text. Two modes driven by store state:
+//   idle      — number input with placeholder "сек", user types desired delay.
+//   counting  — read-only countdown display ticking from N → 0 once per second.
+// When countdown reaches 0 the runner pops + fires (we just stop ticking here).
+// Disarming Run while counting freezes "what's left" back into firstDelaySeconds
+// — that bookkeeping happens in the store, this component just re-reads it.
+type FirstDelayInputProps = { tabId: string; autoRun: boolean };
+function FirstDelayInput({ tabId, autoRun }: FirstDelayInputProps) {
+  const cfg = usePromptQueueStore((s) => s.queues.get(tabId)?.firstDelaySeconds ?? 0);
+  const countdownAt = usePromptQueueStore((s) => s.queues.get(tabId)?.firstDelayCountdownAt ?? null);
+  const setFirstDelaySeconds = usePromptQueueStore((s) => s.setFirstDelaySeconds);
+  const [text, setText] = useState<string>(cfg === 0 ? '' : String(cfg));
+
+  // External writes (countdown finished, cancel-edit, etc) → mirror into local
+  // input only when we're NOT counting (counting mode renders from `remaining`).
+  useEffect(() => {
+    if (countdownAt !== null) return;
+    setText(cfg === 0 ? '' : String(cfg));
+  }, [cfg, countdownAt]);
+
+  // Tick once per second while counting. State is fully derivable from store
+  // (firstDelaySeconds + firstDelayCountdownAt), no local timer state needed.
+  const [, force] = useState(0);
+  useEffect(() => {
+    if (countdownAt === null) return;
+    const id = setInterval(() => force((n) => n + 1), 250);
+    return () => clearInterval(id);
+  }, [countdownAt]);
+
+  const remaining = countdownAt !== null
+    ? Math.max(0, cfg - Math.floor((Date.now() - countdownAt) / 1000))
+    : null;
+
+  // Counting display — read-only, monochrome to fit the dark panel.
+  if (remaining !== null) {
+    return (
+      <span
+        style={{
+          width: 56,
+          padding: '2px 6px',
+          background: 'transparent',
+          border: `1px solid ${PULSE}`,
+          borderRadius: 4,
+          color: PULSE,
+          fontSize: 11,
+          fontVariantNumeric: 'tabular-nums',
+          textAlign: 'center',
+          userSelect: 'none',
+        }}
+        title="Countdown to first prompt — toggle Run after to cancel"
+      >
+        {remaining}s
+      </span>
+    );
+  }
+
+  // Editable input — number, "сек" placeholder, theme-matched dark.
+  // Disabled while autoRun is on but countdown hasn't started yet (delay=0
+  // immediate-fire path) — kept readable, just locked out so the user doesn't
+  // race the runner with a mid-arm edit.
+  const disabled = autoRun;
+  return (
+    <input
+      type="number"
+      min={0}
+      max={3600}
+      value={text}
+      placeholder="сек"
+      disabled={disabled}
+      onChange={(e) => setText(e.target.value)}
+      onBlur={() => {
+        const n = Number(text);
+        if (!Number.isFinite(n) || n < 0) {
+          setText(cfg === 0 ? '' : String(cfg));
+          return;
+        }
+        const clamped = Math.max(0, Math.min(3600, Math.floor(n)));
+        setFirstDelaySeconds(tabId, clamped);
+        setText(clamped === 0 ? '' : String(clamped));
+      }}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter') (e.target as HTMLInputElement).blur();
+        if (e.key === 'Escape') {
+          setText(cfg === 0 ? '' : String(cfg));
+          (e.target as HTMLInputElement).blur();
+        }
+      }}
+      style={{
+        width: 56,
+        padding: '2px 6px',
+        background: '#1a1a1a',
+        border: `1px solid ${BORDER}`,
+        borderRadius: 4,
+        color: disabled ? TEXT_DIM : '#ddd',
+        fontSize: 11,
+        fontVariantNumeric: 'tabular-nums',
+        textAlign: 'center',
+        outline: 'none',
+        cursor: disabled ? 'not-allowed' : 'text',
+      }}
+    />
   );
 }

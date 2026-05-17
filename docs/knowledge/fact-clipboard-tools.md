@@ -54,11 +54,11 @@ UI настроек копирования организован в три ве
 **Дефолты Bash/Tools = OFF.** Старые пользователи имели только Reading/Editing тогглы. После иерархического апгрейда Bash и Tools — новые группы с дефолтом OFF, чтобы существующие пайплайны не получили внезапно 200 KB Bash-логов в `clipboard.writeText()`. Если юзер явно включил Bash раньше через старый Editing (хак: до фикса Bash сидел внутри `includeEditing`), его поведение мигрирует не идеально — это сознательная цена за чистую семантику.
 
 **Tool → group mapping (`getToolGroup` в `main.js`):**
-- `reading` ← Read, Grep, Glob, NotebookRead
+- `reading` ← Read, NotebookRead
 - `editing` ← Edit, Write, NotebookEdit
-- `bash` ← Bash, **Monitor** — Monitor берёт shell-команду параметром и стримит её stdout, семантически это long-running Bash, не «tool». Отделение в Tools создало бы false dichotomy (один тоггл для Bash, второй для «Bash-как-tool» — пользователь не поймёт разницу).
-- `subagent` ← Task
-- `tools` ← всё остальное: `mcp__*`, WebFetch, WebSearch, Agent, Skill, Cron*, ScheduleWakeup, RemoteTrigger, PushNotification, EnterWorktree, ExitPlanMode, ListMcpResources*. Новые tools по умолчанию попадают сюда — safe bucket.
+- `bash` ← Bash, **Monitor**, **Grep**, **Glob** — shell-flavoured commands. Monitor берёт shell-команду параметром и стримит её stdout, семантически это long-running Bash, не «tool». Отделение Grep/Glob в reading создавало рассинхрон с callsite-классификаторами в `claude-data.js` (там они всегда были bash), при котором Glob с `includeBash=ON, includeReading=OFF` проходил pre-filter callsite, но получал label-only внутри formatToolAction. См. Deep serialization секцию ниже.
+- `subagent` ← Task, Agent
+- `tools` ← всё остальное: `mcp__*`, WebFetch, WebSearch, Skill, Cron*, ScheduleWakeup, RemoteTrigger, PushNotification, EnterWorktree, ExitPlanMode, ListMcpResources*, AskUserQuestion. Новые tools по умолчанию попадают сюда — safe bucket.
 
 **Почему MCP/Web/Agent не разделены на отдельные toggle:** дробление по семантике даёт 4-5 категорий с 1-2 вызовами в каждой. UI-сложность не оправдана. Если в будущем какая-то группа явно понадобится отдельно (например, Web для копирования web-research контекста без MCP-шума) — добавится подтоггл, структура расширяется.
 
@@ -77,4 +77,47 @@ UI настроек копирования организован в три ве
 Для обеспечения консистентности данных, логика формирования текста (обработка `thinking` блоков, форматирование `diff` и `tool_use`) вынесена в общую функцию `formatToolAction` в Main-процессе. 
 - **Range Copy:** При двойном клике в Timeline система теперь не просто копирует префикс, а выполняет полноценный Backtrace для поиска `tool_result` и вставляет полное содержание файлов/диффов, если это включено в глобальных настройках.
 - **Actions Block:** Форматирование списка действий (`**Actions:**`) унифицировано для всех видов экспорта.
+
+## Markers row — inline chips под `Copy session`
+Ряд миниатюрных chip'ов рядом с кнопкой `Copy session` зеркалит флаги копирования (User, Claude, text, thinking, read, edit, bash, mcp, ⑂fork, sub-/result). Каждый chip — одиночный toggle: клик переключает соответствующий `copyInclude*` флаг в `useUIStore`. Цвет ON = `#DA7756` (Claude brand), OFF = `#555`. Sub- chip — split-pill: левая половина включает/выключает субагент целиком, правая переключает режим `result ↔ full` (история).
+
+**`ChipText` обязан жить на module-scope, не внутри render.** Раньше компонент был объявлен inline в IIFE рендера InfoPanel — React пересоздавал DOM-ноду каждой chip-кнопки на каждый рендер родителя, trusted-клик молча проглатывался (`pointerdown` приходил в старую ноду, `pointerup` — в новую, синтетический `click` event не выстреливал). Симптом: User и Claude иконки (прямой `<button>` в JSX) кликались, всё остальное — нет. Принцип — см. [`fix-inline-компонент-click.md`](fix-inline-компонент-click.md).
+
+## Subagent tools: Task + Agent (Claude Code 2.1+ alias)
+`Agent` инструмент в Claude Agent SDK ≥2.1 — переименованный `Task`. Тот же `agent_progress` stream через `parentToolUseID`, тот же input shape (`description`, `prompt`, `subagent_type`, `run_in_background`). Все классификаторы группы copy-export'а трактуют их одинаково: `getToolGroup(toolName)` отдаёт `'subagent'` для обоих, `formatToolAction` label `🧵 Субагент (...)` + Result/History ветки покрывают оба. Inline-классификаторы в `claude:copy-range` и `claude:export-clean-session` зеркалят то же mapping.
+
+**Невидимый контекст:** жёстко зашитое `block.name === 'Task'` без alias'а делало `Agent` молчаливо невидимым в копии. Симптом: с тогглами «субагент → результат/история» ON юзер копировал диапазон с `Agent`-вызовом, в копии **ничего не появлялось** про сабагента. `Agent` уходил в fallback-категорию `'tools'`, при `includeTools = OFF` (дефолт) — полностью скрывался; при ON — выводился generic-меткой `⚙️ Agent` без `progressEntries` (потому что `taskProgress` собирался только для `Task`). Фикс приводит четыре места к общему mapping `'Task' || 'Agent' → subagent`.
+
+## Deep serialization для MCP / Web / прочих default tools
+
+До этой правки в `formatToolAction` (main.js) detail-блок (fenced content под label) был только у Read/Edit/Write/Bash/Task. Всё остальное — MCP-инструменты (`mcp__sc-desktop-tg-search__telegram_semantic_search`, `mcp__electron__electron_screenshot`, ...), `WebSearch`/`WebFetch`, `Glob`/`Grep`/`Monitor`, новые tools (`Skill`, `Cron*`, `ScheduleWakeup`, `RemoteTrigger`, `EnterWorktree`, `ExitPlanMode`, `AskUserQuestion`, ...) — попадало в `default: label = '⚙️ ' + toolName` и рендерилось одной строкой. Юзер видел в копии «`⚙️ mcp__knowledge__docs_search`» вместо квадратки с параметрами и ответом, при том что соответствующий toggle (`MCP и прочее` / `bash` / `shell`) был ON.
+
+**Симптом:** «Я выбрал MCP в настройках копирования, но в результате только название инструмента, ни input, ни output не видно».
+
+**Шейп detail-блока для default-tools** (всё, что НЕ Read/Edit/Write/Bash/Monitor/Task/Agent):
+- Label: `🔌 MCP \`<server>\` / \`<method>\`` для `mcp__server__method`; `🌐 Web Search (query)` / `🌐 Web Fetch (url)`; `⚙️ <ToolName>` для остального.
+- Detail: один fenced ```json блок с объектом `{ request, response }`. `request` — input tool_use с удалённым CLI-полем `caller: {type:"direct"}` (вечный шум на каждом вызове). `response` — нормализованный `tool_result.content` (string как есть; array — склейка text-блоков; image-блоки → placeholder `[image: <mime>, ~<N>KB base64 omitted]` чтобы не выгружать 200-килобайтные PNG в clipboard).
+- Не truncate'ится — симметрия с Bash/Read, юзер сам решает что урезать.
+
+**Двойной gate.** Tool_use проходит ДВА фильтра прежде чем получить detail-блок: (1) callsite pre-filter в `claude:copy-range` / `claude:export-clean-session` (inline-классификатор тула → группа → проверка `groupFlags`), (2) `shouldInclude` внутри `formatToolAction` (на основе `getToolGroup`). До этой правки эти две классификации **расходились** на Glob/Grep: inline-классификатор клал в `bash`, `getToolGroup` — в `reading`. Симптом: при `includeBash=ON, includeReading=OFF` Glob проходил callsite и НЕ получал detail, потому что внутренний gate срезал по reading. Фикс: `getToolGroup` синхронизирован с inline (`Glob`/`Grep` → `bash`). Симметрично UI-хинту в Settings popup («`Bash · Monitor` shell»).
+
+**Image-блоки в screenshot.** `mcp__electron__electron_screenshot` возвращает массив `[{type:'text',text:'Screenshot saved.'},{type:'image',source:{data:'<base64 PNG>'}}]`. base64 в clipboard.writeText бесполезен для downstream LLM (нечитаемый шум 200KB+ на каждый скрин), но и пропускать факт скриншота нельзя — теряется контекст «что Claude увидел». Компромисс: image-блоки превращаются в `[image: image/png, ~195KB base64 omitted]` строку (с реальным размером, чтобы reader понимал масштаб), text-блоки идут как есть.
+
+**Legacy callsite** (`claude:get-history` для mobile-web и MCP `get-history`) вызывает `formatToolAction` без `opts.flags`, на старых булевых `includeEditing`/`includeReading`. В legacy-fallback ветке `shouldInclude` для групп `bash`/`tools` остаётся `undefined` → label-only, как и было. Mobile-API не получает изменений в выдаче.
+
+**Невидимый контекст:** при копировании диапазона из сессии где Claude активно работал через `mcp__electron__*` (E2E-тесты) или `mcp__sc-desktop-tg-search__*` (телеграм-ресёрч) — в clipboard был набор `⚙️ mcp__...` строк, бесполезный для downstream-нейросети, которая не могла увидеть ни параметры запроса, ни ответ. Юзер копировал «контекст работы», а получал «список имён».
+
+## Label-always семантика тогглов (depth, not visibility)
+
+До этой правки toggle group OFF делал tool_use **невидимым** в копии (pre-filter `if (!groupOn) continue;` в callsite). Симптом: юзер выключал `read_file` чтобы не дампать содержимое 200 файлов, а в копии исчезала и **сама хронология** «Claude прочитал X, Y, Z». Reader не знал что Claude вообще читал что-то — только текст ответов.
+
+**Новая семантика:** `includeReading`/`includeBash`/`includeTools`/etc. контролируют **глубину** (есть ли fenced content-блок), а не **видимость** tool_use:
+- Toggle OFF → 1-строчный label (`📄 Чтение (path)`, `🔌 MCP \`server\` / \`method\``, `🖥 Команда ("ls -la")`).
+- Toggle ON → label + fenced detail (содержимое файла / diff / stdout / JSON-блок MCP).
+
+**Видимость** по-прежнему контролируется master-тогглами: `includeClaude=OFF` скрывает весь assistant-блок целиком; `includeUser=OFF` скрывает все user-prompts.
+
+**Почему это работает:** labels — дешёвые (одна строка ~30-150 chars), все ветки `formatToolAction` уже обрезают многострочные scalar'ы (`input.command` → substring 50, `input.prompt` → substring 60). 500 Read-labels = ~30KB, что меньше одного `tool_result` от Read большого файла. Никаких многострочных взрывов нет. Симметрия с UX-паттерном Timeline: tooltip всегда показывает labels, content раскрывается отдельно.
+
+**Implementation note:** `formatToolAction` уже корректно возвращает label-only когда `shouldInclude=false` — старый pre-filter `if (!groupOn) continue;` в callsite был избыточен и блокировал label. Удалён в обоих callsite (`claude:copy-range`, `claude:export-clean-session`). Классификация `group` сохранилась — она нужна для оптимизации: поиск `toolResult` в активной истории делается ТОЛЬКО когда `groupOn=true` (когда detail-блок реально понадобится), иначе пропускается. На длинных диапазонах с 400+ tool_use экономит O(N×M) поиск.
 

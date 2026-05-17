@@ -309,12 +309,12 @@ export default function Workspace() {
     // Terminal will auto-refit via ResizeObserver
   }, []);
 
-  // CMD+E toggles the per-tab notes slide-out (the "Open" button next to
+  // CMD+J toggles the per-tab notes slide-out (the "Open" button next to
   // "ЗАМЕТКИ ВКЛАДКИ"). File-explorer sidebar is handled by Cmd+B separately.
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (workspaceView !== 'workspace') return;
-      if (e.metaKey && e.key === 'e' && activeTabId) {
+      if (e.metaKey && e.key === 'j' && activeTabId) {
         e.preventDefault();
         const cur = useUIStore.getState().notesPanelOpenTabs[activeTabId] ?? false;
         useUIStore.getState().setNotesPanelOpen(activeTabId, !cur);

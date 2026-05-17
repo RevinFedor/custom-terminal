@@ -105,6 +105,13 @@ export const Api = {
       `/api/sdk-tabs/${encodeURIComponent(tabId)}/send`,
       { method: 'POST', body: JSON.stringify({ prompt }) },
     ),
+  // Drop everything ≥ targetUuid in the JSONL. Used by Repeat/Edit on a user
+  // bubble — bridges to the same backend path desktop uses.
+  truncate: (tabId: string, targetUuid: string) =>
+    api<{ success: boolean; error?: string; removed?: number; kept?: number }>(
+      `/api/sdk-tabs/${encodeURIComponent(tabId)}/truncate`,
+      { method: 'POST', body: JSON.stringify({ targetUuid }) },
+    ),
   stop: (tabId: string) =>
     api<{ stopped: boolean }>(
       `/api/sdk-tabs/${encodeURIComponent(tabId)}/stop`,

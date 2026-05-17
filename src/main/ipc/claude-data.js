@@ -214,14 +214,22 @@ async function resolveSessionChain(sessionId, cwd, maxDepth = 10) {
         const parentId = _projectManager?.db?.getSessionParent(currentSessionId);
         console.log('[SessionChain] SQLite check for', currentSessionId.substring(0, 8) + ':', parentId ? parentId.substring(0, 8) : 'null', '_projectManager=' + !!_projectManager, 'db=' + !!_projectManager?.db);
         if (parentId) {
-          console.log('[SessionChain] SQLite link:', currentSessionId.substring(0, 8) + '...', '→ parent:', parentId.substring(0, 8) + '...');
-          sessionBoundaries.push({
-            childSessionId: currentSessionId,
-            parentSessionId: parentId,
-          });
-          currentSessionId = parentId;
-          depth++;
-          continue;
+          // Liveness guard: the row in session_links must point to a real JSONL on disk.
+          // Subagent fork-flow used to leave dead entries (child UUID = subagent directory,
+          // not a file) — see fix-dead-session-link-overwrite.md. Honouring those rows
+          // makes the merged record map empty and breaks chain backtrace silently.
+          if (!findSessionFile(parentId, cwd)) {
+            console.warn('[SessionChain] SQLite link → parent', parentId.substring(0, 8), 'has no JSONL on disk — skipping (dead link)');
+          } else {
+            console.log('[SessionChain] SQLite link:', currentSessionId.substring(0, 8) + '...', '→ parent:', parentId.substring(0, 8) + '...');
+            sessionBoundaries.push({
+              childSessionId: currentSessionId,
+              parentSessionId: parentId,
+            });
+            currentSessionId = parentId;
+            depth++;
+            continue;
+          }
         }
       } catch (e) {
         console.error('[SessionChain] SQLite check FAILED for', currentSessionId.substring(0, 8) + ':', e.message);
@@ -295,6 +303,15 @@ function resolveLatestSessionInChain(sessionId, cwd) {
       try {
         const sqliteChild = _projectManager.db.getSessionChild(currentId);
         if (sqliteChild && !visited.has(sqliteChild)) {
+          // Liveness guard: child must exist as a real JSONL file. Subagent fork-flow
+          // creates a directory named `<uuid>/subagents/` inside the project dir, which
+          // looks like a session UUID but has no JSONL. Old session_links rows that
+          // pointed at such directories caused Timeline to overwrite the store with a
+          // dead UUID and render empty (see fix-dead-session-link-overwrite.md).
+          if (!findSessionFile(sqliteChild, cwd)) {
+            console.warn('[SessionChain] SQLite forward link →', sqliteChild.substring(0, 8), 'has no JSONL on disk — skipping (dead link)');
+            break;
+          }
           console.log('[SessionChain] SQLite forward link:', currentId.substring(0, 8) + '...', '→ child:', sqliteChild.substring(0, 8) + '...');
           currentId = sqliteChild;
           continue;
@@ -430,6 +447,16 @@ function parseTimelineUuids(sourcePath) {
   }
 }
 
+// Programmatic API for handlers below. Populated by register() so that other
+// modules (HTTP routes in main.js, overseer MCP endpoints) can call the SAME
+// implementation that IPC uses, without going through ipcMain.
+// Each entry is the raw async function with payload argument (no `event`).
+const _api = {
+  forkSessionFile: null,   // ({sourceSessionId, cwd, skipChainResolve?}) → {success, newSessionId, forkEntryCount}
+  editRange: null,         // ({sessionId, cwd, startUuid, endUuid, compactText}) → {success, removedCount, ...}
+  deleteRange: null,       // ({sessionId, cwd, startUuid, endUuid}) → {success, removedCount, fileDeleted}
+};
+
 function register({ projectManager, formatToolAction }) {
   _projectManager = projectManager;
 
@@ -544,14 +571,42 @@ function register({ projectManager, formatToolAction }) {
       let maxIdx = Math.max(startIndex, endIndex);
 
       // EXPAND RANGE: Include all assistant responses and system messages
-      // that follow the last selected message, until the next user message/compact starts.
+      // that follow the last selected message, until the next real user prompt
+      // (or compact_boundary) starts. tool_result entries are stored with
+      // type: 'user' in Claude JSONL — a naïve break on type==='user' truncates
+      // the turn at the first tool reply. Same forward-expand trap as
+      // fix-timeline-docs-attribute-loop.md and fact-timeline.md::Forward-expand ловушка.
       for (let i = maxIdx + 1; i < activeHistory.length; i++) {
         const entry = activeHistory[i];
-        // Stop if we hit a new "point" (user message or compact boundary)
-        if (entry.type === 'user' || (entry.type === 'system' && entry.subtype === 'compact_boundary')) {
-          break;
+        // Compact boundary is always a real terminator.
+        if (entry.type === 'system' && entry.subtype === 'compact_boundary') break;
+        if (entry.type === 'user' && !entry.isSidechain) {
+          const nc = entry.message?.content;
+          const isToolResult = Array.isArray(nc) && nc.some(b => b && b.type === 'tool_result');
+          const ncStr = typeof nc === 'string' ? nc : '';
+          const isTaskNotif = ncStr.startsWith('<task-notification>');
+          // Synthetic command wrappers (slash-commands & their stdout, local-command-caveat
+          // banner) are not real user prompts — they live inside a turn together with
+          // assistant entries and must not terminate forward-expand. The same set is
+          // filtered out at the render step below (`includes('<command-name>')` etc).
+          const isSyntheticCmd = ncStr.startsWith('<command-name>')
+            || ncStr.startsWith('<local-command-stdout>')
+            || ncStr.startsWith('<local-command-caveat>')
+            || ncStr.startsWith('<bash-notification>')
+            || ncStr.startsWith('<system-reminder>')
+            || ncStr.startsWith('Caveat: The messages below');
+          // Image-meta wrapper: when user pastes a prompt with attachments, Claude Code
+          // writes TWO user entries — the real prompt + base64 images, followed by a
+          // synthetic entry whose text blocks are ALL `[Image: source: <path>]` references
+          // to the local image-cache. Without this guard a single-click copy on the real
+          // prompt terminates forward-expand on the image-meta wrapper, producing a copy
+          // with just the user prompt and zero assistant output.
+          const isImageMetaWrapper = Array.isArray(nc) && nc.length > 0 && nc.every(b =>
+            b && b.type === 'text' && typeof b.text === 'string' && /^\s*\[Image: source: /.test(b.text)
+          );
+          if (!isToolResult && !isTaskNotif && !isSyntheticCmd && !isImageMetaWrapper) break;
         }
-        maxIdx = i; // Include this assistant/system record
+        maxIdx = i; // Include this assistant/system record (and the skipped tool/system noise)
       }
 
       const range = activeHistory.slice(minIdx, maxIdx + 1);
@@ -581,6 +636,11 @@ function register({ projectManager, formatToolAction }) {
           let rawContent = entry.message?.content;
           if (Array.isArray(rawContent)) {
             if (rawContent.some(item => item.type === 'tool_result')) continue;
+            // Image-meta wrapper: skip entirely (sibling of the real prompt, see forward-expand).
+            const isImageMetaWrapper = rawContent.length > 0 && rawContent.every(b =>
+              b && b.type === 'text' && typeof b.text === 'string' && /^\s*\[Image: source: /.test(b.text)
+            );
+            if (isImageMetaWrapper) continue;
             const textBlock = rawContent.find(item => item.type === 'text');
             rawContent = textBlock?.text || '';
           }
@@ -615,14 +675,21 @@ function register({ projectManager, formatToolAction }) {
                 textParts.push(block.text);
               }
               if (block.type === 'tool_use') {
-                // Pre-filter by group: tool_use is suppressed entirely if its group is off
-                // (no label, no result). Subagent (Task) handled by includeSubagent* below.
+                // Label-always semantics: tool_use ALWAYS produces a one-line label
+                // (`📄 Чтение (path)`, `🔌 MCP server/method`, etc.) even when its group toggle
+                // is OFF. The toggle controls DEPTH (fenced content block), not VISIBILITY.
+                // This preserves the chronology of Claude's actions in the copy — reader
+                // sees what Claude did, just without the dumps when toggles are off.
+                // Visibility is still controlled by `includeClaude` master toggle above.
+                //
+                // Group classification stays for one optimization: skip the toolResult
+                // search when the group is off, since formatToolAction will return label-only
+                // anyway. O(n) inner loop * O(toolUse) per turn matters on long ranges.
                 const group = (() => {
                   if (block.name === 'Read' || block.name === 'NotebookRead') return 'reading';
                   if (block.name === 'Edit' || block.name === 'Write' || block.name === 'NotebookEdit') return 'editing';
-                  // Grep/Glob are shell-flavoured search — group with Bash/Monitor, not reading.
                   if (block.name === 'Bash' || block.name === 'Monitor' || block.name === 'Grep' || block.name === 'Glob') return 'bash';
-                  if (block.name === 'Task') return 'subagent';
+                  if (block.name === 'Task' || block.name === 'Agent') return 'subagent';
                   return 'tools';
                 })();
                 const groupOn = (group === 'reading' && groupFlags.reading)
@@ -630,21 +697,22 @@ function register({ projectManager, formatToolAction }) {
                   || (group === 'bash' && groupFlags.bash)
                   || (group === 'tools' && groupFlags.tools)
                   || (group === 'subagent' && (includeSubagentResult || includeSubagentHistory));
-                if (!groupOn) continue;
 
-                // Find matching tool_result in subsequent range records
                 let toolResult = null;
-                for (let j = i + 1; j < range.length; j++) {
-                  const nextEntry = range[j];
-                  if (nextEntry.type === 'user' && Array.isArray(nextEntry.message?.content)) {
-                    const res = nextEntry.message.content.find(c => c.type === 'tool_result' && c.tool_use_id === block.id);
-                    if (res) {
-                      toolResult = res;
-                      break;
+                if (groupOn) {
+                  for (let j = i + 1; j < range.length; j++) {
+                    const nextEntry = range[j];
+                    if (nextEntry.type === 'user' && Array.isArray(nextEntry.message?.content)) {
+                      const res = nextEntry.message.content.find(c => c.type === 'tool_result' && c.tool_use_id === block.id);
+                      if (res) {
+                        toolResult = res;
+                        break;
+                      }
                     }
                   }
                 }
-                const taskProgress = block.name === 'Task' && block.id ? (progressByToolUseId.get(block.id) || []) : [];
+                const isSubagentTool = block.name === 'Task' || block.name === 'Agent';
+                const taskProgress = isSubagentTool && block.id && groupOn ? (progressByToolUseId.get(block.id) || []) : [];
                 const action = formatToolAction(block.name, block.input || {}, toolResult, includeEditing, includeReading, {
                   includeSubagentResult, includeSubagentHistory, progressEntries: taskProgress, flags: groupFlags,
                 });
@@ -761,9 +829,53 @@ function register({ projectManager, formatToolAction }) {
     }
   });
 
+  // Locate a Claude JSONL by UUID and return its origin cwd. `claude --resume <uuid>`
+  // refuses to launch unless invoked from the same project slug — the CLI rebuilds the
+  // slug from process.cwd(), checks `~/.claude/projects/<slug>/<uuid>.jsonl`, and if that
+  // path is missing reports "No conversation found with session ID". Manual ✎ on a tab
+  // whose shell sits in a different project triggers this every time.
+  //
+  // We can fix it at our layer: every JSONL stores the original cwd inside the very first
+  // record (`entry.cwd`). Returning {filePath, projectDir, sessionCwd} lets the renderer
+  // `cd <sessionCwd>` in the PTY before invoking claude-c, so the slug matches.
+  ipcMain.handle('claude:resolve-session-cwd', async (event, { sessionId }) => {
+    if (!sessionId) return { success: false, error: 'No session ID' };
+    try {
+      const found = findSessionFile(sessionId, null);
+      if (!found) return { success: false, error: 'Session file not found on disk' };
+      let sessionCwd = null;
+      try {
+        // Read just the head of the file (first non-empty line with a cwd field — usually
+        // the very first record). 64KB is generous: even Claude's hefty first entries are
+        // a few KB. No JSONL parser, just look at the first parseable line.
+        const fd = fs.openSync(found.filePath, 'r');
+        const buf = Buffer.alloc(64 * 1024);
+        const bytesRead = fs.readSync(fd, buf, 0, buf.length, 0);
+        fs.closeSync(fd);
+        const head = buf.toString('utf-8', 0, bytesRead);
+        for (const line of head.split('\n')) {
+          if (!line.trim()) continue;
+          try {
+            const entry = JSON.parse(line);
+            if (entry && typeof entry.cwd === 'string' && entry.cwd.trim()) {
+              sessionCwd = entry.cwd;
+              break;
+            }
+          } catch {}
+        }
+      } catch (e) {
+        console.warn('[Claude ResolveCwd] failed to read head of', found.filePath, e.message);
+      }
+      return { success: true, filePath: found.filePath, projectDir: found.projectDir, sessionCwd };
+    } catch (error) {
+      console.error('[Claude ResolveCwd] Error:', error);
+      return { success: false, error: error.message };
+    }
+  });
+
   // Fork Claude session file: copy .jsonl with new UUID
   // Searches ALL project directories under ~/.claude/projects/ to find the session file
-  ipcMain.handle('claude:fork-session-file', async (event, { sourceSessionId, cwd, skipChainResolve }) => {
+  _api.forkSessionFile = async function ({ sourceSessionId, cwd, skipChainResolve }) {
     console.log('[Claude Fork] ========================================');
     console.log('[Claude Fork] Requested source session:', sourceSessionId, 'skipChainResolve:', !!skipChainResolve);
     console.log('[Claude Fork] Current cwd:', cwd);
@@ -859,11 +971,12 @@ function register({ projectManager, formatToolAction }) {
       console.error('[Claude Fork] Error:', error);
       return { success: false, error: error.message };
     }
-  });
+  };
+  ipcMain.handle('claude:fork-session-file', (event, payload) => _api.forkSessionFile(payload));
 
   // Edit range: remove entries from JSONL and insert compact summary
   // Flow: read file → backtrace → remove range → insert compact entry → relink → write atomically
-  ipcMain.handle('claude:edit-range', async (event, { sessionId, cwd, startUuid, endUuid, compactText }) => {
+  _api.editRange = async function ({ sessionId, cwd, startUuid, endUuid, compactText }) {
     console.log('[EditRange] ========================================');
     console.log('[EditRange] Session:', sessionId, 'Range:', startUuid?.slice(0, 8), '→', endUuid?.slice(0, 8));
 
@@ -1187,13 +1300,14 @@ function register({ projectManager, formatToolAction }) {
       console.error('[EditRange] Error:', error);
       return { success: false, error: error.message };
     }
-  });
+  };
+  ipcMain.handle('claude:edit-range', (event, payload) => _api.editRange(payload));
 
   // Delete range: remove entries from JSONL WITHOUT inserting a compact replacement.
   // Used by Timeline "Удалить историю" button. If the resulting file is empty (or only
   // non-uuid entries remain), the file is deleted entirely and session_links is cleaned
   // so resolveSessionChain doesn't re-attach a parent session.
-  ipcMain.handle('claude:delete-range', async (event, { sessionId, cwd, startUuid, endUuid }) => {
+  _api.deleteRange = async function ({ sessionId, cwd, startUuid, endUuid }) {
     console.log('[DeleteRange] ========================================');
     console.log('[DeleteRange] Session:', sessionId, 'Range:', startUuid?.slice(0, 8), '→', endUuid?.slice(0, 8));
 
@@ -1483,6 +1597,110 @@ function register({ projectManager, formatToolAction }) {
 
     } catch (error) {
       console.error('[DeleteRange] Error:', error);
+      return { success: false, error: error.message };
+    }
+  };
+  ipcMain.handle('claude:delete-range', (event, payload) => _api.deleteRange(payload));
+
+  // Delete a single user-prompt entry from JSONL.
+  // Keeps the assistant response, relinks any direct children's parentUuid to the
+  // deleted entry's parent so the chain stays intact for Claude --resume.
+  // Rejects: root entry (no parentUuid), tool_result, synthetic-command wrappers,
+  // compact summary. Does NOT stop Claude — caller is expected to invoke this when
+  // the target turn is complete (same trust as delete-range).
+  ipcMain.handle('claude:delete-user-entry', async (event, { sessionId, cwd, uuid }) => {
+    console.log('[DeleteUserEntry] ============================================');
+    console.log('[DeleteUserEntry] Session:', sessionId, 'Entry:', uuid?.slice(0, 8));
+
+    try {
+      const found = findSessionFile(sessionId, cwd);
+      if (!found) return { success: false, error: 'Session file not found' };
+
+      const filePath = found.filePath;
+      const content = await fs.promises.readFile(filePath, 'utf-8');
+      const lines = content.split('\n').filter(l => l.trim());
+
+      const allRecords = [];
+      const recordMap = new Map();
+      for (const line of lines) {
+        try {
+          const entry = JSON.parse(line);
+          allRecords.push(entry);
+          if (entry.uuid) recordMap.set(entry.uuid, entry);
+        } catch { allRecords.push(null); }
+      }
+
+      const target = recordMap.get(uuid);
+      if (!target) return { success: false, error: 'Entry not found in file' };
+
+      // Must be a real human-typed user prompt
+      if (target.type !== 'user') return { success: false, error: 'Not a user entry' };
+      const tc = target.message?.content;
+      const isToolResult = Array.isArray(tc) && tc.some(b => b && b.type === 'tool_result');
+      const tcStr = typeof tc === 'string' ? tc : '';
+      const isWrapper = tcStr.startsWith('<command-name>')
+        || tcStr.startsWith('<local-command-stdout>')
+        || tcStr.startsWith('<local-command-caveat>')
+        || tcStr.startsWith('<bash-notification>')
+        || tcStr.startsWith('<system-reminder>')
+        || tcStr.startsWith('<task-notification>')
+        || tcStr.startsWith('Caveat: The messages below');
+      if (isToolResult || isWrapper) {
+        return { success: false, error: 'Entry is a tool result or system wrapper, not a user prompt' };
+      }
+      if (target.isCompactSummary) {
+        return { success: false, error: 'Cannot delete compact summary' };
+      }
+
+      // Root entry cannot be deleted — its children would lose their anchor and
+      // Claude --resume would refuse the file.
+      if (!target.parentUuid) {
+        return { success: false, error: 'Cannot delete the first message of a session' };
+      }
+      const newParent = target.parentUuid;
+
+      // Relink any record that pointed at the target as its parent.
+      // Both parentUuid and logicalParentUuid (used by compact_boundary entries).
+      let relinked = 0;
+      for (const rec of allRecords) {
+        if (!rec) continue;
+        if (rec.parentUuid === uuid) {
+          rec.parentUuid = newParent;
+          relinked++;
+        }
+        if (rec.logicalParentUuid === uuid) {
+          rec.logicalParentUuid = newParent;
+        }
+      }
+
+      // Write the file back without the target line.
+      const outputLines = [];
+      for (const rec of allRecords) {
+        if (!rec) continue;
+        if (rec.uuid === uuid) continue;
+        outputLines.push(JSON.stringify(rec));
+      }
+
+      const tmpPath = filePath + '.delete-entry-tmp';
+      await fs.promises.writeFile(tmpPath, outputLines.join('\n') + '\n', 'utf-8');
+      await fs.promises.rename(tmpPath, filePath);
+
+      _jsonlCache.delete(filePath);
+
+      // Drop any timeline note attached to this UUID — there's nothing to anchor it to.
+      if (projectManager?.db) {
+        try {
+          projectManager.db.db.prepare('DELETE FROM timeline_notes WHERE entry_uuid = ?').run(uuid);
+        } catch (e) {
+          console.warn('[DeleteUserEntry] timeline_notes cleanup failed:', e.message);
+        }
+      }
+
+      console.log('[DeleteUserEntry] Done. Removed 1 user entry, relinked ' + relinked + ' child reference(s) → parent ' + newParent.slice(0, 8));
+      return { success: true, relinkedChildren: relinked, newParent };
+
+    } catch (error) {
+      console.error('[DeleteUserEntry] Error:', error);
       return { success: false, error: error.message };
     }
   });
@@ -2163,7 +2381,8 @@ function register({ projectManager, formatToolAction }) {
 
       // Delegate to shared formatToolAction with current session's settings
       const formatTool = (toolName, input, toolResult = null, toolUseId = null) => {
-        const taskProgress = toolName === 'Task' && toolUseId ? (progressByToolUseId.get(toolUseId) || []) : [];
+        const isSubagentTool = toolName === 'Task' || toolName === 'Agent';
+        const taskProgress = isSubagentTool && toolUseId ? (progressByToolUseId.get(toolUseId) || []) : [];
         return formatToolAction(toolName, input, toolResult, includeEditing, includeReading, {
           includeSubagentResult, includeSubagentHistory, progressEntries: taskProgress, flags: groupFlags,
         });
@@ -2230,13 +2449,13 @@ function register({ projectManager, formatToolAction }) {
                 textParts.push(block.text);
               }
               if (block.type === 'tool_use') {
-                // Pre-filter by group (mirrors copy-range)
+                // Label-always — see same note in claude:copy-range.
+                // Group classification gates only the toolResult search (perf optimization).
                 const group = (() => {
                   if (block.name === 'Read' || block.name === 'NotebookRead') return 'reading';
                   if (block.name === 'Edit' || block.name === 'Write' || block.name === 'NotebookEdit') return 'editing';
-                  // Grep/Glob → shell search, grouped with Bash.
                   if (block.name === 'Bash' || block.name === 'Monitor' || block.name === 'Grep' || block.name === 'Glob') return 'bash';
-                  if (block.name === 'Task') return 'subagent';
+                  if (block.name === 'Task' || block.name === 'Agent') return 'subagent';
                   return 'tools';
                 })();
                 const groupOn = (group === 'reading' && groupFlags.reading)
@@ -2244,17 +2463,17 @@ function register({ projectManager, formatToolAction }) {
                   || (group === 'bash' && groupFlags.bash)
                   || (group === 'tools' && groupFlags.tools)
                   || (group === 'subagent' && (includeSubagentResult || includeSubagentHistory));
-                if (!groupOn) continue;
 
-                // Find matching tool_result in subsequent records
                 let toolResult = null;
-                for (let j = i + 1; j < activeBranch.length; j++) {
-                  const nextEntry = activeBranch[j];
-                  if (nextEntry.type === 'user' && Array.isArray(nextEntry.message?.content)) {
-                    const res = nextEntry.message.content.find(c => c.type === 'tool_result' && c.tool_use_id === block.id);
-                    if (res) {
-                      toolResult = res;
-                      break;
+                if (groupOn) {
+                  for (let j = i + 1; j < activeBranch.length; j++) {
+                    const nextEntry = activeBranch[j];
+                    if (nextEntry.type === 'user' && Array.isArray(nextEntry.message?.content)) {
+                      const res = nextEntry.message.content.find(c => c.type === 'tool_result' && c.tool_use_id === block.id);
+                      if (res) {
+                        toolResult = res;
+                        break;
+                      }
                     }
                   }
                 }
@@ -2834,4 +3053,4 @@ function parseTimelineEntries(sourcePath) {
   }
 }
 
-module.exports = { register, findSessionFile, loadJsonlRecords, resolveSessionChain, resolveLatestSessionInChain, parseTimelineUuids, parseTimelineEntries };
+module.exports = { register, findSessionFile, loadJsonlRecords, resolveSessionChain, resolveLatestSessionInChain, parseTimelineUuids, parseTimelineEntries, _api };

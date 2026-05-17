@@ -74,41 +74,114 @@ export function usePromptQueueRunner() {
     return () => { ipcRenderer.removeListener('claude:busy-state', handleBusyState); };
   }, []);
 
-  // Cold-start watcher: when items appear in a queue while Claude is idle, fire immediately.
-  // Without this, user has to wait for Claude to first become busy and then idle before the
-  // first queued prompt sends — which never happens if Claude is fresh and idle.
-  // Subscribe to queue changes via store subscription (not React useEffect on items —
-  // because items live in a Map keyed by tabId, we'd need to subscribe to all tabs).
+  // Cold-start watcher: when ALL three conditions are true and Claude is idle,
+  // either fire immediately OR start the firstDelay countdown.
+  //   queue.items.length > 0  AND  queue.autoRun === true  AND  claude is idle
+  // Triggered on EITHER of two edges (whichever happens last makes the trio true):
+  //   (a) items 0 → N  (user added a prompt; autoRun was already on)
+  //   (b) autoRun false → true (user armed; items were already queued)
+  // Edge (b) covers the case: "Claude finished without me, I forgot to arm —
+  // I come back, hit Run after — first prompt must fire immediately, not wait
+  // for a never-coming turn-end". Without this, the prompt sits forever.
+  //
+  // FirstDelay flow:
+  //   q.firstDelaySeconds > 0 AND no active countdown → startFirstDelayCountdown.
+  //     A per-tab setTimeout will later call popNext + clearFirstDelayCountdown.
+  //   q.firstDelaySeconds === 0 → immediate popNext + send-command (legacy path).
+  //   Subsequent items (turn-end IPC handler above) NEVER use this — only the
+  //   very first cold-start fire after arm is delayed. After the first item is
+  //   sent, the rest fire via Stop hook with zero delay, exactly as before.
+  //
+  // Subscribe to queue changes via store subscription (not React useEffect on
+  // items — they live in a Map keyed by tabId, we'd need to subscribe per-tab).
   useEffect(() => {
-    let firing = false;
-    const unsubscribe = usePromptQueueStore.subscribe((state, prevState) => {
-      if (firing) return; // re-entrancy guard while we're processing a fire
-      // Look for tabs whose queue went from empty → non-empty AND autoRun is on AND claude is idle.
-      for (const [tabId, q] of state.queues) {
-        if (!q.autoRun || q.items.length === 0) continue;
-        const prevQ = prevState.queues.get(tabId);
-        const prevCount = prevQ?.items.length ?? 0;
-        if (prevCount > 0) continue; // wasn't empty — auto-runner above handles steady state
-        // Was empty, now has items. Check if claude is currently idle (i.e. not in mid-turn).
-        // prevBusyRef tracks the latest busy state per tab from the IPC listener.
-        const isBusy = prevBusyRef.current.get(tabId) ?? false;
-        if (isBusy) continue; // mid-turn — autoRun will fire on the next turn-end naturally
+    // Per-tab pending fire timer for active first-delay countdowns. Cleared on
+    // user disarm (autoRun false) or when timer elapses and we fire.
+    const pendingTimers = new Map<string, ReturnType<typeof setTimeout>>();
+    const clearTimer = (tabId: string) => {
+      const t = pendingTimers.get(tabId);
+      if (t) { clearTimeout(t); pendingTimers.delete(tabId); }
+    };
 
-        firing = true;
-        try {
-          const beforePop = q.items.length;
-          const head = usePromptQueueStore.getState().popNext(tabId);
-          if (head) {
-            ipcRenderer.invoke('claude:send-command', tabId, head.text).catch((e: unknown) => {
-              console.error('[PromptQueueRunner] cold-start send failed for tab', tabId, e);
-            });
-            if (beforePop === 1) usePromptQueueStore.getState().setAutoRun(tabId, false);
-          }
-        } finally {
-          firing = false;
+    // Shared cold-start firing logic — pops head + sends + auto-disarms.
+    // Used both by zero-delay path and by the delayed-timer callback.
+    let firing = false;
+    const fireHead = (tabId: string) => {
+      if (firing) return;
+      firing = true;
+      try {
+        const q = usePromptQueueStore.getState().getQueue(tabId);
+        if (!q.autoRun || q.items.length === 0) return;
+        const beforePop = q.items.length;
+        const head = usePromptQueueStore.getState().popNext(tabId);
+        if (head) {
+          ipcRenderer.invoke('claude:send-command', tabId, head.text).catch((e: unknown) => {
+            console.error('[PromptQueueRunner] cold-start send failed for tab', tabId, e);
+          });
+          if (beforePop === 1) usePromptQueueStore.getState().setAutoRun(tabId, false);
+        }
+      } finally {
+        firing = false;
+      }
+    };
+
+    const unsubscribe = usePromptQueueStore.subscribe((state, prevState) => {
+      for (const [tabId, q] of state.queues) {
+        const prevQ = prevState.queues.get(tabId);
+
+        // Disarm-while-counting: if autoRun went false OR claude turned busy
+        // while a countdown was running, cancel the pending timer. (The store
+        // helpers handle the remaining-seconds bookkeeping separately — UI's
+        // Run-toggle calls cancelFirstDelayCountdown before flipping autoRun off.)
+        if (prevQ && prevQ.firstDelayCountdownAt !== null && q.firstDelayCountdownAt === null) {
+          clearTimer(tabId);
+        }
+        if (prevQ && prevQ.autoRun && !q.autoRun) {
+          clearTimer(tabId);
+        }
+
+        if (!q.autoRun || q.items.length === 0) continue;
+
+        // Edges to consider for cold-start (immediate fire OR countdown start).
+        const prevCount = prevQ?.items.length ?? 0;
+        const prevAutoRun = prevQ?.autoRun ?? false;
+        const itemsArrived = prevCount === 0 && q.items.length > 0;
+        const autoRunArmed = !prevAutoRun && q.autoRun;
+        if (!itemsArrived && !autoRunArmed) continue;
+
+        // claude busy → turn-end IPC handler will pick it up later, skip.
+        const isBusy = prevBusyRef.current.get(tabId) ?? false;
+        if (isBusy) continue;
+
+        // Already counting down (e.g. items added during an active countdown)
+        // → don't restart. The existing timer will fire when due.
+        if (q.firstDelayCountdownAt !== null) continue;
+
+        if (q.firstDelaySeconds > 0) {
+          // Start countdown. Store records the timestamp; we schedule the real fire.
+          const delayMs = q.firstDelaySeconds * 1000;
+          usePromptQueueStore.getState().startFirstDelayCountdown(tabId);
+          clearTimer(tabId);
+          pendingTimers.set(tabId, setTimeout(() => {
+            pendingTimers.delete(tabId);
+            const q2 = usePromptQueueStore.getState().getQueue(tabId);
+            // Re-check: user may have disarmed while we waited.
+            if (!q2.autoRun || q2.items.length === 0 || q2.firstDelayCountdownAt === null) {
+              usePromptQueueStore.getState().clearFirstDelayCountdown(tabId);
+              return;
+            }
+            usePromptQueueStore.getState().clearFirstDelayCountdown(tabId);
+            fireHead(tabId);
+          }, delayMs));
+        } else {
+          fireHead(tabId);
         }
       }
     });
-    return unsubscribe;
+    return () => {
+      unsubscribe();
+      for (const t of pendingTimers.values()) clearTimeout(t);
+      pendingTimers.clear();
+    };
   }, []);
 }

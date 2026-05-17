@@ -3,8 +3,8 @@ import { useWorkspaceStore, TabColor, isTabInterrupted } from '../../store/useWo
 import { useProjectsStore } from '../../store/useProjectsStore';
 import Tooltip from '../UI/Tooltip';
 import { useUIStore } from '../../store/useUIStore';
-import { useCmdKey, useCmdHoverPopover, CmdHoverPopover } from '../../hooks/useCmdHoverPopover';
-import { MarkdownEditor } from '@gt-editor/markdown-editor';
+import { useCmdKey, useCmdHoverPopover } from '../../hooks/useCmdHoverPopover';
+import TabPreviewPopover from './TabPreviewPopover';
 import '@gt-editor/markdown-editor/styles.css';
 // Removed: framer-motion import - was causing lag on project switch
 import { draggable, dropTargetForElements, monitorForElements } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
@@ -12,7 +12,7 @@ import { attachClosestEdge, extractClosestEdge, type Edge } from '@atlaskit/prag
 import { combine } from '@atlaskit/pragmatic-drag-and-drop/combine';
 import { autoScrollForElements } from '@atlaskit/pragmatic-drag-and-drop-auto-scroll/element';
 import { setCustomNativeDragPreview } from '@atlaskit/pragmatic-drag-and-drop/element/set-custom-native-drag-preview';
-import { ChevronDown, Globe, Bot, Play, Minimize2, Maximize2, PanelLeft } from 'lucide-react';
+import { ChevronDown, Globe, Bot, Play, Minimize2, Maximize2, PanelLeft, Plus } from 'lucide-react';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -857,9 +857,8 @@ function TabBar({ projectId }: TabBarProps) {
   const createSDKTab = useWorkspaceStore((state) => state.createSDKTab);
   const tabsFontSize = useUIStore((state) => state.tabsFontSize);
   const showToast = useUIStore((state) => state.showToast);
-  const tabNotesFontSize = useUIStore((state) => state.tabNotesFontSize);
-  const tabNotesPaddingX = useUIStore((state) => state.tabNotesPaddingX);
-  const tabNotesPaddingY = useUIStore((state) => state.tabNotesPaddingY);
+  const reopenPulseActive = useUIStore((state) => state.reopenPulseActive);
+  // tabNotes* font / padding теперь читаются внутри TabPreviewPopover.
 
   const [editingTabId, setEditingTabId] = useState<string | null>(null);
   const [editValue, setEditValue] = useState('');
@@ -1597,10 +1596,21 @@ function TabBar({ projectId }: TabBarProps) {
     <>
       {/* Single row TabBar */}
       <div
-        className="h-[30px] bg-panel flex items-stretch"
+        className="h-[30px] bg-panel flex items-stretch relative"
         onMouseEnter={() => setIsMouseInTabBar(true)}
         onMouseLeave={() => setIsMouseInTabBar(false)}
       >
+        {/* Shift+Cmd+T pulse — fires synchronously on keydown before the
+            createTab + claude-c handshake resolves, so the user gets a
+            same-frame visual ack. pointer-events-none so it never blocks tab
+            clicks. animate-reopen-pulse is 2 cycles × 300ms = 600ms, matching
+            the auto-clear in useUIStore::triggerReopenPulse. */}
+        {reopenPulseActive && (
+          <div
+            className="absolute inset-0 pointer-events-none animate-reopen-pulse"
+            aria-hidden
+          />
+        )}
         {/* Sidebar toggle */}
         <Tooltip content="Toggle sidebar">
         <button
@@ -1998,59 +2008,107 @@ function TabBar({ projectId }: TabBarProps) {
             if (geminiCount > 0) tooltipParts.push(`${geminiCount} Gemini`);
             const tooltipText = `SIGTERM to ${tooltipParts.join(' + ')} (SIGKILL after 800ms if any hangs)`;
 
+            // Stop pill — extracted so we can place it in two-row grid (single) OR
+            // legacy one-row layout (multi-select). Reserves the right slot even when
+            // nothing's running, so the 2×2 grid stays symmetric. In idle state shows
+            // a muted disabled pill — `add new` row stops looking like a single full-width
+            // button (was visually inconsistent with the Rename/Close row below).
+            const stopPill = showStopAI ? (
+              <Tooltip content={tooltipText}>
+              <button
+                className="flex-1 basis-0 min-w-0 px-2 py-1.5 text-[12px] cursor-pointer flex items-center justify-center gap-1.5 border-l border-[#444] whitespace-nowrap"
+                style={{ color: baseTint, backgroundColor: baseTint + '14' }}
+                onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = baseTint + '33'; }}
+                onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = baseTint + '14'; }}
+                onClick={handleStopAI}
+              >
+                <span style={{ width: 8, height: 8, borderRadius: 2, backgroundColor: baseTint, display: 'inline-block' }} />
+                {stopLabel}
+                {minorCount > 0 && (
+                  <span style={{ color: minorityTint, fontWeight: 600 }}>+{minorCount}</span>
+                )}
+              </button>
+              </Tooltip>
+            ) : showStopScript ? (
+              <Tooltip content={`Send Ctrl+C to ${scriptCount} running script(s) — tab stays open`}>
+              <button
+                className="flex-1 basis-0 min-w-0 px-2 py-1.5 text-[12px] cursor-pointer flex items-center justify-center gap-1.5 border-l border-[#444] whitespace-nowrap"
+                style={{ color: SCRIPT_TINT, backgroundColor: SCRIPT_TINT + '14' }}
+                onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = SCRIPT_TINT + '33'; }}
+                onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = SCRIPT_TINT + '14'; }}
+                onClick={handleStopScript}
+              >
+                <span style={{ width: 8, height: 8, borderRadius: '50%', backgroundColor: SCRIPT_TINT, display: 'inline-block', boxShadow: `0 0 6px ${SCRIPT_TINT}80` }} />
+                {scriptLabel}
+              </button>
+              </Tooltip>
+            ) : (
+              <Tooltip content="No active process to stop">
+              <button
+                disabled
+                className="flex-1 basis-0 min-w-0 px-2 py-1.5 text-[12px] flex items-center justify-center gap-1.5 border-l border-[#444] cursor-not-allowed whitespace-nowrap"
+                style={{ color: '#555', backgroundColor: 'transparent' }}
+              >
+                <span style={{ width: 8, height: 8, borderRadius: '50%', backgroundColor: '#444', display: 'inline-block' }} />
+                Stop
+              </button>
+              </Tooltip>
+            );
+
+            // Multi-select keeps the legacy single-row "[Close N] [Stop N]" layout —
+            // Rename / + add new make no sense for a multi-select target set.
+            if (isMultiSelect) {
+              return (
+                <div className="flex items-stretch w-full">
+                  <button
+                    className="flex-1 text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2"
+                    onClick={handleClose}
+                  >
+                    {`Close ${selectedTabIds.length} Tabs`}
+                  </button>
+                  {stopPill}
+                </div>
+              );
+            }
+
+            // Single-tab mode: 2×2 grid.
+            //   Row 1: [+ add new] [Stop ...]
+            //   Row 2: [Rename]    [Close Tab]
+            // + add new mirrors Cmd+T (handleNewTab → createTabAfterCurrent).
+            // Close Tab uses destructive #f87171 TEXT only (no bg tint) — bg-tint
+            // would conflict semantically with #dc2626 Stop Script pill.
             return (
-              <div className="flex items-stretch w-full">
-                <button
-                  className="flex-1 text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2"
-                  onClick={handleClose}
-                >
-                  {isMultiSelect ? `Close ${selectedTabIds.length} Tabs` : 'Close Tab'}
-                </button>
-                {showStopAI && (
-                  <Tooltip content={tooltipText}>
+              <>
+                <div className="flex items-stretch w-full">
                   <button
-                    className="px-3 py-1.5 text-[12px] cursor-pointer flex items-center gap-1.5 border-l border-[#444]"
-                    style={{ color: baseTint, backgroundColor: baseTint + '14' }}
-                    onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = baseTint + '33'; }}
-                    onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = baseTint + '14'; }}
-                    onClick={handleStopAI}
+                    className="flex-1 basis-0 min-w-0 text-left px-3 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2 whitespace-nowrap"
+                    onClick={(e) => { e.stopPropagation(); handleNewTab(); setContextMenu(null); }}
                   >
-                    <span style={{ width: 8, height: 8, borderRadius: 2, backgroundColor: baseTint, display: 'inline-block' }} />
-                    {stopLabel}
-                    {minorCount > 0 && (
-                      <span style={{ color: minorityTint, fontWeight: 600 }}>+{minorCount}</span>
-                    )}
+                    <Plus size={12} className="text-[#888] flex-shrink-0" />
+                    add new
                   </button>
-                  </Tooltip>
-                )}
-                {showStopScript && (
-                  <Tooltip content={`Send Ctrl+C to ${scriptCount} running script(s) — tab stays open`}>
+                  {stopPill}
+                </div>
+                <div className="flex items-stretch w-full border-t border-[#3a3a3a]">
                   <button
-                    className="px-3 py-1.5 text-[12px] cursor-pointer flex items-center gap-1.5 border-l border-[#444]"
-                    style={{ color: SCRIPT_TINT, backgroundColor: SCRIPT_TINT + '14' }}
-                    onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = SCRIPT_TINT + '33'; }}
-                    onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = SCRIPT_TINT + '14'; }}
-                    onClick={handleStopScript}
+                    className="flex-1 basis-0 min-w-0 text-left px-3 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2 whitespace-nowrap"
+                    onClick={handleContextRename}
                   >
-                    <span style={{ width: 8, height: 8, borderRadius: '50%', backgroundColor: SCRIPT_TINT, display: 'inline-block', boxShadow: `0 0 6px ${SCRIPT_TINT}80` }} />
-                    {scriptLabel}
+                    Rename
                   </button>
-                  </Tooltip>
-                )}
-              </div>
+                  <button
+                    className="flex-1 basis-0 min-w-0 px-2 py-1.5 text-[12px] text-[#f87171] hover:bg-white/10 cursor-pointer flex items-center justify-center border-l border-[#444] whitespace-nowrap"
+                    onClick={handleClose}
+                  >
+                    Close Tab
+                  </button>
+                </div>
+              </>
             );
           })()}
 
           {!isMultiSelect && (
             <>
-              {/* Rename */}
-              <button
-                className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2"
-                onClick={handleContextRename}
-              >
-                Rename
-              </button>
-
               {/* Color - submenu */}
               <div className="relative group/color">
                 <button
@@ -2296,49 +2354,22 @@ function TabBar({ projectId }: TabBarProps) {
         </div>
       )}
 
-      {/* CMD+Hover Notes Preview — unified hook + CmdHoverPopover */}
+      {/* CMD+Hover Notes Preview — unified TabPreviewPopover (name → metadata →
+          notes). Same widget used in ProjectHome cards: единый визуальный язык
+          для preview-вкладки в любом месте приложения. Resize handles живут
+          внутри компоненты. */}
       {notesPopover.isVisible && notesPopover.hoveredItem && (() => {
         const tab = workspace.tabs.get(notesPopover.hoveredItem.id);
         const notes = tab?.notes;
         const isTabCollapsed = tab?.isCollapsed;
         if (!notes && !isTabCollapsed) return null;
         return (
-          <CmdHoverPopover
+          <TabPreviewPopover
             rect={notesPopover.hoveredItem.rect}
             popoverProps={notesPopover.popoverProps}
-            width={380}
-            maxHeight={300}
-          >
-            {isTabCollapsed && (
-              <div style={{
-                padding: '6px 10px',
-                fontSize: '12px',
-                fontWeight: 600,
-                color: '#fff',
-                borderBottom: notes ? '1px solid #333' : 'none',
-                whiteSpace: 'nowrap',
-                overflow: 'hidden',
-                textOverflow: 'ellipsis',
-              }}>
-                {tab?.name}
-              </div>
-            )}
-            {notes && (
-              <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
-                <MarkdownEditor
-                  content={notes}
-                  onChange={() => {}}
-                  readOnly
-                  compact
-                  showLineNumbers={false}
-                  fontSize={tabNotesFontSize}
-                  contentPaddingX={tabNotesPaddingX}
-                  contentPaddingY={tabNotesPaddingY}
-                  wordWrap
-                />
-              </div>
-            )}
-          </CmdHoverPopover>
+            notes={notes || null}
+            isLocked={notesPopover.isLocked}
+          />
         );
       })()}
     </>

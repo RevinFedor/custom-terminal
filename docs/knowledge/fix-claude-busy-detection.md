@@ -73,3 +73,4 @@ Claude Code устанавливает заголовок терминала (ч
 **Связанные факты:**
 - [`fact-claude-tui-mechanics.md`](fact-claude-tui-mechanics.md) — детали работы Ink Engine.
 - [`fact-tabs.md`](fact-tabs.md) — визуализация (RestartZone Pulse).
+- [`fix-claude-aborted-streaming-loader.md`](fix-claude-aborted-streaming-loader.md) — case когда busy=true не сбрасывается через Stop hook (user-initiated interrupt идёт мимо stopHooks через `aborted_streaming`), и mitigation через JSONL transcript watcher.

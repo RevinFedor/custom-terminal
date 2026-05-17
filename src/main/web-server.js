@@ -59,11 +59,19 @@ try {
   WebSocketServer = null;
 }
 
-// Port can be overridden via env (NOTED_WEB_PORT) so a `npm run dev` instance
-// can run alongside the installed production app on a different port. Default
-// 7878 keeps the installed app's URL stable. Typical dev override: 7979.
-const PORT = parseInt(process.env.NOTED_WEB_PORT || '', 10) || 7878;
+// Preferred port. Can be overridden via env (NOTED_WEB_PORT). Default 7878
+// keeps the installed app's URL stable for muscle memory. If 7878 is taken
+// (typically by a sibling dev or prod instance), we walk forward to find the
+// first free port in the range and publish the resolved port via the
+// discovery file below — StatusBar reads it back so the QR/copy URL is always
+// correct. Before this fallback, second instance silently EADDRINUSE-failed
+// and mobile-web was reachable on neither end.
+const PORT_PREFERRED = parseInt(process.env.NOTED_WEB_PORT || '', 10) || 7878;
+const PORT_MAX = PORT_PREFERRED + 20; // 7878..7898 — plenty for parallel runs
+let resolvedPort = PORT_PREFERRED;
 const TOKEN_PATH = path.join(require('os').homedir(), '.noted-terminal', 'web-token.txt');
+const DISCOVERY_DIR = path.join(require('os').homedir(), '.noted-terminal');
+const DISCOVERY_FILE = path.join(DISCOVERY_DIR, 'web-server-' + process.pid + '.json');
 
 let httpServer = null;
 let wss = null;
@@ -332,6 +340,25 @@ async function handleApi(req, res, parsed, sdkSessions) {
       const data = await bridgeRequest('sendSDKMessage', {
         tabId, prompt, model, effort, thinking, cwd,
       });
+      return sendJson(res, 200, data);
+    } catch (e) {
+      return sendJson(res, 500, { error: String(e.message) });
+    }
+  }
+
+  // Truncate history (drop everything ≥ targetUuid). Used by mobile Edit/Repeat
+  // — bridges to the renderer which then invokes the same `claude-sdk:truncate-history`
+  // ipcMain handler the desktop UI uses. After 200 OK the caller sends the new
+  // prompt via /send (with original or edited text) and Claude resumes off the
+  // truncated tip.
+  m = parsed.pathname.match(/^\/api\/sdk-tabs\/([^/]+)\/truncate$/);
+  if (m && req.method === 'POST') {
+    const tabId = m[1];
+    try {
+      const body = await readBody(req);
+      const targetUuid = (body.targetUuid || '').trim();
+      if (!targetUuid) return sendJson(res, 400, { error: 'targetUuid required' });
+      const data = await bridgeRequest('truncateHistory', { tabId, targetUuid });
       return sendJson(res, 200, data);
     } catch (e) {
       return sendJson(res, 500, { error: String(e.message) });
@@ -747,21 +774,48 @@ function start({ sdkSessions }) {
 
   attachWebSocket(httpServer, sdkSessions);
 
-  httpServer.listen(PORT, '0.0.0.0', () => {
-    const ip = getLanIp();
-    console.log('[WebServer] listening on http://' + ip + ':' + PORT);
-    console.log('[WebServer] token (' + TOKEN_PATH + '): ' + token);
-    console.log('[WebServer] mobile URL example: http://' + ip + ':' + PORT + '/?token=' + token);
-  });
+  // Port-walk fallback. listen() emits 'error' with EADDRINUSE if port is taken.
+  // Catch it, increment, retry — up to PORT_MAX. The successful port is stored
+  // in `resolvedPort` and published via discovery file so renderer (StatusBar
+  // mobile-web chip) reads the real port instead of the hardcoded 7878.
+  const tryListen = (p) => {
+    httpServer.once('error', (err) => {
+      if (err && err.code === 'EADDRINUSE' && p < PORT_MAX) {
+        console.warn('[WebServer] port ' + p + ' in use, trying ' + (p + 1));
+        // listen() emits one error per attempt; recreate listener for retry
+        setImmediate(() => tryListen(p + 1));
+        return;
+      }
+      console.error('[WebServer] server error:', err.message);
+    });
+    httpServer.listen(p, '0.0.0.0', () => {
+      resolvedPort = p;
+      writeWebServerDiscovery();
+      const ip = getLanIp();
+      console.log('[WebServer] listening on http://' + ip + ':' + p + ' (pid=' + process.pid + ')');
+      console.log('[WebServer] token (' + TOKEN_PATH + '): ' + token);
+      console.log('[WebServer] mobile URL example: http://' + ip + ':' + p + '/?token=' + token);
+    });
+  };
+  tryListen(PORT_PREFERRED);
+}
 
-  httpServer.on('error', (err) => {
-    console.error('[WebServer] server error:', err.message);
-  });
+function writeWebServerDiscovery() {
+  try {
+    fs.mkdirSync(DISCOVERY_DIR, { recursive: true });
+    fs.writeFileSync(DISCOVERY_FILE, JSON.stringify({
+      port: resolvedPort,
+      pid: process.pid,
+      lanIp: getLanIp(),
+      updatedAt: Date.now(),
+    }));
+  } catch (e) { console.warn('[WebServer:Discovery] write failed:', e.message); }
 }
 
 function stop() {
   if (wss) try { wss.close(); } catch {}
   if (httpServer) try { httpServer.close(); } catch {}
+  try { fs.unlinkSync(DISCOVERY_FILE); } catch {}
   httpServer = null;
   wss = null;
   subscribers.clear();
@@ -770,7 +824,7 @@ function stop() {
 function getInfo() {
   return {
     running: !!httpServer,
-    port: PORT,
+    port: resolvedPort,
     token,
     lanIp: getLanIp(),
   };

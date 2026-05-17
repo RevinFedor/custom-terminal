@@ -27,6 +27,8 @@
 ## Behavior Specs
 - **Static dimensions (900×85vh):** Размер модалки фиксирован для всех табов. Раньше ширина прыгала 900↔560px при переходе на/с AI-таба, что вызывало layout shift и сбивало позицию мыши. На 900px у лёгких табов (Шрифты/Цвета/Горячие) хватает места под двухколоночные сетки.
 - **Двухколоночная сетка в Шрифтах:** `grid-template-columns: 1fr 1fr` (≈410px на колонку). Три колонки тестировали — описания типа «Cmd+/- для быстрой настройки» начинают переноситься/обрезаться.
+- **Прочие шрифты UI в сетке:** Терминал, Сайдбар, Табы, Проекты, Превью файла, Prompt picker, Таймлайн (+ строки таймлайна). `Prompt picker` (`useUIStore.promptPickerFontSize`, default 12, 9-20) — управляет шрифтом Opt+V/Cmd+E picker'а; паддинги и ширины панелей внутри picker'а скейлятся пропорционально, см. `fact-prompt-picker.md`.
+- **Превью таба (Cmd+hover):** отдельная секция в «Шрифтах» — `Ширина` (240-900px) и `Макс. строк` (2-40). Управляет размером popover'а, который появляется при CMD+hover на вкладках TabBar и карточках ProjectHome. Store держит float (drag даёт дробные значения — рамка не прыгает на mouseup), stepper показывает `Math.round` для читаемости. См. `fact-tab-preview-popover.md`.
 - **Stepper, не slider:** Контрол шрифта — `[−] 13px [+]`. Ползунок (`<input type="range">`) визуально занимал ~90px высоты на строку и был бесполезен для ±1px настроек — пользователь всё равно тыкает в края. Stepper уменьшил высоту до ~36px.
 - **Full Model Names:** В редакторе отображаются полные названия моделей (например, "Gemini 3 Pro Preview") и кнопки выбора уровня Thinking (NONE/LOW/MEDIUM/HIGH) для Claude API.
 - **Stale State Protection:** Использование локального React-стейта для всех 6 полей промпта предотвращает гонки при асинхронной записи в SQLite.
@@ -126,12 +128,12 @@
 ### Закрывать кликом вне (overlay-режим)
 - **ON (по умолчанию):** Sidebar работает как overlay — клик в любом месте поверх терминала закрывает его. Клик внутри `[data-sidebar-portal]` или `[data-file-preview-root]` оставляет открытым.
 - **Почему FilePreview не закрывает:** sidebar и file preview — связанные слои. Пользователь читает файл из дерева; клики по preview не должны убирать дерево из-под него. Атрибут `data-file-preview-root` на корне FilePreview — anchor для этой проверки.
-- **Capture-phase listener:** `mousedown` навешен с `useCapture=true`. Без capture canvas terminal (xterm) ловит событие первым через `pointer-events`, и обработчик на window не срабатывает. Известный pattern для overlay'ев поверх xterm — см. `../methodology/react.md::Layering: Portal + pointer-events для UI поверх Canvas`.
+- **Capture-phase listener:** `mousedown` навешен с `useCapture=true`. Без capture canvas terminal (xterm) ловит событие первым через `pointer-events`, и обработчик на window не срабатывает. Известный pattern для overlay'ев поверх xterm — см. `methodology/design-bugs.md::6.3. UI поверх canvas: Portal или Layering Pattern`.
 - **Store:** `useUIStore.sidebarOverlayCloseOnClickOutside`.
 
 ### Связанная логика в Workspace
 - При `sidebarPersistFile=false` И закрытии sidebar — не только скрывается preview, но и `setOpenFilePath(activeProjectId, null)` пишется в БД. Без этого следующее открытие подтянуло бы старый путь из персиста.
-- `sidebarOpenForRender` toggle через `Cmd+E` или `Cmd+/` — оба хоткея работают одинаково и переключают `workspace.sidebarOpen` per-project.
+- `sidebarOpenForRender` toggle через `Cmd+/` (раньше также `Cmd+E`; `Cmd+E` перенесён на prompt picker, см. `fact-notes.md`).
 
 ## Close Button Identity
 Кнопки закрытия панелей редактирования выделены в отдельный визуальный класс:

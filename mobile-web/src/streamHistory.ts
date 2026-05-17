@@ -57,9 +57,25 @@ export function streamHistory(
   const ac = new AbortController();
   let bytesRead = 0;
   let cancelled = false;
+  // Idle watchdog — if no bytes arrive for IDLE_MS we abort with an error.
+  // Without this an Electron crash mid-stream leaves the phone with a forever
+  // "loading…" spinner and no signal. 30s is generous enough for slow WiFi
+  // pauses but tight enough to fail fast when the server actually died.
+  const IDLE_MS = 30_000;
+  let idleTimer: any = null;
+  const armIdleTimer = () => {
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      if (cancelled) return;
+      cancelled = true;
+      try { ac.abort(); } catch {}
+      handlers.onError(new Error('Stream idle timeout (' + (IDLE_MS / 1000) + 's no bytes)'), bytesRead);
+    }, IDLE_MS);
+  };
 
   const finished = (async () => {
     try {
+      armIdleTimer();
       const resp = await fetch(url, {
         headers: {
           'Accept': 'application/x-ndjson',
@@ -82,6 +98,7 @@ export function streamHistory(
       while (!cancelled) {
         const { value, done } = await reader.read();
         if (done) break;
+        armIdleTimer(); // re-arm on every chunk
         bytesRead += value.byteLength;
         // stream: true keeps the decoder mid-codepoint state across chunks —
         // a 4-byte UTF-8 emoji split across two TCP packets won't break.
@@ -123,11 +140,13 @@ export function streamHistory(
     } catch (e: any) {
       if (cancelled) return;
       handlers.onError(e instanceof Error ? e : new Error(String(e)), bytesRead);
+    } finally {
+      clearTimeout(idleTimer);
     }
   })();
 
   return {
-    abort: () => { cancelled = true; ac.abort(); },
+    abort: () => { cancelled = true; clearTimeout(idleTimer); ac.abort(); },
     finished,
   };
 }

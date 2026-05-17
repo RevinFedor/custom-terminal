@@ -63,6 +63,10 @@ interface UIStore {
   sidebarFontSize: number;     // File explorer sidebar
   sidebarWidth: number;        // File explorer width (px)
   filePreviewFontSize: number; // FilePreview readOnly editor
+  promptPickerFontSize: number; // Opt+V picker rows
+  timelineFontSize: number;    // Timeline entries preview text
+  timelineWidth: number;       // Timeline width (px) when expanded (treeMode). Drag-resizable.
+  timelineLineClamp: number;   // How many lines of preview text show in expanded mode.
 
   setSidebarWidth: (width: number) => void;
   setTerminalFontSize: (size: number) => void;
@@ -74,6 +78,11 @@ interface UIStore {
   setSidebarFontSize: (size: number) => void;
 
   setFilePreviewFontSize: (size: number) => void;
+  setPromptPickerFontSize: (size: number) => void;
+
+  setTimelineFontSize: (size: number) => void;
+  setTimelineWidth: (width: number) => void;
+  setTimelineLineClamp: (lines: number) => void;
 
   incrementTerminalFontSize: () => void;
 
@@ -172,6 +181,19 @@ interface UIStore {
   removeToast: (id: string) => void;
 
 
+
+  // Prompt picker overlay (Opt+V) — global, not per-tab. The picker resolves
+  // its target tab dynamically via getEffectiveTabId() when a prompt is chosen,
+  // so there's no per-tab open state to track.
+  promptPickerOpen: boolean;
+  setPromptPickerOpen: (open: boolean) => void;
+
+  // Reopen-tab pulse — flips true synchronously on Shift+Cmd+T keydown so the
+  // user sees TabBar glow flicker BEFORE the IPC round-trip + Claude resume
+  // handshake finishes. Auto-clears after ~600ms via the action's internal
+  // timer; subsequent presses re-arm it.
+  reopenPulseActive: boolean;
+  triggerReopenPulse: () => void;
 
   // History Panel (per-tab state)
   historyPanelOpenTabs: Record<string, boolean>;
@@ -277,6 +299,10 @@ interface UIStore {
   // Status bar debug toggles
   debugHoverBridges: boolean;
   setDebugHoverBridges: (v: boolean) => void;
+  // Diagnostic toggle: when true, Cmd-popups (tooltip/note/fork) stay open
+  // after pointer leaves so user can inspect their inner DOM in devtools.
+  freezeCmdPopups: boolean;
+  setFreezeCmdPopups: (v: boolean) => void;
 
   // Free-ports toggle. When ON, every npm-script start / restart / stop from a
   // devServer-tab first calls `system:free-project-ports` for the tab's cwd —
@@ -305,15 +331,19 @@ interface UIStore {
   notesPanelOffsetY: number;
   setNotesPanelOffsetY: (offset: number) => void;
 
-  // Tab Notes Font Size & Padding
-  tabNotesFontSize: number;
-  setTabNotesFontSize: (size: number) => void;
-  tabNotesPaddingX: number;
-  setTabNotesPaddingX: (px: number) => void;
-  tabNotesPaddingY: number;
-  setTabNotesPaddingY: (px: number) => void;
+  // Tab Preview popover (CMD+hover на табах + Home-карточках). Width + maxLines
+  // фиксируются в Settings, дополнительно поверх живёт пользовательский
+  // resize (live-drag на правом / нижнем / угловом handle popover'а) который
+  // апдейтит те же поля. См. useUIStore.tabPreview*.
+  tabPreviewWidth: number;
+  setTabPreviewWidth: (px: number) => void;
+  tabPreviewMaxLines: number;
+  setTabPreviewMaxLines: (lines: number) => void;
 
-  // Notes Editor Modal (fullscreen) — separate sizing knobs.
+  // Notes Editor — единые настройки для всех мест, где показывается tab.notes:
+  // inline в InfoPanel, slide-out (TabNotesSlideout), CMD+hover preview popover.
+  // Раньше был отдельный набор `tabNotes*` для inline/preview, что приводило к
+  // рассинхрону шрифта между surface'ами (один контент — три размера).
   notesEditorFontSize: number;
   setNotesEditorFontSize: (size: number) => void;
   notesEditorPaddingX: number;
@@ -567,6 +597,40 @@ const loadFilePreviewFontSize = (): number => {
   } catch {}
   return 13;
 };
+
+const loadPromptPickerFontSize = (): number => {
+  try {
+    const v = localStorage.getItem('noted-terminal-prompt-picker-font-size');
+    if (v) return Math.max(9, Math.min(20, Number(v) || 12));
+  } catch {}
+  return 12;
+};
+
+const loadTimelineFontSize = (): number => {
+  try {
+    const v = localStorage.getItem('noted-terminal-timeline-font-size');
+    if (v) return Math.max(10, Math.min(18, Number(v) || 12));
+  } catch {}
+  return 12;
+};
+
+// Width applied when treeMode is on (expanded layout with chip + preview).
+// Drag-resizable via handle on Timeline's left edge.
+const loadTimelineWidth = (): number => {
+  try {
+    const v = localStorage.getItem('noted-terminal-timeline-width');
+    if (v) return Math.max(160, Math.min(600, Number(v) || 220));
+  } catch {}
+  return 220;
+};
+
+const loadTimelineLineClamp = (): number => {
+  try {
+    const v = localStorage.getItem('noted-terminal-timeline-line-clamp');
+    if (v) return Math.max(1, Math.min(10, Number(v) || 3));
+  } catch {}
+  return 3;
+};
 const initialEditorSettings = loadEditorSettings();
 const initialModel = loadSelectedModel();
 const initialThinkingLevel = loadThinkingLevel();
@@ -651,15 +715,37 @@ const saveCopySettings = (settings: CopySettings) => {
 
 const initialCopySettings = loadCopySettings();
 
-// Status-bar toggles (persisted)
+// Status-bar toggles (persisted).
+// SQLite-backed via app:setState — same migration pattern as defaultClaudeEffort
+// and freePortsBeforeStart. localStorage stays as fast initial-paint cache, SQLite
+// is authoritative on hydrate. Without SQLite the toggle would reset whenever
+// vite swaps dev-server origin (5181 → 5182…) and localStorage scopes by origin.
+const APP_STATE_KEY_BRIDGES = 'debugHoverBridges';
 const loadDebugHoverBridges = (): boolean => {
   try { return localStorage.getItem('noted-terminal-debug-hover-bridges') === 'true'; }
   catch { return false; }
 };
 const saveDebugHoverBridges = (v: boolean) => {
   try { localStorage.setItem('noted-terminal-debug-hover-bridges', String(v)); } catch {}
+  try {
+    const { ipcRenderer } = window.require('electron');
+    ipcRenderer.invoke('app:setState', { key: APP_STATE_KEY_BRIDGES, value: v ? '1' : '0' }).catch(() => {});
+  } catch {}
 };
 const initialDebugHoverBridges = loadDebugHoverBridges();
+(async () => {
+  try {
+    const { ipcRenderer } = window.require('electron');
+    const v = await ipcRenderer.invoke('app:getState', APP_STATE_KEY_BRIDGES);
+    if (v !== null && v !== undefined) {
+      const bool = v === '1' || v === 'true' || v === true;
+      if (useUIStore.getState().debugHoverBridges !== bool) {
+        useUIStore.setState({ debugHoverBridges: bool });
+        try { localStorage.setItem('noted-terminal-debug-hover-bridges', String(bool)); } catch {}
+      }
+    }
+  } catch {}
+})();
 
 // freePortsBeforeStart — SQLite-backed (vite-port-stable). Same migration pattern as
 // defaultClaudeEffort (localStorage initial → async SQLite override).
@@ -870,6 +956,10 @@ export const useUIStore = create<UIStore>((set, get) => ({
   sidebarFontSize: initialFontSettings.sidebarFontSize,
   sidebarWidth: (() => { try { const v = localStorage.getItem('sidebarWidth'); return v ? Number(v) : 280; } catch { return 280; } })(),
   filePreviewFontSize: loadFilePreviewFontSize(),
+  promptPickerFontSize: loadPromptPickerFontSize(),
+  timelineFontSize: loadTimelineFontSize(),
+  timelineWidth: loadTimelineWidth(),
+  timelineLineClamp: loadTimelineLineClamp(),
 
   setSidebarWidth: (width) => {
     set({ sidebarWidth: width });
@@ -880,6 +970,30 @@ export const useUIStore = create<UIStore>((set, get) => ({
     const clamped = Math.max(10, Math.min(24, size));
     set({ filePreviewFontSize: clamped });
     try { localStorage.setItem('noted-terminal-file-preview-font-size', String(clamped)); } catch {}
+  },
+
+  setPromptPickerFontSize: (size: number) => {
+    const clamped = Math.max(9, Math.min(20, size));
+    set({ promptPickerFontSize: clamped });
+    try { localStorage.setItem('noted-terminal-prompt-picker-font-size', String(clamped)); } catch {}
+  },
+
+  setTimelineFontSize: (size: number) => {
+    const clamped = Math.max(10, Math.min(18, size));
+    set({ timelineFontSize: clamped });
+    try { localStorage.setItem('noted-terminal-timeline-font-size', String(clamped)); } catch {}
+  },
+
+  setTimelineWidth: (width: number) => {
+    const clamped = Math.max(160, Math.min(600, Math.round(width)));
+    set({ timelineWidth: clamped });
+    try { localStorage.setItem('noted-terminal-timeline-width', String(clamped)); } catch {}
+  },
+
+  setTimelineLineClamp: (lines: number) => {
+    const clamped = Math.max(1, Math.min(10, Math.round(lines)));
+    set({ timelineLineClamp: clamped });
+    try { localStorage.setItem('noted-terminal-timeline-line-clamp', String(clamped)); } catch {}
   },
 
   // Editor Settings (from gt-editor)
@@ -1042,6 +1156,27 @@ export const useUIStore = create<UIStore>((set, get) => ({
   removeToast: (id) => set((state) => ({
     toasts: state.toasts.filter((t) => t.id !== id)
   })),
+
+  // Prompt picker overlay (Opt+V)
+  promptPickerOpen: false,
+  setPromptPickerOpen: (open) => set({ promptPickerOpen: open }),
+
+  reopenPulseActive: false,
+  triggerReopenPulse: () => {
+    set({ reopenPulseActive: true });
+    // Auto-clear: 600ms is long enough for two glow cycles to read as
+    // "deliberate flash" rather than a stutter, but short enough that the
+    // Claude resume handshake (~300-800ms) overlaps with the indicator,
+    // closing the perceptual gap from keypress to visible tab.
+    if (typeof window !== 'undefined') {
+      const w = window as any;
+      if (w.__reopenPulseTimer) clearTimeout(w.__reopenPulseTimer);
+      w.__reopenPulseTimer = setTimeout(() => {
+        useUIStore.setState({ reopenPulseActive: false });
+        w.__reopenPulseTimer = null;
+      }, 600);
+    }
+  },
 
   // History Panel (per-tab state)
   historyPanelOpenTabs: {},
@@ -1306,6 +1441,8 @@ export const useUIStore = create<UIStore>((set, get) => ({
   // Status bar debug toggles
   debugHoverBridges: initialDebugHoverBridges,
   setDebugHoverBridges: (v) => { set({ debugHoverBridges: v }); saveDebugHoverBridges(v); },
+  freezeCmdPopups: false,
+  setFreezeCmdPopups: (v) => set({ freezeCmdPopups: v }),
 
   freePortsBeforeStart: initialFreePortsBeforeStart,
   setFreePortsBeforeStart: (v) => { set({ freePortsBeforeStart: v }); saveFreePortsBeforeStart(v); },
@@ -1367,49 +1504,56 @@ export const useUIStore = create<UIStore>((set, get) => ({
     } catch {}
   },
 
-  // Tab Notes Font Size & Padding
-  tabNotesFontSize: (() => {
+  // Tab Preview popover sizing (CMD+hover). Ключи `noted-terminal-*` зеркалятся
+  // в SQLite автоматически через mirror в main.js → переживает dev-port shuffle.
+  tabPreviewWidth: (() => {
     try {
-      const saved = localStorage.getItem('noted-terminal-tab-notes-font-size');
-      return saved ? parseInt(saved, 10) : 13;
-    } catch { return 13; }
+      const saved = localStorage.getItem('noted-terminal-tab-preview-width');
+      const n = saved ? parseFloat(saved) : 380;
+      return Math.max(240, Math.min(900, Number.isFinite(n) ? n : 380));
+    } catch { return 380; }
   })(),
-  setTabNotesFontSize: (size) => {
-    const clamped = Math.max(10, Math.min(24, size));
-    set({ tabNotesFontSize: clamped });
-    localStorage.setItem('noted-terminal-tab-notes-font-size', String(clamped));
+  setTabPreviewWidth: (px) => {
+    // Храним float — round только в UI-label. Math.round в setter создавал
+    // visual jump на mouseup (юзер видел сдвиг рамки на subpixel несоответствие
+    // между live preview и пост-flush значением).
+    const clamped = Math.max(240, Math.min(900, px));
+    set({ tabPreviewWidth: clamped });
+    try { localStorage.setItem('noted-terminal-tab-preview-width', String(clamped)); } catch {}
   },
-  tabNotesPaddingX: (() => {
+  tabPreviewMaxLines: (() => {
     try {
-      const saved = localStorage.getItem('noted-terminal-tab-notes-padding-x');
-      return saved ? parseInt(saved, 10) : 8;
+      const saved = localStorage.getItem('noted-terminal-tab-preview-max-lines');
+      const n = saved ? parseFloat(saved) : 8;
+      return Math.max(2, Math.min(40, Number.isFinite(n) ? n : 8));
     } catch { return 8; }
   })(),
-  setTabNotesPaddingX: (px) => {
-    const clamped = Math.max(0, Math.min(32, px));
-    set({ tabNotesPaddingX: clamped });
-    localStorage.setItem('noted-terminal-tab-notes-padding-x', String(clamped));
-  },
-  tabNotesPaddingY: (() => {
-    try {
-      const saved = localStorage.getItem('noted-terminal-tab-notes-padding-y');
-      return saved ? parseInt(saved, 10) : 8;
-    } catch { return 8; }
-  })(),
-  setTabNotesPaddingY: (px) => {
-    const clamped = Math.max(0, Math.min(32, px));
-    set({ tabNotesPaddingY: clamped });
-    localStorage.setItem('noted-terminal-tab-notes-padding-y', String(clamped));
+  setTabPreviewMaxLines: (lines) => {
+    // Float-значение для устранения jump при mouseup. Например drag даёт 5.487
+    // строк — store сохраняет ровно 5.487, рамка на flush НЕ меняет высоту.
+    // Settings stepper показывает Math.round(value), но кнопки +/- работают
+    // от целого ceil/floor.
+    const clamped = Math.max(2, Math.min(40, lines));
+    set({ tabPreviewMaxLines: clamped });
+    try { localStorage.setItem('noted-terminal-tab-preview-max-lines', String(clamped)); } catch {}
   },
 
-  // Notes Editor Modal (separate from inline tab-notes). Same persistence
-  // pattern: localStorage for synchronous boot reads, app:setState mirror to
-  // SQLite so the value survives vite port shuffles (different ports = different
-  // origins = separate localStorage buckets). Defaults bigger because the modal
-  // is fullscreen and users want more readable text there.
+  // Notes Editor — единые настройки для всех мест где рендерится tab.notes
+  // (inline в InfoPanel, slide-out, CMD+hover preview). Persistence:
+  // localStorage для синхронного boot read, app:setState mirror в SQLite чтобы
+  // значение пережило vite port shuffles (разные порты = разные origin =
+  // отдельные localStorage buckets).
+  //
+  // Migration: до этого фикса у inline/preview был отдельный набор
+  // `tab-notes-*` ключей, у slide-out — `notes-editor-*`. Если новый ключ не
+  // выставлен, но есть старый — переносим, чтобы юзер не потерял настройку.
   notesEditorFontSize: (() => {
     try {
-      const saved = localStorage.getItem('noted-terminal-notes-editor-font-size');
+      let saved = localStorage.getItem('noted-terminal-notes-editor-font-size');
+      if (!saved) {
+        const legacy = localStorage.getItem('noted-terminal-tab-notes-font-size');
+        if (legacy) { localStorage.setItem('noted-terminal-notes-editor-font-size', legacy); saved = legacy; }
+      }
       return saved ? parseInt(saved, 10) : 14;
     } catch { return 14; }
   })(),
@@ -1424,7 +1568,11 @@ export const useUIStore = create<UIStore>((set, get) => ({
   },
   notesEditorPaddingX: (() => {
     try {
-      const saved = localStorage.getItem('noted-terminal-notes-editor-padding-x');
+      let saved = localStorage.getItem('noted-terminal-notes-editor-padding-x');
+      if (!saved) {
+        const legacy = localStorage.getItem('noted-terminal-tab-notes-padding-x');
+        if (legacy) { localStorage.setItem('noted-terminal-notes-editor-padding-x', legacy); saved = legacy; }
+      }
       return saved ? parseInt(saved, 10) : 12;
     } catch { return 12; }
   })(),
@@ -1439,7 +1587,11 @@ export const useUIStore = create<UIStore>((set, get) => ({
   },
   notesEditorPaddingY: (() => {
     try {
-      const saved = localStorage.getItem('noted-terminal-notes-editor-padding-y');
+      let saved = localStorage.getItem('noted-terminal-notes-editor-padding-y');
+      if (!saved) {
+        const legacy = localStorage.getItem('noted-terminal-tab-notes-padding-y');
+        if (legacy) { localStorage.setItem('noted-terminal-notes-editor-padding-y', legacy); saved = legacy; }
+      }
       return saved ? parseInt(saved, 10) : 12;
     } catch { return 12; }
   })(),

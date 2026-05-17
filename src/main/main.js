@@ -50,7 +50,7 @@ const SessionManager = require(path.join(srcMainDir, 'session-manager'));
 const ClaudeManager = require(path.join(srcMainDir, 'claude-manager'));
 const { resolveGeminiProjectDir, findGeminiSessionFile, invalidateProjectsJsonCache, getGeminiProjectsJson, calculateGeminiHash } = require(path.join(srcMainDir, 'gemini-utils'));
 const ClaudeAgentManager = require(path.join(srcMainDir, 'claude-agent'));
-const { findSessionFile, loadJsonlRecords, resolveSessionChain, resolveLatestSessionInChain, parseTimelineUuids, parseTimelineEntries } = require(path.join(srcMainDir, 'ipc', 'claude-data'));
+const { findSessionFile, loadJsonlRecords, resolveSessionChain, resolveLatestSessionInChain, parseTimelineUuids, parseTimelineEntries, _api: claudeDataApi } = require(path.join(srcMainDir, 'ipc', 'claude-data'));
 
 // SDK session registry — declared early so the mobile-web server can receive
 // the same Map by reference at startup (web-server.start({sdkSessions})).
@@ -149,6 +149,7 @@ if (process.platform === 'darwin') {
 let mainWindow;
 const terminals = new Map(); // tabId -> ptyProcess
 const terminalProjects = new Map(); // tabId -> cwd path
+const terminalProjectIds = new Map(); // tabId -> projectId (authoritative parent project for MCP routing)
 const terminalCommandState = new Map(); // tabId -> { isRunning: boolean, lastExitCode: number }
 const terminalInitialCommand = new Map(); // tabId -> initialCommand string (for restart)
 const terminalOutputBuffer = new Map();  // tabId -> { lines: string[], maxLines: 500 }
@@ -746,6 +747,8 @@ function clearBridgeTab(tabId) {
   claudeTurnBusy.delete(tabId);
   clearTimeout(claudeTurnWatchdog.get(tabId));
   claudeTurnWatchdog.delete(tabId);
+  pendingPasteAudit.delete(tabId);
+  stopInterruptWatcher(tabId);
   // Any in-flight grab-input request gets a clean rejection rather than dangling forever.
   const pendingGrab = grabInputPending.get(tabId);
   if (pendingGrab) {
@@ -763,23 +766,56 @@ function clearBridgeTab(tabId) {
 // Hook script writes one JSON line per event into this socket; we look up the
 // tab by session_id (using bridgeKnownSessions as the source of truth) and
 // broadcast 'claude:turn-state' to the renderer.
-const CLAUDE_HOOK_SOCK = '/tmp/noted-terminal-claude-hook.sock';
+// Per-PID socket path so dev+prod (and N parallel instances) never stomp on
+// each other. Before this fix: both instances wrote to /tmp/noted-terminal-claude-hook.sock,
+// the second one unlink'd the first's socket and rebound — first instance's
+// listener became zombie, all hook events from its Claude tabs went to whoever
+// owned the path. Result: claudeTurnBusy stuck true forever → loader hangs.
+// Hook script picks the right instance via the discovery dir below.
+const CLAUDE_HOOK_DISCOVERY_DIR = path.join(os.homedir(), '.noted-terminal');
+const CLAUDE_HOOK_SOCK = '/tmp/noted-terminal-claude-hook-' + process.pid + '.sock';
+const CLAUDE_HOOK_DISCOVERY_FILE = path.join(CLAUDE_HOOK_DISCOVERY_DIR, 'claude-hook-' + process.pid + '.json');
+// Legacy fixed path used by older hook-script versions — we still bind to it
+// only if no live PID-specific socket exists (i.e. we're the sole instance).
+// Kept for backward compat during the rollout; once new hook script ships to
+// all users this can be removed.
+const CLAUDE_HOOK_SOCK_LEGACY = '/tmp/noted-terminal-claude-hook.sock';
 const claudeTurnBusy = new Map(); // tabId → boolean (true = turn in flight)
 const claudeTurnWatchdog = new Map(); // tabId → timeout ID (silent-tool-stop safety)
 const CLAUDE_TURN_WATCHDOG_MS = 60 * 60 * 1000; // 60min — safety net against silent-tool-stop (#29881) and hook-script crashes; only fires when Stop legitimately never arrives
 
-// Interrupt watchdog — separate, short-fuse fallback for the case Claude's
-// decompiled query.ts does NOT call stopHooks: user-initiated interrupts (Esc /
-// Ctrl+C during streaming). Claude returns `{ reason: 'aborted_streaming' }`
-// without firing Stop or StopFailure. The loader would hang on busy=true for an
-// hour until CLAUDE_TURN_WATCHDOG_MS expires.
+// Last hook event per tab — for diagnostics. When loader hangs, the difference
+// between "hook fired 5s ago" and "hook silent for 20min" tells us instantly
+// whether the bridge is alive. Surfaced in dump-claude-state and the periodic
+// snapshot logger below.
+const claudeHookLastEvent = new Map(); // tabId → { event, ts, sessionId }
+
+// Running counters for hook socket lifecycle. Diff between sock open and
+// hook-event log entries proves whether server is reading data or not.
+let claudeHookConnSeq = 0;
+let claudeHookEventSeq = 0;
+
+// ─── JSONL interruption watcher ─────────────────────────────────────────
+// Claude's `aborted_streaming` path in query.ts:1051 returns WITHOUT firing
+// stopHooks — so on user interrupt (Esc, Ctrl+C, /interrupt, anything that
+// aborts streaming) our Stop hook never arrives and the loader hangs until
+// the 60-min CLAUDE_TURN_WATCHDOG_MS expires.
 //
-// Mechanism: when we detect Esc / Ctrl+C in `terminal:input` for a tab that's
-// currently busy according to claudeTurnBusy, schedule a 2s timer. If Stop hook
-// fires before the timer expires → cancel. If not → user really interrupted,
-// force busy=false. 2s covers PTY buffering + Ink final-frame render after Esc.
-const claudeInterruptWatchdog = new Map(); // tabId → timeout ID
-const CLAUDE_INTERRUPT_WATCHDOG_MS = 2000;
+// Claude DOES write an authoritative record to the session JSONL though: a
+// `type:"user"` message whose content is exactly `[{ type:"text", text:
+// "[Request interrupted by user]" }]` (or the `... for tool use` variant
+// when it interrupts mid-tool-call). That's a deterministic file-system
+// signal we can watch independently of any TUI keystroke.
+//
+// One watcher per active Claude turn. fs.watch on the session JSONL with a
+// minimal tail-only reader (tracks last read byte offset, parses newly-added
+// lines on each `change` event). Disarmed on Stop hook arrival or tab close.
+const claudeInterruptWatchers = new Map(); // tabId → { watcher, filePath, offset, debounce }
+const INTERRUPT_TEXTS = new Set([
+  '[Request interrupted by user]',
+  '[Request interrupted by user for tool use]',
+]);
+
 let claudeHookServer = null;
 
 // PromptQueue grab-input correlator: noted-code-grab.js sends { event:'GrabInput', ppid, text }.
@@ -795,24 +831,129 @@ function findTabIdBySession(sessionId) {
   return null;
 }
 
+// ─── JSONL interruption watcher implementation ───────────────────────────
+// Resolves the session JSONL path from tab cwd + sessionId using Claude's
+// project-slug rule (cwd with `/` → `-`). Sets up fs.watch on the file;
+// each `change` event triggers a tail-read from the last byte offset, parses
+// newly-added lines, and flips busy=false if any line matches the
+// interruption marker. Idempotent — safe to call repeatedly.
+function startInterruptWatcher(tabId, sessionId) {
+  stopInterruptWatcher(tabId); // cancel any previous one
+  const cwd = terminalProjects.get(tabId);
+  if (!cwd || !sessionId) return;
+  const projectSlug = cwd.replace(/\//g, '-');
+  const filePath = path.join(os.homedir(), '.claude', 'projects', projectSlug, sessionId + '.jsonl');
+  let offset = 0;
+  try { offset = fs.statSync(filePath).size; } catch { /* file may appear after first turn */ }
+  const state = { watcher: null, filePath, offset, debounce: null };
+  const onChange = () => {
+    if (state.debounce) return; // coalesce burst of change events
+    state.debounce = setTimeout(() => {
+      state.debounce = null;
+      let stat;
+      try { stat = fs.statSync(filePath); } catch { return; }
+      if (stat.size <= state.offset) { state.offset = stat.size; return; }
+      const fd = fs.openSync(filePath, 'r');
+      const len = stat.size - state.offset;
+      const buf = Buffer.alloc(len);
+      try { fs.readSync(fd, buf, 0, len, state.offset); }
+      finally { fs.closeSync(fd); }
+      state.offset = stat.size;
+      const lines = buf.toString('utf8').split('\n');
+      for (const line of lines) {
+        if (!line) continue;
+        // Cheap pre-check before JSON.parse — most lines won't match.
+        if (line.indexOf('[Request interrupted') === -1) continue;
+        let rec;
+        try { rec = JSON.parse(line); } catch { continue; }
+        if (rec.type !== 'user' || !rec.message || !Array.isArray(rec.message.content)) continue;
+        const hit = rec.message.content.find(c => c && c.type === 'text' && INTERRUPT_TEXTS.has(c.text));
+        if (!hit) continue;
+        // Authoritative interruption signal — flip busy=false and tear down.
+        if (claudeTurnBusy.get(tabId) === true) {
+          console.warn('[ClaudeInterrupt:JSONL] tab=' + tabId.slice(-12) + ' interruption record found in transcript — forcing busy=false (' + hit.text + ')');
+          claudeTurnBusy.set(tabId, false);
+          claudeSpinnerBusy.set(tabId, false);
+          clearTimeout(claudeTurnWatchdog.get(tabId));
+          claudeTurnWatchdog.delete(tabId);
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send('claude:busy-state', { tabId, busy: false });
+            mainWindow.webContents.send('claude:turn-state', {
+              tabId, sessionId,
+              event: 'InterruptStop', busy: false, success: false,
+              lastAssistantMessage: null,
+            });
+          }
+        }
+        stopInterruptWatcher(tabId);
+        return;
+      }
+    }, 100);
+  };
+  try {
+    state.watcher = fs.watch(filePath, { persistent: false }, onChange);
+    console.log('[ClaudeInterrupt:JSONL] tab=' + tabId.slice(-12) + ' watching ' + filePath.replace(os.homedir(), '~') + ' (offset=' + offset + ')');
+  } catch (e) {
+    // File doesn't exist yet — Claude will create it on first prompt write.
+    // Try once more after a short delay; if still missing, give up silently
+    // (turn watchdog @60min remains as last-resort fallback).
+    setTimeout(() => {
+      if (!claudeInterruptWatchers.has(tabId)) return; // tab closed / turn ended
+      try {
+        state.watcher = fs.watch(filePath, { persistent: false }, onChange);
+        try { state.offset = fs.statSync(filePath).size; } catch {}
+        console.log('[ClaudeInterrupt:JSONL] tab=' + tabId.slice(-12) + ' watching (delayed) ' + filePath.replace(os.homedir(), '~'));
+      } catch (e2) {
+        console.warn('[ClaudeInterrupt:JSONL] tab=' + tabId.slice(-12) + ' failed to attach watcher: ' + e2.message);
+        claudeInterruptWatchers.delete(tabId);
+      }
+    }, 500);
+  }
+  claudeInterruptWatchers.set(tabId, state);
+}
+
+function stopInterruptWatcher(tabId) {
+  const state = claudeInterruptWatchers.get(tabId);
+  if (!state) return;
+  if (state.debounce) clearTimeout(state.debounce);
+  if (state.watcher) { try { state.watcher.close(); } catch {} }
+  claudeInterruptWatchers.delete(tabId);
+}
+
 function startClaudeHookServer() {
   try { fs.unlinkSync(CLAUDE_HOOK_SOCK); } catch {}
   claudeHookServer = net.createServer((sock) => {
+    const connId = ++claudeHookConnSeq;
+    const tConnect = Date.now();
+    let dataBytes = 0;
+    let lines = 0;
+    console.log('[ClaudeHook:Conn] open seq=' + connId);
     let buf = '';
     sock.setEncoding('utf8');
     sock.on('data', (chunk) => {
+      dataBytes += chunk.length;
       buf += chunk;
       let nl;
       while ((nl = buf.indexOf('\n')) !== -1) {
         const line = buf.slice(0, nl);
         buf = buf.slice(nl + 1);
         if (!line.trim()) continue;
+        lines++;
         let msg;
         try { msg = JSON.parse(line); } catch (e) {
-          console.warn('[ClaudeHook] Bad JSON:', e.message);
+          console.warn('[ClaudeHook] Bad JSON conn=' + connId + ':', e.message);
           continue;
         }
-        const { event, session_id, last_assistant_message, ts } = msg;
+        const { event, session_id, last_assistant_message, ts, transcript_path } = msg;
+        const eventSeq = ++claudeHookEventSeq;
+
+        // Send ack back to script so it can distinguish "kernel buffered"
+        // (outcome=sent) from "server actually parsed it" (outcome=acked).
+        // Silent-dropout case from May 16 prod incident: 56 envelopes had
+        // outcome=sent on script side, but server never logged them — proof
+        // the read path was broken even though TCP/UDS accept was fine.
+        // ack is just "ok\n" — script reads it before exit.
+        try { sock.write('ok\n'); } catch {}
 
         // ─── GrabInput: payload from noted-code-grab.js helper (no session_id, has ppid) ───
         // Helper is invoked by Claude's external-editor flow. We map ppid → tabId via the
@@ -829,7 +970,7 @@ function startClaudeHookServer() {
           const pending = grabInputPending.get(tabId);
           const text = typeof msg.text === 'string' ? msg.text : '';
           const mode = msg.mode || pending?.mode || 'grab';
-          console.log('[ClaudeHook] GrabInput tab=' + tabId.slice(-12) + ' mode=' + mode + ' bytes=' + text.length + (pending ? '' : ' (no pending — unsolicited?)'));
+          console.log('[ClaudeHook] #' + eventSeq + ' GrabInput tab=' + tabId.slice(-12) + ' mode=' + mode + ' bytes=' + text.length + (pending ? '' : ' (no pending — unsolicited?)'));
           if (pending) {
             clearTimeout(pending.timer);
             grabInputPending.delete(tabId);
@@ -842,9 +983,78 @@ function startClaudeHookServer() {
         const tabId = findTabIdBySession(session_id);
         if (!tabId) {
           // Session not in our tab map — could be a stray claude process outside our terminal.
-          console.log('[ClaudeHook] ' + event + ' session=' + (session_id || '').slice(0, 8) + ' (no tab match)');
+          console.log('[ClaudeHook] #' + eventSeq + ' ' + event + ' session=' + (session_id || '').slice(0, 8) + ' (no tab match)');
           continue;
         }
+
+        claudeHookLastEvent.set(tabId, { event, ts: Date.now(), sessionId: session_id });
+
+        // ── [PasteAudit] consume staged expectation on UserPromptSubmit ──
+        // safePasteAndSubmit staged {expectedLen, expectedHash, ...} right
+        // before pressing Enter. On the next UserPromptSubmit for this tab,
+        // tail the transcript JSONL and compare the last user-record's text.
+        // Mismatch → [PasteAudit:MISMATCH] log so future paste regressions
+        // (TTYHOG truncation, ANSI corruption, single-write data loss) leave
+        // detectable evidence instead of "feels wrong".
+        if (event === 'UserPromptSubmit') {
+          const audit = pendingPasteAudit.get(tabId);
+          if (audit && transcript_path) {
+            // Best-effort, never block the hook ack. Read async, log result.
+            (async () => {
+              try {
+                const fsp = require('fs').promises;
+                const crypto = require('crypto');
+                const raw = await fsp.readFile(transcript_path, 'utf8');
+                // Walk from the end backwards looking for the last
+                // {type:"user", message:{role:"user", content:...}} entry.
+                const lines = raw.split('\n');
+                let actualText = null;
+                for (let li = lines.length - 1; li >= 0; li--) {
+                  const ln = lines[li].trim();
+                  if (!ln) continue;
+                  let rec;
+                  try { rec = JSON.parse(ln); } catch { continue; }
+                  if (rec.type !== 'user') continue;
+                  const m = rec.message;
+                  if (!m || m.role !== 'user') continue;
+                  if (typeof m.content === 'string') { actualText = m.content; break; }
+                  if (Array.isArray(m.content)) {
+                    const textPart = m.content.find(c => c && c.type === 'text');
+                    if (textPart && typeof textPart.text === 'string') { actualText = textPart.text; break; }
+                  }
+                }
+                if (actualText === null) {
+                  console.warn('[PasteAudit] tab=' + tabId.slice(-12) + ' no user record found in transcript ' + transcript_path);
+                } else {
+                  const actualLen = actualText.length;
+                  const actualHash = crypto.createHash('sha1').update(actualText).digest('hex').slice(0, 16);
+                  const match = actualLen === audit.expectedLen && actualHash === audit.expectedHash;
+                  if (match) {
+                    console.log('[PasteAudit] tab=' + tabId.slice(-12) + ' ✅ match len=' + actualLen + ' hash=' + actualHash + ' (sent ' + (Date.now() - audit.sentAt) + 'ms ago)');
+                  } else {
+                    console.warn('[PasteAudit:MISMATCH] tab=' + tabId.slice(-12)
+                      + ' expectedLen=' + audit.expectedLen + ' actualLen=' + actualLen
+                      + ' Δ=' + (actualLen - audit.expectedLen)
+                      + ' expectedHash=' + audit.expectedHash + ' actualHash=' + actualHash
+                      + ' expectedHead=[' + audit.headPreview + ']'
+                      + ' actualHead=[' + actualText.substring(0, 80).replace(/\s+/g, ' ') + ']'
+                      + ' expectedTail=[' + audit.tailPreview + ']'
+                      + ' actualTail=[' + actualText.substring(Math.max(0, actualText.length - 80)).replace(/\s+/g, ' ') + ']'
+                      + ' transcript=' + transcript_path);
+                  }
+                }
+              } catch (e) {
+                console.warn('[PasteAudit] tab=' + tabId.slice(-12) + ' check failed: ' + e.message);
+              } finally {
+                pendingPasteAudit.delete(tabId);
+              }
+            })();
+          } else if (audit && !transcript_path) {
+            console.warn('[PasteAudit] tab=' + tabId.slice(-12) + ' staged but transcript_path missing — cleared');
+            pendingPasteAudit.delete(tabId);
+          }
+        }
+
         const busy = event === 'UserPromptSubmit';
         const prev = claudeTurnBusy.get(tabId);
         claudeTurnBusy.set(tabId, busy);
@@ -852,7 +1062,7 @@ function startClaudeHookServer() {
         // Detailed log for hung-loader diagnosis: include `prev` explicitly so
         // we can spot "UserPromptSubmit while prev=true" (Claude's submit-interrupt
         // path which skips stopHooks) without re-parsing line context.
-        console.log('[ClaudeHook] ' + event + ' tab=' + tabId.slice(-12) + ' session=' + session_id.slice(0, 8) + ' prev=' + (prev === undefined ? 'undef' : prev) + ' busy=' + busy + (prev === busy ? ' (no change)' : '') + (latency !== null ? ' latency=' + latency + 'ms' : ''));
+        console.log('[ClaudeHook] #' + eventSeq + ' ' + event + ' tab=' + tabId.slice(-12) + ' session=' + session_id.slice(0, 8) + ' prev=' + (prev === undefined ? 'undef' : prev) + ' busy=' + busy + (prev === busy ? ' (no change)' : '') + (latency !== null ? ' latency=' + latency + 'ms' : ''));
 
         // ----- Reuse existing claude:busy-state pipeline -----
         // Stop/StopFailure must force loader off, even if spinner glyph still pulses one last frame.
@@ -870,10 +1080,13 @@ function startClaudeHookServer() {
         // fall back to busy=false after CLAUDE_TURN_WATCHDOG_MS so the loader doesn't hang forever.
         clearTimeout(claudeTurnWatchdog.get(tabId));
         claudeTurnWatchdog.delete(tabId);
-        // Interrupt-watchdog: a real Stop hook arrived → cancel any pending interrupt
-        // fallback so we don't double-fire busy=false.
-        clearTimeout(claudeInterruptWatchdog.get(tabId));
-        claudeInterruptWatchdog.delete(tabId);
+        // Start/stop the JSONL interruption watcher on this UserPromptSubmit/Stop edge.
+        // See claudeInterruptWatchers below — turn-start arms it, turn-end disarms it.
+        if (busy) {
+          startInterruptWatcher(tabId, session_id);
+        } else {
+          stopInterruptWatcher(tabId);
+        }
         if (busy) {
           claudeTurnWatchdog.set(tabId, setTimeout(() => {
             console.warn('[ClaudeHook] Watchdog fired for tab ' + tabId.slice(-12) + ' (Stop never arrived)');
@@ -898,22 +1111,156 @@ function startClaudeHookServer() {
         }
       }
     });
-    sock.on('error', (e) => { if (e.code !== 'EPIPE') console.warn('[ClaudeHook] sock err:', e.message); });
+    sock.on('error', (e) => { if (e.code !== 'EPIPE') console.warn('[ClaudeHook:Conn] err seq=' + connId + ':', e.message); });
+    sock.on('close', () => {
+      // Lifecycle close — pairs every "open seq=N" with "close seq=N bytes=X
+      // lines=Y dur=Zms". Diff between open/close count and event count
+      // reveals silent-dropout where server accepts but doesn't read.
+      console.log('[ClaudeHook:Conn] close seq=' + connId + ' bytes=' + dataBytes + ' lines=' + lines + ' dur=' + (Date.now() - tConnect) + 'ms');
+    });
   });
   claudeHookServer.on('error', (e) => { console.error('[ClaudeHook] server err:', e.message); });
+  claudeHookServer.on('close', () => { console.warn('[ClaudeHook] server CLOSED (unexpected)'); });
   claudeHookServer.listen(CLAUDE_HOOK_SOCK, () => {
     try { fs.chmodSync(CLAUDE_HOOK_SOCK, 0o600); } catch {}
-    console.log('[ClaudeHook] Listening on ' + CLAUDE_HOOK_SOCK);
+    console.log('[ClaudeHook] Listening on ' + CLAUDE_HOOK_SOCK + ' (pid=' + process.pid + ')');
+    writeClaudeHookDiscovery();
   });
+
+  // Legacy listener — second net.Server bound to the old fixed path. Old hook
+  // scripts (without discovery support) connect there. We bind ONLY if no
+  // other instance owns it; if a sibling already binds, we silently skip and
+  // rely on the per-PID path.
+  //
+  // CRITICAL: do NOT unconditionally unlink the legacy socket file before
+  // listen — that's exactly the #83 bug (clobber sibling's listener). Path:
+  //   1. try listen(...)
+  //   2. on EADDRINUSE → probe-connect. If `connect` succeeds → sibling alive,
+  //      leave the path to them, do nothing.
+  //   3. on probe ECONNREFUSED → file is orphan (dead listener), unlink + retry.
+  // Net result: only the first live instance claims legacy; orphan stays
+  // cleaned up automatically for the next startup.
+  bindLegacyHookServer();
+  claudeHookLegacyServer = currentLegacyServer;
 }
+
+// Reference held outside so bindLegacyHookServer can recreate the server on
+// EADDRINUSE-after-cleanup retry without losing the handle.
+let currentLegacyServer = null;
+function bindLegacyHookServer(attempt = 0) {
+  const server = net.createServer((sock) => {
+    if (claudeHookServer) claudeHookServer.emit('connection', sock);
+    else { try { sock.destroy(); } catch {} }
+  });
+  currentLegacyServer = server;
+  server.on('error', (e) => {
+    if (e.code === 'EADDRINUSE') {
+      if (attempt >= 1) { /* already retried — give up silently */ return; }
+      // Probe: is there a live listener, or just orphan socket file?
+      const probe = net.createConnection(CLAUDE_HOOK_SOCK_LEGACY);
+      const probeFinish = (orphan) => {
+        try { probe.destroy(); } catch {}
+        if (orphan) {
+          try { fs.unlinkSync(CLAUDE_HOOK_SOCK_LEGACY); } catch {}
+          bindLegacyHookServer(attempt + 1);
+        }
+        // else: sibling is alive, leave legacy path to them
+      };
+      probe.once('connect', () => probeFinish(false));
+      probe.once('error', (err) => probeFinish(err && err.code === 'ECONNREFUSED'));
+    } else {
+      console.warn('[ClaudeHook:Legacy] err:', e.message);
+    }
+  });
+  try {
+    server.listen(CLAUDE_HOOK_SOCK_LEGACY, () => {
+      try { fs.chmodSync(CLAUDE_HOOK_SOCK_LEGACY, 0o600); } catch {}
+      console.log('[ClaudeHook:Legacy] Also listening on ' + CLAUDE_HOOK_SOCK_LEGACY + (attempt > 0 ? ' (after orphan cleanup)' : ''));
+    });
+  } catch (e) { console.warn('[ClaudeHook:Legacy] listen failed:', e.message); }
+}
+
+let claudeHookLegacyServer = null;
+
+// Discovery file: `~/.noted-terminal/claude-hook-<pid>.json` with the socket
+// path + open project cwds + isPackaged flag. The hook script reads all such
+// files at fire-time and picks the right instance by matching the Claude
+// process' cwd against openProjectPaths (longest-prefix), same algorithm as
+// MCP routing. See fact-mcp-routing.md for the parallel pattern.
+function writeClaudeHookDiscovery() {
+  try {
+    fs.mkdirSync(CLAUDE_HOOK_DISCOVERY_DIR, { recursive: true });
+    // Reuse the open-project-paths list maintained for MCP routing.
+    const openProjectPaths = (typeof mcpOpenProjectPaths !== 'undefined' && Array.isArray(mcpOpenProjectPaths)) ? mcpOpenProjectPaths : [];
+    fs.writeFileSync(CLAUDE_HOOK_DISCOVERY_FILE, JSON.stringify({
+      sock: CLAUDE_HOOK_SOCK,
+      pid: process.pid,
+      isPackaged: app.isPackaged,
+      openProjectPaths,
+      updatedAt: Date.now(),
+    }));
+  } catch (e) { console.warn('[ClaudeHook:Discovery] write failed:', e.message); }
+}
+
+// Re-publish discovery whenever the set of open projects changes (same hook
+// the MCP discovery file uses). Wired below in the MCP discovery updater.
+function refreshClaudeHookDiscovery() { writeClaudeHookDiscovery(); }
 
 function stopClaudeHookServer() {
   if (claudeHookServer) {
     try { claudeHookServer.close(); } catch {}
     claudeHookServer = null;
   }
+  if (claudeHookLegacyServer) {
+    try { claudeHookLegacyServer.close(); } catch {}
+    claudeHookLegacyServer = null;
+  }
   try { fs.unlinkSync(CLAUDE_HOOK_SOCK); } catch {}
+  try { fs.unlinkSync(CLAUDE_HOOK_DISCOVERY_FILE); } catch {}
 }
+
+// Periodic compact snapshot of Claude per-tab state. Only logs when at least
+// one tab is busy or has a recent hook event — otherwise silent. The line is
+// dense by design: one rolling row per session window so when the user reports
+// "loader hung at HH:MM" we have a state photo within 30s of that time
+// without needing a fresh repro. Counters at end: conn/event seq + delta
+// (delta=0 between snapshots = bridge is silent, very strong signal).
+let _lastSnapshotConn = 0;
+let _lastSnapshotEvent = 0;
+function logPeriodicClaudeSnapshot() {
+  const now = Date.now();
+  const rows = [];
+  const allTabs = new Set([
+    ...claudeTurnBusy.keys(),
+    ...claudeSpinnerBusy.keys(),
+    ...claudeHookLastEvent.keys(),
+  ]);
+  for (const tabId of allTabs) {
+    const turnBusy = claudeTurnBusy.get(tabId) === true;
+    const spinnerBusy = claudeSpinnerBusy.get(tabId) === true;
+    const last = claudeHookLastEvent.get(tabId);
+    const lastAgo = last ? Math.round((now - last.ts) / 1000) : null;
+    // Skip rows that are completely cold (no busy state + no recent hook)
+    if (!turnBusy && !spinnerBusy && (lastAgo === null || lastAgo > 300)) continue;
+    rows.push(
+      tabId.slice(-12) +
+      ' turn=' + (turnBusy ? '1' : '0') +
+      ' spin=' + (spinnerBusy ? '1' : '0') +
+      (last ? ' last=' + last.event + ':' + lastAgo + 's' : ' last=none') +
+      (claudeTurnWatchdog.has(tabId) ? ' wd' : '') +
+      (claudeInterruptWatchers.has(tabId) ? ' iw' : '')
+    );
+  }
+  const dConn = claudeHookConnSeq - _lastSnapshotConn;
+  const dEvent = claudeHookEventSeq - _lastSnapshotEvent;
+  _lastSnapshotConn = claudeHookConnSeq;
+  _lastSnapshotEvent = claudeHookEventSeq;
+  // Silent when nothing is happening; print counters anyway if there was hook
+  // activity in the window, to surface "conn but no events" (silent dropout).
+  if (rows.length === 0 && dConn === 0 && dEvent === 0) return;
+  console.log('[ClaudeSnapshot] tabs=' + rows.length + ' Δconn=' + dConn + ' Δevent=' + dEvent + ' totalConn=' + claudeHookConnSeq + ' totalEvent=' + claudeHookEventSeq + (rows.length ? ' | ' + rows.join(' || ') : ''));
+}
+setInterval(logPeriodicClaudeSnapshot, 30 * 1000).unref();
 
 // Shell integration directory (for OSC 7 cwd reporting + OSC 133 command lifecycle)
 const shellIntegrationDir = path.join(app.getPath('userData'), 'shell-integration');
@@ -1080,6 +1427,9 @@ function parseOSC133AndEmit(tabId, data) {
         if (mainWindow && !mainWindow.isDestroyed()) {
           mainWindow.webContents.send('terminal:prompt-ready', tabId);
         }
+        // Internal event for terminal:create initialCommand dispatch — fires on first A,
+        // listener self-removes after one match. Decoupled from the renderer-facing IPC.
+        ipcMain.emit('terminal:prompt-ready-internal', null, tabId);
         break;
 
       case 'B': // Command start - user pressed Enter
@@ -1220,7 +1570,7 @@ function createWindow() {
 }
 
 // Context Menu IPC
-ipcMain.on('show-terminal-context-menu', async (event, { hasSelection, prompts, tabId, projectId, cwd }) => {
+ipcMain.on('show-terminal-context-menu', async (event, { hasSelection, prompts, tabId, projectId, cwd, focusInsertPrompt }) => {
   // Load dynamic AI prompts from DB
   let aiPrompts = [];
   try {
@@ -1295,7 +1645,8 @@ ipcMain.on('show-terminal-context-menu', async (event, { hasSelection, prompts, 
 
     template.push({
       label: 'Insert Prompt',
-      submenu: promptsSubmenu
+      submenu: promptsSubmenu,
+      _insertPromptAnchor: true, // marker for positioningItem lookup below
     });
     template.push({ type: 'separator' });
   }
@@ -1384,8 +1735,16 @@ ipcMain.on('show-terminal-context-menu', async (event, { hasSelection, prompts, 
   template.push({ type: 'separator' });
   template.push({ role: 'selectAll' });
 
+  // Cmd+J path requests focus on Insert Prompt — positioningItem aligns that
+  // index under the OS cursor, which on macOS lands the keyboard selection on
+  // that item immediately (no extra ArrowDown press needed).
+  const insertPromptIdx = focusInsertPrompt
+    ? template.findIndex(t => t && t._insertPromptAnchor)
+    : -1;
   const menu = Menu.buildFromTemplate(template);
-  menu.popup(BrowserWindow.fromWebContents(event.sender));
+  const popupOpts = { window: BrowserWindow.fromWebContents(event.sender) };
+  if (insertPromptIdx >= 0) popupOpts.positioningItem = insertPromptIdx;
+  menu.popup(popupOpts);
 });
 
 // SDK tab context menu — slim version, no Scripts / no Research / no Compact.
@@ -1393,7 +1752,7 @@ ipcMain.on('show-terminal-context-menu', async (event, { hasSelection, prompts, 
 // submenu (same prompt-store data as the terminal menu uses). The "insert-prompt"
 // command travels back through the existing `context-menu-command` channel —
 // ClaudeSDKTab listens and routes the payload into its composer textarea.
-ipcMain.on('show-sdk-context-menu', (event, { tabId, hasSelection } = {}) => {
+ipcMain.on('show-sdk-context-menu', (event, { tabId, hasSelection, focusInsertPrompt } = {}) => {
   let prompts = [];
   let promptGroups = [];
   try { prompts = projectManager.getPrompts(); } catch {}
@@ -1439,14 +1798,19 @@ ipcMain.on('show-sdk-context-menu', (event, { tabId, hasSelection } = {}) => {
       }
     });
 
-    template.push({ label: 'Insert Prompt', submenu: promptsSubmenu });
+    template.push({ label: 'Insert Prompt', submenu: promptsSubmenu, _insertPromptAnchor: true });
   }
 
   template.push({ type: 'separator' });
   template.push({ role: 'selectAll' });
 
+  const insertPromptIdx = focusInsertPrompt
+    ? template.findIndex(t => t && t._insertPromptAnchor)
+    : -1;
   const menu = Menu.buildFromTemplate(template);
-  menu.popup(BrowserWindow.fromWebContents(event.sender));
+  const popupOpts = { window: BrowserWindow.fromWebContents(event.sender) };
+  if (insertPromptIdx >= 0) popupOpts.positioningItem = insertPromptIdx;
+  menu.popup(popupOpts);
 });
 
 // Sub-agent chip context menu (right-click on chip in SubAgentBar)
@@ -1594,6 +1958,778 @@ function clearTaskTimeout(taskId) {
   if (task.claudeTabId && projectManager && projectManager.db) {
     projectManager.db.setMcpTaskStartedAt(task.claudeTabId, null);
   }
+}
+
+// ─── Overseer (orchestrator MCP) ──────────────────────────────────────────────
+// Granular read-only inspection of Claude sessions for the orchestrator SDK
+// tab. Endpoints under /overseer/* are designed so the agent can size requests
+// before pulling content: list sessions → stats → turns map → fetch specific
+// turn parts (user / thinking / text) with optional byte ranges.
+//
+// Turn = group of records produced after a user prompt (1 user record + N
+// assistant records: thinking blocks, text blocks, tool_use blocks). Tool_use
+// arguments and tool_result outputs are deliberately excluded from preview
+// surfaces — overseer should not load file dumps or diffs into its context.
+//
+// `isCompactSummary` user records are auto-generated post /compact and are
+// reported with role='compact_summary' so the agent does not confuse them with
+// real user prompts. Compact boundaries are reported as their own turn type.
+
+function _buildActiveBranch(recordMap, lastRecord) {
+  const branch = [];
+  let cur = lastRecord ? lastRecord.uuid : null;
+  const seen = new Set();
+  while (cur && !seen.has(cur)) {
+    seen.add(cur);
+    const rec = recordMap.get(cur);
+    if (!rec) break;
+    branch.unshift(rec);
+    cur = rec.logicalParentUuid || rec.parentUuid;
+  }
+  return branch;
+}
+
+function _isNoisePrompt(text) {
+  if (!text || typeof text !== 'string') return true;
+  return text.includes('<command-name>')
+      || text.includes('<system-reminder>')
+      || text.includes('<task-notification>')
+      || text.includes('<local-command-stdout>')
+      || text.includes('<local-command-stderr>')
+      || text.includes('<local-command-caveat>')
+      || text.startsWith('[Request interrupted');
+}
+
+// Extract user-prompt text from a user-type entry. Returns null for tool_result
+// entries (those are assistant-tool responses, not user input).
+function _extractUserText(entry) {
+  if (entry?.type !== 'user') return null;
+  const c = entry.message?.content;
+  if (typeof c === 'string') return c;
+  if (Array.isArray(c)) {
+    if (c.some(b => b?.type === 'tool_result')) return null;
+    const tb = c.find(b => b?.type === 'text' && b.text);
+    return tb?.text || null;
+  }
+  return null;
+}
+
+// Group the active branch into turns. A turn starts at a user prompt (or a
+// compact_boundary) and includes all subsequent assistant records until the
+// next user prompt / boundary. Tool_result records are attached to the
+// preceding assistant tool_use as `toolResults[id]` but their content is NOT
+// included in the structural summary (too large by definition).
+function _groupIntoTurns(branch) {
+  const turns = [];
+  let current = null;
+
+  function flush() {
+    if (current) turns.push(current);
+    current = null;
+  }
+
+  for (const entry of branch) {
+    if (entry.isSidechain) continue;
+    if (entry.type === 'summary') continue;
+
+    if (entry.type === 'user') {
+      // tool_result branch — attach to last turn if possible, do not start new
+      const arr = entry.message?.content;
+      if (Array.isArray(arr) && arr.some(b => b?.type === 'tool_result')) {
+        if (current) current.hasToolResults = true;
+        continue;
+      }
+      const text = _extractUserText(entry);
+      if (text == null) continue;
+      flush();
+      const isCompactSummary = entry.isCompactSummary === true;
+      current = {
+        kind: isCompactSummary ? 'compact_summary' : 'user',
+        userUuid: entry.uuid,
+        userTimestamp: entry.timestamp || null,
+        userChars: text.length,
+        isNoise: !isCompactSummary && _isNoisePrompt(text),
+        isMeta: entry.isMeta === true,
+        // assistant accumulators
+        thinkingBlocks: [],   // {idx, chars, preview}
+        textBlocks: [],       // {idx, chars, preview}
+        toolUses: [],         // {idx, name}
+        assistantUuids: [],
+        assistantModel: null,
+      };
+    } else if (entry.type === 'system' && entry.subtype === 'compact_boundary') {
+      flush();
+      current = {
+        kind: 'compact_boundary',
+        userUuid: entry.uuid,
+        userTimestamp: entry.timestamp || null,
+        userChars: 0,
+        preTokens: entry.compactMetadata?.preTokens || null,
+        postTokens: entry.compactMetadata?.postTokens || null,
+        trigger: entry.compactMetadata?.trigger || null,
+        thinkingBlocks: [],
+        textBlocks: [],
+        toolUses: [],
+        assistantUuids: [],
+      };
+      flush();
+    } else if (entry.type === 'assistant') {
+      if (!current) continue;
+      current.assistantUuids.push(entry.uuid);
+      if (entry.message?.model && !current.assistantModel) {
+        current.assistantModel = entry.message.model;
+      }
+      const arr = entry.message?.content;
+      if (!Array.isArray(arr)) continue;
+      for (const block of arr) {
+        if (!block || typeof block !== 'object') continue;
+        if (block.type === 'thinking' && typeof block.thinking === 'string') {
+          current.thinkingBlocks.push({
+            idx: current.thinkingBlocks.length,
+            chars: block.thinking.length,
+            preview: block.thinking.slice(0, 160),
+          });
+        } else if (block.type === 'text' && typeof block.text === 'string') {
+          current.textBlocks.push({
+            idx: current.textBlocks.length,
+            chars: block.text.length,
+            preview: block.text.slice(0, 160),
+          });
+        } else if (block.type === 'tool_use' && block.name) {
+          current.toolUses.push({
+            idx: current.toolUses.length,
+            name: block.name,
+          });
+          // Same forward-expand logic the Timeline uses to compute docsEdited
+          // (green dot in UI). Tracked per turn so overseer can tell apart
+          // doc-update turns from coding turns without inspecting tool args.
+          if ((block.name === 'Edit' || block.name === 'Write')) {
+            const fp = block.input?.file_path || '';
+            if (fp.includes('/docs/') || fp.endsWith('/CLAUDE.md') || fp === 'CLAUDE.md') {
+              if (!current.docsEdited) current.docsEdited = new Set();
+              const segs = fp.split('/');
+              const shortName = segs.length >= 2 ? segs.slice(-2).join('/') : segs[segs.length - 1];
+              current.docsEdited.add(shortName);
+            }
+          }
+          if (block.name === 'mcp__knowledge__docs_search') {
+            const q = block.input?.query || '';
+            if (q) {
+              if (!current.docsSearchQueries) current.docsSearchQueries = new Set();
+              current.docsSearchQueries.add(q);
+            }
+          }
+        }
+      }
+    }
+  }
+  flush();
+  // Convert Sets to arrays before returning (Set is not JSON-serializable directly).
+  for (const t of turns) {
+    if (t.docsEdited instanceof Set) t.docsEdited = Array.from(t.docsEdited);
+    if (t.docsSearchQueries instanceof Set) t.docsSearchQueries = Array.from(t.docsSearchQueries);
+  }
+  return turns;
+}
+
+// Load + cache turns for a session. Returns the same shape used by all
+// /overseer/session/:id/* handlers.
+const _overseerTurnsCache = new Map(); // sessionId → { mtimeMs, turns, lastRecord, recordMap }
+
+async function _loadSessionTurns(sessionId, cwd) {
+  const located = findSessionFile(sessionId, cwd);
+  if (!located) {
+    const err = new Error(`Session ${sessionId} not found on disk`);
+    err.status = 404;
+    throw err;
+  }
+  const stat = fs.statSync(located.filePath);
+  const cached = _overseerTurnsCache.get(sessionId);
+  if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+    // Annotations (notes, rewind markers) can change WITHOUT JSONL changing,
+    // so we always re-read them per request — cheap point lookups on SQLite.
+    const annotations = _loadSessionAnnotations(sessionId, cached.turns);
+    return { ...cached, ...annotations, filePath: located.filePath };
+  }
+  const { recordMap, lastRecord } = await loadJsonlRecords(located.filePath);
+  const branch = _buildActiveBranch(recordMap, lastRecord);
+  const turns = _groupIntoTurns(branch);
+  const annotations = _loadSessionAnnotations(sessionId, turns);
+  const result = {
+    sessionId,
+    mtimeMs: stat.mtimeMs,
+    size: stat.size,
+    turns,
+    branchLength: branch.length,
+    filePath: located.filePath,
+    recordMap,
+    ...annotations,
+  };
+  _overseerTurnsCache.set(sessionId, result);
+  return result;
+}
+
+// Load timeline_notes + timeline_rewind_markers for a session and build maps
+// keyed by turnIndex (so callers can join them with /turns output without
+// scanning records again). entry_uuid in DB equals turn.userUuid for normal
+// user-turns. For compact_boundary/compact_summary entries notes are rare but
+// still supported (entry_uuid would match those uuids too).
+function _loadSessionAnnotations(sessionId, turns) {
+  let notesRows = [];
+  let rewindRows = [];
+  try {
+    if (projectManager?.db?.db) {
+      notesRows = projectManager.db.db.prepare(
+        'SELECT entry_uuid, content, position, created_at, updated_at FROM timeline_notes WHERE session_id = ?'
+      ).all(sessionId);
+      rewindRows = projectManager.db.db.prepare(
+        'SELECT entry_uuid, created_at FROM timeline_rewind_markers WHERE session_id = ?'
+      ).all(sessionId);
+    }
+  } catch (e) {
+    console.error('[MCP:Overseer] annotations DB error:', e.message);
+  }
+  // uuid → turnIndex map for join
+  const uuidToTurn = new Map();
+  for (let i = 0; i < turns.length; i++) {
+    if (turns[i].userUuid) uuidToTurn.set(turns[i].userUuid, i);
+  }
+  const notesByTurn = new Map(); // turnIndex → {entryUuid, content, position, createdAt, updatedAt}
+  const orphanNotes = []; // entry_uuid not in active branch (note from forked-out/edited records)
+  for (const row of notesRows) {
+    const idx = uuidToTurn.get(row.entry_uuid);
+    if (idx == null) {
+      orphanNotes.push({ entryUuid: row.entry_uuid, content: row.content, position: row.position });
+      continue;
+    }
+    notesByTurn.set(idx, {
+      entryUuid: row.entry_uuid,
+      content: row.content,
+      position: row.position,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    });
+  }
+  const rewindByTurn = new Map();
+  for (const row of rewindRows) {
+    const idx = uuidToTurn.get(row.entry_uuid);
+    if (idx == null) continue;
+    rewindByTurn.set(idx, { entryUuid: row.entry_uuid, createdAt: row.created_at });
+  }
+  return { notesByTurn, orphanNotes, rewindByTurn };
+}
+
+// Fetch the raw assistant blocks for one turn (so we can serve full thinking /
+// text content on demand). Walks the recordMap by assistantUuids and rebuilds
+// blocks in the same order as during grouping.
+function _collectAssistantBlocks(turn, recordMap) {
+  const thinking = [];
+  const text = [];
+  for (const uuid of turn.assistantUuids || []) {
+    const rec = recordMap.get(uuid);
+    if (!rec) continue;
+    const arr = rec.message?.content;
+    if (!Array.isArray(arr)) continue;
+    for (const block of arr) {
+      if (!block || typeof block !== 'object') continue;
+      if (block.type === 'thinking' && typeof block.thinking === 'string') {
+        thinking.push(block.thinking);
+      } else if (block.type === 'text' && typeof block.text === 'string') {
+        text.push(block.text);
+      }
+    }
+  }
+  return { thinking, text };
+}
+
+function _sliceText(s, start, end) {
+  if (start == null && end == null) return s;
+  const len = s.length;
+  let a = (start == null) ? 0 : (start < 0 ? Math.max(0, len + start) : Math.min(len, start));
+  let b = (end == null) ? len : (end < 0 ? Math.max(0, len + end) : Math.min(len, end));
+  if (b < a) b = a;
+  return s.slice(a, b);
+}
+
+async function handleOverseerRequest(rawUrl) {
+  const url = new URL(rawUrl, 'http://localhost');
+  const p = url.pathname; // e.g. /overseer/sessions
+
+  if (p === '/overseer/sessions') {
+    // Live tabs from DB (any project) with a known Claude sessionId.
+    // bridgeKnownSessions wins over DB column (it reflects the currently active
+    // CLI process, which may be a fork of the persisted id).
+    const rows = projectManager.db.db.prepare(`
+      SELECT t.tab_id, t.name, t.cwd, t.claude_session_id, t.command_type,
+             t.created_at, p.path AS project_path, p.name AS project_title
+      FROM tabs t LEFT JOIN projects p ON p.id = t.project_id
+      WHERE t.tab_id IS NOT NULL
+        AND (t.claude_session_id IS NOT NULL OR t.command_type IN ('claude', 'claude-sdk'))
+      ORDER BY t.created_at DESC
+    `).all();
+
+    const sessions = [];
+    for (const r of rows) {
+      const tabId = r.tab_id;
+      const sessionId = bridgeKnownSessions.get(tabId) || r.claude_session_id || null;
+      if (!sessionId) continue;
+      const isLive = terminals.has(tabId);
+      sessions.push({
+        tabId,
+        tabName: r.name,
+        sessionId,
+        cwd: terminalProjects.get(tabId) || r.cwd,
+        projectPath: r.project_path || null,
+        projectTitle: r.project_title || null,
+        commandType: r.command_type || null,
+        isLive,
+        createdAt: r.created_at || null,
+      });
+    }
+    console.log('[MCP:Overseer] GET /overseer/sessions found=' + sessions.length);
+    return { body: { sessions } };
+  }
+
+  // /overseer/session/:sessionId/...
+  const m = p.match(/^\/overseer\/session\/([0-9a-f-]+)(\/.+)?$/i);
+  if (!m) return { status: 404, body: { error: 'Unknown overseer route' } };
+  const sessionId = m[1];
+  const subpath = m[2] || '';
+  const cwd = url.searchParams.get('cwd') || null;
+
+  const data = await _loadSessionTurns(sessionId, cwd);
+
+  if (subpath === '/stats' || subpath === '') {
+    // Aggregate counts so the agent can decide whether the session is worth
+    // pulling turn-by-turn.
+    let userTurns = 0, compactSummaries = 0, compactBoundaries = 0;
+    let totalUserChars = 0, totalThinkingChars = 0, totalTextChars = 0;
+    let toolUseCount = 0, noisePromptCount = 0;
+    let firstTs = null, lastTs = null;
+    let largestUserTurn = { turnIndex: -1, chars: 0 };
+    let largestThinkingTurn = { turnIndex: -1, chars: 0 };
+    for (let i = 0; i < data.turns.length; i++) {
+      const t = data.turns[i];
+      if (t.userTimestamp) {
+        if (!firstTs) firstTs = t.userTimestamp;
+        lastTs = t.userTimestamp;
+      }
+      if (t.kind === 'user') {
+        userTurns++;
+        totalUserChars += t.userChars;
+        if (t.isNoise) noisePromptCount++;
+        if (t.userChars > largestUserTurn.chars) largestUserTurn = { turnIndex: i, chars: t.userChars };
+      } else if (t.kind === 'compact_summary') {
+        compactSummaries++;
+        totalUserChars += t.userChars;
+      } else if (t.kind === 'compact_boundary') {
+        compactBoundaries++;
+      }
+      const tch = (t.thinkingBlocks || []).reduce((s, b) => s + b.chars, 0);
+      const txc = (t.textBlocks || []).reduce((s, b) => s + b.chars, 0);
+      totalThinkingChars += tch;
+      totalTextChars += txc;
+      toolUseCount += (t.toolUses || []).length;
+      if (tch > largestThinkingTurn.chars) largestThinkingTurn = { turnIndex: i, chars: tch };
+    }
+    // Annotation counts — user-authored notes (purple), rewind markers (pink),
+    // turns where docs/ or CLAUDE.md was edited (green Docs-update dot). These
+    // are the persistent anchors the user actually navigates by.
+    let docsEditedTurns = 0, docsSearchTurns = 0;
+    for (const t of data.turns) {
+      if (t.docsEdited && t.docsEdited.length) docsEditedTurns++;
+      if (t.docsSearchQueries && t.docsSearchQueries.length) docsSearchTurns++;
+    }
+    return { body: {
+      sessionId,
+      filePath: data.filePath,
+      sizeBytes: data.size,
+      branchLength: data.branchLength,
+      turnCount: data.turns.length,
+      userTurns,
+      compactSummaries,
+      compactBoundaries,
+      noisePromptCount,
+      totalChars: { user: totalUserChars, assistantThinking: totalThinkingChars, assistantText: totalTextChars },
+      toolUseCount,
+      firstTimestamp: firstTs,
+      lastTimestamp: lastTs,
+      largestUserTurn,
+      largestThinkingTurn,
+      noteCount: data.notesByTurn.size,
+      orphanNoteCount: data.orphanNotes.length,
+      rewindMarkerCount: data.rewindByTurn.size,
+      docsEditedTurns,
+      docsSearchTurns,
+    }};
+  }
+
+  if (subpath === '/notes') {
+    // Dedicated endpoint for navigation by user anchors. Returns notes in
+    // chronological turn order, each joined with the turn it sits on (so the
+    // agent can answer "what was happening between note A and note B").
+    const sorted = [];
+    for (const [idx, note] of data.notesByTurn) {
+      const t = data.turns[idx];
+      if (!t) continue;
+      sorted.push({
+        turnIndex: idx,
+        entryUuid: note.entryUuid,
+        content: note.content,
+        position: note.position, // 'before' | 'dot' | 'after'
+        createdAt: note.createdAt,
+        updatedAt: note.updatedAt,
+        turnTimestamp: t.userTimestamp,
+        turnKind: t.kind,
+        turnPreview: (() => {
+          if (t.kind === 'compact_boundary') return null;
+          const rec = data.recordMap.get(t.userUuid);
+          const txt = _extractUserText(rec) || '';
+          return txt.slice(0, 160);
+        })(),
+      });
+    }
+    sorted.sort((a, b) => a.turnIndex - b.turnIndex);
+
+    const rewindMarkers = [];
+    for (const [idx, m] of data.rewindByTurn) {
+      const t = data.turns[idx];
+      if (!t) continue;
+      rewindMarkers.push({
+        turnIndex: idx,
+        entryUuid: m.entryUuid,
+        createdAt: m.createdAt,
+        turnTimestamp: t.userTimestamp,
+      });
+    }
+    rewindMarkers.sort((a, b) => a.turnIndex - b.turnIndex);
+
+    return { body: {
+      sessionId,
+      notes: sorted,
+      rewindMarkers,
+      orphanNotes: data.orphanNotes,
+    }};
+  }
+
+  if (subpath === '/turns') {
+    const limit = Math.min(parseInt(url.searchParams.get('limit') || '50', 10) || 50, 500);
+    const offset = Math.max(parseInt(url.searchParams.get('offset') || '0', 10) || 0, 0);
+    const includeNoise = url.searchParams.get('includeNoise') === '1';
+    const kindFilter = url.searchParams.get('kind') || null; // user | compact_summary | compact_boundary
+
+    const items = [];
+    for (let i = 0; i < data.turns.length; i++) {
+      const t = data.turns[i];
+      if (kindFilter && t.kind !== kindFilter) continue;
+      if (!includeNoise && t.kind === 'user' && t.isNoise) continue;
+      const note = data.notesByTurn.get(i);
+      const rewindMarker = data.rewindByTurn.get(i);
+      items.push({
+        turnIndex: i,
+        kind: t.kind,
+        timestamp: t.userTimestamp,
+        userUuid: t.userUuid,
+        userChars: t.userChars,
+        userPreview: t.kind === 'user' || t.kind === 'compact_summary'
+          ? (() => {
+              const rec = data.recordMap.get(t.userUuid);
+              const txt = _extractUserText(rec) || '';
+              return txt.slice(0, 220);
+            })()
+          : null,
+        thinkingBlocks: (t.thinkingBlocks || []).map(b => ({ idx: b.idx, chars: b.chars })),
+        textBlocks: (t.textBlocks || []).map(b => ({ idx: b.idx, chars: b.chars })),
+        toolUses: (t.toolUses || []),
+        hasToolResults: !!t.hasToolResults,
+        model: t.assistantModel || null,
+        preTokens: t.preTokens || undefined,
+        postTokens: t.postTokens || undefined,
+        // Annotations: user-authored note attached to this turn (purple),
+        // rewind marker (pink dot from previous edit-range), docs-related
+        // signals (green dot for any /docs/ or CLAUDE.md edit in this turn).
+        note: note ? { content: note.content, position: note.position } : undefined,
+        rewindMarker: rewindMarker ? true : undefined,
+        docsEdited: t.docsEdited && t.docsEdited.length ? t.docsEdited : undefined,
+        docsSearchQueries: t.docsSearchQueries && t.docsSearchQueries.length ? t.docsSearchQueries : undefined,
+      });
+    }
+    const total = items.length;
+    return { body: {
+      sessionId,
+      total,
+      returned: Math.min(limit, Math.max(0, total - offset)),
+      offset,
+      limit,
+      turns: items.slice(offset, offset + limit),
+    }};
+  }
+
+  // /overseer/session/:id/turn/:idx/(user|thinking|text)
+  const tm = subpath.match(/^\/turn\/(\d+)\/(user|thinking|text)$/);
+  if (tm) {
+    const turnIndex = parseInt(tm[1], 10);
+    const part = tm[2];
+    const turn = data.turns[turnIndex];
+    if (!turn) return { status: 404, body: { error: `turnIndex ${turnIndex} out of range (have ${data.turns.length})` } };
+    const start = url.searchParams.has('start') ? parseInt(url.searchParams.get('start'), 10) : null;
+    const end = url.searchParams.has('end') ? parseInt(url.searchParams.get('end'), 10) : null;
+    const blockParam = url.searchParams.has('block') ? parseInt(url.searchParams.get('block'), 10) : null;
+
+    if (part === 'user') {
+      const rec = data.recordMap.get(turn.userUuid);
+      const txt = _extractUserText(rec) || '';
+      const sliced = _sliceText(txt, start, end);
+      return { body: {
+        sessionId, turnIndex, part, totalChars: txt.length,
+        kind: turn.kind,
+        start: start, end: end,
+        text: sliced,
+      }};
+    }
+
+    // thinking / text — collect blocks then either return one or array of all
+    const { thinking, text } = _collectAssistantBlocks(turn, data.recordMap);
+    const blocks = part === 'thinking' ? thinking : text;
+    if (blockParam != null) {
+      const b = blocks[blockParam];
+      if (b == null) return { status: 404, body: { error: `block ${blockParam} out of range (have ${blocks.length})` } };
+      return { body: {
+        sessionId, turnIndex, part, blockIndex: blockParam,
+        totalChars: b.length, start, end,
+        text: _sliceText(b, start, end),
+      }};
+    }
+    // No specific block requested → return array of {idx, chars, preview}
+    // plus a `full` field carrying the joined content under a range slice
+    // (so the agent can pull all blocks of one part with a single call when
+    // they are small).
+    const joined = blocks.join('\n\n[--- block break ---]\n\n');
+    return { body: {
+      sessionId, turnIndex, part,
+      blockCount: blocks.length,
+      blocks: blocks.map((b, i) => ({ idx: i, chars: b.length, preview: b.slice(0, 200) })),
+      joinedTotalChars: joined.length,
+      joinedText: (start != null || end != null) ? _sliceText(joined, start, end) : undefined,
+    }};
+  }
+
+  return { status: 404, body: { error: 'Unknown overseer subpath: ' + subpath } };
+}
+
+// ─── Overseer mutations (fork / propose_edit / apply_edit) ────────────────────
+// Wraps claude-data.js _api so the overseer agent never edits JSONL directly.
+// propose_edit is a dry-run — computes which records would be removed using the
+// same backtrace + forward-expand logic as the real edit-range, without touching
+// disk. apply_edit invokes editRange or deleteRange. fork wraps forkSessionFile.
+
+async function _resolveSessionFile(sessionId, cwd) {
+  const located = findSessionFile(sessionId, cwd);
+  if (!located) {
+    const err = new Error(`Session ${sessionId} not found on disk`);
+    err.status = 404;
+    throw err;
+  }
+  return located;
+}
+
+// Mirror of edit-range's forward-expand logic but **read-only**.
+// Returns: { removeUuids: Set, actualEnd: number, branch: array, entryBefore, entryAfter }
+function _computeEditRangePlan(sessionId, cwd, startUuid, endUuid) {
+  const located = findSessionFile(sessionId, cwd);
+  if (!located) throw Object.assign(new Error(`Session ${sessionId} not found`), { status: 404 });
+  const content = fs.readFileSync(located.filePath, 'utf-8');
+  const lines = content.split('\n').filter(l => l.trim());
+  const allRecords = [];
+  const recordMap = new Map();
+  for (const line of lines) {
+    try {
+      const e = JSON.parse(line);
+      allRecords.push(e);
+      if (e?.uuid) recordMap.set(e.uuid, e);
+    } catch {}
+  }
+  const lastRecord = allRecords.filter(r => r?.uuid).pop();
+  if (!lastRecord) throw new Error('Session has no records');
+
+  const fileIndexMap = new Map();
+  allRecords.forEach((r, i) => { if (r?.uuid) fileIndexMap.set(r.uuid, i); });
+
+  const branch = [];
+  let cur = lastRecord.uuid;
+  const seen = new Set();
+  while (cur && !seen.has(cur)) {
+    seen.add(cur);
+    const rec = recordMap.get(cur);
+    if (!rec) break;
+    branch.unshift(rec);
+    cur = rec.logicalParentUuid || rec.parentUuid;
+  }
+
+  const startIdx = branch.findIndex(e => e.uuid === startUuid);
+  const endIdx = branch.findIndex(e => e.uuid === endUuid);
+  if (startIdx === -1 || endIdx === -1) {
+    throw Object.assign(new Error(`Range UUIDs not in active branch (start=${startIdx}, end=${endIdx})`), { status: 400 });
+  }
+  const rangeStart = Math.min(startIdx, endIdx);
+  const rangeEnd = Math.max(startIdx, endIdx);
+
+  const removeUuids = new Set();
+  for (let i = rangeStart; i <= rangeEnd; i++) removeUuids.add(branch[i].uuid);
+  // forward-expand
+  for (let i = rangeEnd + 1; i < branch.length; i++) {
+    const e = branch[i];
+    if (e.type === 'assistant' || e.type === 'system' || e.type === 'progress') {
+      removeUuids.add(e.uuid);
+    } else if (e.type === 'user') {
+      const c = e.message?.content;
+      const isToolResult = Array.isArray(c) && c.some(b => b.type === 'tool_result');
+      const isTaskNotif = typeof c === 'string' && c.startsWith('<task-notification>');
+      if (isToolResult || isTaskNotif) removeUuids.add(e.uuid);
+      else break;
+    } else {
+      removeUuids.add(e.uuid);
+    }
+  }
+
+  let actualEnd = rangeEnd;
+  for (let i = rangeEnd + 1; i < branch.length; i++) {
+    if (removeUuids.has(branch[i].uuid)) actualEnd = i;
+    else break;
+  }
+
+  const entryBefore = rangeStart > 0 ? branch[rangeStart - 1] : null;
+  const entryAfter = actualEnd < branch.length - 1 ? branch[actualEnd + 1] : null;
+
+  let removedUsers = 0, removedAssistants = 0, removedOther = 0;
+  let removedUserChars = 0, removedAssistantChars = 0;
+  for (const uuid of removeUuids) {
+    const e = recordMap.get(uuid);
+    if (!e) continue;
+    if (e.type === 'user') {
+      removedUsers++;
+      const c = e.message?.content;
+      if (typeof c === 'string') removedUserChars += c.length;
+      else if (Array.isArray(c)) {
+        for (const b of c) {
+          if (typeof b?.text === 'string') removedUserChars += b.text.length;
+        }
+      }
+    } else if (e.type === 'assistant') {
+      removedAssistants++;
+      const arr = e.message?.content;
+      if (Array.isArray(arr)) {
+        for (const b of arr) {
+          if (typeof b?.text === 'string') removedAssistantChars += b.text.length;
+          else if (typeof b?.thinking === 'string') removedAssistantChars += b.thinking.length;
+        }
+      }
+    } else {
+      removedOther++;
+    }
+  }
+
+  return {
+    filePath: located.filePath,
+    branchLength: branch.length,
+    rangeStart, rangeEnd, actualEnd,
+    removedCount: removeUuids.size,
+    removedUsers, removedAssistants, removedOther,
+    removedUserChars, removedAssistantChars,
+    entryBeforeUuid: entryBefore?.uuid || null,
+    entryBeforeType: entryBefore?.type || null,
+    entryAfterUuid: entryAfter?.uuid || null,
+    entryAfterType: entryAfter?.type || null,
+    firstRemovedUuid: branch[rangeStart].uuid,
+    firstRemovedType: branch[rangeStart].type,
+    firstRemovedPreview: _extractUserText(branch[rangeStart])?.slice(0, 200) || null,
+    lastRemovedUuid: branch[actualEnd].uuid,
+    lastRemovedType: branch[actualEnd].type,
+    nearTip: actualEnd >= branch.length - 3,
+  };
+}
+
+async function handleOverseerMutation(rawUrl, payload) {
+  const url = new URL(rawUrl, 'http://localhost');
+  const p = url.pathname;
+
+  if (p === '/overseer/fork') {
+    const { sessionId, cwd } = payload;
+    if (!sessionId) return { status: 400, body: { error: 'sessionId required' } };
+    if (!claudeDataApi || !claudeDataApi.forkSessionFile) {
+      return { status: 500, body: { error: 'claudeDataApi not initialised (register() not called yet)' } };
+    }
+    // skipChainResolve:true — overseer-fork is explicit, don't follow plan-mode bridges
+    const result = await claudeDataApi.forkSessionFile({ sourceSessionId: sessionId, cwd, skipChainResolve: true });
+    console.log('[MCP:Overseer] /fork sessionId=' + sessionId.slice(0,8) + ' → ' + (result.newSessionId?.slice(0,8) || 'FAILED'));
+    return { body: result };
+  }
+
+  if (p === '/overseer/propose-edit') {
+    const { sessionId, cwd, startUuid, endUuid, mode } = payload;
+    if (!sessionId || !startUuid || !endUuid) {
+      return { status: 400, body: { error: 'sessionId, startUuid, endUuid required' } };
+    }
+    if (!mode || !['compact', 'delete'].includes(mode)) {
+      return { status: 400, body: { error: 'mode must be "compact" or "delete"' } };
+    }
+    const plan = _computeEditRangePlan(sessionId, cwd, startUuid, endUuid);
+    plan.mode = mode;
+    plan.sessionId = sessionId;
+    plan.startUuid = startUuid;
+    plan.endUuid = endUuid;
+    console.log('[MCP:Overseer] /propose-edit mode=' + mode + ' would remove ' + plan.removedCount + ' records (' +
+      plan.removedUsers + ' user, ' + plan.removedAssistants + ' assistant)');
+    return { body: { plan } };
+  }
+
+  if (p === '/overseer/apply-edit') {
+    const { sessionId, cwd, startUuid, endUuid, mode, compactText, autoFork } = payload;
+    if (!sessionId || !startUuid || !endUuid) {
+      return { status: 400, body: { error: 'sessionId, startUuid, endUuid required' } };
+    }
+    if (!mode || !['compact', 'delete'].includes(mode)) {
+      return { status: 400, body: { error: 'mode must be "compact" or "delete"' } };
+    }
+    if (mode === 'compact' && !compactText) {
+      return { status: 400, body: { error: 'compactText required for mode="compact"' } };
+    }
+    if (!claudeDataApi || !claudeDataApi.editRange || !claudeDataApi.deleteRange) {
+      return { status: 500, body: { error: 'claudeDataApi not initialised' } };
+    }
+
+    let workingSessionId = sessionId;
+    let forkResult = null;
+    if (autoFork) {
+      forkResult = await claudeDataApi.forkSessionFile({ sourceSessionId: sessionId, cwd, skipChainResolve: true });
+      if (!forkResult.success) {
+        return { status: 500, body: { error: 'Auto-fork failed: ' + forkResult.error } };
+      }
+      workingSessionId = forkResult.newSessionId;
+      console.log('[MCP:Overseer] /apply-edit auto-fork: ' + sessionId.slice(0,8) + ' → ' + workingSessionId.slice(0,8));
+    }
+
+    const editResult = mode === 'compact'
+      ? await claudeDataApi.editRange({ sessionId: workingSessionId, cwd, startUuid, endUuid, compactText })
+      : await claudeDataApi.deleteRange({ sessionId: workingSessionId, cwd, startUuid, endUuid });
+
+    console.log('[MCP:Overseer] /apply-edit ' + mode + ' on ' + workingSessionId.slice(0,8) + ' → ' + JSON.stringify(editResult).slice(0, 200));
+
+    // Invalidate overseer turns cache for the edited session (file mtime changed,
+    // but explicit clear avoids one stale read).
+    _overseerTurnsCache.delete(workingSessionId);
+
+    return { body: {
+      mode,
+      sourceSessionId: sessionId,
+      workingSessionId,
+      wasForked: !!autoFork,
+      forkResult: forkResult || undefined,
+      editResult,
+    }};
+  }
+
+  return { status: 404, body: { error: 'Unknown overseer mutation: ' + p } };
 }
 
 function startMcpHttpServer() {
@@ -2163,24 +3299,54 @@ function startMcpHttpServer() {
       });
 
     // ========== TERMINAL MANAGEMENT ENDPOINTS ==========
+    // Resolve which project owns `tabId`. Preference:
+    //   1. live map terminalProjectIds — set when PTY was spawned with explicit projectId.
+    //   2. SQLite — DB row tabs.project_id (covers tabs whose PTY died and respawn
+    //      paths that lost the env).
+    // Returns null if unknown.
+    // Used by the HTTP handlers below to validate cross-project tabId access.
+    // (Hoisted as a const, no `function` keyword, to avoid `var`-hoisting across
+    // the big `if/else if` chain.)
+    const resolveProjectForTab = (tabId) => {
+      if (typeof tabId !== 'string' || !tabId) return null;
+      const live = terminalProjectIds.get(tabId);
+      if (live) return live;
+      try {
+        const row = projectManager.db.db.prepare(
+          'SELECT project_id FROM tabs WHERE tab_id = ? LIMIT 1'
+        ).get(tabId);
+        if (row && row.project_id) return row.project_id;
+      } catch {}
+      return null;
+    };
     } else if (req.method === 'GET' && req.url?.startsWith('/terminal/tabs')) {
-      // List terminal tabs for a project (by cwd path)
+      // List terminal tabs for a project (by parentProjectId — preferred — or cwd path)
       (async () => {
         try {
           const urlObj = new URL(req.url, 'http://localhost');
+          const parentProjectId = urlObj.searchParams.get('parentProjectId') || '';
           const projectPath = urlObj.searchParams.get('cwd') || '';
           const colorFilter = urlObj.searchParams.get('color') || '';
 
-          if (!projectPath) {
+          if (!parentProjectId && !projectPath) {
             res.writeHead(400);
-            res.end(JSON.stringify({ error: 'cwd parameter is required' }));
+            res.end(JSON.stringify({ error: 'parentProjectId or cwd parameter is required' }));
             return;
           }
 
-          // Find project by path in DB
-          const project = projectManager.db.db.prepare(
-            'SELECT * FROM projects WHERE path = ? ORDER BY updated_at DESC LIMIT 1'
-          ).get(projectPath);
+          // parentProjectId wins. Resolves project by id (authoritative). Falls
+          // back to cwd-path match only when id missing or unknown.
+          let project = null;
+          if (parentProjectId) {
+            project = projectManager.db.db.prepare(
+              'SELECT * FROM projects WHERE id = ? LIMIT 1'
+            ).get(parentProjectId);
+          }
+          if (!project && projectPath) {
+            project = projectManager.db.db.prepare(
+              'SELECT * FROM projects WHERE path = ? ORDER BY updated_at DESC LIMIT 1'
+            ).get(projectPath);
+          }
 
           if (!project) {
             res.writeHead(200);
@@ -2217,7 +3383,7 @@ function startMcpHttpServer() {
             });
           }
 
-          console.log('[MCP:HTTP] GET /terminal/tabs project=' + projectPath + ' color=' + colorFilter + ' found=' + tabs.length);
+          console.log('[MCP:HTTP] GET /terminal/tabs projectId=' + (parentProjectId || project.id) + ' project=' + (project.path || '') + ' color=' + colorFilter + ' found=' + tabs.length);
           res.writeHead(200);
           res.end(JSON.stringify({ tabs }));
         } catch (e) {
@@ -2233,11 +3399,21 @@ function startMcpHttpServer() {
       req.on('data', chunk => { body += chunk; });
       req.on('end', async () => {
         try {
-          const { tabId, command } = JSON.parse(body);
+          const { tabId, command, parentProjectId } = JSON.parse(body);
           if (!tabId) {
             res.writeHead(400);
             res.end(JSON.stringify({ error: 'tabId is required' }));
             return;
+          }
+
+          if (parentProjectId) {
+            const owner = resolveProjectForTab(tabId);
+            if (owner && owner !== parentProjectId) {
+              console.warn('[MCP:Terminal] /terminal/restart rejected: tab ' + tabId + ' belongs to project ' + owner + ', caller pinned ' + parentProjectId);
+              res.writeHead(403);
+              res.end(JSON.stringify({ error: 'tab does not belong to the requested project', owner, requested: parentProjectId }));
+              return;
+            }
           }
 
           const term = terminals.get(tabId);
@@ -2300,11 +3476,21 @@ function startMcpHttpServer() {
       req.on('data', chunk => { body += chunk; });
       req.on('end', async () => {
         try {
-          const { tabId, command } = JSON.parse(body);
+          const { tabId, command, parentProjectId } = JSON.parse(body);
           if (!tabId || !command) {
             res.writeHead(400);
             res.end(JSON.stringify({ error: 'tabId and command are required' }));
             return;
+          }
+
+          if (parentProjectId) {
+            const owner = resolveProjectForTab(tabId);
+            if (owner && owner !== parentProjectId) {
+              console.warn('[MCP:Terminal] /terminal/run rejected: tab ' + tabId + ' belongs to project ' + owner + ', caller pinned ' + parentProjectId);
+              res.writeHead(403);
+              res.end(JSON.stringify({ error: 'tab does not belong to the requested project', owner, requested: parentProjectId }));
+              return;
+            }
           }
 
           const pty = terminals.get(tabId);
@@ -2333,22 +3519,32 @@ function startMcpHttpServer() {
       req.on('data', chunk => { body += chunk; });
       req.on('end', async () => {
         try {
-          const { name, cwd, command, color } = JSON.parse(body);
-          if (!cwd) {
+          const { name, cwd, command, color, parentProjectId } = JSON.parse(body);
+          // When parentProjectId is set, cwd becomes optional — main can fall back
+          // to the project's stored path. cwd-only flow (legacy callers) still works.
+          let effectiveCwd = cwd;
+          if (parentProjectId && !effectiveCwd) {
+            try {
+              const row = projectManager.db.db.prepare('SELECT path FROM projects WHERE id = ? LIMIT 1').get(parentProjectId);
+              if (row && row.path && !row.path.startsWith('__unset__')) effectiveCwd = row.path;
+            } catch {}
+          }
+          if (!effectiveCwd && !parentProjectId) {
             res.writeHead(400);
-            res.end(JSON.stringify({ error: 'cwd is required' }));
+            res.end(JSON.stringify({ error: 'cwd or parentProjectId is required' }));
             return;
           }
 
-          console.log('[MCP:Terminal] POST /terminal/create name=' + (name || 'auto') + ' cwd=' + cwd + ' cmd=' + (command || '(none)'));
+          console.log('[MCP:Terminal] POST /terminal/create name=' + (name || 'auto') + ' projectId=' + (parentProjectId || '-') + ' cwd=' + effectiveCwd + ' cmd=' + (command || '(none)'));
 
           // Tell renderer to create a new tab
           if (mainWindow && !mainWindow.isDestroyed()) {
             mainWindow.webContents.send('terminal:mcp-create', {
               name: name || undefined,
-              cwd,
+              cwd: effectiveCwd,
               command: command || undefined,
               color: color || undefined,
+              parentProjectId: parentProjectId || undefined,
             });
           }
 
@@ -2366,11 +3562,21 @@ function startMcpHttpServer() {
       req.on('data', chunk => { body += chunk; });
       req.on('end', async () => {
         try {
-          const { tabId } = JSON.parse(body);
+          const { tabId, parentProjectId } = JSON.parse(body);
           if (!tabId) {
             res.writeHead(400);
             res.end(JSON.stringify({ error: 'tabId is required' }));
             return;
+          }
+
+          if (parentProjectId) {
+            const owner = resolveProjectForTab(tabId);
+            if (owner && owner !== parentProjectId) {
+              console.warn('[MCP:Terminal] /terminal/kill rejected: tab ' + tabId + ' belongs to project ' + owner + ', caller pinned ' + parentProjectId);
+              res.writeHead(403);
+              res.end(JSON.stringify({ error: 'tab does not belong to the requested project', owner, requested: parentProjectId }));
+              return;
+            }
           }
 
           const pty = terminals.get(tabId);
@@ -2397,14 +3603,27 @@ function startMcpHttpServer() {
       req.on('data', chunk => { body += chunk; });
       req.on('end', async () => {
         try {
-          const { steps } = JSON.parse(body);
+          const { steps, parentProjectId } = JSON.parse(body);
           if (!steps || !Array.isArray(steps) || steps.length === 0) {
             res.writeHead(400);
             res.end(JSON.stringify({ error: 'steps array is required' }));
             return;
           }
 
-          console.log('[MCP:Terminal] POST /terminal/chain steps=' + steps.length);
+          if (parentProjectId) {
+            for (const step of steps) {
+              if (!step || !step.tabId) continue;
+              const owner = resolveProjectForTab(step.tabId);
+              if (owner && owner !== parentProjectId) {
+                console.warn('[MCP:Terminal] /terminal/chain rejected: tab ' + step.tabId + ' belongs to project ' + owner + ', caller pinned ' + parentProjectId);
+                res.writeHead(403);
+                res.end(JSON.stringify({ error: 'chain contains tabId from another project', tabId: step.tabId, owner, requested: parentProjectId }));
+                return;
+              }
+            }
+          }
+
+          console.log('[MCP:Terminal] POST /terminal/chain projectId=' + (parentProjectId || '-') + ' steps=' + steps.length);
           const results = [];
 
           for (const step of steps) {
@@ -2482,11 +3701,22 @@ function startMcpHttpServer() {
           const urlObj = new URL(req.url, 'http://localhost');
           const tabId = urlObj.searchParams.get('tabId');
           const lines = parseInt(urlObj.searchParams.get('lines') || '50');
+          const parentProjectId = urlObj.searchParams.get('parentProjectId') || '';
 
           if (!tabId) {
             res.writeHead(400);
             res.end(JSON.stringify({ error: 'tabId parameter is required' }));
             return;
+          }
+
+          if (parentProjectId) {
+            const owner = resolveProjectForTab(tabId);
+            if (owner && owner !== parentProjectId) {
+              console.warn('[MCP:Terminal] /terminal/output rejected: tab ' + tabId + ' belongs to project ' + owner + ', caller pinned ' + parentProjectId);
+              res.writeHead(403);
+              res.end(JSON.stringify({ error: 'tab does not belong to the requested project', owner, requested: parentProjectId }));
+              return;
+            }
           }
 
           const buf = terminalOutputBuffer.get(tabId);
@@ -2506,6 +3736,44 @@ function startMcpHttpServer() {
           res.end(JSON.stringify({ error: e.message }));
         }
       })();
+
+    } else if (req.method === 'GET' && req.url?.startsWith('/overseer/')) {
+      // Overseer: granular session inspection for the orchestrator SDK tab.
+      // Reuses findSessionFile + loadJsonlRecords from claude-data.js (same
+      // backtrace logic as parseTimelineEntries). All endpoints are read-only.
+      (async () => {
+        try {
+          const out = await handleOverseerRequest(req.url);
+          res.writeHead(out.status || 200);
+          res.end(JSON.stringify(out.body));
+        } catch (e) {
+          console.error('[MCP:Overseer] Error:', e.message, e.stack);
+          res.writeHead(500);
+          res.end(JSON.stringify({ error: e.message }));
+        }
+      })();
+
+    } else if (req.method === 'POST' && req.url?.startsWith('/overseer/')) {
+      // Mutating overseer endpoints: propose_edit (dry-run preview),
+      // apply_edit (real edit via claudeDataApi.editRange/deleteRange),
+      // fork (creates session fork). All write paths go through the SAME
+      // implementation as the renderer IPC handlers — overseer never touches
+      // JSONL directly. This guarantees identical backtrace/orphan-cleanup
+      // behaviour with the existing Timeline edit-range button.
+      let body = '';
+      req.on('data', chunk => { body += chunk; });
+      req.on('end', async () => {
+        try {
+          const payload = body ? JSON.parse(body) : {};
+          const out = await handleOverseerMutation(req.url, payload);
+          res.writeHead(out.status || 200);
+          res.end(JSON.stringify(out.body));
+        } catch (e) {
+          console.error('[MCP:Overseer:POST] Error:', e.message, e.stack);
+          res.writeHead(500);
+          res.end(JSON.stringify({ error: e.message }));
+        }
+      });
 
     } else {
       res.writeHead(404);
@@ -2536,10 +3804,87 @@ function startMcpHttpServer() {
       }
     } catch {}
 
-    fs.writeFileSync(MCP_PORT_FILE, String(mcpHttpPort));
+    // JSON format: { port, pid, openProjectPaths: string[] }. terminal-server.mjs
+    // picks the instance whose openProjectPaths contains the request's cwd / CLAUDE_PROJECT_DIR
+    // so dev + prod copies running in parallel each get the calls for their own projects,
+    // instead of all calls going to whichever wrote the port file last.
+    writeMcpPortFile();
     console.log('[MCP:HTTP] Port written to ' + MCP_PORT_FILE);
   });
 }
+
+// Renderer tells us which projects it currently has open. Kept up to date by an
+// IPC ping on every openProject / closeProject in the workspace store.
+//
+// Race: discovery files (MCP port-file, Claude hook discovery) are written at
+// listen-callback time, BEFORE renderer has mounted and pushed paths. Without
+// the SQLite-hydration below, that initial write goes out with [] and any
+// hook/MCP call in the first second(s) fails to cwd-route → falls back to
+// most-recent mtime → may pick wrong instance. We persist last-known paths
+// in app_state and rehydrate on boot so even the very first discovery write
+// has the right list (snapshot from previous session). Updated on every push.
+const OPEN_PROJECT_PATHS_KEY = 'mcpOpenProjectPaths';
+const OPEN_PROJECTS_KEY = 'mcpOpenProjects';
+let mcpOpenProjectPaths = [];
+let mcpOpenProjects = []; // [{ id, path, name }]
+try {
+  const cached = projectManager.db.getAppState(OPEN_PROJECT_PATHS_KEY);
+  if (typeof cached === 'string' && cached) {
+    const parsed = JSON.parse(cached);
+    if (Array.isArray(parsed)) {
+      mcpOpenProjectPaths = parsed.filter(p => typeof p === 'string' && p);
+      console.log('[MCP:HTTP] hydrated openProjectPaths from SQLite: ' + mcpOpenProjectPaths.length + ' entries');
+    }
+  }
+} catch (e) { console.warn('[MCP:HTTP] hydrate openProjectPaths failed:', e.message); }
+try {
+  const cached = projectManager.db.getAppState(OPEN_PROJECTS_KEY);
+  if (typeof cached === 'string' && cached) {
+    const parsed = JSON.parse(cached);
+    if (Array.isArray(parsed)) {
+      mcpOpenProjects = parsed.filter(p => p && typeof p.id === 'string');
+      console.log('[MCP:HTTP] hydrated openProjects from SQLite: ' + mcpOpenProjects.length + ' entries');
+    }
+  }
+} catch (e) { console.warn('[MCP:HTTP] hydrate openProjects failed:', e.message); }
+
+function writeMcpPortFile() {
+  if (!mcpHttpPort) return;
+  const payload = {
+    port: mcpHttpPort,
+    pid: process.pid,
+    openProjectPaths: mcpOpenProjectPaths,
+    openProjects: mcpOpenProjects,
+    isPackaged: app.isPackaged,
+    updatedAt: Date.now(),
+  };
+  try { fs.writeFileSync(MCP_PORT_FILE, JSON.stringify(payload)); } catch (e) {
+    console.warn('[MCP:HTTP] failed to write port file: ' + e.message);
+  }
+}
+
+// Second arg `meta` is optional, carries { projects: [{id, path, name}] }.
+// Legacy renderer only sends one positional arg (array of paths) — we still
+// accept that.
+ipcMain.on('mcp:open-project-paths', (_e, paths, meta) => {
+  if (!Array.isArray(paths)) return;
+  mcpOpenProjectPaths = paths.filter(p => typeof p === 'string' && p);
+  if (meta && Array.isArray(meta.projects)) {
+    mcpOpenProjects = meta.projects.filter(p => p && typeof p.id === 'string').map(p => ({
+      id: p.id,
+      path: typeof p.path === 'string' ? p.path : '',
+      name: typeof p.name === 'string' ? p.name : '',
+    }));
+  }
+  writeMcpPortFile();
+  // Mirror project paths into Claude hook discovery so the hook script can
+  // route to the correct Electron instance the same way MCP does.
+  try { refreshClaudeHookDiscovery(); } catch {}
+  // Persist for next boot so the initial discovery write (before renderer pushes)
+  // already has the correct list — see hydration block above.
+  try { projectManager.db.setAppState(OPEN_PROJECT_PATHS_KEY, JSON.stringify(mcpOpenProjectPaths)); } catch {}
+  try { projectManager.db.setAppState(OPEN_PROJECTS_KEY, JSON.stringify(mcpOpenProjects)); } catch {}
+});
 
 function stopMcpHttpServer() {
   if (mcpHttpServer) {
@@ -4199,10 +5544,19 @@ app.on('activate', () => {
 // 'tools'   → everything else: MCP, WebFetch/Search, Skill, Cron*, Agent, planning, notifications, …
 // New tools default to 'tools' — safe bucket that's always included if user keeps Claude+Tools on.
 function getToolGroup(toolName) {
-  if (toolName === 'Read' || toolName === 'Grep' || toolName === 'Glob' || toolName === 'NotebookRead') return 'reading';
+  if (toolName === 'Read' || toolName === 'NotebookRead') return 'reading';
   if (toolName === 'Edit' || toolName === 'Write' || toolName === 'NotebookEdit') return 'editing';
-  if (toolName === 'Bash' || toolName === 'Monitor') return 'bash';
-  if (toolName === 'Task') return 'subagent';
+  // Grep/Glob are shell-flavoured search — same bucket as Bash/Monitor. Mirrors the inline
+  // classifiers in claude-data.js copy-range/export-clean-session (which were already
+  // bash-side), keeping the three places consistent. Without this Glob/Grep would pass
+  // the callsite pre-filter on `bash` but get gated again inside formatToolAction on
+  // `reading=false`, silently suppressing the detail block.
+  if (toolName === 'Bash' || toolName === 'Monitor' || toolName === 'Grep' || toolName === 'Glob') return 'bash';
+  // `Agent` (Claude Agent SDK 2.1+) is the renamed `Task` — same agent_progress stream,
+  // same input shape (description/prompt/subagent_type). Both belong in the `subagent`
+  // toggle pair, otherwise Agent-using sessions fall into the `tools` bucket and the
+  // history/result toggles silently no-op for the user.
+  if (toolName === 'Task' || toolName === 'Agent') return 'subagent';
   return 'tools';
 }
 
@@ -4211,6 +5565,11 @@ function getToolGroup(toolName) {
 function formatToolAction(toolName, input, toolResult = null, includeEditing = false, includeReading = false, opts = {}) {
   const { includeSubagentResult = false, includeSubagentHistory = false, progressEntries = [], flags = null } = opts;
   let label = '';
+  // MCP tools name format: `mcp__<server>__<method>` — render as `🔌 MCP `server` / `method``
+  // so the reader knows which MCP server produced the call without parsing the raw name.
+  const mcpMatch = typeof toolName === 'string' && toolName.startsWith('mcp__')
+    ? toolName.slice(5).split('__')
+    : null;
   switch (toolName) {
     case 'Read': label = '📄 Чтение (' + (input.file_path || '?') + ')'; break;
     case 'Edit': label = '✏️ Редактирование (' + (input.file_path || '?') + ')'; break;
@@ -4227,12 +5586,20 @@ function formatToolAction(toolName, input, toolResult = null, includeEditing = f
     }
     case 'Glob': label = '🔍 Поиск файлов (' + (input.pattern || '?') + ')'; break;
     case 'Grep': label = '🔍 Поиск в коде (' + (input.pattern || '?') + ')'; break;
-    case 'Task': {
+    case 'Task':
+    case 'Agent': {
       const desc = input.description || input.prompt?.substring(0, 60) || '';
       label = '🧵 Субагент (' + desc + ')';
       break;
     }
-    default: label = '⚙️ ' + toolName;
+    case 'WebSearch': label = '🌐 Web Search (' + (input.query || '?') + ')'; break;
+    case 'WebFetch': label = '🌐 Web Fetch (' + (input.url || '?') + ')'; break;
+    default:
+      if (mcpMatch && mcpMatch.length >= 2) {
+        label = '🔌 MCP `' + mcpMatch[0] + '` / `' + mcpMatch.slice(1).join('__') + '`';
+      } else {
+        label = '⚙️ ' + toolName;
+      }
   }
 
   // Compute group-based inclusion. When granular flags passed — use them. Otherwise fall back to
@@ -4250,7 +5617,7 @@ function formatToolAction(toolName, input, toolResult = null, includeEditing = f
     shouldInclude =
       ((toolName === 'Edit' || toolName === 'Write' || toolName === 'Bash') && includeEditing) ||
       (toolName === 'Read' && includeReading) ||
-      (toolName === 'Task' && (includeSubagentResult || includeSubagentHistory));
+      ((toolName === 'Task' || toolName === 'Agent') && (includeSubagentResult || includeSubagentHistory));
   }
 
   if (!shouldInclude) return label;
@@ -4264,7 +5631,7 @@ function formatToolAction(toolName, input, toolResult = null, includeEditing = f
     detail = '\n```\n' + input.content + '\n```';
   } else if (toolName === 'Bash' && toolResult?.content) {
     detail = '\n```\n' + toolResult.content + '\n```';
-  } else if (toolName === 'Task') {
+  } else if (toolName === 'Task' || toolName === 'Agent') {
     // Sub-agent result
     if (includeSubagentResult && toolResult) {
       const resultText = typeof toolResult.content === 'string'
@@ -4314,6 +5681,60 @@ function formatToolAction(toolName, input, toolResult = null, includeEditing = f
         detail += '\n>\n> **History:**\n' + historyLines.join('\n');
       }
     }
+  } else {
+    // Default deep-serialization for "shell-search" (Glob/Grep/Monitor) and the entire
+    // `tools` bucket (mcp__*, Web*, Skill, Cron*, ScheduleWakeup, RemoteTrigger,
+    // EnterWorktree, ExitPlanMode, PushNotification, ListMcpResources*, future tools).
+    // Without this branch each call rendered as a single shallow label — reader saw
+    // `🔌 MCP \`server\` / \`method\`` with no params and no result. Same render shape as
+    // Read/Bash: one fenced json block with {request, response} so a downstream LLM can
+    // read it the same way it reads file diffs.
+    //
+    // Read/Edit/Write/Bash/Monitor handled above; Task/Agent handled above; so the only
+    // group left here is "everything else with a label but no detail". Always opt-in via
+    // shouldInclude check above — won't render for an OFF group.
+    const handledByDedicatedBranch = toolName === 'Read' || toolName === 'Edit'
+      || toolName === 'Write' || toolName === 'Bash' || toolName === 'Monitor'
+      || toolName === 'Task' || toolName === 'Agent';
+    if (!handledByDedicatedBranch) {
+      // Strip CLI-internal `caller` field — adds {type:"direct"} noise to every record
+      // without informing the reader. Same shape on every call.
+      const cleanInput = (input && typeof input === 'object') ? { ...input } : input;
+      if (cleanInput && typeof cleanInput === 'object' && 'caller' in cleanInput) delete cleanInput.caller;
+
+      // Normalize tool_result.content (string | array<{type:'text',text}|{type:'image',source}>).
+      // image blocks rendered as placeholder — base64 PNGs are 200KB+ each and unreadable in clipboard.
+      let responseText = null;
+      if (toolResult && toolResult.content != null) {
+        const rc = toolResult.content;
+        if (typeof rc === 'string') {
+          responseText = rc;
+        } else if (Array.isArray(rc)) {
+          const parts = [];
+          for (const blk of rc) {
+            if (!blk) continue;
+            if (blk.type === 'text' && typeof blk.text === 'string') {
+              parts.push(blk.text);
+            } else if (blk.type === 'image' && blk.source) {
+              const mime = blk.source.media_type || 'image/?';
+              const sizeBytes = (blk.source.data || '').length;
+              const sizeKB = sizeBytes > 0 ? Math.round(sizeBytes / 1024) : 0;
+              parts.push('[image: ' + mime + (sizeKB ? ', ~' + sizeKB + 'KB' : '') + ' base64 omitted]');
+            }
+          }
+          responseText = parts.join('\n');
+        }
+      }
+
+      const body = { request: cleanInput };
+      if (responseText != null) body.response = responseText;
+      try {
+        detail = '\n```json\n' + JSON.stringify(body, null, 2) + '\n```';
+      } catch {
+        // Cyclic / unserializable input — fall back to no detail rather than throwing.
+        detail = '';
+      }
+    }
   }
 
   return label + detail;
@@ -4322,7 +5743,7 @@ function formatToolAction(toolName, input, toolResult = null, includeEditing = f
 // claude:copy-range → ipc/claude-data.js
 
 // Create new terminal for a tab
-ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initialCommand }) => {
+ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, cwd, initialCommand }) => {
     // Guard: if PTY already exists (e.g. respawned by MCP continue_claude), reuse it
     const existingPty = terminals.get(tabId);
     if (existingPty) {
@@ -4357,6 +5778,37 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
       EDITOR: path.join(os.homedir(), '.claude', 'hooks', 'noted-code-grab.js'),
       VISUAL: path.join(os.homedir(), '.claude', 'hooks', 'noted-code-grab.js'),
       NOTED_ORIGINAL_EDITOR: process.env.EDITOR || process.env.VISUAL || '',
+      // Always emit grab-helper diag to /tmp/noted-grab-helper.log. Without
+      // this, when "Helper never reported back" fires we have zero independent
+      // proof of whether the helper started, found the lock-file, or hit the
+      // socket. Cost: ~5 short append lines per Ctrl+G; effectively free.
+      NOTED_GRAB_DEBUG: '1',
+      // Authoritative routing hint for the MCP server (terminal-server.mjs) and
+      // any other child tool that wants to address THIS specific Electron main.
+      // When dev+prod both have the same cwd in openProjectPaths, cwd-routing
+      // ties — but Claude was spawned by exactly one main, so its env knows
+      // which PID. terminal-server.mjs reads NOTED_MAIN_PID and prefers that
+      // instance's port-file over cwd ambiguity. Same idea as #91 but applied
+      // to MCP HTTP routing instead of hook-socket routing.
+      NOTED_MAIN_PID: String(process.pid),
+      // Project-level routing: tells terminal-server.mjs and other tools which
+      // *project* in this main the PTY belongs to. cwd-based matching breaks
+      // when two open projects share/nest a cwd, or when Claude `cd`'s away.
+      // With NOTED_PARENT_PROJECT_ID set, MCP scopes list_tabs/create_tab/run/
+      // restart/kill to this project unconditionally — no cwd heuristic, no
+      // activeProjectId fallback. See methodology/design.md::ID-pinned routing.
+      NOTED_PARENT_PROJECT_ID: typeof projectId === 'string' && projectId ? projectId : '',
+      NOTED_PARENT_TAB_ID: typeof tabId === 'string' ? tabId : '',
+      // Claude Code 2.1.110+ uses an aggressive alternate-screen renderer by
+      // default. Each alt-screen transition (\x1b[?1049h/l) drops Claude's own
+      // DEC ?2004 (bracketed paste mode) — after a few transitions a large
+      // Cmd+V arrives in xterm.js without \x1b[200~/\x1b[201~ wrapping, gets
+      // fragmented by macOS TTYHOG (~1KB), and Ink renders one [Pasted text
+      // #N] chip PER chunk. Setting this env disables the alt-screen path,
+      // keeping DEC 2004 stable across renders and making big pastes show
+      // as one chip again. Supported since Claude 2.1.132 (May 6, 2026).
+      // See deep-research-paste.md §4.1 + research result §3.
+      CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN: '1',
     };
 
     // Zsh: use ZDOTDIR to load our integration
@@ -4371,23 +5823,21 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
 
     console.time(`[PERF:main] pty.spawn ${tabId}`);
 
-    // Build shell arguments
-    // If initialCommand provided, run shell with -c to execute command after loading configs
-    let shellArgs = [];
-    if (initialCommand) {
-      // For zsh/bash: -l (login shell) -c "command; exec shell"
-      // This ensures .zshrc/.bashrc loads before command runs, then keeps shell open
-      const escapedCmd = initialCommand.replace(/"/g, '\\"');
-      shellArgs = ['-l', '-c', `${escapedCmd}; exec ${shell}`];
-      console.log(`[terminal:create] ========== FORK DEBUG ==========`);
-      console.log(`[terminal:create] tabId: ${tabId}`);
-      console.log(`[terminal:create] initialCommand (raw): ${initialCommand}`);
-      console.log(`[terminal:create] escapedCmd: ${escapedCmd}`);
-      console.log(`[terminal:create] shell: ${shell}`);
-      console.log(`[terminal:create] shellArgs:`, shellArgs);
-      console.log(`[terminal:create] Full command: ${shell} ${shellArgs.join(' ')}`);
-      console.log(`[terminal:create] ================================`);
-    }
+    // Always spawn plain interactive shell (no -c wrapper).
+    //
+    // Previously: when initialCommand was provided we ran `zsh -l -c "cmd; exec shell"`.
+    // That broke OSC 133 — `-c` is non-interactive, so the precmd/preexec hooks from
+    // shell-integration/.zshrc never fired for the command, and the `exec shell`
+    // tail spawned a fresh shell that didn't re-source our integration either.
+    // Net effect: tab was alive but green "command running" indicator never lit up
+    // because [terminal:command-started] event never reached the renderer.
+    //
+    // New flow: spawn the shell empty (lets our ZDOTDIR/.zshrc load OSC 133 hooks
+    // normally), then dispatch initialCommand via ptyProcess.write() once the first
+    // OSC 133 A (prompt ready) arrives. preexec/precmd will fire on Enter — same
+    // path as a user manually typing the command, same path as terminal/restart.
+    // Deterministic: no timeouts, no `-c` non-interactive corner cases.
+    const shellArgs = [];
 
     const ptyProcess = pty.spawn(shell, shellArgs, {
       name: 'xterm-256color',
@@ -4397,13 +5847,48 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
       env: shellEnv
     });
     console.timeEnd(`[PERF:main] pty.spawn ${tabId}`);
-    console.log(`[PTY:CREATED] tabId=${tabId} pid=${ptyProcess.pid} cwd=${workingDir} shell=${shell} args=${JSON.stringify(shellArgs)}`);
+    console.log(`[PTY:CREATED] tabId=${tabId} pid=${ptyProcess.pid} cwd=${workingDir} shell=${shell} args=${JSON.stringify(shellArgs)} initialCommand=${initialCommand ? JSON.stringify(initialCommand) : 'none'}`);
 
     terminals.set(tabId, ptyProcess);
     terminalProjects.set(tabId, workingDir);
+    if (typeof projectId === 'string' && projectId) {
+      terminalProjectIds.set(tabId, projectId);
+    }
     terminalCommandState.set(tabId, { isRunning: false, lastExitCode: 0 });
     if (initialCommand) terminalInitialCommand.set(tabId, initialCommand);
     terminalOutputBuffer.set(tabId, { lines: [], maxLines: TERMINAL_OUTPUT_MAX_LINES });
+
+    // If initialCommand provided, wait for shell-integration's first OSC 133;A
+    // (prompt ready) and then write the command. This guarantees:
+    //   1) precmd/preexec hooks are loaded → OSC 133 B will fire on Enter
+    //   2) we don't race the shell startup (writing too early ate by zsh init)
+    //   3) command-finished (OSC 133 D) reaches renderer → green pill clears
+    // Listener self-removes after one fire. Safety timeout 5s in case the user's
+    // .zshrc throws and prompt never arrives — we then just leave the shell idle
+    // (better than blocking forever).
+    if (initialCommand) {
+      let dispatched = false;
+      const tryDispatch = (_evt, evtTabId) => {
+        if (evtTabId !== tabId || dispatched) return;
+        dispatched = true;
+        ipcMain.removeListener('terminal:prompt-ready-internal', tryDispatch);
+        clearTimeout(fallbackTimer);
+        console.log(`[terminal:create] initialCommand dispatch for ${tabId} on OSC 133 A: ${initialCommand}`);
+        try { ptyProcess.write(initialCommand + '\r'); } catch (e) {
+          console.warn(`[terminal:create] write failed: ${e.message}`);
+        }
+      };
+      ipcMain.on('terminal:prompt-ready-internal', tryDispatch);
+      const fallbackTimer = setTimeout(() => {
+        if (dispatched) return;
+        ipcMain.removeListener('terminal:prompt-ready-internal', tryDispatch);
+        console.warn(`[terminal:create] OSC 133 A timeout 5s for ${tabId} — dispatching initialCommand anyway`);
+        dispatched = true;
+        try { ptyProcess.write(initialCommand + '\r'); } catch (e) {
+          console.warn(`[terminal:create] write failed: ${e.message}`);
+        }
+      }, 5000);
+    }
 
     ptyProcess.onData((data) => {
       // Capture output into ring buffer for MCP read_output
@@ -4896,6 +6381,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
       }
       terminals.delete(tabId);
       terminalProjects.delete(tabId);
+      terminalProjectIds.delete(tabId);
       terminalCommandState.delete(tabId);
       terminalInitialCommand.delete(tabId);
       terminalOutputBuffer.delete(tabId);
@@ -4955,6 +6441,37 @@ ipcMain.handle('terminal:create', async (event, { tabId, rows, cols, cwd, initia
 // Bracketed Paste Mode escape sequences
 const PASTE_START = '\x1b[200~';
 const PASTE_END = '\x1b[201~';
+
+// Per-terminal serializer for safePasteAndSubmit. Two concurrent invocations
+// on the same PTY interleave bytes (Ctrl+S, brackets, /commands, Enter from
+// different sources mix together) → Claude TUI submits half-pasted text twice
+// and slash commands get swallowed by an open bracketed-paste of another
+// caller. Was observed in session bb95e71d (2026-05-16): queue runner started
+// a 49156-char paste, user clicked Compact mid-stream — Enter from /compact
+// landed inside the first paste, the big prompt got submitted twice in halves,
+// /compact text ended up as part of the prompt. Fix: chain every safePaste
+// for the same term on a single promise; second caller waits until first
+// returns. WeakMap key on term (no manual cleanup needed when PTY dies).
+const pasteInflight = new WeakMap();
+
+// Per-tab paste audit slot. Filled by safePasteAndSubmit right before Enter is
+// sent. Cleared by the UserPromptSubmit hook handler after comparing the actual
+// last user message in the JSONL transcript against what we sent. Mismatch =>
+// log a [PasteAudit:MISMATCH] line with both lengths/hashes so future paste
+// regressions surface as concrete evidence, not "feels slow/looks wrong".
+// Only the most recent expectation is tracked (Map slot is overwritten per
+// safePasteAndSubmit call) — chained queue items each get their own audit on
+// the next UserPromptSubmit.
+const pendingPasteAudit = new Map();
+
+// Map of term → tabId for the busy broadcast. Filled lazily from `terminals`
+// Map on first paste-busy emit per term.
+function findTabIdForTerm(target) {
+  for (const [tabId, t] of terminals) {
+    if (t === target) return tabId;
+  }
+  return null;
+}
 
 // ============================================================
 // Safe Paste + Echo Verification for PTY
@@ -5064,8 +6581,31 @@ function waitForPtyText(term, textOrRegex, timeoutMs = 5000, logPrefix = '') {
   });
 }
 
-// Main helper: chunked paste + sync marker verification + optional submit
+// Main helper: chunked paste + sync marker verification + optional submit.
+// Wraps the actual work in a per-term promise chain so two concurrent callers
+// can't interleave bytes on the same PTY. See pasteInflight comment above.
 async function safePasteAndSubmit(term, content, options = {}) {
+  if (!term || typeof term.write !== 'function') {
+    const logPrefix = options.logPrefix || '[safePaste]';
+    console.log(logPrefix + ' ❌ Terminal not available');
+    return { success: false, error: 'terminal not available' };
+  }
+  const prev = pasteInflight.get(term) || Promise.resolve();
+  // Swallow prev errors so one failure doesn't poison every subsequent caller.
+  const work = prev.catch(() => {}).then(() => _safePasteAndSubmitInner(term, content, options));
+  pasteInflight.set(term, work);
+  try {
+    return await work;
+  } finally {
+    // Only delete the slot if WE were the last writer — otherwise a newer
+    // caller has already chained on top of us and we'd nuke their entry.
+    if (pasteInflight.get(term) === work) {
+      pasteInflight.delete(term);
+    }
+  }
+}
+
+async function _safePasteAndSubmitInner(term, content, options = {}) {
   const {
     submit = true,
     ctrlCFirst = false,
@@ -5073,22 +6613,59 @@ async function safePasteAndSubmit(term, content, options = {}) {
     dismissAutocomplete = false, // Send Esc after paste to close slash-cmd autocomplete dropdown
     logPrefix = '[safePaste]',
     safetyTimeoutMs = 8000,
-    chunkRenderTimeoutMs = null, // Override per-chunk waitForRender timeout. Null = use safetyTimeoutMs.
     fast = false // Turbo mode for Gemini/Bash (skip render waits)
   } = options;
 
   // TTYHOG on macOS = 1024 bytes. Paste brackets = 12 bytes. Leave margin.
+  // Only used in fast-mode (Gemini/bash) where Ink isn't involved and we don't
+  // need per-chunk render confirmation. Slow-mode (Claude) writes the whole
+  // payload as a single bracket pair — see "Single-write strategy" below.
   const CHUNK_MAX = 900;
 
-  if (!term || typeof term.write !== 'function') {
-    console.log(logPrefix + ' ❌ Terminal not available');
-    return { success: false, error: 'terminal not available' };
-  }
+  // Broadcast paste-busy so UI buttons (Compact/Model/Effort/Think) can grey
+  // out while another caller is mid-paste. Belt-and-braces fix on top of the
+  // mutex: if a button click reaches send-command anyway, the mutex serializes
+  // it — but a disabled button gives the user immediate feedback that nothing
+  // will happen mid-stream.
+  const broadcastTabId = findTabIdForTerm(term);
+  const emitBusy = (busy) => {
+    if (!broadcastTabId) return;
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('claude:paste-busy', { tabId: broadcastTabId, busy });
+    }
+  };
+  emitBusy(true);
+  try {
 
-  // Split content into chunks
+  // Chunking strategy:
+  //   fast=true  (Gemini/bash) — split by CHUNK_MAX, write back-to-back, no waits.
+  //   fast=false (Claude Ink)  — single write of the whole payload wrapped in one
+  //                              bracket pair. No per-chunk render waits.
+  //
+  // Why slow-mode no longer chunks:
+  //   Earlier implementation split the payload into 900-byte chunks and called
+  //   waitForRender after each (up to safetyTimeoutMs=8000ms). On a 50 KB queue
+  //   prompt (56 chunks), 53 of those waits hit the full 1000ms timeout because
+  //   Ink does NOT emit \x1b[?2026l mid-paste while \x1b[200~ is still open —
+  //   it batches the render until \x1b[201~ closes the paste. Net effect: 57 s
+  //   gap between "Run after" firing and Claude receiving the prompt; user
+  //   thought the queue silently failed.
+  //
+  //   node-pty 1.2.0-beta.13 (PR #831) reliably writes >TTYHOG via fs.write
+  //   with EAGAIN retry, so a single 50 KB term.write() no longer drops bytes
+  //   on macOS. Manual Cmd+V already takes this path and lands as one chip
+  //   instantly — slow-mode now mirrors that behaviour.
+  //
+  //   Fact reference: docs/knowledge/fact-claude-tui-mechanics.md §4 (single
+  //   bracket pair) + §9 (alt-screen DEC ?2004 loss). See also fix-claude-
+  //   paste-stuck-queue.md for the 57s repro.
   const chunks = [];
-  for (let i = 0; i < content.length; i += CHUNK_MAX) {
-    chunks.push(content.substring(i, i + CHUNK_MAX));
+  if (fast) {
+    for (let i = 0; i < content.length; i += CHUNK_MAX) {
+      chunks.push(content.substring(i, i + CHUNK_MAX));
+    }
+  } else {
+    chunks.push(content); // Slow-mode = single chunk = single bracket pair = single write.
   }
 
   const t0 = Date.now();
@@ -5141,55 +6718,45 @@ async function safePasteAndSubmit(term, content, options = {}) {
   const renderTimes = [];
 
   // Bracketed Paste wrapping strategy:
-  // - fast mode (Gemini/bash): single bracket pair across ALL chunks → CLI sees one atomic paste
-  //   Chunk 1: \x1b[200~ + text, Chunk 2..N-1: text, Chunk N: text + \x1b[201~
-  // - slow mode (Claude Ink TUI): each chunk wrapped individually → Ink renders after each,
-  //   sync marker confirms before next chunk
-  //   Each chunk: \x1b[200~ + text + \x1b[201~
+  //   slow-mode (Claude Ink): chunks.length === 1 by construction → one write,
+  //     one PASTE_START + payload + PASTE_END pair → Ink sees one atomic paste,
+  //     emits one [Pasted text #N] chip. waitForRender is called once AFTER the
+  //     write (not per-chunk) so we still confirm Ink ingested the bytes before
+  //     pressing Enter.
+  //   fast-mode (Gemini/bash): chunks > 1 possible, write back-to-back. First
+  //     chunk gets PASTE_START, last gets PASTE_END. No waits between chunks.
+  // Verified against fact-claude-tui-mechanics.md §4.
 
   for (let i = 0; i < chunks.length; i++) {
     const chunk = chunks[i];
-    let payload;
-
-    if (fast) {
-      // Single bracket pair across all chunks
-      payload = chunk;
-      if (i === 0) payload = PASTE_START + payload;
-      if (i === chunks.length - 1) payload = payload + PASTE_END;
-    } else {
-      // Per-chunk wrapping for Ink TUI sync marker verification
-      payload = PASTE_START + chunk + PASTE_END;
-    }
-
-    if (!fast && i > 0) {
-      await new Promise(r => setTimeout(r, 50));
-    }
+    let payload = chunk;
+    if (i === 0) payload = PASTE_START + payload;
+    if (i === chunks.length - 1) payload = payload + PASTE_END;
 
     const startTime = Date.now();
-    let renderPromise = null;
-
-    if (!fast) {
-       renderPromise = waitForRender(term, chunkRenderTimeoutMs || safetyTimeoutMs, logPrefix + ':chunk' + (i + 1));
-    }
 
     term.write(payload);
-    if (renderPromise && renderPromise.markWriteTime) {
-      // Reset stale-threshold baseline so markers from THIS write are not
-      // discarded as "<15ms after subscription". Ink can render a short paste
-      // (<20 bytes) in 5-17ms — our paste marker arrives faster than the
-      // stale threshold catches it.
-      renderPromise.markWriteTime();
-    }
 
-    if (!fast && renderPromise) {
-      const chunkResult = await renderPromise;
-      console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] Chunk ' + (i + 1) + '/' + chunks.length + ' render: timedOut=' + chunkResult.timedOut + ' stale=' + (chunkResult.isStale || false) + ' elapsed=' + (chunkResult.elapsedMs || 'n/a') + 'ms');
-    } else {
-      // In fast mode, tiny tick every 10 chunks to prevent node-pty buffer flooding
-      if (i % 10 === 0) await new Promise(r => setTimeout(r, 5));
+    // Fast-mode: tiny tick every 10 chunks to prevent node-pty buffer flooding.
+    // Slow-mode: nothing here — single chunk, post-write drain handled below.
+    if (fast && i > 0 && i % 10 === 0) {
+      await new Promise(r => setTimeout(r, 5));
     }
 
     renderTimes.push(Date.now() - startTime);
+  }
+
+  // Slow-mode: ONE waitForRender for the whole paste. Ink batches all renders
+  // until \x1b[201~ closes the paste, then emits exactly one \x1b[?2026l. This
+  // is the deterministic signal that the chip is fully placed in input and
+  // Enter will submit a complete prompt. Without this wait, large pastes (50 KB+)
+  // can race Enter — Claude submits before the chip is fully rendered, leaving
+  // half the bytes still in Ink's paste buffer.
+  if (!fast) {
+    const render = waitForRender(term, safetyTimeoutMs, logPrefix + ':paste');
+    render.markWriteTime(); // baseline = post-write, not subscription-time
+    const r = await render;
+    console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] Paste render: timedOut=' + r.timedOut + ' elapsed=' + (r.elapsedMs || 'n/a') + 'ms');
   }
 
   if (submit) {
@@ -5207,6 +6774,32 @@ async function safePasteAndSubmit(term, content, options = {}) {
         await new Promise(r => setTimeout(r, 10));
       }
     }
+
+    // Stage paste audit BEFORE Enter so the UserPromptSubmit hook can compare
+    // what Claude actually saw against what we tried to send. Only meaningful
+    // for slow-mode (Claude TUI) — fast-mode targets Gemini/bash which don't
+    // run our hook. Length + sha-prefix is enough to spot truncation/corruption
+    // without writing the whole prompt to disk. Stored per-tab; overwritten by
+    // the next safePasteAndSubmit on the same tab so we always audit the most
+    // recent send. Consumed (deleted) by the hook handler post-comparison.
+    if (!fast && broadcastTabId) {
+      try {
+        const crypto = require('crypto');
+        const expectedHash = crypto.createHash('sha1').update(content).digest('hex').slice(0, 16);
+        pendingPasteAudit.set(broadcastTabId, {
+          expectedLen: content.length,
+          expectedHash,
+          headPreview: content.substring(0, 80).replace(/\s+/g, ' '),
+          tailPreview: content.substring(Math.max(0, content.length - 80)).replace(/\s+/g, ' '),
+          sentAt: Date.now(),
+          logPrefix,
+        });
+        console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] [PasteAudit] staged expectedLen=' + content.length + ' hash=' + expectedHash);
+      } catch (e) {
+        console.warn(logPrefix + ' [PasteAudit] stage failed:', e.message);
+      }
+    }
+
     if (fast) {
       // Fast mode: fixed delay (Gemini/bash don't use Ink sync)
       console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] Waiting 500ms before Enter (fast mode)...');
@@ -5223,6 +6816,10 @@ async function safePasteAndSubmit(term, content, options = {}) {
   }
 
   return { success: true, chunksTotal: chunks.length, renderTimeMs: renderTimes };
+
+  } finally {
+    emitBusy(false);
+  }
 }
 
 // Get Gemini response queue state (for renderer initial load)
@@ -5292,40 +6889,7 @@ ipcMain.on('terminal:input', async (event, tabId, data) => {
     console.log('[ClaudeAgent:Arm] Tab ' + tabId + ': Armed (first user input)');
   }
 
-  // Interrupt watchdog — see comment on claudeInterruptWatchdog declaration.
-  // When user sends Esc (\x1b) or Ctrl+C (\x03) to a tab whose Claude turn is
-  // currently in flight (per Stop hook), arm a 2s fallback timer to force
-  // busy=false. If a real Stop hook arrives before the timer fires it cancels
-  // the timer (via Stop hook handler below clearing claudeInterruptWatchdog).
-  if ((data === '\x1b' || data === '\x03' || data.includes('\x1b') || data.includes('\x03'))
-      && claudeTurnBusy.get(tabId) === true
-      && !claudeInterruptWatchdog.has(tabId)) {
-    const t = setTimeout(() => {
-      claudeInterruptWatchdog.delete(tabId);
-      // Re-check: if Stop hook arrived during the 2s wait, claudeTurnBusy was
-      // already flipped to false. Don't re-emit busy=false redundantly.
-      if (claudeTurnBusy.get(tabId) !== true) return;
-      console.warn('[ClaudeInterrupt] tab=' + tabId.slice(-12) + ': no Stop hook within ' + CLAUDE_INTERRUPT_WATCHDOG_MS + 'ms after Esc/Ctrl+C — forcing busy=false');
-      claudeTurnBusy.set(tabId, false);
-      claudeSpinnerBusy.set(tabId, false);
-      clearTimeout(claudeTurnWatchdog.get(tabId));
-      claudeTurnWatchdog.delete(tabId);
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('claude:busy-state', { tabId, busy: false });
-        // Synthesize a Stop event so renderer-side consumers (PromptQueueRunner)
-        // see a turn-end edge transition and trigger queue logic / stopAfter.
-        mainWindow.webContents.send('claude:turn-state', {
-          tabId, sessionId: bridgeKnownSessions.get(tabId) || null,
-          event: 'InterruptStop', busy: false, success: false,
-          lastAssistantMessage: null,
-        });
-      }
-    }, CLAUDE_INTERRUPT_WATCHDOG_MS);
-    claudeInterruptWatchdog.set(tabId, t);
-    console.log('[ClaudeInterrupt] tab=' + tabId.slice(-12) + ': Esc/Ctrl+C detected mid-turn, watchdog armed (' + CLAUDE_INTERRUPT_WATCHDOG_MS + 'ms)');
-  }
-
-  // User paste (Cmd+V) — direct passthrough, no chunking needed.
+// User paste (Cmd+V) — direct passthrough, no chunking needed.
   if (data.length > 1) {
     const endsWithR = data.endsWith('\r');
     const endsWithN = data.endsWith('\n');
@@ -5375,6 +6939,58 @@ ipcMain.on('terminal:input', async (event, tabId, data) => {
     console.log('[ClaudeAgent:Input] Tab ' + tabId + ': User input contains :::claude, suppressing detection for 5s');
   }
 
+  // === [PasteDiag] Detailed paste diagnostics for >1KB input ===
+  // No rerouting — we just pass the bytes through to term.write() exactly like
+  // iTerm2 does. The diagnostics tell us, on the next paste race, what state
+  // Claude TUI saw: whether xterm.js wrapped this in \x1b[200~ at all, how many
+  // bracket markers ended up inside (e.g. partial earlier paste leaking out),
+  // and how many \r bytes are embedded (each one is a potential Enter submit
+  // inside a non-bracketed long paste). Goes to a single [PasteDiag] line that
+  // dev.log dedupe groups cleanly.
+  if (data.length > 1000) {
+    const startsWithB = data.startsWith('\x1b[200~');
+    const endsWithB = data.endsWith('\x1b[201~');
+    let startCount = 0, endCount = 0, crCount = 0, lfCount = 0;
+    for (let pdi = 0; pdi < data.length; pdi++) {
+      const cc = data.charCodeAt(pdi);
+      if (cc === 13) crCount++;
+      else if (cc === 10) lfCount++;
+      else if (cc === 27 && pdi + 5 < data.length) {
+        // Cheap escape check: \x1b[200~ or \x1b[201~
+        if (data.charCodeAt(pdi + 1) === 91 /* [ */ &&
+            data.charCodeAt(pdi + 2) === 50 /* 2 */ &&
+            data.charCodeAt(pdi + 3) === 48 /* 0 */ &&
+            data.charCodeAt(pdi + 5) === 126 /* ~ */) {
+          const fourth = data.charCodeAt(pdi + 4);
+          if (fourth === 48) startCount++; // 0
+          else if (fourth === 49) endCount++; // 1
+        }
+      }
+    }
+    const head = [];
+    for (let hi = 0; hi < Math.min(40, data.length); hi++) {
+      const cc = data.charCodeAt(hi);
+      head.push(cc < 32 || cc === 127 ? 'x' + cc.toString(16) : data[hi]);
+    }
+    const tail = [];
+    for (let ti = Math.max(0, data.length - 40); ti < data.length; ti++) {
+      const cc = data.charCodeAt(ti);
+      tail.push(cc < 32 || cc === 127 ? 'x' + cc.toString(16) : data[ti]);
+    }
+    console.log('[PasteDiag] tab=' + tabId + ' len=' + data.length
+      + ' startsWith200=' + startsWithB + ' endsWith201=' + endsWithB
+      + ' embed200=' + startCount + ' embed201=' + endCount
+      + ' cr=' + crCount + ' lf=' + lfCount
+      + ' head=[' + head.join('') + ']'
+      + ' tail=[' + tail.join('') + ']');
+  }
+
+  // Pass-through. iTerm2 and friends do exactly this. If Claude TUI has bracketed
+  // paste mode enabled (DEC 2004), it sees \x1b[200~...\x1b[201~ around the
+  // payload and produces ONE [Pasted text #N] chip regardless of how the kernel
+  // chunked the bytes. If DEC 2004 is OFF on Claude's side at the moment of
+  // paste, that's a Claude TUI quirk we don't paper over here — it's the same
+  // behavior the user would see in iTerm2 / Terminal.app.
   term.write(data);
 });
 
@@ -5461,6 +7077,16 @@ async function captureClaudeInput(tabId, mode) {
 
   const claudePid = findClaudePidByTab(tabId);
   if (claudePid) {
+    // Verify the cached PID still maps to a live process. If user restarted Claude in shell
+    // (Ctrl+C → claude --resume) without going through our Bridge:Fresh path, bridgePidCache
+    // holds a dead PID — the lock-file would be written under the dead PID's name and the
+    // live Claude would never find it. Result: silent timeout → "Helper not reachable".
+    let alive = true;
+    try { process.kill(claudePid, 0); } catch (e) { if (e.code === 'ESRCH') alive = false; }
+    if (!alive) {
+      console.warn('[capture-input:' + mode + '] Tab ' + tabId.slice(-12) + ': stale claudePid=' + claudePid + ' (process gone) — bridge cache out of sync, asking renderer to restart Claude');
+      return { success: false, error: 'stale_pid', claudePid };
+    }
     const editor = await readProcessEditor(claudePid);
     if (editor && !editor.includes('noted-code-grab')) {
       console.warn('[capture-input:' + mode + '] Tab ' + tabId.slice(-12) + ': wrong EDITOR=' + editor + ' — restart Claude in this tab');
@@ -5469,13 +7095,28 @@ async function captureClaudeInput(tabId, mode) {
   }
 
   if (grabInputPending.has(tabId)) return { success: false, error: 'already_in_progress' };
-  if (claudeTurnBusy.get(tabId) === true) return { success: false, error: 'claude_busy' };
+  // Intentionally do NOT pre-block on claudeSpinnerBusy: Claude's Ctrl+G
+  // binding works mid-stream as long as there is a draft in the input box —
+  // that's the whole point of the queue (grab + queue while Claude is still
+  // typing). Only block when the Stop-hook actually reports turn-in-flight,
+  // because in that very narrow window Ctrl+G IS a no-op. If timeout fires,
+  // the warn-log below classifies the cause (turn/spinner/silent helper) so
+  // the toast can be honest.
 
   // Write the lock-file that tells the helper which side-effect to apply.
   // Helper consumes (unlinks) it on read, so a stale lock can't fire next time.
+  //
+  // CRITICAL: include this main's PID-specific socket path in the lock. Without
+  // it, when dev+prod both have the same cwd open (`/Users/.../custom-terminal`),
+  // helper's discovery-based routing has no tie-breaker — picks one arbitrarily,
+  // delivers to the wrong main, our `grabInputPending` here times out → false
+  // "Helper never reported back" toast. Lock-file is the authoritative channel:
+  // the main process that wrote the lock IS the main that triggered Ctrl+G and
+  // owns the pending grab. Helper reads `sock` from the lock and connects there
+  // unconditionally — same-cwd ambiguity becomes impossible.
   if (claudePid) {
     try {
-      fs.writeFileSync('/tmp/noted-grab-' + claudePid + '.json', JSON.stringify({ mode, ts: Date.now() }));
+      fs.writeFileSync('/tmp/noted-grab-' + claudePid + '.json', JSON.stringify({ mode, ts: Date.now(), sock: CLAUDE_HOOK_SOCK }));
     } catch (e) {
       console.warn('[capture-input:' + mode + '] lock write failed:', e.message);
       return { success: false, error: 'lock_write_failed' };
@@ -5485,16 +7126,37 @@ async function captureClaudeInput(tabId, mode) {
     return { success: false, error: 'no_claude_pid' };
   }
 
+  // Snapshot helper-log size BEFORE sending Ctrl+G. NOTED_GRAB_DEBUG=1 is
+  // always set in PTY env, so helper appends ~3-5 lines whenever it runs.
+  // If after the timeout the log size is unchanged → helper did NOT start →
+  // Ctrl+G was a no-op (almost always = Claude was mid-stream and ignored it).
+  // We surface this as `claude_busy` so the toast is honest instead of pointing
+  // the user at a working hook script. See fix-claude-hook-silent-dropouts.md.
+  const helperLog = '/tmp/noted-grab-helper.log';
+  let helperLogSizeBefore = -1;
+  try { helperLogSizeBefore = fs.statSync(helperLog).size; } catch {}
+
   return new Promise((resolve) => {
     const timer = setTimeout(() => {
       grabInputPending.delete(tabId);
       // Clean up the lock if helper never ran (e.g. PTY broken)
       try { fs.unlinkSync('/tmp/noted-grab-' + claudePid + '.json'); } catch {}
-      console.warn('[capture-input:' + mode + '] Tab ' + tabId.slice(-12) + ': timeout');
-      resolve({ success: false, error: 'editor_not_wired' });
+      let helperLogSizeAfter = -1;
+      let helperLogMtime = '';
+      try {
+        const s = fs.statSync(helperLog);
+        helperLogSizeAfter = s.size;
+        helperLogMtime = new Date(s.mtimeMs).toISOString();
+      } catch {}
+      const helperRan = helperLogSizeAfter > helperLogSizeBefore;
+      // Classify the failure: helper-log unchanged = Claude TUI ate the Ctrl+G
+      // (mid-stream); helper-log grew = helper ran but socket roundtrip failed.
+      const error = helperRan ? 'editor_not_wired' : 'claude_busy';
+      console.warn('[capture-input:' + mode + '] Tab ' + tabId.slice(-12) + ': timeout (3000ms) → ' + error + ' (helperRan=' + helperRan + ' logBefore=' + helperLogSizeBefore + ' logAfter=' + helperLogSizeAfter + ' mtime=' + helperLogMtime + ') turnBusy=' + claudeTurnBusy.get(tabId) + ' spinnerBusy=' + claudeSpinnerBusy.get(tabId) + ' pid=' + claudePid);
+      resolve({ success: false, error });
     }, 3000);
     grabInputPending.set(tabId, { resolve, timer, mode });
-    console.log('[capture-input:' + mode + '] Tab ' + tabId.slice(-12) + ': sending Ctrl+G');
+    console.log('[capture-input:' + mode + '] Tab ' + tabId.slice(-12) + ': sending Ctrl+G pid=' + claudePid + ' helperLogBefore=' + helperLogSizeBefore);
     term.write('\x07'); // Ctrl+G → chat:externalEditor
   });
 }
@@ -5510,11 +7172,13 @@ ipcMain.handle('claude:clear-input', async (event, tabId) => {
   const term = terminals.get(tabId);
   if (!term) return { success: false, error: 'no_terminal' };
   if (!bridgeKnownSessions.has(tabId)) return { success: false, error: 'no_claude_session' };
+  // Same policy as captureClaudeInput: only block on hook-confirmed turn busy.
+  // Spinner-busy mid-stream still accepts Ctrl+G — see fix-claude-hook-silent-dropouts.md
   if (claudeTurnBusy.get(tabId) === true) return { success: false, error: 'claude_busy' };
   const claudePid = findClaudePidByTab(tabId);
   if (!claudePid) return { success: false, error: 'no_claude_pid' };
   try {
-    fs.writeFileSync('/tmp/noted-grab-' + claudePid + '.json', JSON.stringify({ mode: 'clear', ts: Date.now() }));
+    fs.writeFileSync('/tmp/noted-grab-' + claudePid + '.json', JSON.stringify({ mode: 'clear', ts: Date.now(), sock: CLAUDE_HOOK_SOCK }));
   } catch (e) {
     return { success: false, error: 'lock_write_failed' };
   }
@@ -5551,7 +7215,6 @@ ipcMain.handle('claude:send-command', async (event, tabId, command) => {
     // /effort low) don't match any prefix beyond the slash — autocomplete is empty
     // by the time we send Enter, so PromptInput.onSubmit guard passes. Sending Esc
     // here triggers Claude's "Esc again to clear" hint, visible briefly under input.
-    chunkRenderTimeoutMs: 1000,
     logPrefix: '[send-command:' + tabId + ']'
   });
 });
@@ -6591,6 +8254,15 @@ ipcMain.handle('project:delete-tab-history-entry', (event, { id }) => {
   return { success: true };
 });
 
+// Shift+Cmd+T reopen — atomically pops the latest closed-tab record for a
+// project. Renderer recreates the tab from the returned metadata (cwd, name,
+// claudeSessionId, processWasRunning, position) and the record disappears from
+// History so repeated hotkey presses walk backwards through the archive.
+ipcMain.handle('project:reopen-last-closed-tab', (event, { projectId }) => {
+  const row = projectManager.db.popLatestTabHistory(projectId);
+  return { success: true, entry: row };
+});
+
 // ========== FAVORITES ==========
 
 ipcMain.handle('project:add-favorite', (event, { projectId, tab }) => {
@@ -6979,10 +8651,12 @@ ipcMain.handle('system:dump-claude-state', async () => {
     ...bridgeKnownSessions.keys(),
     ...pidByTab.keys(),
     ...claudeTurnWatchdog.keys(),
-    ...claudeInterruptWatchdog.keys(),
+    ...claudeInterruptWatchers.keys(),
+    ...claudeHookLastEvent.keys(),
   ]);
-  const dump = {};
+  const dump = { _hook: { connSeq: claudeHookConnSeq, eventSeq: claudeHookEventSeq, sockPath: CLAUDE_HOOK_SOCK, serverAlive: !!claudeHookServer }, _tabs: {} };
   const { execSync } = require('child_process');
+  const now = Date.now();
   for (const tabId of allTabs) {
     const pid = pidByTab.get(tabId);
     let pidAlive = null;
@@ -6990,14 +8664,16 @@ ipcMain.handle('system:dump-claude-state', async () => {
       try { execSync('kill -0 ' + pid + ' 2>/dev/null'); pidAlive = true; }
       catch { pidAlive = false; }
     }
-    dump[tabId] = {
+    const last = claudeHookLastEvent.get(tabId);
+    dump._tabs[tabId] = {
       claudeTurnBusy: claudeTurnBusy.get(tabId),
       claudeSpinnerBusy: claudeSpinnerBusy.get(tabId),
       sessionId: bridgeKnownSessions.get(tabId) || null,
       claudePid: pid || null,
       pidAlive,
       turnWatchdog: claudeTurnWatchdog.has(tabId),
-      interruptWatchdog: claudeInterruptWatchdog.has(tabId),
+      interruptWatcher: claudeInterruptWatchers.has(tabId),
+      lastHookEvent: last ? { event: last.event, ageMs: now - last.ts } : null,
     };
   }
   console.log('[Diag:Dump] ' + JSON.stringify(dump));
@@ -8313,7 +9989,7 @@ ipcMain.on('claude:fork-session', async (event, { tabId, existingSessionId, cwd 
 // ========== CLAUDE COMMAND RUNNER (from UI buttons) ========== 
 // This handles claude commands triggered from InfoPanel buttons
 // bypassing the terminal input interception (which only works for keyboard Enter)
-ipcMain.on('claude:run-command', (event, { tabId, command, sessionId, forkSessionId, prompt }) => {
+ipcMain.on('claude:run-command', (event, { tabId, command, sessionId, forkSessionId, prompt, cdTo }) => {
   console.log('[Claude Runner] Command:', command, 'Tab:', tabId, 'Prompt:', prompt ? `${prompt.slice(0, 50)}...` : 'none');
 
   const term = terminals.get(tabId);
@@ -8352,7 +10028,7 @@ ipcMain.on('claude:run-command', (event, { tabId, command, sessionId, forkSessio
     case 'claude-c':
       // Continue session
       if (sessionId) {
-        console.log('[Claude Runner] Continuing session:', sessionId);
+        console.log('[Claude Runner] Continuing session:', sessionId, cdTo ? '(cd ' + cdTo + ')' : '');
         // Enable thinking mode detection (will send Tab when '>' prompt appears)
         claudeState.set(tabId, 'WAITING_PROMPT');
 
@@ -8362,7 +10038,17 @@ ipcMain.on('claude:run-command', (event, { tabId, command, sessionId, forkSessio
           console.log('[Claude Runner] Resume prompt queued, will send after prompt detected');
         }
 
-        term.write(`claude --dangerously-skip-permissions --resume ${sessionId}\r`);
+        // Optional cd: `claude --resume <uuid>` matches by project-slug derived from cwd.
+        // Resuming a session that originated in a different project requires us to land
+        // in that directory first; otherwise Claude reports "No conversation found".
+        // Compose `cd "<path>" && claude ...` in one line so the user can't intercept.
+        let cmdLine = `claude --dangerously-skip-permissions --resume ${sessionId}`;
+        if (cdTo && typeof cdTo === 'string' && cdTo.trim()) {
+          // Single-quote escaping: replace any ' inside the path with '\'' before wrapping.
+          const safe = cdTo.replace(/'/g, "'\\''");
+          cmdLine = `cd '${safe}' && ${cmdLine}`;
+        }
+        term.write(cmdLine + '\r');
         claudeCliActive.set(tabId, true);
         console.log('[Claude Runner] claudeCliActive SET for tab', tabId, '(claude-c)');
 
@@ -8584,6 +10270,50 @@ function _webBroadcast(tabId, payload) {
   try { require(path.join(srcMainDir, 'web-server')).webBroadcast(tabId, payload); } catch {}
 }
 
+// Validate that a session UUID actually has a resumable conversation in
+// Claude's JSONL store. Bug we hit: tab.claudeSessionId could be stale (we
+// captured it once, but Claude later forgot the conversation — the JSONL
+// either doesn't exist or only has our own metadata records). Without this
+// check `query({resume: <staleId>})` rejects with "No conversation found".
+//
+// Heuristic: file exists AND contains at least one record with a `type` of
+// `user` or `assistant`. Our project metadata writes (ai-title, last-prompt,
+// queue-operation) DO populate the file but don't make it resumable for SDK.
+function isResumableSession(sessionUuid, cwd) {
+  if (!sessionUuid) return false;
+  try {
+    // Use existing findSessionFile — it knows Claude's slug rules and also
+    // scans ALL projects when the cwd-based slug doesn't match (handles
+    // moved/renamed project paths). Hand-rolling slug as `'-' + cwd.replace(/\//g, '-')`
+    // produced a DOUBLE leading dash (`--Users-fedor-...`), which never matched
+    // any real project dir → every resume check failed → every turn started
+    // fresh → infinite loop of zero-context sessions. Logs showed:
+    //   sessionId captured: ee6e0db6
+    //   send-message resume=ee6e0db6 → "stale" → starting fresh
+    //   sessionId captured: 5acd120b
+    //   send-message resume=5acd120b → "stale" → starting fresh
+    // Even though both JSONLs existed AND contained user/assistant records.
+    const found = findSessionFile(sessionUuid, cwd || process.cwd());
+    if (!found) return false;
+    // Cheap read: stop after first user/assistant line. Files we ourselves
+    // wrote (ai-title/last-prompt/queue-operation only) are not resumable
+    // for SDK — Claude needs at least one user OR assistant record.
+    const data = fs.readFileSync(found.filePath, 'utf8');
+    const lines = data.split('\n');
+    for (const line of lines) {
+      if (!line) continue;
+      try {
+        const obj = JSON.parse(line);
+        if (obj && (obj.type === 'user' || obj.type === 'assistant')) return true;
+      } catch { /* skip malformed */ }
+    }
+    return false;
+  } catch (err) {
+    console.warn('[ClaudeSDK] isResumableSession check failed:', err.message);
+    return false;
+  }
+}
+
 // Shared function: start SDK query and stream results to renderer
 async function sdkStartQuery(tabId, cwd, prompt, resumeSessionId, model, effort, thinking) {
   // Close existing query if still running (prevents dual streaming loops)
@@ -8612,8 +10342,15 @@ async function sdkStartQuery(tabId, cwd, prompt, resumeSessionId, model, effort,
     thinking: { type: thinkingMode },
     mcpServers,
   };
-  if (resumeSessionId) {
+  // Resume only if the session JSONL actually has a resumable conversation.
+  // Caller-supplied `resumeSessionId` can be stale (caller is renderer/mobile
+  // reading from store/cache that hasn't seen Claude's session-rotation).
+  // Without this guard SDK throws "No conversation found with session ID".
+  if (resumeSessionId && isResumableSession(resumeSessionId, cwd)) {
     options.resume = resumeSessionId;
+  } else if (resumeSessionId) {
+    console.warn('[ClaudeSDK] stale resumeSessionId ' + resumeSessionId.slice(0, 8) + ' — JSONL missing or empty, starting fresh');
+    resumeSessionId = null;
   }
 
   const q = query({ prompt, options });
@@ -8638,9 +10375,43 @@ async function sdkStartQuery(tabId, cwd, prompt, resumeSessionId, model, effort,
   // Stream messages to renderer (fire-and-forget)
   (async () => {
     try {
+      let staleResumeRetry = null; // { reason, originalSessionId } if recovery needed
       for await (const message of q) {
         const win = BrowserWindow.getAllWindows()[0];
         if (!win || win.isDestroyed()) break;
+
+        // [SlashProbe] Every message that crosses main→renderer boundary,
+        // with enough shape to identify local_command_output / compact /
+        // permission-request / any other system subtype we don't currently
+        // handle. Full payload (capped) is dumped — if SDK is intercepting
+        // slash-commands locally it surfaces HERE as type:'system'.
+        try {
+          const m = message;
+          const summary = {
+            type: m?.type,
+            subtype: m?.subtype,
+            is_error: m?.is_error,
+            uuid: m?.uuid?.slice?.(0, 8),
+            sessionId: m?.session_id?.slice?.(0, 8),
+            // Assistant content shape — for normal turns
+            contentTypes: Array.isArray(m?.message?.content)
+              ? m.message.content.map(b => b?.type).join(',')
+              : typeof m?.message?.content === 'string' ? 'string' : null,
+            // System message body — for local_command_output etc.
+            hasContent: typeof m?.content === 'string' ? `${m.content.length}ch` : null,
+            // Anything else that might be relevant
+            allKeys: Object.keys(m || {}).join(','),
+          };
+          console.log('[SlashProbe] tabId=' + tabId.slice(-12) + ' msg=' + JSON.stringify(summary));
+          // If it's a system message — dump the full content (capped at 800
+          // chars) so we can see exactly what /usage etc. produce.
+          if (m?.type === 'system') {
+            const fullDump = JSON.stringify(m).slice(0, 800);
+            console.log('[SlashProbe] tabId=' + tabId.slice(-12) + ' SYSTEM_FULL=' + fullDump);
+          }
+        } catch (e) {
+          console.warn('[SlashProbe] log failed:', e.message);
+        }
 
         // Capture sessionId from first message that has it
         if (message.session_id && !session.sessionId) {
@@ -8648,8 +10419,37 @@ async function sdkStartQuery(tabId, cwd, prompt, resumeSessionId, model, effort,
           console.log('[ClaudeSDK] sessionId captured: ' + session.sessionId);
         }
 
+        // Detect "stale resume" error: SDK delivers it as a regular result
+        // event rather than throwing. Pattern: type=result, subtype=error,
+        // result text contains "No conversation found". On match, drop the
+        // error from UI, retry the original prompt without resume.
+        const isStaleResume = message?.type === 'result'
+          && (message.subtype === 'error' || message.is_error)
+          && /No conversation found/i.test(String(message.result || ''));
+        if (isStaleResume && resumeSessionId) {
+          console.warn('[ClaudeSDK] stale resume detected mid-stream: ' + resumeSessionId.slice(0, 8) + ' — will retry without resume');
+          staleResumeRetry = { reason: 'stale-resume', originalSessionId: resumeSessionId };
+          // Don't forward the error event — UI gets a clean retry instead.
+          break;
+        }
+
         win.webContents.send('claude-sdk:message', { tabId, message, sessionId: session.sessionId || message.session_id });
         _webBroadcast(tabId, { type: 'message', message, sessionId: session.sessionId || message.session_id });
+      }
+
+      // Run retry AFTER the iterator closes naturally (SDK iterator is in a
+      // weird state if we throw out of it). New query with the SAME prompt,
+      // no resume → Claude starts fresh, user sees the prompt go through.
+      if (staleResumeRetry) {
+        sdkSessions.delete(tabId);
+        // Notify renderer to clear stale tab.claudeSessionId so future
+        // prompts don't replay the same stale-resume cycle.
+        const win = BrowserWindow.getAllWindows()[0];
+        if (win && !win.isDestroyed()) {
+          win.webContents.send('claude-sdk:stale-resume-cleared', { tabId, staleSessionId: staleResumeRetry.originalSessionId });
+        }
+        await sdkStartQuery(tabId, cwd, prompt, null, model, effort, thinking);
+        return;
       }
     } catch (err) {
       if (err.name !== 'AbortError') {
@@ -8687,18 +10487,34 @@ ipcMain.handle('claude-sdk:create-session', async (event, { tabId, cwd, prompt, 
   }
 });
 
-ipcMain.handle('claude-sdk:send-message', async (event, { tabId, cwd, prompt, model, effort, thinking }) => {
-  console.log('[ClaudeSDK] send-message tabId=' + tabId + ' effort=' + effort + ' thinking=' + thinking);
+ipcMain.handle('claude-sdk:send-message', async (event, { tabId, cwd, prompt, model, effort, thinking, resumeSessionId }) => {
+  // Resume priority (high → low):
+  //   1) caller-supplied `resumeSessionId` — comes from store/cache (persistent)
+  //   2) `sdkSessions.get(tabId).sessionId` — only set during an ACTIVE stream;
+  //      the Map is wiped in the `finally` of sdkStartQuery, so this only ever
+  //      matches if the user fires send-message while a previous turn is still
+  //      streaming (rare race).
+  //
+  // Why caller-supplied first: the in-memory Map cleared between turns, so
+  // before this fix every turn started with `?--resume=null` → fresh JSONL,
+  // fresh sessionId, Claude with no memory of the previous turn. Logs showed
+  // every `query started` line as `new` (never `resume=...`), one new UUID per
+  // turn even when 5 prompts arrived back-to-back to the same tab.
+  // See knowledge/fix-sdk-session-amnesia.md.
   const existingSession = sdkSessions.get(tabId);
+  const resumeFromStore = resumeSessionId || null;
+  const resumeFromActive = existingSession?.sessionId || null;
+  const resumeId = resumeFromStore || resumeFromActive;
+  console.log('[ClaudeSDK] send-message tabId=' + tabId + ' effort=' + effort + ' thinking=' + thinking + ' resume=' + (resumeId ? resumeId.slice(0, 8) : 'NEW') + ' source=' + (resumeFromStore ? 'caller' : resumeFromActive ? 'active' : 'none'));
 
   try {
-    if (!existingSession || !existingSession.sessionId) {
-      // No active session — start fresh
-      await sdkStartQuery(tabId, cwd, prompt, null, model, effort, thinking);
-    } else {
-      // Resume existing session
-      await sdkStartQuery(tabId, existingSession.cwd, prompt, existingSession.sessionId, model, effort, thinking);
-    }
+    await sdkStartQuery(
+      tabId,
+      cwd || existingSession?.cwd,
+      prompt,
+      resumeId,
+      model, effort, thinking,
+    );
     return { success: true };
   } catch (err) {
     console.error('[ClaudeSDK] send-message failed:', err.message);
@@ -8739,6 +10555,78 @@ ipcMain.handle('claude-sdk:load-history', async (event, { sessionId, cwd }) => {
 ipcMain.handle('claude-sdk:get-model-caps', async () => {
   const caps = await loadSdkModelCapabilities();
   return { success: true, caps };
+});
+
+// [SlashProbe] Probes Query control-API: shipped slash-commands (with
+// aliases), MCP server status, context-usage breakdown. Reuses active
+// session's Query when available so result matches THIS session; otherwise
+// spawns a throw-away one. Caller dumps result to console — full enumeration
+// of what /usage / /status / /cost / /compact resolve to in CLI mode.
+ipcMain.handle('claude-sdk:probe-commands', async (event, { tabId }) => {
+  console.log('[SlashProbe] probe-commands invoked tabId=' + (tabId || '<none>'));
+  try {
+    const sdk = await import('@anthropic-ai/claude-agent-sdk');
+    let q;
+    let spawned = false;
+    const active = tabId ? sdkSessions.get(tabId) : null;
+    if (active?.query) {
+      q = active.query;
+      console.log('[SlashProbe] reusing active session query for tabId=' + tabId.slice(-12));
+    } else {
+      // never-resolves Promise inside the iterator keeps the underlying
+      // streaming-input alive for the duration of all three probe calls.
+      // Bare `(async function*(){})()` reaches `return` immediately → SDK
+      // tears down ProcessTransport between probe calls.
+      const neverYield = (async function*() { await new Promise(() => {}); })();
+      q = sdk.query({
+        prompt: neverYield,
+        options: { allowDangerouslySkipPermissions: true, permissionMode: 'bypassPermissions' },
+      });
+      spawned = true;
+      console.log('[SlashProbe] spawned probe-only query (no active session)');
+    }
+    const out = {};
+    // Sequential awaits — parallel Promise.all crashed because closing the
+    // throw-away query (when no active session) tore down ProcessTransport
+    // mid-call. supportedCommands resolved first, the other two errored with
+    // "Query closed before response received" / "ProcessTransport is not
+    // ready". Sequential = each control-request fully completes before next.
+    try {
+      const cmds = await q.supportedCommands();
+      out.commands = cmds;
+      console.log('[SlashProbe] supportedCommands count=' + cmds.length + ' names=' + cmds.map(c => '/' + c.name).join(','));
+      cmds.forEach(c => {
+        const aliases = c.aliases?.length ? ' aliases=[' + c.aliases.map(a => '/' + a).join(',') + ']' : '';
+        console.log('[SlashProbe]   /' + c.name + ' — ' + String(c.description || '').slice(0, 100) + aliases);
+      });
+    } catch (e) {
+      console.warn('[SlashProbe] supportedCommands failed:', e?.message);
+      out.commandsError = String(e?.message || e);
+    }
+    try {
+      const usage = await q.getContextUsage();
+      out.contextUsage = usage;
+      console.log('[SlashProbe] contextUsage=' + JSON.stringify(usage).slice(0, 500));
+    } catch (e) {
+      console.warn('[SlashProbe] getContextUsage failed:', e?.message);
+      out.contextUsageError = String(e?.message || e);
+    }
+    try {
+      const mcpStatus = await q.mcpServerStatus();
+      out.mcpServerStatus = mcpStatus;
+      console.log('[SlashProbe] mcpServerStatus count=' + mcpStatus.length + ' summary=' + mcpStatus.map(s => s.name + ':' + s.status).join(','));
+    } catch (e) {
+      console.warn('[SlashProbe] mcpServerStatus failed:', e?.message);
+      out.mcpServerStatusError = String(e?.message || e);
+    }
+    if (spawned) {
+      try { await q.close(); } catch {}
+    }
+    return { success: true, ...out };
+  } catch (err) {
+    console.error('[SlashProbe] probe-commands fatal:', err.message);
+    return { success: false, error: String(err.message || err) };
+  }
 });
 
 ipcMain.handle('claude-sdk:stop', async (event, { tabId }) => {
@@ -8882,10 +10770,22 @@ ipcMain.handle('claude-sdk:truncate-history', async (event, { sessionId, cwd, ta
 // reducer can resolve tool statuses). Anchors then line up perfectly.
 ipcMain.handle('claude-sdk:active-branch-messages', async (event, { sessionId, cwd }) => {
   if (!sessionId) return { success: false, error: 'sessionId required', messages: [] };
+  const t0 = Date.now();
+  const sidShort = sessionId.slice(0, 8);
   try {
+    const tFind0 = Date.now();
     const found = findSessionFile(sessionId, cwd);
-    if (!found) return { success: false, error: 'session file not found', messages: [] };
+    const findMs = Date.now() - tFind0;
+    if (!found) {
+      console.log(`[SDKHistory:Main] sid=${sidShort} NOT_FOUND findMs=${findMs}`);
+      return { success: false, error: 'session file not found', messages: [] };
+    }
+    let fileSize = 0;
+    try { fileSize = require('fs').statSync(found.filePath).size; } catch {}
+    const tRead0 = Date.now();
     const content = require('fs').readFileSync(found.filePath, 'utf-8');
+    const readMs = Date.now() - tRead0;
+    const tParse0 = Date.now();
     const lines = content.trim().split('\n').filter(l => l.trim());
     const recordMap = new Map();
     let last = null;
@@ -8895,8 +10795,13 @@ ipcMain.handle('claude-sdk:active-branch-messages', async (event, { sessionId, c
         if (e.uuid) { recordMap.set(e.uuid, e); last = e; }
       } catch {}
     }
-    if (!last) return { success: true, messages: [] };
+    const parseMs = Date.now() - tParse0;
+    if (!last) {
+      console.log(`[SDKHistory:Main] sid=${sidShort} sizeKB=${(fileSize/1024).toFixed(0)} lines=${lines.length} EMPTY totalMs=${Date.now()-t0}`);
+      return { success: true, messages: [] };
+    }
     // Active branch = walk back from last via parentUuid, then reverse.
+    const tWalk0 = Date.now();
     const branch = [];
     let cur = last.uuid;
     const seen = new Set();
@@ -8907,9 +10812,12 @@ ipcMain.handle('claude-sdk:active-branch-messages', async (event, { sessionId, c
       branch.unshift(rec);
       cur = rec.logicalParentUuid || rec.parentUuid;
     }
+    const walkMs = Date.now() - tWalk0;
+    const totalMs = Date.now() - t0;
+    console.log(`[SDKHistory:Main] sid=${sidShort} sizeKB=${(fileSize/1024).toFixed(0)} lines=${lines.length} branchLen=${branch.length} findMs=${findMs} readMs=${readMs} parseMs=${parseMs} walkMs=${walkMs} totalMs=${totalMs}`);
     return { success: true, messages: branch };
   } catch (err) {
-    console.error('[ClaudeSDK] active-branch-messages failed:', err.message);
+    console.error('[SDKHistory:Main] sid=' + sidShort + ' failed:', err.message);
     return { success: false, error: String(err.message || err), messages: [] };
   }
 });

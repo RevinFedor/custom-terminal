@@ -141,7 +141,23 @@ Direction варьируется: popup слева от триггера → bri
 
 В gap'е `elementFromPoint` возвращает то что **под** wrapper'ом и popup'ом (terminal, body). Поэтому `el.closest('[data-bridge]')` фейлит, popup закрывается. **Координатный hit-test (вариант в) — единственно надёжный**, если работаешь не с DOM-обёрткой.
 
-### 2.5. Debug-визуализация bridge'ов
+### 2.5. Tooltip залипает после leave-from-tip (асимметрия cancel-on-enter / no-reset-on-leave)
+
+Двухсекционные hover-state'ы (trigger + portal-tip) с hide-таймером ломаются на сценарии «trigger → tip → выход с tip-а в сторону». Канонический сценарий: trigger hover-state `hovering = true`, leave с trigger планирует `hide-timer` который сбросит `hovering = false` через N мс. Tip onPointerEnter отменяет timer (правильно — иначе tip пропадёт пока курсор переходит через GAP) и ставит `inTip = true`. Tip onPointerLeave наивно делает `setInTip(false)` — и тут залипание: `hovering` всё ещё `true` (timer был отменён и больше не выстрелит), `inTip = false`, но `visible = hovering || inTip` остаётся `true`. Tip не закрывается даже когда курсор уже далеко.
+
+Симптом — *«если я навёлся на тултип и потом с него увёлся, тултип не закрывается»*. Курсор может быть где угодно на экране, tip висит до клика, переключения вкладки или перезагрузки. Узнаётся по тому что **bare-hover trigger leave работает** (timer срабатывает), а **leave из tip-а** нет. Любая логика типа «через 5 секунд автоматически закрой» — не фикс, это hack поверх.
+
+Правильно — leave-from-tip терминален: сбрасывает оба флага и чистит timer.
+```tsx
+onPointerLeave={() => {
+  if (hideTimerRef.current) clearTimeout(hideTimerRef.current);
+  setInTip(false);
+  setHovering(false);   // ← забытая строка, ключевая
+}}
+```
+Возврат курсора на trigger корректно поднимет `hovering = true` через onPointerEnter триггера — flow не сломан. Альтернатива «не отменять timer на tip-enter, тогда timer всё равно выстрелит» провальна — пока курсор на tip-е, timer выстрелит и tip пропадёт под курсором. См. `src/renderer/components/UI/Tooltip.tsx::onPointerLeave`.
+
+### 2.6. Debug-визуализация bridge'ов
 
 В режиме разработки удобно видеть невидимые bridge'ы. Хранится в `useUIStore.debugHoverBridges` (тогглер в `StatusBar`). Компонент `HoverBridgeDebug` рисует красный прозрачный rect поверх bridge-области с `pointer-events: none`. Если в проде popup закрывается «непонятно когда» — включи флаг и увидишь, что курсор реально вышел из всех зон.
 
@@ -193,7 +209,15 @@ Direction варьируется: popup слева от триггера → bri
 
 Если document-listener на `mousedown` (capture или bubble) — у внутренних кликов popup'а должен быть `e.stopPropagation()` ИЛИ listener должен проверять `if (popupRef.contains(e.target)) return`. Выбери один путь и держи единый стиль во всём проекте, не миксуй.
 
-### 4.4. Esc обязателен дополнительно
+### 4.4. Portal-кнопка + handleClickOutside родителя = мгновенный сброс стейта
+
+Симптом — кнопка внутри React Portal обновляет стейт, и тот же стейт сбрасывается в том же тике. Юзер кликает, ничего не происходит, никаких ошибок.
+
+Причина — кнопка внутри Portal живёт в `document.body`, **вне** ref'а родительского компонента. Если у родителя есть `window.addEventListener('click', handleClickOutside)` с проверкой `containerRef.current.contains(e.target)` — клик по Portal-кнопке вызывает `onClick` → стейт устанавливается, но затем событие bubbles до `window` → `containerRef.contains(target)` = `false` (Portal physically не внутри ref) → стейт сбрасывается. Capture-on-parent не помогает: capture идёт сверху вниз и съедает событие до самой кнопки внутри Portal.
+
+Правило универсальное — любая интерактивная кнопка в Portal, меняющая родительский стейт, обязана делать `e.stopPropagation()` на bubble-фазе. `onClick` внутри Portal **продолжает** bubble'ить вверх по React virtual tree (не по DOM tree) — поэтому document-listener всё равно ловит событие, даже когда визуально Portal в `body`. Это часто принимается за «click-outside работает автоматически если в Portal» — нет, проверять явно.
+
+### 4.5. Esc обязателен дополнительно
 
 Click-outside и Esc — два независимых пути. Esc нужен для ситуаций когда мыши под рукой нет, или когда click-outside случайно перехватывается (например, popup занимает весь viewport).
 
@@ -248,6 +272,23 @@ Click-outside и Esc — два независимых пути. Esc нужен 
 `HoverBridgeDebug` рендерит overlay с `z-index: 99999, pointer-events: none`. Это безопасно — он не блокирует клики, но всегда видим. Не понижай его «чтобы не мешал» — он специально такой.
 
 См. `knowledge/fact-timeline.md::Z-index и геометрия popup`.
+
+### 6.3. UI поверх canvas: Portal или Layering Pattern, не голый z-index
+
+Большие canvas-компоненты (xterm.js, WebGL, video) создают локальные stacking context'ы через `transform`/`filter`/`opacity` родителей, ломая `z-index` соседей. UI-элементы, которые должны быть «поверх» canvas, оказываются под ним или не получают клики. Симптом — кнопка визуально видна на canvas, но клики «проходят сквозь неё» в xterm; либо кнопка вообще не видна, хотя в DOM существует с положительным z-index.
+
+Если overlay полностью отделён от canvas (модалка, file picker, screen-wide overlay) — `createPortal` в `document.body` обходит локальные stacking context'ы целиком, проблема не возникает.
+
+Если overlay должен жить **внутри** родительского контейнера canvas — нужен Layering Pattern: соседние absolute-слои с явным разделением хитбоксов.
+```tsx
+<div className="absolute inset-0">
+  <div ref={canvasRef} className="absolute inset-0" />  {/* Слой 1: canvas */}
+  <div className="absolute inset-0 pointer-events-none z-10">  {/* Слой 2: UI */}
+    {showButton && <button className="pointer-events-auto">↓</button>}
+  </div>
+</div>
+```
+`absolute inset-0` на обоих слоях избегает конфликтов размеров — canvas чувствителен к flex/grid sizing. `pointer-events-none` на UI-контейнере + `pointer-events-auto` на конкретных интерактивных элементах: клики проходят сквозь пустые места к canvas, но кнопки кликабельны. Явный `z-index` на UI-слое — иначе порядок зависит от непредсказуемого DOM-order'а. См. `knowledge/fact-settings.md` про capture-phase listener для overlay'ев поверх xterm — это та же проблема под другим углом (canvas жадно ловит pointer events, нужно перехватывать в capture-фазе).
 
 ---
 
