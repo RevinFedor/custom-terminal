@@ -372,11 +372,10 @@ SDK 0.3 не поддерживает midstream приём нового prompt'�
 
 **rejectFlash**: 1-секундный border-red + bg-#2a1414 на composer'е. Юзер: «должно мигать на 1 секунду одно мигание». Без visual signal'а Enter тихо no-op'ится — юзер считает что клавиатура сломалась. Это **destructive-feedback ≥ 1 секунда**, см. `methodology/design.md::Persistent state across UI transitions` — тот же класс UX-проблем.
 
-## Click-handler не крадёт фокус
+## Focus + selection coordination в чате
 
-`handleTabClick` (whitespace-click → focus textarea) раньше: на каждый клик → `textarea.focus()`. Двойной side-effect: re-init caret-blink (визуально мигает на каждый клик в пустой области), потеря active selection (drag-to-select в bubble cancel'ится на mouseup).
+Тема прошла ~12 итераций и два deep-research'а. **Текущая архитектура — пять компонентов**: virtuoso scroller без tabindex (через custom `components.Scroller` который деструктурирует Virtuoso'вский `tabIndex` props и не форвардит), caret snapshot на document-mousedown capture phase, active recovery на document-mouseup capture phase с threshold `selLen ≥ 5`, global keydown listener для печати при `activeElement = body`, и `onMouseDown.preventDefault()` на non-edit кнопках внутри истории (Scroll-FAB, compact toggle, tool-card header).
 
-Skip-conditions добавлены:
-- `target.closest('[data-msg-role]')` — клик внутри message bubble. Юзер может начинать drag-to-select сразу после mouseup'а; наш focus() сбрасывает selection до того как она устанавливается.
-- `document.activeElement === ta` — textarea уже focused. Повторный focus() рестартует caret-blink из 0 → видимое «мигание».
-- Active live selection — было раньше.
+**Три WHATWG-инварианта** делают наивные подходы тупиковыми: `mousedown.preventDefault()` монолитен (отменяет focus И selection одновременно — один `defaultPrevented` gate), `tabindex="-1"` всё равно click-focusable, `ta.focus()` коллапсит `window.getSelection()` (focusing-step 7). Полный разбор симптомов, спецификаций, кладбища отброшенных подходов (range save/restore, focusin redirect, MutationObserver на tabindex, conditional preventDefault, setTimeout refocus в onBlur) — `fix-controlled-textarea-focus-selection.md`.
+
+**CDP test-side note.** `electron_keyboard.type` через MCP не апдейтит React controlled-input (CDP `dispatchKeyEvent` не входит в Blink editor commit path). Для E2E использовать `electron_keyboard.insertText` или новый `electron_insert_text` MCP tool. Реальный OS keystroke от юзера идёт через trusted-event path, всё работает. Drag-select через MCP-mouse тоже не запускает Blink selection-controller — добавлен `electron_select_text` tool (Range API).
