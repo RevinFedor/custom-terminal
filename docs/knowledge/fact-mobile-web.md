@@ -43,6 +43,27 @@ _webBroadcast(tabId, {
 
 Решение: новый IPC `claude-sdk:active-branch-messages` читает JSONL напрямую, walks active branch (тот же алгоритм что в `parseTimelineEntries`), возвращает **все типы** в chain order — user, assistant, tool_use, tool_result. Mobile reducer обрабатывает их так же как стрим. Anchors совпадают.
 
+## Slash-чип / compact-summary / XML wrappers в mobile reducer
+
+Mobile receiver получает тот же поток raw SDK-сообщений что и десктоп — значит видит **все CLI/SDK-инъекции** которые на десктопе разруливаются в `ClaudeSDKTab` парсере: служебные XML-обёртки, slash-команды как user-bubble, compact-summary records с metrics. Без специальной обработки в mobile reducer'е (`mobile-web/src/messages.ts`) юзер видит сырой `<command-name>/compact</command-name>` как обычное сообщение, `<local-command-stdout>Compacted</local-command-stdout>` как user-реплику, а compact summary без оранжевой карточки и метрик.
+
+Распознавание в `apply()` reducer'а:
+- `type:'system' && subtype:'compact_boundary'` — стэшится `pendingCompactMetrics` (preTokens / postTokens / durationMs), сама запись не рендерится. Метрики прицепятся к следующей user-записи с compact-summary флагом.
+- `<command-name>X</command-name>` + optional `<command-args>` → `kind:'slash'`, рендерится как фиолетовая (`rgba(129,140,248,*)`) compact-пилюля справа, моноширный шрифт, `userSelect:none`. Точная копия desktop UserMsg isSlashCommand-ветки.
+- `<local-command-stdout>` / `<local-command-caveat>` / `<system-reminder>` / `<tool_result>` / `[tool_result]` → drop. CLI-артефакты, не пользовательский текст.
+- `isCompactSummary === true` (authoritative SDK-флаг) или text начинается с `'This session is being continued from a previous conversation'` (fallback для старых сессий) → `kind:'compact-summary'`, прицепляются метрики из `pendingCompactMetrics`. Рендерится как orange-card (`#DA7756` border + bg `rgba(218,119,86,0.06)`), заголовок «COMPACT SUMMARY», метрики `preTokens → postTokens · Ns` моноширно, collapsible body с 600-char preview (`COMPACT_PREVIEW_CHARS`).
+- `maybeSwapCompactPair()` — после push'а compact-summary или slash-чипа в `state.entries` пробует swap последних двух элементов если они `[compact-summary, slash('/compact')]`. JSONL пишет summary ДО следующей `<command-name>/compact</command-name>` записи, визуально chip должен быть выше — юзер ввёл команду, потом SDK сделал summary.
+
+Dedup для slash/compact работает через `entryUuid` — WS replay после optimistic local apply не плодит дубликаты.
+
+## Mobile composer: caret + permanent ring + selective scrollbar
+
+Три неочевидных решения в `mobile-web/src/App.tsx::Composer`:
+
+- **Orange visible caret** (`caretColor: '#FFB382'`). Раньше пробовал `caret-color: transparent` (юзер: «значок мигающий надо убрать»). Потом юзер репортил «не работает печать» — на самом деле работало, но он не видел каретки и не знал что инпут активен. Caret — единственный достоверный сигнал «текст идёт сюда» когда юзер начал печатать в полупустой инпут.
+- **Permanent border `#FFB382`** (всегда, не `focus:border-*`). Юзер: *«просто рамка всегда активна»*, *«заново мигать рамкой тоже не надо»*. Раньше переключали `focus:border-[#555]` — каждый re-focus на mobile (touch tap → blur от scroll → re-focus) давал визуальный flicker рамки. Постоянная оранжевая рамка читается как «вот THE инпут».
+- **Conditional orange scrollbar**: textarea автоэкспандится до 40vh; пока content не достиг кап, `overflowY: hidden` (никакого скролла в одну строку); как только превысил — `overflowY: auto` + класс `composer-textarea--scroll` который **переписывает глобальное** `::-webkit-scrollbar { width:0 }` на `width:6px` с `thumb: #FFB382` (orange, отделено от history-скролла который остаётся скрытым). Юзер: *«у инпута, если у нас одна строка, не должен отображаться scroll, и также scroll у инпута сделай отдельно, оранжевым»*.
+
 ## Endpoint map
 
 ```
