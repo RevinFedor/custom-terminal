@@ -73,6 +73,22 @@ Entries используют `flex: '1 0 auto'` с минимальной выс
 - **Много entries:** minHeight сохраняется, контейнер начинает скроллиться.
 - **Разделители** (fork/plan markers): `flex-shrink: 0`, фиксированная высота 8px — не растягиваются.
 
+### Expanded mode (chip+preview)
+
+Кнопка `GitBranch` в `InfoPanel` (бывший «tree mode») переключает Timeline в расширенный layout: dot слева в 14px-gutter, справа N-строчное превью текста entry. Default ширина 220px, drag-resizable [160, 600] через `pointer-events`-handle на левой границе. Ширина живёт в localStorage (`noted-terminal-timeline-width`), глобально на всё приложение (не per-tab) — у юзера один привычный размер вне зависимости от того в каком проекте/табе он сидит.
+
+**Overlay, не resizable cell.** Внешний slot в Workspace flex-row всегда 32px (как в collapsed). Реальный container — `position: absolute; right: 0; width: timelineWidth`, вылезает влево поверх терминала с `backdrop-filter: blur(8px)`. Чат/терминал в layout НЕ сжимаются при раскрытии. Принцип см. [`methodology/design.md::Resizable side panel = overlay над контентом`](../methodology/design.md).
+
+**Тип записи кодирует только цвет dot.** Изначально в превью был chip (`PROMPT/COMPACT/CONTINUED/AGENT/DOCS`) + timestamp в первой строке — юзер потребовал убрать («тип уже виден из цвета кружочка, лейбл дублирует»). См. [`methodology/design.md::Семантика передаётся одним каналом`](../methodology/design.md). Превью теперь только текстовая часть entry, line-clamp настраивается отдельно (Settings → Шрифты → «Таймлайн — строки», по умолчанию 3, диапазон [1, 10]).
+
+**Размер шрифта и плотность.** Font-size root устанавливается через `style={{ fontSize: timelineFontSize + 'px' }}` на корневом div Timeline, потомки используют `em` (текст превью = 1em, dot/badge/timestamp в других местах = 0.65-0.85em). Изменение размера в Settings → «Таймлайн» — пересчёт каскадом, без React-state ниже root. Контрол font-size [10, 18], default 12.
+
+**Dot в expanded режиме статичен.** В compact mode dot растёт на hover (5px → 10px) — это flex-grow safe, потому что entry 20px высоты. В expanded entry имеет auto-height (до 10 строк), и hover-рост dot'а потянул бы реflow всей колонки — текст бы сдвигался. Поэтому в expanded dot фиксирован (8×8 обычный, 12×4 compact), hover меняет **только bg сегмента** (`rgba(255,255,255,0.04)`). Loader/X спиннер при click позиционируется внутри dot-gutter (`absolute left:6, width:14`), не `inset:0` — иначе в wide-entry он улетал бы в центр превью-текста.
+
+**Performance с 200+ entries без virtualization.** `content-visibility: auto` + `containIntrinsicSize: auto ~NNpx` (вычисляется от `lineHeight × clamp × fontSize + 12px padding`) даёт браузеру право пропускать render off-screen entries, при этом refs (`segmentRefs`), hit-boxes для click, координаты для оверлеев — остаются валидными (Chromium держит layout-tree, скипает paint+style для контента). Не виртуализация в смысле react-window — DOM-узлы все на месте, поэтому позиционирование overlay'ев (range-selection, rewind animation) работает без переписывания. Альтернатива (Virtuoso) ломала бы координаты сегментов и потребовала бы рефакторинг всех overlay'ев.
+
+**Graveyard: tree-mode-with-labels.** До этой переделки `GitBranch` раскрывал Timeline в 160px overlay с другим визуалом: левая axis-line (`left: 4, w:1, rgba(255,255,255,0.08)`), вертикальные connector'ы для sub-agent групп (`left: 8/14`, цвет индиго), text label справа от каждой точки (9px шрифт, имя агента / `truncate(content, 60)`), `×N` badge для collapsed-групп. Этот формат почти не использовался — labels были too small для чтения, axis-line не давала полезной информации. Заменили на chip+preview потому что это то, что юзер реально хочет видеть в развёрнутом Timeline. Если кому-то понадобится вернуть — git history до этого коммита, плюс старый код жил под флагом `treeMode && ...` в render-loop и `scrollRef` 160px overlay.
+
 ### Layout Constraints (The Flex-Height Trap)
 Для корректной работы скролла внутри сложной flex-сетки воркспейса используется специальный CSS-хак.
 - **Корневая причина:** Стандартный `height: 100%` на flex-child (скролл-контейнере) часто не резолвится Chromium, если родитель не имеет фиксированной высоты. Это приводило к тому, что контейнер Timeline растягивался на всю высоту контента вместо появления скроллбара.
@@ -320,7 +336,7 @@ Entries используют `flex: '1 0 auto'` с минимальной выс
 - `EditRangePanel`: `10003` (внутри Portal).
 - Tooltips / context menus: `10001` (под action menu, но над контентом).
 
-**Right-anchor через измеренный DOM (popupRightPx).** Все 6 popup'ов на Timeline (context menu, range action, edit-range loading, note tooltip, fork tooltip, expanded tooltip) используют **один** state `popupRightPx` — измеренное расстояние от правого края окна до левого края Timeline + 8px overlap. Обновляется через `ResizeObserver` на `containerRef.current` + `document.body` + listener на `window.resize`.
+**Right-anchor через измеренный DOM (popupRightPx).** Все 6 popup'ов на Timeline (context menu, range action, edit-range loading, note tooltip, fork tooltip, expanded tooltip) используют **один** state `popupRightPx = innerWidth - tlRect.left` — правый край popup ровно совпадает с левым краем Timeline (без overlap, без gap). Обновляется через `ResizeObserver` на `containerRef.current` + `document.body` + listener на `window.resize`. Раньше формула содержала `+8 overlap` чтобы граница popup'а «целовала» strip — этот overlap компенсировал CSS-bridge (8px невидимый `<div>`) внутри tooltip-wrapper'а, который тянул wrapper.width на 8px правее content'а. После удаления bridge (см. [`fix-timeline-tooltip-stability.md::Layout-child bridge ловушка`](fix-timeline-tooltip-stability.md)) overlap больше не нужен — popup'ы вплотную и без компенсации.
 
 - **`x` в popup-state больше не используется.** `contextMenu.x`, `rangeActionMenu.x`, `editRangeLoadingMenu.x` сохранены в типе для обратной совместимости со старым кодом и сериализованным state, но устанавливаются в `0` и не читаются в рендере. Все popup используют `right: ${popupRightPx}px`.
 - **Что пробовали и почему не сработало:**

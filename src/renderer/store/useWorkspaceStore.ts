@@ -11,6 +11,37 @@ export type CommandType = 'generic' | 'devServer' | 'claude' | 'gemini';
 
 export type TabType = 'terminal' | 'browser' | 'claude-sdk';
 
+/**
+ * Tag for the source that wrote `tab.claudeSessionId`. Used for diagnostics
+ * and rendered in the "revert session" history modal so the user knows which
+ * subsystem set each previous value.
+ *   bridge          — SessionBridge `processFile` → claude:session-detected IPC
+ *   autoResume      — App.tsx AutoResume effect after Electron restart
+ *   userIntercept   — terminal:input matched `claude --resume <id>`
+ *   userManual      — InfoPanel ✎ modal direct entry
+ *   timelineChain   — Timeline.tsx Clear-Context chain resolver
+ *   fork            — claude:fork-session-file IPC
+ *   restoredFromDb  — restoreSession at startup
+ *   userRevert      — tab context-menu revert from history
+ *   unknown         — default when caller did not specify (legacy paths)
+ */
+export type SessionWriteReason =
+  | 'bridge'
+  | 'autoResume'
+  | 'userIntercept'
+  | 'userManual'
+  | 'timelineChain'
+  | 'fork'
+  | 'restoredFromDb'
+  | 'userRevert'
+  | 'unknown';
+
+export interface SessionHistoryEntry {
+  sessionId: string;
+  reason: SessionWriteReason;
+  at: number; // Date.now() millis
+}
+
 // Helper: Check if tab has an interrupted AI session that can be resumed
 export const isTabInterrupted = (tab: { wasInterrupted?: boolean; claudeSessionId?: string; geminiSessionId?: string }): boolean => {
   return !!(tab.wasInterrupted && (tab.claudeSessionId || tab.geminiSessionId));
@@ -45,6 +76,17 @@ interface Tab {
   wasInterrupted?: boolean; // True if tab was closed with active AI session (show resume overlay)
   overlayDismissed?: boolean; // True if user dismissed the interrupted overlay (don't show again)
   notes?: string; // Tab-specific notes
+  /**
+   * Recent sessionId rotation log (most-recent-first, capped at 5 entries).
+   * Used as a safety-net for accidental overwrites — user can revert via the
+   * tab context menu when an automated subsystem (bridge watcher, AutoResume,
+   * timeline chain resolver) wrote the wrong session.
+   * Persisted in tabs.claude_session_history (JSON).
+   * Schema: { sessionId, reason, at } where reason is the cause-tag declared
+   * by the caller of setClaudeSessionId.
+   * See docs/knowledge/fix-bridge-stale-takeover.md.
+   */
+  claudeSessionHistory?: SessionHistoryEntry[];
   /**
    * User-assigned semantic status of the session. Independent of runtime type
    * (claude/sdk/gemini/dev) and busy state. Set via right-click context menu.
@@ -193,7 +235,9 @@ interface WorkspaceStore {
   syncAllTabsCwd: (projectId: string) => Promise<void>;
 
   // Claude session tracking
-  setClaudeSessionId: (tabId: string, sessionId: string) => void;
+  // `reason` documents who is writing — bubbles into claudeSessionHistory so
+  // the user can revert mistaken overwrites from the tab context menu.
+  setClaudeSessionId: (tabId: string, sessionId: string, reason?: SessionWriteReason) => void;
   getClaudeSessionId: (tabId: string) => string | null;
 
   // Gemini session tracking
@@ -233,7 +277,7 @@ interface WorkspaceStore {
   setBrowserActiveView: (tabId: string, view: 'browser' | 'terminal') => void;
 
   // Claude SDK tabs
-  createSDKTab: (projectId: string) => Promise<string>;
+  createSDKTab: (projectId: string, name?: string) => Promise<string>;
   convertToSDKTab: (tabId: string) => void;
   updateSDKState: (tabId: string, state: Partial<Pick<Tab, 'sdkState' | 'sdkMessages' | 'claudeSessionId' | 'sdkModel' | 'sdkEffort' | 'sdkThinking'>>) => void;
   // Merge a partial BgTask patch by taskId. Creates the entry if missing.
@@ -823,7 +867,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       nameSetManually: (options as any)?.nameSetManually,
       parentTabId: (options as any)?.parentTabId,
       mcpTaskId: (options as any)?.mcpTaskId,
-      claudeTaskCount: (options as any)?.claudeTaskCount || 0
+      claudeTaskCount: (options as any)?.claudeTaskCount || 0,
+      sessionStatus: (options as any)?.sessionStatus
     };
 
     // Claude SDK tabs don't need a PTY process
@@ -1287,6 +1332,11 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     for (const [projectId, workspace] of openProjects) {
       const tab = workspace.tabs.get(tabId);
       if (tab) {
+        const prev = tab.commandType || 'null';
+        const claudeSess = tab.claudeSessionId ? tab.claudeSessionId.slice(0, 8) : 'null';
+        const geminiSess = tab.geminiSessionId ? tab.geminiSessionId.slice(0, 8) : 'null';
+        const callerLine = (new Error().stack || '').split('\n').slice(2, 5).join(' | ');
+        console.warn('[Store:setTabCommandType] tab=' + tabId.slice(-8) + ' ' + prev + ' → ' + commandType + ' | claude=' + claudeSess + ' gemini=' + geminiSess + ' | caller=' + callerLine);
         // Only set commandType and rename if not already set (first run only)
         const isFirstRun = !tab.commandType;
         tab.commandType = commandType;
@@ -1557,7 +1607,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   },
 
   // Claude session tracking (detected from terminal output)
-  setClaudeSessionId: (tabId, sessionId) => {
+  setClaudeSessionId: (tabId, sessionId, reason = 'unknown') => {
     const { openProjects } = get();
 
     // Find tab across all projects
@@ -1568,12 +1618,24 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         if (tab.claudeSessionId === sessionId) return;
 
         const caller = new Error().stack?.split('\n')[2]?.trim() || 'unknown';
-        const logEntry = { ts: Date.now(), tabId, from: (tab.claudeSessionId || 'null').substring(0, 8), to: sessionId.substring(0, 8), caller };
+        const logEntry = { ts: Date.now(), tabId, from: (tab.claudeSessionId || 'null').substring(0, 8), to: sessionId.substring(0, 8), reason, caller };
         // Ring buffer: always available even if DevTools was closed
         const buf = ((window as any).__sessionLog = (window as any).__sessionLog || []);
         buf.push(logEntry);
         if (buf.length > 100) buf.shift();
-        console.warn('[Store:setClaudeSessionId] ' + logEntry.from + ' -> ' + logEntry.to + ' | tabId=' + tabId + ' | caller=' + caller);
+        console.warn('[Store:setClaudeSessionId] ' + logEntry.from + ' -> ' + logEntry.to + ' | reason=' + reason + ' | tabId=' + tabId + ' | caller=' + caller);
+
+        // History: push the OUTGOING id (the one we are overwriting). The
+        // current value the user is moving TO is already in tab.claudeSessionId
+        // after the assignment below — no point recording it twice. History is
+        // capped at 5; older entries are dropped. Persisted in SQLite.
+        const prev = tab.claudeSessionId;
+        if (prev) {
+          const hist = tab.claudeSessionHistory ? [...tab.claudeSessionHistory] : [];
+          hist.unshift({ sessionId: prev, reason, at: Date.now() });
+          tab.claudeSessionHistory = hist.slice(0, 5);
+        }
+
         tab.claudeSessionId = sessionId;
         // Reset overlay flags when new session starts (so overlay shows again if interrupted)
         tab.wasInterrupted = false;
@@ -1824,7 +1886,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   },
 
   // Claude SDK tabs
-  createSDKTab: async (projectId) => {
+  createSDKTab: async (projectId, name) => {
     const { openProjects, createTab } = get();
     const workspace = openProjects.get(projectId);
     const projectPath = workspace?.projectPath;
@@ -1832,8 +1894,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     // Use the same naming scheme as PTY claude tabs ("claude", "claude-02", ...)
     // so SDK tabs are visually indistinguishable by name from regular ones; the
     // visual differentiation is the peach colour + missing RestartZone.
+    // `name` override используется fork-операцией, чтобы скопировать имя
+    // исходного таба + `_fork` (тот же договор, что forkToTab для PTY).
     const existingNames = workspace ? Array.from(workspace.tabs.values()).map(t => t.name) : [];
-    const tabName = getNextAvailableName('claude', existingNames);
+    const tabName = name || getNextAvailableName('claude', existingNames);
     return createTab(projectId, tabName, cwd, {
       tabType: 'claude-sdk',
       color: 'claude',

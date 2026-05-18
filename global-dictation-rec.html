@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' blob:; worker-src 'self' blob:; child-src 'self' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data:; media-src 'self' blob: data:; connect-src 'self' blob: https://api.soniox.com wss://stt-rt.soniox.com;">
+  <title>Noted Dict Recording</title>
+  <style>
+    html, body { background: transparent; margin: 0; padding: 0; overflow: hidden; height: 100%; }
+    #root { width: 100vw; height: 100vh; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="module" src="/src/global-dictation-renderer/recording.tsx"></script>
+</body>
+</html>

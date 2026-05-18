@@ -10,6 +10,7 @@ import { Api, bootstrapToken, clearToken, getToken, setToken, wsUrl, type Projec
 import { createMessageReducer, type UiEntry } from './messages';
 import { streamHistory, type StreamMeta } from './streamHistory';
 import { readCachedHistory, writeFullHistory, dropSession } from './idb';
+import { DictationSession } from './dictation';
 
 // HashRouter (URL fragment) instead of BrowserRouter so reload from any view
 // works without server-side rewrites — the static file server (web-server.js)
@@ -2119,6 +2120,55 @@ function Composer({ text, setText, busy, onSend, onStop, onPickPrompt }: {
   // track that the user can grab. Separate from the chat-history scrollbar.
   const [hasScroll, setHasScroll] = useState(false);
 
+  // Voice dictation (Soniox real-time). Mounts a DictationSession on click;
+  // partial+final tokens stream into the textarea at the END of whatever the
+  // user already typed (snapshot taken at start so we never clobber it).
+  const [recording, setRecording] = useState(false);
+  const [dictError, setDictError] = useState<string | null>(null);
+  const dictRef = useRef<DictationSession | null>(null);
+  const prefixRef = useRef('');
+  const startDictation = async () => {
+    if (recording) return;
+    prefixRef.current = text;
+    setDictError(null);
+    setRecording(true);
+    const session = new DictationSession({
+      fetchToken: async () => {
+        const r = await Api.sonioxToken();
+        if (!r?.api_key) throw new Error('no api_key returned');
+        return r.api_key;
+      },
+      onUpdate: ({ final, partial }) => {
+        setText(prefixRef.current + final + partial);
+      },
+      onError: (msg) => { setDictError(msg); },
+      onStopped: () => {
+        dictRef.current = null;
+        setRecording(false);
+        // Refocus the textarea so the user can keep typing inline. Drop the
+        // dictation prefix snapshot — next dictation session resnapshots.
+        prefixRef.current = '';
+        requestAnimationFrame(() => {
+          const ta = taRef.current;
+          if (!ta) return;
+          ta.focus();
+          try { ta.setSelectionRange(ta.value.length, ta.value.length); } catch {}
+        });
+      },
+      languageHints: ['en', 'ru'],
+    });
+    dictRef.current = session;
+    await session.start();
+  };
+  const stopDictation = () => {
+    const s = dictRef.current;
+    if (s) s.stop();
+    else setRecording(false);
+  };
+  // Cleanup on unmount — don't leave the mic stream open if the chat view
+  // tears down (navigation, logout).
+  useEffect(() => () => { dictRef.current?.stop(); }, []);
+
   // Autogrow: set height = scrollHeight, capped at 40vh. Resets to single-row
   // baseline when text is empty (otherwise textarea sticks at last grown size).
   useEffect(() => {
@@ -2177,14 +2227,44 @@ function Composer({ text, setText, busy, onSend, onStop, onPickPrompt }: {
             <line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" />
           </svg>
         </ComposerIconButton>
-        {/* 🎤 voice — disabled placeholder */}
-        <ComposerIconButton disabled aria-label="Voice (coming soon)">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+        {/* 🎤 voice — Soniox real-time dictation. One-click toggle: tap to
+            start (mic permission prompt on first use), tap again to stop.
+            While recording: orange tint + pulse, the textarea fills live. */}
+        <button
+          onClick={recording ? stopDictation : startDictation}
+          aria-label={recording ? 'Stop dictation' : 'Start dictation'}
+          title={recording ? 'Tap to stop' : 'Voice dictation'}
+          style={{
+            width: 36, height: 36, borderRadius: 999,
+            background: recording ? 'rgba(218,119,86,0.18)' : 'transparent',
+            border: recording ? '1px solid rgba(218,119,86,0.55)' : 'none',
+            color: recording ? '#FF9466' : '#888',
+            cursor: 'pointer',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            position: 'relative',
+          }}
+        >
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={recording ? 2 : 1.6} strokeLinecap="round" strokeLinejoin="round">
             <rect x="9" y="2" width="6" height="13" rx="3" />
             <path d="M5 11v1a7 7 0 0 0 14 0v-1" />
             <line x1="12" y1="19" x2="12" y2="23" />
           </svg>
-        </ComposerIconButton>
+          {recording && (
+            <span aria-hidden style={{
+              position: 'absolute',
+              top: 2, right: 2,
+              width: 8, height: 8, borderRadius: '50%',
+              background: '#ef4444',
+              boxShadow: '0 0 6px rgba(239,68,68,0.85)',
+              animation: 'mob-mic-pulse 1.2s ease-in-out infinite',
+            }} />
+          )}
+        </button>
+        {dictError && !recording && (
+          <span style={{ fontSize: 10, color: '#f87171', marginLeft: 4, maxWidth: 140, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={dictError}>
+            mic: {dictError}
+          </span>
+        )}
 
         <div style={{ flex: 1 }} />
 
@@ -3262,6 +3342,10 @@ if (typeof document !== 'undefined' && !document.getElementById('noted-mobile-ke
 @keyframes noted-fade-in { from { opacity: 0; } to { opacity: 1; } }
 @keyframes noted-sheet-up { from { transform: translateY(100%); } to { transform: translateY(0); } }
 @keyframes noted-slide-left { from { transform: translateX(100%); } to { transform: translateX(0); } }
+@keyframes mob-mic-pulse {
+  0%,100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.55; transform: scale(0.72); }
+}
 /* Suppress iOS text-selection glow on tap & long-press for tab rows / sheet
    buttons. The system selection highlights "TERMINAL"/"SDK" badges otherwise. */
 button, .noted-no-select { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }

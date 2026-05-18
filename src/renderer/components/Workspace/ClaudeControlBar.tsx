@@ -8,6 +8,7 @@ import {
 } from '../../constants/claudeLevels';
 import { PROVIDER_CATALOG, getSupportedEffortsForAlias } from './providerCatalog';
 import SessionActionChip from './SessionActionChip';
+import MicButton from './MicButton';
 import { useCmdKey } from '../../hooks/useCmdHoverPopover';
 
 const { ipcRenderer } = window.require('electron');
@@ -310,6 +311,19 @@ export default function ClaudeControlBar({
     setPinnedPopup((cur) => (cur === key ? null : key));
   };
 
+  const triggerProps = (key: PopupKey) => ({
+    ref: (el: HTMLButtonElement | null) => { triggerRefs.current[key] = el; },
+    onClick: () => togglePinned(key),
+    onMouseEnter: () => setHoveredTrigger(key),
+    onMouseLeave: () => setHoveredTrigger((cur) => (cur === key ? null : cur)),
+  });
+
+  const popupHoverProps = (key: PopupKey) => ({
+    ref: (el: HTMLDivElement | null) => { popupRefs.current[key] = el; },
+    onMouseEnter: () => setHoveredPopup(key),
+    onMouseLeave: () => setHoveredPopup((cur) => (cur === key ? null : cur)),
+  });
+
   // ===== handlers =====
   const setEffortOnPTY = async (level: string) => {
     setIsLocalBusy(true);
@@ -327,7 +341,7 @@ export default function ClaudeControlBar({
   };
 
   const pickModel = async (mid: string) => {
-    setOpenPopup(null);
+    setPinnedPopup(null); setHoveredTrigger(null); setHoveredPopup(null);
     if (isBusy) return;
     if (isSDKTab) {
       const store = useWorkspaceStore.getState();
@@ -356,7 +370,7 @@ export default function ClaudeControlBar({
   };
 
   const pickEffort = async (level: string) => {
-    setOpenPopup(null);
+    setPinnedPopup(null); setHoveredTrigger(null); setHoveredPopup(null);
     if (isBusy) return;
     if (isSDKTab) {
       useWorkspaceStore.getState().updateSDKState(tabId, { sdkEffort: level });
@@ -369,7 +383,7 @@ export default function ClaudeControlBar({
   };
 
   const pickProvider = async (pid: string) => {
-    setOpenPopup(null);
+    setPinnedPopup(null); setHoveredTrigger(null); setHoveredPopup(null);
     if (isBusy || isSDKTab) return;
     setIsLocalBusy(true);
     try {
@@ -480,6 +494,90 @@ export default function ClaudeControlBar({
     }
   };
 
+  // Pull a UUID out of clipboard text. The clipboard might hold raw whitespace
+  // ("  uuid \n"), a TUI bracketed-paste echo, or "/resume <uuid>" — strip and
+  // validate with the canonical UUID v4 regex. Returns null on no/invalid uuid.
+  const readSessionFromClipboard = (): string | null => {
+    try {
+      const { clipboard } = window.require('electron');
+      const raw = String(clipboard.readText() || '').trim();
+      const m = raw.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
+      return m ? m[0] : null;
+    } catch {
+      return null;
+    }
+  };
+
+  // Fork from the sessionId currently in clipboard into a NEW PTY-Claude tab.
+  // Same `pendingAction: claude-fork` path as `forkToTab` — the new tab spawns
+  // `claude --resume <fork-of-clipboard-sid>` once its PTY is ready.
+  const forkFromClipboardClaude = async () => {
+    if (!tabId) return;
+    const clipSid = readSessionFromClipboard();
+    if (!clipSid) {
+      showToast('В буфере нет session ID (UUID)', 'warning');
+      return;
+    }
+    const state = useWorkspaceStore.getState();
+    for (const [projectId, workspace] of state.openProjects) {
+      const tab = workspace.tabs.get(tabId);
+      if (tab) {
+        const currentCwd = tab.cwd || projectPath || '';
+        const forkName = `${clipSid.slice(0, 8)}_fork`;
+        await state.createTabAfterCurrent(projectId, forkName, currentCwd, {
+          pendingAction: { type: 'claude-fork', sessionId: clipSid },
+          nameSetManually: true,
+        });
+        showToast(`Claude fork ← ${clipSid.slice(0, 8)}`, 'success');
+        return;
+      }
+    }
+  };
+
+  // Same idea for SDK: invoke claude:fork-session-file (rewrites JSONL with
+  // new sessionId) and attach the result to a new SDK tab. Mirrors forkToSDK
+  // but the source sessionId comes from clipboard, not the current tab.
+  const forkFromClipboardSDK = async () => {
+    if (!tabId) return;
+    const clipSid = readSessionFromClipboard();
+    if (!clipSid) {
+      showToast('В буфере нет session ID (UUID)', 'warning');
+      return;
+    }
+    const state = useWorkspaceStore.getState();
+    for (const [projectId, workspace] of state.openProjects) {
+      const tab = workspace.tabs.get(tabId);
+      if (tab) {
+        const currentCwd = tab.cwd || projectPath || '';
+        const forkResult = await ipcRenderer.invoke('claude:fork-session-file', { sourceSessionId: clipSid, cwd: currentCwd, skipChainResolve: true });
+        if (!forkResult.success) {
+          showToast('Fork failed: ' + forkResult.error, 'error');
+          return;
+        }
+        const forkName = `${clipSid.slice(0, 8)}_fork`;
+        const sdkTabId = await state.createSDKTab(projectId, forkName);
+        state.updateSDKState(sdkTabId, { claudeSessionId: forkResult.newSessionId });
+        showToast(`SDK fork ← ${clipSid.slice(0, 8)}`, 'success');
+        return;
+      }
+    }
+  };
+
+  // Convert the CURRENT empty PTY tab into an SDK tab in-place — same as the
+  // `convertToSDKTab` IPC behind the scenes. Юзер: «она должна в текущем
+  // терминале именно создавать». Альтернатива (`createSDKTab` → новый таб)
+  // нарушает связку «я нахожусь в этой вкладке и хочу её превратить в SDK»,
+  // а заодно плодит лишние табы при каждом нажатии.
+  const startNewSDKTab = () => {
+    if (!tabId) return;
+    try {
+      useWorkspaceStore.getState().convertToSDKTab(tabId);
+      showToast('Вкладка переключена в Claude SDK', 'success');
+    } catch (e: any) {
+      showToast('Не удалось открыть SDK: ' + (e?.message || e), 'error');
+    }
+  };
+
   const forkToSDK = async () => {
     if (!sessionId || !tabId || sessionType !== 'claude') return;
     const state = useWorkspaceStore.getState();
@@ -489,9 +587,13 @@ export default function ClaudeControlBar({
         const currentCwd = tab.cwd || projectPath || '';
         const forkResult = await ipcRenderer.invoke('claude:fork-session-file', { sourceSessionId: sessionId, cwd: currentCwd, skipChainResolve: true });
         if (!forkResult.success) { showToast('Fork failed: ' + forkResult.error, 'error'); return; }
-        const sdkTabId = await state.createSDKTab(projectId);
+        // Same naming convention as forkToTab (PTY→PTY): "<source>_fork".
+        // Без этого SDK-форк получал auto-имя "claude-02" и юзер терял связь
+        // c исходным табом.
+        const forkName = tab.name ? `${tab.name}_fork` : undefined;
+        const sdkTabId = await state.createSDKTab(projectId, forkName);
         state.updateSDKState(sdkTabId, { claudeSessionId: forkResult.newSessionId });
-        showToast('SDK fork ← ' + sessionId.slice(0, 8), 'success');
+        showToast(`SDK fork → ${forkName || 'новая вкладка'}`, 'success');
         break;
       }
     }
@@ -567,10 +669,18 @@ export default function ClaudeControlBar({
   // stay inside the viewport. Provider/Model/Effort all live in the right
   // cluster of the control bar — left-anchored popups (left: 0) clipped off
   // the right edge of the window for Effort which sits closest to the corner.
-  const popupStyle: React.CSSProperties = {
+  //
+  // Outer wrapper: position:absolute (без визуала), его paddingBottom:4 +
+  // прижатый к trigger'у bottom:100% играют роль CSS-bridge (hit-area
+  // покрывает gap). Inner div — собственно карточка с боксом и тенью.
+  const popupWrapperStyle: React.CSSProperties = {
     position: 'absolute',
     right: 0,
-    bottom: 'calc(100% + 4px)',
+    bottom: '100%',
+    paddingBottom: 4,
+    zIndex: 100,
+  };
+  const popupCardStyle: React.CSSProperties = {
     display: 'flex',
     gap: 4,
     padding: 4,
@@ -579,7 +689,6 @@ export default function ClaudeControlBar({
     borderRadius: 4,
     boxShadow: '0 4px 12px rgba(0,0,0,0.4)',
     whiteSpace: 'nowrap',
-    zIndex: 100,
   };
 
   const pillStyle = (active: boolean, disabled: boolean): React.CSSProperties => ({
@@ -693,7 +802,12 @@ export default function ClaudeControlBar({
         </div>
 
         {/* Forks: into new PTY tab (⑂→▭) and into new SDK tab (⑂→SDK).
-            SDK fork only for Claude sessions — SDK doesn't run Gemini. */}
+            SDK fork only for Claude sessions — SDK doesn't run Gemini.
+            Без активной сессии форкать нечего, поэтому обе fork-кнопки
+            скрываются и заменяются на одну `+ SDK` (создать новый SDK таб)
+            — единственное осмысленное действие в этом слоте при пустой
+            сессии. На SDK-табе вариант «открыть SDK» не показываем — юзер
+            уже в SDK. */}
         {hasAnySession && (
           <button
             className="text-[10px] px-1.5 py-0.5 rounded text-[#999] hover:text-white cursor-pointer leading-none flex items-center gap-0.5 transition-colors"
@@ -722,6 +836,57 @@ export default function ClaudeControlBar({
             onClick={forkToSDK}
             title="Fork в новый SDK таб"
           >⑂→SDK</button>
+        )}
+        {!hasAnySession && !isSDKTab && (
+          <button
+            className="text-[10px] px-1.5 py-0.5 rounded cursor-pointer leading-none flex items-center gap-0.5 transition-colors"
+            style={{
+              color: '#DA7756',
+              backgroundColor: 'transparent',
+              border: '1px solid rgba(218,119,86,0.30)',
+              flexShrink: 0,
+            }}
+            onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'rgba(218,119,86,0.15)'; (e.currentTarget as HTMLButtonElement).style.color = '#FF9466'; }}
+            onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'transparent'; (e.currentTarget as HTMLButtonElement).style.color = '#DA7756'; }}
+            onClick={startNewSDKTab}
+            title="Открыть новый Claude SDK таб"
+          >+SDK</button>
+        )}
+        {/* Clipboard fork chips — видны только на пустом PTY-табе (новая вкладка).
+            Логика: юзер скопировал sessionId из любого места (Timeline, чужая
+            JSONL, чат) → одна кнопка форкает в PTY-claude, вторая в SDK.
+            UUID извлекается regex'ом, не парсится строго — clipboard может
+            содержать «/resume <uuid>» / whitespace / brackets. Имя нового
+            таба = «<sid-prefix>_fork». */}
+        {!hasAnySession && !isSDKTab && (
+          <>
+            <button
+              className="text-[10px] px-1.5 py-0.5 rounded cursor-pointer leading-none flex items-center gap-0.5 transition-colors"
+              style={{
+                color: '#DA7756',
+                backgroundColor: 'transparent',
+                border: '1px solid rgba(218,119,86,0.30)',
+                flexShrink: 0,
+              }}
+              onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'rgba(218,119,86,0.15)'; (e.currentTarget as HTMLButtonElement).style.color = '#FF9466'; }}
+              onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'transparent'; (e.currentTarget as HTMLButtonElement).style.color = '#DA7756'; }}
+              onClick={forkFromClipboardClaude}
+              title="Форк Claude из session ID в буфере обмена"
+            >⑂ Claude-F</button>
+            <button
+              className="text-[10px] px-1.5 py-0.5 rounded cursor-pointer leading-none flex items-center gap-0.5 transition-colors"
+              style={{
+                color: '#DA7756',
+                backgroundColor: 'transparent',
+                border: '1px solid rgba(218,119,86,0.30)',
+                flexShrink: 0,
+              }}
+              onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'rgba(218,119,86,0.15)'; (e.currentTarget as HTMLButtonElement).style.color = '#FF9466'; }}
+              onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'transparent'; (e.currentTarget as HTMLButtonElement).style.color = '#DA7756'; }}
+              onClick={forkFromClipboardSDK}
+              title="Форк SDK из session ID в буфере обмена"
+            >⑂ SDK-F</button>
+          </>
         )}
 
         {/* ⎘ prompt | + clear split-pill — Claude only. Copy current input,
@@ -760,6 +925,12 @@ export default function ClaudeControlBar({
             </button>
           </div>
         )}
+
+        {/* 🎤 Voice dictation (Soniox real-time). Lives next to the prompt
+            split-pill — same conceptual cluster: "actions on the Claude input".
+            Visible for all tab types: SDK → composer, Claude PTY → TUI input,
+            terminal → floating window above the bar (250×5 lines). */}
+        {tabId && <MicButton tabId={tabId} sessionType={sessionType} />}
 
         {/* Context meter — pushes to far right of LEFT cluster via flex spacer.
             Полоска убрана: места мало (control bar 30px, юзеру важна цифра, а
@@ -800,41 +971,44 @@ export default function ClaudeControlBar({
           {!isSDKTab && (
             <div style={{ position: 'relative' }}>
               <button
+                {...triggerProps('provider')}
                 style={{
                   ...triggerStyle,
                   color: activeProvider.tint,
                   borderColor: `${activeProvider.tint}66`,
                   backgroundColor: `${activeProvider.tint}1F`,
                 }}
-                onClick={() => setOpenPopup(openPopup === 'provider' ? null : 'provider')}
+                title="Provider (клик закрепит, ⌘+наведение откроет временно)"
               >
                 <activeProvider.Icon size={11} color={activeProvider.tint} />
                 <span>{activeProvider.label}</span>
                 <span style={{ opacity: 0.6 }}>▴</span>
               </button>
               {openPopup === 'provider' && (
-                <div style={popupStyle}>
-                  {PROVIDER_CATALOG.map(p => {
-                    const active = p.id === providerState.type;
-                    return (
-                      <button
-                        key={p.id}
-                        style={{
-                          ...pillStyle(active, false),
-                          color: active ? '#fff' : p.tint,
-                          backgroundColor: active ? p.tint : 'transparent',
-                          border: `1px solid ${active ? p.tint : 'rgba(255,255,255,0.08)'}`,
-                          display: 'inline-flex',
-                          alignItems: 'center',
-                          gap: 4,
-                        }}
-                        onClick={() => pickProvider(p.id)}
-                      >
-                        <p.Icon size={11} color={active ? '#fff' : p.tint} />
-                        <span>{p.label}</span>
-                      </button>
-                    );
-                  })}
+                <div {...popupHoverProps('provider')} style={popupWrapperStyle}>
+                  <div style={popupCardStyle}>
+                    {PROVIDER_CATALOG.map(p => {
+                      const active = p.id === providerState.type;
+                      return (
+                        <button
+                          key={p.id}
+                          style={{
+                            ...pillStyle(active, false),
+                            color: active ? '#fff' : p.tint,
+                            backgroundColor: active ? p.tint : 'transparent',
+                            border: `1px solid ${active ? p.tint : 'rgba(255,255,255,0.08)'}`,
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            gap: 4,
+                          }}
+                          onClick={() => pickProvider(p.id)}
+                        >
+                          <p.Icon size={11} color={active ? '#fff' : p.tint} />
+                          <span>{p.label}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
                 </div>
               )}
             </div>
@@ -843,25 +1017,28 @@ export default function ClaudeControlBar({
           {/* Model */}
           <div style={{ position: 'relative' }}>
             <button
+              {...triggerProps('model')}
               style={triggerStyle}
-              onClick={() => setOpenPopup(openPopup === 'model' ? null : 'model')}
+              title="Model (клик закрепит, ⌘+наведение откроет временно)"
             >
               <span style={{ color: '#777', fontSize: 10 }}>Model</span>
               <span style={{ color: '#fff' }}>{modelLabel}</span>
               <span style={{ opacity: 0.6 }}>▴</span>
             </button>
             {openPopup === 'model' && (
-              <div style={popupStyle}>
-                {activeProvider.models.map(m => {
-                  const active = m.id === modelActiveId;
-                  return (
-                    <button
-                      key={m.id}
-                      style={pillStyle(active, false)}
-                      onClick={() => pickModel(m.id)}
-                    >{m.label}</button>
-                  );
-                })}
+              <div {...popupHoverProps('model')} style={popupWrapperStyle}>
+                <div style={popupCardStyle}>
+                  {activeProvider.models.map(m => {
+                    const active = m.id === modelActiveId;
+                    return (
+                      <button
+                        key={m.id}
+                        style={pillStyle(active, false)}
+                        onClick={() => pickModel(m.id)}
+                      >{m.label}</button>
+                    );
+                  })}
+                </div>
               </div>
             )}
           </div>
@@ -872,30 +1049,34 @@ export default function ClaudeControlBar({
               нуть Effort заранее, потом включить Think. */}
           <div style={{ position: 'relative' }}>
             <button
+              {...triggerProps('effort')}
               style={{ ...triggerStyle, opacity: !thinkActive ? 0.4 : 1 }}
-              title={!thinkActive ? 'Effort применяется только когда Think включён' : undefined}
-              onClick={() => setOpenPopup(openPopup === 'effort' ? null : 'effort')}
+              title={!thinkActive
+                ? 'Effort применяется только когда Think включён (клик закрепит, ⌘+наведение откроет временно)'
+                : 'Effort (клик закрепит, ⌘+наведение откроет временно)'}
             >
               <span style={{ color: '#777', fontSize: 10 }}>Effort</span>
               <span style={{ color: '#fff' }}>{effortLabel}</span>
               <span style={{ opacity: 0.6 }}>▴</span>
             </button>
             {openPopup === 'effort' && (
-              <div style={popupStyle}>
-                {effortLevels.map(level => {
-                  const active = effortActive === level;
-                  const isUnsupported = isSDKTab && sdkSupportedEfforts != null && !sdkSupportedEfforts.has(level);
-                  const label = level === 'medium' ? 'med' : level === 'xhigh' ? 'xhi' : level;
-                  return (
-                    <button
-                      key={level}
-                      style={pillStyle(active, isUnsupported)}
-                      disabled={isUnsupported}
-                      title={isUnsupported ? `${level} не поддерживается моделью ${sdkModel}` : undefined}
-                      onClick={() => !isUnsupported && pickEffort(level)}
-                    >{label}</button>
-                  );
-                })}
+              <div {...popupHoverProps('effort')} style={popupWrapperStyle}>
+                <div style={popupCardStyle}>
+                  {effortLevels.map(level => {
+                    const active = effortActive === level;
+                    const isUnsupported = isSDKTab && sdkSupportedEfforts != null && !sdkSupportedEfforts.has(level);
+                    const label = level === 'medium' ? 'med' : level === 'xhigh' ? 'xhi' : level;
+                    return (
+                      <button
+                        key={level}
+                        style={pillStyle(active, isUnsupported)}
+                        disabled={isUnsupported}
+                        title={isUnsupported ? `${level} не поддерживается моделью ${sdkModel}` : undefined}
+                        onClick={() => !isUnsupported && pickEffort(level)}
+                      >{label}</button>
+                    );
+                  })}
+                </div>
               </div>
             )}
           </div>

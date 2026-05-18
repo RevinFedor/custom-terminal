@@ -12,7 +12,7 @@ import { attachClosestEdge, extractClosestEdge, type Edge } from '@atlaskit/prag
 import { combine } from '@atlaskit/pragmatic-drag-and-drop/combine';
 import { autoScrollForElements } from '@atlaskit/pragmatic-drag-and-drop-auto-scroll/element';
 import { setCustomNativeDragPreview } from '@atlaskit/pragmatic-drag-and-drop/element/set-custom-native-drag-preview';
-import { ChevronDown, Globe, Bot, Play, Minimize2, Maximize2, PanelLeft, Plus, StickyNote } from 'lucide-react';
+import { ChevronDown, Globe, Bot, Play, Minimize2, Maximize2, PanelLeft, Plus, StickyNote, RotateCw } from 'lucide-react';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -662,24 +662,24 @@ const TabItem = memo(({
                   }}
                 />
               )}
-              {/* AI-busy shimmer — full-tab horizontal sweep. Triggers when AI session
-                  is thinking/streaming (claude:busy-state / gemini:busy-state /
-                  claude-sdk:busy-state). Works for SDK tabs which have no PTY at all. */}
+              {/* AI-busy background pulse — целый таб мягко пульсирует фоном
+                  (см. .tab-ai-busy-shimmer в globals.css). zIndex:0 ставит
+                  оверлей ПОД контентом (текст таба, иконка заметки, статус-
+                  маркер с zIndex:5–6 рендерятся поверх). Раньше zIndex:3 +
+                  sweep-полоса перекрывала текст и кнопки. */}
               {verticalIsAiBusy && (
                 <div
                   className="tab-ai-busy-shimmer"
                   style={{
                     position: 'absolute',
                     // Растягиваемся НА border-area (включая 2px transparent border-left/right
-                    // вкладки), чтобы скругления shimmer'а совпали со скруглениями карточки.
-                    // Без этого слева видна 2px-полоска без shimmer + curved-corners рассинхрон.
+                    // вкладки), чтобы скругления pulse'а совпали со скруглениями карточки.
                     top: 0,
                     bottom: 0,
                     left: '-2px',
                     right: '-2px',
                     pointerEvents: 'none',
-                    zIndex: 3,
-                    overflow: 'hidden',
+                    zIndex: 0,
                     borderRadius: tabGeo.borderRadius,
                   }}
                   aria-hidden
@@ -817,6 +817,45 @@ const TabItem = memo(({
             </span>
           )}
 
+          {/* Restart button — для зелёных (devServer) вкладок с активным процессом
+                занимает место notes-кнопки. Логика: зелёный таб обычно = npm run dev,
+                заметок там почти не пишут, зато перезапуск из меню вкладки нужен часто.
+                Mutex с notes: если рендерится restart — notes не рендерится. handleRestart
+                — тот же что был у удалённого RestartZone (Ctrl+C → kill ports → !! → Enter). */}
+          {isVerticalMode && tab.color === 'green' && hasProcess && (
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                onRestart?.(tab.id);
+              }}
+              onDoubleClick={(e) => e.stopPropagation()}
+              title="Restart process (kill → re-run last command)"
+              className="flex-shrink-0 inline-flex items-center justify-center cursor-pointer transition-colors"
+              style={{
+                width: 20,
+                height: 18,
+                marginLeft: 6,
+                padding: 0,
+                borderRadius: 4,
+                backgroundColor: '#1e1e2e',
+                color: '#86efac',
+                border: '1px solid rgba(34,197,94,0.25)',
+              }}
+              onMouseEnter={(e) => {
+                const el = e.currentTarget as HTMLButtonElement;
+                el.style.backgroundColor = 'rgba(34,197,94,0.18)';
+                el.style.color = '#bbf7d0';
+              }}
+              onMouseLeave={(e) => {
+                const el = e.currentTarget as HTMLButtonElement;
+                el.style.backgroundColor = '#1e1e2e';
+                el.style.color = '#86efac';
+              }}
+            >
+              <RotateCw size={11} strokeWidth={2.2} />
+            </button>
+          )}
+
           {/* Open notes — peek-button. Three visibility rules:
                 1. slideoutOpenHere — slideout is anchored to this tab (solid-indigo, always visible).
                 2. showNotesPeek — Cmd is held, cursor in TabBar, tab has notes (Cmd-hover peek).
@@ -825,8 +864,10 @@ const TabItem = memo(({
                    only where there are notes" — keeping the default-on-active button on an empty
                    active tab during peek would break that rule.
               The data-tab-id attribute lets TabNotesSlideout query the EXACT trigger for its
-              anchor (multiple peek buttons can be on screen at once when Cmd is held). */}
-          {isVerticalMode && (slideoutOpenHere || showNotesPeek || (isActive && !anySlideoutOpen && !cmdPeekMode)) && (
+              anchor (multiple peek buttons can be on screen at once when Cmd is held).
+              Mutex: если этот же таб зелёный с активным процессом — место занимает Restart-кнопка
+              выше, notes не рендерится. */}
+          {isVerticalMode && !(tab.color === 'green' && hasProcess) && (slideoutOpenHere || showNotesPeek || (isActive && !anySlideoutOpen && !cmdPeekMode)) && (
             <button
               data-tab-notes-open-trigger
               data-tab-id={tab.id}
@@ -835,6 +876,7 @@ const TabItem = memo(({
                 const cur = useUIStore.getState().notesPanelOpenTabs[tab.id] ?? false;
                 useUIStore.getState().setNotesPanelOpen(tab.id, !cur);
               }}
+              onDoubleClick={(e) => e.stopPropagation()}
               title="Open notes (Cmd+E)"
               className="flex-shrink-0 inline-flex items-center justify-center cursor-pointer transition-colors"
               style={{
@@ -1464,10 +1506,21 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   const mainTabs = visibleTabs.filter(t => !t.isUtility);
   const utilityTabs = visibleTabs.filter(t => t.isUtility);
 
-  const handleNewTab = () => {
-    // Get current tab's cwd
+  // CWD priority: project.path (if bound) → активный таб cwd → HOME.
+  // Раньше было наоборот (активный таб → project.path) — при бранч-хоппинге
+  // в активном табе следующий «New Tab» наследовал cwd текущей ветки/папки
+  // вместо корня проекта. Юзер: «новая вкладка автоматически в той директории,
+  // к которой привязан проект». `__unset__` — sentinel для проектов без
+  // привязанной директории (Dashboard / freshly opened без папки).
+  const resolveNewTabCwd = (): string => {
+    const bound = project.path && !project.path.startsWith('__unset__') ? project.path : '';
+    if (bound) return bound;
     const activeTab = workspace.activeTabId ? workspace.tabs.get(workspace.activeTabId) : null;
-    const cwd = activeTab?.cwd || project.path;
+    return activeTab?.cwd || '';
+  };
+
+  const handleNewTab = () => {
+    const cwd = resolveNewTabCwd();
     // Pass undefined for name to use smart naming (tab-1, tab-2, etc.)
     createTabAfterCurrent(projectId, undefined, cwd);
     setProjectView(projectId, 'terminal');
@@ -1475,8 +1528,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
 
   // Create new tab at the end of tabs list (for double-click on empty space)
   const handleNewTabAtEnd = () => {
-    const activeTab = workspace.activeTabId ? workspace.tabs.get(workspace.activeTabId) : null;
-    const cwd = activeTab?.cwd || project.path;
+    const cwd = resolveNewTabCwd();
     createTab(projectId, undefined, cwd);
     setProjectView(projectId, 'terminal');
   };
@@ -2754,6 +2806,61 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
           >
             {isMultiSelect ? `Copy ${selectedTabIds.length} Sessions` : 'Copy ID/Path'}
           </button>
+
+          {/* Revert Session — submenu shown only for claude tabs with rotation history.
+              Safety-net for accidental overwrites by bridge watcher / AutoResume / Timeline
+              chain resolver — user can return to the previous value with one click.
+              See docs/knowledge/fix-bridge-stale-takeover.md. */}
+          {!isMultiSelect && contextMenu && (() => {
+            const ctxTab = workspace.tabs.get(contextMenu.tabId);
+            const hist = ctxTab?.claudeSessionHistory;
+            if (!ctxTab || ctxTab.commandType !== 'claude' || !hist || hist.length === 0) return null;
+            const fmtAgo = (ms: number) => {
+              const sec = Math.floor((Date.now() - ms) / 1000);
+              if (sec < 60) return sec + 's ago';
+              if (sec < 3600) return Math.floor(sec / 60) + 'm ago';
+              if (sec < 86400) return Math.floor(sec / 3600) + 'h ago';
+              return Math.floor(sec / 86400) + 'd ago';
+            };
+            return (
+              <div className="relative group/revert">
+                <button
+                  className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center justify-between"
+                >
+                  <span className="flex items-center gap-2">
+                    <span className="text-[#888]">↶</span>
+                    Revert Session
+                    <span className="text-[10px] text-[#555]">{hist.length}</span>
+                  </span>
+                  <span className="text-[#666]">{'›'}</span>
+                </button>
+                <div className="absolute left-full top-0 -ml-2 pl-2 hidden group-hover/revert:block">
+                  <div className="bg-[#2a2a2a] border border-[#444] rounded-xl shadow-2xl py-1 min-w-[260px]">
+                    {hist.map((entry, idx) => (
+                      <button
+                        key={entry.sessionId + idx}
+                        className="w-full text-left px-3 py-1.5 text-[12px] text-[#ccc] hover:bg-white/10 cursor-pointer"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          if (contextMenu) {
+                            useWorkspaceStore.getState().setClaudeSessionId(contextMenu.tabId, entry.sessionId, 'userRevert');
+                            showToast('Reverted to ' + entry.sessionId.substring(0, 8), 'success');
+                          }
+                          setContextMenu(null);
+                        }}
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="font-mono text-[12px]">{entry.sessionId.substring(0, 8)}</span>
+                          <span className="text-[10px] text-[#777]">{fmtAgo(entry.at)}</span>
+                        </div>
+                        <div className="text-[10px] text-[#666] mt-0.5">{entry.reason}</div>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            );
+          })()}
 
           {/* Add / Remove Favorites */}
           {!isMultiSelect && (

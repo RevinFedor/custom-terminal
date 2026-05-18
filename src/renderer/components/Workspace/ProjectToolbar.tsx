@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import { Home, Minimize2, RotateCcw, Globe, PanelLeft, FileEdit } from 'lucide-react';
 import { VscVscode } from 'react-icons/vsc';
 import { useUIStore } from '../../store/useUIStore';
@@ -9,6 +9,7 @@ import { compressLogs } from '../../utils/compressLogs';
 import SemanticIndexButton from './SemanticIndexButton';
 import CopySessionWithChips from './CopySessionWithChips';
 import DocsButton from './DocsButton';
+import DictationHistoryButton from './DictationHistoryButton';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -112,6 +113,29 @@ export default function ProjectToolbar() {
       showToast(`GT Editor: ${err.message}`, 'error');
     });
   };
+
+  // Cmd+G — глобальный хоткей для «Открыть в GT Editor». Используем `e.code`
+  // ('KeyG'), а не `e.key`, чтобы хоткей работал в кириллической раскладке
+  // тоже (в кириллице `e.key === 'п'`, но `e.code === 'KeyG'` остаётся
+  // физическим клавиатурным сигналом). Тот же паттерн, что для Cmd+T / Cmd+W
+  // / Cmd+, в App.tsx — единая конвенция в проекте.
+  // Гарды: игнорируем, если фокус в input/textarea/contenteditable (юзер
+  // печатает букву G) и если Shift/Alt/Ctrl нажаты (Cmd+Shift+G — find prev
+  // в браузерах, потенциальный конфликт).
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!e.metaKey || e.shiftKey || e.altKey || e.ctrlKey) return;
+      if (e.code !== 'KeyG') return;
+      const target = e.target as HTMLElement | null;
+      const tag = target?.tagName;
+      const editable = target?.isContentEditable;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || editable) return;
+      e.preventDefault();
+      handleOpenGTEditor();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [activeProjectId, openProjects, projects]);
 
   const handleCompressLogs = async () => {
     if (isCompressing) return;
@@ -240,7 +264,7 @@ export default function ProjectToolbar() {
       </Tooltip>
 
       {/* Open in GT Editor Button */}
-      <Tooltip content="Открыть проект в GT Editor (Ctrl+G там — go-to file:line)">
+      <Tooltip content="Открыть проект в GT Editor (⌘G)">
       <button
         onClick={handleOpenGTEditor}
         style={buttonStyle(false)}
@@ -286,6 +310,14 @@ export default function ProjectToolbar() {
 
       {/* Flex spacer — pushes session-copy cluster to the right edge of the toolbar */}
       <div style={{ flex: 1 }} />
+
+      {/* Dictation history — last 100 transcripts captured via the bottom-bar mic.
+          Sits left of Docs/Copy because it's not session-bound (lives across all
+          projects) and the user reaches for it independently of the session-copy
+          flow. Renders the same chip-shaped dropdown style as CopySessionButton. */}
+      <div className="flex items-center pr-2">
+        <DictationHistoryButton />
+      </div>
 
       {/* Docs popover trigger — opens ActionsPanel (Update Docs / Update API → Haiku
           pipeline). Pair-aligned with CopySessionWithChips popover: both anchor to

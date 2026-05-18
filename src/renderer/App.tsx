@@ -21,6 +21,7 @@ import { combine } from '@atlaskit/pragmatic-drag-and-drop/combine';
 // Initialize debug logger (exposes `debug` helper in console)
 import './utils/logger';
 import { usePromptQueueRunner } from './hooks/usePromptQueueRunner';
+import { markPendingResume } from './utils/pendingResume';
 import { hydratePromptQueueStore } from './store/usePromptQueueStore';
 
 const { ipcRenderer } = window.require('electron');
@@ -409,7 +410,24 @@ function App() {
       window.dispatchEvent(new CustomEvent('settings:opened'));
     };
     window.addEventListener('settings:open', onSettingsOpen);
-    return () => window.removeEventListener('settings:open', onSettingsOpen);
+
+    // Bridge: main process can ask us to open Settings on a specific tab via
+    // IPC 'open-settings'. Used by Global Dictation's menu "Open App" button.
+    const onOpenSettingsIpc = (_e: any, payload: { tab?: string } | undefined) => {
+      const tab = payload?.tab || null;
+      setSettingsInitialTab(tab);
+      setSettingsOpen(true);
+    };
+    try {
+      const { ipcRenderer } = (window as any).require('electron');
+      ipcRenderer.on('open-settings', onOpenSettingsIpc);
+      return () => {
+        window.removeEventListener('settings:open', onSettingsOpen);
+        try { ipcRenderer.removeListener('open-settings', onOpenSettingsIpc); } catch {}
+      };
+    } catch {
+      return () => window.removeEventListener('settings:open', onSettingsOpen);
+    }
   }, []);
 
   // Auto-close markdown-editor overlays (Cmd+/ palette, AI-paste indicator) on
@@ -1227,6 +1245,12 @@ function App() {
             for (const { tabId, sessionId } of tabs) {
               s.clearInterruptedState(tabId);
               s.setTabCommandType(tabId, 'claude');
+              // Reserve sessionId BEFORE writing to PTY: SessionBridge fires
+              // claude:session-detected within ~1-2 sec, and any stale bridge
+              // file (Claude CLI keeps months-old bridge JSONs around) racing
+              // ahead of the real resume would stomp this tab. The flag stops
+              // exactly that race. See utils/pendingResume.ts.
+              markPendingResume(tabId, sessionId);
               ipcRenderer.send('terminal:input', tabId, 'claude --dangerously-skip-permissions --resume ' + sessionId + '\r');
               ipcRenderer.send('terminal:force-command-started', { tabId });
               console.warn('[AutoResume] Resumed', tabId, sessionId.substring(0, 8));
@@ -1431,13 +1455,16 @@ function App() {
           const activeProject = getActiveProject();
           const currentProject = projects[activeProjectId];
           const effectiveId = getEffectiveTabId();
+          // CWD priority: project.path (если привязан) → cwd активного таба
+          // → HOME (createTab сам подставит при пустой строке). Юзер: «новая
+          // вкладка автоматически в той директории, к которой привязан проект».
+          const boundProjectPath = currentProject?.path && !currentProject.path.startsWith('__unset__') ? currentProject.path : '';
           if (currentProject && effectiveId) {
-            // Get current tab's cwd (sub-agent aware)
             const currentTab = activeProject?.tabs.get(effectiveId);
-            const cwd = currentTab?.cwd || currentProject.path;
+            const cwd = boundProjectPath || currentTab?.cwd || '';
             createTabAfterCurrent(activeProjectId, undefined, cwd);
           } else if (currentProject) {
-            createTab(activeProjectId, undefined, currentProject.path);
+            createTab(activeProjectId, undefined, boundProjectPath);
           }
           // Switch to terminal view if on Home (per-project)
           const ws = useWorkspaceStore.getState().openProjects.get(activeProjectId);

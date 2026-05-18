@@ -15,6 +15,7 @@ VSCode-style полоса по всей нижней границе окна (п
 | `● kill dev-ports` toggle | Перед каждым запуском npm-скрипта убивать занятые порты проекта | `localStorage` ключ `noted-terminal-free-ports-before-start` |
 | `● bridges` toggle | Подсвечивать невидимые hover-мосты красным (через `HoverBridgeDebug`) | `localStorage` ключ `noted-terminal-debug-hover-bridges` |
 | `! N` оранжевый chip | Счётчик невалидных файловых путей в AI-промптах (рендерится только если N > 0) | derived, не persist |
+| `● freeze tooltips` toggle | Cmd-popup'ы Timeline (tooltip / note / fork) не закрываются по Cmd-release / mouseleave — для инспекции DOM в DevTools | **in-memory**, не persist |
 | `⚙` Settings button | Открывает `SettingsModal` | — |
 
 Левая зона зарезервирована под будущие git/branch/lints/etc — пока живёт только `WebServerChip` (LAN IP мобильного web-сервера).
@@ -47,6 +48,14 @@ Chip-trigger в status bar открывает popup с 6 кнопками тре
 `HoverBridgeDebug` принимает `containerRef` + `menuRef` + `direction: 'left' | 'right' | 'above' | 'below'`, перемеряется через `requestAnimationFrame` (плавно при изменении размеров). См. [`HoverBridgeDebug.tsx`](../../src/renderer/components/HoverBridgeDebug.tsx).
 
 **Зачем юзеру это** — отладка «popup закрывается, когда курсор должен был остаться в hover-зоне». Включил тогл → увидел красный rect → понятно, куда курсор должен идти и где реально мёртвая зона.
+
+## Freeze tooltips toggle
+
+Включает `useUIStore.freezeCmdPopups = true`. В Timeline три `useEffect`-а, которые закрывают Cmd-popup'ы при отпускании Cmd или уводе мыши с tooltip-area, читают этот флаг и **пропускают** ветку закрытия. То есть: открыл Cmd+hover → отпустил Cmd → tooltip остался → можно навестись курсором в любую точку UI (включая DevTools) и спокойно инспектировать DOM popup'а, селекторы, computed styles.
+
+Без этого инспектировать tooltip практически невозможно: Cmd-keyup мгновенно скрывает popup, а попытка зажать Cmd и кликать в DevTools переключает фокус → blur-event → popup-state сброс. Использовался при отладке 8px-bridge ловушки (см. [`fix-timeline-tooltip-stability.md::Layout-child bridge ловушка`](fix-timeline-tooltip-stability.md)) — без freeze diagnostic-логи через `Array.from(children).map(getBoundingClientRect)` пришлось бы добавлять отдельным ref-callback'ом, что засоряло logs/dev.log.
+
+**In-memory (не persist).** Diagnostic-флаги не должны переживать рестарт — иначе юзер забывает выключить, при следующем запуске Cmd-popup'ы «залипают» без явной причины и юзер думает что приложение сломалось.
 
 ## InvalidPathsChip — реактивная валидация путей в AI-промптах
 

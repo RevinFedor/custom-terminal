@@ -41,7 +41,16 @@ renderer: {
     build: {
       outDir: 'dist/renderer',
       rollupOptions: {
-        input: resolve(__dirname, 'index.html')
+        input: {
+          // Main app — keep `main` key so output stays `index.html`.
+          main: resolve(__dirname, 'index.html'),
+          // Global Dictation overlays — separate top-level HTML entries, each
+          // loads its own React tree via the global-dictation modules. The
+          // main process picks them by URL when creating the overlay windows.
+          'global-dictation-chip': resolve(__dirname, 'global-dictation-chip.html'),
+          'global-dictation-rec': resolve(__dirname, 'global-dictation-rec.html'),
+          'global-dictation-menu': resolve(__dirname, 'global-dictation-menu.html'),
+        }
       },
       commonjsOptions: {
         // Ensure single React instance in bundle

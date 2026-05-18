@@ -65,6 +65,7 @@ import { useWorkspaceStore, type PendingAction } from '../../store/useWorkspaceS
 import { PromptQueueOverlay } from './PromptQueueOverlay';
 import { terminalRegistry } from '../../utils/terminalRegistry';
 import { log } from '../../utils/logger';
+import { markPendingResume, clearPendingResume, isStaleAgainstPending } from '../../utils/pendingResume';
 
 // Get buffer management functions outside of component to avoid re-renders
 const getBufferActions = () => ({
@@ -550,14 +551,28 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
       }
     };
 
-    // Session Bridge: receive session ID from StatusLine bridge watcher
+    // Session Bridge: receive session ID from StatusLine bridge watcher.
+    //
+    // pendingResume guard (see utils/pendingResume.ts and
+    // docs/knowledge/fix-bridge-stale-takeover.md):
+    // If this tab just sent `claude --resume <X>` and the bridge is now offering
+    // a DIFFERENT sessionId, that bridge event almost certainly comes from a
+    // stale ~/.claude/bridge/*.json that survived from a long-dead process
+    // (Claude CLI never deletes those). Drop it — the real resumed process will
+    // write its own bridge file within seconds and we'll pick that one up.
     const handleSessionDetected = (_: any, data: { tabId: string; sessionId: string }) => {
       if (data.tabId !== tabId) return;
+      if (isStaleAgainstPending(tabId, data.sessionId)) {
+        console.warn('[Terminal:Bridge] IGNORE stale session for tab', tabId.slice(-12), ': bridge offered', data.sessionId.substring(0, 8), 'but resume in flight to a different id');
+        return;
+      }
       const currentId = getClaudeSessionId(tabId);
       if (currentId !== data.sessionId) {
         console.warn('[Terminal:Bridge] OVERWRITE session for tab', tabId, ':', (currentId || 'null').substring(0, 8), '→', data.sessionId.substring(0, 8));
       }
-      getSetClaudeSessionId()(tabId, data.sessionId);
+      getSetClaudeSessionId()(tabId, data.sessionId, 'bridge');
+      // Resume confirmed — clear pending flag.
+      clearPendingResume(tabId);
     };
 
     // Fresh Claude process started for this tab (new PID seen in bridge cache).
@@ -584,7 +599,7 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
       if (data.tabId !== tabId) return;
       const currentId = getClaudeSessionId(tabId);
       if (!currentId) {
-        getSetClaudeSessionId()(tabId, data.sessionId);
+        getSetClaudeSessionId()(tabId, data.sessionId, 'bridge');
       }
     };
 
@@ -925,6 +940,12 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
         const devServerMatch = fullLine.match(/\b(npm|npx|yarn|pnpm|bun)\s+(run\s+)?(dev|start|serve|watch)\b/i);
         const geminiMatch = fullLine.match(/\bgemini(\s|$)/i);
 
+        if (devServerMatch || geminiMatch) {
+          const claudeSess = getClaudeSessionId(tabId);
+          const preview = fullLine.length > 80 ? fullLine.slice(0, 80) + '…' : fullLine;
+          console.warn('[CmdDetect:initTerminal] tab=' + tabId.slice(-8) + ' match=' + (devServerMatch ? 'devServer' : 'gemini') + ' bufType=' + term.buffer.active.type + ' claudeSess=' + (claudeSess ? claudeSess.slice(0, 8) : 'null') + ' fullLine="' + preview.replace(/"/g, '\\"') + '"');
+        }
+
         if (devServerMatch) {
           getSetTabCommandType()(tabId, 'devServer');
         } else if (geminiMatch) {
@@ -1010,7 +1031,8 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
                                 if (result.success) {
                                   console.log('[Claude Intercept] Forked to new session:', result.newSessionId);
                                   getSetTabCommandType()(tabId, 'claude'); // Set commandType for Timeline visibility
-                                  getSetClaudeSessionId()(tabId, result.newSessionId);
+                                  getSetClaudeSessionId()(tabId, result.newSessionId, 'fork');
+                                  markPendingResume(tabId, result.newSessionId);
                                   ipcRenderer.send('terminal:input', tabId, 'claude --dangerously-skip-permissions --resume ' + result.newSessionId + '\r');
                                 } else {
                                   console.error('[Claude Intercept] Fork failed:', result.error);
@@ -1052,7 +1074,13 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
           const sessionId = resumeMatch[1];
           console.log('[Claude Intercept] Direct --resume detected, sessionId:', sessionId);
           getSetTabCommandType()(tabId, 'claude');
-          getSetClaudeSessionId()(tabId, sessionId);
+          getSetClaudeSessionId()(tabId, sessionId, 'userIntercept');
+          // Tell the Bridge handler to reject any stale ~/.claude/bridge/*.json
+          // that resolves to this tab with a DIFFERENT sessionId during the next
+          // 15s. Without this, ancient stale bridge files (Claude CLI never
+          // cleans them up) can stomp the user's resume target right after they
+          // hit Enter. See utils/pendingResume.ts.
+          markPendingResume(tabId, sessionId);
           // Let the command pass through, but set commandType for Timeline
           // Don't preventDefault - let it run normally
         }
@@ -1414,6 +1442,12 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
           const devServerMatch = fullLine.match(/\b(npm|npx|yarn|pnpm|bun)\s+(run\s+)?(dev|start|serve|watch)\b/i);
           const geminiMatch = fullLine.match(/\bgemini(\s|$)/i);
 
+          if (devServerMatch || geminiMatch) {
+            const claudeSess = getClaudeSessionId(tabId);
+            const preview = fullLine.length > 80 ? fullLine.slice(0, 80) + '…' : fullLine;
+            console.warn('[CmdDetect:reattach] tab=' + tabId.slice(-8) + ' match=' + (devServerMatch ? 'devServer' : 'gemini') + ' bufType=' + term.buffer.active.type + ' claudeSess=' + (claudeSess ? claudeSess.slice(0, 8) : 'null') + ' fullLine="' + preview.replace(/"/g, '\\"') + '"');
+          }
+
           if (devServerMatch) {
             log.commands('Detected devServer command, setting commandType');
             getSetTabCommandType()(tabId, 'devServer');
@@ -1533,7 +1567,8 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
               if (result.success) {
                 console.log('[Claude Intercept] Forked to new session:', result.newSessionId);
                 getSetTabCommandType()(tabId, 'claude'); // Set commandType for Timeline visibility
-                getSetClaudeSessionId()(tabId, result.newSessionId);
+                getSetClaudeSessionId()(tabId, result.newSessionId, 'fork');
+                markPendingResume(tabId, result.newSessionId);
                 ipcRenderer.send('terminal:input', tabId, 'claude --dangerously-skip-permissions --resume ' + result.newSessionId + '\r');
               } else {
                 console.error('[Claude Intercept] Fork failed:', result.error);
@@ -1576,7 +1611,8 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
             const sessionId = resumeMatch[1];
             console.log('[Claude Intercept 2] Direct --resume detected, sessionId:', sessionId);
             getSetTabCommandType()(tabId, 'claude');
-            getSetClaudeSessionId()(tabId, sessionId);
+            getSetClaudeSessionId()(tabId, sessionId, 'userIntercept');
+            markPendingResume(tabId, sessionId);
             // Let the command pass through, but set commandType for Timeline
           }
 
