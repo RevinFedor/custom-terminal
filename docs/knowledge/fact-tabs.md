@@ -1,7 +1,7 @@
 # Feature: Tab Management
 
 ## Intro
-Система вкладок в стиле VSCode с разделением на зоны (Main/Utils), поддержкой интеллектуального именования и автоматического окрашивания.
+Система вкладок в стиле VSCode с разделением на зоны (Main/Utils), поддержкой интеллектуального именования и автоматического окрашивания. В 2026-05 переехала из горизонтального TabBar (над терминалом) в постоянный левый сайдбар (`TabSidebar` 200px default, drag-resize 140-400 через handle на правом краю). Root layout: `[Titlebar] / [ProjectToolbar — full width] / [TabSidebar | TerminalArea | TabNotesSlideout]`. Горизонтальный TabBar остался как fallback-режим в utility-зоне (dropdown collapsed-табы), полное удаление пока не сделано — единая компонента отдаёт оба layout'а через `layout='vertical'` prop.
 
 ## Tab Naming Patterns
 ### Auto-generated Names
@@ -112,6 +112,72 @@
 - **Sync:** Порядок проектов сохраняется в `Map` внутри `useWorkspaceStore`.
 - **Title Bar Integration:** Пустая зона для дропа (`ProjectEmptyDropZone`) поддерживает `WebkitAppRegion: drag`, когда не активен процесс перетаскивания, позволяя двигать окно приложения за шапку.
 
+
+## Vertical mode (TabSidebar)
+
+Permanent left sidebar шириной 140-400px (drag-resize handle на правом краю, default 200, ключ `tabSidebarWidth` в localStorage). Все вкладки одинаково растягиваются на 100% ширины колонки. Тот же TabBar.tsx-компонент через `layout='vertical'` prop.
+
+### Активность через bg-saturation, не top-border
+
+В горизонтальном TabBar активность кодировалась `border-top: 2px solid ${borderColor}` сверху таба. В vertical mode это плохо: занимает 2px из дефицитной вертикали в плотной колонке, и читается как самостоятельный визуальный язык (interrupted=dashed-blue, selected=dashed-white всё ещё используют border'ы — путаница).
+
+Решение — активность через alpha-step фонового цвета самой вкладки. PTY claude (saffron orange):
+- inactive 0.20 alpha → `#49352F` на `#252526` panel
+- hover    0.28 alpha → `#5C3F35`
+- active   0.45 alpha → `#764A3C`
+
+SDK claude (terracotta):
+- inactive 0.30 alpha → `#664F42`
+- hover    0.38 alpha → `#76594A`
+- active   0.55 alpha → `#9D7359`
+
+Hover-step для SDK выше чем для PTY (`+0.08` vs `+0.08`, но от более высокой базы) — SDK не имеет PTY-bar в качестве дополнительного активности-сигнала, поэтому весь акцент состояния идёт через alpha. Не путать с inactive-step: раньше неактивные coloured tabs дополнительно дамперились (`base - 0.10`) чтобы активная вкладка доминировала; юзер три итерации репортил *«не яркость, а прозрачность — даже когда вкладка неактивна, цвет должен быть более яркий»* — дампер убран, inactive теперь равен **прошлому hover'у**, hover поднят отдельным `+0.08` step'ом.
+
+Для uncoloured (browser tabs, новые fresh tabs) — белая подложка 4% inactive → 12% hover → 20% active. **Полностью transparent inactive запрещён**: вкладка сливается с панелью, граница теряется. Минимальный alpha-floor 4% обязателен. См. `methodology/design.md::Активность через насыщенность фона`.
+
+### SDK claude — distinct hue от PTY claude
+
+PTY claude tabs используют saffron `#DA7756` (brand-tint Claude). SDK tabs тоже `color: 'claude'` в данных, но отдельный override в TabItem chrome: `bgColor: rgba(210, 140, 90, 0.30)`, `borderColor: '#D28C5A'` — терракотовый, явно жёлтее/светлее saffron. Юзер: *«вкладки SDK я вообще не могу различать с PTY, они слишком тусклые»*.
+
+**Что пробовали и почему не сработало:**
+- Peach `rgba(255, 178, 130, 0.14)` (изначальный SDK override) — слишком светлый, при active 0.39 alpha белый текст сливался с фоном. Контраст ≈ 4.0, на границе читаемости.
+- Peach `rgba(255, 178, 130, 0.30)` — alpha подняли, контраст inactive стал ок, но юзер: *«белый цвет сливается с ним даже когда вкладка активная»*. Корень: подняли только alpha, RGB остался `(255,178,130)` — слишком близкий к белому (`#FFB382` light salmon). При наложении на panel с alpha 0.55 итог уходит в светлую область где белый text contrast падает.
+- Финал terracotta `rgba(210, 140, 90, 0.30)` — изменили RGB, не alpha. `(210,140,90)` = `#D28C5A` (тёплый коричнево-янтарный), контраст с белым текстом ≈ 5.7 на любом alpha-step. PTY (более красно-рыжий saffron `#DA7756`) vs SDK (более жёлто-коричневый terracotta `#D28C5A`) отличаются **тоном**, не только насыщенностью — на одном `#252526` фоне глаз ловит «два разных runtime'а» без необходимости запоминать какой ярче.
+
+### Два независимых индикатора активности
+
+PTY-процесс жив (claude CLI запущен, или npm run dev) → 3px `tab-process-bar` у края вкладки. AI «думает»/стримит (claude:busy-state / gemini:busy-state / claude-sdk:busy-state) → `tab-ai-busy-shimmer` (full-width horizontal sweep через `::after`). Сосуществуют независимо:
+
+- PTY claude в думанье → оба активны (bar + shimmer)
+- SDK claude в думанье → только shimmer (нет PTY)
+- npm run dev → только bar
+- idle taб → ни одного
+
+См. `methodology/design.md::Два независимых сигнала на одной зоне` (почему нельзя через OR) и `knowledge/fact-process-bar.md` (полная конфигурация bar).
+
+### Configurable session statuses
+
+Status marker 8px (dot или square, sizePx 4..16) рисуется absolute на `left: 5px`, `top: calc(50% + 1px)` слева от текста. `+1px` к геометрическому центру — оптическая компенсация baseline-шифта строчных букв в названиях табов (`claude-03`, `tab-1`, `bash` — все без descender'ов, текст «садится» чуть ниже геометрического центра контейнера). Без сдвига маркер кажется немного выше текста. См. `methodology/design.md::Baseline-шифт оптической центровки`.
+
+Назначается через ПКМ → Status submenu. Список статусов полностью кастомизируется юзером в Settings → Системные (label, hex, добавление, удаление). Tab.sessionStatus хранит **id** статуса, не label — переименование сохраняет ассоциацию. Удаление статуса не чистит Tab.sessionStatus (graceful degrade: возврат статуса с тем же id оживляет все вкладки). Подробности — `knowledge/fact-session-status.md`.
+
+ПКМ Status submenu имеет preview трёх первых статусов inline справа от лейбла `Status ›` — юзер видит «вот эти точки это про статусы» без открытия submenu. См. `methodology/design.md::Submenu trigger показывает preview содержимого`. Toggle-семантика: повторный клик по активному статусу снимает его. Color submenu из ПКМ удалён — юзер не использовал.
+
+### Wheel handler gotcha
+
+`handleWheel` в TabBar.tsx ранее форсировал `scrollLeft += deltaY` на overflowX:hidden контейнере для горизонтального wheel-скролла без Shift. В vertical mode этот же useEffect блокирует нативный вертикальный скролл колесом — деление `scrollLeft` ничего не делает (overflowX:hidden), но `e.preventDefault()` глотает событие до того как браузер обработает scrollTop. Симптом: «вкладки не скроллятся колесом в sidebar».
+
+Фикс — `if (isVerticalLayout) return;` early-return в useEffect перед `addEventListener`. Не удалять весь handler — горизонтальный legacy-режим в utility-dropdown ещё использует.
+
+### CMD+hover preview справа
+
+В vertical layout TabPreviewPopover открывается справа от таба (`placement='right'`) вертикально центрированным. Детали — `knowledge/fact-tab-preview-popover.md::Layout & позиционирование`.
+
+### EmptyDropZone affordance в vertical
+
+Пустая зона ниже последнего таба — drop-target для cross-project переноса, плюс double-click создаёт новую вкладку. В horizontal mode эта зона тянется вправо до края TabBar; юзер ассоциирует её с пустым местом справа от табов и понимает что туда можно дропать. В vertical mode пустая зона занимает всю остаточную высоту колонки, никаких визуальных подсказок что в неё «можно». Симптом — юзер с пустым sidebar'ом не знает как создать первую вкладку (ПКМ → +add new требует знания контекст-меню).
+
+Решение — dashed-border плейсхолдер `+ New tab` в начале vertical empty zone, click = создать таб. Drop-target остаётся на всей зоне как раньше. Hover-state на плейсхолдере подсвечивает border + text → юзер визуально опознаёт «это кликабельно». Horizontal mode без affordance: там empty zone узкая, явный «+» вкладкой сделает её визуально похожей на full-fledged tab при разном hover-state — путаница. См. `methodology/design.md::Empty zone в vertical нужно явный placeholder для discoverability`.
 
 ## Code Map
 - **UI:** `src/renderer/components/Workspace/TabBar.tsx` — логика меню, `RestartZone`, `onGenerateDragPreview` для multi-drag и `useEffect` для авто-скролла.

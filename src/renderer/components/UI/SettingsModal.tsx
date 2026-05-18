@@ -310,30 +310,28 @@ function SidebarBehaviorSettings() {
   );
 }
 
-// SessionStatusesEditor — полный CRUD над sessionStatuses в useUIStore.
-// Один блок заменяет старые «Цвета — Системные» + «Цвета — Пользовательские» (оба
-// были read-only и непонятные). Здесь юзер:
-//   • редактирует label инлайн (одна строка)
-//   • редактирует hex руками (input с # и 6 hex-чарами) — превью кружочка обновляется live
-//   • открывает popover с react-colorful (2D saturation+lightness picker + hue slider)
-//   • удаляет статус (delete icon) — корзина без подтверждения, но id сохраняется в Tab.sessionStatus
-//     (если статус вернут — маркер автоматически восстановится)
-//   • добавляет новый статус (кнопка с +)
-// Hex normalization: принимаем 'fff' / '#fff' / 'ffffff' / '#ffffff' / 'FFF...'; всё что не парсится
-// — не записываем, оставляем старый цвет. Это убирает «пустой #» в инпуте который сломал бы маркер.
+// Общий hex-normalizer для всех color input'ов. Принимает 'fff' / '#fff' / 'ffffff' /
+// '#ffffff' / 'FFF...'; всё что не парсится — null, caller оставляет старый цвет.
+function normalizeHexValue(raw: string): string | null {
+  let v = raw.trim().replace(/^#/, '');
+  if (/^[0-9a-fA-F]{3}$/.test(v)) v = v.split('').map((c) => c + c).join('');
+  if (/^[0-9a-fA-F]{6}$/.test(v)) return `#${v.toUpperCase()}`;
+  return null;
+}
+
+// SessionStatusesEditor — компактный CRUD над sessionStatuses + shape/size маркера.
+// Одна колонка из 2-колоночного layout «Системные».
 function SessionStatusesEditor() {
   const sessionStatuses = useUIStore((s) => s.sessionStatuses);
   const updateSessionStatus = useUIStore((s) => s.updateSessionStatus);
   const addSessionStatus = useUIStore((s) => s.addSessionStatus);
   const removeSessionStatus = useUIStore((s) => s.removeSessionStatus);
+  const statusMarker = useUIStore((s) => s.statusMarker);
+  const setStatusMarker = useUIStore((s) => s.setStatusMarker);
 
-  // Какой статус сейчас открыт в picker'е. null = ни один.
   const [pickerOpenId, setPickerOpenId] = useState<string | null>(null);
-  // Локальный буфер для hex-input. Позволяет юзеру печатать промежуточные значения
-  // ('#ab') без немедленного сохранения мусора в стор.
   const [hexDrafts, setHexDrafts] = useState<Record<string, string>>({});
 
-  // Сворачиваем picker при клике вне.
   const containerRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (!pickerOpenId) return;
@@ -347,21 +345,14 @@ function SessionStatusesEditor() {
     return () => window.removeEventListener('mousedown', onDown);
   }, [pickerOpenId]);
 
-  const normalizeHex = (raw: string): string | null => {
-    let v = raw.trim().replace(/^#/, '');
-    if (/^[0-9a-fA-F]{3}$/.test(v)) v = v.split('').map((c) => c + c).join('');
-    if (/^[0-9a-fA-F]{6}$/.test(v)) return `#${v.toUpperCase()}`;
-    return null;
-  };
-
   return (
     <div
       ref={containerRef}
-      style={{ padding: '14px', backgroundColor: '#222', border: '1px solid #333', borderRadius: '10px' }}
+      style={{ padding: '12px', backgroundColor: '#222', border: '1px solid #333', borderRadius: '10px', height: '100%' }}
     >
       <div style={{
         display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-        marginBottom: '12px',
+        marginBottom: '10px',
       }}>
         <div style={{ fontSize: '11px', fontWeight: 600, color: '#666', textTransform: 'uppercase' }}>
           Статусы вкладок
@@ -370,18 +361,63 @@ function SessionStatusesEditor() {
           onClick={addSessionStatus}
           style={{
             display: 'inline-flex', alignItems: 'center', gap: '4px',
-            padding: '4px 10px', fontSize: '12px', color: '#ccc',
+            padding: '3px 8px', fontSize: '11px', color: '#ccc',
             backgroundColor: '#2a2a2a', border: '1px solid #444', borderRadius: '6px',
             cursor: 'pointer',
           }}
           title="Добавить статус"
         >
-          <Plus size={12} /> новый
+          <Plus size={11} /> новый
         </button>
       </div>
 
-      <div style={{ fontSize: '11px', color: '#666', marginBottom: '10px', lineHeight: 1.5 }}>
-        Статусы выбираются в ПКМ-меню вкладки. Маркер 8px рисуется слева во вкладке (vertical layout).
+      {/* Compact row: shape toggle + size input — управляют отображением маркера */}
+      <div style={{
+        display: 'flex', alignItems: 'center', gap: '10px',
+        padding: '6px 8px', marginBottom: '10px',
+        backgroundColor: '#1e1e1e', border: '1px solid #333', borderRadius: '8px',
+      }}>
+        <span style={{ fontSize: '11px', color: '#888' }}>Маркер:</span>
+        <div style={{ display: 'inline-flex', backgroundColor: '#1a1a1a', borderRadius: '6px', border: '1px solid #333' }}>
+          {(['dot', 'square'] as const).map((shp) => (
+            <button
+              key={shp}
+              onClick={() => setStatusMarker({ shape: shp })}
+              style={{
+                padding: '4px 8px', fontSize: '11px',
+                color: statusMarker.shape === shp ? '#fff' : '#888',
+                background: statusMarker.shape === shp ? '#333' : 'transparent',
+                border: 'none', cursor: 'pointer',
+                borderTopLeftRadius: shp === 'dot' ? 6 : 0,
+                borderBottomLeftRadius: shp === 'dot' ? 6 : 0,
+                borderTopRightRadius: shp === 'square' ? 6 : 0,
+                borderBottomRightRadius: shp === 'square' ? 6 : 0,
+              }}
+              title={shp === 'dot' ? 'Круглый' : 'Квадратный'}
+            >
+              <span style={{
+                display: 'inline-block', width: 8, height: 8,
+                backgroundColor: '#ccc',
+                borderRadius: shp === 'dot' ? '50%' : '2px',
+                verticalAlign: 'middle',
+              }} />
+            </button>
+          ))}
+        </div>
+        <span style={{ fontSize: '11px', color: '#888', marginLeft: 'auto' }}>Размер:</span>
+        <input
+          type="number"
+          min={4}
+          max={16}
+          value={statusMarker.sizePx}
+          onChange={(e) => setStatusMarker({ sizePx: Number(e.target.value) })}
+          style={{
+            width: '52px', padding: '4px 6px',
+            backgroundColor: '#1a1a1a', border: '1px solid #333', borderRadius: '6px',
+            color: '#ccc', fontSize: '12px', fontFamily: 'monospace', outline: 'none',
+          }}
+        />
+        <span style={{ fontSize: '10px', color: '#555' }}>px</span>
       </div>
 
       {sessionStatuses.length === 0 && (
@@ -390,7 +426,7 @@ function SessionStatusesEditor() {
         </div>
       )}
 
-      <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
         {sessionStatuses.map((s) => {
           const isPickerOpen = pickerOpenId === s.id;
           const hexDraft = hexDrafts[s.id] ?? s.color;
@@ -399,99 +435,82 @@ function SessionStatusesEditor() {
               key={s.id}
               style={{
                 position: 'relative',
-                display: 'flex', alignItems: 'center', gap: '10px',
-                padding: '8px 10px',
+                display: 'flex', alignItems: 'center', gap: '6px',
+                padding: '6px 8px',
                 backgroundColor: '#1e1e1e',
                 border: '1px solid #333',
                 borderRadius: '8px',
               }}
             >
-              {/* Цветной круг — клик открывает picker */}
               <button
                 onClick={() => setPickerOpenId(isPickerOpen ? null : s.id)}
                 style={{
-                  width: 24, height: 24, borderRadius: '50%',
+                  width: 20, height: 20,
+                  borderRadius: statusMarker.shape === 'square' ? '4px' : '50%',
                   backgroundColor: s.color,
                   border: '2px solid rgba(255,255,255,0.15)',
-                  cursor: 'pointer', flexShrink: 0,
-                  padding: 0,
+                  cursor: 'pointer', flexShrink: 0, padding: 0,
                 }}
                 title="Открыть палитру"
               />
 
-              {/* Label (inline edit) */}
               <input
                 type="text"
                 value={s.label}
                 onChange={(e) => updateSessionStatus(s.id, { label: e.target.value })}
-                placeholder="Название статуса"
+                placeholder="Название"
                 style={{
                   flex: 1, minWidth: 0,
-                  padding: '6px 8px',
+                  padding: '4px 6px',
                   backgroundColor: '#1a1a1a',
                   border: '1px solid #333', borderRadius: '6px',
-                  color: '#ccc', fontSize: '13px', outline: 'none',
+                  color: '#ccc', fontSize: '12px', outline: 'none',
                 }}
               />
 
-              {/* Hex input — controlled через локальный draft */}
-              <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
-                <span style={{ color: '#666', fontSize: '12px' }}>#</span>
-                <input
-                  type="text"
-                  value={hexDraft.replace(/^#/, '')}
-                  onChange={(e) => {
-                    const next = `#${e.target.value}`;
-                    setHexDrafts((d) => ({ ...d, [s.id]: next }));
-                    const norm = normalizeHex(next);
-                    if (norm) updateSessionStatus(s.id, { color: norm });
-                  }}
-                  onBlur={() => {
-                    // На blur всегда возвращаемся к каноничному значению в сторе.
-                    setHexDrafts((d) => { const cp = { ...d }; delete cp[s.id]; return cp; });
-                  }}
-                  maxLength={7}
-                  style={{
-                    width: '80px',
-                    padding: '6px 6px',
-                    backgroundColor: '#1a1a1a',
-                    border: '1px solid #333', borderRadius: '6px',
-                    color: '#ccc', fontSize: '12px',
-                    fontFamily: 'monospace', outline: 'none',
-                    textTransform: 'uppercase',
-                  }}
-                />
-              </div>
+              <input
+                type="text"
+                value={hexDraft.replace(/^#/, '')}
+                onChange={(e) => {
+                  const next = `#${e.target.value}`;
+                  setHexDrafts((d) => ({ ...d, [s.id]: next }));
+                  const norm = normalizeHexValue(next);
+                  if (norm) updateSessionStatus(s.id, { color: norm });
+                }}
+                onBlur={() => {
+                  setHexDrafts((d) => { const cp = { ...d }; delete cp[s.id]; return cp; });
+                }}
+                maxLength={7}
+                style={{
+                  width: '64px', padding: '4px 6px',
+                  backgroundColor: '#1a1a1a', border: '1px solid #333', borderRadius: '6px',
+                  color: '#ccc', fontSize: '11px', fontFamily: 'monospace',
+                  outline: 'none', textTransform: 'uppercase',
+                }}
+              />
 
-              {/* Delete */}
               <button
                 onClick={() => removeSessionStatus(s.id)}
                 style={{
                   display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
-                  width: 28, height: 28, borderRadius: '6px',
+                  width: 24, height: 24, borderRadius: '6px',
                   background: 'transparent', border: 'none',
-                  color: '#666', cursor: 'pointer',
-                  flexShrink: 0,
+                  color: '#666', cursor: 'pointer', flexShrink: 0,
                 }}
                 onMouseEnter={(e) => { e.currentTarget.style.color = '#f87171'; e.currentTarget.style.backgroundColor = 'rgba(248,113,113,0.1)'; }}
                 onMouseLeave={(e) => { e.currentTarget.style.color = '#666'; e.currentTarget.style.backgroundColor = 'transparent'; }}
                 title="Удалить статус"
               >
-                <Trash2 size={14} />
+                <Trash2 size={12} />
               </button>
 
-              {/* Picker popover — anchored к строке, открывается ниже */}
               {isPickerOpen && (
                 <div
                   style={{
-                    position: 'absolute',
-                    top: '100%', left: 0,
-                    marginTop: '6px',
-                    zIndex: 50,
+                    position: 'absolute', top: '100%', left: 0,
+                    marginTop: '6px', zIndex: 50,
                     padding: '12px',
-                    backgroundColor: '#1a1a1a',
-                    border: '1px solid #444',
-                    borderRadius: '10px',
+                    backgroundColor: '#1a1a1a', border: '1px solid #444', borderRadius: '10px',
                     boxShadow: '0 10px 30px rgba(0,0,0,0.5)',
                   }}
                   onMouseDown={(e) => e.stopPropagation()}
@@ -506,6 +525,215 @@ function SessionStatusesEditor() {
             </div>
           );
         })}
+      </div>
+    </div>
+  );
+}
+
+// ProcessBarEditor — настройка полоски процесса (3px слева в табе, мигает пока PTY жив).
+// Юзер контролирует: enabled (мигание on/off), colorA (нижняя/статичная фаза),
+// colorB (верхняя фаза), durationMs (длительность цикла, 300..6000ms).
+// Live-превью полоски (статичная или с анимацией) показано над контролами.
+function ProcessBarEditor() {
+  const processBar = useUIStore((s) => s.processBar);
+  const setProcessBar = useUIStore((s) => s.setProcessBar);
+
+  const [pickerOpen, setPickerOpen] = useState<'a' | 'b' | null>(null);
+  const [hexDraftA, setHexDraftA] = useState<string | null>(null);
+  const [hexDraftB, setHexDraftB] = useState<string | null>(null);
+
+  const containerRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!pickerOpen) return;
+    const onDown = (e: MouseEvent) => {
+      const t = e.target as Node | null;
+      if (containerRef.current && t && !containerRef.current.contains(t)) setPickerOpen(null);
+    };
+    window.addEventListener('mousedown', onDown);
+    return () => window.removeEventListener('mousedown', onDown);
+  }, [pickerOpen]);
+
+  // Compact превью полоски — занимает 40px высоты, минимально.
+  const previewBar = (
+    <div style={{
+      position: 'relative', width: '100%', height: '32px',
+      backgroundColor: '#252526', border: '1px solid #333',
+      borderRadius: '6px', overflow: 'hidden',
+    }}>
+      <div
+        className={processBar.enabled ? 'tab-process-bar-busy' : 'tab-process-bar-static'}
+        style={{
+          position: 'absolute',
+          [processBar.position === 'right' ? 'right' : 'left']: 0,
+          top: 0, bottom: 0, width: '3px',
+          ['--process-bar-color-a' as any]: processBar.colorA,
+          ['--process-bar-color-b' as any]: processBar.colorB,
+          ['--process-bar-duration' as any]: `${processBar.durationMs}ms`,
+        }}
+      />
+      <div style={{
+        position: 'absolute', left: 12, right: 12, top: '50%', transform: 'translateY(-50%)',
+        fontSize: '11px', color: '#888', textAlign: 'center',
+      }}>
+        {processBar.enabled ? `пульс ${(processBar.durationMs / 1000).toFixed(1)}s` : 'статика'} · {processBar.position === 'right' ? 'справа' : 'слева'}
+      </div>
+    </div>
+  );
+
+  const colorRow = (which: 'a' | 'b') => {
+    const current = which === 'a' ? processBar.colorA : processBar.colorB;
+    const draft = which === 'a' ? hexDraftA : hexDraftB;
+    const setDraft = which === 'a' ? setHexDraftA : setHexDraftB;
+    const disabled = which === 'b' && !processBar.enabled;
+
+    return (
+      <div style={{
+        position: 'relative',
+        display: 'flex', alignItems: 'center', gap: '6px',
+        padding: '6px 8px',
+        backgroundColor: '#1e1e1e', border: '1px solid #333', borderRadius: '8px',
+        opacity: disabled ? 0.4 : 1,
+      }}>
+        <button
+          onClick={() => { if (!disabled) setPickerOpen(pickerOpen === which ? null : which); }}
+          style={{
+            width: 20, height: 20, borderRadius: '50%',
+            backgroundColor: current,
+            border: '2px solid rgba(255,255,255,0.15)',
+            cursor: disabled ? 'not-allowed' : 'pointer',
+            flexShrink: 0, padding: 0,
+          }}
+          title="Палитра"
+        />
+        <span style={{ fontSize: '11px', color: '#ccc', flex: 1 }}>
+          {which === 'a' ? 'A' : 'B'}
+        </span>
+        <input
+          type="text"
+          disabled={disabled}
+          value={(draft ?? current).replace(/^#/, '')}
+          onChange={(e) => {
+            const next = `#${e.target.value}`;
+            setDraft(next);
+            const norm = normalizeHexValue(next);
+            if (norm) setProcessBar(which === 'a' ? { colorA: norm } : { colorB: norm });
+          }}
+          onBlur={() => setDraft(null)}
+          maxLength={7}
+          style={{
+            width: '64px', padding: '4px 6px',
+            backgroundColor: '#1a1a1a', border: '1px solid #333', borderRadius: '6px',
+            color: '#ccc', fontSize: '11px', fontFamily: 'monospace',
+            outline: 'none', textTransform: 'uppercase',
+          }}
+        />
+        {pickerOpen === which && (
+          <div
+            style={{
+              position: 'absolute', top: '100%', left: 0,
+              marginTop: '6px', zIndex: 50,
+              padding: '12px',
+              backgroundColor: '#1a1a1a', border: '1px solid #444', borderRadius: '10px',
+              boxShadow: '0 10px 30px rgba(0,0,0,0.5)',
+            }}
+            onMouseDown={(e) => e.stopPropagation()}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <HexColorPicker
+              color={current}
+              onChange={(c) => setProcessBar(which === 'a' ? { colorA: c.toUpperCase() } : { colorB: c.toUpperCase() })}
+            />
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  return (
+    <div
+      ref={containerRef}
+      style={{ padding: '12px', backgroundColor: '#222', border: '1px solid #333', borderRadius: '10px', height: '100%' }}
+    >
+      <div style={{ fontSize: '11px', fontWeight: 600, color: '#666', marginBottom: '10px', textTransform: 'uppercase' }}>
+        Полоска процесса
+      </div>
+
+      {previewBar}
+
+      {/* Compact toggles row: enable + position */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginTop: '10px' }}>
+        {/* Enable toggle */}
+        <label className="flex items-center gap-2 cursor-pointer select-none">
+          <div
+            className="relative w-7 h-3.5 rounded-full transition-colors shrink-0"
+            style={{ backgroundColor: processBar.enabled ? 'rgba(74, 222, 128, 0.4)' : 'rgba(255,255,255,0.1)' }}
+            onClick={() => setProcessBar({ enabled: !processBar.enabled })}
+          >
+            <div
+              className="absolute top-0.5 w-2.5 h-2.5 rounded-full transition-all"
+              style={{
+                left: processBar.enabled ? '15px' : '2px',
+                backgroundColor: processBar.enabled ? '#4ade80' : '#666',
+              }}
+            />
+          </div>
+          <span style={{ fontSize: '11px', color: '#ccc' }}>Пульс</span>
+        </label>
+
+        {/* Position toggle */}
+        <div style={{ display: 'inline-flex', backgroundColor: '#1a1a1a', borderRadius: '6px', border: '1px solid #333', marginLeft: 'auto' }}>
+          {(['left', 'right'] as const).map((p) => (
+            <button
+              key={p}
+              onClick={() => setProcessBar({ position: p })}
+              style={{
+                padding: '3px 8px', fontSize: '11px',
+                color: processBar.position === p ? '#fff' : '#888',
+                background: processBar.position === p ? '#333' : 'transparent',
+                border: 'none', cursor: 'pointer',
+                borderTopLeftRadius: p === 'left' ? 6 : 0,
+                borderBottomLeftRadius: p === 'left' ? 6 : 0,
+                borderTopRightRadius: p === 'right' ? 6 : 0,
+                borderBottomRightRadius: p === 'right' ? 6 : 0,
+              }}
+              title={p === 'left' ? 'Слева' : 'Справа'}
+            >
+              {p === 'left' ? '⊏' : '⊐'}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Colors A + B */}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', marginTop: '10px' }}>
+        {colorRow('a')}
+        {colorRow('b')}
+      </div>
+
+      {/* Duration — простой input в одну строку */}
+      <div style={{
+        display: 'flex', alignItems: 'center', gap: '6px',
+        marginTop: '10px', padding: '6px 8px',
+        backgroundColor: '#1e1e1e', border: '1px solid #333', borderRadius: '8px',
+        opacity: processBar.enabled ? 1 : 0.4,
+      }}>
+        <span style={{ fontSize: '11px', color: '#ccc', flex: 1 }}>Длительность цикла</span>
+        <input
+          type="number"
+          disabled={!processBar.enabled}
+          min={300}
+          max={6000}
+          step={100}
+          value={processBar.durationMs}
+          onChange={(e) => setProcessBar({ durationMs: Number(e.target.value) })}
+          style={{
+            width: '64px', padding: '4px 6px',
+            backgroundColor: '#1a1a1a', border: '1px solid #333', borderRadius: '6px',
+            color: '#ccc', fontSize: '11px', fontFamily: 'monospace', outline: 'none',
+            textAlign: 'right',
+          }}
+        />
+        <span style={{ fontSize: '10px', color: '#555' }}>ms</span>
       </div>
     </div>
   );
@@ -1546,7 +1774,10 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                 </div>
               </div>
 
-              <SessionStatusesEditor />
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px', alignItems: 'start' }}>
+                <SessionStatusesEditor />
+                <ProcessBarEditor />
+              </div>
             </>
           )}
 

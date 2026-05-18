@@ -4,7 +4,7 @@
 Система заметок, привязанных к **каждой вкладке** (`tab.notes`), а не к проекту целиком. Project-level fullscreen modal (`NotesEditorModal.tsx`) удалён в пользу per-tab slideout — глобальные project notes больше не существуют как сущность в UI. У каждой вкладки своя независимая заметка.
 
 ## User Flow
-1. **Slideout-режим — единственный surface для записи** — `Cmd+E` или клик по иконке `StickyNote` (indigo-tinted) в активной вкладке `TabSidebar`. Открывается ресайзабельная панель **слева-направо** (anchor — правый край TabSidebar). Закрывается клик-outside, Esc или повторный `Cmd+E`. Раньше был ещё inline preview в нижней части `InfoPanel`-сайдбара — удалён вместе с самой правой колонкой (см. `fact-workspace.md::Two-Column Layout`).
+1. **Slideout-режим — единственный surface для записи** — `Cmd+E` или клик по иконке `StickyNote` (indigo-tinted) на вкладке в `TabSidebar`. По дефолту кнопка видна на активной вкладке; при зажатом `Cmd` (cursor в TabSidebar) появляется также на всех вкладках где **есть заметка** — peek-mode, можно открыть slideout на не-активной вкладке без переключения active (см. `### Кнопка-заметки` ниже). Открывается ресайзабельная панель **слева-направо** (anchor — правый край TabSidebar). Закрывается клик-outside, Esc или повторный `Cmd+E`. Раньше был ещё inline preview в нижней части `InfoPanel`-сайдбара — удалён вместе с самой правой колонкой (см. `fact-workspace.md::Two-Column Layout`).
 2. **AI Paste** (`Cmd+/` → `📋 AI Paste` → `Cmd+V`):
    - В editor вставляется `^^ ⏳` placeholder и сворачивается.
    - Параллельно `onGenerateTitle(text)` уходит в Gemini (см. секцию AI Paste ниже).
@@ -20,7 +20,20 @@
 
 ## Tab Notes Slideout (per-tab панель)
 
-Контент хранится в `tab.notes` (per-tab), не в `project.notes` — у каждой вкладки своя независимая заметка. Триггер — `<button data-tab-notes-open-trigger>` с иконкой `StickyNote` справа от имени вкладки в `TabItem` (рендерится только когда `isVerticalMode && isActive` — кнопка живёт **внутри** активной строки, не в отдельном sidebar/header слоте). Раньше триггер был widening header'ом `← Open Заметки вкладки ✦` в нижней части правой `InfoPanel`-сайдбара — после удаления правой колонки переехал в TabItem (см. `methodology/design.md::Активный элемент списка несёт контекстную affordance`). Per-tab open state — `useUIStore.notesPanelOpenTabs: Record<tabId, boolean>`.
+Контент хранится в `tab.notes` (per-tab), не в `project.notes` — у каждой вкладки своя независимая заметка. Триггер — `<button data-tab-notes-open-trigger data-tab-id={tab.id}>` с иконкой `StickyNote` справа от имени вкладки в `TabItem`. Видимость определяется тремя условиями (см. `### Кнопка-заметки` ниже), не одним `isActive`. Раньше триггер был widening header'ом `← Open Заметки вкладки ✦` в нижней части правой `InfoPanel`-сайдбара — после удаления правой колонки переехал в TabItem (см. `methodology/design.md::Активный элемент списка несёт контекстную affordance`). Per-tab open state — `useUIStore.notesPanelOpenTabs: Record<tabId, boolean>`, но **at most one entry is true** (см. `### One-at-a-time` ниже).
+
+### Кнопка-заметки: три условия видимости, peek через Cmd, solid-фон при открытом slideout
+Кнопка `StickyNote` рендерится если выполнено **хотя бы одно**:
+1. **`slideoutOpenHere`** — slideout сейчас якорится к этой вкладке. Solid-indigo фон (`#6366f1` + белая иконка), кнопка видна всегда, независимо от active/peek. Это якорь — пока slideout открыт, юзер должен видеть «откуда он растёт».
+2. **`showNotesPeek`** = `isCmdPressed && isMouseInTabBar && hasNotes` — Cmd зажат, курсор в TabSidebar, у вкладки непустые заметки. Tinted-indigo фон, кликабельна — клик открывает slideout на этой вкладке (без переключения active, `e.stopPropagation()` на onClick).
+3. **default-on-active** — `isActive && !anySlideoutOpen && !cmdPeekMode`. Active вкладка показывает кнопку **только** если (a) slideout не открыт где-то ещё и (b) сейчас не peek-mode. Второе подавление обязательно: при Cmd-peek юзер ждёт «кнопки только там где есть заметки», и default-on-active на active без заметки сломал бы это правило (см. `methodology/design.md::Peek через модификатор`).
+
+Раньше peek-режим был оранжевой dot'кой 5×5px в правом-верхнем углу `TabItem` — она показывала «здесь есть заметка», но не была кликабельна; открыть slideout можно было только переключившись на эту вкладку. Заменили потому что dot в peek-режиме всё равно требовал переключения active → лишний жест; кликабельная peek-кнопка позволяет открыть содержимое на любой вкладке за один клик с зажатым Cmd.
+
+### One-at-a-time: opening on X closes Y
+`setNotesPanelOpen(X, true)` пишет в стор `{[X]: true}` целиком, не `prev[X] = true` — это закрывает slideout на любой другой вкладке. У slideout'а один физический инстанс с геометрическим якорем (anchor по `[data-tab-id]` кнопки), две одновременные привязки невозможны технически. Open на B пере-якоривает overlay с A на B, кнопка на A теряет solid-indigo (slideoutOpenHere = false), на B зажигается. Закрытие slideout (Esc / клик-outside) сбрасывает open-state, кнопка возвращается на active (default-on-active правило снова активно). Принцип переносимый — см. `methodology/design.md::Один экземпляр overlay на N триггеров`.
+
+`TabNotesSlideout` derive'ит `activeTabId` из стора (первый ключ с `true` в `notesPanelOpenTabs`), не получает его prop'ом — это важно, иначе клик при Cmd на не-active вкладке B открыл бы state, но slideout продолжал бы рендериться для предыдущего active A.
 
 ### Bottom-anchor к кнопке открытия (в TabItem)
 Низ модалки прибит к нижней кромке `[data-tab-notes-open-trigger]` плюс пользовательский сдвиг `notesPanelOffsetY`.
@@ -30,6 +43,8 @@ top = openButton.getBoundingClientRect().bottom - panelHeight + notesPanelOffset
 ```
 
 Mental model пользователя: «модалка живёт у кнопки, через которую я её открыл». Кнопка теперь живёт в активной вкладке TabSidebar — при vertical resize окна позиция активной строки в общем потоке TabBar'а сохраняется (вкладки шиномонтажно прижаты к верху колонки), значит и низ модалки остаётся стабильным. Раньше anchor был на header InfoPanel-сайдбара справа (нижняя часть flex-1 контейнера) — flip триггера сохранил тот же DOM-based-anchor паттерн, просто `[data-tab-notes-open-trigger]` теперь живёт по другому пути в DOM.
+
+**Фильтр по `data-tab-id` обязателен.** QuerySelector — `[data-tab-notes-open-trigger][data-tab-id="${activeTabId}"]`, а не голый `[data-tab-notes-open-trigger]`. В peek-mode (Cmd зажат, мышь в TabSidebar) кнопки появляются на нескольких вкладках одновременно; без фильтра `document.querySelector` берёт первую попавшуюся в DOM — обычно это вкладка сверху списка, не та на которой реально открыт slideout, и anchor уезжает на чужую строку. Этот фильтр — конкретная реализация принципа «singleton-overlay с N-кандидат-якорями» (см. `methodology/design.md::Один экземпляр overlay на N триггеров`).
 
 Принцип переносимый — см. `methodology/design.md::Геометрия popup — от измерения, не от формулы`.
 

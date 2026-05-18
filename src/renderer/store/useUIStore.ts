@@ -73,6 +73,7 @@ export interface ProcessBarSettings {
   colorA: string;       // нижняя фаза пульса (или единственный цвет если enabled=false)
   colorB: string;       // верхняя фаза пульса
   durationMs: number;   // длительность одного цикла (300..6000ms — clamp в setter)
+  position: 'left' | 'right'; // где рисовать полоску — у левого или правого края вкладки
 }
 
 const DEFAULT_PROCESS_BAR: ProcessBarSettings = {
@@ -80,6 +81,7 @@ const DEFAULT_PROCESS_BAR: ProcessBarSettings = {
   colorA: '#155E75',  // cyan-800 — приглушённая нижняя фаза
   colorB: '#0E7490',  // cyan-700 — мягкая верхняя
   durationMs: 2400,
+  position: 'left',
 };
 
 function loadProcessBar(): ProcessBarSettings {
@@ -95,12 +97,39 @@ function loadProcessBar(): ProcessBarSettings {
       durationMs: typeof parsed.durationMs === 'number'
         ? Math.max(300, Math.min(6000, parsed.durationMs))
         : DEFAULT_PROCESS_BAR.durationMs,
+      position: parsed.position === 'right' ? 'right' : 'left',
     };
   } catch { return DEFAULT_PROCESS_BAR; }
 }
 
 function saveProcessBar(s: ProcessBarSettings) {
   try { localStorage.setItem('noted-terminal-process-bar', JSON.stringify(s)); } catch {}
+}
+
+export interface StatusMarkerSettings {
+  shape: 'dot' | 'square';
+  sizePx: number;     // 4..16, 1px step
+}
+
+const DEFAULT_STATUS_MARKER: StatusMarkerSettings = { shape: 'dot', sizePx: 8 };
+
+function loadStatusMarker(): StatusMarkerSettings {
+  try {
+    const raw = localStorage.getItem('noted-terminal-status-marker');
+    if (!raw) return DEFAULT_STATUS_MARKER;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return DEFAULT_STATUS_MARKER;
+    return {
+      shape: parsed.shape === 'square' ? 'square' : 'dot',
+      sizePx: typeof parsed.sizePx === 'number'
+        ? Math.max(4, Math.min(16, Math.round(parsed.sizePx)))
+        : DEFAULT_STATUS_MARKER.sizePx,
+    };
+  } catch { return DEFAULT_STATUS_MARKER; }
+}
+
+function saveStatusMarker(s: StatusMarkerSettings) {
+  try { localStorage.setItem('noted-terminal-status-marker', JSON.stringify(s)); } catch {}
 }
 
 
@@ -147,6 +176,12 @@ interface UIStore {
      CSS читает значения через --process-bar-* переменные на :root, обновляемые из App. */
   processBar: ProcessBarSettings;
   setProcessBar: (patch: Partial<ProcessBarSettings>) => void;
+
+  /* Status marker — маркер слева во вкладке (vertical mode) для sessionStatus.
+     shape='dot' → круг, 'square' → квадрат (border-radius различается).
+     sizePx — длина стороны (для круга = диаметр). Clamp 4..16. */
+  statusMarker: StatusMarkerSettings;
+  setStatusMarker: (patch: Partial<StatusMarkerSettings>) => void;
 
   filePreviewFontSize: number; // FilePreview readOnly editor
   promptPickerFontSize: number; // Opt+V picker rows
@@ -1057,7 +1092,17 @@ export const useUIStore = create<UIStore>((set, get) => ({
   projectTabsFontSize: initialFontSettings.projectTabsFontSize,
   sidebarFontSize: initialFontSettings.sidebarFontSize,
   sidebarWidth: (() => { try { const v = localStorage.getItem('sidebarWidth'); return v ? Number(v) : 280; } catch { return 280; } })(),
-  tabSidebarWidth: (() => { try { const v = localStorage.getItem('tabSidebarWidth'); return v ? Number(v) : 200; } catch { return 200; } })(),
+  tabSidebarWidth: (() => {
+    // Clamp при чтении из localStorage: защита от corruption + миграция со старых
+    // значений если diapazon (140..400) поменяется. Drag-handle в TabSidebar.tsx
+    // тоже клампит, но это вторая линия защиты.
+    try {
+      const raw = localStorage.getItem('tabSidebarWidth');
+      const n = raw ? Number(raw) : 200;
+      if (!Number.isFinite(n)) return 200;
+      return Math.max(140, Math.min(400, n));
+    } catch { return 200; }
+  })(),
 
   sessionStatuses: loadSessionStatuses(),
   setSessionStatuses: (next) => {
@@ -1092,9 +1137,23 @@ export const useUIStore = create<UIStore>((set, get) => ({
       durationMs: typeof patch.durationMs === 'number'
         ? Math.max(300, Math.min(6000, patch.durationMs))
         : cur.durationMs,
+      position: patch.position === 'right' || patch.position === 'left' ? patch.position : cur.position,
     };
     set({ processBar: next });
     saveProcessBar(next);
+  },
+
+  statusMarker: loadStatusMarker(),
+  setStatusMarker: (patch) => {
+    const cur = get().statusMarker;
+    const next: StatusMarkerSettings = {
+      shape: patch.shape === 'square' || patch.shape === 'dot' ? patch.shape : cur.shape,
+      sizePx: typeof patch.sizePx === 'number'
+        ? Math.max(4, Math.min(16, Math.round(patch.sizePx)))
+        : cur.sizePx,
+    };
+    set({ statusMarker: next });
+    saveStatusMarker(next);
   },
 
   filePreviewFontSize: loadFilePreviewFontSize(),
@@ -1108,8 +1167,12 @@ export const useUIStore = create<UIStore>((set, get) => ({
     try { localStorage.setItem('sidebarWidth', String(width)); } catch {}
   },
   setTabSidebarWidth: (width) => {
-    set({ tabSidebarWidth: width });
-    try { localStorage.setItem('tabSidebarWidth', String(width)); } catch {}
+    // Кламп здесь — defence-in-depth. Drag-handle в TabSidebar.tsx уже клампит
+    // на mousemove, но кто-то может позвать action напрямую (через DevTools или
+    // программно из тестов). Без clamp юзер получает sidebar 50px или 800px.
+    const clamped = Math.max(140, Math.min(400, width));
+    set({ tabSidebarWidth: clamped });
+    try { localStorage.setItem('tabSidebarWidth', String(clamped)); } catch {}
   },
 
   setFilePreviewFontSize: (size: number) => {

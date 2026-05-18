@@ -916,8 +916,59 @@ function stopInterruptWatcher(tabId) {
   const state = claudeInterruptWatchers.get(tabId);
   if (!state) return;
   if (state.debounce) clearTimeout(state.debounce);
+  if (state.idleProbe) clearTimeout(state.idleProbe);
   if (state.watcher) { try { state.watcher.close(); } catch {} }
   claudeInterruptWatchers.delete(tabId);
+}
+
+// Safety net для пограничного кейса:
+// Юзер нажал Esc, но Claude НЕ написал "[Request interrupted by user]" в JSONL
+// (например прервал до старта стрима, или короткий turn закончился до Esc).
+// Watcher по marker'у не сработает, Stop hook не приходит, loader залип.
+//
+// Решение: armInterruptIdleProbe вызывается из `terminal:input` когда юзер шлёт
+// pure Esc (1 байт `\x1b`) или Ctrl+C (`\x03`). Через PROBE_DELAY_MS=1500 проверяем:
+// если JSONL не менялся последние PROBE_QUIET_MS=1200 (mtime stale) И turn всё
+// ещё помечен busy — значит Claude ничего не пишет → принудительно busy=false.
+//
+// Почему именно pure Esc, не любой `\x1b`:
+// — стрелки/F-keys приходят как многобайтные ESC-sequences (`\x1b[A`, `\x1bO...`),
+//   их пропускаем, иначе любая навигация ложно disarm'ит loader (см. fix-claude-aborted-streaming-loader.md).
+// — Ctrl+C = одиночный `\x03`, тоже однозначен.
+//
+// Idle-проверка вместо немедленного сброса:
+// — если Claude ЕСТЬ работает (Esc был «случайным»/не был перехвачен TUI), он продолжает
+//   писать в JSONL → mtime свежий → guard не срабатывает.
+// — если Claude НЕ работает → mtime замораживается → guard правомерно сбрасывает.
+function armInterruptIdleProbe(tabId) {
+  const state = claudeInterruptWatchers.get(tabId);
+  if (!state || !state.filePath) return;
+  if (state.idleProbe) clearTimeout(state.idleProbe);
+  const PROBE_DELAY_MS = 1500;
+  const PROBE_QUIET_MS = 1200;
+  state.idleProbe = setTimeout(() => {
+    state.idleProbe = null;
+    if (claudeTurnBusy.get(tabId) !== true) return; // turn уже завершён нормально
+    let stat;
+    try { stat = fs.statSync(state.filePath); } catch { return; }
+    const ageMs = Date.now() - stat.mtimeMs;
+    if (ageMs < PROBE_QUIET_MS) return; // Claude всё ещё что-то пишет — не сбрасываем
+    console.warn('[ClaudeInterrupt:Idle] tab=' + tabId.slice(-12) + ' Esc/Ctrl+C без JSONL-записей за ' + ageMs + 'ms — forcing busy=false');
+    claudeTurnBusy.set(tabId, false);
+    claudeSpinnerBusy.set(tabId, false);
+    clearTimeout(claudeTurnWatchdog.get(tabId));
+    claudeTurnWatchdog.delete(tabId);
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('claude:busy-state', { tabId, busy: false });
+      mainWindow.webContents.send('claude:turn-state', {
+        tabId,
+        sessionId: bridgeKnownSessions.get(tabId) || null,
+        event: 'InterruptStop',
+        busy: false, success: false, lastAssistantMessage: null,
+      });
+    }
+    stopInterruptWatcher(tabId);
+  }, PROBE_DELAY_MS);
 }
 
 function startClaudeHookServer() {
@@ -6889,6 +6940,15 @@ ipcMain.on('terminal:input', async (event, tabId, data) => {
   if (!claudeAgentArmed.get(tabId)) {
     claudeAgentArmed.set(tabId, true);
     console.log('[ClaudeAgent:Arm] Tab ' + tabId + ': Armed (first user input)');
+  }
+
+  // Pure Esc (one byte `\x1b`) or Ctrl+C (`\x03`) → arm idle-probe safety net.
+  // Multi-byte ESC sequences (стрелки `\x1b[A`, F-keys, `\x1bO...`) пропускаем —
+  // они не означают interrupt. См. armInterruptIdleProbe выше для подробностей.
+  if (data === '\x1b' || data === '\x03') {
+    if (claudeTurnBusy.get(tabId) === true) {
+      armInterruptIdleProbe(tabId);
+    }
   }
 
 // User paste (Cmd+V) — direct passthrough, no chunking needed.

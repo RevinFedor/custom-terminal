@@ -12,7 +12,7 @@ Bar ложится **под** контентом Terminal-колонки, но �
 
 **Left cluster.** Триплет `[⎘ session-id | Continue/Stop chip | ↻ refresh-timeline]`, форки (`⑂→▭` в новую PTY-вкладку, `⑂→SDK` в новый SDK-таб — только для Claude), Copy-prompt split-pill (`⎘ prompt | + clear` — только для Claude, использует IPC `claude:copy-input`/`claude:clear-input`), context %-meter.
 
-**Right cluster.** Provider (PTY only — SDK гоняет напрямую в Anthropic), Model dropdown, Effort dropdown, Think toggle. Popup'ы открываются **вверх** (`bottom: calc(100% + 4px)`) как плоский ряд пилюль — bar сам внизу, вниз раскрытие некуда.
+**Right cluster.** Provider (PTY only — SDK гоняет напрямую в Anthropic), Model dropdown, Effort dropdown, Think toggle. Popup'ы открываются **вверх** (`bottom: calc(100% + 4px)`) как плоский ряд пилюль — bar сам внизу, вниз раскрытие некуда. **Right-anchored** (`right: 0`, не `left: 0`) — popup растёт влево от триггера. Без этого Effort popup (последний триггер у правого края окна) обрезался на узких окнах; ширина popup'а зависит от количества effort'ов модели (`low/medium/high/xhigh` или подмножество для DeepSeek), формула «куда умещается» дала бы mid-session flip направления при resize. См. `methodology/design.md::Геометрия popup` (последний абзац про right-anchor для правого cluster'а).
 
 Layout одинаковый для PTY и SDK, но набор контролов разный: для SDK скрыты Provider и (когда DeepSeek) Effort с особыми caps'ами (`getSupportedEffortsForAlias`), Continue превращается в фокус на composer вместо `claude --resume` команды.
 
