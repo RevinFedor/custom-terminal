@@ -50,7 +50,7 @@
 
 Стрелочки/Enter/Esc — non-printable, `e.key` для них одинаков везде, можно проверять по `key`.
 
-## Settings: font + scale
+## Settings: font + scale + geometry
 Шрифт picker'а вынесен в Settings → Шрифты («Prompt picker», default 12, диапазон 9-20). Все размеры панелей и паддингов скейлятся пропорционально:
 - `LEFT_W = max(140, fontSize * 15)` ≈ 180px на 12px шрифте
 - `RIGHT_W = max(160, fontSize * 17)` ≈ 204px на 12px
@@ -58,6 +58,15 @@
 - `ROW_PAD_X = max(6, fontSize * 0.66)` ≈ 8px
 
 Стор: `useUIStore.promptPickerFontSize` / `setPromptPickerFontSize`. Persist в `localStorage('noted-terminal-prompt-picker-font-size')`. Слайдер рендерится тем же `<FontSizeSlider>` что и остальные шрифты UI в `SettingsModal.tsx`.
+
+Геометрия fallback-якоря (bottom-center, см. ниже) управляется тремя слайдерами в той же секции:
+| Поле стора | localStorage | Default | Диапазон | Назначение |
+|---|---|---|---|---|
+| `promptPickerBottomOffsetPx` | `noted-terminal-prompt-picker-bottom-offset` | 50 | 0..400 | Расстояние от нижнего края viewport'а до низа picker'а |
+| `promptPickerLeftOffsetPx`   | `noted-terminal-prompt-picker-left-offset`   | 0  | 0..2000 | `>0` → прижатие к левому краю с этим отступом |
+| `promptPickerRightOffsetPx`  | `noted-terminal-prompt-picker-right-offset`  | 0  | 0..2000 | `>0` → прижатие к правому краю; **приоритет над left** |
+
+Приоритет горизонтального якоря: `right>0` побеждает `left>0`, оба `0` → центр. Right выигрывает, чтобы юзер мог использовать только один слайдер и понимать что он точно сработал — второй остаётся `0` как «не важно».
 
 ## Tab-type routing для вставки
 Picker сам резолвит куда вставлять через `getEffectiveTabId()` (sub-agent aware) + `tab.tabType`:
@@ -67,14 +76,50 @@ Picker сам резолвит куда вставлять через `getEffect
 ## Backdrop отсутствует
 Полупрозрачной подложки нет — только click-outside listener на `mousedown` capture phase (см. `App.tsx::onDown` для других overlay'ев — палитра, контекст-меню). Юзер прямо: *«оверлей быть тоже не должно»* — picker должен открываться поверх UI без визуального dimming.
 
-## Anchor: курсор или fallback при выходе из окна
-Picker появляется у курсора, если последний `mousemove` внутри Electron-окна был свежим (≤ 1500мс), иначе fallback на фиксированную позицию (по горизонтали по центру viewport'а, по вертикали на 22% от верха — выше геометрического центра, чтобы не конфликтовать со statusbar'ом снизу).
+## Anchor: SDK caret или bottom-center fallback
+Якорь решается **один раз** при открытии — picker не следует ни за чем пока висит, иначе arrow-навигация ломает mental model «окно стоит, я в нём двигаюсь стрелочками». Mouse-cursor tracking удалён полностью — раньше picker пытался открыться у мыши с проверкой свежести `mousemove` (≤ 1500мс), но это конфликтовало с типичным сценарием «фокус в input → жму Opt+V» где мышь могла быть где угодно. Новая стратегия — основана исключительно на типе активного таба:
 
-Почему именно так. Координаты курсора доступны рендереру только через `mousemove`, и это событие приходит **только пока курсор внутри окна** (Electron/Chromium не присылает координат вне `<window>`). Если юзер фокусирует приложение через `Cmd+Tab` или хоткей с курсором над другим монитором — последний `mousemove` устарел или вообще никогда не приходил с момента старта. Свежесть проверяется по timestamp'у: `Date.now() - lastMouseMove.t <= 1500`. Сам трекинг — singleton-listener на window (capture phase, чтобы не зависеть от того что под курсором).
+| Случай | Якорь | Координаты |
+|---|---|---|
+| Активный таб — `claude-sdk` И его textarea видима И есть selectionEnd | `sdk-caret` | Справа-вниз от текстового курсора в textarea: `left = caret.x + 6`, `top = caret.y + lineHeight + 4` |
+| Иначе (терминал, нет таргета, скрытый SDK, etc.) | `bottom-center` | `top = vh - height - bottomOffsetPx`, `left` по правилам приоритета `right > left > center` |
 
-Якорь решается **один раз** при открытии — picker не следует за курсором пока висит, иначе arrow-навигация ломает mental model «окно стоит, я в нём двигаюсь стрелочками». В cursor-режиме координаты — top-left picker'а со смещением `+4,+4` от позиции курсора (классическое context-menu offset, чтобы клик не попал внутрь picker'а).
+### SDK caret measurement
+Координаты текстового курсора в `<textarea>` получаем через mirror-div technique (inlined, без зависимости от `textarea-caret-coordinates` пакета):
+1. Клонируем computed style текстарии в скрытый `<div>` (whitespace, шрифт, padding, border, размеры — всё что влияет на text wrap).
+2. Кладём в div префикс `ta.value.substring(0, selectionEnd)` + маркер `<span>`.
+3. `span.offsetLeft/offsetTop - ta.scroll{Left,Top}` + `ta.getBoundingClientRect()` → viewport-relative позиция каретки.
+4. Удаляем mirror-div.
 
-После размещения координаты клемпятся в viewport: `left/top` уезжают внутрь если правый/нижний край вылез бы за `innerWidth/innerHeight - 8px`. Реальный размер picker'а измеряется через `useLayoutEffect` + `rootRef.current.offsetWidth/offsetHeight` после первого рендера — оценка по `LEFT_W + GAP + RIGHT_W` используется как fallback до того, как DOM смерил себя. Принцип переносимый — см. `methodology/design.md::Геометрия popup — от измерения, не от формулы`.
+`lineHeight` берётся из `getComputedStyle`; fallback на `fontSize * 1.2` если CSS вернул `'normal'`.
+
+### Visible-tab guard (ловушка)
+**SDK табы НЕ unmount'ятся** при переключении — они переключаются через `display: none|flex` под одинаковым root'ом `.absolute.inset-0.flex.flex-col`. Прямой `document.querySelector('textarea')` находит первую textarea в DOM, включая **скрытые** SDK табы — их `getBoundingClientRect` = `{0,0,0,0}`, и picker уезжал в верхний-левый угол viewport'а.
+
+`findSDKTextarea()` обязан фильтровать по `style.display !== 'none'` (или `getComputedStyle(root).display`) и defense-in-depth проверяй `width===0 && height===0` на самой textarea. Симптом неправильной фильтрации: «picker всегда в (0,0) на SDK табе независимо от того где я».
+
+### Главный picker — только вниз, без mirror-up
+Главная (левая) колонка picker'а **никогда** не зеркалится вверх от каретки. Если каретка слишком близко к низу viewport'а, picker клампится по нижнему краю (`top = vh - measuredH - margin`) и перекрывает несколько пикселей инпута — это приемлемо. Юзер прямо: *«ее можно просто пережать вниз и всё, в этом ничего страшного нет»*.
+
+Mirror-up зарезервирован **только** для правой (групповой) колонки — см. ниже.
+
+### Right panel flip-up
+Правая колонка (содержимое группы) рендерится `position: absolute` внутри обёртки фиксированной ширины:
+- По умолчанию `top: 0` (растёт вниз от верха picker'а).
+- Если её высота больше левой И `top + rightH + margin > vh` — переключается на `bottom: 0` (растёт вверх от низа). Левая колонка не двигается, picker root не меняет высоту — flip-аются только внутренности правого слота.
+
+Это **единственный** legit-сценарий mirror-flip в picker'е: когда выбранная группа содержит сильно больше промптов чем виден потолок левой колонки.
+
+### Bottom-center fallback geometry
+Когда якорь `bottom-center` — горизонтальная позиция определяется приоритетом:
+- `rightOffsetPx > 0` → `left = vw - measuredW - rightOffsetPx`
+- иначе `leftOffsetPx > 0` → `left = leftOffsetPx`
+- иначе → `left = round(vw/2 - measuredW/2)` (центр)
+
+Right выигрывает у left умышленно: юзер часто использует только один слайдер; знать что «правый всегда побеждает» проще чем разбираться какой настроенный.
+
+### Viewport clamp + измерение
+После выбора начальных `left/top` обе оси клемпятся в viewport (`margin = 8`). Реальный размер picker'а измеряется через `useLayoutEffect` + `rootRef.current.offsetWidth/offsetHeight` — оценка `LEFT_W + GAP + RIGHT_W` используется как fallback до того, как DOM смерил себя. Принцип переносимый — см. `methodology/design.md::Геометрия popup — от измерения, не от формулы`.
 
 ## Path-зависимости
 
@@ -82,9 +127,9 @@ Picker появляется у курсора, если последний `mous
 |---|---|
 | `src/renderer/components/Workspace/PromptPickerOverlay.tsx` | Сам компонент. Mounted один раз в App.tsx. |
 | `src/renderer/App.tsx::handlePickerOpenCapture` | Window keydown capture для Opt+V. |
-| `src/renderer/store/useUIStore.ts` | `promptPickerOpen` / `setPromptPickerOpen`, `promptPickerFontSize` / `setPromptPickerFontSize`. |
+| `src/renderer/store/useUIStore.ts` | `promptPickerOpen`, `promptPickerFontSize`, `promptPickerBottomOffsetPx`, `promptPickerLeftOffsetPx`, `promptPickerRightOffsetPx` + сеттеры. Все persist в localStorage. |
 | `src/renderer/components/Workspace/Terminal.tsx` (оба `attachCustomKeyEventHandler`) | Double-safety guard: блокирует Opt+V и navigation keys, когда picker open. |
-| `src/renderer/components/UI/SettingsModal.tsx` | Слайдер «Prompt picker» в секции «Шрифты интерфейса». |
+| `src/renderer/components/UI/SettingsModal.tsx` | Четыре слайдера в секции «Шрифты интерфейса»: «Prompt picker» (шрифт), «Picker — отступ снизу/слева/справа». |
 
 ## Что НЕ удалили (умышленно)
 - **Right-click context menu** на терминале/SDK — open'ится через `ipcMain.on('show-terminal-context-menu')` / `show-sdk-context-menu`. Native menu всё ещё нужен для правого клика, потому что macOS context-menu имеет правильный mouse-pointer-binding и кастомный picker мы туда не привязывали. Removed только клавиатурное открытие native menu (раньше — Cmd+E с `focusInsertPrompt:true`).
@@ -94,6 +139,9 @@ Picker появляется у курсора, если последний `mous
 - **Capture-listener BEZ `stopImmediatePropagation`** — stopPropagation останавливает bubble, но не другие listeners на том же phase. Если bubble-listener xterm уже сам зарегистрирован на capture (что у xterm.js именно так), он получит событие. `stopImmediatePropagation` блокирует все остальные listeners на этом же event.
 - **Listener в bubble phase на window** — xterm и assistant-ui textarea получают keydown первыми (они подписаны на nested DOM-элементы, по DOM-flow bubble идёт snizu вверх). Capture фaza идёт сверху вниз — window-handler срабатывает раньше.
 - **Backdrop с `background: rgba(0,0,0,0.18)`** — был в первой версии, юзер потребовал убрать («оверлей быть тоже не должно»). Заменён на чистый click-outside.
-- **`top: 50%` (по центру)** — picker конкурировал со statusbar'ом на коротких окнах; в fallback'е перешли на `top: 22%`, а в основном кейсе — к курсору.
-- **Анкор по `clientX/clientY` глобального `MouseEvent` без свежести** — если юзер пришёл в окно через `Cmd+Tab`, последний mousemove мог быть полчаса назад над случайной точкой; picker открывался под мышью, которой там уже не было. Лекарство — timestamp + порог 1500мс, иначе fallback на статичную позицию.
+- **`top: 50%` (по центру)** — picker конкурировал со statusbar'ом на коротких окнах. Промежуточный fallback `top: 22%` тоже был удалён вместе со всей mouse-tracking веткой — теперь fallback всегда `bottom-center` (см. секцию Anchor).
+- **Anchor у курсора мыши** (вся ветка с `lastMouseRef`, `mousemove` listener, `Date.now() - t <= 1500` свежесть, fallback на `top: 22%`) — конфликтовал с типичным сценарием «фокус в SDK input → Opt+V» где мышь могла быть в произвольной точке экрана. Picker выскакивал далеко от того места где юзер реально работал. Заменено на детерминированный якорь от типа активного таба: SDK caret или bottom-center.
+- **`document.querySelector('textarea')` для SDK caret** — находит первую textarea в DOM включая **скрытые** SDK табы (они переключаются через `display:none|flex`, не unmount'ятся). Их `getBoundingClientRect = {0,0,0,0}` → caret = (0,0) → picker в верхнем-левом углу viewport'а. Симптом «picker появляется в углу независимо от позиции каретки» = `findSDKTextarea` не фильтрует по `display !== 'none'`.
+- **Mirror-up главного picker'а при нехватке места снизу** — изначально при `top + measuredH + margin > vh` picker зеркалился вверх от каретки SDK. Юзер: *«ее можно просто пережать вниз и всё»* — открытие вверх ломало mental model «выбираю промпт под местом где печатаю», даже если перекрытие нескольких пикселей инпута визуально менее красиво. Mirror-up оставлен только для правой групповой панели.
 - **Правая панель условным рендерингом без wrapper'а** — без зарезервированной обёртки левая колонка при `selectedLeftItem.kind === 'prompt'` центрировалась в overlay'е. Решение — обёртка с `flexShrink: 0` + `width: RIGHT_W` всегда в DOM, content внутри условный.
+- **Правая панель `position: relative` внутри flex-row** — при flip-up левая колонка тоже сжималась/растягивалась по высоте правой, переанкорив весь picker. Решение — правая панель `position: absolute` внутри обёртки `position: relative + alignSelf: stretch`, переключение `top: 0` ↔ `bottom: 0`. Picker root всегда занимает высоту левой колонки, правая overflow'ит выше/ниже не двигая ничего.

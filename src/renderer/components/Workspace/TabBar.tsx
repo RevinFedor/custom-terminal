@@ -16,21 +16,8 @@ import { ChevronDown, Globe, Bot, Play, Minimize2, Maximize2, PanelLeft, Plus, S
 
 const { ipcRenderer } = window.require('electron');
 
-// ============================================================================
-// VERTICAL MODE (TabSidebar) — geometry knobs. Менять ТОЛЬКО эти константы.
-// Подкручивай числа здесь — карточки во всех зонах перестроятся одинаково.
-// ============================================================================
-// Горизонтальный padding ВНУТРИ карточки справа (px). До: 8.
-const TAB_VERTICAL_PADDING_X = 6;
-// Вертикальный padding ВНУТРИ карточки сверху/снизу (px). До: 0 (был height-фикс).
-const TAB_VERTICAL_PADDING_Y = 3;
-// Левый padding — резерв под полосу процесса (2px) + маркер статуса (8px) + воздух (px). До: 20.
-const TAB_VERTICAL_PADDING_LEFT = 16;
-// Радиус закругления углов карточки (px). До: 0.
-const TAB_VERTICAL_BORDER_RADIUS = 6;
-// Вертикальный зазор между соседними карточками (px). До: 1.
-const TAB_VERTICAL_GAP = 3;
-// ============================================================================
+// VERTICAL MODE (TabSidebar) — геометрия в Settings → Размеры → ТАБЫ → Терминал.
+// Подписка: useUIStore.tabGeometry { paddingX, paddingY, paddingLeft, borderRadius, gap }.
 
 // OSC 133 event-driven process status (no more polling!)
 
@@ -424,6 +411,10 @@ const TabItem = memo(({
 
   const [isHovered, setIsHovered] = useState(false);
 
+  // Settings → Размеры → ТАБЫ → Терминал. Геометрия каждой карточки таба.
+  // Поднято в начало TabItem чтобы быть до объявления tabStyle ниже.
+  const tabGeo = useUIStore((s) => s.tabGeometry);
+
   // Get color config
   // SDK tabs share `color: 'claude'` with PTY claude tabs (so existing palette
   // logic — copy buttons, sticky-note tints, etc — keeps working) but the *tab
@@ -548,10 +539,10 @@ const TabItem = memo(({
       ? '0'
       : (tab.tabType === 'browser'
         // Browser tabs: no left gutter at all.
-        ? (isHorizontal ? '0 12px' : `${TAB_VERTICAL_PADDING_Y}px ${TAB_VERTICAL_PADDING_X}px`)
-        // Vertical mode: всё через константы в начале файла (TAB_VERTICAL_PADDING_*).
+        ? (isHorizontal ? '0 12px' : `${tabGeo.paddingY}px ${tabGeo.paddingX}px`)
+        // Vertical mode: всё из стора tabGeometry (Settings → Размеры).
         : (isVerticalMode
-          ? `${TAB_VERTICAL_PADDING_Y}px ${TAB_VERTICAL_PADDING_X}px ${TAB_VERTICAL_PADDING_Y}px ${TAB_VERTICAL_PADDING_LEFT}px`
+          ? `${tabGeo.paddingY}px ${tabGeo.paddingX}px ${tabGeo.paddingY}px ${tabGeo.paddingLeft}px`
           // SDK tabs: left gutter 32px (matches PTY claude — keeps the green dot
           // the same distance from the left edge so adjacent PTY+SDK tabs align
           // perfectly).
@@ -561,7 +552,7 @@ const TabItem = memo(({
     fontSize: `${fontSize}px`,
     height: isVerticalMode ? 'auto' : '30px',
     minHeight: isVerticalMode ? '24px' : undefined,
-    borderRadius: isVerticalMode ? `${TAB_VERTICAL_BORDER_RADIUS}px` : undefined,
+    borderRadius: isVerticalMode ? `${tabGeo.borderRadius}px` : undefined,
     width: isCollapsed ? '28px' : undefined,
     minWidth: isCollapsed ? '28px' : (isHorizontal ? 'auto' : '100%'),
     maxWidth: isCollapsed ? '28px' : undefined,
@@ -666,8 +657,8 @@ const TabItem = memo(({
                     zIndex: 5,
                     // Закруглённые углы только на «своей» стороне вкладки.
                     ...(processBarPosition === 'right'
-                      ? { borderTopRightRadius: TAB_VERTICAL_BORDER_RADIUS, borderBottomRightRadius: TAB_VERTICAL_BORDER_RADIUS }
-                      : { borderTopLeftRadius: TAB_VERTICAL_BORDER_RADIUS, borderBottomLeftRadius: TAB_VERTICAL_BORDER_RADIUS }),
+                      ? { borderTopRightRadius: tabGeo.borderRadius, borderBottomRightRadius: tabGeo.borderRadius }
+                      : { borderTopLeftRadius: tabGeo.borderRadius, borderBottomLeftRadius: tabGeo.borderRadius }),
                   }}
                 />
               )}
@@ -689,7 +680,7 @@ const TabItem = memo(({
                     pointerEvents: 'none',
                     zIndex: 3,
                     overflow: 'hidden',
-                    borderRadius: TAB_VERTICAL_BORDER_RADIUS,
+                    borderRadius: tabGeo.borderRadius,
                   }}
                   aria-hidden
                 />
@@ -1138,6 +1129,9 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   // Configurable session statuses (Settings → Системные). Используется в context menu
   // для рендера превью трёх точек + полного submenu со статусами.
   const ctxSessionStatuses = useUIStore((state) => state.sessionStatuses);
+  // Settings → Размеры → ТАБЫ → Терминал. Зазор между табами в TabSidebar (вертикальный layout).
+  // Также используется как padding контейнера, чтобы первая/последняя вкладка не липли к краю.
+  const tabSidebarGap = useUIStore((state) => state.tabGeometry.gap);
   // tabNotes* font / padding теперь читаются внутри TabPreviewPopover.
 
   const [editingTabId, setEditingTabId] = useState<string | null>(null);
@@ -1910,7 +1904,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
         {mainTabs.length === 0 ? (
           <EmptyMainZone onDrop={(tabId) => moveTabToZone(projectId, tabId, false, 0)} />
         ) : (
-          <div className="flex flex-col" style={{ gap: `${TAB_VERTICAL_GAP}px`, padding: `${TAB_VERTICAL_GAP}px` }}>
+          <div className="flex flex-col" style={{ gap: `${tabSidebarGap}px`, padding: `${tabSidebarGap}px` }}>
             {mainTabs.map((tab, index) => (
               <TabItem
                 key={tab.id}
@@ -1999,7 +1993,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
             )}
           </div>
           <ZoneDropTarget zone="utility" isEmpty={false}>
-            <div className="flex flex-col max-h-[40%] overflow-y-auto scrollbar-hide" style={{ gap: `${TAB_VERTICAL_GAP}px`, padding: `${TAB_VERTICAL_GAP}px` }}>
+            <div className="flex flex-col max-h-[40%] overflow-y-auto scrollbar-hide" style={{ gap: `${tabSidebarGap}px`, padding: `${tabSidebarGap}px` }}>
               {utilityTabs.map((tab, index) => (
                 <TabItem
                   key={tab.id}

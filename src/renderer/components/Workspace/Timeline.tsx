@@ -329,6 +329,18 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   // Cleared by 'history-panel:scrolled-to' event (success) or the safety timeout (4s).
   const pendingHistoryScrollRef = useRef<{ uuid: string; index: number } | null>(null);
   const historyClickTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Failed-click flash for non-clickable strip markers (fork, plan-mode, last-boundary
+  // unified line). Keyed by the entry index the strip is rendered next to + a kind
+  // tag so multiple strips of the same entry (rare) wouldn't collide. Renders a red
+  // X inside the strip's bounding box for 1.2s — same affordance as the dot-level
+  // `failed` state, but scoped to the strip element.
+  const [failedStripFlash, setFailedStripFlash] = useState<{ index: number; kind: 'fork' | 'plan' | 'boundary' | 'compact-strip' } | null>(null);
+  const flashStripFailed = useCallback((index: number, kind: 'fork' | 'plan' | 'boundary' | 'compact-strip') => {
+    setFailedStripFlash({ index, kind });
+    setTimeout(() => {
+      setFailedStripFlash((cur) => (cur && cur.index === index && cur.kind === kind ? null : cur));
+    }, 1200);
+  }, []);
   const [rewindState, setRewindState] = useState<{ index: number; phase: 'compacting' | 'rewinding' | 'pasting' | 'done' } | null>(null);
 
   // Edit Range state
@@ -722,6 +734,19 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   const isHistoryOpen = useUIStore(state => state.historyPanelOpenTabs[tabId] ?? false);
   const setHistoryPanelOpen = useUIStore(state => state.setHistoryPanelOpen);
   const historyVisibleUuids = useUIStore(state => state.historyVisibleUuids[tabId]);
+  // SDK tabs render the FULL chat history in-place (assistant-ui virtualized
+  // thread), so pre-compact entries are reachable in their own chat — the
+  // Timeline "Old History Zone" red background is misleading there. Same idea
+  // as isHistoryOpen: when full history is rendered somewhere, don't mark
+  // pre-compact entries as unreachable. Fingerprint selector to avoid Map-ref
+  // re-renders (see CLAUDE.md anti-pattern «Не подписывайся на Map целиком»).
+  const isSdkTab = useWorkspaceStore(state => {
+    for (const [, ws] of state.openProjects) {
+      const t = ws.tabs.get(tabId);
+      if (t) return t.tabType === 'claude-sdk';
+    }
+    return false;
+  });
   const containerRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const innerWrapperRef = useRef<HTMLDivElement>(null);
@@ -1326,10 +1351,18 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       return;
     }
 
-    // History panel open — UUID-based visibility, no unreachable zone
-    if (isHistoryOpen) {
+    // History panel open OR SDK tab — full history rendered elsewhere, no
+    // terminal-buffer reachability check applies. SDK tabs in particular have
+    // NO xterm buffer at all — running checkReachability against them would
+    // mark every entry as unreachable. Visibility for SDK falls back to
+    // historyVisibleUuids when the SDK chat reports its viewport via the
+    // existing `claude-sdk:visible-uuids` channel (same wire as HistoryPanel).
+    if (isHistoryOpen || isSdkTab) {
       setUnreachableIndices(prev => prev.size === 0 ? prev : new Set());
       setResponseOnlyIndices(prev => prev.size === 0 ? prev : new Set());
+      // Pre-compact entries are reachable elsewhere (full history is rendered);
+      // clear the boundary so `clickIsOldHistory` doesn't gate clicks.
+      setLastBoundaryIndex(-1);
 
       const uuidSet = historyVisibleUuids ? new Set(historyVisibleUuids) : new Set<string>();
       const newVisible = new Set<number>();
@@ -1568,7 +1601,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       if (reachTimer) clearTimeout(reachTimer);
       terminalRegistry.offViewportChange(tabId);
     };
-  }, [tabId, entries, isVisible, isGemini, isHistoryOpen, historyVisibleUuids]);
+  }, [tabId, entries, isVisible, isGemini, isHistoryOpen, isSdkTab, historyVisibleUuids]);
 
   // Refs
   const tooltipRef = useRef<HTMLDivElement>(null);
@@ -1775,18 +1808,31 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       return;
     }
 
-    // Old history entries are not in terminal buffer — ignore click
-    if (clickIsOldHistory) return;
-
-    // Compact/continued/docs_edit/docs_search entries have no terminal position — skip terminal scroll
-    if (isAttributeEntry(entry)) return;
-
-    // SDK tabs: no xterm buffer — dispatch event for React chat scroll
-    const sdkTab = (() => { const s = useWorkspaceStore.getState(); for (const [,ws] of s.openProjects) { const t = ws.tabs.get(tabId); if (t) return t.tabType === 'claude-sdk'; } return false; })();
-    if (sdkTab) {
+    // SDK tabs render the full chat in-place — scroll-in-SDK works for ANY
+    // entry (regular, compact, continued, old-history). Dispatch first so the
+    // boundary/attribute gates below don't intercept SDK-reachable entries.
+    if (isSdkTab) {
       window.dispatchEvent(new CustomEvent('claude-sdk:scroll-to-entry', { detail: { tabId, uuid: entry.uuid, content: entry.content } }));
       setClickedState({ index, status: 'loading' });
       setTimeout(() => setClickedState(null), 300);
+      return;
+    }
+
+    // Old history entries are not in the terminal buffer (and HistoryPanel
+    // isn't open to render them either). Flash failed X so the click is
+    // acknowledged rather than silently ignored.
+    if (clickIsOldHistory) {
+      setClickedState({ index, status: 'failed' });
+      setTimeout(() => setClickedState((s) => (s?.index === index ? null : s)), 1200);
+      return;
+    }
+
+    // Compact/continued/docs_edit/docs_search have no terminal position. Same
+    // failed-flash treatment as old-history — without HistoryPanel they're
+    // non-navigable.
+    if (isAttributeEntry(entry)) {
+      setClickedState({ index, status: 'failed' });
+      setTimeout(() => setClickedState((s) => (s?.index === index ? null : s)), 1200);
       return;
     }
 
@@ -3243,8 +3289,12 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                       ? 'rgba(59, 130, 246, 0.15)'
                       : isHovered && isExpandedLayout && !isGroupMeta
                         ? 'rgba(255, 255, 255, 0.04)'
-                        : (isOldHistory && !isGroupMeta && !isCompacted ? 'rgba(239, 68, 68, 0.06)' : 'transparent'),
-                    cursor: (isContinued || isDocsEdit || isDocsSearch || isOldHistory) ? 'default' : 'pointer',
+                        : (isOldHistory && !isGroupMeta && !isCompacted && !isHistoryOpen && !isSdkTab
+                            ? 'rgba(239, 68, 68, 0.06)'
+                            : 'transparent'),
+                    // Old history is still clickable when full history is reachable
+                    // (HistoryPanel open OR SDK tab — both render pre-compact entries).
+                    cursor: (isContinued || isDocsEdit || isDocsSearch || (isOldHistory && !isHistoryOpen && !isSdkTab)) ? 'default' : 'pointer',
                   } as React.CSSProperties}
                 >
                   {/* Dot */}
@@ -3340,21 +3390,23 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                     </div>
                   )}
 
-                  {/* Loading spinner — positioned over the dot, not entry center.
-                      In expanded mode entry is wide, so a full-inset absolute would
-                      land in the text column. Instead anchor to left 14px gutter
-                      (matches dot column width) and center vertically. */}
+                  {/* Loading indicator — mirrors the resting-state Viewport-Dash
+                      shape (10×3 white strip) so the click→scroll transition is
+                      a pure intensity pulse, not a shape change. Anchored over
+                      the dot column (left 6px / width 14px in expanded mode;
+                      full-inset otherwise). The dash sits visually on top of
+                      the dot/strip beneath via z-index implicit ordering. */}
                   {dotClickState === 'loading' && (
                     isExpandedLayout ? (
                       <div
                         className="absolute top-0 bottom-0 flex items-center justify-center pointer-events-none"
                         style={{ left: 6, width: 14 }}
                       >
-                        <div className="w-2 h-2 rounded-full bg-blue-400 animate-glow-blue shadow-[0_0_8px_rgba(96,165,250,0.6)]" />
+                        <div className="animate-glow-white" style={{ width: 10, height: 3, borderRadius: 1 }} />
                       </div>
                     ) : (
                       <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-                        <div className="w-2 h-2 rounded-full bg-blue-400 animate-glow-blue shadow-[0_0_8px_rgba(96,165,250,0.6)]" />
+                        <div className="animate-glow-white" style={{ width: 10, height: 3, borderRadius: 1 }} />
                       </div>
                     )
                   )}
@@ -3403,12 +3455,14 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                     </div>
                   );
                 })()}
-                {/* Last boundary separator — full-width unified line between old history and current dialog */}
+                {/* Last boundary separator — full-width unified line between old history and current dialog.
+                    Visually marks "session starts below"; not navigable. Click → red X flash. */}
                 {index === lastBoundaryIndex && (
                   <Tooltip content="Current session starts below">
                   <div
-                    className="flex-shrink-0 w-full flex items-center justify-center"
-                    style={{ height: '8px' }}
+                    className="flex-shrink-0 w-full flex items-center justify-center relative"
+                    style={{ height: '8px', cursor: 'default' }}
+                    onClick={(e) => { e.stopPropagation(); flashStripFailed(index, 'boundary'); }}
                   >
                     <div
                       style={{
@@ -3417,14 +3471,25 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                         backgroundColor: 'rgba(255, 255, 255, 0.2)',
                       }}
                     />
+                    {failedStripFlash?.index === index && failedStripFlash.kind === 'boundary' && (
+                      <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                        <svg width="10" height="10" viewBox="0 0 10 10" style={{ opacity: 0.85 }}>
+                          <line x1="2" y1="2" x2="8" y2="8" stroke="#ef4444" strokeWidth="1.5" strokeLinecap="round" />
+                          <line x1="8" y1="2" x2="2" y2="8" stroke="#ef4444" strokeWidth="1.5" strokeLinecap="round" />
+                        </svg>
+                      </div>
+                    )}
                   </div>
                   </Tooltip>
                 )}
-                {/* Fork marker (only outside old history zone — inside it's redundant) */}
+                {/* Fork marker (only outside old history zone — inside it's redundant).
+                    Not a navigable entry — left-click shows red X. Cmd+hover still opens
+                    the fork tooltip (see onMouseEnter below); Cmd+click does the same X flash. */}
                 {forkMarker && !isOldHistory && (
                   <div
-                    className="flex-shrink-0 w-full flex items-center justify-center"
+                    className="flex-shrink-0 w-full flex items-center justify-center relative"
                     style={{ height: '8px', cursor: isCmdHeld ? 'pointer' : 'default', padding: '6px 0', boxSizing: 'content-box' }}
+                    onClick={(e) => { e.stopPropagation(); flashStripFailed(index, 'fork'); }}
                     onMouseEnter={() => {
                       setHoveredForkMarkerIndex(index);
                       if (isCmdHeldRef.current) {
@@ -3463,14 +3528,23 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                         transition: 'all 0.2s',
                       }}
                     />
+                    {failedStripFlash?.index === index && failedStripFlash.kind === 'fork' && (
+                      <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                        <svg width="10" height="10" viewBox="0 0 10 10" style={{ opacity: 0.85 }}>
+                          <line x1="2" y1="2" x2="8" y2="8" stroke="#ef4444" strokeWidth="1.5" strokeLinecap="round" />
+                          <line x1="8" y1="2" x2="2" y2="8" stroke="#ef4444" strokeWidth="1.5" strokeLinecap="round" />
+                        </svg>
+                      </div>
+                    )}
                   </div>
                 )}
-                {/* Plan mode marker (only outside old history zone) */}
+                {/* Plan mode marker (only outside old history zone) — not navigable, click → X. */}
                 {isPlanModeBoundary && !isOldHistory && (
                   <Tooltip content="Plan mode - context was cleared here">
                   <div
-                    className="flex-shrink-0 w-full flex items-center justify-center"
-                    style={{ height: '8px' }}
+                    className="flex-shrink-0 w-full flex items-center justify-center relative"
+                    style={{ height: '8px', cursor: 'default' }}
+                    onClick={(e) => { e.stopPropagation(); flashStripFailed(index, 'plan'); }}
                   >
                     <div
                       style={{
@@ -3482,6 +3556,14 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                         transition: 'background-color 0.2s, box-shadow 0.2s',
                       }}
                     />
+                    {failedStripFlash?.index === index && failedStripFlash.kind === 'plan' && (
+                      <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                        <svg width="10" height="10" viewBox="0 0 10 10" style={{ opacity: 0.85 }}>
+                          <line x1="2" y1="2" x2="8" y2="8" stroke="#ef4444" strokeWidth="1.5" strokeLinecap="round" />
+                          <line x1="8" y1="2" x2="2" y2="8" stroke="#ef4444" strokeWidth="1.5" strokeLinecap="round" />
+                        </svg>
+                      </div>
+                    )}
                   </div>
                   </Tooltip>
                 )}

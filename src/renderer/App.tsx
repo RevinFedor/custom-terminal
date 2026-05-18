@@ -93,6 +93,9 @@ const ProjectTabItem = memo(({
   const [isDragging, setIsDragging] = useState(false);
   const [isTabDropTarget, setIsTabDropTarget] = useState(false); // Highlight when terminal tab is over
 
+  // Settings → Размеры → ТАБЫ → Проекты. Padding x/y чипа проекта в TitleBar.
+  const projectTabGeometry = useUIStore((s) => s.projectTabGeometry);
+
   useEffect(() => {
     if (isEditing && inputRef.current) {
       inputRef.current.focus();
@@ -172,10 +175,12 @@ const ProjectTabItem = memo(({
   return (
     <button
       ref={ref}
-      className={`relative px-3 py-1.5 text-sm font-medium cursor-pointer transition-all rounded-sm ${
+      className={`relative text-sm font-medium cursor-pointer transition-all rounded-sm ${
         isActive && isAreaActive ? 'ring-1 ring-white/50 shadow-[0_0_10px_rgba(255,255,255,0.1)]' : ''
       } ${textColor}`}
       style={{
+        // padding x/y из Settings (раньше был хардкод px-3 py-1.5 = 12px 6px).
+        padding: `${projectTabGeometry.paddingY}px ${projectTabGeometry.paddingX}px`,
         fontSize: `${fontSize}px`,
         opacity: isDragging ? 0.5 : 1,
         outline: isTabDropTarget ? '2px solid #4ade80' : 'none',
@@ -1742,8 +1747,8 @@ function App() {
         } as any}
       >
         {/* Project Tabs - portfolio style */}
-        <div 
-          className="flex items-center gap-1 px-2 h-full" 
+        <div
+          className="flex items-center gap-1 px-2 h-full"
           style={{ WebkitAppRegion: 'no-drag' } as any}
           onMouseDown={() => setActiveArea('projects')} // Focus projects when clicking this container
           onDoubleClick={(e) => {

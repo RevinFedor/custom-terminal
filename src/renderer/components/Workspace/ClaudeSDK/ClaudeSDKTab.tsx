@@ -19,6 +19,7 @@ import { AssistantProviderBase, MessageByIndexProvider } from '@assistant-ui/cor
 import { Virtuoso, type VirtuosoHandle, type VirtuosoProps } from 'react-virtuoso';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import { rehypeHexHighlight } from './rehypeHexHighlight';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import { Loader2, FileEdit, Terminal as TerminalIcon, FolderSearch, Search, FileText, Globe, RefreshCw, Pencil, Check, X as XIcon, Brain, ChevronRight } from 'lucide-react';
@@ -3047,6 +3048,20 @@ const CompactSummaryMsg = () => {
 // «кричал» — двойной сигнал (ярче + жирнее) на одной иерархической ступени.
 // Inline/block code — `#0d0d0d` (ниже фона bubble #151515 hover) для
 // GitHub-dark contrast: фон кода ТЕМНЕЕ окружения, не светлее.
+// Recursively walk react-children и собирать только string-leaves. После
+// rehypeHexHighlight внутри code-блока могут быть <span data-hex-chip> ноды,
+// SyntaxHighlighter их рендерить не должен — ему нужен оригинальный текст.
+const extractRawText = (node: unknown): string => {
+  if (node == null || node === false) return '';
+  if (typeof node === 'string' || typeof node === 'number') return String(node);
+  if (Array.isArray(node)) return node.map(extractRawText).join('');
+  if (typeof node === 'object' && 'props' in (node as Record<string, unknown>)) {
+    const props = (node as { props?: { children?: unknown } }).props;
+    return extractRawText(props?.children);
+  }
+  return '';
+};
+
 const AssistantTextPart = ({ text }: { text: string }) => {
   if (!text.trim()) return null;
   return (
@@ -3060,10 +3075,15 @@ const AssistantTextPart = ({ text }: { text: string }) => {
     >
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
+        rehypePlugins={[rehypeHexHighlight]}
         components={{
           code({ className, children, ...props }) {
             const match = /language-(\w+)/.exec(className || '');
-            const codeString = String(children).replace(/\n$/, '');
+            // rehypeHexHighlight оборачивает hex в <span>; для блочного кода
+            // SyntaxHighlighter ждёт чистую строку — собираем raw text из всех
+            // потомков, минуя обёртки. Inline-code остаётся как React-children
+            // чтобы chip'ы отрендерились внутри `…`.
+            const codeString = extractRawText(children).replace(/\n$/, '');
             if (match) {
               return (
                 <SyntaxHighlighter

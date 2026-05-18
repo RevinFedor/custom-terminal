@@ -8,6 +8,7 @@ import {
 } from '../../constants/claudeLevels';
 import { PROVIDER_CATALOG, getSupportedEffortsForAlias } from './providerCatalog';
 import SessionActionChip from './SessionActionChip';
+import { useCmdKey } from '../../hooks/useCmdHoverPopover';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -40,9 +41,14 @@ export default function ClaudeControlBar({
   projectPath,
 }: Props) {
   const showToast = useUIStore((s) => s.showToast);
-  const sessionType: 'claude' | 'gemini' | null = claudeSessionId
+  // sessionType is never null — when there's no session yet we use commandType
+  // (or default 'claude' for SDK / fresh tabs) so the chip can still render
+  // "Start Claude" / "Start Gemini" and spawn the right process on click.
+  const sessionType: 'claude' | 'gemini' = claudeSessionId
     ? 'claude'
-    : geminiSessionId ? 'gemini' : null;
+    : geminiSessionId ? 'gemini'
+    : commandType === 'gemini' ? 'gemini'
+    : 'claude';
   const sessionId = claudeSessionId || geminiSessionId;
   const hasAnySession = !!sessionId;
   const [sessionCopied, setSessionCopied] = useState(false);
@@ -225,17 +231,84 @@ export default function ClaudeControlBar({
     return thinkLocal ?? true;
   })();
 
-  // ===== popup state =====
-  const [openPopup, setOpenPopup] = useState<null | 'provider' | 'model' | 'effort'>(null);
+  // ===== popup state — tri-mode trigger =====
+  // Popup может открыться тремя путями (см. `EffortSelector` в StatusBar.tsx,
+  // тот же паттерн):
+  //   • Click по chip → pinnedPopup, закрывается click-outside.
+  //   • CMD + hover на chip → tempPopup, закрывается отпусканием CMD + увод курсора.
+  //   • Курсор на popup'е → popupHover, держит открытым после отпускания CMD.
+  // Один popup за раз: переход CMD-hover с одного триггера на другой переключает.
+  type PopupKey = 'provider' | 'model' | 'effort';
+  const [pinnedPopup, setPinnedPopup] = useState<PopupKey | null>(null);
+  const [hoveredTrigger, setHoveredTrigger] = useState<PopupKey | null>(null);
+  const [hoveredPopup, setHoveredPopup] = useState<PopupKey | null>(null);
+  const isCmdPressed = useCmdKey();
+
+  // Derived: какой popup сейчас визуально открыт.
+  const openPopup: PopupKey | null =
+    pinnedPopup
+    ?? (isCmdPressed && hoveredTrigger ? hoveredTrigger : null)
+    ?? hoveredPopup;
+
   const rootRef = useRef<HTMLDivElement>(null);
+  // Refs на каждый trigger + popup для geometric bridge (mousemove hit-test).
+  const triggerRefs = useRef<Record<PopupKey, HTMLButtonElement | null>>({ provider: null, model: null, effort: null });
+  const popupRefs = useRef<Record<PopupKey, HTMLDivElement | null>>({ provider: null, model: null, effort: null });
+
+  // Click-outside закрывает только pinned popup (CMD-hover закрывается по
+  // отпусканию CMD сам).
   useEffect(() => {
-    if (!openPopup) return;
+    if (!pinnedPopup) return;
     const onDown = (e: MouseEvent) => {
-      if (!rootRef.current?.contains(e.target as Node)) setOpenPopup(null);
+      if (!rootRef.current?.contains(e.target as Node)) setPinnedPopup(null);
     };
     document.addEventListener('mousedown', onDown);
     return () => document.removeEventListener('mousedown', onDown);
+  }, [pinnedPopup]);
+
+  // Geometric bridge: пока popup открыт, mousemove пересчитывает hoveredTrigger
+  // и hoveredPopup по реальным координатам курсора. Это покрывает 4px-зазор
+  // между chip и popup'ом — иначе CMD-hover popup схлопывается, когда курсор
+  // едет к нему через gap (см. `methodology/design-bugs.md::1.2 Hover-bridge`).
+  useEffect(() => {
+    if (!openPopup) return;
+    const onMove = (e: MouseEvent) => {
+      const { clientX: x, clientY: y } = e;
+      let newTrigger: PopupKey | null = null;
+      let newPopup: PopupKey | null = null;
+      (['provider', 'model', 'effort'] as PopupKey[]).forEach((key) => {
+        const t = triggerRefs.current[key]?.getBoundingClientRect();
+        const p = popupRefs.current[key]?.getBoundingClientRect();
+        if (t && x >= t.left && x <= t.right && y >= t.top && y <= t.bottom) {
+          newTrigger = key;
+        }
+        if (p && x >= p.left && x <= p.right && y >= p.top && y <= p.bottom) {
+          newPopup = key;
+        }
+        // Bridge corridor: popup is ABOVE trigger, корридор между нижним краем
+        // popup'а и верхним краем trigger'а (горизонтально по объединению).
+        if (t && p) {
+          const inBridge =
+            x >= Math.min(p.left, t.left) - 8 &&
+            x <= Math.max(p.right, t.right) + 8 &&
+            y >= p.bottom &&
+            y <= t.top;
+          if (inBridge) newPopup = key;
+        }
+      });
+      setHoveredTrigger(newTrigger);
+      setHoveredPopup(newPopup);
+    };
+    document.addEventListener('mousemove', onMove);
+    return () => document.removeEventListener('mousemove', onMove);
   }, [openPopup]);
+
+  // Click на trigger toggle'ит pinned-state. Если popup был открыт через
+  // CMD-hover — клик его «закрепляет» (становится pinned, остаётся открытым
+  // после отпускания CMD). Если был уже pinned тот же — закрывает.
+  const togglePinned = (key: PopupKey) => {
+    setPinnedPopup((cur) => (cur === key ? null : key));
+  };
 
   // ===== handlers =====
   const setEffortOnPTY = async (level: string) => {
@@ -328,7 +401,28 @@ export default function ClaudeControlBar({
     } finally { setIsLocalBusy(false); focusTerminal(); }
   };
 
-  // ===== Session lifecycle handlers (Continue / Stop / Refresh / Fork) =====
+  // ===== Session lifecycle handlers (Start / Continue / Stop / Refresh / Fork) =====
+
+  // Spawn a fresh Claude (or Gemini) process in this tab. Used when there's
+  // no session yet — replaces the old "click chip → copy empty id" no-op.
+  // SDK tabs already have an in-app composer, so we just focus it instead.
+  const onStart = () => {
+    if (!tabId) return;
+    if (isSDKTab) {
+      window.dispatchEvent(new CustomEvent('claude-sdk:focus-composer', { detail: { tabId } }));
+      return;
+    }
+    const store = useWorkspaceStore.getState();
+    terminalRegistry.get(tabId)?.scrollToBottom();
+    if (sessionType === 'gemini') {
+      store.setTabCommandType(tabId, 'gemini');
+      ipcRenderer.send('gemini:spawn-with-watcher', { tabId, cwd: projectPath, yesMode: true });
+    } else {
+      store.setTabCommandType(tabId, 'claude');
+      ipcRenderer.send('claude:run-command', { tabId, command: 'claude' });
+    }
+  };
+
   const onContinue = () => {
     if (!tabId) return;
     if (isSDKTab) {
@@ -518,17 +612,19 @@ export default function ClaudeControlBar({
     >
       {/* LEFT: session controls + context meter */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, flex: 1, minWidth: 0 }}>
-        {/* Triplet [⎘ Continue/Stop ↻] — copy session id, lifecycle chip, force-refresh */}
-        {hasAnySession && (
-          <div
-            className="inline-flex items-center rounded overflow-hidden"
-            style={{
-              gap: 0,
-              border: '1px solid rgba(255,255,255,0.10)',
-              flexShrink: 0,
-            }}
-          >
-            {/* Copy session id */}
+        {/* [⎘ Continue/Stop/Start ↻] — copy session id + lifecycle chip + force-refresh.
+            Chip всегда виден (даже без сессии — тогда он Start). Copy и Refresh
+            прячутся когда сессии нет: «копировать пустой id» и «refresh пустой
+            таймлайн» — мёртвые операции, не дезайблнутые но просто отсутствуют. */}
+        <div
+          className="inline-flex items-center rounded overflow-hidden"
+          style={{
+            gap: 0,
+            border: hasAnySession ? '1px solid rgba(255,255,255,0.10)' : 'none',
+            flexShrink: 0,
+          }}
+        >
+          {hasAnySession && (
             <span
               className="cursor-pointer flex-shrink-0 inline-flex items-center justify-center transition-colors"
               style={{
@@ -557,15 +653,16 @@ export default function ClaudeControlBar({
             >
               {sessionCopied ? '✓' : '⎘'}
             </span>
-            <SessionActionChip
-              sessionType={sessionType}
-              sessionId={sessionId}
-              isCommandRunning={isCommandRunning}
-              hasAnySession={hasAnySession}
-              onContinue={onContinue}
-              onStop={onStop}
-              onCopyId={copySessionId}
-            />
+          )}
+          <SessionActionChip
+            sessionType={sessionType}
+            isCommandRunning={isCommandRunning}
+            hasAnySession={hasAnySession}
+            onStart={onStart}
+            onContinue={onContinue}
+            onStop={onStop}
+          />
+          {hasAnySession && (
             <button
               className="flex-shrink-0 inline-flex items-center justify-center cursor-pointer transition-colors"
               style={{
@@ -592,8 +689,8 @@ export default function ClaudeControlBar({
               onClick={refreshTimeline}
               title="Refresh timeline"
             >↻</button>
-          </div>
-        )}
+          )}
+        </div>
 
         {/* Forks: into new PTY tab (⑂→▭) and into new SDK tab (⑂→SDK).
             SDK fork only for Claude sessions — SDK doesn't run Gemini. */}
@@ -664,23 +761,28 @@ export default function ClaudeControlBar({
           </div>
         )}
 
-        {/* Context meter — pushes to far right of LEFT cluster via flex spacer */}
+        {/* Context meter — pushes to far right of LEFT cluster via flex spacer.
+            Полоска убрана: места мало (control bar 30px, юзеру важна цифра, а
+            не визуальный объём). Только цветной процент: цвет даёт градиент
+            здоровья (зелёный → амбер → красный), сама цифра — точное значение. */}
         <div style={{ flex: 1 }} />
         {contextPct > 0 ? (
-          <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0 }}>
-            <span style={{ fontSize: 10, color: '#666' }}>Ctx</span>
-            <div style={{ width: 140, height: 4, backgroundColor: '#2d2d2d', borderRadius: 2, overflow: 'hidden' }}>
-              <div style={{ width: contextPct + '%', height: '100%', backgroundColor: meterColor }} />
-            </div>
-            <span style={{ fontSize: 10, color: meterColor, minWidth: 32 }}>{contextPct.toFixed(0)}%</span>
-          </div>
+          <span
+            style={{ fontSize: 11, color: meterColor, fontVariantNumeric: 'tabular-nums', flexShrink: 0 }}
+            title="Context usage"
+          >
+            {contextPct.toFixed(0)}%
+          </span>
         ) : null}
       </div>
 
-      {/* RIGHT: dropdowns. Когда команда в полёте — обёртка получает
-          control-bar-busy-overlay (shimmer-полоса через ::after) и
-          pointer-events:none (клики блокированы). Ширина сохраняется,
-          opacity триггеров не меняется → нет «съёжившегося dead-блока». */}
+      {/* RIGHT: dropdowns. Два блокирующих состояния:
+          • isBusy → shimmer-overlay через ::after (in-flight command).
+          • !hasAnySession → opacity 0.4 (юзеру нечего настраивать пока
+            процесса нет; провайдер/модель/effort применяются командами в
+            живой TUI — без процесса они просто провалятся в shell). Сам
+            кластер виден чтобы пользователь видел будущий контекст, но
+            клики блокированы pointer-events:none. */}
       {supportsKnobs && (
         <div
           className={isBusy ? 'control-bar-busy-overlay' : undefined}
@@ -688,7 +790,9 @@ export default function ClaudeControlBar({
             display: 'flex',
             alignItems: 'center',
             gap: 6,
-            pointerEvents: isBusy ? 'none' : 'auto',
+            pointerEvents: (isBusy || !hasAnySession) ? 'none' : 'auto',
+            opacity: !hasAnySession ? 0.4 : 1,
+            transition: 'opacity 0.15s',
           }}
           aria-busy={isBusy}
         >

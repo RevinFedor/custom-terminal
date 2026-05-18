@@ -413,6 +413,14 @@ SDK 0.3 не поддерживает midstream приём нового prompt'�
 
 **Что пробовали и почему не сработало.** Первая мысль была — добавить вызов `s.setClaudeSessionId(tabId, sid)` поверх `updateSDKState` в renderer (handleMessage SDK iterator). Не сработало: `setClaudeSessionId` имеет guard `if (tab.claudeSessionId === sessionId) return` и сбрасывает overlay-флаги (`wasInterrupted`/`overlayDismissed`) — для SDK таба эти сбросы случайны и могут схлопнуть Interrupted Session Recovery overlay вместо PTY-таба. Решение через `updateSDKState` локальнее: одно место, одно поведение, save-side effect только когда sid реально меняется.
 
+## Hex chip подсветка в `AssistantTextPart`
+
+Hex-цвета (`#FFF` / `#DA7756` / `#DA775680`) в ответе ассистента оборачиваются в chip со своим `background-color` и контрастным `color` по YIQ-формуле — юзер просил «менять bg текста под цвет где решетка и 6 символов», чтобы цвет считывался глазом, а не ментально декодировался. Реализовано не через кастомный `code` mapper в `ReactMarkdown` (тот видит только ``…``), а через rehype-плагин — основной кейс это **plain text** ассистента (`#DA7756` без backtick'ов), его mapper'ом не дотянуться. Поэтому подсветка работает одинаково в plain `<p>`, inline-code и в блочном коде (CSS/SCSS включительно — «без разницы какая будет разметка, нужно отображать background»).
+
+Единственное исключение — `language-diff` блоки: там +/- и токены имеют собственную смысловую раскраску, юзер сам её и формулировал («исключение только сделать сообщение которое не текстовое, например diff»). Плагин по `className === 'language-diff'` пропускает text-узлы без замены.
+
+Невидимая связь с code-mapper'ом: после плагина внутри блочного `<code class="language-*">` `children` уже **React-tree** с `<span data-hex-chip>` обёртками, а не строка. Прежний паттерн `String(children).replace(/\n$/, '')` отдавал бы `SyntaxHighlighter` мусор со `[object Object]`. Решение — рекурсивный `extractRawText(children)` который проходит по дереву и собирает только text-leaves. Реализация: `src/renderer/components/Workspace/ClaudeSDK/rehypeHexHighlight.ts` и `extractRawText` в `ClaudeSDKTab.tsx` рядом с `AssistantTextPart`.
+
 ## Code map: background tasks
 
 - `src/main/main.js::sdkStartQuery` → `options.agentProgressSummaries:true` + `options.forwardSubagentText:true`. Без них iterator получает только start+end events для subagent'ов.

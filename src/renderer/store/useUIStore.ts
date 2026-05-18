@@ -132,6 +132,66 @@ function saveStatusMarker(s: StatusMarkerSettings) {
   try { localStorage.setItem('noted-terminal-status-marker', JSON.stringify(s)); } catch {}
 }
 
+export interface TabGeometrySettings {
+  paddingX: number;       // горизонтальный padding внутри таба, default 6 (clamp 0..32)
+  paddingY: number;       // вертикальный, default 3 (clamp 0..24)
+  paddingLeft: number;    // левый отступ (резерв под process-bar 3px + status marker 8px + воздух), default 16 (clamp 4..48)
+  borderRadius: number;   // скругление углов, default 6 (clamp 0..20)
+  gap: number;            // зазор между табами, default 3 (clamp 0..16)
+}
+
+const DEFAULT_TAB_GEOMETRY: TabGeometrySettings = {
+  paddingX: 6, paddingY: 3, paddingLeft: 16, borderRadius: 6, gap: 3,
+};
+
+function clampInt(v: any, fallback: number, min: number, max: number): number {
+  return typeof v === 'number' ? Math.max(min, Math.min(max, Math.round(v))) : fallback;
+}
+
+function loadTabGeometry(): TabGeometrySettings {
+  try {
+    const raw = localStorage.getItem('noted-terminal-tab-geometry');
+    if (!raw) return DEFAULT_TAB_GEOMETRY;
+    const p = JSON.parse(raw);
+    if (!p || typeof p !== 'object') return DEFAULT_TAB_GEOMETRY;
+    return {
+      paddingX:     clampInt(p.paddingX,     DEFAULT_TAB_GEOMETRY.paddingX,     0, 32),
+      paddingY:     clampInt(p.paddingY,     DEFAULT_TAB_GEOMETRY.paddingY,     0, 24),
+      paddingLeft:  clampInt(p.paddingLeft,  DEFAULT_TAB_GEOMETRY.paddingLeft,  4, 48),
+      borderRadius: clampInt(p.borderRadius, DEFAULT_TAB_GEOMETRY.borderRadius, 0, 20),
+      gap:          clampInt(p.gap,          DEFAULT_TAB_GEOMETRY.gap,          0, 16),
+    };
+  } catch { return DEFAULT_TAB_GEOMETRY; }
+}
+
+function saveTabGeometry(s: TabGeometrySettings) {
+  try { localStorage.setItem('noted-terminal-tab-geometry', JSON.stringify(s)); } catch {}
+}
+
+export interface ProjectTabGeometrySettings {
+  paddingX: number;   // default 12 (clamp 0..32) — соответствует px-3
+  paddingY: number;   // default 6  (clamp 0..16) — соответствует py-1.5
+}
+
+const DEFAULT_PROJECT_TAB_GEOMETRY: ProjectTabGeometrySettings = { paddingX: 12, paddingY: 6 };
+
+function loadProjectTabGeometry(): ProjectTabGeometrySettings {
+  try {
+    const raw = localStorage.getItem('noted-terminal-project-tab-geometry');
+    if (!raw) return DEFAULT_PROJECT_TAB_GEOMETRY;
+    const p = JSON.parse(raw);
+    if (!p || typeof p !== 'object') return DEFAULT_PROJECT_TAB_GEOMETRY;
+    return {
+      paddingX: clampInt(p.paddingX, DEFAULT_PROJECT_TAB_GEOMETRY.paddingX, 0, 32),
+      paddingY: clampInt(p.paddingY, DEFAULT_PROJECT_TAB_GEOMETRY.paddingY, 0, 16),
+    };
+  } catch { return DEFAULT_PROJECT_TAB_GEOMETRY; }
+}
+
+function saveProjectTabGeometry(s: ProjectTabGeometrySettings) {
+  try { localStorage.setItem('noted-terminal-project-tab-geometry', JSON.stringify(s)); } catch {}
+}
+
 
 interface DocPromptSettings {
 
@@ -183,8 +243,21 @@ interface UIStore {
   statusMarker: StatusMarkerSettings;
   setStatusMarker: (patch: Partial<StatusMarkerSettings>) => void;
 
+  /* Tab geometry — табы терминала в TabSidebar (vertical mode). Все поля px.
+     Раньше — три константы TAB_VERTICAL_PADDING_* в TabBar.tsx, юзер не мог менять
+     не открывая код. Теперь Settings → Размеры → ТАБЫ → Терминал. */
+  tabGeometry: TabGeometrySettings;
+  setTabGeometry: (patch: Partial<TabGeometrySettings>) => void;
+
+  /* Project tab geometry — чипы проектов в TitleBar. */
+  projectTabGeometry: ProjectTabGeometrySettings;
+  setProjectTabGeometry: (patch: Partial<ProjectTabGeometrySettings>) => void;
+
   filePreviewFontSize: number; // FilePreview readOnly editor
   promptPickerFontSize: number; // Opt+V picker rows
+  promptPickerBottomOffsetPx: number; // Отступ от низа viewport'а для fallback-якоря picker'а (PTY-табы)
+  promptPickerLeftOffsetPx: number;   // 0 — центр или прижатие к правому. >0 — прижатие к левому краю.
+  promptPickerRightOffsetPx: number;  // 0 — центр или прижатие к левому. >0 — приоритет: прижатие к правому краю.
   timelineFontSize: number;    // Timeline entries preview text
   timelineWidth: number;       // Timeline width (px) when expanded (treeMode). Drag-resizable.
   timelineLineClamp: number;   // How many lines of preview text show in expanded mode.
@@ -201,6 +274,9 @@ interface UIStore {
 
   setFilePreviewFontSize: (size: number) => void;
   setPromptPickerFontSize: (size: number) => void;
+  setPromptPickerBottomOffsetPx: (px: number) => void;
+  setPromptPickerLeftOffsetPx: (px: number) => void;
+  setPromptPickerRightOffsetPx: (px: number) => void;
 
   setTimelineFontSize: (size: number) => void;
   setTimelineWidth: (width: number) => void;
@@ -747,6 +823,36 @@ const loadPromptPickerFontSize = (): number => {
   return 12;
 };
 
+const loadPromptPickerBottomOffsetPx = (): number => {
+  try {
+    const v = localStorage.getItem('noted-terminal-prompt-picker-bottom-offset');
+    if (v !== null && v !== undefined && v !== '') {
+      return Math.max(0, Math.min(400, Number(v) || 50));
+    }
+  } catch {}
+  return 50;
+};
+
+const loadPromptPickerLeftOffsetPx = (): number => {
+  try {
+    const v = localStorage.getItem('noted-terminal-prompt-picker-left-offset');
+    if (v !== null && v !== undefined && v !== '') {
+      return Math.max(0, Math.min(2000, Number(v) || 0));
+    }
+  } catch {}
+  return 0;
+};
+
+const loadPromptPickerRightOffsetPx = (): number => {
+  try {
+    const v = localStorage.getItem('noted-terminal-prompt-picker-right-offset');
+    if (v !== null && v !== undefined && v !== '') {
+      return Math.max(0, Math.min(2000, Number(v) || 0));
+    }
+  } catch {}
+  return 0;
+};
+
 const loadTimelineFontSize = (): number => {
   try {
     const v = localStorage.getItem('noted-terminal-timeline-font-size');
@@ -1156,8 +1262,36 @@ export const useUIStore = create<UIStore>((set, get) => ({
     saveStatusMarker(next);
   },
 
+  tabGeometry: loadTabGeometry(),
+  setTabGeometry: (patch) => {
+    const cur = get().tabGeometry;
+    const next: TabGeometrySettings = {
+      paddingX:     clampInt(patch.paddingX,     cur.paddingX,     0, 32),
+      paddingY:     clampInt(patch.paddingY,     cur.paddingY,     0, 24),
+      paddingLeft:  clampInt(patch.paddingLeft,  cur.paddingLeft,  4, 48),
+      borderRadius: clampInt(patch.borderRadius, cur.borderRadius, 0, 20),
+      gap:          clampInt(patch.gap,          cur.gap,          0, 16),
+    };
+    set({ tabGeometry: next });
+    saveTabGeometry(next);
+  },
+
+  projectTabGeometry: loadProjectTabGeometry(),
+  setProjectTabGeometry: (patch) => {
+    const cur = get().projectTabGeometry;
+    const next: ProjectTabGeometrySettings = {
+      paddingX: clampInt(patch.paddingX, cur.paddingX, 0, 32),
+      paddingY: clampInt(patch.paddingY, cur.paddingY, 0, 16),
+    };
+    set({ projectTabGeometry: next });
+    saveProjectTabGeometry(next);
+  },
+
   filePreviewFontSize: loadFilePreviewFontSize(),
   promptPickerFontSize: loadPromptPickerFontSize(),
+  promptPickerBottomOffsetPx: loadPromptPickerBottomOffsetPx(),
+  promptPickerLeftOffsetPx: loadPromptPickerLeftOffsetPx(),
+  promptPickerRightOffsetPx: loadPromptPickerRightOffsetPx(),
   timelineFontSize: loadTimelineFontSize(),
   timelineWidth: loadTimelineWidth(),
   timelineLineClamp: loadTimelineLineClamp(),
@@ -1185,6 +1319,22 @@ export const useUIStore = create<UIStore>((set, get) => ({
     const clamped = Math.max(9, Math.min(20, size));
     set({ promptPickerFontSize: clamped });
     try { localStorage.setItem('noted-terminal-prompt-picker-font-size', String(clamped)); } catch {}
+  },
+
+  setPromptPickerBottomOffsetPx: (px: number) => {
+    const clamped = Math.max(0, Math.min(400, Math.round(px)));
+    set({ promptPickerBottomOffsetPx: clamped });
+    try { localStorage.setItem('noted-terminal-prompt-picker-bottom-offset', String(clamped)); } catch {}
+  },
+  setPromptPickerLeftOffsetPx: (px: number) => {
+    const clamped = Math.max(0, Math.min(2000, Math.round(px)));
+    set({ promptPickerLeftOffsetPx: clamped });
+    try { localStorage.setItem('noted-terminal-prompt-picker-left-offset', String(clamped)); } catch {}
+  },
+  setPromptPickerRightOffsetPx: (px: number) => {
+    const clamped = Math.max(0, Math.min(2000, Math.round(px)));
+    set({ promptPickerRightOffsetPx: clamped });
+    try { localStorage.setItem('noted-terminal-prompt-picker-right-offset', String(clamped)); } catch {}
   },
 
   setTimelineFontSize: (size: number) => {
