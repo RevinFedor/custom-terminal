@@ -164,12 +164,21 @@
   50% { background-color: #450a0a; box-shadow: 0 0 10px #dc2626; }
 }
 
+/* White pulsing strip — used as Timeline-dot loader. Mirrors the resting-state
+   Viewport-Dash visual (10×3 white strip) so the click→scroll transition has
+   no shape change, only intensity. */
+@keyframes glow-white {
+  0%, 100% { background-color: rgba(255, 255, 255, 0.95); box-shadow: 0 0 6px rgba(255, 255, 255, 0.6); }
+  50% { background-color: rgba(255, 255, 255, 0.35); box-shadow: 0 0 2px rgba(255, 255, 255, 0.15); }
+}
+
 .animate-glow-yellow { animation: glow-yellow 1.8s ease-in-out infinite; }
 .animate-glow-purple { animation: glow-purple 1.8s ease-in-out infinite; }
 .animate-glow-green { animation: glow-green 1.8s ease-in-out infinite; }
 .animate-glow-indigo { animation: glow-indigo 1.8s ease-in-out infinite; }
 .animate-glow-blue { animation: glow-blue 1.8s ease-in-out infinite; }
 .animate-glow-red { animation: glow-red 1.8s ease-in-out infinite; }
+.animate-glow-white { animation: glow-white 0.9s ease-in-out infinite; }
 
 .animate-slide-in { animation: slide-in 0.3s ease-out forwards; }
 

@@ -655,11 +655,12 @@ export default function Workspace() {
             )}
           </div>
 
-          {/* Claude control bar — Provider/Model/Effort/Think + Ctx meter.
-              Visible whenever the active tab is a Claude session (PTY OR SDK).
-              Lives under the Terminal column, so its width matches the terminal
-              area and Timeline (right-side) keeps its full height untouched. */}
-          {effectiveTab && currentView === 'terminal' && (effectiveTabType === 'claude-sdk' || (effectiveCommandType === 'claude' && effectiveClaudeSessionId)) && (
+          {/* Claude control bar — Provider/Model/Effort/Think + Ctx meter +
+              SessionActionChip (Start/Continue/Stop). Visible on every Terminal
+              column (any tabType except 'browser'). Without a live AI session
+              the bar dims the right cluster and shows a Start-capable chip so
+              the user can spawn Claude from any terminal. */}
+          {effectiveTab && currentView === 'terminal' && effectiveTabType !== 'browser' && (
             <ClaudeControlBar
               tabId={effectiveTab.id}
               claudeSessionId={effectiveClaudeSessionId}

@@ -56,13 +56,100 @@ async function deliverPrompt(prompt: PromptRow, tabId: string, isSDKTab: boolean
   }
 }
 
+// SDK composer textarea. All SDK tabs stay mounted in the DOM under
+// `<div class="absolute inset-0 flex flex-col" style="display:none|flex">`
+// (visibility toggle, not unmount). A blind `document.querySelector('textarea')`
+// finds the textarea of a HIDDEN tab — its getBoundingClientRect is (0,0,0,0),
+// which is why the picker was landing in the top-left corner.
+// We replicate the same visible-tab scan ClaudeSDKTab uses internally:
+// among all SDK roots, pick the one with computed display !== 'none'.
+function findSDKTextarea(): HTMLTextAreaElement | null {
+  const roots = Array.from(
+    document.querySelectorAll('.absolute.inset-0.flex.flex-col')
+  ) as HTMLElement[];
+  for (const root of roots) {
+    const display = root.style?.display || window.getComputedStyle(root).display;
+    if (display === 'none') continue;
+    const ta = root.querySelector('textarea') as HTMLTextAreaElement | null;
+    if (!ta) continue;
+    // Defense in depth: skip textareas whose bounding rect is zero (parent
+    // hidden via class instead of inline style, etc.). Caret measurement
+    // against a zero-rect element is exactly the bug we are avoiding.
+    const r = ta.getBoundingClientRect();
+    if (r.width === 0 && r.height === 0) continue;
+    return ta;
+  }
+  return null;
+}
+
+// Mirror-div technique to get pixel coordinates of the caret inside a
+// textarea. Builds an invisible div with identical text-affecting styles,
+// inserts the value up to `position`, then measures a marker span. Standard
+// approach (same as textarea-caret-coordinates package), inlined to avoid
+// a dependency. Returns viewport-relative coords (already accounts for the
+// textarea's bounding rect and scroll position).
+function getSDKCaretViewportRect(ta: HTMLTextAreaElement): { left: number; top: number; height: number } | null {
+  try {
+    const position = ta.selectionEnd ?? ta.value.length;
+    const computed = window.getComputedStyle(ta);
+    const div = document.createElement('div');
+    document.body.appendChild(div);
+    const style = div.style;
+    style.position = 'absolute';
+    style.visibility = 'hidden';
+    style.whiteSpace = 'pre-wrap';
+    style.wordWrap = 'break-word';
+    style.top = '0';
+    style.left = '0';
+
+    const properties: (keyof CSSStyleDeclaration)[] = [
+      'direction', 'boxSizing', 'width', 'height', 'overflowX', 'overflowY',
+      'borderTopWidth', 'borderRightWidth', 'borderBottomWidth', 'borderLeftWidth',
+      'borderStyle',
+      'paddingTop', 'paddingRight', 'paddingBottom', 'paddingLeft',
+      'fontStyle', 'fontVariant', 'fontWeight', 'fontStretch', 'fontSize',
+      'fontSizeAdjust', 'lineHeight', 'fontFamily',
+      'textAlign', 'textTransform', 'textIndent', 'textDecoration',
+      'letterSpacing', 'wordSpacing',
+      'tabSize',
+    ];
+    properties.forEach((prop) => {
+      (style as any)[prop] = (computed as any)[prop];
+    });
+
+    div.textContent = ta.value.substring(0, position);
+    const span = document.createElement('span');
+    span.textContent = ta.value.substring(position) || '.';
+    div.appendChild(span);
+
+    const lineH = parseFloat(computed.lineHeight) || parseFloat(computed.fontSize) * 1.2 || 20;
+    const localTop = span.offsetTop - ta.scrollTop;
+    const localLeft = span.offsetLeft - ta.scrollLeft;
+    document.body.removeChild(div);
+
+    const rect = ta.getBoundingClientRect();
+    return {
+      left: rect.left + localLeft,
+      top: rect.top + localTop,
+      height: lineH,
+    };
+  } catch {
+    return null;
+  }
+}
+
 const PromptPickerOverlay: React.FC = () => {
   const open = useUIStore((s) => s.promptPickerOpen);
   const setOpen = useUIStore((s) => s.setPromptPickerOpen);
   const showToast = useUIStore((s) => s.showToast);
   const fontSize = useUIStore((s) => s.promptPickerFontSize);
+  const bottomOffsetPx = useUIStore((s) => s.promptPickerBottomOffsetPx);
+  const leftOffsetPx = useUIStore((s) => s.promptPickerLeftOffsetPx);
+  const rightOffsetPx = useUIStore((s) => s.promptPickerRightOffsetPx);
 
   const rootRef = useRef<HTMLDivElement | null>(null);
+  const leftPanelRef = useRef<HTMLDivElement | null>(null);
+  const rightPanelRef = useRef<HTMLDivElement | null>(null);
 
   const [groups, setGroups] = useState<PromptGroupRow[]>([]);
   const [prompts, setPrompts] = useState<PromptRow[]>([]);
@@ -74,23 +161,17 @@ const PromptPickerOverlay: React.FC = () => {
   const [pickerLevel, setPickerLevel] = useState<'group' | 'prompt'>('group');
   const [selectedPromptIdx, setSelectedPromptIdx] = useState(0);
 
-  // Anchor: at the cursor (if mouse moved recently inside the window),
-  // otherwise fall back to a fixed upper-third position. Decided once on
-  // open transition; doesn't follow the cursor while picker is up.
-  type Anchor = { mode: 'fixed-top' } | { mode: 'cursor'; x: number; y: number };
-  const [anchor, setAnchor] = useState<Anchor>({ mode: 'fixed-top' });
-
-  // Continuously tracked while component is mounted (App-level singleton).
-  // mousemove only fires when cursor is inside the Electron window, so a
-  // stale timestamp ⇒ cursor probably outside → trigger fallback.
-  const lastMouseRef = useRef<{ x: number; y: number; t: number }>({ x: 0, y: 0, t: 0 });
-  useEffect(() => {
-    const onMove = (e: MouseEvent) => {
-      lastMouseRef.current = { x: e.clientX, y: e.clientY, t: Date.now() };
-    };
-    window.addEventListener('mousemove', onMove, true);
-    return () => window.removeEventListener('mousemove', onMove, true);
-  }, []);
+  // Anchor strategies:
+  //   sdk-caret  — SDK composer is the active tab; pin to caret pixel position
+  //                inside the textarea (mirror-div measurement). User asked for
+  //                placement right of the blinking text caret.
+  //   bottom-center — anything else (PTY terminal, no active tab, missing
+  //                composer DOM); fixed center-bottom of viewport with a
+  //                user-controlled offset (Settings → "Picker — отступ снизу").
+  type Anchor =
+    | { mode: 'sdk-caret'; x: number; y: number; lineH: number }
+    | { mode: 'bottom-center' };
+  const [anchor, setAnchor] = useState<Anchor>({ mode: 'bottom-center' });
 
   useEffect(() => {
     if (!open) return;
@@ -137,16 +218,38 @@ const PromptPickerOverlay: React.FC = () => {
     setSelectedPromptIdx(0);
   }, [open, loaded, flatLeft]);
 
-  // Decide anchor each time picker opens. If mouse moved inside the window
-  // recently (≤ 1500ms) we trust the last cursor position; otherwise the
-  // cursor is probably outside the Electron window — use fixed fallback.
+  const resolveTarget = useCallback((): { tabId: string; isSDK: boolean } | null => {
+    const state = useWorkspaceStore.getState();
+    const effectiveId = state.getEffectiveTabId();
+    if (!effectiveId) return null;
+    for (const [, ws] of state.openProjects) {
+      const tab = ws.tabs.get(effectiveId);
+      if (tab) {
+        return { tabId: effectiveId, isSDK: tab.tabType === 'claude-sdk' };
+      }
+    }
+    return { tabId: effectiveId, isSDK: false };
+  }, []);
+
+  // Decide anchor each time picker opens. Only two real branches now:
+  //   1) SDK tab + textarea DOM reachable + caret measurable → caret-anchor.
+  //   2) Anything else → fixed bottom-center with user-configured offset.
+  // Decision is made ONCE on open so arrow-nav doesn't drift the picker.
   useEffect(() => {
     if (!open) return;
-    const last = lastMouseRef.current;
-    const fresh = last.t > 0 && (Date.now() - last.t) <= 1500;
-    if (fresh) setAnchor({ mode: 'cursor', x: last.x, y: last.y });
-    else setAnchor({ mode: 'fixed-top' });
-  }, [open]);
+    const target = resolveTarget();
+    if (target?.isSDK) {
+      const ta = findSDKTextarea();
+      if (ta) {
+        const c = getSDKCaretViewportRect(ta);
+        if (c) {
+          setAnchor({ mode: 'sdk-caret', x: c.left, y: c.top, lineH: c.height });
+          return;
+        }
+      }
+    }
+    setAnchor({ mode: 'bottom-center' });
+  }, [open, resolveTarget]);
 
   const closePicker = useCallback(() => {
     setOpen(false);
@@ -183,19 +286,6 @@ const PromptPickerOverlay: React.FC = () => {
     }
   }, [selectedLeftItem, pickerLevel]);
 
-  const resolveTarget = useCallback((): { tabId: string; isSDK: boolean } | null => {
-    const state = useWorkspaceStore.getState();
-    const effectiveId = state.getEffectiveTabId();
-    if (!effectiveId) return null;
-    for (const [, ws] of state.openProjects) {
-      const tab = ws.tabs.get(effectiveId);
-      if (tab) {
-        return { tabId: effectiveId, isSDK: tab.tabType === 'claude-sdk' };
-      }
-    }
-    return { tabId: effectiveId, isSDK: false };
-  }, []);
-
   const handleSelectPrompt = useCallback(async (prompt: PromptRow) => {
     const target = resolveTarget();
     if (!target) {
@@ -218,8 +308,6 @@ const PromptPickerOverlay: React.FC = () => {
         || k === 'ArrowRight' || k === 'Enter' || k === 'Escape';
       if (!navKey) return;
 
-      // Eat the event before anything else (xterm customKeyEventHandler,
-      // assistant-ui textarea, etc.) can act on it.
       e.preventDefault();
       e.stopPropagation();
       if (typeof (e as any).stopImmediatePropagation === 'function') {
@@ -315,7 +403,6 @@ const PromptPickerOverlay: React.FC = () => {
   }, [open, closePicker]);
 
   // Sizes scaled from store fontSize so paddings stay proportional to text.
-  // Defaults at fontSize=12 → row 4px/8px padding, panels 180/200 wide.
   const ROW_PAD_Y = Math.max(3, Math.round(fontSize * 0.33));
   const ROW_PAD_X = Math.max(6, Math.round(fontSize * 0.66));
   const PANEL_PAD = 3;
@@ -324,37 +411,96 @@ const PromptPickerOverlay: React.FC = () => {
   const RIGHT_W = Math.max(160, Math.round(fontSize * 17));
   const MAX_H = 460;
 
-  // Geometry is decided in a layout effect after the picker is mounted —
-  // we need the real measured size to clamp into the viewport. Until the
-  // first measurement lands we render the picker off-screen but mounted
-  // so getBoundingClientRect returns meaningful numbers.
-  const [pos, setPos] = useState<{ left: number; top: number } | null>(null);
+  // Position & flip state. Computed from real measured sizes after mount —
+  // until first measurement lands we render off-screen but mounted so
+  // getBoundingClientRect returns meaningful numbers.
+  //
+  // The MAIN picker (left column) always opens downward from its anchor.
+  // No vertical mirroring — the user explicitly asked for "down only"; if the
+  // caret is close to the bottom the picker is clamped to viewport bottom and
+  // overlaps a few pixels of the input, which is acceptable.
+  //
+  //   rightFlipUp = right (group-content) panel grows upward from the bottom
+  //                 of the left panel instead of downward. Triggered when the
+  //                 right panel would clip the viewport bottom — left column
+  //                 stays put, only the secondary panel reorients.
+  const [pos, setPos] = useState<{ left: number; top: number; rightFlipUp: boolean } | null>(null);
   const estW = LEFT_W + GAP + RIGHT_W + PANEL_PAD * 2;
   const estH = MAX_H;
 
   useLayoutEffect(() => {
     if (!open) { setPos(null); return; }
     if (typeof window === 'undefined') return;
-    const measuredW = rootRef.current?.offsetWidth ?? estW;
-    const measuredH = rootRef.current?.offsetHeight ?? estH;
+
+    const margin = 8;
     const vw = window.innerWidth;
     const vh = window.innerHeight;
-    const margin = 8;
+
+    // Picker root size — for the sdk-caret anchor we want the picker's full
+    // bounding box. For bottom-center the same measurement decides whether
+    // we can fit the offset (we'll clamp into viewport regardless).
+    const measuredW = rootRef.current?.offsetWidth ?? estW;
+    const measuredH = rootRef.current?.offsetHeight ?? estH;
+
+    // Right panel height is needed for the secondary flip independent of the
+    // overall picker height — left panel determines the picker root height
+    // when right is absolute-positioned, so we read right's own height here.
+    const rightH = rightPanelRef.current?.offsetHeight ?? 0;
+    const leftH = leftPanelRef.current?.offsetHeight ?? measuredH;
+
     let left: number;
     let top: number;
-    if (anchor.mode === 'cursor') {
-      left = anchor.x + 4;
-      top = anchor.y + 4;
+
+    if (anchor.mode === 'sdk-caret') {
+      // Always anchor BELOW + right of the caret. If there's not enough space
+      // below — let the bottom viewport clamp (further down) push the whole
+      // picker up. We deliberately do NOT mirror to above the caret line:
+      // user explicitly asked for downward-only opening; covering a couple of
+      // pixels of the input is fine. The "flip up" behavior stays reserved
+      // for the right (group-contents) panel — that's the only case where
+      // reversing direction is needed.
+      left = anchor.x + 6;
+      top = anchor.y + anchor.lineH + 4;
     } else {
-      left = Math.round(vw / 2 - measuredW / 2);
-      top = Math.round(vh * 0.22 - measuredH / 2);
+      // bottom-center fallback. Horizontal placement priority:
+      //   rightOffsetPx > 0 → pin to RIGHT edge with that gap
+      //   leftOffsetPx  > 0 → pin to LEFT edge with that gap
+      //   both zero        → centered
+      // Right wins over left so the user can use just one slider and know it
+      // takes effect; the other can stay at 0 as "don't care".
+      if (rightOffsetPx > 0) {
+        left = vw - measuredW - rightOffsetPx;
+      } else if (leftOffsetPx > 0) {
+        left = leftOffsetPx;
+      } else {
+        left = Math.round(vw / 2 - measuredW / 2);
+      }
+      top = vh - measuredH - bottomOffsetPx;
+      if (top < margin) top = margin;
     }
+
+    // Horizontal viewport clamp (vertical clamp already handled per-mode).
     if (left + measuredW + margin > vw) left = vw - measuredW - margin;
-    if (top + measuredH + margin > vh) top = vh - measuredH - margin;
     if (left < margin) left = margin;
+    if (top + measuredH + margin > vh) top = vh - measuredH - margin;
     if (top < margin) top = margin;
-    setPos({ left, top });
-  }, [open, anchor, estW, estH, flatLeft.length, rightPrompts.length, selectedKey, pickerLevel]);
+
+    // Right panel secondary flip. Anchor for the right panel is the picker
+    // root's top. If renders downward (top:0 of wrapper) it would overflow
+    // viewport bottom — switch to upward growth (bottom:0 of wrapper, aligned
+    // with the BOTTOM of the left panel, expanding above it).
+    let rightFlipUp = false;
+    if (rightH > 0 && selectedLeftItem?.kind === 'group') {
+      const rightBottomIfDown = top + rightH;
+      if (rightBottomIfDown + margin > vh) rightFlipUp = true;
+      // Also flip if the right panel is taller than the left panel by enough
+      // that even sharing the top edge clips the viewport — the user's case
+      // of "second window is too tall, has to open upward".
+      if (rightH > leftH && top + rightH + margin > vh) rightFlipUp = true;
+    }
+
+    setPos({ left, top, rightFlipUp });
+  }, [open, anchor, bottomOffsetPx, leftOffsetPx, rightOffsetPx, estW, estH, flatLeft.length, rightPrompts.length, selectedKey, pickerLevel, selectedLeftItem]);
 
   if (!open) return null;
 
@@ -365,6 +511,7 @@ const PromptPickerOverlay: React.FC = () => {
     zIndex: 99000,
     display: 'flex',
     gap: GAP,
+    alignItems: 'flex-start', // left panel grows from top; right is absolute
     pointerEvents: 'auto',
     fontSize,
   };
@@ -405,10 +552,23 @@ const PromptPickerOverlay: React.FC = () => {
     userSelect: 'none',
   };
 
+  // Right panel positioning style. Wrapper is `relative` (height matches left
+  // panel via flex-stretch), inner panel is absolute so it can overflow above
+  // or below without forcing the picker root taller.
+  const rightWrapperStyle: React.CSSProperties = {
+    width: RIGHT_W,
+    flexShrink: 0,
+    position: 'relative',
+    alignSelf: 'stretch',
+  };
+  const rightPanelPositionStyle: React.CSSProperties = pos?.rightFlipUp
+    ? { position: 'absolute', left: 0, right: 0, bottom: 0 }
+    : { position: 'absolute', left: 0, right: 0, top: 0 };
+
   return createPortal(
     <div ref={rootRef} style={overlayStyle} data-prompt-picker>
       {/* LEFT panel */}
-      <div style={{ ...panelStyle, width: LEFT_W }}>
+      <div ref={leftPanelRef} style={{ ...panelStyle, width: LEFT_W }}>
         {!loaded && (
           <div style={placeholderStyle}>Loading…</div>
         )}
@@ -468,13 +628,15 @@ const PromptPickerOverlay: React.FC = () => {
         })}
       </div>
 
-      {/* RIGHT panel — slot is ALWAYS in the layout (so the left panel never
-          recenters), but visually hidden when the focused left row is not a
-          group. The wrapper holds the width reservation; the inner panel is
-          only visible for groups. Empty groups show a "пусто" placeholder. */}
-      <div style={{ width: RIGHT_W, flexShrink: 0 }}>
+      {/* RIGHT panel — wrapper reserves layout width even when no group is
+          selected (prevents left-column re-center on ↓ navigation). The inner
+          panel is absolute-positioned so it can grow either downward (top:0)
+          or upward (bottom:0) from the picker root WITHOUT forcing the root
+          height up — keeps the left panel anchored. Direction decided by the
+          rightFlipUp flag once we measure heights. */}
+      <div style={rightWrapperStyle}>
         {selectedLeftItem?.kind === 'group' && (
-          <div style={panelStyle}>
+          <div ref={rightPanelRef} style={{ ...panelStyle, ...rightPanelPositionStyle }}>
             {rightPrompts.length > 0 && rightPrompts.map((p, i) => {
               const isSelected = pickerLevel === 'prompt' && i === selectedPromptIdx;
               return (

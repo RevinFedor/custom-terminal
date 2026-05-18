@@ -65,7 +65,7 @@ function FontSizeSlider({
   suffix = 'px',
 }: {
   label: string;
-  description: string;
+  description?: string;          // опционально — без описания строка тоньше
   value: number;
   onChange: (v: number) => void;
   min: number;
@@ -85,15 +85,17 @@ function FontSizeSlider({
     }
     setFocused(false);
   };
-  const btnStyle: React.CSSProperties = {
-    width: '24px',
-    height: '24px',
-    borderRadius: '6px',
-    border: '1px solid #3a3a3a',
-    backgroundColor: '#262626',
-    color: '#ccc',
+  // Объединённый stepper: [−] [123 px] [+] в одной капсуле. Раньше были два отдельных
+  // 24×24 кнопки + 52px input — занимали 80px ширины + 4px gap'ы. Капсула забирает
+  // 92px цельной кнопкой, читается как один контрол, выглядит компактнее.
+  const stepperBtnStyle: React.CSSProperties = {
+    width: '20px',
+    height: '22px',
+    border: 'none',
+    background: 'transparent',
+    color: '#aaa',
     cursor: 'pointer',
-    fontSize: '14px',
+    fontSize: '13px',
     lineHeight: 1,
     display: 'flex',
     alignItems: 'center',
@@ -102,23 +104,34 @@ function FontSizeSlider({
   };
   return (
     <div style={{
-      padding: '8px 12px',
+      padding: '5px 10px',
       backgroundColor: '#1f1f1f',
       border: '1px solid #2a2a2a',
-      borderRadius: '8px',
+      borderRadius: '7px',
       display: 'flex',
       alignItems: 'center',
       justifyContent: 'space-between',
-      gap: '12px',
+      gap: '10px',
+      minHeight: 0,
     }}>
-      <div style={{ minWidth: 0 }}>
-        <div style={{ fontSize: '13px', color: '#eaeaea', fontWeight: 500 }}>{label}</div>
-        <div style={{ fontSize: '11px', color: '#666', marginTop: '1px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{description}</div>
+      <div style={{ minWidth: 0, flex: 1 }}>
+        <div style={{ fontSize: '12px', color: '#eaeaea', fontWeight: 500, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{label}</div>
+        {description && (
+          <div style={{ fontSize: '10px', color: '#666', marginTop: '1px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{description}</div>
+        )}
       </div>
-      <div style={{ display: 'flex', alignItems: 'center', gap: '4px', flexShrink: 0 }}>
+      <div style={{
+        display: 'flex',
+        alignItems: 'center',
+        flexShrink: 0,
+        backgroundColor: '#262626',
+        border: '1px solid #2a2a2a',
+        borderRadius: '6px',
+        overflow: 'hidden',
+      }}>
         <button
           aria-label="-"
-          style={btnStyle}
+          style={stepperBtnStyle}
           disabled={value <= min}
           onClick={() => onChange(Math.max(min, value - 1))}
         >−</button>
@@ -129,7 +142,6 @@ function FontSizeSlider({
           onFocus={(e) => {
             setDraft(String(value));
             setFocused(true);
-            // Select-all чтобы юзер сразу мог ввести число поверх.
             requestAnimationFrame(() => e.target.select());
           }}
           onChange={(e) => setDraft(e.target.value)}
@@ -139,25 +151,159 @@ function FontSizeSlider({
             else if (e.key === 'Escape') { setDraft(String(value)); (e.target as HTMLInputElement).blur(); }
           }}
           style={{
-            width: '52px',
+            width: '40px',
             textAlign: 'center',
-            fontSize: '12px',
+            fontSize: '11px',
             color: '#fff',
             fontVariantNumeric: 'tabular-nums',
-            padding: '2px 6px',
-            backgroundColor: '#262626',
-            border: '1px solid #2a2a2a',
-            borderRadius: '6px',
+            padding: '0',
+            backgroundColor: 'transparent',
+            border: 'none',
+            borderLeft: '1px solid #2a2a2a',
+            borderRight: '1px solid #2a2a2a',
             fontFamily: 'monospace',
             outline: 'none',
+            height: '22px',
           }}
         />
         <button
           aria-label="+"
-          style={btnStyle}
+          style={stepperBtnStyle}
           disabled={value >= max}
           onClick={() => onChange(Math.min(max, value + 1))}
         >+</button>
+      </div>
+    </div>
+  );
+}
+
+// Settings layout primitives — главный заголовок секции, под-заголовок (tree-style)
+// и 4-col grid. Все блоки в табе «Размеры» строятся через них для одной стилистики.
+// Раньше каждый редактор имел свой card-wrapper (padding+bg+border) — выглядело
+// как самостоятельные виджеты вместо единого списка настроек.
+function SettingsSectionHeader({ title, first }: { title: string; first?: boolean }) {
+  return (
+    <div style={{
+      fontSize: '11px',
+      fontWeight: 600,
+      color: '#666',
+      textTransform: 'uppercase',
+      letterSpacing: '0.04em',
+      marginTop: first ? '0' : '20px',
+      marginBottom: '10px',
+      paddingTop: first ? '0' : '14px',
+      borderTop: first ? 'none' : '1px solid #2a2a2a',
+    }}>
+      {title}
+    </div>
+  );
+}
+
+function SettingsSubSectionHeader({ title }: { title: string }) {
+  return (
+    <div style={{
+      fontSize: '10px',
+      fontWeight: 600,
+      color: '#888',
+      textTransform: 'uppercase',
+      letterSpacing: '0.04em',
+      marginTop: '12px',
+      marginBottom: '6px',
+      paddingLeft: '12px',
+    }}>
+      ╰ {title}
+    </div>
+  );
+}
+
+function SettingsGrid4({ children }: { children: React.ReactNode }) {
+  // 3-col grid (имя SettingsGrid4 оставлено для обратной совместимости — переименовать
+  // позже). minmax(260px) даёт ровно 3 колонки на 1200px-модалке и 2 на ~800px.
+  // Раньше было 5 — слишком узкие карточки, лейблы налезали.
+  return (
+    <div style={{
+      display: 'grid',
+      gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))',
+      gap: '6px',
+    }}>
+      {children}
+    </div>
+  );
+}
+
+// PaddingRow — один контрол для пары X/Y. Раньше были два отдельных FontSizeSlider
+// «Padding X» и «Padding Y» — занимали две клетки grid'а, при том что это семантически
+// одна настройка. Юзер: «padding x и padding y должны быть в одной карточке».
+// Реализация: один лейбл «Padding», справа два мини-stepper'а с маленьким префиксом X / Y.
+function PaddingRow({
+  valueX,
+  valueY,
+  onChangeX,
+  onChangeY,
+  minX = 0, maxX = 48,
+  minY = 0, maxY = 48,
+}: {
+  valueX: number;
+  valueY: number;
+  onChangeX: (v: number) => void;
+  onChangeY: (v: number) => void;
+  minX?: number; maxX?: number;
+  minY?: number; maxY?: number;
+}) {
+  const stepperBtnStyle: React.CSSProperties = {
+    width: '18px', height: '20px',
+    border: 'none', background: 'transparent', color: '#aaa',
+    cursor: 'pointer', fontSize: '12px', lineHeight: 1,
+    display: 'flex', alignItems: 'center', justifyContent: 'center',
+    userSelect: 'none',
+  };
+  const inputStyle: React.CSSProperties = {
+    width: '32px', textAlign: 'center', fontSize: '11px',
+    color: '#fff', fontVariantNumeric: 'tabular-nums',
+    padding: '0', backgroundColor: 'transparent',
+    border: 'none',
+    borderLeft: '1px solid #2a2a2a', borderRight: '1px solid #2a2a2a',
+    fontFamily: 'monospace', outline: 'none', height: '20px',
+  };
+
+  const Stepper = ({ value, onChange, min, max, axis }: { value: number; onChange: (v: number) => void; min: number; max: number; axis: 'X' | 'Y' }) => (
+    <div style={{
+      display: 'flex', alignItems: 'center', flexShrink: 0,
+      backgroundColor: '#262626', border: '1px solid #2a2a2a', borderRadius: '6px',
+      overflow: 'hidden',
+    }}>
+      <span style={{ fontSize: '9px', color: '#666', padding: '0 4px', fontWeight: 600 }}>{axis}</span>
+      <button style={stepperBtnStyle} disabled={value <= min} onClick={() => onChange(Math.max(min, value - 1))}>−</button>
+      <input
+        type="text"
+        inputMode="numeric"
+        value={`${value}px`}
+        onChange={(e) => {
+          const n = parseFloat(e.target.value);
+          if (Number.isFinite(n)) onChange(Math.max(min, Math.min(max, n)));
+        }}
+        style={inputStyle}
+      />
+      <button style={stepperBtnStyle} disabled={value >= max} onClick={() => onChange(Math.min(max, value + 1))}>+</button>
+    </div>
+  );
+
+  return (
+    <div style={{
+      padding: '5px 10px',
+      backgroundColor: '#1f1f1f',
+      border: '1px solid #2a2a2a',
+      borderRadius: '7px',
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      gap: '8px',
+      minHeight: 0,
+    }}>
+      <span style={{ fontSize: '12px', color: '#eaeaea', fontWeight: 500 }}>Padding</span>
+      <div style={{ display: 'flex', gap: '4px', flexShrink: 0 }}>
+        <Stepper value={valueX} onChange={onChangeX} min={minX} max={maxX} axis="X" />
+        <Stepper value={valueY} onChange={onChangeY} min={minY} max={maxY} axis="Y" />
       </div>
     </div>
   );
@@ -348,36 +494,27 @@ function SessionStatusesEditor() {
   return (
     <div
       ref={containerRef}
-      style={{ padding: '12px', backgroundColor: '#222', border: '1px solid #333', borderRadius: '10px', height: '100%' }}
+      style={{ paddingLeft: '12px' }}
     >
+      {/* Compact row: «+ новый» слева + shape toggle + size input. */}
       <div style={{
-        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-        marginBottom: '10px',
+        display: 'flex', alignItems: 'center', gap: '10px',
+        padding: '6px 8px', marginBottom: '10px',
+        backgroundColor: '#1e1e1e', border: '1px solid #333', borderRadius: '8px',
       }}>
-        <div style={{ fontSize: '11px', fontWeight: 600, color: '#666', textTransform: 'uppercase' }}>
-          Статусы вкладок
-        </div>
         <button
           onClick={addSessionStatus}
           style={{
             display: 'inline-flex', alignItems: 'center', gap: '4px',
             padding: '3px 8px', fontSize: '11px', color: '#ccc',
             backgroundColor: '#2a2a2a', border: '1px solid #444', borderRadius: '6px',
-            cursor: 'pointer',
+            cursor: 'pointer', flexShrink: 0,
           }}
           title="Добавить статус"
         >
           <Plus size={11} /> новый
         </button>
-      </div>
-
-      {/* Compact row: shape toggle + size input — управляют отображением маркера */}
-      <div style={{
-        display: 'flex', alignItems: 'center', gap: '10px',
-        padding: '6px 8px', marginBottom: '10px',
-        backgroundColor: '#1e1e1e', border: '1px solid #333', borderRadius: '8px',
-      }}>
-        <span style={{ fontSize: '11px', color: '#888' }}>Маркер:</span>
+        <span style={{ fontSize: '11px', color: '#888', marginLeft: '6px' }}>Маркер:</span>
         <div style={{ display: 'inline-flex', backgroundColor: '#1a1a1a', borderRadius: '6px', border: '1px solid #333' }}>
           {(['dot', 'square'] as const).map((shp) => (
             <button
@@ -426,7 +563,11 @@ function SessionStatusesEditor() {
         </div>
       )}
 
-      <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+      <div style={{
+        display: 'grid',
+        gridTemplateColumns: 'repeat(auto-fill, minmax(360px, 1fr))',
+        gap: '6px',
+      }}>
         {sessionStatuses.map((s) => {
           const isPickerOpen = pickerOpenId === s.id;
           const hexDraft = hexDrafts[s.id] ?? s.color;
@@ -580,7 +721,7 @@ function ProcessBarEditor() {
     </div>
   );
 
-  const colorRow = (which: 'a' | 'b') => {
+  const colorChip = (which: 'a' | 'b') => {
     const current = which === 'a' ? processBar.colorA : processBar.colorB;
     const draft = which === 'a' ? hexDraftA : hexDraftB;
     const setDraft = which === 'a' ? setHexDraftA : setHexDraftB;
@@ -589,15 +730,16 @@ function ProcessBarEditor() {
     return (
       <div style={{
         position: 'relative',
-        display: 'flex', alignItems: 'center', gap: '6px',
-        padding: '6px 8px',
+        display: 'inline-flex', alignItems: 'center', gap: '6px',
+        padding: '4px 8px',
         backgroundColor: '#1e1e1e', border: '1px solid #333', borderRadius: '8px',
         opacity: disabled ? 0.4 : 1,
+        flexShrink: 0,
       }}>
         <button
           onClick={() => { if (!disabled) setPickerOpen(pickerOpen === which ? null : which); }}
           style={{
-            width: 20, height: 20, borderRadius: '50%',
+            width: 16, height: 16, borderRadius: '50%',
             backgroundColor: current,
             border: '2px solid rgba(255,255,255,0.15)',
             cursor: disabled ? 'not-allowed' : 'pointer',
@@ -605,7 +747,7 @@ function ProcessBarEditor() {
           }}
           title="Палитра"
         />
-        <span style={{ fontSize: '11px', color: '#ccc', flex: 1 }}>
+        <span style={{ fontSize: '11px', color: '#888' }}>
           {which === 'a' ? 'A' : 'B'}
         </span>
         <input
@@ -621,7 +763,7 @@ function ProcessBarEditor() {
           onBlur={() => setDraft(null)}
           maxLength={7}
           style={{
-            width: '64px', padding: '4px 6px',
+            width: '60px', padding: '3px 6px',
             backgroundColor: '#1a1a1a', border: '1px solid #333', borderRadius: '6px',
             color: '#ccc', fontSize: '11px', fontFamily: 'monospace',
             outline: 'none', textTransform: 'uppercase',
@@ -650,20 +792,25 @@ function ProcessBarEditor() {
   };
 
   return (
-    <div
-      ref={containerRef}
-      style={{ padding: '12px', backgroundColor: '#222', border: '1px solid #333', borderRadius: '10px', height: '100%' }}
-    >
-      <div style={{ fontSize: '11px', fontWeight: 600, color: '#666', marginBottom: '10px', textTransform: 'uppercase' }}>
-        Полоска процесса
-      </div>
-
+    <div ref={containerRef} style={{ paddingLeft: '12px' }}>
+      {/* Uppercase-заголовок задаётся снаружи (SettingsSubSectionHeader), здесь только контент. */}
       {previewBar}
 
-      {/* Compact toggles row: enable + position */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginTop: '10px' }}>
+      {/* Все controls в одну flex-wrap строку — компактные inline-chip'ы как кнопки во вкладках.
+          Запрещено растягивать на 100% ширины: каждый элемент по своему контенту. */}
+      <div style={{
+        display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '8px',
+        marginTop: '10px',
+      }}>
         {/* Enable toggle */}
-        <label className="flex items-center gap-2 cursor-pointer select-none">
+        <label
+          className="flex items-center gap-2 cursor-pointer select-none"
+          style={{
+            padding: '4px 8px',
+            backgroundColor: '#1e1e1e', border: '1px solid #333', borderRadius: '8px',
+            flexShrink: 0,
+          }}
+        >
           <div
             className="relative w-7 h-3.5 rounded-full transition-colors shrink-0"
             style={{ backgroundColor: processBar.enabled ? 'rgba(74, 222, 128, 0.4)' : 'rgba(255,255,255,0.1)' }}
@@ -681,13 +828,13 @@ function ProcessBarEditor() {
         </label>
 
         {/* Position toggle */}
-        <div style={{ display: 'inline-flex', backgroundColor: '#1a1a1a', borderRadius: '6px', border: '1px solid #333', marginLeft: 'auto' }}>
+        <div style={{ display: 'inline-flex', backgroundColor: '#1a1a1a', borderRadius: '6px', border: '1px solid #333', flexShrink: 0 }}>
           {(['left', 'right'] as const).map((p) => (
             <button
               key={p}
               onClick={() => setProcessBar({ position: p })}
               style={{
-                padding: '3px 8px', fontSize: '11px',
+                padding: '4px 10px', fontSize: '11px',
                 color: processBar.position === p ? '#fff' : '#888',
                 background: processBar.position === p ? '#333' : 'transparent',
                 border: 'none', cursor: 'pointer',
@@ -702,38 +849,36 @@ function ProcessBarEditor() {
             </button>
           ))}
         </div>
-      </div>
 
-      {/* Colors A + B */}
-      <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', marginTop: '10px' }}>
-        {colorRow('a')}
-        {colorRow('b')}
-      </div>
+        {colorChip('a')}
+        {colorChip('b')}
 
-      {/* Duration — простой input в одну строку */}
-      <div style={{
-        display: 'flex', alignItems: 'center', gap: '6px',
-        marginTop: '10px', padding: '6px 8px',
-        backgroundColor: '#1e1e1e', border: '1px solid #333', borderRadius: '8px',
-        opacity: processBar.enabled ? 1 : 0.4,
-      }}>
-        <span style={{ fontSize: '11px', color: '#ccc', flex: 1 }}>Длительность цикла</span>
-        <input
-          type="number"
-          disabled={!processBar.enabled}
-          min={300}
-          max={6000}
-          step={100}
-          value={processBar.durationMs}
-          onChange={(e) => setProcessBar({ durationMs: Number(e.target.value) })}
-          style={{
-            width: '64px', padding: '4px 6px',
-            backgroundColor: '#1a1a1a', border: '1px solid #333', borderRadius: '6px',
-            color: '#ccc', fontSize: '11px', fontFamily: 'monospace', outline: 'none',
-            textAlign: 'right',
-          }}
-        />
-        <span style={{ fontSize: '10px', color: '#555' }}>ms</span>
+        {/* Duration — компактный inline-chip */}
+        <div style={{
+          display: 'inline-flex', alignItems: 'center', gap: '6px',
+          padding: '4px 8px',
+          backgroundColor: '#1e1e1e', border: '1px solid #333', borderRadius: '8px',
+          opacity: processBar.enabled ? 1 : 0.4,
+          flexShrink: 0,
+        }}>
+          <span style={{ fontSize: '11px', color: '#888' }}>Цикл</span>
+          <input
+            type="number"
+            disabled={!processBar.enabled}
+            min={300}
+            max={6000}
+            step={100}
+            value={processBar.durationMs}
+            onChange={(e) => setProcessBar({ durationMs: Number(e.target.value) })}
+            style={{
+              width: '54px', padding: '3px 6px',
+              backgroundColor: '#1a1a1a', border: '1px solid #333', borderRadius: '6px',
+              color: '#ccc', fontSize: '11px', fontFamily: 'monospace', outline: 'none',
+              textAlign: 'right',
+            }}
+          />
+          <span style={{ fontSize: '10px', color: '#555' }}>ms</span>
+        </div>
       </div>
     </div>
   );
@@ -767,6 +912,12 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const filePreviewFontSize = useUIStore((s) => s.filePreviewFontSize);
   const promptPickerFontSize = useUIStore((s) => s.promptPickerFontSize);
   const setPromptPickerFontSize = useUIStore((s) => s.setPromptPickerFontSize);
+  const promptPickerBottomOffsetPx = useUIStore((s) => s.promptPickerBottomOffsetPx);
+  const setPromptPickerBottomOffsetPx = useUIStore((s) => s.setPromptPickerBottomOffsetPx);
+  const promptPickerLeftOffsetPx = useUIStore((s) => s.promptPickerLeftOffsetPx);
+  const setPromptPickerLeftOffsetPx = useUIStore((s) => s.setPromptPickerLeftOffsetPx);
+  const promptPickerRightOffsetPx = useUIStore((s) => s.promptPickerRightOffsetPx);
+  const setPromptPickerRightOffsetPx = useUIStore((s) => s.setPromptPickerRightOffsetPx);
   const timelineFontSize = useUIStore((s) => s.timelineFontSize);
   const timelineLineClamp = useUIStore((s) => s.timelineLineClamp);
   const setTimelineLineClamp = useUIStore((s) => s.setTimelineLineClamp);
@@ -797,6 +948,11 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const setTabPreviewRatio = useUIStore((s) => s.setTabPreviewRatio);
   const semanticIndexParallelism = useUIStore((s) => s.semanticIndexParallelism);
   const setSemanticIndexParallelism = useUIStore((s) => s.setSemanticIndexParallelism);
+  // Геометрия табов — Settings → Размеры → ТАБЫ → Терминал/Проекты.
+  const tabGeometry = useUIStore((s) => s.tabGeometry);
+  const setTabGeometry = useUIStore((s) => s.setTabGeometry);
+  const projectTabGeometry = useUIStore((s) => s.projectTabGeometry);
+  const setProjectTabGeometry = useUIStore((s) => s.setProjectTabGeometry);
   const { showToast, docPrompt, setDocPromptUseFile, setDocPromptFilePath, setDocPromptInlineContent, claudeDefaultPromptEnabled, setClaudeDefaultPromptEnabled } = useUIStore();
   const { prompts: aiPrompts, loadPrompts: loadAIPrompts, savePrompt: saveAIPrompt, deletePrompt: deleteAIPrompt, rewindPromptId, setRewindPromptId } = usePromptsStore();
 
@@ -1575,11 +1731,10 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
           backgroundColor: '#1a1a1a',
           borderRadius: '16px',
           border: '1px solid #333',
-          // Static dimensions across all tabs — switching tabs no longer reflows the
-          // window. AI tab needed 900px historically; we keep that as the universal
-          // width so the lighter tabs (Шрифты/Цвета/Горячие клавиши) get more room
-          // for compact controls instead of one-column slider stacks.
-          width: '900px',
+          // Settings → Размеры теперь содержит 5 блоков (ТАБЫ / ШРИФТЫ / ЗАМЕТКИ / СТАТУСЫ / ПОЛОСКА),
+          // 900px тесно. Цель — занять до 1200px, но не вылезать из viewport на маленьких окнах
+          // приложения. `min(1200px, 95vw)` даёт +33% на широких экранах, корректно сжимается.
+          width: 'min(1200px, 95vw)',
           height: '85vh',
           overflow: 'hidden',
           display: 'flex',
@@ -1623,7 +1778,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
         }}>
           {([
             { id: 'ai', label: 'AI' },
-            { id: 'fonts', label: 'Шрифты' },
+            { id: 'fonts', label: 'Размеры' },
             { id: 'colors', label: 'Системные' },
             { id: 'shortcuts', label: 'Горячие клавиши' }
           ] as { id: SettingsTab; label: string }[]).map((tab) => (
@@ -1703,58 +1858,94 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
 
           {activeTab === 'fonts' && (
             <>
-              {/* Шрифты — 2-column grid: at 900px modal width, single-column rows
-                  left ~660px of empty space; two columns gives ~410px per row, plenty
-                  for label + stepper without text wrap. */}
-              <div style={{ fontSize: '11px', fontWeight: 600, color: '#666', marginBottom: '10px', textTransform: 'uppercase' }}>
-                Шрифты интерфейса
-              </div>
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
-                <FontSizeSlider label="Терминал" description="Cmd+/- для быстрой настройки" value={terminalFontSize} onChange={setTerminalFontSize} min={8} max={24} />
-                <FontSizeSlider label="Сайдбар" description="Дерево файлов и Cmd+/" value={sidebarFontSize} onChange={setSidebarFontSize} min={10} max={20} />
-                <FontSizeSlider label="Табы" description="Табы воркспейса" value={tabsFontSize} onChange={setTabsFontSize} min={10} max={20} />
-                <FontSizeSlider label="Проекты" description="Чипы проектов" value={projectTabsFontSize} onChange={setProjectTabsFontSize} min={10} max={16} />
-                <FontSizeSlider label="Превью файла" description="Чтение файла в сайдбаре" value={filePreviewFontSize} onChange={setFilePreviewFontSize} min={10} max={24} />
-                <FontSizeSlider label="Prompt picker" description="Opt+V — две колонки с промптами" value={promptPickerFontSize} onChange={setPromptPickerFontSize} min={9} max={20} />
-                <FontSizeSlider label="Таймлайн" description="Превью записей" value={timelineFontSize} onChange={setTimelineFontSize} min={10} max={18} />
-                <FontSizeSlider label="Таймлайн — строки" description="Высота превью в развёрнутом" value={timelineLineClamp} onChange={setTimelineLineClamp} min={1} max={10} suffix="" />
-              </div>
+              {/* SettingsTree pattern:
+                  - Главные uppercase-заголовки (Табы / Шрифты / Заметки) идут плоско.
+                  - Sub-секции через padding-left 16px + border-left + ╰ префикс.
+                  - Все строки настроек — единый FontSizeSlider компонент в 4-col grid.
+                  Цель — одна стилистика на весь tab, юзер не различает «у этого блока
+                  свой фон, у другого свой». Card-wrapper'ы (свой background+border вокруг
+                  блока) убраны для всех секций. */}
 
-              {/* Заметки вкладки — единая секция, три независимых шрифта для трёх
-                  поверхностей одного контента + общие padding'и + cap'ы окна-превью
-                  (CMD+hover). Размеры окна-превью трактуются как потолки: короткая
-                  заметка ужмётся под контент. */}
-              <div style={{ marginTop: '20px', paddingTop: '14px', borderTop: '1px solid #2a2a2a' }}>
-                <div style={{ fontSize: '11px', fontWeight: 600, color: '#666', marginBottom: '10px', textTransform: 'uppercase' }}>
-                  Заметки вкладки
-                </div>
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
-                  <FontSizeSlider label="Шрифт в сайдбаре" description="Inline-превью в InfoPanel" value={notesSidebarFontSize} onChange={setNotesSidebarFontSize} min={10} max={28} />
-                  <FontSizeSlider label="Шрифт раскрытый" description="Slide-out полнотекстовый редактор" value={notesExpandedFontSize} onChange={setNotesExpandedFontSize} min={10} max={28} />
-                  <FontSizeSlider label="Шрифт в превью" description="Окно при CMD+hover на табе" value={notesTooltipFontSize} onChange={setNotesTooltipFontSize} min={10} max={28} />
-                  <div />
-                  <FontSizeSlider label="Padding X" description="Горизонтальный отступ" value={notesEditorPaddingX} onChange={setNotesEditorPaddingX} min={0} max={48} />
-                  <FontSizeSlider label="Padding Y" description="Вертикальный отступ" value={notesEditorPaddingY} onChange={setNotesEditorPaddingY} min={0} max={48} />
-                  <FontSizeSlider label="Макс. ширина превью" description="Потолок окна CMD+hover" value={Math.round(tabPreviewMaxWidth)} onChange={setTabPreviewMaxWidth} min={120} max={900} />
-                  <FontSizeSlider label="Макс. высота превью" description="Потолок окна CMD+hover" value={Math.round(tabPreviewMaxHeight)} onChange={setTabPreviewMaxHeight} min={80} max={900} />
-                  <RatioRow label="Пропорция превью" description="Целевое W × H (3 × 2 = ширина в 1.5 раза больше)" width={tabPreviewRatioW} height={tabPreviewRatioH} onChange={setTabPreviewRatio} />
-                </div>
-              </div>
+              {/* 1. ТАБЫ — терминальные + проекты + статусы + полоска как подсекции */}
+              <SettingsSectionHeader title="Табы" first />
+              <SettingsSubSectionHeader title="Терминал" />
+              <SettingsGrid4>
+                <PaddingRow
+                  valueX={tabGeometry.paddingX} onChangeX={(v) => setTabGeometry({ paddingX: v })}
+                  valueY={tabGeometry.paddingY} onChangeY={(v) => setTabGeometry({ paddingY: v })}
+                  maxX={32} maxY={24}
+                />
+                <FontSizeSlider label="Левый отступ" value={tabGeometry.paddingLeft} onChange={(v) => setTabGeometry({ paddingLeft: v })} min={4} max={48} />
+                <FontSizeSlider label="Радиус" value={tabGeometry.borderRadius} onChange={(v) => setTabGeometry({ borderRadius: v })} min={0} max={20} />
+                <FontSizeSlider label="Зазор" value={tabGeometry.gap} onChange={(v) => setTabGeometry({ gap: v })} min={0} max={16} />
+              </SettingsGrid4>
 
-              {/* Sidebar behavior toggles — keep full-width because the labels are
-                  longer and 2-column would crop them. */}
+              <SettingsSubSectionHeader title="Проекты" />
+              <SettingsGrid4>
+                <PaddingRow
+                  valueX={projectTabGeometry.paddingX} onChangeX={(v) => setProjectTabGeometry({ paddingX: v })}
+                  valueY={projectTabGeometry.paddingY} onChangeY={(v) => setProjectTabGeometry({ paddingY: v })}
+                  maxX={32} maxY={16}
+                />
+              </SettingsGrid4>
+
+              <SettingsSubSectionHeader title="Статусы" />
+              <SessionStatusesEditor />
+
+              <SettingsSubSectionHeader title="Полоска процесса" />
+              <ProcessBarEditor />
+
+              {/* 2. ШРИФТЫ ИНТЕРФЕЙСА */}
+              <SettingsSectionHeader title="Шрифты интерфейса" />
+              <SettingsGrid4>
+                <FontSizeSlider label="Терминал" value={terminalFontSize} onChange={setTerminalFontSize} min={8} max={24} />
+                <FontSizeSlider label="Сайдбар" value={sidebarFontSize} onChange={setSidebarFontSize} min={10} max={20} />
+                <FontSizeSlider label="Табы" value={tabsFontSize} onChange={setTabsFontSize} min={10} max={20} />
+                <FontSizeSlider label="Проекты" value={projectTabsFontSize} onChange={setProjectTabsFontSize} min={10} max={16} />
+                <FontSizeSlider label="Превью файла" value={filePreviewFontSize} onChange={setFilePreviewFontSize} min={10} max={24} />
+                <FontSizeSlider label="Prompt picker" value={promptPickerFontSize} onChange={setPromptPickerFontSize} min={9} max={20} />
+                <FontSizeSlider label="Picker — отступ снизу" description="От низа viewport'а до picker'а" value={promptPickerBottomOffsetPx} onChange={setPromptPickerBottomOffsetPx} min={0} max={400} suffix="px" />
+                <FontSizeSlider label="Picker — отступ слева" description="0 — центр или прижатие к правому. >0 — прижатие к левому краю" value={promptPickerLeftOffsetPx} onChange={setPromptPickerLeftOffsetPx} min={0} max={2000} suffix="px" />
+                <FontSizeSlider label="Picker — отступ справа" description="0 — центр или прижатие к левому. >0 — приоритет: прижатие к правому краю" value={promptPickerRightOffsetPx} onChange={setPromptPickerRightOffsetPx} min={0} max={2000} suffix="px" />
+                <FontSizeSlider label="Таймлайн" value={timelineFontSize} onChange={setTimelineFontSize} min={10} max={18} />
+                <FontSizeSlider label="Таймлайн — строки" value={timelineLineClamp} onChange={setTimelineLineClamp} min={1} max={10} suffix="" />
+              </SettingsGrid4>
+
+              {/* 3. ЗАМЕТКИ + подсекция Превью CMD+hover */}
+              <SettingsSectionHeader title="Заметки" />
+              <SettingsGrid4>
+                <FontSizeSlider label="Шрифт в сайдбаре" value={notesSidebarFontSize} onChange={setNotesSidebarFontSize} min={10} max={28} />
+                <FontSizeSlider label="Шрифт раскрытый" value={notesExpandedFontSize} onChange={setNotesExpandedFontSize} min={10} max={28} />
+              </SettingsGrid4>
+
+              <SettingsSubSectionHeader title="Превью CMD+hover" />
+              <SettingsGrid4>
+                <FontSizeSlider label="Шрифт" value={notesTooltipFontSize} onChange={setNotesTooltipFontSize} min={10} max={28} />
+                <PaddingRow
+                  valueX={notesEditorPaddingX} onChangeX={setNotesEditorPaddingX}
+                  valueY={notesEditorPaddingY} onChangeY={setNotesEditorPaddingY}
+                  maxX={48} maxY={48}
+                />
+                <FontSizeSlider label="Макс. ширина" value={Math.round(tabPreviewMaxWidth)} onChange={setTabPreviewMaxWidth} min={120} max={900} />
+                <FontSizeSlider label="Макс. высота" value={Math.round(tabPreviewMaxHeight)} onChange={setTabPreviewMaxHeight} min={80} max={900} />
+                <RatioRow label="Пропорция" description="W × H" width={tabPreviewRatioW} height={tabPreviewRatioH} onChange={setTabPreviewRatio} />
+              </SettingsGrid4>
+
+              {/* 4. САЙДБАР — поведение (toggle persistFile, closeOnClickOutside) */}
               <SidebarBehaviorSettings />
             </>
           )}
 
           {activeTab === 'colors' && (
             <>
-              {/* Семантическая индексация — единственная пока «системная» настройка
+              {/* Семантическая индексация — единственная честно «системная» настройка
                   с runtime-эффектом. Управляет --parallel флагом, который main
                   передаёт build-index.sh при запуске. Выше 20 параллельных claude'ов
                   Anthropic жёстко 429-ит; ниже 4 — индексация N=70 файлов начинает
                   занимать минуты. Default 10 выбран как ровно тот же default, что
-                  стоит в самом скрипте (MAX_PARALLEL=10) — UI и CLI consistency. */}
+                  стоит в самом скрипте (MAX_PARALLEL=10) — UI и CLI consistency.
+                  Все визуальные настройки (статусы вкладок, полоска процесса) переехали
+                  в «Размеры» — они влияют на UI, а не на админ-инфраструктуру. */}
               <div style={{ padding: '14px', backgroundColor: '#222', border: '1px solid #333', borderRadius: '10px', marginBottom: '12px' }}>
                 <div style={{ fontSize: '11px', fontWeight: '600', color: '#666', marginBottom: '10px', textTransform: 'uppercase' }}>
                   Семантическая индексация
@@ -1772,11 +1963,6 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                   Применяется к следующему запуску из ProjectToolbar (иконка с числом).
                   Текущий выполняющийся ребилд не прерывается.
                 </div>
-              </div>
-
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px', alignItems: 'start' }}>
-                <SessionStatusesEditor />
-                <ProcessBarEditor />
               </div>
             </>
           )}

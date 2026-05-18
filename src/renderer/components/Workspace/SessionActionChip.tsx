@@ -1,34 +1,45 @@
 import React from 'react';
 
-// Idle:                 shows "Claude" / "Gemini" (the tab's AI label)
-// Hover, no process:    shows "Continue"  → resume session
-// Hover, process alive: shows "Stop"      → send Ctrl+C
-// Click: invokes Continue/Stop. The default label is also clickable — copies
-// the session ID (preserves old behaviour where clicking "Claude" copied the UUID).
-// The session ID tooltip floats above the chip on hover.
+// State matrix (single button, label morphs on state + hover):
+//   No session at all       → label "Claude" / "Gemini" (tinted), hover → "Start", click → onStart
+//   Session in DB, no proc  → label "Continue", click → onContinue (resume)
+//   Session live (process)  → label "Claude"/"Gemini" idle, hover → "Stop", click → onStop
+//
+// sessionType is required (never null) — caller decides which AI the chip
+// represents when no session exists yet (e.g. fall back to commandType or
+// default 'claude'). Старая ветка `onCopyId` для безсессионного клика убрана:
+// «копировать пустой id» — мёртвая операция, юзер хотел стартовать процесс.
 export default function SessionActionChip({
-  sessionType, sessionId, isCommandRunning, hasAnySession,
-  onContinue, onStop, onCopyId,
+  sessionType, isCommandRunning, hasAnySession,
+  onStart, onContinue, onStop,
 }: {
-  sessionType: 'claude' | 'gemini' | null;
-  sessionId: string | null;
+  sessionType: 'claude' | 'gemini';
   isCommandRunning: boolean;
   hasAnySession: boolean;
+  onStart: () => void;
   onContinue: () => void;
   onStop: () => void;
-  onCopyId: () => void;
 }) {
   const [hover, setHover] = React.useState(false);
   const accent = sessionType === 'claude' ? '#DA7756' : '#4E86F8';
   const accentBright = sessionType === 'claude' ? '#FF9466' : '#7BA3FF';
   const defaultLabel = sessionType === 'claude' ? 'Claude' : 'Gemini';
+
   const sessionIdle = hasAnySession && !isCommandRunning;
   const showStopOnHover = hover && isCommandRunning;
-  const label = sessionIdle ? 'Continue' : (showStopOnHover ? 'Stop' : defaultLabel);
-  const color = showStopOnHover ? '#ef4444' : (sessionIdle ? accentBright : accent);
+  const showStartOnHover = hover && !hasAnySession;
+
+  const label = sessionIdle
+    ? 'Continue'
+    : showStopOnHover ? 'Stop'
+    : showStartOnHover ? 'Start'
+    : defaultLabel;
+  const color = showStopOnHover
+    ? '#ef4444'
+    : sessionIdle || showStartOnHover ? accentBright : accent;
 
   const handleClick = () => {
-    if (!hasAnySession) { onCopyId(); return; }
+    if (!hasAnySession) { onStart(); return; }
     if (isCommandRunning) onStop();
     else onContinue();
   };
@@ -38,6 +49,7 @@ export default function SessionActionChip({
   const bg = showStopOnHover
     ? 'rgba(239, 68, 68, 0.18)'
     : sessionIdle ? (hover ? hoverTint : idleTint)
+      : showStartOnHover ? hoverTint
       : (hover ? 'rgba(255,255,255,0.08)' : 'transparent');
   return (
     <span
