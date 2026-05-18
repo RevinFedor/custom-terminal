@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useLayoutEffect, memo, useCallback } from 'react';
+import React, { useState, useRef, useEffect, useLayoutEffect, memo, useCallback, useMemo } from 'react';
 import { useWorkspaceStore, TabColor, isTabInterrupted } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import Tooltip from '../UI/Tooltip';
@@ -12,14 +12,37 @@ import { attachClosestEdge, extractClosestEdge, type Edge } from '@atlaskit/prag
 import { combine } from '@atlaskit/pragmatic-drag-and-drop/combine';
 import { autoScrollForElements } from '@atlaskit/pragmatic-drag-and-drop-auto-scroll/element';
 import { setCustomNativeDragPreview } from '@atlaskit/pragmatic-drag-and-drop/element/set-custom-native-drag-preview';
-import { ChevronDown, Globe, Bot, Play, Minimize2, Maximize2, PanelLeft, Plus } from 'lucide-react';
+import { ChevronDown, Globe, Bot, Play, Minimize2, Maximize2, PanelLeft, Plus, StickyNote } from 'lucide-react';
 
 const { ipcRenderer } = window.require('electron');
+
+// ============================================================================
+// VERTICAL MODE (TabSidebar) — geometry knobs. Менять ТОЛЬКО эти константы.
+// Подкручивай числа здесь — карточки во всех зонах перестроятся одинаково.
+// ============================================================================
+// Горизонтальный padding ВНУТРИ карточки справа (px). До: 8.
+const TAB_VERTICAL_PADDING_X = 6;
+// Вертикальный padding ВНУТРИ карточки сверху/снизу (px). До: 0 (был height-фикс).
+const TAB_VERTICAL_PADDING_Y = 3;
+// Левый padding — резерв под полосу процесса (2px) + маркер статуса (8px) + воздух (px). До: 20.
+const TAB_VERTICAL_PADDING_LEFT = 16;
+// Радиус закругления углов карточки (px). До: 0.
+const TAB_VERTICAL_BORDER_RADIUS = 6;
+// Вертикальный зазор между соседними карточками (px). До: 1.
+const TAB_VERTICAL_GAP = 3;
+// ============================================================================
 
 // OSC 133 event-driven process status (no more polling!)
 
 interface TabBarProps {
   projectId: string;
+  /**
+   * 'horizontal' — legacy single-row bar above terminal. Main-zone scrolls horizontally,
+   *   utility zone is a dropdown.
+   * 'vertical' — left sidebar mode. Main-zone scrolls vertically, utility zone is rendered
+   *   inline below main with a divider. Tab rows span full width.
+   */
+  layout?: 'horizontal' | 'vertical';
 }
 
 interface TabData {
@@ -34,6 +57,7 @@ interface TabData {
   tabType?: string;
   isCollapsed?: boolean;
   parentTabId?: string;
+  sessionStatus?: 'knowledge' | 'bugfix' | 'dev';
 }
 
 type DragData = {
@@ -44,6 +68,12 @@ type DragData = {
   projectId?: string; // For cross-project drag
   selectedTabIds?: string[]; // For multi-tab drag
 };
+
+// Status palette теперь динамическая: SessionStatusDef из useUIStore.
+// Tab.sessionStatus хранит id; render lookup через store.sessionStatuses.find().
+// Если id больше нет в сторе (юзер удалил статус) — маркер просто не рендерится,
+// данные в Tab.sessionStatus остаются (если статус вернут — маркер появится снова).
+type SessionStatus = string;
 
 const TAB_COLORS: { color: TabColor; bgColor: string; borderColor: string; label: string }[] = [
   { color: 'default', bgColor: 'transparent', borderColor: '#666', label: '⚪ Default' },
@@ -221,11 +251,22 @@ interface TabItemProps {
   isInterrupted?: boolean; // Tab has an interrupted AI session
   draggingGroupIds?: string[]; // IDs of tabs being dragged as a group
   onHoverChange?: (hovering: boolean, rect?: DOMRect) => void; // CMD+hover notes preview
-  showNotesIndicator?: boolean; // CMD held + cursor in TabBar = highlight tabs with notes
+  showNotesPeek?: boolean; // CMD held + cursor in TabBar + tab has notes → show the notes
+                            // button as a CLICKABLE peek affordance (not just visual indicator).
+                            // Replaces the old orange dot.
+  slideoutOpenHere?: boolean; // The notes slideout is currently anchored to THIS tab. Forces
+                              //  the button visible (solid-indigo), independent of active/peek.
+  anySlideoutOpen?: boolean; // Slideout is open on SOME tab (possibly another one). When true,
+                             // the default-on-active rule is suppressed — the button only shows
+                             // on the tab where slideout is actually anchored.
   isCollapsed?: boolean; // Collapsed tab — icon-only
   hasSession?: boolean; // Whether tab has an active AI session
   isBusy?: boolean; // AI agent is actively thinking/streaming
   isViewingSubAgent?: boolean; // User is viewing a sub-agent of this tab
+  orientation?: 'horizontal' | 'vertical'; // Layout direction. Main-zone defaults to horizontal,
+                                            // utility-zone (dropdown) defaults to vertical. TabSidebar
+                                            // overrides main-zone to vertical.
+  sessionStatus?: SessionStatus; // Status marker color (vertical mode only).
 }
 
 const TabItem = memo(({
@@ -254,11 +295,15 @@ const TabItem = memo(({
   isInterrupted = false,
   draggingGroupIds = [],
   onHoverChange,
-  showNotesIndicator = false,
+  showNotesPeek = false,
+  slideoutOpenHere = false,
+  anySlideoutOpen = false,
   isCollapsed = false,
   hasSession = false,
   isBusy = false,
   isViewingSubAgent = false,
+  orientation,
+  sessionStatus,
 }: TabItemProps) => {
   const ref = useRef<HTMLDivElement>(null);
   const [closestEdge, setClosestEdge] = useState<Edge | null>(null);
@@ -279,11 +324,16 @@ const TabItem = memo(({
     return false;
   }, [commandType]);
 
+  // Resolve effective orientation: explicit prop wins, otherwise zone fallback
+  // (main = horizontal in legacy TabBar, utility dropdown = vertical).
+  const effectiveOrientation: 'horizontal' | 'vertical' = orientation ?? (zone === 'main' ? 'horizontal' : 'vertical');
+  const isHorizontal = effectiveOrientation === 'horizontal';
+
   useEffect(() => {
     const element = ref.current;
     if (!element) return;
 
-    const allowedEdges: Edge[] = zone === 'main' ? ['left', 'right'] : ['top', 'bottom'];
+    const allowedEdges: Edge[] = isHorizontal ? ['left', 'right'] : ['top', 'bottom'];
 
     return combine(
       draggable({
@@ -366,9 +416,8 @@ const TabItem = memo(({
         onDrop: () => { setClosestEdge(null); setIsAdoptTarget(false); },
       })
     );
-  }, [tab.id, zone, index, projectId, isAdoptDrop]);
+  }, [tab.id, zone, index, projectId, isAdoptDrop, isHorizontal]);
 
-  const isHorizontal = zone === 'main';
   const [isHovered, setIsHovered] = useState(false);
 
   // Get color config
@@ -379,47 +428,59 @@ const TabItem = memo(({
   // layer; everything else continues to read from `colorConfig`.
   const baseColorConfig = TAB_COLORS.find(c => c.color === tab.color) || TAB_COLORS[0];
   const colorConfig = tab.tabType === 'claude-sdk' && tab.color === 'claude'
-    ? { ...baseColorConfig, bgColor: 'rgba(255, 178, 130, 0.14)', borderColor: '#FFB382' }
+    ? { ...baseColorConfig, bgColor: 'rgba(210, 140, 90, 0.30)', borderColor: '#D28C5A' }
     : baseColorConfig;
 
 
   // Determine background color
   const hasColor = tab.color && tab.color !== 'default';
 
+  // Helper: increase/decrease alpha of an rgba() colour string. Used in vertical mode to make
+  // active tab background ~3× saturated vs. inactive (clear visual hierarchy without top-stripe).
+  const adjustAlpha = (rgba: string, delta: number): string => {
+    const m = rgba.match(/rgba?\((\d+),\s*(\d+),\s*(\d+),?\s*([\d.]+)?\)/);
+    if (!m) return rgba;
+    const [, r, g, b, a = '0.2'] = m;
+    const newAlpha = Math.max(0, Math.min(1, parseFloat(a) + delta));
+    return `rgba(${r}, ${g}, ${b}, ${newAlpha})`;
+  };
+
+  // In vertical mode the activity signal is BACKGROUND SATURATION, not a top/left border.
+  // Юзер: «насчёт прозрачности — неактивные слишком тусклые, hover нормальный, active нормальный».
+  // Поэтому ступеньки в vertical: inactive=base, hover=base+0.08, active=base+0.25.
+  // Без -0.10 дампера: inactive coloured tab уже видно как сейчас hover'нутый.
+  // SDK Claude override на 0.30 (выше PTY claude 0.20) → SDK active = 0.55 vs PTY active = 0.45,
+  // SDK явно светлее/жёлтее на одинаковом #252526 фоне.
+  const isVertActive = !isHorizontal && isActive;
   const getBgColor = () => {
-    // Active tab always gets its proper background
     if (isActive) {
       if (hasColor) {
-        return colorConfig.bgColor;
+        return isVertActive ? adjustAlpha(colorConfig.bgColor, 0.25) : colorConfig.bgColor;
       }
-      return 'rgba(255,255,255,0.08)';
+      return isVertActive ? 'rgba(255,255,255,0.20)' : 'rgba(255,255,255,0.08)';
     }
     // Selected but NOT active tabs
     if (isSelected) {
       if (hasColor) {
-        // Slightly brighter version of the tab color
-        const match = colorConfig.bgColor.match(/rgba?\((\d+),\s*(\d+),\s*(\d+),?\s*([\d.]+)?\)/);
-        if (match) {
-          const [, r, g, b, a = '0.2'] = match;
-          const newAlpha = Math.min(parseFloat(a) + 0.1, 0.4);
-          return `rgba(${r}, ${g}, ${b}, ${newAlpha})`;
-        }
-        return colorConfig.bgColor;
+        return adjustAlpha(colorConfig.bgColor, 0.1);
       }
       return 'rgba(255,255,255,0.06)';
     }
-    // Hovered tabs
+    // Hovered tabs — чуть ярче inactive чтобы hover работал как лёгкая подсветка.
     if (isHovered) {
       if (hasColor) {
-        return colorConfig.bgColor;
+        return !isHorizontal ? adjustAlpha(colorConfig.bgColor, 0.08) : colorConfig.bgColor;
       }
-      return 'rgba(255,255,255,0.05)';
+      return !isHorizontal ? 'rgba(255,255,255,0.12)' : 'rgba(255,255,255,0.05)';
     }
-    // Colored tabs always show subtle background
+    // Inactive coloured tab.
+    // Vertical: НЕ дамперим — base alpha уже подобран чтоб inactive было читаемо
+    // (PTY 0.20, SDK 0.30). Дампер -0.10 убран потому что юзер не различал вкладки.
     if (hasColor) {
       return colorConfig.bgColor;
     }
-    return 'transparent';
+    // Inactive uncoloured: в vertical — лёгкая белая подложка чтоб не сливаться с панелью.
+    return !isHorizontal ? 'rgba(255,255,255,0.04)' : 'transparent';
   };
 
   // Border/indicator for active, selected, or interrupted tabs
@@ -462,12 +523,20 @@ const TabItem = memo(({
     return '#888';
   };
 
+  // Vertical mode = TabSidebar:
+  // — top/left activity border убирается, активность кодируется НАСЫЩЕННОСТЬЮ ФОНА.
+  // — RestartZone / SDK-status zone не рендерится (их функцию забирают левая полоса процесса
+  //   и SVG-маркер статуса справа от неё). Поэтому исчезает 32px-gutter слева.
+  // — Тонкая полоса процесса 2px + маркер статуса 8px рисуются абсолютом, поэтому в padding
+  //   достаточно резервировать ~20px слева.
+  const isVerticalMode = !isHorizontal;
+
   // Build inline styles - full control to avoid Tailwind conflicts
   const tabStyle: React.CSSProperties = {
     position: 'relative',
     display: 'flex',
     alignItems: 'center',
-    justifyContent: 'center',
+    justifyContent: isVerticalMode ? 'flex-start' : 'center',
     gap: isCollapsed ? '0' : '8px',
     cursor: 'pointer',
     overflow: 'visible',
@@ -475,23 +544,33 @@ const TabItem = memo(({
       ? '0'
       : (tab.tabType === 'browser'
         // Browser tabs: no left gutter at all.
-        ? (isHorizontal ? '0 12px' : '0 12px')
-        // SDK tabs: left gutter 32px (matches PTY claude — keeps the green dot
-        // the same distance from the left edge so adjacent PTY+SDK tabs align
-        // perfectly). Right padding 12px (kept tight, since SDK has no chunky
-        // right-side affordances). Same widths in horizontal/vertical zones.
-        : (tab.tabType === 'claude-sdk'
-          ? (isHorizontal ? '0 12px 0 32px' : '0 12px 0 32px')
-          : (isHorizontal ? '0 16px 0 32px' : '0 12px 0 32px'))),
+        ? (isHorizontal ? '0 12px' : `${TAB_VERTICAL_PADDING_Y}px ${TAB_VERTICAL_PADDING_X}px`)
+        // Vertical mode: всё через константы в начале файла (TAB_VERTICAL_PADDING_*).
+        : (isVerticalMode
+          ? `${TAB_VERTICAL_PADDING_Y}px ${TAB_VERTICAL_PADDING_X}px ${TAB_VERTICAL_PADDING_Y}px ${TAB_VERTICAL_PADDING_LEFT}px`
+          // SDK tabs: left gutter 32px (matches PTY claude — keeps the green dot
+          // the same distance from the left edge so adjacent PTY+SDK tabs align
+          // perfectly).
+          : (tab.tabType === 'claude-sdk'
+            ? '0 12px 0 32px'
+            : '0 16px 0 32px'))),
     fontSize: `${fontSize}px`,
-    height: '30px',
+    height: isVerticalMode ? 'auto' : '30px',
+    minHeight: isVerticalMode ? '24px' : undefined,
+    borderRadius: isVerticalMode ? `${TAB_VERTICAL_BORDER_RADIUS}px` : undefined,
     width: isCollapsed ? '28px' : undefined,
-    minWidth: isCollapsed ? '28px' : (isHorizontal ? 'auto' : '160px'),
+    minWidth: isCollapsed ? '28px' : (isHorizontal ? 'auto' : '100%'),
     maxWidth: isCollapsed ? '28px' : undefined,
     color: (isActive || isHovered || isSelected) ? '#fff' : '#888',
     backgroundColor: getBgColor(),
+    // Vertical mode: NO activity border — насыщенность фона сама показывает активную вкладку.
+    // Interrupted (dashed blue) и selected (dashed white) сохраняем как маркеры состояния.
     borderTop: isHorizontal ? getTopBorder() : 'none',
-    borderLeft: !isHorizontal ? getLeftBorder() : 'none',
+    borderLeft: isVerticalMode
+      ? (isInterrupted
+        ? '2px dashed #3b82f6'
+        : (isSelected && !isActive ? '2px dashed rgba(255,255,255,0.3)' : '2px solid transparent'))
+      : 'none',
     opacity: isDragging ? 0.5 : (draggingGroupIds.includes(tab.id) && !isDragging ? 0.5 : (isCollapsed && !isActive ? 0.6 : 1)),
     transition: 'color 0.15s ease, background-color 0.15s ease',
     borderRight: isViewingSubAgent ? '2px solid rgba(168, 85, 247, 0.6)' : 'none',
@@ -500,6 +579,27 @@ const TabItem = memo(({
       backgroundColor: 'rgba(99, 102, 241, 0.15)',
     } : {}),
   };
+
+  // Vertical mode разделяет два сигнала:
+  //   hasProcess (PTY жив) → узкая 2px полоса слева мигает.
+  //     PTY-источники: terminal:command-started/finished (claude CLI, npm run dev, bash, gemini CLI).
+  //   isBusy (AI «думает»/стримит)   → горизонтальный shimmer по ВСЕЙ ширине вкладки.
+  //     AI-источники: claude:busy-state, gemini:busy-state, claude-sdk:busy-state.
+  //   SDK claude — нет PTY → hasProcess=false. Sole сигнал — isBusy → только shimmer.
+  //   Если оба true (PTY claude думает) — рендерятся оба: полоса слева + shimmer.
+  const verticalHasProcess = hasProcess;
+  const verticalIsAiBusy = isBusy;
+  // Lookup status definition by id из глобального стора.
+  // useUIStore делает гранулярный subscribe — TabItem ре-рендерится только когда
+  // массив sessionStatuses изменится (юзер отредактировал палитру в SettingsModal).
+  const sessionStatuses = useUIStore((s) => s.sessionStatuses);
+  const statusMeta = sessionStatus
+    ? sessionStatuses.find((s) => s.id === sessionStatus)
+    : null;
+  // processBar.enabled управляет тем, мигает ли полоска или статичная.
+  // Только enabled-флаг нужен здесь — цвета/duration читаются через CSS-переменные на :root
+  // (App.tsx синхронизирует переменные при изменении processBar).
+  const processBarEnabled = useUIStore((s) => s.processBar.enabled);
 
   return (
     <div
@@ -534,8 +634,81 @@ const TabItem = memo(({
         <Bot size={14} style={{ color: getCollapsedIconColor(), flexShrink: 0 }} />
       ) : (
         <>
-          {/* Restart zone - left part of tab (not for browser or SDK tabs) */}
-          {tab.tabType !== 'browser' && tab.tabType !== 'claude-sdk' && (
+          {/* Vertical mode: thin process bar on the very left + status SVG marker
+              just to the right of it. Replaces RestartZone/SDK-status zone. */}
+          {isVerticalMode && (
+            <>
+              {/* Process bar — runs along the full tab height, 3px wide. Pulse animation
+                  via globals.css class `tab-process-bar-busy`. Triggers ONLY by PTY-process
+                  presence (hasProcess) — НЕ AI-busy.
+                  Если processBarEnabled=false (Settings → отключил мигание) — статичный
+                  класс tab-process-bar-static красит фон без анимации. */}
+              {verticalHasProcess && (
+                <div
+                  className={processBarEnabled ? 'tab-process-bar-busy' : 'tab-process-bar-static'}
+                  style={{
+                    position: 'absolute',
+                    // -2px компенсирует 2px transparent border-left (резерв под dashed-states).
+                    // Без этого полоска отрисовывается ВНУТРИ border-area → виден gap у края.
+                    left: '-2px',
+                    top: 0,
+                    bottom: 0,
+                    width: '3px',
+                    pointerEvents: 'none',
+                    zIndex: 5,
+                    borderTopLeftRadius: TAB_VERTICAL_BORDER_RADIUS,
+                    borderBottomLeftRadius: TAB_VERTICAL_BORDER_RADIUS,
+                  }}
+                />
+              )}
+              {/* AI-busy shimmer — full-tab horizontal sweep. Triggers when AI session
+                  is thinking/streaming (claude:busy-state / gemini:busy-state /
+                  claude-sdk:busy-state). Works for SDK tabs which have no PTY at all. */}
+              {verticalIsAiBusy && (
+                <div
+                  className="tab-ai-busy-shimmer"
+                  style={{
+                    position: 'absolute',
+                    inset: 0,
+                    pointerEvents: 'none',
+                    zIndex: 3,
+                    overflow: 'hidden',
+                    borderRadius: TAB_VERTICAL_BORDER_RADIUS,
+                  }}
+                  aria-hidden
+                />
+              )}
+              {/* Status marker — colored dot 8px when sessionStatus is set.
+                  Левый отступ 5px: после 3px polosky процесса (z:5) + 2px зазор → 5px.
+                  По вертикали top:calc(50% + 1px) компенсирует оптический baseline-шифт
+                  строчных букв ('claude-03' без descender'ов выглядит чуть ниже
+                  геометрического центра карточки). */}
+              {statusMeta && (
+                <span
+                  title={statusMeta.label}
+                  style={{
+                    position: 'absolute',
+                    left: '5px',
+                    top: 'calc(50% + 1px)',
+                    transform: 'translateY(-50%)',
+                    width: '8px',
+                    height: '8px',
+                    borderRadius: '50%',
+                    backgroundColor: statusMeta.color,
+                    border: '1px solid rgba(0,0,0,0.4)',
+                    pointerEvents: 'none',
+                    zIndex: 6,
+                  }}
+                />
+              )}
+              {/* В вертикальном режиме middle-click по всей вкладке = close tab (стандартное
+                  поведение TabItem root). Stop через middle-click недоступен — для остановки
+                  процесса юзер открывает ПКМ → Stop, либо использует кнопки InfoPanel. */}
+            </>
+          )}
+
+          {/* Restart zone - left part of tab (horizontal only; not for browser/SDK) */}
+          {!isVerticalMode && tab.tabType !== 'browser' && tab.tabType !== 'claude-sdk' && (
             <RestartZone
               hasProcess={hasProcess}
               hasColor={!!hasColor}
@@ -550,7 +723,7 @@ const TabItem = memo(({
               forwards to onStop when busy so it mirrors PTY claude middle-click
               Stop. Three states: BUSY = peach spinner, has session (idle) = green
               dot, fresh tab = nothing. */}
-          {tab.tabType === 'claude-sdk' && (
+          {!isVerticalMode && tab.tabType === 'claude-sdk' && (
             <div
               style={{
                 position: 'absolute',
@@ -612,7 +785,16 @@ const TabItem = memo(({
             <input
               ref={inputRef}
               type="text"
-              className="bg-[#333] border border-accent rounded px-2 py-0.5 text-[13px] text-white outline-none w-[100px]"
+              className="bg-[#333] border border-accent rounded px-2 py-0.5 text-[13px] text-white outline-none"
+              style={{
+                // Vertical mode (TabSidebar): растягиваем input на остаток ширины, чтобы
+                // кнопка заметок справа осталась прижата к правому краю TabItem (а не
+                // прилипла к short input'у с пустой зоной за ней).
+                // Horizontal mode: legacy fixed 100px — там кнопки заметок нет.
+                width: isHorizontal ? 100 : undefined,
+                flex: isHorizontal ? 'none' : 1,
+                minWidth: 0,
+              }}
               value={editValue}
               onChange={(e) => onEditChange(e.target.value)}
               onBlur={onEditSubmit}
@@ -626,20 +808,52 @@ const TabItem = memo(({
             </span>
           )}
 
-          {/* Notes indicator dot — absolute, doesn't affect layout */}
-          {showNotesIndicator && (
-            <span
-              style={{
-                position: 'absolute',
-                top: '4px',
-                right: '4px',
-                width: '5px',
-                height: '5px',
-                borderRadius: '50%',
-                backgroundColor: '#DA7756',
-                pointerEvents: 'none',
+          {/* Open notes — peek-button. Three visibility rules:
+                1. slideoutOpenHere — slideout is anchored to this tab (solid-indigo, always visible).
+                2. showNotesPeek — Cmd is held, cursor in TabBar, tab has notes (Cmd-hover peek).
+                3. Default-on-active — active tab in vertical mode, but ONLY when no slideout is
+                   currently open on another tab (so the open slideout's anchor is the unique
+                   button on screen).
+              The data-tab-id attribute lets TabNotesSlideout query the EXACT trigger for its
+              anchor (multiple peek buttons can be on screen at once when Cmd is held). */}
+          {isVerticalMode && (slideoutOpenHere || showNotesPeek || (isActive && !anySlideoutOpen)) && (
+            <button
+              data-tab-notes-open-trigger
+              data-tab-id={tab.id}
+              onClick={(e) => {
+                e.stopPropagation();
+                const cur = useUIStore.getState().notesPanelOpenTabs[tab.id] ?? false;
+                useUIStore.getState().setNotesPanelOpen(tab.id, !cur);
               }}
-            />
+              title="Open notes (Cmd+E)"
+              className="flex-shrink-0 inline-flex items-center justify-center cursor-pointer transition-colors"
+              style={{
+                width: 20,
+                height: 18,
+                marginLeft: 6,
+                padding: 0,
+                borderRadius: 4,
+                backgroundColor: slideoutOpenHere ? '#6366f1' : '#1e1e2e',
+                color: slideoutOpenHere ? '#fff' : '#a5b4fc',
+                border: slideoutOpenHere
+                  ? '1px solid #6366f1'
+                  : '1px solid rgba(99,102,241,0.25)',
+              }}
+              onMouseEnter={(e) => {
+                if (slideoutOpenHere) return; // solid state — no hover swap
+                const el = e.currentTarget as HTMLButtonElement;
+                el.style.backgroundColor = '#2a2a3e';
+                el.style.color = '#c7d2fe';
+              }}
+              onMouseLeave={(e) => {
+                if (slideoutOpenHere) return;
+                const el = e.currentTarget as HTMLButtonElement;
+                el.style.backgroundColor = '#1e1e2e';
+                el.style.color = '#a5b4fc';
+              }}
+            >
+              <StickyNote size={11} strokeWidth={2} />
+            </button>
           )}
         </>
       )}
@@ -689,12 +903,13 @@ const ZoneDropTarget = memo(({
 });
 
 // Empty area drop zone - for dropping at the end of tabs (works for both reorder and move from utility)
-const EmptyDropZone = memo(({ onDropMain, onDropFromUtility, onHoverChange, onDoubleClick, onContextMenu }: {
+const EmptyDropZone = memo(({ onDropMain, onDropFromUtility, onHoverChange, onDoubleClick, onContextMenu, orientation = 'horizontal' }: {
   onDropMain: (tabId: string) => void;
   onDropFromUtility: (tabId: string) => void;
   onHoverChange: (isOver: boolean) => void;
   onDoubleClick?: () => void;
   onContextMenu?: (e: React.MouseEvent) => void;
+  orientation?: 'horizontal' | 'vertical';
 }) => {
   const ref = useRef<HTMLDivElement>(null);
   const [isOver, setIsOver] = useState(false);
@@ -728,10 +943,15 @@ const EmptyDropZone = memo(({ onDropMain, onDropFromUtility, onHoverChange, onDo
     });
   }, [onDropMain, onDropFromUtility, onHoverChange]);
 
+  // Horizontal: fill remaining row (h-full flex-1 min-w-[30px]).
+  // Vertical: fill remaining column space (flex-1 w-full min-h-[30px]).
+  const sizeClass = orientation === 'vertical'
+    ? 'flex-1 w-full min-h-[30px]'
+    : 'h-full flex-1 min-w-[30px]';
   return (
     <div
       ref={ref}
-      className={`h-full flex-1 min-w-[30px] transition-colors ${isOver ? 'bg-white/10' : ''}`}
+      className={`${sizeClass} transition-colors ${isOver ? 'bg-white/10' : ''}`}
       onDoubleClick={onDoubleClick}
       onContextMenu={onContextMenu}
     />
@@ -833,7 +1053,8 @@ const UtilsButtonDropTarget = memo(({
   );
 });
 
-function TabBar({ projectId }: TabBarProps) {
+function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
+  const isVerticalLayout = layout === 'vertical';
   // Use individual selectors to minimize re-renders
   const openProjects = useWorkspaceStore((state) => state.openProjects);
   const createTab = useWorkspaceStore((state) => state.createTab);
@@ -842,6 +1063,7 @@ function TabBar({ projectId }: TabBarProps) {
   const switchTab = useWorkspaceStore((state) => state.switchTab);
   const renameTab = useWorkspaceStore((state) => state.renameTab);
   const setTabColor = useWorkspaceStore((state) => state.setTabColor);
+  const setTabSessionStatus = useWorkspaceStore((state) => state.setTabSessionStatus);
   const toggleTabUtility = useWorkspaceStore((state) => state.toggleTabUtility);
   const toggleTabCollapsed = useWorkspaceStore((state) => state.toggleTabCollapsed);
   const reorderInZone = useWorkspaceStore((state) => state.reorderInZone);
@@ -858,6 +1080,9 @@ function TabBar({ projectId }: TabBarProps) {
   const tabsFontSize = useUIStore((state) => state.tabsFontSize);
   const showToast = useUIStore((state) => state.showToast);
   const reopenPulseActive = useUIStore((state) => state.reopenPulseActive);
+  // Configurable session statuses (Settings → Системные). Используется в context menu
+  // для рендера превью трёх точек + полного submenu со статусами.
+  const ctxSessionStatuses = useUIStore((state) => state.sessionStatuses);
   // tabNotes* font / padding теперь читаются внутри TabPreviewPopover.
 
   const [editingTabId, setEditingTabId] = useState<string | null>(null);
@@ -885,6 +1110,16 @@ function TabBar({ projectId }: TabBarProps) {
   const isCmdPressed = useCmdKey();
   const notesPopover = useCmdHoverPopover<string>(isCmdPressed);
   const [isMouseInTabBar, setIsMouseInTabBar] = useState(false);
+
+  // Per-tab notes-slideout open state. `notesPanelOpenTabs` is a Record<tabId,bool>
+  // but the one-at-a-time policy in useUIStore.setNotesPanelOpen means at most one
+  // entry is true. We compute the open tab id once and pass derived flags to each TabItem.
+  const notesPanelOpenTabs = useUIStore((s) => s.notesPanelOpenTabs);
+  const openSlideoutTabId = useMemo(() => {
+    for (const [tid, on] of Object.entries(notesPanelOpenTabs)) if (on) return tid;
+    return null;
+  }, [notesPanelOpenTabs]);
+  const anySlideoutOpen = openSlideoutTabId !== null;
 
   const workspace = openProjects.get(projectId);
   const viewingSubAgentTabId = workspace?.viewingSubAgentTabId ?? null;
@@ -1576,8 +1811,12 @@ function TabBar({ projectId }: TabBarProps) {
     return () => clearTimeout(timer);
   }, [workspace.activeTabId, mainTabs.length]);
 
-  // Convert vertical scroll to horizontal (non-passive to allow preventDefault)
+  // Wheel handler. Horizontal layout — конвертирует deltaY в горизонтальный scroll
+  // чтобы юзер мог листать табы колесом без зажатия Shift. Vertical layout —
+  // NO-op (нативный вертикальный scroll работает сам, форсить scrollLeft на
+  // overflowX:hidden контейнере = блокировка прокрутки).
   useEffect(() => {
+    if (isVerticalLayout) return;
     const scrollContainer = scrollContainerRef.current;
     if (!scrollContainer) return;
 
@@ -1590,11 +1829,175 @@ function TabBar({ projectId }: TabBarProps) {
 
     scrollContainer.addEventListener('wheel', handleWheel, { passive: false });
     return () => scrollContainer.removeEventListener('wheel', handleWheel);
-  }, []);
+  }, [isVerticalLayout]);
+
+  // Vertical sidebar layout — left column, list runs top→bottom, main scrolls
+  // vertically, utility is inline below with a divider. Reuses ALL the state &
+  // handlers from above (drag-drop, context menu, multi-select, busy maps,
+  // hover preview). The only difference from horizontal mode is the chrome.
+  const verticalBody = (
+    <div
+      data-tabbar-vertical
+      className="h-full w-full bg-panel flex flex-col overflow-hidden relative"
+      onMouseEnter={() => setIsMouseInTabBar(true)}
+      onMouseLeave={() => setIsMouseInTabBar(false)}
+    >
+      {reopenPulseActive && (
+        <div className="absolute inset-0 pointer-events-none animate-reopen-pulse" aria-hidden />
+      )}
+
+      {/* Main zone — scrolls vertically */}
+      <div
+        ref={scrollContainerRef}
+        className="flex-1 flex flex-col scrollbar-hide"
+        style={{ overflowX: 'hidden', overflowY: 'auto', minHeight: 0 }}
+      >
+        {mainTabs.length === 0 ? (
+          <EmptyMainZone onDrop={(tabId) => moveTabToZone(projectId, tabId, false, 0)} />
+        ) : (
+          <div className="flex flex-col" style={{ gap: `${TAB_VERTICAL_GAP}px`, padding: `${TAB_VERTICAL_GAP}px` }}>
+            {mainTabs.map((tab, index) => (
+              <TabItem
+                key={tab.id}
+                tab={tab}
+                index={index}
+                zone="main"
+                projectId={projectId}
+                orientation="vertical"
+                sessionStatus={tab.sessionStatus as SessionStatus | undefined}
+                isActive={currentView === 'terminal' && workspace.activeTabId === tab.id}
+                isSelected={selectedTabIds.includes(tab.id)}
+                isEditing={editingTabId === tab.id}
+                editValue={editValue}
+                onSwitch={(e) => {
+                  handleTabClick(e, tab.id);
+                  setProjectView(projectId, 'terminal');
+                }}
+                onClose={(e) => handleCloseTab(e, tab.id)}
+                onDoubleClick={() => {
+                  if (!isMultiSelect) handleDoubleClick(tab.id, tab.name);
+                }}
+                onContextMenu={(e) => handleContextMenu(e, tab.id)}
+                onEditChange={setEditValue}
+                onEditSubmit={handleRenameSubmit}
+                onEditKeyDown={handleRenameKeyDown}
+                inputRef={inputRef as React.RefObject<HTMLInputElement>}
+                fontSize={tabsFontSize}
+                hasProcess={processStatus.get(tab.id) || false}
+                commandType={tab.commandType}
+                hasSession={sessionStatus.get(tab.id) || !!tab.claudeSessionId}
+                isBusy={(tab.commandType === 'gemini' ? geminiBusyMap.get(tab.id) : claudeBusyMap.get(tab.id)) || false}
+                onRestart={handleRestart}
+                onStop={handleStop}
+                isInterrupted={isTabInterrupted(tab)}
+                draggingGroupIds={draggingGroupIds}
+                onHoverChange={(hovering, rect) => handleTabHoverChange(tab.id, hovering, rect)}
+                showNotesPeek={isCmdPressed && isMouseInTabBar && !!workspace.tabs.get(tab.id)?.notes}
+                slideoutOpenHere={openSlideoutTabId === tab.id}
+                anySlideoutOpen={anySlideoutOpen}
+                isCollapsed={!!tab.isCollapsed}
+                isViewingSubAgent={viewingSubAgentParentId === tab.id}
+              />
+            ))}
+          </div>
+        )}
+        {/* Empty drop zone at end — captures drops after last tab + double-click = new tab */}
+        {mainTabs.length > 0 && (
+          <EmptyDropZone
+            orientation="vertical"
+            onDropMain={(tabId) => {
+              const currentTabs = mainTabs.map(t => t.id);
+              if (!currentTabs.includes(tabId)) return;
+              const newOrder = currentTabs.filter(id => id !== tabId);
+              newOrder.push(tabId);
+              reorderInZone(projectId, 'main', newOrder);
+            }}
+            onDropFromUtility={(tabId) => {
+              moveTabToZone(projectId, tabId, false, mainTabs.length);
+            }}
+            onHoverChange={setEmptyZoneHovered}
+            onDoubleClick={handleNewTabAtEnd}
+            onContextMenu={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              setEmptyContextMenu({ x: e.clientX, y: e.clientY });
+            }}
+          />
+        )}
+      </div>
+
+      {/* Utility zone — inline section below main, separated by a divider */}
+      {utilityTabs.length > 0 && (
+        <>
+          <div className="border-t border-border-main" />
+          <div className="px-2 py-1 text-[10px] uppercase tracking-wider text-[#666] flex items-center gap-1">
+            <span>Utils</span>
+            <span className="bg-[#444] px-1.5 rounded text-[10px]">{utilityTabs.length}</span>
+            {hasProcessInUtils && (
+              <span
+                style={{
+                  width: '5px', height: '5px', borderRadius: '50%',
+                  backgroundColor: '#fff', opacity: 0.6, marginLeft: 'auto',
+                }}
+              />
+            )}
+          </div>
+          <ZoneDropTarget zone="utility" isEmpty={false}>
+            <div className="flex flex-col max-h-[40%] overflow-y-auto scrollbar-hide" style={{ gap: `${TAB_VERTICAL_GAP}px`, padding: `${TAB_VERTICAL_GAP}px` }}>
+              {utilityTabs.map((tab, index) => (
+                <TabItem
+                  key={tab.id}
+                  tab={tab}
+                  index={index}
+                  zone="utility"
+                  projectId={projectId}
+                  orientation="vertical"
+                  sessionStatus={tab.sessionStatus as SessionStatus | undefined}
+                  isActive={currentView === 'terminal' && workspace.activeTabId === tab.id}
+                  isSelected={selectedTabIds.includes(tab.id)}
+                  isEditing={editingTabId === tab.id}
+                  editValue={editValue}
+                  onSwitch={(e) => {
+                    handleTabClick(e, tab.id);
+                    setProjectView(projectId, 'terminal');
+                  }}
+                  onClose={() => closeTab(projectId, tab.id)}
+                  onDoubleClick={() => {
+                    if (!isMultiSelect) handleDoubleClick(tab.id, tab.name);
+                  }}
+                  onContextMenu={(e) => handleContextMenu(e, tab.id)}
+                  onEditChange={setEditValue}
+                  onEditSubmit={handleRenameSubmit}
+                  onEditKeyDown={handleRenameKeyDown}
+                  inputRef={inputRef as React.RefObject<HTMLInputElement>}
+                  fontSize={tabsFontSize}
+                  hasProcess={processStatus.get(tab.id) || false}
+                  commandType={tab.commandType}
+                  hasSession={sessionStatus.get(tab.id) || !!tab.claudeSessionId}
+                  isBusy={(tab.commandType === 'gemini' ? geminiBusyMap.get(tab.id) : claudeBusyMap.get(tab.id)) || false}
+                  onRestart={handleRestart}
+                  onStop={handleStop}
+                  isInterrupted={isTabInterrupted(tab)}
+                  draggingGroupIds={draggingGroupIds}
+                  onHoverChange={(hovering, rect) => handleTabHoverChange(tab.id, hovering, rect)}
+                  showNotesPeek={isCmdPressed && isMouseInTabBar && !!workspace.tabs.get(tab.id)?.notes}
+                slideoutOpenHere={openSlideoutTabId === tab.id}
+                anySlideoutOpen={anySlideoutOpen}
+                  isCollapsed={!!tab.isCollapsed}
+                  isViewingSubAgent={viewingSubAgentParentId === tab.id}
+                />
+              ))}
+            </div>
+          </ZoneDropTarget>
+        </>
+      )}
+    </div>
+  );
 
   return (
     <>
-      {/* Single row TabBar */}
+      {isVerticalLayout ? verticalBody : (
+      /* Single row TabBar */
       <div
         className="h-[30px] bg-panel flex items-stretch relative"
         onMouseEnter={() => setIsMouseInTabBar(true)}
@@ -1749,7 +2152,9 @@ function TabBar({ projectId }: TabBarProps) {
                         isInterrupted={isTabInterrupted(tab)}
                         draggingGroupIds={draggingGroupIds}
                         onHoverChange={(hovering, rect) => handleTabHoverChange(tab.id, hovering, rect)}
-                        showNotesIndicator={isCmdPressed && isMouseInTabBar && !!workspace.tabs.get(tab.id)?.notes}
+                        showNotesPeek={isCmdPressed && isMouseInTabBar && !!workspace.tabs.get(tab.id)?.notes}
+                slideoutOpenHere={openSlideoutTabId === tab.id}
+                anySlideoutOpen={anySlideoutOpen}
                         isCollapsed={!!tab.isCollapsed}
                         isViewingSubAgent={viewingSubAgentParentId === tab.id}
                       />
@@ -1819,7 +2224,9 @@ function TabBar({ projectId }: TabBarProps) {
                     isInterrupted={isTabInterrupted(tab)}
                     draggingGroupIds={draggingGroupIds}
                     onHoverChange={(hovering, rect) => handleTabHoverChange(tab.id, hovering, rect)}
-                    showNotesIndicator={isCmdPressed && isMouseInTabBar && !!workspace.tabs.get(tab.id)?.notes}
+                    showNotesPeek={isCmdPressed && isMouseInTabBar && !!workspace.tabs.get(tab.id)?.notes}
+                slideoutOpenHere={openSlideoutTabId === tab.id}
+                anySlideoutOpen={anySlideoutOpen}
                     isCollapsed={!!tab.isCollapsed}
                     isViewingSubAgent={viewingSubAgentParentId === tab.id}
                   />
@@ -1854,6 +2261,7 @@ function TabBar({ projectId }: TabBarProps) {
           )}
         </div>
       </div>
+      )}
 
       {/* Context Menu - styled like terminal context menu */}
       {contextMenu && (
@@ -2109,39 +2517,54 @@ function TabBar({ projectId }: TabBarProps) {
 
           {!isMultiSelect && (
             <>
-              {/* Color - submenu */}
-              <div className="relative group/color">
+              {/* Status - submenu (independent of runtime type). Toggle-семантика:
+                  повторный клик на активный статус снимает его. Отдельной «Без статуса»
+                  кнопки нет — юзер просто кликает второй раз на выделенную галочкой строку. */}
+              <div className="relative group/status">
                 <button
-                  className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center justify-between"
+                  className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center justify-between gap-3"
                 >
-                  <span>Color</span>
-                  <span className="text-[#666]">›</span>
+                  <span>Status</span>
+                  <span className="flex items-center gap-1 ml-auto">
+                    {ctxSessionStatuses.slice(0, 6).map((s) => (
+                      <span
+                        key={s.id}
+                        style={{
+                          width: 8,
+                          height: 8,
+                          borderRadius: '50%',
+                          backgroundColor: s.color,
+                          border: '1px solid rgba(0,0,0,0.4)',
+                          display: 'inline-block',
+                        }}
+                      />
+                    ))}
+                    <span className="text-[#666] ml-1">›</span>
+                  </span>
                 </button>
-                {/* Color submenu */}
-                <div className="absolute left-full top-0 -ml-2 pl-2 hidden group-hover/color:block">
-                  <div className="bg-[#2a2a2a] border border-[#444] rounded-xl shadow-2xl py-2 min-w-[140px]">
-                    {TAB_COLORS.map((c) => {
-                      const isSelected = workspace.tabs.get(contextMenu.tabId)?.color === c.color ||
-                        (!workspace.tabs.get(contextMenu.tabId)?.color && c.color === 'default');
+                <div className="absolute left-full top-0 -ml-2 pl-2 hidden group-hover/status:block">
+                  <div className="bg-[#2a2a2a] border border-[#444] rounded-xl shadow-2xl py-2 min-w-[220px]">
+                    {ctxSessionStatuses.length === 0 && (
+                      <div className="px-4 py-2 text-[12px] text-[#666] italic">
+                        Нет статусов. Добавь в Settings → Системные.
+                      </div>
+                    )}
+                    {ctxSessionStatuses.map((s) => {
+                      const current = workspace.tabs.get(contextMenu.tabId)?.sessionStatus;
+                      const isSelected = current === s.id;
                       return (
                         <button
-                          key={c.color}
-                          className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-3"
+                          key={s.id}
+                          className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-3 whitespace-nowrap"
                           onClick={(e) => {
                             e.stopPropagation();
-                            handleSetColor(c.color);
+                            // Toggle: повторный клик на активный → снимаем (null).
+                            setTabSessionStatus(projectId, contextMenu.tabId, isSelected ? null : s.id);
+                            setContextMenu(null);
                           }}
                         >
-                          <span
-                            style={{
-                              width: '12px',
-                              height: '12px',
-                              borderRadius: '50%',
-                              border: `2px solid ${c.borderColor}`,
-                              backgroundColor: c.bgColor,
-                            }}
-                          />
-                          <span>{c.label.replace(/^. /, '')}</span>
+                          <span style={{ width: 12, height: 12, borderRadius: '50%', backgroundColor: s.color, border: '1px solid rgba(0,0,0,0.4)', flexShrink: 0 }} />
+                          <span>{s.label}</span>
                           {isSelected && <span className="ml-auto text-white">✓</span>}
                         </button>
                       );
@@ -2369,6 +2792,8 @@ function TabBar({ projectId }: TabBarProps) {
             popoverProps={notesPopover.popoverProps}
             notes={notes || null}
             isLocked={notesPopover.isLocked}
+            placement={isVerticalLayout ? 'right' : 'below'}
+            source="tabbar"
           />
         );
       })()}

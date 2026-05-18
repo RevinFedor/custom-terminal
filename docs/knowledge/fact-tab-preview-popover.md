@@ -1,70 +1,121 @@
 # Feature: Tab Preview Popover (CMD+hover)
 
 ## Intro
-Превью карточки таба, появляющееся при наведении с зажатым CMD. Унифицированная компонента `TabPreviewPopover` для двух поверхностей: вкладки `TabBar` и карточки в `ProjectHome` (Active + History). До рефактора TabBar и ProjectHome использовали разные popover-обёртки (`CmdHoverPopover` базовый), визуальный язык расходился — единая компонента устранила это.
+Превью карточки таба, появляющееся при наведении с зажатым CMD. Унифицированный `TabPreviewPopover` для двух поверхностей: вкладки `TabBar` и карточки в `ProjectHome` (Active + History). Без resize handles — размеры окна вычисляются автоматически по контенту в пределах cap'ов из Settings; юзер настраивает рамку пространства, не каждый popover вручную.
 
 ## User Flow
-1. **Активация**: hover на вкладке/карточке + удержание ⌘.
-2. **Контент**: markdown notes (read-only MarkdownEditor) → metadata block (Path / Closed / Created / Type / Messages — состав зависит от поверхности). **Title-блок (имя вкладки bold сверху) удалён** — имя уже видно на самой trigger-карточке, дублировать его в popover'е было visual noise (юзерский запрос).
-3. **Resize**: 5 handles (right / left / bottom edges + 2 corners — BR + BL). Тянем — высота notes и ширина popover'а меняются. Width + maxLines персистятся в Zustand (`tabPreviewWidth`, `tabPreviewMaxLines`).
-4. **Закрытие**: уход курсора с popover'а + отпускание ⌘.
+
+1. **Активация**: hover на вкладке/карточке + удержание ⌘. Появляется popover с заметкой.
+2. **Контент**: markdown notes (read-only). В split-mode (Home) дополнительно metadata-блок (Path / Closed / Created / Type / Messages) **под** карточкой; notes — **над** карточкой. В TabBar — только notes под табом.
+3. **Закрытие**: уход курсора с popover'а + отпускание ⌘.
+4. **Закреп**: CMD+Shift над любым открытым popover'ом — popover «прибивается» (белая рамка 1px). CMD можно отпустить, курсор увести куда угодно, перенаведение на другие триггеры игнорируется. Снятие — повторный CMD+Shift или mousedown в любом месте приложения вне popover-обёртки (атрибут `data-cmd-hover-popover` защищает внутренние клики). Общая механика закрепа — в global `tooltip-resize-modal.md::Закреп: Cmd+Shift делает любой popover пинованным`.
+
+## Sizing: cap + target-ratio + autobalance
+
+Размеры — **не фиксированные**. Popover рендерится `fit-content + max-*`, форма подгоняется к контенту в пределах рамки настроек:
+
+- `tabPreviewMaxWidth` (default 200px, 120-900px) — потолок ширины.
+- `tabPreviewMaxHeight` (default 250px, 80-900px) — потолок высоты.
+- `tabPreviewRatioW × tabPreviewRatioH` (default 3 × 2) — целевая пропорция W:H. Алгоритм пытается выйти на это соотношение.
+
+Алгоритм (`useLayoutEffect` в компоненте, `measureAt(w)` через единый hidden probe-DOM):
+
+1. Замер natural-width контента при `width: max-content + max-width: cap`.
+2. Если natural ≤ cap'а — стартовая ширина = natural. Иначе — cap.
+3. Замер высоты при стартовой ширине.
+4. Если `W/H > targetRatio` (коробка слишком плоская — например одна длинная строка во всю maxWidth): **бисекция вниз** до `NOTES_MIN_WIDTH` пока ratio не сойдётся. Word-wrap при сужении увеличивает H — соотношение крутится к target.
+5. Если `W/H < targetRatio` (коробка слишком высокая): **бисекция вверх** до `maxWidth`. Word-wrap при расширении уменьшает H.
+6. Финальная высота: `min(naturalH, tabPreviewMaxHeight)`. Если контент дальше — внутренний scroll.
+
+8 итераций бисекции достаточно для попадания в 1 пиксель на типичных markdown-документах; все замеры по одному и тому же probe без re-render'ов.
+
+## Wait-for-stable measurement
+
+MarkdownEditor (react-markdown) рендерит markdown-блоки **асинхронно** через несколько микрозадач. Один-проходный `useLayoutEffect`-замер видит partial-state: первые 1-3 кадра `scrollWidth` возвращает 0, или одно слово, или остаток предыдущего hover'а (probe-DOM переиспользуется React'ом). В логах было `naturalW: 200 → 75 → 0` между hover'ами одной и той же заметки — итоговые размеры менялись от replay к replay.
+
+Решение:
+- **rAF-loop ждёт стабильности**: `scrollWidth > 0 && равен предыдущему 3 кадра подряд` → можно использовать. `MAX_FRAMES = 40` страховка от бесконечного цикла.
+- **`key={notes}` на probe-MarkdownEditor**: при смене контента React делает hard-remount probe-DOM, никакого leftover внутреннего state. Это убивает «300px остался от прошлой заметки» когда `widthBefore` после первого measure был установлен, а React не diff'ил inline-style на следующий render.
+- **Inline-style сбрасывается на каждом тике settle**: `probe.style.width = ''` перед чтением `scrollWidth`. Без этого предыдущий measure оставил фиксированную ширину, и `scrollWidth` возвращал зажатое значение.
+
+Логи (`[TabPreviewSize:enter]`, `[TabPreviewSize:settle]`, `[TabPreviewSize:final]` с полями source / framesUsed / targetRatio / actualRatio) можно включить временно для диагностики — текущий код не пишет ничего в продакшене после успешной стабилизации.
 
 ## Layout & позиционирование
 
-**TabBar popover** (CMD+hover на табах): открывается под табом, содержит только notes (без metadata — для активных табов нет смысла дублировать cwd/type которые видны из контекста).
+**TabBar** (CMD+hover на табах): popover открывается под табом, **только notes** (без metadata — у активных табов cwd/type видны из контекста, дублировать нет смысла).
 
-**ProjectHome split-mode** (CMD+hover на Active/History карточках): **два независимых wrapper'а** вокруг карточки. Верхний — notes (resizable) выше карточки через `top: rect.top + translateY(-100%)`. Нижний — metadata block ниже карточки через `top: rect.bottom`. Оба используют общий `popoverProps` (onMouseEnter/Leave) — переход курсором с одной части на другую через карточку держит popover открытым, уход куда-то ещё закрывает обе одновременно.
+**ProjectHome split-mode** (CMD+hover на Active/History карточках): **два независимых wrapper'а** вокруг карточки. Верхний — notes выше карточки через `top: rect.top + translateY(-100%)`. Нижний — metadata block ниже карточки через `top: rect.bottom`. Оба используют общий `popoverProps` (onMouseEnter/Leave) — переход курсором с одной части на другую через карточку держит popover открытым, уход куда-то ещё закрывает обе одновременно. Mental model: «заметка вверху, описание внизу относительно карточки».
 
-**Что пробовали и почему не сработало**: сначала был single-wrapper popover с порядком `title → metadata → notes`, открывался под карточкой. Юзер: *«заметка должна быть над вкладкой, описание под»*. Перенесли в single-wrapper above-режим (notes + metadata в одном блоке выше карточки) — нарушалась mental model «заметка вверху, описание внизу относительно карточки». Только split на два wrapper'а закрывает требование. Финально title-блок (bold имя вкладки сверху popover'а) удалили в обеих поверхностях — имя на trigger-карточке (TabBar/Home-card) и так читается, в popover'е дублирование.
+**Empty-notes skip**: верхний wrapper не рендерится если у вкладки нет заметки. Без этой проверки выше карточки появлялась тонкая полоска от `border: 1px + padding` пустой card — выглядела как баг. Условие: split → `hasNotes`; single → `hasNotes || metaRows`.
 
-## Persistence
+**Что пробовали и почему не сработало**: сначала был single-wrapper popover с порядком `title → metadata → notes`, открывался под карточкой. Юзер: *«заметка должна быть над вкладкой, описание под»*. Перенесли в single-wrapper above-режим — нарушалась mental model. Только split на два wrapper'а закрывает требование. Title-блок (bold имя вкладки сверху popover'а) тоже удалили — имя на trigger-карточке (TabBar таб / Home card) уже читается, в popover'е дублирование.
 
-`tabPreviewWidth` (240–900px) и `tabPreviewMaxLines` (2–40) живут в `useUIStore`, ключи `noted-terminal-tab-preview-width` / `-max-lines` зеркалятся в SQLite через стандартный localStorage mirror (mainprocess `app:mirrorLocalStorageSync`). **Хранятся как float**, не int. Юзер тянет до 5.487 строк → store сохраняет ровно 5.487 → рамка на mouseup НЕ скачет. Раньше `Math.round` в setter'е создавал визуальный jump на ~0.5 lineHeight (см. секцию ниже).
+## Pointer-through на Home
 
-Settings stepper (модалка → «Шрифты» → «Превью таба (Cmd+hover)») отображает `Math.round(value)`, onChange передаёт целое — +/- работают шагом в 1. Дробное значение в store видно только при ручном drag.
+На Project Home карточки выложены сеткой 4×N. При наведении на одну сверху и снизу появляются info-блоки — путь курсора к карточке под/над текущей перегораживается. Контент popover'а на Home read-only и некликабелен, интерактивность не нужна. Поэтому Home передаёт `pointerThrough` → оба wrapper'а получают `pointer-events: none`, hover-эффект проходит сквозь весь блок к карточке под ним, при наведении на следующую карточку popover моментально переключается.
 
-**localLeftShift не персистится** — только в local React state. При drag за левый край popover растёт влево, фиксируем правую границу. После закрытия popover'а leftShift сбрасывается, при следующем open позиция = `rect.left + viewport clamp`. Это сознательно — persisting leftShift привело бы к тому что popover открывается в неожиданном месте relative к новой trigger-карточке.
+В TabBar `pointerThrough` НЕ применяется — там popover один, перекрывать нечего, выделение текста должно работать.
 
-## Shrift и padding наследуются от inline notes
+Закреп (CMD+Shift) автоматически снимает pointer-through: закреплённый popover на Home становится интерактивным (текст можно выделить, ссылки внутри markdown кликаются). Реализация: `pointerThrough && !isLocked ? pointer-events: none : null` в обоих wrapper-стилях.
 
-`fontSize`, `paddingX`, `paddingY` берутся из `notesEditorFontSize` / `notesEditorPaddingX` / `notesEditorPaddingY` — единого набора для всех трёх surface'ов где рендерится `tab.notes` (inline в `InfoPanel`, slide-out `TabNotesSlideout`, этот popover). Single source of truth: меняешь шрифт в Settings (раздел «Заметки вкладки») → одновременно меняется во всех трёх местах. `lineHeight` для расчёта высоты = `fontSize * 1.5` (MarkdownEditor использует 1.5em line-height для prose). Раньше было два независимых набора полей (`tabNotes*` для inline+preview, `notesEditor*` для slide-out) — рассинхрон шрифта; см. `fix-notes-font-fragmentation.md`.
+Принцип — в `methodology/design.md::Pointer-through для info-popover'ов перегораживающих hover-grid`.
 
-## Resize handles
+## Закреп: CMD+Shift
 
-5 handles на card-wrap'е (не на card напрямую — card имеет `overflow: hidden` для скруглённых углов, это обрезало бы handles на offset -5px). card-wrap — промежуточный div с `position: relative`, без overflow.
+Универсальный механизм через `useCmdHoverPopover` hook (см. `useCmdHoverPopover.tsx::toggleLock`). При зажатом CMD нажатие Shift над открытым popover'ом → `isLocked = true`. В locked-режиме:
+- popover больше не закрывается ни от ухода курсора, ни от отпускания CMD.
+- перенаведение на другие триггеры **игнорируется** (`setHovered`, `triggerProps.onMouseEnter`, `popoverProps.onMouseLeave` — все возвращают рано если `isLocked`).
+- белая рамка 1px (`border: '1px solid #fff'` вместо `#333` на главной card; `#fff` вместо `rgba(59,130,246,0.3)` или `rgba(168,85,247,0.3)` на синем/фиолетовом tooltip'ах Timeline).
+- pointer-events возвращаются если был `pointerThrough`.
 
-- **right** edge → ширина
-- **left** edge → ширина растёт влево, popover сдвигается на `appliedDelta` чтобы правый край стоял на месте (`localLeftShift`)
-- **bottom** edge → maxLines (через delta = `dy / lineHeight`, дробное во время drag)
-- **corner-br** → width + maxLines (BR — растяжка)
-- **corner-bl** → leftShift + maxLines
+Снятие — два пути:
+- Повторный CMD+Shift из любой точки экрана. Глобальный keydown listener в `useCmdHoverPopover` ловит независимо от positions.
+- mousedown в любой части приложения вне popover-обёртки. Все wrapper'ы помечены `data-cmd-hover-popover` атрибутом, глобальный mousedown handler через `closest('[data-cmd-hover-popover]')` пропускает события внутри popover'а — выделение текста, скролл, клики по ссылкам lock не снимают.
 
-Подсветка через `data-resize-handle-active='true'` атрибут на mousedown + CSS селектор + `:hover` для покоя — см. `methodology/design.md::Hover-подсветка resize handle через data-attribute`. Удержание подсветки во время drag когда курсор уехал за handle area + корректное состояние после mouseup.
+Аналогично работает в Timeline (entry / note / fork tooltip'ы) — единая methodology, разные компоненты. Старый `freezeCmdPopups` toggle в StatusBar (жёлтый чип «freeze tooltips» для DevTools-инспекции) работает параллельно — это режим для разработки, оставлен нетронутым.
 
-Notes-блок имеет **фиксированную высоту** `maxLines * lineHeight` (`height` + `flex: 0 0 auto`, не `flex:1 + maxHeight`). Без этого короткие notes (5 строк) не реагировали на drag → пользователь видел `+1 строка` в Settings но визуально ничего не происходило. См. `methodology/design.md::Drag-state буфер` секция про CSS-ловушки.
+Подробнее про закреп вообще — `~/Global-Templates/🧩 Code-Patterns/docs-projects/ux-паттерны/tooltip-resize-modal.md::Закреп`.
 
-## Drag closure: isDraggingRef + grace period
+## Persistence settings
 
-Wrapper-`onMouseLeave` обычно убивает popover (через `popoverProps.onMouseLeave` из `useCmdHoverPopover`). Во время drag курсор уходит за wrapper-rect → mouseLeave → popover unmount-ится посреди drag'а. Защита:
-- `isDraggingRef.current = true` на mousedown handle → блокирует mouseLeave пока drag активен.
-- `graceUntilRef.current = Date.now() + 200ms` на mouseup → 200ms grace period, в течение которого случайный mouseLeave от микро-jitter мыши на границе игнорируется.
-- На mouseup проверяем `document.elementFromPoint(release.x, release.y)` — если курсор реально вне popover'а, симулируем `popoverProps.onMouseLeave` (иначе popover залипнет с не зажатым CMD, потому что `isPinned` остался `true`).
+`tabPreviewMaxWidth` / `tabPreviewMaxHeight` / `tabPreviewRatioW` / `tabPreviewRatioH` в `useUIStore`. Ключи `noted-terminal-tab-preview-max-{width,height}` / `noted-terminal-tab-preview-ratio-{w,h}` зеркалятся в SQLite через стандартный localStorage mirror (`app:mirrorLocalStorageSync` в main.js).
 
-Также wrapper имеет `padding: 8px` со всех сторон чтобы handles (offset -5) физически попадали внутрь `wrapper.boundingClientRect()`. Без padding mousedown на handle регистрировался как «вне wrapper'а» → 150ms `triggerProps.onMouseLeave` timer убивал popover до того как drag даже стартовал.
+Settings UI: модалка → секция «Заметки вкладки». Один блок включает:
+- 3 шрифта (sidebar / expanded / tooltip — см. секцию ниже).
+- Padding X/Y.
+- Макс. ширина превью / Макс. высота превью.
+- Пропорция превью — RatioRow с двумя инпутами `W × H`.
 
-## Hover bridge debug
+Все числовые инпуты в `FontSizeSlider` — editable: на focus убирает suffix (`12px` → `12`), select-all, Enter/blur коммитит clamped значение, Escape откатывает. Кнопки +/− по бокам для нудж'ей в единицу.
 
-Toggle «bridges» в StatusBar активирует `HoverBridgeDebug` overlay, который подсвечивает зону между trigger-карточкой и popover'ом красной полупрозрачной областью. Triger получает synthetic ref-shim (HoverBridgeDebug читает только `getBoundingClientRect`, не нужны DOM-методы — достаточно объект с `getBoundingClientRect: () => rect`). Direction = `above` если `pos.showAbove`, иначе `below`.
+## Шрифт: один из трёх по density-контексту
 
-## StrictMode pitfall (важно для maintainers)
+`fontSize` берётся из `notesTooltipFontSize` — отдельный от `notesSidebarFontSize` (inline в InfoPanel) и `notesExpandedFontSize` (slide-out). Раньше был один общий `notesEditorFontSize` — мелкий в превью либо громоздкий в раскрытом, юзер не выбирал между плотностями. Раздельные шрифты — не per-surface, а по семантике плотности окружения (сайдбар тесный → мельче, раскрытый просторный → крупнее, попап над курсором → отдельная балансировка). Принцип — `methodology/design.md::Один контент в нескольких density-контекстах`.
 
-`setDragPreview` обёрнут в `useCallback` который синхронно пишет в `previewRef.current` и потом вызывает `_setDragPreview`. Прямое использование `setDragPreview((prev) => { captured = prev; return null })` ломается под StrictMode — updater вызывается дважды, второй раз с `prev = null`, captured затирается. Захват только через `previewRef.current`, никаких side-effects в updater'е. См. `methodology/design.md::React StrictMode: functional updater вызывается дважды`.
+`paddingX` / `paddingY` единые (`notesEditorPaddingX/Y`) — это визуальный отступ редактора, не диктуется плотностью.
+
+Migration: при отсутствии новых ключей (`noted-terminal-notes-{sidebar,expanded,tooltip}-font-size`) читаем legacy `noted-terminal-notes-editor-font-size` (или ещё более старый `noted-terminal-tab-notes-font-size`) и подставляем во все три. Юзер не теряет значение которое накопил годами.
+
+## Что сняли и почему (graveyard)
+
+Эта компонента прошла через 600+ строк инфраструктуры drag-resize'а который потом полностью убрали. Записано для защиты от регрессии — следующий цикл редизайна не должен возвращать каждый из этих шагов.
+
+- **5 resize handles (right / left / bottom + 2 угла) + drag-state буфер**: юзер тянет handle → live React preview каждый mousemove → один flush в store на mouseup. Работало корректно, но bypass'илось логикой задачи: hover-popover живёт секунды, ручной resize этого времени не оправдывает. Заменено на autobalance.
+- **`localLeftShift` (drag за левый край, popover растёт влево)**: persistence-боль — после закрытия popover'а leftShift сбрасывался, при следующем open позиция = `rect.left + viewport clamp`. Persisting его привёл бы к тому что popover открывается в неожиданном месте relative к новой trigger-карточке. С удалением handles вопрос отпал.
+- **StrictMode previewRef mirror**: `setState(prev => { captured = prev; return null })` в React 19 StrictMode invokes функцию дважды, второй раз с `prev = null` — captured затирался. Лекарство было: параллельный `useRef` зеркало state'а, обёртка `setDragPreview` обновляла оба. Принцип переносим — оставлен в `methodology/design.md::React StrictMode`. Конкретное место (drag-buffer попапа) больше не существует.
+- **isDraggingRef + grace period 200ms + elementFromPoint check**: защита от закрытия popover'а посреди drag'а (курсор уходил за wrapper-rect → mouseLeave → unmount). Без drag'а защищать нечего.
+- **wrapper padding 8px со всех сторон**: чтобы handles на offset -5px физически попадали внутрь `wrapper.boundingClientRect()` (иначе triggerProps.onMouseLeave timer убивал popover до drag'а). С удалением handles padding не нужен — popover примыкает к trigger'у плотно.
+- **Float-значения в store + Math.round только в Settings**: чтобы рамка не прыгала на mouseup из-за subpixel-mismatch'а между live-preview и rounded store. Без drag'а — целые числа.
+- **CSS-ловушки три**: `overflow:hidden` обрезал handles на `-5px` → нужен был card-wrap без overflow. `flex:1 + maxHeight: limit` давал effective `min(natural, limit)` → drag-up не реагировал визуально на коротком content → нужен был `height: limit + flex: 0 0 auto`. `Math.round(dy/lineHeight)` создавал discrete-step jitter → нужен был float. Все три пропали вместе с handles. Принцип остаётся в `methodology/design.md::Drag-state буфер`.
+
+Невозврат: не возвращать ручной resize если задача — info-popover (хover, секунды). Resize handles оправданы только когда юзер сидит с popover'ом долго (модалка заметок, sticky-overlay). См. global `tooltip-resize-modal.md::Tooltip с resize`.
 
 ## Связи
 
-- `methodology/design.md::Drag-state буфер` — общий паттерн live preview + flush on mouseup, плюс CSS-ловушки (overflow:hidden обрезает handles, height vs maxHeight).
-- `methodology/design.md::Hover-подсветка resize handle через data-attribute` — паттерн `data-resize-handle-active`.
-- `methodology/design.md::React StrictMode...` — про `previewRef`.
-- `fact-project-home.md` секция «Hover Popover (CMD+hover)» — про конкретные карточки Home.
-- `fact-notes.md` — `TabNotesSlideout` использует те же паттерны drag-buffer (более старая реализация).
-- `fact-settings.md` секция «Шрифты интерфейса» — новые controls «Превью таба» (Ширина + Макс. строк).
+- `methodology/design.md::Auto-balanced popover sizing` — общий принцип cap+ratio+autobalance, переносим в другие проекты.
+- `methodology/design.md::Pointer-through для info-popover'ов` — почему на Home сквозь, на TabBar нет.
+- `methodology/design.md::Один контент в нескольких density-контекстах` — три fonts по семантике.
+- `fact-project-home.md::Hover Popover (CMD+hover)` — конкретные карточки Home, split-mode на месте.
+- `fact-notes.md::Tab Notes Slideout` — drag-resize в slide-out (единственный оставшийся в проекте после rewrite'а превью).
+- `fix-notes-font-fragmentation.md` — предыдущая итерация (схлопывание в один шрифт) и постскриптум о пересмотре.
+- `~/Global-Templates/🧩 Code-Patterns/docs-projects/ux-паттерны/tooltip-resize-modal.md` — глобальный mental model для всех всплывающих окон с привязкой.

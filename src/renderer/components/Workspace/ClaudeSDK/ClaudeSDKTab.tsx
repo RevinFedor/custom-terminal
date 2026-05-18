@@ -24,6 +24,8 @@ import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import { Loader2, FileEdit, Terminal as TerminalIcon, FolderSearch, Search, FileText, Globe, RefreshCw, Pencil, Check, X as XIcon, Brain, ChevronRight } from 'lucide-react';
 import Tooltip from '../../UI/Tooltip';
 import { consumePrefetched } from '../../../utils/sdkHistoryPrefetch';
+import { BackgroundTasksBar } from './BackgroundTasksBar';
+import { TaskDetailPane } from './TaskDetailPane';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -97,7 +99,7 @@ function extractToolResultText(content: any): string {
 // ============================================================
 // Convert our internal messages to assistant-ui ThreadMessageLike
 // ============================================================
-function convertMessage(msg: SDKChatMessage): ThreadMessageLike {
+export function convertMessage(msg: SDKChatMessage): ThreadMessageLike {
   if (msg.role === 'system') {
     return { role: 'system' as const, content: [{ type: 'text' as const, text: msg.text }], id: msg.id, createdAt: new Date(msg.timestamp) };
   }
@@ -345,7 +347,7 @@ interface UserMsgActions {
   // double-truncates and racing IPC calls.
   busy: boolean;
 }
-const UserMsgActionsContext = React.createContext<UserMsgActions | null>(null);
+export const UserMsgActionsContext = React.createContext<UserMsgActions | null>(null);
 
 // ============================================================
 // Props
@@ -398,6 +400,9 @@ function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKT
   // show Resume affordance" from "naturally finished, normal composer". Cleared
   // when the user resumes (clicks Resume) or sends the next message.
   const [wasStopped, setWasStopped] = useState(false);
+  // Background task that has been expanded into the 300px detail pane (replaces
+  // the composer). Null = composer visible. Bar above stays visible either way.
+  const [expandedTaskId, setExpandedTaskId] = useState<string | null>(null);
   // Context-window usage from the last assistant message. Claude API reports
   // total input as `input_tokens + cache_read_input_tokens + cache_creation_input_tokens`
   // — we keep the raw total here and compute the percentage at render time
@@ -416,6 +421,8 @@ function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKT
   const lastRequestRef = useRef<{ modelAlias?: string; effort?: string }>({});
   const modelMismatchToastedRef = useRef(false);
   const updateSDKState = useWorkspaceStore((s) => s.updateSDKState);
+  const upsertBgTask = useWorkspaceStore((s) => s.upsertBgTask);
+  const removeBgTask = useWorkspaceStore((s) => s.removeBgTask);
 
   // DEBUG: mount/render tracking
   useEffect(() => {
@@ -976,6 +983,97 @@ function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKT
         setMessages(prev => prev.filter(m => m.id !== 'compact-' + tabId));
         return;
       }
+      // ====================================================================
+      // Background tasks: task_started / task_progress / task_updated /
+      // task_notification — SDK 0.3.x events (opt-in via agentProgressSummaries
+      // + forwardSubagentText). Routed into store.bgTasks per tab, surfaced in
+      // BackgroundTasksBar above the composer. Agents == kind:'agent' (have
+      // subagent_type), bash run-in-background == kind:'bash' (tool_use_id ties
+      // to the Bash tool_use block already in thread).
+      if (msg.type === 'system' && msg.subtype === 'task_started') {
+        // SDK 0.3.x emits TWO task_started per Agent tool call:
+        //   1) task_type='local_agent' subagent_type='general-purpose' — the agent itself
+        //   2) task_type='local_bash' (no subagent_type) — each Bash CHILD of that agent
+        // The child bashes belong inside the agent's transcript (visible via
+        // TaskDetailPane → getSubagentMessages). Surfacing them as separate
+        // chips in the bar is noise — drop here.
+        if (msg.task_type === 'local_bash' && !msg.subagent_type) return;
+        const isAgent = !!msg.subagent_type || msg.task_type === 'agent' || msg.task_type === 'local_agent';
+        const head = String(msg.description || msg.prompt || msg.task_id || '').slice(0, 80);
+        upsertBgTask(tabId, msg.task_id, {
+          kind: isAgent ? 'agent' : 'bash',
+          toolUseId: msg.tool_use_id,
+          name: msg.subagent_type || (isAgent ? 'agent' : 'bash') + ': ' + head,
+          description: msg.description,
+          status: 'running',
+          startedAt: Date.now(),
+          // SDK 0.3.x: agentId in JSONL path == task_id for Task-tool subagents.
+          agentSessionId: isAgent ? msg.task_id : undefined,
+          // Capture initial prompt synchronously — subagent JSONL appears on
+          // disk after a short delay; pane uses this until getSubagentMessages
+          // returns at least 1 message.
+          ...(msg.prompt ? { initialPrompt: msg.prompt } : {}),
+        });
+        return;
+      }
+      if (msg.type === 'system' && msg.subtype === 'task_progress') {
+        upsertBgTask(tabId, msg.task_id, {
+          lastToolName: msg.last_tool_name,
+          summary: msg.summary,
+          totalTokens: msg.usage?.total_tokens,
+          toolUses: msg.usage?.tool_uses,
+          durationMs: msg.usage?.duration_ms,
+        });
+        return;
+      }
+      if (msg.type === 'system' && msg.subtype === 'task_updated') {
+        const patch = msg.patch || {};
+        upsertBgTask(tabId, msg.task_id, {
+          ...(patch.description ? { description: patch.description } : {}),
+          ...(patch.status === 'running' ? { status: 'running' as const } : {}),
+          ...(patch.status === 'completed' ? { status: 'completed' as const } : {}),
+          ...(patch.status === 'failed' || patch.status === 'killed' ? { status: 'failed' as const } : {}),
+          ...(typeof patch.end_time === 'number' ? { endedAt: patch.end_time } : {}),
+        });
+        return;
+      }
+      if (msg.type === 'system' && msg.subtype === 'task_notification') {
+        upsertBgTask(tabId, msg.task_id, {
+          status: msg.status === 'completed' ? 'completed'
+                : msg.status === 'failed' ? 'failed'
+                : msg.status === 'stopped' ? 'stopped'
+                : 'completed',
+          outputFile: msg.output_file,
+          finalSummary: msg.summary,
+          totalTokens: msg.usage?.total_tokens,
+          toolUses: msg.usage?.tool_uses,
+          durationMs: msg.usage?.duration_ms,
+          endedAt: Date.now(),
+        });
+        return;
+      }
+      if (msg.type === 'tool_progress' && msg.task_id) {
+        upsertBgTask(tabId, msg.task_id, {
+          lastToolName: msg.tool_name,
+          durationMs: typeof msg.elapsed_time_seconds === 'number'
+            ? Math.round(msg.elapsed_time_seconds * 1000)
+            : undefined,
+        });
+        return;
+      }
+      // SDK 0.3.x leaks subagent stream events into the parent iterator —
+      // both user AND assistant records carry `parent_tool_use_id` (set to the
+      // parent's Agent tool_use block id) and `subagent_type`. Drop them all:
+      // they belong to the subagent transcript only (TaskDetailPane loads
+      // them via getSubagentMessages from agent-<id>.jsonl). Without this
+      // every Bash/Read tool the subagent ran appeared TWICE — once inside
+      // the subagent pane and a second time as a ghost card in the main
+      // thread under the parent's Agent tool_use card.
+      if ((msg.type === 'user' || msg.type === 'assistant') &&
+          (msg.parent_tool_use_id || msg.subagent_type)) {
+        return;
+      }
+
       // Compact-summary user-record arriving live. Authoritative marker is
       // `isCompactSummary:true` on the user-record (set by SDK). Fallback to
       // canonical phrase for older runs. Capture, attach pending metrics,
@@ -1002,6 +1100,10 @@ function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKT
 
       // Assistant message with content blocks
       if (msg.type === 'assistant' && msg.message?.content) {
+        // [BgProbeR] Diagnostic: what's the subagent-shape on assistant chunks?
+        const isFromSub = !!(msg.parent_tool_use_id || msg.subagent_type);
+        const blockTypes = Array.isArray(msg.message.content) ? msg.message.content.map((b: any) => b?.type).join(',') : 'string';
+        console.warn('[BgProbeR:Assistant] tab=' + tabId.slice(-12) + ' fromSub=' + isFromSub + ' parent=' + (msg.parent_tool_use_id?.slice?.(0,8) || 'null') + ' subagent_type=' + (msg.subagent_type || 'null') + ' blocks=' + blockTypes + ' modelEcho=' + msg.message?.model?.slice?.(0,20));
         // Info-slash command active → capture text-only content into overlay
         // state and DO NOT add to thread. SDK ships /usage / /cost / /status
         // results as plain assistant-text (LocalCommandCall text fallback).
@@ -1373,7 +1475,19 @@ function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKT
     // *after* the snapshot we read still arrives async, but we're committed to
     // one of the two outcomes by the time we decide.
     const sid = sessionIdRef.current;
-    ipcRenderer.invoke('claude-sdk:stop', { tabId });
+    // Collect IDs of any task that's still mid-flight so main can stopTask()
+    // each before query.close(). Without this, subagents spawned by the Agent
+    // tool keep running after Escape (close() only tears down the parent
+    // transport; subagent workers live in separate subprocesses).
+    const runningTaskIds: string[] = (() => {
+      const st = useWorkspaceStore.getState();
+      for (const [, ws] of st.openProjects) {
+        const t = ws.tabs.get(tabId);
+        if (t?.bgTasks) return t.bgTasks.filter(b => b.status === 'running').map(b => b.taskId);
+      }
+      return [];
+    })();
+    ipcRenderer.invoke('claude-sdk:stop', { tabId, runningTaskIds });
     setIsRunning(false);
     updateSDKState(tabId, { sdkState: 'idle' });
 
@@ -1718,6 +1832,17 @@ function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKT
     const usedPct = (lastContextUsedTokens / win) * 100;
     return Math.max(0, Math.min(100, usedPct));
   }, [lastContextUsedTokens, lastResolvedModel, sdkModelAlias]);
+
+  // Mirror the SDK context % to ClaudeControlBar (lives under the Terminal
+  // column). Bar can't read this from main — SDK does not stream through IPC —
+  // so we publish via the same window-event pattern already used elsewhere
+  // ('history-panel:loading'). Bar has its own listener gated by tabId.
+  useEffect(() => {
+    if (contextPercentRemaining == null) return;
+    window.dispatchEvent(new CustomEvent('sdk-context-update', {
+      detail: { tabId, contextPct: contextPercentRemaining, model: currentModelLabel },
+    }));
+  }, [tabId, contextPercentRemaining, currentModelLabel]);
 
   // Escape (or Ctrl+[ / Ctrl+C — Claude TUI aliases): three roles by precedence.
   //   1. Slash-overlay open → close overlay.
@@ -2173,25 +2298,58 @@ function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKT
                   contextPercent={contextPercentRemaining}
                   sessionId={sessionId}
                 />
-              ) : <SDKComposer
-                tabId={tabId}
-                isRunning={isRunning}
-                sessionId={sessionId}
-                wasStopped={wasStopped}
-                onResume={() => setWasStopped(false)}
-                modelLabel={currentModelLabel}
-                contextPercent={contextPercentRemaining}
-                onUserInteract={scrollToBottom}
-                onSessionStop={async () => {
-                  // Double-Ctrl+C from inside the composer = "stop the whole
-                  // session" (matches Claude TUI). Same path as the TabBar dot,
-                  // sidebar chip, ctx menu — surface Resume affordance.
-                  try {
-                    await ipcRenderer.invoke('claude-sdk:stop', { tabId });
-                    window.dispatchEvent(new CustomEvent('claude-sdk:was-stopped', { detail: { tabId } }));
-                  } catch (e: any) { console.error('[ComposerStop] error', e); }
-                }}
-              />}
+              ) : (
+                <>
+                  {expandedTaskId ? (
+                    <TaskDetailPane
+                      tabId={tabId}
+                      taskId={expandedTaskId}
+                      parentSessionId={sessionId}
+                      cwd={cwd || ''}
+                      onClose={() => setExpandedTaskId(null)}
+                    />
+                  ) : (
+                    <SDKComposer
+                      tabId={tabId}
+                      isRunning={isRunning}
+                      sessionId={sessionId}
+                      wasStopped={wasStopped}
+                      onResume={() => setWasStopped(false)}
+                      modelLabel={currentModelLabel}
+                      contextPercent={contextPercentRemaining}
+                      onUserInteract={scrollToBottom}
+                      onSessionStop={async () => {
+                        // Double-Ctrl+C from inside the composer = "stop the whole
+                        // session" (matches Claude TUI). Same path as the TabBar dot,
+                        // sidebar chip, ctx menu — surface Resume affordance.
+                        try {
+                          // Collect running task IDs so subagents get stopTask'd
+                          // before query.close() (otherwise their workers keep
+                          // running detached). Mirrors the Escape onCancel path.
+                          const runningTaskIds: string[] = (() => {
+                            const st = useWorkspaceStore.getState();
+                            for (const [, ws] of st.openProjects) {
+                              const t = ws.tabs.get(tabId);
+                              if (t?.bgTasks) return t.bgTasks.filter(b => b.status === 'running').map(b => b.taskId);
+                            }
+                            return [];
+                          })();
+                          await ipcRenderer.invoke('claude-sdk:stop', { tabId, runningTaskIds });
+                          window.dispatchEvent(new CustomEvent('claude-sdk:was-stopped', { detail: { tabId } }));
+                        } catch (e: any) { console.error('[ComposerStop] error', e); }
+                      }}
+                    />
+                  )}
+                  {/* Bar lives BELOW the composer / detail-pane — sits at the
+                      bottom of the viewport as a thin status strip for any
+                      task that is currently running. Disappears once empty. */}
+                  <BackgroundTasksBar
+                    tabId={tabId}
+                    expandedTaskId={expandedTaskId}
+                    onSelect={setExpandedTaskId}
+                  />
+                </>
+              )}
             </ThreadPrimitive.ViewportFooter>
           </ThreadPrimitive.Viewport>
 
@@ -2219,7 +2377,7 @@ function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKT
 // bubble with a textarea (Save → truncate-and-resend with new text, Cancel →
 // drop edit-state). Repeat truncates and resends the original text.
 // ============================================================
-const UserMsg = () => {
+export const UserMsg = () => {
   const actions = React.useContext(UserMsgActionsContext);
   // Null-guarded selectors — see MessageRoleDispatch comment. Compact and
   // session-rotation paths can briefly desync the store from our messages
@@ -2491,7 +2649,7 @@ const UserTextPart = ({ text }: { text: string }) => {
 //   2. "── Compacted · …" — post-compact divider. Subtle, but NOT the dimmest
 //      possible grey — это значимое событие в треде, юзер хочет видеть метрики.
 //   3. anything else — generic dim grey centered divider (legacy fallback).
-const SystemMsg = () => {
+export const SystemMsg = () => {
   // Null-guarded — see MessageRoleDispatch comment about /compact sync gap.
   const text = useMessage((m: any) => {
     try {
@@ -2747,7 +2905,7 @@ function bumpMsgRender() {
   }
 }
 
-const AssistantMsg = () => {
+export const AssistantMsg = () => {
   bumpMsgRender();
   // Discriminate by id prefix — compact-summary entries ride on assistant
   // role (assistant-ui doesn't allow custom roles) but render in a totally

@@ -45,6 +45,20 @@ interface Tab {
   wasInterrupted?: boolean; // True if tab was closed with active AI session (show resume overlay)
   overlayDismissed?: boolean; // True if user dismissed the interrupted overlay (don't show again)
   notes?: string; // Tab-specific notes
+  /**
+   * User-assigned semantic status of the session. Independent of runtime type
+   * (claude/sdk/gemini/dev) and busy state. Set via right-click context menu.
+   * Rendered as a colored SVG marker on the left of the tab in vertical mode.
+   *   dev       — идёт разработка (активная работа)
+   *   bugfix    — отложенный багфикс (не решено сейчас, ждёт)
+   *   knowledge — отложенные знания (нужно записать в md)
+   * Absence (undefined) = без статуса, маркер не показывается.
+   * Тип string — юзер может создавать/удалять статусы в Settings → Системные.
+   * Default seed id'ы — 'dev'|'bugfix'|'knowledge', но любой custom id допустим.
+   * Если id больше нет в useUIStore.sessionStatuses → маркер не рендерится
+   * (graceful degrade), значение в БД сохраняется.
+   */
+  sessionStatus?: string;
   isCollapsed?: boolean; // Collapsed tab — icon-only, for archiving completed sessions
   claudeAgentSessionId?: string; // Claude Agent SDK session ID (for @claude:...@end orchestration)
   claudeAgentStatus?: 'idle' | 'running' | 'done' | 'error' | 'summarizing'; // Claude Agent current status
@@ -68,6 +82,34 @@ interface Tab {
   sdkModel?: string; // Model for next SDK query
   sdkEffort?: string; // Effort level for next SDK query
   sdkThinking?: boolean; // Thinking enabled for next SDK query
+  // Background tasks: live state for Agent/Bash subagents and background bash
+  // commands that have been moved off the foreground turn. Populated from SDK
+  // task_started / task_progress / task_updated / task_notification events.
+  // NOT persisted: rebuilt from JSONL on next session open via getSubagentMessages.
+  bgTasks?: BgTask[];
+}
+
+export type BgTaskKind = 'agent' | 'bash';
+export type BgTaskStatus = 'running' | 'completed' | 'failed' | 'stopped';
+export interface BgTask {
+  taskId: string;          // SDK task_id (stable across task_started→task_notification)
+  toolUseId?: string;       // The tool_use block that started this task (Agent / Bash)
+  kind: BgTaskKind;
+  name: string;            // Display name: subagent_type for agents, command head for bash
+  description?: string;    // For agents: task description from task_started
+  initialPrompt?: string;  // For agents: full prompt the parent gave to the subagent (rendered as the first user-bubble in the pane mini-thread)
+  status: BgTaskStatus;
+  startedAt: number;       // ms timestamp from first task_started
+  endedAt?: number;
+  lastToolName?: string;   // From task_progress.last_tool_name (agents)
+  summary?: string;        // From task_progress.summary (agents, agentProgressSummaries:true)
+  agentSessionId?: string;  // Subagent JSONL agentId (== task_id in current SDK)
+  outputFile?: string;     // For bash: path from task_notification.output_file
+  finalSummary?: string;   // From task_notification.summary (final assistant text / bash tail)
+  totalTokens?: number;
+  toolUses?: number;
+  durationMs?: number;
+  isError?: boolean;
 }
 
 interface ProjectWorkspace {
@@ -135,6 +177,7 @@ interface WorkspaceStore {
 
   // Tab color and utility
   setTabColor: (projectId: string, tabId: string, color: TabColor, manual?: boolean) => void;
+  setTabSessionStatus: (projectId: string, tabId: string, status: string | null) => void;
   setTabCommandType: (tabId: string, commandType: CommandType) => void; // Also sets auto-color on first run
   toggleTabUtility: (projectId: string, tabId: string) => void;
   toggleTabCollapsed: (projectId: string, tabId: string) => void;
@@ -193,6 +236,10 @@ interface WorkspaceStore {
   createSDKTab: (projectId: string) => Promise<string>;
   convertToSDKTab: (tabId: string) => void;
   updateSDKState: (tabId: string, state: Partial<Pick<Tab, 'sdkState' | 'sdkMessages' | 'claudeSessionId' | 'sdkModel' | 'sdkEffort' | 'sdkThinking'>>) => void;
+  // Merge a partial BgTask patch by taskId. Creates the entry if missing.
+  // status terminal transition ('completed'|'failed'|'stopped') also sets endedAt.
+  upsertBgTask: (tabId: string, taskId: string, patch: Partial<BgTask>) => void;
+  removeBgTask: (tabId: string, taskId: string) => void;
 
   // Helpers
   getActiveTab: (projectId: string) => Tab | null;
@@ -262,6 +309,7 @@ const saveTabs = (projectId: string, tabs: Map<string, Tab>, forceCleanup = fals
     activeView: tab.activeView,
     createdAt: tab.createdAt,
     isCollapsed: tab.isCollapsed,
+    sessionStatus: tab.sessionStatus,
     nameSetManually: tab.nameSetManually,
     parentTabId: tab.parentTabId,
     mcpTaskId: tab.mcpTaskId,
@@ -385,6 +433,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
               url: savedTab.url,
               createdAt: savedTab.createdAt,
               isCollapsed: savedTab.isCollapsed,
+              sessionStatus: savedTab.sessionStatus,
               nameSetManually: savedTab.nameSetManually,
               parentTabId: savedTab.parentTabId,
               mcpTaskId: savedTab.mcpTaskId,
@@ -628,6 +677,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
               url: savedTab.url,
               createdAt: savedTab.createdAt,
               isCollapsed: savedTab.isCollapsed,
+              sessionStatus: savedTab.sessionStatus,
               nameSetManually: savedTab.nameSetManually,
               parentTabId: savedTab.parentTabId,
               mcpTaskId: savedTab.mcpTaskId,
@@ -1213,6 +1263,21 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         saveTabs(workspace.projectId, workspace.tabs);
       }
     }
+  },
+
+  setTabSessionStatus: (projectId, tabId, status) => {
+    const { openProjects } = get();
+    const workspace = openProjects.get(projectId);
+    if (!workspace) return;
+    const tab = workspace.tabs.get(tabId);
+    if (!tab) return;
+    if (status === null) {
+      delete tab.sessionStatus;
+    } else {
+      tab.sessionStatus = status;
+    }
+    set({ openProjects: new Map(openProjects) });
+    saveTabs(workspace.projectId, workspace.tabs);
   },
 
   setTabCommandType: (tabId, commandType) => {
@@ -1805,18 +1870,69 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       if (tab) {
         // Guard: skip if all values unchanged (prevents polling spam re-renders)
         let changed = false;
+        let sidChanged = false;
         for (const key of Object.keys(state) as (keyof typeof state)[]) {
-          if ((tab as any)[key] !== state[key]) { changed = true; break; }
+          if ((tab as any)[key] !== state[key]) {
+            changed = true;
+            if (key === 'claudeSessionId') sidChanged = true;
+          }
         }
         if (!changed) return;
 
         console.warn('[Store:updateSDKState] tabId=' + tabId + ' keys=' + Object.keys(state).join(',') + ' claudeSessionId=' + (state as any).claudeSessionId);
         Object.assign(tab, state);
+        // Persist sid to SQLite — without this an SDK tab loses its session
+        // mapping on Electron restart (UI shows "Waiting for session" even
+        // though JSONL exists on disk). Mirrors setClaudeSessionId; ephemeral
+        // state (sdkState / sdkMessages) skip the disk write.
+        if (sidChanged) saveTabs(workspace.projectId, workspace.tabs);
         set({}); // Trigger Zustand notify — primitive selectors detect change
         return;
       }
     }
     console.warn('[Store:updateSDKState] TAB NOT FOUND tabId=' + tabId);
+  },
+
+  upsertBgTask: (tabId, taskId, patch) => {
+    const { openProjects } = get();
+    for (const [, workspace] of openProjects) {
+      const tab = workspace.tabs.get(tabId);
+      if (!tab) continue;
+      const list = tab.bgTasks ? [...tab.bgTasks] : [];
+      const idx = list.findIndex(t => t.taskId === taskId);
+      const isTerminal = patch.status === 'completed' || patch.status === 'failed' || patch.status === 'stopped';
+      if (idx === -1) {
+        list.push({
+          taskId,
+          kind: patch.kind || 'agent',
+          name: patch.name || taskId.slice(0, 8),
+          status: patch.status || 'running',
+          startedAt: patch.startedAt || Date.now(),
+          ...patch,
+          ...(isTerminal && !patch.endedAt ? { endedAt: Date.now() } : {}),
+        } as BgTask);
+      } else {
+        list[idx] = {
+          ...list[idx],
+          ...patch,
+          ...(isTerminal && !list[idx].endedAt && !patch.endedAt ? { endedAt: Date.now() } : {}),
+        };
+      }
+      tab.bgTasks = list;
+      set({}); // Notify primitive selectors
+      return;
+    }
+  },
+
+  removeBgTask: (tabId, taskId) => {
+    const { openProjects } = get();
+    for (const [, workspace] of openProjects) {
+      const tab = workspace.tabs.get(tabId);
+      if (!tab || !tab.bgTasks) continue;
+      tab.bgTasks = tab.bgTasks.filter(t => t.taskId !== taskId);
+      set({});
+      return;
+    }
   },
 
   getActiveTab: (projectId) => {

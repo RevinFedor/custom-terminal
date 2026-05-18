@@ -11,8 +11,14 @@
 | Compress | `Minimize2` (lucide) | Сжать логи из буфера обмена (см. `utils/compressLogs.ts`). |
 | Browser | `Globe` (lucide) | Открыть в-проектный browser-таб. |
 | VS Code | `VscVscode` (`react-icons/vsc`) | `exec('code .', { cwd })` — cwd активного таба или fallback на `project.path`. |
+| GT Editor | `FileEdit` (lucide) | `shell.openExternal('gteditor://open?folder=<cwd>')` — фокусирует уже запущенный GT Editor (или cold-launch'ит) через macOS LaunchServices URL scheme. Если cwd не зарегистрирована в `gt-directories` — gt-editor добавит молча. Внутри редактора `Ctrl+G` принимает `path:line:col` — паттерн «скопировал ссылку на ошибку из терминала → Cmd-кликнул сюда → Ctrl+G → paste → Enter». |
 | SemanticIndex | переменная (см. ниже) | Статус `.semantic-index.json`; клик = переиндексация. |
 | Resume All | `RotateCcw` + badge | Появляется ТОЛЬКО если `interruptedTabs.length > 0` для текущего проекта. |
+| *— flex spacer —* |  | Дальнейшие кнопки прижаты к правому краю. |
+| Docs | `BookOpen` (lucide) | Popover с `ActionsPanel embedded` (Update Docs / Update API → Haiku pipeline). Раньше жил в InfoPanel-сайдбаре `КОМАНДЫ`-блоком — после удаления правой колонки переехал сюда. |
+| Copy session + chips | `Copy` + 9-chip row | `CopySessionButton` + ряд чипов выбора секций (👤/✦/answer/thinking/read/edit/bash/mcp/⑂fork/sub-pill) в **две** строки чтобы не растягивать toolbar по высоте. Рендерится ТОЛЬКО когда у активной вкладки есть Claude/Gemini-сессия — toolbar collapses gracefully на Home / browser-табах. |
+
+**Pair-aligned popover'ы.** Оба popover'а (Docs и Copy-session) открываются downward-right-aligned относительно триггера: `top: bRect.bottom + 6, right: window.innerWidth - bRect.right`. Это сохраняет одну нижнюю горизонталь между двумя popover'ами, и убирает зависимость от viewport-left-edge (раньше Copy popover открывался центр-влево от триггера — на правом краю окна он мог вылетать за viewport). Статичное правило, а не runtime-расчёт «куда умещается»: проще для предсказуемого muscle memory, минус один источник позиционных багов.
 
 **Что было до и почему изменилось:** до этой сессии VS Code был привязан к хоткею `Cmd+.` без UI-кнопки. Хоткей был неоткрываемым (юзер на него натыкался случайно), плюс конфликтовал с системными окнами, которые тоже слушают `Cmd+.`. Решение — снять хоткей полностью (в `src/renderer/App.tsx` весь блок удалён, в `SettingsModal::SHORTCUTS` строка `⌘ + \` снята; реальный хоткей вообще был на `.`, не `\` — там в любом случае было расхождение текста и кода) и добавить видимую кнопку. Cmd+. больше нигде не висит.
 
@@ -25,7 +31,11 @@
 | Idle, всё актуально | `CircleCheck` зелёный | `#22c55e` | `<fresh>` (одно число) |
 | Idle, есть устаревшие/новые | `CircleCheck` зелёный + `AlertTriangle` амбер | `#22c55e` + `#d97706` | `<fresh>` ⚠ `<stale+new>` |
 | Idle, индекса нет | `AlertTriangle` амбер | `#d97706` | `no index` |
-| Running | `Loader2` амбер (вращение) | `#d97706` | `<done>/<outdated_total>` |
+| Running | `Loader2` амбер (вращение) + фиолетовый чип параллелизма | `#d97706` + `#a855f7` | `<done>/<outdated_total>` ×`<parallelism>` |
+
+**Третий чип (фиолетовый ×N) появляется только в Running.** Берётся из `rebuild-started` payload (зеркалит реально работающее N воркеров), а не из текущего значения `useUIStore.semanticIndexParallelism`. При смене настройки mid-rebuild чип остаётся прежним — новое N применится к следующему запуску.
+
+**ПКМ на кнопке → открывает Settings на вкладке «Системные».** Реализовано через `window.dispatchEvent(new CustomEvent('settings:open', { detail: { tab: 'colors' } }))`; App.tsx слушает событие, выставляет `settingsInitialTab` и открывает модалку. Mechanism work for всех состояний кнопки (idle/no-index/running). Без этого юзеру пришлось бы помнить путь Cmd+, → таб «Системные».
 
 **Янтарный, не жёлтый** — `#d97706` (`amber-600` в Tailwind palette). По правилу из CLAUDE.md секция «AI-Optimized UI & Video Forensics»: чистый жёлтый плохо читается на тёмной теме, янтарь сохраняет читаемость и в скринкастах.
 
@@ -70,6 +80,15 @@ success = code===0
 См. `methodology/design.md::Success ≠ exit code: валидация по содержимому, не по факту завершения`.
 
 **Pre-flight гарда:** перед spawn'ом проверяем `CLAUDE.md.bak` в корне. Если существует — отказываемся стартовать с тостом «delete it before rebuilding (previous run crashed)». Без этой проверки скрипт сам бы вышел с `exit 1` (там есть свой check), но в UI это бы выглядело как «короткий лоадер → красный тост `exit code 1`» без понятной причины — пользователь не должен открывать лог чтобы выяснить почему.
+
+**Parallelism wiring (Settings → Системные → Параллельные воркеры):**
+
+- `useUIStore.semanticIndexParallelism` (localStorage-only, 1..20, default 10).
+- При клике на SemanticIndexButton renderer передаёт значение в `semantic-index:rebuild` IPC.
+- `rebuildIndex(projectId, mw, { parallelism })` в main clamp'ит к [1, 20], сохраняет в `state.rebuildParallelism` и спавнит `bash scripts/ai/build-index.sh --parallel <N>`.
+- `rebuild-started` IPC payload включает `parallelism` — renderer показывает фиолетовый чип сразу, без ожидания `get-status`.
+- `get-status` возвращает `rebuildParallelism` — переключение проекта mid-rebuild не теряет чип.
+- Не доверяем raw значению из renderer (вдруг кто-то bypass'ит UI) — clamp на main-стороне обязателен.
 
 ## stdout-маркеры скрипта
 

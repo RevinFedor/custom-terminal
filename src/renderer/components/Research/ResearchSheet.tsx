@@ -7,6 +7,25 @@ import ChatArea from './ChatArea';
 import ResearchInput from './ResearchInput';
 import Tooltip from '../UI/Tooltip';
 
+const { ipcRenderer } = window.require('electron');
+
+// AI Sessions history — flat list of API call records persisted in main process.
+// Used to live as a separate "AI Sessions" tab in the right sidebar; moved here
+// when the user collapsed the right sidebar down to a single Info tab.
+// Каждая запись — один вызов update_docs / research / adopt с моделью и токенами.
+interface ApiCallEntry {
+  id: number;
+  call_type: string;
+  model: string | null;
+  input_tokens: number;
+  output_tokens: number;
+  result_text: string | null;
+  source_tab_id: string | null;
+  target_tab_id: string | null;
+  payload_size: number;
+  created_at: number;
+}
+
 interface ResearchSheetProps {
   projectId: string;
   projectPath: string;
@@ -30,6 +49,24 @@ export default function ResearchSheet({ projectId, projectPath }: ResearchSheetP
   const { getPromptById, savePrompt } = usePromptsStore();
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const [showSettings, setShowSettings] = useState(false);
+  // AI Sessions history — fetched lazily when popover opens. We don't subscribe
+  // to live updates because the list is for inspection, not for streaming work.
+  const [showHistory, setShowHistory] = useState(false);
+  const [apiCalls, setApiCalls] = useState<ApiCallEntry[]>([]);
+  const [expandedApiCallId, setExpandedApiCallId] = useState<number | null>(null);
+  useEffect(() => {
+    if (!showHistory) return;
+    ipcRenderer.invoke('api-calls:list', { limit: 50 }).then((r: any) => {
+      if (r?.success && r.data) setApiCalls(r.data);
+    }).catch(() => {});
+  }, [showHistory]);
+  const getTimeAgo = (timestamp: number) => {
+    const seconds = Math.floor((Date.now() - timestamp * 1000) / 1000);
+    if (seconds < 60) return 'just now';
+    if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+    if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
+    return `${Math.floor(seconds / 86400)}d ago`;
+  };
 
   const conversation = getActiveConversation(projectId);
   const messages = conversation?.messages || [];
@@ -311,6 +348,129 @@ export default function ResearchSheet({ projectId, projectPath }: ResearchSheetP
               </div>
 
               <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                {/* AI Sessions history popover trigger — был отдельной вкладкой
+                    в правом сайдбаре («AI Sessions» / GeminiPanel). После
+                    upstream-cleanup'а sidebar остался один Info-таб, история
+                    переехала сюда — рядом с другими AI-контролями. */}
+                <div style={{ position: 'relative' }}>
+                  <button
+                    onClick={() => setShowHistory(v => !v)}
+                    title="История вызовов AI"
+                    style={{
+                      fontSize: '11px',
+                      color: showHistory ? '#fff' : '#888',
+                      background: showHistory ? 'rgba(255,255,255,0.06)' : 'transparent',
+                      border: '1px solid ' + (showHistory ? 'rgba(255,255,255,0.20)' : 'rgba(255,255,255,0.10)'),
+                      borderRadius: '6px',
+                      padding: '4px 10px',
+                      cursor: 'pointer',
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '4px',
+                      transition: 'all 0.15s ease',
+                    }}
+                  >
+                    <span style={{ fontSize: 12, lineHeight: 1 }}>⌃</span>
+                    <span>History</span>
+                    {apiCalls.length > 0 && (
+                      <span style={{ fontSize: 10, color: '#666', marginLeft: 4 }}>{apiCalls.length}</span>
+                    )}
+                  </button>
+                  {showHistory && (
+                    <>
+                      {/* Click-outside catcher */}
+                      <div
+                        onClick={() => setShowHistory(false)}
+                        style={{ position: 'fixed', inset: 0, zIndex: 60 }}
+                      />
+                      <div
+                        style={{
+                          position: 'absolute',
+                          top: 'calc(100% + 6px)',
+                          right: 0,
+                          width: 420,
+                          maxHeight: 480,
+                          overflowY: 'auto',
+                          backgroundColor: '#222',
+                          border: '1px solid #444',
+                          borderRadius: 8,
+                          padding: 8,
+                          boxShadow: '0 8px 24px rgba(0,0,0,0.6)',
+                          zIndex: 70,
+                        }}
+                      >
+                        {apiCalls.length === 0 ? (
+                          <div style={{ fontSize: 11, color: '#666', textAlign: 'center', padding: 16 }}>
+                            История пуста
+                          </div>
+                        ) : (
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                            {apiCalls.map((call) => {
+                              const isExpanded = expandedApiCallId === call.id;
+                              const typeColors: Record<string, string> = {
+                                adopt: '#6366f1',
+                                update_docs: '#f59e0b',
+                                research: '#0ea5e9',
+                              };
+                              const color = typeColors[call.call_type] || '#888';
+                              const tokensIn = call.input_tokens > 1000 ? (call.input_tokens / 1000).toFixed(1) + 'K' : call.input_tokens;
+                              const tokensOut = call.output_tokens > 1000 ? (call.output_tokens / 1000).toFixed(1) + 'K' : call.output_tokens;
+                              const payloadKB = call.payload_size > 0 ? Math.round(call.payload_size / 1024) + 'KB' : null;
+                              return (
+                                <div
+                                  key={call.id}
+                                  onClick={() => setExpandedApiCallId(isExpanded ? null : call.id)}
+                                  style={{
+                                    backgroundColor: '#2a2a2a',
+                                    borderRadius: 4,
+                                    cursor: 'pointer',
+                                  }}
+                                >
+                                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 8px' }}>
+                                    <span style={{
+                                      fontSize: 9,
+                                      color,
+                                      backgroundColor: color + '20',
+                                      padding: '1px 5px',
+                                      borderRadius: 3,
+                                      fontWeight: 600,
+                                    }}>
+                                      {call.call_type}
+                                    </span>
+                                    <span style={{ fontSize: 10, color: '#888', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                      {call.model || '—'}
+                                    </span>
+                                    <span style={{ fontSize: 10, color: '#666' }}>{tokensIn}/{tokensOut}</span>
+                                    <span style={{ fontSize: 10, color: '#555' }}>{getTimeAgo(call.created_at)}</span>
+                                  </div>
+                                  {isExpanded && call.result_text && (
+                                    <div style={{
+                                      padding: '6px 10px',
+                                      borderTop: '1px solid #333',
+                                      fontSize: 10,
+                                      color: '#aaa',
+                                      maxHeight: 220,
+                                      overflow: 'auto',
+                                      whiteSpace: 'pre-wrap',
+                                      lineHeight: 1.4,
+                                    }}>
+                                      {payloadKB && (
+                                        <div style={{ color: '#666', marginBottom: 4 }}>
+                                          Payload: {payloadKB} | Tokens: {tokensIn} in / {tokensOut} out
+                                        </div>
+                                      )}
+                                      {call.result_text}
+                                    </div>
+                                  )}
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </div>
+                    </>
+                  )}
+                </div>
                 {/* Copy last response button */}
                 {lastAssistantResponse && (
                   <Tooltip content="Скопировать последний ответ">

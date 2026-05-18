@@ -121,3 +121,37 @@ UI настроек копирования организован в три ве
 
 **Implementation note:** `formatToolAction` уже корректно возвращает label-only когда `shouldInclude=false` — старый pre-filter `if (!groupOn) continue;` в callsite был избыточен и блокировал label. Удалён в обоих callsite (`claude:copy-range`, `claude:export-clean-session`). Классификация `group` сохранилась — она нужна для оптимизации: поиск `toolResult` в активной истории делается ТОЛЬКО когда `groupOn=true` (когда detail-блок реально понадобится), иначе пропускается. На длинных диапазонах с 400+ tool_use экономит O(N×M) поиск.
 
+## Range Token Estimate + Breakdown popover
+
+В Timeline range-action popup на чипе `↑XXK` (рядом с кнопкой «Копировать») показывается **верхняя оценка размера копии** — суммарные токены при условии что ВСЕ copy toggle'ы ON. Это не реальный размер текущей копии (toggle'ы могут срезать); это "максимум, который мог бы попасть в clipboard". При hover на чип открывается второй popover (под action menu, слева прижат к Timeline) с breakdown по категориям: User / Claude · text / Claude · thinking / Read / Edit · Write / Bash · shell / MCP · web · прочее / Субагент · result / Субагент · history / Compact summary. Категории с нулём токенов скрыты — чтобы не показывать 10 пустых строк.
+
+**Backend:** IPC `claude:estimate-range-tokens` (claude-data.js). Реюзает тот же `resolveSessionChain` + backtrace + forward-expand что и `claude:copy-range`. Считает `chars` по категориям и конвертирует в токены формулой `Math.ceil(chars/3.5)` (стандартная Anthropic-эвристика). `tool_use.input` сериализуется через `JSON.stringify` (минус CLI-шум `caller`), `tool_result.content`: string как есть, array — text-блоки склейкой, image-блоки → placeholder `[image: image/png, ~NKB base64 omitted]` (та же длина что в копии). Не дёргается на каждое движение мыши — только один раз при открытии rangeActionMenu.
+
+**Frontend:** Timeline.tsx state `tokenEstimate: { total, downTotal, apiInputTokens, apiOutputTokens, categories }`, useEffect фетчит при изменении `rangeActionMenu.startUuid/endUuid`. Single-entry chip в Cmd+hover tooltip'е — lazy fetch на hover с кэшем по uuid (`singleCachedUuidRef`), чтобы хождение мышкой не дёргало backend. Popover в TooltipPortal: range — anchored right (`popupRightPx`), single — `left: chipRect.left`. `useLayoutEffect` flip-up logic: если `chipRect.bottom + popHeight > viewport.bottom - 10`, инвертируется (top: chipRect.top, transform: translateY(-100%)).
+
+**Hit-test через глобальный mousemove, не onMouseLeave.** Popover монтируется conditional (`{open && <Portal>…</Portal>}`) — на `onMouseLeave` с chip-а wrapper unmount'ится в том же тике, до того как курсор пересечёт gap, и `mouseenter` на popover'е не выстреливает. Архитектура closing-логики: глобальный `window.addEventListener('mousemove', …)` активен только пока `open=true`, считает курсор внутри chip-rect ИЛИ popover-rect (с tolerance ±2px) → если вне обоих, `setOpen(false)`. `onMouseLeave` на chip-е и popover'е **не вешать** — они отрабатывают раньше и закрывают popover до того как hit-test может удержать. См. `methodology/design-bugs.md::2.7 Lazy popover wrapper`.
+
+**mousedown stopPropagation на корневом div'е popover'а** (`onMouseDown={(e) => e.stopPropagation()}` + тот же `onClick`). Без этого клик по toggle-кнопке `JSONL`/`API` внутри popover'а закрывает родительский rangeActionMenu (родитель слушает `window.mousedown` для click-outside). `onClick` сам по себе не помогает: mousedown bubble'ит первым, родитель уже сбросил state до того как handler кнопки выстрелит. Симптом — *«кнопка тупо не работает»*. См. `methodology/design-bugs.md::4.6`.
+
+**Gemini fallback:** `claude:estimate-range-tokens` доступен только для Claude-табов. Для Gemini `tokenEstimate=null`, чип показывает старую heuristic-оценку (сумма `entry.content.length/3.5` по user-prompt'ам в range), без breakdown — hover не открывает popover. Симметрично с copy-range backend'ом (Gemini идёт через `gemini:copy-range`, не делит на категории).
+
+**Защита от закрытия action menu** при hover на breakdown popover: `onMouseLeave` rangeActionMenu делает геометрический hit-test против `breakdownPopoverRef.current.getBoundingClientRect()` — если курсор внутри popover'а, action menu не закрывается. То же для Cmd+hover entry tooltip'а — он слушает hit-test против `singleBreakdownPopoverRef`. Без этого пересечение gap между родителем и popover'ом убивает родительский overlay.
+
+## Range Token Estimate: JSONL/API toggle в popover'е
+
+В верху breakdown popover'а — две кнопки-таба `JSONL` / `API`, общий `breakdownMode` state для range и single popover'ов (выбор сохраняется в сессии, переключается раз).
+
+**JSONL mode (default):** 10 категорий + total `В JSONL`. Считает суммарный вес записей в JSONL для диапазона. Отвечает на задачу юзера *«если я вырежу этот ответ, сколько сэкономлю относительно всего контекста»* — реальная экономия при delete-range/edit-range. См. принцип `methodology/design.md::Метрика-инвариант`.
+
+**API mode:** две строки.
+- **Input** = сумма всех 3 входных полей `usage` (`input_tokens` + `cache_creation_input_tokens` + `cache_read_input_tokens`) по всем assistant entries в range. Слагаемое добавляется **только если поле есть** в JSONL — никакого zero-fill для отсутствующих. Юзер сформулировал явно: *«если кэш передаётся, считаем; если нет — не считаем»*.
+- **Output** = сумма `output_tokens` по всем assistants в range.
+
+`apiInputTokens` авторитетен (Anthropic-stamped); `apiOutputTokens` дублирует `downTotal` (тот же `output_tokens`), но кладётся отдельным полем чтобы API-mode был self-contained блоком.
+
+**Почему `↓` убран с chip-а целиком.** Раньше chip показывал `↑XXK ↓YYK` — output_tokens API рядом с heuristic'ом JSONL-веса. Юзер: *«как мне это понимать?»* — `↑` и `↓` ходят по разным шкалам (JSONL chars/3.5 ≠ Anthropic billing tokens), их сумма не имеет смысла, разница тем более. Сейчас chip = одно число (`↑` = JSONL-вес), `↓` живёт только внутри API-mode popover'а как часть осознанного выбора режима. См. `methodology/design.md::Метрика-инвариант`.
+
+## Переименование `text` → `answer` в category labels
+
+Категория Claude-ответа в Copy Settings popup, в InfoPanel mini-chip row и в breakdown popover теперь называется **«answer»**, не «text». Мотивация: `text` родовое — *«непонятно что такое текст, слишком общее описание»*. Под `text` могли неоднозначно подразумеваться thinking-блоки, текст внутри tool_use (input parameters), результаты tool_use; `answer` однозначно про финальный текст ответа Claude юзеру. См. принцип `methodology/design.md::Категориальные toggle — имена сущностей, не абстракции`. Затронутые места — `CopySessionButton.tsx::ToggleRow «answer»`, `InfoPanel.tsx::ChipText «answer»`, `Timeline.tsx::renderBreakdownBody` (`Claude · answer`).
+

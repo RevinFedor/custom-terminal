@@ -1328,9 +1328,9 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
             metaRows={metaRows}
             notes={tab.notes}
             split
-            disableResize
             pointerThrough
             isLocked={activePopover.isLocked}
+            source="home-active"
           />
         );
       })()}
@@ -1354,9 +1354,9 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
             metaRows={metaRows}
             notes={entry.notes}
             split
-            disableResize
             pointerThrough
             isLocked={historyPopover.isLocked}
+            source="home-history"
           />
         );
       })()}

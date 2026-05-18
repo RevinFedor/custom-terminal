@@ -771,6 +771,255 @@ function register({ projectManager, formatToolAction }) {
     }
   });
 
+  // Estimate token breakdown for a range — "max upper bound" assuming ALL toggles ON.
+  // Used by Timeline range-action popup to show ↑XXK + hover breakdown by category.
+  // Renderer doesn't replicate the copy pipeline; backend walks the same backtrace +
+  // forward-expand as copy-range, then categorizes chars by (entry.type × tool group).
+  ipcMain.handle('claude:estimate-range-tokens', async (event, { sessionId, cwd, startUuid, endUuid }) => {
+    if (!sessionId) return { success: false, error: 'No session ID' };
+    try {
+      const { mergedMap: recordMap, lastRecord, sessionBoundaries } = await resolveSessionChain(sessionId, cwd);
+      if (!lastRecord) return { success: false, error: 'No records found' };
+
+      // BACKTRACE — identical to copy-range above.
+      const activeHistory = [];
+      let current = lastRecord.uuid;
+      const seen = new Set();
+      while (current && !seen.has(current)) {
+        seen.add(current);
+        const record = recordMap.get(current);
+        if (!record) {
+          let recovered = false;
+          if (activeHistory.length > 0) {
+            const lastAdded = activeHistory[0];
+            if (lastAdded.type === 'system' && lastAdded.subtype === 'compact_boundary' &&
+                lastAdded.logicalParentUuid === current) {
+              if (lastAdded.parentUuid && recordMap.has(lastAdded.parentUuid) && !seen.has(lastAdded.parentUuid)) {
+                current = lastAdded.parentUuid;
+                recovered = true;
+              } else {
+                let bestPred = null;
+                for (const [uuid, entry] of recordMap) {
+                  if (seen.has(uuid)) continue;
+                  if (entry._fromFile === lastAdded._fromFile &&
+                      entry._fileIndex < lastAdded._fileIndex) {
+                    if (!bestPred || entry._fileIndex > bestPred._fileIndex) bestPred = entry;
+                  }
+                }
+                if (bestPred) { current = bestPred.uuid; recovered = true; }
+              }
+            }
+          }
+          if (recovered) continue;
+          break;
+        }
+        activeHistory.unshift(record);
+        let nextUuid = record.logicalParentUuid || record.parentUuid;
+        if (!nextUuid && sessionBoundaries.length > 0) {
+          for (const [uuid, entry] of recordMap) {
+            if (seen.has(uuid)) continue;
+            if (entry._isBridge && entry.parentUuid && entry.sessionId !== record.sessionId &&
+                !seen.has(entry.parentUuid)) { nextUuid = entry.parentUuid; break; }
+          }
+          if (!nextUuid && record.sessionId) {
+            const boundary = sessionBoundaries.find(b => b.childSessionId === record.sessionId);
+            if (boundary) {
+              let parentLast = null;
+              for (const [uuid, entry] of recordMap) {
+                if (seen.has(uuid)) continue;
+                if (entry._fromFile === boundary.parentSessionId) {
+                  if (!parentLast || entry._fileIndex > parentLast._fileIndex) parentLast = entry;
+                }
+              }
+              if (parentLast) nextUuid = parentLast.uuid;
+            }
+          }
+        }
+        current = nextUuid;
+      }
+
+      const startIndex = activeHistory.findIndex(e => e.uuid === startUuid);
+      const endIndex = activeHistory.findIndex(e => e.uuid === endUuid);
+      if (startIndex === -1 || endIndex === -1) {
+        return { success: false, error: 'Selected range not found in active history' };
+      }
+      const minIdx = Math.min(startIndex, endIndex);
+      let maxIdx = Math.max(startIndex, endIndex);
+
+      // Forward-expand — same guard as copy-range so the LAST turn's tool_result chain counts in.
+      for (let i = maxIdx + 1; i < activeHistory.length; i++) {
+        const entry = activeHistory[i];
+        if (entry.type === 'system' && entry.subtype === 'compact_boundary') break;
+        if (entry.type === 'user' && !entry.isSidechain) {
+          const nc = entry.message?.content;
+          const isToolResult = Array.isArray(nc) && nc.some(b => b && b.type === 'tool_result');
+          const ncStr = typeof nc === 'string' ? nc : '';
+          const isTaskNotif = ncStr.startsWith('<task-notification>');
+          const isSyntheticCmd = ncStr.startsWith('<command-name>')
+            || ncStr.startsWith('<local-command-stdout>')
+            || ncStr.startsWith('<local-command-caveat>')
+            || ncStr.startsWith('<bash-notification>')
+            || ncStr.startsWith('<system-reminder>')
+            || ncStr.startsWith('Caveat: The messages below');
+          if (!isToolResult && !isTaskNotif && !isSyntheticCmd) break;
+        }
+        maxIdx = i;
+      }
+
+      const range = activeHistory.slice(minIdx, maxIdx + 1);
+
+      // Char accumulator per category. Final tokens = ceil(chars/3.5).
+      const chars = {
+        user: 0, claudeText: 0, claudeThinking: 0,
+        read: 0, edit: 0, bash: 0, tools: 0,
+        subagentResult: 0, subagentHistory: 0,
+        compact: 0,
+      };
+      // Authoritative downstream token count from assistant.message.usage.output_tokens.
+      // Same source as the `responseTokens` field on user-entries in claude:get-timeline,
+      // but summed directly across all assistant entries in the range — covers turns
+      // where look-ahead didn't attach a responseTokens to the user-entry yet (e.g. last
+      // turn still streaming, or selection ends mid-turn).
+      let downTokens = 0;
+      // API metrics — what Anthropic actually billed for this range. apiInputTokens =
+      // sum of every present input-side field: input_tokens (uncached prompt) +
+      // cache_creation_input_tokens (first time cached, 1.25× cost) +
+      // cache_read_input_tokens (subsequent reads, 0.1× cost). Each summand is added
+      // only when the field exists (no synthetic zero-fill). Output mirrors the JSONL
+      // ↓ but kept separate so the API mode is one self-contained block.
+      let apiInputTokens = 0;
+      let apiOutputTokens = 0;
+
+      // Same tool→group classifier as the inline ones in copy-range (and getToolGroup).
+      const classifyTool = (name) => {
+        if (name === 'Read' || name === 'NotebookRead') return 'read';
+        if (name === 'Edit' || name === 'Write' || name === 'NotebookEdit') return 'edit';
+        if (name === 'Bash' || name === 'Monitor' || name === 'Grep' || name === 'Glob') return 'bash';
+        if (name === 'Task' || name === 'Agent') return 'subagent';
+        return 'tools';
+      };
+
+      // Match tool_result to its tool_use by id — same lookup as copy-range.
+      const resultByUseId = new Map();
+      for (const entry of range) {
+        if (entry.type === 'user' && Array.isArray(entry.message?.content)) {
+          for (const b of entry.message.content) {
+            if (b && b.type === 'tool_result' && b.tool_use_id) {
+              const rc = b.content;
+              let resStr = '';
+              if (typeof rc === 'string') resStr = rc;
+              else if (Array.isArray(rc)) {
+                for (const blk of rc) {
+                  if (!blk) continue;
+                  if (blk.type === 'text' && typeof blk.text === 'string') resStr += blk.text;
+                  else if (blk.type === 'image' && blk.source) {
+                    // Same placeholder length we emit in formatToolAction default branch.
+                    const mime = blk.source.media_type || 'image/?';
+                    const sizeBytes = (blk.source.data || '').length;
+                    const sizeKB = sizeBytes > 0 ? Math.round(sizeBytes / 1024) : 0;
+                    resStr += '[image: ' + mime + (sizeKB ? ', ~' + sizeKB + 'KB' : '') + ' base64 omitted]';
+                  }
+                }
+              }
+              resultByUseId.set(b.tool_use_id, resStr);
+            }
+          }
+        }
+      }
+
+      for (const entry of range) {
+        if (entry.isSidechain || entry.type === 'summary') continue;
+
+        if (entry.type === 'user') {
+          let rawContent = entry.message?.content;
+          if (Array.isArray(rawContent)) {
+            // tool_result entries are accounted via their tool_use match above —
+            // don't double-count them as user content.
+            if (rawContent.some(item => item && item.type === 'tool_result')) continue;
+            const textBlock = rawContent.find(item => item && item.type === 'text');
+            rawContent = textBlock?.text || '';
+          }
+          if (!rawContent || typeof rawContent !== 'string') continue;
+          if (rawContent.includes('[Request interrupted')) continue;
+          if (rawContent.includes('<command-name>') ||
+              rawContent.includes('<command-message>') ||
+              rawContent.includes('<local-command-stdout>') ||
+              rawContent.includes('<system-reminder>') ||
+              rawContent.includes('<bash-notification>') ||
+              rawContent.startsWith('Caveat: The messages below')) continue;
+          chars.user += rawContent.length;
+        }
+        else if (entry.type === 'assistant') {
+          const usage = entry.message?.usage;
+          const ot = usage?.output_tokens;
+          if (typeof ot === 'number') { downTokens += ot; apiOutputTokens += ot; }
+          if (usage) {
+            if (typeof usage.input_tokens === 'number') apiInputTokens += usage.input_tokens;
+            if (typeof usage.cache_creation_input_tokens === 'number') apiInputTokens += usage.cache_creation_input_tokens;
+            if (typeof usage.cache_read_input_tokens === 'number') apiInputTokens += usage.cache_read_input_tokens;
+          }
+          const msgContent = entry.message?.content;
+          if (!msgContent) continue;
+          if (typeof msgContent === 'string') {
+            chars.claudeText += msgContent.length;
+          } else if (Array.isArray(msgContent)) {
+            for (const block of msgContent) {
+              if (block.type === 'thinking' && block.thinking) chars.claudeThinking += block.thinking.length;
+              else if (block.type === 'text' && block.text) chars.claudeText += block.text.length;
+              else if (block.type === 'tool_use') {
+                const group = classifyTool(block.name);
+                const inputStr = (() => {
+                  try {
+                    const cleanInput = (block.input && typeof block.input === 'object') ? { ...block.input } : block.input;
+                    if (cleanInput && typeof cleanInput === 'object' && 'caller' in cleanInput) delete cleanInput.caller;
+                    return JSON.stringify(cleanInput || {});
+                  } catch { return ''; }
+                })();
+                const resStr = (block.id && resultByUseId.get(block.id)) || '';
+                const totalLen = inputStr.length + resStr.length;
+                if (group === 'read') chars.read += totalLen;
+                else if (group === 'edit') chars.edit += totalLen;
+                else if (group === 'bash') chars.bash += totalLen;
+                else if (group === 'subagent') chars.subagentResult += totalLen;
+                else chars.tools += totalLen;
+              }
+            }
+          }
+        }
+        else if (entry.type === 'system' && entry.subtype === 'compact_boundary') {
+          // Compact summary is appended in copy-range output. Approximate via metadata.preTokens
+          // if present (it's already in tokens, not chars). We'll convert back to fake chars to keep
+          // single tokens formula consistent — preTokens * 3.5.
+          const pre = entry.compactMetadata?.preTokens;
+          if (typeof pre === 'number') chars.compact += pre * 3.5;
+        }
+      }
+
+      const toTokens = (c) => Math.ceil(c / 3.5);
+      const categories = {
+        user: toTokens(chars.user),
+        claudeText: toTokens(chars.claudeText),
+        claudeThinking: toTokens(chars.claudeThinking),
+        read: toTokens(chars.read),
+        edit: toTokens(chars.edit),
+        bash: toTokens(chars.bash),
+        tools: toTokens(chars.tools),
+        subagentResult: toTokens(chars.subagentResult),
+        subagentHistory: toTokens(chars.subagentHistory),
+        compact: toTokens(chars.compact),
+      };
+      const total = Object.values(categories).reduce((a, b) => a + b, 0);
+      return {
+        success: true, categories, total,
+        downTotal: downTokens,
+        apiInputTokens, apiOutputTokens,
+      };
+    } catch (error) {
+      console.error('[Claude EstimateRangeTokens] Error:', error);
+      return { success: false, error: error.message };
+    }
+  });
+
   // Create a pre-filled Claude JSONL session (user question + assistant analysis)
   // Used by Update API: API response is embedded as assistant message, then Claude --resume shows it
   ipcMain.handle('claude:create-prefilled-session', async (event, { content, cwd }) => {

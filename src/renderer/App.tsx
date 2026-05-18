@@ -377,6 +377,35 @@ function App() {
   const projectTabsFontSize = useUIStore((s) => s.projectTabsFontSize);
 
   const [settingsOpen, setSettingsOpen] = useState(false);
+  // Запрошенный начальный таб для SettingsModal — выставляется через
+  // window CustomEvent 'settings:open' { detail: { tab } } (например,
+  // ПКМ на SemanticIndexButton → tab='colors'/«Системные»). null означает
+  // обычное открытие через Cmd+, или StatusBar — модалка покажет lastActiveTab.
+  const [settingsInitialTab, setSettingsInitialTab] = useState<string | null>(null);
+
+  // Sync processBar settings → CSS variables on :root.
+  // Кейфрейм tab-process-bar-pulse читает var(--process-bar-color-a/b/duration);
+  // когда юзер крутит палитру в Settings → useUIStore → этот эффект ставит новые
+  // значения на documentElement, animation мгновенно подхватывает.
+  const processBar = useUIStore((s) => s.processBar);
+  useEffect(() => {
+    const root = document.documentElement;
+    root.style.setProperty('--process-bar-color-a', processBar.colorA);
+    root.style.setProperty('--process-bar-color-b', processBar.colorB);
+    root.style.setProperty('--process-bar-duration', `${processBar.durationMs}ms`);
+  }, [processBar.colorA, processBar.colorB, processBar.durationMs]);
+
+  useEffect(() => {
+    const onSettingsOpen = (e: Event) => {
+      const ce = e as CustomEvent<{ tab?: string }>;
+      const tab = ce.detail?.tab || null;
+      setSettingsInitialTab(tab);
+      setSettingsOpen(true);
+      window.dispatchEvent(new CustomEvent('settings:opened'));
+    };
+    window.addEventListener('settings:open', onSettingsOpen);
+    return () => window.removeEventListener('settings:open', onSettingsOpen);
+  }, []);
 
   // Auto-close markdown-editor overlays (Cmd+/ palette, AI-paste indicator) on
   // mousedown outside their DOM. The editor's own listener uses 'click' on
@@ -1532,17 +1561,17 @@ function App() {
 
     window.addEventListener('keydown', handleKeyDown);
 
-    // Opt+V (primary) and Cmd+E (alias) — open the custom prompt picker
-    // (two-column flyout). Layout-agnostic via e.code, so works on Cyrillic /
-    // QWERTY / Dvorak. Registered as CAPTURE so it fires before xterm's
-    // customKeyEventHandler and before assistant-ui's composer textarea (both
-    // of which see Opt+V first and would otherwise emit `√` on Mac, or
-    // Cmd+E would otherwise still trigger any leftover textarea behaviour).
+    // Opt+V — open the custom prompt picker (two-column flyout).
+    // Layout-agnostic via e.code, so works on Cyrillic / QWERTY / Dvorak.
+    // Registered as CAPTURE so it fires before xterm's customKeyEventHandler
+    // and before assistant-ui's composer textarea (both of which see Opt+V first
+    // and would otherwise emit `√` on Mac).
+    // Cmd+E больше НЕ открывает picker — слот перенесён на toggle slide-out
+    // заметок (Workspace.tsx, см. fact-notes.md). Раньше Cmd+E был алиасом.
     const handlePickerOpenCapture = (e: KeyboardEvent) => {
       if (view !== 'workspace') return;
       const isOptV = e.altKey && !e.metaKey && !e.ctrlKey && !e.shiftKey && e.code === 'KeyV';
-      const isCmdE = e.metaKey && !e.altKey && !e.ctrlKey && !e.shiftKey && e.code === 'KeyE';
-      if (!isOptV && !isCmdE) return;
+      if (!isOptV) return;
       e.preventDefault();
       e.stopPropagation();
       const cur = useUIStore.getState().promptPickerOpen;
@@ -1911,7 +1940,11 @@ function App() {
       <ToastContainer />
       <EditProjectModal />
       <SessionInputModal />
-      <SettingsModal isOpen={settingsOpen} onClose={() => setSettingsOpen(false)} />
+      <SettingsModal
+        isOpen={settingsOpen}
+        onClose={() => { setSettingsOpen(false); setSettingsInitialTab(null); }}
+        initialTab={settingsInitialTab}
+      />
       <PromptPickerOverlay />
 
       {/* Project Context Menu */}

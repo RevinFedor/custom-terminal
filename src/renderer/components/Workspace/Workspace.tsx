@@ -6,19 +6,23 @@ import { useUIStore } from '../../store/useUIStore';
 import { terminalRegistry } from '../../utils/terminalRegistry';
 import { dropTargetForElements } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
 import TabBar from './TabBar';
+import TabSidebar from './TabSidebar';
 import ProjectToolbar from './ProjectToolbar';
 import ProjectHome from './ProjectHome';
 import TerminalArea from './TerminalArea';
 import Timeline from './Timeline';
-import NotesPanel from './NotesPanel';
+// NotesPanel deleted — заметки переехали в TabNotesSlideout (Cmd+E).
+// import NotesPanel from './NotesPanel';
 import '../../utils/sidebarBridge'; // Init window.electronAPI bridge
 import Sidebar from './Sidebar';
 import FilePreview from './FilePreview';
-import Resizer from './Resizer';
+// Resizer was used only by the deleted right-side NotesPanel column.
+// import Resizer from './Resizer';
 import ResearchSheet from '../Research/ResearchSheet';
 import TabNotesSlideout from './TabNotesSlideout';
 import HistoryPanel from './HistoryPanel';
 import SubAgentBar from './SubAgentBar';
+import ClaudeControlBar from './ClaudeControlBar';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -100,6 +104,13 @@ export default function Workspace() {
     const tabId = p.viewingSubAgentTabId || p.activeTabId;
     const tab = tabId ? p.tabs.get(tabId) : null;
     return tab?.commandType || null;
+  });
+  const effectiveTabType = useWorkspaceStore((s) => {
+    const p = s.openProjects.get(s.activeProjectId!);
+    if (!p) return null;
+    const tabId = p.viewingSubAgentTabId || p.activeTabId;
+    const tab = tabId ? p.tabs.get(tabId) : null;
+    return tab?.tabType || null;
   });
   const [showSearch, setShowSearch] = useState(false);
   const [searchText, setSearchText] = useState('');
@@ -309,12 +320,17 @@ export default function Workspace() {
     // Terminal will auto-refit via ResizeObserver
   }, []);
 
-  // CMD+J toggles the per-tab notes slide-out (the "Open" button next to
+  // CMD+E toggles the per-tab notes slide-out (the "Open" button next to
   // "ЗАМЕТКИ ВКЛАДКИ"). File-explorer sidebar is handled by Cmd+B separately.
+  // Layout-agnostic via e.code='KeyE' (см. methodology/design.md::Layout-agnostic
+  // shortcuts) — иначе на Cyrillic шорткат молча отвалится.
+  // Раньше слот занимал Cmd+J; перенесён на Cmd+E по запросу юзера (16.05.2026).
+  // Cmd+E одновременно перестал быть alias'ом на Opt+V prompt picker — picker
+  // остался только на Opt+V.
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (workspaceView !== 'workspace') return;
-      if (e.metaKey && e.key === 'j' && activeTabId) {
+      if (e.metaKey && !e.altKey && !e.ctrlKey && !e.shiftKey && e.code === 'KeyE' && activeTabId) {
         e.preventDefault();
         const cur = useUIStore.getState().notesPanelOpenTabs[activeTabId] ?? false;
         useUIStore.getState().setNotesPanelOpen(activeTabId, !cur);
@@ -500,13 +516,22 @@ export default function Workspace() {
   console.warn(`[Workspace:RENDER] currentView=${currentView} showTimeline=${showTimeline} activeTabId=${activeTab?.id} effectiveTabId=${effectiveTab?.id} isCommandRunning=${isCommandRunning}`);
 
   return (
-    <div className="flex-1 flex h-full overflow-hidden relative">
-      {/* LEFT COLUMN: Tabs + Terminal/Home Area */}
+    <div className="flex-1 flex flex-col h-full overflow-hidden relative">
+      {/* TOP ROW: ProjectToolbar — full width across all columns.
+          Divider под тулбаром НЕ здесь — он рендерится внутри TabSidebar, чтобы линия
+          обрывалась на границе сайдбара и не уходила в область терминала. */}
+      <div className="h-[30px] shrink-0">
+        <ProjectToolbar />
+      </div>
+
+      {/* MAIN ROW: two columns now — TabSidebar | Terminal. Right NotesPanel
+          column was removed (заметки переехали в TabNotesSlideout). */}
+      <div className="flex-1 flex min-h-0 relative">
+      {/* LEFT COLUMN: vertical tab sidebar */}
+      <TabSidebar projectId={activeProjectId} />
+
+      {/* CENTER COLUMN: Terminal/Home Area (no more TabBar above it) */}
       <div className="flex-1 flex flex-col min-w-0 relative">
-        {/* TabBar Row */}
-        <div className="h-[30px] border-b border-border-main">
-          <TabBar projectId={activeProjectId} />
-        </div>
 
         {/* Sub-agent bar + Terminal Area wrapped in adopt drop zone */}
         <div ref={adoptDropRef} className="flex-1 flex flex-col min-w-0 relative">
@@ -530,6 +555,10 @@ export default function Workspace() {
 
           {/* Terminal Area — Timeline + HistoryPanel are constrained to this height */}
           <div className="flex-1 flex min-w-0 relative">
+          {/* Vertical stack [Terminal content | ClaudeControlBar] — bar lives below
+              the terminal area only, NOT under Timeline (Timeline sits to the right
+              of this column and spans the full row height). */}
+          <div className="flex-1 flex flex-col min-w-0">
           {/* Terminal content — overflow hidden clips HistoryPanel slide animation */}
           <div className="flex-1 relative min-w-0 overflow-hidden">
             <TerminalArea projectId={activeProjectId} />
@@ -626,6 +655,22 @@ export default function Workspace() {
             )}
           </div>
 
+          {/* Claude control bar — Provider/Model/Effort/Think + Ctx meter.
+              Visible whenever the active tab is a Claude session (PTY OR SDK).
+              Lives under the Terminal column, so its width matches the terminal
+              area and Timeline (right-side) keeps its full height untouched. */}
+          {effectiveTab && currentView === 'terminal' && (effectiveTabType === 'claude-sdk' || (effectiveCommandType === 'claude' && effectiveClaudeSessionId)) && (
+            <ClaudeControlBar
+              tabId={effectiveTab.id}
+              claudeSessionId={effectiveClaudeSessionId}
+              geminiSessionId={effectiveGeminiSessionId}
+              commandType={effectiveCommandType}
+              isCommandRunning={isCommandRunning}
+              projectPath={currentProject.path}
+            />
+          )}
+          </div>
+
           {/* Timeline — inside terminal row so it only spans terminal height */}
           {showTimeline && (
             <Timeline
@@ -652,23 +697,12 @@ export default function Workspace() {
         )}
       </div>
 
-      {/* RIGHT COLUMN: Toolbar + Notes + Resizer */}
-      <div className="flex flex-col shrink-0 overflow-hidden relative border-l border-border-main" style={{ width: notesPanelWidth }}>
-        {/* ProjectToolbar Row — aligned with TabBar */}
-        <div className="h-[30px] border-b border-border-main">
-          <ProjectToolbar />
-        </div>
+      {/* Right NotesPanel column removed — заметки переехали в TabNotesSlideout
+          (открывается по Cmd+E или по клику кнопки в активной вкладке TabSidebar).
+          InfoPanel (project Info содержимое) тоже больше не рендерится постоянно —
+          его прежний правый сайдбар удалён вместе с NotesPanel'ом. */}
 
-        {/* Bottom Row: Resizer + Notes Panel */}
-        <div className="flex-1 flex overflow-hidden">
-          <Resizer onResize={handleResize} />
-          <div className="flex-1 overflow-hidden relative">
-            {!filePreview && (
-              <NotesPanel projectId={activeProjectId} project={currentProject} />
-            )}
-          </div>
-        </div>
-      </div>
+      </div>{/* /MAIN ROW */}
 
       {/* Global Overlays */}
       {/* Sidebar File Explorer - opens in current terminal's directory */}
@@ -677,7 +711,7 @@ export default function Workspace() {
         const { sidebarExpandedDirs } = getSidebarState(activeProjectId);
         const sidebarWidth = useUIStore.getState().sidebarWidth || 280;
         return ReactDOM.createPortal(
-          <div data-sidebar-portal style={{ position: 'fixed', left: 0, top: 36, bottom: 0, width: sidebarWidth, zIndex: 99999, borderRight: '1px solid #333', boxShadow: '4px 0 20px rgba(0,0,0,0.5)' }}>
+          <div data-sidebar-portal style={{ position: 'fixed', left: 0, top: 70, bottom: 0, width: sidebarWidth, zIndex: 99999, borderRight: '1px solid #333', boxShadow: '4px 0 20px rgba(0,0,0,0.5)' }}>
             <Sidebar
               folderPath={explorerPath}
               width={sidebarWidth}
@@ -734,8 +768,10 @@ export default function Workspace() {
         );
       })()}
 
-      {/* Per-tab Notes slide-out (resizable, anchored to InfoPanel left edge) */}
-      <TabNotesSlideout activeTabId={activeTabId || null} />
+      {/* Per-tab Notes slide-out — binds to whichever tab is flagged in
+          useUIStore.notesPanelOpenTabs (one-at-a-time). Doesn't need activeTabId
+          prop since opening on a non-active tab is now a supported gesture. */}
+      <TabNotesSlideout />
 
     </div>
   );

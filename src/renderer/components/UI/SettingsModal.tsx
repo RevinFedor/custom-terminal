@@ -2,12 +2,18 @@ import React, { useEffect, useState, useRef, useCallback } from 'react';
 import { useUIStore } from '../../store/useUIStore';
 import { usePromptsStore, AIPrompt, AIModel, ThinkingLevel } from '../../store/usePromptsStore';
 import Tooltip from './Tooltip';
+import { HexColorPicker } from 'react-colorful';
+import { Trash2, Plus } from 'lucide-react';
 
 const { ipcRenderer } = window.require('electron');
 
 interface SettingsModalProps {
   isOpen: boolean;
   onClose: () => void;
+  // Опциональный override начального таба — используется при программном открытии
+  // (например, ПКМ на SemanticIndexButton → 'colors'/«Системные»). Если null,
+  // модалка показывает lastActiveTab из локальной переменной (стандартное поведение).
+  initialTab?: string | null;
 }
 
 interface PromptGroup {
@@ -39,7 +45,8 @@ const SHORTCUTS = [
   { keys: '⌘ + T', description: 'Новый таб' },
   { keys: '⌘ + B', description: 'Показать/скрыть боковую панель' },
   { keys: '⌘ + ,', description: 'Открыть настройки' },
-  { keys: '⌘ + E', description: 'Редактор заметок проекта' },
+  { keys: '⌘ + E', description: 'Заметки вкладки (slide-out)' },
+  { keys: '⌥ + V', description: 'Prompt picker (вставка промпта)' },
   { keys: '⌘ + S', description: 'Сохранить заметки (в редакторе)' },
   { keys: '⌘ + ⇧ + R', description: 'Перезагрузить приложение' },
 ];
@@ -65,6 +72,19 @@ function FontSizeSlider({
   max: number;
   suffix?: string;
 }) {
+  // Editable число вместо read-only display. На focus убираем suffix (`12px` → `12`)
+  // чтобы можно было сразу ввести значение клавиатурой без `Backspace × 2`.
+  // На blur коммитим clamped-число; невалидный ввод откатывается к текущему value.
+  const [focused, setFocused] = React.useState(false);
+  const [draft, setDraft] = React.useState<string>('');
+  const display = focused ? draft : `${value}${suffix}`;
+  const commit = () => {
+    const n = parseFloat(draft);
+    if (Number.isFinite(n)) {
+      onChange(Math.max(min, Math.min(max, n)));
+    }
+    setFocused(false);
+  };
   const btnStyle: React.CSSProperties = {
     width: '24px',
     height: '24px',
@@ -102,24 +122,128 @@ function FontSizeSlider({
           disabled={value <= min}
           onClick={() => onChange(Math.max(min, value - 1))}
         >−</button>
-        <div style={{
-          minWidth: '46px',
-          textAlign: 'center',
-          fontSize: '12px',
-          color: '#fff',
-          fontVariantNumeric: 'tabular-nums',
-          padding: '2px 6px',
-          backgroundColor: '#262626',
-          border: '1px solid #2a2a2a',
-          borderRadius: '6px',
-          fontFamily: 'monospace',
-        }}>{value}{suffix}</div>
+        <input
+          type="text"
+          inputMode="numeric"
+          value={display}
+          onFocus={(e) => {
+            setDraft(String(value));
+            setFocused(true);
+            // Select-all чтобы юзер сразу мог ввести число поверх.
+            requestAnimationFrame(() => e.target.select());
+          }}
+          onChange={(e) => setDraft(e.target.value)}
+          onBlur={commit}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') { (e.target as HTMLInputElement).blur(); }
+            else if (e.key === 'Escape') { setDraft(String(value)); (e.target as HTMLInputElement).blur(); }
+          }}
+          style={{
+            width: '52px',
+            textAlign: 'center',
+            fontSize: '12px',
+            color: '#fff',
+            fontVariantNumeric: 'tabular-nums',
+            padding: '2px 6px',
+            backgroundColor: '#262626',
+            border: '1px solid #2a2a2a',
+            borderRadius: '6px',
+            fontFamily: 'monospace',
+            outline: 'none',
+          }}
+        />
         <button
           aria-label="+"
           style={btnStyle}
           disabled={value >= max}
           onClick={() => onChange(Math.min(max, value + 1))}
         >+</button>
+      </div>
+    </div>
+  );
+}
+
+// Дробное соотношение «W × H» в одной строке. Два input'а, на focus убирает
+// suffix, Enter/blur коммитит пару через `onChange(w, h)`. Используется для
+// `tabPreviewRatio*` — целевая пропорция превью таба.
+function RatioRow({
+  label,
+  description,
+  width,
+  height,
+  onChange,
+  min = 1,
+  max = 32,
+}: {
+  label: string;
+  description: string;
+  width: number;
+  height: number;
+  onChange: (w: number, h: number) => void;
+  min?: number;
+  max?: number;
+}) {
+  const [wDraft, setWDraft] = React.useState('');
+  const [hDraft, setHDraft] = React.useState('');
+  const [wFocused, setWFocused] = React.useState(false);
+  const [hFocused, setHFocused] = React.useState(false);
+  const inputStyle: React.CSSProperties = {
+    width: '46px',
+    textAlign: 'center',
+    fontSize: '12px',
+    color: '#fff',
+    fontVariantNumeric: 'tabular-nums',
+    padding: '2px 6px',
+    backgroundColor: '#262626',
+    border: '1px solid #2a2a2a',
+    borderRadius: '6px',
+    fontFamily: 'monospace',
+    outline: 'none',
+  };
+  const commit = (nextW: string, nextH: string) => {
+    const w = parseFloat(nextW);
+    const h = parseFloat(nextH);
+    const w2 = Number.isFinite(w) ? Math.max(min, Math.min(max, w)) : width;
+    const h2 = Number.isFinite(h) ? Math.max(min, Math.min(max, h)) : height;
+    onChange(w2, h2);
+  };
+  return (
+    <div style={{
+      padding: '8px 12px',
+      backgroundColor: '#1f1f1f',
+      border: '1px solid #2a2a2a',
+      borderRadius: '8px',
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      gap: '12px',
+    }}>
+      <div style={{ minWidth: 0 }}>
+        <div style={{ fontSize: '13px', color: '#eaeaea', fontWeight: 500 }}>{label}</div>
+        <div style={{ fontSize: '11px', color: '#666', marginTop: '1px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{description}</div>
+      </div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexShrink: 0 }}>
+        <input
+          type="text"
+          inputMode="numeric"
+          value={wFocused ? wDraft : String(width)}
+          onFocus={(e) => { setWDraft(String(width)); setWFocused(true); requestAnimationFrame(() => e.target.select()); }}
+          onChange={(e) => setWDraft(e.target.value)}
+          onBlur={() => { commit(wDraft, String(height)); setWFocused(false); }}
+          onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur(); else if (e.key === 'Escape') { setWDraft(String(width)); (e.target as HTMLInputElement).blur(); } }}
+          style={inputStyle}
+        />
+        <span style={{ color: '#666', fontSize: '12px', fontFamily: 'monospace' }}>×</span>
+        <input
+          type="text"
+          inputMode="numeric"
+          value={hFocused ? hDraft : String(height)}
+          onFocus={(e) => { setHDraft(String(height)); setHFocused(true); requestAnimationFrame(() => e.target.select()); }}
+          onChange={(e) => setHDraft(e.target.value)}
+          onBlur={() => { commit(String(width), hDraft); setHFocused(false); }}
+          onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur(); else if (e.key === 'Escape') { setHDraft(String(height)); (e.target as HTMLInputElement).blur(); } }}
+          style={inputStyle}
+        />
       </div>
     </div>
   );
@@ -186,11 +310,227 @@ function SidebarBehaviorSettings() {
   );
 }
 
-export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
+// SessionStatusesEditor — полный CRUD над sessionStatuses в useUIStore.
+// Один блок заменяет старые «Цвета — Системные» + «Цвета — Пользовательские» (оба
+// были read-only и непонятные). Здесь юзер:
+//   • редактирует label инлайн (одна строка)
+//   • редактирует hex руками (input с # и 6 hex-чарами) — превью кружочка обновляется live
+//   • открывает popover с react-colorful (2D saturation+lightness picker + hue slider)
+//   • удаляет статус (delete icon) — корзина без подтверждения, но id сохраняется в Tab.sessionStatus
+//     (если статус вернут — маркер автоматически восстановится)
+//   • добавляет новый статус (кнопка с +)
+// Hex normalization: принимаем 'fff' / '#fff' / 'ffffff' / '#ffffff' / 'FFF...'; всё что не парсится
+// — не записываем, оставляем старый цвет. Это убирает «пустой #» в инпуте который сломал бы маркер.
+function SessionStatusesEditor() {
+  const sessionStatuses = useUIStore((s) => s.sessionStatuses);
+  const updateSessionStatus = useUIStore((s) => s.updateSessionStatus);
+  const addSessionStatus = useUIStore((s) => s.addSessionStatus);
+  const removeSessionStatus = useUIStore((s) => s.removeSessionStatus);
+
+  // Какой статус сейчас открыт в picker'е. null = ни один.
+  const [pickerOpenId, setPickerOpenId] = useState<string | null>(null);
+  // Локальный буфер для hex-input. Позволяет юзеру печатать промежуточные значения
+  // ('#ab') без немедленного сохранения мусора в стор.
+  const [hexDrafts, setHexDrafts] = useState<Record<string, string>>({});
+
+  // Сворачиваем picker при клике вне.
+  const containerRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!pickerOpenId) return;
+    const onDown = (e: MouseEvent) => {
+      const target = e.target as Node | null;
+      if (containerRef.current && target && !containerRef.current.contains(target)) {
+        setPickerOpenId(null);
+      }
+    };
+    window.addEventListener('mousedown', onDown);
+    return () => window.removeEventListener('mousedown', onDown);
+  }, [pickerOpenId]);
+
+  const normalizeHex = (raw: string): string | null => {
+    let v = raw.trim().replace(/^#/, '');
+    if (/^[0-9a-fA-F]{3}$/.test(v)) v = v.split('').map((c) => c + c).join('');
+    if (/^[0-9a-fA-F]{6}$/.test(v)) return `#${v.toUpperCase()}`;
+    return null;
+  };
+
+  return (
+    <div
+      ref={containerRef}
+      style={{ padding: '14px', backgroundColor: '#222', border: '1px solid #333', borderRadius: '10px' }}
+    >
+      <div style={{
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+        marginBottom: '12px',
+      }}>
+        <div style={{ fontSize: '11px', fontWeight: 600, color: '#666', textTransform: 'uppercase' }}>
+          Статусы вкладок
+        </div>
+        <button
+          onClick={addSessionStatus}
+          style={{
+            display: 'inline-flex', alignItems: 'center', gap: '4px',
+            padding: '4px 10px', fontSize: '12px', color: '#ccc',
+            backgroundColor: '#2a2a2a', border: '1px solid #444', borderRadius: '6px',
+            cursor: 'pointer',
+          }}
+          title="Добавить статус"
+        >
+          <Plus size={12} /> новый
+        </button>
+      </div>
+
+      <div style={{ fontSize: '11px', color: '#666', marginBottom: '10px', lineHeight: 1.5 }}>
+        Статусы выбираются в ПКМ-меню вкладки. Маркер 8px рисуется слева во вкладке (vertical layout).
+      </div>
+
+      {sessionStatuses.length === 0 && (
+        <div style={{ fontSize: '12px', color: '#666', fontStyle: 'italic', padding: '8px 0' }}>
+          Пусто. Нажми «новый», чтобы создать первый статус.
+        </div>
+      )}
+
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+        {sessionStatuses.map((s) => {
+          const isPickerOpen = pickerOpenId === s.id;
+          const hexDraft = hexDrafts[s.id] ?? s.color;
+          return (
+            <div
+              key={s.id}
+              style={{
+                position: 'relative',
+                display: 'flex', alignItems: 'center', gap: '10px',
+                padding: '8px 10px',
+                backgroundColor: '#1e1e1e',
+                border: '1px solid #333',
+                borderRadius: '8px',
+              }}
+            >
+              {/* Цветной круг — клик открывает picker */}
+              <button
+                onClick={() => setPickerOpenId(isPickerOpen ? null : s.id)}
+                style={{
+                  width: 24, height: 24, borderRadius: '50%',
+                  backgroundColor: s.color,
+                  border: '2px solid rgba(255,255,255,0.15)',
+                  cursor: 'pointer', flexShrink: 0,
+                  padding: 0,
+                }}
+                title="Открыть палитру"
+              />
+
+              {/* Label (inline edit) */}
+              <input
+                type="text"
+                value={s.label}
+                onChange={(e) => updateSessionStatus(s.id, { label: e.target.value })}
+                placeholder="Название статуса"
+                style={{
+                  flex: 1, minWidth: 0,
+                  padding: '6px 8px',
+                  backgroundColor: '#1a1a1a',
+                  border: '1px solid #333', borderRadius: '6px',
+                  color: '#ccc', fontSize: '13px', outline: 'none',
+                }}
+              />
+
+              {/* Hex input — controlled через локальный draft */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                <span style={{ color: '#666', fontSize: '12px' }}>#</span>
+                <input
+                  type="text"
+                  value={hexDraft.replace(/^#/, '')}
+                  onChange={(e) => {
+                    const next = `#${e.target.value}`;
+                    setHexDrafts((d) => ({ ...d, [s.id]: next }));
+                    const norm = normalizeHex(next);
+                    if (norm) updateSessionStatus(s.id, { color: norm });
+                  }}
+                  onBlur={() => {
+                    // На blur всегда возвращаемся к каноничному значению в сторе.
+                    setHexDrafts((d) => { const cp = { ...d }; delete cp[s.id]; return cp; });
+                  }}
+                  maxLength={7}
+                  style={{
+                    width: '80px',
+                    padding: '6px 6px',
+                    backgroundColor: '#1a1a1a',
+                    border: '1px solid #333', borderRadius: '6px',
+                    color: '#ccc', fontSize: '12px',
+                    fontFamily: 'monospace', outline: 'none',
+                    textTransform: 'uppercase',
+                  }}
+                />
+              </div>
+
+              {/* Delete */}
+              <button
+                onClick={() => removeSessionStatus(s.id)}
+                style={{
+                  display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+                  width: 28, height: 28, borderRadius: '6px',
+                  background: 'transparent', border: 'none',
+                  color: '#666', cursor: 'pointer',
+                  flexShrink: 0,
+                }}
+                onMouseEnter={(e) => { e.currentTarget.style.color = '#f87171'; e.currentTarget.style.backgroundColor = 'rgba(248,113,113,0.1)'; }}
+                onMouseLeave={(e) => { e.currentTarget.style.color = '#666'; e.currentTarget.style.backgroundColor = 'transparent'; }}
+                title="Удалить статус"
+              >
+                <Trash2 size={14} />
+              </button>
+
+              {/* Picker popover — anchored к строке, открывается ниже */}
+              {isPickerOpen && (
+                <div
+                  style={{
+                    position: 'absolute',
+                    top: '100%', left: 0,
+                    marginTop: '6px',
+                    zIndex: 50,
+                    padding: '12px',
+                    backgroundColor: '#1a1a1a',
+                    border: '1px solid #444',
+                    borderRadius: '10px',
+                    boxShadow: '0 10px 30px rgba(0,0,0,0.5)',
+                  }}
+                  onMouseDown={(e) => e.stopPropagation()}
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  <HexColorPicker
+                    color={s.color}
+                    onChange={(c) => updateSessionStatus(s.id, { color: c.toUpperCase() })}
+                  />
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProps) {
   // Use last active tab if opened before, otherwise default to shortcuts
   const [activeTab, setActiveTab] = useState<SettingsTab>(() => {
     return hasOpenedBefore ? lastActiveTab : 'ai';
   });
+
+  // Programmatic open with requested tab (e.g. ПКМ на SemanticIndexButton).
+  // Срабатывает на переходе isOpen=false→true когда initialTab задан.
+  // Не блокирует ручное переключение табов после открытия — пользователь
+  // нажал ПКМ → попал на «Системные», дальше может кликать другие табы.
+  const prevIsOpenRef = useRef(isOpen);
+  useEffect(() => {
+    if (isOpen && !prevIsOpenRef.current && initialTab) {
+      const valid: SettingsTab[] = ['shortcuts', 'fonts', 'colors', 'ai'];
+      if (valid.includes(initialTab as SettingsTab)) {
+        setActiveTab(initialTab as SettingsTab);
+      }
+    }
+    prevIsOpenRef.current = isOpen;
+  }, [isOpen, initialTab]);
 
   const terminalFontSize = useUIStore((s) => s.terminalFontSize);
   const tabsFontSize = useUIStore((s) => s.tabsFontSize);
@@ -208,19 +548,27 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
   const setSidebarFontSize = useUIStore((s) => s.setSidebarFontSize);
   const setFilePreviewFontSize = useUIStore((s) => s.setFilePreviewFontSize);
   const setTimelineFontSize = useUIStore((s) => s.setTimelineFontSize);
-  // Tab Preview popover (CMD+hover на табах и Home-карточках) — отдельные knobs
-  // для общей ширины и предела высоты notes в строках. Шрифт/padding единые с
-  // inline и slide-out (notesEditor*), задаются в одном месте ниже.
-  const tabPreviewWidth = useUIStore((s) => s.tabPreviewWidth);
-  const setTabPreviewWidth = useUIStore((s) => s.setTabPreviewWidth);
-  const tabPreviewMaxLines = useUIStore((s) => s.tabPreviewMaxLines);
-  const setTabPreviewMaxLines = useUIStore((s) => s.setTabPreviewMaxLines);
-  const notesEditorFontSize = useUIStore((s) => s.notesEditorFontSize);
-  const setNotesEditorFontSize = useUIStore((s) => s.setNotesEditorFontSize);
+  // Заметки вкладки — три независимых шрифта (сайдбар / раскрытый / превью)
+  // + общие padding'и + cap'ы превью (max width/height попавапа CMD+hover).
+  const notesSidebarFontSize = useUIStore((s) => s.notesSidebarFontSize);
+  const setNotesSidebarFontSize = useUIStore((s) => s.setNotesSidebarFontSize);
+  const notesExpandedFontSize = useUIStore((s) => s.notesExpandedFontSize);
+  const setNotesExpandedFontSize = useUIStore((s) => s.setNotesExpandedFontSize);
+  const notesTooltipFontSize = useUIStore((s) => s.notesTooltipFontSize);
+  const setNotesTooltipFontSize = useUIStore((s) => s.setNotesTooltipFontSize);
   const notesEditorPaddingX = useUIStore((s) => s.notesEditorPaddingX);
   const setNotesEditorPaddingX = useUIStore((s) => s.setNotesEditorPaddingX);
   const notesEditorPaddingY = useUIStore((s) => s.notesEditorPaddingY);
   const setNotesEditorPaddingY = useUIStore((s) => s.setNotesEditorPaddingY);
+  const tabPreviewMaxWidth = useUIStore((s) => s.tabPreviewMaxWidth);
+  const setTabPreviewMaxWidth = useUIStore((s) => s.setTabPreviewMaxWidth);
+  const tabPreviewMaxHeight = useUIStore((s) => s.tabPreviewMaxHeight);
+  const setTabPreviewMaxHeight = useUIStore((s) => s.setTabPreviewMaxHeight);
+  const tabPreviewRatioW = useUIStore((s) => s.tabPreviewRatioW);
+  const tabPreviewRatioH = useUIStore((s) => s.tabPreviewRatioH);
+  const setTabPreviewRatio = useUIStore((s) => s.setTabPreviewRatio);
+  const semanticIndexParallelism = useUIStore((s) => s.semanticIndexParallelism);
+  const setSemanticIndexParallelism = useUIStore((s) => s.setSemanticIndexParallelism);
   const { showToast, docPrompt, setDocPromptUseFile, setDocPromptFilePath, setDocPromptInlineContent, claudeDefaultPromptEnabled, setClaudeDefaultPromptEnabled } = useUIStore();
   const { prompts: aiPrompts, loadPrompts: loadAIPrompts, savePrompt: saveAIPrompt, deletePrompt: deleteAIPrompt, rewindPromptId, setRewindPromptId } = usePromptsStore();
 
@@ -1048,7 +1396,7 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
           {([
             { id: 'ai', label: 'AI' },
             { id: 'fonts', label: 'Шрифты' },
-            { id: 'colors', label: 'Цвета' },
+            { id: 'colors', label: 'Системные' },
             { id: 'shortcuts', label: 'Горячие клавиши' }
           ] as { id: SettingsTab; label: string }[]).map((tab) => (
             <button
@@ -1144,37 +1492,24 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                 <FontSizeSlider label="Таймлайн — строки" description="Высота превью в развёрнутом" value={timelineLineClamp} onChange={setTimelineLineClamp} min={1} max={10} suffix="" />
               </div>
 
-              {/* Единые настройки для всех мест, где показывается tab.notes:
-                  inline в сайдбаре, slide-out, CMD+hover preview popover.
-                  Раньше inline/preview и slide-out имели отдельные ползунки →
-                  один контент рендерился с тремя разными шрифтами. */}
+              {/* Заметки вкладки — единая секция, три независимых шрифта для трёх
+                  поверхностей одного контента + общие padding'и + cap'ы окна-превью
+                  (CMD+hover). Размеры окна-превью трактуются как потолки: короткая
+                  заметка ужмётся под контент. */}
               <div style={{ marginTop: '20px', paddingTop: '14px', borderTop: '1px solid #2a2a2a' }}>
                 <div style={{ fontSize: '11px', fontWeight: 600, color: '#666', marginBottom: '10px', textTransform: 'uppercase' }}>
                   Заметки вкладки
                 </div>
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
-                  <FontSizeSlider label="Шрифт" description="Inline, slide-out и hover preview" value={notesEditorFontSize} onChange={setNotesEditorFontSize} min={10} max={28} />
+                  <FontSizeSlider label="Шрифт в сайдбаре" description="Inline-превью в InfoPanel" value={notesSidebarFontSize} onChange={setNotesSidebarFontSize} min={10} max={28} />
+                  <FontSizeSlider label="Шрифт раскрытый" description="Slide-out полнотекстовый редактор" value={notesExpandedFontSize} onChange={setNotesExpandedFontSize} min={10} max={28} />
+                  <FontSizeSlider label="Шрифт в превью" description="Окно при CMD+hover на табе" value={notesTooltipFontSize} onChange={setNotesTooltipFontSize} min={10} max={28} />
                   <div />
                   <FontSizeSlider label="Padding X" description="Горизонтальный отступ" value={notesEditorPaddingX} onChange={setNotesEditorPaddingX} min={0} max={48} />
                   <FontSizeSlider label="Padding Y" description="Вертикальный отступ" value={notesEditorPaddingY} onChange={setNotesEditorPaddingY} min={0} max={48} />
-                </div>
-              </div>
-
-              {/* Tab Preview popover (CMD+hover на табах + Home-карточках) —
-                  ширина и предел высоты в строках живут отдельно от шрифта
-                  заметок: у preview свои визуальные пропорции (380px wide,
-                  ~8 строк по умолчанию). Resize handles на самом popover'е
-                  флушат значения в эти же поля. */}
-              <div style={{ marginTop: '20px', paddingTop: '14px', borderTop: '1px solid #2a2a2a' }}>
-                <div style={{ fontSize: '11px', fontWeight: 600, color: '#666', marginBottom: '10px', textTransform: 'uppercase' }}>
-                  Превью таба (Cmd+hover)
-                </div>
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
-                  {/* Store держит float (drag даёт 5.487 — рамка не прыгает на flush).
-                      Stepper показывает Math.round + onChange передаёт целое: +/-
-                      работают шагом в 1. */}
-                  <FontSizeSlider label="Ширина" description="Размер окна по горизонтали" value={Math.round(tabPreviewWidth)} onChange={setTabPreviewWidth} min={240} max={900} />
-                  <FontSizeSlider label="Макс. строк" description="Высота notes в строках" value={Math.round(tabPreviewMaxLines)} onChange={setTabPreviewMaxLines} min={2} max={40} suffix="" />
+                  <FontSizeSlider label="Макс. ширина превью" description="Потолок окна CMD+hover" value={Math.round(tabPreviewMaxWidth)} onChange={setTabPreviewMaxWidth} min={120} max={900} />
+                  <FontSizeSlider label="Макс. высота превью" description="Потолок окна CMD+hover" value={Math.round(tabPreviewMaxHeight)} onChange={setTabPreviewMaxHeight} min={80} max={900} />
+                  <RatioRow label="Пропорция превью" description="Целевое W × H (3 × 2 = ширина в 1.5 раза больше)" width={tabPreviewRatioW} height={tabPreviewRatioH} onChange={setTabPreviewRatio} />
                 </div>
               </div>
 
@@ -1186,35 +1521,32 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
 
           {activeTab === 'colors' && (
             <>
+              {/* Семантическая индексация — единственная пока «системная» настройка
+                  с runtime-эффектом. Управляет --parallel флагом, который main
+                  передаёт build-index.sh при запуске. Выше 20 параллельных claude'ов
+                  Anthropic жёстко 429-ит; ниже 4 — индексация N=70 файлов начинает
+                  занимать минуты. Default 10 выбран как ровно тот же default, что
+                  стоит в самом скрипте (MAX_PARALLEL=10) — UI и CLI consistency. */}
               <div style={{ padding: '14px', backgroundColor: '#222', border: '1px solid #333', borderRadius: '10px', marginBottom: '12px' }}>
                 <div style={{ fontSize: '11px', fontWeight: '600', color: '#666', marginBottom: '10px', textTransform: 'uppercase' }}>
-                  Системные
+                  Семантическая индексация
                 </div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-                  <div style={{ width: '20px', height: '20px', borderRadius: '50%', backgroundColor: 'rgba(34, 197, 94, 0.2)', border: '2px solid rgb(34, 197, 94)' }} />
-                  <span style={{ fontSize: '13px', color: '#888' }}>Зелёный — AI агенты</span>
+                <FontSizeSlider
+                  label="Параллельные воркеры"
+                  description="Сколько claude/Haiku одновременно при запуске индексации"
+                  value={semanticIndexParallelism}
+                  onChange={setSemanticIndexParallelism}
+                  min={1}
+                  max={20}
+                  suffix=""
+                />
+                <div style={{ fontSize: '11px', color: '#666', marginTop: '8px', lineHeight: 1.5 }}>
+                  Применяется к следующему запуску из ProjectToolbar (иконка с числом).
+                  Текущий выполняющийся ребилд не прерывается.
                 </div>
               </div>
 
-              <div style={{ padding: '14px', backgroundColor: '#222', border: '1px solid #333', borderRadius: '10px' }}>
-                <div style={{ fontSize: '11px', fontWeight: '600', color: '#666', marginBottom: '10px', textTransform: 'uppercase' }}>
-                  Пользовательские (ПКМ)
-                </div>
-                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '12px' }}>
-                  {[
-                    { color: '#666', label: 'По умолчанию' },
-                    { color: 'rgb(239, 68, 68)', label: 'Красный' },
-                    { color: 'rgb(234, 179, 8)', label: 'Жёлтый' },
-                    { color: 'rgb(59, 130, 246)', label: 'Синий' },
-                    { color: 'rgb(168, 85, 247)', label: 'Фиолетовый' }
-                  ].map(({ color, label }) => (
-                    <div key={label} style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                      <div style={{ width: '16px', height: '16px', borderRadius: '50%', border: `2px solid ${color}` }} />
-                      <span style={{ fontSize: '12px', color: '#666' }}>{label}</span>
-                    </div>
-                  ))}
-                </div>
-              </div>
+              <SessionStatusesEditor />
             </>
           )}
 

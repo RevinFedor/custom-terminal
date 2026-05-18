@@ -163,6 +163,30 @@ onPointerLeave={() => {
 
 Файл: `src/renderer/components/HoverBridgeDebug.tsx`.
 
+### 2.7. Lazy popover wrapper: близкие popover'ы пропадают между chip-ом и собой
+
+Когда popover рендерится через conditional `{open && <Portal>…</Portal>}`, его DOM-узел не существует пока `open === false`. На `onMouseLeave` chip-а ставится `setOpen(false)` — wrapper unmount'ится **в том же тике**, до того как курсор успевает пересечь gap. Соответственно `mouseenter` на wrapper'е не выстреливает (узел уже снят со страницы), popover не реoткроется. Wrapper-CSS-bridge из 2.2(а) тут не помогает — он есть в JSX, но не в DOM в момент перехода. Симптом — *«я не могу навестись на эту модалку»* при том что в DOM wrapper отрисован корректно перед закрытием.
+
+Единственно рабочий путь — **geometric hit-test через global `mousemove` listener** (2.2 вариант в), активный только пока `open=true`. Listener тестирует курсор против `getBoundingClientRect()` обоих узлов (chip + popover) с tolerance ±2px и закрывает popover только когда курсор **вне обоих**. `onMouseLeave` с chip-а и popover-а **не вешать совсем** — они отрабатывают раньше глобального listener'а и убивают popover до того как hit-test может его удержать.
+
+```tsx
+useEffect(() => {
+  if (!open) return;
+  const onMove = (e: MouseEvent) => {
+    const c = chipRef.current?.getBoundingClientRect();
+    const p = popoverRef.current?.getBoundingClientRect();
+    const inRect = (r?: DOMRect, pad = 2) =>
+      !!r && e.clientX >= r.left - pad && e.clientX <= r.right + pad
+        && e.clientY >= r.top - pad && e.clientY <= r.bottom + pad;
+    if (!inRect(c) && !inRect(p)) setOpen(false);
+  };
+  window.addEventListener('mousemove', onMove);
+  return () => window.removeEventListener('mousemove', onMove);
+}, [open]);
+```
+
+Распространённая ошибка — поставить `onMouseLeave` «на всякий случай» рядом с глобальным listener'ом. На быстром движении он срабатывает за миллисекунды до того как глобальный listener успевает решить «курсор в popover'е» — popover мигает и пропадает. Если используешь geometric hit-test — убери **всё** `onMouseLeave`-управление видимостью; открытие держи только на `onMouseEnter`. См. реализацию в `Timeline.tsx::renderBreakdownBody` и `fact-clipboard-tools.md::Range Token Estimate + Breakdown popover`.
+
 ---
 
 ## 3. CMD/Ctrl-hover edge cases
@@ -222,6 +246,17 @@ onPointerLeave={() => {
 Click-outside и Esc — два независимых пути. Esc нужен для ситуаций когда мыши под рукой нет, или когда click-outside случайно перехватывается (например, popup занимает весь viewport).
 
 См. `design.md::Click-outside как universal escape, mouse-leave опционален`.
+
+### 4.6. mousedown bubble'ит раньше click — `stopPropagation` нужен на оба
+
+Когда родительский popup закрывается по `window.addEventListener('mousedown', closeIfOutside)` (а не по `click`), а внутри него живёт вложенный popover-portal с своими кнопками — `e.stopPropagation()` только на `onClick` **не работает**. Mousedown проходит first, родитель уже сбросил state до того как handler кнопки выстрелит. Симптом — *«кнопка тупо не работает»*: визуально нажимается, но эффект не виден, потому что родитель закрыл popover в момент mousedown, и `onClick` (если успевает) обновляет state уже несуществующего UI.
+
+Применимо ко всем nested popover'ам внутри другого click-outside-aware popup'а. Правило: на корневом div'е popover'а **обе** проп'ы:
+```tsx
+onMouseDown={(e) => e.stopPropagation()}
+onClick={(e) => e.stopPropagation()}
+```
+Без mousedown — родительский listener закрывает родителя; popover-узел в Portal'е остаётся, но его `open`-стейт привязан к state родителя и обнуляется тоже. Симптом: первый клик мимо, требуется второй (после реоткрытия родителя). См. `Timeline.tsx::breakdownPopoverRef`/`singleBreakdownPopoverRef` обёртки.
 
 ---
 

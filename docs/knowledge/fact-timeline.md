@@ -103,12 +103,13 @@ Entries используют `flex: '1 0 auto'` с минимальной выс
 - **Motivation:** В длинных сессиях (50+ entries) пользователь может случайно проскроллить вверх и не знать, что ниже есть актуальные (не-красные) данные.
 - **Invisible Intent:** Использование `querySelectorAll('[data-segment]')` вместо прямого обхода `children` необходимо из-за наличия в `scrollRef` технических обёрток (relative wrappers) и анимационных оверлеев, которые не являются сегментами данных.
 
-### Token Count Indicator (Cmd+Hover)
-При зажатом Cmd и открытом tooltip в footer отображается оценка токенов: `⚡ ↑342 ↓2.3K`.
-- **↑ (User message):** Эвристика `Math.ceil(content.length / 3.5)`. Оффлайн-токенизатора для Claude 3+ не существует — Anthropic не опубликовали. Пакет `@anthropic-ai/tokenizer` (npm) — только Claude 1/2. Для кода/JSON разница ±10%, для русского текста хуже (~1 токен ≈ 2 символа).
-- **↓ (Response):** Точные `output_tokens` из `message.usage` в JSONL assistant entries.
+### Token Count Indicator (Cmd+Hover + range action menu)
+В footer'е Cmd+hover tooltip'а и в rangeActionMenu при двойном клике на Timeline — chip `⚡ ↑XXK`. Одно число, hover на чип открывает второй popover с категорийным breakdown'ом. Подробности про popover, JSONL/API toggle и архитектуру close-логики — `fact-clipboard-tools.md::Range Token Estimate + Breakdown popover`.
+
+- **↑ (chip-значение):** для Claude-табов — IPC `claude:estimate-range-tokens` (тот же resolveSessionChain + backtrace + forward-expand что и copy-range). Для single-entry Cmd+hover — range = [uuid, uuid], lazy fetch при наведении на chip с кэшем по uuid. Для rangeActionMenu — fetch при открытии меню. Возвращает «вес записей в JSONL диапазона» (chars/3.5 по 10 категориям, summed). Heuristic `content.length/3.5` оставлен только как fallback **до прихода ответа от backend'а** и для Gemini-табов (у них нет своего estimate-range-tokens IPC).
+- **↓ убран с chip-а.** Раньше chip показывал `↑XXK ↓YYK`, где `↓` — `output_tokens` из API. Шкалы разные (JSONL chars/3.5 vs Anthropic billing), их сосуществование на одном chip-е вводило в заблуждение — `↓` теперь доступен только внутри API-mode breakdown popover'а как часть осознанного выбора режима. См. `methodology/design.md::Метрика-инвариант`.
 - **Ловушка: несколько assistant entries за ход.** Claude пишет отдельный assistant entry на каждый шаг (thinking → tool_use → text). Каждый имеет свой `message.usage`. Нужно **суммировать** `output_tokens` по всем assistant entries до следующего user.
-- **Ловушка: `input_tokens` ≠ размер сообщения.** Поле `input_tokens` в usage — только uncached часть контекста. Полный контекст = `input_tokens + cache_read_input_tokens + cache_creation_input_tokens` (может быть 50K+ для длинных сессий). Поэтому для ↑ используется эвристика от длины текста, а не API-данные.
+- **Ловушка: `input_tokens` ≠ размер сообщения.** Поле `input_tokens` в usage — только uncached часть контекста. Полный контекст = `input_tokens + cache_read_input_tokens + cache_creation_input_tokens` (может быть 50K+ для длинных сессий). В API-mode popover'а Input = сумма всех трёх полей (каждое только если присутствует, без zero-fill).
 
 ### Provider+Model+think badge в footer assistant tooltip
 

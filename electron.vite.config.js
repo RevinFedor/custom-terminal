@@ -1,6 +1,7 @@
 import { defineConfig } from 'electron-vite';
 import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
+import { codeInspectorPlugin } from 'code-inspector-plugin';
 import { resolve } from 'path';
 import { config } from 'dotenv';
 
@@ -39,11 +40,6 @@ renderer: {
     },
     build: {
       outDir: 'dist/renderer',
-      // Inline source maps so react-grab can symbolicate fiber._debugStack
-      // back into /src/... paths inside the packaged .app. Required for
-      // React 19.2 where _debugSource is gone and react-grab/bippy rely
-      // on stack-based resolution via sourcemaps.
-      sourcemap: 'inline',
       rollupOptions: {
         input: resolve(__dirname, 'index.html')
       },
@@ -53,16 +49,35 @@ renderer: {
         requireReturnsDefault: 'auto'
       }
     },
-    plugins: [react(), tailwindcss()],
+    plugins: [
+      // code-inspector-plugin MUST come BEFORE react() — it stamps
+      // data-insp-path="src/Foo.tsx:42:6" attributes on every JSX element
+      // at compile time. Works in prod via dev:()=>true override. Pure
+      // build-time DOM injection — no Fiber, no sourcemap, no fetch — so
+      // it survives React 19 (_debugSource gone), Electron file://, and
+      // the lack of a dev server in a packaged .app.
+      codeInspectorPlugin({
+        bundler: 'vite',
+        dev: () => true,
+        // Quirk: plugin checks `server !== "close"` (string!), not boolean.
+        // Passing `false` here still starts the TCP listener on :5678 and
+        // hangs `vite build` because event loop never exits.
+        server: 'close',
+        behavior: {
+          locate: false,
+          copy: false, // custom formatter via `code-inspector:trackCode` event
+        },
+        // Shift+Opt — safe from system shortcuts (Cmd-anything conflicts
+        // with paste/copy/save and triggers the inspector overlay on every
+        // Cmd press, which is the wrong default UX).
+        hotKeys: ['altKey', 'shiftKey'],
+        pathType: 'relative',
+      }),
+      react(),
+      tailwindcss(),
+    ],
     define: {
       'process.env.GEMINI_API_KEY': JSON.stringify(env.GEMINI_API_KEY || ''),
-      // Force React to load its development build even in production builds.
-      // This keeps `console.createTask` / `_debugStack` alive on React 19 so
-      // react-grab can resolve component source paths inside the installed
-      // .app. Build mode itself (minify, tree-shake) is unaffected — only
-      // the React runtime entry switches. Acceptable here because this is
-      // a local-only Electron app, not a redistributable bundle.
-      'process.env.NODE_ENV': JSON.stringify('development'),
     },
     resolve: {
       alias: [
