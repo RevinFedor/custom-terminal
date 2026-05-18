@@ -9,14 +9,24 @@ const http = require('http');
 const https = require('https');
 const net = require('net');
 
-// Load .env file (works in both dev and packaged builds)
-try {
-  const envPath = path.resolve(app.isPackaged ? path.dirname(process.execPath) : process.cwd(), '.env');
-  if (fs.existsSync(envPath)) {
-    for (const line of fs.readFileSync(envPath, 'utf8').split('\n')) {
+// Load .env file (works in both dev and packaged builds).
+// Production: prefer ~/.noted-terminal/.env (survives reinstall) and fall back
+// to the .env next to execPath if present. Dev: project cwd.
+function loadEnvFile(p) {
+  try {
+    if (!fs.existsSync(p)) return;
+    for (const line of fs.readFileSync(p, 'utf8').split('\n')) {
       const match = line.match(/^([^#=]+)=(.*)$/);
       if (match) process.env[match[1].trim()] = match[2].trim();
     }
+  } catch { /* ignore */ }
+}
+try {
+  if (app.isPackaged) {
+    loadEnvFile(path.join(os.homedir(), '.noted-terminal', '.env'));
+    loadEnvFile(path.join(path.dirname(process.execPath), '.env'));
+  } else {
+    loadEnvFile(path.resolve(process.cwd(), '.env'));
   }
 } catch { /* .env optional */ }
 
@@ -583,6 +593,8 @@ const bridgeKnownSessions = new Map(); // tabId → sessionId
 const bridgeMetadata = new Map(); // tabId → { model, contextPct }
 const bridgePidCache = new Map(); // claudePid → tabId
 const bridgeFileMtimes = new Map(); // filename → mtimeMs
+const bridgeStaleLogged = new Set(); // filenames we've already warned about (dedupe spam)
+const BRIDGE_STALE_SECONDS = 600; // bridge.json older than this = stale process, skip
 let bridgeWatcher = null;
 let bridgePollInterval = null;
 
@@ -599,16 +611,58 @@ function startSessionBridge() {
       const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
       if (!data.session_id || !data.ppid) return;
 
+      // === LIVENESS CHECKS (skip stale bridge.json from long-dead claude processes) ===
+      // Claude CLI does NOT clean up its bridge.json on exit — files in ~/.claude/bridge/
+      // can be months old. If we naively trust them, PID reuse + path-prefix tolerance
+      // can stomp on a freshly-resumed tab with an ancient sessionId. Two cheap probes:
+      //
+      // 1. transcript file existence — if Claude wrote bridge.json the JSONL must exist
+      //    on disk; missing = bridge.json is a tombstone from a deleted/cleaned session.
+      // 2. updated_at freshness — anything older than 10 minutes is from a stale process;
+      //    a live Claude rewrites bridge.json after every assistant turn.
+      //
+      // Both probes are file-system stat calls; no API/CLI calls, no flakiness.
+      // See docs/knowledge/fix-bridge-stale-takeover.md for full incident report.
+      if (data.transcript_path && !fs.existsSync(data.transcript_path)) {
+        if (!bridgeStaleLogged.has(filename)) {
+          bridgeStaleLogged.add(filename);
+          console.warn('[Bridge:DeadTranscript] ' + filename + ' references missing JSONL (' + (data.transcript_path || '?') + ') — ignoring forever');
+        }
+        return;
+      }
+      const nowSec = Math.floor(Date.now() / 1000);
+      if (typeof data.updated_at === 'number' && (nowSec - data.updated_at) > BRIDGE_STALE_SECONDS) {
+        if (!bridgeStaleLogged.has(filename)) {
+          bridgeStaleLogged.add(filename);
+          const ageMin = Math.round((nowSec - data.updated_at) / 60);
+          console.warn('[Bridge:StaleSkip] ' + filename + ' updated_at=' + data.updated_at + ' (' + ageMin + ' min ago) — ignoring until file is rewritten by live claude');
+        }
+        return;
+      }
+
       // Check PID cache first
       let tabId = bridgePidCache.get(data.ppid);
       let pidSource = tabId ? 'cache' : 'resolve';
 
       let isFreshProcess = false;
       if (!tabId) {
-        // Resolve Claude PID → parent (shell PID) → match to our PTY
+        // Resolve Claude PID → parent (shell PID) → match to our PTY.
+        // Verify the PID is actually a claude process (not a PID-reuse coincidence)
+        // by inspecting both `command=` (process name) and `ppid=`. If the kernel
+        // has recycled this PID for a non-claude binary, command-name guard rejects.
         try {
-          const ppidStr = await execAsync('ps -p ' + data.ppid + ' -o ppid=');
-          const shellPid = parseInt(ppidStr.trim());
+          const psOut = await execAsync('ps -p ' + data.ppid + ' -o ppid=,command=');
+          const trimmed = psOut.trim();
+          if (!trimmed) return; // process gone — bridge.json points to dead PID
+          const m = trimmed.match(/^(\d+)\s+(.+)$/);
+          if (!m) return;
+          const shellPid = parseInt(m[1], 10);
+          const commandLine = m[2];
+          // Accept anything resembling claude (handles full paths, "node /…/claude.js", aliases).
+          if (!/(^|\/)claude(\b|[^a-zA-Z])/i.test(commandLine) && !/claude/i.test(commandLine)) {
+            console.warn('[Bridge:NotClaude] ppid=' + data.ppid + ' command="' + commandLine + '" — PID reuse, ignoring bridge file');
+            return;
+          }
           for (const [tid, pty] of terminals) {
             if (pty.pid === shellPid) { tabId = tid; break; }
           }
@@ -654,10 +708,12 @@ function startSessionBridge() {
           }
           return;
         }
-        // Related path (cd up/down within same branch) — proceed and update terminalProjects so
-        // future bridge updates use the bridge cwd as truth.
-        console.log('[Bridge:CwdGuard] Path drift OK (tab=' + tabCwd + ' bridge=' + data.cwd + ') — accepting and updating terminalProjects');
-        terminalProjects.set(tabId, data.cwd);
+        // Related path (cd up/down within same branch) — accept for THIS update.
+        // Do NOT overwrite terminalProjects: when a stale bridge.json sneaks past
+        // the freshness/transcript guards, leaving the canonical tab cwd intact
+        // means subsequent checks still compare against the right project.
+        // See docs/knowledge/fix-bridge-stale-takeover.md.
+        console.log('[Bridge:CwdGuard] Path drift OK (tab=' + tabCwd + ' bridge=' + data.cwd + ') — accepted for this update, tab cwd preserved');
       }
 
       // Debug: log PID chain resolution for session detection
@@ -5348,6 +5404,29 @@ ipcMain.handle('mcp:adopt-agent', async (event, { claudeTabId, geminiTabId }) =>
 });
 
 app.whenReady().then(() => {
+  // Microphone permission for Soniox dictation (MicButton, mobile-web composer).
+  // Without these two handlers Electron's default is "deny" — getUserMedia
+  // rejects with AbortError "The user aborted a request" even when macOS itself
+  // would prompt. Allow for our own origin (file:// in prod, http://localhost
+  // in dev). On macOS the system-level mic permission prompt still fires on
+  // first capture — this only opens the Electron-internal gate.
+  try {
+    const { session } = require('electron');
+    session.defaultSession.setPermissionRequestHandler((_wc, permission, callback) => {
+      if (permission === 'media' || permission === 'audioCapture' || permission === 'microphone') {
+        return callback(true);
+      }
+      callback(false);
+    });
+    session.defaultSession.setPermissionCheckHandler((_wc, permission) => {
+      if (permission === 'media' || permission === 'audioCapture' || permission === 'microphone') return true;
+      return false;
+    });
+    console.log('[Startup] Microphone permission handlers installed');
+  } catch (e) {
+    console.error('[Startup] Failed to install permission handlers:', e.message);
+  }
+
   // Диагностика для отладки проблемы с окном
   console.log('[Startup] ═══════════════════════════════════════');
   console.log('[Startup] Platform:', process.platform);
@@ -7281,6 +7360,26 @@ ipcMain.handle('claude:send-command', async (event, tabId, command) => {
   });
 });
 
+// ========== Soniox temporary API key ==========
+// Mint a short-lived (5 min) key bound to websocket-transcribe usage. Renderer
+// uses this for dictation in Claude PTY/SDK tabs. Mobile-web has its own
+// equivalent endpoint (POST /api/soniox-token) in web-server.js.
+ipcMain.handle('soniox:mint-token', async () => {
+  const key = process.env.SONIOX_API_KEY;
+  if (!key) throw new Error('SONIOX_API_KEY not configured');
+  const r = await fetch('https://api.soniox.com/v1/auth/temporary-api-key', {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ usage_type: 'transcribe_websocket', expires_in_seconds: 300 }),
+  });
+  if (!r.ok) {
+    const txt = await r.text().catch(() => '');
+    throw new Error(`soniox ${r.status}: ${txt.slice(0, 200)}`);
+  }
+  const data = await r.json();
+  return { api_key: data.api_key, expires_at: data.expires_at };
+});
+
 // ========== LLM Provider Switching (per-tab) ==========
 // All three handlers accept (event, { tabId, ... }). tabId is required so that
 // switching the provider in one tab does NOT affect any other tab.
@@ -9077,6 +9176,16 @@ require(path.join(srcMainDir, 'ipc', 'claude-data')).register({ projectManager, 
 // semantic-index:watch, semantic-index:rebuild, semantic-index:status → ipc/semantic-index-status.js
 require(path.join(srcMainDir, 'ipc', 'semantic-index-status')).register({ getMainWindow: () => mainWindow });
 
+// global-dict:* → src/main/global-dictation/index.js
+// System-wide voice dictation (Cmd+`) — owns two overlay windows (chip+rec)
+// and pastes the transcript into whatever app currently has focus.
+try {
+  const globalDict = require(path.join(srcMainDir, 'global-dictation'));
+  globalDict.init({ getMainWindow: () => mainWindow });
+} catch (e) {
+  console.error('[GlobalDict] init failed:', e.message);
+}
+
 
 
 // ========== SESSION PERSISTENCE ==========
@@ -10287,7 +10396,12 @@ async function loadSdkModelCapabilities() {
       // SDK 0.3.x requires `allowDangerouslySkipPermissions: true` alongside
       // `permissionMode: 'bypassPermissions'` — without it the CLI process
       // refuses to start (safety gate against accidentally inheriting bypass).
-      const q = query({ prompt: neverEnding, options: { permissionMode: 'bypassPermissions', allowDangerouslySkipPermissions: true } });
+      const claudeBin = resolveClaudeBinaryPath();
+      const q = query({ prompt: neverEnding, options: {
+        permissionMode: 'bypassPermissions',
+        allowDangerouslySkipPermissions: true,
+        ...(claudeBin ? { pathToClaudeCodeExecutable: claudeBin } : {}),
+      } });
       const models = await q.supportedModels();
       try { q.close(); } catch {}
       const map = {};
@@ -10308,6 +10422,82 @@ async function loadSdkModelCapabilities() {
     }
   })();
   return _sdkModelCapsPromise;
+}
+
+// Resolve the path to the native Claude binary shipped by the SDK's optional
+// platform package (@anthropic-ai/claude-agent-sdk-<plat>-<arch>). The SDK
+// resolves this internally via createRequire(import.meta.url) and hands the
+// path to child_process.spawn — but in a packaged Electron app sdk.mjs lives
+// at app.asar/.../sdk.mjs, so the resolved path is also inside app.asar.
+// spawn() on an asar-wrapped binary path errors with ENOTDIR (asar is a file,
+// not a directory). electron-builder rewrites fs/require for app.asar.unpacked
+// targets but NOT spawn args. Fix: resolve once at startup, rewrite asar →
+// asar.unpacked when both paths are inside the application bundle, hand the
+// real on-disk path to SDK via options.pathToClaudeCodeExecutable.
+//
+// Two resolve attempts in priority order, both via plain require.resolve from
+// this file (works in dev — node_modules on disk — AND in production — main.js
+// lives inside app.asar so Electron's asar-patched resolver finds the SDK's
+// optional platform package the same way):
+//   1) require.resolve('@anthropic-ai/claude-agent-sdk-<plat>-<arch>/claude')
+//   2) fallback: derive from require.resolve('@anthropic-ai/claude-agent-sdk')
+//      → SDK main entry sdk.mjs → ../<platformPkg>/claude
+// Earlier version used createRequire from package.json — that fails because
+// SDK's "exports" field doesn't expose package.json, throwing
+// ERR_PACKAGE_PATH_NOT_EXPORTED. Don't go through package.json.
+// Cached because the resolution does sync FS work.
+let _claudeBinaryPath = undefined; // undefined = not yet probed; null = probed, not found
+function resolveClaudeBinaryPath() {
+  if (_claudeBinaryPath !== undefined) return _claudeBinaryPath;
+  const platformPkg = '@anthropic-ai/claude-agent-sdk-' + process.platform + '-' + process.arch;
+  const candidates = [];
+  // Direct resolve — works as long as the platform pkg is reachable from
+  // main.js's module graph (it is — both in dev node_modules and in app.asar).
+  try { candidates.push({ src: 'direct', path: require.resolve(platformPkg + '/claude') }); }
+  catch (e) { console.warn('[ClaudeSDK] direct resolve of ' + platformPkg + '/claude failed: ' + e.message); }
+  // Fallback: locate SDK main entry (sdk.mjs), then walk to the optional
+  // platform pkg. platformPkg already includes the @anthropic-ai/ scope.
+  try {
+    const sdkMain = require.resolve('@anthropic-ai/claude-agent-sdk');
+    // sdkMain ≈ <prefix>/node_modules/@anthropic-ai/claude-agent-sdk/sdk.mjs
+    // Option A — top-level sibling (npm dedup'd the optional pkg):
+    //   <prefix>/node_modules/@anthropic-ai/<scopelessPlatformPkg>/claude
+    // Option B — nested inside SDK's own node_modules (npm did NOT dedup,
+    // this is what production currently has):
+    //   <sdkDir>/node_modules/<platformPkg>/claude
+    const sdkDir = path.dirname(sdkMain);
+    const scopeRoot = path.dirname(sdkDir);                // .../node_modules/@anthropic-ai
+    const platformPkgName = platformPkg.replace(/^@anthropic-ai\//, '');
+    const sibling = path.join(scopeRoot, platformPkgName, 'claude');
+    const nested = path.join(sdkDir, 'node_modules', platformPkg, 'claude');
+    candidates.push({ src: 'sibling', path: sibling });
+    candidates.push({ src: 'nested', path: nested });
+  } catch (e) {
+    console.warn('[ClaudeSDK] cannot resolve @anthropic-ai/claude-agent-sdk main: ' + e.message);
+  }
+  if (candidates.length === 0) {
+    console.warn('[ClaudeSDK] no candidates for claude binary path — SDK will fall back to default lookup (likely ENOTDIR in packaged build)');
+    _claudeBinaryPath = null;
+    return _claudeBinaryPath;
+  }
+  for (const { src, path: candidate } of candidates) {
+    // Rewrite app.asar → app.asar.unpacked. asarUnpack in package.json
+    // ensures the binary is present on disk under .unpacked.
+    const unpacked = candidate.replace(/([\/\\])app\.asar([\/\\])/, '$1app.asar.unpacked$2');
+    if (fs.existsSync(unpacked)) {
+      console.log('[ClaudeSDK] claude binary resolved via ' + src + ': ' + unpacked + (unpacked !== candidate ? ' (rewrote from asar)' : ''));
+      _claudeBinaryPath = unpacked;
+      return _claudeBinaryPath;
+    }
+    if (fs.existsSync(candidate)) {
+      console.log('[ClaudeSDK] claude binary resolved via ' + src + ': ' + candidate);
+      _claudeBinaryPath = candidate;
+      return _claudeBinaryPath;
+    }
+  }
+  console.warn('[ClaudeSDK] claude binary not found on disk. Candidates tried:\n' + candidates.map(c => '  ' + c.src + ': ' + c.path).join('\n'));
+  _claudeBinaryPath = null;
+  return _claudeBinaryPath;
 }
 
 let _sdkMcpServersCache = null;
@@ -10392,6 +10582,7 @@ async function sdkStartQuery(tabId, cwd, prompt, resumeSessionId, model, effort,
   // thinking: 'adaptive' (default — Opus 4.7+, effort drives thinking depth) or 'disabled'.
   // We always set it explicitly so toggling the UI Think pill is observable in JSONL.
   const thinkingMode = thinking === 'disabled' ? 'disabled' : 'adaptive';
+  const claudeBin = resolveClaudeBinaryPath();
   const options = {
     abortController,
     cwd: cwd || process.cwd(),
@@ -10399,6 +10590,9 @@ async function sdkStartQuery(tabId, cwd, prompt, resumeSessionId, model, effort,
     // SDK 0.3.x explicit safety gate — must be true together with
     // bypassPermissions or the CLI rejects the request at handshake.
     allowDangerouslySkipPermissions: true,
+    // Packaged app: rewrite asar→asar.unpacked path. Without this SDK's own
+    // resolver hands an asar-wrapped path to child_process.spawn → ENOTDIR.
+    ...(claudeBin ? { pathToClaudeCodeExecutable: claudeBin } : {}),
     model: model || undefined,
     effort: effort || 'high',
     thinking: { type: thinkingMode },
@@ -10709,9 +10903,14 @@ ipcMain.handle('claude-sdk:probe-commands', async (event, { tabId }) => {
       // Bare `(async function*(){})()` reaches `return` immediately → SDK
       // tears down ProcessTransport between probe calls.
       const neverYield = (async function*() { await new Promise(() => {}); })();
+      const claudeBin = resolveClaudeBinaryPath();
       q = sdk.query({
         prompt: neverYield,
-        options: { allowDangerouslySkipPermissions: true, permissionMode: 'bypassPermissions' },
+        options: {
+          allowDangerouslySkipPermissions: true,
+          permissionMode: 'bypassPermissions',
+          ...(claudeBin ? { pathToClaudeCodeExecutable: claudeBin } : {}),
+        },
       });
       spawned = true;
       console.log('[SlashProbe] spawned probe-only query (no active session)');

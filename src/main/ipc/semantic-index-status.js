@@ -394,22 +394,51 @@ function rebuildIndex(projectId, mainWindow, opts = {}) {
     }
     const success = reasons.length === 0;
 
-    console.log(
-      '[SemanticIndexStatus] Rebuild', projectId,
-      'exit code', code, 'signal', signal,
-      'sawSummary=', sawSummary,
-      'summaryErr=', summaryErrors,
-      'summaryWarn=', summaryWarnings,
-      'perFileBad=', perFileBad,
-      'success=', success,
-      reasons.length ? `reasons=[${reasons.join('; ')}]` : ''
-    );
+    // Стрим stderr в наш единый лог при любом ненулевом exit / ненулевом stderr.
+     // Иначе юзер видит «exit code 1» в тосте без указания где упало (CLAUDE.md.bak,
+    // claude/jq missing, GEMINI_API_KEY, set -u и т.п.). stderrTail обрезан до
+    // последних 2000 байт — этого достаточно для root cause.
+    if (!success || stderrTail.trim()) {
+      const stderrPreview = stderrTail.trim().slice(-1200);
+      console.log(
+        '[SemanticIndexStatus] Rebuild', projectId,
+        'exit code', code, 'signal', signal,
+        'sawSummary=', sawSummary,
+        'summaryErr=', summaryErrors,
+        'summaryWarn=', summaryWarnings,
+        'perFileBad=', perFileBad,
+        'success=', success,
+        reasons.length ? `reasons=[${reasons.join('; ')}]` : '',
+        stderrPreview ? `stderr=<<<${stderrPreview}>>>` : ''
+      );
+    } else {
+      console.log(
+        '[SemanticIndexStatus] Rebuild', projectId,
+        'exit code', code, 'signal', signal,
+        'success=', success
+      );
+    }
+
+    // Toast в renderer — clean tail из stderr добавляем к reasons, чтобы юзер
+    // видел реальную причину (CLAUDE.md.bak exists / claude CLI missing / etc),
+    // а не сухое «exit code 1».
+    const stderrClean = stderrTail
+      .replace(/\x1b\[[0-9;]*m/g, '')   // ANSI colors
+      .trim()
+      .split('\n')
+      .map((l) => l.trim())
+      .filter(Boolean)
+      .slice(-3)
+      .join(' · ');
+    const combinedError = success
+      ? null
+      : [reasons.join('; '), stderrClean].filter(Boolean).join(' — ') || 'unknown failure';
 
     send('semantic-index:rebuild-done', {
       success,
       code,
       signal,
-      error: success ? null : (reasons.join('; ') || stderrTail || 'unknown failure'),
+      error: combinedError,
       stats: {
         sawSummary,
         summaryErrors,

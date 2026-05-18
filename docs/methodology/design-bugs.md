@@ -543,3 +543,13 @@ Stop — **красный** (`#ef4444`), даже если accent проекта
 - [ ] **Activity selector.** Если есть «активный» state — проверяется И `projectId`, И `tabId`?
 - [ ] **Динамика layout.** Popup перепозиционируется при resize окна / открытии sidebar?
 - [ ] **Truth from server.** Post-factum badge (модель/провайдер/регион) рендерится из ответа сервера, не из локального UI-флага?
+
+## 14. Voice/media capture в Electron renderer
+
+`getUserMedia` + `WebSocket(wss://)` + `AudioWorklet` — три места где Electron сам режет фичу до того как macOS успеет показать системный prompt. Когда «mic-кнопка нажимается, ничего не происходит, в DevTools пусто или AbortError» — корень почти всегда в одном из трёх:
+
+`getUserMedia` reject'ит `AbortError: The user aborted a request` (юзер ничего не делал — это Electron deny по умолчанию). Лечится `session.defaultSession.setPermissionRequestHandler` в main process для `media`/`audioCapture`/`microphone` → `callback(true)` + `setPermissionCheckHandler` для тех же permission names. macOS-уровень разрешения всё равно спросится при первом capture — это нормальный системный prompt, отдельный от Electron-уровня. WebSocket к внешнему домену даёт `Refused to connect` если в CSP нет `connect-src wss://your.domain` — стандартный `default-src 'self'` это запрещает. AudioWorklet через `addModule(blob:URL)` режется на `script-src 'self' 'unsafe-inline'` (нужно добавить `blob:` в `script-src`, `worker-src`, `child-src`). Альтернатива — deprecated `ScriptProcessorNode` работает без CSP-расширений и без blob-инфры; для голоса latency 4096-sample буфера (~85 мс @ 48 kHz) незаметна.
+
+CSP в `<meta http-equiv>` подхватывается только после Cmd+R окна — hot-reload renderer не обновляет head meta. Permission handler в main требует рестарта main process (electron-vite не перегружает main на правки).
+
+В проекте: `knowledge/fact-dictation.md::CSP и permission — два обязательных пререквизита`.

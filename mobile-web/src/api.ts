@@ -153,6 +153,11 @@ export const Api = {
       `/api/sdk-tabs/${encodeURIComponent(tabId)}/params`,
       { method: 'POST', body: JSON.stringify(partial) },
     ),
+  // Soniox temporary API key for browser-side mic dictation. Backend mints a
+  // 5-min ephemeral key bound to websocket-transcribe usage so we never ship
+  // the long-lived SONIOX_API_KEY to the phone.
+  sonioxToken: () =>
+    api<{ api_key: string; expires_at: string }>('/api/soniox-token', { method: 'POST', body: '{}' }),
   // Fire-and-forget diagnostic log — server appends to logs/dev.log. Used from
   // mobile to debug things you can't see locally (timeline scroll, focus, etc).
   log: (tag: string, msg: string, data?: any) => {

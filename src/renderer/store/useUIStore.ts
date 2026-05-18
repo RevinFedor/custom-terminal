@@ -211,6 +211,12 @@ interface UIStore {
 
   terminalFontSize: number;
 
+  // SDK assistant rendering — отдельно от terminalFontSize, потому что PTY
+  // xterm.js рендерит моноширинный grid (1px шаг ощущается сразу), а SDK-таб
+  // рендерит markdown в потоке Virtuoso, и юзеру обычно комфортнее ставить
+  // SDK-шрифт крупнее без раздувания PTY-табов.
+  sdkFontSize: number;
+
   tabsFontSize: number;        // Main + Utils tabs in TabBar
 
   projectTabsFontSize: number; // Project chips in Title Bar
@@ -265,6 +271,7 @@ interface UIStore {
   setSidebarWidth: (width: number) => void;
   setTabSidebarWidth: (width: number) => void;
   setTerminalFontSize: (size: number) => void;
+  setSdkFontSize: (size: number) => void;
 
   setTabsFontSize: (size: number) => void;
 
@@ -815,6 +822,14 @@ const loadFilePreviewFontSize = (): number => {
   return 13;
 };
 
+const loadSdkFontSize = (): number => {
+  try {
+    const v = localStorage.getItem('noted-terminal-sdk-font-size');
+    if (v) return Math.max(8, Math.min(24, Number(v) || 13));
+  } catch {}
+  return 13;
+};
+
 const loadPromptPickerFontSize = (): number => {
   try {
     const v = localStorage.getItem('noted-terminal-prompt-picker-font-size');
@@ -1194,6 +1209,7 @@ const initialApiSettings = loadApiSettings();
 export const useUIStore = create<UIStore>((set, get) => ({
   // Font Settings
   terminalFontSize: initialFontSettings.terminalFontSize,
+  sdkFontSize: loadSdkFontSize(),
   tabsFontSize: initialFontSettings.tabsFontSize,
   projectTabsFontSize: initialFontSettings.projectTabsFontSize,
   sidebarFontSize: initialFontSettings.sidebarFontSize,
@@ -1427,6 +1443,11 @@ export const useUIStore = create<UIStore>((set, get) => ({
     set({ terminalFontSize: clamped });
     const { tabsFontSize, projectTabsFontSize, sidebarFontSize } = get();
     saveFontSettings({ terminalFontSize: clamped, tabsFontSize, projectTabsFontSize, sidebarFontSize });
+  },
+  setSdkFontSize: (size) => {
+    const clamped = Math.max(8, Math.min(24, size));
+    set({ sdkFontSize: clamped });
+    try { localStorage.setItem('noted-terminal-sdk-font-size', String(clamped)); } catch {}
   },
   setTabsFontSize: (size) => {
     const clamped = Math.max(10, Math.min(20, size));

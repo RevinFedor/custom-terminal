@@ -466,7 +466,7 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
     // it as part of the same command line; the renderer never needs to care which
     // project owns which session.
     console.warn('[InfoPanel:ManualSet] MANUAL session set for tab', activeTabId, ':', newId.substring(0, 8));
-    useWorkspaceStore.getState().setClaudeSessionId(activeTabId, newId);
+    useWorkspaceStore.getState().setClaudeSessionId(activeTabId, newId, 'userManual');
     setSessionInputMode(null);
     setManualSessionId('');
     setValidationResult(null);

@@ -229,28 +229,28 @@
    • translateX(-167%): stripe.right_edge = -7% (полностью off-screen left)
    • translateX(+167%): stripe.left_edge = 100% (полностью off-screen right)
    На обоих концах stripe невидим → loop-снап незаметен.
+   Continuous flow: stripe идёт ~1s в viewport'е, ~1.4s проводит off-screen — это даёт
+   гэп в ~1.4s между «уход вправо» и «появление слева» снова. Юзер: «должна идти
+   не заканчиваясь, сразу продолжаясь в начале». Решение — два stripe'а одинаковой
+   анимации со сдвигом фазы на половину периода (`animation-delay: -1.2s`): пока первый
+   ушёл за правый край, второй уже в середине viewport'а. Визуально это непрерывная
+   процессия, не серия одиночных проходов.
    Интенсивность пика 0.20 (не 0.32) — фон уже несёт «вкладка активна», шиммер только
    уточняет «AI думает», не должен спорить с process-bar за внимание. */
-@keyframes tab-ai-busy-sweep {
-  0%   { transform: translateX(-167%); }
-  100% { transform: translateX(167%); }
+/* AI-busy фон таба: целый таб мягко пульсирует фоном между прозрачным и
+   полупрозрачным акцент-цветом. Раньше был sweep-шиммер (полоса слева-направо
+   через ::before+::after с translateX) — юзер: «временно отключи пульсацию
+   слева-направо, сделай пульсацию фона». Цикл и цвет наследуются от
+   processBar (Settings → Полоска процесса → Цвет/Цикл), single source of
+   truth: --process-bar-color-b + --process-bar-duration на :root.
+   color-mix() поддерживается Chromium 111+ (Electron 28 = Chromium 120). */
+@keyframes tab-ai-busy-pulse {
+  0%   { background-color: transparent; }
+  50%  { background-color: color-mix(in srgb, var(--process-bar-color-b, #ffffff) 14%, transparent); }
+  100% { background-color: transparent; }
 }
-.tab-ai-busy-shimmer::after {
-  content: '';
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  left: 0;
-  width: 60%;
-  background: linear-gradient(
-    90deg,
-    rgba(255,255,255,0) 0%,
-    rgba(255,255,255,0.06) 30%,
-    rgba(255,255,255,0.20) 50%,
-    rgba(255,255,255,0.06) 70%,
-    rgba(255,255,255,0) 100%
-  );
-  animation: tab-ai-busy-sweep 2.4s linear infinite;
+.tab-ai-busy-shimmer {
+  animation: tab-ai-busy-pulse var(--process-bar-duration, 2400ms) ease-in-out infinite;
   pointer-events: none;
 }
 

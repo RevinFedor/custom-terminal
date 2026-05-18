@@ -413,6 +413,16 @@ SDK 0.3 не поддерживает midstream приём нового prompt'�
 
 **Что пробовали и почему не сработало.** Первая мысль была — добавить вызов `s.setClaudeSessionId(tabId, sid)` поверх `updateSDKState` в renderer (handleMessage SDK iterator). Не сработало: `setClaudeSessionId` имеет guard `if (tab.claudeSessionId === sessionId) return` и сбрасывает overlay-флаги (`wasInterrupted`/`overlayDismissed`) — для SDK таба эти сбросы случайны и могут схлопнуть Interrupted Session Recovery overlay вместо PTY-таба. Решение через `updateSDKState` локальнее: одно место, одно поведение, save-side effect только когда sid реально меняется.
 
+## Repeat/Edit на непрошедших user-bubble'ах
+
+Hover-action-bar (Repeat / Edit) у user-сообщения раньше показывался только когда `isPersistedMsgId(id)` true — id равен JSONL uuid, т.е. сообщение успело долететь до `~/.claude/.../<session>.jsonl`. Все свежие сообщения сначала живут с placeholder-id `user-<Date.now()>` и swap'аются на uuid только когда первый ответный чанк ассистента приходит через `claude-sdk:message`.
+
+Это нормально для happy path, но **полностью теряет recovery-affordance, если `send-message` упал до flush'а в JSONL** — нативный бинарь не нашёлся (`fix-sdk-asar-spawn.md`), токен MCP сорвался, network 5xx и т.п. В UI оставалось висячее сообщение без кнопок: error-toast уже исчез, кликнуть некуда, единственный путь — перепечатать промпт целиком. Юзер: *«слева от сообщения в паре пикселях должна быть кнопка либо «отредактировать», либо кнопка «перезагрузки», чтобы переотправить промпт, но этого почему-то нет»*.
+
+Решение: action-bar показывается и для `user-*` placeholder'ов тоже (`showActions = isPersisted || isPlaceholderUser`). `truncateAndResend` теперь разделяет path по `isPersistedMsgId`: persisted → как раньше (IPC `claude-sdk:truncate-history` режет JSONL ≥ uuid'у, потом fresh send), placeholder → пропуск truncate (нет uuid для JSONL — резать нечего), просто `setMessages` срезает локально с того места и `claude-sdk:send-message` отправляет новый текст. Edit для placeholder работает так же, как Repeat, только текст может быть отредактирован.
+
+Принцип — `methodology/design.md::Failed optimistic-action оставляет retry-точку в UI`.
+
 ## Hex chip подсветка в `AssistantTextPart`
 
 Hex-цвета (`#FFF` / `#DA7756` / `#DA775680`) в ответе ассистента оборачиваются в chip со своим `background-color` и контрастным `color` по YIQ-формуле — юзер просил «менять bg текста под цвет где решетка и 6 символов», чтобы цвет считывался глазом, а не ментально декодировался. Реализовано не через кастомный `code` mapper в `ReactMarkdown` (тот видит только ``…``), а через rehype-плагин — основной кейс это **plain text** ассистента (`#DA7756` без backtick'ов), его mapper'ом не дотянуться. Поэтому подсветка работает одинаково в plain `<p>`, inline-code и в блочном коде (CSS/SCSS включительно — «без разницы какая будет разметка, нужно отображать background»).
@@ -430,3 +440,5 @@ Hex-цвета (`#FFF` / `#DA7756` / `#DA775680`) в ответе ассисте
 - `src/renderer/components/Workspace/ClaudeSDK/TaskDetailPane.tsx::AgentDetail::messagesWithPrompt` → prepend synthetic user-bubble из `task.initialPrompt` если JSONL ещё не флашнут (или вернул пустой массив user-сообщений).
 - `src/renderer/components/Workspace/ClaudeSDK/sdkHistoryParser.ts::parseSubagentMessages` — выделенный helper из `ClaudeSDKTab::loadHistory` чтобы pane'овский AgentDetail переиспользовал тот же JSONL-парсер.
 - `src/renderer/store/useWorkspaceStore.ts::updateSDKState` → `if (sidChanged) saveTabs(workspace.projectId, workspace.tabs)` — без этого SDK таб теряет `claudeSessionId` после Electron restart.
+- `src/main/main.js::resolveClaudeBinaryPath` → один helper для всех трёх SDK-входов (`loadSdkModelCapabilities`, `sdkStartQuery`, `claude-sdk:probe-commands`). Резолвит путь к native `claude`-бинарю, переписывает `app.asar/` → `app.asar.unpacked/`, отдаёт через `options.pathToClaudeCodeExecutable`. Без этого packaged-сборка падает по `ENOTDIR` в `child_process.spawn`. См. `fix-sdk-asar-spawn.md`.
+- `src/renderer/components/Workspace/ClaudeSDK/ClaudeSDKTab.tsx::truncateAndResend` → две ветки persistence (`isPersistedMsgId`): persisted → IPC truncate JSONL, placeholder → пропуск IPC, local-only replace. Обеспечивает retry для упавших `send-message` без перепечатывания промпта.

@@ -306,6 +306,17 @@ class DatabaseManager {
     // Migration: add claude_task_count to persist iteration counter across restarts
     try { this.db.exec(`ALTER TABLE tabs ADD COLUMN claude_task_count INTEGER DEFAULT 0`); } catch (e) {}
 
+    // Migration: add session_status (user-chosen status marker id, vertical mode).
+    // Stores id from useUIStore.sessionStatuses palette. Lookup в renderer'е,
+    // если id больше нет в палитре — marker просто не рендерится, но данные не теряем.
+    try { this.db.exec(`ALTER TABLE tabs ADD COLUMN session_status TEXT DEFAULT NULL`); } catch (e) {}
+
+    // Migration: claude_session_history — JSON array (most-recent-first, cap 5)
+    // of {sessionId, reason, at}. Lets the user revert when an automated writer
+    // (bridge watcher, AutoResume, timeline chain) overwrites the wrong session.
+    // See docs/knowledge/fix-bridge-stale-takeover.md.
+    try { this.db.exec(`ALTER TABLE tabs ADD COLUMN claude_session_history TEXT DEFAULT NULL`); } catch (e) {}
+
     // Index on tab_id for faster lookups in saveTabs
     try { this.db.exec(`CREATE INDEX IF NOT EXISTS idx_tabs_tab_id ON tabs(tab_id) WHERE tab_id IS NOT NULL`); } catch (e) {}
 
@@ -472,6 +483,11 @@ class DatabaseManager {
         isUtility: t.is_utility === 1,
         commandType: t.command_type || undefined,
         claudeSessionId: t.claude_session_id || undefined,
+        claudeSessionHistory: (() => {
+          if (!t.claude_session_history) return undefined;
+          try { return JSON.parse(t.claude_session_history); }
+          catch { return undefined; }
+        })(),
         geminiSessionId: t.gemini_session_id || undefined,
         wasInterrupted: t.was_interrupted === 1,
         overlayDismissed: t.overlay_dismissed === 1,
@@ -487,7 +503,8 @@ class DatabaseManager {
         tabId: t.tab_id || undefined,
         mcpTaskStartedAt: t.mcp_task_started_at || undefined,
         mcpTaskId: t.mcp_task_id || undefined,
-        claudeTaskCount: t.claude_task_count || 0
+        claudeTaskCount: t.claude_task_count || 0,
+        sessionStatus: t.session_status || undefined
       }))
     };
   }
@@ -611,8 +628,8 @@ class DatabaseManager {
 
     const deleteByTabId = this.db.prepare('DELETE FROM tabs WHERE project_id = ? AND tab_id = ?');
     const insert = this.db.prepare(`
-      INSERT INTO tabs (project_id, name, cwd, position, color, is_utility, command_type, claude_session_id, gemini_session_id, was_interrupted, overlay_dismissed, notes, tab_type, url, terminal_id, terminal_name, active_view, created_at, is_collapsed, parent_tab_id, tab_id, mcp_task_started_at, mcp_task_id, claude_task_count)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO tabs (project_id, name, cwd, position, color, is_utility, command_type, claude_session_id, gemini_session_id, was_interrupted, overlay_dismissed, notes, tab_type, url, terminal_id, terminal_name, active_view, created_at, is_collapsed, parent_tab_id, tab_id, mcp_task_started_at, mcp_task_id, claude_task_count, session_status, claude_session_history)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     const transaction = this.db.transaction((tabList) => {
@@ -627,7 +644,10 @@ class DatabaseManager {
 
       // Step 3: Insert all tabs fresh
       tabList.forEach((tab, index) => {
-        insert.run(projectId, tab.name, tab.cwd, index, tab.color || null, tab.isUtility ? 1 : 0, tab.commandType || null, tab.claudeSessionId || null, tab.geminiSessionId || null, tab.wasInterrupted ? 1 : 0, tab.overlayDismissed ? 1 : 0, tab.notes || '', tab.tabType || 'terminal', tab.url || null, tab.terminalId || null, tab.terminalName || null, tab.activeView || null, tab.createdAt || null, tab.isCollapsed ? 1 : 0, tab.parentTabId || null, tab.tabId || null, tab.mcpTaskStartedAt || null, tab.mcpTaskId || null, tab.claudeTaskCount || 0);
+        const historyJson = (tab.claudeSessionHistory && tab.claudeSessionHistory.length > 0)
+          ? JSON.stringify(tab.claudeSessionHistory)
+          : null;
+        insert.run(projectId, tab.name, tab.cwd, index, tab.color || null, tab.isUtility ? 1 : 0, tab.commandType || null, tab.claudeSessionId || null, tab.geminiSessionId || null, tab.wasInterrupted ? 1 : 0, tab.overlayDismissed ? 1 : 0, tab.notes || '', tab.tabType || 'terminal', tab.url || null, tab.terminalId || null, tab.terminalName || null, tab.activeView || null, tab.createdAt || null, tab.isCollapsed ? 1 : 0, tab.parentTabId || null, tab.tabId || null, tab.mcpTaskStartedAt || null, tab.mcpTaskId || null, tab.claudeTaskCount || 0, tab.sessionStatus || null, historyJson);
       });
 
       // Step 4: Clean up tabs that exist in DB but NOT in the new set

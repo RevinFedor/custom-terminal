@@ -4,6 +4,7 @@ import { usePromptsStore, AIPrompt, AIModel, ThinkingLevel } from '../../store/u
 import Tooltip from './Tooltip';
 import { HexColorPicker } from 'react-colorful';
 import { Trash2, Plus } from 'lucide-react';
+import GlobalDictationSettings from './GlobalDictationSettings';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -32,7 +33,7 @@ interface Prompt {
   file_paths?: string[];
 }
 
-type SettingsTab = 'shortcuts' | 'fonts' | 'colors' | 'ai';
+type SettingsTab = 'shortcuts' | 'fonts' | 'colors' | 'ai' | 'dictation';
 
 const DEFAULT_DOC_FILE_PATH = '/Users/fedor/Global-Templates/🧩 Code-Patterns/документация/docs-rules.prompt.md';
 
@@ -398,17 +399,15 @@ function RatioRow({
 // Sidebar behavior toggles (Cmd+/ persistence + click-outside-close).
 // Extracted to its own component so the hooks live at top level (not inside an IIFE
 // inside the main render — that would conditionally call hooks per render branch).
-function SidebarBehaviorSettings() {
+// Заголовок секции рендерится снаружи (SettingsSubSectionHeader), здесь — только toggles.
+function SidebarBehaviorToggles() {
   const sidebarPersistFile = useUIStore((s) => s.sidebarPersistFile);
   const setSidebarPersistFile = useUIStore((s) => s.setSidebarPersistFile);
   const sidebarOverlayCloseOnClickOutside = useUIStore((s) => s.sidebarOverlayCloseOnClickOutside);
   const setSidebarOverlayCloseOnClickOutside = useUIStore((s) => s.setSidebarOverlayCloseOnClickOutside);
 
   return (
-    <div style={{ marginTop: '16px', paddingTop: '16px', borderTop: '1px solid #333' }}>
-      <div style={{ fontSize: '11px', fontWeight: '600', color: '#666', marginBottom: '12px', textTransform: 'uppercase' }}>
-        Сайдбар (Cmd+/)
-      </div>
+    <div>
       <Tooltip content="Если ВКЛ — при повторном открытии сайдбара восстанавливается ранее открытый файл. Если ВЫКЛ — открывается только дерево.">
         <label className="flex items-start gap-3 cursor-pointer select-none mb-3">
           <div
@@ -897,7 +896,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const prevIsOpenRef = useRef(isOpen);
   useEffect(() => {
     if (isOpen && !prevIsOpenRef.current && initialTab) {
-      const valid: SettingsTab[] = ['shortcuts', 'fonts', 'colors', 'ai'];
+      const valid: SettingsTab[] = ['shortcuts', 'fonts', 'colors', 'ai', 'dictation'];
       if (valid.includes(initialTab as SettingsTab)) {
         setActiveTab(initialTab as SettingsTab);
       }
@@ -922,6 +921,8 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const timelineLineClamp = useUIStore((s) => s.timelineLineClamp);
   const setTimelineLineClamp = useUIStore((s) => s.setTimelineLineClamp);
   const setTerminalFontSize = useUIStore((s) => s.setTerminalFontSize);
+  const sdkFontSize = useUIStore((s) => s.sdkFontSize);
+  const setSdkFontSize = useUIStore((s) => s.setSdkFontSize);
   const setTabsFontSize = useUIStore((s) => s.setTabsFontSize);
   const setProjectTabsFontSize = useUIStore((s) => s.setProjectTabsFontSize);
   const setSidebarFontSize = useUIStore((s) => s.setSidebarFontSize);
@@ -1780,7 +1781,8 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
             { id: 'ai', label: 'AI' },
             { id: 'fonts', label: 'Размеры' },
             { id: 'colors', label: 'Системные' },
-            { id: 'shortcuts', label: 'Горячие клавиши' }
+            { id: 'shortcuts', label: 'Горячие клавиши' },
+            { id: 'dictation', label: 'Диктовка' }
           ] as { id: SettingsTab; label: string }[]).map((tab) => (
             <button
               key={tab.id}
@@ -1866,7 +1868,15 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                   свой фон, у другого свой». Card-wrapper'ы (свой background+border вокруг
                   блока) убраны для всех секций. */}
 
-              {/* 1. ТАБЫ — терминальные + проекты + статусы + полоска как подсекции */}
+              {/* SettingsTree pattern: главные секции (Табы / Терминал / Сайдбар /
+                  Prompt picker / Заметки) — каждая отдельная область интерфейса.
+                  Внутри каждой секции собраны ВСЕ её настройки: padding/радиус/шрифт/
+                  поведение. Глобальный пункт «Шрифты интерфейса» убран — он сводил
+                  все шрифты в одну кучу без привязки к области, юзер не мог понять
+                  «шрифт «Сайдбар» — это про какой именно сайдбар». Теперь шрифт
+                  каждой области лежит рядом с её другими настройками. */}
+
+              {/* 1. ТАБЫ */}
               <SettingsSectionHeader title="Табы" first />
               <SettingsSubSectionHeader title="Терминал" />
               <SettingsGrid4>
@@ -1878,6 +1888,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                 <FontSizeSlider label="Левый отступ" value={tabGeometry.paddingLeft} onChange={(v) => setTabGeometry({ paddingLeft: v })} min={4} max={48} />
                 <FontSizeSlider label="Радиус" value={tabGeometry.borderRadius} onChange={(v) => setTabGeometry({ borderRadius: v })} min={0} max={20} />
                 <FontSizeSlider label="Зазор" value={tabGeometry.gap} onChange={(v) => setTabGeometry({ gap: v })} min={0} max={16} />
+                <FontSizeSlider label="Шрифт" value={tabsFontSize} onChange={setTabsFontSize} min={10} max={20} />
               </SettingsGrid4>
 
               <SettingsSubSectionHeader title="Проекты" />
@@ -1887,6 +1898,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                   valueY={projectTabGeometry.paddingY} onChangeY={(v) => setProjectTabGeometry({ paddingY: v })}
                   maxX={32} maxY={16}
                 />
+                <FontSizeSlider label="Шрифт" value={projectTabsFontSize} onChange={setProjectTabsFontSize} min={10} max={16} />
               </SettingsGrid4>
 
               <SettingsSubSectionHeader title="Статусы" />
@@ -1895,23 +1907,43 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
               <SettingsSubSectionHeader title="Полоска процесса" />
               <ProcessBarEditor />
 
-              {/* 2. ШРИФТЫ ИНТЕРФЕЙСА */}
-              <SettingsSectionHeader title="Шрифты интерфейса" />
+              {/* 2. ТЕРМИНАЛ — шрифт самого терминала + Таймлайн как часть терминала */}
+              <SettingsSectionHeader title="Терминал" />
               <SettingsGrid4>
-                <FontSizeSlider label="Терминал" value={terminalFontSize} onChange={setTerminalFontSize} min={8} max={24} />
-                <FontSizeSlider label="Сайдбар" value={sidebarFontSize} onChange={setSidebarFontSize} min={10} max={20} />
-                <FontSizeSlider label="Табы" value={tabsFontSize} onChange={setTabsFontSize} min={10} max={20} />
-                <FontSizeSlider label="Проекты" value={projectTabsFontSize} onChange={setProjectTabsFontSize} min={10} max={16} />
-                <FontSizeSlider label="Превью файла" value={filePreviewFontSize} onChange={setFilePreviewFontSize} min={10} max={24} />
-                <FontSizeSlider label="Prompt picker" value={promptPickerFontSize} onChange={setPromptPickerFontSize} min={9} max={20} />
-                <FontSizeSlider label="Picker — отступ снизу" description="От низа viewport'а до picker'а" value={promptPickerBottomOffsetPx} onChange={setPromptPickerBottomOffsetPx} min={0} max={400} suffix="px" />
-                <FontSizeSlider label="Picker — отступ слева" description="0 — центр или прижатие к правому. >0 — прижатие к левому краю" value={promptPickerLeftOffsetPx} onChange={setPromptPickerLeftOffsetPx} min={0} max={2000} suffix="px" />
-                <FontSizeSlider label="Picker — отступ справа" description="0 — центр или прижатие к левому. >0 — приоритет: прижатие к правому краю" value={promptPickerRightOffsetPx} onChange={setPromptPickerRightOffsetPx} min={0} max={2000} suffix="px" />
-                <FontSizeSlider label="Таймлайн" value={timelineFontSize} onChange={setTimelineFontSize} min={10} max={18} />
-                <FontSizeSlider label="Таймлайн — строки" value={timelineLineClamp} onChange={setTimelineLineClamp} min={1} max={10} suffix="" />
+                <FontSizeSlider label="Шрифт" value={terminalFontSize} onChange={setTerminalFontSize} min={8} max={24} />
+                <FontSizeSlider label="Шрифт SDK" value={sdkFontSize} onChange={setSdkFontSize} min={8} max={24} />
               </SettingsGrid4>
 
-              {/* 3. ЗАМЕТКИ + подсекция Превью CMD+hover */}
+              <SettingsSubSectionHeader title="Таймлайн" />
+              <SettingsGrid4>
+                <FontSizeSlider label="Шрифт" value={timelineFontSize} onChange={setTimelineFontSize} min={10} max={18} />
+                <FontSizeSlider label="Строки" value={timelineLineClamp} onChange={setTimelineLineClamp} min={1} max={10} suffix="" />
+              </SettingsGrid4>
+
+              {/* 3. САЙДБАР — файловый (Cmd+/): шрифт + превью файла + поведение */}
+              <SettingsSectionHeader title="Сайдбар" />
+              <SettingsGrid4>
+                <FontSizeSlider label="Шрифт" value={sidebarFontSize} onChange={setSidebarFontSize} min={10} max={20} />
+              </SettingsGrid4>
+
+              <SettingsSubSectionHeader title="Превью файла" />
+              <SettingsGrid4>
+                <FontSizeSlider label="Шрифт" value={filePreviewFontSize} onChange={setFilePreviewFontSize} min={10} max={24} />
+              </SettingsGrid4>
+
+              <SettingsSubSectionHeader title="Поведение" />
+              <SidebarBehaviorToggles />
+
+              {/* 4. PROMPT PICKER — отдельная подсистема (overlay с быстрыми промптами) */}
+              <SettingsSectionHeader title="Prompt picker" />
+              <SettingsGrid4>
+                <FontSizeSlider label="Шрифт" value={promptPickerFontSize} onChange={setPromptPickerFontSize} min={9} max={20} />
+                <FontSizeSlider label="Отступ снизу" description="От низа viewport'а до picker'а" value={promptPickerBottomOffsetPx} onChange={setPromptPickerBottomOffsetPx} min={0} max={400} suffix="px" />
+                <FontSizeSlider label="Отступ слева" description="0 — центр или прижатие к правому. >0 — прижатие к левому краю" value={promptPickerLeftOffsetPx} onChange={setPromptPickerLeftOffsetPx} min={0} max={2000} suffix="px" />
+                <FontSizeSlider label="Отступ справа" description="0 — центр или прижатие к левому. >0 — приоритет: прижатие к правому краю" value={promptPickerRightOffsetPx} onChange={setPromptPickerRightOffsetPx} min={0} max={2000} suffix="px" />
+              </SettingsGrid4>
+
+              {/* 5. ЗАМЕТКИ + подсекция Превью CMD+hover */}
               <SettingsSectionHeader title="Заметки" />
               <SettingsGrid4>
                 <FontSizeSlider label="Шрифт в сайдбаре" value={notesSidebarFontSize} onChange={setNotesSidebarFontSize} min={10} max={28} />
@@ -1930,9 +1962,6 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                 <FontSizeSlider label="Макс. высота" value={Math.round(tabPreviewMaxHeight)} onChange={setTabPreviewMaxHeight} min={80} max={900} />
                 <RatioRow label="Пропорция" description="W × H" width={tabPreviewRatioW} height={tabPreviewRatioH} onChange={setTabPreviewRatio} />
               </SettingsGrid4>
-
-              {/* 4. САЙДБАР — поведение (toggle persistFile, closeOnClickOutside) */}
-              <SidebarBehaviorSettings />
             </>
           )}
 
@@ -1965,6 +1994,10 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                 </div>
               </div>
             </>
+          )}
+
+          {activeTab === 'dictation' && (
+            <GlobalDictationSettings />
           )}
 
           {activeTab === 'ai' && (

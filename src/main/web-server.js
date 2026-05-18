@@ -241,6 +241,32 @@ async function handleApi(req, res, parsed, sdkSessions) {
     return sendJson(res, 200, { projects: all });
   }
 
+  // Soniox temporary API key — mints a short-lived (5 min) key bound to
+  // websocket-transcribe usage. Mobile client never sees SONIOX_API_KEY itself.
+  // The mint call goes to api.soniox.com with our long-lived key in the
+  // Authorization header; returned `api_key` is what the browser uses to open
+  // wss://stt-rt.soniox.com/transcribe-websocket. If SONIOX_API_KEY is missing
+  // from env we return 503 so the client can disable the mic button.
+  if (parsed.pathname === '/api/soniox-token' && req.method === 'POST') {
+    try {
+      const key = process.env.SONIOX_API_KEY;
+      if (!key) return sendJson(res, 503, { error: 'SONIOX_API_KEY not configured' });
+      const r = await fetch('https://api.soniox.com/v1/auth/temporary-api-key', {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ usage_type: 'transcribe_websocket', expires_in_seconds: 300 }),
+      });
+      if (!r.ok) {
+        const txt = await r.text().catch(() => '');
+        return sendJson(res, 502, { error: `soniox ${r.status}: ${txt.slice(0, 200)}` });
+      }
+      const data = await r.json();
+      return sendJson(res, 200, { api_key: data.api_key, expires_at: data.expires_at });
+    } catch (e) {
+      return sendJson(res, 500, { error: String(e.message) });
+    }
+  }
+
   // Client-side log sink — mobile sends diagnostic lines here, they land in
   // logs/dev.log via the [WebClient] tag so the user's standard log workflow
   // picks them up. POST body: { tag: 'TimelineGoTo', msg: '...', data: any }.

@@ -27,6 +27,22 @@
 **Problem:** When the wrapper moves (due to height measurement updates), the mouse can suddenly be "outside" the new bounds without actually moving.
 - **Solution:** `onMouseLeave` is gated by `!isResizingTooltipRef.current`. We also use a 2-frame cooldown after resize to let layout settle before re-enabling height measurement.
 
+### 5. Layout-child bridge ловушка (8px visual gap)
+**Problem:** Юзер видит постоянный отступ ~8px между правым краем visible tooltip-content и левым краем Timeline-strip, хотя `popupRightPx` математически прижимает popup вплотную. Изначальные подозрения — `box-shadow`, scrollbar, `marginRight`, padding-right в content'е — все мимо. Через `getBoundingClientRect()` логирование подтверждено: `wrapperWidth=308`, `contentWidth=300`, `wrapperRight === tlLeft`, `contentRight === tlLeft - 8`.
+
+**Root cause:** outer wrapper'а с `display:flex flex-direction:row` имел **два** child'а, не один — `tooltipContent` + второй `<div style={{ width: 8, alignSelf: 'stretch' }}>` помеченный как «CSS Bridge» (для hover-corridor между content'ом и Timeline strip). Flex auto-shrink выбирает размер = `max(child.width)` по horizontal оси, поэтому wrapper тянулся на 8px правее content'а. Wrapper.right совпадал с Timeline.left, но content внутри был прижат к **left wrapper'а** через flex-start (default justify) — отсюда visual gap.
+
+**Solution:** Удалён layout-bridge `<div>` целиком. CSS-overlap `+8` в формуле `popupRightPx` тоже удалён (он раньше компенсировал ту же 8px — теперь компенсировать нечего). Tooltip-wrapper'а имеет только один child (content) — auto-shrink даёт wrapper.width === content.width → визуально вплотную к Timeline.
+
+**Что пробовали и почему не сработало (graveyard):**
+- *Подозрение `box-shadow: -8px 8px 30px`* — shadow не входит в layout size, не растягивает родителя. Мимо.
+- *Подозрение scrollbar* — у content `overflow: hidden`, scrollbar там не появляется.
+- *Подозрение justify-content / alignItems перестановка* — `alignItems: vAlign` это **vertical** ось, не horizontal. Мимо.
+- *Поиск visible 8px padding/margin на content'е* — `marginRight: 0px, paddingRight: 14px (внутри box, не снаружи)`. Мимо.
+- Помогло только: лог всех children wrapper'а через `Array.from(node.children).map(getBoundingClientRect)`. Тогда сразу видно «kids=2», и второй child = 8px sibling справа.
+
+**Если bridge всё-таки нужен** (на случай рассинхрона `mouseleave` при transit через щель): рендерить как **отдельный `position: fixed; right: tlLeft - 0px; width: 8px` с `pointer-events: auto`** — снаружи wrapper'а, не в layout-row. Тогда bridge не влияет на wrapper.width, но ловит курсор между content'ом и strip.
+
 ## Related Files
 - `src/renderer/components/Workspace/Timeline.tsx` — tooltop logic.
-- `knowledge/fact-timeline.md` — general timeline behavior.
+- `knowledge/fact-timeline.md` — general timeline behavior (см. `Right-anchor через измеренный DOM (popupRightPx)`).

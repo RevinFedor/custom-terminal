@@ -1109,7 +1109,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
             } else {
               console.warn('[Timeline:ChainResolve] OVERWRITE session for tab', tabId, ':', sessionId.substring(0, 8), '→', timelineResult.latestSessionId.substring(0, 8), '(Timeline resolved chain)');
               chainResolvedRef.current = sessionId; // remember WHERE we resolved FROM
-              useWorkspaceStore.getState().setClaudeSessionId(tabId, timelineResult.latestSessionId);
+              useWorkspaceStore.getState().setClaudeSessionId(tabId, timelineResult.latestSessionId, 'timelineChain');
             }
           }
         }
@@ -2228,7 +2228,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         // Файл стёрт — освобождаем таб от сессии. Кнопка "Продолжить" запустит claude
         // как новую сессию (без --resume), а Timeline опустеет на следующем рефреше.
         const ws = useWorkspaceStore.getState();
-        ws.setClaudeSessionId(tabId, '');
+        ws.setClaudeSessionId(tabId, '', 'timelineChain');
       } else {
         loadTimeline();
       }

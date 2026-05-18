@@ -22,7 +22,7 @@ import remarkGfm from 'remark-gfm';
 import { rehypeHexHighlight } from './rehypeHexHighlight';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
-import { Loader2, FileEdit, Terminal as TerminalIcon, FolderSearch, Search, FileText, Globe, RefreshCw, Pencil, Check, X as XIcon, Brain, ChevronRight } from 'lucide-react';
+import { Loader2, FileEdit, Terminal as TerminalIcon, FolderSearch, Search, FileText, Globe, RefreshCw, Pencil, Check, X as XIcon, Brain, ChevronRight, Copy as CopyIcon } from 'lucide-react';
 import Tooltip from '../../UI/Tooltip';
 import { consumePrefetched } from '../../../utils/sdkHistoryPrefetch';
 import { BackgroundTasksBar } from './BackgroundTasksBar';
@@ -767,6 +767,10 @@ function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKT
     window.addEventListener('claude-sdk:focus-composer', handler);
     return () => window.removeEventListener('claude-sdk:focus-composer', handler);
   }, [tabId]);
+
+  // Dictation delivery handler now lives inside SDKComposer (where it has
+  // direct access to composerTextareaRef + writeComposerValue). The outer
+  // querySelector approach was unreliable for multi-tab layouts.
 
   // External prompt (mobile-web sent a message via REST). The local composer's
   // onNew was never invoked, so the desktop UI never pushed a user-bubble. Mirror
@@ -1598,15 +1602,16 @@ function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKT
   const isPersistedMsgId = (id: string) => id && !id.startsWith('user-') && !id.startsWith('streaming-') && !id.startsWith('hist-') && !id.startsWith('msg-') && !id.startsWith('init-') && !id.startsWith('error-');
 
   // Shared truncate+resend used by both Repeat (text = original) and Edit
-  // (text = user-edited). Picks the JSONL uuid, calls main to drop everything
-  // ≥ that uuid, trims local messages mirror, fires the new prompt.
+  // (text = user-edited). For persisted msgs picks the JSONL uuid + drops
+  // everything ≥ that uuid before the resend. For placeholder ids ("user-…",
+  // "error-…" — message never reached JSONL because send-message failed mid-
+  // flight, e.g. spawn ENOTDIR in packaged builds) skip the truncate IPC and
+  // just replace the local row, then resend. Without this the only failure
+  // recovery was retyping the prompt by hand.
   const truncateAndResend = useCallback(async (uiMsgId: string, newText: string) => {
+    const persisted = isPersistedMsgId(uiMsgId);
     const sid = sessionIdRef.current;
-    if (!sid) { console.warn('[ClaudeSDKTab:truncateAndResend] no sessionId'); return; }
-    if (!isPersistedMsgId(uiMsgId)) {
-      console.warn('[ClaudeSDKTab:truncateAndResend] cannot edit non-persisted msg id=' + uiMsgId);
-      return;
-    }
+    if (persisted && !sid) { console.warn('[ClaudeSDKTab:truncateAndResend] no sessionId'); return; }
     setActionBusy(true);
     try {
       // Resolve cwd same way as loadHistory.
@@ -1634,22 +1639,25 @@ function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKT
       lastRequestRef.current = { modelAlias: sdkModelAlias, effort: sdkEffort };
       modelMismatchToastedRef.current = false;
 
-      const truncRes = await ipcRenderer.invoke('claude-sdk:truncate-history', {
-        sessionId: sid, cwd: tabCwd, targetUuid: uiMsgId,
-      });
-      if (!truncRes?.success) {
-        console.error('[ClaudeSDKTab:truncateAndResend] backend failed:', truncRes?.error);
-        showToast('Truncate failed: ' + (truncRes?.error || 'unknown'), 'error', 6000);
-        setMessages(prev => [...prev, {
-          id: 'error-' + Date.now(), role: 'system' as const,
-          text: 'Truncate failed: ' + (truncRes?.error || 'unknown'),
-          toolCalls: [], thinking: null, timestamp: Date.now(),
-        }]);
-        setActionBusy(false);
-        return;
+      if (persisted) {
+        const truncRes = await ipcRenderer.invoke('claude-sdk:truncate-history', {
+          sessionId: sid, cwd: tabCwd, targetUuid: uiMsgId,
+        });
+        if (!truncRes?.success) {
+          console.error('[ClaudeSDKTab:truncateAndResend] backend failed:', truncRes?.error);
+          showToast('Truncate failed: ' + (truncRes?.error || 'unknown'), 'error', 6000);
+          setMessages(prev => [...prev, {
+            id: 'error-' + Date.now(), role: 'system' as const,
+            text: 'Truncate failed: ' + (truncRes?.error || 'unknown'),
+            toolCalls: [], thinking: null, timestamp: Date.now(),
+          }]);
+          setActionBusy(false);
+          return;
+        }
       }
 
-      // Trim local messages mirror: drop everything from the target msg onward.
+      // Trim local messages mirror: drop everything from the target msg onward
+      // (also takes out any trailing error-…/system row from the failed turn).
       // Then add the new user msg + flip running for visual feedback.
       setMessages(prev => {
         const idx = prev.findIndex(m => m.id === uiMsgId);
@@ -2186,11 +2194,14 @@ function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKT
     return () => document.removeEventListener('keydown', onKeyDown, true);
   }, []);
 
-  // Inherit terminal font-size for the entire SDK tab — keeps SDK chat in
-  // sync with the user's Terminal preference (Cmd+/− and the Settings slider).
+  // Independent SDK font-size — set in Settings → Размеры → Терминал → «Шрифт SDK».
+  // Why separate from terminalFontSize: PTY xterm.js renders a fixed-grid mono
+  // canvas (1px shifts are immediate), while the SDK tab renders markdown
+  // through Virtuoso, and users typically prefer SDK text noticeably bigger
+  // without inflating the PTY tabs at the same time.
   // All in-card text uses em-based sizes (text-[1em], text-[0.85em], …) so a
   // single base on this root re-scales the whole tree without per-element edits.
-  const sdkBaseFontSize = useUIStore((s) => s.terminalFontSize);
+  const sdkBaseFontSize = useUIStore((s) => s.sdkFontSize);
 
   return (
     <div
@@ -2423,10 +2434,14 @@ export const UserMsg = () => {
     );
   }
 
-  // Heuristic: ids that begin with one of the placeholder prefixes never made
-  // it to JSONL (yet) and can't be safely truncated. Match the same set used
-  // in the parent's isPersistedMsgId so the buttons hide instead of failing.
+  // Placeholder-id heuristic (mirrors isPersistedMsgId in the parent). Persisted
+  // messages get Repeat + Edit (truncate-and-resend off the JSONL uuid).
+  // Placeholders (turn that crashed before its JSONL flush — e.g. spawn
+  // ENOTDIR / token errors) also get the action bar so the prompt can be
+  // re-fired in place; the parent skips the truncate IPC for them.
   const isPersisted = msgId && !/^(user-|streaming-|hist-|msg-|init-|error-)/.test(msgId);
+  const isPlaceholderUser = !!msgId && /^user-/.test(msgId);
+  const showActions = isPersisted || isPlaceholderUser;
 
   const startEdit = () => {
     setEditValue(msgText);
@@ -2514,7 +2529,7 @@ export const UserMsg = () => {
               bubble (bubble itself is right-aligned in viewport, so the buttons
               visually sit just outside its left edge, vertically aligned to the
               top of the message). 4px gap between buttons and bubble corner. */}
-          {isPersisted && (
+          {showActions && (
             <div
               className="absolute top-1.5 flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none group-hover:pointer-events-auto"
               style={{ right: '100%', marginRight: '6px', zIndex: 5 }}
@@ -3062,11 +3077,57 @@ const extractRawText = (node: unknown): string => {
   return '';
 };
 
+// Block code with a tiny header strip: language label (left) + copy button
+// (right). Mirrors Claude.ai / Cursor / GitHub-PR rendering — gives the user
+// a hook for "what language", "copy this snippet" without making them right-
+// click into the syntax-highlighter area.
+// Why a separate component (not inline in `code` override): each block owns
+// its own copy/copied state. Inline closure inside ReactMarkdown.components
+// would re-create on every render and lose hover-state.
+const MarkdownCodeBlock: React.FC<{ language: string; code: string }> = ({ language, code }) => {
+  const [copied, setCopied] = useState(false);
+  const onCopy = useCallback((e: React.MouseEvent) => {
+    e.stopPropagation();
+    try {
+      const electron = (window as any).require?.('electron');
+      if (electron?.clipboard?.writeText) electron.clipboard.writeText(code);
+    } catch {}
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1500);
+  }, [code]);
+  const displayLang = language || 'text';
+  return (
+    <div className="my-2 rounded-lg overflow-hidden border border-white/[0.06] bg-[#0d0d0d]">
+      <div className="flex items-center justify-between px-3 py-1 bg-white/[0.025] border-b border-white/[0.05] text-[0.77em]">
+        <span className="font-mono uppercase tracking-wide text-[#888]">{displayLang}</span>
+        <button
+          type="button"
+          onClick={onCopy}
+          className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[#888] hover:text-white hover:bg-white/[0.06] transition-colors cursor-pointer"
+          title={copied ? 'Copied' : 'Copy'}
+        >
+          {copied ? <Check size={11} className="text-[#4ade80]" /> : <CopyIcon size={11} />}
+          <span>{copied ? 'Copied' : 'Copy'}</span>
+        </button>
+      </div>
+      <SyntaxHighlighter
+        language={language || 'text'}
+        style={oneDark as any}
+        PreTag="div"
+        customStyle={{ margin: 0, padding: '10px 12px', background: 'transparent', fontSize: '0.92em' }}
+        codeTagProps={{ style: { fontFamily: 'inherit' } }}
+      >
+        {code}
+      </SyntaxHighlighter>
+    </div>
+  );
+};
+
 const AssistantTextPart = ({ text }: { text: string }) => {
   if (!text.trim()) return null;
   return (
     <div
-      className="prose prose-invert prose-sm max-w-none text-[1em] prose-headings:font-semibold prose-h1:text-[1.15em] prose-h1:mt-2 prose-h1:mb-0.5 prose-h1:font-bold prose-h2:text-[1.08em] prose-h2:mt-2 prose-h2:mb-0.5 prose-h3:text-[1em] prose-h3:mt-1.5 prose-h3:mb-0 prose-h4:text-[1em] prose-h4:mt-1.5 prose-h4:mb-0 prose-h5:text-[1em] prose-h5:mt-1.5 prose-h5:mb-0 prose-h6:text-[1em] prose-h6:mt-1.5 prose-h6:mb-0 prose-p:my-1 prose-p:leading-snug prose-ul:my-1 prose-ul:pl-4 prose-ol:my-1 prose-ol:pl-4 prose-li:my-0 prose-li:leading-snug prose-li:pl-0 [&_li>p]:my-0 [&_li_>_*]:my-0 [&_ul_ul]:my-0 [&_ol_ol]:my-0 [&_ul_ol]:my-0 [&_ol_ul]:my-0 prose-headings:text-inherit prose-strong:text-inherit prose-strong:font-semibold marker:text-[#666]"
+      className="prose prose-invert prose-sm max-w-none text-[1em] prose-headings:font-semibold prose-h1:text-[1.15em] prose-h1:mt-2 prose-h1:mb-0.5 prose-h1:font-bold prose-h2:text-[1.08em] prose-h2:mt-2 prose-h2:mb-0.5 prose-h3:text-[1em] prose-h3:mt-1.5 prose-h3:mb-0 prose-h4:text-[1em] prose-h4:mt-1.5 prose-h4:mb-0 prose-h5:text-[1em] prose-h5:mt-1.5 prose-h5:mb-0 prose-h6:text-[1em] prose-h6:mt-1.5 prose-h6:mb-0 prose-p:my-1 prose-p:leading-snug prose-ul:my-1 prose-ol:my-1 [&_ul]:list-inside [&_ul]:pl-0 [&_ol]:list-inside [&_ol]:pl-0 prose-li:my-0 prose-li:leading-snug prose-li:pl-0 [&_li>p]:my-0 [&_li>p]:inline [&_li_>_*]:my-0 [&_ul_ul]:my-0 [&_ol_ol]:my-0 [&_ul_ol]:my-0 [&_ol_ul]:my-0 [&_ul_ul]:pl-4 [&_ol_ol]:pl-4 [&_ul_ol]:pl-4 [&_ol_ul]:pl-4 prose-headings:text-inherit prose-strong:text-inherit prose-strong:font-semibold marker:text-[#666] prose-pre:bg-transparent prose-pre:p-0 prose-pre:my-0 prose-pre:border-0"
       style={{
         color: '#d4d4d4',
         lineHeight: '1.45',
@@ -3077,29 +3138,27 @@ const AssistantTextPart = ({ text }: { text: string }) => {
         remarkPlugins={[remarkGfm]}
         rehypePlugins={[rehypeHexHighlight]}
         components={{
+          // Render the block container ourselves so the language strip + copy
+          // chrome sits in the SAME card as the highlighter (no double `<pre>`,
+          // no black-square outer box). `pre > code` is the canonical
+          // markdown-block shape — pull the language + raw text out of the
+          // nested <code> and hand the whole thing to MarkdownCodeBlock.
+          pre({ children }) {
+            const codeNode: any = Array.isArray(children) ? children[0] : children;
+            const codeProps = codeNode?.props || {};
+            const langMatch = /language-(\w+)/.exec(codeProps.className || '');
+            const codeString = extractRawText(codeProps.children).replace(/\n$/, '');
+            return <MarkdownCodeBlock language={langMatch ? langMatch[1] : ''} code={codeString} />;
+          },
           code({ className, children, ...props }) {
-            const match = /language-(\w+)/.exec(className || '');
-            // rehypeHexHighlight оборачивает hex в <span>; для блочного кода
-            // SyntaxHighlighter ждёт чистую строку — собираем raw text из всех
-            // потомков, минуя обёртки. Inline-code остаётся как React-children
-            // чтобы chip'ы отрендерились внутри `…`.
-            const codeString = extractRawText(children).replace(/\n$/, '');
-            if (match) {
-              return (
-                <SyntaxHighlighter
-                  style={oneDark as any} language={match[1]} PreTag="div"
-                  customStyle={{ margin: '8px 0', borderRadius: '8px', fontSize: '0.92em', padding: '12px', backgroundColor: '#0d0d0d', border: '1px solid rgba(255,255,255,0.05)' }}
-                >
-                  {codeString}
-                </SyntaxHighlighter>
-              );
-            }
+            // Block-code (inside <pre>) already handled above. This branch is
+            // ONLY for inline `code` — the <pre> override never delegates here.
             // Code bg ниже окружающего bubble: bubble-base = transparent,
             // bubble-hover = #151515 → код #0d0d0d читается как «врезка»
             // независимо от состояния hover. Text #d4d4d4 = body color
             // (одинаковый цвет на тексте и в коде, разница только в фоне +
             // шрифте). GitHub dark inline-code контракт.
-            return <code className="bg-[#0d0d0d] px-1.5 py-0.5 rounded text-[0.92em] text-[#d4d4d4] border border-white/5" {...props}>{children}</code>;
+            return <code className={`bg-[#0d0d0d] px-1.5 py-0.5 rounded text-[0.92em] text-[#d4d4d4] border border-white/5 ${className || ''}`} {...props}>{children}</code>;
           },
         }}
       >
@@ -3173,10 +3232,34 @@ function toolStatusFrom(result: any, isError?: boolean): ToolStatus {
   return 'done';
 }
 
-function StatusDot({ status }: { status: ToolStatus }) {
-  if (status === 'running') return <Loader2 size={11} className="animate-spin text-[#DA7756]" />;
-  if (status === 'error') return <span className="inline-block w-[8px] h-[8px] rounded-full bg-[#ef4444]" />;
-  return <span className="inline-block w-[8px] h-[8px] rounded-full bg-[#4ade80]" />;
+function statusColor(status: ToolStatus): string {
+  if (status === 'running') return '#DA7756';
+  if (status === 'error') return '#ef4444';
+  return '#4ade80';
+}
+
+// Status carrier — the tool icon itself is the status indicator (bold stroke,
+// coloured by state). Avoids the prior visual where the row had two chevron-
+// shaped glyphs side-by-side (`>` collapse + `>_` Terminal icon) split by a
+// green dot. Now: collapse-chevron stays dim, the next glyph IS the icon and
+// IS the colour signal. Bold strokeWidth keeps it readable at 14px against
+// the dim chevron next to it.
+function ColoredToolIcon({ icon, status }: { icon: React.ReactNode; status: ToolStatus }) {
+  if (status === 'running') {
+    return <Loader2 size={14} strokeWidth={2.75} className="animate-spin shrink-0" style={{ color: statusColor(status) }} />;
+  }
+  // Clone the lucide icon to override size/strokeWidth/color in one place,
+  // regardless of what the tool-specific caller passed in TOOL_ICON.
+  if (React.isValidElement(icon)) {
+    const original = icon as React.ReactElement<any>;
+    return React.cloneElement(original, {
+      size: 14,
+      strokeWidth: 2.75,
+      className: ['shrink-0', original.props?.className || ''].filter(Boolean).join(' '),
+      style: { color: statusColor(status), ...(original.props?.style || {}) },
+    });
+  }
+  return <span className="shrink-0" style={{ color: statusColor(status) }}>{icon}</span>;
 }
 
 // Toggle a collapsible block WITHOUT shifting the visible scroll position.
@@ -3247,22 +3330,26 @@ function useStableCollapseToggle(
   }, [anchorRef, toggle]);
 }
 
-// Generic card chrome — header (always visible) + optional body. Header is
-// click-to-toggle when `collapsible` is true.
-// Header API: takes an icon and TWO text rows. Row-1 is the small uppercase
-// label + counts/badges (always rendered on one line, centred against chevron
-// & status-dot). Row-2 is the full path / command / query — can wrap, never
-// truncates. Splitting them keeps the click-baseline stable regardless of how
-// long row-2 grows.
+// Generic card chrome — single-line header (always visible) + optional body.
+// Header order: [chevron] [icon] [status-dot] LABEL (description) <preview>
+// — all chips grouped LEFT of the status dot, then label/description/preview
+// flow on the SAME line with truncation. Full command/path + tool output live
+// in the collapsible body (defaultOpen=false) — header gives the gist, click
+// to drill in.
+// Why single-line: tool blocks stack densely in a thread; a two-row header
+// doubles vertical real-estate without adding info that user can't get from
+// click-to-expand. Same reason Cursor/Claude TUI use one-line tool chips.
 const ToolCard: React.FC<{
   status: ToolStatus;
   icon: React.ReactNode;
-  labelRow: React.ReactNode; // small uppercase: "READ", "BASH", "+3 −1" badges
-  detailRow?: React.ReactNode; // path / command / query — monospace, wraps
+  label: React.ReactNode; // small uppercase: "READ", "BASH", "WEBSEARCH"
+  description?: React.ReactNode; // optional dim parenthetical, e.g. (Find new-feature branch)
+  preview?: React.ReactNode; // optional monospace command/path/query preview
+  badges?: React.ReactNode; // counts/diff stats — render after label, before description
   body?: React.ReactNode;
   collapsible?: boolean;
   defaultOpen?: boolean;
-}> = ({ status, icon, labelRow, detailRow, body, collapsible = true, defaultOpen = false }) => {
+}> = ({ status, icon, label, description, preview, badges, body, collapsible = true, defaultOpen = false }) => {
   const [open, setOpen] = useState(defaultOpen);
   const cardRef = useRef<HTMLDivElement>(null);
   const hasBody = body !== undefined && body !== null && body !== false;
@@ -3277,8 +3364,8 @@ const ToolCard: React.FC<{
         className={hasBody && collapsible ? 'cursor-pointer hover:bg-white/[0.02] transition-colors' : ''}
         onClick={hasBody && collapsible ? handleToggle : undefined}
       >
-        {/* Row 1: chevron · status · icon · uppercase label — all baseline-aligned */}
-        <div className="flex items-center gap-2 px-3 py-1.5 min-h-[28px]">
+        {/* Single line: chevron · icon · status-dot · LABEL · (description) · preview */}
+        <div className="flex items-center gap-2 px-3 py-1.5 min-h-[28px] overflow-hidden">
           {hasBody && collapsible ? (
             <ChevronRight
               size={12}
@@ -3288,16 +3375,18 @@ const ToolCard: React.FC<{
           ) : (
             <span className="w-[12px] shrink-0" />
           )}
-          <span className="shrink-0 inline-flex items-center justify-center w-[10px]"><StatusDot status={status} /></span>
-          <span className="shrink-0 inline-flex items-center text-[#bdbdbd]">{icon}</span>
-          <div className="flex items-center gap-2 flex-wrap min-w-0 flex-1">{labelRow}</div>
+          <ColoredToolIcon icon={icon} status={status} />
+          <span className="shrink-0 text-[0.85em] font-medium text-[#bdbdbd] uppercase tracking-wide">{label}</span>
+          {badges && <span className="shrink-0 inline-flex items-center gap-1">{badges}</span>}
+          {description && (
+            <span className="shrink-0 text-[0.85em] text-[#888]">({description})</span>
+          )}
+          {preview && (
+            <span className="min-w-0 flex-1 text-[0.92em] font-mono text-[#e0e0e0] truncate">
+              {preview}
+            </span>
+          )}
         </div>
-        {/* Row 2: detail (path / command / query) — full width, monospace, wraps */}
-        {detailRow && (
-          <div className="px-3 pb-1.5 pl-[58px] text-[1em] font-mono text-[#e0e0e0] break-all leading-snug">
-            {detailRow}
-          </div>
-        )}
       </div>
       {hasBody && open && (
         <div className="border-t" style={{ borderColor: TOOL_BORDER }}>
@@ -3309,29 +3398,34 @@ const ToolCard: React.FC<{
 };
 
 // ---- Bash ----
+// Header (collapsed): `[chevron] [icon] [dot] BASH (description) command…`
+// Body (expanded): full command (mono, wraps) + output block.
 const BashCard: React.FC<{ args: Record<string, any>; result: any; status: ToolStatus }> = ({ args, result, status }) => {
   const cmd: string = args.command || '';
   const description: string = args.description || '';
   const resultText = typeof result === 'string' ? result : (result == null ? '' : JSON.stringify(result));
-  const labelRow = (
-    <>
-      <span className="text-[0.92em] font-medium text-[#bdbdbd] uppercase tracking-wide">Bash</span>
-      {description && <span className="text-[0.85em] text-[#888] truncate">{description}</span>}
-    </>
-  );
-  const detailRow = cmd || <span className="italic text-[#666]">(no command)</span>;
-  const body = resultText ? (
-    <SyntaxHighlighter
-      language="bash"
-      style={oneDark as any}
-      PreTag="div"
-      customStyle={{ margin: 0, padding: '10px 12px', background: '#0f0f0f', fontSize: '0.92em', maxHeight: '180px', overflow: 'auto' }}
-      codeTagProps={{ style: { fontFamily: 'inherit' } }}
-    >
-      {resultText}
-    </SyntaxHighlighter>
+  const preview = cmd ? <span>{cmd}</span> : <span className="italic text-[#666]">(no command)</span>;
+  const body = (cmd || resultText) ? (
+    <div>
+      {cmd && (
+        <div className="px-3 py-2 text-[0.92em] font-mono text-[#e0e0e0] whitespace-pre-wrap break-all leading-snug bg-[#0d0d0d] border-b" style={{ borderColor: TOOL_BORDER }}>
+          {cmd}
+        </div>
+      )}
+      {resultText && (
+        <SyntaxHighlighter
+          language="bash"
+          style={oneDark as any}
+          PreTag="div"
+          customStyle={{ margin: 0, padding: '10px 12px', background: '#0f0f0f', fontSize: '0.92em', maxHeight: '180px', overflow: 'auto' }}
+          codeTagProps={{ style: { fontFamily: 'inherit' } }}
+        >
+          {resultText}
+        </SyntaxHighlighter>
+      )}
+    </div>
   ) : null;
-  return <ToolCard status={status} icon={<TerminalIcon size={13} />} labelRow={labelRow} detailRow={detailRow} body={body} defaultOpen={false} />;
+  return <ToolCard status={status} icon={<TerminalIcon size={13} />} label="Bash" description={description || undefined} preview={preview} body={body} defaultOpen={false} />;
 };
 
 // ---- Read ----
@@ -3345,15 +3439,10 @@ const ReadCard: React.FC<{ args: Record<string, any>; result: any; status: ToolS
   const raw = typeof result === 'string' ? result : (result == null ? '' : JSON.stringify(result));
   const content = raw.replace(/\n+$/, '');
   const lines = content ? content.split('\n') : [];
-  const labelRow = (
-    <>
-      <span className="text-[0.92em] font-medium text-[#bdbdbd] uppercase tracking-wide">Read</span>
-      {lines.length > 0 && (
-        <span className="text-[0.77em] text-[#666] font-mono tabular-nums">{lines.length} lines</span>
-      )}
-    </>
-  );
-  const detailRow = path || <span className="italic text-[#666]">(no path)</span>;
+  const badges = lines.length > 0 ? (
+    <span className="text-[0.77em] text-[#666] font-mono tabular-nums">{lines.length} lines</span>
+  ) : null;
+  const preview = path ? <span>{path}</span> : <span className="italic text-[#666]">(no path)</span>;
   const body = content ? (
     <SyntaxHighlighter
       language={lang}
@@ -3365,7 +3454,7 @@ const ReadCard: React.FC<{ args: Record<string, any>; result: any; status: ToolS
       {content}
     </SyntaxHighlighter>
   ) : null;
-  return <ToolCard status={status} icon={<FileText size={13} />} labelRow={labelRow} detailRow={detailRow} body={body} defaultOpen={false} />;
+  return <ToolCard status={status} icon={<FileText size={13} />} label="Read" badges={badges} preview={preview} body={body} defaultOpen={false} />;
 };
 
 // ---- Edit / Write ----
@@ -3427,22 +3516,17 @@ const EditCard: React.FC<{ toolName: string; args: Record<string, any>; status: 
   const { added, removed } = countDiffStats(diff);
   const verb = toolName === 'Write' ? 'Write' : toolName === 'MultiEdit' ? 'MultiEdit' : 'Update';
 
-  const labelRow = (
-    <>
-      <span className="text-[0.92em] font-medium text-[#bdbdbd] uppercase tracking-wide">{verb}</span>
-      {(added > 0 || removed > 0) && (
-        <span className="text-[0.85em] font-mono tabular-nums">
-          {added > 0 && <span className="text-[#4ade80]">+{added}</span>}
-          {added > 0 && removed > 0 && ' '}
-          {removed > 0 && <span className="text-[#ef4444]">−{removed}</span>}
-        </span>
-      )}
-    </>
-  );
-  const detailRow = path || <span className="italic text-[#666]">(no path)</span>;
+  const badges = (added > 0 || removed > 0) ? (
+    <span className="text-[0.85em] font-mono tabular-nums">
+      {added > 0 && <span className="text-[#4ade80]">+{added}</span>}
+      {added > 0 && removed > 0 && ' '}
+      {removed > 0 && <span className="text-[#ef4444]">−{removed}</span>}
+    </span>
+  ) : null;
+  const preview = path ? <span>{path}</span> : <span className="italic text-[#666]">(no path)</span>;
   const body = diff.length > 0 ? <DiffLines entries={diff} language={lang} /> : null;
   // Edit/Write defaultOpen=true — the diff is the whole point of the call.
-  return <ToolCard status={status} icon={<FileEdit size={13} />} labelRow={labelRow} detailRow={detailRow} body={body} defaultOpen={true} />;
+  return <ToolCard status={status} icon={<FileEdit size={13} />} label={verb} badges={badges} preview={preview} body={body} defaultOpen={true} />;
 };
 
 // ---- Fallback for anything else (Glob, Grep, WebSearch, MCP, etc.) ----
@@ -3459,14 +3543,11 @@ const GenericToolCard: React.FC<{ toolName: string; args: Record<string, any>; r
     return '';
   })();
   const resultText = result == null ? '' : (typeof result === 'string' ? result : JSON.stringify(result, null, 2));
-  const labelRow = (
-    <span className="text-[0.92em] font-medium text-[#bdbdbd] uppercase tracking-wide truncate">{toolName}</span>
-  );
-  const detailRow = summary || null;
+  const preview = summary ? <span>{summary}</span> : null;
   const body = resultText ? (
     <pre className="m-0 px-3 py-2 text-[0.92em] text-[#bdbdbd] font-mono whitespace-pre-wrap break-all bg-[#0f0f0f] max-h-[180px] overflow-y-auto">{resultText}</pre>
   ) : null;
-  return <ToolCard status={status} icon={icon} labelRow={labelRow} detailRow={detailRow} body={body} defaultOpen={false} />;
+  return <ToolCard status={status} icon={icon} label={toolName} preview={preview} body={body} defaultOpen={false} />;
 };
 
 // ---- Dispatcher ----
@@ -3645,6 +3726,12 @@ function SDKComposer({
   // state (not in composer runtime) so we can render the chip + diff against
   // the live composer text.
   const [stashed, setStashed] = useState<string | null>(null);
+  // Caret snapshot captured at mousedown — BEFORE Blink resets selectionStart
+  // to 0 when the user clicks outside the textarea. Read in onBlur so we know
+  // where the caret really was instead of seeing 0. The same name exists in
+  // another function in this file (its-own-scope) — this local copy is what
+  // the SDKComposer textarea actually needs.
+  const savedCaretRef = useRef<{ start: number; end: number } | null>(null);
   // 1-second red flash on the composer when юзер пытается отправить (Enter)
   // во время Claude turn'а. Visual signal of «заблокировано» вместо тихого
   // no-op. Триггерится в handleComposerKeyDown.
@@ -3843,6 +3930,25 @@ function SDKComposer({
     writeComposerValue(stashed, { focusEnd: true });
     setStashed(null);
   }, [stashed, writeComposerValue]);
+
+  // Dictation delivery (Soniox): MicButton fires this once on Stop with the
+  // captured transcript. Append to whatever the user already typed (with a
+  // single space separator), park caret at end so they can keep typing.
+  // Inside SDKComposer so we have direct access to writeComposerValue and
+  // the textarea ref — selectors from the outer ClaudeSDKTab scope were
+  // unreliable across multi-tab layouts.
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const { tabId: tid, text } = (e as CustomEvent).detail || {};
+      if (tid !== tabId || !text) return;
+      const ta = composerTextareaRef.current;
+      const existing = ta?.value || '';
+      const sep = existing && !/\s$/.test(existing) ? ' ' : '';
+      writeComposerValue(existing + sep + text, { focusEnd: true });
+    };
+    window.addEventListener('claude-sdk:dictation-deliver', handler);
+    return () => window.removeEventListener('claude-sdk:dictation-deliver', handler);
+  }, [tabId, writeComposerValue]);
 
   const dismissStash = useCallback(() => setStashed(null), []);
 
