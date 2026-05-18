@@ -42,7 +42,9 @@ MarkdownEditor (react-markdown) рендерит markdown-блоки **асин�
 
 ## Layout & позиционирование
 
-**TabBar** (CMD+hover на табах): popover открывается под табом, **только notes** (без metadata — у активных табов cwd/type видны из контекста, дублировать нет смысла).
+**TabBar horizontal mode** (legacy): popover открывается под табом, **только notes** (без metadata — у активных табов cwd/type видны из контекста, дублировать нет смысла).
+
+**TabBar vertical mode (TabSidebar)**: popover открывается **справа от таба** (`placement='right'`), вертикально центрирован относительно середины таба (`top: rect.top + rect.height/2; transform: translateY(-50%); paddingLeft: 6px`). Fallback — flip-left когда viewport справа меньше popover-width (`rect.right + width > viewport.width`). Юзер: *«при наведении и зажатии в CMD у нас открывается модалка с описанием заметки. Ее нужно теперь, чтобы она открывалась справа по центру»*. `data-cmd-hover-popover` атрибут сохраняется на wrapper'е — закреп Cmd+Shift работает идентично below/above режимам.
 
 **ProjectHome split-mode** (CMD+hover на Active/History карточках): **два независимых wrapper'а** вокруг карточки. Верхний — notes выше карточки через `top: rect.top + translateY(-100%)`. Нижний — metadata block ниже карточки через `top: rect.bottom`. Оба используют общий `popoverProps` (onMouseEnter/Leave) — переход курсором с одной части на другую через карточку держит popover открытым, уход куда-то ещё закрывает обе одновременно. Mental model: «заметка вверху, описание внизу относительно карточки».
 

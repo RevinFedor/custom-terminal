@@ -259,6 +259,9 @@ interface TabItemProps {
   anySlideoutOpen?: boolean; // Slideout is open on SOME tab (possibly another one). When true,
                              // the default-on-active rule is suppressed — the button only shows
                              // on the tab where slideout is actually anchored.
+  cmdPeekMode?: boolean; // CMD held AND cursor in TabBar. Suppresses default-on-active so an
+                         // active tab WITHOUT notes doesn't keep showing the button — peek-mode
+                         // is "buttons only where there are notes".
   isCollapsed?: boolean; // Collapsed tab — icon-only
   hasSession?: boolean; // Whether tab has an active AI session
   isBusy?: boolean; // AI agent is actively thinking/streaming
@@ -298,6 +301,7 @@ const TabItem = memo(({
   showNotesPeek = false,
   slideoutOpenHere = false,
   anySlideoutOpen = false,
+  cmdPeekMode = false,
   isCollapsed = false,
   hasSession = false,
   isBusy = false,
@@ -597,9 +601,13 @@ const TabItem = memo(({
     ? sessionStatuses.find((s) => s.id === sessionStatus)
     : null;
   // processBar.enabled управляет тем, мигает ли полоска или статичная.
-  // Только enabled-флаг нужен здесь — цвета/duration читаются через CSS-переменные на :root
-  // (App.tsx синхронизирует переменные при изменении processBar).
+  // position — left|right (юзер выбирает в Settings).
+  // Цвета/duration читаются через CSS-переменные на :root (App.tsx синхронизирует).
   const processBarEnabled = useUIStore((s) => s.processBar.enabled);
+  const processBarPosition = useUIStore((s) => s.processBar.position);
+  // Settings → форма маркера статуса (круг или квадрат) + размер в px.
+  const statusMarkerShape = useUIStore((s) => s.statusMarker.shape);
+  const statusMarkerSize = useUIStore((s) => s.statusMarker.sizePx);
 
   return (
     <div
@@ -648,16 +656,18 @@ const TabItem = memo(({
                   className={processBarEnabled ? 'tab-process-bar-busy' : 'tab-process-bar-static'}
                   style={{
                     position: 'absolute',
-                    // -2px компенсирует 2px transparent border-left (резерв под dashed-states).
+                    // -2px компенсирует 2px transparent border (резерв под dashed-states).
                     // Без этого полоска отрисовывается ВНУТРИ border-area → виден gap у края.
-                    left: '-2px',
+                    [processBarPosition === 'right' ? 'right' : 'left']: '-2px',
                     top: 0,
                     bottom: 0,
                     width: '3px',
                     pointerEvents: 'none',
                     zIndex: 5,
-                    borderTopLeftRadius: TAB_VERTICAL_BORDER_RADIUS,
-                    borderBottomLeftRadius: TAB_VERTICAL_BORDER_RADIUS,
+                    // Закруглённые углы только на «своей» стороне вкладки.
+                    ...(processBarPosition === 'right'
+                      ? { borderTopRightRadius: TAB_VERTICAL_BORDER_RADIUS, borderBottomRightRadius: TAB_VERTICAL_BORDER_RADIUS }
+                      : { borderTopLeftRadius: TAB_VERTICAL_BORDER_RADIUS, borderBottomLeftRadius: TAB_VERTICAL_BORDER_RADIUS }),
                   }}
                 />
               )}
@@ -669,7 +679,13 @@ const TabItem = memo(({
                   className="tab-ai-busy-shimmer"
                   style={{
                     position: 'absolute',
-                    inset: 0,
+                    // Растягиваемся НА border-area (включая 2px transparent border-left/right
+                    // вкладки), чтобы скругления shimmer'а совпали со скруглениями карточки.
+                    // Без этого слева видна 2px-полоска без shimmer + curved-corners рассинхрон.
+                    top: 0,
+                    bottom: 0,
+                    left: '-2px',
+                    right: '-2px',
                     pointerEvents: 'none',
                     zIndex: 3,
                     overflow: 'hidden',
@@ -678,11 +694,13 @@ const TabItem = memo(({
                   aria-hidden
                 />
               )}
-              {/* Status marker — colored dot 8px when sessionStatus is set.
+              {/* Status marker — shape (dot|square) + sizePx из Settings.
                   Левый отступ 5px: после 3px polosky процесса (z:5) + 2px зазор → 5px.
                   По вертикали top:calc(50% + 1px) компенсирует оптический baseline-шифт
                   строчных букв ('claude-03' без descender'ов выглядит чуть ниже
-                  геометрического центра карточки). */}
+                  геометрического центра карточки).
+                  Если полоска процесса справа — маркер всё равно слева (так лучше читается
+                  рядом с текстом названия таба). */}
               {statusMeta && (
                 <span
                   title={statusMeta.label}
@@ -691,9 +709,9 @@ const TabItem = memo(({
                     left: '5px',
                     top: 'calc(50% + 1px)',
                     transform: 'translateY(-50%)',
-                    width: '8px',
-                    height: '8px',
-                    borderRadius: '50%',
+                    width: `${statusMarkerSize}px`,
+                    height: `${statusMarkerSize}px`,
+                    borderRadius: statusMarkerShape === 'square' ? '2px' : '50%',
                     backgroundColor: statusMeta.color,
                     border: '1px solid rgba(0,0,0,0.4)',
                     pointerEvents: 'none',
@@ -811,12 +829,13 @@ const TabItem = memo(({
           {/* Open notes — peek-button. Three visibility rules:
                 1. slideoutOpenHere — slideout is anchored to this tab (solid-indigo, always visible).
                 2. showNotesPeek — Cmd is held, cursor in TabBar, tab has notes (Cmd-hover peek).
-                3. Default-on-active — active tab in vertical mode, but ONLY when no slideout is
-                   currently open on another tab (so the open slideout's anchor is the unique
-                   button on screen).
+                3. Default-on-active — active tab in vertical mode, but ONLY when (a) no slideout
+                   is open on another tab AND (b) we're NOT in peek-mode. Peek-mode means "buttons
+                   only where there are notes" — keeping the default-on-active button on an empty
+                   active tab during peek would break that rule.
               The data-tab-id attribute lets TabNotesSlideout query the EXACT trigger for its
               anchor (multiple peek buttons can be on screen at once when Cmd is held). */}
-          {isVerticalMode && (slideoutOpenHere || showNotesPeek || (isActive && !anySlideoutOpen)) && (
+          {isVerticalMode && (slideoutOpenHere || showNotesPeek || (isActive && !anySlideoutOpen && !cmdPeekMode)) && (
             <button
               data-tab-notes-open-trigger
               data-tab-id={tab.id}
@@ -913,6 +932,7 @@ const EmptyDropZone = memo(({ onDropMain, onDropFromUtility, onHoverChange, onDo
 }) => {
   const ref = useRef<HTMLDivElement>(null);
   const [isOver, setIsOver] = useState(false);
+  const [isHovered, setIsHovered] = useState(false);
 
   useEffect(() => {
     const element = ref.current;
@@ -944,14 +964,49 @@ const EmptyDropZone = memo(({ onDropMain, onDropFromUtility, onHoverChange, onDo
   }, [onDropMain, onDropFromUtility, onHoverChange]);
 
   // Horizontal: fill remaining row (h-full flex-1 min-w-[30px]).
-  // Vertical: fill remaining column space (flex-1 w-full min-h-[30px]).
-  const sizeClass = orientation === 'vertical'
-    ? 'flex-1 w-full min-h-[30px]'
-    : 'h-full flex-1 min-w-[30px]';
+  // Vertical: fill remaining column space + show discoverable «+ New tab» row at the
+  // top (вкладка-плейсхолдер с dashed border). В horizontal mode «add new» доступен
+  // через ПКМ → Add new; в vertical он не очевиден, поэтому показываем кликабельную
+  // строку всегда. Click = создать вкладку, drop-target по всей высоте остаётся.
+  if (orientation === 'vertical') {
+    return (
+      <div
+        ref={ref}
+        className={`flex-1 w-full min-h-[30px] transition-colors ${isOver ? 'bg-white/10' : ''}`}
+        onContextMenu={onContextMenu}
+      >
+        <div
+          onClick={onDoubleClick}
+          onMouseEnter={() => setIsHovered(true)}
+          onMouseLeave={() => setIsHovered(false)}
+          title="New tab (Cmd+T)"
+          style={{
+            margin: '4px 0',
+            padding: '4px 8px 4px 12px',
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+            fontSize: 13,
+            color: isHovered ? '#fff' : '#777',
+            backgroundColor: isHovered ? 'rgba(255,255,255,0.06)' : 'transparent',
+            border: '1px dashed rgba(255,255,255,0.18)',
+            borderRadius: 6,
+            cursor: 'pointer',
+            userSelect: 'none',
+            transition: 'background-color 0.12s, color 0.12s',
+          }}
+        >
+          <span style={{ fontSize: 16, lineHeight: 1 }}>+</span>
+          <span>New tab</span>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div
       ref={ref}
-      className={`${sizeClass} transition-colors ${isOver ? 'bg-white/10' : ''}`}
+      className={`h-full flex-1 min-w-[30px] transition-colors ${isOver ? 'bg-white/10' : ''}`}
       onDoubleClick={onDoubleClick}
       onContextMenu={onContextMenu}
     />
@@ -1895,6 +1950,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                 showNotesPeek={isCmdPressed && isMouseInTabBar && !!workspace.tabs.get(tab.id)?.notes}
                 slideoutOpenHere={openSlideoutTabId === tab.id}
                 anySlideoutOpen={anySlideoutOpen}
+                cmdPeekMode={isCmdPressed && isMouseInTabBar}
                 isCollapsed={!!tab.isCollapsed}
                 isViewingSubAgent={viewingSubAgentParentId === tab.id}
               />
@@ -1983,6 +2039,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                   showNotesPeek={isCmdPressed && isMouseInTabBar && !!workspace.tabs.get(tab.id)?.notes}
                 slideoutOpenHere={openSlideoutTabId === tab.id}
                 anySlideoutOpen={anySlideoutOpen}
+                cmdPeekMode={isCmdPressed && isMouseInTabBar}
                   isCollapsed={!!tab.isCollapsed}
                   isViewingSubAgent={viewingSubAgentParentId === tab.id}
                 />
@@ -2155,6 +2212,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                         showNotesPeek={isCmdPressed && isMouseInTabBar && !!workspace.tabs.get(tab.id)?.notes}
                 slideoutOpenHere={openSlideoutTabId === tab.id}
                 anySlideoutOpen={anySlideoutOpen}
+                cmdPeekMode={isCmdPressed && isMouseInTabBar}
                         isCollapsed={!!tab.isCollapsed}
                         isViewingSubAgent={viewingSubAgentParentId === tab.id}
                       />
@@ -2227,6 +2285,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                     showNotesPeek={isCmdPressed && isMouseInTabBar && !!workspace.tabs.get(tab.id)?.notes}
                 slideoutOpenHere={openSlideoutTabId === tab.id}
                 anySlideoutOpen={anySlideoutOpen}
+                cmdPeekMode={isCmdPressed && isMouseInTabBar}
                     isCollapsed={!!tab.isCollapsed}
                     isViewingSubAgent={viewingSubAgentParentId === tab.id}
                   />
