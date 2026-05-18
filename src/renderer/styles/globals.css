@@ -189,6 +189,100 @@
   to { transform: rotate(360deg); }
 }
 
+/* Vertical tab sidebar — два РАЗНЫХ сигнала:
+   1) Process bar (узкая полоса 2px слева): мерцает пока PTY жив (npm run dev, claude CLI и т.п.).
+   2) AI shimmer (по всей ширине вкладки): диагональная волна свет→тень бежит слева направо,
+      пока AI-сессия думает/стримит. Подходит для SDK-табов где PTY нет.
+   Оба — background-color change (не opacity) ради читаемости в видео-записях
+   (H.264/JPEG съедают мелкие opacity-дельты). */
+/* Process bar — конфигурируется через Settings → Системные.
+   CSS-переменные --process-bar-color-a/b/duration выставляются из App.tsx
+   на корне (документ.documentElement) при изменении useUIStore.processBar.
+   Если юзер выключил pulse (enabled=false) — рендер подменяет класс на
+   .tab-process-bar-static, который просто красит фон без анимации. */
+@keyframes tab-process-bar-pulse {
+  0%   { background-color: var(--process-bar-color-a, #155E75); }
+  50%  { background-color: var(--process-bar-color-b, #0E7490); }
+  100% { background-color: var(--process-bar-color-a, #155E75); }
+}
+.tab-process-bar-busy {
+  animation: tab-process-bar-pulse var(--process-bar-duration, 2.4s) ease-in-out infinite;
+}
+.tab-process-bar-static {
+  background-color: var(--process-bar-color-a, #155E75);
+}
+
+/* AI-busy: горизонтальный шиммер по ширине вкладки.
+   ВАЖНО: keyframes должны привести stripe ПОЛНОСТЬЮ за край viewport'а с обеих сторон,
+   иначе на стыке цикла будет видимый «снап» (яркий пик зависает у правого края и резко
+   прыгает влево). Юзер: «в конце резко останавливается, должна плавно уходить вправо».
+   Stripe.width=60%. Peak gradient на середине stripe = 30% own-width.
+   • translateX(-167%): stripe.right_edge = -7% (полностью off-screen left)
+   • translateX(+167%): stripe.left_edge = 100% (полностью off-screen right)
+   На обоих концах stripe невидим → loop-снап незаметен.
+   Интенсивность пика 0.20 (не 0.32) — фон уже несёт «вкладка активна», шиммер только
+   уточняет «AI думает», не должен спорить с process-bar за внимание. */
+@keyframes tab-ai-busy-sweep {
+  0%   { transform: translateX(-167%); }
+  100% { transform: translateX(167%); }
+}
+.tab-ai-busy-shimmer::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 60%;
+  background: linear-gradient(
+    90deg,
+    rgba(255,255,255,0) 0%,
+    rgba(255,255,255,0.06) 30%,
+    rgba(255,255,255,0.20) 50%,
+    rgba(255,255,255,0.06) 70%,
+    rgba(255,255,255,0) 100%
+  );
+  animation: tab-ai-busy-sweep 2.4s linear infinite;
+  pointer-events: none;
+}
+
+/* ControlBar (Provider/Model/Effort/Think) busy-overlay. Используется когда
+   командная операция в полёте (claude:send-command, provider:switch и т.п.).
+   Не меняет ширину блока (overlay через ::after, position:absolute), не подменяет
+   цвета триггеров — даёт визуальный сигнал «занят» через узкую полосу свечения,
+   бегущую слева направо. Пара с inline-style `pointer-events: none` на самом
+   блоке — клики блокируются, но визуально вкладка живая, а не серая-dead. */
+@keyframes control-bar-busy-sweep {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(200%); }
+}
+.control-bar-busy-overlay {
+  position: relative;
+  /* Тонкий outline вокруг "занятого" кластера — лёгкий tint claude-оранжевый. */
+  box-shadow: inset 0 0 0 1px rgba(218, 119, 86, 0.25);
+  border-radius: 4px;
+  transition: box-shadow 0.16s ease;
+}
+.control-bar-busy-overlay::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: 4px;
+  overflow: hidden;
+  background: linear-gradient(
+    90deg,
+    rgba(218, 119, 86, 0) 0%,
+    rgba(218, 119, 86, 0.08) 35%,
+    rgba(218, 119, 86, 0.22) 50%,
+    rgba(218, 119, 86, 0.08) 65%,
+    rgba(218, 119, 86, 0) 100%
+  );
+  background-size: 50% 100%;
+  background-repeat: no-repeat;
+  animation: control-bar-busy-sweep 1.6s linear infinite;
+  pointer-events: none;
+  z-index: 1;
+}
+
 @keyframes fadeIn {
   from { opacity: 0; transform: translateY(-4px); }
   to { opacity: 1; transform: translateY(0); }
@@ -202,6 +296,21 @@
 @keyframes sdk-cold-loader-fade {
   from { opacity: 0; }
   to { opacity: 1; }
+}
+
+/* Pulsing dot for background-task chips while running. Changes
+   background-color (not just opacity) so H.264/JPEG keep the delta — see
+   "AI-Optimized UI & Video Forensics" rule. Box-shadow scale adds GPU-cheap
+   halo for the visible-corner peripheral signal. */
+@keyframes sdk-bg-task-pulse {
+  0%, 100% {
+    background-color: #d97706;
+    box-shadow: 0 0 3px rgba(217, 119, 6, 0.4);
+  }
+  50% {
+    background-color: #fbbf24;
+    box-shadow: 0 0 8px rgba(251, 191, 36, 0.7);
+  }
 }
 
 @keyframes spin {
@@ -260,6 +369,14 @@
   scrollbar-width: thin;
   scrollbar-color: rgba(255, 255, 255, 0.08) transparent;
 }
+/* Notes editor: резервируем место под скролл, чтобы при его появлении контент
+   не сжимался по ширине. Без этого в правом сайдбаре `cm-scroller` появлялся
+   только когда заметка перерастает высоту — и текст «прыгал» влево на ширину
+   полосы. Целим класс-обёртку, не каждый MarkdownEditor приложения. */
+.notes-editor-stable-scroll .cm-scroller {
+  scrollbar-gutter: stable;
+}
+
 .sdk-chat-scroll::-webkit-scrollbar { width: 5px; height: 5px; }
 .sdk-chat-scroll::-webkit-scrollbar-track { background: transparent; }
 .sdk-chat-scroll::-webkit-scrollbar-thumb {

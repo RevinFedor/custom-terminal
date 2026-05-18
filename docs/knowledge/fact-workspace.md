@@ -19,11 +19,11 @@
    - Поддержка: drag-and-drop файлов (Atlaskit), rename, create, delete (в корзину с undo), context menu, multi-select (Cmd/Shift+Click).
    - Ширина sidebar ресайзится drag handle (min 180px, max 500px), сохраняется в localStorage глобально.
    - Пользователь делает `Cmd+Click` по пути файла в терминале -> файл открывается в **File Preview**.
-4. **Заметки:** Пользователь записывает мысли в InfoPanel или разворачивает полноэкранный редактор. Подробнее: [`knowledge/fact-notes.md`](notes.md).
+4. **Заметки:** Пользователь открывает заметку текущей вкладки в slide-out (`Cmd+E` или иконка `StickyNote` справа в активной вкладке TabSidebar). Подробнее: [`knowledge/fact-notes.md`](notes.md).
 
 ## Behavior Specs
-- **Two-Column Layout:** Рабочая область разделена на две независимые колонки. Левая — для терминалов и Home, правая — для инструментов проекта (Toolbar, Notes).
-- **Sidebar Stability:** Правая колонка (Toolbar, Notes) остается стабильной при переключении между Терминалом и Home. Компоненты (например, Timeline) не удаляются из DOM, а скрываются через `visibility`, что предотвращает Layout Shifts и сохраняет фиксированную ширину сайдбара.
+- **Two-Column Layout:** `TabSidebar` (вертикальные вкладки + drag-resize ширины) слева + Terminal-колонка справа. Раньше была третья правая колонка `NotesPanel` (InfoPanel + Resizer) — удалена. Project tools поднялись наверх в `ProjectToolbar` (full-width 30px), Claude-контролы (Provider/Model/Effort/Think + Continue/Stop/Fork) переехали в `ClaudeControlBar` под Terminal (см. [`fact-claude-control-bar.md`](fact-claude-control-bar.md)), заметки переехали в slide-out (Cmd+E).
+- **Sidebar Stability:** `TabSidebar` (левая колонка) остаётся смонтированной при переключении между Терминалом и Home. Компоненты (Timeline) не удаляются из DOM, а скрываются через `visibility`, что предотвращает Layout Shifts.
 - **Persistent Mounting:** Workspace остается смонтированным всегда после первого открытия. Переход Dashboard ↔ Workspace осуществляется через CSS-скрытие. См. `knowledge/fact-terminal-rendering.md` (раздел 2).
 - **Navigation History:** При закрытии активного проекта система не выбрасывает пользователя на Dashboard, а переключает на предыдущий проект из истории (Stack-based navigation).
 - **Project Focus:** При активации области проектов (`activeArea`), панель получает подсветку `bg-white/[0.05]`, а активный проект — скругленную рамку `ring-1 ring-white/50`.

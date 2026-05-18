@@ -325,6 +325,10 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   // Index of the last compact/plan-mode boundary — entries at or before this are "old history"
   const [lastBoundaryIndex, setLastBoundaryIndex] = useState(-1);
   const [clickedState, setClickedState] = useState<{ index: number; status: 'loading' | 'failed' } | null>(null);
+  // Tracks an in-flight history-panel scroll triggered by Cmd+click / click-when-open.
+  // Cleared by 'history-panel:scrolled-to' event (success) or the safety timeout (4s).
+  const pendingHistoryScrollRef = useRef<{ uuid: string; index: number } | null>(null);
+  const historyClickTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [rewindState, setRewindState] = useState<{ index: number; phase: 'compacting' | 'rewinding' | 'pasting' | 'done' } | null>(null);
 
   // Edit Range state
@@ -418,6 +422,39 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   // slips below the viewport — same issue we fixed for contextMenu).
   const editRangeLoadingMenuRef = useRef<HTMLDivElement>(null);
   const rangeActionMenuRef = useRef<HTMLDivElement>(null);
+  // Token breakdown for range — fetched async from claude:estimate-range-tokens when
+  // the action menu opens. `total` is the "max upper bound" (all toggles ON).
+  // categories is the per-class breakdown rendered in the hover popover.
+  type TokenBreakdown = {
+    total: number;
+    downTotal: number;
+    apiInputTokens: number;
+    apiOutputTokens: number;
+    categories: {
+      user: number; claudeText: number; claudeThinking: number;
+      read: number; edit: number; bash: number; tools: number;
+      subagentResult: number; subagentHistory: number; compact: number;
+    };
+  };
+  const [tokenEstimate, setTokenEstimate] = useState<TokenBreakdown | null>(null);
+  const [breakdownOpen, setBreakdownOpen] = useState(false);
+  const [breakdownFlipUp, setBreakdownFlipUp] = useState(false);
+  const tokenChipRef = useRef<HTMLDivElement>(null);
+  const breakdownPopoverRef = useRef<HTMLDivElement>(null);
+
+  // Single-entry breakdown (Cmd+hover tooltip on a user-entry → ↑XXK chip). Reuses the
+  // same IPC as range mode but with start=end=entry.uuid. Backend forward-expand picks
+  // up the trailing assistant chain automatically.
+  const [singleTokenEstimate, setSingleTokenEstimate] = useState<TokenBreakdown | null>(null);
+  const [singleTokenUuid, setSingleTokenUuid] = useState<string | null>(null);
+  const [singleBreakdownOpen, setSingleBreakdownOpen] = useState(false);
+  const [singleBreakdownFlipUp, setSingleBreakdownFlipUp] = useState(false);
+  const [singleChipEl, setSingleChipEl] = useState<HTMLSpanElement | null>(null);
+  const singleBreakdownPopoverRef = useRef<HTMLDivElement>(null);
+  // Mode toggle shared between range and single popovers. Persists during the session
+  // (user's preference doesn't reset between hovers). 'jsonl' shows the per-category
+  // weight breakdown; 'api' shows what Anthropic actually billed for this range.
+  const [breakdownMode, setBreakdownMode] = useState<'jsonl' | 'api'>('jsonl');
 
   // effect: contextMenu open → mousemove listener closes menu when cursor leaves Timeline+menu+bridge rect (uses geometric hit-test instead of elementFromPoint)
   useEffect(() => {
@@ -510,6 +547,122 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       setRangeActionMenu({ ...rangeActionMenu, y: desired });
     }
   }, [rangeActionMenu?.range?.startIndex, rangeActionMenu?.range?.endIndex, deleteConfirmMode]);
+
+  // Fetch token breakdown for the active range. claude-only; Gemini falls back to the
+  // legacy heuristic (sum of user.content lengths) since it has no copy-range backend.
+  useEffect(() => {
+    if (!rangeActionMenu || isGemini || !sessionId) {
+      setTokenEstimate(null);
+      setBreakdownOpen(false);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      const result = await ipcRenderer.invoke('claude:estimate-range-tokens', {
+        sessionId, cwd,
+        startUuid: rangeActionMenu.startUuid,
+        endUuid: rangeActionMenu.endUuid,
+      });
+      if (cancelled) return;
+      if (result?.success) {
+        setTokenEstimate({ total: result.total, downTotal: result.downTotal || 0, apiInputTokens: result.apiInputTokens || 0, apiOutputTokens: result.apiOutputTokens || 0, categories: result.categories });
+      } else {
+        setTokenEstimate(null);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [rangeActionMenu?.startUuid, rangeActionMenu?.endUuid, sessionId, cwd, isGemini]);
+
+  // Position the breakdown popover: open downward by default, flip up if there's not
+  // enough room below the action menu. Same flip pattern as note tooltip.
+  useLayoutEffect(() => {
+    if (!breakdownOpen) return;
+    const chipEl = tokenChipRef.current;
+    const popEl = breakdownPopoverRef.current;
+    if (!chipEl || !popEl) return;
+    const chipRect = chipEl.getBoundingClientRect();
+    const popHeight = popEl.getBoundingClientRect().height;
+    const margin = 10;
+    const spaceBelow = window.innerHeight - chipRect.bottom - margin;
+    setBreakdownFlipUp(spaceBelow < popHeight && chipRect.top > popHeight + margin);
+  }, [breakdownOpen, tokenEstimate, breakdownMode]);
+
+  // Lazy fetch single-entry breakdown when user hovers the ↑ chip in Cmd+hover tooltip.
+  // Skip if Gemini, no session, or already fetched the same uuid (cache hit avoids
+  // network roundtrip when user moves mouse out and back in).
+  const singleCachedUuidRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!singleTokenUuid || isGemini || !sessionId) {
+      setSingleTokenEstimate(null);
+      return;
+    }
+    if (singleCachedUuidRef.current === singleTokenUuid && singleTokenEstimate) return;
+    let cancelled = false;
+    (async () => {
+      const result = await ipcRenderer.invoke('claude:estimate-range-tokens', {
+        sessionId, cwd,
+        startUuid: singleTokenUuid,
+        endUuid: singleTokenUuid,
+      });
+      if (cancelled) return;
+      if (result?.success) {
+        singleCachedUuidRef.current = singleTokenUuid;
+        setSingleTokenEstimate({ total: result.total, downTotal: result.downTotal || 0, apiInputTokens: result.apiInputTokens || 0, apiOutputTokens: result.apiOutputTokens || 0, categories: result.categories });
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [singleTokenUuid, sessionId, cwd, isGemini]);
+
+  // Global mousemove guard for both breakdown popovers. Closing on chip.onMouseLeave
+  // unmounts the popover wrapper before the cursor can cross the 4px gap into it —
+  // mouseenter never fires on an unmounted node. Instead we keep the popover open
+  // and close it only when the cursor is outside BOTH the chip rect and the popover
+  // rect (with a tiny tolerance for the visual gap). This is the Invisible Bridge
+  // pattern from docs/methodology/design.md — listener only runs while open, no perf
+  // cost otherwise.
+  useEffect(() => {
+    if (!singleBreakdownOpen) return;
+    const onMove = (e: MouseEvent) => {
+      const chipRect = singleChipEl?.getBoundingClientRect();
+      const popRect = singleBreakdownPopoverRef.current?.getBoundingClientRect();
+      const inRect = (r: DOMRect | undefined, pad = 0) =>
+        !!r && e.clientX >= r.left - pad && e.clientX <= r.right + pad
+          && e.clientY >= r.top - pad && e.clientY <= r.bottom + pad;
+      if (!inRect(chipRect, 2) && !inRect(popRect, 2)) {
+        setSingleBreakdownOpen(false);
+      }
+    };
+    window.addEventListener('mousemove', onMove);
+    return () => window.removeEventListener('mousemove', onMove);
+  }, [singleBreakdownOpen, singleChipEl]);
+
+  useEffect(() => {
+    if (!breakdownOpen) return;
+    const onMove = (e: MouseEvent) => {
+      const chipRect = tokenChipRef.current?.getBoundingClientRect();
+      const popRect = breakdownPopoverRef.current?.getBoundingClientRect();
+      const inRect = (r: DOMRect | undefined, pad = 0) =>
+        !!r && e.clientX >= r.left - pad && e.clientX <= r.right + pad
+          && e.clientY >= r.top - pad && e.clientY <= r.bottom + pad;
+      if (!inRect(chipRect, 2) && !inRect(popRect, 2)) {
+        setBreakdownOpen(false);
+      }
+    };
+    window.addEventListener('mousemove', onMove);
+    return () => window.removeEventListener('mousemove', onMove);
+  }, [breakdownOpen]);
+
+  // Single-entry breakdown flip-up logic — same pattern as range version.
+  useLayoutEffect(() => {
+    if (!singleBreakdownOpen || !singleChipEl) return;
+    const popEl = singleBreakdownPopoverRef.current;
+    if (!popEl) return;
+    const chipRect = singleChipEl.getBoundingClientRect();
+    const popHeight = popEl.getBoundingClientRect().height;
+    const margin = 10;
+    const spaceBelow = window.innerHeight - chipRect.bottom - margin;
+    setSingleBreakdownFlipUp(spaceBelow < popHeight && chipRect.top > popHeight + margin);
+  }, [singleBreakdownOpen, singleTokenEstimate, singleChipEl, breakdownMode]);
 
   const [rewindPostPromptMode, setRewindPostPromptMode] = useState(false);
   const [rewindPostPromptText, setRewindPostPromptText] = useState('');
@@ -832,6 +985,29 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   useEffect(() => { activeTooltipIndexRef.current = activeTooltipIndex; }, [activeTooltipIndex]);
   useEffect(() => { activeNoteIndexRef.current = activeNoteIndex; }, [activeNoteIndex]);
   useEffect(() => { activeForkMarkerIndexRef.current = activeForkMarkerIndex; }, [activeForkMarkerIndex]);
+
+  // effect: HistoryPanel scrolled-to → clear dot spinner (Cmd+click / open-panel click path).
+  useEffect(() => {
+    const onScrolledTo = (e: Event) => {
+      const detail = (e as CustomEvent).detail as { tabId?: string; uuid?: string; found?: boolean } | undefined;
+      if (!detail || detail.tabId !== tabId) return;
+      const pending = pendingHistoryScrollRef.current;
+      if (!pending || pending.uuid !== detail.uuid) return;
+      pendingHistoryScrollRef.current = null;
+      if (historyClickTimeoutRef.current) {
+        clearTimeout(historyClickTimeoutRef.current);
+        historyClickTimeoutRef.current = null;
+      }
+      if (detail.found === false) {
+        setClickedState({ index: pending.index, status: 'failed' });
+        setTimeout(() => setClickedState((s) => (s?.index === pending.index ? null : s)), 1200);
+      } else {
+        setClickedState((s) => (s?.index === pending.index ? null : s));
+      }
+    };
+    window.addEventListener('history-panel:scrolled-to', onScrolledTo);
+    return () => window.removeEventListener('history-panel:scrolled-to', onScrolledTo);
+  }, [tabId]);
 
   // effect: CMD+Shift toggle + global mousedown unlock.
   // Закрепить можно когда любой из tooltip'ов открыт или есть hovered entry/note/fork.
@@ -1573,6 +1749,15 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     if (e && (e.metaKey || e.ctrlKey)) {
       if (!isHistoryOpen) setHistoryPanelOpen(tabId, true);
       setHistoryScrollToUuid(entry.uuid);
+      // Spinner on dot — HistoryPanel emits 'history-panel:scrolled-to' when done.
+      // Safety: clear after 4s in case the panel never mounts (no session).
+      setClickedState({ index, status: 'loading' });
+      pendingHistoryScrollRef.current = { uuid: entry.uuid, index };
+      if (historyClickTimeoutRef.current) clearTimeout(historyClickTimeoutRef.current);
+      historyClickTimeoutRef.current = setTimeout(() => {
+        pendingHistoryScrollRef.current = null;
+        setClickedState((s) => (s?.index === index ? null : s));
+      }, 4000);
       return;
     }
 
@@ -1580,6 +1765,13 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     // This includes compact/continued entries which have no terminal position but DO exist in history panel
     if (isHistoryOpen) {
       setHistoryScrollToUuid(entry.uuid);
+      setClickedState({ index, status: 'loading' });
+      pendingHistoryScrollRef.current = { uuid: entry.uuid, index };
+      if (historyClickTimeoutRef.current) clearTimeout(historyClickTimeoutRef.current);
+      historyClickTimeoutRef.current = setTimeout(() => {
+        pendingHistoryScrollRef.current = null;
+        setClickedState((s) => (s?.index === index ? null : s));
+      }, 4000);
       return;
     }
 
@@ -2490,6 +2682,64 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   // ════════════════════════════════════════════════════════════
 
   const currentActiveEntry = activeTooltipIndex !== null ? entries[activeTooltipIndex] : null;
+
+  // Shared body renderer for the JSONL/API breakdown popovers. Same shape in both range
+  // and single-entry mode — only the estimate object varies. Top row is a JSONL/API
+  // toggle; below it either the per-category JSONL weights or the two API numbers.
+  const renderBreakdownBody = (
+    est: TokenBreakdown,
+    rows: Array<{ key: string; label: string; value: number }>,
+  ) => {
+    const TabBtn = ({ mode, children }: { mode: 'jsonl' | 'api'; children: React.ReactNode }) => (
+      <button
+        onClick={(e) => { e.stopPropagation(); setBreakdownMode(mode); }}
+        className="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded transition-colors cursor-pointer"
+        style={{
+          color: breakdownMode === mode ? '#e8a955' : 'rgba(255,255,255,0.4)',
+          backgroundColor: breakdownMode === mode ? 'rgba(232,169,85,0.08)' : 'transparent',
+        }}
+      >{children}</button>
+    );
+    return (
+      <>
+        <div className="flex items-center gap-0.5 mb-1.5">
+          <TabBtn mode="jsonl">JSONL</TabBtn>
+          <TabBtn mode="api">API</TabBtn>
+        </div>
+        {breakdownMode === 'jsonl' ? (
+          <>
+            {rows.length === 0 ? (
+              <div className="text-[11px] text-white/40">Нет данных</div>
+            ) : (
+              <div className="flex flex-col gap-0.5">
+                {rows.map(row => (
+                  <div key={row.key} className="flex items-center justify-between text-[11px]">
+                    <span className="text-white/60">{row.label}</span>
+                    <span className="font-mono text-white/80">{formatTokenCount(row.value)}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+            <div className="mt-1.5 pt-1 border-t border-white/10 flex items-center justify-between text-[11px]">
+              <span className="text-white/50">В JSONL</span>
+              <span className="font-mono font-semibold" style={{ color: '#e8a955' }}>{formatTokenCount(est.total)}</span>
+            </div>
+          </>
+        ) : (
+          <div className="flex flex-col gap-0.5">
+            <div className="flex items-center justify-between text-[11px]">
+              <span className="text-white/60">Input</span>
+              <span className="font-mono text-white/80">{formatTokenCount(est.apiInputTokens)}</span>
+            </div>
+            <div className="flex items-center justify-between text-[11px]">
+              <span className="text-white/60">Output</span>
+              <span className="font-mono text-white/80">{formatTokenCount(est.apiOutputTokens)}</span>
+            </div>
+          </div>
+        )}
+      </>
+    );
+  };
 
   // Compute tooltip wrapper position — uses measured height for precision
   const tooltipPos = activeTooltipIndex !== null ? (() => {
@@ -3682,7 +3932,22 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
               ref={tooltipRef}
               data-cmd-hover-popover
               onMouseEnter={() => { isMouseInTooltipRef.current = true; }}
-              onMouseLeave={(e) => { if (!isResizingTooltipRef.current && !freezeCmdPopups && !isLockedTooltip) { isMouseInTooltipRef.current = false; handleMouseLeaveTooltipArea(); } }}
+              onMouseLeave={(e) => {
+                // Keep tooltip open while cursor is inside the single-entry breakdown
+                // popover (it lives in a sibling portal, so MouseLeave fires when the
+                // cursor crosses the gap). Hit-test against the popover's rect.
+                if (singleBreakdownOpen && singleBreakdownPopoverRef.current) {
+                  const r = singleBreakdownPopoverRef.current.getBoundingClientRect();
+                  if (e.clientX >= r.left && e.clientX <= r.right &&
+                      e.clientY >= r.top && e.clientY <= r.bottom) {
+                    return;
+                  }
+                }
+                if (!isResizingTooltipRef.current && !freezeCmdPopups && !isLockedTooltip) {
+                  isMouseInTooltipRef.current = false;
+                  handleMouseLeaveTooltipArea();
+                }
+              }}
               style={{
                 position: 'fixed',
                 right: `${popupRightPx}px`,
@@ -3830,10 +4095,23 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                     </div>
                     <div className="flex items-center mt-0 pt-1 border-t border-white/5 shrink-0">
                       <span className="text-[10px] text-white/30">{new Date(currentActiveEntry.timestamp).toLocaleTimeString()}</span>
-                      <span className="flex items-center gap-1 ml-2 text-[10px]" style={{ color: '#e8a955' }}>
+                      <span
+                        className="flex items-center gap-1 ml-2 text-[10px]"
+                        onMouseEnter={(e) => {
+                          if (isGemini) return;
+                          setSingleChipEl(e.currentTarget);
+                          setSingleTokenUuid(currentActiveEntry.uuid);
+                          setSingleBreakdownOpen(true);
+                        }}
+                        style={{
+                          color: '#e8a955',
+                          cursor: isGemini ? 'default' : 'help',
+                          textDecoration: isGemini ? 'none' : 'underline dotted rgba(232,169,85,0.4)',
+                          textUnderlineOffset: '2px',
+                        }}
+                      >
                         <Zap size={10} />
-                        <span>↑{formatTokenCount(Math.ceil(currentActiveEntry.content.length / 3.5))}</span>
-                        {currentActiveEntry.responseTokens != null && <span>↓{formatTokenCount(currentActiveEntry.responseTokens)}</span>}
+                        <span>{formatTokenCount(singleTokenEstimate && singleTokenUuid === currentActiveEntry.uuid ? singleTokenEstimate.total : Math.ceil(currentActiveEntry.content.length / 3.5))}</span>
                       </span>
                       <div className="flex-1" />
                       <button
@@ -3869,10 +4147,23 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                     </div>
                     <div className="flex items-center mt-0 pt-1 border-t border-white/5 shrink-0">
                       <span className="text-[10px] text-white/30">{new Date(currentActiveEntry.timestamp).toLocaleTimeString()}</span>
-                      <span className="flex items-center gap-1 ml-2 text-[10px]" style={{ color: '#e8a955' }}>
+                      <span
+                        className="flex items-center gap-1 ml-2 text-[10px]"
+                        onMouseEnter={(e) => {
+                          if (isGemini) return;
+                          setSingleChipEl(e.currentTarget);
+                          setSingleTokenUuid(currentActiveEntry.uuid);
+                          setSingleBreakdownOpen(true);
+                        }}
+                        style={{
+                          color: '#e8a955',
+                          cursor: isGemini ? 'default' : 'help',
+                          textDecoration: isGemini ? 'none' : 'underline dotted rgba(232,169,85,0.4)',
+                          textUnderlineOffset: '2px',
+                        }}
+                      >
                         <Zap size={10} />
-                        <span>↑{formatTokenCount(Math.ceil(currentActiveEntry.content.length / 3.5))}</span>
-                        {currentActiveEntry.responseTokens != null && <span>↓{formatTokenCount(currentActiveEntry.responseTokens)}</span>}
+                        <span>{formatTokenCount(singleTokenEstimate && singleTokenUuid === currentActiveEntry.uuid ? singleTokenEstimate.total : Math.ceil(currentActiveEntry.content.length / 3.5))}</span>
                       </span>
                       <div className="flex-1" />
                       <button
@@ -4011,10 +4302,23 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                     </div>
                     <div className="flex items-center mt-0 pt-1 border-t border-white/5 shrink-0">
                       <span className="text-[10px] text-white/30">{new Date(currentActiveEntry.timestamp).toLocaleTimeString()}</span>
-                      <span className="flex items-center gap-1 ml-2 text-[10px]" style={{ color: '#e8a955' }}>
+                      <span
+                        className="flex items-center gap-1 ml-2 text-[10px]"
+                        onMouseEnter={(e) => {
+                          if (isGemini) return;
+                          setSingleChipEl(e.currentTarget);
+                          setSingleTokenUuid(currentActiveEntry.uuid);
+                          setSingleBreakdownOpen(true);
+                        }}
+                        style={{
+                          color: '#e8a955',
+                          cursor: isGemini ? 'default' : 'help',
+                          textDecoration: isGemini ? 'none' : 'underline dotted rgba(232,169,85,0.4)',
+                          textUnderlineOffset: '2px',
+                        }}
+                      >
                         <Zap size={10} />
-                        <span>↑{formatTokenCount(Math.ceil(currentActiveEntry.content.length / 3.5))}</span>
-                        {currentActiveEntry.responseTokens != null && <span>↓{formatTokenCount(currentActiveEntry.responseTokens)}</span>}
+                        <span>{formatTokenCount(singleTokenEstimate && singleTokenUuid === currentActiveEntry.uuid ? singleTokenEstimate.total : Math.ceil(currentActiveEntry.content.length / 3.5))}</span>
                       </span>
                       <div className="flex-1" />
                       <button
@@ -4309,7 +4613,18 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
           <TooltipPortal>
             <div
               ref={rangeActionMenuRef}
-              onMouseLeave={() => {
+              onMouseLeave={(e) => {
+                // Don't close while user is hovering the breakdown popover — it lives
+                // outside this div in a sibling portal, so MouseLeave fires when cursor
+                // crosses the gap. Geometric hit-test against the popover rect keeps
+                // the menu alive as long as the cursor is within either node.
+                if (breakdownOpen && breakdownPopoverRef.current) {
+                  const r = breakdownPopoverRef.current.getBoundingClientRect();
+                  if (e.clientX >= r.left && e.clientX <= r.right &&
+                      e.clientY >= r.top && e.clientY <= r.bottom) {
+                    return;
+                  }
+                }
                 if (!postPromptMode && !deleteConfirmMode) {
                   setRangeActionMenu(null);
                   selectionStartIdRef.current = null;
@@ -4388,19 +4703,33 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                 );
               })() : !postPromptMode ? (
                 <>
-                  {/* Token summary for selected range */}
+                  {/* Token summary for selected range. ↑ = max upper bound from backend
+                      estimate (all toggles ON); fall back to legacy heuristic for Gemini
+                      or while estimate is loading. Hover ↑ chip → breakdown popover. */}
                   {(() => {
                     const { startIndex, endIndex } = rangeActionMenu.range;
-                    let upTotal = 0, downTotal = 0;
+                    let upFallback = 0, downFallback = 0;
                     for (let i = startIndex; i <= endIndex && i < entries.length; i++) {
-                      upTotal += Math.ceil(entries[i].content.length / 3.5);
-                      downTotal += (entries[i].responseTokens || 0);
+                      upFallback += Math.ceil(entries[i].content.length / 3.5);
+                      downFallback += (entries[i].responseTokens || 0);
                     }
-                    return (upTotal > 0 || downTotal > 0) ? (
-                      <div className="flex items-center gap-1.5 px-3 py-1.5 text-[10px] border-b border-white/5" style={{ color: '#e8a955' }}>
+                    const upTotal = tokenEstimate?.total ?? upFallback;
+                    const downTotal = tokenEstimate?.downTotal ?? downFallback;
+                    const haveBreakdown = !isGemini && tokenEstimate != null;
+                    return (upTotal > 0) ? (
+                      <div
+                        ref={tokenChipRef}
+                        className="flex items-center gap-1.5 px-3 py-1.5 text-[10px] border-b border-white/5"
+                        onMouseEnter={() => { if (haveBreakdown) setBreakdownOpen(true); }}
+                        style={{
+                          color: '#e8a955',
+                          cursor: haveBreakdown ? 'help' : 'default',
+                          textDecoration: haveBreakdown ? 'underline dotted rgba(232,169,85,0.4)' : 'none',
+                          textUnderlineOffset: '2px',
+                        }}
+                      >
                         <Zap size={10} />
-                        <span>↑{formatTokenCount(upTotal)}</span>
-                        {downTotal > 0 && <span>↓{formatTokenCount(downTotal)}</span>}
+                        <span>{formatTokenCount(upTotal)}</span>
                       </div>
                     ) : null;
                   })()}
@@ -4552,6 +4881,141 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
             </div>
           </TooltipPortal>
         )}
+
+        {/* ──── RANGE TOKEN BREAKDOWN POPOVER (hover ↑ chip in rangeActionMenu) ──── */}
+        {/* Hovers below (or flipped above) the action menu's ↑ chip, shows per-category
+            token estimate for the selected range. Same styling as note tooltip: same
+            border-radius, same background, same border. Left edge stays glued to the
+            action menu (right-anchored via popupRightPx) so the popover hangs visually
+            from it. Flip-up logic from useLayoutEffect above kicks in near viewport bottom. */}
+        {isVisible && rangeActionMenu && breakdownOpen && tokenEstimate && (() => {
+          const chipEl = tokenChipRef.current;
+          if (!chipEl) return null;
+          const chipRect = chipEl.getBoundingClientRect();
+          // Anchor to action menu's right edge (same as the menu itself).
+          // Bottom-anchored: top: chip.bottom, then padding inside creates the visual gap.
+          // Same Invisible Bridge pattern as fact-clipboard-tools.md::CSS-bridge — if we
+          // shift the popover by `+4` instead, a 4px dead-zone opens between chip and popover
+          // and onMouseLeave from the chip closes the popover before cursor reaches it.
+          const top = breakdownFlipUp
+            ? chipRect.top
+            : chipRect.bottom;
+          const transform = breakdownFlipUp ? 'translateY(-100%)' : 'none';
+          const paddingTop = breakdownFlipUp ? 0 : 4;
+          const paddingBottom = breakdownFlipUp ? 4 : 0;
+
+          // Build category rows. Skip categories with zero tokens — cleaner UI than
+          // showing 9 rows where 6 are empty.
+          const rows: Array<{ key: string; label: string; value: number }> = [
+            { key: 'user', label: 'User', value: tokenEstimate.categories.user },
+            { key: 'claudeText', label: 'Claude · answer', value: tokenEstimate.categories.claudeText },
+            { key: 'claudeThinking', label: 'Claude · thinking', value: tokenEstimate.categories.claudeThinking },
+            { key: 'read', label: 'Read', value: tokenEstimate.categories.read },
+            { key: 'edit', label: 'Edit · Write', value: tokenEstimate.categories.edit },
+            { key: 'bash', label: 'Bash · shell', value: tokenEstimate.categories.bash },
+            { key: 'tools', label: 'MCP · web · прочее', value: tokenEstimate.categories.tools },
+            { key: 'subagentResult', label: 'Субагент · result', value: tokenEstimate.categories.subagentResult },
+            { key: 'subagentHistory', label: 'Субагент · history', value: tokenEstimate.categories.subagentHistory },
+            { key: 'compact', label: 'Compact summary', value: tokenEstimate.categories.compact },
+          ].filter(r => r.value > 0);
+
+          return (
+            <TooltipPortal>
+              <div
+                ref={breakdownPopoverRef}
+                onMouseDown={(e) => e.stopPropagation()}
+                onClick={(e) => e.stopPropagation()}
+                style={{
+                  position: 'fixed',
+                  right: `${popupRightPx}px`,
+                  top,
+                  transform,
+                  paddingTop,
+                  paddingBottom,
+                  zIndex: 10025,
+                  pointerEvents: 'auto',
+                }}
+              >
+                <div
+                  style={{
+                    backgroundColor: '#1a1a1a',
+                    border: '1px solid #333',
+                    borderRadius: '6px',
+                    padding: '6px 10px',
+                    minWidth: '180px',
+                    maxWidth: '260px',
+                    boxShadow: '0 4px 16px rgba(0,0,0,0.6)',
+                  }}
+                >
+                  {renderBreakdownBody(tokenEstimate, rows)}
+                </div>
+              </div>
+            </TooltipPortal>
+          );
+        })()}
+
+        {/* ──── SINGLE-ENTRY TOKEN BREAKDOWN POPOVER (hover ↑ chip in Cmd+hover tooltip) ──── */}
+        {/* Same content shape as the range popover, but anchored to the chip inside the
+            Cmd+hover entry tooltip (not the range action menu). Positioned via the chip's
+            getBoundingClientRect() since the chip lives in a sibling portal — flips up
+            near viewport bottom. Stays open while cursor is over chip OR popover. */}
+        {isVisible && singleBreakdownOpen && singleTokenEstimate && singleChipEl && (() => {
+          const chipRect = singleChipEl.getBoundingClientRect();
+          const top = singleBreakdownFlipUp ? chipRect.top : chipRect.bottom;
+          const transform = singleBreakdownFlipUp ? 'translateY(-100%)' : 'none';
+          const paddingTop = singleBreakdownFlipUp ? 0 : 4;
+          const paddingBottom = singleBreakdownFlipUp ? 4 : 0;
+
+          const rows: Array<{ key: string; label: string; value: number }> = [
+            { key: 'user', label: 'User', value: singleTokenEstimate.categories.user },
+            { key: 'claudeText', label: 'Claude · answer', value: singleTokenEstimate.categories.claudeText },
+            { key: 'claudeThinking', label: 'Claude · thinking', value: singleTokenEstimate.categories.claudeThinking },
+            { key: 'read', label: 'Read', value: singleTokenEstimate.categories.read },
+            { key: 'edit', label: 'Edit · Write', value: singleTokenEstimate.categories.edit },
+            { key: 'bash', label: 'Bash · shell', value: singleTokenEstimate.categories.bash },
+            { key: 'tools', label: 'MCP · web · прочее', value: singleTokenEstimate.categories.tools },
+            { key: 'subagentResult', label: 'Субагент · result', value: singleTokenEstimate.categories.subagentResult },
+            { key: 'subagentHistory', label: 'Субагент · history', value: singleTokenEstimate.categories.subagentHistory },
+            { key: 'compact', label: 'Compact summary', value: singleTokenEstimate.categories.compact },
+          ].filter(r => r.value > 0);
+
+          // Anchor: left edge of the chip itself (entry tooltip lives next to Timeline,
+          // so we lean against its left side too; no popupRightPx because chip is not
+          // inside the range-action menu).
+          return (
+            <TooltipPortal>
+              <div
+                ref={singleBreakdownPopoverRef}
+                onMouseDown={(e) => e.stopPropagation()}
+                onClick={(e) => e.stopPropagation()}
+                style={{
+                  position: 'fixed',
+                  left: chipRect.left,
+                  top,
+                  transform,
+                  paddingTop,
+                  paddingBottom,
+                  zIndex: 10025,
+                  pointerEvents: 'auto',
+                }}
+              >
+                <div
+                  style={{
+                    backgroundColor: '#1a1a1a',
+                    border: '1px solid #333',
+                    borderRadius: '6px',
+                    padding: '6px 10px',
+                    minWidth: '180px',
+                    maxWidth: '260px',
+                    boxShadow: '0 4px 16px rgba(0,0,0,0.6)',
+                  }}
+                >
+                  {renderBreakdownBody(singleTokenEstimate, rows)}
+                </div>
+              </div>
+            </TooltipPortal>
+          );
+        })()}
 
         {/* ──── FORK-MARKER TOOLTIP PORTAL (blue fork stripe → source session + delete-marker button) ──── */}
         {/* Fork Marker Tooltip Portal */}

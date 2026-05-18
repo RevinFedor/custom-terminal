@@ -49,3 +49,18 @@ if (!saved) {
 - `src/renderer/components/UI/SettingsModal.tsx` — одна секция «Заметки вкладки» вместо двух.
 - `src/renderer/components/Workspace/panels/InfoPanel.tsx`, `Workspace/TabNotesSlideout.tsx`, `Workspace/TabPreviewPopover.tsx` — потребители.
 - [fix-foldstate-dual-editor-divergence.md](../../gt-editor/docs/knowledge/fix-foldstate-dual-editor-divergence.md) — другой шрам того же класса.
+
+## Постскриптум: пересмотр через эксплуатацию (вернулись к трём шрифтам, но по другой модели)
+
+После некоторого времени эксплуатации единого `notesEditorFontSize` выяснилось: юзер реально хочет **разный** шрифт в разных surface'ах. Не потому что они «разные места» (старый антипаттерн per-surface knob), а потому что у них **разная плотность окружения**: сайдбар тесный → читается мелче, slide-out просторный → крупнее, popover над курсором — отдельная балансировка.
+
+Структура теперь: `notesSidebarFontSize` (inline в InfoPanel), `notesExpandedFontSize` (slide-out), `notesTooltipFontSize` (CMD+hover preview). Padding'и `notesEditorPaddingX/Y` остались **общие** — это визуальный отступ редактора, плотностью не диктуется.
+
+Это **не** возврат к старому фрагментированному состоянию. Различие:
+
+- **Раньше** (`tabNotes*` + `notesEditor*`): persistence-ключ привязан к surface произвольно — inline+preview жили в `tabNotes`, slide-out отдельно в `notesEditor`. Юзер видел две группы ползунков в Settings без объясняющей логики. Это plain per-surface knob → антипаттерн.
+- **Сейчас** (`notesSidebar` / `notesExpanded` / `notesTooltip`): persistence-ключ привязан к density-контексту. Три knob'а потому что есть три ощутимо разные плотности; юзер думает «компактно/просторно/всплывает», не «inline/slideout/preview».
+
+Тест на различие: если три knob'а можно одной фразой объяснить через плотность («там тесно — мельче, там просторно — крупнее, там всплывает — отдельный») — оставь раздельно. Если только через перечисление surface'ов («тут одно, тут другое, потому что три места рендерят») — схлопывай в один. См. `methodology/design.md::Один контент в нескольких density-контекстах = независимые шрифты по семантике плотности`.
+
+Migration: переход с единого `notesEditorFontSize` обратно на три выполняется в getter'ах. Если новые ключи (`noted-terminal-notes-{sidebar,expanded,tooltip}-font-size`) отсутствуют — читаем legacy `noted-terminal-notes-editor-font-size` (или ещё более старый `noted-terminal-tab-notes-font-size`) и подставляем во все три. Юзер не теряет накопленное значение, дальше может разойтись по плотностям.

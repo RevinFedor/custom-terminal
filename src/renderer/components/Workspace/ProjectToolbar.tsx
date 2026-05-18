@@ -1,5 +1,5 @@
 import React, { useState, useMemo } from 'react';
-import { Home, Minimize2, RotateCcw, Globe } from 'lucide-react';
+import { Home, Minimize2, RotateCcw, Globe, PanelLeft, FileEdit } from 'lucide-react';
 import { VscVscode } from 'react-icons/vsc';
 import { useUIStore } from '../../store/useUIStore';
 import Tooltip from '../UI/Tooltip';
@@ -7,12 +7,14 @@ import { useWorkspaceStore, isTabInterrupted } from '../../store/useWorkspaceSto
 import { useProjectsStore } from '../../store/useProjectsStore';
 import { compressLogs } from '../../utils/compressLogs';
 import SemanticIndexButton from './SemanticIndexButton';
+import CopySessionWithChips from './CopySessionWithChips';
+import DocsButton from './DocsButton';
 
 const { ipcRenderer } = window.require('electron');
 
 export default function ProjectToolbar() {
   const { showToast } = useUIStore();
-  const { activeProjectId, openProjects, clearInterruptedState, setTabCommandType, createBrowserTab, setProjectView, getEffectiveTabId } = useWorkspaceStore();
+  const { activeProjectId, openProjects, clearInterruptedState, setTabCommandType, createBrowserTab, setProjectView, getEffectiveTabId, getSidebarState, setSidebarOpen } = useWorkspaceStore();
   const { projects } = useProjectsStore();
 
   const [isCompressing, setIsCompressing] = useState(false);
@@ -90,6 +92,27 @@ export default function ProjectToolbar() {
     });
   };
 
+  // Trampoline to GT Editor via custom `gteditor://open` URL scheme. macOS
+  // LaunchServices routes to the already-running GT Editor.app (or cold-launches
+  // it), and the receiving renderer adds the folder to its directory list if
+  // missing — see gt-editor/docs/knowledge/fact-goto-modal.md.
+  const handleOpenGTEditor = () => {
+    if (!activeProjectId) return;
+    const workspace = openProjects.get(activeProjectId);
+    const currentProject = projects[activeProjectId];
+    const effectiveId = getEffectiveTabId();
+    const currentTab = effectiveId && workspace ? workspace.tabs.get(effectiveId) : null;
+    const cwd = currentTab?.cwd || currentProject?.path;
+    if (!cwd) {
+      showToast('Не удалось определить директорию проекта', 'error');
+      return;
+    }
+    const { shell } = window.require('electron');
+    shell.openExternal(`gteditor://open?folder=${encodeURIComponent(cwd)}`).catch((err: Error) => {
+      showToast(`GT Editor: ${err.message}`, 'error');
+    });
+  };
+
   const handleCompressLogs = async () => {
     if (isCompressing) return;
 
@@ -147,6 +170,20 @@ export default function ProjectToolbar() {
     <div
       className="h-[30px] w-full bg-panel flex items-stretch"
     >
+      {/* File Explorer Toggle (Cmd+B) — was inside TabBar before the layout migration */}
+      <Tooltip content="Toggle file explorer">
+      <button
+        onClick={() => {
+          if (!activeProjectId) return;
+          const { sidebarOpen } = getSidebarState(activeProjectId);
+          setSidebarOpen(activeProjectId, !sidebarOpen);
+        }}
+        className="h-full flex items-center px-3 text-[#666] hover:text-white hover:bg-[rgba(255,255,255,0.05)] transition-all duration-150"
+      >
+        <PanelLeft size={14} />
+      </button>
+      </Tooltip>
+
       {/* Home Button */}
       <Tooltip content="Project Home">
       <button
@@ -202,8 +239,25 @@ export default function ProjectToolbar() {
       </button>
       </Tooltip>
 
+      {/* Open in GT Editor Button */}
+      <Tooltip content="Открыть проект в GT Editor (Ctrl+G там — go-to file:line)">
+      <button
+        onClick={handleOpenGTEditor}
+        style={buttonStyle(false)}
+        onMouseEnter={(e) => handleMouseEnter(e, false)}
+        onMouseLeave={(e) => handleMouseLeave(e, false)}
+      >
+        <FileEdit size={14} />
+      </button>
+      </Tooltip>
+
       {/* Semantic Index Status */}
-      <SemanticIndexButton />
+      <SemanticIndexButton
+        onOpenSettings={() => {
+          // App.tsx слушает settings:open и открывает SettingsModal на нужном табе.
+          window.dispatchEvent(new CustomEvent('settings:open', { detail: { tab: 'colors' } }));
+        }}
+      />
 
       {/* Resume All Interrupted Sessions Button - only shows when there are interrupted tabs */}
       {interruptedTabs.length > 0 && (
@@ -229,6 +283,24 @@ export default function ProjectToolbar() {
         </button>
         </Tooltip>
       )}
+
+      {/* Flex spacer — pushes session-copy cluster to the right edge of the toolbar */}
+      <div style={{ flex: 1 }} />
+
+      {/* Docs popover trigger — opens ActionsPanel (Update Docs / Update API → Haiku
+          pipeline). Pair-aligned with CopySessionWithChips popover: both anchor to
+          their trigger's bottom-right edge so the two popovers share the same
+          downward-opening direction. */}
+      <div className="flex items-center pr-2">
+        <DocsButton />
+      </div>
+
+      {/* CopySessionButton + chip-row — moved here from InfoPanel. Renders nothing
+          when there's no active Claude/Gemini session, so the toolbar collapses
+          gracefully on Home / generic tabs. */}
+      <div className="flex items-center pr-3">
+        <CopySessionWithChips />
+      </div>
     </div>
   );
 }

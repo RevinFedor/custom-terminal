@@ -1,5 +1,6 @@
-import React, { useEffect, useLayoutEffect, useState, useRef, useCallback, useMemo, memo, startTransition } from 'react';
+import React, { useEffect, useState, useRef, useCallback, useMemo, memo, startTransition } from 'react';
 import { X, ChevronDown, ChevronRight, Search, ArrowUp, ArrowDown } from 'lucide-react';
+import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
 import { useUIStore } from '../../store/useUIStore';
 import Tooltip from '../UI/Tooltip';
 import MarkdownRenderer from '../Research/MarkdownRenderer';
@@ -432,13 +433,6 @@ if (!document.getElementById('hp-flash-style')) {
   document.head.appendChild(style);
 }
 
-// content-visibility style for off-screen rendering skip (browser-native virtualization)
-const entryWrapperStyle: React.CSSProperties = {
-  paddingTop: 4,
-  paddingBottom: 4,
-  contentVisibility: 'auto',
-  containIntrinsicSize: 'auto 100px',
-};
 
 function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, toolType = 'claude' }: HistoryPanelProps) {
   const setHistoryPanelOpen = useUIStore((s) => s.setHistoryPanelOpen);
@@ -449,10 +443,12 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
   const setHistoryScrollPosition = useUIStore((s) => s.setHistoryScrollPosition);
   const closePanel = useCallback(() => setHistoryPanelOpen(tabId, false), [tabId, setHistoryPanelOpen]);
 
-  // Save scroll position + clean up CSS highlights on unmount
+  // Save scroll position + clean up CSS highlights on unmount.
+  // Virtuoso owns scrolling — the scrollTop we save belongs to the inner
+  // scroller element (via scrollerRef), not scrollRef.
   useEffect(() => {
     return () => {
-      const el = scrollRef.current;
+      const el = virtuosoScrollerRef.current;
       if (el) setHistoryScrollPosition(tabId, el.scrollTop);
       if (scrollSaveTimerRef.current) clearTimeout(scrollSaveTimerRef.current);
       const CSS_HL = (CSS as any).highlights;
@@ -475,12 +471,24 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
 
   const [entries, setEntries] = useState<FullHistoryEntry[]>([]);
   const [loading, setLoading] = useState(true);
-  const scrollRef = useRef<HTMLDivElement>(null);
   const scrollArrowRef = useRef<HTMLDivElement>(null);
+  const virtuosoRef = useRef<VirtuosoHandle | null>(null);
   const isResizing = useRef(false);
   const isAtBottomRef = useRef(true);
   const prevVisibleUuidsRef = useRef('');
   const scrollSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Virtuoso's actual scroller element (filled via `scrollerRef` callback).
+  // Used by Cmd+F CSS Highlight API to walk text nodes of the currently
+  // mounted item range. Virtuoso unmounts off-screen items, so highlights
+  // re-apply on every range change via the same effect (matchPositions deps).
+  const virtuosoScrollerRef = useRef<HTMLElement | null>(null);
+  // Visible index range from Virtuoso. Drives the visible-uuid set without
+  // an IntersectionObserver (cheaper, exact: no threshold guessing).
+  const visibleRangeRef = useRef<{ start: number; end: number }>({ start: 0, end: 0 });
+  // Latest entries length — let stable callbacks (scrollToBottom) read it
+  // without depending on `entries` (which would invalidate downstream effects
+  // on every refresh).
+  const lengthRef = useRef(0);
 
   // ========== SEARCH ==========
   const [searchOpen, setSearchOpen] = useState(false);
@@ -508,13 +516,8 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
   useEffect(() => {
     if (matchPositions.length > 0) {
       setCurrentMatchIdx(0);
-      // Scroll to first match
       const match = matchPositions[0];
-      const el = scrollRef.current;
-      if (el) {
-        const entryEl = el.querySelector(`[data-uuid="${match.entryUuid}"]`) as HTMLElement;
-        if (entryEl) entryEl.scrollIntoView({ block: 'center', behavior: 'smooth' });
-      }
+      virtuosoRef.current?.scrollToIndex({ index: match.entryIdx, align: 'center', behavior: 'smooth' });
     }
   }, [searchQuery]);
 
@@ -522,12 +525,7 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
   const scrollToMatch = useCallback((idx: number) => {
     if (idx < 0 || idx >= matchPositions.length) return;
     const match = matchPositions[idx];
-    const el = scrollRef.current;
-    if (!el) return;
-    const entryEl = el.querySelector(`[data-uuid="${match.entryUuid}"]`) as HTMLElement;
-    if (entryEl) {
-      entryEl.scrollIntoView({ block: 'center', behavior: 'smooth' });
-    }
+    virtuosoRef.current?.scrollToIndex({ index: match.entryIdx, align: 'center', behavior: 'smooth' });
   }, [matchPositions]);
 
   const goNextMatch = useCallback(() => {
@@ -547,7 +545,7 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
   // CSS Highlight API — apply highlights after render
   useEffect(() => {
     const CSS_HL = (CSS as any).highlights;
-    if (!CSS_HL || !scrollRef.current) {
+    if (!CSS_HL || !virtuosoScrollerRef.current) {
       CSS_HL?.delete('hp-search');
       CSS_HL?.delete('hp-search-current');
       return;
@@ -567,7 +565,7 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
       const currentMatch = matchPositions[currentMatchIdx];
 
       // Walk all text nodes in scroll container
-      const walker = document.createTreeWalker(scrollRef.current!, NodeFilter.SHOW_TEXT);
+      const walker = document.createTreeWalker(virtuosoScrollerRef.current!, NodeFilter.SHOW_TEXT);
       // Track which data-uuid entry we're inside + occurrence index per entry
       const entryOccurrences = new Map<string, number>();
 
@@ -579,7 +577,7 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
         // Find which entry this node belongs to
         let entryUuid = '';
         let parent = node.parentElement;
-        while (parent && parent !== scrollRef.current) {
+        while (parent && parent !== virtuosoScrollerRef.current) {
           if (parent.dataset?.uuid) { entryUuid = parent.dataset.uuid; break; }
           parent = parent.parentElement;
         }
@@ -659,11 +657,19 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
     setCurrentMatchIdx(0);
   }, []);
 
-  // Scroll to bottom helper
+  // Scroll to bottom helper — Virtuoso scrollToIndex(last) is more reliable
+  // than scrollTo(scrollHeight) on virtualized lists where final scrollHeight
+  // isn't known until items are measured. `followOutput` on Virtuoso handles
+  // sticky-bottom on incremental refresh automatically; we call this only
+  // from the explicit FAB / history-panel:scroll-to-bottom event.
+  // Reads the latest length via ref so consumer effects don't need to depend
+  // on `entries` (the callback identity stays stable).
   const scrollToBottom = useCallback((smooth = false) => {
-    const el = scrollRef.current;
-    if (!el) return;
-    el.scrollTo({ top: el.scrollHeight, behavior: smooth ? 'smooth' : 'instant' as ScrollBehavior });
+    const handle = virtuosoRef.current;
+    const len = lengthRef.current;
+    if (handle && len > 0) {
+      handle.scrollToIndex({ index: len - 1, align: 'end', behavior: smooth ? 'smooth' : 'auto' });
+    }
   }, []);
 
   // Load full history
@@ -716,21 +722,22 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
     loadHistory(false);
   }, [sessionId, toolType]);
 
-  // Restore saved scroll position after initial load completes
+  // Restore saved scroll position after initial load completes.
+  // Virtuoso owns the scroller, so we write into `virtuosoScrollerRef.current.scrollTop`
+  // after the scroller element has been attached. `initialScrollTop` would be
+  // cleaner but it requires the scroller to be mounted on first render — our
+  // session/loading flow rebuilds the list, so a write-once useEffect is more
+  // robust. Retry once: Virtuoso may re-measure items after first paint.
   useEffect(() => {
     if (loading || initialLoadDoneRef.current) return;
     initialLoadDoneRef.current = true;
     const savedPos = useUIStore.getState().historyScrollPositions[tabId];
     if (savedPos && savedPos > 0) {
-      // Wait for DOM to render entries, then restore scroll
       requestAnimationFrame(() => {
-        const el = scrollRef.current;
+        const el = virtuosoScrollerRef.current;
         if (el) {
           el.scrollTop = savedPos;
-          // contentVisibility:auto may cause layout shifts — retry once
-          requestAnimationFrame(() => {
-            if (el) el.scrollTop = savedPos;
-          });
+          requestAnimationFrame(() => { if (el) el.scrollTop = savedPos; });
         }
       });
     }
@@ -746,68 +753,73 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
   useEffect(() => {
     const handler = (e: Event) => {
       const detail = (e as CustomEvent).detail;
-      if (detail?.tabId === tabId) {
-        scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
-      }
+      if (detail?.tabId === tabId) scrollToBottom(true);
     };
     window.addEventListener('history-panel:scroll-to-bottom', handler);
     return () => window.removeEventListener('history-panel:scroll-to-bottom', handler);
-  }, [tabId]);
+  }, [tabId, scrollToBottom]);
 
-  // Scroll to entry when Timeline click sets historyScrollToUuid
-  // Uses instant scroll + retry: contentVisibility:auto causes layout shifts on first scroll,
-  // so we scroll twice to land accurately regardless of session length.
-  // Adds ~10% top offset so the entry isn't flush against the edge, plus a flash highlight.
+  // Scroll to entry when Timeline click sets historyScrollToUuid.
+  //
+  // Race: Cmd+click on Timeline opens the panel AND sets uuid in the same tick.
+  // The panel mounts → loadHistory async → entries=[] for ~200-500ms.
+  // Effect runs immediately with entries=[] → must NOT drop the uuid (otherwise
+  // the click is lost forever). Only clear uuid once we've actually scrolled.
+  //
+  // Target lookup uses the entry index (we have entries[] here) — Virtuoso's
+  // scrollToIndex handles the off-screen case; DOM querySelector wouldn't
+  // find a virtualized item that isn't mounted yet.
   const [flashUuid, setFlashUuid] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!historyScrollToUuid || loading || entries.length === 0) return;
-    const el = scrollRef.current;
-    if (!el) return;
+    if (!historyScrollToUuid) return;
+    if (loading || entries.length === 0) return; // wait for entries; uuid stays in store
     let cancelled = false;
-    const target = el.querySelector(`[data-uuid="${historyScrollToUuid}"]`) as HTMLElement | null;
-    if (target) {
-      const scrollWithOffset = () => {
-        const targetRect = target.getBoundingClientRect();
-        const containerRect = el.getBoundingClientRect();
-        const offset = targetRect.top - containerRect.top + el.scrollTop;
-        const topPadding = el.clientHeight * 0.1;
-        el.scrollTop = Math.max(0, offset - topPadding);
-      };
-      scrollWithOffset();
-      // Retry after layout recalculation (contentVisibility: auto re-measures nearby elements)
-      requestAnimationFrame(() => {
-        requestAnimationFrame(() => {
-          if (cancelled) return;
-          scrollWithOffset();
-          // Flash highlight AFTER scroll has settled
-          setTimeout(() => {
-            if (cancelled) return;
-            setFlashUuid(historyScrollToUuid);
-            setTimeout(() => { if (!cancelled) setFlashUuid(null); }, 500);
-          }, 80);
-        });
-      });
+    const targetUuid = historyScrollToUuid;
+    const idx = entries.findIndex((e) => e.uuid === targetUuid);
+    if (idx < 0) {
+      // entry doesn't exist in this session — clear uuid so we don't loop
+      setHistoryScrollToUuid(null);
+      window.dispatchEvent(
+        new CustomEvent('history-panel:scrolled-to', { detail: { tabId, uuid: targetUuid, found: false } }),
+      );
+      return;
     }
+    const handle = virtuosoRef.current;
+    if (handle) {
+      handle.scrollToIndex({ index: idx, align: 'center', behavior: 'auto' });
+    }
+    // Flash + emit done-event after layout settles
+    const t = setTimeout(() => {
+      if (cancelled) return;
+      setFlashUuid(targetUuid);
+      window.dispatchEvent(
+        new CustomEvent('history-panel:scrolled-to', { detail: { tabId, uuid: targetUuid, found: true } }),
+      );
+      setTimeout(() => { if (!cancelled) setFlashUuid(null); }, 500);
+    }, 120);
     setHistoryScrollToUuid(null);
-    return () => { cancelled = true; };
-  }, [historyScrollToUuid, loading, entries]);
+    return () => { cancelled = true; clearTimeout(t); };
+  }, [historyScrollToUuid, loading, entries, tabId, setHistoryScrollToUuid]);
 
-  // Native scroll handler — at-bottom detection + scroll direction tracking + position save
+  // Native scroll handler — runs on the Virtuoso scroller element via a
+  // direct addEventListener (Virtuoso doesn't pass an onScroll prop through
+  // to the scroller). Computes scroll direction, at-bottom flag, debounced
+  // position save; the at-bottom signal is also reported by Virtuoso via
+  // `atBottomStateChange`, but we keep the scrollTop-derived signal because
+  // it updates synchronously on every wheel tick (needed for the FAB toggle).
   const lastScrollTopRef = useRef(0);
   const scrollDirectionRef = useRef<'down' | 'up'>('down');
   const handleScroll = useCallback(() => {
-    const el = scrollRef.current;
+    const el = virtuosoScrollerRef.current;
     if (!el) return;
     const distFromBottom = el.scrollHeight - (el.scrollTop + el.clientHeight);
     isAtBottomRef.current = distFromBottom < 150;
-    // Toggle scroll-to-bottom arrow
     if (scrollArrowRef.current) {
       scrollArrowRef.current.style.display = distFromBottom > 150 ? '' : 'none';
     }
     scrollDirectionRef.current = el.scrollTop >= lastScrollTopRef.current ? 'down' : 'up';
     lastScrollTopRef.current = el.scrollTop;
-    // Debounced save of scroll position per-tab
     if (scrollSaveTimerRef.current) clearTimeout(scrollSaveTimerRef.current);
     scrollSaveTimerRef.current = setTimeout(() => {
       setHistoryScrollPosition(tabId, el.scrollTop);
@@ -833,66 +845,68 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
     return map;
   }, [entries]);
 
-  // Track visible entries for Timeline viewport indicator (UUID-based, no text search)
-  useEffect(() => {
-    const el = scrollRef.current;
-    if (!el || entries.length === 0) {
+  // Track visible entries for Timeline viewport indicator (UUID-based, no text search).
+  //
+  // Prev impl used IntersectionObserver on `[data-uuid]` children of scrollRef.
+  // With Virtuoso, off-screen children are unmounted — IntersectionObserver
+  // would see only the small mounted window and the inferred "visible" set
+  // would be inflated. Instead Virtuoso reports `rangeChanged({startIndex,
+  // endIndex})` on every scroll/resize; we recompute the visible UUID set
+  // from that index range directly. Cheaper than IO, exact.
+  const recomputeVisibleUuids = useCallback(() => {
+    const all = entriesRef.current;
+    if (all.length === 0) {
       setHistoryVisibleUuids(tabId, []);
       return;
     }
-
+    const { start, end } = visibleRangeRef.current;
+    const clampedStart = Math.max(0, Math.min(start, all.length - 1));
+    const clampedEnd = Math.max(clampedStart, Math.min(end, all.length - 1));
     const visibleSet = new Set<string>();
+    for (let i = clampedStart; i <= clampedEnd; i++) {
+      const e = all[i];
+      if (e?.uuid) visibleSet.add(e.uuid);
+    }
+    const resolvedSet = new Set<string>();
+    for (const uuid of visibleSet) {
+      resolvedSet.add(uuid);
+      const parentUser = assistantToUserMap.get(uuid);
+      if (parentUser) resolvedSet.add(parentUser);
+    }
+    // Single-turn highlight: if multiple user entries are directly visible,
+    // keep only one based on scroll direction (matches the IO impl).
+    const directlyVisibleUsers: string[] = [];
+    for (const e of all) {
+      if (e.role === 'user' && visibleSet.has(e.uuid)) directlyVisibleUsers.push(e.uuid);
+    }
+    if (directlyVisibleUsers.length > 1) {
+      const keepIdx = scrollDirectionRef.current === 'down'
+        ? directlyVisibleUsers.length - 1
+        : 0;
+      for (let j = 0; j < directlyVisibleUsers.length; j++) {
+        if (j !== keepIdx) resolvedSet.delete(directlyVisibleUsers[j]);
+      }
+    }
+    const key = [...resolvedSet].sort().join(',');
+    if (key !== prevVisibleUuidsRef.current) {
+      prevVisibleUuidsRef.current = key;
+      setHistoryVisibleUuids(tabId, [...resolvedSet]);
+    }
+  }, [tabId, setHistoryVisibleUuids, assistantToUserMap]);
+
+  // Reset prev key + cleanup on session change
+  useEffect(() => {
     prevVisibleUuidsRef.current = '';
-
-    const observer = new IntersectionObserver(
-      (observed) => {
-        for (const oe of observed) {
-          const uuid = (oe.target as HTMLElement).dataset.uuid;
-          if (!uuid) continue;
-          if (oe.isIntersecting) visibleSet.add(uuid);
-          else visibleSet.delete(uuid);
-        }
-        // Resolve assistant UUIDs to their parent user UUIDs for Timeline
-        const resolvedSet = new Set<string>();
-        for (const uuid of visibleSet) {
-          resolvedSet.add(uuid);
-          const parentUser = assistantToUserMap.get(uuid);
-          if (parentUser) resolvedSet.add(parentUser);
-        }
-        // Single-turn highlight: if multiple user entries are directly visible (>10%),
-        // keep only one based on scroll direction:
-        //   scrolling DOWN → keep last (bottom-most, the "next" turn)
-        //   scrolling UP   → keep first (top-most, the "previous" turn)
-        const directlyVisibleUsers: string[] = [];
-        for (const e of entriesRef.current) {
-          if (e.role === 'user' && visibleSet.has(e.uuid)) {
-            directlyVisibleUsers.push(e.uuid);
-          }
-        }
-        if (directlyVisibleUsers.length > 1) {
-          const keepIdx = scrollDirectionRef.current === 'down'
-            ? directlyVisibleUsers.length - 1
-            : 0;
-          for (let j = 0; j < directlyVisibleUsers.length; j++) {
-            if (j !== keepIdx) resolvedSet.delete(directlyVisibleUsers[j]);
-          }
-        }
-        const key = [...resolvedSet].sort().join(',');
-        if (key !== prevVisibleUuidsRef.current) {
-          prevVisibleUuidsRef.current = key;
-          setHistoryVisibleUuids(tabId, [...resolvedSet]);
-        }
-      },
-      { root: el, threshold: 0.1 }
-    );
-
-    el.querySelectorAll('[data-uuid]').forEach(child => observer.observe(child));
-
     return () => {
-      observer.disconnect();
       setHistoryVisibleUuids(tabId, []);
     };
-  }, [tabId, entries.length, setHistoryVisibleUuids, assistantToUserMap]);
+  }, [tabId, setHistoryVisibleUuids]);
+
+  // Recompute when entries change (incremental refresh adds rows → bottom range may shift)
+  useEffect(() => {
+    lengthRef.current = entries.length;
+    recomputeVisibleUuids();
+  }, [entries, recomputeVisibleUuids]);
 
   // Resize handle
   const handleResizeMouseDown = useCallback((e: React.MouseEvent) => {
@@ -1052,36 +1066,55 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
             No history entries
           </div>
         ) : (
-          <div
-            ref={scrollRef}
-            onScroll={handleScroll}
-            style={{ height: '100%', overflowY: 'auto' }}
-          >
-            {entries.map((entry) => (
+          <Virtuoso
+            ref={virtuosoRef}
+            data={entries}
+            // Stable row key from JSONL uuid — DOM nodes survive incremental
+            // refreshes that re-emit the same entry with a new array reference,
+            // and Cmd+F highlight Ranges don't tear when an entry scrolls back
+            // into view.
+            computeItemKey={(_idx, item) => item.uuid}
+            // Mount the scroller against our handleScroll so the per-scroll
+            // FAB toggle / position-save stays identical to pre-virtuoso behavior.
+            scrollerRef={(el) => {
+              const prev = virtuosoScrollerRef.current;
+              if (prev && prev !== el) prev.removeEventListener('scroll', handleScroll);
+              virtuosoScrollerRef.current = el as HTMLElement | null;
+              if (el) (el as HTMLElement).addEventListener('scroll', handleScroll, { passive: true });
+            }}
+            rangeChanged={(range) => {
+              visibleRangeRef.current = { start: range.startIndex, end: range.endIndex };
+              recomputeVisibleUuids();
+            }}
+            // Pre-render a vertical buffer on either side so flash highlights
+            // and Cmd+F treeWalker include the immediate neighborhood (Virtuoso
+            // would otherwise unmount items just past the viewport).
+            increaseViewportBy={{ top: 600, bottom: 600 }}
+            // Start at the tail by default — matches the prior behavior where
+            // long sessions opened at the most-recent message.
+            initialTopMostItemIndex={entries.length > 0 ? entries.length - 1 : 0}
+            followOutput={() => (isAtBottomRef.current ? 'auto' : false)}
+            style={{ height: '100%' }}
+            itemContent={(_idx, entry) => (
               <div
-                key={entry.uuid}
                 data-uuid={entry.uuid}
                 style={{
-                  ...entryWrapperStyle,
+                  paddingTop: 4,
+                  paddingBottom: 4,
                   ...(flashUuid === entry.uuid ? { animation: 'hp-flash 500ms ease-in-out' } : undefined),
                 }}
               >
                 <HistoryEntry entry={entry} toolType={toolType} />
               </div>
-            ))}
-          </div>
+            )}
+          />
         )}
         {/* Scroll-to-bottom arrow — visibility toggled via ref in handleScroll */}
         <Tooltip content="Scroll to bottom">
         <div
           ref={scrollArrowRef}
           className="flex items-center justify-center"
-          onClick={() => {
-            const el = scrollRef.current;
-            if (!el) return;
-            // Instant jump — smooth scroll can't reach the end on very long lists
-            el.scrollTop = el.scrollHeight;
-          }}
+          onClick={() => scrollToBottom(false)}
           style={{
             display: 'none',
             position: 'absolute',

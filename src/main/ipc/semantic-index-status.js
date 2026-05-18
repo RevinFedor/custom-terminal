@@ -195,7 +195,7 @@ function stopWatching(projectId) {
   console.log('[SemanticIndexStatus] Stopped watching:', projectId);
 }
 
-function rebuildIndex(projectId, mainWindow) {
+function rebuildIndex(projectId, mainWindow, opts = {}) {
   const state = watchedProjects.get(projectId);
   if (!state) {
     return { success: false, error: 'Project not being watched' };
@@ -217,7 +217,13 @@ function rebuildIndex(projectId, mainWindow) {
 
   state.isRebuilding = true;
 
-  const proc = spawn('bash', [scriptPath], {
+  // Parallelism — приходит из renderer (Settings → Системные). Не доверяем raw,
+  // clamp на main-стороне; иначе любой UI bypass воткнёт N=1000 в --parallel.
+  const rawN = Number(opts.parallelism);
+  const parallelism = Number.isFinite(rawN) ? Math.max(1, Math.min(20, Math.round(rawN))) : 10;
+  state.rebuildParallelism = parallelism;
+
+  const proc = spawn('bash', [scriptPath, '--parallel', String(parallelism)], {
     cwd: state.projectPath,
     env: { ...process.env, FORCE_COLOR: '0' },
   });
@@ -263,7 +269,7 @@ function rebuildIndex(projectId, mainWindow) {
     }
   };
 
-  send('semantic-index:rebuild-started', {});
+  send('semantic-index:rebuild-started', { parallelism });
 
   const handleLine = (line) => {
     // Strip ANSI escape codes (\e[XXm) — script uses them via $RED/$GREEN/etc.
@@ -454,11 +460,12 @@ function register({ getMainWindow }) {
       // next stdout event.
       isRebuilding: state.isRebuilding,
       rebuildProgress: state.rebuildProgress,
+      rebuildParallelism: state.rebuildParallelism || null,
     };
   });
 
-  ipcMain.handle('semantic-index:rebuild', (event, { projectId }) => {
-    return rebuildIndex(projectId, mw());
+  ipcMain.handle('semantic-index:rebuild', (event, { projectId, parallelism }) => {
+    return rebuildIndex(projectId, mw(), { parallelism });
   });
 
   ipcMain.handle('semantic-index:cancel-rebuild', (event, { projectId }) => {

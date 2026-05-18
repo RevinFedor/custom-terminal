@@ -21,11 +21,11 @@ Unified стиль для интерактивных команд (запуск,
 
 ---
 
-## Unified AI Launch: split-button claude | gemini в InfoPanel
+## Unified AI Launch: session-actions в ClaudeControlBar
 
-Для минимизации кликов отказались от модального переключения между движками:
-- **Inline start**: кнопки запуска обоих (`claude` | `gemini`) всегда видны в `InfoPanel`.
-- **Context preservation**: выпадающее меню с дополнительным промптом (через `Chevron`) сохранено **только** для Claude. Gemini CLI обычно запускается в интерактивном режиме без предварительных инструкций — для него dropdown лишний.
+Для минимизации кликов отказались от модального переключения между движками. Раньше split-button (`claude` | `gemini` запуск) жил в правой `InfoPanel`-сайдбаре — после удаления правой колонки lifecycle-affordance (`Continue` / `Stop` + fork в новый PTY/SDK-таб + copy session-id + force-refresh timeline) переехал в `ClaudeControlBar` под Terminal (см. `fact-claude-control-bar.md`).
+- **Inline lifecycle**: триплет `[⎘ session-id | Continue/Stop | ↻ refresh]` всегда виден когда у активной вкладки есть AI-сессия. Visible одинаково для PTY и SDK табов.
+- **Engine asymmetry**: `⑂→SDK` (fork в SDK-таб) появляется ТОЛЬКО для Claude — SDK не запускает Gemini. Copy-prompt split-pill (`⎘ prompt | + clear`) тоже Claude-only — Gemini CLI не отдаёт текущий input через IPC, аналога нет.
 
 ---
 

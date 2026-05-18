@@ -37,6 +37,72 @@ export interface ApiSettings {
   geminiThinking: ThinkingLevel;
 }
 
+/* Session status (label + color) — назначается вкладке через ПКМ → Status.
+   id = stable handle, который Tab.sessionStatus сохраняет в SQLite.
+   color = любой hex/rgb, юзер редактирует через react-colorful. */
+export interface SessionStatusDef {
+  id: string;
+  label: string;
+  color: string;
+}
+
+const DEFAULT_SESSION_STATUSES: SessionStatusDef[] = [
+  { id: 'dev',       label: 'Идёт разработка',    color: '#FACC15' },
+  { id: 'bugfix',    label: 'Отложенный багфикс', color: '#F43F5E' },
+  { id: 'knowledge', label: 'Отложенные знания',  color: '#10B981' },
+];
+
+function loadSessionStatuses(): SessionStatusDef[] {
+  try {
+    const raw = localStorage.getItem('noted-terminal-session-statuses');
+    if (!raw) return DEFAULT_SESSION_STATUSES;
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return DEFAULT_SESSION_STATUSES;
+    return parsed
+      .filter((s) => s && typeof s.id === 'string' && typeof s.label === 'string' && typeof s.color === 'string')
+      .map((s) => ({ id: s.id, label: s.label, color: s.color }));
+  } catch { return DEFAULT_SESSION_STATUSES; }
+}
+
+function saveSessionStatuses(list: SessionStatusDef[]) {
+  try { localStorage.setItem('noted-terminal-session-statuses', JSON.stringify(list)); } catch {}
+}
+
+export interface ProcessBarSettings {
+  enabled: boolean;     // false → статичный colorA (без анимации)
+  colorA: string;       // нижняя фаза пульса (или единственный цвет если enabled=false)
+  colorB: string;       // верхняя фаза пульса
+  durationMs: number;   // длительность одного цикла (300..6000ms — clamp в setter)
+}
+
+const DEFAULT_PROCESS_BAR: ProcessBarSettings = {
+  enabled: true,
+  colorA: '#155E75',  // cyan-800 — приглушённая нижняя фаза
+  colorB: '#0E7490',  // cyan-700 — мягкая верхняя
+  durationMs: 2400,
+};
+
+function loadProcessBar(): ProcessBarSettings {
+  try {
+    const raw = localStorage.getItem('noted-terminal-process-bar');
+    if (!raw) return DEFAULT_PROCESS_BAR;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return DEFAULT_PROCESS_BAR;
+    return {
+      enabled: typeof parsed.enabled === 'boolean' ? parsed.enabled : DEFAULT_PROCESS_BAR.enabled,
+      colorA: typeof parsed.colorA === 'string' ? parsed.colorA : DEFAULT_PROCESS_BAR.colorA,
+      colorB: typeof parsed.colorB === 'string' ? parsed.colorB : DEFAULT_PROCESS_BAR.colorB,
+      durationMs: typeof parsed.durationMs === 'number'
+        ? Math.max(300, Math.min(6000, parsed.durationMs))
+        : DEFAULT_PROCESS_BAR.durationMs,
+    };
+  } catch { return DEFAULT_PROCESS_BAR; }
+}
+
+function saveProcessBar(s: ProcessBarSettings) {
+  try { localStorage.setItem('noted-terminal-process-bar', JSON.stringify(s)); } catch {}
+}
+
 
 interface DocPromptSettings {
 
@@ -62,6 +128,26 @@ interface UIStore {
 
   sidebarFontSize: number;     // File explorer sidebar
   sidebarWidth: number;        // File explorer width (px)
+  tabSidebarWidth: number;     // Permanent left tab sidebar width (px)
+
+  /* Session statuses (configurable via Settings → Системные).
+     Default seed = dev / bugfix / knowledge with их saturated colors.
+     Tab.sessionStatus stores `id` of selected status; if id was deleted —
+     TabBar просто не рендерит маркер (graceful degrade).
+     Stored in localStorage as JSON array. */
+  sessionStatuses: SessionStatusDef[];
+  setSessionStatuses: (next: SessionStatusDef[]) => void;
+  addSessionStatus: () => string; // returns generated id
+  updateSessionStatus: (id: string, patch: Partial<Omit<SessionStatusDef, 'id'>>) => void;
+  removeSessionStatus: (id: string) => void;
+
+  /* Process bar — мигающая полоска слева во вкладке когда PTY-процесс жив.
+     enabled=false → статичный colorA, без анимации.
+     durationMs — длительность одного цикла пульса (default 2400ms = медленное дыхание).
+     CSS читает значения через --process-bar-* переменные на :root, обновляемые из App. */
+  processBar: ProcessBarSettings;
+  setProcessBar: (patch: Partial<ProcessBarSettings>) => void;
+
   filePreviewFontSize: number; // FilePreview readOnly editor
   promptPickerFontSize: number; // Opt+V picker rows
   timelineFontSize: number;    // Timeline entries preview text
@@ -69,6 +155,7 @@ interface UIStore {
   timelineLineClamp: number;   // How many lines of preview text show in expanded mode.
 
   setSidebarWidth: (width: number) => void;
+  setTabSidebarWidth: (width: number) => void;
   setTerminalFontSize: (size: number) => void;
 
   setTabsFontSize: (size: number) => void;
@@ -335,17 +422,31 @@ interface UIStore {
   // фиксируются в Settings, дополнительно поверх живёт пользовательский
   // resize (live-drag на правом / нижнем / угловом handle popover'а) который
   // апдейтит те же поля. См. useUIStore.tabPreview*.
-  tabPreviewWidth: number;
-  setTabPreviewWidth: (px: number) => void;
-  tabPreviewMaxLines: number;
-  setTabPreviewMaxLines: (lines: number) => void;
+  // Cap'ы — НЕ фиксированные размеры. `width: fit-content + max-width: cap`
+  // и `height: fit-content + max-height: cap`. Layout сам подбирает форму
+  // под контент в пределах cap'ов (target-пропорция 3:2 рассчитывается в
+  // компоненте). См. fact-tab-preview-popover.md `Sizing & balance`.
+  tabPreviewMaxWidth: number;
+  setTabPreviewMaxWidth: (px: number) => void;
+  tabPreviewMaxHeight: number;
+  setTabPreviewMaxHeight: (px: number) => void;
+  // Целевая пропорция превью — width:height. Алгоритм sizing'а пытается выйти
+  // на это соотношение в пределах cap'ов (см. TabPreviewPopover).
+  tabPreviewRatioW: number;
+  tabPreviewRatioH: number;
+  setTabPreviewRatio: (w: number, h: number) => void;
 
-  // Notes Editor — единые настройки для всех мест, где показывается tab.notes:
-  // inline в InfoPanel, slide-out (TabNotesSlideout), CMD+hover preview popover.
-  // Раньше был отдельный набор `tabNotes*` для inline/preview, что приводило к
-  // рассинхрону шрифта между surface'ами (один контент — три размера).
-  notesEditorFontSize: number;
-  setNotesEditorFontSize: (size: number) => void;
+  // Notes Editor — три независимых шрифта для трёх поверхностей tab.notes:
+  //   notesSidebarFontSize  — inline-превью в InfoPanel сайдбара
+  //   notesExpandedFontSize — раскрытый slide-out (TabNotesSlideout)
+  //   notesTooltipFontSize  — CMD+hover tab-preview popover
+  // Padding X/Y — общие для всех (визуальные отступы редактора).
+  notesSidebarFontSize: number;
+  setNotesSidebarFontSize: (size: number) => void;
+  notesExpandedFontSize: number;
+  setNotesExpandedFontSize: (size: number) => void;
+  notesTooltipFontSize: number;
+  setNotesTooltipFontSize: (size: number) => void;
   notesEditorPaddingX: number;
   setNotesEditorPaddingX: (px: number) => void;
   notesEditorPaddingY: number;
@@ -373,6 +474,11 @@ interface UIStore {
   postCheckPrompt: string;
   setPostCheckPrompt: (text: string) => void;
 
+  // Параллелизм семантической индексации — сколько параллельных claude/Haiku воркеров
+  // запускает scripts/ai/build-index.sh. Default 10 (совпадает с дефолтом в скрипте).
+  // Диапазон 1-20 — выше Anthropic начнёт жёстко 429-ить.
+  semanticIndexParallelism: number;
+  setSemanticIndexParallelism: (n: number) => void;
 }
 
 
@@ -830,21 +936,17 @@ const initialDefaultClaudeEffort = loadDefaultClaudeEffort();
 (async () => {
   try {
     const { ipcRenderer } = window.require('electron');
-    const [fontSize, padX, padY] = await Promise.all([
-      ipcRenderer.invoke('app:getState', 'notesEditorFontSize'),
+    const [padX, padY] = await Promise.all([
       ipcRenderer.invoke('app:getState', 'notesEditorPaddingX'),
       ipcRenderer.invoke('app:getState', 'notesEditorPaddingY'),
     ]);
-    const patch: Partial<{ notesEditorFontSize: number; notesEditorPaddingX: number; notesEditorPaddingY: number }> = {};
-    const fs = Number(fontSize);
+    const patch: Partial<{ notesEditorPaddingX: number; notesEditorPaddingY: number }> = {};
     const px = Number(padX);
     const py = Number(padY);
-    if (Number.isFinite(fs) && fs >= 10 && fs <= 28) patch.notesEditorFontSize = fs;
     if (Number.isFinite(px) && px >= 0 && px <= 48) patch.notesEditorPaddingX = px;
     if (Number.isFinite(py) && py >= 0 && py <= 48) patch.notesEditorPaddingY = py;
     if (Object.keys(patch).length > 0) {
       useUIStore.setState(patch);
-      if (patch.notesEditorFontSize != null) localStorage.setItem('noted-terminal-notes-editor-font-size', String(patch.notesEditorFontSize));
       if (patch.notesEditorPaddingX != null) localStorage.setItem('noted-terminal-notes-editor-padding-x', String(patch.notesEditorPaddingX));
       if (patch.notesEditorPaddingY != null) localStorage.setItem('noted-terminal-notes-editor-padding-y', String(patch.notesEditorPaddingY));
     }
@@ -955,6 +1057,46 @@ export const useUIStore = create<UIStore>((set, get) => ({
   projectTabsFontSize: initialFontSettings.projectTabsFontSize,
   sidebarFontSize: initialFontSettings.sidebarFontSize,
   sidebarWidth: (() => { try { const v = localStorage.getItem('sidebarWidth'); return v ? Number(v) : 280; } catch { return 280; } })(),
+  tabSidebarWidth: (() => { try { const v = localStorage.getItem('tabSidebarWidth'); return v ? Number(v) : 200; } catch { return 200; } })(),
+
+  sessionStatuses: loadSessionStatuses(),
+  setSessionStatuses: (next) => {
+    set({ sessionStatuses: next });
+    saveSessionStatuses(next);
+  },
+  addSessionStatus: () => {
+    const id = `status-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    const next = [...get().sessionStatuses, { id, label: 'Новый статус', color: '#7C7C7C' }];
+    set({ sessionStatuses: next });
+    saveSessionStatuses(next);
+    return id;
+  },
+  updateSessionStatus: (id, patch) => {
+    const next = get().sessionStatuses.map((s) => (s.id === id ? { ...s, ...patch } : s));
+    set({ sessionStatuses: next });
+    saveSessionStatuses(next);
+  },
+  removeSessionStatus: (id) => {
+    const next = get().sessionStatuses.filter((s) => s.id !== id);
+    set({ sessionStatuses: next });
+    saveSessionStatuses(next);
+  },
+
+  processBar: loadProcessBar(),
+  setProcessBar: (patch) => {
+    const cur = get().processBar;
+    const next: ProcessBarSettings = {
+      enabled: typeof patch.enabled === 'boolean' ? patch.enabled : cur.enabled,
+      colorA: typeof patch.colorA === 'string' ? patch.colorA : cur.colorA,
+      colorB: typeof patch.colorB === 'string' ? patch.colorB : cur.colorB,
+      durationMs: typeof patch.durationMs === 'number'
+        ? Math.max(300, Math.min(6000, patch.durationMs))
+        : cur.durationMs,
+    };
+    set({ processBar: next });
+    saveProcessBar(next);
+  },
+
   filePreviewFontSize: loadFilePreviewFontSize(),
   promptPickerFontSize: loadPromptPickerFontSize(),
   timelineFontSize: loadTimelineFontSize(),
@@ -964,6 +1106,10 @@ export const useUIStore = create<UIStore>((set, get) => ({
   setSidebarWidth: (width) => {
     set({ sidebarWidth: width });
     try { localStorage.setItem('sidebarWidth', String(width)); } catch {}
+  },
+  setTabSidebarWidth: (width) => {
+    set({ tabSidebarWidth: width });
+    try { localStorage.setItem('tabSidebarWidth', String(width)); } catch {}
   },
 
   setFilePreviewFontSize: (size: number) => {
@@ -1452,14 +1598,21 @@ export const useUIStore = create<UIStore>((set, get) => ({
   setDefaultClaudeEffort: (v) => { set({ defaultClaudeEffort: v }); saveDefaultClaudeEffort(v); },
 
   // Notes Panel — per-tab open state + SQLite-persisted shared size.
+  // One-at-a-time policy: opening on tab X closes any previously-open slideout.
+  // Single slideout instance is anchored to ONE tab at a time; the only state
+  // we need is "which tab id (or null)".
   notesPanelOpenTabs: {},
   setNotesPanelOpen: (tabId, open) => {
     const cur = get().notesPanelOpenTabs;
-    if ((cur[tabId] ?? false) === open) return;
-    const next = { ...cur };
-    if (open) next[tabId] = true;
-    else delete next[tabId];
-    set({ notesPanelOpenTabs: next });
+    if (open) {
+      if (cur[tabId]) return; // already open on this tab
+      set({ notesPanelOpenTabs: { [tabId]: true } });
+    } else {
+      if (!cur[tabId]) return; // already closed
+      const next = { ...cur };
+      delete next[tabId];
+      set({ notesPanelOpenTabs: next });
+    }
   },
   notesPanelSize: (() => {
     try {
@@ -1504,38 +1657,57 @@ export const useUIStore = create<UIStore>((set, get) => ({
     } catch {}
   },
 
-  // Tab Preview popover sizing (CMD+hover). Ключи `noted-terminal-*` зеркалятся
-  // в SQLite автоматически через mirror в main.js → переживает dev-port shuffle.
-  tabPreviewWidth: (() => {
+  // Tab Preview popover cap'ы (CMD+hover). Это НЕ фиксированный размер —
+  // popover рендерится `fit-content` + `max-*: cap`. Layout сам подбирает
+  // ширину/высоту под форму контента (target-пропорция 3:2 в компоненте,
+  // см. TabPreviewPopover.tsx `computeBalancedSize`). Ключи `noted-terminal-*`
+  // зеркалятся в SQLite автоматически через mirror в main.js.
+  tabPreviewMaxWidth: (() => {
     try {
-      const saved = localStorage.getItem('noted-terminal-tab-preview-width');
-      const n = saved ? parseFloat(saved) : 380;
-      return Math.max(240, Math.min(900, Number.isFinite(n) ? n : 380));
-    } catch { return 380; }
+      const saved = localStorage.getItem('noted-terminal-tab-preview-max-width');
+      const n = saved ? parseFloat(saved) : 200;
+      return Math.max(120, Math.min(900, Number.isFinite(n) ? n : 200));
+    } catch { return 200; }
   })(),
-  setTabPreviewWidth: (px) => {
-    // Храним float — round только в UI-label. Math.round в setter создавал
-    // visual jump на mouseup (юзер видел сдвиг рамки на subpixel несоответствие
-    // между live preview и пост-flush значением).
-    const clamped = Math.max(240, Math.min(900, px));
-    set({ tabPreviewWidth: clamped });
-    try { localStorage.setItem('noted-terminal-tab-preview-width', String(clamped)); } catch {}
+  setTabPreviewMaxWidth: (px) => {
+    const clamped = Math.max(120, Math.min(900, px));
+    set({ tabPreviewMaxWidth: clamped });
+    try { localStorage.setItem('noted-terminal-tab-preview-max-width', String(clamped)); } catch {}
   },
-  tabPreviewMaxLines: (() => {
+  tabPreviewMaxHeight: (() => {
     try {
-      const saved = localStorage.getItem('noted-terminal-tab-preview-max-lines');
-      const n = saved ? parseFloat(saved) : 8;
-      return Math.max(2, Math.min(40, Number.isFinite(n) ? n : 8));
-    } catch { return 8; }
+      const saved = localStorage.getItem('noted-terminal-tab-preview-max-height');
+      const n = saved ? parseFloat(saved) : 250;
+      return Math.max(80, Math.min(900, Number.isFinite(n) ? n : 250));
+    } catch { return 250; }
   })(),
-  setTabPreviewMaxLines: (lines) => {
-    // Float-значение для устранения jump при mouseup. Например drag даёт 5.487
-    // строк — store сохраняет ровно 5.487, рамка на flush НЕ меняет высоту.
-    // Settings stepper показывает Math.round(value), но кнопки +/- работают
-    // от целого ceil/floor.
-    const clamped = Math.max(2, Math.min(40, lines));
-    set({ tabPreviewMaxLines: clamped });
-    try { localStorage.setItem('noted-terminal-tab-preview-max-lines', String(clamped)); } catch {}
+  setTabPreviewMaxHeight: (px) => {
+    const clamped = Math.max(80, Math.min(900, px));
+    set({ tabPreviewMaxHeight: clamped });
+    try { localStorage.setItem('noted-terminal-tab-preview-max-height', String(clamped)); } catch {}
+  },
+  tabPreviewRatioW: (() => {
+    try {
+      const saved = localStorage.getItem('noted-terminal-tab-preview-ratio-w');
+      const n = saved ? parseFloat(saved) : 3;
+      return Math.max(1, Math.min(32, Number.isFinite(n) ? n : 3));
+    } catch { return 3; }
+  })(),
+  tabPreviewRatioH: (() => {
+    try {
+      const saved = localStorage.getItem('noted-terminal-tab-preview-ratio-h');
+      const n = saved ? parseFloat(saved) : 2;
+      return Math.max(1, Math.min(32, Number.isFinite(n) ? n : 2));
+    } catch { return 2; }
+  })(),
+  setTabPreviewRatio: (w, h) => {
+    const wc = Math.max(1, Math.min(32, w));
+    const hc = Math.max(1, Math.min(32, h));
+    set({ tabPreviewRatioW: wc, tabPreviewRatioH: hc });
+    try {
+      localStorage.setItem('noted-terminal-tab-preview-ratio-w', String(wc));
+      localStorage.setItem('noted-terminal-tab-preview-ratio-h', String(hc));
+    } catch {}
   },
 
   // Notes Editor — единые настройки для всех мест где рендерится tab.notes
@@ -1547,24 +1719,50 @@ export const useUIStore = create<UIStore>((set, get) => ({
   // Migration: до этого фикса у inline/preview был отдельный набор
   // `tab-notes-*` ключей, у slide-out — `notes-editor-*`. Если новый ключ не
   // выставлен, но есть старый — переносим, чтобы юзер не потерял настройку.
-  notesEditorFontSize: (() => {
+  // Три независимых шрифта. Migration: до этого был один `notesEditorFontSize` —
+  // если новые ключи пусты, читаем legacy и подставляем во все три, чтобы юзер
+  // не получил неожиданные дефолты после апдейта.
+  notesSidebarFontSize: (() => {
     try {
-      let saved = localStorage.getItem('noted-terminal-notes-editor-font-size');
-      if (!saved) {
-        const legacy = localStorage.getItem('noted-terminal-tab-notes-font-size');
-        if (legacy) { localStorage.setItem('noted-terminal-notes-editor-font-size', legacy); saved = legacy; }
-      }
-      return saved ? parseInt(saved, 10) : 14;
+      const saved = localStorage.getItem('noted-terminal-notes-sidebar-font-size');
+      if (saved) return Math.max(10, Math.min(28, parseInt(saved, 10) || 14));
+      const legacy = localStorage.getItem('noted-terminal-notes-editor-font-size')
+        || localStorage.getItem('noted-terminal-tab-notes-font-size');
+      return legacy ? Math.max(10, Math.min(28, parseInt(legacy, 10) || 14)) : 14;
     } catch { return 14; }
   })(),
-  setNotesEditorFontSize: (size) => {
+  setNotesSidebarFontSize: (size) => {
     const clamped = Math.max(10, Math.min(28, size));
-    set({ notesEditorFontSize: clamped });
-    try { localStorage.setItem('noted-terminal-notes-editor-font-size', String(clamped)); } catch {}
+    set({ notesSidebarFontSize: clamped });
+    try { localStorage.setItem('noted-terminal-notes-sidebar-font-size', String(clamped)); } catch {}
+  },
+  notesExpandedFontSize: (() => {
     try {
-      const { ipcRenderer } = window.require('electron');
-      ipcRenderer.invoke('app:setState', { key: 'notesEditorFontSize', value: clamped }).catch(() => {});
-    } catch {}
+      const saved = localStorage.getItem('noted-terminal-notes-expanded-font-size');
+      if (saved) return Math.max(10, Math.min(28, parseInt(saved, 10) || 14));
+      const legacy = localStorage.getItem('noted-terminal-notes-editor-font-size')
+        || localStorage.getItem('noted-terminal-tab-notes-font-size');
+      return legacy ? Math.max(10, Math.min(28, parseInt(legacy, 10) || 14)) : 14;
+    } catch { return 14; }
+  })(),
+  setNotesExpandedFontSize: (size) => {
+    const clamped = Math.max(10, Math.min(28, size));
+    set({ notesExpandedFontSize: clamped });
+    try { localStorage.setItem('noted-terminal-notes-expanded-font-size', String(clamped)); } catch {}
+  },
+  notesTooltipFontSize: (() => {
+    try {
+      const saved = localStorage.getItem('noted-terminal-notes-tooltip-font-size');
+      if (saved) return Math.max(10, Math.min(28, parseInt(saved, 10) || 14));
+      const legacy = localStorage.getItem('noted-terminal-notes-editor-font-size')
+        || localStorage.getItem('noted-terminal-tab-notes-font-size');
+      return legacy ? Math.max(10, Math.min(28, parseInt(legacy, 10) || 14)) : 14;
+    } catch { return 14; }
+  })(),
+  setNotesTooltipFontSize: (size) => {
+    const clamped = Math.max(10, Math.min(28, size));
+    set({ notesTooltipFontSize: clamped });
+    try { localStorage.setItem('noted-terminal-notes-tooltip-font-size', String(clamped)); } catch {}
   },
   notesEditorPaddingX: (() => {
     try {
@@ -1654,6 +1852,21 @@ export const useUIStore = create<UIStore>((set, get) => ({
   setPostCheckPrompt: (text) => {
     set({ postCheckPrompt: text });
     localStorage.setItem('noted-terminal-post-check-prompt', text);
+  },
+
+  // Параллелизм семантической индексации (build-index.sh --parallel N).
+  // localStorage-only — никакого SQLite-зеркала, настройка хост-локальна и легковесна.
+  semanticIndexParallelism: (() => {
+    try {
+      const saved = localStorage.getItem('noted-terminal-semantic-index-parallelism');
+      if (saved) return Math.max(1, Math.min(20, parseInt(saved, 10) || 10));
+    } catch {}
+    return 10;
+  })(),
+  setSemanticIndexParallelism: (n) => {
+    const clamped = Math.max(1, Math.min(20, Math.round(n)));
+    set({ semanticIndexParallelism: clamped });
+    try { localStorage.setItem('noted-terminal-semantic-index-parallelism', String(clamped)); } catch {}
   },
 
   // Focus Area

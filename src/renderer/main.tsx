@@ -11,147 +11,48 @@ bootstrapPersistedStorage();
 import App from './App';
 import './styles/globals.css';
 import './styles/sidebar.css';
-// === file:// shim for bippy/react-grab in packaged Electron ===
-// Problem: bippy's isFetchableUrl() rejects anything that isn't http(s).
-// In a packaged .app the renderer loads via file://, so stack frames look
-// like file:///Applications/.../app.asar/dist/renderer/index.js and bippy
-// never symbolicates → react-grab can't show component paths.
-//
-// Fix: (1) intercept window.fetch, route http://__app__/... requests to
-// fs.readFile on the real filesystem; (2) rewrite file:// URLs to that
-// http://__app__/... prefix at every entry point bippy uses — stack
-// strings on Error.prototype.stack (via Error.captureStackTrace would be
-// overkill; we patch Error.prototype.stack getter) and the
-// document.scripts URLs that bippy reads.
-//
-// nodeIntegration=true + contextIsolation=false makes this trivial — full
-// access to fs from the renderer.
-//
-// Must run BEFORE react-grab is loaded.
-(() => {
+
+// === code-inspector: Claude/Cursor-friendly clipboard formatter ===
+// The plugin emits `code-inspector:trackCode` with `detail = HTMLElement` on
+// ⌘+click. We format outerHTML + component path so the clipboard payload is
+// self-contained — you can paste straight into Claude/Cursor and the model
+// has the file:line:col reference plus the actual JSX/DOM snippet.
+window.addEventListener('code-inspector:trackCode', (e: any) => {
   try {
-    const nodeReq = (window as any).require;
-    if (!nodeReq) return;
-    const fs = nodeReq('fs');
-    const HTTP_PREFIX = 'http://__app__/';
-    const FILE_PREFIX = 'file://';
+    const d = e?.detail || {};
+    const { name = '', path = '', line = '', column = '' } = d;
+    const loc = path ? `${path}:${line}:${column}` : '';
 
-    const rewrite = (s: string): string =>
-      typeof s === 'string' ? s.split(FILE_PREFIX).join(HTTP_PREFIX) : s;
-
-    const httpToPath = (httpUrl: string): string | null => {
-      if (!httpUrl.startsWith(HTTP_PREFIX)) return null;
-      let p = '/' + httpUrl.slice(HTTP_PREFIX.length);
-      try { p = decodeURI(p); } catch {}
-      // Drop query / hash
-      p = p.split('?')[0].split('#')[0];
-      return p;
-    };
-
-    // (1) fetch shim — read http://__app__/<path> from disk
-    const origFetch = window.fetch.bind(window);
-    window.fetch = ((input: any, init?: any) => {
-      const url = typeof input === 'string' ? input : (input?.url || String(input));
-      const path = typeof url === 'string' ? httpToPath(url) : null;
-      if (path) {
-        return new Promise((resolve) => {
-          fs.readFile(path, 'utf8', (err: any, data: string) => {
-            if (err) {
-              resolve(new Response(null, { status: 404, statusText: err.message }));
-              return;
-            }
-            resolve(new Response(data, { status: 200, headers: { 'content-type': 'application/javascript' } }));
-          });
-        });
+    // Try to locate the actual DOM node by data-insp-path so we can include
+    // its outerHTML (claude/cursor likes seeing the JSX snippet, not just
+    // a file:line ref). data-insp-path format from plugin: "path:line:col".
+    let html = '';
+    if (loc) {
+      const candidates = document.querySelectorAll<HTMLElement>(`[data-insp-path="${loc}"]`);
+      const el = candidates[candidates.length - 1]; // outermost matching node
+      if (el) {
+        const clone = el.cloneNode(true) as HTMLElement;
+        clone.querySelectorAll?.('[data-insp-path]').forEach(n => n.removeAttribute('data-insp-path'));
+        clone.removeAttribute('data-insp-path');
+        html = clone.outerHTML || '';
+        if (html.length > 1200) html = html.slice(0, 1200) + '\n  ...(truncated)';
       }
-      return origFetch(input, init);
-    }) as typeof fetch;
+    }
 
-    // (2) Rewrite Error.prototype.stack so V8 stack strings shown to bippy
-    // contain http://__app__/ instead of file://
-    const errProto = Error.prototype as any;
-    const origStackDesc = Object.getOwnPropertyDescriptor(errProto, 'stack');
-    Object.defineProperty(errProto, 'stack', {
-      configurable: true,
-      get() {
-        const raw = origStackDesc?.get ? origStackDesc.get.call(this) : this._origStack;
-        return rewrite(raw || '');
-      },
-      set(v: string) {
-        if (origStackDesc?.set) origStackDesc.set.call(this, v);
-        else this._origStack = v;
-      },
-    });
+    const text = html
+      ? `${html}\n\nin <${name}> at ${loc}`
+      : `<${name}> at ${loc}`;
 
-    console.log('[ReactGrabShim] installed: file:// → http://__app__/');
-  } catch (e: any) {
-    console.log('[ReactGrabShim] failed:', e?.message || String(e));
+    const electron = (window as any).require?.('electron');
+    if (electron?.clipboard?.writeText) {
+      electron.clipboard.writeText(text);
+    } else {
+      navigator.clipboard?.writeText?.(text);
+    }
+  } catch (err: any) {
+    console.error('[code-inspector] copy failed:', err?.message || err);
   }
-})();
-
-import('react-grab').catch(() => {});
-
-// === [ReactGrabDiag] one-shot probe of Fiber source info in this build ===
-// Runs once after first paint and prints what react-grab will see.
-// Remove this block after diagnosis.
-setTimeout(async () => {
-  try {
-    const root = document.getElementById('react-root');
-    const firstChild = root?.querySelector('*');
-    if (!firstChild) {
-      console.log('[ReactGrabDiag] no React tree yet');
-      return;
-    }
-    const fiberKey = Object.keys(firstChild).find(k => k.startsWith('__reactFiber$'));
-    const fiber: any = fiberKey ? (firstChild as any)[fiberKey] : null;
-    console.log('[ReactGrabDiag] React.version =', (React as any).version);
-    console.log('[ReactGrabDiag] process.env.NODE_ENV =', process.env.NODE_ENV);
-    console.log('[ReactGrabDiag] fiber present =', !!fiber);
-    if (!fiber) return;
-
-    console.log('[ReactGrabDiag] _debugSource =', JSON.stringify(fiber._debugSource));
-    console.log('[ReactGrabDiag] _debugStack present =', !!fiber._debugStack);
-    console.log('[ReactGrabDiag] _debugOwner present =', !!fiber._debugOwner);
-
-    // Print raw _debugStack contents — this is what bippy parses
-    if (fiber._debugStack) {
-      const stackStr = fiber._debugStack.stack || String(fiber._debugStack);
-      console.log('[ReactGrabDiag] _debugStack first 600 chars =', String(stackStr).slice(0, 600));
-    }
-
-    // Try to ask bippy/source directly what it resolves
-    try {
-      const bippySource = await import('bippy/source');
-      const resolved = await bippySource.getSource(fiber);
-      console.log('[ReactGrabDiag] bippy getSource result =', JSON.stringify(resolved));
-      const displayName = await bippySource.getDisplayNameFromSource(fiber);
-      console.log('[ReactGrabDiag] bippy displayName =', displayName);
-    } catch (e: any) {
-      console.log('[ReactGrabDiag] bippy resolve failed:', e?.message || String(e));
-    }
-
-    // Check if any script chunk has sourcemap available
-    try {
-      const scripts = Array.from(document.querySelectorAll('script[src]'));
-      const firstSrc = (scripts[0] as HTMLScriptElement)?.src;
-      if (firstSrc) {
-        const resp = await fetch(firstSrc);
-        const text = await resp.text();
-        const lastLines = text.slice(-300);
-        const hasSourceMap = /sourceMappingURL/.test(lastLines);
-        console.log('[ReactGrabDiag] first script has sourceMappingURL =', hasSourceMap);
-        if (hasSourceMap) {
-          const match = lastLines.match(/sourceMappingURL=(\S+)/);
-          console.log('[ReactGrabDiag] sourceMappingURL prefix =', match?.[1]?.slice(0, 100));
-        }
-      }
-    } catch (e: any) {
-      console.log('[ReactGrabDiag] sourcemap check failed:', e?.message);
-    }
-  } catch (e: any) {
-    console.log('[ReactGrabDiag] probe failed:', e?.message || String(e));
-  }
-}, 2000);
+});
 
 // === TAG-BASED CONSOLE FILTER ===
 const _origLog = console.log.bind(console);

@@ -1,41 +1,41 @@
-import React, { useCallback, useMemo, useRef, useState } from 'react';
+import React, { useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { MarkdownEditor } from '@gt-editor/markdown-editor';
 import { useUIStore } from '../../store/useUIStore';
 import { getPopoverPosition } from '../../hooks/useCmdHoverPopover';
 import HoverBridgeDebug from '../HoverBridgeDebug';
 
-// Resize behavior matches TabNotesSlideout: live React preview during drag, single
-// store flush on mouseup (60 sync writes/sec to localStorage+SQLite was producing
-// jerky drag in earlier iterations — см. fact-notes.md `Drag-preview буфер`).
+// CMD+hover preview shared by TabBar and ProjectHome (Active + History cards).
 //
-// Шрамы этой компоненты:
-// 1. Drag вниз/влево/etc → курсор уходит за пределы popover-обёртки → React `onMouseLeave`
-//    на wrapper'е → useCmdHoverPopover.popoverProps.onMouseLeave() → setHoveredItem(null)
-//    → popover unmount'ится посреди drag'а. Лекарство: isDraggingRef guard в обёртке
-//    handleWrapperMouseLeave — пока drag активен, mouseLeave игнорируется.
-// 2. После mouseup курсор может оказаться вне popover'а. Если просто оставить — popover
-//    залипнет (для CMD не зажат, isPinned=true, ничего не закрывает). Лекарство:
-//    elementFromPoint(release.x, release.y) — если вне обёртки, имитируем onMouseLeave.
-// 3. Микро-движения сразу после mouseup могут трогать handle (offset -5px вне rectangle):
-//    переход на handle никогда не закрывает popover (handle — child outer wrapper, не
-//    triggers mouseleave). НО переход с handle мимо обоих в пустоту — да. Grace period
-//    200ms после mouseup гасит первое-же ложное mouseLeave.
-const MIN_W = 240;
-const MAX_W = 900;
-const MIN_LINES = 2;
-const MAX_LINES = 40;
+// Sizing: balanced fit-content в пределах cap'ов из настроек.
+//
+//   tabPreviewMaxWidth  → жёсткий потолок ширины
+//   tabPreviewMaxHeight → жёсткий потолок высоты
+//
+// Между этими потолками layout сам подбирает форму под контент с прицелом на
+// умеренно вытянутую коробку (target ratio width:height ≈ 3:2). Алгоритм
+// (computeBalancedSize):
+//   1. Измеряем natural-width контента при `width: max-content`.
+//   2. Если контент влезает в одну строку И эта строка короче cap'а — берём
+//      natural-width. Маленькая заметка не растягивается в широкую коробку.
+//   3. Если контент шире cap'а — ширина = cap, высота = max-content в этом cap'е.
+//      Получается высокая узкая коробка; чтобы выправить пропорцию, расширяем
+//      ширину пока height/width не уменьшится до target ratio (cap height ставит
+//      потолок снизу — высота при максимальной ширине ограничена tabPreviewMaxHeight).
+//   4. Высота в любом случае ≤ tabPreviewMaxHeight (внутренний scroll).
+//
+// Title-блок (имя вкладки bold сверху) удалён — имя уже видно на trigger-карточке.
+//
+// Persistence: cap'ы живут в useUIStore (`noted-terminal-tab-preview-max-{width,height}`).
+// Меняются ТОЛЬКО из Settings → секция «Превью таба». Никаких resize handles
+// на самой компоненте — балансировка целиком на алгоритме, юзер настраивает
+// только границы пространства.
+
 const VIEWPORT_MARGIN = 8;
-const HANDLE_EDGE_THICKNESS = 6;    // 4px outside + 2px inside рамки (визуально тонкая)
-const HANDLE_EDGE_OFFSET = -4;
-const HANDLE_CORNER_SIZE = 14;
-const HANDLE_CORNER_OFFSET = -5;
-const HANDLE_EDGE_INSET = 14;       // edge handle отступает от corner
-const DRAG_GRACE_MS = 200;
+const NOTES_MIN_WIDTH = 80;   // не уже одной средней «строки» в notes
 
 export interface MetaRow {
   label?: string;
   value: React.ReactNode;
-  /** Force value to wrap on long content (Path-style). Defaults to truncate. */
   wrap?: boolean;
   muted?: boolean;
 }
@@ -43,64 +43,41 @@ export interface MetaRow {
 interface TabPreviewPopoverProps {
   rect: DOMRect;
   popoverProps: { onMouseEnter: () => void; onMouseLeave: () => void };
-  /** Metadata rows (Path/Closed/Created/Type/Messages). Rendered above notes. */
   metaRows?: MetaRow[];
-  /** Optional markdown content rendered as a resizable notes block. */
   notes?: string | null;
-  /** When true, popover may flip above the trigger if there's not enough space below. */
   smartPosition?: boolean;
-  /** When true, popover is forced ABOVE trigger regardless of available space. */
   forceAbove?: boolean;
   /**
+   * Side relative to trigger:
+   *   'below'  — popover ниже trigger'а, выровнен по левому краю (горизонтальный TabBar).
+   *   'above'  — popover выше trigger'а (legacy `forceAbove`-режим в Home).
+   *   'right'  — popover справа от trigger'а, по вертикальному центру (вертикальный TabSidebar).
+   * Если не указано — поведение прежнее (below или smart).
+   */
+  placement?: 'below' | 'above' | 'right';
+  /**
    * Split-режим (используется в ProjectHome): два независимых блока вокруг trigger'а.
-   *   Верхний (above) — title + notes (resizable).
+   *   Верхний (above) — notes.
    *   Нижний (below) — metadata.
    * Если нет notes — верхний блок не рендерится. Если нет metaRows — нижний не рендерится.
    */
   split?: boolean;
   /**
-   * Отключить resize handles. Размеры всё равно читаются из store (`tabPreviewWidth`/
-   * `tabPreviewMaxLines`), но изменить их с этой поверхности нельзя. Используется
-   * в ProjectHome — настройки превью живут только на странице проекта (TabBar),
-   * Home отображает результат.
-   */
-  disableResize?: boolean;
-  /**
    * Сделать popover прозрачным для курсора (`pointer-events: none`). Визуально
-   * рендерится как обычно, но hover-эффект проходит сквозь — на сеточном Home
-   * это даёт перейти курсором к карточке под/над текущей: блоки превью больше
-   * не перегораживают путь. Контент превью на Home всё равно нередактируем
-   * и некликабелен, поэтому функциональность не теряется (выделение текста
-   * сознательно пропускаем).
-   *
-   * Когда `isLocked === true`, pointer-through автоматически отключается —
-   * закреплённый popover становится интерактивным (выделение текста, скролл).
+   * рендерится как обычно, но hover проходит сквозь — на сеточном Home это
+   * пропускает курсор к карточке под/над текущей. В locked-режиме отключается:
+   * закреплённый popover становится интерактивным.
    */
   pointerThrough?: boolean;
   /**
-   * Popover закреплён через CMD+Shift. Отображается белая рамка (визуальный
-   * сигнал «прибито»), pointer-events возвращается даже при `pointerThrough`.
+   * Popover закреплён через CMD+Shift. Белая рамка, pointer-events возвращается
+   * даже при `pointerThrough`.
    */
   isLocked?: boolean;
+  /** Debug: откуда вызван — `tabbar` / `home-active` / `home-history`. */
+  source?: string;
 }
 
-type ResizeEdge = 'right' | 'left' | 'bottom' | 'corner-br' | 'corner-bl';
-
-// CMD+hover preview shared by TabBar and ProjectHome (Active + History cards).
-//
-// Layout (top → bottom):
-//   1. Notes block  — MarkdownEditor read-only. Resizable со всех сторон + 2 угла.
-//   2. Metadata     — fixed-size block (Closed → Created → Path → Type → Messages).
-//
-// Title-блок (имя вкладки bold сверху) был удалён по запросу юзера: имя уже видно
-// на самой trigger-карточке (TabBar таб или ProjectHome card), дублировать его
-// в popover'е — visual noise.
-//
-// Persistence: `tabPreviewWidth` / `tabPreviewMaxLines` живут в useUIStore (mirror
-// в SQLite через standard `noted-terminal-*` localStorage). `localLeftShift` — только
-// в local state, не персистится: при следующем open popover'а left возвращается к
-// rect.left + viewport-clamp. Юзер тянет влево → popover растёт влево; после mouseup
-// width в store, но позиция остаётся pending до закрытия popover'а.
 export default function TabPreviewPopover({
   rect,
   popoverProps,
@@ -108,58 +85,147 @@ export default function TabPreviewPopover({
   notes,
   smartPosition,
   forceAbove,
+  placement,
   split,
-  disableResize,
   pointerThrough,
   isLocked,
+  source,
 }: TabPreviewPopoverProps) {
-  const fontSize = useUIStore((s) => s.notesEditorFontSize);
+  // Три независимых шрифта на трёх поверхностях tab.notes — здесь tooltip-вариант
+  // (notesTooltipFontSize). Padding'и единые для всех трёх (notesEditorPadding*).
+  const fontSize = useUIStore((s) => s.notesTooltipFontSize);
   const paddingX = useUIStore((s) => s.notesEditorPaddingX);
   const paddingY = useUIStore((s) => s.notesEditorPaddingY);
-  const widthFromStore = useUIStore((s) => s.tabPreviewWidth);
-  const maxLinesFromStore = useUIStore((s) => s.tabPreviewMaxLines);
-  const setTabPreviewWidth = useUIStore((s) => s.setTabPreviewWidth);
-  const setTabPreviewMaxLines = useUIStore((s) => s.setTabPreviewMaxLines);
+  const maxWidth = useUIStore((s) => s.tabPreviewMaxWidth);
+  const maxHeight = useUIStore((s) => s.tabPreviewMaxHeight);
+  const ratioW = useUIStore((s) => s.tabPreviewRatioW);
+  const ratioH = useUIStore((s) => s.tabPreviewRatioH);
+  const targetRatio = ratioW / ratioH; // width / height
 
-  // Live drag preview — пишем сюда каждый mousemove. Store обновляется один раз
-  // на mouseup. `previewRef` зеркалит state, потому что в React StrictMode
-  // функциональный setState double-invokes: захват `captured = prev` внутри
-  // updater'а во второй проход даёт `prev=null` и затирает значение. Безопасный
-  // путь — параллельный ref, который пишется при каждом setDragPreview.
-  const [dragPreview, _setDragPreview] = useState<{
-    width: number; maxLines: number; leftShift: number;
-  } | null>(null);
-  const previewRef = useRef<{ width: number; maxLines: number; leftShift: number } | null>(null);
-  const setDragPreview = useCallback((next: { width: number; maxLines: number; leftShift: number } | null) => {
-    previewRef.current = next;
-    _setDragPreview(next);
-  }, []);
-  // Persistent left shift — растёт пока popover открыт, сбрасывается на следующий open.
-  // Хранит pending leftward growth от drag'ов на left/corner-bl handles.
-  const [localLeftShift, setLocalLeftShift] = useState(0);
+  // Hidden probe: рендерим notes в скрытом контейнере с `width: max-content`
+  // чтобы измерить natural-width при текущем шрифте. После measure пересчитываем
+  // финальные размеры (computeBalancedSize) и помещаем результат в state.
+  const probeRef = useRef<HTMLDivElement | null>(null);
+  const [notesBox, setNotesBox] = useState<{ width: number; height: number } | null>(null);
 
-  const dragRef = useRef<null | {
-    edge: ResizeEdge;
-    startX: number; startY: number;
-    startWidth: number; startMaxLines: number;
-    startLeftShift: number;
-    pxPerLine: number;
-  }>(null);
+  const hasNotes = Boolean(notes && notes.trim().length > 0);
 
-  // Mouse-leave guard. Pinned by setIsPinned in useCmdHoverPopover keeps popover
-  // alive while CMD released, но как только cursor уходит ЗА outer wrapper —
-  // popoverProps.onMouseLeave убивает state. Во время drag это убивает drag.
-  const isDraggingRef = useRef(false);
-  const graceUntilRef = useRef(0);
-  const wrapperRef = useRef<HTMLDivElement | null>(null);
-  // Ref на handle, который сейчас тянется — для очистки `data-resize-handle-active`
-  // на mouseup. Закрепляется на mousedown в `startResize`.
-  const activeHandleRef = useRef<HTMLElement | null>(null);
+  // Measure после paint — MarkdownEditor рендерится через несколько микрозадач
+  // (внутри Vite + react-markdown), `scrollWidth` сразу после mount часто 0.
+  // Двухпроходный замер: первый тик useLayoutEffect + второй через rAF на случай
+  // если контент ещё не отлэйаутился. Без rAF ловили баг «первый hover — полоска,
+  // переключился на другую вкладку и обратно → нормально» (DOM-нода переиспользована,
+  // scrollWidth уже стабильный).
+  useLayoutEffect(() => {
+    if (!hasNotes) { setNotesBox(null); return; }
+    const probe = probeRef.current;
+    if (!probe) return;
+    let cancelled = false;
 
-  // Synthetic ref для HoverBridgeDebug — у нас только `rect: DOMRect` от
-  // trigger'а (snapshot), не живой DOM. Делаем shim-объект который HoverBridgeDebug
-  // воспринимает как ref на trigger element. `getBoundingClientRect` возвращает
-  // переданный rect, остальные props не нужны (HoverBridgeDebug читает только rect).
+    // Wait-for-stable measure. MarkdownEditor рендерит блок-контент через
+    // react-markdown асинхронно — за первый кадр в probe может оказаться
+    // частично-собранный layout (одно слово вместо абзаца) или вообще остаток
+    // предыдущей вкладки (probe-DOM переиспользуется). Поэтому ждём пока
+    // scrollWidth не зафинализируется: одно и то же значение >0 в трёх кадрах
+    // подряд. MAX_FRAMES — страховка от бесконечного цикла.
+    const notesPreview = (notes || '').slice(0, 30).replace(/\n/g, '\\n');
+    console.log('[TabPreviewSize:enter]', JSON.stringify({
+      notesLen: (notes || '').length,
+      source: source || '?', notesPreview,
+      maxWidth, maxHeight, fontSize, paddingX, paddingY,
+      rect: { l: Math.round(rect.left), t: Math.round(rect.top), w: Math.round(rect.width), h: Math.round(rect.height) },
+      split: !!split,
+    }));
+    const MAX_FRAMES = 40;
+    const STABLE_REQUIRED = 3;
+    let prevW = -1;
+    let stableHits = 0;
+    let frame = 0;
+
+    const settle = () => {
+      if (cancelled) return;
+      probe.style.width = '';
+      const w = Math.ceil(probe.scrollWidth);
+      if (w > 0 && w === prevW) {
+        stableHits++;
+      } else {
+        stableHits = 0;
+        prevW = w;
+      }
+      console.log('[TabPreviewSize:settle]', JSON.stringify({
+        source: source || '?', notesPreview, frame, w, prevW, stableHits,
+      }));
+      if (stableHits < STABLE_REQUIRED && frame < MAX_FRAMES) {
+        frame++;
+        requestAnimationFrame(settle);
+        return;
+      }
+      finalize(w);
+    };
+
+    // Балансировка по целевой пропорции (`targetRatio = ratioW/ratioH`).
+    // Идея: при разных пробных ширинах форма меняется немонотонно для краткого
+    // контента, но монотонно для текста с word-wrap (узкая ширина → высокий
+    // столбец, широкая → плоский). Бисекцией ищем chosenW в [MIN, maxWidth]
+    // такую что фактическое отношение W/H ≤ targetRatio (минимально близкое
+    // к target сверху). Контент сам диктует возможный диапазон высот.
+    const measureAt = (w: number) => {
+      probe.style.width = `${w}px`;
+      return Math.ceil(probe.scrollHeight);
+    };
+    const finalize = (naturalW: number) => {
+      if (cancelled || naturalW <= 0) return;
+      // Стартовая ширина = min(naturalW, maxWidth). Если контент уже шире cap'а,
+      // потолок = cap. Если меньше — возможно надо СУЗИТЬ для пропорции.
+      const startW = Math.min(naturalW, maxWidth);
+      let chosenW = startW;
+      let chosenH = measureAt(chosenW);
+
+      // Если коробка получается слишком ПЛОСКАЯ (W/H > target → шире чем надо):
+      // сужаем chosenW пока W/H ≤ target ИЛИ chosenW = MIN. С `wordWrap`
+      // более узкая ширина увеличивает H → ratio падает.
+      if (chosenW / chosenH > targetRatio && chosenW > NOTES_MIN_WIDTH) {
+        let lo = NOTES_MIN_WIDTH;
+        let hi = chosenW;
+        for (let i = 0; i < 8; i++) {
+          const mid = Math.round((lo + hi) / 2);
+          if (mid <= lo) break;
+          const h = measureAt(mid);
+          if (mid / h > targetRatio) hi = mid;
+          else lo = mid;
+        }
+        chosenW = lo;
+        chosenH = measureAt(chosenW);
+      }
+      // Если коробка слишком ВЫСОКАЯ (W/H < target → нужна шире) и есть запас
+      // до maxWidth — расширяем. Word-wrap на большей ширине уменьшает H.
+      else if (chosenW / chosenH < targetRatio && chosenW < maxWidth) {
+        let lo = chosenW;
+        let hi = maxWidth;
+        for (let i = 0; i < 8; i++) {
+          const mid = Math.round((lo + hi) / 2);
+          if (mid <= lo) break;
+          const h = measureAt(mid);
+          if (mid / h < targetRatio) lo = mid;
+          else hi = mid;
+        }
+        chosenW = hi;
+        chosenH = measureAt(chosenW);
+      }
+      const finalH = Math.min(chosenH, maxHeight);
+      console.log('[TabPreviewSize:final]', JSON.stringify({
+        source: source || '?', notesPreview, naturalW, startW,
+        chosenW, chosenH: finalH, targetRatio: +targetRatio.toFixed(3),
+        actualRatio: +(chosenW / chosenH).toFixed(3), framesUsed: frame,
+      }));
+      if (!cancelled) setNotesBox({ width: chosenW, height: finalH });
+    };
+
+    settle();
+    return () => { cancelled = true; };
+  }, [notes, hasNotes, maxWidth, maxHeight, fontSize, paddingX, paddingY, ratioW, ratioH]);
+
+  // Synthetic ref для HoverBridgeDebug — у нас только rect от trigger'а.
   const triggerRefShim = useMemo(
     () => ({
       current: {
@@ -169,159 +235,35 @@ export default function TabPreviewPopover({
     [rect],
   );
 
-  const effectiveWidth = dragPreview ? dragPreview.width : widthFromStore;
-  const effectiveMaxLines = dragPreview ? dragPreview.maxLines : maxLinesFromStore;
-  const effectiveLeftShift = dragPreview ? dragPreview.leftShift : localLeftShift;
+  const wrapperRef = useRef<HTMLDivElement | null>(null);
 
-  // Approximate line height in px используется для maxHeight cap и для конверсии
-  // vertical drag → строки. MarkdownEditor использует 1.5em line-height.
-  const lineHeightPx = fontSize * 1.5;
-  const notesMaxHeight = Math.max(lineHeightPx * effectiveMaxLines, lineHeightPx * MIN_LINES);
+  // Финальная ширина popover'а: max между notesBox.width и шириной meta-карточки.
+  // Если есть только metadata (split=false и hasNotes=false) — даём metaRows
+  // занять до maxWidth и определиться по контенту.
+  const popoverWidth = notesBox?.width ?? Math.min(maxWidth, 320);
 
-  const startResize = useCallback(
-    (edge: ResizeEdge, e: React.MouseEvent) => {
-      e.preventDefault();
-      e.stopPropagation();
-      isDraggingRef.current = true;
-      // data-resize-handle-active атрибут на самом handle → CSS-селектор держит
-      // подсветку во время drag, даже когда курсор физически вне handle area.
-      // Стандартный паттерн (react-resizable-panels by Brian Vaughn): атрибут
-      // навешивается на mousedown, снимается на mouseup. CSS `:hover` обрабатывает
-      // покоящееся состояние.
-      const handleEl = e.currentTarget as HTMLElement;
-      handleEl.dataset.resizeHandleActive = 'true';
-      activeHandleRef.current = handleEl;
-      dragRef.current = {
-        edge,
-        startX: e.clientX,
-        startY: e.clientY,
-        startWidth: widthFromStore,
-        startMaxLines: maxLinesFromStore,
-        startLeftShift: localLeftShift,
-        pxPerLine: lineHeightPx,
-      };
-      setDragPreview({
-        width: widthFromStore,
-        maxLines: maxLinesFromStore,
-        leftShift: localLeftShift,
-      });
+  // Placement резолвится так: явный prop `placement` (новый API) > legacy `split/forceAbove`
+  // (Home above-режим) > `smartPosition` > дефолт ниже. `'right'` рендерит сбоку справа от
+  // trigger'а с вертикальным центрированием — используется в вертикальном TabSidebar'е.
+  const effectivePlacement: 'below' | 'above' | 'right' =
+    placement ?? (split || forceAbove ? 'above' : 'below');
 
-      const onMove = (ev: MouseEvent) => {
-        const d = dragRef.current;
-        if (!d) return;
-        const dx = ev.clientX - d.startX;
-        const dy = ev.clientY - d.startY;
+  const isRight = effectivePlacement === 'right';
+  const isAboveLayout = effectivePlacement === 'above';
 
-        let nextWidth = d.startWidth;
-        let nextLines = d.startMaxLines;
-        let nextLeftShift = d.startLeftShift;
-
-        const isRight = d.edge === 'right' || d.edge === 'corner-br';
-        const isLeft = d.edge === 'left' || d.edge === 'corner-bl';
-        const isBottom = d.edge === 'bottom' || d.edge === 'corner-br' || d.edge === 'corner-bl';
-
-        if (isRight) {
-          nextWidth = Math.max(MIN_W, Math.min(MAX_W, d.startWidth + dx));
-        }
-        if (isLeft) {
-          // Width растёт ВЛЕВО: mouse moves left (dx<0) → width растёт.
-          // Одновременно сдвигаем popover влево на тот же дельта, чтобы правый край
-          // остался на месте (intuitive «тяну за левый край»). После clamp width
-          // фиксируется в [MIN_W, MAX_W] — leftShift корректируется пропорционально.
-          const desired = d.startWidth - dx;
-          nextWidth = Math.max(MIN_W, Math.min(MAX_W, desired));
-          const appliedDelta = nextWidth - d.startWidth; // положит. = растянули; отриц. = сжали
-          nextLeftShift = d.startLeftShift - appliedDelta;
-        }
-        if (isBottom) {
-          // Дробное значение для плавного follow за курсором. Высота блока =
-          // lineHeight * nextLines, поэтому при dy=50px height вырастет ровно на
-          // 50px (без снапа к ближайшей строке во время drag'а). На mouseup
-          // округляем для store. Раньше Math.round тут давал рывки по 19.5px и
-          // несоответствие позиции курсора и рамки в момент отпускания.
-          const deltaLines = dy / d.pxPerLine;
-          nextLines = Math.max(MIN_LINES, Math.min(MAX_LINES, d.startMaxLines + deltaLines));
-        }
-
-        setDragPreview({ width: nextWidth, maxLines: nextLines, leftShift: nextLeftShift });
-      };
-
-      const onUp = (ev: MouseEvent) => {
-        // Flush. previewRef хранит последнее preview-значение (зеркало state'а,
-        // safe от React StrictMode double-invocation функционального updater'а).
-        // Прямой setDragPreview(null) не теряет данные — setters вызываются ПОСЛЕ
-        // захвата через ref.
-        const captured = previewRef.current;
-        setDragPreview(null);
-        if (captured) {
-          if (captured.width !== widthFromStore) setTabPreviewWidth(captured.width);
-          if (captured.maxLines !== maxLinesFromStore) setTabPreviewMaxLines(captured.maxLines);
-          if (captured.leftShift !== localLeftShift) setLocalLeftShift(captured.leftShift);
-        }
-        dragRef.current = null;
-        isDraggingRef.current = false;
-        graceUntilRef.current = Date.now() + DRAG_GRACE_MS;
-        // Снимаем `data-resize-handle-active` с handle'а. CSS `:hover` правило
-        // продолжит подсвечивать handle, пока курсор находится над ним; иначе
-        // подсветка естественно исчезнет.
-        if (activeHandleRef.current) {
-          delete activeHandleRef.current.dataset.resizeHandleActive;
-          activeHandleRef.current = null;
-        }
-
-        window.removeEventListener('mousemove', onMove);
-        window.removeEventListener('mouseup', onUp);
-
-        // Если курсор отпущен ЗА пределами popover'а — имитируем mouseleave
-        // (без этого popover залипнет с CMD не зажат).
-        const wrapper = wrapperRef.current;
-        if (wrapper) {
-          const el = document.elementFromPoint(ev.clientX, ev.clientY);
-          const inside = !!(el && wrapper.contains(el));
-          if (!inside) {
-            // Grace period сбрасываем сразу — мы сами имитируем уход.
-            graceUntilRef.current = 0;
-            popoverProps.onMouseLeave();
-          }
-        }
-      };
-
-      window.addEventListener('mousemove', onMove);
-      window.addEventListener('mouseup', onUp);
-    },
-    [widthFromStore, maxLinesFromStore, localLeftShift, setTabPreviewWidth, setTabPreviewMaxLines, lineHeightPx, popoverProps],
-  );
-
-  // Wrapper handlers — перехватываем mouseLeave чтобы не закрывать popover во время
-  // drag'а или в grace period сразу после.
-  const handleWrapperMouseEnter = useCallback(() => {
-    popoverProps.onMouseEnter();
-  }, [popoverProps]);
-  const handleWrapperMouseLeave = useCallback(() => {
-    if (isDraggingRef.current) return;
-    if (Date.now() < graceUntilRef.current) return;
-    popoverProps.onMouseLeave();
-  }, [popoverProps]);
-
-  // Clamp в viewport с обоих сторон. Если popover не влезает справа — сдвигаем влево
-  // (или ограничиваем шириной). Если выехал слева — прижимаем к VIEWPORT_MARGIN.
-  const vw = window.innerWidth;
-  const desiredLeft = rect.left + effectiveLeftShift;
-  let adjustedLeft = desiredLeft;
-  if (adjustedLeft + effectiveWidth > vw - VIEWPORT_MARGIN) {
-    adjustedLeft = vw - VIEWPORT_MARGIN - effectiveWidth;
-  }
-  if (adjustedLeft < VIEWPORT_MARGIN) {
-    adjustedLeft = VIEWPORT_MARGIN;
-  }
-
-  // Position resolution:
-  //   split=true → главный wrapper (title+notes) ВСЕГДА выше trigger'а.
-  //                 metadata уходит во второй wrapper ниже trigger'а (рендерится отдельно).
-  //   forceAbove=true → popover ВСЕГДА над trigger'ом (translate(-100%))
-  //   smartPosition=true → выше или ниже в зависимости от spaceBelow
-  //   default → below trigger.
-  const pos = split || forceAbove
+  const pos = isRight
+    ? {
+        style: {
+          position: 'fixed' as const,
+          left: rect.right,
+          top: rect.top + rect.height / 2,
+          paddingLeft: '6px',
+          transform: 'translateY(-50%)',
+          zIndex: 100,
+        } as React.CSSProperties,
+        showAbove: false,
+      }
+    : isAboveLayout
     ? {
         style: {
           position: 'fixed' as const,
@@ -345,299 +287,188 @@ export default function TabPreviewPopover({
         } as React.CSSProperties,
         showAbove: false,
       };
-  // Wrapper расширяется на 8px по бокам и снизу/сверху (вместо стандартного 4px
-  // hover-bridge'а от getPopoverPosition), чтобы handles (offset -5px от card)
-  // оставались ВНУТРИ wrapper.boundingRect. Иначе курсор на handle регистрируется
-  // как «вне wrapper'а» → triggerProps.onMouseLeave timer (150ms) убивает popover
-  // до того, как mousedown даже стартанёт drag. Top-padding для below mode сохраняем
-  // как hover-bridge между trigger и popover (4px вверх). Bottom-padding 8px (для
-  // bottom resize handle). Симметрично для above mode.
-  const WRAPPER_PAD = 8;
+
+  // Viewport clamp. Для below/above — горизонталь по left. Для right — горизонталь по
+  // left=rect.right (адаптируем), вертикаль по rect.top + height/2 ± height (адаптируем).
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  let adjustedLeft = isRight ? rect.right : rect.left;
+  let adjustedTop = isRight ? rect.top + rect.height / 2 : (pos.style.top as number);
+
+  if (isRight) {
+    // Если справа не помещается — флипаем налево от сайдбара.
+    if (adjustedLeft + popoverWidth + VIEWPORT_MARGIN > vw - VIEWPORT_MARGIN) {
+      adjustedLeft = rect.left - popoverWidth - 6;
+    }
+    if (adjustedLeft < VIEWPORT_MARGIN) {
+      adjustedLeft = VIEWPORT_MARGIN;
+    }
+    // Высота popover'а ≤ maxHeight — но клампим центрирование чтобы не вылетал за viewport.
+    const halfH = (notesBox?.height ?? maxHeight) / 2;
+    if (adjustedTop - halfH < VIEWPORT_MARGIN) adjustedTop = VIEWPORT_MARGIN + halfH;
+    if (adjustedTop + halfH > vh - VIEWPORT_MARGIN) adjustedTop = vh - VIEWPORT_MARGIN - halfH;
+  } else {
+    if (adjustedLeft + popoverWidth > vw - VIEWPORT_MARGIN) {
+      adjustedLeft = vw - VIEWPORT_MARGIN - popoverWidth;
+    }
+    if (adjustedLeft < VIEWPORT_MARGIN) {
+      adjustedLeft = VIEWPORT_MARGIN;
+    }
+  }
+
   const isAbove = pos.showAbove;
   const wrapperStyle: React.CSSProperties = {
     ...pos.style,
-    left: adjustedLeft - WRAPPER_PAD,
-    paddingLeft: WRAPPER_PAD,
-    paddingRight: WRAPPER_PAD,
-    // Для below mode: top=4 (hover-bridge), bottom=WRAPPER_PAD (для bottom handle).
-    // Для above mode: bottom=4 (hover-bridge), top=WRAPPER_PAD.
-    paddingTop: isAbove ? WRAPPER_PAD : '4px',
-    paddingBottom: isAbove ? '4px' : WRAPPER_PAD,
-    // pointerThrough: курсор проходит сквозь весь wrapper насквозь (Home grid).
-    // Влияет на ВЕСЬ wrapper включая padding и внутреннюю карточку — иначе
-    // padding-зоны ловили бы mousemove и блокировали карточку под popover'ом.
-    // В locked-режиме pointer-through автоматически отключается: закреплённый
-    // popover должен быть интерактивным (text selection, scroll).
+    left: adjustedLeft,
+    ...(isRight ? { top: adjustedTop } : {}),
+    paddingTop: isRight ? 0 : (isAbove ? 0 : '4px'),
+    paddingBottom: isRight ? 0 : (isAbove ? '4px' : 0),
+    paddingLeft: isRight ? '6px' : undefined,
     ...(pointerThrough && !isLocked ? { pointerEvents: 'none' as const } : null),
   };
 
-  const hasNotes = Boolean(notes && notes.trim().length > 0);
-
-  // Edge / corner handles. Тонкие (6px на офсете -4), corners 14×14 на -5.
-  // Подсветка через CSS-классы `tab-preview-handle` + `data-resize-handle-active`
-  // (см. <style> ниже + cleanup в onUp). JS hover handlers удалены — `:hover`
-  // правило корректно отображает курсор-под-handle, а dataset-атрибут держит
-  // подсветку во время drag даже когда курсор уехал.
-  const edgeHandleStyle = (cssProps: React.CSSProperties): React.CSSProperties => ({
-    position: 'absolute',
-    zIndex: 2,
-    ...cssProps,
-  });
-  const cornerHandleStyle = (cssProps: React.CSSProperties): React.CSSProperties => ({
-    position: 'absolute',
-    width: HANDLE_CORNER_SIZE,
-    height: HANDLE_CORNER_SIZE,
-    zIndex: 3,
-    ...cssProps,
-  });
-
-  // Стиль для metadata-wrapper'а (нижний блок в split-режиме). Параллелен
-  // основному wrapperStyle, но прибит к bottom edge trigger'а через `top:
-  // rect.bottom`. left+padding такой же что у основного — оба блока вертикально
-  // align'нуты.
   const metaWrapperStyle: React.CSSProperties = {
     position: 'fixed',
-    left: adjustedLeft - WRAPPER_PAD,
+    left: adjustedLeft,
     top: rect.bottom,
     paddingTop: '4px',
-    paddingLeft: WRAPPER_PAD,
-    paddingRight: WRAPPER_PAD,
-    paddingBottom: WRAPPER_PAD,
     zIndex: 100,
     ...(pointerThrough && !isLocked ? { pointerEvents: 'none' as const } : null),
   };
 
   const showSplitMeta = split && metaRows && metaRows.length > 0;
-  // Верхний wrapper имеет смысл только если внутри есть контент:
-  //   • split-режим (Home) — рендерим лишь когда есть notes; metadata живёт
-  //     в отдельном нижнем wrapper'е.
-  //   • обычный режим (TabBar) — рендерим если есть notes ИЛИ metaRows.
-  // Без этого условия пустая card с `border: 1px solid #333` выдавала тонкую
-  // полоску над карточкой trigger'а на ProjectHome для табов без заметок.
   const showMainWrapper = split
     ? hasNotes
     : hasNotes || (metaRows && metaRows.length > 0);
 
+  // Стили карточек (общие для main и meta-wrapper'а).
+  const cardStyle = (extra: React.CSSProperties = {}): React.CSSProperties => ({
+    backgroundColor: '#1e1e1e',
+    border: isLocked ? '1px solid #fff' : '1px solid #333',
+    borderRadius: '6px',
+    boxShadow: '0 4px 12px rgba(0,0,0,0.4)',
+    overflow: 'hidden',
+    display: 'flex',
+    flexDirection: 'column',
+    ...extra,
+  });
+
   return (
     <>
-    {showMainWrapper && (
-    <div
-      ref={wrapperRef}
-      style={wrapperStyle}
-      onMouseEnter={handleWrapperMouseEnter}
-      onMouseLeave={handleWrapperMouseLeave}
-      data-cmd-hover-popover
-    >
-      {/* Debug hover-bridge visualizer (StatusBar toggle «bridges»). Покажет
-          красную полупрозрачную область между trigger-карточкой и popover'ом,
-          чтобы видеть гэп, в котором юзер может свободно двигать мышь. */}
-      <HoverBridgeDebug
-        containerRef={triggerRefShim}
-        menuRef={wrapperRef}
-        direction={pos.showAbove ? 'above' : 'below'}
-      />
-      {/* card-wrap нужен потому что card имеет `overflow: hidden` для скруглённых
-          углов — это обрезало handles, которые торчат на -5px за пределы card'а.
-          card-wrap без overflow и с position: relative — handles живут на нём,
-          торчат за card на 5px и остаются кликабельными. */}
-      <div
-        style={{
-          width: `${effectiveWidth}px`,
-          position: 'relative',
-        }}
-      >
-      <div
-        style={{
-          width: '100%',
-          backgroundColor: '#1e1e1e',
-          // В locked-режиме (CMD+Shift) рисуем белую рамку — визуальный сигнал
-          // «прибито». Без сдвига layout'а: толщина та же 1px.
-          border: isLocked ? '1px solid #fff' : '1px solid #333',
-          borderRadius: '6px',
-          boxShadow: '0 4px 12px rgba(0,0,0,0.4)',
-          overflow: 'hidden',
-          display: 'flex',
-          flexDirection: 'column',
-        }}
-      >
-        {/* Notes block — единственный контент popover'а сверху. Title удалён
-            (имя вкладки видно на trigger-карточке). Resizable, высота
-            фиксирована maxLines*lineHeight. */}
-        {hasNotes && (
-          <div
-            style={{
-              height: notesMaxHeight,
-              flex: '0 0 auto',
-              display: 'flex',
-              flexDirection: 'column',
-              overflow: 'hidden',
-              // В split mode metadata живёт в отдельном wrapper'е ниже trigger'а,
-              // border-разделитель не нужен.
-              borderBottom: !split && metaRows && metaRows.length > 0 ? '1px solid #2a2a2a' : 'none',
-            }}
-          >
-            <MarkdownEditor
-              content={notes!}
-              onChange={() => {}}
-              readOnly
-              compact
-              showLineNumbers={false}
-              fontSize={fontSize}
-              contentPaddingX={paddingX}
-              contentPaddingY={paddingY}
-              wordWrap
-            />
-          </div>
-        )}
-
-        {/* Metadata block — внизу popover'а. Технические поля сессии (путь, даты,
-            тип). Фиксированная высота — не resizable. В split-режиме рендерится
-            в отдельный wrapper НИЖЕ trigger'а (см. ниже return-block), здесь
-            скипаем чтобы не дублировать. */}
-        {!split && metaRows && metaRows.length > 0 && (
-          <div
-            style={{
-              padding: '6px 10px',
-              flexShrink: 0,
-            }}
-          >
-            <div style={{ fontSize: '10px', color: '#888', display: 'flex', flexDirection: 'column', gap: '2px' }}>
-              {metaRows.map((row, idx) => (
-                <div
-                  key={idx}
-                  style={{
-                    wordBreak: row.wrap === false ? 'normal' : 'break-all',
-                    color: row.muted ? '#888' : '#ccc',
-                    whiteSpace: row.wrap === false ? 'nowrap' : 'normal',
-                    overflow: row.wrap === false ? 'hidden' : 'visible',
-                    textOverflow: row.wrap === false ? 'ellipsis' : 'clip',
-                  }}
-                >
-                  {row.label ? <span style={{ color: '#666' }}>{row.label}: </span> : null}
-                  {row.value}
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
-      </div>
-
-      {/* Resize handles — render только если есть notes. Title + metadata
-          fixed-size, нечего тянуть. Handles живут на card-WRAP (без overflow),
-          а не на card (там overflow: hidden обрезал бы их offset -5px).
-          Подсветка через CSS-классы — устраняет «потерю hover после mouseup»:
-          `:hover` всегда правильный для текущей позиции курсора, а
-          `data-resize-handle-active` держит подсветку во время drag (когда
-          курсор уехал за handle area). */}
-      {hasNotes && !disableResize && (
-        <>
-          <style>{`
-            .tab-preview-handle:hover,
-            .tab-preview-handle[data-resize-handle-active='true'] {
-              background-color: rgba(99,102,241,0.4);
-            }
-          `}</style>
-          {/* Right edge */}
-          <div
-            className="tab-preview-handle"
-            onMouseDown={(e) => startResize('right', e)}
-            style={edgeHandleStyle({
-              top: HANDLE_EDGE_INSET,
-              bottom: HANDLE_EDGE_INSET,
-              right: HANDLE_EDGE_OFFSET,
-              width: HANDLE_EDGE_THICKNESS,
-              cursor: 'ew-resize',
-            })}
-          />
-          {/* Left edge */}
-          <div
-            className="tab-preview-handle"
-            onMouseDown={(e) => startResize('left', e)}
-            style={edgeHandleStyle({
-              top: HANDLE_EDGE_INSET,
-              bottom: HANDLE_EDGE_INSET,
-              left: HANDLE_EDGE_OFFSET,
-              width: HANDLE_EDGE_THICKNESS,
-              cursor: 'ew-resize',
-            })}
-          />
-          {/* Bottom edge */}
-          <div
-            className="tab-preview-handle"
-            onMouseDown={(e) => startResize('bottom', e)}
-            style={edgeHandleStyle({
-              left: HANDLE_EDGE_INSET,
-              right: HANDLE_EDGE_INSET,
-              bottom: HANDLE_EDGE_OFFSET,
-              height: HANDLE_EDGE_THICKNESS,
-              cursor: 'ns-resize',
-            })}
-          />
-          {/* Corner BR */}
-          <div
-            className="tab-preview-handle"
-            onMouseDown={(e) => startResize('corner-br', e)}
-            style={cornerHandleStyle({
-              right: HANDLE_CORNER_OFFSET,
-              bottom: HANDLE_CORNER_OFFSET,
-              cursor: 'nwse-resize',
-            })}
-          />
-          {/* Corner BL */}
-          <div
-            className="tab-preview-handle"
-            onMouseDown={(e) => startResize('corner-bl', e)}
-            style={cornerHandleStyle({
-              left: HANDLE_CORNER_OFFSET,
-              bottom: HANDLE_CORNER_OFFSET,
-              cursor: 'nesw-resize',
-            })}
-          />
-        </>
-      )}
-      </div>
-    </div>
-    )}
-    {/* Split-mode: отдельный wrapper с metadata НИЖЕ trigger'а. Использует те же
-        popoverProps (onMouseEnter/Leave) для общего pin state — обе части
-        ведут себя как единый popover при mouse-over. */}
-    {showSplitMeta && (
-      <div
-        style={metaWrapperStyle}
-        onMouseEnter={handleWrapperMouseEnter}
-        onMouseLeave={handleWrapperMouseLeave}
-        data-cmd-hover-popover
-      >
+      {/* Скрытый probe для замера natural-width / height. Рендерится вне
+          потока (visibility: hidden + abs position) с теми же стилями что
+          реальный MarkdownEditor — fontSize, padding, line-height. */}
+      {hasNotes && (
         <div
+          ref={probeRef}
+          aria-hidden
           style={{
-            backgroundColor: '#1e1e1e',
-            border: isLocked ? '1px solid #fff' : '1px solid #333',
-            borderRadius: '6px',
-            boxShadow: '0 4px 12px rgba(0,0,0,0.4)',
-            width: `${effectiveWidth}px`,
-            padding: '6px 10px',
+            position: 'fixed',
+            visibility: 'hidden',
+            pointerEvents: 'none',
+            top: -99999,
+            left: -99999,
+            width: 'max-content',
+            maxWidth: `${maxWidth}px`,
+            zIndex: -1,
           }}
         >
-          <div style={{ fontSize: '10px', color: '#888', display: 'flex', flexDirection: 'column', gap: '2px' }}>
-            {metaRows!.map((row, idx) => (
+          <MarkdownEditor
+            key={`probe::${notes}`}
+            content={notes!}
+            onChange={() => {}}
+            readOnly
+            compact
+            fontSize={fontSize}
+            contentPaddingX={paddingX}
+            contentPaddingY={paddingY}
+            wordWrap
+          />
+        </div>
+      )}
+
+      {showMainWrapper && notesBox && (
+        <div
+          ref={wrapperRef}
+          style={wrapperStyle}
+          onMouseEnter={popoverProps.onMouseEnter}
+          onMouseLeave={popoverProps.onMouseLeave}
+          data-cmd-hover-popover
+        >
+          <HoverBridgeDebug
+            containerRef={triggerRefShim}
+            menuRef={wrapperRef}
+            direction={isAbove ? 'above' : 'below'}
+          />
+          <div style={cardStyle({ width: `${popoverWidth}px` })}>
+            {hasNotes && (
               <div
-                key={idx}
                 style={{
-                  wordBreak: row.wrap === false ? 'normal' : 'break-all',
-                  color: row.muted ? '#888' : '#ccc',
-                  whiteSpace: row.wrap === false ? 'nowrap' : 'normal',
-                  overflow: row.wrap === false ? 'hidden' : 'visible',
-                  textOverflow: row.wrap === false ? 'ellipsis' : 'clip',
+                  width: `${notesBox.width}px`,
+                  height: `${notesBox.height}px`,
+                  overflow: 'auto',
+                  flexShrink: 0,
+                  borderBottom: !split && metaRows && metaRows.length > 0 ? '1px solid #2a2a2a' : 'none',
                 }}
               >
-                {row.label ? <span style={{ color: '#666' }}>{row.label}: </span> : null}
-                {row.value}
+                <MarkdownEditor
+                  content={notes!}
+                  onChange={() => {}}
+                  readOnly
+                  compact
+                  fontSize={fontSize}
+                  contentPaddingX={paddingX}
+                  contentPaddingY={paddingY}
+                  wordWrap
+                />
               </div>
-            ))}
+            )}
+
+            {!split && metaRows && metaRows.length > 0 && (
+              <div style={{ padding: '6px 10px', flexShrink: 0 }}>
+                <MetaList rows={metaRows} />
+              </div>
+            )}
           </div>
         </div>
-      </div>
-    )}
+      )}
+
+      {showSplitMeta && (
+        <div
+          style={metaWrapperStyle}
+          onMouseEnter={popoverProps.onMouseEnter}
+          onMouseLeave={popoverProps.onMouseLeave}
+          data-cmd-hover-popover
+        >
+          <div style={cardStyle({ width: `${popoverWidth}px`, padding: '6px 10px' })}>
+            <MetaList rows={metaRows!} />
+          </div>
+        </div>
+      )}
     </>
+  );
+}
+
+// Стандартный рендер metadata-rows — отдельным компонентом чтобы не дублировать
+// между split-meta-wrapper'ом и inline-под-notes.
+function MetaList({ rows }: { rows: MetaRow[] }) {
+  return (
+    <div style={{ fontSize: '10px', color: '#888', display: 'flex', flexDirection: 'column', gap: '2px' }}>
+      {rows.map((row, idx) => (
+        <div
+          key={idx}
+          style={{
+            wordBreak: row.wrap === false ? 'normal' : 'break-all',
+            color: row.muted ? '#888' : '#ccc',
+            whiteSpace: row.wrap === false ? 'nowrap' : 'normal',
+            overflow: row.wrap === false ? 'hidden' : 'visible',
+            textOverflow: row.wrap === false ? 'ellipsis' : 'clip',
+          }}
+        >
+          {row.label ? <span style={{ color: '#666' }}>{row.label}: </span> : null}
+          {row.value}
+        </div>
+      ))}
+    </div>
   );
 }

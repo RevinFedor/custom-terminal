@@ -1720,7 +1720,7 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
     }
   };
 
-  // Open native terminal context menu (used by right-click AND Cmd+J shortcut).
+  // Open native terminal context menu (used by right-click).
   // Electron Menu.popup() without explicit coords pops at the current OS cursor
   // position; positioningItem (passed when focusInsertPrompt=true) puts Insert
   // Prompt under the cursor so it's keyboard-focused immediately.

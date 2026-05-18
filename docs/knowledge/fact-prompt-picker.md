@@ -1,7 +1,7 @@
-# Feature: Prompt Picker (Opt+V / Cmd+E)
+# Feature: Prompt Picker (Opt+V)
 
 ## Intro
-Двухколонный keyboard-first picker для вставки промпта в активный таб. Заменил native macOS `Menu.popup({positioningItem})` который раньше открывался на Cmd+E как нативное контекстное меню с пунктом *Insert Prompt*. Те же данные из SQLite (`prompts` + `prompt_groups`), но рендерится React-portal'ом в `document.body`. Открывается двумя хоткеями: **Opt+V** (primary) и **Cmd+E** (alias на ту же команду — старый rebind сохранён в memory юзеров). Source: `src/renderer/components/Workspace/PromptPickerOverlay.tsx`.
+Двухколонный keyboard-first picker для вставки промпта в активный таб. Заменил native macOS `Menu.popup({positioningItem})` который раньше открывался на Cmd+E как нативное контекстное меню с пунктом *Insert Prompt*. Те же данные из SQLite (`prompts` + `prompt_groups`), но рендерится React-portal'ом в `document.body`. Открывается одним хоткеем — **Opt+V**. Раньше существовал alias **Cmd+E**, но 16.05.2026 слот переназначен на toggle Tab Notes Slideout (см. `fact-notes.md`); Opt+V остаётся единственным keyboard-входом в picker.
 
 ## Why not native menu
 - Native menu **не настраивается визуально** — нельзя поменять шрифт, паддинги, скрыть фон.
@@ -46,7 +46,7 @@
 После reading store-флага `promptPickerOpen=true` listener делает `e.preventDefault() + e.stopPropagation() + e.stopImmediatePropagation()` и не пускает событие дальше. Double-safety: оба xterm `attachCustomKeyEventHandler` в `Terminal.tsx` тоже проверяют `useUIStore.getState().promptPickerOpen` и возвращают `false` на arrow/Enter/Esc — если capture-flow по какой-то причине пропустит событие, xterm всё равно его не пошлёт в PTY. Принцип переносимый — см. `methodology/design.md::Global shortcut в capture phase`.
 
 ### Layout-agnostic шорткаты через `event.code`
-Открытие picker'а: `e.altKey && e.code === 'KeyV'` (Opt+V) или `e.metaKey && e.code === 'KeyE'` (Cmd+E). Не `e.key === 'v'` — на Mac Opt+V в QWERTY-layout это символ `√` (option layer), а в Cyrillic-layout — `М`. `e.code` указывает физическую клавишу, не глиф. Принцип переносимый — см. `methodology/design.md::Layout-agnostic shortcuts`.
+Открытие picker'а: `e.altKey && e.code === 'KeyV'` (Opt+V). Не `e.key === 'v'` — на Mac Opt+V в QWERTY-layout это символ `√` (option layer), а в Cyrillic-layout — `М`. `e.code` указывает физическую клавишу, не глиф. Принцип переносимый — см. `methodology/design.md::Layout-agnostic shortcuts`. Cmd+E больше не открывает picker (см. Intro).
 
 Стрелочки/Enter/Esc — non-printable, `e.key` для них одинаков везде, можно проверять по `key`.
 
@@ -81,7 +81,7 @@ Picker появляется у курсора, если последний `mous
 | Файл | Что делает |
 |---|---|
 | `src/renderer/components/Workspace/PromptPickerOverlay.tsx` | Сам компонент. Mounted один раз в App.tsx. |
-| `src/renderer/App.tsx::handlePickerOpenCapture` | Window keydown capture для Opt+V/Cmd+E. |
+| `src/renderer/App.tsx::handlePickerOpenCapture` | Window keydown capture для Opt+V. |
 | `src/renderer/store/useUIStore.ts` | `promptPickerOpen` / `setPromptPickerOpen`, `promptPickerFontSize` / `setPromptPickerFontSize`. |
 | `src/renderer/components/Workspace/Terminal.tsx` (оба `attachCustomKeyEventHandler`) | Double-safety guard: блокирует Opt+V и navigation keys, когда picker open. |
 | `src/renderer/components/UI/SettingsModal.tsx` | Слайдер «Prompt picker» в секции «Шрифты интерфейса». |

@@ -1,9 +1,12 @@
-import React, { useState, useEffect } from 'react';
+import React from 'react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
-import { useResearchStore } from '../../store/useResearchStore';
 import InfoPanel from './panels/InfoPanel';
-import GeminiPanel from './panels/GeminiPanel';
-import SessionsPanel from './panels/SessionsPanel';
+
+// AI Sessions tab (GeminiPanel) — открывается через Cmd+Shift+E как модалка ResearchSheet.
+// Sessions tab (SessionsPanel, Trojan-Horse import) — устарел: команды Gemini /chat save
+// больше не нужны (мы используем JSONL), Claude вообще не нуждается в spawning через PTY.
+// Файлы panels/GeminiPanel.tsx и panels/SessionsPanel.tsx сохранены в кодовой базе как
+// historical reference (см. ResearchSheet для актуального replacement). Удалены отсюда.
 
 interface Project {
   id: string;
@@ -18,79 +21,17 @@ interface NotesPanelProps {
   project: Project;
 }
 
-type TabType = 'info' | 'ai' | 'sessions';
-
-export default function NotesPanel({ projectId, project }: NotesPanelProps) {
-  const { getActiveProject, getEffectiveTabId } = useWorkspaceStore();
-  const { pendingResearch } = useResearchStore();
-
-  const [activeTab, setActiveTab] = useState<TabType>('info');
-
-  const activeProject = getActiveProject();
-  // Use effectiveTabId (sub-agent aware) — resolves to sub-agent tab when viewing one
+export default function NotesPanel({ projectId: _projectId, project }: NotesPanelProps) {
+  const { getEffectiveTabId } = useWorkspaceStore();
   const activeTabId = getEffectiveTabId();
-
-  // Check if active tab has an active AI session
-  const activeTabData = activeTabId && activeProject ? activeProject.tabs.get(activeTabId) : null;
-  const hasActiveSession = !!(activeTabData?.claudeSessionId || activeTabData?.geminiSessionId);
-
-  // Auto-switch to AI tab when research is triggered
-  useEffect(() => {
-    if (pendingResearch) {
-      setActiveTab('ai');
-    }
-  }, [pendingResearch]);
-
-  const tabs: { id: TabType; label: string }[] = [
-    { id: 'info', label: 'Info' },
-    { id: 'ai', label: 'AI Sessions' },
-    { id: 'sessions', label: 'Sessions' }
-  ];
 
   return (
     <div
       data-info-aside
       className="bg-notes border-l border-border-main flex flex-col min-w-[150px] w-full h-full"
     >
-      {/* Tabs */}
-      <div className="flex border-b border-border-main bg-[#2d2d2d]">
-        {tabs.map((tab) => (
-          <button
-            key={tab.id}
-            className={`flex-1 bg-transparent border-none py-2 text-xs cursor-pointer border-b-2 transition-colors flex items-center justify-center gap-1 ${
-              activeTab === tab.id
-                ? 'text-white border-accent'
-                : 'text-[#888] border-transparent hover:text-[#ccc]'
-            }`}
-            onClick={() => setActiveTab(tab.id)}
-          >
-            {tab.label}
-            {tab.id === 'info' && hasActiveSession && (
-              <span style={{ width: 5, height: 5, borderRadius: '50%', backgroundColor: '#4ade80', flexShrink: 0 }} />
-            )}
-          </button>
-        ))}
-      </div>
-
-      {/* Content */}
       <div className="flex-1 overflow-hidden">
-        {activeTab === 'info' && (
-          <InfoPanel activeTabId={activeTabId} project={project} />
-        )}
-
-        {activeTab === 'ai' && (
-          <GeminiPanel
-            projectPath={project.path}
-            geminiPrompt={project.geminiPrompt}
-          />
-        )}
-
-        {activeTab === 'sessions' && (
-          <SessionsPanel
-            projectPath={project.path}
-            activeTabId={activeTabId}
-          />
-        )}
+        <InfoPanel activeTabId={activeTabId} project={project} />
       </div>
     </div>
   );

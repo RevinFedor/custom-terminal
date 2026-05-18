@@ -2737,6 +2737,27 @@ function startMcpHttpServer() {
     // CORS headers for local requests
     res.setHeader('Content-Type', 'application/json');
 
+    // Resolve which project owns `tabId`. Preference:
+    //   1. live map terminalProjectIds — set when PTY was spawned with explicit projectId.
+    //   2. SQLite — DB row tabs.project_id (covers tabs whose PTY died and respawn
+    //      paths that lost the env).
+    // Returns null if unknown.
+    // Used by /terminal/* handlers below to validate cross-project tabId access.
+    // MUST live at callback-scope, not inside an else-if branch, so every handler
+    // can see it (else: ReferenceError on /terminal/output etc. when caller pins parentProjectId).
+    const resolveProjectForTab = (tabId) => {
+      if (typeof tabId !== 'string' || !tabId) return null;
+      const live = terminalProjectIds.get(tabId);
+      if (live) return live;
+      try {
+        const row = projectManager.db.db.prepare(
+          'SELECT project_id FROM tabs WHERE tab_id = ? LIMIT 1'
+        ).get(tabId);
+        if (row && row.project_id) return row.project_id;
+      } catch {}
+      return null;
+    };
+
     if (req.method === 'POST' && req.url === '/delegate') {
       let body = '';
       req.on('data', chunk => { body += chunk; });
@@ -3299,26 +3320,7 @@ function startMcpHttpServer() {
       });
 
     // ========== TERMINAL MANAGEMENT ENDPOINTS ==========
-    // Resolve which project owns `tabId`. Preference:
-    //   1. live map terminalProjectIds — set when PTY was spawned with explicit projectId.
-    //   2. SQLite — DB row tabs.project_id (covers tabs whose PTY died and respawn
-    //      paths that lost the env).
-    // Returns null if unknown.
-    // Used by the HTTP handlers below to validate cross-project tabId access.
-    // (Hoisted as a const, no `function` keyword, to avoid `var`-hoisting across
-    // the big `if/else if` chain.)
-    const resolveProjectForTab = (tabId) => {
-      if (typeof tabId !== 'string' || !tabId) return null;
-      const live = terminalProjectIds.get(tabId);
-      if (live) return live;
-      try {
-        const row = projectManager.db.db.prepare(
-          'SELECT project_id FROM tabs WHERE tab_id = ? LIMIT 1'
-        ).get(tabId);
-        if (row && row.project_id) return row.project_id;
-      } catch {}
-      return null;
-    };
+    // resolveProjectForTab is declared at callback scope above (see top of startMcpHttpServer).
     } else if (req.method === 'GET' && req.url?.startsWith('/terminal/tabs')) {
       // List terminal tabs for a project (by parentProjectId — preferred — or cwd path)
       (async () => {
@@ -10341,6 +10343,13 @@ async function sdkStartQuery(tabId, cwd, prompt, resumeSessionId, model, effort,
     effort: effort || 'high',
     thinking: { type: thinkingMode },
     mcpServers,
+    // SDK 0.3.x background-task surface: opt-in to AI-generated summaries on
+    // task_progress events and live subagent text-deltas. Without these flags
+    // the iterator emits only task_started/task_notification (start+end), no
+    // mid-flight status. We surface the live data in BackgroundTasksBar +
+    // TaskDetailPane, so the renderer wants the full stream.
+    agentProgressSummaries: true,
+    forwardSubagentText: true,
   };
   // Resume only if the session JSONL actually has a resumable conversation.
   // Caller-supplied `resumeSessionId` can be stale (caller is renderer/mobile
@@ -10393,6 +10402,12 @@ async function sdkStartQuery(tabId, cwd, prompt, resumeSessionId, model, effort,
             is_error: m?.is_error,
             uuid: m?.uuid?.slice?.(0, 8),
             sessionId: m?.session_id?.slice?.(0, 8),
+            // Subagent-related flags — main signal for routing decisions
+            parent_tool_use_id: m?.parent_tool_use_id?.slice?.(0, 8) || null,
+            subagent_type: m?.subagent_type || null,
+            task_description: m?.task_description ? String(m.task_description).slice(0, 40) : null,
+            task_id: m?.task_id?.slice?.(0, 8) || null,
+            tool_use_id: m?.tool_use_id?.slice?.(0, 8) || null,
             // Assistant content shape — for normal turns
             contentTypes: Array.isArray(m?.message?.content)
               ? m.message.content.map(b => b?.type).join(',')
@@ -10402,15 +10417,27 @@ async function sdkStartQuery(tabId, cwd, prompt, resumeSessionId, model, effort,
             // Anything else that might be relevant
             allKeys: Object.keys(m || {}).join(','),
           };
-          console.log('[SlashProbe] tabId=' + tabId.slice(-12) + ' msg=' + JSON.stringify(summary));
+          console.log('[BgProbe] tabId=' + tabId.slice(-12) + ' msg=' + JSON.stringify(summary));
+          // For user/assistant msgs from subagent — dump first content block for content forensics.
+          if ((m?.type === 'user' || m?.type === 'assistant') && (m?.parent_tool_use_id || m?.subagent_type)) {
+            const firstBlock = Array.isArray(m?.message?.content) ? m.message.content[0] : null;
+            const blockPreview = firstBlock ? {
+              type: firstBlock.type,
+              text: typeof firstBlock.text === 'string' ? firstBlock.text.slice(0, 120) : null,
+              thinking: typeof firstBlock.thinking === 'string' ? firstBlock.thinking.slice(0, 80) : null,
+              name: firstBlock.name,
+              tool_use_id: firstBlock.tool_use_id?.slice?.(0, 8),
+            } : null;
+            console.log('[BgProbe:SUBAGENT_CONTENT] tabId=' + tabId.slice(-12) + ' subagent_type=' + m?.subagent_type + ' parent=' + (m?.parent_tool_use_id?.slice?.(0,8) || 'null') + ' firstBlock=' + JSON.stringify(blockPreview));
+          }
           // If it's a system message — dump the full content (capped at 800
           // chars) so we can see exactly what /usage etc. produce.
           if (m?.type === 'system') {
             const fullDump = JSON.stringify(m).slice(0, 800);
-            console.log('[SlashProbe] tabId=' + tabId.slice(-12) + ' SYSTEM_FULL=' + fullDump);
+            console.log('[BgProbe] tabId=' + tabId.slice(-12) + ' SYSTEM_FULL=' + fullDump);
           }
         } catch (e) {
-          console.warn('[SlashProbe] log failed:', e.message);
+          console.warn('[BgProbe] log failed:', e.message);
         }
 
         // Capture sessionId from first message that has it
@@ -10549,6 +10576,50 @@ ipcMain.handle('claude-sdk:load-history', async (event, { sessionId, cwd }) => {
   }
 });
 
+// Load a subagent's transcript from its own JSONL (lives at
+// ~/.claude/projects/<dir>/<sessionId>/subagents/agent-<agentId>.jsonl).
+// Used by TaskDetailPane to render the agent's mini-thread when the user
+// expands a running/finished background-agent chip.
+ipcMain.handle('claude-sdk:get-subagent-messages', async (event, { sessionId, agentId, cwd }) => {
+  if (!sessionId || !agentId) return { success: false, error: 'sessionId and agentId required', messages: [] };
+  try {
+    const { getSubagentMessages } = await import('@anthropic-ai/claude-agent-sdk');
+    let msgs = await getSubagentMessages(sessionId, agentId, { dir: cwd || undefined });
+    if ((!msgs || msgs.length === 0) && cwd) {
+      msgs = await getSubagentMessages(sessionId, agentId);
+    }
+    return { success: true, messages: msgs || [] };
+  } catch (err) {
+    console.error('[ClaudeSDK] get-subagent-messages failed:', err.message);
+    return { success: false, error: String(err.message || err), messages: [] };
+  }
+});
+
+// Read a background-task output file (task_notification.output_file) from
+// the given byte offset. Returns { content, size } where size is the new
+// file length — caller advances its tail pointer for the next poll. Used by
+// TaskDetailPane to live-tail background bash stdout.
+ipcMain.handle('claude-sdk:read-background-output', async (event, { path: filePath, offset }) => {
+  if (!filePath) return { success: false, error: 'path required', content: '', size: 0 };
+  try {
+    if (!fs.existsSync(filePath)) return { success: true, content: '', size: 0, missing: true };
+    const stat = fs.statSync(filePath);
+    const start = Math.max(0, Number(offset) || 0);
+    if (start >= stat.size) return { success: true, content: '', size: stat.size };
+    const fd = fs.openSync(filePath, 'r');
+    try {
+      const len = stat.size - start;
+      const buf = Buffer.alloc(len);
+      fs.readSync(fd, buf, 0, len, start);
+      return { success: true, content: buf.toString('utf8'), size: stat.size };
+    } finally {
+      try { fs.closeSync(fd); } catch {}
+    }
+  } catch (err) {
+    return { success: false, error: String(err.message || err), content: '', size: 0 };
+  }
+});
+
 // Exposes SDK-shipped model capability table to renderer. Returns
 // { [modelId]: ['low','medium','high','xhigh','max'][] }. Renderer uses this
 // to gate effort pills per active model and auto-downgrade unsupported pairs.
@@ -10629,18 +10700,36 @@ ipcMain.handle('claude-sdk:probe-commands', async (event, { tabId }) => {
   }
 });
 
-ipcMain.handle('claude-sdk:stop', async (event, { tabId }) => {
-  console.log('[ClaudeSDK] stop tabId=' + tabId);
+ipcMain.handle('claude-sdk:stop', async (event, { tabId, runningTaskIds }) => {
+  console.log('[ClaudeSDK] stop tabId=' + tabId + ' runningTaskIds=' + JSON.stringify(runningTaskIds || []));
   const session = sdkSessions.get(tabId);
   if (session) {
+    console.warn('[BgProbe:STOP] found session sid=' + session.sessionId?.slice(0,8));
+    // Cancel each running task BEFORE closing the query — close() just rips
+    // the transport, leaving any spawned subagent worker alive on the system.
+    // stopTask is the documented way: it emits task_notification{status:'stopped'}
+    // and tears down the subagent's own subprocess.
+    if (Array.isArray(runningTaskIds) && runningTaskIds.length > 0) {
+      for (const tid of runningTaskIds) {
+        try {
+          await session.query.stopTask(tid);
+          console.warn('[BgProbe:STOP] stopTask(' + tid.slice(0,8) + ') ok');
+        } catch (err) {
+          console.warn('[BgProbe:STOP] stopTask(' + tid.slice(0,8) + ') err: ' + err.message);
+        }
+      }
+    }
+    try { session.abortController?.abort(); } catch (err) { console.warn('[BgProbe:STOP] abort err: ' + err.message); }
     try {
       session.query.close();
+      console.warn('[BgProbe:STOP] query.close() ok');
     } catch (err) {
       console.error('[ClaudeSDK] stop error:', err.message);
     }
     sdkSessions.delete(tabId);
     return { success: true };
   }
+  console.warn('[BgProbe:STOP] no active session for tabId=' + tabId.slice(-12));
   return { success: false, error: 'no active session' };
 });
 

@@ -275,8 +275,12 @@ export default function CopySessionButton({ activeTabId, sessionType }: CopySess
             alignItems: 'center',
             backgroundColor: copyHovered ? `${accentRgba} 0.28)` : 'transparent',
             color: copyHovered ? '#fff' : accent,
-            fontWeight: copyHovered ? 600 : 400,
-            transition: 'background-color 0.12s, color 0.12s, font-weight 0.12s',
+            // Юзер: «не должно при ховер-эффекте менять ширину». Bold (600) шире чем
+            // regular (400) — текст разъезжался при hover, остальной toolbar дёргался.
+            // Фиксированный 500: визуально чуть «жирнее» чем стандартный 400 (читаемо
+            // и без hover, и с hover), но без скачка metrics.
+            fontWeight: 500,
+            transition: 'background-color 0.12s, color 0.12s',
           }}
         >
           {isCopying ? 'Copying...' : isMultiSelect ? `Copy ${selectedTabs.length}× session` : customId.trim() ? 'Copy custom' : 'Copy session'}
@@ -304,10 +308,15 @@ export default function CopySessionButton({ activeTabId, sessionType }: CopySess
               ref={settingsPopupRef}
               onClick={(e) => e.stopPropagation()}
               style={{
+                // Position: below the trigger, right-edge-aligned to the trigger's
+                // right edge. Этот вариант ставит popover на ту же нижнюю линию,
+                // что и Docs-popover в ProjectToolbar — оба идут вниз от своих
+                // триггеров справа налево. Раньше popover открывался слева-центр
+                // и упирался в левый край экрана, когда CopySessionButton живёт в
+                // правом краю toolbar'а.
                 position: 'fixed',
-                left: bRect.left - 3,
-                top: bRect.top + bRect.height / 2,
-                transform: 'translate(-100%, -50%)',
+                top: bRect.bottom + 6,
+                right: window.innerWidth - bRect.right,
                 zIndex: 10000,
                 display: 'flex',
                 flexDirection: 'row',
@@ -322,7 +331,7 @@ export default function CopySessionButton({ activeTabId, sessionType }: CopySess
                 </div>
                 <ToggleRow label="👤 User" active={includeUser} color="bg-[#DA7756]" onToggle={() => setIncludeUser(!includeUser)} />
                 <ToggleRow label={<span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}><ClaudeSparkle size={12} color="#DA7756" /> Claude</span>} active={includeClaude} color="bg-[#DA7756]" onToggle={() => setIncludeClaude(!includeClaude)} />
-                <ToggleRow label={<span style={{ fontStyle: 'italic' }}>«text»</span>} active={includeText} color="bg-[#DA7756]" disabled={!includeClaude} indent onToggle={() => setIncludeText(!includeText)} />
+                <ToggleRow label={<span style={{ fontStyle: 'italic' }}>«answer»</span>} active={includeText} color="bg-[#DA7756]" disabled={!includeClaude} indent onToggle={() => setIncludeText(!includeText)} />
                 <ToggleRow label={<span style={{ fontStyle: 'italic' }}>«thinking»</span>} active={includeThinking} color="bg-[#DA7756]" disabled={!includeClaude} indent onToggle={() => setIncludeThinking(!includeThinking)} />
                 <ToggleRow label={<ToolGroupLabel tools={['read_file']} />} active={includeReading} color="bg-[#DA7756]" disabled={!includeClaude} indent onToggle={() => setIncludeReading(!includeReading)} />
                 <ToggleRow label={<ToolGroupLabel tools={['edit', 'write']} />} active={includeEditing} color="bg-[#DA7756]" disabled={!includeClaude} indent onToggle={() => setIncludeEditing(!includeEditing)} />

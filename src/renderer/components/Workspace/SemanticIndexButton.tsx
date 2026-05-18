@@ -21,12 +21,24 @@ interface ProgressState {
   currentFile: string;
 }
 
-export default function SemanticIndexButton() {
+interface SemanticIndexButtonProps {
+  // Колбэк для ПКМ — открыть Settings на вкладке «Системные».
+  // Хост (ProjectToolbar) знает про SettingsModal lifecycle, кнопка — нет.
+  onOpenSettings?: () => void;
+}
+
+export default function SemanticIndexButton({ onOpenSettings }: SemanticIndexButtonProps) {
   const activeProjectId = useWorkspaceStore((s) => s.activeProjectId);
   const { showToast } = useUIStore();
+  const semanticIndexParallelism = useUIStore((s) => s.semanticIndexParallelism);
 
   const [status, setStatus] = useState<IndexStatus | null>(null);
   const [isRunning, setIsRunning] = useState(false);
+  // Параллелизм, с которым запущен текущий ребилд. Берётся из rebuild-started
+  // payload, не из store — чтобы при mid-rebuild смене настройки чип
+  // продолжал показывать реальное N работающих воркеров, а не текущее значение
+  // настройки (которое применится к следующему запуску).
+  const [runningParallelism, setRunningParallelism] = useState<number | null>(null);
   const [progress, setProgress] = useState<ProgressState>({ outdatedTotal: 0, outdatedCompleted: 0, currentFile: '' });
   const activeProjectIdRef = useRef(activeProjectId);
   activeProjectIdRef.current = activeProjectId;
@@ -40,6 +52,7 @@ export default function SemanticIndexButton() {
     // projectId so they will only re-attach if the rebuild belongs to the new project.)
     setStatus(null);
     setIsRunning(false);
+    setRunningParallelism(null);
     setProgress({ outdatedTotal: 0, outdatedCompleted: 0, currentFile: '' });
 
     if (!activeProjectId) return;
@@ -58,6 +71,9 @@ export default function SemanticIndexButton() {
             setStatus(r.status);
             if (r.isRebuilding) {
               setIsRunning(true);
+              if (typeof r.rebuildParallelism === 'number') {
+                setRunningParallelism(r.rebuildParallelism);
+              }
               if (r.rebuildProgress) {
                 setProgress({
                   outdatedTotal: r.rebuildProgress.outdatedTotal ?? 0,
@@ -86,9 +102,10 @@ export default function SemanticIndexButton() {
       });
     };
 
-    const onRebuildStarted = (_e: any, payload: { projectId: string }) => {
+    const onRebuildStarted = (_e: any, payload: { projectId: string; parallelism?: number }) => {
       if (payload.projectId !== activeProjectIdRef.current) return;
       setIsRunning(true);
+      setRunningParallelism(typeof payload.parallelism === 'number' ? payload.parallelism : null);
       setProgress({ outdatedTotal: 0, outdatedCompleted: 0, currentFile: '' });
     };
 
@@ -118,6 +135,7 @@ export default function SemanticIndexButton() {
     ) => {
       if (payload.projectId !== activeProjectIdRef.current) return;
       setIsRunning(false);
+      setRunningParallelism(null);
       if (payload.success) {
         const s = payload.stats;
         const summary = s ? `Индекс обновлён: ${s.outdatedCompleted}/${s.outdatedTotal} файлов` : 'Индекс обновлён';
@@ -142,10 +160,18 @@ export default function SemanticIndexButton() {
 
   const handleClick = async () => {
     if (!activeProjectId || isRunning) return;
-    const res = await ipcRenderer.invoke('semantic-index:rebuild', { projectId: activeProjectId });
+    const res = await ipcRenderer.invoke('semantic-index:rebuild', {
+      projectId: activeProjectId,
+      parallelism: semanticIndexParallelism,
+    });
     if (!res?.success) {
       showToast(res?.error || 'Не удалось запустить индексацию', 'error');
     }
+  };
+
+  const handleContextMenu = (e: React.MouseEvent<HTMLButtonElement>) => {
+    e.preventDefault();
+    onOpenSettings?.();
   };
 
   if (!activeProjectId) return null;
@@ -178,18 +204,26 @@ export default function SemanticIndexButton() {
   // === Running state ===
   // Показываем только реально переиндексируемые файлы — кэшированные не считаются
   // (нет смысла показывать "5/90" если 85 из них cached и пролетают мгновенно).
+  // Третий параметр — параллелизм (фиолетовый чип), берётся из rebuild-started
+  // payload (runningParallelism) и зеркалит реально работающее N воркеров,
+  // а не текущее значение Settings.
   if (isRunning) {
     const { outdatedTotal, outdatedCompleted, currentFile } = progress;
     const counter = outdatedTotal > 0 ? `${outdatedCompleted}/${outdatedTotal}` : '…';
-    const tooltipText = currentFile
-      ? `Переиндексация: ${counter}\n${currentFile}`
-      : `Переиндексация: ${counter}`;
+    const parallelismLabel = runningParallelism ?? semanticIndexParallelism;
+    const tooltipParts = [
+      `Переиндексация: ${counter}`,
+      `Параллелизм: ${parallelismLabel} (Settings → Системные)`,
+    ];
+    if (currentFile) tooltipParts.push(currentFile);
+    const tooltipText = tooltipParts.join('\n');
 
     return (
       <Tooltip content={tooltipText}>
-        <button onClick={handleClick} style={buttonStyle} disabled>
+        <button onClick={handleClick} onContextMenu={handleContextMenu} style={buttonStyle} disabled>
           <Loader2 size={13} className="animate-spin" style={{ color: '#d97706' }} />
           <span style={{ color: '#d97706' }}>{counter}</span>
+          <span style={{ color: '#a855f7', marginLeft: '4px' }}>×{parallelismLabel}</span>
         </button>
       </Tooltip>
     );
@@ -198,7 +232,7 @@ export default function SemanticIndexButton() {
   // === Idle state ===
   if (!status) {
     return (
-      <button style={{ ...buttonStyle, opacity: 0.4 }} disabled>
+      <button onContextMenu={handleContextMenu} style={{ ...buttonStyle, opacity: 0.4 }} disabled>
         <CircleCheck size={13} />
         <span>—</span>
       </button>
@@ -207,9 +241,10 @@ export default function SemanticIndexButton() {
 
   if (!status.indexExists) {
     return (
-      <Tooltip content="Семантический индекс не создан. Клик — собрать индекс через scripts/ai/build-index.sh">
+      <Tooltip content="Семантический индекс не создан. Клик — собрать индекс через scripts/ai/build-index.sh. ПКМ — настройки.">
         <button
           onClick={handleClick}
+          onContextMenu={handleContextMenu}
           style={buttonStyle}
           onMouseEnter={handleEnter}
           onMouseLeave={handleLeave}
@@ -225,12 +260,14 @@ export default function SemanticIndexButton() {
   const tooltipText =
     `Индекс: ${status.fresh} актуальных, ${status.stale} устаревших, ${status.new} новых\n` +
     `Файлов в docs/: ${status.docsTotal}, записей в индексе: ${status.indexedTotal}\n` +
-    (outdated > 0 ? 'Клик — переиндексировать (запуск scripts/ai/build-index.sh в фоне)' : 'Индекс актуален');
+    (outdated > 0 ? 'Клик — переиндексировать (запуск scripts/ai/build-index.sh в фоне)' : 'Индекс актуален') +
+    '\nПКМ — открыть настройки.';
 
   return (
     <Tooltip content={tooltipText}>
       <button
         onClick={handleClick}
+        onContextMenu={handleContextMenu}
         style={buttonStyle}
         onMouseEnter={handleEnter}
         onMouseLeave={handleLeave}
