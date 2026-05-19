@@ -163,6 +163,12 @@ Status marker 8px (dot или square, sizePx 4..16) рисуется absolute н
 
 ПКМ Status submenu имеет preview трёх первых статусов inline справа от лейбла `Status ›` — юзер видит «вот эти точки это про статусы» без открытия submenu. См. `methodology/design.md::Submenu trigger показывает preview содержимого`. Toggle-семантика: повторный клик по активному статусу снимает его. Color submenu из ПКМ удалён — юзер не использовал.
 
+### Revert Session submenu
+
+ПКМ → «↶ Revert Session ›» появляется только на claude-табах, у которых непустой `tab.claudeSessionHistory` (последние до 5 предыдущих значений sessionId с reason и timestamp). Submenu отрисовывает каждую запись короткой строкой: `<8-char sessionId monospace> · <relative time>` и под ней `<reason>` мелким текстом. Клик возвращает значение — записывается обратно через `setClaudeSessionId(tabId, sid, 'userRevert')` (значит сам revert тоже попадает в историю; можно отменить отмену).
+
+Назначение — last line of defense когда автоматический writer всё-таки перетёр sessionId таба не на тот: stale bridge file проскочил защиты, AutoResume отработал на испорченный state из SQLite, Timeline chain resolver нашёл мёртвую ссылку. Без UI revert юзер должен grep'ать `~/Library/Logs/noted-terminal/production.log` по `[Store:setTabCommandType] tab=...claude=...` чтобы вспомнить какие sessionId раньше сидели на вкладке. См. полный контракт `SessionWriteReason` и список 9 источников записи — `knowledge/fact-session-capture.md::SessionWriteReason contract` и `knowledge/fact-session-detection.md::Stale bridge files + pendingResume guard`.
+
 ### Wheel handler gotcha
 
 `handleWheel` в TabBar.tsx ранее форсировал `scrollLeft += deltaY` на overflowX:hidden контейнере для горизонтального wheel-скролла без Shift. В vertical mode этот же useEffect блокирует нативный вертикальный скролл колесом — деление `scrollLeft` ничего не делает (overflowX:hidden), но `e.preventDefault()` глотает событие до того как браузер обработает scrollTop. Симптом: «вкладки не скроллятся колесом в sidebar».

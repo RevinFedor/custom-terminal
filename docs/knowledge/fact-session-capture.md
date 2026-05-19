@@ -193,6 +193,14 @@ Apply для Claude делает три действия в одном flow, н�
 ### Anti-flap на dead session_links
 Раньше Apply «откатывался через секунду» — Timeline через `latestSessionId` тащил dead UUID из `session_links` SQLite и перезатёртывал store. Это **другой** баг с другим фиксом — см. [`fix-dead-session-link-overwrite.md`](fix-dead-session-link-overwrite.md) и [`fact-session-detection.md::Dead session_links + chain resolve trap`](fact-session-detection.md). Без liveness-guard'а никакой Apply корректно не работал, потому что polling Timeline'а перетоптывал ручной выбор.
 
+### SessionWriteReason contract + claude_session_history
+
+После инцидента с stale bridge takeover (см. `fix-bridge-stale-takeover.md`) `setClaudeSessionId(tabId, sessionId, reason)` теперь требует обязательный третий параметр — `SessionWriteReason` sealed union: `bridge` / `autoResume` / `userIntercept` / `userManual` / `timelineChain` / `fork` / `restoredFromDb` / `userRevert` / `unknown`. TypeScript не даст забыть — любой новый call-сайт обязан декларировать почему пишет в общее поле.
+
+При смене значения предыдущий sessionId пушится в `tab.claudeSessionHistory` (cap 5, JSON в SQLite колонке `tabs.claude_session_history`), вместе с reason и timestamp. История переживает рестарт. TabBar context-menu → «Revert Session ›» submenu отображает её с relative time и одним кликом возвращает значение (запишется обратно с `reason: 'userRevert'` — тоже в историю). Это last line of defense, когда защитные слои в bridge watcher'е и `pendingResume` guard'е пропустят wrong write.
+
+Полный список 9 writer'ов и их reason-тэгов — `fact-session-detection.md::Stale bridge files + pendingResume guard` секция «Решение».
+
 ---
 
 ## 6. Session Item Visual Selection

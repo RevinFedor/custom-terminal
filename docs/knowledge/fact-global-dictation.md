@@ -92,6 +92,64 @@ Save-restore clipboard обязательное — без него мы пер�
 
 Возврат `osascript exit code` != 0 = почти всегда **нет Accessibility permission**. Показываем toast в main app через `mainWindow.webContents.send('global-dict:paste-failed', { error })`. После rebuild — проверь [`fact-codesign-tcc.md`](fact-codesign-tcc.md), TCC привязывает grant к code-signing requirement.
 
+## Двойной snapshot target-app (start + stop) + skip-self-activate
+
+`captureFrontmostApp` запускается **дважды** за recording session:
+
+1. **На START** (hotkey idle→recording, или `openMenuWindow`). Сохраняется в `targetAppBundleId`. Это «где юзер был когда нажал».
+2. **На STOP** (внутри `handleFinalTranscript`, после `closeRecWindow()` + 100ms wait). Это «где юзер сейчас, в момент когда мы готовы вставить».
+
+Выбор финального `effective` target'а делается по таблице:
+
+| `liveFront` (stop) | `startCaptured` | `effective` (что активируем) |
+|---|---|---|
+| другое app | — | `liveFront` (вернулся в browser посреди записи → туда и вставляем) |
+| наш app | другое app | `startCaptured` (всё ещё помним где был, лучше чем ничего) |
+| наш app | наш app | `null` (никого не активируем) |
+
+`pasteToFrontmostApp` принимает `effective` аргументом. Если `effective === null` ИЛИ `effective === OWN_BUNDLE_ID` (`com.noted.terminal`) — `tell ... activate` **не выполняется вообще**, Cmd+V уходит в OS-уровневый frontmost (если это мы — ну, паста пойдёт в нас; никакого другого правильного направления у нас нет). Раньше `pasteToFrontmostApp` activate'ило `targetAppBundleId` слепо, и если start-snapshot был наш собственный bundle — мы активировали сами себя, отбирая фокус у любого app куда юзер успел кликнуть посреди записи.
+
+Этот fix покрыл два симптома:
+- *«я нажал alt+\`, потом во время диктовки кликнул в браузер — но вставка всё равно не приходит в браузер, paste куда-то теряется»*. До: `targetAppBundleId === 'com.noted.terminal'` (start был на нас) → activate self → keystroke в нас же → юзер не видит пасту.
+- *«после нескольких диктовок paste «через раз» в правильное app»* — потому что random'но иногда start-capture попадал в нужное app, иногда в нас.
+
+Логи показывают decision-trail: `target decision liveFront="X" startCaptured="Y" effective="Z"`. Если в багрепорте «paste не туда пришёл» — grep'ни эту строчку и сравни decision с тем что юзер ожидал. Принцип переносимый, см. [`methodology/design.md::Re-capture в момент действия, не в момент намерения`](../methodology/design.md).
+
+## `type: 'panel'` + `showInactive()` для focusable:false overlays
+
+Чтобы overlay-окно **физически не могло** активировать наш Electron-процесс, нужны **обе** вещи:
+
+1. **`type: 'panel'`** в BrowserWindow opts. Электронный PR #34388 (Electron ≥21) добавил поддержку `NSWindowStyleMaskNonactivatingPanel` — это уровень AppKit, окно создаётся как NSPanel с non-activating флагом. Plain BrowserWindow (без type) — обычный NSWindow, который macOS уважает `focusable:false` **только частично**: окно всё равно requests key status в момент `show()`/`showInactive()`. Особенно болезненно на Sonoma 14.x: подтверждённый Electron issue #39914 + PR #40307 фиксят `showInactive()` который регрессировал в `[NSApp activate]` для **panel-typed окон только**. Plain BrowserWindow на Sonoma всё равно крадёт фокус через `showInactive`. **Без `type:'panel'` нашa фикс-замена на `showInactive` лечит только Mojave-Ventura, на Sonoma+ симптом возвращается.**
+
+2. **`showInactive()`** вместо `show()`. `show()` под капотом дёргает `[NSApp activateIgnoringOtherApps:YES]` для любого окна. `showInactive()` делает `orderFront:` без activate — с `type:'panel'` это работает как должно (окно появляется, target keeps key).
+
+Применяется для **chipWindow** и **recWindow**. `menuWindow` намеренно остаётся обычным NSWindow (`focusable: true` + `show()`) — popover должен забрать фокус ради `blur` event'а для авто-close.
+
+Порядок вызовов критичен: `setAlwaysOnTop` и `setVisibleOnAllWorkspaces` ставим **до** первого `showInactive`, не после — иначе brief activation flash при reapply panel-style mid-flight.
+
+**Что НЕ помогает альтернативно:**
+- `app.setActivationPolicy('accessory')` + `app.dock.hide()` — это Raycast/Wisper-стиль, превращает приложение в menubar-only agent без Dock icon и без app menu. Наше Noted Terminal — полноценное приложение с Dock icon и settings, эту policy менять нельзя. Не нужно для overlay-фикса если есть `type:'panel'`.
+- `setActivationPolicy('prohibited')` — Apple Developer Forums thread 67584: «result of setActivationPolicy('.regular') after .prohibited is false» — не транзитивно обратно к regular. Не использовать.
+
+Принцип переносимый, см. [`methodology/design.md::NSPanel vs NSWindow для overlays`](../methodology/design.md). Reference: Electron PR #34388, PR #40307, issue #29644, issue #39914.
+
+## Chip-width shrink: idle 56px, recording 220px
+
+ChipWindow в idle режиме ужимается до **56×56** (только круглая mic-кнопка + 6px padding каждой стороны), в recording разворачивается до **220×56** (place для X / Auto-Enter pill / Stop row). Без этого: окно всегда 220×56, в idle юзеру видна только 44px кнопка в центре, но клик в ПУСТУЮ область вокруг неё тоже бьёт по нашему NSWindow → macOS активирует наш app → Noted Terminal вылазит поверх browser'а ровно от того что юзер «промахнулся мимо кнопки». Юзер репортил: *«когда я кликаю рядом с кнопкой микрофона, у меня активируется кастом терминал, то есть получается, он открывается поверх всех окон»*.
+
+Реализация:
+- `chipWidthForState(state)` → 220 для `recording`/`delivering`, 56 для `idle`.
+- `reapplyChipBounds()` вызывается из `setState()` на каждом state transition — `setBounds` с center-preservation (новый `x = cx - newWidth/2`, чтобы визуальный якорь — центр кнопки — оставался на месте).
+- `chipPos` хранится как `cxPct/cyPct` (CENTER, не TOP-LEFT) — позиция инвариантна к смене ширины окна.
+- `computeChipPosition(width)` принимает текущую ширину аргументом для правильного clamp'а в workArea.
+- `openMenuWindow` и `createRecWindow` теперь читают chip bounds через `getBounds()` (динамическая ширина), не константу — anchor'инг по chip-center, не по правому краю.
+
+Side-benefit: меньше chip в idle = меньше визуального присутствия, ровно круглая кнопка. Transition 56→220 при старте recording визуально читается как «раскрытие row кнопок», не как баг.
+
+**Альтернативы которые отброшены:**
+- `setIgnoreMouseEvents(true, {forward: true})` + динамический hit-test через mousemove listener: рабочий cookbook pattern для chromeless HUD, но добавляет постоянный mousemove + IPC roundtrip, и в recording-row 220×56 всё равно остаются зазоры между тремя кнопками которые промахом активируют app.
+- Полностью клик-сквозной чип через CSS `pointer-events: none` на «пустом» div и `auto` на кнопке: на нашем стеке React хук'и хорошо работают с DOM, но Electron определяет hit-test через NSWindow geometry, не через CSS pointer-events — пустая прозрачная область всё равно ловит NSWindow click.
+
 ## Accessibility permission gate
 
 `systemPreferences.isTrustedAccessibilityClient(false)` — `false` означает «not granted yet, but **don't prompt**». В UI settings показываем плашку «требуется разрешение» + две кнопки: «Открыть System Settings» (`x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility`) и «Проверить разрешение» (`isTrustedAccessibilityClient(true)` — last arg `true` триггерит OS prompt **один раз**, если ещё не было решено).
@@ -241,6 +299,10 @@ win.webContents.on('console-message', (_e, level, message, line, source) => {
 - **Triggering paste через `nut.js` / native module** — `osascript` встроен в macOS, нулевая зависимость. Trade-off: macOS-only.
 - **Один общий BrowserWindow для chip+recording** — `setBounds`+`setIgnoreMouseEvents` race-условия на дальних рабочих столах ловить дороже чем держать независимые окна.
 - **`movable: true` на chip** — macOS drag-region перехватывает клики у overlap'ающих button-element'ов. Renderer-side pointer drag через mousedown→mousemove→mouseup со страховкой `e.buttons===0`.
+- **`show()` для chipWindow/recWindow** — `show()` на macOS делает `[NSApp activateIgnoringOtherApps:YES]` даже для focusable:false окна, и hotkey визуально крадёт фокус у browser/terminal. Фикс: `showInactive()` (только для тех окон, которым не нужен focus; menuWindow остаётся на `show()` ради blur-event).
+- **`focusable:false` без `type:'panel'`** — `focusable:false` уважается macOS только частично для plain NSWindow. Plain BrowserWindow на Sonoma+ всё равно requests key status даже через `showInactive`. Фикс: `type:'panel'` в opts — добавляет `NSWindowStyleMaskNonactivatingPanel`, окно физически не может становиться key. Без этого `showInactive()` лечит фокус-стил только до Sonoma — на 14+ симптом возвращается (Electron issue #39914).
+- **chipWindow всегда 220×56** — даже в idle когда видна только круглая 44px кнопка. Прозрачная область вокруг кнопки всё равно NSWindow-rect, click в неё активирует наш app. Фикс: `chipWidthForState()` + `reapplyChipBounds()` на `setState`, idle ужимается до 56×56, recording разворачивается до 220×56 с center-preservation.
+- **Single capture target-app на START** — если юзер посреди записи кликает в другой app, paste всё равно activate'ит изначальный target (часто self → Cmd+V в нас). Фикс: dual snapshot (start + stop), `effective = liveFront!=ours ? liveFront : startCaptured!=ours ? startCaptured : null`, skip `tell activate` если `effective` is null или our own bundle.
 
 ## Path-зависимости
 
