@@ -101,11 +101,28 @@ let getMainWindow = () => null;
 let targetAppBundleId = null;
 
 // Dimensions — single source of truth.
-const CHIP_W = 220;          // wide enough to fit the recording row (X | autoEnter | Stop)
+//
+// Two widths: IDLE shrinks to the round button + small padding so clicks
+// AROUND the visible button don't land inside our NSWindow (which would
+// activate our app on macOS, raising the app over the user's browser — a
+// reported bug). RECORDING expands to fit the three-button row.
+//
+// chipPos is stored as cx/cyPct (CENTER of the chip) so the position is
+// invariant under width changes — only `computeChipPosition` reads it and
+// reapplyChipBounds() rewrites x to keep that center constant on width
+// transitions.
+const CHIP_W_IDLE = 56;      // 44 button + 6px transparent padding each side
+const CHIP_W_REC = 220;      // wide enough for X | Auto-Enter pill | Stop
 const CHIP_H = 56;
 const CHIP_BUTTON_SIZE = 44; // diameter of the idle-mode round button (centered)
 const MENU_W = 200;
 const MENU_H = 168;          // 3 buttons × ~50px + padding
+
+// What chip width to use for a given state. recording AND delivering both
+// keep the wide row visible (the row is still on-screen during paste).
+function chipWidthForState(s) {
+  return (s === 'recording' || s === 'delivering') ? CHIP_W_REC : CHIP_W_IDLE;
+}
 
 function ensureDir() {
   try { fs.mkdirSync(STORAGE_DIR, { recursive: true }); } catch {}
@@ -233,7 +250,8 @@ function loadRendererPage(win, name) {
   });
 }
 
-function computeChipPosition() {
+function computeChipPosition(width) {
+  const w = width || CHIP_W_IDLE;
   // Preferred: center-based pct + remembered display id.
   // Fall back through: old corner-based pct → old absolute coords → default.
   if (settings.chipPos && typeof settings.chipPos.cxPct === 'number') {
@@ -243,9 +261,9 @@ function computeChipPosition() {
     const wa = display.workArea;
     const cx = wa.x + settings.chipPos.cxPct * wa.width;
     const cy = wa.y + settings.chipPos.cyPct * wa.height;
-    let x = Math.round(cx - CHIP_W / 2);
+    let x = Math.round(cx - w / 2);
     let y = Math.round(cy - CHIP_H / 2);
-    x = Math.max(wa.x, Math.min(wa.x + wa.width - CHIP_W, x));
+    x = Math.max(wa.x, Math.min(wa.x + wa.width - w, x));
     y = Math.max(wa.y, Math.min(wa.y + wa.height - CHIP_H, y));
     return { x, y };
   }
@@ -255,7 +273,7 @@ function computeChipPosition() {
     const wa = display.workArea;
     let x = Math.round(wa.x + settings.chipPos.xPct * wa.width);
     let y = Math.round(wa.y + settings.chipPos.yPct * wa.height);
-    x = Math.max(wa.x, Math.min(wa.x + wa.width - CHIP_W, x));
+    x = Math.max(wa.x, Math.min(wa.x + wa.width - w, x));
     y = Math.max(wa.y, Math.min(wa.y + wa.height - CHIP_H, y));
     return { x, y };
   }
@@ -265,20 +283,53 @@ function computeChipPosition() {
   }
   // Default: bottom-center of primary display, just above the Dock.
   const display = screen.getPrimaryDisplay();
-  const { x: dx, y: dy, width, height } = display.workArea;
+  const { x: dx, y: dy, width: dw, height: dh } = display.workArea;
   return {
-    x: Math.round(dx + (width - CHIP_W) / 2),
-    y: Math.round(dy + height - CHIP_H - 24),
+    x: Math.round(dx + (dw - w) / 2),
+    y: Math.round(dy + dh - CHIP_H - 24),
   };
+}
+
+// Resize chipWindow to the width that matches the current state (idle/rec),
+// keeping the CENTER constant — the visual anchor stays put even when
+// expanding to the recording row or shrinking back to the round button.
+// Called from setState() on every state transition. Clamps to display
+// workArea so the wider recording row can't spill off-screen.
+function reapplyChipBounds() {
+  if (!chipWindow || chipWindow.isDestroyed()) return;
+  const w = chipWidthForState(state);
+  try {
+    const b = chipWindow.getBounds();
+    if (b.width === w) return;
+    const cx = b.x + b.width / 2;
+    let newX = Math.round(cx - w / 2);
+    const display = screen.getDisplayNearestPoint({ x: cx, y: b.y + b.height / 2 });
+    const wa = display.workArea;
+    newX = Math.max(wa.x, Math.min(wa.x + wa.width - w, newX));
+    chipWindow.setBounds({ x: newX, y: b.y, width: w, height: CHIP_H }, false);
+    console.log('[GlobalDict] reapplyChipBounds state=' + state + ' width=' + w + ' x=' + newX);
+  } catch (e) { console.error('[GlobalDict] reapplyChipBounds failed: ' + e.message); }
 }
 
 function createChipWindow() {
   if (chipWindow && !chipWindow.isDestroyed()) return chipWindow;
-  const pos = computeChipPosition();
-  console.log('[GlobalDict] createChipWindow at x=' + pos.x + ' y=' + pos.y + ' size=' + CHIP_W + 'x' + CHIP_H);
+  // Initial width matches the initial state — always idle on chip creation.
+  const initialW = chipWidthForState(state);
+  const pos = computeChipPosition(initialW);
+  console.log('[GlobalDict] createChipWindow at x=' + pos.x + ' y=' + pos.y + ' size=' + initialW + 'x' + CHIP_H);
   chipWindow = new BrowserWindow({
-    width: CHIP_W, height: CHIP_H,
+    width: initialW, height: CHIP_H,
     x: pos.x, y: pos.y,
+    // type:'panel' — adds NSWindowStyleMaskNonactivatingPanel on macOS so
+    // the window cannot become key. Without this, focusable:false is only
+    // partially honored by macOS (a plain NSWindow still requests key
+    // status, and on Sonoma 14+ even `showInactive` regressed to call
+    // activateIgnoringOtherApps — fixed for panel-typed windows in
+    // Electron PR #40307, requires Electron ≥ 28.2.3). With type:'panel'
+    // the previously-frontmost app keeps its blinking cursor when our
+    // overlay appears. Reference: electron/electron PR #34388 (panel
+    // support), PR #40307 (Sonoma activation regression fix).
+    type: 'panel',
     frame: false,
     transparent: true,
     resizable: false,
@@ -304,13 +355,21 @@ function createChipWindow() {
       backgroundThrottling: false,
     },
   });
+  // setAlwaysOnTop + setVisibleOnAllWorkspaces MUST run BEFORE the first
+  // showInactive — calling them after the window is on-screen can cause a
+  // brief activation flash where the panel-style is reapplied mid-flight.
   chipWindow.setAlwaysOnTop(true, 'floating', 1);
   try { chipWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true }); } catch {}
   chipWindow.on('closed', () => { console.log('[GlobalDict] chipWindow closed'); chipWindow = null; });
   loadRendererPage(chipWindow, 'global-dictation-chip');
   chipWindow.once('ready-to-show', () => {
     console.log('[GlobalDict] chipWindow ready-to-show, will show=' + (settings.showChip && settings.enabled));
-    if (settings.showChip && settings.enabled) chipWindow.show();
+    // showInactive() — NOT show(). On macOS BrowserWindow.show() implicitly
+    // calls [NSApp activateIgnoringOtherApps:YES], which raises our process
+    // to frontmost even when the window is focusable:false. The visible
+    // symptom is "cursor leaves the browser when the chip first appears".
+    // showInactive() orders the window front WITHOUT app activation.
+    if (settings.showChip && settings.enabled) chipWindow.showInactive();
   });
   return chipWindow;
 }
@@ -351,12 +410,14 @@ function openMenuWindow() {
       targetAppBundleId = bid;
     }
   });
-  const [cx, cy] = chipWindow.getPosition();
-  // Anchor right edge of menu to right edge of chip; menu sits ABOVE chip.
+  // Anchor menu CENTER to chip CENTER (chip width varies between idle 56 and
+  // recording 220 — center-anchored stays put). Menu sits ABOVE chip.
+  const chipBounds = chipWindow.getBounds();
+  const chipCx = chipBounds.x + chipBounds.width / 2;
   const gap = Math.max(0, settings.menuGap || 0);
-  const x = Math.max(8, cx + CHIP_W - MENU_W);
-  const y = Math.max(8, cy - MENU_H - gap);
-  console.log('[GlobalDict] openMenuWindow at x=' + x + ' y=' + y + ' gap=' + gap);
+  const x = Math.max(8, Math.round(chipCx - MENU_W / 2));
+  const y = Math.max(8, chipBounds.y - MENU_H - gap);
+  console.log('[GlobalDict] openMenuWindow at x=' + x + ' y=' + y + ' gap=' + gap + ' chipCx=' + chipCx);
   menuWindow = new BrowserWindow({
     width: MENU_W, height: MENU_H,
     x, y,
@@ -430,16 +491,24 @@ function createRecWindow() {
   let y = Math.round(dy + height - H - CHIP_H - 32);
   if (chipWindow && !chipWindow.isDestroyed()) {
     try {
-      const [cx, cy] = chipWindow.getPosition();
+      // Center rec window above chip CENTER (chip width varies with state).
+      const cb = chipWindow.getBounds();
+      const chipCx = cb.x + cb.width / 2;
       const recGap = Math.max(0, settings.recWindowGap || 0);
-      x = Math.max(dx + 8, Math.min(dx + width - W - 8, cx + CHIP_W / 2 - W / 2));
-      y = Math.max(dy + 8, cy - H - recGap);
+      x = Math.max(dx + 8, Math.min(dx + width - W - 8, Math.round(chipCx - W / 2)));
+      y = Math.max(dy + 8, cb.y - H - recGap);
     } catch {}
   }
   console.log('[GlobalDict] createRecWindow at x=' + x + ' y=' + y + ' initialSize=' + W + 'x' + H);
   recWindow = new BrowserWindow({
     width: W, height: H,
     x, y,
+    // type:'panel' — same rationale as in createChipWindow. Without this
+    // the recording window steals focus from the user's target app even
+    // with focusable:false (NSWindow still gets requested as key on plain
+    // BrowserWindow; on Sonoma showInactive regresses to activate
+    // unless the window is a panel-typed window — Electron PR #40307).
+    type: 'panel',
     frame: false,
     transparent: true,
     resizable: false,
@@ -458,11 +527,15 @@ function createRecWindow() {
       backgroundThrottling: false,
     },
   });
+  // Set before showInactive — see chipWindow comment.
   recWindow.setAlwaysOnTop(true, 'screen-saver', 2);
   try { recWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true }); } catch {}
   recWindow.on('closed', () => { console.log('[GlobalDict] recWindow closed'); recWindow = null; });
   loadRendererPage(recWindow, 'global-dictation-rec');
-  recWindow.once('ready-to-show', () => recWindow.show());
+  // showInactive() — see chipWindow comment. Showing this with show() would
+  // activate our process and the dictation hotkey would visibly steal focus
+  // from the browser/terminal the user is dictating into.
+  recWindow.once('ready-to-show', () => recWindow.showInactive());
   return recWindow;
 }
 
@@ -485,6 +558,11 @@ function broadcastState() {
 function setState(next) {
   if (state === next) return;
   state = next;
+  // Width transitions between idle 56 and recording 220 — resync window
+  // bounds so the click-catching NSWindow rect shrinks back to the visible
+  // round button after recording ends, otherwise clicks NEAR the mic icon
+  // would still hit our transparent area and macOS would activate our app.
+  reapplyChipBounds();
   broadcastState();
 }
 
@@ -544,6 +622,12 @@ function toggleRecording() {
 // our text, presses Cmd+V (and Return if autoEnter), then restores the
 // clipboard half a second later. Requires Accessibility permission — without
 // it, `osascript` exits non-zero and we surface a toast via main window.
+
+// Our own bundle id. We never want to `tell ... to activate` ourselves —
+// it has no effect (we're already running) AND it cancels the user's
+// chance to manually click back to the real target before paste fires.
+const OWN_BUNDLE_ID = 'com.noted.terminal';
+
 // Synchronous-ish helper: ask System Events which app is frontmost, return
 // its bundle identifier. Used to snapshot the target app *before* any of
 // our windows could grab focus.
@@ -572,8 +656,8 @@ function captureFrontmostApp() {
   });
 }
 
-function pasteToFrontmostApp(text, autoEnter) {
-  console.log('[GlobalDict] pasteToFrontmostApp ENTER len=' + (text||'').length + ' autoEnter=' + autoEnter);
+function pasteToFrontmostApp(text, autoEnter, effectiveTargetBundle) {
+  console.log('[GlobalDict] pasteToFrontmostApp ENTER len=' + (text||'').length + ' autoEnter=' + autoEnter + ' target=' + JSON.stringify(effectiveTargetBundle));
   if (!text || !text.trim()) {
     console.log('[GlobalDict] pasteToFrontmostApp: empty text, skipping');
     return Promise.resolve({ ok: true, skipped: true });
@@ -592,17 +676,16 @@ function pasteToFrontmostApp(text, autoEnter) {
       console.error('[GlobalDict] pasteToFrontmostApp: clipboard write FAILED: ' + e.message);
       return resolve({ ok: false, error: 'clipboard write failed: ' + e.message });
     }
-    // Build script. If we captured the target app's bundle id before
-    // recording started, activate it FIRST so the keystroke lands there
-    // (defensive against our own chip/menu having stolen focus).
+    // Build script. Only `tell ... activate` if the target is a real other
+    // app — never activate ourselves (it's a no-op for the running app and
+    // it would not "fix" anything since we're the wrong destination anyway).
     const lines = [];
-    if (targetAppBundleId) {
-      // The standard form is: tell application id "com.foo" to activate.
-      // Escape any quotes in the bundle id (paranoid — bundle ids never have
-      // them, but cheap insurance).
-      const safeBid = String(targetAppBundleId).replace(/"/g, '\\"');
+    if (effectiveTargetBundle && effectiveTargetBundle !== OWN_BUNDLE_ID) {
+      const safeBid = String(effectiveTargetBundle).replace(/"/g, '\\"');
       lines.push(`tell application id "${safeBid}" to activate`);
       lines.push('delay 0.08');   // give WindowServer time to flip frontmost
+    } else {
+      console.log('[GlobalDict] pasteToFrontmostApp: NOT activating any app (target=' + JSON.stringify(effectiveTargetBundle) + ' — own/null)');
     }
     lines.push('tell application "System Events" to keystroke "v" using command down');
     if (autoEnter) {
@@ -610,7 +693,7 @@ function pasteToFrontmostApp(text, autoEnter) {
       lines.push('tell application "System Events" to key code 36');  // 36 = Return
     }
     const script = lines.join('\n');
-    console.log('[GlobalDict] pasteToFrontmostApp: spawning osascript, targetBundle=' + JSON.stringify(targetAppBundleId));
+    console.log('[GlobalDict] pasteToFrontmostApp: spawning osascript');
     const child = spawn('osascript', ['-e', script]);
     let stderr = '';
     child.stderr.on('data', (d) => { stderr += d.toString(); });
@@ -655,10 +738,34 @@ async function handleFinalTranscript(text) {
   // before we trigger Cmd+V. 80ms is enough on M-series Macs.
   console.log('[GlobalDict] handleFinalTranscript: waiting 100ms for focus to settle');
   await new Promise(r => setTimeout(r, 100));
+  // Re-capture the LIVE frontmost app. The user may have clicked into a
+  // different app during recording — in that case the start-time snapshot
+  // (`targetAppBundleId`, captured in registerHotkey() on idle→recording)
+  // is stale and points to whoever was frontmost when they pressed the
+  // hotkey, not where they want the paste to land.
+  //
+  // Decision table for effective target:
+  //   liveFront != own  → liveFront     (user's current focus wins)
+  //   liveFront == own  → startCapture if startCapture != own, else null
+  //   live missing      → fall back to startCapture
+  //
+  // When the effective target is null OR own, pasteToFrontmostApp skips
+  // `tell ... activate` entirely — Cmd+V then goes to whoever IS frontmost
+  // at the OS level (which is the only correct destination we can reach).
+  const liveFront = await captureFrontmostApp();
+  let effective = null;
+  if (liveFront && liveFront !== OWN_BUNDLE_ID) {
+    effective = liveFront;
+  } else if (targetAppBundleId && targetAppBundleId !== OWN_BUNDLE_ID) {
+    effective = targetAppBundleId;
+  } else {
+    effective = null;
+  }
+  console.log('[GlobalDict] handleFinalTranscript: target decision liveFront=' + JSON.stringify(liveFront) + ' startCaptured=' + JSON.stringify(targetAppBundleId) + ' effective=' + JSON.stringify(effective));
   // Use the LIVE per-session toggle (sessionAutoEnter), not the default.
   // User may have flipped the pill during recording.
   console.log('[GlobalDict] handleFinalTranscript: calling pasteToFrontmostApp autoEnter=' + sessionAutoEnter);
-  const result = await pasteToFrontmostApp(pendingFinalText, sessionAutoEnter);
+  const result = await pasteToFrontmostApp(pendingFinalText, sessionAutoEnter, effective);
   console.log('[GlobalDict] handleFinalTranscript: paste result=' + JSON.stringify(result));
   if (!result.ok) {
     notifyMain('global-dict:paste-failed', { error: result.error });
@@ -773,7 +880,10 @@ function applyChipVisibility() {
   if (!chipWindow || chipWindow.isDestroyed()) {
     createChipWindow();
   } else {
-    try { chipWindow.show(); } catch {}
+    // showInactive() not show() — same reason as in createChipWindow:
+    // .show() activates our NSApp on macOS and steals focus from the user's
+    // current frontmost (browser/terminal).
+    try { chipWindow.showInactive(); } catch {}
   }
 }
 

@@ -1532,6 +1532,52 @@ Captured хоткей в UI-поле «нажми клавиши» собира�
 
 Применимо к любому floating overlay в desktop-app: voice/screen capture HUDs, command palette если она plays nice с тем что юзер делает в IDE, persistent dock-overlay, sidebar который не должен прерывать active text input. В custom-terminal — `knowledge/fact-global-dictation.md::Почему focusable:false`.
 
+## NSPanel vs NSWindow для overlays — focusable:false недостаточно на macOS
+
+`focusable:false` в Electron — **частичная мера**. Под капотом BrowserWindow это NSWindow, и macOS уважает «не становись key» только когда window — `NSPanel` с `NSWindowStyleMaskNonactivatingPanel`. Plain NSWindow всё равно requests key status в момент `show()`/`showInactive()` через Chromium's `views::Widget::Show()` → `[NSWindow makeKeyAndOrderFront:]`. Особенно болезненно на Sonoma 14.x: regression `showInactive()` который начал вызывать `[NSApp activate]` для **panel-typed окон только** был исправлен в Electron PR #40307 (мерж в 28.2.3+, 27.x.y, 26.x.y) — но plain BrowserWindow на Sonoma всё равно крадёт фокус через `showInactive`.
+
+Решение в Electron: `new BrowserWindow({ type: 'panel', focusable: false, show: false, ... })` + `win.showInactive()`. PR #34388 (Electron ≥21) добавил поддержку panel-style mask на runtime. С `type:'panel'` окно физически не может становиться key — previously-frontmost app keeps its blinking cursor when our overlay appears.
+
+Минимальная триада для overlay'я в Electron:
+```js
+const overlay = new BrowserWindow({
+  type: 'panel',                                          // critical
+  focusable: false,                                       // double-belt
+  acceptFirstMouse: true,                                 // click without activate
+  alwaysOnTop: true,
+  show: false,
+  /* ... */
+});
+overlay.setAlwaysOnTop(true, 'screen-saver');             // before showInactive
+overlay.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+overlay.showInactive();                                   // never show() / focus()
+```
+
+`show()` всегда вызывает `[NSApp activateIgnoringOtherApps:YES]` — никогда не использовать для inactive-overlay'ев. Если окну **нужен** `blur` event (popover, dropdown) — это другой класс окон, можно plain BrowserWindow с `focusable:true` + `show()`. Их не смешивать со status overlays.
+
+`app.setActivationPolicy('accessory')` + `app.dock.hide()` (Raycast/Wisper-стиль) — отдельная история, нужно **только** для menubar-only agents без Dock icon и app menu. Для полноценных приложений с собственным UI (Noted Terminal, IDE-плагины) эту policy не трогать — `type:'panel'` для overlay'ев достаточно. Reference: Electron PR #34388, PR #40307; issue #29644, #39914.
+
+Применимо к любому Electron-приложению которое делает HUD/overlay-окна (voice capture, snippet expander, color picker, screen ruler, persistent status). В custom-terminal — `knowledge/fact-global-dictation.md::type: 'panel' + showInactive()`.
+
+## Re-capture в момент действия, не в момент намерения
+
+Cross-app действия которые требуют знать «куда мы вставляем» (paste, type-out, screenshot to app, drag-out) — фиксировать target в момент **исполнения** действия, не в момент когда юзер начал последовательность шагов. Если между триггером и финалом проходит секунды (recording session, slow upload, confirmation modal), пользователь успевает переключить контекст; начальный snapshot устаревает.
+
+Конкретное воплощение в session: первая версия global dictation капчила frontmost-app один раз — на старте recording (idle→recording hotkey). Юзер во время записи переключался в браузер чтобы прочесть текст, потом нажимал stop — paste activate'ило **исходное app** (часто наше же Noted Terminal, потому что юзер триггерил hotkey пока мы были frontmost) → keystroke улетал куда-то в нас, юзер видел «paste не работает». Фикс — **двойной snapshot**: фиксируем start-frontmost (даёт fallback если live-capture пустой), и **в момент paste** заново читаем live-frontmost через osascript. Decision-rule: `live!=ours ? live : start!=ours ? start : null`. Если effective = null или our own bundle — `tell activate` не выполняем, keystroke уходит в OS-уровневый frontmost (пусть это будет «ничего» или «мы» — лучше чем активировать неправильный target).
+
+Применимо к: paste-to-frontmost, drag-out gestures (фиксируется drop-target в moveend, не mousedown), screenshot-to-app (target определяется когда screenshot captured, не когда юзер открыл popup-меню), AppleScript automation, любой «между намерением и actions есть user-controlled delay». Юзер: *«даже если во время записи я обратно поставлю курсор в браузер, у меня вставка почему-то всё равно не происходит»* — симптом единственного start-time snapshot'а. В custom-terminal — `knowledge/fact-global-dictation.md::Двойной snapshot target-app`.
+
+## Прозрачный overlay = прозрачный hit-test, но НЕ прозрачный NSWindow rect
+
+CSS-прозрачные участки внутри `BrowserWindow({ transparent: true })` визуально пустые, но **NSWindow всё ещё ловит click внутри своего bounds-rect**. macOS не различает прозрачную и непрозрачную часть transparent BrowserWindow для целей window activation — click в любую точку 220×56 rect'а триггерит app-level activation если окно не `type:'panel'`. Симптом: юзер видит круглую mic-кнопку 44×44 в центре прозрачного chip'а 220×56, кликает рядом с кнопкой (в визуально-пустую область) → наш Electron app встаёт поверх browser'а. Юзер: *«когда я кликаю рядом с кнопкой микрофона, активируется кастом терминал»*.
+
+Решения по эффективности:
+1. **(лучший) `type:'panel'`** — окно физически не активирует app, click в прозрачную часть ничего не делает. См. секцию выше.
+2. **Shrink окно до размера видимого UI** — chip-window 56×56 в idle (только кнопка), 220×56 только в recording-mode где видна row. `setBounds` на state transition с center-preservation. Окно физически меньше → меньше mis-clicks.
+3. **`setIgnoreMouseEvents(true, {forward:true})`** + динамический hit-test через mousemove listener — окно прозрачное и для кликов, JS вручную переключает hit-region в зависимости от того, под чем курсор. Cookbook pattern из Electron docs, но требует постоянного mousemove listener + IPC roundtrip; в нашем случае избыточно (recording-row 220×56 всё равно имеет зазоры между кнопками).
+
+Принцип: **видимый размер UI ≠ click-catching область** для transparent overlay'я. Либо делаем окно non-activating (panel), либо подгоняем bounds под визуальный UI, либо переключаем mouse-event passthrough. Применимо к любому transparent floating overlay в Electron / native macOS. В custom-terminal — `knowledge/fact-global-dictation.md::Chip-width shrink`.
+
 ## Sync state capture в gesture handler — async = race с mouseup
 
 Любой mousedown-handler начинающий gesture (drag, resize, lasso, marquee) обязан **синхронно в том же frame** установить active-flag в ref/state. Если данные нужно подтянуть из другого процесса/IPC — кешировать заранее или читать из синхронных window-properties (`window.screenX`, `getBoundingClientRect`), не `await` внутри handler'а.
@@ -1569,3 +1615,9 @@ Captured хоткей в UI-поле «нажми клавиши» собира�
 `cursor: pointer` — affordance клика (как ссылка/кнопка). На элементах которые **в первую очередь** drag/press-and-hold targets (chip, draggable handle, scroll-thumb-knob, custom slider) `pointer` создаёт ложное ожидание «нажми и отпусти, что-то произойдёт». Юзер кликает, ничего не происходит (потому что primary action — drag, не click), мысленно списывает в «не работает». Правильно — `cursor: default` (или `cursor: grab` → `grabbing` если хочется явно сигналить drag-affordance, но это уже шум для простых случаев). Юзер: *«курсор поинтеру по этой штуке никогда делать не надо»* — про главную кнопку чипа с press-and-hold drag.
 
 Применимо к dock-overlays, custom drag handles, pill-widgets которые двигаются мышью, любому UI элементу где click — побочное действие, а drag — основное. См. также `methodology/design.md::Resizable side panel`.
+
+## Масштаб рефактора = масштабу проблемы
+
+Запрос «отрефактори всё, чтобы было детерминированно и по SOLID» — частый ответ на каскад связанных багов в одной подсистеме. Соблазн ввести **единую новую абстракцию** (Service, Manager, Coordinator), через которую теперь будут идти все писатели общего поля, велик — «зато архитектурно правильно». Реальный конфликт почти всегда **локальнее** запроса. Хороший паттерн действия — сначала audit (кто, когда, откуда пишет в спорное поле); потом смотрим **не сколько** writer'ов, а **сколько из них реально конфликтуют между собой**. Большинство — уже изолированы доменом (user-action handler, restore-from-DB, fork flow, manual entry) и просто не пересекаются по времени или контексту.
+
+Точечный фикс конфликтующей пары + контракт декларации источника (`reason: SealedUnion`) + история последних значений как safety net обычно даёт больше пользы чем service-слой над семью хорошо себя ведущими call-сайтами. Service на 7 writer'ов навязывает ceremony чистым пяти, чтобы починить грязные два — net negative по anti-over-engineering. Записать решение «почему не сделали глубже» в incident-документ обязательно: следующая итерация бага не должна заново проходить путь «давайте сделаем SessionService». В этом проекте audit 7 writer'ов `tab.claudeSessionId` показал что конфликтуют только bridge↔AutoResume, хирургического фикса хватило; см. `knowledge/fix-bridge-stale-takeover.md`.

@@ -136,3 +136,34 @@ Liveness-guard на трёх уровнях, общий probe — `findSessionFi
 
 ### Что НЕ ломаем
 `latestSessionId` overwrite остаётся легитимным механизмом для Clear Context chains: parent JSONL заканчивается bridge entry на child, Timeline корректно прыгает вперёд в child, юзеру не нужно вручную менять таб. Guard срабатывает только когда цепочка указывает в пустоту.
+
+## Fix: Stale bridge files + pendingResume guard
+
+### Симптомы
+- AutoResume сразу после рестарта приложения пишет `claude --resume <correctSid>` в новый PTY, и через 1-2 секунды claudeSessionId таба «сам собой» меняется на чужой UUID — часто на сессию из этого же проекта **двухмесячной давности**.
+- Timeline затем фейлит с `[SessionChain] File not found for: <foreignSid>` и `[Timeline:Backtrace] No lastRecord for session: <foreignSid>`.
+- Юзер вручную делает `claude --resume <X>` несколько раз, перебирая возможные UUID — каждая попытка перетирает claudeSessionId, история теряется без следа.
+
+### Природа бага
+Claude CLI **никогда не удаляет** свои bridge-файлы `~/.claude/bridge/<sid>.json` после exit, они копятся годами в одной директории с активными. Наш `processFile()` после рестарта Electron'а делает initial scan всех файлов в директории — встречает древнюю запись с `ppid` от давно умершего процесса. `ps -p <ppid> -o ppid=` неожиданно возвращает валидный родительский PID, потому что **ОС переиспользовала номер** для свежего shell'а нашей же только что созданной вкладки. Path-prefix tolerance из `Bridge:CwdGuard` пропускает mismatch (bridge.cwd = parent project, tabCwd = subdirectory — одна ветка ФС), и `claude:session-detected` уезжает в renderer с мёртвым sessionId, до того как реальный resumed claude успел дописать свой bridge.json.
+
+Дополнительный путь race: рендерер слепо доверяет любому `claude:session-detected` IPC. Между моментом когда AutoResume записал `claude --resume <Y>` в PTY и моментом когда реальный bridge file для `<Y>` появится на диске — окно 1-3 секунды, в которое любой stale bridge с матчем по PID-tree успевает выиграть гонку.
+
+### Решение (5 слоёв)
+Все защиты обязательны вместе — каждая закрывает свою часть отказа, по отдельности дыры остаются.
+
+1. **`processFile()` — transcript existence probe.** `fs.existsSync(data.transcript_path)` — если JSONL удалён вручную или сессия была вычищена, bridge.json — tombstone, skip. Лог `[Bridge:DeadTranscript] <file> references missing JSONL — ignoring forever`, dedupe через `bridgeStaleLogged` Set.
+2. **`processFile()` — `updated_at` freshness probe.** `now - data.updated_at > BRIDGE_STALE_SECONDS` (600s) → skip. Живой Claude переписывает bridge.json после каждого assistant turn, 10 минут без апдейта = процесс умер.
+3. **`processFile()` — command-name validation.** `ps -p <ppid> -o ppid=,command=`, regex по `claude` в commandline. Без этого PID reuse матчит случайные процессы. Лог `[Bridge:NotClaude] ppid=N command="..." — PID reuse, ignoring`.
+4. **`processFile()` — убран `terminalProjects.set(tabId, bridge.cwd)` в path-drift ветке.** Раньше при принятии cwd-drift событие overwrite'ило canonical tab cwd на cwd зомби — следующие проверки становились ещё слабее. Теперь drift принимается **только для текущего вызова**, canonical cwd таба не трогается.
+5. **`pendingResume` Map (`src/renderer/utils/pendingResume.ts`).** Любой код-path, пишущий `claude --resume <X>` в PTY, обязан вызвать `markPendingResume(tabId, X)`. `Terminal.tsx::handleSessionDetected` дропает bridge events с sessionId ≠ pending в течение 15 секунд. Wired в 6 точках: AutoResume (App.tsx), Claude Intercept Case 5 + Case 2 (Terminal.tsx), fork flows ×2, и сам bridge-success path очищает флаг.
+
+### Last line of defense: claude_session_history
+Колонка `tabs.claude_session_history TEXT` (JSON, cap 5 entries `{sessionId, reason, at}`) пишется автоматически когда `setClaudeSessionId(tabId, newSid, reason)` меняет значение. Reason — `SessionWriteReason` sealed union: `bridge` / `autoResume` / `userIntercept` / `userManual` / `timelineChain` / `fork` / `restoredFromDb` / `userRevert` / `unknown`. TabBar context-menu → «Revert Session ›» submenu показывает historystack с reason'ом и относительным временем каждой записи, один клик возвращает значение. Это страховка: если все 5 защитных слоёв всё-таки пропустят wrong write, юзер откатывается одним кликом, не grep'ая production.log.
+
+### Связанные failure modes
+- `## Fix: Bridge CWD Guard` (выше) — overwrite от **foreign-cwd resume**, не от stale file. Срабатывает когда юзер сознательно делает `claude --resume <chuzhoy-sid>` в `cd /tmp`.
+- `## Fix: Dead session_links + chain resolve trap` (выше) — overwrite от **Timeline chain resolver**, не от bridge. Срабатывает когда в SQLite `session_links` есть мёртвые child UUID без JSONL.
+- Все три — одна общая категория: «автоматический writer перетирает sessionId таба без подтверждения». Защитные слои разные, но контракт один: `setClaudeSessionId` теперь требует `reason: SessionWriteReason` от любого нового call-сайта (sealed union — TS не даст забыть).
+
+Полный incident report (UTC хронология 2026-05-18, root cause analysis, обоснование «почему не SessionService») — `fix-bridge-stale-takeover.md`. Принцип «масштаб рефактора = масштабу проблемы» — `methodology/design.md`.
