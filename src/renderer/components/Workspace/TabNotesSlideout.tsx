@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import { MarkdownEditor } from '@gt-editor/markdown-editor';
 import '@gt-editor/markdown-editor/styles.css';
+import type { EditorView } from '@codemirror/view';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { generateAITitle } from '../../utils/generateAITitle';
@@ -67,9 +68,90 @@ export default function TabNotesSlideout() {
     if (activeTabId) setTabNotes(activeTabId, next);
   }, [activeTabId, setTabNotes]);
 
+  // EditorView ref + auto-focus при открытии слайдаута. Без этого Cmd+E /
+  // клик по StickyNote открывают панель но фокус не приземляется на editor:
+  // курсор не видно, Cmd+V улетает в document.body. setTimeout 80ms ждёт пока
+  // framer-motion закончит initial slide-in.
+  //
+  // Selection при focus — last известная позиция per-tab, fallback на конец
+  // документа. Раньше view.focus() оставлял selection на default 0 (editor
+  // монтируется заново при каждом open → state.selection.main = {from:0,to:0}),
+  // юзер открывал заметку «прямо в начале» вместо ожидаемого «куда я в прошлый
+  // раз писал». Сохраняем `head` позицию в useUIStore.notesPanelSelectionByTab
+  // при close (см. handleClose), читаем здесь при open. Сохранение в localStorage
+  // живёт в useUIStore — переживает рестарт.
+  //
+  // Сценарий «в конец документа» как fallback: заметки растут в конец, новые
+  // юзер дописывает там же; курсор в конец = «продолжай печатать», курсор в 0
+  // = «перепиши всё с начала» (неверный смысловой default).
+  const editorViewRef = useRef<EditorView | null>(null);
+  const handleEditorView = useCallback((view: EditorView) => {
+    editorViewRef.current = view;
+  }, []);
+  const notesSelectionByTab = useUIStore((s) => s.notesPanelSelectionByTab);
+  const setNotesSelection = useUIStore((s) => s.setNotesPanelSelection);
+  useEffect(() => {
+    if (!activeTabId) return;
+    const id = window.setTimeout(() => {
+      const view = editorViewRef.current;
+      if (!view) return;
+      const docLen = view.state.doc.length;
+      const saved = notesSelectionByTab[activeTabId];
+      const pos = (typeof saved === 'number' && saved >= 0 && saved <= docLen)
+        ? saved
+        : docLen;
+      view.dispatch({ selection: { anchor: pos, head: pos }, scrollIntoView: true });
+      view.focus();
+    }, 80);
+    return () => window.clearTimeout(id);
+  }, [activeTabId, notesSelectionByTab]);
+
+  // Manual Cmd+V — обход markdown-editor's встроенного `Mod-v` keymap,
+  // который читает `navigator.clipboard.read()` / `.readText()`. В Electron
+  // renderer эти API возвращают пустоту (anti-pattern из CLAUDE.md: «Не
+  // используй navigator.clipboard в renderer»). Editor получает empty string,
+  // ничего не вставляет, юзер видит «вставка не работает».
+  //
+  // Поэтому на корневом контейнере слайдаута перехватываем keydown с
+  // Cmd+V/Ctrl+V в фазе capture, читаем text через electron.clipboard.readText()
+  // и dispatching insert-транзакцию вручную. `preventDefault` + `stopPropagation`
+  // блокируют дальнейшее распространение в editor's keymap. Если буфер пустой
+  // или не текст — пропускаем дальше (editor попробует image-paste через
+  // встроенный DOM `paste` handler — там clipboardData доступен напрямую).
+  const handleSlideoutKeyDown = useCallback((e: React.KeyboardEvent) => {
+    if (!(e.metaKey || e.ctrlKey) || e.altKey || e.shiftKey) return;
+    if (e.code !== 'KeyV') return;
+    const view = editorViewRef.current;
+    if (!view) return;
+    let text = '';
+    try {
+      const { clipboard } = (window as any).require('electron');
+      text = clipboard.readText() || '';
+    } catch { /* outside electron — fall through to native */ return; }
+    if (!text) return; // пусто или нетекст — пропускаем (image-paste пойдёт через DOM)
+    e.preventDefault();
+    e.stopPropagation();
+    const sel = view.state.selection.main;
+    view.dispatch({
+      changes: { from: sel.from, to: sel.to, insert: text },
+      selection: { anchor: sel.from + text.length },
+      scrollIntoView: true,
+      userEvent: 'input.paste',
+    });
+  }, []);
+
   const handleClose = useCallback(() => {
-    if (activeTabId) setNotesPanelOpen(activeTabId, false);
-  }, [activeTabId, setNotesPanelOpen]);
+    if (!activeTabId) return;
+    // Запомнить позицию курсора per-tab, чтобы при следующем open поставить
+    // selection туда же. view может быть null если editor ещё не смонтировался
+    // (ранний close) — в таком случае сохранять нечего.
+    const view = editorViewRef.current;
+    if (view) {
+      const head = view.state.selection.main.head;
+      setNotesSelection(activeTabId, head);
+    }
+    setNotesPanelOpen(activeTabId, false);
+  }, [activeTabId, setNotesPanelOpen, setNotesSelection]);
 
   // Track TabSidebar right edge as our LEFT anchor. Falls back to viewport
   // left edge (MARGIN) if the sidebar isn't rendered (defensive).
@@ -254,6 +336,7 @@ export default function TabNotesSlideout() {
         <motion.div
           key="panel"
           data-tab-notes-slideout
+          onKeyDownCapture={handleSlideoutKeyDown}
           // Flipped enter/exit direction: now slides IN from the LEFT
           // (negative x → 0). Matches the new left-anchored layout.
           initial={{ opacity: 0, x: -20 }}
@@ -328,6 +411,7 @@ export default function TabNotesSlideout() {
               <MarkdownEditor
                 content={content}
                 onChange={handleChange}
+                onEditorView={handleEditorView}
                 onGenerateTitle={generateAITitle}
                 fontSize={notesEditorFontSize}
                 contentPaddingX={notesEditorPaddingX}

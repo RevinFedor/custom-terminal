@@ -55,9 +55,17 @@ export default function ClaudeControlBar({
   const [sessionCopied, setSessionCopied] = useState(false);
   const copySessionId = () => {
     if (!sessionId) return;
-    navigator.clipboard.writeText(sessionId);
-    setSessionCopied(true);
-    setTimeout(() => setSessionCopied(false), 1000);
+    // Electron clipboard, не navigator.clipboard — последний в renderer тихо
+    // отваливается без HTTPS/permissions, юзер видит как «даже логов нет».
+    // См. CLAUDE.md anti-pattern «Не используй navigator.clipboard в renderer».
+    try {
+      const { clipboard } = window.require('electron');
+      clipboard.writeText(sessionId);
+      setSessionCopied(true);
+      setTimeout(() => setSessionCopied(false), 1000);
+    } catch (e) {
+      console.error('[ClaudeControlBar] copySessionId failed:', e);
+    }
   };
   // Per-field primitive selectors. A single composite-object selector returned a
   // fresh `{}` on every render → Zustand fires re-renders forever → Maximum
@@ -187,6 +195,20 @@ export default function ClaudeControlBar({
     ipcRenderer.on('claude:paste-busy', handler);
     return () => { ipcRenderer.removeListener('claude:paste-busy', handler); };
   }, [tabId]);
+
+  // SDK busy mirror — для SDK таба нет OSC 133, isCommandRunning из Workspace
+  // всегда false. Подписываемся на claude:busy-state (main.js forward'ит сюда
+  // claude-sdk:busy-state через 10810). Используется чтобы SessionActionChip
+  // правильно показывал Stop на hover'е во время живого SDK turn'а.
+  const [sdkBusy, setSdkBusy] = useState(false);
+  useEffect(() => {
+    if (!isSDKTab) return;
+    const handler = (_: any, data: { tabId: string; busy: boolean }) => {
+      if (data.tabId === tabId) setSdkBusy(data.busy);
+    };
+    ipcRenderer.on('claude:busy-state', handler);
+    return () => { ipcRenderer.removeListener('claude:busy-state', handler); };
+  }, [tabId, isSDKTab]);
 
   const focusTerminal = () => {
     requestAnimationFrame(() => terminalRegistry.get(tabId)?.focus());
@@ -460,6 +482,11 @@ export default function ClaudeControlBar({
   const onStop = async () => {
     if (!tabId) return;
     if (isSDKTab) {
+      // Guard: was-stopped event → overlay «Process stopped — history preserved»
+      // в композере. Без guard'а idle-клик показывал overlay без причины.
+      // sdkBusy подписан на claude:busy-state локально (см. выше) — single
+      // source of truth, та же шина что у TabBar/SessionActionChip.
+      if (!sdkBusy) return;
       try {
         await ipcRenderer.invoke('claude-sdk:stop', { tabId });
         window.dispatchEvent(new CustomEvent('claude-sdk:was-stopped', { detail: { tabId } }));
@@ -600,10 +627,21 @@ export default function ClaudeControlBar({
   };
 
   // ===== Prompt copy / clear (Claude only — Gemini has no equivalent IPC). =====
+  // clearAfter=true uses claude:grab-input (atomic copy+truncate in one Ctrl+G round,
+  // helper truncates the tempfile before sending text back to socket — see
+  // ~/.claude/hooks/noted-code-grab.js mode='grab' path). Why not the older two-step
+  // copy-input + clear-input: two separate Ctrl+G round-trips race each other.
+  // The second Ctrl+G arrives while Claude is still in external-editor cycle from
+  // the first — falls into the input buffer as a literal ^G character, never reaches
+  // chat:externalEditor binding. Plus claude:clear-input had a claudeTurnBusy guard
+  // that copy-input did not have → asymmetric "Copied" succeeds, "+ clear" silently
+  // dropped when Claude was mid-turn. grab-input fires once and is the same path the
+  // PromptQueue uses, no asymmetry.
   const handleCopyPrompt = async (clearAfter: boolean) => {
     if (!tabId || sessionType !== 'claude') return;
     try {
-      const res = await ipcRenderer.invoke('claude:copy-input', tabId);
+      const ipcName = clearAfter ? 'claude:grab-input' : 'claude:copy-input';
+      const res = await ipcRenderer.invoke(ipcName, tabId);
       if (res?.success && typeof res.text === 'string') {
         const t = res.text;
         if (!t.trim()) { showToast('Claude input is empty', 'warning'); return; }
@@ -615,8 +653,10 @@ export default function ClaudeControlBar({
         const verb = clearAfter ? 'Copied + cleared' : 'Copied';
         showToast(`${verb}: "${preview}"${res.images ? ` · ${res.images} 📎` : ''}`, 'success', 1800);
         if (clearAfter) {
+          // Refocus so Claude re-reads the now-empty tempfile in the next frame
+          // (without focus, the visual input keeps showing old text until user
+          // clicks back into the terminal — same gotcha as PromptQueue's +grab).
           focusTerminal();
-          ipcRenderer.invoke('claude:clear-input', tabId).catch(() => {});
         }
       } else {
         const code = res?.error || 'timeout';
@@ -703,7 +743,62 @@ export default function ClaudeControlBar({
     cursor: disabled ? 'not-allowed' : 'pointer',
   });
 
+  // ============================================================================
   // ===== render =====
+  // ============================================================================
+  //
+  // КАРТА ВИДИМОСТИ КНОПОК — по двум осям: tabType (PTY vs SDK) и состояние
+  // (hasAnySession / isCommandRunning / isSDKTab / sessionId). Если меняешь
+  // ЛЮБОЙ guard ниже — обнови эту таблицу, чтобы следующий разработчик мог
+  // понять без чтения 1000 строк JSX.
+  //
+  //                              | PTY new | PTY running | PTY idle    | SDK new | SDK running | SDK idle
+  //                              | (нет    | (claude     | (сессия в   | (нет    | (query      | (между
+  //                              | session)| process)    | БД, claude  | session)| активен)    | turn'ами)
+  //                              |         |             | мёртв)      |         |             |
+  // -----------------------------+---------+-------------+-------------+---------+-------------+----------
+  // ⎘ copy-session-id            | -       | + (если sid)| +           | -       | + (если sid)| + (если sid)
+  // SessionActionChip            | "Start" | "Stop" hover| "Continue"  | "Claude"| "Stop" hover| "Claude"
+  // ↻ refresh-timeline           | -       | +           | +           | -       | +           | +
+  // ⑂→▭ forkToTab (PTY)          | -       | +           | +           | -       | +           | +
+  // ⑂→SDK forkToSDK              | -       | + (Claude)  | + (Claude)  | -       | -           | -
+  // +SDK startNewSDKTab          | + 1)    | -           | -           | -       | -           | -
+  // ⑂ Claude-F (from clipboard)  | + 1)    | -           | -           | -       | -           | -
+  // ⑂ SDK-F (from clipboard)     | + 1)    | -           | -           | -       | -           | -
+  // ⎘ prompt | + clear (PTY only)| -       | + (Claude)  | + (Claude)  | -       | -           | -
+  // Right cluster Provider/Model | dimmed  | enabled     | dimmed      | enabled | shimmer     | enabled
+  //   /Effort/Think              |         |             |             |         |             |
+  //
+  // 1) +SDK / Claude-F / SDK-F появляются ТОЛЬКО когда нет sessionId И нет
+  //    живого процесса (`!hasAnySession && !isSDKTab && !isCommandRunning`).
+  //    Раньше guard был `!hasAnySession && !isSDKTab` — кнопки показывались
+  //    в окне «процесс стартанул, sessionId ещё не записался в Tab». Юзер
+  //    видел Claude-F/SDK-F одновременно с живым claude процессом.
+  //
+  // ВЕТКИ И ИХ ИСТОЧНИКИ:
+  //
+  //   isSDKTab — `tabType === 'claude-sdk'`. SDK таб не имеет PTY, поэтому
+  //              isCommandRunning от Workspace всегда false для него.
+  //              SDK-busy получаем отдельно через subscriber на
+  //              claude:busy-state (forward'ится main'ом из claude-sdk:busy-state).
+  //
+  //   hasAnySession — `!!sessionId`. Для PTY = bridge записал sessionId в
+  //              Tab.claudeSessionId. Для SDK = после первой SSE-записи в JSONL.
+  //
+  //   isCommandRunning — OSC 133 D/B от PTY shell. Для SDK всегда false.
+  //
+  //   sdkBusy — claude-sdk:busy-state из ClaudeSDKTab (isRunning эффект).
+  //
+  // АНТИПАТТЕРН (не повторять):
+  //   — `pointerEvents: 'none' + opacity: 0.5` на disabled-кластере. Это
+  //     меняет визуальный вес и блок «съёживается» при смене ширины model
+  //     label'а. Используй .control-bar-busy-overlay (shimmer ::after) — см.
+  //     fact-claude-control-bar.md::Busy-overlay.
+  //   — Композитный селектор Zustand `state => ({ a, b, c })` → новая ссылка
+  //     каждый рендер → infinite re-render. Используй отдельные primitive
+  //     селекторы (см. начало компонента, `tabType` / `sdkModel` etc).
+  //
+  // ============================================================================
   return (
     <div
       ref={rootRef}
@@ -721,10 +816,10 @@ export default function ClaudeControlBar({
     >
       {/* LEFT: session controls + context meter */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, flex: 1, minWidth: 0 }}>
-        {/* [⎘ Continue/Stop/Start ↻] — copy session id + lifecycle chip + force-refresh.
-            Chip всегда виден (даже без сессии — тогда он Start). Copy и Refresh
-            прячутся когда сессии нет: «копировать пустой id» и «refresh пустой
-            таймлайн» — мёртвые операции, не дезайблнутые но просто отсутствуют. */}
+        {/* ── [⎘ session-id-copy | SessionActionChip | ↻ refresh-timeline] ──
+            Container border видим только при наличии sessionId. Содержимое
+            заходит в один rounded-3-pill блок. Copy/Refresh скрыты на
+            новой вкладке (нечего копировать / нечего обновлять). */}
         <div
           className="inline-flex items-center rounded overflow-hidden"
           style={{
@@ -763,9 +858,15 @@ export default function ClaudeControlBar({
               {sessionCopied ? '✓' : '⎘'}
             </span>
           )}
+          {/* PTY mode: 3-state матрица (Start/Continue/Stop). SDK mode: 2-state
+              (idle / running) — там Continue/Start не имеют семантики, таб
+              существует — query запустится первым же сообщением. См. headed
+              comment в SessionActionChip.tsx. isCommandRunning для SDK — это
+              sdkBusy (claude-sdk:busy-state forward'ится через claude:busy-state). */}
           <SessionActionChip
             sessionType={sessionType}
-            isCommandRunning={isCommandRunning}
+            mode={isSDKTab ? 'sdk' : 'pty'}
+            isCommandRunning={isSDKTab ? sdkBusy : isCommandRunning}
             hasAnySession={hasAnySession}
             onStart={onStart}
             onContinue={onContinue}
@@ -837,7 +938,14 @@ export default function ClaudeControlBar({
             title="Fork в новый SDK таб"
           >⑂→SDK</button>
         )}
-        {!hasAnySession && !isSDKTab && (
+        {/* Pristine-PTY guard: видно только в новой PTY-вкладке (нет sessionId
+            И нет живого процесса). hasAnySession false + isCommandRunning true
+            = окно «процесс стартанул, sessionId ещё не записался в Tab» — там
+            +SDK/Claude-F/SDK-F НЕ показываем, иначе юзер видит fork-кнопки
+            одновременно с живым claude процессом. Юзер: «у меня в этой вкладке
+            запущен процесс клода, но одновременно отображаются кнопки Claude-F
+            и SDK-F, какого хуя они отображаются». */}
+        {!hasAnySession && !isSDKTab && !isCommandRunning && (
           <button
             className="text-[10px] px-1.5 py-0.5 rounded cursor-pointer leading-none flex items-center gap-0.5 transition-colors"
             style={{
@@ -857,8 +965,13 @@ export default function ClaudeControlBar({
             JSONL, чат) → одна кнопка форкает в PTY-claude, вторая в SDK.
             UUID извлекается regex'ом, не парсится строго — clipboard может
             содержать «/resume <uuid>» / whitespace / brackets. Имя нового
-            таба = «<sid-prefix>_fork». */}
-        {!hasAnySession && !isSDKTab && (
+            таба = «<sid-prefix>_fork».
+            Тот же `!isCommandRunning` guard что выше — fork-from-clipboard
+            не имеет смысла когда процесс уже запущен (новый fork создаётся в
+            ОТДЕЛЬНОЙ вкладке через createTabAfterCurrent, но визуально кнопки
+            на «занятой» вкладке выглядели как «процесс работает, но почему-то
+            предлагают форкнуть из буфера»). */}
+        {!hasAnySession && !isSDKTab && !isCommandRunning && (
           <>
             <button
               className="text-[10px] px-1.5 py-0.5 rounded cursor-pointer leading-none flex items-center gap-0.5 transition-colors"
@@ -949,20 +1062,30 @@ export default function ClaudeControlBar({
 
       {/* RIGHT: dropdowns. Два блокирующих состояния:
           • isBusy → shimmer-overlay через ::after (in-flight command).
-          • !hasAnySession → opacity 0.4 (юзеру нечего настраивать пока
-            процесса нет; провайдер/модель/effort применяются командами в
-            живой TUI — без процесса они просто провалятся в shell). Сам
-            кластер виден чтобы пользователь видел будущий контекст, но
-            клики блокированы pointer-events:none. */}
-      {supportsKnobs && (
+          • PTY: !isCommandRunning → opacity 0.4. Provider/Model/Effort/Think
+            применяются slash-командами в живой TUI; когда процесс убит, БД
+            хранит session row, но TUI нет — команды улетят в мёртвый shell
+            и потеряются. SessionActionChip справа от этого кластера
+            ориентируется на тот же сигнал (показывает Continue вместо Stop).
+          • SDK: **всегда enabled**. SDK таб не имеет PTY — model/effort/
+            think применяются параметром при следующем `query()` вызове
+            (см. fact-claude-sdk-tab.md). Юзер может выбрать модель ДО
+            первого сообщения; настройки персистятся в Tab.sdk* полях.
+            Привязывать к hasAnySession неправильно: новый SDK таб без
+            session_id всё равно должен позволять выбрать модель — иначе
+            юзер видит disabled кнопки и видит хвостовой «Start» на чипе,
+            хотя SDK уже готов принять prompt. */}
+      {supportsKnobs && (() => {
+        const canControl = isSDKTab ? true : isCommandRunning;
+        return (
         <div
           className={isBusy ? 'control-bar-busy-overlay' : undefined}
           style={{
             display: 'flex',
             alignItems: 'center',
             gap: 6,
-            pointerEvents: (isBusy || !hasAnySession) ? 'none' : 'auto',
-            opacity: !hasAnySession ? 0.4 : 1,
+            pointerEvents: (isBusy || !canControl) ? 'none' : 'auto',
+            opacity: !canControl ? 0.4 : 1,
             transition: 'opacity 0.15s',
           }}
           aria-busy={isBusy}
@@ -977,12 +1100,13 @@ export default function ClaudeControlBar({
                   color: activeProvider.tint,
                   borderColor: `${activeProvider.tint}66`,
                   backgroundColor: `${activeProvider.tint}1F`,
+                  padding: '0 6px',
+                  gap: 3,
                 }}
-                title="Provider (клик закрепит, ⌘+наведение откроет временно)"
+                title={`Provider: ${activeProvider.label} (клик закрепит, ⌘+наведение откроет временно)`}
               >
-                <activeProvider.Icon size={11} color={activeProvider.tint} />
-                <span>{activeProvider.label}</span>
-                <span style={{ opacity: 0.6 }}>▴</span>
+                <activeProvider.Icon size={12} color={activeProvider.tint} />
+                <span style={{ opacity: 0.6, fontSize: 9 }}>▴</span>
               </button>
               {openPopup === 'provider' && (
                 <div {...popupHoverProps('provider')} style={popupWrapperStyle}>
@@ -1047,38 +1171,38 @@ export default function ClaudeControlBar({
               only takes effect during reasoning, so visually telegraphing that
               the value won't matter right now. Не disabled: юзер может пресет-
               нуть Effort заранее, потом включить Think. */}
-          <div style={{ position: 'relative' }}>
-            <button
-              {...triggerProps('effort')}
-              style={{ ...triggerStyle, opacity: !thinkActive ? 0.4 : 1 }}
-              title={!thinkActive
-                ? 'Effort применяется только когда Think включён (клик закрепит, ⌘+наведение откроет временно)'
-                : 'Effort (клик закрепит, ⌘+наведение откроет временно)'}
-            >
-              <span style={{ color: '#777', fontSize: 10 }}>Effort</span>
-              <span style={{ color: '#fff' }}>{effortLabel}</span>
-              <span style={{ opacity: 0.6 }}>▴</span>
-            </button>
-            {openPopup === 'effort' && (
-              <div {...popupHoverProps('effort')} style={popupWrapperStyle}>
-                <div style={popupCardStyle}>
-                  {effortLevels.map(level => {
-                    const active = effortActive === level;
-                    const isUnsupported = isSDKTab && sdkSupportedEfforts != null && !sdkSupportedEfforts.has(level);
-                    const label = level === 'medium' ? 'med' : level === 'xhigh' ? 'xhi' : level;
-                    return (
-                      <button
-                        key={level}
-                        style={pillStyle(active, isUnsupported)}
-                        disabled={isUnsupported}
-                        title={isUnsupported ? `${level} не поддерживается моделью ${sdkModel}` : undefined}
-                        onClick={() => !isUnsupported && pickEffort(level)}
-                      >{label}</button>
-                    );
-                  })}
-                </div>
-              </div>
-            )}
+          {/* Effort — inline pill row instead of dropdown. Все уровни видны
+              сразу, один клик переключает. Dimmed когда Think выключен (effort
+              работает только при reasoning, поэтому визуально телеграфируем
+              что значение сейчас не применяется), но не disabled — юзер может
+              пресет-нуть заранее и потом включить Think. */}
+          <div
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 2,
+              opacity: !thinkActive ? 0.4 : 1,
+              transition: 'opacity 0.12s',
+            }}
+            title={!thinkActive
+              ? 'Effort применяется только когда Think включён'
+              : 'Effort level'}
+          >
+            <span style={{ color: '#777', fontSize: 10, marginRight: 4 }}>Effort</span>
+            {effortLevels.map(level => {
+              const active = effortActive === level;
+              const isUnsupported = isSDKTab && sdkSupportedEfforts != null && !sdkSupportedEfforts.has(level);
+              const label = level === 'medium' ? 'med' : level === 'xhigh' ? 'xhi' : level;
+              return (
+                <button
+                  key={level}
+                  style={pillStyle(active, isUnsupported)}
+                  disabled={isUnsupported}
+                  title={isUnsupported ? `${level} не поддерживается моделью ${sdkModel}` : level}
+                  onClick={() => !isUnsupported && pickEffort(level)}
+                >{label}</button>
+              );
+            })}
           </div>
 
           {/* Think — single toggle, no dropdown */}
@@ -1097,7 +1221,8 @@ export default function ClaudeControlBar({
             </button>
           )}
         </div>
-      )}
+        );
+      })()}
     </div>
   );
 }

@@ -1,8 +1,32 @@
 import { useEffect, useRef } from 'react';
 import { usePromptQueueStore } from '../store/usePromptQueueStore';
 import { useUIStore } from '../store/useUIStore';
+import { useWorkspaceStore } from '../store/useWorkspaceStore';
 
 const { ipcRenderer } = window.require('electron');
+
+// Walk openProjects → find the project that owns this tab. Used after stopAfter
+// fires when closeAfter is also armed — we need both ids to call closeTab.
+// O(N) but openProjects rarely has more than a handful of entries.
+function findProjectIdForTab(tabId: string): string | null {
+  const state = useWorkspaceStore.getState();
+  for (const [projId, ws] of state.openProjects) {
+    if (ws.tabs.has(tabId)) return projId;
+  }
+  return null;
+}
+
+// When the per-tab post-prompt toggle is ON and post-prompt text is non-empty,
+// every fired queue item gets the post-prompt appended after a blank-line
+// separator. Empty text is treated as disabled (no glue line, no warning).
+// Single chokepoint: every send-command call from the runner goes through this.
+function withPostPrompt(tabId: string, body: string): string {
+  const q = usePromptQueueStore.getState().getQueue(tabId);
+  if (!q.postPromptEnabled) return body;
+  const post = q.postPromptText;
+  if (!post || !post.trim()) return body;
+  return body + '\n\n' + post;
+}
 
 // Always-mounted auto-runner for the per-tab prompt queue. Mounted ONCE at app
 // root (App.tsx) so it survives tab switches, project switches, view changes —
@@ -30,8 +54,8 @@ export function usePromptQueueRunner() {
   const prevBusyRef = useRef<Map<string, boolean>>(new Map());
 
   useEffect(() => {
-    const handleBusyState = (_: any, data: { tabId: string; busy: boolean }) => {
-      const { tabId, busy } = data;
+    const handleBusyState = (_: any, data: { tabId: string; busy: boolean; reason?: string }) => {
+      const { tabId, busy, reason } = data;
       const wasBusy = prevBusyRef.current.get(tabId) ?? false;
       prevBusyRef.current.set(tabId, busy);
 
@@ -39,6 +63,16 @@ export function usePromptQueueRunner() {
       // (false → true) doesn't trigger queue actions — user submitted manually
       // or our send-command IPC kicked it off.
       if (!(wasBusy && !busy)) return;
+
+      // reason:'manual-stop' — пользователь явно нажал Stop chip / context-menu
+      // Stop / двойной Esc. Это НЕ обычный turn-end. Auto-run следующего промпта
+      // создал бы петлю «выключил → процесс снова запустился из очереди». См.
+      // main.js::terminal:stop-ai-process. Stop-after тоже пропускаем — terminal
+      // уже мёртв, повторный SIGTERM на «нет AI process» вернёт ошибку.
+      if (reason === 'manual-stop') {
+        console.log('[PromptQueueRunner] tab=' + tabId.slice(-12) + ' manual-stop → skip auto-run/stop-after');
+        return;
+      }
 
       const queue = usePromptQueueStore.getState().getQueue(tabId);
       const { popNext, setAutoRun, setStopAfter } = usePromptQueueStore.getState();
@@ -49,7 +83,8 @@ export function usePromptQueueRunner() {
         const beforePop = queue.items.length;
         const head = popNext(tabId);
         if (head) {
-          ipcRenderer.invoke('claude:send-command', tabId, head.text).catch((e: unknown) => {
+          const payload = withPostPrompt(tabId, head.text);
+          ipcRenderer.invoke('claude:send-command', tabId, payload).catch((e: unknown) => {
             console.error('[PromptQueueRunner] send failed for tab', tabId, e);
           });
           // Auto-disarm after the last prompt drained from the queue.
@@ -58,15 +93,41 @@ export function usePromptQueueRunner() {
         return; // wait for THIS prompt's turn before considering stopAfter
       }
 
-      // stopAfter: queue empty (or autoRun off), turn finished → kill claude
+      // stopAfter: queue empty (or autoRun off), turn finished → kill claude.
+      // closeAfter (chained on top): after the stop fires, also close the whole
+      // tab via useWorkspaceStore.closeTab with skipProcessCheck so no confirm
+      // dialog appears (we just killed the process — there's nothing to ask).
       if (queue.stopAfter) {
+        const shouldCloseTab = queue.closeAfter;
         ipcRenderer.invoke('terminal:stop-ai-process', tabId)
-          .then((res: { success?: boolean; error?: string }) => {
-            if (res?.success) showToast('Claude stopped', 'success', 1500);
-            else if (res?.error) console.warn('[PromptQueueRunner] stop failed:', res.error);
+          .then(async (res: { success?: boolean; error?: string }) => {
+            if (res?.success) {
+              showToast(shouldCloseTab ? 'Claude stopped, closing tab' : 'Claude stopped', 'success', 1500);
+            } else if (res?.error) {
+              console.warn('[PromptQueueRunner] stop failed:', res.error);
+            }
+            // Even if stop reported an error, attempt close if armed — the user
+            // explicitly opted into "kill + close" and a failed kill (e.g.
+            // process already dead) shouldn't block the close.
+            if (shouldCloseTab) {
+              const projectId = findProjectIdForTab(tabId);
+              if (!projectId) {
+                console.warn('[PromptQueueRunner] closeAfter: no project found for tab', tabId);
+                return;
+              }
+              try {
+                await useWorkspaceStore.getState().closeTab(projectId, tabId, {
+                  skipProcessCheck: true, // we already issued the SIGTERM above
+                  forceCleanup: true,
+                });
+              } catch (e) {
+                console.error('[PromptQueueRunner] closeAfter failed:', e);
+              }
+            }
           })
           .catch((e: unknown) => console.error('[PromptQueueRunner] stop error', e));
         setStopAfter(tabId, false);
+        // setStopAfter(false) already cascades closeAfter→false via the store.
       }
     };
 
@@ -115,7 +176,8 @@ export function usePromptQueueRunner() {
         const beforePop = q.items.length;
         const head = usePromptQueueStore.getState().popNext(tabId);
         if (head) {
-          ipcRenderer.invoke('claude:send-command', tabId, head.text).catch((e: unknown) => {
+          const payload = withPostPrompt(tabId, head.text);
+          ipcRenderer.invoke('claude:send-command', tabId, payload).catch((e: unknown) => {
             console.error('[PromptQueueRunner] cold-start send failed for tab', tabId, e);
           });
           if (beforePop === 1) usePromptQueueStore.getState().setAutoRun(tabId, false);

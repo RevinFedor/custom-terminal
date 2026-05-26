@@ -21,6 +21,8 @@
 
 **Trap: Два раздельных контекстных меню скриптов.** Tab context menu (ПКМ по вкладке) — React-компонент в `TabBar.tsx`, проверяет `processStatus` Map + `commandType` из store. Terminal context menu (ПКМ по терминалу) — нативное `Menu.buildFromTemplate` в `main.js:show-terminal-context-menu`, проверяет `terminalCommandState` Map напрямую. При изменении логики скриптов нужно обновлять **оба** места.
 
+**Один из шрамов: auto-color симметрия.** Долго работала только в React-меню TabBar — оно само звало `setTabCommandType(tabId, 'devServer')` после detect'а `^(dev|start|serve|watch)/i`. Нативное меню main.js шлёт команду через `event.send('context-menu-command', 'run-script', { tabId, command })` → renderer App.tsx делает `ipcRenderer.send('terminal:input', tabId, command)` **напрямую в PTY**. Этот путь полностью обходит xterm keydown Enter handler в Terminal.tsx, где живёт второй auto-detect — поэтому вкладка не зеленела при run-script через нативное меню. Симптом юзера: *«ввёл npm run dev, цвет вкладки не стал зелёным»* (см. лог prod-Electron'а: `[ContextMenu] Command received: run-script` followed by `terminal:input ... "npm run dev"` — но без `[Store:setTabCommandType] devServer`). Fix — мирроринг regex'а в `App.tsx::run-script` handler перед `terminal:input`.
+
 Разница restart vs stop: `handleRestart` = `\x03` → 300ms → `!!\r` (Ctrl+C + повтор последней команды через `!!` bash). `handleStop` = только `\x03`.
 
 ## 4. Code Map

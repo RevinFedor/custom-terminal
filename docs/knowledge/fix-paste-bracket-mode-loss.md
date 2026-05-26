@@ -41,7 +41,7 @@
 
 ### 3. Manual paste — pass-through без обёрток
 
-`ipcMain.on('terminal:input', ...)` для длинного paste делает только `term.write(data)`, как iTerm2. Никаких bracketed-paste обёрток на нашей стороне, никакого chunking — это работа Claude TUI на основе своего DEC ?2004 state. См. `methodology/design.md::Transparent passthrough`.
+`ipcMain.on('terminal:input', ...)` для длинного paste делает только `term.write(data)`, как iTerm2. Никаких bracketed-paste обёрток на нашей стороне, никакого chunking — это работа Claude TUI на основе своего DEC ?2004 state. См. `methodology/переносимый-дизайн.md::Transparent passthrough`.
 
 ## Диагностика следующего рецидива: `[PasteDiag]`
 
@@ -68,4 +68,4 @@
 - `fact-claude-tui-mechanics.md::Section 4` — Atomic Bracketed Paste, single bracket pair правило.
 - `fact-claude-tui-mechanics.md::Section 9` — Alt-screen ⇄ DEC ?2004 state loss.
 - `fix-electron-native-rebuild-trap.md` — как делать `electron-rebuild` для отдельного модуля без падения на других native deps.
-- `methodology/design.md::Transparent passthrough` — почему pass-through победил rerouting.
+- `methodology/переносимый-дизайн.md::Transparent passthrough` — почему pass-through победил rerouting.

@@ -20,6 +20,8 @@ VSCode-style полоса по всей нижней границе окна (п
 
 Левая зона зарезервирована под будущие git/branch/lints/etc — пока живёт только `WebServerChip` (LAN IP мобильного web-сервера).
 
+**Чип лимитов Claude — не здесь.** Weekly% Anthropic подписки и per-tab token-cost живут в [`ProjectToolbar`](../../src/renderer/components/Workspace/ProjectToolbar.tsx), не в StatusBar. Причина: chip session-aware (читает `getEffectiveTabId` и активный проект), а status bar — глобальные toggle'ы без привязки к табу. См. [`fact-claude-usage-chip.md`](fact-claude-usage-chip.md).
+
 ## EffortSelector: tri-mode trigger
 
 Chip-trigger в status bar открывает popup с 6 кнопками тремя путями:
@@ -34,7 +36,7 @@ Chip-trigger в status bar открывает popup с 6 кнопками тре
 
 **Геометрия popup'а.**
 - Раскрывается **вверх** (status bar внизу, popup растёт от него к экрану): `bottom: window.innerHeight - chipRect.top`.
-- **Right-anchor**: `right: window.innerWidth - chipRect.right`. Не left-anchor — иначе popup уходит вправо за Timeline-strip и обрезается. См. [`methodology/design-bugs.md::1.1 Popup уезжает за правый/нижний край`](../methodology/design-bugs.md).
+- **Right-anchor**: `right: window.innerWidth - chipRect.right`. Не left-anchor — иначе popup уходит вправо за Timeline-strip и обрезается. См. [`methodology/сценарии-багов.md::1.1 Popup уезжает за правый/нижний край`](../methodology/сценарии-багов.md).
 - CSS-bridge через `paddingBottom: 4` ВНУТРИ popup-wrapper'а — gap от popup до chip покрыт hit-area'ой popup'а, курсор может ехать через эти 4px не теряя hover. Wrapper вплотную к chip'у (`bottom: window.innerHeight - chipRect.top`, **без** offset'а).
 
 **Применение к runtime сессии — пока НЕ реализовано.** Селектор только сохраняет выбор. Hookup «при создании нового Claude-таба автоматически отправить `/effort <level>` после handshake'а» отложен — добавится отдельно, когда понадобится. Сейчас юзер просто фиксирует предпочтение, чтобы оно не терялось между перезапусками.
@@ -69,9 +71,9 @@ Chip-trigger в status bar открывает popup с 6 кнопками тре
 
 **IPC батч-проверка.** Один вызов `ai-prompts:check-paths` принимает массив путей и возвращает `{ missing: string[] }`. В main (`settings.js`) — простой цикл по `fs.existsSync`. Без батча было бы N round-trip'ов через `ai-prompts:check-file` (отдельный helper на один путь, оставлен для inline-feedback в SettingsModal — там как раз нужна точечная проверка одного значения).
 
-**Render-when-N>0, не «всегда серый 0».** Если все пути валидны — chip **скрыт целиком**, а не показывается серой `! 0` плашкой. Принцип «context-irrelevant indicator = hide, не show as 0/N/A» — см. `methodology/design.md::Context-irrelevant indicator`. Серый zero шумит и тренирует юзера игнорировать индикатор; absence of chip — самый чистый сигнал «всё ок».
+**Render-when-N>0, не «всегда серый 0».** Если все пути валидны — chip **скрыт целиком**, а не показывается серой `! 0` плашкой. Принцип «context-irrelevant indicator = hide, не show as 0/N/A» — см. `methodology/переносимый-дизайн.md::Context-irrelevant indicator`. Серый zero шумит и тренирует юзера игнорировать индикатор; absence of chip — самый чистый сигнал «всё ок».
 
-**Tooltip.** Содержимое — первые 5 путей с указанием `+N` если больше, и подсказка «Клик → Настройки». Юзер может убедиться какой именно файл сломан, не открывая Settings.
+**Hover-подсказка через native `title`.** Содержимое — первые 5 путей с указанием `+N` если больше, и подсказка «Клик → Настройки». Юзер может убедиться какой именно файл сломан, не открывая Settings.
 
 ## Settings button (шестерёнка)
 

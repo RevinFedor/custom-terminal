@@ -21,7 +21,7 @@
 
 После Слоя 1 написал legacy listener: «для обратной совместимости со старыми hook-script'ами, ещё биндим `/tmp/noted-terminal-claude-hook.sock`». Сделал `try { unlinkSync } catch {} → legacyServer.listen(path)`. Это **снова #83**: dev стартует вторым, unlink удаляет прод-владельца легаси-пути, дев захватывает; прод-legacyServer уже listening, на него никто не приходит, дев-legacyServer ловит всех старых клиентов.
 
-**Фикс — probe-before-unlink:** при EADDRINUSE на listen не делать unlink unconditional. Сначала probe: попытаться connect к этому пути. Если connect succeeds → сосед жив, оставляем путь ему. Если connect fails с `ECONNREFUSED` → socket file orphan (listener мёртв) → safe to unlink + retry listen. См. переносимый принцип `methodology/design.md::Probe-before-unlink на shared paths`.
+**Фикс — probe-before-unlink:** при EADDRINUSE на listen не делать unlink unconditional. Сначала probe: попытаться connect к этому пути. Если connect succeeds → сосед жив, оставляем путь ему. Если connect fails с `ECONNREFUSED` → socket file orphan (listener мёртв) → safe to unlink + retry listen. См. переносимый принцип `methodology/переносимый-дизайн.md::Probe-before-unlink на shared paths`.
 
 ### Слой 3: cwd-routing не разрешает tie
 
@@ -32,7 +32,7 @@
 2. cwd longest-prefix — fallback когда env hint отсутствует (сторонние tool'ы из `/tmp`).
 3. mtime — последний рубеж.
 
-См. `methodology/design.md::ID-pinned routing > cwd-routing`.
+См. `methodology/переносимый-дизайн.md::ID-pinned routing > cwd-routing`.
 
 ### Слой 4: lock-файл noted-grab-<claudePid>.json не указывал sock
 
@@ -51,7 +51,7 @@
 - `sent_no_ack` — bytes ушли в kernel, server не парсит (был силент-dropout в Слое 1).
 - `sock_err:ECONNREFUSED` — orphan socket file, listener мёртв.
 
-См. `methodology/design.md::App-level ack для silent socket transports`.
+См. `methodology/переносимый-дизайн.md::App-level ack для silent socket transports`.
 
 ## Observability добавили в main
 
@@ -83,6 +83,6 @@
 - `fact-claude-stop-hook.md` — общая архитектура hook → socket → renderer.
 - `fact-mcp-routing.md::Priority order` — тот же env-hint паттерн в MCP HTTP server.
 - `fact-prompt-queue.md::Lock-file dispatcher` — grab/copy/clear modes и роль sock-field.
-- `methodology/design.md::ID-pinned routing > cwd-routing` — переносимый принцип.
-- `methodology/design.md::Probe-before-unlink на shared paths` — переносимый принцип.
-- `methodology/design.md::App-level ack для silent socket transports` — переносимый принцип.
+- `methodology/переносимый-дизайн.md::ID-pinned routing > cwd-routing` — переносимый принцип.
+- `methodology/переносимый-дизайн.md::Probe-before-unlink на shared paths` — переносимый принцип.
+- `methodology/переносимый-дизайн.md::App-level ack для silent socket transports` — переносимый принцип.

@@ -78,6 +78,7 @@ interface TabHistoryEntry {
   claude_session_id: string | null;
   gemini_session_id: string | null;
   message_count: number | null;
+  session_status: string | null;
 }
 
 interface FavoriteEntry {
@@ -187,6 +188,11 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
   const { openProjects, switchTab, createTab, closeTab, setProjectView } = useWorkspaceStore();
   const { projects, updateProject } = useProjectsStore();
   const { showToast } = useUIStore();
+  // Status-marker palette + shape/size. Granular selectors — re-rendered только когда
+  // юзер правит палитру в SettingsModal, не на каждый closed-tab card flip.
+  const sessionStatuses = useUIStore((s) => s.sessionStatuses);
+  const statusMarkerShape = useUIStore((s) => s.statusMarker.shape);
+  const statusMarkerSize = useUIStore((s) => s.statusMarker.sizePx);
   // tabNotes* font / padding теперь читаются внутри TabPreviewPopover.
   const [syncName, setSyncName] = useState<string | null>(null);
   const [history, setHistory] = useState<TabHistoryEntry[]>([]);
@@ -419,6 +425,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
       pendingAction,
       claudeSessionId: entry.claude_session_id || undefined,
       geminiSessionId: entry.gemini_session_id || undefined,
+      sessionStatus: entry.session_status || undefined,
     });
 
     await ipcRenderer.invoke('project:delete-tab-history-entry', { id: entry.id });
@@ -451,6 +458,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
       pendingAction,
       claudeSessionId: entry.claude_session_id || undefined,
       geminiSessionId: entry.gemini_session_id || undefined,
+      sessionStatus: entry.session_status || undefined,
       background: true,
     });
 
@@ -925,8 +933,34 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
                                   gap: '1px',
                                 }}
                               >
-                                <span className="text-[12px] text-white truncate block">
-                                  {entry.name}
+                                {/* Status marker (если был выставлен) рендерим inline
+                                    слева от имени — тот же маркер что слева от имени
+                                    в TabBar vertical-mode. Shape/size приходят из
+                                    Settings (statusMarker.{shape,sizePx}). lookup в
+                                    палитре useUIStore.sessionStatuses по id — если
+                                    палитру с этим id юзер удалил, marker не рендерится,
+                                    но data в history-row остаётся. */}
+                                <span className="text-[12px] text-white truncate block" style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                                  {(() => {
+                                    const meta = entry.session_status
+                                      ? sessionStatuses.find((s) => s.id === entry.session_status)
+                                      : null;
+                                    if (!meta) return null;
+                                    return (
+                                      <span
+                                        title={meta.label}
+                                        style={{
+                                          flexShrink: 0,
+                                          width: `${statusMarkerSize}px`,
+                                          height: `${statusMarkerSize}px`,
+                                          borderRadius: statusMarkerShape === 'square' ? '2px' : '50%',
+                                          backgroundColor: meta.color,
+                                          border: '1px solid rgba(0,0,0,0.4)',
+                                        }}
+                                      />
+                                    );
+                                  })()}
+                                  <span className="truncate">{entry.name}</span>
                                 </span>
                                 {/* Second row is the closed-at stamp, not the
                                     CWD: brighter (#aaa vs #666), and useful for

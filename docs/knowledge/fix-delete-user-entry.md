@@ -6,7 +6,7 @@
 - `Delete Range` стирает заодно весь ответ Claude — не то что нужно.
 
 ### Жест и UI
-ПКМ по точке user-prompt → пункт `Удалить user-mess` (красный, иконка Trash2) в той же группе что Copy/Note/Rewind. Двухшаговый inline-confirm — см. `methodology/design.md::Two-step inline confirm для destructive в context menu`.
+ПКМ по точке user-prompt → пункт `Удалить user-mess` (красный, иконка Trash2) в той же группе что Copy/Note/Rewind. Двухшаговый inline-confirm — см. `methodology/переносимый-дизайн.md::Two-step inline confirm для destructive в context menu`.
 
 Пункт скрыт для:
 - Gemini табов (JSON-формат, отдельный пайплайн)

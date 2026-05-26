@@ -52,7 +52,7 @@ Mobile открывает чат phase 1 = `?last=200` (~250KB gzipped, ~1 се�
 
 UI gating пока phase 2 не закончилась:
 - GoTo на uuid не найденный в reducer → drawer закрывается, overlay висит, после прихода full → auto-jump.
-- «↑ Load older» — disabled с loading-точками. См. `methodology/design-mobile.md::Tail-first loading`.
+- «↑ Load older» — disabled с loading-точками. См. `methodology/мобильный-дизайн.md::Tail-first loading`.
 
 ## Итог по timing
 

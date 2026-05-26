@@ -33,7 +33,7 @@
 </div>
 ```
 
-Когда выделен ungrouped промпт — внутреннего `panelStyle`-блока нет, но wrapper держит ширину, и левая колонка не центрируется в overlay'е. Без этого при движении ↓ через смешанный список «группа → ungrouped промпт → группа» основное окно прыгало бы влево-вправо. Принцип переносимый — см. `methodology/design.md::Layout reservation`.
+Когда выделен ungrouped промпт — внутреннего `panelStyle`-блока нет, но wrapper держит ширину, и левая колонка не центрируется в overlay'е. Без этого при движении ↓ через смешанный список «группа → ungrouped промпт → группа» основное окно прыгало бы влево-вправо. Принцип переносимый — см. `methodology/переносимый-дизайн.md::Layout reservation`.
 
 Для пустой группы (есть группа, нет промптов в ней) внутри слота показывается placeholder *«пусто»* — отдельное состояние от «не группа выбрана».
 
@@ -43,10 +43,10 @@
 - `Enter` отправляет в PTY пустой `\r` (тогда как picker должен был вставить промпт).
 - `Esc` закрывает только модалку assistant-ui (если она была видна), а picker остаётся.
 
-После reading store-флага `promptPickerOpen=true` listener делает `e.preventDefault() + e.stopPropagation() + e.stopImmediatePropagation()` и не пускает событие дальше. Double-safety: оба xterm `attachCustomKeyEventHandler` в `Terminal.tsx` тоже проверяют `useUIStore.getState().promptPickerOpen` и возвращают `false` на arrow/Enter/Esc — если capture-flow по какой-то причине пропустит событие, xterm всё равно его не пошлёт в PTY. Принцип переносимый — см. `methodology/design.md::Global shortcut в capture phase`.
+После reading store-флага `promptPickerOpen=true` listener делает `e.preventDefault() + e.stopPropagation() + e.stopImmediatePropagation()` и не пускает событие дальше. Double-safety: оба xterm `attachCustomKeyEventHandler` в `Terminal.tsx` тоже проверяют `useUIStore.getState().promptPickerOpen` и возвращают `false` на arrow/Enter/Esc — если capture-flow по какой-то причине пропустит событие, xterm всё равно его не пошлёт в PTY. Принцип переносимый — см. `methodology/переносимый-дизайн.md::Global shortcut в capture phase`.
 
 ### Layout-agnostic шорткаты через `event.code`
-Открытие picker'а: `e.altKey && e.code === 'KeyV'` (Opt+V). Не `e.key === 'v'` — на Mac Opt+V в QWERTY-layout это символ `√` (option layer), а в Cyrillic-layout — `М`. `e.code` указывает физическую клавишу, не глиф. Принцип переносимый — см. `methodology/design.md::Layout-agnostic shortcuts`. Cmd+E больше не открывает picker (см. Intro).
+Открытие picker'а: `e.altKey && e.code === 'KeyV'` (Opt+V). Не `e.key === 'v'` — на Mac Opt+V в QWERTY-layout это символ `√` (option layer), а в Cyrillic-layout — `М`. `e.code` указывает физическую клавишу, не глиф. Принцип переносимый — см. `methodology/переносимый-дизайн.md::Layout-agnostic shortcuts`. Cmd+E больше не открывает picker (см. Intro).
 
 Стрелочки/Enter/Esc — non-printable, `e.key` для них одинаков везде, можно проверять по `key`.
 
@@ -72,6 +72,12 @@
 Picker сам резолвит куда вставлять через `getEffectiveTabId()` (sub-agent aware) + `tab.tabType`:
 - `claude-sdk` → `window.dispatchEvent(new CustomEvent('claude-sdk:composer-insert', { detail: { tabId, text } }))` — тот же event что использует right-click SDK menu.
 - иначе (PTY: claude/gemini/bash) → `ipcRenderer.send('terminal:input', tabId, content)` + `ipcRenderer.invoke('terminal:paste', …)` для file_paths. Идентично существующему `cmd === 'insert-prompt'` handler'у в `App.tsx`.
+
+## Focus restore при закрытии (обязательно)
+
+`closePicker()` после `setOpen(false)` диспатчит `nt:window-refocus-active` через `requestAnimationFrame`. Без этого DOM-focus оставался на `<body>` после закрытия — клик по строке picker'а (это `<div>`, не focusable) блюрит xterm-textarea в `body`, а Esc/click-outside никогда не возвращали фокус назад. Симптом: после Opt+V → выбор промпта (или Esc) курсор пропадает из Claude TUI, юзер вынужден кликать в терминал руками. Юзер: *«мне приходится вручную нажимать лишний клик, чтобы поставить курсор обратно в input терминала»*.
+
+Все пути закрытия проходят через единственный `closePicker` callback (Esc, ArrowLeft на левой колонке, click-outside, вставка промпта) — фикс в одном месте покрывает все. Переиспользуется существующая шина `nt:window-refocus-active` (Terminal.tsx + SDKComposer уже слушают, см. [`fact-cmd-tab-refocus.md`](fact-cmd-tab-refocus.md)), не изобретается своя focus-логика. `requestAnimationFrame` критичен — portal должен сначала unmount'иться, а SDK composer-insert отработать, прежде чем мы заберём focus; синхронный dispatch внутри того же тика фокуснул бы элемент который picker ещё перекрывает. Подтверждено живьём: до фикса `document.activeElement === body` после реального клика по строке, после фикса — `xterm-helper-textarea`.
 
 ## Backdrop отсутствует
 Полупрозрачной подложки нет — только click-outside listener на `mousedown` capture phase (см. `App.tsx::onDown` для других overlay'ев — палитра, контекст-меню). Юзер прямо: *«оверлей быть тоже не должно»* — picker должен открываться поверх UI без визуального dimming.
@@ -119,7 +125,7 @@ Mirror-up зарезервирован **только** для правой (г�
 Right выигрывает у left умышленно: юзер часто использует только один слайдер; знать что «правый всегда побеждает» проще чем разбираться какой настроенный.
 
 ### Viewport clamp + измерение
-После выбора начальных `left/top` обе оси клемпятся в viewport (`margin = 8`). Реальный размер picker'а измеряется через `useLayoutEffect` + `rootRef.current.offsetWidth/offsetHeight` — оценка `LEFT_W + GAP + RIGHT_W` используется как fallback до того, как DOM смерил себя. Принцип переносимый — см. `methodology/design.md::Геометрия popup — от измерения, не от формулы`.
+После выбора начальных `left/top` обе оси клемпятся в viewport (`margin = 8`). Реальный размер picker'а измеряется через `useLayoutEffect` + `rootRef.current.offsetWidth/offsetHeight` — оценка `LEFT_W + GAP + RIGHT_W` используется как fallback до того, как DOM смерил себя. Принцип переносимый — см. `methodology/переносимый-дизайн.md::Геометрия popup — от измерения, не от формулы`.
 
 ## Path-зависимости
 

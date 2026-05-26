@@ -165,14 +165,20 @@ function readBody(req) {
 // state that only the live UI knows (current openProjects map, tab creation).
 function bridgeRequest(action, payload, timeoutMs = 5000) {
   return new Promise((resolve, reject) => {
-    const win = BrowserWindow.getAllWindows()[0];
-    if (!win || win.isDestroyed()) return reject(new Error('No window'));
+    const wins = BrowserWindow.getAllWindows();
+    const win = wins[0];
+    if (!win || win.isDestroyed()) {
+      console.log('[BridgeDiag] NO_WINDOW action=' + action + ' wins=' + wins.length);
+      return reject(new Error('No window'));
+    }
     const requestId = crypto.randomBytes(8).toString('hex');
     const timer = setTimeout(() => {
       pendingBridge.delete(requestId);
+      console.log('[BridgeDiag] TIMEOUT action=' + action + ' rid=' + requestId + ' afterMs=' + timeoutMs);
       reject(new Error('Bridge timeout: ' + action));
     }, timeoutMs);
-    pendingBridge.set(requestId, { resolve, reject, timer });
+    pendingBridge.set(requestId, { resolve, reject, timer, action, sentAt: Date.now() });
+    console.log('[BridgeDiag] SEND action=' + action + ' rid=' + requestId + ' wins=' + wins.length);
     win.webContents.send('web:bridge-request', { requestId, action, payload });
   });
 }
@@ -180,12 +186,25 @@ function bridgeRequest(action, payload, timeoutMs = 5000) {
 function registerBridgeReplyHandler() {
   ipcMain.on('web:bridge-reply', (_event, { requestId, ok, data, error }) => {
     const pending = pendingBridge.get(requestId);
-    if (!pending) return;
+    if (!pending) {
+      console.log('[BridgeDiag] REPLY_DROPPED rid=' + requestId + ' ok=' + ok + ' err=' + (error || '-') + ' (no pending — probably already timed out)');
+      return;
+    }
+    const elapsed = Date.now() - pending.sentAt;
+    console.log('[BridgeDiag] REPLY action=' + pending.action + ' rid=' + requestId + ' ok=' + ok + ' elapsedMs=' + elapsed + ' err=' + (error || '-'));
     clearTimeout(pending.timer);
     pendingBridge.delete(requestId);
     if (ok) pending.resolve(data);
     else pending.reject(new Error(error || 'Bridge failed'));
   });
+}
+
+// Project/tab IDs могут содержать `=` (base64 от пути), пробелы, кириллицу —
+// всё это URL-кодируется на клиенте как %3D, %20, %D0%9F и т.п.
+// Без decodeURIComponent любой projectId оканчивающийся на `=` (например
+// uav → `...dWF2%3D`) превращается в строку которой нет в БД → 404.
+function decId(s) {
+  try { return decodeURIComponent(s); } catch { return s; }
 }
 
 // ───────── REST handlers ─────────
@@ -310,8 +329,23 @@ async function handleApi(req, res, parsed, sdkSessions) {
   // Tabs of a project
   let m = parsed.pathname.match(/^\/api\/projects\/([^/]+)\/tabs$/);
   if (m && req.method === 'GET') {
-    const project = projectManager.db.getProjectById(m[1]);
-    if (!project) return sendJson(res, 404, { error: 'project not found' });
+    const projectId = decId(m[1]);
+    let project = projectManager.db.getProjectById(projectId);
+    // Live fallback — проект может быть открыт в Zustand но без записи в БД
+    // (новый незаsavedaftered draft). Спрашиваем renderer что у него есть.
+    if (!project) {
+      try {
+        const live = await bridgeRequest('getProjectTabsLive', { projectId }, 1500);
+        if (live?.project) {
+          console.log('[WebServer] project ' + projectId.slice(0, 16) + ' served from live Zustand (not in DB)');
+          return sendJson(res, 200, live);
+        }
+      } catch (e) {
+        // bridge failed, fall through to 404
+      }
+      console.log('[WebServer] 404 project not found: ' + projectId + ' (not in DB, not in live Zustand)');
+      return sendJson(res, 404, { error: 'project not found', projectId });
+    }
     const tabs = (project.tabs || []).map(t => {
       // Cheap timeline-count: only computed if the tab has a session file we
       // can find. parseTimelineUuids reads the JSONL once and returns the
@@ -345,7 +379,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
   m = parsed.pathname.match(/^\/api\/projects\/([^/]+)\/sdk-tabs$/);
   if (m && req.method === 'POST') {
     try {
-      const data = await bridgeRequest('createSDKTab', { projectId: m[1] });
+      const data = await bridgeRequest('createSDKTab', { projectId: decId(m[1]) });
       return sendJson(res, 200, data);
     } catch (e) {
       return sendJson(res, 500, { error: String(e.message) });
@@ -355,7 +389,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
   // Send prompt to SDK tab — invokes the same handler the desktop UI uses.
   m = parsed.pathname.match(/^\/api\/sdk-tabs\/([^/]+)\/send$/);
   if (m && req.method === 'POST') {
-    const tabId = m[1];
+    const tabId = decId(m[1]);
     try {
       const body = await readBody(req);
       const { prompt, model, effort, thinking, cwd } = body;
@@ -379,7 +413,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
   // truncated tip.
   m = parsed.pathname.match(/^\/api\/sdk-tabs\/([^/]+)\/truncate$/);
   if (m && req.method === 'POST') {
-    const tabId = m[1];
+    const tabId = decId(m[1]);
     try {
       const body = await readBody(req);
       const targetUuid = (body.targetUuid || '').trim();
@@ -395,7 +429,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
   // currently OPEN in the desktop). Returns 409 if the tab isn't open.
   m = parsed.pathname.match(/^\/api\/sdk-tabs\/([^/]+)\/rename$/);
   if (m && req.method === 'POST') {
-    const tabId = m[1];
+    const tabId = decId(m[1]);
     try {
       const body = await readBody(req);
       const name = (body.name || '').trim();
@@ -411,7 +445,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
   // closed-only-when-open).
   m = parsed.pathname.match(/^\/api\/sdk-tabs\/([^/]+)\/close$/);
   if (m && req.method === 'POST') {
-    const tabId = m[1];
+    const tabId = decId(m[1]);
     try {
       const data = await bridgeRequest('closeTab', { tabId });
       return sendJson(res, 200, data);
@@ -425,7 +459,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
   // so the mobile client can navigate straight into the chat.
   m = parsed.pathname.match(/^\/api\/tabs\/([^/]+)\/fork-to-sdk$/);
   if (m && req.method === 'POST') {
-    const tabId = m[1];
+    const tabId = decId(m[1]);
     try {
       const data = await bridgeRequest('forkToSDK', { tabId });
       return sendJson(res, 200, data);
@@ -437,7 +471,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
   // Stop SDK stream
   m = parsed.pathname.match(/^\/api\/sdk-tabs\/([^/]+)\/stop$/);
   if (m && req.method === 'POST') {
-    const tabId = m[1];
+    const tabId = decId(m[1]);
     const session = sdkSessions.get(tabId);
     if (session) {
       try { session.query.close(); } catch {}
@@ -451,14 +485,14 @@ async function handleApi(req, res, parsed, sdkSessions) {
   m = parsed.pathname.match(/^\/api\/sdk-tabs\/([^/]+)\/params$/);
   if (m && req.method === 'GET') {
     try {
-      const data = await bridgeRequest('getSDKParams', { tabId: m[1] });
+      const data = await bridgeRequest('getSDKParams', { tabId: decId(m[1]) });
       return sendJson(res, 200, data);
     } catch (e) { return sendJson(res, 409, { error: String(e.message) }); }
   }
   if (m && req.method === 'POST') {
     try {
       const body = await readBody(req);
-      const data = await bridgeRequest('setSDKParams', { tabId: m[1], ...body });
+      const data = await bridgeRequest('setSDKParams', { tabId: decId(m[1]) , ...body });
       return sendJson(res, 200, data);
     } catch (e) { return sendJson(res, 409, { error: String(e.message) }); }
   }
@@ -468,7 +502,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
   // claudeSessionId from the live store, then we call the IPC directly here.
   m = parsed.pathname.match(/^\/api\/sdk-tabs\/([^/]+)\/timeline$/);
   if (m && req.method === 'GET') {
-    const tabId = m[1];
+    const tabId = decId(m[1]);
     const t0 = Date.now();
     console.log(`[WebTiming] /timeline START tabId=${tabId.slice(0, 24)}`);
     if (!parseTimelineEntries || !findSessionFile) return sendJson(res, 500, { error: 'timeline parser not loaded' });
@@ -526,7 +560,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
   // - `?last=N` returns the last N messages.
   m = parsed.pathname.match(/^\/api\/sdk-tabs\/([^/]+)\/history$/);
   if (m && req.method === 'GET') {
-    const tabId = m[1];
+    const tabId = decId(m[1]);
     const t0 = Date.now();
     const lastRaw = parsed.query.last;
     const lastN = lastRaw != null ? Math.max(1, Math.min(20000, parseInt(String(lastRaw), 10) || 0)) : null;

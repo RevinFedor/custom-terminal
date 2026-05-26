@@ -1,10 +1,11 @@
 import React, { useEffect, useState, useRef, useCallback } from 'react';
 import { useUIStore } from '../../store/useUIStore';
 import { usePromptsStore, AIPrompt, AIModel, ThinkingLevel } from '../../store/usePromptsStore';
+import { useWorkspaceStore } from '../../store/useWorkspaceStore';
+import { useMirrorStatusStore } from '../../store/useMirrorStatusStore';
 import Tooltip from './Tooltip';
 import { HexColorPicker } from 'react-colorful';
 import { Trash2, Plus } from 'lucide-react';
-import GlobalDictationSettings from './GlobalDictationSettings';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -33,7 +34,7 @@ interface Prompt {
   file_paths?: string[];
 }
 
-type SettingsTab = 'shortcuts' | 'fonts' | 'colors' | 'ai' | 'dictation';
+type SettingsTab = 'shortcuts' | 'fonts' | 'colors' | 'ai';
 
 const DEFAULT_DOC_FILE_PATH = '/Users/fedor/Global-Templates/🧩 Code-Patterns/документация/docs-rules.prompt.md';
 
@@ -464,6 +465,136 @@ function normalizeHexValue(raw: string): string | null {
   return null;
 }
 
+// ClaudeMdMirrorBlock — секция «Зеркала CLAUDE.md» в табе «Системные».
+// Полностью read-only кроме toggle и кнопок «Создать сейчас» / «Перезаписать».
+// Статус живёт в useMirrorStatusStore, флаг — в useUIStore.
+function ClaudeMdMirrorBlock({
+  enabled,
+  onToggle,
+  status,
+  activeProjectId,
+}: {
+  enabled: boolean;
+  onToggle: (on: boolean) => void;
+  status: any;
+  activeProjectId: string | null;
+}) {
+  const formatTime = (ms: number | null) => {
+    if (!ms) return null;
+    const d = new Date(ms);
+    const hh = String(d.getHours()).padStart(2, '0');
+    const mm = String(d.getMinutes()).padStart(2, '0');
+    const sameDay = new Date().toDateString() === d.toDateString();
+    return sameDay ? `${hh}:${mm}` : d.toLocaleDateString() + ' ' + `${hh}:${mm}`;
+  };
+  const formatBytes = (n: number) => {
+    if (n < 1024) return `${n} Б`;
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} КБ`;
+    return `${(n / (1024 * 1024)).toFixed(2)} МБ`;
+  };
+
+  const requestCreateNow = async () => {
+    if (!activeProjectId) return;
+    try {
+      await window.require('electron').ipcRenderer.invoke('mirror:create-now', { projectId: activeProjectId });
+    } catch {}
+  };
+
+  return (
+    <div style={{ padding: '14px', backgroundColor: '#222', border: '1px solid #333', borderRadius: '10px', marginBottom: '12px' }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '10px' }}>
+        <div style={{ fontSize: '11px', fontWeight: '600', color: '#666', textTransform: 'uppercase' }}>
+          Зеркала CLAUDE.md
+        </div>
+        <div
+          onClick={() => onToggle(!enabled)}
+          style={{ width: '32px', height: '18px', borderRadius: '9px', backgroundColor: enabled ? '#22c55e' : '#444', position: 'relative', cursor: 'pointer', transition: 'background-color 0.2s', flexShrink: 0 }}
+        >
+          <div style={{ width: '14px', height: '14px', borderRadius: '50%', backgroundColor: '#fff', position: 'absolute', top: '2px', left: enabled ? '16px' : '2px', transition: 'left 0.2s' }} />
+        </div>
+      </div>
+
+      {!activeProjectId && (
+        <div style={{ fontSize: '11px', color: '#666', lineHeight: 1.5 }}>
+          Открой проект, чтобы увидеть статус его файлов.
+        </div>
+      )}
+
+      {activeProjectId && !status && (
+        <div style={{ fontSize: '11px', color: '#666', lineHeight: 1.5 }}>
+          Загрузка статуса…
+        </div>
+      )}
+
+      {activeProjectId && status && (
+        <>
+          {/* Источник */}
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 8px', backgroundColor: '#1a1a1a', borderRadius: '6px', marginBottom: '6px' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '6px', minWidth: 0 }}>
+              <span style={{ fontSize: '11px', color: status.source.exists ? '#22c55e' : '#ef4444', flexShrink: 0 }}>
+                {status.source.exists ? '✓' : '✕'}
+              </span>
+              <span style={{ fontSize: '12px', color: '#eaeaea', fontFamily: 'monospace' }}>./CLAUDE.md</span>
+              <span style={{ fontSize: '10px', color: '#777', marginLeft: '4px' }}>источник</span>
+            </div>
+            <div style={{ fontSize: '10px', color: '#666', fontFamily: 'monospace' }}>
+              {status.source.exists ? formatBytes(status.source.sizeBytes) : 'не найден'}
+            </div>
+          </div>
+
+          {/* Mirror'ы */}
+          {status.mirrors.map((m: any) => {
+            const lastWrite = formatTime(m.lastWriteAt);
+            const mtimeLabel = formatTime(m.mtime);
+            return (
+              <div key={m.path} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 8px', backgroundColor: '#1a1a1a', borderRadius: '6px', marginBottom: '6px' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '6px', minWidth: 0 }}>
+                  {m.exists ? (
+                    <span style={{ fontSize: '11px', color: m.inSync ? '#22c55e' : '#d97706', flexShrink: 0 }}>
+                      {m.inSync ? '✓' : '⚠'}
+                    </span>
+                  ) : (
+                    <span style={{ fontSize: '11px', color: '#666', flexShrink: 0 }}>○</span>
+                  )}
+                  <span style={{ fontSize: '12px', color: m.exists ? '#eaeaea' : '#666', fontFamily: 'monospace' }}>./{m.name}</span>
+                  {m.exists ? (
+                    <span style={{ fontSize: '10px', color: m.inSync ? '#22c55e88' : '#d9770688', marginLeft: '4px' }}>
+                      {m.inSync ? 'в синхроне' : 'расходится'}
+                    </span>
+                  ) : (
+                    <span style={{ fontSize: '10px', color: '#666', marginLeft: '4px' }}>отсутствует</span>
+                  )}
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexShrink: 0 }}>
+                  {m.exists && (lastWrite || mtimeLabel) && (
+                    <span style={{ fontSize: '10px', color: '#666', fontFamily: 'monospace' }}>
+                      {lastWrite ? `обновлено ${lastWrite}` : `mtime ${mtimeLabel}`}
+                    </span>
+                  )}
+                  {enabled && status.source.exists && (!m.exists || !m.inSync) && (
+                    <button
+                      onClick={requestCreateNow}
+                      style={{ background: '#2a2a2a', border: '1px solid #393939', borderRadius: '4px', color: '#aaa', fontSize: '10px', cursor: 'pointer', padding: '2px 7px' }}
+                    >
+                      {m.exists ? 'Перезаписать' : 'Создать сейчас'}
+                    </button>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+
+          <div style={{ fontSize: '11px', color: '#666', marginTop: '8px', lineHeight: 1.5 }}>
+            {enabled
+              ? 'CLAUDE.md — единственный редактируемый файл. Правка зеркал перезатирается копией источника.'
+              : 'Тогл выключен. Файлы независимы и ничего не переписывается.'}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 // SessionStatusesEditor — компактный CRUD над sessionStatuses + shape/size маркера.
 // Одна колонка из 2-колоночного layout «Системные».
 function SessionStatusesEditor() {
@@ -706,16 +837,22 @@ function ProcessBarEditor() {
           position: 'absolute',
           [processBar.position === 'right' ? 'right' : 'left']: 0,
           top: 0, bottom: 0, width: '3px',
+          overflow: 'hidden',
           ['--process-bar-color-a' as any]: processBar.colorA,
           ['--process-bar-color-b' as any]: processBar.colorB,
           ['--process-bar-duration' as any]: `${processBar.durationMs}ms`,
         }}
-      />
+      >
+        {/* Блик AI-busy крутится в превью постоянно — юзер видит как он
+            наслаивается на пульс цветом. В рантайме блик появляется только
+            когда AI стримит (isBusy). */}
+        <div className="tab-process-bar-ai-shimmer-overlay" />
+      </div>
       <div style={{
         position: 'absolute', left: 12, right: 12, top: '50%', transform: 'translateY(-50%)',
         fontSize: '11px', color: '#888', textAlign: 'center',
       }}>
-        {processBar.enabled ? `пульс ${(processBar.durationMs / 1000).toFixed(1)}s` : 'статика'} · {processBar.position === 'right' ? 'справа' : 'слева'}
+        {processBar.enabled ? `пульс ${(processBar.durationMs / 1000).toFixed(1)}s` : 'статика'} · {processBar.position === 'right' ? 'справа' : 'слева'} · блик AI
       </div>
     </div>
   );
@@ -883,6 +1020,224 @@ function ProcessBarEditor() {
   );
 }
 
+// AIPulseEditor — настройка фона таба пока AI «думает» (claude/gemini/sdk busy-state).
+// Идентичная структура с ProcessBarEditor: enabled (мигание on/off), colorA (нижняя/
+// статичная фаза), colorB (верхняя фаза = пик пульса), durationMs. Отличие — нет
+// position toggle: фон занимает весь таб, у него нет «стороны». Цвет A может быть
+// 'transparent' (дефолт — таб мигает только в сторону colorB и обратно к прозрачности),
+// что отражает реальный кейс «таб подсветиться когда AI отвечает».
+function AIPulseEditor() {
+  const aiPulse = useUIStore((s) => s.aiPulse);
+  const setAiPulse = useUIStore((s) => s.setAiPulse);
+
+  const [pickerOpen, setPickerOpen] = useState<'a' | 'b' | null>(null);
+  const [hexDraftA, setHexDraftA] = useState<string | null>(null);
+  const [hexDraftB, setHexDraftB] = useState<string | null>(null);
+
+  const containerRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!pickerOpen) return;
+    const onDown = (e: MouseEvent) => {
+      const t = e.target as Node | null;
+      if (containerRef.current && t && !containerRef.current.contains(t)) setPickerOpen(null);
+    };
+    window.addEventListener('mousedown', onDown);
+    return () => window.removeEventListener('mousedown', onDown);
+  }, [pickerOpen]);
+
+  // Preview — узкий card-таб, мигающий в реальном цвете/цикле. Использует локальные
+  // CSS vars в style, не зависит от :root → обновляется ДО App-effect'а синхронизации.
+  // Чтобы пульс был плавным (см. App.tsx::aiPulse effect — color-mix внутри keyframe
+  // не интерполируется в Chromium), вычисляем rgba endpoints здесь же.
+  const hexToRgba = (hex: string, alpha: number): string => {
+    if (hex === 'transparent') return 'rgba(0,0,0,0)';
+    const clean = hex.replace(/^#/, '');
+    if (clean.length !== 6) return `rgba(218,119,86,${alpha})`;
+    const r = parseInt(clean.slice(0, 2), 16);
+    const g = parseInt(clean.slice(2, 4), 16);
+    const b = parseInt(clean.slice(4, 6), 16);
+    if (isNaN(r) || isNaN(g) || isNaN(b)) return `rgba(218,119,86,${alpha})`;
+    return `rgba(${r},${g},${b},${alpha})`;
+  };
+  const previewColorA = aiPulse.colorA === 'transparent' ? 'rgba(0,0,0,0)' : hexToRgba(aiPulse.colorA, 1);
+  const previewColorBPeak = hexToRgba(aiPulse.colorB, 0.22);
+  const previewColorBStatic = hexToRgba(aiPulse.colorB, 0.14);
+
+  const previewBar = (
+    <div style={{
+      position: 'relative', width: '100%', height: '32px',
+      backgroundColor: '#252526', border: '1px solid #333',
+      borderRadius: '6px', overflow: 'hidden',
+    }}>
+      <div
+        className={aiPulse.enabled ? 'tab-ai-busy-shimmer' : 'tab-ai-busy-static'}
+        style={{
+          position: 'absolute', inset: 0,
+          ['--ai-pulse-color-a' as any]: previewColorA,
+          ['--ai-pulse-color-b' as any]: previewColorBPeak,
+          ['--ai-pulse-color-static' as any]: previewColorBStatic,
+          ['--ai-pulse-duration' as any]: `${aiPulse.durationMs}ms`,
+        }}
+      />
+      <div style={{
+        position: 'absolute', left: 12, right: 12, top: '50%', transform: 'translateY(-50%)',
+        fontSize: '11px', color: '#aaa', textAlign: 'center', pointerEvents: 'none',
+      }}>
+        AI thinking · {aiPulse.enabled ? `${(aiPulse.durationMs / 1000).toFixed(1)}s` : 'static'}
+      </div>
+    </div>
+  );
+
+  const colorChip = (which: 'a' | 'b') => {
+    const current = which === 'a' ? aiPulse.colorA : aiPulse.colorB;
+    const draft = which === 'a' ? hexDraftA : hexDraftB;
+    const setDraft = which === 'a' ? setHexDraftA : setHexDraftB;
+    const disabled = which === 'b' && !aiPulse.enabled;
+
+    return (
+      <div style={{
+        position: 'relative',
+        display: 'inline-flex', alignItems: 'center', gap: '6px',
+        padding: '4px 8px',
+        backgroundColor: '#1e1e1e', border: '1px solid #333', borderRadius: '8px',
+        opacity: disabled ? 0.4 : 1,
+        flexShrink: 0,
+      }}>
+        <button
+          onClick={() => { if (!disabled) setPickerOpen(pickerOpen === which ? null : which); }}
+          style={{
+            width: 16, height: 16, borderRadius: '50%',
+            backgroundColor: current === 'transparent' ? 'rgba(255,255,255,0.05)' : current,
+            border: '2px solid rgba(255,255,255,0.15)',
+            cursor: disabled ? 'not-allowed' : 'pointer',
+            flexShrink: 0, padding: 0,
+          }}
+          title="Палитра"
+        />
+        <span style={{ fontSize: '11px', color: '#888' }}>
+          {which === 'a' ? 'A' : 'B'}
+        </span>
+        <input
+          type="text"
+          disabled={disabled}
+          value={(draft ?? current).replace(/^#/, '')}
+          onChange={(e) => {
+            const next = `#${e.target.value}`;
+            setDraft(next);
+            const norm = normalizeHexValue(next);
+            if (norm) setAiPulse(which === 'a' ? { colorA: norm } : { colorB: norm });
+          }}
+          onBlur={() => setDraft(null)}
+          maxLength={7}
+          style={{
+            width: '60px', padding: '3px 6px',
+            backgroundColor: '#1a1a1a', border: '1px solid #333', borderRadius: '6px',
+            color: '#ccc', fontSize: '11px', fontFamily: 'monospace',
+            outline: 'none', textTransform: 'uppercase',
+          }}
+        />
+        {/* Для colorA — отдельная кнопка-чип «transparent». ColorA выступает как
+            нижняя/статичная фаза, юзеру обычно нужно «фон таба до пика прозрачный».
+            Hex-input не умеет прозрачность, поэтому отдельный toggle. */}
+        {which === 'a' && (
+          <button
+            onClick={() => setAiPulse({ colorA: aiPulse.colorA === 'transparent' ? '#000000' : 'transparent' })}
+            style={{
+              padding: '2px 6px', fontSize: '10px',
+              backgroundColor: aiPulse.colorA === 'transparent' ? 'rgba(74,222,128,0.18)' : '#1a1a1a',
+              color: aiPulse.colorA === 'transparent' ? '#86efac' : '#888',
+              border: '1px solid #333', borderRadius: '4px', cursor: 'pointer',
+            }}
+            title="Прозрачный фон в нижней фазе пульса"
+          >∅</button>
+        )}
+        {pickerOpen === which && (
+          <div
+            style={{
+              position: 'absolute', top: '100%', left: 0,
+              marginTop: '6px', zIndex: 50,
+              padding: '12px',
+              backgroundColor: '#1a1a1a', border: '1px solid #444', borderRadius: '10px',
+              boxShadow: '0 10px 30px rgba(0,0,0,0.5)',
+            }}
+            onMouseDown={(e) => e.stopPropagation()}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <HexColorPicker
+              color={current === 'transparent' ? '#000000' : current}
+              onChange={(c) => setAiPulse(which === 'a' ? { colorA: c.toUpperCase() } : { colorB: c.toUpperCase() })}
+            />
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  return (
+    <div ref={containerRef} style={{ paddingLeft: '12px' }}>
+      {previewBar}
+
+      <div style={{
+        display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '8px',
+        marginTop: '10px',
+      }}>
+        <label
+          className="flex items-center gap-2 cursor-pointer select-none"
+          style={{
+            padding: '4px 8px',
+            backgroundColor: '#1e1e1e', border: '1px solid #333', borderRadius: '8px',
+            flexShrink: 0,
+          }}
+        >
+          <div
+            className="relative w-7 h-3.5 rounded-full transition-colors shrink-0"
+            style={{ backgroundColor: aiPulse.enabled ? 'rgba(74, 222, 128, 0.4)' : 'rgba(255,255,255,0.1)' }}
+            onClick={() => setAiPulse({ enabled: !aiPulse.enabled })}
+          >
+            <div
+              className="absolute top-0.5 w-2.5 h-2.5 rounded-full transition-all"
+              style={{
+                left: aiPulse.enabled ? '15px' : '2px',
+                backgroundColor: aiPulse.enabled ? '#4ade80' : '#666',
+              }}
+            />
+          </div>
+          <span style={{ fontSize: '11px', color: '#ccc' }}>Пульс</span>
+        </label>
+
+        {colorChip('a')}
+        {colorChip('b')}
+
+        <div style={{
+          display: 'inline-flex', alignItems: 'center', gap: '6px',
+          padding: '4px 8px',
+          backgroundColor: '#1e1e1e', border: '1px solid #333', borderRadius: '8px',
+          opacity: aiPulse.enabled ? 1 : 0.4,
+          flexShrink: 0,
+        }}>
+          <span style={{ fontSize: '11px', color: '#888' }}>Цикл</span>
+          <input
+            type="number"
+            disabled={!aiPulse.enabled}
+            min={300}
+            max={6000}
+            step={100}
+            value={aiPulse.durationMs}
+            onChange={(e) => setAiPulse({ durationMs: Number(e.target.value) })}
+            style={{
+              width: '54px', padding: '3px 6px',
+              backgroundColor: '#1a1a1a', border: '1px solid #333', borderRadius: '6px',
+              color: '#ccc', fontSize: '11px', fontFamily: 'monospace', outline: 'none',
+              textAlign: 'right',
+            }}
+          />
+          <span style={{ fontSize: '10px', color: '#555' }}>ms</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProps) {
   // Use last active tab if opened before, otherwise default to shortcuts
   const [activeTab, setActiveTab] = useState<SettingsTab>(() => {
@@ -896,7 +1251,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const prevIsOpenRef = useRef(isOpen);
   useEffect(() => {
     if (isOpen && !prevIsOpenRef.current && initialTab) {
-      const valid: SettingsTab[] = ['shortcuts', 'fonts', 'colors', 'ai', 'dictation'];
+      const valid: SettingsTab[] = ['shortcuts', 'fonts', 'colors', 'ai'];
       if (valid.includes(initialTab as SettingsTab)) {
         setActiveTab(initialTab as SettingsTab);
       }
@@ -920,6 +1275,8 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const timelineFontSize = useUIStore((s) => s.timelineFontSize);
   const timelineLineClamp = useUIStore((s) => s.timelineLineClamp);
   const setTimelineLineClamp = useUIStore((s) => s.setTimelineLineClamp);
+  const promptQueueChipLineClamp = useUIStore((s) => s.promptQueueChipLineClamp);
+  const setPromptQueueChipLineClamp = useUIStore((s) => s.setPromptQueueChipLineClamp);
   const setTerminalFontSize = useUIStore((s) => s.setTerminalFontSize);
   const sdkFontSize = useUIStore((s) => s.sdkFontSize);
   const setSdkFontSize = useUIStore((s) => s.setSdkFontSize);
@@ -948,6 +1305,10 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const tabPreviewRatioH = useUIStore((s) => s.tabPreviewRatioH);
   const setTabPreviewRatio = useUIStore((s) => s.setTabPreviewRatio);
   const semanticIndexParallelism = useUIStore((s) => s.semanticIndexParallelism);
+  const claudeMdMirrorEnabled = useUIStore((s) => s.claudeMdMirrorEnabled);
+  const setClaudeMdMirrorEnabled = useUIStore((s) => s.setClaudeMdMirrorEnabled);
+  const activeProjectId = useWorkspaceStore((s) => s.activeProjectId);
+  const mirrorStatus = useMirrorStatusStore((s) => (activeProjectId ? s.byProject[activeProjectId] : undefined));
   const setSemanticIndexParallelism = useUIStore((s) => s.setSemanticIndexParallelism);
   // Геометрия табов — Settings → Размеры → ТАБЫ → Терминал/Проекты.
   const tabGeometry = useUIStore((s) => s.tabGeometry);
@@ -1781,8 +2142,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
             { id: 'ai', label: 'AI' },
             { id: 'fonts', label: 'Размеры' },
             { id: 'colors', label: 'Системные' },
-            { id: 'shortcuts', label: 'Горячие клавиши' },
-            { id: 'dictation', label: 'Диктовка' }
+            { id: 'shortcuts', label: 'Горячие клавиши' }
           ] as { id: SettingsTab; label: string }[]).map((tab) => (
             <button
               key={tab.id}
@@ -1907,6 +2267,9 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
               <SettingsSubSectionHeader title="Полоска процесса" />
               <ProcessBarEditor />
 
+              <SettingsSubSectionHeader title="Фон AI-загрузки" />
+              <AIPulseEditor />
+
               {/* 2. ТЕРМИНАЛ — шрифт самого терминала + Таймлайн как часть терминала */}
               <SettingsSectionHeader title="Терминал" />
               <SettingsGrid4>
@@ -1918,6 +2281,11 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
               <SettingsGrid4>
                 <FontSizeSlider label="Шрифт" value={timelineFontSize} onChange={setTimelineFontSize} min={10} max={18} />
                 <FontSizeSlider label="Строки" value={timelineLineClamp} onChange={setTimelineLineClamp} min={1} max={10} suffix="" />
+              </SettingsGrid4>
+
+              <SettingsSubSectionHeader title="Run after" />
+              <SettingsGrid4>
+                <FontSizeSlider label="Строки в чипе" description="Сколько строк текста промпта показывать в каждом чипе очереди (1 = ellipsis в одну строку)" value={promptQueueChipLineClamp} onChange={setPromptQueueChipLineClamp} min={1} max={10} suffix="" />
               </SettingsGrid4>
 
               {/* 3. САЙДБАР — файловый (Cmd+/): шрифт + превью файла + поведение */}
@@ -1967,6 +2335,18 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
 
           {activeTab === 'colors' && (
             <>
+              {/* Зеркала CLAUDE.md — auto-mirror одного исходного файла в AGENTS.md/GEMINI.md
+                  в корне активного проекта. Watcher в main всегда жив (статус-инфо
+                  должна быть свежей при открытии Settings), а сами writes делает только
+                  когда тогл ON. Источник истины — CLAUDE.md; mirror'ы перезатираются
+                  при любой ручной правке. */}
+              <ClaudeMdMirrorBlock
+                enabled={claudeMdMirrorEnabled}
+                onToggle={setClaudeMdMirrorEnabled}
+                status={mirrorStatus}
+                activeProjectId={activeProjectId}
+              />
+
               {/* Семантическая индексация — единственная честно «системная» настройка
                   с runtime-эффектом. Управляет --parallel флагом, который main
                   передаёт build-index.sh при запуске. Выше 20 параллельных claude'ов
@@ -1994,10 +2374,6 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                 </div>
               </div>
             </>
-          )}
-
-          {activeTab === 'dictation' && (
-            <GlobalDictationSettings />
           )}
 
           {activeTab === 'ai' && (

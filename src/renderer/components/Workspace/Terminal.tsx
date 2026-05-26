@@ -65,7 +65,73 @@ import { useWorkspaceStore, type PendingAction } from '../../store/useWorkspaceS
 import { PromptQueueOverlay } from './PromptQueueOverlay';
 import { terminalRegistry } from '../../utils/terminalRegistry';
 import { log } from '../../utils/logger';
-import { markPendingResume, clearPendingResume, isStaleAgainstPending } from '../../utils/pendingResume';
+import { markPendingResume, clearPendingResume, isStaleAgainstPending, getPendingResume } from '../../utils/pendingResume';
+
+// ============================================================================
+// EffortInject TUI-readiness diagnostic instrumentation (temporary, May 2026)
+// ============================================================================
+// Tracks the first 5 seconds of PTY output after `claude:process-started` so we
+// can see exactly when Claude TUI signals readiness (sync markers \x1b[?2026l,
+// bracketed-paste mode \x1b[?2004h, prompt boundary chars `╰` / `⏵`) RELATIVE
+// to when our /effort inject would fire. Goal: determine the right deterministic
+// gate for inject so race-conditions with TUI init disappear.
+//
+// Logs are printed via console with CSS styling — bright red background so they
+// stand out in DevTools when scrolling through hundreds of lines.
+//
+// Remove after diagnosis is complete (search for "EffortDiag" callers).
+// ============================================================================
+const _effortDiagStart = new Map<string, number>();   // tabId → process-started ts
+const _effortDiagSeen = new Map<string, Set<string>>(); // tabId → set of markers already logged
+
+function _effortDiag(tabId: string, label: string, extra?: string) {
+  const start = _effortDiagStart.get(tabId);
+  if (start === undefined) return;
+  const elapsed = Date.now() - start;
+  if (elapsed > 5000) return; // window closed
+  console.log(
+    '%c[EffortDiag]%c ' + label + ' %c+' + elapsed + 'ms%c tab=' + tabId.slice(-8) + (extra ? ' · ' + extra : ''),
+    'background:#c0392b;color:#fff;padding:2px 6px;border-radius:3px;font-weight:bold;',
+    'color:#e74c3c;font-weight:bold;',
+    'background:#f39c12;color:#000;padding:1px 5px;border-radius:2px;font-weight:bold;',
+    'color:#888;'
+  );
+}
+
+function _effortDiagOnce(tabId: string, key: string, label: string, extra?: string) {
+  let seen = _effortDiagSeen.get(tabId);
+  if (!seen) { seen = new Set(); _effortDiagSeen.set(tabId, seen); }
+  if (seen.has(key)) return;
+  seen.add(key);
+  _effortDiag(tabId, label, extra);
+}
+
+function _effortDiagScan(tabId: string, data: string) {
+  if (!_effortDiagStart.has(tabId)) return;
+  // \x1b[?2026l — sync output end (Ink frame rendered)
+  if (data.indexOf('\x1b[?2026l') !== -1) {
+    _effortDiagOnce(tabId, 'sync-end-first', '🟢 FIRST sync-marker \\x1b[?2026l (TUI frame rendered)');
+  }
+  // \x1b[?2004h — bracketed paste mode ON
+  if (data.indexOf('\x1b[?2004h') !== -1) {
+    _effortDiagOnce(tabId, 'bracketed-on', '🟢 bracketed-paste ON (\\x1b[?2004h)');
+  }
+  // \x1b[?2004l — bracketed paste mode OFF (regression case)
+  if (data.indexOf('\x1b[?2004l') !== -1) {
+    _effortDiag(tabId, '🔴 bracketed-paste OFF (\\x1b[?2004l) — DEC 2004 dropped');
+  }
+  // Prompt-ready box chars
+  if (data.indexOf('╰') !== -1) {
+    _effortDiagOnce(tabId, 'box-bottom', '🟢 box-bottom `╰` seen (prompt input ready)');
+  }
+  if (data.indexOf('⏵') !== -1) {
+    _effortDiagOnce(tabId, 'prompt-arrow', '🟢 prompt-arrow `⏵` seen');
+  }
+  // OSC 133 A — shell prompt ready
+  if (data.indexOf('\x1b]133;A') !== -1) {
+    _effortDiagOnce(tabId, 'osc133a', '🟢 OSC 133 A (shell prompt ready)');
+  }
+}
 
 // Get buffer management functions outside of component to avoid re-renders
 const getBufferActions = () => ({
@@ -388,6 +454,22 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
     activeRef.current = effectiveActive;
   }, [effectiveActive]);
 
+  // Cmd+Tab focus restore: when our window becomes frontmost via Cmd+Tab,
+  // macOS does NOT restore DOM focus to any element — Chromium's NSEvent
+  // monitor sees Cmd+V but routes it to nowhere, so paste from external
+  // dictation apps silently drops. Per-tab refocus on this event.
+  useEffect(() => {
+    if (!effectiveActive) return;  // only the currently-visible terminal grabs focus
+    const onRefocus = () => {
+      const term = terminalRegistry.get(tabId);
+      if (term) {
+        try { term.focus(); } catch {}
+      }
+    };
+    window.addEventListener('nt:window-refocus-active', onRefocus);
+    return () => window.removeEventListener('nt:window-refocus-active', onRefocus);
+  }, [tabId, effectiveActive]);
+
   // Diagnostic: log overlay-gate transitions for this Claude tab.
   // Fires ONLY on transitions (not every render) by tracking prev tuple in a ref.
   // Order: effectiveActive, isClaudeTab, hasClaudeSession, claudeProcessAlive.
@@ -515,6 +597,9 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
     const handleData = (_: any, payload: { tabId: string; data: string }) => {
       if (payload.tabId !== tabId) return;
 
+      // EffortDiag: scan first 5s of PTY output for TUI-readiness markers.
+      _effortDiagScan(tabId, payload.data);
+
       // Execute pendingAction on first PTY output (= shell is ready)
       if (!pendingActionExecuted.current) {
         pendingActionExecuted.current = true;
@@ -578,18 +663,72 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
     // Fresh Claude process started for this tab (new PID seen in bridge cache).
     // Fires once per real spawn — unlike session-detected which re-syncs on every
     // bridge update of the same session. Right place to auto-inject /effort.
+    //
+    // Kill-switch policy:
+    // - effort === 'none' → do nothing (user opted out, both inject + cleanup skipped)
+    // - this is a --resume (pendingResume marker active) → do nothing
+    //     Reason: 2026-05-21 incident traced a race where inject fired in the
+    //     same ms as Bridge:Fresh during resume → safePasteAndSubmit's Ctrl+S
+    //     stash collided with our paste, 303 bytes of user buffer leaked into
+    //     Claude TUI input. Effort level is preserved in Claude TUI state
+    //     across resume anyway, so injecting on resume is both unnecessary
+    //     and dangerous. Only fire on truly fresh sessions (no --resume).
+    // - claude TUI is fresh start → inject `/effort N` + arm cleanup
     const handleProcessStarted = (_: any, data: { tabId: string; sessionId: string; claudePid: number }) => {
       if (data.tabId !== tabId) return;
       const eff = useUIStore.getState().defaultClaudeEffort;
-      console.log('[Terminal:EffortInject] tab=' + tabId.slice(-12) + ' pid=' + data.claudePid + ' default=' + eff);
-      if (!eff || eff === 'none') return;
+      const pending = getPendingResume(tabId);
+      const isResume = pending !== null;
+
+      // EffortDiag: open 5-second observation window for this tab.
+      _effortDiagStart.set(tabId, Date.now());
+      _effortDiagSeen.set(tabId, new Set());
+      _effortDiag(tabId, '⚡ PROCESS-STARTED', 'pid=' + data.claudePid + ' effort=' + eff + ' isResume=' + isResume);
+      setTimeout(() => {
+        _effortDiag(tabId, '🏁 5s window closed — END OF DIAG');
+        _effortDiagStart.delete(tabId);
+        _effortDiagSeen.delete(tabId);
+      }, 5100);
+
+      console.log('[Terminal:EffortInject] tab=' + tabId.slice(-12) + ' pid=' + data.claudePid + ' default=' + eff + ' isResume=' + isResume);
+
+      // Kill-switch: effort='none' fully disables both inject and the JSONL
+      // cleanup that follows. User chose to opt out of all our writes to the
+      // session transcript.
+      if (!eff || eff === 'none') {
+        _effortDiag(tabId, '⛔ INJECT SKIPPED', 'effort=none (kill-switch)');
+        console.log('[Terminal:EffortInject] tab=' + tabId.slice(-12) + ' SKIP — effort=none (JSONL editing fully off)');
+        return;
+      }
+
+      // Resume guard: skip inject + cleanup on --resume. Effort survives in
+      // Claude TUI memory across resumes; we have nothing to apply.
+      if (isResume) {
+        _effortDiag(tabId, '⛔ INJECT SKIPPED', 'isResume=true (resume-guard)');
+        console.log('[Terminal:EffortInject] tab=' + tabId.slice(-12) + ' SKIP — resume in flight (effort preserved by Claude TUI state)');
+        return;
+      }
+
+      // No live JSONL cleanup: the /effort wrapper sits in the file as a normal
+      // <command-name> record, Timeline filters it out via the tag-filter in
+      // claude-data.js (parseTimelineEntries skips `<command-name>` / `<local-command-stdout>`
+      // user-records). Live truncate+relink used to run here but created phantom-parent
+      // chain-breaks: cleanup tore the wrapper out before the user's first real prompt
+      // arrived, then that prompt landed with parentUuid pointing at the deleted wrapper
+      // → orphan → red zone in Timeline. The wrapper is invisible to the user either way;
+      // leaving it in the file makes parentUuid chains intact.
+
       // No setTimeout: safePasteAndSubmit is fully event-driven — it sends Ctrl+S → waits
       // for Ink's sync marker → bracketed-paste → waits again → Enter. Sync marker arrives
       // only when Ink has actually rendered the prompt input. If Claude isn't ready yet,
       // we wait *inside* that function rather than blindly stalling 800ms here.
       // The /effort dialog auto-confirmer in main handles the "Change effort level?"
       // prompt that may appear on a fresh directory.
-      ipcRenderer.invoke('claude:send-command', tabId, '/effort ' + eff).catch((e: unknown) => {
+      _effortDiag(tabId, '🚀 INJECT FIRED', '/effort ' + eff + ' — sending to claude:send-command');
+      ipcRenderer.invoke('claude:send-command', tabId, '/effort ' + eff).then(() => {
+        _effortDiag(tabId, '✅ INJECT COMPLETED', '/effort ' + eff + ' — Claude acknowledged');
+      }).catch((e: unknown) => {
+        _effortDiag(tabId, '❌ INJECT FAILED', String(e));
         console.error('[Terminal:EffortInject] failed', e);
       });
     };

@@ -44,7 +44,7 @@ setTabNotesStore(activeTabId, newNotes)
 - **Через `useRef` хранить latest tabNotes (updateRef в useEffect).** Решает stale closure в async, но mirror остаётся, ping-pong потенциал остаётся, doc-vs-code drift остаётся. Полумера.
 
 ## Принцип
-Переносимый — см. [methodology/design.md::State-mirror через useState — ловушка stale read в async](../methodology/design.md). Любой раз когда компонент мирорит reactive-state в локальный `useState` — это контракт «локальный snapshot отстаёт на 1 кадр + closure-зафризен в async». Если в компоненте есть async handlers пишущие обратно в store — mirror **обязательно** даст concurrent-write race.
+Переносимый — см. [methodology/переносимый-дизайн.md::State-mirror через useState — ловушка stale read в async](../methodology/переносимый-дизайн.md). Любой раз когда компонент мирорит reactive-state в локальный `useState` — это контракт «локальный snapshot отстаёт на 1 кадр + closure-зафризен в async». Если в компоненте есть async handlers пишущие обратно в store — mirror **обязательно** даст concurrent-write race.
 
 ## Связанные файлы
 - `src/renderer/components/Workspace/panels/InfoPanel.tsx` — `useState+useEffect` mirror удалён, `tabNotes` теперь reactive selector. `handleGenerateDescription` использует `useWorkspaceStore.getState()` после `await`.

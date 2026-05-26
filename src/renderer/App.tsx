@@ -8,6 +8,7 @@ import Dashboard from './components/Dashboard/Dashboard';
 import Workspace from './components/Workspace/Workspace';
 import StatusBar from './components/StatusBar';
 import ToastContainer from './components/UI/Toast';
+import ShutdownOverlay from './components/UI/ShutdownOverlay';
 import EditProjectModal from './components/UI/EditProjectModal';
 import SessionInputModal from './components/UI/SessionInputModal';
 import SettingsModal from './components/UI/SettingsModal';
@@ -23,6 +24,7 @@ import './utils/logger';
 import { usePromptQueueRunner } from './hooks/usePromptQueueRunner';
 import { markPendingResume } from './utils/pendingResume';
 import { hydratePromptQueueStore } from './store/usePromptQueueStore';
+import { useMirrorStatusStore } from './store/useMirrorStatusStore';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -401,6 +403,41 @@ function App() {
     root.style.setProperty('--process-bar-duration', `${processBar.durationMs}ms`);
   }, [processBar.colorA, processBar.colorB, processBar.durationMs]);
 
+  // Sync aiPulse settings → CSS variables on :root.
+  // Keyframe tab-ai-busy-pulse читает --ai-pulse-color-a/b/duration; раньше
+  // полагался на --process-bar-color-b (один цвет на два разных индикатора).
+  // ВАЖНО: вычисляем peak-color (rgba) на JS-стороне, не используем
+  // color-mix(...) внутри keyframe — Chromium не всегда плавно интерполирует
+  // между двумя color-mix() значениями, юзер видит как «через разный
+  // промежуток происходит мигание», без плавности. Plain rgba endpoints
+  // интерполируются по каждому каналу как обычные числа → плавно.
+  const aiPulse = useUIStore((s) => s.aiPulse);
+  useEffect(() => {
+    const root = document.documentElement;
+    const hexToRgba = (hex: string, alpha: number): string => {
+      if (hex === 'transparent') return 'rgba(0,0,0,0)';
+      const clean = hex.replace(/^#/, '');
+      if (clean.length !== 6) return `rgba(218,119,86,${alpha})`;
+      const r = parseInt(clean.slice(0, 2), 16);
+      const g = parseInt(clean.slice(2, 4), 16);
+      const b = parseInt(clean.slice(4, 6), 16);
+      if (isNaN(r) || isNaN(g) || isNaN(b)) return `rgba(218,119,86,${alpha})`;
+      return `rgba(${r},${g},${b},${alpha})`;
+    };
+    // colorA = нижняя фаза. 'transparent' интерпретируем как полностью прозрачный.
+    const colorALow = aiPulse.colorA === 'transparent'
+      ? 'rgba(0,0,0,0)'
+      : hexToRgba(aiPulse.colorA, 1);
+    // colorB = пик. 22% alpha — заметная подсветка таба без подавления текста.
+    const colorBPeak = hexToRgba(aiPulse.colorB, 0.22);
+    // Static-вариант (enabled=false) — мягче, 14% alpha.
+    const colorBStatic = hexToRgba(aiPulse.colorB, 0.14);
+    root.style.setProperty('--ai-pulse-color-a', colorALow);
+    root.style.setProperty('--ai-pulse-color-b', colorBPeak);
+    root.style.setProperty('--ai-pulse-color-static', colorBStatic);
+    root.style.setProperty('--ai-pulse-duration', `${aiPulse.durationMs}ms`);
+  }, [aiPulse.colorA, aiPulse.colorB, aiPulse.durationMs]);
+
   useEffect(() => {
     const onSettingsOpen = (e: Event) => {
       const ce = e as CustomEvent<{ tab?: string }>;
@@ -418,12 +455,51 @@ function App() {
       setSettingsInitialTab(tab);
       setSettingsOpen(true);
     };
+    // Boot-time AutoRepair summary — main process scans all session JSONLs at
+    // startup, patches dangling parentUuid that would have truncated Claude TUI
+    // history on next resume. Surface to user so they know background recovery
+    // ran and what it covered.
+    const onAutoRepairSummary = (
+      _e: any,
+      payload: { sessionsFixed?: number; totalRepaired?: number; scanned?: number } | undefined,
+    ) => {
+      const sf = payload?.sessionsFixed || 0;
+      const tr = payload?.totalRepaired || 0;
+      if (sf <= 0) return;
+      showToast(
+        `Auto-repair при старте: починили ${tr} orphan parentUuid в ${sf} сесси${sf === 1 ? 'и' : 'ях'}. Без этого Claude обрезал бы историю при resume.`,
+        'info',
+        10000,
+        false,
+      );
+    };
+    // Anti-arrow-mash guard fired in main — uniform run of arrow escape codes
+    // from xterm.js was blocked (likely stuck physical key or accessibility
+    // helper). Surface a brief warning so user knows a keystroke didn't go
+    // through and can release the key / unplug the device.
+    const onArrowMashBlocked = (
+      _e: any,
+      payload: { count?: number; arrowName?: string } | undefined,
+    ) => {
+      const n = payload?.count || 0;
+      const arrow = payload?.arrowName || '?';
+      showToast(
+        `Заблокирован поток из ${n} стрелок ${arrow} от клавиатуры — возможно залипла клавиша.`,
+        'warning',
+        6000,
+        false,
+      );
+    };
     try {
       const { ipcRenderer } = (window as any).require('electron');
       ipcRenderer.on('open-settings', onOpenSettingsIpc);
+      ipcRenderer.on('jsonl-auto-repair:summary', onAutoRepairSummary);
+      ipcRenderer.on('arrow-mash:blocked', onArrowMashBlocked);
       return () => {
         window.removeEventListener('settings:open', onSettingsOpen);
         try { ipcRenderer.removeListener('open-settings', onOpenSettingsIpc); } catch {}
+        try { ipcRenderer.removeListener('jsonl-auto-repair:summary', onAutoRepairSummary); } catch {}
+        try { ipcRenderer.removeListener('arrow-mash:blocked', onArrowMashBlocked); } catch {}
       };
     } catch {
       return () => window.removeEventListener('settings:open', onSettingsOpen);
@@ -982,7 +1058,11 @@ function App() {
     // load session history). Reply with same requestId so the HTTP handler in
     // web-server.js can resolve its bridgeRequest promise.
     const handleWebBridge = async (_: any, { requestId, action, payload }: { requestId: string; action: string; payload: any }) => {
+      const startedAt = Date.now();
+      console.log('[BridgeDiag:R] RECV rid=' + requestId + ' action=' + action);
       const reply = (ok: boolean, data?: any, error?: string) => {
+        const elapsed = Date.now() - startedAt;
+        console.log('[BridgeDiag:R] REPLY rid=' + requestId + ' action=' + action + ' ok=' + ok + ' elapsedMs=' + elapsed + ' err=' + (error || '-'));
         ipcRenderer.send('web:bridge-reply', { requestId, ok, data, error });
       };
       try {
@@ -991,6 +1071,27 @@ function App() {
           // Live snapshot of which projects are currently open in the desktop UI.
           // Used by /api/projects to split the mobile list into Active vs Other.
           return reply(true, { ids: Array.from(state.openProjects.keys()), activeProjectId: state.activeProjectId || null });
+        }
+        if (action === 'getProjectTabsLive') {
+          // Live tabs from an open project in renderer Zustand. Used by
+          // /api/projects/:id/tabs as a primary source (or fallback when
+          // SQLite doesn't have the project — e.g. unsaved draft projects).
+          const { projectId } = payload || {};
+          if (!projectId) return reply(false, null, 'projectId required');
+          const ws = state.openProjects.get(projectId);
+          if (!ws) return reply(false, null, 'project not open in UI');
+          const tabs = Array.from(ws.tabs.values()).map((t: any) => ({
+            tabId: t.tabId,
+            name: t.name,
+            tabType: t.tabType || 'terminal',
+            commandType: t.commandType,
+            cwd: t.cwd,
+            claudeSessionId: t.claudeSessionId,
+          }));
+          return reply(true, {
+            project: { id: projectId, name: ws.projectPath?.split('/').pop() || projectId, path: ws.projectPath },
+            tabs,
+          });
         }
         if (action === 'createSDKTab') {
           const { projectId } = payload || {};
@@ -1174,6 +1275,40 @@ function App() {
     };
     ipcRenderer.on('gemini:busy-state', handleGeminiBusy);
 
+    // Cmd+Tab refocus: main process fires this on every BrowserWindow 'focus'
+    // event. We re-broadcast it as a DOM CustomEvent so per-tab components
+    // (Terminal.tsx, ClaudeSDKTab.tsx) can listen via window.addEventListener
+    // and refocus their own ref (xterm / textarea) without coupling them to
+    // ipcRenderer or the store. Each component decides itself whether it's
+    // the active one (via its existing `active` / `isVisible` prop).
+    const handleWindowRefocus = () => {
+      try { window.dispatchEvent(new CustomEvent('nt:window-refocus-active')); } catch {}
+    };
+    ipcRenderer.on('window:refocus-active', handleWindowRefocus);
+
+    // Cmd+V intra-window refocus. Cmd+Tab path covers "window just became
+    // frontmost"; this covers "window was already frontmost but DOM focus
+    // sits on a button/sidebar/Stop chip" — happens whenever the user
+    // clicked any UI control before triggering Voice Record. Without a
+    // refocus, the synthesised Cmd+V from cgpaste lands on that button
+    // and silently no-ops. We listen on capture so the refocus happens
+    // BEFORE the keydown bubbles to whatever element currently holds
+    // focus, giving xterm/textarea one tick to take over before the
+    // browser actually processes the paste. Inputs and textareas inside
+    // our own UI (SettingsModal, search box, contenteditable) are skipped
+    // — those are legitimate paste targets in their own right.
+    const handlePasteRefocus = (e: KeyboardEvent) => {
+      if (!e.metaKey || e.shiftKey || e.altKey || e.ctrlKey) return;
+      if (e.code !== 'KeyV' && e.key !== 'v' && e.key !== 'V') return;
+      const t = e.target as HTMLElement | null;
+      if (t) {
+        const tag = t.tagName;
+        if (tag === 'INPUT' || tag === 'TEXTAREA' || t.isContentEditable) return;
+      }
+      try { window.dispatchEvent(new CustomEvent('nt:window-refocus-active')); } catch {}
+    };
+    window.addEventListener('keydown', handlePasteRefocus, true);
+
     return () => {
       ipcRenderer.removeListener('terminal:mcp-restart', handleMcpRestart);
       ipcRenderer.removeListener('terminal:mcp-create', handleMcpCreate);
@@ -1191,6 +1326,8 @@ function App() {
       ipcRenderer.removeListener('mcp:respawn-sub-agent-pty', handleRespawnSubAgentPty);
       ipcRenderer.removeListener('gemini:auto-spawn', handleGeminiAutoSpawn);
       ipcRenderer.removeListener('gemini:busy-state', handleGeminiBusy);
+      ipcRenderer.removeListener('window:refocus-active', handleWindowRefocus);
+      window.removeEventListener('keydown', handlePasteRefocus, true);
     };
   }, [openProjects.size]); // Re-init when projects change
 
@@ -1251,6 +1388,29 @@ function App() {
               // ahead of the real resume would stomp this tab. The flag stops
               // exactly that race. See utils/pendingResume.ts.
               markPendingResume(tabId, sessionId);
+              // Repair dangling parentUuid in JSONL before resume so Claude CLI
+              // backtrace doesn't truncate history at first orphan (slash-command
+              // assistant or attachment virtual parent never written to disk).
+              // When repair returns repaired > 0 — surface to user: this is the
+              // moment we ACTUALLY saved history that Claude TUI would have lost.
+              try {
+                const tab = (s.openProjects.get(s.activeProjectId || '') || { tabs: new Map() }).tabs.get(tabId) as any;
+                const cwd = tab?.cwd || undefined;
+                const repairRes = await ipcRenderer.invoke('claude:repair-jsonl-before-resume', { sessionId, cwd });
+                const fixedCount = repairRes?.repaired || 0;
+                if (fixedCount > 0) {
+                  showToast(
+                    `Перед открытием сессии починили ${fixedCount} orphan${fixedCount === 1 ? '' : 's'} parentUuid — без этого Claude обрезал бы историю.`,
+                    'info',
+                    8000,
+                    false,
+                    undefined,
+                    undefined,
+                    undefined,
+                    tabId
+                  );
+                }
+              } catch (e: any) { console.warn('[AutoResume] JSONL repair skipped:', e?.message || String(e)); }
               ipcRenderer.send('terminal:input', tabId, 'claude --dangerously-skip-permissions --resume ' + sessionId + '\r');
               ipcRenderer.send('terminal:force-command-started', { tabId });
               console.warn('[AutoResume] Resumed', tabId, sessionId.substring(0, 8));
@@ -1304,6 +1464,57 @@ function App() {
       unsubProj();
       for (const projectId of tracked) {
         ipcRenderer.invoke('semantic-index:unwatch', { projectId }).catch(() => {});
+      }
+    };
+  }, []);
+
+  // CLAUDE.md mirror watchers — same lifecycle as semantic-index above. Two
+  // separate IPC channels (mirror:watch / mirror:unwatch). Watch on every open
+  // project, not just active — Settings panel pulls status from useMirrorStatusStore
+  // and we need fresh data the moment the user opens it.
+  useEffect(() => {
+    const tracked = new Set<string>();
+
+    const sync = () => {
+      const state = useWorkspaceStore.getState();
+      const { projects: projectsMap } = useProjectsStore.getState();
+      const currentIds = new Set(state.openProjects.keys());
+
+      for (const projectId of currentIds) {
+        if (tracked.has(projectId)) continue;
+        const proj = projectsMap[projectId];
+        if (!proj?.path) continue;
+        ipcRenderer.invoke('mirror:watch', { projectId, projectPath: proj.path }).catch(() => {});
+        tracked.add(projectId);
+      }
+
+      for (const projectId of Array.from(tracked)) {
+        if (!currentIds.has(projectId)) {
+          ipcRenderer.invoke('mirror:unwatch', { projectId }).catch(() => {});
+          useMirrorStatusStore.getState().clearStatus(projectId);
+          tracked.delete(projectId);
+        }
+      }
+    };
+
+    sync();
+
+    const unsubWs = useWorkspaceStore.subscribe(sync);
+    const unsubProj = useProjectsStore.subscribe(sync);
+
+    const onStatus = (_evt: unknown, payload: { projectId: string } & any) => {
+      if (!payload?.projectId) return;
+      const { projectId, ...status } = payload;
+      useMirrorStatusStore.getState().setStatus(projectId, status as any);
+    };
+    ipcRenderer.on('mirror:status', onStatus);
+
+    return () => {
+      unsubWs();
+      unsubProj();
+      ipcRenderer.removeListener('mirror:status', onStatus);
+      for (const projectId of tracked) {
+        ipcRenderer.invoke('mirror:unwatch', { projectId }).catch(() => {});
       }
     };
   }, []);
@@ -1718,8 +1929,26 @@ function App() {
         // Run npm script or .sh file from terminal context menu.
         // Same kill-ports prefix logic as TabBar's tab-context-menu path —
         // if "kill dev-ports" toggle is on, prepend `lsof | kill -9; ` to the line.
+        //
+        // Mirror TabBar's auto-color: any dev-like script name (`dev`, `start`,
+        // `serve`, `watch` prefix; `npm run X`, `yarn dev`, `./watch.sh` all
+        // qualify) sets commandType=devServer so the tab turns green and the
+        // RestartZone activates. Without this, ПКМ внутри терминала → Scripts
+        // doesn't recolor (only ПКМ по табу did, since the xterm keydown Enter
+        // handler is bypassed when the command comes from IPC).
         const { tabId, command } = data || {};
         if (!tabId || !command) return;
+        // Strip leading kill-ports prefix and trailing \r, then check if the
+        // last script name in the chain matches dev-like prefix.
+        const scriptName = String(command)
+          .replace(/^.*?(?:npm|yarn|pnpm|bun)\s+(?:run\s+)?/i, '')
+          .replace(/^\.\//, '')
+          .replace(/\.sh\b.*$/i, '')
+          .trim();
+        const isDevScript = /^(dev|start|serve|watch)/i.test(scriptName);
+        if (isDevScript) {
+          useWorkspaceStore.getState().setTabCommandType(tabId, 'devServer');
+        }
         const runIt = (prefix: string) => {
           ipcRenderer.send('terminal:input', tabId, `${prefix}${command}`);
         };
@@ -1969,6 +2198,7 @@ function App() {
       <StatusBar onOpenSettings={() => setSettingsOpen(true)} />
 
       {/* Global UI Components */}
+      <ShutdownOverlay />
       <ToastContainer />
       <EditProjectModal />
       <SessionInputModal />

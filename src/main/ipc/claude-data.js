@@ -11,6 +11,73 @@ let _projectManager = null;
 // For a 159MB session file: first read ~3.5s, all subsequent reads ~0ms (if no new entries)
 // or microseconds (if only a few new lines added).
 const _jsonlCache = new Map();
+// Dedup keys for [JsonlChainDiag:ChainBreak] log line — Timeline polls every 2s,
+// without this Set the same break writes 30+ identical lines per minute, drowning the log.
+// Key: `${sessionId}:${missingParentUuid}` — first hit logs, subsequent hits silently skip.
+const _jsonlChainDiagLogged = new Set();
+
+// Classify an orphan entry into a human-readable flavor so users see WHAT
+// triggered the break (mcp_instructions_delta reconnect / slash command /
+// thinking-only abort / etc.), not just "orphanType=attachment".
+// Used by both the diagnostic log line and the toast that fires in renderer.
+function _classifyOrphanFlavor(entry) {
+  if (!entry || typeof entry !== 'object') return { flavor: 'unknown', short: 'неизвестный тип' };
+  const t = entry.type;
+
+  if (t === 'attachment') {
+    const sub = entry.attachment?.type || '';
+    if (sub === 'mcp_instructions_delta') {
+      const added = entry.attachment?.addedNames || [];
+      const name = added.join(',');
+      return { flavor: 'attachment:mcp_instructions_delta', short: 'MCP подключился (' + (name || 'unknown') + ')', subtype: sub, addedNames: added };
+    }
+    if (sub === 'skill_listing') {
+      return { flavor: 'attachment:skill_listing', short: 'новый skill подключился', subtype: sub };
+    }
+    if (sub === 'image' || (entry.message?.content || []).some?.(b => b.type === 'image')) {
+      return { flavor: 'attachment:image', short: 'drag&drop файла/скриншота', subtype: sub || 'image' };
+    }
+    return { flavor: 'attachment:' + (sub || 'unknown'), short: 'вложение типа ' + (sub || '?'), subtype: sub };
+  }
+
+  if (t === 'assistant') {
+    const blocks = Array.isArray(entry.message?.content) ? entry.message.content.map(b => b?.type).filter(Boolean) : [];
+    const hasThinking = blocks.includes('thinking');
+    const hasText = blocks.includes('text');
+    const hasToolUse = blocks.includes('tool_use');
+    if (hasThinking && !hasText && !hasToolUse) {
+      return { flavor: 'assistant:thinking-only', short: 'Claude прервался во время размышления', blocks };
+    }
+    return { flavor: 'assistant:' + blocks.join('|'), short: 'оборванный ответ ассистента', blocks };
+  }
+
+  if (t === 'user') {
+    const c = entry.message?.content;
+    if (typeof c === 'string') {
+      const slashMatch = c.match(/<command-name>([^<]+)<\/command-name>/);
+      if (slashMatch) {
+        return { flavor: 'user:slash:' + slashMatch[1], short: 'slash-команда ' + slashMatch[1] };
+      }
+      if (c.startsWith('<local-command-')) {
+        return { flavor: 'user:command-result', short: 'результат локальной команды' };
+      }
+      return { flavor: 'user:text', short: 'твой текстовый промпт', contentSample: c.substring(0, 100) };
+    }
+    if (Array.isArray(c)) {
+      const blocks = c.map(b => b?.type).filter(Boolean);
+      if (blocks.includes('image')) return { flavor: 'user:image-paste', short: 'юзер вставил изображение', blocks };
+      if (blocks.includes('tool_result')) return { flavor: 'user:tool_result', short: 'результат инструмента', blocks };
+      return { flavor: 'user:' + blocks.join('|'), short: 'промпт с блоками: ' + blocks.join(','), blocks };
+    }
+    return { flavor: 'user:empty', short: 'пустой user-entry' };
+  }
+
+  if (t === 'system') {
+    return { flavor: 'system:' + (entry.subtype || 'unknown'), short: 'system: ' + (entry.subtype || '?'), subtype: entry.subtype };
+  }
+
+  return { flavor: t || 'unknown', short: t || 'неизвестно' };
+}
 // filePath → { size, mtimeMs, recordMap, lastRecord, bridgeSessionId, progressEntries }
 
 // ========== SESSION CHAIN HELPERS ==========
@@ -42,6 +109,164 @@ function findSessionFile(sessionId, cwd) {
     return null;
   } catch (e) {
     return null;
+  }
+}
+
+// Tail-only cleanup of the just-injected `/effort` slash-command pair.
+//
+// Why tail-only:
+//   Сессия может быть >100 MB. Полный read+JSON.parse+stringify+write блокирует
+//   main process на 2-3 секунды → юзер видит залипший shimmer и не может
+//   переключить модель. Исторические `/effort` записи трогать смысла нет —
+//   они уже глубоко в parentUuid chain, Claude `--resume` их пройдёт линейно
+//   как обычные user-записи без каких-либо последствий. Чистим **только**
+//   ту пару которую только что инжектнули (она гарантированно последняя или
+//   предпоследняя в файле — Claude пишет wrapper + paired stdout
+//   синхронно при submit slash-команды).
+//
+// Что пробовали и почему отброшено:
+//   - Полный rewrite файла (всё что выше): корректно, но 3 сек CPU-блок на 115 MB
+//     сессии — неприемлемо. Юзер: «вертикальная черта идёт очень долго».
+//   - Streaming JSONL parser: тот же CPU-стоимостный JSON.parse на каждой строке,
+//     просто без full-file alloc — экономит память, не время.
+//   - Skip-cleanup для больших файлов: оставляет накопление в активной сессии.
+//
+// Algorithm:
+//   1. fs.read последние TAIL_BYTES байт файла.
+//   2. Split на строки, дропнуть partial-prefix (первая строка может быть
+//      разорвана если TAIL_BYTES пришлось на середину записи).
+//   3. Парсить каждую найденную строку, искать `<command-name>/effort` wrapper
+//      и paired `<local-command-stdout>Set effort level` следом.
+//   4. Если нашли — truncate файл до начала первой удаляемой строки + дозаписать
+//      оставшиеся (которые после удаляемых, если такие есть).
+//
+// Relink: НЕ нужен. Удаляемые записи — самые свежие в файле, никаких потомков
+// у них ещё нет (Claude не успел продолжить turn — мы стартанули cleanup сразу
+// после fs.watch event'а о появлении wrapper'а в JSONL).
+const TAIL_BYTES = 16 * 1024; // 16 KB достаточно для 2-3 последних записей claude
+
+async function _deleteEffortEntries(sessionId, cwd, projectManager) {
+  if (!sessionId) return { success: false, error: 'No sessionId' };
+  try {
+    const found = findSessionFile(sessionId, cwd);
+    if (!found) return { success: false, error: 'Session file not found' };
+    const filePath = found.filePath;
+
+    const stat = await fs.promises.stat(filePath);
+    const fileSize = stat.size;
+    if (fileSize === 0) return { success: true, deleted: 0, relinked: 0 };
+
+    const readSize = Math.min(TAIL_BYTES, fileSize);
+    const startOffset = fileSize - readSize;
+    const buf = Buffer.alloc(readSize);
+    const fd = await fs.promises.open(filePath, 'r');
+    try {
+      await fd.read(buf, 0, readSize, startOffset);
+    } finally {
+      await fd.close();
+    }
+    const tailText = buf.toString('utf8');
+
+    // Если читали не с начала файла — первая «строка» может быть partial-prefix
+    // от записи, которая началась раньше нашего offset'а. Дропаем её, ища первый
+    // \n в буфере. Также храним offset начала каждой строки относительно файла
+    // (нужен потом для truncate point).
+    const lines = [];                                  // { text, startOffset }
+    let cursor = 0;
+    let absStart = startOffset;
+    if (startOffset > 0) {
+      const firstNL = tailText.indexOf('\n');
+      if (firstNL === -1) return { success: true, deleted: 0, relinked: 0 };
+      cursor = firstNL + 1;
+      absStart = startOffset + cursor;
+    }
+    while (cursor < tailText.length) {
+      const nl = tailText.indexOf('\n', cursor);
+      const end = nl === -1 ? tailText.length : nl;
+      const lineText = tailText.slice(cursor, end);
+      if (lineText.trim()) {
+        lines.push({ text: lineText, startOffset: absStart });
+      }
+      if (nl === -1) break;
+      cursor = nl + 1;
+      absStart = startOffset + cursor;
+    }
+
+    // Найти самую правую пару [wrapper, paired-stdout]. Wrapper — наша инжекция,
+    // paired-stdout — ответ Claude, опционально (может ещё не быть на диске
+    // в момент cleanup'а на быстром turn'е). Если есть только wrapper — чистим
+    // его, paired-stdout прилетит и останется orphan'ом — это OK, юзер увидит
+    // одну лишнюю запись вместо двух, на следующий запуск она тоже будет видна,
+    // но новый cleanup её схватит из хвоста (TAIL_BYTES покрывает).
+    let wrapperIdx = -1;
+    let pairedIdx = -1;
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const rec = (() => { try { return JSON.parse(lines[i].text); } catch { return null; } })();
+      if (!rec || rec.type !== 'user') continue;
+      const c = rec.message?.content;
+      if (typeof c !== 'string') continue;
+      if (/^<command-name>\/effort<\/command-name>/.test(c.trim())) {
+        wrapperIdx = i;
+        // Look forward for paired stdout (next user-record with stdout signature).
+        for (let j = i + 1; j < lines.length; j++) {
+          const r2 = (() => { try { return JSON.parse(lines[j].text); } catch { return null; } })();
+          if (!r2 || r2.type !== 'user') continue;
+          const c2 = r2.message?.content;
+          if (typeof c2 !== 'string') continue;
+          if (/^<local-command-stdout>Set effort level to/.test(c2.trim())) {
+            pairedIdx = j;
+          }
+          break;
+        }
+        break;
+      }
+    }
+
+    if (wrapperIdx === -1) {
+      return { success: true, deleted: 0, relinked: 0 };
+    }
+
+    // Truncate at wrapper start, then re-append any lines that came AFTER the
+    // paired stdout (or after the wrapper if no paired stdout was on disk yet).
+    const truncateAt = lines[wrapperIdx].startOffset;
+    const tailStartIdx = (pairedIdx >= 0 ? pairedIdx : wrapperIdx) + 1;
+    const keepLines = lines.slice(tailStartIdx);
+    const keepText = keepLines.length > 0
+      ? keepLines.map(l => l.text).join('\n') + '\n'
+      : '';
+
+    await fs.promises.truncate(filePath, truncateAt);
+    if (keepText.length > 0) {
+      await fs.promises.appendFile(filePath, keepText, 'utf8');
+    }
+    _jsonlCache.delete(filePath);
+
+    const removed = (wrapperIdx >= 0 ? 1 : 0) + (pairedIdx >= 0 ? 1 : 0);
+    const removedUuids = [];
+    try {
+      const w = JSON.parse(lines[wrapperIdx].text);
+      if (w?.uuid) removedUuids.push(w.uuid);
+    } catch {}
+    if (pairedIdx >= 0) {
+      try {
+        const p = JSON.parse(lines[pairedIdx].text);
+        if (p?.uuid) removedUuids.push(p.uuid);
+      } catch {}
+    }
+    if (projectManager?.db && removedUuids.length > 0) {
+      try {
+        const stmt = projectManager.db.db.prepare('DELETE FROM timeline_notes WHERE entry_uuid = ?');
+        for (const uuid of removedUuids) stmt.run(uuid);
+      } catch (e) {
+        console.warn('[DeleteEffortEntries] timeline_notes cleanup failed:', e.message);
+      }
+    }
+
+    console.log('[DeleteEffortEntries] session=' + sessionId.slice(0, 8) + ' tail-mode removed=' + removed + ' (wrapper=' + (wrapperIdx >= 0) + ' paired=' + (pairedIdx >= 0) + ')');
+    return { success: true, deleted: removed, relinked: 0 };
+  } catch (error) {
+    console.error('[DeleteEffortEntries] Error:', error);
+    return { success: false, error: error.message };
   }
 }
 
@@ -881,13 +1106,19 @@ function register({ projectManager, formatToolAction }) {
       // where look-ahead didn't attach a responseTokens to the user-entry yet (e.g. last
       // turn still streaming, or selection ends mid-turn).
       let downTokens = 0;
-      // API metrics — what Anthropic actually billed for this range. apiInputTokens =
-      // sum of every present input-side field: input_tokens (uncached prompt) +
-      // cache_creation_input_tokens (first time cached, 1.25× cost) +
-      // cache_read_input_tokens (subsequent reads, 0.1× cost). Each summand is added
-      // only when the field exists (no synthetic zero-fill). Output mirrors the JSONL
-      // ↓ but kept separate so the API mode is one self-contained block.
+      // API metrics — что Anthropic реально билит за этот range. Cache touches
+      // только input side (output не кэшируется — Claude каждый раз генерирует
+      // его заново), поэтому output одно поле, input — три раздельных:
+      //   • apiInputUncached    = usage.input_tokens (свежий промпт, full price)
+      //   • apiInputCacheCreate = usage.cache_creation_input_tokens (1.25× cost)
+      //   • apiInputCacheRead   = usage.cache_read_input_tokens (0.1× cost)
+      // apiInputTokens = uncached + create + read — оставлен для backward compat
+      // c уже-задеплоенным renderer'ом (показывал ОДНУ цифру Input). Renderer
+      // теперь рендерит три строки разделённых, но если backend старее — fallback.
       let apiInputTokens = 0;
+      let apiInputUncached = 0;
+      let apiInputCacheCreate = 0;
+      let apiInputCacheRead = 0;
       let apiOutputTokens = 0;
 
       // Same tool→group classifier as the inline ones in copy-range (and getToolGroup).
@@ -954,9 +1185,18 @@ function register({ projectManager, formatToolAction }) {
           const ot = usage?.output_tokens;
           if (typeof ot === 'number') { downTokens += ot; apiOutputTokens += ot; }
           if (usage) {
-            if (typeof usage.input_tokens === 'number') apiInputTokens += usage.input_tokens;
-            if (typeof usage.cache_creation_input_tokens === 'number') apiInputTokens += usage.cache_creation_input_tokens;
-            if (typeof usage.cache_read_input_tokens === 'number') apiInputTokens += usage.cache_read_input_tokens;
+            if (typeof usage.input_tokens === 'number') {
+              apiInputTokens += usage.input_tokens;
+              apiInputUncached += usage.input_tokens;
+            }
+            if (typeof usage.cache_creation_input_tokens === 'number') {
+              apiInputTokens += usage.cache_creation_input_tokens;
+              apiInputCacheCreate += usage.cache_creation_input_tokens;
+            }
+            if (typeof usage.cache_read_input_tokens === 'number') {
+              apiInputTokens += usage.cache_read_input_tokens;
+              apiInputCacheRead += usage.cache_read_input_tokens;
+            }
           }
           const msgContent = entry.message?.content;
           if (!msgContent) continue;
@@ -1013,6 +1253,7 @@ function register({ projectManager, formatToolAction }) {
         success: true, categories, total,
         downTotal: downTokens,
         apiInputTokens, apiOutputTokens,
+        apiInputUncached, apiInputCacheCreate, apiInputCacheRead,
       };
     } catch (error) {
       console.error('[Claude EstimateRangeTokens] Error:', error);
@@ -1954,6 +2195,10 @@ function register({ projectManager, formatToolAction }) {
     }
   });
 
+  ipcMain.handle('claude:delete-effort-entries', async (event, { sessionId, cwd }) => {
+    return _deleteEffortEntries(sessionId, cwd, projectManager);
+  });
+
   // Get fork markers for a session (for Timeline blue lines)
   ipcMain.handle('claude:get-fork-markers', async (event, { sessionId }) => {
     if (!sessionId) return { success: false, error: 'No session ID', markers: [] };
@@ -1993,7 +2238,9 @@ function register({ projectManager, formatToolAction }) {
       let currentUuid = lastRecord.uuid;
       const seen = new Set();
       let _compactRecoveryCount = 0;
+      let _compactPassthroughCount = 0; // compact_boundary → physical predecessor jumps (intentional /compact, NOT a bug)
       let _bridgeFollowCount = 0;
+      const _chainBreaks = []; // Generic CHAIN BREAK recovery hits (proxy crash, lost in-flight assistant records)
 
       while (currentUuid && !seen.has(currentUuid)) {
         seen.add(currentUuid);
@@ -2055,7 +2302,107 @@ function register({ projectManager, formatToolAction }) {
                 }
                 console.log('[Timeline:Backtrace] Cache recovery FAILED — uuid=' + currentUuid.substring(0, 8) + ' still missing after full re-read');
               }
-              console.log('[Timeline:Backtrace] BREAK: uuid=' + currentUuid.substring(0, 8) + ' not in recordMap. lastAdded.type=' + lastAdded.type + ' subtype=' + (lastAdded.subtype || 'none'));
+
+              // Generic CHAIN BREAK recovery: proxy crash or lost in-flight assistant record.
+              // Next user prompt references a parentUuid that was in Claude's memory but
+              // never made it to disk. Jump to the physical predecessor in the same file.
+              let bestPred = null;
+              for (const [uuid, entry] of recordMap) {
+                if (seen.has(uuid)) continue;
+                if (entry._fromFile === lastAdded._fromFile &&
+                    typeof entry._fileIndex === 'number' &&
+                    typeof lastAdded._fileIndex === 'number' &&
+                    entry._fileIndex < lastAdded._fileIndex) {
+                  if (!bestPred || entry._fileIndex > bestPred._fileIndex) {
+                    bestPred = entry;
+                  }
+                }
+              }
+              if (bestPred) {
+                const _classified = _classifyOrphanFlavor(lastAdded);
+
+                // Post-compact attachment init — NOT a real chain break.
+                // After /compact, Claude Code writes a series of attachment
+                // entries (skill_listing, mcp_instructions_delta, etc.) whose
+                // parentUuid points into Claude's in-RAM session-init state
+                // that was never serialized to JSONL. Recovery jumps over
+                // them safely; no user data was lost. Suppress these from
+                // _chainBreaks so toast/red-paint don't lie.
+                //
+                // Heuristic: orphan is attachment AND bestPred is one of
+                // {compact_boundary, isCompactSummary user, post-compact slash
+                // command artifact} that physically sits in the same backfill
+                // window. Detected by walking from bestPred backwards a few
+                // entries to see if a compact_boundary is within reach.
+                let isPostCompactInit = false;
+                if (lastAdded.type === 'attachment') {
+                  // Look at up to 10 entries around bestPred for a compact_boundary
+                  const predIdx = bestPred._fileIndex;
+                  for (const [, entry] of recordMap) {
+                    if (entry._fromFile !== bestPred._fromFile) continue;
+                    if (typeof entry._fileIndex !== 'number') continue;
+                    if (entry._fileIndex < predIdx - 10 || entry._fileIndex > lastAdded._fileIndex) continue;
+                    if (entry.type === 'system' && entry.subtype === 'compact_boundary') {
+                      isPostCompactInit = true;
+                      break;
+                    }
+                  }
+                }
+
+                if (isPostCompactInit) {
+                  console.log('[Timeline:Backtrace] CHAIN BREAK suppressed (post-compact init): orphan=' + lastAdded.uuid.substring(0, 8) + ' type=attachment near compact_boundary — Claude internal init, not data loss');
+                  currentUuid = bestPred.uuid;
+                  recovered = true;
+                  // Skip the rest of this if-block (no _chainBreaks.push,
+                  // no diag log) — fall through to outer `if (recovered) continue`.
+                } else {
+                _chainBreaks.push({
+                  missingUuid: currentUuid,
+                  recoveredFromUuid: lastAdded.uuid,
+                  jumpedToUuid: bestPred.uuid,
+                  // Classification surfaces in the toast — UI shows "MCP X reconnected"
+                  // not just "history recovered: 1 break".
+                  flavor: _classified.flavor,
+                  short: _classified.short,
+                  subtype: _classified.subtype || null,
+                  addedNames: _classified.addedNames || null,
+                  orphanTimestamp: lastAdded.timestamp || null,
+                });
+                console.log('[Timeline:Backtrace] CHAIN BREAK recovery: ' + currentUuid.substring(0, 8) + ' missing, jumping to ' + bestPred.uuid.substring(0, 8) + ' (fileIdx ' + bestPred._fileIndex + ', type=' + bestPred.type + ')');
+                const _diagKey = sessionId + ':' + currentUuid;
+                if (!_jsonlChainDiagLogged.has(_diagKey)) {
+                  _jsonlChainDiagLogged.add(_diagKey);
+                  // Content sample helps post-mortem ("which prompt did the user
+                  // type when this happened") without sweeping the whole file.
+                  let contentSample = '';
+                  try {
+                    const c = lastAdded.message?.content;
+                    if (typeof c === 'string') contentSample = c.substring(0, 100).replace(/\n/g, ' ');
+                    else if (Array.isArray(c)) {
+                      const text = c.find(b => b.type === 'text')?.text;
+                      contentSample = (text || c.map(b => b.type).join('|')).substring(0, 100);
+                    }
+                  } catch {}
+                  console.log('[JsonlChainDiag:ChainBreak] session=' + sessionId.substring(0, 8) +
+                    ' orphanUuid=' + lastAdded.uuid.substring(0, 8) +
+                    ' orphanType=' + lastAdded.type +
+                    ' flavor=' + _classified.flavor +
+                    ' orphanTimestamp=' + (lastAdded.timestamp || '?') +
+                    ' missingParent=' + currentUuid.substring(0, 8) +
+                    ' jumpedToUuid=' + bestPred.uuid.substring(0, 8) +
+                    ' jumpedType=' + bestPred.type +
+                    ' jumpedTimestamp=' + (bestPred.timestamp || '?') +
+                    ' fileIdx ' + bestPred._fileIndex + '→' + lastAdded._fileIndex +
+                    ' gapEntries=' + (lastAdded._fileIndex - bestPred._fileIndex - 1) +
+                    (contentSample ? ' content="' + contentSample + '"' : '') +
+                    ' (subsequent occurrences for this orphan deduped)');
+                }
+                currentUuid = bestPred.uuid;
+                recovered = true;
+                } // end of else (not isPostCompactInit)
+              } else {
+                console.log('[Timeline:Backtrace] BREAK: uuid=' + currentUuid.substring(0, 8) + ' not in recordMap. lastAdded.type=' + lastAdded.type + ' subtype=' + (lastAdded.subtype || 'none'));
+              }
             }
           } else {
             console.log('[Timeline:Backtrace] BREAK: uuid=' + currentUuid.substring(0, 8) + ' not in recordMap (activeBranch empty)');
@@ -2068,6 +2415,39 @@ function register({ projectManager, formatToolAction }) {
 
         // Move to parent (use logicalParentUuid for compact boundaries, else parentUuid)
         let nextUuid = record.logicalParentUuid || record.parentUuid;
+
+        // ── Compact passthrough ──
+        // When backtrace arrives at a compact_boundary, logicalParentUuid usually
+        // points FORWARD into post-compact entries (already in `seen`) or to a
+        // dangling UUID, while parentUuid is null. Result: backtrace stops at
+        // compact and pre-compact history (still physically present in JSONL)
+        // becomes invisible to Timeline/History — even though the user only ran
+        // /compact, no UUID-corruption happened. This is NOT a chain break and
+        // must NOT trigger ghost-styling or toasts. Jump to the physical
+        // predecessor in the same file to keep walking backwards through the
+        // pre-compact tail.
+        if (record.type === 'system' && record.subtype === 'compact_boundary') {
+          const isDeadEnd = !nextUuid || seen.has(nextUuid) || !recordMap.has(nextUuid);
+          if (isDeadEnd) {
+            let bestPred = null;
+            for (const [uuid, entry] of recordMap) {
+              if (seen.has(uuid)) continue;
+              if (entry._fromFile === record._fromFile &&
+                  typeof entry._fileIndex === 'number' &&
+                  typeof record._fileIndex === 'number' &&
+                  entry._fileIndex < record._fileIndex) {
+                if (!bestPred || entry._fileIndex > bestPred._fileIndex) {
+                  bestPred = entry;
+                }
+              }
+            }
+            if (bestPred) {
+              nextUuid = bestPred.uuid;
+              _compactPassthroughCount++;
+              console.log('[Timeline:Backtrace] Compact passthrough: compact=' + record.uuid.substring(0, 8) + ' fileIdx=' + record._fileIndex + ' → predecessor=' + bestPred.uuid.substring(0, 8) + ' fileIdx=' + bestPred._fileIndex);
+            }
+          }
+        }
 
         // If we hit the root (parentUuid=null), check for bridge entry to parent session.
         // Bridge entry has a DIFFERENT sessionId and its parentUuid points into the parent file.
@@ -2112,7 +2492,7 @@ function register({ projectManager, formatToolAction }) {
         currentUuid = nextUuid;
       }
 
-      console.log('[Timeline:Backtrace] DONE session=' + sessionId.substring(0, 8) + ' activeBranch=' + activeBranch.length + ' compactRecoveries=' + _compactRecoveryCount + ' bridgeFollows=' + _bridgeFollowCount + ' root=' + (activeBranch.length > 0 ? activeBranch[0].uuid.substring(0, 8) + '/' + activeBranch[0].type : 'empty'));
+      console.log('[Timeline:Backtrace] DONE session=' + sessionId.substring(0, 8) + ' activeBranch=' + activeBranch.length + ' compactRecoveries=' + _compactRecoveryCount + ' compactPassthrough=' + _compactPassthroughCount + ' bridgeFollows=' + _bridgeFollowCount + ' chainBreaks=' + _chainBreaks.length + ' root=' + (activeBranch.length > 0 ? activeBranch[0].uuid.substring(0, 8) + '/' + activeBranch[0].type : 'empty'));
 
       // Now filter the active branch for Timeline display
       const entries = [];
@@ -2287,7 +2667,15 @@ function register({ projectManager, formatToolAction }) {
       // This helps the renderer detect if claudeSessionId needs updating
       const latestSessionId = resolveLatestSessionInChain(sessionId, cwd);
 
-      return { success: true, entries: entries, latestSessionId, sessionBoundaries };
+      // Claude's own backtrace stops at the first orphan — everything before
+      // is invisible to the live Claude process even though it's on disk.
+      // Surface that boundary so UI can grey out entries Claude doesn't remember.
+      // The boundary uuid is the LAST entry Claude still sees (i.e. lastAdded at
+      // the moment the first chain break fired — the youngest entry of the
+      // pre-orphan tail). Everything in activeBranch with an index lower than
+      // this uuid's index is invisible to Claude.
+      const claudeMemoryBoundaryUuid = _chainBreaks.length > 0 ? _chainBreaks[0].recoveredFromUuid : null;
+      return { success: true, entries: entries, latestSessionId, sessionBoundaries, chainBreaks: _chainBreaks, claudeMemoryBoundaryUuid };
 
     } catch (error) {
       console.error('[Claude Timeline] Error:', error);
@@ -2803,6 +3191,10 @@ function register({ projectManager, formatToolAction }) {
       const activeBranch = [];
       let currentUuid = lastRecord.uuid;
       const seen = new Set();
+      // First-orphan boundary uuid — last entry the live Claude process still
+      // sees via its OWN backtrace. UI greys entries before this point to show
+      // user what Claude actually has in context vs what's just on disk.
+      let _firstOrphanRecoveredFromUuid = null;
 
       while (currentUuid && !seen.has(currentUuid)) {
         seen.add(currentUuid);
@@ -2833,6 +3225,53 @@ function register({ projectManager, formatToolAction }) {
                 }
               }
             }
+            // Generic CHAIN BREAK recovery — same logic as claude:get-timeline.
+            // Slash-command assistant replies + attachment virtual parents are not
+            // written to JSONL; following user-prompt references a phantom uuid.
+            // Without this, history panel and Claude TUI both stop at the orphan
+            // and lose every pre-orphan turn.
+            if (!recovered) {
+              let bestPred = null;
+              for (const [uuid, entry] of recordMap) {
+                if (seen.has(uuid)) continue;
+                if (entry._fromFile === lastAdded._fromFile &&
+                    typeof entry._fileIndex === 'number' &&
+                    typeof lastAdded._fileIndex === 'number' &&
+                    entry._fileIndex < lastAdded._fileIndex) {
+                  if (!bestPred || entry._fileIndex > bestPred._fileIndex) {
+                    bestPred = entry;
+                  }
+                }
+              }
+              if (bestPred) {
+                console.log('[FullHistory:Backtrace] CHAIN BREAK recovery: ' + currentUuid.substring(0, 8) + ' missing, jumping to ' + bestPred.uuid.substring(0, 8) + ' (fileIdx ' + bestPred._fileIndex + ', type=' + bestPred.type + ')');
+
+                // Same post-compact-attachment-init suppression as in
+                // claude:get-timeline above. If the orphan is an attachment
+                // and a compact_boundary sits nearby, this is Claude's own
+                // session init backfill, not data loss — don't surface it
+                // via claudeMemoryBoundaryUuid.
+                let isPostCompactInit = false;
+                if (lastAdded.type === 'attachment') {
+                  const predIdx = bestPred._fileIndex;
+                  for (const [, entry] of recordMap) {
+                    if (entry._fromFile !== bestPred._fromFile) continue;
+                    if (typeof entry._fileIndex !== 'number') continue;
+                    if (entry._fileIndex < predIdx - 10 || entry._fileIndex > lastAdded._fileIndex) continue;
+                    if (entry.type === 'system' && entry.subtype === 'compact_boundary') {
+                      isPostCompactInit = true;
+                      break;
+                    }
+                  }
+                }
+
+                if (!isPostCompactInit && _firstOrphanRecoveredFromUuid === null) {
+                  _firstOrphanRecoveredFromUuid = lastAdded.uuid;
+                }
+                currentUuid = bestPred.uuid;
+                recovered = true;
+              }
+            }
           }
           if (recovered) continue;
           break;
@@ -2841,6 +3280,32 @@ function register({ projectManager, formatToolAction }) {
         activeBranch.unshift(record);
 
         let nextUuid = record.logicalParentUuid || record.parentUuid;
+
+        // Compact passthrough — see same comment in claude:get-timeline above.
+        // Manual /compact is not a UUID corruption: just jump to physical
+        // predecessor in the same file to keep pre-compact entries visible.
+        if (record.type === 'system' && record.subtype === 'compact_boundary') {
+          const isDeadEnd = !nextUuid || seen.has(nextUuid) || !recordMap.has(nextUuid);
+          if (isDeadEnd) {
+            let bestPred = null;
+            for (const [uuid, entry] of recordMap) {
+              if (seen.has(uuid)) continue;
+              if (entry._fromFile === record._fromFile &&
+                  typeof entry._fileIndex === 'number' &&
+                  typeof record._fileIndex === 'number' &&
+                  entry._fileIndex < record._fileIndex) {
+                if (!bestPred || entry._fileIndex > bestPred._fileIndex) {
+                  bestPred = entry;
+                }
+              }
+            }
+            if (bestPred) {
+              nextUuid = bestPred.uuid;
+              console.log('[FullHistory:Backtrace] Compact passthrough: compact=' + record.uuid.substring(0, 8) + ' fileIdx=' + record._fileIndex + ' → predecessor=' + bestPred.uuid.substring(0, 8) + ' fileIdx=' + bestPred._fileIndex);
+            }
+          }
+        }
+
         if (!nextUuid && sessionBoundaries.length > 0) {
           for (const [uuid, entry] of recordMap) {
             if (seen.has(uuid)) continue;
@@ -3115,7 +3580,7 @@ function register({ projectManager, formatToolAction }) {
 
       const latestSessionId = resolveLatestSessionInChain(sessionId, cwd);
 
-      return { success: true, entries, latestSessionId };
+      return { success: true, entries, latestSessionId, claudeMemoryBoundaryUuid: _firstOrphanRecoveredFromUuid };
     } catch (error) {
       console.error('[Claude FullHistory] Error:', error);
       return { success: false, error: error.message };
@@ -3302,4 +3767,105 @@ function parseTimelineEntries(sourcePath) {
   }
 }
 
-module.exports = { register, findSessionFile, loadJsonlRecords, resolveSessionChain, resolveLatestSessionInChain, parseTimelineUuids, parseTimelineEntries, _api };
+// Repair dangling parentUuid in a JSONL file by rewriting each broken reference
+// to the uuid of the physical predecessor line. Same logic as the offline
+// /tmp/jsonl-repair.sh script — but runs in-process before `claude --resume`
+// so the upstream Claude CLI sees a clean chain and renders full history.
+//
+// Why this is needed: Claude CLI never writes its slash-command assistant
+// replies or attachment virtual parents to JSONL — the next user-prompt
+// references a phantom uuid. CLI backtrace stops at the orphan, history
+// truncates to "everything AFTER the orphan", matching exactly what user
+// sees in `claude --resume` and history panel before this fix.
+async function repairJsonlChainBreaks(sessionId, cwd) {
+  try {
+    const found = findSessionFile(sessionId, cwd);
+    if (!found) return { repaired: 0, reason: 'file-not-found' };
+    const filePath = found.filePath;
+    const raw = fs.readFileSync(filePath, 'utf-8');
+    const lines = raw.split('\n');
+
+    // PARSE every line with real JSON.parse (not regex on raw text).
+    // Regex-based scan caught false uuids inside last-prompt content strings
+    // (which themselves contain JSON literals like '"uuid":"..."') and made
+    // dangling-detection silently miss real cases — hence the user seeing
+    // "history truncated" even after a fake-OK audit. Real JSON parsing
+    // ignores content fields and only looks at top-level keys.
+    const parsed = []; // null or { uuid, parentUuid, raw_d }
+    const uuids = new Set();
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (!line || line[0] !== '{') { parsed.push(null); continue; }
+      try {
+        const d = JSON.parse(line);
+        parsed.push(d);
+        if (d.uuid) uuids.add(d.uuid);
+      } catch {
+        parsed.push(null);
+      }
+    }
+
+    // Find dangling parentUuid refs and compute predecessor for each.
+    const fixes = []; // { lineIdx, oldParent, newParent }
+    for (let i = 0; i < parsed.length; i++) {
+      const d = parsed[i];
+      if (!d || !d.parentUuid || uuids.has(d.parentUuid)) continue;
+      // search predecessor up to 10 lines back
+      let predUuid = null;
+      for (let k = i - 1; k >= Math.max(0, i - 10); k--) {
+        if (parsed[k] && parsed[k].uuid) { predUuid = parsed[k].uuid; break; }
+      }
+      if (!predUuid) continue;
+      fixes.push({ lineIdx: i, oldParent: d.parentUuid, newParent: predUuid });
+    }
+
+    if (fixes.length === 0) return { repaired: 0, reason: 'no-dangling' };
+
+    // Rewrite each affected line by re-serializing the parsed object — avoids
+    // ambiguity from string-level replacement (which can hit content fields).
+    const newLines = lines.slice();
+    for (const { lineIdx, oldParent, newParent } of fixes) {
+      const d = parsed[lineIdx];
+      const _classified = _classifyOrphanFlavor(d);
+      // Verbose forensic log for post-mortem grep: same fields as
+      // [JsonlChainDiag:ChainBreak] so a single grep "JsonlChainDiag" or
+      // "JsonlAutoRepair" across multi-day logs surfaces every repair with
+      // flavor + content sample + timestamps. Without this, boot-time sweep
+      // silently heals breaks and post-mortem loses all visibility.
+      let contentSample = '';
+      try {
+        const c = d.message?.content;
+        if (typeof c === 'string') contentSample = c.substring(0, 100).replace(/\n/g, ' ');
+        else if (Array.isArray(c)) {
+          const text = c.find(b => b.type === 'text')?.text;
+          contentSample = (text || c.map(b => b.type).join('|')).substring(0, 100);
+        }
+      } catch {}
+      d.parentUuid = newParent;
+      newLines[lineIdx] = JSON.stringify(d);
+      console.log('[JsonlAutoRepair] session=' + sessionId.substring(0, 8) +
+        ' line=' + (lineIdx + 1) +
+        ' orphanUuid=' + (d.uuid || '?').substring(0, 8) +
+        ' orphanType=' + (d.type || '?') +
+        ' flavor=' + _classified.flavor +
+        ' orphanTimestamp=' + (d.timestamp || '?') +
+        ' missingParent=' + oldParent.substring(0, 8) +
+        ' newParent=' + newParent.substring(0, 8) +
+        (contentSample ? ' content="' + contentSample + '"' : ''));
+    }
+
+    // Backup before write
+    const backupPath = filePath + '.autorepair-' + Math.floor(Date.now() / 1000);
+    fs.copyFileSync(filePath, backupPath);
+    fs.writeFileSync(filePath, newLines.join('\n'), 'utf-8');
+    console.log('[JsonlAutoRepair] session=' + sessionId.substring(0, 8) + ' repaired=' + fixes.length + ' backup=' + backupPath);
+    // Invalidate cache so next read picks up changes
+    _jsonlCache.delete(filePath);
+    return { repaired: fixes.length, backupPath };
+  } catch (e) {
+    console.error('[JsonlAutoRepair] Error for session ' + sessionId + ':', e.message);
+    return { repaired: 0, error: e.message };
+  }
+}
+
+module.exports = { register, findSessionFile, loadJsonlRecords, resolveSessionChain, resolveLatestSessionInChain, parseTimelineUuids, parseTimelineEntries, deleteEffortEntries: _deleteEffortEntries, repairJsonlChainBreaks, _api };

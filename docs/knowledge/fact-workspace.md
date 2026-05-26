@@ -15,7 +15,7 @@
    - **Compact Paths:** В карточках отображаются только последние две папки пути (например, `vs-code/my-app`).
    - **Instant Tooltip:** При наведении на сокращенный путь мгновенно всплывает полный адрес.
 3. **Файлы:** Пользователь открывает Sidebar (`Cmd+B`) — полноценный file explorer из gt-editor.
-   - Проводник открывается поверх терминала через React Portal (см. `methodology/design-bugs.md::6.3. UI поверх canvas: Portal или Layering Pattern`).
+   - Проводник открывается поверх терминала через React Portal (см. `methodology/сценарии-багов.md::6.3. UI поверх canvas: Portal или Layering Pattern`).
    - Поддержка: drag-and-drop файлов (Atlaskit), rename, create, delete (в корзину с undo), context menu, multi-select (Cmd/Shift+Click).
    - Ширина sidebar ресайзится drag handle (min 180px, max 500px), сохраняется в localStorage глобально.
    - Пользователь делает `Cmd+Click` по пути файла в терминале -> файл открывается в **File Preview**.

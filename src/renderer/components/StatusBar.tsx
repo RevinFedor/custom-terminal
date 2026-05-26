@@ -5,7 +5,6 @@ import { useUIStore, DefaultClaudeEffort } from '../store/useUIStore';
 import { usePromptsStore } from '../store/usePromptsStore';
 import { CLAUDE_EFFORT_LEVELS_WITH_NONE, CLAUDE_EFFORT_LABELS } from '../constants/claudeLevels';
 import { useCmdKey } from '../hooks/useCmdHoverPopover';
-import Tooltip from './UI/Tooltip';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -116,59 +115,50 @@ function InvalidPathsChip({ onOpenSettings }: { onOpenSettings?: () => void }) {
 
   if (missing.length === 0) return null;
 
-  // Tooltip shows truncated list of missing files so the user can confirm what's broken
-  // without opening Settings. Limited to first 5 to avoid an unbounded balloon.
-  const preview = missing.slice(0, 5).join('\n') + (missing.length > 5 ? `\n…+${missing.length - 5}` : '');
-  const tooltip = `Невалидные пути в AI-промптах (${missing.length}):\n${preview}\n\nКлик → Настройки.`;
-
   return (
-    <Tooltip content={tooltip}>
-      <button
-        onClick={onOpenSettings}
-        className="inline-flex items-center cursor-pointer rounded"
-        style={{
-          gap: 4,
-          padding: '0 8px',
-          height: 20,
-          backgroundColor: 'rgba(218, 119, 86, 0.12)',
-          color: '#DA7756',
-          fontVariantNumeric: 'tabular-nums',
-          fontWeight: 600,
-          border: 'none',
-          outline: 'none',
-        }}
-        onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'rgba(218, 119, 86, 0.22)'; }}
-        onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'rgba(218, 119, 86, 0.12)'; }}
-      >
-        <span style={{ fontSize: 13, lineHeight: 1 }}>!</span>
-        <span style={{ fontSize: 12 }}>{missing.length}</span>
-      </button>
-    </Tooltip>
+    <button
+      onClick={onOpenSettings}
+      className="inline-flex items-center cursor-pointer rounded"
+      style={{
+        gap: 4,
+        padding: '0 8px',
+        height: 20,
+        backgroundColor: 'rgba(218, 119, 86, 0.12)',
+        color: '#DA7756',
+        fontVariantNumeric: 'tabular-nums',
+        fontWeight: 600,
+        border: 'none',
+        outline: 'none',
+      }}
+      onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'rgba(218, 119, 86, 0.22)'; }}
+      onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'rgba(218, 119, 86, 0.12)'; }}
+    >
+      <span style={{ fontSize: 13, lineHeight: 1 }}>!</span>
+      <span style={{ fontSize: 12 }}>{missing.length}</span>
+    </button>
   );
 }
 
 function SettingsButton({ onClick }: { onClick?: () => void }) {
   return (
-    <Tooltip content="Открыть настройки">
-      <button
-        onClick={onClick}
-        aria-label="Settings"
-        className="inline-flex items-center justify-center cursor-pointer rounded"
-        style={{
-          width: 22,
-          height: 20,
-          padding: 0,
-          background: 'transparent',
-          color: '#bbb',
-          border: 'none',
-          outline: 'none',
-        }}
-        onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.color = '#fff'; (e.currentTarget as HTMLButtonElement).style.background = 'rgba(255,255,255,0.08)'; }}
-        onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.color = '#bbb'; (e.currentTarget as HTMLButtonElement).style.background = 'transparent'; }}
-      >
-        <Settings size={14} strokeWidth={1.75} />
-      </button>
-    </Tooltip>
+    <button
+      onClick={onClick}
+      aria-label="Settings"
+      className="inline-flex items-center justify-center cursor-pointer rounded"
+      style={{
+        width: 22,
+        height: 20,
+        padding: 0,
+        background: 'transparent',
+        color: '#bbb',
+        border: 'none',
+        outline: 'none',
+      }}
+      onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.color = '#fff'; (e.currentTarget as HTMLButtonElement).style.background = 'rgba(255,255,255,0.08)'; }}
+      onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.color = '#bbb'; (e.currentTarget as HTMLButtonElement).style.background = 'transparent'; }}
+    >
+      <Settings size={14} strokeWidth={1.75} />
+    </button>
   );
 }
 
@@ -243,21 +233,19 @@ function EffortSelector({ value, onChange }: {
 
   return (
     <>
-      <Tooltip content="Default Claude effort (клик закрепит, ⌘+наведение откроет временно). 'none' = не подставлять.">
-        <button
-          ref={chipRef}
-          onClick={() => setClicked(!clicked)}
-          onMouseEnter={() => setChipHover(true)}
-          onMouseLeave={() => setChipHover(false)}
-          className="inline-flex items-center gap-1 cursor-pointer hover:bg-white/5 rounded"
-          style={{ padding: '1px 6px', height: 18 }}
-        >
-          <span style={{ color: '#666' }}>Effort:</span>
-          <span style={{ color: value === 'none' ? '#666' : '#DA7756', fontWeight: 500 }}>
-            {EFFORT_LABEL[value]}
-          </span>
-        </button>
-      </Tooltip>
+      <button
+        ref={chipRef}
+        onClick={() => setClicked(!clicked)}
+        onMouseEnter={() => setChipHover(true)}
+        onMouseLeave={() => setChipHover(false)}
+        className="inline-flex items-center gap-1 cursor-pointer hover:bg-white/5 rounded"
+        style={{ padding: '1px 6px', height: 18 }}
+      >
+        <span style={{ color: '#666' }}>Effort:</span>
+        <span style={{ color: value === 'none' ? '#666' : '#DA7756', fontWeight: 500 }}>
+          {EFFORT_LABEL[value]}
+        </span>
+      </button>
       {open && chipRef.current && createPortal(
         <EffortPopup
           chipRect={chipRef.current.getBoundingClientRect()}
@@ -306,19 +294,18 @@ function EffortPopup({ chipRect, popupRef, value, onSelect, onPopupEnter, onPopu
         {EFFORT_LEVELS.map((level) => {
           const isActive = value === level;
           return (
-            <Tooltip key={level} content={'Set default effort to ' + level}>
-              <button
-                onClick={() => onSelect(isActive ? 'none' : level)}
-                className={`text-[10px] px-1.5 py-1 rounded cursor-pointer ${
-                  isActive
-                    ? 'bg-[#DA7756]/20 text-white font-medium'
-                    : 'bg-[#2d2d2d] text-[#888] hover:text-white hover:bg-[#3d3d3d]'
-                }`}
-                style={{ minWidth: 32 }}
-              >
-                {EFFORT_LABEL[level]}
-              </button>
-            </Tooltip>
+            <button
+              key={level}
+              onClick={() => onSelect(isActive ? 'none' : level)}
+              className={`text-[10px] px-1.5 py-1 rounded cursor-pointer ${
+                isActive
+                  ? 'bg-[#DA7756]/20 text-white font-medium'
+                  : 'bg-[#2d2d2d] text-[#888] hover:text-white hover:bg-[#3d3d3d]'
+              }`}
+              style={{ minWidth: 32 }}
+            >
+              {EFFORT_LABEL[level]}
+            </button>
           );
         })}
       </div>
@@ -328,10 +315,8 @@ function EffortPopup({ chipRect, popupRef, value, onSelect, onPopupEnter, onPopu
 
 // Mobile-web access chip. Pulls live info from main (web-server.js) on mount,
 // shows the LAN URL as a clickable pill: click → opens in default OS browser
-// (so you can scan the address visually then scribe it onto your phone). Long-
-// press / right-click would be ideal for "copy to clipboard" but that's noise
-// for the common case — single click to open is enough. Tooltip exposes the
-// full URL with token so you can read it off-screen if needed.
+// (so you can scan the address visually then scribe it onto your phone).
+// Right-click → copy full URL with token to clipboard.
 function WebServerChip() {
   const [info, setInfo] = useState<{ running: boolean; lanIp?: string; port?: number; token?: string } | null>(null);
   const [copied, setCopied] = useState(false);
@@ -355,15 +340,16 @@ function WebServerChip() {
 
   if (!info) return null;
   if (!info.running) {
-    return (
-      <Tooltip content="Mobile web server is not running — check main process logs.">
-        <span style={{ color: '#666', fontSize: 11 }}>web: off</span>
-      </Tooltip>
-    );
+    return <span style={{ color: '#666', fontSize: 11 }}>web: off</span>;
   }
 
-  const fullUrl = `http://${info.lanIp}:${info.port}/?token=${info.token}`;
-  const shortUrl = `${info.lanIp}:${info.port}`;
+  // Prod (7878) → публичный домен через VPS-туннель; dev (7979 и любой другой) → локальный IP:port
+  const isProd = info.port === 7878;
+  const PUBLIC_HOST = 'remote-control.f9922.tech';
+  const fullUrl = isProd
+    ? `https://${PUBLIC_HOST}/?token=${info.token}`
+    : `http://${info.lanIp}:${info.port}/?token=${info.token}`;
+  const shortUrl = isProd ? PUBLIC_HOST : `local:${info.port}`;
 
   const handleClick = () => {
     try {
@@ -382,52 +368,48 @@ function WebServerChip() {
   };
 
   return (
-    <Tooltip content={`Open mobile-web in browser. Right-click to copy URL with token.\n\n${fullUrl}`}>
-      <button
-        onClick={handleClick}
-        onContextMenu={handleRightClick}
-        className="inline-flex items-center gap-1 cursor-pointer hover:bg-white/5 rounded"
-        style={{ padding: '1px 6px', height: 18 }}
-      >
-        <span
-          style={{
-            width: 8, height: 8, borderRadius: 4,
-            backgroundColor: '#FFB382',
-            boxShadow: '0 0 6px rgba(255, 178, 130, 0.5)',
-          }}
-        />
-        <span style={{ color: copied ? '#a6e3a1' : '#ddd' }}>
-          {copied ? 'copied!' : shortUrl}
-        </span>
-      </button>
-    </Tooltip>
+    <button
+      onClick={handleClick}
+      onContextMenu={handleRightClick}
+      className="inline-flex items-center gap-1 cursor-pointer hover:bg-white/5 rounded"
+      style={{ padding: '1px 6px', height: 18 }}
+    >
+      <span
+        style={{
+          width: 8, height: 8, borderRadius: 4,
+          backgroundColor: '#FFB382',
+          boxShadow: '0 0 6px rgba(255, 178, 130, 0.5)',
+        }}
+      />
+      <span style={{ color: copied ? '#a6e3a1' : '#ddd' }}>
+        {copied ? 'copied!' : shortUrl}
+      </span>
+    </button>
   );
 }
 
-function StatusToggle({ label, title, active, onClick, activeColor = '#22c55e' }: {
+function StatusToggle({ label, active, onClick, activeColor = '#22c55e' }: {
   label: string;
-  title: string;
+  title?: string;
   active: boolean;
   onClick: () => void;
   activeColor?: string;
 }) {
   return (
-    <Tooltip content={title}>
-      <button
-        onClick={onClick}
-        className="inline-flex items-center gap-1 cursor-pointer hover:bg-white/5 rounded"
-        style={{ padding: '1px 6px', height: 18 }}
-      >
-        <span
-          style={{
-            width: 8, height: 8, borderRadius: 4,
-            backgroundColor: active ? activeColor : '#444',
-            boxShadow: active ? `0 0 6px ${activeColor}` : 'none',
-            transition: 'background-color 0.15s, box-shadow 0.15s',
-          }}
-        />
-        <span style={{ color: active ? '#ddd' : '#666' }}>{label}</span>
-      </button>
-    </Tooltip>
+    <button
+      onClick={onClick}
+      className="inline-flex items-center gap-1 cursor-pointer hover:bg-white/5 rounded"
+      style={{ padding: '1px 6px', height: 18 }}
+    >
+      <span
+        style={{
+          width: 8, height: 8, borderRadius: 4,
+          backgroundColor: active ? activeColor : '#444',
+          boxShadow: active ? `0 0 6px ${activeColor}` : 'none',
+          transition: 'background-color 0.15s, box-shadow 0.15s',
+        }}
+      />
+      <span style={{ color: active ? '#ddd' : '#666' }}>{label}</span>
+    </button>
   );
 }

@@ -90,6 +90,52 @@ POST /api/log/client                           → mobile diagnostic logs → co
 WS   /ws?token=&tabId=                         → snapshot, message, busy, done events
 ```
 
+Все pathname-параметры (`:id`, `:tabId`) ОБЯЗАТЕЛЬНО прогоняются через `decId()` (`decodeURIComponent`) перед использованием — см. секцию «URL-encoded path параметры» ниже.
+
+Публичный URL вместо LAN-IP — см. [`fact-remote-access.md`](fact-remote-access.md). С phone'а через интернет endpoint-map тот же, отличается только хост в URL.
+
+## URL-encoded path параметры (`=` в base64-id)
+
+ProjectId формируется как `base64(path)`. Короткие пути (`/Users/fedor/Desktop/vs-code/agrotech/uav` → `L1VzZXJzL2ZlZG9yL0Rlc2t0b3AvdnMtY29kZS9hZ3JvdGVjaC91YXY=`) оканчиваются на `=`, который в URL сериализуется как `%3D`. Tab-id наследует base64-префикс от projectId, тот же эффект.
+
+**Симптом:** `HTTP 404: {"error":"project not found","projectId":"…%3D"}` только на проектах с коротким именем; длинные имена (`custom-terminal`) с padding `0` или `==` без `=` работают сразу.
+
+**Причина:** regex-захват `parsed.pathname.match(/^\/api\/projects\/([^/]+)\/tabs$/)` возвращает **URL-encoded** строку. `projectManager.db.getProjectById('…%3D')` ищет в SQLite по дословному ключу, а в БД — декодированный `=`. Не находит → 404.
+
+**Решение:** helper `decId(s) { try { return decodeURIComponent(s); } catch { return s; } }` обязательно применяется к каждому `m[1]` / `m[2]` в `web-server.js::handleApi`. Это покрывает не только `=`, но и кириллицу, пробелы, любой символ который mobile-web кодирует в URL. Когда добавляешь новый route с pathname-параметром — `decId(m[1])`, не голый `m[1]`.
+
+## Live-fallback для `/api/projects/:id/tabs` через Zustand-bridge
+
+`getProjectById` в `database.js` ходит **только в SQLite**. Проблема: проекты бывают **dashboard-only / draft** — открытые в Zustand `openProjects` Map, но ещё не записанные через `saveTabs` в БД. До этой правки таких проектов с phone'а нельзя было открыть — 404.
+
+**Логика endpoint'а теперь двухступенчатая:**
+1. `projectManager.db.getProjectById(projectId)` — основной путь (persisted проекты).
+2. Если `null` → `bridgeRequest('getProjectTabsLive', { projectId })` — renderer проверяет `state.openProjects.get(projectId)` в Zustand и отдаёт live-snapshot табов.
+3. Если и там нет → 404 с диагностическим логом `[WebServer] 404 project not found: <id> (not in DB, not in live Zustand)`.
+
+Bridge-action `getProjectTabsLive` в `App.tsx::handleWebBridge` возвращает табы в том же shape что SQLite-путь, чтобы phone не отличал. Один из крайних случаев: если проект **открыт в UI и одновременно есть в БД с другим набором табов** — live из Zustand берёт верх (первый ступень нашла, ко второй не пошли). Это правильно — Zustand authoritative для активного состояния.
+
+## Stale prod-app → silent bridge timeout (5s)
+
+**Самый дорогой класс багов с phone-доступом.** Если в `App.tsx::handleWebBridge` или `web-server.js::bridgeRequest` сделана правка, но **не запущен `build:install`** — prod-app продолжает работать со старой сборкой в asar. С позиции web-server'а bridge-вызов уходит в `webContents.send('web:bridge-request', …)`, renderer его получает, но **handler с нужным action'ом не зарегистрирован** в старой версии → reply не приходит → ровно через `timeoutMs` (5000 по умолчанию) web-server отдаёт 500 `Bridge timeout: <action>`.
+
+**Симптомы:**
+- `[WebTiming] /history ERROR Bridge timeout: loadSDKHistory total=5000ms` (или другой action ровно по таймауту).
+- Phone показывает бесконечный loader, через ~15с — пустой чат с composer'ом «Send something below».
+- `/timeline` тоже валится в `bridge=1500ms` (там короче timeout на `getOpenProjectIds`), но **продолжает работать** через fallback на пустой openIds + чтение JSONL напрямую → юзер видит таймлайн при пустом чате, что особенно сбивает.
+
+**Диагностика — мгновенные парные логи в трёх точках:**
+- `web-server.js::bridgeRequest` пишет `[BridgeDiag] SEND action=… rid=… wins=…` на отправке, `[BridgeDiag] REPLY action=… elapsedMs=…` на приёме, `[BridgeDiag] TIMEOUT action=…` при истечении, `[BridgeDiag] REPLY_DROPPED rid=…` если ответ пришёл уже после timeout.
+- `App.tsx::handleWebBridge` пишет `[BridgeDiag:R] RECV rid=…` на входе и `[BridgeDiag:R] REPLY rid=… ok=… elapsedMs=…` перед `ipcRenderer.send('web:bridge-reply', …)`.
+
+Сценарии чтения:
+- `SEND` без последующего `RECV` (через ~50ms gap) → renderer не получает IPC. Window-mismatch, dead webContents, или handler не зарегистрирован.
+- `SEND + RECV + REPLY:R + REPLY (main)` все есть → всё ок, замерь `elapsedMs`.
+- `SEND + RECV + REPLY:R` но `REPLY_DROPPED` в main → ответ опоздал, поднять `timeoutMs` для этого action'а в `bridgeRequest`.
+- `SEND + RECV` но **нет** `REPLY:R` → handler упал silent внутри `await` (например `ipcRenderer.invoke('claude-sdk:active-branch-messages', …)` на огромном JSONL).
+
+**Правило:** любая правка `App.tsx::handleWebBridge` или `web-server.js::bridgeRequest` требует `npm run build:install` перед тестом с phone'а — иначе симптом всегда будет «Bridge timeout» вне зависимости от качества правки. Это занудно, но иначе час уйдёт на отладку не того процесса. Mobile-web Vite dev (`cd mobile-web && npm run dev`) НЕ решает — фронт можно итерировать без билда, но `web-server.js` живёт в Electron main, его правки требуют `build:install` всё равно.
+
 ## WS protocol
 
 Server → client:
@@ -135,7 +181,7 @@ const webServer = require(path.join(srcMainDir, 'web-server'));
 
 ## Routing (HashRouter)
 
-URL-схема: `#/projects/:projectId/chat/:tabId[?ro=1]`. HashRouter а не BrowserRouter — node-static в `web-server.js` не имеет SPA-fallback'а на произвольные pathnames; hash на сервер не уходит, фрагмент читается клиентом. Reload на любой странице → попадаешь обратно туда же. Deep-link (нет `state.tab` в `history.state`) → `Api.listTabs(projectId)` ищет TabInfo по `tabId`, либо показывает «Tab not found» с кнопкой назад. См. `methodology/design-mobile.md::Deep-link routing`.
+URL-схема: `#/projects/:projectId/chat/:tabId[?ro=1]`. HashRouter а не BrowserRouter — node-static в `web-server.js` не имеет SPA-fallback'а на произвольные pathnames; hash на сервер не уходит, фрагмент читается клиентом. Reload на любой странице → попадаешь обратно туда же. Deep-link (нет `state.tab` в `history.state`) → `Api.listTabs(projectId)` ищет TabInfo по `tabId`, либо показывает «Tab not found» с кнопкой назад. См. `methodology/мобильный-дизайн.md::Deep-link routing`.
 
 ## History pipeline (NDJSON streaming + IDB delta sync + virtuoso)
 
@@ -193,13 +239,13 @@ Warm-cache путь: только одна фаза `?after=<cachedLastUuid>` �
 
 **Synthetic broadcast skip on mobile:** main.js шлёт `__webSynthetic: true` user message через WS чтобы desktop рендер показал bubble на mobile-prompt'ах. Phone reducer **игнорирует** synthetic — иначе phone получит дубль (synthetic + real-record). Mobile получает мгновенный feedback через **локальный optimistic push** в `send()`, real-record adopt'ит свой uuid в существующую entry (dedupe by text).
 
-См. `methodology/design-mobile.md::Tail-first loading`, `knowledge/fix-mobile-history-bottleneck.md` (история отладки до streaming), `knowledge/fix-mobile-scroll-jitter-virtuoso.md` (CV+virtuoso антипаттерн).
+См. `methodology/мобильный-дизайн.md::Tail-first loading`, `knowledge/fix-mobile-history-bottleneck.md` (история отладки до streaming), `knowledge/fix-mobile-scroll-jitter-virtuoso.md` (CV+virtuoso антипаттерн).
 
 ## Expanded state map (across virtuoso re-mount)
 
 `_entryExpanded: Map<entryId, boolean>` в module scope `mobile-web/src/App.tsx`. Hook `useEntryExpanded(id, defaultOpen)` подписывается на per-id version counter. Используется в ThinkingCard и ToolCard. Cleanup в `clearEntryExpandedForIds` срабатывает на ChatView unmount — иначе Map течёт по entry.id'ам всех когда-либо открытых чатов.
 
-См. `methodology/design-mobile.md::Persistent expanded state across virtual list re-mount`.
+См. `methodology/мобильный-дизайн.md::Persistent expanded state across virtual list re-mount`.
 
 ## Dev-port isolation (parallel production)
 

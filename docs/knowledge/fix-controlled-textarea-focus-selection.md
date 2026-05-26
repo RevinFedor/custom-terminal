@@ -65,4 +65,4 @@ Threshold 5 chars: меньше — обычно случайный микро-d
 
 ## Принципы
 
-Переносимая часть — `methodology/design.md::Focus-vs-selection in scrollable text containers`, `::Suppress focus on non-edit buttons in scroll-content`, `::Global keystroke routing для selection-scope UI`.
+Переносимая часть — `methodology/переносимый-дизайн.md::Focus-vs-selection in scrollable text containers`, `::Suppress focus on non-edit buttons in scroll-content`, `::Global keystroke routing для selection-scope UI`.

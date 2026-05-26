@@ -256,6 +256,16 @@ const PromptPickerOverlay: React.FC = () => {
     setSelectedKey(null);
     setPickerLevel('group');
     setSelectedPromptIdx(0);
+    // Restore focus to the active terminal / SDK composer. Without this,
+    // DOM focus is left on <body> after the picker closes — a row click blurs
+    // the xterm textarea, and Esc/click-outside never put it back — so the
+    // Claude TUI loses its cursor and the user has to click the terminal again.
+    // Reuse the existing refocus bus (Terminal.tsx + SDKComposer already listen;
+    // see fact-cmd-tab-refocus.md). Fire on the next frame so the portal has
+    // unmounted and any SDK composer-insert has run before we grab focus.
+    requestAnimationFrame(() => {
+      try { window.dispatchEvent(new CustomEvent('nt:window-refocus-active')); } catch {}
+    });
   }, [setOpen]);
 
   const selectedLeftItem = useMemo<FlatLeftItem | null>(() => {
