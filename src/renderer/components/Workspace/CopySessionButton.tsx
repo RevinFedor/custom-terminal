@@ -198,7 +198,8 @@ export default function CopySessionButton({ activeTabId, sessionType }: CopySess
       }
       if (allResults.length > 0) {
         const finalContent = allResults.join('\n\n' + '='.repeat(40) + '\n\n');
-        await navigator.clipboard.writeText(finalContent);
+        const { clipboard } = window.require('electron');
+        clipboard.writeText(finalContent);
         const sizeKB = Math.round(finalContent.length / 1024);
         showToast(`Скопировано ${validTabs.length}/${tabsToCopy.length} сессий (${sizeKB}KB)`, 'success');
       } else {

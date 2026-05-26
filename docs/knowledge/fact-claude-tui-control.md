@@ -95,7 +95,7 @@ Flow в `safePasteAndSubmit` опцией `stashFirst: true`:
 - Внутри: ~20ms drain после Ctrl+S, ~250ms ожидание sync marker от paste, ~50ms tail drain, ~5ms Enter.
 - До фиксов: 8-9 секунд (timeout race).
 
-См. также `methodology/design.md::Воспринимаемая задержка UI-команд` — пустой инпут ощущается «лагающим» на тех же 80ms, на которых заполненный инпут визуально «мгновенный»; именно поэтому drain'ы свели до минимума event-driven путём.
+См. также `methodology/переносимый-дизайн.md::Воспринимаемая задержка UI-команд` — пустой инпут ощущается «лагающим» на тех же 80ms, на которых заполненный инпут визуально «мгновенный»; именно поэтому drain'ы свели до минимума event-driven путём.
 
 ## Управление Effort Level
 
@@ -116,7 +116,7 @@ Effort Level (уровень интенсивности размышлений) 
 1. **`ANTHROPIC_MODEL="default"` в env:** Установка этого значения в переменных окружения (`.zshrc`) приводит к повреждению отображения в TUI (показывается `[default] 0%`). Для использования модели по умолчанию с 1M контекстом через env-переменные необходимо использовать формат `opus[1m]`.
 2. **`effortLevel: "max"` в settings.json:** Попытка прописать уровень `max` напрямую в файл настроек приводит к его **тихому сбросу** (null) при следующем запуске Claude. Уровень `max` не является персистентным; максимальное значение, которое сохраняет CLI между сессиями — `high`.
 3. **`1m context` маркер:** Единственный надежный способ отличить модель `default` от явно выбранной `opus` в потоке данных — наличие подстроки `(1M context)` в имени модели.
-4. **Список effort-уровней меняется между релизами Claude.** В мае 2026 `auto` был удалён, добавлен `xhigh` между `high` и `max`. Хардкод массивов `['auto','low','medium','high','max']` рассыпан по 4 файлам не пережил апдейт — UI показывал несуществующий `auto`, новый `xhigh` отсутствовал. Решение: **один canonical-файл** `src/renderer/constants/claudeLevels.ts` экспортирует `CLAUDE_EFFORT_LEVELS`, `CLAUDE_EFFORT_TOGGLE_OFF`, `CLAUDE_MODELS`. Все use sites импортируют оттуда. Legacy migration `'auto' → 'low'` для persisted values. Принцип переносимый — см. `methodology/design.md::Single source of truth для third-party shipping values`.
+4. **Список effort-уровней меняется между релизами Claude.** В мае 2026 `auto` был удалён, добавлен `xhigh` между `high` и `max`. Хардкод массивов `['auto','low','medium','high','max']` рассыпан по 4 файлам не пережил апдейт — UI показывал несуществующий `auto`, новый `xhigh` отсутствовал. Решение: **один canonical-файл** `src/renderer/constants/claudeLevels.ts` экспортирует `CLAUDE_EFFORT_LEVELS`, `CLAUDE_EFFORT_TOGGLE_OFF`, `CLAUDE_MODELS`. Все use sites импортируют оттуда. Legacy migration `'auto' → 'low'` для persisted values. Принцип переносимый — см. `methodology/переносимый-дизайн.md::Single source of truth для third-party shipping values`.
 
 ## Реактивное управление TUI через синхронизацию
 
@@ -248,7 +248,7 @@ the full history gets re-read on your next message.
 
 **Задержка 120мс перед `\r`:** ранее было 80 — Ink не успевал дорисовать остаток меню до прихода Enter, и Enter иногда попадал в неопределённое состояние (то срабатывал, то «съедал» prompt). 120мс — детерминированно после полного render.
 
-**Принцип:** см. `methodology/design.md::Ink TUI: пробелы как ANSI-команды, текст разорван по чанкам`. Любой будущий парсер TUI-вывода для Claude должен матчить **минимальные уникальные подстроки** (одно слово или короткая фраза), не комбинацию из двух — Ink почти гарантированно разнесёт их по чанкам.
+**Принцип:** см. `methodology/переносимый-дизайн.md::Ink TUI: пробелы как ANSI-команды, текст разорван по чанкам`. Любой будущий парсер TUI-вывода для Claude должен матчить **минимальные уникальные подстроки** (одно слово или короткая фраза), не комбинацию из двух — Ink почти гарантированно разнесёт их по чанкам.
 
 ### Auto-inject `/effort` при запуске Claude
 
@@ -262,15 +262,50 @@ bridge видит новый PID → claude:process-started fires
 
 **Почему `claude:process-started`, а не `claude:session-detected`:** session-detected fires на каждом bridge re-sync (раз в 1-2 секунды); session_id остаётся прежним при `claude --resume`, guard всегда false → /effort инжектится только однажды на жизнь таба. Process-started fires ровно один раз на спавн binary (новый PID). См. `fact-claude-stop-hook.md::Fresh-process detection`.
 
-**Почему без setTimeout:** `safePasteAndSubmit` сам ждёт sync-marker `\x1b[?2026l` от Ink. Если инпут ещё не готов — ждёт **внутри** функции (event-driven). Возвращается за 8-30ms на happy path. Раньше был paranoid `setTimeout(800ms)` обёртка — это "timeout как safety net вместо причины", антипаттерн (см. `methodology/design.md::Воспринимаемая задержка UI-команд`).
+**Почему без setTimeout:** `safePasteAndSubmit` сам ждёт sync-marker `\x1b[?2026l` от Ink. Если инпут ещё не готов — ждёт **внутри** функции (event-driven). Возвращается за 8-30ms на happy path. Раньше был paranoid `setTimeout(800ms)` обёртка — это "timeout как safety net вместо причины", антипаттерн (см. `methodology/переносимый-дизайн.md::Воспринимаемая задержка UI-команд`).
 
 **`max` нельзя задать в settings.json:** Claude CLI silently downgrades `effortLevel: "max"` до null при первом запуске. Максимум что settings.json держит — `high`. Из-за этого инжекция через `/effort max` — **единственный** способ стартовать сессию в max effort.
 
 **Persistence — SQLite, не localStorage.** `defaultClaudeEffort` сохраняется через `app:setState` IPC. Раньше был localStorage — но vite-dev меняет порт (5181 → 5182 → 5183) когда есть orphan Electron'ы, и каждый порт это **отдельный origin** → отдельное localStorage хранилище. Юзер видел "max сбрасывается после рестарта", думал что не сохраняется — на самом деле сохранялось, но на другом origin'е. См. `fix-localstorage-origin.md`.
 
+**Post-inject поведение: wrapper остаётся в JSONL, Timeline его скрывает фильтром.** Каждый спавн Claude в табе → `process-started` → инжект `/effort <level>`. Claude TUI синхронно пишет в JSONL пару записей:
+
+```
+{type:'user', content:'<command-name>/effort</command-name>...<command-args>max</command-args>', uuid, parentUuid, ...}
+{type:'user', content:'<local-command-stdout>Set effort level to max ...</local-command-stdout>', parentUuid: <предыдущая>}
+```
+
+**Мы их НЕ стираем.** Timeline render (`claude-data.js::parseTimelineEntries`) пропускает любые записи с тегами `<command-name>`, `<command-message>`, `<command-args>`, `<local-command-stdout>`, `<local-command-stderr>`, `<bash-notification>` — это существующий tag-filter, который и так покрывает `/compact`, `/clear`, `/status`, любые slash-команды. `/effort` попадает под тот же фильтр автоматически. В Timeline у юзера wrapper-карточки **не появляются**. parentUuid цепочка через wrapper проходит насквозь — `recordMap` его держит, render просто пропускает.
+
+**Graveyard №1 — busy-state trigger.** До artifact-side `fs.watch` пробовали слушать `claude:busy-state` edge true→false как сигнал окончания /effort turn'а. **Не сработало**: `/effort` это slash-команда, обрабатывается inline в Claude TUI **без вызова model API** → Stop hook никогда не fires (`query.ts:1062::handleStopHooks` срабатывает только после `model.complete()`, для slash-команд этого пути нет) → `claude:busy-state` остаётся false весь pendulum → safety timeout 5s срабатывал на каждом инжекте, cleanup пропускался. В логах юзера было видно три подряд `/effort max` в JSONL и три `busy-state timeout — Claude turn never finished, skip cleanup`.
+
+**Graveyard №2 — full-file rewrite после artifact-side fs.watch.** Перешли на `fs.watch` JSONL + tail-read дельты + match wrapper → batch-delete + relink parentUuid детей. Первая реализация делала `fs.readFile(filePath)` целиком → `JSON.parse` каждой строки → batch-relink всех parentUuid в targets set → `JSON.stringify` обратно → atomic tmp+rename. Корректно работало, но на сессии с 115 MB JSONL занимало **3 секунды CPU-блока main process** — за это время `provider:switch` / `provider:set-options` IPC handlers стояли в очереди, ClaudeControlBar показывал залипший shimmer-overlay, юзер не мог переключить модель. Юзер: *«вертикальная черта идёт очень долго»*, *«мы всё равно не можем редактировать историю до последнего юзер-сообщения, можем только с конца»*.
+
+**Graveyard №3 — tail-mode rewrite.** Свели полный rewrite к **только последним 16 KB** файла: `fs.open` + `read(buf, 0, 16K, fileSize - 16K)` → split на строки → найти самый правый `<command-name>/effort` wrapper в хвосте → `truncate(filePath, wrapper.startOffset)` + `appendFile(остатки)`. На тех же 115 MB занимало 4 ms вместо 3 секунд. Релинк parentUuid не делался — расчёт был на то что запись только что инжектнута, у неё ещё нет детей.
+
+**Graveyard №4 (final) — tail-mode создавал phantom parentUuid race.** Расчёт «у wrapper'а ещё нет детей» был неверен. Cleanup отрабатывал через 0.5-1с после inject'а (как только `fs.watch` ловил появление wrapper'а), но **первый user prompt в новой сессии** Claude TUI писал через 5-60 секунд (юзер шёл за кофе, читал предыдущий контекст, формулировал вопрос). К моменту prompt'а wrapper уже стёрт → Claude TUI пишет prompt с `parentUuid: <deleted-wrapper>` → orphan → красная зона в Timeline. Конкретный repro 2026-05-23: на 4 сессиях подряд (`8f0a0b48`, `cb2e4c26`, `09351b71`, `e4be2fe0`) phantom создавался ровно этим путём, лог `[DeleteEffortEntries] removed=2 relinked=0` — relink-pass всегда проходил вхолостую, потому что дети ещё не существовали. Юзер на 5-й сессии получил предупреждение «Обрыв UUID в JSONL», стал замечать паттерн: *«при смене effort у меня осталось предупреждение что сессия потеряна UUID»*.
+
+**Final fix (2026-05-23): cleanup удалён полностью.** `startEffortCleanupWatcher` / `stopEffortCleanupWatcher` / Map `claudeEffortCleanupWatchers` / IPC `claude:arm-effort-cleanup` / вызов из `Terminal.tsx::handleProcessStarted` — всё удалено из кода. Wrapper остаётся в JSONL, Timeline и так его не рендерит через tag-filter. Принцип переносимый — см. [`methodology/переносимый-дизайн.md::Не модифицируй чужой shared append-only файл во время работы владельца`](../methodology/переносимый-дизайн.md). `_deleteEffortEntries` функция в `claude-data.js` оставлена мёртвым кодом на случай если когда-нибудь захочется чистить накопленные wrapper'ы на resume (не live, а **только** когда Claude процесс уже exit'нул и не пишет в файл). IPC `claude:delete-effort-entries` тоже оставлен но из renderer'а не вызывается.
+
+### EffortInject kill-switch (`effort=none`) + resume-guard
+
+В StatusBar `Effort` chip поддерживает значение `none` — это **полный kill-switch** для EffortInject: `/effort` paste **не отправляется** на `process-started`. Эффект: при `effort=none` наш main process **ничего не пишет в Claude TUI** автоматически. С момента удаления live cleanup (см. Graveyard №4 выше) этот kill-switch стал почти ритуальным — даже при `effort=max` мы пишем только один paste-keystroke, не модифицируем JSONL. Сохранён для юзеров которые хотят 100% «приложение не вмешивается».
+
+**Resume-guard.** Даже при `effort=max/high/medium/low` инжект **skip'ается на `--resume`**: при resume Claude TUI восстанавливает effort из своего in-memory state предыдущей сессии, повторный paste бесполезен и потенциально опасен. Опасность задокументирована incident'ом 2026-05-21 15:09:34: Bridge:Fresh event и `Terminal:EffortInject` сработали в одну и ту же миллисекунду на `--resume`, `safePasteAndSubmit`'s Ctrl+S stash race'нулся с paste — `[PasteAudit:MISMATCH]` поймал что вместо 11 байт `/effort max` в композер Claude влетели 303 байта старого user prompt'а из buffer.
+
+Детекция resume: через renderer-side `getPendingResume(tabId)` из `utils/pendingResume.ts`. `markPendingResume` ставится при `claude --resume <sid>` (в AutoResume и любом другом code path запускающем resume), `clearPendingResume` в `handleSessionDetected` после bridge confirmation. На момент `handleProcessStarted` события `pendingResume` ещё active → inject skip с логом `[Terminal:EffortInject] tab=... SKIP — resume in flight (effort preserved by Claude TUI state)`. Fresh start (новый claude без `--resume`) → `pending === null` → обычный inject.
+
+Полная таблица поведения:
+
+| Условие | `/effort` paste | Лог |
+|---|---|---|
+| `effort='none'` | NO | `SKIP — effort=none` |
+| `effort=max/.../low` + resume in flight | NO | `SKIP — resume in flight` |
+| `effort=max/.../low` + fresh claude | YES | (обычный flow) |
+
 ### Click-toggle-off на effort кнопке
 
-Повторный клик на уже-активный effort → выбор сбрасывается на `auto` (DeepSeek: `off`). Это **переносимый UX-принцип** (см. `methodology/design.md::Click-toggle-off на single-select`) — для filter pills, tag selectors, любых toggle-эквивалентных кнопок.
+Повторный клик на уже-активный effort → выбор сбрасывается на `auto` (DeepSeek: `off`). Это **переносимый UX-принцип** (см. `methodology/переносимый-дизайн.md::Click-toggle-off на single-select`) — для filter pills, tag selectors, любых toggle-эквивалентных кнопок.
 
 Реализация: `const targetLevel = isActive ? (isDeepSeek ? 'off' : 'auto') : level;` — один тернарник в onClick, остальная логика без изменений. Tooltip меняется на `Click again to deselect (→ auto)` когда `isActive`.
 
@@ -325,7 +360,7 @@ wasEnabled  = |checkIdx - enabledIdx| < |checkIdx - disabledIdx|
 
 ## Per-provider behavior: Model, Effort, Think
 
-InfoPanel содержит **две зависимые строки** — Provider row и Model row — плюс Effort и Think. Принцип двухуровневого селектора (Provider → Model) описан в `methodology/design.md::Two-tier hierarchical selectors`. Здесь — конкретика поведения и **разные backend'ы для одинаковых UI-контролов** в зависимости от выбранного провайдера.
+InfoPanel содержит **две зависимые строки** — Provider row и Model row — плюс Effort и Think. Принцип двухуровневого селектора (Provider → Model) описан в `methodology/переносимый-дизайн.md::Two-tier hierarchical selectors`. Здесь — конкретика поведения и **разные backend'ы для одинаковых UI-контролов** в зависимости от выбранного провайдера.
 
 ### Model row vs реальный target запроса
 

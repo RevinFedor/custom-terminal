@@ -23,11 +23,16 @@ Noted Terminal обеспечивает глубокую интеграцию с
 `[⎘ copy] [SessionActionChip] [↻ refresh]  …  [⑂→▭ Fork-tab] [⑂→SDK]`.
 Снизу к этой строке примыкает компактный chip Copy session (см. [`fact-clipboard-tools.md::Copy Session: размещение и UX`](fact-clipboard-tools.md)).
 
-- **`SessionActionChip`** — fixed-width 64px кнопка с tri-state поведением:
-    - idle: `Claude` / `Gemini` (accent-цвет, прозрачный фон) — клик копирует sessionId (дублирует ⎘).
-    - hover + сессия есть + процесс **не** запущен: `Continue` — клик шлёт `claude:run-command`/`gemini:run-command` с `--resume`.
-    - hover + процесс **запущен** (`isCommandRunning`): `Stop` (красный `#ef4444`) — клик шлёт `\x03` (Ctrl+C) через `terminal:input`.
-    Fixed-width 64px необходим, иначе layout прыгает при смене лейбла (Claude → Continue → Stop разной ширины) и кнопки правее сдвигаются. Stop **намеренно** через Ctrl+C, не `terminal:kill` — kill убивает PTY вместе с табом, юзеру нужно прервать процесс **внутри** живого таба. См. также методологический принцип tri-state в [`methodology/design-bugs.md::Tri-state кнопка действия`](../methodology/design-bugs.md).
+- **`SessionActionChip`** — fixed-width 64px кнопка с двумя матрицами состояний в зависимости от `mode` prop:
+    - **PTY-режим** (`mode='pty'`, default — терминал с claude/gemini CLI):
+        - idle: `Claude` / `Gemini` (accent-цвет, прозрачный фон) — клик копирует sessionId (дублирует ⎘).
+        - hover + сессия есть + процесс **не** запущен: `Continue` — клик шлёт `claude:run-command`/`gemini:run-command` с `--resume`.
+        - hover + процесс **запущен** (`isCommandRunning`): `Stop` (красный `#ef4444`) — клик шлёт `\x03` (Ctrl+C) через `terminal:input`.
+    - **SDK-режим** (`mode='sdk'`, для Anthropic Agent SDK табов где нет PTY):
+        - idle: `Claude` (accent-цвет) — клик → focus composer (`claude-sdk:focus-composer` event). НЕ `Continue` и НЕ `Start`, потому что у SDK нет «процесс между turn'ами» как state — query живёт ровно один turn, новый prompt и есть continue. Юзер: *«должна отображаться просто кнопка „Claude“, которая никакого функционала не выполняет»*.
+        - hover + query активен (`isCommandRunning` = `sdkBusy` из `claude:busy-state` IPC): `Stop` (красный) — `claude-sdk:stop` IPC + dispatch `claude-sdk:was-stopped` для overlay'я «Process stopped — history preserved».
+
+    Fixed-width 64px необходим, иначе layout прыгает при смене лейбла (Claude → Continue → Stop разной ширины) и кнопки правее сдвигаются. PTY Stop **намеренно** через Ctrl+C, не `terminal:kill` — kill убивает PTY вместе с табом, юзеру нужно прервать процесс **внутри** живого таба. SDK Stop — через `claude-sdk:stop` IPC (закрывает AbortController + `query.close()`), но **с guard'ом**: dispatch'ится только при `sdkBusy=true` — без этого middle-click / context-menu Stop на idle SDK табе показывал overlay «Process stopped» без причины. См. также методологический принцип в [`methodology/сценарии-багов.md::12.6 Матрица состояний = lifecycle модели`](../methodology/сценарии-багов.md).
 - **Тултип на SessionActionChip** — sessionId появляется мгновенно (CSS `group-hover`), всплывает сверху вплотную к чипу.
 - **↻ Refresh timeline** — слева от Fork-кнопок, прижата к chip'у. Размер 16x16, шрифт 12px (выровнено с ⎘ через `inline-flex items-center justify-center`).
 - **Fork → tab** (`⑂→[icon]`) и **Fork → SDK** (`⑂→SDK`) — справа, ширина ~30–50px каждая. ПКМ по `⑂→tab` конвертирует текущий таб в SDK.

@@ -121,4 +121,4 @@ if (!fast) {
 - `fix-paste-bracket-mode-loss.md` — три фактора потери bracketed paste mode (env, node-pty, single bracket pair).
 - `fix-claude-paste-race.md` — concurrent safePasteAndSubmit race (тот же файл, но другой механизм — interleaved bytes из двух callers).
 - `fact-prompt-queue.md::cold-start через store subscription` — почему очередь вообще fires автоматически после +grab.
-- `methodology/design.md::Transparent passthrough` — почему manual Cmd+V не идёт через тот же helper.
+- `methodology/переносимый-дизайн.md::Transparent passthrough` — почему manual Cmd+V не идёт через тот же helper.

@@ -596,6 +596,8 @@ const TabItem = memo(({
   // Цвета/duration читаются через CSS-переменные на :root (App.tsx синхронизирует).
   const processBarEnabled = useUIStore((s) => s.processBar.enabled);
   const processBarPosition = useUIStore((s) => s.processBar.position);
+  // AI-pulse — отдельные от ProcessBar настройки фона таба пока AI «думает».
+  const aiPulseEnabled = useUIStore((s) => s.aiPulse.enabled);
   // Settings → форма маркера статуса (круг или квадрат) + размер в px.
   const statusMarkerShape = useUIStore((s) => s.statusMarker.shape);
   const statusMarkerSize = useUIStore((s) => s.statusMarker.sizePx);
@@ -637,14 +639,22 @@ const TabItem = memo(({
               just to the right of it. Replaces RestartZone/SDK-status zone. */}
           {isVerticalMode && (
             <>
-              {/* Process bar — runs along the full tab height, 3px wide. Pulse animation
-                  via globals.css class `tab-process-bar-busy`. Triggers ONLY by PTY-process
-                  presence (hasProcess) — НЕ AI-busy.
-                  Если processBarEnabled=false (Settings → отключил мигание) — статичный
-                  класс tab-process-bar-static красит фон без анимации. */}
-              {verticalHasProcess && (
+              {/* Process bar — 3px полоска по полной высоте вкладки. Внутри неё
+                  рендерятся ДВА независимых сигнала одновременно:
+                    • PTY-alive (hasProcess) → цветной пульс A↔B (или статика если
+                      processBarEnabled=false).
+                    • AI-busy (isBusy) → белёсый блик ползёт сверху вниз поверх цвета.
+                  Если активен только один сигнал — рисуется только он. Если AI думает
+                  без PTY (SDK-таб) — цвет полоски статичный colorA, блик ползёт.
+                  overflow:hidden нужен чтобы шиммер-overlay не вылезал за полоску
+                  на off-screen фазах translateY. */}
+              {(verticalHasProcess || verticalIsAiBusy) && (
                 <div
-                  className={processBarEnabled ? 'tab-process-bar-busy' : 'tab-process-bar-static'}
+                  className={
+                    verticalHasProcess
+                      ? (processBarEnabled ? 'tab-process-bar-busy' : 'tab-process-bar-static')
+                      : 'tab-process-bar-static'
+                  }
                   style={{
                     position: 'absolute',
                     // -2px компенсирует 2px transparent border (резерв под dashed-states).
@@ -655,12 +665,15 @@ const TabItem = memo(({
                     width: '3px',
                     pointerEvents: 'none',
                     zIndex: 5,
+                    overflow: 'hidden',
                     // Закруглённые углы только на «своей» стороне вкладки.
                     ...(processBarPosition === 'right'
                       ? { borderTopRightRadius: tabGeo.borderRadius, borderBottomRightRadius: tabGeo.borderRadius }
                       : { borderTopLeftRadius: tabGeo.borderRadius, borderBottomLeftRadius: tabGeo.borderRadius }),
                   }}
-                />
+                >
+                  {verticalIsAiBusy && <div className="tab-process-bar-ai-shimmer-overlay" />}
+                </div>
               )}
               {/* AI-busy background pulse — целый таб мягко пульсирует фоном
                   (см. .tab-ai-busy-shimmer в globals.css). zIndex:0 ставит
@@ -669,7 +682,7 @@ const TabItem = memo(({
                   sweep-полоса перекрывала текст и кнопки. */}
               {verticalIsAiBusy && (
                 <div
-                  className="tab-ai-busy-shimmer"
+                  className={aiPulseEnabled ? 'tab-ai-busy-shimmer' : 'tab-ai-busy-static'}
                   style={{
                     position: 'absolute',
                     // Растягиваемся НА border-area (включая 2px transparent border-left/right
@@ -863,50 +876,67 @@ const TabItem = memo(({
                    is open on another tab AND (b) we're NOT in peek-mode. Peek-mode means "buttons
                    only where there are notes" — keeping the default-on-active button on an empty
                    active tab during peek would break that rule.
-              The data-tab-id attribute lets TabNotesSlideout query the EXACT trigger for its
-              anchor (multiple peek buttons can be on screen at once when Cmd is held).
+              Empty vs filled: tab.notes пустой → тусклый dim-grey стиль (юзер видит «здесь нет
+              заметок, но кнопка чтобы создать»), notes есть → indigo-tinted (заметка ждёт). При
+              slideoutOpenHere — solid-indigo всегда (anchor-индикатор сильнее семантики empty).
+              position:relative + zIndex:1 нужны чтобы AI-busy-фон вкладки (zIndex:0, absolute) не
+              перекрасил кнопку — без явного stacking context positioned-sibling рисуется поверх
+              static-кнопки в том же flex'е. См. fact-notes.md::Z-index над AI-pulse.
               Mutex: если этот же таб зелёный с активным процессом — место занимает Restart-кнопка
               выше, notes не рендерится. */}
-          {isVerticalMode && !(tab.color === 'green' && hasProcess) && (slideoutOpenHere || showNotesPeek || (isActive && !anySlideoutOpen && !cmdPeekMode)) && (
-            <button
-              data-tab-notes-open-trigger
-              data-tab-id={tab.id}
-              onClick={(e) => {
-                e.stopPropagation();
-                const cur = useUIStore.getState().notesPanelOpenTabs[tab.id] ?? false;
-                useUIStore.getState().setNotesPanelOpen(tab.id, !cur);
-              }}
-              onDoubleClick={(e) => e.stopPropagation()}
-              title="Open notes (Cmd+E)"
-              className="flex-shrink-0 inline-flex items-center justify-center cursor-pointer transition-colors"
-              style={{
-                width: 20,
-                height: 18,
-                marginLeft: 6,
-                padding: 0,
-                borderRadius: 4,
-                backgroundColor: slideoutOpenHere ? '#6366f1' : '#1e1e2e',
-                color: slideoutOpenHere ? '#fff' : '#a5b4fc',
-                border: slideoutOpenHere
-                  ? '1px solid #6366f1'
-                  : '1px solid rgba(99,102,241,0.25)',
-              }}
-              onMouseEnter={(e) => {
-                if (slideoutOpenHere) return; // solid state — no hover swap
-                const el = e.currentTarget as HTMLButtonElement;
-                el.style.backgroundColor = '#2a2a3e';
-                el.style.color = '#c7d2fe';
-              }}
-              onMouseLeave={(e) => {
-                if (slideoutOpenHere) return;
-                const el = e.currentTarget as HTMLButtonElement;
-                el.style.backgroundColor = '#1e1e2e';
-                el.style.color = '#a5b4fc';
-              }}
-            >
-              <StickyNote size={11} strokeWidth={2} />
-            </button>
-          )}
+          {isVerticalMode && !(tab.color === 'green' && hasProcess) && (slideoutOpenHere || showNotesPeek || (isActive && !anySlideoutOpen && !cmdPeekMode)) && (() => {
+            const hasNotes = !!(tab.notes && tab.notes.trim().length > 0);
+            const dim = !slideoutOpenHere && !hasNotes;
+            const baseBg = slideoutOpenHere ? '#6366f1' : '#1e1e2e';
+            const baseColor = slideoutOpenHere
+              ? '#fff'
+              : (dim ? '#4f5167' : '#a5b4fc');
+            const baseBorder = slideoutOpenHere
+              ? '1px solid #6366f1'
+              : (dim
+                ? '1px solid rgba(99,102,241,0.10)'
+                : '1px solid rgba(99,102,241,0.25)');
+            return (
+              <button
+                data-tab-notes-open-trigger
+                data-tab-id={tab.id}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  const cur = useUIStore.getState().notesPanelOpenTabs[tab.id] ?? false;
+                  useUIStore.getState().setNotesPanelOpen(tab.id, !cur);
+                }}
+                onDoubleClick={(e) => e.stopPropagation()}
+                title={hasNotes ? 'Open notes (Cmd+E)' : 'Create notes (Cmd+E)'}
+                className="flex-shrink-0 inline-flex items-center justify-center cursor-pointer transition-colors"
+                style={{
+                  position: 'relative',
+                  zIndex: 1,
+                  width: 20,
+                  height: 18,
+                  marginLeft: 6,
+                  padding: 0,
+                  borderRadius: 4,
+                  backgroundColor: baseBg,
+                  color: baseColor,
+                  border: baseBorder,
+                }}
+                onMouseEnter={(e) => {
+                  if (slideoutOpenHere) return; // solid state — no hover swap
+                  const el = e.currentTarget as HTMLButtonElement;
+                  el.style.backgroundColor = '#2a2a3e';
+                  el.style.color = dim ? '#a5b4fc' : '#c7d2fe';
+                }}
+                onMouseLeave={(e) => {
+                  if (slideoutOpenHere) return;
+                  const el = e.currentTarget as HTMLButtonElement;
+                  el.style.backgroundColor = baseBg;
+                  el.style.color = baseColor;
+                }}
+              >
+                <StickyNote size={11} strokeWidth={2} />
+              </button>
+            );
+          })()}
         </>
       )}
 
@@ -1675,13 +1705,19 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   const handleStop = async (tabId: string) => {
     // SDK tabs have no PTY — cancel the in-process query instead of writing Ctrl+C
     // into a non-existent terminal. claude-sdk:stop closes the AbortController which
-    // makes the streaming for-await loop bail; ClaudeSDKTab's :done handler then
+    // makes the streaming for-after loop bail; ClaudeSDKTab's :done handler then
     // flips isRunning=false so the loader pill clears.
     const tab = workspace.tabs.get(tabId);
     if (tab?.tabType === 'claude-sdk') {
+      // Guard: dispatch claude-sdk:was-stopped (→ Resume overlay в композере)
+      // ТОЛЬКО когда query реально идёт. Без guard'а middle-click / tab-dot
+      // на idle SDK табе показывал «Process stopped — history preserved» с
+      // кнопкой Resume — хотя ничего не останавливали. Тот же guard стоит в
+      // context-menu (line 2475).
+      const isSDKBusy = claudeBusyMap.get(tabId);
+      if (!isSDKBusy) return;
       try {
         await ipcRenderer.invoke('claude-sdk:stop', { tabId });
-        // Surface the Resume affordance in the composer (history kept intact).
         window.dispatchEvent(new CustomEvent('claude-sdk:was-stopped', { detail: { tabId } }));
       } catch (e: any) { console.error('[TabBar:SDKStop] error', e); }
       return;

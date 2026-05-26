@@ -1862,8 +1862,11 @@ function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKT
   useEffect(() => {
     if (!isVisible) return;
     const handler = (e: KeyboardEvent) => {
+      // e.code для физических клавиш — иначе на русской/немецкой раскладке
+      // Ctrl+C приходит как e.key='с'/'c' (Cyrillic) и handler не срабатывает.
+      // CLAUDE.md: «Captured хоткей собирается через e.code, не e.key».
       const isEscapeAlias = e.key === 'Escape'
-        || (e.ctrlKey && !e.metaKey && !e.altKey && (e.key === '[' || e.key === 'c'));
+        || (e.ctrlKey && !e.metaKey && !e.altKey && (e.code === 'BracketLeft' || e.code === 'KeyC'));
       if (!isEscapeAlias) return;
       if (slashOverlay) {
         e.preventDefault();
@@ -3765,6 +3768,22 @@ function SDKComposer({
   // value setter + dispatch input event so React's onChange picks it up).
   const composerTextareaRef = useRef<HTMLTextAreaElement | null>(null);
 
+  // Cmd+Tab focus restore. main fires BrowserWindow 'focus' → App.tsx
+  // re-dispatches as window event. Mounted only when this SDK tab is the
+  // currently visible one (SDKComposer is rendered conditionally on active
+  // SDK tab), so unconditional refocus is correct here — no extra active
+  // check needed.
+  useEffect(() => {
+    const onRefocus = () => {
+      const ta = composerTextareaRef.current;
+      if (ta) {
+        try { ta.focus({ preventScroll: true }); } catch {}
+      }
+    };
+    window.addEventListener('nt:window-refocus-active', onRefocus);
+    return () => window.removeEventListener('nt:window-refocus-active', onRefocus);
+  }, []);
+
   // After a successful send the composer text resets to '', and we want the
   // stash to clear too — it has served its purpose. We watch for the empty
   // composer transition right after stash existed.
@@ -4004,36 +4023,32 @@ function SDKComposer({
     // Ctrl+S: stash. Mac users hit ⌘S in muscle memory; we accept both. Skip
     // when textarea is empty (nothing to stash) so a stray ⌘S doesn't replace
     // an existing stash with an empty one.
-    if (e.key === 's' && (e.ctrlKey || e.metaKey)) {
+    // e.code для физической клавиши — на русской раскладке e.key === 'ы', не 's'.
+    if (e.code === 'KeyS' && (e.ctrlKey || e.metaKey)) {
       e.preventDefault();
       if (composerText.trim().length === 0) return;
       setStashed(composerText);
       writeComposerValue('');
       return;
     }
-    // Ctrl+C: TUI-style two-stage clear → stop. Mac default ⌘C copies; we
-    // explicitly require Ctrl (not Meta) so highlight-and-copy still works.
-    if (e.key === 'c' && e.ctrlKey && !e.metaKey) {
-      // Don't intercept if the user actually has a text selection — they want
-      // to copy that selection, not clear/stop.
+    // Ctrl+C: ТОЛЬКО clear input. Stop процесса = отдельный жест (Esc на
+    // window-level handler line ~1862, или кнопка Stop в ControlBar/TabBar).
+    // Юзер: «При Ctrl+C разве у нас просто не должен очищаться input?» — да.
+    // Раньше Ctrl+C на пустом input или двойной Ctrl+C эскалировался в
+    // onSessionStop() → overlay «Process stopped — history preserved», что
+    // выглядело как баг (юзер хотел просто очистить ввод, а ему показывают
+    // что процесс остановлен).
+    // Mac default ⌘C copies; мы требуем Ctrl (не Meta), чтобы highlight-and-
+    // copy продолжал работать на macOS. e.code === 'KeyC' — на русской
+    // раскладке e.key === 'с' (cyrillic), не 'c'.
+    if (e.code === 'KeyC' && e.ctrlKey && !e.metaKey) {
+      // Не интерсептим если есть выделение — юзер хочет скопировать его.
       const sel = window.getSelection();
       if (sel && sel.toString().length > 0) return;
+      // Пустой композер → ничего не делаем (нечего очищать).
+      if (composerText.length === 0) return;
       e.preventDefault();
-      const now = Date.now();
-      const isDouble = now - lastCtrlCRef.current < CTRLC_DOUBLE_WINDOW_MS;
-      lastCtrlCRef.current = now;
-
-      // First press with non-empty input → clear. First press with empty input
-      // → escalate immediately to Stop (matches "nothing to clear, you mean
-      // exit"). Second press within window → escalate.
-      if (composerText.length > 0 && !isDouble) {
-        writeComposerValue('');
-        return;
-      }
-      if (isRunning) {
-        onSessionStop();
-        lastCtrlCRef.current = 0; // reset so next session-Ctrl+C starts fresh
-      }
+      writeComposerValue('');
       return;
     }
   }, [composerText, writeComposerValue, isRunning, onSessionStop, triggerRejectFlash, commitSlash]);

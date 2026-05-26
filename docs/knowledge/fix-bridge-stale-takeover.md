@@ -13,6 +13,11 @@
   drifting the tab's sessionId between several historical UUIDs before the user gives
   up. SQLite persists each drift; after the next restart AutoResume fires with the
   poisoned value.
+- Inverse failure mode (CwdGuard too strict): tab "knows" no session at all after
+  restart. `production.log` shows `[Bridge:Fresh]` for the tab but no follow-up
+  `[Bridge] Tab ... -> session: <sid>` and no `[Store:setClaudeSessionId]` on the
+  renderer side. PTY was created in cwd `A` but user `cd`'d to `B` inside the shell
+  before launching claude. See [`fix-cwdguard-session-not-detected.md`](fix-cwdguard-session-not-detected.md).
 
 ## Concrete incident (2026-05-18)
 
@@ -59,6 +64,17 @@ Lost work was recoverable only by grepping `production.log` for
 4. **Renderer Bridge handler had no guard against AutoResume races**. The Bridge
    IPC event won unconditionally, even when AutoResume had just written
    `claude --resume <Y>` to the PTY but no live bridge file existed yet for `<Y>`.
+5. **CwdGuard blocked `claude:session-detected` broadcast even for legitimate sessions**
+   (added 2026-05-23). The unrelated-path branch did a blanket `return`, which prevented
+   not only `terminalProjects.set` / `bridgeKnownSessions.set` (the real takeover
+   vectors) but also the renderer broadcast that writes `Tab.claudeSessionId` to
+   SQLite. Outcome: if PTY was created in cwd `A` but the user did `cd B` inside
+   the shell before launching `claude`, the renderer never learned the sessionId.
+   Across `build:install` restart the tab restored with `claudeSessionId=null`,
+   AutoResume couldn't fire, the tab lost its session. Fix lives in
+   [`fix-cwdguard-session-not-detected.md`](fix-cwdguard-session-not-detected.md):
+   emit `session-detected` once per new sessionId even on CwdGuard refusal, but
+   keep main-side caches untouched.
 
 ## Fix (5 layers, all required)
 

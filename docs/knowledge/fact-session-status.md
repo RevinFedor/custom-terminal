@@ -41,8 +41,14 @@ Hex normalizer (`normalizeHexValue`) принимает `'fff'` / `'#fff'` / `'f
 
 localStorage ключ `noted-terminal-session-statuses` (массив JSON). `statusMarker` отдельным ключом `noted-terminal-status-marker`. Tab.sessionStatus идёт через стандартный saveTabs → SQLite. **Не зеркалится в SQLite через `app:mirrorLocalStorageSync`** — это локальная UI-настройка, синк между Electron-инстансами на разных машинах для конфигурации статусов не нужен (одна машина = одна палитра).
 
+## Survival across close/restore
+
+Маркер переживает закрытие вкладки: колонка `tab_history.session_status` хранит id статуса при `archiveTab`, обе ветки restore (одиночный клик в Home и middle-click background) пробрасывают его в `createTab({sessionStatus})`. То же в Shift+Cmd+T (`reopenLastClosedTab` через `popLatestTabHistory`). Без этого юзер открывает Home, кликает по закрытой Claude-сессии «помеченной как bugfix» — таб восстанавливается без маркера, дальнейшая сортировка по статусу не работает.
+
+В history-карточке Home маркер рисуется **inline слева от имени** (`flex` строка `[маркер][имя]`), shape/size берутся из тех же `useUIStore.statusMarker` что и для активных вкладок. Если статус с этим id был удалён из палитры — маркер не рендерится, но row в `tab_history` сохраняет id (восстановится автоматически если юзер вернёт статус в палитру). См. также `methodology/переносимый-дизайн.md::Активность через насыщенность фона` про общую логику когда маркер не теряется при удалении статуса.
+
 ## Связи
 
 - `knowledge/fact-tabs.md::Vertical mode (TabSidebar)` — где рендерится маркер.
 - `knowledge/fact-process-bar.md` — process-bar с position toggle живёт в той же конфигурации.
-- `methodology/design.md::Активность через насыщенность фона` — почему маркер не использует tint самой вкладки.
+- `methodology/переносимый-дизайн.md::Активность через насыщенность фона` — почему маркер не использует tint самой вкладки.

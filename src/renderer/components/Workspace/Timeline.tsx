@@ -317,6 +317,14 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   const [isLoading, setIsLoading] = useState(false);
   const [contextMenu, setContextMenu] = useState<{ x: number, y: number, entry: TimelineEntry, source?: 'dot' | 'segment' } | null>(null);
   const [sessionBoundaries, setSessionBoundaries] = useState<SessionBoundary[]>([]);
+  // Boundary uuid from backend (= youngest entry of pre-orphan tail, set when
+  // Generic CHAIN BREAK recovery fired). Used ONLY to detect post-compact
+  // chain breaks (orphan UUID after the last /compact boundary) — those need
+  // red-background even in HistoryPanel/SDK mode, because pre-orphan tail in
+  // post-compact zone is not actually visible to live Claude. When the orphan
+  // sits BEFORE the last compact, the existing isOldHistory red band already
+  // covers it — nothing extra to do.
+  const [claudeMemoryBoundaryUuid, setClaudeMemoryBoundaryUuid] = useState<string | null>(null);
   const [copyingRange, setCopyingRange] = useState<{ startIndex: number, endIndex: number } | null>(null);
   const [copiedRange, setCopiedRange] = useState<{ startIndex: number, endIndex: number } | null>(null);
   const [visibleEntryIndices, setVisibleEntryIndices] = useState<Set<number>>(new Set());
@@ -442,6 +450,15 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     downTotal: number;
     apiInputTokens: number;
     apiOutputTokens: number;
+    // Cache breakdown — splits apiInputTokens на три части. Сумма всегда равна
+    // apiInputTokens. Cache touches только input (output не кэшируется).
+    //   apiInputUncached    — input_tokens, full price (свежий промпт)
+    //   apiInputCacheCreate — cache_creation_input_tokens, 1.25× price
+    //   apiInputCacheRead   — cache_read_input_tokens, 0.1× price
+    // Backend старый версии может не вернуть эти поля → 0 fallback.
+    apiInputUncached?: number;
+    apiInputCacheCreate?: number;
+    apiInputCacheRead?: number;
     categories: {
       user: number; claudeText: number; claudeThinking: number;
       read: number; edit: number; bash: number; tools: number;
@@ -577,7 +594,16 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       });
       if (cancelled) return;
       if (result?.success) {
-        setTokenEstimate({ total: result.total, downTotal: result.downTotal || 0, apiInputTokens: result.apiInputTokens || 0, apiOutputTokens: result.apiOutputTokens || 0, categories: result.categories });
+        setTokenEstimate({
+          total: result.total,
+          downTotal: result.downTotal || 0,
+          apiInputTokens: result.apiInputTokens || 0,
+          apiOutputTokens: result.apiOutputTokens || 0,
+          apiInputUncached: result.apiInputUncached || 0,
+          apiInputCacheCreate: result.apiInputCacheCreate || 0,
+          apiInputCacheRead: result.apiInputCacheRead || 0,
+          categories: result.categories,
+        });
       } else {
         setTokenEstimate(null);
       }
@@ -619,7 +645,16 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       if (cancelled) return;
       if (result?.success) {
         singleCachedUuidRef.current = singleTokenUuid;
-        setSingleTokenEstimate({ total: result.total, downTotal: result.downTotal || 0, apiInputTokens: result.apiInputTokens || 0, apiOutputTokens: result.apiOutputTokens || 0, categories: result.categories });
+        setSingleTokenEstimate({
+          total: result.total,
+          downTotal: result.downTotal || 0,
+          apiInputTokens: result.apiInputTokens || 0,
+          apiOutputTokens: result.apiOutputTokens || 0,
+          apiInputUncached: result.apiInputUncached || 0,
+          apiInputCacheCreate: result.apiInputCacheCreate || 0,
+          apiInputCacheRead: result.apiInputCacheRead || 0,
+          categories: result.categories,
+        });
       }
     })();
     return () => { cancelled = true; };
@@ -685,6 +720,13 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   // Phase 3: Tree view (per-tab, persisted in UIStore)
   const treeMode = useUIStore(state => state.timelineTreeModeTabs[tabId] ?? false);
   const setTimelineTreeMode = useUIStore(state => state.setTimelineTreeMode);
+  const showToast = useUIStore(state => state.showToast);
+  // Dedup CHAIN BREAK toast per (session, count): show once when recovery first appears
+  // (proxy crash dropped an in-flight assistant response, history auto-recovered).
+  const chainBreakNotifiedRef = useRef<Map<string, number>>(new Map());
+  // Last orphan uuid we already toast'ed for this session — used so a NEW
+  // orphan (different uuid) in the same session produces a fresh toast.
+  const chainBreakLastUuidRef = useRef<Map<string, string>>(new Map());
 
   const notesPanelWidth = useUIStore(state => state.notesPanelWidth);
   const timelineTooltipWidth = useUIStore(state => state.timelineTooltipWidth);
@@ -811,6 +853,13 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
 
   // Compute group map for sub-agent entries (Phase 2)
   const groupMap = useMemo(() => computeGroups(entries), [entries]);
+
+  // Index of the chain-break boundary (= youngest entry of pre-orphan tail).
+  // Resolved here from uuid → index for downstream useMemos.
+  const claudeMemoryBoundaryIndex = useMemo(() => {
+    if (!claudeMemoryBoundaryUuid) return -1;
+    return entries.findIndex(e => e.uuid === claudeMemoryBoundaryUuid);
+  }, [entries, claudeMemoryBoundaryUuid]);
   // Precompute fork snapshot UUID Sets for suppressing inherited plan mode boundaries
   const forkSnapshotSets = useMemo(() =>
     forkMarkers.filter(m => m.entry_uuids && m.entry_uuids.length > 0).map(m => new Set(m.entry_uuids)),
@@ -1076,6 +1125,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       setForkMarkers([]);
       setExpandedGroups(new Set());
       setTimelineTreeMode(tabId, false);
+      setClaudeMemoryBoundaryUuid(null);
       return;
     }
 
@@ -1088,6 +1138,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
           setEntries(timelineResult.entries);
           setSessionBoundaries([]);
           setForkMarkers([]);
+          setClaudeMemoryBoundaryUuid(null);
         }
       } else {
         // Claude: load timeline entries and fork markers in parallel
@@ -1099,6 +1150,52 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         if (timelineResult.success) {
           setEntries(timelineResult.entries);
           setSessionBoundaries(timelineResult.sessionBoundaries || []);
+          setClaudeMemoryBoundaryUuid(timelineResult.claudeMemoryBoundaryUuid || null);
+
+          // CHAIN BREAK notifications.
+          //
+          // Any orphan parentUuid in the JSONL is a chain break — caused by
+          // Claude CLI being killed mid-stream (rebuild / Stop button / Esc
+          // mid-turn / SSE crash / close-tab / etc.). Live Claude usually
+          // still has the missing parent in RAM so the running session keeps
+          // working, but the JSONL is corrupted — on next `claude --resume`
+          // the live backtrace would truncate at the orphan. AutoRepair fixes
+          // this at app boot and at pre-resume time; here we just SURFACE it
+          // to the user so they know it happened and can verify the red zone.
+          //
+          // Toast policy: fire whenever boundaryUuid CHANGES (new orphan
+          // appeared OR a different orphan became the newest). Keyed by uuid
+          // so a second/third orphan in the same session produces a fresh
+          // toast; same uuid = same break = no spam.
+          //
+          // No compact guard — orphans are independent of /compact. They can
+          // appear in sessions with zero compacts (the original bug we hunted
+          // for hours: rebuild while Claude is writing). Painting them as
+          // post-compact-only red was wrong.
+          //
+          // [JsonlChainDiag:ChainBreak] log line in main process remains for
+          // forensic grep — `tail -F production.log | grep ChainBreak` still works.
+          const newBoundaryUuid: string | null = timelineResult.claudeMemoryBoundaryUuid || null;
+          const lastNotifiedUuid = chainBreakLastUuidRef.current.get(sessionId);
+          if (newBoundaryUuid && newBoundaryUuid !== lastNotifiedUuid) {
+            const prevCount = chainBreakNotifiedRef.current.get(sessionId) || 0;
+            const newCount = prevCount + 1;
+            chainBreakNotifiedRef.current.set(sessionId, newCount);
+            chainBreakLastUuidRef.current.set(sessionId, newBoundaryUuid);
+            const message = newCount === 1
+              ? 'Обрыв UUID в JSONL — записи до обрыва Claude не видит через backtrace, помечены красным. При следующем resume будут восстановлены.'
+              : `Ещё один обрыв UUID (всего ${newCount}). Записи до обрыва помечены красным.`;
+            showToast(
+              message,
+              'warning',
+              0,
+              true,
+              undefined,
+              undefined,
+              undefined,
+              tabId
+            );
+          }
 
           // Detect session ID change (e.g., after "Clear Context" in plan mode)
           // Guard: prevent A→B→A→B feedback loop (circular session_links from dual-PID Bridge)
@@ -2772,16 +2869,59 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
             </div>
           </>
         ) : (
-          <div className="flex flex-col gap-0.5">
-            <div className="flex items-center justify-between text-[11px]">
-              <span className="text-white/60">Input</span>
-              <span className="font-mono text-white/80">{formatTokenCount(est.apiInputTokens)}</span>
-            </div>
-            <div className="flex items-center justify-between text-[11px]">
-              <span className="text-white/60">Output</span>
-              <span className="font-mono text-white/80">{formatTokenCount(est.apiOutputTokens)}</span>
-            </div>
-          </div>
+          // API-mode: разделяем input на три статьи. Cache touches только
+          // input (Claude никогда не кэширует output), поэтому Output остаётся
+          // одной строкой. Sum (Uncached + Cache create + Cache read) =
+          // apiInputTokens — это и есть «полный prompt size как если бы
+          // кэша не было». Юзеру в одну строку, какая часть была billed как
+          // свежий промпт, какая попала под cache_creation (1.25×), какая —
+          // под cache_read (0.1×).
+          (() => {
+            const uncached = est.apiInputUncached ?? 0;
+            const cacheCreate = est.apiInputCacheCreate ?? 0;
+            const cacheRead = est.apiInputCacheRead ?? 0;
+            const cachedTotal = cacheCreate + cacheRead;
+            const hasCacheData = uncached + cachedTotal > 0;
+            // Fallback: если backend не вернул разбивку (старый main) —
+            // показываем одну строку как раньше.
+            if (!hasCacheData && est.apiInputTokens > 0) {
+              return (
+                <div className="flex flex-col gap-0.5">
+                  <div className="flex items-center justify-between text-[11px]">
+                    <span className="text-white/60">Input</span>
+                    <span className="font-mono text-white/80">{formatTokenCount(est.apiInputTokens)}</span>
+                  </div>
+                  <div className="flex items-center justify-between text-[11px]">
+                    <span className="text-white/60">Output</span>
+                    <span className="font-mono text-white/80">{formatTokenCount(est.apiOutputTokens)}</span>
+                  </div>
+                </div>
+              );
+            }
+            return (
+              <div className="flex flex-col gap-0.5">
+                <div className="flex items-center justify-between text-[11px]">
+                  <span className="text-white/60" title="usage.input_tokens — свежий промпт, полная цена">Input billed</span>
+                  <span className="font-mono text-white/80">{formatTokenCount(uncached)}</span>
+                </div>
+                <div
+                  className="flex items-center justify-between text-[11px]"
+                  title="cache_creation_input_tokens (1.25×) + cache_read_input_tokens (0.1×)"
+                >
+                  <span className="text-white/40">↳ cached</span>
+                  <span className="font-mono text-white/60">{formatTokenCount(cachedTotal)}</span>
+                </div>
+                <div className="flex items-center justify-between text-[11px] mt-0.5 pt-0.5 border-t border-white/5">
+                  <span className="text-white/50">Input (total)</span>
+                  <span className="font-mono text-white/80">{formatTokenCount(uncached + cachedTotal)}</span>
+                </div>
+                <div className="flex items-center justify-between text-[11px] mt-1">
+                  <span className="text-white/60">Output</span>
+                  <span className="font-mono text-white/80">{formatTokenCount(est.apiOutputTokens)}</span>
+                </div>
+              </div>
+            );
+          })()
         )}
       </>
     );
@@ -3089,6 +3229,17 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
             const isPromptVisible = isInViewport && !isResponseOnly;
             // Old history = before last compact/plan boundary (not part of current dialog)
             const isOldHistory = lastBoundaryIndex >= 0 && index <= lastBoundaryIndex;
+            // Chain-break zone: entries that are visually rendered but invisible
+            // to Claude's own backtrace because a phantom parentUuid breaks the
+            // chain somewhere along the way. claudeMemoryBoundaryIndex marks
+            // the youngest entry of the pre-orphan tail — anything older than
+            // it (including the boundary itself) cannot be reached by live
+            // Claude. Compact is unrelated: orphans can appear with or without
+            // a compact in the session (rebuild/Stop/Esc/SSE crash all produce
+            // them).
+            const isChainBreakZone =
+              claudeMemoryBoundaryIndex >= 0 &&
+              index <= claudeMemoryBoundaryIndex;
 
             if (isCompacted) {
               dotColor = isHovered ? '#fbbf24' : '#a67c1a';
@@ -3289,11 +3440,20 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                       ? 'rgba(59, 130, 246, 0.15)'
                       : isHovered && isExpandedLayout && !isGroupMeta
                         ? 'rgba(255, 255, 255, 0.04)'
-                        : (isOldHistory && !isGroupMeta && !isCompacted && !isHistoryOpen && !isSdkTab
-                            ? 'rgba(239, 68, 68, 0.06)'
-                            : 'transparent'),
-                    // Old history is still clickable when full history is reachable
-                    // (HistoryPanel open OR SDK tab — both render pre-compact entries).
+                        // Red zones:
+                        // - chain-break zone (entries unreachable by Claude's
+                        //   own backtrace due to phantom parentUuid) — shown
+                        //   in ALL views including HistoryPanel/SDK, because
+                        //   even though the renderer can display them via
+                        //   recovery, live Claude cannot see them.
+                        // - pre-compact old-history — suppressed when
+                        //   HistoryPanel open OR SDK tab (those render full
+                        //   chat themselves so it'd be redundant).
+                        : (isChainBreakZone && !isGroupMeta && !isCompacted)
+                          ? 'rgba(239, 68, 68, 0.06)'
+                          : (isOldHistory && !isGroupMeta && !isCompacted && !isHistoryOpen && !isSdkTab
+                              ? 'rgba(239, 68, 68, 0.06)'
+                              : 'transparent'),
                     cursor: (isContinued || isDocsEdit || isDocsSearch || (isOldHistory && !isHistoryOpen && !isSdkTab)) ? 'default' : 'pointer',
                   } as React.CSSProperties}
                 >
@@ -5026,6 +5186,13 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                     padding: '6px 10px',
                     minWidth: '180px',
                     maxWidth: '260px',
+                    // minHeight стабилизирует popover при switch JSONL→API.
+                    // Без неё API-mode (3-4 строки) короче JSONL (10 строк) → попап
+                    // схлопывается, нижний край уползает выше курсора, mouseleave
+                    // выстреливает и popover закрывается до того как юзер успел
+                    // нажать. Юзер: «когда я тыкаю на вторую вкладку, у меня
+                    // меняется размер, и мгновенно это окно закрывается».
+                    minHeight: '180px',
                     boxShadow: '0 4px 16px rgba(0,0,0,0.6)',
                   }}
                 >
@@ -5089,6 +5256,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                     padding: '6px 10px',
                     minWidth: '180px',
                     maxWidth: '260px',
+                    minHeight: '180px',
                     boxShadow: '0 4px 16px rgba(0,0,0,0.6)',
                   }}
                 >

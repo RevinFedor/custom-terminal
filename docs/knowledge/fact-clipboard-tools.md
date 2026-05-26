@@ -29,14 +29,14 @@
 - **📋-половина** (settings): hover → accent-tinted фон + открывает Settings popup слева (тот же hierarchical-tree с тогглами).
 - **Copy-половина** (label): hover → accent-tinted фон + текст белый + полужирный. Клик копирует сессию.
 
-Каждая половина имеет собственный hover-state, не наследуется от другой — иначе непонятно, что именно сейчас будет нажато. См. [`methodology/design-bugs.md::7. Hover affordance`](../methodology/design-bugs.md).
+Каждая половина имеет собственный hover-state, не наследуется от другой — иначе непонятно, что именно сейчас будет нажато. См. [`methodology/сценарии-багов.md::7. Hover affordance`](../methodology/сценарии-багов.md).
 
 **CMD+hover на chip → single-line input снизу для custom session ID.** Это замена развёрнутой textarea-«модалки» (раньше клик по `▶` открывал блок с textarea + кнопкой Copy). Сейчас:
 - Просто `<input>` высотой 26px, без заголовка/описания/footer-кнопки. Enter = copy + close, Esc = close.
 - Ширина **динамическая**: от `chipRect.left` до левого края Timeline-strip (`[data-timeline]`) минус 8px. Перемеряется на `window.resize`. Без этого статичные 320px клипались за сайдбар.
-- Принцип «single-line input вместо модалки» см. [`methodology/design-bugs.md::Минимализм popup'ов`](../methodology/design-bugs.md).
+- Принцип «single-line input вместо модалки» см. [`methodology/сценарии-багов.md::Минимализм popup'ов`](../methodology/сценарии-багов.md).
 
-**CSS-bridge между chip'ом и input'ом.** Wrapper позиционирован **вплотную** к низу кнопки (`top: chip.bottom`), визуальный 4px gap создаётся через `paddingTop: 4` ВНУТРИ wrapper'а. Если задать `top: chip.bottom + 4` — между chip'ом и wrapper'ом возникает 4px мёртвая зона, popup закрывается при движении курсора сверху вниз. См. [`methodology/design-bugs.md::2.3 Wrapper смещён вниз от триггера`](../methodology/design-bugs.md).
+**CSS-bridge между chip'ом и input'ом.** Wrapper позиционирован **вплотную** к низу кнопки (`top: chip.bottom`), визуальный 4px gap создаётся через `paddingTop: 4` ВНУТРИ wrapper'а. Если задать `top: chip.bottom + 4` — между chip'ом и wrapper'ом возникает 4px мёртвая зона, popup закрывается при движении курсора сверху вниз. См. [`methodology/сценарии-багов.md::2.3 Wrapper смещён вниз от триггера`](../methodology/сценарии-багов.md).
 
 **Индикаторные точки на 📋** показывают только «не-дефолтные» флаги: красные — если User/Claude отключены, цветные — если Reading/Editing/Bash/Tools включены (по дефолту OFF), синий — если `fromStart=false`. Юзер видит «что в копии есть подозрительного» одним взглядом без открытия Settings.
 
@@ -65,9 +65,9 @@ UI настроек копирования организован в три ве
 **Master-toggle + incremental cascade.**
 - Parent OFF → все children рендерятся `disabled` (значение сохраняется в store, UI-клик блокируется). Восстановление parent ON возвращает прежний выбор children.
 - `Subagent` master синтезирован: `active = result || history`. Клик по нему: если оба OFF → включает только Result (минимальный полезный набор); если хоть один ON → выключает оба.
-- Subagent.History ON форсирует Subagent.Result ON (история без финального результата теряет анкер для отображения). Subagent.Result OFF форсирует History OFF (зеркально). Принцип «incremental» сформулирован пользователем дословно: *«вкл туго последнее → выкл туго вся история, и наоборот»*. Принцип в `methodology/design.md::Master toggle + incremental children`.
+- Subagent.History ON форсирует Subagent.Result ON (история без финального результата теряет анкер для отображения). Subagent.Result OFF форсирует History OFF (зеркально). Принцип «incremental» сформулирован пользователем дословно: *«вкл туго последнее → выкл туго вся история, и наоборот»*. Принцип в `methodology/переносимый-дизайн.md::Master toggle + incremental children`.
 
-**UI-лейблы child-тогглов = реальные имена tool из JSONL.** Раньше child назывались абстрактно (`Bash`, `Tools`) — пользователь не понимал разницу. Теперь рендерятся как код в monospace: `<code>Read</code> · <code>Grep</code> · <code>Glob</code>` для reading; `<code>Bash</code> · <code>Monitor</code>` + хинт `shell`; `<code>mcp__*</code> · <code>Web</code> · <code>Agent</code>` + хинт `MCP и прочее`. См. `methodology/design.md::Категориальные toggle — имена сущностей, не абстракции`.
+**UI-лейблы child-тогглов = реальные имена tool из JSONL.** Раньше child назывались абстрактно (`Bash`, `Tools`) — пользователь не понимал разницу. Теперь рендерятся как код в monospace: `<code>Read</code> · <code>Grep</code> · <code>Glob</code>` для reading; `<code>Bash</code> · <code>Monitor</code>` + хинт `shell`; `<code>mcp__*</code> · <code>Web</code> · <code>Agent</code>` + хинт `MCP и прочее`. См. `methodology/переносимый-дизайн.md::Категориальные toggle — имена сущностей, не абстракции`.
 
 **Indicator dot-логика на 📋:** красные точки при отклонении от дефолта в сторону «меньше» (User/Claude OFF — пользователь что-то намеренно исключил, потенциально неожиданно при копировании), цветные при отклонении в сторону «больше» (Bash/Tools/Sub-agent ON — добавлен extra-контент). Дефолтное состояние = ни одной точки.
 
@@ -129,9 +129,9 @@ UI настроек копирования организован в три ве
 
 **Frontend:** Timeline.tsx state `tokenEstimate: { total, downTotal, apiInputTokens, apiOutputTokens, categories }`, useEffect фетчит при изменении `rangeActionMenu.startUuid/endUuid`. Single-entry chip в Cmd+hover tooltip'е — lazy fetch на hover с кэшем по uuid (`singleCachedUuidRef`), чтобы хождение мышкой не дёргало backend. Popover в TooltipPortal: range — anchored right (`popupRightPx`), single — `left: chipRect.left`. `useLayoutEffect` flip-up logic: если `chipRect.bottom + popHeight > viewport.bottom - 10`, инвертируется (top: chipRect.top, transform: translateY(-100%)).
 
-**Hit-test через глобальный mousemove, не onMouseLeave.** Popover монтируется conditional (`{open && <Portal>…</Portal>}`) — на `onMouseLeave` с chip-а wrapper unmount'ится в том же тике, до того как курсор пересечёт gap, и `mouseenter` на popover'е не выстреливает. Архитектура closing-логики: глобальный `window.addEventListener('mousemove', …)` активен только пока `open=true`, считает курсор внутри chip-rect ИЛИ popover-rect (с tolerance ±2px) → если вне обоих, `setOpen(false)`. `onMouseLeave` на chip-е и popover'е **не вешать** — они отрабатывают раньше и закрывают popover до того как hit-test может удержать. См. `methodology/design-bugs.md::2.7 Lazy popover wrapper`.
+**Hit-test через глобальный mousemove, не onMouseLeave.** Popover монтируется conditional (`{open && <Portal>…</Portal>}`) — на `onMouseLeave` с chip-а wrapper unmount'ится в том же тике, до того как курсор пересечёт gap, и `mouseenter` на popover'е не выстреливает. Архитектура closing-логики: глобальный `window.addEventListener('mousemove', …)` активен только пока `open=true`, считает курсор внутри chip-rect ИЛИ popover-rect (с tolerance ±2px) → если вне обоих, `setOpen(false)`. `onMouseLeave` на chip-е и popover'е **не вешать** — они отрабатывают раньше и закрывают popover до того как hit-test может удержать. См. `methodology/сценарии-багов.md::2.7 Lazy popover wrapper`.
 
-**mousedown stopPropagation на корневом div'е popover'а** (`onMouseDown={(e) => e.stopPropagation()}` + тот же `onClick`). Без этого клик по toggle-кнопке `JSONL`/`API` внутри popover'а закрывает родительский rangeActionMenu (родитель слушает `window.mousedown` для click-outside). `onClick` сам по себе не помогает: mousedown bubble'ит первым, родитель уже сбросил state до того как handler кнопки выстрелит. Симптом — *«кнопка тупо не работает»*. См. `methodology/design-bugs.md::4.6`.
+**mousedown stopPropagation на корневом div'е popover'а** (`onMouseDown={(e) => e.stopPropagation()}` + тот же `onClick`). Без этого клик по toggle-кнопке `JSONL`/`API` внутри popover'а закрывает родительский rangeActionMenu (родитель слушает `window.mousedown` для click-outside). `onClick` сам по себе не помогает: mousedown bubble'ит первым, родитель уже сбросил state до того как handler кнопки выстрелит. Симптом — *«кнопка тупо не работает»*. См. `methodology/сценарии-багов.md::4.6`.
 
 **Gemini fallback:** `claude:estimate-range-tokens` доступен только для Claude-табов. Для Gemini `tokenEstimate=null`, чип показывает старую heuristic-оценку (сумма `entry.content.length/3.5` по user-prompt'ам в range), без breakdown — hover не открывает popover. Симметрично с copy-range backend'ом (Gemini идёт через `gemini:copy-range`, не делит на категории).
 
@@ -141,17 +141,23 @@ UI настроек копирования организован в три ве
 
 В верху breakdown popover'а — две кнопки-таба `JSONL` / `API`, общий `breakdownMode` state для range и single popover'ов (выбор сохраняется в сессии, переключается раз).
 
-**JSONL mode (default):** 10 категорий + total `В JSONL`. Считает суммарный вес записей в JSONL для диапазона. Отвечает на задачу юзера *«если я вырежу этот ответ, сколько сэкономлю относительно всего контекста»* — реальная экономия при delete-range/edit-range. См. принцип `methodology/design.md::Метрика-инвариант`.
+**JSONL mode (default):** 10 категорий + total `В JSONL`. Считает суммарный вес записей в JSONL для диапазона. Отвечает на задачу юзера *«если я вырежу этот ответ, сколько сэкономлю относительно всего контекста»* — реальная экономия при delete-range/edit-range. См. принцип `methodology/переносимый-дизайн.md::Метрика-инвариант`.
 
-**API mode:** две строки.
-- **Input** = сумма всех 3 входных полей `usage` (`input_tokens` + `cache_creation_input_tokens` + `cache_read_input_tokens`) по всем assistant entries в range. Слагаемое добавляется **только если поле есть** в JSONL — никакого zero-fill для отсутствующих. Юзер сформулировал явно: *«если кэш передаётся, считаем; если нет — не считаем»*.
-- **Output** = сумма `output_tokens` по всем assistants в range.
+**API mode:** три статьи input + одна output. Раньше была одна строка `Input` = сумма всех трёх (uncached + cache_creation + cache_read), но это скрывало структуру биллинга. Сейчас:
+- **Input billed** = `usage.input_tokens` (свежий промпт, full price)
+- **↳ cached** = `cache_creation_input_tokens` (1.25×) + `cache_read_input_tokens` (0.1×). Indented под billed, dimmer цвет — это **дополнительный** input что попал под кэширование, не отдельный от billed.
+- **Input (total)** = uncached + cached. Сумма с разделителем сверху. Это и есть «полный размер промпта как если бы кэша не было», та цифра что раньше показывалась как одиночный `Input`. Юзер: *«если эти два значения суммировать, то получится общий вес промпта, как если бы не было кэша»* — UI это отражает явно, через горизонтальную линию-сумму.
+- **Output** = `output_tokens` (cache не применяется к output — Claude генерирует его заново каждый раз).
 
-`apiInputTokens` авторитетен (Anthropic-stamped); `apiOutputTokens` дублирует `downTotal` (тот же `output_tokens`), но кладётся отдельным полем чтобы API-mode был self-contained блоком.
+Backend (`claude:estimate-range-tokens`) возвращает три отдельных поля: `apiInputUncached`, `apiInputCacheCreate`, `apiInputCacheRead` — плюс aggregate `apiInputTokens` оставлен для backward compat (renderer падает на одну строку при отсутствии разбивки). Каждое слагаемое добавляется **только если поле есть** в JSONL — никакого zero-fill для отсутствующих. Юзер сформулировал явно: *«если кэш передаётся, считаем; если нет — не считаем»*.
 
-**Почему `↓` убран с chip-а целиком.** Раньше chip показывал `↑XXK ↓YYK` — output_tokens API рядом с heuristic'ом JSONL-веса. Юзер: *«как мне это понимать?»* — `↑` и `↓` ходят по разным шкалам (JSONL chars/3.5 ≠ Anthropic billing tokens), их сумма не имеет смысла, разница тем более. Сейчас chip = одно число (`↑` = JSONL-вес), `↓` живёт только внутри API-mode popover'а как часть осознанного выбора режима. См. `methodology/design.md::Метрика-инвариант`.
+`apiOutputTokens` дублирует `downTotal` (тот же `output_tokens`), но кладётся отдельным полем чтобы API-mode был self-contained блоком.
+
+**Popover не должен схлопываться при переключении JSONL→API.** JSONL-mode рисует до 10 строк, API-mode — 3-4. Без `minHeight` на body popover'а высота просто сжимается на свитче, нижний край уползает выше курсора, mouseleave выстреливает, popover закрывается до того как юзер успел кликнуть. Юзер: *«когда я тыкаю на вторую вкладку, у меня меняется размер, и мгновенно это окно закрывается»*. Лечение — `minHeight: 180px` на оба popover'а (range и single). Если API-mode требует меньше — popover не сжимается, курсор остаётся над ним, bridge не рвётся. См. `methodology/переносимый-дизайн.md::Layout reservation`.
+
+**Почему `↓` убран с chip-а целиком.** Раньше chip показывал `↑XXK ↓YYK` — output_tokens API рядом с heuristic'ом JSONL-веса. Юзер: *«как мне это понимать?»* — `↑` и `↓` ходят по разным шкалам (JSONL chars/3.5 ≠ Anthropic billing tokens), их сумма не имеет смысла, разница тем более. Сейчас chip = одно число (`↑` = JSONL-вес), `↓` живёт только внутри API-mode popover'а как часть осознанного выбора режима. См. `methodology/переносимый-дизайн.md::Метрика-инвариант`.
 
 ## Переименование `text` → `answer` в category labels
 
-Категория Claude-ответа в Copy Settings popup, в InfoPanel mini-chip row и в breakdown popover теперь называется **«answer»**, не «text». Мотивация: `text` родовое — *«непонятно что такое текст, слишком общее описание»*. Под `text` могли неоднозначно подразумеваться thinking-блоки, текст внутри tool_use (input parameters), результаты tool_use; `answer` однозначно про финальный текст ответа Claude юзеру. См. принцип `methodology/design.md::Категориальные toggle — имена сущностей, не абстракции`. Затронутые места — `CopySessionButton.tsx::ToggleRow «answer»`, `InfoPanel.tsx::ChipText «answer»`, `Timeline.tsx::renderBreakdownBody` (`Claude · answer`).
+Категория Claude-ответа в Copy Settings popup, в InfoPanel mini-chip row и в breakdown popover теперь называется **«answer»**, не «text». Мотивация: `text` родовое — *«непонятно что такое текст, слишком общее описание»*. Под `text` могли неоднозначно подразумеваться thinking-блоки, текст внутри tool_use (input parameters), результаты tool_use; `answer` однозначно про финальный текст ответа Claude юзеру. См. принцип `methodology/переносимый-дизайн.md::Категориальные toggle — имена сущностей, не абстракции`. Затронутые места — `CopySessionButton.tsx::ToggleRow «answer»`, `InfoPanel.tsx::ChipText «answer»`, `Timeline.tsx::renderBreakdownBody` (`Claude · answer`).
 

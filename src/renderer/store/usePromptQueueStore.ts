@@ -4,8 +4,10 @@ const { ipcRenderer } = window.require('electron');
 
 // SQLite-backed persistence via the existing app:setState / app:getState
 // pattern (same as defaultClaudeEffort, debugHoverBridges, freePorts).
-// Persist: items, autoRun, stopAfter, firstDelaySeconds PER TAB. Skip: previewId (UI-only).
-// Serialized shape: { [tabId]: { items, autoRun, stopAfter, firstDelaySeconds } }.
+// Persist: items, autoRun, stopAfter, firstDelaySeconds, postPromptEnabled,
+// postPromptText PER TAB. Skip: previewId, firstChipHintActive (UI-only).
+// Serialized shape: { [tabId]: { items, autoRun, stopAfter, firstDelaySeconds,
+//                                postPromptEnabled, postPromptText } }.
 const APP_STATE_KEY_QUEUE = 'promptQueueByTab';
 
 // Throttle disk writes — drag-reorder fires many state updates per second and
@@ -16,14 +18,30 @@ function scheduleSave(snapshot: Map<string, TabQueue>) {
   if (saveTimer) clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
     saveTimer = null;
-    const out: Record<string, Pick<TabQueue, 'items' | 'autoRun' | 'stopAfter' | 'firstDelaySeconds'>> = {};
+    const out: Record<string, Pick<TabQueue, 'items' | 'autoRun' | 'stopAfter' | 'closeAfter' | 'firstDelaySeconds' | 'postPromptEnabled' | 'postPromptText'>> = {};
     for (const [tabId, q] of snapshot) {
       // Skip cold tabs with no persistable state — saves space + avoids polluting
-      // the kv store with thousands of empty rows over time. Non-default delay is
-      // persistable too so the user's chosen "X seconds" survives restarts even
-      // when the queue is empty.
-      if (q.items.length === 0 && !q.autoRun && !q.stopAfter && q.firstDelaySeconds === 0) continue;
-      out[tabId] = { items: q.items, autoRun: q.autoRun, stopAfter: q.stopAfter, firstDelaySeconds: q.firstDelaySeconds };
+      // the kv store with thousands of empty rows over time. Non-default delay
+      // and post-prompt are persistable too so the user's choices survive
+      // restarts even when the queue is empty.
+      if (
+        q.items.length === 0 &&
+        !q.autoRun &&
+        !q.stopAfter &&
+        !q.closeAfter &&
+        q.firstDelaySeconds === 0 &&
+        !q.postPromptEnabled &&
+        !q.postPromptText
+      ) continue;
+      out[tabId] = {
+        items: q.items,
+        autoRun: q.autoRun,
+        stopAfter: q.stopAfter,
+        closeAfter: q.closeAfter,
+        firstDelaySeconds: q.firstDelaySeconds,
+        postPromptEnabled: q.postPromptEnabled,
+        postPromptText: q.postPromptText,
+      };
     }
     ipcRenderer.invoke('app:setState', { key: APP_STATE_KEY_QUEUE, value: JSON.stringify(out) })
       .catch((e: unknown) => console.warn('[PromptQueue] save failed:', e));
@@ -34,10 +52,26 @@ function scheduleSave(snapshot: Map<string, TabQueue>) {
 // `text` is the raw prompt as the user typed it. `images` is a count of image placeholders
 // the user had referenced (e.g. "[Image #1]") — we can't carry the actual image bytes through
 // the editor extraction path so we surface a stub marker instead. `id` is monotonic per session.
+// Resolved on-disk location of one [Image #N] placeholder. Populated by main
+// process when grabbing input: ~/.claude/image-cache/<sessionId>/<id>.<ext>.
+// Path may become stale if Claude is restarted in this tab (cleanupOldImageCaches
+// wipes non-current sessionIds on boot) — UI treats `path` as best-effort.
+export type QueuedImageRef = {
+  id: number;        // pasteId Claude assigned (matches the [Image #N] placeholder)
+  path: string;      // absolute path on disk while sessionId is alive
+  mediaType: string; // image/png|jpeg|...
+  size: number;      // bytes at grab time (purely informational)
+};
+
 export type QueuedPrompt = {
   id: string;
   text: string;
   images: number; // number of [Image] / [Pasted image] placeholders the original input had
+  // Resolved disk paths for each [Image #N] in `text`, in order of appearance.
+  // Length may be < `images` if some files were missing at grab time (logged
+  // as [GrabImages] ... :MISSING). Undefined for legacy chips loaded from
+  // pre-imagePaths persisted state — UI should treat that as "unknown" not "zero".
+  imagePaths?: QueuedImageRef[];
   createdAt: number;
 };
 
@@ -52,6 +86,12 @@ type TabQueue = {
   // Independent from autoRun: works even without queued items so the user can fire-and-forget
   // a single prompt then have Claude shut down automatically.
   stopAfter: boolean;
+  // When true, after stop fires (see stopAfter above) we ALSO close the whole
+  // tab via useWorkspaceStore.closeTab — no confirm. Implies stopAfter must be
+  // true to make sense (you can't close a tab without stopping its process),
+  // so the UI auto-arms stopAfter whenever closeAfter is turned on. Turning
+  // closeAfter off does NOT turn stopAfter off — they are two-toggle stack.
+  closeAfter: boolean;
   // Open preview slideout for which item (null = closed). UI-only state — not persisted.
   previewId: string | null;
   // Countdown (seconds) BEFORE the first queued prompt fires after Run-after is armed.
@@ -70,13 +110,43 @@ type TabQueue = {
   // Neither slot is consumed for items 2..N — only on the very first arm-after-empty edge.
   firstDelaySeconds: number;
   firstDelayCountdownAt: number | null;
+
+  // ── Post-prompt (Run After post-prompt) ──────────────────────────────────
+  // When postPromptEnabled === true, the runner appends `\n\n${postPromptText}`
+  // to EVERY queued item just before claude:send-command. Per-tab so different
+  // Claude tabs can carry different "answer-all-clarifications-yourself" hints.
+  // postPromptText is the raw text user wrote in the editor (empty = treated as
+  // disabled even if enabled flag is on — appending empty string is a no-op).
+  postPromptEnabled: boolean;
+  postPromptText: string;
+
+  // ── First-chip armed hint ────────────────────────────────────────────────
+  // True when user added the FIRST chip into an empty queue while Run after
+  // was OFF — the Run after pill renders with a soft red glow as a nudge.
+  // Cleared on first hover over the pill (consumeFirstChipHint). Re-armed
+  // every time the queue transitions from 0 → 1 with autoRun=false.
+  // UI-only — not persisted (re-restore would just nag the user on each boot).
+  firstChipHintActive: boolean;
+
+  // ── Close-after restore memory ──────────────────────────────────────────
+  // Remembers whether stopAfter was already ON at the moment the user armed
+  // closeAfter. Turning closeAfter OFF restores stopAfter to that prior value
+  // instead of leaving it stuck on, so:
+  //   (stop=OFF, close=OFF) → click ⏻ → (stop=ON, close=ON)
+  //                         → click ⏻ → (stop=OFF, close=OFF)   ← restored
+  //   (stop=ON,  close=OFF) → click ⏻ → (stop=ON, close=ON)
+  //                         → click ⏻ → (stop=ON,  close=OFF)   ← preserved
+  // Reset to false whenever user clicks left zone directly OR closeAfter
+  // returns to OFF (after a restore-cycle the slot has done its job).
+  // Non-persistent — across restarts there is no "prior" state to restore to.
+  stopBeforeCloseArm: boolean;
 };
 
 interface PromptQueueStore {
   // Per-tab queues. Outside Claude tabs the overlay is hidden, but state survives tab switching.
   queues: Map<string, TabQueue>;
 
-  addPrompt: (tabId: string, text: string, images?: number) => string;
+  addPrompt: (tabId: string, text: string, images?: number, imagePaths?: QueuedImageRef[]) => string;
   removePrompt: (tabId: string, id: string) => void;
   updatePromptText: (tabId: string, id: string, text: string) => void;
   reorderPrompt: (tabId: string, fromIndex: number, toIndex: number) => void;
@@ -84,6 +154,7 @@ interface PromptQueueStore {
 
   setAutoRun: (tabId: string, value: boolean) => void;
   setStopAfter: (tabId: string, value: boolean) => void;
+  setCloseAfter: (tabId: string, value: boolean) => void;
   setFirstDelaySeconds: (tabId: string, value: number) => void;
   // Start the first-delay countdown for this tab. Caller must already have
   // ensured firstDelaySeconds > 0 and autoRun === true.
@@ -97,13 +168,35 @@ interface PromptQueueStore {
   clearFirstDelayCountdown: (tabId: string) => void;
   setPreviewId: (tabId: string, id: string | null) => void;
 
+  // Post-prompt management. setPostPromptEnabled toggles the per-tab flag;
+  // setPostPromptText writes the body. Both are persisted.
+  setPostPromptEnabled: (tabId: string, value: boolean) => void;
+  setPostPromptText: (tabId: string, text: string) => void;
+
+  // First-chip armed hint helpers. consumeFirstChipHint clears the flag on
+  // first hover. (Setting it happens implicitly inside addPrompt on the 0→1
+  // edge when autoRun is false.)
+  consumeFirstChipHint: (tabId: string) => void;
+
   // Pops the head item — used by the auto-runner when Stop hook fires. Returns null if empty.
   popNext: (tabId: string) => QueuedPrompt | null;
 
   getQueue: (tabId: string) => TabQueue;
 }
 
-const EMPTY: TabQueue = { items: [], autoRun: false, stopAfter: false, previewId: null, firstDelaySeconds: 0, firstDelayCountdownAt: null };
+const EMPTY: TabQueue = {
+  items: [],
+  autoRun: false,
+  stopAfter: false,
+  closeAfter: false,
+  previewId: null,
+  firstDelaySeconds: 0,
+  firstDelayCountdownAt: null,
+  postPromptEnabled: false,
+  postPromptText: '',
+  firstChipHintActive: false,
+  stopBeforeCloseArm: false,
+};
 
 let idCounter = 0;
 const nextId = () => `pq-${Date.now().toString(36)}-${(idCounter++).toString(36)}`;
@@ -131,14 +224,19 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
   return {
     queues: new Map(),
 
-    addPrompt: (tabId, text, images) => {
+    addPrompt: (tabId, text, images, imagePaths) => {
       const id = nextId();
       setAndPersist((state) => {
         const next = new Map(state.queues);
         const cur = next.get(tabId) ?? EMPTY;
         const detectedImages = images ?? countImages(text);
-        const items = [...cur.items, { id, text, images: detectedImages, createdAt: Date.now() }];
-        next.set(tabId, { ...cur, items });
+        const items = [...cur.items, { id, text, images: detectedImages, imagePaths: (imagePaths && imagePaths.length > 0) ? imagePaths : undefined, createdAt: Date.now() }];
+        // First-chip armed hint: only when transitioning empty → 1 AND auto-run
+        // is currently OFF. Subsequent adds into a non-empty queue or adds into
+        // an already-armed queue don't re-trigger the nudge.
+        const wasEmpty = cur.items.length === 0;
+        const shouldArmHint = wasEmpty && !cur.autoRun;
+        next.set(tabId, { ...cur, items, firstChipHintActive: shouldArmHint ? true : cur.firstChipHintActive });
         return { queues: next };
       });
       return id;
@@ -150,7 +248,28 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
         if (!cur) return state;
         const items = cur.items.filter((p) => p.id !== id);
         const next = new Map(state.queues);
-        next.set(tabId, { ...cur, items, previewId: cur.previewId === id ? null : cur.previewId });
+        // Manual drain (×-remove OR Replay ▶) emptied the queue. Stop after /
+        // Close after were waiting on this queue to finish — now that there's
+        // nothing left to wait for, they MUST disarm. Otherwise the user sees
+        // an active "Stop after" pill with zero context — and on the next
+        // turn-end the runner would SIGTERM Claude unexpectedly.
+        //
+        // Carefully NOT applied in popNext: there the LAST chip just left the
+        // queue to be SENT to Claude — stopAfter SHOULD still be armed so the
+        // runner stops Claude after that prompt's turn finishes. popNext is
+        // the autoRun-drain path; this hook only covers manual user removals.
+        const queueEmptied = cur.items.length > 0 && items.length === 0;
+        const stopAfter = queueEmptied ? false : cur.stopAfter;
+        const closeAfter = queueEmptied ? false : cur.closeAfter;
+        const stopBeforeCloseArm = queueEmptied ? false : cur.stopBeforeCloseArm;
+        next.set(tabId, {
+          ...cur,
+          items,
+          stopAfter,
+          closeAfter,
+          stopBeforeCloseArm,
+          previewId: cur.previewId === id ? null : cur.previewId,
+        });
         return { queues: next };
       });
     },
@@ -193,7 +312,9 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
       setAndPersist((state) => {
         const next = new Map(state.queues);
         const cur = next.get(tabId) ?? EMPTY;
-        next.set(tabId, { ...cur, autoRun: value });
+        // Any user interaction with Run after acknowledges the hint — clear it
+        // unconditionally. Re-arming only happens on the next 0→1 chip edge.
+        next.set(tabId, { ...cur, autoRun: value, firstChipHintActive: false });
         return { queues: next };
       });
     },
@@ -202,7 +323,46 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
       setAndPersist((state) => {
         const next = new Map(state.queues);
         const cur = next.get(tabId) ?? EMPTY;
-        next.set(tabId, { ...cur, stopAfter: value });
+        // Turning Stop after OFF must also disable closeAfter — closing a tab
+        // whose stop is not scheduled would never fire. (Inverse: turning
+        // stopAfter ON doesn't touch closeAfter; user decides separately.)
+        const closeAfter = value ? cur.closeAfter : false;
+        // User clicked the LEFT zone directly. Whatever the close-arm memory
+        // was holding is now stale (the new baseline is whatever stop=value
+        // means), so wipe it. Otherwise the next close-arm/disarm cycle
+        // would restore stop=true based on data from BEFORE this click.
+        next.set(tabId, { ...cur, stopAfter: value, closeAfter, stopBeforeCloseArm: false });
+        return { queues: next };
+      });
+    },
+
+    setCloseAfter: (tabId, value) => {
+      setAndPersist((state) => {
+        const next = new Map(state.queues);
+        const cur = next.get(tabId) ?? EMPTY;
+        if (value) {
+          // Arming closeAfter forces stopAfter ON (can't close a tab whose
+          // process never gets stopped). Remember whether stopAfter was ALREADY
+          // on, so the inverse click can restore it accurately.
+          next.set(tabId, {
+            ...cur,
+            closeAfter: true,
+            stopAfter: true,
+            stopBeforeCloseArm: cur.stopAfter,
+          });
+        } else {
+          // Disarming closeAfter: restore stopAfter to what it was BEFORE this
+          // close-arm cycle. If user had stopAfter on independently before,
+          // it stays on. If user clicked ⏻ from the all-off baseline, both
+          // toggles return to off — matching user expectation:
+          //   "click ⏻ once → both on; click ⏻ again → both off."
+          next.set(tabId, {
+            ...cur,
+            closeAfter: false,
+            stopAfter: cur.stopBeforeCloseArm,
+            stopBeforeCloseArm: false,
+          });
+        }
         return { queues: next };
       });
     },
@@ -261,6 +421,35 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
       }, { skipSave: true });
     },
 
+    setPostPromptEnabled: (tabId, value) => {
+      setAndPersist((state) => {
+        const next = new Map(state.queues);
+        const cur = next.get(tabId) ?? EMPTY;
+        next.set(tabId, { ...cur, postPromptEnabled: value });
+        return { queues: next };
+      });
+    },
+
+    setPostPromptText: (tabId, text) => {
+      setAndPersist((state) => {
+        const next = new Map(state.queues);
+        const cur = next.get(tabId) ?? EMPTY;
+        next.set(tabId, { ...cur, postPromptText: text });
+        return { queues: next };
+      });
+    },
+
+    consumeFirstChipHint: (tabId) => {
+      // UI-only state — skip disk save.
+      setAndPersist((state) => {
+        const cur = state.queues.get(tabId);
+        if (!cur || !cur.firstChipHintActive) return state;
+        const next = new Map(state.queues);
+        next.set(tabId, { ...cur, firstChipHintActive: false });
+        return { queues: next };
+      }, { skipSave: true });
+    },
+
     popNext: (tabId) => {
       const cur = get().queues.get(tabId);
       if (!cur || cur.items.length === 0) return null;
@@ -285,28 +474,50 @@ export async function hydratePromptQueueStore(): Promise<void> {
   try {
     const raw = await ipcRenderer.invoke('app:getState', APP_STATE_KEY_QUEUE);
     if (!raw) return;
-    const parsed = JSON.parse(raw) as Record<string, { items?: QueuedPrompt[]; autoRun?: boolean; stopAfter?: boolean }>;
+    // database.getAppState() already JSON.parses the stored string and returns
+    // an OBJECT (it only returns the raw string when the parse fails). So `raw`
+    // is normally an object here, not a string. Blindly JSON.parse-ing it again
+    // coerces the object to "[object Object]" and throws — which is exactly the
+    // `[PromptQueue] hydrate failed: {}` that fired on every boot, silently
+    // dropping a queue that WAS saved correctly. Accept either shape.
+    const parsed = (typeof raw === 'string' ? JSON.parse(raw) : raw) as Record<string, {
+      items?: QueuedPrompt[];
+      autoRun?: boolean;
+      stopAfter?: boolean;
+      closeAfter?: boolean;
+      firstDelaySeconds?: number;
+      postPromptEnabled?: boolean;
+      postPromptText?: string;
+    }>;
     if (!parsed || typeof parsed !== 'object') return;
     usePromptQueueStore.setState((state) => {
       const next = new Map(state.queues);
       for (const [tabId, entry] of Object.entries(parsed)) {
         if (next.has(tabId)) continue; // don't clobber an in-memory entry
         const items = Array.isArray(entry.items) ? entry.items : [];
-        const fd = typeof (entry as { firstDelaySeconds?: number }).firstDelaySeconds === 'number'
-          ? Math.max(0, Math.min(3600, Math.floor((entry as { firstDelaySeconds: number }).firstDelaySeconds)))
+        const fd = typeof entry.firstDelaySeconds === 'number'
+          ? Math.max(0, Math.min(3600, Math.floor(entry.firstDelaySeconds)))
           : 0;
         next.set(tabId, {
           items,
           autoRun: !!entry.autoRun,
           stopAfter: !!entry.stopAfter,
+          closeAfter: !!entry.closeAfter,
           previewId: null,
           firstDelaySeconds: fd,
           firstDelayCountdownAt: null, // never restore an in-flight countdown across restart
+          postPromptEnabled: !!entry.postPromptEnabled,
+          postPromptText: typeof entry.postPromptText === 'string' ? entry.postPromptText : '',
+          firstChipHintActive: false, // UI-only, never restored
+          stopBeforeCloseArm: false, // UI-only memory, never restored
         });
       }
       return { queues: next };
     });
   } catch (e) {
-    console.warn('[PromptQueue] hydrate failed:', e);
+    // Surface the real message — an Error serializes to `{}` through the
+    // renderer→file log forwarder (JSON.stringify drops non-enumerable props),
+    // which once hid this exact bug for days.
+    console.warn('[PromptQueue] hydrate failed:', e instanceof Error ? e.message : String(e));
   }
 }

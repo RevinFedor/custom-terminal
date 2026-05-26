@@ -60,7 +60,7 @@ MarkdownEditor (react-markdown) рендерит markdown-блоки **асин�
 
 Закреп (CMD+Shift) автоматически снимает pointer-through: закреплённый popover на Home становится интерактивным (текст можно выделить, ссылки внутри markdown кликаются). Реализация: `pointerThrough && !isLocked ? pointer-events: none : null` в обоих wrapper-стилях.
 
-Принцип — в `methodology/design.md::Pointer-through для info-popover'ов перегораживающих hover-grid`.
+Принцип — в `methodology/переносимый-дизайн.md::Pointer-through для info-popover'ов перегораживающих hover-grid`.
 
 ## Закреп: CMD+Shift
 
@@ -92,7 +92,7 @@ Settings UI: модалка → секция «Заметки вкладки». 
 
 ## Шрифт: один из трёх по density-контексту
 
-`fontSize` берётся из `notesTooltipFontSize` — отдельный от `notesSidebarFontSize` (inline в InfoPanel) и `notesExpandedFontSize` (slide-out). Раньше был один общий `notesEditorFontSize` — мелкий в превью либо громоздкий в раскрытом, юзер не выбирал между плотностями. Раздельные шрифты — не per-surface, а по семантике плотности окружения (сайдбар тесный → мельче, раскрытый просторный → крупнее, попап над курсором → отдельная балансировка). Принцип — `methodology/design.md::Один контент в нескольких density-контекстах`.
+`fontSize` берётся из `notesTooltipFontSize` — отдельный от `notesSidebarFontSize` (inline в InfoPanel) и `notesExpandedFontSize` (slide-out). Раньше был один общий `notesEditorFontSize` — мелкий в превью либо громоздкий в раскрытом, юзер не выбирал между плотностями. Раздельные шрифты — не per-surface, а по семантике плотности окружения (сайдбар тесный → мельче, раскрытый просторный → крупнее, попап над курсором → отдельная балансировка). Принцип — `methodology/переносимый-дизайн.md::Один контент в нескольких density-контекстах`.
 
 `paddingX` / `paddingY` единые (`notesEditorPaddingX/Y`) — это визуальный отступ редактора, не диктуется плотностью.
 
@@ -104,19 +104,19 @@ Migration: при отсутствии новых ключей (`noted-terminal-
 
 - **5 resize handles (right / left / bottom + 2 угла) + drag-state буфер**: юзер тянет handle → live React preview каждый mousemove → один flush в store на mouseup. Работало корректно, но bypass'илось логикой задачи: hover-popover живёт секунды, ручной resize этого времени не оправдывает. Заменено на autobalance.
 - **`localLeftShift` (drag за левый край, popover растёт влево)**: persistence-боль — после закрытия popover'а leftShift сбрасывался, при следующем open позиция = `rect.left + viewport clamp`. Persisting его привёл бы к тому что popover открывается в неожиданном месте relative к новой trigger-карточке. С удалением handles вопрос отпал.
-- **StrictMode previewRef mirror**: `setState(prev => { captured = prev; return null })` в React 19 StrictMode invokes функцию дважды, второй раз с `prev = null` — captured затирался. Лекарство было: параллельный `useRef` зеркало state'а, обёртка `setDragPreview` обновляла оба. Принцип переносим — оставлен в `methodology/design.md::React StrictMode`. Конкретное место (drag-buffer попапа) больше не существует.
+- **StrictMode previewRef mirror**: `setState(prev => { captured = prev; return null })` в React 19 StrictMode invokes функцию дважды, второй раз с `prev = null` — captured затирался. Лекарство было: параллельный `useRef` зеркало state'а, обёртка `setDragPreview` обновляла оба. Принцип переносим — оставлен в `methodology/переносимый-дизайн.md::React StrictMode`. Конкретное место (drag-buffer попапа) больше не существует.
 - **isDraggingRef + grace period 200ms + elementFromPoint check**: защита от закрытия popover'а посреди drag'а (курсор уходил за wrapper-rect → mouseLeave → unmount). Без drag'а защищать нечего.
 - **wrapper padding 8px со всех сторон**: чтобы handles на offset -5px физически попадали внутрь `wrapper.boundingClientRect()` (иначе triggerProps.onMouseLeave timer убивал popover до drag'а). С удалением handles padding не нужен — popover примыкает к trigger'у плотно.
 - **Float-значения в store + Math.round только в Settings**: чтобы рамка не прыгала на mouseup из-за subpixel-mismatch'а между live-preview и rounded store. Без drag'а — целые числа.
-- **CSS-ловушки три**: `overflow:hidden` обрезал handles на `-5px` → нужен был card-wrap без overflow. `flex:1 + maxHeight: limit` давал effective `min(natural, limit)` → drag-up не реагировал визуально на коротком content → нужен был `height: limit + flex: 0 0 auto`. `Math.round(dy/lineHeight)` создавал discrete-step jitter → нужен был float. Все три пропали вместе с handles. Принцип остаётся в `methodology/design.md::Drag-state буфер`.
+- **CSS-ловушки три**: `overflow:hidden` обрезал handles на `-5px` → нужен был card-wrap без overflow. `flex:1 + maxHeight: limit` давал effective `min(natural, limit)` → drag-up не реагировал визуально на коротком content → нужен был `height: limit + flex: 0 0 auto`. `Math.round(dy/lineHeight)` создавал discrete-step jitter → нужен был float. Все три пропали вместе с handles. Принцип остаётся в `methodology/переносимый-дизайн.md::Drag-state буфер`.
 
 Невозврат: не возвращать ручной resize если задача — info-popover (хover, секунды). Resize handles оправданы только когда юзер сидит с popover'ом долго (модалка заметок, sticky-overlay). См. global `tooltip-resize-modal.md::Tooltip с resize`.
 
 ## Связи
 
-- `methodology/design.md::Auto-balanced popover sizing` — общий принцип cap+ratio+autobalance, переносим в другие проекты.
-- `methodology/design.md::Pointer-through для info-popover'ов` — почему на Home сквозь, на TabBar нет.
-- `methodology/design.md::Один контент в нескольких density-контекстах` — три fonts по семантике.
+- `methodology/переносимый-дизайн.md::Auto-balanced popover sizing` — общий принцип cap+ratio+autobalance, переносим в другие проекты.
+- `methodology/переносимый-дизайн.md::Pointer-through для info-popover'ов` — почему на Home сквозь, на TabBar нет.
+- `methodology/переносимый-дизайн.md::Один контент в нескольких density-контекстах` — три fonts по семантике.
 - `fact-project-home.md::Hover Popover (CMD+hover)` — конкретные карточки Home, split-mode на месте.
 - `fact-notes.md::Tab Notes Slideout` — drag-resize в slide-out (единственный оставшийся в проекте после rewrite'а превью).
 - `fix-notes-font-fragmentation.md` — предыдущая итерация (схлопывание в один шрифт) и постскриптум о пересмотре.

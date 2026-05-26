@@ -70,4 +70,4 @@ The mechanism is legitimately useful for Clear Context chains: parent session en
 ## Related
 - `fact-session-detection.md::Dead session_links + chain resolve trap` — short user-facing description and link back here.
 - `fact-session-capture.md::Manual session ID entry (✎)` — why the manual edit «flapped» before this fix.
-- `methodology/design.md::Cached external resource: alive-probe перед использованием` — same family of bug (cached cross-process/cross-DB reference that outlived its referent), here applied to SQLite `session_links` table rather than PID cache.
+- `methodology/переносимый-дизайн.md::Cached external resource: alive-probe перед использованием` — same family of bug (cached cross-process/cross-DB reference that outlived its referent), here applied to SQLite `session_links` table rather than PID cache.

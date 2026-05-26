@@ -46,7 +46,7 @@
 ### Discovery в terminal-server.mjs — priority order
 
 `listLiveInstances()` парсит JSON каждого живого port-файла. `pickInstance(cwd)` выбирает в три приоритета:
-1. **`NOTED_MAIN_PID` env** — каждый Claude процесс наследует env от того main'а который его spawn'ил. Эту переменную main инжектит при `pty.spawn` рядом с `EDITOR=noted-code-grab.js`. Если хоть один live-инстанс имеет совпадающий `pid` — return immediately. Это убирает ambiguity когда дев и прод одновременно open'или один cwd (longest-prefix даёт tie длины 38, sort-order arbitrary — без env запрос уходил в случайный из двух). См. `methodology/design.md::ID-pinned routing > cwd-routing`.
+1. **`NOTED_MAIN_PID` env** — каждый Claude процесс наследует env от того main'а который его spawn'ил. Эту переменную main инжектит при `pty.spawn` рядом с `EDITOR=noted-code-grab.js`. Если хоть один live-инстанс имеет совпадающий `pid` — return immediately. Это убирает ambiguity когда дев и прод одновременно open'или один cwd (longest-prefix даёт tie длины 38, sort-order arbitrary — без env запрос уходил в случайный из двух). См. `methodology/переносимый-дизайн.md::ID-pinned routing > cwd-routing`.
 2. **cwd longest-prefix** — entry в `openProjectPaths` префикс `cwd` (включая subdirectories — `/uav/agrofield_back` матчится с `/uav`). Wins на случай вложенных открытых проектов. Fallback когда NOTED_MAIN_PID не выставлен (helper-script запущен из `/tmp`, сторонний tool).
 3. **mtime** — самый свежий port-файл. Последний рубеж для свободных cwd.
 
@@ -91,6 +91,6 @@ Legacy port-файлы содержали только число. `listLiveInst
 - `~/.claude/mcp/terminal-server.mjs::PARENT_PROJECT_ID` — env-pinned, шлётся в каждый tool-call.
 
 ## Связанные
-- `methodology/design.md::Routing по контексту запроса, не по глобальному last-active state` — переносимый принцип.
-- `methodology/design.md::ID-pinned routing > cwd-routing когда инстансы делят cwd` — `NOTED_MAIN_PID` env как priority-1 разрешает tie.
+- `methodology/переносимый-дизайн.md::Routing по контексту запроса, не по глобальному last-active state` — переносимый принцип.
+- `methodology/переносимый-дизайн.md::ID-pinned routing > cwd-routing когда инстансы делят cwd` — `NOTED_MAIN_PID` env как priority-1 разрешает tie.
 - `fix-claude-hook-silent-dropouts.md` — параллельный фикс той же проблемы для Claude hook bridge.

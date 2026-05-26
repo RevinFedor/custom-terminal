@@ -28,7 +28,7 @@ lsof -ti:5181,3000 2>/dev/null | xargs -r kill -9 2>/dev/null; npm run dev
 - **History сохраняет** — re-up arrow повторит kill+run
 - **Без отдельного toast — терминал сам показывает результат**
 
-Принцип переносимый: для любых destructive side effects около пользовательских команд лучше показывать в общем потоке shell, чем тихий IPC + toast. См. `methodology/design.md::Visible side effect > silent IPC`.
+Принцип переносимый: для любых destructive side effects около пользовательских команд лучше показывать в общем потоке shell, чем тихий IPC + toast. См. `methodology/переносимый-дизайн.md::Visible side effect > silent IPC`.
 
 ### Port autodetect
 `scanProjectPorts(cwd)` — рекурсия глубиной до 1 (immediate subfolders, для monorepo типа `uav/agrofield_back` + `uav/agrofield_front`). Источники в приоритете:
@@ -70,4 +70,4 @@ Legacy mirror в localStorage сохраняется (для синхронно�
 
 - `fix-localstorage-origin.md` — почему SQLite, не localStorage
 - `fact-claude-tui-control.md::Auto-inject /effort` — EffortSelector в той же StatusBar
-- `methodology/design.md::Visible side effect > silent IPC` — переносимый принцип
+- `methodology/переносимый-дизайн.md::Visible side effect > silent IPC` — переносимый принцип

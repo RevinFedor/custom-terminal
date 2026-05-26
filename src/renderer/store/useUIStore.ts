@@ -8,6 +8,9 @@ interface Toast {
   copyText?: string;
   actionLabel?: string;
   onAction?: () => void;
+  // When set, toast is only rendered while this tab is the effective active tab.
+  // Used for tab-scoped notifications (e.g. "history chain recovered" in Timeline).
+  tabId?: string;
 }
 
 interface FilePreview {
@@ -104,6 +107,51 @@ function loadProcessBar(): ProcessBarSettings {
 
 function saveProcessBar(s: ProcessBarSettings) {
   try { localStorage.setItem('noted-terminal-process-bar', JSON.stringify(s)); } catch {}
+}
+
+/* AI pulse — фон всей вкладки мягко пульсирует пока AI «думает» (claude:busy-state,
+   gemini:busy-state, claude-sdk:busy-state). Раньше брал цвет/цикл из ProcessBar
+   (одно настройка на два разных индикатора — не настраивалось отдельно). */
+export interface AIPulseSettings {
+  enabled: boolean;
+  colorA: string;       // нижняя фаза пульса (transparent если строкa 'transparent')
+  colorB: string;       // верхняя фаза
+  durationMs: number;   // 300..6000ms
+}
+
+const DEFAULT_AI_PULSE: AIPulseSettings = {
+  enabled: true,
+  colorA: 'transparent',
+  colorB: '#DA7756',    // claude-оранжевый — заметный пик на тёмном фоне таба
+  // Synced с DEFAULT_PROCESS_BAR.durationMs (2400ms). При живом PTY-Claude
+  // активны ОБЕ анимации одновременно (process-bar pulse слева + tab-fon-pulse
+  // под всем табом). Разные периоды визуально «бьются» — пик process-bar'а
+  // совпадает с минимумом фона на одном кадре, с максимумом на другом, глаз
+  // ловит «дрожание». См. fact-process-bar.md::«Период тоже 2.4s — синхронно
+  // с process-bar pulse, чтобы две анимации на одном табе не бились разными
+  // частотами». Юзер может менять в Settings независимо — если хочет.
+  durationMs: 2400,
+};
+
+function loadAIPulse(): AIPulseSettings {
+  try {
+    const raw = localStorage.getItem('noted-terminal-ai-pulse');
+    if (!raw) return DEFAULT_AI_PULSE;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return DEFAULT_AI_PULSE;
+    return {
+      enabled: typeof parsed.enabled === 'boolean' ? parsed.enabled : DEFAULT_AI_PULSE.enabled,
+      colorA: typeof parsed.colorA === 'string' ? parsed.colorA : DEFAULT_AI_PULSE.colorA,
+      colorB: typeof parsed.colorB === 'string' ? parsed.colorB : DEFAULT_AI_PULSE.colorB,
+      durationMs: typeof parsed.durationMs === 'number'
+        ? Math.max(300, Math.min(6000, parsed.durationMs))
+        : DEFAULT_AI_PULSE.durationMs,
+    };
+  } catch { return DEFAULT_AI_PULSE; }
+}
+
+function saveAIPulse(s: AIPulseSettings) {
+  try { localStorage.setItem('noted-terminal-ai-pulse', JSON.stringify(s)); } catch {}
 }
 
 export interface StatusMarkerSettings {
@@ -243,6 +291,11 @@ interface UIStore {
   processBar: ProcessBarSettings;
   setProcessBar: (patch: Partial<ProcessBarSettings>) => void;
 
+  /* AI-pulse — фон таба пульсирует когда AI «думает» (claude/gemini/sdk busy-state).
+     Отдельные настройки (раньше цвет/цикл заимствовались у processBar). */
+  aiPulse: AIPulseSettings;
+  setAiPulse: (patch: Partial<AIPulseSettings>) => void;
+
   /* Status marker — маркер слева во вкладке (vertical mode) для sessionStatus.
      shape='dot' → круг, 'square' → квадрат (border-radius различается).
      sizePx — длина стороны (для круга = диаметр). Clamp 4..16. */
@@ -267,6 +320,7 @@ interface UIStore {
   timelineFontSize: number;    // Timeline entries preview text
   timelineWidth: number;       // Timeline width (px) when expanded (treeMode). Drag-resizable.
   timelineLineClamp: number;   // How many lines of preview text show in expanded mode.
+  promptQueueChipLineClamp: number; // How many lines of chip text show inside Run After overlay (1 = single-line ellipsis).
 
   setSidebarWidth: (width: number) => void;
   setTabSidebarWidth: (width: number) => void;
@@ -288,6 +342,7 @@ interface UIStore {
   setTimelineFontSize: (size: number) => void;
   setTimelineWidth: (width: number) => void;
   setTimelineLineClamp: (lines: number) => void;
+  setPromptQueueChipLineClamp: (lines: number) => void;
 
   incrementTerminalFontSize: () => void;
 
@@ -381,7 +436,7 @@ interface UIStore {
 
   toasts: Toast[];
 
-  showToast: (message: string, type?: Toast['type'], duration?: number, persistent?: boolean, copyText?: string, actionLabel?: string, onAction?: () => void) => void;
+  showToast: (message: string, type?: Toast['type'], duration?: number, persistent?: boolean, copyText?: string, actionLabel?: string, onAction?: () => void, tabId?: string) => void;
 
   removeToast: (id: string) => void;
 
@@ -535,6 +590,11 @@ interface UIStore {
   // (тем же путём, что и notesPanelSize), чтобы position переживала перезапуски.
   notesPanelOffsetY: number;
   setNotesPanelOffsetY: (offset: number) => void;
+  // Last-known cursor head position per tab. Used to restore selection when
+  // slideout is reopened — без этого editor unmount'ится на close и selection
+  // сбрасывается на 0, юзер видит «курсор всегда в начало».
+  notesPanelSelectionByTab: Record<string, number>;
+  setNotesPanelSelection: (tabId: string, head: number) => void;
 
   // Tab Preview popover (CMD+hover на табах + Home-карточках). Width + maxLines
   // фиксируются в Settings, дополнительно поверх живёт пользовательский
@@ -597,6 +657,13 @@ interface UIStore {
   // Диапазон 1-20 — выше Anthropic начнёт жёстко 429-ить.
   semanticIndexParallelism: number;
   setSemanticIndexParallelism: (n: number) => void;
+
+  // CLAUDE.md mirror toggle. ON = main process переписывает AGENTS.md/GEMINI.md
+  // в корне каждого открытого проекта при правке CLAUDE.md, и обратно перезатирает
+  // если правят сами mirror'ы. Off-by-default — авто-копирование никогда не должно
+  // случаться неожиданно. Persist через app:setState (SQLite, vite-port-stable).
+  claudeMdMirrorEnabled: boolean;
+  setClaudeMdMirrorEnabled: (on: boolean) => void;
 }
 
 
@@ -893,6 +960,13 @@ const loadTimelineLineClamp = (): number => {
   } catch {}
   return 3;
 };
+const loadPromptQueueChipLineClamp = (): number => {
+  try {
+    const v = localStorage.getItem('noted-terminal-prompt-queue-chip-line-clamp');
+    if (v) return Math.max(1, Math.min(10, Number(v) || 1));
+  } catch {}
+  return 1;
+};
 const initialEditorSettings = loadEditorSettings();
 const initialModel = loadSelectedModel();
 const initialThinkingLevel = loadThinkingLevel();
@@ -1033,6 +1107,40 @@ const initialFreePortsBeforeStart = loadFreePortsBeforeStart();
       if (useUIStore.getState().freePortsBeforeStart !== bool) {
         useUIStore.setState({ freePortsBeforeStart: bool });
         try { localStorage.setItem('noted-terminal-free-ports', String(bool)); } catch {}
+      }
+    }
+  } catch {}
+})();
+
+// claudeMdMirrorEnabled — SQLite-backed по тем же причинам что и freePortsBeforeStart
+// (localStorage привязан к vite-origin → теряется при смене порта).
+// Main процесс читает тот же ключ из app_state на старте, чтобы знать про тогл до
+// первого IPC из renderer'а.
+const APP_STATE_KEY_MIRROR = 'claudeMdMirrorEnabled';
+const loadMirrorEnabled = (): boolean => {
+  try { return localStorage.getItem('noted-terminal-claude-md-mirror') === 'true'; }
+  catch { return false; }
+};
+const saveMirrorEnabled = (v: boolean) => {
+  try { localStorage.setItem('noted-terminal-claude-md-mirror', String(v)); } catch {}
+  try {
+    const { ipcRenderer } = window.require('electron');
+    // Зеркалим в SQLite через общий app:setState — main процесс читает то же.
+    ipcRenderer.invoke('app:setState', { key: APP_STATE_KEY_MIRROR, value: v ? '1' : '0' }).catch(() => {});
+    // И триггерим main, чтобы он сразу применил флаг (включил/выключил writes).
+    ipcRenderer.invoke('mirror:set-enabled', { enabled: v }).catch(() => {});
+  } catch {}
+};
+const initialMirrorEnabled = loadMirrorEnabled();
+(async () => {
+  try {
+    const { ipcRenderer } = window.require('electron');
+    const v = await ipcRenderer.invoke('app:getState', APP_STATE_KEY_MIRROR);
+    if (v !== null && v !== undefined) {
+      const bool = v === '1' || v === 'true' || v === true;
+      if (useUIStore.getState().claudeMdMirrorEnabled !== bool) {
+        useUIStore.setState({ claudeMdMirrorEnabled: bool });
+        try { localStorage.setItem('noted-terminal-claude-md-mirror', String(bool)); } catch {}
       }
     }
   } catch {}
@@ -1265,6 +1373,21 @@ export const useUIStore = create<UIStore>((set, get) => ({
     saveProcessBar(next);
   },
 
+  aiPulse: loadAIPulse(),
+  setAiPulse: (patch) => {
+    const cur = get().aiPulse;
+    const next: AIPulseSettings = {
+      enabled: typeof patch.enabled === 'boolean' ? patch.enabled : cur.enabled,
+      colorA: typeof patch.colorA === 'string' ? patch.colorA : cur.colorA,
+      colorB: typeof patch.colorB === 'string' ? patch.colorB : cur.colorB,
+      durationMs: typeof patch.durationMs === 'number'
+        ? Math.max(300, Math.min(6000, patch.durationMs))
+        : cur.durationMs,
+    };
+    set({ aiPulse: next });
+    saveAIPulse(next);
+  },
+
   statusMarker: loadStatusMarker(),
   setStatusMarker: (patch) => {
     const cur = get().statusMarker;
@@ -1311,6 +1434,7 @@ export const useUIStore = create<UIStore>((set, get) => ({
   timelineFontSize: loadTimelineFontSize(),
   timelineWidth: loadTimelineWidth(),
   timelineLineClamp: loadTimelineLineClamp(),
+  promptQueueChipLineClamp: loadPromptQueueChipLineClamp(),
 
   setSidebarWidth: (width) => {
     set({ sidebarWidth: width });
@@ -1369,6 +1493,12 @@ export const useUIStore = create<UIStore>((set, get) => ({
     const clamped = Math.max(1, Math.min(10, Math.round(lines)));
     set({ timelineLineClamp: clamped });
     try { localStorage.setItem('noted-terminal-timeline-line-clamp', String(clamped)); } catch {}
+  },
+
+  setPromptQueueChipLineClamp: (lines: number) => {
+    const clamped = Math.max(1, Math.min(10, Math.round(lines)));
+    set({ promptQueueChipLineClamp: clamped });
+    try { localStorage.setItem('noted-terminal-prompt-queue-chip-line-clamp', String(clamped)); } catch {}
   },
 
   // Editor Settings (from gt-editor)
@@ -1521,10 +1651,10 @@ export const useUIStore = create<UIStore>((set, get) => ({
 
   // Toast Notifications
   toasts: [],
-  showToast: (message, type = 'success', duration = 2500, persistent = false, copyText, actionLabel, onAction) => {
+  showToast: (message, type = 'success', duration = 2500, persistent = false, copyText, actionLabel, onAction, tabId) => {
     const id = `toast-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
     set((state) => ({
-      toasts: [...state.toasts, { id, message, type, persistent, copyText, actionLabel, onAction }]
+      toasts: [...state.toasts, { id, message, type, persistent, copyText, actionLabel, onAction, tabId }]
     }));
 
     if (!persistent) {
@@ -1827,6 +1957,9 @@ export const useUIStore = create<UIStore>((set, get) => ({
   freePortsBeforeStart: initialFreePortsBeforeStart,
   setFreePortsBeforeStart: (v) => { set({ freePortsBeforeStart: v }); saveFreePortsBeforeStart(v); },
 
+  claudeMdMirrorEnabled: initialMirrorEnabled,
+  setClaudeMdMirrorEnabled: (v) => { set({ claudeMdMirrorEnabled: v }); saveMirrorEnabled(v); },
+
   // Default Claude effort (status-bar selector)
   defaultClaudeEffort: initialDefaultClaudeEffort,
   setDefaultClaudeEffort: (v) => { set({ defaultClaudeEffort: v }); saveDefaultClaudeEffort(v); },
@@ -1889,6 +2022,40 @@ export const useUIStore = create<UIStore>((set, get) => ({
       const { ipcRenderer } = window.require('electron');
       ipcRenderer.invoke('app:setState', { key: 'notesPanelOffsetY', value: v }).catch(() => {});
     } catch {}
+  },
+
+  // Per-tab last cursor head position. localStorage only — позиция курсора это
+  // pure UX-state, в SQLite mirror'ить не нужно. Cap=200 записей, чтобы для
+  // долгоживущих юзеров не разрастался словарь до бесконечности.
+  notesPanelSelectionByTab: (() => {
+    try {
+      const saved = localStorage.getItem('noted-terminal-notes-panel-selection');
+      if (saved) {
+        const p = JSON.parse(saved);
+        if (p && typeof p === 'object') {
+          const cleaned: Record<string, number> = {};
+          for (const [k, v] of Object.entries(p)) {
+            if (typeof v === 'number' && Number.isFinite(v) && v >= 0) cleaned[k] = v;
+          }
+          return cleaned;
+        }
+      }
+    } catch {}
+    return {};
+  })(),
+  setNotesPanelSelection: (tabId, head) => {
+    if (!tabId || typeof head !== 'number' || !Number.isFinite(head) || head < 0) return;
+    const cur = get().notesPanelSelectionByTab;
+    if (cur[tabId] === head) return;
+    let next: Record<string, number> = { ...cur, [tabId]: head };
+    const entries = Object.entries(next);
+    if (entries.length > 200) {
+      // Срезаем самые старые — Map preserve insertion order in plain object,
+      // entries() читает в порядке вставки. Берём последние 200.
+      next = Object.fromEntries(entries.slice(entries.length - 200));
+    }
+    set({ notesPanelSelectionByTab: next });
+    try { localStorage.setItem('noted-terminal-notes-panel-selection', JSON.stringify(next)); } catch {}
   },
 
   // Tab Preview popover cap'ы (CMD+hover). Это НЕ фиксированный размер —

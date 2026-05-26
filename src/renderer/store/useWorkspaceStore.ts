@@ -124,6 +124,17 @@ interface Tab {
   sdkModel?: string; // Model for next SDK query
   sdkEffort?: string; // Effort level for next SDK query
   sdkThinking?: boolean; // Thinking enabled for next SDK query
+  /**
+   * Per-tab provider/model selection for the Claude proxy. Persisted via SQLite
+   * (tabs.provider_state JSON). Authoritative writer is main process — it owns
+   * `providerStates` Map and writes the row directly through DB on every
+   * provider:switch / provider:set-options. This field on the Tab is the
+   * cached projection: read on tabs load, updated via `provider:state-changed`
+   * IPC broadcast from main. Renderer never writes it back via saveTabs.
+   * Default (undefined / {type:'anthropic'} with no extras) means "subscription
+   * Claude API, model picked by Claude TUI itself".
+   */
+  providerState?: { type: string; model?: string; effort?: string; thinking?: string };
   // Background tasks: live state for Agent/Bash subagents and background bash
   // commands that have been moved off the foreground turn. Populated from SDK
   // task_started / task_progress / task_updated / task_notification events.
@@ -201,7 +212,7 @@ interface WorkspaceStore {
   closeProject: (projectId: string) => Promise<void>;
 
   // Tab management
-  createTab: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; tabType?: TabType; url?: string; background?: boolean }) => Promise<string>;
+  createTab: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; tabType?: TabType; url?: string; background?: boolean; sessionStatus?: string }) => Promise<string>;
   createTabAfterCurrent: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; tabType?: TabType; url?: string; afterTabId?: string; nameSetManually?: boolean; background?: boolean }) => Promise<string>;
   closeTab: (projectId: string, tabId: string, options?: { skipProcessCheck?: boolean; forceCleanup?: boolean }) => Promise<void>;
   reopenLastClosedTab: (projectId: string) => Promise<{ tabId: string | null; reason?: 'empty' | 'error' }>;
@@ -1102,6 +1113,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           createdAt: tab.createdAt,
           claudeSessionId: tab.claudeSessionId,
           geminiSessionId: tab.geminiSessionId,
+          sessionStatus: tab.sessionStatus,
           position: closedPosition >= 0 ? closedPosition : null,
           processWasRunning,
         }
@@ -1200,6 +1212,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       pendingAction,
       claudeSessionId: entry.claude_session_id || undefined,
       geminiSessionId: entry.gemini_session_id || undefined,
+      sessionStatus: entry.session_status || undefined,
     });
 
     // Re-order: pull the freshly-created tab out and splice it at targetIndex

@@ -554,7 +554,6 @@ function LoginView({ onLogin }: { onLogin: () => void }) {
 function ProjectsView({ onPick, onLogout }: { onPick: (p: ProjectInfo) => void; onLogout: () => void }) {
   const [projects, setProjects] = useState<ProjectInfo[] | null>(null);
   const [error, setError] = useState('');
-  const [showAll, setShowAll] = useState(false);
 
   // Refresh every 4s while view is mounted so live SDK / open-state stays
   // current without the user having to pull-to-refresh.
@@ -631,25 +630,10 @@ function ProjectsView({ onPick, onLogout }: { onPick: (p: ProjectInfo) => void; 
 
         {projects && inactive.length > 0 && (
           <div style={{ marginTop: 22 }}>
-            <button
-              onClick={() => setShowAll((v) => !v)}
-              style={{
-                width: '100%', padding: '10px 14px', borderRadius: 10,
-                background: showAll ? '#161616' : 'transparent',
-                border: '1px solid #1f1f1f',
-                color: '#888', fontSize: 12,
-                display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-                cursor: 'pointer', textTransform: 'uppercase', letterSpacing: 0.5,
-              }}
-            >
-              <span>All projects · {inactive.length}</span>
-              <span style={{ fontSize: 11, transform: showAll ? 'rotate(180deg)' : 'none', transition: 'transform 0.15s' }}>▾</span>
-            </button>
-            {showAll && (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 10 }}>
-                {inactive.map((p) => <ProjectCard key={p.id} project={p} prominent={false} onClick={() => onPick(p)} />)}
-              </div>
-            )}
+            <SectionHeader>All projects · {inactive.length}</SectionHeader>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              {inactive.map((p) => <ProjectCard key={p.id} project={p} prominent={false} onClick={() => onPick(p)} />)}
+            </div>
           </div>
         )}
 
@@ -1008,12 +992,16 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
   // Read in dev.log via `[ScrollDiag]` grep.
   const lastScrollDiagAtRef = useRef<number>(0);
   const scrollDiag = useCallback((tag: string, data?: any) => {
-    // Throttle to one log per ~80ms so we don't spam during streams. Critical
-    // events (flush during scroll) bypass the throttle by setting force=true.
-    const now = performance.now();
-    const force = data?.force;
-    if (!force && now - lastScrollDiagAtRef.current < 80) return;
-    lastScrollDiagAtRef.current = now;
+    // Throttle only the noisy `scroll` tag (raw onScroll spam). Edge-events
+    // (flushReducer, followOutput, atBottomStateChange, isScrolling, ws-msg,
+    // scrollToIndex, height-change) bypass the throttle — they're rare and
+    // we need every one to reconstruct the jitter sequence.
+    if (tag === 'scroll') {
+      const now = performance.now();
+      const force = data?.force;
+      if (!force && now - lastScrollDiagAtRef.current < 80) return;
+      lastScrollDiagAtRef.current = now;
+    }
     Api.log('ScrollDiag', tag, data);
   }, []);
 
@@ -1023,9 +1011,10 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
   const flushReducer = useCallback((reason: 'append' | 'replace' | 'prepend-aware') => {
     const fresh = reducer.current.getEntries();
     const prev = prevEntriesLenRef.current;
-    if (fresh.length !== prev) {
-      scrollDiag('flushReducer', { reason, prev, next: fresh.length, force: true });
-    }
+    // Always log — even when length didn't change. A mutating entry (same
+    // count, different content/height) still triggers a re-render and can
+    // bump scrollTop. We need this signal to correlate with `scroll` events.
+    scrollDiag('flushReducer', { reason, prev, next: fresh.length, changed: fresh.length !== prev });
     if (reason === 'prepend-aware' && fresh.length > prev) {
       // Determine if the additional entries are at the FRONT (prepend) by
       // checking whether the last entry's id matches prev's last entry's id.
@@ -1108,6 +1097,7 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
     // DOM is bounded (10-30 nodes total regardless of `entries.length`).
     setDrawerOpen(false);
     requestAnimationFrame(() => {
+      scrollDiag('scrollToIndex', { from: 'goToEntry', index: targetIdx, align: 'center' });
       virtuosoRef.current?.scrollToIndex({
         index: targetIdx,
         align: 'center',
@@ -1392,6 +1382,7 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
     // Two rAFs: first lets virtuoso commit the entries-grew render, second
     // lets it finish layout/measure of the newly-mounted last item.
     requestAnimationFrame(() => requestAnimationFrame(() => {
+      scrollDiag('scrollToIndex', { from: 'initialLoad', index: entries.length - 1, align: 'end' });
       virtuosoRef.current?.scrollToIndex({
         index: entries.length - 1,
         align: 'end',
@@ -1440,6 +1431,19 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
       ws.onmessage = (ev) => {
         try {
           const m = JSON.parse(ev.data);
+          // Diagnostic: log every WS message TYPE so we can correlate
+          // arrivals with scrollTop bumps. Don't log payload — too big.
+          if (m.type === 'message') {
+            const inner = m.message;
+            scrollDiag('ws-msg', {
+              type: m.type,
+              innerType: inner?.type,
+              role: inner?.message?.role,
+              hasContent: Array.isArray(inner?.message?.content) ? inner.message.content.length : 0,
+            });
+          } else if (m.type === 'busy' || m.type === 'done') {
+            scrollDiag('ws-msg', { type: m.type, busy: m.busy });
+          }
           if (m.type === 'snapshot') {
             if (m.sessionId) setSessionId(m.sessionId);
             setBusy(!!m.busy);
@@ -1508,6 +1512,7 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
   // onMessage and onDone where we push to rawHistoryBufferRef.
 
   const scrollChatToBottom = useCallback(() => {
+    scrollDiag('scrollToIndex', { from: 'scrollChatToBottom', index: entries.length - 1, align: 'end' });
     virtuosoRef.current?.scrollToIndex({
       index: entries.length - 1,
       align: 'end',

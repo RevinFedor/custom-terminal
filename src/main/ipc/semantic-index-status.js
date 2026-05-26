@@ -12,6 +12,7 @@
 
 const { ipcMain } = require('electron');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
@@ -223,9 +224,30 @@ function rebuildIndex(projectId, mainWindow, opts = {}) {
   const parallelism = Number.isFinite(rawN) ? Math.max(1, Math.min(20, Math.round(rawN))) : 10;
   state.rebuildParallelism = parallelism;
 
+  // PATH augment — production Electron на macOS наследует launchd PATH
+  // (`/usr/bin:/bin:/usr/sbin:/sbin`), без homebrew и без user-local. Скрипт
+  // build-index.sh делает `command -v claude` / `command -v jq` → not found →
+  // `echo -e ${RED}ERROR${NC}` на STDOUT + exit 1. stderr пустой, юзер видит
+  // «Индексация не удалась: exit code 1» без причины. Это [Bug 6] — повторяющийся
+  // failure 8+ раз в production.log при пустых stderr.
+  //
+  // Добавляем стандартные locations где обычно живут claude / jq / node:
+  //   /opt/homebrew/bin       — Apple Silicon Homebrew
+  //   /usr/local/bin          — Intel Homebrew + node global
+  //   ~/.local/bin            — pip --user / pipx
+  //   ~/.claude/local/bin     — Claude Code CLI alternate install location
+  // ПЕРЕД оригинальным PATH, чтобы наши версии победили над launchd-stubs.
+  const homeDir = os.homedir();
+  const extraPaths = [
+    '/opt/homebrew/bin',
+    '/usr/local/bin',
+    path.join(homeDir, '.local', 'bin'),
+    path.join(homeDir, '.claude', 'local', 'bin'),
+  ];
+  const augmentedPath = [...extraPaths, process.env.PATH || ''].filter(Boolean).join(':');
   const proc = spawn('bash', [scriptPath, '--parallel', String(parallelism)], {
     cwd: state.projectPath,
-    env: { ...process.env, FORCE_COLOR: '0' },
+    env: { ...process.env, FORCE_COLOR: '0', PATH: augmentedPath },
   });
   state.rebuildProc = proc;
 
@@ -233,6 +255,12 @@ function rebuildIndex(projectId, mainWindow, opts = {}) {
   let completed = 0;      // all file-done events (incl. cached) — kept for debugging
   let currentFile = '';
   let stderrTail = '';
+  // Tail stdout тоже — скрипт пишет ошибки через `echo -e ${RED}...` на STDOUT,
+  // не stderr. Если упал до summary (claude CLI missing / jq missing / mktemp
+  // fail) — без буферизации stdout мы получаем `exit code 1` БЕЗ stderr, юзер
+  // в продакшене видит «Индексация не удалась: exit code 1» без причины.
+  // Это [Bug 6] — failure без stderr 8+ раз в production.log.
+  let stdoutTail = '';
   // Outdated tracking: how many files were actually re-indexed (not cached).
   // outdatedTotal grows as we see [launched ...] events; outdatedCompleted grows
   // when a launched file reports its result. Cached files never go into either.
@@ -354,7 +382,9 @@ function rebuildIndex(projectId, mainWindow, opts = {}) {
 
   let stdoutBuf = '';
   proc.stdout.on('data', (chunk) => {
-    stdoutBuf += chunk.toString('utf8');
+    const s = chunk.toString('utf8');
+    stdoutTail = (stdoutTail + s).slice(-2000);
+    stdoutBuf += s;
     let nl;
     while ((nl = stdoutBuf.indexOf('\n')) !== -1) {
       const line = stdoutBuf.slice(0, nl);
@@ -394,12 +424,22 @@ function rebuildIndex(projectId, mainWindow, opts = {}) {
     }
     const success = reasons.length === 0;
 
-    // Стрим stderr в наш единый лог при любом ненулевом exit / ненулевом stderr.
+    // Стрим stderr+stdout в наш единый лог при любом ненулевом exit / ненулевом stderr.
      // Иначе юзер видит «exit code 1» в тосте без указания где упало (CLAUDE.md.bak,
-    // claude/jq missing, GEMINI_API_KEY, set -u и т.п.). stderrTail обрезан до
-    // последних 2000 байт — этого достаточно для root cause.
-    if (!success || stderrTail.trim()) {
+    // claude/jq missing, GEMINI_API_KEY, set -u и т.п.). build-index.sh пишет
+    // ошибки через `echo -e ${RED}...` на STDOUT (не stderr), поэтому буферим оба.
+    if (!success || stderrTail.trim() || stdoutTail.trim()) {
       const stderrPreview = stderrTail.trim().slice(-1200);
+      // ANSI-strip + последние 3 непустые строки stdout — обычно тут «ERROR: ...».
+      const stdoutPreview = stdoutTail
+        .replace(/\x1b\[[0-9;]*m/g, '')
+        .trim()
+        .split('\n')
+        .map(l => l.trim())
+        .filter(Boolean)
+        .slice(-3)
+        .join(' · ')
+        .slice(-1200);
       console.log(
         '[SemanticIndexStatus] Rebuild', projectId,
         'exit code', code, 'signal', signal,
@@ -409,7 +449,8 @@ function rebuildIndex(projectId, mainWindow, opts = {}) {
         'perFileBad=', perFileBad,
         'success=', success,
         reasons.length ? `reasons=[${reasons.join('; ')}]` : '',
-        stderrPreview ? `stderr=<<<${stderrPreview}>>>` : ''
+        stderrPreview ? `stderr=<<<${stderrPreview}>>>` : '',
+        stdoutPreview ? `stdout=<<<${stdoutPreview}>>>` : ''
       );
     } else {
       console.log(
@@ -419,10 +460,12 @@ function rebuildIndex(projectId, mainWindow, opts = {}) {
       );
     }
 
-    // Toast в renderer — clean tail из stderr добавляем к reasons, чтобы юзер
-    // видел реальную причину (CLAUDE.md.bak exists / claude CLI missing / etc),
-    // а не сухое «exit code 1».
-    const stderrClean = stderrTail
+    // Toast в renderer — clean tail из stderr+stdout добавляем к reasons, чтобы
+    // юзер видел реальную причину (CLAUDE.md.bak exists / claude CLI missing /
+    // jq missing / etc), а не сухое «exit code 1». build-index.sh пишет ошибки
+    // на STDOUT через `echo -e ${RED}...`, поэтому stdoutTail имеет смысл
+    // лить в toast наравне со stderr.
+    const ansiStrip = (s) => s
       .replace(/\x1b\[[0-9;]*m/g, '')   // ANSI colors
       .trim()
       .split('\n')
@@ -430,9 +473,14 @@ function rebuildIndex(projectId, mainWindow, opts = {}) {
       .filter(Boolean)
       .slice(-3)
       .join(' · ');
+    const stderrClean = ansiStrip(stderrTail);
+    const stdoutClean = ansiStrip(stdoutTail);
+    // Берём ту струю, в которой есть «ERROR» / непустой контент. Обе пустые →
+    // оставляем reasons как есть. Обе непустые → склеиваем через ` · `.
+    const sourceLine = [stderrClean, stdoutClean].filter(Boolean).join(' · ');
     const combinedError = success
       ? null
-      : [reasons.join('; '), stderrClean].filter(Boolean).join(' — ') || 'unknown failure';
+      : [reasons.join('; '), sourceLine].filter(Boolean).join(' — ') || 'unknown failure';
 
     send('semantic-index:rebuild-done', {
       success,

@@ -18,6 +18,8 @@ Passthrough к `api.anthropic.com`. OAuth-токен подписки пробр
 ### DeepSeek
 Перенаправляет на `api.deepseek.com/anthropic` — это **официальный** Anthropic-совместимый endpoint DeepSeek, не community-хак. Параллельно с OpenAI-форматом DeepSeek сам реализовал `/anthropic/v1/messages` для интеграции с Claude Code. Тот же API-ключ работает для обоих форматов.
 
+**Где живёт ключ:** `DEEPSEEK_API_KEY` в `~/.noted-terminal/.env` (production). Проектный `.env` рядом с .app **не используется** — `build:install` переписывает его на каждой сборке. Тот же home-dir файл, что и `SONIOX_API_KEY` (см. `fact-dictation.md::Production env`). Симптом не настроенного ключа: в табе с выбранным DeepSeek-провайдером Claude роняет `API Error: 401 Authentication Fails, Your api key: is invalid` — пустая строка после `key:` сигнализирует именно про `process.env.DEEPSEEK_API_KEY === ''`. Dev-режим читает проектный `.env` из cwd как раньше.
+
 **Что DeepSeek принимает (Anthropic-формат):** `model`, `max_tokens`, `stop_sequences`, `stream`, `system`, `temperature`, `top_p`, tool definitions, message content (text + tool_use/tool_result), `thinking`, `output_config.effort`.
 
 **Что игнорирует:** `cache_control` (нет prompt cache у DeepSeek — `[ProviderProxy] Cache: read=0 create=0` для deepseek mode = норма, не баг), `anthropic-beta`/`anthropic-version` headers, `top_k`, `metadata`, `service_tier`, image/document/search_result content types.
@@ -43,7 +45,19 @@ Passthrough к `api.anthropic.com`. OAuth-токен подписки пробр
 
 **Fallback:** для запросов без `/t/` prefix (внешний Claude в shell, не из приложения) state читается из bucket `'global'` — это исключает крах если кто-то открыл Claude напрямую с `ANTHROPIC_BASE_URL=http://127.0.0.1:4001/` (без префикса).
 
-Принцип в общем виде см. `methodology/design.md::Per-tab tooling state`.
+Принцип в общем виде см. `methodology/переносимый-дизайн.md::Per-tab tooling state`.
+
+## Per-tab persistence (SQLite)
+
+`providerStates` Map в main process — in-memory only, до этой итерации сбрасывался каждый рестарт Electron'а. Юзер: *«хочу чтоб они сохранилсь меж перезапуском сесий и прилжоения»* — добавлен SQLite-backed persistence per-tab.
+
+Колонка `tabs.provider_state TEXT` хранит сериализованный `{type, model?, effort?, thinking?}` JSON. На startup, **до** того как `app.whenReady().then(...)` шипит spawn первой Claude-сессии (AutoResume / Continue / Restore), `getAllTabProviderStates()` читает все строки и наполняет `providerStates` Map. Хук стоит в `setupShellIntegration()` block — гарантирует что любой Claude-spawn с `ANTHROPIC_BASE_URL=http://.../t/<tabId>` уже видит правильный state на первом request'е.
+
+На каждый `provider:switch` / `provider:set-options` main **прямо** пишет в `db.updateTabProviderState(tabId, state)` без round-trip через renderer-side `saveTabs`. Альтернатива (broadcast `provider:state-changed` → renderer мутирует tab.providerState → `saveTabs` всех табов) дороже на каждом клике и race-prone: между mutate и flush юзер может сменить таб, новый saveTabs запишет stale Map. Direct write избегает обоих сценариев.
+
+`Tab.providerState` в zustand-сторе — **read-only кэш** для UI; renderer никогда не вызывает `saveTabs` с дельтой по `providerState`. Source of truth — `providerStates` Map в main + `tabs.provider_state` row в SQLite. См. `methodology/переносимый-дизайн.md::Per-tab tooling state` для общего принципа изоляции state между табами.
+
+**Что НЕ персистится:** anthropic-side `/model` выбор (default/opus/sonnet/haiku) — это команда внутри Claude TUI, не часть `providerState`. При `--resume` Claude сам сбрасывает модель на default. Чтобы выбор модели в anthropic-режиме переживал restart, нужна отдельная injection `/model <X>` на `process-started` event (аналог `/effort` auto-inject) — не сделано в этой итерации.
 
 ## Bridge врёт про active provider
 
@@ -53,7 +67,7 @@ Passthrough к `api.anthropic.com`. OAuth-токен подписки пробр
 
 **Правда live (in-flight):** UI Provider row (одна из 3 кнопок Claude/DeepSeek/Zen, подсвечена). Per-tab state в main process.
 
-Принцип «индикация что реально произошло — из server response, не из локального state» — см. `methodology/design.md::Truth from server response`.
+Принцип «индикация что реально произошло — из server response, не из локального state» — см. `methodology/переносимый-дизайн.md::Truth from server response`.
 
 ## Effort/Think injection (deepseek mode)
 

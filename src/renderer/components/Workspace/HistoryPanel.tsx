@@ -471,6 +471,18 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
 
   const [entries, setEntries] = useState<FullHistoryEntry[]>([]);
   const [loading, setLoading] = useState(true);
+  // Last entry uuid Claude's own backtrace reaches before stopping at the first
+  // orphan. Any entry at index <= boundary is part of the chain-break zone:
+  // visible in HistoryPanel through recovery, but unreachable by Claude's
+  // own backtrace. Red tint marks it across all view modes (HistoryPanel
+  // included) so the user sees what Claude actually has in RAM vs what we
+  // recovered via physical-predecessor fallback. Compact is irrelevant —
+  // orphans appear with or without compacts (rebuild / Stop / Esc / SSE).
+  const [claudeMemoryBoundaryUuid, setClaudeMemoryBoundaryUuid] = useState<string | null>(null);
+  const claudeMemoryBoundaryIndex = useMemo(() => {
+    if (!claudeMemoryBoundaryUuid) return -1;
+    return entries.findIndex(e => e.uuid === claudeMemoryBoundaryUuid);
+  }, [entries, claudeMemoryBoundaryUuid]);
   const scrollArrowRef = useRef<HTMLDivElement>(null);
   const virtuosoRef = useRef<VirtuosoHandle | null>(null);
   const isResizing = useRef(false);
@@ -680,6 +692,7 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
       const result = await ipcRenderer.invoke(ipcChannel, { sessionId, cwd });
       if (result.success) {
         const newEntries: FullHistoryEntry[] = result.entries || [];
+        setClaudeMemoryBoundaryUuid(result.claudeMemoryBoundaryUuid || null);
 
         if (!isRefresh) {
           console.warn(`[HP] initial load: ${newEntries.length} entries`);
@@ -1095,18 +1108,28 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
             initialTopMostItemIndex={entries.length > 0 ? entries.length - 1 : 0}
             followOutput={() => (isAtBottomRef.current ? 'auto' : false)}
             style={{ height: '100%' }}
-            itemContent={(_idx, entry) => (
-              <div
-                data-uuid={entry.uuid}
-                style={{
-                  paddingTop: 4,
-                  paddingBottom: 4,
-                  ...(flashUuid === entry.uuid ? { animation: 'hp-flash 500ms ease-in-out' } : undefined),
-                }}
-              >
-                <HistoryEntry entry={entry} toolType={toolType} />
-              </div>
-            )}
+            itemContent={(_idx, entry) => {
+              // Red tint for the chain-break zone: every entry at or before
+              // the boundary uuid is unreachable by Claude's own backtrace
+              // (live Claude would truncate to entries AFTER the boundary on
+              // next resume). Independent of compact — orphans appear with
+              // or without compact (rebuild / Stop / Esc / SSE crash).
+              const isChainBreakZone =
+                claudeMemoryBoundaryIndex >= 0 && _idx <= claudeMemoryBoundaryIndex;
+              return (
+                <div
+                  data-uuid={entry.uuid}
+                  style={{
+                    paddingTop: 4,
+                    paddingBottom: 4,
+                    backgroundColor: isChainBreakZone ? 'rgba(239, 68, 68, 0.06)' : undefined,
+                    ...(flashUuid === entry.uuid ? { animation: 'hp-flash 500ms ease-in-out' } : undefined),
+                  }}
+                >
+                  <HistoryEntry entry={entry} toolType={toolType} />
+                </div>
+              );
+            }}
           />
         )}
         {/* Scroll-to-bottom arrow — visibility toggled via ref in handleScroll */}

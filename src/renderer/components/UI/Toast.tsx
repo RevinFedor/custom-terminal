@@ -1,8 +1,14 @@
 import React from 'react';
 import { useUIStore } from '../../store/useUIStore';
+import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 
 export default function ToastContainer() {
   const { toasts, removeToast } = useUIStore();
+  // Tab-scoped toasts (toast.tabId set) only render while their tab is the
+  // effective active one — switching tabs hides the toast, switching back shows
+  // it again. Global toasts (no tabId) render always.
+  const effectiveTabId = useWorkspaceStore((s) => s.getEffectiveTabId());
+  const visibleToasts = toasts.filter((t) => !t.tabId || t.tabId === effectiveTabId);
 
   return (
     <div
@@ -18,7 +24,7 @@ export default function ToastContainer() {
         maxWidth: '340px'
       }}
     >
-      {toasts.map((toast) => (
+      {visibleToasts.map((toast) => (
         <div
           key={toast.id}
           className={`pointer-events-auto flex items-center gap-2 px-3 py-2 rounded-lg shadow-lg backdrop-blur-sm transform transition-all duration-300 ease-out animate-slide-in ${
@@ -39,10 +45,25 @@ export default function ToastContainer() {
           {/* ✕ close button — left side for persistent toasts */}
           {toast.persistent && (
             <span
-              className="shrink-0 cursor-pointer rounded-full flex items-center justify-center hover:bg-white/20 transition-colors"
-              style={{ width: '18px', height: '18px', fontSize: '11px', opacity: 0.7 }}
-              onMouseEnter={(e) => { e.currentTarget.style.opacity = '1'; }}
-              onMouseLeave={(e) => { e.currentTarget.style.opacity = '0.7'; }}
+              className="shrink-0 cursor-pointer rounded-full flex items-center justify-center transition-colors"
+              style={{
+                width: '18px',
+                height: '18px',
+                fontSize: '11px',
+                lineHeight: 1,
+                opacity: 0.95,
+                background: 'rgba(0,0,0,0.28)',
+                border: '1px solid rgba(255,255,255,0.35)',
+                color: '#fff',
+              }}
+              onMouseEnter={(e) => {
+                e.currentTarget.style.background = 'rgba(0,0,0,0.5)';
+                e.currentTarget.style.borderColor = 'rgba(255,255,255,0.7)';
+              }}
+              onMouseLeave={(e) => {
+                e.currentTarget.style.background = 'rgba(0,0,0,0.28)';
+                e.currentTarget.style.borderColor = 'rgba(255,255,255,0.35)';
+              }}
               onClick={(e) => { e.stopPropagation(); removeToast(toast.id); }}
             >
               ✕

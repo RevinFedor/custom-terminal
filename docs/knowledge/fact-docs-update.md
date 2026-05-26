@@ -32,7 +32,7 @@
     **Важно:** После Bracketed Paste (`\x1b[201~`) нужна задержка ~500ms перед `\r`, иначе Gemini интерпретирует Enter как перенос строки, а не submit.
 - **Интерактивность:**
     - `⌘+Enter` в поле ввода запускает процесс обновления.
-    - Состояние выделения вкладок (Multi-select) сохраняется при кликах внутрь панели и вводе текста (см. `knowledge/fact-ux-patterns.md`).
+    - Состояние выделения вкладок (Multi-select) сохраняется при кликах внутрь панели и вводе текста (атрибут `data-keep-selection` на обёртке `ActionsPanel`). Механизм — `knowledge/fact-tabs.md::Multi-select persistence`.
 - **Анализ (Gemini):**
     - Система создает prefilled-сессию через `gemini:create-prefilled-session`, затем запускает Gemini-таб через `gemini:spawn-with-watcher` с флагами `resumeSessionId` и `yesMode: true`.
     - Итоговая команда в PTY: `gemini -y -r <sessionId>` — `-y` (auto-approve) + `-r` (resume prefilled session). Это гарантирует, что Gemini начнет обработку без ручного подтверждения.
@@ -103,6 +103,6 @@ Gemini-оркестратор может вызвать `update_docs` как MCP
 - **Styles:** Анимация вращающегося кольца при загрузке.
 - **Fixes:**
     - `knowledge/fact-export-session.md` — детали унифицированного экспорта.
-    - `knowledge/fact-ux-patterns.md` — механизм удержания выделения табов.
+    - `knowledge/fact-tabs.md::Multi-select persistence` — механизм удержания выделения табов через `data-keep-selection`.
     - `knowledge/fact-claude-tui-mechanics.md` — как работает вставка больших промптов.
     - `knowledge/fact-claude-sessions.md` — Prefilled Sessions для обновления документации.

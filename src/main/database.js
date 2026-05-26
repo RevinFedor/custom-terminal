@@ -108,6 +108,11 @@ class DatabaseManager {
     try { this.db.exec(`ALTER TABLE tabs ADD COLUMN color TEXT DEFAULT NULL`); } catch (e) {}
     try { this.db.exec(`ALTER TABLE tabs ADD COLUMN is_utility INTEGER DEFAULT 0`); } catch (e) {}
     try { this.db.exec(`ALTER TABLE tabs ADD COLUMN claude_session_id TEXT DEFAULT NULL`); } catch (e) {}
+    // Per-tab provider state (provider type + chosen model + effort + thinking).
+    // JSON-serialized {type:'anthropic'|'deepseek'|'zen', model?, effort?, thinking?}.
+    // Persisted because main's `providerStates` Map is in-memory only — without
+    // this column every restart resets all tabs to default anthropic provider.
+    try { this.db.exec(`ALTER TABLE tabs ADD COLUMN provider_state TEXT DEFAULT NULL`); } catch (e) {}
     try { this.db.exec(`ALTER TABLE tabs ADD COLUMN was_interrupted INTEGER DEFAULT 0`); } catch (e) {}
     try { this.db.exec(`ALTER TABLE tabs ADD COLUMN gemini_session_id TEXT DEFAULT NULL`); } catch (e) {}
     try {
@@ -336,6 +341,9 @@ class DatabaseManager {
     try { this.db.exec(`ALTER TABLE tab_history ADD COLUMN position INTEGER DEFAULT NULL`); } catch (e) {}
     try { this.db.exec(`ALTER TABLE tab_history ADD COLUMN process_was_running INTEGER DEFAULT 0`); } catch (e) {}
 
+    // Migration: session_status survives close/restore (matches tabs.session_status).
+    try { this.db.exec(`ALTER TABLE tab_history ADD COLUMN session_status TEXT DEFAULT NULL`); } catch (e) {}
+
     // Migration: add position to timeline_notes
     try { this.db.exec(`ALTER TABLE timeline_notes ADD COLUMN position TEXT DEFAULT 'before'`); } catch (e) {}
 
@@ -409,6 +417,55 @@ class DatabaseManager {
         created_at INTEGER DEFAULT (strftime('%s', 'now')),
         UNIQUE(entry_uuid, session_id)
       )
+    `);
+
+    // claude_usage_snapshots — sample of /oauth/usage every minute.
+    // Storage: 1440 rows/day × ~50B ≈ 26 MB/year. Kept FOREVER (no prune) —
+    // user wants unbounded history so the "By day" chart can look back over
+    // arbitrary ranges, not just the last week.
+    // `weekly_resets_at` is the ISO string from Anthropic — used to detect
+    // weekly resets (when value drops because Anthropic rotated the bucket).
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS claude_usage_snapshots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts INTEGER NOT NULL,
+        weekly_pct REAL,
+        five_hour_pct REAL,
+        weekly_opus_pct REAL,
+        weekly_sonnet_pct REAL,
+        weekly_resets_at TEXT,
+        five_hour_resets_at TEXT
+      )
+    `);
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_usage_snapshots_ts ON claude_usage_snapshots(ts DESC);
+    `);
+
+    // agent_activity_intervals — one row per "loader was on" span, i.e. an
+    // agent (Claude PTY / Claude SDK / Gemini) actively working in a tab.
+    // Boundaries come from the SAME busy-state signal that drives the tab
+    // loader (see main.js recordActivity). Identity columns are DENORMALIZED
+    // snapshots taken at interval-open time so a row survives the tab/project
+    // being deleted later. Only CLOSED intervals are written (start+end known),
+    // so there are never dangling NULL-end rows; a crash mid-interval simply
+    // loses that one in-flight span. Timestamps are ms epoch.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS agent_activity_intervals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        tab_id TEXT,
+        project_id TEXT,
+        project_path TEXT,
+        project_name TEXT,
+        tab_name TEXT,
+        engine TEXT,
+        session_id TEXT,
+        start_ts INTEGER NOT NULL,
+        end_ts INTEGER NOT NULL,
+        duration_ms INTEGER NOT NULL
+      )
+    `);
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_activity_start ON agent_activity_intervals(start_ts DESC);
     `);
 
   }
@@ -504,9 +561,42 @@ class DatabaseManager {
         mcpTaskStartedAt: t.mcp_task_started_at || undefined,
         mcpTaskId: t.mcp_task_id || undefined,
         claudeTaskCount: t.claude_task_count || 0,
-        sessionStatus: t.session_status || undefined
+        sessionStatus: t.session_status || undefined,
+        providerState: (() => {
+          if (!t.provider_state) return undefined;
+          try { return JSON.parse(t.provider_state); }
+          catch { return undefined; }
+        })()
       }))
     };
+  }
+
+  // Direct one-tab update used by main.js's provider:switch / provider:set-options
+  // handlers — avoids renderer round-trip (renderer would have to receive
+  // broadcast → mutate tab → saveTabs ALL tabs of the project). state==null
+  // resets to default; pass `null` to clear.
+  updateTabProviderState(tabId, state) {
+    if (!tabId) return;
+    try {
+      const json = state ? JSON.stringify(state) : null;
+      this.db.prepare('UPDATE tabs SET provider_state = ? WHERE tab_id = ?').run(json, tabId);
+    } catch (e) {
+      console.error('[DB] updateTabProviderState error:', e.message);
+    }
+  }
+
+  // Read every tab's persisted providerState across all projects. Called once
+  // at app startup so main can hydrate `providerStates` Map before any Claude
+  // process spawns and asks proxy what provider to route to.
+  getAllTabProviderStates() {
+    try {
+      return this.db.prepare(
+        `SELECT tab_id, provider_state FROM tabs WHERE provider_state IS NOT NULL AND tab_id IS NOT NULL`
+      ).all();
+    } catch (e) {
+      console.error('[DB] getAllTabProviderStates error:', e.message);
+      return [];
+    }
   }
 
   // Update mcp_task_started_at for a specific sub-agent tab (by tab_id)
@@ -628,8 +718,8 @@ class DatabaseManager {
 
     const deleteByTabId = this.db.prepare('DELETE FROM tabs WHERE project_id = ? AND tab_id = ?');
     const insert = this.db.prepare(`
-      INSERT INTO tabs (project_id, name, cwd, position, color, is_utility, command_type, claude_session_id, gemini_session_id, was_interrupted, overlay_dismissed, notes, tab_type, url, terminal_id, terminal_name, active_view, created_at, is_collapsed, parent_tab_id, tab_id, mcp_task_started_at, mcp_task_id, claude_task_count, session_status, claude_session_history)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO tabs (project_id, name, cwd, position, color, is_utility, command_type, claude_session_id, gemini_session_id, was_interrupted, overlay_dismissed, notes, tab_type, url, terminal_id, terminal_name, active_view, created_at, is_collapsed, parent_tab_id, tab_id, mcp_task_started_at, mcp_task_id, claude_task_count, session_status, claude_session_history, provider_state)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     const transaction = this.db.transaction((tabList) => {
@@ -647,7 +737,15 @@ class DatabaseManager {
         const historyJson = (tab.claudeSessionHistory && tab.claudeSessionHistory.length > 0)
           ? JSON.stringify(tab.claudeSessionHistory)
           : null;
-        insert.run(projectId, tab.name, tab.cwd, index, tab.color || null, tab.isUtility ? 1 : 0, tab.commandType || null, tab.claudeSessionId || null, tab.geminiSessionId || null, tab.wasInterrupted ? 1 : 0, tab.overlayDismissed ? 1 : 0, tab.notes || '', tab.tabType || 'terminal', tab.url || null, tab.terminalId || null, tab.terminalName || null, tab.activeView || null, tab.createdAt || null, tab.isCollapsed ? 1 : 0, tab.parentTabId || null, tab.tabId || null, tab.mcpTaskStartedAt || null, tab.mcpTaskId || null, tab.claudeTaskCount || 0, tab.sessionStatus || null, historyJson);
+        // providerState: serialize only if non-default (anthropic, no model/effort/thinking).
+        // Default state == NULL — saves space and aligns with "fresh tab" semantics.
+        const providerStateJson = tab.providerState && (
+          tab.providerState.type !== 'anthropic' ||
+          tab.providerState.model ||
+          tab.providerState.effort ||
+          tab.providerState.thinking
+        ) ? JSON.stringify(tab.providerState) : null;
+        insert.run(projectId, tab.name, tab.cwd, index, tab.color || null, tab.isUtility ? 1 : 0, tab.commandType || null, tab.claudeSessionId || null, tab.geminiSessionId || null, tab.wasInterrupted ? 1 : 0, tab.overlayDismissed ? 1 : 0, tab.notes || '', tab.tabType || 'terminal', tab.url || null, tab.terminalId || null, tab.terminalName || null, tab.activeView || null, tab.createdAt || null, tab.isCollapsed ? 1 : 0, tab.parentTabId || null, tab.tabId || null, tab.mcpTaskStartedAt || null, tab.mcpTaskId || null, tab.claudeTaskCount || 0, tab.sessionStatus || null, historyJson, providerStateJson);
       });
 
       // Step 4: Clean up tabs that exist in DB but NOT in the new set
@@ -669,8 +767,8 @@ class DatabaseManager {
   archiveTab(projectId, tab) {
     const now = Math.floor(Date.now() / 1000);
     const info = this.db.prepare(`
-      INSERT INTO tab_history (project_id, name, cwd, color, notes, command_type, tab_type, url, created_at, closed_at, claude_session_id, gemini_session_id, message_count, position, process_was_running)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO tab_history (project_id, name, cwd, color, notes, command_type, tab_type, url, created_at, closed_at, claude_session_id, gemini_session_id, message_count, position, process_was_running, session_status)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       projectId,
       tab.name,
@@ -686,7 +784,8 @@ class DatabaseManager {
       tab.geminiSessionId || null,
       tab.messageCount ?? null,
       tab.position ?? null,
-      tab.processWasRunning ? 1 : 0
+      tab.processWasRunning ? 1 : 0,
+      tab.sessionStatus || null
     );
     return info.lastInsertRowid;
   }
@@ -1365,6 +1464,105 @@ class DatabaseManager {
     }
 
     return { notes: notesCopied, rewindMarkers: rewindCopied };
+  }
+
+  // ========== CLAUDE USAGE SNAPSHOTS ==========
+
+  // Append one snapshot from /oauth/usage. NO pruning — history is retained
+  // indefinitely (user opted out of the 60-day window so long-range "By day"
+  // charts have real data to draw).
+  saveClaudeUsageSnapshot(snapshot) {
+    if (!snapshot) return;
+    const ts = snapshot.ts || Math.floor(Date.now() / 1000);
+    try {
+      this.db.prepare(`
+        INSERT INTO claude_usage_snapshots
+          (ts, weekly_pct, five_hour_pct, weekly_opus_pct, weekly_sonnet_pct,
+           weekly_resets_at, five_hour_resets_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        ts,
+        snapshot.weekly_pct ?? null,
+        snapshot.five_hour_pct ?? null,
+        snapshot.weekly_opus_pct ?? null,
+        snapshot.weekly_sonnet_pct ?? null,
+        snapshot.weekly_resets_at ?? null,
+        snapshot.five_hour_resets_at ?? null
+      );
+    } catch (e) {
+      console.error('[DB] saveClaudeUsageSnapshot failed:', e.message);
+    }
+  }
+
+  // Last persisted snapshot — used as fallback usage data when live /oauth/usage
+  // is rate-limited and the in-memory cache is empty (e.g. fresh app start
+  // hits 429 before any successful fetch). Lets the chip show real numbers
+  // instead of a dash even when API is temporarily unavailable.
+  getLatestClaudeUsageSnapshot() {
+    return this.db.prepare(`
+      SELECT ts, weekly_pct, five_hour_pct, weekly_opus_pct, weekly_sonnet_pct,
+             weekly_resets_at, five_hour_resets_at
+      FROM claude_usage_snapshots
+      ORDER BY ts DESC
+      LIMIT 1
+    `).get();
+  }
+
+  // Return raw snapshots between two unix timestamps, ascending order.
+  getClaudeUsageSnapshots(fromTs, toTs) {
+    return this.db.prepare(`
+      SELECT ts, weekly_pct, five_hour_pct, weekly_opus_pct, weekly_sonnet_pct,
+             weekly_resets_at, five_hour_resets_at
+      FROM claude_usage_snapshots
+      WHERE ts >= ? AND ts <= ?
+      ORDER BY ts ASC
+    `).all(fromTs, toTs);
+  }
+
+  // ========== AGENT ACTIVITY INTERVALS ==========
+
+  // Persist one CLOSED activity interval. `iv` carries the denormalized
+  // identity snapshot captured at open-time plus start/end ms timestamps.
+  // Zero / negative spans are dropped (idempotent recorder may emit a
+  // false→false with no real interval).
+  saveActivityInterval(iv) {
+    if (!iv || !iv.startTs || !iv.endTs) return;
+    const duration = iv.endTs - iv.startTs;
+    if (duration <= 0) return;
+    try {
+      this.db.prepare(`
+        INSERT INTO agent_activity_intervals
+          (tab_id, project_id, project_path, project_name, tab_name, engine,
+           session_id, start_ts, end_ts, duration_ms)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        iv.tabId ?? null,
+        iv.projectId ?? null,
+        iv.projectPath ?? null,
+        iv.projectName ?? null,
+        iv.tabName ?? null,
+        iv.engine ?? null,
+        iv.sessionId ?? null,
+        iv.startTs,
+        iv.endTs,
+        duration
+      );
+    } catch (e) {
+      console.error('[DB] saveActivityInterval failed:', e.message);
+    }
+  }
+
+  // Raw closed intervals overlapping [fromTs, toTs] (ms). Ascending by start.
+  // Aggregation (by day / project / tab / engine) is done by the IPC layer,
+  // mirroring how computeDailyHistory consumes raw usage snapshots.
+  getActivityIntervals(fromTs, toTs) {
+    return this.db.prepare(`
+      SELECT tab_id, project_id, project_path, project_name, tab_name, engine,
+             session_id, start_ts, end_ts, duration_ms
+      FROM agent_activity_intervals
+      WHERE end_ts >= ? AND start_ts <= ?
+      ORDER BY start_ts ASC
+    `).all(fromTs, toTs);
   }
 
   close() { this.db.close(); }

@@ -39,7 +39,7 @@
 
 **Янтарный, не жёлтый** — `#d97706` (`amber-600` в Tailwind palette). По правилу из CLAUDE.md секция «AI-Optimized UI & Video Forensics»: чистый жёлтый плохо читается на тёмной теме, янтарь сохраняет читаемость и в скринкастах.
 
-**Почему cached не считается в running-счётчике** — см. `methodology/design.md::Прогресс-индикатор показывает active work, не total volume`. Кратко: cached пролетают за миллисекунды, и `5/90` создаёт иллюзию «осталось много» там, где реально осталось 5.
+**Почему cached не считается в running-счётчике** — см. `methodology/переносимый-дизайн.md::Прогресс-индикатор показывает active work, не total volume`. Кратко: cached пролетают за миллисекунды, и `5/90` создаёт иллюзию «осталось много» там, где реально осталось 5.
 
 **Tooltip разбивка** — показывает все три числа отдельно (`fresh / stale / new`) плюс `docsTotal` / `indexedTotal` для отладки. В running-режиме — `currentFile` (последний файл, который скрипт начал индексировать).
 
@@ -77,9 +77,13 @@ success = code===0
 - `summaryWarnings` — `warn:` поле (это «wrapped» — Claude отдал не-JSON, файл записан с пустыми `implicit:[]`, де-факто бесполезен для роутера).
 - `perFileBad` — счётчик `error|missing|wrapped` событий из stdout (дублирует summary, страховка от случая, когда summary врёт о собственных полях).
 
-См. `methodology/design.md::Success ≠ exit code: валидация по содержимому, не по факту завершения`.
+См. `methodology/переносимый-дизайн.md::Success ≠ exit code: валидация по содержимому, не по факту завершения`.
 
 **Pre-flight гарда:** перед spawn'ом проверяем `CLAUDE.md.bak` в корне. Если существует — отказываемся стартовать с тостом «delete it before rebuilding (previous run crashed)». Без этой проверки скрипт сам бы вышел с `exit 1` (там есть свой check), но в UI это бы выглядело как «короткий лоадер → красный тост `exit code 1`» без понятной причины — пользователь не должен открывать лог чтобы выяснить почему.
+
+**PATH augmentation для production spawn:** production `.app` запускается launchd'ом с минимальным PATH `/usr/bin:/bin:/usr/sbin:/sbin` — без Homebrew (`/opt/homebrew/bin`, `/usr/local/bin`), без user-local (`~/.local/bin`, `~/.claude/local/bin`). `build-index.sh` делает `command -v claude` / `command -v jq` → not found → `echo -e ${RED}ERROR${NC}` + exit 1. В dev все эти пути есть (process унаследован от shell юзера) — баг невидим до выкатки. В production.log за месяц нашли 8+ failure'ов с пустым stderr и `reasons=[exit code 1]` без указания причины. Лечение — `env: { ...process.env, PATH: [...extraPaths, process.env.PATH].join(':') }` перед `spawn()`, extraPaths кладутся **впереди** оригинального, иначе stub'ы из `/usr/bin` могут победить (`/usr/bin/node` без правильных tool versions). Список нужных путей — `/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin`, `~/.claude/local/bin`. Принцип переносим — см. `methodology/переносимый-дизайн.md::Production Electron на macOS наследует launchd PATH`.
+
+**STDOUT-буфер для ошибок без stderr:** `build-index.sh` пишет ошибки через `echo -e ${RED}ERROR: claude CLI not found${NC}` на **STDOUT**, не stderr. `echo` без `>&2` идёт в stdout по умолчанию. Если main парсит только stdout по regex'ам для прогресса и буферит **только stderr** для финального отчёта — ошибки пропадают: regex'ы их не матчат, stderr пустой, юзер видит `exit code 1` без причины. Лечение — `stdoutTail = (stdoutTail + chunk).slice(-2000)` параллельно с stderrTail, при non-zero exit включать обе строки в combined error toast (`ANSI strip → split('\n') → filter empty → slice(-3) → join(' · ')`). Принцип «success ≠ exit code» в `methodology/переносимый-дизайн.md::Success ≠ exit code` дополняется наблюдением «ERROR на STDOUT — не из злого умысла, `echo` по дефолту туда».
 
 **Parallelism wiring (Settings → Системные → Параллельные воркеры):**
 

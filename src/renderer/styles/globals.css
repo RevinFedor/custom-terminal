@@ -221,6 +221,57 @@
   background-color: var(--process-bar-color-a, #155E75);
 }
 
+/* AI-busy блик внутри полоски процесса — белёсая полупрозрачная просвечка
+   ползёт сверху вниз поверх цветного фона полоски. Это сигнал «AI думает/
+   стримит» (claude/gemini/sdk busy-state) перенесённый с фона таба на саму
+   полоску. Рендерится КАК ОВЕРЛЕЙ внутри полоски, а не вместо неё — pulse
+   цветом (PTY-alive) и блик (AI-busy) могут идти одновременно. Цвет блика
+   не настраивается — стандартная light-overlay метафора как у material
+   linear-progress, любой цвет полоски остаётся читаемым под ней.
+   Подход — `background-position-y` на full-bar overlay с **wrapping gradient**:
+   pattern (1 tile = 100% bar height) содержит ОДИН пик яркости в центре, но
+   яркая зона расширена до 60% pattern'а (10%-90% stops). Это значит на стыках
+   tile'ов (граница y=0/100% pattern repeat) яркость уже dim-но-не-ноль,
+   следующий tile подхватывает блик без чёрной паузы. background-position
+   ползёт от 0 0 до 0 100% за period — полный сдвиг на один tile, seamless по
+   построению (`background-repeat: repeat-y`). Раньше пробовали:
+     1) translateY один overlay — гэп ~30% времени когда пик off-screen.
+     2) Два overlay'я с фазой 50% — юзер видит ДВА блика одновременно в той
+        части цикла когда верхний ещё не ушёл, нижний уже появился.
+     3) Pattern 200% с пиком 30%-70% — на стыках 60% pattern'а имели alpha 0
+        подряд (30% хвоста tile_n + 30% начала tile_n+1), пик надолго пропадал.
+   Текущий вариант — пик растянут на 80% pattern'а с плавными фейдами к 0 на
+   границах, gradient функционально непрерывен по всей полоске, blur эффект
+   светится постоянно но смещается. */
+@keyframes tab-process-bar-ai-shimmer {
+  0%   { background-position: 0 0; }
+  100% { background-position: 0 100%; }
+}
+.tab-process-bar-ai-shimmer-overlay {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  /* Seamless tile pattern. `background-size: 100% 50%` = одна полоска вмещает
+     ровно ДВА tile'а; `background-repeat: repeat-y` повторяет паттерн без
+     ограничений (за пределами видимой зоны тоже tiles рендерятся, anim сдвигает
+     через них). Pattern: пик яркости в центре tile, alpha=.12 на 0% и 100%
+     этого tile — НЕ ноль, чтобы на стыках двух tile'ов яркость не падала в
+     темноту. background-position 0→100% per period (1.2s) сдвигает паттерн
+     ровно на ОДИН tile сверху вниз — пользователь видит непрерывный поток
+     светлых пиков. На стыке цикла (animation iteration boundary) позиция
+     `0 100%` визуально идентична `0 0` благодаря repeat-y → loop seamless. */
+  background-image: linear-gradient(
+    to bottom,
+    rgba(255, 255, 255, 0.12)   0%,
+    rgba(255, 255, 255, 0.55)  50%,
+    rgba(255, 255, 255, 0.12) 100%
+  );
+  background-size: 100% 50%;
+  background-repeat: repeat-y;
+  animation: tab-process-bar-ai-shimmer 1.2s linear infinite;
+  will-change: background-position;
+}
+
 /* AI-busy: горизонтальный шиммер по ширине вкладки.
    ВАЖНО: keyframes должны привести stripe ПОЛНОСТЬЮ за край viewport'а с обеих сторон,
    иначе на стыке цикла будет видимый «снап» (яркий пик зависает у правого края и резко
@@ -237,20 +288,34 @@
    процессия, не серия одиночных проходов.
    Интенсивность пика 0.20 (не 0.32) — фон уже несёт «вкладка активна», шиммер только
    уточняет «AI думает», не должен спорить с process-bar за внимание. */
-/* AI-busy фон таба: целый таб мягко пульсирует фоном между прозрачным и
-   полупрозрачным акцент-цветом. Раньше был sweep-шиммер (полоса слева-направо
-   через ::before+::after с translateX) — юзер: «временно отключи пульсацию
-   слева-направо, сделай пульсацию фона». Цикл и цвет наследуются от
-   processBar (Settings → Полоска процесса → Цвет/Цикл), single source of
-   truth: --process-bar-color-b + --process-bar-duration на :root.
-   color-mix() поддерживается Chromium 111+ (Electron 28 = Chromium 120). */
+/* AI-busy фон таба: целый таб мягко пульсирует фоном между colorA и colorB пока
+   AI «думает» (claude/gemini/sdk busy-state). Цикл/цвета — независимые от
+   ProcessBar настройки: --ai-pulse-color-a/b/duration на :root (Settings →
+   Размеры → Табы → Фон AI-загрузки). Раньше paint брался из processBar
+   (color-mix(colorB, transparent, 14%)) → один цвет на два разных индикатора,
+   юзер не мог настроить отдельно.
+   color-mix() поддерживается Chromium 111+ (Electron 28 = Chromium 120) и
+   используется чтобы из голого colorB сделать полупрозрачный пик — задавать
+   юзеру hex+alpha-input в Settings было бы громоздко, проще hex и сразу
+   фиксированная 22% прозрачность пика. */
+/* Endpoints — rgba(), вычисленные на JS-стороне (см. App.tsx::aiPulse effect).
+   color-mix() внутри keyframe не интерполируется плавно в Chromium — мигание
+   получается «рывками без плавности», юзер описывал как «нет анимации, через
+   разный промежуток происходит мигание». Plain rgba интерполируется per-channel
+   как обычные числа → плавный fade. */
 @keyframes tab-ai-busy-pulse {
-  0%   { background-color: transparent; }
-  50%  { background-color: color-mix(in srgb, var(--process-bar-color-b, #ffffff) 14%, transparent); }
-  100% { background-color: transparent; }
+  0%   { background-color: var(--ai-pulse-color-a, rgba(0,0,0,0)); }
+  50%  { background-color: var(--ai-pulse-color-b, rgba(218,119,86,0.22)); }
+  100% { background-color: var(--ai-pulse-color-a, rgba(0,0,0,0)); }
 }
 .tab-ai-busy-shimmer {
-  animation: tab-ai-busy-pulse var(--process-bar-duration, 2400ms) ease-in-out infinite;
+  animation: tab-ai-busy-pulse var(--ai-pulse-duration, 1800ms) ease-in-out infinite;
+  pointer-events: none;
+}
+/* Статичный AI-фон (enabled=false): красит фон colorB без анимации.
+   Тот же визуальный сигнал «AI busy», но без пульса. */
+.tab-ai-busy-static {
+  background-color: var(--ai-pulse-color-static, rgba(218,119,86,0.14));
   pointer-events: none;
 }
 

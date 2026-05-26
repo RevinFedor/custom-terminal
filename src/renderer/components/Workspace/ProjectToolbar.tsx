@@ -10,6 +10,7 @@ import SemanticIndexButton from './SemanticIndexButton';
 import CopySessionWithChips from './CopySessionWithChips';
 import DocsButton from './DocsButton';
 import DictationHistoryButton from './DictationHistoryButton';
+import ClaudeUsageButton from './ClaudeUsageButton';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -142,11 +143,16 @@ export default function ProjectToolbar() {
 
     setIsCompressing(true);
     try {
-      const clipboardText = await navigator.clipboard.readText();
+      // navigator.clipboard в production Electron-renderer falls back to
+      // секурного контекста (file://) — readText/writeText тихо reject'ятся.
+      // Electron clipboard module (main) работает безусловно. Тот же
+      // anti-pattern см. в CLAUDE.md «Не используй navigator.clipboard в renderer».
+      const { clipboard } = window.require('electron');
+      const clipboardText = clipboard.readText();
       const result = compressLogs(clipboardText);
 
       if (result.success) {
-        await navigator.clipboard.writeText(result.compressed);
+        clipboard.writeText(result.compressed);
         showToast(result.message, 'success');
       } else {
         showToast(result.message, 'warning');
@@ -310,6 +316,13 @@ export default function ProjectToolbar() {
 
       {/* Flex spacer — pushes session-copy cluster to the right edge of the toolbar */}
       <div style={{ flex: 1 }} />
+
+      {/* Claude usage chip — weekly utilization % from Anthropic OAuth usage API
+          (same source as Blimp-Labs claude-usage-bar). Sits left of Dictation
+          history; popover opens DOWN with full 5h/7d/extra-credits breakdown. */}
+      <div className="flex items-center pr-2">
+        <ClaudeUsageButton />
+      </div>
 
       {/* Dictation history — last 100 transcripts captured via the bottom-bar mic.
           Sits left of Docs/Copy because it's not session-bound (lives across all

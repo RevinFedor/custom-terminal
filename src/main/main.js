@@ -60,7 +60,7 @@ const SessionManager = require(path.join(srcMainDir, 'session-manager'));
 const ClaudeManager = require(path.join(srcMainDir, 'claude-manager'));
 const { resolveGeminiProjectDir, findGeminiSessionFile, invalidateProjectsJsonCache, getGeminiProjectsJson, calculateGeminiHash } = require(path.join(srcMainDir, 'gemini-utils'));
 const ClaudeAgentManager = require(path.join(srcMainDir, 'claude-agent'));
-const { findSessionFile, loadJsonlRecords, resolveSessionChain, resolveLatestSessionInChain, parseTimelineUuids, parseTimelineEntries, _api: claudeDataApi } = require(path.join(srcMainDir, 'ipc', 'claude-data'));
+const { findSessionFile, loadJsonlRecords, resolveSessionChain, resolveLatestSessionInChain, parseTimelineUuids, parseTimelineEntries, deleteEffortEntries, repairJsonlChainBreaks, _api: claudeDataApi } = require(path.join(srcMainDir, 'ipc', 'claude-data'));
 
 // SDK session registry — declared early so the mobile-web server can receive
 // the same Map by reference at startup (web-server.start({sdkSessions})).
@@ -208,6 +208,117 @@ const geminiSpinnerBusy = new Map();       // tabId → boolean
 const geminiSpinnerIdleTimers = new Map(); // tabId → timeout ID (debounce idle transition)
 const GEMINI_SPINNER_RE = /[\u280B\u2819\u2839\u2838\u283C\u2834\u2826\u2827\u2807\u280F]/;
 const geminiActiveTabs = new Set();        // tabs with active Gemini process (for spinner detection)
+
+// ========== AGENT ACTIVITY TRACKING (loader-on intervals) ==========
+// Records how long an agent (Claude PTY / Claude SDK / Gemini) is actively
+// working in a tab \u2014 defined as "the tab loader is on", i.e. the SAME
+// busy-state signal the UI consumes. recordActivity() is the single
+// idempotent, edge-triggered chokepoint: open-on-first-true, close-on-
+// first-false; redundant calls of the same polarity are no-ops. This lets us
+// drop purely-additive recordActivity() calls next to every existing
+// busy-state send WITHOUT touching the loader sends themselves.
+//
+// Only CLOSED intervals are persisted (start+end known) \u2014 a crash mid-interval
+// loses that one in-flight span but never corrupts. Identity (project / tab /
+// session) is snapshotted at OPEN time, while the tab is still alive, and
+// denormalized into the row so it survives later tab/project deletion.
+const activityOpenIntervals = new Map();   // tabId \u2192 { startTs, engine, projectId, projectPath, projectName, tabName, sessionId }
+
+// Resolve a denormalized identity snapshot for a tab at this instant. Works for
+// PTY tabs (terminalProjectIds live map \u2192 SQLite fallback) and SDK tabs
+// (sdkSessions). Best-effort: any missing field is left null, the interval is
+// still worth recording for total-time aggregation.
+function resolveActivityIdentity(tabId, engine) {
+  const out = {
+    engine: engine || null,
+    projectId: null, projectPath: null, projectName: null,
+    tabName: null, sessionId: null,
+  };
+  try {
+    let projectId = terminalProjectIds.get(tabId) || null;
+    let row = null;
+    if (projectManager?.db?.db) {
+      try {
+        row = projectManager.db.db.prepare(
+          'SELECT project_id, name, claude_session_id, gemini_session_id FROM tabs WHERE tab_id = ? LIMIT 1'
+        ).get(tabId);
+      } catch {}
+    }
+    if (!projectId && row) projectId = row.project_id || null;
+    out.projectId = projectId;
+    if (row) {
+      out.tabName = row.name || null;
+      out.sessionId = bridgeKnownSessions.get(tabId)
+        || row.claude_session_id || row.gemini_session_id || null;
+    } else {
+      out.sessionId = bridgeKnownSessions.get(tabId) || null;
+    }
+    // SDK tabs aren't in terminalProjectIds; pull cwd/session from sdkSessions.
+    const sdk = sdkSessions.get(tabId);
+    if (sdk) {
+      if (!out.sessionId) out.sessionId = sdk.sessionId || null;
+      if (!out.projectPath) out.projectPath = sdk.cwd || null;
+    }
+    if (projectId && projectManager?.db?.db) {
+      // Direct one-row lookup — getProjectById() also hydrates all tabs +
+      // global commands, far more than the name/path we need per turn-start.
+      try {
+        const proj = projectManager.db.db.prepare(
+          'SELECT name, path FROM projects WHERE id = ? LIMIT 1'
+        ).get(projectId);
+        if (proj) {
+          out.projectName = proj.name || null;
+          if (!out.projectPath) out.projectPath = proj.path || null;
+        }
+      } catch {}
+    }
+    if (!out.projectPath) out.projectPath = terminalProjects.get(tabId) || null;
+  } catch (e) {
+    console.error('[Activity] identity resolve failed:', e.message);
+  }
+  return out;
+}
+
+function recordActivity(tabId, busy, engine) {
+  if (!tabId) return;
+  const open = activityOpenIntervals.get(tabId);
+  if (busy) {
+    if (open) return; // already open \u2014 no-op (idempotent)
+    const id = resolveActivityIdentity(tabId, engine);
+    activityOpenIntervals.set(tabId, { startTs: Date.now(), ...id });
+  } else {
+    if (!open) return; // wasn't open \u2014 no-op
+    activityOpenIntervals.delete(tabId);
+    const endTs = Date.now();
+    // Engine may be known only at close-time (e.g. forwarder); prefer the
+    // engine captured at open, fall back to the close-time hint.
+    if (engine && !open.engine) open.engine = engine;
+    try {
+      projectManager?.db?.saveActivityInterval({
+        tabId,
+        projectId: open.projectId,
+        projectPath: open.projectPath,
+        projectName: open.projectName,
+        tabName: open.tabName,
+        engine: open.engine,
+        sessionId: open.sessionId,
+        startTs: open.startTs,
+        endTs,
+      });
+    } catch (e) {
+      console.error('[Activity] save failed:', e.message);
+    }
+  }
+}
+
+// Persist every currently-open interval, truncated at now. Called on app quit
+// so in-flight turns aren't lost. Closes each via recordActivity(false) which
+// drains activityOpenIntervals as it goes.
+function flushOpenActivityIntervals() {
+  const openTabs = Array.from(activityOpenIntervals.keys());
+  for (const tabId of openTabs) recordActivity(tabId, false);
+  if (openTabs.length) console.log('[Activity] flushed ' + openTabs.length + ' open interval(s) on quit');
+}
 
 // ========== SUB-AGENT INTERCEPTOR STATE ==========
 // Controls whether Claude sub-agent responses are auto-delivered to Gemini.
@@ -705,6 +816,16 @@ function startSessionBridge() {
           const known = bridgeKnownSessions.get(tabId);
           if (known !== data.session_id) {
             console.warn('[Bridge:CwdGuard] Skip overwrite: tab cwd=' + tabCwd + ' but bridge cwd=' + data.cwd + ' (sid=' + data.session_id.substring(0, 8) + '...) — paths unrelated');
+            // Renderer-side persistence still fires. CwdGuard's job is to prevent
+            // `terminalProjects.set` and `bridgeKnownSessions.set` (those are the
+            // takeover vectors — see fix-bridge-stale-takeover.md). But the *renderer*
+            // needs sessionId to land in Tab.claudeSessionId or the tab forgets its
+            // session across app restart. PID resolution already proved this PTY's
+            // shell parents the live Claude → safe to tell renderer. We just don't
+            // mutate main-side caches.
+            if (mainWindow && !mainWindow.isDestroyed()) {
+              mainWindow.webContents.send('claude:session-detected', { tabId, sessionId: data.session_id });
+            }
           }
           return;
         }
@@ -932,6 +1053,7 @@ function startInterruptWatcher(tabId, sessionId) {
           claudeSpinnerBusy.set(tabId, false);
           clearTimeout(claudeTurnWatchdog.get(tabId));
           claudeTurnWatchdog.delete(tabId);
+          recordActivity(tabId, false, 'claude');
           if (mainWindow && !mainWindow.isDestroyed()) {
             mainWindow.webContents.send('claude:busy-state', { tabId, busy: false });
             mainWindow.webContents.send('claude:turn-state', {
@@ -1014,6 +1136,7 @@ function armInterruptIdleProbe(tabId) {
     claudeSpinnerBusy.set(tabId, false);
     clearTimeout(claudeTurnWatchdog.get(tabId));
     claudeTurnWatchdog.delete(tabId);
+    recordActivity(tabId, false, 'claude');
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('claude:busy-state', { tabId, busy: false });
       mainWindow.webContents.send('claude:turn-state', {
@@ -1082,7 +1205,20 @@ function startClaudeHookServer() {
             clearTimeout(pending.timer);
             grabInputPending.delete(tabId);
             const images = (text.match(/\[Image(?:\s+#?\d+)?\]/g) || []).length;
-            pending.resolve({ success: true, text, images, mode });
+            // Resolve [Image #N] placeholders → real files under
+            // ~/.claude/image-cache/<sessionId>/. Logged regardless of UI use so a
+            // missing file surfaces here (helps when Claude was restarted between
+            // paste and grab — image-cache for the OLD sessionId is left on disk
+            // but won't be touched by cleanupOldImageCaches until next boot).
+            let imagePaths = [];
+            if (images > 0) {
+              const sid = bridgeKnownSessions.get(tabId) || null;
+              const resolved = resolveGrabbedImagePaths(sid, text);
+              imagePaths = resolved.filter(r => !r.missing).map(r => ({ id: r.id, path: r.path, mediaType: r.mediaType, size: r.size }));
+              const summary = resolved.map(r => r.missing ? ('#' + r.id + ':MISSING') : ('#' + r.id + ':' + (r.size / 1024).toFixed(1) + 'KB')).join(',');
+              console.log('[GrabImages] tab=' + tabId.slice(-12) + ' sessionId=' + (sid ? sid.slice(0, 8) : 'none') + ' refs=' + images + ' resolved=[' + summary + ']');
+            }
+            pending.resolve({ success: true, text, images, imagePaths, mode });
           }
           continue;
         }
@@ -1182,6 +1318,8 @@ function startClaudeHookServer() {
         if (prevSpinner !== busy && mainWindow && !mainWindow.isDestroyed()) {
           mainWindow.webContents.send('claude:busy-state', { tabId, busy });
         }
+        // Activity tracking — authoritative turn edges (idempotent recorder).
+        recordActivity(tabId, busy, 'claude');
 
         // Watchdog — if Stop never fires (silent tool stop bug #29881, hook script crash, etc.)
         // fall back to busy=false after CLAUDE_TURN_WATCHDOG_MS so the loader doesn't hang forever.
@@ -1200,6 +1338,7 @@ function startClaudeHookServer() {
             claudeTurnBusy.set(tabId, false);
             claudeSpinnerBusy.set(tabId, false);
             claudeTurnWatchdog.delete(tabId);
+            recordActivity(tabId, false, 'claude');
             if (mainWindow && !mainWindow.isDestroyed()) {
               mainWindow.webContents.send('claude:busy-state', { tabId, busy: false });
             }
@@ -1606,6 +1745,26 @@ function createWindow() {
 
   mainWindow = new BrowserWindow(windowOptions);
   console.log('[Window] BrowserWindow created');
+
+  // Cmd+Tab focus restore: when macOS re-fronts our window via Cmd+Tab,
+  // Chromium does NOT auto-restore DOM focus to any element. Side-effect:
+  // the next Cmd+V from a paste-source app (e.g. Voice Record dictation
+  // overlay) is swallowed because no focused input/terminal receives the
+  // key event — AXFocusedUIElement returns -25212 / kAXErrorNoValue.
+  // Tab-switching inside the app works because that codepath explicitly
+  // re-focuses (terminalRegistry.get(tabId).focus / textareaRef.focus),
+  // but window-level focus has no such hook.
+  //
+  // Fix: on every BrowserWindow 'focus' event, broadcast a window-event to
+  // the renderer; per-tab components (Terminal.tsx, ClaudeSDKTab.tsx)
+  // listen and refocus their own DOM element via the same path they use
+  // for tab switching.
+  mainWindow.on('focus', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      console.log('[Window:Focus] browser-window focus → broadcast window:refocus-active');
+      mainWindow.webContents.send('window:refocus-active');
+    }
+  });
 
   // Show window when ready and force focus on macOS (Sequoia/Tahoe workaround)
   mainWindow.once('ready-to-show', () => {
@@ -3893,6 +4052,10 @@ function startMcpHttpServer() {
   mcpHttpServer.listen(0, '127.0.0.1', () => {
     mcpHttpPort = mcpHttpServer.address().port;
     console.log('[MCP:HTTP] Server listening on 127.0.0.1:' + mcpHttpPort);
+    // Cross-reference marker for [JsonlChainDiag:ChainBreak]: when this line
+    // appears within a few seconds BEFORE a chain break, the orphan is almost
+    // certainly mcp_instructions_delta caused by our own MCP server (re)start.
+    console.log('[McpReconnect] terminal-mcp listening on port ' + mcpHttpPort + ' (pid=' + process.pid + ') — any active Claude session may now write attachment[mcp_instructions_delta]');
 
     // Write port to PID-specific file so MCP server can discover it
     try { fs.mkdirSync(MCP_PORT_DIR, { recursive: true }); } catch {}
@@ -4002,6 +4165,7 @@ function stopMcpHttpServer() {
   }
   try { fs.unlinkSync(MCP_PORT_FILE); } catch {}
   console.log('[MCP:HTTP] Server stopped, port file removed');
+  console.log('[McpReconnect] terminal-mcp STOPPED (pid=' + process.pid + ') — on next start active Claude sessions will write attachment[mcp_instructions_delta]');
 }
 
 // Adopt an existing Claude tab as a sub-agent: set parent, summarize via API, deliver context to Gemini
@@ -4504,6 +4668,17 @@ async function continueClaudeSubAgent(taskId, prompt, ppid) {
     // Restore subAgentParentTab mapping
     if (geminiTabId) {
       subAgentParentTab.set(claudeTabId, geminiTabId);
+    }
+
+    // Repair any dangling parentUuid in the JSONL before resume — Claude CLI
+    // backtrace stops at the first orphan and only renders entries AFTER it.
+    try {
+      const repairResult = await repairJsonlChainBreaks(claudeSessionId, respawnCwd);
+      if (repairResult.repaired > 0) {
+        console.log('[MCP:Continue] Pre-resume JSONL repair: fixed ' + repairResult.repaired + ' dangling parentUuid');
+      }
+    } catch (e) {
+      console.warn('[MCP:Continue] JSONL repair failed (non-fatal):', e.message);
     }
 
     // Launch claude --resume and use handshake to send prompt
@@ -5441,6 +5616,28 @@ app.whenReady().then(() => {
   console.log('[Startup] Setting up shell integration...');
   setupShellIntegration();
 
+  // Hydrate per-tab provider state Map from SQLite BEFORE any tab spawns.
+  // Without this, first Claude request from a restored tab would hit the
+  // fallback `{type:'anthropic'}` default in providerStates Map, ignoring
+  // the DeepSeek/Zen selection the user made last session. The proxy reads
+  // this Map synchronously on every request — needs to be populated before
+  // any AutoResume/Continue path fires `claude --resume` in PTY env.
+  try {
+    const rows = projectManager.db.getAllTabProviderStates();
+    let hydrated = 0;
+    for (const r of rows) {
+      if (!r.tab_id || !r.provider_state) continue;
+      try {
+        const state = JSON.parse(r.provider_state);
+        providerStates.set(r.tab_id, state);
+        hydrated++;
+      } catch { /* corrupt row, skip */ }
+    }
+    console.log('[Startup] Hydrated providerStates: ' + hydrated + ' tab(s)');
+  } catch (e) {
+    console.warn('[Startup] providerStates hydration failed:', e.message);
+  }
+
   // Initialize session manager with database from project manager
   console.log('[Startup] Initializing SessionManager...');
   try {
@@ -5523,7 +5720,12 @@ app.whenReady().then(() => {
       try {
         const info = webServer.getInfo();
         if (!info.running) return { ok: false, error: 'web-server not running' };
-        const url = `http://${info.lanIp}:${info.port}/?token=${encodeURIComponent(info.token)}`;
+        // Prod (port 7878) → публичный URL через VPS-туннель.
+        // Dev и любой другой порт → локальный LAN-IP.
+        const isProd = info.port === 7878;
+        const url = isProd
+          ? `https://remote-control.f9922.tech/?token=${encodeURIComponent(info.token)}`
+          : `http://${info.lanIp}:${info.port}/?token=${encodeURIComponent(info.token)}`;
         require('electron').shell.openExternal(url);
         return { ok: true };
       } catch (e) {
@@ -5558,6 +5760,59 @@ app.whenReady().then(() => {
   console.log('[Startup] Calling createWindow()...');
   createWindow();
   console.log('[Startup] createWindow() returned');
+
+  // Boot-time JSONL auto-repair: scan recent session files, physically rewrite
+  // any dangling parentUuid (slash-command orphans, attachment virtual parents,
+  // mid-stream proxy crashes). This prevents the toast storm where each tab's
+  // Timeline polls discover the same accumulated breaks and fire warning
+  // notifications. After repair, recovery only triggers for genuinely NEW
+  // breaks — i.e. things that happen during the running session.
+  //
+  // Run in background — must not block window creation.
+  setTimeout(async () => {
+    try {
+      const projectsRoot = path.join(require('os').homedir(), '.claude', 'projects');
+      if (!fs.existsSync(projectsRoot)) return;
+      const projects = fs.readdirSync(projectsRoot);
+      let scanned = 0, repaired = 0, sessionsFixed = 0;
+      const cutoff = Date.now() - 14 * 24 * 60 * 60 * 1000; // 14 days
+      for (const proj of projects) {
+        const projDir = path.join(projectsRoot, proj);
+        let entries;
+        try { entries = fs.readdirSync(projDir); } catch { continue; }
+        for (const f of entries) {
+          if (!f.endsWith('.jsonl')) continue;
+          const full = path.join(projDir, f);
+          let stat;
+          try { stat = fs.statSync(full); } catch { continue; }
+          if (stat.mtimeMs < cutoff) continue;
+          scanned++;
+          const sid = f.replace(/\.jsonl$/, '');
+          try {
+            const res = await repairJsonlChainBreaks(sid, projDir);
+            if (res.repaired > 0) {
+              repaired += res.repaired;
+              sessionsFixed++;
+            }
+          } catch (e) {
+            console.warn('[Startup:AutoRepair] err on ' + sid + ':', e.message);
+          }
+        }
+      }
+      console.log('[Startup:AutoRepair] DONE pid=' + process.pid + ' scanned=' + scanned + ' sessionsFixed=' + sessionsFixed + ' totalDanglingRepaired=' + repaired + ' — every individual repair logged above with [JsonlAutoRepair] (grep "JsonlAutoRepair\\|JsonlChainDiag\\|McpReconnect" for full forensic view)');
+      // Notify renderer so user sees what was healed in the background.
+      // Skip when nothing was repaired (silent boot path).
+      if (sessionsFixed > 0 && mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('jsonl-auto-repair:summary', {
+          sessionsFixed,
+          totalRepaired: repaired,
+          scanned,
+        });
+      }
+    } catch (e) {
+      console.warn('[Startup:AutoRepair] sweep failed:', e.message);
+    }
+  }, 3000);
 });
 
 // Interrupted session management: SINGLE source of truth in main process.
@@ -5569,9 +5824,100 @@ app.whenReady().then(() => {
 //
 // before-quit: safety net — runs first, marks known sessions.
 // will-quit: definitive — runs AFTER beforeunload, clears stale + marks active.
-app.on('before-quit', async () => {
+//
+// CRITICAL: Electron does NOT await async before-quit handlers by default.
+// Without event.preventDefault(), Electron continues teardown in parallel —
+// our Ctrl+C polling races against renderer destruction and PTY SIGHUP,
+// almost always losing. We use the standard pattern:
+//   1. First entry: preventDefault, do the work, then app.quit() again.
+//   2. Re-entry guard skips the handler on the second pass so app.quit()
+//      really exits.
+// See methodology/design.md::Graceful exit через Ctrl+C, не SIGTERM первым.
+let _gracefulShutdownInProgress = false;
+let _gracefulShutdownDone = false;
+
+app.on('before-quit', async (event) => {
+  if (_gracefulShutdownDone) return;          // second pass — let Electron quit
+  if (_gracefulShutdownInProgress) {           // user mashed ⌘Q during shutdown
+    event.preventDefault();
+    return;
+  }
+  _gracefulShutdownInProgress = true;
+  event.preventDefault();
+
+  // Persist any still-open activity intervals (truncated at quit time) so a
+  // turn that was in flight at shutdown isn't lost from the activity log.
+  try { flushOpenActivityIntervals(); } catch (e) {
+    console.error('[Activity] flush on quit failed:', e.message);
+  }
+
+  // Tell renderer to show "Останавливаю Claude…" overlay
+  try {
+    const tabsCount = Array.from(terminals.entries())
+      .filter(([tabId]) => bridgeKnownSessions.has(tabId)).length;
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('shutdown:overlay', { show: true, tabsCount });
+    }
+  } catch {}
+
   // Drain active proxy connections before killing terminals
-  await proxyGracefulShutdown();
+  try { await proxyGracefulShutdown(); } catch (e) {
+    console.error('[Shutdown] proxyGracefulShutdown error:', e.message);
+  }
+
+  // Graceful Ctrl+C to every live claude CLI BEFORE PTY kill. Direct term.kill()
+  // delivers SIGHUP, which bypasses Ink TUI and cancels any in-flight SSE chunk
+  // → orphan parentUuid on next resume. Sending \x03 lets Claude flush the
+  // current assistant entry to JSONL and exit cleanly. Concurrent fan-out:
+  // ps lookups + Ctrl+C all start in parallel, then Promise.all with 1.5s
+  // deadline so we don't hang shutdown when claude refuses to exit.
+  // See fix-claude-busy-detection.md::Manual Stop and JsonlChainDiag traces.
+  try {
+    const tabs = Array.from(terminals.entries()).filter(([tabId]) => bridgeKnownSessions.has(tabId));
+    if (tabs.length > 0) {
+      console.log('[Shutdown:GracefulCtrlC] Sending Ctrl+C to ' + tabs.length + ' live claude tab(s) before kill');
+      await Promise.race([
+        Promise.all(tabs.map(async ([tabId, term]) => {
+          let childPid = null;
+          try {
+            const psOut = await execAsync('ps -eo pid,ppid,command | grep -E " (claude|gemini)( |$)" | grep -v grep', 1500);
+            for (const line of (psOut || '').split('\n').filter(Boolean)) {
+              const m = line.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/);
+              if (!m) continue;
+              const [, pid, ppid, cmd] = m;
+              if (cmd.includes('Electron') || cmd.includes('electron')) continue;
+              if (Number(ppid) === term.pid) { childPid = Number(pid); break; }
+            }
+          } catch {}
+          if (!childPid) return;
+          const sid = bridgeKnownSessions.get(tabId);
+          console.log('[Shutdown:GracefulCtrlC] tabId=' + tabId.slice(-12) + ' childPid=' + childPid + ' sessionId=' + (sid ? sid.substring(0, 8) : 'none') + ' — \\x03 → waiting for graceful exit');
+          try { term.write('\x03'); } catch (err) { console.log('[Shutdown:GracefulCtrlC] write failed: ' + err.message); }
+          // Poll until process is gone or 1200ms passes.
+          await new Promise((resolve) => {
+            const start = Date.now();
+            const poll = () => {
+              try {
+                process.kill(childPid, 0);
+                if (Date.now() - start >= 1200) {
+                  console.log('[Shutdown:GracefulCtrlC] tabId=' + tabId.slice(-12) + ' childPid=' + childPid + ' — did NOT exit in 1200ms, term.kill() will SIGHUP it');
+                  return resolve();
+                }
+                setTimeout(poll, 60);
+              } catch {
+                console.log('[Shutdown:GracefulCtrlC] tabId=' + tabId.slice(-12) + ' childPid=' + childPid + ' — exited cleanly in ' + (Date.now() - start) + 'ms');
+                resolve();
+              }
+            };
+            setTimeout(poll, 60);
+          });
+        })),
+        new Promise((resolve) => setTimeout(resolve, 1500)),
+      ]);
+    }
+  } catch (e) {
+    console.error('[Shutdown:GracefulCtrlC] error:', e.message);
+  }
 
   try {
     if (projectManager?.db?.db) {
@@ -5588,6 +5934,11 @@ app.on('before-quit', async () => {
   } catch (e) {
     console.error('[Shutdown] before-quit error:', e.message);
   }
+
+  // All graceful work done. Re-trigger quit; the guard above will let it pass.
+  console.log('[Shutdown:GracefulCtrlC] graceful flow complete, calling app.quit()');
+  _gracefulShutdownDone = true;
+  app.quit();
 });
 
 app.on('will-quit', () => {
@@ -5644,8 +5995,15 @@ app.on('window-all-closed', () => {
   // Cleanup MCP HTTP server
   stopMcpHttpServer();
 
-  // Kill all terminals
+  // Kill all terminals. By this point before-quit has already sent Ctrl+C to
+  // every live claude and waited up to 1.2s for graceful exit, so most claudes
+  // are already dead and term.kill() here just reaps the shell. If a claude
+  // still ignored Ctrl+C — term.kill() delivers SIGHUP as a last resort and
+  // this trace will flag it for post-mortem.
   for (const [tabId, term] of terminals) {
+    const sid = bridgeKnownSessions.get(tabId) || null;
+    const busy = claudeTurnBusy.get(tabId) === true || claudeSpinnerBusy.get(tabId) === true;
+    console.error('[JsonlChainDiag:WindowAllClosed] tabId=' + tabId + ' shellPid=' + term.pid + ' sessionId=' + (sid ? sid.substring(0, 8) : 'none') + ' busy=' + busy + ' — calling term.kill() (Ctrl+C in before-quit already attempted; SIGHUP here only matters if claude ignored it)');
     term.kill();
   }
   if (process.platform !== 'darwin') {
@@ -6340,6 +6698,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
               // Gemini became busy → user submitted input → reset char counter
               updateGeminiCharCount(tabId, 0, 'Gemini BUSY');
               console.log('[GeminiSpinner] Tab ' + tabId + ': THINKING');
+              recordActivity(tabId, true, 'gemini');
               if (mainWindow && !mainWindow.isDestroyed()) {
                 mainWindow.webContents.send('gemini:busy-state', { tabId, busy: true });
               }
@@ -6351,6 +6710,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
               geminiSpinnerBusy.set(tabId, false);
               geminiSpinnerIdleTimers.delete(tabId);
               console.log('[GeminiSpinner] Tab ' + tabId + ': IDLE (response complete)');
+              recordActivity(tabId, false, 'gemini');
               if (mainWindow && !mainWindow.isDestroyed()) {
                 mainWindow.webContents.send('gemini:busy-state', { tabId, busy: false });
               }
@@ -6455,6 +6815,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
             claudeSpinnerBusy.set(tabId, false);
             claudeSpinnerIdleTimer.delete(tabId);
             console.log('[Spinner] Tab ' + tabId + ': IDLE');
+            recordActivity(tabId, false, 'claude');
             if (mainWindow && !mainWindow.isDestroyed()) {
               mainWindow.webContents.send('claude:busy-state', { tabId, busy: false });
             }
@@ -6489,6 +6850,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
           if (!claudeSpinnerBusy.get(tabId)) {
             claudeSpinnerBusy.set(tabId, true);
             console.log('[Spinner] Tab ' + tabId + ': BUSY');
+            recordActivity(tabId, true, 'claude');
             if (mainWindow && !mainWindow.isDestroyed()) {
               mainWindow.webContents.send('claude:busy-state', { tabId, busy: true });
             }
@@ -6507,7 +6869,15 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
     });
 
     ptyProcess.onExit((exitCode) => {
+      // [JsonlChainDiag] PTY shell death — if Claude was streaming an assistant turn at
+      // this moment, the in-flight assistant JSONL entry is lost. Surface session state
+      // so we can correlate later breaks with this exit point.
+      const _diagSid = bridgeKnownSessions.get(tabId) || null;
+      const _diagBusy = claudeTurnBusy.get(tabId) === true || claudeSpinnerBusy.get(tabId) === true;
+      const _diagSpinBusy = claudeSpinnerBusy.get(tabId) === true;
+      const _diagTurnBusy = claudeTurnBusy.get(tabId) === true;
       console.error(`[PTY:EXIT] tabId=${tabId} pid=${ptyProcess.pid} exitCode=${JSON.stringify(exitCode)} cwd=${workingDir} shell=${shell} args=${JSON.stringify(shellArgs)}`);
+      console.error(`[JsonlChainDiag:PtyExit] tabId=${tabId} shellPid=${ptyProcess.pid} sessionId=${_diagSid ? _diagSid.substring(0, 8) : 'none'} spinnerBusy=${_diagSpinBusy} turnBusy=${_diagTurnBusy} ${_diagBusy ? '*** EXITED MID-TURN — likely JSONL chain break next user prompt ***' : '(idle, safe)'}`);
       if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.webContents.send('terminal:exit', tabId, exitCode);
       }
@@ -6529,6 +6899,9 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
       geminiActiveTabs.delete(tabId);
       geminiInputCharCount.delete(tabId);
       geminiResponseQueue.delete(tabId);
+      // Close any open activity interval on PTY death (idempotent — covers
+      // whichever engine, claude or gemini, was mid-turn when the shell died).
+      recordActivity(tabId, false);
       // Claude spinner cleanup on PTY exit
       clearTimeout(claudeSpinnerIdleTimer.get(tabId));
       clearTimeout(subAgentDeferredCheck.get(tabId));
@@ -6713,6 +7086,41 @@ function waitForPtyText(term, textOrRegex, timeoutMs = 5000, logPrefix = '') {
   });
 }
 
+// Stash-detect helper. Claude TUI's chat:stash binding is bi-directional:
+//   - input has text + no existing stash  → Ctrl+S pushes input to stash, clears input
+//   - input is empty + existing stash     → Ctrl+S pops stash BACK INTO the input
+//   - input has text + existing stash     → Ctrl+S OVERWRITES stash with new text,
+//                                           dropping what the user had saved
+// We render "› Stashed (auto-restores after submit)" under the input whenever a
+// stash exists. Detect that line in the recent PTY output and skip our own
+// Ctrl+S — sending it would corrupt the user's already-saved draft (cases 2 + 3
+// above). Caller still wants the rest of safePasteAndSubmit (paste + submit) to
+// run normally — the existing stash will auto-restore after our slash-cmd
+// submits, which is exactly the same outcome as the happy path.
+//
+// Three known gotchas with the matching strategy (see fact-claude-tui-control.md
+// "Ink TUI: пробелы как ANSI-команды, текст разорван по чанкам"):
+//   1. Ink emits spaces inside its bottom status row as `\x1b[<N>C` (cursor-
+//      forward), so after stripVTControlCharacters the literal becomes
+//      "Stashed(auto-restoresaftersubmit)" without spaces.
+//   2. PTY data arrives in 3-5 chunks for a single Ink re-render; split('\n')
+//      can land the marker across two ring-buffer entries.
+//   3. Long assistant streams push the marker out of any small tail window;
+//      the marker doesn't get re-rendered until input-box refreshes.
+// Mitigations: join the entire ring buffer (capped at 500 lines = bounded
+// work), strip ONCE on the joined string, then match a tolerant regex that
+// accepts zero-or-more whitespace between tokens. The marker is unique enough
+// in PTY output that false positives are not a realistic concern.
+const STASH_MARKER_RE = /Stashed\s*\(\s*auto-restores\s*after\s*submit\s*\)/;
+function hasStashedMarker(tabId) {
+  if (!tabId) return false;
+  const buf = terminalOutputBuffer.get(tabId);
+  if (!buf || !buf.lines || buf.lines.length === 0) return false;
+  const joined = buf.lines.join('\n');
+  const stripped = stripVTControlCharacters(joined);
+  return STASH_MARKER_RE.test(stripped);
+}
+
 // Main helper: chunked paste + sync marker verification + optional submit.
 // Wraps the actual work in a per-term promise chain so two concurrent callers
 // can't interleave bytes on the same PTY. See pasteInflight comment above.
@@ -6811,17 +7219,28 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
   // command — Esc + Enter still submits cleanly because slash-cmd takes the
   // whole input verbatim.
   if (stashFirst) {
-    console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] Sending Ctrl+S (stash)...');
-    term.write('\x13');
-    if (!fast) {
-      // 20ms drain just to let Ink ingest \x13 before our paste lands. If
-      // input had text, Ink renders "Stashed (auto-restores after submit)"
-      // ~40ms later — paste arrives after that render starts but Ink
-      // processes our bytes in order regardless. Larger drain hurts the
-      // empty-input case (Ctrl+S = no-op, no data, drain waits in vain).
-      await drainPtyData(term, 20);
+    // Skip Ctrl+S if Claude is already showing the "Stashed (auto-restores)"
+    // marker — sending another Ctrl+S in that state would either pop the saved
+    // stash back into the input (empty-input case) or overwrite it with the
+    // current input (non-empty case). Both destroy user-saved work. See
+    // hasStashedMarker() above for the marker scan + fact-claude-tui-control.md
+    // "Stash Flow" section for the bidirectional handleStash semantics.
+    const alreadyStashed = broadcastTabId ? hasStashedMarker(broadcastTabId) : false;
+    if (alreadyStashed) {
+      console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] Stash marker already present in PTY buffer → skip Ctrl+S (would corrupt existing stash)');
     } else {
-      await new Promise(r => setTimeout(r, 10));
+      console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] Sending Ctrl+S (stash)...');
+      term.write('\x13');
+      if (!fast) {
+        // 20ms drain just to let Ink ingest \x13 before our paste lands. If
+        // input had text, Ink renders "Stashed (auto-restores after submit)"
+        // ~40ms later — paste arrives after that render starts but Ink
+        // processes our bytes in order regardless. Larger drain hurts the
+        // empty-input case (Ctrl+S = no-op, no data, drain waits in vain).
+        await drainPtyData(term, 20);
+      } else {
+        await new Promise(r => setTimeout(r, 10));
+      }
     }
   }
 
@@ -7015,6 +7434,29 @@ ipcMain.on('terminal:input', async (event, tabId, data) => {
     return;
   }
 
+  // Anti-arrow-mash guard. Catches the failure mode where xterm.js emits a
+  // huge run of identical arrow escape codes (e.g. user's keyboard auto-repeat
+  // got stuck holding Left Arrow, a Magic Mouse fingerprint glitch, an OS
+  // accessibility helper, etc). On 2026-05-21 a 2265-byte burst of \x1b[D
+  // landed mid-Claude-turn, corrupted the JSONL, and forced a full session
+  // recovery. Real paste never looks like this — paste always contains
+  // printable chars; long key-hold never targets a Claude TUI prompt
+  // intentionally. Drop on the floor with a forensic log so we can audit.
+  //
+  // Criteria: data length >= 200 AND data is a uniform run of one of the
+  // 4 arrow escape sequences (\x1b[A/B/C/D). Conservative — won't trip on
+  // legitimate input.
+  if (data.length >= 200 && /^(\x1b\[[ABCD])\1{60,}$/.test(data)) {
+    const arrow = data.substring(0, 3);
+    const arrowName = { '\x1b[A': 'UP', '\x1b[B': 'DOWN', '\x1b[C': 'RIGHT', '\x1b[D': 'LEFT' }[arrow] || '?';
+    const count = Math.floor(data.length / 3);
+    console.error('[terminal:input] BLOCKED arrow-mash: tab=' + tabId + ' len=' + data.length + ' arrow=' + arrowName + ' count=' + count + ' — dropping (xterm.js stuck keyboard / accessibility helper / glitch)');
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('arrow-mash:blocked', { count, arrowName });
+    }
+    return;
+  }
+
   // Arm Claude Agent detector on first user input (prevents restore replay triggers)
   if (!claudeAgentArmed.get(tabId)) {
     claudeAgentArmed.set(tabId, true);
@@ -7167,6 +7609,19 @@ ipcMain.handle('claude:is-active', (event, tabId) => {
   return active;
 });
 
+// Repair dangling parentUuid in a JSONL file so `claude --resume` and the
+// history panel render full pre-orphan history. Called BEFORE writing
+// `claude --resume <sid>\r` to the PTY — see AutoResume in renderer/App.tsx.
+ipcMain.handle('claude:repair-jsonl-before-resume', async (event, { sessionId, cwd }) => {
+  if (!sessionId) return { success: false, error: 'sessionId required' };
+  try {
+    const result = await repairJsonlChainBreaks(sessionId, cwd);
+    return { success: true, ...result };
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+});
+
 // PromptQueue: grab the current Claude input via the chat:externalEditor flow.
 //
 // Flow:
@@ -7203,6 +7658,52 @@ async function readProcessEditor(pid) {
   } catch {
     return null;
   }
+}
+
+// Resolve [Image #N] placeholders in grabbed text to actual files on disk.
+//
+// HOW CLAUDE STORES PASTED IMAGES (from decompiled v2.x source — packages/claude-code-src/utils/imageStore.ts):
+//   1. Cmd+V image into PromptInput → onImagePaste(base64, mediaType) assigns numeric id (nextPasteIdRef++)
+//   2. Placeholder [Image #N] inserted at caret in the text input
+//   3. Background: storeImage() writes ~/.claude/image-cache/<sessionId>/<N>.<ext>
+//      where ext = mediaType.split('/')[1]  (png|jpeg|jpg|gif|webp|bmp), 0o600
+//   4. Files are NEVER deleted while the session is alive — pruning a [Image #N]
+//      from the input only removes the in-memory pastedContents entry, the file stays
+//   5. cleanupOldImageCaches() runs ONCE at Claude boot — wipes all session subdirs
+//      except the current sessionId
+//
+// Our external-editor grab gets the EXPANDED text (expandPastedTextRefs leaves image
+// refs as-is — only text refs are inlined). So the file extensions
+// noted-code-grab sends back contains literal "[Image #N]" tokens and the actual
+// images are still on disk under the current sessionId. We resolve N → filesystem
+// path by trying known extensions until one exists.
+function resolveGrabbedImagePaths(sessionId, text) {
+  if (!sessionId || !text) return [];
+  const ids = [];
+  const seen = new Set();
+  const re = /\[Image\s+#?(\d+)\]/g;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    const id = parseInt(m[1], 10);
+    if (!isNaN(id) && !seen.has(id)) { seen.add(id); ids.push(id); }
+  }
+  if (ids.length === 0) return [];
+  const baseDir = path.join(os.homedir(), '.claude', 'image-cache', sessionId);
+  const exts = ['png', 'jpeg', 'jpg', 'gif', 'webp', 'bmp'];
+  const mediaByExt = { png: 'image/png', jpeg: 'image/jpeg', jpg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', bmp: 'image/bmp' };
+  const resolved = [];
+  for (const id of ids) {
+    let hit = null;
+    for (const ext of exts) {
+      const p = path.join(baseDir, id + '.' + ext);
+      try {
+        const st = fs.statSync(p);
+        if (st.isFile()) { hit = { id, path: p, mediaType: mediaByExt[ext], size: st.size }; break; }
+      } catch {}
+    }
+    resolved.push(hit || { id, path: null, mediaType: null, size: 0, missing: true });
+  }
+  return resolved;
 }
 
 // Shared by claude:grab-input and claude:copy-input — both fire Ctrl+G after writing
@@ -7360,6 +7861,39 @@ ipcMain.handle('claude:send-command', async (event, tabId, command) => {
   });
 });
 
+// PromptQueue replay (▶ chip button): paste text into Claude's input WITHOUT
+// stashing the user's current draft and WITHOUT pressing Enter. Just appends
+// to whatever is already in the prompt — user reviews and submits manually.
+// Goes through safePasteAndSubmit so bracketed-paste + sync marker logic still
+// guarantees Ink ingests the chip atomically (no [Pasted text #N] fragments).
+ipcMain.handle('claude:append-input', async (event, tabId, text) => {
+  console.log('[append-input] 📩 Received: tabId=' + tabId + ' chars=' + (text || '').length + ' ts=' + Date.now());
+  const term = terminals.get(tabId);
+  if (!term) {
+    console.log('[append-input] ❌ Terminal not found for tabId=' + tabId);
+    return { success: false, error: 'no_terminal' };
+  }
+  if (!text || typeof text !== 'string') {
+    return { success: false, error: 'empty_text' };
+  }
+  // Hard refusal when Claude isn't running in this tab — overlay is gated by
+  // claudeProcessAlive but the IPC can race a Claude exit. Without this guard,
+  // bracketed paste lands in a bash/zsh prompt (modern zsh supports bracketed
+  // paste mode) → the chip text becomes one shell command-line. Chip starting
+  // with "rm -rf" / "sudo …" would execute on the user's machine. Refuse loud.
+  if (!claudeCliActive.get(tabId)) {
+    console.log('[append-input] ❌ Claude not active in tab ' + tabId + ' — refusing to paste into non-Claude PTY');
+    return { success: false, error: 'no_claude_session' };
+  }
+  const result = await safePasteAndSubmit(term, text, {
+    submit: false,
+    stashFirst: false, // never stash on replay — user wants append, not replace
+    ctrlCFirst: false,
+    logPrefix: '[append-input:' + tabId + ']'
+  });
+  return result;
+});
+
 // ========== Soniox temporary API key ==========
 // Mint a short-lived (5 min) key bound to websocket-transcribe usage. Renderer
 // uses this for dictation in Claude PTY/SDK tabs. Mobile-web has its own
@@ -7405,6 +7939,12 @@ ipcMain.handle('provider:switch', (event, opts) => {
     if (oldState.effort) next.effort = oldState.effort;
   }
   setProviderState(tabId, next);
+  // Persist to SQLite immediately (real tabs only — skip 'global' bucket which
+  // doesn't correspond to a DB row). DB write is synchronous via better-sqlite3,
+  // so the row is committed before the IPC handler returns.
+  if (tabId && projectManager?.db) {
+    projectManager.db.updateTabProviderState(tabId, next);
+  }
   console.log('[ProviderProxy] Switched[' + (tabId ? tabId.slice(-12) : 'global') + ']: ' + prev + ' → ' + JSON.stringify(next));
   broadcastProviderState(tabId, next);
   return next;
@@ -7423,6 +7963,9 @@ ipcMain.handle('provider:set-options', (event, opts) => {
   if (typeof opts?.thinking === 'string') cur.thinking = opts.thinking;
   if (typeof opts?.effort === 'string') cur.effort = opts.effort;
   setProviderState(tabId, cur);
+  if (tabId && projectManager?.db) {
+    projectManager.db.updateTabProviderState(tabId, cur);
+  }
   console.log('[ProviderProxy] Options[' + (tabId ? tabId.slice(-12) : 'global') + ']: ' + JSON.stringify(cur));
   broadcastProviderState(tabId, cur);
   return cur;
@@ -7864,9 +8407,49 @@ ipcMain.on('terminal:resize', (event, tabId, cols, rows) => {
 });
 
 // Kill terminal
-ipcMain.on('terminal:kill', (event, tabId) => {
+ipcMain.on('terminal:kill', async (event, tabId) => {
   const term = terminals.get(tabId);
   if (term) {
+    // Graceful Ctrl+C to live claude before SIGHUP via term.kill().
+    // Same reasoning as before-quit and terminal:stop-ai-process: term.kill()
+    // delivers SIGHUP through the PTY which propagates to children and
+    // bypasses Ink TUI, dropping any in-flight JSONL write. \x03 lets Claude
+    // flush the current assistant entry first.
+    if (bridgeKnownSessions.has(tabId)) {
+      let childPid = null;
+      try {
+        const psOut = await execAsync('ps -eo pid,ppid,command | grep -E " (claude|gemini)( |$)" | grep -v grep', 1500);
+        for (const line of (psOut || '').split('\n').filter(Boolean)) {
+          const m = line.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/);
+          if (!m) continue;
+          const [, pid, ppid, cmd] = m;
+          if (cmd.includes('Electron') || cmd.includes('electron')) continue;
+          if (Number(ppid) === term.pid) { childPid = Number(pid); break; }
+        }
+      } catch {}
+      if (childPid) {
+        const sid = bridgeKnownSessions.get(tabId);
+        console.log('[TerminalKill:GracefulCtrlC] tabId=' + tabId.slice(-12) + ' childPid=' + childPid + ' sessionId=' + (sid ? sid.substring(0, 8) : 'none') + ' — \\x03 → waiting for graceful exit');
+        try { term.write('\x03'); } catch (err) { console.log('[TerminalKill:GracefulCtrlC] write failed: ' + err.message); }
+        await new Promise((resolve) => {
+          const start = Date.now();
+          const poll = () => {
+            try {
+              process.kill(childPid, 0);
+              if (Date.now() - start >= 1200) {
+                console.log('[TerminalKill:GracefulCtrlC] tabId=' + tabId.slice(-12) + ' childPid=' + childPid + ' — did NOT exit in 1200ms, term.kill() will SIGHUP it');
+                return resolve();
+              }
+              setTimeout(poll, 60);
+            } catch {
+              console.log('[TerminalKill:GracefulCtrlC] tabId=' + tabId.slice(-12) + ' childPid=' + childPid + ' — exited cleanly in ' + (Date.now() - start) + 'ms');
+              resolve();
+            }
+          };
+          setTimeout(poll, 60);
+        });
+      }
+    }
     term.kill();
     terminals.delete(tabId);
   }
@@ -7877,6 +8460,8 @@ ipcMain.on('terminal:kill', (event, tabId) => {
   geminiActiveTabs.delete(tabId);
   geminiInputCharCount.delete(tabId);
   geminiResponseQueue.delete(tabId);
+  // Close any open activity interval on kill (idempotent, either engine).
+  recordActivity(tabId, false);
   // Claude spinner cleanup on kill
   clearTimeout(claudeSpinnerIdleTimer.get(tabId));
   clearTimeout(subAgentDeferredCheck.get(tabId));
@@ -8920,7 +9505,77 @@ ipcMain.handle('terminal:stop-ai-process', async (event, tabId) => {
     return { success: false, error: 'no AI process found' };
   }
 
-  console.log('[StopAI] Tab ' + tabId + ': SIGTERM → pid=' + childPid + ' (' + processName + ')');
+  const _diagStopSid = bridgeKnownSessions.get(tabId) || null;
+  const _diagStopBusy = claudeTurnBusy.get(tabId) === true || claudeSpinnerBusy.get(tabId) === true;
+
+  // Hoist stopBusyState (declared further below) up so the Ctrl+C graceful
+  // exit path can call it on success without referring to it before init.
+  const stopBusyState = () => {
+    clearTimeout(claudeSpinnerIdleTimer.get(tabId));
+    claudeSpinnerIdleTimer.delete(tabId);
+    clearTimeout(claudeTurnWatchdog.get(tabId));
+    claudeTurnWatchdog.delete(tabId);
+    const wasBusy = claudeSpinnerBusy.get(tabId) === true || claudeTurnBusy.get(tabId) === true;
+    claudeSpinnerBusy.set(tabId, false);
+    claudeTurnBusy.set(tabId, false);
+    claudeHookLastEvent.set(tabId, {
+      event: 'ManualStop',
+      ts: Date.now(),
+      sessionId: bridgeKnownSessions.get(tabId) || null,
+    });
+    recordActivity(tabId, false, 'claude');
+    if (wasBusy && mainWindow && !mainWindow.isDestroyed()) {
+      console.log('[StopAI] Tab ' + tabId + ': busy-state cleanup → false (manual Stop)');
+      mainWindow.webContents.send('claude:busy-state', { tabId, busy: false, reason: 'manual-stop' });
+      mainWindow.webContents.send('claude:turn-state', {
+        tabId,
+        sessionId: bridgeKnownSessions.get(tabId) || null,
+        event: 'ManualStop',
+        busy: false, success: false, lastAssistantMessage: null,
+      });
+    }
+    stopInterruptWatcher(tabId);
+  };
+
+  // Graceful Ctrl+C first — Ink (Claude Code TUI) listens for \x03 through its
+  // own keyboard handler and finishes the current SSE chunk + flushes the
+  // assistant entry to JSONL before exiting. Direct SIGTERM bypasses Ink and
+  // cancels the in-flight async stream mid-write → orphan parentUuid in the
+  // next session resume. See fix-claude-busy-detection.md::Manual Stop +
+  // [JsonlChainDiag:StopAI:SIGKILL] forensic note further below.
+  //
+  // Sequence: write \x03 → poll kill(0) up to 300ms → if dead, done. Otherwise
+  // fall through to the existing SIGTERM→800ms→SIGKILL escalation.
+  console.log('[StopAI] Tab ' + tabId + ': Ctrl+C → pid=' + childPid + ' (' + processName + ')');
+  console.log('[JsonlChainDiag:StopAI] tabId=' + tabId + ' childPid=' + childPid + ' processName=' + processName + ' sessionId=' + (_diagStopSid ? _diagStopSid.substring(0, 8) : 'none') + ' busy=' + _diagStopBusy + ' — manual Stop button click via UI; sending \\x03 first');
+  try {
+    term.write('\x03');
+  } catch (err) {
+    console.log('[StopAI] Ctrl+C write failed: ' + err.message + ' — falling through to SIGTERM');
+  }
+
+  // Give Claude up to 300ms to react to Ctrl+C and exit gracefully.
+  const ctrlCExited = await new Promise((resolve) => {
+    const start = Date.now();
+    const poll = () => {
+      try {
+        process.kill(childPid, 0);
+        if (Date.now() - start >= 300) return resolve(false);
+        setTimeout(poll, 40);
+      } catch {
+        resolve(true); // process gone
+      }
+    };
+    setTimeout(poll, 40);
+  });
+
+  if (ctrlCExited) {
+    console.log('[StopAI] Tab ' + tabId + ': ' + processName + ' exited gracefully via Ctrl+C');
+    stopBusyState();
+    return { success: true, processName, escalated: false, graceful: 'ctrl-c' };
+  }
+
+  console.log('[StopAI] Tab ' + tabId + ': SIGTERM → pid=' + childPid + ' (Ctrl+C ignored 300ms)');
   try {
     process.kill(childPid, 'SIGTERM');
   } catch (err) {
@@ -8928,6 +9583,7 @@ ipcMain.handle('terminal:stop-ai-process', async (event, tabId) => {
     return { success: false, error: err.message };
   }
 
+  // stopBusyState declared above (hoisted) so the Ctrl+C path can call it.
   // Verify exit within 800ms. If still alive, SIGKILL.
   return new Promise((resolve) => {
     const start = Date.now();
@@ -8936,7 +9592,9 @@ ipcMain.handle('terminal:stop-ai-process', async (event, tabId) => {
         process.kill(childPid, 0); // signal 0 = alive check
         if (Date.now() - start >= 800) {
           console.log('[StopAI] Tab ' + tabId + ': SIGTERM stalled, SIGKILL pid=' + childPid);
+          console.log('[JsonlChainDiag:StopAI:SIGKILL] tabId=' + tabId + ' childPid=' + childPid + ' — SIGTERM ignored 800ms, escalating to SIGKILL — JSONL flush GUARANTEED lost for in-flight write');
           try { process.kill(childPid, 'SIGKILL'); } catch {}
+          stopBusyState();
           resolve({ success: true, processName, escalated: true });
           return;
         }
@@ -8944,6 +9602,7 @@ ipcMain.handle('terminal:stop-ai-process', async (event, tabId) => {
       } catch {
         // ESRCH = process gone
         console.log('[StopAI] Tab ' + tabId + ': ' + processName + ' exited cleanly in ' + (Date.now() - start) + 'ms');
+        stopBusyState();
         resolve({ success: true, processName, escalated: false });
       }
     };
@@ -9176,15 +9835,32 @@ require(path.join(srcMainDir, 'ipc', 'claude-data')).register({ projectManager, 
 // semantic-index:watch, semantic-index:rebuild, semantic-index:status → ipc/semantic-index-status.js
 require(path.join(srcMainDir, 'ipc', 'semantic-index-status')).register({ getMainWindow: () => mainWindow });
 
-// global-dict:* → src/main/global-dictation/index.js
-// System-wide voice dictation (Cmd+`) — owns two overlay windows (chip+rec)
-// and pastes the transcript into whatever app currently has focus.
-try {
-  const globalDict = require(path.join(srcMainDir, 'global-dictation'));
-  globalDict.init({ getMainWindow: () => mainWindow });
-} catch (e) {
-  console.error('[GlobalDict] init failed:', e.message);
-}
+// mirror:watch, mirror:set-enabled, mirror:get-status → ipc/claude-md-mirror.js
+// Syncs CLAUDE.md → AGENTS.md/GEMINI.md per-project. Watcher always runs (so the
+// Settings panel has fresh status); writes only happen when the global tggle is ON.
+require(path.join(srcMainDir, 'ipc', 'claude-md-mirror')).register({ getMainWindow: () => mainWindow, projectManager });
+
+// claude-usage:get / claude-usage:daily-history → ipc/claude-usage.js
+// (weekly/5h limits from Anthropic OAuth + SQLite-persisted daily history)
+require(path.join(srcMainDir, 'ipc', 'claude-usage')).register({ projectManager });
+
+// claude-tokens:summary → ipc/claude-tokens.js (per-tab usage from JSONL on disk)
+require(path.join(srcMainDir, 'ipc', 'claude-tokens')).register({
+  claudeData: require(path.join(srcMainDir, 'ipc', 'claude-data')),
+});
+
+// Global Dictation (system-wide chip + overlay + hotkey) extracted to a
+// separate Electron app — Voice Record (~/Desktop/voice-record, installed
+// to /Applications/Voice Record.app). See docs/GLOBAL-DICTATION-POSTMORTEM.md
+// for why it had to be a separate app (LSUIElement=true + accessory
+// activation policy is the only way to stop AppKit from promoting our
+// process to frontmost on overlay open/close).
+//
+// In-tab dictation (MicButton in ClaudeControlBar / Composer) is unaffected
+// — it lives in src/renderer/utils/dictation.ts and uses the existing
+// `soniox:mint-token` IPC handler below. Voice Record shares the same
+// SONIOX_API_KEY (~/.noted-terminal/.env) and the same settings/history
+// directory (~/.noted-terminal/global-dictation/).
 
 
 
@@ -10805,6 +11481,9 @@ ipcMain.handle('claude-sdk:send-message', async (event, { tabId, cwd, prompt, mo
 
 // Forward SDK busy state to TabBar via existing claude:busy-state channel
 ipcMain.on('claude-sdk:busy-state', (event, { tabId, busy }) => {
+  // Activity tracking — for SDK tabs this is the ONLY busy signal (no PTY,
+  // no spinner heuristic, no Stop hook). Idempotent recorder.
+  recordActivity(tabId, busy, 'claude-sdk');
   const win = BrowserWindow.getAllWindows()[0];
   if (win && !win.isDestroyed()) {
     win.webContents.send('claude:busy-state', { tabId, busy });

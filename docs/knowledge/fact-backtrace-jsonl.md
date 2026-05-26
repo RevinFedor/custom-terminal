@@ -83,6 +83,37 @@ Compact — не единственная причина «дыр» в цепо�
 ### Invisible Intent
 Этот recovery покрывает любые причины «дыр»: proxy crash, потеря данных при записи, corrupt JSONL. В отличие от Compact Recovery (Level 1/2), который привязан к `compact_boundary` subtype, generic recovery срабатывает для **любого** типа записи с отсутствующим parentUuid. Аналогичная логика добавлена в backtrace внутри `claude:edit-range` handler (использует inline `fileIndexMap`).
 
+Каждый успешный recovery поднимает `claudeMemoryBoundaryUuid` — uuid последнего entry в pre-orphan tail. Renderer использует его чтобы пометить зону до boundary красным фоном (`isChainBreakZone` в `Timeline.tsx`/`HistoryPanel.tsx`). Этот красный канал работает **параллельно** старому `isOldHistory` (всё до compact) и **независимо от наличия compact** в сессии — orphan может появиться в любой момент работы (kill mid-stream, Esc на резком rewind, resume-time RAM-state desync) без какого-либо `/compact`. Toast policy: один persistent warning на каждый новый boundary UUID (keyed by uuid, не sessionId — второй/третий orphan в той же сессии тоже триггерит свежий toast). См. [`fact-timeline.md::Chain-break zone`](fact-timeline.md).
+
+---
+
+## 2.3. Compact Passthrough (dead-end `logicalParentUuid`)
+
+### Проблема
+В некоторых сессиях `compact_boundary` имеет `parentUuid: null` и `logicalParentUuid` указывающий **в уже посещённый** post-compact узел (или в phantom UUID). Backtrace выходит на compact, пытается прыгнуть через `logicalParentUuid` — но это либо `seen.has(...)`, либо `!recordMap.has(...)`. Level 1/2 recovery (секция 2) **не срабатывает**, потому что Level 1 требует валидный `parentUuid`, а Level 2 — отсутствующий uuid в `recordMap`. Здесь uuid в Map есть, просто уже посещён.
+
+Результат: backtrace останавливается на compact_boundary, **не доходит до pre-compact истории**, хотя физически она в файле есть.
+
+### Решение
+После добавления записи в `activeBranch`, если она `type === 'system' && subtype === 'compact_boundary'` И вычисленный `nextUuid` оказался dead-end (`!nextUuid || seen.has(nextUuid) || !recordMap.has(nextUuid)`), искать физического предшественника compact'а в том же файле (`_fromFile`) с максимальным `_fileIndex < compact._fileIndex` среди невидимых. Прыгнуть на него.
+
+Это **НЕ chain break** — компакт legitimate граница, не bug. Поэтому `_chainBreaks.push` не вызывается, `claudeMemoryBoundaryUuid` не выставляется, ghost-styling/toast не активируется. Отдельный счётчик `_compactPassthroughCount` для диагностики (лог `[Timeline:Backtrace] DONE ... compactPassthrough=N`).
+
+---
+
+## 4. Post-compact attachment init suppression
+
+### Природа
+Сразу после `compact_boundary` Claude Code пишет в JSONL **серию attachment entries** (`skill_listing`, `mcp_instructions_delta`, и т.п.). Они представляют его внутреннее post-compact init состояние и могут иметь `parentUuid` указывающий в virtual-parent из RAM нового инстанса (никогда не флашится на диск). Backtrace натыкается на missing parent и формально это chain break — но **юзер ничего не потерял**, это штатная инициализация Claude.
+
+### Подавление
+В Generic CHAIN BREAK recovery (секция 2.2): если orphan = `type === 'attachment'` И в окне ±10 entries от его physical predecessor находится `system/compact_boundary` — это post-compact init. Делать recovery (физический прыжок) но **НЕ пушить в `_chainBreaks`**, **НЕ выставлять `claudeMemoryBoundaryUuid` / `_firstOrphanRecoveredFromUuid`**. Лог `[Timeline:Backtrace] CHAIN BREAK suppressed (post-compact init): orphan=... — Claude internal init, not data loss`.
+
+Без suppression: каждый `/compact` в активной сессии давал бы false-positive warning toast «обрыв UUID после /compact», потому что внутренние init-attachments выглядят как chain break.
+
+### Принцип
+См. [`methodology/переносимый-дизайн.md::Симптом-индикатор только когда реальная потеря`](../methodology/переносимый-дизайн.md) — silent recovery когда нет потери, видимый toast только когда юзер бы заметил отсутствие данных.
+
 ---
 
 ## 3. Bridge Following: Защита от циклов

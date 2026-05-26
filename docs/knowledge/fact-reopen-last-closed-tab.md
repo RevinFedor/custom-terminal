@@ -28,7 +28,7 @@ Main-side handler `project:reopen-last-closed-tab` делает `SELECT ... ORDE
 После delete запись пропадает и из History в ProjectHome — это сознательно, тот же контракт, что у Restore-клика по карточке.
 
 ### Layout-agnostic hotkey через `event.code`
-App-level capture listener: `e.metaKey && e.shiftKey && e.code === 'KeyT'` (см. `methodology/design.md::Layout-agnostic shortcuts`). На QWERTY/Cyrillic/Dvorak — одна и та же физическая клавиша T. `e.preventDefault + stopPropagation + stopImmediatePropagation` глушит событие до того, как его подхватит xterm `attachCustomKeyEventHandler` или composer textarea в SDK-табах. Double-safety guard в обоих `attachCustomKeyEventHandler` в `Terminal.tsx` — на случай, если capture-flow пропустит событие, xterm всё равно вернёт `false` и литерал `T` не попадёт в Claude TUI.
+App-level capture listener: `e.metaKey && e.shiftKey && e.code === 'KeyT'` (см. `methodology/переносимый-дизайн.md::Layout-agnostic shortcuts`). На QWERTY/Cyrillic/Dvorak — одна и та же физическая клавиша T. `e.preventDefault + stopPropagation + stopImmediatePropagation` глушит событие до того, как его подхватит xterm `attachCustomKeyEventHandler` или composer textarea в SDK-табах. Double-safety guard в обоих `attachCustomKeyEventHandler` в `Terminal.tsx` — на случай, если capture-flow пропустит событие, xterm всё равно вернёт `false` и литерал `T` не попадёт в Claude TUI.
 
 Принцип — тот же, что у Opt+V picker'а: см. `fact-prompt-picker.md::Capture-phase listener`.
 
@@ -46,7 +46,7 @@ App-level capture listener: `e.metaKey && e.shiftKey && e.code === 'KeyT'` (см
 - **`pointer-events-none` + `aria-hidden`** на overlay — клики по табам не должны блокироваться индикатором.
 - **600мс совпадает с типичной верхней границей задержки** — когда вкладка появляется, pulse как раз заканчивается; перекрытие читается как «вспышка → вкладка», без визуального разрыва.
 
-Принцип переносимый — мгновенный визуальный ack на действия с задержкой выполнения. См. `methodology/design.md::Synchronous feedback для async-операций`.
+Принцип переносимый — мгновенный визуальный ack на действия с задержкой выполнения. См. `methodology/переносимый-дизайн.md::Synchronous feedback для async-операций`.
 
 ## Schema migration
 ```sql
