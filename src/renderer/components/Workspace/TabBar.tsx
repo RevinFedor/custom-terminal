@@ -109,12 +109,17 @@ const DropIndicatorLine = memo(({ edge }: IndicatorProps) => {
 
 // Restart zone - left part of tab, shows restart button on hover when process is running
 // Only shows restart for devServer commands (npm/yarn/etc), not for claude/gemini
-const RestartZone = memo(({ hasProcess, hasColor, commandType, hasSession, isBusy, onRestart, onStop }: {
+const RestartZone = memo(({ hasProcess, hasColor, commandType, hasSession, isBusy, isStopping, onRestart, onStop }: {
   hasProcess: boolean;
   hasColor: boolean;
   commandType?: string;
   hasSession?: boolean;
   isBusy?: boolean;
+  // Deterministic stop/restart is mid-cycle for this tab. While true: clicks are
+  // ignored (cursor stays as wait), and the ↻ icon rotates to signal that the
+  // system is busy killing descendants and waiting for ports to release.
+  // Cleared by terminal:stop-progress { phase: 'done' } in the parent.
+  isStopping?: boolean;
   onRestart: () => void;
   onStop: () => void;
 }) => {
@@ -135,17 +140,18 @@ const RestartZone = memo(({ hasProcess, hasColor, commandType, hasSession, isBus
         alignItems: 'center',
         justifyContent: 'center',
         zIndex: 10,
+        cursor: isStopping ? 'wait' : undefined,
       }}
       onMouseEnter={() => setIsHovered(true)}
       onMouseLeave={() => setIsHovered(false)}
       onClick={(e) => {
-        if (showRestart) {
+        if (showRestart && !isStopping) {
           e.stopPropagation();
           onRestart();
         }
       }}
       onAuxClick={(e) => {
-        if (e.button === 1 && showRestart) {
+        if (e.button === 1 && showRestart && !isStopping) {
           e.preventDefault();
           e.stopPropagation();
           onStop();
@@ -153,9 +159,31 @@ const RestartZone = memo(({ hasProcess, hasColor, commandType, hasSession, isBus
       }}
     >
       {hasProcess ? (
-        isHovered && showRestart ? (
+        isStopping && showRestart ? (
+          // Deterministic-stop in flight: spinning ↻ icon, cursor:wait. The
+          // animation runs whether or not the mouse is over the zone, so the
+          // user sees that a stop is actually happening even after moving away.
+          <Tooltip content="Stopping…">
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              width: '24px',
+              height: '24px',
+              borderRadius: '4px',
+              backgroundColor: 'rgba(255,255,255,0.06)',
+              color: '#999',
+              fontSize: '14px',
+              animation: 'tab-dot-spin 0.8s linear infinite',
+            }}
+          >
+            ↻
+          </div>
+          </Tooltip>
+        ) : isHovered && showRestart ? (
           // Restart button when hovered (only for devServer)
-          <Tooltip content="Restart (Ctrl+C → !! → Enter)">
+          <Tooltip content="Restart (kill descendants + ports, then re-run)">
           <div
             style={{
               display: 'flex',
@@ -233,8 +261,9 @@ interface TabItemProps {
   fontSize: number;
   hasProcess?: boolean; // Whether tab has a running process
   commandType?: string; // Type of command running (devServer, claude, gemini, generic)
-  onRestart?: (tabId: string) => void; // Restart process (Ctrl+C, Up, Enter)
-  onStop?: (tabId: string) => void; // Stop process (Ctrl+C only, no restart)
+  onRestart?: (tabId: string) => void; // Restart process (deterministic stop + !!)
+  onStop?: (tabId: string) => void; // Stop process (deterministic stop only)
+  isStopping?: boolean; // Deterministic-stop is mid-cycle; lock the click + spin icon
   isInterrupted?: boolean; // Tab has an interrupted AI session
   draggingGroupIds?: string[]; // IDs of tabs being dragged as a group
   onHoverChange?: (hovering: boolean, rect?: DOMRect) => void; // CMD+hover notes preview
@@ -252,6 +281,11 @@ interface TabItemProps {
   isCollapsed?: boolean; // Collapsed tab — icon-only
   hasSession?: boolean; // Whether tab has an active AI session
   isBusy?: boolean; // AI agent is actively thinking/streaming
+  sdkProcessAlive?: boolean; // SDK tab: the CLI process is alive (parked between
+                             // turns or generating). SDK has no PTY → hasProcess
+                             // is always false; this feeds the activity-plate so
+                             // the bar stays lit while the process lives, matching
+                             // the control-bar process indicator (single signal).
   isViewingSubAgent?: boolean; // User is viewing a sub-agent of this tab
   orientation?: 'horizontal' | 'vertical'; // Layout direction. Main-zone defaults to horizontal,
                                             // utility-zone (dropdown) defaults to vertical. TabSidebar
@@ -282,6 +316,7 @@ const TabItem = memo(({
   commandType,
   onRestart,
   onStop,
+  isStopping = false,
   isInterrupted = false,
   draggingGroupIds = [],
   onHoverChange,
@@ -292,6 +327,7 @@ const TabItem = memo(({
   isCollapsed = false,
   hasSession = false,
   isBusy = false,
+  sdkProcessAlive = false,
   isViewingSubAgent = false,
   orientation,
   sessionStatus,
@@ -580,9 +616,14 @@ const TabItem = memo(({
   //     PTY-источники: terminal:command-started/finished (claude CLI, npm run dev, bash, gemini CLI).
   //   isBusy (AI «думает»/стримит)   → горизонтальный shimmer по ВСЕЙ ширине вкладки.
   //     AI-источники: claude:busy-state, gemini:busy-state, claude-sdk:busy-state.
-  //   SDK claude — нет PTY → hasProcess=false. Sole сигнал — isBusy → только shimmer.
+  //   SDK claude — нет PTY → hasProcess=false. Раньше единственным сигналом был
+  //   isBusy → плашка горела ТОЛЬКО пока генерится ответ, а после soft-interrupt
+  //   (процесс жив, простаивает) гасла, хотя процесс жив. Теперь sdkProcessAlive
+  //   кормит тот же канал что hasProcess: полоса горит пока процесс жив (ровно,
+  //   если не busy; пульс+shimmer пока busy), гаснет только на hard-kill —
+  //   единый сигнал с индикатором в ControlBar.
   //   Если оба true (PTY claude думает) — рендерятся оба: полоса слева + shimmer.
-  const verticalHasProcess = hasProcess;
+  const verticalHasProcess = hasProcess || sdkProcessAlive;
   const verticalIsAiBusy = isBusy;
   // Lookup status definition by id из глобального стора.
   // useUIStore делает гранулярный subscribe — TabItem ре-рендерится только когда
@@ -737,6 +778,7 @@ const TabItem = memo(({
               commandType={commandType}
               hasSession={hasSession}
               isBusy={isBusy}
+              isStopping={isStopping}
               onRestart={() => onRestart && onRestart(tab.id)}
               onStop={() => onStop && onStop(tab.id)}
             />
@@ -833,17 +875,19 @@ const TabItem = memo(({
           {/* Restart button — для зелёных (devServer) вкладок с активным процессом
                 занимает место notes-кнопки. Логика: зелёный таб обычно = npm run dev,
                 заметок там почти не пишут, зато перезапуск из меню вкладки нужен часто.
-                Mutex с notes: если рендерится restart — notes не рендерится. handleRestart
-                — тот же что был у удалённого RestartZone (Ctrl+C → kill ports → !! → Enter). */}
+                Mutex с notes: если рендерится restart — notes не рендерится. Кнопка
+                делегирует в onRestart (детерминистический stop+!! в одном IPC).
+                Пока stop в полёте — иконка крутится, click заблокирован. */}
           {isVerticalMode && tab.color === 'green' && hasProcess && (
             <button
               onClick={(e) => {
                 e.stopPropagation();
+                if (isStopping) return;
                 onRestart?.(tab.id);
               }}
               onDoubleClick={(e) => e.stopPropagation()}
-              title="Restart process (kill → re-run last command)"
-              className="flex-shrink-0 inline-flex items-center justify-center cursor-pointer transition-colors"
+              title={isStopping ? 'Stopping…' : 'Restart process (kill descendants + ports, then re-run)'}
+              className="flex-shrink-0 inline-flex items-center justify-center transition-colors"
               style={{
                 width: 20,
                 height: 18,
@@ -851,21 +895,28 @@ const TabItem = memo(({
                 padding: 0,
                 borderRadius: 4,
                 backgroundColor: '#1e1e2e',
-                color: '#86efac',
+                color: isStopping ? '#666' : '#86efac',
                 border: '1px solid rgba(34,197,94,0.25)',
+                cursor: isStopping ? 'wait' : 'pointer',
               }}
               onMouseEnter={(e) => {
+                if (isStopping) return;
                 const el = e.currentTarget as HTMLButtonElement;
                 el.style.backgroundColor = 'rgba(34,197,94,0.18)';
                 el.style.color = '#bbf7d0';
               }}
               onMouseLeave={(e) => {
+                if (isStopping) return;
                 const el = e.currentTarget as HTMLButtonElement;
                 el.style.backgroundColor = '#1e1e2e';
                 el.style.color = '#86efac';
               }}
             >
-              <RotateCw size={11} strokeWidth={2.2} />
+              <RotateCw
+                size={11}
+                strokeWidth={2.2}
+                style={isStopping ? { animation: 'tab-dot-spin 0.8s linear infinite' } : undefined}
+              />
             </button>
           )}
 
@@ -1219,6 +1270,12 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   const utilityCloseTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const [emptyZoneHovered, setEmptyZoneHovered] = useState(false);
   const [processStatus, setProcessStatus] = useState<Map<string, boolean>>(new Map());
+  // Tabs currently inside a deterministic stop/restart cycle. While in this set
+  // the Restart / Stop buttons render disabled with a wait-cursor, so the user
+  // can't fire a second stop while the first one is still polling for descendants
+  // to die. Populated synchronously when handleRestart/handleStop is called,
+  // cleared on `terminal:stop-progress { phase: 'done' }`.
+  const [restartInFlight, setRestartInFlight] = useState<Set<string>>(new Set());
   const [sessionStatus, setSessionStatus] = useState<Map<string, boolean>>(new Map());
   const [claudeBusyMap, setClaudeBusyMap] = useState<Map<string, boolean>>(new Map());
   const [geminiBusyMap, setGeminiBusyMap] = useState<Map<string, boolean>>(new Map());
@@ -1326,11 +1383,26 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
       });
     };
 
+    // Deterministic stop/restart: lock the ↻ / Stop buttons for the affected
+    // tab until main reports phase='done'. Without this the user can fire a
+    // second Stop while the first one is still polling lsof → races.
+    const handleStopProgress = (_: any, { tabId, phase }: { tabId: string; phase: string }) => {
+      if (phase === 'done') {
+        setRestartInFlight(prev => {
+          if (!prev.has(tabId)) return prev;
+          const next = new Set(prev);
+          next.delete(tabId);
+          return next;
+        });
+      }
+    };
+
     ipcRenderer.on('terminal:command-started', handleCommandStarted);
     ipcRenderer.on('terminal:command-finished', handleCommandFinished);
     ipcRenderer.on('claude:session-detected', handleSessionDetected);
     ipcRenderer.on('claude:busy-state', handleClaudeBusy);
     ipcRenderer.on('gemini:busy-state', handleGeminiBusy);
+    ipcRenderer.on('terminal:stop-progress', handleStopProgress);
 
     return () => {
       ipcRenderer.removeListener('terminal:command-started', handleCommandStarted);
@@ -1338,6 +1410,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
       ipcRenderer.removeListener('claude:session-detected', handleSessionDetected);
       ipcRenderer.removeListener('claude:busy-state', handleClaudeBusy);
       ipcRenderer.removeListener('gemini:busy-state', handleGeminiBusy);
+      ipcRenderer.removeListener('terminal:stop-progress', handleStopProgress);
     };
   }, []); // Stable — no re-subscriptions
 
@@ -1657,16 +1730,14 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
     })();
   };
 
-  // Restart process: Ctrl+C → delay → !! (repeat last command)
-  // When "kill dev-ports" toggle is on, prepend `lsof | kill -9` command in the SAME
-  // shell session before the actual npm-script line. Wrapping into one composite line:
-  //   `lsof -ti:5181 -ti:3000 2>/dev/null | xargs kill -9 2>/dev/null; npm run dev`
-  // ...is the right pattern because:
-  //   1. Visible in scrollback — user sees what got freed
-  //   2. Sequential by shell semantics, not by setTimeout race — `;` guarantees kill
-  //      finishes before `npm run dev` starts (kernel TIME_WAIT freed in same tick)
-  //   3. Lands in shell history, so re-up arrow gives same kill+run combo
-  // Returns the prefix string to prepend (`...; ` ready to concat), or '' if disabled / no ports.
+  // Build a "kill leaked port holders" shell prefix for the SCRIPT LAUNCH path
+  // (Scripts submenu → click `npm run X`). This is NOT the stop path — here the
+  // process isn't running yet; we only want to free ports a previous crashed run
+  // may still hold, in the SAME visible shell line: `lsof ... | kill -9; npm run X`.
+  // The `;` makes it atomic-by-shell-semantics (kill finishes before npm starts),
+  // it lands in scrollback + history, and now picks up env-only ports (7979) via
+  // the extended detector. Returns '' when the toggle is off or no ports found.
+  // (Stop/restart of a RUNNING process goes through runDeterministicStop instead.)
   const buildKillPortsPrefix = async (tabId: string): Promise<string> => {
     if (!useUIStore.getState().freePortsBeforeStart) return '';
     const tab = workspace.tabs.get(tabId);
@@ -1676,8 +1747,6 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
       const res = await ipcRenderer.invoke('system:detect-project-ports', cwd);
       const ports: number[] = res?.ports || [];
       if (ports.length === 0) return '';
-      // -ti collapses multiple -ti flags? No — must be `lsof -ti:port` per port separated by space-style.
-      // Cleanest portable form: `lsof -ti:5181,3000` (comma list — supported by lsof on macOS/Linux).
       const lsofArg = ports.join(',');
       return `lsof -ti:${lsofArg} 2>/dev/null | xargs -r kill -9 2>/dev/null; `;
     } catch (e) {
@@ -1686,34 +1755,63 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
     }
   };
 
-  const handleRestart = async (tabId: string) => {
-    // Ctrl+C first — shell prompt returns, then we can type the composite kill+!! line.
-    // Compositing kill into a single visible shell line (instead of fire-and-forget IPC)
-    // lets the user see what ports were freed and removes setTimeout race vs port release.
-    ipcRenderer.send('terminal:input', tabId, '\x03');
-    const killPrefix = await buildKillPortsPrefix(tabId);
-    setTimeout(() => {
-      // `lsof -ti:... | xargs kill -9; !!` — shell semicolon guarantees kill finishes
-      // before `!!` re-runs the previous command. No timing assumption.
-      ipcRenderer.send('terminal:input', tabId, `${killPrefix}!!\r`);
-    }, 300);
+  // Restart / Stop — deterministic, event-driven, no setTimeout guesses.
+  //
+  // The legacy flow ("Ctrl+C → setTimeout(300) → kill+!!") was broken in two ways:
+  //   1. PTY Ctrl+C only reaches the foreground process group of the shell
+  //      (zsh + npm). Children that detached their controlling terminal —
+  //      Electron BrowserWindow, vite preview fork, detached node spawn —
+  //      survive and keep holding ports. Symptom: every ↻ on `npm run dev` for
+  //      this project spawned a second Electron Dock icon, because the old one
+  //      held port 7979 (NOTED_WEB_PORT) and never got the signal.
+  //   2. setTimeout(300) is a guess. If the process needed >300ms to release
+  //      the port, `!!` ran against an occupied port → "address in use" loop.
+  //
+  // New flow: one IPC call to terminal:deterministic-stop. Main does:
+  //   BFS the shell PID's full descendant tree → SIGTERM all → poll kill(-0)
+  //   AND lsof on declared ports every 50ms → resolve only when both lists are
+  //   empty → optionally write `!!\r` to PTY. Watchdog: SIGKILL after 2000ms.
+  //
+  // While the call is in-flight, restartInFlight contains tabId; render layer
+  // uses it to grey-out both buttons (no double-fire while polling).
+  const runDeterministicStop = async (tabId: string, restart: boolean) => {
+    setRestartInFlight(prev => {
+      if (prev.has(tabId)) return prev;
+      const next = new Set(prev);
+      next.add(tabId);
+      return next;
+    });
+    try {
+      const res = await ipcRenderer.invoke('terminal:deterministic-stop', { tabId, restart });
+      if (!res?.success) {
+        console.warn('[TabBar] deterministic-stop residual', res);
+      }
+    } catch (e) {
+      console.error('[TabBar] deterministic-stop failed', e);
+    } finally {
+      // Listener on terminal:stop-progress { phase: 'done' } clears the flag,
+      // but clear here too as a safety net for early errors that never emit.
+      setRestartInFlight(prev => {
+        if (!prev.has(tabId)) return prev;
+        const next = new Set(prev);
+        next.delete(tabId);
+        return next;
+      });
+    }
   };
 
-  // Stop process: Ctrl+C, then optionally kill leaked ports as a separate visible line.
-  // User often hits Stop because the process is stuck holding the port; the explicit
-  // kill line confirms what was freed in the scrollback.
+  const handleRestart = async (tabId: string) => {
+    if (restartInFlight.has(tabId)) return;
+    await runDeterministicStop(tabId, true);
+  };
+
   const handleStop = async (tabId: string) => {
-    // SDK tabs have no PTY — cancel the in-process query instead of writing Ctrl+C
-    // into a non-existent terminal. claude-sdk:stop closes the AbortController which
-    // makes the streaming for-after loop bail; ClaudeSDKTab's :done handler then
-    // flips isRunning=false so the loader pill clears.
+    // SDK tabs have no PTY — cancel the in-process query instead. Same guard
+    // as multi-select Stop in the context menu: only dispatch was-stopped when
+    // the query is actually running, otherwise idle SDK tabs would show a
+    // bogus "Process stopped — history preserved" pill on middle-click.
     const tab = workspace.tabs.get(tabId);
     if (tab?.tabType === 'claude-sdk') {
-      // Guard: dispatch claude-sdk:was-stopped (→ Resume overlay в композере)
-      // ТОЛЬКО когда query реально идёт. Без guard'а middle-click / tab-dot
-      // на idle SDK табе показывал «Process stopped — history preserved» с
-      // кнопкой Resume — хотя ничего не останавливали. Тот же guard стоит в
-      // context-menu (line 2475).
       const isSDKBusy = claudeBusyMap.get(tabId);
       if (!isSDKBusy) return;
       try {
@@ -1722,15 +1820,8 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
       } catch (e: any) { console.error('[TabBar:SDKStop] error', e); }
       return;
     }
-    ipcRenderer.send('terminal:input', tabId, '\x03');
-    const killPrefix = await buildKillPortsPrefix(tabId);
-    if (killPrefix) {
-      // Strip the trailing `; ` to make it a standalone line (without a pending `!!`).
-      const standalone = killPrefix.replace(/;\s*$/, '');
-      setTimeout(() => {
-        ipcRenderer.send('terminal:input', tabId, `${standalone}\r`);
-      }, 300);
-    }
+    if (restartInFlight.has(tabId)) return;
+    await runDeterministicStop(tabId, false);
   };
 
   const handleRenameSubmit = () => {
@@ -2024,8 +2115,10 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                 commandType={tab.commandType}
                 hasSession={sessionStatus.get(tab.id) || !!tab.claudeSessionId}
                 isBusy={(tab.commandType === 'gemini' ? geminiBusyMap.get(tab.id) : claudeBusyMap.get(tab.id)) || false}
+                sdkProcessAlive={!!tab.sdkProcessAlive}
                 onRestart={handleRestart}
                 onStop={handleStop}
+                isStopping={restartInFlight.has(tab.id)}
                 isInterrupted={isTabInterrupted(tab)}
                 draggingGroupIds={draggingGroupIds}
                 onHoverChange={(hovering, rect) => handleTabHoverChange(tab.id, hovering, rect)}
@@ -2113,8 +2206,10 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                   commandType={tab.commandType}
                   hasSession={sessionStatus.get(tab.id) || !!tab.claudeSessionId}
                   isBusy={(tab.commandType === 'gemini' ? geminiBusyMap.get(tab.id) : claudeBusyMap.get(tab.id)) || false}
+                  sdkProcessAlive={!!tab.sdkProcessAlive}
                   onRestart={handleRestart}
                   onStop={handleStop}
+                  isStopping={restartInFlight.has(tab.id)}
                   isInterrupted={isTabInterrupted(tab)}
                   draggingGroupIds={draggingGroupIds}
                   onHoverChange={(hovering, rect) => handleTabHoverChange(tab.id, hovering, rect)}
@@ -2286,8 +2381,10 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                         commandType={tab.commandType}
                         hasSession={sessionStatus.get(tab.id) || !!tab.claudeSessionId}
                         isBusy={(tab.commandType === 'gemini' ? geminiBusyMap.get(tab.id) : claudeBusyMap.get(tab.id)) || false}
+                        sdkProcessAlive={!!tab.sdkProcessAlive}
                         onRestart={handleRestart}
                         onStop={handleStop}
+                        isStopping={restartInFlight.has(tab.id)}
                         isInterrupted={isTabInterrupted(tab)}
                         draggingGroupIds={draggingGroupIds}
                         onHoverChange={(hovering, rect) => handleTabHoverChange(tab.id, hovering, rect)}
@@ -2359,8 +2456,10 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                     commandType={tab.commandType}
                     hasSession={sessionStatus.get(tab.id) || !!tab.claudeSessionId}
                     isBusy={(tab.commandType === 'gemini' ? geminiBusyMap.get(tab.id) : claudeBusyMap.get(tab.id)) || false}
+                    sdkProcessAlive={!!tab.sdkProcessAlive}
                     onRestart={handleRestart}
                     onStop={handleStop}
+                    isStopping={restartInFlight.has(tab.id)}
                     isInterrupted={isTabInterrupted(tab)}
                     draggingGroupIds={draggingGroupIds}
                     onHoverChange={(hovering, rect) => handleTabHoverChange(tab.id, hovering, rect)}
@@ -2392,7 +2491,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                 moveTabToZone(projectId, tabId, false, mainTabs.length);
               }}
               onHoverChange={setEmptyZoneHovered}
-              onDoubleClick={handleNewTabAtEnd}
+              onDoubleClick={handleNewTab}
               onContextMenu={(e) => {
                 e.preventDefault();
                 e.stopPropagation();
@@ -2525,21 +2624,15 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
             const handleStopScript = async (e: React.MouseEvent) => {
               e.stopPropagation();
               setContextMenu(null);
-              for (const id of targetTabIds) {
-                if (!processStatus.get(id)) continue;
+              // Deterministic stop on every selected script tab in parallel.
+              // Main BFSes each shell's descendant tree, SIGTERMs all, polls for
+              // death + port release, escalates to SIGKILL at 2s.
+              await Promise.all(targetTabIds.map(async (id) => {
+                if (!processStatus.get(id)) return;
                 const cmd = workspace.tabs.get(id)?.commandType;
-                if (cmd === 'claude' || cmd === 'gemini') continue;
-                // Ctrl+C first, then visible kill-ports line if toggle is on.
-                // Same pattern as handleStop — single source of behavior.
-                ipcRenderer.send('terminal:input', id, '\x03');
-                const killPrefix = await buildKillPortsPrefix(id);
-                if (killPrefix) {
-                  const standalone = killPrefix.replace(/;\s*$/, '');
-                  setTimeout(() => {
-                    ipcRenderer.send('terminal:input', id, `${standalone}\r`);
-                  }, 300);
-                }
-              }
+                if (cmd === 'claude' || cmd === 'gemini') return;
+                await runDeterministicStop(id, false);
+              }));
             };
 
             const scriptLabel = (() => {
@@ -2582,12 +2675,18 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
               <Tooltip content={`Send Ctrl+C to ${scriptCount} running script(s) — tab stays open`}>
               <button
                 className="flex-1 basis-0 min-w-0 px-2 py-1.5 text-[12px] cursor-pointer flex items-center justify-center gap-1.5 border-l border-[#444] whitespace-nowrap"
-                style={{ color: SCRIPT_TINT, backgroundColor: SCRIPT_TINT + '14' }}
-                onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = SCRIPT_TINT + '33'; }}
-                onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = SCRIPT_TINT + '14'; }}
+                style={{ color: '#f87171', backgroundColor: 'transparent' }}
+                onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = SCRIPT_TINT + '1f'; }}
+                onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'transparent'; }}
                 onClick={handleStopScript}
               >
-                <span style={{ width: 8, height: 8, borderRadius: '50%', backgroundColor: SCRIPT_TINT, display: 'inline-block', boxShadow: `0 0 6px ${SCRIPT_TINT}80` }} />
+                {/* Two-colour semantics: GREEN glowing dot = "process is alive" (status,
+                    echoes the running-dot), SOFT-RED label = "Stop" (destructive action).
+                    Splitting status (dot) from action (text) is why this can use green
+                    without reading as "all OK" — the red word carries the kill intent.
+                    Earlier all-red (bg+text) read as too aggressive; earlier all-green
+                    read as non-destructive. This hybrid resolves both. */}
+                <span style={{ width: 8, height: 8, borderRadius: '50%', backgroundColor: '#4ade80', display: 'inline-block', boxShadow: '0 0 6px rgba(74,222,128,0.6)' }} />
                 {scriptLabel}
               </button>
               </Tooltip>

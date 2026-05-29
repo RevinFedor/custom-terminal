@@ -46,26 +46,19 @@ Claude Code CLI автоматически читает `mcpServers` из `~/.cl
 
 См. `methodology/переносимый-дизайн.md::Silent platform downgrade → toast` про то, как мы сигнализируем юзеру когда SDK что-то делает иначе, чем он ожидает.
 
-## Effort gating + auto-downgrade
+## Effort: gating отменён, ultracode через settings
 
-Anthropic API **не падает** при невалидной комбинации `(model, effort)`. Он **тихо понижает уровень**. Юзер выбрал `xhigh` на Sonnet 4.6 → API ответил на `high`, ошибки нет, в UI пилюля всё ещё на `xhigh`. Это самая опасная категория багов — нет detection-сигнала.
+Anthropic API **не падает** при невалидной комбинации `(model, effort)` — **тихо понижает уровень**. Раньше из этого был сделан вывод, что надо гейтить пилюли по модели. **Это оказалось ошибкой и откачено** (2026-05-29). Реальный Claude Code **не гейтит effort по модели**: его слайдер `/effort` предлагает `low…max + ultracode` для **любой** модели, включая Haiku, и принимает любой уровень. Юзер показал скриншот (Haiku + `/effort max` → «Set effort level to max»). `supportedModels().supportedEffortLevels` — **не жёсткий гейт доступности** (Haiku возвращает его пустым, но слайдер всё равно даёт max). Матчить поведение референс-платформы важнее, чем вводить свой строгий гейт — см. `methodology/переносимый-дизайн.md::Несовместимость параметров — гасить в точке выбора, не в момент отправки` (раздел про границу «свой источник правды vs зеркалирование чужого UI»).
 
-**Источник правды — `query.supportedModels()` из SDK**, не хардкод. Метод возвращает `ModelInfo[]` где каждая модель имеет `supportedEffortLevels: ('low'|'medium'|'high'|'xhigh'|'max')[]`. Получаем один раз при старте Electron main (`loadSdkModelCapabilities()` в `main.js`), кэшируем на process lifetime, отдаём в renderer через IPC `claude-sdk:get-model-caps`. **Хардкод-таблица была удалена** (раньше жила в `ClaudeSDKTab.tsx::isEffortSupportedForAlias`) — каждый Anthropic-release её устаревал, теперь обновление SDK автоматически приносит свежий manifest.
+Итог по UI: все уровни всегда видны и кликабельны для всех моделей. Пилюли НЕ disabled, кластер НЕ скрывается, авто-даунгрейда при смене модели НЕТ.
 
-**Получение manifest'а — нюанс:** `supportedModels()` это **Query-instance метод**, не top-level export. Чтобы дёрнуть, нужна streaming-input query (control-request методы доступны только в этом режиме). Открываем минимальную query с never-yielding async iterable, вызываем `supportedModels()`, закрываем query — net cost ~200ms один раз за весь сеанс Electron'а.
+**Что пробовали и почему откатили (graveyard):** добавляли per-model гейтинг через `query.supportedModels()` — `getSupportedEffortsForAlias()` возвращал `Set` поддерживаемых уровней, UI рисовал неподдерживаемые пилюли `disabled`, `hideEffortCluster` прятал весь кластер для Haiku (`supportedEffortLevels` пустой), ultracode дизейблился на не-xhigh моделях, при смене модели был авто-даунгрейд. Всё удалено. Параллельно убран и `loadSdkModelCapabilities()`-fetch из ControlBar (лишний IPC + спавн throw-away query). Сам IPC `claude-sdk:get-model-caps` + `supportedModels()`-probe в `main.js` оставлены (могут пригодиться), но в UI больше не используются.
 
-**Реализация в UI (InfoPanel.tsx):**
+**ultracode — НЕ уровень effort, а session-режим.** ultracode = `xhigh` + standing dynamic-workflow orchestration (Claude сам решает запускать workflow на каждый существенный таск). Транспортная асимметрия между PTY и SDK:
+- **PTY** шлёт `/effort ultracode` напрямую — интерактивный slider-парсер CLI принимает `[low|medium|high|xhigh|max|ultracode|auto]`. Работает.
+- **SDK** через `options.effort` уходит в флаг `--effort`, а его zod-енум **закрыт** на `[low|medium|high|xhigh|max]` — `ultracode` роняет процесс с exit 1 (форензика: tab-3197, `effort=ultracode → exited code 1`, тут же `effort=max → ok`). Поэтому в `sdkStartQuery` транслируем: `effort === 'ultracode'` → `effort: 'xhigh'` + `extraArgs: { settings: JSON.stringify({ enableWorkflows: true, ultracode: true }) }`. `ultracode`/`enableWorkflows` — поля **Settings-схемы**, не `query()` Options (top-level молча отбрасываются), `--settings` ложится в flag-слой и не затирает `~/.claude`. См. `fact-claude-sdk-workflows.md`.
 
-- **Visual disabled на неподдерживаемых пилюлях.** `getSupportedEffortsForAlias(alias, caps)` возвращает `Set<string>` или `null` (null = «не знаем» = fall open). Пилюля рендерится с `opacity: 0.3, cursor: not-allowed, disabled={true}`, hover-title *«max не поддерживается моделью haiku»*. Клик заблокирован native HTML disabled.
-- **Auto-downgrade при смене модели.** Юзер был на `(opus, max)`, переключил модель на `haiku` → текущий effort невалиден. UI **немедленно** даунгрейдит до ближайшего поддерживаемого (`max → xhigh → high → medium → low`, первый из supported wins), показывает короткий info-toast *«effort: max → high (haiku не поддерживает max)»*.
-
-**Граница: alias `'default'` не gating'ится.** SDK сам выберет модель — мы не знаем какую. Все 5 пилюль остаются enabled. Если активный effort окажется несовместимым с реально выбранной моделью — поймает следующий слой.
-
-**Runtime mismatch** (`detectModelFamilyMismatch`): safety net на случай server-side подмены. На первом `assistant`-чанке сравниваем `lastRequestRef.modelAlias` (что просили) с `msg.message.model` (что вернул API). Если family отличается (`opus` → `sonnet`) — toast `warning` *один раз на turn* (`modelMismatchToastedRef`).
-
-**Что не покрыли:** активный effort после server-side silent downgrade. SDK 0.3 кладёт его в hook-контекст (`PreToolUse`/`PostToolUse`), мы хуки не регистрируем. С capability gating'ом этот gap менее критичен — невалидные пары теперь недостижимы из UI, остаётся только редкий случай server-side capacity overflow.
-
-**Принцип** — см. `methodology/переносимый-дизайн.md::Несовместимость параметров — гасить в точке выбора, не в момент отправки`.
+**Runtime mismatch** (`detectModelFamilyMismatch`): safety net на случай server-side подмены модели (не effort'а). На первом `assistant`-чанке сравниваем `lastRequestRef.modelAlias` с `msg.message.model`. Family отличается (`opus` → `sonnet`) → toast `warning` один раз на turn (`modelMismatchToastedRef`).
 
 ## Thinking как параметр SDK
 
@@ -79,9 +72,11 @@ UI-пилюля Think маппится так: `tab.sdkThinking === false` → `
 
 ## Single source of truth для model aliases
 
-`SDK_MODEL_MAP` в `ClaudeSDKTab.tsx` маппит UI-алиасы (`opus`, `sonnet`, `haiku`, `default`) на актуальные Anthropic model IDs. **Не дублируется** — два места которые читали маппинг (`onNew` и `truncateAndResend`) теперь оба идут через `resolveSdkModel()`. См. `methodology/переносимый-дизайн.md::Single source of truth для third-party shipping values` — здесь то же правило что для `claudeLevels.ts`, только специфично к SDK-табу.
+`SDK_MODEL_MAP` в `ClaudeSDKTab.tsx` маппит UI-алиасы (`opus`, `sonnet`, `haiku`, `default`) на то, что отдаём в `query()` options.model. **Не дублируется** — два места которые читали маппинг (`onNew` и `truncateAndResend`) теперь оба идут через `resolveSdkModel()`. См. `methodology/переносимый-дизайн.md::Single source of truth для third-party shipping values`.
 
-**Ловушка:** при следующем Anthropic-апдейте (например выйдет Opus 4.8) ровно одна правка — добавить новый id в `SDK_MODEL_MAP`. Если забыть — старая модель тихо `404`-ится в API, ошибка приходит как `result.is_error`, юзер видит красный toast «Claude SDK: model not found». На UI пилюля показывает `opus` как активную — это правда (юзер выбрал), но id мёртв.
+**Передаём АЛИАСЫ, не полные id.** Проверено живым `supportedModels()`: бинарь отдаёт как выбираемые `value` именно алиасы — `default / sonnet / sonnet[1m] / haiku / opus[1m]` (НЕ полные id, НЕ голый `opus`). Поэтому `SDK_MODEL_MAP.opus = 'opus[1m]'` (Opus 4.8, 1M) — CLI сам резолвит алиас в текущую shipping-модель + цепляет 1M-бету из суффикса `[1m]`.
+
+**1M определяется суффиксом `[1m]`, не версией модели.** Это правило из декомпила (`has1mContext(m) = /\[1m\]/i.test(m)` → цепляет beta `context-1m-2025-08-07`). Поэтому `opus` без `[1m]` = фактически 200K, даже если футер пишет «1M» — **именно такой латентный баг был**: до этой сессии `SDK_MODEL_MAP.opus = 'claude-opus-4-7'` (без суффикса И устаревшая версия). Любая правка модели — ровно одна строка в `SDK_MODEL_MAP`; забыл `[1m]` → молча урезанный контекст; забыл версию → старый id `404`-ится (`result.is_error` → красный toast «model not found»), на UI пилюля показывает `opus` как активную (это правда — юзер выбрал — но id мёртв).
 
 ## Ctrl+C в композере — только clear input
 
@@ -90,6 +85,23 @@ UI-пилюля Think маппится так: `tab.sdkThinking === false` → `
 В UI композере с явной Stop-кнопкой (chip в ControlBar / TabBar dot / двойной Esc) Ctrl+C **только чистит input**, ничего больше. Если процесс не идёт — Ctrl+C проходит как обычное keystroke (native browser default), не интерсептим. Если идёт — preventDefault + clear текстового поля. Stop процесса — отдельный жест с явным визуальным affordance. Этот принцип переносим в любые UI с text-input + explicit process control — см. `methodology/переносимый-дизайн.md::Ctrl+C в UI композере = clear input, не stop process`.
 
 Window-level handler (Escape / Ctrl+[ / Ctrl+C) на стороне ClaudeSDKTab.tsx остался — он вызывает `onCancel()` только когда `isRunning`. Этот путь покрывает классический TUI-muscle-memory (Esc отменяет turn), но **не** интерсептит Ctrl+C на текстовом поле — keydown handler у композера запускается до window listener, и если он сделал early-return (`!isRunning` или пустой текст), Ctrl+C дойдёт до window'а только когда юзер действительно хочет cancel turn.
+
+## Markdown inline-code: цвет permission-blue + strip backtick
+
+`AssistantTextPart` рендерит markdown через react-markdown с классами `prose prose-invert` (`@tailwindcss/typography`). Inline `` `code` `` стилизуется **только цветом** — `#b1b9f9` (это значение `permission` из dark-темы Claude Code, `packages/claude-code-src/utils/markdown.ts::codespan` → `color('permission')` = `rgb(177,185,249)`). Никакого фона, рамки, скруглений. Раньше был серый pill `bg-[#0d0d0d] border border-white/5` — юзер: *«убрать плашку, чистый синий, скопируй цвета из исходников Claude Code»*. Разворот прежнего принципа inset-фона — см. `methodology/переносимый-дизайн.md::Inset content на dark theme`.
+
+**Обратные кавычки видны из-за typography plugin, не из markdown.** `@tailwindcss/typography` инжектит `` ` `` через CSS `code::before { content: "\`" }` + `code::after` (см. `node_modules/@tailwindcss/typography/src/styles.js`). react-markdown сам кавычки strip'ает — они приходили от prose-класса. Симптом: *«в блоках кода всё равно отображаются обратные кавычки, синие»*. Лечение — `[&_code]:before:content-none [&_code]:after:content-none` в className обёртки. Без знания что источник — typography-плагин, а не наш renderer, дебаг уходит в неправильную сторону (правка `code` компонента react-markdown ничего не даёт).
+
+**Body-текст `#e8e8e8` (не `#d4d4d4`).** Подняли яркость основного текста — юзер: *«текст менее чёткий, фон сделать белее»*. Заголовки наследуют (`prose-headings:text-inherit`), иерархия только через `font-bold` + `mt`-зазоры. Калибровка отступов: `prose-p:my-0.5` (плотно внутри секции) + `prose-h*:mt-3/mt-4` (зазор между секциями), таблицы `[&_th/td]:px-3 py-1.5`.
+
+## Paste-chip: распаковать в композер vs удалить — две affordance
+
+Длинный paste (> `PASTE_THRESHOLD` 500 символов) становится chip'ом над композером вместо инлайна. У chip'а два разных действия в двух местах:
+
+- **Свёрнутый chip, иконка справа `↓` (`ArrowDownToLine`)** — `unpackChip`: высыпает полный текст chip'а в конец композера как plain text (через `\n` если уже есть ввод), сам chip уходит из бара, композер получает фокус. Раньше тут был `×` (delete) — юзер: *«вместо крестика должна быть кнопка которая переводит текст в инпут, просто вставляет в конец»*. Тело chip'а (превью-текст) остаётся click-toggle на preview-окно.
+- **Раскрытое preview-окно, иконка слева — корзина (`Trash2`, красная `#b91c1c` → hover `#ef4444`)** — `removeChip`: удаляет chip целиком. Delete переехал из свёрнутого состояния в раскрытое и влево (где глаз ищет destructive-действие первым). Принцип — `methodology/переносимый-дизайн.md::Chip: распаковать ≠ удалить`.
+
+**Submit при пустом тексте + chip'ы.** `ComposerPrimitive.Input` (assistant-ui) гейтит Send по `text.trim() !== ''` — chip-only payload не отправлялся, Enter молча no-op'ил. Симптом: *«если в чипе что-то есть, а в инпуте ничего — не могу нажать Enter»*. Обход в `handleComposerKeyDown`: при `Enter && composerText.trim()==='' && chips.length>0` форсим — idle Claude: `writeComposerValue(' ')` + `composerRuntime.send()` в `setTimeout(0)` (пробел снимает гейт, `onNew` собирает чипы из `__sdkPasteChips` и подставляет `'Analyze this content'` placeholder); busy Claude: enqueue в type-ahead с текстом-пробелом. Принцип — `methodology/переносимый-дизайн.md::Submit валиден при вложениях без текста`.
 
 ## Сворачивание длинных user-сообщений
 
@@ -105,13 +117,21 @@ Window-level handler (Escape / Ctrl+[ / Ctrl+C) на стороне ClaudeSDKTab
 
 **Read preview через extension → Prism language map.** Файл `package.json` подсветится как JSON, `*.ts/.tsx` как TypeScript/TSX, `*.py` как Python и т.д. Карта `EXT_LANG` короткая (~25 расширений) — больше и не надо: oneDark из react-syntax-highlighter качественно стилизует только эти языки, остальные fall back на `text` без визуального проигрыша. **Контент рендерится целиком** в SyntaxHighlighter с `maxHeight: '480px', overflow: 'auto'` — никакого preview-N-lines + expand toggle. Раньше был preview 8 строк + `FullContentToggle` который раскрывал полный контент в **втором** code-блоке — оба паттерна делали то же что встроенный scroll: показывали что ниже. Удалили as redundant (см. `methodology/переносимый-дизайн.md::collapse только когда scroll невозможен`).
 
-**Edit diff — собственная LCS реализация (не lib).** Anthropic Edit-tool отдаёт `args.old_string` и `args.new_string`. Установка `diff`/`fast-diff` npm-пакета не оправдана (Bundle + edge cases) — простой DP по LCS на ~50 строк делает то же самое. `lineDiff(old, new)` возвращает `Array<{tag: 'eq'|'add'|'del', line}>`, renderer проходит по entries и рисует `+/-` sign-gutter + цветной bg. **Для Write** — `args.content.split('\n')` целиком как adds (вся файла новая). **Для MultiEdit** — батч hunks через `─`-разделитель. `defaultOpen={true}` для всех diff-карточек: суть вызова — в diff'е, скрывать его за chevron'ом контрпродуктивно. **Diff также без expand-toggle**: контейнер `max-h: 480px overflow-y: auto`, длинные diff'ы скроллятся внутри. Removed `DIFF_COLLAPSED_LINES = 24` + кнопка `Раскрыть полностью` — те же причины что в Read.
+**Edit diff — собственная LCS реализация (не lib).** Anthropic Edit-tool отдаёт `args.old_string` и `args.new_string`. Установка `diff`/`fast-diff` npm-пакета не оправдана (Bundle + edge cases) — простой DP по LCS на ~50 строк делает то же самое. `lineDiff(old, new)` возвращает `Array<{tag: 'eq'|'add'|'del', line}>`. **Для Write** — `args.content.split('\n')` целиком как adds (вся файла новая). **Для MultiEdit** — батч hunks через `─`-разделитель. `defaultOpen={true}` для всех diff-карточек: суть вызова — в diff'е, скрывать его за chevron'ом контрпродуктивно. **Diff без expand-toggle**: контейнер `max-h: 480px overflow-y: auto`, длинные diff'ы скроллятся внутри.
 
-**StatusDot вместо trailing-spinner.** До: spinner после имени tool'а (running) или ничего (done). После: dot слева — зелёный (done), красный (error), вращающийся Loader2 (running). Один визуальный slot вместо двух — глаз быстрее парсит статус всего треда «сколько идёт / сколько готово».
+**Diff-строка: gutter номеров + per-line Prism для add/eq, white для del.** Каждая строка — flex `[№ gutter 3.5em][±/space marker 16px][code]`. Номера последовательные `1..N` по позиции в diff'е (НЕ реальные номера файла — `lineDiff` их не знает, source/target line tracking усложнил бы LCS ради косметики). Код add/eq-строк прогоняется через `<SyntaxHighlighter PreTag="span" customStyle={{background:'transparent'}}>` per-line — `const` синий, `return` красный, строки зелёные; bg-tint строки (add 12% / del 14% alpha) просвечивает сквозь прозрачный Prism. **Del-строки — белый `#fafafa`, Prism OFF**: на красном фоне Prism-цвета (зелёные строки, оранжевые keyword'ы) нечитаемы, плюс удалённый код не нуждается в семантической подсветке. Юзер на скриншоте Claude-thread'а: *«текст не серым, а полноценным цветом кода — return красным, const синим; у красного белым; писать количество строк»*.
 
-**`mr-[60px]` на root ToolCard и ReasoningPart.** Карточки уже окружающей prose ассистента на 60px справа. Это даёт scroll-зону для мыши (правый край — гарантированно main thread scroll, не внутренности карточки) и визуальное разделение «речь vs действие». Принцип — `methodology/переносимый-дизайн.md::Action-карточки уже prose`.
+**Borderless layout (chevron убран, иконка на левом крае, hover = trigger).** `ToolCard` каркас и `ReasoningPart` НЕ имеют рамки/фона. Строка-шапка: `[colored tool-icon][UPPERCASE label][badges][(description)][preview…]`, выровнена по левому краю окружающей prose (`-mx-1 px-1` резервирует место под hover-tint не сдвигая контент). Chevron-disclosure убран — вся строка `cursor-pointer hover:bg-white/[0.03]`, hover-tint несёт affordance раскрытия. Иконка **голая**, без chip-фона (фон вокруг неё был лишним шумом когда карточек несколько подряд). Раскрытое body индентится под строкой через **absolute `border-l` который останавливается за 6px до низа** (`bottom: 6px`) — между двумя соседними `Update` карточками (`my-3` зазор) видна чёткая граница, а не одна сплошная вертикаль во всю высоту треда. Юзер: *«отдельный бэкграунд для иконки убрать, сместить на одну линию с текстом; вертикальная полоса не должна идти до конца — из-за неё непонятно разделение между блоками»*. Принцип — `methodology/переносимый-дизайн.md::Strip-chip vs card-chip` (обобщён на tool-карточки).
 
-См. `methodology/переносимый-дизайн.md::Tool call = карточка, не сообщение` для принципа. Конкретные пороги превью/diff (8 / 24 / 10 строк) — см. `methodology/переносимый-дизайн.md::Generalisation: тот же приоритет для любого user-generated long content`.
+**Edit/Update subtitle вместо badge.** Line-count для Edit/Write/MultiEdit идёт **под** шапкой отдельной dim-строкой `Added N lines, removed M lines` (цифры цветные), не `+N −M` badge'ем в самой шапке. Повторяет формат Claude-thread'а — читается прозой, не кластером компактных значков. `ToolCard` получил slot `subtitle?: React.ReactNode`.
+
+**Preview команды/пути — `whitespace-nowrap truncate`, ровно одна строка.** Bash-команда в шапке `BashCard` никогда не переносится на второй визуальный ряд (раньше длинная команда wrap'илась рядом с одно-строчным label'ом — выглядело сломано), обрезается многоточием, полный текст в раскрытом body. Юзер: *«баш-команды должны быть в одну строку, как сейчас с MCP-вызовами»*.
+
+**StatusDot вместо trailing-spinner.** Tool-иконка слева сама несёт статус: зелёная (done), красная (error), вращающийся Loader2 (running). Один визуальный slot, глаз быстрее парсит «сколько идёт / сколько готово».
+
+**`mr-[60px]` на root ToolCard и ReasoningPart.** Карточки уже окружающей prose на 60px справа — scroll-зона для мыши + визуальное разделение «речь vs действие». Принцип — `methodology/переносимый-дизайн.md::Action-карточки уже prose`.
+
+См. `methodology/переносимый-дизайн.md::Tool call = карточка, не сообщение` и `::Diff на dark theme` для переносимых принципов.
 
 ## Smart Cancel: сохранение vs откат по содержимому streaming
 
@@ -152,17 +172,17 @@ Composer (`SDKComposer`) — child `ThreadPrimitive.Viewport`, последни�
 
 ## Footer pill: `[Model] N% context` — захват usage + window-table
 
-Под composer'ом — две части: слева `[Opus 4.7 (1M context)] N%`, справа `Session: xxx…` (dim grey). Видно когда есть хоть что-то одно.
+Под composer'ом — две части: слева `[Opus 4.8 (1M context)] N%`, справа `Session: xxx…` (dim grey). Видно когда есть хоть что-то одно.
 
 **Источник model'а — две стратегии:**
 1. **`lastResolvedModel`** — real model id из `msg.message.model` (SSE chunk). Captured в `handleMessage` при `msg.type === 'assistant'`. Это truth от Anthropic — может отличаться от UI-alias если был silent downgrade.
 2. **`sdkModelAlias`** fallback — `tab.sdkModel || 'default'` через `resolveSdkModel()`. Используется когда ещё не было ни одного assistant-чанка (новый таб без turn'ов).
 
-Helper `formatModelLabel(realModel, alias)` → `"Opus 4.7 (1M context)"` / `"Sonnet 4.5"`. Family + version из regex по id (`-4-7` / `-4.5`). `(1M context)` суффикс только для Opus 4.7.
+Helper `formatModelLabel(realModel, alias)` → `"Opus 4.8 (1M context)"` / `"Sonnet 4.6"`. Family из id, версия — из real-model SSE-эхо (`claude-opus-4-8`), а не из alias (`opus[1m]` цифр версии не несёт). `(1M context)` определяется **суффиксом `[1m]` ИЛИ Opus ≥ 4.8** (1M by-default на API с 4.8), НЕ хардкодом конкретной версии — `has1mTag = /\[1m\]/.test(src)`. Так футер перестал врать: раньше суффикс хардкодился на «Opus 4.7», и `opus` без `[1m]` (200K) подписывался как 1M.
 
 **Источник context %:**
 - `lastContextUsedTokens` — захватываем `input_tokens + cache_read_input_tokens + cache_creation_input_tokens` (полный context, не только uncached). Из той же `msg.message.usage` где трэкается mismatch model'а.
-- `getModelContextWindow(realModel, alias)` — таблица: Opus 4.7 = 1M, Sonnet/Haiku/прочие Opus = 200K. Anthropic не shipping'ит это в SDK, hardcode по доке.
+- `getModelContextWindow(realModel, alias)` — 1M когда: явный суффикс `[1m]` (в real-model id ИЛИ в alias — alias несёт `[1m]`, real id нет) ИЛИ Opus ≥ 4.8 (1M by-default). Иначе 200K. Смотрит на ОБА (real id + alias), потому что суффикс живёт на alias'е, а версия — на real id. Anthropic не shipping'ит окно в SDK, эвристика по доке.
 - `% remaining = 100 - (used / window) * 100`. Clamp [0, 100].
 
 **Цветовое gating:**
@@ -171,6 +191,8 @@ Helper `formatModelLabel(realModel, alias)` → `"Opus 4.7 (1M context)"` / `"So
 - `< 10%` — красный `#ef4444` (срочно).
 
 Только цвет процента, не всего pill'а — model-label остаётся читаемым `#bdbdbd`. Параллельно с pill `Cost` или `Tokens used` не показываем — оставшийся context — главный actionable сигнал для юзера («когда ждать compact'а»).
+
+**Размер шрифта model-label = `useUIStore.terminalFontSize`, не em.** Сам footer на `text-[0.7em]` (масштабируется от SDK-font root'а), но строка `[{modelLabel}]` получает абсолютный `style={{ fontSize: terminalFontSize px }}` — пинится к настройке «Шрифт» из Settings → Размеры → **Терминал** (не SDK-font). Юзер: *«название модели под инпутом должно быть того же размера шрифта как шрифт терминала из настроек»*. Реактивно — смена размера в настройках обновляет label сразу.
 
 ## Font-size root + em-потомки
 
@@ -231,7 +253,7 @@ Header pill и mobile composer показывают **% использовани
 
 ## Initial scroll
 
-`didInitialScrollRef = useRef<string | null>(null)` хранит **sessionId** для которого scroll-to-bottom уже сделан. Один раз на смену сессии (включая после `/rewind` / fork когда меняется uuid), не на focus tab. Без этого юзер при возврате в чат каждый раз скакал в начало истории. См. `methodology/мобильный-дизайн.md::Initial scroll = once-per-context`.
+`didInitialScrollRef = useRef<string | null>(null)` хранит **sessionId** для которого scroll-to-bottom уже сделан. Один раз на смену сессии (включая после `/rewind` / fork когда меняется uuid), не на focus tab. Без этого юзер при возврате в чат каждый раз скакал в начало истории. См. `methodology/переносимый-дизайн-mobile.md::Initial scroll = once-per-context`.
 
 ## Composer button slot (Send / Stop)
 
@@ -349,7 +371,7 @@ Graveyard:
 При смене alias в sidebar: realModel держит старое значение из ПОСЛЕДНЕГО SSE → формула возвращает его → footer показывает Opus пока юзер уже выбрал Sonnet, до первого нового turn'а.
 
 Фикс:
-1. **`SDK_DEFAULT_MODEL_ID = 'claude-opus-4-7'`** — fallback когда alias='default' И realModel=null (cold start). SDK default = whatever Anthropic ships under 'default' parameter; сейчас Opus 4.7. При смене shipping default — обновить константу.
+1. **`SDK_DEFAULT_MODEL_ID = 'claude-opus-4-8'`** — fallback когда alias='default' И realModel=null (cold start). SDK default = whatever Anthropic ships under 'default' parameter; сейчас Opus 4.8 (28 мая 2026, 1M by-default). При смене shipping default — обновить константу.
 2. **Alias-first priority при manual selection**: если `alias !== 'default'` И `resolveSdkModel(alias)` returns id — используем его (не realModel). RealModel wins только когда alias='default'.
 3. **Reset `lastResolvedModel = null` через useEffect** на изменение `sdkModelAlias`. Без этого после смены модели формула застревает на старом realModel.
 
@@ -369,16 +391,17 @@ Loader виден только пока **активно ждём**. До это
 
 `'typing'` — это **не** loading-state в UX-смысле; tracking'уется чтобы callers могли отличить «активно отдаёт токены» от «ничего». UI скрывает loader для `typing` AND `idle`. Принцип близок к `methodology/переносимый-дизайн.md::Status indicator: signal-on-change, не permanent label` — теперь signals дифференцированы.
 
-## Hard gate на Enter во время turn'а + rejectFlash
+**Loader-stomp при stop→resend.** Любой код который сначала останавливает живой query (`claude-sdk:stop`), а потом стартует новый, должен ставить `'fetching'` **после** await stop, не до: `stop` эмитит `claude-sdk:done` → `handleDone` гасит state в `'idle'`, и преждевременный fetching будет затёрт. Конкретный шрам — `## Repeat/Edit::Loader-stomp`.
 
-SDK 0.3 не поддерживает midstream приём нового prompt'а — попытка вызовет race с активной query. У нас уже есть PromptQueue для PTY-Claude (см. `fact-prompt-queue.md`), для SDK будем потом — пока самый безопасный путь блокировать ввод.
+## Enter во время turn'а: mid-stream type-ahead (single-slot)
 
-Три точки блокировки:
-1. **`handleComposerKeyDown`** — Enter (без Shift) при `isRunning` → `preventDefault` + `triggerRejectFlash()` + early return.
-2. **`onNew`** — guard в начале: `currentlyRunning = isRunning || sdkState in ['thinking','tool_use']` → silently drop. Two sources of truth (local stream-state + Zustand) проверяются OR — один может lag'ать.
-3. **`commitSlash`** — если isRunning, slash-команду set'аем в текстарею, но НЕ дёргаем `composerRuntime.send()`. Юзер сам нажмёт Enter когда turn закончится.
+**Обновление 2026-05: midstream теперь поддержан.** Раньше тут был hard-gate «SDK 0.3 не поддерживает midstream, блокируем ввод» — это **больше не так**. Через long-lived input-channel с `priority:'next'` сообщение, отправленное во время стриминга, доезжает до Claude на ближайшей block-boundary (как нативный TUI). Полная механика, три фазы chip (queued→sent→landed), JSONL-watcher для позиции, channel race fix, drop-on-interrupt — в [`fix-sdk-midstream-typeahead.md`](fix-sdk-midstream-typeahead.md).
 
-**rejectFlash**: 1-секундный border-red + bg-#2a1414 на composer'е. Юзер: «должно мигать на 1 секунду одно мигание». Без visual signal'а Enter тихо no-op'ится — юзер считает что клавиатура сломалась. Это **destructive-feedback ≥ 1 секунда**, см. `methodology/переносимый-дизайн.md::Persistent state across UI transitions` — тот же класс UX-проблем.
+Текущая политика — **single-slot**, не полная очередь: одновременно может висеть **один** mid-stream chip. Пока он есть (любого состояния), второй Enter не отправляется:
+1. **`handleComposerKeyDown`** — Enter при `isRunning` И `queued != null` → `preventDefault` + toast + chip-flash + early return. Если chip'а нет — enqueue в type-ahead.
+2. **`commitSlash`** — если isRunning, slash-команду set'аем в текстарею, но НЕ дёргаем `composerRuntime.send()`. Юзер сам нажмёт Enter когда turn закончится.
+
+**chip-flash при отклонённом втором Enter**: chip вспыхивает (CSS `sdk-chip-flash`, key-remount), toast объясняет почему (`queued` → «edit/discard chip»; `sent` → «in flight to Claude»). Без visual signal'а Enter тихо no-op'ится — юзер считает что клавиатура сломалась. Это **destructive-feedback ≥ 1 секунда**, тот же класс что `methodology/переносимый-дизайн.md::Anti-mash guard на любой repeating input`.
 
 ## Focus + selection coordination в чате
 
@@ -413,7 +436,13 @@ SDK 0.3 не поддерживает midstream приём нового prompt'�
 
 **Что пробовали и почему не сработало.** Изначально `claude-sdk:stop` дёргал только `query.close()` — рассчитывая что cascading abort через AbortController остановит и subagent. Не сработало: SDK 0.3.x спавнит subagent как отдельный CLI subprocess со своим `Query`-инстансом, у parent'а нет дескриптора для его abort. Тест с subagent'ом запущенным на 20+ Read'ов: после `close()` parent stream'а subagent продолжал отрабатывать в логах ещё ~30s (`task_progress` events приходили через event-channel который не закрывался по `close()`). Только `query.stopTask(taskId)` (control-request method) реально вызывает teardown subagent'а — это документированный путь в SDK 0.3.x.
 
-## SDK session ID persistence через `updateSDKState`
+## TaskListPanel: табло задач текущего turn'а
+
+Сворачиваемая карточка над composer'ом показывает TaskCreate/TaskUpdate/TodoWrite живым списком (как нативный TUI в `expandedView:'tasks'`). Источник — поток tool_use-блоков из `messages[*].parts[*]`, чистый renderer-side агрегат (`aggregateTasksFromMessages`), без IPC — все данные уже в треде.
+
+**Scope = последний turn, не вся сессия.** Агрегатор кормится не всем `messages`, а `messages.slice(lastUserIdx)` — от последнего `role:'user'` и до конца. Без этого панель накапливала задачи за всю сессию: на длинном чате с десятками промптов набегало 141 «✓»-строка, табло превращалось в нечитаемый журнал. Юзер: *«нахуй мне отображать все задачи, которые были за сессию»*. Новый prompt обнуляет панель (как нативный Claude, где TodoWrite/TaskCreate видны пока актуальны), завершённый turn уходит в историю треда. Принцип — `methodology/переносимый-дизайн.md::Live tracker ≠ history` (временной scope живого трекера).
+
+Агрегатор stateless и идемпотентен — гоняется заново на каждую мутацию `messages` (включая streaming-чанки), линейный проход по parts[]. `TaskCreate` резолвит реальный `Task #<id>` из tool_result (до него — stub-id `create:<tool_use_id>`), `TaskUpdate status:'deleted'` убирает строку, legacy `TodoWrite` (full-replace, шлёт весь массив) — `allDone` стирает табло целиком. `TaskList`/`TaskGet` read-only, игнорируются.
 
 `Tab.claudeSessionId` для SDK табов **до 2026-05-18** записывался в Zustand-store через `updateSDKState({claudeSessionId})`, но **в SQLite не персистился** — `saveTabs` дёргал только `setClaudeSessionId` (PTY-табы), для SDK был обходной путь. Симптом: после `restart_process` dev-сервера или явного Electron-restart юзер открывал свои SDK-табы и видел *"Waiting for session"* в InfoPanel, хотя JSONL на диске целый. В SQLite колонка `claude_session_id` для этих табов была пустая.
 
@@ -421,15 +450,23 @@ SDK 0.3 не поддерживает midstream приём нового prompt'�
 
 **Что пробовали и почему не сработало.** Первая мысль была — добавить вызов `s.setClaudeSessionId(tabId, sid)` поверх `updateSDKState` в renderer (handleMessage SDK iterator). Не сработало: `setClaudeSessionId` имеет guard `if (tab.claudeSessionId === sessionId) return` и сбрасывает overlay-флаги (`wasInterrupted`/`overlayDismissed`) — для SDK таба эти сбросы случайны и могут схлопнуть Interrupted Session Recovery overlay вместо PTY-таба. Решение через `updateSDKState` локальнее: одно место, одно поведение, save-side effect только когда sid реально меняется.
 
-## Repeat/Edit на непрошедших user-bubble'ах
+## Repeat/Edit: идемпотентный re-send по позиции user'а
 
-Hover-action-bar (Repeat / Edit) у user-сообщения раньше показывался только когда `isPersistedMsgId(id)` true — id равен JSONL uuid, т.е. сообщение успело долететь до `~/.claude/.../<session>.jsonl`. Все свежие сообщения сначала живут с placeholder-id `user-<Date.now()>` и swap'аются на uuid только когда первый ответный чанк ассистента приходит через `claude-sdk:message`.
+Обе кнопки (↻ Repeat — переотправить как есть, ✎ Edit — отредактировать и отправить) идут через одну функцию `truncateAndResend(uiMsgId, newText)`. Контракт: **N кликов на тот же чип сводят тред к одному и тому же состоянию** — первые N−1 user-prompt'ов остаются, N-ный переотправляется. Принцип идемпотентности и почему моделируем по позиции — `methodology/переносимый-дизайн.md::Повторный replace/destructive = идемпотентность`.
 
-Это нормально для happy path, но **полностью теряет recovery-affordance, если `send-message` упал до flush'а в JSONL** — нативный бинарь не нашёлся (`fix-sdk-asar-spawn.md`), токен MCP сорвался, network 5xx и т.п. В UI оставалось висячее сообщение без кнопок: error-toast уже исчез, кликнуть некуда, единственный путь — перепечатать промпт целиком. Юзер: *«слева от сообщения в паре пикселях должна быть кнопка либо «отредактировать», либо кнопка «перезагрузки», чтобы переотправить промпт, но этого почему-то нет»*.
+**Адресация — позиция user'а, не msgId.** В renderer считаем `userPos` = сколько `role:'user'` сообщений идёт **до** кликнутого в `messagesRef.current`. Это инвариант: после re-send тот же визуальный prompt получает новый placeholder-id, но его порядковый номер в треде не меняется. Передаём `claude-sdk:truncate-history { sessionId, userPosition }` — main строит активную ветку (тот же parentUuid-backtrace что в Timeline), находит N-ный `type:'user'`-record (пропуская sidechain и `parent_tool_use_id` — subagent-prompt'ы не в счёт) и сносит его + всё после inclusive. Затем `send-message resume` дописывает свежий turn от обрезанного tip'а. Старый `targetUuid`-режим (+ legacy `truncateAfter`) в хендлере остался для обратной совместимости, но Repeat/Edit его больше не используют.
 
-Решение: action-bar показывается и для `user-*` placeholder'ов тоже (`showActions = isPersisted || isPlaceholderUser`). `truncateAndResend` теперь разделяет path по `isPersistedMsgId`: persisted → как раньше (IPC `claude-sdk:truncate-history` режет JSONL ≥ uuid'у, потом fresh send), placeholder → пропуск truncate (нет uuid для JSONL — резать нечего), просто `setMessages` срезает локально с того места и `claude-sdk:send-message` отправляет новый текст. Edit для placeholder работает так же, как Repeat, только текст может быть отредактирован.
+**Что пробовали и почему не сработало (3 итерации, каждая со своим шрамом).**
 
-Принцип — `methodology/переносимый-дизайн.md::Failed optimistic-action оставляет retry-точку в UI`.
+1. *Развилка persisted/placeholder по `isPersistedMsgId`.* Persisted → truncate JSONL по uuid, placeholder → пропуск truncate, local-only срез. Сломалось на **повторном клике**: после первого re-send тот же prompt висел с новым placeholder-id `user-<ts>` → второй клик уходил в placeholder-ветку → truncate пропускался → на диск дописывался дубликат → в Timeline 3 ответа вместо 2. Развилка по эфемерному id неидемпотентна by design. Заменено на единый userPosition-путь.
+
+2. *Click-storm.* Гард `actionBusy`/`isRunning` — это React state, ставится через setter. Быстрые повторные клики (юзер реально кликал ~20 раз за 2с пока UI «не реагировал») все проходили с `actionBusy=false`, потому что React батчит и не успевает flush'нуть первый `setActionBusy(true)` до следующего onClick → 20 параллельных `send-message`. Лечится **синхронным** `actionInFlightRef` (useRef): флипается в первой строке хендлера до любого setState, сбрасывается в `finally`. State-гард для re-entry бесполезен, нужен ref. См. `methodology/переносимый-дизайн.md::State-mirror через useState+useEffect`.
+
+3. *Loader-stomp.* Лоадер (`sdkState`) пропадал на 2-м клике. Причина: `truncateAndResend` ставил `setIsRunning(true)` + `sdkState:'fetching'` **до** `await claude-sdk:stop`. `stop` на main делает `query.close()`, что эмитит `claude-sdk:done` → renderer-handler `handleDone` гасит `isRunning=false` + `sdkState:'idle'` поверх только что выставленного fetching. На первом клике stop не звался (`has-active-session=false`) и баг не проявлялся. Лечение — выставлять loader **после** stop+truncate, прямо перед send: к этому моменту late `done` от закрытого query уже отработал.
+
+Невидимая связь: `onRepeat` нельзя писать как `setMessages(prev => { truncateAndResend(prev.find().text); return prev })` — outer-updater вернёт `prev` и затрёт оптимистичный trim из inner-setMessages. Читать текст через `messagesRef.current`. См. `methodology/переносимый-дизайн.md::React StrictMode`.
+
+Action-bar (↻/✎) показывается и для `user-*` placeholder'ов тоже (`showActions = isPersisted || isPlaceholderUser`) — чтобы упавший `send-message` (нативный бинарь не нашёлся `fix-sdk-asar-spawn.md`, MCP-токен сорвался, network 5xx) оставлял retry-точку, а не висячее сообщение без кнопок. Юзер: *«слева от сообщения в паре пикселях должна быть кнопка либо «отредактировать», либо «перезагрузки», чтобы переотправить промпт»*. Принцип — `methodology/переносимый-дизайн.md::Failed optimistic-action оставляет retry-точку в UI`.
 
 ## Hex chip подсветка в `AssistantTextPart`
 
@@ -449,4 +486,6 @@ Hex-цвета (`#FFF` / `#DA7756` / `#DA775680`) в ответе ассисте
 - `src/renderer/components/Workspace/ClaudeSDK/sdkHistoryParser.ts::parseSubagentMessages` — выделенный helper из `ClaudeSDKTab::loadHistory` чтобы pane'овский AgentDetail переиспользовал тот же JSONL-парсер.
 - `src/renderer/store/useWorkspaceStore.ts::updateSDKState` → `if (sidChanged) saveTabs(workspace.projectId, workspace.tabs)` — без этого SDK таб теряет `claudeSessionId` после Electron restart.
 - `src/main/main.js::resolveClaudeBinaryPath` → один helper для всех трёх SDK-входов (`loadSdkModelCapabilities`, `sdkStartQuery`, `claude-sdk:probe-commands`). Резолвит путь к native `claude`-бинарю, переписывает `app.asar/` → `app.asar.unpacked/`, отдаёт через `options.pathToClaudeCodeExecutable`. Без этого packaged-сборка падает по `ENOTDIR` в `child_process.spawn`. См. `fix-sdk-asar-spawn.md`.
-- `src/renderer/components/Workspace/ClaudeSDK/ClaudeSDKTab.tsx::truncateAndResend` → две ветки persistence (`isPersistedMsgId`): persisted → IPC truncate JSONL, placeholder → пропуск IPC, local-only replace. Обеспечивает retry для упавших `send-message` без перепечатывания промпта.
+- `src/renderer/components/Workspace/ClaudeSDK/ClaudeSDKTab.tsx::truncateAndResend` → единый путь по `userPosition` (счёт `role:'user'` до кликнутого в `messagesRef`). Синхронный `actionInFlightRef` против click-storm; loader (`fetching`) ставится после `await stop`, не до. См. `## Repeat/Edit` про 3 шрама (persisted/placeholder развилка, storm, loader-stomp).
+- `src/main/main.js::ipcMain.handle('claude-sdk:truncate-history')` → принимает `userPosition` (N-ный `type:'user'` в активной ветке, inclusive cut) ИЛИ legacy `targetUuid` (+`truncateAfter`). userPosition идемпотентен между повторными Repeat-кликами, targetUuid — нет (id меняется после re-send).
+- `src/main/main.js::ipcMain.handle('claude-sdk:has-active-session')` → лёгкий предикат `{active}` для renderer: нужно ли звать stop перед resend.

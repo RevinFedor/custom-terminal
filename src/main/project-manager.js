@@ -56,8 +56,8 @@ class ProjectManager {
     this.db.saveQuickActions(projectId, actions);
   }
 
-  saveProjectTabs(projectId, tabs, forceCleanup = false) {
-    this.db.saveTabs(projectId, tabs, forceCleanup);
+  saveProjectTabs(projectId, tabs, forceCleanup = false, preserveInterrupted = false) {
+    this.db.saveTabs(projectId, tabs, forceCleanup, preserveInterrupted);
   }
 
   saveProjectMetadata(projectId, metadata) {

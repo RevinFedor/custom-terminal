@@ -18,7 +18,7 @@ function scheduleSave(snapshot: Map<string, TabQueue>) {
   if (saveTimer) clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
     saveTimer = null;
-    const out: Record<string, Pick<TabQueue, 'items' | 'autoRun' | 'stopAfter' | 'closeAfter' | 'firstDelaySeconds' | 'postPromptEnabled' | 'postPromptText'>> = {};
+    const out: Record<string, Pick<TabQueue, 'items' | 'autoRun' | 'stopAfter' | 'closeAfter' | 'firstDelaySeconds' | 'postPromptEnabled' | 'postPromptText' | 'runAfterTabId'>> = {};
     for (const [tabId, q] of snapshot) {
       // Skip cold tabs with no persistable state — saves space + avoids polluting
       // the kv store with thousands of empty rows over time. Non-default delay
@@ -31,7 +31,8 @@ function scheduleSave(snapshot: Map<string, TabQueue>) {
         !q.closeAfter &&
         q.firstDelaySeconds === 0 &&
         !q.postPromptEnabled &&
-        !q.postPromptText
+        !q.postPromptText &&
+        !q.runAfterTabId
       ) continue;
       out[tabId] = {
         items: q.items,
@@ -41,6 +42,7 @@ function scheduleSave(snapshot: Map<string, TabQueue>) {
         firstDelaySeconds: q.firstDelaySeconds,
         postPromptEnabled: q.postPromptEnabled,
         postPromptText: q.postPromptText,
+        runAfterTabId: q.runAfterTabId,
       };
     }
     ipcRenderer.invoke('app:setState', { key: APP_STATE_KEY_QUEUE, value: JSON.stringify(out) })
@@ -140,6 +142,26 @@ type TabQueue = {
   // returns to OFF (after a restore-cycle the slot has done its job).
   // Non-persistent — across restarts there is no "prior" state to restore to.
   stopBeforeCloseArm: boolean;
+
+  // ── Run-after target tab ────────────────────────────────────────────────
+  // When non-null, the auto-runner waits for the busy→idle transition on
+  // ANOTHER tab (this id) instead of the queue-owner tab. Use case: «когда
+  // вот в той вкладке (Claude/Gemini/SDK) закончится текущий стрим — отправь
+  // мне следующий промпт здесь». Null = default behaviour (wait on own
+  // claude:busy-state for THIS tab).
+  //
+  // Selecting a tab that is NOT currently active in its project is allowed:
+  // runner stays in "waiting" state until that tab's busy-state becomes true
+  // (user activates it and sends a prompt → loader starts) and then false.
+  // The UI surfaces this with a "!" icon (waiting for activation) vs spinner
+  // (already busy, waiting for finish).
+  //
+  // Persistent so the choice survives restarts. Stale ids (target tab was
+  // closed) are validated lazily in the runner — if the tab no longer exists
+  // in any project workspace, the slot self-clears to null and falls back to
+  // standard own-tab behaviour. Don't validate in the store (would create a
+  // dependency cycle with useWorkspaceStore).
+  runAfterTabId: string | null;
 };
 
 interface PromptQueueStore {
@@ -155,6 +177,9 @@ interface PromptQueueStore {
   setAutoRun: (tabId: string, value: boolean) => void;
   setStopAfter: (tabId: string, value: boolean) => void;
   setCloseAfter: (tabId: string, value: boolean) => void;
+  // Set the target tab whose busy→idle transition should trigger the auto-run.
+  // null = clear (fall back to own-tab autoRun behaviour).
+  setRunAfterTab: (tabId: string, targetTabId: string | null) => void;
   setFirstDelaySeconds: (tabId: string, value: number) => void;
   // Start the first-delay countdown for this tab. Caller must already have
   // ensured firstDelaySeconds > 0 and autoRun === true.
@@ -196,6 +221,7 @@ const EMPTY: TabQueue = {
   postPromptText: '',
   firstChipHintActive: false,
   stopBeforeCloseArm: false,
+  runAfterTabId: null,
 };
 
 let idCounter = 0;
@@ -367,6 +393,18 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
       });
     },
 
+    setRunAfterTab: (tabId, targetTabId) => {
+      setAndPersist((state) => {
+        const next = new Map(state.queues);
+        const cur = next.get(tabId) ?? EMPTY;
+        // Self-target makes no semantic sense (waiting on yourself = waiting
+        // forever, since the same Stop hook would fire). Coerce to null.
+        const value = targetTabId === tabId ? null : targetTabId;
+        next.set(tabId, { ...cur, runAfterTabId: value });
+        return { queues: next };
+      });
+    },
+
     setFirstDelaySeconds: (tabId, value) => {
       const clamped = Math.max(0, Math.min(3600, Math.floor(value)));
       setAndPersist((state) => {
@@ -488,6 +526,7 @@ export async function hydratePromptQueueStore(): Promise<void> {
       firstDelaySeconds?: number;
       postPromptEnabled?: boolean;
       postPromptText?: string;
+      runAfterTabId?: string | null;
     }>;
     if (!parsed || typeof parsed !== 'object') return;
     usePromptQueueStore.setState((state) => {
@@ -510,6 +549,7 @@ export async function hydratePromptQueueStore(): Promise<void> {
           postPromptText: typeof entry.postPromptText === 'string' ? entry.postPromptText : '',
           firstChipHintActive: false, // UI-only, never restored
           stopBeforeCloseArm: false, // UI-only memory, never restored
+          runAfterTabId: typeof entry.runAfterTabId === 'string' ? entry.runAfterTabId : null,
         });
       }
       return { queues: next };

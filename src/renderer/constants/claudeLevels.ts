@@ -5,8 +5,22 @@
 //
 // DeepSeek uses its own scale ('off' as off-state) — kept separate intentionally.
 
-export const CLAUDE_EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
+// 'ultracode' (May 2026, Opus 4.8) is NOT a model effort level — it's a Claude
+// Code SESSION mode = xhigh effort + standing dynamic-workflow orchestration
+// (Claude auto-decides when to spin up a workflow, no "workflow" keyword needed).
+// The CLI accepts it as an `/effort ultracode` argument (binary ships the menu
+// `[low|medium|high|xhigh|max|ultracode|auto]`) and the SDK forwards
+// `options.effort` to `--effort` with no enum check — so it works identically on
+// PTY and SDK tabs. Sits last (heaviest). Requires an xhigh-capable model.
+export const CLAUDE_EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultracode'] as const;
 export type ClaudeEffortLevel = typeof CLAUDE_EFFORT_LEVELS[number];
+
+// ultracode gets special UI treatment: purple accent + "this turns on
+// auto-workflows" tooltip. Branch on this, don't hardcode. NOT gated by model
+// (effort gating was reverted — real Claude Code offers every level to every
+// model, incl. Haiku). SDK transport differs: ultracode → effort=xhigh +
+// settings.ultracode (the --effort flag's enum rejects 'ultracode').
+export const CLAUDE_ULTRACODE: ClaudeEffortLevel = 'ultracode';
 
 // 'none' is our own UI sentinel meaning "don't auto-inject /effort at all".
 // Stored in user prefs alongside real levels.
@@ -23,8 +37,9 @@ export const CLAUDE_EFFORT_LABELS: Record<ClaudeEffortLevel, string> = {
   low: 'low',
   medium: 'med',
   high: 'high',
-  xhigh: 'xhigh',
+  xhigh: 'xhi',
   max: 'max',
+  ultracode: 'ultra',
 };
 
 // DeepSeek's effort scale — distinct from Claude's because it includes an off-state.

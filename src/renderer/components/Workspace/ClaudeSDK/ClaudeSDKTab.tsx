@@ -22,11 +22,12 @@ import remarkGfm from 'remark-gfm';
 import { rehypeHexHighlight } from './rehypeHexHighlight';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
-import { Loader2, FileEdit, Terminal as TerminalIcon, FolderSearch, Search, FileText, Globe, RefreshCw, Pencil, Check, X as XIcon, Brain, ChevronRight, Copy as CopyIcon } from 'lucide-react';
+import { Loader2, FileEdit, Terminal as TerminalIcon, FolderSearch, Search, FileText, Globe, RefreshCw, Pencil, Check, X as XIcon, Brain, ChevronRight, Copy as CopyIcon, Trash2, ArrowDownToLine } from 'lucide-react';
 import Tooltip from '../../UI/Tooltip';
 import { consumePrefetched } from '../../../utils/sdkHistoryPrefetch';
 import { BackgroundTasksBar } from './BackgroundTasksBar';
 import { TaskDetailPane } from './TaskDetailPane';
+import { WorkflowPanel } from './WorkflowPanel';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -64,6 +65,45 @@ interface SDKChatMessage {
   // (pre/post tokens + duration). Прикрепляются в loadHistory когда
   // compact_boundary запись встречается прямо перед summary в JSONL chain.
   compactMetrics?: { preTokens: number; postTokens: number; durationMs: number; trigger?: string };
+  // True если user-prompt был отправлен из type-ahead очереди (Enter во время
+  // стриминга → auto-send при turn-end). Live-only — Anthropic JSONL не
+  // хранит UI-метаданные, после reload флаг теряется. UserMsg рендерит
+  // маленький оранжевый chip "queued" над bubble'ом.
+  wasQueued?: boolean;
+  // True если этот assistant-turn был прерван юзером (Esc / красная отмена /
+  // двойной Ctrl+C). В отличие от wasQueued ВЫЖИВАЕТ reload: на диске Claude
+  // пишет служебную запись-маркер `[Request interrupted by user]`, которую
+  // loadHistory детектит и навешивает этот флаг на предшествующий assistant.
+  // Live-путь (onCancel branch A) ставит флаг сразу, не дожидаясь reload.
+  // Рендерится приглушённой плашкой «⊘ stopped» слева у сообщения (AssistantMsg).
+  interrupted?: boolean;
+}
+
+// Служебные строки, которые Claude CLI/SDK пишет в JSONL как отдельную
+// `type:'user'` запись когда turn прерван юзером (Esc / отмена / Ctrl+C).
+// Константа захардкожена в самом Claude (английская, не локализуется,
+// стабильна на 20+ версиях CLI) — main.js дублирует тот же набор в
+// INTERRUPT_TEXTS для PTY busy-watcher'а. Три варианта: обычный стоп, стоп
+// во время tool-use, и короткая форма из старых версий.
+const SDK_INTERRUPT_TEXTS = new Set([
+  '[Request interrupted by user]',
+  '[Request interrupted by user for tool use]',
+  '[Request interrupted]',
+]);
+
+// Возвращает true если JSONL-запись — это маркер прерывания (type:'user' с
+// единственным text-блоком из SDK_INTERRUPT_TEXTS). Контент бывает строкой
+// ИЛИ массивом [{type:'text'}] — обрабатываем оба shape'а (как claude-data.js).
+function isInterruptMarkerRecord(rec: any): boolean {
+  if (!rec || rec.type !== 'user') return false;
+  const content = rec.message?.content;
+  if (typeof content === 'string') return SDK_INTERRUPT_TEXTS.has(content.trim());
+  if (Array.isArray(content)) {
+    if (content.length !== 1) return false;
+    const b = content[0];
+    return !!b && b.type === 'text' && typeof b.text === 'string' && SDK_INTERRUPT_TEXTS.has(b.text.trim());
+  }
+  return false;
 }
 
 // Derive flat fields from ordered parts. Mirrors the old paths so legacy
@@ -98,6 +138,202 @@ function extractToolResultText(content: any): string {
 }
 
 // ============================================================
+// Task aggregator — собирает TaskCreate / TaskUpdate / TaskList / TodoWrite
+// в один live-список (как нативный Claude TUI делает в `expandedView:'tasks'`).
+// Source of truth — поток tool_use блоков из assistant сообщений + парные
+// tool_result'ы (где для TaskCreate приходит фактический id вида "Task #123").
+//
+// TodoWrite (legacy V1) — пишет весь список одним вызовом, мы используем
+// последний эмит как полную замену. TaskCreate/TaskUpdate (V2) — инкрементальные
+// мутации, мы реконструируем состояние пошагово.
+//
+// Renderer-side (никакой IPC) — потому что все нужные данные уже в
+// `messages[*].parts[*]`, нет смысла поднимать main->renderer событие.
+// ============================================================
+export type AggregatedTaskStatus = 'pending' | 'in_progress' | 'completed';
+export interface AggregatedTask {
+  id: string;          // taskId (V2) или sintetic 'todo-<idx>' для legacy V1
+  subject: string;     // что показывать юзеру (TodoItem.content / Task.subject)
+  activeForm?: string; // present-continuous для in_progress спиннера
+  status: AggregatedTaskStatus;
+}
+const TASK_TOOL_NAMES = new Set(['TaskCreate', 'TaskUpdate', 'TaskList', 'TaskGet', 'TodoWrite']);
+// Извлекает Task #<id> из тула-результата TaskCreate. Native шлёт ровно
+// "Task #<id> created successfully: <subject>".
+const TASK_ID_FROM_RESULT_RE = /Task\s+#?(\w+)\s+created/i;
+function parseTaskIdFromCreateResult(result: any): string | null {
+  if (typeof result !== 'string') return null;
+  const m = result.match(TASK_ID_FROM_RESULT_RE);
+  return m ? m[1] : null;
+}
+export function aggregateTasksFromMessages(messages: SDKChatMessage[]): AggregatedTask[] {
+  // Map<taskId, AggregatedTask> сохраняет порядок вставки (как нативный list).
+  // Для legacy TodoWrite полностью пересоздаём ordered list при каждом вызове —
+  // он шлёт весь массив целиком, история мутаций неважна.
+  let tasks: AggregatedTask[] = [];
+  const byId = new Map<string, number>(); // taskId → index in tasks[]
+  // Для TaskCreate мы видим args ДО результата (в стриме), id придёт позже
+  // в tool_result. Промежуточный buffer: tool_use_id → temp record (id=tool_use_id
+  // как stub). При появлении result обновим запись на настоящий id.
+  // НО т.к. мы ходим по уже завершённым parts[] (которые уже могут иметь
+  // .result), и стрим обновляет parts[] in-place — этот аггрегатор всегда
+  // запускается на актуальном snapshot'е и не должен накапливать состояние
+  // между вызовами. Pass-2 проходит по тем же массивам и если result доехал,
+  // обновляет stub-id на реальный.
+  for (const m of messages) {
+    if (m.role !== 'assistant' || !m.parts) continue;
+    for (const p of m.parts) {
+      if (p.type !== 'tool') continue;
+      const name = p.name;
+      if (!TASK_TOOL_NAMES.has(name)) continue;
+      const args = p.args || {};
+      if (name === 'TodoWrite' && Array.isArray(args.todos)) {
+        // Legacy V1: full replace. Если все completed → native обнуляет список
+        // (см. TodoWriteTool.call::allDone), мы тоже скрываем — пустой массив.
+        const allDone = args.todos.length > 0 && args.todos.every((t: any) => t?.status === 'completed');
+        if (allDone) { tasks = []; byId.clear(); continue; }
+        tasks = args.todos.map((t: any, i: number) => ({
+          id: 'todo-' + i,
+          subject: String(t?.content ?? ''),
+          activeForm: typeof t?.activeForm === 'string' ? t.activeForm : undefined,
+          status: (t?.status === 'in_progress' || t?.status === 'completed' ? t.status : 'pending') as AggregatedTaskStatus,
+        }));
+        byId.clear();
+        tasks.forEach((t, i) => byId.set(t.id, i));
+        continue;
+      }
+      if (name === 'TaskCreate') {
+        // Реальный taskId приходит в tool_result; до него используем tool_use_id как stub.
+        // Дальше при чтении p.result резолвим в настоящий id и переименовываем запись.
+        let tid: string | null = parseTaskIdFromCreateResult(p.result);
+        const subject = String(args.subject ?? '');
+        const activeForm = typeof args.activeForm === 'string' ? args.activeForm : undefined;
+        if (tid && byId.has(tid)) continue; // уже есть (idempotent)
+        const stubKey = 'create:' + p.id; // pre-result placeholder
+        if (!tid) {
+          // stream still in flight — пока result не пришёл, держим stub
+          if (byId.has(stubKey)) continue;
+          tasks.push({ id: stubKey, subject, activeForm, status: 'pending' });
+          byId.set(stubKey, tasks.length - 1);
+          continue;
+        }
+        // result есть — добавляем под реальным id. Если был stub — заменяем его.
+        const stubIdx = byId.get(stubKey);
+        const record: AggregatedTask = { id: tid, subject, activeForm, status: 'pending' };
+        if (stubIdx !== undefined) {
+          tasks[stubIdx] = record;
+          byId.delete(stubKey);
+          byId.set(tid, stubIdx);
+        } else if (!byId.has(tid)) {
+          tasks.push(record);
+          byId.set(tid, tasks.length - 1);
+        }
+        continue;
+      }
+      if (name === 'TaskUpdate' && typeof args.taskId === 'string') {
+        const idx = byId.get(args.taskId);
+        if (idx === undefined) continue; // update для неизвестного — ignore (TaskList мог запушить, но мы его не парсим — fine)
+        const cur = tasks[idx];
+        // status === 'deleted' → убираем запись (native deleteTask flow)
+        if (args.status === 'deleted') {
+          tasks.splice(idx, 1);
+          byId.delete(args.taskId);
+          // переиндексируем хвост
+          for (let i = idx; i < tasks.length; i++) byId.set(tasks[i].id, i);
+          continue;
+        }
+        const nextStatus: AggregatedTaskStatus | undefined =
+          (args.status === 'pending' || args.status === 'in_progress' || args.status === 'completed') ? args.status : undefined;
+        tasks[idx] = {
+          ...cur,
+          subject: typeof args.subject === 'string' ? args.subject : cur.subject,
+          activeForm: typeof args.activeForm === 'string' ? args.activeForm : cur.activeForm,
+          status: nextStatus ?? cur.status,
+        };
+        continue;
+      }
+      // TaskList / TaskGet — read-only, не меняют state. Игнорируем
+      // (parsing tool_result текста было бы fragile, у нас всё уже есть из Create/Update).
+    }
+  }
+  return tasks;
+}
+
+// ============================================================
+// TaskListPanel — collapsible card sitting above the composer.
+// Header: ✻ <activeForm of current in_progress task> (N/M)  →  click toggles
+// expand. Expanded body: row per task with status glyph + strikethrough on
+// completed. Stays empty (renders null) if no tasks.
+// ============================================================
+function TaskListPanel({ tasks, collapsed, onToggle }: { tasks: AggregatedTask[]; collapsed: boolean; onToggle: () => void }) {
+  if (!tasks || tasks.length === 0) return null;
+  const done = tasks.filter(t => t.status === 'completed').length;
+  const inProgress = tasks.find(t => t.status === 'in_progress');
+  // Header label — prefer the active task's activeForm (что Claude "сейчас делает"),
+  // иначе static "Tasks". Native CLI делает то же — спиннер крутится с activeForm.
+  const headerLabel = inProgress?.activeForm || inProgress?.subject || (done === tasks.length ? 'Tasks (all done)' : 'Tasks');
+  return (
+    <div className="px-4 pb-1.5">
+      <div
+        style={{
+          backgroundColor: 'rgba(218, 119, 86, 0.06)',
+          border: '1px solid rgba(218, 119, 86, 0.22)',
+          borderRadius: 6,
+          padding: '4px 8px',
+          maxWidth: '100%',
+        }}
+      >
+        {/* Header row — clickable, toggles collapse */}
+        <div
+          onClick={onToggle}
+          className="flex items-center gap-2 cursor-pointer select-none"
+          style={{ fontSize: '0.85em' }}
+          title={collapsed ? 'Развернуть список задач' : 'Свернуть список задач'}
+        >
+          <span style={{ color: '#DA7756', fontWeight: 600, letterSpacing: '0.04em', fontSize: '0.85em' }}>TASKS</span>
+          <span className="truncate" style={{ color: '#d8b9a3' }}>
+            {inProgress ? <Loader2 size={10} className="animate-spin inline-block mr-1.5 align-[-1px]" /> : null}
+            {headerLabel}
+          </span>
+          <span className="ml-auto shrink-0" style={{ color: '#9a7a63', fontSize: '0.77em' }}>
+            {done}/{tasks.length}
+          </span>
+          <span className="shrink-0" style={{ color: '#9a7a63', fontSize: '0.77em', minWidth: 10, textAlign: 'right' }}>
+            {collapsed ? '▸' : '▾'}
+          </span>
+        </div>
+
+        {/* Body — only rendered when expanded. Each row: glyph + subject. */}
+        {!collapsed && (
+          <ul className="mt-1.5 flex flex-col gap-0.5" style={{ listStyle: 'none', padding: 0, margin: 0 }}>
+            {tasks.map(t => {
+              const isDone = t.status === 'completed';
+              const isActive = t.status === 'in_progress';
+              const glyph = isDone ? '✓' : isActive ? '▣' : '□';
+              const glyphColor = isDone ? '#7ab87a' : isActive ? '#DA7756' : '#888';
+              const textColor = isDone ? '#777' : isActive ? '#FFB382' : '#bdbdbd';
+              return (
+                <li key={t.id} className="flex items-start gap-2" style={{ fontSize: '0.85em', lineHeight: 1.4 }}>
+                  <span style={{ color: glyphColor, fontFamily: 'monospace', flexShrink: 0, width: 14, textAlign: 'center' }}>{glyph}</span>
+                  <span
+                    style={{
+                      color: textColor,
+                      textDecoration: isDone ? 'line-through' : 'none',
+                    }}
+                  >
+                    {t.subject}
+                  </span>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
 // Convert our internal messages to assistant-ui ThreadMessageLike
 // ============================================================
 export function convertMessage(msg: SDKChatMessage): ThreadMessageLike {
@@ -129,6 +365,9 @@ export function convertMessage(msg: SDKChatMessage): ThreadMessageLike {
   // tail. Source of truth is `msg.parts[]`; if absent (legacy code path /
   // pre-refactor placeholder) fall back to the flat fields in canonical
   // order (thinking → text → tools).
+  // Carry the interrupt flag into the module-level Set (ThreadMessageLike drops
+  // custom fields) so AssistantMsg can render the «⊘ stopped» badge by id.
+  if (msg.interrupted) setInterruptedForMsg(msg.id);
   const aui: ThreadMessageLike['content'] = [];
 
   if (msg.parts && msg.parts.length > 0) {
@@ -138,6 +377,11 @@ export function convertMessage(msg: SDKChatMessage): ThreadMessageLike {
       } else if (p.type === 'text') {
         if (p.text) aui.push({ type: 'text' as const, text: p.text });
       } else if (p.type === 'tool') {
+        // Task* / TodoWrite tools агрегируются в TaskListPanel над composer'ом
+        // (как нативный TUI делает в `expandedView:'tasks'`). Не рендерим их
+        // дублирующимися карточками в основном треде — иначе одно и то же
+        // содержимое видно дважды.
+        if (TASK_TOOL_NAMES.has(p.name)) continue;
         aui.push({
           type: 'tool-call' as const,
           toolName: p.name,
@@ -153,6 +397,8 @@ export function convertMessage(msg: SDKChatMessage): ThreadMessageLike {
     if (msg.thinking) aui.push({ type: 'reasoning' as const, text: msg.thinking });
     if (msg.text) aui.push({ type: 'text' as const, text: msg.text });
     for (const tc of msg.toolCalls) {
+      // Task* / TodoWrite — см. комментарий выше, тот же гард для legacy path.
+      if (TASK_TOOL_NAMES.has(tc.name)) continue;
       aui.push({
         type: 'tool-call' as const,
         toolName: tc.name,
@@ -188,10 +434,17 @@ export function convertMessage(msg: SDKChatMessage): ThreadMessageLike {
 // as runtime 404 from the API (no client-side preflight today). Update this
 // table when Anthropic ships a new generation; nothing else in the codebase
 // needs to change because every model-mapping lookup goes through here.
+// Values are what we hand to query() options.model. We pass ALIASES (not full
+// IDs) so the CLI's own resolver picks the current shipping model + attaches
+// the 1M beta from the [1m] suffix — exactly what `supportedModels()` returns
+// as selectable values (verified live: default / sonnet / sonnet[1m] / haiku /
+// opus[1m]). The binary maps `opus[1m]` → Opus 4.8 (1M) internally. Passing a
+// bare `claude-opus-4-7` here was a double bug: stale version AND no [1m], so
+// it silently ran 200K while the footer claimed "(1M context)".
 const SDK_MODEL_MAP: Record<string, string | undefined> = {
   default: undefined,
   sonnet: 'claude-sonnet-4-6',
-  opus: 'claude-opus-4-7',
+  opus: 'opus[1m]',
   haiku: 'claude-haiku-4-5-20251001',
 };
 function resolveSdkModel(alias: string | undefined): string | undefined {
@@ -227,7 +480,7 @@ function detectModelFamilyMismatch(requestedAlias: string | undefined, actualMod
 // SDK default = whatever Anthropic ships as 'default' for `query()` — at the
 // moment of writing this is Opus 4.7. Used as fallback label when alias is
 // 'default' (or undefined) AND no real model id is known yet (cold start).
-const SDK_DEFAULT_MODEL_ID = 'claude-opus-4-7';
+const SDK_DEFAULT_MODEL_ID = 'claude-opus-4-8';
 
 function formatModelLabel(realModel: string | null, alias: string | undefined): string | null {
   // Resolution priority:
@@ -242,11 +495,24 @@ function formatModelLabel(realModel: string | null, alias: string | undefined): 
   if (!src || src.startsWith('<')) return null;
   const family = src.includes('opus') ? 'Opus' : src.includes('sonnet') ? 'Sonnet' : src.includes('haiku') ? 'Haiku' : null;
   if (!family) return realModel; // unknown — show raw
-  // Pull version like "4-7" or "4.5" out of "claude-opus-4-7", "claude-opus-4-7-20251202", etc.
-  const versionMatch = src.match(/-(\d+)[-.](\d+)(?:[-.]\d+)*(?:-\d{8})?$/);
+  // 1M is driven by the [1m] alias suffix (mirrors the CLI's has1mContext =
+  // /\[1m\]/ which attaches the context-1m beta). We may be looking at the
+  // alias ('opus[1m]') OR a real SSE id ('claude-opus-4-8'); the real id never
+  // carries [1m], so also treat a known-1M family id as 1M. Opus is 1M-by-
+  // default on the API (4.8); Sonnet only with the explicit [1m] variant.
+  const has1mTag = /\[1m\]/.test(src);
+  // Version digits live on a real model id ('claude-opus-4-8'), never on a bare
+  // alias ('opus[1m]'). Prefer the SSE-truth realModel for the version when it's
+  // the same family as what we're labelling, so picking the 'opus' alias still
+  // renders "Opus 4.8" (not a version-less "Opus") once the first chunk lands.
+  const versionSrc = (realModel && family && realModel.toLowerCase().includes(family.toLowerCase()))
+    ? realModel.toLowerCase() : src;
+  const versionMatch = versionSrc.match(/-(\d+)[-.](\d+)(?:[-.]\d+)*(?:-\d{8})?$/);
   const version = versionMatch ? `${versionMatch[1]}.${versionMatch[2]}` : '';
-  // Opus 4.7 supports 1M context; everything else is 200K (current shipping defaults).
-  const is1M = family === 'Opus' && version === '4.7';
+  // Opus is 1M-by-default on the API from 4.8 onward; pre-4.8 Opus and all
+  // Sonnet/Haiku are 200K unless the [1m] variant was explicitly chosen.
+  const opusIs1mByDefault = family === 'Opus' && version !== '' && version !== '4.5' && version !== '4.6' && version !== '4.7';
+  const is1M = has1mTag || opusIs1mByDefault;
   const window = is1M ? ' (1M context)' : '';
   return `${family}${version ? ' ' + version : ''}${window}`;
 }
@@ -255,11 +521,19 @@ function formatModelLabel(realModel: string | null, alias: string | undefined): 
 // the "N% used / left" pill — Anthropic doesn't ship this in the SDK so we
 // hard-code well-known values. Off-by-2% is fine for the indicator's purpose.
 function getModelContextWindow(realModel: string | null, alias: string | undefined): number {
-  const src = (realModel || resolveSdkModel(alias) || alias || '').toLowerCase();
-  if (src.includes('opus-4-7') || src.includes('opus-4.7')) return 1_000_000;
-  if (src.includes('sonnet')) return 200_000;
-  if (src.includes('haiku')) return 200_000;
-  if (src.includes('opus')) return 200_000;
+  // Consider BOTH the real SSE id and the chosen alias — the alias carries the
+  // [1m] suffix that the real id drops. 1M when: explicit [1m] tag (any family
+  // that supports it), or Opus 4.8+ (1M by default on the API).
+  const aliasSrc = (resolveSdkModel(alias) || alias || '').toLowerCase();
+  const realSrc = (realModel || '').toLowerCase();
+  const combined = realSrc + ' ' + aliasSrc;
+  if (/\[1m\]/.test(combined)) return 1_000_000;
+  // Opus 4.8+ → 1M default (4.5/4.6/4.7 were 200K unless [1m]).
+  const opusVer = combined.match(/opus-(\d+)[-.](\d+)/);
+  if (opusVer) {
+    const v = `${opusVer[1]}.${opusVer[2]}`;
+    if (v !== '4.5' && v !== '4.6' && v !== '4.7') return 1_000_000;
+  }
   return 200_000;
 }
 
@@ -401,9 +675,83 @@ function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKT
   // show Resume affordance" from "naturally finished, normal composer". Cleared
   // when the user resumes (clicks Resume) or sends the next message.
   const [wasStopped, setWasStopped] = useState(false);
+  // Type-ahead queue (single slot) — the user hit Enter while Claude was still
+  // streaming. Mirrors native Claude TUI: the message parks above the input and
+  // auto-sends when the current turn finishes naturally. Lives in the OUTER
+  // component (not SDKComposer) so it survives the composer unmounting when a
+  // task-detail-pane opens, and sits next to the `result` handler + dispatchPrompt
+  // + onCancel that drive it. `queued` is the render source; `queuedRef` is the
+  // synchronous mirror the result-handler reads (its useEffect closure can't see
+  // fresh state). Full multi-item queue (reorder, stop-after) is a separate
+  // later feature — this is just the native single-shot type-ahead.
+  const [queued, setQueued] = useState<string | null>(null);
+  const queuedRef = useRef<string | null>(null);
+  // Visual state of the chip-over-input:
+  //   'queued' — pushed locally, SDK has not yet pulled it. Reversible.
+  //              Orange chip; Esc/Up returns text to input.
+  //   'sent'   — SDK pulled from channel, Claude received it but JSONL
+  //              has not landed yet. Gray chip; recall is no-op
+  //              (cannot un-send to Claude).
+  //   null     — no chip rendered.
+  const [queuedState, setQueuedState] = useState<'queued' | 'sent' | null>(null);
+  const queuedStateRef = useRef<'queued' | 'sent' | null>(null);
+  // Pending mid-stream type-ahead prompts awaiting "promote to thread"
+  // signal: we don't push user-bubble for wasQueued=true immediately (to
+  // avoid showing a bubble before SDK actually delivers). When SDK's
+  // mid-chain drain happens, Claude emits the NEXT assistant chunk that
+  // semantically responds to our queued prompt. We use that chunk as the
+  // signal to promote chip → real user-bubble in the thread.
+  // Each entry tracks its lifecycle state:
+  //   - 'queued':   pushed to main, SDK has not yet pulled from input channel
+  //                 → chip is reversible (Esc/Up returns text to input)
+  //   - 'sent':     SDK pulled it from channel, en-route to Claude CLI
+  //                 → chip is locked (cannot recall), but not yet in JSONL
+  //   - landed → entry is removed from pending entirely and a user-bubble is
+  //               inserted into the thread at the JSONL position.
+  //
+  // State transitions:
+  //   push      → state:'queued'  (dispatchPrompt for wasQueued=true)
+  //   consumed  → state:'sent'    (handleMidstreamConsumed, IPC from main)
+  //   landed    → REMOVED         (handleMidstreamJsonlLanded, IPC from main)
+  //   done (result/error)  → fallback promote of any remaining 'sent' as
+  //                          unconfirmed user-bubble; orphan 'queued' (impossible
+  //                          in practice — SDK consumes synchronously) cleared.
+  //   stop (manual) → 'sent' → unconfirmed; 'queued' → discarded entirely.
+  const pendingMidstreamRef = useRef<Array<{text: string; ts: number; state: 'queued' | 'sent'}>>([]);
+  // wasStopped mirror for the result-handler closure (belt-and-suspenders: a
+  // natural `result` shouldn't arrive after Stop, but guards the rare race).
+  const wasStoppedRef = useRef(false);
+  useEffect(() => { wasStoppedRef.current = wasStopped; }, [wasStopped]);
+  // isRunning mirror for `onCancel`. assistant-ui's runtime can invoke onCancel
+  // unconditionally on Escape (even after the turn finished and the Cancel
+  // affordance is gone), and onCancel's rollback branch (B) would then drop the
+  // last user→assistant pair from history. Gate the whole function on this ref
+  // — Escape after turn-end is a no-op for the SDK tab. Putting `isRunning` in
+  // onCancel's useCallback deps would churn the runtime (every state flip
+  // recreates the callback, useExternalStoreRuntime may resubscribe), the ref
+  // sidesteps that.
+  const isRunningRef = useRef(false);
+  useEffect(() => { isRunningRef.current = isRunning; }, [isRunning]);
+  // dispatchPrompt is defined below; the result-handler effect (above it) needs
+  // to call it at event-time, so bridge through a ref kept current by an effect.
+  const dispatchPromptRef = useRef<((t: string, opts?: { wasQueued?: boolean }) => Promise<void>) | null>(null);
   // Background task that has been expanded into the 300px detail pane (replaces
   // the composer). Null = composer visible. Bar above stays visible either way.
   const [expandedTaskId, setExpandedTaskId] = useState<string | null>(null);
+  // Is the currently-expanded task a workflow? Drives which panel the footer
+  // shows (WorkflowPanel vs TaskDetailPane). A workflow is NOT auto-expanded —
+  // it appears as a chip in BackgroundTasksBar and only expands when the user
+  // selects it (↓ to the chip + Enter, or click), exactly like any other task.
+  // Primitive boolean selector → no re-render churn.
+  const expandedTaskIsWorkflow = useWorkspaceStore((s) => {
+    if (!expandedTaskId) return false;
+    for (const [, ws] of s.openProjects) {
+      const t = ws.tabs.get(tabId);
+      const bt = t?.bgTasks?.find(b => b.taskId === expandedTaskId);
+      if (bt) return bt.kind === 'workflow';
+    }
+    return false;
+  });
   // Context-window usage from the last assistant message. Claude API reports
   // total input as `input_tokens + cache_read_input_tokens + cache_creation_input_tokens`
   // — we keep the raw total here and compute the percentage at render time
@@ -424,6 +772,60 @@ function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKT
   const updateSDKState = useWorkspaceStore((s) => s.updateSDKState);
   const upsertBgTask = useWorkspaceStore((s) => s.upsertBgTask);
   const removeBgTask = useWorkspaceStore((s) => s.removeBgTask);
+  // Any background task (workflow / subagent / bash) still running on this tab.
+  // Edit/Repeat must be blocked while one runs: rewriting the JSONL requires a
+  // hard kill, which would silently abort the bg agent. Granular boolean
+  // selector (Fingerprint pattern — never subscribe to the bgTasks array shape).
+  const bgAgentRunning = useWorkspaceStore((s) => {
+    for (const [, ws] of s.openProjects) {
+      const t = ws.tabs.get(tabId);
+      if (t) return !!t.bgTasks?.some(b => b.status === 'running');
+    }
+    return false;
+  });
+
+  // Mirror pendingMidstreamRef into the Zustand tab so that switching projects
+  // (which unmounts this component) doesn't lose the chip state. On remount we
+  // hydrate the ref from the store. Main-process JSONL watcher is keyed by
+  // tabId — it stays alive across project switches; events keep flowing,
+  // they just queue up while the component is unmounted, and re-fire onto
+  // the freshly hydrated chip when the user returns.
+  const syncPendingToStore = useCallback(() => {
+    const snapshot = pendingMidstreamRef.current.map(p => ({ text: p.text, ts: p.ts, state: p.state }));
+    updateSDKState(tabId, { sdkMidstreamPending: snapshot });
+  }, [tabId, updateSDKState]);
+  // Re-derive the visible chip from the front of the pending queue. Called
+  // whenever pending mutates so the chip text + color reflect the head.
+  const refreshChipFromPending = useCallback(() => {
+    const pending = pendingMidstreamRef.current;
+    if (pending.length === 0) {
+      queuedRef.current = null;
+      setQueued(null);
+      queuedStateRef.current = null;
+      setQueuedState(null);
+    } else {
+      queuedRef.current = pending[0].text;
+      setQueued(pending[0].text);
+      queuedStateRef.current = pending[0].state;
+      setQueuedState(pending[0].state);
+    }
+  }, []);
+  // Hydrate pending from store on mount. Allows the chip to reappear after
+  // a project switch (component unmount/remount).
+  useEffect(() => {
+    const state = useWorkspaceStore.getState();
+    let stored: Array<{ text: string; ts: number; state: 'queued' | 'sent' }> | undefined;
+    for (const [, ws] of state.openProjects) {
+      const t = ws.tabs.get(tabId);
+      if (t && Array.isArray(t.sdkMidstreamPending)) { stored = t.sdkMidstreamPending; break; }
+    }
+    if (stored && stored.length > 0) {
+      pendingMidstreamRef.current = stored.map(p => ({ ...p }));
+      refreshChipFromPending();
+      console.log('[TypeAhead] hydrated pending=' + stored.length + ' tab=' + tabId.slice(-12));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tabId]);
 
   // DEBUG: mount/render tracking
   useEffect(() => {
@@ -490,11 +892,67 @@ function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKT
       }
     }
 
+    // Pre-pass: resolve which assistant turns the user interrupted. Claude
+    // writes a synthetic `[Request interrupted by user]` user-record whose
+    // parentUuid chain leads back to the interrupted assistant turn — directly
+    // for a text/thinking abort, or through the tool_result record for a
+    // mid-tool abort. Walk parentUuid up to the nearest assistant and remember
+    // its uuid; the map below drops the marker record itself and flags that
+    // assistant message instead (so the «⊘ stopped» badge anchors on the
+    // answer, not on a literal "[Request interrupted by user]" user bubble).
+    const _byUuid: Record<string, any> = {};
+    for (const r of result.messages) { if (r && r.uuid) _byUuid[r.uuid] = r; }
+    const _parentOf = (r: any) => (r && (r.logicalParentUuid || r.parentUuid)) || null;
+    const interruptedAssistantUuids = new Set<string>();
+    for (const r of result.messages) {
+      if (!isInterruptMarkerRecord(r)) continue;
+      let cur = _parentOf(r);
+      let hops = 0;
+      while (cur && hops < 20) {
+        const rec = _byUuid[cur];
+        if (!rec) break;
+        if (rec.type === 'assistant' && rec.uuid) { interruptedAssistantUuids.add(rec.uuid); break; }
+        cur = _parentOf(rec);
+        hops++;
+      }
+    }
+
     // Pending metrics from a compact_boundary record, waiting to attach to
     // the next compact-summary entry. JSONL ordering guarantees boundary →
     // summary adjacency.
     let pendingCompactMetrics: SDKChatMessage['compactMetrics'] | null = null;
     const loaded: SDKChatMessage[] = result.messages.map((m: any, i: number) => {
+      // Interrupt marker record — never a renderable bubble. The pre-pass above
+      // already flagged the assistant turn it points at; drop the marker itself.
+      if (isInterruptMarkerRecord(m)) return null;
+      // queued_command attachment — CLI writes user mid-stream pushes
+      // (priority:'next' / type-ahead during a running turn) as an
+      // attachment record, NOT a regular type:'user' record. Surface it as
+      // a user-bubble with the wasQueued flag so the orange "↑ QUEUED"
+      // badge renders (matches the live-stream path's badge). Without this
+      // branch, the entry's role becomes the literal 'attachment' string
+      // and the assistant-ui adapter silently drops it — the user
+      // perceives this as «my queued message vanished after reload».
+      if (m.type === 'attachment' && m.attachment && m.attachment.type === 'queued_command') {
+        const prompt = m.attachment.prompt;
+        const text = Array.isArray(prompt) && prompt[0] && typeof prompt[0].text === 'string'
+          ? prompt[0].text
+          : '';
+        // The orange "↑ QUEUED" badge discriminator on user bubbles checks
+        // `msgId` against `/^user-queued-/`, not the wasQueued boolean —
+        // because assistant-ui drops unknown extra fields when re-importing
+        // the message. We must encode wasQueued into the id itself so the
+        // badge survives a reload.
+        return {
+          id: 'user-queued-' + (m.uuid || ('hist-' + i)),
+          role: 'user' as const,
+          text,
+          toolCalls: [],
+          thinking: null,
+          timestamp: Date.now() - (result.messages.length - i) * 1000,
+          wasQueued: true,
+        };
+      }
       // Build ordered parts[] for assistant messages — preserving the exact
       // block sequence Claude emitted (thinking → tool → tool → thinking → text
       // etc.). Each JSONL record contributes its own ordered slice; cross-record
@@ -633,7 +1091,13 @@ function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKT
         thinking: role === 'assistant' ? derived.thinking : null,
         timestamp: Date.now() - (result.messages.length - i) * 1000,
       };
-      if (role === 'assistant') out.parts = parts;
+      if (role === 'assistant') {
+        out.parts = parts;
+        // Was THIS assistant record the one the user interrupted? (Resolved by
+        // the parentUuid pre-pass.) The merge below ORs the flag onto the
+        // surviving merged turn — the marker may point at any constituent record.
+        if (m.uuid && interruptedAssistantUuids.has(m.uuid)) out.interrupted = true;
+      }
       return out;
     }).filter((m: SDKChatMessage | null): m is SDKChatMessage => {
       if (!m) return false;
@@ -655,6 +1119,8 @@ function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKT
         prev.text = d.text;
         prev.thinking = d.thinking;
         prev.toolCalls = d.toolCalls;
+        // Marker may have pointed at a later constituent record of this turn.
+        if (m.interrupted) prev.interrupted = true;
       } else {
         merged.push({ ...m });
       }
@@ -740,10 +1206,134 @@ function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKT
       const { tabId: tid } = (e as CustomEvent).detail;
       if (tid !== tabId) return;
       setWasStopped(true);
+      // Stop = "abandon this turn". JSONL is the source of truth: anything
+      // that already landed in the transcript was promoted by
+      // handleMidstreamJsonlLanded before stop fired (main also does one
+      // final tail-read on stop to catch last-millisecond writes). Anything
+      // STILL in pending after that is not in the transcript and never
+      // will be — Claude wouldn't see it on a future resume. Drop silently
+      // for sent. Queued never reached the channel → safe to recall to
+      // the composer.
+      const pending = pendingMidstreamRef.current;
+      const queuedItems = pending.filter(p => p.state === 'queued');
+      const droppedSent = pending.filter(p => p.state === 'sent').length;
+      pendingMidstreamRef.current = [];
+      queuedRef.current = null;
+      setQueued(null);
+      queuedStateRef.current = null;
+      setQueuedState(null);
+      syncPendingToStore();
+      if (queuedItems.length > 0) {
+        const text = queuedItems[0].text;
+        window.dispatchEvent(new CustomEvent('claude-sdk:composer-insert', { detail: { tabId, text } }));
+      }
+      if (droppedSent > 0) {
+        console.log('[TypeAhead] stop-time drop unconfirmed sent=' + droppedSent + ' tab=' + tabId.slice(-12));
+      }
     };
     window.addEventListener('claude-sdk:was-stopped', handler);
     return () => window.removeEventListener('claude-sdk:was-stopped', handler);
+  }, [tabId, syncPendingToStore]);
+
+  // Durable "stopped" badge — live path for stop gestures that DON'T run
+  // onCancel branch A (TabBar dot, ControlBar chip, ctx-menu — they only invoke
+  // claude-sdk:stop). Main's interrupt-marker tail-read (claude-sdk:interrupted)
+  // fires once the CLI flushes `[Request interrupted by user]` to JSONL after
+  // our graceful query.interrupt(). We flag the LAST assistant message so the
+  // «⊘ stopped» plate appears without waiting for a reload. On reopen,
+  // loadHistory re-derives the same flag from the on-disk marker, so the two
+  // agree. (onCancel branch A already tags its kept partial directly.)
+  useEffect(() => {
+    const handler = (_: any, data: { tabId: string; markerUuid: string | null; parentUuid: string | null }) => {
+      if (data.tabId !== tabId) return;
+      setMessages(prev => {
+        // Prefer the assistant message the marker parents (by source uuid);
+        // fall back to the last assistant message in the thread.
+        let idx = -1;
+        if (data.parentUuid) idx = prev.findLastIndex(m => m.role === 'assistant' && m.id === data.parentUuid);
+        if (idx === -1) idx = prev.findLastIndex(m => m.role === 'assistant');
+        if (idx === -1) return prev;
+        const target = prev[idx];
+        if (target.interrupted) return prev; // already flagged (onCancel beat us)
+        setInterruptedForMsg(target.id);
+        const next = prev.slice();
+        next[idx] = { ...target, interrupted: true };
+        return next;
+      });
+    };
+    ipcRenderer.on('claude-sdk:interrupted', handler);
+    return () => { ipcRenderer.removeListener('claude-sdk:interrupted', handler); };
   }, [tabId]);
+
+  // Type-ahead enqueue/recall bridge. SDKComposer (which owns the keydown +
+  // composer text) fires these; the queue state lives here in the outer
+  // component (survives composer unmount on task-pane open). enqueue: park the
+  // text above the input. recall: pull it back into the composer (used by
+  // ArrowUp-on-empty-caret and by the chip's click/×). recall routes through
+  // composer-insert (append semantics) so it lands at the end of whatever the
+  // user already typed — matching the user's spec «если в инпуте уже что-то
+  // есть то в конец».
+  useEffect(() => {
+    const onEnqueue = (e: Event) => {
+      const { tabId: tid, text } = (e as CustomEvent).detail || {};
+      if (tid !== tabId || !text) return;
+      // Mid-stream type-ahead: push IMMEDIATELY into the live query channel
+      // (main detects existing session and routes to session.push with
+      // priority:'next'). SDK delivers it at the next block boundary —
+      // именно то что юзер описывает: «дожидается окончания блока который
+      // сейчас, потом сразу отправляется», not waiting full `result`.
+      console.log('[TypeAhead] mid-stream push tab=' + tabId.slice(-12) + ' len=' + text.length);
+      // dispatchPrompt сам пушит user-bubble в тред и не нуждается в chip'е
+      // как промежуточном "pending" индикаторе — bubble появляется мгновенно
+      // (синхронный setMessages). Раньше тут стояли `queuedRef.current=text;
+      // setQueued(text)` ПОСЛЕ вызова dispatchPrompt — это переустанавливало
+      // chip, который dispatchPrompt только что очистил (внутри setMessages +
+      // setQueued(null)), и chip висел навсегда. Race fixed: дёргаем dispatch
+      // и НЕ трогаем queue state — bubble в треде достаточен.
+      dispatchPromptRef.current?.(text, { wasQueued: true });
+    };
+    const onRecall = (e: Event) => {
+      const { tabId: tid } = (e as CustomEvent).detail || {};
+      if (tid !== tabId) return;
+      if (!queuedRef.current) return;
+      // Only the 'queued' state is recallable. Once SDK pulled the message
+      // from channel ('sent'), it's already at Claude — cannot un-send.
+      if (queuedStateRef.current !== 'queued') {
+        console.log('[TypeAhead] recall ignored — state=' + queuedStateRef.current + ' tab=' + tabId.slice(-12));
+        return;
+      }
+      const text = queuedRef.current;
+      // Remove only the front 'queued' entry; preserve any later entries
+      // (none in practice — single-shot type-ahead — but defensive).
+      const pending = pendingMidstreamRef.current;
+      const idx = pending.findIndex(p => p.state === 'queued' && p.text === text);
+      if (idx >= 0) pending.splice(idx, 1);
+      refreshChipFromPending();
+      syncPendingToStore();
+      window.dispatchEvent(new CustomEvent('claude-sdk:composer-insert', { detail: { tabId, text } }));
+    };
+    const onDismiss = (e: Event) => {
+      const { tabId: tid } = (e as CustomEvent).detail || {};
+      if (tid !== tabId) return;
+      if (queuedStateRef.current !== 'queued') {
+        console.log('[TypeAhead] dismiss ignored — state=' + queuedStateRef.current + ' tab=' + tabId.slice(-12));
+        return;
+      }
+      const pending = pendingMidstreamRef.current;
+      const idx = pending.findIndex(p => p.state === 'queued');
+      if (idx >= 0) pending.splice(idx, 1);
+      refreshChipFromPending();
+      syncPendingToStore();
+    };
+    window.addEventListener('claude-sdk:typeahead-enqueue', onEnqueue);
+    window.addEventListener('claude-sdk:typeahead-recall', onRecall);
+    window.addEventListener('claude-sdk:typeahead-dismiss', onDismiss);
+    return () => {
+      window.removeEventListener('claude-sdk:typeahead-enqueue', onEnqueue);
+      window.removeEventListener('claude-sdk:typeahead-recall', onRecall);
+      window.removeEventListener('claude-sdk:typeahead-dismiss', onDismiss);
+    };
+  }, [tabId, refreshChipFromPending, syncPendingToStore]);
 
   // Focus the composer input when SessionActionChip's "Continue" is clicked
   // for an SDK tab — there's no PTY to bring forward, so the meaningful action
@@ -785,7 +1375,7 @@ function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKT
       setWasStopped(false);
       updateSDKState(tabId, { sdkState: 'fetching' });
       setMessages(prev => [...prev, {
-        id: 'user-ext-' + Date.now(),
+        id: 'user-ext-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8),
         role: 'user' as const,
         text,
         toolCalls: [],
@@ -846,26 +1436,14 @@ function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKT
     const handleMessage = (_: any, data: { tabId: string; message: any; sessionId: string }) => {
       if (data.tabId !== tabId) return;
 
-      // [SlashProbe] Mirror of main-side log: every message that hits the
-      // renderer gets a one-liner with type/subtype/content shape. System
-      // messages (especially local_command_output) get a full dump — they're
-      // the ones SDK emits for /usage, /cost, /status, /help, /compact etc.
+      // Verbose per-message renderer dump — gated behind a localStorage flag
+      // so it's available for future SDK-stream forensics without spamming the
+      // log on every run. Enable: localStorage.NOTED_DEBUG_SDK_STREAM = '1'.
       try {
-        const m = data.message;
-        const summary = {
-          type: m?.type,
-          subtype: m?.subtype,
-          is_error: m?.is_error,
-          uuid: m?.uuid?.slice?.(0, 8),
-          contentTypes: Array.isArray(m?.message?.content)
-            ? m.message.content.map((b: any) => b?.type).join(',')
-            : typeof m?.message?.content === 'string' ? 'string' : null,
-          hasContent: typeof m?.content === 'string' ? `${m.content.length}ch` : null,
-          allKeys: Object.keys(m || {}).join(','),
-        };
-        console.log('[SlashProbe:Renderer] tab=' + tabId.slice(-12) + ' msg=' + JSON.stringify(summary));
-        if (m?.type === 'system') {
-          console.log('[SlashProbe:Renderer] tab=' + tabId.slice(-12) + ' SYSTEM_FULL=' + JSON.stringify(m).slice(0, 1000));
+        if (localStorage.getItem('NOTED_DEBUG_SDK_STREAM') === '1') {
+          const m = data.message;
+          console.log('[SlashProbe:Renderer] tab=' + tabId.slice(-12) + ' ' + m?.type + '/' + (m?.subtype || '') + ' keys=' + Object.keys(m || {}).join(','));
+          if (m?.type === 'system') console.log('[SlashProbe:Renderer] SYSTEM_FULL=' + JSON.stringify(m).slice(0, 1000));
         }
       } catch {}
 
@@ -996,6 +1574,25 @@ function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKT
       // subagent_type), bash run-in-background == kind:'bash' (tool_use_id ties
       // to the Bash tool_use block already in thread).
       if (msg.type === 'system' && msg.subtype === 'task_started') {
+        // ---- Workflow (SDK 0.3.156 'local_workflow') ----------------------
+        // GROUND TRUTH from a real run: a workflow emits ONE task_started, then
+        // its phases+agents arrive via task_progress.workflow_progress[] (see
+        // that branch below). There is NO per-agent task_started. So here we
+        // only create the single workflow BgTask; agents are filled by progress.
+        if (msg.task_type === 'local_workflow') {
+          upsertBgTask(tabId, msg.task_id, {
+            kind: 'workflow',
+            workflowName: msg.workflow_name || msg.description || 'workflow',
+            name: msg.workflow_name || msg.description || 'workflow',
+            description: msg.description,
+            status: 'running',
+            startedAt: Date.now(),
+            phases: [],
+            agents: [],
+          });
+          return;
+        }
+
         // SDK 0.3.x emits TWO task_started per Agent tool call:
         //   1) task_type='local_agent' subagent_type='general-purpose' — the agent itself
         //   2) task_type='local_bash' (no subagent_type) — each Bash CHILD of that agent
@@ -1022,22 +1619,78 @@ function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKT
         return;
       }
       if (msg.type === 'system' && msg.subtype === 'task_progress') {
+        // Workflow progress: the UNDOCUMENTED workflow_progress[] array carries
+        // the live tree. Each event is PARTIAL — only changed phases/agents —
+        // so we MERGE by index into the workflow BgTask's phases/agents arrays.
+        const wp = Array.isArray(msg.workflow_progress) ? msg.workflow_progress : null;
+        if (wp) {
+          const st = useWorkspaceStore.getState();
+          let prev: { phases: any[]; agents: any[] } = { phases: [], agents: [] };
+          for (const [, ws] of st.openProjects) {
+            const t = ws.tabs.get(tabId);
+            const bt = t?.bgTasks?.find(b => b.taskId === msg.task_id);
+            if (bt) { prev = { phases: bt.phases || [], agents: bt.agents || [] }; break; }
+          }
+          const phaseMap = new Map<number, any>(prev.phases.map((p: any) => [p.index, p]));
+          const agentMap = new Map<number, any>(prev.agents.map((a: any) => [a.index, a]));
+          for (const item of wp) {
+            if (item?.type === 'workflow_phase' && typeof item.index === 'number') {
+              phaseMap.set(item.index, { index: item.index, title: item.title || ('Phase ' + item.index) });
+            } else if (item?.type === 'workflow_agent' && typeof item.index === 'number') {
+              const old = agentMap.get(item.index) || {};
+              agentMap.set(item.index, {
+                ...old,
+                index: item.index,
+                label: item.label ?? old.label,
+                phaseIndex: item.phaseIndex ?? old.phaseIndex,
+                phaseTitle: item.phaseTitle ?? old.phaseTitle,
+                agentId: item.agentId ?? old.agentId,
+                model: item.model ?? old.model,
+                state: item.state ?? old.state ?? 'progress',
+                tokens: item.tokens ?? old.tokens,
+                toolCalls: item.toolCalls ?? old.toolCalls,
+                lastToolName: item.lastToolName ?? old.lastToolName,
+                lastToolSummary: item.lastToolSummary ?? old.lastToolSummary,
+                promptPreview: item.promptPreview ?? old.promptPreview,
+                resultPreview: item.resultPreview ?? old.resultPreview,
+                durationMs: item.durationMs ?? old.durationMs,
+                startedAt: item.startedAt ?? old.startedAt,
+                attempt: item.attempt ?? old.attempt,
+              });
+            }
+          }
+          upsertBgTask(tabId, msg.task_id, {
+            kind: 'workflow',
+            phases: [...phaseMap.values()].sort((a, b) => a.index - b.index),
+            agents: [...agentMap.values()].sort((a, b) => a.index - b.index),
+            summary: msg.summary,
+            totalTokens: msg.usage?.total_tokens,
+            durationMs: msg.usage?.duration_ms,
+          });
+          return;
+        }
+        // Non-workflow task progress (standalone agent/bash).
         upsertBgTask(tabId, msg.task_id, {
           lastToolName: msg.last_tool_name,
           summary: msg.summary,
           totalTokens: msg.usage?.total_tokens,
           toolUses: msg.usage?.tool_uses,
           durationMs: msg.usage?.duration_ms,
+          ...(msg.subagent_type ? { name: msg.subagent_type } : {}),
         });
         return;
       }
       if (msg.type === 'system' && msg.subtype === 'task_updated') {
         const patch = msg.patch || {};
+        // 'paused' added in SDK 0.3.156 — a workflow/agent can be paused (`p`).
+        const mappedStatus = patch.status === 'running' ? 'running' as const
+          : patch.status === 'completed' ? 'completed' as const
+          : patch.status === 'paused' ? 'paused' as const
+          : (patch.status === 'failed' || patch.status === 'killed') ? 'failed' as const
+          : undefined;
         upsertBgTask(tabId, msg.task_id, {
           ...(patch.description ? { description: patch.description } : {}),
-          ...(patch.status === 'running' ? { status: 'running' as const } : {}),
-          ...(patch.status === 'completed' ? { status: 'completed' as const } : {}),
-          ...(patch.status === 'failed' || patch.status === 'killed' ? { status: 'failed' as const } : {}),
+          ...(mappedStatus ? { status: mappedStatus } : {}),
           ...(typeof patch.end_time === 'number' ? { endedAt: patch.end_time } : {}),
         });
         return;
@@ -1058,8 +1711,21 @@ function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKT
         return;
       }
       if (msg.type === 'tool_progress' && msg.task_id) {
+        // Accumulate a rolling activity log (last ~12 tool calls) + monotonic
+        // total, feeding the detail pane's "Activity · last 3 of N tool calls".
+        const st = useWorkspaceStore.getState();
+        let prevActivity: string[] = [];
+        let prevTotal = 0;
+        for (const [, ws] of st.openProjects) {
+          const t = ws.tabs.get(tabId);
+          const bt = t?.bgTasks?.find(b => b.taskId === msg.task_id);
+          if (bt) { prevActivity = bt.activity || []; prevTotal = bt.toolCallTotal || 0; break; }
+        }
+        const nextActivity = [...prevActivity, String(msg.tool_name || '?')].slice(-12);
         upsertBgTask(tabId, msg.task_id, {
           lastToolName: msg.tool_name,
+          activity: nextActivity,
+          toolCallTotal: prevTotal + 1,
           durationMs: typeof msg.elapsed_time_seconds === 'number'
             ? Math.round(msg.elapsed_time_seconds * 1000)
             : undefined,
@@ -1105,10 +1771,11 @@ function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKT
 
       // Assistant message with content blocks
       if (msg.type === 'assistant' && msg.message?.content) {
-        // [BgProbeR] Diagnostic: what's the subagent-shape on assistant chunks?
-        const isFromSub = !!(msg.parent_tool_use_id || msg.subagent_type);
-        const blockTypes = Array.isArray(msg.message.content) ? msg.message.content.map((b: any) => b?.type).join(',') : 'string';
-        console.warn('[BgProbeR:Assistant] tab=' + tabId.slice(-12) + ' fromSub=' + isFromSub + ' parent=' + (msg.parent_tool_use_id?.slice?.(0,8) || 'null') + ' subagent_type=' + (msg.subagent_type || 'null') + ' blocks=' + blockTypes + ' modelEcho=' + msg.message?.model?.slice?.(0,20));
+        if (localStorage.getItem('NOTED_DEBUG_SDK_STREAM') === '1') {
+          const isFromSub = !!(msg.parent_tool_use_id || msg.subagent_type);
+          const blockTypes = Array.isArray(msg.message.content) ? msg.message.content.map((b: any) => b?.type).join(',') : 'string';
+          console.warn('[BgProbeR:Assistant] tab=' + tabId.slice(-12) + ' fromSub=' + isFromSub + ' subagent_type=' + (msg.subagent_type || 'null') + ' blocks=' + blockTypes + ' modelEcho=' + msg.message?.model?.slice?.(0,20));
+        }
         // Info-slash command active → capture text-only content into overlay
         // state and DO NOT add to thread. SDK ships /usage / /cost / /status
         // results as plain assistant-text (LocalCommandCall text fallback).
@@ -1181,6 +1848,15 @@ function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKT
           else updateSDKState(tabId, { sdkState: 'thinking' });
         }
 
+        // Note: mid-stream chip→bubble promotion is driven by main process
+        // event `claude-sdk:midstream-consumed` (handler below), NOT by the
+        // first assistant chunk after a push. SDK only consumes a pushed
+        // priority:'next' message at the boundary between its sub-iterations
+        // — that's the exact moment Claude's JSONL gets the `attachment`
+        // record. Promoting on the next assistant chunk would put the bubble
+        // ABOVE the in-flight tool/text block that fired before SDK actually
+        // drained the channel, mis-ordering the visual thread relative to
+        // JSONL ground truth.
         setMessages(prev => {
           const last = prev[prev.length - 1];
 
@@ -1260,6 +1936,24 @@ function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKT
 
         setIsRunning(false);
         updateSDKState(tabId, { sdkState: msg.is_error ? 'error' : 'idle' });
+
+        // Turn-end cleanup. JSONL is the source of truth: every entry that
+        // actually made it into the transcript was already promoted by
+        // handleMidstreamJsonlLanded. Anything still in pending after `result`
+        // arrives is not in JSONL and never will be (Claude wouldn't see it
+        // on resume), so we drop silently. Don't render a ghost bubble that
+        // doesn't match the transcript.
+        if (pendingMidstreamRef.current.length > 0) {
+          const remaining = pendingMidstreamRef.current.splice(0);
+          const sent = remaining.filter(p => p.state === 'sent').length;
+          const queued = remaining.filter(p => p.state === 'queued').length;
+          console.log('[TypeAhead] turn-end drop sent=' + sent + ' queued=' + queued + ' tab=' + tabId.slice(-12));
+          queuedRef.current = null;
+          setQueued(null);
+          queuedStateRef.current = null;
+          setQueuedState(null);
+          syncPendingToStore();
+        }
         if (msg.is_error) {
           // Server-side or stream-level failure (timeout, API 4xx/5xx, abort, etc.).
           // The system-message fallback below stays in-thread; the toast surfaces it
@@ -1310,6 +2004,71 @@ function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKT
       updateSDKState(tabId, { sdkState: 'idle' });
     };
 
+    // Stage 2 transition: SDK pulled the pushed message out of the input
+    // channel and forwarded it to Claude CLI. Chip stays above the input
+    // but switches to gray (sent) — cannot be recalled. The actual JSONL
+    // landing is reported separately via `claude-sdk:midstream-jsonl-landed`.
+    const handleMidstreamConsumed = (_: any, data: { tabId: string; text: string; ts: number }) => {
+      if (data.tabId !== tabId) return;
+      const pending = pendingMidstreamRef.current;
+      // Match the oldest queued entry with the same text and flip its state.
+      const idx = pending.findIndex(p => p.state === 'queued' && p.text === data.text);
+      if (idx < 0) {
+        console.log('[TypeAhead] consumed event with no matching queued tab=' + tabId.slice(-12));
+        return;
+      }
+      pending[idx].state = 'sent';
+      console.log('[TypeAhead] queued→sent idx=' + idx + ' tab=' + tabId.slice(-12));
+      // Visual: if the front of the queue is now 'sent', flip the chip color.
+      if (pending[0] && pending[0].state === 'sent') {
+        queuedStateRef.current = 'sent';
+        setQueuedState('sent');
+      }
+      syncPendingToStore();
+    };
+
+    // Stage 3 transition: the queued_command attachment record has been
+    // written to the session JSONL by Claude CLI. This is the authoritative
+    // position for the user-bubble in the thread. Remove from pending and
+    // insert a user-bubble (with wasQueued tag) at the current end of the
+    // thread — chunks that arrive after this lands will go below the bubble,
+    // mirroring how the JSONL records the order.
+    const handleMidstreamJsonlLanded = (_: any, data: { tabId: string; text: string; attachmentUuid: string | null; ts: number }) => {
+      if (data.tabId !== tabId) return;
+      const pending = pendingMidstreamRef.current;
+      // Match by text. Prefer 'sent' entries (they should always be the ones
+      // landing); fall back to 'queued' if the consumed event somehow got
+      // skipped (e.g. very fast write between consume and JSONL flush).
+      let idx = pending.findIndex(p => p.state === 'sent' && p.text === data.text);
+      if (idx < 0) idx = pending.findIndex(p => p.text === data.text);
+      if (idx < 0) {
+        console.log('[TypeAhead] jsonl-landed no matching pending tab=' + tabId.slice(-12) + ' textLen=' + data.text.length);
+        return;
+      }
+      const [promotedItem] = pending.splice(idx, 1);
+      console.log('[TypeAhead] promote-on-jsonl-landed idx=' + idx + ' uuid=' + (data.attachmentUuid || '?').slice(-8) + ' remaining=' + pending.length + ' tab=' + tabId.slice(-12));
+      refreshChipFromPending();
+      syncPendingToStore();
+      setMessages(prev => {
+        // Finalize any open streaming placeholder so the user-bubble + next
+        // chunks split cleanly into separate messages.
+        const finalized = prev.map(m => {
+          if (m.id !== 'streaming-' + tabId) return m;
+          return { ...m, id: 'msg-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8) };
+        });
+        const rng = Math.random().toString(36).slice(2, 8);
+        return [...finalized, {
+          id: 'user-queued-' + (data.attachmentUuid || promotedItem.ts) + '-' + rng,
+          role: 'user' as const,
+          text: promotedItem.text,
+          toolCalls: [],
+          thinking: null,
+          timestamp: data.ts || promotedItem.ts,
+          wasQueued: true,
+        }];
+      });
+    };
+
     // When main detects a stale resumeSessionId mid-stream and retries
     // without resume, it asks us to clear the cached id so future prompts
     // don't replay the same dead handshake. The retry's `init` message will
@@ -1324,62 +2083,41 @@ function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKT
     ipcRenderer.on('claude-sdk:message', handleMessage);
     ipcRenderer.on('claude-sdk:done', handleDone);
     ipcRenderer.on('claude-sdk:stale-resume-cleared', handleStaleResume);
+    ipcRenderer.on('claude-sdk:midstream-consumed', handleMidstreamConsumed);
+    ipcRenderer.on('claude-sdk:midstream-jsonl-landed', handleMidstreamJsonlLanded);
     return () => {
       ipcRenderer.removeListener('claude-sdk:message', handleMessage);
       ipcRenderer.removeListener('claude-sdk:done', handleDone);
       ipcRenderer.removeListener('claude-sdk:stale-resume-cleared', handleStaleResume);
+      ipcRenderer.removeListener('claude-sdk:midstream-consumed', handleMidstreamConsumed);
+      ipcRenderer.removeListener('claude-sdk:midstream-jsonl-landed', handleMidstreamJsonlLanded);
     };
-  }, [tabId, updateSDKState]);
+  }, [tabId, updateSDKState, syncPendingToStore, refreshChipFromPending]);
 
-  // ---- Send handler for external store ----
-  const onNew = useCallback(async (message: AppendMessage) => {
-    // HARD GATE — pre-empts every send path (typed Enter, click Send, slash
-    // commit, external prompt, queue replay). SDK не поддерживает midstream
-    // приём prompt'а: попытка вызовет race с активной query и потеряет
-    // сообщение. Two sources of truth checked together (один может lag'аться
-    // относительно другого):
-    //  1. `isRunning` — локальный stream-state, ставится в onNew/setMessages-stream
-    //     до того как Zustand update долетит до tabs map.
-    //  2. `sdkState` в store — авторитативно но обновляется с tick'а отставанием.
-    // ANY === running → silently drop. UI button уже становится Cancel, юзер
-    // видит что заблокировано; на Enter мы preventDefault в handleComposerKeyDown.
-    const currentlyRunning = isRunning || (() => {
-      const s = useWorkspaceStore.getState();
-      for (const [, ws] of s.openProjects) {
-        const t = ws.tabs.get(tabId);
-        if (t) return t.sdkState === 'thinking' || t.sdkState === 'tool_use';
-      }
-      return false;
-    })();
-    if (currentlyRunning) {
-      console.log('[OnNew] blocked: already running tab=' + tabId.slice(-12));
-      return;
-    }
-
-    const textPart = message.content.find((p: any) => p.type === 'text');
-    const inputText = (textPart?.type === 'text' ? textPart.text : '').trim();
-
-    // Gather paste chips
-    const pasteChips: Array<{ text: string }> = (window as any).__sdkPasteChips || [];
-    const chipTexts = pasteChips.map(c => c.text);
-
-    // Build full prompt: chips + text
-    const parts: string[] = [];
-    for (const ct of chipTexts) {
-      parts.push('<pasted_content>\n' + ct + '\n</pasted_content>');
-    }
-    if (inputText) parts.push(inputText);
-    else if (parts.length > 0) parts.push('Analyze this content');
-
-    const text = parts.join('\n\n');
+  // ---- Send core — shared by manual onNew AND type-ahead auto-send ----
+  // Takes the FINAL prompt string (paste-chips already embedded by the caller).
+  // Does NOT gate on isRunning: `onNew` runs the HARD GATE before calling, and
+  // the type-ahead auto-send (claude-sdk:turn-complete listener in SDKComposer)
+  // fires exactly on turn-end when the previous query is already torn down. The
+  // queued message bypasses the composer entirely, so whatever the user typed
+  // AFTER queueing stays untouched in the input.
+  const dispatchPrompt = useCallback(async (text: string, opts?: { wasQueued?: boolean }) => {
     if (!text.trim()) return;
+    // `wasQueued` — был ли этот prompt отправлен из type-ahead очереди (Enter
+    // во время стриминга → парк в QUEUED → auto-send на result event). Юзер
+    // визуально отличает background-сообщения от обычных submit'ов: они едут
+    // одинаковым путём через query(), но в треде помечаются маленьким
+    // оранжевым chip'ом "queued". Флаг live-only — после reload теряется,
+    // потому что Anthropic JSONL не хранит наши UI-метаданные. Native TUI
+    // делает то же (см. useQueuedMessage context — UI-only, no persistence).
+    const wasQueued = !!opts?.wasQueued;
 
     // [SlashProbe] Detect slash-command prefix in user input. If SDK
     // intercepts these we'll see system messages back; if not, the text
     // goes to the API as-is (Claude reads it literally).
     const slashMatch = text.match(/^\/(\S+)(?:\s|$)/);
     if (slashMatch) {
-      console.log('[SlashProbe:onNew] tab=' + tabId.slice(-12) + ' SLASH_DETECTED cmd=/' + slashMatch[1] + ' fullPrompt=' + JSON.stringify(text.slice(0, 200)));
+      console.log('[SlashProbe:dispatch] tab=' + tabId.slice(-12) + ' SLASH_DETECTED cmd=/' + slashMatch[1] + ' fullPrompt=' + JSON.stringify(text.slice(0, 200)));
       // Info-type commands open SlashCommandOverlay вместо рендера output'а в
       // thread. Список — те команды, что в CLI открывают полноэкранный
       // Settings panel (LocalJSXCommandCall). SDK для них шипит plain-text
@@ -1394,11 +2132,9 @@ function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKT
         setSlashOverlay({ cmd: slashName });
       }
     } else {
-      console.log('[SlashProbe:onNew] tab=' + tabId.slice(-12) + ' normal_prompt len=' + text.length);
+      console.log('[SlashProbe:dispatch] tab=' + tabId.slice(-12) + ' normal_prompt len=' + text.length);
     }
 
-    // Clear chips
-    window.dispatchEvent(new Event('claude-sdk:chips-clear'));
     setIsRunning(true);
     setWasStopped(false); // user opted into a new turn — drop the Resume affordance
     // Start at 'fetching' — pure network/warm-up window before SDK sends
@@ -1406,11 +2142,49 @@ function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKT
     // first content arrives. See handleMessage phase-machine below.
     updateSDKState(tabId, { sdkState: 'fetching' });
 
-    // Add user message
-    setMessages(prev => [...prev, {
-      id: 'user-' + Date.now(), role: 'user' as const,
-      text, toolCalls: [], thinking: null, timestamp: Date.now(),
-    }]);
+    if (wasQueued) {
+      // Mid-stream type-ahead path. Three lifecycle stages:
+      //   1. queued (orange chip): pushed locally to main, SDK has not yet
+      //      pulled it. Reversible (Esc/↑ returns text to input).
+      //   2. sent   (gray chip):   main got `claude-sdk:midstream-consumed`
+      //      from createInputChannel's onConsumed — SDK pulled the message
+      //      out of the input channel and forwarded it to the Claude CLI
+      //      subprocess. Cannot be recalled (it's at Claude). The CLI then
+      //      decides when to flush the attachment record into JSONL — that
+      //      can be 100ms or 5+ seconds later, on the next tool/turn
+      //      boundary.
+      //   3. landed (thread bubble): main saw the `attachment` line with
+      //      type 'queued_command' appear in the session JSONL via
+      //      fs.watch tail-read. This is the authoritative position — we
+      //      promote chip → user-bubble HERE, so the visual order matches
+      //      what the JSONL records and what native Claude TUI shows.
+      // Fallbacks: turn-end (`result`) promotes any still-pending sent
+      // entries as unconfirmed user-bubble (timeout safety, no permanent
+      // hang). Manual stop discards pending state.
+      queuedRef.current = text;
+      setQueued(text);
+      queuedStateRef.current = 'queued';
+      setQueuedState('queued');
+      pendingMidstreamRef.current.push({ text, ts: Date.now(), state: 'queued' });
+      syncPendingToStore();
+    } else {
+      // Fresh turn path (нет live session или юзер явно сабмитнул когда
+      // Claude уже закончил): query() стартует с этим prompt'ом, Anthropic
+      // запишет его в JSONL → bubble консистентен с persistence.
+      const rng = Math.random().toString(36).slice(2, 8);
+      const userId = 'user-' + Date.now() + '-' + rng;
+      setMessages(prev => {
+        const finalized = prev.map(m => {
+          if (m.id !== 'streaming-' + tabId) return m;
+          return { ...m, id: 'msg-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8) };
+        });
+        return [...finalized, {
+          id: userId, role: 'user' as const,
+          text, toolCalls: [], thinking: null, timestamp: Date.now(),
+          wasQueued: false,
+        }];
+      });
+    }
 
     // Read SDK settings. `thinking` is the SDK shape ({type:'adaptive'|'disabled'});
     // the InfoPanel Think pill stores a bool in tab.sdkThinking, undefined=ON by default.
@@ -1448,6 +2222,12 @@ function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKT
     const result = await ipcRenderer.invoke(ipcChannel, {
       tabId, cwd, prompt: text, model: sdkModel, effort: sdkEffort, thinking: sdkThinking,
       resumeSessionId: sessionIdRef.current || null,
+      // wasQueued — desktop type-ahead очередь auto-sent эту запись. Прокидываем
+      // флаг в main → main передаёт его в _webBroadcast synthetic user-message
+      // → mobile UI рендерит "queued" chip. Anthropic SDK сам флаг не видит,
+      // payload отправляется как обычный prompt; это чисто UI-метаданные для
+      // mobile-клиента.
+      wasQueued,
     });
 
     if (!result.success) {
@@ -1459,9 +2239,102 @@ function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKT
         text: 'Error: ' + result.error, toolCalls: [], thinking: null, timestamp: Date.now(),
       }]);
     }
-  }, [tabId, cwd, updateSDKState]);
+  }, [tabId, cwd, updateSDKState, syncPendingToStore]);
+  // Keep the ref current so the message-handler effect (defined above
+  // dispatchPrompt) can auto-send the type-ahead queue at turn-end.
+  useEffect(() => { dispatchPromptRef.current = dispatchPrompt; }, [dispatchPrompt]);
+
+  // ---- Send handler for external store ----
+  const onNew = useCallback(async (message: AppendMessage) => {
+    // HARD GATE — pre-empts the manual send paths (typed Enter, click Send,
+    // slash commit). SDK не поддерживает midstream приём prompt'а: попытка
+    // вызовет race с активной query и потеряет сообщение. Two sources of truth
+    // checked together (один может lag'аться относительно другого):
+    //  1. `isRunning` — локальный stream-state, ставится в dispatchPrompt/
+    //     setMessages-stream до того как Zustand update долетит до tabs map.
+    //  2. `sdkState` в store — авторитативно но обновляется с tick'а отставанием.
+    // ANY === running → НЕ дропаем молча: type-ahead кладёт текст в очередь
+    // (handleComposerKeyDown ловит Enter раньше, чем сюда дойдёт). Этот guard
+    // остаётся как последний рубеж на случай программного send() в обход
+    // keydown'а (assistant-ui bubbled Enter, click). Reach сюда при running =
+    // дроп, чтобы не было двойного turn'а.
+    const currentlyRunning = isRunning || (() => {
+      const s = useWorkspaceStore.getState();
+      for (const [, ws] of s.openProjects) {
+        const t = ws.tabs.get(tabId);
+        if (t) return t.sdkState === 'thinking' || t.sdkState === 'tool_use';
+      }
+      return false;
+    })();
+    if (currentlyRunning) {
+      console.log('[OnNew] blocked: already running tab=' + tabId.slice(-12));
+      return;
+    }
+
+    const textPart = message.content.find((p: any) => p.type === 'text');
+    const inputText = (textPart?.type === 'text' ? textPart.text : '').trim();
+
+    // Gather paste chips
+    const pasteChips: Array<{ text: string }> = (window as any).__sdkPasteChips || [];
+    const chipTexts = pasteChips.map(c => c.text);
+
+    // Build full prompt: chips + text
+    const parts: string[] = [];
+    for (const ct of chipTexts) {
+      parts.push('<pasted_content>\n' + ct + '\n</pasted_content>');
+    }
+    if (inputText) parts.push(inputText);
+    else if (parts.length > 0) parts.push('Analyze this content');
+
+    const text = parts.join('\n\n');
+    if (!text.trim()) return;
+
+    // Clear chips (consumed into `text` above)
+    window.dispatchEvent(new Event('claude-sdk:chips-clear'));
+    await dispatchPrompt(text);
+  }, [tabId, isRunning, dispatchPrompt]);
 
   const onCancel = useCallback(async () => {
+    const eId = 'E' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+    try { ipcRenderer.send('log:renderer', `[RepeatDiag] ESCAPE_ENTER ${eId} isRunningRef=${isRunningRef.current} queued=${!!queuedRef.current}`); } catch {}
+    // Early-return when no live turn. Bug 2026-05-28: assistant-ui's runtime
+    // calls `onCancel` on Escape regardless of whether anything is running. If
+    // the turn already completed, our rollback branch (B) below would find no
+    // streaming placeholder and proceed to drop the last user→assistant pair
+    // from history (and truncate JSONL up to that user msg). Юзер: «ответ уже
+    // был дан, я нажал Escape, и у меня в итоге история просто стёрлась».
+    // Window-level handler on line ~1991 already guards by `isRunning`; this
+    // mirrors that for the runtime-driven path. Anything destructive only when
+    // there is actually a turn to cancel.
+    if (!isRunningRef.current) {
+      try { ipcRenderer.send('log:renderer', `[RepeatDiag] ESCAPE_EARLY_RETURN ${eId} reason=not-running`); } catch {}
+      return;
+    }
+
+    // Type-ahead handling on cancel — JSONL is the source of truth.
+    // queued: never reached the channel → recall to composer for resend.
+    // sent:   not yet in JSONL → drop silently (Claude wouldn't see it on
+    //         resume either; transcript is what's real).
+    // Anything that already landed in JSONL was promoted by
+    // handleMidstreamJsonlLanded before cancel fired.
+    {
+      const pending = pendingMidstreamRef.current;
+      const queuedItems = pending.filter(p => p.state === 'queued');
+      const droppedSent = pending.filter(p => p.state === 'sent').length;
+      pendingMidstreamRef.current = [];
+      queuedRef.current = null;
+      setQueued(null);
+      queuedStateRef.current = null;
+      setQueuedState(null);
+      syncPendingToStore();
+      if (queuedItems.length > 0) {
+        const qtext = queuedItems[0].text;
+        window.dispatchEvent(new CustomEvent('claude-sdk:composer-insert', { detail: { tabId, text: qtext } }));
+      }
+      if (droppedSent > 0) {
+        console.log('[TypeAhead] cancel-time drop unconfirmed sent=' + droppedSent + ' tab=' + tabId.slice(-12));
+      }
+    }
     // The composer's red Cancel button = "stop THIS prompt", not "stop the whole
     // session". Two outcomes depending on what the assistant produced before we
     // intercepted:
@@ -1476,23 +2349,14 @@ function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKT
     //       --resume would replay the prompt as if we'd sent it), then push the
     //       original text back into the composer input so the user can edit
     //       and resubmit.
-    // We tell main to abort the stream first either way — content captured
-    // *after* the snapshot we read still arrives async, but we're committed to
-    // one of the two outcomes by the time we decide.
+    // Escape = SOFT interrupt (native Esc): stop the current TURN, keep the
+    // process + session + any background workflow agents ALIVE. We do NOT pass
+    // hard:true and do NOT stopTask — background agents keep running and will
+    // still deliver their task_notification. (Branch B below escalates to a
+    // hard kill before truncating, because JSONL surgery can't run under a live
+    // stream.) The interrupted partial answer gets the «⊘ stopped» badge.
     const sid = sessionIdRef.current;
-    // Collect IDs of any task that's still mid-flight so main can stopTask()
-    // each before query.close(). Without this, subagents spawned by the Agent
-    // tool keep running after Escape (close() only tears down the parent
-    // transport; subagent workers live in separate subprocesses).
-    const runningTaskIds: string[] = (() => {
-      const st = useWorkspaceStore.getState();
-      for (const [, ws] of st.openProjects) {
-        const t = ws.tabs.get(tabId);
-        if (t?.bgTasks) return t.bgTasks.filter(b => b.status === 'running').map(b => b.taskId);
-      }
-      return [];
-    })();
-    ipcRenderer.invoke('claude-sdk:stop', { tabId, runningTaskIds });
+    ipcRenderer.invoke('claude-sdk:stop', { tabId });
     setIsRunning(false);
     updateSDKState(tabId, { sdkState: 'idle' });
 
@@ -1531,10 +2395,18 @@ function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKT
         ))
       );
 
+      try { ipcRenderer.send('log:renderer', `[RepeatDiag] ESCAPE_SNAPSHOT ${eId} prevLen=${prev.length} streamingIdx=${streamingIdx} lastUserIdx=${lastUserIdx} hasContent=${hasContent}`); } catch {}
       // (A) Content captured → keep everything. We just rename the streaming
       // placeholder to a stable id so it survives re-renders (mirrors what the
       // `result` handler usually does, but we beat it by cancelling).
       if (hasContent) {
+        try { ipcRenderer.send('log:renderer', `[RepeatDiag] ESCAPE_BRANCH_A ${eId} keep-all`); } catch {}
+        const stoppedId = 'msg-' + Date.now();
+        // Live "stopped" badge: tag the kept partial NOW so the «⊘ stopped»
+        // plate shows instantly, without waiting for the JSONL marker to land +
+        // a reload. The durable source (loadHistory marker detection) re-derives
+        // the same flag on reopen, so the two agree.
+        setInterruptedForMsg(stoppedId);
         return prev.map(m => {
           if (m.id !== 'streaming-' + tabId) return m;
           const nextParts: AssistantPart[] | undefined = m.parts?.map(p =>
@@ -1543,7 +2415,8 @@ function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKT
           const d = nextParts ? assembleMessageFields(nextParts) : null;
           return {
             ...m,
-            id: 'msg-' + Date.now(),
+            id: stoppedId,
+            interrupted: true,
             parts: nextParts,
             toolCalls: d ? d.toolCalls : m.toolCalls.map(t => t.status === 'running' ? { ...t, status: 'done' as const } : t),
           };
@@ -1553,7 +2426,10 @@ function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKT
       // (B) Nothing captured → drop user + empty streaming placeholder. Stash
       // the original text in pendingRollback so we can push it back into the
       // composer + (maybe) truncate JSONL after the setMessages commit.
-      if (lastUserIdx === -1) return prev; // nothing to roll back
+      if (lastUserIdx === -1) {
+        try { ipcRenderer.send('log:renderer', `[RepeatDiag] ESCAPE_BRANCH_B_NOOP ${eId} no-user-to-rollback`); } catch {}
+        return prev; // nothing to roll back
+      }
       const userMsg = prev[lastUserIdx];
       // Only persisted user messages have a real JSONL uuid; placeholders
       // ("user-…") never made it to disk yet (or arrived without a uuid swap),
@@ -1561,6 +2437,7 @@ function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKT
       const userUuidForTruncate = isPersistedMsgId(userMsg.id) ? userMsg.id : null;
       pendingRollback = { userMsg, userUuidForTruncate };
       const cutoff = streamingIdx === -1 ? lastUserIdx : Math.min(lastUserIdx, streamingIdx);
+      try { ipcRenderer.send('log:renderer', `[RepeatDiag] ESCAPE_BRANCH_B ${eId} cutoff=${cutoff} dropCount=${prev.length - cutoff} userMsgId=${userMsg.id?.slice(0,8)} userPersisted=${!!userUuidForTruncate}`); } catch {}
       return prev.slice(0, cutoff);
     });
 
@@ -1575,6 +2452,13 @@ function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKT
         detail: { tabId, text: userMsg.text, replace: true },
       }));
       if (sid && userUuidForTruncate) {
+        // Branch B rewrites the JSONL (drop the empty turn). The soft interrupt
+        // above left the session ALIVE — truncating under a live stream would
+        // corrupt the parentUuid chain. Escalate to a HARD kill first so the
+        // query is fully torn down before JSONL surgery. (Branch B only fires
+        // when the assistant produced nothing, so killing the empty turn is safe.)
+        try { await ipcRenderer.invoke('claude-sdk:stop', { tabId, hard: true }); }
+        catch (err: any) { console.warn('[ClaudeSDKTab:onCancel] hard-stop before truncate threw:', err?.message); }
         try {
           const res = await ipcRenderer.invoke('claude-sdk:truncate-history', {
             sessionId: sid, cwd, targetUuid: userUuidForTruncate,
@@ -1587,12 +2471,18 @@ function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKT
         }
       }
     });
-  }, [tabId, cwd, updateSDKState]);
+  }, [tabId, cwd, updateSDKState, syncPendingToStore]);
 
   // Edit / Repeat action busy flag — separate from isRunning so the streaming
   // spinner doesn't fire prematurely on truncate, and both action buttons get
   // disabled together while the JSONL surgery + new send is in flight.
   const [actionBusy, setActionBusy] = useState(false);
+  // Synchronous click-storm guard. React's `actionBusy` state setter is async —
+  // a fast double/triple-click on Repeat fires multiple onClick handlers before
+  // React flushes the first `setActionBusy(true)`, so they all see `actionBusy=false`
+  // and each spawns its own `send-message`. Юзер: «нажимал 1 раз — в таймлайне 4
+  // запроса». A useRef flipped synchronously inside the handler closes the gap.
+  const actionInFlightRef = useRef(false);
 
   // Find the JSONL uuid corresponding to a UI message id. For history-loaded
   // entries id === uuid. For freshly-sent messages we used "user-<ts>" / "streaming-<tabId>"
@@ -1601,86 +2491,129 @@ function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKT
   // SDK's session_id metadata. Cheaper: only allow Edit/Repeat on persisted msgs.
   const isPersistedMsgId = (id: string) => id && !id.startsWith('user-') && !id.startsWith('streaming-') && !id.startsWith('hist-') && !id.startsWith('msg-') && !id.startsWith('init-') && !id.startsWith('error-');
 
-  // Shared truncate+resend used by both Repeat (text = original) and Edit
-  // (text = user-edited). For persisted msgs picks the JSONL uuid + drops
-  // everything ≥ that uuid before the resend. For placeholder ids ("user-…",
-  // "error-…" — message never reached JSONL because send-message failed mid-
-  // flight, e.g. spawn ENOTDIR in packaged builds) skip the truncate IPC and
-  // just replace the local row, then resend. Without this the only failure
-  // recovery was retyping the prompt by hand.
+  // Repeat/Edit — идемпотентный путь на «позиции user-сообщения».
+  // N-ный по счёту user msg в треде → удалить ВСЁ на диске начиная с этой
+  // позиции (включая её) → послать заново. Кликаешь 5 раз подряд = 5 раз
+  // одинаковая операция: каждый клик возвращает тред к одному и тому же
+  // состоянию (первые N-1 user-prompts + новая попытка N-ного).
+  // Никаких persisted/placeholder развилок: позиция в треде стабильна между
+  // кликами, msgId меняется (после resend новый user получает временный
+  // placeholder id) но позиция — нет.
   const truncateAndResend = useCallback(async (uiMsgId: string, newText: string) => {
-    const persisted = isPersistedMsgId(uiMsgId);
+    const diagId = 'D' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+    if (actionInFlightRef.current) {
+      try { ipcRenderer.send('log:renderer', `[RepeatDiag] STORM_GUARD ${diagId} reject`); } catch {}
+      return;
+    }
+    actionInFlightRef.current = true;
+
     const sid = sessionIdRef.current;
-    if (persisted && !sid) { console.warn('[ClaudeSDKTab:truncateAndResend] no sessionId'); return; }
+    // Position = index среди USER-сообщений (не общий). Это инвариант: каждый
+    // юзер видит "первый, второй, третий user-prompt" — порядок не меняется
+    // когда мы переотправляем N-ный (все ≥N сносятся, потом N добавляется).
+    const arr = messagesRef.current;
+    const flatIdx = arr.findIndex(m => m.id === uiMsgId);
+    if (flatIdx === -1) {
+      try { ipcRenderer.send('log:renderer', `[RepeatDiag] ABORT ${diagId} reason=msg-not-in-ref id=${uiMsgId?.slice(0,8)}`); } catch {}
+      actionInFlightRef.current = false;
+      return;
+    }
+    let userPos = 0;
+    for (let i = 0; i < flatIdx; i++) if (arr[i].role === 'user') userPos++;
+
+    try { ipcRenderer.send('log:renderer', `[RepeatDiag] ENTER ${diagId} userPos=${userPos} flatIdx=${flatIdx} sid=${sid?.slice(0,8)} textLen=${newText?.length}`); } catch {}
+
+    if (!sid) {
+      console.warn('[ClaudeSDKTab:truncateAndResend] no sessionId');
+      actionInFlightRef.current = false;
+      return;
+    }
     setActionBusy(true);
+
+    const state = useWorkspaceStore.getState();
+    let tabCwd = cwd;
+    let sdkModel: string | undefined;
+    let sdkModelAlias: string | undefined;
+    let sdkEffort: string | undefined;
+    let sdkThinking: 'adaptive' | 'disabled' = 'adaptive';
+    for (const [, ws] of state.openProjects) {
+      const t = ws.tabs.get(tabId);
+      if (t) {
+        tabCwd = t.cwd || cwd;
+        sdkModelAlias = t.sdkModel || 'default';
+        sdkModel = resolveSdkModel(sdkModelAlias);
+        sdkEffort = t.sdkEffort || 'high';
+        sdkThinking = t.sdkThinking === false ? 'disabled' : 'adaptive';
+        break;
+      }
+    }
+    const showToast = useUIStore.getState().showToast;
+    lastRequestRef.current = { modelAlias: sdkModelAlias, effort: sdkEffort };
+    modelMismatchToastedRef.current = false;
+
+    // Optimistic local trim. Снапшот для отката, потом синхронно режем
+    // визуальный список до flatIdx (всё что было ≥ удаляем) + добавляем
+    // новый user-msg на месте N-ного.
+    let snapshot: SDKChatMessage[] | null = null;
+    const newUserMsg: SDKChatMessage = {
+      id: 'user-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8),
+      role: 'user' as const,
+      text: newText,
+      toolCalls: [], thinking: null,
+      timestamp: Date.now(),
+    };
+    setMessages(prev => {
+      snapshot = prev;
+      const next = [...prev.slice(0, flatIdx), newUserMsg];
+      try { ipcRenderer.send('log:renderer', `[RepeatDiag] OPTIMISTIC_TRIM ${diagId} prevLen=${prev.length} cut=${flatIdx} nextLen=${next.length}`); } catch {}
+      return next;
+    });
+    setWasStopped(false);
+
     try {
-      // Resolve cwd same way as loadHistory.
-      const state = useWorkspaceStore.getState();
-      let tabCwd = cwd;
-      let sdkModel: string | undefined;
-      let sdkModelAlias: string | undefined;
-      let sdkEffort: string | undefined;
-      let sdkThinking: 'adaptive' | 'disabled' = 'adaptive';
-      for (const [, ws] of state.openProjects) {
-        const t = ws.tabs.get(tabId);
-        if (t) {
-          tabCwd = t.cwd || cwd;
-          sdkModelAlias = t.sdkModel || 'default';
-          sdkModel = resolveSdkModel(sdkModelAlias);
-          sdkEffort = t.sdkEffort || 'high';
-          sdkThinking = t.sdkThinking === false ? 'disabled' : 'adaptive';
-          break;
-        }
+      // Stop сначала — он триггерит main → 'claude-sdk:done' → handleDone →
+      // setIsRunning(false) + sdkState='idle'. Если мы поставим fetching ДО
+      // stop'а, done прилетит сразу после и затрёт наш fetching. Поэтому
+      // setIsRunning(true) + sdkState='fetching' ПОСЛЕ stop, прямо перед send.
+      const existing = await ipcRenderer.invoke('claude-sdk:has-active-session', { tabId }).catch(() => null);
+      try { ipcRenderer.send('log:renderer', `[RepeatDiag] HAS_ACTIVE ${diagId} active=${!!existing?.active}`); } catch {}
+      if (existing?.active) {
+        // HARD kill — Edit/Repeat rewrites the JSONL; the query must be fully
+        // torn down (not merely soft-interrupted) before truncate-history.
+        // Surface a deterministic "останавливаю процесс…" cue on the control-bar
+        // indicator so the user sees the process is being killed (not a hang)
+        // before the new turn starts. The process-state alive:false from the
+        // hard kill flips the dot to ОСТАНОВЛЕН; this label rides alongside.
+        window.dispatchEvent(new CustomEvent('claude-sdk:stopping', { detail: { tabId } }));
+        await ipcRenderer.invoke('claude-sdk:stop', { tabId, hard: true, runningTaskIds: [] });
+        try { ipcRenderer.send('log:renderer', `[RepeatDiag] STOPPED_ACTIVE ${diagId}`); } catch {}
       }
 
-      // Same as onNew above — capability gating happens in InfoPanel; only
-      // server-side mismatch and IPC failure surface toasts from here.
-      const showToast = useUIStore.getState().showToast;
-      lastRequestRef.current = { modelAlias: sdkModelAlias, effort: sdkEffort };
-      modelMismatchToastedRef.current = false;
-
-      if (persisted) {
-        const truncRes = await ipcRenderer.invoke('claude-sdk:truncate-history', {
-          sessionId: sid, cwd: tabCwd, targetUuid: uiMsgId,
-        });
-        if (!truncRes?.success) {
-          console.error('[ClaudeSDKTab:truncateAndResend] backend failed:', truncRes?.error);
-          showToast('Truncate failed: ' + (truncRes?.error || 'unknown'), 'error', 6000);
-          setMessages(prev => [...prev, {
-            id: 'error-' + Date.now(), role: 'system' as const,
-            text: 'Truncate failed: ' + (truncRes?.error || 'unknown'),
-            toolCalls: [], thinking: null, timestamp: Date.now(),
-          }]);
-          setActionBusy(false);
-          return;
-        }
-      }
-
-      // Trim local messages mirror: drop everything from the target msg onward
-      // (also takes out any trailing error-…/system row from the failed turn).
-      // Then add the new user msg + flip running for visual feedback.
-      setMessages(prev => {
-        const idx = prev.findIndex(m => m.id === uiMsgId);
-        const head = idx === -1 ? prev : prev.slice(0, idx);
-        return [...head, {
-          id: 'user-' + Date.now(),
-          role: 'user' as const,
-          text: newText,
-          toolCalls: [], thinking: null,
-          timestamp: Date.now(),
-        }];
+      try { ipcRenderer.send('log:renderer', `[RepeatDiag] TRUNCATE_INVOKE ${diagId} userPos=${userPos}`); } catch {}
+      const truncRes = await ipcRenderer.invoke('claude-sdk:truncate-history', {
+        sessionId: sid, cwd: tabCwd, userPosition: userPos,
       });
-      setIsRunning(true);
-      setWasStopped(false);
-      updateSDKState(tabId, { sdkState: 'fetching' });
+      try { ipcRenderer.send('log:renderer', `[RepeatDiag] TRUNCATE_RESULT ${diagId} success=${!!truncRes?.success} removed=${truncRes?.removed ?? '?'} err=${truncRes?.error || 'none'}`); } catch {}
+      if (!truncRes?.success) {
+        console.error('[ClaudeSDKTab:truncateAndResend] backend failed:', truncRes?.error);
+        showToast('Truncate failed: ' + (truncRes?.error || 'unknown'), 'error', 6000);
+        if (snapshot) setMessages(snapshot);
+        return;
+      }
 
-      // Fire the resend through the existing SDK channel — server-side
-      // session.sessionId is preserved, so this lands as the new turn off the
-      // truncated tip. Pass resumeSessionId explicitly (see fix-sdk-session-amnesia).
+      // Loader ON — после stop+truncate, прямо перед send. Любой late `done`
+      // event от прошлой query уже отработал (он прилетает синхронно с
+      // close(), мы только что await'нули stop). Теперь fetching устоит.
+      setIsRunning(true);
+      updateSDKState(tabId, { sdkState: 'fetching' });
+      try { ipcRenderer.send('log:renderer', `[RepeatDiag] LOADER_ON ${diagId}`); } catch {}
+
+      try { ipcRenderer.send('log:renderer', `[RepeatDiag] SEND_INVOKE ${diagId} resumeSid=${sessionIdRef.current?.slice(0,8)}`); } catch {}
       const result = await ipcRenderer.invoke('claude-sdk:send-message', {
         tabId, cwd: tabCwd, prompt: newText, model: sdkModel, effort: sdkEffort, thinking: sdkThinking,
         resumeSessionId: sessionIdRef.current || null,
       });
+      try { ipcRenderer.send('log:renderer', `[RepeatDiag] SEND_RESULT ${diagId} success=${!!result?.success} err=${result?.error || 'none'}`); } catch {}
       if (!result?.success) {
         setIsRunning(false);
         updateSDKState(tabId, { sdkState: 'error' });
@@ -1692,21 +2625,32 @@ function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKT
       }
     } finally {
       setActionBusy(false);
+      actionInFlightRef.current = false;
     }
   }, [tabId, cwd, updateSDKState]);
 
   const userMsgActions = useMemo<UserMsgActions>(() => ({
     onRepeat: (msgId) => {
-      // Find the original text in messages and resend it as-is.
-      setMessages(prev => {
-        const m = prev.find(x => x.id === msgId);
-        if (m) truncateAndResend(msgId, m.text);
-        return prev;
-      });
+      try { ipcRenderer.send('log:renderer', `[RepeatDiag] CLICK onRepeat msgId=${msgId?.slice(0,8)} actionBusy=${actionBusy} isRunning=${isRunning}`); } catch {}
+      // Read text via messagesRef synchronously WITHOUT wrapping in setMessages.
+      // Раньше тут был `setMessages(prev => { …; return prev })` — outer return
+      // prev побеждал inner trim в одном React batch'е, оптимистичный срез
+      // молча перетирался. messagesRef.current даёт ту же актуальную копию
+      // без побочки на state.
+      const m = messagesRef.current.find(x => x.id === msgId);
+      try { ipcRenderer.send('log:renderer', `[RepeatDiag] CLICK onRepeat foundInMessages=${!!m} refLen=${messagesRef.current.length}`); } catch {}
+      if (m) truncateAndResend(msgId, m.text);
     },
-    onEdit: (msgId, newText) => truncateAndResend(msgId, newText),
-    busy: actionBusy || isRunning,
-  }), [actionBusy, isRunning, truncateAndResend]);
+    onEdit: (msgId, newText) => {
+      try { ipcRenderer.send('log:renderer', `[RepeatDiag] CLICK onEdit msgId=${msgId?.slice(0,8)} textLen=${newText?.length} actionBusy=${actionBusy} isRunning=${isRunning}`); } catch {}
+      truncateAndResend(msgId, newText);
+    },
+    // Disable Edit/Repeat when: a repeat/edit is mid-flight (actionBusy), the
+    // turn is streaming (isRunning — like native /rewind only between turns), OR
+    // a background agent is still running (bgAgentRunning — a hard kill to
+    // rewrite history would abort it). Enabled only on a fully-idle turn.
+    busy: actionBusy || isRunning || bgAgentRunning,
+  }), [actionBusy, isRunning, bgAgentRunning, truncateAndResend]);
 
   const isVisible = active && isActiveProject;
 
@@ -1874,8 +2818,11 @@ function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKT
         return;
       }
       if (isRunning) {
+        try { ipcRenderer.send('log:renderer', `[RepeatDiag] WINDOW_ESCAPE_TRIGGER isRunning=true → onCancel()`); } catch {}
         e.preventDefault();
         onCancel();
+      } else {
+        try { ipcRenderer.send('log:renderer', `[RepeatDiag] WINDOW_ESCAPE_IGNORE isRunning=false`); } catch {}
       }
     };
     window.addEventListener('keydown', handler);
@@ -1925,10 +2872,31 @@ function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKT
       // Allowed roles: user / assistant / system / compact-summary. Anything
       // else (raw 'attachment' SDK records, etc.) is internal protocol.
       if (m.role !== 'user' && m.role !== 'assistant' && m.role !== 'system' && m.role !== 'compact-summary') return false;
-      if (m.role === 'assistant' && !m.text.trim() && m.toolCalls.length === 0 && !m.thinking) return false;
+      if (m.role === 'assistant') {
+        if (!m.text.trim() && m.toolCalls.length === 0 && !m.thinking) return false;
+        // Skip turns whose only "content" is Task* / TodoWrite mgmt (no text,
+        // no thinking, all toolCalls are Task tools). They are already
+        // represented in TaskListPanel above the composer; rendering an empty
+        // bubble for them is noise. См. aggregateTasksFromMessages.
+        if (!m.text.trim() && !m.thinking && m.toolCalls.length > 0 && m.toolCalls.every(t => TASK_TOOL_NAMES.has(t.name))) return false;
+      }
       return true;
     }),
   [messages]);
+
+  // Aggregate TaskCreate/TaskUpdate/TodoWrite только из ПОСЛЕДНЕГО turn'а:
+  // от последнего user-сообщения и до конца. Каждый prompt начинает новый
+  // task-список — старые таски прошлых turn'ов в панели не висят. Native
+  // Claude TUI ведёт себя так же: TodoWrite/TaskCreate видны пока актуальны,
+  // новый юзер-prompt стирает табло (allDone тоже его стирает, см. aggregator).
+  const aggregatedTasks = useMemo(() => {
+    let lastUserIdx = -1;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === 'user') { lastUserIdx = i; break; }
+    }
+    const slice = lastUserIdx === -1 ? messages : messages.slice(lastUserIdx);
+    return aggregateTasksFromMessages(slice);
+  }, [messages]);
 
   const runtime = useExternalStoreRuntime({
     messages: filteredMessages,
@@ -2051,6 +3019,9 @@ function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKT
       const target = e.target as HTMLElement | null;
       const tabRoot = target?.closest?.('.absolute.inset-0.flex.flex-col');
       if (!tabRoot) return;
+      // Mark mouse-pressed-in-tab BEFORE the focus shift / textarea onBlur runs
+      // (this capture listener fires before the mousedown default action).
+      _sdkPointerDown.current = true;
       const ta = tabRoot.querySelector('textarea') as HTMLTextAreaElement | null;
       if (!ta) return;
       // Only snapshot when click is OUTSIDE the textarea — that's the case
@@ -2069,6 +3040,10 @@ function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKT
     // window.getSelection() != collapsed → leave focus in body so selection
     // stays visible.
     const onMouseUp = (e: MouseEvent) => {
+      // Always clear the pressed flag first, before any early-return — a drag
+      // can start in the chat and end over the sidebar (tabRoot=null below),
+      // and the flag must not get stuck true or onBlur refocus stays disabled.
+      _sdkPointerDown.current = false;
       if (!isVisibleRef.current) return;
       const target = e.target as HTMLElement | null;
       const tabRoot = target?.closest?.('.absolute.inset-0.flex.flex-col');
@@ -2315,7 +3290,20 @@ function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKT
                 />
               ) : (
                 <>
-                  {expandedTaskId ? (
+                  {expandedTaskId && expandedTaskIsWorkflow ? (
+                    // Workflow expanded into its phase/agent panel. Only when the
+                    // user explicitly opened the workflow chip (↓ + Enter or click)
+                    // — it never auto-takes-over the composer.
+                    <WorkflowPanel
+                      tabId={tabId}
+                      taskId={expandedTaskId}
+                      onStopTask={(taskId) => {
+                        ipcRenderer.invoke('claude-sdk:stop-task', { tabId, taskId })
+                          .catch((e: any) => console.error('[WorkflowStop] error', e));
+                      }}
+                      onClose={() => setExpandedTaskId(null)}
+                    />
+                  ) : expandedTaskId ? (
                     <TaskDetailPane
                       tabId={tabId}
                       taskId={expandedTaskId}
@@ -2329,27 +3317,20 @@ function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKT
                       isRunning={isRunning}
                       sessionId={sessionId}
                       wasStopped={wasStopped}
-                      onResume={() => setWasStopped(false)}
+                      queued={queued}
+                      queuedState={queuedState}
+                      tasks={aggregatedTasks}
                       modelLabel={currentModelLabel}
                       contextPercent={contextPercentRemaining}
                       onUserInteract={scrollToBottom}
                       onSessionStop={async () => {
-                        // Double-Ctrl+C from inside the composer = "stop the whole
-                        // session" (matches Claude TUI). Same path as the TabBar dot,
-                        // sidebar chip, ctx menu — surface Resume affordance.
+                        // Double-Ctrl+C from the composer = SOFT interrupt of the
+                        // current turn (matches native Esc). Process + session +
+                        // background agents stay alive; only the dedicated kill
+                        // button (control-bar indicator) or closing the tab fully
+                        // terminates the process. So NO hard flag, NO stopTask.
                         try {
-                          // Collect running task IDs so subagents get stopTask'd
-                          // before query.close() (otherwise their workers keep
-                          // running detached). Mirrors the Escape onCancel path.
-                          const runningTaskIds: string[] = (() => {
-                            const st = useWorkspaceStore.getState();
-                            for (const [, ws] of st.openProjects) {
-                              const t = ws.tabs.get(tabId);
-                              if (t?.bgTasks) return t.bgTasks.filter(b => b.status === 'running').map(b => b.taskId);
-                            }
-                            return [];
-                          })();
-                          await ipcRenderer.invoke('claude-sdk:stop', { tabId, runningTaskIds });
+                          await ipcRenderer.invoke('claude-sdk:stop', { tabId });
                           window.dispatchEvent(new CustomEvent('claude-sdk:was-stopped', { detail: { tabId } }));
                         } catch (e: any) { console.error('[ComposerStop] error', e); }
                       }}
@@ -2445,6 +3426,11 @@ export const UserMsg = () => {
   const isPersisted = msgId && !/^(user-|streaming-|hist-|msg-|init-|error-)/.test(msgId);
   const isPlaceholderUser = !!msgId && /^user-/.test(msgId);
   const showActions = isPersisted || isPlaceholderUser;
+  // wasQueued discriminator: type-ahead очередь auto-sent эту запись (см.
+  // dispatchPrompt). Live-only флаг (anthropic JSONL не хранит, после reload
+  // теряется). Прежний `user-` regex выше matched и `user-queued-` тоже —
+  // оба считаются placeholder/in-memory user-msg.
+  const wasQueued = !!msgId && /^user-queued-/.test(msgId);
 
   const startEdit = () => {
     setEditValue(msgText);
@@ -2522,7 +3508,29 @@ export const UserMsg = () => {
           </div>
         </div>
       ) : (
-        <div className="relative max-w-[80%]">
+        <div className="relative max-w-[80%] flex flex-col items-end">
+          {/* "queued" chip — type-ahead background-prompt (отправлен из QUEUED
+              очереди когда Claude стримил предыдущий ответ). Маленький
+              оранжевый chip над bubble'ом — визуальный signal что это
+              background-сообщение, не обычный submit. См. dispatchPrompt +
+              `user-queued-` id-prefix. Mirror на mobile-web в EntryView.user. */}
+          {wasQueued && (
+            <div
+              className="inline-flex items-center gap-1 mb-1 px-1.5 py-0.5 rounded-md select-none"
+              style={{
+                color: '#FFB382',
+                backgroundColor: 'rgba(255, 178, 130, 0.10)',
+                border: '1px solid rgba(255, 178, 130, 0.25)',
+                fontSize: '0.7em',
+                letterSpacing: '0.04em',
+                fontWeight: 600,
+              }}
+              title="Это сообщение было поставлено в очередь во время стриминга Claude и отправлено автоматически когда turn закончился"
+            >
+              <span style={{ fontSize: '0.85em' }}>↑</span>
+              <span>QUEUED</span>
+            </div>
+          )}
           <div className="bg-[#DA7756]/12 border border-[#DA7756]/20 rounded-xl rounded-br-sm px-3 py-2">
             <MessagePrimitive.Content
               components={{ Text: UserTextPart }}
@@ -2540,19 +3548,29 @@ export const UserMsg = () => {
               <div className="flex items-center gap-0.5 rounded-md bg-[#1a1a1a] border border-[#333] shadow-lg px-0.5 py-0.5">
                 <button
                   type="button"
-                  onClick={() => actions?.onRepeat(msgId)}
+                  onClick={() => { if (!actions?.busy) actions?.onRepeat(msgId); }}
                   disabled={actions?.busy}
-                  className="inline-flex items-center justify-center w-[20px] h-[20px] rounded cursor-pointer text-[#888] hover:text-white hover:bg-white/10 transition-colors disabled:opacity-30 disabled:cursor-default"
-                  title="Repeat — drop replies, resend this message"
+                  className={
+                    'inline-flex items-center justify-center w-[20px] h-[20px] rounded transition-colors ' +
+                    (actions?.busy
+                      ? 'opacity-30 cursor-not-allowed text-[#888]'
+                      : 'cursor-pointer text-[#888] hover:text-white hover:bg-white/10')
+                  }
+                  title={actions?.busy ? 'Недоступно пока идёт ответ или работает фоновый агент' : 'Repeat — drop replies, resend this message'}
                 >
                   <RefreshCw size={11} />
                 </button>
                 <button
                   type="button"
-                  onClick={startEdit}
+                  onClick={() => { if (!actions?.busy) startEdit(); }}
                   disabled={actions?.busy}
-                  className="inline-flex items-center justify-center w-[20px] h-[20px] rounded cursor-pointer text-[#888] hover:text-white hover:bg-white/10 transition-colors disabled:opacity-30 disabled:cursor-default"
-                  title="Edit — drop replies, send a new version of this message"
+                  className={
+                    'inline-flex items-center justify-center w-[20px] h-[20px] rounded transition-colors ' +
+                    (actions?.busy
+                      ? 'opacity-30 cursor-not-allowed text-[#888]'
+                      : 'cursor-pointer text-[#888] hover:text-white hover:bg-white/10')
+                  }
+                  title={actions?.busy ? 'Недоступно пока идёт ответ или работает фоновый агент' : 'Edit — drop replies, send a new version of this message'}
                 >
                   <Pencil size={11} />
                 </button>
@@ -2893,6 +3911,30 @@ function getCompactMetricsForMsg(id: string): NonNullable<SDKChatMessage['compac
   return _compactMetricsByMsgId.get(id) || null;
 }
 
+// Same module-level carry trick for the "stopped" badge: ThreadMessageLike has
+// no slot for our per-message `interrupted` flag, so AssistantMsg looks it up by
+// id here. Set from loadHistory (durable, JSONL marker) AND from onCancel branch
+// A (live, before reload). Map id, not boolean — assistant-ui strips extra fields.
+const _interruptedByMsgId = new Set<string>();
+function setInterruptedForMsg(id: string) { _interruptedByMsgId.add(id); }
+function getInterruptedForMsg(id: string): boolean { return _interruptedByMsgId.has(id); }
+
+// Module-level mouse-pressed flag, shared between the document-level
+// mousedown/mouseup handlers (declared in ClaudeSDKTab) and the composer
+// textarea's onBlur (declared in the SIBLING top-level function SDKComposer —
+// NOT nested, so a component-scoped ref can't reach both). Same "module-level
+// carry" trick as _interruptedByMsgId above.
+//
+// Why it exists: a click/drag in the chat blurs the textarea synchronously at
+// mousedown. The onBlur's setTimeout(0) would otherwise fire ~1ms later, BEFORE
+// the drag has built any selection, see isCollapsed=true, and yank focus back —
+// collapsing the nascent selection (double-click survived only because its word
+// selection is synchronous). While the button is down, onBlur defers refocus to
+// the document mouseup handler (SDKActiveRecover), which runs at gesture-end and
+// can distinguish a real drag-selection from a plain click.
+// See fix-controlled-textarea-focus-selection.md.
+const _sdkPointerDown = { current: false };
+
 // Module-level slash-commands cache. Captured from `system:init` event of any
 // live SDK session — it includes the full per-session slash_commands manifest
 // (which throw-away probe-query misses because it has no session/model
@@ -2940,6 +3982,13 @@ export const AssistantMsg = () => {
     return <CompactSummaryMsg />;
   }
 
+  // Per-message "stopped" badge: this assistant turn was interrupted by the
+  // user (Esc / red cancel / double Ctrl+C). Flag carried via module-level Set
+  // (set from the JSONL marker in loadHistory → survives reload, AND from
+  // onCancel branch A → instant). Muted amber, static, uppercase-free — a small
+  // affordance to the LEFT/top of the message, not a status bar.
+  const interrupted = getInterruptedForMsg(id);
+
   // Copy button: sticky pin that follows the viewport while ANY part of this
   // assistant message is on screen — same pattern as Claude.ai / ChatGPT.
   return (
@@ -2959,6 +4008,27 @@ export const AssistantMsg = () => {
           tools: { Fallback: ToolCallPart },
         }}
       />
+      {/* Plate sits BELOW the content — the answer was cut off at its END, so the
+          "stopped" marker belongs where the text actually stops. */}
+      {interrupted && (
+        <div
+          className="inline-flex items-center gap-1 mt-1.5 px-1.5 py-0.5 rounded select-none"
+          style={{
+            fontSize: 11,
+            lineHeight: 1,
+            color: '#d97706',
+            backgroundColor: 'rgba(217, 119, 6, 0.12)',
+            border: '1px solid rgba(217, 119, 6, 0.30)',
+          }}
+          title="Этот ответ был остановлен пользователем"
+        >
+          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
+            <circle cx="12" cy="12" r="9" />
+            <line x1="6.3" y1="6.3" x2="17.7" y2="17.7" />
+          </svg>
+          stopped
+        </div>
+      )}
     </MessagePrimitive.Root>
   );
 };
@@ -3130,10 +4200,10 @@ const AssistantTextPart = ({ text }: { text: string }) => {
   if (!text.trim()) return null;
   return (
     <div
-      className="prose prose-invert prose-sm max-w-none text-[1em] prose-headings:font-semibold prose-h1:text-[1.15em] prose-h1:mt-2 prose-h1:mb-0.5 prose-h1:font-bold prose-h2:text-[1.08em] prose-h2:mt-2 prose-h2:mb-0.5 prose-h3:text-[1em] prose-h3:mt-1.5 prose-h3:mb-0 prose-h4:text-[1em] prose-h4:mt-1.5 prose-h4:mb-0 prose-h5:text-[1em] prose-h5:mt-1.5 prose-h5:mb-0 prose-h6:text-[1em] prose-h6:mt-1.5 prose-h6:mb-0 prose-p:my-1 prose-p:leading-snug prose-ul:my-1 prose-ol:my-1 [&_ul]:list-inside [&_ul]:pl-0 [&_ol]:list-inside [&_ol]:pl-0 prose-li:my-0 prose-li:leading-snug prose-li:pl-0 [&_li>p]:my-0 [&_li>p]:inline [&_li_>_*]:my-0 [&_ul_ul]:my-0 [&_ol_ol]:my-0 [&_ul_ol]:my-0 [&_ol_ul]:my-0 [&_ul_ul]:pl-4 [&_ol_ol]:pl-4 [&_ul_ol]:pl-4 [&_ol_ul]:pl-4 prose-headings:text-inherit prose-strong:text-inherit prose-strong:font-semibold marker:text-[#666] prose-pre:bg-transparent prose-pre:p-0 prose-pre:my-0 prose-pre:border-0"
+      className="prose prose-invert prose-sm max-w-none text-[1em] prose-headings:font-semibold prose-h1:text-[1.15em] prose-h1:mt-4 prose-h1:mb-1 prose-h1:font-bold prose-h2:text-[1.08em] prose-h2:mt-4 prose-h2:mb-1 prose-h3:text-[1em] prose-h3:mt-3 prose-h3:mb-0.5 prose-h4:text-[1em] prose-h4:mt-3 prose-h4:mb-0.5 prose-h5:text-[1em] prose-h5:mt-3 prose-h5:mb-0.5 prose-h6:text-[1em] prose-h6:mt-3 prose-h6:mb-0.5 prose-p:my-0.5 prose-p:leading-snug prose-ul:my-0.5 prose-ol:my-0.5 [&_ul]:list-inside [&_ul]:pl-0 [&_ol]:list-inside [&_ol]:pl-0 prose-li:my-0 prose-li:leading-snug prose-li:pl-0 [&_li>p]:my-0 [&_li>p]:inline [&_li_>_*]:my-0 [&_ul_ul]:my-0 [&_ol_ol]:my-0 [&_ul_ol]:my-0 [&_ol_ul]:my-0 [&_ul_ul]:pl-4 [&_ol_ol]:pl-4 [&_ul_ol]:pl-4 [&_ol_ul]:pl-4 prose-headings:text-inherit prose-strong:text-inherit prose-strong:font-semibold marker:text-[#666] prose-pre:bg-transparent prose-pre:p-0 prose-pre:my-0 prose-pre:border-0 prose-table:my-3 [&_th]:px-3 [&_th]:py-1.5 [&_td]:px-3 [&_td]:py-1.5 [&_th]:text-left [&_th]:font-semibold prose-blockquote:my-2 [&_code]:before:content-none [&_code]:after:content-none"
       style={{
-        color: '#d4d4d4',
-        lineHeight: '1.45',
+        color: '#e8e8e8',
+        lineHeight: '1.5',
         fontFamily: '"JetBrainsMono Nerd Font", "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace',
       }}
     >
@@ -3155,13 +4225,13 @@ const AssistantTextPart = ({ text }: { text: string }) => {
           },
           code({ className, children, ...props }) {
             // Block-code (inside <pre>) already handled above. This branch is
-            // ONLY for inline `code` — the <pre> override never delegates here.
-            // Code bg ниже окружающего bubble: bubble-base = transparent,
-            // bubble-hover = #151515 → код #0d0d0d читается как «врезка»
-            // независимо от состояния hover. Text #d4d4d4 = body color
-            // (одинаковый цвет на тексте и в коде, разница только в фоне +
-            // шрифте). GitHub dark inline-code контракт.
-            return <code className={`bg-[#0d0d0d] px-1.5 py-0.5 rounded text-[0.92em] text-[#d4d4d4] border border-white/5 ${className || ''}`} {...props}>{children}</code>;
+            // ONLY for inline `code`. Match Claude Code CLI's `permission` color
+            // (rgb(177,185,249) light blue-purple) — plain colored text, no
+            // background pill, no border. The CLI renders inline code through
+            // `color('permission', theme)(token.text)`; the visual is just a
+            // hue shift, not a chip. Pill-style boxes here previously created
+            // the "backtick chip" look we explicitly wanted to drop.
+            return <code className={`text-[#b1b9f9] ${className || ''}`} {...props}>{children}</code>;
           },
         }}
       >
@@ -3190,25 +4260,33 @@ const ReasoningPart = ({ text }: { text: string }) => {
     }
     return null;
   });
+  // Visual: no card border/background. Just a single-row trigger with a mini-
+  // chip around the Brain icon (small bg+padding so the icon reads as a sticker,
+  // not a floating glyph). Whole row is the clickable surface — hover-tint hints
+  // at it, the chevron-toggle was redundant. Expanded body sits under the row
+  // with a left border (border-l) instead of a wrapper card — visual scoping
+  // without a second background layer.
+  // Header sits on the SAME left edge as body text (no chip background around
+  // the icon, no extra indent). Negative `-mx-1` + matching `px-1` gives the
+  // hover-tint room to breathe without pushing content right of the body
+  // paragraph baseline. Expanded body indents under the row with an absolutely-
+  // positioned border-l that stops short of the bottom (bottom: 6px), so two
+  // consecutive blocks have a visible vertical break between them.
   return (
-    <div ref={anchorRef} className="my-2 mr-[60px] rounded-lg border border-white/10 overflow-hidden bg-white/[0.02]">
+    <div ref={anchorRef} className="my-3 mr-[60px]">
       <button
         type="button"
         onClick={onToggle}
         onMouseDown={(e) => e.preventDefault()}
-        className="flex w-full items-center gap-2 px-3 py-2 text-[0.92em] text-[#bdbdbd] hover:text-white hover:bg-white/[0.04] transition-colors cursor-pointer select-none"
+        className="flex w-full items-center gap-2 -mx-1 px-1 py-1 text-[0.92em] text-[#bdbdbd] hover:text-white hover:bg-white/[0.03] rounded transition-colors cursor-pointer select-none"
       >
-        <ChevronRight
-          size={12}
-          className="text-[#888] transition-transform"
-          style={{ transform: open ? 'rotate(90deg)' : 'none' }}
-        />
-        <Brain size={13} className="text-[#a78bfa]" />
+        <Brain size={13} className="shrink-0 text-[#a78bfa]" />
         <span className="font-medium">thinking{effort ? ` · ${effort}` : ''}</span>
       </button>
       {open && (
-        <div className="px-4 py-3 border-t border-white/10 bg-white/[0.015]">
-          <div className="text-[1em] italic leading-relaxed text-[#d4d4d4] whitespace-pre-wrap break-words max-h-[280px] overflow-y-auto">
+        <div className="ml-2 mt-1 pl-3 relative">
+          <span className="absolute left-0 top-0 border-l border-white/10" style={{ bottom: '6px' }} />
+          <div className="py-1 text-[1em] italic leading-relaxed text-[#d4d4d4] whitespace-pre-wrap break-words max-h-[280px] overflow-y-auto">
             {text}
           </div>
         </div>
@@ -3349,50 +4427,69 @@ const ToolCard: React.FC<{
   description?: React.ReactNode; // optional dim parenthetical, e.g. (Find new-feature branch)
   preview?: React.ReactNode; // optional monospace command/path/query preview
   badges?: React.ReactNode; // counts/diff stats — render after label, before description
+  subtitle?: React.ReactNode; // optional dim sub-line BELOW header (e.g. "Added 1 line, removed 1 line" for Edit)
   body?: React.ReactNode;
   collapsible?: boolean;
   defaultOpen?: boolean;
-}> = ({ status, icon, label, description, preview, badges, body, collapsible = true, defaultOpen = false }) => {
+}> = ({ status, icon, label, description, preview, badges, subtitle, body, collapsible = true, defaultOpen = false }) => {
   const [open, setOpen] = useState(defaultOpen);
   const cardRef = useRef<HTMLDivElement>(null);
   const hasBody = body !== undefined && body !== null && body !== false;
   const handleToggle = useStableCollapseToggle(cardRef, () => setOpen(v => !v));
+  // Visual contract: no card chrome (no border, no background). Whole row is
+  // the clickable surface — cursor:pointer + hover-tint signal it. Chevron
+  // dropped — it was a redundant affordance next to the colored tool icon,
+  // and stole horizontal space from the command preview (which is what the
+  // user actually reads). Icon sits in a tiny chip (bg + padding) so it reads
+  // as a sticker, not a floating glyph against the page background.
+  //
+  // Single-row layout: [icon-chip] [LABEL] [badges] [(description)] [preview...]
+  // Preview row is `whitespace-nowrap` + `truncate` — long Bash commands stay
+  // on ONE line and get cut with ellipsis. Click to expand into body to read
+  // full text. Previously preview wrapped to a second visual line which looked
+  // broken next to a one-line LABEL.
+  //
+  // Expanded body: NO wrapper card. Indented under the row with `border-l`
+  // (single vertical line) — gives the block a visual boundary without a
+  // second background layer that would compete with the page bg.
+  // Layout contract:
+  //  - Header row sits at the SAME left edge as surrounding body text. Icon is
+  //    bare (no chip background) — the bg behind it was redundant noise once
+  //    several rows stacked. `-mx-1` + `px-1` reserves the hover-tint without
+  //    pushing label/preview right.
+  //  - `subtitle` slot (Update/Edit only) renders directly under the header
+  //    in dim text: "Added N lines, removed M lines". Replaces the old +N/-M
+  //    badges in the header row — matches Claude's own thread renderer.
+  //  - Expanded body is indented with an ABSOLUTE border-l that stops 6px
+  //    above the bottom edge of the wrapper. With `my-3` between cards two
+  //    consecutive Updates show a clear vertical gap; the truncated bar makes
+  //    each block's boundary readable instead of one continuous line.
   return (
-    <div
-      ref={cardRef}
-      className="my-2 mr-[60px] rounded-md overflow-hidden"
-      style={{ background: TOOL_BG, border: `1px solid ${TOOL_BORDER}` }}
-    >
+    <div ref={cardRef} className="my-3 mr-[60px]">
       <div
-        className={hasBody && collapsible ? 'cursor-pointer hover:bg-white/[0.02] transition-colors' : ''}
+        className={`flex items-center gap-2 -mx-1 px-1 py-1 rounded overflow-hidden ${hasBody && collapsible ? 'cursor-pointer hover:bg-white/[0.03]' : ''} transition-colors`}
         onClick={hasBody && collapsible ? handleToggle : undefined}
       >
-        {/* Single line: chevron · icon · status-dot · LABEL · (description) · preview */}
-        <div className="flex items-center gap-2 px-3 py-1.5 min-h-[28px] overflow-hidden">
-          {hasBody && collapsible ? (
-            <ChevronRight
-              size={12}
-              className="shrink-0 text-[#888] transition-transform"
-              style={{ transform: open ? 'rotate(90deg)' : 'none' }}
-            />
-          ) : (
-            <span className="w-[12px] shrink-0" />
-          )}
-          <ColoredToolIcon icon={icon} status={status} />
-          <span className="shrink-0 text-[0.85em] font-medium text-[#bdbdbd] uppercase tracking-wide">{label}</span>
-          {badges && <span className="shrink-0 inline-flex items-center gap-1">{badges}</span>}
-          {description && (
-            <span className="shrink-0 text-[0.85em] text-[#888]">({description})</span>
-          )}
-          {preview && (
-            <span className="min-w-0 flex-1 text-[0.92em] font-mono text-[#e0e0e0] truncate">
-              {preview}
-            </span>
-          )}
-        </div>
+        <ColoredToolIcon icon={icon} status={status} />
+        <span className="shrink-0 text-[0.85em] font-medium text-[#bdbdbd] uppercase tracking-wide">{label}</span>
+        {badges && <span className="shrink-0 inline-flex items-center gap-1">{badges}</span>}
+        {description && (
+          <span className="shrink-0 text-[0.85em] text-[#888]">({description})</span>
+        )}
+        {preview && (
+          <span className="min-w-0 flex-1 text-[0.92em] font-mono text-[#e0e0e0] whitespace-nowrap truncate">
+            {preview}
+          </span>
+        )}
       </div>
+      {subtitle && (
+        <div className="-mx-1 px-1 -mt-0.5 text-[0.85em] text-[#888] leading-tight">
+          {subtitle}
+        </div>
+      )}
       {hasBody && open && (
-        <div className="border-t" style={{ borderColor: TOOL_BORDER }}>
+        <div className="ml-2 mt-1.5 pl-3 relative">
+          <span className="absolute left-0 top-0 border-l border-white/10" style={{ bottom: '6px' }} />
           {body}
         </div>
       )}
@@ -3408,10 +4505,14 @@ const BashCard: React.FC<{ args: Record<string, any>; result: any; status: ToolS
   const description: string = args.description || '';
   const resultText = typeof result === 'string' ? result : (result == null ? '' : JSON.stringify(result));
   const preview = cmd ? <span>{cmd}</span> : <span className="italic text-[#666]">(no command)</span>;
+  // Body lives inside the parent's border-l indent (no card frame). No tinted
+  // backgrounds on either the command echo or the result block — the left
+  // border already scopes them. Light divider between command and output kept
+  // as `border-t` (single hairline, не подложка).
   const body = (cmd || resultText) ? (
-    <div>
+    <div className="py-1">
       {cmd && (
-        <div className="px-3 py-2 text-[0.92em] font-mono text-[#e0e0e0] whitespace-pre-wrap break-all leading-snug bg-[#0d0d0d] border-b" style={{ borderColor: TOOL_BORDER }}>
+        <div className="py-1 text-[0.92em] font-mono text-[#e0e0e0] whitespace-pre-wrap break-all leading-snug">
           {cmd}
         </div>
       )}
@@ -3420,7 +4521,7 @@ const BashCard: React.FC<{ args: Record<string, any>; result: any; status: ToolS
           language="bash"
           style={oneDark as any}
           PreTag="div"
-          customStyle={{ margin: 0, padding: '10px 12px', background: '#0f0f0f', fontSize: '0.92em', maxHeight: '180px', overflow: 'auto' }}
+          customStyle={{ margin: cmd ? '6px 0 0' : 0, padding: '6px 0 0', background: 'transparent', fontSize: '0.92em', maxHeight: '180px', overflow: 'auto', borderTop: cmd ? `1px solid ${TOOL_BORDER}` : undefined }}
           codeTagProps={{ style: { fontFamily: 'inherit' } }}
         >
           {resultText}
@@ -3451,7 +4552,7 @@ const ReadCard: React.FC<{ args: Record<string, any>; result: any; status: ToolS
       language={lang}
       style={oneDark as any}
       PreTag="div"
-      customStyle={{ margin: 0, padding: '10px 12px', background: '#0f0f0f', fontSize: '0.92em', maxHeight: '320px', overflow: 'auto' }}
+      customStyle={{ margin: 0, padding: '6px 0 0', background: 'transparent', fontSize: '0.92em', maxHeight: '320px', overflow: 'auto' }}
       codeTagProps={{ style: { fontFamily: 'inherit' } }}
     >
       {content}
@@ -3468,19 +4569,54 @@ const ReadCard: React.FC<{ args: Record<string, any>; result: any; status: ToolS
 // "show all N lines" would just duplicate what scrolling already does. Same
 // logic as ReadCard — redundant click on top of native scroll.
 
+// Diff lines styled after Claude's own thread renderer.
+// Layout per row: [line-no gutter] [+/-/space marker] [code (Prism-highlighted)].
+//   - gutter: dim line-numbers; nothing fancy, sequential 1..N over the diff,
+//     not the file's real numbers (lineDiff doesn't know them).
+//   - background tints stay at ~12% alpha on add/del; eq is fully transparent.
+//   - color contract:
+//       add / eq → Prism syntax-highlighted code colors (const = blue,
+//                  return = red, strings = green, etc.). User explicitly asked
+//                  for "полноценный цвет кода" on add/eq lines, not a flat
+//                  green wash.
+//       del      → white (#fafafa), Prism OFF. На красном фоне Prism тонов
+//                  плохо читаются (зелёные строки на красном — eye-strain),
+//                  и логически удалённый код — это «обведено к исчезновению»,
+//                  ему не нужна семантическая подсветка.
+function HighlightedLine({ line, language }: { line: string; language: string }) {
+  // Prism inline render. We disable the wrapper's customStyle bg so the row's
+  // own bg-tint (add/del) shows through. `code` tag inherits font-family from
+  // the parent .font-mono. PreTag="span" keeps it inline-flow so the row
+  // stays a single-line flex item.
+  return (
+    <SyntaxHighlighter
+      language={language}
+      style={oneDark as any}
+      PreTag="span"
+      CodeTag="span"
+      customStyle={{ margin: 0, padding: 0, background: 'transparent', fontSize: 'inherit', display: 'inline' }}
+      codeTagProps={{ style: { fontFamily: 'inherit', background: 'transparent' } }}
+    >
+      {line || ' '}
+    </SyntaxHighlighter>
+  );
+}
+
 function DiffLines({ entries, language }: { entries: DiffEntry[]; language: string }) {
   return (
     <div>
-      <div className="font-mono text-[0.92em] leading-[1.55] max-h-[320px] overflow-y-auto bg-[#0f0f0f]" data-diff-lang={language}>
+      <div className="font-mono text-[0.92em] leading-[1.55] max-h-[320px] overflow-y-auto" data-diff-lang={language}>
         {entries.map((e, idx) => {
-          const bg = e.tag === 'add' ? 'rgba(74, 222, 128, 0.10)' : e.tag === 'del' ? 'rgba(239, 68, 68, 0.10)' : 'transparent';
-          const color = e.tag === 'add' ? '#86efac' : e.tag === 'del' ? '#fca5a5' : '#888';
+          const bg = e.tag === 'add' ? 'rgba(74, 222, 128, 0.12)' : e.tag === 'del' ? 'rgba(239, 68, 68, 0.14)' : 'transparent';
+          const markerColor = e.tag === 'add' ? '#4ade80' : e.tag === 'del' ? '#ef4444' : '#555';
           const sign = e.tag === 'add' ? '+' : e.tag === 'del' ? '-' : ' ';
+          const lineNo = idx + 1;
           return (
-            <div key={idx} className="flex" style={{ background: bg }}>
-              <span className="select-none w-[20px] shrink-0 text-center" style={{ color }}>{sign}</span>
-              <span className="whitespace-pre-wrap break-all flex-1 pr-3" style={{ color: e.tag === 'eq' ? '#888' : '#e0e0e0' }}>
-                {e.line || ' '}
+            <div key={idx} className="flex items-start" style={{ background: bg }}>
+              <span className="select-none shrink-0 text-right pr-2 pl-2 text-[#555] tabular-nums" style={{ width: '3.5em' }}>{lineNo}</span>
+              <span className="select-none w-[16px] shrink-0 text-center" style={{ color: markerColor }}>{sign}</span>
+              <span className="whitespace-pre-wrap break-all flex-1 pr-3" style={{ color: e.tag === 'del' ? '#fafafa' : undefined }}>
+                {e.tag === 'del' ? (e.line || ' ') : <HighlightedLine line={e.line} language={language} />}
               </span>
             </div>
           );
@@ -3519,17 +4655,21 @@ const EditCard: React.FC<{ toolName: string; args: Record<string, any>; status: 
   const { added, removed } = countDiffStats(diff);
   const verb = toolName === 'Write' ? 'Write' : toolName === 'MultiEdit' ? 'MultiEdit' : 'Update';
 
-  const badges = (added > 0 || removed > 0) ? (
-    <span className="text-[0.85em] font-mono tabular-nums">
-      {added > 0 && <span className="text-[#4ade80]">+{added}</span>}
-      {added > 0 && removed > 0 && ' '}
-      {removed > 0 && <span className="text-[#ef4444]">−{removed}</span>}
+  // Header is bare path; line-count summary moves to a `subtitle` line below
+  // (matches Claude's renderer: "Added N lines, removed M lines"). Reads as
+  // sentence prose, not a cluster of compact +N/-M badges that drew the eye
+  // away from the file path.
+  const subtitle = (added > 0 || removed > 0) ? (
+    <span className="font-mono tabular-nums">
+      {added > 0 && <>Added <span className="text-[#4ade80]">{added}</span> {added === 1 ? 'line' : 'lines'}</>}
+      {added > 0 && removed > 0 && ', '}
+      {removed > 0 && <>removed <span className="text-[#ef4444]">{removed}</span> {removed === 1 ? 'line' : 'lines'}</>}
     </span>
   ) : null;
   const preview = path ? <span>{path}</span> : <span className="italic text-[#666]">(no path)</span>;
   const body = diff.length > 0 ? <DiffLines entries={diff} language={lang} /> : null;
   // Edit/Write defaultOpen=true — the diff is the whole point of the call.
-  return <ToolCard status={status} icon={<FileEdit size={13} />} label={verb} badges={badges} preview={preview} body={body} defaultOpen={true} />;
+  return <ToolCard status={status} icon={<FileEdit size={13} />} label={verb} preview={preview} subtitle={subtitle} body={body} defaultOpen={true} />;
 };
 
 // ---- Fallback for anything else (Glob, Grep, WebSearch, MCP, etc.) ----
@@ -3548,7 +4688,7 @@ const GenericToolCard: React.FC<{ toolName: string; args: Record<string, any>; r
   const resultText = result == null ? '' : (typeof result === 'string' ? result : JSON.stringify(result, null, 2));
   const preview = summary ? <span>{summary}</span> : null;
   const body = resultText ? (
-    <pre className="m-0 px-3 py-2 text-[0.92em] text-[#bdbdbd] font-mono whitespace-pre-wrap break-all bg-[#0f0f0f] max-h-[180px] overflow-y-auto">{resultText}</pre>
+    <pre className="m-0 py-1 text-[0.92em] text-[#bdbdbd] font-mono whitespace-pre-wrap break-all max-h-[180px] overflow-y-auto">{resultText}</pre>
   ) : null;
   return <ToolCard status={status} icon={icon} label={toolName} preview={preview} body={body} defaultOpen={false} />;
 };
@@ -3706,7 +4846,9 @@ function SDKComposer({
   isRunning,
   sessionId,
   wasStopped,
-  onResume,
+  queued,
+  queuedState,
+  tasks,
   onSessionStop,
   modelLabel,
   contextPercent,
@@ -3716,36 +4858,79 @@ function SDKComposer({
   isRunning: boolean;
   sessionId: string | null;
   wasStopped: boolean;
-  onResume: () => void;
+  queued: string | null;
+  queuedState: 'queued' | 'sent' | null;
+  tasks: AggregatedTask[];
   onSessionStop: () => void;
   modelLabel: string | null;
   contextPercent: number | null;
   onUserInteract?: () => void;
 }) {
+  // Footer model-label font size is pinned to the TERMINAL font setting (the
+  // single «Шрифт» under Settings → Размеры → Терминал), NOT the SDK font and
+  // NOT a relative em. Юзер: «название модели под инпутом должно быть того же
+  // размера шрифта, как шрифт терминала из настроек». Absolute px so it never
+  // inherits the composer's local em scaling.
+  const terminalFontSize = useUIStore((s) => s.terminalFontSize);
+  // "Logical focus" — composer is the keyboard target. Tracks DOM focus PLUS
+  // the selection-in-chat case where DOM focus is parked on body but typing
+  // still routes here (global keydown router). Drives the orange border that
+  // replaces the blinking caret as the "input is active" signal while text is
+  // selected in the history (the caret itself can't survive a selection —
+  // WHATWG focus collapses it).
+  const [composerFocused, setComposerFocused] = useState(false);
   const [chips, setChips] = useState<PasteChip[]>([]);
   const [previewChip, setPreviewChip] = useState<PasteChip | null>(null);
+  // Flash pulse for the queued chip when the user tries to submit a SECOND
+  // mid-stream Enter under an already-pending one. Single-slot UX: there's
+  // no room for a second chip; the existing one briefly highlights to
+  // confirm the keypress was received but rejected.
+  const [chipFlashTick, setChipFlashTick] = useState(0);
+  // True for ~400ms after the composer is focused via the process-chip click —
+  // drives a one-shot orange glow on the input so the click is visibly answered
+  // (focusing an empty input is otherwise near-invisible). Pure style toggle, no
+  // remount (a changing key would drop the caret/text).
+  const [focusFlash, setFocusFlash] = useState(false);
+  useEffect(() => {
+    const onFlash = (e: Event) => {
+      const { tabId: tid } = (e as CustomEvent).detail || {};
+      if (tid !== tabId) return;
+      setChipFlashTick(t => t + 1);
+    };
+    window.addEventListener('claude-sdk:typeahead-flash', onFlash);
+    return () => window.removeEventListener('claude-sdk:typeahead-flash', onFlash);
+  }, [tabId]);
   // Stashed text — populated by Ctrl+S, restored by clicking the chip or
   // reset-to-empty after the next successful submit. Kept here in component
   // state (not in composer runtime) so we can render the chip + diff against
   // the live composer text.
   const [stashed, setStashed] = useState<string | null>(null);
+  // Task list collapse/expand. Native CLI auto-expands on first Create/Update
+  // (см. TaskCreateTool.call → setAppState({expandedView:'tasks'})), мы делаем
+  // то же: первый раз когда tasks.length стал >0 — expand; дальше уважаем
+  // юзер-collapse. Per-tab состояние (key = tabId через mount) — состояние
+  // не персистится между перезапусками, сбрасывается при ремаунте composer'а
+  // (open task-pane → close → composer remount), что приемлемо: при следующем
+  // Create/Update auto-expand сработает заново.
+  const [tasksCollapsed, setTasksCollapsed] = useState(false);
+  const tasksAutoExpandedRef = useRef(false);
+  useEffect(() => {
+    if (tasks.length > 0 && !tasksAutoExpandedRef.current) {
+      tasksAutoExpandedRef.current = true;
+      setTasksCollapsed(false);
+    }
+    // Если все таски сброшены (TodoWrite allDone → tasks=[]), reset auto-expand
+    // memory чтобы следующий новый список снова auto-expand'ился.
+    if (tasks.length === 0 && tasksAutoExpandedRef.current) {
+      tasksAutoExpandedRef.current = false;
+    }
+  }, [tasks.length]);
   // Caret snapshot captured at mousedown — BEFORE Blink resets selectionStart
   // to 0 when the user clicks outside the textarea. Read in onBlur so we know
   // where the caret really was instead of seeing 0. The same name exists in
   // another function in this file (its-own-scope) — this local copy is what
   // the SDKComposer textarea actually needs.
   const savedCaretRef = useRef<{ start: number; end: number } | null>(null);
-  // 1-second red flash on the composer when юзер пытается отправить (Enter)
-  // во время Claude turn'а. Visual signal of «заблокировано» вместо тихого
-  // no-op. Триггерится в handleComposerKeyDown.
-  const [rejectFlash, setRejectFlash] = useState(false);
-  const rejectFlashTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const triggerRejectFlash = useCallback(() => {
-    setRejectFlash(true);
-    if (rejectFlashTimerRef.current) clearTimeout(rejectFlashTimerRef.current);
-    rejectFlashTimerRef.current = setTimeout(() => setRejectFlash(false), 1000);
-  }, []);
-  useEffect(() => () => { if (rejectFlashTimerRef.current) clearTimeout(rejectFlashTimerRef.current); }, []);
   // Effort label for the live "thinking · <effort>" indicator. Subscribed via
   // selector so the indicator re-renders when the user flips the Effort pill
   // mid-turn (rare but valid — pill changes apply to the next request, but the
@@ -3759,6 +4944,24 @@ function SDKComposer({
     }
     return null;
   });
+  // Transient "останавливаю процесс…" cue while Edit/Repeat hard-kills the live
+  // session before rewriting history (fired by truncateAndResend via the
+  // claude-sdk:stopping window event). Auto-clears after 1.2s or when the new
+  // turn starts streaming (isRunning flips true). Shown in the status line in
+  // place of the "thinking" loader so the user sees the process being stopped.
+  const [composerStopping, setComposerStopping] = useState(false);
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const { tabId: t } = (e as CustomEvent).detail || {};
+      if (t !== tabId) return;
+      setComposerStopping(true);
+      setTimeout(() => setComposerStopping(false), 1200);
+    };
+    window.addEventListener('claude-sdk:stopping', handler);
+    return () => window.removeEventListener('claude-sdk:stopping', handler);
+  }, [tabId]);
+  useEffect(() => { if (isRunning) setComposerStopping(false); }, [isRunning]);
+
   // Last-Ctrl+C timestamp for the double-press → Stop escalation.
   const lastCtrlCRef = useRef<number>(0);
   // Composer runtime: text source-of-truth + setText/cancel methods.
@@ -3969,23 +5172,36 @@ function SDKComposer({
     return () => window.removeEventListener('claude-sdk:dictation-deliver', handler);
   }, [tabId, writeComposerValue]);
 
+  // Focus the composer on demand (process-state chip click when «остановлен»,
+  // SessionActionChip onStart/onContinue). Handled HERE — direct textarea ref,
+  // not the outer-scope querySelector (which fails when the thread has no
+  // assistant messages yet → no [data-msg-role] marker to anchor on).
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const { tabId: tid } = (e as CustomEvent).detail || {};
+      if (tid !== tabId) return;
+      requestAnimationFrame(() => {
+        composerTextareaRef.current?.focus();
+        // Focusing an EMPTY input is visually near-invisible (just a caret), so
+        // the click read as "ничего не происходит". Pulse the input border +
+        // scroll the thread to the bottom so the click has an unmistakable
+        // visual response. Reuses the sdk-chip-flash orange pulse.
+        setFocusFlash(true);
+        setTimeout(() => setFocusFlash(false), 400);
+        onUserInteract?.();
+      });
+    };
+    window.addEventListener('claude-sdk:focus-composer', handler);
+    return () => window.removeEventListener('claude-sdk:focus-composer', handler);
+  }, [tabId, onUserInteract]);
+
   const dismissStash = useCallback(() => setStashed(null), []);
 
   const handleComposerKeyDown = useCallback((e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    // HARD GATE: пока Claude печатает (isRunning), Enter не отправляет ничего —
-    // ни обычный prompt, ни slash-команду, ни выбранный из popup. Это убирает
-    // race-condition с тем что SDK midstream приём новых prompt'ов не
-    // поддерживает (нужен result event и новый turn). Очередь будем делать
-    // отдельно — пока самый безопасный путь блокировать ввод. Shift+Enter
-    // (newline в textarea) пропускаем. Визуальный сигнал блокировки — на
-    // 1 секунду подсвечиваем border + bg композера красным, иначе тихий
-    // no-op читается юзером как баг клавиатуры.
-    if (isRunning && e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      e.stopPropagation();
-      triggerRejectFlash();
-      return;
-    }
+    // NB: the old hard-gate (Enter-while-running → reject-flash) is GONE. Mid-
+    // stream Enter now parks the message in the type-ahead queue (see block
+    // below the slash popup). The slash-popup handler runs first so slash nav
+    // (↑↓/Tab/Enter) still works while Claude streams.
 
     // Slash autocomplete: when popup is open, arrows/Tab/Enter steer the
     // selection and commit. Reads through refs because handleComposerKeyDown
@@ -4020,6 +5236,94 @@ function SDKComposer({
       }
     }
 
+    // Enter with empty composer BUT chips present → still a valid submission.
+    // assistant-ui's ComposerPrimitive.Input gates Send on `text.trim() !== ''`
+    // so a chip-only payload couldn't be submitted — Enter was silently
+    // swallowed and the user saw "Enter не работает". Bypass by injecting a
+    // single space (onNew uses `'Analyze this content'` placeholder when the
+    // trimmed text part is empty — the space we inject is irrelevant payload-
+    // wise but unblocks the gate). Must run BEFORE the type-ahead branch:
+    // if Claude is busy, we still want chips to enqueue, not get silently
+    // dropped at the gate.
+    if (e.key === 'Enter' && !e.shiftKey && composerText.trim().length === 0 && chips.length > 0) {
+      e.preventDefault();
+      e.stopPropagation();
+      if (isRunning) {
+        // Mid-stream: enqueue chip-only payload. Same single-slot gate as
+        // the text-Enter path.
+        if (queued != null) {
+          try {
+            useUIStore.getState().showToast(
+              queuedState === 'sent'
+                ? 'Previous mid-stream message is in flight to Claude — wait until it appears in the thread.'
+                : 'Already queued: edit or discard the chip above the input first.',
+              'info', 3500,
+            );
+          } catch {}
+          window.dispatchEvent(new CustomEvent('claude-sdk:typeahead-flash', { detail: { tabId } }));
+          return;
+        }
+        window.dispatchEvent(new CustomEvent('claude-sdk:typeahead-enqueue', { detail: { tabId, text: ' ' } }));
+        return;
+      }
+      writeComposerValue(' ');
+      // After React commits the text, fire send. composerRuntime.send() reads
+      // composer state which assistant-ui will have synced to ' '.
+      setTimeout(() => {
+        try { composerRuntime?.send(); } catch (err) { console.warn('[ChipOnlySend] send failed', err); }
+      }, 0);
+      return;
+    }
+
+    // Type-ahead: Enter while Claude is still streaming → park the text in the
+    // queue (single slot, owned by the outer component) instead of sending. It
+    // auto-fires when this turn finishes naturally. Matches native Claude TUI:
+    // you can type the next prompt mid-answer and it goes the moment Claude is
+    // done. Shift+Enter is a newline (skip). Empty input is a no-op (nothing to
+    // queue) — let it fall through so a stray Enter doesn't queue blanks.
+    // Single-slot: if there is already a chip (queued or sent) we refuse —
+    // input keeps the text, the chip flashes (CSS), a toast explains why.
+    // Reason: a second mid-stream Enter under a still-pending one creates
+    // an unbounded queue, the user loses track of order, and the existing
+    // chip can't represent multiple entries.
+    if (isRunning && e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      e.stopPropagation();
+      if (composerText.trim().length === 0) return;
+      if (queued != null) {
+        try {
+          useUIStore.getState().showToast(
+            queuedState === 'sent'
+              ? 'Previous mid-stream message is in flight to Claude — wait until it appears in the thread.'
+              : 'Already queued: edit or discard the chip above the input first.',
+            'info', 3500,
+          );
+        } catch {}
+        window.dispatchEvent(new CustomEvent('claude-sdk:typeahead-flash', { detail: { tabId } }));
+        return;
+      }
+      window.dispatchEvent(new CustomEvent('claude-sdk:typeahead-enqueue', { detail: { tabId, text: composerText } }));
+      writeComposerValue('');
+      return;
+    }
+
+    // ArrowUp at the very start of the input (caret at offset 0, no selection)
+    // recalls the queued type-ahead message back into the composer — append to
+    // whatever is already typed. Mirrors the user's spec: «нажатие стрелки вверх
+    // — оно возвращается обратно в инпут; если в инпуте уже что-то есть, то в
+    // конец». Guarded by caret==0 so ArrowUp still navigates multi-line text
+    // normally. Only when something is actually queued — otherwise pass through.
+    if (e.key === 'ArrowUp' && !e.shiftKey && queued != null) {
+      const ta = composerTextareaRef.current;
+      const atStart = !ta || (ta.selectionStart === 0 && ta.selectionEnd === 0);
+      if (atStart) {
+        e.preventDefault();
+        e.stopPropagation();
+        window.dispatchEvent(new CustomEvent('claude-sdk:typeahead-recall', { detail: { tabId } }));
+        return;
+      }
+    }
+
     // Ctrl+S: stash. Mac users hit ⌘S in muscle memory; we accept both. Skip
     // when textarea is empty (nothing to stash) so a stray ⌘S doesn't replace
     // an existing stash with an empty one.
@@ -4035,9 +5339,8 @@ function SDKComposer({
     // window-level handler line ~1862, или кнопка Stop в ControlBar/TabBar).
     // Юзер: «При Ctrl+C разве у нас просто не должен очищаться input?» — да.
     // Раньше Ctrl+C на пустом input или двойной Ctrl+C эскалировался в
-    // onSessionStop() → overlay «Process stopped — history preserved», что
-    // выглядело как баг (юзер хотел просто очистить ввод, а ему показывают
-    // что процесс остановлен).
+    // onSessionStop(), что выглядело как баг (юзер хотел просто очистить ввод,
+    // а ему останавливали turn).
     // Mac default ⌘C copies; мы требуем Ctrl (не Meta), чтобы highlight-and-
     // copy продолжал работать на macOS. e.code === 'KeyC' — на русской
     // раскладке e.key === 'с' (cyrillic), не 'c'.
@@ -4051,7 +5354,7 @@ function SDKComposer({
       writeComposerValue('');
       return;
     }
-  }, [composerText, writeComposerValue, isRunning, onSessionStop, triggerRejectFlash, commitSlash]);
+  }, [composerText, writeComposerValue, isRunning, onSessionStop, commitSlash, tabId, queued, chips, composerRuntime]);
 
   const handlePaste = useCallback((e: React.ClipboardEvent) => {
     const text = e.clipboardData.getData('text/plain');
@@ -4070,6 +5373,21 @@ function SDKComposer({
     setChips(prev => prev.filter(c => c.id !== id));
     if (previewChip?.id === id) setPreviewChip(null);
   }, [previewChip]);
+
+  // Unpack a chip back into the composer as plain text appended to whatever is
+  // currently typed. Replaces the old × (delete) icon on the chip header —
+  // delete now lives in the preview pane (trash icon, left side). Two distinct
+  // verbs, two distinct surfaces: "expand into input" vs "discard entirely".
+  const unpackChip = useCallback((chip: PasteChip) => {
+    const ta = composerTextareaRef.current;
+    const cur = ta?.value ?? composerText;
+    const sep = cur && !cur.endsWith('\n') ? '\n' : '';
+    writeComposerValue(cur + sep + chip.text);
+    setChips(prev => prev.filter(c => c.id !== chip.id));
+    if (previewChip?.id === chip.id) setPreviewChip(null);
+    // Refocus so the user can keep typing immediately after the unpacked text.
+    setTimeout(() => composerTextareaRef.current?.focus(), 0);
+  }, [composerText, writeComposerValue, previewChip]);
 
   // Expose chips to parent via custom event so onNew can read them
   useEffect(() => {
@@ -4121,15 +5439,96 @@ function SDKComposer({
 
   return (
     <div className="relative">
-      {/* Status bar — Thinking only. Session badge moved below input (under
-          Send) so it sits in the same visual region as the user's last action,
-          freeing the top of the composer for the Stash chip. */}
-      {isRunning && (
+      {/* Status bar — "thinking" while streaming, "останавливаю процесс…" during
+          the Edit/Repeat hard-kill. Session badge moved below input (under Send)
+          so it sits in the same visual region as the user's last action, freeing
+          the top of the composer for the Stash chip. */}
+      {composerStopping ? (
+        <div className="flex items-center gap-2 px-4 py-1 text-[0.77em] text-[#555]">
+          <span className="flex items-center gap-1" style={{ color: '#d97706' }}>
+            <Loader2 size={10} className="animate-spin" />
+            останавливаю процесс…
+          </span>
+        </div>
+      ) : isRunning && (
         <div className="flex items-center gap-2 px-4 py-1 text-[0.77em] text-[#555]">
           <span className="flex items-center gap-1 text-[#DA7756]">
             <Loader2 size={10} className="animate-spin" />
             thinking{composerEffort ? ` · ${composerEffort}` : ''}
           </span>
+        </div>
+      )}
+
+      {/* Task list panel — aggregates TaskCreate/TaskUpdate/TodoWrite tool-calls
+          в один свёрнутый список вместо N отдельных карточек в треде. Зеркало
+          native Claude CLI поведения (TaskCreateTool.call → expandedView:tasks).
+          Скрыто если tasks нет. Header кликабельный → toggle expand. */}
+      <TaskListPanel
+        tasks={tasks}
+        collapsed={tasksCollapsed}
+        onToggle={() => setTasksCollapsed(v => !v)}
+      />
+
+      {/* Type-ahead chip — appears when user pressed Enter mid-stream. Two
+          visual states:
+            queued (orange) — SDK has not yet pulled the message; reversible.
+              Click or ↑ (caret at start) recalls; × discards.
+            sent (gray)     — SDK pulled the message and forwarded it to
+              Claude. Cannot be recalled (it's already at Claude). No edit
+              affordance, no discard button. Auto-clears when JSONL writes
+              the attachment record (chip → user-bubble in thread). If turn
+              ends without the attachment landing, chip is promoted as
+              unconfirmed user-bubble by the result-handler fallback.
+          Hidden when wasStopped — that handler already recalled it. Uppercase
+          label per AI-forensics OCR rule (CLAUDE.md). */}
+      {queued != null && !wasStopped && queuedState === 'queued' && (
+        <div className="px-4 pb-1.5">
+          <div
+            key={'chip-q-' + chipFlashTick}
+            className={"inline-flex items-center gap-2 px-2 py-1 rounded-md text-[0.85em] cursor-pointer transition-colors" + (chipFlashTick > 0 ? " sdk-chip-flash" : "")}
+            style={{
+              color: '#FFB382',
+              backgroundColor: 'rgba(255, 178, 130, 0.12)',
+              border: '1px solid rgba(255, 178, 130, 0.30)',
+              maxWidth: '100%',
+            }}
+            onClick={() => window.dispatchEvent(new CustomEvent('claude-sdk:typeahead-recall', { detail: { tabId } }))}
+            title="Queued — sends when Claude is ready. Click or press ↑ to edit."
+          >
+            <span style={{ color: '#FFB382', fontWeight: 600, fontSize: '0.85em', letterSpacing: '0.04em' }}>QUEUED</span>
+            <span className="truncate" style={{ color: '#d8b9a3' }}>
+              {queued.replace(/\s+/g, ' ').slice(0, 60)}{queued.length > 60 ? '…' : ''}
+            </span>
+            <span className="shrink-0" style={{ color: '#9a7a63', fontSize: '0.77em' }}>↑ edit</span>
+            <button
+              type="button"
+              onClick={(e) => { e.stopPropagation(); window.dispatchEvent(new CustomEvent('claude-sdk:typeahead-dismiss', { detail: { tabId } })); }}
+              className="ml-1 shrink-0"
+              style={{ color: '#9a7a63' }}
+              title="Discard queued message"
+            >×</button>
+          </div>
+        </div>
+      )}
+      {queued != null && !wasStopped && queuedState === 'sent' && (
+        <div className="px-4 pb-1.5">
+          <div
+            key={'chip-s-' + chipFlashTick}
+            className={"inline-flex items-center gap-2 px-2 py-1 rounded-md text-[0.85em] transition-colors" + (chipFlashTick > 0 ? " sdk-chip-flash" : "")}
+            style={{
+              color: '#a0a0a0',
+              backgroundColor: 'rgba(140, 140, 140, 0.10)',
+              border: '1px solid rgba(140, 140, 140, 0.25)',
+              maxWidth: '100%',
+              cursor: 'default',
+            }}
+            title="Sent to Claude. Waiting for transcript to record."
+          >
+            <span style={{ color: '#a0a0a0', fontWeight: 600, fontSize: '0.85em', letterSpacing: '0.04em' }}>SENT</span>
+            <span className="truncate" style={{ color: '#bdbdbd' }}>
+              {queued.replace(/\s+/g, ' ').slice(0, 60)}{queued.length > 60 ? '…' : ''}
+            </span>
+          </div>
         </div>
       )}
 
@@ -4162,73 +5561,76 @@ function SDKComposer({
         </div>
       )}
 
-      {/* Paste chips */}
+      {/* Paste chips.
+          Right-side affordance is "unpack into composer" (ArrowDownToLine icon),
+          NOT delete — клик высыпает текст чипа в конец composer'а как plain
+          text, сам чип уходит из бара. Delete-action переехал в preview-окно
+          (trash слева от заголовка). Пользователь: «вместо × должна быть кнопка
+          которая переводит этот текст в инпут, то есть просто вставляет его в
+          конец». Двойное назначение одной кнопки (preview vs delete) раньше
+          путало — теперь явно: сам чип-тело = preview-toggle, иконка справа =
+          unpack-to-text. */}
       {chips.length > 0 && (
         <div className="flex flex-wrap gap-1.5 px-4 pb-1.5">
           {chips.map(chip => (
-            <Tooltip key={chip.id} content="Click to preview">
             <span
-              className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[0.85em] bg-[#6B8AFF]/15 text-[#8ba4ff] border border-[#6B8AFF]/20 cursor-pointer hover:bg-[#6B8AFF]/25 max-w-[200px]"
-              onClick={() => setPreviewChip(previewChip?.id === chip.id ? null : chip)}
+              key={chip.id}
+              className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[0.85em] bg-[#6B8AFF]/15 text-[#8ba4ff] border border-[#6B8AFF]/20 max-w-[220px]"
             >
-              <span className="truncate">{chip.preview}</span>
-              <span
-                className="text-[#666] hover:text-white ml-0.5 shrink-0"
-                onClick={(e) => { e.stopPropagation(); removeChip(chip.id); }}
-              >×</span>
+              <Tooltip content="Click to preview">
+                <span
+                  className="truncate cursor-pointer"
+                  onClick={() => setPreviewChip(previewChip?.id === chip.id ? null : chip)}
+                >{chip.preview}</span>
+              </Tooltip>
+              <Tooltip content="Unpack into composer">
+                <button
+                  type="button"
+                  className="ml-0.5 shrink-0 inline-flex items-center justify-center w-4 h-4 rounded text-[#8ba4ff]/60 hover:text-white hover:bg-white/10 cursor-pointer"
+                  onClick={(e) => { e.stopPropagation(); unpackChip(chip); }}
+                >
+                  <ArrowDownToLine size={12} />
+                </button>
+              </Tooltip>
             </span>
-            </Tooltip>
           ))}
         </div>
       )}
 
-      {/* Chip preview overlay */}
+      {/* Chip preview overlay.
+          Header: [Trash icon LEFT] [title CENTER-left] [close-collapse RIGHT].
+          Trash now occupies the prominent left slot (where the eye naturally
+          lands first) — клик удаляет сам чип целиком из бара. Раньше там был
+          крестик-закрытия preview справа, который путал юзера: он
+          выглядел как «удалить» но фактически только сворачивал. Теперь
+          сворачивание ушло, preview закрывается повторным кликом на чип
+          (toggle). Если хочется явный «collapse preview» — добавим позже. */}
       {previewChip && (
         <div className="mx-4 mb-2 bg-[#1a1a1a] border border-[#333] rounded-lg max-h-[200px] overflow-y-auto">
-          <div className="flex items-center justify-between px-3 py-1.5 border-b border-[#333]">
-            <span className="text-[0.77em] text-[#888]">Pasted content ({previewChip.text.length.toLocaleString()} chars)</span>
-            <button className="text-[#666] hover:text-white text-[0.92em] cursor-pointer" onClick={() => setPreviewChip(null)}>×</button>
+          <div className="flex items-center gap-2 px-3 py-1.5 border-b border-[#333]">
+            <Tooltip content="Delete chip">
+              <button
+                type="button"
+                className="shrink-0 inline-flex items-center justify-center w-5 h-5 rounded text-[#b91c1c] hover:text-[#ef4444] hover:bg-white/[0.06] cursor-pointer transition-colors"
+                onClick={() => removeChip(previewChip.id)}
+              >
+                <Trash2 size={12} />
+              </button>
+            </Tooltip>
+            <span className="text-[0.77em] text-[#888] flex-1">Pasted content ({previewChip.text.length.toLocaleString()} chars)</span>
           </div>
           <pre className="px-3 py-2 text-[0.85em] text-[#aaa] whitespace-pre-wrap">{previewChip.text}</pre>
         </div>
       )}
 
-      {wasStopped && !isRunning ? (
-        // Stopped state: replace the composer with a single Resume button. The
-        // Claude SDK has no "/resume" — sessionId is preserved across stops, the
-        // next user message naturally continues the conversation. Resume here
-        // simply restores the normal composer UI (clears the wasStopped flag).
-        // History is intact: the messages array is untouched by Stop.
-        <div className="flex items-center justify-between gap-3 px-4 py-3">
-          <div className="flex items-center gap-2 min-w-0">
-            <span
-              style={{
-                width: 8, height: 8, borderRadius: 2,
-                backgroundColor: '#ef4444',
-                display: 'inline-block', flexShrink: 0,
-              }}
-            />
-            <span className="text-[0.92em] text-[#999] truncate">
-              Process stopped — history preserved
-            </span>
-          </div>
-          <button
-            onClick={onResume}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg cursor-pointer transition-colors"
-            style={{
-              fontSize: 12,
-              color: '#FFB382',
-              backgroundColor: 'rgba(255, 178, 130, 0.14)',
-              border: '1px solid rgba(255, 178, 130, 0.35)',
-            }}
-            onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'rgba(255, 178, 130, 0.24)'; }}
-            onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'rgba(255, 178, 130, 0.14)'; }}
-          >
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><polygon points="6 4 20 12 6 20 6 4" /></svg>
-            Resume
-          </button>
-        </div>
-      ) : (
+      {/* SDK has no background process and no "/resume": stopping closes the
+          query, sessionId is preserved, and the next user message continues the
+          conversation on its own. There is nothing to "resume", so we don't
+          replace the composer with a Process-stopped/Resume affordance (that was
+          misleading — it implied a paused process). The only trace of a stop is
+          the per-message "stopped" badge in the thread. The composer stays
+          available immediately after a stop. */}
+      {(
         // relative wrapper для absolute-popup'а. Юзер: «команды должны быть в
         // позиции absolute, перекрывать историю, не двигать ничего».
         <div className="relative">
@@ -4270,13 +5672,24 @@ function SDKComposer({
               // текст реально шёл в textarea, но он его не видел и думал
               // «инпут не работает». Caret = единственный достоверный сигнал
               // «текст идёт сюда» когда юзер начал печатать.
-              style={{ caretColor: '#FFB382' }}
-              className={'flex-1 text-[#e0e0e0] text-[1em] rounded-lg px-3 py-2 resize-none outline-none border placeholder-[#555] min-h-[36px] max-h-[120px] bg-[#1a1a1a] ' + (rejectFlash ? 'border-red-500 bg-[#2a1414]' : 'border-[#555]')}
+              // Border doubles as the focus signal. When text is selected in the
+              // chat, DOM focus parks on body so the blinking caret disappears
+              // (WHATWG: focus collapses the selection — can't keep both). The
+              // orange border (same #FFB382 as the caret) stays lit via
+              // composerFocused to show the input is still the keyboard target.
+              style={{
+                caretColor: '#FFB382',
+                borderColor: focusFlash ? '#FFB382' : (composerFocused ? '#FFB382' : '#555'),
+                boxShadow: focusFlash ? '0 0 0 3px rgba(255,178,130,0.45)' : 'none',
+                transition: 'border-color 120ms ease, box-shadow 200ms ease',
+              }}
+              className={'flex-1 text-[#e0e0e0] text-[1em] rounded-lg px-3 py-2 resize-none outline-none border placeholder-[#555] min-h-[36px] max-h-[120px] bg-[#1a1a1a]'}
               rows={1}
               onPaste={handlePaste}
               onKeyDown={handleComposerKeyDown}
               onInput={() => onUserInteract?.()}
               onFocus={() => {
+                setComposerFocused(true);
                 try { ipcRenderer.send('log:renderer', '[SDKFocus] textarea onFocus'); } catch {}
               }}
               onBlur={(e) => {
@@ -4312,11 +5725,31 @@ function SDKComposer({
                 //   * Outside our tab root entirely (sidebar, header, modal).
                 const tabRoot = ta.closest('.absolute.inset-0.flex.flex-col') as HTMLElement | null;
                 if (!tabRoot) return;
+                // Mouse-initiated blur → DO NOT refocus here. A click/drag in
+                // the chat blurs the textarea at mousedown; this onBlur's
+                // setTimeout(0) would fire ~1ms later, BEFORE the drag has built
+                // any selection, see isCollapsed=true, and steal focus back —
+                // killing drag-select (double-click survived only because the
+                // word is selected synchronously). Defer entirely to the
+                // document mouseup handler (SDKActiveRecover) which runs at
+                // gesture-end and can tell a real selection from a plain click.
+                // Keyboard-only blur (no button down) keeps the refocus path.
+                if (_sdkPointerDown.current) {
+                  try { ipcRenderer.send('log:renderer', '[SDKFocus] onBlur skip-refocus (mouse down → mouseup owns it)'); } catch {}
+                  // Keep the logical-focus border lit: the composer is still the
+                  // keyboard target (global keydown router writes here), even
+                  // though DOM focus left for the selection. The blinking caret
+                  // can't survive (WHATWG: focus collapses selection), so the
+                  // border is the "input is active" signal in its place.
+                  setComposerFocused(true);
+                  return;
+                }
                 if (rel) {
                   // Focus moved to another real element. Refocus only if it's
                   // inside our tab AND it's not an interactive control.
-                  if (!tabRoot.contains(rel)) return;
-                  if (rel.closest('button, a, input, textarea, [contenteditable]')) return;
+                  // These two cases = genuine focus loss → drop the border.
+                  if (!tabRoot.contains(rel)) { setComposerFocused(false); return; }
+                  if (rel.closest('button, a, input, textarea, [contenteditable]')) { setComposerFocused(false); return; }
                 }
                 // (rel is null OR rel is a passive descendant of tabRoot) → refocus.
                 // Microtask: wait for Blink to commit the selection range, then
@@ -4351,7 +5784,7 @@ function SDKComposer({
             <div className="px-4 pb-2 pt-0.5 flex items-center justify-between gap-3 text-[0.7em]" style={{ color: '#5a5a5a' }}>
               <div className="flex items-center gap-1.5 min-w-0">
                 {modelLabel && (
-                  <span className="text-[#bdbdbd] font-medium truncate">[{modelLabel}]</span>
+                  <span className="text-[#bdbdbd] font-medium truncate" style={{ fontSize: `${terminalFontSize}px` }}>[{modelLabel}]</span>
                 )}
                 {contextPercent != null && (
                   <span

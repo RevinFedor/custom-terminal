@@ -20,7 +20,51 @@ Per-tab очередь: `Map<tabId, { items: QueuedPrompt[], autoRun: boolean, s
 Sticky 240px справа-вверху Claude таба. Гейтится тремя условиями:
 - `commandType === 'claude'` (не bash/gemini)
 - `tab.claudeSessionId` существует (есть зарегистрированная сессия)
-- `claudeProcessAlive` — local state от `terminal:command-started/finished` (OSC 133), pure-React: подписка в Terminal.tsx, гейт через prop. **Когда Claude процесс умирает (Stop кнопка) — оверлей мгновенно пропадает**, иначе остался бы по `claudeSessionId` (он persistит после exit для /resume).
+- `claudeProcessAlive` — local state от `terminal:command-started/finished` (OSC 133), pure-React: подписка в Terminal.tsx, гейт через prop. **Когда Claude процесс умирает (Stop кнопка) — оверлей мгновенно пропадает**, иначе остался бы по `claudeSessionId` (он persistit после exit для /resume).
+
+**Шрам: OSC 133 `B` теряется → оверлей висит HIDDEN пока Claude жив.** `claudeProcessAlive` ставится в `true` ТОЛЬКО по OSC 133 `command-started` (B). Но этот маркер **пропускается**, когда Claude ожил способом, не прошедшим через нашу подписку на OSC: восстановление при старте приложения, запуск в **фоновом** табе (компонент Terminal ещё не смонтирован), `--resume` руками без хоткея claude-c (он один force-эмитит `command-started`). Тогда `getCommandState` при маунте возвращает `isRunning:false` → `alive=false` → оверлея нет, **хотя Claude отвечает**. Появляется только после Stop+«продолжить» (claude-c принудительно шлёт сигнал). Симптом юзера: *«Claude отвечает — окна Run after нет; жму Стоп — окно появляется»* (инверсия). Поймано на проде 10:42:43: `alive=false → HIDDEN` без предшествующего `command-finished`/StopAI, затем claude-c → `alive=true → SHOWN`.
+
+**Фикс — bridge-alive как авторитетный fallback.** `bridgeKnownSessions` = «CLI жив в этом табе, держится до kill терминала» (в отличие от `claudeCliActive` = «сейчас обрабатывает», пуст на idle — см. коммент у `before-quit`). Решение:
+1. `terminal:getCommandState` (main) возвращает `isRunning: oscRunning || bridgeKnownSessions.has(tabId)` — если мост знает живую сессию, Claude жив независимо от того, поймали ли мы OSC `B`.
+2. `Terminal.tsx`: `handleSessionDetected` и `handleProcessStarted` ставят `setClaudeProcessAlive(true)` (functional updater — deps эффекта `[tabId]`, прямое чтение стейта было бы stale). Ловит случай «мост обнаружил Claude уже ПОСЛЕ маунта/initial-sync».
+
+Диагностика (можно удалить позже): `[RunAfterDiag]` на OSC B/D + `getCommandState` логирует `bridgeAlive` vs `oscRunning` расхождение.
+
+### 2a. Run after pivot to other tab (`runAfterTabId`)
+
+Поверх обычного `autoRun` (= «по окончании ТЕКУЩЕГО turn-а отправь head» — слушает busy→idle на собственном табе) добавлен опциональный pivot: дропдаун `[on tab ▾]` слева от Run after pill позволяет выбрать **другую** вкладку проекта. Когда выбрана `runAfterTabId = T`, runner ждёт busy→idle на T, а не на queue-owner. Use case: открыт Gemini-таб с длинным research'ем, в Claude-табе сложился промпт «обсуди результат» — арм Run after, на Gemini → когда Gemini закончит, Claude получит промпт.
+
+**Источник busy для T = унифицированный.** Runner подписан на три IPC сразу — `claude:busy-state` (PTY claude + SDK через forward `claude-sdk:busy-state` → `claude:busy-state` в main.js:11559), `gemini:busy-state`. Все три пишут в общий `Map<tabId, boolean> prevBusyRef`. Pivot не различает «какой агент работает на T», только «есть ли там сейчас активный спиннер».
+
+**Три состояния target-таба в UI (определяются в `statusFor()`):**
+
+| Состояние target | Иконка справа от имени | Что делает runner |
+|---|---|---|
+| `busy` (`isTabBusyNow(T) === true`) | спиннер (svg arc, 9px, `pq-spin 0.9s linear infinite`) | ждёт busy→idle edge |
+| `inactive` (`activeTabId !== T`) | `!` в кружке (border `TEXT_MUTED`) | ждёт пока юзер сам активирует T и пошлёт что-то → T станет busy → потом idle → fire |
+| `ready` (T идл и активен) | ничего (occupies 0 width) | cold-start fires немедленно |
+
+«Inactive» — критическая граница: пользователь может выбрать вкладку, в которой Claude ещё ни разу не отвечал. Без специальной обработки `cold-start` сработал бы мгновенно (потому что `prevBusyRef.get(T) ?? false` = `false`, выглядит как idle). Поэтому в cold-start subscription есть `if (!prevBusyRef.has(effectiveTrigger)) continue` — фильтр «есть ли в map'е запись», не просто значение. Запись появляется только когда T получил первый busy event → если истории нет, ждём.
+
+**Где firing:**
+- Owner tab: `fireQueueOwner(ownerTabId, triggerTabId)` поп'ит head из очереди ownerTabId и пошлёт `claude:send-command` на ownerTabId. Trigger используется только в логе (стрелка `↩` = self, `⇒` = pivot).
+- `findOwnersWaitingOn(triggerTabId)` обходит все queues при каждом busy event, ищет те у кого `runAfterTabId === triggerTabId` (или `runAfterTabId === null && triggerTabId === ownerTabId` для default).
+
+**Stale target — lazy validation.** Если target-таб закрыли — `tabExists(runAfterTabId)` возвращает false, runner делает `setRunAfterTab(owner, null)` и фоллбэк на own-tab. Не валидируем в store (создало бы зависимость store→workspaceStore). Validation повторяется на каждом busy event и в cold-start subscription.
+
+**UI layout — 2 равных колонки в header (`1fr 1fr`).** Грид с `grid-template-columns: 1fr 1fr; columnGap: 6`. Левая колонка: trigger «on tab» + delay seconds input. Правая колонка: Run after row / Stop after split / Post split — каждая `width:100%` от своей колонки. Все элементы внутри колонок `width:100% + box-sizing:border-box + minWidth:0` чтобы grid реально схлопывал ячейки. Раньше пробовал `90px 1fr` — правая колонка получалась в 2-3 раза шире левой, кнопки выглядели «непропорционально огромными», input «сек» был хардкод 56px и не подтягивался под колонку. Юзер: *«ширина у инпута и триггера одинаковая, и обе равны кнопкам справа»*.
+
+**Slideout через `createPortal(menu, document.body)` — обязательно.** Раньше picker рендерил slideout inline (`position:fixed` внутри JSX picker'а). Это **не работало**: panel root имеет `backdrop-filter: blur(8px)`, что по CSS-spec делает его containing block для **любого** `position:fixed` потомка. Coords `top: panelRect.top; right: window.innerWidth - panelRect.left + 6` пересчитывались **от panel'я, не от viewport'а** → менюшка улетала за пределы экрана, клики провалились в пустоту, симптом «кнопка тупо не открывается» (`open=true` в state, нет визуала). Editor slideout не страдает потому что он — sibling panel'я, не descendant; picker живёт **внутри** header'а panel'я, поэтому нуждается в портале. Anchor сейчас передаётся через `panelRef` prop напрямую (не walk-up до `position:absolute` ancestor'а — этот walk был фрагилен: HMR / CSS-in-JS объект-стиль не выставляет inline `style.position`, walk доходил до BODY, fallback anchor был мусором). См. `methodology/сценарии-багов-design.md::10` (Portal-кейсы) и `methodology/переносимый-дизайн.md::position:fixed × ancestor transform`.
+
+**Click-toggle-off в picker'е.** Повторный клик по уже-выбранной строке в dropdown сбрасывает target обратно в null. Без этого юзер для отмены выбора должен скроллить к верхней строке `— no target —`, что для пары AI-табов нормально, для проектов с 10+ табами — раздражает. Реализация в onClick row'а: `setRunAfterTab(tabId, isSelected ? null : t.id)`. Канонический паттерн single-select — см. `methodology/переносимый-дизайн.md::Click-toggle-off на single-select pill`.
+
+**Цвет дотика по AI-runtime, не по `tab.color`.** Раньше я использовал `tab.color` как ключ (`claude → #DA7756, gemini → #4E86F8`), но это давало одинаковую саффрон-точку и PTY Claude, и SDK Claude — юзер: *«отображаются все вкладки терминала, хотя клода не запущен... отметь соответствующим кружочком, SDK ≠ PTY»*. Сейчас отдельный enum `AiTabKind: claude-pty | claude-sdk | gemini` и `AI_KIND_COLOR` map: PTY = `#DA7756` (saffron), SDK = `#D28C5A` (terracotta, ровно как в TabItem.tsx:425 SDK override), Gemini = `#4E86F8`. Источник истины для kind — детектор:
+- `tabType === 'claude-sdk'` → `claude-sdk` (regardless of commandType/sessionId — SDK-таб AI-предназначения by definition)
+- иначе `commandType === 'claude' && claudeSessionId` → `claude-pty`
+- иначе `commandType === 'gemini' && geminiSessionId` → `gemini`
+- иначе таб ВООБЩЕ не показывается в списке (фильтр против bash/run-dev — в них нет turn-end edge, бессмысленно ждать)
+
+**Fingerprint Pattern в селекторе.** Подписка на `openProjects` через селектор возвращающий объект ломает Zustand: `set({openProjects: new Map(...)})` каждый busy event → Object.is видит новую ссылку → re-render → селектор создаёт новый объект → infinite loop → `Maximum update depth exceeded`. Фикс: селектор возвращает строку-фингерпринт (id+name AI-табов), shape деривируется через `useMemo([fingerprint, tabId])` с `useWorkspaceStore.getState()` внутри useMemo. Этот шрам ловится моментально через React HMR, но симптом ругательский (стэк-overflow + бесконечный лог) — см. `fix-performance-lags.md::Fingerprint Pattern`.
 
 ### 3. External Editor hijack
 Claude Code TUI имеет хоткей `Ctrl+G` → `chat:externalEditor` → `execSync($EDITOR <tempfile>)`. Мы перехватываем это:

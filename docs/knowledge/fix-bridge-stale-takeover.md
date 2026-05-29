@@ -117,6 +117,7 @@ fires `claude --resume <X>`:
 - AutoResume (`App.tsx` ~L1244)
 - Direct user `claude --resume X` interception (`Terminal.tsx` Case 5 + Case 2)
 - Fork flow (`Terminal.tsx` claude-f handlers)
+- Mobile-initiated Resume (`App.tsx::handleWebBridge::resumeClaudeTab`) — фон от phone тоже шлёт `claude --resume` в PTY и обязан помечать, иначе stale bridge stomp'нет sessionId на mobile-resumed табе. См. `fact-mobile-claude-pty.md::Resume guard rails`.
 
 `Terminal.tsx::handleSessionDetected` consults `isStaleAgainstPending(tabId, incoming)`
 before writing — drops bridge events whose sessionId disagrees with the in-flight

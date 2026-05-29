@@ -497,3 +497,15 @@
   from { opacity: 0; transform: scaleY(0.85); }
   to { opacity: 1; transform: scaleY(1); }
 }
+/* SDK type-ahead chip flash — fired when user tries to enqueue a SECOND
+   mid-stream message while one is still pending. Single-slot UX: there
+   is no room for a second chip, so the existing one briefly highlights
+   to confirm the keypress was received but rejected. */
+@keyframes sdkChipFlash {
+  0%   { box-shadow: 0 0 0 0 rgba(255, 178, 130, 0.55); }
+  50%  { box-shadow: 0 0 0 6px rgba(255, 178, 130, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(255, 178, 130, 0); }
+}
+.sdk-chip-flash {
+  animation: sdkChipFlash 360ms ease-out;
+}

@@ -696,7 +696,7 @@ class DatabaseManager {
 
   // ========== TABS ========== 
 
-  saveTabs(projectId, tabs, forceCleanup = false) {
+  saveTabs(projectId, tabs, forceCleanup = false, preserveInterrupted = false) {
     // Check if project exists to avoid FOREIGN KEY constraint error
     const projectExists = this.db.prepare('SELECT 1 FROM projects WHERE id = ?').get(projectId);
     if (!projectExists) {
@@ -715,6 +715,24 @@ class DatabaseManager {
     }
 
     const newTabIds = tabs.map(t => t.tabId).filter(Boolean);
+
+    // Shutdown guard (never-downgrade): saveTabs does a full delete+reinsert,
+    // writing was_interrupted from the renderer's in-memory tab, which is always
+    // `false` during normal operation. During app shutdown the before-quit
+    // handler marks was_interrupted=1 FIRST (so a stalled proxy-drain / pkill
+    // can't lose it), but the renderer stays alive through the up-to-20s drain
+    // and any background saveTabs (e.g. a bridge session-detected firing
+    // setClaudeSessionId on cwd-drift) would reinsert every row with
+    // was_interrupted=0 → clobber the mark → AutoResume "No interrupted tabs"
+    // on next launch. With preserveInterrupted we snapshot the on-disk flag
+    // BEFORE the delete and OR it into the reinsert: a 1 never drops to 0,
+    // every other field saves normally. See fix-interrupted-session-lifecycle.md.
+    let interruptedSnapshot = null;
+    if (preserveInterrupted) {
+      interruptedSnapshot = new Map();
+      const rows = this.db.prepare('SELECT tab_id, was_interrupted FROM tabs WHERE project_id = ? AND tab_id IS NOT NULL').all(projectId);
+      for (const r of rows) interruptedSnapshot.set(r.tab_id, r.was_interrupted === 1);
+    }
 
     const deleteByTabId = this.db.prepare('DELETE FROM tabs WHERE project_id = ? AND tab_id = ?');
     const insert = this.db.prepare(`
@@ -745,7 +763,12 @@ class DatabaseManager {
           tab.providerState.effort ||
           tab.providerState.thinking
         ) ? JSON.stringify(tab.providerState) : null;
-        insert.run(projectId, tab.name, tab.cwd, index, tab.color || null, tab.isUtility ? 1 : 0, tab.commandType || null, tab.claudeSessionId || null, tab.geminiSessionId || null, tab.wasInterrupted ? 1 : 0, tab.overlayDismissed ? 1 : 0, tab.notes || '', tab.tabType || 'terminal', tab.url || null, tab.terminalId || null, tab.terminalName || null, tab.activeView || null, tab.createdAt || null, tab.isCollapsed ? 1 : 0, tab.parentTabId || null, tab.tabId || null, tab.mcpTaskStartedAt || null, tab.mcpTaskId || null, tab.claudeTaskCount || 0, tab.sessionStatus || null, historyJson, providerStateJson);
+        // never-downgrade: if shutdown already marked this tab interrupted on
+        // disk, keep it 1 even though the in-memory tab carries false.
+        const interruptedFlag = (interruptedSnapshot && interruptedSnapshot.get(tab.tabId))
+          ? 1
+          : (tab.wasInterrupted ? 1 : 0);
+        insert.run(projectId, tab.name, tab.cwd, index, tab.color || null, tab.isUtility ? 1 : 0, tab.commandType || null, tab.claudeSessionId || null, tab.geminiSessionId || null, interruptedFlag, tab.overlayDismissed ? 1 : 0, tab.notes || '', tab.tabType || 'terminal', tab.url || null, tab.terminalId || null, tab.terminalName || null, tab.activeView || null, tab.createdAt || null, tab.isCollapsed ? 1 : 0, tab.parentTabId || null, tab.tabId || null, tab.mcpTaskStartedAt || null, tab.mcpTaskId || null, tab.claudeTaskCount || 0, tab.sessionStatus || null, historyJson, providerStateJson);
       });
 
       // Step 4: Clean up tabs that exist in DB but NOT in the new set

@@ -932,6 +932,13 @@ function App() {
       setBusyTabs(prev => { const n = new Map(prev); if (data.busy) n.set(data.tabId, true); else n.delete(data.tabId); return n; });
     };
 
+    // SDK process-alive signal (single source for the control-bar indicator AND
+    // the tab activity plate). Lives here (always-mounted) so the tab plate
+    // updates even when the SDK tab component is unmounted (inactive tab).
+    const handleSdkProcessState = (_: any, data: { tabId: string; alive: boolean }) => {
+      useWorkspaceStore.getState().setSdkProcessAlive(data.tabId, data.alive);
+    };
+
     // Interceptor state (armed/disarmed) for sub-agent response delivery
     const handleInterceptorState = (_: any, data: { claudeTabId: string; state: 'armed' | 'disarmed' | null }) => {
       const state = useWorkspaceStore.getState();
@@ -1080,13 +1087,23 @@ function App() {
           if (!projectId) return reply(false, null, 'projectId required');
           const ws = state.openProjects.get(projectId);
           if (!ws) return reply(false, null, 'project not open in UI');
-          const tabs = Array.from(ws.tabs.values()).map((t: any) => ({
-            tabId: t.tabId,
-            name: t.name,
-            tabType: t.tabType || 'terminal',
-            commandType: t.commandType,
-            cwd: t.cwd,
-            claudeSessionId: t.claudeSessionId,
+          const tabs = await Promise.all(Array.from(ws.tabs.values()).map(async (t: any) => {
+            let sessionStatus: 'active' | 'busy' | 'inactive' | null = null;
+            if (t.commandType === 'claude') {
+              try {
+                const p = await ipcRenderer.invoke('claude:get-presence', t.tabId);
+                sessionStatus = p?.status || 'inactive';
+              } catch { sessionStatus = 'inactive'; }
+            }
+            return {
+              tabId: t.tabId,
+              name: t.name,
+              tabType: t.tabType || 'terminal',
+              commandType: t.commandType,
+              cwd: t.cwd,
+              claudeSessionId: t.claudeSessionId,
+              sessionStatus,
+            };
           }));
           return reply(true, {
             project: { id: projectId, name: ws.projectPath?.split('/').pop() || projectId, path: ws.projectPath },
@@ -1148,7 +1165,30 @@ function App() {
           if (!tabId) return reply(false, null, 'tabId required');
           for (const ws of state.openProjects.values()) {
             const t = ws.tabs.get(tabId);
-            if (t) return reply(true, {
+            if (!t) continue;
+            // PTY+Claude: derive model from bridgeMetadata (live), effort from
+            // tab's persisted choice OR the global default (claudeEffortLocal).
+            // Thinking is always "adaptive" on PTY — controlled by claude:toggle-thinking,
+            // not surfaced as a separate param in the mobile UI here.
+            if (t.commandType === 'claude' && t.tabType !== 'claude-sdk') {
+              let model = 'default';
+              try {
+                const meta = await ipcRenderer.invoke('claude:get-bridge-metadata', tabId);
+                const rawModel = (meta?.model || '').toLowerCase();
+                if (rawModel.includes('1m')) model = 'default';
+                else if (rawModel.includes('opus')) model = 'opus';
+                else if (rawModel.includes('sonnet')) model = 'sonnet';
+                else if (rawModel.includes('haiku')) model = 'haiku';
+              } catch {}
+              return reply(true, {
+                tabId,
+                model,
+                effort: (t as any).claudeEffortLocal || 'high',
+                thinking: 'adaptive',
+              });
+            }
+            // SDK path
+            return reply(true, {
               tabId,
               model: t.sdkModel || 'default',
               effort: t.sdkEffort || 'high',
@@ -1160,6 +1200,29 @@ function App() {
         if (action === 'setSDKParams') {
           const { tabId, model, effort, thinking } = payload || {};
           if (!tabId) return reply(false, null, 'tabId required');
+          let tab: any = null;
+          for (const ws of state.openProjects.values()) {
+            const t = ws.tabs.get(tabId);
+            if (t) { tab = t; break; }
+          }
+          if (!tab) return reply(false, null, 'tab not open');
+          // PTY+Claude: dispatch slash commands. /model X works any time;
+          // /effort Y only takes effect when Claude is at the prompt — but
+          // safePasteAndSubmit serialises via its per-term mutex, so even
+          // during a turn the command queues correctly.
+          if (tab.commandType === 'claude' && tab.tabType !== 'claude-sdk') {
+            if (model !== undefined) {
+              try { await ipcRenderer.invoke('claude:send-command', tabId, '/model ' + model); } catch {}
+            }
+            if (effort !== undefined) {
+              (tab as any).claudeEffortLocal = effort; // remember the choice for getParams reads
+              try { await ipcRenderer.invoke('claude:send-command', tabId, '/effort ' + effort); } catch {}
+            }
+            // thinking toggle is intentionally not wired here — matches desktop
+            // separation of Think (toggleThink) vs Effort (slash command).
+            return reply(true, { tabId, model, effort });
+          }
+          // SDK path
           const partial: any = {};
           if (model !== undefined) partial.sdkModel = model;
           if (effort !== undefined) partial.sdkEffort = effort;
@@ -1230,6 +1293,181 @@ function App() {
           }
           return reply(false, null, 'tab not open');
         }
+        if (action === 'createClaudeTab') {
+          // Create new PTY terminal tab with pendingAction='claude-new' — the
+          // Terminal.tsx component handles spawning the Claude CLI itself on
+          // first mount (same as desktop "+ New tab → claude" flow). We don't
+          // call claude:spawn-with-watcher here because that would race with
+          // Terminal.tsx and start Claude twice in the same PTY.
+          const { projectId } = payload || {};
+          if (!projectId) return reply(false, null, 'projectId required');
+          const ws = state.openProjects.get(projectId);
+          if (!ws) return reply(false, null, 'project not open');
+          const cwd = ws.projectPath && !ws.projectPath.startsWith('__unset__') ? ws.projectPath : undefined;
+          const tabId = await state.createTab(projectId, undefined, cwd, {
+            commandType: 'claude',
+            pendingAction: { type: 'claude-new' },
+          });
+          const tab = ws.tabs.get(tabId);
+          return reply(true, { tabId, name: tab?.name, cwd: tab?.cwd, projectId });
+        }
+        if (action === 'resumeClaudeTab') {
+          // For Inactive CLAUDE-tabs: spawn `claude --resume <sessionId>` in the
+          // existing PTY (or recreate the PTY if it was killed).
+          const { tabId } = payload || {};
+          if (!tabId) return reply(false, null, 'tabId required');
+          let tab: any = null;
+          for (const ws of state.openProjects.values()) {
+            const t = ws.tabs.get(tabId);
+            if (t) { tab = t; break; }
+          }
+          if (!tab) return reply(false, null, 'tab not open');
+          if (!tab.claudeSessionId) return reply(false, null, 'no session to resume');
+          console.log('[MobResume:Bridge] resumeClaudeTab begin tab=' + String(tabId).slice(-12) + ' sid=' + String(tab.claudeSessionId).slice(0, 8));
+          // Authoritative liveness check: bridgeKnownSessions tracks "Claude
+          // CLI is actually in this PTY". If Claude is alive, sending Ctrl+U
+          // would erase whatever the desktop user is typing AND drop them out
+          // of Claude's input — destructive. Refuse instead.
+          try {
+            const presence = await ipcRenderer.invoke('claude:get-presence', tabId);
+            console.log('[MobResume:Bridge] presence tab=' + String(tabId).slice(-12) + ' status=' + (presence?.status || 'unknown'));
+            if (presence?.status === 'active' || presence?.status === 'busy') {
+              state.clearInterruptedState(tabId); // overlay was wrong anyway
+              return reply(true, { tabId, sessionId: tab.claudeSessionId, alreadyRunning: true });
+            }
+          } catch (e) { console.log('[MobResume:Bridge] presence-err tab=' + String(tabId).slice(-12) + ' ' + (e as any)?.message); }
+          // Mark pending-resume guard so stale ~/.claude/bridge/*.json from old
+          // dead processes can't stamp the wrong sessionId during the next 15s.
+          // See docs/knowledge/fix-bridge-stale-takeover.md.
+          markPendingResume(tabId, tab.claudeSessionId);
+          // Clear the "interrupted session" overlay on desktop — mobile is
+          // re-launching Claude, so the overlay's purpose (offer to continue)
+          // is fulfilled. Without this the desktop user sees a stale "Сессия
+          // была прервана" modal even though Claude is already running.
+          state.clearInterruptedState(tabId);
+          // Clear current line then send the resume command. Same exact shape
+          // as Terminal.tsx Case 2 (claude-c interception) which is the
+          // canonical resume path on desktop — using --dangerously-skip-permissions
+          // matches existing PTY-shell expectations and keeps Stop-hook behavior.
+          const cmd = '\x15claude --dangerously-skip-permissions --resume ' + tab.claudeSessionId + '\r';
+          ipcRenderer.send('terminal:input', tabId, cmd);
+          ipcRenderer.send('terminal:force-command-started', tabId);
+          console.log('[MobResume:Bridge] resumeClaudeTab cmd-sent tab=' + String(tabId).slice(-12));
+          return reply(true, { tabId, sessionId: tab.claudeSessionId });
+        }
+        if (action === 'stopClaudeTab') {
+          // SIGTERM by PID, not keystrokes. The previous Ctrl+C×2 with
+          // setTimeout(250ms) was deterministically broken — Ink TUI redraws
+          // the prompt between Ctrl+C's, so the second one is read as a NEW
+          // first one ("Press Ctrl-C again to exit" fires twice, Claude never
+          // exits). See fix-claude-busy-detection.md::4 (rejected approaches)
+          // and fact-claude-tui-control.md::Stop button. Same path the
+          // desktop Stop button uses — finds claude child-PID under the
+          // shell's PID, SIGTERM → 800ms → SIGKILL. Shell survives, so
+          // Resume re-launches `claude --resume <id>` in the same PTY tab.
+          const { tabId } = payload || {};
+          if (!tabId) return reply(false, null, 'tabId required');
+          console.log('[MobStop:Bridge] stopClaudeTab SIGTERM begin tab=' + String(tabId).slice(-12));
+          try {
+            const r = await ipcRenderer.invoke('terminal:stop-ai-process', tabId);
+            console.log('[MobStop:Bridge] stopClaudeTab done tab=' + String(tabId).slice(-12) + ' result=' + JSON.stringify(r));
+            return reply(!!r?.success, { tabId, stopped: !!r?.success, ...r });
+          } catch (e: any) {
+            console.log('[MobStop:Bridge] stopClaudeTab err tab=' + String(tabId).slice(-12) + ' ' + (e?.message || e));
+            return reply(false, null, String(e?.message || e));
+          }
+        }
+        if (action === 'sendMessageAuto') {
+          // Single dispatch entry for /api/sdk-tabs/:id/send — backend used
+          // to do TWO bridge round-trips (status check + actual send). Now
+          // the routing happens here, in the same call that does the work.
+          const { tabId, prompt, model, effort, thinking, cwd } = payload || {};
+          if (!tabId || !prompt) return reply(false, null, 'tabId+prompt required');
+          let tab: any = null;
+          for (const ws of state.openProjects.values()) {
+            const t = ws.tabs.get(tabId);
+            if (t) { tab = t; break; }
+          }
+          const isClaudePty = tab && tab.commandType === 'claude' && tab.tabType !== 'claude-sdk';
+          if (isClaudePty) {
+            state.clearInterruptedState(tabId); // drop desktop "interrupted" overlay
+            const result = await ipcRenderer.invoke('terminal:paste', {
+              tabId, content: prompt, submit: true, fast: false,
+            });
+            return reply(!!result?.success ?? true, result || { tabId });
+          }
+          // SDK path (default)
+          const sendCwd = cwd || tab?.cwd;
+          const sendModel = model ?? tab?.sdkModel;
+          const sendEffort = effort ?? tab?.sdkEffort ?? 'high';
+          const sendThinking = thinking ?? (tab?.sdkThinking === false ? 'disabled' : 'adaptive');
+          window.dispatchEvent(new CustomEvent('claude-sdk:external-prompt', {
+            detail: { tabId, text: prompt, source: 'web' },
+          }));
+          const result = await ipcRenderer.invoke('claude-sdk:send-message', {
+            tabId, cwd: sendCwd, prompt, model: sendModel, effort: sendEffort, thinking: sendThinking,
+            resumeSessionId: tab?.claudeSessionId || null,
+          });
+          return reply(!!result?.success, result, result?.error);
+        }
+        if (action === 'sendClaudeMessage') {
+          // PTY-paste via safePasteAndSubmit. CRITICAL: fast=false for Claude
+          // TUI — Ink renderer needs single bracket-pair + waitForRender
+          // between paste and Enter, otherwise Ink emits multiple [Pasted
+          // text #N] chips and sync markers race. fact-claude-tui-mechanics
+          // sections 2 & 4 + fix-claude-paste-race.md. The per-term mutex
+          // inside safePasteAndSubmit (WeakMap pasteInflight) serialises
+          // concurrent callers — if user is also clicking buttons in the
+          // desktop UI, both queue up properly.
+          const { tabId, prompt } = payload || {};
+          if (!tabId || !prompt) return reply(false, null, 'tabId+prompt required');
+          // Drop interrupted-session overlay on desktop: a send from mobile
+          // implies the user is actively using the session, even if the
+          // desktop window has the modal up.
+          state.clearInterruptedState(tabId);
+          const result = await ipcRenderer.invoke('terminal:paste', {
+            tabId, content: prompt, submit: true, fast: false,
+          });
+          return reply(!!result?.success ?? true, result || { tabId });
+        }
+        if (action === 'getClaudeTabStatusBatch') {
+          const { tabIds } = payload || {};
+          if (!Array.isArray(tabIds)) return reply(false, null, 'tabIds required');
+          const statuses: Record<string, 'active' | 'busy' | 'inactive'> = {};
+          for (const tid of tabIds) {
+            try {
+              const p = await ipcRenderer.invoke('claude:get-presence', tid);
+              statuses[tid] = p?.status || 'inactive';
+            } catch {
+              statuses[tid] = 'inactive';
+            }
+          }
+          return reply(true, { statuses });
+        }
+        if (action === 'getClaudeTabStatus') {
+          const { tabId } = payload || {};
+          if (!tabId) return reply(false, null, 'tabId required');
+          let tab: any = null;
+          for (const ws of state.openProjects.values()) {
+            const t = ws.tabs.get(tabId);
+            if (t) { tab = t; break; }
+          }
+          if (!tab) return reply(true, { tabId, status: 'inactive', commandType: null, sessionId: null });
+          let status: 'active' | 'busy' | 'inactive' = 'inactive';
+          if (tab.commandType === 'claude') {
+            try {
+              const p = await ipcRenderer.invoke('claude:get-presence', tabId);
+              status = p?.status || 'inactive';
+            } catch { status = 'inactive'; }
+          }
+          return reply(true, {
+            tabId,
+            status,
+            commandType: tab.commandType || null,
+            sessionId: tab.claudeSessionId || null,
+            cwd: tab.cwd,
+          });
+        }
         if (action === 'loadSDKHistory') {
           const { tabId } = payload || {};
           if (!tabId) return reply(false, null, 'tabId required');
@@ -1264,6 +1502,7 @@ function App() {
     ipcRenderer.on('terminal:exit', handleTerminalExit);
     ipcRenderer.on('mcp:claude-cli-active', handleClaudeCliActive);
     ipcRenderer.on('claude:busy-state', handleClaudeBusyState);
+    ipcRenderer.on('claude-sdk:process-state', handleSdkProcessState);
     ipcRenderer.on('mcp:interceptor-state', handleInterceptorState);
     ipcRenderer.on('mcp:close-sub-agent-tab', handleMcpCloseSubAgent);
     ipcRenderer.on('mcp:respawn-sub-agent-pty', handleRespawnSubAgentPty);
@@ -1321,6 +1560,7 @@ function App() {
       ipcRenderer.removeListener('terminal:exit', handleTerminalExit);
       ipcRenderer.removeListener('mcp:claude-cli-active', handleClaudeCliActive);
       ipcRenderer.removeListener('claude:busy-state', handleClaudeBusyState);
+      ipcRenderer.removeListener('claude-sdk:process-state', handleSdkProcessState);
       ipcRenderer.removeListener('mcp:interceptor-state', handleInterceptorState);
       ipcRenderer.removeListener('mcp:close-sub-agent-tab', handleMcpCloseSubAgent);
       ipcRenderer.removeListener('mcp:respawn-sub-agent-pty', handleRespawnSubAgentPty);

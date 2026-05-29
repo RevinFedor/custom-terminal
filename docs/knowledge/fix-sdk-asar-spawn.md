@@ -7,7 +7,7 @@
 [ERROR] [SlashProbe] probe-commands fatal: spawn ENOTDIR
 [ClaudeSDK] failed to read model capabilities: spawn ENOTDIR
 ```
-В dev (`npm run dev`) — всё работало. После провала в UI оставалось «висячее» юзер-сообщение без hover-кнопок Repeat/Edit, и единственным способом переотправить промпт было перепечатать его руками — see `fact-claude-sdk-tab.md::Repeat/Edit на непрошедших user-bubble'ах`.
+В dev (`npm run dev`) — всё работало. После провала в UI оставалось «висячее» юзер-сообщение без hover-кнопок Repeat/Edit, и единственным способом переотправить промпт было перепечатать его руками — see `fact-claude-sdk-tab.md::Repeat/Edit`.
 
 ## Причина
 
@@ -48,4 +48,4 @@ Resolver (`src/main/main.js::resolveClaudeBinaryPath`) пробует три к�
 
 ## См. также
 - `fix-packaged-app-logs.md` — другая asar-ловушка (запись через `fs.createWriteStream` в asar читается без ошибки, но молча игнорится).
-- `fact-claude-sdk-tab.md::Repeat/Edit на непрошедших user-bubble'ах` — UI-recovery для случая, когда `send-message` отвалился по этой ошибке.
+- `fact-claude-sdk-tab.md::Repeat/Edit` — UI-recovery для случая, когда `send-message` отвалился по этой ошибке.

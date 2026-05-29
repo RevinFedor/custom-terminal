@@ -36,7 +36,7 @@ Chip-trigger в status bar открывает popup с 6 кнопками тре
 
 **Геометрия popup'а.**
 - Раскрывается **вверх** (status bar внизу, popup растёт от него к экрану): `bottom: window.innerHeight - chipRect.top`.
-- **Right-anchor**: `right: window.innerWidth - chipRect.right`. Не left-anchor — иначе popup уходит вправо за Timeline-strip и обрезается. См. [`methodology/сценарии-багов.md::1.1 Popup уезжает за правый/нижний край`](../methodology/сценарии-багов.md).
+- **Right-anchor**: `right: window.innerWidth - chipRect.right`. Не left-anchor — иначе popup уходит вправо за Timeline-strip и обрезается. См. [`methodology/сценарии-багов-design.md::1.1 Popup уезжает за правый/нижний край`](../methodology/сценарии-багов-design.md).
 - CSS-bridge через `paddingBottom: 4` ВНУТРИ popup-wrapper'а — gap от popup до chip покрыт hit-area'ой popup'а, курсор может ехать через эти 4px не теряя hover. Wrapper вплотную к chip'у (`bottom: window.innerHeight - chipRect.top`, **без** offset'а).
 
 **Применение к runtime сессии — пока НЕ реализовано.** Селектор только сохраняет выбор. Hookup «при создании нового Claude-таба автоматически отправить `/effort <level>` после handshake'а» отложен — добавится отдельно, когда понадобится. Сейчас юзер просто фиксирует предпочтение, чтобы оно не терялось между перезапусками.

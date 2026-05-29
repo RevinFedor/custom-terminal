@@ -244,7 +244,7 @@ setRenderEnd(newEnd);
 
 **Когда CV уместен:** не-виртуальный длинный список, где DOM полный (CommonMark articles, Wikipedia-style страницы, log viewer без virtualization). Там CV — реальная экономия paint.
 
-См. `knowledge/fix-mobile-scroll-jitter-virtuoso.md`.
+См. `knowledge/fix-mobile-scroll-jitter-virtuoso.md` (CV+ResizeObserver конфликт) и `knowledge/fix-virtuoso-to-virtua-migration.md` (общий вывод: для chat-virtualization с дико разнородными высотами на iOS WebKit сам react-virtuoso архитектурно не подходит — `upwardScrollFixSystem` копит deviation и применяет cascade'ом после finger-up; ушли на virtua).
 
 ## Initial scroll = once-per-context, не per-focus
 

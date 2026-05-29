@@ -112,7 +112,9 @@ ipcRenderer.on('claude:process-started', (_, { tabId, sessionId, claudePid }) =>
 });
 ```
 
-Использовать для всего что должно случиться **один раз на спавн**: `/effort max` инжекция, welcome-toast, регистрация в аналитике. **Не использовать** для отслеживания sessionId (для этого session-detected).
+Использовать для всего что должно случиться **один раз на спавн** и которому нужен PID/sessionId: welcome-toast, регистрация в аналитике. **Не использовать** для отслеживания sessionId (для этого session-detected).
+
+**`/effort` инжект больше НЕ висит на этом сигнале как на главном.** `claude:process-started` (= `Bridge:Fresh`) лагает 3-6с после старта Claude — bridge.json должен появиться, пережить DeadTranscript-guard (у свежей сессии JSONL ещё не на диске), затем PID зарезолвиться. За это время prompt в TUI уже нарисован; юзер видел готовую строку без effort'а и кликал руками → дубль. Главный сигнал для `/effort` теперь `claude:tui-ready` (Claude нарисовал `⏵` в PTY, ~0.8с), `process-started` оставлен **fallback'ом** под once-per-process sentinel. Полная механика — `fact-claude-tui-control.md::Auto-inject /effort`, принцип выбора сигнала — `methodology/переносимый-дизайн.md::Liveness ≠ readiness`.
 
 ## Prompt Queue — grab-input flow
 

@@ -52,6 +52,8 @@ const ids = useStore(useShallow(s => s.items.filter(i => i.active).map(i => i.id
 ```
 Худший вариант — подписаться на Map/Set целиком и потом фильтровать. Не делай так: обновление через `set({ map: new Map(get().map) })` создаёт новую ссылку — подписчики на весь Map ре-рендерятся при любом изменении любого ключа. Подписывайся только на нужные значения (`s => s.map.get(id)`) или на fingerprint состава ключей. См. anti-pattern «Zustand: Не подписывайся на Map целиком» в `CLAUDE.md` — это тот же паттерн под другим углом.
 
+**Recurrence 2026-05-28: Run-after picker.** Селектор `useWorkspaceStore((state) => { /* walk projects, build tabs array */ return { projectId, activeTabId, tabs }; })` возвращал свежий объект на каждый рендер. `set({ openProjects: new Map(...) })` срабатывает на любое busy-событие в любом табе любого проекта → новая ссылка → re-render picker'а → селектор снова создаёт свежий `{projectId, activeTabId, tabs}` → loop → `Maximum update depth exceeded`. Фикс — fingerprint string из id+name AI-табов (только нашего проекта) + `useMemo([fingerprint, tabId])` для деривации shape через `useWorkspaceStore.getState()` внутри useMemo. См. `knowledge/fact-prompt-queue.md::Fingerprint Pattern в селекторе`. Урок: при подписке на nested Map (`openProjects.<projectId>.tabs`) **всегда** возвращай примитив, никогда — объект-результат итерации.
+
 ---
 
 ## 3. Проблема: O(n²) Startup Cascade
@@ -202,7 +204,7 @@ parts.push(`${tab.id}:${tab.tabType || 'terminal'}`);
 
 Причина — React сравнивает детей по позиции, если у них нет стабильных ключей. Условный child при включении/выключении сдвигает индексы соседей. React видит «на месте [N] теперь другой component type» и **уничтожает поддерево** (unmount + remount), не пытаясь сохранить state. Для тяжёлых компонентов (xterm, WebGL canvas, video) это означает потерянное состояние и заново инициализированный canvas.
 
-Решение — stable indexing: условные children рендерятся **последними** среди соседей, их появление/исчезновение не сдвигает индексы остальных. Альтернатива — absolute positioning (`absolute inset-0` + z-index) для overlay'я: он физически в конце списка детей, но визуально перекрывает их (см. Layering Pattern в `methodology/сценарии-багов.md`). Стабильные `key` пропы для всех children тоже работают, но требуют дисциплины на каждом уровне иерархии.
+Решение — stable indexing: условные children рендерятся **последними** среди соседей, их появление/исчезновение не сдвигает индексы остальных. Альтернатива — absolute positioning (`absolute inset-0` + z-index) для overlay'я: он физически в конце списка детей, но визуально перекрывает их (см. Layering Pattern в `methodology/сценарии-багов-design.md`). Стабильные `key` пропы для всех children тоже работают, но требуют дисциплины на каждом уровне иерархии.
 
 ---
 
