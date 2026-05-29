@@ -11,7 +11,7 @@
 Часть REST-эндпоинтов требует **живого renderer state** (Zustand store с открытыми проектами и табами). Main не имеет доступа к store напрямую. Решение — request/reply IPC bridge:
 
 1. Main: `bridgeRequest(action, payload, timeoutMs=5000)` спавнит `requestId`, шлёт `web:bridge-request` в renderer, ждёт ответа на `web:bridge-reply` с тем же id.
-2. Renderer: один listener в `App.tsx` диспатчит по action — `getOpenProjectIds`, `createSDKTab`, `sendSDKMessage`, `loadSDKHistory`, `forkToSDK`, `closeTab`, `renameTab`, `getSDKParams`, `setSDKParams`, `getTabSessionInfo`.
+2. Renderer: один listener в `App.tsx` диспатчит по action — `getOpenProjectIds`, `createSDKTab`, `sendSDKMessage`, `loadSDKHistory`, `forkToSDK`, `closeTab`, `renameTab`, `getSDKParams`, `setSDKParams`, `getTabSessionInfo`. Расширение для PTY+Claude: `createClaudeTab`, `resumeClaudeTab`, `stopClaudeTab`, `sendMessageAuto` (единая точка `/send` — сам роутит SDK vs PTY), `getClaudeTabStatus`, `getClaudeTabStatusBatch`, `getProjectTabsLive` (отдаёт `sessionStatus`). Детали — `fact-mobile-claude-pty.md`.
 3. На таймауте promise rejected — endpoint возвращает 409.
 
 **Критично:** bridge нужен ТОЛЬКО для actions, требующих store. Чисто-серверные operations (timeline parse через `parseTimelineEntries`, projects list из SQLite через `projectManager.db.getAllProjects()`) идут напрямую без bridge — это и быстрее, и работает даже если renderer mounted с задержкой.
@@ -87,8 +87,14 @@ GET  /api/sdk-tabs/:tabId/params               → getSDKParams
 POST /api/sdk-tabs/:tabId/params               → setSDKParams
 GET  /api/prompts[?etag=X]                     → getPrompts + getPromptGroups (no bridge); ?etag match → { etag, unchanged: true }
 POST /api/log/client                           → mobile diagnostic logs → console.log → dev.log
-WS   /ws?token=&tabId=                         → snapshot, message, busy, done events
+GET  /api/events?token=&tabId=                 → SSE (text/event-stream) — ОСНОВНОЙ live-канал. snapshot/message/busy/done/bridge-update. Не блокируется anti-tracker'ами как ws://. См. секцию «SSE transport».
+WS   /ws?token=&tabId=                          → тот же набор events. Legacy-канал для permissive-браузеров; на Yandex/Chrome с Protect не работает (ws:// к private-IP режется молча).
+POST /api/projects/:id/claude-tabs              → создать PTY+Claude таб (Terminal.tsx сам spawn'ит Claude по pendingAction)
+POST /api/sdk-tabs/:tabId/resume                → claude --resume <sid> в existing PTY
+GET  /api/sdk-tabs/:tabId/status                → status строка (inactive/starting/active/busy) + sessionId + commandType
 ```
+
+Для CLAUDE-табов (commandType='claude' && tabType!='claude-sdk') расширение mobile-web — см. `fact-mobile-claude-pty.md`. `/send` и `/stop` теперь sumарно роутятся: backend сам выбирает SDK путь или PTY+paste путь по `tab.commandType`.
 
 Все pathname-параметры (`:id`, `:tabId`) ОБЯЗАТЕЛЬНО прогоняются через `decId()` (`decodeURIComponent`) перед использованием — см. секцию «URL-encoded path параметры» ниже.
 
@@ -136,15 +142,18 @@ Bridge-action `getProjectTabsLive` в `App.tsx::handleWebBridge` возвращ�
 
 **Правило:** любая правка `App.tsx::handleWebBridge` или `web-server.js::bridgeRequest` требует `npm run build:install` перед тестом с phone'а — иначе симптом всегда будет «Bridge timeout» вне зависимости от качества правки. Это занудно, но иначе час уйдёт на отладку не того процесса. Mobile-web Vite dev (`cd mobile-web && npm run dev`) НЕ решает — фронт можно итерировать без билда, но `web-server.js` живёт в Electron main, его правки требуют `build:install` всё равно.
 
-## WS protocol
+## Wire protocol (общий для SSE и WS)
 
-Server → client:
+Один и тот же JSON-envelope летит и через SSE (`data: <json>\n\n`), и через WS (`ws.send(<json>)`) — `webBroadcast` транспортно-агностичен (см. «SSE transport»). Server → client:
 ```
-{ type:'snapshot',  tabId, sessionId, busy }       — на upgrade
-{ type:'message',   tabId, message, sessionId }    — каждое SDK-сообщение
-{ type:'busy',      tabId, busy }                  — переключение busy
-{ type:'done',      tabId, sessionId }             — окончание turn'а
+{ type:'snapshot',     tabId, sessionId, busy, sessionStatus?, inputReady? }   — на connect и при lifecycle-сменах
+{ type:'message',      tabId, message, sessionId }                              — каждое SDK или JSONL-сообщение
+{ type:'busy',         tabId, busy }                                            — переключение busy (SDK + PTY-Claude)
+{ type:'done',         tabId, sessionId }                                       — окончание turn'а
+{ type:'bridge-update', tabId, sessionId, model, contextPct }                   — PTY-Claude: StatusLine bridge.json обновился
 ```
+
+`sessionStatus` / `inputReady` / `bridge-update` появились с расширением mobile-web на CLAUDE-PTY-табы — см. `fact-mobile-claude-pty.md::WS protocol`.
 
 Client → server: `{ type: 'subscribe', tabId }` для смены подписки на лету (текущая mobile-сборка не использует — переподключается).
 
@@ -181,7 +190,7 @@ const webServer = require(path.join(srcMainDir, 'web-server'));
 
 ## Routing (HashRouter)
 
-URL-схема: `#/projects/:projectId/chat/:tabId[?ro=1]`. HashRouter а не BrowserRouter — node-static в `web-server.js` не имеет SPA-fallback'а на произвольные pathnames; hash на сервер не уходит, фрагмент читается клиентом. Reload на любой странице → попадаешь обратно туда же. Deep-link (нет `state.tab` в `history.state`) → `Api.listTabs(projectId)` ищет TabInfo по `tabId`, либо показывает «Tab not found» с кнопкой назад. См. `methodology/мобильный-дизайн.md::Deep-link routing`.
+URL-схема: `#/projects/:projectId/chat/:tabId[?ro=1]`. HashRouter а не BrowserRouter — node-static в `web-server.js` не имеет SPA-fallback'а на произвольные pathnames; hash на сервер не уходит, фрагмент читается клиентом. Reload на любой странице → попадаешь обратно туда же. Deep-link (нет `state.tab` в `history.state`) → `Api.listTabs(projectId)` ищет TabInfo по `tabId`, либо показывает «Tab not found» с кнопкой назад. См. `methodology/переносимый-дизайн-mobile.md::Deep-link routing`.
 
 ## History pipeline (NDJSON streaming + IDB delta sync + virtuoso)
 
@@ -233,19 +242,41 @@ Warm-cache путь: только одна фаза `?after=<cachedLastUuid>` �
 - WS handler: `if (prefixMergeLockRef.current) wsDeferredQueueRef.push(msg); return`
 - После apply(merged): drain wsDeferredQueue → reducer.apply каждый → flush → release lock
 
-**WS auto-reconnect с backoff:** Safari закрывает WS в фоновых табах через ~30 сек. `connect()` цикл с backoff 1s → 2s → 5s → 10s → 30s (cap), reset на onopen. Без этого юзер возвращается в чат через час и видит молчаливо мёртвый WS.
+## SSE transport (заменил WebSocket в live-канале)
+
+**Корень почему не WS:** Yandex Browser (его встроенный Protect) и Chrome anti-tracker расширения **молча блокируют `ws://` к private-IP** (`192.168.x`, `127.0.0.1`). Детерминированно (горело 2026-05-28): из браузера `fetch('/api/me')` → 200, а `new WebSocket('ws://192.168.0.103:7979/ws')` → `readyState` навсегда `0` (CONNECTING), ни `open`, ни `error`, ни `close`, и на сервер **не приходит ни одного upgrade-запроса**. При этом `curl` с тем же URL даёт `101 Switching Protocols` — сервер исправен, режет именно браузер. WS-события `error readyState=3 + close 1006` мгновенно если расширение рвёт после конструктора. Симптом для юзера: «WebSocket подключается…», Resume жмётся но «ничего не происходит» (бэкенд работает, broadcast'ы падают в `[WebBcast:DROP] noSubscribers`).
+
+**Решение — Server-Sent Events** (`GET /api/events?token=&tabId=`, `EventSource` на клиенте). SSE едет поверх обычного HTTP GET (`text/event-stream`), который anti-tracker'ы не трогают. Проверено в реальном Яндексе: `EventSource` → `OPEN@5ms` + snapshot, там где ws:// висел вечно.
+
+Серверная механика — **транспортно-агностичный Sink** в `web-server.js`:
+- `subscribers: Map<tabId, Set<Sink>>`, `Sink = { kind:'ws'|'sse', send(str), isAlive(), close() }`.
+- `wsSink(ws)` оборачивает WebSocket; SSE-route создаёт inline-sink (`send` пишет `data: <json>\n\n`, `isAlive` = `!res.writableEnded`).
+- `webBroadcast(tabId, payload)` фанит на оба транспорта одинаково — main.js не знает какой транспорт у клиента. **WS-эндпоинт оставлен** для permissive-браузеров (десктоп, Safari) — оба регистрируются в один реестр.
+- SSE-route: `Content-Type: text/event-stream`, `X-Accel-Buffering: no` (отрубить прокси-буфер), `retry: 2000` (EventSource auto-reconnect), heartbeat-комментарий `: hb\n\n` каждые 25s (держит сокет тёплым за радиомодемами), `req.on('close')` → `unsubscribeAll(sink) + releaseClaudeWatchersIfOrphan()`.
+- **gzip не трогает SSE** — `sendJson` (где gzip) не вызывается, route пишет `res.write` напрямую. Глобального gzip-middleware в `createServer` нет.
+
+Клиент: `EventSource` имеет **встроенный** auto-reconnect — рукодельный backoff/watchdog/visibilitychange (которые были у WS) удалены, браузер сам реконнектит. `esRef`, `eventsUrl()` в `api.ts`. Парсинг сообщений тот же (общий JSON-envelope).
+
+**`webBroadcast` логирование — lifecycle-only:** `type:'message'` фанится десятками раз за turn → без подписчика залил бы `dev.log` сотнями `[WebBcast:DROP] type=message`. `BCAST_LOG_TYPES = {snapshot,busy,done,bridge-update}` — логируется только это + `dead`-pruning. `message` молчит. См. CLAUDE.md::Логирование (no spam in hot paths).
+
+**Loader'ы Resume/Stop — строго по SSE-событию, без таймаутов:**
+- Resume: `setResuming(true)` на клик, HTTP-ответ (~15ms) loader НЕ гасит. Гаснет `useEffect` когда `claudeStatus → active|busy` (SSE snapshot от `Bridge:Fresh`/`ClaudePromptReady`, ~1.1s). Edge: bridge вернул `alreadyRunning:true` (Claude уже жив, stale mobile-статус) → нового snapshot не будет → гасим loader сразу в `onResume` + `setClaudeStatus('active')`, иначе вечный спиннер.
+- Stop: `setStopping(true)` на клик, гаснет когда `claudeStatus → inactive` (SSE snapshot от `clearBridgeTab` после реальной смерти процесса, ~500ms). Edge: `stop` вернул `{stopped:false}` (процесса уже не было) → нет PTY-exit → гасим loader сразу + `setClaudeStatus('inactive')`.
+- `InlineSpinner` — `transform:rotate` (не opacity), UPPERCASE лейбл «RESUMING…»/«STOPPING» — детектируется на видеозаписи (CLAUDE.md::AI-Optimized UI).
+
+**Регрессия-canary:** `[WebSSE:Open/Close]`, `[WebSub:Subscribe/Unsubscribe]`, `[WebBcast:SEND/DROP]` (lifecycle-типы), `[MobResume]/[MobStop] click/reply-ok/loader-cleared`, `[MobWS] snapshot/busy/done` (имя `MobWS` историческое, канал теперь SSE). Если loader виснет — grep `loader-cleared` отсутствует → SSE-событие смены статуса не пришло (проверь `[WebBcast:SEND] to=N/N` на сервере и `EventSource` readyState на клиенте).
 
 **Stream idle watchdog:** 30s без bytes → abort + onError. Без этого Electron-crash mid-stream → phone forever pending без сигнала.
 
 **Synthetic broadcast skip on mobile:** main.js шлёт `__webSynthetic: true` user message через WS чтобы desktop рендер показал bubble на mobile-prompt'ах. Phone reducer **игнорирует** synthetic — иначе phone получит дубль (synthetic + real-record). Mobile получает мгновенный feedback через **локальный optimistic push** в `send()`, real-record adopt'ит свой uuid в существующую entry (dedupe by text).
 
-См. `methodology/мобильный-дизайн.md::Tail-first loading`, `knowledge/fix-mobile-history-bottleneck.md` (история отладки до streaming), `knowledge/fix-mobile-scroll-jitter-virtuoso.md` (CV+virtuoso антипаттерн).
+См. `methodology/переносимый-дизайн-mobile.md::Tail-first loading`, `knowledge/fix-mobile-history-bottleneck.md` (история отладки до streaming), `knowledge/fix-mobile-scroll-jitter-virtuoso.md` (CV+virtuoso антипаттерн), `knowledge/fix-mobile-scroll-teleport.md` (resize-shrink → false-positive atBottom → followOutput pin).
 
 ## Expanded state map (across virtuoso re-mount)
 
 `_entryExpanded: Map<entryId, boolean>` в module scope `mobile-web/src/App.tsx`. Hook `useEntryExpanded(id, defaultOpen)` подписывается на per-id version counter. Используется в ThinkingCard и ToolCard. Cleanup в `clearEntryExpandedForIds` срабатывает на ChatView unmount — иначе Map течёт по entry.id'ам всех когда-либо открытых чатов.
 
-См. `methodology/мобильный-дизайн.md::Persistent expanded state across virtual list re-mount`.
+См. `methodology/переносимый-дизайн-mobile.md::Persistent expanded state across virtual list re-mount`.
 
 ## Dev-port isolation (parallel production)
 
@@ -267,7 +298,7 @@ Token общий — `~/.noted-terminal/web-token.txt` читается обои
 
 Server: `[WebTiming]` теги — каждый `/timeline`, `/history` пишет `bridge=Xms find=Yms parse=Zms total=Wms`, `[WebGzip] origB → gzipB (N%) in Tms` для крупных payloads (>64KB).
 
-Client: `[History] streamFetch / streamMeta / streamDone / prefixMerged / idbWrote / cacheHit` через `Api.log()` → `POST /api/log/client` → `console.log` → `dev.log`. Каждый шаг с `*Ms` для blame'а. `[TimelineGoTo] click / done / NOT FOUND` для timeline-навигации. `[WS] open / close` с code/reason/backoffMs для reconnect диагностики. `[ScrollDiag] flushReducer / followOutput / atBottomStateChange / isScrolling / scroll {delta:N}` — для отладки scroll-jitter (см. `fix-mobile-scroll-jitter-virtuoso.md`).
+Client: `[History] streamFetch / streamMeta / streamDone / prefixMerged / idbWrote / cacheHit` через `Api.log()` → `POST /api/log/client` → `console.log` → `dev.log`. Каждый шаг с `*Ms` для blame'а. `[TimelineGoTo] click / done / NOT FOUND` для timeline-навигации. `[WS] open / close` с code/reason/backoffMs для reconnect диагностики. `[ScrollDiag] flushReducer / followOutput / atBottomStateChange / isScrolling / scroll {delta:N}` — для отладки scroll-jitter (см. `fix-mobile-scroll-jitter-virtuoso.md` для CV-кейса, `fix-mobile-scroll-teleport.md` для shrink+false-atBottom-кейса). `atBottomStateChange` несёт `{isScrolling}` тегом — gate в коде дропает true пока юзер тащит палец.
 
 **Архивные теги (устарели):** `tailFetch / tailFetched / fullFetch / fullFetched / fullApplied` использовались в JSON two-phase архитектуре, удалены вместе с ней.
 

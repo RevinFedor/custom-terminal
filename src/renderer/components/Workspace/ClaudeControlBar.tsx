@@ -6,7 +6,7 @@ import {
   CLAUDE_EFFORT_LEVELS,
   DEEPSEEK_EFFORT_LEVELS,
 } from '../../constants/claudeLevels';
-import { PROVIDER_CATALOG, getSupportedEffortsForAlias } from './providerCatalog';
+import { PROVIDER_CATALOG } from './providerCatalog';
 import SessionActionChip from './SessionActionChip';
 import MicButton from './MicButton';
 import { useCmdKey } from '../../hooks/useCmdHoverPopover';
@@ -99,6 +99,15 @@ export default function ClaudeControlBar({
     }
     return true;
   });
+  // Process-alive flag (granular primitive selector — Fingerprint pattern, no
+  // Map subscription). Drives the process indicator's 3 states together with sdkBusy.
+  const sdkProcessAlive = useWorkspaceStore((s) => {
+    for (const [, ws] of s.openProjects) {
+      const t = ws.tabs.get(tabId);
+      if (t) return !!t.sdkProcessAlive;
+    }
+    return false;
+  });
   const isSDKTab = tabType === 'claude-sdk';
 
   // Live bridge data (PTY only): model name + context %.
@@ -168,21 +177,10 @@ export default function ClaudeControlBar({
     };
   }, [tabId, isSDKTab]);
 
-  // SDK model caps — gates effort pills per-model. Fetch once per mount when
-  // the tab is an SDK tab; main process caches the result for the Electron
-  // lifetime so it's a fast no-op on repeat calls.
-  //
-  // IMPORTANT: `sdkModelCaps` MUST NOT be a dep here. If main returns
-  // `{success:true, caps:{}}`, setSdkModelCaps({}) bumps the ref → effect
-  // re-fires → another invoke → new {} → infinite loop. Confirmed via
-  // [CB:R] render counter.
-  const [sdkModelCaps, setSdkModelCaps] = useState<Record<string, string[]>>({});
-  useEffect(() => {
-    if (!isSDKTab) return;
-    ipcRenderer.invoke('claude-sdk:get-model-caps').then((r: any) => {
-      if (r?.success && r.caps && Object.keys(r.caps).length > 0) setSdkModelCaps(r.caps);
-    }).catch(() => {});
-  }, [isSDKTab]);
+  // (SDK model-caps fetch removed: we no longer gate effort pills per model —
+  // the CLI itself offers every effort level for every model, so there's no UI
+  // gate to feed. The `claude-sdk:get-model-caps` IPC + supportedModels() probe
+  // still exist in main for any future use, just unused here.)
 
   // Paste/control busy mirror — disables all writes while another caller mid-paste.
   const [isPasteBusy, setIsPasteBusy] = useState(false);
@@ -204,10 +202,29 @@ export default function ClaudeControlBar({
   useEffect(() => {
     if (!isSDKTab) return;
     const handler = (_: any, data: { tabId: string; busy: boolean }) => {
-      if (data.tabId === tabId) setSdkBusy(data.busy);
+      if (data.tabId === tabId) {
+        setSdkBusy(data.busy);
+        if (data.busy) setSdkStopping(false); // new turn started → clear the stopping cue
+      }
     };
     ipcRenderer.on('claude:busy-state', handler);
     return () => { ipcRenderer.removeListener('claude:busy-state', handler); };
+  }, [tabId, isSDKTab]);
+
+  // Transient "останавливаю процесс…" cue while Edit/Repeat hard-kills the live
+  // session before rewriting history. Fired by ClaudeSDKTab right before the
+  // hard kill; auto-clears after 1.2s or as soon as the new turn goes busy.
+  const [sdkStopping, setSdkStopping] = useState(false);
+  useEffect(() => {
+    if (!isSDKTab) return;
+    const handler = (e: Event) => {
+      const { tabId: t } = (e as CustomEvent).detail || {};
+      if (t !== tabId) return;
+      setSdkStopping(true);
+      setTimeout(() => setSdkStopping(false), 1200);
+    };
+    window.addEventListener('claude-sdk:stopping', handler);
+    return () => window.removeEventListener('claude-sdk:stopping', handler);
   }, [tabId, isSDKTab]);
 
   const focusTerminal = () => {
@@ -225,9 +242,16 @@ export default function ClaudeControlBar({
 
   const effortLevels = isDeepSeekPTY ? DEEPSEEK_EFFORT_LEVELS : CLAUDE_EFFORT_LEVELS;
 
-  const sdkSupportedEfforts = isSDKTab
-    ? getSupportedEffortsForAlias(sdkModel, sdkModelCaps)
-    : null;
+  // NOTE: we deliberately DO NOT gate effort pills per model. Real Claude Code
+  // shows the full effort scale (low…max + ultracode) for EVERY model incl.
+  // Haiku and lets you pick any of them — `supportedModels().supportedEffortLevels`
+  // is NOT a hard availability gate (Haiku returns it empty yet the CLI slider
+  // still offers max/ultracode). Matching CLI behaviour beats inventing a
+  // stricter gate. The ONE real per-model constraint is a transport detail, not
+  // UI: ultracode must reach the SDK via the settings layer, not `--effort`
+  // (the --effort flag's closed enum rejects 'ultracode' → exit 1). That's
+  // handled in main.js sdkStartQuery, not here. See fact-claude-sdk-tab /
+  // fact-claude-control-bar docs.
 
   // Model active id
   const lm = claudeModel?.toLowerCase() || '';
@@ -348,6 +372,13 @@ export default function ClaudeControlBar({
 
   // ===== handlers =====
   const setEffortOnPTY = async (level: string) => {
+    // Mark this tab as "effort sent" so the tui-ready and Bridge:Fresh auto-inject
+    // paths in Terminal.tsx see it and skip. Without this, the user's frustration
+    // click while waiting for tui-ready would race the auto-inject and produce
+    // two /effort lines (forensic: 2026-05 tab-2933 incident).
+    const sentinelMap = (window as any).__effortSentForTab as Map<string, { at: number; via: string }> | undefined;
+    if (sentinelMap) sentinelMap.set(tabId, { at: Date.now(), via: 'manual-click' });
+    console.warn('[EffortDiag2026-05][CONTROLBAR-CLICK] tab=' + tabId.slice(-12) + ' level=' + level + ' ts=' + Date.now());
     setIsLocalBusy(true);
     setEffortLocal(level);
     try { await ipcRenderer.invoke('claude:send-command', tabId, '/effort ' + level); }
@@ -366,14 +397,10 @@ export default function ClaudeControlBar({
     setPinnedPopup(null); setHoveredTrigger(null); setHoveredPopup(null);
     if (isBusy) return;
     if (isSDKTab) {
-      const store = useWorkspaceStore.getState();
-      store.updateSDKState(tabId, { sdkModel: mid });
-      const supported = getSupportedEffortsForAlias(mid, sdkModelCaps);
-      const cur = sdkEffort || 'high';
-      if (supported && !supported.has(cur)) {
-        const fallback = ['xhigh', 'high', 'medium', 'low'].find(e => supported.has(e)) || 'high';
-        store.updateSDKState(tabId, { sdkEffort: fallback });
-      }
+      // No effort auto-downgrade on model switch: like the CLI, any effort is
+      // selectable on any model (see effort-gating note above). The user's
+      // chosen effort persists across model changes.
+      useWorkspaceStore.getState().updateSDKState(tabId, { sdkModel: mid });
       focusTerminal();
       return;
     }
@@ -482,10 +509,8 @@ export default function ClaudeControlBar({
   const onStop = async () => {
     if (!tabId) return;
     if (isSDKTab) {
-      // Guard: was-stopped event → overlay «Process stopped — history preserved»
-      // в композере. Без guard'а idle-клик показывал overlay без причины.
-      // sdkBusy подписан на claude:busy-state локально (см. выше) — single
-      // source of truth, та же шина что у TabBar/SessionActionChip.
+      // SOFT interrupt of the current turn (default). sdkBusy guard: only when a
+      // turn is actually streaming. Process + session + bg agents stay alive.
       if (!sdkBusy) return;
       try {
         await ipcRenderer.invoke('claude-sdk:stop', { tabId });
@@ -499,25 +524,55 @@ export default function ClaudeControlBar({
     } catch (e: any) { console.error('[SessionStop] error', e); }
   };
 
+  // HARD kill — terminate the SDK process AND all its background agents. Bound
+  // to the process indicator click when the process is alive. Immediate, no
+  // confirm (per UX decision). The next message auto-revives a fresh process.
+  const onKillProcess = async () => {
+    if (!tabId || !isSDKTab) return;
+    try {
+      await ipcRenderer.invoke('claude-sdk:stop', { tabId, hard: true });
+      window.dispatchEvent(new CustomEvent('claude-sdk:was-stopped', { detail: { tabId } }));
+    } catch (e: any) { console.error('[SDKKill] error', e); }
+  };
+
   const refreshTimeline = () => {
     window.dispatchEvent(new CustomEvent('timeline:force-refresh', { detail: { tabId } }));
   };
 
+  // Fork into PTY tab. Three branches:
+  //   - current tab is SDK → ALWAYS new PTY tab after this one. Cross-type
+  //     reuse is impossible (SDK tab has no PTY shell to send claude-f into),
+  //     and converting SDK→PTY in-place would discard the SDK message history.
+  //     Юзер: «если у меня запущена вкладка SDK и я жму Fork в Claude
+  //     Terminal → открыть новый PTY таб после текущего SDK».
+  //   - PTY tab with process running → new tab after this one. Touching the
+  //     current tab would interrupt the live Claude/Gemini session.
+  //   - PTY tab, process NOT running → reuse THIS tab. Same type, no live
+  //     state to preserve; spawning a sibling and switching to it is just
+  //     TabBar clutter.
   const forkToTab = async () => {
     if (!sessionId || !tabId || !sessionType) return;
     const state = useWorkspaceStore.getState();
     for (const [projectId, workspace] of state.openProjects) {
       const tab = workspace.tabs.get(tabId);
-      if (tab) {
-        const currentCwd = tab.cwd || projectPath || '';
+      if (!tab) continue;
+      const currentCwd = tab.cwd || projectPath || '';
+      const canReuseInPlace = !isSDKTab && !isCommandRunning;
+      if (canReuseInPlace) {
+        const cmd = sessionType === 'claude' ? 'claude-f' : 'gemini-f';
+        const ipcChannel = sessionType === 'claude' ? 'claude:run-command' : 'gemini:run-command';
+        const payloadKey = sessionType === 'claude' ? 'forkSessionId' : 'sessionId';
+        ipcRenderer.send(ipcChannel, { tabId, command: cmd, [payloadKey]: sessionId, cwd: currentCwd });
+        showToast(`Fork ${sessionType === 'claude' ? 'Claude' : 'Gemini'} (в этой вкладке)`, 'success');
+      } else {
         const forkName = tab.name ? `${tab.name}_fork` : undefined;
         await state.createTabAfterCurrent(projectId, forkName, currentCwd, {
           pendingAction: { type: sessionType === 'claude' ? 'claude-fork' : 'gemini-fork', sessionId },
           nameSetManually: !!forkName,
         });
         showToast(`Fork ${sessionType === 'claude' ? 'Claude' : 'Gemini'} → ${forkName || 'новая вкладка'}`, 'success');
-        break;
       }
+      break;
     }
   };
 
@@ -605,24 +660,41 @@ export default function ClaudeControlBar({
     }
   };
 
+  // Fork → SDK.
+  //   - current tab is SDK → ALWAYS new SDK tab after this one. The point of a
+  //     fork from an SDK chat is to branch the conversation — swapping the
+  //     sessionId on the current tab would discard the visible thread the user
+  //     is looking at. Юзер: «если у меня запущен SDK в текущей вкладке и я
+  //     жму Fork SDK, это означает форк ОТ этой вкладки → создаётся сбоку
+  //     новая вкладка SDK».
+  //   - current tab is PTY with a live process → new SDK tab. Don't kill the
+  //     running PTY Claude.
+  //   - current tab is PTY, no live process → convert in-place to SDK and
+  //     attach the forked sessionId. Empty PTY tab is fair game to repurpose.
   const forkToSDK = async () => {
     if (!sessionId || !tabId || sessionType !== 'claude') return;
     const state = useWorkspaceStore.getState();
     for (const [projectId, workspace] of state.openProjects) {
       const tab = workspace.tabs.get(tabId);
-      if (tab) {
-        const currentCwd = tab.cwd || projectPath || '';
-        const forkResult = await ipcRenderer.invoke('claude:fork-session-file', { sourceSessionId: sessionId, cwd: currentCwd, skipChainResolve: true });
-        if (!forkResult.success) { showToast('Fork failed: ' + forkResult.error, 'error'); return; }
-        // Same naming convention as forkToTab (PTY→PTY): "<source>_fork".
-        // Без этого SDK-форк получал auto-имя "claude-02" и юзер терял связь
-        // c исходным табом.
+      if (!tab) continue;
+      const currentCwd = tab.cwd || projectPath || '';
+      const forkResult = await ipcRenderer.invoke('claude:fork-session-file', { sourceSessionId: sessionId, cwd: currentCwd, skipChainResolve: true });
+      if (!forkResult.success) { showToast('Fork failed: ' + forkResult.error, 'error'); return; }
+      const canReuseInPlace = !isSDKTab && !isCommandRunning;
+      if (canReuseInPlace) {
+        try { state.convertToSDKTab(tabId); } catch (e: any) {
+          showToast('Не удалось конвертировать в SDK: ' + (e?.message || e), 'error');
+          return;
+        }
+        state.updateSDKState(tabId, { claudeSessionId: forkResult.newSessionId });
+        showToast('SDK fork (в этой вкладке)', 'success');
+      } else {
         const forkName = tab.name ? `${tab.name}_fork` : undefined;
         const sdkTabId = await state.createSDKTab(projectId, forkName);
         state.updateSDKState(sdkTabId, { claudeSessionId: forkResult.newSessionId });
         showToast(`SDK fork → ${forkName || 'новая вкладка'}`, 'success');
-        break;
       }
+      break;
     }
   };
 
@@ -682,7 +754,7 @@ export default function ClaudeControlBar({
     const m = activeProvider.models.find(m => m.id === modelActiveId);
     return m?.label || modelActiveId || '—';
   })();
-  const effortLabel = (effortActive === 'medium' ? 'med' : effortActive === 'xhigh' ? 'xhi' : (effortActive || '—'));
+  const effortLabel = (effortActive === 'medium' ? 'med' : effortActive === 'xhigh' ? 'xhi' : effortActive === 'ultracode' ? 'ultra' : (effortActive || '—'));
 
   // ===== styles =====
   // Triggers сами не меняют opacity при busy — лоадер реализован overlay'ем на
@@ -863,15 +935,64 @@ export default function ClaudeControlBar({
               существует — query запустится первым же сообщением. См. headed
               comment в SessionActionChip.tsx. isCommandRunning для SDK — это
               sdkBusy (claude-sdk:busy-state forward'ится через claude:busy-state). */}
-          <SessionActionChip
-            sessionType={sessionType}
-            mode={isSDKTab ? 'sdk' : 'pty'}
-            isCommandRunning={isSDKTab ? sdkBusy : isCommandRunning}
-            hasAnySession={hasAnySession}
-            onStart={onStart}
-            onContinue={onContinue}
-            onStop={onStop}
-          />
+          {isSDKTab ? (
+            // SDK: the middle "chip" slot shows the PROCESS state (РАБОТАЕТ /
+            // АКТИВЕН / ОСТАНОВЛЕН) and is the HARD-kill button — same states /
+            // dot / text as the standalone indicator, but using the chip's font
+            // (text-xs font-medium) and living inside the session pill. Soft
+            // interrupt of the turn stays on Escape; this button kills the whole
+            // process + bg agents. 4 states: stopping > running > active > stopped.
+            (() => {
+              const alive = sdkProcessAlive && !sdkStopping;
+              const label = sdkStopping ? 'останавливаю…'
+                : sdkProcessAlive ? (sdkBusy ? 'работает' : 'активен')
+                : 'остановлен';
+              // Always clickable: alive → HARD kill the process; stopped →
+              // activate the tab + focus the composer (the only way to start a
+              // fresh process is to write a message). During the transient
+              // stopping cue it's inert.
+              const clickable = !sdkStopping;
+              const onClick = !clickable ? undefined : (alive ? onKillProcess : onContinue);
+              const title = sdkStopping ? 'Останавливаю процесс…'
+                : alive ? 'Процесс активен — нажмите, чтобы полностью остановить'
+                : 'Процесс остановлен — нажмите, чтобы перейти к вводу';
+              return (
+                <span
+                  onClick={onClick}
+                  title={title}
+                  className="text-xs font-medium relative inline-flex items-center justify-center gap-1.5"
+                  style={{
+                    height: 18,
+                    padding: '0 8px',
+                    cursor: clickable ? 'pointer' : 'default',
+                    color: alive ? '#d97706' : '#666',
+                    backgroundColor: alive ? 'rgba(217,119,6,0.12)' : 'transparent',
+                    transition: 'background-color 0.12s, color 0.12s',
+                    userSelect: 'none',
+                  }}
+                  onMouseEnter={(e) => { if (clickable) (e.currentTarget as HTMLSpanElement).style.backgroundColor = alive ? 'rgba(217,119,6,0.22)' : 'rgba(255,255,255,0.06)'; }}
+                  onMouseLeave={(e) => { if (clickable) (e.currentTarget as HTMLSpanElement).style.backgroundColor = alive ? 'rgba(217,119,6,0.12)' : 'transparent'; }}
+                >
+                  <span
+                    aria-hidden
+                    className={alive && sdkBusy ? 'animate-glow-yellow' : undefined}
+                    style={{ width: 7, height: 7, borderRadius: 2, flexShrink: 0, backgroundColor: alive ? '#d97706' : '#555' }}
+                  />
+                  {label}
+                </span>
+              );
+            })()
+          ) : (
+            <SessionActionChip
+              sessionType={sessionType}
+              mode="pty"
+              isCommandRunning={isCommandRunning}
+              hasAnySession={hasAnySession}
+              onStart={onStart}
+              onContinue={onContinue}
+              onStop={onStop}
+            />
+          )}
           {hasAnySession && (
             <button
               className="flex-shrink-0 inline-flex items-center justify-center cursor-pointer transition-colors"
@@ -1002,10 +1123,10 @@ export default function ClaudeControlBar({
           </>
         )}
 
-        {/* ⎘ prompt | + clear split-pill — Claude only. Copy current input,
-            optionally clear it. Lives in the bar because user wants the input
-            actions near other Claude-control affordances, not in the right panel. */}
-        {sessionType === 'claude' && tabId && (
+        {/* ⎘ prompt | + clear split-pill — Claude PTY only. Copies the live TUI
+            input; the SDK composer has no equivalent grab, so hidden for SDK
+            tabs (пока что не отображаем). */}
+        {sessionType === 'claude' && !isSDKTab && tabId && (
           <div
             className="inline-flex items-stretch rounded select-none overflow-hidden"
             style={{
@@ -1175,7 +1296,9 @@ export default function ClaudeControlBar({
               сразу, один клик переключает. Dimmed когда Think выключен (effort
               работает только при reasoning, поэтому визуально телеграфируем
               что значение сейчас не применяется), но не disabled — юзер может
-              пресет-нуть заранее и потом включить Think. */}
+              пресет-нуть заранее и потом включить Think.
+              Уровни НЕ гейтятся по модели — как в самом Claude Code, любой
+              уровень выбираем для любой модели (вкл. Haiku). */}
           <div
             style={{
               display: 'inline-flex',
@@ -1191,16 +1314,31 @@ export default function ClaudeControlBar({
             <span style={{ color: '#777', fontSize: 10, marginRight: 4 }}>Effort</span>
             {effortLevels.map(level => {
               const active = effortActive === level;
-              const isUnsupported = isSDKTab && sdkSupportedEfforts != null && !sdkSupportedEfforts.has(level);
-              const label = level === 'medium' ? 'med' : level === 'xhigh' ? 'xhi' : level;
+              const isUltra = level === 'ultracode';
+              const label = isUltra ? 'ultra'
+                : level === 'medium' ? 'med'
+                : level === 'xhigh' ? 'xhi'
+                : level;
+              const title = isUltra
+                ? 'ultracode — xhigh + авто dynamic-workflows на всю сессию (Claude сам решает когда запускать workflow). Дорого по токенам; сбрасывается в начале новой сессии.'
+                : level;
+              // ultracode pill: purple accent (matches workflow chip), separated
+              // from the plain levels by a thin divider so it reads as a mode.
+              const ultraStyle = isUltra ? {
+                ...pillStyle(active, false),
+                ...(active
+                  ? { backgroundColor: '#7c5cd6', borderColor: '#a78bfa', color: '#fff' }
+                  : { color: '#a78bfa', borderColor: 'rgba(167,139,250,0.4)' }),
+              } : pillStyle(active, false);
               return (
-                <button
-                  key={level}
-                  style={pillStyle(active, isUnsupported)}
-                  disabled={isUnsupported}
-                  title={isUnsupported ? `${level} не поддерживается моделью ${sdkModel}` : level}
-                  onClick={() => !isUnsupported && pickEffort(level)}
-                >{label}</button>
+                <React.Fragment key={level}>
+                  {isUltra && <span aria-hidden style={{ width: 1, alignSelf: 'stretch', background: 'rgba(255,255,255,0.12)', margin: '2px 2px' }} />}
+                  <button
+                    style={ultraStyle}
+                    title={title}
+                    onClick={() => pickEffort(level)}
+                  >{label}</button>
+                </React.Fragment>
               );
             })}
           </div>
@@ -1223,6 +1361,7 @@ export default function ClaudeControlBar({
         </div>
         );
       })()}
+
     </div>
   );
 }

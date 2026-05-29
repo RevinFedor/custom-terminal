@@ -270,6 +270,135 @@ async function _deleteEffortEntries(sessionId, cwd, projectManager) {
   }
 }
 
+// ─── On-restart trailing `/effort` trim (sync, called BEFORE claude --resume) ───
+//
+// Назначение: убрать накопившиеся `/effort` slash-команды из ХВОСТА JSONL перед
+// тем как заново открыть сессию. Каждый запуск Claude авто-инжектит `/effort max`
+// (max нельзя держать в settings.json — Claude его сбрасывает, см.
+// fact-claude-tui-control.md). Без чистки после N перезапусков подряд в хвосте
+// копится N пар `/effort` wrapper+stdout, видимых в Claude TUI scrollback и
+// rewind-меню (в нашем Timeline они и так скрыты tag-фильтром).
+//
+// ПОЧЕМУ ЭТО НЕ ТОТ САМЫЙ phantom-баг (важно): удалённый EffortCleanup watcher
+// чистил `/effort` пока Claude ЖИВ — и через 40 сек юзер дописывал prompt с
+// parentUuid на стёртую запись → phantom. Здесь чистка идёт ТОЛЬКО в момент
+// claude-c перед `term.write(--resume)`, когда старый процесс УЖЕ МЁРТВ. Никто
+// не допишет ребёнка к удаляемой записи. Phantom физически невозможен.
+//
+// ПОЧЕМУ ТОЛЬКО ХВОСТ И ТОЛЬКО ЕСЛИ /effort = последнее: parentUuid всегда
+// указывает НАЗАД. Если после `/effort` есть реальное сообщение — у `/effort`
+// появился потомок, и резать нельзя (порвём цепочку). Поэтому строгий suffix-match:
+// режем только когда максимальный хвост это [caveat? wrapper stdout trailing-meta*]
+// и НИЧЕГО реального после. Если после `/effort` хоть одна real-запись — no-op.
+// Никакого re-append, никакого relink — чистый truncate. Verified dry-run на 455
+// сессиях: срабатывает редко, remaining-refs-into-deleted всегда NONE.
+function _trimTrailingEffortEntries(sessionId, cwd) {
+  if (!sessionId) return { success: false, error: 'No sessionId' };
+  try {
+    const found = findSessionFile(sessionId, cwd);
+    if (!found) return { success: true, trimmed: 0 }; // fresh session, no file yet
+    const filePath = found.filePath;
+    const stat = fs.statSync(filePath);
+    const fileSize = stat.size;
+    if (fileSize === 0) return { success: true, trimmed: 0 };
+
+    const readSize = Math.min(TAIL_BYTES, fileSize);
+    const startOffset = fileSize - readSize;
+    const fd = fs.openSync(filePath, 'r');
+    const buf = Buffer.alloc(readSize);
+    try { fs.readSync(fd, buf, 0, readSize, startOffset); }
+    finally { fs.closeSync(fd); }
+
+    // Split on byte 0x0A (\n) working in BYTE offsets, NOT string indices.
+    // Critical: JSONL with Cyrillic/emoji content is multi-byte UTF-8, so
+    // String.indexOf('\n') returns a CHARACTER index that diverges from the
+    // byte offset — adding it to startOffset gives a wrong truncate point that
+    // cuts mid-record (file corruption). We compute every offset from the Buffer.
+    // See methodology/переносимый-дизайн.md::Ink TUI (bytes ≠ chars).
+    const lines = []; // { rec|null, byteStart } — byteStart is absolute file offset of line start
+    let lineStartInBuf = 0;
+    if (startOffset > 0) {
+      // We didn't read from byte 0 — first line may be a torn partial. Drop up to first \n.
+      const firstNL = buf.indexOf(0x0A);
+      if (firstNL === -1) return { success: true, trimmed: 0 };
+      lineStartInBuf = firstNL + 1;
+    }
+    let p = lineStartInBuf;
+    while (p < readSize) {
+      let nl = buf.indexOf(0x0A, p);
+      const end = nl === -1 ? readSize : nl;
+      const lineBuf = buf.subarray(p, end);
+      const lineText = lineBuf.toString('utf8');
+      if (lineText.trim()) {
+        let rec = null;
+        try { rec = JSON.parse(lineText); } catch { rec = null; }
+        lines.push({ rec, byteStart: startOffset + p });
+      }
+      if (nl === -1) break;
+      p = nl + 1;
+    }
+    if (lines.length === 0) return { success: true, trimmed: 0 };
+
+    const classify = (rec) => {
+      if (!rec) return 'unparseable';
+      if (!rec.uuid) return 'meta'; // last-prompt / permission-mode / ai-title / queue-operation
+      const c = rec.message && rec.message.content;
+      if (typeof c === 'string') {
+        const s = c.trim();
+        if (s.startsWith('<command-name>/effort')) return 'effort-wrapper';
+        if (s.startsWith('<local-command-stdout>Set effort level')) return 'effort-stdout';
+        if (s.startsWith('<local-command-caveat>')) return 'caveat';
+      }
+      return 'real';
+    };
+
+    // Strict suffix walk from the end. The tail may contain SEVERAL `/effort`
+    // blocks back-to-back (user restarted the session N times with no real
+    // message in between — each restart injects a fresh `/effort`). We peel them
+    // one block at a time in a loop, so all consecutive trailing `/effort` blocks
+    // collapse in one pass. Each block (from the end) matches:
+    //   [trailing meta]*  effort-stdout  effort-wrapper  [one caveat]?
+    // followed optionally by more meta + another block. We STOP at the first
+    // record that isn't part of an `/effort` block (a real user/assistant
+    // message) — its descendant chain must stay intact (no phantom).
+    //
+    // An unparseable trailing line (torn write) bails immediately — never
+    // truncate next to corrupted bytes.
+    let i = lines.length - 1;
+    if (classify(lines[i].rec) === 'unparseable') return { success: true, trimmed: 0 };
+    let cutIdx = -1; // lowest index we will truncate from; -1 = nothing matched yet
+    while (i >= 0) {
+      // skip trailing/inter-block meta
+      let j = i;
+      while (j >= 0 && classify(lines[j].rec) === 'meta') j--;
+      // expect effort-stdout then effort-wrapper
+      if (j < 0 || classify(lines[j].rec) !== 'effort-stdout') break;
+      j--;
+      if (j < 0 || classify(lines[j].rec) !== 'effort-wrapper') break;
+      let blockStart = j; // wrapper
+      // optional single caveat right before the wrapper
+      if (j - 1 >= 0 && lines[j - 1].rec && classify(lines[j - 1].rec) === 'caveat') {
+        blockStart = j - 1;
+      }
+      cutIdx = blockStart;     // extend the cut down to this block's start
+      i = blockStart - 1;      // continue: maybe another /effort block precedes it
+    }
+
+    if (cutIdx === -1) return { success: true, trimmed: 0 };
+
+    const truncateAt = lines[cutIdx].byteStart;
+    fs.truncateSync(filePath, truncateAt);
+    _jsonlCache.delete(filePath);
+
+    const removed = lines.length - cutIdx;
+    console.log('[TrimEffort] session=' + sessionId.slice(0, 8) + ' trimmed trailing /effort block (' + removed + ' lines) at offset ' + truncateAt);
+    return { success: true, trimmed: removed };
+  } catch (error) {
+    console.error('[TrimEffort] Error:', error.message);
+    return { success: false, error: error.message };
+  }
+}
+
 // Parse JSONL lines into an existing recordMap (shared logic for full + incremental reads)
 function _parseJsonlLines(lines, sessionId, recordMap, progressEntries, startFileIndex, bridgeSessionIdIn) {
   let lastRecord = null;
@@ -3868,4 +3997,4 @@ async function repairJsonlChainBreaks(sessionId, cwd) {
   }
 }
 
-module.exports = { register, findSessionFile, loadJsonlRecords, resolveSessionChain, resolveLatestSessionInChain, parseTimelineUuids, parseTimelineEntries, deleteEffortEntries: _deleteEffortEntries, repairJsonlChainBreaks, _api };
+module.exports = { register, findSessionFile, loadJsonlRecords, resolveSessionChain, resolveLatestSessionInChain, parseTimelineUuids, parseTimelineEntries, deleteEffortEntries: _deleteEffortEntries, trimTrailingEffortEntries: _trimTrailingEffortEntries, repairJsonlChainBreaks, _api };

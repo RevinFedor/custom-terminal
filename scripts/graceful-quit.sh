@@ -29,16 +29,25 @@ echo "[graceful-quit] requesting graceful quit of '${APP_NAME}' (deadline ${DEAD
 osascript -e "tell application \"${APP_NAME}\" to quit" 2>/dev/null || true
 
 # Poll until process disappears or deadline passes.
-SECS=0
+# NOTE: DEADLINE is REAL SECONDS. The previous loop did `sleep 0.25; SECS+=1`,
+# so DEADLINE=5 actually pkilled after 5×0.25 = 1.25s of wall-clock — far below
+# the app's own before-quit budget (proxyGracefulShutdown drains active SSE
+# connections for up to 15s when a Claude turn is mid-flight). The mismatch
+# pkilled the process before before-quit could mark was_interrupted, so on the
+# next launch AutoResume saw "No interrupted tabs" and no Continue overlay
+# appeared, even though JSONL was intact (forensic: 2026-05-26 16:06 restart).
+# Now we sleep a real 0.25s per tick and compare elapsed wall-clock, so the
+# default deadline genuinely covers the drain budget.
+START_TS=$(date +%s)
 while is_running; do
-  if [ "${SECS}" -ge "${DEADLINE}" ]; then
+  ELAPSED=$(( $(date +%s) - START_TS ))
+  if [ "${ELAPSED}" -ge "${DEADLINE}" ]; then
     echo "[graceful-quit] app did NOT exit in ${DEADLINE}s — falling back to pkill (JSONL of unfinished turns may be lost)"
     pkill -f "/Applications/${APP_NAME}.app" 2>/dev/null || true
     sleep 0.5
     break
   fi
   sleep 0.25
-  SECS=$((SECS + 1))
 done
 
 # Final cleanup wait so the OS releases /Applications/Noted Terminal.app

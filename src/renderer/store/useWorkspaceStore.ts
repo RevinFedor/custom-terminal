@@ -120,10 +120,25 @@ interface Tab {
   //   tool_use   — Claude вызвал tool, ждём result. Лоадер: «Running <name>…»
   //   error/idle — окончание turn'а.
   sdkState?: 'idle' | 'fetching' | 'thinking' | 'typing' | 'tool_use' | 'error';
+  // Process-alive flag for SDK tabs (single source for the control-bar process
+  // indicator AND the tab activity plate). true once a query exists; stays true
+  // between turns (soft interrupt parks the session); false only on hard kill /
+  // natural end / tab close. Distinct from sdkState (per-turn) and from busy
+  // (token streaming): a process can be alive+idle («Активен») with no busy.
+  sdkProcessAlive?: boolean;
   sdkMessages?: Array<{ role: string; type: string; content: string; timestamp: number; toolName?: string; toolStatus?: string }>; // In-memory messages for chat UI
   sdkModel?: string; // Model for next SDK query
   sdkEffort?: string; // Effort level for next SDK query
   sdkThinking?: boolean; // Thinking enabled for next SDK query
+  /**
+   * Live mid-stream type-ahead queue for this SDK tab. Kept here (not in
+   * ClaudeSDKTab local ref) so that switching projects doesn't unmount the
+   * pending state. The main-process JSONL watcher keeps running tied to the
+   * tabId; when the user returns the chip is re-rendered from this array.
+   * Each entry: text user pushed + push timestamp + lifecycle state.
+   * NOT persisted to SQLite — lives only during a session.
+   */
+  sdkMidstreamPending?: Array<{ text: string; ts: number; state: 'queued' | 'sent' }>;
   /**
    * Per-tab provider/model selection for the Claude proxy. Persisted via SQLite
    * (tabs.provider_state JSON). Authoritative writer is main process — it owns
@@ -142,8 +157,44 @@ interface Tab {
   bgTasks?: BgTask[];
 }
 
-export type BgTaskKind = 'agent' | 'bash';
-export type BgTaskStatus = 'running' | 'completed' | 'failed' | 'stopped';
+// 'workflow' = a dynamic-workflow orchestration (SDK task_type 'local_workflow').
+// GROUND TRUTH (captured from a real run, NOT the .d.ts which omits this): the
+// workflow does NOT emit a task_started per child agent. It emits ONE
+// task_started (the workflow) + a stream of task_progress whose UNDOCUMENTED
+// `workflow_progress[]` array carries the full tree — phases and agents with
+// label/model/state/tokens/toolCalls/promptPreview/resultPreview. So we embed
+// phases+agents ON the single workflow BgTask (below), not as separate entries.
+export type BgTaskKind = 'agent' | 'bash' | 'workflow';
+// 'paused' added in SDK 0.3.156 (SDKTaskUpdatedMessage.patch.status) — a
+// workflow/agent can be paused (`p` hotkey) and resumed.
+export type BgTaskStatus = 'running' | 'completed' | 'failed' | 'stopped' | 'paused';
+
+// One phase of a dynamic workflow (workflow_progress entry type 'workflow_phase').
+export interface WorkflowPhase {
+  index: number;   // 1-based phase order
+  title: string;   // e.g. 'Fan-out', 'Synthesize'
+}
+// One agent of a dynamic workflow (workflow_progress entry type 'workflow_agent').
+// Merged by `index` across successive task_progress events (each event may carry
+// only the agents whose state changed, and 'done' adds resultPreview).
+export interface WorkflowAgent {
+  index: number;            // stable key across events
+  label: string;            // 'ask:colors' / 'synthesize'
+  phaseIndex?: number;
+  phaseTitle?: string;
+  agentId?: string;         // assigned once the agent starts running
+  model?: string;           // 'claude-opus-4-8[1m]'
+  state: 'start' | 'progress' | 'done' | 'error';
+  tokens?: number;          // per-agent token count
+  toolCalls?: number;       // per-agent tool-call count
+  lastToolName?: string;
+  lastToolSummary?: string;
+  promptPreview?: string;
+  resultPreview?: string;   // appears in 'done'
+  durationMs?: number;
+  startedAt?: number;
+  attempt?: number;
+}
 export interface BgTask {
   taskId: string;          // SDK task_id (stable across task_started→task_notification)
   toolUseId?: string;       // The tool_use block that started this task (Agent / Bash)
@@ -163,6 +214,16 @@ export interface BgTask {
   toolUses?: number;
   durationMs?: number;
   isError?: boolean;
+  // ---- Workflow (SDK 0.3.156 local_workflow) ----
+  // For kind==='workflow' ONLY. The phases + agents are parsed out of every
+  // task_progress.workflow_progress[] and merged here by index (events are
+  // partial — they carry only changed agents). The WorkflowPanel renders
+  // straight off these two arrays; there are no separate per-agent BgTasks.
+  workflowName?: string;   // task_started.workflow_name (meta.name of the script)
+  phases?: WorkflowPhase[];
+  agents?: WorkflowAgent[];
+  activity?: string[];     // Rolling tool-call log, cap ~12 (non-workflow agent tasks)
+  toolCallTotal?: number;  // Monotonic count of tool calls seen
 }
 
 interface ProjectWorkspace {
@@ -259,6 +320,7 @@ interface WorkspaceStore {
   setClaudeAgentStatus: (tabId: string, status: 'idle' | 'running' | 'done' | 'error' | 'summarizing', sessionId?: string) => void;
   setClaudeActive: (tabId: string, alive: boolean) => void;
   setClaudeBusy: (tabId: string, busy: boolean) => void;
+  setSdkProcessAlive: (tabId: string, alive: boolean) => void;
   setInterceptorState: (tabId: string, state: 'armed' | 'disarmed' | null) => void;
 
   // MCP sub-agent tab management
@@ -290,7 +352,7 @@ interface WorkspaceStore {
   // Claude SDK tabs
   createSDKTab: (projectId: string, name?: string) => Promise<string>;
   convertToSDKTab: (tabId: string) => void;
-  updateSDKState: (tabId: string, state: Partial<Pick<Tab, 'sdkState' | 'sdkMessages' | 'claudeSessionId' | 'sdkModel' | 'sdkEffort' | 'sdkThinking'>>) => void;
+  updateSDKState: (tabId: string, state: Partial<Pick<Tab, 'sdkState' | 'sdkMessages' | 'claudeSessionId' | 'sdkModel' | 'sdkEffort' | 'sdkThinking' | 'sdkMidstreamPending'>>) => void;
   // Merge a partial BgTask patch by taskId. Creates the entry if missing.
   // status terminal transition ('completed'|'failed'|'stopped') also sets endedAt.
   upsertBgTask: (tabId: string, taskId: string, patch: Partial<BgTask>) => void;
@@ -966,24 +1028,31 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       ? options.pendingAction.command
       : undefined;
 
-    console.log('[Store:createTabAfterCurrent] Creating terminal with:', {
-      tabId,
-      cwd: newTab.cwd,
-      pendingAction: options?.pendingAction,
-      initialCommand
-    });
+    // Claude SDK tabs don't need a PTY process — mirror createTab's guard.
+    // Without it, routing SDK fork through this function would spawn an unused
+    // PTY (waste + потенциальные phantom lifecycle-сигналы для SDK-таба).
+    if (newTab.tabType === 'claude-sdk') {
+      console.log('[Store:createTabAfterCurrent] SDK tab, skipping PTY for:', tabId);
+    } else {
+      console.log('[Store:createTabAfterCurrent] Creating terminal with:', {
+        tabId,
+        cwd: newTab.cwd,
+        pendingAction: options?.pendingAction,
+        initialCommand
+      });
 
-    const { pid } = await ipcRenderer.invoke('terminal:create', {
-      tabId,
-      projectId,
-      cwd: newTab.cwd,
-      rows: 24,
-      cols: 80,
-      initialCommand
-    });
+      const { pid } = await ipcRenderer.invoke('terminal:create', {
+        tabId,
+        projectId,
+        cwd: newTab.cwd,
+        rows: 24,
+        cols: 80,
+        initialCommand
+      });
 
-    console.log('[Store:createTabAfterCurrent] Terminal created with pid:', pid);
-    newTab.pid = pid;
+      console.log('[Store:createTabAfterCurrent] Terminal created with pid:', pid);
+      newTab.pid = pid;
+    }
 
     // Insert after specified tab or current active tab (or at end if no active tab)
     const referenceTabId = options?.afterTabId || workspace.activeTabId;
@@ -1087,9 +1156,12 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       .filter(t => !t.parentTabId && !t.isUtility);
     const closedPosition = orderedMainTabs.findIndex(t => t.id === tabId);
 
-    // Stop SDK session if this is a claude-sdk tab + clear busy state
+    // Stop SDK session if this is a claude-sdk tab + clear busy state.
+    // HARD kill — closing the tab must fully terminate the process and all its
+    // background agents (no orphans). A soft interrupt would leave the parked
+    // session + bg workers alive with no UI to control them.
     if (tab?.tabType === 'claude-sdk') {
-      ipcRenderer.invoke('claude-sdk:stop', { tabId }).catch(() => {});
+      ipcRenderer.invoke('claude-sdk:stop', { tabId, hard: true }).catch(() => {});
       ipcRenderer.send('claude-sdk:busy-state', { tabId, busy: false });
     }
 
@@ -1630,6 +1702,31 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         // Skip if session ID unchanged (Bridge polls repeatedly with same ID)
         if (tab.claudeSessionId === sessionId) return;
 
+        // Guard against TRUNCATED session IDs clobbering a good one. The
+        // `userIntercept` path scrapes `claude --resume <id>` off the xterm
+        // screen buffer; when the line wraps/renders partially it can capture a
+        // prefix like "00581613-b3" (11 chars) instead of the full 36-char
+        // UUID. Writing that corrupts tab.claudeSessionId — Timeline still
+        // prefix-matches the JSONL so it "works", but the copy-session-id button
+        // yields a broken id and /resume elsewhere fails. Empty string is a
+        // legitimate CLEAR (timelineChain), so only validate non-empty values.
+        // Reject anything that isn't a full UUID, and especially refuse to
+        // replace an existing FULL uuid with a prefix of itself.
+        if (sessionId) {
+          const FULL_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+          if (!FULL_UUID.test(sessionId)) {
+            const prev = tab.claudeSessionId || '';
+            const isPrefixOfExisting = prev && prev.startsWith(sessionId);
+            console.warn(
+              '[Store:setClaudeSessionId] REJECT malformed sessionId "' + sessionId +
+              '" (len=' + sessionId.length + ', reason=' + reason + ', tab=' + tabId.slice(-8) +
+              ', prev=' + (prev ? prev.slice(0, 8) + '…' : 'null') +
+              (isPrefixOfExisting ? ', is-prefix-of-existing' : '') + ') — not a full UUID, ignoring'
+            );
+            return;
+          }
+        }
+
         const caller = new Error().stack?.split('\n')[2]?.trim() || 'unknown';
         const logEntry = { ts: Date.now(), tabId, from: (tab.claudeSessionId || 'null').substring(0, 8), to: sessionId.substring(0, 8), reason, caller };
         // Ring buffer: always available even if DevTools was closed
@@ -1802,6 +1899,19 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     }
   },
 
+  setSdkProcessAlive: (tabId, alive) => {
+    const { openProjects } = get();
+    for (const [, workspace] of openProjects) {
+      const tab = workspace.tabs.get(tabId);
+      if (tab) {
+        if (tab.sdkProcessAlive === alive) return; // guard: no re-render if unchanged
+        tab.sdkProcessAlive = alive;
+        set({ openProjects: new Map(openProjects) });
+        return;
+      }
+    }
+  },
+
   setInterceptorState: (tabId: string, state: 'armed' | 'disarmed' | null) => {
     const { openProjects } = get();
     for (const [, workspace] of openProjects) {
@@ -1900,7 +2010,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
 
   // Claude SDK tabs
   createSDKTab: async (projectId, name) => {
-    const { openProjects, createTab } = get();
+    const { openProjects, createTabAfterCurrent } = get();
     const workspace = openProjects.get(projectId);
     const projectPath = workspace?.projectPath;
     const cwd = (projectPath && !projectPath.startsWith('__unset__')) ? projectPath : (process.env.HOME || '~');
@@ -1911,7 +2021,12 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     // исходного таба + `_fork` (тот же договор, что forkToTab для PTY).
     const existingNames = workspace ? Array.from(workspace.tabs.values()).map(t => t.name) : [];
     const tabName = name || getNextAvailableName('claude', existingNames);
-    return createTab(projectId, tabName, cwd, {
+    // Insert AFTER the active tab (same convention as PTY fork via
+    // createTabAfterCurrent) — раньше дёргали createTab, который пихал SDK-форк
+    // в самый конец списка, и юзер был вынужден прокручивать сайдбар, чтобы
+    // найти только что созданный таб. Юзер: «он должен создаваться не в конце,
+    // а снизу от той сессии, которая сейчас активна».
+    return createTabAfterCurrent(projectId, tabName, cwd, {
       tabType: 'claude-sdk',
       color: 'claude',
       commandType: 'claude',
@@ -1956,7 +2071,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         }
         if (!changed) return;
 
-        console.warn('[Store:updateSDKState] tabId=' + tabId + ' keys=' + Object.keys(state).join(',') + ' claudeSessionId=' + (state as any).claudeSessionId);
+        console.warn('[Store:updateSDKState] tabId=' + tabId + ' keys=' + Object.keys(state).join(',') + ' claudeSessionId=' + (state as any).claudeSessionId + ' sdkState=' + (state as any).sdkState);
         Object.assign(tab, state);
         // Persist sid to SQLite — without this an SDK tab loses its session
         // mapping on Electron restart (UI shows "Waiting for session" even

@@ -18,9 +18,9 @@ Bar ложится **под** контентом Terminal-колонки, но �
 
 **Right cluster.** Provider (PTY only — SDK гоняет напрямую в Anthropic), Model dropdown, Effort **inline pill-row** (не dropdown), Think toggle. Popup'ы Provider/Model открываются **вверх** (`bottom: calc(100% + 4px)`) как плоский ряд пилюль — bar сам внизу, вниз раскрытие некуда. **Right-anchored** (`right: 0`, не `left: 0`) — popup растёт влево от триггера. Без этого Model popup у правого края окна обрезался на узких окнах; формула «куда умещается» дала бы mid-session flip направления при resize. См. `methodology/переносимый-дизайн.md::Геометрия popup` (последний абзац про right-anchor для правого cluster'а).
 
-**Effort inline, Provider только иконка — разные стратегии для разных триггеров.** Effort row рендерит все 5 пилюль (`low/med/high/xhi/max`) прямо в баре, активная подсвечена `#DA7756` — выбор постоянно виден без раскрытия, один клик переключает. Provider trigger в свёрнутом виде показывает **только иконку** провайдера (без текстового имени Claude/Zen/DeepSeek), имя осталось в `title` и в раскрытом popup'е. Расхождение намеренное: Effort = 5 значений с близкой семантикой, нужно постоянное визуальное сравнение «активный vs остальные»; Provider = 3 значения с сильным брендингом, иконка `<activeProvider.Icon>` уже различима, текст имени дублирует. Принцип переносимый — см. `methodology/переносимый-дизайн.md::Dropdown vs inline`. До этой переделки Effort был dropdown'ом с триггером `Effort: max ▴` — popup открывался **только** при клике/⌘+наведении, юзер не видел в свёрнутом виде какие уровни доступны, и **не мог** сравнить активный с соседним без раскрытия.
+**Effort inline, Provider только иконка — разные стратегии для разных триггеров.** Effort row рендерит все 6 пилюль (`low/med/high/xhi/max/ultra`) прямо в баре, активная подсвечена `#DA7756` — выбор постоянно виден без раскрытия, один клик переключает. `ultra` = ultracode (xhigh + dynamic-workflow на всю сессию), не уровень модели; отделён вертикальной чертой и фиолетовым акцентом `#7c5cd6` как отдельный режим. Пилюли НЕ гейтятся по модели — любой уровень доступен любой модели, включая Haiku (см. `fact-claude-sdk-tab.md::Effort: gating отменён, ultracode через settings`). Provider trigger в свёрнутом виде показывает **только иконку** провайдера (без текстового имени Claude/Zen/DeepSeek), имя осталось в `title` и в раскрытом popup'е. Расхождение намеренное: Effort = 5 значений с близкой семантикой, нужно постоянное визуальное сравнение «активный vs остальные»; Provider = 3 значения с сильным брендингом, иконка `<activeProvider.Icon>` уже различима, текст имени дублирует. Принцип переносимый — см. `methodology/переносимый-дизайн.md::Dropdown vs inline`. До этой переделки Effort был dropdown'ом с триггером `Effort: max ▴` — popup открывался **только** при клике/⌘+наведении, юзер не видел в свёрнутом виде какие уровни доступны, и **не мог** сравнить активный с соседним без раскрытия.
 
-Layout одинаковый для PTY и SDK, но набор контролов разный: для SDK скрыты Provider и (когда DeepSeek) Effort с особыми caps'ами (`getSupportedEffortsForAlias`), Continue превращается в фокус на composer вместо `claude --resume` команды.
+Layout одинаковый для PTY и SDK, но набор контролов разный: для SDK скрыт Provider (SDK гоняет напрямую в Anthropic), Effort-кластер показывается полностью для всех моделей (DeepSeek-PTY использует свою шкалу `DEEPSEEK_EFFORT_LEVELS` с `off`), Continue превращается в фокус на composer вместо `claude --resume` команды. (Раньше тут было «для SDK скрыт Effort с caps'ами через `getSupportedEffortsForAlias`» — это был per-model гейтинг, отменён 2026-05-29, см. `fact-claude-sdk-tab.md`.)
 
 ## Per-tab state и selectors
 
@@ -40,13 +40,23 @@ PTY-табы получают `isCommandRunning` от Workspace через OSC 1
 
 ## Right cluster для SDK всегда enabled
 
-PTY-режим: правый кластер (Provider/Model/Effort/Think) затемнён когда `!isCommandRunning` — без живого TUI slash-команды улетят в мёртвый shell и потеряются. SDK-режим: параметры применяются **аргументом** при следующем `query()` вызове (см. `fact-claude-sdk-tab.md::Effort gating`), не slash-командой в живой TUI. Юзер может выбрать модель/effort/think **до** первого сообщения, настройки персистятся в `Tab.sdk*` полях, в первый же submit пойдут.
+PTY-режим: правый кластер (Provider/Model/Effort/Think) затемнён когда `!isCommandRunning` — без живого TUI slash-команды улетят в мёртвый shell и потеряются. SDK-режим: параметры применяются **аргументом** при следующем `query()` вызове (см. `fact-claude-sdk-tab.md::Effort: gating отменён, ultracode через settings`), не slash-командой в живой TUI. Юзер может выбрать модель/effort/think **до** первого сообщения, настройки персистятся в `Tab.sdk*` полях, в первый же submit пойдут.
 
 Гард в коде — `const canControl = isSDKTab ? true : isCommandRunning;`. Без этого SDK таб без session_id показывал кластер с `opacity: 0.4` + `pointer-events: none`, юзер видел disabled кнопки и не мог поменять модель до отправки первого prompt'а.
 
 ## Visibility guards для clipboard-fork chips
 
 Кнопки `+SDK` (`startNewSDKTab`), `⑂ Claude-F`, `⑂ SDK-F` (fork-from-clipboard) показываются на pristine табах — `!hasAnySession && !isSDKTab`. К этому guard'у добавлен **третий**: `!isCommandRunning`. Без него существовал window между `claude:process-started` (PTY запустил claude) и первой записью bridge'а в `Tab.claudeSessionId` (1-3 сек) — в этом окне юзер видел fork-кнопки одновременно с живым процессом, *«у меня в этой вкладке запущен процесс клода, но одновременно отображаются Claude-F и SDK-F, какого хуя»*. С `!isCommandRunning` guard'ом кнопки прячутся как только OSC 133 D говорит «команда запущена».
+
+## Fork: reuse-in-place vs new-tab — по типу таба, не по busy-флагу
+
+`⑂→▭` (`forkToTab`) и `⑂→SDK` (`forkToSDK`) выбирают между «форк в текущую вкладку» и «новый таб после текущей» по матрице:
+
+- **PTY-таб, процесс НЕ запущен** (`!isSDKTab && !isCommandRunning`) → **in-place**: шлём `claude:run-command {command:'claude-f', forkSessionId}` (или `gemini-f`) прямо на текущий `tabId`. PTY shell уже жив, форкнутый Claude стартует в нём. Юзер сидит в этой вкладке, прошлая сессия мертва (CLI вышел) — плодить sibling-таб и переключаться на него = захламлять TabBar.
+- **PTY-таб, процесс запущен** → **новый таб** после текущего (`createTabAfterCurrent` + pendingAction). Трогать текущий нельзя — прервём живой процесс.
+- **SDK-таб (любое состояние)** → **всегда новый таб** сбоку. Два момента: (1) для SDK `isCommandRunning` (OSC 133) **всегда false** — нельзя использовать его как «idle?»-сигнал, иначе busy SDK-таб попадёт в in-place ветку и форк затрёт активную беседу. (2) форк от SDK-чата по смыслу = ветвление беседы, подмена sessionId на текущем табе выкинула бы видимую историю. `forkToSDK` из PTY-idle конвертирует таб в SDK (`convertToSDKTab`) + цепляет форкнутый sessionId; из SDK — `createSDKTab`.
+
+Корневой баг при разработке: первая версия гейтила обе fork-функции по `isCommandRunning`. Для SDK он `false` → in-place ветка → *«запущен SDK в текущей вкладке, жму Fork SDK, оно форкает В текущей вкладке вместо новой сбоку»*. Лечение — ветка по `isSDKTab` (тип таба), не по busy-флагу. Переносимый принцип — `methodology/переносимый-дизайн.md::Fork от живого/типизированного контекста = новый объект`.
 
 ## Карта visibility всех кнопок
 

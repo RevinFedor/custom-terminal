@@ -83,6 +83,15 @@ import { markPendingResume, clearPendingResume, isStaleAgainstPending, getPendin
 // ============================================================================
 const _effortDiagStart = new Map<string, number>();   // tabId → process-started ts
 const _effortDiagSeen = new Map<string, Set<string>>(); // tabId → set of markers already logged
+const _effortHandlerCalls = new Map<string, number>(); // [EffortDiag2026-05] handler invocation counter per tab — distinguishes "handler fired twice" from "handler fired once, log delayed"
+const _effortInjectCalls = new Map<string, number>(); // [EffortDiag2026-05] invoke-fire counter — must equal handler-call counter; if not, second sender exists
+
+// Once-per-Claude-process sentinel: any path that sends /effort (tui-ready early
+// path, Bridge:Fresh fallback path, manual ControlBar click) sets this. Other
+// paths see it set and short-circuit. Cleared when the Claude process exits so
+// the next fresh spawn starts clean. Exposed on window for ControlBar access.
+const _effortSentForTab = new Map<string, { at: number; via: string }>();
+(window as any).__effortSentForTab = _effortSentForTab;
 
 function _effortDiag(tabId: string, label: string, extra?: string) {
   const start = _effortDiagStart.get(tabId);
@@ -409,16 +418,24 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
     return false;
   });
   const [claudeProcessAlive, setClaudeProcessAlive] = useState(false);
+  // Synchronous mirror for use inside the xterm key handler (which captures a
+  // stale closure). Tells command-type auto-detection "a foreground program is
+  // running" → getCurrentCommand() reads PROGRAM OUTPUT, not a shell command,
+  // so devServer/gemini regex matches (e.g. Claude rendering `⏺ Bash(npm run
+  // dev…)`) must NOT downgrade the tab type. See fix #2 / fact-tabs.md.
+  const claudeProcessAliveRef = useRef(false);
   useEffect(() => {
     const onStarted = (_: any, data: { tabId: string }) => {
       if (data.tabId === tabId) {
         console.warn('[QueueGate:proc] tab=' + tabId.slice(-8) + ' command-started → alive=true');
+        claudeProcessAliveRef.current = true;
         setClaudeProcessAlive(true);
       }
     };
     const onFinished = (_: any, data: { tabId: string }) => {
       if (data.tabId === tabId) {
         console.warn('[QueueGate:proc] tab=' + tabId.slice(-8) + ' command-finished → alive=false');
+        claudeProcessAliveRef.current = false;
         setClaudeProcessAlive(false);
       }
     };
@@ -427,7 +444,7 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
     // Initial sync — main keeps per-tab state we can poll once.
     ipcRenderer.invoke('terminal:getCommandState', tabId).then((s: any) => {
       console.warn('[QueueGate:proc] tab=' + tabId.slice(-8) + ' initial-sync isRunning=' + !!s?.isRunning);
-      if (s?.isRunning) setClaudeProcessAlive(true);
+      if (s?.isRunning) { claudeProcessAliveRef.current = true; setClaudeProcessAlive(true); }
     }).catch(() => {});
     return () => {
       ipcRenderer.removeListener('terminal:command-started', onStarted);
@@ -567,6 +584,16 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
       const colsBefore = term.cols;
       const rowsBefore = term.rows;
 
+      // [FocusDiag2026-05] focus snapshot BEFORE fit
+      const focusBefore = (() => {
+        try {
+          const el = document.activeElement;
+          const tag = el?.tagName || 'NULL';
+          const cls = (el?.className || '').toString().slice(0, 60);
+          return tag + (cls ? '.' + cls : '');
+        } catch { return 'ERR'; }
+      })();
+
       fit.fit();
 
       const dims = fit.proposeDimensions();
@@ -577,6 +604,18 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
 
       if (dims && dimsChanged) {
         console.warn(`[safeFit] tabId=${tabId} RESIZED ${colsBefore}x${rowsBefore} → ${colsAfter}x${rowsAfter}, sending resize to PTY`);
+        // [FocusDiag2026-05] focus snapshot AFTER fit when dims changed — catches
+        // the moment Prompt-queue overlay mount triggers a fit that shrinks the
+        // terminal, possibly stealing focus during layout reflow.
+        const focusAfter = (() => {
+          try {
+            const el = document.activeElement;
+            const tag = el?.tagName || 'NULL';
+            const cls = (el?.className || '').toString().slice(0, 60);
+            return tag + (cls ? '.' + cls : '');
+          } catch { return 'ERR'; }
+        })();
+        console.warn('[FocusDiag2026-05][safeFit-resize] tab=' + tabId.slice(-12) + ' before=' + focusBefore + ' after=' + focusAfter + ' dims=' + colsBefore + 'x' + rowsBefore + '→' + colsAfter + 'x' + rowsAfter + ' ts=' + Date.now());
         ipcRenderer.send('terminal:resize', tabId, dims.cols, dims.rows);
       }
     } catch (e) {
@@ -634,6 +673,9 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
       if (exitedTabId === tabId && xtermInstance.current) {
         xtermInstance.current.write('\r\n\r\n[Process completed]');
       }
+      // Reset the /effort once-per-process sentinel on PTY exit so the next
+      // fresh Claude spawn in this tab starts clean.
+      if (exitedTabId === tabId) _effortSentForTab.delete(tabId);
     };
 
     // Session Bridge: receive session ID from StatusLine bridge watcher.
@@ -658,6 +700,37 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
       getSetClaudeSessionId()(tabId, data.sessionId, 'bridge');
       // Resume confirmed — clear pending flag.
       clearPendingResume(tabId);
+      // Bridge sees a live Claude session in this tab → the tab IS a Claude tab,
+      // regardless of how it was launched (typed `claude` in a green devServer
+      // tab, restored on boot, etc). Promote commandType so the Run-after
+      // overlay (gated on commandType==='claude') and tab color are correct.
+      // Без этого зелёная вкладка с запущенным внутри Claude оставалась
+      // commandType='devServer' и оверлей не показывался. См. fact-tabs.md fix #2.
+      // GUARD: session-detected fires on EVERY bridge sync (~1-2s). setTabCommandType
+      // unconditionally does set(new Map)+saveTabs (SQLite write), so calling it
+      // every sync = re-render+I/O storm (CLAUDE.md Zustand anti-pattern). Only
+      // call when it would actually change the type.
+      {
+        const curType = useWorkspaceStore.getState().openProjects;
+        let needsPromote = false;
+        for (const [, ws] of curType) {
+          const t = ws.tabs.get(tabId);
+          if (t) { needsPromote = t.commandType !== 'claude'; break; }
+        }
+        if (needsPromote) getSetTabCommandType()(tabId, 'claude');
+      }
+      // Bridge sees a live session in this tab → Claude IS running, even if we
+      // missed the OSC 133 command-started (process restored on boot, launched
+      // in a background tab, or resumed without the claude-c hotkey). Assert
+      // alive so the Run-after overlay shows. Без этого overlay висел HIDDEN
+      // пока юзер не передёрнет Stop+continue. См. fact-prompt-queue.md.
+      // Functional updater + prev-guard avoids stale-closure read (effect deps
+      // are [tabId], so a captured `claudeProcessAlive` would always be false).
+      claudeProcessAliveRef.current = true;
+      setClaudeProcessAlive((prev) => {
+        if (!prev) console.warn('[QueueGate:proc] tab=' + tabId.slice(-8) + ' bridge session-detected → alive=true (OSC B may have been missed)');
+        return true;
+      });
     };
 
     // Fresh Claude process started for this tab (new PID seen in bridge cache).
@@ -676,6 +749,56 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
     // - claude TUI is fresh start → inject `/effort N` + arm cleanup
     const handleProcessStarted = (_: any, data: { tabId: string; sessionId: string; claudePid: number }) => {
       if (data.tabId !== tabId) return;
+      // Note: NO sentinel reset here. tui-ready fires BEFORE Bridge:Fresh
+      // (process-started), so resetting here would clobber the tui-ready
+      // mark and let Bridge:Fresh send a second /effort — exactly the bug
+      // we're fixing. Sentinel is cleared only on PTY exit (handleExit).
+      // [EffortDiag2026-05] handler entry counter — written to log BEFORE any
+      // early-return / async work. If the file shows N≥2 calls per fresh tab,
+      // main emitted process-started multiple times (Bridge:Fresh ran twice).
+      // If only N=1 yet two send-command lines appear in main log, the second
+      // sender lives outside handleProcessStarted.
+      const hCount = (_effortHandlerCalls.get(tabId) || 0) + 1;
+      _effortHandlerCalls.set(tabId, hCount);
+      console.warn('[EffortDiag2026-05][HANDLER-ENTRY] tab=' + tabId.slice(-12) + ' callN=' + hCount + ' pid=' + data.claudePid + ' sessionId=' + (data.sessionId || 'null').substring(0, 8) + ' ts=' + Date.now());
+
+      // [FocusDiag2026-05] periodic focus snapshot — first 3 seconds after fresh
+      // Claude spawn, every 200ms. If the user sees focus disappear ~1s after
+      // launch, the log shows exactly when activeElement stops being the xterm
+      // canvas. Pair the timestamp with the closest preceding [safeFit] or
+      // [Overlay:MOUNT] line in the same log file.
+      const _focusStart = Date.now();
+      const _focusSampler = setInterval(() => {
+        const elapsed = Date.now() - _focusStart;
+        if (elapsed > 3000) { clearInterval(_focusSampler); return; }
+        try {
+          const el = document.activeElement;
+          const tag = el?.tagName || 'NULL';
+          const cls = (el?.className || '').toString().slice(0, 60);
+          console.warn('[FocusDiag2026-05][sample] tab=' + tabId.slice(-12) + ' t+' + elapsed + 'ms active=' + tag + (cls ? '.' + cls : '') + ' ts=' + Date.now());
+        } catch (e) { console.warn('[FocusDiag2026-05][sample-err] ' + String(e)); }
+      }, 200);
+      // Fresh Claude PID for this tab → unambiguously alive. Assert it before
+      // the effort-inject early-returns below so the Run-after overlay gate is
+      // correct even when the OSC 133 command-started was missed (restore /
+      // background-tab launch). Idempotent with the OSC-driven path. Functional
+      // updater avoids stale-closure read (effect deps are [tabId]).
+      // Also promote commandType → 'claude' (fresh PID = Claude owns this tab)
+      // and sync the alive-ref so command-type auto-detection is suppressed.
+      // Guard against redundant set()+saveTabs (see handleSessionDetected).
+      {
+        let needsPromote = false;
+        for (const [, ws] of useWorkspaceStore.getState().openProjects) {
+          const t = ws.tabs.get(tabId);
+          if (t) { needsPromote = t.commandType !== 'claude'; break; }
+        }
+        if (needsPromote) getSetTabCommandType()(tabId, 'claude');
+      }
+      claudeProcessAliveRef.current = true;
+      setClaudeProcessAlive((prev) => {
+        if (!prev) console.warn('[QueueGate:proc] tab=' + tabId.slice(-8) + ' process-started → alive=true');
+        return true;
+      });
       const eff = useUIStore.getState().defaultClaudeEffort;
       const pending = getPendingResume(tabId);
       const isResume = pending !== null;
@@ -724,12 +847,56 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
       // we wait *inside* that function rather than blindly stalling 800ms here.
       // The /effort dialog auto-confirmer in main handles the "Change effort level?"
       // prompt that may appear on a fresh directory.
+      // Once-per-process guard: if tui-ready or manual click already sent
+      // /effort for this tab, skip the Bridge:Fresh fallback inject. Without
+      // this, a single fresh spawn would land TWO /effort lines (tui-ready
+      // ~13:37:46, Bridge:Fresh ~13:37:48 in the prod trace).
+      const sentinel = _effortSentForTab.get(tabId);
+      if (sentinel) {
+        _effortDiag(tabId, '⛔ INJECT SKIPPED', 'already sent via ' + sentinel.via + ' at +' + (Date.now() - sentinel.at) + 'ms');
+        console.warn('[Terminal:EffortInject] tab=' + tabId.slice(-12) + ' SKIP — already sent via ' + sentinel.via);
+        return;
+      }
+      _effortSentForTab.set(tabId, { at: Date.now(), via: 'bridge-fresh' });
       _effortDiag(tabId, '🚀 INJECT FIRED', '/effort ' + eff + ' — sending to claude:send-command');
+      // [EffortDiag2026-05] invoke-fire counter — written SYNCHRONOUSLY in the
+      // same tick as the invoke. Pair with HANDLER-ENTRY: callN=K must equal
+      // invokeN=K. If invokeN < handlerN, an early-return cut off the inject.
+      // If invokeN > handlerN — impossible, would expose a code path bug.
+      const iCount = (_effortInjectCalls.get(tabId) || 0) + 1;
+      _effortInjectCalls.set(tabId, iCount);
+      console.warn('[EffortDiag2026-05][INVOKE-FIRE] tab=' + tabId.slice(-12) + ' invokeN=' + iCount + ' handlerN=' + (_effortHandlerCalls.get(tabId) || 0) + ' effort=' + eff + ' ts=' + Date.now());
       ipcRenderer.invoke('claude:send-command', tabId, '/effort ' + eff).then(() => {
         _effortDiag(tabId, '✅ INJECT COMPLETED', '/effort ' + eff + ' — Claude acknowledged');
       }).catch((e: unknown) => {
         _effortDiag(tabId, '❌ INJECT FAILED', String(e));
         console.error('[Terminal:EffortInject] failed', e);
+      });
+    };
+
+    // Early "Claude TUI ready" signal — fires the moment Claude renders ⏵ in
+    // the PTY stream, 2-6 seconds BEFORE Bridge:Fresh in prod logs. We send
+    // /effort here so the user doesn't sit at a ready prompt with no effort
+    // line for several seconds and then manually click — that race produced
+    // the duplicate /effort. The sentinel makes the later Bridge:Fresh path
+    // (handleProcessStarted) a no-op once this has fired.
+    const handleTuiReady = (_: any, data: { tabId: string; ts: number }) => {
+      if (data.tabId !== tabId) return;
+      if (_effortSentForTab.has(tabId)) return; // already sent (manual click or earlier tui-ready)
+      const eff = useUIStore.getState().defaultClaudeEffort;
+      if (!eff || eff === 'none') return;
+      // Resume guard: same logic as Bridge:Fresh path — effort survives in
+      // Claude TUI memory across --resume so we have nothing to apply.
+      const pending = getPendingResume(tabId);
+      if (pending !== null) {
+        console.warn('[Terminal:TuiReady] tab=' + tabId.slice(-12) + ' SKIP — resume in flight');
+        return;
+      }
+      _effortSentForTab.set(tabId, { at: Date.now(), via: 'tui-ready' });
+      console.warn('[Terminal:TuiReady] tab=' + tabId.slice(-12) + ' /effort ' + eff + ' (early path, before Bridge:Fresh)');
+      ipcRenderer.invoke('claude:send-command', tabId, '/effort ' + eff).catch((e: unknown) => {
+        console.error('[Terminal:TuiReady] inject failed', e);
+        _effortSentForTab.delete(tabId); // allow Bridge:Fresh fallback to retry
       });
     };
 
@@ -772,6 +939,7 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
     ipcRenderer.on('terminal:exit', handleExit);
     ipcRenderer.on('claude:session-detected', handleSessionDetected);
     ipcRenderer.on('claude:process-started', handleProcessStarted);
+    ipcRenderer.on('claude:tui-ready', handleTuiReady);
     ipcRenderer.on('claude:status-session-detected', handleStatusSessionDetected);
     ipcRenderer.on('gemini:session-detected', handleGeminiSessionDetected);
     ipcRenderer.on('claude-agent:status', handleClaudeAgentStatus);
@@ -1079,16 +1247,25 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
         const devServerMatch = fullLine.match(/\b(npm|npx|yarn|pnpm|bun)\s+(run\s+)?(dev|start|serve|watch)\b/i);
         const geminiMatch = fullLine.match(/\bgemini(\s|$)/i);
 
+        // Suppress devServer/gemini auto-detection while a Claude process is
+        // alive in this tab. When Claude holds the foreground, getCurrentCommand()
+        // reads CLAUDE'S OWN OUTPUT (e.g. it renders `⏺ Bash(npm run dev …)` for a
+        // Bash tool call) — the regex below would match that and wrongly downgrade
+        // commandType claude→devServer, killing the Run-after overlay + tab color.
+        // claudeProcessAliveRef is the synchronous liveness signal. See fix #2.
+        const claudeAliveNow = claudeProcessAliveRef.current;
         if (devServerMatch || geminiMatch) {
           const claudeSess = getClaudeSessionId(tabId);
           const preview = fullLine.length > 80 ? fullLine.slice(0, 80) + '…' : fullLine;
-          console.warn('[CmdDetect:initTerminal] tab=' + tabId.slice(-8) + ' match=' + (devServerMatch ? 'devServer' : 'gemini') + ' bufType=' + term.buffer.active.type + ' claudeSess=' + (claudeSess ? claudeSess.slice(0, 8) : 'null') + ' fullLine="' + preview.replace(/"/g, '\\"') + '"');
+          console.warn('[CmdDetect:initTerminal] tab=' + tabId.slice(-8) + ' match=' + (devServerMatch ? 'devServer' : 'gemini') + ' bufType=' + term.buffer.active.type + ' claudeAlive=' + claudeAliveNow + ' claudeSess=' + (claudeSess ? claudeSess.slice(0, 8) : 'null') + ' fullLine="' + preview.replace(/"/g, '\\"') + '"');
         }
 
-        if (devServerMatch) {
-          getSetTabCommandType()(tabId, 'devServer');
-        } else if (geminiMatch) {
-          getSetTabCommandType()(tabId, 'gemini');
+        if (!claudeAliveNow) {
+          if (devServerMatch) {
+            getSetTabCommandType()(tabId, 'devServer');
+          } else if (geminiMatch) {
+            getSetTabCommandType()(tabId, 'gemini');
+          }
         }
 
         // --- CASE 1: claude (new session) - must end with exactly "claude" ---
@@ -1206,8 +1383,16 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
         }
 
         // --- CASE 5: claude --resume <ID> (direct resume command) ---
+        // Require a FULL 36-char UUID, not `{8,}`. fullLine is scraped off the
+        // xterm screen buffer (getCurrentCommand); a long resume command can
+        // wrap across visual rows or be read mid-render, leaving a prefix like
+        // "00581613-b3". The old `{8,}` floor happily matched that partial and
+        // userIntercept persisted a truncated id, clobbering the full UUID the
+        // bridge had. Full-UUID anchor → a partial line just doesn't match, and
+        // we fall back to the bridge's authoritative capture. See
+        // fact-session-capture.md::Truncated --resume scrape.
         console.log('[Claude Intercept] Checking for --resume pattern in:', fullLine);
-        const resumeMatch = fullLine.match(/claude\s+.*--resume\s+([a-f0-9-]{8,})/i);
+        const resumeMatch = fullLine.match(/--resume\s+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b/i);
         console.log('[Claude Intercept] Resume match result:', resumeMatch);
         if (resumeMatch) {
           const sessionId = resumeMatch[1];
@@ -1328,6 +1513,7 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
       ipcRenderer.removeListener('terminal:exit', handleExit);
       ipcRenderer.removeListener('claude:session-detected', handleSessionDetected);
       ipcRenderer.removeListener('claude:process-started', handleProcessStarted);
+      ipcRenderer.removeListener('claude:tui-ready', handleTuiReady);
       ipcRenderer.removeListener('claude:status-session-detected', handleStatusSessionDetected);
       ipcRenderer.removeListener('gemini:session-detected', handleGeminiSessionDetected);
       ipcRenderer.removeListener('claude-agent:status', handleClaudeAgentStatus);
@@ -1581,18 +1767,24 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
           const devServerMatch = fullLine.match(/\b(npm|npx|yarn|pnpm|bun)\s+(run\s+)?(dev|start|serve|watch)\b/i);
           const geminiMatch = fullLine.match(/\bgemini(\s|$)/i);
 
+          // Same guard as initTerminal block: don't let Claude's rendered
+          // output (`⏺ Bash(npm run dev …)`) downgrade commandType while a
+          // Claude process is alive. See fix #2 / fact-tabs.md.
+          const claudeAliveNow = claudeProcessAliveRef.current;
           if (devServerMatch || geminiMatch) {
             const claudeSess = getClaudeSessionId(tabId);
             const preview = fullLine.length > 80 ? fullLine.slice(0, 80) + '…' : fullLine;
-            console.warn('[CmdDetect:reattach] tab=' + tabId.slice(-8) + ' match=' + (devServerMatch ? 'devServer' : 'gemini') + ' bufType=' + term.buffer.active.type + ' claudeSess=' + (claudeSess ? claudeSess.slice(0, 8) : 'null') + ' fullLine="' + preview.replace(/"/g, '\\"') + '"');
+            console.warn('[CmdDetect:reattach] tab=' + tabId.slice(-8) + ' match=' + (devServerMatch ? 'devServer' : 'gemini') + ' bufType=' + term.buffer.active.type + ' claudeAlive=' + claudeAliveNow + ' claudeSess=' + (claudeSess ? claudeSess.slice(0, 8) : 'null') + ' fullLine="' + preview.replace(/"/g, '\\"') + '"');
           }
 
-          if (devServerMatch) {
-            log.commands('Detected devServer command, setting commandType');
-            getSetTabCommandType()(tabId, 'devServer');
-          } else if (geminiMatch) {
-            log.commands('Detected gemini command, setting commandType');
-            getSetTabCommandType()(tabId, 'gemini');
+          if (!claudeAliveNow) {
+            if (devServerMatch) {
+              log.commands('Detected devServer command, setting commandType');
+              getSetTabCommandType()(tabId, 'devServer');
+            } else if (geminiMatch) {
+              log.commands('Detected gemini command, setting commandType');
+              getSetTabCommandType()(tabId, 'gemini');
+            }
           }
 
           // --- Gemini interception (mirrors initTerminal logic) ---
@@ -1743,8 +1935,10 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
           }
 
           // --- CASE 5: claude --resume <ID> (direct resume command) ---
+          // Full-UUID anchor (see CASE 5 in the sibling handler above) — guards
+          // against truncated screen-buffer scrapes persisting a partial id.
           console.log('[Claude Intercept 2] Checking for --resume pattern in:', fullLine);
-          const resumeMatch = fullLine.match(/claude\s+.*--resume\s+([a-f0-9-]{8,})/i);
+          const resumeMatch = fullLine.match(/--resume\s+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b/i);
           console.log('[Claude Intercept 2] Resume match result:', resumeMatch);
           if (resumeMatch) {
             const sessionId = resumeMatch[1];

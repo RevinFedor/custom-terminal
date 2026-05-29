@@ -102,3 +102,13 @@ Claude Code с версии 2.1.110 (16 апреля 2026) использует 
 
 Фикс — env `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1` в PTY shell env (добавлен Anthropic в Claude 2.1.132, май 2026). Возвращает Claude к scrollback-renderer'у, alt-screen toggle перестаёт случаться, DEC ?2004 держится стабильно. Применяется к всем PTY безопасно — не-Claude процессы env игнорируют. См. [`fix-paste-bracket-mode-loss.md`](fix-paste-bracket-mode-loss.md).
 
+## 10. Prompt-ready как глобальный сигнал
+
+Существующий handshake-детектор `⏵`/`>` (Section 2) включён только в `claudeState === 'WAITING_PROMPT'` ветке — то есть **только** когда мы запускаем Claude чтобы отправить ему конкретный prompt по handshake-протоколу. Для всех остальных табов и сценариев (ручной запуск, Resume, MCP-delegate, mobile-инициированный create) детектор молчит — после `claudeState.delete(tabId)` поток PTY-данных проходит мимо.
+
+При работе mobile-web с CLAUDE-PTY-табами этот сигнал нужен расширенно: phone-композер должен знать когда Claude **действительно** готов принимать ввод. Текущий критерий «процесс жив» через `bridgeKnownSessions.has(tabId)` опережает реальную готовность TUI на 1-6 секунд — bridge.json пишется при инициализации, **до** того как Ink отрисовал prompt. Send в этот промежуток приходит в недо-инициализированный input.
+
+Решение — глобальный детектор поверх существующего: при каждом PTY-data event для таба у которого `bridgeKnownSessions.has` и `claudePromptReady` ещё не выставлен, ищем `⏵`/`>` в данных. Первое попадание → `claudePromptReady.add(tabId)` + WS snapshot для mobile. Локальный handshake-state не трогается — продолжает работать как раньше, просто теперь есть второй reader того же сигнала.
+
+`claude:get-presence` IPC использует флаг для различения `starting` (process есть, prompt ещё нет) и `active` (готов к вводу). Cleanup в трёх местах: `clearBridgeTab` (Claude exit через Ctrl+C×2), PTY `onExit`, `terminal:kill`. См. `fact-mobile-claude-pty.md::Lifecycle states`.
+

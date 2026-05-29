@@ -76,7 +76,13 @@ const DISCOVERY_FILE = path.join(DISCOVERY_DIR, 'web-server-' + process.pid + '.
 let httpServer = null;
 let wss = null;
 let token = null;
-// tabId → Set<WebSocket>
+// tabId → Set<Sink>. A Sink is the common interface for both transports:
+//   { kind:'ws'|'sse', send(str):void, isAlive():bool, close():void }
+// WebSocket and SSE both register here so webBroadcast() fans out to either
+// without caring which transport the client used. Yandex/Chrome anti-tracker
+// extensions silently block ws:// to private IPs (deterministically observed:
+// fetch 200 but WS TIMEOUT rs=0, while curl gets 101) — SSE over plain GET is
+// the reliable fallback. See fact-mobile-web.md::SSE transport.
 const subscribers = new Map();
 // pending bridge requests to renderer: requestId → { resolve, reject, timer }
 const pendingBridge = new Map();
@@ -221,6 +227,65 @@ async function handleApi(req, res, parsed, sdkSessions) {
     return sendJson(res, 200, { ok: true, lanIp: getLanIp() });
   }
 
+  // ───────── SSE live channel (WebSocket replacement) ─────────
+  // EventSource over plain HTTP GET. Yandex/Chrome anti-tracker extensions
+  // block ws:// to private IPs but NOT text/event-stream. Same subscriber
+  // registry + webBroadcast() as WS, so main.js fan-out is transport-agnostic.
+  // Auth via ?token= (EventSource can't set headers, same as WS handshake).
+  if (parsed.pathname === '/api/events' && req.method === 'GET') {
+    if (!checkAuth(req)) return sendJson(res, 401, { error: 'unauthorized' });
+    const tabId = parsed.query.tabId ? decId(String(parsed.query.tabId)) : null;
+    if (!tabId) return sendJson(res, 400, { error: 'tabId required' });
+
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache, no-transform',
+      'Connection': 'keep-alive',
+      // Disable proxy buffering (nginx etc.) so events flush immediately.
+      'X-Accel-Buffering': 'no',
+    });
+    // Initial comment + retry hint. EventSource auto-reconnects on drop using
+    // this interval; we still keep it modest since the network is LAN.
+    res.write('retry: 2000\n\n');
+
+    const sink = {
+      kind: 'sse',
+      send: (str) => { try { res.write('data: ' + str + '\n\n'); } catch {} },
+      isAlive: () => !res.writableEnded && !res.destroyed,
+      close: () => { try { res.end(); } catch {} },
+    };
+    subscribe(tabId, sink);
+    console.log('[WebSSE:Open] tab=' + String(tabId).slice(-12) + ' from=' + (req.socket.remoteAddress || '?'));
+
+    // Initial snapshot — mirror the WS upgrade path so the client renders
+    // immediately without waiting for the next broadcast.
+    const session = sdkSessions.get(tabId);
+    sink.send(JSON.stringify({
+      type: 'snapshot',
+      tabId,
+      sessionId: session?.sessionId || null,
+      busy: !!session,
+    }));
+    startClaudeTabWatcher(tabId).catch(() => {});
+
+    // Heartbeat: SSE connections die silently behind some proxies/radios.
+    // A comment line every 25s keeps the socket warm and lets the client's
+    // onerror fire promptly if the pipe is actually dead.
+    const hb = setInterval(() => {
+      try { res.write(': hb\n\n'); } catch {}
+    }, 25000);
+
+    const cleanup = () => {
+      clearInterval(hb);
+      unsubscribeAll(sink);
+      releaseClaudeWatchersIfOrphan();
+      console.log('[WebSSE:Close] tab=' + String(tabId).slice(-12));
+    };
+    req.on('close', cleanup);
+    req.on('error', cleanup);
+    return; // keep the response open
+  }
+
   if (!checkAuth(req)) return sendJson(res, 401, { error: 'unauthorized' });
 
   const projectManager = require('./project-manager');
@@ -346,6 +411,23 @@ async function handleApi(req, res, parsed, sdkSessions) {
       console.log('[WebServer] 404 project not found: ' + projectId + ' (not in DB, not in live Zustand)');
       return sendJson(res, 404, { error: 'project not found', projectId });
     }
+    // For PTY+Claude tabs (commandType='claude' && tabType!='claude-sdk')
+    // ask renderer for sessionStatus in a single batch — cheap because
+    // renderer holds the live `claudeCliActive` Map. SDK tabs have no
+    // sessionStatus concept here; we keep null for them.
+    let statusMap = new Map();
+    const ptyClaudeIds = (project.tabs || [])
+      .filter(t => t.commandType === 'claude' && (t.tabType || 'terminal') !== 'claude-sdk')
+      .map(t => t.tabId);
+    if (ptyClaudeIds.length > 0) {
+      try {
+        const data = await bridgeRequest('getClaudeTabStatusBatch', { tabIds: ptyClaudeIds }, 1500);
+        if (data?.statuses) for (const [id, st] of Object.entries(data.statuses)) statusMap.set(id, st);
+      } catch (e) {
+        // Bridge unavailable — every PTY+Claude tab will show no badge until
+        // user opens it (per-tab GET /status still works on demand).
+      }
+    }
     const tabs = (project.tabs || []).map(t => {
       // Cheap timeline-count: only computed if the tab has a session file we
       // can find. parseTimelineUuids reads the JSONL once and returns the
@@ -365,6 +447,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
         cwd: t.cwd,
         claudeSessionId: t.claudeSessionId,
         timelineCount,
+        sessionStatus: statusMap.get(t.tabId) || null,
         // Live state if SDK session is active in main right now
         live: t.tabId && sdkSessions.has(t.tabId) ? {
           sessionId: sdkSessions.get(t.tabId).sessionId,
@@ -387,6 +470,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
   }
 
   // Send prompt to SDK tab — invokes the same handler the desktop UI uses.
+  // For PTY+Claude tabs (commandType==='claude') routes through safePasteAndSubmit
+  // instead. Mobile uses the same URL for both; routing is by tab type.
   m = parsed.pathname.match(/^\/api\/sdk-tabs\/([^/]+)\/send$/);
   if (m && req.method === 'POST') {
     const tabId = decId(m[1]);
@@ -394,12 +479,48 @@ async function handleApi(req, res, parsed, sdkSessions) {
       const body = await readBody(req);
       const { prompt, model, effort, thinking, cwd } = body;
       if (!prompt) return sendJson(res, 400, { error: 'prompt required' });
-      // Call sdkStartQuery via main's existing wiring — bounce through bridge
-      // so we don't depend on whatever the live tab's currently-selected model
-      // is (renderer is the source of truth for that).
-      const data = await bridgeRequest('sendSDKMessage', {
+      // Single bridge round-trip — renderer dispatches by tab.tabType/commandType.
+      // Earlier this endpoint did TWO round-trips (status check + send), adding
+      // ~50ms per phone send on top of the actual PTY paste latency.
+      const data = await bridgeRequest('sendMessageAuto', {
         tabId, prompt, model, effort, thinking, cwd,
       });
+      return sendJson(res, 200, data);
+    } catch (e) {
+      return sendJson(res, 500, { error: String(e.message) });
+    }
+  }
+
+  // Create PTY+Claude tab in a project (mobile button "+ New Claude terminal").
+  m = parsed.pathname.match(/^\/api\/projects\/([^/]+)\/claude-tabs$/);
+  if (m && req.method === 'POST') {
+    try {
+      const data = await bridgeRequest('createClaudeTab', { projectId: decId(m[1]) });
+      return sendJson(res, 200, data);
+    } catch (e) {
+      return sendJson(res, 500, { error: String(e.message) });
+    }
+  }
+
+  // Resume inactive Claude session (PTY tab whose `claude` process exited).
+  m = parsed.pathname.match(/^\/api\/sdk-tabs\/([^/]+)\/resume$/);
+  if (m && req.method === 'POST') {
+    const tabId = decId(m[1]);
+    try {
+      const data = await bridgeRequest('resumeClaudeTab', { tabId });
+      return sendJson(res, 200, data);
+    } catch (e) {
+      return sendJson(res, 500, { error: String(e.message) });
+    }
+  }
+
+  // Status snapshot for a PTY+Claude tab: active | busy | inactive.
+  // Mobile polls this on chat-open to decide Resume-banner visibility.
+  m = parsed.pathname.match(/^\/api\/sdk-tabs\/([^/]+)\/status$/);
+  if (m && req.method === 'GET') {
+    const tabId = decId(m[1]);
+    try {
+      const data = await bridgeRequest('getClaudeTabStatus', { tabId });
       return sendJson(res, 200, data);
     } catch (e) {
       return sendJson(res, 500, { error: String(e.message) });
@@ -468,7 +589,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
     }
   }
 
-  // Stop SDK stream
+  // Stop SDK stream OR shut down PTY+Claude session (Ctrl+C Ctrl+C Ctrl+D).
   m = parsed.pathname.match(/^\/api\/sdk-tabs\/([^/]+)\/stop$/);
   if (m && req.method === 'POST') {
     const tabId = decId(m[1]);
@@ -478,7 +599,13 @@ async function handleApi(req, res, parsed, sdkSessions) {
       sdkSessions.delete(tabId);
       return sendJson(res, 200, { stopped: true });
     }
-    return sendJson(res, 200, { stopped: false, reason: 'no active session' });
+    // Not an SDK tab — maybe it's PTY+Claude. Try stop via bridge.
+    try {
+      const data = await bridgeRequest('stopClaudeTab', { tabId }, 2000);
+      return sendJson(res, 200, { stopped: true, ...data });
+    } catch (e) {
+      return sendJson(res, 200, { stopped: false, reason: 'no active session' });
+    }
   }
 
   // SDK params (model/effort/thinking) for a tab — read & update.
@@ -735,23 +862,264 @@ function serveStatic(req, res, parsed) {
 
 // ───────── WS pub/sub ─────────
 
-function subscribe(tabId, ws) {
+function subscribe(tabId, sink) {
   if (!subscribers.has(tabId)) subscribers.set(tabId, new Set());
-  subscribers.get(tabId).add(ws);
+  subscribers.get(tabId).add(sink);
+  console.log('[WebSub:Subscribe] tab=' + String(tabId).slice(-12) + ' kind=' + sink.kind + ' total=' + subscribers.get(tabId).size + ' tabs=' + subscribers.size);
 }
-function unsubscribeAll(ws) {
-  for (const set of subscribers.values()) set.delete(ws);
+function unsubscribeAll(sink) {
+  let removed = 0;
+  for (const set of subscribers.values()) { if (set.delete(sink)) removed++; }
+  if (removed) console.log('[WebSub:Unsubscribe] kind=' + (sink.kind || '?') + ' removed=' + removed + ' remainingTabs=' + Array.from(subscribers.entries()).filter(([_, s]) => s.size > 0).length);
 }
 
-// Called from main.js when SDK fires events. Cheap O(n) over WS clients
-// subscribed to that specific tabId — usually 0-1 phone connected.
-function webBroadcast(tabId, payload) {
-  const set = subscribers.get(tabId);
-  if (!set || set.size === 0) return;
-  const msg = JSON.stringify({ tabId, ...payload });
-  for (const ws of set) {
-    try { if (ws.readyState === 1) ws.send(msg); } catch {}
+// Wrap a raw WebSocket as a Sink.
+function wsSink(ws) {
+  return {
+    kind: 'ws',
+    send: (str) => { if (ws.readyState === 1) ws.send(str); },
+    isAlive: () => ws.readyState === 1,
+    close: () => { try { ws.close(); } catch {} },
+    _ws: ws,
+  };
+}
+
+// Stop watcher AND drop pending-promotion slot for any tab whose last
+// subscriber (ws OR sse) disconnected. Both maps may hold orphans. Shared by
+// the WS close/error handlers and the SSE req-close handler.
+function releaseClaudeWatchersIfOrphan() {
+  const allTabIds = new Set([
+    ...claudeTabWatchers.keys(),
+    ...claudeTabWatcherPending,
+  ]);
+  for (const tid of allTabIds) {
+    const set = subscribers.get(tid);
+    if (!set || set.size === 0) stopClaudeTabWatcher(tid);
   }
+}
+
+// Called from main.js when SDK/PTY fires events. Cheap O(n) over clients
+// subscribed to that specific tabId — usually 0-1 phone connected. Transport
+// (ws/sse) is opaque here; each Sink knows how to write itself.
+//
+// Logging is LIFECYCLE-ONLY. The 'message' type fires once per stream chunk —
+// dozens per Claude turn — and with no phone connected (the 99% desktop case)
+// would flood dev.log with [WebBcast:DROP] type=message on every token. We
+// only log the transitions worth correlating (snapshot/busy/done/bridge-update
+// + the no-subscriber drop for those), never the per-chunk message fan-out.
+// See CLAUDE.md::Логирование (no spam in hot paths).
+const BCAST_LOG_TYPES = new Set(['snapshot', 'busy', 'done', 'bridge-update']);
+function webBroadcast(tabId, payload) {
+  const type = payload && payload.type;
+  const loggable = BCAST_LOG_TYPES.has(type);
+  const set = subscribers.get(tabId);
+  if (!set || set.size === 0) {
+    if (loggable) console.log('[WebBcast:DROP] tab=' + String(tabId).slice(-12) + ' type=' + type + ' noSubscribers (registered=' + subscribers.size + ')');
+    return;
+  }
+  const msg = JSON.stringify({ tabId, ...payload });
+  let sent = 0;
+  const dead = [];
+  for (const sink of set) {
+    try {
+      if (sink.isAlive()) { sink.send(msg); sent++; }
+      else dead.push(sink);
+    } catch { dead.push(sink); }
+  }
+  for (const d of dead) set.delete(d);
+  if (loggable || dead.length) {
+    console.log('[WebBcast:SEND] tab=' + String(tabId).slice(-12) + ' type=' + type + ' to=' + sent + '/' + (sent + dead.length) + (dead.length ? ' (pruned ' + dead.length + ' dead)' : ''));
+  }
+}
+
+// ───────── JSONL tail-watchers for PTY+Claude tabs ─────────
+// SDK tabs get their live events via webBroadcast() called from main on each
+// SDK message. PTY+Claude tabs write to a JSONL file (~/.claude/projects/...) —
+// the mobile client needs the same {type:'message'} stream. We fs.watch the
+// resolved JSONL path and incrementally read new bytes.
+//
+// Activated on first WS subscribe to a tabId whose commandType==='claude'.
+// Released when all subscribers for that tab disconnect.
+//
+// tabId -> { sessionId, filePath, offset, watcher, leftover, timer, inflight, attempts }
+const claudeTabWatchers = new Map();
+// Tabs whose WS is subscribed but Claude hasn't produced a sessionId yet.
+// When sessionId arrives via main's `claude:session-detected` IPC path we
+// promote them to live watchers — no polling, no timeouts. The set is also
+// consulted on bridgeReady so we don't miss a sessionId that materialised
+// before subscribe.
+const claudeTabWatcherPending = new Set();
+
+// Called from main.js whenever a claude session id is freshly attached to a
+// tab (Bridge:Fresh / Bridge:PID / explicit resume / fork). Promotes any
+// pending watcher for this tabId from "waiting for sessionId" → live fs.watch.
+// Idempotent: a no-op if no pending entry exists.
+function notifyClaudeSessionAvailable(tabId) {
+  if (!claudeTabWatcherPending.has(tabId)) return;
+  claudeTabWatcherPending.delete(tabId);
+  startClaudeTabWatcher(tabId).catch((e) => {
+    console.warn('[ClaudeWatcher] late-start failed for', tabId.slice(-12), e?.message);
+  });
+}
+
+async function startClaudeTabWatcher(tabId) {
+  if (claudeTabWatchers.has(tabId)) return;
+  let status;
+  try {
+    status = await bridgeRequest('getClaudeTabStatus', { tabId }, 2000);
+  } catch {
+    return; // tab not open in renderer or bridge unavailable — skip
+  }
+  if (status?.commandType !== 'claude') return; // not a PTY+Claude tab
+  if (!status.sessionId || !findSessionFile) {
+    // No sessionId yet — Claude is still booting. Park the tabId; main.js will
+    // call notifyClaudeSessionAvailable(tabId) the moment session-detected
+    // fires (deterministic event from SessionBridge — never polled).
+    claudeTabWatcherPending.add(tabId);
+    console.log('[ClaudeWatcher] parked tabId=' + tabId.slice(-12) + ' waiting for sessionId event');
+    return;
+  }
+  const found = findSessionFile(status.sessionId, status.cwd);
+  if (!found) {
+    // SessionId is known but the JSONL file isn't on disk yet — Claude wrote
+    // the bridge.json moments before the first JSONL line landed (it batches
+    // initial writes). Watch the parent directory ONCE for the file to
+    // appear, then promote. No polling — fs.watch on the dir is event-driven.
+    if (claudeTabWatcherPending.has(tabId)) return;
+    claudeTabWatcherPending.add(tabId);
+    const projectDir = path.dirname(path.join(require('os').homedir(),
+      '.claude', 'projects', 'placeholder', 'placeholder.jsonl'));
+    let dirWatcher = null;
+    const tryPromote = () => {
+      if (findSessionFile(status.sessionId, status.cwd)) {
+        try { dirWatcher?.close(); } catch {}
+        claudeTabWatcherPending.delete(tabId);
+        startClaudeTabWatcher(tabId).catch(() => {});
+      }
+    };
+    try {
+      // Watch the projects/ root since cwd-encoded subdir may itself not
+      // exist yet for a brand-new project.
+      const watchDir = path.join(require('os').homedir(), '.claude', 'projects');
+      dirWatcher = fs.watch(watchDir, { recursive: true }, (_, fname) => {
+        if (fname && fname.includes(status.sessionId)) tryPromote();
+      });
+    } catch (e) {
+      console.warn('[ClaudeWatcher] dir-watch failed', e?.message);
+    }
+    return;
+  }
+  const filePath = found.filePath;
+  // Start at current EOF when there's already some history (user got it via
+  // /history REST endpoint on chat open). For brand-new sessions whose first
+  // JSONL bytes haven't been written yet, the file would have been "not found"
+  // above; here size >= 1 record means /history already returned it.
+  // Always-from-EOF policy avoids duplicate messages on the mobile reducer
+  // (which would still dedupe by uuid, but at the cost of unnecessary WS
+  // bytes). The race window where mobile has loaded /history but JSONL grew
+  // between that read and our fs.stat is small (~ms); any messages from that
+  // window arrive via the next turn's WS push because reducer.apply is
+  // idempotent on uuid.
+  let offset = 0;
+  try { offset = fs.statSync(filePath).size; } catch { return; }
+  const entry = {
+    sessionId: status.sessionId,
+    filePath,
+    offset,
+    watcher: null,
+    timer: null,
+    inflight: false,        // guard against re-entrant readDelta
+    leftover: '',           // partial last line carried to next read
+  };
+
+  // Send initial snapshot — phone needs current sessionStatus right after connect.
+  webBroadcast(tabId, { type: 'snapshot', sessionId: status.sessionId, busy: status.status === 'busy', sessionStatus: status.status });
+
+  const readDelta = () => {
+    // Inflight guard: fs.watch on macOS can fire multiple times between our
+    // scheduleRead debounce and stream.on('end'). Without this, two concurrent
+    // reads share entry.offset and skip bytes (same shape as bug in
+    // fix-incremental-reader-race.md::Race condition in Case 2).
+    if (entry.inflight) return;
+    let size;
+    try { size = fs.statSync(filePath).size; } catch { return; }
+    if (size <= entry.offset) {
+      // File got truncated (e.g. fork rewrite reusing same sessionId, or
+      // session rewrite via `claude:fork-session-file`). Reset to head and
+      // also drop leftover — old position invalidates partial line buffer.
+      if (size < entry.offset) {
+        entry.offset = 0;
+        entry.leftover = '';
+      }
+      return;
+    }
+    entry.inflight = true;
+    const startOffset = entry.offset; // snapshot before yielding
+    const stream = fs.createReadStream(filePath, { start: startOffset, end: size - 1 });
+    let buf = entry.leftover;
+    entry.leftover = ''; // carry forward only what survives this pass
+    stream.on('data', (chunk) => { buf += chunk.toString('utf-8'); });
+    stream.on('end', () => {
+      entry.offset = size;
+      // Last fragment may not end with \n — Claude's append could land
+      // mid-record between two writes. Defer to next readDelta.
+      const endsWithNewline = buf.endsWith('\n');
+      const lines = buf.split('\n');
+      if (!endsWithNewline) entry.leftover = lines.pop() || '';
+      for (const raw of lines) {
+        const line = raw.trim();
+        if (!line) continue;
+        let parsed;
+        try { parsed = JSON.parse(line); } catch {
+          // Malformed JSON in a complete line is a real corruption — log
+          // (deduped) and skip. NOT the partial-line case above.
+          continue;
+        }
+        // Mirror SDK WS protocol — mobile reducer expects { type:'message', message: inner }.
+        // The inner record is what JSONL stores: { type:'user'|'assistant'|..., message:..., uuid, ... }.
+        webBroadcast(tabId, { type: 'message', sessionId: parsed.sessionId || status.sessionId, message: parsed });
+      }
+      entry.inflight = false;
+      // If fs.stat shows growth that happened DURING our read, schedule once
+      // more so we don't miss bytes flushed between stat and our consumption.
+      try {
+        const nowSize = fs.statSync(filePath).size;
+        if (nowSize > entry.offset) scheduleRead();
+      } catch {}
+    });
+    stream.on('error', () => { entry.inflight = false; });
+  };
+
+  // Debounced re-read to coalesce rapid writes (Claude flushes JSONL in bursts).
+  const scheduleRead = () => {
+    if (entry.timer) return;
+    entry.timer = setTimeout(() => { entry.timer = null; readDelta(); }, 60);
+  };
+
+  try {
+    entry.watcher = fs.watch(filePath, () => scheduleRead());
+  } catch (e) {
+    console.warn('[ClaudeWatcher] fs.watch failed for', filePath, e.message);
+    return;
+  }
+  claudeTabWatchers.set(tabId, entry);
+  console.log('[ClaudeWatcher] started tabId=' + tabId.slice(-12) + ' file=' + filePath + ' startOffset=' + offset);
+  // Immediate read once — covers the race where Claude appended bytes between
+  // our fs.statSync(filePath).size above and fs.watch arming. Subsequent
+  // growth is caught by the watcher itself; offset guards against duplicates.
+  scheduleRead();
+}
+
+function stopClaudeTabWatcher(tabId) {
+  // Drop pending-promotion slot so a late session-detected event doesn't
+  // try to start a watcher for a tab no one is watching anymore.
+  claudeTabWatcherPending.delete(tabId);
+  const entry = claudeTabWatchers.get(tabId);
+  if (!entry) return;
+  try { entry.watcher?.close(); } catch {}
+  if (entry.timer) clearTimeout(entry.timer);
+  claudeTabWatchers.delete(tabId);
+  console.log('[ClaudeWatcher] stopped tabId=' + tabId.slice(-12));
 }
 
 function attachWebSocket(server, sdkSessions) {
@@ -762,49 +1130,55 @@ function attachWebSocket(server, sdkSessions) {
   wss = new WebSocketServer({ noServer: true });
   server.on('upgrade', (req, socket, head) => {
     const parsed = url.parse(req.url, true);
+    const remote = (socket.remoteAddress || '?') + ':' + (socket.remotePort || '?');
+    console.log('[WebWS:Upgrade] path=' + parsed.pathname + ' tabId=' + String(parsed.query.tabId || '').slice(-12) + ' from=' + remote + ' tokenLen=' + String(parsed.query.token || '').length);
     if (parsed.pathname !== '/ws') {
+      console.log('[WebWS:Upgrade:REJECT] bad path ' + parsed.pathname);
       socket.destroy();
       return;
     }
     if (parsed.query.token !== token) {
+      console.log('[WebWS:Upgrade:REJECT] token mismatch (got len=' + String(parsed.query.token || '').length + ', expected len=' + String(token || '').length + ')');
       socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
       socket.destroy();
       return;
     }
     wss.handleUpgrade(req, socket, head, (ws) => {
       const tabId = parsed.query.tabId;
+      const sink = wsSink(ws);
       ws.tabId = tabId || null;
       if (tabId) {
-        subscribe(tabId, ws);
+        subscribe(tabId, sink);
         // Send initial snapshot of live state — what the phone needs to render
         // immediately without waiting for the next message.
         const session = sdkSessions.get(tabId);
-        try {
-          ws.send(JSON.stringify({
-            type: 'snapshot',
-            tabId,
-            sessionId: session?.sessionId || null,
-            busy: !!session,
-          }));
-        } catch {}
+        sink.send(JSON.stringify({
+          type: 'snapshot',
+          tabId,
+          sessionId: session?.sessionId || null,
+          busy: !!session,
+        }));
+        // Start fs-watch on PTY+Claude tab's JSONL (no-op for SDK tabs).
+        startClaudeTabWatcher(tabId).catch(() => {});
       }
       ws.on('message', (raw) => {
         try {
           const msg = JSON.parse(raw.toString());
           if (msg.type === 'subscribe' && msg.tabId) {
-            subscribe(msg.tabId, ws);
+            subscribe(msg.tabId, sink);
             const session = sdkSessions.get(msg.tabId);
-            ws.send(JSON.stringify({
+            sink.send(JSON.stringify({
               type: 'snapshot',
               tabId: msg.tabId,
               sessionId: session?.sessionId || null,
               busy: !!session,
             }));
+            startClaudeTabWatcher(msg.tabId).catch(() => {});
           }
         } catch {}
       });
-      ws.on('close', () => unsubscribeAll(ws));
-      ws.on('error', () => unsubscribeAll(ws));
+      ws.on('close', () => { unsubscribeAll(sink); releaseClaudeWatchersIfOrphan(); });
+      ws.on('error', () => { unsubscribeAll(sink); releaseClaudeWatchersIfOrphan(); });
     });
   });
 }
@@ -890,4 +1264,4 @@ function getInfo() {
   };
 }
 
-module.exports = { start, stop, webBroadcast, getInfo };
+module.exports = { start, stop, webBroadcast, getInfo, notifyClaudeSessionAvailable };

@@ -130,7 +130,7 @@
 ### Закрывать кликом вне (overlay-режим)
 - **ON (по умолчанию):** Sidebar работает как overlay — клик в любом месте поверх терминала закрывает его. Клик внутри `[data-sidebar-portal]` или `[data-file-preview-root]` оставляет открытым.
 - **Почему FilePreview не закрывает:** sidebar и file preview — связанные слои. Пользователь читает файл из дерева; клики по preview не должны убирать дерево из-под него. Атрибут `data-file-preview-root` на корне FilePreview — anchor для этой проверки.
-- **Capture-phase listener:** `mousedown` навешен с `useCapture=true`. Без capture canvas terminal (xterm) ловит событие первым через `pointer-events`, и обработчик на window не срабатывает. Известный pattern для overlay'ев поверх xterm — см. `methodology/сценарии-багов.md::6.3. UI поверх canvas: Portal или Layering Pattern`.
+- **Capture-phase listener:** `mousedown` навешен с `useCapture=true`. Без capture canvas terminal (xterm) ловит событие первым через `pointer-events`, и обработчик на window не срабатывает. Известный pattern для overlay'ев поверх xterm — см. `methodology/сценарии-багов-design.md::6.3. UI поверх canvas: Portal или Layering Pattern`.
 - **Store:** `useUIStore.sidebarOverlayCloseOnClickOutside`.
 
 ### Связанная логика в Workspace

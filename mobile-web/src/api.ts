@@ -75,6 +75,9 @@ export type TabInfo = {
   // on the active branch. null = no Claude session attached.
   timelineCount?: number | null;
   live?: { sessionId?: string; cwd: string } | null;
+  // For PTY+Claude tabs only: lifecycle of the embedded `claude` process.
+  // null for SDK tabs and bare-shell tabs.
+  sessionStatus?: 'active' | 'busy' | 'inactive' | null;
 };
 
 export type TimelineEntry = {
@@ -99,6 +102,20 @@ export const Api = {
     api<{ tabId: string; name: string; cwd: string; projectId: string }>(
       `/api/projects/${encodeURIComponent(projectId)}/sdk-tabs`,
       { method: 'POST', body: '{}' },
+    ),
+  createClaudeTab: (projectId: string) =>
+    api<{ tabId: string; name: string; cwd: string; projectId: string }>(
+      `/api/projects/${encodeURIComponent(projectId)}/claude-tabs`,
+      { method: 'POST', body: '{}' },
+    ),
+  resumeClaudeTab: (tabId: string) =>
+    api<{ tabId: string; sessionId: string; alreadyRunning?: boolean }>(
+      `/api/sdk-tabs/${encodeURIComponent(tabId)}/resume`,
+      { method: 'POST', body: '{}' },
+    ),
+  claudeStatus: (tabId: string) =>
+    api<{ tabId: string; status: 'active' | 'busy' | 'inactive' | 'starting'; commandType: string | null; sessionId: string | null; cwd?: string }>(
+      `/api/sdk-tabs/${encodeURIComponent(tabId)}/status`,
     ),
   send: (tabId: string, prompt: string) =>
     api<{ success: boolean; error?: string }>(
@@ -182,8 +199,20 @@ export const Api = {
 
 // Build a websocket URL that points at the same origin as the page, with
 // the bearer token embedded so the server can authenticate the upgrade.
+// NOTE: ws:// is blocked by some browsers' anti-tracker layer (Yandex Protect,
+// Chrome extensions) when the host is a private IP — fetch works but the WS
+// handshake never leaves the browser. Prefer eventsUrl() (SSE) which rides
+// plain HTTP GET and is not subject to that block. wsUrl kept for any caller
+// that still wants WS on a permissive browser.
 export function wsUrl(tabId: string) {
   const token = getToken() || '';
   const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   return `${proto}//${window.location.host}/ws?token=${encodeURIComponent(token)}&tabId=${encodeURIComponent(tabId)}`;
+}
+
+// SSE endpoint for the live channel — same-origin HTTP GET, token in query
+// (EventSource cannot set headers). Replaces wsUrl for the live stream.
+export function eventsUrl(tabId: string) {
+  const token = getToken() || '';
+  return `/api/events?token=${encodeURIComponent(token)}&tabId=${encodeURIComponent(tabId)}`;
 }

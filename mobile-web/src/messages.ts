@@ -14,7 +14,10 @@
 export type UiEntry =
   // entryUuid (when present) anchors a chat bubble to its JSONL record so
   // the timeline drawer's GoTo can scroll to it via [data-entry-uuid].
-  | { kind: 'user'; id: string; text: string; entryUuid?: string }
+  // wasQueued — desktop отправил из type-ahead очереди (Enter во время
+  // стриминга). Live-only флаг, после reload теряется (Anthropic JSONL не
+  // хранит UI-метаданные). EntryView рендерит маленький "queued" chip.
+  | { kind: 'user'; id: string; text: string; entryUuid?: string; wasQueued?: boolean }
   | { kind: 'assistant'; id: string; text: string; entryUuid?: string }
   | { kind: 'thinking'; id: string; text: string; entryUuid?: string }
   | { kind: 'tool'; id: string; tool: string; input?: any; result?: string; isError?: boolean }
@@ -150,7 +153,13 @@ export function createMessageReducer() {
           return { kind: 'compact-summary', id: uuid || nextId(), text: trimmed, entryUuid: uuid, metrics };
         }
 
-        return { kind: 'user', id: nextId(), text, entryUuid: uuid };
+        // wasQueued прокинут через WS-payload из main (`__wasQueued`) — это
+        // ТОЛЬКО для synthetic-broadcast'ов от desktop'а (когда desktop отправил
+        // prompt из type-ahead очереди). Real Anthropic records этот флаг не
+        // несут (JSONL не хранит наши UI-метаданные), поэтому после reload
+        // флаг теряется естественно.
+        const wasQueued = raw.__wasQueued === true;
+        return { kind: 'user', id: nextId(), text, entryUuid: uuid, ...(wasQueued ? { wasQueued: true } : {}) };
       };
 
       // Dedupe + adopt-or-push for normal user bubbles. For slash/compact
@@ -161,6 +170,9 @@ export function createMessageReducer() {
           const last = state.entries[state.entries.length - 1] as any;
           if (last && last.kind === 'user' && last.text === entry.text && !last.entryUuid && entry.entryUuid) {
             last.entryUuid = entry.entryUuid;
+            // Inherit wasQueued from the incoming (broadcast) entry. The local
+            // optimistic bubble didn't have it; the synthetic broadcast does.
+            if (entry.wasQueued) last.wasQueued = true;
             return;
           }
         } else if (entry.kind === 'slash' || entry.kind === 'compact-summary') {

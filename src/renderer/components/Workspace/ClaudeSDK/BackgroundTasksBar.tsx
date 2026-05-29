@@ -1,6 +1,6 @@
-import React, { useEffect, useMemo } from 'react';
+import React, { useEffect, useMemo, useRef } from 'react';
 import { useWorkspaceStore, type BgTask } from '../../../store/useWorkspaceStore';
-import { Terminal as TerminalIcon, Bot } from 'lucide-react';
+import { Terminal as TerminalIcon, Bot, Workflow as WorkflowIcon } from 'lucide-react';
 
 // Per-tab selector. Subscribes only to bgTasks (granular) — avoids whole-tab
 // re-renders on every assistant chunk.
@@ -45,10 +45,14 @@ interface BackgroundTasksBarProps {
 
 export function BackgroundTasksBar({ tabId, expandedTaskId, onSelect }: BackgroundTasksBarProps) {
   const allTasks = useBgTasks(tabId);
-  // Bar surfaces ONLY running tasks. Completed/failed/stopped fall back into
-  // chat history (the inline Agent/Bash tool-cards in the main thread are the
-  // record). Once a task transitions out of 'running', its chip disappears.
-  const tasks = useMemo(() => allTasks.filter(t => t.status === 'running'), [allTasks]);
+  // Bar surfaces ONLY running tasks (incl. workflows — a workflow is a one-line
+  // chip here, and expands into WorkflowPanel only when selected). Completed/
+  // failed/stopped fall back into chat history. Once a task leaves 'running'
+  // its chip disappears.
+  const tasks = useMemo(
+    () => allTasks.filter(t => t.status === 'running'),
+    [allTasks],
+  );
 
   // Auto-close detail-pane if the currently expanded task is no longer in the
   // running list (it finished while user was looking at it).
@@ -65,28 +69,34 @@ export function BackgroundTasksBar({ tabId, expandedTaskId, onSelect }: Backgrou
     return () => window.clearInterval(h);
   }, [tasks.length]);
 
-  // Arrow-nav while expanded — Left/Right cycle through running chips.
+  // Sort by start time (newest first). Workflows and standalone tasks share the
+  // strip; the workflow chip carries a `workflow` prefix so it's recognisable.
+  const sorted = useMemo(() => [...tasks].sort((a, b) => b.startedAt - a.startedAt), [tasks]);
+
+  // Keyboard: ArrowDown FROM the composer textarea jumps focus to the FIRST
+  // chip (so the user can ↓ off the input straight onto a running task);
+  // Enter on a focused chip expands it. Uses e.code so it's layout-independent.
+  // Only when NOT already expanded — once expanded, WorkflowPanel/TaskDetailPane
+  // own the keyboard. Refs to the chip buttons let us focus the first one.
+  const firstChipRef = useRef<HTMLButtonElement | null>(null);
   useEffect(() => {
-    if (!expandedTaskId || tasks.length < 2) return;
+    if (expandedTaskId || sorted.length === 0) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.target && (e.target as HTMLElement).tagName === 'TEXTAREA') return;
-      if (e.target && (e.target as HTMLElement).tagName === 'INPUT') return;
-      if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
-      const idx = tasks.findIndex(t => t.taskId === expandedTaskId);
-      if (idx < 0) return;
-      const next = e.key === 'ArrowLeft'
-        ? (idx - 1 + tasks.length) % tasks.length
-        : (idx + 1) % tasks.length;
-      onSelect(tasks[next].taskId);
-      e.preventDefault();
+      if (e.code !== 'ArrowDown') return;
+      const el = e.target as HTMLElement | null;
+      // Only hijack ArrowDown when the caret is at the END of the composer
+      // textarea (so normal down-arrow within multi-line text still works).
+      if (el && el.tagName === 'TEXTAREA') {
+        const ta = el as HTMLTextAreaElement;
+        const atEnd = ta.selectionStart === ta.value.length && ta.selectionStart === ta.selectionEnd;
+        if (!atEnd) return;
+        firstChipRef.current?.focus();
+        e.preventDefault();
+      }
     };
     document.addEventListener('keydown', onKey);
     return () => document.removeEventListener('keydown', onKey);
-  }, [expandedTaskId, tasks, onSelect]);
-
-  // Sort by start time so order stays stable (newest first feels right for
-  // "what did I just launch"). No completed/finished interleaving anymore.
-  const sorted = useMemo(() => [...tasks].sort((a, b) => b.startedAt - a.startedAt), [tasks]);
+  }, [expandedTaskId, sorted.length]);
 
   if (sorted.length === 0) return null;
 
@@ -97,7 +107,10 @@ export function BackgroundTasksBar({ tabId, expandedTaskId, onSelect }: Backgrou
     >
       {sorted.map((t, i) => {
         const expanded = t.taskId === expandedTaskId;
-        const Icon = t.kind === 'bash' ? TerminalIcon : Bot;
+        const isWorkflow = t.kind === 'workflow';
+        const Icon = isWorkflow ? WorkflowIcon : t.kind === 'bash' ? TerminalIcon : Bot;
+        const accent = isWorkflow ? '#a78bfa' : '#d97706';
+        const agentCount = isWorkflow ? (t.agents?.length || 0) : 0;
         return (
           <React.Fragment key={t.taskId}>
             {i > 0 && (
@@ -109,22 +122,45 @@ export function BackgroundTasksBar({ tabId, expandedTaskId, onSelect }: Backgrou
             )}
             <button
               type="button"
+              ref={i === 0 ? firstChipRef : undefined}
               onClick={() => onSelect(expanded ? null : t.taskId)}
               onMouseDown={(e) => e.preventDefault()}
-              className="group inline-flex items-center gap-1.5 px-2.5 py-1 text-[0.85em] font-mono shrink-0 cursor-pointer transition-colors"
+              onKeyDown={(e) => {
+                // Layout-independent (e.code): Enter/Space expand; arrows move
+                // focus between chips; Escape returns focus implicitly (blur).
+                if (e.code === 'Enter' || e.code === 'Space') {
+                  onSelect(expanded ? null : t.taskId); e.preventDefault();
+                } else if (e.code === 'ArrowRight' || e.code === 'ArrowDown') {
+                  const next = (e.currentTarget.parentElement?.parentElement
+                    ?.querySelectorAll('button')[i + 1]) as HTMLButtonElement | undefined;
+                  next?.focus(); e.preventDefault();
+                } else if (e.code === 'ArrowLeft' || e.code === 'ArrowUp') {
+                  const btns = e.currentTarget.parentElement?.parentElement?.querySelectorAll('button');
+                  const prev = btns && i > 0 ? (btns[i - 1] as HTMLButtonElement) : undefined;
+                  prev?.focus(); e.preventDefault();
+                }
+              }}
+              className="group inline-flex items-center gap-1.5 px-2.5 py-1 text-[0.85em] font-mono shrink-0 cursor-pointer transition-colors outline-none focus:ring-1 focus:ring-inset"
               style={{
-                background: expanded ? 'rgba(217, 119, 6, 0.10)' : 'transparent',
+                background: expanded ? (isWorkflow ? 'rgba(167,139,250,0.12)' : 'rgba(217, 119, 6, 0.10)') : 'transparent',
                 color: '#bdbdbd',
                 minHeight: 22,
+                ['--tw-ring-color' as any]: accent,
               }}
               onMouseEnter={(e) => { if (!expanded) (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.04)'; }}
               onMouseLeave={(e) => { if (!expanded) (e.currentTarget as HTMLElement).style.background = 'transparent'; }}
               title={t.description || t.summary || t.name}
             >
               <StatusDot />
-              <Icon size={11} style={{ color: '#d97706' }} />
+              <Icon size={11} style={{ color: accent }} />
+              {isWorkflow && (
+                <span className="uppercase tracking-wider text-[0.8em] font-semibold" style={{ color: accent }}>workflow</span>
+              )}
               <span className="truncate max-w-[200px]">{t.name}</span>
-              {t.lastToolName && (
+              {isWorkflow && agentCount > 0 && (
+                <span className="text-[0.85em] text-[#888]">· {agentCount} agent{agentCount === 1 ? '' : 's'}</span>
+              )}
+              {!isWorkflow && t.lastToolName && (
                 <span className="text-[0.85em] text-[#888] truncate max-w-[120px]">· {t.lastToolName}</span>
               )}
               <span className="text-[0.85em] text-[#666] tabular-nums">{formatElapsed(t)}</span>

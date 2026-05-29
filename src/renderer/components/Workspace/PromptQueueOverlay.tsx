@@ -1,6 +1,9 @@
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
+import { createPortal } from 'react-dom';
 import { usePromptQueueStore } from '../../store/usePromptQueueStore';
 import { useUIStore } from '../../store/useUIStore';
+import { useWorkspaceStore } from '../../store/useWorkspaceStore';
+import { isTabBusyNow } from '../../hooks/usePromptQueueRunner';
 import { terminalRegistry } from '../../utils/terminalRegistry';
 
 const { ipcRenderer } = window.require('electron');
@@ -22,6 +25,13 @@ const GRAB_ERROR_TOASTS: Record<string, string> = {
 // ─── visual constants ──────────────────────────────────────────────────────
 const TINT = '#DA7756';           // Claude orange tint for active states
 const PULSE = '#a78bfa';          // purple — armed/waiting auto-run indicator
+// Deeper violet for the Run-after target-tab pill. Distinct from PULSE so a
+// user looking at the overlay sees "armed-self" (PULSE around the Run after
+// button) vs "armed-on-other-tab" (DEEP_PULSE on the dropdown) as two
+// different states, not the same thing. Both are in the purple family because
+// they share the meaning "auto-run is configured for this queue", just with
+// different triggers.
+const DEEP_PULSE = '#8b5cf6';     // violet-500 — Run-after pointed at another tab
 const HINT_RED = '#ef4444';       // red-500 — first-chip "don't forget to arm" hint
                                   // Previously #d97706 (amber) but that read as
                                   // "orange" and conflicted visually with the
@@ -39,8 +49,12 @@ const TEXT_DIM = '#555';
 // header row (e.g. the Stop/Close split-button uses a CSS grid to reserve
 // the wider of the two labels' widths). PANEL_MIN_WIDTH ≈ the previous
 // fixed value so existing layouts don't suddenly shrink.
-const PANEL_MIN_WIDTH = 296;
-const PANEL_MAX_WIDTH = 420;
+// PANEL_MIN_WIDTH was 296px to fit the old wide-flex header. After the
+// 2-column grid refactor each cell needs only ~110-120px so the panel can be
+// narrower. Kept slightly above 2×110px + gaps + padding so neither column
+// gets squeezed below the input/trigger's intrinsic readable width.
+const PANEL_MIN_WIDTH = 240;
+const PANEL_MAX_WIDTH = 360;
 const PREVIEW_WIDTH = 380;
 const PREVIEW_MAX_HEIGHT = 420;
 
@@ -69,9 +83,10 @@ export function PromptQueueOverlay({ tabId, claudeBusy }: Props) {
   const postPromptEnabled = queue?.postPromptEnabled ?? false;
   const postPromptText = queue?.postPromptText ?? '';
   const firstChipArmedHint = queue?.firstChipHintActive ?? false;
+  const runAfterTabId = queue?.runAfterTabId ?? null;
   const {
     addPrompt, removePrompt, updatePromptText, reorderPrompt,
-    setAutoRun, setStopAfter, setCloseAfter,
+    setAutoRun, setStopAfter, setCloseAfter, setRunAfterTab,
     setPostPromptEnabled, setPostPromptText, consumeFirstChipHint,
     // popNext is consumed by hooks/usePromptQueueRunner.ts — not referenced here.
   } = usePromptQueueStore.getState();
@@ -440,56 +455,76 @@ export function PromptQueueOverlay({ tabId, claudeBusy }: Props) {
             "Run after" toggles autoRun. Arming with delay > 0 starts the countdown.
             Disarming mid-countdown freezes the remaining seconds back into the input.
             "Stop after" — SIGTERM claude after the next turn ends (independent). */}
-        <div style={{ padding: '6px 8px', display: 'flex', alignItems: 'center', gap: 6, rowGap: 6, borderBottom: `1px solid ${BORDER}`, flexWrap: 'wrap' }}>
-          <FirstDelayInput tabId={tabId} autoRun={autoRun} />
+        {/* Two-column header layout — both columns ~120px to match the user's
+            spec ("колонки одинаковой ширины, узкие — как раньше Stop after").
+            Old `grid 90px 1fr` made the right column 2-3x wider than the
+            left, which is why Run after / Stop after / Post visually felt
+            "huge" vs the trigger on the left.
+            Strict equal columns via `1fr 1fr`; cell padding kept compact
+            (6px outer, 4px row gap). All children of each column are
+            `width:100%` to fill the column — fixed cell width means no
+            layout shift when the trigger flips between «on tab» / selected. */}
+        <div style={{
+          padding: '6px 8px',
+          borderBottom: `1px solid ${BORDER}`,
+          display: 'grid',
+          gridTemplateColumns: '1fr 1fr',
+          columnGap: 6,
+          rowGap: 4,
+        }}>
+          {/* ── LEFT COLUMN ───────────────────────────────────────────────── */}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0 }}>
+            <RunAfterTabPicker
+              tabId={tabId}
+              runAfterTabId={runAfterTabId}
+              setRunAfterTab={setRunAfterTab}
+              panelRef={panelRef}
+            />
+            <div style={{ display: 'flex', alignItems: 'center', gap: 4, width: '100%' }}>
+              <FirstDelayInput tabId={tabId} autoRun={autoRun} />
+              {items.length > 0 && (
+                <span style={{ color: TEXT_DIM, fontSize: 9, userSelect: 'none', flexShrink: 0 }}>·{items.length}</span>
+              )}
+            </div>
+          </div>
 
-          {items.length > 0 && (
-            <span style={{ color: TEXT_DIM, fontSize: 10, userSelect: 'none', flexShrink: 0 }}>· {items.length}</span>
-          )}
+          {/* ── RIGHT COLUMN ──────────────────────────────────────────────── */}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 4, alignItems: 'stretch', minWidth: 0 }}>
 
-          <span style={{ flex: 1 }} />
-
-          {/* Run-after pill.
+          {/* Run-after pill — row 1 of right column. Width: 100% of column.
               firstChipArmedHint: subtle red glow that appears when user adds
               the FIRST chip into an empty queue while Run after is OFF — visual
-              nudge "don't forget to arm me". Cleared on first hover (handled
-              by firstChipHintConsumed flag in store) and never re-shown until
-              the queue empties again. */}
+              nudge "don't forget to arm me". Cleared on first hover and never
+              re-shown until the queue empties again. */}
           <button
             onClick={toggleAutoRun}
             onMouseEnter={() => {
               if (firstChipArmedHint) consumeFirstChipHint(tabId);
             }}
             style={{
-              position: 'relative', // anchor for the blink overlay
+              position: 'relative',
+              width: '100%',
               padding: '2px 6px',
               background: autoRun ? `${PULSE}26` : (firstChipArmedHint ? `${HINT_RED}26` : 'transparent'),
               border: `1px solid ${autoRun ? PULSE : (firstChipArmedHint ? HINT_RED : BORDER)}`,
               borderRadius: 10,
               color: autoRun ? PULSE : (firstChipArmedHint ? HINT_RED : TEXT_MUTED),
               cursor: 'pointer', fontSize: 9, letterSpacing: 0.3,
-              display: 'inline-flex', alignItems: 'center', gap: 4,
-              whiteSpace: 'nowrap', flexShrink: 0,
+              display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: 4,
+              whiteSpace: 'nowrap',
               transition: 'all 0.15s',
-              // The static glow that lingers AFTER the 2.5s blink finishes.
-              // The blink itself is rendered by the absolute span below — its
-              // animation overrides this glow while playing.
               boxShadow: armedFlash
                 ? `0 0 6px ${PULSE}`
                 : (firstChipArmedHint ? `0 0 6px ${HINT_RED}66` : 'none'),
             }}
           >
-            {/* 2.5-second red blink overlay — only mounted while the hint is
-                active. `key={blinkKey}` forces a remount on each re-arm so the
-                animation starts from frame 0 every time. pointer-events:none
-                keeps clicks landing on the button below. */}
             {firstChipArmedHint && (
               <span
                 key={blinkKey}
                 aria-hidden="true"
                 style={{
                   position: 'absolute',
-                  inset: -1, // cover the border too
+                  inset: -1,
                   borderRadius: 10,
                   pointerEvents: 'none',
                   animation: `pq-hint-blink ${BLINK_CYCLE_MS}ms ease-in-out ${BLINK_ITERATIONS}`,
@@ -569,7 +604,7 @@ export function PromptQueueOverlay({ tabId, claudeBusy }: Props) {
             const rightColor = closeAfter ? CLOSE_RED : TEXT_MUTED;
             const rightBg = closeAfter ? `${CLOSE_RED}26` : 'transparent';
             return (
-              <div style={{ display: 'inline-flex', flexShrink: 0 }}>
+              <div style={{ display: 'flex', width: '100%' }}>
                 <button
                   onClick={() => setStopAfter(tabId, !stopAfter)}
                   title="Stop Claude after the next turn ends (if queue is empty)"
@@ -586,17 +621,10 @@ export function PromptQueueOverlay({ tabId, claudeBusy }: Props) {
                     (e.currentTarget as HTMLElement).style.color = TEXT_MUTED;
                   }}
                   style={{
+                    flex: 1,
                     padding: '2px 6px',
                     background: leftBg,
-                    // FULL border — including the right edge, which IS the
-                    // seam between the two zones. This is the entire fix:
-                    // the seam is now a single integer-pixel border-right
-                    // owned by one element, not a fragile adjacency between
-                    // two borders.
                     border: `1px solid ${leftBorder}`,
-                    // Round only the left corners — the seam between left
-                    // and right buttons stays flat, so visually we still
-                    // read as one "split button".
                     borderTopLeftRadius: 10,
                     borderBottomLeftRadius: 10,
                     borderTopRightRadius: 0,
@@ -604,15 +632,10 @@ export function PromptQueueOverlay({ tabId, claudeBusy }: Props) {
                     color: leftColor,
                     cursor: 'pointer', fontSize: 9, letterSpacing: 0.3,
                     whiteSpace: 'nowrap',
-                    // Width-reservation grid: both labels live in the same
-                    // cell, the longest defines the column width, only the
-                    // active one is visible. Result: clicking the right
-                    // zone (which retypes the label) does NOT shift any
-                    // pixel in the panel.
-                    display: 'inline-grid',
+                    display: 'grid',
                     gridTemplateColumns: 'auto',
                     alignItems: 'center',
-                    justifyItems: 'start',
+                    justifyItems: 'center',
                   }}
                 >
                   <span style={{ gridArea: '1 / 1', visibility: closeAfter ? 'visible' : 'hidden' }}>Close after</span>
@@ -668,14 +691,14 @@ export function PromptQueueOverlay({ tabId, claudeBusy }: Props) {
           {/* Post-prompt split-button: left zone toggles, right zone (✏) opens
               the editor. Active = orange (matches "command attached to every
               send"). Both zones share one rounded border for a single visual
-              control. */}
+              control. Full column-width to match Run after / Stop after rows. */}
           <div
             style={{
-              display: 'inline-flex',
+              display: 'flex',
+              width: '100%',
               border: `1px solid ${postPromptEnabled ? TINT : BORDER}`,
               borderRadius: 10,
               overflow: 'hidden',
-              flexShrink: 0,
               transition: 'border-color 0.15s',
             }}
           >
@@ -683,12 +706,13 @@ export function PromptQueueOverlay({ tabId, claudeBusy }: Props) {
               onClick={() => setPostPromptEnabled(tabId, !postPromptEnabled)}
               title={postPromptText ? 'Post-prompt: ' + (postPromptText.length > 60 ? postPromptText.slice(0, 60) + '…' : postPromptText) : 'Post-prompt is empty — click ✏ to add'}
               style={{
+                flex: 1,
                 padding: '2px 6px',
                 background: postPromptEnabled ? `${TINT}26` : 'transparent',
                 border: 'none',
                 color: postPromptEnabled ? TINT : TEXT_MUTED,
                 cursor: 'pointer', fontSize: 9, letterSpacing: 0.3,
-                display: 'inline-flex', alignItems: 'center', gap: 4,
+                display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: 4,
                 whiteSpace: 'nowrap',
                 transition: 'all 0.15s',
               }}
@@ -723,6 +747,9 @@ export function PromptQueueOverlay({ tabId, claudeBusy }: Props) {
               </svg>
             </button>
           </div>
+
+          </div>
+          {/* end right column */}
         </div>
 
         {/* Clear-all row — only when queue has items */}
@@ -1015,7 +1042,7 @@ function FirstDelayInput({ tabId, autoRun }: FirstDelayInputProps) {
     return (
       <span
         style={{
-          width: 56,
+          width: '100%',           // matches the trigger above (left column)
           padding: '2px 6px',
           background: 'transparent',
           border: `1px solid ${PULSE}`,
@@ -1025,6 +1052,7 @@ function FirstDelayInput({ tabId, autoRun }: FirstDelayInputProps) {
           fontVariantNumeric: 'tabular-nums',
           textAlign: 'center',
           userSelect: 'none',
+          boxSizing: 'border-box',
         }}
         title="Countdown to first prompt — toggle Run after to cancel"
       >
@@ -1066,7 +1094,7 @@ function FirstDelayInput({ tabId, autoRun }: FirstDelayInputProps) {
         }
       }}
       style={{
-        width: 56,
+        width: '100%',             // matches the trigger above (left column)
         padding: '2px 6px',
         background: '#1a1a1a',
         border: `1px solid ${BORDER}`,
@@ -1077,7 +1105,455 @@ function FirstDelayInput({ tabId, autoRun }: FirstDelayInputProps) {
         textAlign: 'center',
         outline: 'none',
         cursor: disabled ? 'not-allowed' : 'text',
+        boxSizing: 'border-box',
       }}
     />
   );
+}
+
+// ─── RunAfterTabPicker ─────────────────────────────────────────────────────
+// Compact dropdown next to the "Run after" pill. Lets the user pick ANOTHER
+// tab in the same project — when that tab's loader (claude/gemini/sdk busy
+// signal) finishes, the queue's head fires here.
+//
+// Design choices:
+//  - Width-clamped pill (max 140px) — tab names get truncated with ellipsis,
+//    panel never visibly grows just from a long tab name.
+//  - Violet tint for the active state. Distinct from PULSE (used by Run after
+//    self-firing) so the two states read differently at a glance.
+//  - Status icon on the RIGHT of the name:
+//      • idle, active in its project    → no icon (we'll fire instantly on
+//                                          next busy→idle, nothing visual)
+//      • busy NOW                       → spinning loader (svg arc)
+//      • idle, INACTIVE in its project  → "!" — user must still activate the
+//                                          tab AND submit something there
+//                                          before the loader starts; only
+//                                          then do we wait for idle.
+//  - First row in dropdown is always "— no target —" (clears the slot).
+//  - Tabs are listed in original project order, color-dot shows their
+//    canonical tab color so user instantly recognises Claude (orange) vs
+//    Gemini (blue) vs bash (green) vs script.
+//  - Self-row hidden (selecting yourself = wait-forever loop; setRunAfterTab
+//    also coerces self→null defensively).
+
+type RunAfterTabPickerProps = {
+  tabId: string;
+  runAfterTabId: string | null;
+  setRunAfterTab: (tabId: string, target: string | null) => void;
+  // Ref to the overlay panel's outer container. Used to anchor the side
+  // slideout — `right: window.innerWidth - panelRect.left + gap` docks the
+  // slideout to the left edge of the panel, full-height. Walking up via
+  // `node.style.position === 'absolute'` was fragile (would land on BODY
+  // when inline style was stripped by HMR / when grid container interposed)
+  // and produced off-screen anchors that silently rendered the menu where
+  // nobody could see it — symptom was «меню не кликается». Passing the
+  // ref directly removes the ambiguity.
+  panelRef: React.RefObject<HTMLDivElement>;
+};
+
+// Distinct kind for each AI surface — affects the colour dot ONLY (PTY
+// claude saffron vs SDK claude terracotta, matching TabItem.tsx::colorConfig
+// line 425 + fact-tabs.md "SDK claude — distinct hue from PTY claude").
+// User explicitly called out that PTY and SDK rows must be visually
+// distinguishable in the dropdown.
+type AiTabKind = 'claude-pty' | 'claude-sdk' | 'gemini';
+const AI_KIND_COLOR: Record<AiTabKind, string> = {
+  'claude-pty': '#DA7756', // saffron orange — PTY claude
+  'claude-sdk': '#D28C5A', // terracotta — SDK claude
+  'gemini':     '#4E86F8', // blue — Gemini
+};
+
+// Trigger spans the entire left column (width:100% of parent grid cell).
+// Column width is fixed by the parent grid `1fr 1fr` with `minWidth:0` on
+// children — so the trigger settles at the same pixel width as the input
+// below and the Run-after pill across the seam. Removing the old hardcoded
+// 90px constant was necessary to match the user's spec «ширина у инпута и
+// триггера одинаковая, и обе равны кнопкам справа».
+
+// One AI-tab option in the picker.
+type AiTab = {
+  id: string;
+  name: string;
+  kind: AiTabKind;
+};
+
+function RunAfterTabPicker({ tabId, runAfterTabId, setRunAfterTab, panelRef }: RunAfterTabPickerProps) {
+  // Fingerprint Pattern (CLAUDE.md / fix-performance-lags.md): селектор ОБЯЗАН
+  // вернуть примитив. Возврат свежего `{projectId, activeTabId, tabs}` каждый
+  // раз приводит к infinite loop через Object.is (Zustand сравнение).
+  // Сейчас селектор фильтрует только AI-вкладки (Claude PTY с активной
+  // сессией, Gemini с активной сессией, любой SDK-таб) и собирает компактный
+  // fingerprint-string из id+name. Re-render только когда AI-инвентарь
+  // проекта реально поменялся.
+  //
+  // Критерий AI-таба (user complaint *«отображаются терминалы, хотя внутри
+  // никакой Claude не запущен»* — без этого фильтра в выпадающем списке
+  // болтались bash/run-dev табы, которые никогда не дадут turn-end edge):
+  //   PTY claude: commandType === 'claude' && claudeSessionId   (= CLI был
+  //               запущен хотя бы раз — sessionId осталась даже после exit;
+  //               это достаточный сигнал, что таб «AI-предназначения»).
+  //   PTY gemini: commandType === 'gemini' && geminiSessionId
+  //   SDK:        tabType === 'claude-sdk'                       (по
+  //               определению AI-таб, sessionId может быть пуст до первой
+  //               отправки)
+  const fingerprint = useWorkspaceStore((state) => {
+    let projectId: string | null = null;
+    let workspaceRef: ReturnType<typeof state.openProjects.get> | null = null;
+    for (const [pid, ws] of state.openProjects) {
+      if (ws.tabs.has(tabId)) { projectId = pid; workspaceRef = ws; break; }
+    }
+    if (!projectId || !workspaceRef) return '';
+    const parts: string[] = [projectId];
+    for (const t of workspaceRef.tabs.values()) {
+      if (t.parentTabId) continue;
+      const isSDK = t.tabType === 'claude-sdk';
+      const isClaudePTY = !isSDK && t.commandType === 'claude' && !!t.claudeSessionId;
+      const isGemini = !isSDK && t.commandType === 'gemini' && !!t.geminiSessionId;
+      if (!isSDK && !isClaudePTY && !isGemini) continue;
+      parts.push(t.id + ':' + (t.name || ''));
+    }
+    return parts.join('|');
+  });
+
+  const aiTabs = useMemo<AiTab[]>(() => {
+    if (!fingerprint) return [];
+    const state = useWorkspaceStore.getState();
+    let ws: ReturnType<typeof state.openProjects.get> | null = null;
+    for (const w of state.openProjects.values()) {
+      if (w.tabs.has(tabId)) { ws = w; break; }
+    }
+    if (!ws) return [];
+    // Map.values() preserves insertion order — and `useWorkspaceStore.openTab`
+    // appends new tabs in user-visible sidebar order, so we get them ordered
+    // exactly as the user sees them (per user's spec: «порядок вкладок должен
+    // быть такой же, как в левом сайдбаре»).
+    const out: AiTab[] = [];
+    for (const t of ws.tabs.values()) {
+      if (t.parentTabId) continue;
+      const isSDK = t.tabType === 'claude-sdk';
+      const isClaudePTY = !isSDK && t.commandType === 'claude' && !!t.claudeSessionId;
+      const isGemini = !isSDK && t.commandType === 'gemini' && !!t.geminiSessionId;
+      let kind: AiTabKind | null = null;
+      if (isSDK) kind = 'claude-sdk';
+      else if (isClaudePTY) kind = 'claude-pty';
+      else if (isGemini) kind = 'gemini';
+      if (!kind) continue;
+      out.push({ id: t.id, name: t.name || t.id.slice(-6), kind });
+    }
+    return out;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fingerprint, tabId]);
+
+  // Track activeTabId separately — used for status detection (inactive=
+  // user hasn't activated the picked tab yet). Fingerprint excludes it
+  // because activeTabId changes don't affect WHICH tabs we list, only how
+  // we badge them; separate subscription keeps the list-rebuild O(0) on
+  // pure tab-switch events.
+  const activeTabId = useWorkspaceStore((state) => {
+    for (const ws of state.openProjects.values()) {
+      if (ws.tabs.has(tabId)) return ws.activeTabId;
+    }
+    return null;
+  });
+
+  const [open, setOpen] = useState(false);
+  // Anchor coords for the side slideout — set on every open so it tracks
+  // viewport resizes mid-session.
+  const [anchor, setAnchor] = useState<{ top: number; right: number; height: number } | null>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+
+  // Re-render once per 750ms while menu is open OR a target is selected —
+  // status icon (spinner vs "!") follows live busy state which lives outside
+  // Zustand. Off otherwise to avoid wasted renders for the common case.
+  const [, force] = useState(0);
+  useEffect(() => {
+    if (!runAfterTabId && !open) return;
+    const id = setInterval(() => force((n) => (n + 1) & 0xffff), 750);
+    return () => clearInterval(id);
+  }, [runAfterTabId, open]);
+
+  // Outside-click + Esc → close.
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => {
+      const t = e.target as Node;
+      if (triggerRef.current?.contains(t)) return;
+      if (menuRef.current?.contains(t)) return;
+      setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false); };
+    document.addEventListener('mousedown', onDown);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onDown);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [open]);
+
+  const handleOpen = useCallback(() => {
+    // Anchor like the editor slideout: docked LEFT of the overlay panel,
+    // full-height. panelRef points at the overlay's outer container — see
+    // RunAfterTabPickerProps.panelRef comment for why we don't walk up the
+    // DOM tree.
+    const panel = panelRef.current;
+    if (!panel) return;
+    const r = panel.getBoundingClientRect();
+    setAnchor({
+      top: r.top,
+      right: window.innerWidth - r.left + 6,
+      height: r.height,
+    });
+    setOpen(true);
+  }, [panelRef]);
+
+  // Status: drives the right-side icon both in the closed pill (for the
+  // selected target) and in each open-menu row.
+  type Status = 'busy' | 'inactive' | 'ready';
+  const statusFor = (id: string): Status => {
+    if (isTabBusyNow(id)) return 'busy';
+    if (activeTabId !== id) return 'inactive';
+    return 'ready';
+  };
+
+  const selectedTab = runAfterTabId
+    ? aiTabs.find((t) => t.id === runAfterTabId) ?? null
+    : null;
+  const selectedStatus = selectedTab ? statusFor(selectedTab.id) : null;
+  const truncate = (s: string, n: number) => (s.length > n ? s.slice(0, n - 1) + '…' : s);
+
+  const armed = !!runAfterTabId;
+  const triggerBorder = armed ? DEEP_PULSE : BORDER;
+  const triggerColor = armed ? DEEP_PULSE : TEXT_MUTED;
+  const triggerBg = armed ? `${DEEP_PULSE}22` : 'transparent';
+
+  return (
+    <>
+      <button
+        ref={triggerRef}
+        onClick={() => open ? setOpen(false) : handleOpen()}
+        title={
+          armed && selectedTab
+            ? `Run after tab "${selectedTab.name}" finishes` +
+              (selectedStatus === 'inactive' ? ' (waiting for activation)' : '') +
+              (selectedStatus === 'busy' ? ' (busy now)' : '')
+            : 'Pick a tab to wait on (otherwise fires on own turn-end)'
+        }
+        style={{
+          width: '100%',           // fills parent column (1fr in 1fr 1fr grid)
+          minWidth: 0,             // allow grid to actually shrink the cell
+          padding: '2px 4px',
+          background: triggerBg,
+          border: `1px solid ${triggerBorder}`,
+          borderRadius: 4,
+          color: triggerColor,
+          cursor: 'pointer', fontSize: 9, letterSpacing: 0.3,
+          display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 3,
+          whiteSpace: 'nowrap',
+          overflow: 'hidden',
+          boxSizing: 'border-box',
+          transition: 'background 0.12s, border-color 0.12s, color 0.12s',
+        }}
+      >
+        {armed && selectedTab ? (
+          <>
+            <span style={{
+              width: 5, height: 5, borderRadius: '50%',
+              background: AI_KIND_COLOR[selectedTab.kind],
+              flexShrink: 0,
+            }} />
+            <span style={{
+              flex: 1, minWidth: 0,
+              overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+              textAlign: 'left',
+            }}>{truncate(selectedTab.name, 9)}</span>
+            <StatusIcon status={selectedStatus!} color={DEEP_PULSE} />
+          </>
+        ) : (
+          <>
+            <svg width="8" height="8" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" style={{ flexShrink: 0 }}>
+              <path d="M6 9l6 6 6-6" />
+            </svg>
+            <span>on tab</span>
+          </>
+        )}
+      </button>
+
+      {open && anchor && createPortal(
+        (
+          // Portal to document.body — CRITICAL. The panel root has
+          // `backdropFilter: blur(8px)` which creates a new containing block
+          // for any `position: fixed` descendant (CSS spec: filter /
+          // backdrop-filter / transform / will-change all do this — see
+          // https://developer.mozilla.org/en-US/docs/Web/CSS/position#fixed).
+          // Rendering inline would make `top: anchor.top; right: anchor.right`
+          // resolve relative to the panel, not the viewport → slideout flies
+          // off-screen and silently swallows clicks (symptom was «menu не
+          // открывается» despite onClick firing on the trigger). Editor
+          // slideout already works because it's a sibling of the panel in
+          // the same JSX tree, not a descendant — but the picker lives
+          // INSIDE the header, so we have to escape the panel via portal.
+          <div
+            ref={menuRef}
+            style={{
+              position: 'fixed',
+              top: anchor.top,
+              right: anchor.right,
+              width: 240,
+              height: anchor.height,
+              background: PANEL_BG,
+              border: `1px solid ${BORDER}`,
+              borderRadius: 6,
+              boxShadow: '0 6px 20px rgba(0,0,0,0.45)',
+              backdropFilter: 'blur(8px)',
+              zIndex: 60,
+              display: 'flex', flexDirection: 'column',
+              overflow: 'hidden',
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div style={{
+              padding: '6px 8px',
+              borderBottom: `1px solid ${BORDER}`,
+              display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+              fontSize: 10, color: TEXT_MUTED,
+            }}>
+              <span>Run after · pick a tab</span>
+              <button
+                onClick={() => setOpen(false)}
+                style={{ background: 'transparent', border: 'none', color: TEXT_DIM, cursor: 'pointer', fontSize: 14, padding: 0, lineHeight: 1 }}
+              >×</button>
+            </div>
+
+            <div style={{ overflowY: 'auto', flex: 1, padding: 2 }}>
+              {/* Row 0: clear target → fall back to own-tab autoRun behaviour.
+                  Click on the row when it's already selected (= runAfterTabId
+                  is null) is a no-op — there's nothing to invert from. */}
+              <RunAfterRow
+                label="— no target —"
+                colorDot="transparent"
+                statusIcon={null}
+                selected={!runAfterTabId}
+                onClick={() => { setRunAfterTab(tabId, null); setOpen(false); }}
+                muted
+              />
+              {aiTabs.length === 0 && (
+                <div style={{ padding: '12px 8px', fontSize: 9, color: TEXT_DIM, textAlign: 'center', lineHeight: 1.4 }}>
+                  no AI tabs in this project<br/>
+                  <span style={{ color: '#555' }}>(start Claude / Gemini in another tab to make it appear here)</span>
+                </div>
+              )}
+              {aiTabs.map((t) => {
+                // Hide the queue-owner self-row (selecting yourself = wait-forever).
+                if (t.id === tabId) return null;
+                const status = statusFor(t.id);
+                const isSelected = runAfterTabId === t.id;
+                return (
+                  <RunAfterRow
+                    key={t.id}
+                    label={t.name}
+                    colorDot={AI_KIND_COLOR[t.kind]}
+                    statusIcon={<StatusIcon status={status} color={TEXT_MUTED} />}
+                    selected={isSelected}
+                    onClick={() => {
+                      // Toggle-off: clicking the already-selected row clears
+                      // the target back to «no target». Lets the user undo
+                      // their pick without scrolling up to row 0. User spec:
+                      // «инверсия, с неё снимается выделение, получается NoTarget».
+                      setRunAfterTab(tabId, isSelected ? null : t.id);
+                      setOpen(false);
+                    }}
+                  />
+                );
+              })}
+            </div>
+          </div>
+        ),
+        document.body
+      )}
+    </>
+  );
+}
+
+// One dropdown row. Centralised so spacing/hover stays uniform across the
+// "no target" row, all tab rows, and any future "category header" rows.
+function RunAfterRow({
+  label, colorDot, statusIcon, selected, onClick, muted,
+}: {
+  label: string;
+  colorDot: string;
+  statusIcon: React.ReactNode | null;
+  selected: boolean;
+  onClick: () => void;
+  muted?: boolean;
+}) {
+  const [hover, setHover] = useState(false);
+  return (
+    <button
+      onClick={onClick}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      style={{
+        width: '100%',
+        padding: '4px 6px',
+        background: selected ? `${DEEP_PULSE}33` : (hover ? `${DEEP_PULSE}1a` : 'transparent'),
+        border: 'none',
+        borderRadius: 3,
+        color: muted ? TEXT_DIM : (selected ? DEEP_PULSE : '#ddd'),
+        cursor: 'pointer',
+        fontSize: 10,
+        display: 'flex', alignItems: 'center', gap: 6,
+        textAlign: 'left',
+      }}
+    >
+      <span style={{
+        width: 6, height: 6, borderRadius: '50%',
+        background: colorDot,
+        flexShrink: 0,
+      }} />
+      <span style={{
+        flex: 1, minWidth: 0,
+        overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+      }}>{label}</span>
+      {statusIcon}
+    </button>
+  );
+}
+
+// Status icon for one tab. busy = spinning loader, inactive = warning "!",
+// ready = nothing (empty span so layout doesn't shift). Spinner animation
+// uses the same global `pq-spinner` rule already defined in the overlay's
+// CSS keyframes (see pq-spinner class on Replay button).
+function StatusIcon({ status, color }: { status: 'busy' | 'inactive' | 'ready'; color: string }) {
+  if (status === 'busy') {
+    return (
+      <span style={{ flexShrink: 0, display: 'inline-flex' }}>
+        <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="3" strokeLinecap="round" aria-hidden="true" style={{ animation: 'pq-spin 0.9s linear infinite' }}>
+          <path d="M12 2v4" />
+          <path d="M12 18v4" />
+          <path d="M4.93 4.93l2.83 2.83" />
+          <path d="M16.24 16.24l2.83 2.83" />
+          <path d="M2 12h4" />
+          <path d="M18 12h4" />
+          <path d="M4.93 19.07l2.83-2.83" />
+          <path d="M16.24 7.76l2.83-2.83" />
+        </svg>
+      </span>
+    );
+  }
+  if (status === 'inactive') {
+    return (
+      <span title="Tab is not active — waiting for you to switch to it and submit a prompt" style={{
+        flexShrink: 0,
+        width: 11, height: 11, borderRadius: '50%',
+        background: 'transparent',
+        border: `1px solid ${color}`,
+        color,
+        fontSize: 8, fontWeight: 700, lineHeight: '9px',
+        display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+      }}>!</span>
+    );
+  }
+  // ready: occupy 0 width so the row layout stays consistent across statuses.
+  return null;
 }

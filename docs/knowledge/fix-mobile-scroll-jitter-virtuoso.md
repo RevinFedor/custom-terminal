@@ -24,7 +24,7 @@
 
 `content-visibility: auto` несовместим с любой виртуализацией, которая опирается на ResizeObserver или DOM-measurement (react-virtuoso, react-window, virtua, tanstack/react-virtual). Применяй CV только в **не-виртуальных** длинных списках где DOM полный.
 
-См. `methodology/мобильный-дизайн.md::content-visibility: auto + virtualization = конфликт`.
+См. `methodology/переносимый-дизайн-mobile.md::content-visibility: auto + virtualization = конфликт`.
 
 ## Telemetry для подтверждения
 

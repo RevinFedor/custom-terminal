@@ -1,12 +1,12 @@
-import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { HashRouter, Navigate, Route, Routes, useNavigate, useParams } from 'react-router-dom';
-import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
+import { Virtualizer, type VirtualizerHandle } from 'virtua';
 // localStorage cache (cache.ts) replaced by IndexedDB record store (idb.ts) —
 // see fact-mobile-web.md::IDB record store. The cache module is kept on disk
 // for now in case rollback is needed, but no longer imported.
-import { Api, bootstrapToken, clearToken, getToken, setToken, wsUrl, type ProjectInfo, type TabInfo, type TimelineEntry } from './api';
+import { Api, bootstrapToken, clearToken, getToken, setToken, eventsUrl, type ProjectInfo, type TabInfo, type TimelineEntry } from './api';
 import { createMessageReducer, type UiEntry } from './messages';
 import { streamHistory, type StreamMeta } from './streamHistory';
 import { readCachedHistory, writeFullHistory, dropSession } from './idb';
@@ -471,7 +471,13 @@ function TerminalTabRow({ tab, onTap, onLongPress }: { tab: TabInfo; onTap: () =
         }} />
       )}
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, position: 'relative' }}>
-        <span style={{ width: 9, height: 9, borderRadius: 999, background: accentColor, opacity: 0.8, flexShrink: 0 }} />
+        <span style={{
+          width: 9, height: 9, borderRadius: 999, flexShrink: 0,
+          background: tab.sessionStatus === 'active' ? '#a6e3a1' :
+                      tab.sessionStatus === 'busy' ? '#d97706' :
+                      tab.sessionStatus === 'inactive' ? '#555' : accentColor,
+          opacity: 0.85,
+        }} />
         <span style={{
           fontSize: 10, color: accentColor, textTransform: 'uppercase', letterSpacing: 0.5,
           background: `${accentColor}1f`, padding: '2px 6px', borderRadius: 4, fontWeight: 600,
@@ -490,8 +496,17 @@ function TerminalTabRow({ tab, onTap, onLongPress }: { tab: TabInfo; onTap: () =
           </span>
         )}
       </div>
-      <div style={{ fontSize: 11, color: '#555', marginTop: 4, position: 'relative' }}>
-        {tab.claudeSessionId ? `${tab.claudeSessionId.slice(0, 8)}…` : (tab.cwd ? tab.cwd.split('/').slice(-2).join('/') : 'tap to view')}
+      <div style={{ fontSize: 11, color: '#555', marginTop: 4, position: 'relative', display: 'flex', alignItems: 'center', gap: 8 }}>
+        {tab.sessionStatus && (
+          <span style={{
+            color: tab.sessionStatus === 'active' ? '#a6e3a1' :
+                   tab.sessionStatus === 'busy' ? '#d97706' : '#777',
+            fontWeight: 500, fontSize: 10, textTransform: 'uppercase', letterSpacing: 0.4,
+          }}>
+            {tab.sessionStatus}
+          </span>
+        )}
+        <span>{tab.claudeSessionId ? `${tab.claudeSessionId.slice(0, 8)}…` : (tab.cwd ? tab.cwd.split('/').slice(-2).join('/') : 'tap to view')}</span>
       </div>
     </button>
   );
@@ -742,7 +757,10 @@ function ProjectView(props: {
   const [renameTarget, setRenameTarget] = useState<TabInfo | null>(null);
 
   const sdkTabs = tabs.filter((t) => t.tabType === 'claude-sdk' && t.tabId);
-  const otherTabs = tabs.filter((t) => t.tabType !== 'claude-sdk' && t.tabId);
+  // PTY tabs running Claude CLI — mobile can open them as a chat just like SDK tabs.
+  const claudeTabs = tabs.filter((t) => t.tabType !== 'claude-sdk' && t.commandType === 'claude' && t.tabId);
+  // Plain shell / Gemini / other PTY tabs — still read-only on mobile.
+  const otherTabs = tabs.filter((t) => t.tabType !== 'claude-sdk' && t.commandType !== 'claude' && t.tabId);
 
   const create = async () => {
     setCreating(true);
@@ -759,6 +777,21 @@ function ProjectView(props: {
       if (newTab) onOpenChat(newTab);
     } catch (e: any) {
       alert('Create failed: ' + e.message);
+    } finally {
+      setCreating(false);
+    }
+  };
+
+  const createClaude = async () => {
+    setCreating(true);
+    try {
+      const r = await Api.createClaudeTab(project.id);
+      await onCreated();
+      const fresh = await Api.listTabs(project.id);
+      const newTab = fresh.tabs.find(x => x.tabId === r.tabId);
+      if (newTab) onOpenChat(newTab);
+    } catch (e: any) {
+      alert('Create Claude terminal failed: ' + e.message);
     } finally {
       setCreating(false);
     }
@@ -826,9 +859,12 @@ function ProjectView(props: {
         left={<button className="noted-icon" style={S.iconBtn} onClick={onBack}>←</button>}
         subtitle={project.path}
       />
-      <div style={{ padding: 12 }}>
+      <div style={{ padding: 12, display: 'flex', flexDirection: 'column', gap: 8 }}>
         <button onClick={create} disabled={creating} style={S.primaryBtn}>
           {creating ? 'Creating…' : '+ New SDK chat'}
+        </button>
+        <button onClick={createClaude} disabled={creating} style={S.primaryBtn}>
+          {creating ? 'Creating…' : '+ New Claude terminal'}
         </button>
       </div>
       <div style={{ flex: 1, overflowY: 'auto', padding: '4px 12px 32px' }}>
@@ -842,6 +878,20 @@ function ProjectView(props: {
             onLongPress={() => setActionTarget({ tab: t, kind: 'sdk' })}
           />
         ))}
+
+        {claudeTabs.length > 0 && (
+          <>
+            <SectionHeader>Claude terminals</SectionHeader>
+            {claudeTabs.map((t) => (
+              <TerminalTabRow
+                key={t.tabId}
+                tab={t}
+                onTap={() => onOpenChat(t)}
+                onLongPress={() => setActionTarget({ tab: t, kind: 'terminal' })}
+              />
+            ))}
+          </>
+        )}
 
         <SectionHeader>Terminal tabs</SectionHeader>
         {otherTabs.length === 0 && <Empty>None in this project.</Empty>}
@@ -933,7 +983,7 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
   //     the next mount opens instantly.
   const [entries, setEntries] = useState<UiEntry[]>([]);
   const [busy, setBusy] = useState(false);
-  const [historyLoading, setHistoryLoading] = useState<boolean>(!!tab.claudeSessionId || tab.tabType === 'claude-sdk');
+  const [historyLoading, setHistoryLoading] = useState<boolean>(!!tab.claudeSessionId || tab.tabType === 'claude-sdk' || tab.commandType === 'claude');
   const [sessionId, setSessionId] = useState<string | undefined>(tab.claudeSessionId || tab.live?.sessionId);
   const [wsState, setWsState] = useState<'connecting' | 'open' | 'closed'>('connecting');
   const [text, setText] = useState('');
@@ -952,11 +1002,107 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
   // atBottomStateChange to know whether to extend the tail when WS messages
   // arrive vs leaving the user's reading position alone.
   const [atBottom, setAtBottom] = useState<boolean>(true);
+  // For PTY+Claude tabs only: lifecycle of the Claude CLI process inside the PTY.
+  // null = SDK tab (status concept doesn't apply). Polled on mount + after every
+  // /resume + after /stop. WS snapshot also updates it on connect.
+  const [claudeStatus, setClaudeStatus] = useState<'active' | 'busy' | 'inactive' | 'starting' | null>(
+    tab.commandType === 'claude' ? (tab.sessionStatus || null) : null,
+  );
+  const [resuming, setResuming] = useState(false);
+  const [stopping, setStopping] = useState(false);
+  const isClaudePtyTab = tab.commandType === 'claude' && tab.tabType !== 'claude-sdk';
+
+  // Poll status on mount AND every time sessionId resolves (newly created tabs
+  // get their sessionId via WS a few seconds after Claude spawns; we need to
+  // re-poll then so the "Starting Claude…" strip flips to active composer).
+  useEffect(() => {
+    if (!isClaudePtyTab || !tab.tabId) return;
+    let cancelled = false;
+    const poll = () => Api.claudeStatus(tab.tabId!).then((d) => {
+      if (!cancelled && d?.status) setClaudeStatus(d.status);
+    }).catch(() => {});
+    poll();
+    return () => { cancelled = true; };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab.tabId, isClaudePtyTab, sessionId]);
+
+  // Resume/Stop loaders are driven by the SSE-sourced claudeStatus, NOT by the
+  // HTTP reply (which returns in ~20ms, long before Claude is actually up). No
+  // timeouts: the loader holds until the real lifecycle event arrives.
+  //   • Resume in flight → clears when status flips to active|busy (Claude TUI
+  //     rendered ⏵, broadcast via clearBridgeTab/ClaudePromptReady snapshot).
+  //   • Stop in flight   → clears when status flips to inactive (PTY-exit /
+  //     clearBridgeTab snapshot after the process actually died).
+  useEffect(() => {
+    if (resuming && (claudeStatus === 'active' || claudeStatus === 'busy')) {
+      Api.log('MobResume', 'loader-cleared', { tabId: (tab.tabId || '').slice(-12), status: claudeStatus });
+      setResuming(false);
+    }
+  }, [resuming, claudeStatus, tab.tabId]);
+  useEffect(() => {
+    if (stopping && claudeStatus === 'inactive') {
+      Api.log('MobStop', 'loader-cleared', { tabId: (tab.tabId || '').slice(-12), status: claudeStatus });
+      setStopping(false);
+    }
+  }, [stopping, claudeStatus, tab.tabId]);
+
+  const onResume = async () => {
+    if (!tab.tabId || resuming) return;
+    Api.log('MobResume', 'click', { tabId: tab.tabId.slice(-12), status: claudeStatus, ssid: (tab.claudeSessionId || sessionId || '').slice(0, 8) });
+    setResuming(true);
+    const t0 = performance.now();
+    try {
+      const r = await Api.resumeClaudeTab(tab.tabId);
+      Api.log('MobResume', 'reply-ok', { tabId: tab.tabId.slice(-12), elapsedMs: Math.round(performance.now() - t0), alreadyRunning: !!r?.alreadyRunning });
+      if (r?.alreadyRunning) {
+        // Claude was already live (mobile's SSE-derived status was stale vs the
+        // bridge's authoritative presence check). No fresh active-snapshot will
+        // arrive because the status never changed — clear the loader here and
+        // sync the local status, else the spinner would hang forever.
+        setClaudeStatus('active');
+        setResuming(false);
+      }
+      // Otherwise loader stays ON — cleared by the claudeStatus→active|busy
+      // effect when the SSE snapshot says Claude is really up.
+    } catch (e: any) {
+      Api.log('MobResume', 'reply-err', { tabId: tab.tabId.slice(-12), msg: String(e?.message || e) });
+      setResuming(false); // HTTP itself failed — no lifecycle event will come
+      alert('Resume failed: ' + e.message);
+    }
+  };
+
+  const onHeaderStop = async () => {
+    if (!tab.tabId || stopping) return;
+    Api.log('MobStop', 'header-click', { tabId: tab.tabId.slice(-12), busy, status: claudeStatus });
+    setStopping(true);
+    try {
+      const r = await Api.stop(tab.tabId);
+      Api.log('MobStop', 'header-reply-ok', { tabId: tab.tabId.slice(-12), stopped: !!r?.stopped });
+      if (r && r.stopped === false) {
+        // No live process to kill (mobile status was stale vs the real PTY —
+        // Claude already exited). No inactive-snapshot will arrive because the
+        // process was already gone, so clear the loader + sync status here,
+        // else STOPPING would hang forever.
+        setClaudeStatus('inactive');
+        setStopping(false);
+      }
+      // Otherwise loader stays ON until the claudeStatus→inactive effect clears
+      // it (driven by the real PTY-exit SSE snapshot).
+    } catch (e: any) {
+      Api.log('MobStop', 'header-reply-err', { tabId: tab.tabId.slice(-12), msg: String(e?.message || e) });
+      setStopping(false);
+      alert('Stop failed: ' + e.message);
+    }
+  };
 
   const reducer = useRef(createMessageReducer());
-  const wsRef = useRef<WebSocket | null>(null);
+  const esRef = useRef<EventSource | null>(null);
   // Virtuoso handle for programmatic scroll (GoTo, "scroll-to-bottom" FAB).
-  const virtuosoRef = useRef<VirtuosoHandle | null>(null);
+  const virtuosoRef = useRef<VirtualizerHandle | null>(null);
+  // Ref to the scrollable parent — virtua needs this directly (not the
+  // Virtualizer ref) so that flex-spacer pattern works. virtuoso owned the
+  // scroller internally; in virtua the scroller is OUR div.
+  const scrollParentRef = useRef<HTMLDivElement | null>(null);
   // Last seen scrollTop — for jitter telemetry (compute delta on each scroll).
   const lastScrollTopRef = useRef<number>(0);
   // True until we've performed the one-time "scroll to last message" after
@@ -1035,7 +1181,7 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
   // ── Timeline prefetch (independent of chat data) ────────────────────────
   useEffect(() => {
     if (!tab.tabId) return;
-    if (!tab.claudeSessionId && tab.tabType !== 'claude-sdk') return;
+    if (!tab.claudeSessionId && tab.tabType !== 'claude-sdk' && tab.commandType !== 'claude') return;
     let cancelled = false;
     Api.timeline(tab.tabId)
       .then((d) => { if (!cancelled) setTimelineEntries(d.entries || []); })
@@ -1098,11 +1244,7 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
     setDrawerOpen(false);
     requestAnimationFrame(() => {
       scrollDiag('scrollToIndex', { from: 'goToEntry', index: targetIdx, align: 'center' });
-      virtuosoRef.current?.scrollToIndex({
-        index: targetIdx,
-        align: 'center',
-        behavior: 'auto', // instant jump — smooth-scroll across 5000 items kills iOS
-      });
+      virtuosoRef.current?.scrollToIndex(targetIdx, { align: 'center' });
       // Trigger background highlight on the target row. The row renderer
       // reads `flashUuid` and applies a 1.5s transition.
       setFlashUuid(uuid);
@@ -1114,7 +1256,15 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
   // ── History load: hydrate from IDB → stream NDJSON delta ────────────────
   useEffect(() => {
     if (!tab.tabId) { setHistoryLoading(false); return; }
-    if (!tab.claudeSessionId && tab.tabType !== 'claude-sdk') {
+    if (!tab.claudeSessionId && tab.tabType !== 'claude-sdk' && tab.commandType !== 'claude') {
+      setHistoryLoading(false);
+      return;
+    }
+    // PTY+Claude tab created fresh (no sessionId yet): keep "loading" banner
+    // hidden until the bridge watcher delivers the first message via WS — the
+    // user sees empty chat with "No messages yet" placeholder while Claude CLI
+    // boots, which matches the desktop UX.
+    if (tab.commandType === 'claude' && !tab.claudeSessionId) {
       setHistoryLoading(false);
       return;
     }
@@ -1383,52 +1533,44 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
     // lets it finish layout/measure of the newly-mounted last item.
     requestAnimationFrame(() => requestAnimationFrame(() => {
       scrollDiag('scrollToIndex', { from: 'initialLoad', index: entries.length - 1, align: 'end' });
-      virtuosoRef.current?.scrollToIndex({
-        index: entries.length - 1,
-        align: 'end',
-        behavior: 'auto',
-      });
+      virtuosoRef.current?.scrollToIndex(entries.length - 1, { align: 'end' });
     }));
   }, [entries.length]);
 
-  // ── WebSocket: live messages, busy, done ─────────────────────────────────
-  // Auto-reconnect with backoff. Safari aggressively closes WS in background
-  // tabs (~30s) and on any network blip. Without reconnect the user comes
-  // back from their pocket and sees a dead chat — no spinner, no error, just
-  // silence — until they full-reload the page. Backoff: 1s → 2s → 5s → 10s
-  // → 30s, capped. Reset to 1s on successful onopen.
+  // ── Live channel via SSE (EventSource) ───────────────────────────────────
+  // Was WebSocket. Switched to SSE because Yandex Browser / Chrome anti-tracker
+  // extensions silently block ws:// to private LAN IPs — fetch() works but the
+  // WS handshake never leaves the browser (deterministically observed: HTTP
+  // 200, WS stuck readyState=0 forever, server sees zero upgrades; meanwhile
+  // curl to the same host gets 101). SSE rides plain HTTP GET (/api/events),
+  // which those layers don't touch. EventSource also has built-in reconnect,
+  // so the hand-rolled backoff/watchdog/visibility machinery is gone — the
+  // browser owns recovery. The onmessage parsing below is transport-agnostic
+  // (same JSON envelope as WS). See fact-mobile-web.md::SSE transport.
   useEffect(() => {
     if (!tab.tabId) return;
     const tabIdLocal = tab.tabId;
     let cancelled = false;
-    let backoffMs = 1000;
-    let reconnectTimer: any = null;
 
     const connect = () => {
       if (cancelled) return;
-      const ws = new WebSocket(wsUrl(tabIdLocal));
-      wsRef.current = ws;
-      ws.onopen = () => {
-        if (cancelled) { try { ws.close(); } catch {} return; }
+      const u = eventsUrl(tabIdLocal);
+      Api.log('SSE', 'connect-attempt', { tag: tabIdLocal.slice(-12), host: location.host });
+      const es = new EventSource(u);
+      esRef.current = es;
+      es.onopen = () => {
+        if (cancelled) { try { es.close(); } catch {} return; }
         setWsState('open');
-        backoffMs = 1000; // reset
-        Api.log('WS', 'open', { tag: tabIdLocal.slice(-12) });
+        Api.log('SSE', 'open', { tag: tabIdLocal.slice(-12) });
       };
-      ws.onclose = (ev) => {
+      es.onerror = () => {
         if (cancelled) return;
-        setWsState('closed');
-        Api.log('WS', 'close', { tag: tabIdLocal.slice(-12), code: ev.code, reason: ev.reason || '', clean: ev.wasClean, backoffMs });
-        // Schedule reconnect
-        clearTimeout(reconnectTimer);
-        reconnectTimer = setTimeout(connect, backoffMs);
-        backoffMs = Math.min(30000, Math.round(backoffMs * 1.8));
+        // EventSource auto-reconnects (readyState CONNECTING=0). Only surface
+        // 'closed' when it truly gave up (readyState CLOSED=2).
+        setWsState(es.readyState === 2 ? 'closed' : 'connecting');
+        Api.log('SSE', 'error', { tag: tabIdLocal.slice(-12), readyState: es.readyState });
       };
-      ws.onerror = () => {
-        if (cancelled) return;
-        setWsState('closed');
-        // onerror is followed by onclose — don't double-schedule reconnect.
-      };
-      ws.onmessage = (ev) => {
+      es.onmessage = (ev) => {
         try {
           const m = JSON.parse(ev.data);
           // Diagnostic: log every WS message TYPE so we can correlate
@@ -1445,13 +1587,38 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
             scrollDiag('ws-msg', { type: m.type, busy: m.busy });
           }
           if (m.type === 'snapshot') {
+            Api.log('MobWS', 'snapshot', { tab: (tab.tabId || '').slice(-12), busy: !!m.busy, sessionStatus: m.sessionStatus, sid: (m.sessionId || '').slice(0, 8) });
             if (m.sessionId) setSessionId(m.sessionId);
             setBusy(!!m.busy);
+            // sessionStatus is set by the CLAUDE-tab fs-watcher snapshot when
+            // a PTY+Claude tab is opened — gives the phone immediate truth
+            // about active/busy/inactive without waiting for the periodic poll.
+            if (m.sessionStatus && isClaudePtyTab) setClaudeStatus(m.sessionStatus);
+          } else if (m.type === 'bridge-update') {
+            // PTY+Claude only — main mirrors statusline bridge writes (model,
+            // contextPct) so the phone header pill stays in sync without
+            // polling. SDK has its own usage path via assistant SSE.
+            if (m.model) setResolvedModel(m.model);
+            if (typeof m.contextPct === 'number' && m.contextPct > 0) {
+              // The header uses usedTokens / contextWindow to compute %; we
+              // already have contextPct from main, so back-derive a token
+              // count. Window depends on model — opus 1M, others 200K.
+              const win = (m.model || '').toLowerCase().includes('1m') ? 1_000_000 : 200_000;
+              setUsedTokens(Math.round(win * m.contextPct / 100));
+            }
           } else if (m.type === 'busy') {
+            Api.log('MobWS', 'busy', { tab: (tab.tabId || '').slice(-12), busy: !!m.busy });
             setBusy(!!m.busy);
+            // Bridge the new busy events that main now broadcasts for PTY+Claude
+            // tabs (hook-driven) into the status string the Resume-banner check
+            // depends on. Otherwise the composer would stay enabled while
+            // Claude is mid-turn and a Send would race the previous prompt.
+            if (isClaudePtyTab) setClaudeStatus(m.busy ? 'busy' : 'active');
           } else if (m.type === 'done') {
+            Api.log('MobWS', 'done', { tab: (tab.tabId || '').slice(-12), sid: (m.sessionId || '').slice(0, 8) });
             setBusy(false);
             if (m.sessionId) setSessionId(m.sessionId);
+            if (isClaudePtyTab) setClaudeStatus('active');
             // Turn ended naturally — clear in-flight refs so a later stop()
             // (no-op at this point) doesn't try to restore an old prompt.
             pendingPromptRef.current = null;
@@ -1500,8 +1667,7 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
 
     return () => {
       cancelled = true;
-      clearTimeout(reconnectTimer);
-      try { wsRef.current?.close(); } catch {}
+      try { esRef.current?.close(); } catch {}
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tab.tabId]);
@@ -1513,11 +1679,7 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
 
   const scrollChatToBottom = useCallback(() => {
     scrollDiag('scrollToIndex', { from: 'scrollChatToBottom', index: entries.length - 1, align: 'end' });
-    virtuosoRef.current?.scrollToIndex({
-      index: entries.length - 1,
-      align: 'end',
-      behavior: 'auto',
-    });
+    virtuosoRef.current?.scrollToIndex(entries.length - 1, { align: 'end' });
   }, [entries.length]);
 
   // Track the prompt that's currently in flight + whether the assistant has
@@ -1559,8 +1721,11 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
     // by the time stop completes, more chunks could have arrived.
     const earlyStop = !assistantStartedThisTurnRef.current && !!pendingPromptRef.current;
     const promptToRestore = pendingPromptRef.current;
-    try { await Api.stop(tab.tabId); } catch {}
+    Api.log('MobStop', 'composer-click', { tabId: tab.tabId.slice(-12), busy, status: claudeStatus, earlyStop, isClaudePty: isClaudePtyTab });
+    const t0 = performance.now();
+    try { await Api.stop(tab.tabId); Api.log('MobStop', 'reply-ok', { tabId: tab.tabId.slice(-12), elapsedMs: Math.round(performance.now() - t0) }); } catch (e: any) { Api.log('MobStop', 'reply-err', { tabId: tab.tabId.slice(-12), msg: String(e?.message || e) }); }
     setBusy(false);
+    Api.log('MobStop', 'after-setBusy-false', { tabId: tab.tabId.slice(-12) });
     if (earlyStop && promptToRestore) {
       // Restore the prompt to composer so user can edit + resubmit. Same UX
       // as desktop ClaudeSDKTab.onCancel "(B) assistant emitted nothing".
@@ -1575,11 +1740,14 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
 
   const isTerminal = tab.tabType !== 'claude-sdk';
   const canTimeline = !!(sessionId || tab.claudeSessionId);
-  const canParams = !readOnly && !isTerminal && !!tab.tabId;
+  // Params pill (model · effort): SDK tabs always; PTY tabs only when Claude
+  // is actually live in the TUI (slash commands need an active prompt to
+  // route through safePasteAndSubmit's Stash flow without losing user text).
+  const canParams = !readOnly && !!tab.tabId && (!isTerminal || (isClaudePtyTab && (claudeStatus === 'active' || claudeStatus === 'busy')));
 
-  // Context window per model: 1M for opus-4-7, 200K otherwise. Pulled from
-  // the model id the API actually returned (not the user-selected alias) so
-  // silent downgrades show the correct window.
+  // Context window per model: 1M for Opus 4.8+ (or any [1m] variant), 200K
+  // otherwise. Pulled from the model id the API actually returned (not the
+  // user-selected alias) so silent downgrades show the correct window.
   //
   // Show USED %, not remaining. Old formula (100 - used/window*100) showed
   // 92% at start of chat = "92% remaining" — but users read "92%" as "92%
@@ -1588,7 +1756,15 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
   //   < 75% → muted grey (plenty of room)
   //   75-90% → amber (consider /compact)
   //   > 90% → red (about to overflow)
-  const contextWindow = (resolvedModel || '').includes('opus-4-7') ? 1_000_000 : 200_000;
+  // 1M when: explicit [1m] tag, or Opus 4.8+ (1M-by-default on the API).
+  // 4.5/4.6/4.7 Opus and all Sonnet/Haiku are 200K unless the [1m] variant.
+  const contextWindow = (() => {
+    const m = (resolvedModel || '').toLowerCase();
+    if (/\[1m\]/.test(m)) return 1_000_000;
+    const ov = m.match(/opus-(\d+)[-.](\d+)/);
+    if (ov) { const v = `${ov[1]}.${ov[2]}`; if (v !== '4.5' && v !== '4.6' && v !== '4.7') return 1_000_000; }
+    return 200_000;
+  })();
   const contextPercent = usedTokens != null ? Math.max(0, Math.min(100, (usedTokens / contextWindow) * 100)) : null;
   const contextColor = contextPercent == null ? '#666'
     : contextPercent > 90 ? '#ef4444'
@@ -1627,7 +1803,7 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
             }}>
               {tab.name}
             </span>
-            {contextPercent != null && !isTerminal && (
+            {contextPercent != null && (!isTerminal || isClaudePtyTab) && (
               <span style={{
                 fontSize: 10, color: contextColor, fontWeight: 600, fontVariantNumeric: 'tabular-nums',
               }}>
@@ -1677,6 +1853,24 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
             send/stop is one mental action, having Stop top-right and Send
             bottom-right meant two different muscle paths for the same idea. */}
         <div style={{ display: 'flex', gap: 4, alignItems: 'center', flex: '0 0 auto', marginLeft: 'auto' }}>
+          {/* Stop — kills Claude in the PTY (Ctrl+C × 2). Shell survives so a
+              Resume from this same tab brings Claude back on the same sessionId. */}
+          {isClaudePtyTab && (claudeStatus === 'active' || claudeStatus === 'busy' || stopping) && !readOnly && (
+            <button
+              className="noted-icon"
+              disabled={stopping}
+              style={{
+                ...S.iconBtn,
+                width: 'auto', minWidth: 32, paddingLeft: 8, paddingRight: 8,
+                fontSize: 13, color: '#f87171', borderColor: 'rgba(248,113,113,0.4)',
+                display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: 5,
+              }}
+              onClick={onHeaderStop}
+              title={stopping ? 'Stopping Claude…' : 'Stop Claude in this tab (keeps the session, Resume to reattach)'}
+            >
+              {stopping ? <><InlineSpinner color="#f87171" /><span style={{ fontSize: 11 }}>STOPPING</span></> : '■'}
+            </button>
+          )}
           {canTimeline && (
             <button
               className="noted-icon"
@@ -1722,20 +1916,30 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
         </div>
       )}
 
-      {/* Virtualized chat: react-virtuoso keeps mounted DOM proportional to
-          viewport — ~15-30 items at any time regardless of `entries.length`.
-          Properties:
-            - data: full array. Virtuoso slices it itself.
-            - firstItemIndex: stable anchor for "older messages prepended"
-              (we don't currently prepend after initial load since stream
-              uses ?after=lastUuid → only deltas at tail. firstItemIndex
-              stays constant; left in place for future prepend support.)
-            - followOutput: 'smooth' when at bottom → live messages keep
-              the user pinned. Returns false when not at bottom, virtuoso
-              leaves position alone.
-            - atBottomStateChange: drives the ↓ FAB visibility.
-            - increaseViewportBy: 800px overscan for iOS Safari momentum
-              scroll (react-virtuoso issue #1049 workaround). */}
+      {/* Virtualized chat using virtua (migrated from react-virtuoso 2026-05-28
+          after 4 days of hitting the iOS scroll-teleport cascade bug — see
+          fix-mobile-scroll-teleport.md). Architecture:
+
+          - OUR div is the scroll container (virtua doesn't own it). This means
+            we control overflow, padding, momentum-scroll CSS, and most
+            importantly: we pass scrollRef to Virtualizer so it knows where
+            to listen for scroll/resize events.
+          - flex-column + flex-grow:1 spacer + Virtualizer = "bottom-anchored
+            chat layout" pattern documented in virtua 0.48.0 release notes
+            (replaces the removed `reverse` prop).
+          - overflow-anchor: none on the scroll container disables browser
+            scroll-anchoring so virtua's own jump-compensation isn't fighting
+            the browser. virtua sets this internally on the viewport too, but
+            we set it on the outer to be defensive.
+          - onScroll callback gives us the offset directly (no event.target
+            unwrapping). atBottom calculation: scrollSize − scrollOffset −
+            viewportSize < threshold. We drive setAtBottom from here.
+          - followOutput equivalent: useEffect on entries.length checks if
+            user was near bottom BEFORE the update and only then scrolls
+            to last index. Same UX semantics as virtuoso's auto-follow.
+          - ScrollDiag kept: same tags as before, helps if a future regression
+            happens; teleport bug needed instrumentation to diagnose, virtua
+            failure modes will need the same. */}
       <div style={{ flex: 1, minHeight: 0, position: 'relative' }}>
         {historyLoading && entries.length === 0 && (
           <div style={{
@@ -1762,87 +1966,143 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
           </div>
         )}
         {entries.length > 0 && (
-          <Virtuoso
-            ref={virtuosoRef}
-            data={entries}
-            firstItemIndex={firstItemIndex}
-            initialTopMostItemIndex={Math.max(0, entries.length - 1)}
-            followOutput={(isAtBottom) => {
-              // Telemetry: did virtuoso decide to autofollow on this update?
-              // 'smooth' value here causes a programmatic scroll which IS the
-              // backward-jerk if isAtBottom is true at a moment when the user
-              // is actually scrolling up (race: atBottomStateChange hasn't
-              // fired yet for the new position).
-              scrollDiag('followOutput', { isAtBottom, returned: isAtBottom ? 'smooth' : false, len: entries.length });
-              return isAtBottom ? 'smooth' : false;
+          <div
+            ref={scrollParentRef}
+            onScroll={() => {
+              // atBottom recompute on each DOM-scroll. virtua's onScroll on
+              // <Virtualizer> below handles delta-tagged ScrollDiag — this
+              // outer one only updates atBottom (which depends on scrollSize
+              // / viewportSize, available via the virtua handle).
+              const h = virtuosoRef.current;
+              if (!h) return;
+              const distFromBottom = h.scrollSize - h.scrollOffset - h.viewportSize;
+              const nextAtBottom = distFromBottom < 120;
+              setAtBottom((prev) => {
+                if (prev !== nextAtBottom) {
+                  scrollDiag('atBottomStateChange', { atBottom: nextAtBottom, dist: Math.round(distFromBottom) });
+                  return nextAtBottom;
+                }
+                return prev;
+              });
             }}
-            atBottomStateChange={(b) => {
-              scrollDiag('atBottomStateChange', { atBottom: b });
-              setAtBottom(b);
+            style={{
+              height: '100%',
+              overflowY: 'auto',
+              overflowAnchor: 'none',
+              WebkitOverflowScrolling: 'touch',
+              display: 'flex',
+              flexDirection: 'column',
+              overscrollBehavior: 'contain',
             }}
-            isScrolling={(s) => {
-              // Snap a marker every time scroll-state flips. If we then see a
-              // [ScrollDiag] flushReducer immediately after `isScrolling=true`,
-              // the React state-update is the suspect.
-              scrollDiag('isScrolling', { isScrolling: s });
-            }}
-            // Track raw scrollTop on every onScroll — needed to detect
-            // backward jumps. We log the delta vs last seen position; large
-            // negative deltas == "got jerked back".
-            onScroll={(ev) => {
-              const target = ev.target as HTMLElement;
-              const top = target?.scrollTop ?? 0;
-              const last = (lastScrollTopRef.current ?? top);
-              const delta = top - last;
-              lastScrollTopRef.current = top;
-              // Log only meaningful deltas (>10px). Backward jumps tagged.
-              if (Math.abs(delta) > 10) {
-                scrollDiag('scroll', { top, delta, height: target?.scrollHeight, force: delta < -20 });
-              }
-            }}
-            atBottomThreshold={120}
-            increaseViewportBy={{ top: 800, bottom: 800 }}
-            // skipAnimationFrameInResizeObserver: virtuoso #1049 — Safari
-            // momentum-scroll + ResizeObserver-in-rAF causes janky scroll on
-            // dynamic-height items. Disabling the rAF wrapper is the documented
-            // workaround when items have meaningful height variance (markdown).
-            skipAnimationFrameInResizeObserver
-            itemContent={(_index, entry) => (
-              <div
-                data-entry-uuid={(entry as any).entryUuid || undefined}
-                style={{
-                  // NO content-visibility:auto here — incompatible with virtuoso.
-                  // Virtuoso uses ResizeObserver to learn each item's real
-                  // height and cache it. content-visibility:auto reports the
-                  // FAKE contain-intrinsic-size (200px) for off-screen items,
-                  // so when the user scrolls up and a previously-off-screen
-                  // 600px assistant text "wakes up", virtuoso suddenly learns
-                  // the real height → recomputes total list size → bumps
-                  // scrollTop → user sees the chat jerk backward as they scroll.
-                  // Virtuoso already keeps DOM bounded; content-visibility is
-                  // pure overhead here that breaks measurements.
-                  background: flashUuid && ((entry as any).entryUuid === flashUuid || (entry as any).entryUuid?.startsWith(flashUuid.slice(0, 8)))
-                    ? 'rgba(255,178,130,0.18)'
-                    : 'transparent',
-                  transition: 'background 0.4s ease-out',
-                }}
-              >
-                <EntryView entry={entry} />
+          >
+            {/* Bottom-anchor spacer: pushes the Virtualizer to the bottom when
+                content is shorter than viewport. Without it, chat would sit
+                at the top with empty space below. */}
+            <div style={{ flexGrow: 1 }} />
+            <Virtualizer
+              ref={virtuosoRef}
+              scrollRef={scrollParentRef}
+              onScroll={(offset) => {
+                // virtua-driven onScroll fires for both user scroll and
+                // programmatic scrollToIndex. Used here only to detect that
+                // virtua is alive — actual offset/atBottom logic is in the
+                // outer div's onScroll above (it has access to scrollSize
+                // via the handle, which is needed for atBottom math).
+                const last = lastScrollTopRef.current ?? offset;
+                const delta = offset - last;
+                lastScrollTopRef.current = offset;
+                if (Math.abs(delta) > 10) {
+                  scrollDiag('scroll', { top: offset, delta, force: delta < -20 });
+                }
+              }}
+              onScrollEnd={() => scrollDiag('isScrolling', { isScrolling: false })}
+            >
+              {entries.map((entry, _index) => {
+                const uuid = (entry as any).entryUuid;
+                const key = uuid || (entry as any).id || _index;
+                return (
+                  <div
+                    key={key}
+                    data-entry-uuid={uuid || undefined}
+                    style={{
+                      background: flashUuid && (uuid === flashUuid || uuid?.startsWith(flashUuid.slice(0, 8)))
+                        ? 'rgba(255,178,130,0.18)'
+                        : 'transparent',
+                      transition: 'background 0.4s ease-out',
+                    }}
+                  >
+                    <EntryView entry={entry} />
+                  </div>
+                );
+              })}
+            </Virtualizer>
+            {/* Footer: streaming dots when claude/sdk is mid-turn. Equivalent to
+                virtuoso's components.Footer slot. */}
+            {busy && !readOnly ? (
+              <div style={{ display: 'flex', gap: 6, padding: '8px 14px', color: '#888', fontSize: 12 }}>
+                <span style={S.dot} /> <span style={S.dot} /> <span style={S.dot} />
               </div>
-            )}
-            components={{
-              Footer: () => busy && !readOnly ? (
-                <div style={{ display: 'flex', gap: 6, padding: '8px 14px', color: '#888', fontSize: 12 }}>
-                  <span style={S.dot} /> <span style={S.dot} /> <span style={S.dot} />
-                </div>
-              ) : <div style={{ height: 12 }} />,
-            }}
-            style={{ height: '100%' }}
-          />
+            ) : <div style={{ height: 12 }} />}
+          </div>
         )}
       </div>
       <ScrollToBottomFAB visible={!atBottom && entries.length > 0} onClick={scrollChatToBottom} side="right" />
-      {!readOnly && (
+      {/* "Starting Claude…" strip — Claude process exists (bridge known) but
+          the TUI hasn't drawn its prompt yet. Sending now would race the
+          handshake; show a neutral progress bar instead. Auto-flips to
+          composer when main broadcasts inputReady (event-driven, no polling).
+          See fact-claude-tui-mechanics.md::Section 2. */}
+      {!readOnly && isClaudePtyTab && claudeStatus === 'starting' && !resuming && (
+        <div style={{
+          borderTop: '1px solid #1f1f1f',
+          background: '#0e0e0e',
+          padding: '14px max(10px, env(safe-area-inset-bottom)) 14px',
+          display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8,
+          color: '#888', fontSize: 13,
+        }}>
+          <span style={S.dot} /> <span style={S.dot} /> <span style={S.dot} />
+          <span>Starting Claude…</span>
+        </div>
+      )}
+      {/* Resume banner — shown while a known-session tab is inactive, OR while a
+          resume we just kicked off is still coming up (resuming holds the
+          banner+spinner through the inactive→starting→active transition so the
+          loader doesn't blink out mid-launch). Cleared by the SSE status event. */}
+      {!readOnly && isClaudePtyTab && (tab.claudeSessionId || sessionId) && (claudeStatus === 'inactive' || resuming) && (
+        <div style={{
+          borderTop: '1px solid #1f1f1f',
+          background: '#0e0e0e',
+          padding: '10px 14px max(10px, env(safe-area-inset-bottom)) 14px',
+        }}>
+          {wsState !== 'open' && (
+            <div style={{ marginBottom: 8, padding: '6px 12px', borderRadius: 10, background: '#1a1a1a', border: '1px solid #2a2a2a', color: '#777', fontSize: 11, textAlign: 'center' }}>
+              live-канал {wsState === 'connecting' ? 'подключается…' : 'переподключается…'} — Resume сработает, статус обновится как только канал поднимется
+            </div>
+          )}
+          <button
+            onClick={onResume}
+            disabled={resuming || !tab.claudeSessionId}
+            style={{
+              width: '100%', padding: '14px 18px',
+              borderRadius: 14, border: 'none',
+              background: resuming ? '#3a2218' : '#DA7756',
+              color: resuming ? '#DA7756' : '#1a1a1a',
+              fontSize: 15, fontWeight: 600, cursor: resuming ? 'default' : 'pointer',
+              display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8,
+              touchAction: 'manipulation',
+            }}
+            title={resuming ? 'Resuming Claude — waiting for it to come up' : 'Resume the Claude CLI process for this tab'}
+          >
+            {resuming
+              ? (<><InlineSpinner color="#DA7756" /><span>RESUMING…</span></>)
+              : (<>▶ Resume Claude session</>)}
+          </button>
+          <div style={{ marginTop: 6, fontSize: 11, color: '#666', textAlign: 'center' }}>
+            {resuming ? 'launching CLI · waiting for input prompt' : 'session stopped · JSONL preserved'}
+          </div>
+        </div>
+      )}
+      {!readOnly && !(isClaudePtyTab && claudeStatus === 'starting' && !resuming) && !(isClaudePtyTab && (tab.claudeSessionId || sessionId) && (claudeStatus === 'inactive' || resuming)) && (
         <Composer
           text={text}
           setText={setText}
@@ -1903,18 +2163,18 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
 // Each entry's label is the SAME string used in both the Model picker pills
 // (sheet) and as the candidate header pill — single source of truth.
 // `default` keeps a leading marker so the user can see they're on the alias
-// rather than the explicit opus value (both resolve to opus-4.7 in API).
+// rather than the explicit opus value (both resolve to opus-4.8 [1M] in API).
 const SDK_MODELS = [
-  { value: 'default', label: 'default · opus-4.7 [1M]' },
-  { value: 'opus',    label: 'opus-4.7 [1M]' },
+  { value: 'default', label: 'default · opus-4.8 [1M]' },
+  { value: 'opus',    label: 'opus-4.8 [1M]' },
   { value: 'sonnet',  label: 'sonnet-4.6' },
   { value: 'haiku',   label: 'haiku-4.5' },
 ];
 // Header shows the resolved model name even when the alias is `default`,
 // so the badge reflects what the API will actually serve.
 const HEADER_MODEL_LABEL: Record<string, string> = {
-  default: 'opus-4.7 [1M]',
-  opus:    'opus-4.7 [1M]',
+  default: 'opus-4.8 [1M]',
+  opus:    'opus-4.8 [1M]',
   sonnet:  'sonnet-4.6',
   haiku:   'haiku-4.5',
 };
@@ -2548,6 +2808,23 @@ function ParamRow({ label, children }: { label: string; children: any }) {
   );
 }
 
+// Rotating ring spinner. Uses transform:rotate (not opacity) so it survives
+// H.264/JPEG compression on screen recordings — per CLAUDE.md AI-Optimized UI:
+// a moving border is high pixel-delta per frame, an opacity pulse is not.
+// Paired with an UPPERCASE static label ("STOPPING"/"RESUMING") at call sites
+// for OCR reliability.
+function InlineSpinner({ color = '#FFB382', size = 12 }: { color?: string; size?: number }) {
+  return (
+    <span
+      style={{
+        display: 'inline-block', width: size, height: size,
+        border: `2px solid ${color}40`, borderTopColor: color,
+        borderRadius: '50%', animation: 'mob-spin 0.7s linear infinite',
+      }}
+    />
+  );
+}
+
 function ParamPill({ active, onClick, children }: { active: boolean; onClick: () => void; children: any }) {
   return (
     <button
@@ -2583,11 +2860,15 @@ function TimelineDrawer({ open, entries, expanded, onToggle, onGoTo, onDismiss }
   // Virtualize via Virtuoso — same reason as the chat list. On a session with
   // 5000 timeline entries the previous `entries.map(...)` rendered 5000 DOM
   // nodes synchronously, killed Safari with OOM. Virtuoso keeps ~30 mounted.
-  const virtuosoRef = useRef<VirtuosoHandle | null>(null);
+  const virtuosoRef = useRef<VirtualizerHandle | null>(null);
+  // Ref to the scrollable parent — virtua needs this directly (not the
+  // Virtualizer ref) so that flex-spacer pattern works. virtuoso owned the
+  // scroller internally; in virtua the scroller is OUR div.
+  const scrollParentRef = useRef<HTMLDivElement | null>(null);
   const [drawerAtBottom, setDrawerAtBottom] = useState<boolean>(true);
   const drawerScrollDown = () => {
     if (!entries || entries.length === 0) return;
-    virtuosoRef.current?.scrollToIndex({ index: entries.length - 1, align: 'end', behavior: 'auto' });
+    virtuosoRef.current?.scrollToIndex(entries.length - 1, { align: 'end' });
   };
 
   return (
@@ -2632,27 +2913,35 @@ function TimelineDrawer({ open, entries, expanded, onToggle, onGoTo, onDismiss }
             <div style={{ padding: 16, color: '#555', fontSize: 12, textAlign: 'center' }}>Empty timeline.</div>
           )}
           {entries && entries.length > 0 && (
-            <Virtuoso
-              ref={virtuosoRef}
-              data={entries}
-              atBottomStateChange={setDrawerAtBottom}
-              atBottomThreshold={200}
-              increaseViewportBy={{ top: 600, bottom: 600 }}
-              skipAnimationFrameInResizeObserver
-              computeItemKey={(_index, e) => e.uuid}
-              itemContent={(_index, e) => (
-                // No content-visibility — same incompatibility with virtuoso
-                // as in the chat list. Timeline rows have variable expanded
-                // height; cv:auto would clobber virtuoso's measurements.
-                <TimelineEntryRow
-                  entry={e}
-                  expanded={expanded.has(e.uuid)}
-                  onToggle={() => onToggle(e.uuid)}
-                  onGoTo={() => onGoTo(e.uuid)}
-                />
-              )}
-              style={{ height: '100%' }}
-            />
+            <div
+              ref={scrollParentRef}
+              onScroll={() => {
+                const h = virtuosoRef.current;
+                if (!h) return;
+                const distFromBottom = h.scrollSize - h.scrollOffset - h.viewportSize;
+                setDrawerAtBottom(distFromBottom < 200);
+              }}
+              style={{
+                height: '100%',
+                overflowY: 'auto',
+                overflowAnchor: 'none',
+                WebkitOverflowScrolling: 'touch',
+                overscrollBehavior: 'contain',
+              }}
+            >
+              <Virtualizer ref={virtuosoRef} scrollRef={scrollParentRef}>
+                {entries.map((e) => (
+                  <div key={e.uuid}>
+                    <TimelineEntryRow
+                      entry={e}
+                      expanded={expanded.has(e.uuid)}
+                      onToggle={() => onToggle(e.uuid)}
+                      onGoTo={() => onGoTo(e.uuid)}
+                    />
+                  </div>
+                ))}
+              </Virtualizer>
+            </div>
           )}
         </div>
         <ScrollToBottomFAB visible={!drawerAtBottom && !!entries && entries.length > 0} onClick={drawerScrollDown} side="left" bottomOffset={20} />
@@ -2834,8 +3123,30 @@ function EntryView({ entry }: { entry: UiEntry }) {
     return (
       <div
         data-entry-uuid={entry.entryUuid}
-        style={{ display: 'flex', justifyContent: 'flex-end', padding: '6px 12px' }}
+        style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', padding: '6px 12px' }}
       >
+        {/* "queued" chip — desktop отправил из type-ahead очереди (Enter во
+            время стриминга). Mirror desktop UserMsg badge. Live-only; история
+            при reload потеряет флаг — это намеренно (Anthropic JSONL не несёт
+            UI-метаданные). */}
+        {entry.wasQueued && (
+          <div style={{
+            display: 'inline-flex', alignItems: 'center', gap: 3,
+            marginBottom: 4,
+            padding: '2px 6px',
+            borderRadius: 6,
+            background: 'rgba(255, 178, 130, 0.10)',
+            color: '#FFB382',
+            border: '1px solid rgba(255, 178, 130, 0.25)',
+            fontSize: 10,
+            fontWeight: 600,
+            letterSpacing: '0.04em',
+            userSelect: 'none',
+          }}>
+            <span style={{ fontSize: 9 }}>↑</span>
+            <span>QUEUED</span>
+          </div>
+        )}
         <div style={{
           ...S.bubble,
           background: '#1f3a5f',
@@ -3351,6 +3662,7 @@ if (typeof document !== 'undefined' && !document.getElementById('noted-mobile-ke
   0%,100% { opacity: 1; transform: scale(1); }
   50% { opacity: 0.55; transform: scale(0.72); }
 }
+@keyframes mob-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
 /* Suppress iOS text-selection glow on tap & long-press for tab rows / sheet
    buttons. The system selection highlights "TERMINAL"/"SDK" badges otherwise. */
 button, .noted-no-select { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }

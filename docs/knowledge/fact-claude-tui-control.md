@@ -252,15 +252,22 @@ the full history gets re-read on your next message.
 
 ### Auto-inject `/effort` при запуске Claude
 
-В StatusBar справа — pill `Effort: max` (default per-app, не per-tab). При каждом запуске Claude процесса значение шлётся как `/effort <level>` через event-chain:
+В StatusBar справа — pill `Effort: max` (default per-app, не per-tab). При каждом запуске Claude процесса значение шлётся как `/effort <level>`. Сигнал запуска — **самый ранний детерминированный признак готовности TUI к вводу**, не появление bridge-файла:
 
 ```
-bridge видит новый PID → claude:process-started fires
+Claude рисует prompt-символ ⏵ в PTY → main эмитит claude:tui-ready (~0.8с после старта)
 → Terminal.tsx handler читает useUIStore.getState().defaultClaudeEffort
-→ если ≠ 'none' → ipcRenderer.invoke('claude:send-command', tabId, '/effort max')
+→ если ≠ 'none' и не resume → ipcRenderer.invoke('claude:send-command', tabId, '/effort max')
+→ ставит sentinel _effortSentForTab (via='tui-ready')
 ```
 
-**Почему `claude:process-started`, а не `claude:session-detected`:** session-detected fires на каждом bridge re-sync (раз в 1-2 секунды); session_id остаётся прежним при `claude --resume`, guard всегда false → /effort инжектится только однажды на жизнь таба. Process-started fires ровно один раз на спавн binary (новый PID). См. `fact-claude-stop-hook.md::Fresh-process detection`.
+`claude:tui-ready` эмитится из того же места `main.js`, где Handshake детектит prompt-символ (`stripVTControlCharacters(data).includes('⏵' | '>')` в state `WAITING_PROMPT`). Это момент когда Claude **готов принять ввод**, а не просто «процесс жив». Принцип «liveness ≠ readiness, бери ранний сигнал» — `methodology/переносимый-дизайн.md::Liveness ≠ readiness`.
+
+**Bridge:Fresh (`claude:process-started`) — теперь fallback, не главный путь.** Раньше инжект висел на нём, но `Bridge:Fresh` лагает: bridge.json должен *появиться* → *пережить DeadTranscript-guard* (у свежей сессии JSONL ещё не на диске, guard «ignoring forever» отбрасывает первый bridge) → *PID зарезолвиться в таб*. В проде измерено **3-6 секунд** после старта Claude (сессии tab-2933 `3c4712b9`, tab-2986). `handleProcessStarted` остался как fallback на случай если ⏵ не распарсился (новая версия TUI / кастомный шрифт) — он проверяет sentinel и молчит если tui-ready уже отработал.
+
+**Graveyard — Bridge:Fresh как единственный сигнал → двойной `/effort`.** Пока инжект висел только на `Bridge:Fresh`, юзер видел нарисованный prompt без эффекта (3-6с лага), решал что «эффект не выставился», кликал `/effort` руками в ControlBar → улетал **первый** `/effort`, потом запоздавший Bridge:Fresh догонял **вторым**. В JSONL/scrollback копилось два `/effort max` подряд. Детерминированно подтверждено счётчиками `[EffortDiag][HANDLER-ENTRY] callN` / `[INVOKE-FIRE] invokeN` — handler входил один раз, но первая команда уходила за 391мс **до** него (это был ручной клик). Чинится связкой ранний-сигнал + sentinel ниже.
+
+**Once-per-process sentinel `_effortSentForTab`.** Map `tabId → {at, via}`, экспонируется на `window.__effortSentForTab` для доступа из ControlBar. Любой из трёх источников `/effort` (ранний `tui-ready`, fallback `Bridge:Fresh`, ручной клик `setEffortOnPTY` в ControlBar) первым делом ставит метку; остальные видят её и делают early-return. Сброс — **только на PTY exit** (`handleExit`), НЕ на `process-started`: tui-ready fires раньше Bridge:Fresh, и если сбрасывать на process-started — затрётся метка раннего пути и fallback пошлёт дубль. Это та же ловушка «liveness как reset-триггер», что и в выборе сигнала.
 
 **Почему без setTimeout:** `safePasteAndSubmit` сам ждёт sync-marker `\x1b[?2026l` от Ink. Если инпут ещё не готов — ждёт **внутри** функции (event-driven). Возвращается за 8-30ms на happy path. Раньше был paranoid `setTimeout(800ms)` обёртка — это "timeout как safety net вместо причины", антипаттерн (см. `methodology/переносимый-дизайн.md::Воспринимаемая задержка UI-команд`).
 
@@ -285,7 +292,23 @@ bridge видит новый PID → claude:process-started fires
 
 **Graveyard №4 (final) — tail-mode создавал phantom parentUuid race.** Расчёт «у wrapper'а ещё нет детей» был неверен. Cleanup отрабатывал через 0.5-1с после inject'а (как только `fs.watch` ловил появление wrapper'а), но **первый user prompt в новой сессии** Claude TUI писал через 5-60 секунд (юзер шёл за кофе, читал предыдущий контекст, формулировал вопрос). К моменту prompt'а wrapper уже стёрт → Claude TUI пишет prompt с `parentUuid: <deleted-wrapper>` → orphan → красная зона в Timeline. Конкретный repro 2026-05-23: на 4 сессиях подряд (`8f0a0b48`, `cb2e4c26`, `09351b71`, `e4be2fe0`) phantom создавался ровно этим путём, лог `[DeleteEffortEntries] removed=2 relinked=0` — relink-pass всегда проходил вхолостую, потому что дети ещё не существовали. Юзер на 5-й сессии получил предупреждение «Обрыв UUID в JSONL», стал замечать паттерн: *«при смене effort у меня осталось предупреждение что сессия потеряна UUID»*.
 
-**Final fix (2026-05-23): cleanup удалён полностью.** `startEffortCleanupWatcher` / `stopEffortCleanupWatcher` / Map `claudeEffortCleanupWatchers` / IPC `claude:arm-effort-cleanup` / вызов из `Terminal.tsx::handleProcessStarted` — всё удалено из кода. Wrapper остаётся в JSONL, Timeline и так его не рендерит через tag-filter. Принцип переносимый — см. [`methodology/переносимый-дизайн.md::Не модифицируй чужой shared append-only файл во время работы владельца`](../methodology/переносимый-дизайн.md). `_deleteEffortEntries` функция в `claude-data.js` оставлена мёртвым кодом на случай если когда-нибудь захочется чистить накопленные wrapper'ы на resume (не live, а **только** когда Claude процесс уже exit'нул и не пишет в файл). IPC `claude:delete-effort-entries` тоже оставлен но из renderer'а не вызывается.
+**Live cleanup удалён полностью (2026-05-23).** `startEffortCleanupWatcher` / `stopEffortCleanupWatcher` / Map `claudeEffortCleanupWatchers` / IPC `claude:arm-effort-cleanup` / вызов из `Terminal.tsx::handleProcessStarted` — всё удалено. Wrapper остаётся в JSONL, Timeline и так его не рендерит через tag-filter. Принцип переносимый — см. [`methodology/переносимый-дизайн.md::Не модифицируй чужой shared append-only файл во время работы владельца`](../methodology/переносимый-дизайн.md).
+
+### On-restart trailing /effort trim (безопасный наследник cleanup'а)
+
+После удаления live cleanup'а `/effort` записи стали копиться: каждый перезапуск Claude инжектит новую пару, в Claude TUI scrollback и rewind-меню скапливается стопка `/effort max` подряд (в нашем Timeline их не видно — tag-filter). Юзер: *«я просто перезапускаю сессию несколько раз, и при новом запуске старый effort через JSONL не очищается»*.
+
+Решение — `_trimTrailingEffortEntries(sessionId, cwd)` в `claude-data.js`, вызывается **синхронно** из `main.js::case 'claude-c'` **до** `term.write('claude --resume')`. Ключевое отличие от удалённого live-cleanup'а: чистка идёт когда **предыдущий Claude процесс уже мёртв** → никто не допишет ребёнка к удаляемой записи → phantom-parentUuid race **физически невозможен**. Это тот же инвариант что в [`methodology/переносимый-дизайн.md::Не модифицируй чужой shared append-only файл`](../methodology/переносимый-дизайн.md): мутируем чужой файл только когда owner не активен.
+
+**Строгий suffix-match (цикл по блокам), plain truncate, без relink.** Алгоритм читает последние 16 KB, идёт от конца **в цикле**, отслаивая `/effort` блоки один за другим. Один блок (от конца): `[trailing meta]* → effort-stdout → effort-wrapper → [один caveat]?`. После блока — снова может идти meta и ещё блок (юзер перезапустил сессию N раз подряд **без сообщений между** — каждый рестарт инжектит свежий `/effort`, в хвосте копится `/effort, /effort, /effort` вплотную). Цикл съедает **все** подряд идущие блоки за один проход и **останавливается на первой реальной записи** (user/assistant). Если после `/effort` есть реальное сообщение — этот `/effort` не трогается (у него появился потомок, резать = порвать parentUuid chain → phantom).
+
+Граничный случай (реальная сессия `dfa77496`): `/effort #1 → ответ Claude → /effort #2`. Срезается **только** #2 (хвост), #1 остаётся навсегда — у него потомок (ответ). Юзер видит в Claude TUI scrollback два `/effort` и думает что trim не дорезал; на деле #1 неприкосновенен by design. Только **подряд** идущие (без ответа между) схлопываются полностью.
+
+Поскольку режем строго непрерывный хвост и после него ничего не остаётся — релинк не нужен, никакая оставшаяся запись не ссылается на удалённые (parentUuid всегда указывает назад). Чистый `truncateSync(filePath, byteStart)`, без re-append.
+
+**Шрам — байты vs символы (поймано в тестах до прода).** Первая версия делала split через `tailText.indexOf('\n')` (строковый индекс) и truncate на `startOffset + charIndex`. На сессии с кириллицей (`5fbdb1d9`) это резало **в середине записи** — `trimmed:6` рапортовалось, реально удалялось 13 строк, последняя оставшаяся = битый JSON. Корень: UTF-8 кириллица многобайтовая, character-index ≠ byte-offset, а `fs.truncateSync` работает в байтах. Фикс: split через `buf.indexOf(0x0A)` в Buffer, все offset'ы байтовые (`startOffset + p`), не строковые. Тот же класс ловушки что [`methodology/переносимый-дизайн.md::Ink TUI`](../methodology/переносимый-дизайн.md) (bytes ≠ chars при работе с PTY/файлами). Verified: на 455 сессиях срабатывает на 3, `corruptBefore == corruptAfter` (не вносит новой порчи), `trimmed == actualLineDiff`.
+
+Лог: `[TrimEffort] session=<sid> trimmed trailing /effort block (N lines) at offset <byteOffset>`. `_deleteEffortEntries` (старая re-append версия) оставлена мёртвым кодом — НЕ переиспользована, потому что она re-append'ит хвост после удаляемого без relink (создала бы phantom если бы после `/effort` была реальная запись). Новая функция избегает этого через строгий suffix-match.
 
 ### EffortInject kill-switch (`effort=none`) + resume-guard
 
@@ -316,6 +339,16 @@ InfoPanel `SessionActionChip` hover → "Stop" → клик. Реализаци�
 **Почему Ctrl+C не работает:** Claude TUI обрабатывает одиночный Ctrl+C как **"clear input"** (если в input есть текст) или **"взвести danger zone"** (Press Ctrl-C again to exit). Юзер кликает Stop → Claude не умирает, никаких ошибок → недоумение.
 
 **SIGTERM по PID детерминированный:** `terminal:stop-ai-process` находит дочерний PID через `ps -eo pid,ppid,command | grep claude` где `ppid === ptyProcess.pid`, шлёт `SIGTERM` через `process.kill`. Через 800ms escalate в `SIGKILL` если процесс не умер. Тот же IPC использует split-button "Stop Claude" в TabBar — если split-button работает, InfoPanel Stop должна работать так же.
+
+### Mobile preserve-shell Stop (SIGTERM по PID, тот же `terminal:stop-ai-process`)
+
+Mobile-web `stopClaudeTab` bridge action в `src/renderer/App.tsx::handleWebBridge` зовёт `ipcRenderer.invoke('terminal:stop-ai-process', tabId)` — тот же handler что и desktop Stop-кнопка. Найдёт claude child-PID через `ps -eo pid,ppid` под shell-PID, шлёт SIGTERM, через 800ms эскалирует в SIGKILL если жив. Shell PTY не трогается — Resume в этом же табе пишет `claude --resume <id>\r` в живой shell.
+
+**Graveyard: Ctrl+C × 2 через `terminal:input` с задержкой 250ms.** Жил до 2026-05-28, отброшен после детерминированной диагностики: `CtrlC-DangerZone` в `main.js:6711` сработал **дважды** в логах (на каждый Ctrl+C), значит Ink TUI **перерисовал prompt** между ними и второй Ctrl+C трактовался как **новый первый** ("Press Ctrl-C again to exit" опять) — Claude не выходил, через 42 сек desktop ещё видел `isCommandRunning=true`. Это явно отмечено в `fix-claude-busy-detection.md::4` как rejected approach (0ms = Ink merges, 500ms = Ink redraws). 250ms попало ровно в зону redraws. Любая фиксированная задержка ненадёжна — Ink реагирует за разное время в зависимости от content density текущего экрана.
+
+Дополнительный side-effect Ctrl+C×2-подхода: если Claude не умирал — не срабатывал PTY-exit cleanup в `main.js:7029-7031` (`_webBroadcast 'busy=false, sessionStatus=inactive'`), и mobile composer **залипал в busy навсегда** — нет ни turn-end, ни exit-event'а. SIGTERM-путь чинит это попутно: kill → PTY exit handler → broadcast inactive → mobile сбрасывает busy.
+
+Ctrl+D (`\x04`) **категорически нельзя** на mobile — после убийства Claude EOF закрыл бы shell → PTY exits → таб умрёт целиком. SIGTERM по PID этой проблемы не создаёт: kernel доставляет сигнал ровно child-процессу claude, shell не получает ничего. См. `fact-mobile-claude-pty.md::Resume guard rails`, `fix-claude-busy-detection.md::4`.
 
 ## Реактивное управление Think Mode
 
