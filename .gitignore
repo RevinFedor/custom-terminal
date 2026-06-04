@@ -44,6 +44,9 @@ prebuilds/
 # Packages (leaked source code, forks)
 /packages/
 
+# Private infra (VPS IP, root SSH, tunnel topology)
+docs/knowledge/fact-remote-access.md
+
 # Database
 *.db
 
