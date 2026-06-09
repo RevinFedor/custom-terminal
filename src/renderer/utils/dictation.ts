@@ -82,11 +82,55 @@ function floatToS16LE(buf: Float32Array): ArrayBuffer {
 
 const TARGET_RATE = 16000;
 
+// AudioWorklet processor source. Loaded as a blob: URL via addModule().
+//
+// Why a worklet at all: the previous engine used a ScriptProcessorNode, whose
+// onaudioprocess fires on the renderer MAIN thread. On macOS Electron that
+// deprecated node intermittently SIGSEGVs the whole renderer (white screen,
+// "Render frame was disposed") even with an off-device sink — the off-device
+// fix reduced but did not eliminate it. An AudioWorkletProcessor runs on the
+// dedicated audio render thread instead, removing that crash class entirely.
+//
+// The processor does no DSP: it accumulates channel-0 Float32 samples and posts
+// them to the main thread in ~4096-sample batches. Downsample + s16le packing
+// stay on the main thread (handleFrame) exactly as before, so the capture
+// pipeline and Soniox payload are byte-for-byte identical to the old SPN path.
+// Batching to 4096 matches the SPN buffer size — same ws.send cadence (~12/s),
+// not 370 tiny frames/s (the worklet otherwise fires every 128-sample quantum).
+const WORKLET_BATCH = 4096;
+const WORKLET_SRC = `
+const BATCH = ${WORKLET_BATCH};
+class CaptureProcessor extends AudioWorkletProcessor {
+  constructor() { super(); this._buf = new Float32Array(BATCH); this._n = 0; }
+  process(inputs) {
+    const ch = inputs[0] && inputs[0][0];
+    if (ch && ch.length) {
+      for (let i = 0; i < ch.length; i++) {
+        this._buf[this._n++] = ch[i];
+        if (this._n === BATCH) {
+          this.port.postMessage(this._buf.slice(0));
+          this._n = 0;
+        }
+      }
+    }
+    return true; // keep the node alive until we disconnect it
+  }
+}
+registerProcessor('capture-processor', CaptureProcessor);
+`;
+
 export class DictationSession {
   private ws: WebSocket | null = null;
   private ac: AudioContext | null = null;
+  // Capture node: prefer AudioWorkletNode (runs on the audio render thread,
+  // off the renderer main thread). ScriptProcessorNode is kept only as a
+  // fallback if addModule() is refused (old CSP / platform). See the graph
+  // wiring in start() and fix-mic-renderer-sigsegv.md.
+  private workletNode: AudioWorkletNode | null = null;
+  private workletURL: string | null = null;
   private processor: ScriptProcessorNode | null = null;
   private source: MediaStreamAudioSourceNode | null = null;
+  private muteSink: MediaStreamAudioDestinationNode | null = null;
   private stream: MediaStream | null = null;
   // PCM chunks captured between getUserMedia-ready and ws.open. Flushed on
   // onopen; bounded by maxPending so a slow socket can't OOM. ~50 chunks ≈
@@ -139,28 +183,62 @@ export class DictationSession {
         try { await this.ac.resume(); } catch {}
       }
       this.source = this.ac.createMediaStreamSource(this.stream);
-      this.processor = this.ac.createScriptProcessor(4096, 1, 1);
-      this.source.connect(this.processor);
-      const sink = this.ac.createGain();
-      sink.gain.value = 0;
-      this.processor.connect(sink).connect(this.ac.destination);
-      dlog('audio ok rate=' + this.acRate);
 
-      // Wire the capture handler IMMEDIATELY. Frames will go to `pending`
-      // until ws.onopen flips wsOpen=true.
-      this.processor.onaudioprocess = (ev) => {
-        const ch0 = ev.inputBuffer.getChannelData(0);
-        const down = downsampleFloat32(ch0, this.acRate, TARGET_RATE);
-        const pcm = floatToS16LE(down);
-        if (this.wsOpen && this.ws && this.ws.readyState === WebSocket.OPEN) {
-          try { this.ws.send(pcm); } catch {}
-        } else if (this.pending.length < this.maxPending) {
-          this.pending.push(pcm);
+      // Off-device sink shared by BOTH capture paths (worklet + SPN fallback).
+      // A node is only pulled (its process()/onaudioprocess fires) while it
+      // reaches a destination. MediaStreamAudioDestinationNode is a real
+      // destination but writes into an off-device MediaStream we never read —
+      // audio never reaches the CoreAudio output unit (the SIGSEGV path), yet
+      // the upstream node is pulled normally. We deliberately do NOT rely on
+      // zero-output worklet nodes being pulled — that is inconsistent across
+      // Chromium versions. See fix-mic-renderer-sigsegv.md.
+      this.muteSink = this.ac.createMediaStreamDestination();
+
+      let usingWorklet = false;
+      try {
+        if (this.ac.audioWorklet) {
+          const blob = new Blob([WORKLET_SRC], { type: 'application/javascript' });
+          this.workletURL = URL.createObjectURL(blob);
+          await this.ac.audioWorklet.addModule(this.workletURL);
+          this.workletNode = new AudioWorkletNode(this.ac, 'capture-processor', {
+            numberOfInputs: 1,
+            numberOfOutputs: 1,
+            outputChannelCount: [1],
+            channelCount: 1,
+          });
+          this.workletNode.port.onmessage = (ev) => {
+            this.handleFrame(ev.data as Float32Array);
+          };
+          // source → worklet → off-device sink. The worklet's process() runs on
+          // the audio render thread (off the renderer main thread, unlike SPN),
+          // and the off-device sink guarantees it's pulled without the hardware
+          // output crash path. The worklet emits silence on its output; the sink
+          // discards it. Capture is via postMessage, not this output.
+          this.source.connect(this.workletNode);
+          this.workletNode.connect(this.muteSink);
+          usingWorklet = true;
         }
-        // Else: queue overflow → drop oldest-first behavior would be more
-        // correct, but in practice this only triggers if ws hangs >4s; the
-        // user will hit Stop long before that.
-      };
+      } catch (e: any) {
+        dlog('worklet addModule failed, falling back to SPN: ' + (e?.message || e));
+        try { this.workletNode?.disconnect(); } catch {}
+        this.workletNode = null;
+        if (this.workletURL) { try { URL.revokeObjectURL(this.workletURL); } catch {}; this.workletURL = null; }
+      }
+
+      if (!usingWorklet) {
+        // Fallback: ScriptProcessorNode (deprecated, runs on the main thread —
+        // this is the path that can still SIGSEGV; we only reach it if the
+        // worklet refused to load). Pull it via the same off-device sink so it
+        // at least avoids the hardware-output crash path. See
+        // fix-mic-renderer-sigsegv.md.
+        this.processor = this.ac.createScriptProcessor(4096, 1, 1);
+        this.source.connect(this.processor);
+        this.processor.connect(this.muteSink);
+        this.processor.onaudioprocess = (ev) => {
+          this.handleFrame(ev.inputBuffer.getChannelData(0));
+        };
+      }
+      dlog('audio ok rate=' + this.acRate + ' capture=' + (usingWorklet ? 'worklet' : 'spn'));
     } catch (e: any) {
       dlog('audio error: ' + (e?.name || '') + ' ' + (e?.message || String(e)));
       this.opts.onError('audio: ' + (e?.message || String(e)));
@@ -292,16 +370,37 @@ export class DictationSession {
   /** Full transcript captured so far (final + partial tail). */
   getText(): string { return this.finalText + this.partialText; }
 
+  // Shared capture path for both the worklet (Float32 batch via postMessage)
+  // and the SPN fallback (inputBuffer channel data). Downsample to 16 kHz, pack
+  // s16le, send to ws if open else buffer in `pending` for onopen flush.
+  private handleFrame(ch0: Float32Array) {
+    const down = downsampleFloat32(ch0, this.acRate, TARGET_RATE);
+    const pcm = floatToS16LE(down);
+    if (this.wsOpen && this.ws && this.ws.readyState === WebSocket.OPEN) {
+      try { this.ws.send(pcm); } catch {}
+    } else if (this.pending.length < this.maxPending) {
+      this.pending.push(pcm);
+    }
+    // Else: queue overflow → only triggers if ws hangs >4s; user hits Stop first.
+  }
+
   private async cleanup(): Promise<void> {
     try { if (this.processor) this.processor.onaudioprocess = null as any; } catch {}
+    try { if (this.workletNode) this.workletNode.port.onmessage = null as any; } catch {}
+    try { this.workletNode?.disconnect(); } catch {}
     try { this.processor?.disconnect(); } catch {}
     try { this.source?.disconnect(); } catch {}
+    try { this.muteSink?.disconnect(); } catch {}
+    try { this.muteSink?.stream.getTracks().forEach(t => t.stop()); } catch {}
     try { this.stream?.getTracks().forEach(t => t.stop()); } catch {}
     try { await this.ac?.close(); } catch {}
+    if (this.workletURL) { try { URL.revokeObjectURL(this.workletURL); } catch {}; this.workletURL = null; }
     this.ws = null;
     this.ac = null;
+    this.workletNode = null;
     this.processor = null;
     this.source = null;
+    this.muteSink = null;
     this.stream = null;
     this.pending = [];
   }

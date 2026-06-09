@@ -288,34 +288,59 @@
    процессия, не серия одиночных проходов.
    Интенсивность пика 0.20 (не 0.32) — фон уже несёт «вкладка активна», шиммер только
    уточняет «AI думает», не должен спорить с process-bar за внимание. */
-/* AI-busy фон таба: целый таб мягко пульсирует фоном между colorA и colorB пока
-   AI «думает» (claude/gemini/sdk busy-state). Цикл/цвета — независимые от
-   ProcessBar настройки: --ai-pulse-color-a/b/duration на :root (Settings →
-   Размеры → Табы → Фон AI-загрузки). Раньше paint брался из processBar
-   (color-mix(colorB, transparent, 14%)) → один цвет на два разных индикатора,
-   юзер не мог настроить отдельно.
-   color-mix() поддерживается Chromium 111+ (Electron 28 = Chromium 120) и
-   используется чтобы из голого colorB сделать полупрозрачный пик — задавать
-   юзеру hex+alpha-input в Settings было бы громоздко, проще hex и сразу
-   фиксированная 22% прозрачность пика. */
-/* Endpoints — rgba(), вычисленные на JS-стороне (см. App.tsx::aiPulse effect).
-   color-mix() внутри keyframe не интерполируется плавно в Chromium — мигание
-   получается «рывками без плавности», юзер описывал как «нет анимации, через
-   разный промежуток происходит мигание». Plain rgba интерполируется per-channel
-   как обычные числа → плавный fade. */
-@keyframes tab-ai-busy-pulse {
-  0%   { background-color: var(--ai-pulse-color-a, rgba(0,0,0,0)); }
-  50%  { background-color: var(--ai-pulse-color-b, rgba(218,119,86,0.22)); }
-  100% { background-color: var(--ai-pulse-color-a, rgba(0,0,0,0)); }
+/* AI-busy loader is the process-bar shimmer STRIP (.tab-process-bar-ai-shimmer-
+   overlay, above) on the left/right edge — NOT a tint of the whole tab. The
+   former whole-tab background pulse (.tab-ai-busy-shimmer / -static, keyframe
+   tab-ai-busy-pulse, --ai-pulse-* vars) was removed: the loader is the
+   переливающаяся полоска у края. See fact-process-bar.md::AIPulse removed. */
+
+/* Awaiting-user-input (AskUserQuestion) — Claude задал вопрос и ЖДЁТ ответа.
+   НЕ заливаем фон (это читалось как «AI думает» и слепило). Вместо этого —
+   тонкая бегущая рамка 1.2px: яркий фиолетовый сегмент ходит по периметру таба
+   поверх еле заметного постоянного кольца.
+
+   Техника traveling-border:
+   1. conic-gradient как background — яркая дуга ~90° на прозрачном фоне.
+   2. @property --awaiting-angle (<angle>) — даёт ПЛАВНУЮ интерполяцию угла в
+      keyframe (без @property conic-gradient прыгал бы рывками; Electron 28 =
+      Chromium 120, поддержка есть).
+   3. padding:1.2px + mask-exclude (content-box XOR border-box) — оставляет
+      только кольцо толщиной padding по border-radius элемента. box-sizing у
+      проекта border-box (Tailwind) — ring width ровно = padding.
+
+   background-color НЕ анимируется (фон прозрачный) — сигнал несёт движущийся
+   яркий сегмент (высокая дельта пикселей по периметру → codec/AI-detectable,
+   CLAUDE.md::AI-Optimized UI). border-radius наследуется от inline-стиля
+   оверлея (tabGeo.borderRadius в TabBar, rounded-sm в App project-tab). */
+@property --awaiting-angle {
+  syntax: '<angle>';
+  initial-value: 0deg;
+  inherits: false;
 }
-.tab-ai-busy-shimmer {
-  animation: tab-ai-busy-pulse var(--ai-pulse-duration, 1800ms) ease-in-out infinite;
-  pointer-events: none;
+@keyframes tab-awaiting-spin {
+  to { --awaiting-angle: 360deg; }
 }
-/* Статичный AI-фон (enabled=false): красит фон colorB без анимации.
-   Тот же визуальный сигнал «AI busy», но без пульса. */
-.tab-ai-busy-static {
-  background-color: var(--ai-pulse-color-static, rgba(218,119,86,0.14));
+.tab-awaiting-input {
+  padding: 1.2px; /* толщина бегущей рамки */
+  background:
+    /* яркий сегмент с хвостом, вращается через --awaiting-angle */
+    conic-gradient(from var(--awaiting-angle),
+      rgba(168, 85, 247, 0) 0deg,
+      rgba(168, 85, 247, 0) 240deg,
+      rgba(168, 85, 247, 0.85) 312deg,
+      rgba(216, 180, 254, 1) 348deg,
+      rgba(168, 85, 247, 0) 360deg),
+    /* еле заметное постоянное кольцо — рамка всегда «есть» */
+    rgba(147, 51, 234, 0.22);
+  -webkit-mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  mask-composite: exclude;
+  animation: tab-awaiting-spin 1.6s linear infinite;
   pointer-events: none;
 }
 
@@ -355,6 +380,39 @@
   animation: control-bar-busy-sweep 1.6s linear infinite;
   pointer-events: none;
   z-index: 1;
+}
+
+/* Click-to-reset escape hatch for a STUCK busy indicator on the right cluster
+   (Provider/Model/Effort/Think). The parent .control-bar-busy-overlay sets
+   pointer-events:none while busy, so this child re-enables itself with
+   pointer-events:auto and sits ABOVE the shimmer ::after (z-index 2 > 1).
+   Idle look = invisible (transparent, label hidden) so the orange shimmer shows
+   through untouched. Hover = solid red wash + static white uppercase "СБРОС"
+   label — destructive-intent affordance, and per the project's AI-OCR rule the
+   label is static uppercase B/W (no opacity-only animation) so it's readable on
+   video. Click clears the local busy flags. See
+   fact-claude-control-bar.md::Busy-state tab binding. */
+.control-bar-busy-reset {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  pointer-events: auto;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: transparent;
+  background-color: transparent;
+  transition: background-color 0.12s ease, color 0.12s ease, box-shadow 0.12s ease;
+}
+.control-bar-busy-reset:hover {
+  color: #fff;
+  background-color: rgba(220, 38, 38, 0.82);
+  box-shadow: inset 0 0 0 1px rgba(220, 38, 38, 0.9), 0 0 8px rgba(220, 38, 38, 0.5);
 }
 
 @keyframes fadeIn {

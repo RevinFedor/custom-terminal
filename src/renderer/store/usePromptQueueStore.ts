@@ -77,7 +77,7 @@ export type QueuedPrompt = {
   createdAt: number;
 };
 
-type TabQueue = {
+export type TabQueue = {
   items: QueuedPrompt[];
   // When true, as soon as the current Claude turn ends (Stop hook fires) the next item
   // is shifted off and sent via claude:send-command. After the last item runs, autoRun stays
@@ -226,6 +226,34 @@ const EMPTY: TabQueue = {
 
 let idCounter = 0;
 const nextId = () => `pq-${Date.now().toString(36)}-${(idCounter++).toString(36)}`;
+
+// ── Cross-client core shape ──────────────────────────────────────────────────
+// The subset of a TabQueue that crosses the wire to mobile (and that SQLite
+// persists). UI-only slots (previewId, firstChipHintActive, firstDelayCountdownAt,
+// stopBeforeCloseArm) are intentionally NOT here — they are local-presentation
+// state, meaningless on another client. Mobile reads this via the getPromptQueue
+// bridge action and receives live deltas via the `queue-update` SSE event; it
+// never holds its own copy of the queue — the desktop store is the single source
+// of truth and the desktop runner is the single firing engine (same model the
+// effort/think window-maps use: mobile is a thin remote, not a second store).
+export type PromptQueueCore = Pick<
+  TabQueue,
+  'items' | 'autoRun' | 'stopAfter' | 'closeAfter' | 'runAfterTabId'
+  | 'firstDelaySeconds' | 'postPromptEnabled' | 'postPromptText'
+>;
+
+export function serializePromptQueueCore(q: TabQueue): PromptQueueCore {
+  return {
+    items: q.items,
+    autoRun: q.autoRun,
+    stopAfter: q.stopAfter,
+    closeAfter: q.closeAfter,
+    runAfterTabId: q.runAfterTabId,
+    firstDelaySeconds: q.firstDelaySeconds,
+    postPromptEnabled: q.postPromptEnabled,
+    postPromptText: q.postPromptText,
+  };
+}
 
 // Count image placeholders in raw input text. Claude TUI renders pasted images as
 // "[Image #N]" tokens. Pasted-text-chips like "[Pasted text #N +M lines]" are NOT

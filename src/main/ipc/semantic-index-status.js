@@ -222,7 +222,18 @@ function rebuildIndex(projectId, mainWindow, opts = {}) {
   // clamp на main-стороне; иначе любой UI bypass воткнёт N=1000 в --parallel.
   const rawN = Number(opts.parallelism);
   const parallelism = Number.isFinite(rawN) ? Math.max(1, Math.min(20, Math.round(rawN))) : 10;
-  state.rebuildParallelism = parallelism;
+
+  // Compute how many files are actually outdated BEFORE spawning, so the UI shows
+  // the real total (`0/3`) from the first frame instead of `…`, and the ×N chip
+  // reflects EFFECTIVE workers = min(configured, outdated). With 3 outdated files
+  // and parallelism 5, only 3 workers ever run → show ×3, not ×5. The script is
+  // still spawned with the configured N (it never launches more jobs than there
+  // are files anyway), so a mid-run estimate drift only affects the cosmetic chip,
+  // never throughput.
+  const preStatus = computeStatus(state.projectPath);
+  const outdatedAtStart = (preStatus.stale || 0) + (preStatus.new || 0);
+  const displayParallelism = outdatedAtStart > 0 ? Math.min(parallelism, outdatedAtStart) : parallelism;
+  state.rebuildParallelism = displayParallelism;
 
   // PATH augment — production Electron на macOS наследует launchd PATH
   // (`/usr/bin:/bin:/usr/sbin:/sbin`), без homebrew и без user-local. Скрипт
@@ -265,7 +276,7 @@ function rebuildIndex(projectId, mainWindow, opts = {}) {
   // outdatedTotal grows as we see [launched ...] events; outdatedCompleted grows
   // when a launched file reports its result. Cached files never go into either.
   const launchedFiles = new Set();
-  let outdatedTotal = 0;
+  let outdatedTotal = outdatedAtStart;   // seeded from computeStatus; grows if more files launch than estimated
   let outdatedCompleted = 0;
   // Strict success validation — never claim success unless we positively observed it.
   // build-index.sh ALWAYS exits 0 even when N files failed, so exit code is not enough.
@@ -297,7 +308,11 @@ function rebuildIndex(projectId, mainWindow, opts = {}) {
     }
   };
 
-  send('semantic-index:rebuild-started', { parallelism });
+  send('semantic-index:rebuild-started', { parallelism: displayParallelism, outdatedTotal });
+  // Seed progress immediately so the live counter AND a mid-run tab-switch
+  // (get-status → rebuildProgress) both have the real total before any file
+  // finishes — UI shows `0/3` from frame one instead of `…`.
+  send('semantic-index:progress', { phase: 'init', total, completed: 0, outdatedTotal, outdatedCompleted: 0 });
 
   const handleLine = (line) => {
     // Strip ANSI escape codes (\e[XXm) — script uses them via $RED/$GREEN/etc.
@@ -319,13 +334,39 @@ function rebuildIndex(projectId, mainWindow, opts = {}) {
     if (m) {
       currentFile = m[3];
       launchedFiles.add(currentFile);
-      outdatedTotal = launchedFiles.size;
+      // Grow the total if more files end up launched than the up-front estimate
+      // (e.g. a doc was edited between computeStatus and spawn). Never shrink it.
+      outdatedTotal = Math.max(outdatedTotal, launchedFiles.size);
       send('semantic-index:progress', {
         phase: 'launched',
         launched: parseInt(m[1], 10),
         total: parseInt(m[2], 10),
         file: currentFile,
         completed,
+        outdatedTotal,
+        outdatedCompleted,
+      });
+      return;
+    }
+
+    // "[done] docs/..." — real-time completion pulse from inside a worker, emitted
+    // the instant it finishes (success OR failure), BEFORE the merge loop. This is
+    // the ONLY signal that arrives during actual work: the ok/cached/wrapped lines
+    // below are all printed together in the post-`wait` merge phase, so they can't
+    // drive a live counter (that's why it used to read 0/N the whole run then jump
+    // to N/N). [done] owns outdatedCompleted; the merge lines only do error/warn
+    // accounting. cached files never emit [done] (they're handled inline, skipped).
+    m = stripped.match(/^\[done\]\s+(.+)$/);
+    if (m) {
+      const file = m[1];
+      currentFile = file;
+      outdatedCompleted += 1;
+      if (outdatedCompleted > outdatedTotal) outdatedTotal = outdatedCompleted;
+      send('semantic-index:progress', {
+        phase: 'done',
+        file,
+        completed,
+        total,
         outdatedTotal,
         outdatedCompleted,
       });
@@ -339,12 +380,10 @@ function rebuildIndex(projectId, mainWindow, opts = {}) {
       const file = m[2];
       completed += 1;
       currentFile = file;
-      // Only files that were actually launched count toward outdatedCompleted.
-      // (cached files emit a "cached <path>" line but were never launched.)
-      if (kind !== 'cached' && launchedFiles.has(file)) {
-        outdatedCompleted += 1;
-      }
-      // Per-file failure tracking — used in the strict success check at exit.
+      // NOTE: outdatedCompleted is NOT touched here — these lines are printed in
+      // the merge loop, all at once at the end, after every worker is already done.
+      // The live [done] handler above owns the counter. Here we only track per-file
+      // failures for the strict success check at exit.
       if (kind === 'error' || kind === 'missing' || kind === 'wrapped') {
         perFileBad += 1;
         if (failedFiles.length < 10) failedFiles.push(`${kind}:${file}`);
@@ -367,6 +406,10 @@ function rebuildIndex(projectId, mainWindow, opts = {}) {
       sawSummary = true;
       summaryWarnings = parseInt(m[5], 10);
       summaryErrors = parseInt(m[6], 10);
+      // Safety net: if a worker crashed without emitting [done] (RESULT_FILE
+      // missing → "missing" in merge), the live counter could end below total.
+      // The run is over by the time summary prints, so snap to 100%.
+      if (outdatedTotal > 0) outdatedCompleted = outdatedTotal;
       send('semantic-index:progress', {
         phase: 'summary',
         indexed: parseInt(m[1], 10),
@@ -375,6 +418,8 @@ function rebuildIndex(projectId, mainWindow, opts = {}) {
         skipped: parseInt(m[4], 10),
         warnings: summaryWarnings,
         errors: summaryErrors,
+        outdatedTotal,
+        outdatedCompleted,
       });
       return;
     }

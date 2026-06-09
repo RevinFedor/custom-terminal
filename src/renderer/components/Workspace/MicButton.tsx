@@ -23,6 +23,7 @@ import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useUIStore } from '../../store/useUIStore';
 import { DictationSession } from '../../utils/dictation';
 import { appendDictationEntry } from '../../utils/dictationHistory';
+import { DictationHistoryPopover } from './DictationHistoryButton';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -65,6 +66,9 @@ export default function MicButton({ tabId }: Props) {
   const [stopping, setStopping] = useState(false);
   const [final, setFinal] = useState('');
   const [partial, setPartial] = useState('');
+  // Cmd+click on the mic opens the dictation-history popover (the old toolbar
+  // `history` chip is gone). Plain click toggles recording as before.
+  const [historyOpen, setHistoryOpen] = useState(false);
   const sessionRef = useRef<DictationSession | null>(null);
   const btnRef = useRef<HTMLButtonElement>(null);
 
@@ -135,7 +139,14 @@ export default function MicButton({ tabId }: Props) {
     }, 4000);
   };
 
-  const onClick = () => {
+  const onClick = (e: React.MouseEvent) => {
+    // Cmd/Ctrl+click → open dictation history instead of recording. (Meta on
+    // macOS, Ctrl elsewhere.) Never toggles recording in this branch.
+    if (e.metaKey || e.ctrlKey) {
+      e.preventDefault();
+      setHistoryOpen(o => !o);
+      return;
+    }
     if (stopping) return;
     if (recording) stop();
     else start();
@@ -146,7 +157,7 @@ export default function MicButton({ tabId }: Props) {
       <button
         ref={btnRef}
         onClick={onClick}
-        title={recording ? 'Click to stop' : 'Start voice dictation (Soniox)'}
+        title={recording ? 'Click to stop' : 'Start voice dictation (Soniox) · ⌘-click for history'}
         aria-label={recording ? 'Stop dictation' : 'Start voice dictation'}
         style={{
           height: 22,
@@ -202,6 +213,14 @@ export default function MicButton({ tabId }: Props) {
           onStop={stop}
         />
       )}
+
+      {/* Dictation history — opened via ⌘-click on the mic (was a separate
+          toolbar chip). Anchored above the button via a Portal. */}
+      <DictationHistoryPopover
+        anchorRef={btnRef}
+        open={historyOpen}
+        onClose={() => setHistoryOpen(false)}
+      />
 
       <style>{`
         @keyframes mic-pulse {

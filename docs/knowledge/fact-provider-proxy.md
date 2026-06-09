@@ -82,13 +82,17 @@ Passthrough к `api.anthropic.com`. OAuth-токен подписки пробр
 Каждый режим имеет свой `https.Agent` с `keepAlive: true`. Без keepAlive каждый запрос = новый TCP + TLS handshake (~200-500ms). С keepAlive повторные запросы переиспользуют существующее TLS-соединение.
 
 ## Cache Stats Logging
-Proxy перехватывает первый SSE `message_start` event в streaming response и логирует cache метрики:
+Proxy перехватывает первый SSE `message_start` event в streaming response и логирует cache метрики, плюс шлёт `claude:cache-update` IPC в renderer для cooldown-чипа в ControlBar (см. `fact-claude-control-bar.md`):
 ```
 [ProviderProxy] Cache: read=187000 create=1500 input=3 HIT
 ```
 Поля: `cache_read_input_tokens` (из кэша, 0.1x стоимости), `cache_creation_input_tokens` (записано в кэш, 1.25x).
 
 **Эмпирическая проверка (апрель 2026):** 96% cache hit rate на 904 turns через proxy. Кэш работает — cache key вычисляется сервером по содержимому messages после JSON decode, а не по бинарному HTTP body.
+
+**Ответ сжат — парсить надо на декомпрессированной копии, не на сыром потоке.** Anthropic шлёт SSE с `content-encoding: gzip` (иногда `br`). Первая версия искала regex `event: message_start` прямо в `chunk.toString()` сырого потока — в gzip-байтах текста `message_start` нет, match никогда не срабатывал, `claude:cache-update` не отправлялся, и чип на PTY-терминале оставался пустым **при тысячах успешных запросов**. Лечение: ответ зеркалится в `PassThrough` tap, tap прогоняется через `zlib.createGunzip()` / `createBrotliDecompress()` / `createInflate()` по `content-encoding`, и `message_start` ищется уже в распакованном тексте. **Реальный ответ клиенту (`res`) форвардится байт-в-байт, всё ещё сжатый** — декомпрессится только наблюдательная копия, чтобы не сломать клиента и не пересчитывать `content-length`. Декомпрессор глушит `error` (truncated stream), tap независим от forward-пути. Общий принцип — `methodology/переносимый-дизайн.md::Forward байт-в-байт, интроспекция на декодированной копии`.
+
+**Что пробовали и почему диагностировалось долго:** симптом — «чип не показывается на терминале» — сначала увели в renderer (persist, busy-флаг), потому что старые логи (до смены поведения upstream на сжатие) содержали валидные `[ProviderProxy] Cache:` строки и казалось что данные есть. Решающий шаг — лог `firstChunkHead` первого чанка: показал байты `1f 8b` (сигнатура gzip), что мгновенно объяснило молчание regex'а. Урок: когда «событие не рождается» при живом трафике — логируй **сырой head источника**, не доверяй тому что апстрим отдаёт тот же формат что раньше.
 
 ## Graceful Shutdown
 При `before-quit` proxy drain'ит активные соединения (до 15s). Без этого crash mid-stream → assistant response не записывается в JSONL → chain break в backtrace. См. [`fact-backtrace-jsonl.md`](fact-backtrace-jsonl.md) секция 2.2 (Generic Chain Break Recovery).

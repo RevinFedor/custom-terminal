@@ -3,7 +3,11 @@ import { X, ChevronDown, ChevronRight, Search, ArrowUp, ArrowDown } from 'lucide
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
 import { useUIStore } from '../../store/useUIStore';
 import Tooltip from '../UI/Tooltip';
-import MarkdownRenderer from '../Research/MarkdownRenderer';
+// Shared conversation blocks — same renderer as the SDK tab. The JSONL history
+// window now draws tool-calls / diff / thinking / markdown through this package
+// so its style matches the rest of the app. Subagents (Task) are intentionally
+// left on the legacy SubAgentBlock path ("субагентов пока не трогаем").
+import { ToolCallPart as CBToolCallPart, ThinkBlock as CBThinkBlock, Markdown as CBMarkdown } from '@noted/claude-blocks';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -21,10 +25,18 @@ interface TaskAction {
   result?: string;
   history?: Array<{ type: string; content?: string; tools?: string[] }>;
 }
-type Action = string | FileAction | TaskAction;
+// Raw tool carrier emitted by the main-process parser for every non-Task
+// tool_use — full name+input+result, rendered via the package ToolCallPart.
+interface RawAction {
+  tool: '__raw__';
+  rawTool: { toolName: string; args: Record<string, any>; result?: string; isError?: boolean };
+}
+type Action = string | FileAction | TaskAction | RawAction;
 
+const isRawAction = (a: Action): a is RawAction =>
+  typeof a === 'object' && a !== null && 'tool' in a && (a as any).tool === '__raw__';
 const isFileAction = (a: Action): a is FileAction =>
-  typeof a === 'object' && a !== null && 'tool' in a && (a as any).tool !== 'Task';
+  typeof a === 'object' && a !== null && 'tool' in a && (a as any).tool !== 'Task' && (a as any).tool !== '__raw__';
 const isTaskAction = (a: Action): a is TaskAction =>
   typeof a === 'object' && a !== null && 'tool' in a && (a as any).tool === 'Task';
 
@@ -50,49 +62,9 @@ interface HistoryPanelProps {
   toolType?: 'claude' | 'gemini';
 }
 
-// Thinking block — blue collapsible, collapsed by default
-const ThinkingBlock = memo(({ text }: { text: string }) => {
-  const [open, setOpen] = useState(false);
-  return (
-    <div
-      style={{
-        marginTop: 8,
-        borderLeft: '3px solid #60a5fa',
-        paddingLeft: 8,
-        backgroundColor: 'rgba(96, 165, 250, 0.06)',
-        borderRadius: '0 4px 4px 0',
-        padding: '4px 8px 4px 8px',
-      }}
-    >
-      <button
-        onClick={() => setOpen(!open)}
-        style={{
-          background: 'none',
-          border: 'none',
-          color: '#60a5fa',
-          cursor: 'pointer',
-          fontSize: 11,
-          display: 'flex',
-          alignItems: 'center',
-          gap: 4,
-          padding: 0,
-          fontWeight: 500,
-        }}
-      >
-        {open ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
-        Thinking
-      </button>
-      {open && (
-        <div style={{
-          fontSize: 12, color: '#b0c4de', marginTop: 6, whiteSpace: 'pre-wrap',
-          lineHeight: 1.5, maxHeight: 400, overflowY: 'auto',
-        }}>
-          <MarkdownRenderer content={text} />
-        </div>
-      )}
-    </div>
-  );
-});
+// Thinking + markdown now render via @noted/claude-blocks (CBThinkBlock /
+// CBMarkdown) — the local ThinkingBlock and the MarkdownRenderer import were
+// removed. SubAgentBlock (Task) keeps its own inline rendering below.
 
 // Short path: last 2 segments
 const shortPath = (p: string) => {
@@ -356,56 +328,52 @@ const HistoryEntry = memo(({ entry, toolType }: { entry: FullHistoryEntry; toolT
         )}
       </div>
 
-      {entry.thinking && <ThinkingBlock text={entry.thinking} />}
+      {entry.thinking && <CBThinkBlock text={entry.thinking} />}
 
       {entry.content && (
         <div style={{ fontSize: 13 }}>
-          <MarkdownRenderer content={entry.content} />
+          <CBMarkdown text={entry.content} />
         </div>
       )}
 
       {entry.actions && entry.actions.length > 0 && (() => {
-        const editWriteActions: FileAction[] = [];
-        const readActions: FileAction[] = [];
-        const taskActions: TaskAction[] = [];
-        const otherActions: string[] = [];
-        for (const a of entry.actions) {
-          if (isTaskAction(a)) {
-            taskActions.push(a);
-          } else if (isFileAction(a)) {
-            if (a.tool === 'Read') readActions.push(a);
-            else editWriteActions.push(a);
-          } else if (typeof a === 'string') {
-            otherActions.push(a);
-          }
-        }
+        // Render actions IN ORDER (a turn interleaves Bash → Edit → Task). Raw
+        // tool actions go through the package card; Task keeps SubAgentBlock;
+        // legacy string/FileAction shapes (e.g. Gemini, or older cached data)
+        // fall back to the old inline renderers so nothing regresses.
         return (
           <>
-            {editWriteActions.map((action, i) => (
-              <FileActionBlock key={'ew' + i} action={action} />
-            ))}
-            {readActions.map((action, i) => (
-              <ReadActionBlock key={'rd' + i} filePath={action.filePath} />
-            ))}
-            {taskActions.map((action, i) => (
-              <SubAgentBlock key={'task' + i} action={action} />
-            ))}
-            {otherActions.length > 0 && (
-              <div style={{ marginTop: 6, display: 'flex', flexWrap: 'wrap', gap: 4 }}>
-                {otherActions.map((action, i) => (
-                  <span
-                    key={i}
-                    style={{
-                      fontSize: 11, color: '#999',
-                      backgroundColor: 'rgba(255,255,255,0.04)',
-                      padding: '2px 6px', borderRadius: 4, wordBreak: 'break-all',
-                    }}
-                  >
-                    {action}
+            {entry.actions!.map((a, i) => {
+              if (isRawAction(a)) {
+                return (
+                  <CBToolCallPart
+                    key={'raw' + i}
+                    toolName={a.rawTool.toolName}
+                    args={a.rawTool.args || {}}
+                    result={a.rawTool.result}
+                    isError={a.rawTool.isError}
+                  />
+                );
+              }
+              if (isTaskAction(a)) return <SubAgentBlock key={'task' + i} action={a} />;
+              if (isFileAction(a)) {
+                return a.tool === 'Read'
+                  ? <ReadActionBlock key={'rd' + i} filePath={a.filePath} />
+                  : <FileActionBlock key={'ew' + i} action={a} />;
+              }
+              // string fallback (Gemini / legacy)
+              return (
+                <div key={'s' + i} style={{ marginTop: 6 }}>
+                  <span style={{
+                    fontSize: 11, color: '#999',
+                    backgroundColor: 'rgba(255,255,255,0.04)',
+                    padding: '2px 6px', borderRadius: 4, wordBreak: 'break-all',
+                  }}>
+                    {a as string}
                   </span>
-                ))}
-              </div>
-            )}
+                </div>
+              );
+            })}
           </>
         );
       })()}
@@ -784,35 +752,80 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
   // find a virtualized item that isn't mounted yet.
   const [flashUuid, setFlashUuid] = useState<string | null>(null);
 
+  // Generation guard for the scroll-to-uuid convergence loop below: a newer
+  // Cmd+click supersedes an in-flight loop, and unmount stops it (so it can't
+  // setState on an unmounted component). NOT driven by the effect's cleanup —
+  // the loop must survive the re-render caused by clearing historyScrollToUuid.
+  const scrollGenRef = useRef(0);
+  const scrollMountedRef = useRef(true);
+  useEffect(() => () => { scrollMountedRef.current = false; scrollGenRef.current++; }, []);
+
   useEffect(() => {
     if (!historyScrollToUuid) return;
     if (loading || entries.length === 0) return; // wait for entries; uuid stays in store
-    let cancelled = false;
     const targetUuid = historyScrollToUuid;
     const idx = entries.findIndex((e) => e.uuid === targetUuid);
+    // Consume the store key immediately. The convergence loop is driven by the
+    // ref-generation guard, NOT by this effect's cleanup, so clearing the key
+    // (which re-runs the effect → early-return above) does not abort the loop.
+    setHistoryScrollToUuid(null);
     if (idx < 0) {
-      // entry doesn't exist in this session — clear uuid so we don't loop
-      setHistoryScrollToUuid(null);
+      // entry doesn't exist in this session — acknowledge so the dot spinner clears
       window.dispatchEvent(
         new CustomEvent('history-panel:scrolled-to', { detail: { tabId, uuid: targetUuid, found: false } }),
       );
       return;
     }
-    const handle = virtuosoRef.current;
-    if (handle) {
-      handle.scrollToIndex({ index: idx, align: 'center', behavior: 'auto' });
-    }
-    // Flash + emit done-event after layout settles
-    const t = setTimeout(() => {
-      if (cancelled) return;
+
+    // Variable-height virtualization race. When the panel was just opened
+    // (closed→open — the Cmd+click path), Virtuoso mounts at the tail
+    // (initialTopMostItemIndex = last) and a single scrollToIndex fired in the
+    // same tick lands on an ESTIMATED offset — the rows above the target aren't
+    // measured yet, so the farther the target the larger the error (user:
+    // «на длинных дистанциях скроллится не к тому юзерпромпту»). When the panel
+    // was already open the rows are measured and one call is accurate.
+    // Fix: re-issue scrollToIndex across frames until the target row's real DOM
+    // rect stops moving (Virtuoso has honored the scroll AND finished measuring),
+    // then flash + emit the done-event. Stability — not a fixed delay — is the
+    // signal, so it self-adapts to short vs long distances.
+    const myGen = ++scrollGenRef.current;
+    let attempts = 0;
+    let stable = 0;
+    let lastTop: number | null = null;
+    const MAX_ATTEMPTS = 40; // ~40 × 40ms ≈ 1.6s ceiling
+
+    const finish = () => {
+      if (!scrollMountedRef.current || scrollGenRef.current !== myGen) return;
       setFlashUuid(targetUuid);
       window.dispatchEvent(
         new CustomEvent('history-panel:scrolled-to', { detail: { tabId, uuid: targetUuid, found: true } }),
       );
-      setTimeout(() => { if (!cancelled) setFlashUuid(null); }, 500);
-    }, 120);
-    setHistoryScrollToUuid(null);
-    return () => { cancelled = true; clearTimeout(t); };
+      setTimeout(() => {
+        if (scrollMountedRef.current && scrollGenRef.current === myGen) setFlashUuid(null);
+      }, 600);
+    };
+
+    const step = () => {
+      if (!scrollMountedRef.current || scrollGenRef.current !== myGen) return; // superseded / unmounted
+      virtuosoRef.current?.scrollToIndex({ index: idx, align: 'center', behavior: 'auto' });
+      attempts++;
+      const scroller = virtuosoScrollerRef.current;
+      const node = scroller?.querySelector(`[data-uuid="${CSS.escape(targetUuid)}"]`) as HTMLElement | null;
+      if (node && scroller) {
+        // Offset of the row relative to the scroller's own viewport — immune to
+        // the panel's slide-in transform (both translate together), so this only
+        // moves when the INTERNAL scroll position is still settling.
+        const top = node.getBoundingClientRect().top - scroller.getBoundingClientRect().top;
+        if (lastTop !== null && Math.abs(top - lastTop) < 1) stable++; else stable = 0;
+        lastTop = top;
+        // Mounted + position unchanged for 2 consecutive frames, after at least
+        // a few scrollToIndex calls → Virtuoso has settled on the target row.
+        if (stable >= 2 && attempts >= 3) { finish(); return; }
+      }
+      if (attempts >= MAX_ATTEMPTS) { finish(); return; }
+      setTimeout(step, 40);
+    };
+    setTimeout(step, 0);
   }, [historyScrollToUuid, loading, entries, tabId, setHistoryScrollToUuid]);
 
   // Native scroll handler — runs on the Virtuoso scroller element via a

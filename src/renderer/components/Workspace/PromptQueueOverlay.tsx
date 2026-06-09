@@ -3,7 +3,12 @@ import { createPortal } from 'react-dom';
 import { usePromptQueueStore } from '../../store/usePromptQueueStore';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
-import { isTabBusyNow } from '../../hooks/usePromptQueueRunner';
+// Run-after picker SEEDS its busy map from this always-on snapshot on mount,
+// then keeps it live via the same claude:busy-state / gemini:busy-state IPC
+// TabBar uses (see RunAfterTabPicker). Seeding is required because the overlay
+// mounts with the active Claude tab and would otherwise miss the busy:true edge
+// that already fired on a background target tab.
+import { getBusyTabsSnapshot } from '../../hooks/usePromptQueueRunner';
 import { terminalRegistry } from '../../utils/terminalRegistry';
 
 const { ipcRenderer } = window.require('electron');
@@ -42,21 +47,28 @@ const BORDER = 'rgba(255,255,255,0.08)';
 const TEXT_MUTED = '#888';
 const TEXT_DIM = '#555';
 
-// Panel sizes itself to its content (`width: 'fit-content'`) but is clamped
-// to a sensible range so it never gets pencil-thin on an empty queue and
-// never eats half the terminal on a long post-prompt. Toggling button states
-// MUST NOT change the panel's measured width — that's enforced inside the
-// header row (e.g. the Stop/Close split-button uses a CSS grid to reserve
-// the wider of the two labels' widths). PANEL_MIN_WIDTH ≈ the previous
-// fixed value so existing layouts don't suddenly shrink.
-// PANEL_MIN_WIDTH was 296px to fit the old wide-flex header. After the
-// 2-column grid refactor each cell needs only ~110-120px so the panel can be
-// narrower. Kept slightly above 2×110px + gaps + padding so neither column
-// gets squeezed below the input/trigger's intrinsic readable width.
-const PANEL_MIN_WIDTH = 240;
-const PANEL_MAX_WIDTH = 360;
+// Panel width is now FIXED (user-resizable, persisted in useUIStore.promptQueueWidth),
+// NOT `fit-content`. Reason: `fit-content` reflowed the panel every time a +grab
+// chip was added/removed or a button label changed — the user wants a stable width
+// they set once. Width-stability of inner controls still matters (the Stop/Close
+// split-button uses a CSS grid to reserve the wider label) so the content never
+// pushes past the fixed width. Bounds + default live in useUIStore
+// (PROMPT_QUEUE_WIDTH_MIN/MAX); RESIZE_MIN/MAX_WIDTH below must mirror them.
 const PREVIEW_WIDTH = 380;
 const PREVIEW_MAX_HEIGHT = 420;
+
+// Which screen edge the overlay is docked to. The panel is pinned by this edge
+// (it never moves), and the resize handle lives on the OPPOSITE (free) edge so
+// dragging only grows/shrinks toward the available space — per
+// `🧩 Code-Patterns/.../tooltip-resize-modal.md`: «resize только в сторону,
+// противоположную опорной границе». Today the overlay sits top-RIGHT
+// (style `right: 8`), so anchor = 'right' → handle on the LEFT → drag-left grows.
+// When the menu later moves to the left side, flip this to 'left' (and swap the
+// style to `left: 8`) — the handle auto-moves to the right, no other change.
+const ANCHOR_SIDE: 'left' | 'right' = 'right';
+// Resize bounds — must match useUIStore's PROMPT_QUEUE_WIDTH_MIN/MAX clamp.
+const RESIZE_MIN_WIDTH = 240;
+const RESIZE_MAX_WIDTH = 600;
 
 // First line of the prompt → chip header. Tail is the rest as +chars indicator.
 function chipParts(text: string): { head: string; tail: string } {
@@ -130,6 +142,43 @@ export function PromptQueueOverlay({ tabId, claudeBusy }: Props) {
   // and its top edge to this rect's top edge. null = anchor to the whole panel's top-right corner.
   const [editorAnchor, setEditorAnchor] = useState<{ top: number; right: number } | null>(null);
   const panelRef = useRef<HTMLDivElement>(null);
+
+  // ─── fixed width + drag-resize ─────────────────────────────────────────────
+  // The panel has a FIXED width (no `fit-content`) so adding a +grab chip can't
+  // reflow it — the user's complaint. Width is global (like timelineWidth) and
+  // persisted in useUIStore. During a drag we render from `dragWidth` (local,
+  // for 60fps without store churn) and commit to the store on mouse-up.
+  const promptQueueWidth = useUIStore((s) => s.promptQueueWidth);
+  const setPromptQueueWidth = useUIStore((s) => s.setPromptQueueWidth);
+  const [dragWidth, setDragWidth] = useState<number | null>(null);
+  const effectiveWidth = dragWidth ?? promptQueueWidth;
+
+  const startResize = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const startX = e.clientX;
+    const startW = useUIStore.getState().promptQueueWidth;
+    const onMove = (ev: MouseEvent) => {
+      const dx = ev.clientX - startX;
+      // Anchor on the RIGHT → the LEFT edge is free → moving cursor left (dx<0)
+      // must GROW the panel, so the delta is inverted. Anchor on the LEFT →
+      // RIGHT edge free → dx is positive-grow. ANCHOR_SIDE makes this a 1-flip
+      // change when the menu moves sides.
+      const delta = ANCHOR_SIDE === 'right' ? -dx : dx;
+      const next = Math.max(RESIZE_MIN_WIDTH, Math.min(RESIZE_MAX_WIDTH, startW + delta));
+      setDragWidth(next);
+    };
+    const onUp = () => {
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+      setDragWidth((w) => {
+        if (w != null) setPromptQueueWidth(w);
+        return null;
+      });
+    };
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  }, [setPromptQueueWidth]);
 
   // Toast handle — single getState() at top so both grabCurrent and the auto-runner share it
   // without re-declaring (which TS catches as duplicate identifier).
@@ -361,9 +410,8 @@ export function PromptQueueOverlay({ tabId, claudeBusy }: Props) {
           return;
         }
         addPrompt(tabId, t, res.images || 0, Array.isArray(res.imagePaths) ? res.imagePaths : undefined);
-        const oneLine = t.replace(/\s+/g, ' ').trim();
-        const preview = oneLine.length > 20 ? oneLine.slice(0, 20) + '…' : oneLine;
-        showToast(`Queued: "${preview}"`, 'success', 1500);
+        // No success toast on queue-add — the new chip appearing in the overlay
+        // is its own confirmation; the toast was redundant noise (user request).
         // Refocus so Claude re-reads the (now empty) tempfile immediately — without
         // this the input visually keeps the old text until user clicks the terminal.
         focusActiveTerminal();
@@ -430,10 +478,12 @@ export function PromptQueueOverlay({ tabId, claudeBusy }: Props) {
         ref={panelRef}
         style={{
           position: 'absolute',
-          top: 8, right: 8,
-          width: 'fit-content',
-          minWidth: PANEL_MIN_WIDTH,
-          maxWidth: PANEL_MAX_WIDTH,
+          top: 8,
+          // Anchored edge — pinned, never moves during resize.
+          ...(ANCHOR_SIDE === 'right' ? { right: 8 } : { left: 8 }),
+          // FIXED width (was `fit-content` clamped [min,max] → reflowed on +grab).
+          // Drag-resizable via the handle on the free edge below.
+          width: effectiveWidth,
           background: PANEL_BG,
           border: `1px solid ${BORDER}`,
           borderRadius: 6,
@@ -447,6 +497,27 @@ export function PromptQueueOverlay({ tabId, claudeBusy }: Props) {
           overflow: 'hidden',
         }}
       >
+        {/* Resize handle on the FREE edge (opposite the anchor). Drag changes
+            width only; height is governed by chip line-clamp in Settings, not
+            here. `data-cmd-hover-popover` so a Cmd+Shift-pinned popover elsewhere
+            isn't dismissed by the mousedown. Flush INSIDE the edge (left/right:0,
+            width 6) — the panel is `overflow:hidden`, so an outside offset would
+            be clipped to a sliver; the 6px zone sits over the header's left
+            padding, not over any interactive control. */}
+        <div
+          data-cmd-hover-popover
+          onMouseDown={startResize}
+          title="Потяни — изменить ширину"
+          style={{
+            position: 'absolute',
+            top: 0,
+            bottom: 0,
+            ...(ANCHOR_SIDE === 'right' ? { left: 0 } : { right: 0 }),
+            width: 6,
+            cursor: 'ew-resize',
+            zIndex: 60,
+          }}
+        />
         {/* Header row: first-delay timer input on left, Run/Stop pills on right.
             The title "Очередь" was removed — context is obvious from the panel.
             Timer input doubles as a countdown display when armed:
@@ -1244,17 +1315,38 @@ function RunAfterTabPicker({ tabId, runAfterTabId, setRunAfterTab, panelRef }: R
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fingerprint, tabId]);
 
-  // Track activeTabId separately — used for status detection (inactive=
-  // user hasn't activated the picked tab yet). Fingerprint excludes it
-  // because activeTabId changes don't affect WHICH tabs we list, only how
-  // we badge them; separate subscription keeps the list-rebuild O(0) on
-  // pure tab-switch events.
-  const activeTabId = useWorkspaceStore((state) => {
-    for (const ws of state.openProjects.values()) {
-      if (ws.tabs.has(tabId)) return ws.activeTabId;
-    }
-    return null;
-  });
+  // Live per-tab busy map — mirrors TabBar's claudeBusyMap/geminiBusyMap. The
+  // status icon (spinner vs nothing) must update reactively for BACKGROUND
+  // tabs (the waited-on tab is by definition never the focused one), so we
+  // subscribe to the SAME focus-independent IPC broadcasts TabBar consumes
+  // and keep the result in React state. No polling: every busy edge → setState
+  // → re-render of the closed pill and every open row. Both engines write into
+  // one map keyed by tabId (we wait on a TAB, not a specific engine), exactly
+  // like the runner's unified prevBusyRef. The runner's prevBusyRef is left
+  // untouched — auto-run firing still depends on it.
+  // Seed from the always-on runner snapshot so a target that's ALREADY busy at
+  // mount shows its spinner immediately (the overlay mounts/unmounts with the
+  // active tab, so we can't rely on catching the busy:true edge ourselves).
+  const [busyMap, setBusyMap] = useState<Map<string, boolean>>(() => getBusyTabsSnapshot());
+  useEffect(() => {
+    // Re-seed on (re)mount in case edges fired between initial state and effect.
+    setBusyMap(getBusyTabsSnapshot());
+    const apply = (tid: string, busy: boolean) =>
+      setBusyMap((prev) => {
+        if (prev.get(tid) === busy) return prev;
+        const next = new Map(prev);
+        next.set(tid, busy);
+        return next;
+      });
+    const handleClaudeBusy = (_: any, { tabId: tid, busy }: { tabId: string; busy: boolean }) => apply(tid, busy);
+    const handleGeminiBusy = (_: any, { tabId: tid, busy }: { tabId: string; busy: boolean }) => apply(tid, busy);
+    ipcRenderer.on('claude:busy-state', handleClaudeBusy);
+    ipcRenderer.on('gemini:busy-state', handleGeminiBusy);
+    return () => {
+      ipcRenderer.removeListener('claude:busy-state', handleClaudeBusy);
+      ipcRenderer.removeListener('gemini:busy-state', handleGeminiBusy);
+    };
+  }, []);
 
   const [open, setOpen] = useState(false);
   // Anchor coords for the side slideout — set on every open so it tracks
@@ -1262,16 +1354,6 @@ function RunAfterTabPicker({ tabId, runAfterTabId, setRunAfterTab, panelRef }: R
   const [anchor, setAnchor] = useState<{ top: number; right: number; height: number } | null>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
-
-  // Re-render once per 750ms while menu is open OR a target is selected —
-  // status icon (spinner vs "!") follows live busy state which lives outside
-  // Zustand. Off otherwise to avoid wasted renders for the common case.
-  const [, force] = useState(0);
-  useEffect(() => {
-    if (!runAfterTabId && !open) return;
-    const id = setInterval(() => force((n) => (n + 1) & 0xffff), 750);
-    return () => clearInterval(id);
-  }, [runAfterTabId, open]);
 
   // Outside-click + Esc → close.
   useEffect(() => {
@@ -1308,13 +1390,12 @@ function RunAfterTabPicker({ tabId, runAfterTabId, setRunAfterTab, panelRef }: R
   }, [panelRef]);
 
   // Status: drives the right-side icon both in the closed pill (for the
-  // selected target) and in each open-menu row.
-  type Status = 'busy' | 'inactive' | 'ready';
-  const statusFor = (id: string): Status => {
-    if (isTabBusyNow(id)) return 'busy';
-    if (activeTabId !== id) return 'inactive';
-    return 'ready';
-  };
+  // selected target) and in each open-menu row. 2-state by design — a tab
+  // whose agent is actively thinking shows a spinner, anything else shows
+  // nothing. (The old 'inactive'=not-focused '!' badge was noise: it lit up
+  // on nearly every row because at most one tab equals the focused tab.)
+  type Status = 'busy' | 'idle';
+  const statusFor = (id: string): Status => (busyMap.get(id) === true ? 'busy' : 'idle');
 
   const selectedTab = runAfterTabId
     ? aiTabs.find((t) => t.id === runAfterTabId) ?? null
@@ -1322,10 +1403,15 @@ function RunAfterTabPicker({ tabId, runAfterTabId, setRunAfterTab, panelRef }: R
   const selectedStatus = selectedTab ? statusFor(selectedTab.id) : null;
   const truncate = (s: string, n: number) => (s.length > n ? s.slice(0, n - 1) + '…' : s);
 
+  // Armed palette: purple is a translucent BACKGROUND fill only; border + text
+  // are white. Purple as foreground (text/thin border) on near-black is low
+  // contrast and "режет глаза" — white foreground on a soft violet fill reads
+  // cleanly on the dark overlay. (User: «только background фиолетовым, рамку и
+  // цвет внутри — белым».)
   const armed = !!runAfterTabId;
-  const triggerBorder = armed ? DEEP_PULSE : BORDER;
-  const triggerColor = armed ? DEEP_PULSE : TEXT_MUTED;
-  const triggerBg = armed ? `${DEEP_PULSE}22` : 'transparent';
+  const triggerBorder = armed ? 'rgba(255,255,255,0.55)' : BORDER;
+  const triggerColor = armed ? '#fff' : TEXT_MUTED;
+  const triggerBg = armed ? `${DEEP_PULSE}33` : 'transparent';
 
   return (
     <>
@@ -1335,7 +1421,6 @@ function RunAfterTabPicker({ tabId, runAfterTabId, setRunAfterTab, panelRef }: R
         title={
           armed && selectedTab
             ? `Run after tab "${selectedTab.name}" finishes` +
-              (selectedStatus === 'inactive' ? ' (waiting for activation)' : '') +
               (selectedStatus === 'busy' ? ' (busy now)' : '')
             : 'Pick a tab to wait on (otherwise fires on own turn-end)'
         }
@@ -1366,8 +1451,9 @@ function RunAfterTabPicker({ tabId, runAfterTabId, setRunAfterTab, panelRef }: R
               flex: 1, minWidth: 0,
               overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
               textAlign: 'left',
+              fontSize: 11,  // +2px on the tab name (button base is 9) per user request
             }}>{truncate(selectedTab.name, 9)}</span>
-            <StatusIcon status={selectedStatus!} color={DEEP_PULSE} />
+            <StatusIcon status={selectedStatus!} color="#fff" />
           </>
         ) : (
           <>
@@ -1453,7 +1539,7 @@ function RunAfterTabPicker({ tabId, runAfterTabId, setRunAfterTab, panelRef }: R
                     key={t.id}
                     label={t.name}
                     colorDot={AI_KIND_COLOR[t.kind]}
-                    statusIcon={<StatusIcon status={status} color={TEXT_MUTED} />}
+                    statusIcon={<StatusIcon status={status} color="#fff" />}
                     selected={isSelected}
                     onClick={() => {
                       // Toggle-off: clicking the already-selected row clears
@@ -1496,12 +1582,14 @@ function RunAfterRow({
       style={{
         width: '100%',
         padding: '4px 6px',
-        background: selected ? `${DEEP_PULSE}33` : (hover ? `${DEEP_PULSE}1a` : 'transparent'),
+        // Purple is BACKGROUND only; selected text is white (purple-on-dark text
+        // is low-contrast / harsh). +2px on the label per user request.
+        background: selected ? `${DEEP_PULSE}40` : (hover ? `${DEEP_PULSE}1a` : 'transparent'),
         border: 'none',
         borderRadius: 3,
-        color: muted ? TEXT_DIM : (selected ? DEEP_PULSE : '#ddd'),
+        color: muted ? TEXT_DIM : (selected ? '#fff' : '#ddd'),
         cursor: 'pointer',
-        fontSize: 10,
+        fontSize: 12,
         display: 'flex', alignItems: 'center', gap: 6,
         textAlign: 'left',
       }}
@@ -1520,11 +1608,10 @@ function RunAfterRow({
   );
 }
 
-// Status icon for one tab. busy = spinning loader, inactive = warning "!",
-// ready = nothing (empty span so layout doesn't shift). Spinner animation
-// uses the same global `pq-spinner` rule already defined in the overlay's
-// CSS keyframes (see pq-spinner class on Replay button).
-function StatusIcon({ status, color }: { status: 'busy' | 'inactive' | 'ready'; color: string }) {
+// Status icon for one tab. busy = spinning loader (agent actively thinking),
+// idle = nothing. Spinner uses the global `pq-spin` keyframe defined in the
+// overlay's always-rendered <style> block (same rule as the Replay button).
+function StatusIcon({ status, color }: { status: 'busy' | 'idle'; color: string }) {
   if (status === 'busy') {
     return (
       <span style={{ flexShrink: 0, display: 'inline-flex' }}>
@@ -1541,19 +1628,6 @@ function StatusIcon({ status, color }: { status: 'busy' | 'inactive' | 'ready'; 
       </span>
     );
   }
-  if (status === 'inactive') {
-    return (
-      <span title="Tab is not active — waiting for you to switch to it and submit a prompt" style={{
-        flexShrink: 0,
-        width: 11, height: 11, borderRadius: '50%',
-        background: 'transparent',
-        border: `1px solid ${color}`,
-        color,
-        fontSize: 8, fontWeight: 700, lineHeight: '9px',
-        display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
-      }}>!</span>
-    );
-  }
-  // ready: occupy 0 width so the row layout stays consistent across statuses.
+  // idle: render nothing (no badge, no layout shift).
   return null;
 }

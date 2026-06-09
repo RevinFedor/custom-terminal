@@ -677,11 +677,30 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
           && e.clientY >= r.top - pad && e.clientY <= r.bottom + pad;
       if (!inRect(chipRect, 2) && !inRect(popRect, 2)) {
         setSingleBreakdownOpen(false);
+        // §2.7: while the popover is open the parent onMouseLeave is a no-op (~4177),
+        // so THIS continuous guard is the sole owner of closing the gesture. The chip
+        // lives in the parent tooltip footer — once the cursor has left both chip and
+        // popover we must ALSO re-evaluate the parent, else it would be left stuck open.
+        // tooltipRef is the wrapper (visible content + CSS bridge corridor to the
+        // Timeline strip); if the cursor is outside that too, close it exactly like
+        // handleMouseLeaveTooltipArea would. Guards read via refs / store.getState() —
+        // they are declared later in the body, so they MUST NOT go in the deps array
+        // (deps are evaluated eagerly at render → TDZ). Reading at event-time is safe.
+        const parentRect = tooltipRef.current?.getBoundingClientRect();
+        if (!inRect(parentRect, 2)
+            && !isExpanded
+            && !isResizingTooltipRef.current
+            && !isLockedTooltipRef.current
+            && !useUIStore.getState().freezeCmdPopups) {
+          isMouseInTooltipRef.current = false;
+          setHoveredIndex(null);
+          setActiveTooltipIndex(null);
+        }
       }
     };
     window.addEventListener('mousemove', onMove);
     return () => window.removeEventListener('mousemove', onMove);
-  }, [singleBreakdownOpen, singleChipEl]);
+  }, [singleBreakdownOpen, singleChipEl, isExpanded]);
 
   useEffect(() => {
     if (!breakdownOpen) return;
@@ -1323,23 +1342,43 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     };
   }, [sessionId]);
 
-  // Auto-scroll timeline to bottom on initial load (when sessionId changes)
-  // This ensures the user sees the latest (reachable) entries, not old red ones at the top
-  const prevSessionRef = useRef<string | null>(null);
-  // effect: sessionId changes + entries loaded → scrollRef.scrollTo bottom (so user sees latest reachable entries on session-switch / initial mount)
+  // Auto-scroll Timeline to bottom whenever the user lands on a tab/session.
+  //
+  // Intent (user): "переключился на другую вкладку и обратно — скролл всегда внизу",
+  // regardless of whether Claude/Gemini/SDK is running or not. The Timeline is a
+  // SINGLE instance whose tabId/sessionId props swap on tab switch (isVisible stays
+  // true within a project), so the trigger is a (tabId | sessionId) change.
+  //
+  // The trap the previous impl fell into: it scrolled on the prop-change tick, when
+  // `entries` still held the PREVIOUS tab's data — so it scrolled to a stale
+  // scrollHeight and never re-scrolled after loadTimeline replaced entries (its guard
+  // `sessionId !== prevSessionRef` was already satisfied). Fix: ARM a pending flag on
+  // key change, then CONSUME it on the first NON-EMPTY `entries` reference change (the
+  // post-load commit). The 2s poll also changes `entries`, but it always lands AFTER
+  // the pending flag was cleared → it never scrolls → manual scroll-up is preserved
+  // (see fact-timeline.md::Auto-Scroll при продолжении сессии — "не sticky-scroll").
+  // Timing-independent: no setTimeout window to outrun a slow IPC load.
+  const scrollKeyRef = useRef<string | null>(null);
+  const pendingBottomRef = useRef(false);
+  // effect: (tabId | sessionId) change → arm pending bottom-scroll (consumed by the next fresh entries commit)
   useEffect(() => {
-    if (sessionId && sessionId !== prevSessionRef.current && entries.length > 0) {
-      prevSessionRef.current = sessionId;
-      const el = scrollRef.current;
-      console.warn(`[Timeline:AutoScroll] sessionId=${sessionId.substring(0,8)} entries=${entries.length} scrollRef=${!!el} scrollHeight=${el?.scrollHeight} clientHeight=${el?.clientHeight} scrollTop=${el?.scrollTop}`);
-      requestAnimationFrame(() => {
-        if (scrollRef.current) {
-          scrollRef.current.scrollTo({ top: scrollRef.current.scrollHeight });
-          console.warn(`[Timeline:AutoScroll] DONE scrollTo=${scrollRef.current.scrollHeight} newScrollTop=${scrollRef.current.scrollTop}`);
-        }
-      });
+    const key = `${tabId}::${sessionId || ''}`;
+    if (key !== scrollKeyRef.current) {
+      scrollKeyRef.current = key;
+      pendingBottomRef.current = true;
     }
-  }, [sessionId, entries.length]);
+  }, [tabId, sessionId]);
+
+  // effect: first non-empty `entries` commit after arming → jump scroll to bottom (double-rAF survives content-visibility:auto height correction), then disarm so poll updates don't fight manual scroll
+  useEffect(() => {
+    if (!pendingBottomRef.current || entries.length === 0) return;
+    pendingBottomRef.current = false;
+    const jump = () => {
+      const el = scrollRef.current;
+      if (el) el.scrollTop = el.scrollHeight;
+    };
+    requestAnimationFrame(() => { jump(); requestAnimationFrame(jump); });
+  }, [entries]);
 
   // effect: sessionId/loadTimeline/isVisible + document.visibilitychange → 2s setInterval(loadTimeline) (paused while tab hidden; PERF: avoids IPC round-trips in background — Timeline:PollPaused/Resumed logs)
   useEffect(() => {
@@ -4174,16 +4213,17 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
               ref={tooltipRef}
               data-cmd-hover-popover
               onMouseEnter={() => { isMouseInTooltipRef.current = true; }}
-              onMouseLeave={(e) => {
-                // Keep tooltip open while cursor is inside the single-entry breakdown
-                // popover (it lives in a sibling portal, so MouseLeave fires when the
-                // cursor crosses the gap). Hit-test against the popover's rect.
-                if (singleBreakdownOpen && singleBreakdownPopoverRef.current) {
-                  const r = singleBreakdownPopoverRef.current.getBoundingClientRect();
-                  if (e.clientX >= r.left && e.clientX <= r.right &&
-                      e.clientY >= r.top && e.clientY <= r.bottom) {
-                    return;
-                  }
+              onMouseLeave={() => {
+                // §2.7 (сценарии-багов-design): while the single-entry breakdown popover
+                // is open, the global 'mousemove' keep-alive (the singleBreakdownOpen
+                // effect ~670) owns ALL closing for this gesture — it hit-tests
+                // chip+popover+parent every frame. onMouseLeave fires a few ms earlier and
+                // (during flip-up / JSONL↔API re-measure) reads a transiently stale popover
+                // rect, killing the PARENT while the child survives — the exact intermittent
+                // close the user hit. So do NOT decide visibility here in that state: make
+                // MouseLeave a no-op and let the continuous geometric guard close both.
+                if (singleBreakdownOpen) {
+                  return;
                 }
                 if (!isResizingTooltipRef.current && !freezeCmdPopups && !isLockedTooltip) {
                   isMouseInTooltipRef.current = false;

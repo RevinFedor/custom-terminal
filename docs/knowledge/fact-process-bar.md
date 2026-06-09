@@ -1,7 +1,7 @@
 # Feature: Tab Process Bar (PTY-alive indicator)
 
 ## Intro
-3px цветная полоска у одного из краёв вкладки в vertical layout. Появляется когда жив PTY-процесс (claude CLI, npm run dev, bash, gemini) **или** AI стримит (`isBusy`). PTY-сигнал даёт цветной пульс A↔B, AI-сигнал — белёсый блик ползёт сверху вниз поверх цвета. Оба могут идти одновременно. Конфигурируется в Settings → Системные: enabled/colors A+B/duration/position; блик не конфигурируется (фиксированный белёсый light-overlay). Соседний индикатор `tab-ai-busy-shimmer` (фон всей вкладки) пока сосуществует, планируется удалить после переноса AI-сигнала на полоску.
+3px цветная полоска у одного из краёв вкладки в vertical layout. Появляется когда жив PTY-процесс (claude CLI, npm run dev, bash, gemini) **или** AI стримит (`isBusy`). PTY-сигнал даёт цветной пульс A↔B, AI-сигнал — белёсый блик ползёт сверху вниз поверх цвета. Оба могут идти одновременно. Конфигурируется в Settings → Системные: enabled/colors A+B/duration/position; блик не конфигурируется (фиксированный белёсый light-overlay). Это **единственный** busy/process-индикатор — бывший фон-пульс всей вкладки (`tab-ai-busy-shimmer`, фича AIPulse) удалён целиком, см. секцию «AIPulse removed» ниже.
 
 ## Data model
 
@@ -106,62 +106,25 @@ Settings-UI: при выключенном пульсе input цвета B и sl
 - Compact color-rows для A и B (button → hex input, popup picker)
 - Длительность — `<input type="number">` 64px справа от лейбла, в **милисекундах** (300..6000, step 100). Юзер: *«длительность цикла сделай input обычный, нахуй ты это вынес на целую огроменную полоску, которая занимает всю ширину»* — первая итерация была `<input type="range">` на всю ширину блока, оказалась визуально доминирующей. Number input компактнее, не претендует на главенство.
 
-## AI pulse — фон всего таба, не sweep-полоса
+## AIPulse removed — лоадер это полоска, не фон всего таба
 
-Соседний индикатор `tab-ai-busy-shimmer` сейчас — мягкий пульс **фона всей карточки таба** между двумя цветами (`--ai-pulse-color-a` ↔ `--ai-pulse-color-b`). До этого был sweep-шиммер (горизонтальная полоса 60% ширины, бежит слева направо через `translateX`), но юзер: *«временно отключи пульсацию слева-направо, сделай пульсацию фона»* — sweep слишком навязчиво конкурировал с текстом таба за внимание, фон-pulse читается как «теплится», не «бежит».
+**Фича AIPulse (`tab-ai-busy-shimmer`/`-static`, пульс фона ВСЕЙ карточки таба) удалена целиком.** Юзер: *«если в настройках есть что-то что отвечает за изменение бэкграунда всего таба во время работы — удали это нахуй; лоадер у нас отвечает переливающаяся полоска слева или справа»*. Единственный AI-busy / process-alive индикатор теперь — **process-bar полоска у края** (этот файл, секции выше): цветной пульс A↔B пока жив процесс, белёсый shimmer-overlay ползёт по ней пока AI реально стримит.
 
-Дата-модель отдельная от ProcessBar (раньше шаринг был одного `--process-bar-*` для обоих):
+Что снесено (5 точек, искать если всплывёт): `AIPulseSettings`/`aiPulse`/`setAiPulse`/`loadAIPulse`/`saveAIPulse` в `useUIStore.ts`; `--ai-pulse-*` :root-effect в `App.tsx`; `tab-ai-busy-*` render-блок в `TabBar.tsx`; `@keyframes tab-ai-busy-pulse` + `.tab-ai-busy-shimmer/-static` в `globals.css`; `AIPulseEditor` + «Фон AI-загрузки» секция в `SettingsModal.tsx`. Никаких importers не осталось.
 
-```ts
-AIPulseSettings = {
-  enabled: boolean,     // false → статичный mix(colorB, 14%, transparent) без анимации
-  colorA: string,       // нижняя фаза. 'transparent' → полностью прозрачный фон между пиками
-  colorB: string,       // пик. Рендерится с alpha 22% (мягкая подсветка, не заливка)
-  durationMs: number,   // 300..6000ms, default 2400 = sync c processBar
-}
-```
+Исторический контекст (почему вообще была): сначала был sweep-шиммер (горизонтальная полоса 60% ширины через `translateX`), потом фон-pulse всей карточки — юзер тогда просил *«сделай пульсацию фона»*. Теперь решение откатано в пользу полоски-у-края: фон-tint всего таба конкурировал с текстом за внимание, лоадер должен быть локализован в полоске.
 
-localStorage `noted-terminal-ai-pulse`, default `enabled: true, colorA: 'transparent', colorB: '#DA7756', durationMs: 2400`. Дефолтный colorB — Claude-оранжевый: фон таба «подсвечивается» когда AI стримит, выглядит как «таб активен», а не как алерт. Юзер может сменить на любой hex через Settings → Размеры → Табы → Фон AI-загрузки.
+## Mobile-web зеркалит полоску (process-bar = лоадер на телефоне)
 
-**Sync с ProcessBar duration.** Default 2400ms взят одинаковым с `processBar.durationMs` — иначе при живом PTY-claude в думанье работают одновременно ОБА индикатора (process-bar pulse слева 3px полоской + tab-ai-busy pulse под всем табом), и разные периоды визуально «бьются» (пик одного на минимуме другого, потом наоборот). Юзер может выставить разные значения в Settings, если осознанно — но default обязан совпадать.
+Mobile-web tab-row рисует **ту же полоску-лоадер** у края строки (`ProcessBarStrip` в `mobile-web/src/App.tsx`). Конфиг (`enabled/colorA/colorB/durationMs/position`) приходит из desktop `useUIStore.processBar` через тот же канал что `statusMarker`/`statusColor`: `GET /api/projects/:id/tabs` отдаёт top-level `processBar`, оба пути (DB-path web-server.js через bridge `getStatusMarkerConfig`, live-Zustand-path App.tsx `getProjectTabsLive`) читают `useUIStore.getState().processBar`. **Desktop store = единственный источник правды, мобилка только читает** (юзер: «по-хорошему чтобы хранилось в одном состоянии»).
 
-## AI pulse — hex-to-rgba endpoints, не color-mix() в keyframe
-
-```css
-@keyframes tab-ai-busy-pulse {
-  0%   { background-color: var(--ai-pulse-color-a, rgba(0,0,0,0)); }
-  50%  { background-color: var(--ai-pulse-color-b, rgba(218,119,86,0.22)); }
-  100% { background-color: var(--ai-pulse-color-a, rgba(0,0,0,0)); }
-}
-.tab-ai-busy-shimmer {
-  animation: tab-ai-busy-pulse var(--ai-pulse-duration, 2400ms) ease-in-out infinite;
-  pointer-events: none;
-}
-.tab-ai-busy-static {
-  background-color: var(--ai-pulse-color-static, rgba(218,119,86,0.14));
-  pointer-events: none;
-}
-```
-
-Endpoints на `:root` — **plain rgba**, не `color-mix(...)`. Первая итерация клала `color-mix(in srgb, var(--colorB) 22%, transparent)` прямо внутрь `50%` keyframe — Chromium **не интерполирует** между двумя color-mix() выражениями покадрово, ставит endpoints и переходит между ними скачком. Юзер: *«нет плавности и анимации, просто через разный промежуток происходит мигание до сих пор»*. Лечение — hex-to-rgba конверсия в JS (`App.tsx::useEffect([aiPulse.*])`): берём `colorB`, считаем `rgba(r,g,b,0.22)` строкой и пишем на `:root.style.setProperty('--ai-pulse-color-b', ...)`. Keyframe теперь интерполирует **per-channel** между двумя обычными rgba, как простые числа → плавный fade. Принцип см. `methodology/переносимый-дизайн.md::color-mix() внутри @keyframes интерполируется рывками`.
-
-`--ai-pulse-color-static` — отдельная переменная для `enabled: false` варианта (14% alpha вместо 22% — мягче, без анимации). Тоже plain rgba, считается в JS.
-
-## tab-ai-busy-static — варианте без анимации
-
-`enabled: false` → класс `tab-ai-busy-static` вместо `tab-ai-busy-shimmer`. Фон colorB с фиксированным 14% alpha, без `animation`. Юзер видит лёгкую подсветку таба «AI занят», но без пульса для тех кто находит мигание отвлекающим. Тот же сигнал «AI стримит», просто статичная форма — аналогично `tab-process-bar-static` для PTY-полоски.
-
-Settings UI: AIPulseEditor — отдельный компонент рядом с ProcessBarEditor в Settings → Размеры → Табы. Структура та же (preview / toggle / два color chip'а / number input для duration), но с дополнительной кнопкой `∅` рядом с colorA — переключает между hex-значением и literal `'transparent'`. Hex-input не умеет prозрачность, нужен отдельный toggle.
-
-## Shimmer-rect выравнен с border-area вкладки
-
-Аналогично process-bar: shimmer-wrapper изначально использовал `inset: 0` (растягивается до padding-edge). При `border-left: 2px solid transparent` это давало 2px gap слева, плюс `borderRadius: 6px` рендерился на узком rect — скругления shimmer'а не совпадали со скруглениями карточки. Решение — `top:0, bottom:0, left:-2px, right:-2px` (растянули в border-area с обеих сторон). Скругления теперь совпадают, gap исчез.
+Маппинг рантайма на полоску: `running` (sessionStatus active/busy или SDK live) → полоска видна, пульс A↔B (`@keyframes mob-pbar-pulse`, vars `--mob-pbar-a/b` inline per-row). `busy` (turn в полёте) → плюс sweep-band `.mob-pbar-shimmer` (`translateY -100%→250%`, seamless). `position:right` → `{right:0}` + правые радиусы, иначе левые — зеркало desktop edge-anchoring. Строка резервирует `paddingLeft/Right:17` на стороне полоски чтобы текст не лез под неё. Старый whole-row background-breathing (`mob-row-busy`) и правая точка/ring удалены — полоска единственный лоадер, как на desktop. Graceful degrade: старый сервер без `processBar` → дефолт cyan/left.
 
 ## Связи
 
-- `methodology/переносимый-дизайн.md::Два независимых сигнала на одной зоне = два визуально разных индикатора` — почему PTY-bar и AI-pulse разделены.
-- `methodology/переносимый-дизайн.md::color-mix() внутри @keyframes интерполируется рывками` — почему endpoints как plain rgba, а не color-mix.
-- `methodology/переносимый-дизайн.md::Snap у края при бесконечном translate-loop` — расчёт keyframe-range (применялось в legacy sweep-варианте AI shimmer).
+- `methodology/переносимый-дизайн.md::Два независимых сигнала на одной зоне = два визуально разных индикатора` — почему PTY-alive пульс и AI-busy блик разделены геометрически внутри полоски.
+- `methodology/переносимый-дизайн.md::Лоадер = локализованный элемент, не заливка всей поверхности` — переносимый принцип, по которому AIPulse (фон всей вкладки) удалён в пользу краевой полоски.
+- `methodology/переносимый-дизайн.md::Snap у края при бесконечном translate-loop` — расчёт keyframe-range (sweep-блик `-100%→250%`).
 - `knowledge/fact-tabs.md::Vertical mode (TabSidebar)` — где рендерится полоска, как сосуществует с маркером статуса.
 - `knowledge/fact-session-status.md::Marker shape + size` — параллельная конфигурация маркера в той же settings-секции.
 - `CLAUDE.md::Anti-Patterns::AI-Optimized UI` — background-color pulse вместо opacity-pulse для H.264-читаемости в скринкастах (применяется здесь).

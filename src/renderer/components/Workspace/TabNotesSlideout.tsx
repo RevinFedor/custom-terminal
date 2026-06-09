@@ -20,6 +20,37 @@ const MAX_W = 1200;
 const MIN_H = 180;
 const MAX_H = 900;
 
+// Electron clipboard adapter injected into MarkdownEditor. The editor package's
+// clipboard layer (Mod-c/x/v, AI-paste, collapsed-paste) defaults to
+// navigator.clipboard, which is DEAD in this Electron renderer (no native Edit
+// menu — see CLAUDE.md "Не используй navigator.clipboard в renderer"). We supply
+// electron.clipboard so copy/cut/paste + AI-paste all work through the editor's
+// own keymap. `readText`/`writeText` are synchronous in Electron — the editor
+// wraps them in Promise.resolve, so sync return is fine.
+//
+// `readItems` is deliberately OMITTED: that makes the keymap's image-probe
+// branch yield to the editor's native DOM `paste` handler (imagePaste.ts,
+// event.clipboardData), which already handles image paste correctly in Electron.
+//
+// Module-level (stable reference) so it doesn't churn the editor on re-render.
+// See docs/knowledge/fix-notes-clipboard-adapter.md.
+const electronClipboardAdapter = {
+  readText: (): string => {
+    try {
+      const { clipboard } = (window as any).require('electron');
+      return clipboard.readText() || '';
+    } catch {
+      return '';
+    }
+  },
+  writeText: (text: string): void => {
+    try {
+      const { clipboard } = (window as any).require('electron');
+      clipboard.writeText(text);
+    } catch { /* outside electron — no-op */ }
+  },
+};
+
 // Slide-in notes panel anchored to the RIGHT edge of the left-side TabSidebar
 // (the `[data-tabbar-vertical]` element rendered inside TabSidebar.tsx). Opens
 // left→right: its left edge sits flush against the sidebar's right edge.
@@ -44,6 +75,7 @@ export default function TabNotesSlideout() {
   const setNotesPanelOffsetY = useUIStore((s) => s.setNotesPanelOffsetY);
   const wordWrap = useUIStore((s) => s.wordWrap);
   const notesEditorFontSize = useUIStore((s) => s.notesExpandedFontSize);
+  const notesEditorShowLineNumbers = useUIStore((s) => s.notesEditorShowLineNumbers);
   const notesEditorPaddingX = useUIStore((s) => s.notesEditorPaddingX);
   const notesEditorPaddingY = useUIStore((s) => s.notesEditorPaddingY);
 
@@ -106,39 +138,12 @@ export default function TabNotesSlideout() {
     return () => window.clearTimeout(id);
   }, [activeTabId, notesSelectionByTab]);
 
-  // Manual Cmd+V — обход markdown-editor's встроенного `Mod-v` keymap,
-  // который читает `navigator.clipboard.read()` / `.readText()`. В Electron
-  // renderer эти API возвращают пустоту (anti-pattern из CLAUDE.md: «Не
-  // используй navigator.clipboard в renderer»). Editor получает empty string,
-  // ничего не вставляет, юзер видит «вставка не работает».
-  //
-  // Поэтому на корневом контейнере слайдаута перехватываем keydown с
-  // Cmd+V/Ctrl+V в фазе capture, читаем text через electron.clipboard.readText()
-  // и dispatching insert-транзакцию вручную. `preventDefault` + `stopPropagation`
-  // блокируют дальнейшее распространение в editor's keymap. Если буфер пустой
-  // или не текст — пропускаем дальше (editor попробует image-paste через
-  // встроенный DOM `paste` handler — там clipboardData доступен напрямую).
-  const handleSlideoutKeyDown = useCallback((e: React.KeyboardEvent) => {
-    if (!(e.metaKey || e.ctrlKey) || e.altKey || e.shiftKey) return;
-    if (e.code !== 'KeyV') return;
-    const view = editorViewRef.current;
-    if (!view) return;
-    let text = '';
-    try {
-      const { clipboard } = (window as any).require('electron');
-      text = clipboard.readText() || '';
-    } catch { /* outside electron — fall through to native */ return; }
-    if (!text) return; // пусто или нетекст — пропускаем (image-paste пойдёт через DOM)
-    e.preventDefault();
-    e.stopPropagation();
-    const sel = view.state.selection.main;
-    view.dispatch({
-      changes: { from: sel.from, to: sel.to, insert: text },
-      selection: { anchor: sel.from + text.length },
-      scrollIntoView: true,
-      userEvent: 'input.paste',
-    });
-  }, []);
+  // Clipboard (Cmd+C / Cmd+X / Cmd+V / AI-paste) is handled inside the editor's
+  // own keymap, fed by the `electronClipboardAdapter` we pass to <MarkdownEditor>.
+  // The previous capture-phase Cmd+V band-aid was removed: it only handled plain
+  // paste and — firing before the editor keymap — silently swallowed AI-paste
+  // (the keymap never saw the event, so the _waitingForAIPaste branch never ran).
+  // See docs/knowledge/fix-notes-clipboard-adapter.md.
 
   const handleClose = useCallback(() => {
     if (!activeTabId) return;
@@ -336,7 +341,6 @@ export default function TabNotesSlideout() {
         <motion.div
           key="panel"
           data-tab-notes-slideout
-          onKeyDownCapture={handleSlideoutKeyDown}
           // Flipped enter/exit direction: now slides IN from the LEFT
           // (negative x → 0). Matches the new left-anchored layout.
           initial={{ opacity: 0, x: -20 }}
@@ -413,10 +417,12 @@ export default function TabNotesSlideout() {
                 onChange={handleChange}
                 onEditorView={handleEditorView}
                 onGenerateTitle={generateAITitle}
+                clipboard={electronClipboardAdapter}
                 fontSize={notesEditorFontSize}
                 contentPaddingX={notesEditorPaddingX}
                 contentPaddingY={notesEditorPaddingY}
                 wordWrap={wordWrap}
+                showLineNumbers={notesEditorShowLineNumbers}
                 compact
               />
             </div>

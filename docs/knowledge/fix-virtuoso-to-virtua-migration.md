@@ -105,7 +105,7 @@ Bundle: 532KB → **484KB** (−48KB, −9%).
 
 1. `awk '$1 >= "HH:MM:00"' logs/dev.log | grep ScrollDiag` (UTC = MSK−3, см. CLAUDE.md::Логирование).
 2. Серия `scroll {delta:-XXX, force:true}` с `XXX > 500` подряд = cascade. Если это вернулось — virtua тоже не справилась, копать в её GitHub issues по симптомам.
-3. `atBottomStateChange {atBottom:true}` транзиент в неподходящий момент = followOutput race, иди по тому же пути что был у virtuoso.
+3. `followIntent {armed:false}` транзиент во время стрима без касания экрана, или отсутствие `pin` событий пока чат стримит = follow-bottom сломался. Полный разбор + что НЕ делать — `fix-mobile-follow-bottom-intent.md`. (Раньше follow гейтился distance-флагом `atBottomStateChange {atBottom}` — заменён на intent-ref, тот лог удалён.)
 
 ## Что НЕ делать при будущих регрессиях
 

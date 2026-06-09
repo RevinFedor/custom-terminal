@@ -6,6 +6,7 @@ import BrowserTab from './BrowserTab';
 import ClaudeSDKTab from './ClaudeSDK/ClaudeSDKTab';
 import { motion, AnimatePresence } from 'framer-motion';
 import { terminalRegistry } from '../../utils/terminalRegistry';
+import { markPendingResume } from '../../utils/pendingResume';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -264,6 +265,10 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
       setTabCommandType(tabId, 'claude');
 
       terminalRegistry.get(tabId)?.scrollToBottom();
+      // Arm the 15s stale-bridge guard BEFORE the resume write (см.
+      // fix-bridge-stale-takeover.md layer 4/5) — иначе протухший bridge.json
+      // перезапишет sessionId таба в окне resume.
+      markPendingResume(tabId, targetSessionId);
       const cmd = `claude --dangerously-skip-permissions --resume ${targetSessionId}\r`;
       console.log('[TerminalArea] Sending terminal:input:', cmd);
       ipcRenderer.send('terminal:input', tabId, cmd);

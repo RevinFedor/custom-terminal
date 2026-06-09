@@ -1,15 +1,16 @@
-// Dictation-history dropdown for the project toolbar. Lives next to
-// CopySessionWithChips and mimics its visual style — a small rounded chip
-// that opens a popover with the list of past Soniox transcripts. Each row
-// is one entry; click → copy to clipboard. The mic button writes here on
-// every successful Stop (see MicButton.tsx onStopped handler).
+// Dictation-history popover. No longer a standalone toolbar chip — it is now
+// opened by Cmd+click on the bottom-bar mic button (MicButton.tsx). The panel
+// renders into a Portal anchored ABOVE the mic button (same rAF-anchoring
+// technique as the live FloatingTranscript), so the control bar's
+// overflow:hidden ancestors don't clip it.
 //
-// Wires into the global `dictation-history-updated` event so the open
-// dropdown refreshes when a new transcript arrives without us prop-drilling
-// state down from MicButton.
+// Each row is one past Soniox transcript; click → copy to clipboard. The mic
+// button writes here on every successful Stop (MicButton.tsx onStopped).
+// Wires into the global `dictation-history-updated` event so an open popover
+// refreshes when a new transcript arrives.
 
-import { useEffect, useRef, useState } from 'react';
-import { Clock } from 'lucide-react';
+import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { useUIStore } from '../../store/useUIStore';
 import {
   DictationHistoryEntry,
@@ -35,37 +36,69 @@ function formatTime(ts: number) {
   return `${pad(d.getMonth()+1)}/${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
-export default function DictationHistoryButton() {
+// Popover panel, controlled by the mic button. Anchored above `anchorRef`.
+export function DictationHistoryPopover({ anchorRef, open, onClose }: {
+  anchorRef: React.RefObject<HTMLButtonElement>;
+  open: boolean;
+  onClose: () => void;
+}) {
   const showToast = useUIStore((s) => s.showToast);
-  const [open, setOpen] = useState(false);
   const [entries, setEntries] = useState<DictationHistoryEntry[]>(() => loadDictationHistory());
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
-  const rootRef = useRef<HTMLDivElement>(null);
+  const [pos, setPos] = useState<{ left: number; bottom: number } | null>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
 
-  // Refresh when MicButton (or anything else) writes a new entry.
+  // Refresh list + snapshot fresh when (re)opened, and whenever a new entry is
+  // written elsewhere.
   useEffect(() => {
+    if (open) setEntries(loadDictationHistory());
     const refresh = () => setEntries(loadDictationHistory());
     window.addEventListener('dictation-history-updated', refresh);
     return () => window.removeEventListener('dictation-history-updated', refresh);
-  }, []);
+  }, [open]);
 
-  // Click-outside / Esc to close. Geometric hit-test rather than onMouseLeave
-  // (per project pattern — onMouseLeave on lazy-mounted popover is unreliable).
+  // Anchor the panel above the mic button; re-read every rAF so it follows
+  // layout shifts (same technique as FloatingTranscript). Opens UP because the
+  // control bar sits near the bottom of the window.
+  useLayoutEffect(() => {
+    if (!open) { setPos(null); return; }
+    let raf = 0;
+    const tick = () => {
+      const el = anchorRef.current;
+      if (el) {
+        const r = el.getBoundingClientRect();
+        const width = 340;
+        let left = r.left;
+        if (left + width > window.innerWidth - 8) left = window.innerWidth - width - 8;
+        if (left < 8) left = 8;
+        const bottom = window.innerHeight - r.top + 6;
+        setPos((prev) => (prev && Math.abs(prev.left - left) < 0.5 && Math.abs(prev.bottom - bottom) < 0.5) ? prev : { left, bottom });
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [open, anchorRef]);
+
+  // Click-outside / Esc to close. Geometric hit-test against panel + anchor so
+  // a click on the mic button itself (which toggles) doesn't double-fire.
   useEffect(() => {
     if (!open) return;
     const onDown = (e: MouseEvent) => {
-      if (!rootRef.current) return;
-      if (!rootRef.current.contains(e.target as Node)) setOpen(false);
+      const t = e.target as Node;
+      if (panelRef.current?.contains(t)) return;
+      if (anchorRef.current?.contains(t)) return;
+      onClose();
     };
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false); };
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
     window.addEventListener('mousedown', onDown);
     window.addEventListener('keydown', onKey);
     return () => {
       window.removeEventListener('mousedown', onDown);
       window.removeEventListener('keydown', onKey);
     };
-  }, [open]);
+  }, [open, anchorRef, onClose]);
 
   const copyEntry = (entry: DictationHistoryEntry) => {
     try {
@@ -78,63 +111,24 @@ export default function DictationHistoryButton() {
     }
   };
 
-  return (
-    <div ref={rootRef} style={{ position: 'relative' }}>
-      <button
-        onClick={() => setOpen(o => !o)}
-        title={entries.length ? `Dictation history (${entries.length})` : 'Dictation history (empty)'}
-        style={{
-          display: 'inline-flex',
-          alignItems: 'center',
-          gap: 4,
-          height: 26,
-          padding: '0 8px',
-          background: open ? 'rgba(218,119,86,0.12)' : 'transparent',
-          color: open ? '#FF9466' : '#bbb',
-          border: `1px solid ${open ? 'rgba(218,119,86,0.45)' : 'rgba(255,255,255,0.12)'}`,
-          borderRadius: 4,
-          fontSize: 11,
-          cursor: 'pointer',
-          transition: 'background-color 0.12s, color 0.12s, border-color 0.12s',
-        }}
-        onMouseEnter={(e) => {
-          if (open) return;
-          (e.currentTarget as HTMLButtonElement).style.background = 'rgba(255,255,255,0.05)';
-          (e.currentTarget as HTMLButtonElement).style.color = '#fff';
-        }}
-        onMouseLeave={(e) => {
-          if (open) return;
-          (e.currentTarget as HTMLButtonElement).style.background = 'transparent';
-          (e.currentTarget as HTMLButtonElement).style.color = '#bbb';
-        }}
-      >
-        <Clock size={13} />
-        <span>history</span>
-        {entries.length > 0 && (
-          <span style={{
-            fontSize: 10,
-            color: '#888',
-            fontVariantNumeric: 'tabular-nums',
-          }}>{entries.length}</span>
-        )}
-      </button>
+  if (!open || !pos) return null;
 
-      {open && (
+  return createPortal(
         <div
-          // Opens DOWN (project toolbar lives at the top), right-anchored so it
-          // doesn't clip the viewport. 320 px wide — enough for ~50 chars of
-          // transcript preview at 12 px font.
+          ref={panelRef}
+          // Anchored ABOVE the mic button (control bar is near the window
+          // bottom). Left-aligned to the button, clamped to viewport.
           style={{
-            position: 'absolute',
-            top: 'calc(100% + 4px)',
-            right: 0,
+            position: 'fixed',
+            left: pos.left,
+            bottom: pos.bottom,
             width: 340,
             maxHeight: 380,
             background: '#161616',
             border: '1px solid rgba(255,255,255,0.12)',
             borderRadius: 6,
             boxShadow: '0 6px 20px rgba(0,0,0,0.55)',
-            zIndex: 1000,
+            zIndex: 9999,
             display: 'flex',
             flexDirection: 'column',
           }}
@@ -232,8 +226,7 @@ export default function DictationHistoryButton() {
               );
             })}
           </div>
-        </div>
-      )}
-    </div>
+        </div>,
+    document.body
   );
 }

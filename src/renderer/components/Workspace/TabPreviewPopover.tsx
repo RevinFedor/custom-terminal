@@ -1,4 +1,4 @@
-import React, { useLayoutEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { MarkdownEditor } from '@gt-editor/markdown-editor';
 import { useUIStore } from '../../store/useUIStore';
 import { getPopoverPosition } from '../../hooks/useCmdHoverPopover';
@@ -96,11 +96,24 @@ export default function TabPreviewPopover({
   const fontSize = useUIStore((s) => s.notesTooltipFontSize);
   const paddingX = useUIStore((s) => s.notesEditorPaddingX);
   const paddingY = useUIStore((s) => s.notesEditorPaddingY);
-  const maxWidth = useUIStore((s) => s.tabPreviewMaxWidth);
+  const showLineNumbers = useUIStore((s) => s.notesPreviewShowLineNumbers);
+  // previewWidth — потолок переноса текста, задаётся resize-ручкой на правом
+  // крае превью (персист в store). maxHeight — потолок скролла по высоте.
+  const previewWidth = useUIStore((s) => s.tabPreviewMaxWidth);
+  const setPreviewWidth = useUIStore((s) => s.setTabPreviewMaxWidth);
   const maxHeight = useUIStore((s) => s.tabPreviewMaxHeight);
-  const ratioW = useUIStore((s) => s.tabPreviewRatioW);
-  const ratioH = useUIStore((s) => s.tabPreviewRatioH);
-  const targetRatio = ratioW / ratioH; // width / height
+
+  // heightCap — фактический потолок высоты = min(настройка, место до края экрана).
+  // Если вкладка близко к низу/верху и контент не влезает даже в maxHeight —
+  // скролл наступает раньше. Берём бОльшую из двух сторон (popover флипается
+  // вверх/вниз туда где места больше).
+  const heightCap = useMemo(() => {
+    const margin = VIEWPORT_MARGIN + 8;
+    const spaceBelow = window.innerHeight - rect.bottom - margin;
+    const spaceAbove = rect.top - margin;
+    const avail = Math.max(spaceBelow, spaceAbove, 120); // не уже 120px даже у самого края
+    return Math.min(maxHeight, avail);
+  }, [rect.bottom, rect.top, maxHeight]);
 
   // Hidden probe: рендерим notes в скрытом контейнере с `width: max-content`
   // чтобы измерить natural-width при текущем шрифте. После measure пересчитываем
@@ -132,7 +145,7 @@ export default function TabPreviewPopover({
     console.log('[TabPreviewSize:enter]', JSON.stringify({
       notesLen: (notes || '').length,
       source: source || '?', notesPreview,
-      maxWidth, maxHeight, fontSize, paddingX, paddingY,
+      previewWidth, maxHeight, heightCap, fontSize, paddingX, paddingY,
       rect: { l: Math.round(rect.left), t: Math.round(rect.top), w: Math.round(rect.width), h: Math.round(rect.height) },
       split: !!split,
     }));
@@ -163,67 +176,33 @@ export default function TabPreviewPopover({
       finalize(w);
     };
 
-    // Балансировка по целевой пропорции (`targetRatio = ratioW/ratioH`).
-    // Идея: при разных пробных ширинах форма меняется немонотонно для краткого
-    // контента, но монотонно для текста с word-wrap (узкая ширина → высокий
-    // столбец, широкая → плоский). Бисекцией ищем chosenW в [MIN, maxWidth]
-    // такую что фактическое отношение W/H ≤ targetRatio (минимально близкое
-    // к target сверху). Контент сам диктует возможный диапазон высот.
+    // Sizing model (no proportion balancing):
+    //   • Width = ПОТОЛОК переноса = `previewWidth` (resizable via drag, persisted).
+    //     Если контент уже этого потолка (короткая заметка в одну строку) — коробка
+    //     ужимается до natural-width (обрезка пустого места справа). Иначе = потолок.
+    //   • Height = ДИНАМИЧЕСКАЯ построчно: высота контента при chosenW. Скроллится
+    //     при упоре в `heightCap` (= min(maxHeight, доступное место до края экрана)).
     const measureAt = (w: number) => {
       probe.style.width = `${w}px`;
       return Math.ceil(probe.scrollHeight);
     };
     const finalize = (naturalW: number) => {
       if (cancelled || naturalW <= 0) return;
-      // Стартовая ширина = min(naturalW, maxWidth). Если контент уже шире cap'а,
-      // потолок = cap. Если меньше — возможно надо СУЗИТЬ для пропорции.
-      const startW = Math.min(naturalW, maxWidth);
-      let chosenW = startW;
-      let chosenH = measureAt(chosenW);
-
-      // Если коробка получается слишком ПЛОСКАЯ (W/H > target → шире чем надо):
-      // сужаем chosenW пока W/H ≤ target ИЛИ chosenW = MIN. С `wordWrap`
-      // более узкая ширина увеличивает H → ratio падает.
-      if (chosenW / chosenH > targetRatio && chosenW > NOTES_MIN_WIDTH) {
-        let lo = NOTES_MIN_WIDTH;
-        let hi = chosenW;
-        for (let i = 0; i < 8; i++) {
-          const mid = Math.round((lo + hi) / 2);
-          if (mid <= lo) break;
-          const h = measureAt(mid);
-          if (mid / h > targetRatio) hi = mid;
-          else lo = mid;
-        }
-        chosenW = lo;
-        chosenH = measureAt(chosenW);
-      }
-      // Если коробка слишком ВЫСОКАЯ (W/H < target → нужна шире) и есть запас
-      // до maxWidth — расширяем. Word-wrap на большей ширине уменьшает H.
-      else if (chosenW / chosenH < targetRatio && chosenW < maxWidth) {
-        let lo = chosenW;
-        let hi = maxWidth;
-        for (let i = 0; i < 8; i++) {
-          const mid = Math.round((lo + hi) / 2);
-          if (mid <= lo) break;
-          const h = measureAt(mid);
-          if (mid / h < targetRatio) lo = mid;
-          else hi = mid;
-        }
-        chosenW = hi;
-        chosenH = measureAt(chosenW);
-      }
-      const finalH = Math.min(chosenH, maxHeight);
+      // Width: clamp natural-width к resize-потолку. Короче потолка → shrink
+      // (нет пустого места справа). Шире → перенос в потолок.
+      const chosenW = Math.max(NOTES_MIN_WIDTH, Math.min(naturalW, previewWidth));
+      const contentH = measureAt(chosenW);
+      const finalH = Math.min(contentH, heightCap);
       console.log('[TabPreviewSize:final]', JSON.stringify({
-        source: source || '?', notesPreview, naturalW, startW,
-        chosenW, chosenH: finalH, targetRatio: +targetRatio.toFixed(3),
-        actualRatio: +(chosenW / chosenH).toFixed(3), framesUsed: frame,
+        source: source || '?', notesPreview, naturalW,
+        previewWidth, chosenW, contentH, heightCap, finalH, framesUsed: frame,
       }));
       if (!cancelled) setNotesBox({ width: chosenW, height: finalH });
     };
 
     settle();
     return () => { cancelled = true; };
-  }, [notes, hasNotes, maxWidth, maxHeight, fontSize, paddingX, paddingY, ratioW, ratioH]);
+  }, [notes, hasNotes, previewWidth, heightCap, fontSize, paddingX, paddingY, showLineNumbers]);
 
   // Synthetic ref для HoverBridgeDebug — у нас только rect от trigger'а.
   const triggerRefShim = useMemo(
@@ -237,10 +216,58 @@ export default function TabPreviewPopover({
 
   const wrapperRef = useRef<HTMLDivElement | null>(null);
 
+  // ─── Resize ширины перетаскиванием правого края превью ──────────────────
+  // Ширина — это потолок переноса (previewWidth в store). Тянем правый край →
+  // пишем новое значение в store live (как у заметок). resizingRef глушит
+  // mouse-leave-close popover'а на время drag'а (курсор гуляет по window).
+  const resizingRef = useRef(false);
+  const startResize = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    resizingRef.current = true;
+    const startX = e.clientX;
+    const startW = useUIStore.getState().tabPreviewMaxWidth;
+    const onMove = (ev: MouseEvent) => {
+      const next = startW + (ev.clientX - startX);
+      setPreviewWidth(next); // store сам clamp'ит [120, 900]
+    };
+    const onUp = () => {
+      resizingRef.current = false;
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  }, [setPreviewWidth]);
+
+  // Mouse-leave для popover-обёрток: во время resize-drag игнорируем (иначе
+  // курсор, выехавший за край при перетаскивании, закрыл бы превью).
+  const guardedMouseLeave = useCallback(() => {
+    if (resizingRef.current) return;
+    popoverProps.onMouseLeave();
+  }, [popoverProps]);
+
+  // Right-edge resize handle — узкая полоса по правому краю карточки, ew-resize,
+  // подсветка на hover. JSX inline (не вложенный компонент) чтобы не ремаунтить
+  // на каждый рендер. data-cmd-hover-popover уже на обёртке — mousedown внутри
+  // не разлочивает закреплённый popover.
+  const resizeHandle = (
+    <div
+      onMouseDown={startResize}
+      title="Потянуть — ширина превью"
+      style={{
+        position: 'absolute', top: 0, bottom: 0, right: 0, width: 7,
+        cursor: 'ew-resize', zIndex: 5,
+      }}
+      onMouseEnter={(ev) => { (ev.currentTarget as HTMLDivElement).style.backgroundColor = 'rgba(99,102,241,0.4)'; }}
+      onMouseLeave={(ev) => { (ev.currentTarget as HTMLDivElement).style.backgroundColor = ''; }}
+    />
+  );
+
   // Финальная ширина popover'а: max между notesBox.width и шириной meta-карточки.
   // Если есть только metadata (split=false и hasNotes=false) — даём metaRows
-  // занять до maxWidth и определиться по контенту.
-  const popoverWidth = notesBox?.width ?? Math.min(maxWidth, 320);
+  // занять до previewWidth и определиться по контенту.
+  const popoverWidth = notesBox?.width ?? Math.min(previewWidth, 320);
 
   // Placement резолвится так: явный prop `placement` (новый API) > legacy `split/forceAbove`
   // (Home above-режим) > `smartPosition` > дефолт ниже. `'right'` рендерит сбоку справа от
@@ -369,7 +396,7 @@ export default function TabPreviewPopover({
             top: -99999,
             left: -99999,
             width: 'max-content',
-            maxWidth: `${maxWidth}px`,
+            maxWidth: `${previewWidth}px`,
             zIndex: -1,
           }}
         >
@@ -383,6 +410,7 @@ export default function TabPreviewPopover({
             contentPaddingX={paddingX}
             contentPaddingY={paddingY}
             wordWrap
+            showLineNumbers={showLineNumbers}
           />
         </div>
       )}
@@ -392,7 +420,7 @@ export default function TabPreviewPopover({
           ref={wrapperRef}
           style={wrapperStyle}
           onMouseEnter={popoverProps.onMouseEnter}
-          onMouseLeave={popoverProps.onMouseLeave}
+          onMouseLeave={guardedMouseLeave}
           data-cmd-hover-popover
         >
           <HoverBridgeDebug
@@ -400,7 +428,7 @@ export default function TabPreviewPopover({
             menuRef={wrapperRef}
             direction={isAbove ? 'above' : 'below'}
           />
-          <div style={cardStyle({ width: `${popoverWidth}px` })}>
+          <div style={cardStyle({ width: `${popoverWidth}px`, position: 'relative' })}>
             {hasNotes && (
               <div
                 style={{
@@ -420,6 +448,7 @@ export default function TabPreviewPopover({
                   contentPaddingX={paddingX}
                   contentPaddingY={paddingY}
                   wordWrap
+                  showLineNumbers={showLineNumbers}
                 />
               </div>
             )}
@@ -429,6 +458,7 @@ export default function TabPreviewPopover({
                 <MetaList rows={metaRows} />
               </div>
             )}
+            {hasNotes && resizeHandle}
           </div>
         </div>
       )}

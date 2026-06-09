@@ -98,6 +98,8 @@ Window-level handler (Escape / Ctrl+[ / Ctrl+C) на стороне ClaudeSDKTab
 
 Длинный paste (> `PASTE_THRESHOLD` 500 символов) становится chip'ом над композером вместо инлайна. У chip'а два разных действия в двух местах:
 
+**Длинный текст из Opt+V picker'а тоже становится chip'ом.** Opt+V — это **не** clipboard-paste, а открытие picker'а сохранённых промптов (`App.tsx` handlePickerOpenCapture); выбор промпта диспатчит `claude-sdk:composer-insert` (append-ветка), который писал текст **прямо в textarea, минуя `handlePaste`** — поэтому длинный picked-промпт вываливался простынёй, а не чипом. Фикс — общий `addChip` helper (единый источник «длинный текст → chip», переиспользован в `handlePaste` и в append-ветке `composer-insert`): если `text.length >= PASTE_THRESHOLD` → чип. Ветка `replace` (откат отменённого промпта на редактирование) НЕ чипуется — там текст обязан лечь в textarea для правки.
+
 - **Свёрнутый chip, иконка справа `↓` (`ArrowDownToLine`)** — `unpackChip`: высыпает полный текст chip'а в конец композера как plain text (через `\n` если уже есть ввод), сам chip уходит из бара, композер получает фокус. Раньше тут был `×` (delete) — юзер: *«вместо крестика должна быть кнопка которая переводит текст в инпут, просто вставляет в конец»*. Тело chip'а (превью-текст) остаётся click-toggle на preview-окно.
 - **Раскрытое preview-окно, иконка слева — корзина (`Trash2`, красная `#b91c1c` → hover `#ef4444`)** — `removeChip`: удаляет chip целиком. Delete переехал из свёрнутого состояния в раскрытое и влево (где глаз ищет destructive-действие первым). Принцип — `methodology/переносимый-дизайн.md::Chip: распаковать ≠ удалить`.
 
@@ -207,9 +209,17 @@ SDK-таб root получает `style={{ fontSize: ${useUIStore.terminalFontSi
 **Что было невидимо:**
 1. **Почему не `useLayoutEffect`:** хук generic, не имеет своего state — owner-компонент держит `[open, setOpen]`, мы получаем только callback. layout-effect нельзя повесить на «когда callback изменит state у консьюмера» — мы не знаем когда это случится. flushSync даёт ту же sync-commit гарантию изнутри click-handler'а.
 2. **`findScrollParent`** ищет ближайшего предка с `overflow-y: auto|scroll` И `scrollHeight > clientHeight`. Второй чек важен: если предок имеет `overflow-y: auto` но контент **помещается**, у него нет scroll'а и компенсация не нужна (пропускаем).
-3. **`wasAtBottom` rule** — 4px tolerance. Меньше — флапает на pixel-rounding (anti-aliased scroll). Больше — выходит из «у самого низа» включая случаи когда user реально читает 1-2 строки выше дна и не хочет автоскролл.
+3. **Две ветки по `wasAtBottom`** (4px tolerance — `BOTTOM_PIN_PX`):
+   - **был у самого низа** (`scrollHeight − scrollTop − clientHeight ≤ 4px`) → после toggle через 2×rAF делаем `scrollTop = scrollHeight` (re-stick к новому низу). Покрывает И expand, И collapse. Зачем: turn можно остановить mid-stream, и раскрывающийся блок (thinking / tool-карточка / дифф / промпт) окажется внизу — при раскрытии его тело должно остаться видимым, а не уехать под фолд.
+   - **не у низа** → anchor-pin: держим top кликнутого блока на той же viewport-Y (старая логика, чтобы при раскрытии блока выше глаз не прыгал).
 
-Применён к 5 toggle-точкам: `ToolCard` (chevron в шапке), `ReasoningPart` (thinking), `FullContentToggle` (Read full content), `DiffLines` expand (diff > 24 строк), `CollapsibleText` (user-prompt > 600 символов).
+   **Шрам:** ветку `wasAtBottom` однажды **выпилили при рефакторинге** (остался только anchor-pin), коммент про неё в коде остался — рассинхрон «доки обещают, код не делает». Симптом: раскрыл свой промпт внизу — тело раскрылось ВНИЗ под фолд, надо доскролливать вручную. Вернули обе ветки. Любая правка хука — проверь что обе ветки на месте.
+
+Применён ко всем toggle-точкам через инжект `open/onToggle/anchorRef` в пакетные `CBToolCallPart`/`CBThinkBlock` + локальные `CollapsibleText`/`CompactSummaryMsg`.
+
+**Мобилка — свой `stickToggle`** (`mobile-web/src/App.tsx`): пакетные компоненты те же, но scroll-контейнер (`scrollParentRef`) живёт в `ChatView`, а карточки — глубоко в virtua-списке. Решение: `ChatView` регистрирует контейнер в module-level `_scrollContainer` (`registerScrollContainer`), любой toggle карточки зовёт `stickToggle(fn)` — snapshot `wasAtBottom` (порог 80px, не 4 — touch-scroll rounding) → `fn()` → 2×rAF `scrollTop = scrollHeight` если был внизу. Те же три toggle-сайта (ThinkingCard / ToolCard / CollapsibleText).
+
+**Стриминг-автоскролл — асимметрия desktop/mobile.** Desktop: Virtuoso `followOutput="auto"` + `atBottomStateChange` — из коробки. Mobile (virtua): `followOutput` **нет**; комменты обещали «equivalent», но реально был только одноразовый `didInitialScrollRef` (скролл один раз при загрузке), поэтому чат **не следовал** за стримингом. Фикс — effect на `[entries, atBottom]`: на КАЖДОЙ смене `entries` (новый tail ИЛИ рост текста последнего блока — `flushReducer('append')` каждый чанк отдаёт новый массив) если `atBottom` → `scrollToIndex(last, {align:'end'})`. `atBottom` (порог 120px) считается в `onScroll` outer-div'а через virtua-handle (`scrollSize − scrollOffset − viewportSize`).
 
 ## Ctrl+[ как alias Escape
 
@@ -411,6 +421,39 @@ Loader виден только пока **активно ждём**. До это
 
 **CDP test-side note.** `electron_keyboard.type` через MCP не апдейтит React controlled-input (CDP `dispatchKeyEvent` не входит в Blink editor commit path). Для E2E использовать `electron_keyboard.insertText` или новый `electron_insert_text` MCP tool. Реальный OS keystroke от юзера идёт через trusted-event path, всё работает. Drag-select через MCP-mouse тоже не запускает Blink selection-controller — добавлен `electron_select_text` tool (Range API).
 
+## Soft interrupt vs hard kill: процесс переживает прерывание хода
+
+Стоп в SDK-табе расщеплён на два жеста (переносимый принцип — `methodology/переносимый-дизайн.md::Прервать текущий ход ≠ убить процесс`). `claude-sdk:stop` принимает флаг `hard`:
+
+- **SOFT (по умолчанию)** — `await query.interrupt()` и **всё**. НЕ зовём `abortController.abort()`, `channel.end()`, `query.close()`, `stopJsonlWatcher`, `sdkSessions.delete`, и НЕ `stopTask` фоновых агентов. Процесс паркуется живым, stream-loop продолжает крутиться, следующий промпт продолжает ту же сессию через mid-stream push. Это нативный Esc Claude TUI: прервать foreground-ход, фон оставить. Маршрутизируется сюда: Escape (onCancel branch A), точка на вкладке, ctx-menu Stop, двойной Ctrl+C.
+- **HARD (`hard:true`)** — после interrupt'а ещё `stopTask` каждого running-таска (чистый `task_notification{stopped}` до смерти транспорта) → `abort()` → `channel.end()` → `query.close()` → delete. Маршрутизируется сюда: кнопка-индикатор процесса, закрытие вкладки, Правка/Повтор (truncate JSONL под живым процессом портит цепочку — сначала kill).
+
+**Почему именно так / A/B-доказательство (2026-05-29, один бинарь 2.1.156).** Стартовали с гипотезы что субагенты надо `stopTask`'ать потому что `close()` их не убивает (старый текст ниже это утверждал — он **неверен**, см. graveyard). Живой probe: streaming-query, прерванный через `interrupt()` БЕЗ close, **выживает** — push второго сообщения запускает новый ход (ответил `ALIVE`), итератор не падает. Контрольный A/B на JSONL-маркер: `interrupt()→close()` ⇒ `[Request interrupted by user]` на диске; `abort()+close()` ⇒ нет (транспорт срублен до flush'а). Значит durable-метка прерывания (на которой держится «stopped»-плашка) появляется только на graceful-пути.
+
+**Подавление ожидаемой ошибки прерывания.** `interrupt()` заставляет CLI эмитить `result{subtype:'error_during_execution', is_error:true}` (диагностический `[ede_diagnostic] result_type=user`) и затем **бросить** ту же ошибку в наш `for await`. На user-stop это НЕ настоящий сбой — иначе на каждый Escape всплывал бы красный тост. `session.userInterrupted=true` ставится перед `interrupt()`; stream-loop и его catch проверяют флаг и глушат и forward результата, и throw. Флаг сбрасывается в `false` на следующем mid-stream push (новый ход — настоящие ошибки снова проходят). Проверено probe: с suppression на стоп ничего не доходит до рендерера, маркер на диске, итератор завершается чисто.
+
+**Warm-start: клик по «остановлен» поднимает процесс вхолостую.** `claude-sdk:warm-start` зовёт `sdkStartQuery` с `prompt:null` — канал открывается **без** seed-сообщения, CLI-процесс спавнится и паркуется, `process-state alive:true` фаерит → индикатор «остановлен»→«активен» без отправки сообщения. С `resume:<sid>` тёплый процесс держит полную память + тот же JSONL на первом pushed-ходе (probe: вспомнил факт из прошлого хода, sessionId не сменился). Фантомных записей пока процесс припаркован НЕ пишется — sessionId не создаётся до первого реального сообщения (probe: `parked no-sid-yet`, маркер сессии пришёл только после push). На warm-start пропускаем web-broadcast `busy:true` + user-bubble — хода нет, это была бы ложь.
+
+## «⊘ stopped» badge: durable из JSONL-маркера
+
+Прерванный ответ получает приглушённо-янтарную плашку `⊘ stopped` **снизу** под содержимым (ответ обрывается в конце — там и метка). Источник — durable, переживает полный перезапуск (принцип — `methodology/переносимый-дизайн.md::Durable artifact определяет UI-историю`).
+
+Детектор — запись-маркер, которую CLI пишет на прерывании: `type:'user'` с единственным text-блоком из набора `[Request interrupted by user]` / `… for tool use` / `[Request interrupted]` (контент бывает строкой ИЛИ `[{type:'text'}]`-массивом, оба shape'а). На диске байт-в-байт одинаков для PTY (`entrypoint:'cli'`) и SDK (`sdk-ts`/`sdk-cli`) — единственное отличие `entrypoint`. Это тот же маркер что PTY-watcher (`INTERRUPT_TEXTS` в `main.js`), хардкод английский, не локализуется.
+
+Two-tier (как PTY-фикс прерывания):
+1. **Durable (reopen)** — `loadHistory` детектит маркер-запись, не рендерит её как user-бабл, навешивает `interrupted:true` на assistant-сообщение, на которое она ссылается по `parentUuid` (НЕ по соседству в массиве — пре-pass резолвит parentUuid вверх до ближайшего assistant; маркер может ссылаться на любую из смерженных в один turn записей, флаг OR'ится при merge). Флаг переносится через module-level `Set` (как `_compactMetricsByMsgId` — `ThreadMessageLike` кастомные поля роняет).
+2. **Live (без reload)** — `onCancel` branch A ставит флаг сразу на сохранённый partial; `claude-sdk:interrupted` IPC (из `_processJsonlTail` когда маркер лёг) ставит для жестов, не идущих через onCancel (точка вкладки). `_processJsonlTail` обязан детектить маркер **до** Path-B ветки промоушена чипа — маркер shape'ом совпадает с sdk-cli mid-stream push'ем и иначе ложно-промоутится как queued-чип.
+
+Удалён прежний overlay «Process stopped — history preserved» + Resume: SDK не висит в фоне, «возобновлять» нечего (resume-кнопка лишь прятала overlay), а сам overlay врал про паузу процесса. После стопа композер просто остаётся доступен.
+
+## Процесс-индикатор состояния (работает/активен/остановлен)
+
+В `ClaudeControlBar` на месте старого SessionActionChip для SDK-таба — индикатор состояния процесса тремя состояниями: `работает` (жив + busy, пульсация `animate-glow-yellow`), `активен` (жив, простаивает — возможно фон работает), `остановлен` (серый). Шрифт chip'а (`text-xs font-medium`). Клик-семантика: в `активен`/`работает` → hard-kill; в `остановлен` → warm-start (поднять процесс) + фокус композера; в transient `останавливаю…` инертен.
+
+Единый сигнал с плашкой активности на вкладке: оба читают `tab.sdkProcessAlive` + busy (принцип — `methodology/переносимый-дизайн.md::Один сигнал состояния — все его поверхности`). `sdkProcessAlive` ставит main: `alive:true` при старте query, `alive:false` только в `finally` stream-loop'а (hard kill / естественный конец / закрытие вкладки) — soft-interrupt loop не завершает, поэтому процесс остаётся `активен` между ходами. Слушатель `claude-sdk:process-state` живёт в always-mounted `App.tsx`, не в табе, — плашка вкладки обновляется даже когда таб неактивен (компонент размонтирован).
+
+Транзиентный лоадер «останавливаю процесс…» при hard-kill из Правки/Повтора: `claude-sdk:stopping` window-event → и индикатор, и статус-строка композера показывают его ~1.2с (гаснет по таймеру или когда новый ход пошёл в `работает`). Без него остановка процесса перед переписыванием истории читалась как зависание.
+
 ## Background tasks: bar + detail-pane + stream events (SDK 0.3.x)
 
 В SDK-таб встроен живой трекер запущенных subagent'ов (Agent tool) и фоновых bash-команд. Реализация: тонкий strip-bar **под** composer'ом с chip'ами для каждого running task'а, клик по chip'у заменяет composer на 300px detail-pane (live stdout для bash, read-only mini-thread для агента через переиспользование `UserMsg`/`AssistantMsg`/`ToolCard` из основного чата). Завершённый task сразу пропадает из bar — он уже виден в main thread как обычная BashCard/GenericToolCard, дублировать его статичным chip'ом избыточно. Принцип — `methodology/переносимый-дизайн.md::Live tracker ≠ history`.
@@ -432,9 +475,13 @@ Loader виден только пока **активно ждём**. До это
 
 **SDK auto-backgrounds long-running bash.** Эмпирически: subagent с prompt'ом «Sleep 90 seconds via bash, then echo done» отрапортовал `task_notification status:'completed'` через **10.6s** (не 90). Что произошло: SDK сам перевёл `sleep 90` в background (видимо эвристика по длительности или по `&` syntax), agent получил background notification в свой контекст, считает что job started, возвращает результат parent'у. Реальный bash при этом продолжает работать — `task_updated status:'completed'` для bash task_id прилетает через 90s. Следствие: visible status агента в bar исчезает до того как его child bash дофинишировал. Это **не баг** нашей системы, это поведение SDK; UI отражает корректно (agent для пользователя завершён, его background bash — это внутреннее дело subagent'а).
 
-**Stop running task: stopTask + abort + close.** `query.close()` рвёт только parent transport-сокет. Subagent-worker запускается SDK как **отдельный subprocess**, `close()` его не убивает — он доедет до своего естественного конца сам. Чтобы реально остановить subagent при Escape/Cancel — renderer собирает список running task_id из `tab.bgTasks`, шлёт в `claude-sdk:stop` payload `{ tabId, runningTaskIds }`, main вызывает `await query.stopTask(taskId)` для каждого **перед** `abortController.abort()` + `query.close()`. Подтверждено логом `[BgProbe:STOP] stopTask(a0319245) ok` после которого subagent эмитит `task_notification status:'stopped'`. Принцип — `methodology/переносимый-дизайн.md::Stop = stop tree`.
+**Stop running task: subagent — in-process генератор, НЕ отдельный subprocess.** Критическая поправка к прежнему тексту (см. graveyard): субагент/workflow-агент исполняется как **in-process async-генератор внутри того же одного CLI-subprocess'а**, что и родитель (декомпил: `runAgent.ts` — `export async function*`, abort через `createChildAbortController`, «backgrounded» = флаг состояния `isBackgrounded`, не отдельный процесс). Поэтому `hard`-путь (`abortController.abort()` каскадит на child-контроллеры + `query.close()` рубит единственный subprocess) **убивает и субагентов разом** — отдельный per-agent kill не нужен для самого факта остановки. `stopTask(taskId)` зовём в hard-пути **до** close ради чистого `task_notification{stopped}` на каждый таск (а не ради того что иначе worker выживет). На **soft**-пути `stopTask` НЕ зовём — фоновые агенты намеренно продолжают (нативное Esc-поведение).
 
-**Что пробовали и почему не сработало.** Изначально `claude-sdk:stop` дёргал только `query.close()` — рассчитывая что cascading abort через AbortController остановит и subagent. Не сработало: SDK 0.3.x спавнит subagent как отдельный CLI subprocess со своим `Query`-инстансом, у parent'а нет дескриптора для его abort. Тест с subagent'ом запущенным на 20+ Read'ов: после `close()` parent stream'а subagent продолжал отрабатывать в логах ещё ~30s (`task_progress` events приходили через event-channel который не закрывался по `close()`). Только `query.stopTask(taskId)` (control-request method) реально вызывает teardown subagent'а — это документированный путь в SDK 0.3.x.
+Сбор running task_id для hard-стопа: renderer flatten'ит и контейнер workflow-таска, и его `agents[]` в состоянии `progress`/`start` (id-space совпадает с тем что шлёт WorkflowPanel KeyX), иначе живые workflow-агенты не попадают в `stopTask`-список. Принцип — `methodology/переносимый-дизайн.md::Прервать текущий ход ≠ убить процесс`.
+
+**«Обратный callback по завершении фона» — нативная фича, но только пока сессия жива.** Юзерская модель «остановил Claude → фоновый агент дорабатывает → присылает результат обратно» верна **для конца хода при живой сессии**: CLI придерживает `result` (`heldBackResult`), крутит drain-loop пока есть running bg-task, по завершении инжектит синтетический `<task_notification>` user-turn в тот же диалог. Но это НЕ переживает закрытие сессии: bg-агент — child-генератор, `close()`/SIGKILL единственного процесса забирает его с собой, и канала для late-notification больше нет. Reattach-API нет (`resumeAgent` читает транскрипт с диска и стартует новый query). Поэтому в нашем SDK-табе: soft Escape оставляет агента работать и его notification долетает (loop жив); hard kill / закрытие вкладки — агент мёртв, ничего не «отзвонится».
+
+**Что пробовали и почему было неверно (graveyard).** Прежняя версия этого файла (и комментарий в коде `main.js`) утверждала: «subagent — отдельный CLI subprocess со своим Query, `close()` его не убивает, нужен `stopTask`». Это **опровергнуто** декомпилом + живым тестом (Escape мягко прерывает foreground, агенты переживают — значит они дети сессии, не автономные процессы; а hard-`close()` их забирает). Источник заблуждения — вывод по `.d.ts`-доке `stopTask` без проверки процессной модели. Зависший workflow в реальной сессии оказался не «живым runaway-процессом», а **UI-трупом**: на диске `status:"killed"`, ни одного живого процесса, просто чип в интерфейсе никто не погасил после teardown (отдельный баг реконсиляции чипов).
 
 ## TaskListPanel: табло задач текущего turn'а
 
@@ -453,6 +500,10 @@ Loader виден только пока **активно ждём**. До это
 ## Repeat/Edit: идемпотентный re-send по позиции user'а
 
 Обе кнопки (↻ Repeat — переотправить как есть, ✎ Edit — отредактировать и отправить) идут через одну функцию `truncateAndResend(uiMsgId, newText)`. Контракт: **N кликов на тот же чип сводят тред к одному и тому же состоянию** — первые N−1 user-prompt'ов остаются, N-ный переотправляется. Принцип идемпотентности и почему моделируем по позиции — `methodology/переносимый-дизайн.md::Повторный replace/destructive = идемпотентность`.
+
+**Gate: недоступны во время стрима И пока жив фоновый агент.** Контекст `UserMsgActions.busy = actionBusy || isRunning || bgAgentRunning` дизейблит обе кнопки (серые, `cursor:not-allowed`, hover-эффекты off, клик не проходит, tooltip объясняет). Причина: truncate переписывает JSONL, а под живым процессом это портит parentUuid-цепочку — как нативный `/rewind`, который делают только между ходами, не на середине ответа. `bgAgentRunning` — гранулярный селектор `bgTasks.some(status==='running')`; Правка при живом workflow-агенте недоступна, потому что переписать историю можно только убив процесс (а это оборвёт агента). Сам hard-kill перед truncate сопровождается «останавливаю процесс…» индикатором (см. `## Процесс-индикатор`). Переносимый принцип — `methodology/переносимый-дизайн.md::Не модифицируй чужой shared append-only файл` (UI-следствие).
+
+**Cursor disabled — условный className, не `disabled:` variant.** `disabled:cursor-not-allowed` Tailwind-вариант перебивался базовым `cursor-pointer` (одинаковая специфичность, побеждал порядок) — курсор не менялся, кнопка выглядела активной. Лечение: курсор/hover/opacity гоним через тернарник по `actions?.busy`, не через `disabled:`-вариант.
 
 **Адресация — позиция user'а, не msgId.** В renderer считаем `userPos` = сколько `role:'user'` сообщений идёт **до** кликнутого в `messagesRef.current`. Это инвариант: после re-send тот же визуальный prompt получает новый placeholder-id, но его порядковый номер в треде не меняется. Передаём `claude-sdk:truncate-history { sessionId, userPosition }` — main строит активную ветку (тот же parentUuid-backtrace что в Timeline), находит N-ный `type:'user'`-record (пропуская sidechain и `parent_tool_use_id` — subagent-prompt'ы не в счёт) и сносит его + всё после inclusive. Затем `send-message resume` дописывает свежий turn от обрезанного tip'а. Старый `targetUuid`-режим (+ legacy `truncateAfter`) в хендлере остался для обратной совместимости, но Repeat/Edit его больше не используют.
 
@@ -479,7 +530,7 @@ Hex-цвета (`#FFF` / `#DA7756` / `#DA775680`) в ответе ассисте
 ## Code map: background tasks
 
 - `src/main/main.js::sdkStartQuery` → `options.agentProgressSummaries:true` + `options.forwardSubagentText:true`. Без них iterator получает только start+end events для subagent'ов.
-- `src/main/main.js::ipcMain.handle('claude-sdk:stop')` → `await session.query.stopTask(taskId)` для каждого `runningTaskIds[]` **перед** `abortController.abort()` + `query.close()`. `query.close()` сам не убивает subagent workers.
+- `src/main/main.js::ipcMain.handle('claude-sdk:stop', {hard})` → SOFT: только `await session.query.interrupt()` (+ tail-read для durable-маркера), сессия/loop/фон живут. HARD: `stopTask` каждого running + `abort()` + `channel.end()` + `query.close()` + delete. `userInterrupted` флаг глушит ожидаемый `error_during_execution`-результат и throw на обоих путях. Субагенты — in-process дети, `close()` их забирает (НЕ отдельные процессы). Новый `claude-sdk:warm-start` (`prompt:null`) поднимает процесс idle с `resume`. См. `## Soft interrupt vs hard kill`.
 - `src/renderer/components/Workspace/ClaudeSDK/ClaudeSDKTab.tsx::handleMessage` → 5 новых case'ов на `system:task_*` + `tool_progress`. Фильтр subagent leak'а `(user|assistant) && (parent_tool_use_id || subagent_type) → return` до того как чанк попадёт в `streaming-<tabId>` placeholder. Фильтр child bash в `task_started`: `task_type === 'local_bash' && !subagent_type → return`.
 - `src/renderer/components/Workspace/ClaudeSDK/BackgroundTasksBar.tsx` — strip-chip bar под composer'ом, видим только когда `bgTasks.filter(running).length > 0`. Auto-close detail-pane'а через useEffect когда expandedTaskId уходит из running списка.
 - `src/renderer/components/Workspace/ClaudeSDK/TaskDetailPane.tsx::AgentDetail::messagesWithPrompt` → prepend synthetic user-bubble из `task.initialPrompt` если JSONL ещё не флашнут (или вернул пустой массив user-сообщений).
@@ -489,3 +540,57 @@ Hex-цвета (`#FFF` / `#DA7756` / `#DA775680`) в ответе ассисте
 - `src/renderer/components/Workspace/ClaudeSDK/ClaudeSDKTab.tsx::truncateAndResend` → единый путь по `userPosition` (счёт `role:'user'` до кликнутого в `messagesRef`). Синхронный `actionInFlightRef` против click-storm; loader (`fetching`) ставится после `await stop`, не до. См. `## Repeat/Edit` про 3 шрама (persisted/placeholder развилка, storm, loader-stomp).
 - `src/main/main.js::ipcMain.handle('claude-sdk:truncate-history')` → принимает `userPosition` (N-ный `type:'user'` в активной ветке, inclusive cut) ИЛИ legacy `targetUuid` (+`truncateAfter`). userPosition идемпотентен между повторными Repeat-кликами, targetUuid — нет (id меняется после re-send).
 - `src/main/main.js::ipcMain.handle('claude-sdk:has-active-session')` → лёгкий предикат `{active}` для renderer: нужно ли звать stop перед resend.
+
+## AskUserQuestion via canUseTool (интерактивный вопрос в SDK-табе)
+
+В **PTY** интерактивный диалог `AskUserQuestion` рисует сам Claude (Ink-TUI), input при этом перекрыт. В **SDK диалог рисуем мы** — SDK отдаёт вопрос через `options.canUseTool` callback, и хост обязан вернуть ответ. Без обработки вопрос в SDK-табе авто-резолвится (под `bypassPermissions`) и юзер не может ответить.
+
+### Почему canUseTool срабатывает даже под bypassPermissions
+SDK-таб стартует с `permissionMode:'bypassPermissions'`. Казалось бы, bypass должен пропускать все permission-промпты мимо `canUseTool`. Но `AskUserQuestion.requiresUserInteraction() === true`, а в резолвере CLI (`packages/claude-code-src/utils/permissions/permissions.ts`) гард `requiresUserInteraction` возвращает `behavior:'ask'` на шаге 1e — **до** bypass-short-circuit (шаг 2a). Поэтому вопрос НЕ глотается bypass'ом и маршрутизируется в наш callback. **Менять `permissionMode` НЕ нужно** — достаточно самого факта наличия `canUseTool`: SDK тогда спавнит CLI с `--permission-prompt-tool stdio` (control-protocol маршрут). **Нельзя** одновременно ставить `permissionPromptTool` — взаимоисключающи, SDK кидает исключение.
+
+### Архитектура (event-driven, без таймаутов)
+```
+SDK iterator → main canUseTool('AskUserQuestion', {questions}, {toolUseID, signal})
+  → НЕ AskUserQuestion → {behavior:'allow', updatedInput:input}  (no-op bypass для всех прочих тулзов — без регрессии)
+  → AskUserQuestion:
+      pendingQuestions.set(`${tabId}:${toolUseID}`, {resolve, signal, onAbort})
+      send 'claude-sdk:ask-question' {tabId, toolUseID, questions}
+      send 'claude:awaiting-input' {awaiting:true}   ← переиспользуем фиолетовый glow (PTY-фича)
+      return await new Promise(resolve => …)          ← ПАРКУЕТСЯ, таймера нет ни у нас, ни у SDK
+  ↓ renderer
+ClaudeSDKTab: setActiveQuestion({toolUseID, questions}) → <SDKAskQuestion> ЗАМЕНЯЕТ <SDKComposer>
+  (footer-тернарник, activeQuestion — outermost arm → печатать нельзя, как в PTY)
+  ↓ юзер ответил / стоп
+invoke 'claude-sdk:answer-question' {tabId, toolUseID, questions, answers, stop}
+  ↓ main
+  answer → resolve({behavior:'allow', updatedInput:{questions, answers, annotations?}})
+  stop   → session.userInterrupted=true; resolve({behavior:'deny', message, interrupt:true})
+  send 'claude:awaiting-input' {awaiting:false}
+```
+
+### Ключевые инварианты (легко сломать)
+- **`updatedInput` ПОЛНОСТЬЮ заменяет input** (`queryHelpers.ts` — без merge). Поэтому в allow обязательно **эхо `questions`** обратно: strict-схема тула требует `questions.min(1)`, `{answers}`-only невалиден на `tool.call`. Ответы — `answers: Record<questionText, label>`, multiSelect — join через `", "` (запятая+пробел, как в `outputSchema`).
+- **stop = `deny`+`interrupt`** прерывает turn через `abortController.abort()` (PermissionPromptToolResultSchema), а **не** через `claude-sdk:stop`-хендлер → `session.userInterrupted` остаётся false → существующее подавление `error_during_execution` (`main.js` result-handler) НЕ сработает → юзер увидит красный error-toast. **Лечение:** в `answer-question` при `stop` ставим `session.userInterrupted=true` ПЕРЕД resolve. Переиспользуем существующую interrupt-машинерию, не дублируем детекцию (CLAUDE.md anti-pattern).
+- **Leak/hang guard:** на каждом выходе `canUseTool` promise обязан зарезолвиться. Сайты: (1) answer, (2) stop — через IPC-хендлер; (3) `signal.abort` (turn оборвался иначе) — `onAbort` резолвит `deny` без interrupt; (4) stream `finally` — проходит `pendingQuestions` по `tabId`, резолвит `deny` (закрытие таба / смерть процесса). Пропустишь любой → SDK-процесс висит вечно (таймера нет).
+
+### Tab-switch НЕ теряет диалог
+SDK-табы **не unmount'ятся** при переключении — скрываются через `display:none` (`ClaudeSDKTab.tsx`, Virtuoso mount-gating, `isVisible = active && isActiveProject`). React-state `activeQuestion` переживает переключение, диалог возвращается на switch-back. **Rehydrate-handler не нужен** (в черновике плана была ложная посылка про unmount — отвергнута верификатором по `TerminalArea.tsx::workspace.tabs.forEach`).
+
+### Glow off для SDK
+`claude:awaiting-input` consumers (App.tsx, TabBar) keyed по `tabId`, generic. Авто-сброс `awaiting⊆busy` слушает `claude:busy-state`, который SDK форвардит из `claude-sdk:busy-state` (`main.js`), плюс явные `awaiting:false` на каждом выходе canUseTool — двойное покрытие.
+
+### UI (`SDKAskQuestion.tsx`)
+Навигация как в Ink: ↑↓ — опции вопроса, ←→ — между вопросами + Submit-вкладка, Enter — выбор/submit, Esc — стоп. Верхний nav-bar: чипы `☐ Header / ✔ Header` (✔ когда отвечено) + `Submit`, обрамлён `← →`. Submit-вкладка («Review your answers» + «не на все вопросы ответили») **только при ≥2 вопросах**; один вопрос — Enter сразу сабмитит. multiSelect → `☒/☐`, single → `◉/○`. **«Type something»** оставлен = **стоп** (deny+interrupt + фокус в композер для ручного ввода — продуктовое решение юзера, НЕ инлайн free-text как в нативном Claude). **«Chat about this» убран**. Preview опции (markdown/ascii-box) рендерится `<pre white-space:pre-wrap>` под single-select опциями.
+
+### Известные ограничения
+- **Хуки/опции читаются при старте сессии** — фича подхватится только на **рестарт SDK-процесса** (новый таб / `--resume`). Уже запущенный SDK-таб не получит `canUseTool` пока процесс жив.
+- **Resume сессии с висевшим вопросом:** `pendingQuestions` живёт только в памяти main. После рестарта пусто, в JSONL — `tool_use` без `tool_result` (неотвеченный тул), Claude обычно переспрашивает на следующем turn'е. Ничего особого не делаем.
+- **mobile-web вне scope:** диалог не рендерится на телефоне; протокол пробрасывается (`_webBroadcast {type:'ask-question'}`), но мобильный клиент висит в «running» пока десктоп не ответит/не остановит. Отдельная фича.
+- **Runtime gate:** load-bearing допущение (`canUseTool` fires под bypass) подтверждено из декомпила, но финальная проверка — живой лог `[ClaudeSDK] canUseTool fired tool=AskUserQuestion` на реальном turn'е после рестарта main.
+
+**Code map:**
+- `src/main/main.js::sdkStartQuery options.canUseTool` — park + emit (scoped на AskUserQuestion, иначе auto-allow).
+- `src/main/main.js::ipcMain.handle('claude-sdk:answer-question')` — resolve allow/deny+interrupt, `userInterrupted` на stop.
+- `src/main/main.js` stream `finally` — cleanup parked questions по tabId.
+- `src/renderer/components/Workspace/ClaudeSDK/SDKAskQuestion.tsx` — UI диалога.
+- `src/renderer/components/Workspace/ClaudeSDK/ClaudeSDKTab.tsx` — `activeQuestion` state, `ask-question`/`question-cancelled`/`done` listeners, `answerQuestion` helper, footer-arm, focus-composer на stop.

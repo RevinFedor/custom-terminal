@@ -84,6 +84,13 @@ renderer: {
     },
     resolve: {
       alias: [
+        // Local source package — Vite компилит TSX из исходника напрямую
+        // (без dist/rsync/prebundle, как обычный файл проекта). Один find
+        // покрывает и бару `@noted/claude-blocks` (→ src/index.ts), и
+        // `@noted/claude-blocks/styles.css` (→ src/styles.css). Ставится
+        // ПЕРЕД '@' ради приоритета. React внутри пакета резолвится через
+        // alias ниже → единый инстанс.
+        { find: '@noted/claude-blocks', replacement: resolve(__dirname, 'packages/claude-blocks/src') },
         { find: '@', replacement: resolve(__dirname, 'src/renderer') },
         { find: 'react', replacement: resolve(__dirname, 'node_modules/react') },
         { find: 'react-dom', replacement: resolve(__dirname, 'node_modules/react-dom') }

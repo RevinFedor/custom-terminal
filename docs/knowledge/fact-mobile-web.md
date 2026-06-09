@@ -56,6 +56,72 @@ Mobile receiver получает тот же поток raw SDK-сообщени
 
 Dedup для slash/compact работает через `entryUuid` — WS replay после optimistic local apply не плодит дубликаты.
 
+## Paste-chip flow на мобилке + EntryView как адаптер к пакету
+
+Мобилка получила **полный paste-chip flow** — зеркало desktop SDK (порог 500, чип-бар над композером, tap → preview, `<pasted_content>`-обёртка каждого чипа при отправке, `UserText`-разбор обёртки в user-бабле). Раньше мобильный composer не имел `onPaste` вообще: длинный текст вваливался в textarea, `send()` слал сырьё, бабл рендерил его без разбора. Send активен при наличии чипа даже с пустым текстом (bare-paste = валидный промпт, как на десктопе).
+
+Весь визуал строки чата теперь рисует `@noted/claude-blocks::ChatMessage` (см. `fact-claude-blocks-package.md::ChatMessage`). Мобильный `EntryView` стал **тонким адаптером**: `uiToChatEntry(UiEntry) → <ChatMessage ctx={mobileRenderCtx}>`. Все прежние per-kind карточки (`UserText`/`ThinkingCard`/`ToolCard`/`CompactSummaryCard`/`CollapsibleText`/`Markdown`-wrapper, ~150 строк) **удалены** — их форма ушла в пакет. `mobileRenderCtx` инжектит collapse-контроллер: `isOpen` читает persist-карту `_entryExpanded`, `toggle` оборачивает в `stickToggle` (bottom-stick) + глобальный re-render через `bumpGlobalToggle`/`useGlobalToggle` (virtua держит в DOM только видимые ряды, перерисуются лишь они). Бабл юзера при переезде перекрашен `#1f3a5f` → Claude-оранж (canon — десктоп). Под капотом lifecycle (SSE/JSONL/kill) остаётся у мобилы — пакет его не касается.
+
+## ParamsSheet (model/effort/think) — close-on-select + invisible-intent источники
+
+Хедер-пилюля `model · effort ▾` открывает bottom-sheet `ParamsSheet` (SDK и
+PTY-Claude табы). Три неочевидных факта:
+
+- **Select = loader-in-pill → close по применению (НЕ по сырому тапу).** Тап по
+  опции помечает её busy (спиннер на месте, `cursor: wait`), соседи тускнеют и
+  блокируются (`busyKey`), и sheet закрывается **по резолву** `Api.setParams`;
+  на reject — спиннер снят, sheet остаётся для повтора. Переносимый принцип —
+  `methodology/переносимый-дизайн.md::Async single-select`. Предпосылка к этому —
+  iOS touch-retarget: на iOS Safari тап по внутренней `<button>` баблится так,
+  что голый `onClick={onDismiss}` на backdrop'е тоже срабатывал → выбор любого
+  Model/Effort/Thinking **мгновенно** закрывал sheet (до применения, и SDK и PTY).
+  Guard `onClick={(e) => { if (e.target === e.currentTarget && !busyKey)
+  onDismiss(); }}` — закрытие только по тапу в сам backdrop, и только когда не
+  busy. Браузерный синтетический click (десктоп) баг НЕ воспроизводит — нужен
+  реальный тач, ловить живьём на телефоне.
+- **Effort/Think для PTY = invisible-intent через window-карты.** PTY-Claude не
+  транслирует effort/think обратно. `getSDKParams` (renderer-bridge в `App.tsx`)
+  читает effort из `window.__effortSentForTab` (`{level}`, set'ится auto-inject'ом
+  и ручными кликами, чистится на смерти Claude — см.
+  [`fact-claude-tui-control.md::Auto-inject /effort`](fact-claude-tui-control.md)),
+  think — из `window.__thinkStateForTab` (`Map<tabId,bool>`, default ON, пишется
+  десктопным `toggleThink` И мобильным `setSDKParams`). Absent effort → `'?'`
+  (а не врущее `high`). Это та же модель что десктопный ControlBar показывает в
+  `effortLocal`/`thinkLocal` — единый cross-client источник, не пересчёт.
+- **Think — одна toggle-пилюля, не on/off-пара.** Mirror десктопной Think-кнопки:
+  `Think ON`/`Think OFF`, тап флипает. Для PTY каждая смена шлёт
+  `claude:toggle-thinking` (meta+t флип), и **только** если запрошенное состояние
+  отличается от трекнутого (picker — toggle, не setter; повторный тап того же
+  значения = no-op). Для SDK — `sdkThinking` boolean в Tab.
+
+## Prompt Queue ("Run after") — mobile mirror, НЕ второй движок
+
+Мобильная панель Run-after (иконка в правом верхнем углу хедера, рядом с timeline-бургером) — **зеркало** десктопного `PromptQueueOverlay`, не самостоятельная фича. Ключевой инвариант: **мобилка не владеет очередью**. Единственный источник правды — десктопный `usePromptQueueStore`, единственный движок исполнения — App-root синглтон `usePromptQueueRunner` (см. `fact-prompt-queue.md`). Мобилка только (1) читает live-core и (2) шлёт мутации; стрельбу промптов делает десктоп. Это та же модель, что у effort/think window-карт (мобилка — тонкий remote, не второе хранилище) — и прямое следствие принципа CLAUDE.md «переиспользуй существующий код, не переизобретай».
+
+**Три канала (read / write / live), все через bridge:**
+- **Read:** `GET /queue` → bridge `getPromptQueue` → renderer сериализует `serializePromptQueueCore(getQueue(tabId))` + список sibling AI-табов (для pivot-пикера «on tab», тот же предикат что десктопный `RunAfterTabPicker`: SDK / PTY-claude+sessionId / gemini+sessionId, self исключён).
+- **Write:** любой контрол → `POST /queue {op,args}` → bridge `mutatePromptQueue` → вызывает **тот же store-метод** что десктопный оверлей (`addPrompt`/`setAutoRun`/`setStopAfter`/`setCloseAfter`/`setRunAfterTab`/`setFirstDelaySeconds`/`setPostPrompt*`/...). Все каскады (closeAfter⟹stopAfter, auto-disarm на manual empty-out, SQLite-persist, hint-arming) срабатывают идентично — мы **не реимплементим** логику очереди, только remote-invoke. Op-таблица `QueueOp` в `mobile-web/src/api.ts` — 1:1 с case-веткой в `App.tsx::mutatePromptQueue`.
+- **Live:** любое изменение store (десктоп ИЛИ телефон) → `usePromptQueueWebSync` (App-root, рядом с runner) диффает per-tab core-JSON → `web:broadcast-queue` IPC → main `_webBroadcast(type:'queue-update')` → SSE → телефон обновляет мирор. `webBroadcast` no-op'ит без подписчиков, поэтому на desktop-only пути это один `JSON.stringify`+Map-дифф на мутацию и ничего больше.
+
+**Owner = ТОЛЬКО PTY-claude (`canQueue = isClaudePtyTab`).** Runner стреляет через `claude:send-command`, а это **PTY-TUI paste** (`terminals.get(tabId)`, no-op на SDK-табах). SDK-owned очередь никогда бы не выстрелила. Поэтому иконка очереди на мобилке доступна только на PTY-claude-табах — **точно как десктопный оверлей** (`commandType==='claude' && claudeSessionId`). SDK/gemini-табы остаются валидными **pivot-таргетами** (у них есть turn-end edge), просто не owner'ами. Если будущий код добавит SDK-owner — сначала научить runner роутить SDK-ветку, иначе тихо-немая очередь.
+
+**Почему web-sync на App-root, не в панели:** идентично runner'у — панель unmount'ится как только юзер ушёл с Claude-таба, но телефон может смотреть **фоновый** таб. Gated-by-active-tab бродкастер замолчал бы ровно когда телефон ждёт дельту. См. `fact-prompt-queue.md::Auto-runner — singleton hook, не в overlay`.
+
+**UI-маппинг на десктопный оверлей (bottom-sheet, не right-panel — thumb-reach, как ParamsSheet/ActionSheet):** хедер-иконка = list-глиф + violet `[N]` когда armed; при открытой панели становится ✕ (закрывает и панель, и редактор). Две колонки настроек: левая — pivot «on tab» + delay-секунды; правая — Run after (violet) / Stop after split с power-иконкой Close-after (red) / Post split с карандашом. Список очереди (≈5 строк, потом скролл), тап по строке или «+ Add» → инлайн-редактор (Mirror Editing, ≈5 строк textarea, Save). `queue-update` SSE держит всё live без ре-фетча. Цвета — те же семантические роли что в `PromptQueueOverlay`: `#a78bfa` armed, `#8b5cf6` pivot-target, `#DA7756` stop/post, `#ef4444` close.
+
+**Prod требует `build:install`** — `App.tsx::handleWebBridge` (новые actions) и `web-server.js` (новые routes) живут в asar; mobile-web Vite-dev итерирует только фронт. См. «Stale prod-app → silent bridge timeout» ниже.
+
+## Self-healing busy reconciliation (loader никогда не залипает навсегда)
+
+**Проблема.** Мобильный loader («thinking…») управляется SSE-событиями `busy`/`done`. Но если `busy:false`/`done` **потерялся** — turn закончился путём, который не сделал `_webBroadcast busy:false` (например: на десктопе юзер **отклонил** AskUserQuestion → «Request interrupted by user for tool use» → turn оборвался через aborted_streaming), SSE-фрейм дропнулся, ИЛИ баг в самом мобильном коде неверно затрекал busy — phone **залипает** на «thinking…» навсегда. Юзер: *«нажал ⏺ → declined → но на мобилке всё равно идёт thinking… хотя thinking нет; нужен фолбэк, чтобы мобилка подхватывала реальное состояние с продакшена»*.
+
+**Решение — периодический authoritative-поллинг, который ВСЕГДА побеждает.** `ChatView` для PTY-claude табов поллит `Api.claudeStatus` (`claude:get-presence`) на mount + при смене sessionId + **каждые 4с**, и **сверяет** `busy`:
+```ts
+const authoritativeBusy = d.status === 'busy';
+setBusy(cur => cur !== authoritativeBusy ? authoritativeBusy : cur);
+```
+`get-presence` выводит `status` из `claudeTurnBusy` (Stop-hook pipeline — тот же authoritative источник, которому доверяет десктопный loader), поэтому рассинхрон лечится за ≤1 интервал поллинга, **независимо от причины**. Это и есть «реальное соединение с продом»: мобилка никогда не доверяет своему залипшему `busy` бесконечно — периодическое authoritative-чтение всегда корректирует. Forcing только при **расхождении** (`cur !== authoritativeBusy`), чтобы не драться с in-flight оптимистик-апдейтом в том же кадре. Раньше этот поллинг был **one-shot на mount** (обновлял только `claudeStatus`, не `busy`) — отсюда залипание. Переносимый принцип — [`methodology/переносимый-дизайн.md::Authoritative artifact > эвристика`] + «periodic reconcile для latched UI-state от lossy event-канала».
+
 ## Mobile composer: caret + permanent ring + selective scrollbar
 
 Три неочевидных решения в `mobile-web/src/App.tsx::Composer`:
@@ -63,7 +129,7 @@ Dedup для slash/compact работает через `entryUuid` — WS replay
 - **Orange visible caret** (`caretColor: '#FFB382'`). Раньше пробовал `caret-color: transparent` (юзер: «значок мигающий надо убрать»). Потом юзер репортил «не работает печать» — на самом деле работало, но он не видел каретки и не знал что инпут активен. Caret — единственный достоверный сигнал «текст идёт сюда» когда юзер начал печатать в полупустой инпут.
 - **Permanent border `#FFB382`** (всегда, не `focus:border-*`). Юзер: *«просто рамка всегда активна»*, *«заново мигать рамкой тоже не надо»*. Раньше переключали `focus:border-[#555]` — каждый re-focus на mobile (touch tap → blur от scroll → re-focus) давал визуальный flicker рамки. Постоянная оранжевая рамка читается как «вот THE инпут».
 - **Conditional orange scrollbar**: textarea автоэкспандится до 40vh; пока content не достиг кап, `overflowY: hidden` (никакого скролла в одну строку); как только превысил — `overflowY: auto` + класс `composer-textarea--scroll` который **переписывает глобальное** `::-webkit-scrollbar { width:0 }` на `width:6px` с `thumb: #FFB382` (orange, отделено от history-скролла который остаётся скрытым). Юзер: *«у инпута, если у нас одна строка, не должен отображаться scroll, и также scroll у инпута сделай отдельно, оранжевым»*.
-- **Mic-dictation (Soniox)**: 🎤-кнопка в row 2 composer'а, тот же движок что в десктопном `MicButton` (`mobile-web/src/dictation.ts` — копия `src/renderer/utils/dictation.ts`, два независимых Vite-билда не могут шарить через alias). При старте — `prefixRef.current = text` снимает снэпшот того что юзер успел напечатать, потом `onUpdate` пишет `prefix + final + partial` в textarea. Без снэпшота транскрипт затирал бы пользовательский текст. По stop — `prefixRef.current = ''` для следующей сессии. Floating window над кнопкой реализован прямо в composer'е (не делегируется внешнему компоненту). Token mint — `Api.sonioxToken()` → `POST /api/soniox-token` → main process с `SONIOX_API_KEY` из env.
+- **Mic-dictation (Soniox)**: 🎤-кнопка в row 2 composer'а, тот же движок что в десктопном `MicButton` (`mobile-web/src/dictation.ts` — копия `src/renderer/utils/dictation.ts`, два независимых Vite-билда не могут шарить через alias). При старте — `prefixRef.current = text` снимает снэпшот того что юзер успел напечатать, потом `onUpdate` пишет `prefix + final + partial` в textarea. Без снэпшота транскрипт затирал бы пользовательский текст. По stop — `prefixRef.current = ''` для следующей сессии. Floating window над кнопкой реализован прямо в composer'е (не делегируется внешнему компоненту). Token mint — `Api.sonioxToken()` → `POST /api/soniox-token` → main process с `SONIOX_API_KEY` из env. **Требует secure context**: `navigator.mediaDevices` существует только на HTTPS/localhost. Phone грузит mobile-web по plain `http://<lan-ip>:7878` в **dev** → `mediaDevices === undefined` → мик не работает («needs HTTPS» в `onError`, явный guard в `dictation.ts` вместо загадочного «Cannot read getUserMedia of undefined»). На **Prod** (HTTPS через VPS-туннель, `fact-remote-access.md`) — работает; WKWebView сам грантит мик через `allowsInlineMediaPlayback`. Тот же `MediaStreamAudioDestinationNode`-фикс от SIGSEGV что на десктопе — см. [`fix-mic-renderer-sigsegv.md`](fix-mic-renderer-sigsegv.md).
 
 ## Endpoint map
 
@@ -85,9 +151,13 @@ POST /api/sdk-tabs/:tabId/truncate              → drop everything ≥ targetUu
 GET  /api/sdk-tabs/:tabId/timeline             → parseTimelineEntries
 GET  /api/sdk-tabs/:tabId/params               → getSDKParams
 POST /api/sdk-tabs/:tabId/params               → setSDKParams
+GET  /api/sdk-tabs/:tabId/queue                 → getPromptQueue (core + sibling aiTabs)
+POST /api/sdk-tabs/:tabId/queue                 → mutatePromptQueue ({op, args})
+GET  /api/sdk-tabs/:tabId/pending-question      → текущий AskUserQuestion (connect mid-question)
+POST /api/sdk-tabs/:tabId/answer-question       → answerClaudeQuestion ({source, answers, stop})
 GET  /api/prompts[?etag=X]                     → getPrompts + getPromptGroups (no bridge); ?etag match → { etag, unchanged: true }
 POST /api/log/client                           → mobile diagnostic logs → console.log → dev.log
-GET  /api/events?token=&tabId=                 → SSE (text/event-stream) — ОСНОВНОЙ live-канал. snapshot/message/busy/done/bridge-update. Не блокируется anti-tracker'ами как ws://. См. секцию «SSE transport».
+GET  /api/events?token=&tabId=                 → SSE (text/event-stream) — ОСНОВНОЙ live-канал. snapshot/message/busy/done/bridge-update/queue-update/ask-question/question-cancelled. Не блокируется anti-tracker'ами как ws://. См. секцию «SSE transport».
 WS   /ws?token=&tabId=                          → тот же набор events. Legacy-канал для permissive-браузеров; на Yandex/Chrome с Protect не работает (ws:// к private-IP режется молча).
 POST /api/projects/:id/claude-tabs              → создать PTY+Claude таб (Terminal.tsx сам spawn'ит Claude по pendingAction)
 POST /api/sdk-tabs/:tabId/resume                → claude --resume <sid> в existing PTY
@@ -142,6 +212,8 @@ Bridge-action `getProjectTabsLive` в `App.tsx::handleWebBridge` возвращ�
 
 **Правило:** любая правка `App.tsx::handleWebBridge` или `web-server.js::bridgeRequest` требует `npm run build:install` перед тестом с phone'а — иначе симптом всегда будет «Bridge timeout» вне зависимости от качества правки. Это занудно, но иначе час уйдёт на отладку не того процесса. Mobile-web Vite dev (`cd mobile-web && npm run dev`) НЕ решает — фронт можно итерировать без билда, но `web-server.js` живёт в Electron main, его правки требуют `build:install` всё равно.
 
+**`build:install` теперь собирает мобилку сам.** Цепочка: `graceful-quit → build:markdown → build:mobile (cd mobile-web && npm run build) → electron-vite build → electron-builder → install`. Electron-builder **копирует** `mobile-web/dist/**` в asar (`build.files`), но НЕ собирает — раньше пёк устаревший dist, если забыл пересобрать вручную. Каждый `npm run <step>` изолирован (npm всегда cwd=package-root), поэтому внутренние `cd` в `build:markdown`/`build:mobile` не утекают в следующий шаг. `build:mobile` — отдельный скрипт, можно дёрнуть в одиночку для быстрой пересборки только фронта.
+
 ## Wire protocol (общий для SSE и WS)
 
 Один и тот же JSON-envelope летит и через SSE (`data: <json>\n\n`), и через WS (`ws.send(<json>)`) — `webBroadcast` транспортно-агностичен (см. «SSE transport»). Server → client:
@@ -151,7 +223,12 @@ Bridge-action `getProjectTabsLive` в `App.tsx::handleWebBridge` возвращ�
 { type:'busy',         tabId, busy }                                            — переключение busy (SDK + PTY-Claude)
 { type:'done',         tabId, sessionId }                                       — окончание turn'а
 { type:'bridge-update', tabId, sessionId, model, contextPct }                   — PTY-Claude: StatusLine bridge.json обновился
+{ type:'queue-update',  tabId, queue }                                          — Run-after очередь изменилась (десктоп или другой телефон); `queue` = PromptQueueCore
+{ type:'ask-question',  tabId, source, toolUseID, questions }                   — Claude задал AskUserQuestion; source=pty|sdk
+{ type:'question-cancelled', tabId, source }                                    — вопрос отвечен/прерван/turn оборвался
 ```
+
+Вопросы (`ask-question`/`question-cancelled`): десктоп показывает AskUserQuestion в Ink TUI, мобилка TUI не имеет — main бродкастит **контент** вопроса, телефон рисует свой пикер. PTY-ответ драйвит Ink клавишами, SDK резолвит parked `canUseTool` Promise. Полная механика — `fact-claude-awaiting-input.md::Мобильное расширение`.
 
 `sessionStatus` / `inputReady` / `bridge-update` появились с расширением mobile-web на CLAUDE-PTY-табы — см. `fact-mobile-claude-pty.md::WS protocol`.
 
@@ -236,6 +313,33 @@ Warm-cache путь: только одна фаза `?after=<cachedLastUuid>` �
 - `messages` store keyed by `[sessionId, ord]`: одна запись на сообщение, secondary index `by-uuid`
 - Read returns structured-cloned live objects — **нет JSON.parse на хот-пути** (vs 30ms parse 20MB blob каждый mount)
 - Delta sync: meta.lastUuid → server `?after=<lastUuid>` → дописываем appendDelta. Полный rewrite только когда нет cache.
+
+## SWR-кэш списков проектов/табов (мгновенный заход в проект)
+
+**Проблема:** заход в проект показывал full-screen «Loading…» пока `Api.listTabs`
+не вернётся целиком — а он тянет live-статус по каждой вкладке (N+1, задача #42),
+поэтому «крайне долго». То же на экране всех проектов.
+
+**Решение — stale-while-revalidate** через generic `kv`-store в том же IDB
+(`idb.ts`, DB **v2**, additive upgrade — chat-history stores НЕ тронуты):
+- `kv` keyed by string: `'projects'`, `'tabs:<projectId>'`. Хелперы `readKv`/`writeKv`
+  (best-effort, `try/catch` — private-mode IDB недоступен → фоллбэк на сеть).
+- `ProjectRoute`: на mount читает `tabs:<id>` из кэша → `setData` мгновенно (paint
+  табов за ~18ms, измерено), параллельно фоновый `listTabs` → overwrite + `writeKv`.
+  Inline-спиннер (`InlineSpinner`, серый, в `right`-слоте `Header`) виден ТОЛЬКО пока
+  идёт фоновый refresh (`revalidating` флаг) — табы остаются видимы и кликабельны.
+- `ProjectsView` (все проекты): seed из `kv:'projects'` на mount + `writeKv` на каждом
+  4s-poll. Full-screen «Loading projects…» только при cold-open с пустым кэшом.
+- `ChatRoute` deep-link reload: резолвит таб сперва из `tabs:<id>` кэша (instant),
+  потом подтверждает сетью. Историю чата дальше красит свой IDB-кэш истории.
+
+**Error-policy (важно):** ошибка сети показывается full-screen ТОЛЬКО когда показать
+нечего (`error && !data`). Если кэш есть — стейл-табы остаются, ошибка глотается, next
+poll восстановит. Иначе мигающий «Failed» поверх рабочего списка.
+
+**Bump DB-версии безопасен:** `upgrade()` создаёт `kv` только если его нет
+(`if (!db.objectStoreNames.contains('kv'))`) — `meta`/`messages` не пересоздаются,
+кэш переписок юзера переживает миграцию.
 
 **Race protection (prefix-merge lock):** между `reducer.reset()` и `apply(merged)` в phase-2 могут прийти WS messages. Раньше они применялись в `reset → empty → WS apply (без context) → merge replace` → live message терялся. Теперь:
 - `prefixMergeLockRef.current = true` перед reset

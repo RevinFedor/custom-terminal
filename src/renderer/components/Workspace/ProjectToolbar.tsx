@@ -6,10 +6,10 @@ import Tooltip from '../UI/Tooltip';
 import { useWorkspaceStore, isTabInterrupted } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import { compressLogs } from '../../utils/compressLogs';
+import { markPendingResume } from '../../utils/pendingResume';
 import SemanticIndexButton from './SemanticIndexButton';
 import CopySessionWithChips from './CopySessionWithChips';
 import DocsButton from './DocsButton';
-import DictationHistoryButton from './DictationHistoryButton';
 import ClaudeUsageButton from './ClaudeUsageButton';
 
 const { ipcRenderer } = window.require('electron');
@@ -61,6 +61,10 @@ export default function ProjectToolbar() {
       // Send resume command based on session type
       if (tab.claudeSessionId) {
         setTabCommandType(tab.id, 'claude');
+        // Arm the per-tab stale-bridge guard before each resume write. Bulk-resume
+        // has a higher blast radius (N tabs at once), so missing this let any stale
+        // bridge file overwrite a resumed tab's sessionId. См. fix-bridge-stale-takeover.md.
+        markPendingResume(tab.id, tab.claudeSessionId);
         const cmd = `claude --dangerously-skip-permissions --resume ${tab.claudeSessionId}\r`;
         ipcRenderer.send('terminal:input', tab.id, cmd);
         ipcRenderer.send('terminal:force-command-started', tab.id);
@@ -324,13 +328,9 @@ export default function ProjectToolbar() {
         <ClaudeUsageButton />
       </div>
 
-      {/* Dictation history — last 100 transcripts captured via the bottom-bar mic.
-          Sits left of Docs/Copy because it's not session-bound (lives across all
-          projects) and the user reaches for it independently of the session-copy
-          flow. Renders the same chip-shaped dropdown style as CopySessionButton. */}
-      <div className="flex items-center pr-2">
-        <DictationHistoryButton />
-      </div>
+      {/* Dictation history moved OUT of the toolbar — it now opens via ⌘-click on
+          the bottom-bar mic button (see MicButton.tsx / DictationHistoryPopover).
+          The standalone chip was removed per user request. */}
 
       {/* Docs popover trigger — opens ActionsPanel (Update Docs / Update API → Haiku
           pipeline). Pair-aligned with CopySessionWithChips popover: both anchor to

@@ -47,7 +47,11 @@ Soniox реально шлёт synthetic-токены `<end>` (endpoint detectio
 - **`pty-claude`** → `ipcRenderer.invoke('terminal:paste', {tabId, content, submit: false})`. Текст печатается в TUI input без Enter — юзер сам решит когда отправить.
 - **`terminal`** (обычный шелл / нет активного Claude) → только в историю. Floating-окно остаётся **единственным** способом увидеть транскрипт (плюс копировать из dropdown).
 
-Во ВСЕХ трёх режимах `appendDictationEntry(text)` в localStorage — toolbar-dropdown показывает прошлые транскрипты независимо от того куда они улетели.
+Во ВСЕХ трёх режимах `appendDictationEntry(text)` в localStorage — список прошлых транскриптов доступен независимо от того куда они улетели.
+
+## История диктовки — ⌘-click по mic, не отдельный toolbar-чип
+
+Раньше история жила отдельной кнопкой-чипом `history` в ProjectToolbar (`DictationHistoryButton`). Убрана: история — **вторичное** действие над тем же микрофоном, не самостоятельная сущность тулбара. Теперь обычный клик по mic = запись (старт/стоп), **⌘-click** (Ctrl на не-Mac) = открыть/закрыть popover истории. `DictationHistoryButton` стал именованным `DictationHistoryPopover` — только панель (без своего триггера), рендерится через Portal **над** mic-кнопкой (тот же rAF-anchoring через `getBoundingClientRect`, что у live floating-окна — control bar внизу окна, popover открывается вверх). Click-outside/Esc закрывают; geometric hit-test против панели **и** якоря, чтобы повторный ⌘-click по mic корректно тоглил, а не дабл-фарил (mic onClick проверяет `e.metaKey || e.ctrlKey` → `preventDefault` + toggle, обычный клик в эту ветку не заходит).
 
 ## Floating window: Portal + rAF anchoring
 
@@ -78,8 +82,10 @@ Production-сервер на 7878 раздаёт `mobile-web/dist/index.html` п
 
 ## Graveyard
 
+- **`ScriptProcessorNode → gain(0) → ac.destination`** (пул через хардварный выход) — интермиттентно SIGSEGV'ил **весь рендерер** (exitCode 11, «Render frame was disposed», белый экран). Падало сразу после `audio ok`. Фикс — пул через off-device `MediaStreamAudioDestinationNode` (`processor.connect(createMediaStreamDestination())`): SPN пулится так же, но звук не доходит до CoreAudio output, крэш-путь исчезает. Захват не страдает (PCM снимаем внутри `onaudioprocess`). Применено в обоих движках (desktop + mobile-web). См. [`fix-mic-renderer-sigsegv.md`](fix-mic-renderer-sigsegv.md).
+- **`navigator.mediaDevices` на mobile поверх plain http** — `undefined` (secure-context-only API). Phone грузит mobile-web по `http://<lan-ip>:7878` в dev → `.getUserMedia` бросает «Cannot read properties of undefined», юзер видел загадочное «Mic undefined». Фикс: явный guard `if (!navigator.mediaDevices?.getUserMedia)` → понятная ошибка «needs HTTPS (use Prod address)». Prod (HTTPS-туннель через VPS) работает. См. [`fact-mobile-web.md`](fact-mobile-web.md).
 - **`AudioContext({sampleRate: 16000})`** — macOS игнорирует hint и AudioContext later throws на operations с device rate 44100/48000. Решение: создавать `new AudioContext()` без hint'а, читать `this.ac.sampleRate` и downsample'ить в processor.
 - **Floating window только в `mode==='terminal'`** — первая версия показывала floating только когда нет активного Claude, в SDK/PTY текст лился real-time в композер через native value setter. Real-time запись в controlled-input assistant-ui отъедалась трекером, юзер видел текст «только после STOP». Решение: floating window во ВСЕХ mode'ах, real-time только там, доставка в композер — один раз по STOP.
-- **`navigator.clipboard.writeText`** в DictationHistoryButton — `permission denied` без active document focus в renderer. Заменено на `window.require('electron').clipboard.writeText` (см. CLAUDE.md anti-pattern).
+- **`navigator.clipboard.writeText`** в истории диктовки (`DictationHistoryPopover`, бывш. `DictationHistoryButton`) — `permission denied` без active document focus в renderer. Заменено на `window.require('electron').clipboard.writeText` (см. CLAUDE.md anti-pattern).
 - **`cursor: wait`** на mic-кнопке во время `stopping` — macOS поднимает system wait-cursor (волчок) поверх UI, читается как «всё приложение зависло». Заменено на `cursor: default` — спиннер внутри STOP-кнопки внутри floating-окна остаётся единственной индикацией.
 - **`setState('connecting')` отдельный** — добавляет 300-700 мс «лоадера» между кликом и началом записи. Юзер: *«Loader в начале быть не должно. Запись начинается на диск локально, потом отправляется на сервак»*. Заменено на синхронный `recording=true` + локальный буфер до ws.onopen.

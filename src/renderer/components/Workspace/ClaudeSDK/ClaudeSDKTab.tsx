@@ -17,17 +17,25 @@ import {
 } from '@assistant-ui/react';
 import { AssistantProviderBase, MessageByIndexProvider } from '@assistant-ui/core/react';
 import { Virtuoso, type VirtuosoHandle, type VirtuosoProps } from 'react-virtuoso';
-import ReactMarkdown from 'react-markdown';
-import remarkGfm from 'remark-gfm';
-import { rehypeHexHighlight } from './rehypeHexHighlight';
-import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
-import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
-import { Loader2, FileEdit, Terminal as TerminalIcon, FolderSearch, Search, FileText, Globe, RefreshCw, Pencil, Check, X as XIcon, Brain, ChevronRight, Copy as CopyIcon, Trash2, ArrowDownToLine } from 'lucide-react';
+import { Loader2, RefreshCw, Pencil, Check, X as XIcon, Trash2, ArrowDownToLine } from 'lucide-react';
+// Portable conversation blocks. The visual canon for tool cards / bash / diff /
+// thinking / markdown now lives in this package (single source for desktop +
+// mobile). react-markdown, remark-gfm, react-syntax-highlighter and the per-tool
+// lucide icons are now its dependencies, not this file's. Collapse behaviour is
+// injected (open/onToggle/anchorRef) so this tab keeps its Virtuoso scroll-stable
+// toggle. See packages/claude-blocks.
+import {
+  Markdown as CBMarkdown,
+  ThinkBlock as CBThinkBlock,
+  ToolCallPart as CBToolCallPart,
+  defaultOpenForTool,
+} from '@noted/claude-blocks';
 import Tooltip from '../../UI/Tooltip';
 import { consumePrefetched } from '../../../utils/sdkHistoryPrefetch';
 import { BackgroundTasksBar } from './BackgroundTasksBar';
 import { TaskDetailPane } from './TaskDetailPane';
 import { WorkflowPanel } from './WorkflowPanel';
+import SDKAskQuestion, { type SDKQuestion } from './SDKAskQuestion';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -537,73 +545,9 @@ function getModelContextWindow(realModel: string | null, alias: string | undefin
   return 200_000;
 }
 
-// ============================================================
-// Tool icon mapping
-// ============================================================
-const TOOL_ICON: Record<string, React.ReactNode> = {
-  Edit: <FileEdit size={12} />, Write: <FileEdit size={12} />, Read: <FileText size={12} />,
-  Bash: <TerminalIcon size={12} />, Glob: <FolderSearch size={12} />, Grep: <Search size={12} />,
-  WebSearch: <Globe size={12} />, WebFetch: <Globe size={12} />,
-};
-
-// ============================================================
-// Tool rendering helpers — language detection + simple line diff
-// ============================================================
-// File extension → Prism language id. Only includes languages we know oneDark
-// styles meaningfully; everything else falls back to plain text.
-const EXT_LANG: Record<string, string> = {
-  ts: 'typescript', tsx: 'tsx', js: 'javascript', jsx: 'jsx', mjs: 'javascript', cjs: 'javascript',
-  json: 'json', md: 'markdown', mdx: 'markdown', html: 'html', css: 'css', scss: 'scss',
-  py: 'python', rb: 'ruby', go: 'go', rs: 'rust', java: 'java', c: 'c', cpp: 'cpp', h: 'c',
-  sh: 'bash', bash: 'bash', zsh: 'bash', yml: 'yaml', yaml: 'yaml', toml: 'toml',
-  sql: 'sql', xml: 'xml', graphql: 'graphql', gql: 'graphql',
-};
-function detectLanguage(filePath: string | undefined): string {
-  if (!filePath) return 'text';
-  const dot = filePath.lastIndexOf('.');
-  if (dot < 0) return 'text';
-  const ext = filePath.slice(dot + 1).toLowerCase();
-  return EXT_LANG[ext] || 'text';
-}
-
-// LCS-based line diff. Returns a flat sequence of {tag, line} entries where
-// tag ∈ 'eq' | 'add' | 'del'. Good enough for the Edit-tool case where we
-// typically diff two short strings (≤ a few hundred lines). Equal lines from
-// the equal-region get collapsed to context outside the renderer; here we just
-// emit the structural diff.
-type DiffEntry = { tag: 'eq' | 'add' | 'del'; line: string };
-function lineDiff(oldText: string, newText: string): DiffEntry[] {
-  const a = oldText.split('\n');
-  const b = newText.split('\n');
-  const n = a.length, m = b.length;
-  // LCS DP table
-  const dp: number[][] = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0));
-  for (let i = n - 1; i >= 0; i--) {
-    for (let j = m - 1; j >= 0; j--) {
-      if (a[i] === b[j]) dp[i][j] = dp[i + 1][j + 1] + 1;
-      else dp[i][j] = Math.max(dp[i + 1][j], dp[i][j + 1]);
-    }
-  }
-  const out: DiffEntry[] = [];
-  let i = 0, j = 0;
-  while (i < n && j < m) {
-    if (a[i] === b[j]) { out.push({ tag: 'eq', line: a[i] }); i++; j++; }
-    else if (dp[i + 1][j] >= dp[i][j + 1]) { out.push({ tag: 'del', line: a[i] }); i++; }
-    else { out.push({ tag: 'add', line: b[j] }); j++; }
-  }
-  while (i < n) { out.push({ tag: 'del', line: a[i] }); i++; }
-  while (j < m) { out.push({ tag: 'add', line: b[j] }); j++; }
-  return out;
-}
-
-function countDiffStats(entries: DiffEntry[]): { added: number; removed: number } {
-  let added = 0, removed = 0;
-  for (const e of entries) {
-    if (e.tag === 'add') added++;
-    else if (e.tag === 'del') removed++;
-  }
-  return { added, removed };
-}
+// Tool icon mapping, language detection и line-diff переехали в
+// @noted/claude-blocks (единый источник для desktop + mobile). Здесь больше
+// не нужны — рендер tool-карточек целиком делегирован пакету.
 
 // ============================================================
 // Per-message actions (Edit / Repeat) — exposed via context so the assistant-ui
@@ -738,6 +682,12 @@ function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKT
   // Background task that has been expanded into the 300px detail pane (replaces
   // the composer). Null = composer visible. Bar above stays visible either way.
   const [expandedTaskId, setExpandedTaskId] = useState<string | null>(null);
+  // Interactive AskUserQuestion (SDK). Set when main's canUseTool parks a
+  // question (claude-sdk:ask-question); cleared on answer/stop/cancel/done.
+  // While non-null, <SDKAskQuestion> replaces the composer (blocks typing),
+  // exactly like the PTY Ink dialog. State lives here (the tab stays mounted
+  // via display:none on switch, so it survives tab switches for free).
+  const [activeQuestion, setActiveQuestion] = useState<null | { toolUseID: string; questions: SDKQuestion[] }>(null);
   // Is the currently-expanded task a workflow? Drives which panel the footer
   // shows (WorkflowPanel vs TaskDetailPane). A workflow is NOT auto-expanded —
   // it appears as a chip in BackgroundTasksBar and only expands when the user
@@ -1810,6 +1760,17 @@ function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKT
           const u = msg.message.usage;
           const total = (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0);
           if (total > 0) setLastContextUsedTokens(total);
+          // Cache split → ControlBar cooldown chip. SDK runs directly against
+          // Anthropic (no proxy in the loop), so unlike PTY we publish from here
+          // via the same window-event pattern as sdk-context-update. ts = the
+          // moment this turn touched the cache (cooldown anchor, server 1h TTL).
+          const cr = u.cache_read_input_tokens || 0;
+          const cc = u.cache_creation_input_tokens || 0;
+          if (cr > 0 || cc > 0) {
+            window.dispatchEvent(new CustomEvent('sdk-cache-update', {
+              detail: { tabId, cacheRead: cr, cacheCreate: cc, input: u.input_tokens || 0, ts: Date.now() },
+            }));
+          }
         }
         // Build new parts in the order Claude emitted them (inside this chunk).
         // Each chunk may contain any mix of thinking/text/tool_use blocks; we
@@ -2002,6 +1963,20 @@ function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKT
       if (data.tabId !== tabId) return;
       setIsRunning(false);
       updateSDKState(tabId, { sdkState: 'idle' });
+      // A turn that ends can't have a live question parked anymore.
+      setActiveQuestion(null);
+    };
+
+    // Interactive AskUserQuestion bridge (main canUseTool parked a question).
+    const handleAskQuestion = (_: any, data: { tabId: string; toolUseID: string; questions: SDKQuestion[] }) => {
+      if (data.tabId !== tabId) return;
+      setActiveQuestion({ toolUseID: data.toolUseID, questions: data.questions || [] });
+    };
+    // Main resolved/aborted the parked question on its own (turn abort, session
+    // end) — tear the dialog down so the composer returns.
+    const handleQuestionCancelled = (_: any, data: { tabId: string; toolUseID?: string }) => {
+      if (data.tabId !== tabId) return;
+      setActiveQuestion((cur) => (cur && (!data.toolUseID || cur.toolUseID === data.toolUseID) ? null : cur));
     };
 
     // Stage 2 transition: SDK pulled the pushed message out of the input
@@ -2085,12 +2060,16 @@ function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKT
     ipcRenderer.on('claude-sdk:stale-resume-cleared', handleStaleResume);
     ipcRenderer.on('claude-sdk:midstream-consumed', handleMidstreamConsumed);
     ipcRenderer.on('claude-sdk:midstream-jsonl-landed', handleMidstreamJsonlLanded);
+    ipcRenderer.on('claude-sdk:ask-question', handleAskQuestion);
+    ipcRenderer.on('claude-sdk:question-cancelled', handleQuestionCancelled);
     return () => {
       ipcRenderer.removeListener('claude-sdk:message', handleMessage);
       ipcRenderer.removeListener('claude-sdk:done', handleDone);
       ipcRenderer.removeListener('claude-sdk:stale-resume-cleared', handleStaleResume);
       ipcRenderer.removeListener('claude-sdk:midstream-consumed', handleMidstreamConsumed);
       ipcRenderer.removeListener('claude-sdk:midstream-jsonl-landed', handleMidstreamJsonlLanded);
+      ipcRenderer.removeListener('claude-sdk:ask-question', handleAskQuestion);
+      ipcRenderer.removeListener('claude-sdk:question-cancelled', handleQuestionCancelled);
     };
   }, [tabId, updateSDKState, syncPendingToStore, refreshChipFromPending]);
 
@@ -2773,6 +2752,32 @@ function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKT
     () => formatModelLabel(lastResolvedModel, sdkModelAlias),
     [lastResolvedModel, sdkModelAlias],
   );
+
+  // Resolve the active AskUserQuestion. answers → allow (model continues with
+  // the answers). stop → deny+interrupt (turn aborts; focus returns to composer
+  // so the user types free text). Clears the dialog optimistically; main also
+  // emits claude:awaiting-input false. The focus-composer dispatch is caught by
+  // the outer ClaudeSDKTab listener (survives the composer remount).
+  const answerQuestion = useCallback(async (answers: Record<string, string> | null, stop: boolean) => {
+    const q = activeQuestion;
+    if (!q) return;
+    setActiveQuestion(null);
+    try {
+      await ipcRenderer.invoke('claude-sdk:answer-question', {
+        tabId,
+        toolUseID: q.toolUseID,
+        questions: q.questions,
+        answers: answers || {},
+        stop,
+      });
+    } catch (e: any) {
+      console.error('[SDKAskQuestion] answer-question invoke failed', e);
+    }
+    if (stop) {
+      // Return focus to the (now-remounted) composer for manual input.
+      setTimeout(() => window.dispatchEvent(new CustomEvent('claude-sdk:focus-composer', { detail: { tabId } })), 0);
+    }
+  }, [activeQuestion, tabId]);
   // Show USED percent (filled), not remaining. User reads "92%" as "92%
   // full" — the old "remaining" semantic confused everyone. Match mobile
   // ChatView (same fix in fact-claude-sdk-tab.md::Context indicator).
@@ -3277,7 +3282,18 @@ function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKT
                 not an overlay. When chat is short, messages-div's flex-1 grows
                 and pushes the composer to the bottom-anchored slot anyway. */}
             <ThreadPrimitive.ViewportFooter className="shrink-0">
-              {slashOverlay ? (
+              {activeQuestion ? (
+                // Interactive AskUserQuestion REPLACES the composer (blocks
+                // typing), mirroring the PTY Ink dialog. Outermost arm so a
+                // pending question suppresses the slash overlay / task panes too.
+                <SDKAskQuestion
+                  key={activeQuestion.toolUseID}
+                  questions={activeQuestion.questions}
+                  fontPx={sdkBaseFontSize}
+                  onSubmit={(answers) => answerQuestion(answers, false)}
+                  onStop={() => answerQuestion(null, true)}
+                />
+              ) : slashOverlay ? (
                 <SlashCommandOverlay
                   cmd={slashOverlay.cmd}
                   output={slashOutput}
@@ -4130,116 +4146,12 @@ const CompactSummaryMsg = () => {
 // с её implicit gap'ом). Tailwind `prose-sm` defaults (my-3.5, leading
 // 1.625, list pl-6) растягивают то же содержание в 2-3 раза против CLI.
 //
-// Color contract (matches CLI Ink + GitHub dark palette): заголовки тем же
-// цветом что body — выделяются только bold-весом, как Ink (`<Text bold>`),
-// не цветом. Раньше явный `text-[#e8e8e8]` (=232) на body `#d4d4d4` (=212)
-// «кричал» — двойной сигнал (ярче + жирнее) на одной иерархической ступени.
-// Inline/block code — `#0d0d0d` (ниже фона bubble #151515 hover) для
-// GitHub-dark contrast: фон кода ТЕМНЕЕ окружения, не светлее.
-// Recursively walk react-children и собирать только string-leaves. После
-// rehypeHexHighlight внутри code-блока могут быть <span data-hex-chip> ноды,
-// SyntaxHighlighter их рендерить не должен — ему нужен оригинальный текст.
-const extractRawText = (node: unknown): string => {
-  if (node == null || node === false) return '';
-  if (typeof node === 'string' || typeof node === 'number') return String(node);
-  if (Array.isArray(node)) return node.map(extractRawText).join('');
-  if (typeof node === 'object' && 'props' in (node as Record<string, unknown>)) {
-    const props = (node as { props?: { children?: unknown } }).props;
-    return extractRawText(props?.children);
-  }
-  return '';
-};
-
-// Block code with a tiny header strip: language label (left) + copy button
-// (right). Mirrors Claude.ai / Cursor / GitHub-PR rendering — gives the user
-// a hook for "what language", "copy this snippet" without making them right-
-// click into the syntax-highlighter area.
-// Why a separate component (not inline in `code` override): each block owns
-// its own copy/copied state. Inline closure inside ReactMarkdown.components
-// would re-create on every render and lose hover-state.
-const MarkdownCodeBlock: React.FC<{ language: string; code: string }> = ({ language, code }) => {
-  const [copied, setCopied] = useState(false);
-  const onCopy = useCallback((e: React.MouseEvent) => {
-    e.stopPropagation();
-    try {
-      const electron = (window as any).require?.('electron');
-      if (electron?.clipboard?.writeText) electron.clipboard.writeText(code);
-    } catch {}
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1500);
-  }, [code]);
-  const displayLang = language || 'text';
-  return (
-    <div className="my-2 rounded-lg overflow-hidden border border-white/[0.06] bg-[#0d0d0d]">
-      <div className="flex items-center justify-between px-3 py-1 bg-white/[0.025] border-b border-white/[0.05] text-[0.77em]">
-        <span className="font-mono uppercase tracking-wide text-[#888]">{displayLang}</span>
-        <button
-          type="button"
-          onClick={onCopy}
-          className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[#888] hover:text-white hover:bg-white/[0.06] transition-colors cursor-pointer"
-          title={copied ? 'Copied' : 'Copy'}
-        >
-          {copied ? <Check size={11} className="text-[#4ade80]" /> : <CopyIcon size={11} />}
-          <span>{copied ? 'Copied' : 'Copy'}</span>
-        </button>
-      </div>
-      <SyntaxHighlighter
-        language={language || 'text'}
-        style={oneDark as any}
-        PreTag="div"
-        customStyle={{ margin: 0, padding: '10px 12px', background: 'transparent', fontSize: '0.92em' }}
-        codeTagProps={{ style: { fontFamily: 'inherit' } }}
-      >
-        {code}
-      </SyntaxHighlighter>
-    </div>
-  );
-};
-
-const AssistantTextPart = ({ text }: { text: string }) => {
-  if (!text.trim()) return null;
-  return (
-    <div
-      className="prose prose-invert prose-sm max-w-none text-[1em] prose-headings:font-semibold prose-h1:text-[1.15em] prose-h1:mt-4 prose-h1:mb-1 prose-h1:font-bold prose-h2:text-[1.08em] prose-h2:mt-4 prose-h2:mb-1 prose-h3:text-[1em] prose-h3:mt-3 prose-h3:mb-0.5 prose-h4:text-[1em] prose-h4:mt-3 prose-h4:mb-0.5 prose-h5:text-[1em] prose-h5:mt-3 prose-h5:mb-0.5 prose-h6:text-[1em] prose-h6:mt-3 prose-h6:mb-0.5 prose-p:my-0.5 prose-p:leading-snug prose-ul:my-0.5 prose-ol:my-0.5 [&_ul]:list-inside [&_ul]:pl-0 [&_ol]:list-inside [&_ol]:pl-0 prose-li:my-0 prose-li:leading-snug prose-li:pl-0 [&_li>p]:my-0 [&_li>p]:inline [&_li_>_*]:my-0 [&_ul_ul]:my-0 [&_ol_ol]:my-0 [&_ul_ol]:my-0 [&_ol_ul]:my-0 [&_ul_ul]:pl-4 [&_ol_ol]:pl-4 [&_ul_ol]:pl-4 [&_ol_ul]:pl-4 prose-headings:text-inherit prose-strong:text-inherit prose-strong:font-semibold marker:text-[#666] prose-pre:bg-transparent prose-pre:p-0 prose-pre:my-0 prose-pre:border-0 prose-table:my-3 [&_th]:px-3 [&_th]:py-1.5 [&_td]:px-3 [&_td]:py-1.5 [&_th]:text-left [&_th]:font-semibold prose-blockquote:my-2 [&_code]:before:content-none [&_code]:after:content-none"
-      style={{
-        color: '#e8e8e8',
-        lineHeight: '1.5',
-        fontFamily: '"JetBrainsMono Nerd Font", "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace',
-      }}
-    >
-      <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
-        rehypePlugins={[rehypeHexHighlight]}
-        components={{
-          // Render the block container ourselves so the language strip + copy
-          // chrome sits in the SAME card as the highlighter (no double `<pre>`,
-          // no black-square outer box). `pre > code` is the canonical
-          // markdown-block shape — pull the language + raw text out of the
-          // nested <code> and hand the whole thing to MarkdownCodeBlock.
-          pre({ children }) {
-            const codeNode: any = Array.isArray(children) ? children[0] : children;
-            const codeProps = codeNode?.props || {};
-            const langMatch = /language-(\w+)/.exec(codeProps.className || '');
-            const codeString = extractRawText(codeProps.children).replace(/\n$/, '');
-            return <MarkdownCodeBlock language={langMatch ? langMatch[1] : ''} code={codeString} />;
-          },
-          code({ className, children, ...props }) {
-            // Block-code (inside <pre>) already handled above. This branch is
-            // ONLY for inline `code`. Match Claude Code CLI's `permission` color
-            // (rgb(177,185,249) light blue-purple) — plain colored text, no
-            // background pill, no border. The CLI renders inline code through
-            // `color('permission', theme)(token.text)`; the visual is just a
-            // hue shift, not a chip. Pill-style boxes here previously created
-            // the "backtick chip" look we explicitly wanted to drop.
-            return <code className={`text-[#b1b9f9] ${className || ''}`} {...props}>{children}</code>;
-          },
-        }}
-      >
-        {text}
-      </ReactMarkdown>
-    </div>
-  );
-};
+// Markdown body of an assistant message. Visual canon (prose typography, code-
+// block chrome, inline-code hue, hex-chips) now lives in @noted/claude-blocks —
+// this is a thin delegate. The package's `.cb-prose` carries the font-smoothing
+// fix (`-webkit-font-smoothing: antialiased`) so normal text is no longer
+// rendered half-a-weight too heavy on macOS.
+const AssistantTextPart = ({ text }: { text: string }) => <CBMarkdown text={text} />;
 
 // ---- Reasoning/thinking part ----
 // Visual: collapsed by default, click to expand. Brain icon + "thinking · <effort>"
@@ -4247,6 +4159,10 @@ const AssistantTextPart = ({ text }: { text: string }) => {
 // subtly-tinted background (not the muted-gray-on-dark void that blended with the
 // rest of the UI). Border `white/10` + bg `white/[0.02]` is the established
 // "subtle card, distinct from prose" pattern from Vercel AI Elements / Zed.
+// Thinking block. Visual now lives in @noted/claude-blocks::ThinkBlock; this
+// delegate injects the two desktop-specific bits: (1) the scroll-stable toggle
+// (Virtuoso scroll-compensation), (2) the "thinking · <effort>" label pulled
+// from the active tab's sdkEffort.
 const ReasoningPart = ({ text }: { text: string }) => {
   const [open, setOpen] = useState(false);
   const anchorRef = useRef<HTMLDivElement>(null);
@@ -4260,88 +4176,26 @@ const ReasoningPart = ({ text }: { text: string }) => {
     }
     return null;
   });
-  // Visual: no card border/background. Just a single-row trigger with a mini-
-  // chip around the Brain icon (small bg+padding so the icon reads as a sticker,
-  // not a floating glyph). Whole row is the clickable surface — hover-tint hints
-  // at it, the chevron-toggle was redundant. Expanded body sits under the row
-  // with a left border (border-l) instead of a wrapper card — visual scoping
-  // without a second background layer.
-  // Header sits on the SAME left edge as body text (no chip background around
-  // the icon, no extra indent). Negative `-mx-1` + matching `px-1` gives the
-  // hover-tint room to breathe without pushing content right of the body
-  // paragraph baseline. Expanded body indents under the row with an absolutely-
-  // positioned border-l that stops short of the bottom (bottom: 6px), so two
-  // consecutive blocks have a visible vertical break between them.
   return (
-    <div ref={anchorRef} className="my-3 mr-[60px]">
-      <button
-        type="button"
-        onClick={onToggle}
-        onMouseDown={(e) => e.preventDefault()}
-        className="flex w-full items-center gap-2 -mx-1 px-1 py-1 text-[0.92em] text-[#bdbdbd] hover:text-white hover:bg-white/[0.03] rounded transition-colors cursor-pointer select-none"
-      >
-        <Brain size={13} className="shrink-0 text-[#a78bfa]" />
-        <span className="font-medium">thinking{effort ? ` · ${effort}` : ''}</span>
-      </button>
-      {open && (
-        <div className="ml-2 mt-1 pl-3 relative">
-          <span className="absolute left-0 top-0 border-l border-white/10" style={{ bottom: '6px' }} />
-          <div className="py-1 text-[1em] italic leading-relaxed text-[#d4d4d4] whitespace-pre-wrap break-words max-h-[280px] overflow-y-auto">
-            {text}
-          </div>
-        </div>
-      )}
-    </div>
+    <CBThinkBlock
+      text={text}
+      label={`thinking${effort ? ` · ${effort}` : ''}`}
+      open={open}
+      onToggle={onToggle}
+      anchorRef={anchorRef}
+    />
   );
 };
 
 // ============================================================
-// Tool call rendering — dispatcher + specialised cards
+// Tool call rendering — delegated to @noted/claude-blocks
 // ============================================================
-// Rendering strategy: each tool gets its own card layout (Bash → shell block,
-// Read → header + preview, Edit/Write → diff). Shared chrome lives in
-// <ToolCard>. Anything we don't have a specialisation for falls back to the
-// previous compact one-line pill.
-
-const TOOL_BG = 'rgba(255,255,255,0.025)';
-const TOOL_BORDER = 'rgba(255,255,255,0.08)';
-
-type ToolStatus = 'running' | 'done' | 'error';
-function toolStatusFrom(result: any, isError?: boolean): ToolStatus {
-  if (isError) return 'error';
-  if (result === undefined || result === null) return 'running';
-  return 'done';
-}
-
-function statusColor(status: ToolStatus): string {
-  if (status === 'running') return '#DA7756';
-  if (status === 'error') return '#ef4444';
-  return '#4ade80';
-}
-
-// Status carrier — the tool icon itself is the status indicator (bold stroke,
-// coloured by state). Avoids the prior visual where the row had two chevron-
-// shaped glyphs side-by-side (`>` collapse + `>_` Terminal icon) split by a
-// green dot. Now: collapse-chevron stays dim, the next glyph IS the icon and
-// IS the colour signal. Bold strokeWidth keeps it readable at 14px against
-// the dim chevron next to it.
-function ColoredToolIcon({ icon, status }: { icon: React.ReactNode; status: ToolStatus }) {
-  if (status === 'running') {
-    return <Loader2 size={14} strokeWidth={2.75} className="animate-spin shrink-0" style={{ color: statusColor(status) }} />;
-  }
-  // Clone the lucide icon to override size/strokeWidth/color in one place,
-  // regardless of what the tool-specific caller passed in TOOL_ICON.
-  if (React.isValidElement(icon)) {
-    const original = icon as React.ReactElement<any>;
-    return React.cloneElement(original, {
-      size: 14,
-      strokeWidth: 2.75,
-      className: ['shrink-0', original.props?.className || ''].filter(Boolean).join(' '),
-      style: { color: statusColor(status), ...(original.props?.style || {}) },
-    });
-  }
-  return <span className="shrink-0" style={{ color: statusColor(status) }}>{icon}</span>;
-}
+// The tool-card chrome, status colours, icon-as-status-indicator, Bash/Read/
+// Edit/Write/MultiEdit/Generic cards and the diff renderer all live in the
+// package now (single source for desktop + mobile). The desktop-specific seam
+// is collapse behaviour: this tab injects its scroll-stable toggle (the
+// `useStableCollapseToggle` hook below, kept here because CompactSummaryMsg /
+// CollapsibleText also use it) into the package cards via open/onToggle/anchorRef.
 
 // Toggle a collapsible block WITHOUT shifting the visible scroll position.
 // Mechanism (no visible jerk):
@@ -4392,6 +4246,13 @@ function useStableCollapseToggle(
     const anchorTopBefore = el.getBoundingClientRect().top;
     const scrollerTopBefore = scroller.getBoundingClientRect().top;
     const targetOffsetFromScroller = anchorTopBefore - scrollerTopBefore;
+    // wasAtBottom: if the user was glued to the very bottom before the click,
+    // a toggle there (collapse/expand of the last block — e.g. a turn was
+    // stopped mid-stream and the block ended up at the bottom) should FOLLOW
+    // to the new bottom, not pin the anchor. Otherwise expanding the last
+    // block would push the revealed content below the fold and the user would
+    // have to scroll down manually. Distance-to-bottom < BOTTOM_PIN_PX = glued.
+    const wasAtBottom = (scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight) <= BOTTOM_PIN_PX;
     flushSync(() => { toggle(); });
     // Two rAFs: first lets React + Virtuoso commit/measure, second is when
     // ResizeObserver has emitted и known-size обновлён. После этого
@@ -4401,6 +4262,9 @@ function useStableCollapseToggle(
       requestAnimationFrame(() => {
         const el2 = anchorRef.current;
         if (!el2) return;
+        // Glued-to-bottom path: re-stick to the new bottom (instant, no smooth —
+        // matches Claude TUI bottom-pinned input). Covers expand AND collapse.
+        if (wasAtBottom) { scroller.scrollTop = scroller.scrollHeight; return; }
         const newAnchorTop = el2.getBoundingClientRect().top;
         const newScrollerTop = scroller.getBoundingClientRect().top;
         const newOffsetFromScroller = newAnchorTop - newScrollerTop;
@@ -4411,297 +4275,25 @@ function useStableCollapseToggle(
   }, [anchorRef, toggle]);
 }
 
-// Generic card chrome — single-line header (always visible) + optional body.
-// Header order: [chevron] [icon] [status-dot] LABEL (description) <preview>
-// — all chips grouped LEFT of the status dot, then label/description/preview
-// flow on the SAME line with truncation. Full command/path + tool output live
-// in the collapsible body (defaultOpen=false) — header gives the gist, click
-// to drill in.
-// Why single-line: tool blocks stack densely in a thread; a two-row header
-// doubles vertical real-estate without adding info that user can't get from
-// click-to-expand. Same reason Cursor/Claude TUI use one-line tool chips.
-const ToolCard: React.FC<{
-  status: ToolStatus;
-  icon: React.ReactNode;
-  label: React.ReactNode; // small uppercase: "READ", "BASH", "WEBSEARCH"
-  description?: React.ReactNode; // optional dim parenthetical, e.g. (Find new-feature branch)
-  preview?: React.ReactNode; // optional monospace command/path/query preview
-  badges?: React.ReactNode; // counts/diff stats — render after label, before description
-  subtitle?: React.ReactNode; // optional dim sub-line BELOW header (e.g. "Added 1 line, removed 1 line" for Edit)
-  body?: React.ReactNode;
-  collapsible?: boolean;
-  defaultOpen?: boolean;
-}> = ({ status, icon, label, description, preview, badges, subtitle, body, collapsible = true, defaultOpen = false }) => {
-  const [open, setOpen] = useState(defaultOpen);
-  const cardRef = useRef<HTMLDivElement>(null);
-  const hasBody = body !== undefined && body !== null && body !== false;
-  const handleToggle = useStableCollapseToggle(cardRef, () => setOpen(v => !v));
-  // Visual contract: no card chrome (no border, no background). Whole row is
-  // the clickable surface — cursor:pointer + hover-tint signal it. Chevron
-  // dropped — it was a redundant affordance next to the colored tool icon,
-  // and stole horizontal space from the command preview (which is what the
-  // user actually reads). Icon sits in a tiny chip (bg + padding) so it reads
-  // as a sticker, not a floating glyph against the page background.
-  //
-  // Single-row layout: [icon-chip] [LABEL] [badges] [(description)] [preview...]
-  // Preview row is `whitespace-nowrap` + `truncate` — long Bash commands stay
-  // on ONE line and get cut with ellipsis. Click to expand into body to read
-  // full text. Previously preview wrapped to a second visual line which looked
-  // broken next to a one-line LABEL.
-  //
-  // Expanded body: NO wrapper card. Indented under the row with `border-l`
-  // (single vertical line) — gives the block a visual boundary without a
-  // second background layer that would compete with the page bg.
-  // Layout contract:
-  //  - Header row sits at the SAME left edge as surrounding body text. Icon is
-  //    bare (no chip background) — the bg behind it was redundant noise once
-  //    several rows stacked. `-mx-1` + `px-1` reserves the hover-tint without
-  //    pushing label/preview right.
-  //  - `subtitle` slot (Update/Edit only) renders directly under the header
-  //    in dim text: "Added N lines, removed M lines". Replaces the old +N/-M
-  //    badges in the header row — matches Claude's own thread renderer.
-  //  - Expanded body is indented with an ABSOLUTE border-l that stops 6px
-  //    above the bottom edge of the wrapper. With `my-3` between cards two
-  //    consecutive Updates show a clear vertical gap; the truncated bar makes
-  //    each block's boundary readable instead of one continuous line.
-  return (
-    <div ref={cardRef} className="my-3 mr-[60px]">
-      <div
-        className={`flex items-center gap-2 -mx-1 px-1 py-1 rounded overflow-hidden ${hasBody && collapsible ? 'cursor-pointer hover:bg-white/[0.03]' : ''} transition-colors`}
-        onClick={hasBody && collapsible ? handleToggle : undefined}
-      >
-        <ColoredToolIcon icon={icon} status={status} />
-        <span className="shrink-0 text-[0.85em] font-medium text-[#bdbdbd] uppercase tracking-wide">{label}</span>
-        {badges && <span className="shrink-0 inline-flex items-center gap-1">{badges}</span>}
-        {description && (
-          <span className="shrink-0 text-[0.85em] text-[#888]">({description})</span>
-        )}
-        {preview && (
-          <span className="min-w-0 flex-1 text-[0.92em] font-mono text-[#e0e0e0] whitespace-nowrap truncate">
-            {preview}
-          </span>
-        )}
-      </div>
-      {subtitle && (
-        <div className="-mx-1 px-1 -mt-0.5 text-[0.85em] text-[#888] leading-tight">
-          {subtitle}
-        </div>
-      )}
-      {hasBody && open && (
-        <div className="ml-2 mt-1.5 pl-3 relative">
-          <span className="absolute left-0 top-0 border-l border-white/10" style={{ bottom: '6px' }} />
-          {body}
-        </div>
-      )}
-    </div>
-  );
-};
-
-// ---- Bash ----
-// Header (collapsed): `[chevron] [icon] [dot] BASH (description) command…`
-// Body (expanded): full command (mono, wraps) + output block.
-const BashCard: React.FC<{ args: Record<string, any>; result: any; status: ToolStatus }> = ({ args, result, status }) => {
-  const cmd: string = args.command || '';
-  const description: string = args.description || '';
-  const resultText = typeof result === 'string' ? result : (result == null ? '' : JSON.stringify(result));
-  const preview = cmd ? <span>{cmd}</span> : <span className="italic text-[#666]">(no command)</span>;
-  // Body lives inside the parent's border-l indent (no card frame). No tinted
-  // backgrounds on either the command echo or the result block — the left
-  // border already scopes them. Light divider between command and output kept
-  // as `border-t` (single hairline, не подложка).
-  const body = (cmd || resultText) ? (
-    <div className="py-1">
-      {cmd && (
-        <div className="py-1 text-[0.92em] font-mono text-[#e0e0e0] whitespace-pre-wrap break-all leading-snug">
-          {cmd}
-        </div>
-      )}
-      {resultText && (
-        <SyntaxHighlighter
-          language="bash"
-          style={oneDark as any}
-          PreTag="div"
-          customStyle={{ margin: cmd ? '6px 0 0' : 0, padding: '6px 0 0', background: 'transparent', fontSize: '0.92em', maxHeight: '180px', overflow: 'auto', borderTop: cmd ? `1px solid ${TOOL_BORDER}` : undefined }}
-          codeTagProps={{ style: { fontFamily: 'inherit' } }}
-        >
-          {resultText}
-        </SyntaxHighlighter>
-      )}
-    </div>
-  ) : null;
-  return <ToolCard status={status} icon={<TerminalIcon size={13} />} label="Bash" description={description || undefined} preview={preview} body={body} defaultOpen={false} />;
-};
-
-// ---- Read ----
-// Body holds full content in a single scroll container — no preview+toggle
-// because the SyntaxHighlighter already caps height with overflow:auto, so a
-// "show more" button below would just duplicate what scrolling already does.
-// Click cost without information gain == redundant affordance.
-const ReadCard: React.FC<{ args: Record<string, any>; result: any; status: ToolStatus }> = ({ args, result, status }) => {
-  const path: string = args.file_path || args.path || '';
-  const lang = detectLanguage(path);
-  const raw = typeof result === 'string' ? result : (result == null ? '' : JSON.stringify(result));
-  const content = raw.replace(/\n+$/, '');
-  const lines = content ? content.split('\n') : [];
-  const badges = lines.length > 0 ? (
-    <span className="text-[0.77em] text-[#666] font-mono tabular-nums">{lines.length} lines</span>
-  ) : null;
-  const preview = path ? <span>{path}</span> : <span className="italic text-[#666]">(no path)</span>;
-  const body = content ? (
-    <SyntaxHighlighter
-      language={lang}
-      style={oneDark as any}
-      PreTag="div"
-      customStyle={{ margin: 0, padding: '6px 0 0', background: 'transparent', fontSize: '0.92em', maxHeight: '320px', overflow: 'auto' }}
-      codeTagProps={{ style: { fontFamily: 'inherit' } }}
-    >
-      {content}
-    </SyntaxHighlighter>
-  ) : null;
-  return <ToolCard status={status} icon={<FileText size={13} />} label="Read" badges={badges} preview={preview} body={body} defaultOpen={false} />;
-};
-
-// ---- Edit / Write ----
-// Edit: diff old_string → new_string with red/green line bg.
-// Write: all lines as adds (the whole file is new).
-// MultiEdit: render each edit as its own diff hunk.
-// No expand-toggle: the container already has max-h + overflow-y:auto, so
-// "show all N lines" would just duplicate what scrolling already does. Same
-// logic as ReadCard — redundant click on top of native scroll.
-
-// Diff lines styled after Claude's own thread renderer.
-// Layout per row: [line-no gutter] [+/-/space marker] [code (Prism-highlighted)].
-//   - gutter: dim line-numbers; nothing fancy, sequential 1..N over the diff,
-//     not the file's real numbers (lineDiff doesn't know them).
-//   - background tints stay at ~12% alpha on add/del; eq is fully transparent.
-//   - color contract:
-//       add / eq → Prism syntax-highlighted code colors (const = blue,
-//                  return = red, strings = green, etc.). User explicitly asked
-//                  for "полноценный цвет кода" on add/eq lines, not a flat
-//                  green wash.
-//       del      → white (#fafafa), Prism OFF. На красном фоне Prism тонов
-//                  плохо читаются (зелёные строки на красном — eye-strain),
-//                  и логически удалённый код — это «обведено к исчезновению»,
-//                  ему не нужна семантическая подсветка.
-function HighlightedLine({ line, language }: { line: string; language: string }) {
-  // Prism inline render. We disable the wrapper's customStyle bg so the row's
-  // own bg-tint (add/del) shows through. `code` tag inherits font-family from
-  // the parent .font-mono. PreTag="span" keeps it inline-flow so the row
-  // stays a single-line flex item.
-  return (
-    <SyntaxHighlighter
-      language={language}
-      style={oneDark as any}
-      PreTag="span"
-      CodeTag="span"
-      customStyle={{ margin: 0, padding: 0, background: 'transparent', fontSize: 'inherit', display: 'inline' }}
-      codeTagProps={{ style: { fontFamily: 'inherit', background: 'transparent' } }}
-    >
-      {line || ' '}
-    </SyntaxHighlighter>
-  );
-}
-
-function DiffLines({ entries, language }: { entries: DiffEntry[]; language: string }) {
-  return (
-    <div>
-      <div className="font-mono text-[0.92em] leading-[1.55] max-h-[320px] overflow-y-auto" data-diff-lang={language}>
-        {entries.map((e, idx) => {
-          const bg = e.tag === 'add' ? 'rgba(74, 222, 128, 0.12)' : e.tag === 'del' ? 'rgba(239, 68, 68, 0.14)' : 'transparent';
-          const markerColor = e.tag === 'add' ? '#4ade80' : e.tag === 'del' ? '#ef4444' : '#555';
-          const sign = e.tag === 'add' ? '+' : e.tag === 'del' ? '-' : ' ';
-          const lineNo = idx + 1;
-          return (
-            <div key={idx} className="flex items-start" style={{ background: bg }}>
-              <span className="select-none shrink-0 text-right pr-2 pl-2 text-[#555] tabular-nums" style={{ width: '3.5em' }}>{lineNo}</span>
-              <span className="select-none w-[16px] shrink-0 text-center" style={{ color: markerColor }}>{sign}</span>
-              <span className="whitespace-pre-wrap break-all flex-1 pr-3" style={{ color: e.tag === 'del' ? '#fafafa' : undefined }}>
-                {e.tag === 'del' ? (e.line || ' ') : <HighlightedLine line={e.line} language={language} />}
-              </span>
-            </div>
-          );
-        })}
-      </div>
-    </div>
-  );
-}
-
-const EditCard: React.FC<{ toolName: string; args: Record<string, any>; status: ToolStatus }> = ({ toolName, args, status }) => {
-  const path: string = args.file_path || args.path || '';
-  const lang = detectLanguage(path);
-
-  // Build diff entries based on the specific tool variant.
-  const diff: DiffEntry[] = React.useMemo(() => {
-    if (toolName === 'Write') {
-      // Whole file is a new addition.
-      const content = (args.content || '') as string;
-      return content ? content.split('\n').map(line => ({ tag: 'add' as const, line })) : [];
-    }
-    if (toolName === 'MultiEdit') {
-      const edits: Array<{ old_string?: string; new_string?: string }> = Array.isArray(args.edits) ? args.edits : [];
-      const out: DiffEntry[] = [];
-      for (let i = 0; i < edits.length; i++) {
-        const e = edits[i];
-        const hunk = lineDiff(e.old_string || '', e.new_string || '');
-        if (i > 0) out.push({ tag: 'eq', line: '─'.repeat(40) });
-        out.push(...hunk);
-      }
-      return out;
-    }
-    // Edit
-    return lineDiff(args.old_string || '', args.new_string || '');
-  }, [toolName, args]);
-
-  const { added, removed } = countDiffStats(diff);
-  const verb = toolName === 'Write' ? 'Write' : toolName === 'MultiEdit' ? 'MultiEdit' : 'Update';
-
-  // Header is bare path; line-count summary moves to a `subtitle` line below
-  // (matches Claude's renderer: "Added N lines, removed M lines"). Reads as
-  // sentence prose, not a cluster of compact +N/-M badges that drew the eye
-  // away from the file path.
-  const subtitle = (added > 0 || removed > 0) ? (
-    <span className="font-mono tabular-nums">
-      {added > 0 && <>Added <span className="text-[#4ade80]">{added}</span> {added === 1 ? 'line' : 'lines'}</>}
-      {added > 0 && removed > 0 && ', '}
-      {removed > 0 && <>removed <span className="text-[#ef4444]">{removed}</span> {removed === 1 ? 'line' : 'lines'}</>}
-    </span>
-  ) : null;
-  const preview = path ? <span>{path}</span> : <span className="italic text-[#666]">(no path)</span>;
-  const body = diff.length > 0 ? <DiffLines entries={diff} language={lang} /> : null;
-  // Edit/Write defaultOpen=true — the diff is the whole point of the call.
-  return <ToolCard status={status} icon={<FileEdit size={13} />} label={verb} preview={preview} subtitle={subtitle} body={body} defaultOpen={true} />;
-};
-
-// ---- Fallback for anything else (Glob, Grep, WebSearch, MCP, etc.) ----
-const GenericToolCard: React.FC<{ toolName: string; args: Record<string, any>; result: any; status: ToolStatus }> = ({ toolName, args, result, status }) => {
-  const icon = TOOL_ICON[toolName] || <TerminalIcon size={13} />;
-  const summary = (() => {
-    if (toolName === 'Glob') return args.pattern || '';
-    if (toolName === 'Grep') return args.pattern || '';
-    if (toolName === 'WebSearch' || toolName === 'WebFetch') return args.query || args.url || '';
-    if (typeof args === 'object' && args) {
-      const first = Object.values(args).find(v => typeof v === 'string') as string | undefined;
-      return first ? first.slice(0, 200) : '';
-    }
-    return '';
-  })();
-  const resultText = result == null ? '' : (typeof result === 'string' ? result : JSON.stringify(result, null, 2));
-  const preview = summary ? <span>{summary}</span> : null;
-  const body = resultText ? (
-    <pre className="m-0 py-1 text-[0.92em] text-[#bdbdbd] font-mono whitespace-pre-wrap break-all max-h-[180px] overflow-y-auto">{resultText}</pre>
-  ) : null;
-  return <ToolCard status={status} icon={icon} label={toolName} preview={preview} body={body} defaultOpen={false} />;
-};
-
 // ---- Dispatcher ----
+// Delegates to @noted/claude-blocks::ToolCallPart for ALL card rendering. The
+// only desktop-specific bit is the collapse mechanism — we inject the scroll-
+// stable toggle (useStableCollapseToggle, defined above) so expanding a tool
+// card inside Virtuoso doesn't jerk the scroll position. The package dispatcher
+// renders exactly ONE card, so a single open/onToggle/anchorRef pair is enough.
 const ToolCallPart = ({ toolName, args, result, isError }: { toolName: string; args: Record<string, any>; argsText: string; toolCallId: string; result?: any; isError?: boolean }) => {
-  const status = toolStatusFrom(result, isError);
-  if (toolName === 'Bash') return <BashCard args={args} result={result} status={status} />;
-  if (toolName === 'Read') return <ReadCard args={args} result={result} status={status} />;
-  if (toolName === 'Edit' || toolName === 'Write' || toolName === 'MultiEdit') {
-    return <EditCard toolName={toolName} args={args} status={status} />;
-  }
-  return <GenericToolCard toolName={toolName} args={args} result={result} status={status} />;
+  const anchorRef = useRef<HTMLDivElement>(null);
+  const [open, setOpen] = useState(() => defaultOpenForTool(toolName));
+  const onToggle = useStableCollapseToggle(anchorRef, () => setOpen(v => !v));
+  return (
+    <CBToolCallPart
+      toolName={toolName}
+      args={args}
+      result={result}
+      isError={isError}
+      collapse={{ open, onToggle, anchorRef }}
+    />
+  );
 };
 
 // ============================================================
@@ -4886,11 +4478,6 @@ function SDKComposer({
   // no room for a second chip; the existing one briefly highlights to
   // confirm the keypress was received but rejected.
   const [chipFlashTick, setChipFlashTick] = useState(0);
-  // True for ~400ms after the composer is focused via the process-chip click —
-  // drives a one-shot orange glow on the input so the click is visibly answered
-  // (focusing an empty input is otherwise near-invisible). Pure style toggle, no
-  // remount (a changing key would drop the caret/text).
-  const [focusFlash, setFocusFlash] = useState(false);
   useEffect(() => {
     const onFlash = (e: Event) => {
       const { tabId: tid } = (e as CustomEvent).detail || {};
@@ -5182,12 +4769,6 @@ function SDKComposer({
       if (tid !== tabId) return;
       requestAnimationFrame(() => {
         composerTextareaRef.current?.focus();
-        // Focusing an EMPTY input is visually near-invisible (just a caret), so
-        // the click read as "ничего не происходит". Pulse the input border +
-        // scroll the thread to the bottom so the click has an unmistakable
-        // visual response. Reuses the sdk-chip-flash orange pulse.
-        setFocusFlash(true);
-        setTimeout(() => setFocusFlash(false), 400);
         onUserInteract?.();
       });
     };
@@ -5356,18 +4937,26 @@ function SDKComposer({
     }
   }, [composerText, writeComposerValue, isRunning, onSessionStop, commitSlash, tabId, queued, chips, composerRuntime]);
 
+  // Single source of truth for "long text → chip". Used by both the paste
+  // handler AND the Insert-Prompt path (Opt+V picker) — a long saved prompt
+  // pulled in via the picker is conceptually the same as a long paste, so it
+  // should collapse into a chip instead of dumping raw text into the composer.
+  const addChip = useCallback((text: string) => {
+    setChips(prev => [...prev, {
+      id: 'chip-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6),
+      text,
+      preview: text.slice(0, 60).replace(/\n/g, ' ') + '...',
+    }]);
+  }, []);
+
   const handlePaste = useCallback((e: React.ClipboardEvent) => {
     const text = e.clipboardData.getData('text/plain');
     if (text.length >= PASTE_THRESHOLD) {
       e.preventDefault();
-      setChips(prev => [...prev, {
-        id: 'chip-' + Date.now(),
-        text,
-        preview: text.slice(0, 60).replace(/\n/g, ' ') + '...',
-      }]);
+      addChip(text);
     }
     // Short pastes go through normally to ComposerPrimitive.Input
-  }, []);
+  }, [addChip]);
 
   const removeChip = useCallback((id: string) => {
     setChips(prev => prev.filter(c => c.id !== id));
@@ -5424,6 +5013,17 @@ function SDKComposer({
         writeComposerValue(detail.text, { focusEnd: true });
         return;
       }
+      // Long inserted prompts (Opt+V picker → a saved prompt above the paste
+      // threshold) collapse into a chip, same as a long manual paste — instead
+      // of dumping a wall of text into the composer. The chip carries the full
+      // body and is wrapped in <pasted_content> on send. Short prompts append
+      // inline as before. `skipChip` lets callers force inline (none today).
+      if (!detail.skipChip && typeof detail.text === 'string' && detail.text.length >= PASTE_THRESHOLD) {
+        addChip(detail.text);
+        // Keep the composer focused so the user can add a covering message.
+        setTimeout(() => composerTextareaRef.current?.focus(), 0);
+        return;
+      }
       // Read the *current* textarea value, not the runtime state — runtime
       // can lag the DOM after rapid edits, and we want to append to what the
       // user actually sees on screen right now.
@@ -5435,7 +5035,7 @@ function SDKComposer({
     };
     window.addEventListener('claude-sdk:composer-insert', handler);
     return () => window.removeEventListener('claude-sdk:composer-insert', handler);
-  }, [writeComposerValue]);
+  }, [writeComposerValue, addChip]);
 
   return (
     <div className="relative">
@@ -5679,9 +5279,8 @@ function SDKComposer({
               // composerFocused to show the input is still the keyboard target.
               style={{
                 caretColor: '#FFB382',
-                borderColor: focusFlash ? '#FFB382' : (composerFocused ? '#FFB382' : '#555'),
-                boxShadow: focusFlash ? '0 0 0 3px rgba(255,178,130,0.45)' : 'none',
-                transition: 'border-color 120ms ease, box-shadow 200ms ease',
+                borderColor: composerFocused ? '#FFB382' : '#555',
+                transition: 'border-color 120ms ease',
               }}
               className={'flex-1 text-[#e0e0e0] text-[1em] rounded-lg px-3 py-2 resize-none outline-none border placeholder-[#555] min-h-[36px] max-h-[120px] bg-[#1a1a1a]'}
               rows={1}

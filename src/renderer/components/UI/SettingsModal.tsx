@@ -65,6 +65,7 @@ function FontSizeSlider({
   min,
   max,
   suffix = 'px',
+  disabled = false,
 }: {
   label: string;
   description?: string;          // опционально — без описания строка тоньше
@@ -73,6 +74,10 @@ function FontSizeSlider({
   min: number;
   max: number;
   suffix?: string;
+  // disabled — показываем значение read-only, без +/− и без редактирования.
+  // Используется когда величина задаётся в другом месте (напр. resize-ручкой),
+  // а здесь только отражается по факту.
+  disabled?: boolean;
 }) {
   // Editable число вместо read-only display. На focus убираем suffix (`12px` → `12`)
   // чтобы можно было сразу ввести значение клавиатурой без `Backspace × 2`.
@@ -115,6 +120,7 @@ function FontSizeSlider({
       justifyContent: 'space-between',
       gap: '10px',
       minHeight: 0,
+      opacity: disabled ? 0.6 : 1,
     }}>
       <div style={{ minWidth: 0, flex: 1 }}>
         <div style={{ fontSize: '12px', color: '#eaeaea', fontWeight: 500, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{label}</div>
@@ -122,6 +128,24 @@ function FontSizeSlider({
           <div style={{ fontSize: '10px', color: '#666', marginTop: '1px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{description}</div>
         )}
       </div>
+      {disabled ? (
+        // Read-only display: значение по факту, без +/− и без редактирования
+        // (величина управляется в другом месте — напр. resize-ручкой превью).
+        <div style={{
+          flexShrink: 0,
+          padding: '0 10px',
+          height: '24px',
+          display: 'flex',
+          alignItems: 'center',
+          backgroundColor: '#262626',
+          border: '1px solid #2a2a2a',
+          borderRadius: '6px',
+          fontSize: '11px',
+          color: '#888',
+          fontVariantNumeric: 'tabular-nums',
+          fontFamily: 'monospace',
+        }}>{value}{suffix}</div>
+      ) : (
       <div style={{
         display: 'flex',
         alignItems: 'center',
@@ -175,6 +199,7 @@ function FontSizeSlider({
           onClick={() => onChange(Math.min(max, value + 1))}
         >+</button>
       </div>
+      )}
     </div>
   );
 }
@@ -311,92 +336,6 @@ function PaddingRow({
   );
 }
 
-// Дробное соотношение «W × H» в одной строке. Два input'а, на focus убирает
-// suffix, Enter/blur коммитит пару через `onChange(w, h)`. Используется для
-// `tabPreviewRatio*` — целевая пропорция превью таба.
-function RatioRow({
-  label,
-  description,
-  width,
-  height,
-  onChange,
-  min = 1,
-  max = 32,
-}: {
-  label: string;
-  description: string;
-  width: number;
-  height: number;
-  onChange: (w: number, h: number) => void;
-  min?: number;
-  max?: number;
-}) {
-  const [wDraft, setWDraft] = React.useState('');
-  const [hDraft, setHDraft] = React.useState('');
-  const [wFocused, setWFocused] = React.useState(false);
-  const [hFocused, setHFocused] = React.useState(false);
-  const inputStyle: React.CSSProperties = {
-    width: '46px',
-    textAlign: 'center',
-    fontSize: '12px',
-    color: '#fff',
-    fontVariantNumeric: 'tabular-nums',
-    padding: '2px 6px',
-    backgroundColor: '#262626',
-    border: '1px solid #2a2a2a',
-    borderRadius: '6px',
-    fontFamily: 'monospace',
-    outline: 'none',
-  };
-  const commit = (nextW: string, nextH: string) => {
-    const w = parseFloat(nextW);
-    const h = parseFloat(nextH);
-    const w2 = Number.isFinite(w) ? Math.max(min, Math.min(max, w)) : width;
-    const h2 = Number.isFinite(h) ? Math.max(min, Math.min(max, h)) : height;
-    onChange(w2, h2);
-  };
-  return (
-    <div style={{
-      padding: '8px 12px',
-      backgroundColor: '#1f1f1f',
-      border: '1px solid #2a2a2a',
-      borderRadius: '8px',
-      display: 'flex',
-      alignItems: 'center',
-      justifyContent: 'space-between',
-      gap: '12px',
-    }}>
-      <div style={{ minWidth: 0 }}>
-        <div style={{ fontSize: '13px', color: '#eaeaea', fontWeight: 500 }}>{label}</div>
-        <div style={{ fontSize: '11px', color: '#666', marginTop: '1px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{description}</div>
-      </div>
-      <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexShrink: 0 }}>
-        <input
-          type="text"
-          inputMode="numeric"
-          value={wFocused ? wDraft : String(width)}
-          onFocus={(e) => { setWDraft(String(width)); setWFocused(true); requestAnimationFrame(() => e.target.select()); }}
-          onChange={(e) => setWDraft(e.target.value)}
-          onBlur={() => { commit(wDraft, String(height)); setWFocused(false); }}
-          onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur(); else if (e.key === 'Escape') { setWDraft(String(width)); (e.target as HTMLInputElement).blur(); } }}
-          style={inputStyle}
-        />
-        <span style={{ color: '#666', fontSize: '12px', fontFamily: 'monospace' }}>×</span>
-        <input
-          type="text"
-          inputMode="numeric"
-          value={hFocused ? hDraft : String(height)}
-          onFocus={(e) => { setHDraft(String(height)); setHFocused(true); requestAnimationFrame(() => e.target.select()); }}
-          onChange={(e) => setHDraft(e.target.value)}
-          onBlur={() => { commit(String(width), hDraft); setHFocused(false); }}
-          onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur(); else if (e.key === 'Escape') { setHDraft(String(height)); (e.target as HTMLInputElement).blur(); } }}
-          style={inputStyle}
-        />
-      </div>
-    </div>
-  );
-}
-
 // Sidebar behavior toggles (Cmd+/ persistence + click-outside-close).
 // Extracted to its own component so the hooks live at top level (not inside an IIFE
 // inside the main render — that would conditionally call hooks per render branch).
@@ -453,6 +392,48 @@ function SidebarBehaviorToggles() {
         </label>
       </Tooltip>
     </div>
+  );
+}
+
+// Один toggle-ряд для «показывать номера строк». Визуал зеркалит
+// SidebarBehaviorToggles (та же green-pill геометрия), но это standalone-строка —
+// используется отдельно в секции «Заметки» (редактор) и в подсекции
+// «Превью CMD+hover» (превью), у каждой поверхности свой независимый toggle.
+function LineNumbersToggle({
+  checked,
+  onChange,
+  label,
+  description,
+  tooltip,
+}: {
+  checked: boolean;
+  onChange: (v: boolean) => void;
+  label: string;
+  description: string;
+  tooltip: string;
+}) {
+  return (
+    <Tooltip content={tooltip}>
+      <label className="flex items-start gap-3 cursor-pointer select-none">
+        <div
+          className="relative w-8 h-4 rounded-full transition-colors mt-0.5 shrink-0"
+          style={{ backgroundColor: checked ? 'rgba(74, 222, 128, 0.4)' : 'rgba(255,255,255,0.1)' }}
+          onClick={() => onChange(!checked)}
+        >
+          <div
+            className="absolute top-0.5 w-3 h-3 rounded-full transition-all"
+            style={{
+              left: checked ? '18px' : '2px',
+              backgroundColor: checked ? '#4ade80' : '#666',
+            }}
+          />
+        </div>
+        <div>
+          <div style={{ fontSize: '13px', color: '#ccc' }}>{label}</div>
+          <div style={{ fontSize: '11px', color: '#666' }}>{description}</div>
+        </div>
+      </label>
+    </Tooltip>
   );
 }
 
@@ -1020,223 +1001,8 @@ function ProcessBarEditor() {
   );
 }
 
-// AIPulseEditor — настройка фона таба пока AI «думает» (claude/gemini/sdk busy-state).
-// Идентичная структура с ProcessBarEditor: enabled (мигание on/off), colorA (нижняя/
-// статичная фаза), colorB (верхняя фаза = пик пульса), durationMs. Отличие — нет
-// position toggle: фон занимает весь таб, у него нет «стороны». Цвет A может быть
-// 'transparent' (дефолт — таб мигает только в сторону colorB и обратно к прозрачности),
-// что отражает реальный кейс «таб подсветиться когда AI отвечает».
-function AIPulseEditor() {
-  const aiPulse = useUIStore((s) => s.aiPulse);
-  const setAiPulse = useUIStore((s) => s.setAiPulse);
-
-  const [pickerOpen, setPickerOpen] = useState<'a' | 'b' | null>(null);
-  const [hexDraftA, setHexDraftA] = useState<string | null>(null);
-  const [hexDraftB, setHexDraftB] = useState<string | null>(null);
-
-  const containerRef = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    if (!pickerOpen) return;
-    const onDown = (e: MouseEvent) => {
-      const t = e.target as Node | null;
-      if (containerRef.current && t && !containerRef.current.contains(t)) setPickerOpen(null);
-    };
-    window.addEventListener('mousedown', onDown);
-    return () => window.removeEventListener('mousedown', onDown);
-  }, [pickerOpen]);
-
-  // Preview — узкий card-таб, мигающий в реальном цвете/цикле. Использует локальные
-  // CSS vars в style, не зависит от :root → обновляется ДО App-effect'а синхронизации.
-  // Чтобы пульс был плавным (см. App.tsx::aiPulse effect — color-mix внутри keyframe
-  // не интерполируется в Chromium), вычисляем rgba endpoints здесь же.
-  const hexToRgba = (hex: string, alpha: number): string => {
-    if (hex === 'transparent') return 'rgba(0,0,0,0)';
-    const clean = hex.replace(/^#/, '');
-    if (clean.length !== 6) return `rgba(218,119,86,${alpha})`;
-    const r = parseInt(clean.slice(0, 2), 16);
-    const g = parseInt(clean.slice(2, 4), 16);
-    const b = parseInt(clean.slice(4, 6), 16);
-    if (isNaN(r) || isNaN(g) || isNaN(b)) return `rgba(218,119,86,${alpha})`;
-    return `rgba(${r},${g},${b},${alpha})`;
-  };
-  const previewColorA = aiPulse.colorA === 'transparent' ? 'rgba(0,0,0,0)' : hexToRgba(aiPulse.colorA, 1);
-  const previewColorBPeak = hexToRgba(aiPulse.colorB, 0.22);
-  const previewColorBStatic = hexToRgba(aiPulse.colorB, 0.14);
-
-  const previewBar = (
-    <div style={{
-      position: 'relative', width: '100%', height: '32px',
-      backgroundColor: '#252526', border: '1px solid #333',
-      borderRadius: '6px', overflow: 'hidden',
-    }}>
-      <div
-        className={aiPulse.enabled ? 'tab-ai-busy-shimmer' : 'tab-ai-busy-static'}
-        style={{
-          position: 'absolute', inset: 0,
-          ['--ai-pulse-color-a' as any]: previewColorA,
-          ['--ai-pulse-color-b' as any]: previewColorBPeak,
-          ['--ai-pulse-color-static' as any]: previewColorBStatic,
-          ['--ai-pulse-duration' as any]: `${aiPulse.durationMs}ms`,
-        }}
-      />
-      <div style={{
-        position: 'absolute', left: 12, right: 12, top: '50%', transform: 'translateY(-50%)',
-        fontSize: '11px', color: '#aaa', textAlign: 'center', pointerEvents: 'none',
-      }}>
-        AI thinking · {aiPulse.enabled ? `${(aiPulse.durationMs / 1000).toFixed(1)}s` : 'static'}
-      </div>
-    </div>
-  );
-
-  const colorChip = (which: 'a' | 'b') => {
-    const current = which === 'a' ? aiPulse.colorA : aiPulse.colorB;
-    const draft = which === 'a' ? hexDraftA : hexDraftB;
-    const setDraft = which === 'a' ? setHexDraftA : setHexDraftB;
-    const disabled = which === 'b' && !aiPulse.enabled;
-
-    return (
-      <div style={{
-        position: 'relative',
-        display: 'inline-flex', alignItems: 'center', gap: '6px',
-        padding: '4px 8px',
-        backgroundColor: '#1e1e1e', border: '1px solid #333', borderRadius: '8px',
-        opacity: disabled ? 0.4 : 1,
-        flexShrink: 0,
-      }}>
-        <button
-          onClick={() => { if (!disabled) setPickerOpen(pickerOpen === which ? null : which); }}
-          style={{
-            width: 16, height: 16, borderRadius: '50%',
-            backgroundColor: current === 'transparent' ? 'rgba(255,255,255,0.05)' : current,
-            border: '2px solid rgba(255,255,255,0.15)',
-            cursor: disabled ? 'not-allowed' : 'pointer',
-            flexShrink: 0, padding: 0,
-          }}
-          title="Палитра"
-        />
-        <span style={{ fontSize: '11px', color: '#888' }}>
-          {which === 'a' ? 'A' : 'B'}
-        </span>
-        <input
-          type="text"
-          disabled={disabled}
-          value={(draft ?? current).replace(/^#/, '')}
-          onChange={(e) => {
-            const next = `#${e.target.value}`;
-            setDraft(next);
-            const norm = normalizeHexValue(next);
-            if (norm) setAiPulse(which === 'a' ? { colorA: norm } : { colorB: norm });
-          }}
-          onBlur={() => setDraft(null)}
-          maxLength={7}
-          style={{
-            width: '60px', padding: '3px 6px',
-            backgroundColor: '#1a1a1a', border: '1px solid #333', borderRadius: '6px',
-            color: '#ccc', fontSize: '11px', fontFamily: 'monospace',
-            outline: 'none', textTransform: 'uppercase',
-          }}
-        />
-        {/* Для colorA — отдельная кнопка-чип «transparent». ColorA выступает как
-            нижняя/статичная фаза, юзеру обычно нужно «фон таба до пика прозрачный».
-            Hex-input не умеет прозрачность, поэтому отдельный toggle. */}
-        {which === 'a' && (
-          <button
-            onClick={() => setAiPulse({ colorA: aiPulse.colorA === 'transparent' ? '#000000' : 'transparent' })}
-            style={{
-              padding: '2px 6px', fontSize: '10px',
-              backgroundColor: aiPulse.colorA === 'transparent' ? 'rgba(74,222,128,0.18)' : '#1a1a1a',
-              color: aiPulse.colorA === 'transparent' ? '#86efac' : '#888',
-              border: '1px solid #333', borderRadius: '4px', cursor: 'pointer',
-            }}
-            title="Прозрачный фон в нижней фазе пульса"
-          >∅</button>
-        )}
-        {pickerOpen === which && (
-          <div
-            style={{
-              position: 'absolute', top: '100%', left: 0,
-              marginTop: '6px', zIndex: 50,
-              padding: '12px',
-              backgroundColor: '#1a1a1a', border: '1px solid #444', borderRadius: '10px',
-              boxShadow: '0 10px 30px rgba(0,0,0,0.5)',
-            }}
-            onMouseDown={(e) => e.stopPropagation()}
-            onClick={(e) => e.stopPropagation()}
-          >
-            <HexColorPicker
-              color={current === 'transparent' ? '#000000' : current}
-              onChange={(c) => setAiPulse(which === 'a' ? { colorA: c.toUpperCase() } : { colorB: c.toUpperCase() })}
-            />
-          </div>
-        )}
-      </div>
-    );
-  };
-
-  return (
-    <div ref={containerRef} style={{ paddingLeft: '12px' }}>
-      {previewBar}
-
-      <div style={{
-        display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '8px',
-        marginTop: '10px',
-      }}>
-        <label
-          className="flex items-center gap-2 cursor-pointer select-none"
-          style={{
-            padding: '4px 8px',
-            backgroundColor: '#1e1e1e', border: '1px solid #333', borderRadius: '8px',
-            flexShrink: 0,
-          }}
-        >
-          <div
-            className="relative w-7 h-3.5 rounded-full transition-colors shrink-0"
-            style={{ backgroundColor: aiPulse.enabled ? 'rgba(74, 222, 128, 0.4)' : 'rgba(255,255,255,0.1)' }}
-            onClick={() => setAiPulse({ enabled: !aiPulse.enabled })}
-          >
-            <div
-              className="absolute top-0.5 w-2.5 h-2.5 rounded-full transition-all"
-              style={{
-                left: aiPulse.enabled ? '15px' : '2px',
-                backgroundColor: aiPulse.enabled ? '#4ade80' : '#666',
-              }}
-            />
-          </div>
-          <span style={{ fontSize: '11px', color: '#ccc' }}>Пульс</span>
-        </label>
-
-        {colorChip('a')}
-        {colorChip('b')}
-
-        <div style={{
-          display: 'inline-flex', alignItems: 'center', gap: '6px',
-          padding: '4px 8px',
-          backgroundColor: '#1e1e1e', border: '1px solid #333', borderRadius: '8px',
-          opacity: aiPulse.enabled ? 1 : 0.4,
-          flexShrink: 0,
-        }}>
-          <span style={{ fontSize: '11px', color: '#888' }}>Цикл</span>
-          <input
-            type="number"
-            disabled={!aiPulse.enabled}
-            min={300}
-            max={6000}
-            step={100}
-            value={aiPulse.durationMs}
-            onChange={(e) => setAiPulse({ durationMs: Number(e.target.value) })}
-            style={{
-              width: '54px', padding: '3px 6px',
-              backgroundColor: '#1a1a1a', border: '1px solid #333', borderRadius: '6px',
-              color: '#ccc', fontSize: '11px', fontFamily: 'monospace', outline: 'none',
-              textAlign: 'right',
-            }}
-          />
-          <span style={{ fontSize: '10px', color: '#555' }}>ms</span>
-        </div>
-      </div>
-    </div>
-  );
-}
+// AIPulseEditor (whole-tab AI-busy background pulse) was removed — the loader is
+// the process-bar shimmer strip. See fact-process-bar.md::AIPulse removed.
 
 export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProps) {
   // Use last active tab if opened before, otherwise default to shortcuts
@@ -1297,13 +1063,14 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const setNotesEditorPaddingX = useUIStore((s) => s.setNotesEditorPaddingX);
   const notesEditorPaddingY = useUIStore((s) => s.notesEditorPaddingY);
   const setNotesEditorPaddingY = useUIStore((s) => s.setNotesEditorPaddingY);
+  const notesEditorShowLineNumbers = useUIStore((s) => s.notesEditorShowLineNumbers);
+  const setNotesEditorShowLineNumbers = useUIStore((s) => s.setNotesEditorShowLineNumbers);
+  const notesPreviewShowLineNumbers = useUIStore((s) => s.notesPreviewShowLineNumbers);
+  const setNotesPreviewShowLineNumbers = useUIStore((s) => s.setNotesPreviewShowLineNumbers);
   const tabPreviewMaxWidth = useUIStore((s) => s.tabPreviewMaxWidth);
   const setTabPreviewMaxWidth = useUIStore((s) => s.setTabPreviewMaxWidth);
   const tabPreviewMaxHeight = useUIStore((s) => s.tabPreviewMaxHeight);
   const setTabPreviewMaxHeight = useUIStore((s) => s.setTabPreviewMaxHeight);
-  const tabPreviewRatioW = useUIStore((s) => s.tabPreviewRatioW);
-  const tabPreviewRatioH = useUIStore((s) => s.tabPreviewRatioH);
-  const setTabPreviewRatio = useUIStore((s) => s.setTabPreviewRatio);
   const semanticIndexParallelism = useUIStore((s) => s.semanticIndexParallelism);
   const claudeMdMirrorEnabled = useUIStore((s) => s.claudeMdMirrorEnabled);
   const setClaudeMdMirrorEnabled = useUIStore((s) => s.setClaudeMdMirrorEnabled);
@@ -2267,9 +2034,6 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
               <SettingsSubSectionHeader title="Полоска процесса" />
               <ProcessBarEditor />
 
-              <SettingsSubSectionHeader title="Фон AI-загрузки" />
-              <AIPulseEditor />
-
               {/* 2. ТЕРМИНАЛ — шрифт самого терминала + Таймлайн как часть терминала */}
               <SettingsSectionHeader title="Терминал" />
               <SettingsGrid4>
@@ -2317,6 +2081,15 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                 <FontSizeSlider label="Шрифт в сайдбаре" value={notesSidebarFontSize} onChange={setNotesSidebarFontSize} min={10} max={28} />
                 <FontSizeSlider label="Шрифт раскрытый" value={notesExpandedFontSize} onChange={setNotesExpandedFontSize} min={10} max={28} />
               </SettingsGrid4>
+              <div style={{ marginTop: '10px' }}>
+                <LineNumbersToggle
+                  checked={notesEditorShowLineNumbers}
+                  onChange={setNotesEditorShowLineNumbers}
+                  label="Номера строк"
+                  description="Показывать колонку с номерами строк в редакторе заметки"
+                  tooltip="Колонка с номерами строк слева в раскрытом редакторе заметок (slide-out)."
+                />
+              </div>
 
               <SettingsSubSectionHeader title="Превью CMD+hover" />
               <SettingsGrid4>
@@ -2326,10 +2099,18 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                   valueY={notesEditorPaddingY} onChangeY={setNotesEditorPaddingY}
                   maxX={48} maxY={48}
                 />
-                <FontSizeSlider label="Макс. ширина" value={Math.round(tabPreviewMaxWidth)} onChange={setTabPreviewMaxWidth} min={120} max={900} />
-                <FontSizeSlider label="Макс. высота" value={Math.round(tabPreviewMaxHeight)} onChange={setTabPreviewMaxHeight} min={80} max={900} />
-                <RatioRow label="Пропорция" description="W × H" width={tabPreviewRatioW} height={tabPreviewRatioH} onChange={setTabPreviewRatio} />
+                <FontSizeSlider label="Макс. ширина [resize]" description="Задаётся перетаскиванием правого края превью" value={Math.round(tabPreviewMaxWidth)} onChange={setTabPreviewMaxWidth} min={120} max={900} disabled />
+                <FontSizeSlider label="Макс. высота" description="До неё растёт высота, дальше скролл" value={Math.round(tabPreviewMaxHeight)} onChange={setTabPreviewMaxHeight} min={80} max={900} />
               </SettingsGrid4>
+              <div style={{ marginTop: '10px' }}>
+                <LineNumbersToggle
+                  checked={notesPreviewShowLineNumbers}
+                  onChange={setNotesPreviewShowLineNumbers}
+                  label="Номера строк"
+                  description="Показывать колонку с номерами строк в превью (CMD+hover)"
+                  tooltip="Колонка с номерами строк слева в CMD+hover превью заметки."
+                />
+              </div>
             </>
           )}
 

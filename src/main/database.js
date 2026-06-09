@@ -322,6 +322,22 @@ class DatabaseManager {
     // See docs/knowledge/fix-bridge-stale-takeover.md.
     try { this.db.exec(`ALTER TABLE tabs ADD COLUMN claude_session_history TEXT DEFAULT NULL`); } catch (e) {}
 
+    // Migration: context_pct — last-known context-window fill % for this tab.
+    // Persisted so the control-bar meter can show the value even when no Claude
+    // process is running (CLI exited / not launched yet). Written point-wise via
+    // updateTabContextPct (cheap single-column UPDATE, like provider_state) and
+    // preserved across full-reinsert saveTabs by a snapshot (never wiped to NULL
+    // just because the renderer's saveTabs payload doesn't carry it).
+    try { this.db.exec(`ALTER TABLE tabs ADD COLUMN context_pct REAL DEFAULT NULL`); } catch (e) {}
+
+    // Migration: cache_stats — last-known prompt-cache split for the control-bar
+    // cooldown chip, stored as JSON {cacheRead,cacheCreate,input,ts}. ts is a
+    // wall-clock anchor (server cache TTL is wall-clock), so a persisted value
+    // still yields an accurate "cools down in N min" countdown after a tab switch
+    // or app restart. Same point-wise write + snapshot-preserve pattern as
+    // context_pct / provider_state.
+    try { this.db.exec(`ALTER TABLE tabs ADD COLUMN cache_stats TEXT DEFAULT NULL`); } catch (e) {}
+
     // Index on tab_id for faster lookups in saveTabs
     try { this.db.exec(`CREATE INDEX IF NOT EXISTS idx_tabs_tab_id ON tabs(tab_id) WHERE tab_id IS NOT NULL`); } catch (e) {}
 
@@ -562,6 +578,12 @@ class DatabaseManager {
         mcpTaskId: t.mcp_task_id || undefined,
         claudeTaskCount: t.claude_task_count || 0,
         sessionStatus: t.session_status || undefined,
+        contextPct: (t.context_pct ?? undefined),
+        cacheStats: (() => {
+          if (!t.cache_stats) return undefined;
+          try { return JSON.parse(t.cache_stats); }
+          catch { return undefined; }
+        })(),
         providerState: (() => {
           if (!t.provider_state) return undefined;
           try { return JSON.parse(t.provider_state); }
@@ -569,6 +591,57 @@ class DatabaseManager {
         })()
       }))
     };
+  }
+
+  // Point-wise context% write (no renderer round-trip, no full-reinsert).
+  // Called many times across a session as the bridge / SDK reports new fill;
+  // single-column UPDATE keeps it cheap. NULL-guard: only writes a real number.
+  updateTabContextPct(tabId, pct) {
+    if (!tabId || typeof pct !== 'number' || !isFinite(pct)) return;
+    try {
+      this.db.prepare('UPDATE tabs SET context_pct = ? WHERE tab_id = ?').run(pct, tabId);
+    } catch (e) {
+      console.error('[DB] updateTabContextPct error:', e.message);
+    }
+  }
+
+  // Read one tab's last-known context%. Used by the control-bar to seed the
+  // meter on mount, so a tab with no live process still shows its last fill.
+  getTabContextPct(tabId) {
+    if (!tabId) return null;
+    try {
+      const row = this.db.prepare('SELECT context_pct FROM tabs WHERE tab_id = ?').get(tabId);
+      return row && row.context_pct != null ? row.context_pct : null;
+    } catch (e) {
+      console.error('[DB] getTabContextPct error:', e.message);
+      return null;
+    }
+  }
+
+  // Point-wise cache-stats write for the control-bar cooldown chip. Stores the
+  // {cacheRead,cacheCreate,input,ts} JSON for one tab. Called once per turn
+  // (message_start), so a single-row UPDATE is cheap. NULL-guard: skip non-objects.
+  updateTabCacheStats(tabId, stats) {
+    if (!tabId || !stats || typeof stats !== 'object') return;
+    try {
+      this.db.prepare('UPDATE tabs SET cache_stats = ? WHERE tab_id = ?').run(JSON.stringify(stats), tabId);
+    } catch (e) {
+      console.error('[DB] updateTabCacheStats error:', e.message);
+    }
+  }
+
+  // Read one tab's last-known cache split. Used by the control-bar to seed the
+  // cooldown chip on mount so it survives tab switches / restart.
+  getTabCacheStats(tabId) {
+    if (!tabId) return null;
+    try {
+      const row = this.db.prepare('SELECT cache_stats FROM tabs WHERE tab_id = ?').get(tabId);
+      if (!row || row.cache_stats == null) return null;
+      try { return JSON.parse(row.cache_stats); } catch { return null; }
+    } catch (e) {
+      console.error('[DB] getTabCacheStats error:', e.message);
+      return null;
+    }
   }
 
   // Direct one-tab update used by main.js's provider:switch / provider:set-options
@@ -734,10 +807,31 @@ class DatabaseManager {
       for (const r of rows) interruptedSnapshot.set(r.tab_id, r.was_interrupted === 1);
     }
 
+    // Snapshot context_pct BEFORE the delete+reinsert. The renderer's saveTabs
+    // payload does NOT carry contextPct (it's written point-wise via
+    // updateTabContextPct), so a full reinsert triggered by an unrelated change
+    // (rename, colour, notes) would otherwise reset the column to NULL and wipe
+    // the last-known meter value. We re-apply the snapshot when the incoming tab
+    // carries no contextPct of its own. Same never-downgrade idea as interrupted.
+    const contextPctSnapshot = new Map();
+    {
+      const rows = this.db.prepare('SELECT tab_id, context_pct FROM tabs WHERE project_id = ? AND tab_id IS NOT NULL').all(projectId);
+      for (const r of rows) contextPctSnapshot.set(r.tab_id, r.context_pct);
+    }
+
+    // Same snapshot-preserve as context_pct: the renderer's saveTabs payload does
+    // not carry cacheStats (written point-wise via updateTabCacheStats), so a full
+    // reinsert from an unrelated change must not wipe the cooldown chip's data.
+    const cacheStatsSnapshot = new Map();
+    {
+      const rows = this.db.prepare('SELECT tab_id, cache_stats FROM tabs WHERE project_id = ? AND tab_id IS NOT NULL').all(projectId);
+      for (const r of rows) cacheStatsSnapshot.set(r.tab_id, r.cache_stats);
+    }
+
     const deleteByTabId = this.db.prepare('DELETE FROM tabs WHERE project_id = ? AND tab_id = ?');
     const insert = this.db.prepare(`
-      INSERT INTO tabs (project_id, name, cwd, position, color, is_utility, command_type, claude_session_id, gemini_session_id, was_interrupted, overlay_dismissed, notes, tab_type, url, terminal_id, terminal_name, active_view, created_at, is_collapsed, parent_tab_id, tab_id, mcp_task_started_at, mcp_task_id, claude_task_count, session_status, claude_session_history, provider_state)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO tabs (project_id, name, cwd, position, color, is_utility, command_type, claude_session_id, gemini_session_id, was_interrupted, overlay_dismissed, notes, tab_type, url, terminal_id, terminal_name, active_view, created_at, is_collapsed, parent_tab_id, tab_id, mcp_task_started_at, mcp_task_id, claude_task_count, session_status, claude_session_history, provider_state, context_pct, cache_stats)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     const transaction = this.db.transaction((tabList) => {
@@ -768,7 +862,18 @@ class DatabaseManager {
         const interruptedFlag = (interruptedSnapshot && interruptedSnapshot.get(tab.tabId))
           ? 1
           : (tab.wasInterrupted ? 1 : 0);
-        insert.run(projectId, tab.name, tab.cwd, index, tab.color || null, tab.isUtility ? 1 : 0, tab.commandType || null, tab.claudeSessionId || null, tab.geminiSessionId || null, interruptedFlag, tab.overlayDismissed ? 1 : 0, tab.notes || '', tab.tabType || 'terminal', tab.url || null, tab.terminalId || null, tab.terminalName || null, tab.activeView || null, tab.createdAt || null, tab.isCollapsed ? 1 : 0, tab.parentTabId || null, tab.tabId || null, tab.mcpTaskStartedAt || null, tab.mcpTaskId || null, tab.claudeTaskCount || 0, tab.sessionStatus || null, historyJson, providerStateJson);
+        // context_pct: prefer an incoming value (rare — payload usually omits it),
+        // else re-apply the pre-delete snapshot so a full-reinsert never wipes it.
+        const ctxPct = (typeof tab.contextPct === 'number' && isFinite(tab.contextPct))
+          ? tab.contextPct
+          : (contextPctSnapshot.has(tab.tabId) ? contextPctSnapshot.get(tab.tabId) : null);
+        // cache_stats: prefer an incoming object (rare — payload omits it), else
+        // re-apply the pre-delete snapshot (already a JSON string or null) so a
+        // full reinsert never wipes the cooldown chip's last-known split.
+        const cacheStatsJson = (tab.cacheStats && typeof tab.cacheStats === 'object')
+          ? JSON.stringify(tab.cacheStats)
+          : (cacheStatsSnapshot.has(tab.tabId) ? cacheStatsSnapshot.get(tab.tabId) : null);
+        insert.run(projectId, tab.name, tab.cwd, index, tab.color || null, tab.isUtility ? 1 : 0, tab.commandType || null, tab.claudeSessionId || null, tab.geminiSessionId || null, interruptedFlag, tab.overlayDismissed ? 1 : 0, tab.notes || '', tab.tabType || 'terminal', tab.url || null, tab.terminalId || null, tab.terminalName || null, tab.activeView || null, tab.createdAt || null, tab.isCollapsed ? 1 : 0, tab.parentTabId || null, tab.tabId || null, tab.mcpTaskStartedAt || null, tab.mcpTaskId || null, tab.claudeTaskCount || 0, tab.sessionStatus || null, historyJson, providerStateJson, ctxPct, cacheStatsJson);
       });
 
       // Step 4: Clean up tabs that exist in DB but NOT in the new set
