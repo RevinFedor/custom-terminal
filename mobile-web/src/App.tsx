@@ -1,15 +1,28 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import ReactMarkdown from 'react-markdown';
-import remarkGfm from 'remark-gfm';
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ClipboardEvent as ReactClipboardEvent, type ReactNode } from 'react';
 import { HashRouter, Navigate, Route, Routes, useNavigate, useParams } from 'react-router-dom';
+// Shared conversation blocks (same source as the desktop SDK tab). Mobile now
+// renders tool cards / bash / diff / thinking / markdown through this package
+// instead of its own divergent components — single visual canon. Collapse
+// persistence (useEntryExpanded) is injected via open/onToggle. See
+// packages/claude-blocks.
+import {
+  Markdown as CBMarkdown,
+  ThinkBlock as CBThinkBlock,
+  ToolCallPart as CBToolCallPart,
+  ChatMessage as CBChatMessage,
+  defaultOpenForTool,
+  type ChatEntry as CBChatEntry,
+  type CollapseController as CBCollapseController,
+  type ChatRenderContext as CBChatRenderContext,
+} from '@noted/claude-blocks';
 import { Virtualizer, type VirtualizerHandle } from 'virtua';
 // localStorage cache (cache.ts) replaced by IndexedDB record store (idb.ts) —
 // see fact-mobile-web.md::IDB record store. The cache module is kept on disk
 // for now in case rollback is needed, but no longer imported.
-import { Api, bootstrapToken, clearToken, getToken, setToken, eventsUrl, type ProjectInfo, type TabInfo, type TimelineEntry } from './api';
+import { Api, bootstrapToken, clearToken, getToken, setToken, eventsUrl, type ProjectInfo, type TabInfo, type TimelineEntry, type StatusMarkerCfg, type ProcessBarCfg, type QueueData, type QueueCore, type QueueAiTab, type QueueOp, type PendingQuestion, type MobileQuestion } from './api';
 import { createMessageReducer, type UiEntry } from './messages';
 import { streamHistory, type StreamMeta } from './streamHistory';
-import { readCachedHistory, writeFullHistory, dropSession } from './idb';
+import { readCachedHistory, writeFullHistory, dropSession, readKv, writeKv } from './idb';
 import { DictationSession } from './dictation';
 
 // HashRouter (URL fragment) instead of BrowserRouter so reload from any view
@@ -59,25 +72,54 @@ function ProjectsRoute() {
   );
 }
 
+type ProjectData = { project: { id: string; name: string; path: string }; tabs: TabInfo[]; statusMarker?: StatusMarkerCfg; processBar?: ProcessBarCfg };
+
 function ProjectRoute() {
   const { projectId } = useParams();
   const navigate = useNavigate();
-  const [data, setData] = useState<{ project: { id: string; name: string; path: string }; tabs: TabInfo[] } | null>(null);
+  const [data, setData] = useState<ProjectData | null>(null);
+  // `revalidating` = a background listTabs is in flight while we already show
+  // cached tabs. Drives the inline loader next to the project title — the tabs
+  // stay visible & tappable the whole time (no full-screen "Loading…" wall).
+  const [revalidating, setRevalidating] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // STALE: paint cached tabs immediately so the project opens instantly. The
+  // network refresh below overwrites once it lands. Cache key is per-project.
+  useEffect(() => {
+    if (!projectId) return;
+    let cancelled = false;
+    readKv<ProjectData>(`tabs:${projectId}`).then((hit) => {
+      // Only apply the cache if we haven't already got fresh network data.
+      if (!cancelled && hit?.payload?.tabs) {
+        setData((cur) => cur ?? hit.payload);
+      }
+    });
+    return () => { cancelled = true; };
+  }, [projectId]);
+
+  // REVALIDATE: background fetch. On success → update UI + persist snapshot.
+  // Error only surfaces as a full-screen failure when we have NOTHING cached
+  // to show; otherwise we keep the stale tabs and silently drop the error.
   const refresh = useCallback(async () => {
     if (!projectId) return;
+    setRevalidating(true);
     try {
       const list = await Api.listTabs(projectId);
-      setData({ project: list.project, tabs: list.tabs });
+      const next: ProjectData = { project: list.project, tabs: list.tabs, statusMarker: list.statusMarker, processBar: list.processBar };
+      setData(next);
+      setError(null);
+      writeKv(`tabs:${projectId}`, next); // fire-and-forget persist
     } catch (e: any) {
-      setError(e?.message || 'failed to load project');
+      setData((cur) => { if (!cur) setError(e?.message || 'failed to load project'); return cur; });
+    } finally {
+      setRevalidating(false);
     }
   }, [projectId]);
 
   useEffect(() => { refresh(); }, [refresh]);
 
-  if (error) return (
+  if (error && !data) return (
     <div style={S.page}>
       <div style={{ padding: 20, color: '#f38ba8' }}>
         Failed: {error}
@@ -87,12 +129,16 @@ function ProjectRoute() {
       </div>
     </div>
   );
+  // Only the very first cold open (no cache, no network yet) shows the wall.
   if (!data) return <div style={S.page}><div style={{ padding: 20, color: '#888' }}>Loading…</div></div>;
 
   return (
     <ProjectView
       project={data.project}
       tabs={data.tabs}
+      statusMarker={data.statusMarker}
+      processBar={data.processBar}
+      revalidating={revalidating}
       onBack={() => navigate('/projects')}
       onOpenChat={(tab, opts) => {
         const ro = opts?.readOnly ? '?ro=1' : '';
@@ -118,18 +164,29 @@ function ChatRoute() {
   const ro = new URLSearchParams(window.location.hash.split('?')[1] || '').get('ro') === '1';
 
   useEffect(() => {
-    // Reload-fallback: if we landed here via a deep-link (no state.tab), pull
-    // tabs from the server and pick the matching one. Once we have it, render.
+    // Reload-fallback: if we landed here via a deep-link (no state.tab), resolve
+    // the tab. First try the SWR cache (instant — "сразу быстро зайти в чат"),
+    // then confirm/refresh from the server. ChatView's own history cache then
+    // paints the conversation. If the tab is genuinely gone, surface the error.
     if (tab || !projectId || !tabId) return;
     let cancelled = false;
+
+    // STALE: cached tab snapshot → render immediately if the tab is there.
+    readKv<ProjectData>(`tabs:${projectId}`).then((hit) => {
+      if (cancelled || tab) return;
+      const cached = hit?.payload?.tabs?.find((t) => t.tabId === tabId);
+      if (cached) setTab((cur) => cur ?? cached);
+    });
+
+    // REVALIDATE: authoritative lookup. Overwrites/clears as needed.
     Api.listTabs(projectId)
       .then((d) => {
         if (cancelled) return;
         const found = (d.tabs || []).find((t) => t.tabId === tabId);
-        if (found) setTab(found);
-        else setError('Tab not found in project. It may have been closed.');
+        if (found) { setTab(found); writeKv(`tabs:${projectId}`, d); }
+        else setTab((cur) => { if (!cur) setError('Tab not found in project. It may have been closed.'); return cur; });
       })
-      .catch((e) => { if (!cancelled) setError(e?.message || 'failed to load tab'); });
+      .catch((e) => { if (!cancelled) setTab((cur) => { if (!cur) setError(e?.message || 'failed to load tab'); return cur; }); });
     return () => { cancelled = true; };
   }, [projectId, tabId, tab]);
 
@@ -378,75 +435,102 @@ function RenameDialog({ initial, onSubmit, onDismiss }: {
 }
 
 // ────────── Tab rows ──────────
-function SDKTabRow({ tab, onTap, onLongPress }: { tab: TabInfo; onTap: () => void; onLongPress: () => void }) {
-  const lp = useLongPress(onLongPress);
-  const live = !!tab.live;
+
+// Desktop TabColor → background tint. MIRRORS the desktop TAB_COLORS table +
+// the SDK-claude override (TabBar.tsx) so the mobile list looks exactly like the
+// desktop vertical tab list. Rows use the INACTIVE vertical background (base
+// bgColor for coloured tabs, faint white for default) and have NO border — on
+// desktop the border is only an active/selected indicator, inactive tabs are
+// borderless. accent is the tab's brand colour (used only for the long-press fill).
+const TAB_COLOR_BG: Record<string, { bg: string; accent: string }> = {
+  default: { bg: 'rgba(255,255,255,0.04)', accent: '#888' },
+  red:     { bg: 'rgba(239, 68, 68, 0.2)',  accent: 'rgb(239, 68, 68)' },
+  yellow:  { bg: 'rgba(234, 179, 8, 0.2)',  accent: 'rgb(234, 179, 8)' },
+  green:   { bg: 'rgba(34, 197, 94, 0.2)',  accent: 'rgb(34, 197, 94)' },
+  blue:    { bg: 'rgba(59, 130, 246, 0.2)', accent: 'rgb(59, 130, 246)' },
+  purple:  { bg: 'rgba(168, 85, 247, 0.2)', accent: 'rgb(168, 85, 247)' },
+  claude:  { bg: 'rgba(218, 119, 86, 0.2)', accent: '#DA7756' },
+  gemini:  { bg: 'rgba(78, 134, 248, 0.2)', accent: '#4E86F8' },
+};
+function tabRowStyle(tab: TabInfo): { bg: string; accent: string } {
+  const color = tab.color || 'default';
+  // SDK-claude override — desktop bumps alpha 0.20→0.30 so SDK reads brighter.
+  if (tab.tabType === 'claude-sdk' && color === 'claude') {
+    return { bg: 'rgba(210, 140, 90, 0.30)', accent: '#D28C5A' };
+  }
+  return TAB_COLOR_BG[color] || TAB_COLOR_BG.default;
+}
+
+// Left marker — mirrors the desktop TabBar status marker exactly: shape (dot vs
+// square) + size from the desktop statusMarker config, color from the assigned
+// category status (statusColor, resolved from the palette server-side). Renders
+// ONLY when a category is actually assigned — no category → no marker at all
+// (the desktop TabBar does the same: `sessionStatuses.find()` undefined → guard,
+// nothing drawn). The type chip already identifies the row, so the slot doesn't
+// need reserving. Runtime state (active/busy/inactive) is NOT encoded here — it
+// lives in the loader + row background per the design.
+function StatusMarker({ marker, color }: { marker: StatusMarkerCfg; color: string | null }) {
+  if (!color) return null;
   return (
-    <button
-      {...lp.handlers}
-      onClick={() => { if (!lp.didTrigger()) onTap(); }}
-      style={{
-        width: '100%', textAlign: 'left', cursor: 'pointer',
-        padding: '12px 14px', borderRadius: 12,
-        marginBottom: 8,
-        background: live
-          ? 'linear-gradient(180deg, rgba(255,178,130,0.08) 0%, rgba(255,178,130,0.03) 100%), #181210'
-          : 'linear-gradient(180deg, rgba(255,178,130,0.03) 0%, transparent 100%), #1a1715',
-        border: live ? '1px solid rgba(255,178,130,0.45)' : '1px solid rgba(255,178,130,0.18)',
-        color: 'inherit', position: 'relative', overflow: 'hidden',
-        transform: lp.state.active ? `scale(${1 - lp.state.progress * 0.04})` : undefined,
-        transition: lp.state.active ? 'none' : 'transform 0.15s',
-      }}
-    >
-      {/* Long-press progress fill */}
-      {lp.state.active && (
-        <span style={{
-          position: 'absolute', inset: 0,
-          background: `radial-gradient(circle at center, rgba(255,178,130,${lp.state.progress * 0.25}) 0%, transparent 70%)`,
-          pointerEvents: 'none',
-        }} />
-      )}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 10, position: 'relative' }}>
-        <span style={{
-          width: 9, height: 9, borderRadius: 999,
-          background: live ? '#FFB382' : '#5a5a5a',
-          boxShadow: live ? '0 0 8px rgba(255,178,130,0.7)' : 'none',
-          ...(live ? { animation: 'noted-live-pulse 1.6s ease-in-out infinite' } : {}),
-          flexShrink: 0,
-        }} />
-        <span style={{
-          fontSize: 10, color: '#FFB382', textTransform: 'uppercase', letterSpacing: 0.5,
-          background: 'rgba(255,178,130,0.12)', padding: '2px 6px', borderRadius: 4, fontWeight: 600,
-        }}>SDK</span>
-        <span style={{ flex: 1, fontSize: 14, color: '#f0e8e0', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-          {tab.name}
-        </span>
-        {live && <span style={{ fontSize: 10, color: '#FFB382' }}>live</span>}
-        {typeof tab.timelineCount === 'number' && tab.timelineCount > 0 && (
-          <span style={{
-            fontSize: 11, color: '#a6e3a1',
-            background: 'rgba(166,227,161,0.10)',
-            padding: '2px 7px', borderRadius: 999,
-            fontWeight: 500, fontVariantNumeric: 'tabular-nums',
-          }}>
-            {tab.timelineCount}
-          </span>
-        )}
-      </div>
-      <div style={{ fontSize: 11, color: '#776a60', marginTop: 4, position: 'relative' }}>
-        {tab.claudeSessionId ? `${tab.claudeSessionId.slice(0, 8)}…` : 'no session yet'}
-      </div>
-    </button>
+    <span style={{
+      width: marker.sizePx, height: marker.sizePx, flexShrink: 0,
+      borderRadius: marker.shape === 'square' ? Math.max(2, Math.round(marker.sizePx / 4)) : '50%',
+      background: color,
+    }} />
   );
 }
 
-function TerminalTabRow({ tab, onTap, onLongPress }: { tab: TabInfo; onTap: () => void; onLongPress: () => void }) {
+// Process-bar STRIP — the loader. Mirrors the desktop process-bar: a thin
+// vertical strip at the left OR right edge (cfg.position), colored by the
+// processBar palette, that PULSES colorA↔colorB while the process is running.
+// A brighter shimmer band sweeps down it while the AI is actually generating
+// (busy). enabled:false → static colorA strip, no pulse. This is the ONLY
+// running/loader indicator on the row — no right-side dot, no whole-row tint.
+function ProcessBarStrip({ cfg, running, busy }: { cfg: ProcessBarCfg; running: boolean; busy: boolean }) {
+  if (!running) return null;
+  const side = cfg.position === 'right' ? { right: 0 } : { left: 0 };
+  const radius = cfg.position === 'right'
+    ? { borderTopRightRadius: 12, borderBottomRightRadius: 12 }
+    : { borderTopLeftRadius: 12, borderBottomLeftRadius: 12 };
+  return (
+    <span
+      aria-hidden
+      style={{
+        position: 'absolute', top: 0, bottom: 0, width: 3, ...side, ...radius,
+        // Pulse colorA↔colorB (background-color delta = codec-safe, like desktop).
+        // enabled:false → static colorA. CSS var drive keeps it cheap.
+        backgroundColor: cfg.colorA,
+        ...(cfg.enabled
+          ? {
+              ['--mob-pbar-a' as any]: cfg.colorA,
+              ['--mob-pbar-b' as any]: cfg.colorB,
+              animation: `mob-pbar-pulse ${cfg.durationMs}ms ease-in-out infinite`,
+            }
+          : {}),
+        pointerEvents: 'none', overflow: 'hidden',
+      }}
+    >
+      {/* AI-busy shimmer band sweeping down the strip — the "loader is working"
+          cue, same metaphor as desktop tab-process-bar-ai-shimmer-overlay. */}
+      {busy && <span className="mob-pbar-shimmer" />}
+    </span>
+  );
+}
+
+function TabRow({ tab, marker, processBar, onTap, onLongPress }: { tab: TabInfo; marker: StatusMarkerCfg; processBar: ProcessBarCfg; onTap: () => void; onLongPress: () => void }) {
   const lp = useLongPress(onLongPress);
-  const isClaude = tab.commandType === 'claude' || !!tab.claudeSessionId;
-  const isGemini = tab.commandType === 'gemini' || !!(tab as any).geminiSessionId;
-  const isDev = tab.commandType === 'devServer';
-  const accentColor = isClaude ? '#DA7756' : isGemini ? '#88c0d0' : isDev ? '#a6e3a1' : '#888';
-  const labelText = isClaude ? 'CLAUDE' : isGemini ? 'GEMINI' : isDev ? 'DEV' : 'TERMINAL';
+  const rowStyle = tabRowStyle(tab);
+  // Runtime "is this process working right now": SDK uses the live session
+  // presence; PTY+Claude uses the sessionStatus lifecycle string. running →
+  // process-bar strip appears (pulsing); busy → shimmer sweeps the strip.
+  const live = !!tab.live;
+  const busy = tab.sessionStatus === 'busy';
+  const running = busy || live || tab.sessionStatus === 'active';
+  // Marker color: ONLY the assigned-category color. No category → null → marker
+  // renders nothing (no muted fallback dot — user explicitly didn't want it).
+  const markerColor = tab.statusColor || null;
+  // Reserve horizontal room for the strip on its side so text never sits under it.
+  const stripPad = processBar.position === 'right' ? { paddingRight: 17 } : { paddingLeft: 17 };
 
   return (
     <button
@@ -454,35 +538,44 @@ function TerminalTabRow({ tab, onTap, onLongPress }: { tab: TabInfo; onTap: () =
       onClick={() => { if (!lp.didTrigger()) onTap(); }}
       style={{
         width: '100%', textAlign: 'left', cursor: 'pointer',
-        padding: '12px 14px', borderRadius: 12,
-        marginBottom: 8,
-        background: '#141414',
-        border: '1px solid #232323',
+        padding: '11px 14px', ...stripPad, borderRadius: 8,
+        marginBottom: 4,
+        // Desktop tab background (tab.color tint). NO border — inactive desktop
+        // vertical tabs are borderless; the border was a per-type artifact.
+        // border/appearance reset KILLS the native 2px `outset` button frame the
+        // UA draws otherwise — outset renders light-grey on top+left, which read
+        // as a "серая рамка слева вверху" on the dark tab bg. Desktop has none.
+        border: 'none', appearance: 'none', WebkitAppearance: 'none',
+        background: rowStyle.bg,
         color: 'inherit', position: 'relative', overflow: 'hidden',
         transform: lp.state.active ? `scale(${1 - lp.state.progress * 0.04})` : undefined,
         transition: lp.state.active ? 'none' : 'transform 0.15s',
       }}
     >
+      {/* Loader = process-bar strip at the configured edge. No whole-row tint. */}
+      <ProcessBarStrip cfg={processBar} running={running} busy={busy} />
+      {/* Awaiting-answer = rotating purple border (copied 1:1 from desktop
+          .tab-awaiting-input — conic-gradient traveling segment masked to a ring).
+          Claude is blocked on an AskUserQuestion in this tab. inset:0 over the
+          row, radius matches the button (8px). pointer-events:none. */}
+      {tab.awaiting && (
+        <span className="mob-awaiting-ring" aria-hidden style={{
+          position: 'absolute', inset: 0, borderRadius: 8, zIndex: 2,
+        }} />
+      )}
+      {/* Long-press progress fill — tinted to the tab accent. */}
       {lp.state.active && (
         <span style={{
           position: 'absolute', inset: 0,
-          background: `radial-gradient(circle at center, rgba(255,255,255,${lp.state.progress * 0.08}) 0%, transparent 70%)`,
+          background: `radial-gradient(circle at center, ${rowStyle.accent}22 0%, transparent 70%)`,
           pointerEvents: 'none',
         }} />
       )}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 10, position: 'relative' }}>
-        <span style={{
-          width: 9, height: 9, borderRadius: 999, flexShrink: 0,
-          background: tab.sessionStatus === 'active' ? '#a6e3a1' :
-                      tab.sessionStatus === 'busy' ? '#d97706' :
-                      tab.sessionStatus === 'inactive' ? '#555' : accentColor,
-          opacity: 0.85,
-        }} />
-        <span style={{
-          fontSize: 10, color: accentColor, textTransform: 'uppercase', letterSpacing: 0.5,
-          background: `${accentColor}1f`, padding: '2px 6px', borderRadius: 4, fontWeight: 600,
-        }}>{labelText}</span>
-        <span style={{ flex: 1, fontSize: 14, color: '#cccccc', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 9, position: 'relative' }}>
+        {/* Left: category status marker (shape+color mirror desktop). No type chip. */}
+        <StatusMarker marker={marker} color={markerColor} />
+        {/* Tab name — same string as desktop, no chip prefix. */}
+        <span style={{ flex: 1, fontSize: 14, color: '#e8e4de', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
           {tab.name}
         </span>
         {typeof tab.timelineCount === 'number' && tab.timelineCount > 0 && (
@@ -495,18 +588,6 @@ function TerminalTabRow({ tab, onTap, onLongPress }: { tab: TabInfo; onTap: () =
             {tab.timelineCount}
           </span>
         )}
-      </div>
-      <div style={{ fontSize: 11, color: '#555', marginTop: 4, position: 'relative', display: 'flex', alignItems: 'center', gap: 8 }}>
-        {tab.sessionStatus && (
-          <span style={{
-            color: tab.sessionStatus === 'active' ? '#a6e3a1' :
-                   tab.sessionStatus === 'busy' ? '#d97706' : '#777',
-            fontWeight: 500, fontSize: 10, textTransform: 'uppercase', letterSpacing: 0.4,
-          }}>
-            {tab.sessionStatus}
-          </span>
-        )}
-        <span>{tab.claudeSessionId ? `${tab.claudeSessionId.slice(0, 8)}…` : (tab.cwd ? tab.cwd.split('/').slice(-2).join('/') : 'tap to view')}</span>
       </div>
     </button>
   );
@@ -570,14 +651,25 @@ function ProjectsView({ onPick, onLogout }: { onPick: (p: ProjectInfo) => void; 
   const [projects, setProjects] = useState<ProjectInfo[] | null>(null);
   const [error, setError] = useState('');
 
-  // Refresh every 4s while view is mounted so live SDK / open-state stays
-  // current without the user having to pull-to-refresh.
+  // STALE: paint the last cached project list immediately so returning to this
+  // screen is instant (no "Loading projects…" wall). Network refresh overwrites.
+  useEffect(() => {
+    let cancelled = false;
+    readKv<ProjectInfo[]>('projects').then((hit) => {
+      if (!cancelled && Array.isArray(hit?.payload)) setProjects((cur) => cur ?? hit!.payload);
+    });
+    return () => { cancelled = true; };
+  }, []);
+
+  // REVALIDATE: refresh every 4s while view is mounted so live SDK / open-state
+  // stays current without the user having to pull-to-refresh. Each fresh result
+  // is persisted as the SWR snapshot for the next cold open / back-navigation.
   useEffect(() => {
     let cancelled = false;
     let t: number;
     const load = () => {
       Api.listProjects()
-        .then((d) => { if (!cancelled) setProjects(d.projects); })
+        .then((d) => { if (!cancelled) { setProjects(d.projects); writeKv('projects', d.projects); } })
         .catch((e) => { if (!cancelled) setError(e.message); });
     };
     load();
@@ -619,7 +711,9 @@ function ProjectsView({ onPick, onLogout }: { onPick: (p: ProjectInfo) => void; 
         }
       />
       <div style={{ flex: 1, overflowY: 'auto', padding: '12px 12px 32px' }}>
-        {error && <div style={{ padding: 16, color: '#f38ba8' }}>Error: {error}</div>}
+        {/* Error only when we have NOTHING cached to show — otherwise keep the
+            stale list visible and let the next 4s poll recover silently. */}
+        {error && !projects && <div style={{ padding: 16, color: '#f38ba8' }}>Error: {error}</div>}
         {!projects && !error && (
           <div style={{ padding: 32, color: '#666', fontSize: 13, textAlign: 'center' }}>Loading projects…</div>
         )}
@@ -683,8 +777,13 @@ function ProjectCard({ project, prominent, onClick }: { project: ProjectInfo; pr
         padding: '10px 12px', borderRadius: 10,
         background: '#0f0f0f', border: '1px solid #181818',
         display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10,
-        color: 'inherit',
+        color: 'inherit', position: 'relative', overflow: 'hidden',
       }}>
+        {project.hasAwaiting && (
+          <span className="mob-awaiting-ring" aria-hidden style={{
+            position: 'absolute', inset: 0, borderRadius: 10, zIndex: 2,
+          }} />
+        )}
         <div style={{ minWidth: 0, flex: 1 }}>
           <div style={{ fontSize: 13, color: '#cccccc', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
             {project.name}
@@ -707,8 +806,15 @@ function ProjectCard({ project, prominent, onClick }: { project: ProjectInfo; pr
       background: hasLive ? 'linear-gradient(180deg, rgba(255,178,130,0.06) 0%, #131313 100%)' : '#141414',
       border: hasLive ? '1px solid rgba(255,178,130,0.35)' : '1px solid #232323',
       boxShadow: hasLive ? '0 0 0 1px rgba(255,178,130,0.08), 0 8px 24px -16px rgba(255,178,130,0.4)' : 'none',
-      color: 'inherit', position: 'relative',
+      color: 'inherit', position: 'relative', overflow: 'hidden',
     }}>
+      {/* Rotating purple ring — a claude tab in this project is awaiting an
+          AskUserQuestion answer. Same conic-gradient traveling-border as desktop. */}
+      {project.hasAwaiting && (
+        <span className="mob-awaiting-ring" aria-hidden style={{
+          position: 'absolute', inset: 0, borderRadius: 14, zIndex: 2,
+        }} />
+      )}
       <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
         <span style={{
           width: 9, height: 9, borderRadius: 999,
@@ -747,20 +853,28 @@ function ProjectCard({ project, prominent, onClick }: { project: ProjectInfo; pr
 function ProjectView(props: {
   project: { id: string; name: string; path: string };
   tabs: TabInfo[];
+  statusMarker?: StatusMarkerCfg;
+  processBar?: ProcessBarCfg;
+  revalidating?: boolean;
   onBack: () => void;
   onOpenChat: (t: TabInfo, opts?: { readOnly?: boolean }) => void;
   onCreated: () => void;
 }) {
-  const { project, tabs, onBack, onOpenChat, onCreated } = props;
+  const { project, tabs, statusMarker, processBar, revalidating, onBack, onOpenChat, onCreated } = props;
+  // Mirror desktop default (dot/8px) when the server predates statusMarker.
+  const marker: StatusMarkerCfg = statusMarker || { shape: 'dot', sizePx: 8 };
+  // Mirror desktop default process-bar (cyan, left) when server predates it.
+  const procBar: ProcessBarCfg = processBar || { enabled: true, colorA: '#155E75', colorB: '#0E7490', durationMs: 2400, position: 'left' };
   const [creating, setCreating] = useState(false);
   const [actionTarget, setActionTarget] = useState<{ tab: TabInfo; kind: 'sdk' | 'terminal' } | null>(null);
   const [renameTarget, setRenameTarget] = useState<TabInfo | null>(null);
 
-  const sdkTabs = tabs.filter((t) => t.tabType === 'claude-sdk' && t.tabId);
-  // PTY tabs running Claude CLI — mobile can open them as a chat just like SDK tabs.
-  const claudeTabs = tabs.filter((t) => t.tabType !== 'claude-sdk' && t.commandType === 'claude' && t.tabId);
-  // Plain shell / Gemini / other PTY tabs — still read-only on mobile.
-  const otherTabs = tabs.filter((t) => t.tabType !== 'claude-sdk' && t.commandType !== 'claude' && t.tabId);
+  // ONE flat list in DESKTOP ORDER (server returns tabs ORDER BY position) — no
+  // grouping by type, no section headers. Whether a tab opens interactive (SDK /
+  // Claude chat) or read-only (plain shell / Gemini / other PTY) is a per-tab
+  // predicate, NOT a layout split — it only changes the onTap target + kind.
+  const visibleTabs = tabs.filter((t) => t.tabId);
+  const isInteractive = (t: TabInfo) => t.tabType === 'claude-sdk' || t.commandType === 'claude';
 
   const create = async () => {
     setCreating(true);
@@ -858,6 +972,7 @@ function ProjectView(props: {
         title={project.name}
         left={<button className="noted-icon" style={S.iconBtn} onClick={onBack}>←</button>}
         subtitle={project.path}
+        right={revalidating ? <InlineSpinner color="#666" size={12} /> : undefined}
       />
       <div style={{ padding: 12, display: 'flex', flexDirection: 'column', gap: 8 }}>
         <button onClick={create} disabled={creating} style={S.primaryBtn}>
@@ -868,41 +983,22 @@ function ProjectView(props: {
         </button>
       </div>
       <div style={{ flex: 1, overflowY: 'auto', padding: '4px 12px 32px' }}>
-        <SectionHeader>SDK tabs</SectionHeader>
-        {sdkTabs.length === 0 && <Empty>No SDK chats yet — tap «+ New SDK chat» above. Long-press other tabs to fork into SDK.</Empty>}
-        {sdkTabs.map((t) => (
-          <SDKTabRow
-            key={t.tabId}
-            tab={t}
-            onTap={() => onOpenChat(t)}
-            onLongPress={() => setActionTarget({ tab: t, kind: 'sdk' })}
-          />
-        ))}
-
-        {claudeTabs.length > 0 && (
-          <>
-            <SectionHeader>Claude terminals</SectionHeader>
-            {claudeTabs.map((t) => (
-              <TerminalTabRow
-                key={t.tabId}
-                tab={t}
-                onTap={() => onOpenChat(t)}
-                onLongPress={() => setActionTarget({ tab: t, kind: 'terminal' })}
-              />
-            ))}
-          </>
-        )}
-
-        <SectionHeader>Terminal tabs</SectionHeader>
-        {otherTabs.length === 0 && <Empty>None in this project.</Empty>}
-        {otherTabs.map((t) => (
-          <TerminalTabRow
-            key={t.tabId}
-            tab={t}
-            onTap={() => onOpenChat(t, { readOnly: true })}
-            onLongPress={() => setActionTarget({ tab: t, kind: 'terminal' })}
-          />
-        ))}
+        {visibleTabs.length === 0 && <Empty>No tabs in this project yet.</Empty>}
+        {/* Flat list, desktop order. SDK + Claude open interactive; everything
+            else opens read-only. No section headers, no per-type grouping. */}
+        {visibleTabs.map((t) => {
+          const interactive = isInteractive(t);
+          return (
+            <TabRow
+              key={t.tabId}
+              tab={t}
+              marker={marker}
+              processBar={procBar}
+              onTap={() => onOpenChat(t, interactive ? undefined : { readOnly: true })}
+              onLongPress={() => setActionTarget({ tab: t, kind: t.tabType === 'claude-sdk' ? 'sdk' : 'terminal' })}
+            />
+          );
+        })}
       </div>
 
       {actionTarget && actionTarget.kind === 'sdk' && (
@@ -947,6 +1043,11 @@ function ProjectView(props: {
 
 // ────────── Chat (SDK tab) ──────────
 
+// Paste chip — long pasted text collapses into a chip instead of flooding the
+// composer. Mirror of desktop SDK (ClaudeSDKTab.tsx PasteChip + PASTE_THRESHOLD).
+type PasteChip = { id: string; text: string; preview: string };
+const PASTE_THRESHOLD = 500; // chars — above this, paste becomes a chip
+
 function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () => void; readOnly?: boolean }) {
   // For Fork-to-SDK button (terminal tabs only) — push the user into the
   // newly-created SDK tab without making them go back to project list.
@@ -987,6 +1088,10 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
   const [sessionId, setSessionId] = useState<string | undefined>(tab.claudeSessionId || tab.live?.sessionId);
   const [wsState, setWsState] = useState<'connecting' | 'open' | 'closed'>('connecting');
   const [text, setText] = useState('');
+  // Paste chips — long pasted text collapses into a chip instead of flooding
+  // the textarea (mirror of desktop SDK composer). On send each chip is wrapped
+  // in <pasted_content> so the user-bubble renderer can re-collapse it.
+  const [chips, setChips] = useState<PasteChip[]>([]);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [timelineEntries, setTimelineEntries] = useState<TimelineEntry[] | null>(null);
   const [timelineExpanded, setTimelineExpanded] = useState<Set<string>>(new Set());
@@ -998,10 +1103,29 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
   // Highlight a freshly-jumped entry by uuid for ~1.5s. Set by goToEntry, used
   // by the row renderer to apply a background-fade.
   const [flashUuid, setFlashUuid] = useState<string | null>(null);
-  // Virtuoso doesn't expose scroll-from-bottom natively — we listen via
-  // atBottomStateChange to know whether to extend the tail when WS messages
-  // arrive vs leaving the user's reading position alone.
-  const [atBottom, setAtBottom] = useState<boolean>(true);
+  // ── Follow-bottom intent (NOT a distance flag) ───────────────────────────
+  // The earlier design derived "stick to bottom" from the instantaneous
+  // distance (scrollSize − scrollOffset − viewportSize < 120). That signal is
+  // fragile under streaming: while Claude writes, the last entry grows in
+  // height *below* the viewport, so distance momentarily exceeds the threshold
+  // and a stray onScroll flips the flag false — killing auto-follow after the
+  // very first chunk, and popping the ↓ arrow even though the user never moved.
+  //
+  // Intent is a REF, not state: it represents "the user wants to stay pinned"
+  // and only the user can revoke it (a genuine upward drag = negative scroll
+  // delta). Content growth never produces a negative delta on the tail entry,
+  // so streaming can't disarm it. Re-armed automatically when the user scrolls
+  // back to within REARM_PX of the bottom. See fix-mobile-scroll-teleport.md /
+  // fix-virtuoso-to-virtua-migration.md for the history of this surface.
+  const followBottomRef = useRef(true);
+  // True while WE are programmatically scrolling (pinToBottom) so the onScroll
+  // it triggers isn't misread as user input and doesn't disarm the intent.
+  const programmaticScrollRef = useRef(false);
+  // Last offset seen by the outer onScroll — to compute direction (delta).
+  const lastFollowOffsetRef = useRef<number | null>(null);
+  // FAB visibility. Hidden whenever we're following (intent true) OR at the
+  // exact bottom. Shown only when the user has deliberately scrolled up to read.
+  const [atTrueBottom, setAtTrueBottom] = useState<boolean>(true);
   // For PTY+Claude tabs only: lifecycle of the Claude CLI process inside the PTY.
   // null = SDK tab (status concept doesn't apply). Polled on mount + after every
   // /resume + after /stop. WS snapshot also updates it on connect.
@@ -1012,17 +1136,130 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
   const [stopping, setStopping] = useState(false);
   const isClaudePtyTab = tab.commandType === 'claude' && tab.tabType !== 'claude-sdk';
 
-  // Poll status on mount AND every time sessionId resolves (newly created tabs
-  // get their sessionId via WS a few seconds after Claude spawns; we need to
-  // re-poll then so the "Starting Claude…" strip flips to active composer).
+  // ── Prompt Queue ("Run after") — mobile mirror ───────────────────────────
+  // We do NOT own the queue: `queue` is the live desktop core, refreshed on
+  // mount and kept in sync by the `queue-update` SSE event. Every interaction
+  // POSTs a mutation op; the desktop App-root runner fires the prompts. The
+  // panel (RunAfter menu) opens from a header icon; while open the header icon
+  // becomes a ✕ that closes both panel and editor. Only meaningful for AI tabs
+  // with a turn-end edge (PTY-Claude / SDK) — bash tabs have no queue.
+  const [queue, setQueue] = useState<QueueCore | null>(null);
+  const [queueAiTabs, setQueueAiTabs] = useState<QueueAiTab[]>([]);
+  const [queueOpen, setQueueOpen] = useState(false);
+  // PTY-claude ONLY — same gate as the desktop overlay. The runner fires queued
+  // prompts via claude:send-command, which is a PTY-TUI paste (terminals.get) and
+  // no-ops on SDK tabs; so an SDK-owned queue could never fire. SDK/gemini tabs
+  // can still be PIVOT TARGETS (valid turn-end triggers) — just not queue owners.
+  const canQueue = !readOnly && !!tab.tabId && isClaudePtyTab;
+
+  // Fetch the queue core once when the panel is first opened (and re-fetch the
+  // sibling AI-tab list, which can change). SSE keeps `queue` fresh afterward.
+  const refreshQueue = useCallback(async () => {
+    if (!tab.tabId) return;
+    try {
+      const d: QueueData = await Api.getQueue(tab.tabId);
+      setQueue(d.queue);
+      setQueueAiTabs(d.aiTabs || []);
+    } catch { /* 409 when tab not open on desktop — leave prior state */ }
+  }, [tab.tabId]);
+
+  // Apply a mutation op with optimistic echo. The POST returns the new core; we
+  // also receive a queue-update SSE shortly after (idempotent — same shape).
+  const mutateQueue = useCallback(async (body: QueueOp) => {
+    if (!tab.tabId) return;
+    try {
+      const r = await Api.queueMutate(tab.tabId, body);
+      if (r?.queue) setQueue(r.queue);
+    } catch (e: any) {
+      Api.log('Queue', 'mutate-failed', { op: (body as any).op, err: e?.message });
+    }
+  }, [tab.tabId]);
+
+  // ── AskUserQuestion (interactive question from Claude) ───────────────────
+  // When Claude asks a question, it arrives via the ask-question SSE event (and
+  // we fetch any already-pending one on mount). While set, a purple frame wraps
+  // the chat and the composer is replaced by the QuestionCard picker. Answering
+  // POSTs to /answer-question (PTY drives TUI keystrokes, SDK resolves the
+  // parked Promise); question-cancelled / the busy-reconcile clears it.
+  const [pendingQuestion, setPendingQuestion] = useState<PendingQuestion | null>(null);
+  const [answeringQuestion, setAnsweringQuestion] = useState(false);
+
+  // Fetch any already-pending question on mount (covers connecting mid-question,
+  // before the live ask-question event fires for this client).
+  useEffect(() => {
+    if (!tab.tabId) return;
+    let cancelled = false;
+    Api.pendingQuestion(tab.tabId).then((d) => {
+      if (!cancelled && d?.pendingQuestion) setPendingQuestion(d.pendingQuestion);
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, [tab.tabId]);
+
+  // Submit answers (or stop) for the active question.
+  const answerQuestion = useCallback(async (answers: Record<string, string>, stop: boolean) => {
+    if (!tab.tabId || !pendingQuestion || answeringQuestion) return;
+    setAnsweringQuestion(true);
+    try {
+      await Api.answerQuestion(tab.tabId, {
+        source: pendingQuestion.source,
+        toolUseID: pendingQuestion.toolUseID,
+        questions: pendingQuestion.questions,
+        answers,
+        stop,
+      });
+      // Optimistically clear; the question-cancelled SSE / PostToolUse will
+      // confirm. On stop, the turn ends → busy reconcile clears "thinking…".
+      setPendingQuestion(null);
+    } catch (e: any) {
+      Api.log('MobQuestion', 'answer-failed', { err: e?.message });
+      setAnsweringQuestion(false);
+    } finally {
+      // Leave answeringQuestion true until the card unmounts (cleared above on
+      // success-path setPendingQuestion(null) re-render); reset on error only.
+    }
+  }, [tab.tabId, pendingQuestion, answeringQuestion]);
+
+  // Fetch lazily on first open so closed panels cost nothing.
+  useEffect(() => {
+    if (queueOpen && canQueue && !queue) refreshQueue();
+  }, [queueOpen, canQueue, queue, refreshQueue]);
+  // Also fetch the armed-count badge eagerly (so the header icon shows [N] even
+  // before the user opens the panel) — only for AI tabs.
+  useEffect(() => {
+    if (canQueue && !queue) refreshQueue();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [canQueue]);
+
+  // ── Authoritative status reconciliation (self-healing) ───────────────────
+  // Poll claude:get-presence on mount, on sessionId change, AND every 4s while
+  // the tab is open. This is the safety net that makes the live channel
+  // *eventually consistent* with the desktop truth, no matter what:
+  //   • a busy:false / done SSE event is lost (e.g. you DECLINE an
+  //     AskUserQuestion → "Request interrupted" → the turn ends through a path
+  //     that didn't _webBroadcast busy:false → mobile latched "thinking…"),
+  //   • the SSE socket silently drops a frame,
+  //   • a bug in THIS mobile build mis-tracks busy.
+  // get-presence derives status from claudeTurnBusy (the Stop-hook pipeline —
+  // the same authoritative source the desktop loader trusts), so reconciling
+  // `busy` against it heals any desync within one poll interval. This is the
+  // "real connection back to production" — mobile never trusts its own latched
+  // busy indefinitely; the periodic authoritative read always wins.
+  // See fact-mobile-claude-pty.md::Self-healing busy reconciliation.
   useEffect(() => {
     if (!isClaudePtyTab || !tab.tabId) return;
     let cancelled = false;
     const poll = () => Api.claudeStatus(tab.tabId!).then((d) => {
-      if (!cancelled && d?.status) setClaudeStatus(d.status);
+      if (cancelled || !d?.status) return;
+      setClaudeStatus(d.status);
+      // Reconcile the loader: the authoritative status says whether a turn is
+      // actually in flight. Only force-correct on disagreement so we don't
+      // fight an in-flight optimistic update on the same frame.
+      const authoritativeBusy = d.status === 'busy';
+      setBusy((cur) => (cur !== authoritativeBusy ? authoritativeBusy : cur));
     }).catch(() => {});
     poll();
-    return () => { cancelled = true; };
+    const id = setInterval(poll, 4000);
+    return () => { cancelled = true; clearInterval(id); };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tab.tabId, isClaudePtyTab, sessionId]);
 
@@ -1537,6 +1774,60 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
     }));
   }, [entries.length]);
 
+  // Register ChatView's scroll container so collapse-toggles deep in the virtua
+  // list can re-stick to bottom (stickToggle). Re-runs when the ref attaches.
+  useEffect(() => {
+    registerScrollContainer(scrollParentRef.current);
+    return () => registerScrollContainer(null);
+  });
+
+  // Pin to the exact bottom by writing scrollTop directly on OUR scroller.
+  // Why not virtua's scrollToIndex(align:'end')? That lands a few px short or
+  // fires its final event mid-glide, so the FAB could never reliably hide and
+  // the next chunk re-measured as "not at bottom". scrollTop = scrollHeight
+  // lands at the true 0px bottom every time, no glide, no short-land. We guard
+  // it with programmaticScrollRef so the resulting onScroll is not mistaken for
+  // a user gesture (which would disarm follow intent).
+  // NOTE: declared ABOVE the streaming-follow effect that lists it in deps —
+  // a useCallback referenced in a deps array must exist before that effect runs
+  // (TDZ: "Cannot access 'pinToBottom' before initialization" otherwise).
+  const pinToBottom = useCallback(() => {
+    const el = scrollParentRef.current;
+    if (!el) return;
+    const before = el.scrollTop;
+    programmaticScrollRef.current = true;
+    el.scrollTop = el.scrollHeight;
+    lastFollowOffsetRef.current = el.scrollTop;
+    // Determinism canary: log every programmatic pin with the jump size and the
+    // resulting residual distance from bottom. If auto-follow ever "dies" again,
+    // grep [ScrollDiag] pin — absent pins during a stream = the follow effect
+    // isn't firing (intent disarmed); pins present but residual>2 = layout not
+    // settled (need an extra rAF). See fix-mobile-follow-bottom-intent.md canary.
+    const residual = el.scrollHeight - el.scrollTop - el.clientHeight;
+    scrollDiag('pin', { from: Math.round(before), to: Math.round(el.scrollTop), residual: Math.round(residual) });
+    // Release the guard after the scroll event for this write has flushed.
+    requestAnimationFrame(() => { programmaticScrollRef.current = false; });
+  }, [scrollDiag]);
+
+  // STREAMING auto-scroll: virtua has NO `followOutput`, so we re-implement it.
+  // On EVERY entries change while follow intent is armed — whether a new tail
+  // entry arrived OR the last entry's text/height grew (flushReducer('append')
+  // re-emits a fresh array each chunk) — re-pin to the exact bottom. The gate
+  // is the INTENT ref, not a distance flag: streaming-driven height growth can
+  // momentarily blow past any distance threshold and would (in the old design)
+  // permanently kill follow after the first chunk. Intent is only revoked by a
+  // real upward user drag (see the outer onScroll handler). If the user scrolled
+  // up to read, followBottomRef is false → their position is left untouched.
+  useEffect(() => {
+    if (!followBottomRef.current || entries.length === 0) return;
+    if (!didInitialScrollRef.current) return; // initial-scroll effect owns first paint
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      if (!followBottomRef.current) return; // re-check after the rAF gap
+      scrollDiag('scrollToIndex', { from: 'followOutput', index: entries.length - 1, align: 'end' });
+      pinToBottom();
+    }));
+  }, [entries, pinToBottom]);
+
   // ── Live channel via SSE (EventSource) ───────────────────────────────────
   // Was WebSocket. Switched to SSE because Yandex Browser / Chrome anti-tracker
   // extensions silently block ws:// to private LAN IPs — fetch() works but the
@@ -1606,6 +1897,24 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
               const win = (m.model || '').toLowerCase().includes('1m') ? 1_000_000 : 200_000;
               setUsedTokens(Math.round(win * m.contextPct / 100));
             }
+          } else if (m.type === 'queue-update') {
+            // Prompt-queue delta pushed by the desktop usePromptQueueWebSync hook
+            // whenever this tab's queue core changes (locally on desktop OR from
+            // another phone). Keep our mirror live without re-fetching.
+            if (m.queue) setQueue(m.queue as QueueCore);
+          } else if (m.type === 'ask-question') {
+            // Claude asked an interactive question (PTY-terminal or SDK). Show the
+            // picker; purple frame wraps the chat. source distinguishes the answer
+            // path. busy stays true (a question only exists mid-turn) — that's fine,
+            // the QuestionCard replaces the "thinking…" composer anyway.
+            Api.log('MobQuestion', 'ask', { tab: (tab.tabId || '').slice(-12), source: m.source, qs: (m.questions || []).length });
+            setPendingQuestion({ source: m.source || 'pty', toolUseID: m.toolUseID || 'pty', questions: m.questions || [] });
+          } else if (m.type === 'question-cancelled') {
+            // Question answered/aborted at the desktop, or the turn ended — drop
+            // the picker. (Answering FROM mobile also clears it locally on success.)
+            Api.log('MobQuestion', 'cancelled', { tab: (tab.tabId || '').slice(-12), source: m.source });
+            setPendingQuestion(null);
+            setAnsweringQuestion(false);
           } else if (m.type === 'busy') {
             Api.log('MobWS', 'busy', { tab: (tab.tabId || '').slice(-12), busy: !!m.busy });
             setBusy(!!m.busy);
@@ -1677,10 +1986,17 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
   // Done inline above via incoming buffer + apply loop — see streamFetch's
   // onMessage and onDone where we push to rawHistoryBufferRef.
 
+  // Pin to the exact bottom by writing scrollTop directly on OUR scroller.
   const scrollChatToBottom = useCallback(() => {
     scrollDiag('scrollToIndex', { from: 'scrollChatToBottom', index: entries.length - 1, align: 'end' });
-    virtuosoRef.current?.scrollToIndex(entries.length - 1, { align: 'end' });
-  }, [entries.length]);
+    // Tapping the FAB = "take me down AND keep me there". Re-arm follow intent
+    // and pin. The arrow hides immediately (driven by intent, asserted here),
+    // not by waiting for a distance recompute that may never land at <=2px.
+    followBottomRef.current = true;
+    setAtTrueBottom(true);
+    // Two rAFs: let any pending height change commit, then land exactly at end.
+    requestAnimationFrame(() => requestAnimationFrame(() => pinToBottom()));
+  }, [entries.length, pinToBottom]);
 
   // Track the prompt that's currently in flight + whether the assistant has
   // emitted any content for it yet. `pendingPromptRef` is set on send, cleared
@@ -1691,11 +2007,22 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
   const assistantStartedThisTurnRef = useRef<boolean>(false);
 
   const send = async () => {
-    if (!text.trim() || !tab.tabId || busy) return;
-    const prompt = text;
+    // Allow send when there's typed text OR at least one chip (a bare paste
+    // with no covering message is still a valid prompt — desktop does the same).
+    if ((!text.trim() && chips.length === 0) || !tab.tabId || busy) return;
+    // Build the full prompt: chips (wrapped in <pasted_content>) + typed text.
+    // Matches desktop onNew so the user-bubble renderer re-collapses each block.
+    const parts: string[] = [];
+    for (const c of chips) parts.push('<pasted_content>\n' + c.text + '\n</pasted_content>');
+    const typed = text.trim();
+    if (typed) parts.push(typed);
+    else if (parts.length > 0) parts.push('Analyze this content');
+    const prompt = parts.join('\n\n');
+    if (!prompt.trim()) return;
     pendingPromptRef.current = prompt;
     assistantStartedThisTurnRef.current = false;
     setText('');
+    setChips([]);
     setBusy(true);
     // Local optimistic push — instant feedback. Real JSONL record arrives via
     // WS in 100-500ms with the SAME text + a uuid, but reducer dedupes by
@@ -1717,13 +2044,17 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
 
   const stop = async () => {
     if (!tab.tabId) return;
-    // Snapshot the "did assistant produce anything" decision BEFORE we await —
-    // by the time stop completes, more chunks could have arrived.
+    // Composer Stop = SOFT interrupt of the CURRENT TURN, NOT kill the session.
+    // PTY+Claude → single Esc into the TUI (Claude stops generating, stays alive
+    // at the prompt); SDK → close the query stream (process warm). The navbar
+    // Stop ■ (onHeaderStop) is the one that KILLS the process — these are two
+    // different actions. Before this fix the composer called Api.stop → SIGTERM
+    // and the whole session died on a Stop tap. See fact-mobile-claude-pty.md.
     const earlyStop = !assistantStartedThisTurnRef.current && !!pendingPromptRef.current;
     const promptToRestore = pendingPromptRef.current;
     Api.log('MobStop', 'composer-click', { tabId: tab.tabId.slice(-12), busy, status: claudeStatus, earlyStop, isClaudePty: isClaudePtyTab });
     const t0 = performance.now();
-    try { await Api.stop(tab.tabId); Api.log('MobStop', 'reply-ok', { tabId: tab.tabId.slice(-12), elapsedMs: Math.round(performance.now() - t0) }); } catch (e: any) { Api.log('MobStop', 'reply-err', { tabId: tab.tabId.slice(-12), msg: String(e?.message || e) }); }
+    try { await Api.interrupt(tab.tabId); Api.log('MobStop', 'interrupt-ok', { tabId: tab.tabId.slice(-12), elapsedMs: Math.round(performance.now() - t0) }); } catch (e: any) { Api.log('MobStop', 'interrupt-err', { tabId: tab.tabId.slice(-12), msg: String(e?.message || e) }); }
     setBusy(false);
     Api.log('MobStop', 'after-setBusy-false', { tabId: tab.tabId.slice(-12) });
     if (earlyStop && promptToRestore) {
@@ -1871,6 +2202,42 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
               {stopping ? <><InlineSpinner color="#f87171" /><span style={{ fontSize: 11 }}>STOPPING</span></> : '■'}
             </button>
           )}
+          {canQueue && (
+            <button
+              className="noted-icon"
+              style={{
+                ...S.iconBtn,
+                width: 'auto', minWidth: 32, paddingLeft: 8, paddingRight: 8,
+                gap: 5, fontSize: 13,
+                // Armed (autoRun) → violet accent; open → neutral (it's a close ✕).
+                color: queueOpen ? '#e0e0e0' : (queue?.autoRun ? '#a78bfa' : '#888'),
+                borderColor: queueOpen ? 'rgba(255,255,255,0.18)' : (queue?.autoRun ? 'rgba(167,139,250,0.45)' : undefined),
+              }}
+              onClick={() => setQueueOpen((o) => !o)}
+              title={queueOpen ? 'Close Run-after menu' : 'Run after — queue prompts'}
+            >
+              {queueOpen ? (
+                // ✕ — collapse back into the icon (closes editor too, see panel).
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                  <line x1="6" y1="6" x2="18" y2="18" /><line x1="18" y1="6" x2="6" y2="18" />
+                </svg>
+              ) : (
+                <>
+                  {/* List/queue glyph */}
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                    <line x1="8" y1="6" x2="20" y2="6" /><line x1="8" y1="12" x2="20" y2="12" /><line x1="8" y1="18" x2="20" y2="18" />
+                    <circle cx="3.5" cy="6" r="1.3" fill="currentColor" stroke="none" /><circle cx="3.5" cy="12" r="1.3" fill="currentColor" stroke="none" /><circle cx="3.5" cy="18" r="1.3" fill="currentColor" stroke="none" />
+                  </svg>
+                  {/* Armed → violet [N] count. Plain count when items but not armed. */}
+                  {(queue?.items.length ?? 0) > 0 && (
+                    <span style={{ fontSize: 11, color: queue?.autoRun ? '#a78bfa' : '#888', fontVariantNumeric: 'tabular-nums' }}>
+                      [{queue!.items.length}]
+                    </span>
+                  )}
+                </>
+              )}
+            </button>
+          )}
           {canTimeline && (
             <button
               className="noted-icon"
@@ -1931,12 +2298,13 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
             scroll-anchoring so virtua's own jump-compensation isn't fighting
             the browser. virtua sets this internally on the viewport too, but
             we set it on the outer to be defensive.
-          - onScroll callback gives us the offset directly (no event.target
-            unwrapping). atBottom calculation: scrollSize − scrollOffset −
-            viewportSize < threshold. We drive setAtBottom from here.
-          - followOutput equivalent: useEffect on entries.length checks if
-            user was near bottom BEFORE the update and only then scrolls
-            to last index. Same UX semantics as virtuoso's auto-follow.
+          - onScroll on the outer scroller drives follow INTENT (a ref, not a
+            distance flag) + FAB visibility. Direction (delta) revokes/re-arms
+            intent; height growth never produces an upward delta so streaming
+            can't disarm it.
+          - followOutput equivalent: useEffect on `entries` re-pins to bottom
+            whenever follow intent is armed. Same UX semantics as virtuoso's
+            auto-follow, but driven by intent instead of fragile distance.
           - ScrollDiag kept: same tags as before, helps if a future regression
             happens; teleport bug needed instrumentation to diagnose, virtua
             failure modes will need the same. */}
@@ -1968,22 +2336,44 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
         {entries.length > 0 && (
           <div
             ref={scrollParentRef}
-            onScroll={() => {
-              // atBottom recompute on each DOM-scroll. virtua's onScroll on
-              // <Virtualizer> below handles delta-tagged ScrollDiag — this
-              // outer one only updates atBottom (which depends on scrollSize
-              // / viewportSize, available via the virtua handle).
-              const h = virtuosoRef.current;
-              if (!h) return;
-              const distFromBottom = h.scrollSize - h.scrollOffset - h.viewportSize;
-              const nextAtBottom = distFromBottom < 120;
-              setAtBottom((prev) => {
-                if (prev !== nextAtBottom) {
-                  scrollDiag('atBottomStateChange', { atBottom: nextAtBottom, dist: Math.round(distFromBottom) });
-                  return nextAtBottom;
+            onScroll={(e) => {
+              // Single source of truth for follow intent + FAB visibility.
+              // Read geometry straight off OUR scroller (it IS the scroll
+              // container in the virtua architecture) — no dependence on
+              // virtua's handle, which lags a frame behind the DOM.
+              const el = e.currentTarget as HTMLDivElement;
+              const offset = el.scrollTop;
+              const distFromBottom = el.scrollHeight - offset - el.clientHeight;
+              const REARM_PX = 80;   // within this of bottom → re-arm follow
+              const TRUE_PX = 2;     // sub-pixel rounding tolerance for "exact"
+
+              const prevOffset = lastFollowOffsetRef.current;
+              const delta = prevOffset == null ? 0 : offset - prevOffset;
+              lastFollowOffsetRef.current = offset;
+
+              // A programmatic pin (pinToBottom) must not be read as a gesture.
+              if (!programmaticScrollRef.current) {
+                if (delta < -4) {
+                  // Genuine upward drag → user wants to read history. Revoke
+                  // follow intent. Height growth on the tail never produces a
+                  // negative delta, so streaming can't trip this.
+                  if (followBottomRef.current) {
+                    followBottomRef.current = false;
+                    scrollDiag('followIntent', { armed: false, reason: 'user-drag-up', delta: Math.round(delta) });
+                  }
+                } else if (distFromBottom <= REARM_PX) {
+                  // User scrolled back down to the bottom band → re-arm.
+                  if (!followBottomRef.current) {
+                    followBottomRef.current = true;
+                    scrollDiag('followIntent', { armed: true, reason: 'user-at-bottom', dist: Math.round(distFromBottom) });
+                  }
                 }
-                return prev;
-              });
+              }
+
+              // FAB: hidden while following (we're pinned / will re-pin) or at the
+              // exact bottom; shown only when the user has scrolled up to read.
+              const nextTrueBottom = followBottomRef.current || distFromBottom <= TRUE_PX;
+              setAtTrueBottom((prev) => (prev !== nextTrueBottom ? nextTrueBottom : prev));
             }}
             style={{
               height: '100%',
@@ -2036,17 +2426,15 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
                 );
               })}
             </Virtualizer>
-            {/* Footer: streaming dots when claude/sdk is mid-turn. Equivalent to
-                virtuoso's components.Footer slot. */}
-            {busy && !readOnly ? (
-              <div style={{ display: 'flex', gap: 6, padding: '8px 14px', color: '#888', fontSize: 12 }}>
-                <span style={S.dot} /> <span style={S.dot} /> <span style={S.dot} />
-              </div>
-            ) : <div style={{ height: 12 }} />}
+            {/* Footer spacer. The "thinking…" indicator is NOT rendered here in
+                the scroll list — it's pinned just above the composer (see below)
+                so it stays visible while the user scrolls up through history,
+                instead of being parked at the bottom of the transcript. */}
+            <div style={{ height: 12 }} />
           </div>
         )}
       </div>
-      <ScrollToBottomFAB visible={!atBottom && entries.length > 0} onClick={scrollChatToBottom} side="right" />
+      <ScrollToBottomFAB visible={!atTrueBottom && entries.length > 0} onClick={scrollChatToBottom} side="right" />
       {/* "Starting Claude…" strip — Claude process exists (bridge known) but
           the TUI hasn't drawn its prompt yet. Sending now would race the
           handshake; show a neutral progress bar instead. Auto-flips to
@@ -2102,14 +2490,57 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
           </div>
         </div>
       )}
-      {!readOnly && !(isClaudePtyTab && claudeStatus === 'starting' && !resuming) && !(isClaudePtyTab && (tab.claudeSessionId || sessionId) && (claudeStatus === 'inactive' || resuming)) && (
+      {/* "thinking…" — pinned directly ABOVE the composer, transparent bg, so it
+          stays in view while the user scrolls up through the transcript (the old
+          spot was the bottom of the scroll list → scrolled away). Plain text +
+          animated dots, no card. Renders only when a turn is in flight AND the
+          composer itself is showing (not during Starting/Resume banners, which
+          carry their own progress UI). */}
+      {!readOnly && busy && !pendingQuestion
+        && !(isClaudePtyTab && claudeStatus === 'starting' && !resuming)
+        && !(isClaudePtyTab && (tab.claudeSessionId || sessionId) && (claudeStatus === 'inactive' || resuming)) && (
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 6,
+          padding: '4px 16px 0', background: 'transparent',
+          color: '#888', fontSize: 12, pointerEvents: 'none',
+        }}>
+          <span>thinking</span>
+          <span style={S.dot} /> <span style={S.dot} /> <span style={S.dot} />
+        </div>
+      )}
+      {/* AskUserQuestion picker — replaces the composer while Claude is blocked
+          on a question (mirror of the desktop SDKAskQuestion / PTY Ink dialog).
+          Takes priority over the composer so the user must answer or stop. */}
+      {!readOnly && pendingQuestion && pendingQuestion.questions.length > 0 && (
+        <QuestionCard
+          pending={pendingQuestion}
+          answering={answeringQuestion}
+          onAnswer={(answers) => answerQuestion(answers, false)}
+          onStop={() => answerQuestion({}, true)}
+        />
+      )}
+      {!readOnly && !pendingQuestion && !(isClaudePtyTab && claudeStatus === 'starting' && !resuming) && !(isClaudePtyTab && (tab.claudeSessionId || sessionId) && (claudeStatus === 'inactive' || resuming)) && (
         <Composer
           text={text}
           setText={setText}
           busy={busy}
           onSend={send}
           onStop={stop}
-          onPickPrompt={(content) => setText((prev) => prev ? `${prev}\n\n${content}` : content)}
+          chips={chips}
+          setChips={setChips}
+          onPickPrompt={(content) => {
+            // Long saved prompts collapse into a chip (same as a long paste);
+            // short ones append inline. Mirrors desktop Opt+V picker behaviour.
+            if (content.length >= PASTE_THRESHOLD) {
+              setChips((prev) => [...prev, {
+                id: 'chip-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6),
+                text: content,
+                preview: content.slice(0, 60).replace(/\n/g, ' ') + '...',
+              }]);
+            } else {
+              setText((prev) => prev ? `${prev}\n\n${content}` : content);
+            }
+          }}
         />
       )}
       {readOnly && tab.claudeSessionId && tab.tabType !== 'claude-sdk' && (
@@ -2153,6 +2584,15 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
           onDismiss={() => setDrawerOpen(false)}
         />
       )}
+      {canQueue && queueOpen && queue && (
+        <QueuePanel
+          queue={queue}
+          aiTabs={queueAiTabs}
+          busy={busy}
+          mutate={mutateQueue}
+          onClose={() => setQueueOpen(false)}
+        />
+      )}
     </div>
   );
 }
@@ -2164,6 +2604,539 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
 // (sheet) and as the candidate header pill — single source of truth.
 // `default` keeps a leading marker so the user can see they're on the alias
 // rather than the explicit opus value (both resolve to opus-4.8 [1M] in API).
+// ── AskUserQuestion picker (mobile) ──────────────────────────────────────────
+// Replaces the composer while Claude is blocked on a question. Tap-driven (no
+// arrow keys on a phone). Single-select: tap an option → answer that question;
+// when it's the only/last question this submits immediately. Multi-question:
+// each question is answered in order, a sticky "Submit" bar finalises. multiSelect:
+// tap toggles options, then Submit. "Respond manually" (Stop) aborts the question
+// so the user can type free text — same semantics as desktop "Type something".
+const Q_PURPLE = '#a78bfa';
+const Q_PURPLE_BG = 'rgba(147,51,234,0.18)';
+const Q_PURPLE_BORDER = 'rgba(168,85,247,0.9)';
+
+function QuestionCard({ pending, answering, onAnswer, onStop }: {
+  pending: PendingQuestion;
+  answering: boolean;
+  onAnswer: (answers: Record<string, string>) => void;
+  onStop: () => void;
+}) {
+  const questions = pending.questions;
+  const multiQ = questions.length > 1;
+  // Per-question selected labels. Single-select keeps one; multiSelect keeps many.
+  const [selection, setSelection] = useState<Record<number, string[]>>({});
+  // Which question is shown (multi-question wizard). Single question → always 0.
+  const [qIdx, setQIdx] = useState(0);
+
+  const q = questions[qIdx];
+  const isMulti = !!q?.multiSelect;
+  const sel = selection[qIdx] ?? [];
+
+  const buildAnswers = useCallback((snapshot: Record<number, string[]>) => {
+    const out: Record<string, string> = {};
+    questions.forEach((qq, i) => {
+      const s = snapshot[i];
+      if (s && s.length) out[qq.question] = s.join(', ');
+    });
+    return out;
+  }, [questions]);
+
+  const allAnswered = questions.every((_qq, i) => (selection[i]?.length ?? 0) > 0);
+
+  // Pick an option. Single-select: set + advance (or submit if last). multiSelect:
+  // toggle membership, stay on the question (user taps Submit/Next).
+  const pick = (label: string) => {
+    if (answering) return;
+    if (isMulti) {
+      setSelection((prev) => {
+        const cur = prev[qIdx] ?? [];
+        const next = cur.includes(label) ? cur.filter((l) => l !== label) : [...cur, label];
+        return { ...prev, [qIdx]: next };
+      });
+      return;
+    }
+    // single-select
+    const nextSel = { ...selection, [qIdx]: [label] };
+    setSelection(nextSel);
+    if (!multiQ) {
+      // only question → submit immediately
+      onAnswer(buildAnswers(nextSel));
+    } else if (qIdx < questions.length - 1) {
+      setQIdx(qIdx + 1);
+    }
+    // else: last question of many — wait for Submit (so user can review).
+  };
+
+  return (
+    <div style={{
+      // Plain composer-like surface — NO purple frame/line above the question.
+      // Inside the chat it's already obvious this is a question (QUESTION badge +
+      // the card replacing the composer); the purple rotating ring lives ONLY on
+      // the tab/project cards in the lists, per user.
+      borderTop: '1px solid #1f1f1f',
+      background: '#0e0e0e',
+      padding: '10px 14px max(10px, env(safe-area-inset-bottom)) 14px',
+      maxHeight: '60vh', overflowY: 'auto',
+      animation: 'noted-fade-in 0.18s ease-out',
+    }}>
+      {/* Header: purple QUESTION label (UPPERCASE → OCR-reliable per CLAUDE.md) */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+        <span style={{
+          fontSize: 10, fontWeight: 700, letterSpacing: 0.6, color: Q_PURPLE,
+          padding: '2px 8px', borderRadius: 999, background: Q_PURPLE_BG, border: `1px solid ${Q_PURPLE_BORDER}`,
+        }}>QUESTION{multiQ ? ` ${qIdx + 1}/${questions.length}` : ''}</span>
+        {q?.header && <span style={{ fontSize: 12, color: '#999', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{q.header}</span>}
+        <div style={{ flex: 1 }} />
+        {answering && <InlineSpinner color={Q_PURPLE} size={13} />}
+      </div>
+
+      {/* Multi-question tab strip — tap to jump, ✓ marks answered. */}
+      {multiQ && (
+        <div style={{ display: 'flex', gap: 6, marginBottom: 8, flexWrap: 'wrap' }}>
+          {questions.map((qq, i) => {
+            const answered = (selection[i]?.length ?? 0) > 0;
+            const active = i === qIdx;
+            return (
+              <button
+                key={i}
+                onClick={() => setQIdx(i)}
+                style={{
+                  fontSize: 11, padding: '3px 8px', borderRadius: 8, cursor: 'pointer',
+                  background: active ? Q_PURPLE_BG : '#1a1a1a',
+                  border: `1px solid ${active ? Q_PURPLE_BORDER : '#2a2a2a'}`,
+                  color: active ? '#fff' : (answered ? Q_PURPLE : '#888'),
+                  whiteSpace: 'nowrap',
+                }}
+              >{answered ? '✓ ' : ''}{qq.header || `Q${i + 1}`}</button>
+            );
+          })}
+        </div>
+      )}
+
+      {/* Question text */}
+      <div style={{ fontSize: 14, fontWeight: 600, color: '#fff', marginBottom: 10, lineHeight: 1.4 }}>
+        {q?.question}
+      </div>
+
+      {/* Options */}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+        {(q?.options || []).map((opt, idx) => {
+          const checked = sel.includes(opt.label);
+          return (
+            <button
+              key={idx}
+              onClick={() => pick(opt.label)}
+              disabled={answering}
+              style={{
+                textAlign: 'left', width: '100%',
+                padding: '11px 12px', borderRadius: 12,
+                background: checked ? Q_PURPLE_BG : '#1a1a1a',
+                border: `1px solid ${checked ? Q_PURPLE_BORDER : '#2a2a2a'}`,
+                color: '#e8e8e8', cursor: answering ? 'wait' : 'pointer',
+                display: 'flex', flexDirection: 'column', gap: 3,
+              }}
+            >
+              <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <span style={{ color: checked ? Q_PURPLE : '#666', fontSize: 14, flexShrink: 0 }}>
+                  {isMulti ? (checked ? '☑' : '☐') : (checked ? '◉' : '○')}
+                </span>
+                <span style={{ fontWeight: checked ? 600 : 500 }}>{opt.label}</span>
+              </span>
+              {opt.description && (
+                <span style={{ color: '#888', fontSize: 12, marginLeft: 22, lineHeight: 1.35 }}>{opt.description}</span>
+              )}
+              {opt.preview && (
+                <pre style={{
+                  margin: '4px 0 0 22px', padding: '8px 10px', borderRadius: 8,
+                  background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.08)',
+                  color: '#bbb', fontSize: 11, lineHeight: 1.4, maxHeight: 160, overflow: 'auto',
+                  whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+                }}>{opt.preview}</pre>
+              )}
+            </button>
+          );
+        })}
+      </div>
+
+      {/* Action bar: Submit (multiSelect / multi-question) + Respond manually (stop) */}
+      <div style={{ display: 'flex', gap: 8, marginTop: 12, alignItems: 'center' }}>
+        <button
+          onClick={onStop}
+          disabled={answering}
+          style={{
+            padding: '10px 14px', borderRadius: 12, border: '1px solid #2a2a2a',
+            background: '#1a1a1a', color: '#aaa', fontSize: 13, cursor: 'pointer',
+            whiteSpace: 'nowrap',
+          }}
+        >Respond manually</button>
+        <div style={{ flex: 1 }} />
+        {(isMulti || multiQ) && (
+          <button
+            onClick={() => { if (!answering && allAnswered) onAnswer(buildAnswers(selection)); }}
+            disabled={answering || !allAnswered}
+            style={{
+              padding: '10px 20px', borderRadius: 12, border: 'none',
+              background: allAnswered ? Q_PURPLE : '#2a2a2a',
+              color: allAnswered ? '#1a1a1a' : '#666',
+              fontSize: 14, fontWeight: 700, cursor: allAnswered && !answering ? 'pointer' : 'default',
+              display: 'inline-flex', alignItems: 'center', gap: 6,
+            }}
+          >
+            {answering && <InlineSpinner color="#1a1a1a" size={12} />}
+            {isMulti && !multiQ ? 'Submit' : `Submit${multiQ ? ` (${questions.filter((_q, i) => (selection[i]?.length ?? 0) > 0).length}/${questions.length})` : ''}`}
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── Prompt-Queue ("Run after") bottom sheet ──────────────────────────────────
+// Mobile mirror of the desktop PromptQueueOverlay. It owns NO queue state — every
+// control POSTs a mutation op to the desktop store (Api.queueMutate) and the
+// desktop App-root runner does the firing; `queue` here is the live core kept
+// fresh by the queue-update SSE event. Layout mirrors desktop: two setting
+// columns (left = on-tab pivot + first-delay; right = Run after / Stop after /
+// Post toggles), then the queue list (max ~5 rows, then it scrolls), then Add.
+// Tapping a chip or Add swaps the list region for an inline editor (Mirror
+// Editing) — "окно редактирования под менюшкой". The header ✕ closes the whole
+// sheet, which also closes the editor.
+const Q_VIOLET = '#a78bfa';   // armed / Run-after
+const Q_DEEP_VIOLET = '#8b5cf6'; // Run-after pointed at another tab
+const Q_ORANGE = '#DA7756';   // Stop after / Post
+const Q_RED = '#ef4444';      // Close after
+const Q_AI_KIND_COLOR: Record<'claude-pty' | 'claude-sdk' | 'gemini', string> = {
+  'claude-pty': '#DA7756', 'claude-sdk': '#D28C5A', 'gemini': '#4E86F8',
+};
+
+function QueueToggle({ label, on, color, onClick, sub }: {
+  label: string; on: boolean; color: string; onClick: () => void; sub?: ReactNode;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      style={{
+        width: '100%', padding: '9px 10px', borderRadius: 10,
+        background: on ? `${color}22` : '#222',
+        border: `1px solid ${on ? color : '#2a2a2a'}`,
+        color: on ? color : '#bbb',
+        fontSize: 13, fontWeight: 500, cursor: 'pointer',
+        display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6,
+        textAlign: 'center',
+      }}
+    >
+      {label}{sub}
+    </button>
+  );
+}
+
+function QueuePanel({ queue, aiTabs, busy, mutate, onClose }: {
+  // tabId is intentionally NOT a prop — `mutate` is pre-bound to the tab by the
+  // parent (ChatView). Keeping the panel tab-agnostic avoids a second source of
+  // truth for "which tab".
+  queue: QueueCore;
+  aiTabs: QueueAiTab[];
+  busy: boolean;
+  mutate: (body: QueueOp) => Promise<void>;
+  onClose: () => void;
+}) {
+  // Editor: null = list view; { id } = editing chip; { id:null } = new prompt;
+  // { post:true } = editing the per-tab post-prompt body.
+  const [editor, setEditor] = useState<{ id: string | null; post?: boolean } | null>(null);
+  const [editorText, setEditorText] = useState('');
+  const [tabPickerOpen, setTabPickerOpen] = useState(false);
+  const [delayText, setDelayText] = useState(queue.firstDelaySeconds === 0 ? '' : String(queue.firstDelaySeconds));
+
+  // Mirror external delay changes into the local input when not focused-editing.
+  useEffect(() => {
+    setDelayText(queue.firstDelaySeconds === 0 ? '' : String(queue.firstDelaySeconds));
+  }, [queue.firstDelaySeconds]);
+
+  const openNew = () => { setEditorText(''); setEditor({ id: null }); };
+  const openEdit = (id: string, text: string) => { setEditorText(text); setEditor({ id }); };
+  const openPost = () => { setEditorText(queue.postPromptText || ''); setEditor({ id: null, post: true }); };
+  const closeEditor = () => { setEditor(null); setEditorText(''); };
+
+  const saveEditor = async () => {
+    if (!editor) return;
+    if (editor.post) {
+      await mutate({ op: 'setPostPromptText', args: { value: editorText } });
+      closeEditor();
+      return;
+    }
+    const t = editorText.trim();
+    if (!t) { closeEditor(); return; }
+    if (editor.id) await mutate({ op: 'update', args: { id: editor.id, text: t } });
+    else await mutate({ op: 'add', args: { text: t } });
+    closeEditor();
+  };
+
+  const targetTab = queue.runAfterTabId ? aiTabs.find((t) => t.id === queue.runAfterTabId) : null;
+
+  return (
+    <div
+      // Backdrop. Tap outside the card closes the whole sheet (and editor).
+      onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
+      style={{
+        position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.55)', zIndex: 1000,
+        display: 'flex', alignItems: 'flex-end', justifyContent: 'center',
+        animation: 'noted-fade-in 0.18s ease-out',
+      }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          width: '100%', maxWidth: 480,
+          background: '#1a1a1a', borderRadius: '18px 18px 0 0',
+          padding: '8px 16px max(16px, env(safe-area-inset-bottom)) 16px',
+          maxHeight: '85vh', display: 'flex', flexDirection: 'column',
+          animation: 'noted-sheet-up 0.22s cubic-bezier(0.16, 1, 0.3, 1)',
+        }}
+      >
+        {/* Header: title + armed badge + ✕ (closes sheet & editor). */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '4px 0 12px' }}>
+          <span style={{ fontSize: 15, fontWeight: 600, color: '#e0e0e0' }}>Run after</span>
+          {queue.autoRun && (
+            <span style={{
+              fontSize: 11, fontWeight: 600, color: Q_VIOLET, fontVariantNumeric: 'tabular-nums',
+              padding: '1px 7px', borderRadius: 999, border: `1px solid ${Q_VIOLET}55`, background: `${Q_VIOLET}1a`,
+              display: 'inline-flex', alignItems: 'center', gap: 5,
+            }}>
+              <span style={{ width: 6, height: 6, borderRadius: '50%', background: Q_VIOLET, animation: busy ? 'mob-mic-pulse 1.4s ease-in-out infinite' : 'none' }} />
+              armed [{queue.items.length}]
+            </span>
+          )}
+          <div style={{ flex: 1 }} />
+          <button
+            onClick={onClose}
+            aria-label="Close"
+            style={{
+              width: 30, height: 30, borderRadius: 8, border: '1px solid #2a2a2a',
+              background: '#222', color: '#bbb', cursor: 'pointer',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+            }}
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+              <line x1="6" y1="6" x2="18" y2="18" /><line x1="18" y1="6" x2="6" y2="18" />
+            </svg>
+          </button>
+        </div>
+
+        {/* ── Settings: two columns ────────────────────────────────────────── */}
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginBottom: 10 }}>
+          {/* LEFT col: on-tab pivot + first-delay seconds */}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            <button
+              onClick={() => setTabPickerOpen((o) => !o)}
+              title="Wait for another tab's turn to end before firing"
+              style={{
+                width: '100%', padding: '9px 10px', borderRadius: 10,
+                background: targetTab ? `${Q_DEEP_VIOLET}22` : '#222',
+                border: `1px solid ${targetTab ? Q_DEEP_VIOLET : '#2a2a2a'}`,
+                color: targetTab ? Q_DEEP_VIOLET : '#bbb',
+                fontSize: 12, fontWeight: 500, cursor: 'pointer',
+                display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 4,
+                whiteSpace: 'nowrap', overflow: 'hidden',
+              }}
+            >
+              <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                {targetTab ? targetTab.name : 'on tab'}
+              </span>
+              <span style={{ color: '#666', fontSize: 10, flexShrink: 0 }}>▾</span>
+            </button>
+            <input
+              type="number" min={0} max={3600} inputMode="numeric"
+              value={delayText}
+              placeholder="delay s"
+              disabled={queue.autoRun}
+              onChange={(e) => setDelayText(e.target.value)}
+              onBlur={() => {
+                const n = Number(delayText);
+                const clamped = Number.isFinite(n) && n > 0 ? Math.min(3600, Math.floor(n)) : 0;
+                mutate({ op: 'setFirstDelaySeconds', args: { value: clamped } });
+                setDelayText(clamped === 0 ? '' : String(clamped));
+              }}
+              style={{
+                width: '100%', padding: '9px 10px', borderRadius: 10,
+                background: '#222', border: '1px solid #2a2a2a',
+                color: queue.autoRun ? '#555' : '#ddd', fontSize: 13,
+                textAlign: 'center', outline: 'none', boxSizing: 'border-box',
+                fontVariantNumeric: 'tabular-nums',
+              }}
+            />
+          </div>
+
+          {/* RIGHT col: Run after / Stop after / Post toggles */}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            <QueueToggle
+              label="Run after" on={queue.autoRun} color={Q_VIOLET}
+              onClick={() => mutate({ op: 'setAutoRun', args: { value: !queue.autoRun } })}
+              sub={<span style={{ width: 6, height: 6, borderRadius: '50%', background: queue.autoRun ? Q_VIOLET : '#555', animation: queue.autoRun && busy ? 'mob-mic-pulse 1.4s ease-in-out infinite' : 'none' }} />}
+            />
+            <div style={{ display: 'flex', gap: 6 }}>
+              <div style={{ flex: 1 }}>
+                <QueueToggle
+                  label={queue.closeAfter ? 'Close after' : 'Stop after'}
+                  on={queue.stopAfter || queue.closeAfter}
+                  color={queue.closeAfter ? Q_RED : Q_ORANGE}
+                  onClick={() => mutate({ op: 'setStopAfter', args: { value: !queue.stopAfter } })}
+                />
+              </div>
+              {/* Close-after toggle (power icon) — cascades stopAfter on. */}
+              <button
+                onClick={() => mutate({ op: 'setCloseAfter', args: { value: !queue.closeAfter } })}
+                title="Also close the tab after Claude stops"
+                style={{
+                  width: 38, borderRadius: 10,
+                  background: queue.closeAfter ? `${Q_RED}22` : '#222',
+                  border: `1px solid ${queue.closeAfter ? Q_RED : '#2a2a2a'}`,
+                  color: queue.closeAfter ? Q_RED : '#888', cursor: 'pointer',
+                  display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
+                }}
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M12 2v10" /><path d="M18.4 6.6a9 9 0 1 1-12.77.04" />
+                </svg>
+              </button>
+            </div>
+            <div style={{ display: 'flex', gap: 6 }}>
+              <div style={{ flex: 1 }}>
+                <QueueToggle
+                  label="Post" on={queue.postPromptEnabled} color={Q_ORANGE}
+                  onClick={() => mutate({ op: 'setPostPromptEnabled', args: { value: !queue.postPromptEnabled } })}
+                />
+              </div>
+              {/* Pencil — edit the post-prompt body. */}
+              <button
+                onClick={openPost}
+                title="Edit post-prompt text (appended to every queued prompt)"
+                style={{
+                  width: 38, borderRadius: 10,
+                  background: editor?.post ? `${Q_ORANGE}22` : '#222',
+                  border: `1px solid ${editor?.post ? Q_ORANGE : '#2a2a2a'}`,
+                  color: queue.postPromptEnabled || editor?.post ? Q_ORANGE : '#888', cursor: 'pointer',
+                  display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
+                }}
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M12 20h9" /><path d="M16.5 3.5a2.12 2.12 0 1 1 3 3L7 19l-4 1 1-4Z" />
+                </svg>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        {/* On-tab pivot dropdown (inline list of sibling AI tabs). */}
+        {tabPickerOpen && (
+          <div style={{
+            marginBottom: 10, border: '1px solid #2a2a2a', borderRadius: 10,
+            background: '#111', maxHeight: 180, overflowY: 'auto',
+          }}>
+            <button
+              onClick={() => { mutate({ op: 'setRunAfterTab', args: { value: null } }); setTabPickerOpen(false); }}
+              style={{ width: '100%', padding: '10px 12px', background: 'transparent', border: 'none', borderBottom: '1px solid #1f1f1f', color: !queue.runAfterTabId ? Q_DEEP_VIOLET : '#888', fontSize: 13, textAlign: 'left', cursor: 'pointer' }}
+            >— no target (this tab) —</button>
+            {aiTabs.length === 0 && (
+              <div style={{ padding: '10px 12px', color: '#555', fontSize: 12 }}>no other AI tabs</div>
+            )}
+            {aiTabs.map((t) => {
+              const sel = queue.runAfterTabId === t.id;
+              return (
+                <button
+                  key={t.id}
+                  onClick={() => { mutate({ op: 'setRunAfterTab', args: { value: sel ? null : t.id } }); setTabPickerOpen(false); }}
+                  style={{ width: '100%', padding: '10px 12px', background: sel ? `${Q_DEEP_VIOLET}1a` : 'transparent', border: 'none', borderBottom: '1px solid #1f1f1f', color: sel ? Q_DEEP_VIOLET : '#ccc', fontSize: 13, textAlign: 'left', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 8 }}
+                >
+                  <span style={{ width: 8, height: 8, borderRadius: '50%', background: Q_AI_KIND_COLOR[t.kind], flexShrink: 0 }} />
+                  <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t.name}</span>
+                </button>
+              );
+            })}
+          </div>
+        )}
+
+        {/* ── Body: list view OR editor (Mirror Editing) ───────────────────── */}
+        {editor ? (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8, minHeight: 0 }}>
+            <div style={{ fontSize: 11, color: '#888' }}>
+              {editor.post ? 'Post-prompt · appended to every queued prompt' : (editor.id ? 'Edit prompt' : 'New prompt')}
+            </div>
+            <textarea
+              autoFocus
+              value={editorText}
+              onChange={(e) => setEditorText(e.target.value)}
+              placeholder={editor.post ? 'Text appended after each queued prompt…' : 'Type or paste a prompt…'}
+              style={{
+                width: '100%', boxSizing: 'border-box',
+                // ~5 visible rows then scroll (≈ 22px line-height × 5 + padding).
+                minHeight: 120, maxHeight: 130, overflowY: 'auto',
+                background: '#0e0e0e', color: '#e0e0e0',
+                border: '1px solid #FFB382', borderRadius: 12, padding: '10px 12px',
+                fontSize: 14, lineHeight: 1.45, resize: 'none', outline: 'none',
+              }}
+            />
+            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+              <button onClick={closeEditor} style={{ padding: '9px 16px', borderRadius: 10, border: '1px solid #2a2a2a', background: '#222', color: '#bbb', fontSize: 13, cursor: 'pointer' }}>Cancel</button>
+              <button onClick={saveEditor} style={{ padding: '9px 18px', borderRadius: 10, border: 'none', background: '#FFB382', color: '#1a1a1a', fontSize: 13, fontWeight: 600, cursor: 'pointer' }}>Save</button>
+            </div>
+          </div>
+        ) : (
+          <>
+            {/* Queue list — up to ~5 rows then scrolls. */}
+            <div style={{ flex: '0 1 auto', minHeight: 0, overflowY: 'auto', maxHeight: 5 * 52, border: '1px solid #1f1f1f', borderRadius: 12, background: '#111' }}>
+              {queue.items.length === 0 ? (
+                <div style={{ padding: '18px 12px', textAlign: 'center', color: '#555', fontSize: 12 }}>
+                  queue is empty — Add a prompt below
+                </div>
+              ) : (
+                queue.items.map((it) => {
+                  const firstLine = it.text.split('\n')[0];
+                  const head = firstLine.length > 60 ? firstLine.slice(0, 60) + '…' : firstLine;
+                  return (
+                    <div
+                      key={it.id}
+                      onClick={() => openEdit(it.id, it.text)}
+                      style={{
+                        display: 'flex', alignItems: 'center', gap: 8,
+                        padding: '11px 12px', borderBottom: '1px solid #1a1a1a',
+                        cursor: 'pointer',
+                      }}
+                    >
+                      <span style={{ flex: 1, minWidth: 0, fontSize: 13, color: '#ddd', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {head || '(empty)'}
+                      </span>
+                      {it.images > 0 && <span style={{ fontSize: 11, color: Q_ORANGE, flexShrink: 0 }}>📎{it.images}</span>}
+                      <button
+                        onClick={(e) => { e.stopPropagation(); mutate({ op: 'remove', args: { id: it.id } }); }}
+                        aria-label="Remove"
+                        style={{ flexShrink: 0, width: 26, height: 26, borderRadius: 7, border: 'none', background: 'transparent', color: '#777', fontSize: 16, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+                      >×</button>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+
+            {/* Add + clear-all row */}
+            <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
+              <button
+                onClick={openNew}
+                style={{ flex: 1, padding: '12px', borderRadius: 12, border: '1px dashed #3a3a3a', background: '#181818', color: '#ccc', fontSize: 14, fontWeight: 500, cursor: 'pointer' }}
+              >+ Add prompt</button>
+              {queue.items.length > 0 && (
+                <button
+                  onClick={() => mutate({ op: 'clear' })}
+                  style={{ padding: '12px 14px', borderRadius: 12, border: '1px solid #2a2a2a', background: '#181818', color: '#888', fontSize: 13, cursor: 'pointer' }}
+                >Clear</button>
+              )}
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
 const SDK_MODELS = [
   { value: 'default', label: 'default · opus-4.8 [1M]' },
   { value: 'opus',    label: 'opus-4.8 [1M]' },
@@ -2201,6 +3174,8 @@ function SDKParamsButton({ tabId }: { tabId: string }) {
     );
   }
 
+  // Returns the in-flight promise so ParamsSheet can show a spinner on the
+  // tapped pill and close the sheet only once the change has been applied.
   const apply = async (partial: Partial<typeof params>) => {
     const next = { ...params, ...partial };
     setParams(next); // optimistic
@@ -2246,12 +3221,39 @@ function SDKParamsButton({ tabId }: { tabId: string }) {
 
 function ParamsSheet({ params, onChange, onDismiss }: {
   params: { model: string; effort: string; thinking: 'adaptive' | 'disabled' };
-  onChange: (p: Partial<typeof params>) => void;
+  onChange: (p: Partial<typeof params>) => Promise<void> | void;
   onDismiss: () => void;
 }) {
+  // The pill the user just tapped, while its change is being applied. That pill
+  // shows a spinner (mirrors the desktop ControlBar's in-flight loader); when
+  // the apply resolves we close the whole sheet. `busy` non-null also blocks
+  // further taps so a second selection can't race the first.
+  const [busyKey, setBusyKey] = useState<string | null>(null);
+
+  // Run a change: mark the pill busy, await the apply, then dismiss. If apply
+  // throws (alerted upstream) we still clear busy and leave the sheet open so
+  // the user can retry.
+  const pick = async (key: string, partial: Partial<typeof params>) => {
+    if (busyKey) return;
+    setBusyKey(key);
+    try {
+      await onChange(partial);
+      onDismiss();
+    } catch {
+      setBusyKey(null);
+    }
+  };
+
   return (
     <div
-      onClick={onDismiss}
+      // Dismiss ONLY when the tap lands on the backdrop itself. On iOS Safari a
+      // tap on an inner <button> can retarget/bubble such that a naked
+      // `onClick={onDismiss}` here fires too (stopPropagation on the card is not
+      // enough — touch event retargeting + the synthetic click on the backdrop
+      // both reach this handler). Guarding on `e.target === e.currentTarget`
+      // makes a pill tap never reach the backdrop; the sheet then closes itself
+      // AFTER the apply resolves (see pick()), not on the raw tap.
+      onClick={(e) => { if (e.target === e.currentTarget && !busyKey) onDismiss(); }}
       style={{
         position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.55)', zIndex: 1000,
         display: 'flex', alignItems: 'flex-end', justifyContent: 'center',
@@ -2271,7 +3273,9 @@ function ParamsSheet({ params, onChange, onDismiss }: {
 
         <ParamRow label="Model">
           {SDK_MODELS.map((m) => (
-            <ParamPill key={m.value} active={params.model === m.value} onClick={() => onChange({ model: m.value })}>
+            <ParamPill key={m.value} active={params.model === m.value}
+              busy={busyKey === 'model:' + m.value} disabled={!!busyKey}
+              onClick={() => pick('model:' + m.value, { model: m.value })}>
               {m.label}
             </ParamPill>
           ))}
@@ -2279,18 +3283,25 @@ function ParamsSheet({ params, onChange, onDismiss }: {
 
         <ParamRow label="Effort">
           {SDK_EFFORTS.map((e) => (
-            <ParamPill key={e} active={params.effort === e} onClick={() => onChange({ effort: e })}>
+            <ParamPill key={e} active={params.effort === e}
+              busy={busyKey === 'effort:' + e} disabled={!!busyKey}
+              onClick={() => pick('effort:' + e, { effort: e })}>
               {e}
             </ParamPill>
           ))}
         </ParamRow>
 
         <ParamRow label="Thinking">
-          <ParamPill active={params.thinking === 'adaptive'} onClick={() => onChange({ thinking: 'adaptive' })}>
-            on
-          </ParamPill>
-          <ParamPill active={params.thinking === 'disabled'} onClick={() => onChange({ thinking: 'disabled' })}>
-            off
+          {/* Single toggle pill (mirrors the desktop Think button) — tap flips
+              on↔off. Not two on/off pills: Think is a binary toggle, and for PTY
+              tabs each change dispatches a meta+t flip, so the UI must read as
+              one switch, not a 2-option selector. */}
+          <ParamPill
+            active={params.thinking === 'adaptive'}
+            busy={busyKey === 'think'} disabled={!!busyKey}
+            onClick={() => pick('think', { thinking: params.thinking === 'adaptive' ? 'disabled' : 'adaptive' })}
+          >
+            {params.thinking === 'adaptive' ? 'Think ON' : 'Think OFF'}
           </ParamPill>
         </ParamRow>
 
@@ -2370,14 +3381,37 @@ function ScrollToBottomFAB({ visible, onClick, side, bottomOffset = 110 }: {
 // + and 🎤 disabled — placeholders for future image-attach and voice-input.
 // 40vh chosen to match Claude mobile: ~11 lines visible without keyboard,
 // ~7-8 with keyboard up. Hard cap on iPhone 15 Pro is ~340px.
-function Composer({ text, setText, busy, onSend, onStop, onPickPrompt }: {
+function Composer({ text, setText, busy, onSend, onStop, onPickPrompt, chips, setChips }: {
   text: string;
   setText: (v: string | ((prev: string) => string)) => void;
   busy: boolean;
   onSend: () => void;
   onStop: () => void;
   onPickPrompt: (content: string) => void;
+  chips: PasteChip[];
+  setChips: (v: PasteChip[] | ((prev: PasteChip[]) => PasteChip[])) => void;
 }) {
+  // Which chip's full body is expanded inline (tap chip to toggle preview).
+  const [previewChipId, setPreviewChipId] = useState<string | null>(null);
+  const addChip = (body: string) => {
+    setChips((prev) => [...prev, {
+      id: 'chip-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6),
+      text: body,
+      preview: body.slice(0, 60).replace(/\n/g, ' ') + '...',
+    }]);
+  };
+  const removeChip = (id: string) => {
+    setChips((prev) => prev.filter((c) => c.id !== id));
+    setPreviewChipId((cur) => (cur === id ? null : cur));
+  };
+  const handlePaste = (e: ReactClipboardEvent<HTMLTextAreaElement>) => {
+    const pasted = e.clipboardData.getData('text/plain');
+    if (pasted.length >= PASTE_THRESHOLD) {
+      e.preventDefault();
+      addChip(pasted);
+    }
+    // Short pastes fall through to the textarea's native paste.
+  };
   const taRef = useRef<HTMLTextAreaElement>(null);
   // True only when textarea content overflows the 40vh cap. Used to toggle
   // overflowY: hidden|auto so a single-line input never shows a scrollbar
@@ -2454,6 +3488,59 @@ function Composer({ text, setText, busy, onSend, onStop, onPickPrompt }: {
       padding: '8px 12px max(8px, env(safe-area-inset-bottom)) 12px',
       display: 'flex', flexDirection: 'column', gap: 6,
     }}>
+      {/* Paste-chip bar — long pasted/picked text collapses here instead of
+          flooding the textarea. Tap a chip to preview its full body; tap the ×
+          to discard. Mirror of desktop SDK chip bar (blue pill grammar). */}
+      {chips.length > 0 && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+            {chips.map((chip) => (
+              <span
+                key={chip.id}
+                onClick={() => setPreviewChipId((cur) => (cur === chip.id ? null : chip.id))}
+                style={{
+                  display: 'inline-flex', alignItems: 'center', gap: 6,
+                  maxWidth: '100%',
+                  padding: '4px 8px', borderRadius: 8,
+                  fontSize: 12,
+                  background: 'rgba(107,138,255,0.15)',
+                  color: '#8ba4ff',
+                  border: '1px solid rgba(107,138,255,0.25)',
+                  cursor: 'pointer',
+                }}
+              >
+                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{chip.preview}</span>
+                <span style={{ fontSize: 10, color: '#6679cc', flexShrink: 0 }}>{chip.text.length.toLocaleString()}</span>
+                <span
+                  role="button"
+                  aria-label="Remove chip"
+                  onClick={(e) => { e.stopPropagation(); removeChip(chip.id); }}
+                  style={{
+                    flexShrink: 0, display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+                    width: 16, height: 16, borderRadius: 4,
+                    color: '#8ba4ff', opacity: 0.7,
+                  }}
+                >✕</span>
+              </span>
+            ))}
+          </div>
+          {previewChipId && (() => {
+            const pc = chips.find((c) => c.id === previewChipId);
+            if (!pc) return null;
+            return (
+              <pre style={{
+                margin: 0, padding: '8px 10px',
+                fontSize: 12, lineHeight: 1.45,
+                color: '#aaa',
+                background: '#1a1a1a',
+                border: '1px solid #333', borderRadius: 10,
+                maxHeight: 200, overflowY: 'auto',
+                whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+              }}>{pc.text}</pre>
+            );
+          })()}
+        </div>
+      )}
       <textarea
         ref={taRef}
         value={text}
@@ -2478,6 +3565,7 @@ function Composer({ text, setText, busy, onSend, onStop, onPickPrompt }: {
           resize: 'none',
           overflowY: hasScroll ? 'auto' : 'hidden',
         }}
+        onPaste={handlePaste}
         onKeyDown={(e) => {
           if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
             e.preventDefault();
@@ -2560,13 +3648,13 @@ function Composer({ text, setText, busy, onSend, onStop, onPickPrompt }: {
         ) : (
           <button
             onClick={onSend}
-            disabled={!text.trim()}
+            disabled={!text.trim() && chips.length === 0}
             aria-label="Send"
             style={{
               width: 36, height: 36, borderRadius: 999,
               border: 'none',
-              background: !text.trim() ? '#2a2a2a' : '#FFB382',
-              color: !text.trim() ? '#666' : '#1a1a1a',
+              background: (!text.trim() && chips.length === 0) ? '#2a2a2a' : '#FFB382',
+              color: (!text.trim() && chips.length === 0) ? '#666' : '#1a1a1a',
               fontSize: 18, fontWeight: 700, cursor: 'pointer',
               display: 'flex', alignItems: 'center', justifyContent: 'center',
             }}
@@ -2825,19 +3913,27 @@ function InlineSpinner({ color = '#FFB382', size = 12 }: { color?: string; size?
   );
 }
 
-function ParamPill({ active, onClick, children }: { active: boolean; onClick: () => void; children: any }) {
+function ParamPill({ active, onClick, children, busy = false, disabled = false }: {
+  active: boolean; onClick: () => void; children: any; busy?: boolean; disabled?: boolean;
+}) {
   return (
     <button
       onClick={onClick}
+      disabled={disabled}
       style={{
         padding: '8px 12px', borderRadius: 10,
         background: active ? 'rgba(255,178,130,0.18)' : '#222',
         border: active ? '1px solid #FFB382' : '1px solid #2a2a2a',
         color: active ? '#FFB382' : '#bbb',
-        fontSize: 13, fontWeight: 500, cursor: 'pointer',
+        fontSize: 13, fontWeight: 500,
+        // The tapped pill spins (cursor:wait); the others dim while one applies.
+        cursor: busy ? 'wait' : disabled ? 'default' : 'pointer',
+        opacity: disabled && !busy ? 0.4 : 1,
         textAlign: 'center',
+        display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: 6,
       }}
     >
+      {busy && <InlineSpinner color={active ? '#FFB382' : '#bbb'} size={11} />}
       {children}
     </button>
   );
@@ -3118,454 +4214,91 @@ function useEntryExpanded(id: string, defaultOpen: boolean): [boolean, (v: boole
   return [open, set];
 }
 
+// ── Collapse-toggle bottom-stick (mirror desktop useStableCollapseToggle's
+// wasAtBottom branch) ──────────────────────────────────────────────────────
+// EntryView cards live deep inside the virtua list and can't reach ChatView's
+// scrollParentRef directly. ChatView registers its scroll container here once;
+// any card's toggle calls stickToggle(fn) which: snapshots whether the user was
+// glued to the bottom BEFORE flipping, runs the toggle, then re-sticks to the
+// new bottom across two rAFs (virtua needs a frame to re-measure the grown/
+// shrunk item). If the user wasn't at the bottom, position is left untouched.
+// Covers thinking, tool cards, diff, user-prompt — every collapsible block.
+let _scrollContainer: HTMLElement | null = null;
+function registerScrollContainer(el: HTMLElement | null) { _scrollContainer = el; }
+const STICK_BOTTOM_PX = 80; // a bit looser than desktop's 4px — touch scroll rounding
+function stickToggle(toggle: () => void) {
+  const sc = _scrollContainer;
+  if (!sc) { toggle(); return; }
+  const wasAtBottom = (sc.scrollHeight - sc.scrollTop - sc.clientHeight) <= STICK_BOTTOM_PX;
+  toggle();
+  if (!wasAtBottom) return;
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    const el = _scrollContainer;
+    if (el) el.scrollTop = el.scrollHeight;
+  }));
+}
+
+// ── Полный рендер чата теперь живёт в @noted/claude-blocks::ChatMessage ──────
+// Раньше EntryView сам рисовал каждый kind (user/assistant/thinking/tool/slash/
+// compact/error) — это была мобильная копия десктопной раскладки. Теперь весь
+// визуал строки (расположение, бабблы, бейджи, чипы, карточки) — в пакете, а
+// мобила лишь (1) маппит UiEntry → ChatEntry, (2) внедряет свой collapse-
+// контроллер (persist через _entryExpanded + bottom-stick через stickToggle).
+// Под капотом lifecycle (SSE/JSONL/kill) — по-прежнему у мобилы, пакет его не
+// касается. Перекраска бабла под Claude-оранж (был #1f3a5f) — намеренно: «как
+// в десктопе» (canon — десктопный SDK).
+
+function uiToChatEntry(e: UiEntry): CBChatEntry {
+  switch (e.kind) {
+    case 'tool':
+      return { kind: 'tool', id: e.id, tool: e.tool, input: e.input, result: e.result, isError: e.isError, entryUuid: (e as any).entryUuid };
+    case 'compact-summary':
+      return { kind: 'compact-summary', id: e.id, text: e.text, entryUuid: e.entryUuid, metrics: e.metrics };
+    default:
+      return e as unknown as CBChatEntry; // user/assistant/thinking/slash/error — shape совпадает
+  }
+}
+
+// Глобальный re-render по любому toggle: virtua держит в DOM только видимые
+// ряды, так что перерисуются лишь они. Open-state читается из _entryExpanded
+// (переживает unmount при скролле), version-counter лишь дёргает React.
+let _globalToggleVersion = 0;
+const _globalToggleListeners = new Set<() => void>();
+function bumpGlobalToggle() {
+  _globalToggleVersion++;
+  _globalToggleListeners.forEach((cb) => cb());
+}
+function useGlobalToggle() {
+  const [, force] = useState(0);
+  useEffect(() => {
+    const cb = () => force((n) => n + 1);
+    _globalToggleListeners.add(cb);
+    return () => { _globalToggleListeners.delete(cb); };
+  }, []);
+}
+
+// Мобильный collapse-контроллер для пакета: isOpen читает persist-карту,
+// toggle оборачивает запись в stickToggle (bottom-stick) + глобальный re-render.
+const mobileCollapse: CBCollapseController = {
+  isOpen: (id: string, defaultOpen: boolean) => getEntryExpanded(id, defaultOpen),
+  toggle: (id: string, next: boolean) => {
+    stickToggle(() => {
+      setEntryExpanded(id, next);
+      bumpGlobalToggle();
+    });
+  },
+};
+const mobileRenderCtx: CBChatRenderContext = { collapse: mobileCollapse };
+
 function EntryView({ entry }: { entry: UiEntry }) {
-  if (entry.kind === 'user') {
-    return (
-      <div
-        data-entry-uuid={entry.entryUuid}
-        style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', padding: '6px 12px' }}
-      >
-        {/* "queued" chip — desktop отправил из type-ahead очереди (Enter во
-            время стриминга). Mirror desktop UserMsg badge. Live-only; история
-            при reload потеряет флаг — это намеренно (Anthropic JSONL не несёт
-            UI-метаданные). */}
-        {entry.wasQueued && (
-          <div style={{
-            display: 'inline-flex', alignItems: 'center', gap: 3,
-            marginBottom: 4,
-            padding: '2px 6px',
-            borderRadius: 6,
-            background: 'rgba(255, 178, 130, 0.10)',
-            color: '#FFB382',
-            border: '1px solid rgba(255, 178, 130, 0.25)',
-            fontSize: 10,
-            fontWeight: 600,
-            letterSpacing: '0.04em',
-            userSelect: 'none',
-          }}>
-            <span style={{ fontSize: 9 }}>↑</span>
-            <span>QUEUED</span>
-          </div>
-        )}
-        <div style={{
-          ...S.bubble,
-          background: '#1f3a5f',
-          color: '#e0e6ed',
-          maxWidth: '85%',
-          whiteSpace: 'pre-wrap',
-          wordBreak: 'break-word',
-        }}>
-          <CollapsibleText text={entry.text} threshold={600} previewSize={400} />
-        </div>
-      </div>
-    );
-  }
-  if (entry.kind === 'thinking') {
-    return <ThinkingCard id={entry.id} text={entry.text} />;
-  }
-  if (entry.kind === 'assistant') {
-    // Assistant fills the full chat width — no bubble cap. Tools/MCP do too,
-    // so the conversation has a single text column instead of a chat-bubble
-    // shape that wastes the right edge for assistant content.
-    return (
-      <div style={{ padding: '8px 14px' }}>
-        <div style={{
-          color: '#cccccc',
-          fontSize: 14,
-          lineHeight: 1.5,
-          wordBreak: 'break-word',
-        }}>
-          {entry.text ? <Markdown text={entry.text} /> : <span style={{ color: '#555' }}>…</span>}
-        </div>
-      </div>
-    );
-  }
-  if (entry.kind === 'tool') {
-    return <ToolCard entry={entry} />;
-  }
-  if (entry.kind === 'slash') {
-    // Violet chip — right-aligned like a user prompt but compact and one-line.
-    // Mirror of desktop UserMsg isSlashCommand branch (rgba(129,140,248,*)).
-    // Distinct color from user-bubble's blue/orange so it reads as "system
-    // action, not regular prompt".
-    return (
-      <div
-        data-entry-uuid={entry.entryUuid}
-        style={{ display: 'flex', justifyContent: 'flex-end', padding: '4px 12px' }}
-      >
-        <div style={{
-          display: 'inline-flex', alignItems: 'center',
-          padding: '4px 10px', borderRadius: 8,
-          background: 'rgba(129, 140, 248, 0.10)',
-          color: '#a5b4fc',
-          border: '1px solid rgba(129, 140, 248, 0.28)',
-          fontSize: 13,
-          fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-          userSelect: 'none',
-          maxWidth: '85%',
-          wordBreak: 'break-all',
-        }}>
-          {entry.text}
-        </div>
-      </div>
-    );
-  }
-  if (entry.kind === 'compact-summary') {
-    return <CompactSummaryCard entry={entry} />;
-  }
-  if (entry.kind === 'error') {
-    return (
-      <div style={{ padding: '4px 12px' }}>
-        <div style={{ background: '#2a1316', color: '#f38ba8', borderRadius: 10, padding: '8px 12px', fontSize: 12 }}>{entry.text}</div>
-      </div>
-    );
-  }
-  return null;
+  useGlobalToggle(); // re-render visible row on any collapse toggle
+  return <CBChatMessage entry={uiToChatEntry(entry)} ctx={mobileRenderCtx} />;
 }
 
-// Compact-summary card — orange "Compact summary" header + collapsible long
-// body. Mirrors desktop CompactSummaryMsg layout but mobile-tuned (smaller
-// font, no JetBrainsMono — system body text). 600-char preview matches the
-// desktop COMPACT_COLLAPSED_CHARS.
-const COMPACT_PREVIEW_CHARS = 600;
-function CompactSummaryCard({ entry }: { entry: UiEntry & { kind: 'compact-summary' } }) {
-  const [open, setOpen] = useEntryExpanded(entry.id, false);
-  const text = entry.text || '';
-  const metrics = entry.metrics;
-  const needsCollapse = text.length > COMPACT_PREVIEW_CHARS;
-  const preview = text.slice(0, COMPACT_PREVIEW_CHARS).trimEnd();
-  const k = (n: number) => n >= 1000 ? (n / 1000).toFixed(1) + 'K' : String(n);
-  const s = metrics ? Math.round(metrics.durationMs / 1000) : 0;
-  const toggle = needsCollapse ? (
-    <button
-      onClick={() => setOpen(!open)}
-      style={{
-        background: 'transparent', border: 'none', cursor: 'pointer',
-        color: '#FFB382', fontSize: 12, padding: 0,
-        textAlign: 'left', marginTop: 6,
-      }}
-    >
-      {open ? 'Свернуть' : `Раскрыть полностью (${text.length.toLocaleString()} символов)`}
-    </button>
-  ) : null;
-  return (
-    <div data-entry-uuid={entry.entryUuid} style={{ padding: '6px 12px' }}>
-      <div style={{
-        background: 'rgba(218, 119, 86, 0.06)',
-        border: '1px solid rgba(218, 119, 86, 0.30)',
-        borderRadius: 12,
-        padding: '10px 12px',
-      }}>
-        <div style={{
-          display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10,
-          marginBottom: 8,
-        }}>
-          <span style={{
-            fontSize: 11, fontWeight: 700, letterSpacing: 0.5,
-            color: '#DA7756', textTransform: 'uppercase',
-          }}>
-            Compact summary
-          </span>
-          {metrics && (
-            <span style={{
-              fontSize: 10, color: '#a87356',
-              fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-            }}>
-              {k(metrics.preTokens)} → {k(metrics.postTokens)} · {s}s
-            </span>
-          )}
-        </div>
-        <div style={{
-          color: '#d4d4d4',
-          fontSize: 13, lineHeight: 1.45,
-          whiteSpace: 'pre-wrap', wordBreak: 'break-word',
-        }}>
-          {needsCollapse && !open ? preview + '…' : text}
-        </div>
-        {toggle}
-      </div>
-    </div>
-  );
-}
-
-// CollapsibleText — preview + toggle, never ellipsis. Same pattern as
-// desktop SDK CollapsibleText (fact-claude-sdk-tab.md).
-function CollapsibleText({ text, threshold, previewSize }: { text: string; threshold: number; previewSize: number }) {
-  const [open, setOpen] = useState(false);
-  if (text.length <= threshold) return <>{text}</>;
-  const preview = open ? text : text.slice(0, previewSize) + '…';
-  return (
-    <>
-      {preview}
-      <button
-        onClick={() => setOpen(!open)}
-        style={{
-          display: 'block', marginTop: 6,
-          background: 'transparent', border: 'none', cursor: 'pointer',
-          color: '#FFB382', fontSize: 11, padding: 0,
-        }}
-      >
-        {open ? 'Свернуть' : `Раскрыть полностью (${text.split('\n').length} строк)`}
-      </button>
-    </>
-  );
-}
-
-// ToolCard — chevron · status-dot · LABEL · counters · target on next line.
-// Tool-specific bodies via dispatching on entry.tool name.
-// Markdown renderer for assistant text + thinking. Uses react-markdown + GFM
-// (tables, strikethrough, task lists). Styling lives in the .md-body CSS block
-// at the top of this file — colours match the desktop SDK chat as much as
-// makes sense on mobile (smaller font, looser line-height for legibility).
-function Markdown({ text }: { text: string }) {
-  return (
-    <div className="md-body">
-      <ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown>
-    </div>
-  );
-}
-
-// Thinking block — same shape as ToolCard so the chat has consistent grammar.
-// Header is the click target (chevron toggle); body is italic muted text.
-// Default open while there's no body yet (streaming) — collapses easily once
-// the user has read it.
-function ThinkingCard({ id, text }: { id: string; text: string }) {
-  // Default COLLAPSED to match desktop. Expanded state stored in module-level
-  // map keyed by entry id, so virtuoso re-mounts (scroll-out → scroll-back)
-  // preserve the user's choice. See useEntryExpanded comment block above.
-  const [open, setOpen] = useEntryExpanded(id, false);
-  return (
-    <div style={{ padding: '4px 12px' }}>
-      <div style={{
-        background: 'rgba(40, 40, 60, 0.20)',
-        border: '1px solid #2a2a3a',
-        borderRadius: 10,
-        overflow: 'hidden',
-      }}>
-        <div
-          onClick={() => setOpen(!open)}
-          style={{
-            display: 'flex', alignItems: 'center', gap: 8,
-            padding: '8px 12px', cursor: 'pointer',
-            borderBottom: open ? '1px solid #232336' : 'none',
-          }}
-        >
-          <span style={{
-            color: '#666', fontSize: 11,
-            transition: 'transform 0.15s',
-            transform: open ? 'rotate(90deg)' : 'rotate(0)',
-          }}>▶</span>
-          <span style={{ color: '#7a7aa0', fontSize: 11 }}>◆</span>
-          <span style={{
-            fontSize: 10, color: '#cdd6f4', fontWeight: 700, letterSpacing: 0.5,
-            background: 'rgba(122, 122, 160, 0.15)', padding: '2px 7px', borderRadius: 4,
-          }}>THINKING</span>
-        </div>
-        {open && (
-          <div style={{
-            padding: '10px 12px',
-            fontSize: 13, color: '#9da0c0', fontStyle: 'italic',
-            whiteSpace: 'pre-wrap', lineHeight: 1.45,
-            wordBreak: 'break-word',
-          }}>
-            {text || <span style={{ color: '#555' }}>thinking…</span>}
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function ToolCard({ entry }: { entry: UiEntry & { kind: 'tool' } }) {
-  const isPending = entry.result === undefined;
-  const isError = entry.isError;
-  // Default OPEN only for errors / pending. After completion → COLLAPSED.
-  // State persists across virtuoso re-mounts via module-level Map.
-  const [open, setOpen] = useEntryExpanded(entry.id, isError || isPending);
-  const statusColor = isError ? '#f38ba8' : isPending ? '#FFB382' : '#a6e3a1';
-  const tool = entry.tool;
-  const input = entry.input || {};
-
-  // Target/path/command summary in header line under name
-  let target: string | null = null;
-  if (tool === 'Bash' && typeof input.command === 'string') target = input.command;
-  else if ((tool === 'Read' || tool === 'Edit' || tool === 'Write' || tool === 'Glob' || tool === 'Grep') && typeof input.file_path === 'string') target = input.file_path;
-  else if (typeof input.path === 'string') target = input.path;
-
-  // Diff stats for Edit/Write
-  let diffStats: { added: number; removed: number } | null = null;
-  if (tool === 'Edit' && typeof input.old_string === 'string' && typeof input.new_string === 'string') {
-    diffStats = computeDiffStats(input.old_string, input.new_string);
-  } else if (tool === 'Write' && typeof input.content === 'string') {
-    diffStats = { added: input.content.split('\n').length, removed: 0 };
-  }
-
-  return (
-    <div style={{ padding: '4px 12px' }}>
-      <div style={{
-        background: '#141414',
-        border: '1px solid ' + (isError ? 'rgba(243,139,168,0.3)' : '#252525'),
-        borderRadius: 10,
-        overflow: 'hidden',
-      }}>
-        {/* Header */}
-        <div
-          onClick={() => setOpen(!open)}
-          style={{
-            display: 'flex', alignItems: 'center', gap: 8,
-            padding: '8px 12px',
-            cursor: 'pointer',
-            borderBottom: open ? '1px solid #1f1f1f' : 'none',
-          }}
-        >
-          <span style={{ color: '#666', fontSize: 11, transition: 'transform 0.15s', transform: open ? 'rotate(90deg)' : 'rotate(0)' }}>▶</span>
-          <span style={{
-            color: statusColor, fontSize: 13,
-            ...(isPending ? { animation: 'noted-dot-pulse 1.4s infinite' } : {}),
-          }}>●</span>
-          <span style={{
-            fontSize: 10, color: '#cdd6f4', fontWeight: 700, letterSpacing: 0.5,
-            background: '#1f1f1f', padding: '2px 7px', borderRadius: 4,
-          }}>{tool.toUpperCase()}</span>
-          {diffStats && (
-            <span style={{ fontSize: 11, fontFamily: 'ui-monospace, monospace' }}>
-              <span style={{ color: '#a6e3a1' }}>+{diffStats.added}</span>{' '}
-              <span style={{ color: '#f38ba8' }}>−{diffStats.removed}</span>
-            </span>
-          )}
-          {isPending && <span style={{ marginLeft: 'auto', fontSize: 10, color: '#666' }}>running</span>}
-          {isError && <span style={{ marginLeft: 'auto', fontSize: 10, color: '#f38ba8' }}>error</span>}
-          {/* No "done" badge — successful completion is implied by the absence
-              of running/error and by the green dot. The label was just visual noise. */}
-        </div>
-
-        {target && (
-          <div style={{
-            padding: '6px 12px',
-            fontSize: 11, color: '#888',
-            fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-            wordBreak: 'break-all',
-            borderBottom: open ? '1px solid #1f1f1f' : 'none',
-          }}>
-            {target}
-          </div>
-        )}
-
-        {open && (
-          <div>
-            {/* Tool-specific body */}
-            {tool === 'Edit' && typeof input.old_string === 'string' && typeof input.new_string === 'string' ? (
-              <DiffView oldText={input.old_string} newText={input.new_string} />
-            ) : tool === 'Write' && typeof input.content === 'string' ? (
-              <CodePreview text={input.content} maxLines={24} highlightLine={() => '#a6e3a1'} prefix="+" />
-            ) : null}
-
-            {/* Result */}
-            {entry.result && (
-              <div style={{
-                padding: '8px 12px', fontSize: 11,
-                fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-                color: isError ? '#f38ba8' : '#9aa0a6',
-                whiteSpace: 'pre-wrap', wordBreak: 'break-word',
-                background: '#0d0d0d',
-                borderTop: '1px solid #1f1f1f',
-                maxHeight: 240, overflow: 'auto',
-              }}>
-                <ResultPreview text={entry.result} maxLines={tool === 'Read' ? 8 : 10} />
-              </div>
-            )}
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function ResultPreview({ text, maxLines }: { text: string; maxLines: number }) {
-  const [open, setOpen] = useState(false);
-  const lines = text.split('\n');
-  if (lines.length <= maxLines && text.length < 800) return <>{text}</>;
-  const preview = open ? text : lines.slice(0, maxLines).join('\n');
-  return (
-    <>
-      {preview}
-      {!open && lines.length > maxLines && <div style={{ color: '#555', marginTop: 4 }}>… +{lines.length - maxLines} more lines</div>}
-      <button
-        onClick={(e) => { e.stopPropagation(); setOpen(!open); }}
-        style={{
-          display: 'block', marginTop: 6, background: 'transparent', border: 'none',
-          color: '#FFB382', fontSize: 11, cursor: 'pointer', padding: 0,
-        }}
-      >
-        {open ? 'Свернуть' : `Раскрыть (${lines.length} строк)`}
-      </button>
-    </>
-  );
-}
-
-function CodePreview({ text, maxLines, prefix = '' }: { text: string; maxLines: number; prefix?: string; highlightLine?: () => string }) {
-  const lines = text.split('\n');
-  const showAll = lines.length <= maxLines;
-  const visible = showAll ? lines : lines.slice(0, maxLines);
-  return (
-    <div style={{
-      padding: '8px 12px', fontSize: 11,
-      fontFamily: 'ui-monospace, monospace',
-      background: '#0d0d0d',
-      maxHeight: maxLines * 18 + 20, overflow: 'auto',
-    }}>
-      {visible.map((line, i) => (
-        <div key={i} style={{ color: '#a6e3a1', whiteSpace: 'pre' }}>{prefix}{line}</div>
-      ))}
-      {!showAll && <div style={{ color: '#555', marginTop: 4 }}>… +{lines.length - maxLines} more</div>}
-    </div>
-  );
-}
-
-// Cheap line-level diff: just count and color whole lines that changed.
-// Not a Myers diff — that's a lot of code for mobile screen real estate.
-function DiffView({ oldText, newText }: { oldText: string; newText: string }) {
-  const oldLines = oldText.split('\n');
-  const newLines = newText.split('\n');
-  const max = Math.min(24, Math.max(oldLines.length, newLines.length));
-  const rows: Array<{ kind: '+' | '-' | '='; text: string }> = [];
-  // Simple alignment: render removed block then added block. Good enough for
-  // typical Edit (small replacement); Myers can come later if needed.
-  for (let i = 0; i < oldLines.length && rows.length < max * 2; i++) {
-    rows.push({ kind: '-', text: oldLines[i] });
-  }
-  for (let i = 0; i < newLines.length && rows.length < max * 2; i++) {
-    rows.push({ kind: '+', text: newLines[i] });
-  }
-  const truncated = oldLines.length + newLines.length > rows.length;
-
-  return (
-    <div style={{
-      padding: '8px 12px', fontSize: 11,
-      fontFamily: 'ui-monospace, monospace',
-      background: '#0d0d0d',
-      maxHeight: 320, overflow: 'auto',
-    }}>
-      {rows.map((r, i) => (
-        <div key={i} style={{
-          background: r.kind === '+' ? 'rgba(166,227,161,0.10)' : r.kind === '-' ? 'rgba(243,139,168,0.10)' : 'transparent',
-          color: r.kind === '+' ? '#a6e3a1' : r.kind === '-' ? '#f38ba8' : '#888',
-          padding: '0 4px', whiteSpace: 'pre-wrap', wordBreak: 'break-all',
-        }}>
-          <span style={{ opacity: 0.7, marginRight: 6 }}>{r.kind}</span>{r.text}
-        </div>
-      ))}
-      {truncated && (
-        <div style={{ color: '#555', marginTop: 4 }}>… diff truncated</div>
-      )}
-    </div>
-  );
-}
-
-function computeDiffStats(oldText: string, newText: string): { added: number; removed: number } {
-  // Same heuristic as desktop's quick diff stats — line counts.
-  return { removed: oldText.split('\n').length, added: newText.split('\n').length };
-}
+// Per-kind mobile cards (CompactSummaryCard / CollapsibleText / UserText /
+// Markdown / ThinkingCard / ToolCard) — УДАЛЕНЫ. Весь визуал строки чата теперь
+// в @noted/claude-blocks::ChatMessage (см. EntryView выше). Раскрытие/скролл
+// внедряются через mobileRenderCtx (persist + stickToggle).
 
 // ────────── Inline styles ──────────
 
@@ -3650,6 +4383,14 @@ if (typeof document !== 'undefined' && !document.getElementById('noted-mobile-ke
   const style = document.createElement('style');
   style.id = 'noted-mobile-keyframes';
   style.textContent = `
+/* @property for smooth conic-gradient angle interpolation in .mob-awaiting-ring
+   (without it the angle jumps stepwise instead of rotating). Mirror of desktop
+   globals.css @property --awaiting-angle. Must sit at stylesheet top level. */
+@property --mob-awaiting-angle {
+  syntax: '<angle>';
+  initial-value: 0deg;
+  inherits: false;
+}
 @keyframes noted-dot-pulse { 0%,100% { opacity: 0.3; transform: scale(0.8); } 50% { opacity: 1; transform: scale(1); } }
 @keyframes noted-live-pulse {
   0%,100% { box-shadow: 0 0 6px rgba(255,178,130,0.5); }
@@ -3663,6 +4404,55 @@ if (typeof document !== 'undefined' && !document.getElementById('noted-mobile-ke
   50% { opacity: 0.55; transform: scale(0.72); }
 }
 @keyframes mob-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+/* "Claude is asking a question" rotating border — copied 1:1 from the desktop
+   .tab-awaiting-input (globals.css). conic-gradient traveling segment + faint
+   constant ring, masked (content-box XOR border-box) to a 1.2px border, angle
+   animated via @property for smooth rotation (Chromium 120+ / WKWebView 16+).
+   Applied to both the project-tab row (TabRow) and the chat-tab frame (ChatView).
+   background-color is NOT animated — the moving bright segment carries the
+   signal (high per-frame pixel delta → codec/AI-detectable). */
+@keyframes mob-awaiting-spin { to { --mob-awaiting-angle: 360deg; } }
+.mob-awaiting-ring {
+  padding: 1.2px;
+  background:
+    conic-gradient(from var(--mob-awaiting-angle, 0deg),
+      rgba(168, 85, 247, 0) 0deg,
+      rgba(168, 85, 247, 0) 240deg,
+      rgba(168, 85, 247, 0.85) 312deg,
+      rgba(216, 180, 254, 1) 348deg,
+      rgba(168, 85, 247, 0) 360deg),
+    rgba(147, 51, 234, 0.22);
+  -webkit-mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  mask-composite: exclude;
+  animation: mob-awaiting-spin 1.6s linear infinite;
+  pointer-events: none;
+}
+/* Process-bar STRIP loader (mirror of desktop tab-process-bar). The edge strip
+   pulses colorA↔colorB while the process is alive (background-color delta =
+   codec-safe per AI-Optimized UI, NOT opacity). Vars set inline per-row from
+   the shared processBar config. */
+@keyframes mob-pbar-pulse {
+  0%,100% { background-color: var(--mob-pbar-a, #155E75); }
+  50%     { background-color: var(--mob-pbar-b, #0E7490); }
+}
+/* AI-busy shimmer band sweeping DOWN the strip — the "loader is generating" cue
+   (same metaphor as desktop tab-process-bar-ai-shimmer-overlay). Whitish band
+   ~40% tall translates top→bottom; seamless loop (-100%→250% both off-screen). */
+.mob-pbar-shimmer {
+  position: absolute; left: 0; right: 0; height: 40%;
+  background: linear-gradient(to bottom, rgba(255,255,255,0) 0%, rgba(255,255,255,0.6) 50%, rgba(255,255,255,0) 100%);
+  animation: mob-pbar-shimmer-sweep 1.2s linear infinite;
+}
+@keyframes mob-pbar-shimmer-sweep {
+  0%   { transform: translateY(-100%); }
+  100% { transform: translateY(250%); }
+}
 /* Suppress iOS text-selection glow on tap & long-press for tab rows / sheet
    buttons. The system selection highlights "TERMINAL"/"SDK" badges otherwise. */
 button, .noted-no-select { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
@@ -3677,46 +4467,8 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
    when an inline transform overrides scale. */
 .noted-icon:active { background: #333 !important; }
 
-/* Markdown body — matches desktop SDK chat colours. p, ul, ol, code, pre,
-   blockquote handled. Headings are slightly smaller than desktop because
-   mobile lines are shorter and a 1.5em h1 dominates the column. */
-.md-body { color: inherit; line-height: 1.5; word-break: break-word; }
-.md-body p { margin: 0 0 8px; }
-.md-body p:last-child { margin-bottom: 0; }
-.md-body strong { color: #ffa348; }
-.md-body em { color: #69dbdb; }
-.md-body code {
-  background: rgba(80, 80, 80, 0.4);
-  color: #50fa7b;
-  padding: 1px 5px; border-radius: 3px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 0.92em;
-  word-break: break-all;
-}
-.md-body pre {
-  background: rgba(80, 80, 80, 0.25);
-  border-radius: 6px;
-  padding: 10px 12px;
-  margin: 8px 0;
-  overflow-x: auto;
-  font-size: 12px;
-}
-.md-body pre code { background: transparent; padding: 0; color: #cccccc; font-size: inherit; }
-.md-body ul, .md-body ol { margin: 4px 0 8px; padding-left: 22px; }
-.md-body li { margin-bottom: 4px; }
-.md-body h1 { font-size: 1.25em; margin: 12px 0 6px; color: #c678dd; }
-.md-body h2 { font-size: 1.15em; margin: 10px 0 6px; color: #b197fc; }
-.md-body h3 { font-size: 1.05em; margin: 8px 0 4px; color: #a78bfa; }
-.md-body h4, .md-body h5, .md-body h6 { font-size: 1em; margin: 6px 0 3px; color: #9775fa; font-weight: 600; }
-.md-body blockquote {
-  margin: 6px 0; padding: 4px 10px;
-  border-left: 3px solid #444; color: #888;
-}
-.md-body a { color: #88c0d0; text-decoration: underline; }
-.md-body hr { border: none; height: 1px; background: rgba(255,255,255,0.15); margin: 12px 0; }
-.md-body table { border-collapse: collapse; margin: 8px 0; font-size: 0.92em; }
-.md-body th, .md-body td { border: 1px solid #2a2a2a; padding: 4px 8px; }
-.md-body th { background: #1a1a1a; color: #cdd6f4; }
+/* Markdown rendering moved to @noted/claude-blocks (.cb-prose). The old mobile
+   .md-body block was removed — visual canon is the shared package now. */
 ::-webkit-scrollbar { width: 0; height: 0; }
 
 /* Composer textarea — orange scrollbar appears ONLY when content exceeds the

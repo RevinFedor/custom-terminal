@@ -11,6 +11,10 @@ bootstrapPersistedStorage();
 import App from './App';
 import './styles/globals.css';
 import './styles/sidebar.css';
+// Portable Claude-conversation blocks (tool cards / bash / diff / thinking /
+// markdown) + design-token theme. Imported AFTER globals so the host could
+// override any --cb-* token there if needed. See packages/claude-blocks.
+import '@noted/claude-blocks/styles.css';
 
 // === code-inspector: Claude/Cursor-friendly clipboard formatter ===
 // The plugin emits `code-inspector:trackCode` with `detail = HTMLElement` on

@@ -102,11 +102,14 @@ export default function SemanticIndexButton({ onOpenSettings }: SemanticIndexBut
       });
     };
 
-    const onRebuildStarted = (_e: any, payload: { projectId: string; parallelism?: number }) => {
+    const onRebuildStarted = (_e: any, payload: { projectId: string; parallelism?: number; outdatedTotal?: number }) => {
       if (payload.projectId !== activeProjectIdRef.current) return;
       setIsRunning(true);
       setRunningParallelism(typeof payload.parallelism === 'number' ? payload.parallelism : null);
-      setProgress({ outdatedTotal: 0, outdatedCompleted: 0, currentFile: '' });
+      // Seed the total from the start payload so the counter reads `0/3` (real
+      // outdated count) immediately, not `…`. main computed it via computeStatus
+      // before spawning the script.
+      setProgress({ outdatedTotal: payload.outdatedTotal ?? 0, outdatedCompleted: 0, currentFile: '' });
     };
 
     const onProgress = (_e: any, payload: any) => {

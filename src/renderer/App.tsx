@@ -23,7 +23,8 @@ import { combine } from '@atlaskit/pragmatic-drag-and-drop/combine';
 import './utils/logger';
 import { usePromptQueueRunner } from './hooks/usePromptQueueRunner';
 import { markPendingResume } from './utils/pendingResume';
-import { hydratePromptQueueStore } from './store/usePromptQueueStore';
+import { hydratePromptQueueStore, usePromptQueueStore, serializePromptQueueCore } from './store/usePromptQueueStore';
+import { usePromptQueueWebSync } from './hooks/usePromptQueueWebSync';
 import { useMirrorStatusStore } from './store/useMirrorStatusStore';
 
 const { ipcRenderer } = window.require('electron');
@@ -53,6 +54,7 @@ interface ProjectTabItemProps {
   activeProcessCount?: number; // Count of running processes in project
   interruptedCount?: number; // Count of interrupted (paused) sessions in project
   isProjectBusy?: boolean; // Any tab in project has Claude/Gemini thinking
+  isProjectAwaiting?: boolean; // Any tab in project blocked on AskUserQuestion (needs answer)
   isEditing: boolean;
   editValue: string;
   onEditChange: (val: string) => void;
@@ -88,6 +90,7 @@ const ProjectTabItem = memo(({
   onTabDrop,
   isAreaActive,
   isProjectBusy = false,
+  isProjectAwaiting = false,
   isProjectLoading = false
 }: ProjectTabItemProps) => {
   const ref = useRef<HTMLButtonElement>(null);
@@ -202,6 +205,13 @@ const ProjectTabItem = memo(({
     >
       {isActive && (
         <div className="absolute inset-0 bg-white rounded-sm" />
+      )}
+      {/* Awaiting-user-input — project has a tab blocked on AskUserQuestion.
+          Purple wash pulses over the whole project tab (above the active-white
+          bg, below the z-10 text) so it's visible whether or not the project is
+          active. Same signal/keyframe as the per-tab glow. */}
+      {isProjectAwaiting && (
+        <div className="tab-awaiting-input absolute inset-0 rounded-sm" style={{ zIndex: 5 }} aria-hidden />
       )}
       <span className="relative z-10 flex items-center gap-1.5">
         {isEditing ? (
@@ -352,6 +362,10 @@ function App() {
   // it fixes (auto-run silently breaking the moment user goes to another tab).
   usePromptQueueRunner();
 
+  // Broadcast per-tab queue deltas to any connected phone (queue-update SSE).
+  // Pure mirror — fires only when a connected mobile cares; no-op otherwise.
+  usePromptQueueWebSync();
+
   // Hydrate persisted queues from SQLite once at boot. Fire-and-forget — the
   // runner above tolerates queue items appearing after mount (subscribes to
   // store deltas), so this doesn't need to block render.
@@ -403,40 +417,9 @@ function App() {
     root.style.setProperty('--process-bar-duration', `${processBar.durationMs}ms`);
   }, [processBar.colorA, processBar.colorB, processBar.durationMs]);
 
-  // Sync aiPulse settings → CSS variables on :root.
-  // Keyframe tab-ai-busy-pulse читает --ai-pulse-color-a/b/duration; раньше
-  // полагался на --process-bar-color-b (один цвет на два разных индикатора).
-  // ВАЖНО: вычисляем peak-color (rgba) на JS-стороне, не используем
-  // color-mix(...) внутри keyframe — Chromium не всегда плавно интерполирует
-  // между двумя color-mix() значениями, юзер видит как «через разный
-  // промежуток происходит мигание», без плавности. Plain rgba endpoints
-  // интерполируются по каждому каналу как обычные числа → плавно.
-  const aiPulse = useUIStore((s) => s.aiPulse);
-  useEffect(() => {
-    const root = document.documentElement;
-    const hexToRgba = (hex: string, alpha: number): string => {
-      if (hex === 'transparent') return 'rgba(0,0,0,0)';
-      const clean = hex.replace(/^#/, '');
-      if (clean.length !== 6) return `rgba(218,119,86,${alpha})`;
-      const r = parseInt(clean.slice(0, 2), 16);
-      const g = parseInt(clean.slice(2, 4), 16);
-      const b = parseInt(clean.slice(4, 6), 16);
-      if (isNaN(r) || isNaN(g) || isNaN(b)) return `rgba(218,119,86,${alpha})`;
-      return `rgba(${r},${g},${b},${alpha})`;
-    };
-    // colorA = нижняя фаза. 'transparent' интерпретируем как полностью прозрачный.
-    const colorALow = aiPulse.colorA === 'transparent'
-      ? 'rgba(0,0,0,0)'
-      : hexToRgba(aiPulse.colorA, 1);
-    // colorB = пик. 22% alpha — заметная подсветка таба без подавления текста.
-    const colorBPeak = hexToRgba(aiPulse.colorB, 0.22);
-    // Static-вариант (enabled=false) — мягче, 14% alpha.
-    const colorBStatic = hexToRgba(aiPulse.colorB, 0.14);
-    root.style.setProperty('--ai-pulse-color-a', colorALow);
-    root.style.setProperty('--ai-pulse-color-b', colorBPeak);
-    root.style.setProperty('--ai-pulse-color-static', colorBStatic);
-    root.style.setProperty('--ai-pulse-duration', `${aiPulse.durationMs}ms`);
-  }, [aiPulse.colorA, aiPulse.colorB, aiPulse.durationMs]);
+  // AIPulse (whole-tab background pulse) was removed — its :root var sync
+  // (--ai-pulse-*) went with it. The loader is the process-bar shimmer strip,
+  // configured via --process-bar-* above. See fact-process-bar.md::AIPulse removed.
 
   useEffect(() => {
     const onSettingsOpen = (e: Event) => {
@@ -533,6 +516,9 @@ function App() {
   const [projectEmptyZoneHovered, setProjectEmptyZoneHovered] = useState(false);
   const [processStatus, setProcessStatus] = useState<Map<string, boolean>>(new Map()); // tabId -> isRunning
   const [busyTabs, setBusyTabs] = useState<Map<string, boolean>>(new Map()); // tabId -> isBusy (Claude/Gemini thinking)
+  // tabId -> awaiting (Claude blocked on AskUserQuestion, waiting for human answer).
+  // Feeds the project-tab purple glow. Bracketed by claude:awaiting-input (main.js).
+  const [awaitingTabs, setAwaitingTabs] = useState<Map<string, boolean>>(new Map());
   const [apiLoadingProjects, setApiLoadingProjects] = useState<Set<string>>(new Set()); // projectIds with active API requests
 
   // Listen for project API loading events from ActionsPanel
@@ -930,7 +916,24 @@ function App() {
       const state = useWorkspaceStore.getState();
       state.setClaudeBusy(data.tabId, data.busy);
       setBusyTabs(prev => { const n = new Map(prev); if (data.busy) n.set(data.tabId, true); else n.delete(data.tabId); return n; });
+      // Safety net for awaiting ⊆ busy: any turn-end clears a lingering awaiting flag
+      // (user pressed Esc to cancel the whole turn instead of answering the question).
+      if (!data.busy) {
+        setAwaitingTabs(prev => { if (!prev.get(data.tabId)) return prev; const n = new Map(prev); n.delete(data.tabId); return n; });
+      }
     };
+
+    // AskUserQuestion bracket → project-tab purple glow. awaiting=true on PreToolUse,
+    // false on PostToolUse/PostToolUseFailure. See fact-claude-awaiting-input.md.
+    const handleAwaitingInput = (_: any, data: { tabId: string; awaiting: boolean }) => {
+      setAwaitingTabs(prev => {
+        if ((prev.get(data.tabId) || false) === data.awaiting) return prev;
+        const n = new Map(prev);
+        if (data.awaiting) n.set(data.tabId, true); else n.delete(data.tabId);
+        return n;
+      });
+    };
+    ipcRenderer.on('claude:awaiting-input', handleAwaitingInput);
 
     // SDK process-alive signal (single source for the control-bar indicator AND
     // the tab activity plate). Lives here (always-mounted) so the tab plate
@@ -1077,7 +1080,21 @@ function App() {
         if (action === 'getOpenProjectIds') {
           // Live snapshot of which projects are currently open in the desktop UI.
           // Used by /api/projects to split the mobile list into Active vs Other.
-          return reply(true, { ids: Array.from(state.openProjects.keys()), activeProjectId: state.activeProjectId || null });
+          // awaitingIds = projects with ≥1 claude tab blocked on AskUserQuestion —
+          // drives the rotating purple ring on the mobile project card.
+          const awaitingIds: string[] = [];
+          for (const [projId, ws] of state.openProjects) {
+            let anyAwaiting = false;
+            for (const t of ws.tabs.values()) {
+              if (t.commandType !== 'claude') continue;
+              try {
+                const p = await ipcRenderer.invoke('claude:get-presence', t.tabId);
+                if (p?.awaiting) { anyAwaiting = true; break; }
+              } catch {}
+            }
+            if (anyAwaiting) awaitingIds.push(projId);
+          }
+          return reply(true, { ids: Array.from(state.openProjects.keys()), activeProjectId: state.activeProjectId || null, awaitingIds });
         }
         if (action === 'getProjectTabsLive') {
           // Live tabs from an open project in renderer Zustand. Used by
@@ -1087,27 +1104,72 @@ function App() {
           if (!projectId) return reply(false, null, 'projectId required');
           const ws = state.openProjects.get(projectId);
           if (!ws) return reply(false, null, 'project not open in UI');
+          // Resolve the configurable status-marker palette once per call so each
+          // tab can carry its assigned-category COLOR (not just the id) — mobile
+          // has no access to useUIStore where the palette lives.
+          const uiState = useUIStore.getState();
+          const statusPalette = uiState.sessionStatuses || [];
           const tabs = await Promise.all(Array.from(ws.tabs.values()).map(async (t: any) => {
             let sessionStatus: 'active' | 'busy' | 'inactive' | null = null;
+            let awaiting = false;
             if (t.commandType === 'claude') {
               try {
                 const p = await ipcRenderer.invoke('claude:get-presence', t.tabId);
                 sessionStatus = p?.status || 'inactive';
+                awaiting = !!p?.awaiting;
               } catch { sessionStatus = 'inactive'; }
             }
+            // Assigned category status (dev/bugfix/knowledge/custom) — id stored
+            // on the tab, color looked up in the palette. Distinct from the
+            // runtime sessionStatus above (which drives the loader/background).
+            const statusId = t.sessionStatus || null;
+            const statusMeta = statusId ? statusPalette.find((s: any) => s.id === statusId) : null;
             return {
               tabId: t.tabId,
               name: t.name,
               tabType: t.tabType || 'terminal',
               commandType: t.commandType,
+              color: t.color || null,   // desktop TabColor — drives row bg on mobile
               cwd: t.cwd,
               claudeSessionId: t.claudeSessionId,
               sessionStatus,
+              awaiting,
+              statusId,
+              statusColor: statusMeta?.color || null,
             };
           }));
           return reply(true, {
             project: { id: projectId, name: ws.projectPath?.split('/').pop() || projectId, path: ws.projectPath },
             tabs,
+            statusMarker: { shape: uiState.statusMarker.shape, sizePx: uiState.statusMarker.sizePx },
+            processBar: {
+              enabled: uiState.processBar.enabled,
+              colorA: uiState.processBar.colorA,
+              colorB: uiState.processBar.colorB,
+              durationMs: uiState.processBar.durationMs,
+              position: uiState.processBar.position,
+            },
+          });
+        }
+        if (action === 'getStatusMarkerConfig') {
+          // Mobile-web reads the desktop's status-marker palette + shape/size AND
+          // the process-bar config (position/colors/pulse) so it can render the
+          // SAME left marker (category color + square/dot) AND the SAME loader
+          // strip (переливающаяся полоска left/right edge) the desktop TabBar
+          // draws. Source of truth is useUIStore (localStorage); there is no
+          // second config — mobile is a pure mirror.
+          const uiState = useUIStore.getState();
+          return reply(true, {
+            shape: uiState.statusMarker.shape,
+            sizePx: uiState.statusMarker.sizePx,
+            statuses: (uiState.sessionStatuses || []).map((s: any) => ({ id: s.id, color: s.color, label: s.label })),
+            processBar: {
+              enabled: uiState.processBar.enabled,
+              colorA: uiState.processBar.colorA,
+              colorB: uiState.processBar.colorB,
+              durationMs: uiState.processBar.durationMs,
+              position: uiState.processBar.position,
+            },
           });
         }
         if (action === 'createSDKTab') {
@@ -1167,7 +1229,8 @@ function App() {
             const t = ws.tabs.get(tabId);
             if (!t) continue;
             // PTY+Claude: derive model from bridgeMetadata (live), effort from
-            // tab's persisted choice OR the global default (claudeEffortLocal).
+            // the live _effortSentForTab sentinel (see below — single truth for
+            // what /effort this process is actually on).
             // Thinking is always "adaptive" on PTY — controlled by claude:toggle-thinking,
             // not surfaced as a separate param in the mobile UI here.
             if (t.commandType === 'claude' && t.tabType !== 'claude-sdk') {
@@ -1180,11 +1243,27 @@ function App() {
                 else if (rawModel.includes('sonnet')) model = 'sonnet';
                 else if (rawModel.includes('haiku')) model = 'haiku';
               } catch {}
+              // Effort = same "invisible intent" as desktop ControlBar: the only
+              // truth is what `/effort` we actually injected into THIS live Claude
+              // process. That lives in the `_effortSentForTab` sentinel (set on
+              // tui-ready / bridge-fresh / manual-click, cleared when Claude dies).
+              // Absent → process never got an effort inject (e.g. effort=none) or
+              // it died → report '?' so mobile shows a question mark instead of a
+              // confident-but-wrong 'high'. Do NOT seed from defaultClaudeEffort:
+              // that's the app default, not what this process is on.
+              const sentinel = (window as any).__effortSentForTab as Map<string, { level?: string }> | undefined;
+              const liveEffort = sentinel?.get(tabId)?.level;
+              // Think state: same invisible-intent model. Tracked in a shared
+              // window map written by the desktop ControlBar's toggleThink AND
+              // mobile setSDKParams below. Default ON (Claude boots with
+              // alwaysThinkingEnabled:true), so absent → 'adaptive'.
+              const thinkMap = (window as any).__thinkStateForTab as Map<string, boolean> | undefined;
+              const thinkOn = thinkMap?.has(tabId) ? thinkMap.get(tabId)! : true;
               return reply(true, {
                 tabId,
                 model,
-                effort: (t as any).claudeEffortLocal || 'high',
-                thinking: 'adaptive',
+                effort: liveEffort || '?',
+                thinking: thinkOn ? 'adaptive' : 'disabled',
               });
             }
             // SDK path
@@ -1215,12 +1294,32 @@ function App() {
               try { await ipcRenderer.invoke('claude:send-command', tabId, '/model ' + model); } catch {}
             }
             if (effort !== undefined) {
-              (tab as any).claudeEffortLocal = effort; // remember the choice for getParams reads
+              // Update the cross-client sentinel so a subsequent getParams (desktop
+              // ControlBar or another phone) reads the value we just applied —
+              // same map the auto-inject paths write. Mirrors desktop manual-click.
+              const sentinel = (window as any).__effortSentForTab as Map<string, { at: number; via: string; level: string }> | undefined;
+              if (sentinel) sentinel.set(tabId, { at: Date.now(), via: 'mobile-click', level: effort });
               try { await ipcRenderer.invoke('claude:send-command', tabId, '/effort ' + effort); } catch {}
             }
-            // thinking toggle is intentionally not wired here — matches desktop
-            // separation of Think (toggleThink) vs Effort (slash command).
-            return reply(true, { tabId, model, effort });
+            // Think toggle for PTY: claude:toggle-thinking FLIPS the meta+t
+            // picker and returns the new absolute state. We only fire it when the
+            // requested state differs from what we last tracked, so re-selecting
+            // the same value is a no-op (the picker is a toggle, not a setter).
+            if (thinking !== undefined) {
+              const want = thinking !== 'disabled';
+              const thinkMap: Map<string, boolean> = (window as any).__thinkStateForTab
+                || ((window as any).__thinkStateForTab = new Map());
+              const cur = thinkMap.has(tabId) ? thinkMap.get(tabId)! : true; // default ON
+              if (cur !== want) {
+                try {
+                  const r = await ipcRenderer.invoke('claude:toggle-thinking', tabId);
+                  // Trust the reconciled state if the handler reports it.
+                  if (r?.success && typeof r.thinking === 'boolean') thinkMap.set(tabId, r.thinking);
+                  else thinkMap.set(tabId, want);
+                } catch { thinkMap.set(tabId, want); }
+              }
+            }
+            return reply(true, { tabId, model, effort, thinking });
           }
           // SDK path
           const partial: any = {};
@@ -1229,6 +1328,77 @@ function App() {
           if (thinking !== undefined) partial.sdkThinking = thinking !== 'disabled';
           state.updateSDKState(tabId, partial);
           return reply(true, { tabId, ...partial });
+        }
+        if (action === 'getPromptQueue') {
+          // Mobile mirror of the desktop Prompt Queue ("Run after"). Mobile does
+          // NOT own a queue — it reads the live desktop store and pushes mutations
+          // back here; the App-root usePromptQueueRunner does all firing. So this
+          // returns the same PromptQueueCore the desktop overlay renders from, plus
+          // the list of sibling AI-tabs (for the "on tab" pivot picker) in the same
+          // order/kind the desktop RunAfterTabPicker shows.
+          const { tabId } = payload || {};
+          if (!tabId) return reply(false, null, 'tabId required');
+          // Locate the owning workspace so we can enumerate sibling AI-tabs.
+          let ws: ReturnType<typeof state.openProjects.get> | null = null;
+          for (const w of state.openProjects.values()) {
+            if (w.tabs.has(tabId)) { ws = w; break; }
+          }
+          const q = usePromptQueueStore.getState().getQueue(tabId);
+          const core = serializePromptQueueCore(q);
+          // Sibling AI-tabs — same predicate as RunAfterTabPicker: SDK tab, OR
+          // PTY-claude with a sessionId, OR gemini with a sessionId. bash/run-dev
+          // tabs are excluded (no turn-end edge to wait on). Self is excluded.
+          const aiTabs: Array<{ id: string; name: string; kind: 'claude-pty' | 'claude-sdk' | 'gemini' }> = [];
+          if (ws) {
+            for (const t of ws.tabs.values()) {
+              if (t.parentTabId) continue;
+              if (t.id === tabId) continue;
+              const isSDK = t.tabType === 'claude-sdk';
+              const isClaudePTY = !isSDK && t.commandType === 'claude' && !!t.claudeSessionId;
+              const isGemini = !isSDK && t.commandType === 'gemini' && !!t.geminiSessionId;
+              let kind: 'claude-pty' | 'claude-sdk' | 'gemini' | null = null;
+              if (isSDK) kind = 'claude-sdk';
+              else if (isClaudePTY) kind = 'claude-pty';
+              else if (isGemini) kind = 'gemini';
+              if (!kind) continue;
+              aiTabs.push({ id: t.id, name: t.name || t.id.slice(-6), kind });
+            }
+          }
+          return reply(true, { tabId, queue: core, aiTabs });
+        }
+        if (action === 'mutatePromptQueue') {
+          // Apply ONE mutation op to the desktop queue store. Every op maps to an
+          // existing store method so cascade rules (closeAfter⟹stopAfter, hint
+          // arming, SQLite persistence, auto-disarm) stay identical to desktop —
+          // we never reimplement the queue logic, only remote-invoke it. The
+          // App-root runner then fires on the next busy→idle edge exactly as if
+          // the desktop overlay had made the change.
+          const { tabId, op, args } = payload || {};
+          if (!tabId || !op) return reply(false, null, 'tabId+op required');
+          const s = usePromptQueueStore.getState();
+          const a = args || {};
+          try {
+            switch (op) {
+              case 'add':            s.addPrompt(tabId, String(a.text || '')); break;
+              case 'remove':         s.removePrompt(tabId, String(a.id)); break;
+              case 'update':         s.updatePromptText(tabId, String(a.id), String(a.text || '')); break;
+              case 'reorder':        s.reorderPrompt(tabId, Number(a.fromIndex), Number(a.toIndex)); break;
+              case 'clear':          for (const it of s.getQueue(tabId).items) s.removePrompt(tabId, it.id); break;
+              case 'setAutoRun':     s.setAutoRun(tabId, !!a.value); break;
+              case 'setStopAfter':   s.setStopAfter(tabId, !!a.value); break;
+              case 'setCloseAfter':  s.setCloseAfter(tabId, !!a.value); break;
+              case 'setRunAfterTab': s.setRunAfterTab(tabId, a.value == null ? null : String(a.value)); break;
+              case 'setFirstDelaySeconds': s.setFirstDelaySeconds(tabId, Number(a.value) || 0); break;
+              case 'setPostPromptEnabled': s.setPostPromptEnabled(tabId, !!a.value); break;
+              case 'setPostPromptText':    s.setPostPromptText(tabId, String(a.value ?? '')); break;
+              default: return reply(false, null, 'unknown op: ' + op);
+            }
+          } catch (e: any) {
+            return reply(false, null, 'mutate failed: ' + String(e?.message || e));
+          }
+          // Echo the new core so the caller can render immediately without a
+          // round-trip; the queue-update SSE event will also fan-out shortly.
+          return reply(true, { tabId, queue: serializePromptQueueCore(usePromptQueueStore.getState().getQueue(tabId)) });
         }
         if (action === 'getTabSessionInfo') {
           const { tabId } = payload || {};
@@ -1377,6 +1547,26 @@ function App() {
             return reply(false, null, String(e?.message || e));
           }
         }
+        if (action === 'interruptClaudeTurn') {
+          // SOFT interrupt of the CURRENT TURN — single Escape (\x1b) into the
+          // live Claude TUI. Claude's own Esc-handler stops generating and
+          // returns to the ⏵ prompt; the process STAYS ALIVE (no SIGTERM, no
+          // session loss). This is what the composer Stop button must do —
+          // distinct from stopClaudeTab (navbar Stop = kill the process).
+          // Single \x1b, NOT \x1b×2 (that opens the Rewind menu) and NOT \x03×2
+          // (that exits Claude). Same keystroke a desktop user presses with the
+          // physical Esc key. See fact-mobile-claude-pty.md::Composer Stop = turn-interrupt.
+          const { tabId } = payload || {};
+          if (!tabId) return reply(false, null, 'tabId required');
+          console.log('[MobInterrupt:Bridge] interruptClaudeTurn Esc tab=' + String(tabId).slice(-12));
+          try {
+            ipcRenderer.send('terminal:input', tabId, '\x1b');
+            return reply(true, { tabId, interrupted: true });
+          } catch (e: any) {
+            console.log('[MobInterrupt:Bridge] err tab=' + String(tabId).slice(-12) + ' ' + (e?.message || e));
+            return reply(false, null, String(e?.message || e));
+          }
+        }
         if (action === 'sendMessageAuto') {
           // Single dispatch entry for /api/sdk-tabs/:id/send — backend used
           // to do TWO bridge round-trips (status check + actual send). Now
@@ -1434,15 +1624,19 @@ function App() {
           const { tabIds } = payload || {};
           if (!Array.isArray(tabIds)) return reply(false, null, 'tabIds required');
           const statuses: Record<string, 'active' | 'busy' | 'inactive'> = {};
+          // awaiting (Claude blocked on AskUserQuestion) per tab — drives the
+          // mobile tab-list purple dot. Same presence call, extra field.
+          const awaiting: Record<string, boolean> = {};
           for (const tid of tabIds) {
             try {
               const p = await ipcRenderer.invoke('claude:get-presence', tid);
               statuses[tid] = p?.status || 'inactive';
+              if (p?.awaiting) awaiting[tid] = true;
             } catch {
               statuses[tid] = 'inactive';
             }
           }
-          return reply(true, { statuses });
+          return reply(true, { statuses, awaiting });
         }
         if (action === 'getClaudeTabStatus') {
           const { tabId } = payload || {};
@@ -1566,6 +1760,7 @@ function App() {
       ipcRenderer.removeListener('mcp:respawn-sub-agent-pty', handleRespawnSubAgentPty);
       ipcRenderer.removeListener('gemini:auto-spawn', handleGeminiAutoSpawn);
       ipcRenderer.removeListener('gemini:busy-state', handleGeminiBusy);
+      ipcRenderer.removeListener('claude:awaiting-input', handleAwaitingInput);
       ipcRenderer.removeListener('window:refocus-active', handleWindowRefocus);
       window.removeEventListener('keydown', handlePasteRefocus, true);
     };
@@ -1652,7 +1847,12 @@ function App() {
                 }
               } catch (e: any) { console.warn('[AutoResume] JSONL repair skipped:', e?.message || String(e)); }
               ipcRenderer.send('terminal:input', tabId, 'claude --dangerously-skip-permissions --resume ' + sessionId + '\r');
-              ipcRenderer.send('terminal:force-command-started', { tabId });
+              // BARE string tabId — main's handler does terminalCommandState.get(tabId)
+              // and rebroadcasts terminal:command-started {tabId}; an object key never
+              // matches the string-keyed state, so the immediate process-alive signal
+              // was silently lost on AutoResume (other caller at :1394 already passes a
+              // string). See pty-streaming audit.
+              ipcRenderer.send('terminal:force-command-started', tabId);
               console.warn('[AutoResume] Resumed', tabId, sessionId.substring(0, 8));
             }
           } catch (e: any) {
@@ -2315,9 +2515,11 @@ function App() {
             // Count active processes and busy tabs in this project
             let activeCount = 0;
             let hasBusyTab = false;
+            let hasAwaitingTab = false;
             workspace.tabs.forEach((_, tabId) => {
               if (processStatus.get(tabId)) activeCount++;
               if (busyTabs.get(tabId)) hasBusyTab = true;
+              if (awaitingTabs.get(tabId)) hasAwaitingTab = true;
             });
 
             // Count interrupted (paused) sessions
@@ -2339,6 +2541,7 @@ function App() {
                 activeProcessCount={activeCount}
                 interruptedCount={interruptedCount}
                 isProjectBusy={hasBusyTab || apiLoadingProjects.has(projectId)}
+                isProjectAwaiting={hasAwaitingTab}
                 isEditing={editingProjectId === projectId}
                 editValue={projectEditValue}
                 onEditChange={setProjectEditValue}
@@ -2484,6 +2687,21 @@ function App() {
               }}
             >
               Close Project
+            </button>
+            <button
+              className="w-full text-left px-4 py-2 text-sm text-[#ccc] hover:bg-white/10 cursor-pointer"
+              onClick={() => {
+                // Same as the tab-row "Copy ID/Path" — Electron clipboard, not
+                // navigator.clipboard (the latter silently no-ops in the renderer
+                // without HTTPS/permissions). See CLAUDE.md anti-pattern.
+                const project = projects[projectContextMenu.projectId];
+                if (project?.path) {
+                  try { window.require('electron').clipboard.writeText(project.path); } catch {}
+                }
+                setProjectContextMenu(null);
+              }}
+            >
+              Copy Path
             </button>
           </div>
         </>

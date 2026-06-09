@@ -43,6 +43,25 @@
 
 **Если bridge всё-таки нужен** (на случай рассинхрона `mouseleave` при transit через щель): рендерить как **отдельный `position: fixed; right: tlLeft - 0px; width: 8px` с `pointer-events: auto`** — снаружи wrapper'а, не в layout-row. Тогда bridge не влияет на wrapper.width, но ловит курсор между content'ом и strip.
 
+### 6. Nested popover закрывает РОДИТЕЛЯ при наведении на свой заголовок (one-shot point-test vs continuous guard)
+
+**Симптом.** Cmd+hover entry-tooltip (`Timeline.tsx:4173`, gated by `activeTooltipIndex`) держит внутри footer'а ⚡-чип, hover по которому открывает вложенный single-entry breakdown popover (`Timeline.tsx:5251`, sibling-portal, gated by `singleBreakdownOpen`) с заголовком-тоглом `JSONL / API`. Когда курсор переезжает на этот заголовок — **родительский** tooltip «в какой-то момент» закрывается (интермиттентно). Юзер: *«когда навожусь на заголовок json/api основная модалка закрывается»*.
+
+**Root cause.** Родитель закрывался через свой `onMouseLeave` (4177), keep-alive которого был **one-shot point-test**: на единичной координате leave-события проверял `singleBreakdownPopoverRef.getBoundingClientRect()` и возвращался рано только если курсор уже внутри. Это ровно антипаттерн `сценарии-багов-design.md §2.7`: когда узел уже держится глобальным `mousemove` hit-test'ом, `onMouseLeave` **нельзя** оставлять управлять видимостью — он выстреливает на несколько мс раньше сэмпла mousemove и читает rect, который **транзиентно устарел**. Для single-entry версии окно устаревания шире, чем у работающей range-версии (4858), по двум причинам, которых у range нет:
+1. **Flip-up после first paint.** `singleBreakdownFlipUp` ставится `useLayoutEffect`'ом (703-712) ПОСЛЕ первого paint'а: popover монтируется ниже чипа (`top: chipRect.bottom`), затем перепрыгивает выше чипа (`top: chipRect.top` + `translateY(-100%)`). Чип в самом низу родителя → курсор к заголовку (верхняя строка popover'а) идёт ВВЕРХ, выходя за верхнюю границу родителя, ровно когда rect ещё пере-измеряется.
+2. **Re-measure на JSONL↔API toggle.** `setBreakdownMode` (2838) — dep `useLayoutEffect`'а (712) → ещё один reposition-транзиент, в котором `onMouseLeave` читает stale rect. Поэтому баг привязан именно к заголовку-тоглу.
+
+Когда point-test промахивается → `isMouseInTooltipRef=false` (4189) → `handleMouseLeaveTooltipArea()` → `setActiveTooltipIndex(null)`. Вложенный popover при этом выживает (его глобальный `mousemove` guard 670-684 родителя не трогает) — отсюда «ребёнок жив, родитель умер».
+
+**Fix (доку-выровненный, §2.7).** Два edit'а:
+- **(1)** В `onMouseLeave` родителя (4177): убран one-shot point-test; пока `singleBreakdownOpen` — **полный no-op** (`if (singleBreakdownOpen) return;`). Родитель больше не решает свою видимость по leave-событию во время жеста.
+- **(2)** Существующий глобальный `mousemove` guard вложенного popover'а (670-703, который раньше делал только `setSingleBreakdownOpen(false)`) расширен: когда курсор вне чипа И popover'а — дополнительно hit-тестит `tooltipRef` (обёртка родителя = видимый контент + CSS-bridge коридор к Timeline-strip) и, если курсор вне неё тоже, закрывает родителя (`isMouseInTooltipRef=false` + `setHoveredIndex(null)` + `setActiveTooltipIndex(null)`, зеркало `handleMouseLeaveTooltipArea`). `setHoveredIndex(null)` обязателен — иначе CMD-sync эффект (1026: `if (isCmdHeld && hoveredIndex !== null)`) мгновенно реоткрыл бы родителя.
+
+**TDZ-ловушка (поймана adversarial-verify, чуть не зашипилась).** Первая версия фикса добавляла `freezeCmdPopups` (decl 758) и `isLockedTooltip` (decl 820) в **deps array** эффекта на строке 670. Deps array вычисляется **eagerly при рендере** (≈684) — ссылка на `const` объявленный НИЖЕ → `ReferenceError: Cannot access 'X' before initialization` на КАЖДОМ рендере, краш всего Timeline. Closure-тело безопасно (бежит на mousemove, после строки 820), но deps — нет. Лечение: guard'ы читаются ВНУТРИ `onMove` через refs/`getState()` — `isResizingTooltipRef.current`, `isLockedTooltipRef.current`, `useUIStore.getState().freezeCmdPopups`; в deps только `isExpanded` (decl 309, до эффекта). **Правило: значение, объявленное после useEffect, нельзя класть в его deps array — читай через ref или store.getState() в теле closure.**
+
+**Что НЕ трогаем.** Range-версия popover/menu (4858) использует тот же 4181-style guard, но работает (нет flip-up, нет re-measure на toggle) — оставлена как есть; латентный §2.7-шрам, если range-menu когда-нибудь начнёт флипаться. Fork tooltip (5272), note tooltip, resize (4231), lock/freeze, mousedown click-outside (1734) — не затронуты.
+
 ## Related Files
-- `src/renderer/components/Workspace/Timeline.tsx` — tooltop logic.
+- `src/renderer/components/Workspace/Timeline.tsx` — tooltop logic (parent onMouseLeave ~4177, nested keep-alive ~670, single-entry popover ~5251).
 - `knowledge/fact-timeline.md` — general timeline behavior (см. `Right-anchor через измеренный DOM (popupRightPx)`).
+- `methodology/сценарии-багов-design.md §2.7` — lazy popover + global-mousemove hit-test, почему `onMouseLeave` нельзя миксовать с ним.

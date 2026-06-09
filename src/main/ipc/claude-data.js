@@ -3633,29 +3633,51 @@ function register({ projectManager, formatToolAction }) {
               if (block.type === 'tool_use') {
                 const name = block.name;
                 const input = block.input || {};
-                if (name === 'Edit' || name === 'Write') {
-                  actions.push(mkFileAction(name, input));
-                } else {
-                  const actionObj = fmtAction(name, input, block.id);
-                  // For Task: find tool_result to get final answer
-                  if (name === 'Task' && typeof actionObj === 'object' && actionObj.tool === 'Task') {
-                    for (let j = i + 1; j < activeBranch.length; j++) {
-                      const nextEntry = activeBranch[j];
-                      if (nextEntry.type === 'user' && Array.isArray(nextEntry.message?.content)) {
-                        const res = nextEntry.message.content.find(c => c.type === 'tool_result' && c.tool_use_id === block.id);
-                        if (res) {
-                          const resContent = res.content;
-                          if (typeof resContent === 'string') {
-                            actionObj.result = resContent;
-                          } else if (Array.isArray(resContent)) {
-                            actionObj.result = resContent.filter(c => c.type === 'text').map(c => c.text).join('\n');
-                          }
-                          break;
-                        }
+
+                // Generic tool_result finder — walks forward for the user-record
+                // tool_result matching this tool_use id. Used both for Task (final
+                // answer) AND for the raw-tool carrier below (so the HistoryPanel
+                // package renderer can show Bash output / Read content / etc.).
+                const findToolResult = () => {
+                  for (let j = i + 1; j < activeBranch.length; j++) {
+                    const nextEntry = activeBranch[j];
+                    if (nextEntry.type === 'user' && Array.isArray(nextEntry.message?.content)) {
+                      const res = nextEntry.message.content.find(c => c.type === 'tool_result' && c.tool_use_id === block.id);
+                      if (res) {
+                        const rc = res.content;
+                        const text = typeof rc === 'string' ? rc
+                          : Array.isArray(rc) ? rc.filter(c => c.type === 'text').map(c => c.text).join('\n') : '';
+                        return { text, isError: !!res.is_error };
                       }
                     }
                   }
+                  return null;
+                };
+
+                if (name === 'Task') {
+                  // Subagents keep the legacy SubAgentBlock path — NOT touched.
+                  const actionObj = fmtAction(name, input, block.id);
+                  if (typeof actionObj === 'object' && actionObj.tool === 'Task') {
+                    const rr = findToolResult();
+                    if (rr) actionObj.result = rr.text;
+                  }
                   actions.push(actionObj);
+                } else {
+                  // Raw tool carrier — full (untruncated) name+input+result for the
+                  // package-based renderer (@noted/claude-blocks ToolCallPart). Every
+                  // non-Task tool_use (Bash/Read/Edit/Write/MultiEdit/Glob/Grep/Web*/
+                  // MCP…) renders as a real card with the proper LCS diff / Prism
+                  // output, mirroring the SDK tab.
+                  const rr = findToolResult();
+                  actions.push({
+                    tool: '__raw__',
+                    rawTool: {
+                      toolName: name,
+                      args: input,
+                      result: rr ? rr.text : undefined,
+                      isError: rr ? rr.isError : undefined,
+                    },
+                  });
                 }
               }
             }

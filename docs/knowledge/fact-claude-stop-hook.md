@@ -31,15 +31,19 @@ Per-PID socket путь означает что каждый main listens на �
 
 ```json
 "hooks": {
-  "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "node ~/.claude/hooks/noted-turn-event.js" }] }],
-  "Stop":             [{ "hooks": [{ "type": "command", "command": "node ~/.claude/hooks/noted-turn-event.js" }] }],
-  "StopFailure":      [{ "hooks": [{ "type": "command", "command": "node ~/.claude/hooks/noted-turn-event.js" }] }]
+  "UserPromptSubmit":   [{ "hooks": [{ "type": "command", "command": "node ~/.claude/hooks/noted-turn-event.js" }] }],
+  "Stop":               [{ "hooks": [{ "type": "command", "command": "node ~/.claude/hooks/noted-turn-event.js" }] }],
+  "StopFailure":        [{ "hooks": [{ "type": "command", "command": "node ~/.claude/hooks/noted-turn-event.js" }] }],
+  "PreToolUse":         [{ "matcher": "AskUserQuestion", "hooks": [{ "type": "command", "command": "node ~/.claude/hooks/noted-turn-event.js" }] }],
+  "PostToolUse":        [{ "matcher": "AskUserQuestion", "hooks": [{ "type": "command", "command": "node ~/.claude/hooks/noted-turn-event.js" }] }],
+  "PostToolUseFailure": [{ "matcher": "AskUserQuestion", "hooks": [{ "type": "command", "command": "node ~/.claude/hooks/noted-turn-event.js" }] }]
 }
 ```
 
 - **UserPromptSubmit** → `busy: true` (turn начался)
 - **Stop** → `busy: false, success: true` (turn завершился успешно)
 - **StopFailure** → `busy: false, success: false` (turn упал на API error: rate_limit / auth / server_error)
+- **PreToolUse / PostToolUse / PostToolUseFailure** (matcher `AskUserQuestion`) → `claude:awaiting-input` `{awaiting:true|false}` — детерминированный бракет «Claude задал вопрос и ждёт ответа человека». Тот же скрипт, тот же сокет. PreToolUse(AskUserQuestion) = вопрос появился; Post*(AskUserQuestion) = ответил/отменил. Matcher гарантирует ноль спавнов скрипта на Read/Bash/Edit. Полная механика — [`fact-claude-awaiting-input.md`](fact-claude-awaiting-input.md).
 
 ### IPC payload в renderer
 

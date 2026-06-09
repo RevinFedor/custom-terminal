@@ -53,6 +53,17 @@ export function isTabBusyNow(tabId: string): boolean {
   return prevBusyRef.get(tabId) === true;
 }
 
+// Snapshot of the current per-tab busy map. The Run-after picker SEEDS its local
+// React state from this ON MOUNT. Critical: the picker overlay mounts/unmounts
+// with the active Claude tab (Terminal.tsx gate), so subscribing only to FUTURE
+// busy edges misses the busy:true that already fired on a background target —
+// the spinner then appears only at a late turn-end flap, if at all. This
+// always-on runner (App-root) records every edge into prevBusyRef regardless of
+// focus, so seeding from it gives the picker the correct state at mount time.
+export function getBusyTabsSnapshot(): Map<string, boolean> {
+  return new Map(prevBusyRef);
+}
+
 // Always-mounted auto-runner for the per-tab prompt queue. Mounted ONCE at app
 // root (App.tsx) so it survives tab switches, project switches, view changes —
 // anywhere the user could navigate away from the overlay component itself.
@@ -135,17 +146,64 @@ export function usePromptQueueRunner() {
         // or our send-command IPC kicked it off.
         if (!(wasBusy && !busy)) return;
 
-        // reason:'manual-stop' — пользователь явно нажал Stop chip / context-menu
-        // Stop / двойной Esc. Это НЕ обычный turn-end. Auto-run следующего промпта
-        // создал бы петлю «выключил → процесс снова запустился из очереди». См.
-        // main.js::terminal:stop-ai-process. Stop-after тоже пропускаем — terminal
-        // уже мёртв, повторный SIGTERM на «нет AI process» вернёт ошибку.
+        // Skip auto-run/stop-after for any NON-NATURAL turn-end. Только чистый
+        // успешный Stop (reason === undefined) должен запускать следующий промпт
+        // очереди. Все остальные исходы — это не «Claude закончил ход», а обрыв,
+        // и заливать следующий промпт в сломанный/прерванный turn нельзя:
+        //   - 'manual-stop' — юзер нажал Stop chip / context-menu Stop / двойной Esc
+        //     (main.js::terminal:stop-ai-process). Auto-run создал бы петлю
+        //     «выключил → процесс снова запустился из очереди».
+        //   - 'error'       — turn упал на API/inference-ошибке, напр. "API Error:
+        //     500" (main.js Stop-hook, event==='StopFailure'). Следующий промпт
+        //     ушёл бы в уже сломанный turn.
+        //   - 'interrupt'   — Esc/Ctrl+C (main.js JSONL-marker watcher и idle-probe,
+        //     event==='InterruptStop'). Юзер прервал намеренно.
+        //   - 'watchdog'    — Stop так и не пришёл за 60 мин, turn завис/мёртв
+        //     (main.js CLAUDE_TURN_WATCHDOG_MS). Состояние неизвестно.
+        // Stop-after тоже пропускаем во всех этих случаях — terminal уже мёртв либо
+        // в неопределённом состоянии, повторный SIGTERM вернёт ошибку.
         //
-        // The manual-stop guard ALSO applies to pivoted queues: if a user stops
-        // the trigger tab, we should NOT fire the owner's queue (the trigger
-        // didn't naturally finish, the user yanked it). Skip across the board.
-        if (reason === 'manual-stop') {
-          console.log('[PromptQueueRunner] tab=' + tabId.slice(-12) + ' ch=' + channel + ' manual-stop → skip auto-run/stop-after');
+        // Гард стоит ВЫШЕ обоих путей (step-1 pivot и step-2 own-tab), поэтому он
+        // покрывает и pivoted-очереди: если ТРИГГЕР-таб упал/прерван, очередь
+        // owner'а тоже НЕ стреляет (триггер не закончил ход естественно).
+        //
+        // Additive: busy:false уже записан в prevBusyRef выше (loader гасится у
+        // всех консьюмеров, которые читают только {tabId,busy}); reason — это
+        // только метаданные исхода. Натуральные reason-less пути (PTY spinner IDLE,
+        // SDK-форвард claude-sdk:busy-state) проходят гард и стреляют как раньше.
+        // DISARM (не просто skip) on any non-natural turn-end. Юзер: «если я
+        // нажал Escape чтобы вмешаться, run-after должен ВЫКЛЮЧИТЬСЯ, а не молча
+        // продолжить на следующем штатном ответе». Skip-once было недостаточно:
+        // autoRun оставался true → следующий natural Stop (reason-less) стрелял
+        // очередью в контекст, куда юзер уже вмешался. Поэтому здесь снимаем
+        // тумблеры, а не пропускаем один запуск.
+        //
+        // Почему НЕ перехватываем Escape/Ctrl+C/Ctrl+] по-клавишно: main уже
+        // классифицирует ПРИЧИНУ остановки (reason на claude:busy-state) —
+        // 'interrupt' (Esc/Ctrl+C через JSONL-marker watcher + idle-probe),
+        // 'manual-stop' (кнопка Stop), 'error' (StopFailure / API 500),
+        // 'watchdog' (зависание). Слушаем reason, не keystroke — единый сигнал
+        // вместо ручного парсинга каждой клавиши. Per user: «любой ненормальный
+        // конец → тумблер off».
+        const SKIP_REASONS = ['manual-stop', 'error', 'interrupt', 'watchdog'];
+        if (reason && SKIP_REASONS.includes(reason)) {
+          // Disarm EVERY owner queue this turn-end affects: the trigger tab's own
+          // queue AND any pivoted queue waiting on this tab as its target — same
+          // fan-out the firing path uses, so a target abort disarms the owner too.
+          const { setAutoRun, setStopAfter, clearFirstDelayCountdown } = usePromptQueueStore.getState();
+          const queues = usePromptQueueStore.getState().queues;
+          for (const [ownerTabId, q] of queues) {
+            if (!q.autoRun && !q.stopAfter && q.firstDelayCountdownAt === null) continue;
+            const effectiveTrigger = q.runAfterTabId ?? ownerTabId;
+            if (effectiveTrigger !== tabId) continue;
+            if (q.autoRun) setAutoRun(ownerTabId, false);
+            if (q.stopAfter) setStopAfter(ownerTabId, false); // cascades closeAfter→false (closeAfter⟹stopAfter, so this always runs when closeAfter was set)
+            if (q.firstDelayCountdownAt !== null) clearFirstDelayCountdown(ownerTabId); // freeze the "секундомер" (first-delay countdown)
+            if (ownerTabId !== tabId) {
+              console.log('[PromptQueueRunner] tab=' + tabId.slice(-12) + ' ch=' + channel + ' reason=' + reason + ' → DISARM pivoted owner=' + ownerTabId.slice(-12));
+            }
+          }
+          console.log('[PromptQueueRunner] tab=' + tabId.slice(-12) + ' ch=' + channel + ' reason=' + reason + ' → DISARM auto-run/stop-after (non-natural turn-end)');
           return;
         }
 

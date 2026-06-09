@@ -253,6 +253,7 @@ interface WorkspaceStore {
   openProjects: Map<string, ProjectWorkspace>;
   projectHistory: string[]; // Stack of project IDs in order of activation
   isRestoring: boolean;
+  pendingEditTabId: string | null; // Set after createTab to trigger inline rename; consumed once by TabBar
 
   // Terminal buffer serialization (for preserving history on unmount/remount)
   terminalBuffers: Map<string, string>;
@@ -442,6 +443,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   openProjects: new Map(),
   projectHistory: [],
   isRestoring: false,
+  pendingEditTabId: null,
 
   // Terminal buffer serialization
   terminalBuffers: new Map(),
@@ -981,7 +983,12 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
 
     // During restore, skip per-tab state updates and DB writes — openProject will batch them at the end
     if (!isRestoring) {
-      set({ openProjects: new Map(openProjects) });
+      // Only trigger rename for user-initiated tab creation without an explicit name
+      const shouldEdit = !options?.background && !name;
+      set({
+        openProjects: new Map(openProjects),
+        pendingEditTabId: shouldEdit ? tabId : null,
+      });
       saveTabs(workspace.projectId, workspace.tabs);
     }
 
@@ -1094,7 +1101,12 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       workspace.tabHistory = [...workspace.tabHistory.filter(id => id !== tabId), tabId].slice(-20);
     }
 
-    set({ openProjects: new Map(openProjects) });
+    // Only trigger rename for user-initiated tab creation without an explicit name
+    const shouldEdit = !options?.background && !name && !options?.nameSetManually;
+    set({
+      openProjects: new Map(openProjects),
+      pendingEditTabId: shouldEdit ? tabId : null,
+    });
 
     // Save tabs
     saveTabs(workspace.projectId, workspace.tabs);

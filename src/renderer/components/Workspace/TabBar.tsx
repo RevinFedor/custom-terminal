@@ -281,6 +281,7 @@ interface TabItemProps {
   isCollapsed?: boolean; // Collapsed tab — icon-only
   hasSession?: boolean; // Whether tab has an active AI session
   isBusy?: boolean; // AI agent is actively thinking/streaming
+  isAwaitingInput?: boolean; // Claude blocked on AskUserQuestion, waiting for human answer
   sdkProcessAlive?: boolean; // SDK tab: the CLI process is alive (parked between
                              // turns or generating). SDK has no PTY → hasProcess
                              // is always false; this feeds the activity-plate so
@@ -327,6 +328,7 @@ const TabItem = memo(({
   isCollapsed = false,
   hasSession = false,
   isBusy = false,
+  isAwaitingInput = false,
   sdkProcessAlive = false,
   isViewingSubAgent = false,
   orientation,
@@ -625,6 +627,9 @@ const TabItem = memo(({
   //   Если оба true (PTY claude думает) — рендерятся оба: полоса слева + shimmer.
   const verticalHasProcess = hasProcess || sdkProcessAlive;
   const verticalIsAiBusy = isBusy;
+  // Awaiting-input pulses purple OVER the busy shimmer (awaiting ⊆ busy). Kept
+  // separate so "Claude needs my answer" reads differently from "Claude is thinking".
+  const verticalIsAwaiting = isAwaitingInput;
   // Lookup status definition by id из глобального стора.
   // useUIStore делает гранулярный subscribe — TabItem ре-рендерится только когда
   // массив sessionStatuses изменится (юзер отредактировал палитру в SettingsModal).
@@ -637,8 +642,6 @@ const TabItem = memo(({
   // Цвета/duration читаются через CSS-переменные на :root (App.tsx синхронизирует).
   const processBarEnabled = useUIStore((s) => s.processBar.enabled);
   const processBarPosition = useUIStore((s) => s.processBar.position);
-  // AI-pulse — отдельные от ProcessBar настройки фона таба пока AI «думает».
-  const aiPulseEnabled = useUIStore((s) => s.aiPulse.enabled);
   // Settings → форма маркера статуса (круг или квадрат) + размер в px.
   const statusMarkerShape = useUIStore((s) => s.statusMarker.shape);
   const statusMarkerSize = useUIStore((s) => s.statusMarker.sizePx);
@@ -716,24 +719,23 @@ const TabItem = memo(({
                   {verticalIsAiBusy && <div className="tab-process-bar-ai-shimmer-overlay" />}
                 </div>
               )}
-              {/* AI-busy background pulse — целый таб мягко пульсирует фоном
-                  (см. .tab-ai-busy-shimmer в globals.css). zIndex:0 ставит
-                  оверлей ПОД контентом (текст таба, иконка заметки, статус-
-                  маркер с zIndex:5–6 рендерятся поверх). Раньше zIndex:3 +
-                  sweep-полоса перекрывала текст и кнопки. */}
-              {verticalIsAiBusy && (
+              {/* AI-busy loader = the process-bar shimmer STRIP (left/right edge,
+                  rendered above). The whole-tab background pulse was removed —
+                  the loader is the переливающаяся полоска у края, not a tint of
+                  the entire tab. See fact-process-bar.md::AIPulse removed. */}
+              {/* Awaiting-user-input purple wash — layers above the busy shimmer
+                  (zIndex:1 vs 0) but still under tab content (text z:5–6). */}
+              {verticalIsAwaiting && (
                 <div
-                  className={aiPulseEnabled ? 'tab-ai-busy-shimmer' : 'tab-ai-busy-static'}
+                  className="tab-awaiting-input"
                   style={{
                     position: 'absolute',
-                    // Растягиваемся НА border-area (включая 2px transparent border-left/right
-                    // вкладки), чтобы скругления pulse'а совпали со скруглениями карточки.
                     top: 0,
                     bottom: 0,
                     left: '-2px',
                     right: '-2px',
                     pointerEvents: 'none',
-                    zIndex: 0,
+                    zIndex: 1,
                     borderRadius: tabGeo.borderRadius,
                   }}
                   aria-hidden
@@ -1226,6 +1228,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   const isVerticalLayout = layout === 'vertical';
   // Use individual selectors to minimize re-renders
   const openProjects = useWorkspaceStore((state) => state.openProjects);
+  const pendingEditTabId = useWorkspaceStore((state) => state.pendingEditTabId);
   const createTab = useWorkspaceStore((state) => state.createTab);
   const createTabAfterCurrent = useWorkspaceStore((state) => state.createTabAfterCurrent);
   const closeTab = useWorkspaceStore((state) => state.closeTab);
@@ -1279,6 +1282,12 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   const [sessionStatus, setSessionStatus] = useState<Map<string, boolean>>(new Map());
   const [claudeBusyMap, setClaudeBusyMap] = useState<Map<string, boolean>>(new Map());
   const [geminiBusyMap, setGeminiBusyMap] = useState<Map<string, boolean>>(new Map());
+  // Awaiting-user-input: Claude called AskUserQuestion and is blocked waiting for
+  // the human to answer. Deterministic, bracketed by PreToolUse/PostToolUse hooks
+  // (main.js → claude:awaiting-input). Distinct from busy: a question is a special
+  // sub-state of busy (awaiting ⊆ busy), rendered as a purple glow instead of the
+  // plain "thinking" shimmer. See fact-claude-awaiting-input.md.
+  const [awaitingMap, setAwaitingMap] = useState<Map<string, boolean>>(new Map());
   const inputRef = useRef<HTMLInputElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const contextMenuRef = useRef<HTMLDivElement>(null);
@@ -1383,6 +1392,33 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
       });
     };
 
+    const handleAwaitingInput = (_: any, { tabId, awaiting }: { tabId: string; awaiting: boolean }) => {
+      console.warn('[TabBar:Awaiting] tabId=' + tabId.slice(-8) + ' awaiting=' + awaiting);
+      setAwaitingMap(prev => {
+        if ((prev.get(tabId) || false) === awaiting) return prev;
+        const next = new Map(prev);
+        // Delete (not set-false) so the map never accumulates tombstones — mirrors
+        // App.tsx awaitingTabs. "not awaiting" = key absent.
+        if (awaiting) next.set(tabId, true); else next.delete(tabId);
+        return next;
+      });
+    };
+
+    // Safety net for invariant awaiting ⊆ busy: any turn-end (interrupt, watchdog,
+    // manual-stop, Stop, StopFailure, process exit) emits claude:busy-state
+    // busy:false. If a question was still marked awaiting (e.g. user pressed Esc to
+    // cancel the whole turn instead of answering), clear it here — main may not get
+    // a PostToolUse in that path. Cheap: only mutates when an awaiting flag is set.
+    const handleClaudeBusyClearAwaiting = (_: any, { tabId, busy }: { tabId: string; busy: boolean }) => {
+      if (busy) return;
+      setAwaitingMap(prev => {
+        if (!prev.get(tabId)) return prev;
+        const next = new Map(prev);
+        next.delete(tabId);
+        return next;
+      });
+    };
+
     // Deterministic stop/restart: lock the ↻ / Stop buttons for the affected
     // tab until main reports phase='done'. Without this the user can fire a
     // second Stop while the first one is still polling lsof → races.
@@ -1401,7 +1437,9 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
     ipcRenderer.on('terminal:command-finished', handleCommandFinished);
     ipcRenderer.on('claude:session-detected', handleSessionDetected);
     ipcRenderer.on('claude:busy-state', handleClaudeBusy);
+    ipcRenderer.on('claude:busy-state', handleClaudeBusyClearAwaiting);
     ipcRenderer.on('gemini:busy-state', handleGeminiBusy);
+    ipcRenderer.on('claude:awaiting-input', handleAwaitingInput);
     ipcRenderer.on('terminal:stop-progress', handleStopProgress);
 
     return () => {
@@ -1409,7 +1447,9 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
       ipcRenderer.removeListener('terminal:command-finished', handleCommandFinished);
       ipcRenderer.removeListener('claude:session-detected', handleSessionDetected);
       ipcRenderer.removeListener('claude:busy-state', handleClaudeBusy);
+      ipcRenderer.removeListener('claude:busy-state', handleClaudeBusyClearAwaiting);
       ipcRenderer.removeListener('gemini:busy-state', handleGeminiBusy);
+      ipcRenderer.removeListener('claude:awaiting-input', handleAwaitingInput);
       ipcRenderer.removeListener('terminal:stop-progress', handleStopProgress);
     };
   }, []); // Stable — no re-subscriptions
@@ -1560,6 +1600,18 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
       inputRef.current.select();
     }
   }, [editingTabId]);
+
+  // Consume pendingEditTabId set by createTab/createTabAfterCurrent to auto-enter rename mode
+  useEffect(() => {
+    if (!pendingEditTabId) return;
+    const ws = useWorkspaceStore.getState().openProjects.get(projectId);
+    if (!ws?.tabs.has(pendingEditTabId)) return;
+    const tabName = ws.tabs.get(pendingEditTabId)?.name ?? '';
+    setEditingTabId(pendingEditTabId);
+    setEditValue(tabName);
+    // Clear so other TabBar instances (other projects) don't also enter edit
+    useWorkspaceStore.setState({ pendingEditTabId: null });
+  }, [pendingEditTabId, projectId]);
 
   useEffect(() => {
     if (!contextMenu && !emptyContextMenu) return;
@@ -1824,6 +1876,18 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
     await runDeterministicStop(tabId, false);
   };
 
+  // After rename closes via an EXPLICIT keyboard action (Enter/Escape), hand
+  // focus back to the active terminal so the user can type immediately — the
+  // terminal's own auto-focus was suppressed while the rename input was up
+  // (isExternalEditableFocused). NOT called on blur: a blur means the user
+  // clicked some other target (Timeline, notes, another tab) and we must not
+  // yank focus away from wherever they intentionally went.
+  const refocusActiveTerminal = () => {
+    try { window.dispatchEvent(new CustomEvent('nt:window-refocus-active')); } catch {}
+  };
+
+  // Shared close path — also used as the input's onBlur. Commits a non-empty
+  // name and exits edit mode. Does NOT refocus (see refocusActiveTerminal).
   const handleRenameSubmit = () => {
     if (editingTabId && editValue.trim()) {
       renameTab(projectId, editingTabId, editValue.trim());
@@ -1833,10 +1897,13 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   };
 
   const handleRenameKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter') handleRenameSubmit();
-    else if (e.key === 'Escape') {
+    if (e.key === 'Enter') {
+      handleRenameSubmit();
+      refocusActiveTerminal();
+    } else if (e.key === 'Escape') {
       setEditingTabId(null);
       setEditValue('');
+      refocusActiveTerminal();
     }
   };
 
@@ -2115,6 +2182,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                 commandType={tab.commandType}
                 hasSession={sessionStatus.get(tab.id) || !!tab.claudeSessionId}
                 isBusy={(tab.commandType === 'gemini' ? geminiBusyMap.get(tab.id) : claudeBusyMap.get(tab.id)) || false}
+                isAwaitingInput={awaitingMap.get(tab.id) || false}
                 sdkProcessAlive={!!tab.sdkProcessAlive}
                 onRestart={handleRestart}
                 onStop={handleStop}
@@ -2206,6 +2274,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                   commandType={tab.commandType}
                   hasSession={sessionStatus.get(tab.id) || !!tab.claudeSessionId}
                   isBusy={(tab.commandType === 'gemini' ? geminiBusyMap.get(tab.id) : claudeBusyMap.get(tab.id)) || false}
+                  isAwaitingInput={awaitingMap.get(tab.id) || false}
                   sdkProcessAlive={!!tab.sdkProcessAlive}
                   onRestart={handleRestart}
                   onStop={handleStop}
@@ -2381,6 +2450,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                         commandType={tab.commandType}
                         hasSession={sessionStatus.get(tab.id) || !!tab.claudeSessionId}
                         isBusy={(tab.commandType === 'gemini' ? geminiBusyMap.get(tab.id) : claudeBusyMap.get(tab.id)) || false}
+                        isAwaitingInput={awaitingMap.get(tab.id) || false}
                         sdkProcessAlive={!!tab.sdkProcessAlive}
                         onRestart={handleRestart}
                         onStop={handleStop}
@@ -2456,6 +2526,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                     commandType={tab.commandType}
                     hasSession={sessionStatus.get(tab.id) || !!tab.claudeSessionId}
                     isBusy={(tab.commandType === 'gemini' ? geminiBusyMap.get(tab.id) : claudeBusyMap.get(tab.id)) || false}
+                    isAwaitingInput={awaitingMap.get(tab.id) || false}
                     sdkProcessAlive={!!tab.sdkProcessAlive}
                     onRestart={handleRestart}
                     onStop={handleStop}

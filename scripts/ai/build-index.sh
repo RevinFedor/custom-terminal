@@ -218,6 +218,7 @@ process_file() {
   CONTENT=$(cat "$FILE" 2>/dev/null) || true
   if [ -z "$CONTENT" ]; then
     echo "SKIP" > "$RESULT_FILE"
+    echo -e "${BLUE}[done]${NC} $REL_PATH"
     return
   fi
 
@@ -276,6 +277,7 @@ process_file() {
         log "GEMINI ERROR (no text) for $REL_PATH: $(echo "$RAW" | head -c 300)"
       fi
       echo "ERROR" > "$RESULT_FILE"
+      echo -e "${BLUE}[done]${NC} $REL_PATH"
       return
     fi
   else
@@ -295,6 +297,7 @@ process_file() {
 
   if [ -z "$TEXT" ]; then
     echo "ERROR" > "$RESULT_FILE"
+    echo -e "${BLUE}[done]${NC} $REL_PATH"
     log "ERROR (empty response): $REL_PATH"
     return
   fi
@@ -338,6 +341,11 @@ process_file() {
   fi
 
   echo "$PARSED" > "$RESULT_FILE"
+  # Real-time completion pulse — emitted the moment THIS worker finishes, before
+  # the post-`wait` merge loop. Lets the UI counter advance 0→1→2→3 live instead
+  # of sitting at 0 and jumping to N at the end (the ok/cached/wrapped lines are
+  # all printed together during merge, long after the work is actually done).
+  echo -e "${BLUE}[done]${NC} $REL_PATH"
 }
 
 # ===== Параллельный запуск =====

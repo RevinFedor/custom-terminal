@@ -90,7 +90,12 @@ const _effortInjectCalls = new Map<string, number>(); // [EffortDiag2026-05] inv
 // path, Bridge:Fresh fallback path, manual ControlBar click) sets this. Other
 // paths see it set and short-circuit. Cleared when the Claude process exits so
 // the next fresh spawn starts clean. Exposed on window for ControlBar access.
-const _effortSentForTab = new Map<string, { at: number; via: string }>();
+// `level` carries the effort actually injected (the same value desktop's
+// ControlBar shows in `effortLocal`). It is the single cross-client source of
+// truth for "what effort is this live Claude process on": mobile reads it via
+// the window map in getSDKParams. Absent (process never injected, or died and
+// cleared) → mobile shows `?`, matching the desktop "dimmed/unknown" intent.
+const _effortSentForTab = new Map<string, { at: number; via: string; level: string }>();
 (window as any).__effortSentForTab = _effortSentForTab;
 
 function _effortDiag(tabId: string, label: string, extra?: string) {
@@ -140,6 +145,26 @@ function _effortDiagScan(tabId: string, data: string) {
   if (data.indexOf('\x1b]133;A') !== -1) {
     _effortDiagOnce(tabId, 'osc133a', '🟢 OSC 133 A (shell prompt ready)');
   }
+}
+
+// Guard for the AUTOMATIC (deferred) terminal focus calls fired after a tab
+// mounts/activates: setTimeout(100)/rAF in the init + activate effects. These
+// must NOT steal focus from a real UI text field. The canonical victim is the
+// inline tab-rename <input> (TabBar) that opens automatically on Cmd+T / new
+// tab — the terminal mounts in the same tick, then its deferred focus() yanks
+// focus out of the input → blur → rename auto-submits → "edit mode flashes for
+// ~0.5s then resets" (user-reported). The xterm helper textarea is fair game
+// (it IS the terminal); only bail when a NON-terminal editable element holds
+// focus. Manual focus (handleClick) intentionally skips this guard.
+function isExternalEditableFocused(): boolean {
+  const el = document.activeElement as HTMLElement | null;
+  if (!el) return false;
+  // xterm's own input surface — focusing it is the whole point, never defer.
+  if (el.classList.contains('xterm-helper-textarea')) return false;
+  const tag = el.tagName;
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true;
+  if (el.isContentEditable) return true;
+  return false;
 }
 
 // Get buffer management functions outside of component to avoid re-renders
@@ -437,6 +462,18 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
         console.warn('[QueueGate:proc] tab=' + tabId.slice(-8) + ' command-finished → alive=false');
         claudeProcessAliveRef.current = false;
         setClaudeProcessAlive(false);
+        // Clear the once-per-process /effort sentinel on claude DEATH too — not
+        // only on terminal:exit. `claude-c` restart reuses the SAME shell PTY,
+        // so the shell never exits and handleExit never fires; the sentinel set
+        // by the FIRST launch's tui-ready survives forever, and every restart's
+        // tui-ready then silently early-returns (`_effortSentForTab.has` → true)
+        // → /effort is injected only on the very first launch in the tab's life,
+        // never on restarts. Prod-confirmed: tab-283 (ea2ae02c) logged
+        // "SKIP — already sent via tui-ready" on callN=2..5 with NO TuiReady
+        // inject line. OSC 133 D (command-finished) is the deterministic
+        // "claude process died, shell alive" signal. See
+        // fact-claude-tui-control.md::Auto-inject /effort.
+        _effortSentForTab.delete(tabId);
       }
     };
     ipcRenderer.on('terminal:command-started', onStarted);
@@ -857,7 +894,7 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
         console.warn('[Terminal:EffortInject] tab=' + tabId.slice(-12) + ' SKIP — already sent via ' + sentinel.via);
         return;
       }
-      _effortSentForTab.set(tabId, { at: Date.now(), via: 'bridge-fresh' });
+      _effortSentForTab.set(tabId, { at: Date.now(), via: 'bridge-fresh', level: eff });
       _effortDiag(tabId, '🚀 INJECT FIRED', '/effort ' + eff + ' — sending to claude:send-command');
       // [EffortDiag2026-05] invoke-fire counter — written SYNCHRONOUSLY in the
       // same tick as the invoke. Pair with HANDLER-ENTRY: callN=K must equal
@@ -885,14 +922,22 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
       if (_effortSentForTab.has(tabId)) return; // already sent (manual click or earlier tui-ready)
       const eff = useUIStore.getState().defaultClaudeEffort;
       if (!eff || eff === 'none') return;
-      // Resume guard: same logic as Bridge:Fresh path — effort survives in
-      // Claude TUI memory across --resume so we have nothing to apply.
-      const pending = getPendingResume(tabId);
-      if (pending !== null) {
-        console.warn('[Terminal:TuiReady] tab=' + tabId.slice(-12) + ' SKIP — resume in flight');
-        return;
-      }
-      _effortSentForTab.set(tabId, { at: Date.now(), via: 'tui-ready' });
+      // NO resume guard here — this is the safe path to (re-)inject on --resume.
+      // Why resume needs re-inject at all: `claude --resume` is a FRESH process.
+      // Per decompiled Claude Code (main.tsx: `parseEffortValue(options.effort)
+      // ?? getInitialEffortSetting()`), with no --effort flag it falls back to
+      // settings.json's effortLevel — and `toPersistableEffort` STRIPS 'max' on
+      // read. So a resumed session silently loses max (and any session-scoped
+      // level). The old guard's premise ("effort preserved by Claude TUI state")
+      // was false — there is no surviving memory across a process restart.
+      // Why it's safe HERE specifically: tui-ready fires only once Claude has
+      // drawn the ⏵ prompt = the resume handshake is finished and the input is
+      // idle/ready. The 2026-05-21 paste-race (303 bytes of old prompt eaten by
+      // Ctrl+S stash) was on the Bridge:Fresh / process-started path, which
+      // fires DURING the handshake — that path keeps its resume guard below.
+      // The sentinel guarantees a single inject (tui-ready sets it ~2-6s before
+      // Bridge:Fresh, which then no-ops). See fact-claude-tui-control.md.
+      _effortSentForTab.set(tabId, { at: Date.now(), via: 'tui-ready', level: eff });
       console.warn('[Terminal:TuiReady] tab=' + tabId.slice(-12) + ' /effort ' + eff + ' (early path, before Bridge:Fresh)');
       ipcRenderer.invoke('claude:send-command', tabId, '/effort ' + eff).catch((e: unknown) => {
         console.error('[Terminal:TuiReady] inject failed', e);
@@ -1135,7 +1180,7 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
         term.scrollToBottom();
         isReadyRef.current = true;
         setIsVisible(true); // Reveal after first fit to prevent jitter
-        if (active) {
+        if (active && !isExternalEditableFocused()) {
           term.focus();
         }
 
@@ -1956,7 +2001,11 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
           safeFit();
           isReadyRef.current = true;
           setIsVisible(true);
-          term.focus();
+          // Don't steal focus from an open tab-rename input (Cmd+T / new tab
+          // auto-opens it in this same tick). See isExternalEditableFocused.
+          if (!isExternalEditableFocused()) {
+            term.focus();
+          }
 
           // NOTE: Pending command execution moved to handleData
           // It now waits for first PTY output (= shell ready) instead of arbitrary timeout
@@ -2020,7 +2069,10 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
         console.warn('[Terminal:activate] _renderService.clear() ERROR:', e);
       }
 
-      term.focus();
+      // Don't steal focus from an open tab-rename input (new-tab auto-edit).
+      if (!isExternalEditableFocused()) {
+        term.focus();
+      }
 
       // Restore saved scroll position (from when tab was deactivated)
       const savedWasAtBottom = wasAtBottom.current;

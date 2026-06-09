@@ -22,6 +22,34 @@ Bar ложится **под** контентом Terminal-колонки, но �
 
 Layout одинаковый для PTY и SDK, но набор контролов разный: для SDK скрыт Provider (SDK гоняет напрямую в Anthropic), Effort-кластер показывается полностью для всех моделей (DeepSeek-PTY использует свою шкалу `DEEPSEEK_EFFORT_LEVELS` с `off`), Continue превращается в фокус на composer вместо `claude --resume` команды. (Раньше тут было «для SDK скрыт Effort с caps'ами через `getSupportedEffortsForAlias`» — это был per-model гейтинг, отменён 2026-05-29, см. `fact-claude-sdk-tab.md`.)
 
+## Busy-state tab binding — `useState` НЕ сбрасывается сам при смене таба
+
+`ClaudeControlBar` монтируется в `Workspace.tsx` **без `key`** — React **переиспользует** один инстанс на все табы проекта, при переключении меняется только проп `tabId`, компонент **не ремаунтится**. Из этого следует ловушка для любого локального `useState`-флага (`isPasteBusy`, `isLocalBusy`, `effortLocal`, `thinkLocal`): он **не обнуляется** автоматически при смене `tabId`. Эффекты с `[tabId]` в deps пере-подписывают слушатели, но значение state остаётся от прошлого таба.
+
+Два прод-бага вытекают ровно отсюда (сессия `ea2ae02c` / tab-283, 2026-06-03 ~22:07 MSK):
+
+1. **LEAK across tabs.** `isPasteBusy=true` пойман для таба A → юзер переключился на таб B → shimmer-overlay правого кластера всё ещё горит, хотя B ничем не занят. Юзер: *«я на другую вкладку перешёл… но у меня почему-то loader от вот этого компонента всё равно сохранялся»*.
+2. **STUCK FOREVER.** `safePasteAndSubmit` шлёт `emitBusy(false)` с `{tabId: A}` (см. `fact-claude-tui-control.md::paste-busy`). Но к моменту прихода этого события слушатель уже фильтрует по **новому** `tabId` (B): `if (data.tabId === tabId)` → `A !== B` → `false` **дропается**. Локальный `isPasteBusy` остаётся `true` навсегда — переживает reload вкладки и даже kill Claude-процесса. Это и есть «убил процесс клода, а loader не сбросился».
+
+**Корень совпал с гипотезой юзера:** *«лоудер не имеет привязки к вкладке»*. Буквально: busy-флаг — это renderer-local state одного переиспользуемого инстанса, не per-tab persistent поле, и при ребинде он не чистится.
+
+**Фикс (три слоя в одном `useEffect([tabId])`):**
+- **Синхронный reset на ребинд:** в начале эффекта `setIsPasteBusy(false); setIsLocalBusy(false)` — свежепривязанный таб всегда стартует чистым, не наследует busy прошлого.
+- **Clear на lifecycle-краях:** подписка на `claude:process-started` и `terminal:command-finished` (OSC 133 D) с фильтром по `tabId` → обнуляют оба флага. Когда Claude стартовал или умер — живого TUI mid-paste нет, любой висящий индикатор по определению stale. Это то, что чинит recovery после kill.
+- **Manual escape hatch** (см. ниже) — на случай если оба автопути промахнулись.
+
+Переносимый принцип: **любой `useState` в keyless-переиспользуемом компоненте, чьё значение семантически per-tab (или per-любой-prop-идентичность), обязан иметь explicit reset в `useEffect([thatProp])`.** Без `key` React не сделает это за тебя. Родственный антипаттерн — `fix-zustand-silent-mutation.md` (stale value при правильной подписке).
+
+## Click-to-reset overlay на залипшем busy-кластере
+
+Юзер-запрошенный escape hatch поверх автоматических clear'ов: *«самое простое решение — сделать эту область кликабельной, при наведении красное СТОП на весь loader, переклик сбрасывает состояние»*.
+
+Когда `isBusy` — поверх всего правого кластера (Provider/Model/Effort/Think) рендерится `.control-bar-busy-reset` (absolute, `inset:0`, `z-index:2` — выше shimmer-`::after` который `z-index:1`). Родитель в busy ставит `pointer-events:none`; overlay сам себе возвращает `pointer-events:auto` через CSS. Idle-вид overlay'я — прозрачный (label `color:transparent`), чтобы оранжевый shimmer просвечивал нетронутым. Hover — сплошная красная заливка + статичный белый **uppercase «СБРОС»** (destructive-intent + AI-OCR rule: статичный B/W uppercase, не opacity-анимация). Клик зовёт `forceResetBusy` → `setIsPasteBusy(false); setIsLocalBusy(false)` + refocus terminal.
+
+**Что reset НЕ делает:** не отменяет реально летящий main-side paste — он только ре-синкает UI. Per-term mutex (`pasteInflight` WeakMap) в `safePasteAndSubmit` всё равно сериализует любую настоящую конкурентную запись на тот же PTY. То есть клик безопасен даже если main на самом деле занят: UI разблокируется, но байты не интерлевятся.
+
+CSS — `globals.css::.control-bar-busy-reset` (рядом с `.control-bar-busy-overlay`). Красный тон `rgba(220,38,38,…)` = тот же `#dc2626` что в `glow-red` (единая палитра destructive).
+
 ## Per-tab state и selectors
 
 Tab-метаданные (`tabType`, `sdkModel`, `sdkEffort`, `sdkThinking`) читаются через **отдельные** primitive Zustand-селекторы на каждое поле. **НЕ** единый композитный селектор — он возвращал бы свежий объект `{}` на каждом рендере, Zustand видит новую ссылку и фурит компонент в бесконечный re-render. Это та же ловушка что в CLAUDE.md anti-pattern «Не подписывайся на Map целиком» (Zustand fingerprint pattern).
@@ -30,9 +58,15 @@ PTY-only: `effortLocal` и `thinkLocal` — local UI mirror, который **н
 
 ## Context % bridge: два разных канала для PTY и SDK
 
-PTY: `claude:bridge-update` IPC event с payload `{tabId, model, contextPct}` — обновляется на каждом ассистентском chunk'е, парсится из bridge JSONL.
+PTY: `claude:bridge-update` IPC event с payload `{tabId, sessionId, model, contextPct}`. **Цифра — собственное число Claude, не наш расчёт.** Цепочка: Claude Code statusLine отдаёт `context_window.used_percentage` (уже посчитанный против `context_window_size` модели — 200k или 1M, знаменатель разрешает сам Claude) → `~/.claude/statusline-bridge.sh` читает это поле (`jq '.context_window.used_percentage'`, `cut -d. -f1` флорит в int) и пишет в `~/.claude/bridge/<session>.json` поле `context_pct` → main `processFile()` форвардит как `claude:bridge-update` → ControlBar показывает сырым. Это **ровно то же значение что в TUI-statusLine** — никакого пересчёта `used/window` на нашей стороне (и не должно быть: своя формула разойдётся с источником на 1M-сессиях, см. `methodology/переносимый-дизайн.md::Отображаемую метрику читай из числа источника`). НЕ «парсится из JSONL» — источник именно statusLine-хук, не транскрипт.
 
-SDK: нет IPC. `ClaudeSDKTab` хранит `lastContextUsedTokens` в локальном React-стейте и диспатчит `window.CustomEvent('sdk-context-update', {detail: {tabId, contextPct, model}})` на каждом ассистентском SSE. ControlBar слушает window-event. Мотивация: добавлять новый IPC channel + поле в Tab interface ради одного UI-меридиана — overkill. Window CustomEvent дешевле и не трогает SQLite-схему. Тот же паттерн уже использован для `history-panel:loading`.
+Два guard'а на handler'е (`ClaudeControlBar.tsx`):
+- **stale-session**: handler консультирует `isStaleAgainstPending(tabId, data.sessionId)` перед display+persist. Без этого во время resume-гонки (PID reuse) мёртвая сессия штамповала свой % на таб И писала его в SQLite (`tab:persist-context-pct`) — Terminal.tsx отвергал чужой sessionId-write, но meter всё равно врал. main шлёт `sessionId` в payload именно для этой сверки. См. `fix-bridge-stale-takeover.md`.
+- **live-0 не затирает seed**: live-кадр `contextPct === 0` (sub-1% зафлоренный `cut -d. -f1`, или отсутствующее `.used_percentage` → jq `// 0` fallback) больше НЕ вызывает `setContextPct(0)` — render-guard прячет meter при 0, и безусловный сброс гасил только что засиженное из SQLite значение. `setContextPct` теперь симметричен `persistContextPct`'s `pct <= 0` guard: применяется только положительное число, иначе держим last-known.
+
+Seed: на mount таба meter засевается из SQLite (`tab:get-context-pct` → `getTabContextPct`) — показывает last-known fill даже когда Claude не запущен (CLI вышел / ещё не стартовал). Известная неточность которую НЕ чиним: после `/clear`/rewind реальный контекст падает, но seed/last-persisted держит старый % до следующего assistant-turn'а который перепишет bridge.json.
+
+SDK: нет IPC. `ClaudeSDKTab` хранит `lastContextUsedTokens` в локальном React-стейте и диспатчит `window.CustomEvent('sdk-context-update', {detail: {tabId, contextPct, model}})` на каждом ассистентском SSE. ControlBar слушает window-event. Мотивация: добавлять новый IPC channel + поле в Tab interface ради одного UI-меридиана — overkill. Window CustomEvent дешевле и не трогает SQLite-схему. Тот же паттерн уже использован для `history-panel:loading`. (SDK считает % сам — `lastContextUsedTokens / getModelContextWindow(...)` с детектом `[1m]`/Opus-4.8 — потому что у SDK нет statusLine-хука; это исключение из «бери число у источника», т.к. источника готового процента у SDK-канала нет.)
 
 ## sdkBusy mirror — отдельная подписка для SDK таб'ов
 

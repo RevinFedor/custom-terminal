@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useUIStore } from '../../store/useUIStore';
 import { terminalRegistry } from '../../utils/terminalRegistry';
+import { markPendingResume, isStaleAgainstPending } from '../../utils/pendingResume';
 import {
   CLAUDE_EFFORT_LEVELS,
   DEEPSEEK_EFFORT_LEVELS,
@@ -21,6 +22,131 @@ interface Props {
   commandType: string | null;     // 'claude' | 'gemini' | etc — used to label SessionActionChip
   isCommandRunning: boolean;
   projectPath?: string;
+}
+
+// ============================================================================
+// CacheCooldownChip — twin of the context meter, lives in the right cluster.
+// ============================================================================
+// Shows minutes left until Anthropic's prompt cache cools down (1h TTL that
+// refreshes on every turn — so the countdown only ticks while the session is
+// idle; an active turn re-anchors it). Main figure = minutes; secondary = the
+// billing ratio (what fraction of full price this turn cost — cache_read pays
+// 0.1×, so a warm cache lands ~10%). Hover → breakdown card, fixed width.
+//
+// Lives as its own component so its 1/min setInterval re-renders only the chip,
+// not the whole bar. Hidden entirely when not Anthropic (DeepSeek/Zen have no
+// cache → parent passes show=false) or when no turn has touched the cache yet.
+const CACHE_TTL_MIN = 60; // server-side 1h TTL (see fact-provider-proxy.md)
+
+function CacheCooldownChip({
+  data,
+  busy,
+}: {
+  data: { cacheRead: number; cacheCreate: number; input: number; ts: number };
+  busy: boolean;
+}) {
+  const [hover, setHover] = useState(false);
+  // Re-render once a minute so the countdown stays current while idle. When a
+  // turn is in flight (busy) the countdown is meaningless (cache re-anchors on
+  // this very turn) — we show a live dot instead, no need to tick.
+  const [, forceTick] = useState(0);
+  useEffect(() => {
+    if (busy) return;
+    const id = setInterval(() => forceTick(t => t + 1), 60_000);
+    return () => clearInterval(id);
+  }, [busy, data.ts]);
+
+  const ageMin = (Date.now() - data.ts) / 60000;
+  const leftMin = Math.max(0, CACHE_TTL_MIN - ageMin);
+  const cold = leftMin <= 0;
+  const soon = !cold && leftMin <= 10;
+
+  // Billing ratio: cache_read bills 0.1×, cache_creation + fresh input bill 1×.
+  // ratio = paid / (paid if everything were full-price). Lower = better.
+  const billed = data.cacheRead * 0.1 + data.cacheCreate + data.input;
+  const fullPrice = data.cacheRead + data.cacheCreate + data.input;
+  const ratioPct = fullPrice > 0 ? Math.round((billed / fullPrice) * 100) : 100;
+  const saveFactor = billed > 0 ? fullPrice / billed : 1;
+
+  // Color: warm green, cooling-soon amber, cold grey.
+  const color = cold ? '#777' : soon ? '#f59e0b' : '#4ade80';
+
+  // Main figure = minutes (per user). Busy → dot (countdown frozen/re-anchoring).
+  // Cold → snowflake glyph, no number. Secondary = billing %.
+  const mainLabel = cold ? '❄' : busy ? '●' : `${Math.round(leftMin)}м`;
+
+  const fmtK = (n: number) => n >= 1000 ? `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}K` : `${n}`;
+
+  return (
+    <span
+      style={{ position: 'relative', flexShrink: 0, display: 'inline-flex', alignItems: 'center' }}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+    >
+      <span
+        style={{
+          display: 'inline-flex', alignItems: 'center', gap: 4,
+          fontSize: 12, color, fontVariantNumeric: 'tabular-nums',
+          cursor: 'default', whiteSpace: 'nowrap',
+        }}
+      >
+        {/* Cache/snapshot glyph — a clock-with-arrow (cooldown timer). Inherits
+            currentColor so it tracks the warm/amber/cold state. Only the minutes
+            are shown inline; the billing % lives in the hover card. */}
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none"
+          stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"
+          style={{ opacity: 0.85, flexShrink: 0 }} aria-hidden>
+          <path d="M21 12a9 9 0 1 1-3-6.7" />
+          <polyline points="21 3 21 9 15 9" />
+          <polyline points="12 8 12 12 14.5 13.5" />
+        </svg>
+        <span style={{ fontWeight: 500 }}>{mainLabel}</span>
+      </span>
+
+      {hover && (
+        <div
+          style={{
+            position: 'absolute', bottom: 'calc(100% + 6px)', right: 0,
+            width: 232, padding: '10px 12px',
+            backgroundColor: '#1c1c1c', border: '1px solid #333', borderRadius: 6,
+            boxShadow: '0 4px 16px rgba(0,0,0,0.5)', zIndex: 50,
+            fontSize: 12, lineHeight: 1.5, color: '#ddd', cursor: 'default',
+          }}
+        >
+          {cold ? (
+            <>
+              <div style={{ fontWeight: 600, color: '#aaa', marginBottom: 4 }}>Кэш остыл</div>
+              <div style={{ color: '#999' }}>
+                Следующий ход пересчитает весь контекст заново — полная цена.
+                Любой ход снова прогреет кэш на час.
+              </div>
+            </>
+          ) : (
+            <>
+              <div style={{ fontWeight: 600, color, marginBottom: 4 }}>
+                {busy ? 'Кэш активен' : 'Кэш тёплый'}
+              </div>
+              <div style={{ color: '#999', marginBottom: 8 }}>
+                {busy ? 'Отсчёт продлевается этим ходом' : `Остынет через ${Math.round(leftMin)} мин`}
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <span style={{ color: '#888' }}>из кэша</span>
+                <span style={{ color: '#4ade80', fontVariantNumeric: 'tabular-nums' }}>{fmtK(data.cacheRead)} · ×0.1</span>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <span style={{ color: '#888' }}>пересчитано</span>
+                <span style={{ color: '#bbb', fontVariantNumeric: 'tabular-nums' }}>{fmtK(data.cacheCreate + data.input)}</span>
+              </div>
+              <div style={{ borderTop: '1px solid #2e2e2e', marginTop: 8, paddingTop: 6, color: '#999' }}>
+                Заплатил ~{ratioPct}% от полной цены
+                {saveFactor >= 1.5 && <> · экономия ≈ ×{saveFactor.toFixed(saveFactor >= 10 ? 0 : 1)}</>}
+              </div>
+            </>
+          )}
+        </div>
+      )}
+    </span>
+  );
 }
 
 // Bottom-anchored Claude control strip rendered under the Terminal column for
@@ -113,33 +239,127 @@ export default function ClaudeControlBar({
   // Live bridge data (PTY only): model name + context %.
   const [claudeModel, setClaudeModel] = useState<string | null>(null);
   const [contextPct, setContextPct] = useState<number>(0);
+  // Cache cooldown chip data: split + the timestamp this turn touched the cache.
+  // Anthropic's prompt cache uses a 1h TTL that REFRESHES on every use, so `ts`
+  // is the cooldown anchor — countdown = 60min − (now − ts). PTY arrives via
+  // claude:cache-update IPC (proxy taps message_start); SDK via sdk-cache-update
+  // window event (SDK bypasses the proxy). Null = no turn yet this session →
+  // chip hidden. Not persisted: freshness is a live metric, stale ts would lie.
+  const [cacheData, setCacheData] = useState<{ cacheRead: number; cacheCreate: number; input: number; ts: number } | null>(null);
+  // Last whole-percent we persisted. The bridge/SDK report % many times per
+  // turn; we only hit the DB when the rounded value actually moves, so the
+  // single-column UPDATE fires a few dozen times a session, not per tick.
+  const lastPersistedPctRef = useRef<number>(-1);
+  const persistContextPct = (pct: number) => {
+    if (typeof pct !== 'number' || pct <= 0) return;
+    const rounded = Math.round(pct);
+    if (rounded === lastPersistedPctRef.current) return;
+    lastPersistedPctRef.current = rounded;
+    ipcRenderer.invoke('tab:persist-context-pct', { tabId, pct }).catch(() => {});
+  };
+
+  // Seed the meter from the last value persisted for THIS tab, so it shows the
+  // last-known context fill even when no Claude process is running (CLI exited
+  // or not launched yet). Guard against a live tick that already landed: only
+  // apply the seed if the meter is still at 0.
   useEffect(() => {
     setClaudeModel(null);
     setContextPct(0);
-    const handler = (_: any, data: { tabId: string; model: string; contextPct: number }) => {
+    setCacheData(null);
+    lastPersistedPctRef.current = -1;
+    let cancelled = false;
+    ipcRenderer.invoke('tab:get-context-pct', { tabId }).then((r: any) => {
+      const seeded = r?.pct;
+      if (cancelled || typeof seeded !== 'number' || seeded <= 0) return;
+      setContextPct(prev => (prev === 0 ? seeded : prev));
+      lastPersistedPctRef.current = Math.round(seeded);
+    }).catch(() => {});
+
+    const handler = (_: any, data: { tabId: string; sessionId?: string; model: string; contextPct: number }) => {
       if (data.tabId !== tabId) return;
+      // Same stale-bridge guard Terminal.tsx applies to sessionId writes: during a
+      // resume (PID-reuse race) a foreign/dead session's bridge can fire first. We
+      // must not stamp — and especially not PERSIST — its model/%/cache onto this
+      // tab. Terminal.tsx already rejects the foreign sessionId write; mirror that
+      // here so the meter doesn't show another session's number. See
+      // fix-bridge-stale-takeover.md + pty-streaming audit.
+      if (data.sessionId && isStaleAgainstPending(tabId, data.sessionId)) return;
       setClaudeModel(data.model);
-      setContextPct(data.contextPct);
+      // Symmetric with persistContextPct's `pct <= 0` guard: a live frame of 0
+      // (sub-1% floored by statusline-bridge's `cut -d. -f1`, or a missing
+      // .used_percentage where jq returns the `// 0` fallback) must NOT wipe a
+      // known non-zero meter — the render guard hides at 0, so an unconditional
+      // setContextPct(0) made the % vanish mid-session / right after a SQLite seed.
+      // Keep the last-known value until a real positive number arrives.
+      if (typeof data.contextPct === 'number' && data.contextPct > 0) {
+        setContextPct(data.contextPct);
+        persistContextPct(data.contextPct);
+      }
     };
     ipcRenderer.on('claude:bridge-update', handler);
-    return () => { ipcRenderer.removeListener('claude:bridge-update', handler); };
+    return () => { cancelled = true; ipcRenderer.removeListener('claude:bridge-update', handler); };
   }, [tabId]);
 
   // SDK tab: context % lives in ClaudeSDKTab local state. It re-emits a window
   // CustomEvent('sdk-context-update', {tabId, contextPct, model}) on every
   // assistant SSE — same pattern as the existing 'history-panel:loading' event.
-  // Keeps Tab interface untouched (no SQLite schema bump).
+  // No setContextPct(0) reset here — the effect above already seeded from the
+  // persisted value; zeroing would wipe the last-known % on every tab switch.
   useEffect(() => {
     if (!isSDKTab) return;
     const handler = (e: Event) => {
       const { tabId: t, contextPct: c, model: m } = (e as CustomEvent).detail || {};
       if (t !== tabId) return;
-      if (typeof c === 'number') setContextPct(c);
+      if (typeof c === 'number') { setContextPct(c); persistContextPct(c); }
       if (m) setClaudeModel(m);
     };
     window.addEventListener('sdk-context-update', handler);
     return () => window.removeEventListener('sdk-context-update', handler);
   }, [tabId, isSDKTab]);
+
+  // Cache cooldown data — two channels, same shape, mutually exclusive by tab type.
+  // PTY: claude:cache-update IPC (proxy parsed message_start, only fires for
+  // anthropic mode → DeepSeek/Zen never emit → chip stays hidden for them).
+  // SDK: sdk-cache-update window event (SDK runs direct to Anthropic, no proxy).
+  //
+  // Persisted per-tab in SQLite: ts is a wall-clock anchor (server cache TTL is
+  // wall-clock), so the "cools down in N min" countdown stays accurate after a
+  // tab switch or restart. Without this the chip vanished on every navigation
+  // (it only existed between a live turn and the next remount). Seed on mount
+  // from the stored value; live events overwrite + re-persist.
+  const persistCacheStats = (s: { cacheRead: number; cacheCreate: number; input: number; ts: number }) => {
+    ipcRenderer.invoke('tab:persist-cache-stats', { tabId, stats: s }).catch(() => {});
+  };
+  useEffect(() => {
+    let cancelled = false;
+    ipcRenderer.invoke('tab:get-cache-stats', { tabId }).then((r: any) => {
+      const s = r?.stats;
+      if (cancelled || !s || typeof s.ts !== 'number') return;
+      // Don't clobber a live event that already landed during the async round-trip.
+      setCacheData(prev => prev ?? { cacheRead: s.cacheRead || 0, cacheCreate: s.cacheCreate || 0, input: s.input || 0, ts: s.ts });
+    }).catch(() => {});
+
+    const ptyHandler = (_: any, data: { tabId: string; cacheRead: number; cacheCreate: number; input: number; ts: number }) => {
+      if (data.tabId !== tabId) return;
+      const s = { cacheRead: data.cacheRead, cacheCreate: data.cacheCreate, input: data.input, ts: data.ts };
+      setCacheData(s);
+      persistCacheStats(s);
+    };
+    const sdkHandler = (e: Event) => {
+      const d = (e as CustomEvent).detail || {};
+      if (d.tabId !== tabId) return;
+      const s = { cacheRead: d.cacheRead, cacheCreate: d.cacheCreate, input: d.input, ts: d.ts };
+      setCacheData(s);
+      persistCacheStats(s);
+    };
+    ipcRenderer.on('claude:cache-update', ptyHandler);
+    window.addEventListener('sdk-cache-update', sdkHandler);
+    return () => {
+      cancelled = true;
+      ipcRenderer.removeListener('claude:cache-update', ptyHandler);
+      window.removeEventListener('sdk-cache-update', sdkHandler);
+    };
+  }, [tabId]);
 
   // Provider state (PTY only — SDK runs directly against Anthropic).
   const [providerState, setProviderState] = useState<{ type: string; model?: string; effort?: string }>({ type: 'anthropic' });
@@ -186,12 +406,43 @@ export default function ClaudeControlBar({
   const [isPasteBusy, setIsPasteBusy] = useState(false);
   const [isLocalBusy, setIsLocalBusy] = useState(false);
   const isBusy = isPasteBusy || isLocalBusy;
+  // CRITICAL: this component is mounted WITHOUT a `key` (Workspace.tsx) so React
+  // REUSES the same instance across tab switches — only the `tabId` prop changes,
+  // the instance never remounts. Therefore `useState` busy flags do NOT reset on
+  // their own when the user switches tabs. Two prod bugs come straight out of that
+  // (session ea2ae02c / tab-283, 2026-06-03 ~22:07 MSK):
+  //   • LEAK: busy=true captured for tab A still shows the shimmer when the user
+  //     switches to tab B (state carried over).
+  //   • STUCK FOREVER: the matching emitBusy(false) for tab A is broadcast with
+  //     {tabId: A}, but by the time it lands the listener below filters on the
+  //     NEW tabId (B) → A≠B → the false is DROPPED → loader never clears, even
+  //     after the user reloads the tab or kills the Claude process.
+  // Fix: on every tabId change, hard-reset both flags so a freshly-bound tab
+  // starts clean; the live listener then reflects only THIS tab's paste state.
+  // Also clear on the two process-lifecycle edges (fresh spawn / process death)
+  // — when Claude starts or is killed there is no live TUI mid-paste, so any
+  // lingering indicator is stale by definition. This is what makes "я убил
+  // процесс клода, а лоудер не сбросился" recover. See
+  // fact-claude-control-bar.md::Busy-state tab binding.
   useEffect(() => {
+    // Reset synchronously on bind to a new tab — never inherit the previous
+    // tab's busy state.
+    setIsPasteBusy(false);
+    setIsLocalBusy(false);
     const handler = (_: any, data: { tabId: string; busy: boolean }) => {
       if (data.tabId === tabId) setIsPasteBusy(data.busy);
     };
+    const clearOnLifecycle = (_: any, data: { tabId: string }) => {
+      if (data.tabId === tabId) { setIsPasteBusy(false); setIsLocalBusy(false); }
+    };
     ipcRenderer.on('claude:paste-busy', handler);
-    return () => { ipcRenderer.removeListener('claude:paste-busy', handler); };
+    ipcRenderer.on('claude:process-started', clearOnLifecycle);
+    ipcRenderer.on('terminal:command-finished', clearOnLifecycle);
+    return () => {
+      ipcRenderer.removeListener('claude:paste-busy', handler);
+      ipcRenderer.removeListener('claude:process-started', clearOnLifecycle);
+      ipcRenderer.removeListener('terminal:command-finished', clearOnLifecycle);
+    };
   }, [tabId]);
 
   // SDK busy mirror — для SDK таба нет OSC 133, isCommandRunning из Workspace
@@ -239,6 +490,18 @@ export default function ClaudeControlBar({
   const isAnthropicPTY = !isSDKTab && providerState.type === 'anthropic';
   const isDeepSeekPTY = !isSDKTab && providerState.type === 'deepseek';
   const supportsKnobs = isSDKTab || isAnthropicPTY || isDeepSeekPTY;
+
+  // Cache cooldown chip: Claude only (Anthropic PTY or SDK). DeepSeek/Zen have
+  // no prompt cache, so the chip is meaningless there — hide entirely. Also
+  // needs at least one cache-bearing turn captured this session.
+  const showCacheChip = (isSDKTab || isAnthropicPTY) && cacheData != null;
+  // Turn-level busy, NOT process-level. `sdkBusy` is fed by claude:busy-state,
+  // which main emits for BOTH SDK and PTY Claude (spinner + stop-hook), filtered
+  // by tabId — so it goes false between turns on both. Using isCommandRunning
+  // here was the PTY bug: it tracks the Claude PROCESS lifetime (OSC 133 B→D),
+  // so it stayed true the whole session → the chip was frozen on the busy `●`
+  // dot and never showed the "60м" countdown the SDK chip shows.
+  const cacheBusy = sdkBusy;
 
   const effortLevels = isDeepSeekPTY ? DEEPSEEK_EFFORT_LEVELS : CLAUDE_EFFORT_LEVELS;
 
@@ -376,8 +639,8 @@ export default function ClaudeControlBar({
     // paths in Terminal.tsx see it and skip. Without this, the user's frustration
     // click while waiting for tui-ready would race the auto-inject and produce
     // two /effort lines (forensic: 2026-05 tab-2933 incident).
-    const sentinelMap = (window as any).__effortSentForTab as Map<string, { at: number; via: string }> | undefined;
-    if (sentinelMap) sentinelMap.set(tabId, { at: Date.now(), via: 'manual-click' });
+    const sentinelMap = (window as any).__effortSentForTab as Map<string, { at: number; via: string; level: string }> | undefined;
+    if (sentinelMap) sentinelMap.set(tabId, { at: Date.now(), via: 'manual-click', level });
     console.warn('[EffortDiag2026-05][CONTROLBAR-CLICK] tab=' + tabId.slice(-12) + ' level=' + level + ' ts=' + Date.now());
     setIsLocalBusy(true);
     setEffortLocal(level);
@@ -458,9 +721,15 @@ export default function ClaudeControlBar({
     setIsLocalBusy(true);
     const next = !thinkActive;
     setThinkLocal(next);
+    // Mirror the resolved think state into the cross-client map so the mobile
+    // ParamsSheet (which reads __thinkStateForTab via getSDKParams) shows the
+    // same on/off the desktop just applied. Same pattern as __effortSentForTab.
+    const thinkMap: Map<string, boolean> = (window as any).__thinkStateForTab
+      || ((window as any).__thinkStateForTab = new Map());
+    thinkMap.set(tabId, next);
     try {
       const r = await ipcRenderer.invoke('claude:toggle-thinking', tabId);
-      if (r?.success && typeof r.thinking === 'boolean') setThinkLocal(r.thinking);
+      if (r?.success && typeof r.thinking === 'boolean') { setThinkLocal(r.thinking); thinkMap.set(tabId, r.thinking); }
     } finally { setIsLocalBusy(false); focusTerminal(); }
   };
 
@@ -497,6 +766,11 @@ export default function ClaudeControlBar({
       store.setTabCommandType(tabId, 'claude');
       terminalRegistry.get(tabId)?.scrollToBottom();
       window.dispatchEvent(new CustomEvent('timeline:scroll-to-bottom', { detail: { tabId } }));
+      // Arm the 15s stale-bridge guard BEFORE writing resume — без этого протухший
+      // ~/.claude/bridge/*.json (PID reuse) перезапишет sessionId таба на мёртвый
+      // UUID в окне resume. Contract: любой путь, пишущий `claude --resume`, обязан
+      // вызвать markPendingResume. См. fix-bridge-stale-takeover.md layer 4/5.
+      if (claudeSessionId) markPendingResume(tabId, claudeSessionId);
       ipcRenderer.send('claude:run-command', { tabId, command: 'claude-c', sessionId: claudeSessionId });
     } else if (sessionType === 'gemini') {
       store.setTabCommandType(tabId, 'gemini');
@@ -535,8 +809,43 @@ export default function ClaudeControlBar({
     } catch (e: any) { console.error('[SDKKill] error', e); }
   };
 
+  // WARM-START — boot the SDK process idle so the chip flips ОСТАНОВЛЕН→АКТИВЕН
+  // on click, without sending a message. Passes the tab's sessionId as resume so
+  // the warm process keeps full memory. Also focus the composer so the user can
+  // immediately type. The process-state alive:true from main flips the chip.
+  const onWarmStart = () => {
+    if (!tabId || !isSDKTab) return;
+    ipcRenderer.invoke('claude-sdk:warm-start', {
+      tabId,
+      cwd: projectPath,
+      model: sdkModel || undefined,
+      effort: sdkEffort,
+      thinking: sdkThinking ? 'adaptive' : 'disabled',
+      resumeSessionId: claudeSessionId || undefined,
+    }).catch((e: any) => console.error('[SDKWarmStart] error', e));
+    window.dispatchEvent(new CustomEvent('claude-sdk:focus-composer', { detail: { tabId } }));
+  };
+
   const refreshTimeline = () => {
     window.dispatchEvent(new CustomEvent('timeline:force-refresh', { detail: { tabId } }));
+  };
+
+  // Manual escape hatch for a STUCK busy indicator. The right cluster's shimmer
+  // is driven by isPasteBusy/isLocalBusy; those are renderer-local mirrors of a
+  // main-side paste that emits busy=true→false. If the false is ever lost (the
+  // user switched tabs mid-/effort so emitBusy(false){tabId:A} arrived while the
+  // listener filtered tabId:B → dropped; or the user manually aborted the turn
+  // so /effort's slash-command never confirmed), the cluster shimmers forever.
+  // Clicking the cluster while busy force-clears the local flags so the controls
+  // come back. This does NOT cancel a genuinely in-flight main-side paste — it
+  // only re-syncs the UI; the per-term mutex in safePasteAndSubmit still
+  // serializes any real concurrent write. Юзер: «сделать эту область кликабельной,
+  // при наведении красное СТОП на весь loader, переклик сбрасывает состояние».
+  const forceResetBusy = () => {
+    console.warn('[ControlBar] manual busy-reset by user — clearing stuck loader for tab ' + tabId.slice(-12));
+    setIsPasteBusy(false);
+    setIsLocalBusy(false);
+    focusTerminal();
   };
 
   // Fork into PTY tab. Three branches:
@@ -948,14 +1257,13 @@ export default function ClaudeControlBar({
                 : sdkProcessAlive ? (sdkBusy ? 'работает' : 'активен')
                 : 'остановлен';
               // Always clickable: alive → HARD kill the process; stopped →
-              // activate the tab + focus the composer (the only way to start a
-              // fresh process is to write a message). During the transient
-              // stopping cue it's inert.
+              // WARM-START (boot the process idle → flips to АКТИВЕН) + focus the
+              // composer. During the transient stopping cue it's inert.
               const clickable = !sdkStopping;
-              const onClick = !clickable ? undefined : (alive ? onKillProcess : onContinue);
+              const onClick = !clickable ? undefined : (alive ? onKillProcess : onWarmStart);
               const title = sdkStopping ? 'Останавливаю процесс…'
                 : alive ? 'Процесс активен — нажмите, чтобы полностью остановить'
-                : 'Процесс остановлен — нажмите, чтобы перейти к вводу';
+                : 'Процесс остановлен — нажмите, чтобы запустить';
               return (
                 <span
                   onClick={onClick}
@@ -1171,6 +1479,13 @@ export default function ClaudeControlBar({
             не визуальный объём). Только цветной процент: цвет даёт градиент
             здоровья (зелёный → амбер → красный), сама цифра — точное значение. */}
         <div style={{ flex: 1 }} />
+        {showCacheChip && <CacheCooldownChip data={cacheData!} busy={cacheBusy} />}
+        {/* Vertical divider — only when BOTH chip and context% are present, so a
+            lone separator never floats next to a single value. Same hairline
+            style as the session-pill divider above. */}
+        {showCacheChip && contextPct > 0 && (
+          <span style={{ width: 1, alignSelf: 'center', height: '70%', backgroundColor: 'rgba(255,255,255,0.12)', flexShrink: 0 }} />
+        )}
         {contextPct > 0 ? (
           <span
             style={{ fontSize: 11, color: meterColor, fontVariantNumeric: 'tabular-nums', flexShrink: 0 }}
@@ -1202,6 +1517,7 @@ export default function ClaudeControlBar({
         <div
           className={isBusy ? 'control-bar-busy-overlay' : undefined}
           style={{
+            position: 'relative',
             display: 'flex',
             alignItems: 'center',
             gap: 6,
@@ -1211,6 +1527,19 @@ export default function ClaudeControlBar({
           }}
           aria-busy={isBusy}
         >
+          {/* Click-to-reset escape hatch — covers the WHOLE cluster while busy.
+              Parent sets pointer-events:none; this re-enables itself (CSS) and
+              sits above the shimmer. Hover = red "СБРОС", click force-clears a
+              stuck loader. See forceResetBusy + fact-claude-control-bar.md. */}
+          {isBusy && (
+            <div
+              className="control-bar-busy-reset"
+              onClick={forceResetBusy}
+              title="Сбросить зависший индикатор (loader не сбросился сам)"
+            >
+              СБРОС
+            </div>
+          )}
           {/* Provider — only for PTY tabs */}
           {!isSDKTab && (
             <div style={{ position: 'relative' }}>

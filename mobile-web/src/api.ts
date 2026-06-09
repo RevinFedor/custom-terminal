@@ -62,6 +62,9 @@ export type ProjectInfo = {
   updatedAt: number;
   isOpen: boolean;
   isActive: boolean;
+  // True when any claude tab in this project is blocked on an AskUserQuestion —
+  // the project card shows the rotating purple ring (mirror of desktop).
+  hasAwaiting?: boolean;
 };
 
 export type TabInfo = {
@@ -69,6 +72,10 @@ export type TabInfo = {
   name: string;
   tabType: string;
   commandType?: string;
+  // Desktop user-assigned tab color (TabColor enum) — drives the row background
+  // so the mobile list looks exactly like the desktop vertical tab list. null =
+  // default (faint translucent bg). Server may omit it (old build) → treated null.
+  color?: string | null;
   cwd: string;
   claudeSessionId?: string;
   // Number of Timeline-relevant entries (user prompts + compact boundaries)
@@ -76,8 +83,90 @@ export type TabInfo = {
   timelineCount?: number | null;
   live?: { sessionId?: string; cwd: string } | null;
   // For PTY+Claude tabs only: lifecycle of the embedded `claude` process.
-  // null for SDK tabs and bare-shell tabs.
+  // null for SDK tabs and bare-shell tabs. Drives the loader + row glow.
   sessionStatus?: 'active' | 'busy' | 'inactive' | null;
+  // True when Claude is blocked on an AskUserQuestion in this tab — the tab list
+  // shows a pulsing purple dot ("needs your answer"), mirroring the desktop glow.
+  awaiting?: boolean;
+  // Assigned-category status (dev/bugfix/knowledge/custom) mirrored from the
+  // desktop "Статусы" palette. `statusId` is the stable id, `statusColor` the
+  // resolved hex from the desktop palette. null when no category is assigned or
+  // the desktop server predates this field (graceful: marker falls back).
+  statusId?: string | null;
+  statusColor?: string | null;
+};
+
+// Status-marker shape/size mirrored from the desktop useUIStore.statusMarker.
+// Sent at the top of /api/projects/:id/tabs so the phone draws the SAME left
+// marker (square vs dot) the desktop TabBar uses.
+export type StatusMarkerCfg = { shape: 'dot' | 'square'; sizePx: number };
+
+// Process-bar config mirrored from desktop useUIStore.processBar. Drives the
+// loader STRIP (переливающаяся полоска) on the tab-row edge — position left/right,
+// colors + pulse cycle. `enabled:false` = static colorA strip (no pulse). This is
+// the AI-busy / process-alive loader; there is NO whole-tab background tint.
+export type ProcessBarCfg = {
+  enabled: boolean;
+  colorA: string;
+  colorB: string;
+  durationMs: number;
+  position: 'left' | 'right';
+};
+
+// ── Prompt Queue ("Run after") — mobile mirror of the desktop store ──────────
+// Mobile does NOT own the queue: it reads this core from the desktop store and
+// pushes mutation ops back; the desktop App-root runner fires the prompts. Live
+// deltas arrive via the `queue-update` SSE event. The shape mirrors the
+// desktop's PromptQueueCore (usePromptQueueStore.ts).
+export type QueueItem = {
+  id: string;
+  text: string;
+  images: number;
+  createdAt: number;
+};
+export type QueueCore = {
+  items: QueueItem[];
+  autoRun: boolean;
+  stopAfter: boolean;
+  closeAfter: boolean;
+  runAfterTabId: string | null;
+  firstDelaySeconds: number;
+  postPromptEnabled: boolean;
+  postPromptText: string;
+};
+export type QueueAiTab = { id: string; name: string; kind: 'claude-pty' | 'claude-sdk' | 'gemini' };
+export type QueueData = { tabId: string; queue: QueueCore; aiTabs: QueueAiTab[] };
+// Mutation ops — each maps 1:1 to a desktop store method.
+export type QueueOp =
+  | { op: 'add'; args: { text: string } }
+  | { op: 'remove'; args: { id: string } }
+  | { op: 'update'; args: { id: string; text: string } }
+  | { op: 'reorder'; args: { fromIndex: number; toIndex: number } }
+  | { op: 'clear'; args?: {} }
+  | { op: 'setAutoRun'; args: { value: boolean } }
+  | { op: 'setStopAfter'; args: { value: boolean } }
+  | { op: 'setCloseAfter'; args: { value: boolean } }
+  | { op: 'setRunAfterTab'; args: { value: string | null } }
+  | { op: 'setFirstDelaySeconds'; args: { value: number } }
+  | { op: 'setPostPromptEnabled'; args: { value: boolean } }
+  | { op: 'setPostPromptText'; args: { value: string } };
+
+// ── AskUserQuestion (interactive question from Claude) ───────────────────────
+// Claude can pause and ask the user a multiple-choice question (AskUserQuestion
+// tool). Both PTY-terminal-Claude and SDK tabs surface it. Mobile renders its
+// own picker and answers back; PTY answers drive the Ink TUI keystrokes, SDK
+// answers resolve the parked canUseTool Promise (server routes by `source`).
+export type QuestionOption = { label: string; description?: string; preview?: string };
+export type MobileQuestion = {
+  question: string;
+  header?: string;
+  multiSelect?: boolean;
+  options: QuestionOption[];
+};
+export type PendingQuestion = {
+  source: 'pty' | 'sdk';
+  toolUseID: string;
+  questions: MobileQuestion[];
 };
 
 export type TimelineEntry = {
@@ -95,7 +184,7 @@ export const Api = {
   ping: () => api<{ ok: boolean; lanIp: string }>('/api/me'),
   listProjects: () => api<{ projects: ProjectInfo[] }>('/api/projects'),
   listTabs: (projectId: string) =>
-    api<{ project: { id: string; name: string; path: string }; tabs: TabInfo[] }>(
+    api<{ project: { id: string; name: string; path: string }; tabs: TabInfo[]; statusMarker?: StatusMarkerCfg; processBar?: ProcessBarCfg }>(
       `/api/projects/${encodeURIComponent(projectId)}/tabs`,
     ),
   createSDKTab: (projectId: string) =>
@@ -129,9 +218,17 @@ export const Api = {
       `/api/sdk-tabs/${encodeURIComponent(tabId)}/truncate`,
       { method: 'POST', body: JSON.stringify({ targetUuid }) },
     ),
+  // Kill the process (navbar Stop ■). PTY → SIGTERM claude child; SDK → close query.
   stop: (tabId: string) =>
     api<{ stopped: boolean }>(
       `/api/sdk-tabs/${encodeURIComponent(tabId)}/stop`,
+      { method: 'POST', body: '{}' },
+    ),
+  // Soft-interrupt the CURRENT TURN (composer Stop). PTY → single Esc into TUI
+  // (Claude stops generating, stays alive); SDK → close query (process warm).
+  interrupt: (tabId: string) =>
+    api<{ interrupted: boolean; kind?: string }>(
+      `/api/sdk-tabs/${encodeURIComponent(tabId)}/interrupt`,
       { method: 'POST', body: '{}' },
     ),
   rename: (tabId: string, name: string) =>
@@ -169,6 +266,34 @@ export const Api = {
     api<{ tabId: string }>(
       `/api/sdk-tabs/${encodeURIComponent(tabId)}/params`,
       { method: 'POST', body: JSON.stringify(partial) },
+    ),
+  // Prompt-queue ("Run after") for a tab — read the live desktop core + the list
+  // of sibling AI-tabs (for the "on tab" pivot picker). Returns null-safe shape.
+  getQueue: (tabId: string) =>
+    api<QueueData>(`/api/sdk-tabs/${encodeURIComponent(tabId)}/queue`),
+  // Apply one mutation op. Returns the new core (echo) so the caller can paint
+  // immediately; the queue-update SSE event will also fan-out shortly after.
+  queueMutate: (tabId: string, body: QueueOp) =>
+    api<{ tabId: string; queue: QueueCore }>(
+      `/api/sdk-tabs/${encodeURIComponent(tabId)}/queue`,
+      { method: 'POST', body: JSON.stringify(body) },
+    ),
+  // Current pending AskUserQuestion for a tab (mobile fetches on mount in case
+  // it connected mid-question, before the live ask-question event fired).
+  pendingQuestion: (tabId: string) =>
+    api<{ pendingQuestion: PendingQuestion | null }>(
+      `/api/sdk-tabs/${encodeURIComponent(tabId)}/pending-question`,
+    ),
+  // Answer (or stop) a pending question. answers keyed by question text; value
+  // is a single label (single-select) or comma-joined labels (multiSelect).
+  // stop:true → "Type something / respond manually" (PTY: Esc; SDK: deny+interrupt).
+  answerQuestion: (
+    tabId: string,
+    body: { source: 'pty' | 'sdk'; toolUseID?: string; questions?: MobileQuestion[]; answers?: Record<string, string>; stop?: boolean },
+  ) =>
+    api<{ success: boolean; error?: string }>(
+      `/api/sdk-tabs/${encodeURIComponent(tabId)}/answer-question`,
+      { method: 'POST', body: JSON.stringify(body) },
     ),
   // Soniox temporary API key for browser-side mic dictation. Backend mints a
   // 5-min ephemeral key bound to websocket-transcribe usage so we never ship

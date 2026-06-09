@@ -118,10 +118,26 @@ fires `claude --resume <X>`:
 - Direct user `claude --resume X` interception (`Terminal.tsx` Case 5 + Case 2)
 - Fork flow (`Terminal.tsx` claude-f handlers)
 - Mobile-initiated Resume (`App.tsx::handleWebBridge::resumeClaudeTab`) — фон от phone тоже шлёт `claude --resume` в PTY и обязан помечать, иначе stale bridge stomp'нет sessionId на mobile-resumed табе. См. `fact-mobile-claude-pty.md::Resume guard rails`.
+- **Continue chip** (`ClaudeControlBar.tsx::onContinue`, `claude-c`) — SessionActionChip.
+- **Interrupted-overlay Continue** (`TerminalArea.tsx::handleContinueSession`).
+- **Resume-all** (`ProjectToolbar.tsx::handleResumeAll`) — bulk, высокий blast-radius (N табов разом).
+
+⚠️ **Ловушка (горело — pty-streaming audit 2026-06):** изначально пометить `markPendingResume` помнили только автоматические/typed пути; **три UI-кнопки Continue/Resume** (чип, overlay, resume-all) писали `claude --resume` БЕЗ пометки → guard их не защищал, и ровно сценарий этого инцидента (stale bridge → OVERWRITE на мёртвый sessionId → `[SessionChain] File not found`) воспроизводился через них. Правило абсолютное: **любая** новая affordance, дергающая resume (UI-кнопка, hotkey, IPC, mobile) — первой строкой `markPendingResume(tabId, sessionId)`, до `terminal:input`/`claude:run-command`.
 
 `Terminal.tsx::handleSessionDetected` consults `isStaleAgainstPending(tabId, incoming)`
 before writing — drops bridge events whose sessionId disagrees with the in-flight
 resume for 15 seconds. On successful match (or after TTL) the flag is cleared.
+
+**Второй потребитель guard'а — context-meter.** `ClaudeControlBar.tsx`'s
+`claude:bridge-update` handler тоже консультирует `isStaleAgainstPending(tabId,
+data.sessionId)` перед тем как показать/заперсистить model+%+cache. Без этого во
+время resume-гонки чужая (мёртвая) сессия штамповала свой контекст-% на таб И
+писала его в SQLite (`tab:persist-context-pct`) — Terminal.tsx отвергал чужой
+sessionId-write, но meter всё равно врал. main шлёт `sessionId` в payload
+`bridge-update` (main.js ~L1011) именно для этого. Плюс: live-кадр `contextPct === 0`
+(sub-1% зафлоренный `cut -d. -f1`, или отсутствующее `.used_percentage` → jq `// 0`)
+больше НЕ затирает известный ненулевой meter — `setContextPct` симметричен
+`persistContextPct`'s `pct <= 0` guard.
 
 ### 5. `tabs.claude_session_history` column + history-aware setClaudeSessionId
 

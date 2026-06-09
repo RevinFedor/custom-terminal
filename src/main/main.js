@@ -80,6 +80,14 @@ const { findSessionFile, loadJsonlRecords, resolveSessionChain, resolveLatestSes
 // section near the end of this file.
 const sdkSessions = new Map(); // tabId → { query, abortController, sessionId, cwd }
 
+// Parked AskUserQuestion permission requests for SDK tabs. The SDK delivers an
+// interactive AskUserQuestion via the canUseTool callback (sdkStartQuery); we
+// park its Promise here keyed by `tabId:toolUseID` and resolve it when the
+// renderer posts the user's answer (or stop) via claude-sdk:answer-question.
+// No timeout — the SDK awaits canUseTool indefinitely (event-driven, per
+// fact-claude-sdk-tab.md::AskUserQuestion via canUseTool).
+const pendingQuestions = new Map(); // `${tabId}:${toolUseID}` → { resolve, tabId, signal, onAbort }
+
 const isDev = !app.isPackaged;
 
 // ========== PRODUCTION FILE LOGGER ==========
@@ -298,6 +306,98 @@ function resolveActivityIdentity(tabId, engine) {
     console.error('[Activity] identity resolve failed:', e.message);
   }
   return out;
+}
+
+// Aggregate "is anything still working" across EVERY tab in EVERY project.
+// Single source of truth: reuses the SAME live Maps that drive the per-tab
+// loader in the UI — there is no second notion of "busy" invented here.
+//   • PTY Claude   → bridgeKnownSessions + terminals + presence trio
+//                    (identical logic to ipcMain 'claude:get-presence')
+//   • SDK Claude   → sdkSessions (one entry per in-flight query())
+//   • Gemini       → geminiSpinnerBusy
+//   • devServer /  → terminalCommandState.isRunning  (OSC 133 B/D)
+//     any process
+// Consumed by the external `build:i-obs` poller via GET /api/active-loaders so
+// a rebuild waits until every Claude / Gemini / SDK / running process across
+// the app has gone idle. Runs in main (not via the renderer bridge) so it still
+// answers correctly while the renderer is mid-reload or unfocused.
+function computeActiveLoaders() {
+  const loaders = [];
+  const seen = new Set(); // tabId — one tab contributes at most one loader
+
+  // tabId → { project, name } label, resolved from terminalProjectIds → SQLite
+  // tabs row → projects row. Per-call project-name cache keeps it to ~1 query
+  // per distinct project even with many tabs.
+  const projNameCache = new Map();
+  const labelFor = (tabId) => {
+    let projectId = terminalProjectIds.get(tabId) || null;
+    let tabName = null;
+    if (projectManager?.db?.db) {
+      try {
+        const row = projectManager.db.db.prepare(
+          'SELECT project_id, name FROM tabs WHERE tab_id = ? LIMIT 1'
+        ).get(tabId);
+        if (row) {
+          tabName = row.name || null;
+          if (!projectId) projectId = row.project_id || null;
+        }
+      } catch {}
+    }
+    let projectName = null;
+    if (projectId) {
+      if (projNameCache.has(projectId)) projectName = projNameCache.get(projectId);
+      else {
+        try {
+          const p = projectManager.db.db.prepare('SELECT name FROM projects WHERE id = ? LIMIT 1').get(projectId);
+          projectName = p?.name || null;
+        } catch {}
+        projNameCache.set(projectId, projectName);
+      }
+    }
+    return {
+      project: projectName,
+      name: tabName || ('tab ' + String(tabId).slice(-6)),
+      cwd: terminalProjects.get(tabId) || null,
+    };
+  };
+
+  // 1) PTY Claude. bridgeKnownSessions = "CLI alive in this tab" (persists until
+  //    terminal killed). Skip if the PTY is already gone — that mirrors
+  //    get-presence returning 'inactive' (no loader) for a stale bridge entry.
+  for (const tabId of bridgeKnownSessions.keys()) {
+    if (!terminals.has(tabId)) continue; // PTY dead → not blocking (= 'inactive')
+    const isBusy = !!claudeCliActive.get(tabId) || !!claudeTurnBusy.get(tabId);
+    const inputReady = claudePromptReady.has(tabId);
+    const status = isBusy ? 'busy' : (inputReady ? 'active' : 'starting');
+    loaders.push({ tabId, kind: 'claude', status, ...labelFor(tabId) });
+    seen.add(tabId);
+  }
+
+  // 2) SDK Claude — every live query() is an in-flight turn.
+  for (const tabId of sdkSessions.keys()) {
+    if (seen.has(tabId)) continue;
+    loaders.push({ tabId, kind: 'claude-sdk', status: 'busy', ...labelFor(tabId) });
+    seen.add(tabId);
+  }
+
+  // 3) Gemini thinking/streaming.
+  for (const [tabId, busy] of geminiSpinnerBusy) {
+    if (!busy || seen.has(tabId)) continue;
+    loaders.push({ tabId, kind: 'gemini', status: 'busy', ...labelFor(tabId) });
+    seen.add(tabId);
+  }
+
+  // 4) Any running process (npm run dev, build scripts, long commands). The user
+  //    asked that "npm run dev тоже считается" — so ANY isRunning tab blocks,
+  //    not only commandType==='devServer'.
+  for (const [tabId, st] of terminalCommandState) {
+    if (!st?.isRunning || seen.has(tabId)) continue;
+    const cmd = terminalInitialCommand.get(tabId) || null;
+    loaders.push({ tabId, kind: 'process', status: 'running', command: cmd, ...labelFor(tabId) });
+    seen.add(tabId);
+  }
+
+  return { idle: loaders.length === 0, count: loaders.length, loaders, ts: Date.now() };
 }
 
 function recordActivity(tabId, busy, engine) {
@@ -638,13 +738,32 @@ const providerProxy = http.createServer((req, res) => {
       // Log cache stats from streaming response (first SSE message_start event)
       if (mode === 'anthropic' && proxyRes.headers['content-type']?.includes('event-stream')) {
         let firstChunkParsed = false;
-        const origPipe = proxyRes.pipe.bind(proxyRes);
         const { PassThrough } = require('stream');
+        const zlib = require('zlib');
+        // The response body is usually compressed (Anthropic sends gzip/br). We mirror
+        // it into a tap copy and run that copy through the matching decompressor before
+        // searching for `message_start` — the real response (`res`) stays untouched and
+        // is forwarded byte-for-byte (still compressed), so we never break the client.
         const tap = new PassThrough();
+        const enc = (proxyRes.headers['content-encoding'] || '').toLowerCase();
+        let inspectStream = tap;
+        if (enc.includes('br')) inspectStream = tap.pipe(zlib.createBrotliDecompress());
+        else if (enc.includes('gzip')) inspectStream = tap.pipe(zlib.createGunzip());
+        else if (enc.includes('deflate')) inspectStream = tap.pipe(zlib.createInflate());
+        // A decompressor can emit errors on truncated streams — swallow them so the tap
+        // never crashes the proxy (the real response path is independent of this).
+        inspectStream.on('error', () => {});
         let sseBuffer = '';
-        tap.on('data', (chunk) => {
+        let cacheDiagBufLogged = false;
+        inspectStream.on('data', (chunk) => {
           if (firstChunkParsed) return;
           sseBuffer += chunk.toString();
+          // [CacheDiag] log the head of the very first decompressed chunk once, so we can
+          // confirm the SSE framing the regex is matched against.
+          if (!cacheDiagBufLogged) {
+            cacheDiagBufLogged = true;
+            console.log('[CacheDiag] enc=' + (enc || 'none') + ' firstChunkHead=' + JSON.stringify(sseBuffer.slice(0, 120)));
+          }
           // Look for message_start event in SSE stream
           const msgMatch = sseBuffer.match(/event:\s*message_start\ndata:\s*(\{[^\n]+)/);
           if (msgMatch) {
@@ -658,6 +777,20 @@ const providerProxy = http.createServer((req, res) => {
                 const input = u.input_tokens || 0;
                 console.log('[ProviderProxy] Cache: read=' + cacheRead + ' create=' + cacheCreate + ' input=' + input +
                   (cacheRead > 0 ? ' HIT' : cacheCreate > 0 ? ' MISS(new)' : ' NONE'));
+                // Forward the cache split to the renderer so ClaudeControlBar can
+                // render the cooldown chip. Only anthropic mode reaches here (the
+                // `if (mode === 'anthropic')` guard above) — DeepSeek/Zen have no
+                // cache, so the chip stays hidden for them by construction. tabId
+                // is captured from the /t/<id> URL prefix parsed at request start.
+                // ts is the moment this turn touched the cache → cooldown anchor
+                // (server 1h TTL refreshes on every use; see fact-provider-proxy.md).
+                if (mainWindow && !mainWindow.isDestroyed() && (cacheRead > 0 || cacheCreate > 0)) {
+                  mainWindow.webContents.send('claude:cache-update', {
+                    tabId: tabId || null,
+                    cacheRead, cacheCreate, input,
+                    ts: Date.now(),
+                  });
+                }
               }
             } catch {}
           }
@@ -1012,6 +1145,25 @@ const claudeTurnBusy = new Map(); // tabId → boolean (true = turn in flight)
 const claudeTurnWatchdog = new Map(); // tabId → timeout ID (silent-tool-stop safety)
 const CLAUDE_TURN_WATCHDOG_MS = 60 * 60 * 1000; // 60min — safety net against silent-tool-stop (#29881) and hook-script crashes; only fires when Stop legitimately never arrives
 
+// Awaiting-user-input state per tab. true = Claude called AskUserQuestion and is
+// blocked in its interactive-permission phase waiting for the human to answer.
+// Bracketed deterministically by PreToolUse(AskUserQuestion)=true and
+// PostToolUse|PostToolUseFailure(AskUserQuestion)=false — same socket/tabId
+// pipeline as claudeTurnBusy. Invariant: awaiting ⊆ busy (a question only exists
+// mid-turn), so the renderer also clears awaiting on any claude:busy-state
+// busy:false edge as a safety net — we therefore do NOT touch the 12 busy:false
+// emit sites here. See fact-claude-awaiting-input.md.
+const claudeAwaitingInput = new Map(); // tabId → boolean
+
+// Pending AskUserQuestion CONTENT for PTY-Claude tabs, keyed by tabId →
+// { questions:[...], at }. Populated on PreToolUse(AskUserQuestion) from the
+// hook's tool_input, cleared on Post/PostFailure (and on any turn-end safety
+// net). Mobile reads this (web-server snapshot + ask-question broadcast) to
+// render its own question picker, and answers by driving the TUI keystrokes
+// (answerClaudeQuestionPTY). SDK tabs use the separate pendingQuestions Map
+// (parked canUseTool Promises) — these two never overlap (a tab is PTY xor SDK).
+const claudePendingQuestion = new Map(); // tabId → { questions, at }
+
 // Last hook event per tab — for diagnostics. When loader hangs, the difference
 // between "hook fired 5s ago" and "hook silent for 20min" tells us instantly
 // whether the bridge is alive. Surfaced in dump-claude-state and the periodic
@@ -1106,7 +1258,10 @@ function startInterruptWatcher(tabId, sessionId) {
           claudeTurnWatchdog.delete(tabId);
           recordActivity(tabId, false, 'claude');
           if (mainWindow && !mainWindow.isDestroyed()) {
-            mainWindow.webContents.send('claude:busy-state', { tabId, busy: false });
+            // Esc/Ctrl+C interrupt (transcript marker found) — NOT a natural
+            // completion. reason:'interrupt' makes the prompt-queue auto-runner
+            // skip firing the next prompt. busy:false still turns the loader off.
+            mainWindow.webContents.send('claude:busy-state', { tabId, busy: false, reason: 'interrupt' });
             mainWindow.webContents.send('claude:turn-state', {
               tabId, sessionId,
               event: 'InterruptStop', busy: false, success: false,
@@ -1189,7 +1344,10 @@ function armInterruptIdleProbe(tabId) {
     claudeTurnWatchdog.delete(tabId);
     recordActivity(tabId, false, 'claude');
     if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('claude:busy-state', { tabId, busy: false });
+      // Esc/Ctrl+C before Claude wrote anything to JSONL (idle-probe fallback) —
+      // NOT a natural completion. reason:'interrupt' makes the prompt-queue
+      // auto-runner skip the next prompt. busy:false still clears the loader.
+      mainWindow.webContents.send('claude:busy-state', { tabId, busy: false, reason: 'interrupt' });
       mainWindow.webContents.send('claude:turn-state', {
         tabId,
         sessionId: bridgeKnownSessions.get(tabId) || null,
@@ -1283,6 +1441,52 @@ function startClaudeHookServer() {
 
         claudeHookLastEvent.set(tabId, { event, ts: Date.now(), sessionId: session_id });
 
+        // ── Awaiting-user-input: AskUserQuestion brackets ──
+        // PreToolUse(AskUserQuestion) fires the instant Claude blocks on its
+        // interactive question dialog (toolExecution.ts: runPreToolUseHooks runs
+        // BEFORE canUseTool, and for AskUserQuestion the dialog IS the permission
+        // phase). PostToolUse fires when answered; PostToolUseFailure when the
+        // question is cancelled/aborted with feedback. These three events must
+        // NOT fall through to the `busy = event === 'UserPromptSubmit'` logic
+        // below (that would wrongly force busy=false), so we handle + continue.
+        // The tool_name guard keeps us scoped to AskUserQuestion even if other
+        // tools ever get a PreToolUse matcher pointed at this same script.
+        if (event === 'PreToolUse' || event === 'PostToolUse' || event === 'PostToolUseFailure') {
+          if (msg.tool_name === 'AskUserQuestion') {
+            const awaiting = event === 'PreToolUse';
+            const prevAwaiting = claudeAwaitingInput.get(tabId);
+            claudeAwaitingInput.set(tabId, awaiting);
+            console.log('[ClaudeHook] #' + eventSeq + ' ' + event + '(AskUserQuestion) tab=' + tabId.slice(-12) + ' awaiting=' + awaiting + (prevAwaiting === awaiting ? ' (no change)' : ''));
+            if (prevAwaiting !== awaiting && mainWindow && !mainWindow.isDestroyed()) {
+              mainWindow.webContents.send('claude:awaiting-input', { tabId, awaiting });
+            }
+            // ── Mobile question mirror (PTY) ──
+            // The desktop reads the question from the Ink TUI; mobile has no TUI,
+            // so we forward the structured questions over the same web channel the
+            // SDK path uses (type:'ask-question', source:'pty'). On PreToolUse we
+            // store + broadcast the questions; on Post/PostFailure we clear +
+            // broadcast question-cancelled (the user answered/cancelled at the
+            // desktop TUI, or the turn aborted). Answering FROM mobile drives the
+            // TUI via keystrokes — see claudePendingQuestion + answerClaudeQuestionPTY.
+            if (awaiting) {
+              const questions = Array.isArray(msg.tool_input?.questions) ? msg.tool_input.questions : [];
+              // toolUseID isn't in the hook payload; PTY answers don't need it
+              // (we drive the TUI, not a parked canUseTool Promise). Use a synthetic
+              // marker so the mobile envelope shape matches the SDK one.
+              claudePendingQuestion.set(tabId, { questions, at: Date.now() });
+              console.log('[ClaudeHook] PTY question stored tab=' + tabId.slice(-12) + ' qs=' + questions.length);
+              _webBroadcast(tabId, { type: 'ask-question', source: 'pty', toolUseID: 'pty', questions });
+            } else {
+              if (claudePendingQuestion.has(tabId)) {
+                claudePendingQuestion.delete(tabId);
+                _webBroadcast(tabId, { type: 'question-cancelled', source: 'pty' });
+              }
+            }
+          }
+          // Pre/PostToolUse are mid-turn — they never change turn busy-state.
+          continue;
+        }
+
         // ── [PasteAudit] consume staged expectation on UserPromptSubmit ──
         // safePasteAndSubmit staged {expectedLen, expectedHash, ...} right
         // before pressing Enter. On the next UserPromptSubmit for this tab,
@@ -1352,6 +1556,26 @@ function startClaudeHookServer() {
         const busy = event === 'UserPromptSubmit';
         const prev = claudeTurnBusy.get(tabId);
         claudeTurnBusy.set(tabId, busy);
+        // Clear any stale awaiting-input flag on a turn-end edge (Stop/StopFailure).
+        // Normally PostToolUse(AskUserQuestion) already cleared it before Stop, but
+        // if the turn died another way (process restart re-emitting, abort) this
+        // keeps main's map honest. The renderer enforces awaiting⊆busy on its own
+        // busy:false edge regardless; this is just main-side bookkeeping.
+        if (!busy && claudeAwaitingInput.get(tabId)) {
+          claudeAwaitingInput.set(tabId, false);
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send('claude:awaiting-input', { tabId, awaiting: false });
+          }
+        }
+        // Safety net for mobile: if a question was pending and the turn ended
+        // any other way than a clean PostToolUse (e.g. user pressed Esc / declined
+        // at the desktop TUI → "Request interrupted", or the process died), clear
+        // the stored question and tell mobile to drop its picker. Mirrors the
+        // awaiting⊆busy net above so mobile's question card never latches.
+        if (!busy && claudePendingQuestion.has(tabId)) {
+          claudePendingQuestion.delete(tabId);
+          _webBroadcast(tabId, { type: 'question-cancelled', source: 'pty' });
+        }
         const latency = ts ? (Date.now() - ts) : null;
         // Detailed log for hung-loader diagnosis: include `prev` explicitly so
         // we can spot "UserPromptSubmit while prev=true" (Claude's submit-interrupt
@@ -1367,7 +1591,13 @@ function startClaudeHookServer() {
         const prevSpinner = claudeSpinnerBusy.get(tabId);
         claudeSpinnerBusy.set(tabId, busy);
         if (prevSpinner !== busy && mainWindow && !mainWindow.isDestroyed()) {
-          mainWindow.webContents.send('claude:busy-state', { tabId, busy });
+          // StopFailure = turn ended on an API/inference error (e.g. "API Error:
+          // 500"). Tag the busy:false edge with reason:'error' so the prompt-queue
+          // auto-runner SKIPS firing the next prompt into a broken turn (same skip
+          // class as manual-stop). Natural Stop and the busy:true turn-start stay
+          // reason-less = "natural". See usePromptQueueRunner.ts handleBusyState.
+          const reason = (!busy && event === 'StopFailure') ? 'error' : undefined;
+          mainWindow.webContents.send('claude:busy-state', { tabId, busy, reason });
         }
         // Mirror busy-state to any mobile-web subscribers of this PTY+Claude
         // tab — otherwise phone composer never learns Claude is processing
@@ -1400,7 +1630,10 @@ function startClaudeHookServer() {
             claudeTurnWatchdog.delete(tabId);
             recordActivity(tabId, false, 'claude');
             if (mainWindow && !mainWindow.isDestroyed()) {
-              mainWindow.webContents.send('claude:busy-state', { tabId, busy: false });
+              // Stop never arrived within the watchdog window — turn is hung/dead,
+              // not cleanly finished. reason:'watchdog' makes the prompt-queue
+              // auto-runner skip firing the next prompt into an unknown state.
+              mainWindow.webContents.send('claude:busy-state', { tabId, busy: false, reason: 'watchdog' });
             }
           }, CLAUDE_TURN_WATCHDOG_MS));
         }
@@ -1883,6 +2116,53 @@ function createWindow() {
 
   mainWindow.webContents.on('did-fail-load', (event, errorCode, errorDescription) => {
     console.error('[Window] did-fail-load:', errorCode, errorDescription);
+  });
+
+  // Renderer-crash safety net. The dictation mic path (deprecated
+  // ScriptProcessorNode → AudioWorklet migration, see fix-mic-renderer-sigsegv.md)
+  // could SIGSEGV the renderer, leaving a frozen white window the user had to
+  // reload by hand. This auto-reloads on a genuine crash so the app recovers
+  // itself. We skip:
+  //   • normal teardown during quit (reason 'clean-exit', or our shutdown flags)
+  //   • 'killed' (SIGTERM/SIGKILL — that's us or the OS tearing it down)
+  // and we rate-limit reloads so a crash-on-load can't spin forever.
+  let _lastRendererReload = 0;
+  let _rendererReloadCount = 0;
+  mainWindow.webContents.on('render-process-gone', (event, details) => {
+    const reason = details?.reason || 'unknown';
+    console.error('[Window] render-process-gone:', JSON.stringify(details));
+
+    if (_gracefulShutdownInProgress || _gracefulShutdownDone) {
+      console.log('[Window] render-process-gone during shutdown → no reload');
+      return;
+    }
+    // 'clean-exit'/'killed' are intentional teardown, not a crash to recover from.
+    if (reason === 'clean-exit' || reason === 'killed') {
+      console.log('[Window] render-process-gone reason=' + reason + ' → no reload (intentional)');
+      return;
+    }
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+
+    // Rate-limit: if we already reloaded <10s ago, the renderer is crashing on
+    // load — reloading again just loops. Bail after 3 rapid attempts.
+    const now = Date.now();
+    if (now - _lastRendererReload < 10000) {
+      _rendererReloadCount++;
+    } else {
+      _rendererReloadCount = 1;
+    }
+    _lastRendererReload = now;
+    if (_rendererReloadCount > 3) {
+      console.error('[Window] render-process-gone: ' + _rendererReloadCount +
+        ' crashes in 10s — giving up auto-reload to avoid a loop');
+      return;
+    }
+
+    console.log('[Window] render-process-gone reason=' + reason +
+      ' → auto-reloading renderer (attempt ' + _rendererReloadCount + ')');
+    try { mainWindow.webContents.reload(); } catch (e) {
+      console.error('[Window] auto-reload failed:', e?.message || e);
+    }
   });
 
   // Prevent the main window from navigating away (kills the renderer)
@@ -5771,7 +6051,17 @@ app.whenReady().then(() => {
     // Load from src/main, not dist/main — electron-vite only bundles main.js,
     // sibling modules live as raw .js files (same pattern as claude-agent etc).
     const webServer = require(path.join(srcMainDir, 'web-server'));
-    webServer.start({ sdkSessions });
+    // computeActiveLoaders is injected (not imported) so web-server stays a leaf
+    // module with no back-reference into main — it only reads the live Maps that
+    // already exist here. GET /api/active-loaders calls it on each poll.
+    webServer.start({
+      sdkSessions,
+      computeActiveLoaders,
+      // Mobile question answering (PTY drives TUI keystrokes, SDK resolves the
+      // parked canUseTool Promise) + snapshot read for connect-mid-question.
+      answerClaudeQuestion: answerClaudeQuestionUnified,
+      getClaudePendingQuestion,
+    });
     console.log('[Startup] Mobile WebServer OK');
 
     // Expose connection info to the renderer's StatusBar chip.
@@ -5781,6 +6071,14 @@ app.whenReady().then(() => {
       } catch (e) {
         return { running: false, error: String(e.message) };
       }
+    });
+    // Renderer → web relay for prompt-queue deltas. usePromptQueueWebSync (App
+    // root) fires this whenever a tab's queue core changes; we fan it out to any
+    // phone subscribed to that tab as a `queue-update` SSE event. webBroadcast
+    // no-ops when nobody's subscribed, so this is free on the desktop-only path.
+    ipcMain.on('web:broadcast-queue', (_e, { tabId, queue }) => {
+      if (!tabId) return;
+      _webBroadcast(tabId, { type: 'queue-update', queue });
     });
     // Open the LAN URL in the user's default browser (the StatusBar chip uses
     // this so a single click works without the user having to copy+paste).
@@ -6581,11 +6879,20 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
         if (hayStack.includes('⏵') || hayStack.includes('>')) {
           claudePromptReady.add(tabId);
           console.log('[ClaudePromptReady] Tab ' + tabId.slice(-12) + ' — input ready (⏵ rendered)');
+          // BUSY here must be the AUTHORITATIVE turn flag (claudeTurnBusy, the
+          // Stop-hook), NOT claudeSpinnerBusy. On Resume the PTY replays old
+          // scrollback containing a stale spinner glyph (`✻ Cooked for 13s`),
+          // which false-fires claudeSpinnerBusy=true → this snapshot would send
+          // busy:true to the phone the instant ⏵ renders → composer locks on
+          // Stop until a manual refresh. Same conflation fixed in get-presence;
+          // this is the second broadcast path that bypassed it. See
+          // fact-mobile-claude-pty.md::Composer busy = turn, not spinner/alive.
+          const turnBusy = !!claudeTurnBusy.get(tabId);
           _webBroadcast(tabId, {
             type: 'snapshot',
             sessionId: bridgeKnownSessions.get(tabId) || null,
-            busy: !!claudeSpinnerBusy.get(tabId),
-            sessionStatus: claudeSpinnerBusy.get(tabId) ? 'busy' : 'active',
+            busy: turnBusy,
+            sessionStatus: turnBusy ? 'busy' : 'active',
             inputReady: true,
           });
         }
@@ -7177,17 +7484,35 @@ function waitForRender(term, timeoutMs, logPrefix) {
   return result;
 }
 
-// Helper: drain any pending PTY data (wait for silence)
-function drainPtyData(term, ms = 300) {
+// Helper: drain any pending PTY data (wait for `quietMs` of silence).
+//
+// `maxWaitMs` (optional) is a HARD CEILING. drainPtyData resolves on whichever
+// comes first: `quietMs` of silence, OR `maxWaitMs` total. Without a ceiling
+// the "wait for silence" debounce never resolves while the PTY keeps emitting —
+// which is exactly what happens during a Claude turn (Ink streams render frames
+// continuously). The Replay ▶ button pastes into the input WHILE Claude streams
+// (that's its purpose), so an uncapped pre-paste drain blocked for the entire
+// turn: prod showed replays hanging 9.7s and 98s, all of it in this drain (the
+// paste write + waitForRender after it resolved in <12ms). Pass a ceiling on any
+// drain that can run mid-stream. See fix below in safePasteAndSubmit.
+function drainPtyData(term, quietMs = 300, maxWaitMs = null) {
   return new Promise((resolve) => {
     let buf = '';
-    let timer = null;
+    let quietTimer = null;
+    let hardTimer = null;
     const sub = term.onData((data) => {
       buf += data;
-      if (timer) clearTimeout(timer);
-      timer = setTimeout(() => { sub.dispose(); resolve(buf); }, ms);
+      if (quietTimer) clearTimeout(quietTimer);
+      quietTimer = setTimeout(finish, quietMs);
     });
-    timer = setTimeout(() => { sub.dispose(); resolve(buf); }, ms);
+    function finish() {
+      if (quietTimer) clearTimeout(quietTimer);
+      if (hardTimer) clearTimeout(hardTimer);
+      try { sub.dispose(); } catch {}
+      resolve(buf);
+    }
+    quietTimer = setTimeout(finish, quietMs);
+    if (maxWaitMs != null) hardTimer = setTimeout(finish, maxWaitMs);
   });
 }
 
@@ -7390,9 +7715,18 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
   }
 
   // Drain deferred renders (from focus loss/regain, periodic updates, etc.)
-  // These would produce stale sync markers that pass the 15ms threshold
+  // These would produce stale sync markers that pass the 15ms threshold.
+  //
+  // HARD CEILING is mandatory here: this is a "wait for 150ms of silence"
+  // debounce, but the Replay ▶ button (and any send-during-stream path) pastes
+  // WHILE Claude is streaming, when the PTY never goes quiet for 150ms — so an
+  // uncapped drain blocks for the whole turn (prod: 9.7s and 98s replays, all
+  // of it here; the paste + waitForRender after resolved in <12ms). 600ms is
+  // ample to absorb a focus/resize render burst when idle, and bounds the
+  // worst case when streaming. The post-write waitForRender still guards stale
+  // markers, so bailing the drain early costs no correctness.
   if (!fast) {
-    await drainPtyData(term, 150);
+    await drainPtyData(term, 150, 600);
   }
 
   const renderTimes = [];
@@ -7487,9 +7821,12 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
     } else {
       // Slow mode: short drain for secondary React renders / re-layouts.
       // 50ms is enough because waitForRender already confirmed the primary
-      // sync marker — this is just settling tail re-renders.
+      // sync marker — this is just settling tail re-renders. Hard ceiling for
+      // the same reason as the pre-paste drain above: if a submit lands while
+      // the PTY is still streaming this debounce would never see 50ms of
+      // silence; cap it so Enter isn't delayed for the rest of the turn.
       console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] Draining PTY before Enter (slow mode)...');
-      await drainPtyData(term, 50);
+      await drainPtyData(term, 50, 600);
     }
     term.write('\r');
     console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] ✅ Sent Enter (total: ' + (Date.now() - t0) + 'ms)');
@@ -7740,7 +8077,10 @@ ipcMain.handle('claude:is-active', (event, tabId) => {
 
 // Higher-level presence used by mobile-web: distinguishes "Claude alive in
 // the PTY" (bridgeKnownSessions has us) from "Claude currently processing a
-// turn" (claudeCliActive — that map empties at the prompt). Returns:
+// turn" (claudeTurnBusy/claudeSpinnerBusy — the Stop-hook + spinner pair that
+// actually toggles per turn). NB: claudeCliActive is process-liveness, NOT a
+// turn flag — it does NOT empty at the prompt (set on launch, cleared only on
+// exit), so it must never feed isBusy. Returns:
 //   - 'busy'     — Claude is generating right now
 //   - 'active'   — Claude TUI is running, idle at the prompt
 //   - 'inactive' — PTY gone OR Claude was Ctrl-D'd / crashed
@@ -7750,9 +8090,32 @@ ipcMain.handle('claude:get-bridge-metadata', (event, tabId) => {
 
 ipcMain.handle('claude:get-presence', (event, tabId) => {
   const hasBridge = bridgeKnownSessions.has(tabId);
-  const isBusy = !!claudeCliActive.get(tabId) || !!claudeTurnBusy.get(tabId);
+  // BUSY = "Claude is generating a turn right now", NOT "Claude is alive" and
+  // NOT "the glyph-spinner blinked". This status drives the MOBILE COMPOSER's
+  // Send↔Stop swap — the button is a TURN/loader control, so busy must be the
+  // AUTHORITATIVE turn signal only: claudeTurnBusy (Stop-hook pipeline,
+  // UserPromptSubmit→true / Stop→false, installed + alive).
+  //
+  // Deliberately EXCLUDES:
+  //   - claudeCliActive — process-liveness, true the whole session incl. idle
+  //     at the ⏵ prompt (was the first bug: idle-alive → 'busy' forever).
+  //   - claudeSpinnerBusy — the glyph (`✻✳…`) heuristic. It FALSE-FIRES on
+  //     stale scrollback: when a tab is reopened the PTY replays history that
+  //     still contains an old "✻ Brewed for 15m" frame → detector flips BUSY
+  //     with BoundarySM=idle, and its IDLE edge only sends `claude:busy-state`
+  //     to the desktop renderer (never _webBroadcast) → the phone latched
+  //     busy:true with no busy:false to clear it → composer stuck on Stop.
+  //     The glyph is desktop-only liveness flavor; the hook is the truth.
+  // Process-running ("Claude is up in this PTY") is conveyed by the 'active'
+  // status + the navbar Stop button (claudeStatus), NOT by this busy flag.
+  // See fact-mobile-claude-pty.md::Composer busy = turn, not spinner/alive.
+  const isBusy = !!claudeTurnBusy.get(tabId);
   const hasTerm = terminals.has(tabId);
   const inputReady = claudePromptReady.has(tabId);
+  // awaiting = Claude is blocked on an AskUserQuestion (purple "needs answer"
+  // marker). Surfaced so the mobile tab list can dot the tab the way the desktop
+  // glows it. Only meaningful while the process is alive.
+  const awaiting = !!claudeAwaitingInput.get(tabId);
   let status;
   if (!hasTerm) status = 'inactive';
   else if (hasBridge) {
@@ -7760,7 +8123,7 @@ ipcMain.handle('claude:get-presence', (event, tabId) => {
     else if (inputReady) status = 'active';
     else status = 'starting'; // Claude process exists but TUI hasn't drawn the prompt yet
   } else status = 'inactive';
-  return { status, hasBridge, isBusy, hasTerm, inputReady };
+  return { status, hasBridge, isBusy, hasTerm, inputReady, awaiting };
 });
 
 // Repair dangling parentUuid in a JSONL file so `claude --resume` and the
@@ -7799,6 +8162,33 @@ function findClaudePidByTab(tabId) {
     if (tid === tabId) return pid;
   }
   return null;
+}
+
+// Liveness check for "is Claude running in this tab's PTY" — the guard every
+// input-write handler (grab / copy / clear / append / replay) needs before
+// pasting into the terminal (refusing protects against bracketed paste landing
+// in a bare bash/zsh prompt).
+//
+// `bridgeKnownSessions.has(tabId)` alone is INSUFFICIENT: when the user `cd`s
+// into another project inside the shell before launching claude (cwd-drift),
+// CwdGuard in processFile deliberately skips `bridgeKnownSessions.set` to avoid
+// stale-bridge takeover (see fix-bridge-stale-takeover.md + fix-cwdguard-
+// session-not-detected.md) — yet Claude is genuinely alive and the renderer
+// store DID get the sessionId. The guards then refused grab/replay with
+// "No Claude session running in this tab" even though Claude was answering.
+//
+// The drift-immune signal is bridgePidCache: it's populated in processFile only
+// AFTER `ps` confirmed a real `claude` process parented by THIS tab's shell
+// (PID + command-name validated, not cwd). A live claude child is authoritative
+// liveness regardless of cwd. We still verify the cached PID is alive so a
+// shell-side restart that left a stale cache entry doesn't read as alive.
+// A pure bash/zsh tab has neither a bridge session nor a claude child → still
+// refused, so the anti-rm-rf intent is preserved.
+function hasLiveClaudeInTab(tabId) {
+  if (bridgeKnownSessions.has(tabId)) return true;
+  const pid = findClaudePidByTab(tabId);
+  if (!pid) return false;
+  try { process.kill(pid, 0); return true; } catch { return false; }
 }
 
 // Read the EDITOR env of a running process via `ps -wwwE`. Returns null if process
@@ -7866,8 +8256,8 @@ async function captureClaudeInput(tabId, mode) {
   const term = terminals.get(tabId);
   if (!term) return { success: false, error: 'no_terminal' };
 
-  if (!bridgeKnownSessions.has(tabId)) {
-    console.log('[capture-input:' + mode + '] Tab ' + tabId.slice(-12) + ': no active Claude session');
+  if (!hasLiveClaudeInTab(tabId)) {
+    console.log('[capture-input:' + mode + '] Tab ' + tabId.slice(-12) + ': no active Claude session (bridge/pid)');
     return { success: false, error: 'no_claude_session' };
   }
 
@@ -7967,7 +8357,7 @@ ipcMain.handle('claude:copy-input', async (event, tabId) => captureClaudeInput(t
 ipcMain.handle('claude:clear-input', async (event, tabId) => {
   const term = terminals.get(tabId);
   if (!term) return { success: false, error: 'no_terminal' };
-  if (!bridgeKnownSessions.has(tabId)) return { success: false, error: 'no_claude_session' };
+  if (!hasLiveClaudeInTab(tabId)) return { success: false, error: 'no_claude_session' };
   // Same policy as captureClaudeInput: only block on hook-confirmed turn busy.
   // Spinner-busy mid-stream still accepts Ctrl+G — see fix-claude-hook-silent-dropouts.md
   if (claudeTurnBusy.get(tabId) === true) return { success: false, error: 'claude_busy' };
@@ -8035,8 +8425,23 @@ ipcMain.handle('claude:append-input', async (event, tabId, text) => {
   // bracketed paste lands in a bash/zsh prompt (modern zsh supports bracketed
   // paste mode) → the chip text becomes one shell command-line. Chip starting
   // with "rm -rf" / "sudo …" would execute on the user's machine. Refuse loud.
-  if (!claudeCliActive.get(tabId)) {
-    console.log('[append-input] ❌ Claude not active in tab ' + tabId + ' — refusing to paste into non-Claude PTY');
+  //
+  // Liveness source = bridgeKnownSessions, NOT claudeCliActive. claudeCliActive
+  // means "Claude is PROCESSING right now" and is set ONLY by the explicit spawn
+  // paths (claude:run-command, MCP, handshake) — it is empty at an idle prompt
+  // and, crucially, is NEVER set when a tab is AutoResumed (App.tsx writes
+  // `claude --resume <id>` straight into the PTY via terminal:input; that path
+  // populates bridgeKnownSessions through handleSessionDetected but never touches
+  // claudeCliActive). Net effect on a resumed/restored tab: auto-run's
+  // claude:send-command (no guard) lands fine, but manual Replay ▶ here refused
+  // with no_claude_session even though Claude was alive and idle at the prompt.
+  // Prod-confirmed tab-5 (59cf2ebf) 2026-06-03 19:34: 4× "Claude not active"
+  // from append-input, then send-command paste succeeded 12s later on the SAME
+  // live Claude. bridgeKnownSessions is the same liveness check captureClaudeInput
+  // (grab/copy) already uses, and it still refuses a pure bash/zsh tab (no bridge
+  // session) so the anti-rm-rf intent is preserved. See fact-prompt-queue.md.
+  if (!hasLiveClaudeInTab(tabId)) {
+    console.log('[append-input] ❌ No live Claude session (bridge/pid) in tab ' + tabId + ' — refusing to paste into non-Claude PTY');
     return { success: false, error: 'no_claude_session' };
   }
   const result = await safePasteAndSubmit(term, text, {
@@ -9085,6 +9490,36 @@ ipcMain.handle('project:save-tabs', (event, { projectId, tabs, forceCleanup }) =
   // db.saveTabs never downgrade an on-disk 1 → 0. See fix-interrupted-session-lifecycle.md.
   projectManager.saveProjectTabs(projectId, tabs, forceCleanup, _gracefulShutdownInProgress);
   return { success: true };
+});
+
+// Point-wise context% persistence for the control-bar meter. Cheap single-column
+// UPDATE, no full-reinsert — the renderer throttles to whole-percent changes so
+// this fires a few dozen times a session, not on every bridge tick. Persisted so
+// the meter shows the last-known fill even when no Claude process is running.
+ipcMain.handle('tab:persist-context-pct', (event, { tabId, pct }) => {
+  try { projectManager?.db?.updateTabContextPct?.(tabId, pct); } catch {}
+  return { success: true };
+});
+
+// Seed value for the meter on control-bar mount — survives CLI exit / restart.
+ipcMain.handle('tab:get-context-pct', (event, { tabId }) => {
+  try { return { pct: projectManager?.db?.getTabContextPct?.(tabId) ?? null }; }
+  catch { return { pct: null }; }
+});
+
+// Point-wise cache-stats persistence for the control-bar cooldown chip. One write
+// per turn (message_start). stats = {cacheRead,cacheCreate,input,ts}. Persisted so
+// the chip survives tab switches AND restart — the chip's countdown is anchored on
+// ts (wall-clock), so a stored value stays accurate. Mirrors tab:persist-context-pct.
+ipcMain.handle('tab:persist-cache-stats', (event, { tabId, stats }) => {
+  try { projectManager?.db?.updateTabCacheStats?.(tabId, stats); } catch {}
+  return { success: true };
+});
+
+// Seed value for the cooldown chip on control-bar mount.
+ipcMain.handle('tab:get-cache-stats', (event, { tabId }) => {
+  try { return { stats: projectManager?.db?.getTabCacheStats?.(tabId) ?? null }; }
+  catch { return { stats: null }; }
 });
 
 // Synchronous version for beforeunload (pkill-safe)
@@ -12047,6 +12482,51 @@ async function sdkStartQuery(tabId, cwd, prompt, resumeSessionId, model, effort,
     // SDK 0.3.x explicit safety gate — must be true together with
     // bypassPermissions or the CLI rejects the request at handshake.
     allowDangerouslySkipPermissions: true,
+    // Interactive AskUserQuestion bridge. Even under bypassPermissions the SDK
+    // routes AskUserQuestion through canUseTool, because the CLI's permission
+    // resolver returns behavior:'ask' for requiresUserInteraction tools BEFORE
+    // the bypass short-circuit (decompile: permissions.ts step 1e precedes 2a).
+    // The mere PRESENCE of canUseTool makes the SDK spawn the CLI with
+    // `--permission-prompt-tool stdio`; do NOT also set permissionPromptTool
+    // (mutually exclusive — SDK throws). For AskUserQuestion we park a Promise
+    // and ask the renderer; for EVERY other tool we auto-allow with the original
+    // input — the exact no-op equivalent of bypassPermissions, so no regression.
+    canUseTool: async (toolName, input, { toolUseID, signal }) => {
+      if (toolName !== 'AskUserQuestion') {
+        return { behavior: 'allow', updatedInput: input };
+      }
+      const key = tabId + ':' + toolUseID;
+      const win = BrowserWindow.getAllWindows()[0];
+      if (win && !win.isDestroyed()) {
+        win.webContents.send('claude-sdk:ask-question', {
+          tabId, toolUseID, questions: input.questions || [],
+        });
+        // Reuse the purple awaiting-input glow channel (PTY feature) — keyed by
+        // tabId, already consumed in App.tsx / TabBar for any tab.
+        win.webContents.send('claude:awaiting-input', { tabId, awaiting: true });
+      }
+      _webBroadcast(tabId, { type: 'ask-question', source: 'sdk', toolUseID, questions: input.questions || [] });
+      console.log('[ClaudeSDK] canUseTool fired tool=AskUserQuestion tab=' + tabId.slice(-12) + ' qs=' + ((input.questions || []).length) + ' toolUseID=' + String(toolUseID).slice(0, 12));
+      return await new Promise((resolve) => {
+        const onAbort = () => {
+          if (!pendingQuestions.has(key)) return;
+          pendingQuestions.delete(key);
+          // Turn aborted elsewhere (query.interrupt / hard kill) — deny WITHOUT
+          // interrupt so we don't double-abort an already-aborting turn.
+          resolve({ behavior: 'deny', message: 'Turn aborted before question was answered.' });
+          const w2 = BrowserWindow.getAllWindows()[0];
+          if (w2 && !w2.isDestroyed()) {
+            w2.webContents.send('claude:awaiting-input', { tabId, awaiting: false });
+            w2.webContents.send('claude-sdk:question-cancelled', { tabId, toolUseID });
+          }
+          _webBroadcast(tabId, { type: 'question-cancelled', source: 'sdk', toolUseID });
+        };
+        try { if (signal) signal.addEventListener('abort', onAbort, { once: true }); } catch {}
+        // Store `questions` too so a phone connecting mid-question can be handed
+        // the content in the SSE snapshot (getClaudePendingQuestion).
+        pendingQuestions.set(key, { resolve, tabId, signal, onAbort, questions: input.questions || [] });
+      });
+    },
     // Packaged app: rewrite asar→asar.unpacked path. Without this SDK's own
     // resolver hands an asar-wrapped path to child_process.spawn → ENOTDIR.
     ...(claudeBin ? { pathToClaudeCodeExecutable: claudeBin } : {}),
@@ -12079,7 +12559,13 @@ async function sdkStartQuery(tabId, cwd, prompt, resumeSessionId, model, effort,
   // Open a long-lived input channel. First message is the initial prompt with
   // no priority (it opens the conversation, not mid-stream). Subsequent pushes
   // use priority:'next' to land at the next block boundary mid-stream.
-  const initialMsg = buildUserMessage(prompt);
+  // Warm-start: prompt === null means "boot the process and PARK it idle"
+  // (clicking the ОСТАНОВЛЕН chip). The channel opens with NO seed message — the
+  // CLI subprocess spawns and waits; the first real prompt arrives later via
+  // mid-stream push. Verified on 2.1.156 (2026-05-29): with options.resume set,
+  // the warm process keeps full memory + the same JSONL on the first pushed turn.
+  const isWarmStart = prompt == null;
+  const initialMsg = isWarmStart ? null : buildUserMessage(prompt);
   const channelTag = tabId.slice(-8) + '-' + Date.now().toString().slice(-4);
   // onConsumed fires the instant SDK pulled a *pushed* message out of the
   // channel — that is the closest signal we have to «attachment now landed in
@@ -12146,22 +12632,26 @@ async function sdkStartQuery(tabId, cwd, prompt, resumeSessionId, model, effort,
   }
   // Mirror busy state and the user's prompt to phone clients (they need to
   // render the user-message bubble too — local renderer does it from its own
-  // state, but the phone has no such state without help).
-  _webBroadcast(tabId, { type: 'busy', busy: true });
-  _webBroadcast(tabId, {
-    type: 'message',
-    sessionId: resumeSessionId || null,
-    message: {
-      type: 'user',
-      message: { role: 'user', content: [{ type: 'text', text: typeof prompt === 'string' ? prompt : '' }] },
-      __webSynthetic: true,
-      // wasQueued — desktop отправил из type-ahead очереди. Прокидываем флаг
-      // в WS-payload → mobile reducer пометит entry, EntryView отрендерит
-      // "queued" chip. Live-only; reload истории на мобиле потеряет флаг
-      // (Anthropic JSONL не хранит UI-метаданные — mirror desktop behavior).
-      __wasQueued: !!wasQueued,
-    },
-  });
+  // state, but the phone has no such state without help). SKIP on warm-start:
+  // there is no prompt and no turn — the process is just parked idle, so a
+  // busy:true + empty user-bubble would be a lie.
+  if (!isWarmStart) {
+    _webBroadcast(tabId, { type: 'busy', busy: true });
+    _webBroadcast(tabId, {
+      type: 'message',
+      sessionId: resumeSessionId || null,
+      message: {
+        type: 'user',
+        message: { role: 'user', content: [{ type: 'text', text: typeof prompt === 'string' ? prompt : '' }] },
+        __webSynthetic: true,
+        // wasQueued — desktop отправил из type-ahead очереди. Прокидываем флаг
+        // в WS-payload → mobile reducer пометит entry, EntryView отрендерит
+        // "queued" chip. Live-only; reload истории на мобиле потеряет флаг
+        // (Anthropic JSONL не хранит UI-метаданные — mirror desktop behavior).
+        __wasQueued: !!wasQueued,
+      },
+    });
+  }
 
   // Stream messages to renderer (fire-and-forget)
   (async () => {
@@ -12290,8 +12780,20 @@ async function sdkStartQuery(tabId, cwd, prompt, resumeSessionId, model, effort,
       }
       stopJsonlWatcher(tabId);
       sdkSessions.delete(tabId);
+      // Resolve any AskUserQuestion parked for this tab — the stream (and the CLI
+      // subprocess that owns the control request) is gone, so the Promise would
+      // leak otherwise. deny WITHOUT interrupt (the turn is already ending).
+      for (const [k, p] of pendingQuestions) {
+        if (p.tabId !== tabId) continue;
+        try { if (p.signal && p.onAbort) p.signal.removeEventListener('abort', p.onAbort); } catch {}
+        pendingQuestions.delete(k);
+        try { p.resolve({ behavior: 'deny', message: 'Session ended before question was answered.' }); } catch {}
+      }
+      _webBroadcast(tabId, { type: 'question-cancelled', source: 'sdk' });
       const win = BrowserWindow.getAllWindows()[0];
       if (win && !win.isDestroyed()) {
+        win.webContents.send('claude:awaiting-input', { tabId, awaiting: false });
+        win.webContents.send('claude-sdk:question-cancelled', { tabId });
         win.webContents.send('claude-sdk:done', { tabId, sessionId: session.sessionId });
         // Process truly gone — the loop ended (hard kill / natural completion /
         // tab close). Soft interrupt never reaches here (loop keeps iterating).
@@ -12313,6 +12815,28 @@ ipcMain.handle('claude-sdk:create-session', async (event, { tabId, cwd, prompt, 
     return { success: true };
   } catch (err) {
     console.error('[ClaudeSDK] create-session failed:', err.message);
+    return { success: false, error: String(err.message || err) };
+  }
+});
+
+// Warm-start: boot the CLI process and PARK it idle WITHOUT sending a prompt.
+// Backs the ОСТАНОВЛЕН-chip click — the user wants the process to come alive
+// («активен») deterministically on click, not only after the first message.
+// prompt:null → sdkStartQuery opens an empty channel; the process spawns, the
+// stream loop parks, process-state alive:true fires. With resumeSessionId the
+// warm process keeps full memory + the same JSONL on the first pushed turn
+// (verified 2026-05-29). No-op if a session is already live for this tab.
+ipcMain.handle('claude-sdk:warm-start', async (event, { tabId, cwd, model, effort, thinking, resumeSessionId }) => {
+  if (sdkSessions.has(tabId)) {
+    console.log('[ClaudeSDK] warm-start skipped — session already live tabId=' + tabId.slice(-12));
+    return { success: true, alreadyAlive: true };
+  }
+  console.log('[ClaudeSDK] warm-start tabId=' + tabId + ' resume=' + (resumeSessionId ? resumeSessionId.slice(0, 8) : 'NEW'));
+  try {
+    await sdkStartQuery(tabId, cwd, null, resumeSessionId || null, model, effort, thinking, false);
+    return { success: true };
+  } catch (err) {
+    console.error('[ClaudeSDK] warm-start failed:', err.message);
     return { success: false, error: String(err.message || err) };
   }
 });
@@ -12416,6 +12940,179 @@ ipcMain.handle('claude-sdk:load-history', async (event, { sessionId, cwd }) => {
     console.error('[ClaudeSDK] load-history failed:', err.message);
     return { success: false, error: String(err.message || err), messages: [] };
   }
+});
+
+// ── Answer a PTY-Claude AskUserQuestion by driving the Ink TUI keystrokes ────
+// PTY-Claude renders its question picker in the xterm (Ink CustomSelect). There
+// is NO IPC answer path like SDK's parked canUseTool — the desktop user answers
+// by literally pressing arrows + Enter in the terminal. So to answer from mobile
+// we synthesise the same keystrokes into the PTY.
+//
+// Ink navigation (decompiled QuestionView.tsx / AskUserQuestionPermissionRequest.tsx):
+//   • Options are a vertical list; cursor starts at index 0. ↓ (\x1b[B) moves down.
+//   • Enter (\r) on a single-select option picks it AND advances to the next
+//     question (or submits when it's the only/last and hideSubmitTab is true).
+//   • hideSubmitTab = (questions.length === 1 && !multiSelect) → one plain
+//     question auto-submits on Enter, no Submit view.
+//   • multiSelect: Space toggles the focused option; you then →/Submit to finish.
+//   • Esc (\x1b) cancels the whole question (= "respond to Claude manually").
+//
+// We support the common cases deterministically: single-select (one Enter per
+// question after ↓-navigating to the chosen option) and multiSelect (Space on
+// each chosen option, then advance). For ≥2 questions we answer each in order;
+// the final Enter lands on / confirms the Submit view. Best-effort with small
+// inter-keystroke delays so Ink processes each event (it batches stdin per frame).
+async function answerClaudeQuestionPTY(tabId, answers) {
+  const term = terminals.get(tabId);
+  if (!term) return { success: false, error: 'no_terminal' };
+  const pending = claudePendingQuestion.get(tabId);
+  if (!pending) return { success: false, error: 'no_pending_question' };
+  const questions = pending.questions || [];
+  const KEY = { down: '\x1b[B', up: '\x1b[A', right: '\x1b[C', enter: '\r', space: ' ', esc: '\x1b' };
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const press = async (seq, gap = 70) => { term.write(seq); await sleep(gap); };
+  try {
+    for (let qi = 0; qi < questions.length; qi++) {
+      const q = questions[qi];
+      const opts = Array.isArray(q.options) ? q.options : [];
+      // answers is keyed by question text; value is a single label (single-select)
+      // or comma-joined labels (multiSelect), matching the SDK answers schema.
+      const want = answers[q.question];
+      const wantLabels = typeof want === 'string'
+        ? want.split(',').map((s) => s.trim()).filter(Boolean)
+        : (Array.isArray(want) ? want : []);
+      if (q.multiSelect) {
+        // Walk top→bottom, Space-toggle each wanted option. Cursor starts at 0.
+        for (let oi = 0; oi < opts.length; oi++) {
+          if (wantLabels.includes(opts[oi].label)) await press(KEY.space);
+          if (oi < opts.length - 1) await press(KEY.down);
+        }
+        // Advance to next question / submit tab.
+        await press(KEY.right, 90);
+      } else {
+        // Single-select: ↓ to the chosen index, then Enter (picks + advances).
+        const idx = Math.max(0, opts.findIndex((o) => wantLabels.includes(o.label)));
+        for (let s = 0; s < idx; s++) await press(KEY.down);
+        await press(KEY.enter, 110);
+      }
+    }
+    // For multi-question or multiSelect, a final Enter confirms the Submit view.
+    // (Single plain question already auto-submitted via the Enter above —
+    // hideSubmitTab. An extra Enter there would land in the freed composer; to
+    // avoid a stray newline we only send it when a Submit view is expected.)
+    const needsSubmitEnter = questions.length > 1 || questions.some((q) => q.multiSelect);
+    if (needsSubmitEnter) await press(KEY.enter, 110);
+    console.log('[ClaudeQuestion] PTY answered tab=' + tabId.slice(-12) + ' qs=' + questions.length + ' submitEnter=' + needsSubmitEnter);
+    // Clear our stored pending — PostToolUse(AskUserQuestion) will also fire and
+    // broadcast, this just makes the map honest immediately.
+    claudePendingQuestion.delete(tabId);
+    return { success: true };
+  } catch (e) {
+    console.error('[ClaudeQuestion] PTY answer failed:', e.message);
+    return { success: false, error: String(e.message || e) };
+  }
+}
+
+// Cancel a PTY question (mobile "Type something / Stop") = Esc into the TUI →
+// Claude stops asking and returns to the prompt for free-text. Mirrors the SDK
+// stop path semantically.
+async function stopClaudeQuestionPTY(tabId) {
+  const term = terminals.get(tabId);
+  if (!term) return { success: false, error: 'no_terminal' };
+  try {
+    term.write('\x1b'); // Esc — onCancel in QuestionView
+    claudePendingQuestion.delete(tabId);
+    _webBroadcast(tabId, { type: 'question-cancelled', source: 'pty' });
+    console.log('[ClaudeQuestion] PTY stopped (Esc) tab=' + tabId.slice(-12));
+    return { success: true };
+  } catch (e) {
+    return { success: false, error: String(e.message || e) };
+  }
+}
+
+// Unified answer entrypoint used by the web-server (mobile). Routes by source:
+//   • 'sdk' → resolve the parked canUseTool Promise (same as desktop SDKAskQuestion).
+//   • 'pty' → drive the Ink TUI keystrokes (answer) or Esc (stop).
+// Returns { success }.
+async function answerClaudeQuestionUnified({ tabId, source, toolUseID, questions, answers, stop }) {
+  if (source === 'pty') {
+    if (stop) return stopClaudeQuestionPTY(tabId);
+    return answerClaudeQuestionPTY(tabId, answers || {});
+  }
+  // SDK: reuse the existing parked-Promise resolver via the same code the IPC
+  // handler runs. We replicate its core here (the IPC handler is renderer-only).
+  const key = tabId + ':' + toolUseID;
+  const p = pendingQuestions.get(key);
+  if (!p) return { success: false, error: 'not-pending' };
+  try { if (p.signal && p.onAbort) p.signal.removeEventListener('abort', p.onAbort); } catch {}
+  pendingQuestions.delete(key);
+  if (stop) {
+    const session = sdkSessions.get(tabId);
+    if (session) session.userInterrupted = true;
+    p.resolve({ behavior: 'deny', message: 'User chose to respond manually.', interrupt: true });
+  } else {
+    const updatedInput = { questions: questions || [], answers: answers || {} };
+    p.resolve({ behavior: 'allow', updatedInput });
+  }
+  const win = BrowserWindow.getAllWindows()[0];
+  if (win && !win.isDestroyed()) win.webContents.send('claude:awaiting-input', { tabId, awaiting: false });
+  return { success: true };
+}
+
+// Read the current pending question for a tab (SDK or PTY) so the web-server can
+// include it in the SSE connect snapshot (phone opened mid-question → still sees it).
+function getClaudePendingQuestion(tabId) {
+  // PTY store first.
+  const pty = claudePendingQuestion.get(tabId);
+  if (pty) return { source: 'pty', toolUseID: 'pty', questions: pty.questions || [] };
+  // SDK parked promises are keyed `${tabId}:${toolUseID}`.
+  for (const [k, p] of pendingQuestions) {
+    if (p.tabId !== tabId) continue;
+    const toolUseID = k.slice(tabId.length + 1);
+    return { source: 'sdk', toolUseID, questions: p.questions || [] };
+  }
+  return null;
+}
+
+// Resolve a parked AskUserQuestion (SDK tab). The renderer's <SDKAskQuestion>
+// posts either the collected answers or a stop request; we resolve the parked
+// canUseTool Promise accordingly and clear the awaiting glow.
+//  - answer → { behavior:'allow', updatedInput:{ questions, answers, annotations? } }
+//    updatedInput FULLY REPLACES the tool input (queryHelpers.ts:262 — no merge),
+//    so we MUST echo `questions` back (the tool's strict schema requires
+//    questions.min(1); answers-only would be schema-invalid at tool.call).
+//  - stop  → { behavior:'deny', interrupt:true } aborts the whole turn. We set
+//    session.userInterrupted=true FIRST so the existing error_during_execution
+//    suppression (main.js result-handler) treats it as a user interrupt, not an
+//    API error (no red toast). Mirrors the claude-sdk:stop machinery rather than
+//    duplicating interrupt detection (CLAUDE.md: «не дублируй детекцию событий»).
+ipcMain.handle('claude-sdk:answer-question', async (_e, { tabId, toolUseID, questions, answers, annotations, stop }) => {
+  const key = tabId + ':' + toolUseID;
+  const p = pendingQuestions.get(key);
+  if (!p) {
+    console.warn('[ClaudeSDK] answer-question: no pending question for ' + key);
+    return { success: false, reason: 'not-pending' };
+  }
+  // Detach the abort listener so resolving here doesn't race onAbort.
+  try { if (p.signal && p.onAbort) p.signal.removeEventListener('abort', p.onAbort); } catch {}
+  pendingQuestions.delete(key);
+
+  if (stop) {
+    const session = sdkSessions.get(tabId);
+    // Pre-mark as user-interrupt so the turn-abort that deny+interrupt triggers
+    // is suppressed like a Stop, not surfaced as an error.
+    if (session) session.userInterrupted = true;
+    p.resolve({ behavior: 'deny', message: 'User chose to respond manually.', interrupt: true });
+    console.log('[ClaudeSDK] answer-question STOP tab=' + tabId.slice(-12) + ' toolUseID=' + String(toolUseID).slice(0, 12));
+  } else {
+    const updatedInput = { questions: questions || [], answers: answers || {} };
+    if (annotations && Object.keys(annotations).length) updatedInput.annotations = annotations;
+    p.resolve({ behavior: 'allow', updatedInput });
+    console.log('[ClaudeSDK] answer-question ANSWERED tab=' + tabId.slice(-12) + ' answers=' + Object.keys(answers || {}).length);
+  }
+  const win = BrowserWindow.getAllWindows()[0];
+  if (win && !win.isDestroyed()) win.webContents.send('claude:awaiting-input', { tabId, awaiting: false });
+  return { success: true };
 });
 
 // Load a subagent's transcript from its own JSONL (lives at

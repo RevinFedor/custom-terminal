@@ -267,7 +267,11 @@ Claude рисует prompt-символ ⏵ в PTY → main эмитит claude:
 
 **Graveyard — Bridge:Fresh как единственный сигнал → двойной `/effort`.** Пока инжект висел только на `Bridge:Fresh`, юзер видел нарисованный prompt без эффекта (3-6с лага), решал что «эффект не выставился», кликал `/effort` руками в ControlBar → улетал **первый** `/effort`, потом запоздавший Bridge:Fresh догонял **вторым**. В JSONL/scrollback копилось два `/effort max` подряд. Детерминированно подтверждено счётчиками `[EffortDiag][HANDLER-ENTRY] callN` / `[INVOKE-FIRE] invokeN` — handler входил один раз, но первая команда уходила за 391мс **до** него (это был ручной клик). Чинится связкой ранний-сигнал + sentinel ниже.
 
-**Once-per-process sentinel `_effortSentForTab`.** Map `tabId → {at, via}`, экспонируется на `window.__effortSentForTab` для доступа из ControlBar. Любой из трёх источников `/effort` (ранний `tui-ready`, fallback `Bridge:Fresh`, ручной клик `setEffortOnPTY` в ControlBar) первым делом ставит метку; остальные видят её и делают early-return. Сброс — **только на PTY exit** (`handleExit`), НЕ на `process-started`: tui-ready fires раньше Bridge:Fresh, и если сбрасывать на process-started — затрётся метка раннего пути и fallback пошлёт дубль. Это та же ловушка «liveness как reset-триггер», что и в выборе сигнала.
+**Once-per-process sentinel `_effortSentForTab`.** Map `tabId → {at, via}`, экспонируется на `window.__effortSentForTab` для доступа из ControlBar. Любой из трёх источников `/effort` (ранний `tui-ready`, fallback `Bridge:Fresh`, ручной клик `setEffortOnPTY` в ControlBar) первым делом ставит метку; остальные видят её и делают early-return. Сброс — НЕ на `process-started`: tui-ready fires раньше Bridge:Fresh, и если сбрасывать на process-started — затрётся метка раннего пути и fallback пошлёт дубль. Это та же ловушка «liveness как reset-триггер», что и в выборе сигнала.
+
+**Сброс sentinel'а — на смерти Claude (`command-finished`), не только на смерти shell (`terminal:exit`).** Первая версия чистила `_effortSentForTab` **только** в `handleExit` (PTY exit = shell умер). Но `claude-c` (Continue/restart) **переиспользует тот же shell PTY** — shell не выходит, `terminal:exit` не fires, sentinel от **первого** запуска в жизни таба живёт вечно. Каждый последующий рестарт Claude: `tui-ready` fires → `_effortSentForTab.has(tabId)` → `true` → early-return → `/effort` **молча не отправляется**. Эффект: `/effort` инжектится ровно один раз за всю жизнь вкладки, при рестартах — никогда. Юзер: *«сессию я перезапускал, при перезапуске почему-то автоматически /effort не срабатывал, хотя он установлен системой»*.
+
+Прод-подтверждение (tab-283, `ea2ae02c`, 2026-06-03): на 4 рестартах подряд лог `[Terminal:EffortInject] … SKIP — already sent via tui-ready` (callN=2,3,4,5), и **ни одной** строки `[Terminal:TuiReady] … /effort max` после первой. Сигнал смерти Claude при живом shell — **OSC 133 D** (`terminal:command-finished`, тот же что гасит `claudeProcessAlive`). Фикс: `_effortSentForTab.delete(tabId)` в `Terminal.tsx::onFinished` (handler `terminal:command-finished`). `handleExit` сброс оставлен как belt-and-braces для настоящего shell-exit. Принцип: **once-per-process sentinel должен сбрасываться на смерти ТОГО процесса, к которому привязан (Claude), а не на смерти контейнера (shell)** — иначе reuse контейнера навсегда залипит метку.
 
 **Почему без setTimeout:** `safePasteAndSubmit` сам ждёт sync-marker `\x1b[?2026l` от Ink. Если инпут ещё не готов — ждёт **внутри** функции (event-driven). Возвращается за 8-30ms на happy path. Раньше был paranoid `setTimeout(800ms)` обёртка — это "timeout как safety net вместо причины", антипаттерн (см. `methodology/переносимый-дизайн.md::Воспринимаемая задержка UI-команд`).
 
@@ -314,17 +318,24 @@ Claude рисует prompt-символ ⏵ в PTY → main эмитит claude:
 
 В StatusBar `Effort` chip поддерживает значение `none` — это **полный kill-switch** для EffortInject: `/effort` paste **не отправляется** на `process-started`. Эффект: при `effort=none` наш main process **ничего не пишет в Claude TUI** автоматически. С момента удаления live cleanup (см. Graveyard №4 выше) этот kill-switch стал почти ритуальным — даже при `effort=max` мы пишем только один paste-keystroke, не модифицируем JSONL. Сохранён для юзеров которые хотят 100% «приложение не вмешивается».
 
-**Resume-guard.** Даже при `effort=max/high/medium/low` инжект **skip'ается на `--resume`**: при resume Claude TUI восстанавливает effort из своего in-memory state предыдущей сессии, повторный paste бесполезен и потенциально опасен. Опасность задокументирована incident'ом 2026-05-21 15:09:34: Bridge:Fresh event и `Terminal:EffortInject` сработали в одну и ту же миллисекунду на `--resume`, `safePasteAndSubmit`'s Ctrl+S stash race'нулся с paste — `[PasteAudit:MISMATCH]` поймал что вместо 11 байт `/effort max` в композер Claude влетели 303 байта старого user prompt'а из buffer.
+**Resume-guard — только на process-started/Bridge:Fresh пути, НЕ на tui-ready.**
 
-Детекция resume: через renderer-side `getPendingResume(tabId)` из `utils/pendingResume.ts`. `markPendingResume` ставится при `claude --resume <sid>` (в AutoResume и любом другом code path запускающем resume), `clearPendingResume` в `handleSessionDetected` после bridge confirmation. На момент `handleProcessStarted` события `pendingResume` ещё active → inject skip с логом `[Terminal:EffortInject] tab=... SKIP — resume in flight (effort preserved by Claude TUI state)`. Fresh start (новый claude без `--resume`) → `pending === null` → обычный inject.
+**Граветярд ложной предпосылки (горело tab-3234 `6f26c93d`, 2026-06-07).** Первая версия guard'а **полностью** skip'ала инжект на `--resume` под предлогом «при resume Claude TUI восстанавливает effort из in-memory state предыдущей сессии». **Это фактически неверно.** `claude --resume` — это **свежий процесс**, у мёртвого предшественника нет «памяти» которая бы пережила. По декомпилированному исходнику Claude Code (`main.tsx`): `effortValue: parseEffortValue(options.effort) ?? getInitialEffortSetting()`. Мы `--effort` флаг не передаём → fallback на `getInitialEffortSetting()` → `toPersistableEffort(settings.effortLevel)`, который **strip'ает `'max'` на чтении** (комментарий в исходнике: *«filters 'max' for non-ants on read»*). Итог: resumed-сессия **молча теряет max** (и любой session-scoped уровень) — падает на то что лежит в settings.json, а туда `max` не сохраняется (CLI downgrade'ит, см. ниже). Юзер: *«в той сессии effort max не подставлялся при перезапуске, хотя по умолчанию выбран max»*. В логах его сессии: fresh start `isResume=false` → `/effort max` инжектнут, дальше **каждый** рестарт → `SKIP — resume in flight` (и `[Terminal:TuiReady] SKIP — resume in flight` тоже).
+
+**Что guard РЕАЛЬНО защищал.** Incident 2026-05-21 15:09:34 был **paste-race**, не «resume preserves effort»: Bridge:Fresh event и `Terminal:EffortInject` сработали в одну и ту же миллисекунду на `--resume`, `safePasteAndSubmit`'s Ctrl+S stash race'нулся с paste — `[PasteAudit:MISMATCH]` поймал что вместо 11 байт `/effort max` в композер влетели 303 байта старого user prompt'а из buffer. Гонка была на **Bridge:Fresh / process-started** пути — он fires **во время** resume-handshake (bridge.json только появился, PTY ещё может дописывать).
+
+**Фикс — guard остаётся ТОЛЬКО на process-started, снят с tui-ready.** `tui-ready` fires когда Claude **нарисовал `⏵` prompt** = resume-handshake завершён, инпут idle/ready. Это не racer (он позже handshake'а по определению). Поэтому re-inject на resume идёт через tui-ready безопасно. Sentinel `_effortSentForTab` гарантирует **один** инжект: tui-ready ставит метку за 2-6с до Bridge:Fresh, тот видит метку → no-op. Если `⏵` не распарсился (новая версия TUI) — fallback Bridge:Fresh, но он по-прежнему skip'ается на resume (там paste-race), так что в этом редком случае max на resume не применится — приемлемо, лучше потеря max чем порча prompt'а.
+
+Детекция resume: через renderer-side `getPendingResume(tabId)` из `utils/pendingResume.ts`. `markPendingResume` ставится при `claude --resume <sid>` (в AutoResume и любом другом code path запускающем resume), `clearPendingResume` в `handleSessionDetected` после bridge confirmation.
 
 Полная таблица поведения:
 
-| Условие | `/effort` paste | Лог |
-|---|---|---|
-| `effort='none'` | NO | `SKIP — effort=none` |
-| `effort=max/.../low` + resume in flight | NO | `SKIP — resume in flight` |
-| `effort=max/.../low` + fresh claude | YES | (обычный flow) |
+| Условие | `/effort` paste | Путь | Лог |
+|---|---|---|---|
+| `effort='none'` | NO | — | `SKIP — effort=none` |
+| `effort=max/.../low` + resume + tui-ready | **YES** | tui-ready | `/effort max (early path)` |
+| `effort=max/.../low` + resume + только Bridge:Fresh | NO | process-started | `SKIP — resume in flight` |
+| `effort=max/.../low` + fresh claude | YES | tui-ready | (обычный flow) |
 
 ### Click-toggle-off на effort кнопке
 

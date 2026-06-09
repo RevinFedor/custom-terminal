@@ -19,6 +19,9 @@
 //   { type:'message',   tabId, message, sessionId }            (per SDK message)
 //   { type:'busy',      tabId, busy }                          (busy toggled)
 //   { type:'done',      tabId, sessionId }                     (turn ended)
+//   { type:'queue-update', tabId, queue }                      (Run-after queue changed)
+//   { type:'ask-question', tabId, source, toolUseID, questions }  (Claude asked a question)
+//   { type:'question-cancelled', tabId, source }               (question answered/aborted)
 //
 // State source: tabs come from SQLite (works for ALL projects, even closed),
 // because renderer's openProjects map only has currently-open ones. Live SDK
@@ -76,6 +79,14 @@ const DISCOVERY_FILE = path.join(DISCOVERY_DIR, 'web-server-' + process.pid + '.
 let httpServer = null;
 let wss = null;
 let token = null;
+// Injected from main at start() — reads the live busy/running Maps (the same
+// ones that drive the per-tab UI loader). Used by GET /api/active-loaders.
+let computeActiveLoaders = null;
+// Mobile question answering — injected by main.start(). answerClaudeQuestion
+// routes SDK (resolve parked Promise) vs PTY (drive TUI keystrokes);
+// getClaudePendingQuestion reads the live pending question for the SSE snapshot.
+let answerClaudeQuestion = null;
+let getClaudePendingQuestion = null;
 // tabId → Set<Sink>. A Sink is the common interface for both transports:
 //   { kind:'ws'|'sse', send(str):void, isAlive():bool, close():void }
 // WebSocket and SSE both register here so webBroadcast() fans out to either
@@ -227,6 +238,26 @@ async function handleApi(req, res, parsed, sdkSessions) {
     return sendJson(res, 200, { ok: true, lanIp: getLanIp() });
   }
 
+  // Active-loaders snapshot — every tab across every project that is still
+  // "working" (Claude PTY alive / SDK streaming / Gemini busy / any running
+  // process). Polled by the external `build:i-obs` script which waits for
+  // `idle:true` before rebuilding. Computed in main against the live Maps that
+  // already drive the UI loader — no separate busy notion. See
+  // computeActiveLoaders() in main.js.
+  if (parsed.pathname === '/api/active-loaders' && req.method === 'GET') {
+    if (!checkAuth(req)) return sendJson(res, 401, { error: 'unauthorized' });
+    if (!computeActiveLoaders) {
+      // Fail SAFE: if the injection is missing we must NOT report idle — that
+      // would green-light a rebuild mid-work. Signal the poller to keep waiting.
+      return sendJson(res, 503, { error: 'active-loaders unavailable', idle: false });
+    }
+    try {
+      return sendJson(res, 200, computeActiveLoaders());
+    } catch (e) {
+      return sendJson(res, 500, { error: String(e.message), idle: false });
+    }
+  }
+
   // ───────── SSE live channel (WebSocket replacement) ─────────
   // EventSource over plain HTTP GET. Yandex/Chrome anti-tracker extensions
   // block ws:// to private IPs but NOT text/event-stream. Same subscriber
@@ -298,10 +329,12 @@ async function handleApi(req, res, parsed, sdkSessions) {
     // gets the project list, just without the badge.
     let openIds = new Set();
     let activeProjectId = null;
+    let awaitingIds = new Set();
     try {
       const data = await bridgeRequest('getOpenProjectIds', {}, 1500);
       if (data?.ids) openIds = new Set(data.ids);
       activeProjectId = data?.activeProjectId || null;
+      if (Array.isArray(data?.awaitingIds)) awaitingIds = new Set(data.awaitingIds);
     } catch {}
 
     const all = projectManager.db.getAllProjects().map(p => {
@@ -320,6 +353,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
         updatedAt: p.updatedAt,
         isOpen: openIds.has(p.id),
         isActive: p.id === activeProjectId,
+        hasAwaiting: awaitingIds.has(p.id),
       };
     });
     return sendJson(res, 200, { projects: all });
@@ -416,6 +450,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
     // renderer holds the live `claudeCliActive` Map. SDK tabs have no
     // sessionStatus concept here; we keep null for them.
     let statusMap = new Map();
+    let awaitingMap = new Map();
     const ptyClaudeIds = (project.tabs || [])
       .filter(t => t.commandType === 'claude' && (t.tabType || 'terminal') !== 'claude-sdk')
       .map(t => t.tabId);
@@ -423,10 +458,27 @@ async function handleApi(req, res, parsed, sdkSessions) {
       try {
         const data = await bridgeRequest('getClaudeTabStatusBatch', { tabIds: ptyClaudeIds }, 1500);
         if (data?.statuses) for (const [id, st] of Object.entries(data.statuses)) statusMap.set(id, st);
+        if (data?.awaiting) for (const [id, aw] of Object.entries(data.awaiting)) if (aw) awaitingMap.set(id, true);
       } catch (e) {
         // Bridge unavailable — every PTY+Claude tab will show no badge until
         // user opens it (per-tab GET /status still works on demand).
       }
+    }
+    // Configurable status-marker palette (assigned-category color + shape/size)
+    // AND process-bar config (loader strip position/colors) live in renderer
+    // useUIStore — fetch once so the phone mirrors both the desktop left-marker
+    // and the loader strip exactly. Falls back to dot/8px + left process-bar
+    // when the bridge is unavailable.
+    let markerCfg = { shape: 'dot', sizePx: 8 };
+    let processBarCfg = { enabled: true, colorA: '#155E75', colorB: '#0E7490', durationMs: 2400, position: 'left' };
+    let paletteById = new Map();
+    try {
+      const cfg = await bridgeRequest('getStatusMarkerConfig', {}, 1500);
+      if (cfg?.shape) markerCfg = { shape: cfg.shape, sizePx: cfg.sizePx || 8 };
+      if (Array.isArray(cfg?.statuses)) for (const s of cfg.statuses) paletteById.set(s.id, s.color);
+      if (cfg?.processBar) processBarCfg = cfg.processBar;
+    } catch (e) {
+      // renderer not ready — phone renders runtime-only markers, no category tint
     }
     const tabs = (project.tabs || []).map(t => {
       // Cheap timeline-count: only computed if the tab has a session file we
@@ -439,15 +491,22 @@ async function handleApi(req, res, parsed, sdkSessions) {
           if (found) timelineCount = parseTimelineUuids(found.filePath).length;
         } catch {}
       }
+      // Assigned-category status (DB column session_status holds the palette id;
+      // distinct from runtime sessionStatus which drives the loader/background).
+      const statusId = t.sessionStatus || null;
       return {
         tabId: t.tabId,
         name: t.name,
         tabType: t.tabType || 'terminal',
         commandType: t.commandType,
+        color: t.color || null,   // desktop TabColor — drives row bg (mobile mirrors desktop)
         cwd: t.cwd,
         claudeSessionId: t.claudeSessionId,
         timelineCount,
         sessionStatus: statusMap.get(t.tabId) || null,
+        awaiting: awaitingMap.get(t.tabId) || false,
+        statusId,
+        statusColor: statusId ? (paletteById.get(statusId) || null) : null,
         // Live state if SDK session is active in main right now
         live: t.tabId && sdkSessions.has(t.tabId) ? {
           sessionId: sdkSessions.get(t.tabId).sessionId,
@@ -455,7 +514,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
         } : null,
       };
     });
-    return sendJson(res, 200, { project: { id: project.id, name: project.name, path: project.path }, tabs });
+    return sendJson(res, 200, { project: { id: project.id, name: project.name, path: project.path }, tabs, statusMarker: markerCfg, processBar: processBarCfg });
   }
 
   // Create SDK tab in a project (delegates to renderer store)
@@ -608,6 +667,61 @@ async function handleApi(req, res, parsed, sdkSessions) {
     }
   }
 
+  // SOFT interrupt the CURRENT TURN (composer Stop button). SDK → query.close()
+  // (process stays warm). PTY+Claude → single Esc into the TUI via bridge —
+  // Claude stops generating, stays alive at the prompt. Distinct from /stop,
+  // which SIGTERMs the PTY-Claude process. See fact-mobile-claude-pty.md.
+  m = parsed.pathname.match(/^\/api\/sdk-tabs\/([^/]+)\/interrupt$/);
+  if (m && req.method === 'POST') {
+    const tabId = decId(m[1]);
+    const session = sdkSessions.get(tabId);
+    if (session) {
+      // SDK soft-interrupt = close the query stream; the process is kept warm by
+      // the desktop runner and the next message revives the turn loop.
+      try { session.query.close(); } catch {}
+      sdkSessions.delete(tabId);
+      return sendJson(res, 200, { interrupted: true, kind: 'sdk' });
+    }
+    try {
+      const data = await bridgeRequest('interruptClaudeTurn', { tabId }, 2000);
+      return sendJson(res, 200, { interrupted: true, kind: 'pty', ...data });
+    } catch (e) {
+      return sendJson(res, 200, { interrupted: false, reason: 'no active session' });
+    }
+  }
+
+  // Answer (or stop) an AskUserQuestion from mobile. Body:
+  //   { source:'pty'|'sdk', toolUseID, answers:{[questionText]:label|labels}, stop? }
+  // Routes to main's answerClaudeQuestion (PTY → drive TUI keystrokes, SDK →
+  // resolve the parked canUseTool Promise). No bridge — these run in main directly.
+  m = parsed.pathname.match(/^\/api\/sdk-tabs\/([^/]+)\/answer-question$/);
+  if (m && req.method === 'POST') {
+    const tabId = decId(m[1]);
+    if (!answerClaudeQuestion) return sendJson(res, 500, { error: 'answer handler not wired' });
+    try {
+      const body = await readBody(req);
+      const result = await answerClaudeQuestion({
+        tabId,
+        source: body.source || 'pty',
+        toolUseID: body.toolUseID,
+        questions: body.questions,
+        answers: body.answers || {},
+        stop: !!body.stop,
+      });
+      return sendJson(res, 200, result || { success: false });
+    } catch (e) {
+      return sendJson(res, 200, { success: false, error: String(e.message) });
+    }
+  }
+  // Current pending question for a tab (mobile fetches on mount in case it
+  // connected mid-question and the ask-question broadcast already fired).
+  m = parsed.pathname.match(/^\/api\/sdk-tabs\/([^/]+)\/pending-question$/);
+  if (m && req.method === 'GET') {
+    const tabId = decId(m[1]);
+    const q = getClaudePendingQuestion ? getClaudePendingQuestion(tabId) : null;
+    return sendJson(res, 200, { pendingQuestion: q });
+  }
+
   // SDK params (model/effort/thinking) for a tab — read & update.
   m = parsed.pathname.match(/^\/api\/sdk-tabs\/([^/]+)\/params$/);
   if (m && req.method === 'GET') {
@@ -620,6 +734,26 @@ async function handleApi(req, res, parsed, sdkSessions) {
     try {
       const body = await readBody(req);
       const data = await bridgeRequest('setSDKParams', { tabId: decId(m[1]) , ...body });
+      return sendJson(res, 200, data);
+    } catch (e) { return sendJson(res, 409, { error: String(e.message) }); }
+  }
+
+  // Prompt-queue ("Run after") for a tab — read live core + sibling AI-tabs, or
+  // apply one mutation op. Mobile mirrors the desktop store; the desktop runner
+  // does the firing. GET returns { queue, aiTabs }; POST body { op, args } maps
+  // 1:1 to a store method (see App.tsx::mutatePromptQueue). Live deltas arrive
+  // separately via the `queue-update` SSE event.
+  m = parsed.pathname.match(/^\/api\/sdk-tabs\/([^/]+)\/queue$/);
+  if (m && req.method === 'GET') {
+    try {
+      const data = await bridgeRequest('getPromptQueue', { tabId: decId(m[1]) });
+      return sendJson(res, 200, data);
+    } catch (e) { return sendJson(res, 409, { error: String(e.message) }); }
+  }
+  if (m && req.method === 'POST') {
+    try {
+      const body = await readBody(req);
+      const data = await bridgeRequest('mutatePromptQueue', { tabId: decId(m[1]), op: body.op, args: body.args });
       return sendJson(res, 200, data);
     } catch (e) { return sendJson(res, 409, { error: String(e.message) }); }
   }
@@ -908,7 +1042,7 @@ function releaseClaudeWatchersIfOrphan() {
 // only log the transitions worth correlating (snapshot/busy/done/bridge-update
 // + the no-subscriber drop for those), never the per-chunk message fan-out.
 // See CLAUDE.md::Логирование (no spam in hot paths).
-const BCAST_LOG_TYPES = new Set(['snapshot', 'busy', 'done', 'bridge-update']);
+const BCAST_LOG_TYPES = new Set(['snapshot', 'busy', 'done', 'bridge-update', 'queue-update', 'ask-question', 'question-cancelled']);
 function webBroadcast(tabId, payload) {
   const type = payload && payload.type;
   const loggable = BCAST_LOG_TYPES.has(type);
@@ -1185,12 +1319,15 @@ function attachWebSocket(server, sdkSessions) {
 
 // ───────── lifecycle ─────────
 
-function start({ sdkSessions }) {
+function start({ sdkSessions, computeActiveLoaders: computeFn, answerClaudeQuestion: answerFn, getClaudePendingQuestion: getQFn }) {
   if (httpServer) {
     console.log('[WebServer] already started');
     return;
   }
   if (!sdkSessions) throw new Error('start({sdkSessions}) — Map of live SDK sessions required');
+  computeActiveLoaders = computeFn || null;
+  answerClaudeQuestion = answerFn || null;
+  getClaudePendingQuestion = getQFn || null;
   token = loadOrCreateToken();
   registerBridgeReplyHandler();
 

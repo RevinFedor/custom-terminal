@@ -36,15 +36,18 @@ Sticky 240px справа-вверху Claude таба. Гейтится тре�
 
 **Источник busy для T = унифицированный.** Runner подписан на три IPC сразу — `claude:busy-state` (PTY claude + SDK через forward `claude-sdk:busy-state` → `claude:busy-state` в main.js:11559), `gemini:busy-state`. Все три пишут в общий `Map<tabId, boolean> prevBusyRef`. Pivot не различает «какой агент работает на T», только «есть ли там сейчас активный спиннер».
 
-**Три состояния target-таба в UI (определяются в `statusFor()`):**
+**UI-статус target-таба — 2 состояния (определяется в `statusFor()`):**
 
-| Состояние target | Иконка справа от имени | Что делает runner |
-|---|---|---|
-| `busy` (`isTabBusyNow(T) === true`) | спиннер (svg arc, 9px, `pq-spin 0.9s linear infinite`) | ждёт busy→idle edge |
-| `inactive` (`activeTabId !== T`) | `!` в кружке (border `TEXT_MUTED`) | ждёт пока юзер сам активирует T и пошлёт что-то → T станет busy → потом idle → fire |
-| `ready` (T идл и активен) | ничего (occupies 0 width) | cold-start fires немедленно |
+| Состояние target | Иконка справа от имени |
+|---|---|
+| `busy` (агент сейчас думает/стримит) | спиннер (svg arc, 9px, `pq-spin 0.9s linear infinite`) |
+| `idle` (всё остальное) | ничего |
 
-«Inactive» — критическая граница: пользователь может выбрать вкладку, в которой Claude ещё ни разу не отвечал. Без специальной обработки `cold-start` сработал бы мгновенно (потому что `prevBusyRef.get(T) ?? false` = `false`, выглядит как idle). Поэтому в cold-start subscription есть `if (!prevBusyRef.has(effectiveTrigger)) continue` — фильтр «есть ли в map'е запись», не просто значение. Запись появляется только когда T получил первый busy event → если истории нет, ждём.
+Семантика лоадера = «агент в этом табе **сейчас отвечает**» — зеркало shimmer-пульсации вкладки в TabBar (`isBusy`). Idle-но-живой таб → ничего; не запущен → его вообще нет в списке (`aiTabs` фильтрует по наличию сессии).
+
+**Реактивность статуса — собственный `busyMap`, НЕ `isTabBusyNow` + polling.** Picker держит `const [busyMap, setBusyMap] = useState<Map<string,boolean>>()` и подписывается на те же IPC, что TabBar — `claude:busy-state` + `gemini:busy-state` (focus-независимые broadcast'ы из main, долетают для **фоновых** табов — а target по определению не сфокусирован). `statusFor(id) = busyMap.get(id)===true ? 'busy' : 'idle'`. Никакого `setInterval`.
+
+**Что было до и почему сломалось (горело):** статус читался из `isTabBusyNow(id)` — это **не-реактивный** module-Map (`prevBusyRef`) runner'а, поэтому picker перерисовывался только по `setInterval(force, 750)`, который вдобавок был gated `if (!runAfterTabId && !open) return` — при закрытом pill без выбранного target интервал вообще не запускался. Спиннер «не крутился». Плюс третий статус `inactive = (activeTabId !== id)` означал «это не сфокусированный таб» (а не «не запущен») → `!`-кружок горел почти на **каждой** строке (в проекте >1 AI-таба только один == activeTabId). Юзер: *«везде восклицательный знак, что это значит; лоадер не крутится»*. Фикс: убрать `activeTabId`-концепцию и `isTabBusyNow`+poll целиком, статус сделать реактивным от собственного `busyMap` (зеркало TabBar). **Runner'ский `prevBusyRef` НЕ трогаем** — auto-run firing по-прежнему зависит от него; picker просто перестал его читать. Ловушка на будущее: `isTabBusyNow` нереактивен — любой UI, читающий его в рендере, обязан иметь собственный реактивный источник (busyMap/store), а не polling. SDK-таб в фоне: busy-edge может потеряться если компонент unmount'ится (latent, см. `fix-claude-busy-detection.md::3a`) — наследуется и TabBar'ом, фикс не ухудшает.
 
 **Где firing:**
 - Owner tab: `fireQueueOwner(ownerTabId, triggerTabId)` поп'ит head из очереди ownerTabId и пошлёт `claude:send-command` на ownerTabId. Trigger используется только в логе (стрелка `↩` = self, `⇒` = pivot).
@@ -53,6 +56,11 @@ Sticky 240px справа-вверху Claude таба. Гейтится тре�
 **Stale target — lazy validation.** Если target-таб закрыли — `tabExists(runAfterTabId)` возвращает false, runner делает `setRunAfterTab(owner, null)` и фоллбэк на own-tab. Не валидируем в store (создало бы зависимость store→workspaceStore). Validation повторяется на каждом busy event и в cold-start subscription.
 
 **UI layout — 2 равных колонки в header (`1fr 1fr`).** Грид с `grid-template-columns: 1fr 1fr; columnGap: 6`. Левая колонка: trigger «on tab» + delay seconds input. Правая колонка: Run after row / Stop after split / Post split — каждая `width:100%` от своей колонки. Все элементы внутри колонок `width:100% + box-sizing:border-box + minWidth:0` чтобы grid реально схлопывал ячейки. Раньше пробовал `90px 1fr` — правая колонка получалась в 2-3 раза шире левой, кнопки выглядели «непропорционально огромными», input «сек» был хардкод 56px и не подтягивался под колонку. Юзер: *«ширина у инпута и триггера одинаковая, и обе равны кнопкам справа»*.
+
+**Фиксированная ширина + drag-resize (не `fit-content`).** Раньше panel был `width: 'fit-content'` с clamp `minWidth/maxWidth [240, 360]` — ширина **прыгала** при каждом добавлении +grab-чипа или смене лейбла кнопки (юзер: *«когда я плюс граб добавляю промт, ширина меняется — она должна быть фиксированная»*). Теперь ширина **фиксированная**, хранится глобально в `useUIStore.promptQueueWidth` (localStorage `noted-terminal-prompt-queue-width`, clamp `[240, 600]`, default 300 — внутри старого fit-content-диапазона, чтобы первый рендер после миграции не дёрнулся; зеркало `timelineWidth`-паттерна, один привычный размер на всё приложение). Drag-resize меняет **только ширину** (высота — это `chipLineClamp` из Settings, её не трогаем). Во время drag рендер идёт из локального `dragWidth` (60fps без store-churn), коммит в store на mouseup.
+- **Resize-handle на СВОБОДНОЙ грани, не на опорной.** Panel заякорен в top-RIGHT (`right: 8`) → опорная грань правая, никогда не двигается → handle на ЛЕВОЙ грани, drag влево растит панель (dx инвертируется). Это прямое следствие `🧩 Code-Patterns/.../tooltip-resize-modal.md::Resize только в сторону, противоположную опорной`. Handle на опорной грани оторвал бы панель от якоря.
+- **`ANCHOR_SIDE: 'left' | 'right'` — 1-флип-параметр на будущее.** Юзер заложил: меню в будущем может переехать влево. `ANCHOR_SIDE` управляет тремя вещами разом: какая грань pinned (`right:8` vs `left:8`), на какой грани handle (`left:0` vs `right:0`), и знак дельты в drag (`right` → `-dx`, `left` → `+dx`). При переезде меню — поменять одну константу, handle и направление роста подстроятся сами. Принцип «resize учитывает визуальное расположение, расширяется только в доступную сторону».
+- **Handle flush-inside (`left:0`, width 6), НЕ снаружи (`-3`).** Panel имеет `overflow:hidden` — offset наружу клипнулся бы в тонкую полоску. 6px-зона лежит над левым padding'ом header'а, не над интерактивными контролами. `data-cmd-hover-popover` на handle — чтобы mousedown не закрывал Cmd+Shift-пиннутый popover в другом месте.
 
 **Slideout через `createPortal(menu, document.body)` — обязательно.** Раньше picker рендерил slideout inline (`position:fixed` внутри JSX picker'а). Это **не работало**: panel root имеет `backdrop-filter: blur(8px)`, что по CSS-spec делает его containing block для **любого** `position:fixed` потомка. Coords `top: panelRect.top; right: window.innerWidth - panelRect.left + 6` пересчитывались **от panel'я, не от viewport'а** → менюшка улетала за пределы экрана, клики провалились в пустоту, симптом «кнопка тупо не открывается» (`open=true` в state, нет визуала). Editor slideout не страдает потому что он — sibling panel'я, не descendant; picker живёт **внутри** header'а panel'я, поэтому нуждается в портале. Anchor сейчас передаётся через `panelRef` prop напрямую (не walk-up до `position:absolute` ancestor'а — этот walk был фрагилен: HMR / CSS-in-JS объект-стиль не выставляет inline `style.position`, walk доходил до BODY, fallback anchor был мусором). См. `methodology/сценарии-багов-design.md::10` (Portal-кейсы) и `methodology/переносимый-дизайн.md::position:fixed × ancestor transform`.
 
@@ -146,6 +154,34 @@ ipcRenderer.on('claude:busy-state', ({ tabId, busy }) => {
 
 `claudeBusy` приходит из `claude:busy-state` который authoritative от Stop hook (см. `fact-claude-stop-hook.md::Интеграция в claude:busy-state`). Никаких setTimeout, никакого spinner-эвристики — pure event chain.
 
+### Auto-run стреляет ТОЛЬКО на штатный конец turn'а — `reason` на busy-state (горело)
+
+Runner реагирует на фронт `busy:true→false` канала `claude:busy-state`. Но «turn закончился» ≠ «Claude штатно ответил»: turn может оборваться на **API-ошибке** (StopFailure, напр. `API Error: 500`), на **Escape/Ctrl+C** (InterruptStop), или зависнуть и быть сброшенным **watchdog'ом** (60 мин). Все эти исходы технически дают `busy:false` — и если runner их не отличает, он **заливает следующий промпт в сломанный/прерванный turn**. Юзер: *«если выпала ошибка или я нажал Escape — run-after не должен срабатывать, а наоборот деактивироваться»*.
+
+**Ловушка двух каналов.** Различие успех/ошибка (`event`, `success: event !== 'StopFailure'`) main шлёт **только** на `claude:turn-state`. Loader-канал `claude:busy-state` исторически слал **голый `{tabId, busy:false}` без reason** для ВСЕХ исходов — natural Stop, StopFailure, InterruptStop, watchdog неотличимы. Runner слушает `busy-state` (не `turn-state`), поэтому видел только `busy:false` и стрелял очередью на каждом. Изначально скипался лишь `reason === 'manual-stop'` (кнопка Stop) — единственный путь, который reason проставлял (`terminal:stop-ai-process` → `stopBusyState()`, main.js).
+
+**Фикс — протянуть `reason` на busy-state на всех аномальных концах** (зеркало `manual-stop`-паттерна), runner скипает весь набор:
+- `manual-stop` — кнопка Stop / context-menu / двойной Esc (был).
+- `error` — `event === 'StopFailure'` (API/inference error). main.js Stop-hook: `reason = (!busy && event === 'StopFailure') ? 'error' : undefined` — **только** на busy:false-конце; natural Stop и busy:true-старт остаются reason-less.
+- `interrupt` — Esc/Ctrl+C: оба пути (JSONL-marker watcher `[Request interrupted by user]` + idle-probe для «Esc до первой записи в JSONL»).
+- `watchdog` — Stop не пришёл за `CLAUDE_TURN_WATCHDOG_MS`, turn завис/мёртв.
+
+Runner: `const SKIP_REASONS = ['manual-stop','error','interrupt','watchdog'];` — **allowlist, не `reason !== 'natural'` catch-all** (fail-safe: будущий reason-less или явно-natural путь по-прежнему стреляет, регрессий auto-run нет).
+
+**DISARM, не skip-once (вторая половина фикса, доделана позже).** Изначально на `SKIP_REASONS` runner делал `return` — пропускал ОДИН запуск, но `autoRun` оставался `true`. Этого мало: юзер жал Escape чтобы вмешаться → autoRun жив → следующий **натуральный** Stop (reason-less) стрелял очередью в контекст, куда юзер уже влез. Юзер: *«если нажал Escape чтобы уточнить — run-after должен ВЫКЛЮЧИТЬСЯ, а не молча продолжить»*. Поэтому на любом `reason` из `SKIP_REASONS` теперь **disarm**: для каждой затронутой owner-очереди `setAutoRun(false)` + `setStopAfter(false)` (каскадит `closeAfter→false`) + `clearFirstDelayCountdown` (гасит «секундомер» first-delay). Затем `return` (firing-пути ниже не достигаются). Натуральный Stop (reason-less) проходит мимо disarm-блока и стреляет как раньше.
+- **Fan-out disarm'а = fan-out firing'а:** цикл по `queues`, `effectiveTrigger = q.runAfterTabId ?? ownerTabId; if (effectiveTrigger !== tabId) continue` — та же логика что `findOwnersWaitingOn`. Значит обрыв **target**-таба disarm'ит **owner**-очередь (pivoted), симметрично тому как завершение target'а её бы запустило. Own-tab (`runAfterTabId === null`) — тоже.
+- **Почему НЕ перехватываем клавиши вручную (Escape/Ctrl+C/Ctrl+]):** причина остановки уже классифицирована в `reason` (main: `interrupt` = Esc/Ctrl+C через JSONL-marker watcher + idle-probe; `manual-stop` = кнопка; `error` = StopFailure; `watchdog` = зависание). Слушаем **причину**, не keystroke — единый сигнал вместо ручного парсинга. Это и есть «отслеживать по какой причине была остановка Claude».
+- **Решение «любой обрыв → disarm»** (не «только ручные → disarm, ошибки → skip») — выбор юзера: максимально предсказуемо, после любого ненатурального конца тумблер off, переармить вручную.
+- **Store-безопасность:** до 3 сеттеров × N owner = всё равно ОДНА debounced SQLite-запись (`scheduleSave` 250ms, shared timer). Итерация по снапшоту `queues` безопасна — сеттеры строят `new Map`, не мутируют итерируемый объект. Gemini: `gemini:busy-state` всегда reason-less → guard `if (reason && ...)` ложен → natural gemini-конец никогда не disarm'ится.
+
+**Тонкости которые держать в голове:**
+- Гард стоит **выше** обоих путей (step-1 pivot + step-2 own-tab) → pivoted-очередь (`runAfterTabId`) тоже НЕ стреляет если оборвался **target**-таб. Симметрично `manual-stop`.
+- **Аддитивно к loader'у:** `prevBusyRef.set(tabId, busy)` пишется ДО гарда; все консьюмеры (`App.tsx`, `TabBar`, `InfoPanel`, `ClaudeControlBar`, picker `busyMap`) читают только `{tabId, busy}` и игнорят `reason` → спиннер гаснет на всех исходах как раньше.
+- **Натуральные reason-less пути НЕ трогаем:** SDK-форвард `claude-sdk:busy-state` (нет error-канала), legacy spinner-IDLE (gated `claudeTurnBusy`), PTY-onExit / `terminal:kill` cleanup (таб/PTY уже мёртв — send в мёртвый таб no-op). Все они = natural → стреляют. **Gemini:** `gemini:busy-state` имеет только spinner-on/off, нет StopFailure/Interrupt-канала → каждый `busy:false` натуральный, fix Claude-only.
+- **Schema-drift риск:** тег `'error'` висит на строковой константе `event === 'StopFailure'`. Если Claude переименует событие — путь регрессирует к firing (как и `success`-флаг на turn-state, та же единственная константа).
+
+См. `fact-claude-stop-hook.md` (Stop/StopFailure/InterruptStop события) и `fix-claude-aborted-streaming-loader.md` (aborted_streaming не fires hook → JSONL-marker watcher).
+
 ### Почему не в overlay (первая реализация была там и сломалась)
 
 Overlay рендерится через гейт `effectiveActive && isClaudeTab && hasClaudeSession && claudeProcessAlive`. `effectiveActive` становится `false` как только юзер уходит на другой таб / Dashboard / Home view → React unmount'ит overlay → `useEffect` cleanup → `prevBusyRef` теряется.
@@ -197,7 +233,21 @@ Overlay рендерится через гейт `effectiveActive && isClaudeTab
 
 **Spinner on the button while IPC is in flight.** Replay roundtrip — ~400-800ms (Ctrl+G grab → helper write → main IPC paste). Без видимой in-flight индикации юзер двойным кликом ставит вторую `claude:append-input` параллельно, потом `removePrompt` дважды — второй уже на несуществующем id. Guard через `replayingIds: Set<string>` в локальном state'е: на entry в handler добавляем id, кнопка для этого chip'а рендерится с `<span class="pq-spinner" />` вместо `▶` + `disabled` + статичный hover-палитра. Hover-handlers `if (replayingIds.has(it.id)) return;` чтобы стиль не дёргался при движении курсора. В `finally` удаляем id из set'а (на success чип всё равно уже исчез через removePrompt — set-операция no-op).
 
-**Hard guard `claudeCliActive.get(tabId)` в main-handler.** Без него: Claude exit-нулся между renderer-снимком и приходом IPC → bracketed paste чипа улетает в живой shell-parent PTY (bash/zsh). Современный zsh поддерживает bracketed paste mode → весь чип становится **одной shell command-line**. Чип `rm -rf node_modules` отрабатывает мгновенно, чип `sudo apt remove ...` запрашивает пароль. Handler сразу `return { success: false, error: 'no_claude_session' }` если флаг false; renderer показывает toast «No Claude session for replay». Тело чипа открывает редактор по клику; ▶ и × используют `data-chip-action` + `stopPropagation`, чтобы клик не пробил в тело.
+**Hard guard в main-handler — источник liveness = `bridgeKnownSessions`, НЕ `claudeCliActive`.** Без guard'а вообще: Claude exit-нулся между renderer-снимком и приходом IPC → bracketed paste чипа улетает в живой shell-parent PTY (bash/zsh). Современный zsh поддерживает bracketed paste mode → весь чип становится **одной shell command-line**. Чип `rm -rf node_modules` отрабатывает мгновенно, чип `sudo apt remove ...` запрашивает пароль. Handler сразу `return { success: false, error: 'no_claude_session' }` если сессии нет; renderer показывает toast «No Claude session for replay». Тело чипа открывает редактор по клику; ▶ и × используют `data-chip-action` + `stopPropagation`, чтобы клик не пробил в тело.
+
+**Шрам: guard был на `claudeCliActive` → Replay падал на AutoResume'нутых табах, хотя auto-run работал.** Первая версия гейтила `if (!claudeCliActive.get(tabId))`. Это **неверный флаг** для liveness: `claudeCliActive` = «Claude *сейчас обрабатывает* turn», ставится **только** explicit-spawn путями (`claude:run-command`, MCP, handshake), пуст на idle-prompt'е и — ключевое — **никогда не ставится при AutoResume**. AutoResume пишет `claude --resume <id>` прямо в PTY через `terminal:input` (renderer, `App.tsx`); этот путь наполняет `bridgeKnownSessions` через `handleSessionDetected`, но `claudeCliActive` не трогает вообще.
+
+Результат — **three-way асимметрия guard'ов на одном живом PTY**: три хендлера, пишущие в один и тот же Claude-инпут, проверяли разные источники:
+
+| Handler | UI-триггер | Guard | На resumed-табе |
+|---|---|---|---|
+| `claude:send-command` | auto-run, Model/Effort | (нет guard'а) | ✅ работает |
+| `captureClaudeInput` | grab / copy | `bridgeKnownSessions` | ✅ работает |
+| `claude:append-input` | **Replay ▶** | `claudeCliActive` ❌ | ❌ `no_claude_session` |
+
+Симптом юзера: *«run after сам работает в авторежиме корректно, но при нажатии на эту кнопку вручную вставка в инпут не хочет работать»* + красный тост `Replay failed: no_claude_session`. Прод-подтверждение (tab-5, сессия `59cf2ebf`, 2026-06-03): таб AutoResume'нут в 19:10:17 (`[AutoResume] Resumed … claude --resume`), `bridgeKnownSessions` знает сессию (auto-run `send-command` отрабатывал), но `claudeCliActive` пуст. В 19:34:36–44 — **4× `[append-input] ❌ Claude not active`**; в 19:34:48 (12 секунд спустя, тот же таб, тот же живой Claude) — `send-command` паста прошла за 247ms. Один и тот же инстанс Claude: append-input отказывает, send-command работает.
+
+**Фикс:** guard `claude:append-input` переведён на `bridgeKnownSessions.has(tabId)` — тот же источник liveness, что у sibling-хендлера `captureClaudeInput`. Anti-`rm -rf` интент сохранён: чистый bash/zsh-таб без зарегистрированной Claude-сессии в `bridgeKnownSessions` по-прежнему отклоняется. Переносимый принцип: **liveness-guard для записи в Claude PTY = `bridgeKnownSessions` (процесс жив), не `claudeCliActive` (процесс занят turn'ом).** `claudeCliActive` ≠ liveness — это документировано и в CLAUDE.md (anti-pattern про `claudeCliActive` = «currently processing», пуст на idle) и в `fact-claude-tui-control.md` / комментарии `claude:get-presence` (main.js: «liveness belongs to hasBridge, never to isBusy»). Любой новый PTY-write handler обязан гейтить на `bridgeKnownSessions`, а не `claudeCliActive`.
 
 ## Stop/Close split: каскад stopAfter ↔ closeAfter
 
@@ -265,6 +315,12 @@ Cross-trigger swap (чип A → ✎ post-prompt, или ✎ → `+add`) по-п
 | `src/renderer/store/usePromptQueueStore.ts` | Per-tab queue + autoRun + stopAfter state |
 | `src/renderer/components/Workspace/PromptQueueOverlay.tsx` | UI overlay (gated by active tab) — only renders pills/chips/editor, NO runner logic |
 | `src/renderer/hooks/usePromptQueueRunner.ts` | Singleton auto-runner. Mounted in App.tsx, fires regardless of which tab is visible |
+| `src/renderer/hooks/usePromptQueueWebSync.ts` | Singleton store-subscriber. Диффает per-tab core-JSON, шлёт `web:broadcast-queue` IPC → SSE `queue-update` на телефон. App-root по той же причине что runner (фоновый таб). |
+| `App.tsx::handleWebBridge` (`getPromptQueue`/`mutatePromptQueue`) | Read/write мост для мобильного мирора. mutate вызывает те же store-методы (каскады идентичны). |
+
+## Мобильный мирор (Run after с телефона)
+
+Десктопный store — **единственный источник правды**, runner — **единственный движок**. Мобилка читает core через `getPromptQueue`, мутирует через `mutatePromptQueue` (1:1 на store-методы), live-дельты через SSE `queue-update` (пушит `usePromptQueueWebSync`). Owner очереди = **только PTY-claude** (runner стреляет `claude:send-command` = PTY-paste, no-op на SDK). Полная архитектура — `fact-mobile-web.md::Prompt Queue ("Run after") — mobile mirror`. **Любой новый store-метод, меняющий очередь, автоматически доступен с телефона** если добавить его в op-таблицу `mutatePromptQueue` + `QueueOp` (mobile-web/src/api.ts) — реимплементировать логику не нужно.
 
 ## Что пробовали и почему отбросили
 

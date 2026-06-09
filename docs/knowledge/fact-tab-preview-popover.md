@@ -1,7 +1,7 @@
 # Feature: Tab Preview Popover (CMD+hover)
 
 ## Intro
-Превью карточки таба, появляющееся при наведении с зажатым CMD. Унифицированный `TabPreviewPopover` для двух поверхностей: вкладки `TabBar` и карточки в `ProjectHome` (Active + History). Без resize handles — размеры окна вычисляются автоматически по контенту в пределах cap'ов из Settings; юзер настраивает рамку пространства, не каждый popover вручную.
+Превью карточки таба, появляющееся при наведении с зажатым CMD. Унифицированный `TabPreviewPopover` для двух поверхностей: вкладки `TabBar` и карточки в `ProjectHome` (Active + History). Ширину юзер задаёт resize-ручкой на правом крае (персистится), высота динамическая под контент до потолка из Settings. Раньше была autobalance по пропорции — удалена (см. Sizing graveyard).
 
 ## User Flow
 
@@ -10,24 +10,24 @@
 3. **Закрытие**: уход курсора с popover'а + отпускание ⌘.
 4. **Закреп**: CMD+Shift над любым открытым popover'ом — popover «прибивается» (белая рамка 1px). CMD можно отпустить, курсор увести куда угодно, перенаведение на другие триггеры игнорируется. Снятие — повторный CMD+Shift или mousedown в любом месте приложения вне popover-обёртки (атрибут `data-cmd-hover-popover` защищает внутренние клики). Общая механика закрепа — в global `tooltip-resize-modal.md::Закреп: Cmd+Shift делает любой popover пинованным`.
 
-## Sizing: cap + target-ratio + autobalance
+## Sizing: resize-ширина + динамическая высота
 
-Размеры — **не фиксированные**. Popover рендерится `fit-content + max-*`, форма подгоняется к контенту в пределах рамки настроек:
+Модель простая и предсказуемая: **ширину задаёт юзер перетаскиванием правого края превью, высота динамическая под контент**.
 
-- `tabPreviewMaxWidth` (default 200px, 120-900px) — потолок ширины.
-- `tabPreviewMaxHeight` (default 250px, 80-900px) — потолок высоты.
-- `tabPreviewRatioW × tabPreviewRatioH` (default 3 × 2) — целевая пропорция W:H. Алгоритм пытается выйти на это соотношение.
+- `tabPreviewMaxWidth` (default 200px, 120-900px) — **потолок переноса текста**, его двигает resize-ручка на правом крае превью (не Settings — там оно disabled-отображением). Текст переносится в эту ширину.
+- `tabPreviewMaxHeight` (default 250px, 80-900px) — потолок высоты, до которого коробка растёт построчно; дальше внутренний scroll. Активно редактируется в Settings.
+- `ratio` удалён полностью (см. graveyard).
 
-Алгоритм (`useLayoutEffect` в компоненте, `measureAt(w)` через единый hidden probe-DOM):
+Алгоритм (`useLayoutEffect`, `measureAt(w)` через единый hidden probe-DOM):
+1. Замер natural-width контента при `width: max-content + max-width: previewWidth`.
+2. **Ширина** = `clamp(naturalW, NOTES_MIN_WIDTH, previewWidth)`. Контент короче потолка (заметка в одну строку) → коробка ужимается до natural-width — **нет пустого места справа**. Контент шире → ширина = потолок, текст переносится.
+3. **Высота** = `measureAt(chosenW)`, обрезается `heightCap`. Динамическая построчно.
+4. `heightCap = min(tabPreviewMaxHeight, доступное место до края экрана)`. Если вкладка близко к низу/верху и контент не влезает даже в maxHeight — scroll наступает раньше (`avail = max(spaceBelow, spaceAbove, 120)` — popover флипается туда где места больше, минимум 120px даже у самого края).
 
-1. Замер natural-width контента при `width: max-content + max-width: cap`.
-2. Если natural ≤ cap'а — стартовая ширина = natural. Иначе — cap.
-3. Замер высоты при стартовой ширине.
-4. Если `W/H > targetRatio` (коробка слишком плоская — например одна длинная строка во всю maxWidth): **бисекция вниз** до `NOTES_MIN_WIDTH` пока ratio не сойдётся. Word-wrap при сужении увеличивает H — соотношение крутится к target.
-5. Если `W/H < targetRatio` (коробка слишком высокая): **бисекция вверх** до `maxWidth`. Word-wrap при расширении уменьшает H.
-6. Финальная высота: `min(naturalH, tabPreviewMaxHeight)`. Если контент дальше — внутренний scroll.
+Никакой бисекции/балансировки — width фиксируется юзером, height просто меряется один раз. Эффект пере-запускается при изменении `previewWidth` (resize) и `heightCap` (rect/maxHeight).
 
-8 итераций бисекции достаточно для попадания в 1 пиксель на типичных markdown-документах; все замеры по одному и тому же probe без re-render'ов.
+### Resize-ручка
+Узкая (7px) полоса по правому краю notes-карточки, `ew-resize`, подсветка индиго на hover (та же стилистика что resize-края slide-out заметок). Drag пишет `tabPreviewMaxWidth` в store **live** (store сам clamp'ит [120, 900]), эффект пере-меряет на каждое изменение. Тянуть **шире natural-width бессмысленно** — коробка уже = naturalW (короткий текст), потому ширина «не даётся в большую сторону пока есть запас справа»; реально расширение работает только когда текст переносится (naturalW > previewWidth). `resizingRef` глушит mouse-leave-close popover'а на время drag'а — иначе курсор, выехавший за край, закрыл бы превью. Только на notes (meta-only popover не ресайзится). Persist: `tabPreviewMaxWidth` зеркалится в SQLite (`app:setState`) + localStorage — переживает рестарт и vite port shuffle.
 
 ## Wait-for-stable measurement
 
@@ -85,10 +85,11 @@ MarkdownEditor (react-markdown) рендерит markdown-блоки **асин�
 Settings UI: модалка → секция «Заметки вкладки». Один блок включает:
 - 3 шрифта (sidebar / expanded / tooltip — см. секцию ниже).
 - Padding X/Y.
-- Макс. ширина превью / Макс. высота превью.
-- Пропорция превью — RatioRow с двумя инпутами `W × H`.
+- **Макс. ширина [resize]** — `FontSizeSlider disabled`: показывает текущее значение read-only (без +/−, dimmed), потому что ширину юзер задаёт перетаскиванием правого края превью, а не в Settings. Лейбл с `[resize]` сигнализирует канал ввода.
+- **Макс. высота** — обычный editable `FontSizeSlider`: до неё растёт высота, дальше scroll.
+- Пропорция (RatioRow) удалена.
 
-Все числовые инпуты в `FontSizeSlider` — editable: на focus убирает suffix (`12px` → `12`), select-all, Enter/blur коммитит clamped значение, Escape откатывает. Кнопки +/− по бокам для нудж'ей в единицу.
+Числовые инпуты в `FontSizeSlider` (кроме disabled) — editable: на focus убирает suffix (`12px` → `12`), select-all, Enter/blur коммитит clamped значение, Escape откатывает. Кнопки +/− по бокам для нудж'ей. `disabled`-вариант рендерит просто значение-пилюлю без кнопок.
 
 ## Шрифт: один из трёх по density-контексту
 
@@ -109,12 +110,13 @@ Migration: при отсутствии новых ключей (`noted-terminal-
 - **wrapper padding 8px со всех сторон**: чтобы handles на offset -5px физически попадали внутрь `wrapper.boundingClientRect()` (иначе triggerProps.onMouseLeave timer убивал popover до drag'а). С удалением handles padding не нужен — popover примыкает к trigger'у плотно.
 - **Float-значения в store + Math.round только в Settings**: чтобы рамка не прыгала на mouseup из-за subpixel-mismatch'а между live-preview и rounded store. Без drag'а — целые числа.
 - **CSS-ловушки три**: `overflow:hidden` обрезал handles на `-5px` → нужен был card-wrap без overflow. `flex:1 + maxHeight: limit` давал effective `min(natural, limit)` → drag-up не реагировал визуально на коротком content → нужен был `height: limit + flex: 0 0 auto`. `Math.round(dy/lineHeight)` создавал discrete-step jitter → нужен был float. Все три пропали вместе с handles. Принцип остаётся в `methodology/переносимый-дизайн.md::Drag-state буфер`.
+- **Autobalance по target-ratio (бисекция W в [MIN, maxWidth] под `ratioW/ratioH`)**: пришла на смену тем handles, прожила недолго и тоже снята. Баг, по которому сняли: при пропорции 6:2 и max 400×400 длинный текст давал коробку **уже** maxWidth и высокую — фактическое W/H ≈ 1.07 вместо целевого 3.0. Причина: ветка «коробка слишком плоская» **сужала** chosenW (242→157) ради ratio, хотя был запас до 400; настройка maxWidth почти не работала, алгоритм сам отказывался её использовать. Плюс `min(naturalH, maxHeight)` накладывался ПОСЛЕ выбора ширины — ratio не «видел» что лишнюю высоту срежет scroll, и сужал ширину зря. Юзер: *«ширина меньше 400, хотя и ширина и высота 400, а пропорция 6:2»*. Заменено на resize-ширина + динамическая высота (см. Sizing). `tabPreviewRatioW/H` + `setTabPreviewRatio` + `RatioRow` удалены из store/Settings; localStorage-ключи `noted-terminal-tab-preview-ratio-{w,h}` осиротели (никто не читает, безвредны).
 
-Невозврат: не возвращать ручной resize если задача — info-popover (хover, секунды). Resize handles оправданы только когда юзер сидит с popover'ом долго (модалка заметок, sticky-overlay). См. global `tooltip-resize-modal.md::Tooltip с resize`.
+Невозврат: **не возвращать проекционную autobalance** (бисекцию под пропорцию) — она душит ширину и делает настройку maxWidth бесполезной. Resize-ширина вернулась намеренно (юзер сам попросил: предсказуемая фикс-ширина + обрезка пустого места справа на коротком тексте), но **только по ширине** — высота остаётся динамической. Resize info-popover оправдан здесь потому что превью часто закрепляют (CMD+Shift lock) и читают долго; для короткоживущего hover он избыточен, но lock меняет режим. См. global `tooltip-resize-modal.md::Tooltip с resize`.
 
 ## Связи
 
-- `methodology/переносимый-дизайн.md::Auto-balanced popover sizing` — общий принцип cap+ratio+autobalance, переносим в другие проекты.
+- `methodology/переносимый-дизайн.md::Popover sizing переменного контента` — фикс-ширина (resize) + динамическая высота; почему autobalance по пропорции отвергнут.
 - `methodology/переносимый-дизайн.md::Pointer-through для info-popover'ов` — почему на Home сквозь, на TabBar нет.
 - `methodology/переносимый-дизайн.md::Один контент в нескольких density-контекстах` — три fonts по семантике.
 - `fact-project-home.md::Hover Popover (CMD+hover)` — конкретные карточки Home, split-mode на месте.

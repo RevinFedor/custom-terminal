@@ -109,50 +109,9 @@ function saveProcessBar(s: ProcessBarSettings) {
   try { localStorage.setItem('noted-terminal-process-bar', JSON.stringify(s)); } catch {}
 }
 
-/* AI pulse — фон всей вкладки мягко пульсирует пока AI «думает» (claude:busy-state,
-   gemini:busy-state, claude-sdk:busy-state). Раньше брал цвет/цикл из ProcessBar
-   (одно настройка на два разных индикатора — не настраивалось отдельно). */
-export interface AIPulseSettings {
-  enabled: boolean;
-  colorA: string;       // нижняя фаза пульса (transparent если строкa 'transparent')
-  colorB: string;       // верхняя фаза
-  durationMs: number;   // 300..6000ms
-}
-
-const DEFAULT_AI_PULSE: AIPulseSettings = {
-  enabled: true,
-  colorA: 'transparent',
-  colorB: '#DA7756',    // claude-оранжевый — заметный пик на тёмном фоне таба
-  // Synced с DEFAULT_PROCESS_BAR.durationMs (2400ms). При живом PTY-Claude
-  // активны ОБЕ анимации одновременно (process-bar pulse слева + tab-fon-pulse
-  // под всем табом). Разные периоды визуально «бьются» — пик process-bar'а
-  // совпадает с минимумом фона на одном кадре, с максимумом на другом, глаз
-  // ловит «дрожание». См. fact-process-bar.md::«Период тоже 2.4s — синхронно
-  // с process-bar pulse, чтобы две анимации на одном табе не бились разными
-  // частотами». Юзер может менять в Settings независимо — если хочет.
-  durationMs: 2400,
-};
-
-function loadAIPulse(): AIPulseSettings {
-  try {
-    const raw = localStorage.getItem('noted-terminal-ai-pulse');
-    if (!raw) return DEFAULT_AI_PULSE;
-    const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== 'object') return DEFAULT_AI_PULSE;
-    return {
-      enabled: typeof parsed.enabled === 'boolean' ? parsed.enabled : DEFAULT_AI_PULSE.enabled,
-      colorA: typeof parsed.colorA === 'string' ? parsed.colorA : DEFAULT_AI_PULSE.colorA,
-      colorB: typeof parsed.colorB === 'string' ? parsed.colorB : DEFAULT_AI_PULSE.colorB,
-      durationMs: typeof parsed.durationMs === 'number'
-        ? Math.max(300, Math.min(6000, parsed.durationMs))
-        : DEFAULT_AI_PULSE.durationMs,
-    };
-  } catch { return DEFAULT_AI_PULSE; }
-}
-
-function saveAIPulse(s: AIPulseSettings) {
-  try { localStorage.setItem('noted-terminal-ai-pulse', JSON.stringify(s)); } catch {}
-}
+/* AIPulse (whole-tab background pulse during AI-busy) was REMOVED — the loader
+   is the process-bar shimmer strip on the tab edge, not a tint of the entire
+   tab. See fact-process-bar.md::AIPulse removed. */
 
 export interface StatusMarkerSettings {
   shape: 'dot' | 'square';
@@ -291,11 +250,6 @@ interface UIStore {
   processBar: ProcessBarSettings;
   setProcessBar: (patch: Partial<ProcessBarSettings>) => void;
 
-  /* AI-pulse — фон таба пульсирует когда AI «думает» (claude/gemini/sdk busy-state).
-     Отдельные настройки (раньше цвет/цикл заимствовались у processBar). */
-  aiPulse: AIPulseSettings;
-  setAiPulse: (patch: Partial<AIPulseSettings>) => void;
-
   /* Status marker — маркер слева во вкладке (vertical mode) для sessionStatus.
      shape='dot' → круг, 'square' → квадрат (border-radius различается).
      sizePx — длина стороны (для круга = диаметр). Clamp 4..16. */
@@ -321,6 +275,7 @@ interface UIStore {
   timelineWidth: number;       // Timeline width (px) when expanded (treeMode). Drag-resizable.
   timelineLineClamp: number;   // How many lines of preview text show in expanded mode.
   promptQueueChipLineClamp: number; // How many lines of chip text show inside Run After overlay (1 = single-line ellipsis).
+  promptQueueWidth: number;    // Run-after overlay width (px). FIXED — adding a +grab chip must not reflow it. Drag-resizable on the free (non-anchor) edge. Global, like timelineWidth.
 
   setSidebarWidth: (width: number) => void;
   setTabSidebarWidth: (width: number) => void;
@@ -343,6 +298,7 @@ interface UIStore {
   setTimelineWidth: (width: number) => void;
   setTimelineLineClamp: (lines: number) => void;
   setPromptQueueChipLineClamp: (lines: number) => void;
+  setPromptQueueWidth: (width: number) => void;
 
   incrementTerminalFontSize: () => void;
 
@@ -600,19 +556,16 @@ interface UIStore {
   // фиксируются в Settings, дополнительно поверх живёт пользовательский
   // resize (live-drag на правом / нижнем / угловом handle popover'а) который
   // апдейтит те же поля. См. useUIStore.tabPreview*.
-  // Cap'ы — НЕ фиксированные размеры. `width: fit-content + max-width: cap`
-  // и `height: fit-content + max-height: cap`. Layout сам подбирает форму
-  // под контент в пределах cap'ов (target-пропорция 3:2 рассчитывается в
-  // компоненте). См. fact-tab-preview-popover.md `Sizing & balance`.
+  // Превью CMD+hover: ширина = ПОТОЛОК переноса текста, задаётся resize-ручкой
+  // на самом превью (как у заметок), персистится. Высота динамическая (построчно
+  // под контент), скроллится при упоре в tabPreviewMaxHeight ИЛИ при нехватке
+  // места до края экрана. Ширина — `tabPreviewMaxWidth`: в Settings показывается
+  // disabled (юзер меняет её только перетаскиванием правого края превью).
+  // См. fact-tab-preview-popover.md `Sizing`.
   tabPreviewMaxWidth: number;
   setTabPreviewMaxWidth: (px: number) => void;
   tabPreviewMaxHeight: number;
   setTabPreviewMaxHeight: (px: number) => void;
-  // Целевая пропорция превью — width:height. Алгоритм sizing'а пытается выйти
-  // на это соотношение в пределах cap'ов (см. TabPreviewPopover).
-  tabPreviewRatioW: number;
-  tabPreviewRatioH: number;
-  setTabPreviewRatio: (w: number, h: number) => void;
 
   // Notes Editor — три независимых шрифта для трёх поверхностей tab.notes:
   //   notesSidebarFontSize  — inline-превью в InfoPanel сайдбара
@@ -629,6 +582,14 @@ interface UIStore {
   setNotesEditorPaddingX: (px: number) => void;
   notesEditorPaddingY: number;
   setNotesEditorPaddingY: (px: number) => void;
+  // Show line-number gutter, independent per surface:
+  //   notesEditorShowLineNumbers  — раскрытый slide-out редактор (TabNotesSlideout)
+  //   notesPreviewShowLineNumbers — CMD+hover tab-preview popover (TabPreviewPopover)
+  // Default true (= прежнее поведение, package default showLineNumbers=true).
+  notesEditorShowLineNumbers: boolean;
+  setNotesEditorShowLineNumbers: (on: boolean) => void;
+  notesPreviewShowLineNumbers: boolean;
+  setNotesPreviewShowLineNumbers: (on: boolean) => void;
 
   // API Settings Modal
   apiSettingsOpen: boolean;
@@ -967,6 +928,18 @@ const loadPromptQueueChipLineClamp = (): number => {
   } catch {}
   return 1;
 };
+// Run-after overlay width. Clamp [240, 600] — 240 ≈ the old PANEL_MIN_WIDTH so
+// existing layouts don't shrink; default 300 sits inside the old fit-content
+// [240,360] band so the first render after this change doesn't jump.
+const PROMPT_QUEUE_WIDTH_MIN = 240;
+const PROMPT_QUEUE_WIDTH_MAX = 600;
+const loadPromptQueueWidth = (): number => {
+  try {
+    const v = localStorage.getItem('noted-terminal-prompt-queue-width');
+    if (v) return Math.max(PROMPT_QUEUE_WIDTH_MIN, Math.min(PROMPT_QUEUE_WIDTH_MAX, Number(v) || 300));
+  } catch {}
+  return 300;
+};
 const initialEditorSettings = loadEditorSettings();
 const initialModel = loadSelectedModel();
 const initialThinkingLevel = loadThinkingLevel();
@@ -1217,6 +1190,22 @@ const initialDefaultClaudeEffort = loadDefaultClaudeEffort();
   } catch {}
 })();
 
+// Hydrate Tab-preview width (resizable via drag on the popover's right edge) from SQLite.
+(async () => {
+  try {
+    const { ipcRenderer } = window.require('electron');
+    const v = await ipcRenderer.invoke('app:getState', 'tabPreviewMaxWidth');
+    const n = Number(v);
+    if (Number.isFinite(n)) {
+      const w = Math.max(120, Math.min(900, n));
+      if (useUIStore.getState().tabPreviewMaxWidth !== w) {
+        useUIStore.setState({ tabPreviewMaxWidth: w });
+        try { localStorage.setItem('noted-terminal-tab-preview-max-width', String(w)); } catch {}
+      }
+    }
+  } catch {}
+})();
+
 // Hydrate Notes Panel size (slide-in resizable panel) from SQLite.
 (async () => {
   try {
@@ -1373,20 +1362,6 @@ export const useUIStore = create<UIStore>((set, get) => ({
     saveProcessBar(next);
   },
 
-  aiPulse: loadAIPulse(),
-  setAiPulse: (patch) => {
-    const cur = get().aiPulse;
-    const next: AIPulseSettings = {
-      enabled: typeof patch.enabled === 'boolean' ? patch.enabled : cur.enabled,
-      colorA: typeof patch.colorA === 'string' ? patch.colorA : cur.colorA,
-      colorB: typeof patch.colorB === 'string' ? patch.colorB : cur.colorB,
-      durationMs: typeof patch.durationMs === 'number'
-        ? Math.max(300, Math.min(6000, patch.durationMs))
-        : cur.durationMs,
-    };
-    set({ aiPulse: next });
-    saveAIPulse(next);
-  },
 
   statusMarker: loadStatusMarker(),
   setStatusMarker: (patch) => {
@@ -1435,6 +1410,7 @@ export const useUIStore = create<UIStore>((set, get) => ({
   timelineWidth: loadTimelineWidth(),
   timelineLineClamp: loadTimelineLineClamp(),
   promptQueueChipLineClamp: loadPromptQueueChipLineClamp(),
+  promptQueueWidth: loadPromptQueueWidth(),
 
   setSidebarWidth: (width) => {
     set({ sidebarWidth: width });
@@ -1499,6 +1475,12 @@ export const useUIStore = create<UIStore>((set, get) => ({
     const clamped = Math.max(1, Math.min(10, Math.round(lines)));
     set({ promptQueueChipLineClamp: clamped });
     try { localStorage.setItem('noted-terminal-prompt-queue-chip-line-clamp', String(clamped)); } catch {}
+  },
+
+  setPromptQueueWidth: (width: number) => {
+    const clamped = Math.max(PROMPT_QUEUE_WIDTH_MIN, Math.min(PROMPT_QUEUE_WIDTH_MAX, Math.round(width)));
+    set({ promptQueueWidth: clamped });
+    try { localStorage.setItem('noted-terminal-prompt-queue-width', String(clamped)); } catch {}
   },
 
   // Editor Settings (from gt-editor)
@@ -2074,6 +2056,11 @@ export const useUIStore = create<UIStore>((set, get) => ({
     const clamped = Math.max(120, Math.min(900, px));
     set({ tabPreviewMaxWidth: clamped });
     try { localStorage.setItem('noted-terminal-tab-preview-max-width', String(clamped)); } catch {}
+    // Mirror to SQLite so a resize survives vite port shuffles (same as notesPanelSize).
+    try {
+      const { ipcRenderer } = window.require('electron');
+      ipcRenderer.invoke('app:setState', { key: 'tabPreviewMaxWidth', value: clamped }).catch(() => {});
+    } catch {}
   },
   tabPreviewMaxHeight: (() => {
     try {
@@ -2087,30 +2074,6 @@ export const useUIStore = create<UIStore>((set, get) => ({
     set({ tabPreviewMaxHeight: clamped });
     try { localStorage.setItem('noted-terminal-tab-preview-max-height', String(clamped)); } catch {}
   },
-  tabPreviewRatioW: (() => {
-    try {
-      const saved = localStorage.getItem('noted-terminal-tab-preview-ratio-w');
-      const n = saved ? parseFloat(saved) : 3;
-      return Math.max(1, Math.min(32, Number.isFinite(n) ? n : 3));
-    } catch { return 3; }
-  })(),
-  tabPreviewRatioH: (() => {
-    try {
-      const saved = localStorage.getItem('noted-terminal-tab-preview-ratio-h');
-      const n = saved ? parseFloat(saved) : 2;
-      return Math.max(1, Math.min(32, Number.isFinite(n) ? n : 2));
-    } catch { return 2; }
-  })(),
-  setTabPreviewRatio: (w, h) => {
-    const wc = Math.max(1, Math.min(32, w));
-    const hc = Math.max(1, Math.min(32, h));
-    set({ tabPreviewRatioW: wc, tabPreviewRatioH: hc });
-    try {
-      localStorage.setItem('noted-terminal-tab-preview-ratio-w', String(wc));
-      localStorage.setItem('noted-terminal-tab-preview-ratio-h', String(hc));
-    } catch {}
-  },
-
   // Notes Editor — единые настройки для всех мест где рендерится tab.notes
   // (inline в InfoPanel, slide-out, CMD+hover preview). Persistence:
   // localStorage для синхронного boot read, app:setState mirror в SQLite чтобы
@@ -2202,6 +2165,26 @@ export const useUIStore = create<UIStore>((set, get) => ({
       const { ipcRenderer } = window.require('electron');
       ipcRenderer.invoke('app:setState', { key: 'notesEditorPaddingY', value: clamped }).catch(() => {});
     } catch {}
+  },
+  notesEditorShowLineNumbers: (() => {
+    try {
+      const saved = localStorage.getItem('noted-terminal-notes-editor-line-numbers');
+      return saved === null ? true : saved === 'true';
+    } catch { return true; }
+  })(),
+  setNotesEditorShowLineNumbers: (on) => {
+    set({ notesEditorShowLineNumbers: on });
+    try { localStorage.setItem('noted-terminal-notes-editor-line-numbers', String(on)); } catch {}
+  },
+  notesPreviewShowLineNumbers: (() => {
+    try {
+      const saved = localStorage.getItem('noted-terminal-notes-preview-line-numbers');
+      return saved === null ? true : saved === 'true';
+    } catch { return true; }
+  })(),
+  setNotesPreviewShowLineNumbers: (on) => {
+    set({ notesPreviewShowLineNumbers: on });
+    try { localStorage.setItem('noted-terminal-notes-preview-line-numbers', String(on)); } catch {}
   },
 
   // API Settings Modal
