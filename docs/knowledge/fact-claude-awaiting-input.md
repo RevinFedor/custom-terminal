@@ -67,14 +67,30 @@ PreToolUse(AskUserQuestion)  ──►  [человек думает, минут
 - **`TabBar.tsx`**: `awaitingMap` (как `claudeBusyMap`), проп `isAwaitingInput` в `TabItem`, оверлей `.tab-awaiting-input` (zIndex:1, поверх busy-shimmer'а zIndex:0, под текстом z:5–6). Рендерится в `isVerticalMode`-ветке — там же где busy-shimmer.
 - **`App.tsx`**: `awaitingTabs` Map, per-project `hasAwaitingTab`, проп `isProjectAwaiting` в `ProjectTabItem` → оверлей `.tab-awaiting-input` на всю кнопку проект-таба (zIndex:5, под z-10 текстом).
 
-### 5. CSS `.tab-awaiting-input` (globals.css)
+### 5. CSS `.tab-awaiting-input` (globals.css) — бегущая рамка, НЕ заливка
+Финальная форма — тонкая (1.2px) рамка с ярким сегментом, бегущим по периметру таба, поверх еле заметного постоянного кольца. Не заливка фона.
 ```css
-@keyframes tab-awaiting-pulse {
-  0%,100% { background-color: rgba(147, 51, 234, 0.16); }
-  50%     { background-color: rgba(147, 51, 234, 0.42); }
+@property --awaiting-angle { syntax:'<angle>'; initial-value:0deg; inherits:false; }
+@keyframes tab-awaiting-spin { to { --awaiting-angle: 360deg; } }
+.tab-awaiting-input {
+  padding: 1.2px;                                  /* толщина рамки */
+  background:
+    conic-gradient(from var(--awaiting-angle),     /* яркий сегмент с хвостом */
+      rgba(168,85,247,0) 240deg, rgba(168,85,247,.85) 312deg,
+      rgba(216,180,254,1) 348deg, rgba(168,85,247,0) 360deg),
+    rgba(147,51,234,.22);                          /* постоянное кольцо */
+  mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  mask-composite: exclude;                         /* вырез центра → только кольцо */
+  animation: tab-awaiting-spin 1.6s linear infinite;
 }
 ```
-Меняет `background-color` напрямую (не opacity) — codec-friendly, детектируется AI на видео (CLAUDE.md::AI-Optimized UI). Translucent peak 0.42 → текст таба читаем. 1400ms (чуть быстрее busy-pulse 1800ms — «зовёт внимание»).
+- `@property --awaiting-angle` обязателен для **плавной** интерполяции угла — без него `conic-gradient` в keyframe прыгает рывками (Electron 28 = Chromium 120, поддержка есть).
+- `padding:1.2px` + `mask-composite:exclude` (content-box XOR border-box) оставляет только кольцо толщиной padding по `border-radius` элемента (`box-sizing:border-box` от Tailwind preflight). `border-radius` наследуется от inline-стиля оверлея (`tabGeo.borderRadius` в TabBar, `rounded-sm` в App project-tab).
+- Сигнал несёт **движущийся сегмент** (высокая дельта пикселей по периметру → codec/AI-detectable, CLAUDE.md::AI-Optimized UI), фон НЕ анимируется.
+
+**Что пробовали и отвергли:** первая версия = пульсация `background-color` всего таба (`tab-awaiting-pulse`, peak 0.42). Юзер отверг — *«мигает весь бэкграунд, а я хочу только рамку в 1.2px чтобы она вокруг ходила»*: заливка слепила и конкурировала с текстом таба за внимание (тот же класс что `methodology/переносимый-дизайн.md::Лоадер = локализованный элемент`). Переносимый принцип — `methodology/переносимый-дизайн.md::«Нужен твой ответ» ≠ «AI занят»`.
+
+**Подавление busy-shimmer во время awaiting.** Пока висит вопрос, таб всё ещё `busy` (turn не закончен), поэтому под рамкой иначе пульсировал бы штатный thinking-shimmer фона. Чтобы осталась «только рамка», busy-фон гасится: `{verticalIsAiBusy && !verticalIsAwaiting && (...)}` в TabBar. Process-bar liveness (PTY-жив) остаётся. Логика: вопрос = Claude НЕ думает, а ждёт юзера, поэтому «думающий» фон неуместен.
 
 ## Инвариант awaiting ⊆ busy — почему не трогаем 12 busy:false-сайтов
 
