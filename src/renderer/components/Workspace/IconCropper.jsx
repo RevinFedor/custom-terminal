@@ -10,6 +10,7 @@ function IconCropper({ imageSrc, onCrop, onCancel }) {
   const imgRef = useRef(null)
   const dragRef = useRef({ active: false, x: 0, y: 0, ox: 0, oy: 0 })
   const replaceInputRef = useRef(null)
+  const mouseDownOnOverlay = useRef(false)
 
   const [currentSrc, setCurrentSrc] = useState(imageSrc)
   const [zoom, setZoom] = useState(1)
@@ -142,7 +143,11 @@ function IconCropper({ imageSrc, onCrop, onCancel }) {
   }
 
   return (
-    <div className="icon-cropper-overlay" onClick={onCancel}>
+    <div
+      className="icon-cropper-overlay"
+      onMouseDown={(e) => { mouseDownOnOverlay.current = e.target === e.currentTarget }}
+      onClick={(e) => { if (e.target === e.currentTarget && mouseDownOnOverlay.current) onCancel() }}
+    >
       <div className="icon-cropper-modal" onClick={e => e.stopPropagation()}>
         <h3 className="icon-cropper-title">Crop Icon</h3>
 

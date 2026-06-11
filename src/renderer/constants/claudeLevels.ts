@@ -25,7 +25,7 @@ export const CLAUDE_ULTRACODE: ClaudeEffortLevel = 'ultracode';
 // 'none' is our own UI sentinel meaning "don't auto-inject /effort at all".
 // Stored in user prefs alongside real levels.
 export const CLAUDE_EFFORT_LEVELS_WITH_NONE = ['none', ...CLAUDE_EFFORT_LEVELS] as const;
-export type DefaultClaudeEffort = typeof CLAUDE_EFFORT_LEVELS_WITH_NONE[number];
+export type DefaultClaudeEffort = string;
 
 // Neutral default selected by click-toggle-off (clicking an already-active pill).
 // Used to be 'auto' before Claude removed it; now the lowest level acts as deselect.
@@ -48,6 +48,30 @@ export const CLAUDE_EFFORT_LABELS: Record<ClaudeEffortLevel, string> = {
 export const DEEPSEEK_EFFORT_LEVELS = ['off', 'low', 'medium', 'high'] as const;
 export type DeepSeekEffortLevel = typeof DEEPSEEK_EFFORT_LEVELS[number];
 
+export interface ClaudeCodeModelOption {
+  id: string;
+  label: string;
+  cmd?: boolean;
+}
+
+export interface ClaudeCodeSettings {
+  models: ClaudeCodeModelOption[];
+  efforts: string[];
+}
+
 // Claude model name list — same memoization concern, ships from Anthropic.
-export const CLAUDE_MODELS = ['default', 'sonnet', 'opus', 'haiku'] as const;
+export const DEFAULT_CLAUDE_CODE_MODELS: ClaudeCodeModelOption[] = [
+  { id: 'default', label: 'default', cmd: true },
+  { id: 'sonnet', label: 'sonnet', cmd: true },
+  { id: 'opus', label: 'opus', cmd: true },
+  { id: 'haiku', label: 'haiku', cmd: true },
+  { id: 'claude-fable-5[1m]', label: 'fable', cmd: true },
+];
+
+export const DEFAULT_CLAUDE_CODE_SETTINGS: ClaudeCodeSettings = {
+  models: DEFAULT_CLAUDE_CODE_MODELS,
+  efforts: [...CLAUDE_EFFORT_LEVELS],
+};
+
+export const CLAUDE_MODELS = DEFAULT_CLAUDE_CODE_MODELS.map((m) => m.id);
 export type ClaudeModel = typeof CLAUDE_MODELS[number];

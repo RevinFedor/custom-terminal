@@ -4,8 +4,10 @@ import { usePromptsStore, AIPrompt, AIModel, ThinkingLevel } from '../../store/u
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useMirrorStatusStore } from '../../store/useMirrorStatusStore';
 import Tooltip from './Tooltip';
+import ProjectIconsSettings from './ProjectIconsSettings';
 import { HexColorPicker } from 'react-colorful';
 import { Trash2, Plus } from 'lucide-react';
+import { DEFAULT_CLAUDE_CODE_SETTINGS } from '../../constants/claudeLevels';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -34,7 +36,56 @@ interface Prompt {
   file_paths?: string[];
 }
 
-type SettingsTab = 'shortcuts' | 'fonts' | 'colors' | 'ai';
+type FlatPromptItem = { type: 'prompt'; origIdx: number; prompt: Prompt };
+type FlatGroupItem = { type: 'group'; group: PromptGroup };
+type FlatItem = FlatPromptItem | FlatGroupItem;
+type DragItem = { type: 'group'; id: number } | { type: 'prompt'; index: number };
+type PromptDragState = { prompts: Prompt[]; promptGroups: PromptGroup[] };
+type RectSnap = { left: number; right: number; top: number; bottom: number; height: number; midY: number };
+type DragFlatZone = { idx: number; item: DragItem; rect: RectSnap; header: RectSnap };
+type DragGroupZone = {
+  groupId: number;
+  header: RectSnap | null;
+  body: RectSnap;
+  rows: { promptIndex: number; rect: RectSnap }[];
+  empty: RectSnap | null;
+  rowLeft: number | null;
+  rowRight: number | null;
+};
+type DragGeometry = { list: RectSnap; flat: DragFlatZone[]; groups: DragGroupZone[] };
+type DragTarget = { key: string; label: string; reason: string; next: PromptDragState };
+type PointerDragSession = {
+  item: DragItem;
+  startX: number;
+  startY: number;
+  active: boolean;
+  base: PromptDragState;
+  geometry: DragGeometry | null;
+  lastKey: string | null;
+  click: () => void;
+  prevCursor: string;
+  prevUserSelect: string;
+};
+
+const snapRect = (el: Element): RectSnap => {
+  const r = el.getBoundingClientRect();
+  return { left: r.left, right: r.right, top: r.top, bottom: r.bottom, height: r.height, midY: r.top + r.height / 2 };
+};
+
+const fmtY = (r: RectSnap) => `${Math.round(r.top)}-${Math.round(r.midY)}-${Math.round(r.bottom)}`;
+
+type SettingsTab = 'shortcuts' | 'fonts' | 'colors' | 'ai' | 'projects';
+type AISubTab = 'text' | 'system';
+
+const VR_ACCENT = '#3b82f6';
+const VR_CARD = '#1e1e22';
+const VR_FIELD = '#141417';
+const VR_BORDER = '#2c2c30';
+const VR_TEXT = '#e8e8ea';
+const VR_DIM = '#8a8a8d';
+const VR_VIOLET = '#7c3aed';
+const VR_GREEN = '#22c55e';
+const VR_RED = '#ef4444';
 
 const DEFAULT_DOC_FILE_PATH = '/Users/fedor/Global-Templates/🧩 Code-Patterns/документация/docs-rules.prompt.md';
 
@@ -446,6 +497,18 @@ function normalizeHexValue(raw: string): string | null {
   return null;
 }
 
+function hexToRgbTriplet(hex: string, fallback = '255, 255, 255') {
+  const v = (hex || '').trim().replace(/^#/, '');
+  if (!/^[0-9a-fA-F]{6}$/.test(v)) return fallback;
+  const n = parseInt(v, 16);
+  return `${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}`;
+}
+
+function opacityPctToAlpha(pct: number, fallback = 55) {
+  const safe = Number.isFinite(pct) ? pct : fallback;
+  return Math.max(5, Math.min(100, Math.round(safe))) / 100;
+}
+
 // ClaudeMdMirrorBlock — секция «Зеркала CLAUDE.md» в табе «Системные».
 // Полностью read-only кроме toggle и кнопок «Создать сейчас» / «Перезаписать».
 // Статус живёт в useMirrorStatusStore, флаг — в useUIStore.
@@ -460,6 +523,12 @@ function ClaudeMdMirrorBlock({
   status: any;
   activeProjectId: string | null;
 }) {
+  const [skillsSyncBusy, setSkillsSyncBusy] = useState(false);
+  const [skillsSyncResult, setSkillsSyncResult] = useState<any>(null);
+  const [skillsStatus, setSkillsStatus] = useState<any>(null);
+  const [skillsStatusBusy, setSkillsStatusBusy] = useState(false);
+  const [skillsJustSynced, setSkillsJustSynced] = useState(false);
+  const skillsSyncedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const formatTime = (ms: number | null) => {
     if (!ms) return null;
     const d = new Date(ms);
@@ -474,12 +543,134 @@ function ClaudeMdMirrorBlock({
     return `${(n / (1024 * 1024)).toFixed(2)} МБ`;
   };
 
+  const loadSkillsStatus = async () => {
+    setSkillsStatusBusy(true);
+    try {
+      const result = await ipcRenderer.invoke('skills:get-sync-status');
+      setSkillsStatus(result);
+      return result;
+    } catch (e: any) {
+      const result = { success: false, error: e?.message || String(e) };
+      setSkillsStatus(result);
+      return result;
+    } finally {
+      setSkillsStatusBusy(false);
+    }
+  };
+
+  useEffect(() => {
+    void loadSkillsStatus();
+  }, []);
+
+  useEffect(() => {
+    const handler = (_event: any, payload: any) => {
+      if (payload?.status) setSkillsStatus(payload.status);
+      if (payload?.reason && payload.reason !== 'manual') setSkillsSyncResult(null);
+    };
+    ipcRenderer.on('skills:sync-status', handler);
+    return () => {
+      ipcRenderer.removeListener('skills:sync-status', handler);
+    };
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (skillsSyncedTimer.current) clearTimeout(skillsSyncedTimer.current);
+    };
+  }, []);
+
+  const clearSkillsSyncedTimer = () => {
+    if (skillsSyncedTimer.current) {
+      clearTimeout(skillsSyncedTimer.current);
+      skillsSyncedTimer.current = null;
+    }
+  };
+
+  const flashSkillsSynced = () => {
+    clearSkillsSyncedTimer();
+    setSkillsJustSynced(true);
+    skillsSyncedTimer.current = setTimeout(() => {
+      setSkillsJustSynced(false);
+      skillsSyncedTimer.current = null;
+    }, 1000);
+  };
+
+  const syncSkillsNow = async () => {
+    clearSkillsSyncedTimer();
+    setSkillsJustSynced(false);
+    setSkillsSyncBusy(true);
+    try {
+      const result = await ipcRenderer.invoke('skills:sync-claude-to-codex');
+      setSkillsSyncResult(result);
+      if (result?.status) setSkillsStatus(result.status);
+      else await loadSkillsStatus();
+      if (result?.success) flashSkillsSynced();
+      return result;
+    } catch (e: any) {
+      const result = { success: false, error: e?.message || String(e) };
+      setSkillsSyncResult(result);
+      return result;
+    } finally {
+      setSkillsSyncBusy(false);
+    }
+  };
+
   const requestCreateNow = async () => {
     if (!activeProjectId) return;
     try {
       await window.require('electron').ipcRenderer.invoke('mirror:create-now', { projectId: activeProjectId });
+      await syncSkillsNow();
     } catch {}
   };
+
+  const currentSkillsStatus = skillsSyncResult?.status || skillsStatus;
+  const codexOnlySkills: string[] = Array.isArray(currentSkillsStatus?.codexOnly) ? currentSkillsStatus.codexOnly : [];
+  const missingInCodexSkills: string[] = Array.isArray(currentSkillsStatus?.missingInCodex) ? currentSkillsStatus.missingInCodex : [];
+  const skillsHasWarning = codexOnlySkills.length > 0;
+  const skillsWatcher = currentSkillsStatus?.watcher;
+  const skillsAutoError = skillsWatcher?.lastAutoSyncError;
+  const skillsAutoLabel = skillsWatcher?.active
+    ? `авто ${skillsWatcher.lastAutoSyncAt ? formatTime(skillsWatcher.lastAutoSyncAt) : 'вкл'}`
+    : 'авто выкл';
+  const skillsButtonSynced = !skillsSyncBusy && skillsJustSynced;
+  const skillsIconColor = skillsSyncResult?.success === false || currentSkillsStatus?.success === false || skillsAutoError
+    ? '#ef4444'
+    : skillsHasWarning ? '#d97706'
+    : skillsSyncResult?.success ? '#22c55e'
+    : '#999';
+  const skillsIcon = skillsSyncResult?.success === false || currentSkillsStatus?.success === false || skillsAutoError
+    ? '✕'
+    : skillsHasWarning ? '⚠'
+    : skillsSyncResult?.success ? '✓'
+    : '↔';
+  const skillsStatusText = (() => {
+    if (skillsSyncResult?.success === false) {
+      return `Ошибка: ${skillsSyncResult.error || (skillsSyncResult.errors?.[0]?.error) || 'не удалось синхронизировать'}`;
+    }
+    if (currentSkillsStatus?.success === false) {
+      return `Ошибка статуса: ${currentSkillsStatus.error || 'не удалось прочитать skills'}`;
+    }
+    if (skillsAutoError) {
+      return `Ошибка авто-синхронизации: ${skillsAutoError}`;
+    }
+    if (skillsStatusBusy && !currentSkillsStatus) return 'Проверка статуса…';
+    if (skillsSyncResult?.success) {
+      const copied = `Скопировано: ${skillsSyncResult.copiedCount || 0}`;
+      return skillsHasWarning
+        ? `${copied}. В Codex есть отдельные skills: ${codexOnlySkills.join(', ')}`
+        : copied;
+    }
+    if (skillsHasWarning) {
+      return `Предупреждение: только в Codex: ${codexOnlySkills.join(', ')}. Синхронизация их не удаляет.`;
+    }
+    if (currentSkillsStatus) {
+      const base = `Claude: ${currentSkillsStatus.claudeSkills?.length || 0} · Codex: ${currentSkillsStatus.codexSkills?.length || 0} · ${skillsAutoLabel} · Codex-only нет`;
+      return missingInCodexSkills.length
+        ? `${base}. Будут добавлены: ${missingInCodexSkills.join(', ')}`
+        : base;
+    }
+    return 'Копирует пользовательские Claude skills в Codex, не трогая ~/.codex/skills/.system.';
+  })();
 
   return (
     <div style={{ padding: '14px', backgroundColor: '#222', border: '1px solid #333', borderRadius: '10px', marginBottom: '12px' }}>
@@ -572,6 +763,40 @@ function ClaudeMdMirrorBlock({
           </div>
         </>
       )}
+
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 8px', backgroundColor: '#1a1a1a', borderRadius: '6px', marginTop: activeProjectId && status ? '10px' : '0' }}>
+        <div style={{ minWidth: 0 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '6px', minWidth: 0 }}>
+            <span style={{ fontSize: '11px', color: skillsIconColor, flexShrink: 0 }}>
+              {skillsIcon}
+            </span>
+            <span style={{ fontSize: '12px', color: '#eaeaea', fontFamily: 'monospace' }}>~/.claude/skills → ~/.codex/skills</span>
+            {skillsHasWarning && (
+              <span style={{ fontSize: '10px', color: '#d97706', marginLeft: '4px' }}>Codex-only</span>
+            )}
+          </div>
+          <div style={{ fontSize: '10px', color: skillsSyncResult?.success === false || currentSkillsStatus?.success === false ? '#ef4444aa' : skillsHasWarning ? '#d97706aa' : '#666', marginTop: '3px', lineHeight: 1.35, wordBreak: 'break-word' }}>
+            {skillsStatusText}
+          </div>
+        </div>
+        <button
+          type="button"
+          disabled={skillsSyncBusy || skillsButtonSynced}
+          onClick={syncSkillsNow}
+          style={{
+            background: skillsSyncBusy || skillsButtonSynced ? 'rgba(218,119,86,0.12)' : '#2a2a2a',
+            border: `1px solid ${skillsSyncBusy || skillsButtonSynced ? 'rgba(218,119,86,0.45)' : '#393939'}`,
+            borderRadius: '4px',
+            color: skillsSyncBusy || skillsButtonSynced ? '#FF9466' : '#aaa',
+            fontSize: '10px',
+            cursor: skillsSyncBusy || skillsButtonSynced ? 'default' : 'pointer',
+            padding: '2px 7px',
+            flexShrink: 0,
+          }}
+        >
+          {skillsSyncBusy ? 'Синхронизация…' : skillsButtonSynced ? '✓ синхронизирована' : 'Синхронизировать'}
+        </button>
+      </div>
     </div>
   );
 }
@@ -782,10 +1007,9 @@ function SessionStatusesEditor() {
   );
 }
 
-// ProcessBarEditor — настройка полоски процесса (3px слева в табе, мигает пока PTY жив).
-// Юзер контролирует: enabled (мигание on/off), colorA (нижняя/статичная фаза),
-// colorB (верхняя фаза), durationMs (длительность цикла, 300..6000ms).
-// Live-превью полоски (статичная или с анимацией) показано над контролами.
+// ProcessBarEditor — настройка полоски процесса (3px слева/справа в табе).
+// Базовая полоса всегда статична; AI-busy поверх неё рисует бегущий shimmer.
+// Юзер контролирует базовый цвет, цвет/плотность блика, расстояние между бликами и сторону.
 function ProcessBarEditor() {
   const processBar = useUIStore((s) => s.processBar);
   const setProcessBar = useUIStore((s) => s.setProcessBar);
@@ -806,6 +1030,7 @@ function ProcessBarEditor() {
   }, [pickerOpen]);
 
   // Compact превью полоски — занимает 40px высоты, минимально.
+  const previewPeakAlpha = opacityPctToAlpha(processBar.shimmerOpacityPct);
   const previewBar = (
     <div style={{
       position: 'relative', width: '100%', height: '32px',
@@ -813,36 +1038,37 @@ function ProcessBarEditor() {
       borderRadius: '6px', overflow: 'hidden',
     }}>
       <div
-        className={processBar.enabled ? 'tab-process-bar-busy' : 'tab-process-bar-static'}
+        className="tab-process-bar-static"
         style={{
           position: 'absolute',
           [processBar.position === 'right' ? 'right' : 'left']: 0,
           top: 0, bottom: 0, width: '3px',
           overflow: 'hidden',
           ['--process-bar-color-a' as any]: processBar.colorA,
-          ['--process-bar-color-b' as any]: processBar.colorB,
-          ['--process-bar-duration' as any]: `${processBar.durationMs}ms`,
+          ['--process-bar-shimmer-rgb' as any]: hexToRgbTriplet(processBar.shimmerColor),
+          ['--process-bar-shimmer-spacing' as any]: `${processBar.shimmerSpacingPct}%`,
+          ['--process-bar-shimmer-alpha' as any]: previewPeakAlpha,
+          ['--process-bar-shimmer-edge-alpha' as any]: Math.max(0.01, previewPeakAlpha * 0.22),
         }}
       >
-        {/* Блик AI-busy крутится в превью постоянно — юзер видит как он
-            наслаивается на пульс цветом. В рантайме блик появляется только
-            когда AI стримит (isBusy). */}
+        {/* Блик AI-busy крутится в превью постоянно; в рантайме он появляется
+            только когда AI стримит/думает (isBusy). */}
         <div className="tab-process-bar-ai-shimmer-overlay" />
       </div>
       <div style={{
         position: 'absolute', left: 12, right: 12, top: '50%', transform: 'translateY(-50%)',
         fontSize: '11px', color: '#888', textAlign: 'center',
       }}>
-        {processBar.enabled ? `пульс ${(processBar.durationMs / 1000).toFixed(1)}s` : 'статика'} · {processBar.position === 'right' ? 'справа' : 'слева'} · блик AI
+        полоса · {processBar.position === 'right' ? 'справа' : 'слева'} · блик {processBar.shimmerSpacingPct}% / {processBar.shimmerOpacityPct}%
       </div>
     </div>
   );
 
   const colorChip = (which: 'a' | 'b') => {
-    const current = which === 'a' ? processBar.colorA : processBar.colorB;
+    const current = which === 'a' ? processBar.colorA : processBar.shimmerColor;
     const draft = which === 'a' ? hexDraftA : hexDraftB;
     const setDraft = which === 'a' ? setHexDraftA : setHexDraftB;
-    const disabled = which === 'b' && !processBar.enabled;
+    const label = which === 'a' ? 'Полоса' : 'Блик';
 
     return (
       <div style={{
@@ -850,32 +1076,30 @@ function ProcessBarEditor() {
         display: 'inline-flex', alignItems: 'center', gap: '6px',
         padding: '4px 8px',
         backgroundColor: '#1e1e1e', border: '1px solid #333', borderRadius: '8px',
-        opacity: disabled ? 0.4 : 1,
         flexShrink: 0,
       }}>
         <button
-          onClick={() => { if (!disabled) setPickerOpen(pickerOpen === which ? null : which); }}
+          onClick={() => { setPickerOpen(pickerOpen === which ? null : which); }}
           style={{
             width: 16, height: 16, borderRadius: '50%',
             backgroundColor: current,
             border: '2px solid rgba(255,255,255,0.15)',
-            cursor: disabled ? 'not-allowed' : 'pointer',
+            cursor: 'pointer',
             flexShrink: 0, padding: 0,
           }}
           title="Палитра"
         />
         <span style={{ fontSize: '11px', color: '#888' }}>
-          {which === 'a' ? 'A' : 'B'}
+          {label}
         </span>
         <input
           type="text"
-          disabled={disabled}
           value={(draft ?? current).replace(/^#/, '')}
           onChange={(e) => {
             const next = `#${e.target.value}`;
             setDraft(next);
             const norm = normalizeHexValue(next);
-            if (norm) setProcessBar(which === 'a' ? { colorA: norm } : { colorB: norm });
+            if (norm) setProcessBar(which === 'a' ? { colorA: norm } : { shimmerColor: norm });
           }}
           onBlur={() => setDraft(null)}
           maxLength={7}
@@ -900,7 +1124,7 @@ function ProcessBarEditor() {
           >
             <HexColorPicker
               color={current}
-              onChange={(c) => setProcessBar(which === 'a' ? { colorA: c.toUpperCase() } : { colorB: c.toUpperCase() })}
+              onChange={(c) => setProcessBar(which === 'a' ? { colorA: c.toUpperCase() } : { shimmerColor: c.toUpperCase() })}
             />
           </div>
         )}
@@ -919,31 +1143,6 @@ function ProcessBarEditor() {
         display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '8px',
         marginTop: '10px',
       }}>
-        {/* Enable toggle */}
-        <label
-          className="flex items-center gap-2 cursor-pointer select-none"
-          style={{
-            padding: '4px 8px',
-            backgroundColor: '#1e1e1e', border: '1px solid #333', borderRadius: '8px',
-            flexShrink: 0,
-          }}
-        >
-          <div
-            className="relative w-7 h-3.5 rounded-full transition-colors shrink-0"
-            style={{ backgroundColor: processBar.enabled ? 'rgba(74, 222, 128, 0.4)' : 'rgba(255,255,255,0.1)' }}
-            onClick={() => setProcessBar({ enabled: !processBar.enabled })}
-          >
-            <div
-              className="absolute top-0.5 w-2.5 h-2.5 rounded-full transition-all"
-              style={{
-                left: processBar.enabled ? '15px' : '2px',
-                backgroundColor: processBar.enabled ? '#4ade80' : '#666',
-              }}
-            />
-          </div>
-          <span style={{ fontSize: '11px', color: '#ccc' }}>Пульс</span>
-        </label>
-
         {/* Position toggle */}
         <div style={{ display: 'inline-flex', backgroundColor: '#1a1a1a', borderRadius: '6px', border: '1px solid #333', flexShrink: 0 }}>
           {(['left', 'right'] as const).map((p) => (
@@ -970,31 +1169,54 @@ function ProcessBarEditor() {
         {colorChip('a')}
         {colorChip('b')}
 
-        {/* Duration — компактный inline-chip */}
+        {/* Shimmer spacing — компактный inline-chip */}
         <div style={{
           display: 'inline-flex', alignItems: 'center', gap: '6px',
           padding: '4px 8px',
           backgroundColor: '#1e1e1e', border: '1px solid #333', borderRadius: '8px',
-          opacity: processBar.enabled ? 1 : 0.4,
           flexShrink: 0,
         }}>
-          <span style={{ fontSize: '11px', color: '#888' }}>Цикл</span>
+          <span style={{ fontSize: '11px', color: '#888' }}>Расстояние</span>
           <input
             type="number"
-            disabled={!processBar.enabled}
-            min={300}
-            max={6000}
-            step={100}
-            value={processBar.durationMs}
-            onChange={(e) => setProcessBar({ durationMs: Number(e.target.value) })}
+            min={20}
+            max={200}
+            step={5}
+            value={processBar.shimmerSpacingPct}
+            onChange={(e) => setProcessBar({ shimmerSpacingPct: Number(e.target.value) })}
             style={{
-              width: '54px', padding: '3px 6px',
+              width: '48px', padding: '3px 6px',
               backgroundColor: '#1a1a1a', border: '1px solid #333', borderRadius: '6px',
               color: '#ccc', fontSize: '11px', fontFamily: 'monospace', outline: 'none',
               textAlign: 'right',
             }}
           />
-          <span style={{ fontSize: '10px', color: '#555' }}>ms</span>
+          <span style={{ fontSize: '10px', color: '#555' }}>%</span>
+        </div>
+
+        {/* Shimmer opacity — peak alpha, edges are derived softer in CSS vars */}
+        <div style={{
+          display: 'inline-flex', alignItems: 'center', gap: '6px',
+          padding: '4px 8px',
+          backgroundColor: '#1e1e1e', border: '1px solid #333', borderRadius: '8px',
+          flexShrink: 0,
+        }}>
+          <span style={{ fontSize: '11px', color: '#888' }}>Плотность</span>
+          <input
+            type="number"
+            min={5}
+            max={100}
+            step={5}
+            value={processBar.shimmerOpacityPct}
+            onChange={(e) => setProcessBar({ shimmerOpacityPct: Number(e.target.value) })}
+            style={{
+              width: '44px', padding: '3px 6px',
+              backgroundColor: '#1a1a1a', border: '1px solid #333', borderRadius: '6px',
+              color: '#ccc', fontSize: '11px', fontFamily: 'monospace', outline: 'none',
+              textAlign: 'right',
+            }}
+          />
+          <span style={{ fontSize: '10px', color: '#555' }}>%</span>
         </div>
       </div>
     </div>
@@ -1009,6 +1231,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const [activeTab, setActiveTab] = useState<SettingsTab>(() => {
     return hasOpenedBefore ? lastActiveTab : 'ai';
   });
+  const [aiSubTab, setAiSubTab] = useState<AISubTab>('text');
 
   // Programmatic open with requested tab (e.g. ПКМ на SemanticIndexButton).
   // Срабатывает на переходе isOpen=false→true когда initialTab задан.
@@ -1017,7 +1240,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const prevIsOpenRef = useRef(isOpen);
   useEffect(() => {
     if (isOpen && !prevIsOpenRef.current && initialTab) {
-      const valid: SettingsTab[] = ['shortcuts', 'fonts', 'colors', 'ai'];
+      const valid: SettingsTab[] = ['shortcuts', 'fonts', 'colors', 'ai', 'projects'];
       if (valid.includes(initialTab as SettingsTab)) {
         setActiveTab(initialTab as SettingsTab);
       }
@@ -1072,6 +1295,8 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const tabPreviewMaxHeight = useUIStore((s) => s.tabPreviewMaxHeight);
   const setTabPreviewMaxHeight = useUIStore((s) => s.setTabPreviewMaxHeight);
   const semanticIndexParallelism = useUIStore((s) => s.semanticIndexParallelism);
+  const claudeCodeSettings = useUIStore((s) => s.claudeCodeSettings);
+  const setClaudeCodeSettings = useUIStore((s) => s.setClaudeCodeSettings);
   const claudeMdMirrorEnabled = useUIStore((s) => s.claudeMdMirrorEnabled);
   const setClaudeMdMirrorEnabled = useUIStore((s) => s.setClaudeMdMirrorEnabled);
   const activeProjectId = useWorkspaceStore((s) => s.activeProjectId);
@@ -1100,13 +1325,11 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const [localGroupDescription, setLocalGroupDescription] = useState('');
   const [savedGroupFlash, setSavedGroupFlash] = useState<'name' | 'description' | null>(null);
   const savedGroupTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const [dragOverGroupId, setDragOverGroupId] = useState<number | 'ungrouped' | null>(null);
-  const dragOverGroupRef = useRef<number | 'ungrouped' | null>(null);
-  const [draggingFlatIdx, setDraggingFlatIdx] = useState<number | null>(null);
-  const [flatDropTarget, setFlatDropTarget] = useState<number | null>(null);
-  const [flatDragReady, setFlatDragReady] = useState(false);
-  const floatingFlatCloneRef = useRef<HTMLDivElement | null>(null);
-  const dragFlatItemHeight = useRef(0);
+  const [draggingItem, setDraggingItem] = useState<DragItem | null>(null);
+  const textListRef = useRef<HTMLDivElement>(null);
+  const pointerDragRef = useRef<PointerDragSession | null>(null);
+  const dragVisualStateRef = useRef<PromptDragState>({ prompts: [], promptGroups: [] });
+  const latestPromptStateRef = useRef<PromptDragState>({ prompts: [], promptGroups: [] });
 
   // Editing states
   const [editingClaude, setEditingClaude] = useState(false);
@@ -1121,12 +1344,10 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const [insertionFileInputs, setInsertionFileInputs] = useState<{ value: string; valid: boolean | null }[]>([]);
   const [savedInsertionFlash, setSavedInsertionFlash] = useState<'title' | 'content' | null>(null);
   const savedInsertionTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const [draggingTextIndex, setDraggingTextIndex] = useState<number | null>(null);
-  const [textDropTarget, setTextDropTarget] = useState<number | null>(null);
-  const [dragTransitionsReady, setDragTransitionsReady] = useState(false);
-  const textListRef = useRef<HTMLDivElement>(null);
-  const floatingCloneRef = useRef<HTMLDivElement | null>(null);
-  const dragCardHeight = useRef(0);
+  dragVisualStateRef.current = { prompts, promptGroups };
+  if (!pointerDragRef.current?.active) {
+    latestPromptStateRef.current = { prompts, promptGroups };
+  }
 
   // Local copies of AI prompt fields for editing
   const [localPromptContent, setLocalPromptContent] = useState('');
@@ -1153,16 +1374,6 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
       lastActiveTab = activeTab;
     }
   }, [activeTab, isOpen]);
-
-  // Enable drag transitions after first render (so initial gap replaces hidden card instantly)
-  useEffect(() => {
-    if (draggingTextIndex !== null) {
-      const id = requestAnimationFrame(() => setDragTransitionsReady(true));
-      return () => cancelAnimationFrame(id);
-    } else {
-      setDragTransitionsReady(false);
-    }
-  }, [draggingTextIndex]);
 
   // Load all data on open
   useEffect(() => {
@@ -1321,392 +1532,359 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
     setEditingGroupId(null);
   };
 
+  const promptStateWithLocalDrafts = (): PromptDragState => {
+    const nextPrompts = prompts.map(p => ({ ...p }));
+    const nextGroups = promptGroups.map(g => ({ ...g }));
+    if (editingInsertionIndex !== null && nextPrompts[editingInsertionIndex]) {
+      nextPrompts[editingInsertionIndex] = {
+        ...nextPrompts[editingInsertionIndex],
+        title: localInsertionTitle,
+        content: localInsertionContent,
+        file_paths: localInsertionFilePaths,
+      };
+    }
+    if (editingGroupId !== null) {
+      const gi = nextGroups.findIndex(g => g.id === editingGroupId);
+      if (gi >= 0) {
+        nextGroups[gi] = { ...nextGroups[gi], name: localGroupName, description: localGroupDescription };
+      }
+    }
+    return { prompts: nextPrompts, promptGroups: nextGroups };
+  };
+
+  const promptPos = (p: Prompt, fallback: number) => Number.isFinite(Number(p.position)) ? Number(p.position) : fallback;
+
   // Build flat items: groups and ungrouped prompts interleaved by position
-  const buildFlatItems = () => {
-    const items: Array<{ type: 'group'; group: PromptGroup } | { type: 'prompt'; origIdx: number; prompt: Prompt }> = [];
-    promptGroups.forEach(g => items.push({ type: 'group', group: g }));
-    prompts.forEach((p, i) => { if (!p.group_id) items.push({ type: 'prompt', origIdx: i, prompt: p }); });
-    items.sort((a, b) => {
-      const posA = a.type === 'group' ? a.group.position : (a.prompt.position ?? 0);
-      const posB = b.type === 'group' ? b.group.position : (b.prompt.position ?? 0);
+  const flatItemsFor = (state: PromptDragState): FlatItem[] => {
+    const items: FlatItem[] = [];
+    state.promptGroups.forEach(g => items.push({ type: 'group', group: g }));
+    state.prompts.forEach((p, i) => { if (!p.group_id) items.push({ type: 'prompt', origIdx: i, prompt: p }); });
+    return items.sort((a, b) => {
+      const posA = a.type === 'group' ? a.group.position : promptPos(a.prompt, a.origIdx);
+      const posB = b.type === 'group' ? b.group.position : promptPos(b.prompt, b.origIdx);
       return posA - posB;
     });
-    return items;
   };
 
-  // Save flat order: assign sequential positions to all flat items
-  const saveFlatOrder = (newFlatItems: ReturnType<typeof buildFlatItems>) => {
-    const newGroups = [...promptGroups];
-    const newPrompts = [...prompts];
-    newFlatItems.forEach((item, pos) => {
+  const buildFlatItems = () => flatItemsFor({ prompts, promptGroups });
+
+  const sameDragItem = (a: DragItem, b: DragItem) =>
+    a.type === b.type && (a.type === 'group' ? a.id === (b as { type: 'group'; id: number }).id : a.index === (b as { type: 'prompt'; index: number }).index);
+
+  const flatItemToDrag = (item: FlatItem): DragItem =>
+    item.type === 'group' ? { type: 'group', id: item.group.id } : { type: 'prompt', index: item.origIdx };
+
+  const reindexFlatState = (state: PromptDragState, flat: FlatItem[]): PromptDragState => {
+    const nextGroups = state.promptGroups.map(g => ({ ...g }));
+    const nextPrompts = state.prompts.map(p => ({ ...p }));
+    flat.forEach((item, pos) => {
       if (item.type === 'group') {
-        const gIdx = newGroups.findIndex(g => g.id === item.group.id);
-        if (gIdx >= 0) newGroups[gIdx] = { ...newGroups[gIdx], position: pos };
+        const gi = nextGroups.findIndex(g => g.id === item.group.id);
+        if (gi >= 0) nextGroups[gi] = { ...nextGroups[gi], position: pos };
       } else {
-        newPrompts[item.origIdx] = { ...newPrompts[item.origIdx], position: pos };
+        nextPrompts[item.origIdx] = { ...nextPrompts[item.origIdx], group_id: null, position: pos };
       }
     });
-    setPromptGroups(newGroups);
-    setPrompts(newPrompts);
-    ipcRenderer.invoke('prompt-groups:save', newGroups);
-    savePromptsImmediate(newPrompts);
+    return { prompts: nextPrompts, promptGroups: nextGroups };
   };
 
-  // Unified flat DnD for groups + ungrouped prompts
-  const handleFlatItemDrag = (flatIdx: number) => (e: React.PointerEvent) => {
+  const moveFlatItem = (state: PromptDragState, drag: DragItem, targetIdx: number): PromptDragState => {
+    const flat = flatItemsFor(state);
+    const existingIdx = flat.findIndex(item => sameDragItem(flatItemToDrag(item), drag));
+    const moving: FlatItem | null = drag.type === 'group'
+      ? (() => {
+          const group = state.promptGroups.find(g => g.id === drag.id);
+          return group ? { type: 'group' as const, group } : null;
+        })()
+      : (() => {
+          const prompt = state.prompts[drag.index];
+          return prompt ? { type: 'prompt' as const, origIdx: drag.index, prompt } : null;
+        })();
+    if (!moving) return state;
+    const without = flat.filter(item => !sameDragItem(flatItemToDrag(item), drag));
+    const insertAt = Math.max(0, Math.min(existingIdx >= 0 && existingIdx < targetIdx ? targetIdx - 1 : targetIdx, without.length));
+    return reindexFlatState(state, [...without.slice(0, insertAt), moving, ...without.slice(insertAt)]);
+  };
+
+  const movePromptIntoGroupAt = (state: PromptDragState, drag: DragItem, groupId: number, targetIdxRaw: number): PromptDragState => {
+    if (drag.type !== 'prompt' || !state.promptGroups.some(g => g.id === groupId)) return state;
+    const moving = state.prompts[drag.index];
+    if (!moving) return state;
+    const groupPrompts = state.prompts
+      .map((p, i) => ({ prompt: p, index: i }))
+      .filter(item => item.prompt.group_id === groupId && item.index !== drag.index)
+      .sort((a, b) => promptPos(a.prompt, a.index) - promptPos(b.prompt, b.index));
+    const targetIdx = Math.max(0, Math.min(targetIdxRaw, groupPrompts.length));
+    const ordered = [
+      ...groupPrompts.slice(0, targetIdx),
+      { prompt: moving, index: drag.index },
+      ...groupPrompts.slice(targetIdx),
+    ];
+    const promptsNext = state.prompts.map((p, i) => {
+      const pos = ordered.findIndex(item => item.index === i);
+      return pos >= 0 ? { ...p, group_id: groupId, position: pos } : p;
+    });
+    const next = { prompts: promptsNext, promptGroups: state.promptGroups };
+    return reindexFlatState(next, flatItemsFor(next));
+  };
+
+  const applyPromptDragState = (state: PromptDragState, save: boolean) => {
+    dragVisualStateRef.current = state;
+    if (save) latestPromptStateRef.current = state;
+    setPrompts(state.prompts);
+    setPromptGroups(state.promptGroups);
+    if (save) {
+      savePromptsImmediate(state.prompts);
+      ipcRenderer.invoke('prompt-groups:save', state.promptGroups);
+    }
+  };
+
+  const autoScrollDragList = (clientY: number) => {
+    const el = textListRef.current;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    const edge = 34;
+    if (clientY < r.top + edge) el.scrollTop -= Math.ceil((r.top + edge - clientY) / 3) + 6;
+    else if (clientY > r.bottom - edge) el.scrollTop += Math.ceil((clientY - (r.bottom - edge)) / 3) + 6;
+  };
+
+  const captureDragGeometry = (base: PromptDragState): DragGeometry | null => {
+    const list = textListRef.current;
+    if (!list) return null;
+    const flat = flatItemsFor(base);
+    const flatZones: DragFlatZone[] = [];
+    for (const c of Array.from(list.querySelectorAll<HTMLElement>('[data-dnd-flat-container]'))) {
+      const type = c.dataset.dndType as DragItem['type'] | undefined;
+      const idRaw = c.dataset.dndId;
+      if (!type || idRaw == null) continue;
+      const item: DragItem = type === 'group' ? { type, id: Number(idRaw) } : { type, index: Number(idRaw) };
+      const idx = flat.findIndex(row => sameDragItem(flatItemToDrag(row), item));
+      if (idx < 0) continue;
+      const headerEl = type === 'group' ? c.querySelector<HTMLElement>('[data-dnd-kind="flat"]') || c : c;
+      flatZones.push({ idx, item, rect: snapRect(c), header: snapRect(headerEl) });
+    }
+
+    const groupZones: DragGroupZone[] = [];
+    for (const body of Array.from(list.querySelectorAll<HTMLElement>('[data-dnd-kind="group-body"]'))) {
+      const groupId = Number(body.dataset.groupId);
+      if (!Number.isFinite(groupId)) continue;
+      const container = body.closest<HTMLElement>('[data-dnd-flat-container]');
+      const header = container?.querySelector<HTMLElement>('[data-dnd-kind="flat"]') || null;
+      const rows = Array.from(body.querySelectorAll<HTMLElement>('[data-dnd-kind="group-prompt"]'))
+        .map(row => ({ promptIndex: Number(row.dataset.promptIndex), rect: snapRect(row) }))
+        .filter(row => Number.isFinite(row.promptIndex));
+      const empty = body.querySelector<HTMLElement>('[data-dnd-kind="group-empty"]');
+      groupZones.push({
+        groupId,
+        header: header ? snapRect(header) : null,
+        body: snapRect(body),
+        rows,
+        empty: empty ? snapRect(empty) : null,
+        rowLeft: rows.length ? Math.min(...rows.map(row => row.rect.left)) : null,
+        rowRight: rows.length ? Math.max(...rows.map(row => row.rect.right)) : null,
+      });
+    }
+
+    flatZones.sort((a, b) => a.idx - b.idx);
+    return { list: snapRect(list), flat: flatZones, groups: groupZones };
+  };
+
+  const summarizeDragGeometry = (g: DragGeometry | null) => {
+    if (!g) return 'geom=null';
+    const flat = g.flat.map(z => `${z.idx}:${z.item.type[0]}:${z.item.type === 'group' ? z.item.id : z.item.index}@${fmtY(z.rect)} h@${fmtY(z.header)}`).join(' ');
+    const groups = g.groups.map(z => `g:${z.groupId} rows=${z.rows.length} body@${fmtY(z.body)}`).join(' ');
+    return `flat=[${flat}] groups=[${groups}]`;
+  };
+
+  const resolveDragTarget = (item: DragItem, clientX: number, clientY: number): DragTarget | null => {
+    const session = pointerDragRef.current;
+    const base = session?.base || dragVisualStateRef.current;
+    let geometry = session?.geometry || null;
+    if (!geometry) {
+      geometry = captureDragGeometry(base);
+      if (session) session.geometry = geometry;
+    }
+    if (!geometry) return null;
+    const listRect = geometry.list;
+    if (clientX < listRect.left - 28 || clientX > listRect.right + 28 || clientY < listRect.top - 80 || clientY > listRect.bottom + 80) {
+      return null;
+    }
+
+    if (item.type === 'prompt') {
+      for (const group of geometry.groups) {
+        const flatGroup = geometry.flat.find(z => z.item.type === 'group' && z.item.id === group.groupId);
+        if (flatGroup && group.header && clientX >= group.header.left && clientX <= group.header.right && clientY >= group.header.top && clientY <= group.header.bottom) {
+          if (clientY >= group.header.midY) {
+            return {
+              key: `group:${group.groupId}:0`,
+              label: `group:${group.groupId}:0`,
+              reason: `group-header-lower y=${Math.round(clientY)} mid=${Math.round(group.header.midY)}`,
+              next: movePromptIntoGroupAt(base, item, group.groupId, 0),
+            };
+          }
+          return {
+            key: `flat:${flatGroup.idx}`,
+            label: `flat:${flatGroup.idx}`,
+            reason: `group-header-upper y=${Math.round(clientY)} mid=${Math.round(group.header.midY)}`,
+            next: moveFlatItem(base, item, flatGroup.idx),
+          };
+        }
+
+        if (group.rows.length === 0) {
+          const er = group.empty;
+          if (er && clientY >= er.top && clientY <= er.bottom && clientX >= er.left - 18 && clientX <= er.right + 18) {
+            return {
+              key: `group:${group.groupId}:0`,
+              label: `group:${group.groupId}:0`,
+              reason: 'group-empty',
+              next: movePromptIntoGroupAt(base, item, group.groupId, 0),
+            };
+          }
+          continue;
+        }
+
+        const first = group.rows[0].rect;
+        const last = group.rows[group.rows.length - 1].rect;
+        const rowLeft = group.rowLeft ?? group.body.left;
+        const rowRight = group.rowRight ?? group.body.right;
+        if (clientY < Math.min(group.body.top, first.top - 8) || clientY > last.bottom) continue;
+        if (clientX < rowLeft - 12 || clientX > rowRight + 18) continue;
+
+        let targetIdx = 0;
+        for (const row of group.rows) {
+          if (row.promptIndex === item.index) continue;
+          if (clientY < row.rect.midY) break;
+          targetIdx += 1;
+        }
+        return {
+          key: `group:${group.groupId}:${targetIdx}`,
+          label: `group:${group.groupId}:${targetIdx}`,
+          reason: `group-rows y=${Math.round(clientY)} rows=${group.rows.map(r => `${r.promptIndex}@${Math.round(r.rect.midY)}`).join(',')}`,
+          next: movePromptIntoGroupAt(base, item, group.groupId, targetIdx),
+        };
+      }
+    }
+
+    let targetIdx = geometry.flat.length;
+    for (const row of geometry.flat) {
+      if (clientY < row.rect.midY) { targetIdx = row.idx; break; }
+      targetIdx = row.idx + 1;
+    }
+    return {
+      key: `flat:${targetIdx}`,
+      label: `flat:${targetIdx}`,
+      reason: `flat-block y=${Math.round(clientY)} mids=${geometry.flat.map(z => `${z.idx}:${z.item.type[0]}:${Math.round(z.rect.midY)}`).join(',')}`,
+      next: moveFlatItem(base, item, targetIdx),
+    };
+  };
+
+  const previewPointerDrag = (item: DragItem, clientX: number, clientY: number) => {
+    const session = pointerDragRef.current;
+    if (!session || !session.active) return;
+    const target = resolveDragTarget(item, clientX, clientY);
+    if (!target || target.key === session.lastKey) return;
+    session.lastKey = target.key;
+    applyPromptDragState(target.next, false);
+    console.warn('[PromptDnD] preview', item, '->', target.label, 'via', target.reason, 'at', Math.round(clientX), Math.round(clientY));
+  };
+
+  const startPointerDrag = (item: DragItem, click: () => void) => (e: React.PointerEvent<HTMLElement>) => {
+    if (e.button !== 0) return;
+    const target = e.target as HTMLElement | null;
+    if (target?.closest('[data-no-card-drag],button,input,textarea,select,a')) return;
     e.preventDefault();
     e.stopPropagation();
 
+    const base = promptStateWithLocalDrafts();
     saveCurrentGroup();
     saveCurrentInsertion();
     saveCurrentAIPrompt();
     setEditingGroupId(null);
     setEditingInsertionIndex(null);
     setEditingPromptId(null);
+    applyPromptDragState(base, false);
 
-    const card = (e.target as HTMLElement).closest('[data-flat-card]') as HTMLElement | null;
-    if (!card) return;
-    const fullEl = card.closest('[data-flat-container]') as HTMLElement | null;
-    const fullRect = fullEl ? fullEl.getBoundingClientRect() : card.getBoundingClientRect();
-    dragFlatItemHeight.current = fullRect.height;
-
-    const cardRect = card.getBoundingClientRect();
-    const offsetY = e.clientY - cardRect.top;
-    const offsetX = e.clientX - cardRect.left;
-
-    const clone = card.cloneNode(true) as HTMLDivElement;
-    clone.style.position = 'fixed';
-    clone.style.left = `${cardRect.left}px`;
-    clone.style.top = `${cardRect.top}px`;
-    clone.style.width = `${cardRect.width}px`;
-    clone.style.zIndex = '9999';
-    clone.style.pointerEvents = 'none';
-    clone.style.boxShadow = '0 2px 4px rgba(0,0,0,0.2)';
-    clone.style.border = '2px solid #8b5cf6';
-    clone.style.opacity = '0.9';
-    clone.style.transform = 'scale(1)';
-    clone.style.transition = 'box-shadow 0.15s ease, transform 0.15s ease, opacity 0.15s ease';
-    document.body.appendChild(clone);
-    requestAnimationFrame(() => {
-      clone.style.boxShadow = '0 8px 24px rgba(139,92,246,0.25)';
-      clone.style.transform = 'scale(1.02)';
-      clone.style.opacity = '1';
-    });
-    floatingFlatCloneRef.current = clone;
-
-    setDraggingFlatIdx(flatIdx);
-    setFlatDropTarget(flatIdx);
-
-    let statics: { idx: number; midY: number }[] | null = null;
-    let firstMove = true;
-    const flatItems = buildFlatItems();
-    console.warn('[FlatDnD] START flatIdx=', flatIdx, 'flatItems=', flatItems.map((it, i) => `${i}:${it.type}${it.type === 'group' ? '(g' + it.group.id + ')' : '(p' + it.origIdx + ')'}`));
-
-    // Track if the dragged item is a prompt (can be dropped into a group)
-    const draggedItem = flatItems[flatIdx];
-    const isPromptDrag = draggedItem?.type === 'prompt';
-
-    const onMove = (ev: PointerEvent) => {
-      if (floatingFlatCloneRef.current) {
-        if (firstMove) {
-          floatingFlatCloneRef.current.style.transition = 'none';
-          firstMove = false;
-          requestAnimationFrame(() => setFlatDragReady(true));
-        }
-        floatingFlatCloneRef.current.style.left = `${ev.clientX - offsetX}px`;
-        floatingFlatCloneRef.current.style.top = `${ev.clientY - offsetY}px`;
-      }
-
-      // Detect group drop zones (for moving prompts into groups)
-      if (isPromptDrag) {
-        const groupEls = document.querySelectorAll('[data-group-drop]');
-        let foundGroup: number | 'ungrouped' | null = null;
-        groupEls.forEach(el => {
-          const r = el.getBoundingClientRect();
-          if (ev.clientY >= r.top && ev.clientY <= r.bottom && ev.clientX >= r.left && ev.clientX <= r.right) {
-            const val = el.getAttribute('data-group-drop');
-            foundGroup = val === 'ungrouped' ? 'ungrouped' : Number(val);
-          }
-        });
-        if (foundGroup !== dragOverGroupRef.current) console.warn('[FlatDnD] groupZone changed:', dragOverGroupRef.current, '->', foundGroup);
-        dragOverGroupRef.current = foundGroup;
-        setDragOverGroupId(foundGroup);
-      }
-
-      if (!statics) {
-        const listEl = textListRef.current;
-        if (!listEl) return;
-        statics = [];
-        const cards = Array.from(listEl.querySelectorAll('[data-flat-card]')) as HTMLElement[];
-        for (const c of cards) {
-          if (c.dataset.hidden === 'true') continue;
-          const idx = Number(c.dataset.flatIdx);
-          const r = c.getBoundingClientRect();
-          statics.push({ idx, midY: r.top + r.height / 2 });
-        }
-      }
-      let target = flatItems.length;
-      for (const s of statics) {
-        if (ev.clientY < s.midY) { target = s.idx; break; }
-      }
-      setFlatDropTarget(target);
+    const session: PointerDragSession = {
+      item,
+      startX: e.clientX,
+      startY: e.clientY,
+      active: false,
+      base,
+      geometry: null,
+      lastKey: null,
+      click,
+      prevCursor: document.body.style.cursor,
+      prevUserSelect: document.body.style.userSelect,
     };
+    pointerDragRef.current = session;
 
-    const onUp = () => {
+    let onMove: (ev: PointerEvent) => void = () => {};
+    let onUp: () => void = () => {};
+    let onCancel: () => void = () => {};
+    let onKeyDown: (ev: KeyboardEvent) => void = () => {};
+    let onBlur: () => void = () => {};
+
+    const finish = (commit: boolean) => {
+      if (pointerDragRef.current !== session) return;
       window.removeEventListener('pointermove', onMove);
       window.removeEventListener('pointerup', onUp);
-      if (floatingFlatCloneRef.current) { floatingFlatCloneRef.current.remove(); floatingFlatCloneRef.current = null; }
+      window.removeEventListener('pointercancel', onCancel);
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('blur', onBlur);
+      document.body.style.cursor = session.prevCursor;
+      document.body.style.userSelect = session.prevUserSelect;
 
-      const targetGroup = isPromptDrag ? dragOverGroupRef.current : null;
-      console.warn('[FlatDnD] DROP isPromptDrag=', isPromptDrag, 'targetGroup=', targetGroup);
-      dragOverGroupRef.current = null;
-      setDragOverGroupId(null);
-
-      setFlatDragReady(false);
-      setDraggingFlatIdx((fromIdx) => {
-        setFlatDropTarget((toPos) => {
-          console.warn('[FlatDnD] RESOLVE fromIdx=', fromIdx, 'toPos=', toPos, 'targetGroup=', targetGroup);
-          if (fromIdx !== null && toPos !== null) {
-            // If an ungrouped prompt was dropped on a group zone → move into group
-            if (isPromptDrag && targetGroup !== null && targetGroup !== 'ungrouped' && draggedItem.type === 'prompt') {
-              console.warn('[FlatDnD] MOVE TO GROUP origIdx=', draggedItem.origIdx, '→ group', targetGroup);
-              // Single atomic update: change group_id + reassign flat positions for remaining items
-              const newPrompts = [...prompts];
-              newPrompts[draggedItem.origIdx] = { ...newPrompts[draggedItem.origIdx], group_id: targetGroup, position: undefined };
-              // Reassign flat positions for remaining ungrouped prompts + groups
-              const remainingFlat = flatItems.filter((_, i) => i !== fromIdx);
-              const newGroups = [...promptGroups];
-              remainingFlat.forEach((item, pos) => {
-                if (item.type === 'group') {
-                  const gIdx = newGroups.findIndex(g => g.id === item.group.id);
-                  if (gIdx >= 0) newGroups[gIdx] = { ...newGroups[gIdx], position: pos };
-                } else {
-                  newPrompts[item.origIdx] = { ...newPrompts[item.origIdx], position: pos };
-                }
-              });
-              setPrompts(newPrompts);
-              setPromptGroups(newGroups);
-              savePromptsImmediate(newPrompts);
-              ipcRenderer.invoke('prompt-groups:save', newGroups);
-            } else {
-              // Normal flat reorder
-              const adjustedTo = toPos > fromIdx ? toPos - 1 : toPos;
-              console.warn('[FlatDnD] REORDER from=', fromIdx, 'adjustedTo=', adjustedTo, fromIdx === adjustedTo ? '(no-op)' : '(apply)');
-              if (fromIdx !== adjustedTo) {
-                const items = [...flatItems];
-                const [moved] = items.splice(fromIdx, 1);
-                items.splice(adjustedTo, 0, moved);
-                saveFlatOrder(items);
-              }
-            }
-          }
-          return null;
-        });
-        return null;
-      });
+      if (session.active) {
+        if (commit) {
+          applyPromptDragState(dragVisualStateRef.current, true);
+          console.warn('[PromptDnD] drop', item, '->', session.lastKey || 'same');
+        } else {
+          applyPromptDragState(session.base, false);
+          console.warn('[PromptDnD] cancel', item);
+        }
+      } else if (commit) {
+        session.click();
+      }
+      pointerDragRef.current = null;
+      setDraggingItem(null);
     };
+
+    const beginIfNeeded = (ev: PointerEvent) => {
+      if (session.active) return true;
+      const dx = ev.clientX - session.startX;
+      const dy = ev.clientY - session.startY;
+      if (Math.hypot(dx, dy) < 4) return false;
+      session.geometry = captureDragGeometry(session.base);
+      session.active = true;
+      setDraggingItem(item);
+      document.body.style.cursor = 'grabbing';
+      document.body.style.userSelect = 'none';
+      console.warn('[PromptDnD] start', item, summarizeDragGeometry(session.geometry));
+      return true;
+    };
+
+    onMove = (ev: PointerEvent) => {
+      if (pointerDragRef.current !== session) return;
+      ev.preventDefault();
+      if (!beginIfNeeded(ev)) return;
+      autoScrollDragList(ev.clientY);
+      previewPointerDrag(item, ev.clientX, ev.clientY);
+    };
+    onUp = () => finish(true);
+    onCancel = () => finish(false);
+    onKeyDown = (ev: KeyboardEvent) => { if (ev.key === 'Escape') finish(false); };
+    onBlur = () => finish(false);
 
     window.addEventListener('pointermove', onMove);
     window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onCancel);
+    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('blur', onBlur);
   };
 
   const closeInsertionEditor = () => {
     saveCurrentInsertion();
     setEditingInsertionIndex(null);
-  };
-
-  // Classic drag-and-drop: floating clone follows cursor, gap shows target
-  const handleGripPointerDown = (origIndex: number) => (e: React.PointerEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-
-    // Clear all editing states so no stale selection remains
-    saveCurrentGroup();
-    saveCurrentInsertion();
-    saveCurrentAIPrompt();
-    setEditingGroupId(null);
-    setEditingInsertionIndex(null);
-    setEditingPromptId(null);
-
-    const card = (e.target as HTMLElement).closest('[data-text-card]') as HTMLElement | null;
-    if (!card) return;
-    const cardRect = card.getBoundingClientRect();
-    const offsetY = e.clientY - cardRect.top;
-    const offsetX = e.clientX - cardRect.left;
-    dragCardHeight.current = cardRect.height;
-
-    // Create floating clone with pickup animation
-    const clone = card.cloneNode(true) as HTMLDivElement;
-    clone.style.position = 'fixed';
-    clone.style.left = `${cardRect.left}px`;
-    clone.style.top = `${cardRect.top}px`;
-    clone.style.width = `${cardRect.width}px`;
-    clone.style.zIndex = '9999';
-    clone.style.pointerEvents = 'none';
-    clone.style.boxShadow = '0 2px 4px rgba(0,0,0,0.2)';
-    clone.style.border = '2px solid #8b5cf6';
-    clone.style.opacity = '0.9';
-    clone.style.cursor = 'grabbing';
-    clone.style.transform = 'scale(1)';
-    clone.style.transition = 'box-shadow 0.15s ease, transform 0.15s ease, opacity 0.15s ease';
-    document.body.appendChild(clone);
-    // Trigger pickup effect next frame
-    requestAnimationFrame(() => {
-      clone.style.boxShadow = '0 8px 24px rgba(139,92,246,0.25)';
-      clone.style.transform = 'scale(1.02)';
-      clone.style.opacity = '1';
-    });
-    floatingCloneRef.current = clone;
-
-    setDraggingTextIndex(origIndex);
-    setTextDropTarget(origIndex);
-
-    // Static midpoints captured once (after React hides dragged card) — prevents jitter
-    let statics: { origIdx: number; midY: number }[] | null = null;
-    // Flat midpoints for "exit group" preview
-    let flatStatics: { idx: number; midY: number }[] | null = null;
-    const currentFlatItems = buildFlatItems();
-    let firstMove = true;
-
-    const onMove = (ev: PointerEvent) => {
-      if (floatingCloneRef.current) {
-        if (firstMove) { floatingCloneRef.current.style.transition = 'none'; firstMove = false; }
-        floatingCloneRef.current.style.left = `${ev.clientX - offsetX}px`;
-        floatingCloneRef.current.style.top = `${ev.clientY - offsetY}px`;
-      }
-
-      // Detect group drop zones
-      const groupEls = document.querySelectorAll('[data-group-drop]');
-      let foundGroup: number | 'ungrouped' | null = null;
-      groupEls.forEach(el => {
-        const r = el.getBoundingClientRect();
-        if (ev.clientY >= r.top && ev.clientY <= r.bottom && ev.clientX >= r.left && ev.clientX <= r.right) {
-          const val = el.getAttribute('data-group-drop');
-          foundGroup = val === 'ungrouped' ? 'ungrouped' : Number(val);
-        }
-      });
-      dragOverGroupRef.current = foundGroup;
-      setDragOverGroupId(foundGroup);
-
-      // When over ungrouped zone: compute flat insertion position for preview
-      if (foundGroup === 'ungrouped') {
-        if (!flatStatics) {
-          const listEl = textListRef.current;
-          if (listEl) {
-            flatStatics = [];
-            const flatCards = Array.from(listEl.querySelectorAll('[data-flat-card]')) as HTMLElement[];
-            for (const c of flatCards) {
-              if (c.dataset.hidden === 'true') continue;
-              const idx = Number(c.dataset.flatIdx);
-              const r = c.getBoundingClientRect();
-              flatStatics.push({ idx, midY: r.top + r.height / 2 });
-            }
-          }
-        }
-        if (flatStatics) {
-          let flatTarget = currentFlatItems.length;
-          for (const s of flatStatics) {
-            if (ev.clientY < s.midY) { flatTarget = s.idx; break; }
-          }
-          dragFlatItemHeight.current = dragCardHeight.current;
-          setDraggingFlatIdx(-1); // sentinel: "grouped prompt exiting to flat"
-          setFlatDropTarget(flatTarget);
-        }
-      } else {
-        setDraggingFlatIdx(null);
-        setFlatDropTarget(null);
-      }
-
-      // Capture midpoints once (after dragged card is hidden)
-      if (!statics) {
-        const listEl = textListRef.current;
-        if (!listEl) return;
-        statics = [];
-        const cards = Array.from(listEl.querySelectorAll('[data-text-card]')) as HTMLElement[];
-        for (const c of cards) {
-          if (c.dataset.hidden === 'true') continue;
-          const idx = Number(c.dataset.origIndex);
-          const r = c.getBoundingClientRect();
-          statics.push({ origIdx: idx, midY: r.top + r.height / 2 });
-        }
-      }
-      // Find insertion point using static positions (original array index)
-      let target = prompts.length;
-      for (const s of statics) {
-        if (ev.clientY < s.midY) { target = s.origIdx; break; }
-      }
-      setTextDropTarget(target);
-    };
-
-    const onUp = () => {
-      window.removeEventListener('pointermove', onMove);
-      window.removeEventListener('pointerup', onUp);
-      if (floatingCloneRef.current) {
-        floatingCloneRef.current.remove();
-        floatingCloneRef.current = null;
-      }
-
-      const targetGroup = dragOverGroupRef.current;
-      const flatTargetAtDrop = flatDropTarget;
-      dragOverGroupRef.current = null;
-      setDragOverGroupId(null);
-      setDraggingFlatIdx(null);
-      setFlatDropTarget(null);
-
-      setDragTransitionsReady(false);
-      setDraggingTextIndex((fromIdx) => {
-        setTextDropTarget((toPos) => {
-          if (fromIdx !== null && toPos !== null) {
-            const np = [...prompts];
-            const editItem = editingInsertionIndex !== null ? np[editingInsertionIndex] : null;
-
-            console.warn('[GroupedDnD] DROP fromIdx=', fromIdx, 'targetGroup=', targetGroup, 'flatTarget=', flatTargetAtDrop);
-            if (targetGroup === 'ungrouped') {
-              // Moving from group to ungrouped: insert at flat position based on cursor
-              np[fromIdx] = { ...np[fromIdx], group_id: null, position: undefined };
-              // Insert into flat list at the position where the user dropped
-              const newFlatItems = [...currentFlatItems];
-              const insertAt = flatTargetAtDrop ?? currentFlatItems.length;
-              newFlatItems.splice(insertAt, 0, { type: 'prompt', origIdx: fromIdx, prompt: np[fromIdx] });
-              // Reassign positions
-              const newGroups = [...promptGroups];
-              newFlatItems.forEach((item, pos) => {
-                if (item.type === 'group') {
-                  const gIdx = newGroups.findIndex(g => g.id === item.group.id);
-                  if (gIdx >= 0) newGroups[gIdx] = { ...newGroups[gIdx], position: pos };
-                } else {
-                  np[item.origIdx] = { ...np[item.origIdx], position: pos };
-                }
-              });
-              setPrompts(np);
-              setPromptGroups(newGroups);
-              savePromptsImmediate(np);
-              ipcRenderer.invoke('prompt-groups:save', newGroups);
-              if (editItem !== null) setEditingInsertionIndex(np.indexOf(editItem));
-              return null;
-            } else if (targetGroup !== null) {
-              np[fromIdx] = { ...np[fromIdx], group_id: targetGroup, position: undefined };
-            }
-
-            // Within-group reorder or cross-group
-            const adjustedTo = toPos > fromIdx ? toPos - 1 : toPos;
-            if (fromIdx !== adjustedTo) {
-              const [moved] = np.splice(fromIdx, 1);
-              np.splice(adjustedTo, 0, moved);
-            }
-
-            setPrompts(np);
-            savePromptsImmediate(np);
-            if (editItem !== null) setEditingInsertionIndex(np.indexOf(editItem));
-          }
-          return null;
-        });
-        return null;
-      });
-    };
-
-    window.addEventListener('pointermove', onMove);
-    window.addEventListener('pointerup', onUp);
   };
 
   const handleDocBlur = (e: React.FocusEvent) => {
@@ -1769,7 +1947,9 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
     saveCurrentInsertion();
     saveCurrentAIPrompt();
     setEditingPromptId(null);
-    const pos = groupId ? undefined : getNextFlatPosition();
+    const pos = groupId
+      ? Math.max(-1, ...prompts.filter(p => p.group_id === groupId).map((p, i) => promptPos(p, i))) + 1
+      : getNextFlatPosition();
     const newPrompts = [...prompts, { title: `Prompt ${prompts.length + 1}`, content: '', group_id: groupId ?? null, position: pos }];
     setPrompts(newPrompts);
     savePromptsImmediate(newPrompts);
@@ -1777,6 +1957,8 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
     setEditingInsertionIndex(idx);
     setLocalInsertionTitle(newPrompts[idx].title);
     setLocalInsertionContent('');
+    setLocalInsertionFilePaths([]);
+    setInsertionFileInputs([]);
   };
 
   const addPromptGroup = async () => {
@@ -1821,6 +2003,677 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
     setDocPromptUseFile(true);
   };
 
+  const switchAISubTab = (next: AISubTab) => {
+    if (next === aiSubTab) return;
+    if (next === 'text') {
+      saveCurrentAIPrompt();
+      setEditingPromptId(null);
+    } else {
+      saveCurrentInsertion();
+      saveCurrentGroup();
+      setEditingInsertionIndex(null);
+      setEditingGroupId(null);
+    }
+    setAiSubTab(next);
+  };
+
+  const renderTextPromptCard = (prompt: Prompt, index: number, dndKind: 'flat' | 'group-prompt', groupId?: number) => {
+    const isSelected = editingInsertionIndex === index;
+    const isDragged = draggingItem?.type === 'prompt' && draggingItem.index === index;
+    return (
+      <div
+        key={`${dndKind}-${index}`}
+        data-dnd-kind={dndKind}
+        data-dnd-flat-container={dndKind === 'flat' ? 'true' : undefined}
+        data-dnd-type={dndKind === 'flat' ? 'prompt' : undefined}
+        data-dnd-id={dndKind === 'flat' ? String(index) : undefined}
+        data-group-id={groupId != null ? String(groupId) : undefined}
+        data-prompt-index={String(index)}
+        onPointerDown={startPointerDrag({ type: 'prompt', index }, () => startEditingInsertion(index))}
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 8,
+          marginBottom: 6,
+          padding: '8px 9px',
+          borderRadius: 8,
+          background: isDragged ? 'rgba(124,58,237,0.18)' : (isSelected ? '#24242a' : VR_CARD),
+          border: `1px solid ${isDragged ? VR_VIOLET : (isSelected ? VR_ACCENT : VR_BORDER)}`,
+          boxShadow: isDragged ? '0 0 0 1px rgba(124,58,237,0.28) inset, 0 0 18px rgba(124,58,237,0.16)' : 'none',
+          cursor: isDragged ? 'grabbing' : 'pointer',
+          minWidth: 0,
+          userSelect: 'none',
+          touchAction: 'none',
+          transition: 'background 110ms ease, border-color 110ms ease, box-shadow 110ms ease',
+        }}
+      >
+        <VRDocIcon />
+        <div style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: isSelected ? '#bfdbfe' : VR_TEXT, fontWeight: 620, fontSize: 13 }}>
+          {prompt.title || 'Untitled'}
+        </div>
+        {(prompt.file_paths?.length || 0) > 0 && <VRTag accent>{prompt.file_paths?.length} файл.</VRTag>}
+        <VRGrip />
+      </div>
+    );
+  };
+
+  const renderInsertionFiles = () => {
+    const pickFile = async () => {
+      const result = await ipcRenderer.invoke('ai-prompts:select-file');
+      if (result.success && result.data) {
+        const updated = [...localInsertionFilePaths, result.data];
+        setLocalInsertionFilePaths(updated);
+        saveCurrentInsertion(updated);
+      }
+    };
+
+    const commitManualPath = async (idx: number) => {
+      const val = insertionFileInputs[idx]?.value?.trim();
+      if (!val) {
+        setInsertionFileInputs(prev => prev.filter((_, i) => i !== idx));
+        return;
+      }
+      const result = await ipcRenderer.invoke('ai-prompts:check-file', val);
+      if (result.exists) {
+        const updated = [...localInsertionFilePaths, val];
+        setLocalInsertionFilePaths(updated);
+        setInsertionFileInputs(prev => prev.filter((_, i) => i !== idx));
+        saveCurrentInsertion(updated);
+      } else {
+        const updated = [...insertionFileInputs];
+        updated[idx] = { ...updated[idx], valid: false };
+        setInsertionFileInputs(updated);
+      }
+    };
+
+    return (
+      <VRSection title="Файлы в конце промпта" onAdd={pickFile} addLabel="Finder">
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+          {localInsertionFilePaths.map((fp, idx) => (
+            <div key={`${fp}-${idx}`} style={{ display: 'flex', alignItems: 'center', gap: 7, border: `1px solid ${VR_BORDER}`, background: VR_FIELD, borderRadius: 7, padding: '6px 8px' }}>
+              <VRFileIcon />
+              <span title={fp} style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', direction: 'rtl', textAlign: 'left', color: '#bdbdc2', fontSize: 11.5 }}>{fp}</span>
+              <VRIconBtn
+                title="Убрать файл"
+                danger
+                small
+                onClick={() => {
+                  const updated = localInsertionFilePaths.filter((_, i) => i !== idx);
+                  setLocalInsertionFilePaths(updated);
+                  saveCurrentInsertion(updated);
+                }}
+              >
+                <VRXIcon />
+              </VRIconBtn>
+            </div>
+          ))}
+          {insertionFileInputs.map((input, idx) => (
+            <div key={`input-${idx}`} style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+              <input
+                type="text"
+                autoFocus
+                value={input.value}
+                onChange={(e) => {
+                  const updated = [...insertionFileInputs];
+                  updated[idx] = { value: e.target.value, valid: null };
+                  setInsertionFileInputs(updated);
+                }}
+                onBlur={() => commitManualPath(idx)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') commitManualPath(idx);
+                  if (e.key === 'Escape') setInsertionFileInputs(prev => prev.filter((_, i) => i !== idx));
+                }}
+                placeholder="/Users/..."
+                style={{ ...vrFieldStyle, flex: 1, borderColor: input.valid === false ? VR_RED : VR_BORDER, fontFamily: 'ui-monospace, Menlo, monospace', fontSize: 11.5 }}
+              />
+              <VRIconBtn title="Убрать строку" danger small onClick={() => setInsertionFileInputs(prev => prev.filter((_, i) => i !== idx))}>
+                <VRXIcon />
+              </VRIconBtn>
+            </div>
+          ))}
+          <div>
+            <button onClick={() => setInsertionFileInputs(prev => [...prev, { value: '', valid: null }])} style={vrSmallBtnStyle('neutral')}>
+              <VRPlusIcon small /> путь
+            </button>
+          </div>
+        </div>
+      </VRSection>
+    );
+  };
+
+  const renderTextInsertEditor = () => {
+    const selectedGroup = editingGroupId !== null ? promptGroups.find(g => g.id === editingGroupId) : null;
+    const selectedPrompt = editingInsertionIndex !== null ? prompts[editingInsertionIndex] : null;
+    const flatItems = buildFlatItems();
+
+    return (
+      <div style={{ display: 'grid', gridTemplateColumns: 'minmax(280px, 34%) minmax(360px, 1fr)', gap: 12, height: '100%', minHeight: 0 }}>
+        <div style={{ minHeight: 0, display: 'flex', flexDirection: 'column', background: '#17171a', border: `1px solid ${VR_BORDER}`, borderRadius: 10, overflow: 'hidden' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '10px 10px', borderBottom: `1px solid ${VR_BORDER}` }}>
+            <span style={{ fontSize: 11, fontWeight: 750, letterSpacing: 0.4, color: VR_DIM, textTransform: 'uppercase' }}>Текстовые вставки</span>
+            <VRTag>{prompts.length}</VRTag>
+            <div style={{ flex: 1 }} />
+            <button onClick={addPromptGroup} style={vrSmallBtnStyle('neutral')}><VRFolderIcon /> Группа</button>
+            <button onClick={() => addPrompt()} style={vrSmallBtnStyle('accent')}><VRPlusIcon small /> Промпт</button>
+          </div>
+
+          <div ref={textListRef} onDragStart={(e) => e.preventDefault()} style={{ padding: 8, overflowY: 'auto', minHeight: 0, flex: 1 }}>
+            {flatItems.length === 0 ? (
+              <VREmpty text="Нет промптов. Добавь первый." />
+            ) : (
+              <>
+                {flatItems.map((item) => {
+                  if (item.type === 'group') {
+                    const group = item.group;
+                    const groupPrompts = prompts
+                      .map((p, i) => ({ ...p, _idx: i }))
+                      .filter(p => p.group_id === group.id)
+                      .sort((a, b) => promptPos(a, a._idx) - promptPos(b, b._idx));
+                    const isSelected = editingGroupId === group.id;
+                    const isDragging = draggingItem?.type === 'group' && draggingItem.id === group.id;
+                    return (
+                      <div key={`g-${group.id}`}>
+                        <div data-dnd-flat-container="true" data-dnd-type="group" data-dnd-id={String(group.id)} style={{ border: '1px solid transparent', borderRadius: 9, marginBottom: 7 }}>
+                          <div
+                            data-dnd-kind="flat"
+                            data-dnd-type="group"
+                            data-dnd-id={String(group.id)}
+                            onPointerDown={startPointerDrag({ type: 'group', id: group.id }, () => startEditingGroup(group.id))}
+                            style={{
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: 8,
+                              padding: '8px 9px',
+                              borderRadius: 8,
+                              background: isDragging ? 'rgba(124,58,237,0.18)' : (isSelected ? '#24242a' : VR_CARD),
+                              border: `1px solid ${isDragging ? VR_VIOLET : (isSelected ? VR_VIOLET : VR_BORDER)}`,
+                              boxShadow: isDragging ? '0 0 0 1px rgba(124,58,237,0.18) inset' : 'none',
+                              cursor: isDragging ? 'grabbing' : 'pointer',
+                              userSelect: 'none',
+                              touchAction: 'none',
+                              transition: 'background 110ms ease, border-color 110ms ease, box-shadow 110ms ease',
+                            }}
+                          >
+                            <button
+                              data-no-card-drag
+                              onPointerDown={(e) => e.stopPropagation()}
+                              onMouseDown={(e) => e.stopPropagation()}
+                              onClick={(e) => { e.stopPropagation(); toggleGroupCollapsed(group.id); }}
+                              style={{ border: 'none', background: 'transparent', color: VR_DIM, cursor: 'pointer', padding: 0, width: 18, display: 'flex' }}
+                            >
+                              <VRChevronIcon open={!group.is_collapsed} />
+                            </button>
+                            <VRFolderIcon />
+                            <div style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: isSelected ? '#ddd6fe' : VR_TEXT, fontWeight: 650, fontSize: 13 }}>
+                              {group.name || 'Группа'}
+                            </div>
+                            <VRTag>{groupPrompts.length}</VRTag>
+                            <VRGrip />
+                          </div>
+                          {!group.is_collapsed && (
+                            <div data-dnd-kind="group-body" data-group-id={String(group.id)} style={{ padding: '6px 0 0 26px' }}>
+                              {groupPrompts.length === 0 && (
+                                <div data-dnd-kind="group-empty" style={{ padding: '8px', marginBottom: 5, borderRadius: 8, border: '1px dashed #3a2f55', color: '#6f638a', fontSize: 11, textAlign: 'center' }}>
+                                  Перетащи промпт сюда
+                                </div>
+                              )}
+                              {groupPrompts.map((prompt) => renderTextPromptCard(prompt, prompt._idx, 'group-prompt', group.id))}
+                              <button data-no-card-drag onClick={() => addPrompt(group.id)} style={{ width: '100%', margin: '2px 0 7px', padding: '6px 8px', borderRadius: 8, border: '1px dashed #3a3a42', background: 'transparent', color: VR_DIM, fontSize: 11, cursor: 'pointer' }}>
+                                + промпт в группу
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  }
+                  return renderTextPromptCard(item.prompt, item.origIdx, 'flat');
+                })}
+                <div style={{ height: 10 }} />
+              </>
+            )}
+          </div>
+        </div>
+
+        <div style={{ minHeight: 0, background: '#17171a', border: `1px solid ${VR_BORDER}`, borderRadius: 10, overflow: 'hidden' }}>
+          {selectedPrompt ? (
+            <div style={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
+              <div style={{ padding: '12px 14px', borderBottom: `1px solid ${VR_BORDER}`, display: 'flex', alignItems: 'center', gap: 10 }}>
+                <VRDocIcon />
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ color: VR_TEXT, fontSize: 14, fontWeight: 750, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{localInsertionTitle || 'Untitled'}</div>
+                </div>
+                <VRIconBtn title="Удалить промпт" danger onClick={() => editingInsertionIndex !== null && deletePrompt(editingInsertionIndex)}><VRTrashIcon /></VRIconBtn>
+              </div>
+              <div style={{ padding: 14, overflowY: 'auto', minHeight: 0, flex: 1, display: 'flex', flexDirection: 'column', gap: 14 }}>
+                <VRField label="Название">
+                  <input
+                    value={localInsertionTitle}
+                    placeholder="Название промпта"
+                    onChange={(e) => setLocalInsertionTitle(e.target.value)}
+                    onBlur={() => {
+                      saveCurrentInsertion();
+                      setSavedInsertionFlash('title');
+                      if (savedInsertionTimer.current) clearTimeout(savedInsertionTimer.current);
+                      savedInsertionTimer.current = setTimeout(() => setSavedInsertionFlash(null), 400);
+                    }}
+                    style={{ ...vrFieldStyle, borderColor: savedInsertionFlash === 'title' ? VR_GREEN : VR_BORDER }}
+                  />
+                </VRField>
+                <VRField label="Текст">
+                  <textarea
+                    value={localInsertionContent}
+                    placeholder="Содержимое вставки..."
+                    onChange={(e) => setLocalInsertionContent(e.target.value)}
+                    onBlur={() => {
+                      saveCurrentInsertion();
+                      setSavedInsertionFlash('content');
+                      if (savedInsertionTimer.current) clearTimeout(savedInsertionTimer.current);
+                      savedInsertionTimer.current = setTimeout(() => setSavedInsertionFlash(null), 400);
+                    }}
+                    rows={16}
+                    style={{ ...vrFieldStyle, minHeight: 320, height: 'auto', resize: 'vertical', fontFamily: 'ui-monospace, Menlo, monospace', fontSize: 12.5, lineHeight: 1.5, borderColor: savedInsertionFlash === 'content' ? VR_GREEN : VR_BORDER }}
+                  />
+                </VRField>
+                {renderInsertionFiles()}
+              </div>
+            </div>
+          ) : selectedGroup ? (
+            <div style={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
+              <div style={{ padding: '12px 14px', borderBottom: `1px solid ${VR_BORDER}`, display: 'flex', alignItems: 'center', gap: 10 }}>
+                <VRFolderIcon />
+                <div style={{ color: VR_TEXT, fontSize: 14, fontWeight: 750, flex: 1 }}>Группа</div>
+                <VRIconBtn title="Удалить группу" danger onClick={() => deletePromptGroup(selectedGroup.id)}><VRTrashIcon /></VRIconBtn>
+              </div>
+              <div style={{ padding: 14, display: 'flex', flexDirection: 'column', gap: 14 }}>
+                <VRField label="Название">
+                  <input
+                    value={localGroupName}
+                    onChange={(e) => setLocalGroupName(e.target.value)}
+                    onBlur={() => {
+                      saveCurrentGroup();
+                      setSavedGroupFlash('name');
+                      if (savedGroupTimer.current) clearTimeout(savedGroupTimer.current);
+                      savedGroupTimer.current = setTimeout(() => setSavedGroupFlash(null), 400);
+                    }}
+                    style={{ ...vrFieldStyle, borderColor: savedGroupFlash === 'name' ? VR_GREEN : VR_BORDER }}
+                  />
+                </VRField>
+              </div>
+            </div>
+          ) : (
+            <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: VR_DIM, fontSize: 13 }}>
+              Выбери промпт или группу слева
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  };
+
+  const renderSystemPrompts = () => {
+    const editingAIPrompt = editingPromptId !== null ? aiPrompts.find(p => p.id === editingPromptId) : null;
+
+    const renderAIPromptEditor = () => {
+      if (!editingAIPrompt) {
+        return (
+          <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: VR_DIM, fontSize: 13 }}>
+            Выбери системный промпт слева
+          </div>
+        );
+      }
+
+      const saveField = (overrides: Partial<AIPrompt>) => {
+        saveAIPrompt({
+          ...editingAIPrompt,
+          name: localPromptName,
+          content: localPromptContent,
+          color: localPromptColor,
+          showInContextMenu: localPromptShowInMenu,
+          model: localPromptModel,
+          thinkingLevel: localPromptThinkingLevel,
+          filePaths: localPromptFilePaths,
+          ...overrides
+        });
+      };
+
+      const pickFile = async () => {
+        const result = await ipcRenderer.invoke('ai-prompts:select-file');
+        if (result.success && result.data) {
+          const updated = [...localPromptFilePaths, result.data];
+          setLocalPromptFilePaths(updated);
+          saveField({ filePaths: updated });
+        }
+      };
+
+      const commitManualPath = async (idx: number) => {
+        const val = filePathInputs[idx]?.value?.trim();
+        if (!val) {
+          setFilePathInputs(prev => prev.filter((_, i) => i !== idx));
+          return;
+        }
+        const result = await ipcRenderer.invoke('ai-prompts:check-file', val);
+        if (result.exists) {
+          const updated = [...localPromptFilePaths, val];
+          setLocalPromptFilePaths(updated);
+          setFilePathInputs(prev => prev.filter((_, i) => i !== idx));
+          saveField({ filePaths: updated });
+        } else {
+          const updated = [...filePathInputs];
+          updated[idx] = { ...updated[idx], valid: false };
+          setFilePathInputs(updated);
+        }
+      };
+
+      return (
+        <div style={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
+          <div style={{ padding: '12px 14px', borderBottom: `1px solid ${VR_BORDER}`, display: 'flex', alignItems: 'center', gap: 10 }}>
+            <div style={{ width: 10, height: 10, borderRadius: '50%', background: localPromptColor, flexShrink: 0 }} />
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ color: VR_TEXT, fontSize: 14, fontWeight: 750, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{localPromptName || 'Prompt'}</div>
+            </div>
+            <VRIconBtn title="Закрыть" onClick={closeAIPromptEditor}><VRXIcon /></VRIconBtn>
+          </div>
+
+          <div style={{ padding: 14, overflowY: 'auto', minHeight: 0, flex: 1, display: 'flex', flexDirection: 'column', gap: 14 }}>
+            <VRField label="Название">
+              <input
+                type="text"
+                value={localPromptName}
+                onChange={(e) => setLocalPromptName(e.target.value)}
+                onBlur={() => saveCurrentAIPrompt('name')}
+                placeholder="Название..."
+                style={{ ...vrFieldStyle, borderColor: savedFlashField === 'name' ? VR_GREEN : VR_BORDER }}
+              />
+            </VRField>
+
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                <span style={{ fontSize: 10.5, color: VR_DIM, flexShrink: 0 }}>Модель:</span>
+                {([
+                  { value: 'gemini-3-flash-preview' as AIModel, label: 'Gemini 3 Flash' },
+                  { value: 'gemini-3-pro-preview' as AIModel, label: 'Gemini 3 Pro' }
+                ]).map((model) => (
+                  <button
+                    key={model.value}
+                    onClick={(e) => { e.stopPropagation(); setLocalPromptModel(model.value); saveField({ model: model.value }); }}
+                    style={{ padding: '4px 10px', backgroundColor: localPromptModel === model.value ? localPromptColor : VR_FIELD, color: localPromptModel === model.value ? '#fff' : VR_DIM, border: `1px solid ${localPromptModel === model.value ? localPromptColor : VR_BORDER}`, borderRadius: 7, fontSize: 11.5, cursor: 'pointer' }}
+                  >
+                    {model.label}
+                  </button>
+                ))}
+              </div>
+
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                <span style={{ fontSize: 10.5, color: VR_DIM, flexShrink: 0 }}>Думание:</span>
+                {(['NONE', 'LOW', 'MEDIUM', 'HIGH'] as ThinkingLevel[]).map((level) => (
+                  <button
+                    key={level}
+                    onClick={(e) => { e.stopPropagation(); setLocalPromptThinkingLevel(level); saveField({ thinkingLevel: level }); }}
+                    style={{ padding: '4px 8px', backgroundColor: localPromptThinkingLevel === level ? localPromptColor : VR_FIELD, color: localPromptThinkingLevel === level ? '#fff' : VR_DIM, border: `1px solid ${localPromptThinkingLevel === level ? localPromptColor : VR_BORDER}`, borderRadius: 7, fontSize: 11.5, cursor: 'pointer' }}
+                  >
+                    {level}
+                  </button>
+                ))}
+              </div>
+
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                <span style={{ fontSize: 10.5, color: VR_DIM, flexShrink: 0 }}>Цвет:</span>
+                {['#0ea5e9', '#a855f7', '#f59e0b', '#22c55e', '#ef4444', '#6366f1', '#ec4899'].map((color) => (
+                  <button
+                    key={color}
+                    onClick={(e) => { e.stopPropagation(); setLocalPromptColor(color); saveField({ color }); }}
+                    style={{ width: 18, height: 18, borderRadius: '50%', backgroundColor: color, cursor: 'pointer', border: localPromptColor === color ? '2px solid #fff' : '2px solid transparent', padding: 0 }}
+                  />
+                ))}
+              </div>
+
+              <label style={{ display: 'flex', alignItems: 'center', gap: 8, color: VR_DIM, fontSize: 11.5 }}>
+                <span>В контекстном меню:</span>
+                <button
+                  onClick={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    const next = !localPromptShowInMenu;
+                    setLocalPromptShowInMenu(next);
+                    saveField({ showInContextMenu: next });
+                  }}
+                  style={{ width: 30, height: 17, borderRadius: 9, border: 'none', backgroundColor: localPromptShowInMenu ? localPromptColor : '#444', position: 'relative', cursor: 'pointer', padding: 0 }}
+                >
+                  <span style={{ width: 13, height: 13, borderRadius: '50%', backgroundColor: '#fff', position: 'absolute', top: 2, left: localPromptShowInMenu ? 15 : 2, transition: 'left 0.2s' }} />
+                </button>
+              </label>
+            </div>
+
+            <VRField label="Промпт">
+              <textarea
+                value={localPromptContent}
+                onChange={(e) => setLocalPromptContent(e.target.value)}
+                onBlur={() => saveCurrentAIPrompt('content')}
+                placeholder="Содержимое промпта..."
+                rows={16}
+                style={{ ...vrFieldStyle, minHeight: 320, height: 'auto', resize: 'vertical', fontFamily: 'ui-monospace, Menlo, monospace', fontSize: 12.5, lineHeight: 1.5, borderColor: savedFlashField === 'content' ? VR_GREEN : VR_BORDER }}
+              />
+            </VRField>
+
+            <VRSection title="Файлы в конце промпта" onAdd={pickFile} addLabel="Finder">
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                {localPromptFilePaths.map((fp, idx) => (
+                  <div key={`${fp}-${idx}`} style={{ display: 'flex', alignItems: 'center', gap: 7, border: `1px solid ${VR_BORDER}`, background: VR_FIELD, borderRadius: 7, padding: '6px 8px' }}>
+                    <VRFileIcon />
+                    <span title={fp} style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', direction: 'rtl', textAlign: 'left', color: '#bdbdc2', fontSize: 11.5 }}>{fp}</span>
+                    <VRIconBtn
+                      title="Убрать файл"
+                      danger
+                      small
+                      onClick={() => {
+                        const updated = localPromptFilePaths.filter((_, i) => i !== idx);
+                        setLocalPromptFilePaths(updated);
+                        saveField({ filePaths: updated });
+                      }}
+                    >
+                      <VRXIcon />
+                    </VRIconBtn>
+                  </div>
+                ))}
+                {filePathInputs.map((input, idx) => (
+                  <div key={`ai-input-${idx}`} style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+                    <input
+                      type="text"
+                      autoFocus
+                      value={input.value}
+                      onChange={(e) => {
+                        const updated = [...filePathInputs];
+                        updated[idx] = { value: e.target.value, valid: null };
+                        setFilePathInputs(updated);
+                      }}
+                      onBlur={() => commitManualPath(idx)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') commitManualPath(idx);
+                        if (e.key === 'Escape') setFilePathInputs(prev => prev.filter((_, i) => i !== idx));
+                      }}
+                      placeholder="/Users/..."
+                      style={{ ...vrFieldStyle, flex: 1, borderColor: input.valid === false ? VR_RED : VR_BORDER, fontFamily: 'ui-monospace, Menlo, monospace', fontSize: 11.5 }}
+                    />
+                    <VRIconBtn title="Убрать строку" danger small onClick={() => setFilePathInputs(prev => prev.filter((_, i) => i !== idx))}>
+                      <VRXIcon />
+                    </VRIconBtn>
+                  </div>
+                ))}
+                <div>
+                  <button onClick={() => setFilePathInputs(prev => [...prev, { value: '', valid: null }])} style={vrSmallBtnStyle('neutral')}>
+                    <VRPlusIcon small /> путь
+                  </button>
+                </div>
+              </div>
+            </VRSection>
+
+            {!editingAIPrompt.isBuiltIn && (
+              <button onClick={() => { deleteAIPrompt(editingAIPrompt.id); setEditingPromptId(null); showToast('Deleted', 'success'); }} style={{ alignSelf: 'flex-start', padding: 0, background: 'transparent', border: 'none', color: '#ff6b6b', fontSize: 12, fontWeight: 650, cursor: 'pointer' }}>
+                Удалить промпт
+              </button>
+            )}
+          </div>
+        </div>
+      );
+    };
+
+    return (
+      <div style={{ display: 'grid', gridTemplateColumns: 'minmax(280px, 34%) minmax(360px, 1fr)', gap: 12, height: '100%', minHeight: 0 }}>
+        <div style={{ minHeight: 0, display: 'flex', flexDirection: 'column', background: '#17171a', border: `1px solid ${VR_BORDER}`, borderRadius: 10, overflow: 'hidden' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '10px 10px', borderBottom: `1px solid ${VR_BORDER}` }}>
+            <span style={{ fontSize: 11, fontWeight: 750, letterSpacing: 0.4, color: VR_DIM, textTransform: 'uppercase' }}>Системные промпты</span>
+            <VRTag>{aiPrompts.length}</VRTag>
+            <div style={{ flex: 1 }} />
+            <button onClick={addAIPrompt} style={vrSmallBtnStyle('accent')}><VRPlusIcon small /> Промпт</button>
+          </div>
+
+          <div style={{ padding: 8, overflowY: 'auto', minHeight: 0, flex: 1 }}>
+            {aiPrompts.map((aiPrompt) => {
+              const isSelected = editingPromptId === aiPrompt.id;
+              const displayName = isSelected ? localPromptName : aiPrompt.name;
+              const displayColor = isSelected ? localPromptColor : aiPrompt.color;
+              const displayModel = isSelected ? localPromptModel : aiPrompt.model;
+              const displayThinking = isSelected ? localPromptThinkingLevel : aiPrompt.thinkingLevel;
+              const displayMenu = isSelected ? localPromptShowInMenu : aiPrompt.showInContextMenu;
+              return (
+                <div
+                  key={aiPrompt.id}
+                  onClick={() => startEditingAIPrompt(aiPrompt)}
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 8,
+                    marginBottom: 6,
+                    padding: '8px 9px',
+                    borderRadius: 8,
+                    background: isSelected ? '#24242a' : VR_CARD,
+                    border: `1px solid ${isSelected ? displayColor : VR_BORDER}`,
+                    cursor: 'pointer',
+                    minWidth: 0,
+                    transition: 'background 110ms ease, border-color 110ms ease',
+                  }}
+                >
+                  <span style={{ width: 8, height: 8, borderRadius: '50%', background: displayColor, flexShrink: 0 }} />
+                  <div style={{ flex: 1, minWidth: 0, color: isSelected ? '#bfdbfe' : VR_TEXT, fontWeight: 620, fontSize: 13, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{displayName}</div>
+                  <VRTag accent={displayModel.includes('pro')}>{displayModel.includes('pro') ? 'PRO' : 'FLASH'}</VRTag>
+                  {displayThinking !== 'HIGH' && <VRTag>{displayThinking}</VRTag>}
+                  {displayMenu && <VRTag>ПКМ</VRTag>}
+                </div>
+              );
+            })}
+
+            <div style={{ padding: '10px', background: VR_CARD, border: `1px solid ${VR_BORDER}`, borderRadius: 8, margin: '10px 0' }}>
+              <div style={{ fontSize: 11, color: VR_DIM, marginBottom: 6 }}>Промпт для "Откатиться":</div>
+              <select
+                value={rewindPromptId}
+                onChange={(e) => setRewindPromptId(e.target.value)}
+                style={{ ...vrFieldStyle, height: 32, cursor: 'pointer' }}
+              >
+                {aiPrompts.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+              </select>
+            </div>
+
+            <div style={{ borderTop: `1px solid ${VR_BORDER}`, margin: '14px 0 10px', position: 'relative' }}>
+              <span style={{ position: 'absolute', top: '-8px', left: 10, backgroundColor: '#17171a', padding: '0 8px', fontSize: 10, color: '#666', textTransform: 'uppercase' }}>Встроенные</span>
+            </div>
+
+            <div
+              ref={claudeEditRef}
+              onClick={() => !editingClaude && setEditingClaude(true)}
+              style={{ padding: 10, background: editingClaude ? '#24242a' : VR_CARD, border: `1px solid ${editingClaude ? '#DA7756' : VR_BORDER}`, borderRadius: 8, cursor: editingClaude ? 'default' : 'pointer', marginBottom: 7, opacity: editingClaude || claudeDefaultPromptEnabled ? 1 : 0.6 }}
+            >
+              {editingClaude ? (
+                <textarea value={claudeDefaultPrompt} onChange={(e) => setClaudeDefaultPrompt(e.target.value)} onBlur={handleClaudeBlur} placeholder="Стартовый промпт Claude..." rows={4} autoFocus style={{ ...vrFieldStyle, height: 'auto', minHeight: 110, resize: 'vertical', fontFamily: 'ui-monospace, Menlo, monospace', fontSize: 12 }} />
+              ) : (
+                <>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
+                    <div style={{ fontSize: 13, color: '#DA7756', fontWeight: 650 }}>Claude Default</div>
+                    <button onClick={(e) => { e.stopPropagation(); setClaudeDefaultPromptEnabled(!claudeDefaultPromptEnabled); }} style={{ width: 32, height: 18, borderRadius: 9, border: 'none', backgroundColor: claudeDefaultPromptEnabled ? '#DA7756' : '#444', position: 'relative', cursor: 'pointer', padding: 0, flexShrink: 0 }}>
+                      <span style={{ width: 14, height: 14, borderRadius: '50%', backgroundColor: '#fff', position: 'absolute', top: 2, left: claudeDefaultPromptEnabled ? 16 : 2, transition: 'left 0.2s' }} />
+                    </button>
+                  </div>
+                  <div style={{ fontSize: 11, color: claudeDefaultPromptEnabled ? VR_DIM : '#555', overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', opacity: claudeDefaultPromptEnabled ? 1 : 0.5 }}>
+                    {claudeDefaultPrompt || 'Не задан'}
+                  </div>
+                </>
+              )}
+            </div>
+
+            <div
+              ref={docEditRef}
+              onClick={() => !editingDocPrompt && setEditingDocPrompt(true)}
+              style={{ padding: 10, background: editingDocPrompt ? '#24242a' : VR_CARD, border: `1px solid ${editingDocPrompt ? VR_GREEN : VR_BORDER}`, borderRadius: 8, cursor: editingDocPrompt ? 'default' : 'pointer', marginBottom: 7 }}
+            >
+              {editingDocPrompt ? (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <span style={{ fontSize: 11, color: VR_DIM }}>Источник:</span>
+                    <button onClick={(e) => { e.stopPropagation(); setDocPromptUseFile(true); }} style={{ padding: '4px 9px', backgroundColor: docPrompt.useFile ? VR_GREEN : VR_FIELD, color: docPrompt.useFile ? '#fff' : VR_DIM, border: `1px solid ${docPrompt.useFile ? VR_GREEN : VR_BORDER}`, borderRadius: 7, fontSize: 11, cursor: 'pointer' }}>Файл</button>
+                    <button onClick={(e) => { e.stopPropagation(); setDocPromptUseFile(false); }} style={{ padding: '4px 9px', backgroundColor: !docPrompt.useFile ? VR_GREEN : VR_FIELD, color: !docPrompt.useFile ? '#fff' : VR_DIM, border: `1px solid ${!docPrompt.useFile ? VR_GREEN : VR_BORDER}`, borderRadius: 7, fontSize: 11, cursor: 'pointer' }}>Inline</button>
+                  </div>
+                  {docPrompt.useFile ? (
+                    <input type="text" value={localDocFilePath} onChange={(e) => setLocalDocFilePath(e.target.value)} onBlur={handleDocBlur} placeholder="Путь к файлу..." autoFocus style={{ ...vrFieldStyle, fontFamily: 'ui-monospace, Menlo, monospace', fontSize: 11.5 }} />
+                  ) : (
+                    <textarea value={localDocInlineContent} onChange={(e) => setLocalDocInlineContent(e.target.value)} onBlur={handleDocBlur} rows={4} autoFocus style={{ ...vrFieldStyle, height: 'auto', minHeight: 120, resize: 'vertical', fontFamily: 'ui-monospace, Menlo, monospace', fontSize: 12 }} />
+                  )}
+                  <button onClick={(e) => { e.stopPropagation(); resetDoc(); }} style={{ alignSelf: 'flex-start', padding: 0, backgroundColor: 'transparent', color: VR_DIM, border: 'none', fontSize: 11, cursor: 'pointer' }}>Сбросить</button>
+                </div>
+              ) : (
+                <>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
+                    <span style={{ fontSize: 13, color: VR_GREEN, fontWeight: 650 }}>Documentation</span>
+                    <VRTag accent={docPrompt.useFile}>{docPrompt.useFile ? 'ФАЙЛ' : 'INLINE'}</VRTag>
+                  </div>
+                  <div style={{ fontSize: 11, color: VR_DIM, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {docPrompt.useFile ? localDocFilePath : (localDocInlineContent || 'Не задан')}
+                  </div>
+                </>
+              )}
+            </div>
+
+            <div
+              ref={postCheckEditRef}
+              onClick={() => !editingPostCheck && setEditingPostCheck(true)}
+              style={{ padding: 10, background: editingPostCheck ? '#24242a' : VR_CARD, border: `1px solid ${editingPostCheck ? '#a78bfa' : VR_BORDER}`, borderRadius: 8, cursor: editingPostCheck ? 'default' : 'pointer' }}
+            >
+              {editingPostCheck ? (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                  <span style={{ fontSize: 11, color: '#a78bfa', fontWeight: 650 }}>Post-check</span>
+                  <textarea
+                    value={localPostCheckContent}
+                    onChange={(e) => setLocalPostCheckContent(e.target.value)}
+                    onBlur={(e) => {
+                      if (isBlurInsideContainer(e, postCheckEditRef)) return;
+                      useUIStore.getState().setPostCheckPrompt(localPostCheckContent);
+                      setEditingPostCheck(false);
+                    }}
+                    rows={5}
+                    autoFocus
+                    style={{ ...vrFieldStyle, height: 'auto', minHeight: 140, resize: 'vertical', fontFamily: 'ui-monospace, Menlo, monospace', fontSize: 12 }}
+                  />
+                </div>
+              ) : (
+                <>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
+                    <span style={{ fontSize: 13, color: '#a78bfa', fontWeight: 650 }}>Post-check</span>
+                  </div>
+                  <div style={{ fontSize: 11, color: VR_DIM, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {localPostCheckContent || 'Не задан'}
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+
+        <div style={{ minHeight: 0, background: '#17171a', border: `1px solid ${VR_BORDER}`, borderRadius: 10, overflow: 'hidden' }}>
+          {renderAIPromptEditor()}
+        </div>
+      </div>
+    );
+  };
+
   // Close on Escape or Cmd+,
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -1833,6 +2686,20 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [isOpen, onClose]);
+
+  const commitClaudeCodeModel = (index: number, patch: { id?: string; label?: string }) => {
+    const models = claudeCodeSettings.models.map((m, i) => (i === index ? { ...m, ...patch } : m));
+    setClaudeCodeSettings({ ...claudeCodeSettings, models });
+  };
+
+  const commitClaudeCodeEffort = (index: number, value: string) => {
+    const efforts = claudeCodeSettings.efforts.map((level, i) => (i === index ? value : level));
+    setClaudeCodeSettings({ ...claudeCodeSettings, efforts });
+  };
+
+  const commitInputOnEnter = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'Enter') (e.currentTarget as HTMLInputElement).blur();
+  };
 
   if (!isOpen) return null;
 
@@ -1909,7 +2776,8 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
             { id: 'ai', label: 'AI' },
             { id: 'fonts', label: 'Размеры' },
             { id: 'colors', label: 'Системные' },
-            { id: 'shortcuts', label: 'Горячие клавиши' }
+            { id: 'shortcuts', label: 'Горячие клавиши' },
+            { id: 'projects', label: 'Проекты' }
           ] as { id: SettingsTab; label: string }[]).map((tab) => (
             <button
               key={tab.id}
@@ -1983,6 +2851,10 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                 ))}
               </div>
             </div>
+          )}
+
+          {activeTab === 'projects' && (
+            <ProjectIconsSettings />
           )}
 
           {activeTab === 'fonts' && (
@@ -2128,6 +3000,54 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                 activeProjectId={activeProjectId}
               />
 
+              <div style={{ padding: '14px', backgroundColor: '#222', border: '1px solid #333', borderRadius: '10px', marginBottom: '12px' }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginBottom: '10px' }}>
+                  <div style={{ fontSize: '11px', fontWeight: '600', color: '#666', textTransform: 'uppercase' }}>
+                    Claude Code команды
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setClaudeCodeSettings(DEFAULT_CLAUDE_CODE_SETTINGS)}
+                    style={{ ...vrSmallBtnStyle('neutral'), height: 24, padding: '0 8px' }}
+                  >
+                    reset
+                  </button>
+                </div>
+
+                <SettingsSubSectionHeader title="Модели" />
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))', gap: 6 }}>
+                  {claudeCodeSettings.models.map((model, index) => (
+                    <div key={`${index}-${model.id}`} style={{ display: 'grid', gridTemplateColumns: '70px 1fr', gap: 6, alignItems: 'center' }}>
+                      <input
+                        defaultValue={model.label}
+                        onBlur={(e) => commitClaudeCodeModel(index, { label: e.currentTarget.value })}
+                        onKeyDown={commitInputOnEnter}
+                        style={{ ...vrFieldStyle, height: 28, fontSize: 11.5, padding: '5px 7px' }}
+                      />
+                      <input
+                        defaultValue={model.id}
+                        onBlur={(e) => commitClaudeCodeModel(index, { id: e.currentTarget.value })}
+                        onKeyDown={commitInputOnEnter}
+                        style={{ ...vrFieldStyle, height: 28, fontSize: 11.5, padding: '5px 7px', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' }}
+                      />
+                    </div>
+                  ))}
+                </div>
+
+                <SettingsSubSectionHeader title="Effort" />
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(86px, 1fr))', gap: 6 }}>
+                  {claudeCodeSettings.efforts.map((level, index) => (
+                    <input
+                      key={`${index}-${level}`}
+                      defaultValue={level}
+                      onBlur={(e) => commitClaudeCodeEffort(index, e.currentTarget.value)}
+                      onKeyDown={commitInputOnEnter}
+                      style={{ ...vrFieldStyle, height: 28, fontSize: 11.5, padding: '5px 7px', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' }}
+                    />
+                  ))}
+                </div>
+              </div>
+
               {/* Семантическая индексация — единственная честно «системная» настройка
                   с runtime-эффектом. Управляет --parallel флагом, который main
                   передаёт build-index.sh при запуске. Выше 20 параллельных claude'ов
@@ -2158,704 +3078,206 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
           )}
 
           {activeTab === 'ai' && (
-            <div style={{ display: 'flex', gap: '24px', height: 'calc(85vh - 130px)' }}>
-              {/* Left Column */}
-              <div style={{ flex: 1, minWidth: 0, overflowY: 'auto', paddingRight: '4px' }}>
-                {editingGroupId !== null ? (() => {
-                  const grp = promptGroups.find(g => g.id === editingGroupId);
-                  if (!grp) return null;
-                  return (
-                    <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '12px', flexShrink: 0 }}>
-                        <input type="text" value={localGroupName} onChange={(e) => setLocalGroupName(e.target.value)} onBlur={() => { saveCurrentGroup(); setSavedGroupFlash('name'); if (savedGroupTimer.current) clearTimeout(savedGroupTimer.current); savedGroupTimer.current = setTimeout(() => setSavedGroupFlash(null), 400); }} placeholder="Название группы..." autoFocus style={{ flex: 1, padding: '8px', backgroundColor: '#1a1a1a', border: savedGroupFlash === 'name' ? '1px solid #22c55e' : '1px solid #444', borderRadius: '6px', color: '#fff', fontSize: '13px', outline: 'none', boxSizing: 'border-box' as const, transition: 'border-color 0.15s ease' }} />
-                        <div style={{ width: '1px', height: '20px', backgroundColor: '#333', flexShrink: 0 }} />
-                        <button onClick={(e) => { e.stopPropagation(); closeGroupEditor(); }} style={{ background: '#2a2a2a', border: '1px solid #393939', borderRadius: '4px', color: '#888', fontSize: '14px', cursor: 'pointer', padding: '1px 7px', lineHeight: 1 }}>✕</button>
-                      </div>
-                      <textarea
-                        value={localGroupDescription}
-                        onChange={(e) => {
-                          const lines = e.target.value.split('\n');
-                          if (lines.length <= 6) setLocalGroupDescription(e.target.value);
-                        }}
-                        onBlur={() => { saveCurrentGroup(); setSavedGroupFlash('description'); if (savedGroupTimer.current) clearTimeout(savedGroupTimer.current); savedGroupTimer.current = setTimeout(() => setSavedGroupFlash(null), 400); }}
-                        placeholder="Описание (необязательно)..."
-                        rows={Math.max(1, Math.min(5, localGroupDescription.split('\n').length))}
-                        style={{ padding: '8px', backgroundColor: '#1a1a1a', border: savedGroupFlash === 'description' ? '1px solid #22c55e' : '1px solid #444', borderRadius: '6px', color: '#aaa', fontSize: '12px', outline: 'none', boxSizing: 'border-box' as const, transition: 'border-color 0.15s ease', marginBottom: '12px', flexShrink: 0, resize: 'none', fontFamily: 'inherit', overflowY: localGroupDescription.split('\n').length > 5 ? 'auto' : 'hidden', maxHeight: '110px' }}
-                      />
-                      <div style={{ marginTop: 'auto', flexShrink: 0 }}>
-                        <button onClick={(e) => { e.stopPropagation(); deletePromptGroup(editingGroupId); }} style={{ padding: '4px 8px', backgroundColor: 'transparent', color: '#ef4444', border: 'none', fontSize: '10px', cursor: 'pointer' }}>Удалить группу</button>
-                      </div>
-                    </div>
-                  );
-                })() : editingInsertionIndex !== null ? (() => {
-                  const ins = prompts[editingInsertionIndex];
-                  if (!ins) return null;
-                  return (
-                    <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '12px', flexShrink: 0 }}>
-                        <input type="text" value={localInsertionTitle} onChange={(e) => setLocalInsertionTitle(e.target.value)} onBlur={() => { saveCurrentInsertion(); setSavedInsertionFlash('title'); if (savedInsertionTimer.current) clearTimeout(savedInsertionTimer.current); savedInsertionTimer.current = setTimeout(() => setSavedInsertionFlash(null), 400); }} placeholder="Название..." autoFocus style={{ flex: 1, padding: '8px', backgroundColor: '#1a1a1a', border: savedInsertionFlash === 'title' ? '1px solid #22c55e' : '1px solid #444', borderRadius: '6px', color: '#fff', fontSize: '13px', outline: 'none', boxSizing: 'border-box' as const, transition: 'border-color 0.15s ease' }} />
-                        <div style={{ width: '1px', height: '20px', backgroundColor: '#333', flexShrink: 0 }} />
-                        <button onClick={(e) => { e.stopPropagation(); closeInsertionEditor(); }} style={{ background: '#2a2a2a', border: '1px solid #393939', borderRadius: '4px', color: '#888', fontSize: '14px', cursor: 'pointer', padding: '1px 7px', lineHeight: 1 }}>✕</button>
-                      </div>
-                      <textarea value={localInsertionContent} onChange={(e) => setLocalInsertionContent(e.target.value)} onBlur={() => { saveCurrentInsertion(); setSavedInsertionFlash('content'); if (savedInsertionTimer.current) clearTimeout(savedInsertionTimer.current); savedInsertionTimer.current = setTimeout(() => setSavedInsertionFlash(null), 400); }} placeholder="Содержимое..." style={{ flex: 1, padding: '10px', backgroundColor: '#1a1a1a', border: savedInsertionFlash === 'content' ? '1px solid #22c55e' : '1px solid #444', borderRadius: '6px', color: '#aaa', fontSize: '11px', fontFamily: 'monospace', outline: 'none', resize: 'none', boxSizing: 'border-box' as const, minHeight: 0, transition: 'border-color 0.15s ease' }} />
-                      {/* File attachments */}
-                      <div style={{ marginTop: '8px', flexShrink: 0, display: 'flex', flexDirection: 'column', gap: '4px' }}>
-                        {localInsertionFilePaths.map((fp, idx) => (
-                          <div key={idx} style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
-                            <span style={{ fontSize: '10px', color: '#666', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, direction: 'rtl', textAlign: 'left' }}>{fp}</span>
-                            <button onClick={(e) => {
-                              e.stopPropagation();
-                              const updated = localInsertionFilePaths.filter((_, i) => i !== idx);
-                              setLocalInsertionFilePaths(updated);
-                              saveCurrentInsertion(updated);
-                            }} style={{ background: 'none', border: 'none', color: '#666', fontSize: '12px', cursor: 'pointer', padding: '0 2px', flexShrink: 0 }}>✕</button>
-                          </div>
-                        ))}
-                        {insertionFileInputs.map((input, idx) => (
-                          <div key={`input-${idx}`} style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
-                            <input type="text" autoFocus value={input.value}
-                              onChange={(e) => { const u = [...insertionFileInputs]; u[idx] = { value: e.target.value, valid: null }; setInsertionFileInputs(u); }}
-                              onBlur={async () => {
-                                const val = insertionFileInputs[idx]?.value?.trim();
-                                if (!val) { setInsertionFileInputs(prev => prev.filter((_, i) => i !== idx)); return; }
-                                const result = await ipcRenderer.invoke('ai-prompts:check-file', val);
-                                if (result.exists) {
-                                  const updated = [...localInsertionFilePaths, val];
-                                  setLocalInsertionFilePaths(updated);
-                                  setInsertionFileInputs(prev => prev.filter((_, i) => i !== idx));
-                                  saveCurrentInsertion(updated);
-                                } else {
-                                  const u = [...insertionFileInputs]; u[idx] = { ...u[idx], valid: false }; setInsertionFileInputs(u);
-                                }
-                              }}
-                              onKeyDown={(e) => { if (e.key === 'Escape') setInsertionFileInputs(prev => prev.filter((_, i) => i !== idx)); }}
-                              placeholder="/Users/..."
-                              style={{ flex: 1, padding: '3px 6px', backgroundColor: '#1a1a1a', border: `1px solid ${input.valid === false ? '#ef4444' : '#444'}`, borderRadius: '4px', color: '#aaa', fontSize: '10px', fontFamily: 'monospace', outline: 'none' }}
-                            />
-                            <button onClick={(e) => { e.stopPropagation(); setInsertionFileInputs(prev => prev.filter((_, i) => i !== idx)); }} style={{ background: 'none', border: 'none', color: '#666', fontSize: '12px', cursor: 'pointer', padding: '0 2px', flexShrink: 0 }}>✕</button>
-                          </div>
-                        ))}
-                        <div style={{ display: 'flex', gap: '4px' }}>
-                          <button onClick={(e) => { e.stopPropagation(); setInsertionFileInputs(prev => [...prev, { value: '', valid: null }]); }} style={{ padding: '2px 6px', backgroundColor: 'transparent', color: '#666', border: '1px solid #333', borderRadius: '4px', fontSize: '10px', cursor: 'pointer' }}>+ путь</button>
-                          <button onClick={async (e) => {
-                            e.stopPropagation();
-                            const result = await ipcRenderer.invoke('ai-prompts:select-file');
-                            if (result.success && result.data) {
-                              const updated = [...localInsertionFilePaths, result.data];
-                              setLocalInsertionFilePaths(updated);
-                              saveCurrentInsertion(updated);
-                            }
-                          }} style={{ padding: '2px 6px', backgroundColor: 'transparent', color: '#666', border: '1px solid #333', borderRadius: '4px', fontSize: '10px', cursor: 'pointer' }}>+ файл</button>
-                        </div>
-                      </div>
-                      <div style={{ marginTop: '8px', flexShrink: 0 }}>
-                        <button onClick={(e) => { e.stopPropagation(); deletePrompt(editingInsertionIndex); }} style={{ padding: '4px 8px', backgroundColor: 'transparent', color: '#ef4444', border: 'none', fontSize: '10px', cursor: 'pointer' }}>Удалить</button>
-                      </div>
-                    </div>
-                  );
-                })() : (<>
-                <div style={{ fontSize: '11px', fontWeight: '600', color: '#666', marginBottom: '12px', textTransform: 'uppercase' }}>
-                  AI промпты (Gemini)
-                </div>
-
-                {aiPrompts.map((aiPrompt) => {
-                  const isSelected = editingPromptId === aiPrompt.id;
-                  const displayName = isSelected ? localPromptName : aiPrompt.name;
-                  const displayColor = isSelected ? localPromptColor : aiPrompt.color;
-                  const displayModel = isSelected ? localPromptModel : aiPrompt.model;
-                  const displayThinking = isSelected ? localPromptThinkingLevel : aiPrompt.thinkingLevel;
-                  const displayMenu = isSelected ? localPromptShowInMenu : aiPrompt.showInContextMenu;
-
-                  return (
-                    <div
-                      key={aiPrompt.id}
-                      onClick={() => startEditingAIPrompt(aiPrompt)}
-                      style={{
-                        padding: '12px',
-                        backgroundColor: isSelected ? '#252525' : '#222',
-                        border: `2px solid ${isSelected ? displayColor : displayColor + '33'}`,
-                        borderRadius: '10px',
-                        cursor: 'pointer',
-                        marginBottom: '10px'
-                      }}
-                    >
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                          <span style={{ fontSize: '13px', color: displayColor, fontWeight: '500' }}>{displayName}</span>
-                          <span style={{ fontSize: '9px', padding: '1px 4px', backgroundColor: `${displayColor}22`, color: displayColor, borderRadius: '3px' }}>
-                            {displayModel.includes('pro') ? 'PRO' : 'FLASH'}
-                          </span>
-                          {displayThinking !== 'HIGH' && (
-                            <span style={{ fontSize: '9px', padding: '1px 4px', backgroundColor: '#ffffff11', color: '#888', borderRadius: '3px' }}>
-                              {displayThinking}
-                            </span>
-                          )}
-                          {displayMenu && (
-                            <span style={{ fontSize: '9px', padding: '1px 4px', backgroundColor: '#ffffff11', color: '#666', borderRadius: '3px' }}>ПКМ</span>
-                          )}
-                        </div>
-                    </div>
-                  );
-                })}
-
-                {/* Add new AI prompt button */}
-                <button
-                  onClick={addAIPrompt}
-                  style={{ width: '100%', padding: '10px', backgroundColor: '#222', border: '2px dashed #444', borderRadius: '10px', color: '#666', fontSize: '12px', cursor: 'pointer', marginBottom: '10px' }}
-                >
-                  + Добавить промпт
-                </button>
-
-                {/* Rewind Assignment */}
-                <div style={{ padding: '12px', backgroundColor: '#222', border: '1px solid #333', borderRadius: '10px', marginBottom: '10px' }}>
-                  <div style={{ fontSize: '11px', color: '#888', marginBottom: '6px' }}>Промпт для "Откатиться":</div>
-                  <select
-                    value={rewindPromptId}
-                    onChange={(e) => setRewindPromptId(e.target.value)}
-                    style={{ width: '100%', padding: '6px 8px', backgroundColor: '#1a1a1a', border: '1px solid #444', borderRadius: '6px', color: '#ccc', fontSize: '11px', outline: 'none', cursor: 'pointer' }}
+            <div style={{ height: 'calc(85vh - 130px)', minHeight: 0, display: 'flex', flexDirection: 'column', gap: 12, overflow: 'hidden' }}>
+              <div style={{ display: 'inline-flex', alignSelf: 'flex-start', background: VR_FIELD, border: `1px solid ${VR_BORDER}`, borderRadius: 9, padding: 3, gap: 3, flexShrink: 0 }}>
+                {([
+                  { id: 'text' as AISubTab, label: 'Текстовые вставки' },
+                  { id: 'system' as AISubTab, label: 'Системные промпты' },
+                ]).map((tab) => (
+                  <button
+                    key={tab.id}
+                    onClick={() => switchAISubTab(tab.id)}
+                    style={{
+                      height: 28,
+                      padding: '0 12px',
+                      borderRadius: 7,
+                      border: 'none',
+                      background: aiSubTab === tab.id ? '#24242a' : 'transparent',
+                      color: aiSubTab === tab.id ? VR_TEXT : VR_DIM,
+                      fontSize: 12,
+                      fontWeight: 650,
+                      cursor: 'pointer',
+                    }}
                   >
-                    {aiPrompts.map((p) => (
-                      <option key={p.id} value={p.id}>{p.name}</option>
-                    ))}
-                  </select>
-                </div>
-
-                {/* Separator */}
-                <div style={{ borderTop: '1px solid #333', margin: '16px 0 12px', position: 'relative' as const }}>
-                  <span style={{ position: 'absolute' as const, top: '-8px', left: '12px', backgroundColor: '#1a1a1a', padding: '0 8px', fontSize: '10px', color: '#555', textTransform: 'uppercase' }}>
-                    Системные промпты
-                  </span>
-                </div>
-
-                {/* Claude Default Prompt */}
-                <div
-                  ref={claudeEditRef}
-                  onClick={() => !editingClaude && setEditingClaude(true)}
-                  style={{
-                    padding: '12px',
-                    backgroundColor: editingClaude ? '#252525' : '#222',
-                    border: editingClaude ? '2px solid #DA7756' : `2px solid ${claudeDefaultPromptEnabled ? '#DA775633' : '#DA775615'}`,
-                    borderRadius: '10px',
-                    cursor: editingClaude ? 'default' : 'pointer',
-                    marginBottom: '10px',
-                    opacity: editingClaude || claudeDefaultPromptEnabled ? 1 : 0.6
-                  }}
-                >
-                  {editingClaude ? (
-                    <textarea
-                      value={claudeDefaultPrompt}
-                      onChange={(e) => setClaudeDefaultPrompt(e.target.value)}
-                      onBlur={handleClaudeBlur}
-                      placeholder="Стартовый промпт Claude..."
-                      rows={3}
-                      autoFocus
-                      style={{ width: '100%', padding: '8px', backgroundColor: '#1a1a1a', border: '1px solid #444', borderRadius: '6px', color: '#aaa', fontSize: '11px', fontFamily: 'monospace', outline: 'none', resize: 'none', boxSizing: 'border-box' as const }}
-                    />
-                  ) : (
-                    <>
-                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '4px' }}>
-                        <div style={{ fontSize: '13px', color: '#DA7756', fontWeight: '500' }}>Claude Default</div>
-                        <div
-                          onClick={(e) => { e.stopPropagation(); setClaudeDefaultPromptEnabled(!claudeDefaultPromptEnabled); }}
-                          style={{ width: '32px', height: '18px', borderRadius: '9px', backgroundColor: claudeDefaultPromptEnabled ? '#DA7756' : '#444', position: 'relative' as const, cursor: 'pointer', transition: 'background-color 0.2s', flexShrink: 0 }}
-                        >
-                          <div style={{ width: '14px', height: '14px', borderRadius: '50%', backgroundColor: '#fff', position: 'absolute' as const, top: '2px', left: claudeDefaultPromptEnabled ? '16px' : '2px', transition: 'left 0.2s' }} />
-                        </div>
-                      </div>
-                      <div style={{ fontSize: '11px', color: claudeDefaultPromptEnabled ? '#666' : '#555', overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' as const, opacity: claudeDefaultPromptEnabled ? 1 : 0.5 }}>
-                        {claudeDefaultPrompt || 'Не задан'}
-                      </div>
-                    </>
-                  )}
-                </div>
-
-                {/* Documentation Prompt */}
-                <div
-                  ref={docEditRef}
-                  onClick={() => !editingDocPrompt && setEditingDocPrompt(true)}
-                  style={{
-                    padding: '12px',
-                    backgroundColor: editingDocPrompt ? '#252525' : '#222',
-                    border: editingDocPrompt ? '2px solid #22c55e' : '2px solid #22c55e33',
-                    borderRadius: '10px',
-                    cursor: editingDocPrompt ? 'default' : 'pointer'
-                  }}
-                >
-                  {editingDocPrompt ? (
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                        <span style={{ fontSize: '11px', color: '#888' }}>Источник:</span>
-                        <button onClick={(e) => { e.stopPropagation(); setDocPromptUseFile(true); }} style={{ padding: '3px 8px', backgroundColor: docPrompt.useFile ? '#22c55e' : '#333', color: docPrompt.useFile ? '#fff' : '#888', border: 'none', borderRadius: '4px', fontSize: '10px', cursor: 'pointer' }}>Файл</button>
-                        <button onClick={(e) => { e.stopPropagation(); setDocPromptUseFile(false); }} style={{ padding: '3px 8px', backgroundColor: !docPrompt.useFile ? '#22c55e' : '#333', color: !docPrompt.useFile ? '#fff' : '#888', border: 'none', borderRadius: '4px', fontSize: '10px', cursor: 'pointer' }}>Inline</button>
-                      </div>
-                      {docPrompt.useFile ? (
-                        <input type="text" value={localDocFilePath} onChange={(e) => setLocalDocFilePath(e.target.value)} onBlur={handleDocBlur} placeholder="Путь к файлу..." autoFocus style={{ width: '100%', padding: '8px', backgroundColor: '#1a1a1a', border: '1px solid #444', borderRadius: '6px', color: '#aaa', fontSize: '11px', fontFamily: 'monospace', outline: 'none', boxSizing: 'border-box' as const }} />
-                      ) : (
-                        <textarea value={localDocInlineContent} onChange={(e) => setLocalDocInlineContent(e.target.value)} onBlur={handleDocBlur} rows={3} autoFocus style={{ width: '100%', padding: '8px', backgroundColor: '#1a1a1a', border: '1px solid #444', borderRadius: '6px', color: '#aaa', fontSize: '11px', fontFamily: 'monospace', outline: 'none', resize: 'none', boxSizing: 'border-box' as const }} />
-                      )}
-                      <button onClick={(e) => { e.stopPropagation(); resetDoc(); }} style={{ alignSelf: 'flex-start', padding: '4px 8px', backgroundColor: 'transparent', color: '#666', border: 'none', fontSize: '10px', cursor: 'pointer' }}>Сбросить</button>
-                    </div>
-                  ) : (
-                    <>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '4px' }}>
-                        <span style={{ fontSize: '13px', color: '#22c55e', fontWeight: '500' }}>Documentation</span>
-                        <span style={{ fontSize: '9px', padding: '1px 4px', backgroundColor: docPrompt.useFile ? '#22c55e22' : '#8b5cf622', color: docPrompt.useFile ? '#22c55e' : '#8b5cf6', borderRadius: '3px' }}>{docPrompt.useFile ? 'ФАЙЛ' : 'INLINE'}</span>
-                      </div>
-                      <div style={{ fontSize: '11px', color: '#666', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                        {docPrompt.useFile ? localDocFilePath : (localDocInlineContent || 'Не задан')}
-                      </div>
-                    </>
-                  )}
-                </div>
-
-                {/* Post-check Prompt */}
-                <div
-                  ref={postCheckEditRef}
-                  onClick={() => !editingPostCheck && setEditingPostCheck(true)}
-                  style={{
-                    padding: '12px',
-                    backgroundColor: editingPostCheck ? '#252525' : '#222',
-                    border: editingPostCheck ? '2px solid #a78bfa' : '2px solid #a78bfa33',
-                    borderRadius: '10px',
-                    cursor: editingPostCheck ? 'default' : 'pointer'
-                  }}
-                >
-                  {editingPostCheck ? (
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                      <span style={{ fontSize: '11px', color: '#a78bfa', fontWeight: '500' }}>Post-check</span>
-                      <textarea
-                        value={localPostCheckContent}
-                        onChange={(e) => setLocalPostCheckContent(e.target.value)}
-                        onBlur={(e) => {
-                          if (isBlurInsideContainer(e, postCheckEditRef)) return;
-                          useUIStore.getState().setPostCheckPrompt(localPostCheckContent);
-                          setEditingPostCheck(false);
-                        }}
-                        rows={4}
-                        autoFocus
-                        style={{ width: '100%', padding: '8px', backgroundColor: '#1a1a1a', border: '1px solid #444', borderRadius: '6px', color: '#aaa', fontSize: '11px', fontFamily: 'monospace', outline: 'none', resize: 'none', boxSizing: 'border-box' as const }}
-                      />
-                    </div>
-                  ) : (
-                    <>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '4px' }}>
-                        <span style={{ fontSize: '13px', color: '#a78bfa', fontWeight: '500' }}>Post-check</span>
-                      </div>
-                      <div style={{ fontSize: '11px', color: '#666', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                        {localPostCheckContent || 'Не задан'}
-                      </div>
-                    </>
-                  )}
-                </div>
-                </>)}
+                    {tab.label}
+                  </button>
+                ))}
               </div>
-
-              {/* Right Column */}
-              <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column' }}>
-                {editingPromptId !== null ? (
-                  (() => {
-                    const editingAIPrompt = aiPrompts.find(p => p.id === editingPromptId);
-                    if (!editingAIPrompt) return null;
-
-                    // Helper: save all local edits + overrides to DB (all fields from local state, no stale store reads)
-                    const saveField = (overrides: Partial<AIPrompt>) => {
-                      saveAIPrompt({
-                        ...editingAIPrompt,
-                        name: localPromptName,
-                        content: localPromptContent,
-                        color: localPromptColor,
-                        showInContextMenu: localPromptShowInMenu,
-                        model: localPromptModel,
-                        thinkingLevel: localPromptThinkingLevel,
-                        filePaths: localPromptFilePaths,
-                        ...overrides
-                      });
-                    };
-
-                    return (
-                      <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
-                        {/* Header: Name input + close button */}
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '12px', flexShrink: 0 }}>
-                          <input
-                            type="text"
-                            value={localPromptName}
-                            onChange={(e) => setLocalPromptName(e.target.value)}
-                            onBlur={() => saveCurrentAIPrompt('name')}
-                            placeholder="Название..."
-                            style={{ flex: 1, padding: '8px', backgroundColor: '#1a1a1a', border: savedFlashField === 'name' ? '1px solid #22c55e' : '1px solid #444', borderRadius: '6px', color: '#fff', fontSize: '13px', outline: 'none', boxSizing: 'border-box' as const, transition: 'border-color 0.15s ease' }}
-                          />
-                          <div style={{ width: '1px', height: '20px', backgroundColor: '#333', flexShrink: 0 }} />
-                          <button
-                            onClick={(e) => { e.stopPropagation(); closeAIPromptEditor(); }}
-                            style={{ background: '#2a2a2a', border: '1px solid #393939', borderRadius: '4px', color: '#888', fontSize: '14px', cursor: 'pointer', padding: '1px 7px', lineHeight: 1 }}
-                          >
-                            ✕
-                          </button>
-                        </div>
-
-                        {/* Controls */}
-                        <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginBottom: '12px', flexShrink: 0 }}>
-                          {/* Model selector — full names */}
-                          <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                            <span style={{ fontSize: '10px', color: '#888', flexShrink: 0 }}>Модель:</span>
-                            {([
-                              { value: 'gemini-3-flash-preview' as AIModel, label: 'Gemini 3 Flash' },
-                              { value: 'gemini-3-pro-preview' as AIModel, label: 'Gemini 3 Pro' }
-                            ]).map((m) => (
-                              <button
-                                key={m.value}
-                                onClick={(e) => { e.stopPropagation(); setLocalPromptModel(m.value); saveField({ model: m.value }); }}
-                                style={{
-                                  padding: '3px 10px',
-                                  backgroundColor: localPromptModel === m.value ? localPromptColor : '#333',
-                                  color: localPromptModel === m.value ? '#fff' : '#888',
-                                  border: 'none', borderRadius: '4px', fontSize: '10px', cursor: 'pointer'
-                                }}
-                              >
-                                {m.label}
-                              </button>
-                            ))}
-                          </div>
-
-                          {/* Thinking level selector */}
-                          <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                            <span style={{ fontSize: '10px', color: '#888', flexShrink: 0 }}>Думание:</span>
-                            {(['NONE', 'LOW', 'MEDIUM', 'HIGH'] as ThinkingLevel[]).map((level) => (
-                              <button
-                                key={level}
-                                onClick={(e) => { e.stopPropagation(); setLocalPromptThinkingLevel(level); saveField({ thinkingLevel: level }); }}
-                                style={{
-                                  padding: '3px 8px',
-                                  backgroundColor: localPromptThinkingLevel === level ? localPromptColor : '#333',
-                                  color: localPromptThinkingLevel === level ? '#fff' : '#888',
-                                  border: 'none', borderRadius: '4px', fontSize: '10px', cursor: 'pointer'
-                                }}
-                              >
-                                {level}
-                              </button>
-                            ))}
-                          </div>
-
-                          {/* Color picker */}
-                          <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
-                            <span style={{ fontSize: '10px', color: '#888', flexShrink: 0 }}>Цвет:</span>
-                            {['#0ea5e9', '#a855f7', '#f59e0b', '#22c55e', '#ef4444', '#6366f1', '#ec4899'].map((c) => (
-                              <div
-                                key={c}
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  setLocalPromptColor(c);
-                                  saveField({ color: c });
-                                }}
-                                style={{
-                                  width: '14px', height: '14px', borderRadius: '50%', backgroundColor: c, cursor: 'pointer',
-                                  border: localPromptColor === c ? '2px solid #fff' : '2px solid transparent'
-                                }}
-                              />
-                            ))}
-                          </div>
-
-                          {/* Context menu toggle */}
-                          <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                            <span style={{ fontSize: '10px', color: '#888' }}>В контекстном меню:</span>
-                            <div
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                const newVal = !localPromptShowInMenu;
-                                setLocalPromptShowInMenu(newVal);
-                                saveField({ showInContextMenu: newVal });
-                              }}
-                              style={{ width: '28px', height: '16px', borderRadius: '8px', backgroundColor: localPromptShowInMenu ? localPromptColor : '#444', position: 'relative' as const, cursor: 'pointer', transition: 'background-color 0.2s', flexShrink: 0 }}
-                            >
-                              <div style={{ width: '12px', height: '12px', borderRadius: '50%', backgroundColor: '#fff', position: 'absolute' as const, top: '2px', left: localPromptShowInMenu ? '14px' : '2px', transition: 'left 0.2s' }} />
-                            </div>
-                          </div>
-                        </div>
-
-                        {/* Textarea — fills remaining space */}
-                        <textarea
-                          value={localPromptContent}
-                          onChange={(e) => setLocalPromptContent(e.target.value)}
-                          onBlur={() => saveCurrentAIPrompt('content')}
-                          placeholder="Содержимое промпта..."
-                          style={{
-                            flex: 1,
-                            padding: '10px',
-                            backgroundColor: '#1a1a1a',
-                            border: savedFlashField === 'content' ? '1px solid #22c55e' : '1px solid #444',
-                            transition: 'border-color 0.15s ease',
-                            borderRadius: '6px',
-                            color: '#aaa',
-                            fontSize: '11px',
-                            fontFamily: 'monospace',
-                            outline: 'none',
-                            resize: 'none',
-                            boxSizing: 'border-box' as const,
-                            minHeight: 0
-                          }}
-                        />
-
-                        {/* File attachments */}
-                        <div style={{ marginTop: '8px', flexShrink: 0, display: 'flex', flexDirection: 'column', gap: '4px' }}>
-                          {/* Existing file paths */}
-                          {localPromptFilePaths.map((fp, idx) => (
-                            <div key={idx} style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
-                              <span style={{ fontSize: '10px', color: '#666', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, direction: 'rtl', textAlign: 'left' }}>
-                                {fp}
-                              </span>
-                              <button
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  const updated = localPromptFilePaths.filter((_, i) => i !== idx);
-                                  setLocalPromptFilePaths(updated);
-                                  saveField({ filePaths: updated });
-                                }}
-                                style={{ background: 'none', border: 'none', color: '#666', fontSize: '12px', cursor: 'pointer', padding: '0 2px', flexShrink: 0 }}
-                              >
-                                ✕
-                              </button>
-                            </div>
-                          ))}
-                          {/* Pending file path inputs */}
-                          {filePathInputs.map((input, idx) => (
-                            <div key={`input-${idx}`} style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
-                              <input
-                                type="text"
-                                autoFocus
-                                value={input.value}
-                                onChange={(e) => {
-                                  const updated = [...filePathInputs];
-                                  updated[idx] = { value: e.target.value, valid: null };
-                                  setFilePathInputs(updated);
-                                }}
-                                onBlur={async () => {
-                                  const val = filePathInputs[idx]?.value?.trim();
-                                  if (!val) {
-                                    setFilePathInputs(prev => prev.filter((_, i) => i !== idx));
-                                    return;
-                                  }
-                                  const result = await ipcRenderer.invoke('ai-prompts:check-file', val);
-                                  if (result.exists) {
-                                    const updated = [...localPromptFilePaths, val];
-                                    setLocalPromptFilePaths(updated);
-                                    setFilePathInputs(prev => prev.filter((_, i) => i !== idx));
-                                    saveField({ filePaths: updated });
-                                  } else {
-                                    const upd = [...filePathInputs];
-                                    upd[idx] = { ...upd[idx], valid: false };
-                                    setFilePathInputs(upd);
-                                  }
-                                }}
-                                onKeyDown={(e) => {
-                                  if (e.key === 'Escape') {
-                                    setFilePathInputs(prev => prev.filter((_, i) => i !== idx));
-                                  }
-                                }}
-                                placeholder="/Users/..."
-                                style={{
-                                  flex: 1, padding: '3px 6px', backgroundColor: '#1a1a1a',
-                                  border: `1px solid ${input.valid === false ? '#ef4444' : '#444'}`,
-                                  borderRadius: '4px', color: '#aaa', fontSize: '10px', fontFamily: 'monospace', outline: 'none'
-                                }}
-                              />
-                              <button
-                                onClick={(e) => { e.stopPropagation(); setFilePathInputs(prev => prev.filter((_, i) => i !== idx)); }}
-                                style={{ background: 'none', border: 'none', color: '#666', fontSize: '12px', cursor: 'pointer', padding: '0 2px', flexShrink: 0 }}
-                              >
-                                ✕
-                              </button>
-                            </div>
-                          ))}
-                          {/* Add file buttons */}
-                          <div style={{ display: 'flex', gap: '4px' }}>
-                            <button
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                setFilePathInputs(prev => [...prev, { value: '', valid: null }]);
-                              }}
-                              style={{ padding: '2px 6px', backgroundColor: 'transparent', color: '#666', border: '1px solid #333', borderRadius: '4px', fontSize: '10px', cursor: 'pointer' }}
-                            >
-                              + путь
-                            </button>
-                            <button
-                              onClick={async (e) => {
-                                e.stopPropagation();
-                                const result = await ipcRenderer.invoke('ai-prompts:select-file');
-                                if (result.success && result.data) {
-                                  const updated = [...localPromptFilePaths, result.data];
-                                  setLocalPromptFilePaths(updated);
-                                  saveField({ filePaths: updated });
-                                }
-                              }}
-                              style={{ padding: '2px 6px', backgroundColor: 'transparent', color: '#666', border: '1px solid #333', borderRadius: '4px', fontSize: '10px', cursor: 'pointer' }}
-                            >
-                              + файл
-                            </button>
-                          </div>
-                        </div>
-
-                        {/* Footer: Delete button (non-builtIn only) */}
-                        {!editingAIPrompt.isBuiltIn && (
-                          <div style={{ marginTop: '8px', flexShrink: 0 }}>
-                            <button
-                              onClick={(e) => { e.stopPropagation(); deleteAIPrompt(editingAIPrompt.id); setEditingPromptId(null); showToast('Deleted', 'success'); }}
-                              style={{ padding: '4px 8px', backgroundColor: 'transparent', color: '#ef4444', border: 'none', fontSize: '10px', cursor: 'pointer' }}
-                            >
-                              Удалить промпт
-                            </button>
-                          </div>
-                        )}
-                      </div>
-                    );
-                  })()
-                ) : (
-                  <>
-                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '12px', flexShrink: 0 }}>
-                      <div style={{ fontSize: '11px', fontWeight: '600', color: '#666', textTransform: 'uppercase' }}>
-                        Текстовые вставки
-                      </div>
-                      <div style={{ display: 'flex', gap: '6px' }}>
-                        <button onClick={addPromptGroup} style={{ padding: '4px 10px', backgroundColor: '#333', color: '#aaa', border: '1px solid #555', borderRadius: '4px', fontSize: '10px', cursor: 'pointer' }}>+ Группа</button>
-                        <button onClick={() => addPrompt()} style={{ padding: '4px 10px', backgroundColor: '#8b5cf6', color: '#fff', border: 'none', borderRadius: '4px', fontSize: '10px', cursor: 'pointer' }}>+ Добавить</button>
-                      </div>
-                    </div>
-
-                    <div ref={textListRef} data-group-drop="ungrouped" style={{ display: 'flex', flexDirection: 'column', overflowY: 'auto', flex: 1, minHeight: 0 }}>
-                      {prompts.length === 0 && promptGroups.length === 0 ? (
-                        <div style={{ padding: '24px', textAlign: 'center', color: '#555', fontSize: '12px', border: '2px dashed #333', borderRadius: '10px' }}>Пока нет промптов</div>
-                      ) : (() => {
-                        const flatItems = buildFlatItems();
-                        const flatGapH = dragFlatItemHeight.current;
-                        const flatGapTransition = flatDragReady ? 'height 0.12s ease-out, margin-bottom 0.12s ease-out' : 'none';
-                        return (<>
-                          {flatItems.map((item, flatIdx) => {
-                            // Suppress gap slot when hovering over a group zone (prompt will move INTO group, not reorder)
-                            const isOverGroupZone = dragOverGroupId !== null && dragOverGroupId !== 'ungrouped';
-                            const isFlatGapHere = draggingFlatIdx !== null && flatDropTarget === flatIdx && !isOverGroupZone;
-                            if (item.type === 'group') {
-                              const group = item.group;
-                              const groupPrompts = prompts.map((p, i) => ({ ...p, _idx: i })).filter(p => p.group_id === group.id);
-                              const isCollapsed = group.is_collapsed;
-                              const isDropTarget = (draggingTextIndex !== null || draggingFlatIdx !== null) && dragOverGroupId === group.id;
-                              const isGroupSelected = editingGroupId === group.id;
-                              const isFlatDragged = draggingFlatIdx === flatIdx;
-                              return (
-                                <React.Fragment key={`g-${group.id}`}>
-                                  <div style={{ height: isFlatGapHere ? `${flatGapH + 8}px` : '0px', marginBottom: isFlatGapHere ? '4px' : '0px', overflow: 'hidden', transition: flatGapTransition, boxSizing: 'border-box' as const }}>
-                                    <div style={{ height: `${flatGapH + 8}px`, borderRadius: '10px', border: '2px dashed #8b5cf640', backgroundColor: '#8b5cf608', boxSizing: 'border-box' as const }} />
-                                  </div>
-                                  <div
-                                    data-flat-container
-                                    data-group-drop={group.id}
-                                    style={{ marginBottom: '4px', borderRadius: '8px', border: isDropTarget ? '2px solid #8b5cf6' : '2px solid transparent', transition: 'border-color 0.15s ease', display: isFlatDragged ? 'none' : undefined }}
-                                  >
-                                    <div
-                                      data-flat-card
-                                      data-flat-idx={flatIdx}
-                                      data-hidden={isFlatDragged || undefined}
-                                      style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '11px 12px', marginBottom: '4px', backgroundColor: isGroupSelected ? '#252525' : '#222', border: isGroupSelected ? '2px solid #8b5cf6' : '2px solid #333', borderRadius: '10px', cursor: 'pointer', userSelect: 'none' }}
-                                      onClick={() => { if (isGroupSelected) { toggleGroupCollapsed(group.id); } else { startEditingGroup(group.id); } }}
-                                    >
-                                      <div
-                                        onClick={(e) => { e.stopPropagation(); toggleGroupCollapsed(group.id); }}
-                                        onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.backgroundColor = '#3a3a3a'; }}
-                                        onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.backgroundColor = 'transparent'; }}
-                                        style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', width: '20px', height: '20px', borderRadius: '4px', flexShrink: 0, transition: 'background-color 0.1s' }}
-                                      >
-                                        <span style={{ fontSize: '10px', color: '#888' }}>{isCollapsed ? '\u25B6' : '\u25BC'}</span>
-                                      </div>
-                                      <span style={{ flex: 1, fontSize: '14px', color: isGroupSelected ? '#8b5cf6' : '#fff', fontWeight: '500', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{group.name}</span>
-                                      <div
-                                        onPointerDown={handleFlatItemDrag(flatIdx)}
-                                        onClick={(e) => e.stopPropagation()}
-                                        style={{ display: 'grid', gridTemplateColumns: '3px 3px', gap: '2px', padding: '4px 2px', cursor: 'grab', flexShrink: 0, touchAction: 'none' }}
-                                      >
-                                        {[...Array(6)].map((_, i) => <div key={i} style={{ width: '3px', height: '3px', borderRadius: '50%', backgroundColor: '#555' }} />)}
-                                      </div>
-                                    </div>
-                                    {!isCollapsed && (
-                                      <div style={{ paddingLeft: '10px' }}>
-                                        {groupPrompts.length === 0 ? (
-                                          <div style={{ padding: '8px', textAlign: 'center', color: '#444', fontSize: '10px', border: '1px dashed #333', borderRadius: '8px', marginBottom: '4px' }}>
-                                            Перетащите сюда
-                                          </div>
-                                        ) : groupPrompts.map(prompt => {
-                                          const index = prompt._idx;
-                                          const isSelected = editingInsertionIndex === index;
-                                          const isDragged = draggingTextIndex === index;
-                                          const isGapHere = draggingTextIndex !== null && textDropTarget === index;
-                                          const gapH = dragCardHeight.current;
-                                          const gapTransition = dragTransitionsReady ? 'height 0.12s ease-out, margin-bottom 0.12s ease-out' : 'none';
-                                          return (
-                                            <React.Fragment key={index}>
-                                              <div style={{ height: isGapHere ? `${gapH}px` : '0px', marginBottom: isGapHere ? '4px' : '0px', overflow: 'hidden', transition: gapTransition, boxSizing: 'border-box' as const }}>
-                                                <div style={{ height: `${gapH}px`, borderRadius: '8px', border: '2px dashed #8b5cf640', backgroundColor: '#8b5cf608', boxSizing: 'border-box' as const }} />
-                                              </div>
-                                              <div
-                                                data-text-card
-                                                data-hidden={isDragged || undefined}
-                                                data-orig-index={index}
-                                                onClick={() => !isDragged && startEditingInsertion(index)}
-                                                style={{ padding: '9px 10px', marginBottom: '4px', backgroundColor: isSelected ? '#252525' : '#222', border: isSelected ? '2px solid #8b5cf6' : '2px solid #333', borderRadius: '8px', cursor: 'pointer', display: isDragged ? 'none' : 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px' }}
-                                              >
-                                                <span style={{ fontSize: '13px', color: isSelected ? '#8b5cf6' : '#fff', fontWeight: '500', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{prompt.title}</span>
-                                                <div onPointerDown={handleGripPointerDown(index)} onClick={(e) => e.stopPropagation()} style={{ display: 'grid', gridTemplateColumns: '3px 3px', gap: '2px', padding: '4px 2px', cursor: 'grab', flexShrink: 0, touchAction: 'none' }}>
-                                                  {[...Array(6)].map((_, i) => <div key={i} style={{ width: '3px', height: '3px', borderRadius: '50%', backgroundColor: '#555' }} />)}
-                                                </div>
-                                              </div>
-                                            </React.Fragment>
-                                          );
-                                        })}
-                                      </div>
-                                    )}
-                                  </div>
-                                </React.Fragment>
-                              );
-                            } else {
-                              // Ungrouped prompt as flat item
-                              const index = item.origIdx;
-                              const prompt = item.prompt;
-                              const isSelected = editingInsertionIndex === index;
-                              const isDragged = draggingTextIndex === index;
-                              const isFlatDragged = draggingFlatIdx === flatIdx;
-                              const isHidden = isDragged || isFlatDragged;
-                              return (
-                                <React.Fragment key={`p-${index}`}>
-                                  <div style={{ height: isFlatGapHere ? `${flatGapH + 8}px` : '0px', marginBottom: isFlatGapHere ? '4px' : '0px', overflow: 'hidden', transition: flatGapTransition, boxSizing: 'border-box' as const }}>
-                                    <div style={{ height: `${flatGapH + 8}px`, borderRadius: '10px', border: '2px dashed #8b5cf640', backgroundColor: '#8b5cf608', boxSizing: 'border-box' as const }} />
-                                  </div>
-                                  <div
-                                    data-flat-container
-                                    data-flat-card
-                                    data-flat-idx={flatIdx}
-                                    data-hidden={isHidden || undefined}
-                                    data-text-card
-                                    data-orig-index={index}
-                                    onClick={() => !isHidden && startEditingInsertion(index)}
-                                    style={{ padding: '9px 12px', marginBottom: '8px', backgroundColor: isSelected ? '#252525' : '#222', border: isSelected ? '2px solid #8b5cf6' : '2px solid #333', borderRadius: '10px', cursor: 'pointer', display: isHidden ? 'none' : 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px' }}
-                                  >
-                                    <span style={{ fontSize: '13px', color: isSelected ? '#8b5cf6' : '#fff', fontWeight: '500', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{prompt.title}</span>
-                                    <div onPointerDown={handleFlatItemDrag(flatIdx)} onClick={(e) => e.stopPropagation()} style={{ display: 'grid', gridTemplateColumns: '3px 3px', gap: '2px', padding: '4px 2px', cursor: 'grab', flexShrink: 0, touchAction: 'none' }}>
-                                      {[...Array(6)].map((_, i) => <div key={i} style={{ width: '3px', height: '3px', borderRadius: '50%', backgroundColor: '#555' }} />)}
-                                    </div>
-                                  </div>
-                                </React.Fragment>
-                              );
-                            }
-                          })}
-                          {/* Gap slot after last flat item */}
-                          <div style={{ height: (draggingFlatIdx !== null && flatDropTarget === flatItems.length && !(dragOverGroupId !== null && dragOverGroupId !== 'ungrouped')) ? `${flatGapH + 8}px` : '0px', overflow: 'hidden', transition: flatGapTransition, boxSizing: 'border-box' as const }}>
-                            <div style={{ height: `${flatGapH + 8}px`, borderRadius: '10px', border: '2px dashed #8b5cf640', backgroundColor: '#8b5cf608', boxSizing: 'border-box' as const }} />
-                          </div>
-                        </>);
-                      })()}
-                    </div>
-                  </>
-                )}
+              <div style={{ flex: 1, minHeight: 0 }}>
+                {aiSubTab === 'text' ? renderTextInsertEditor() : renderSystemPrompts()}
               </div>
             </div>
           )}
+
         </div>
       </div>
     </div>
   );
 }
+
+const vrFieldStyle: React.CSSProperties = {
+  width: '100%',
+  minWidth: 0,
+  height: 34,
+  boxSizing: 'border-box',
+  border: `1px solid ${VR_BORDER}`,
+  borderRadius: 8,
+  background: VR_FIELD,
+  color: VR_TEXT,
+  outline: 'none',
+  padding: '7px 9px',
+  fontSize: 12.5,
+  fontFamily: 'inherit',
+};
+
+function vrSmallBtnStyle(kind: 'accent' | 'neutral'): React.CSSProperties {
+  return {
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: 5,
+    height: 28,
+    padding: '0 10px',
+    borderRadius: 7,
+    border: kind === 'accent' ? 'none' : `1px solid ${VR_BORDER}`,
+    background: kind === 'accent' ? VR_ACCENT : VR_FIELD,
+    color: kind === 'accent' ? '#fff' : '#c9c9cd',
+    fontSize: 11.5,
+    fontWeight: 650,
+    cursor: 'pointer',
+    whiteSpace: 'nowrap',
+  };
+}
+
+function VRTag({ children, accent }: { children: React.ReactNode; accent?: boolean }) {
+  return (
+    <span style={{
+      fontSize: 10,
+      fontWeight: 650,
+      padding: '2px 6px',
+      borderRadius: 6,
+      background: accent ? 'rgba(124,58,237,0.16)' : 'rgba(255,255,255,0.06)',
+      color: accent ? '#c4b5fd' : VR_DIM,
+      whiteSpace: 'nowrap',
+    }}>
+      {children}
+    </span>
+  );
+}
+
+function VRGrip() {
+  return (
+    <div
+      title="Перетащить"
+      style={{ display: 'grid', gridTemplateColumns: '3px 3px', gap: 2, padding: '4px 2px', cursor: 'grab', flexShrink: 0 }}
+    >
+      {[...Array(6)].map((_, i) => (
+        <span key={i} style={{ width: 3, height: 3, borderRadius: '50%', background: '#666' }} />
+      ))}
+    </div>
+  );
+}
+
+function VRIconBtn({ children, onClick, title, danger, small }: { children: React.ReactNode; onClick: () => void; title: string; danger?: boolean; small?: boolean }) {
+  const [hovered, setHovered] = useState(false);
+  const size = small ? 24 : 28;
+  return (
+    <button
+      title={title}
+      onClick={(e) => { e.stopPropagation(); onClick(); }}
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
+      style={{
+        width: size,
+        height: size,
+        borderRadius: 7,
+        border: 'none',
+        cursor: 'pointer',
+        flexShrink: 0,
+        background: hovered ? (danger ? 'rgba(255,107,107,0.14)' : 'rgba(255,255,255,0.08)') : 'transparent',
+        color: danger ? '#ff6b6b' : VR_DIM,
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        padding: 0,
+      }}
+    >
+      {children}
+    </button>
+  );
+}
+
+function VREmpty({ text }: { text: string }) {
+  return (
+    <div style={{ padding: 22, textAlign: 'center', color: VR_DIM, fontSize: 12, border: `1px dashed ${VR_BORDER}`, borderRadius: 10 }}>
+      {text}
+    </div>
+  );
+}
+
+function VRSection({ title, onAdd, addLabel, children }: { title: string; onAdd: () => void; addLabel: string; children: React.ReactNode }) {
+  return (
+    <div>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
+        <span style={{ fontSize: 11, fontWeight: 750, letterSpacing: 0.4, color: '#9b9b9d', textTransform: 'uppercase' }}>{title}</span>
+        <button
+          onClick={onAdd}
+          style={{ display: 'inline-flex', alignItems: 'center', gap: 4, background: 'transparent', border: 'none', color: VR_ACCENT, fontSize: 12, fontWeight: 650, cursor: 'pointer', padding: 0 }}
+        >
+          <VRPlusIcon small /> {addLabel}
+        </button>
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function VRField({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <label style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+      <span style={{ color: VR_DIM, fontSize: 11, fontWeight: 700, textTransform: 'uppercase' }}>{label}</span>
+      {children}
+    </label>
+  );
+}
+
+const VRPlusIcon = ({ small }: { small?: boolean }) => (
+  <svg width={small ? 12 : 14} height={small ? 12 : 14} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
+    <path d="M12 5v14M5 12h14" />
+  </svg>
+);
+const VRXIcon = () => (
+  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round">
+    <path d="M18 6 6 18M6 6l12 12" />
+  </svg>
+);
+const VRTrashIcon = ({ small }: { small?: boolean }) => (
+  <svg width={small ? 13 : 14} height={small ? 13 : 14} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+    <path d="M3 6h18" />
+    <path d="M8 6V4h8v2" />
+    <path d="M6 6l1 15h10l1-15" />
+  </svg>
+);
+const VRFolderIcon = () => (
+  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#c4b5fd" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M3 7h6l2 2h10v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
+    <path d="M3 7V5a2 2 0 0 1 2-2h4l2 2h6a2 2 0 0 1 2 2v2" />
+  </svg>
+);
+const VRDocIcon = () => (
+  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#93c5fd" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+    <path d="M14 2v6h6" />
+    <path d="M8 13h8M8 17h5" />
+  </svg>
+);
+const VRFileIcon = () => (
+  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#a5b4fc" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M14 2H7a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7z" />
+    <path d="M14 2v5h5" />
+  </svg>
+);
+const VRChevronIcon = ({ open }: { open: boolean }) => (
+  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.6" strokeLinecap="round" strokeLinejoin="round" style={{ transform: open ? 'rotate(90deg)' : 'rotate(0)', transition: 'transform 120ms ease' }}>
+    <polyline points="9 6 15 12 9 18" />
+  </svg>
+);

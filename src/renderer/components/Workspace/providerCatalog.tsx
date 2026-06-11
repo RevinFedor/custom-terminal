@@ -1,6 +1,7 @@
 import React from 'react';
 import { ClaudeSparkle } from './CopySessionButton';
 import { DeepSeekIcon, ZenIcon } from '../icons/ProviderIcons';
+import { DEFAULT_CLAUDE_CODE_MODELS } from '../../constants/claudeLevels';
 
 export type ProviderId = 'anthropic' | 'zen' | 'deepseek';
 
@@ -20,12 +21,7 @@ export const PROVIDER_CATALOG: ProviderEntry[] = [
     title: 'Anthropic subscription (direct)',
     tint: '#DA7756',
     Icon: ClaudeSparkle,
-    models: [
-      { id: 'default', label: 'default', cmd: true },
-      { id: 'sonnet', label: 'sonnet', cmd: true },
-      { id: 'opus', label: 'opus', cmd: true },
-      { id: 'haiku', label: 'haiku', cmd: true },
-    ],
+    models: DEFAULT_CLAUDE_CODE_MODELS.filter((m) => !m.id.startsWith('claude-fable-5')),
   },
   {
     id: 'deepseek',

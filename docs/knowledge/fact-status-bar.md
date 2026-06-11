@@ -11,11 +11,11 @@ VSCode-style полоса по всей нижней границе окна (п
 
 | Элемент | Назначение | Persistence |
 |---|---|---|
-| `Effort: <value>` chip + popup | Default Claude effort для будущих сессий (`none / auto / low / med / high / max`) | `localStorage` ключ `noted-terminal-default-claude-effort` |
-| `● kill dev-ports` toggle | Перед каждым запуском npm-скрипта убивать занятые порты проекта | `localStorage` ключ `noted-terminal-free-ports-before-start` |
-| `● bridges` toggle | Подсвечивать невидимые hover-мосты красным (через `HoverBridgeDebug`) | `localStorage` ключ `noted-terminal-debug-hover-bridges` |
+| `Effort: <value>` chip + popup | Default Claude effort для будущих сессий (`none / auto / low / med / high / max`) | SQLite `app:setState(defaultClaudeEffort)` + localStorage boot mirror |
+| `● kill dev-ports` toggle | Перед каждым запуском npm-скрипта убивать занятые порты проекта | SQLite `app:setState(freePortsBeforeStart)` + localStorage boot mirror |
+| `● bridges` toggle | Подсвечивать невидимые hover-мосты красным (через `HoverBridgeDebug`) | SQLite `app:setState(debugHoverBridges)` + localStorage boot mirror |
 | `! N` оранжевый chip | Счётчик невалидных файловых путей в AI-промптах (рендерится только если N > 0) | derived, не persist |
-| `● freeze tooltips` toggle | Cmd-popup'ы Timeline (tooltip / note / fork) не закрываются по Cmd-release / mouseleave — для инспекции DOM в DevTools | **in-memory**, не persist |
+| `● freeze tooltips` toggle | Cmd-popup'ы Timeline (tooltip / note / fork) не закрываются по Cmd-release / mouseleave — для инспекции DOM в DevTools | SQLite `app:setState(freezeCmdPopups)` + localStorage boot mirror |
 | `⚙` Settings button | Открывает `SettingsModal` | — |
 
 Левая зона зарезервирована под будущие git/branch/lints/etc — пока живёт только `WebServerChip` (LAN IP мобильного web-сервера).
@@ -39,7 +39,7 @@ Chip-trigger в status bar открывает popup с 6 кнопками тре
 - **Right-anchor**: `right: window.innerWidth - chipRect.right`. Не left-anchor — иначе popup уходит вправо за Timeline-strip и обрезается. См. [`methodology/сценарии-багов-design.md::1.1 Popup уезжает за правый/нижний край`](../methodology/сценарии-багов-design.md).
 - CSS-bridge через `paddingBottom: 4` ВНУТРИ popup-wrapper'а — gap от popup до chip покрыт hit-area'ой popup'а, курсор может ехать через эти 4px не теряя hover. Wrapper вплотную к chip'у (`bottom: window.innerHeight - chipRect.top`, **без** offset'а).
 
-**Применение к runtime сессии — пока НЕ реализовано.** Селектор только сохраняет выбор. Hookup «при создании нового Claude-таба автоматически отправить `/effort <level>` после handshake'а» отложен — добавится отдельно, когда понадобится. Сейчас юзер просто фиксирует предпочтение, чтобы оно не терялось между перезапусками.
+**Применение к runtime сессии реализовано через ранний `tui-ready`.** Селектор сохраняет global default, а при запуске Claude `Terminal.tsx` ждёт детерминированный prompt-сигнал и отправляет `/effort <level>` через `claude:send-command`. Bridge/process-started остаётся fallback'ом, но не главным trigger'ом: bridge может прийти на 3-6 секунд позже prompt'а и создать дубль. Полная таблица resume/fresh поведения — `fact-claude-tui-control.md::Auto-inject /effort при запуске Claude`.
 
 ## Bridges debug toggle
 
@@ -57,7 +57,7 @@ Chip-trigger в status bar открывает popup с 6 кнопками тре
 
 Без этого инспектировать tooltip практически невозможно: Cmd-keyup мгновенно скрывает popup, а попытка зажать Cmd и кликать в DevTools переключает фокус → blur-event → popup-state сброс. Использовался при отладке 8px-bridge ловушки (см. [`fix-timeline-tooltip-stability.md::Layout-child bridge ловушка`](fix-timeline-tooltip-stability.md)) — без freeze diagnostic-логи через `Array.from(children).map(getBoundingClientRect)` пришлось бы добавлять отдельным ref-callback'ом, что засоряло logs/dev.log.
 
-**In-memory (не persist).** Diagnostic-флаги не должны переживать рестарт — иначе юзер забывает выключить, при следующем запуске Cmd-popup'ы «залипают» без явной причины и юзер думает что приложение сломалось.
+**Persistence.** Несмотря на диагностическую природу, toggle сохраняется в SQLite `app_state` (`freezeCmdPopups`). Это пользовательский выбор в footer'е, а не transient hover-state: если юзер включил freeze для отладки, он ожидает увидеть тот же режим после restart'а production. `localStorage` остаётся только boot mirror для первого paint и миграции между старыми значениями.
 
 ## InvalidPathsChip — реактивная валидация путей в AI-промптах
 
@@ -84,7 +84,7 @@ Lucide `Settings` size 14, stroke 1.75. Idle — серый `#bbb`, hover — б
 При добавлении новых toggle'ов:
 - Используй `<StatusToggle>` (точка-индикатор + лейбл, с glow при ON) для bool-флагов.
 - Для multi-value селекторов — pattern из `EffortSelector` (chip-trigger + popup).
-- Каждый persistent-флаг — отдельный `load/save` helper в `useUIStore.ts` + ключ `noted-terminal-<feature>`. **Не** объединяй несколько toggle'ов в один JSON-объект — следующий разработчик может добавить флаг и забыть про migration.
+- Каждый persistent-флаг — отдельный `load/save` helper в `useUIStore.ts`: SQLite `app:setState(<featureKey>)` как authoritative store + `localStorage` только как synchronous boot mirror. **Не** объединяй несколько toggle'ов в один JSON-объект — следующий разработчик может добавить флаг и забыть про migration.
 - Правая зона — для debug/defaults + индикаторов проблем. Левая — для status-info (git branch, lint counts, тип activeAreas).
 - Шрифт 12px унаследуется через root style; кнопки внутри popup'ов могут оставлять свой размер (например, Effort-кнопки 10px согласованы с такими же в InfoPanel).
 - Если индикатор показывает «количество проблем» (как InvalidPathsChip) — render-when-N>0, не «серый 0».

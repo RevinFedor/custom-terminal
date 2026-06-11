@@ -29,6 +29,24 @@ import { useMirrorStatusStore } from './store/useMirrorStatusStore';
 
 const { ipcRenderer } = window.require('electron');
 
+function hexToRgbTriplet(hex: string, fallback = '255, 255, 255') {
+  const v = (hex || '').trim().replace(/^#/, '');
+  if (!/^[0-9a-fA-F]{6}$/.test(v)) return fallback;
+  const n = parseInt(v, 16);
+  return `${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}`;
+}
+
+function opacityPctToAlpha(pct: number, fallback = 55) {
+  const safe = Number.isFinite(pct) ? pct : fallback;
+  return Math.max(5, Math.min(100, Math.round(safe))) / 100;
+}
+
+function isAiForegroundProcess(info?: { hasProcess?: boolean; processName?: string; command?: string } | null) {
+  if (!info?.hasProcess) return false;
+  const text = `${info.processName || ''} ${info.command || ''}`.toLowerCase();
+  return /\b(claude|gemini|codex)\b/.test(text) || text.includes('@openai/codex');
+}
+
 // Drop Indicator Line for project tabs
 const ProjectDropIndicator = memo(({ edge }: { edge: 'left' | 'right' }) => {
   const positionClass = edge === 'left'
@@ -47,6 +65,7 @@ const ProjectDropIndicator = memo(({ edge }: { edge: 'left' | 'right' }) => {
 interface ProjectTabItemProps {
   projectId: string;
   projectName: string;
+  projectIcon?: string | null;
   index: number;
   isActive: boolean;
   fontSize: number;
@@ -55,6 +74,8 @@ interface ProjectTabItemProps {
   interruptedCount?: number; // Count of interrupted (paused) sessions in project
   isProjectBusy?: boolean; // Any tab in project has Claude/Gemini thinking
   isProjectAwaiting?: boolean; // Any tab in project blocked on AskUserQuestion (needs answer)
+  hasProcessBar?: boolean; // Any child tab currently renders the process strip
+  hasProcessBarShimmer?: boolean; // Any child tab currently renders the AI shimmer inside the strip
   isEditing: boolean;
   editValue: string;
   onEditChange: (val: string) => void;
@@ -72,6 +93,7 @@ interface ProjectTabItemProps {
 const ProjectTabItem = memo(({
   projectId,
   projectName,
+  projectIcon,
   index,
   isActive,
   fontSize,
@@ -91,6 +113,8 @@ const ProjectTabItem = memo(({
   isAreaActive,
   isProjectBusy = false,
   isProjectAwaiting = false,
+  hasProcessBar = false,
+  hasProcessBarShimmer = false,
   isProjectLoading = false
 }: ProjectTabItemProps) => {
   const ref = useRef<HTMLButtonElement>(null);
@@ -101,6 +125,7 @@ const ProjectTabItem = memo(({
 
   // Settings → Размеры → ТАБЫ → Проекты. Padding x/y чипа проекта в TitleBar.
   const projectTabGeometry = useUIStore((s) => s.projectTabGeometry);
+  const processBarPosition = useUIStore((s) => s.processBar.position);
 
   useEffect(() => {
     if (isEditing && inputRef.current) {
@@ -206,12 +231,25 @@ const ProjectTabItem = memo(({
       {isActive && (
         <div className="absolute inset-0 bg-white rounded-sm" />
       )}
+      {hasProcessBar && !isEditing && (
+        <div
+          className="tab-process-bar-static absolute top-[2px] bottom-[2px] rounded-[2px] overflow-hidden pointer-events-none"
+          style={{
+            width: '2px',
+            zIndex: 6,
+            [processBarPosition === 'right' ? 'right' : 'left']: '2px',
+          }}
+          aria-hidden
+        >
+          {hasProcessBarShimmer && <div className="tab-process-bar-ai-shimmer-overlay" />}
+        </div>
+      )}
       {/* Awaiting-user-input — project has a tab blocked on AskUserQuestion.
           Purple wash pulses over the whole project tab (above the active-white
           bg, below the z-10 text) so it's visible whether or not the project is
           active. Same signal/keyframe as the per-tab glow. */}
       {isProjectAwaiting && (
-        <div className="tab-awaiting-input absolute inset-0 rounded-sm" style={{ zIndex: 5 }} aria-hidden />
+        <div className="tab-awaiting-input absolute inset-0 rounded-sm" style={{ zIndex: 8 }} aria-hidden />
       )}
       <span className="relative z-10 flex items-center gap-1.5">
         {isEditing ? (
@@ -237,7 +275,17 @@ const ProjectTabItem = memo(({
             onClick={(e) => e.stopPropagation()}
           />
         ) : (
-          <span className="max-w-[120px] truncate">{projectName}</span>
+          <>
+            {projectIcon && (
+              <img
+                src={projectIcon}
+                alt=""
+                className="w-4 h-4 rounded-[3px] object-cover flex-shrink-0"
+                draggable={false}
+              />
+            )}
+            <span className="max-w-[120px] truncate">{projectName}</span>
+          </>
         )}
         {activeProcessCount > 0 && !isEditing && (
           <span
@@ -406,16 +454,18 @@ function App() {
   const [settingsInitialTab, setSettingsInitialTab] = useState<string | null>(null);
 
   // Sync processBar settings → CSS variables on :root.
-  // Кейфрейм tab-process-bar-pulse читает var(--process-bar-color-a/b/duration);
-  // когда юзер крутит палитру в Settings → useUIStore → этот эффект ставит новые
-  // значения на documentElement, animation мгновенно подхватывает.
+  // Base strip color + shimmer color/spacing/opacity are renderer-wide CSS vars; Settings
+  // updates land in useUIStore and the visible TabBar picks them up immediately.
   const processBar = useUIStore((s) => s.processBar);
   useEffect(() => {
     const root = document.documentElement;
+    const peakAlpha = opacityPctToAlpha(processBar.shimmerOpacityPct);
     root.style.setProperty('--process-bar-color-a', processBar.colorA);
-    root.style.setProperty('--process-bar-color-b', processBar.colorB);
-    root.style.setProperty('--process-bar-duration', `${processBar.durationMs}ms`);
-  }, [processBar.colorA, processBar.colorB, processBar.durationMs]);
+    root.style.setProperty('--process-bar-shimmer-rgb', hexToRgbTriplet(processBar.shimmerColor));
+    root.style.setProperty('--process-bar-shimmer-spacing', `${processBar.shimmerSpacingPct}%`);
+    root.style.setProperty('--process-bar-shimmer-alpha', String(peakAlpha));
+    root.style.setProperty('--process-bar-shimmer-edge-alpha', String(Math.max(0.01, peakAlpha * 0.22)));
+  }, [processBar.colorA, processBar.shimmerColor, processBar.shimmerSpacingPct, processBar.shimmerOpacityPct]);
 
   // AIPulse (whole-tab background pulse) was removed — its :root var sync
   // (--ai-pulse-*) went with it. The loader is the process-bar shimmer strip,
@@ -516,6 +566,7 @@ function App() {
   const [projectEmptyZoneHovered, setProjectEmptyZoneHovered] = useState(false);
   const [processStatus, setProcessStatus] = useState<Map<string, boolean>>(new Map()); // tabId -> isRunning
   const [busyTabs, setBusyTabs] = useState<Map<string, boolean>>(new Map()); // tabId -> isBusy (Claude/Gemini thinking)
+  const [pasteBusyTabs, setPasteBusyTabs] = useState<Map<string, boolean>>(new Map()); // tabId -> safePasteAndSubmit in flight
   // tabId -> awaiting (Claude blocked on AskUserQuestion, waiting for human answer).
   // Feeds the project-tab purple glow. Bracketed by claude:awaiting-input (main.js).
   const [awaitingTabs, setAwaitingTabs] = useState<Map<string, boolean>>(new Map());
@@ -915,6 +966,7 @@ function App() {
       console.warn('[App:BusyState] tabId=' + data.tabId.slice(-8) + ' busy=' + data.busy);
       const state = useWorkspaceStore.getState();
       state.setClaudeBusy(data.tabId, data.busy);
+      state.setAiBusy(data.tabId, data.busy);
       setBusyTabs(prev => { const n = new Map(prev); if (data.busy) n.set(data.tabId, true); else n.delete(data.tabId); return n; });
       // Safety net for awaiting ⊆ busy: any turn-end clears a lingering awaiting flag
       // (user pressed Esc to cancel the whole turn instead of answering the question).
@@ -1143,17 +1195,17 @@ function App() {
             tabs,
             statusMarker: { shape: uiState.statusMarker.shape, sizePx: uiState.statusMarker.sizePx },
             processBar: {
-              enabled: uiState.processBar.enabled,
               colorA: uiState.processBar.colorA,
-              colorB: uiState.processBar.colorB,
-              durationMs: uiState.processBar.durationMs,
+              shimmerColor: uiState.processBar.shimmerColor,
+              shimmerSpacingPct: uiState.processBar.shimmerSpacingPct,
+              shimmerOpacityPct: uiState.processBar.shimmerOpacityPct,
               position: uiState.processBar.position,
             },
           });
         }
         if (action === 'getStatusMarkerConfig') {
           // Mobile-web reads the desktop's status-marker palette + shape/size AND
-          // the process-bar config (position/colors/pulse) so it can render the
+          // the process-bar config (position/base color/shimmer) so it can render the
           // SAME left marker (category color + square/dot) AND the SAME loader
           // strip (переливающаяся полоска left/right edge) the desktop TabBar
           // draws. Source of truth is useUIStore (localStorage); there is no
@@ -1164,10 +1216,10 @@ function App() {
             sizePx: uiState.statusMarker.sizePx,
             statuses: (uiState.sessionStatuses || []).map((s: any) => ({ id: s.id, color: s.color, label: s.label })),
             processBar: {
-              enabled: uiState.processBar.enabled,
               colorA: uiState.processBar.colorA,
-              colorB: uiState.processBar.colorB,
-              durationMs: uiState.processBar.durationMs,
+              shimmerColor: uiState.processBar.shimmerColor,
+              shimmerSpacingPct: uiState.processBar.shimmerSpacingPct,
+              shimmerOpacityPct: uiState.processBar.shimmerOpacityPct,
               position: uiState.processBar.position,
             },
           });
@@ -1346,19 +1398,21 @@ function App() {
           const q = usePromptQueueStore.getState().getQueue(tabId);
           const core = serializePromptQueueCore(q);
           // Sibling AI-tabs — same predicate as RunAfterTabPicker: SDK tab, OR
-          // PTY-claude with a sessionId, OR gemini with a sessionId. bash/run-dev
+          // PTY-claude/codex/gemini with a sessionId. bash/run-dev
           // tabs are excluded (no turn-end edge to wait on). Self is excluded.
-          const aiTabs: Array<{ id: string; name: string; kind: 'claude-pty' | 'claude-sdk' | 'gemini' }> = [];
+          const aiTabs: Array<{ id: string; name: string; kind: 'claude-pty' | 'claude-sdk' | 'gemini' | 'codex' }> = [];
           if (ws) {
             for (const t of ws.tabs.values()) {
               if (t.parentTabId) continue;
               if (t.id === tabId) continue;
               const isSDK = t.tabType === 'claude-sdk';
               const isClaudePTY = !isSDK && t.commandType === 'claude' && !!t.claudeSessionId;
+              const isCodex = !isSDK && t.commandType === 'codex' && !!t.codexSessionId;
               const isGemini = !isSDK && t.commandType === 'gemini' && !!t.geminiSessionId;
-              let kind: 'claude-pty' | 'claude-sdk' | 'gemini' | null = null;
+              let kind: 'claude-pty' | 'claude-sdk' | 'gemini' | 'codex' | null = null;
               if (isSDK) kind = 'claude-sdk';
               else if (isClaudePTY) kind = 'claude-pty';
+              else if (isCodex) kind = 'codex';
               else if (isGemini) kind = 'gemini';
               if (!kind) continue;
               aiTabs.push({ id: t.id, name: t.name || t.id.slice(-6), kind });
@@ -1440,7 +1494,10 @@ function App() {
             sessionId: srcTab.claudeSessionId, cwd: srcTab.cwd,
           });
           if (!fork?.success) return reply(false, null, fork?.error || 'fork failed');
-          const newTabId = await state.createSDKTab(projectId);
+          const newTabId = await state.createSDKTab(projectId, undefined, {
+            afterTabId: srcTab.id,
+            visualParentTabId: srcTab.id,
+          });
           state.updateSDKState(newTabId, { claudeSessionId: fork.newSessionId });
           // Carry source tab name → new SDK tab. User explicitly asked: "fork
           // creates same name, only background indicates SDK". The 'CLAUDE'
@@ -1704,9 +1761,26 @@ function App() {
 
     // Gemini busy state → project badge spinner
     const handleGeminiBusy = (_: any, { tabId, busy }: { tabId: string; busy: boolean }) => {
+      useWorkspaceStore.getState().setAiBusy(tabId, busy);
       setBusyTabs(prev => { const n = new Map(prev); if (busy) n.set(tabId, true); else n.delete(tabId); return n; });
     };
     ipcRenderer.on('gemini:busy-state', handleGeminiBusy);
+
+    // Codex busy-state must feed the same project-level signal as the per-tab
+    // process strip. Otherwise Codex can shimmer in the sidebar while the project
+    // tab stays visually idle.
+    const handleCodexBusy = (_: any, { tabId, busy }: { tabId: string; busy: boolean }) => {
+      useWorkspaceStore.getState().setAiBusy(tabId, busy);
+      setBusyTabs(prev => { const n = new Map(prev); if (busy) n.set(tabId, true); else n.delete(tabId); return n; });
+    };
+    ipcRenderer.on('codex:busy-state', handleCodexBusy);
+
+    // safePasteAndSubmit emits a short pre-turn loader before the agent's own
+    // busy-state edge. Mirror it at project level whenever a tab strip shows it.
+    const handlePasteBusy = (_: any, { tabId, busy }: { tabId: string; busy: boolean }) => {
+      setPasteBusyTabs(prev => { const n = new Map(prev); if (busy) n.set(tabId, true); else n.delete(tabId); return n; });
+    };
+    ipcRenderer.on('claude:paste-busy', handlePasteBusy);
 
     // Cmd+Tab refocus: main process fires this on every BrowserWindow 'focus'
     // event. We re-broadcast it as a DOM CustomEvent so per-tab components
@@ -1760,13 +1834,15 @@ function App() {
       ipcRenderer.removeListener('mcp:respawn-sub-agent-pty', handleRespawnSubAgentPty);
       ipcRenderer.removeListener('gemini:auto-spawn', handleGeminiAutoSpawn);
       ipcRenderer.removeListener('gemini:busy-state', handleGeminiBusy);
+      ipcRenderer.removeListener('codex:busy-state', handleCodexBusy);
+      ipcRenderer.removeListener('claude:paste-busy', handlePasteBusy);
       ipcRenderer.removeListener('claude:awaiting-input', handleAwaitingInput);
       ipcRenderer.removeListener('window:refocus-active', handleWindowRefocus);
       window.removeEventListener('keydown', handlePasteRefocus, true);
     };
   }, [openProjects.size]); // Re-init when projects change
 
-  // Save session and mark Claude sessions as interrupted when app closes
+  // Save session; main process marks live AI sessions as interrupted when app closes
   useEffect(() => {
     const handleBeforeUnload = () => {
       const state = useWorkspaceStore.getState();
@@ -1803,20 +1879,33 @@ function App() {
               return;
             }
             const s = useWorkspaceStore.getState();
-            const tabs: { tabId: string; sessionId: string }[] = [];
+            const tabs: { tabId: string; sessionId: string; engine: 'claude' | 'codex'; cwd?: string }[] = [];
             for (const [, ws] of s.openProjects) {
               for (const [tabId, tab] of ws.tabs) {
                 if (tab.wasInterrupted && tab.claudeSessionId && !tab.overlayDismissed &&
                     (tab.commandType === 'claude' || tab.color === 'claude')) {
-                  tabs.push({ tabId, sessionId: tab.claudeSessionId });
+                  tabs.push({ tabId, sessionId: tab.claudeSessionId, engine: 'claude', cwd: tab.cwd });
+                } else if (tab.wasInterrupted && tab.codexSessionId && !tab.overlayDismissed &&
+                           tab.commandType === 'codex') {
+                  tabs.push({ tabId, sessionId: tab.codexSessionId, engine: 'codex', cwd: tab.cwd });
                 }
               }
             }
             if (tabs.length === 0) { console.warn('[AutoResume] No interrupted tabs'); return; }
             console.warn('[AutoResume] Resuming', tabs.length, 'sessions');
-            for (const { tabId, sessionId } of tabs) {
+            for (const { tabId, sessionId, engine, cwd } of tabs) {
               s.clearInterruptedState(tabId);
-              s.setTabCommandType(tabId, 'claude');
+              s.setTabCommandType(tabId, engine);
+              if (engine === 'codex') {
+                ipcRenderer.send('codex:run-command', {
+                  tabId,
+                  command: 'codex-c',
+                  sessionId,
+                  cwd,
+                });
+                console.warn('[AutoResume] Resumed codex', tabId, sessionId.substring(0, 8));
+                continue;
+              }
               // Reserve sessionId BEFORE writing to PTY: SessionBridge fires
               // claude:session-detected within ~1-2 sec, and any stale bridge
               // file (Claude CLI keeps months-old bridge JSONs around) racing
@@ -1829,8 +1918,6 @@ function App() {
               // When repair returns repaired > 0 — surface to user: this is the
               // moment we ACTUALLY saved history that Claude TUI would have lost.
               try {
-                const tab = (s.openProjects.get(s.activeProjectId || '') || { tabs: new Map() }).tabs.get(tabId) as any;
-                const cwd = tab?.cwd || undefined;
                 const repairRes = await ipcRenderer.invoke('claude:repair-jsonl-before-resume', { sessionId, cwd });
                 const fixedCount = repairRes?.repaired || 0;
                 if (fixedCount > 0) {
@@ -1853,7 +1940,7 @@ function App() {
               // was silently lost on AutoResume (other caller at :1394 already passes a
               // string). See pty-streaming audit.
               ipcRenderer.send('terminal:force-command-started', tabId);
-              console.warn('[AutoResume] Resumed', tabId, sessionId.substring(0, 8));
+              console.warn('[AutoResume] Resumed claude', tabId, sessionId.substring(0, 8));
             }
           } catch (e: any) {
             console.warn('[AutoResume] Error:', e?.message || String(e));
@@ -2166,29 +2253,50 @@ function App() {
           } else if (activeProject && activeProject.activeTabId) {
             const selected = activeProject.selectedTabIds;
             if (selected.length > 1) {
-              // Multi-select: close all selected tabs with batch confirmation
+              // Multi-select: close all selected tabs. Confirm only for real
+              // risk: non-AI running process, or AI tab currently streaming.
               (async () => {
                 const running: { id: string; name: string }[] = [];
+                const busyAi: { id: string; name: string }[] = [];
                 for (const id of selected) {
+                  const tab = activeProject.tabs.get(id) as any;
+                  const isAiTab = tab?.tabType === 'claude-sdk' || tab?.commandType === 'claude' || tab?.commandType === 'gemini' || tab?.commandType === 'codex';
+                  const isSdkBusy = tab?.sdkState === 'fetching' || tab?.sdkState === 'thinking' || tab?.sdkState === 'tool_use';
+                  const aiBusy = !!(tab?.aiBusy || tab?.claudeBusy || isSdkBusy);
+                  if (isAiTab && aiBusy) {
+                    busyAi.push({ id, name: tab?.name || 'AI' });
+                    continue;
+                  }
+                  if (tab?.tabType === 'claude-sdk') continue;
                   const state = await ipcRenderer.invoke('terminal:getCommandState', id);
                   if (state.isRunning) {
-                    const { processName } = await ipcRenderer.invoke('terminal:hasRunningProcess', id);
-                    running.push({ id, name: processName || 'unknown' });
+                    const info = await ipcRenderer.invoke('terminal:hasRunningProcess', id).catch(() => null);
+                    if (isAiTab && (!info?.hasProcess || isAiForegroundProcess(info))) continue;
+                    running.push({ id, name: info?.processName || tab?.name || 'unknown' });
                   }
                 }
 
-                let confirmed = true;
-                if (running.length > 0) {
-                  confirmed = window.confirm(
-                    `${running.length} tab(s) have running processes:\n${running.map(r => `\u2022 ${r.name}`).join('\n')}\n\nClose all ${selected.length} tabs?`
-                  );
-                } else {
-                  confirmed = window.confirm(`Close ${selected.length} tabs?`);
+                const warnings: string[] = [];
+                if (busyAi.length > 0) {
+                  warnings.push(`${busyAi.length} AI-вкладк(и) сейчас отвечают:\n${busyAi.map(t => `• ${t.name}`).join('\n')}`);
                 }
+                if (running.length > 0) {
+                  warnings.push(`${running.length} вкладк(и) с обычными процессами:\n${running.map(r => `• ${r.name}`).join('\n')}`);
+                }
+
+                const confirmed = warnings.length === 0
+                  ? true
+                  : window.confirm(`${warnings.join('\n\n')}\n\nОстановить и закрыть ${selected.length} вкладк(и)?`);
 
                 if (confirmed) {
                   for (const id of selected) {
-                    await closeTab(activeProjectId!, id, { skipProcessCheck: true, forceCleanup: true });
+                    const tab = activeProject.tabs.get(id) as any;
+                    const isSdkBusy = tab?.sdkState === 'fetching' || tab?.sdkState === 'thinking' || tab?.sdkState === 'tool_use';
+                    await closeTab(activeProjectId!, id, {
+                      skipProcessCheck: true,
+                      forceCleanup: true,
+                      aiBusyOverride: !!(tab?.aiBusy || tab?.claudeBusy || isSdkBusy),
+                    });
                   }
                 }
               })();
@@ -2515,12 +2623,21 @@ function App() {
             // Count active processes and busy tabs in this project
             let activeCount = 0;
             let hasBusyTab = false;
+            let hasPasteBusyTab = false;
+            let hasVisibleProcessBar = false;
             let hasAwaitingTab = false;
-            workspace.tabs.forEach((_, tabId) => {
-              if (processStatus.get(tabId)) activeCount++;
+            workspace.tabs.forEach((tab, tabId) => {
+              const hasLiveProcess = !!processStatus.get(tabId) || !!(tab as any).sdkProcessAlive;
+              if (hasLiveProcess) {
+                activeCount++;
+                hasVisibleProcessBar = true;
+              }
               if (busyTabs.get(tabId)) hasBusyTab = true;
+              if (pasteBusyTabs.get(tabId)) hasPasteBusyTab = true;
               if (awaitingTabs.get(tabId)) hasAwaitingTab = true;
             });
+            const projectIsLoading = apiLoadingProjects.has(projectId);
+            const hasProjectShimmer = hasBusyTab || hasPasteBusyTab || projectIsLoading;
 
             // Count interrupted (paused) sessions
             // Count interrupted (paused) sessions using helper
@@ -2534,21 +2651,24 @@ function App() {
                 key={projectId}
                 projectId={projectId}
                 projectName={lastCreatedProjectId === projectId ? projectEditValue : project.name}
+                projectIcon={project.icon}
                 index={index}
                 isActive={isActive}
                 fontSize={projectTabsFontSize}
                 forceRightIndicator={isLast && projectEmptyZoneHovered}
                 activeProcessCount={activeCount}
                 interruptedCount={interruptedCount}
-                isProjectBusy={hasBusyTab || apiLoadingProjects.has(projectId)}
+                isProjectBusy={hasProjectShimmer}
                 isProjectAwaiting={hasAwaitingTab}
+                hasProcessBar={hasVisibleProcessBar || hasProjectShimmer}
+                hasProcessBarShimmer={hasProjectShimmer}
                 isEditing={editingProjectId === projectId}
                 editValue={projectEditValue}
                 onEditChange={setProjectEditValue}
                 onEditSubmit={handleSubmitProjectRename}
                 onEditCancel={handleCancelProjectRename}
                 isAreaActive={activeArea === 'projects'}
-                isProjectLoading={apiLoadingProjects.has(projectId)}
+                isProjectLoading={projectIsLoading}
                 onClick={() => {
                   openProject(projectId, project.path);
                 }}
@@ -2687,6 +2807,16 @@ function App() {
               }}
             >
               Close Project
+            </button>
+            <button
+              className="w-full text-left px-4 py-2 text-sm text-[#ccc] hover:bg-white/10 cursor-pointer"
+              onClick={() => {
+                setProjectContextMenu(null);
+                setSettingsInitialTab('projects');
+                setSettingsOpen(true);
+              }}
+            >
+              Иконка проекта
             </button>
             <button
               className="w-full text-left px-4 py-2 text-sm text-[#ccc] hover:bg-white/10 cursor-pointer"

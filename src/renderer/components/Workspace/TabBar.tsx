@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useLayoutEffect, memo, useCallback, useMemo } from 'react';
-import { useWorkspaceStore, TabColor, isTabInterrupted } from '../../store/useWorkspaceStore';
+import { useWorkspaceStore, TabColor, TabGroup, isTabInterrupted } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import Tooltip from '../UI/Tooltip';
 import { useUIStore } from '../../store/useUIStore';
@@ -12,9 +12,34 @@ import { attachClosestEdge, extractClosestEdge, type Edge } from '@atlaskit/prag
 import { combine } from '@atlaskit/pragmatic-drag-and-drop/combine';
 import { autoScrollForElements } from '@atlaskit/pragmatic-drag-and-drop-auto-scroll/element';
 import { setCustomNativeDragPreview } from '@atlaskit/pragmatic-drag-and-drop/element/set-custom-native-drag-preview';
-import { ChevronDown, Globe, Bot, Play, Minimize2, Maximize2, PanelLeft, Plus, StickyNote, RotateCw } from 'lucide-react';
+import { ChevronDown, Globe, Bot, Play, PanelLeft, Plus, StickyNote, RotateCw, Folder, ArrowUp, ArrowDown } from 'lucide-react';
 
 const { ipcRenderer } = window.require('electron');
+
+let forcedDragCursorDepth = 0;
+let forcedDragCursorStyleEl: HTMLStyleElement | null = null;
+
+const acquireForcedDragCursor = () => {
+  if (typeof document === 'undefined') return;
+  forcedDragCursorDepth += 1;
+  if (forcedDragCursorStyleEl) return;
+  forcedDragCursorStyleEl = document.createElement('style');
+  forcedDragCursorStyleEl.setAttribute('data-tabbar-forced-drag-cursor', 'true');
+  forcedDragCursorStyleEl.textContent = `
+    html, body, body * {
+      cursor: grabbing !important;
+    }
+  `;
+  document.head.appendChild(forcedDragCursorStyleEl);
+};
+
+const releaseForcedDragCursor = () => {
+  if (typeof document === 'undefined') return;
+  forcedDragCursorDepth = Math.max(0, forcedDragCursorDepth - 1);
+  if (forcedDragCursorDepth > 0) return;
+  forcedDragCursorStyleEl?.remove();
+  forcedDragCursorStyleEl = null;
+};
 
 // VERTICAL MODE (TabSidebar) — геометрия в Settings → Размеры → ТАБЫ → Терминал.
 // Подписка: useUIStore.tabGeometry { paddingX, paddingY, paddingLeft, borderRadius, gap }.
@@ -41,19 +66,63 @@ interface TabData {
   wasInterrupted?: boolean;
   claudeSessionId?: string;
   geminiSessionId?: string;
+  codexSessionId?: string;
   tabType?: string;
+  aiClosing?: boolean;
   isCollapsed?: boolean;
+  groupId?: string;
+  visualParentTabId?: string;
   parentTabId?: string;
   sessionStatus?: 'knowledge' | 'bugfix' | 'dev';
 }
 
-type DragData = {
+type TabDragData = {
   type: 'TAB';
   id: string;
   zone: 'main' | 'utility';
   index: number;
   projectId?: string; // For cross-project drag
   selectedTabIds?: string[]; // For multi-tab drag
+  groupId?: string;
+  groupIndex?: number;
+};
+
+type GroupDragData = {
+  type: 'TAB_GROUP';
+  groupId: string;
+  zone: 'main';
+  projectId: string;
+};
+
+type DragData = TabDragData | GroupDragData;
+
+type DragPreviewLayout = {
+  orderedIds: string[];
+  groupAssignments: Record<string, string | null | undefined>;
+  visualParentAssignments?: Record<string, string | null | undefined>;
+};
+
+type VerticalRow =
+  | { type: 'tab'; tab: TabData; index: number }
+  | { type: 'group'; group: TabGroup; tabs: TabData[]; index: number };
+
+type RectSnap = { left: number; right: number; top: number; bottom: number; height: number; midY: number };
+type VerticalDragTabRow = { type: 'tab'; tabId: string; rect: RectSnap };
+type VerticalDragGroupRow = {
+  type: 'group';
+  groupId: string;
+  rect: RectSnap;
+  header: RectSnap;
+  tabRows: { tabId: string; rect: RectSnap }[];
+};
+type VerticalDragGeometry = {
+  list: RectSnap;
+  rows: Array<VerticalDragTabRow | VerticalDragGroupRow>;
+};
+
+const snapRect = (el: Element): RectSnap => {
+  const r = el.getBoundingClientRect();
+  return { left: r.left, right: r.right, top: r.top, bottom: r.bottom, height: r.height, midY: r.top + r.height / 2 };
 };
 
 // Status palette теперь динамическая: SessionStatusDef из useUIStore.
@@ -71,7 +140,44 @@ const TAB_COLORS: { color: TabColor; bgColor: string; borderColor: string; label
   { color: 'purple', bgColor: 'rgba(168, 85, 247, 0.2)', borderColor: 'rgb(168, 85, 247)', label: '🟣 Purple' },
   { color: 'claude', bgColor: 'rgba(218, 119, 86, 0.2)', borderColor: '#DA7756', label: '🟠 Claude' },
   { color: 'gemini', bgColor: 'rgba(78, 134, 248, 0.2)', borderColor: '#4E86F8', label: '💎 Gemini' },
+  { color: 'codex', bgColor: 'rgba(16, 163, 127, 0.18)', borderColor: '#10A37F', label: 'Codex' },
 ];
+
+const adjustRgbaAlpha = (rgba: string, delta: number): string => {
+  const m = rgba.match(/rgba?\((\d+),\s*(\d+),\s*(\d+),?\s*([\d.]+)?\)/);
+  if (!m) return rgba;
+  const [, r, g, b, a = '0.2'] = m;
+  const newAlpha = Math.max(0, Math.min(1, parseFloat(a) + delta));
+  return `rgba(${r}, ${g}, ${b}, ${newAlpha})`;
+};
+
+const getTabChromeColorConfig = (tab: Pick<TabData, 'color' | 'tabType'>) => {
+  const base = TAB_COLORS.find(c => c.color === tab.color) || TAB_COLORS[0];
+  return tab.tabType === 'claude-sdk' && tab.color === 'claude'
+    ? { ...base, bgColor: 'rgba(210, 140, 90, 0.30)', borderColor: '#D28C5A' }
+    : base;
+};
+
+const getVisualConnectorColor = (tab: TabData, isActive: boolean) => {
+  const config = getTabChromeColorConfig(tab);
+  const hasColor = tab.color && tab.color !== 'default';
+  if (hasColor) {
+    return adjustRgbaAlpha(config.bgColor, isActive ? 0.28 : 0.22);
+  }
+  return isActive ? 'rgba(255,255,255,0.24)' : 'rgba(255,255,255,0.14)';
+};
+
+const AI_COMMAND_TYPES = new Set(['claude', 'gemini', 'codex']);
+
+const isAiRuntimeTab = (tab?: { commandType?: string; tabType?: string } | null): boolean => {
+  return !!tab && (tab.tabType === 'claude-sdk' || AI_COMMAND_TYPES.has(tab.commandType || ''));
+};
+
+const isAiForegroundProcess = (info?: { hasProcess?: boolean; processName?: string; command?: string } | null): boolean => {
+  if (!info?.hasProcess) return false;
+  const text = `${info.processName || ''} ${info.command || ''}`.toLowerCase();
+  return /\b(claude|gemini|codex)\b/.test(text) || text.includes('@openai/codex');
+};
 
 
 // Drop Indicator Line - absolute overlay (doesn't affect layout)
@@ -205,7 +311,7 @@ const RestartZone = memo(({ hasProcess, hasColor, commandType, hasSession, isBus
         ) : (
           // Green dot (process running) or red dot (claude without saved session)
           // Claude/Gemini tabs show spinning arc when busy
-          ((commandType === 'claude' || commandType === 'gemini') && isBusy) ? (
+          ((commandType === 'claude' || commandType === 'gemini' || commandType === 'codex') && isBusy) ? (
             <span
               style={{
                 display: 'block',
@@ -225,9 +331,9 @@ const RestartZone = memo(({ hasProcess, hasColor, commandType, hasSession, isBus
                 width: '6px',
                 height: '6px',
                 borderRadius: '50%',
-                backgroundColor: (commandType === 'claude' && !hasSession) ? '#f87171' : '#4ade80',
+                backgroundColor: ((commandType === 'claude' || commandType === 'codex') && !hasSession) ? '#f87171' : '#4ade80',
                 opacity: hasColor ? 0.9 : 0.8,
-                boxShadow: (commandType === 'claude' && !hasSession)
+                boxShadow: ((commandType === 'claude' || commandType === 'codex') && !hasSession)
                   ? '0 0 4px rgba(248, 113, 113, 0.5)'
                   : '0 0 4px rgba(74, 222, 128, 0.5)',
               }}
@@ -243,6 +349,8 @@ const RestartZone = memo(({ hasProcess, hasColor, commandType, hasSession, isBus
 interface TabItemProps {
   tab: TabData;
   index: number;
+  groupId?: string;
+  groupIndex?: number;
   zone: 'main' | 'utility';
   projectId: string; // For cross-project drag
   isActive: boolean;
@@ -258,6 +366,7 @@ interface TabItemProps {
   onEditKeyDown: (e: React.KeyboardEvent) => void;
   inputRef: React.RefObject<HTMLInputElement>;
   forceRightIndicator?: boolean; // Show right indicator when empty zone is hovered
+  suppressDropIndicator?: boolean;
   fontSize: number;
   hasProcess?: boolean; // Whether tab has a running process
   commandType?: string; // Type of command running (devServer, claude, gemini, generic)
@@ -297,6 +406,8 @@ interface TabItemProps {
 const TabItem = memo(({
   tab,
   index,
+  groupId,
+  groupIndex,
   zone,
   projectId,
   isActive,
@@ -312,6 +423,7 @@ const TabItem = memo(({
   onEditKeyDown,
   inputRef,
   forceRightIndicator = false,
+  suppressDropIndicator = false,
   fontSize,
   hasProcess = false,
   commandType,
@@ -337,10 +449,47 @@ const TabItem = memo(({
   const ref = useRef<HTMLDivElement>(null);
   const [closestEdge, setClosestEdge] = useState<Edge | null>(null);
   const [isDragging, setIsDragging] = useState(false);
+  const [isPressing, setIsPressing] = useState(false);
   const [isAdoptTarget, setIsAdoptTarget] = useState(false);
+  const bodyCursorRef = useRef<string | null>(null);
+
+  const setBodyGrabbing = useCallback(() => {
+    if (bodyCursorRef.current === null) {
+      bodyCursorRef.current = document.body.style.cursor;
+      document.body.style.cursor = 'grabbing';
+      acquireForcedDragCursor();
+    }
+  }, []);
+
+  const clearBodyGrabbing = useCallback(() => {
+    if (bodyCursorRef.current !== null) {
+      document.body.style.cursor = bodyCursorRef.current;
+      bodyCursorRef.current = null;
+      releaseForcedDragCursor();
+    }
+  }, []);
+
+  useEffect(() => () => clearBodyGrabbing(), [clearBodyGrabbing]);
+
+  useEffect(() => {
+    if (!isPressing) return;
+    const clearPress = () => {
+      setIsPressing(false);
+      clearBodyGrabbing();
+    };
+    window.addEventListener('mouseup', clearPress);
+    window.addEventListener('blur', clearPress);
+    window.addEventListener('dragend', clearPress);
+    return () => {
+      window.removeEventListener('mouseup', clearPress);
+      window.removeEventListener('blur', clearPress);
+      window.removeEventListener('dragend', clearPress);
+    };
+  }, [clearBodyGrabbing, isPressing]);
 
   // Check if a drag source is a Claude tab eligible for adoption onto this Gemini tab
   const isAdoptDrop = useCallback((sourceData: DragData) => {
+    if (sourceData.type !== 'TAB') return false;
     if (commandType !== 'gemini') return false;
     const sourceTabId = sourceData.id;
     const state = useWorkspaceStore.getState();
@@ -371,9 +520,24 @@ const TabItem = memo(({
           const ws = useWorkspaceStore.getState().openProjects.get(projectId);
           const sel = ws?.selectedTabIds || [];
           const tabIds = sel.includes(tab.id) ? sel : [tab.id];
-          return { type: 'TAB', id: tab.id, zone, index, projectId, selectedTabIds: tabIds };
+          return { type: 'TAB', id: tab.id, zone, index, projectId, selectedTabIds: tabIds, groupId, groupIndex };
         },
         onGenerateDragPreview: ({ nativeSetDragImage }) => {
+          if (!isHorizontal) {
+            setCustomNativeDragPreview({
+              nativeSetDragImage,
+              render({ container }) {
+                Object.assign(container.style, {
+                  width: '1px',
+                  height: '1px',
+                  opacity: '0',
+                  pointerEvents: 'none',
+                });
+              },
+            });
+            return;
+          }
+
           const ws = useWorkspaceStore.getState().openProjects.get(projectId);
           const sel = ws?.selectedTabIds || [];
           const count = sel.includes(tab.id) ? sel.length : 1;
@@ -404,22 +568,29 @@ const TabItem = memo(({
             },
           });
         },
-        onDragStart: () => setIsDragging(true),
-        onDrop: () => setIsDragging(false),
+        onDragStart: () => {
+          setIsDragging(true);
+          setBodyGrabbing();
+        },
+        onDrop: () => {
+          setIsDragging(false);
+          setIsPressing(false);
+          clearBodyGrabbing();
+        },
       }),
       dropTargetForElements({
         element,
         getData: ({ input, element }) => {
           return attachClosestEdge(
-            { type: 'TAB', id: tab.id, zone, index },
+            { type: 'TAB', id: tab.id, zone, index, groupId, groupIndex },
             { element, input, allowedEdges }
           );
         },
-        canDrop: ({ source }) => source.data.type === 'TAB',
+        canDrop: ({ source }) => source.data.type === 'TAB' || source.data.type === 'TAB_GROUP',
         onDragEnter: ({ source, self }) => {
           const sourceData = source.data as DragData;
-          if (sourceData.id === tab.id) return;
-          if (isAdoptDrop(sourceData)) {
+          if (sourceData.type === 'TAB' && sourceData.id === tab.id) return;
+          if (sourceData.type === 'TAB' && isAdoptDrop(sourceData)) {
             setIsAdoptTarget(true);
             setClosestEdge(null);
           } else {
@@ -428,12 +599,12 @@ const TabItem = memo(({
         },
         onDrag: ({ source, self }) => {
           const sourceData = source.data as DragData;
-          if (sourceData.id === tab.id) {
+          if (sourceData.type === 'TAB' && sourceData.id === tab.id) {
             setClosestEdge(null);
             setIsAdoptTarget(false);
             return;
           }
-          if (isAdoptDrop(sourceData)) {
+          if (sourceData.type === 'TAB' && isAdoptDrop(sourceData)) {
             setIsAdoptTarget(true);
             setClosestEdge(null);
           } else {
@@ -445,7 +616,7 @@ const TabItem = memo(({
         onDrop: () => { setClosestEdge(null); setIsAdoptTarget(false); },
       })
     );
-  }, [tab.id, zone, index, projectId, isAdoptDrop, isHorizontal]);
+  }, [tab.id, zone, index, projectId, isAdoptDrop, isHorizontal, groupId, groupIndex]);
 
   const [isHovered, setIsHovered] = useState(false);
 
@@ -552,6 +723,7 @@ const TabItem = memo(({
   const getCollapsedIconColor = () => {
     if (tab.color === 'claude') return '#DA7756';
     if (tab.color === 'gemini') return '#4E86F8';
+    if (tab.color === 'codex') return '#10A37F';
     if (hasColor) return colorConfig.borderColor;
     return '#888';
   };
@@ -563,6 +735,7 @@ const TabItem = memo(({
   // — Тонкая полоса процесса 2px + маркер статуса 8px рисуются абсолютом, поэтому в padding
   //   достаточно резервировать ~20px слева.
   const isVerticalMode = !isHorizontal;
+  const dragLiftActive = isVerticalMode && (isPressing || isDragging);
 
   // Build inline styles - full control to avoid Tailwind conflicts
   const tabStyle: React.CSSProperties = {
@@ -571,7 +744,7 @@ const TabItem = memo(({
     alignItems: 'center',
     justifyContent: isVerticalMode ? 'flex-start' : 'center',
     gap: isCollapsed ? '0' : '8px',
-    cursor: 'pointer',
+    cursor: dragLiftActive ? 'grabbing' : 'pointer',
     overflow: 'visible',
     padding: isCollapsed
       ? '0'
@@ -604,9 +777,15 @@ const TabItem = memo(({
         ? '2px dashed #3b82f6'
         : (isSelected && !isActive ? '2px dashed rgba(255,255,255,0.3)' : '2px solid transparent'))
       : 'none',
-    opacity: isDragging ? 0.5 : (draggingGroupIds.includes(tab.id) && !isDragging ? 0.5 : (isCollapsed && !isActive ? 0.6 : 1)),
-    transition: 'color 0.15s ease, background-color 0.15s ease',
+    opacity: isDragging ? (isVerticalMode ? 0.96 : 0.5) : (draggingGroupIds.includes(tab.id) && !isDragging ? 0.5 : (isCollapsed && !isActive ? 0.6 : 1)),
+    transform: dragLiftActive ? 'scale(1.015)' : undefined,
+    transformOrigin: 'center',
+    transition: 'color 0.15s ease, background-color 0.15s ease, transform 90ms ease, box-shadow 90ms ease, opacity 0.12s ease',
     borderRight: isViewingSubAgent ? '2px solid rgba(168, 85, 247, 0.6)' : 'none',
+    ...(dragLiftActive ? {
+      boxShadow: '0 0 0 1px rgba(139, 92, 246, 0.55), 0 6px 18px rgba(0, 0, 0, 0.28)',
+      backgroundColor: hasColor ? adjustAlpha(colorConfig.bgColor, 0.10) : 'rgba(139, 92, 246, 0.16)',
+    } : {}),
     ...(isAdoptTarget ? {
       boxShadow: 'inset 0 0 0 1.5px rgba(99, 102, 241, 0.7)',
       backgroundColor: 'rgba(99, 102, 241, 0.15)',
@@ -614,15 +793,15 @@ const TabItem = memo(({
   };
 
   // Vertical mode разделяет два сигнала:
-  //   hasProcess (PTY жив) → узкая 2px полоса слева мигает.
+  //   hasProcess (PTY жив) → узкая 3px полоса слева/справа горит статично.
   //     PTY-источники: terminal:command-started/finished (claude CLI, npm run dev, bash, gemini CLI).
-  //   isBusy (AI «думает»/стримит)   → горизонтальный shimmer по ВСЕЙ ширине вкладки.
+  //   isBusy (AI «думает»/стримит)   → shimmer-блик внутри этой полосы.
   //     AI-источники: claude:busy-state, gemini:busy-state, claude-sdk:busy-state.
   //   SDK claude — нет PTY → hasProcess=false. Раньше единственным сигналом был
   //   isBusy → плашка горела ТОЛЬКО пока генерится ответ, а после soft-interrupt
   //   (процесс жив, простаивает) гасла, хотя процесс жив. Теперь sdkProcessAlive
   //   кормит тот же канал что hasProcess: полоса горит пока процесс жив (ровно,
-  //   если не busy; пульс+shimmer пока busy), гаснет только на hard-kill —
+  //   если не busy; shimmer поверх неё пока busy), гаснет только на hard-kill —
   //   единый сигнал с индикатором в ControlBar.
   //   Если оба true (PTY claude думает) — рендерятся оба: полоса слева + shimmer.
   const verticalHasProcess = hasProcess || sdkProcessAlive;
@@ -637,10 +816,8 @@ const TabItem = memo(({
   const statusMeta = sessionStatus
     ? sessionStatuses.find((s) => s.id === sessionStatus)
     : null;
-  // processBar.enabled управляет тем, мигает ли полоска или статичная.
-  // position — left|right (юзер выбирает в Settings).
-  // Цвета/duration читаются через CSS-переменные на :root (App.tsx синхронизирует).
-  const processBarEnabled = useUIStore((s) => s.processBar.enabled);
+  // position — left|right (юзер выбирает в Settings). Цвет полоски и shimmer
+  // читаются через CSS-переменные на :root (App.tsx синхронизирует).
   const processBarPosition = useUIStore((s) => s.processBar.position);
   // Settings → форма маркера статуса (круг или квадрат) + размер в px.
   const statusMarkerShape = useUIStore((s) => s.statusMarker.shape);
@@ -651,7 +828,17 @@ const TabItem = memo(({
       ref={ref}
       className="group"
       data-tab-item
+      data-tab-id={tab.id}
+      data-tab-zone={zone}
+      data-tab-group-id={groupId}
       style={tabStyle}
+      onMouseDown={(e) => {
+        if (e.button !== 0) return;
+        const target = e.target as HTMLElement | null;
+        if (target?.closest('[data-no-tab-drag],button,input,textarea,select,a')) return;
+        setIsPressing(true);
+        setBodyGrabbing();
+      }}
       onClick={(e) => onSwitch(e)}
       onDoubleClick={onDoubleClick}
       onContextMenu={onContextMenu}
@@ -685,20 +872,14 @@ const TabItem = memo(({
             <>
               {/* Process bar — 3px полоска по полной высоте вкладки. Внутри неё
                   рендерятся ДВА независимых сигнала одновременно:
-                    • PTY-alive (hasProcess) → цветной пульс A↔B (или статика если
-                      processBarEnabled=false).
-                    • AI-busy (isBusy) → белёсый блик ползёт сверху вниз поверх цвета.
+                    • process-alive (hasProcess) → статичная цветная полоска.
+                    • AI-busy (isBusy) → настраиваемый блик ползёт сверху вниз поверх цвета.
                   Если активен только один сигнал — рисуется только он. Если AI думает
                   без PTY (SDK-таб) — цвет полоски статичный colorA, блик ползёт.
-                  overflow:hidden нужен чтобы шиммер-overlay не вылезал за полоску
-                  на off-screen фазах translateY. */}
+                  overflow:hidden держит shimmer-overlay строго внутри полоски. */}
               {(verticalHasProcess || verticalIsAiBusy) && (
                 <div
-                  className={
-                    verticalHasProcess
-                      ? (processBarEnabled ? 'tab-process-bar-busy' : 'tab-process-bar-static')
-                      : 'tab-process-bar-static'
-                  }
+                  className="tab-process-bar-static"
                   style={{
                     position: 'absolute',
                     // -2px компенсирует 2px transparent border (резерв под dashed-states).
@@ -865,12 +1046,20 @@ const TabItem = memo(({
               onChange={(e) => onEditChange(e.target.value)}
               onBlur={onEditSubmit}
               onKeyDown={onEditKeyDown}
+              onMouseDown={(e) => e.stopPropagation()}
               onClick={(e) => e.stopPropagation()}
             />
           ) : (
-            <span className="select-none whitespace-nowrap overflow-hidden text-ellipsis flex items-center gap-1" style={{ flex: isHorizontal ? 'none' : 1 }}>
+            <span
+              className="select-none whitespace-nowrap overflow-hidden text-ellipsis flex items-center gap-1"
+              style={{
+                flex: isHorizontal ? 'none' : 1,
+                color: tab.aiClosing ? '#8a8a8a' : undefined,
+                fontStyle: tab.aiClosing ? 'italic' : undefined,
+              }}
+            >
               {tab.tabType === 'browser' && <Globe size={12} className="flex-shrink-0 opacity-60" />}
-              {tab.name}
+              {tab.aiClosing ? 'остановка сессии...' : tab.name}
             </span>
           )}
 
@@ -882,11 +1071,13 @@ const TabItem = memo(({
                 Пока stop в полёте — иконка крутится, click заблокирован. */}
           {isVerticalMode && tab.color === 'green' && hasProcess && (
             <button
+              data-no-tab-drag
               onClick={(e) => {
                 e.stopPropagation();
                 if (isStopping) return;
                 onRestart?.(tab.id);
               }}
+              onMouseDown={(e) => e.stopPropagation()}
               onDoubleClick={(e) => e.stopPropagation()}
               title={isStopping ? 'Stopping…' : 'Restart process (kill descendants + ports, then re-run)'}
               className="flex-shrink-0 inline-flex items-center justify-center transition-colors"
@@ -952,7 +1143,9 @@ const TabItem = memo(({
             return (
               <button
                 data-tab-notes-open-trigger
+                data-no-tab-drag
                 data-tab-id={tab.id}
+                onMouseDown={(e) => e.stopPropagation()}
                 onClick={(e) => {
                   e.stopPropagation();
                   const cur = useUIStore.getState().notesPanelOpenTabs[tab.id] ?? false;
@@ -994,8 +1187,8 @@ const TabItem = memo(({
       )}
 
       {/* Absolute overlay indicator - doesn't affect layout */}
-      {closestEdge && <DropIndicatorLine edge={closestEdge} />}
-      {forceRightIndicator && !closestEdge && <DropIndicatorLine edge="right" />}
+      {!suppressDropIndicator && closestEdge && <DropIndicatorLine edge={closestEdge} />}
+      {!suppressDropIndicator && forceRightIndicator && !closestEdge && <DropIndicatorLine edge="right" />}
     </div>
   );
 });
@@ -1037,10 +1230,141 @@ const ZoneDropTarget = memo(({
   );
 });
 
+const TabGroupHeader = memo(({ group, count, projectId }: {
+  group: TabGroup;
+  count: number;
+  projectId: string;
+}) => {
+  const ref = useRef<HTMLDivElement>(null);
+  const [isDragging, setIsDragging] = useState(false);
+  const [isPressing, setIsPressing] = useState(false);
+  const [isHovered, setIsHovered] = useState(false);
+  const bodyCursorRef = useRef<string | null>(null);
+
+  const setBodyGrabbing = useCallback(() => {
+    if (bodyCursorRef.current === null) {
+      bodyCursorRef.current = document.body.style.cursor;
+      document.body.style.cursor = 'grabbing';
+      acquireForcedDragCursor();
+    }
+  }, []);
+
+  const clearBodyGrabbing = useCallback(() => {
+    if (bodyCursorRef.current !== null) {
+      document.body.style.cursor = bodyCursorRef.current;
+      bodyCursorRef.current = null;
+      releaseForcedDragCursor();
+    }
+  }, []);
+
+  useEffect(() => () => clearBodyGrabbing(), [clearBodyGrabbing]);
+
+  useEffect(() => {
+    if (!isPressing) return;
+    const clearPress = () => {
+      setIsPressing(false);
+      clearBodyGrabbing();
+    };
+    window.addEventListener('mouseup', clearPress);
+    window.addEventListener('blur', clearPress);
+    window.addEventListener('dragend', clearPress);
+    return () => {
+      window.removeEventListener('mouseup', clearPress);
+      window.removeEventListener('blur', clearPress);
+      window.removeEventListener('dragend', clearPress);
+    };
+  }, [clearBodyGrabbing, isPressing]);
+
+  useEffect(() => {
+    const element = ref.current;
+    if (!element) return;
+
+    return combine(
+      draggable({
+        element,
+        getInitialData: (): DragData => ({ type: 'TAB_GROUP', groupId: group.id, zone: 'main', projectId }),
+        onGenerateDragPreview: ({ nativeSetDragImage }) => {
+          setCustomNativeDragPreview({
+            nativeSetDragImage,
+            render({ container }) {
+              Object.assign(container.style, {
+                width: '1px',
+                height: '1px',
+                opacity: '0',
+                pointerEvents: 'none',
+              });
+            },
+          });
+        },
+        onDragStart: () => {
+          setIsDragging(true);
+          setBodyGrabbing();
+        },
+        onDrop: () => {
+          setIsDragging(false);
+          setIsPressing(false);
+          clearBodyGrabbing();
+        },
+      }),
+      dropTargetForElements({
+        element,
+        getData: ({ input, element }) => attachClosestEdge(
+          { type: 'GROUP', groupId: group.id },
+          { element, input, allowedEdges: ['top', 'bottom'] }
+        ),
+        canDrop: ({ source }) => source.data.type === 'TAB' || source.data.type === 'TAB_GROUP',
+      })
+    );
+  }, [group.id, projectId]);
+
+  const dragLiftActive = isPressing || isDragging;
+
+  return (
+    <div
+      ref={ref}
+      data-tab-group-header
+      data-group-id={group.id}
+      style={{
+        display: 'flex',
+        alignItems: 'center',
+        gap: 7,
+        minHeight: 28,
+        padding: '5px 8px',
+        borderRadius: 7,
+        cursor: dragLiftActive ? 'grabbing' : 'grab',
+        userSelect: 'none',
+        color: (isHovered || dragLiftActive) ? '#e5e7eb' : '#a1a1aa',
+        backgroundColor: dragLiftActive ? 'rgba(139,92,246,0.16)' : (isHovered ? 'rgba(255,255,255,0.07)' : 'rgba(255,255,255,0.035)'),
+        border: `1px solid ${dragLiftActive ? 'rgba(139,92,246,0.58)' : 'rgba(255,255,255,0.08)'}`,
+        opacity: isDragging ? 0.96 : 1,
+        transform: dragLiftActive ? 'scale(1.015)' : undefined,
+        transformOrigin: 'center',
+        boxShadow: dragLiftActive ? '0 0 0 1px rgba(139,92,246,0.32), 0 6px 18px rgba(0,0,0,0.28)' : 'none',
+        transition: 'background-color 0.12s, color 0.12s, opacity 0.12s, transform 90ms ease, box-shadow 90ms ease, border-color 90ms ease',
+      }}
+      onMouseDown={(e) => {
+        if (e.button !== 0) return;
+        setIsPressing(true);
+        setBodyGrabbing();
+      }}
+      onMouseEnter={() => setIsHovered(true)}
+      onMouseLeave={() => setIsHovered(false)}
+      title="Drag group"
+    >
+      <Folder size={13} strokeWidth={2} style={{ color: '#8b5cf6', flexShrink: 0 }} />
+      <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 12 }}>
+        {group.name}
+      </span>
+      <span style={{ color: '#71717a', fontSize: 11, flexShrink: 0 }}>{count}</span>
+    </div>
+  );
+});
+
 // Empty area drop zone - for dropping at the end of tabs (works for both reorder and move from utility)
-const EmptyDropZone = memo(({ onDropMain, onDropFromUtility, onHoverChange, onDoubleClick, onContextMenu, orientation = 'horizontal' }: {
+const EmptyDropZone = memo(({ onDropMain, onDropFromUtility, onDropGroup, onHoverChange, onDoubleClick, onContextMenu, orientation = 'horizontal' }: {
   onDropMain: (tabId: string) => void;
   onDropFromUtility: (tabId: string) => void;
+  onDropGroup?: (groupId: string) => void;
   onHoverChange: (isOver: boolean) => void;
   onDoubleClick?: () => void;
   onContextMenu?: (e: React.MouseEvent) => void;
@@ -1048,7 +1372,6 @@ const EmptyDropZone = memo(({ onDropMain, onDropFromUtility, onHoverChange, onDo
 }) => {
   const ref = useRef<HTMLDivElement>(null);
   const [isOver, setIsOver] = useState(false);
-  const [isHovered, setIsHovered] = useState(false);
 
   useEffect(() => {
     const element = ref.current;
@@ -1057,7 +1380,7 @@ const EmptyDropZone = memo(({ onDropMain, onDropFromUtility, onHoverChange, onDo
     return dropTargetForElements({
       element,
       getData: () => ({ type: 'EMPTY_ZONE' }),
-      canDrop: ({ source }) => source.data.type === 'TAB',
+      canDrop: ({ source }) => source.data.type === 'TAB' || source.data.type === 'TAB_GROUP',
       onDragEnter: () => {
         setIsOver(true);
         onHoverChange(true);
@@ -1068,7 +1391,9 @@ const EmptyDropZone = memo(({ onDropMain, onDropFromUtility, onHoverChange, onDo
       },
       onDrop: ({ source }) => {
         const data = source.data as DragData;
-        if (data.zone === 'main') {
+        if (data.type === 'TAB_GROUP') {
+          onDropGroup?.(data.groupId);
+        } else if (data.zone === 'main') {
           onDropMain(data.id);
         } else if (data.zone === 'utility') {
           onDropFromUtility(data.id);
@@ -1077,45 +1402,19 @@ const EmptyDropZone = memo(({ onDropMain, onDropFromUtility, onHoverChange, onDo
         onHoverChange(false);
       },
     });
-  }, [onDropMain, onDropFromUtility, onHoverChange]);
+  }, [onDropMain, onDropFromUtility, onDropGroup, onHoverChange]);
 
   // Horizontal: fill remaining row (h-full flex-1 min-w-[30px]).
-  // Vertical: fill remaining column space + show discoverable «+ New tab» row at the
-  // top (вкладка-плейсхолдер с dashed border). В horizontal mode «add new» доступен
-  // через ПКМ → Add new; в vertical он не очевиден, поэтому показываем кликабельную
-  // строку всегда. Click = создать вкладку, drop-target по всей высоте остаётся.
+  // Vertical: fill remaining column space only. Creation moved to right-click menu
+  // so the sidebar doesn't show a fake tab row.
   if (orientation === 'vertical') {
     return (
       <div
         ref={ref}
-        className={`flex-1 w-full min-h-[30px] transition-colors ${isOver ? 'bg-white/10' : ''}`}
+        className="flex-1 w-full min-h-[30px]"
         onContextMenu={onContextMenu}
-      >
-        <div
-          onClick={onDoubleClick}
-          onMouseEnter={() => setIsHovered(true)}
-          onMouseLeave={() => setIsHovered(false)}
-          title="New tab (Cmd+T)"
-          style={{
-            margin: '4px 0',
-            padding: '4px 8px 4px 12px',
-            display: 'flex',
-            alignItems: 'center',
-            gap: 8,
-            fontSize: 13,
-            color: isHovered ? '#fff' : '#777',
-            backgroundColor: isHovered ? 'rgba(255,255,255,0.06)' : 'transparent',
-            border: '1px dashed rgba(255,255,255,0.18)',
-            borderRadius: 6,
-            cursor: 'pointer',
-            userSelect: 'none',
-            transition: 'background-color 0.12s, color 0.12s',
-          }}
-        >
-          <span style={{ fontSize: 16, lineHeight: 1 }}>+</span>
-          <span>New tab</span>
-        </div>
-      </div>
+        onDoubleClick={onDoubleClick}
+      />
     );
   }
 
@@ -1130,7 +1429,11 @@ const EmptyDropZone = memo(({ onDropMain, onDropFromUtility, onHoverChange, onDo
 });
 
 // Empty main zone - when all tabs are in utility
-const EmptyMainZone = memo(({ onDrop }: { onDrop: (tabId: string) => void }) => {
+const EmptyMainZone = memo(({ onDrop, onContextMenu, onDoubleClick }: {
+  onDrop: (tabId: string) => void;
+  onContextMenu?: (e: React.MouseEvent) => void;
+  onDoubleClick?: () => void;
+}) => {
   const ref = useRef<HTMLDivElement>(null);
   const [isOver, setIsOver] = useState(false);
 
@@ -1159,6 +1462,8 @@ const EmptyMainZone = memo(({ onDrop }: { onDrop: (tabId: string) => void }) => 
     <div
       ref={ref}
       className={`flex-1 h-full flex items-center justify-center text-[#666] text-sm transition-colors ${isOver ? 'bg-white/10' : ''}`}
+      onContextMenu={onContextMenu}
+      onDoubleClick={onDoubleClick}
     >
       {isOver && <span>Drop here</span>}
     </div>
@@ -1224,6 +1529,86 @@ const UtilsButtonDropTarget = memo(({
   );
 });
 
+function buildVerticalRows(mainTabs: TabData[], tabGroups: TabGroup[]): VerticalRow[] {
+  const rows: VerticalRow[] = [];
+  const groupById = new Map(tabGroups.map(group => [group.id, group]));
+  const renderedGroups = new Set<string>();
+
+  for (const tab of mainTabs) {
+    const groupId = tab.groupId && groupById.has(tab.groupId) ? tab.groupId : undefined;
+    if (!groupId) {
+      rows.push({ type: 'tab', tab, index: rows.length });
+      continue;
+    }
+    if (renderedGroups.has(groupId)) continue;
+    const group = groupById.get(groupId)!;
+    const tabs = mainTabs.filter(candidate => candidate.groupId === groupId);
+    renderedGroups.add(groupId);
+    rows.push({ type: 'group', group, tabs, index: rows.length });
+  }
+
+  for (const group of tabGroups) {
+    if (!renderedGroups.has(group.id)) {
+      rows.push({ type: 'group', group, tabs: [], index: rows.length });
+    }
+  }
+
+  return rows;
+}
+
+function orderTabsWithVisualChildren(mainTabs: TabData[]): TabData[] {
+  const byId = new Map(mainTabs.map(tab => [tab.id, tab]));
+  const childrenByParent = new Map<string, TabData[]>();
+  const roots: TabData[] = [];
+
+  for (const tab of mainTabs) {
+    const parentId = tab.visualParentTabId;
+    if (!parentId || !byId.has(parentId) || parentId === tab.id) {
+      roots.push(tab);
+      continue;
+    }
+    const children = childrenByParent.get(parentId) || [];
+    children.push(tab);
+    childrenByParent.set(parentId, children);
+  }
+
+  const ordered: TabData[] = [];
+  const seen = new Set<string>();
+  const visit = (tab: TabData) => {
+    if (seen.has(tab.id)) return;
+    seen.add(tab.id);
+    ordered.push(tab);
+    for (const child of childrenByParent.get(tab.id) || []) {
+      visit(child);
+    }
+  };
+
+  for (const tab of roots) visit(tab);
+  for (const tab of mainTabs) visit(tab);
+  return ordered;
+}
+
+function buildVisualDepthMap(mainTabs: TabData[]): Map<string, number> {
+  const byId = new Map(mainTabs.map(tab => [tab.id, tab]));
+  const cache = new Map<string, number>();
+  const depthOf = (tab: TabData, trail = new Set<string>()): number => {
+    const cached = cache.get(tab.id);
+    if (cached !== undefined) return cached;
+    const parentId = tab.visualParentTabId;
+    if (!parentId || parentId === tab.id || trail.has(tab.id) || !byId.has(parentId)) {
+      cache.set(tab.id, 0);
+      return 0;
+    }
+    trail.add(tab.id);
+    const parent = byId.get(parentId)!;
+    const depth = Math.min(4, depthOf(parent, trail) + 1);
+    cache.set(tab.id, depth);
+    return depth;
+  };
+  for (const tab of mainTabs) depthOf(tab);
+  return cache;
+}
+
 function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   const isVerticalLayout = layout === 'vertical';
   // Use individual selectors to minimize re-renders
@@ -1237,9 +1622,11 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   const setTabColor = useWorkspaceStore((state) => state.setTabColor);
   const setTabSessionStatus = useWorkspaceStore((state) => state.setTabSessionStatus);
   const toggleTabUtility = useWorkspaceStore((state) => state.toggleTabUtility);
-  const toggleTabCollapsed = useWorkspaceStore((state) => state.toggleTabCollapsed);
   const reorderInZone = useWorkspaceStore((state) => state.reorderInZone);
   const moveTabToZone = useWorkspaceStore((state) => state.moveTabToZone);
+  const createTabGroup = useWorkspaceStore((state) => state.createTabGroup);
+  const applyTabLayout = useWorkspaceStore((state) => state.applyTabLayout);
+  const setTabVisualParent = useWorkspaceStore((state) => state.setTabVisualParent);
   const toggleTabSelection = useWorkspaceStore((state) => state.toggleTabSelection);
   const selectTabRange = useWorkspaceStore((state) => state.selectTabRange);
   const clearSelection = useWorkspaceStore((state) => state.clearSelection);
@@ -1248,7 +1635,6 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   const setProjectView = useWorkspaceStore((state) => state.setProjectView);
   const setSidebarOpen = useWorkspaceStore((state) => state.setSidebarOpen);
   const getSidebarState = useWorkspaceStore((state) => state.getSidebarState);
-  const createSDKTab = useWorkspaceStore((state) => state.createSDKTab);
   const tabsFontSize = useUIStore((state) => state.tabsFontSize);
   const showToast = useUIStore((state) => state.showToast);
   const reopenPulseActive = useUIStore((state) => state.reopenPulseActive);
@@ -1272,6 +1658,9 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   const utilityHoverTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const utilityCloseTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const [emptyZoneHovered, setEmptyZoneHovered] = useState(false);
+  const [dragPreview, setDragPreview] = useState<DragPreviewLayout | null>(null);
+  const dragPreviewKeyRef = useRef<string>('');
+  const verticalDragGeometryRef = useRef<VerticalDragGeometry | null>(null);
   const [processStatus, setProcessStatus] = useState<Map<string, boolean>>(new Map());
   // Tabs currently inside a deterministic stop/restart cycle. While in this set
   // the Restart / Stop buttons render disabled with a wait-cursor, so the user
@@ -1282,12 +1671,23 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   const [sessionStatus, setSessionStatus] = useState<Map<string, boolean>>(new Map());
   const [claudeBusyMap, setClaudeBusyMap] = useState<Map<string, boolean>>(new Map());
   const [geminiBusyMap, setGeminiBusyMap] = useState<Map<string, boolean>>(new Map());
+  const [codexBusyMap, setCodexBusyMap] = useState<Map<string, boolean>>(new Map());
+  const [pasteBusyMap, setPasteBusyMap] = useState<Map<string, boolean>>(new Map());
   // Awaiting-user-input: Claude called AskUserQuestion and is blocked waiting for
   // the human to answer. Deterministic, bracketed by PreToolUse/PostToolUse hooks
   // (main.js → claude:awaiting-input). Distinct from busy: a question is a special
   // sub-state of busy (awaiting ⊆ busy), rendered as a purple glow instead of the
   // plain "thinking" shimmer. See fact-claude-awaiting-input.md.
   const [awaitingMap, setAwaitingMap] = useState<Map<string, boolean>>(new Map());
+  const hasVisibleProcessBar = (tab: TabData): boolean => {
+    return processStatus.get(tab.id) || false;
+  };
+  const isTabTurnBusy = (tab: TabData): boolean => {
+    const pasteBusy = pasteBusyMap.get(tab.id) || false;
+    if (tab.commandType === 'gemini') return (geminiBusyMap.get(tab.id) || false) || pasteBusy;
+    if (tab.commandType === 'codex') return (codexBusyMap.get(tab.id) || false) || pasteBusy;
+    return (claudeBusyMap.get(tab.id) || false) || pasteBusy;
+  };
   const inputRef = useRef<HTMLInputElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const contextMenuRef = useRef<HTMLDivElement>(null);
@@ -1318,12 +1718,55 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   const selectedTabIds = workspace?.selectedTabIds || [];
   const isMultiSelect = selectedTabIds.length > 1;
 
+  const confirmCloseTabs = async (tabIds: string[]): Promise<boolean> => {
+    if (!workspace) return false;
+    const runningProcesses: { id: string; name: string }[] = [];
+    const busyAiTabs: { id: string; name: string }[] = [];
+
+    for (const id of tabIds) {
+      const tab = workspace.tabs.get(id);
+      if (!tab) continue;
+      const aiTab = isAiRuntimeTab(tab);
+      const aiBusy = isTabTurnBusy(tab);
+      if (aiTab && aiBusy) {
+        busyAiTabs.push({ id, name: tab.name || 'AI' });
+        continue;
+      }
+      if (tab.tabType === 'claude-sdk') continue;
+
+      const state = await ipcRenderer.invoke('terminal:getCommandState', id);
+      if (!state?.isRunning) continue;
+
+      const info = await ipcRenderer.invoke('terminal:hasRunningProcess', id).catch(() => null);
+      if (aiTab && (!info?.hasProcess || isAiForegroundProcess(info))) continue;
+
+      runningProcesses.push({ id, name: info?.processName || tab.name || 'unknown' });
+    }
+
+    if (runningProcesses.length === 0 && busyAiTabs.length === 0) return true;
+
+    const parts: string[] = [];
+    if (busyAiTabs.length) {
+      parts.push(`${busyAiTabs.length} AI-вкладк(и) сейчас отвечают:\n${busyAiTabs.map(t => `• ${t.name}`).join('\n')}`);
+    }
+    if (runningProcesses.length) {
+      parts.push(`${runningProcesses.length} вкладк(и) с обычными процессами:\n${runningProcesses.map(t => `• ${t.name}`).join('\n')}`);
+    }
+    return window.confirm(`${parts.join('\n\n')}\n\nОстановить и закрыть ${tabIds.length} вкладк(и)?`);
+  };
+
   const handleTabClick = (e: React.MouseEvent, tabId: string) => {
     if (e.shiftKey) {
       selectTabRange(projectId, tabId);
     } else if (e.metaKey || e.ctrlKey) {
       toggleTabSelection(projectId, tabId, true);
     } else {
+      if (isVerticalLayout && currentView === 'home' && tabId === workspace?.activeTabId) {
+        e.preventDefault();
+        e.stopPropagation();
+        console.warn('[TabBar:click] ignored active tab while Home project=' + projectId + ' tabId=' + tabId + ' ts=' + Date.now());
+        return;
+      }
       console.warn('[TabBar:click] switchTab tabId=' + tabId + ' ts=' + Date.now());
       // If clicking the already-active Gemini tab while viewing a sub-agent → return to Gemini
       if (tabId === workspace?.activeTabId && viewingSubAgentTabId) {
@@ -1392,6 +1835,25 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
       });
     };
 
+    const handleCodexBusy = (_: any, { tabId, busy, reason }: { tabId: string; busy: boolean; reason?: string }) => {
+      console.warn('[TabBar:CodexBusyState] tabId=' + tabId.slice(-8) + ' busy=' + busy + (reason ? ' reason=' + reason : ''));
+      setCodexBusyMap(prev => {
+        if (prev.get(tabId) === busy) return prev;
+        const next = new Map(prev);
+        next.set(tabId, busy);
+        return next;
+      });
+    };
+
+    const handlePasteBusy = (_: any, { tabId, busy }: { tabId: string; busy: boolean }) => {
+      setPasteBusyMap(prev => {
+        if (prev.get(tabId) === busy) return prev;
+        const next = new Map(prev);
+        next.set(tabId, busy);
+        return next;
+      });
+    };
+
     const handleAwaitingInput = (_: any, { tabId, awaiting }: { tabId: string; awaiting: boolean }) => {
       console.warn('[TabBar:Awaiting] tabId=' + tabId.slice(-8) + ' awaiting=' + awaiting);
       setAwaitingMap(prev => {
@@ -1439,6 +1901,8 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
     ipcRenderer.on('claude:busy-state', handleClaudeBusy);
     ipcRenderer.on('claude:busy-state', handleClaudeBusyClearAwaiting);
     ipcRenderer.on('gemini:busy-state', handleGeminiBusy);
+    ipcRenderer.on('codex:busy-state', handleCodexBusy);
+    ipcRenderer.on('claude:paste-busy', handlePasteBusy);
     ipcRenderer.on('claude:awaiting-input', handleAwaitingInput);
     ipcRenderer.on('terminal:stop-progress', handleStopProgress);
 
@@ -1449,6 +1913,8 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
       ipcRenderer.removeListener('claude:busy-state', handleClaudeBusy);
       ipcRenderer.removeListener('claude:busy-state', handleClaudeBusyClearAwaiting);
       ipcRenderer.removeListener('gemini:busy-state', handleGeminiBusy);
+      ipcRenderer.removeListener('codex:busy-state', handleCodexBusy);
+      ipcRenderer.removeListener('claude:paste-busy', handlePasteBusy);
       ipcRenderer.removeListener('claude:awaiting-input', handleAwaitingInput);
       ipcRenderer.removeListener('terminal:stop-progress', handleStopProgress);
     };
@@ -1495,20 +1961,231 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
     syncStatus();
   }, [workspace?.tabs.size]); // Sync new tabs, but never clobber existing state
 
+  const captureVerticalDragGeometry = useCallback((): VerticalDragGeometry | null => {
+    if (!isVerticalLayout) return null;
+    const scroller = scrollContainerRef.current;
+    const list = scroller?.querySelector<HTMLElement>('[data-vertical-main-list]');
+    if (!scroller || !list) return null;
+
+    const rows: VerticalDragGeometry['rows'] = [];
+    for (const rowEl of Array.from(list.querySelectorAll<HTMLElement>(':scope > [data-vertical-row]'))) {
+      const rowType = rowEl.dataset.rowType;
+      if (rowType === 'tab') {
+        const tabId = rowEl.dataset.tabId;
+        const tabEl = rowEl.querySelector<HTMLElement>('[data-tab-item]');
+        if (!tabId || !tabEl) continue;
+        rows.push({ type: 'tab', tabId, rect: snapRect(tabEl) });
+        continue;
+      }
+
+      if (rowType === 'group') {
+        const groupId = rowEl.dataset.groupId;
+        const header = rowEl.querySelector<HTMLElement>('[data-tab-group-header]');
+        if (!groupId || !header) continue;
+        const tabRows = Array.from(rowEl.querySelectorAll<HTMLElement>('[data-tab-group-body] [data-tab-item]'))
+          .map(el => {
+            const tabId = el.dataset.tabId;
+            return tabId ? { tabId, rect: snapRect(el) } : null;
+          })
+          .filter((row): row is { tabId: string; rect: RectSnap } => !!row);
+        rows.push({ type: 'group', groupId, rect: snapRect(rowEl), header: snapRect(header), tabRows });
+      }
+    }
+
+    return { list: snapRect(scroller), rows };
+  }, [isVerticalLayout]);
+
+  const isAdoptDropTarget = useCallback((sourceData: DragData, targetData: any): boolean => {
+    if (sourceData.type !== 'TAB' || targetData?.type !== 'TAB') return false;
+    const currentWorkspace = useWorkspaceStore.getState().openProjects.get(projectId);
+    if (!currentWorkspace) return false;
+    const sourceTab = currentWorkspace.tabs.get(sourceData.id);
+    const targetTab = currentWorkspace.tabs.get(targetData.id);
+    return !!(sourceTab?.commandType === 'claude' && !sourceTab.parentTabId && targetTab?.commandType === 'gemini');
+  }, [projectId]);
+
+  const resolveStaticVerticalPreview = useCallback((sourceData: DragData, clientX: number, clientY: number, targetData?: any): DragPreviewLayout | null => {
+    if (!isVerticalLayout) return null;
+    if (sourceData.projectId && sourceData.projectId !== projectId) return null;
+    if (sourceData.zone !== 'main') return null;
+    if (isAdoptDropTarget(sourceData, targetData)) return null;
+
+    let geometry = verticalDragGeometryRef.current;
+    if (!geometry) {
+      geometry = captureVerticalDragGeometry();
+      verticalDragGeometryRef.current = geometry;
+    }
+    if (!geometry) return null;
+
+    const list = geometry.list;
+    if (clientX < list.left - 28 || clientX > list.right + 28 || clientY < list.top - 80 || clientY > list.bottom + 80) {
+      return null;
+    }
+
+    const currentWorkspace = useWorkspaceStore.getState().openProjects.get(projectId);
+    if (!currentWorkspace) return null;
+    const baseTabs = orderTabsWithVisualChildren(
+      Array.from(currentWorkspace.tabs.values()).filter(tab => !tab.parentTabId && !tab.isUtility)
+    );
+    const baseOrder = baseTabs.map(tab => tab.id);
+    const tabById = new Map(baseTabs.map(tab => [tab.id, tab]));
+    const collectWithVisualChildren = (ids: string[]) => {
+      const result: string[] = [];
+      const add = (id: string) => {
+        if (!tabById.has(id) || result.includes(id)) return;
+        result.push(id);
+        for (const child of baseTabs) {
+          if (child.visualParentTabId === id) add(child.id);
+        }
+      };
+      ids.forEach(add);
+      return result;
+    };
+
+    const sourceIds = (() => {
+      if (sourceData.type === 'TAB_GROUP') {
+        return baseOrder.filter(id => tabById.get(id)?.groupId === sourceData.groupId);
+      }
+      const selected = sourceData.selectedTabIds && sourceData.selectedTabIds.includes(sourceData.id)
+        ? sourceData.selectedTabIds
+        : [sourceData.id];
+      return collectWithVisualChildren(selected.filter(id => tabById.has(id)));
+    })();
+    if (sourceIds.length === 0) return null;
+
+    const sourceSet = new Set(sourceIds);
+    const withoutSource = baseOrder.filter(id => !sourceSet.has(id));
+    const groupAssignments: Record<string, string | null | undefined> = {};
+    const visualParentAssignments: Record<string, string | null | undefined> = {};
+    if (sourceData.type === 'TAB') {
+      const selectedRoots = sourceData.selectedTabIds && sourceData.selectedTabIds.includes(sourceData.id)
+        ? sourceData.selectedTabIds
+        : [sourceData.id];
+      for (const id of selectedRoots) {
+        if (tabById.get(id)?.visualParentTabId) visualParentAssignments[id] = null;
+      }
+    }
+    const makePreview = (orderedIds: string[]) => ({
+      orderedIds,
+      groupAssignments,
+      visualParentAssignments,
+    });
+    const insertAt = (order: string[], ids: string[], index: number) => {
+      const next = [...order];
+      next.splice(Math.max(0, Math.min(index, next.length)), 0, ...ids);
+      return next;
+    };
+    const indexAtFlatPosition = (flatIndex: number) => {
+      let index = 0;
+      for (let i = 0; i < Math.min(flatIndex, geometry!.rows.length); i += 1) {
+        const row = geometry!.rows[i];
+        if (row.type === 'tab') {
+          if (withoutSource.includes(row.tabId)) index += 1;
+        } else {
+          index += row.tabRows.filter(tabRow => withoutSource.includes(tabRow.tabId)).length;
+        }
+      }
+      return index;
+    };
+    const flatIndexFromY = () => {
+      let flatIndex = geometry!.rows.length;
+      for (let i = 0; i < geometry!.rows.length; i += 1) {
+        const row = geometry!.rows[i];
+        if (clientY < row.rect.midY) {
+          flatIndex = i;
+          break;
+        }
+      }
+      return flatIndex;
+    };
+    const indexInGroup = (groupId: string, memberIndex: number, rowIndex: number) => {
+      const members = withoutSource.filter(id => tabById.get(id)?.groupId === groupId);
+      if (members.length === 0) return indexAtFlatPosition(rowIndex);
+      const beforeId = members[memberIndex];
+      if (beforeId) return withoutSource.indexOf(beforeId);
+      return withoutSource.indexOf(members[members.length - 1]) + 1;
+    };
+
+    if (sourceData.type === 'TAB_GROUP') {
+      const targetIndex = indexAtFlatPosition(flatIndexFromY());
+      return makePreview(insertAt(withoutSource, sourceIds, targetIndex));
+    }
+
+    const assignFlat = (flatIndex: number) => {
+      for (const id of sourceIds) groupAssignments[id] = null;
+      return makePreview(insertAt(withoutSource, sourceIds, indexAtFlatPosition(flatIndex)));
+    };
+    const assignGroup = (groupId: string, memberIndex: number, rowIndex: number) => {
+      for (const id of sourceIds) groupAssignments[id] = groupId;
+      return makePreview(insertAt(withoutSource, sourceIds, indexInGroup(groupId, memberIndex, rowIndex)));
+    };
+
+    for (let rowIndex = 0; rowIndex < geometry.rows.length; rowIndex += 1) {
+      const row = geometry.rows[rowIndex];
+      if (row.type !== 'group') continue;
+      if (clientY >= row.header.top && clientY <= row.header.bottom) {
+        return clientY < row.header.midY
+          ? assignFlat(rowIndex)
+          : assignGroup(row.groupId, 0, rowIndex);
+      }
+      if (row.tabRows.length === 0) continue;
+      const first = row.tabRows[0];
+      const last = row.tabRows[row.tabRows.length - 1];
+      if (clientY < row.header.bottom || clientY > row.rect.bottom) continue;
+      if (clientY < first.rect.top - 8 || clientY > last.rect.bottom + 12) continue;
+      let targetMemberIndex = 0;
+      for (const tabRow of row.tabRows) {
+        if (sourceSet.has(tabRow.tabId)) continue;
+        if (clientY < tabRow.rect.midY) break;
+        targetMemberIndex += 1;
+      }
+      return assignGroup(row.groupId, targetMemberIndex, rowIndex);
+    }
+
+    return assignFlat(flatIndexFromY());
+  }, [captureVerticalDragGeometry, isAdoptDropTarget, isVerticalLayout, projectId]);
+
   // Monitor for all drag events
   useEffect(() => {
     return monitorForElements({
-      canMonitor: ({ source }) => source.data.type === 'TAB',
-      onDrop({ source, location }) {
-        const target = location.current.dropTargets[0];
-        if (!target) return;
-
+      canMonitor: ({ source }) => source.data.type === 'TAB' || source.data.type === 'TAB_GROUP',
+      onDragStart({ source }) {
         const sourceData = source.data as DragData;
-        const targetData = target.data as any;
+        verticalDragGeometryRef.current = sourceData.projectId === projectId ? captureVerticalDragGeometry() : null;
+      },
+      onDrag({ source, location }) {
+        const target = location.current.dropTargets[0];
+        const input = location.current.input;
+        const preview = resolveStaticVerticalPreview(source.data as DragData, input.clientX, input.clientY, target?.data);
+        const key = preview ? JSON.stringify(preview) : '';
+        if (key !== dragPreviewKeyRef.current) {
+          dragPreviewKeyRef.current = key;
+          setDragPreview(preview);
+        }
+      },
+      onDrop({ source, location }) {
+        const sourceData = source.data as DragData;
+        const target = location.current.dropTargets[0];
+        const targetData = target?.data as any;
+        const input = location.current.input;
+
+        const preview = resolveStaticVerticalPreview(sourceData, input.clientX, input.clientY, targetData);
+        if (preview) {
+          applyTabLayout(projectId, preview.orderedIds, preview.groupAssignments, preview.visualParentAssignments);
+          dragPreviewKeyRef.current = '';
+          verticalDragGeometryRef.current = null;
+          setDragPreview(null);
+          return;
+        }
+        dragPreviewKeyRef.current = '';
+        verticalDragGeometryRef.current = null;
+        setDragPreview(null);
+        if (!target) return;
 
         // Get fresh tabs from workspace (avoid stale closure)
         const currentWorkspace = useWorkspaceStore.getState().openProjects.get(projectId);
         if (!currentWorkspace) return;
+        if (sourceData.type !== 'TAB') return;
 
         // ===== DETACH: sub-agent chip dropped back to TabBar → detach from parent =====
         const sourceTab = currentWorkspace.tabs.get(sourceData.id);
@@ -1520,6 +2197,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
           store.switchTab(projectId, sourceData.id);
           return;
         }
+        if (isVerticalLayout && sourceData.zone === 'main' && !isAdoptDropTarget(sourceData, targetData)) return;
 
         const allTabsNow = Array.from(currentWorkspace.tabs.values());
         const visibleTabsNow = allTabsNow.filter(t => !t.parentTabId);
@@ -1592,7 +2270,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
         }
       },
     });
-  }, [projectId, moveTabToZone, reorderInZone]);
+  }, [projectId, moveTabToZone, reorderInZone, applyTabLayout, captureVerticalDragGeometry, resolveStaticVerticalPreview, isVerticalLayout, isAdoptDropTarget]);
 
   useEffect(() => {
     if (editingTabId && inputRef.current) {
@@ -1658,8 +2336,39 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   const allTabs = Array.from(workspace.tabs.values());
   // Hide sub-agent tabs (parentTabId set) — they are only shown in SubAgentBar
   const visibleTabs = allTabs.filter(t => !t.parentTabId);
-  const mainTabs = visibleTabs.filter(t => !t.isUtility);
+  const mainTabsBase = visibleTabs.filter(t => !t.isUtility);
   const utilityTabs = visibleTabs.filter(t => t.isUtility);
+  const tabGroups = workspace.tabGroups || [];
+  const mainTabs = (() => {
+    if (!isVerticalLayout || !dragPreview) return mainTabsBase;
+    const byId = new Map(mainTabsBase.map(tab => [tab.id, tab]));
+    const ordered: TabData[] = [];
+    const used = new Set<string>();
+    const applyPreviewTab = (tab: TabData): TabData => {
+      let next = tab;
+      if (Object.prototype.hasOwnProperty.call(dragPreview.groupAssignments, tab.id)) {
+        next = { ...next, groupId: dragPreview.groupAssignments[tab.id] || undefined };
+      }
+      if (dragPreview.visualParentAssignments && Object.prototype.hasOwnProperty.call(dragPreview.visualParentAssignments, tab.id)) {
+        next = { ...next, visualParentTabId: dragPreview.visualParentAssignments[tab.id] || undefined };
+      }
+      return next;
+    };
+    for (const id of dragPreview.orderedIds) {
+      const tab = byId.get(id);
+      if (!tab) continue;
+      used.add(id);
+      ordered.push(applyPreviewTab(tab));
+    }
+    for (const tab of mainTabsBase) {
+      if (used.has(tab.id)) continue;
+      ordered.push(applyPreviewTab(tab));
+    }
+    return ordered;
+  })();
+  const mainTabsForDisplay = isVerticalLayout ? orderTabsWithVisualChildren(mainTabs) : mainTabs;
+  const visualDepthById = isVerticalLayout ? buildVisualDepthMap(mainTabsForDisplay) : new Map<string, number>();
+  const verticalRows = isVerticalLayout ? buildVerticalRows(mainTabsForDisplay, tabGroups) : [];
 
   // CWD priority: project.path (if bound) → активный таб cwd → HOME.
   // Раньше было наоборот (активный таб → project.path) — при бранч-хоппинге
@@ -1688,35 +2397,44 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
     setProjectView(projectId, 'terminal');
   };
 
+  const getVisualParentCandidateId = (tabId: string, direction: 'up' | 'down'): string | null => {
+    const index = mainTabsForDisplay.findIndex(tab => tab.id === tabId);
+    if (index === -1) return null;
+    const step = direction === 'up' ? -1 : 1;
+    for (let i = index + step; i >= 0 && i < mainTabsForDisplay.length; i += step) {
+      const candidate = mainTabsForDisplay[i];
+      if (!candidate || candidate.id === tabId) continue;
+      if (candidate.visualParentTabId === tabId) continue;
+      return candidate.id;
+    }
+    return null;
+  };
+
+  const contextMenuTabId = contextMenu?.tabId || null;
+  const visualParentAboveId = contextMenuTabId ? getVisualParentCandidateId(contextMenuTabId, 'up') : null;
+  const visualParentBelowId = contextMenuTabId ? getVisualParentCandidateId(contextMenuTabId, 'down') : null;
+
+  const attachVisualParent = (direction: 'up' | 'down') => {
+    if (!contextMenu) return;
+    const parentId = direction === 'up' ? visualParentAboveId : visualParentBelowId;
+    if (!parentId) return;
+    setTabVisualParent(projectId, contextMenu.tabId, parentId);
+    setContextMenu(null);
+  };
+
   const handleCloseTab = async (e: React.MouseEvent, tabId: string) => {
     e.stopPropagation();
     // If multi-select and clicked tab is among selected — close all selected
     if (isMultiSelect && selectedTabIds.includes(tabId)) {
-      const running: { id: string; name: string }[] = [];
-      for (const id of selectedTabIds) {
-        const state = await ipcRenderer.invoke('terminal:getCommandState', id);
-        if (state.isRunning) {
-          const { processName } = await ipcRenderer.invoke('terminal:hasRunningProcess', id);
-          running.push({ id, name: processName || 'unknown' });
-        }
-      }
-
-      let confirmed = true;
-      if (running.length > 0) {
-        confirmed = window.confirm(
-          `${running.length} tab(s) have running processes:\n${running.map(r => `\u2022 ${r.name}`).join('\n')}\n\nClose all ${selectedTabIds.length} tabs?`
-        );
-      } else {
-        confirmed = window.confirm(`Close ${selectedTabIds.length} tabs?`);
-      }
-
-      if (confirmed) {
+      if (await confirmCloseTabs(selectedTabIds)) {
         for (const id of selectedTabIds) {
-          await closeTab(projectId, id, { skipProcessCheck: true, forceCleanup: true });
+          const tab = workspace?.tabs.get(id);
+          await closeTab(projectId, id, { skipProcessCheck: true, forceCleanup: true, aiBusyOverride: tab ? isTabTurnBusy(tab) : undefined });
         }
       }
     } else {
-      closeTab(projectId, tabId);
+      const tab = workspace?.tabs.get(tabId);
+      closeTab(projectId, tabId, { aiBusyOverride: tab ? isTabTurnBusy(tab) : undefined });
     }
   };
 
@@ -1919,7 +2637,10 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   };
 
   const handleContextClose = () => {
-    if (contextMenu) closeTab(projectId, contextMenu.tabId);
+    if (contextMenu) {
+      const tab = workspace.tabs.get(contextMenu.tabId);
+      closeTab(projectId, contextMenu.tabId, { aiBusyOverride: tab ? isTabTurnBusy(tab) : undefined });
+    }
     setContextMenu(null);
   };
 
@@ -1943,17 +2664,20 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   // Monitor drag start/end for utils dropdown behavior
   useEffect(() => {
     return monitorForElements({
-      canMonitor: ({ source }) => source.data.type === 'TAB',
+      canMonitor: ({ source }) => source.data.type === 'TAB' || source.data.type === 'TAB_GROUP',
       onDragStart: ({ source }) => {
         setIsDraggingTab(true);
         const data = source.data as DragData;
-        if (data.selectedTabIds && data.selectedTabIds.length > 1) {
+        if (data.type === 'TAB' && data.selectedTabIds && data.selectedTabIds.length > 1) {
           setDraggingGroupIds(data.selectedTabIds);
         }
       },
       onDrop: () => {
         setIsDraggingTab(false);
         setDraggingGroupIds([]);
+        dragPreviewKeyRef.current = '';
+        verticalDragGeometryRef.current = null;
+        setDragPreview(null);
         dropCooldownRef.current = true;
         setTimeout(() => { dropCooldownRef.current = false; }, 100);
         // Close Utils if it was opened by hover (not manually)
@@ -2147,72 +2871,186 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
         className="flex-1 flex flex-col scrollbar-hide"
         style={{ overflowX: 'hidden', overflowY: 'auto', minHeight: 0 }}
       >
-        {mainTabs.length === 0 ? (
-          <EmptyMainZone onDrop={(tabId) => moveTabToZone(projectId, tabId, false, 0)} />
+        {mainTabs.length === 0 && tabGroups.length === 0 ? (
+          <EmptyMainZone
+            onDrop={(tabId) => moveTabToZone(projectId, tabId, false, 0)}
+            onDoubleClick={handleNewTabAtEnd}
+            onContextMenu={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              setEmptyContextMenu({ x: e.clientX, y: e.clientY });
+            }}
+          />
         ) : (
-          <div className="flex flex-col" style={{ gap: `${tabSidebarGap}px`, padding: `${tabSidebarGap}px` }}>
-            {mainTabs.map((tab, index) => (
-              <TabItem
-                key={tab.id}
-                tab={tab}
-                index={index}
-                zone="main"
-                projectId={projectId}
-                orientation="vertical"
-                sessionStatus={tab.sessionStatus as SessionStatus | undefined}
-                isActive={currentView === 'terminal' && workspace.activeTabId === tab.id}
-                isSelected={selectedTabIds.includes(tab.id)}
-                isEditing={editingTabId === tab.id}
-                editValue={editValue}
-                onSwitch={(e) => {
-                  handleTabClick(e, tab.id);
-                  setProjectView(projectId, 'terminal');
-                }}
-                onClose={(e) => handleCloseTab(e, tab.id)}
-                onDoubleClick={() => {
-                  if (!isMultiSelect) handleDoubleClick(tab.id, tab.name);
-                }}
-                onContextMenu={(e) => handleContextMenu(e, tab.id)}
-                onEditChange={setEditValue}
-                onEditSubmit={handleRenameSubmit}
-                onEditKeyDown={handleRenameKeyDown}
-                inputRef={inputRef as React.RefObject<HTMLInputElement>}
-                fontSize={tabsFontSize}
-                hasProcess={processStatus.get(tab.id) || false}
-                commandType={tab.commandType}
-                hasSession={sessionStatus.get(tab.id) || !!tab.claudeSessionId}
-                isBusy={(tab.commandType === 'gemini' ? geminiBusyMap.get(tab.id) : claudeBusyMap.get(tab.id)) || false}
-                isAwaitingInput={awaitingMap.get(tab.id) || false}
-                sdkProcessAlive={!!tab.sdkProcessAlive}
-                onRestart={handleRestart}
-                onStop={handleStop}
-                isStopping={restartInFlight.has(tab.id)}
-                isInterrupted={isTabInterrupted(tab)}
-                draggingGroupIds={draggingGroupIds}
-                onHoverChange={(hovering, rect) => handleTabHoverChange(tab.id, hovering, rect)}
-                showNotesPeek={isCmdPressed && isMouseInTabBar && !!workspace.tabs.get(tab.id)?.notes}
-                slideoutOpenHere={openSlideoutTabId === tab.id}
-                anySlideoutOpen={anySlideoutOpen}
-                cmdPeekMode={isCmdPressed && isMouseInTabBar}
-                isCollapsed={!!tab.isCollapsed}
-                isViewingSubAgent={viewingSubAgentParentId === tab.id}
-              />
-            ))}
+          <div data-vertical-main-list className="flex flex-col" style={{ gap: `${tabSidebarGap}px`, padding: `${tabSidebarGap}px` }}>
+            {verticalRows.map((row) => {
+              const renderTab = (tab: TabData, groupId?: string, groupIndex?: number) => {
+                const index = mainTabsForDisplay.findIndex(t => t.id === tab.id);
+                const visualDepth = Math.max(0, visualDepthById.get(tab.id) || 0);
+                const tabNode = (
+                  <TabItem
+                    key={tab.id}
+                    tab={tab}
+                    index={index}
+                    groupId={groupId}
+                    groupIndex={groupIndex}
+                    zone="main"
+                    projectId={projectId}
+                    orientation="vertical"
+                    suppressDropIndicator
+                    sessionStatus={tab.sessionStatus as SessionStatus | undefined}
+                    isActive={currentView === 'terminal' && workspace.activeTabId === tab.id}
+                    isSelected={selectedTabIds.includes(tab.id)}
+                    isEditing={editingTabId === tab.id}
+                    editValue={editValue}
+                    onSwitch={(e) => {
+                      handleTabClick(e, tab.id);
+                      if (!e.defaultPrevented) setProjectView(projectId, 'terminal');
+                    }}
+                    onClose={(e) => handleCloseTab(e, tab.id)}
+                    onDoubleClick={() => {
+                      if (!isMultiSelect) handleDoubleClick(tab.id, tab.name);
+                    }}
+                    onContextMenu={(e) => handleContextMenu(e, tab.id)}
+                    onEditChange={setEditValue}
+                    onEditSubmit={handleRenameSubmit}
+                    onEditKeyDown={handleRenameKeyDown}
+                    inputRef={inputRef as React.RefObject<HTMLInputElement>}
+                    fontSize={tabsFontSize}
+                    hasProcess={hasVisibleProcessBar(tab)}
+                    commandType={tab.commandType}
+                    hasSession={sessionStatus.get(tab.id) || !!tab.claudeSessionId || !!tab.geminiSessionId || !!tab.codexSessionId}
+                    isBusy={isTabTurnBusy(tab)}
+                    isAwaitingInput={awaitingMap.get(tab.id) || false}
+                    sdkProcessAlive={!!tab.sdkProcessAlive}
+                    onRestart={handleRestart}
+                    onStop={handleStop}
+                    isStopping={restartInFlight.has(tab.id)}
+                    isInterrupted={isTabInterrupted(tab)}
+                    draggingGroupIds={draggingGroupIds}
+                    onHoverChange={(hovering, rect) => handleTabHoverChange(tab.id, hovering, rect)}
+                    showNotesPeek={isCmdPressed && isMouseInTabBar && !!workspace.tabs.get(tab.id)?.notes}
+                    slideoutOpenHere={openSlideoutTabId === tab.id}
+                    anySlideoutOpen={anySlideoutOpen}
+                    cmdPeekMode={isCmdPressed && isMouseInTabBar}
+                    isCollapsed={!!tab.isCollapsed}
+                    isViewingSubAgent={viewingSubAgentParentId === tab.id}
+                  />
+                );
+                if (!visualDepth) return tabNode;
+                const parentTab = tab.visualParentTabId
+                  ? mainTabsForDisplay.find(candidate => candidate.id === tab.visualParentTabId)
+                  : null;
+                const parentIsActive = !!parentTab && currentView === 'terminal' && workspace.activeTabId === parentTab.id;
+                const connectorColor = parentTab
+                  ? getVisualConnectorColor(parentTab, parentIsActive)
+                  : 'rgba(255,255,255,0.14)';
+                const indent = Math.min(18, 3 + (visualDepth - 1) * 6);
+                const connectorLeft = 3;
+                return (
+                  <div
+                    key={tab.id}
+                    data-visual-child-row
+                    data-visual-depth={visualDepth}
+                    style={{
+                      position: 'relative',
+                      marginLeft: indent,
+                      paddingLeft: 9,
+                    }}
+                  >
+                    <span
+                      aria-hidden
+                      style={{
+                        position: 'absolute',
+                        left: connectorLeft,
+                        top: `-${tabSidebarGap}px`,
+                        bottom: '50%',
+                        width: 1,
+                        background: connectorColor,
+                        pointerEvents: 'none',
+                      }}
+                    />
+                    <span
+                      aria-hidden
+                      style={{
+                        position: 'absolute',
+                        left: connectorLeft,
+                        top: '50%',
+                        width: 9,
+                        height: 1,
+                        background: connectorColor,
+                        pointerEvents: 'none',
+                      }}
+                    />
+                    {tabNode}
+                  </div>
+                );
+              };
+
+              if (row.type === 'tab') {
+                return (
+                  <div key={row.tab.id} data-vertical-row data-row-type="tab" data-tab-id={row.tab.id}>
+                    {renderTab(row.tab)}
+                  </div>
+                );
+              }
+              return (
+                <div
+                  key={row.group.id}
+                  data-vertical-row
+                  data-row-type="group"
+                  data-group-id={row.group.id}
+                  className="flex flex-col"
+                  style={{ gap: `${tabSidebarGap}px` }}
+                >
+                  <TabGroupHeader group={row.group} count={row.tabs.length} projectId={projectId} />
+                  {row.tabs.length > 0 && (
+                    <div
+                      data-tab-group-body
+                      data-group-id={row.group.id}
+                      className="flex flex-col"
+                      style={{
+                        gap: `${tabSidebarGap}px`,
+                        marginLeft: 9,
+                        paddingLeft: 7,
+                        borderLeft: '1px solid rgba(139,92,246,0.22)',
+                      }}
+                    >
+                      {row.tabs.map((tab, groupIndex) => renderTab(tab, row.group.id, groupIndex))}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
           </div>
         )}
         {/* Empty drop zone at end — captures drops after last tab + double-click = new tab */}
-        {mainTabs.length > 0 && (
+        {(mainTabsForDisplay.length > 0 || tabGroups.length > 0) && (
           <EmptyDropZone
             orientation="vertical"
             onDropMain={(tabId) => {
-              const currentTabs = mainTabs.map(t => t.id);
+              const currentTabs = mainTabsForDisplay.map(t => t.id);
               if (!currentTabs.includes(tabId)) return;
               const newOrder = currentTabs.filter(id => id !== tabId);
               newOrder.push(tabId);
               reorderInZone(projectId, 'main', newOrder);
             }}
             onDropFromUtility={(tabId) => {
-              moveTabToZone(projectId, tabId, false, mainTabs.length);
+              moveTabToZone(projectId, tabId, false, mainTabsForDisplay.length);
+            }}
+            onDropGroup={(groupId) => {
+              const currentWorkspace = useWorkspaceStore.getState().openProjects.get(projectId);
+              if (!currentWorkspace) return;
+              const groupIds = Array.from(currentWorkspace.tabs.values())
+                .filter(tab => !tab.parentTabId && !tab.isUtility && tab.groupId === groupId)
+                .map(tab => tab.id);
+              if (groupIds.length === 0) return;
+              const currentTabs = orderTabsWithVisualChildren(
+                Array.from(currentWorkspace.tabs.values()).filter(tab => !tab.parentTabId && !tab.isUtility)
+              ).map(tab => tab.id);
+              const newOrder = currentTabs.filter(id => !groupIds.includes(id));
+              newOrder.push(...groupIds);
+              applyTabLayout(projectId, newOrder, {});
             }}
             onHoverChange={setEmptyZoneHovered}
             onDoubleClick={handleNewTabAtEnd}
@@ -2258,9 +3096,9 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                   editValue={editValue}
                   onSwitch={(e) => {
                     handleTabClick(e, tab.id);
-                    setProjectView(projectId, 'terminal');
+                    if (!e.defaultPrevented) setProjectView(projectId, 'terminal');
                   }}
-                  onClose={() => closeTab(projectId, tab.id)}
+                  onClose={(e) => handleCloseTab(e, tab.id)}
                   onDoubleClick={() => {
                     if (!isMultiSelect) handleDoubleClick(tab.id, tab.name);
                   }}
@@ -2270,10 +3108,10 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                   onEditKeyDown={handleRenameKeyDown}
                   inputRef={inputRef as React.RefObject<HTMLInputElement>}
                   fontSize={tabsFontSize}
-                  hasProcess={processStatus.get(tab.id) || false}
+                  hasProcess={hasVisibleProcessBar(tab)}
                   commandType={tab.commandType}
-                  hasSession={sessionStatus.get(tab.id) || !!tab.claudeSessionId}
-                  isBusy={(tab.commandType === 'gemini' ? geminiBusyMap.get(tab.id) : claudeBusyMap.get(tab.id)) || false}
+                  hasSession={sessionStatus.get(tab.id) || !!tab.claudeSessionId || !!tab.geminiSessionId || !!tab.codexSessionId}
+                  isBusy={isTabTurnBusy(tab)}
                   isAwaitingInput={awaitingMap.get(tab.id) || false}
                   sdkProcessAlive={!!tab.sdkProcessAlive}
                   onRestart={handleRestart}
@@ -2429,12 +3267,12 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                         editValue={editValue}
                         onSwitch={(e) => {
                           handleTabClick(e, tab.id);
-                          if (!e.shiftKey && !e.metaKey && !e.ctrlKey) {
+                          if (!e.defaultPrevented && !e.shiftKey && !e.metaKey && !e.ctrlKey) {
                             setUtilityExpanded(false); // Close dropdown only on direct switch
                           }
-                          setProjectView(projectId, 'terminal');
+                          if (!e.defaultPrevented) setProjectView(projectId, 'terminal');
                         }}
-                        onClose={() => closeTab(projectId, tab.id)} // Close tab, not move to main
+                        onClose={(e) => handleCloseTab(e, tab.id)} // Close tab, not move to main
                         onDoubleClick={() => {
                       if (!isMultiSelect) {
                         handleDoubleClick(tab.id, tab.name);
@@ -2446,10 +3284,10 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                         onEditKeyDown={handleRenameKeyDown}
                         inputRef={inputRef as React.RefObject<HTMLInputElement>}
                         fontSize={tabsFontSize}
-                        hasProcess={processStatus.get(tab.id) || false}
+                        hasProcess={hasVisibleProcessBar(tab)}
                         commandType={tab.commandType}
-                        hasSession={sessionStatus.get(tab.id) || !!tab.claudeSessionId}
-                        isBusy={(tab.commandType === 'gemini' ? geminiBusyMap.get(tab.id) : claudeBusyMap.get(tab.id)) || false}
+                        hasSession={sessionStatus.get(tab.id) || !!tab.claudeSessionId || !!tab.geminiSessionId || !!tab.codexSessionId}
+                        isBusy={isTabTurnBusy(tab)}
                         isAwaitingInput={awaitingMap.get(tab.id) || false}
                         sdkProcessAlive={!!tab.sdkProcessAlive}
                         onRestart={handleRestart}
@@ -2490,6 +3328,12 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
               /* Empty main zone - show drop target */
               <EmptyMainZone
                 onDrop={(tabId) => moveTabToZone(projectId, tabId, false, 0)}
+                onDoubleClick={handleNewTabAtEnd}
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  setEmptyContextMenu({ x: e.clientX, y: e.clientY });
+                }}
               />
             ) : (
               /* Tabs */
@@ -2507,7 +3351,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                     editValue={editValue}
                     onSwitch={(e) => {
                       handleTabClick(e, tab.id);
-                      setProjectView(projectId, 'terminal');
+                      if (!e.defaultPrevented) setProjectView(projectId, 'terminal');
                     }}
                     onClose={(e) => handleCloseTab(e, tab.id)}
                     onDoubleClick={() => {
@@ -2522,10 +3366,10 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                     inputRef={inputRef as React.RefObject<HTMLInputElement>}
                     forceRightIndicator={emptyZoneHovered && index === mainTabs.length - 1}
                     fontSize={tabsFontSize}
-                    hasProcess={processStatus.get(tab.id) || false}
+                    hasProcess={hasVisibleProcessBar(tab)}
                     commandType={tab.commandType}
-                    hasSession={sessionStatus.get(tab.id) || !!tab.claudeSessionId}
-                    isBusy={(tab.commandType === 'gemini' ? geminiBusyMap.get(tab.id) : claudeBusyMap.get(tab.id)) || false}
+                    hasSession={sessionStatus.get(tab.id) || !!tab.claudeSessionId || !!tab.geminiSessionId || !!tab.codexSessionId}
+                    isBusy={isTabTurnBusy(tab)}
                     isAwaitingInput={awaitingMap.get(tab.id) || false}
                     sdkProcessAlive={!!tab.sdkProcessAlive}
                     onRestart={handleRestart}
@@ -2584,24 +3428,24 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
           onClick={(e) => e.stopPropagation()}
           onMouseDown={(e) => e.stopPropagation()}
         >
-          {/* Close Tab(s) + optional Stop split. Stop visible only when at
-              least one tab in selection has a running Claude or Gemini
-              process. shell/dev-server are out of scope \u2014 dev-server uses
-              middle-click Stop in RestartZone, bash has no graceful stop hook. */}
+          {/* Close Tab(s) + optional Stop split. Stop visible when at least one
+              selected tab has a running AI process or script process. */}
           {(() => {
             // Canonical AI tints used elsewhere in the app:
             // Claude #DA7756 = Provider row primary (InfoPanel)
             // Gemini  #4E86F8 = TAB_COLORS.gemini, ApiSettingsModal, ActionsPanel copy accent
+            // Codex   #10A37F = TAB_COLORS.codex
             const CLAUDE_TINT = '#DA7756';
             const GEMINI_TINT = '#4E86F8';
 
             // Tabs targeted by Stop = either the single right-clicked tab, or
             // all selected tabs when right-click happened on a selected one
-            // (isMultiSelect already gates this). We count Claude/Gemini
-            // separately so the badge can show majority+minority split.
+            // (isMultiSelect already gates this). We count AI engines separately
+            // so the badge can show majority+minority split.
             const targetTabIds = isMultiSelect ? selectedTabIds : (contextMenu ? [contextMenu.tabId] : []);
             let claudeCount = 0;
             let geminiCount = 0;
+            let codexCount = 0;
             let scriptCount = 0; // devServer / shell-command tabs with a live PID
             for (const id of targetTabIds) {
               const tab = workspace.tabs.get(id);
@@ -2612,53 +3456,44 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
               const isSDKBusy = tab?.tabType === 'claude-sdk' && claudeBusyMap.get(id);
               if (!processStatus.get(id) && !isSDKBusy) continue;
               const cmd = tab?.commandType;
-              if (cmd === 'claude') claudeCount++;
+              if (tab?.tabType === 'claude-sdk') claudeCount++;
+              else if (cmd === 'claude') claudeCount++;
               else if (cmd === 'gemini') geminiCount++;
+              else if (cmd === 'codex') codexCount++;
               else scriptCount++; // bash, devServer, shell-script — everything else with live process
             }
-            const totalAI = claudeCount + geminiCount;
+            const totalAI = claudeCount + geminiCount + codexCount;
             const showStopAI = totalAI > 0;
             // Script-stop branch — same split-button layout but green tint (process indicator color),
             // and Ctrl+C path instead of SIGTERM (zsh/bash handles SIGINT, no danger zone like Claude TUI).
             const showStopScript = !showStopAI && scriptCount > 0;
             const SCRIPT_TINT = '#dc2626'; // cherry-red — distinguish from green "running" dot; AI buttons keep their own tints
 
-            // Majority decides base color. Ties go to Claude (project default).
-            // Minority is rendered as small "+N" badge in the OTHER tint, so the
-            // user can see at a glance "mostly Claude, also 1 Gemini in there".
-            const claudeIsMajor = claudeCount >= geminiCount;
-            const baseTint = claudeIsMajor ? CLAUDE_TINT : GEMINI_TINT;
-            const minorityTint = claudeIsMajor ? GEMINI_TINT : CLAUDE_TINT;
-            const majorCount = claudeIsMajor ? claudeCount : geminiCount;
-            const minorCount = claudeIsMajor ? geminiCount : claudeCount;
+            // Majority decides base color. Minority is rendered as a small "+N"
+            // badge, so mixed Claude/Gemini/Codex selections stay readable.
+            const aiCounts = [
+              { label: 'Claude', count: claudeCount, tint: CLAUDE_TINT },
+              { label: 'Gemini', count: geminiCount, tint: GEMINI_TINT },
+              { label: 'Codex', count: codexCount, tint: '#10A37F' },
+            ].filter(x => x.count > 0).sort((a, b) => b.count - a.count);
+            const majorAi = aiCounts[0] || { label: 'AI', count: 0, tint: CLAUDE_TINT };
+            const baseTint = majorAi.tint;
+            const minorityTint = aiCounts[1]?.tint || baseTint;
+            const majorCount = majorAi.count;
+            const minorCount = Math.max(0, totalAI - majorCount);
 
             // Label: single tab keeps full name, multi just shows count under the icon
             const singleTab = totalAI === 1 && targetTabIds.length === 1;
             const stopLabel = singleTab
-              ? (claudeIsMajor ? 'Stop Claude' : 'Stop Gemini')
+              ? `Stop ${majorAi.label}`
               : `Stop ${majorCount}`;
 
             const handleClose = async () => {
               if (isMultiSelect) {
-                const running: { id: string; name: string }[] = [];
-                for (const id of selectedTabIds) {
-                  const state = await ipcRenderer.invoke('terminal:getCommandState', id);
-                  if (state.isRunning) {
-                    const { processName } = await ipcRenderer.invoke('terminal:hasRunningProcess', id);
-                    running.push({ id, name: processName || 'unknown' });
-                  }
-                }
-                let confirmed = true;
-                if (running.length > 0) {
-                  confirmed = window.confirm(
-                    `${running.length} tab(s) have running processes:\n${running.map(r => `\u2022 ${r.name}`).join('\n')}\n\nClose all ${selectedTabIds.length} tabs?`
-                  );
-                } else {
-                  confirmed = window.confirm(`Close ${selectedTabIds.length} tabs?`);
-                }
-                if (confirmed) {
+                if (await confirmCloseTabs(selectedTabIds)) {
                   for (const id of selectedTabIds) {
-                    await closeTab(projectId, id, { skipProcessCheck: true, forceCleanup: true });
+                    const tab = workspace.tabs.get(id);
+                    await closeTab(projectId, id, { skipProcessCheck: true, forceCleanup: true, aiBusyOverride: tab ? isTabTurnBusy(tab) : undefined });
                   }
                 }
               } else {
@@ -2681,7 +3516,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                   window.dispatchEvent(new CustomEvent('claude-sdk:was-stopped', { detail: { tabId: id } }));
                   return ipcRenderer.invoke('claude-sdk:stop', { tabId: id });
                 }
-                if (cmd !== 'claude' && cmd !== 'gemini') return null;
+                if (cmd !== 'claude' && cmd !== 'gemini' && cmd !== 'codex') return null;
                 if (!processStatus.get(id)) return null;
                 return ipcRenderer.invoke('terminal:stop-ai-process', id);
               }).filter(Boolean));
@@ -2701,17 +3536,14 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
               await Promise.all(targetTabIds.map(async (id) => {
                 if (!processStatus.get(id)) return;
                 const cmd = workspace.tabs.get(id)?.commandType;
-                if (cmd === 'claude' || cmd === 'gemini') return;
+                if (cmd === 'claude' || cmd === 'gemini' || cmd === 'codex') return;
                 await runDeterministicStop(id, false);
               }));
             };
 
             const scriptLabel = (() => {
               if (scriptCount === 1 && targetTabIds.length === 1) {
-                const t = workspace.tabs.get(targetTabIds[0]);
-                const name = t?.name || 'script';
-                // Truncate long names so the pill doesn't push Close Tab off the menu.
-                return name.length > 18 ? 'Stop ' + name.slice(0, 18) + '\u2026' : 'Stop ' + name;
+                return 'Stop Proc';
               }
               return `Stop ${scriptCount}`;
             })();
@@ -2719,6 +3551,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
             const tooltipParts = [];
             if (claudeCount > 0) tooltipParts.push(`${claudeCount} Claude`);
             if (geminiCount > 0) tooltipParts.push(`${geminiCount} Gemini`);
+            if (codexCount > 0) tooltipParts.push(`${codexCount} Codex`);
             const tooltipText = `SIGTERM to ${tooltipParts.join(' + ')} (SIGKILL after 800ms if any hangs)`;
 
             // Stop pill — extracted so we can place it in two-row grid (single) OR
@@ -2743,21 +3576,44 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
               </button>
               </Tooltip>
             ) : showStopScript ? (
-              <Tooltip content={`Send Ctrl+C to ${scriptCount} running script(s) — tab stays open`}>
+              <Tooltip content="Stop process (Ctrl+C) - tab stays open">
               <button
                 className="flex-1 basis-0 min-w-0 px-2 py-1.5 text-[12px] cursor-pointer flex items-center justify-center gap-1.5 border-l border-[#444] whitespace-nowrap"
                 style={{ color: '#f87171', backgroundColor: 'transparent' }}
-                onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = SCRIPT_TINT + '1f'; }}
-                onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'transparent'; }}
+                onMouseEnter={(e) => {
+                  const btn = e.currentTarget as HTMLButtonElement;
+                  btn.style.backgroundColor = SCRIPT_TINT + '1f';
+                  const marker = btn.querySelector('[data-stop-script-marker]') as HTMLSpanElement | null;
+                  if (marker) {
+                    marker.style.borderRadius = '2px';
+                    marker.style.backgroundColor = '#f87171';
+                    marker.style.boxShadow = 'none';
+                  }
+                }}
+                onMouseLeave={(e) => {
+                  const btn = e.currentTarget as HTMLButtonElement;
+                  btn.style.backgroundColor = 'transparent';
+                  const marker = btn.querySelector('[data-stop-script-marker]') as HTMLSpanElement | null;
+                  if (marker) {
+                    marker.style.borderRadius = '50%';
+                    marker.style.backgroundColor = '#4ade80';
+                    marker.style.boxShadow = '0 0 6px rgba(74,222,128,0.6)';
+                  }
+                }}
                 onClick={handleStopScript}
               >
-                {/* Two-colour semantics: GREEN glowing dot = "process is alive" (status,
-                    echoes the running-dot), SOFT-RED label = "Stop" (destructive action).
-                    Splitting status (dot) from action (text) is why this can use green
-                    without reading as "all OK" — the red word carries the kill intent.
-                    Earlier all-red (bg+text) read as too aggressive; earlier all-green
-                    read as non-destructive. This hybrid resolves both. */}
-                <span style={{ width: 8, height: 8, borderRadius: '50%', backgroundColor: '#4ade80', display: 'inline-block', boxShadow: '0 0 6px rgba(74,222,128,0.6)' }} />
+                <span
+                  data-stop-script-marker
+                  style={{
+                    width: 8,
+                    height: 8,
+                    borderRadius: '50%',
+                    backgroundColor: '#4ade80',
+                    display: 'inline-block',
+                    boxShadow: '0 0 6px rgba(74,222,128,0.6)',
+                    transition: 'border-radius 100ms ease, background-color 100ms ease, box-shadow 100ms ease',
+                  }}
+                />
                 {scriptLabel}
               </button>
               </Tooltip>
@@ -2791,8 +3647,8 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
             }
 
             // Single-tab mode: 2×2 grid.
-            //   Row 1: [+ add new] [Stop ...]
-            //   Row 2: [Rename]    [Close Tab]
+            //   Row 1: [+ add new] [Close Tab]
+            //   Row 2: [Rename]    [Stop ...]
             // + add new mirrors Cmd+T (handleNewTab → createTabAfterCurrent).
             // Close Tab uses destructive #f87171 TEXT only (no bg tint) — bg-tint
             // would conflict semantically with #dc2626 Stop Script pill.
@@ -2806,7 +3662,12 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                     <Plus size={12} className="text-[#888] flex-shrink-0" />
                     add new
                   </button>
-                  {stopPill}
+                  <button
+                    className="flex-1 basis-0 min-w-0 px-2 py-1.5 text-[12px] text-[#f87171] hover:bg-white/10 cursor-pointer flex items-center justify-center border-l border-[#444] whitespace-nowrap"
+                    onClick={handleClose}
+                  >
+                    Close Tab
+                  </button>
                 </div>
                 <div className="flex items-stretch w-full border-t border-[#3a3a3a]">
                   <button
@@ -2815,12 +3676,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                   >
                     Rename
                   </button>
-                  <button
-                    className="flex-1 basis-0 min-w-0 px-2 py-1.5 text-[12px] text-[#f87171] hover:bg-white/10 cursor-pointer flex items-center justify-center border-l border-[#444] whitespace-nowrap"
-                    onClick={handleClose}
-                  >
-                    Close Tab
-                  </button>
+                  {stopPill}
                 </div>
               </>
             );
@@ -2880,28 +3736,98 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                         </button>
                       );
                     })}
+                    <div className="my-1 border-t border-[#3a3a3a]" />
+                    <div className="relative group/background">
+                      <button
+                        className="w-full text-left px-4 py-1 text-[11px] text-[#888] hover:bg-white/10 hover:text-[#bbb] cursor-pointer flex items-center justify-between gap-3 whitespace-nowrap"
+                      >
+                        <span>Background</span>
+                        <span className="flex items-center gap-1.5 ml-auto">
+                          {(() => {
+                            const currentColor = workspace.tabs.get(contextMenu.tabId)?.color || 'default';
+                            const meta = TAB_COLORS.find((c) => c.color === currentColor) || TAB_COLORS[0];
+                            return (
+                              <span
+                                style={{
+                                  width: 9,
+                                  height: 9,
+                                  borderRadius: 3,
+                                  backgroundColor: meta.bgColor === 'transparent' ? 'transparent' : meta.borderColor,
+                                  border: `1px solid ${meta.borderColor}`,
+                                  display: 'inline-block',
+                                }}
+                              />
+                            );
+                          })()}
+                          <span className="text-[#555]">›</span>
+                        </span>
+                      </button>
+                      <div className="absolute left-full bottom-0 -ml-2 pl-2 hidden group-hover/background:block">
+                        <div className="bg-[#2a2a2a] border border-[#444] rounded-xl shadow-2xl py-1 min-w-[165px]">
+                          {TAB_COLORS.map((c) => {
+                            const currentColor = workspace.tabs.get(contextMenu.tabId)?.color || 'default';
+                            const isSelected = currentColor === c.color;
+                            return (
+                              <button
+                                key={c.color}
+                                className="w-full text-left px-3 py-1 text-[12px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2 whitespace-nowrap"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleSetColor(c.color);
+                                }}
+                              >
+                                <span
+                                  style={{
+                                    width: 11,
+                                    height: 11,
+                                    borderRadius: 3,
+                                    backgroundColor: c.bgColor === 'transparent' ? 'transparent' : c.borderColor,
+                                    border: `1px solid ${c.borderColor}`,
+                                    flexShrink: 0,
+                                  }}
+                                />
+                                <span>{c.label.replace(/^[^\wА-Яа-я]+\\s*/, '')}</span>
+                                {isSelected && <span className="ml-auto text-white">✓</span>}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    </div>
                   </div>
                 </div>
               </div>
             </>
           )}
 
-          {/* Collapse / Expand */}
+          {/* Visual parent split control */}
           {!isMultiSelect && (
-            <button
-              className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2"
-              onClick={() => {
-                if (contextMenu) {
-                  toggleTabCollapsed(projectId, contextMenu.tabId);
-                }
-                setContextMenu(null);
-              }}
-            >
-              {workspace.tabs.get(contextMenu!.tabId)?.isCollapsed
-                ? <><Maximize2 size={12} className="text-[#666]" /> Expand</>
-                : <><Minimize2 size={12} className="text-[#666]" /> Collapse</>
-              }
-            </button>
+            <div className="grid grid-cols-2 border-t border-[#333] border-b border-[#333]">
+              <button
+                className={`px-4 py-1.5 text-[13px] flex items-center justify-center gap-2 ${
+                  visualParentAboveId
+                    ? 'text-[#ccc] hover:bg-white/10 cursor-pointer'
+                    : 'text-[#555] cursor-not-allowed'
+                }`}
+                disabled={!visualParentAboveId}
+                title="Make this tab child of the nearest visible tab above"
+                onClick={() => attachVisualParent('up')}
+              >
+                <ArrowUp size={13} className={visualParentAboveId ? 'text-[#8b5cf6]' : 'text-[#555]'} />
+              </button>
+              <button
+                className={`px-4 py-1.5 text-[13px] flex items-center justify-center gap-2 border-l border-[#333] ${
+                  visualParentBelowId
+                    ? 'text-[#ccc] hover:bg-white/10 cursor-pointer'
+                    : 'text-[#555] cursor-not-allowed'
+                }`}
+                disabled={!visualParentBelowId}
+                title="Make this tab child of the nearest visible tab below"
+                onClick={() => attachVisualParent('down')}
+              >
+                <ArrowDown size={13} className={visualParentBelowId ? 'text-[#8b5cf6]' : 'text-[#555]'} />
+              </button>
+            </div>
           )}
 
           {/* Scripts - submenu */}
@@ -2990,7 +3916,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                 selectedTabIds.forEach(tabId => {
                   const tab = workspace.tabs.get(tabId);
                   if (tab) {
-                    const sessionId = tab.claudeSessionId || tab.geminiSessionId || 'no-session';
+                    const sessionId = tab.claudeSessionId || tab.geminiSessionId || tab.codexSessionId || 'no-session';
                     const path = tab.cwd || project?.path || '/';
                     lines.push(`${sessionId}\ncwd: ${path}`);
                   }
@@ -3000,7 +3926,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
               } else {
                 const tab = workspace.tabs.get(contextMenu.tabId);
                 if (tab) {
-                  const sessionId = tab.claudeSessionId || tab.geminiSessionId || 'no-session';
+                  const sessionId = tab.claudeSessionId || tab.geminiSessionId || tab.codexSessionId || 'no-session';
                   const path = tab.cwd || project?.path || '/';
                   const text = `${sessionId}\ncwd: ${path}`;
                   navigator.clipboard.writeText(text);
@@ -3096,6 +4022,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                           url: tab.url || null,
                           claudeSessionId: tab.claudeSessionId || null,
                           geminiSessionId: tab.geminiSessionId || null,
+                          codexSessionId: tab.codexSessionId || null,
                         }
                       });
                       showToast(`"${tab.name}" added to favorites`, 'success');
@@ -3111,7 +4038,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
         </div>
       )}
 
-      {/* Empty space context menu — Create SDK tab */}
+      {/* Empty space context menu */}
       {emptyContextMenu && (
         <div
           className="fixed bg-[#2a2a2a] border border-[#444] shadow-2xl min-w-[180px] z-[100] rounded-md overflow-hidden"
@@ -3122,23 +4049,22 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
           <button
             className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2"
             onClick={() => {
-              createSDKTab(projectId);
-              setProjectView(projectId, 'terminal');
-              setEmptyContextMenu(null);
-            }}
-          >
-            <span style={{ color: '#DA7756' }}>◆</span>
-            Create Claude SDK tab
-          </button>
-          <button
-            className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2"
-            onClick={() => {
               handleNewTabAtEnd();
               setEmptyContextMenu(null);
             }}
           >
             <span style={{ color: '#888' }}>+</span>
             New Terminal tab
+          </button>
+          <button
+            className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2"
+            onClick={() => {
+              createTabGroup(projectId);
+              setEmptyContextMenu(null);
+            }}
+          >
+            <Folder size={12} className="text-[#8b5cf6]" />
+            New Group
           </button>
         </div>
       )}

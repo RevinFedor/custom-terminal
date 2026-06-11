@@ -5,9 +5,9 @@ import { setPrefetched } from '../utils/sdkHistoryPrefetch';
 
 const { ipcRenderer } = window.require('electron');
 
-export type TabColor = 'default' | 'red' | 'yellow' | 'green' | 'blue' | 'purple' | 'claude' | 'gemini';
+export type TabColor = 'default' | 'red' | 'yellow' | 'green' | 'blue' | 'purple' | 'claude' | 'gemini' | 'codex';
 
-export type CommandType = 'generic' | 'devServer' | 'claude' | 'gemini';
+export type CommandType = 'generic' | 'devServer' | 'claude' | 'gemini' | 'codex';
 
 export type TabType = 'terminal' | 'browser' | 'claude-sdk';
 
@@ -42,15 +42,38 @@ export interface SessionHistoryEntry {
   at: number; // Date.now() millis
 }
 
+export interface TabGroup {
+  id: string;
+  name: string;
+  createdAt: number;
+}
+
+export interface AiLaunchSnapshot {
+  sessionType: 'claude' | 'codex';
+  commandType?: CommandType;
+  name: string;
+  color?: TabColor;
+  colorSetManually?: boolean;
+  nameSetManually?: boolean;
+  claudeSessionId?: string;
+  geminiSessionId?: string;
+  codexSessionId?: string;
+  wasInterrupted?: boolean;
+  overlayDismissed?: boolean;
+  at: number;
+}
+
+const aiLaunchSnapshots = new Map<string, AiLaunchSnapshot>();
+
 // Helper: Check if tab has an interrupted AI session that can be resumed
-export const isTabInterrupted = (tab: { wasInterrupted?: boolean; claudeSessionId?: string; geminiSessionId?: string }): boolean => {
-  return !!(tab.wasInterrupted && (tab.claudeSessionId || tab.geminiSessionId));
+export const isTabInterrupted = (tab: { wasInterrupted?: boolean; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string }): boolean => {
+  return !!(tab.wasInterrupted && (tab.claudeSessionId || tab.geminiSessionId || tab.codexSessionId));
 };
 
 // Typed pending action - executed after terminal is ready
 export interface PendingAction {
-  type: 'claude-fork' | 'claude-continue' | 'claude-new' | 'gemini-fork' | 'gemini-continue' | 'gemini-new' | 'shell-command';
-  sessionId?: string;    // For claude-fork, claude-continue, gemini-fork, gemini-continue
+  type: 'claude-fork' | 'claude-continue' | 'claude-new' | 'gemini-fork' | 'gemini-continue' | 'gemini-new' | 'codex-fork' | 'codex-continue' | 'codex-new' | 'shell-command';
+  sessionId?: string;    // For AI fork/continue actions
   command?: string;      // For shell-command
 }
 
@@ -72,6 +95,9 @@ interface Tab {
   createdAt?: number; // Timestamp when tab was created
   claudeSessionId?: string; // Active Claude Code session UUID (detected from terminal output)
   geminiSessionId?: string; // Active Gemini CLI session ID (detected via Sniper Watcher)
+  codexSessionId?: string; // Active Codex CLI session ID (detected from ~/.codex/sessions JSONL)
+  codexModel?: string; // Per-tab Codex model selection for ControlBar launches
+  codexEffort?: string; // Per-tab Codex reasoning effort selection for ControlBar launches
   pendingAction?: PendingAction; // Action to execute when terminal is ready
   wasInterrupted?: boolean; // True if tab was closed with active AI session (show resume overlay)
   overlayDismissed?: boolean; // True if user dismissed the interrupted overlay (don't show again)
@@ -101,11 +127,15 @@ interface Tab {
    * (graceful degrade), значение в БД сохраняется.
    */
   sessionStatus?: string;
+  groupId?: string; // One-level TabBar group membership. Separate from parentTabId (sub-agents).
+  visualParentTabId?: string; // Visual-only tab nesting in TabBar. Never use for MCP sub-agents.
   isCollapsed?: boolean; // Collapsed tab — icon-only, for archiving completed sessions
   claudeAgentSessionId?: string; // Claude Agent SDK session ID (for @claude:...@end orchestration)
   claudeAgentStatus?: 'idle' | 'running' | 'done' | 'error' | 'summarizing'; // Claude Agent current status
   claudeActive?: boolean; // True if Claude CLI is running inside PTY (not just shell alive)
   claudeBusy?: boolean; // True if Claude CLI spinner is active (from claude:busy-state)
+  aiBusy?: boolean; // True when this AI tab is actively streaming/thinking (Claude/SDK/Gemini/Codex)
+  aiClosing?: boolean; // Short-lived UI state while close waits for graceful AI stop
   claudeTaskCount?: number; // Number of completed MCP tasks (delegate/continue)
   parentTabId?: string; // If this is a MCP sub-agent tab, points to parent (Gemini) tab
   mcpTaskId?: string; // MCP task UUID assigned when delegate_to_claude created this sub-agent
@@ -230,6 +260,7 @@ interface ProjectWorkspace {
   projectId: string;
   projectPath: string;
   tabs: Map<string, Tab>;
+  tabGroups: TabGroup[];
   activeTabId: string | null;
   selectedTabIds: string[]; // List of selected tab IDs for multi-action
   tabHistory: string[]; // LRU stack of tab IDs (max 20) for navigation on close
@@ -240,6 +271,25 @@ interface ProjectWorkspace {
   currentView: 'terminal' | 'home'; // Per-project view state (Home vs Terminal)
   viewingSubAgentTabId: string | null; // When viewing a sub-agent, points to the Claude sub-agent tab
 }
+
+const isAiRuntimeTab = (tab?: Pick<Tab, 'commandType' | 'tabType'> | null): boolean => {
+  return !!tab && (tab.tabType === 'claude-sdk' || tab.commandType === 'claude' || tab.commandType === 'gemini' || tab.commandType === 'codex');
+};
+
+const isSdkBusyState = (tab?: Pick<Tab, 'sdkState'> | null): boolean => {
+  return tab?.sdkState === 'fetching' || tab?.sdkState === 'thinking' || tab?.sdkState === 'tool_use';
+};
+
+const isAiBusyTab = (tab?: Pick<Tab, 'aiBusy' | 'claudeBusy' | 'sdkState'> | null, override?: boolean): boolean => {
+  if (typeof override === 'boolean') return override;
+  return !!(tab?.aiBusy || tab?.claudeBusy || isSdkBusyState(tab));
+};
+
+const isAiForegroundProcess = (info?: { hasProcess?: boolean; processName?: string; command?: string } | null): boolean => {
+  if (!info?.hasProcess) return false;
+  const text = `${info.processName || ''} ${info.command || ''}`.toLowerCase();
+  return /\b(claude|gemini|codex)\b/.test(text) || text.includes('@openai/codex');
+};
 
 interface SessionState {
   openProjects: { projectId: string; projectPath: string; activeTabIndex: number }[];
@@ -274,9 +324,9 @@ interface WorkspaceStore {
   closeProject: (projectId: string) => Promise<void>;
 
   // Tab management
-  createTab: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; tabType?: TabType; url?: string; background?: boolean; sessionStatus?: string }) => Promise<string>;
-  createTabAfterCurrent: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; tabType?: TabType; url?: string; afterTabId?: string; nameSetManually?: boolean; background?: boolean }) => Promise<string>;
-  closeTab: (projectId: string, tabId: string, options?: { skipProcessCheck?: boolean; forceCleanup?: boolean }) => Promise<void>;
+  createTab: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; tabType?: TabType; url?: string; background?: boolean; sessionStatus?: string; groupId?: string; visualParentTabId?: string }) => Promise<string>;
+  createTabAfterCurrent: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; tabType?: TabType; url?: string; afterTabId?: string; nameSetManually?: boolean; background?: boolean; groupId?: string; visualParentTabId?: string }) => Promise<string>;
+  closeTab: (projectId: string, tabId: string, options?: { skipProcessCheck?: boolean; forceCleanup?: boolean; aiBusyOverride?: boolean }) => Promise<boolean>;
   reopenLastClosedTab: (projectId: string) => Promise<{ tabId: string | null; reason?: 'empty' | 'error' }>;
   switchTab: (projectId: string, tabId: string) => void;
   renameTab: (projectId: string, tabId: string, newName: string) => void;
@@ -294,6 +344,9 @@ interface WorkspaceStore {
   setTabColor: (projectId: string, tabId: string, color: TabColor, manual?: boolean) => void;
   setTabSessionStatus: (projectId: string, tabId: string, status: string | null) => void;
   setTabCommandType: (tabId: string, commandType: CommandType) => void; // Also sets auto-color on first run
+  getAiLaunchSnapshot: (tabId: string) => AiLaunchSnapshot | null;
+  clearAiLaunchSnapshot: (tabId: string, reason?: string) => void;
+  rollbackUnmaterializedAiLaunch: (tabId: string, reason: string) => boolean;
   toggleTabUtility: (projectId: string, tabId: string) => void;
   toggleTabCollapsed: (projectId: string, tabId: string) => void;
 
@@ -302,6 +355,10 @@ interface WorkspaceStore {
   moveTabToZone: (projectId: string, tabId: string, toUtility: boolean, atIndex: number) => void;
   moveTabToProject: (sourceProjectId: string, tabId: string, targetProjectId: string) => void;
   moveTabsToProject: (sourceProjectId: string, tabIds: string[], targetProjectId: string) => void;
+  createTabGroup: (projectId: string, name?: string) => string;
+  renameTabGroup: (projectId: string, groupId: string, name: string) => void;
+  setTabVisualParent: (projectId: string, tabId: string, parentTabId: string | undefined) => void;
+  applyTabLayout: (projectId: string, orderedIds: string[], groupAssignments?: Record<string, string | null | undefined>, visualParentAssignments?: Record<string, string | null | undefined>) => void;
 
   // Update tab cwd
   updateTabCwd: (projectId: string, tabId: string, newCwd: string) => void;
@@ -317,10 +374,16 @@ interface WorkspaceStore {
   setGeminiSessionId: (tabId: string, sessionId: string) => void;
   getGeminiSessionId: (tabId: string) => string | null;
 
+  // Codex session tracking
+  setCodexSessionId: (tabId: string, sessionId: string) => void;
+  getCodexSessionId: (tabId: string) => string | null;
+  updateCodexState: (tabId: string, state: Partial<Pick<Tab, 'codexModel' | 'codexEffort'>>) => void;
+
   // Claude Agent orchestration
   setClaudeAgentStatus: (tabId: string, status: 'idle' | 'running' | 'done' | 'error' | 'summarizing', sessionId?: string) => void;
   setClaudeActive: (tabId: string, alive: boolean) => void;
   setClaudeBusy: (tabId: string, busy: boolean) => void;
+  setAiBusy: (tabId: string, busy: boolean) => void;
   setSdkProcessAlive: (tabId: string, alive: boolean) => void;
   setInterceptorState: (tabId: string, state: 'armed' | 'disarmed' | null) => void;
 
@@ -351,7 +414,7 @@ interface WorkspaceStore {
   setBrowserActiveView: (tabId: string, view: 'browser' | 'terminal') => void;
 
   // Claude SDK tabs
-  createSDKTab: (projectId: string, name?: string) => Promise<string>;
+  createSDKTab: (projectId: string, name?: string, options?: { afterTabId?: string; groupId?: string; visualParentTabId?: string; background?: boolean }) => Promise<string>;
   convertToSDKTab: (tabId: string) => void;
   updateSDKState: (tabId: string, state: Partial<Pick<Tab, 'sdkState' | 'sdkMessages' | 'claudeSessionId' | 'sdkModel' | 'sdkEffort' | 'sdkThinking' | 'sdkMidstreamPending'>>) => void;
   // Merge a partial BgTask patch by taskId. Creates the entry if missing.
@@ -417,6 +480,9 @@ const saveTabs = (projectId: string, tabs: Map<string, Tab>, forceCleanup = fals
     commandType: tab.commandType, // Preserve to prevent auto-rename on resume
     claudeSessionId: tab.claudeSessionId,
     geminiSessionId: tab.geminiSessionId,
+    codexSessionId: tab.codexSessionId,
+    codexModel: tab.codexModel,
+    codexEffort: tab.codexEffort,
     wasInterrupted: tab.wasInterrupted,
     overlayDismissed: tab.overlayDismissed,
     notes: tab.notes,
@@ -428,6 +494,8 @@ const saveTabs = (projectId: string, tabs: Map<string, Tab>, forceCleanup = fals
     createdAt: tab.createdAt,
     isCollapsed: tab.isCollapsed,
     sessionStatus: tab.sessionStatus,
+    groupId: tab.groupId,
+    visualParentTabId: tab.visualParentTabId,
     nameSetManually: tab.nameSetManually,
     parentTabId: tab.parentTabId,
     mcpTaskId: tab.mcpTaskId,
@@ -435,6 +503,10 @@ const saveTabs = (projectId: string, tabs: Map<string, Tab>, forceCleanup = fals
     tabId: tab.id
   }));
   ipcRenderer.invoke('project:save-tabs', { projectId, tabs: tabsArray, forceCleanup });
+};
+
+const saveTabGroups = (projectId: string, groups: TabGroup[]) => {
+  ipcRenderer.invoke('project:save-tab-groups', { projectId, groups });
 };
 
 export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
@@ -517,6 +589,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           projectId: proj.projectId,
           projectPath: proj.projectPath,
           tabs: new Map(),
+          tabGroups: projectData?.tabGroups || [],
           activeTabId: null,
           selectedTabIds: [],
           tabHistory: [],
@@ -545,6 +618,9 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
               commandType: savedTab.commandType,
               claudeSessionId: savedTab.claudeSessionId,
               geminiSessionId: savedTab.geminiSessionId,
+              codexSessionId: savedTab.codexSessionId,
+              codexModel: savedTab.codexModel,
+              codexEffort: savedTab.codexEffort,
               wasInterrupted: savedTab.wasInterrupted,
               overlayDismissed: savedTab.overlayDismissed,
               notes: savedTab.notes,
@@ -552,6 +628,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
               url: savedTab.url,
               createdAt: savedTab.createdAt,
               isCollapsed: savedTab.isCollapsed,
+              groupId: savedTab.groupId,
+              visualParentTabId: savedTab.visualParentTabId,
               sessionStatus: savedTab.sessionStatus,
               nameSetManually: savedTab.nameSetManually,
               parentTabId: savedTab.parentTabId,
@@ -752,6 +830,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         projectId,
         projectPath,
         tabs: new Map(),
+        tabGroups: projectData?.tabGroups || [],
         activeTabId: null,
         selectedTabIds: [],
         tabHistory: [],
@@ -789,6 +868,9 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
               commandType: savedTab.commandType,
               claudeSessionId: savedTab.claudeSessionId,
               geminiSessionId: savedTab.geminiSessionId,
+              codexSessionId: savedTab.codexSessionId,
+              codexModel: savedTab.codexModel,
+              codexEffort: savedTab.codexEffort,
               wasInterrupted: savedTab.wasInterrupted,
               overlayDismissed: savedTab.overlayDismissed,
               notes: savedTab.notes,
@@ -796,6 +878,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
               url: savedTab.url,
               createdAt: savedTab.createdAt,
               isCollapsed: savedTab.isCollapsed,
+              groupId: savedTab.groupId,
+              visualParentTabId: savedTab.visualParentTabId,
               sessionStatus: savedTab.sessionStatus,
               nameSetManually: savedTab.nameSetManually,
               parentTabId: savedTab.parentTabId,
@@ -857,23 +941,17 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   },
 
   closeProject: async (projectId) => {
-    const { openProjects, activeProjectId, view, saveSession, syncAllTabsCwd, projectHistory } = get();
+    const { openProjects, activeProjectId, view, saveSession, projectHistory } = get();
     const workspace = openProjects.get(projectId);
 
     if (workspace) {
-      // Sync cwd for all tabs before closing
-      await syncAllTabsCwd(projectId);
-
       // Save tabs before closing (manual close = NOT interrupted)
       saveTabs(workspace.projectId, workspace.tabs);
 
-      // Kill all terminals
-      workspace.tabs.forEach((tab) => {
-        ipcRenderer.send('terminal:kill', tab.id);
-      });
+      const tabsToKill = Array.from(workspace.tabs.keys());
+      const nextOpenProjects = new Map(openProjects);
+      nextOpenProjects.delete(projectId);
 
-      openProjects.delete(projectId);
-      
       // Update history: remove closed project
       const newHistory = projectHistory.filter(id => id !== projectId);
       
@@ -884,22 +962,28 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         // Find next best project from history that is still open
         nextActiveId = null;
         for (let i = newHistory.length - 1; i >= 0; i--) {
-          if (openProjects.has(newHistory[i])) {
+          if (nextOpenProjects.has(newHistory[i])) {
             nextActiveId = newHistory[i];
             break;
           }
         }
       }
-      
-      set({
-        openProjects: new Map(openProjects),
+
+      startTransition(() => set({
+        openProjects: nextOpenProjects,
         activeProjectId: nextActiveId,
         projectHistory: newHistory,
         // If we closed the active project and no projects are left in history -> dashboard
         view: (isClosingActive && !nextActiveId && view === 'workspace') ? 'dashboard' : view
-      });
+      }));
 
       saveSession();
+
+      // PTY shutdown may involve process checks and graceful Ctrl+C. Keep it off the
+      // critical UI path so closing a project cannot look like a global freeze.
+      tabsToKill.forEach((tabId) => {
+        ipcRenderer.send('terminal:kill', tabId);
+      });
     }
   },
 
@@ -932,6 +1016,9 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       pendingAction: options?.pendingAction,
       claudeSessionId: options?.claudeSessionId,
       geminiSessionId: options?.geminiSessionId,
+      codexSessionId: options?.codexSessionId,
+      codexModel: options?.codexModel,
+      codexEffort: options?.codexEffort,
       wasInterrupted: options?.wasInterrupted,
       overlayDismissed: options?.overlayDismissed,
       notes: options?.notes,
@@ -939,6 +1026,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       url: options?.url,
       createdAt: (options as any)?.createdAt || Math.floor(Date.now() / 1000),
       isCollapsed: (options as any)?.isCollapsed,
+      groupId: options?.isUtility ? undefined : options?.groupId,
+      visualParentTabId: options?.isUtility ? undefined : (options as any)?.visualParentTabId,
       nameSetManually: (options as any)?.nameSetManually,
       parentTabId: (options as any)?.parentTabId,
       mcpTaskId: (options as any)?.mcpTaskId,
@@ -1011,6 +1100,12 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     const existingNames = Array.from(workspace.tabs.values()).map(t => t.name);
     const tabName = name || getNextAvailableName('tab', existingNames);
 
+    const requestedVisualParentId = options?.isUtility ? undefined : options?.visualParentTabId;
+    const visualParentTab = requestedVisualParentId ? workspace.tabs.get(requestedVisualParentId) : undefined;
+    const visualParentTabId = visualParentTab && !visualParentTab.isUtility && !visualParentTab.parentTabId
+      ? requestedVisualParentId
+      : undefined;
+
     const newTab: Tab = {
       id: tabId,
       name: tabName,
@@ -1021,12 +1116,17 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       pendingAction: options?.pendingAction,
       claudeSessionId: options?.claudeSessionId,
       geminiSessionId: options?.geminiSessionId,
+      codexSessionId: options?.codexSessionId,
+      codexModel: options?.codexModel,
+      codexEffort: options?.codexEffort,
       wasInterrupted: options?.wasInterrupted,
       overlayDismissed: options?.overlayDismissed,
       notes: options?.notes,
       tabType: options?.tabType || 'terminal',
       url: options?.url,
       nameSetManually: (options as any)?.nameSetManually,
+      groupId: options?.isUtility ? undefined : (options?.groupId ?? visualParentTab?.groupId),
+      visualParentTabId,
       createdAt: (options as any)?.createdAt || Math.floor(Date.now() / 1000)
     };
 
@@ -1115,50 +1215,93 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   },
 
   closeTab: async (projectId, tabId, options) => {
+    const closeStartedAt = Date.now();
     const { openProjects, clearTerminalBuffer } = get();
     const workspace = openProjects.get(projectId);
 
-    if (!workspace) return;
+    if (!workspace) return false;
 
     const tab = workspace.tabs.get(tabId);
+    if (!tab) return false;
     const skipProcessCheck = options?.skipProcessCheck || false;
+    const isAiTab = isAiRuntimeTab(tab);
+    const aiBusyAtClose = isAiBusyTab(tab, options?.aiBusyOverride);
+    console.log('[CloseTab] start project=' + projectId.slice(-12) +
+      ' tab=' + tabId.slice(-12) +
+      ' name=' + JSON.stringify(tab?.name || '') +
+      ' cmd=' + (tab?.commandType || 'none') +
+      ' type=' + (tab?.tabType || 'terminal') +
+      ' ai=' + isAiTab +
+      ' aiBusy=' + aiBusyAtClose +
+      ' skip=' + !!options?.skipProcessCheck +
+      ' forceCleanup=' + !!options?.forceCleanup);
     // OSC 133 process state — captured before potential confirm() dialog so we
     // can persist whether the tab had a live CLI for Shift+Cmd+T reopen logic.
     let processWasRunning = false;
+    let commandState: any = null;
+    let runningProcessInfo: any = null;
+    let foregroundAiProcess = false;
 
-    if (!skipProcessCheck && tab?.tabType !== 'claude-sdk') {
+    if (tab.tabType !== 'claude-sdk') {
       // Check if terminal has running process via OSC 133 state (fast, no syscalls)
-      const commandState = await ipcRenderer.invoke('terminal:getCommandState', tabId);
+      commandState = await ipcRenderer.invoke('terminal:getCommandState', tabId);
       processWasRunning = !!commandState?.isRunning;
-
-      if (commandState.isRunning) {
-        // Only call hasRunningProcess to get process name (single syscall, not polling)
-        const { processName } = await ipcRenderer.invoke('terminal:hasRunningProcess', tabId);
-        const confirmed = window.confirm(
-          `Terminal has a running process: "${processName || 'unknown'}"\n\nAre you sure you want to close this tab?`
-        );
-        if (!confirmed) return;
+      console.log('[CloseTab] command-state tab=' + tabId.slice(-12) +
+        ' running=' + processWasRunning +
+        ' durMs=' + (Date.now() - closeStartedAt));
+      if (processWasRunning) {
+        runningProcessInfo = await ipcRenderer.invoke('terminal:hasRunningProcess', tabId).catch(() => null);
+        foregroundAiProcess = isAiForegroundProcess(runningProcessInfo);
       }
 
-      // Check if tab has saved Claude session
-      if (tab?.claudeSessionId && !commandState.isRunning) {
-        const confirmed = window.confirm(
-          `Эта вкладка содержит Claude сессию:\n${tab.claudeSessionId}\n\nПри закрытии вы потеряете привязку к этой сессии. Продолжить?`
-        );
-        if (!confirmed) return;
+      if (!skipProcessCheck && commandState.isRunning) {
+        if (isAiTab && (foregroundAiProcess || !runningProcessInfo?.hasProcess)) {
+          if (aiBusyAtClose) {
+            const confirmed = window.confirm(
+              'AI-сессия сейчас отвечает. Остановить её и закрыть вкладку?'
+            );
+            if (!confirmed) return false;
+          }
+        } else {
+          const confirmed = window.confirm(
+            `Terminal has a running process: "${runningProcessInfo?.processName || 'unknown'}"\n\nAre you sure you want to close this tab?`
+          );
+          if (!confirmed) return false;
+        }
       }
-    } else if (tab?.tabType !== 'claude-sdk') {
-      // skipProcessCheck path (programmatic close) — still need processWasRunning
-      // for archive, so we read OSC 133 state without prompting.
-      try {
-        const cs = await ipcRenderer.invoke('terminal:getCommandState', tabId);
-        processWasRunning = !!cs?.isRunning;
-      } catch {}
     }
     // For SDK tabs, "running" means the SDK turn is mid-stream — we infer it
     // from claudeBusy which is the same signal SessionActionChip watches.
-    if (tab?.tabType === 'claude-sdk') {
-      processWasRunning = !!(tab as any).claudeBusy;
+    if (tab.tabType === 'claude-sdk') {
+      processWasRunning = aiBusyAtClose;
+      if (!skipProcessCheck && aiBusyAtClose) {
+        const confirmed = window.confirm(
+          'Claude SDK сейчас отвечает. Остановить сессию и закрыть вкладку?'
+        );
+        if (!confirmed) return false;
+      }
+    }
+
+    if (isAiTab && (aiBusyAtClose || (processWasRunning && (foregroundAiProcess || !runningProcessInfo?.hasProcess)))) {
+      tab.aiClosing = true;
+      startTransition(() => {
+        set({ openProjects: new Map(openProjects) });
+      });
+      try {
+        if (tab.tabType === 'claude-sdk') {
+          await Promise.race([
+            ipcRenderer.invoke('claude-sdk:stop', { tabId, hard: true }),
+            new Promise(resolve => setTimeout(resolve, 2500)),
+          ]);
+        } else {
+          await Promise.race([
+            ipcRenderer.invoke('terminal:stop-ai-process', tabId),
+            new Promise(resolve => setTimeout(resolve, 1800)),
+          ]);
+        }
+      } catch (err: any) {
+        console.warn('[CloseTab] graceful AI stop failed tab=' + tabId.slice(-12) + ': ' + (err?.message || err));
+      }
     }
 
     // Compute TabBar position at close time (excluding sub-agent / utility
@@ -1172,13 +1315,17 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     // HARD kill — closing the tab must fully terminate the process and all its
     // background agents (no orphans). A soft interrupt would leave the parked
     // session + bg workers alive with no UI to control them.
-    if (tab?.tabType === 'claude-sdk') {
-      ipcRenderer.invoke('claude-sdk:stop', { tabId, hard: true }).catch(() => {});
+    if (tab.tabType === 'claude-sdk') {
+      if (!aiBusyAtClose) {
+        ipcRenderer.invoke('claude-sdk:stop', { tabId, hard: true }).catch(() => {});
+      }
       ipcRenderer.send('claude-sdk:busy-state', { tabId, busy: false });
     }
 
-    if (tab?.tabType !== 'claude-sdk') {
+    if (tab.tabType !== 'claude-sdk') {
       ipcRenderer.send('terminal:kill', tabId);
+      console.log('[CloseTab] terminal:kill sent tab=' + tabId.slice(-12) +
+        ' durMs=' + (Date.now() - closeStartedAt));
     }
     clearTerminalBuffer(tabId); // Clean up serialized buffer
 
@@ -1197,11 +1344,20 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           createdAt: tab.createdAt,
           claudeSessionId: tab.claudeSessionId,
           geminiSessionId: tab.geminiSessionId,
+          codexSessionId: tab.codexSessionId,
+          codexModel: tab.codexModel,
+          codexEffort: tab.codexEffort,
           sessionStatus: tab.sessionStatus,
           position: closedPosition >= 0 ? closedPosition : null,
           processWasRunning,
         }
-      }).catch(() => {});
+      }).then((res: any) => {
+        console.log('[CloseTab] archive resolved tab=' + tabId.slice(-12) +
+          ' historyId=' + (res?.historyId || 'none') +
+          ' durMs=' + (Date.now() - closeStartedAt));
+      }).catch((err: any) => {
+        console.warn('[CloseTab] archive failed tab=' + tabId.slice(-12) + ': ' + (err?.message || err));
+      });
     }
 
     workspace.tabs.delete(tabId);
@@ -1236,6 +1392,11 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
 
     // Save tabs (forceCleanup when called from batch close)
     saveTabs(workspace.projectId, workspace.tabs, options?.forceCleanup);
+    console.log('[CloseTab] state-updated tab=' + tabId.slice(-12) +
+      ' remaining=' + workspace.tabs.size +
+      ' active=' + (workspace.activeTabId ? workspace.activeTabId.slice(-12) : 'none') +
+      ' durMs=' + (Date.now() - closeStartedAt));
+    return true;
   },
 
   // Shift+Cmd+T — pop the latest entry from tab_history for this project and
@@ -1268,10 +1429,14 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         pendingAction = { type: 'claude-continue', sessionId: entry.claude_session_id };
       } else if (entry.command_type === 'gemini' && entry.gemini_session_id) {
         pendingAction = { type: 'gemini-continue', sessionId: entry.gemini_session_id };
+      } else if (entry.command_type === 'codex' && entry.codex_session_id) {
+        pendingAction = { type: 'codex-continue', sessionId: entry.codex_session_id };
       } else if (entry.command_type === 'claude') {
         pendingAction = { type: 'claude-new' };
       } else if (entry.command_type === 'gemini') {
         pendingAction = { type: 'gemini-new' };
+      } else if (entry.command_type === 'codex') {
+        pendingAction = { type: 'codex-new' };
       }
     }
 
@@ -1296,6 +1461,9 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       pendingAction,
       claudeSessionId: entry.claude_session_id || undefined,
       geminiSessionId: entry.gemini_session_id || undefined,
+      codexSessionId: entry.codex_session_id || undefined,
+      codexModel: entry.codex_model || undefined,
+      codexEffort: entry.codex_effort || undefined,
       sessionStatus: entry.session_status || undefined,
     });
 
@@ -1432,8 +1600,30 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         const prev = tab.commandType || 'null';
         const claudeSess = tab.claudeSessionId ? tab.claudeSessionId.slice(0, 8) : 'null';
         const geminiSess = tab.geminiSessionId ? tab.geminiSessionId.slice(0, 8) : 'null';
+        const codexSess = tab.codexSessionId ? tab.codexSessionId.slice(0, 8) : 'null';
         const callerLine = (new Error().stack || '').split('\n').slice(2, 5).join(' | ');
-        console.warn('[Store:setTabCommandType] tab=' + tabId.slice(-8) + ' ' + prev + ' → ' + commandType + ' | claude=' + claudeSess + ' gemini=' + geminiSess + ' | caller=' + callerLine);
+        console.warn('[Store:setTabCommandType] tab=' + tabId.slice(-8) + ' ' + prev + ' → ' + commandType + ' | claude=' + claudeSess + ' gemini=' + geminiSess + ' codex=' + codexSess + ' | caller=' + callerLine);
+        if ((commandType === 'claude' || commandType === 'codex') && !aiLaunchSnapshots.has(tabId)) {
+          const hasSessionForLaunch = commandType === 'claude' ? !!tab.claudeSessionId : !!tab.codexSessionId;
+          if (!hasSessionForLaunch) {
+            aiLaunchSnapshots.set(tabId, {
+              sessionType: commandType,
+              commandType: tab.commandType,
+              name: tab.name,
+              color: tab.color,
+              colorSetManually: tab.colorSetManually,
+              nameSetManually: tab.nameSetManually,
+              claudeSessionId: tab.claudeSessionId,
+              geminiSessionId: tab.geminiSessionId,
+              codexSessionId: tab.codexSessionId,
+              wasInterrupted: tab.wasInterrupted,
+              overlayDismissed: tab.overlayDismissed,
+              at: Date.now(),
+            });
+            console.warn('[Store:AiLaunchSnapshot] capture tab=' + tabId.slice(-8) + ' type=' + commandType + ' prevCommand=' + (tab.commandType || 'null') + ' name=' + JSON.stringify(tab.name) + ' color=' + (tab.color || 'null'));
+          }
+        }
+
         // Only set commandType and rename if not already set (first run only)
         const isFirstRun = !tab.commandType;
         tab.commandType = commandType;
@@ -1447,6 +1637,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
             baseName = 'claude';
           } else if (commandType === 'gemini') {
             baseName = 'gemini';
+          } else if (commandType === 'codex') {
+            baseName = 'codex';
           } else if (commandType === 'devServer') {
             baseName = 'run-dev';
           }
@@ -1468,6 +1660,9 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           } else if (commandType === 'gemini') {
             log.tabs('Setting color to gemini');
             tab.color = 'gemini';
+          } else if (commandType === 'codex') {
+            log.tabs('Setting color to codex');
+            tab.color = 'codex';
           } else if (commandType === 'devServer') {
             log.tabs('Setting color to green');
             tab.color = 'green';
@@ -1481,6 +1676,65 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         break;
       }
     }
+  },
+
+  getAiLaunchSnapshot: (tabId) => {
+    return aiLaunchSnapshots.get(tabId) || null;
+  },
+
+  clearAiLaunchSnapshot: (tabId, reason = 'materialized') => {
+    const snap = aiLaunchSnapshots.get(tabId);
+    if (!snap) return;
+    aiLaunchSnapshots.delete(tabId);
+    console.warn('[Store:AiLaunchSnapshot] clear tab=' + tabId.slice(-8) + ' type=' + snap.sessionType + ' reason=' + reason);
+  },
+
+  rollbackUnmaterializedAiLaunch: (tabId, reason) => {
+    const snap = aiLaunchSnapshots.get(tabId);
+    if (!snap) {
+      console.warn('[Store:AiLaunchRollback] skip tab=' + tabId.slice(-8) + ' reason=' + reason + ' no-snapshot');
+      return false;
+    }
+
+    const { openProjects } = get();
+    for (const [, workspace] of openProjects) {
+      const tab = workspace.tabs.get(tabId);
+      if (!tab) continue;
+
+      if (snap.commandType) tab.commandType = snap.commandType;
+      else delete tab.commandType;
+
+      tab.name = snap.name;
+      if (snap.color) tab.color = snap.color;
+      else delete tab.color;
+
+      if (snap.colorSetManually === undefined) delete tab.colorSetManually;
+      else tab.colorSetManually = snap.colorSetManually;
+
+      if (snap.nameSetManually === undefined) delete tab.nameSetManually;
+      else tab.nameSetManually = snap.nameSetManually;
+
+      if (snap.claudeSessionId) tab.claudeSessionId = snap.claudeSessionId;
+      else delete tab.claudeSessionId;
+      if (snap.geminiSessionId) tab.geminiSessionId = snap.geminiSessionId;
+      else delete tab.geminiSessionId;
+      if (snap.codexSessionId) tab.codexSessionId = snap.codexSessionId;
+      else delete tab.codexSessionId;
+
+      tab.wasInterrupted = !!snap.wasInterrupted;
+      tab.overlayDismissed = !!snap.overlayDismissed;
+
+      aiLaunchSnapshots.delete(tabId);
+      console.warn('[Store:AiLaunchRollback] tab=' + tabId.slice(-8) + ' type=' + snap.sessionType + ' reason=' + reason + ' restoreCommand=' + (snap.commandType || 'null') + ' name=' + JSON.stringify(snap.name) + ' color=' + (snap.color || 'null'));
+
+      set({ openProjects: new Map(openProjects) });
+      saveTabs(workspace.projectId, workspace.tabs);
+      return true;
+    }
+
+    console.warn('[Store:AiLaunchRollback] skip tab=' + tabId.slice(-8) + ' reason=' + reason + ' tab-not-found');
+    aiLaunchSnapshots.delete(tabId);
+    return false;
   },
 
   toggleTabUtility: (projectId, tabId) => {
@@ -1560,6 +1814,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
 
     // Change utility flag
     tab.isUtility = toUtility;
+    if (toUtility) {
+      tab.groupId = undefined;
+      tab.visualParentTabId = undefined;
+    }
 
     // Get tabs of target zone (after flag change)
     const allTabs = Array.from(workspace.tabs.entries());
@@ -1617,6 +1875,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
 
     // Add to target project (as main tab, not utility)
     tab.isUtility = false;
+    tab.groupId = undefined;
+    tab.visualParentTabId = undefined;
     targetWorkspace.tabs.set(tabId, tab);
 
     // Make it active in target project
@@ -1646,6 +1906,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       if (!tab) continue;
       src.tabs.delete(tabId);
       tab.isUtility = false;
+      tab.groupId = undefined;
+      tab.visualParentTabId = undefined;
       tgt.tabs.set(tabId, tab);
       lastId = tabId;
     }
@@ -1667,6 +1929,111 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     log.tabs(`[moveTabsToProject] Moved ${tabIds.length} tabs from ${sourceProjectId} to ${targetProjectId}`);
   },
 
+  createTabGroup: (projectId, name) => {
+    const { openProjects } = get();
+    const workspace = openProjects.get(projectId);
+    if (!workspace) return '';
+
+    const existingNames = workspace.tabGroups.map(g => g.name);
+    const groupName = name || getNextAvailableName('group', existingNames);
+    const groupId = `${projectId}-group-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    const group: TabGroup = { id: groupId, name: groupName, createdAt: Date.now() };
+
+    workspace.tabGroups = [...workspace.tabGroups, group];
+    set({ openProjects: new Map(openProjects) });
+    saveTabGroups(projectId, workspace.tabGroups);
+    return groupId;
+  },
+
+  renameTabGroup: (projectId, groupId, name) => {
+    const { openProjects } = get();
+    const workspace = openProjects.get(projectId);
+    if (!workspace) return;
+
+    const next = name.trim();
+    if (!next) return;
+    workspace.tabGroups = workspace.tabGroups.map(group =>
+      group.id === groupId ? { ...group, name: next } : group
+    );
+    set({ openProjects: new Map(openProjects) });
+    saveTabGroups(projectId, workspace.tabGroups);
+  },
+
+  setTabVisualParent: (projectId, tabId, parentTabId) => {
+    const { openProjects } = get();
+    const workspace = openProjects.get(projectId);
+    if (!workspace) return;
+
+    const tab = workspace.tabs.get(tabId);
+    if (!tab || tab.parentTabId || tab.isUtility) return;
+
+    const nextParentId = parentTabId || undefined;
+    if (!nextParentId) {
+      tab.visualParentTabId = undefined;
+      set({ openProjects: new Map(openProjects) });
+      saveTabs(workspace.projectId, workspace.tabs);
+      return;
+    }
+
+    if (nextParentId === tabId) return;
+    const parent = workspace.tabs.get(nextParentId);
+    if (!parent || parent.parentTabId || parent.isUtility) return;
+
+    let cursor: string | undefined = nextParentId;
+    const seen = new Set<string>([tabId]);
+    while (cursor) {
+      if (seen.has(cursor)) return;
+      seen.add(cursor);
+      cursor = workspace.tabs.get(cursor)?.visualParentTabId;
+    }
+
+    tab.visualParentTabId = nextParentId;
+    // Keep visual parent/child inside one existing tab group. Cross-group
+    // nesting creates ambiguous rendering because groups already own a body.
+    tab.groupId = parent.groupId;
+    set({ openProjects: new Map(openProjects) });
+    saveTabs(workspace.projectId, workspace.tabs);
+  },
+
+  applyTabLayout: (projectId, orderedIds, groupAssignments = {}, visualParentAssignments = {}) => {
+    const { openProjects } = get();
+    const workspace = openProjects.get(projectId);
+    if (!workspace) return;
+
+    const existing = workspace.tabs;
+    const orderedSet = new Set(orderedIds);
+    const nextTabs = new Map<string, Tab>();
+
+    for (const id of orderedIds) {
+      const tab = existing.get(id);
+      if (!tab) continue;
+      if (Object.prototype.hasOwnProperty.call(groupAssignments, id)) {
+        const nextGroup = groupAssignments[id];
+        tab.groupId = nextGroup || undefined;
+      }
+      if (Object.prototype.hasOwnProperty.call(visualParentAssignments, id)) {
+        tab.visualParentTabId = visualParentAssignments[id] || undefined;
+      }
+      nextTabs.set(id, tab);
+    }
+
+    for (const [id, tab] of existing) {
+      if (orderedSet.has(id)) continue;
+      if (Object.prototype.hasOwnProperty.call(groupAssignments, id)) {
+        const nextGroup = groupAssignments[id];
+        tab.groupId = nextGroup || undefined;
+      }
+      if (Object.prototype.hasOwnProperty.call(visualParentAssignments, id)) {
+        tab.visualParentTabId = visualParentAssignments[id] || undefined;
+      }
+      nextTabs.set(id, tab);
+    }
+
+    workspace.tabs = nextTabs;
+    set({ openProjects: new Map(openProjects) });
+    saveTabs(workspace.projectId, workspace.tabs);
+  },
+
   updateTabCwd: (projectId, tabId, newCwd) => {
     const { openProjects } = get();
     const workspace = openProjects.get(projectId);
@@ -1682,24 +2049,56 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   },
 
   syncAllTabsCwd: async (projectId) => {
-    const { openProjects, updateTabCwd } = get();
+    const { openProjects } = get();
     const workspace = openProjects.get(projectId);
 
     if (!workspace) {
       return;
     }
 
+    const tabEntries = Array.from(workspace.tabs.entries());
+    const updates: Array<[string, string]> = [];
+    let cursor = 0;
+    const workerCount = Math.min(6, tabEntries.length);
 
-    for (const [tabId, tab] of workspace.tabs) {
-      try {
-        const currentCwd = await ipcRenderer.invoke('terminal:getCwd', tabId);
-        if (currentCwd && currentCwd !== tab.cwd) {
-          updateTabCwd(projectId, tabId, currentCwd);
-        } else {
+    const worker = async () => {
+      while (cursor < tabEntries.length) {
+        const [tabId, tab] = tabEntries[cursor++];
+        try {
+          const currentCwd = await ipcRenderer.invoke('terminal:getCwd', tabId);
+          if (currentCwd && currentCwd !== tab.cwd) {
+            updates.push([tabId, currentCwd]);
+          }
+        } catch (e) {
+          console.error('[Workspace] ❌ Failed to get cwd for tab:', tabId, e);
         }
-      } catch (e) {
-        console.error('[Workspace] ❌ Failed to get cwd for tab:', tabId, e);
       }
+    };
+
+    await Promise.all(Array.from({ length: workerCount }, worker));
+
+    if (updates.length === 0) {
+      return;
+    }
+
+    const latestOpenProjects = get().openProjects;
+    const latestWorkspace = latestOpenProjects.get(projectId);
+    if (!latestWorkspace) {
+      return;
+    }
+
+    let changed = false;
+    for (const [tabId, currentCwd] of updates) {
+      const tab = latestWorkspace.tabs.get(tabId);
+      if (tab && tab.cwd !== currentCwd) {
+        tab.cwd = currentCwd;
+        changed = true;
+      }
+    }
+
+    if (changed) {
+      set({ openProjects: new Map(latestOpenProjects) });
+      saveTabs(latestWorkspace.projectId, latestWorkspace.tabs);
     }
   },
 
@@ -1820,6 +2219,59 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     return null;
   },
 
+  // Codex session tracking (detected from ~/.codex/sessions JSONL)
+  setCodexSessionId: (tabId, sessionId) => {
+    const { openProjects } = get();
+
+    for (const [projectId, workspace] of openProjects) {
+      const tab = workspace.tabs.get(tabId);
+      if (tab) {
+        if (tab.codexSessionId === sessionId) return;
+        tab.codexSessionId = sessionId;
+        tab.wasInterrupted = false;
+        tab.overlayDismissed = false;
+        console.log(`[Workspace] Codex session set for tab ${tabId}: ${sessionId} (reset overlay flags)`);
+        saveTabs(workspace.projectId, workspace.tabs);
+        set({});
+        return;
+      }
+    }
+  },
+
+  getCodexSessionId: (tabId) => {
+    const { openProjects } = get();
+
+    for (const [, workspace] of openProjects) {
+      const tab = workspace.tabs.get(tabId);
+      if (tab) {
+        return tab.codexSessionId || null;
+      }
+    }
+    return null;
+  },
+
+  updateCodexState: (tabId, state) => {
+    const { openProjects } = get();
+    for (const [, workspace] of openProjects) {
+      const tab = workspace.tabs.get(tabId);
+      if (!tab) continue;
+
+      let changed = false;
+      for (const key of Object.keys(state) as (keyof typeof state)[]) {
+        if ((tab as any)[key] !== state[key]) {
+          changed = true;
+          break;
+        }
+      }
+      if (!changed) return;
+
+      Object.assign(tab, state);
+      saveTabs(workspace.projectId, workspace.tabs);
+      set({});
+      return;
+    }
+  },
+
   // MCP sub-agent tab management
   setTabParent: (tabId, parentTabId) => {
     const { openProjects } = get();
@@ -1905,6 +2357,19 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       const tab = workspace.tabs.get(tabId);
       if (tab) {
         tab.claudeBusy = busy;
+        set({ openProjects: new Map(openProjects) });
+        return;
+      }
+    }
+  },
+
+  setAiBusy: (tabId, busy) => {
+    const { openProjects } = get();
+    for (const [, workspace] of openProjects) {
+      const tab = workspace.tabs.get(tabId);
+      if (tab) {
+        if (tab.aiBusy === busy) return;
+        tab.aiBusy = busy;
         set({ openProjects: new Map(openProjects) });
         return;
       }
@@ -2021,7 +2486,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   },
 
   // Claude SDK tabs
-  createSDKTab: async (projectId, name) => {
+  createSDKTab: async (projectId, name, options) => {
     const { openProjects, createTabAfterCurrent } = get();
     const workspace = openProjects.get(projectId);
     const projectPath = workspace?.projectPath;
@@ -2043,6 +2508,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       color: 'claude',
       commandType: 'claude',
       nameSetManually: true, // lock the auto-rename loop in setTabCommandType
+      afterTabId: options?.afterTabId,
+      groupId: options?.groupId,
+      visualParentTabId: options?.visualParentTabId,
+      background: options?.background,
     });
   },
 
@@ -2216,10 +2685,12 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         const tabsArray = Array.from(workspace.tabs.values()).map((tab) => ({
           name: tab.name, cwd: tab.cwd, color: tab.color, isUtility: tab.isUtility,
           commandType: tab.commandType, claudeSessionId: tab.claudeSessionId,
-          geminiSessionId: tab.geminiSessionId, wasInterrupted: tab.wasInterrupted,
+          geminiSessionId: tab.geminiSessionId, codexSessionId: tab.codexSessionId,
+          codexModel: tab.codexModel, codexEffort: tab.codexEffort, wasInterrupted: tab.wasInterrupted,
           overlayDismissed: tab.overlayDismissed, notes: tab.notes, tabType: tab.tabType,
           url: tab.url, terminalId: tab.terminalId, terminalName: tab.terminalName,
           activeView: tab.activeView, createdAt: tab.createdAt, isCollapsed: tab.isCollapsed,
+          groupId: tab.groupId, visualParentTabId: tab.visualParentTabId,
           nameSetManually: tab.nameSetManually, parentTabId: tab.parentTabId,
           mcpTaskId: tab.mcpTaskId, claudeTaskCount: tab.claudeTaskCount || 0, tabId: tab.id
         }));
@@ -2260,10 +2731,12 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   setProjectView: (projectId, view) => {
     const { openProjects } = get();
     const workspace = openProjects.get(projectId);
-    if (workspace) {
-      workspace.currentView = view;
-      set({ openProjects: new Map(openProjects) });
-    }
+    if (!workspace || workspace.currentView === view) return;
+    const previousView = workspace.currentView;
+    const totalTabs = Array.from(openProjects.values()).reduce((acc, ws) => acc + ws.tabs.size, 0);
+    workspace.currentView = view;
+    console.warn(`[Perf:ProjectView] project=${projectId.slice(-12)} ${previousView}->${view} tabs=${workspace.tabs.size} totalTabs=${totalTabs}`);
+    startTransition(() => set({ openProjects: new Map(openProjects) }));
   },
 
   // Sidebar state (per-project)

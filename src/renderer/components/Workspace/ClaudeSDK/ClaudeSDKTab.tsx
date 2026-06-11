@@ -573,15 +573,27 @@ export const UserMsgActionsContext = React.createContext<UserMsgActions | null>(
 // ============================================================
 interface ClaudeSDKTabProps {
   tabId: string;
-  active: boolean;
+  active?: boolean;
   isActiveProject?: boolean;
+  ownerProjectId?: string;
   cwd: string;
 }
 
 // ============================================================
 // Main component
 // ============================================================
-function ClaudeSDKTab({ tabId, active, isActiveProject = true, cwd }: ClaudeSDKTabProps) {
+function ClaudeSDKTab({ tabId, active: activeProp, isActiveProject: isActiveProjectProp, ownerProjectId, cwd }: ClaudeSDKTabProps) {
+  const activeFromStore = useWorkspaceStore((state) => {
+    if (!ownerProjectId) return false;
+    const workspace = state.openProjects.get(ownerProjectId);
+    return !!workspace && state.activeProjectId === ownerProjectId && workspace.activeTabId === tabId;
+  });
+  const isActiveProjectFromStore = useWorkspaceStore((state) => {
+    return ownerProjectId ? state.activeProjectId === ownerProjectId : true;
+  });
+  const active = activeProp ?? activeFromStore;
+  const isActiveProject = isActiveProjectProp ?? isActiveProjectFromStore;
+
   const [messages, setMessages] = useState<SDKChatMessage[]>([]);
   const [isRunning, setIsRunning] = useState(false);
   const [sessionId, setSessionId] = useState<string | null>(null);

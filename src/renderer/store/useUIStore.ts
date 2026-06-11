@@ -29,9 +29,9 @@ export type ApiClaudeModel = 'claude-opus-4.6' | 'claude-sonnet-4.5';
 // Re-export from canonical source. Older code imports DefaultClaudeEffort from useUIStore
 // because the type used to be defined here; we keep the alias so we don't touch dozens
 // of call sites. The list itself lives in constants/claudeLevels.ts.
-export type { DefaultClaudeEffort } from '../constants/claudeLevels';
-import type { DefaultClaudeEffort } from '../constants/claudeLevels';
-import { CLAUDE_EFFORT_LEVELS_WITH_NONE } from '../constants/claudeLevels';
+export type { ClaudeCodeModelOption, ClaudeCodeSettings, DefaultClaudeEffort } from '../constants/claudeLevels';
+import type { ClaudeCodeSettings, DefaultClaudeEffort } from '../constants/claudeLevels';
+import { DEFAULT_CLAUDE_CODE_SETTINGS } from '../constants/claudeLevels';
 
 export interface ApiSettings {
   claudeModel: ApiClaudeModel;
@@ -72,18 +72,18 @@ function saveSessionStatuses(list: SessionStatusDef[]) {
 }
 
 export interface ProcessBarSettings {
-  enabled: boolean;     // false → статичный colorA (без анимации)
-  colorA: string;       // нижняя фаза пульса (или единственный цвет если enabled=false)
-  colorB: string;       // верхняя фаза пульса
-  durationMs: number;   // длительность одного цикла (300..6000ms — clamp в setter)
+  colorA: string;       // базовый цвет полоски процесса
+  shimmerColor: string; // цвет бегущего AI-busy блика поверх полоски
+  shimmerSpacingPct: number; // высота repeat-tile в %, визуально = расстояние между бликами
+  shimmerOpacityPct: number; // peak-alpha блика в %, края считаются слабее в CSS vars
   position: 'left' | 'right'; // где рисовать полоску — у левого или правого края вкладки
 }
 
 const DEFAULT_PROCESS_BAR: ProcessBarSettings = {
-  enabled: true,
-  colorA: '#155E75',  // cyan-800 — приглушённая нижняя фаза
-  colorB: '#0E7490',  // cyan-700 — мягкая верхняя
-  durationMs: 2400,
+  colorA: '#155E75',        // cyan-800 — приглушённая базовая полоса
+  shimmerColor: '#FFFFFF',  // белый блик, который раньше был зашит в CSS
+  shimmerSpacingPct: 50,
+  shimmerOpacityPct: 55,
   position: 'left',
 };
 
@@ -93,13 +93,21 @@ function loadProcessBar(): ProcessBarSettings {
     if (!raw) return DEFAULT_PROCESS_BAR;
     const parsed = JSON.parse(raw);
     if (!parsed || typeof parsed !== 'object') return DEFAULT_PROCESS_BAR;
+    const rawSpacing = typeof parsed.shimmerSpacingPct === 'number'
+      ? parsed.shimmerSpacingPct
+      : DEFAULT_PROCESS_BAR.shimmerSpacingPct;
+    const rawOpacity = typeof parsed.shimmerOpacityPct === 'number'
+      ? parsed.shimmerOpacityPct
+      : DEFAULT_PROCESS_BAR.shimmerOpacityPct;
     return {
-      enabled: typeof parsed.enabled === 'boolean' ? parsed.enabled : DEFAULT_PROCESS_BAR.enabled,
       colorA: typeof parsed.colorA === 'string' ? parsed.colorA : DEFAULT_PROCESS_BAR.colorA,
-      colorB: typeof parsed.colorB === 'string' ? parsed.colorB : DEFAULT_PROCESS_BAR.colorB,
-      durationMs: typeof parsed.durationMs === 'number'
-        ? Math.max(300, Math.min(6000, parsed.durationMs))
-        : DEFAULT_PROCESS_BAR.durationMs,
+      // Legacy `colorB` was a pulse phase, not the shimmer color. When opening an
+      // old saved config, keep the current hardcoded white shimmer as the new chip.
+      shimmerColor: typeof parsed.shimmerColor === 'string'
+        ? parsed.shimmerColor
+        : DEFAULT_PROCESS_BAR.shimmerColor,
+      shimmerSpacingPct: Math.max(20, Math.min(200, Math.round(rawSpacing))),
+      shimmerOpacityPct: Math.max(5, Math.min(100, Math.round(rawOpacity))),
       position: parsed.position === 'right' ? 'right' : 'left',
     };
   } catch { return DEFAULT_PROCESS_BAR; }
@@ -243,9 +251,9 @@ interface UIStore {
   updateSessionStatus: (id: string, patch: Partial<Omit<SessionStatusDef, 'id'>>) => void;
   removeSessionStatus: (id: string) => void;
 
-  /* Process bar — мигающая полоска слева во вкладке когда PTY-процесс жив.
-     enabled=false → статичный colorA, без анимации.
-     durationMs — длительность одного цикла пульса (default 2400ms = медленное дыхание).
+  /* Process bar — полоска слева/справа во вкладке когда процесс жив.
+     Полоса всегда видима при живом процессе; настройка НЕ содержит выключателя.
+     AI-busy рисуется отдельным shimmer-оверлеем с цветом/расстоянием/плотностью из настроек.
      CSS читает значения через --process-bar-* переменные на :root, обновляемые из App. */
   processBar: ProcessBarSettings;
   setProcessBar: (patch: Partial<ProcessBarSettings>) => void;
@@ -532,6 +540,8 @@ interface UIStore {
   // 'none' means "do not apply any default" — current session keeps whatever was last picked.
   defaultClaudeEffort: DefaultClaudeEffort;
   setDefaultClaudeEffort: (v: DefaultClaudeEffort) => void;
+  claudeCodeSettings: ClaudeCodeSettings;
+  setClaudeCodeSettings: (settings: ClaudeCodeSettings) => void;
 
   // Notes Panel — per-tab slide-in. `notesPanelOpenTabs` holds tab IDs for
   // which the panel is currently expanded. Size is shared across tabs and
@@ -1024,6 +1034,9 @@ const saveCopySettings = (settings: CopySettings) => {
 
 const initialCopySettings = loadCopySettings();
 
+const parsePersistedBool = (v: unknown): boolean =>
+  v === true || v === 1 || v === '1' || v === 'true';
+
 // Status-bar toggles (persisted).
 // SQLite-backed via app:setState — same migration pattern as defaultClaudeEffort
 // and freePortsBeforeStart. localStorage stays as fast initial-paint cache, SQLite
@@ -1038,7 +1051,7 @@ const saveDebugHoverBridges = (v: boolean) => {
   try { localStorage.setItem('noted-terminal-debug-hover-bridges', String(v)); } catch {}
   try {
     const { ipcRenderer } = window.require('electron');
-    ipcRenderer.invoke('app:setState', { key: APP_STATE_KEY_BRIDGES, value: v ? '1' : '0' }).catch(() => {});
+    ipcRenderer.invoke('app:setState', { key: APP_STATE_KEY_BRIDGES, value: v }).catch(() => {});
   } catch {}
 };
 const initialDebugHoverBridges = loadDebugHoverBridges();
@@ -1047,7 +1060,7 @@ const initialDebugHoverBridges = loadDebugHoverBridges();
     const { ipcRenderer } = window.require('electron');
     const v = await ipcRenderer.invoke('app:getState', APP_STATE_KEY_BRIDGES);
     if (v !== null && v !== undefined) {
-      const bool = v === '1' || v === 'true' || v === true;
+      const bool = parsePersistedBool(v);
       if (useUIStore.getState().debugHoverBridges !== bool) {
         useUIStore.setState({ debugHoverBridges: bool });
         try { localStorage.setItem('noted-terminal-debug-hover-bridges', String(bool)); } catch {}
@@ -1067,7 +1080,7 @@ const saveFreePortsBeforeStart = (v: boolean) => {
   try { localStorage.setItem('noted-terminal-free-ports', String(v)); } catch {}
   try {
     const { ipcRenderer } = window.require('electron');
-    ipcRenderer.invoke('app:setState', { key: APP_STATE_KEY_FREE_PORTS, value: v ? '1' : '0' }).catch(() => {});
+    ipcRenderer.invoke('app:setState', { key: APP_STATE_KEY_FREE_PORTS, value: v }).catch(() => {});
   } catch {}
 };
 const initialFreePortsBeforeStart = loadFreePortsBeforeStart();
@@ -1076,10 +1089,40 @@ const initialFreePortsBeforeStart = loadFreePortsBeforeStart();
     const { ipcRenderer } = window.require('electron');
     const v = await ipcRenderer.invoke('app:getState', APP_STATE_KEY_FREE_PORTS);
     if (v !== null && v !== undefined) {
-      const bool = v === '1' || v === 'true' || v === true;
+      const bool = parsePersistedBool(v);
       if (useUIStore.getState().freePortsBeforeStart !== bool) {
         useUIStore.setState({ freePortsBeforeStart: bool });
         try { localStorage.setItem('noted-terminal-free-ports', String(bool)); } catch {}
+      }
+    }
+  } catch {}
+})();
+
+// freezeCmdPopups — status-bar diagnostic toggle. It is user-controlled state, so
+// it must survive app restarts in SQLite; localStorage is only a synchronous boot
+// mirror for the first paint.
+const APP_STATE_KEY_FREEZE_CMD_POPUPS = 'freezeCmdPopups';
+const loadFreezeCmdPopups = (): boolean => {
+  try { return localStorage.getItem('noted-terminal-freeze-cmd-popups') === 'true'; }
+  catch { return false; }
+};
+const saveFreezeCmdPopups = (v: boolean) => {
+  try { localStorage.setItem('noted-terminal-freeze-cmd-popups', String(v)); } catch {}
+  try {
+    const { ipcRenderer } = window.require('electron');
+    ipcRenderer.invoke('app:setState', { key: APP_STATE_KEY_FREEZE_CMD_POPUPS, value: v }).catch(() => {});
+  } catch {}
+};
+const initialFreezeCmdPopups = loadFreezeCmdPopups();
+(async () => {
+  try {
+    const { ipcRenderer } = window.require('electron');
+    const v = await ipcRenderer.invoke('app:getState', APP_STATE_KEY_FREEZE_CMD_POPUPS);
+    if (v !== null && v !== undefined) {
+      const bool = parsePersistedBool(v);
+      if (useUIStore.getState().freezeCmdPopups !== bool) {
+        useUIStore.setState({ freezeCmdPopups: bool });
+        try { localStorage.setItem('noted-terminal-freeze-cmd-popups', String(bool)); } catch {}
       }
     }
   } catch {}
@@ -1099,7 +1142,7 @@ const saveMirrorEnabled = (v: boolean) => {
   try {
     const { ipcRenderer } = window.require('electron');
     // Зеркалим в SQLite через общий app:setState — main процесс читает то же.
-    ipcRenderer.invoke('app:setState', { key: APP_STATE_KEY_MIRROR, value: v ? '1' : '0' }).catch(() => {});
+    ipcRenderer.invoke('app:setState', { key: APP_STATE_KEY_MIRROR, value: v }).catch(() => {});
     // И триггерим main, чтобы он сразу применил флаг (включил/выключил writes).
     ipcRenderer.invoke('mirror:set-enabled', { enabled: v }).catch(() => {});
   } catch {}
@@ -1110,7 +1153,7 @@ const initialMirrorEnabled = loadMirrorEnabled();
     const { ipcRenderer } = window.require('electron');
     const v = await ipcRenderer.invoke('app:getState', APP_STATE_KEY_MIRROR);
     if (v !== null && v !== undefined) {
-      const bool = v === '1' || v === 'true' || v === true;
+      const bool = parsePersistedBool(v);
       if (useUIStore.getState().claudeMdMirrorEnabled !== bool) {
         useUIStore.setState({ claudeMdMirrorEnabled: bool });
         try { localStorage.setItem('noted-terminal-claude-md-mirror', String(bool)); } catch {}
@@ -1132,7 +1175,7 @@ const loadDefaultClaudeEffort = (): DefaultClaudeEffort => {
     // Legacy migration: Claude removed 'auto' in May 2026 and added 'xhigh'.
     // Old persisted values: map 'auto' → 'low' (the new toggle-off-equivalent).
     if (saved === 'auto') saved = 'low';
-    if (saved && (CLAUDE_EFFORT_LEVELS_WITH_NONE as readonly string[]).includes(saved)) return saved as DefaultClaudeEffort;
+    if (saved && saved.trim()) return saved.trim();
   } catch {}
   return 'none';
 };
@@ -1152,16 +1195,78 @@ const initialDefaultClaudeEffort = loadDefaultClaudeEffort();
     const { ipcRenderer } = window.require('electron');
     let v = await ipcRenderer.invoke('app:getState', APP_STATE_KEY_EFFORT);
     if (v === 'auto') v = 'low'; // legacy migration — Claude dropped 'auto' May 2026
-    if (v && (CLAUDE_EFFORT_LEVELS_WITH_NONE as readonly string[]).includes(v)) {
+    if (typeof v === 'string' && v.trim()) {
       // Use the store's setter so the change propagates to all subscribers.
       // Importing here would be circular; reach into the store after it's defined below
       // — useUIStore.setState exists by the time this IIFE awaits.
       const s = useUIStore.getState();
       if (s.defaultClaudeEffort !== v) {
         // Bypass save (we just read from SQLite) — write only to localStorage mirror.
-        useUIStore.setState({ defaultClaudeEffort: v as DefaultClaudeEffort });
+        useUIStore.setState({ defaultClaudeEffort: v.trim() });
         try { localStorage.setItem('noted-terminal-default-claude-effort', v); } catch {}
       }
+    }
+  } catch {}
+})();
+
+const APP_STATE_KEY_CLAUDE_CODE_SETTINGS = 'claudeCodeSettings';
+const LOCAL_KEY_CLAUDE_CODE_SETTINGS = 'noted-terminal-claude-code-settings';
+
+const normalizeClaudeCodeSettings = (raw: unknown): ClaudeCodeSettings => {
+  const obj = raw && typeof raw === 'object' ? raw as Partial<ClaudeCodeSettings> : {};
+  const modelsRaw = Array.isArray(obj.models) ? obj.models : [];
+  const models = modelsRaw
+    .map((m) => {
+      if (!m || typeof m !== 'object') return null;
+      let id = String((m as any).id || '').trim();
+      if (!id) return null;
+      if (id === 'claude-fable-5') id = 'claude-fable-5[1m]';
+      const label = String((m as any).label || id).trim() || id;
+      return { id, label, cmd: true };
+    })
+    .filter(Boolean) as ClaudeCodeSettings['models'];
+  const mergedModels = models.length > 0 ? [...models] : [...DEFAULT_CLAUDE_CODE_SETTINGS.models];
+  DEFAULT_CLAUDE_CODE_SETTINGS.models.forEach((m) => {
+    if (!mergedModels.some((existing) => existing.id === m.id)) mergedModels.push(m);
+  });
+
+  const effortsRaw = Array.isArray(obj.efforts) ? obj.efforts : [];
+  const efforts = effortsRaw
+    .map((v) => String(v || '').trim())
+    .filter((v, index, arr) => v && arr.indexOf(v) === index);
+
+  return {
+    models: mergedModels,
+    efforts: efforts.length > 0 ? efforts : [...DEFAULT_CLAUDE_CODE_SETTINGS.efforts],
+  };
+};
+
+const loadClaudeCodeSettings = (): ClaudeCodeSettings => {
+  try {
+    const raw = localStorage.getItem(LOCAL_KEY_CLAUDE_CODE_SETTINGS);
+    if (raw) return normalizeClaudeCodeSettings(JSON.parse(raw));
+  } catch {}
+  return normalizeClaudeCodeSettings(DEFAULT_CLAUDE_CODE_SETTINGS);
+};
+
+const saveClaudeCodeSettings = (settings: ClaudeCodeSettings) => {
+  const normalized = normalizeClaudeCodeSettings(settings);
+  try { localStorage.setItem(LOCAL_KEY_CLAUDE_CODE_SETTINGS, JSON.stringify(normalized)); } catch {}
+  try {
+    const { ipcRenderer } = window.require('electron');
+    ipcRenderer.invoke('app:setState', { key: APP_STATE_KEY_CLAUDE_CODE_SETTINGS, value: normalized }).catch(() => {});
+  } catch {}
+};
+
+const initialClaudeCodeSettings = loadClaudeCodeSettings();
+(async () => {
+  try {
+    const { ipcRenderer } = window.require('electron');
+    const v = await ipcRenderer.invoke('app:getState', APP_STATE_KEY_CLAUDE_CODE_SETTINGS);
+    if (v !== null && v !== undefined) {
+      const normalized = normalizeClaudeCodeSettings(v);
+      useUIStore.setState({ claudeCodeSettings: normalized });
+      try { localStorage.setItem(LOCAL_KEY_CLAUDE_CODE_SETTINGS, JSON.stringify(normalized)); } catch {}
     }
   } catch {}
 })();
@@ -1350,12 +1455,14 @@ export const useUIStore = create<UIStore>((set, get) => ({
   setProcessBar: (patch) => {
     const cur = get().processBar;
     const next: ProcessBarSettings = {
-      enabled: typeof patch.enabled === 'boolean' ? patch.enabled : cur.enabled,
       colorA: typeof patch.colorA === 'string' ? patch.colorA : cur.colorA,
-      colorB: typeof patch.colorB === 'string' ? patch.colorB : cur.colorB,
-      durationMs: typeof patch.durationMs === 'number'
-        ? Math.max(300, Math.min(6000, patch.durationMs))
-        : cur.durationMs,
+      shimmerColor: typeof patch.shimmerColor === 'string' ? patch.shimmerColor : cur.shimmerColor,
+      shimmerSpacingPct: typeof patch.shimmerSpacingPct === 'number'
+        ? Math.max(20, Math.min(200, Math.round(patch.shimmerSpacingPct)))
+        : cur.shimmerSpacingPct,
+      shimmerOpacityPct: typeof patch.shimmerOpacityPct === 'number'
+        ? Math.max(5, Math.min(100, Math.round(patch.shimmerOpacityPct)))
+        : cur.shimmerOpacityPct,
       position: patch.position === 'right' || patch.position === 'left' ? patch.position : cur.position,
     };
     set({ processBar: next });
@@ -1933,8 +2040,8 @@ export const useUIStore = create<UIStore>((set, get) => ({
   // Status bar debug toggles
   debugHoverBridges: initialDebugHoverBridges,
   setDebugHoverBridges: (v) => { set({ debugHoverBridges: v }); saveDebugHoverBridges(v); },
-  freezeCmdPopups: false,
-  setFreezeCmdPopups: (v) => set({ freezeCmdPopups: v }),
+  freezeCmdPopups: initialFreezeCmdPopups,
+  setFreezeCmdPopups: (v) => { set({ freezeCmdPopups: v }); saveFreezeCmdPopups(v); },
 
   freePortsBeforeStart: initialFreePortsBeforeStart,
   setFreePortsBeforeStart: (v) => { set({ freePortsBeforeStart: v }); saveFreePortsBeforeStart(v); },
@@ -1945,6 +2052,12 @@ export const useUIStore = create<UIStore>((set, get) => ({
   // Default Claude effort (status-bar selector)
   defaultClaudeEffort: initialDefaultClaudeEffort,
   setDefaultClaudeEffort: (v) => { set({ defaultClaudeEffort: v }); saveDefaultClaudeEffort(v); },
+  claudeCodeSettings: initialClaudeCodeSettings,
+  setClaudeCodeSettings: (settings) => {
+    const normalized = normalizeClaudeCodeSettings(settings);
+    set({ claudeCodeSettings: normalized });
+    saveClaudeCodeSettings(normalized);
+  },
 
   // Notes Panel — per-tab open state + SQLite-persisted shared size.
   // One-at-a-time policy: opening on tab X closes any previously-open slideout.

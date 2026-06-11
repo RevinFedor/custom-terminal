@@ -337,8 +337,8 @@ function computeActivityStats(days = 14) {
   const fromTs = now - days * 24 * 60 * 60 * 1000;
   const rows = _projectManager.db.getActivityIntervals(fromTs, now);
 
-  const ENGINES = ['claude', 'claude-sdk', 'gemini'];
-  const emptyEngineMap = () => ({ claude: 0, 'claude-sdk': 0, gemini: 0 });
+  const ENGINES = ['claude', 'claude-sdk', 'gemini', 'codex'];
+  const emptyEngineMap = () => ({ claude: 0, 'claude-sdk': 0, gemini: 0, codex: 0 });
 
   let totalMs = 0;
   const byDay = new Map();      // date → { ms, byEngine }

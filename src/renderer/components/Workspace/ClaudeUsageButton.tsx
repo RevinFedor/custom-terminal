@@ -20,9 +20,10 @@
 //
 // Backend: ipc 'claude-usage:get' (limits) + 'claude-tokens:summary' (per-tab).
 
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { useEffect, useRef, useState, useCallback, useId } from 'react';
 import { RefreshCw, ChevronRight } from 'lucide-react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
+import { ClaudeSparkle } from './CopySessionButton';
 
 const { ipcRenderer } = (window as any).require('electron');
 
@@ -81,7 +82,7 @@ interface DailyHistoryResponse {
 interface ActivityByDay {
   date: string;            // YYYY-MM-DD (local)
   ms: number;
-  byEngine: { claude: number; 'claude-sdk': number; gemini: number };
+  byEngine: { claude: number; 'claude-sdk': number; gemini: number; codex: number; [key: string]: number };
 }
 interface ActivityByProject {
   projectId: string | null;
@@ -104,6 +105,22 @@ interface ActivityResponse {
   byDay?: ActivityByDay[];
   byProject?: ActivityByProject[];
   byTab?: ActivityByTab[];
+}
+
+interface CodexUsageData {
+  primary?: UsageBucket | null;
+  secondary?: UsageBucket | null;
+  five_hour?: UsageBucket | null;
+  seven_day?: UsageBucket | null;
+  limit_id?: string | null;
+  limit_name?: string | null;
+  plan_type?: string | null;
+  timestamp?: string | null;
+}
+interface CodexUsageResponse {
+  success?: boolean;
+  error?: string;
+  data?: CodexUsageData | null;
 }
 
 function formatUsd(amount: number | null | undefined): string {
@@ -137,45 +154,51 @@ function colorForPct(p: number | null | undefined): string {
   return '#f87171';
 }
 
-function formatResetTime(iso: string | null | undefined): string {
+function CodexIcon({ size = 12, muted = false }: { size?: number; muted?: boolean }) {
+  const gradientId = `codex-icon-gradient-${useId().replace(/:/g, '')}`;
+  return (
+    <svg
+      aria-hidden
+      focusable="false"
+      viewBox="0 0 24 24"
+      style={{
+        width: size,
+        height: size,
+        flexShrink: 0,
+        display: 'block',
+        opacity: muted ? 0.45 : 1,
+      }}
+    >
+      <path
+        d="M9.064 3.344a4.578 4.578 0 012.285-.312c1 .115 1.891.54 2.673 1.275.01.01.024.017.037.021a.09.09 0 00.043 0 4.55 4.55 0 013.046.275l.047.022.116.057a4.581 4.581 0 012.188 2.399c.209.51.313 1.041.315 1.595a4.24 4.24 0 01-.134 1.223.123.123 0 00.03.115c.594.607.988 1.33 1.183 2.17.289 1.425-.007 2.71-.887 3.854l-.136.166a4.548 4.548 0 01-2.201 1.388.123.123 0 00-.081.076c-.191.551-.383 1.023-.74 1.494-.9 1.187-2.222 1.846-3.711 1.838-1.187-.006-2.239-.44-3.157-1.302a.107.107 0 00-.105-.024c-.388.125-.78.143-1.204.138a4.441 4.441 0 01-1.945-.466 4.544 4.544 0 01-1.61-1.335c-.152-.202-.303-.392-.414-.617a5.81 5.81 0 01-.37-.961 4.582 4.582 0 01-.014-2.298.124.124 0 00.006-.056.085.085 0 00-.027-.048 4.467 4.467 0 01-1.034-1.651 3.896 3.896 0 01-.251-1.192 5.189 5.189 0 01.141-1.6c.337-1.112.982-1.985 1.933-2.618.212-.141.413-.251.601-.33.215-.089.43-.164.646-.227a.098.098 0 00.065-.066 4.51 4.51 0 01.829-1.615 4.535 4.535 0 011.837-1.388zm3.482 10.565a.637.637 0 000 1.272h3.636a.637.637 0 100-1.272h-3.636zM8.462 9.23a.637.637 0 00-1.106.631l1.272 2.224-1.266 2.136a.636.636 0 101.095.649l1.454-2.455a.636.636 0 00.005-.64L8.462 9.23z"
+        fill={`url(#${gradientId})`}
+      />
+      <defs>
+        <linearGradient gradientUnits="userSpaceOnUse" id={gradientId} x1="12" x2="12" y1="3" y2="21">
+          <stop stopColor="#B1A7FF" />
+          <stop offset=".5" stopColor="#7A9DFF" />
+          <stop offset="1" stopColor="#3941FF" />
+        </linearGradient>
+      </defs>
+    </svg>
+  );
+}
+
+function formatResetDateTime(iso: string | null | undefined): string {
   if (!iso) return '—';
   const d = new Date(iso);
   if (isNaN(d.getTime())) return '—';
-  const now = new Date();
-  const diffMs = d.getTime() - now.getTime();
-  if (diffMs <= 0) return 'now';
-  const mins = Math.round(diffMs / 60000);
-  if (mins < 60) return `in ${mins}m`;
-  const hrs = Math.round(mins / 60);
-  if (hrs < 24) return `in ${hrs}h`;
-  const days = Math.round(hrs / 24);
-  return `in ${days}d`;
-}
-
-// Detailed reset countdown for the popover header: "in 6d 4h 12m" / "in 4h 12m" /
-// "in 12m". Returns null if no resets_at or already past. Updates by virtue of
-// the parent re-rendering — header consumer wraps it in a 30-second ticker.
-function formatResetCountdown(iso: string | null | undefined): string | null {
-  if (!iso) return null;
-  const d = new Date(iso);
-  if (isNaN(d.getTime())) return null;
-  const diffMs = d.getTime() - Date.now();
-  if (diffMs <= 0) return 'now';
-  const totalMin = Math.floor(diffMs / 60000);
-  const days = Math.floor(totalMin / (60 * 24));
-  const hrs = Math.floor((totalMin % (60 * 24)) / 60);
-  const mins = totalMin % 60;
-  const parts: string[] = [];
-  if (days > 0) parts.push(`${days}d`);
-  if (hrs > 0 || days > 0) parts.push(`${hrs}h`);
-  parts.push(`${mins}m`);
-  return `in ${parts.join(' ')}`;
+  return new Intl.DateTimeFormat(undefined, {
+    month: 'short',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  }).format(d);
 }
 
 // Ultra-compact reset countdown for the CHIP itself (always visible, must be
 // tiny): "1d 12h" / "12h 30m" / "45m" / "now". Always ≤2 units. The header
-// popover uses formatResetCountdown (3-unit "in 6d 4h 12m"); this one trades
-// precision for width.
+// popover uses the exact local reset date/time; this one trades precision for width.
 function formatResetShort(iso: string | null | undefined): string | null {
   if (!iso) return null;
   const d = new Date(iso);
@@ -228,7 +251,7 @@ function ProgressRow({ label, pct, resetsAt }: { label: string; pct?: number | n
           {formatPct(pct)}
           {resetsAt && (
             <span style={{ color: '#666', marginLeft: 8, fontSize: 10 }}>
-              resets {formatResetTime(resetsAt)}
+              resets {formatResetDateTime(resetsAt)}
             </span>
           )}
         </span>
@@ -363,11 +386,13 @@ const ENGINE_COLOR: Record<string, string> = {
   claude: '#DA7756',        // Claude orange (PTY)
   'claude-sdk': '#C9826A',  // Claude orange, slightly muted (SDK)
   gemini: '#4E86F8',        // Gemini blue
+  codex: '#22c55e',         // Codex green (matches Codex session chip)
 };
 const ENGINE_LABEL: Record<string, string> = {
   claude: 'Claude',
   'claude-sdk': 'Claude SDK',
   gemini: 'Gemini',
+  codex: 'Codex',
 };
 
 // Activity section body: total active time + per-day stacked bars (segmented
@@ -377,7 +402,7 @@ function ActivityView({ activity }: { activity: ActivityResponse }) {
   const byProject = activity.byProject || [];
   const maxDayMs = Math.max(1, ...byDay.map(d => d.ms));
   const maxProjMs = Math.max(1, ...byProject.map(p => p.ms));
-  const engines: Array<keyof ActivityByDay['byEngine']> = ['claude', 'claude-sdk', 'gemini'];
+  const engines = ['claude', 'claude-sdk', 'gemini', 'codex'];
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
@@ -503,7 +528,7 @@ function ActivityView({ activity }: { activity: ActivityResponse }) {
   );
 }
 
-export default function ClaudeUsageButton() {
+function ClaudeUsageChip() {
   // Pin states (3-level):
   //   clicked  → light pin (current-tab scope, closes on tab switch)
   //   sticky   → strong pin (Cmd+Shift) — survives tab/project switch
@@ -806,7 +831,6 @@ export default function ClaudeUsageButton() {
   const chipColor = colorForPct(weeklyPct);
   // Compact "time until weekly reset" for the chip face. null → no resets_at.
   const resetShort = formatResetShort(data?.seven_day?.resets_at);
-  const gaugeFill = Math.max(0, Math.min(100, weeklyPct ?? 0));
 
   // Border style: sticky uses brighter white for "this is pinned long-term"
   const popoverBorder = sticky
@@ -822,14 +846,15 @@ export default function ClaudeUsageButton() {
         onMouseEnter={() => setTriggerHover(true)}
         onMouseLeave={() => setTriggerHover(false)}
         title={weeklyPct != null
-          ? `Weekly: ${formatPct(weeklyPct)}${resetShort ? ` • resets in ${resetShort}` : ''}  •  click → pin to tab  •  ⌘+hover → peek  •  ⌘⇧ → sticky pin`
+          ? `Claude weekly: ${formatPct(weeklyPct)}${resetShort ? ` • resets in ${resetShort}` : ''}  •  click → pin to tab  •  ⌘+hover → peek  •  ⌘⇧ → sticky pin`
           : (error || 'Click to fetch Claude usage')}
         style={{
           display: 'inline-flex',
           alignItems: 'center',
           gap: 6,
           height: 26,
-          padding: '0 8px',
+          padding: '0 7px',
+          minWidth: 76,
           background: showPopover ? `${chipColor}0A` : 'transparent',
           color: weeklyPct != null ? chipColor : '#888',
           border: `1px solid ${sticky ? 'rgba(255,255,255,0.4)' : (showPopover ? `${chipColor}33` : 'rgba(255,255,255,0.12)')}`,
@@ -847,31 +872,7 @@ export default function ClaudeUsageButton() {
           '—'
         ) : (
           <>
-            {/* Vertical fill-gauge: a thin column filling bottom-up by weekly%,
-                in the same severity color as the text. Reads as a tiny battery
-                meter so the chip carries shape, not just a number. */}
-            <span
-              aria-hidden
-              style={{
-                position: 'relative',
-                width: 4,
-                height: 14,
-                borderRadius: 2,
-                background: 'rgba(255,255,255,0.10)',
-                overflow: 'hidden',
-                flexShrink: 0,
-              }}
-            >
-              <span style={{
-                position: 'absolute',
-                left: 0,
-                right: 0,
-                bottom: 0,
-                height: `${gaugeFill}%`,
-                background: chipColor,
-                transition: 'height 0.3s ease',
-              }} />
-            </span>
+            <ClaudeSparkle size={12} color={weeklyPct != null ? '#DA7756' : '#777'} />
             <span>{formatPct(weeklyPct)}</span>
             {/* Compact reset countdown. Deliberately muted neutral, NOT the
                 severity color — the % already owns the color signal; a second
@@ -917,13 +918,13 @@ export default function ClaudeUsageButton() {
             <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
               {data?.seven_day?.resets_at ? (
                 <>
-                  <span style={{ color: '#666' }}>weekly resets</span>
+                  <span style={{ color: '#666' }}>weekly reset</span>
                   <span style={{ color: '#ddd' }}>
-                    {formatResetCountdown(data.seven_day.resets_at) || '—'}
+                    {formatResetDateTime(data.seven_day.resets_at)}
                   </span>
                 </>
               ) : (
-                <span style={{ color: '#666' }}>weekly resets —</span>
+                <span style={{ color: '#666' }}>weekly reset —</span>
               )}
               {sticky && (
                 <span style={{
@@ -1323,6 +1324,370 @@ export default function ClaudeUsageButton() {
           100% { background: transparent; }
         }
       `}</style>
+    </div>
+  );
+}
+
+function CodexUsageChip() {
+  const [clicked, setClicked] = useState(false);
+  const [cmdPressed, setCmdPressed] = useState(false);
+  const [triggerHover, setTriggerHover] = useState(false);
+  const [popoverHover, setPopoverHover] = useState(false);
+  const [data, setData] = useState<CodexUsageData | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [activity, setActivity] = useState<ActivityResponse | null>(null);
+  const [activityLoading, setActivityLoading] = useState(false);
+  const [activityExpanded, setActivityExpanded] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+
+  const activeTabId = useWorkspaceStore((s) => s.getEffectiveTabId());
+  const activeCodexSessionId = useWorkspaceStore((s) => {
+    if (!activeTabId) return null;
+    for (const [, ws] of s.openProjects) {
+      const t = ws.tabs.get(activeTabId);
+      if (t?.codexSessionId) return t.codexSessionId;
+    }
+    return null;
+  });
+  const activeCwd = useWorkspaceStore((s) => {
+    if (!activeTabId) return null;
+    for (const [, ws] of s.openProjects) {
+      const t = ws.tabs.get(activeTabId);
+      if (t) return t.cwd || null;
+    }
+    return null;
+  });
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    try {
+      const res: CodexUsageResponse = await ipcRenderer.invoke('codex:get-usage', {
+        sessionId: activeCodexSessionId,
+        cwd: activeCwd,
+      });
+      if (res?.success) {
+        setData(res.data || null);
+        setError(null);
+      } else {
+        setError(res?.error || 'Failed to read Codex usage');
+      }
+    } catch (e: any) {
+      setError(e?.message || String(e));
+    } finally {
+      setLoading(false);
+    }
+  }, [activeCodexSessionId, activeCwd]);
+
+  const refreshActivity = useCallback(async () => {
+    setActivityLoading(true);
+    try {
+      const res: ActivityResponse = await ipcRenderer.invoke('claude-usage:activity', { days: 14 });
+      setActivity(res);
+    } catch (e: any) {
+      setActivity({ ok: false, error: e?.message || String(e) });
+    } finally {
+      setActivityLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    refresh();
+    let id: ReturnType<typeof setInterval> | null = null;
+    const start = () => {
+      if (id) return;
+      id = setInterval(() => refresh(), 180 * 1000);
+    };
+    const stop = () => {
+      if (id) { clearInterval(id); id = null; }
+    };
+    const onVis = () => {
+      if (document.visibilityState === 'visible') {
+        refresh();
+        start();
+      } else {
+        stop();
+      }
+    };
+    if (document.visibilityState === 'visible') start();
+    document.addEventListener('visibilitychange', onVis);
+    return () => { stop(); document.removeEventListener('visibilitychange', onVis); };
+  }, [refresh]);
+
+  useEffect(() => {
+    if (!activityExpanded) return;
+    refreshActivity();
+  }, [activityExpanded, refreshActivity]);
+
+  useEffect(() => {
+    const down = (e: KeyboardEvent) => {
+      if (e.metaKey || e.ctrlKey) setCmdPressed(true);
+    };
+    const up = (e: KeyboardEvent) => {
+      if (!e.metaKey && !e.ctrlKey) setCmdPressed(false);
+    };
+    const blur = () => setCmdPressed(false);
+    const move = (e: MouseEvent) => {
+      if (cmdPressed && !e.metaKey && !e.ctrlKey) setCmdPressed(false);
+    };
+    window.addEventListener('keydown', down);
+    window.addEventListener('keyup', up);
+    window.addEventListener('blur', blur);
+    window.addEventListener('mousemove', move);
+    return () => {
+      window.removeEventListener('keydown', down);
+      window.removeEventListener('keyup', up);
+      window.removeEventListener('blur', blur);
+      window.removeEventListener('mousemove', move);
+    };
+  }, [cmdPressed]);
+
+  useEffect(() => {
+    if (!clicked) return;
+    const onDown = (e: MouseEvent) => {
+      if (!rootRef.current) return;
+      if (rootRef.current.contains(e.target as Node)) return;
+      setClicked(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setClicked(false);
+    };
+    window.addEventListener('mousedown', onDown);
+    window.addEventListener('keydown', onKey);
+    return () => {
+      window.removeEventListener('mousedown', onDown);
+      window.removeEventListener('keydown', onKey);
+    };
+  }, [clicked]);
+
+  const showPopover = clicked || (cmdPressed && triggerHover) || popoverHover;
+  useEffect(() => {
+    if (!showPopover && activityExpanded) setActivityExpanded(false);
+  }, [showPopover, activityExpanded]);
+
+  const [, setNowTick] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => setNowTick((n) => n + 1), 60_000);
+    return () => clearInterval(id);
+  }, []);
+
+  const weekly = data?.seven_day || data?.secondary || null;
+  const fiveHour = data?.five_hour || data?.primary || null;
+  const weeklyPct = weekly?.utilization ?? null;
+  const chipColor = colorForPct(weeklyPct);
+  const resetShort = formatResetShort(weekly?.resets_at);
+
+  return (
+    <div ref={rootRef} style={{ position: 'relative' }}>
+      <button
+        onClick={() => setClicked(v => !v)}
+        onMouseEnter={() => setTriggerHover(true)}
+        onMouseLeave={() => setTriggerHover(false)}
+        title={weeklyPct != null
+          ? `Codex weekly: ${formatPct(weeklyPct)}${resetShort ? ` • resets in ${resetShort}` : ''}`
+          : (error || 'Codex usage appears after Codex writes a token_count record')}
+        style={{
+          display: 'inline-flex',
+          alignItems: 'center',
+          gap: 6,
+          height: 26,
+          minWidth: 76,
+          padding: '0 7px',
+          background: showPopover ? `${chipColor}0A` : 'transparent',
+          color: weeklyPct != null ? chipColor : '#888',
+          border: `1px solid ${showPopover ? `${chipColor}33` : 'rgba(255,255,255,0.12)'}`,
+          borderRadius: 4,
+          fontSize: 11,
+          fontWeight: 600,
+          fontVariantNumeric: 'tabular-nums',
+          cursor: 'pointer',
+          transition: 'background-color 0.12s, color 0.12s, border-color 0.12s',
+        }}
+      >
+        {loading && !data ? (
+          '…'
+        ) : error && !data ? (
+          <>
+            <CodexIcon size={15} muted />
+            <span>—</span>
+          </>
+        ) : (
+          <>
+            <CodexIcon size={15} muted={weeklyPct == null} />
+            <span>{formatPct(weeklyPct)}</span>
+            {resetShort && (
+              <span style={{ color: '#6b7280', fontWeight: 500 }}>{resetShort}</span>
+            )}
+          </>
+        )}
+      </button>
+
+      {showPopover && (
+        <div
+          onMouseEnter={() => setPopoverHover(true)}
+          onMouseLeave={() => setPopoverHover(false)}
+          style={{
+            position: 'absolute',
+            top: 'calc(100% + 4px)',
+            right: 0,
+            width: 320,
+            background: '#161616',
+            border: '1px solid rgba(255,255,255,0.12)',
+            borderRadius: 6,
+            boxShadow: '0 6px 20px rgba(0,0,0,0.55)',
+            zIndex: 1000,
+            display: 'flex',
+            flexDirection: 'column',
+          }}
+        >
+          <div style={{
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            padding: '8px 12px',
+            borderBottom: '1px solid rgba(255,255,255,0.07)',
+            fontSize: 11,
+            color: '#aaa',
+          }}>
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+              <CodexIcon size={15} />
+              {weekly?.resets_at ? (
+                <>
+                  <span style={{ color: '#666' }}>weekly reset</span>
+                  <span style={{ color: '#ddd' }}>{formatResetDateTime(weekly.resets_at)}</span>
+                </>
+              ) : (
+                <span style={{ color: '#666' }}>weekly reset —</span>
+              )}
+            </span>
+            <button
+              onClick={(e) => { e.stopPropagation(); refresh(); }}
+              disabled={loading}
+              style={{
+                background: 'transparent',
+                border: 'none',
+                color: loading ? '#555' : '#888',
+                cursor: loading ? 'default' : 'pointer',
+                padding: 2,
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 4,
+                fontSize: 10,
+              }}
+              title="Refresh Codex usage"
+            >
+              <RefreshCw size={11} style={{ animation: loading ? 'spin 1s linear infinite' : 'none' }} />
+              refresh
+            </button>
+          </div>
+
+          {error && !data && (
+            <div style={{ padding: '12px', fontSize: 11, color: '#f87171' }}>
+              {error}
+              <div style={{ marginTop: 6, color: '#666' }}>
+                Run Codex until it writes a token count, then refresh.
+              </div>
+            </div>
+          )}
+
+          {data ? (
+            <>
+              <ProgressRow label="Weekly (Codex)" pct={weekly?.utilization} resetsAt={weekly?.resets_at} />
+              <ProgressRow label="5-hour" pct={fiveHour?.utilization} resetsAt={fiveHour?.resets_at} />
+              {(data.plan_type || data.limit_id) && (
+                <div style={{
+                  padding: '6px 12px',
+                  borderTop: '1px solid rgba(255,255,255,0.07)',
+                  fontSize: 10,
+                  color: '#777',
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  gap: 8,
+                }}>
+                  <span>Plan</span>
+                  <span style={{ color: '#aaa', fontFamily: 'ui-monospace, monospace' }}>
+                    {[data.plan_type, data.limit_id].filter(Boolean).join(' · ')}
+                  </span>
+                </div>
+              )}
+            </>
+          ) : !error ? (
+            <div style={{ padding: '12px', fontSize: 11, color: '#666' }}>
+              No Codex limit sample yet.
+            </div>
+          ) : null}
+
+          <div style={{ borderTop: '1px solid rgba(255,255,255,0.07)' }}>
+            <button
+              onClick={() => setActivityExpanded(e => !e)}
+              style={{
+                width: '100%',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                padding: '8px 12px',
+                background: 'transparent',
+                border: 'none',
+                color: '#aaa',
+                fontSize: 11,
+                cursor: 'pointer',
+                textAlign: 'left',
+              }}
+              onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.background = 'rgba(255,255,255,0.03)'; }}
+              onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.background = 'transparent'; }}
+            >
+              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                <ChevronRight size={11} style={{
+                  transform: activityExpanded ? 'rotate(90deg)' : 'rotate(0deg)',
+                  transition: 'transform 0.15s',
+                }} />
+                Activity
+                <span style={{ color: '#666', fontSize: 10 }}>(agent time)</span>
+              </span>
+              {activityExpanded && (
+                <span
+                  onClick={(e) => { e.stopPropagation(); refreshActivity(); }}
+                  style={{
+                    fontSize: 10,
+                    color: activityLoading ? '#555' : '#888',
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: 3,
+                    cursor: 'pointer',
+                  }}
+                >
+                  <RefreshCw size={9} style={{ animation: activityLoading ? 'spin 1s linear infinite' : 'none' }} />
+                </span>
+              )}
+            </button>
+
+            {activityExpanded && (
+              <div style={{ padding: '0 12px 10px' }}>
+                {!activity ? (
+                  <div style={{ fontSize: 10, color: '#666', padding: '4px 0' }}>
+                    {activityLoading ? 'Loading…' : '—'}
+                  </div>
+                ) : !activity.ok ? (
+                  <div style={{ fontSize: 10, color: '#f87171', padding: '4px 0' }}>
+                    {activity.error}
+                  </div>
+                ) : (
+                  <ActivityView activity={activity} />
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+export default function ClaudeUsageButton() {
+  return (
+    <div style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+      <ClaudeUsageChip />
+      <CodexUsageChip />
     </div>
   );
 }

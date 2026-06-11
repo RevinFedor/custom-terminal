@@ -27,6 +27,30 @@ function tabExists(tabId: string): boolean {
   return false;
 }
 
+type QueueAgent = 'claude' | 'codex';
+
+function getPromptQueueAgent(tabId: string): QueueAgent {
+  const state = useWorkspaceStore.getState();
+  for (const ws of state.openProjects.values()) {
+    const tab = ws.tabs.get(tabId);
+    if (!tab) continue;
+    if (tab.commandType === 'codex') return 'codex';
+    if (tab.commandType !== 'claude' && tab.codexSessionId && !tab.claudeSessionId) return 'codex';
+    return 'claude';
+  }
+  return 'claude';
+}
+
+function getPromptQueueAgentLabel(tabId: string): string {
+  return getPromptQueueAgent(tabId) === 'codex' ? 'Codex' : 'Claude';
+}
+
+function sendQueueCommand(tabId: string, payload: string): Promise<unknown> {
+  const agent = getPromptQueueAgent(tabId);
+  const channel = agent === 'codex' ? 'codex:send-command' : 'claude:send-command';
+  return ipcRenderer.invoke(channel, tabId, payload);
+}
+
 // When the per-tab post-prompt toggle is ON and post-prompt text is non-empty,
 // every fired queue item gets the post-prompt appended after a blank-line
 // separator. Empty text is treated as disabled (no glue line, no warning).
@@ -72,6 +96,7 @@ export function getBusyTabsSnapshot(): Map<string, boolean> {
 //   - claude:busy-state      — PTY claude tabs + SDK tabs forwarded by main
 //                              (main.js::ipcMain.on('claude-sdk:busy-state'))
 //   - gemini:busy-state      — Gemini PTY tabs
+//   - codex:busy-state       — Codex rollout JSONL turn watcher
 // Both feed into the same per-tab `prevBusyRef` map keyed by tabId. From the
 // runner's POV "any agent on tab X is busy" is a single bit — the user picks
 // a TAB to wait on, not a specific engine.
@@ -104,7 +129,7 @@ export function usePromptQueueRunner() {
       const payload = withPostPrompt(ownerTabId, head.text);
       const arrow = ownerTabId === triggerTabId ? '↩' : '⇒';
       console.log('[PromptQueueRunner] fire owner=' + ownerTabId.slice(-8) + ' ' + arrow + ' trigger=' + triggerTabId.slice(-8) + ' remaining=' + (beforePop - 1));
-      ipcRenderer.invoke('claude:send-command', ownerTabId, payload).catch((e: unknown) => {
+      sendQueueCommand(ownerTabId, payload).catch((e: unknown) => {
         console.error('[PromptQueueRunner] send failed for owner tab', ownerTabId, e);
       });
       if (beforePop === 1) setAutoRun(ownerTabId, false);
@@ -135,7 +160,7 @@ export function usePromptQueueRunner() {
       return owners;
     };
 
-    const handleBusyState = (channel: 'claude' | 'gemini') =>
+    const handleBusyState = (channel: 'claude' | 'gemini' | 'codex') =>
       (_: any, data: { tabId: string; busy: boolean; reason?: string }) => {
         const { tabId, busy, reason } = data;
         const wasBusy = prevBusyRef.get(tabId) ?? false;
@@ -169,8 +194,22 @@ export function usePromptQueueRunner() {
         //
         // Additive: busy:false уже записан в prevBusyRef выше (loader гасится у
         // всех консьюмеров, которые читают только {tabId,busy}); reason — это
-        // только метаданные исхода. Натуральные reason-less пути (PTY spinner IDLE,
-        // SDK-форвард claude-sdk:busy-state) проходят гард и стреляют как раньше.
+        // только метаданные исхода. Натуральные reason-less пути проходят гард и
+        // стреляют как раньше.
+        //
+        // These reasons are NOT end-of-turn signals. They exist for UI liveness
+        // only, so never fire or disarm prompt queues from this edge:
+        // - 'spinner' — PTY glyph heuristic that can flap between thinking phases.
+        // - 'local-command' — slash-command bracket such as /compact; completion
+        //   is a local Claude operation, not a successful answer to a queued prompt.
+        if (reason === 'spinner' || reason === 'local-command') {
+          console.log('[PromptQueueRunner] tab=' + tabId.slice(-12) + ' ch=' + channel + ' reason=' + reason + ' → IGNORE non-turn busy edge');
+          return;
+        }
+
+        // Natural reason-less paths still fire: authoritative Stop hook,
+        // SDK-forward claude-sdk:busy-state, Gemini spinner idle, PTY-exit
+        // cleanup. Non-natural reasoned paths below disarm.
         // DISARM (не просто skip) on any non-natural turn-end. Юзер: «если я
         // нажал Escape чтобы вмешаться, run-after должен ВЫКЛЮЧИТЬСЯ, а не молча
         // продолжить на следующем штатном ответе». Skip-once было недостаточно:
@@ -185,7 +224,15 @@ export function usePromptQueueRunner() {
         // 'watchdog' (зависание). Слушаем reason, не keystroke — единый сигнал
         // вместо ручного парсинга каждой клавиши. Per user: «любой ненормальный
         // конец → тумблер off».
-        const SKIP_REASONS = ['manual-stop', 'error', 'interrupt', 'watchdog'];
+        const SKIP_REASONS = [
+          'manual-stop',
+          'error',
+          'interrupt',
+          'watchdog',
+          'turn_aborted',
+          'send-command-failed',
+          'send-command-error',
+        ];
         if (reason && SKIP_REASONS.includes(reason)) {
           // Disarm EVERY owner queue this turn-end affects: the trigger tab's own
           // queue AND any pivoted queue waiting on this tab as its target — same
@@ -241,10 +288,11 @@ export function usePromptQueueRunner() {
         // process — there's nothing to ask).
         if (ownQueue.stopAfter) {
           const shouldCloseTab = ownQueue.closeAfter;
+          const agentLabel = getPromptQueueAgentLabel(tabId);
           ipcRenderer.invoke('terminal:stop-ai-process', tabId)
             .then(async (res: { success?: boolean; error?: string }) => {
               if (res?.success) {
-                showToast(shouldCloseTab ? 'Claude stopped, closing tab' : 'Claude stopped', 'success', 1500);
+                showToast(shouldCloseTab ? agentLabel + ' stopped, closing tab' : agentLabel + ' stopped', 'success', 1500);
               } else if (res?.error) {
                 console.warn('[PromptQueueRunner] stop failed:', res.error);
               }
@@ -271,11 +319,14 @@ export function usePromptQueueRunner() {
 
     const claudeHandler = handleBusyState('claude');
     const geminiHandler = handleBusyState('gemini');
+    const codexHandler = handleBusyState('codex');
     ipcRenderer.on('claude:busy-state', claudeHandler);
     ipcRenderer.on('gemini:busy-state', geminiHandler);
+    ipcRenderer.on('codex:busy-state', codexHandler);
     return () => {
       ipcRenderer.removeListener('claude:busy-state', claudeHandler);
       ipcRenderer.removeListener('gemini:busy-state', geminiHandler);
+      ipcRenderer.removeListener('codex:busy-state', codexHandler);
     };
   }, []);
 
@@ -319,7 +370,7 @@ export function usePromptQueueRunner() {
           const payload = withPostPrompt(ownerTabId, head.text);
           const arrow = ownerTabId === triggerTabId ? '↩' : '⇒';
           console.log('[PromptQueueRunner] cold-start owner=' + ownerTabId.slice(-8) + ' ' + arrow + ' trigger=' + triggerTabId.slice(-8));
-          ipcRenderer.invoke('claude:send-command', ownerTabId, payload).catch((e: unknown) => {
+          sendQueueCommand(ownerTabId, payload).catch((e: unknown) => {
             console.error('[PromptQueueRunner] cold-start send failed for tab', ownerTabId, e);
           });
           if (beforePop === 1) usePromptQueueStore.getState().setAutoRun(ownerTabId, false);

@@ -36,6 +36,8 @@
 - Ширина **динамическая**: от `chipRect.left` до левого края Timeline-strip (`[data-timeline]`) минус 8px. Перемеряется на `window.resize`. Без этого статичные 320px клипались за сайдбар.
 - Принцип «single-line input вместо модалки» см. [`methodology/сценарии-багов-design.md::Минимализм popup'ов`](../methodology/сценарии-багов-design.md).
 
+**Не путать с `⎘ session-id-copy` в ControlBar.** Там Cmd-hover — read-only tooltip сверху с текущим UUID, без input и без копирования другой сессии. Здесь Cmd-hover — намеренный override: пользователь вставляет чужой session id / текст с `cwd:` и копирует не активную вкладку, а указанную сессию. Два жеста похожи, но семантика разная: preview identity vs custom source. См. `fact-claude-control-bar.md::Session-id copy`.
+
 **CSS-bridge между chip'ом и input'ом.** Wrapper позиционирован **вплотную** к низу кнопки (`top: chip.bottom`), визуальный 4px gap создаётся через `paddingTop: 4` ВНУТРИ wrapper'а. Если задать `top: chip.bottom + 4` — между chip'ом и wrapper'ом возникает 4px мёртвая зона, popup закрывается при движении курсора сверху вниз. См. [`methodology/сценарии-багов-design.md::2.3 Wrapper смещён вниз от триггера`](../methodology/сценарии-багов-design.md).
 
 **Индикаторные точки на 📋** показывают только «не-дефолтные» флаги: красные — если User/Claude отключены, цветные — если Reading/Editing/Bash/Tools включены (по дефолту OFF), синий — если `fromStart=false`. Юзер видит «что в копии есть подозрительного» одним взглядом без открытия Settings.
@@ -160,4 +162,3 @@ Backend (`claude:estimate-range-tokens`) возвращает три отдел�
 ## Переименование `text` → `answer` в category labels
 
 Категория Claude-ответа в Copy Settings popup, в InfoPanel mini-chip row и в breakdown popover теперь называется **«answer»**, не «text». Мотивация: `text` родовое — *«непонятно что такое текст, слишком общее описание»*. Под `text` могли неоднозначно подразумеваться thinking-блоки, текст внутри tool_use (input parameters), результаты tool_use; `answer` однозначно про финальный текст ответа Claude юзеру. См. принцип `methodology/переносимый-дизайн.md::Категориальные toggle — имена сущностей, не абстракции`. Затронутые места — `CopySessionButton.tsx::ToggleRow «answer»`, `InfoPanel.tsx::ChipText «answer»`, `Timeline.tsx::renderBreakdownBody` (`Claude · answer`).
-

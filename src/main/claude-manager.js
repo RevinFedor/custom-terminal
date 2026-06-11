@@ -275,11 +275,16 @@ class ClaudeManager {
           const children = await execAsync(`pgrep -P ${shellPid}`);
 
           if (children) {
-            // Get the name of the first child process
+            // Get both short name and full command. Codex can appear as a node
+            // wrapper, so renderer needs command-line context to distinguish it
+            // from an ordinary node/npm process in an AI-typed tab.
             const childPid = children.split('\n')[0];
-            const processName = await execAsync(`ps -p ${childPid} -o comm=`);
+            const [processName, command] = await Promise.all([
+              execAsync(`ps -p ${childPid} -o comm=`),
+              execAsync(`ps -p ${childPid} -o command=`),
+            ]);
 
-            return { hasProcess: true, processName };
+            return { hasProcess: true, processName: String(processName || '').trim(), command: String(command || '').trim() };
           }
         }
 

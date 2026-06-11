@@ -98,6 +98,13 @@ export default function Workspace() {
     const tab = tabId ? p.tabs.get(tabId) : null;
     return tab?.geminiSessionId || null;
   });
+  const effectiveCodexSessionId = useWorkspaceStore((s) => {
+    const p = s.openProjects.get(s.activeProjectId!);
+    if (!p) return null;
+    const tabId = p.viewingSubAgentTabId || p.activeTabId;
+    const tab = tabId ? p.tabs.get(tabId) : null;
+    return tab?.codexSessionId || null;
+  });
   const effectiveCommandType = useWorkspaceStore((s) => {
     const p = s.openProjects.get(s.activeProjectId!);
     if (!p) return null;
@@ -190,15 +197,15 @@ export default function Workspace() {
   }, [viewingSubAgentTabId, activeProject, activeTab]);
 
   // Track effective session state transitions for debugging
-  const prevEffectiveRef = useRef({ tab: effectiveTab?.id, claude: effectiveClaudeSessionId, gemini: effectiveGeminiSessionId, cmd: effectiveCommandType });
+  const prevEffectiveRef = useRef({ tab: effectiveTab?.id, claude: effectiveClaudeSessionId, gemini: effectiveGeminiSessionId, codex: effectiveCodexSessionId, cmd: effectiveCommandType });
   useEffect(() => {
     const prev = prevEffectiveRef.current;
-    const cur = { tab: effectiveTab?.id, claude: effectiveClaudeSessionId, gemini: effectiveGeminiSessionId, cmd: effectiveCommandType };
-    if (prev.tab !== cur.tab || prev.claude !== cur.claude || prev.gemini !== cur.gemini || prev.cmd !== cur.cmd) {
-      const hadSession = (prev.cmd === 'claude' && prev.claude) || (prev.cmd === 'gemini' && prev.gemini);
-      const hasSession = (cur.cmd === 'claude' && cur.claude) || (cur.cmd === 'gemini' && cur.gemini);
+    const cur = { tab: effectiveTab?.id, claude: effectiveClaudeSessionId, gemini: effectiveGeminiSessionId, codex: effectiveCodexSessionId, cmd: effectiveCommandType };
+    if (prev.tab !== cur.tab || prev.claude !== cur.claude || prev.gemini !== cur.gemini || prev.codex !== cur.codex || prev.cmd !== cur.cmd) {
+      const hadSession = (prev.cmd === 'claude' && prev.claude) || (prev.cmd === 'gemini' && prev.gemini) || (prev.cmd === 'codex' && prev.codex);
+      const hasSession = (cur.cmd === 'claude' && cur.claude) || (cur.cmd === 'gemini' && cur.gemini) || (cur.cmd === 'codex' && cur.codex);
       if (hadSession && !hasSession) {
-        console.warn('[Workspace:Guard] Session LOST → hotkeys disabled | tab=' + (cur.tab || 'null') + ' cmdType=' + cur.cmd + ' claude=' + (cur.claude ? cur.claude.substring(0, 8) : 'null') + ' gemini=' + (cur.gemini ? cur.gemini.substring(0, 8) : 'null') + ' prev.tab=' + (prev.tab || 'null') + ' prev.cmd=' + prev.cmd);
+        console.warn('[Workspace:Guard] Session LOST → hotkeys disabled | tab=' + (cur.tab || 'null') + ' cmdType=' + cur.cmd + ' claude=' + (cur.claude ? cur.claude.substring(0, 8) : 'null') + ' gemini=' + (cur.gemini ? cur.gemini.substring(0, 8) : 'null') + ' codex=' + (cur.codex ? cur.codex.substring(0, 8) : 'null') + ' prev.tab=' + (prev.tab || 'null') + ' prev.cmd=' + prev.cmd);
       }
       prevEffectiveRef.current = cur;
     }
@@ -347,9 +354,9 @@ export default function Workspace() {
       if (workspaceView !== 'workspace') return;
       const isBackslash = e.code === 'Backslash' || e.key === '\\' || e.code === 'IntlBackslash';
       if (e.metaKey && isBackslash) {
-        const hasSession = effectiveClaudeSessionId || effectiveGeminiSessionId;
+        const hasSession = effectiveClaudeSessionId || effectiveGeminiSessionId || effectiveCodexSessionId;
         if (!effectiveTab?.id || !hasSession) {
-          console.warn('[Workspace:Hotkey] CMD+\\ BLOCKED: effectiveTab=' + (effectiveTab?.id || 'null') + ' cmdType=' + effectiveCommandType + ' claudeSession=' + (effectiveClaudeSessionId ? effectiveClaudeSessionId.substring(0, 8) : 'null') + ' geminiSession=' + (effectiveGeminiSessionId ? effectiveGeminiSessionId.substring(0, 8) : 'null'));
+          console.warn('[Workspace:Hotkey] CMD+\\ BLOCKED: effectiveTab=' + (effectiveTab?.id || 'null') + ' cmdType=' + effectiveCommandType + ' claudeSession=' + (effectiveClaudeSessionId ? effectiveClaudeSessionId.substring(0, 8) : 'null') + ' geminiSession=' + (effectiveGeminiSessionId ? effectiveGeminiSessionId.substring(0, 8) : 'null') + ' codexSession=' + (effectiveCodexSessionId ? effectiveCodexSessionId.substring(0, 8) : 'null'));
           return;
         }
         e.preventDefault();
@@ -361,7 +368,7 @@ export default function Workspace() {
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [workspaceView, effectiveTab?.id, effectiveClaudeSessionId, effectiveGeminiSessionId, effectiveCommandType, setHistoryPanelOpen, setTimelineTreeMode]);
+  }, [workspaceView, effectiveTab?.id, effectiveClaudeSessionId, effectiveGeminiSessionId, effectiveCodexSessionId, effectiveCommandType, setHistoryPanelOpen, setTimelineTreeMode]);
 
   // CMD+] hotkey to toggle timeline tree mode
   useEffect(() => {
@@ -369,9 +376,9 @@ export default function Workspace() {
       if (workspaceView !== 'workspace') return;
       if (e.metaKey && e.code === 'BracketRight') {
         const hasSession =
-          effectiveClaudeSessionId || effectiveGeminiSessionId;
+          effectiveClaudeSessionId || effectiveGeminiSessionId || effectiveCodexSessionId;
         if (!effectiveTab?.id || !hasSession) {
-          console.warn('[Workspace:Hotkey] CMD+] BLOCKED: effectiveTab=' + (effectiveTab?.id || 'null') + ' cmdType=' + effectiveCommandType + ' claudeSession=' + (effectiveClaudeSessionId ? effectiveClaudeSessionId.substring(0, 8) : 'null') + ' geminiSession=' + (effectiveGeminiSessionId ? effectiveGeminiSessionId.substring(0, 8) : 'null'));
+          console.warn('[Workspace:Hotkey] CMD+] BLOCKED: effectiveTab=' + (effectiveTab?.id || 'null') + ' cmdType=' + effectiveCommandType + ' claudeSession=' + (effectiveClaudeSessionId ? effectiveClaudeSessionId.substring(0, 8) : 'null') + ' geminiSession=' + (effectiveGeminiSessionId ? effectiveGeminiSessionId.substring(0, 8) : 'null') + ' codexSession=' + (effectiveCodexSessionId ? effectiveCodexSessionId.substring(0, 8) : 'null'));
           return;
         }
         e.preventDefault();
@@ -383,7 +390,7 @@ export default function Workspace() {
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [workspaceView, effectiveTab?.id, effectiveClaudeSessionId, effectiveGeminiSessionId, effectiveCommandType, setTimelineTreeMode, setHistoryPanelOpen]);
+  }, [workspaceView, effectiveTab?.id, effectiveClaudeSessionId, effectiveGeminiSessionId, effectiveCodexSessionId, effectiveCommandType, setTimelineTreeMode, setHistoryPanelOpen]);
 
   // CMD+F hotkey for terminal search
   useEffect(() => {
@@ -477,6 +484,21 @@ export default function Workspace() {
 
   // Tab creation is now handled in useWorkspaceStore.openProject()
 
+  // Delayed unmount for slide-out animation (keep mounted briefly after close).
+  // Must stay above the empty-workspace guard: activeProject can be transiently
+  // null during restore/HMR/project close, and returning before hooks breaks the
+  // Rules of Hooks ("Rendered fewer hooks than expected").
+  const isHistoryOpen = effectiveTab?.id ? (historyPanelOpenTabs[effectiveTab.id] ?? false) : false;
+  const [historyMounted, setHistoryMounted] = useState(false);
+  useEffect(() => {
+    if (isHistoryOpen) {
+      setHistoryMounted(true);
+    } else if (historyMounted) {
+      const timer = setTimeout(() => setHistoryMounted(false), 60);
+      return () => clearTimeout(timer);
+    }
+  }, [isHistoryOpen, historyMounted]);
+
   if (!activeProject || !activeProjectId || !currentProject) {
     console.warn('[Workspace:EARLY_RETURN] Empty workspace!', { activeProject: !!activeProject, activeProjectId, currentProject: !!currentProject });
     return <div className="flex-1 bg-bg-main" />;
@@ -488,32 +510,27 @@ export default function Workspace() {
   // Session IDs come from fine-grained selectors (top of component) — not effectiveTab.
   // This ensures Workspace re-renders when Bridge updates session ID via set({}).
   // Show timeline if ANY session exists — don't gate on commandType match.
-  // effectiveCommandType and effectiveClaudeSessionId/effectiveGeminiSessionId come from different
+  // effectiveCommandType and effective*SessionId come from different
   // Zustand selectors that can temporarily desync (e.g. when viewingSubAgentTabId changes).
   // Requiring cmdType match caused timeline to permanently disappear.
-  const showTimeline = !filePreview && (effectiveClaudeSessionId || effectiveGeminiSessionId);
-  const timelineSessionId = effectiveGeminiSessionId && effectiveCommandType === 'gemini' ? effectiveGeminiSessionId : effectiveClaudeSessionId;
-  const timelineToolType = (effectiveGeminiSessionId && effectiveCommandType === 'gemini' ? 'gemini' : 'claude') as 'claude' | 'gemini';
+  const showTimeline = !filePreview && (effectiveClaudeSessionId || effectiveGeminiSessionId || effectiveCodexSessionId);
+  const timelineSessionId = effectiveCodexSessionId && effectiveCommandType === 'codex'
+    ? effectiveCodexSessionId
+    : effectiveGeminiSessionId && effectiveCommandType === 'gemini'
+      ? effectiveGeminiSessionId
+      : effectiveClaudeSessionId;
+  const timelineToolType = (effectiveCodexSessionId && effectiveCommandType === 'codex'
+    ? 'codex'
+    : effectiveGeminiSessionId && effectiveCommandType === 'gemini'
+      ? 'gemini'
+      : 'claude') as 'claude' | 'gemini' | 'codex';
 
   // DEBUG: Uncomment to debug Timeline visibility
   // console.log('[Timeline Debug] showTimeline:', showTimeline, 'claudeSessionId:', claudeSessionId, 'commandType:', activeTab?.commandType, 'isRunning:', isCommandRunning);
 
-  // Per-tab history panel state
-  const isHistoryOpen = effectiveTab?.id ? (historyPanelOpenTabs[effectiveTab.id] ?? false) : false;
-
-  // Delayed unmount for slide-out animation (keep mounted 200ms after close)
-  const [historyMounted, setHistoryMounted] = useState(false);
-  useEffect(() => {
-    if (isHistoryOpen) {
-      setHistoryMounted(true);
-    } else if (historyMounted) {
-      const timer = setTimeout(() => setHistoryMounted(false), 60);
-      return () => clearTimeout(timer);
-    }
-  }, [isHistoryOpen]);
-
-  // DEBUG: Track state changes
-  console.warn(`[Workspace:RENDER] currentView=${currentView} showTimeline=${showTimeline} activeTabId=${activeTab?.id} effectiveTabId=${effectiveTab?.id} isCommandRunning=${isCommandRunning}`);
+  if ((window as any).__NOTED_RENDER_DIAG__ === true) {
+    console.warn(`[Workspace:RENDER] currentView=${currentView} showTimeline=${showTimeline} activeTabId=${activeTab?.id} effectiveTabId=${effectiveTab?.id} isCommandRunning=${isCommandRunning}`);
+  }
 
   return (
     <div className="flex-1 flex flex-col h-full overflow-hidden relative">
@@ -665,6 +682,7 @@ export default function Workspace() {
               tabId={effectiveTab.id}
               claudeSessionId={effectiveClaudeSessionId}
               geminiSessionId={effectiveGeminiSessionId}
+              codexSessionId={effectiveCodexSessionId}
               commandType={effectiveCommandType}
               isCommandRunning={isCommandRunning}
               projectPath={currentProject.path}

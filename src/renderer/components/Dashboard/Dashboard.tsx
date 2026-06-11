@@ -277,7 +277,7 @@ export default function Dashboard() {
 
         {/* Settings */}
         <div className="flex items-center gap-3 mb-4 px-1">
-          <Tooltip content="Автоматически возобновлять прерванные Claude сессии при запуске приложения">
+          <Tooltip content="Автоматически возобновлять прерванные AI-сессии при запуске приложения">
             <label className="flex items-center gap-2 cursor-pointer select-none">
               <div
                 className="relative w-8 h-4 rounded-full transition-colors"
@@ -296,7 +296,7 @@ export default function Dashboard() {
                   }}
                 />
               </div>
-              <span className="text-xs text-[#888]">Auto-resume sessions</span>
+              <span className="text-xs text-[#888]">Auto-resume AI sessions</span>
             </label>
           </Tooltip>
         </div>

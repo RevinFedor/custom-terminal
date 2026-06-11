@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo, startTransition } from 'react';
 import { useWorkspaceStore, TabColor, TabType, PendingAction } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import Tooltip from '../UI/Tooltip';
@@ -182,12 +182,46 @@ const TAB_COLORS: Record<TabColor, { bgColor: string; borderColor: string }> = {
   purple: { bgColor: 'rgba(168, 85, 247, 0.2)', borderColor: 'rgb(168, 85, 247)' },
   claude: { bgColor: 'rgba(218, 119, 86, 0.2)', borderColor: '#DA7756' },
   gemini: { bgColor: 'rgba(78, 134, 248, 0.2)', borderColor: '#4E86F8' },
+  codex: { bgColor: 'rgba(16, 163, 127, 0.18)', borderColor: '#10A37F' },
 };
 
 export default function ProjectHome({ projectId }: ProjectHomeProps) {
-  const { openProjects, switchTab, createTab, closeTab, setProjectView } = useWorkspaceStore();
-  const { projects, updateProject } = useProjectsStore();
-  const { showToast } = useUIStore();
+  const switchTab = useWorkspaceStore((state) => state.switchTab);
+  const createTab = useWorkspaceStore((state) => state.createTab);
+  const closeTab = useWorkspaceStore((state) => state.closeTab);
+  const setProjectView = useWorkspaceStore((state) => state.setProjectView);
+  const workspaceFingerprint = useWorkspaceStore((state) => {
+    const workspace = state.openProjects.get(projectId);
+    if (!workspace) return 'missing';
+
+    const tabsKey = Array.from(workspace.tabs.values()).map((tab) => [
+      tab.id,
+      tab.name,
+      tab.cwd,
+      tab.color || '',
+      tab.commandType || '',
+      tab.tabType || '',
+      tab.url || '',
+      tab.claudeSessionId || '',
+      tab.geminiSessionId || '',
+      tab.codexSessionId || '',
+      tab.wasInterrupted ? '1' : '0',
+      tab.overlayDismissed ? '1' : '0',
+      tab.notes ? 'notes' : '',
+      tab.sessionStatus || '',
+    ].join(':')).join('|');
+
+    return [
+      workspace.projectPath,
+      workspace.activeTabId || '',
+      workspace.tabCounter,
+      workspace.currentView,
+      tabsKey,
+    ].join('::');
+  });
+  const project = useProjectsStore((state) => state.projects[projectId]);
+  const updateProject = useProjectsStore((state) => state.updateProject);
+  const showToast = useUIStore((state) => state.showToast);
   // Status-marker palette + shape/size. Granular selectors — re-rendered только когда
   // юзер правит палитру в SettingsModal, не на каждый closed-tab card flip.
   const sessionStatuses = useUIStore((s) => s.sessionStatuses);
@@ -198,6 +232,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
   const [history, setHistory] = useState<TabHistoryEntry[]>([]);
   const [favorites, setFavorites] = useState<FavoriteEntry[]>([]);
   const [isLoaded, setIsLoaded] = useState(false);
+  const historyLoadProjectRef = useRef<string | null>(null);
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set(['This Month', 'Older']));
   // OSC 133 event-driven process status — mirror of TabBar's subscription. Used
   // to render the same green/red status dot on Active cards that the real
@@ -394,9 +429,21 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
     return () => window.removeEventListener('project:name-sync', handleSync);
   }, [projectId, isDraft]);
 
-  const workspace = openProjects.get(projectId);
-  const project = projects[projectId];
-  const tabs = workspace ? Array.from(workspace.tabs.values()) : [];
+  const workspace = useMemo(() => (
+    useWorkspaceStore.getState().openProjects.get(projectId)
+  ), [projectId, workspaceFingerprint]);
+  const tabs = useMemo(() => (
+    workspace ? Array.from(workspace.tabs.values()) : []
+  ), [workspace, workspaceFingerprint]);
+  const tabIdsKey = useMemo(() => tabs.map((tab) => tab.id).join('|'), [tabs]);
+
+  useEffect(() => {
+    const mountedAt = performance.now();
+    console.warn(`[Perf:Home] mount project=${projectId.slice(-12)} tabs=${tabs.length}`);
+    return () => {
+      console.warn(`[Perf:Home] unmount project=${projectId.slice(-12)} aliveMs=${(performance.now() - mountedAt).toFixed(1)}`);
+    };
+  }, [projectId]);
 
   // Restore a closed tab from history
   const restoreTab = async (entry: TabHistoryEntry) => {
@@ -500,8 +547,13 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
   // Initial sync on mount + on tabs.length change (covers create/close).
   // Same event names as TabBar — single source of truth in main process.
   useEffect(() => {
-    if (!workspace) return;
-    const tabIds = Array.from(workspace.tabs.keys());
+    const tabIds = tabIdsKey ? tabIdsKey.split('|') : [];
+    if (tabIds.length === 0) {
+      setProcessStatus(new Map());
+      return;
+    }
+    const tabIdSet = new Set(tabIds);
+    let cancelled = false;
 
     Promise.all(
       tabIds.map(async (tabId) => {
@@ -513,10 +565,12 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
         }
       })
     ).then((pairs) => {
+      if (cancelled) return;
       setProcessStatus(new Map(pairs));
     });
 
     const handleStarted = (_: any, { tabId }: { tabId: string }) => {
+      if (!tabIdSet.has(tabId)) return;
       setProcessStatus(prev => {
         const next = new Map(prev);
         next.set(tabId, true);
@@ -524,6 +578,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
       });
     };
     const handleFinished = (_: any, { tabId }: { tabId: string }) => {
+      if (!tabIdSet.has(tabId)) return;
       setProcessStatus(prev => {
         const next = new Map(prev);
         next.set(tabId, false);
@@ -533,10 +588,11 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
     ipcRenderer.on('terminal:command-started', handleStarted);
     ipcRenderer.on('terminal:command-finished', handleFinished);
     return () => {
+      cancelled = true;
       ipcRenderer.removeListener('terminal:command-started', handleStarted);
       ipcRenderer.removeListener('terminal:command-finished', handleFinished);
     };
-  }, [projectId, tabs.length]);
+  }, [tabIdsKey]);
 
   // Fetch history + favorites in parallel. We gate the entire content (lists +
   // SemanticSearch) on Promise.all so the user doesn't see Search appear before
@@ -546,14 +602,43 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
   useEffect(() => {
     if (!projectId) return;
     let cancelled = false;
+    const startedAt = performance.now();
+    const firstLoadForProject = historyLoadProjectRef.current !== projectId;
+    historyLoadProjectRef.current = projectId;
+    if (firstLoadForProject) {
+      setIsLoaded(false);
+    }
     Promise.all([
       ipcRenderer.invoke('project:get-tab-history', { projectId }) as Promise<TabHistoryEntry[]>,
       ipcRenderer.invoke('project:get-favorites', { projectId }) as Promise<FavoriteEntry[]>,
     ]).then(([h, f]) => {
       if (cancelled) return;
-      setHistory(h || []);
-      setFavorites(f || []);
-      setIsLoaded(true);
+      const historyRows = h || [];
+      const favoriteRows = f || [];
+      const ipcMs = performance.now() - startedAt;
+      console.warn(
+        `[Perf:Home] ready project=${projectId.slice(-12)} firstLoad=${firstLoadForProject}` +
+        ` tabs=${tabs.length} history=${historyRows.length} favorites=${favoriteRows.length}` +
+        ` ipcMs=${ipcMs.toFixed(1)}`
+      );
+      startTransition(() => {
+        setHistory(historyRows);
+        setFavorites(favoriteRows);
+        setIsLoaded(true);
+      });
+    }).catch((err) => {
+      console.error('[ProjectHome] Failed to load history/favorites:', err);
+      if (cancelled) return;
+      const ipcMs = performance.now() - startedAt;
+      console.warn(
+        `[Perf:Home] ready project=${projectId.slice(-12)} firstLoad=${firstLoadForProject}` +
+        ` tabs=${tabs.length} history=0 favorites=0 ipcMs=${ipcMs.toFixed(1)} error=true`
+      );
+      startTransition(() => {
+        setHistory([]);
+        setFavorites([]);
+        setIsLoaded(true);
+      });
     });
     return () => { cancelled = true; };
   }, [projectId, tabs.length]);

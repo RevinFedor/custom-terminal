@@ -102,14 +102,13 @@ export type TabInfo = {
 export type StatusMarkerCfg = { shape: 'dot' | 'square'; sizePx: number };
 
 // Process-bar config mirrored from desktop useUIStore.processBar. Drives the
-// loader STRIP (переливающаяся полоска) on the tab-row edge — position left/right,
-// colors + pulse cycle. `enabled:false` = static colorA strip (no pulse). This is
-// the AI-busy / process-alive loader; there is NO whole-tab background tint.
+// loader STRIP (переливающаяся полоска) on the tab-row edge: base color, shimmer
+// color/spacing/opacity, and position. There is no pulse toggle and no whole-tab tint.
 export type ProcessBarCfg = {
-  enabled: boolean;
   colorA: string;
-  colorB: string;
-  durationMs: number;
+  shimmerColor: string;
+  shimmerSpacingPct: number;
+  shimmerOpacityPct: number;
   position: 'left' | 'right';
 };
 

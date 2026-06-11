@@ -3,7 +3,6 @@ import { createPortal } from 'react-dom';
 import { Settings } from 'lucide-react';
 import { useUIStore, DefaultClaudeEffort } from '../store/useUIStore';
 import { usePromptsStore } from '../store/usePromptsStore';
-import { CLAUDE_EFFORT_LEVELS_WITH_NONE, CLAUDE_EFFORT_LABELS } from '../constants/claudeLevels';
 import { useCmdKey } from '../hooks/useCmdHoverPopover';
 
 const { ipcRenderer } = window.require('electron');
@@ -26,6 +25,7 @@ export default function StatusBar({ onOpenSettings }: StatusBarProps) {
   const setFreePortsBeforeStart = useUIStore((s) => s.setFreePortsBeforeStart);
   const defaultClaudeEffort = useUIStore((s) => s.defaultClaudeEffort);
   const setDefaultClaudeEffort = useUIStore((s) => s.setDefaultClaudeEffort);
+  const claudeCodeEfforts = useUIStore((s) => s.claudeCodeSettings.efforts);
 
   return (
     <div
@@ -43,7 +43,7 @@ export default function StatusBar({ onOpenSettings }: StatusBarProps) {
         <WebServerChip />
       </div>
       <div className="flex items-center gap-2">
-        <EffortSelector value={defaultClaudeEffort} onChange={setDefaultClaudeEffort} />
+        <EffortSelector value={defaultClaudeEffort} options={claudeCodeEfforts} onChange={setDefaultClaudeEffort} />
         <StatusToggle
           label="kill dev-ports"
           title="Если ВКЛ — перед каждым запуском npm-скрипта / restart / stop сначала убиваются занятые порты проекта (vite/backend), считанные из vite.config / .env / NestJS main.ts. Защита от 'address in use' после крашей."
@@ -162,20 +162,19 @@ function SettingsButton({ onClick }: { onClick?: () => void }) {
   );
 }
 
-// Display order for the popup. Sourced from canonical list + 'none' sentinel.
-// Effort values themselves ship from Anthropic — keep the actual list in
-// constants/claudeLevels.ts so a Claude rev only touches one file.
-const EFFORT_LEVELS: readonly DefaultClaudeEffort[] = CLAUDE_EFFORT_LEVELS_WITH_NONE;
-const EFFORT_LABEL: Record<DefaultClaudeEffort, string> = {
-  none: 'none',
-  ...CLAUDE_EFFORT_LABELS,
+const effortLabel = (level: string): string => {
+  if (level === 'medium') return 'med';
+  if (level === 'xhigh') return 'xhi';
+  if (level === 'ultracode') return 'ultra';
+  return level;
 };
 
 // Same visual language as InfoPanel Effort buttons: small pills, accent for active.
 // Status-bar version is a single chip showing the current effort, click → popup with all
 // six levels appearing ABOVE (status bar is at the bottom). One click selects + persists.
-function EffortSelector({ value, onChange }: {
+function EffortSelector({ value, options, onChange }: {
   value: DefaultClaudeEffort;
+  options: string[];
   onChange: (v: DefaultClaudeEffort) => void;
 }) {
   const [clicked, setClicked] = useState(false);     // pinned via click
@@ -243,7 +242,7 @@ function EffortSelector({ value, onChange }: {
       >
         <span style={{ color: '#666' }}>Effort:</span>
         <span style={{ color: value === 'none' ? '#666' : '#DA7756', fontWeight: 500 }}>
-          {EFFORT_LABEL[value]}
+          {effortLabel(value)}
         </span>
       </button>
       {open && chipRef.current && createPortal(
@@ -251,6 +250,7 @@ function EffortSelector({ value, onChange }: {
           chipRect={chipRef.current.getBoundingClientRect()}
           popupRef={popupRef}
           value={value}
+          options={options}
           onSelect={(v) => { onChange(v); setClicked(false); setPopupHover(false); }}
           onPopupEnter={() => setPopupHover(true)}
           onPopupLeave={() => setPopupHover(false)}
@@ -261,14 +261,20 @@ function EffortSelector({ value, onChange }: {
   );
 }
 
-function EffortPopup({ chipRect, popupRef, value, onSelect, onPopupEnter, onPopupLeave }: {
+function EffortPopup({ chipRect, popupRef, value, options, onSelect, onPopupEnter, onPopupLeave }: {
   chipRect: DOMRect;
   popupRef: React.RefObject<HTMLDivElement | null>;
   value: DefaultClaudeEffort;
+  options: string[];
   onSelect: (v: DefaultClaudeEffort) => void;
   onPopupEnter?: () => void;
   onPopupLeave?: () => void;
 }) {
+  const levels = useMemo(() => {
+    const base = ['none', ...options.filter(Boolean)];
+    return base.includes(value) ? base : [...base, value];
+  }, [options, value]);
+
   return (
     <div
       ref={popupRef}
@@ -291,7 +297,7 @@ function EffortPopup({ chipRect, popupRef, value, onSelect, onPopupEnter, onPopu
         className="flex gap-1 bg-[#1a1a1a] border border-[#444] rounded shadow-2xl"
         style={{ padding: 4, boxShadow: '0 -8px 24px rgba(0,0,0,0.5)' }}
       >
-        {EFFORT_LEVELS.map((level) => {
+        {levels.map((level) => {
           const isActive = value === level;
           return (
             <button
@@ -304,7 +310,7 @@ function EffortPopup({ chipRect, popupRef, value, onSelect, onPopupEnter, onPopu
               }`}
               style={{ minWidth: 32 }}
             >
-              {EFFORT_LABEL[level]}
+              {effortLabel(level)}
             </button>
           );
         })}
@@ -388,7 +394,7 @@ function WebServerChip() {
   );
 }
 
-function StatusToggle({ label, active, onClick, activeColor = '#22c55e' }: {
+function StatusToggle({ label, title, active, onClick, activeColor = '#22c55e' }: {
   label: string;
   title?: string;
   active: boolean;
@@ -398,6 +404,7 @@ function StatusToggle({ label, active, onClick, activeColor = '#22c55e' }: {
   return (
     <button
       onClick={onClick}
+      title={title}
       className="inline-flex items-center gap-1 cursor-pointer hover:bg-white/5 rounded"
       style={{ padding: '1px 6px', height: 18 }}
     >

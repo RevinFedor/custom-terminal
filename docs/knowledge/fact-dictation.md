@@ -44,7 +44,7 @@ Soniox реально шлёт synthetic-токены `<end>` (endpoint detectio
 Решение «куда уходит текст после STOP» зависит от типа активного таба (детектится в `MicButton` через Zustand-селекторы `tabType` и `commandType`):
 
 - **`sdk`** (claude-sdk таб) → `window.dispatchEvent('claude-sdk:dictation-deliver', {tabId, text})`. Handler внутри `SDKComposer` (НЕ в `ClaudeSDKTab` верхнего уровня) использует прямой `composerTextareaRef` + `writeComposerValue()`. Раньше handler сидел в `ClaudeSDKTab` и искал textarea через `querySelector('.absolute.inset-0:not([style*="display: none"])')` — селектор нестабилен в multi-tab layout'е, текст уходил в чужой таб. Внутри SDKComposer есть готовый `writeComposerValue` (тот же путь что Stash-restore и insert-prompt используют — гарантированно работает с assistant-ui ComposerPrimitive).
-- **`pty-claude`** → `ipcRenderer.invoke('terminal:paste', {tabId, content, submit: false})`. Текст печатается в TUI input без Enter — юзер сам решит когда отправить.
+- **`pty-claude` / `pty-codex`** → `ipcRenderer.invoke('terminal:paste', {tabId, content, submit: false})`. Текст печатается в TUI input без Enter — юзер сам решит когда отправить. Codex использует тот же PTY-path, потому что у него нет отдельного React composer'а внутри приложения.
 - **`terminal`** (обычный шелл / нет активного Claude) → только в историю. Floating-окно остаётся **единственным** способом увидеть транскрипт (плюс копировать из dropdown).
 
 Во ВСЕХ трёх режимах `appendDictationEntry(text)` в localStorage — список прошлых транскриптов доступен независимо от того куда они улетели.
@@ -66,6 +66,14 @@ Final tokens — белый `#e0e0e0`, partial — серый italic `#aaa`. Aut
 ## State machine MicButton
 
 `idle → recording → stopping → idle` (плюс короткий transient `recording`-while-connecting который для UI неотличим от полноценного recording — иконка оранжевая, floating-окно открыто, юзер уже говорит, фоном идёт ws-handshake).
+
+## Enter во время диктовки
+
+В живом Claude/Codex PTY пользователь может нажать `Enter` в ControlBar пока микрофон ещё пишет. Семантика этого жеста: «заверши диктовку, вставь распознанный текст в composer, потом отправь». Нельзя сразу слать raw `\r`: это отправило бы старый TUI input без только что сказанного текста. Нельзя и просто остановить микрофон без submit: пользователь нажал Enter именно как send-action.
+
+`MicButton` публикует window-события состояния (`dictation:state`) и принимает `dictation:stop-and-deliver` с `requestId`. Если состояние `recording`, Enter сначала просит stop; если уже `stopping`, новый stop не запускается, Enter просто ждёт delivery. После финализации `deliverFinal()` делает обычный delivery (`terminal:paste submit:false` для PTY, SDK event для SDK, history-only для обычного terminal) и только после успешной доставки шлёт `dictation:delivered`. ControlBar держит `enterPending` loader всё это время и после matching `requestId` отправляет raw `\r` в PTY.
+
+Для PTY `terminal:paste submit:false` остаётся обязательной промежуточной фазой даже когда следующий шаг — Enter. Paste path сам отвечает за bracketed paste и render-commit; raw `\r` идёт только после delivery signal. Это тот же принцип что у TUI-команд: submit должен идти после подтверждения, что текст уже стал состоянием input'а, а не по фиксированной задержке.
 
 `stop()` идемпотентен и имеет fallback-таймаут:
 - Если `ws.readyState === OPEN` — шлёт пустой ArrayBuffer (Soniox flush'ит финалы и закрывает) + safety 3-секундный таймер на случай зависшего WebSocket.

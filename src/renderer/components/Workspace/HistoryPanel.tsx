@@ -59,7 +59,7 @@ interface HistoryPanelProps {
   width: number;
   notesPanelWidth: number;
   isOpen: boolean;
-  toolType?: 'claude' | 'gemini';
+  toolType?: 'claude' | 'gemini' | 'codex';
 }
 
 // Thinking + markdown now render via @noted/claude-blocks (CBThinkBlock /
@@ -212,11 +212,36 @@ const SubAgentBlock = memo(({ action }: { action: TaskAction }) => {
 // Compact block — expandable with summary
 const CompactBlock = memo(({ entry }: { entry: FullHistoryEntry }) => {
   const [open, setOpen] = useState(false);
+  const [hovered, setHovered] = useState(false);
+  const [altHeld, setAltHeld] = useState(false);
   const hasSummary = !!entry.compactSummary;
+  const visible = open || (hovered && altHeld);
   const tokensLabel = entry.preTokens ? `${Math.round(entry.preTokens / 1000)}k tokens` : null;
+
+  useEffect(() => {
+    if (!hasSummary) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Alt') setAltHeld(true);
+    };
+    const onKeyUp = (e: KeyboardEvent) => {
+      if (e.key === 'Alt') setAltHeld(false);
+    };
+    const onBlur = () => setAltHeld(false);
+    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('keyup', onKeyUp);
+    window.addEventListener('blur', onBlur);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('keyup', onKeyUp);
+      window.removeEventListener('blur', onBlur);
+    };
+  }, [hasSummary]);
+
   return (
     <div style={{ padding: '4px 0' }}>
       <div
+        onMouseEnter={() => setHovered(true)}
+        onMouseLeave={() => setHovered(false)}
         style={{
           display: 'flex', alignItems: 'center', justifyContent: 'center',
           gap: 6, cursor: hasSummary ? 'pointer' : 'default',
@@ -225,15 +250,15 @@ const CompactBlock = memo(({ entry }: { entry: FullHistoryEntry }) => {
       >
         <div style={{ flex: 1, height: 1, backgroundColor: '#f59e0b', opacity: 0.3 }} />
         {hasSummary && (
-          open ? <ChevronDown size={10} style={{ color: '#f59e0b', flexShrink: 0 }} />
-               : <ChevronRight size={10} style={{ color: '#f59e0b', flexShrink: 0 }} />
+          visible ? <ChevronDown size={10} style={{ color: '#f59e0b', flexShrink: 0 }} />
+                  : <ChevronRight size={10} style={{ color: '#f59e0b', flexShrink: 0 }} />
         )}
         <span style={{ color: '#f59e0b', fontSize: 11, letterSpacing: 1, flexShrink: 0, opacity: 0.8 }}>
           COMPACTED{tokensLabel ? ` (${tokensLabel})` : ''}
         </span>
         <div style={{ flex: 1, height: 1, backgroundColor: '#f59e0b', opacity: 0.3 }} />
       </div>
-      {open && entry.compactSummary && (
+      {visible && entry.compactSummary && (
         <div style={{
           marginTop: 6, padding: '8px 12px',
           backgroundColor: 'rgba(245, 158, 11, 0.04)',
@@ -251,7 +276,7 @@ const CompactBlock = memo(({ entry }: { entry: FullHistoryEntry }) => {
 });
 
 // Single history entry renderer
-const HistoryEntry = memo(({ entry, toolType }: { entry: FullHistoryEntry; toolType?: 'claude' | 'gemini' }) => {
+const HistoryEntry = memo(({ entry, toolType }: { entry: FullHistoryEntry; toolType?: 'claude' | 'gemini' | 'codex' }) => {
   if (entry.role === 'compact') {
     return <CompactBlock entry={entry} />;
   }
@@ -315,7 +340,7 @@ const HistoryEntry = memo(({ entry, toolType }: { entry: FullHistoryEntry; toolT
   return (
     <div style={{ padding: '8px 12px' }}>
       <div style={{ fontSize: 10, color: '#666', marginBottom: 4 }}>
-        {toolType === 'gemini' ? 'GEMINI' : 'CLAUDE'}
+        {toolType === 'gemini' ? 'GEMINI' : toolType === 'codex' ? 'CODEX' : 'CLAUDE'}
         {entry.timestamp && (
           <span style={{ marginLeft: 8 }}>
             {new Date(entry.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
@@ -656,7 +681,7 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
   const loadHistory = useCallback(async (isRefresh = false) => {
     if (!sessionId) return;
     try {
-      const ipcChannel = toolType === 'gemini' ? 'gemini:get-full-history' : 'claude:get-full-history';
+      const ipcChannel = toolType === 'gemini' ? 'gemini:get-full-history' : toolType === 'codex' ? 'codex:get-full-history' : 'claude:get-full-history';
       const result = await ipcRenderer.invoke(ipcChannel, { sessionId, cwd });
       if (result.success) {
         const newEntries: FullHistoryEntry[] = result.entries || [];

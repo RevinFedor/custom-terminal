@@ -465,12 +465,12 @@ async function handleApi(req, res, parsed, sdkSessions) {
       }
     }
     // Configurable status-marker palette (assigned-category color + shape/size)
-    // AND process-bar config (loader strip position/colors) live in renderer
+    // AND process-bar config (loader strip position/base/shimmer) live in renderer
     // useUIStore — fetch once so the phone mirrors both the desktop left-marker
     // and the loader strip exactly. Falls back to dot/8px + left process-bar
     // when the bridge is unavailable.
     let markerCfg = { shape: 'dot', sizePx: 8 };
-    let processBarCfg = { enabled: true, colorA: '#155E75', colorB: '#0E7490', durationMs: 2400, position: 'left' };
+    let processBarCfg = { colorA: '#155E75', shimmerColor: '#FFFFFF', shimmerSpacingPct: 50, shimmerOpacityPct: 55, position: 'left' };
     let paletteById = new Map();
     try {
       const cfg = await bridgeRequest('getStatusMarkerConfig', {}, 1500);

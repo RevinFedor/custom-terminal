@@ -266,6 +266,12 @@ Popover с двумя уровнями pin'а (light = клик-закреп к 
 
 Применимо к любому popover'у с reactive content (см. `переносимый-дизайн.md::Sticky pin: snapshot vs reactive content`) — там sticky особенно важен, потому что окно реагирует на смену active state и закрыть его при смене вкладок = убить смысл sticky-режима. Базовая механика ⌘⇧-закрепа — global `tooltip-resize-modal.md::Закреп`.
 
+### 4.8. Backdrop click после drag внутри модалки
+
+**Симптом.** Cropper/resize-модалка закрывается, когда пользователь начал жест внутри контента, потащил мышь и отпустил над backdrop. Для пользователя это не click-outside, а продолжение drag-жеста; потеря модалки читается как случайное закрытие и может выбросить незавершённое кадрирование.
+
+**Фикс.** Backdrop dismiss срабатывает только если `mousedown` начался на overlay **и** финальный `click` тоже пришёл по overlay. Храни `mouseDownOnOverlay` в ref, сбрасывай после click. Одного `onClick={(e) => e.target === e.currentTarget && close()}` недостаточно: browser синтезирует click по release-target, а intent жеста определялся в момент mouse down. В custom-terminal это применено в `IconCropper`: drag внутри crop-area не должен закрывать окно при release на полупрозрачном фоне.
+
 ---
 
 ## 5. Рассинхрон видимости и состояния

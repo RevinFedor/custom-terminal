@@ -25,6 +25,18 @@ import { streamHistory, type StreamMeta } from './streamHistory';
 import { readCachedHistory, writeFullHistory, dropSession, readKv, writeKv } from './idb';
 import { DictationSession } from './dictation';
 
+function hexToRgbTriplet(hex: string, fallback = '255,255,255') {
+  const v = (hex || '').trim().replace(/^#/, '');
+  if (!/^[0-9a-fA-F]{6}$/.test(v)) return fallback;
+  const n = parseInt(v, 16);
+  return `${(n >> 16) & 255},${(n >> 8) & 255},${n & 255}`;
+}
+
+function opacityPctToAlpha(pct: number, fallback = 55) {
+  const safe = Number.isFinite(pct) ? pct : fallback;
+  return Math.max(5, Math.min(100, Math.round(safe))) / 100;
+}
+
 // HashRouter (URL fragment) instead of BrowserRouter so reload from any view
 // works without server-side rewrites — the static file server (web-server.js)
 // only knows /index.html, /assets/*; deep paths like /project/<id>/chat/<tabId>
@@ -482,9 +494,8 @@ function StatusMarker({ marker, color }: { marker: StatusMarkerCfg; color: strin
 
 // Process-bar STRIP — the loader. Mirrors the desktop process-bar: a thin
 // vertical strip at the left OR right edge (cfg.position), colored by the
-// processBar palette, that PULSES colorA↔colorB while the process is running.
-// A brighter shimmer band sweeps down it while the AI is actually generating
-// (busy). enabled:false → static colorA strip, no pulse. This is the ONLY
+// processBar base color while the process is running. A configurable shimmer band
+// sweeps down it while the AI is actually generating (busy). This is the ONLY
 // running/loader indicator on the row — no right-side dot, no whole-row tint.
 function ProcessBarStrip({ cfg, running, busy }: { cfg: ProcessBarCfg; running: boolean; busy: boolean }) {
   if (!running) return null;
@@ -492,21 +503,17 @@ function ProcessBarStrip({ cfg, running, busy }: { cfg: ProcessBarCfg; running: 
   const radius = cfg.position === 'right'
     ? { borderTopRightRadius: 12, borderBottomRightRadius: 12 }
     : { borderTopLeftRadius: 12, borderBottomLeftRadius: 12 };
+  const peakAlpha = opacityPctToAlpha(cfg.shimmerOpacityPct);
   return (
     <span
       aria-hidden
       style={{
         position: 'absolute', top: 0, bottom: 0, width: 3, ...side, ...radius,
-        // Pulse colorA↔colorB (background-color delta = codec-safe, like desktop).
-        // enabled:false → static colorA. CSS var drive keeps it cheap.
         backgroundColor: cfg.colorA,
-        ...(cfg.enabled
-          ? {
-              ['--mob-pbar-a' as any]: cfg.colorA,
-              ['--mob-pbar-b' as any]: cfg.colorB,
-              animation: `mob-pbar-pulse ${cfg.durationMs}ms ease-in-out infinite`,
-            }
-          : {}),
+        ['--mob-pbar-shimmer-rgb' as any]: hexToRgbTriplet(cfg.shimmerColor),
+        ['--mob-pbar-shimmer-spacing' as any]: `${cfg.shimmerSpacingPct}%`,
+        ['--mob-pbar-shimmer-alpha' as any]: peakAlpha,
+        ['--mob-pbar-shimmer-edge-alpha' as any]: Math.max(0.01, peakAlpha * 0.22),
         pointerEvents: 'none', overflow: 'hidden',
       }}
     >
@@ -522,7 +529,7 @@ function TabRow({ tab, marker, processBar, onTap, onLongPress }: { tab: TabInfo;
   const rowStyle = tabRowStyle(tab);
   // Runtime "is this process working right now": SDK uses the live session
   // presence; PTY+Claude uses the sessionStatus lifecycle string. running →
-  // process-bar strip appears (pulsing); busy → shimmer sweeps the strip.
+  // process-bar strip appears; busy → shimmer sweeps the strip.
   const live = !!tab.live;
   const busy = tab.sessionStatus === 'busy';
   const running = busy || live || tab.sessionStatus === 'active';
@@ -864,7 +871,13 @@ function ProjectView(props: {
   // Mirror desktop default (dot/8px) when the server predates statusMarker.
   const marker: StatusMarkerCfg = statusMarker || { shape: 'dot', sizePx: 8 };
   // Mirror desktop default process-bar (cyan, left) when server predates it.
-  const procBar: ProcessBarCfg = processBar || { enabled: true, colorA: '#155E75', colorB: '#0E7490', durationMs: 2400, position: 'left' };
+  const procBar: ProcessBarCfg = {
+    colorA: processBar?.colorA || '#155E75',
+    shimmerColor: processBar?.shimmerColor || '#FFFFFF',
+    shimmerSpacingPct: Number.isFinite(processBar?.shimmerSpacingPct) ? processBar!.shimmerSpacingPct : 50,
+    shimmerOpacityPct: Number.isFinite(processBar?.shimmerOpacityPct) ? processBar!.shimmerOpacityPct : 55,
+    position: processBar?.position === 'right' ? 'right' : 'left',
+  };
   const [creating, setCreating] = useState(false);
   const [actionTarget, setActionTarget] = useState<{ tab: TabInfo; kind: 'sdk' | 'terminal' } | null>(null);
   const [renameTarget, setRenameTarget] = useState<TabInfo | null>(null);
@@ -4433,25 +4446,26 @@ if (typeof document !== 'undefined' && !document.getElementById('noted-mobile-ke
   animation: mob-awaiting-spin 1.6s linear infinite;
   pointer-events: none;
 }
-/* Process-bar STRIP loader (mirror of desktop tab-process-bar). The edge strip
-   pulses colorA↔colorB while the process is alive (background-color delta =
-   codec-safe per AI-Optimized UI, NOT opacity). Vars set inline per-row from
-   the shared processBar config. */
-@keyframes mob-pbar-pulse {
-  0%,100% { background-color: var(--mob-pbar-a, #155E75); }
-  50%     { background-color: var(--mob-pbar-b, #0E7490); }
-}
+/* Process-bar STRIP loader (mirror of desktop tab-process-bar). The base edge
+   strip is static while the process is alive; AI-busy adds the shimmer below. */
 /* AI-busy shimmer band sweeping DOWN the strip — the "loader is generating" cue
-   (same metaphor as desktop tab-process-bar-ai-shimmer-overlay). Whitish band
-   ~40% tall translates top→bottom; seamless loop (-100%→250% both off-screen). */
+   (same metaphor as desktop tab-process-bar-ai-shimmer-overlay). */
 .mob-pbar-shimmer {
-  position: absolute; left: 0; right: 0; height: 40%;
-  background: linear-gradient(to bottom, rgba(255,255,255,0) 0%, rgba(255,255,255,0.6) 50%, rgba(255,255,255,0) 100%);
+  position: absolute;
+  inset: 0;
+  background-image: linear-gradient(
+    to bottom,
+    rgba(var(--mob-pbar-shimmer-rgb, 255,255,255), var(--mob-pbar-shimmer-edge-alpha, 0.12)) 0%,
+    rgba(var(--mob-pbar-shimmer-rgb, 255,255,255), var(--mob-pbar-shimmer-alpha, 0.55)) 50%,
+    rgba(var(--mob-pbar-shimmer-rgb, 255,255,255), var(--mob-pbar-shimmer-edge-alpha, 0.12)) 100%
+  );
+  background-size: 100% var(--mob-pbar-shimmer-spacing, 50%);
+  background-repeat: repeat-y;
   animation: mob-pbar-shimmer-sweep 1.2s linear infinite;
 }
 @keyframes mob-pbar-shimmer-sweep {
-  0%   { transform: translateY(-100%); }
-  100% { transform: translateY(250%); }
+  0%   { background-position: 0 0; }
+  100% { background-position: 0 100%; }
 }
 /* Suppress iOS text-selection glow on tap & long-press for tab rows / sheet
    buttons. The system selection highlights "TERMINAL"/"SDK" badges otherwise. */
